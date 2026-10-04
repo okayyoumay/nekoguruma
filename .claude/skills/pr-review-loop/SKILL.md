@@ -33,10 +33,9 @@ round's push and a clean verdict wait for that settled read, so late findings jo
 round. At the check-in, read the trigger comment's reactions (Step 1) to see
 whether Codex reacted 👍 (a clean round) or never started (below).
 
-**Codex not available.** If the trigger comment still has no 👀 and no review 15 minutes after
-it was posted (and after CI on that commit has finished, whichever is later; a PR that skips
-`ci.yml` finishes CI in seconds, so the time limit is what counts there), Codex is not enabled
-for this repository (it is switched on per
+**Codex not available.** If the trigger comment still has no 👀 and no review at the check-in
+(15 minutes after it was posted; CI does not matter here), Codex is not enabled for this
+repository (it is switched on per
 repository in the Codex settings on chatgpt.com, which only Yoko can do). Say so once in the
 thread, do not post the trigger again on this PR, and run the fallback review instead:
 `edge-case-hunter` on the whole PR diff (`git diff origin/main...HEAD`), whatever the diff's

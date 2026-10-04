@@ -47,7 +47,8 @@ Workspace skeleton (step 1): every crate goes as far as type and boundary defini
 
 ## `crates/j2534-defs`, `crates/vci-discovery`
 
-- **P1**: Linux J2534 registration definition (design 7.1.1) is not implemented in `vci-discovery` yet. The worker services have no equivalent; they read a library path from their own `config.toml`.
+- **P1**: Shared library resolver (ADR-228, design 7.1.1 / 7.2 / 7.3): one crate that resolves a VCI name to a library path (Windows registry, Linux `/etc/nekoguruma/j2534/` definitions; the Linux side is not implemented anywhere yet) and runs the 7.2 pre-load checks, used by the agent for discovery and by the worker services before loading. Consolidates the resolution logic now spread over `vci-discovery`, `vci-service-config` and `j2534-0404-registry`. Done when: `j2534-0404-service` started with only a library name loads the library its definition names on Linux and Windows, refuses a library that fails a 7.2 check, and the agent's discovery uses the same crate.
+- **P1**: Fixed configuration locations (ADR-228): the worker services' build-time default config path (`vci-service-launcher/config.toml`, `crates/vci-service-config/build.rs`) resolves to the filesystem root on Linux. Move it under `/etc/nekoguruma/` (and the matching ProgramData folder on Windows), and give the registration-definition directory the same build-time location with a debug-only override (ADR-073). Done when: release builds read only those locations and a test covers the debug-only override.
 - **P2**: `REG_EXPAND_SZ`: `FunctionLibrary` is returned unexpanded; expansion per library bitness (design 7.1) is still to do.
 - **P2**: Wiring: `agent` does not call `vci-discovery` yet.
 - **P3**: COMPARAM mapping covers J2534-1 base protocols only. J2534-2 cases (CAN FD, J1939, TP2.0, SW/FT CAN, pin-switched variants beyond the plain `_PS` IDs) exist in `j2534-0404-service` and can be carried over when needed.
@@ -56,7 +57,6 @@ Workspace skeleton (step 1): every crate goes as far as type and boundary defini
 ## Worker services (`docs/worker-crates.md`, `crates/worker-host`)
 
 - **P1**: gRPC client in the agent: `worker-host` launches the service and holds the auth key, but token minting (`vci1.<payload>.<HMAC>`, `crates/vci-service-launcher/src/token.rs`) and the tonic client are not written yet.
-- **P1**: Library resolution on Linux: the services resolve a library name through their own `config.toml` (`vci-service-config`). Decide whether the agent writes that file from the design 7.1.1 definition, or the service is changed to take an absolute path.
 - **P1**: `long_size = 8` end to end is only unit-tested with fake 64-bit functions. `sim-vci` uses `c_ulong` on Linux but exports only 8 of the 14 functions the service needs; add the missing stubs and run the service against it in CI.
 - **P3**: Vendor IOCTLs with data are rejected in 64-bit mode (layout unknown); add a VCI profile entry (design 9.3) for them. Blocked on: a vendor that needs one.
 - **P3**: J2534 v05.00 workers are not covered. A standalone service manager is not planned (the agent takes that role).

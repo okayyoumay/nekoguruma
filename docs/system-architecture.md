@@ -553,14 +553,7 @@ Confirmation level (6.3) and two-person approval. The server decides the require
 
 J2534 on Linux **reuses the Windows API definitions as-is**. Function signatures and structures are common as per the standard; OS differences appear only in the discovery path. Since Linux has no common registration store equivalent to the registry, registration information is defined in a format specific to this software.
 
-**Search paths** (XDG-compliant)
-
-| Path | Purpose | Written by |
-|---|---|---|
-| `/etc/nekoguruma/j2534/` | System-wide | Administrator |
-| `$XDG_CONFIG_HOME/nekoguruma/j2534/` (default `~/.config/nekoguruma/j2534/`) | Per user | User |
-
-The precedence when a definition with the same name exists in both is to be documented explicitly.
+**Search path**: `/etc/nekoguruma/j2534/` only, written by the administrator, in both operating modes. Per-user locations (such as `$XDG_CONFIG_HOME`) are not supported. The directory is fixed at build time; a runtime override exists only in debug builds, for tests (ADR-228).
 
 **Format**: One file per VCI (TOML or JSON). A single large file would have installers from multiple vendors editing the same file and conflicting, so the granularity matches the registry's one key per VCI.
 
@@ -580,7 +573,7 @@ The precedence when a definition with the same name exists in both is to be docu
 2. This software ships templates for known vendors
 3. Vendors are asked to register in this format
 
-The agent provides a generation helper. It actually `dlopen`s the specified .so, checks for the presence of J2534 symbols (`PassThruOpen` etc.), and then writes out the definition file.
+The agent provides a generation helper, run with administrator rights. It actually `dlopen`s the specified .so, checks for the presence of J2534 symbols (`PassThruOpen` etc.), and then writes out the definition file.
 
 **OS differences absorbed on the worker side**
 
@@ -616,14 +609,13 @@ Basis for the inference: AArch64's AAPCS64 matches x86_64's System V ABI in that
 - If an Authenticode signature is present, also verify the signer
 - Load by absolute path (`LoadLibraryEx` / `dlopen`)
 
-**Trusted search paths (by mode)**
+**Trusted locations**
 
-On Windows, the basis for trust is that HKLM can be modified only by administrators. Per-user paths on Linux lack this premise, so the trust scope is defined per mode.
+On Windows, the basis for trust is that HKLM can be modified only by administrators. Linux gets the same premise by reading registration definitions only from `/etc/nekoguruma/j2534/` (7.1.1), in both modes. The locations of every file that decides which library is loaded (registration definitions, the worker service's configuration file) are fixed at build time. They are not taken from environment variables or command-line arguments, so another process cannot redirect a worker to a different file; a runtime override is compiled into debug builds only, for tests (ADR-228).
 
-| Mode | Search paths read |
-|---|---|
-| Device mode | `/etc/nekoguruma/j2534/` only (per-user paths are ignored) |
-| User mode | Both. However, verify that the definition file and .so are not writable by other regular users |
+**One resolver, checked where the library is loaded**
+
+Resolving a VCI name to a library path, and the checks above, live in one shared crate used by both the agent and the worker services. The agent uses it for discovery and to report loadability in `capabilities` (9.5); the worker service resolves the name it was started with through the same code and runs the checks itself immediately before loading, so the file that is checked is the file that is loaded.
 
 ### 7.3 ABI Detection and Worker Selection
 
@@ -661,7 +653,7 @@ flowchart TD
 - Emulation of a different architecture is out of scope (Linux)
 - The launch test runs through the worker service itself, not through a separate probe binary: the agent launches the service for the detected ABI, connects the module and calls `GetVersion`, which the j2534-0404 service answers with `PassThruReadVersion`. The test therefore exercises the same binary, FFI layer and `long_size` that the job will use, and each ABI ships one worker binary per library kind
 
-**Implementation** (`crates/worker-host`): `abi::detect_file` reads the header and returns the ABI name of the 7.1.2 table. Worker binaries are installed as `<workers>/<ABI name>/<service binary>`, and `WorkerLayout::find` reports a missing build as `UNSUPPORTED_ABI`. The J2534 `long_size` (definition file value, else the 7.1.2 default from `Abi::default_long_size`) is passed to the j2534-0404 service in the `NGR_J2534_LONG_SIZE` environment variable; its sys layer converts between 32-bit and 64-bit structures at the FFI boundary.
+**Implementation** (`crates/worker-host`): the agent starts a worker service with the VCI's library name only; the service resolves the path itself (7.2). `abi::detect_file` reads the header and returns the ABI name of the 7.1.2 table. Worker binaries are installed as `<workers>/<ABI name>/<service binary>`, and `WorkerLayout::find` reports a missing build as `UNSUPPORTED_ABI`. The J2534 `long_size` (definition file value, else the 7.1.2 default from `Abi::default_long_size`) is passed to the j2534-0404 service in the `NGR_J2534_LONG_SIZE` environment variable; its sys layer converts between 32-bit and 64-bit structures at the FFI boundary.
 
 ### 7.4 IPC
 
@@ -1029,6 +1021,8 @@ VCI-specific differences are expressed declaratively. Whereas the registration d
 | Known quirks | Initialization order, wait times required after specific API calls, unsupported APIs and workarounds |
 | Constraints | Threading constraints, whether multiple devices can be opened concurrently (8.8.1), minimum monitoring period (measured), default ring buffer retention time (4.6) |
 | Operational info | Whether it works in device mode, who performs signature verification (11.2) |
+
+The worker services also read per-library settings (for example the CAN channel mode and vendor IOCTL layouts) from their own configuration file at the fixed location (7.2). That file is installed and updated outside this software, for example by a package management or software distribution service; the agent does not write it.
 
 Whether this can be turned into data determines the success of the framework approach. When a quirk is found that requires code to handle, first consider whether it can be generalized as a profile item.
 

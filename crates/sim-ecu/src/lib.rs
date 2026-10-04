@@ -55,6 +55,7 @@ pub struct SimEcu {
     pub flash: FlashPhase,
     pub security_unlocked: bool,
     pub gateway_authenticated: bool,
+    #[expect(dead_code, reason = "read by 0x27 SecurityAccess, not implemented yet")]
     seed_counter: u32,
 }
 

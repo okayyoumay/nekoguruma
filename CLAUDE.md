@@ -146,15 +146,25 @@ run on main. Pull requests that change only documentation, `work/` or `.claude/`
 `repo-checks.yml` always runs. Do not run cross-target builds locally unless asked; CI covers
 them.
 
+Compiler warnings fail CI: `core-linux`, `core-windows` and `worker-check` build with
+`RUSTFLAGS=-D warnings`, and `core-linux` runs `cargo fmt --check`. Clippy is not run in CI
+(it would add a build to every pull request); run it locally before pushing. Silence a warning for code that
+is unused only until later work lands with `#[expect(..., reason = "...")]`, not `#[allow]`, so
+the attribute fails the build once the code is used and gets removed.
+
 ## Pull requests
 
 1. Work on the branch you were given; open the pull request as a draft and fill in
    `.github/pull_request_template.md`.
 2. Drive CI to green. A failure is fixed at its root cause; never skip, disable or loosen a test
    to get green.
-3. Before marking the PR ready, check that nothing deferred during the work exists only in the
+3. Run the automated review loop with the `pr-review-loop` skill: request a Codex review
+   (`@codex review`), fix or answer every finding, and re-request until a round is clean. If
+   Codex is not enabled for the repository, the skill falls back to an `edge-case-hunter` pass
+   over the whole diff.
+4. Before marking the PR ready, check that nothing deferred during the work exists only in the
    conversation: every follow-up is either done in the PR or added to the backlog (`backlog`
    skill). Items the PR finishes are closed in the same PR.
-4. Yoko reviews and merges. Do not merge your own PR unless asked.
+5. Yoko reviews and merges. Do not merge your own PR unless asked.
 
 Commit messages and PR descriptions follow the same copyright rule as the code.

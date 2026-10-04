@@ -37,15 +37,23 @@ jobs:
   # Linux: one process per test with nextest, so tests that are #[serial] under `cargo test` run in
   # parallel (.config/nextest.toml). nextest does not run doc tests, hence the separate --doc step.
   # Build caches are saved from main only; pull requests restore them.
+  # Compiler warnings fail core-linux, core-windows and worker-check (RUSTFLAGS), which build the
+  # code anyway, so the check costs no extra build. The release builds on main leave it out: zig's
+  # linker prints a warning of its own.
   core-linux:
     runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -D warnings
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@nextest
+      - run: cargo fmt --all -- --check
       - run: cargo nextest run --workspace --locked --exclude sim-vci --profile ci
       - run: cargo test --workspace --locked --exclude sim-vci --doc
 
@@ -57,8 +65,9 @@ jobs:
     runs-on: windows-latest
     env:
       EXCLUDE: ${{ github.event_name == 'pull_request' && '--exclude j2534-0404-service' || '' }}
+      RUSTFLAGS: -D warnings
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -72,14 +81,17 @@ jobs:
   # Worker has 6 targets (12.1). On pull requests they are only type-checked, all on one Linux
   # runner: no crate compiles C code, so checking needs no cross toolchain or linker. The full
   # release builds (worker-linux, worker-windows) run on main.
+  # RUSTFLAGS replaces the gnullvm `rustflags` in .cargo/config.toml (+crt-static); that does not
+  # matter for a type check, which links nothing.
   worker-check:
     runs-on: ubuntu-latest
     env:
+      RUSTFLAGS: -D warnings
       TARGETS: >-
         x86_64-unknown-linux-gnu i686-unknown-linux-gnu aarch64-unknown-linux-gnu
         armv7-unknown-linux-gnueabihf x86_64-pc-windows-gnullvm i686-pc-windows-gnullvm
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-gnu,i686-unknown-linux-gnu,aarch64-unknown-linux-gnu,armv7-unknown-linux-gnueabihf,x86_64-pc-windows-gnullvm,i686-pc-windows-gnullvm
@@ -103,13 +115,15 @@ jobs:
           - aarch64-unknown-linux-gnu   # linux-arm64 (ABI interpretation is inferred. 7.1.2)
           - armv7-unknown-linux-gnueabihf # linux-armhf (same as above)
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
+          # One cache per target; with a shared key the matrix jobs race to save it.
+          cache-key: ${{ matrix.target }}
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-zigbuild
@@ -132,7 +146,7 @@ jobs:
           - x86_64-pc-windows-gnullvm   # win-x64
           - i686-pc-windows-gnullvm     # win-x86
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -164,7 +178,7 @@ jobs:
   abi-roundtrip:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: i686-unknown-linux-gnu

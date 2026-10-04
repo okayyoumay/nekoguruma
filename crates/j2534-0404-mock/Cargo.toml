@@ -1,0 +1,16 @@
+[package]
+name = "j2534-0404-mock"
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "j2534_0404_mock"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+j2534-0404-sys = { workspace = true }
+
+[dev-dependencies]
+j2534-0404 = { workspace = true }

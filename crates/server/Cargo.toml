@@ -1,0 +1,12 @@
+[package]
+name = "server"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+shared-proto.workspace = true
+diag-ir.workspace = true
+tokio.workspace = true
+axum.workspace = true
+serde.workspace = true
+tracing.workspace = true

@@ -1,0 +1,657 @@
+openapi: 3.1.0
+info:
+  title: Vehicle Diagnostic System API
+  version: 0.1.0
+  description: |
+    Corresponds to the design document system-architecture.md.
+
+    Separates the SOVD-compliant part from proprietary extensions (8.7).
+    - `/v1/sovd/**` : Compliant with the SOVD resource model
+    - `/v1/**`      : Specific to this system (jobs, agents, artifacts, extensions)
+
+    Authentication is OIDC (Bearer). This is consistent with SOVD assuming OAuth2.
+
+servers:
+  - url: https://example.com/api
+    description: Standard deployment
+  - url: http://127.0.0.1:8080/api
+    description: Local deployment (chapter 13)
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: jobs
+  - name: agents
+  - name: artifacts
+  - name: extensions
+  - name: data
+  - name: sovd
+
+paths:
+  # ------------------------------------------------------------ Jobs
+  /v1/jobs:
+    post:
+      tags: [jobs]
+      summary: Issue a job
+      description: |
+        The server checks permissions (6.8) and compatibility, generates a signed job instruction,
+        and delivers it to the target agent. Operations requiring seed-key or OEM authentication
+        must be online (5.7).
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/JobRequest' }
+      responses:
+        '202':
+          description: Accepted (delivery is asynchronous)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Job' }
+        '403': { $ref: '#/components/responses/Problem' }
+        '409':
+          description: Target VCI or vehicle is in use (soft lock, 8.8)
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /v1/jobs/{jobId}:
+    get:
+      tags: [jobs]
+      summary: Get job status
+      parameters:
+        - $ref: '#/components/parameters/JobId'
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Job' }
+
+  /v1/jobs/{jobId}/cancel:
+    post:
+      tags: [jobs]
+      summary: Request cancellation
+      description: |
+        Does not take effect immediately. In an uninterruptible section (8.10.1) the request is held,
+        and the job transitions to cancelled once it reaches an interruptible point.
+      parameters:
+        - $ref: '#/components/parameters/JobId'
+      responses:
+        '202': { description: Cancellation request accepted }
+
+  /v1/jobs/{jobId}/hmi/{requestId}:
+    post:
+      tags: [jobs]
+      summary: Respond to an HMI request (8.6)
+      parameters:
+        - $ref: '#/components/parameters/JobId'
+        - name: requestId
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        '204': { description: Accepted }
+
+  /v1/jobs/{jobId}/offline-package:
+    get:
+      tags: [jobs]
+      summary: Get the offline job package (5.7)
+      description: |
+        Returns the signed job instruction, references to ECU artifacts, references to IR, and an offline token
+        together. The expiry is short.
+      parameters:
+        - $ref: '#/components/parameters/JobId'
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OfflinePackage' }
+        '409':
+          description: Cannot start offline (seed-key or OEM authentication required)
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  # ------------------------------------------------------------ Agents
+  /v1/agents:
+    get:
+      tags: [agents]
+      summary: List operable agents
+      description: Returns only agents whose allowed-user list includes the caller (6.6).
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Agent' }
+
+  /v1/agents/{agentId}:
+    get:
+      tags: [agents]
+      parameters: [{ $ref: '#/components/parameters/AgentId' }]
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Agent' }
+
+  /v1/agents/{agentId}/revoke:
+    post:
+      tags: [agents]
+      summary: Revoke an agent key (16.3)
+      parameters: [{ $ref: '#/components/parameters/AgentId' }]
+      responses:
+        '204': { description: Revoked }
+
+  /v1/agents/register:
+    post:
+      tags: [agents]
+      summary: Register (one-time code or device authorization flow. 6.4)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code, publicKey, capabilities]
+              properties:
+                code: { type: string }
+                publicKey: { type: string, description: PEM or JWK }
+                capabilities: { $ref: '#/components/schemas/Capabilities' }
+      responses:
+        '201':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Agent' }
+
+  # ------------------------------------------------------------ Artifacts and extensions
+  /v1/artifacts:
+    post:
+      tags: [artifacts]
+      summary: Ingest an ECU artifact (11.2)
+      description: |
+        Stored without altering the bytes and identified by hash. No re-signing or decryption is performed.
+        If there is no manifest, target models etc. are accepted as a declaration.
+      requestBody:
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file: { type: string, format: binary }
+                declaredTargets:
+                  type: array
+                  items: { type: string }
+      responses:
+        '201':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Artifact' }
+
+  /v1/artifacts/{digest}/publish:
+    post:
+      tags: [artifacts]
+      summary: Publish a version (staged rollout)
+      parameters:
+        - name: digest
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                rolloutPercent: { type: integer, minimum: 0, maximum: 100 }
+      responses:
+        '204': { description: Published }
+
+  /v1/extensions:
+    post:
+      tags: [extensions]
+      summary: Ingest an extension package (9.4)
+      description: |
+        After validation, re-signed with the operator's distribution key (ingestion signature. 11.1).
+        VCI profiles, IR, screen/report definitions, record templates, message text, unit systems.
+      requestBody:
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file: { type: string, format: binary }
+      responses:
+        '201':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Extension' }
+        '422':
+          description: Contains elements outside the supported subset (8.3). Returns a list of the offending locations
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  # ------------------------------------------------------------ Acquired data
+  /v1/datasets/{datasetId}:
+    get:
+      tags: [data]
+      summary: Return metadata for acquired data (4.5)
+      parameters:
+        - name: datasetId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Dataset' }
+
+  /v1/datasets/{datasetId}/series:
+    get:
+      tags: [data]
+      summary: Read a time series at a specified resolution
+      description: |
+        Dedicated API that hides the storage format. Changing the implementation does not affect consumers.
+      parameters:
+        - name: datasetId
+          in: path
+          required: true
+          schema: { type: string }
+        - name: from
+          in: query
+          schema: { type: string, format: date-time }
+        - name: to
+          in: query
+          schema: { type: string, format: date-time }
+        - name: fields
+          in: query
+          schema: { type: array, items: { type: integer } }
+        - name: resolution
+          in: query
+          description: Number of points matching the screen width. Downsamples using min/max values
+          schema: { type: integer }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SeriesPage' }
+
+  /v1/datasets/{datasetId}/annotations:
+    post:
+      tags: [data]
+      summary: Add an annotation
+      description: Values acquired from the vehicle cannot be edited. Annotations are separate records (4.3).
+      parameters:
+        - name: datasetId
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Annotation' }
+      responses:
+        '201':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Annotation' }
+
+  /v1/datasets/{datasetId}/records:
+    put:
+      tags: [data]
+      summary: Update a work record (3-way merge)
+      description: |
+        Detects conflicts using `baseVersion` and per-item versions (4.4).
+        Auto-filled values (from the vehicle) cannot be edited.
+      parameters:
+        - name: datasetId
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RecordUpdate' }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RecordUpdate' }
+        '409':
+          description: Conflict. Returns the server's latest version and the base version
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /v1/changes:
+    get:
+      tags: [data]
+      summary: Change feed (4.4)
+      parameters:
+        - name: cursor
+          in: query
+          schema: { type: string }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  changes: { type: array, items: { type: object } }
+                  nextCursor: { type: string }
+
+  # ------------------------------------------------------------ SOVD
+  /v1/sovd/components:
+    get:
+      tags: [sovd]
+      summary: Component hierarchy (VCI → vehicle → ECU)
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { type: object }
+
+  /v1/sovd/components/{componentId}/data:
+    get:
+      tags: [sovd]
+      description: Derived from IR data objects. Use WebSocket for 10ms-interval subscriptions
+      parameters: [{ $ref: '#/components/parameters/ComponentId' }]
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { type: object } } } }
+
+  /v1/sovd/components/{componentId}/faults:
+    get:
+      tags: [sovd]
+      description: DTCs. Read-only; annotations only
+      parameters: [{ $ref: '#/components/parameters/ComponentId' }]
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { type: object } } } }
+
+  /v1/sovd/components/{componentId}/operations:
+    get:
+      tags: [sovd]
+      parameters: [{ $ref: '#/components/parameters/ComponentId' }]
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { type: object } } } }
+
+  /v1/sovd/components/{componentId}/updates:
+    get:
+      tags: [sovd]
+      description: ECU reprogramming. Execution is mapped onto the job model
+      parameters: [{ $ref: '#/components/parameters/ComponentId' }]
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { type: object } } } }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    JobId:
+      name: jobId
+      in: path
+      required: true
+      schema: { type: string }
+    AgentId:
+      name: agentId
+      in: path
+      required: true
+      schema: { type: string }
+    ComponentId:
+      name: componentId
+      in: path
+      required: true
+      schema: { type: string }
+
+  responses:
+    Problem:
+      description: Error (RFC 9457)
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+  schemas:
+    Problem:
+      type: object
+      description: RFC 9457. `code` holds a machine-readable value
+      properties:
+        type: { type: string }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        code:
+          type: string
+          enum:
+            - DEVICE_LOCKED
+            - VEHICLE_LOCKED
+            - VIN_MISMATCH
+            - VARIANT_MISMATCH
+            - POWER_CONDITION
+            - SIGNATURE_INVALID
+            - UNSUPPORTED_ABI
+            - GATEWAY_AUTH_REQUIRED
+            - SEED_KEY_REQUIRED
+            - AGENT_TOO_OLD
+            - UNSUPPORTED_IR_SCHEMA
+            - SUBSET_VIOLATION
+            - CONFLICT
+
+    JobRequest:
+      type: object
+      required: [kind, agentId, vciId]
+      properties:
+        kind:
+          type: string
+          enum: [acquire, monitorSession, monitorCapture, runSequence, writeSettings, reprogram]
+        agentId: { type: string }
+        vciId: { type: string }
+        vin: { type: string }
+        irDigest: { type: string }
+        artifactDigest: { type: string }
+        parameters:
+          type: object
+          additionalProperties: true
+        startDeadline: { type: string, format: date-time }
+        executionWindow:
+          type: object
+          properties:
+            from: { type: string, format: date-time }
+            to: { type: string, format: date-time }
+        remote: { type: boolean, description: Remote execution (requires the remote operator role and permission on the agent side)
+        }
+        onSiteContact: { type: string, description: Required for remote reprogramming }
+
+    Job:
+      type: object
+      properties:
+        jobId: { type: string }
+        kind: { type: string }
+        state:
+          type: string
+          enum:
+            [received, precheck, ready, running, verifying, awaitingHmi,
+             cancelRequested, completed, failed, cancelled, expired,
+             preconditionFailed, needsOnSiteRecovery]
+        progressPermille: { type: integer }
+        confirmation:
+          type: object
+          properties:
+            level: { type: string, enum: [notifyOnly, gracePeriod, onSiteApproval, twoPerson] }
+            approvedAt: { type: string, format: date-time }
+            approvedBy: { type: string }
+        datasetId: { type: string }
+        lastSeenAt: { type: string, format: date-time, description: Treated as running while disconnected }
+
+    OfflinePackage:
+      type: object
+      properties:
+        signedJob: { type: string, description: base64 }
+        offlineToken: { type: string }
+        expiresAt: { type: string, format: date-time }
+        artifacts: { type: array, items: { type: string } }
+        irDigests: { type: array, items: { type: string } }
+
+    Agent:
+      type: object
+      properties:
+        agentId: { type: string }
+        displayName: { type: string }
+        online: { type: boolean }
+        mode: { type: string, enum: [user, machine] }
+        allowRemote: { type: boolean }
+        preset: { type: string, enum: [personal, personalRemote, shared] }
+        capabilities: { $ref: '#/components/schemas/Capabilities' }
+
+    Capabilities:
+      type: object
+      description: 9.5. The server uses this to decide whether delivery is possible
+      properties:
+        agentVersion: { type: string }
+        protocolVersion: { type: integer }
+        platform:
+          type: object
+          properties:
+            os: { type: string }
+            nativeArch: { type: string }
+            emulated: { type: boolean }
+            mode: { type: string }
+        workers:
+          type: array
+          items:
+            type: object
+            properties:
+              abi: { type: string }
+              available: { type: boolean }
+              reason: { type: string }
+        vcis:
+          type: array
+          items:
+            type: object
+            properties:
+              vciId: { type: string }
+              name: { type: string }
+              vendor: { type: string }
+              standard: { type: string }
+              abiInterpretation: { type: string, enum: [standard, productDefined, inferred] }
+              loadable: { type: boolean }
+              reason: { type: string }
+              signatureVerifier: { type: string, enum: [library, adapter, ecuOnly] }
+        irSchemaVersions: { type: array, items: { type: integer } }
+        extensionSchemaVersions: { type: array, items: { type: integer } }
+        monitorDirect: { type: boolean }
+        offlineCapable: { type: boolean }
+
+    Artifact:
+      type: object
+      properties:
+        digest: { type: string }
+        size: { type: integer }
+        declaredTargets: { type: array, items: { type: string } }
+        manifestParsed: { type: boolean }
+        signatureVerifier: { type: string, enum: [library, adapter, ecuOnly] }
+        publishedAt: { type: string, format: date-time }
+
+    Extension:
+      type: object
+      properties:
+        id: { type: string, description: Reverse-domain format }
+        version: { type: string }
+        kind:
+          type: string
+          enum: [vciProfile, ir, screen, recordTemplate, message, unit]
+        schemaVersion: { type: integer }
+        license:
+          type: object
+          properties:
+            origin: { type: string }
+            scope: { type: string, enum: [tenantOnly, redistributable] }
+        signedAt: { type: string, format: date-time }
+
+    Dataset:
+      type: object
+      properties:
+        datasetId: { type: string }
+        jobId: { type: string }
+        vin: { type: string }
+        ecu:
+          type: object
+          properties:
+            address: { type: string }
+            partNumber: { type: string }
+            swVersion: { type: string }
+        vci:
+          type: object
+          properties:
+            model: { type: string }
+            serial: { type: string }
+        versions:
+          type: object
+          properties:
+            library: { type: string }
+            ir: { type: string }
+            agent: { type: string }
+        clockOffsetMillis: { type: integer }
+        capturedFromMonitor:
+          type: object
+          description: Only for capture (4.6)
+          properties:
+            route: { type: string, enum: [direct, relay] }
+            measuredIntervalMillis: { type: integer }
+            framesDropped: { type: integer }
+
+    SeriesPage:
+      type: object
+      properties:
+        fields: { type: array, items: { type: integer } }
+        points:
+          type: array
+          description: With a resolution specified, [t, min, max] tuples
+          items: { type: array, items: { type: number } }
+        nextCursor: { type: string }
+
+    Annotation:
+      type: object
+      properties:
+        annotationId: { type: string }
+        target: { type: string, description: DTC code or time range etc. }
+        text: { type: string }
+        verdict: { type: string, enum: [ok, needsCheck, ng] }
+        author: { type: string }
+        createdAt: { type: string, format: date-time }
+
+    RecordUpdate:
+      type: object
+      description: Work record based on a record template (4.3.1)
+      properties:
+        templateId: { type: string }
+        baseVersion: { type: integer }
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              itemId: { type: string }
+              value: {}
+              version: { type: integer }
+              origin: { type: string, enum: [manual, autoFilled] }
+              reason: { type: string, description: Required when correcting }

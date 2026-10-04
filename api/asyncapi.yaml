@@ -1,0 +1,233 @@
+asyncapi: 3.0.0
+info:
+  title: Vehicle Diagnostics System Event Specification
+  version: 0.1.0
+  description: |
+    Defines two kinds of paths (5.2).
+
+    1. Agent ⇄ server: WSS (outbound 443). Commands and events.
+    2. Browser ⇄ server: WebSocket. Job state and monitoring relay.
+
+    The direct monitoring link (WebRTC DataChannel) uses binary frames
+    with the same structure as `monitorFrame` in this spec (10.1).
+    Signaling goes through the server (10.4).
+
+servers:
+  agentGateway:
+    host: example.com
+    pathname: /agent/v1
+    protocol: wss
+    description: Agent connection. Mutual authentication uses the key issued at registration
+  browser:
+    host: example.com
+    pathname: /ws/v1
+    protocol: wss
+  localOffline:
+    host: 127.0.0.1:8099
+    pathname: /local/v1
+    protocol: ws
+    description: |
+      Enabled only when offline (5.7.1). Listens while the agent is disconnected.
+      Performs Origin checks and CORS; limited to starting prefetched jobs and reading progress.
+
+channels:
+  agentControl:
+    address: /agent/v1
+    servers: [{ $ref: '#/servers/agentGateway' }]
+    messages:
+      jobCommand: { $ref: '#/components/messages/JobCommand' }
+      cancelCommand: { $ref: '#/components/messages/CancelCommand' }
+      hmiResponse: { $ref: '#/components/messages/HmiResponse' }
+      seedKeyResponse: { $ref: '#/components/messages/SeedKeyResponse' }
+      agentEvent: { $ref: '#/components/messages/AgentEvent' }
+      heartbeat: { $ref: '#/components/messages/Heartbeat' }
+      reconcile: { $ref: '#/components/messages/Reconcile' }
+
+  browserStream:
+    address: /ws/v1
+    servers: [{ $ref: '#/servers/browser' }]
+    messages:
+      jobState: { $ref: '#/components/messages/JobStateEvent' }
+      monitorFrame: { $ref: '#/components/messages/MonitorFrame' }
+      changeFeed: { $ref: '#/components/messages/ChangeFeedEvent' }
+
+operations:
+  receiveJob:
+    action: receive
+    channel: { $ref: '#/channels/agentControl' }
+    summary: Server → agent. Job delivery
+    description: |
+      Idempotent. The agent ACKs receipt, records the job ID in its journal, and
+      ignores duplicates (5.3). Jobs past their start deadline are not run; Expired is reported instead.
+    messages:
+      - { $ref: '#/channels/agentControl/messages/jobCommand' }
+
+  sendEvent:
+    action: send
+    channel: { $ref: '#/channels/agentControl' }
+    summary: Agent → server. Sequence-numbered outbox
+    description: |
+      Must-deliver events (completed, failed) are retained until ACKed.
+      Progress may be thinned; only the latest value is sent (5.4).
+      The server deduplicates by "agent ID + sequence number".
+    messages:
+      - { $ref: '#/channels/agentControl/messages/agentEvent' }
+
+  reconcileOnReconnect:
+    action: send
+    channel: { $ref: '#/channels/agentControl' }
+    summary: State reconciliation on reconnection (open jobs only)
+    messages:
+      - { $ref: '#/channels/agentControl/messages/reconcile' }
+
+  streamMonitor:
+    action: receive
+    channel: { $ref: '#/channels/browserStream' }
+    summary: Server → browser. Monitoring relay
+    description: |
+      Used when the direct link cannot be established, and for delivery to the second and later subscribers (10.4).
+      The update interval is determined from measurements.
+    messages:
+      - { $ref: '#/channels/browserStream/messages/monitorFrame' }
+
+components:
+  messages:
+    JobCommand:
+      name: jobCommand
+      payload:
+        type: object
+        required: [commandId, signedJob]
+        properties:
+          commandId: { type: string }
+          signedJob:
+            type: string
+            description: |
+              base64. Signed with the server's instruction key (11.1).
+              The agent verifies it with the key received at registration.
+          irDigests: { type: array, items: { type: string } }
+          artifactDigest: { type: string }
+
+    CancelCommand:
+      name: cancelCommand
+      payload:
+        type: object
+        properties:
+          jobId: { type: string }
+
+    HmiResponse:
+      name: hmiResponse
+      payload:
+        type: object
+        properties:
+          jobId: { type: string }
+          requestId: { type: string }
+          values: { type: object, additionalProperties: true }
+
+    SeedKeyResponse:
+      name: seedKeyResponse
+      description: |
+        Sends the seed to the server (or HSM) and receives the key (8.10).
+        S3 keep-alive continues while waiting. Not possible offline.
+      payload:
+        type: object
+        properties:
+          jobId: { type: string }
+          requestId: { type: string }
+          key: { type: string, description: base64 }
+
+    AgentEvent:
+      name: agentEvent
+      payload:
+        type: object
+        required: [agentId, seq, kind]
+        properties:
+          agentId: { type: string }
+          seq: { type: integer, description: Monotonically increasing per agent }
+          delivery: { type: string, enum: [guaranteed, lossy] }
+          kind:
+            type: string
+            enum: [jobState, progress, hmiRequest, capabilities, capture, log]
+          jobId: { type: string }
+          state: { type: string }
+          failureCode: { type: string }
+          progressPermille: { type: integer }
+          phase: { type: string }
+          hmiRequest:
+            type: object
+            properties:
+              requestId: { type: string }
+              templateId: { type: string, description: Record template or HMI form }
+          capabilities: { type: object }
+          occurredAtAgent:
+            type: string
+            format: date-time
+            description: |
+              Device time is for reference only. Audit logs treat the server receive time as authoritative (16.3).
+
+    Heartbeat:
+      name: heartbeat
+      description: |
+        Application-level heartbeat. Detects half-open connections and
+        counters load balancer idle timeouts (14.1).
+        Does not update the DB; kept in memory and periodically batch-written (15.1).
+      payload:
+        type: object
+        properties:
+          agentId: { type: string }
+          sentAt: { type: string, format: date-time }
+
+    Reconcile:
+      name: reconcile
+      payload:
+        type: object
+        properties:
+          agentId: { type: string }
+          openJobs:
+            type: array
+            description: Open jobs only. Never sends the full set
+            items:
+              type: object
+              properties:
+                jobId: { type: string }
+                state: { type: string }
+                checkpoint:
+                  type: object
+                  description: Summary for handover to another device (8.2.5)
+                  properties:
+                    section: { type: integer }
+                    vin: { type: string }
+                    artifactDigest: { type: string }
+
+    JobStateEvent:
+      name: jobState
+      payload:
+        type: object
+        properties:
+          jobId: { type: string }
+          state: { type: string }
+          progressPermille: { type: integer }
+
+    MonitorFrame:
+      name: monitorFrame
+      contentType: application/octet-stream
+      description: |
+        Fixed-layout binary (10.3). Not JSON.
+        Header: [sessionId u64][seq u32][timestampNanos u64][timeSource u8]
+                [flags u8][fieldCount u16]
+        Body:   [values ... ] (order and types as defined by the IR's MonitorSet)
+
+        timeSource: 0=vehicle-side time, 1=derived from sample number, 2=receive time
+        flags bit0: gap since the previous frame
+      payload:
+        type: string
+        format: binary
+
+    ChangeFeedEvent:
+      name: changeFeed
+      description: Change feed (4.4). Subscriptions are aggregated per dataset (15.3)
+      payload:
+        type: object
+        properties:
+          cursor: { type: string }
+          datasetId: { type: string }
+          kind: { type: string, enum: [annotation, record] }

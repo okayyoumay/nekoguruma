@@ -1,0 +1,19 @@
+[package]
+name = "worker-host"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+base64 = { workspace = true }
+getrandom = { workspace = true }
+
+# Test double for the service stdio protocol, used by tests/service.rs.
+[[bin]]
+name = "fake-vci-service"
+path = "src/bin/fake-vci-service.rs"
+test = false
+doc = false

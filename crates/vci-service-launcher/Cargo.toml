@@ -1,0 +1,50 @@
+[package]
+name = "vci-service-launcher"
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[features]
+# Write logs to the Windows Event Log (Windows only; falls back to stderr on other platforms).
+eventlog = ["vci-service-config/eventlog"]
+# Write logs to the systemd journal (Linux only; falls back to stderr on other platforms).
+journald = ["dep:tracing-journald", "vci-service-config/journald"]
+# Use the directory containing the executable as the config root (all platforms).
+# The path within that root (or an absolute override) is governed by VCI_CONFIG_PATH.
+config-root-exe-dir = ["vci-service-config/config-root-exe-dir"]
+# Windows only: use FOLDERID_LocalAppData as the config root.
+# Mutually exclusive with other config-root-win-* features; see vci-service-config for priority.
+config-root-win-local-app-data = ["vci-service-config/config-root-win-local-app-data"]
+# Windows only: use FOLDERID_RoamingAppData as the config root.
+config-root-win-roaming-app-data = ["vci-service-config/config-root-win-roaming-app-data"]
+# Windows only: use FOLDERID_ProgramFiles as the config root.
+config-root-win-program-files = ["vci-service-config/config-root-win-program-files"]
+# Windows only: use FOLDERID_ProgramFilesX86 as the config root.
+config-root-win-program-files-x86 = ["vci-service-config/config-root-win-program-files-x86"]
+
+[dependencies]
+base64 = "0.23.1"
+hmac = "0.13.0"
+serde = { workspace = true, features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11.0"
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "io-util", "io-std", "process"] }
+tokio-stream = { version = "0.1.18", features = ["net"] }
+tonic = "0.14.6"
+tonic-web = "0.14.6"
+tower-http = { version = "0.7.1", features = ["cors"] }
+tracing = { workspace = true }
+tracing-journald = { version = "0.3", optional = true }
+tracing-subscriber = { workspace = true }
+url = "2.5.7"
+vci-service-config = { workspace = true }
+vci-service-interface = { workspace = true }
+
+# windows-sys is always available on Windows (used for the eventlog feature);
+# it is never compiled on non-Windows targets.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_System_EventLog",
+] }

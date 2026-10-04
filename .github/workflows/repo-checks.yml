@@ -1,0 +1,21 @@
+name: Repository checks
+
+# Repository rules from CLAUDE.md that can be checked mechanically. Kept apart from ci.yml so that
+# they also run for changes that touch only documentation or work/.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  repo-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: scripts/check-work-refs.sh
+      - run: scripts/check-adr-index.sh
+      - run: scripts/check-backlog.sh

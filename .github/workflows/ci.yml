@@ -1,0 +1,176 @@
+name: CI
+
+# Pull requests run through `pull_request` only; `push` is limited to main so a PR commit is not
+# built twice. Changes that touch only documentation, `work/` or `.claude/` skip this workflow;
+# the repository checks that cover those files are in repo-checks.yml.
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'work/**'
+      - '.claude/**'
+  pull_request:
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'work/**'
+      - '.claude/**'
+  workflow_dispatch:
+
+# A new push to a pull request cancels the run for its previous commit.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Test builds keep only line tables (enough for backtraces) instead of full debug info, which
+  # makes the debug build and its linking slower.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+
+permissions:
+  contents: read
+
+jobs:
+  # Server and agent are 64-bit only.
+  # Linux: one process per test with nextest, so tests that are #[serial] under `cargo test` run in
+  # parallel (.config/nextest.toml). nextest does not run doc tests, hence the separate --doc step.
+  # Build caches are saved from main only; pull requests restore them.
+  core-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/install-action@nextest
+      - run: cargo nextest run --workspace --locked --exclude sim-vci --profile ci
+      - run: cargo test --workspace --locked --exclude sim-vci --doc
+
+  # Windows: some timing-sensitive worker-crate tests fail there when run in parallel, so the
+  # `ci-windows` profile runs one test at a time. On pull requests, j2534-0404-service (about 90%
+  # of the tests and of the Windows time) is left out: it has no Windows-specific code, and Linux
+  # runs it on every pull request. main runs everything.
+  core-windows:
+    runs-on: windows-latest
+    env:
+      EXCLUDE: ${{ github.event_name == 'pull_request' && '--exclude j2534-0404-service' || '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/install-action@nextest
+      - shell: bash
+        run: cargo nextest run --workspace --locked --exclude sim-vci $EXCLUDE --profile ci-windows
+      - shell: bash
+        run: cargo test --workspace --locked --exclude sim-vci $EXCLUDE --doc
+
+  # Worker has 6 targets (12.1). On pull requests they are only type-checked, all on one Linux
+  # runner: no crate compiles C code, so checking needs no cross toolchain or linker. The full
+  # release builds (worker-linux, worker-windows) run on main.
+  worker-check:
+    runs-on: ubuntu-latest
+    env:
+      TARGETS: >-
+        x86_64-unknown-linux-gnu i686-unknown-linux-gnu aarch64-unknown-linux-gnu
+        armv7-unknown-linux-gnueabihf x86_64-pc-windows-gnullvm i686-pc-windows-gnullvm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu,i686-unknown-linux-gnu,aarch64-unknown-linux-gnu,armv7-unknown-linux-gnueabihf,x86_64-pc-windows-gnullvm,i686-pc-windows-gnullvm
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: |
+          for target in $TARGETS; do
+            cargo check --locked -p sim-vci -p j2534-0404-service -p iso22900-service --target "$target"
+          done
+
+  # Linux targets: glibc version is pinned with cargo-zigbuild.
+  worker-linux:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu    # linux-x86_64
+          - i686-unknown-linux-gnu      # linux-x86
+          - aarch64-unknown-linux-gnu   # linux-arm64 (ABI interpretation is inferred. 7.1.2)
+          - armv7-unknown-linux-gnueabihf # linux-armhf (same as above)
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      # j2534-0404-service / iso22900-service: service binaries used as workers (docs/worker-crates.md)
+      - run: cargo zigbuild --locked -p sim-vci -p j2534-0404-service -p iso22900-service --target ${{ matrix.target }} --release
+
+  # Windows targets are *-pc-windows-gnullvm, cross-built on Linux with the llvm-mingw toolchain
+  # (clang, lld and the mingw-w64 import libraries). .cargo/config.toml links libunwind
+  # statically, so the binaries need no DLL beyond those Windows itself provides; the last step
+  # checks that.
+  worker-windows:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target:
+          - x86_64-pc-windows-gnullvm   # win-x64
+          - i686-pc-windows-gnullvm     # win-x86
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install llvm-mingw
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LLVM_MINGW: llvm-mingw-20260922-ucrt-ubuntu-22.04-x86_64
+        run: |
+          gh release download 20260922 --repo mstorsjo/llvm-mingw --pattern "$LLVM_MINGW.tar.xz" --dir "$RUNNER_TEMP"
+          tar -xf "$RUNNER_TEMP/$LLVM_MINGW.tar.xz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/$LLVM_MINGW/bin" >> "$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - run: cargo build --locked -p sim-vci -p j2534-0404-service -p iso22900-service --target ${{ matrix.target }} --release
+      - name: Check DLL imports
+        run: |
+          for exe in target/${{ matrix.target }}/release/*.exe; do
+            echo "$exe"
+            llvm-objdump -p "$exe" | grep 'DLL Name' | tee "$RUNNER_TEMP/imports.txt"
+            if grep -Eiv 'DLL Name: (kernel32|ntdll|ucrtbase|advapi32|ws2_32|bcrypt|bcryptprimitives|userenv|user32|ole32|oleaut32|shell32|secur32|crypt32|ncrypt|iphlpapi|dbghelp|psapi|synchronization|api-ms-win-[a-z0-9-]+)\.dll' "$RUNNER_TEMP/imports.txt"; then
+              echo "::error::$exe imports a DLL that Windows does not provide"
+              exit 1
+            fi
+          done
+
+  # Verify ABI interpretation via a worker service x VCI simulator round trip.
+  # Include ARM via QEMU user mode (real hardware tested separately).
+  abi-roundtrip:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: i686-unknown-linux-gnu
+      - run: sudo apt-get update && sudo apt-get install -y qemu-user gcc-multilib
+      - run: cargo build --locked -p sim-vci --target i686-unknown-linux-gnu
+      - run: ./scripts/abi-roundtrip.sh
+
+  # Integration tests for operation modes (user / device) run in separate environments.
+  # TODO: startup tests as a Windows service / systemd user service

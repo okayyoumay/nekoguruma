@@ -1,0 +1,128 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/record-template.schema.json",
+  "title": "Record Template",
+  "description": "Design document 4.3.1. Item definitions for work records. An independent extension point that can be referenced from both IR procedures and screen definitions.",
+  "type": "object",
+  "required": ["schemaVersion", "id", "items"],
+  "additionalProperties": false,
+  "properties": {
+    "schemaVersion": { "type": "integer", "const": 1 },
+    "id": { "type": "string" },
+    "titleId": { "type": "integer", "description": "Message text ID. Resolved by the extension (9.2)" },
+
+    "appliesTo": {
+      "type": "object",
+      "description": "If omitted, the template is generic. If specified, it becomes vehicle-model-specific",
+      "additionalProperties": false,
+      "properties": {
+        "partNumbers": { "type": "array", "items": { "type": "string" } },
+        "models": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+
+    "items": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/item" }
+    }
+  },
+
+  "$defs": {
+    "item": {
+      "type": "object",
+      "required": ["id", "type"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string" },
+        "labelId": { "type": "integer" },
+        "type": {
+          "type": "string",
+          "enum": ["number", "choice", "boolean", "text", "attachment"],
+          "description": "Types are limited to these 5"
+        },
+        "required": { "type": "boolean", "default": false },
+        "unitId": { "type": "integer", "description": "The unit system is resolved by the extension" },
+
+        "choices": {
+          "type": "array",
+          "description": "When type=choice",
+          "items": {
+            "type": "object",
+            "required": ["value"],
+            "additionalProperties": false,
+            "properties": {
+              "value": { "type": "string" },
+              "labelId": { "type": "integer" }
+            }
+          }
+        },
+
+        "criteria": {
+          "type": "object",
+          "description": "Used for input validation and automatic pass/fail judgment",
+          "additionalProperties": false,
+          "properties": {
+            "min": { "type": "number" },
+            "max": { "type": "number" },
+            "maxLength": { "type": "integer" },
+            "pass": {
+              "type": "object",
+              "description": "Pass/fail condition. Judged ok if met, ng if not",
+              "additionalProperties": false,
+              "properties": {
+                "min": { "type": "number" },
+                "max": { "type": "number" },
+                "equals": {},
+                "oneOf": { "type": "array", "items": {} }
+              }
+            }
+          }
+        },
+
+        "autoFill": {
+          "type": "object",
+          "description": "Auto-fill from acquired values. Auto-filled values come from the vehicle and are therefore not editable (4.3.1)",
+          "required": ["source"],
+          "additionalProperties": false,
+          "properties": {
+            "source": {
+              "type": "string",
+              "enum": ["irField", "monitorSet", "vehicleMeta"],
+              "description": "irField: IR Field ID / vehicleMeta: VIN, part number, SW version, etc."
+            },
+            "fieldId": { "type": "integer" },
+            "metaKey": {
+              "type": "string",
+              "enum": ["vin", "partNumber", "swVersion", "vciSerial", "capturedAt"]
+            },
+            "aggregate": {
+              "type": "string",
+              "enum": ["last", "min", "max", "average"],
+              "default": "last",
+              "description": "How to take a single value from a time series"
+            },
+            "allowManualOverrideAsSeparateItem": {
+              "type": "string",
+              "description": "id of a separate item that records a manually re-measured value. The auto-filled value is never overwritten"
+            }
+          }
+        }
+      },
+
+      "allOf": [
+        {
+          "if": { "properties": { "type": { "const": "choice" } }, "required": ["type"] },
+          "then": { "required": ["choices"] }
+        },
+        {
+          "if": { "properties": { "type": { "const": "attachment" } }, "required": ["type"] },
+          "then": {
+            "not": { "required": ["autoFill"] },
+            "description": "Attachments are not eligible for auto-fill"
+          }
+        }
+      ]
+    }
+  }
+}

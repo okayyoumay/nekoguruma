@@ -1,0 +1,11 @@
+[package]
+name = "vci-discovery"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+roxmltree.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+winreg.workspace = true

@@ -1,0 +1,14 @@
+[package]
+name = "agent"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+shared-proto.workspace = true
+diag-ir.workspace = true
+vci-discovery.workspace = true
+worker-host.workspace = true
+tokio.workspace = true
+axum.workspace = true
+serde.workspace = true
+tracing.workspace = true

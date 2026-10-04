@@ -1,0 +1,24 @@
+# cargo-nextest configuration. CI runs `cargo nextest run --profile ci` on Linux and
+# `--profile ci-windows` on Windows.
+#
+# nextest runs every test in its own process. The worker-crate integration tests
+# (e.g. `j2534-0404-service`'s `grpc_mock`) load a mock J2534 / D-PDU library whose
+# state is process-global, so under `cargo test` they are marked `#[serial]` and run
+# one at a time. In separate processes they cannot share that state, so they can run
+# in parallel. They spend most of their time waiting on timers rather than on the
+# CPU, which is why the CI profile runs more tests at once than the runner has cores.
+
+[profile.ci]
+test-threads = 16
+# Report every failure, not only the first.
+fail-fast = false
+# Never retry: a test that passes only on retry is a flaky test to fix, not to hide.
+retries = 0
+
+# Windows CI. Some timing-sensitive worker-crate tests fail on the Windows runner when other tests
+# run at the same time, so this profile runs one test at a time, which matches what `cargo test`
+# does for the `#[serial]` tests.
+[profile.ci-windows]
+test-threads = 1
+fail-fast = false
+retries = 0

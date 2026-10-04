@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "match": { "vendor": "Example Tool Co.", "namePattern": "^EX-\\d{4}$" },
+  "standard": { "kind": "j2534", "version": "04.04" },
+  "abi": { "longSize": 4, "callingConvention": "stdcall", "symbolDecoration": "stdcallSuffix" },
+  "capabilities": {
+    "protocols": ["ISO15765", "CAN", "ISO14230"],
+    "baudRates": [125000, 250000, 500000],
+    "maxChannels": 2,
+    "concurrentOpen": false,
+    "buttonEvents": false,
+    "readsBatteryVoltage": true
+  },
+  "comparamMapping": [
+    { "comparam": "CP_CanPhysReqId", "target": "connectFlag", "flagBit": 0 },
+    { "comparam": "CP_P2Max", "target": "ioctl", "ioctlId": 2, "parameterId": 65, "scale": 0.5 },
+    { "comparam": "CP_VendorSpecific", "target": "ignore" }
+  ],
+  "quirks": {
+    "initSequence": ["PassThruOpen", "PassThruReadVersion", "PassThruConnect"],
+    "postCallDelays": [{ "api": "PassThruConnect", "delayMillis": 50 }],
+    "unsupportedApis": [{ "api": "PassThruStartPeriodicMsg", "fallback": "pollingLoop" }],
+    "reopenAfterError": [8]
+  },
+  "constraints": {
+    "threadAffinity": "deviceThread",
+    "minMonitorPeriodMillis": 20,
+    "ringBufferDefaultSeconds": 60
+  },
+  "operations": {
+    "machineModeSupported": true,
+    "signatureVerifier": "ecuOnly",
+    "firmwareUpdate": "vendorToolOnly"
+  }
+}

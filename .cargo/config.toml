@@ -1,0 +1,7 @@
+# Windows workers are built for *-pc-windows-gnullvm. Link the LLVM unwinder statically so the
+# binaries do not need libunwind.dll next to them.
+[target.x86_64-pc-windows-gnullvm]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.i686-pc-windows-gnullvm]
+rustflags = ["-C", "target-feature=+crt-static"]

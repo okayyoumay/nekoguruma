@@ -1,0 +1,7 @@
+[package]
+name = "j2534-defs"
+version.workspace = true
+edition.workspace = true
+
+# No dependencies: shared by the worker (cross-built for 6 targets) and sim-vci.
+[dependencies]

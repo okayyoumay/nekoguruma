@@ -1,0 +1,33 @@
+[package]
+name = "j2534-0404-service"
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[features]
+eventlog = ["vci-service-launcher/eventlog"]
+journald = ["vci-service-launcher/journald"]
+config-root-exe-dir = ["vci-service-launcher/config-root-exe-dir"]
+config-root-win-local-app-data = ["vci-service-launcher/config-root-win-local-app-data"]
+config-root-win-roaming-app-data = ["vci-service-launcher/config-root-win-roaming-app-data"]
+config-root-win-program-files = ["vci-service-launcher/config-root-win-program-files"]
+config-root-win-program-files-x86 = ["vci-service-launcher/config-root-win-program-files-x86"]
+
+[dependencies]
+j2534-0404 = { workspace = true }
+j2534-0404-registry = { workspace = true }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "io-util", "io-std", "process", "time"] }
+tokio-stream = { version = "0.1.18", features = ["net"] }
+tonic = "0.14.6"
+url = "2.5.7"
+vci-service-launcher = { workspace = true }
+vci-service-interface = { workspace = true }
+tracing = { workspace = true }
+portable-atomic = { workspace = true }
+
+[dev-dependencies]
+j2534-0404-mock = { workspace = true }
+j2534-0404-sys = { workspace = true }
+serde_json = "1"
+serial_test = "3"

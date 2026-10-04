@@ -1,0 +1,83 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/shared-proto",
+    "crates/shared-crypto",
+    "crates/diag-ir",
+    "crates/diag-frontend",
+    "crates/vendor-manifest",
+    "crates/j2534-defs",
+    "crates/vci-discovery",
+    "crates/worker-host",
+    "crates/iso22900",
+    "crates/iso22900-sys",
+    "crates/iso22900-mock",
+    "crates/iso22900-registry",
+    "crates/iso22900-service",
+    "crates/j2534-0404",
+    "crates/j2534-0404-sys",
+    "crates/j2534-0404-mock",
+    "crates/j2534-0404-registry",
+    "crates/j2534-0404-service",
+    "crates/vci-service-config",
+    "crates/vci-service-interface",
+    "crates/vci-service-launcher",
+    "crates/server",
+    "crates/agent",
+    "crates/sim-vci",
+    "crates/sim-ecu",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+
+[workspace.dependencies]
+# In-workspace
+shared-proto = { path = "crates/shared-proto" }
+shared-crypto = { path = "crates/shared-crypto" }
+diag-ir = { path = "crates/diag-ir" }
+vendor-manifest = { path = "crates/vendor-manifest" }
+sim-ecu = { path = "crates/sim-ecu" }
+j2534-defs = { path = "crates/j2534-defs" }
+vci-discovery = { path = "crates/vci-discovery" }
+worker-host = { path = "crates/worker-host" }
+iso22900 = { path = "crates/iso22900" }
+iso22900-sys = { path = "crates/iso22900-sys" }
+iso22900-mock = { path = "crates/iso22900-mock" }
+iso22900-registry = { path = "crates/iso22900-registry" }
+j2534-0404 = { path = "crates/j2534-0404" }
+j2534-0404-sys = { path = "crates/j2534-0404-sys" }
+j2534-0404-mock = { path = "crates/j2534-0404-mock" }
+j2534-0404-registry = { path = "crates/j2534-0404-registry" }
+vci-service-config = { path = "crates/vci-service-config" }
+vci-service-interface = { path = "crates/vci-service-interface" }
+vci-service-launcher = { path = "crates/vci-service-launcher" }
+
+# Common
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+postcard = { version = "1", features = ["alloc"] }
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+toml = "0.8"
+portable-atomic = "1"
+
+# Server / agent
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.8", features = ["ws"] }
+base64 = "0.22"
+getrandom = "0.3"
+
+# Agent: discovery (7.1)
+roxmltree = "0.21"
+winreg = "0.55"
+
+# Worker (keep dependencies minimal, since it is cross-built for 32-bit / ARM)
+
+[profile.release]
+lto = "thin"
+panic = "unwind" # Not abort, because catch_unwind is used at the FFI boundary

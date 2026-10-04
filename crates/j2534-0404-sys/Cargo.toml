@@ -1,0 +1,15 @@
+[package]
+name = "j2534-0404-sys"
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+libloading = "0.8.0"
+
+[build-dependencies]
+bindgen = { version = "0.72.1", optional = true }
+
+[features]
+bindgen = ["dep:bindgen"]

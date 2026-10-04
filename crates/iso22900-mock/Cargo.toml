@@ -1,0 +1,13 @@
+[package]
+name = "iso22900-mock"
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "iso22900_mock"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+iso22900-sys = { workspace = true }

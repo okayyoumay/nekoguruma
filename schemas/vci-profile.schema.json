@@ -1,0 +1,184 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/vci-profile.schema.json",
+  "title": "VCI Profile",
+  "description": "Design document 9.3. Whereas the registration definition (7.1) states 'where the library is', this declares 'how to handle that VCI'. Whether this can be expressed as data decides whether the framework approach succeeds.",
+  "type": "object",
+  "required": ["schemaVersion", "match", "standard"],
+  "additionalProperties": false,
+  "properties": {
+    "schemaVersion": { "type": "integer", "const": 1 },
+
+    "match": {
+      "type": "object",
+      "description": "Which VCI this applies to. Matched against discovery results",
+      "additionalProperties": false,
+      "properties": {
+        "vendor": { "type": "string" },
+        "namePattern": { "type": "string", "description": "Regular expression" },
+        "libraryFileName": { "type": "string" }
+      }
+    },
+
+    "standard": {
+      "type": "object",
+      "required": ["kind"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "type": "string", "enum": ["j2534", "dpdu"] },
+        "version": { "type": "string", "examples": ["04.04", "2.2"] }
+      }
+    },
+
+    "abi": {
+      "type": "object",
+      "description": "Overrides the values inferred in 7.1.2. If inference is wrong on ARM, fix it here (no core change needed)",
+      "additionalProperties": false,
+      "properties": {
+        "longSize": { "type": "integer", "enum": [4, 8] },
+        "callingConvention": { "type": "string", "enum": ["c", "stdcall"] },
+        "structAlignment": { "type": "integer", "enum": [1, 2, 4, 8] },
+        "symbolDecoration": {
+          "type": "string",
+          "enum": ["none", "stdcallSuffix"],
+          "description": "Support for the Windows x86 _Name@N format"
+        }
+      }
+    },
+
+    "capabilities": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "protocols": {
+          "type": "array",
+          "items": { "type": "string", "examples": ["ISO15765", "CAN", "ISO14230", "J1850VPW"] }
+        },
+        "baudRates": { "type": "array", "items": { "type": "integer" } },
+        "maxChannels": { "type": "integer", "minimum": 1 },
+        "concurrentOpen": {
+          "type": "boolean",
+          "default": false,
+          "description": "8.8.1. Whether multiple devices can be open simultaneously. If false, a separate worker is used per VCI"
+        },
+        "buttonEvents": {
+          "type": "boolean",
+          "default": false,
+          "description": "10.4. Whether triggers can be read from buttons on the VCI unit itself (non-standard, vendor-specific)"
+        },
+        "readsBatteryVoltage": {
+          "type": "boolean",
+          "default": true,
+          "description": "Whether it can be used for the precondition checks in 8.9.1"
+        }
+      }
+    },
+
+    "comparamMapping": {
+      "type": "array",
+      "description": "8.5. Mapping from COMPARAM to J2534 PassThruConnect flags / PassThruIoctl",
+      "items": {
+        "type": "object",
+        "required": ["comparam", "target"],
+        "additionalProperties": false,
+        "properties": {
+          "comparam": { "type": "string" },
+          "target": { "type": "string", "enum": ["connectFlag", "ioctl", "ignore"] },
+          "flagBit": { "type": "integer" },
+          "ioctlId": { "type": "integer" },
+          "parameterId": { "type": "integer" },
+          "scale": { "type": "number", "default": 1 }
+        }
+      }
+    },
+
+    "quirks": {
+      "type": "object",
+      "description": "Known quirks. Any quirk that cannot be expressed declaratively requires a core change (P4)",
+      "additionalProperties": false,
+      "properties": {
+        "initSequence": {
+          "type": "array",
+          "description": "Sequence of calls required after open",
+          "items": { "type": "string" }
+        },
+        "postCallDelays": {
+          "type": "array",
+          "description": "Wait time required after specific API calls",
+          "items": {
+            "type": "object",
+            "required": ["api", "delayMillis"],
+            "additionalProperties": false,
+            "properties": {
+              "api": { "type": "string" },
+              "delayMillis": { "type": "integer" }
+            }
+          }
+        },
+        "unsupportedApis": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["api"],
+            "additionalProperties": false,
+            "properties": {
+              "api": { "type": "string" },
+              "fallback": { "type": "string", "description": "Fallback. If none, the feature is disabled" }
+            }
+          }
+        },
+        "reopenAfterError": {
+          "type": "array",
+          "description": "Reopen the device on receiving these error codes",
+          "items": { "type": "integer" }
+        }
+      }
+    },
+
+    "constraints": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "threadAffinity": {
+          "type": "string",
+          "enum": ["deviceThread", "singleThread", "free"],
+          "default": "deviceThread",
+          "description": "Many J2534 DLLs are not thread-safe (3.4)"
+        },
+        "minMonitorPeriodMillis": {
+          "type": "integer",
+          "description": "10.3. Measured values are authoritative; this is only a rough upper-bound guide"
+        },
+        "ringBufferDefaultSeconds": {
+          "type": "integer",
+          "default": 60,
+          "description": "4.6 Default look-back window for capture"
+        }
+      }
+    },
+
+    "operations": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "machineModeSupported": {
+          "type": "boolean",
+          "default": true,
+          "description": "Whether it runs in machine mode (as a service). false for libraries that require an interactive session"
+        },
+        "signatureVerifier": {
+          "type": "string",
+          "enum": ["library", "adapter", "ecuOnly"],
+          "default": "ecuOnly",
+          "description": "11.3. Also shown in the Web UI"
+        },
+        "firmwareUpdate": {
+          "type": "string",
+          "enum": ["vendorToolOnly"],
+          "default": "vendorToolOnly",
+          "description": "8.9.1. Updating the VCI itself is left to the vendor's official tool; this system only verifies"
+        }
+      }
+    }
+  }
+}

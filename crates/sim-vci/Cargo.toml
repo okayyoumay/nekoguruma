@@ -1,0 +1,11 @@
+[package]
+name = "sim-vci"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+sim-ecu.workspace = true
+j2534-defs.workspace = true

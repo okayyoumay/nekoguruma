@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Checks docs/adr/: no duplicate ADR numbers, and INDEX.md links every ADR
+# file and nothing else. A duplicate number never conflicts in git (the two
+# files have different slugs), so this is the backstop for the number
+# reservation procedure (.claude/skills/adr-number-reservation/SKILL.md).
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+status=0
+dups="$(
+  ls docs/adr \
+    | sed -n 's/^ADR-\([0-9][0-9]*\)-.*\.md$/\1/p' \
+    | while IFS= read -r n; do echo "$((10#$n))"; done \
+    | sort -n | uniq -d
+)"
+if [ -n "$dups" ]; then
+  echo "duplicate ADR number(s) in docs/adr/:" $dups >&2
+  status=1
+fi
+for f in docs/adr/ADR-*.md; do
+  base="${f##*/}"
+  if ! grep -qF "($base)" docs/adr/INDEX.md; then
+    echo "docs/adr/INDEX.md has no row linking $base" >&2
+    status=1
+  fi
+done
+while IFS= read -r link; do
+  if [ ! -f "docs/adr/$link" ]; then
+    echo "docs/adr/INDEX.md links nonexistent file $link" >&2
+    status=1
+  fi
+done < <(grep -o 'ADR-[0-9][0-9]*-[A-Za-z0-9-]*\.md' docs/adr/INDEX.md | sort -u)
+exit "$status"

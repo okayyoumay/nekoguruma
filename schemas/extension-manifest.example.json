@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "id": "com.example.vci.ex4000",
+  "version": "1.2.0",
+  "kind": "vciProfile",
+  "displayName": "Example EX-4000 Profile",
+  "coreVersionRange": ">=0.1.0 <0.3.0",
+  "files": [
+    {
+      "path": "vci-profile.json",
+      "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "sizeBytes": 1024,
+      "mediaType": "application/json"
+    }
+  ],
+  "license": { "origin": "Example Tool Co.", "scope": "tenantOnly" },
+  "priority": 10
+}

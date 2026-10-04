@@ -1,0 +1,46 @@
+name: ADR reservation cleanup
+
+# adr-reservation/{NNN} branches are ADR number reservations created through
+# the GitHub API by sessions that cannot delete branches themselves
+# (.claude/skills/adr-number-reservation/SKILL.md). Once the ADR file is on
+# main the reservation has served its purpose, so delete it.
+
+on:
+  push:
+    branches: [main]
+    paths: ['docs/adr/**']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      # Always evaluate main, even when started manually from another ref.
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - name: Delete reservation branches whose ADR has merged
+        run: |
+          git ls-remote --heads origin 'adr-reservation/*' | while read -r _sha ref; do
+            num="${ref#refs/heads/adr-reservation/}"
+            case "$num" in *[!0-9]*|'') continue ;; esac
+            if compgen -G "docs/adr/ADR-${num}-*.md" > /dev/null; then
+              echo "ADR-${num} is on main, deleting its reservation branch"
+              if ! git push origin --delete "adr-reservation/${num}"; then
+                # Tolerate only a concurrent run having deleted it first:
+                # ls-remote --exit-code returns 2 when the ref is absent.
+                if git ls-remote --exit-code --heads origin "adr-reservation/${num}" > /dev/null 2>&1; then
+                  rc=0
+                else
+                  rc=$?
+                fi
+                if [ "$rc" -ne 2 ]; then
+                  echo "failed to delete adr-reservation/${num} (ls-remote exit ${rc})" >&2
+                  exit 1
+                fi
+              fi
+            fi
+          done

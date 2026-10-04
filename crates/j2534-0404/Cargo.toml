@@ -1,0 +1,13 @@
+[package]
+name = "j2534-0404"
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+j2534-0404-sys = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+j2534-0404-registry = { workspace = true }

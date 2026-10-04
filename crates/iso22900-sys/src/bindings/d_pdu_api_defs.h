@@ -1,0 +1,487 @@
+#ifndef CA1405F3_BB26_4A37_B1D2_D703099C9E17
+#define CA1405F3_BB26_4A37_B1D2_D703099C9E17
+
+#include <stdint.h>
+
+#ifndef STDCALL
+#ifdef _WIN32
+#define STDCALL __stdcall
+#else
+#define STDCALL
+#endif
+#endif
+
+typedef int8_t SNUM8;
+typedef uint8_t UNUM8;
+typedef int16_t SNUM16;
+typedef uint16_t UNUM16;
+typedef int32_t SNUM32;
+typedef uint32_t UNUM32;
+typedef char CHAR8;
+
+typedef enum E_PDU_PC {
+  PDU_PC_TIMING = 1,
+  PDU_PC_INIT = 2,
+  PDU_PC_COM = 3,
+  PDU_PC_ERRHDL = 4,
+  PDU_PC_BUSTYPE = 5,
+  PDU_PC_UNIQUE_ID = 6,
+  PDU_PC_TESTER_PRESENT = 7,
+} T_PDU_PC;
+
+typedef enum E_PDU_PT {
+  PDU_PT_UNUM8 = 0x00000101,
+  PDU_PT_SNUM8 = 0x00000102,
+  PDU_PT_UNUM16 = 0x00000103,
+  PDU_PT_SNUM16 = 0x00000104,
+  PDU_PT_UNUM32 = 0x00000105,
+  PDU_PT_SNUM32 = 0x00000106,
+  PDU_PT_BYTEFIELD = 0x00000107,
+  PDU_PT_STRUCTFIELD = 0x00000108,
+  PDU_PT_LONGFIELD = 0x00000109,
+} T_PDU_PT;
+
+typedef struct {
+  UNUM32 ParamMaxLen;
+  UNUM32 ParamActLen;
+  UNUM8 *pDataArray;
+} PDU_PARAM_BYTEFIELD_DATA;
+
+typedef enum E_PDU_CPST {
+  PDU_CPST_SESSION_TIMING = 0x00000001,
+  PDU_CPST_ACCESS_TIMING = 0x00000002,
+  PDU_CPST_TLS_VERSION_AND_CIPHER = 0x00000003,
+} T_PDU_CPST;
+
+typedef struct {
+  T_PDU_CPST ComParamStructType;
+  UNUM32 ParamMaxEntries;
+  UNUM32 ParamActEntries;
+  void *pStructArray;
+} PDU_PARAM_STRUCTFIELD_DATA;
+
+typedef struct {
+  UNUM16 session;
+  UNUM8 P2Max_high;
+  UNUM8 P2Max_low;
+  UNUM8 P2Star_high;
+  UNUM8 P2Star_low;
+} PDU_PARAM_STRUCT_SESS_TIMING;
+
+typedef struct {
+  UNUM8 P2Min;
+  UNUM8 P2Max;
+  UNUM8 P3Min;
+  UNUM8 P3Max;
+  UNUM8 P4Min;
+  UNUM8 TimingSet;
+} PDU_PARAM_STRUCT_ACCESS_TIMING;
+
+typedef struct
+{
+  UNUM8 TlsMajorVersion;
+  UNUM8 TlsMinorVersion;
+  UNUM8 CipherActEntries;
+  UNUM16 CipherList[5];
+} PDU_PARAM_STRUCT_TLS_VERSION_AND_CIPHER;
+
+typedef struct {
+  UNUM32 ParamMaxLen;
+  UNUM32 ParamActLen;
+  UNUM32 *pDataArray;
+} PDU_PARAM_LONGFIELD_DATA;
+
+typedef enum E_PDU_IT {
+  PDU_IT_IO_UNUM32 = 0x1000,
+  PDU_IT_IO_PROG_VOLTAGE = 0x1001,
+  PDU_IT_IO_BYTEARRAY = 0x1002,
+  PDU_IT_IO_FILTER = 0x1003,
+  PDU_IT_IO_EVENT_QUEUE_PROPERTY = 0x1004,
+  PDU_IT_IO_TLS_CERTIFICATE = 0x1005,
+  PDU_IT_RSC_STATUS = 0x1100,
+  PDU_IT_PARAM = 0x1200,
+  PDU_IT_RESULT = 0x1300,
+  PDU_IT_STATUS = 0x1301,
+  PDU_IT_ERROR = 0x1302,
+  PDU_IT_INFO = 0x1303,
+  PDU_IT_RSC_ID = 0x1400,
+  PDU_IT_RSC_CONFLICT = 0x1500,
+  PDU_IT_MODULE_ID = 0x1600,
+  PDU_IT_UNIQUE_RESP_ID_TABLE = 0x1700,
+  PDU_IT_IO_VEHICLE_ID_REQUEST = 0x1800,
+  PDU_IT_IO_ETH_SWITCH_STATE = 0x1801,
+  PDU_IT_IO_ENTITY_ADDRESS = 0x1802,
+  PDU_IT_IO_ENTITY_STATUS = 0x1803
+} T_PDU_IT;
+
+typedef enum E_PDU_COPT {
+  PDU_COPT_STARTCOMM = 0x8001,
+  PDU_COPT_STOPCOMM = 0x8002,
+  PDU_COPT_UPDATEPARAM = 0x8003,
+  PDU_COPT_SENDRECV = 0x8004,
+  PDU_COPT_DELAY = 0x8005,
+  PDU_COPT_RESTORE_PARAM = 0x8006,
+} T_PDU_COPT;
+
+typedef enum E_PDU_OBJT {
+  PDU_OBJT_PROTOCOL = 0x8021,
+  PDU_OBJT_BUSTYPE = 0x8022,
+  PDU_OBJT_IO_CTRL = 0x8023,
+  PDU_OBJT_COMPARAM = 0x8024,
+  PDU_OBJT_PINTYPE = 0x8025,
+  PDU_OBJT_RESOURCE = 0x8026,
+} T_PDU_OBJT;
+
+typedef enum E_PDU_STATUS {
+  PDU_COPST_IDLE = 0x8010,
+  PDU_COPST_EXECUTING = 0x8011,
+  PDU_COPST_FINISHED = 0x8012,
+  PDU_COPST_CANCELLED = 0x8013,
+  PDU_COPST_WAITING = 0x8014,
+  PDU_CLLST_OFFLINE = 0x8050,
+  PDU_CLLST_ONLINE = 0x8051,
+  PDU_CLLST_COMM_STARTED = 0x8052,
+  PDU_MODST_READY = 0x8060,
+  PDU_MODST_NOT_READY = 0x8061,
+  PDU_MODST_NOT_AVAIL = 0x8062,
+  PDU_MODST_AVAIL = 0x8063,
+} T_PDU_STATUS;
+
+typedef enum E_PDU_INFO {
+  PDU_INFO_MODULE_LIST_CHG = 0x8070,
+  PDU_INFO_RSC_LOCK_CHG = 0x8071,
+  PDU_INFO_PHYS_COMPARAM_CHG = 0x8072
+} T_PDU_INFO;
+
+typedef enum E_PDU_EVT_DATA {
+  PDU_EVT_DATA_AVAILABLE = 0x0801,
+  PDU_EVT_DATA_LOST = 0x0802
+} T_PDU_EVT_DATA;
+
+static const UNUM32 PDU_ID_UNDEF = 0xFFFFFFFE;
+static const UNUM32 PDU_HANDLE_UNDEF = 0xFFFFFFFF;
+
+typedef enum E_PDU_FILTER {
+  PDU_FLT_PASS = 0x00000001,
+  PDU_FLT_BLOCK = 0x00000002,
+  PDU_FLT_PASS_UUDT = 0x00000011,
+  PDU_FLT_BLOCK_UUDT = 0x00000012
+} T_PDU_FILTER;
+
+typedef enum E_PDU_QUEUE_MODE {
+  PDU_QUE_UNLIMITED = 0x00000000,
+  PDU_QUE_LIMITED = 0x00000001,
+  PDU_QUE_CIRCULAR = 0x00000002
+} T_PDU_QUEUE_MODE;
+
+typedef enum E_PDU_ERROR {
+  PDU_STATUS_NOERROR = 0x00000000,
+  PDU_ERR_FCT_FAILED = 0x00000001,
+  PDU_ERR_RESERVED_1 = 0x00000010,
+  PDU_ERR_COMM_PC_TO_VCI_FAILED = 0x00000011,
+  PDU_ERR_PDUAPI_NOT_CONSTRUCTED = 0x00000020,
+  PDU_ERR_SHARING_VIOLATION = 0x00000021,
+  PDU_ERR_RESOURCE_BUSY = 0x00000030,
+  PDU_ERR_RESOURCE_TABLE_CHANGED = 0x00000031,
+  PDU_ERR_RESOURCE_ERROR = 0x00000032,
+  PDU_ERR_CLL_NOT_CONNECTED = 0x00000040,
+  PDU_ERR_CLL_NOT_STARTED = 0x00000041,
+  PDU_ERR_INVALID_PARAMETERS = 0x00000050,
+  PDU_ERR_INVALID_HANDLE = 0x00000060,
+  PDU_ERR_VALUE_NOT_SUPPORTED = 0x00000061,
+  PDU_ERR_ID_NOT_SUPPORTED = 0x00000062,
+  PDU_ERR_COMPARAM_NOT_SUPPORTED = 0x00000063,
+  PDU_ERR_COMPARAM_LOCKED = 0x00000064,
+  PDU_ERR_TX_QUEUE_FULL = 0x00000070,
+  PDU_ERR_EVENT_QUEUE_EMPTY = 0x00000071,
+  PDU_ERR_VOLTAGE_NOT_SUPPORTED = 0x00000080,
+  PDU_ERR_MUX_RSC_NOT_SUPPORTED = 0x00000081,
+  PDU_ERR_CABLE_UNKNOWN = 0x00000082,
+  PDU_ERR_NO_CABLE_DETECTED = 0x00000083,
+  PDU_ERR_CLL_CONNECTED = 0x00000084,
+  PDU_ERR_TEMPPARAM_NOT_ALLOWED = 0x00000090,
+  PDU_ERR_RSC_LOCKED = 0x000000A0,
+  PDU_ERR_RSC_LOCKED_BY_OTHER_CLL = 0x000000A1,
+  PDU_ERR_RSC_NOT_LOCKED = 0x000000A2,
+  PDU_ERR_MODULE_NOT_CONNECTED = 0x000000A3,
+  PDU_ERR_API_SW_OUT_OF_DATE = 0x000000A4,
+  PDU_ERR_MODULE_FW_OUT_OF_DATE = 0x000000A5,
+  PDU_ERR_PIN_NOT_CONNECTED = 0x000000A6,
+  PDU_ERR_IP_PROTOCOL_NOT_SUPPORTED = 0x000000B0,
+  PDU_ERR_DOIP_ROUTING_ACTIVATION_FAILED = 0x000000B1,
+  PDU_ERR_DOIP_ROUTING_ACTIVATION_AUTHENTICATION_FAILED = 0x000000B2,
+  PDU_ERR_DOIP_AMBIGUOUS_LOGICAL_ADDRESS = 0x000000B3,
+  PDU_ERR_DOIP_ROUTING_ACTIVATION_INVALID_SOURCE_ADDRESS = 0x000000B4,
+  PDU_ERR_DOIP_ROUTING_ACTIVATION_NO_DATA_SOCKET_AVAILABLE = 0x000000B5,
+  PDU_ERR_DOIP_ROUTING_ACTIVATION_SOURCE_ADDRESS_CHANGED = 0x000000B6,
+  PDU_ERR_DOIP_ROUTING_ACTIVATION_SOURCE_ADDRESS_IN_USE = 0x000000B7,
+  PDU_ERR_DOIP_ROUTING_ACTIVATION_CONFIRMATION_REJECTED = 0x000000B8,
+  PDU_ERR_DOIP_ROUTING_ACTIVATION_TYPE_UNSUPPORTED = 0x000000B9,
+  PDU_ERR_DOIP_ROUTING_ACTIVATION_RESPONSE_CODE_UNKNOWN = 0x000000BA,
+  PDU_ERR_DOIP_ROUTING_ACTIVATION_RESPONSE_TIMEOUT = 0x000000BB,
+  PDU_ERR_DOIP_RESPONSE_TIMEOUT = 0x000000BC,
+} T_PDU_ERROR;
+
+typedef enum E_PDU_ERR_EVT {
+  PDU_ERR_EVT_NOERROR = 0x00000000,
+  PDU_ERR_EVT_FRAME_STRUCT = 0x00000100,
+  PDU_ERR_EVT_TX_ERROR = 0x00000101,
+  PDU_ERR_EVT_TESTER_PRESENT_ERROR = 0x00000102,
+  PDU_ERR_EVT_RSC_LOCKED = 0x00000109,
+  PDU_ERR_EVT_RX_TIMEOUT = 0x00000103,
+  PDU_ERR_EVT_RX_ERROR = 0x00000104,
+  PDU_ERR_EVT_PROT_ERR = 0x00000105,
+  PDU_ERR_EVT_LOST_COMM_TO_VCI = 0x00000106,
+  PDU_ERR_EVT_VCI_HARDWARE_FAULT = 0x00000107,
+  PDU_ERR_EVT_INIT_ERROR = 0x00000108,
+} T_PDU_ERR_EVT;
+
+typedef struct {
+  T_PDU_IT ItemType;
+  void *pData;
+} PDU_DATA_ITEM;
+
+typedef struct {
+  UNUM32 ProgVoltage_mv;
+  UNUM32 PinOnDLC;
+} PDU_IO_PROG_VOLTAGE_DATA;
+
+typedef struct {
+  UNUM32 DataSize;
+  UNUM8 *pData;
+} PDU_IO_BYTEARRAY_DATA;
+
+typedef struct {
+  T_PDU_FILTER FilterType;
+  UNUM32 FilterNumber;
+  UNUM32 FilterCompareSize;
+  UNUM8 FilterMaskMessage[12];
+  UNUM8 FilterPatternMessage[12];
+} PDU_IO_FILTER_DATA;
+
+typedef struct {
+  UNUM32 NumFilterEntries;
+  PDU_IO_FILTER_DATA *pFilterData;
+} PDU_IO_FILTER_LIST;
+
+typedef struct {
+  UNUM32 QueueSize;
+  T_PDU_QUEUE_MODE QueueMode;
+} PDU_IO_EVENT_QUEUE_PROPERTY_DATA;
+
+typedef struct {
+  UNUM32 IpVersion;
+  UNUM8 *pAddress;
+} PDU_IP_ADDR_INFO;
+
+typedef struct {
+  UNUM32 PreselectionMode;
+  CHAR8 *PreselectionValue;
+  UNUM32 CombinationMode;
+  UNUM32 VehicleDiscoveryTime;
+  UNUM32 NumDestinationAddresses;
+  PDU_IP_ADDR_INFO *pDestinationAddresses;
+} PDU_IO_VEHICLE_ID_REQUEST;
+
+typedef struct {
+  UNUM32 EthernetSenseState;
+  UNUM32 EthernetActPinNumber;
+} PDU_IO_ETH_SWITCH_STATE;
+
+typedef struct {
+  UNUM32 hMod;
+  UNUM32 ResourceId;
+  UNUM32 ResourceStatus;
+} PDU_RSC_STATUS_DATA;
+
+typedef struct {
+  T_PDU_IT ItemType;
+  UNUM32 NumEntries;
+  PDU_RSC_STATUS_DATA *pResourceStatusData;
+} PDU_RSC_STATUS_ITEM;
+
+typedef struct {
+  T_PDU_IT ItemType;
+  UNUM32 ComParamId;
+  T_PDU_PT ComParamDataType;
+  T_PDU_PC ComParamClass;
+  void *pComParamData;
+} PDU_PARAM_ITEM;
+
+typedef struct {
+  UNUM32 ModuleTypeId;
+  UNUM32 hMod;
+  CHAR8 *pVendorModuleName;
+  CHAR8 *pVendorAdditionalInfo;
+  T_PDU_STATUS ModuleStatus;
+} PDU_MODULE_DATA;
+
+typedef struct {
+  T_PDU_IT ItemType;
+  UNUM32 NumEntries;
+  PDU_MODULE_DATA *pModuleData;
+} PDU_MODULE_ITEM;
+
+typedef struct {
+  UNUM32 hMod;
+  UNUM32 NumIds;
+  UNUM32 *pResourceIdArray;
+} PDU_RSC_ID_ITEM_DATA;
+
+typedef struct {
+  T_PDU_IT ItemType;
+  UNUM32 NumModules;
+  PDU_RSC_ID_ITEM_DATA *pResourceIdDataArray;
+} PDU_RSC_ID_ITEM;
+
+typedef struct {
+  UNUM32 DLCPinNumber;
+  UNUM32 DLCPinTypeId;
+} PDU_PIN_DATA;
+
+typedef struct {
+  UNUM32 BusTypeId;
+  UNUM32 ProtocolId;
+  UNUM32 NumPinData;
+  PDU_PIN_DATA *pDLCPinData;
+} PDU_RSC_DATA;
+
+typedef struct {
+  UNUM32 hMod;
+  UNUM32 ResourceId;
+} PDU_RSC_CONFLICT_DATA;
+
+typedef struct {
+  T_PDU_IT ItemType;
+  UNUM32 NumEntries;
+  PDU_RSC_CONFLICT_DATA *pRscConflictData;
+} PDU_RSC_CONFLICT_ITEM;
+
+typedef struct {
+  UNUM32 UniqueRespIdentifier;
+  UNUM32 NumParamItems;
+  PDU_PARAM_ITEM *pParams;
+} PDU_ECU_UNIQUE_RESP_DATA;
+
+typedef struct {
+  T_PDU_IT ItemType;
+  UNUM32 NumEntries;
+  PDU_ECU_UNIQUE_RESP_DATA *pUniqueData;
+} PDU_UNIQUE_RESP_ID_TABLE_ITEM;
+
+typedef struct {
+  T_PDU_IT ItemType;
+  UNUM32 hCop;
+  void *pCoPTag;
+  UNUM32 Timestamp;
+  void *pData;
+} PDU_EVENT_ITEM;
+
+typedef T_PDU_STATUS PDU_STATUS_DATA;
+
+typedef struct {
+  T_PDU_INFO InfoCode;
+  UNUM32 ExtraInfoData;
+} PDU_INFO_DATA;
+
+typedef struct {
+  T_PDU_ERR_EVT ErrorCodeId;
+  UNUM32 ExtraErrorInfoId;
+} PDU_ERROR_DATA;
+
+typedef struct {
+  UNUM32 NumFlagBytes;
+  UNUM8 *pFlagData;
+} PDU_FLAG_DATA;
+
+typedef struct {
+  UNUM32 NumHeaderBytes;
+  UNUM32 NumFooterBytes;
+  UNUM8 *pHeaderBytes;
+  UNUM8 *pFooterBytes;
+} PDU_EXTRA_INFO;
+
+typedef struct {
+  PDU_FLAG_DATA RxFlag;
+  UNUM32 UniqueRespIdentifier;
+  UNUM32 AcceptanceId;
+  PDU_FLAG_DATA TimestampFlags;
+  UNUM32 TxMsgDoneTimestamp;
+  UNUM32 StartMsgTimestamp;
+  PDU_EXTRA_INFO *pExtraInfo;
+  UNUM32 NumDataBytes;
+  UNUM8 *pDataBytes;
+} PDU_RESULT_DATA;
+
+typedef struct {
+  UNUM32 MVCI_Part1StandardVersion;
+  UNUM32 MVCI_Part2StandardVersion;
+  UNUM32 HwSerialNumber;
+  CHAR8 HwName[64];
+  UNUM32 HwVersion;
+  UNUM32 HwDate;
+  UNUM32 HwInterface;
+  CHAR8 FwName[64];
+  UNUM32 FwVersion;
+  UNUM32 FwDate;
+  CHAR8 VendorName[64];
+  CHAR8 PDUApiSwName[64];
+  UNUM32 PDUApiSwVersion;
+  UNUM32 PDUApiSwDate;
+} PDU_VERSION_DATA;
+
+typedef struct {
+  UNUM32 ResponseType;
+  UNUM32 AcceptanceId;
+  UNUM32 NumMaskPatternBytes;
+  UNUM8 *pMaskData;
+  UNUM8 *pPatternData;
+  UNUM32 NumUniqueRespIds;
+  UNUM32 *pUniqueRespIds;
+} PDU_EXP_RESP_DATA;
+
+typedef struct {
+  UNUM32 Time;
+  SNUM32 NumSendCycles;
+  SNUM32 NumReceiveCycles;
+  UNUM32 TempParamUpdate;
+  PDU_FLAG_DATA TxFlag;
+  UNUM32 NumPossibleExpectedResponses;
+  PDU_EXP_RESP_DATA *pExpectedResponseArray;
+} PDU_COP_CTRL_DATA;
+
+typedef struct {
+  UNUM32 LogicalAddress;
+  UNUM32 DoIPCtrlTimeout;
+} PDU_IO_ENTITY_ADDRESS_DATA;
+
+typedef struct {
+  UNUM32 EntityType;
+  UNUM32 TcpClientsMax;
+  UNUM32 TcpClients;
+  UNUM32 MaxDataSize;
+} PDU_IO_ENTITY_STATUS_DATA;
+
+typedef struct {
+  T_PDU_IT ItemType;
+} PDU_ITEM;
+
+typedef struct {
+  UNUM32 CertLen;
+  UNUM8 *CertBuffer;
+} PDU_IO_TLS_CERT_DATA;
+
+typedef struct {
+  UNUM32 NumCertificates;
+  PDU_IO_TLS_CERT_DATA *pTlsCertData;
+} PDU_IO_TLS_CERT_CHAIN_DATA;
+
+typedef struct {
+  UNUM32 NumCertChains;
+  PDU_IO_TLS_CERT_CHAIN_DATA *pTlsCertChainData;
+} PDU_IO_TLS_CERTIFICATE;
+
+typedef void(STDCALL *CALLBACKFNC)(T_PDU_EVT_DATA eventType, UNUM32 hMod,
+                                   UNUM32 hCLL, void *pCllTag, void *pAPITag);
+
+#endif /* CA1405F3_BB26_4A37_B1D2_D703099C9E17 */

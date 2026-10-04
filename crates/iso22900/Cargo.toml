@@ -1,0 +1,20 @@
+[package]
+name = "iso22900"
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+iso22900-sys = { workspace = true }
+roxmltree = "0.21.1"
+url = "2.5.7"
+tracing = { workspace = true }
+
+iso22900-registry = { path = "../iso22900-registry" }
+
+[dev-dependencies]
+iso22900-mock = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.55.0"

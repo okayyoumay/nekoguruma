@@ -1,0 +1,16 @@
+[package]
+name = "j2534-0404-registry"
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+tracing = { workspace = true }
+vci-service-config = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.55"
+
+[dev-dependencies]
+tempfile = "3"

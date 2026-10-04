@@ -1,0 +1,55 @@
+{
+  "schemaVersion": 1,
+  "id": "com.example.record.reprogram-check",
+  "titleId": 1001,
+  "appliesTo": { "partNumbers": ["12345-67890"] },
+  "items": [
+    {
+      "id": "swVersionAfter",
+      "labelId": 1002,
+      "type": "text",
+      "required": true,
+      "autoFill": { "source": "vehicleMeta", "metaKey": "swVersion" }
+    },
+    {
+      "id": "batteryVoltage",
+      "labelId": 1003,
+      "type": "number",
+      "unitId": 11,
+      "required": true,
+      "criteria": { "min": 0, "max": 20, "pass": { "min": 12.5 } },
+      "autoFill": {
+        "source": "monitorSet",
+        "fieldId": 4201,
+        "aggregate": "min",
+        "allowManualOverrideAsSeparateItem": "batteryVoltageManual"
+      }
+    },
+    {
+      "id": "batteryVoltageManual",
+      "labelId": 1004,
+      "type": "number",
+      "unitId": 11,
+      "criteria": { "min": 0, "max": 20 }
+    },
+    {
+      "id": "dtcCleared",
+      "labelId": 1005,
+      "type": "boolean",
+      "required": true
+    },
+    {
+      "id": "verdict",
+      "labelId": 1006,
+      "type": "choice",
+      "required": true,
+      "choices": [
+        { "value": "ok", "labelId": 1007 },
+        { "value": "needsCheck", "labelId": 1008 },
+        { "value": "ng", "labelId": 1009 }
+      ]
+    },
+    { "id": "note", "labelId": 1010, "type": "text", "criteria": { "maxLength": 2000 } },
+    { "id": "photo", "labelId": 1011, "type": "attachment" }
+  ]
+}

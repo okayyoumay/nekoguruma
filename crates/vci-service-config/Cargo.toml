@@ -1,0 +1,42 @@
+[package]
+name = "vci-service-config"
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[features]
+# Enables the `LogOutputKind::Eventlog` variant. Consumed by vci-service-launcher's
+# `eventlog` feature, which additionally wires up the Windows Event Log writer itself.
+eventlog = []
+# Enables the `LogOutputKind::Journald` variant. Consumed by vci-service-launcher's
+# `journald` feature, which additionally wires up the systemd journal writer itself.
+journald = []
+# Use the directory containing the executable as the config root (all platforms).
+# The path within that root (or an absolute override) is governed by VCI_CONFIG_PATH.
+config-root-exe-dir = []
+# Windows only: use FOLDERID_LocalAppData as the config root.
+# Mutually exclusive with other config-root-win-* features; see src/lib.rs for priority.
+config-root-win-local-app-data = []
+# Windows only: use FOLDERID_RoamingAppData as the config root.
+config-root-win-roaming-app-data = []
+# Windows only: use FOLDERID_ProgramFiles as the config root.
+config-root-win-program-files = []
+# Windows only: use FOLDERID_ProgramFilesX86 as the config root.
+config-root-win-program-files-x86 = []
+
+[dependencies]
+serde = { workspace = true }
+toml = { workspace = true }
+
+# windows-sys is always available on Windows (used for SHGetKnownFolderPath and
+# CoTaskMemFree in config-root resolution); it is never compiled on non-Windows targets.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = [
+    "Win32_System_Com",
+    "Win32_UI_Shell",
+    "Win32_Foundation",
+] }
+
+[dev-dependencies]
+tempfile = "3"

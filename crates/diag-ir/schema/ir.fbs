@@ -1,0 +1,268 @@
+// Schema for the IR declaration part (design document 8.2.2).
+//
+// Policy:
+//  - Whatever the input format (ODX/OTX, CSV+JS), the frontend normalizes it into this shape (8.2)
+//  - Response decoding is not interpreted at runtime; it is expanded into flat arrays at import time
+//  - Split into one file per ECU variant, identified by hash (8.2.6)
+//
+// Generate: flatc --rust --gen-object-api -o src/generated schema/ir.fbs
+
+namespace diag.ir;
+
+file_identifier "DIR1";
+file_extension "dir";
+
+// ---------------------------------------------------------------- Basic types
+
+enum ByteOrder : byte {
+  Big = 0,   // default for vehicle diagnostics
+  Little = 1,
+}
+
+enum DataKind : byte {
+  Uint = 0,
+  Int = 1,
+  Float = 2,
+  Ascii = 3,
+  Bytes = 4,
+  Bcd = 5,
+}
+
+// Conversion to physical values (equivalent to COMPU-METHOD).
+// No general-purpose expression engine; each kind is expressed as coefficients or arrays.
+union Compu {
+  CompuIdentity,
+  CompuLinear,
+  CompuScaleLinear,
+  CompuTextTable,
+  CompuTableInterp,
+  CompuRational,
+  CompuBytecode,
+}
+
+table CompuIdentity {}
+
+// physical = (internal * numerator + offset) / denominator
+table CompuLinear {
+  numerator: double;
+  denominator: double;
+  offset: double;
+}
+
+table CompuScaleLinear {
+  scales: [LinearScale];
+}
+
+struct LinearScale {
+  lower: double;
+  upper: double;
+  numerator: double;
+  denominator: double;
+  offset: double;
+}
+
+table CompuTextTable {
+  entries: [TextEntry];
+  default_text_id: uint32 = 0; // message text is resolved on the extension side (9.2)
+}
+
+table TextEntry {
+  value: int64;
+  text_id: uint32;
+}
+
+table CompuTableInterp {
+  points: [InterpPoint];
+}
+
+struct InterpPoint {
+  internal: double;
+  physical: double;
+}
+
+table CompuRational {
+  numerator_coeffs: [double];
+  denominator_coeffs: [double];
+}
+
+// Equivalent to COMPUCODE. Evaluated with an instruction subset of the procedure part VM (8.2.2).
+table CompuBytecode {
+  code_offset: uint32; // start position within the procedure part program
+}
+
+// ---------------------------------------------------------------- Decode plan
+
+// Flattened response layout. Monitoring obtains physical values just by walking
+// this array (to meet the 10ms target in 10.3).
+table Field {
+  id: uint32;                 // stable ID for references
+  short_name: string;
+  bit_offset: uint32;
+  bit_length: uint32;
+  kind: DataKind;
+  byte_order: ByteOrder = Big;
+  compu: Compu;
+  unit_id: uint32 = 0;        // unit system is resolved on the extension side (9.2)
+  // Variable-length field: id of another field that holds the length (0 = fixed length)
+  length_from_field: uint32 = 0;
+}
+
+// ---------------------------------------------------------------- Diagnostic services
+
+table Request {
+  sid: uint8;
+  // Fixed byte sequence (sub-function etc. after the SID)
+  prefix: [uint8];
+  // Where parameters are embedded
+  params: [Field];
+}
+
+table PositiveResponse {
+  sid: uint8;               // usually request.sid + 0x40
+  prefix: [uint8];
+  fields: [Field];
+}
+
+table NegativeResponse {
+  nrc: uint8;
+  message_id: uint32;       // user-facing message text (resolved by extension)
+  // Whether this NRC is retryable (0x78 ResponsePending etc.)
+  retryable: bool = false;
+}
+
+table Service {
+  id: uint32;
+  short_name: string;
+  request: Request;
+  positive: PositiveResponse;
+  negatives: [NegativeResponse];
+  // Session and security level required for execution
+  required_session: uint8 = 0;
+  required_security_level: uint8 = 0;
+  // P2 / P2* (ms). Exceeding them is treated as a timeout
+  p2_millis: uint32 = 50;
+  p2_star_millis: uint32 = 5000;
+}
+
+// ---------------------------------------------------------------- DTC
+
+table DtcDefinition {
+  code: uint32;             // 3-byte DTC
+  display_code: string;     // "P0301" etc.
+  message_id: uint32;
+  // Bit definitions of the status byte
+  status_fields: [Field];
+  // Freeze frame layout
+  snapshot_fields: [Field];
+  // Extended data layout
+  extended_fields: [Field];
+}
+
+// ---------------------------------------------------------------- Communication parameters
+
+// COMPARAM is defined close to the D-PDU API, so the mapping to J2534 lives on the worker side (8.5).
+// Here it is held as standard-neutral values.
+table ComParam {
+  short_name: string;
+  value: int64;
+  unit_id: uint32 = 0;
+}
+
+table Protocol {
+  short_name: string;       // "ISO15765" etc.
+  baud_rate: uint32;
+  // Addressing
+  tx_id: uint32;
+  rx_id: uint32;
+  functional_id: uint32 = 0;
+  extended_addressing: bool = false;
+  params: [ComParam];
+}
+
+// ---------------------------------------------------------------- Flash description
+
+enum FlashStep : byte {
+  EnterProgrammingSession = 0,
+  SecurityAccess = 1,
+  EraseMemory = 2,
+  RequestDownload = 3,
+  TransferData = 4,
+  TransferExit = 5,
+  CheckMemory = 6,
+  EcuReset = 7,
+}
+
+table FlashSegment {
+  short_name: string;
+  start_address: uint64;
+  length: uint64;
+  // Offset within the distributed artifact. The payload is an OEM-signed binary and is not re-signed (11.1)
+  artifact_offset: uint64;
+  block_size: uint32;
+  checksum: [uint8];
+}
+
+table FlashSession {
+  id: uint32;
+  short_name: string;
+  steps: [FlashStep];
+  segments: [FlashSegment];
+  // Preconditions (8.9). Not executed if they are not met
+  min_voltage_mv: uint32 = 0;
+  max_voltage_mv: uint32 = 0;
+  require_ignition_on: bool = true;
+  require_engine_off: bool = true;
+  require_vehicle_stopped: bool = true;
+  // Whether an interruption in this range requires on-site intervention (8.10.1)
+  recovery_required_from_step: uint8 = 2; // default: from the start of erase onward
+}
+
+// ---------------------------------------------------------------- ECU variants
+
+// Variant identification (equivalent to ECU-VARIANT-PATTERN).
+// Runs identification services and selects the variant whose responses match (integrated into the pre-check in 8.9.1).
+table VariantPattern {
+  service_id: uint32;       // identification service to run
+  field_id: uint32;         // field to compare
+  expected: [uint8];        // expected value (prefix match)
+}
+
+table EcuVariant {
+  id: uint32;
+  short_name: string;
+  part_numbers: [string];
+  sw_versions: [string];
+  patterns: [VariantPattern];
+
+  protocols: [Protocol];
+  services: [Service];
+  dtcs: [DtcDefinition];
+  flash_sessions: [FlashSession];
+
+  // Decode plans pre-expanded for monitoring (10.2)
+  monitor_sets: [MonitorSet];
+}
+
+// A set of PIDs read together. Multiple values are fetched in one request.
+table MonitorSet {
+  id: uint32;
+  short_name: string;
+  service_id: uint32;
+  fields: [Field];
+  // Nominal period achievable with this set (ms). Measured values take precedence (10.3)
+  nominal_period_millis: uint32;
+}
+
+// ---------------------------------------------------------------- Root
+
+table EcuDocument {
+  schema_version: uint32;
+  // Provenance of the input format (8.2). "odx" | "csv-js" etc.
+  source_format: string;
+  source_digest: string;     // hash of the original file
+  variant: EcuVariant;
+  // Procedure part program (postcard-serialized bytes). Corresponds to Program
+  procedure: [uint8];
+}
+
+root_type EcuDocument;

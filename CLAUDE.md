@@ -1,0 +1,160 @@
+# CLAUDE.md
+
+Guidance for Claude Code sessions working in this repository. Agent usage, model allocation and
+cost rules are in [.claude/README.md](.claude/README.md).
+
+## Project
+
+**Nekoguruma (NGR)** is diagnostic software for vehicles: a server, an agent on the device that
+talks to the vehicle interface (VCI), and worker processes that load vendor J2534 / ISO 22900
+D-PDU API libraries for the ABI they were built for. Start with:
+
+- [README.md](README.md): workspace table (crate, role, design-document section)
+- [docs/system-architecture.md](docs/system-architecture.md): the design document. Code and docs
+  cite it by section number (e.g. "7.3")
+- [docs/worker-crates.md](docs/worker-crates.md): the `iso22900*`, `j2534-0404*` and
+  `vci-service-*` worker crates, target ABIs and bindings
+
+Naming: the full lowercase name `nekoguruma` is used for paths and configuration directories;
+`ngr` is the prefix for commands, binaries and new crates (e.g. `ngr-agent`).
+
+## Guidelines
+
+If an instruction contains a contradiction, ambiguity or missing information that changes the
+outcome, ask before making changes. When a choice is reversible and the instruction leaves it
+open, pick the reasonable default and say which one you picked.
+
+### Temporary vs. permanent files
+
+`work/` holds temporary working material (task lists, open items, status notes, the worker-crate
+backlog). Its rules are in [work/README.md](work/README.md). In short:
+
+- Open items and "not done yet" notes go in `work/`, never in permanent documents. A `todo!()`
+  placeholder or short `TODO` comment in code is fine; list the work itself in `work/`.
+- Permanent files (everything outside `work/`, including this file and `.claude/`) must not name
+  files inside `work/` or depend on their numbering. Naming the folder itself, or
+  `work/README.md`, is fine.
+- When an item in `work/` produces a lasting decision, write the decision into the permanent
+  document it belongs to (usually `docs/system-architecture.md`, a crate's docs, or an ADR), then
+  delete the item. A finished item is deleted, not checked off.
+
+`scripts/check-work-refs.sh` checks the second rule. It runs in CI and as a Claude Code hook
+after every file edit (`.claude/settings.json`).
+
+### Backlog
+
+Open items live in the backlog files in `work/`, one prioritized bullet per item (`- **P1**: ...`).
+The format, the P0-P3 scale and the file list are in `work/README.md` ("Backlog format");
+`scripts/check-backlog.sh` checks it in CI. Use the skills:
+
+- `backlog`: add an item whenever work is deferred, and close it (delete it, keeping any
+  residual as a new item) when it is done
+- `next-task`: recommend what to pick up next
+- `backlog-triage` (run on request only): clean up stale, duplicate or mis-prioritized items
+
+### Documentation sync
+
+Update every document that describes the area you change, in the same pull request:
+
+| Change | Document |
+|---|---|
+| Design, behaviour, data flow, security model | `docs/system-architecture.md` (keep its section numbers stable; code cites them) |
+| Crate added, removed, renamed or re-scoped | `README.md` workspace table, and `docs/worker-crates.md` for worker crates |
+| Worker gRPC interface (`crates/vci-service-interface/src/proto/service.proto`) | `docs/rpc-api-guide.md` |
+| J2534 v04.04 adapter (`j2534-0404-service`) | `docs/j2534-0404-architecture.md`, `docs/j2534-2-support-plan.md` |
+| Server Web API / event stream | `api/openapi.yaml`, `api/asyncapi.yaml` |
+| JSON schemas | `schemas/*.schema.json` and the matching `*.example.json` |
+| Database | a new file in `db/migrations/`, plus `db/README.md` |
+| New domain term | `docs/glossary.md` |
+| Crate scope, policy or detailed design | that crate's `crates/<crate>/docs/*.md` |
+| Non-obvious design decision | a new ADR (below) |
+
+Documentation is written in English and file names are kebab-case.
+
+### Architecture Decision Records
+
+ADRs live in `docs/adr/` as `ADR-{NNN}-{short-slug}.md` and follow
+[docs/adr/TEMPLATE.md](docs/adr/TEMPLATE.md). Each new ADR gets a row in `docs/adr/INDEX.md`'s
+main table and an entry under the matching theme section at the bottom of that file.
+
+Write an ADR when a design choice is non-obvious (data structure, concurrency model, state
+machine, protocol interpretation, trust boundary), when a prior ADR is revised, or when a spec
+requirement drives the code in a way that would surprise a reader. Plain bug fixes and refactors
+without behaviour change need none.
+
+**Numbering:** reserve the number before writing it anywhere. Parallel sessions that compute
+"max + 1" pick the same number, and the duplicate merges silently because the slugs differ. Use
+the `adr-number-reservation` skill (it creates `adr-reservation/{NNN}` via the GitHub API).
+`scripts/check-adr-index.sh` (CI) fails on duplicate numbers or `INDEX.md` drift.
+
+When superseding an ADR, set its `**Status:**` to `Superseded by ADR-{NNN}`; for a partial
+supersession, annotate instead, e.g. `Accepted (Decision item 2 superseded by ADR-{NNN})`.
+
+Older ADRs, notes and code comments in the worker crates record their provenance (PR numbers,
+review rounds, agent names). Those refer to earlier history that is not part of this repository;
+read them as provenance, and do not cite such history in new text.
+
+### Spec references and copyright
+
+ISO 22900-2 (2009 and 2022 editions), SAE J2534-1 (v04.04), SAE J2534-2 and ISO 14229-1 (2026
+edition) are available as converted text in the sibling `vehicle-comm-specs` repository (add it
+to the session with `add_repo` if it is missing). Check which edition a finding targets before citing it.
+
+These standards are copyrighted. **Never copy their text verbatim**, at any length, into anything
+this repository stores: code comments, `docs/`, ADRs, commit messages, PR or issue bodies. Cite
+the clause or section number and paraphrase in your own words.
+
+### Generated code
+
+Proto bindings (`crates/vci-service-interface`) and FFI bindings (`crates/*-sys/src/bindings/`)
+are generated and committed. Never hand-edit them, and never regenerate FFI bindings without
+asking first (slow cross builds). The details are in `.claude/rules/generated-code.md`, which
+loads when you open files in those crates.
+
+### Path-scoped rules
+
+Rules that matter only for part of the repository live in `.claude/rules/` and load when Claude
+reads or edits a matching file: `generated-code.md`, `worker-crates.md`, `work-folder.md`.
+Personal, uncommitted instructions go in `CLAUDE.local.md` (gitignored).
+
+## Building and testing
+
+```sh
+cargo check --workspace --locked
+cargo test --workspace --locked --exclude sim-vci
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked
+scripts/check-work-refs.sh
+scripts/check-adr-index.sh
+scripts/check-backlog.sh
+```
+
+CI runs the tests with [cargo-nextest](https://nexte.st/) instead. The `core-linux` job runs
+`cargo nextest run --workspace --locked --exclude sim-vci --profile ci`, then
+the doc tests with `cargo test ... --doc`. nextest runs each test in its own process, so the
+`#[serial]` worker-crate integration tests run in parallel there (`.config/nextest.toml`).
+`cargo test` gives the same results, only more slowly; keep `#[serial]` on tests that share
+process-global state, since `cargo test` still needs it. Some of those tests are too
+timing-sensitive to run in parallel on the Windows runner, so the `core-windows` job uses the
+`ci-windows` profile (one test at a time). On pull requests `core-windows` leaves out
+`j2534-0404-service`, which has no Windows-specific code; main runs every test on Windows.
+
+CI (`.github/workflows/ci.yml`) also checks the worker crates for six targets and runs
+`scripts/abi-roundtrip.sh`. On pull requests the worker targets are only type-checked
+(`cargo check --target`); the release builds (cargo-zigbuild for Linux, llvm-mingw for the `*-pc-windows-gnullvm` Windows targets, all on Linux)
+run on main. Pull requests that change only documentation, `work/` or `.claude/` skip `ci.yml`;
+`repo-checks.yml` always runs. Do not run cross-target builds locally unless asked; CI covers
+them.
+
+## Pull requests
+
+1. Work on the branch you were given; open the pull request as a draft and fill in
+   `.github/pull_request_template.md`.
+2. Drive CI to green. A failure is fixed at its root cause; never skip, disable or loosen a test
+   to get green.
+3. Before marking the PR ready, check that nothing deferred during the work exists only in the
+   conversation: every follow-up is either done in the PR or added to the backlog (`backlog`
+   skill). Items the PR finishes are closed in the same PR.
+4. Yoko reviews and merges. Do not merge your own PR unless asked.
+
+Commit messages and PR descriptions follow the same copyright rule as the code.

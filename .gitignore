@@ -1,0 +1,6 @@
+/target
+**/*.rs.bk
+
+# Personal Claude Code settings and instructions
+/CLAUDE.local.md
+/.claude/settings.local.json

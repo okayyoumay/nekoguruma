@@ -1,0 +1,17 @@
+[dev-dependencies]
+tempfile = "3"
+[package]
+name = "iso22900-registry"
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+roxmltree = "0.18"
+url = "2.2"
+vci-service-config = { workspace = true }
+tracing = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.10"

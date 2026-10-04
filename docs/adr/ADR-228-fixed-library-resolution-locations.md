@@ -2,7 +2,7 @@
 
 **Date:** 2026-10-04
 **Status:** Accepted
-**Affects:** `docs/system-architecture.md` (7.1.1, 7.2, 7.3, 9.3), `crates/vci-discovery`, `crates/vci-service-config`, `crates/j2534-0404-registry`, `crates/worker-host`, worker services
+**Affects:** `docs/system-architecture.md` (4, 4.2, 7.1.1, 7.2, 7.3, 9.2, 9.3, 9.4, 11, 11.1, 16.1), `api/openapi.yaml`, `schemas/extension-manifest.*`, `db/migrations/0002_extensions_without_vci_profile.sql`, `crates/vci-discovery`, `crates/vci-service-config`, `crates/j2534-0404-registry`, `crates/worker-host`, worker services
 
 ## Context
 
@@ -41,9 +41,12 @@ checked file and the loaded file can differ.
 4. **One shared resolver.** Resolution and the 7.2 pre-load checks live in one crate used by both
    the agent (discovery, loadability in `capabilities`) and the worker services. The service runs
    the checks itself immediately before loading, so the file checked is the file loaded.
-5. **The worker's configuration file is not written by this software.** Its per-library settings
-   are installed and updated outside the project, for example by a package management or software
-   distribution service.
+5. **VCI profiles are installed outside this software.** VCI profiles (9.3), both the data the
+   agent reads and the per-library settings in the worker services' configuration file, are local
+   files at fixed, administrator-only locations. They are installed and updated by an external
+   package management or software distribution service, which is out of this project's scope.
+   They are removed from the extension packages the agent syncs from the server (9.4), so they no
+   longer carry the ingestion signature; their trust rests on the location (item 1).
 
 ## Consequences
 
@@ -56,5 +59,8 @@ checked file and the loaded file can differ.
   location embedded.
 - The worker services' current default configuration location is a placeholder that resolves to
   the filesystem root on Linux; it has to move under `/etc/nekoguruma/`.
+- A VCI profile fix can no longer be pushed to agents from the server; it reaches devices only
+  through the operator's package management. The server's extension-package ingestion no longer
+  handles VCI profiles.
 - The shared resolver crate does not exist yet. `vci-discovery`, `vci-service-config` and
   `j2534-0404-registry` each hold part of the logic today and are consolidated into it.

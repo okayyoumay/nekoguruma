@@ -227,7 +227,8 @@ paths:
       summary: Ingest an extension package (9.4)
       description: |
         After validation, re-signed with the operator's distribution key (ingestion signature. 11.1).
-        VCI profiles, IR, screen/report definitions, record templates, message text, unit systems.
+        IR, screen/report definitions, record templates, message text, unit systems.
+        VCI profiles are not ingested here; they are installed on devices outside this software (9.3).
       requestBody:
         content:
           multipart/form-data:
@@ -578,7 +579,7 @@ components:
         version: { type: string }
         kind:
           type: string
-          enum: [vciProfile, ir, screen, recordTemplate, message, unit]
+          enum: [ir, screen, recordTemplate, message, unit]
         schemaVersion: { type: integer }
         license:
           type: object

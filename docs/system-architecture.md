@@ -176,7 +176,7 @@ Each device's operating mode is fixed to exactly one of "user mode" or "device m
 ```mermaid
 flowchart LR
     VN["Supplier / OEM<br/>Signed and encrypted"]
-    EXT["Extension author<br/>VCI profile / ODX/OTX"]
+    EXT["Extension author<br/>ODX/OTX"]
     ADM["Admin"]
     SRV["Server"]
     AGT["Agent"]
@@ -221,7 +221,8 @@ All are cached in an area that cannot be modified with user privileges. Deletion
 
 ### 4.2 Extension Packages
 
-- VCI profiles, IR, screen and report definitions, message text, unit systems (9.2)
+- IR, screen and report definitions, message text, unit systems (9.2)
+- VCI profiles are not extension packages: they are installed on the device outside this software (9.3)
 - The server verifies them on ingestion and signs them with the operator's distribution key (ingestion signature. 11.1)
 - The agent lazily fetches only what it needs. The initial sync scope follows 9.4
 - The delivery path is shared with ECU artifacts (HTTPS data channel), but re-signing and fetch scope differ
@@ -995,7 +996,7 @@ The core has no knowledge whatsoever of specific VCIs or vehicle models.
 
 | Extension point | Form | Location | When added |
 |---|---|---|---|
-| VCI profile | Data (declarative) | Agent | No redistribution needed |
+| VCI profile | Data (declarative) | Agent (installed outside this software; 9.3) | No redistribution needed |
 | Vehicle/ECU definitions (IR declaration part) | Data | Agent | No redistribution needed |
 | Procedure definitions (IR procedure part) | Data | Agent | No redistribution needed |
 | Screen/report definitions | Data | Server | No redistribution needed |
@@ -1022,7 +1023,7 @@ VCI-specific differences are expressed declaratively. Whereas the registration d
 | Constraints | Threading constraints, whether multiple devices can be opened concurrently (8.8.1), minimum monitoring period (measured), default ring buffer retention time (4.6) |
 | Operational info | Whether it works in device mode, who performs signature verification (11.2) |
 
-The worker services also read per-library settings (for example the CAN channel mode and vendor IOCTL layouts) from their own configuration file at the fixed location (7.2). That file is installed and updated outside this software, for example by a package management or software distribution service; the agent does not write it.
+**Distribution**: VCI profiles are not distributed through extension packages (9.4) and are not written by the agent. They are local files at fixed, administrator-only locations (7.2), installed and updated outside this software, for example by a package management or software distribution service. This covers both the profile data the agent reads and the per-library settings the worker services read from their own configuration file (for example the CAN channel mode and vendor IOCTL layouts). Their trust rests on the location being writable by administrators only, not on the ingestion signature (11.1) (ADR-228).
 
 Whether this can be turned into data determines the success of the framework approach. When a quirk is found that requires code to handle, first consider whether it can be generalized as a profile item.
 
@@ -1031,11 +1032,11 @@ Whether this can be turned into data determines the success of the framework app
 Even across different kinds, a single distribution mechanism is used.
 
 - **Structure**: extension manifest (ID, version, supported core version range, dependencies, hash of each file) + content files. This is distinct from the ECU artifact manifest (11.2) and the IR manifest (8.2.6); where the text needs to distinguish them, a qualifier is added
-- **ID**: namespaces are separated using reverse-domain notation (`com.example.vci.xyz`)
+- **ID**: namespaces are separated using reverse-domain notation (`com.example.ir.xyz`)
 - **Signing**: the manifest is signed with the operator's distribution key (ingestion signature; 11.1). Individual author keys are not registered on the agent
 - **Compatibility**: the core reports its schema versions and supported features via `capabilities`, and does not load out-of-range extensions, reporting the reason instead
 - **Conflict resolution**: the priority when multiple extensions apply to the same target (organization-defined > bundled, etc.) is documented explicitly
-- **Initial sync scope**: right after new registration, data for all vehicle models is not delivered; only manifests and common definitions are fetched. Model-specific IR and VCI profiles are lazily fetched once the target is determined. When offline work is planned, targets are specified in advance and prefetched (5.7)
+- **Initial sync scope**: right after new registration, data for all vehicle models is not delivered; only manifests and common definitions are fetched. Model-specific IR is lazily fetched once the target is determined. When offline work is planned, targets are specified in advance and prefetched (5.7)
 - **License records**: the manifest records the origin and license scope (organization-internal only / redistributable, etc.). License terms themselves are a matter of individual contracts; the system's requirement is that "the redistribution scope of ingested data can be controlled". A setting restricts distribution to within the tenant, and origin and license at ingestion time can be audited
 
 ### 9.5 capabilities (Contract Between Agent and Server)
@@ -1146,7 +1147,7 @@ There are two kinds of ingestion targets, with different paths and handling.
 | Target | Examples | Re-signing | Distribution to agent |
 |---|---|---|---|
 | ECU artifacts | Flash data, configuration values | No (bytes are not modified) | Prefetched at job issuance or by advance designation (4.1) |
-| Extension packages | VCI profiles, IR, screen/report definitions, message text, unit systems | Yes (ingestion signature) | Only what is needed, lazily fetched (9.4) |
+| Extension packages | IR, screen/report definitions, message text, unit systems | Yes (ingestion signature) | Only what is needed, lazily fetched (9.4) |
 
 Both are ingested by the server and managed as immutable versions. Below, 11.1 covers the trust model common to both, and 11.2 covers ingestion processing specific to ECU artifacts. For the extension package format and manifest, see 9.4.
 
@@ -1157,7 +1158,7 @@ Each signed object differs in what is guaranteed, the basis of trust and the rev
 | Signed object | Signer | Agent's basis of trust | What is guaranteed | Key rotation |
 |---|---|---|---|---|
 | ECU flash data | OEM (provider) | Verified by the ECU itself | Authenticity of the data | OEM-managed |
-| Extension packages (VCI profiles, IR, screen definitions, message text) | System operator's distribution key | Root key embedded in the agent | Provenance (ingested under the operator's control and not tampered with) | Agent update |
+| Extension packages (IR, screen definitions, message text) | System operator's distribution key | Root key embedded in the agent | Provenance (ingested under the operator's control and not tampered with) | Agent update |
 | Job instructions | Server's instruction key | Key received at registration | Target VCI, vehicle, approval record, expiry | Re-registration |
 
 **Ingestion signature**: having extension authors (VCI vendors, OEMs, organizations) sign with their own keys would make the set of keys to register on agents grow without bound, breaking the key distribution principle. Therefore, extensions received from authors are verified on the server side and then **re-signed with the operator's distribution key**.
@@ -1389,7 +1390,8 @@ Since this is provided as a framework, the scope of responsibility is made expli
 | Scope | Responsibility |
 |---|---|
 | Core, UI framework, non-replaceable admin screens, signing and key management | Framework provider |
-| Correctness of extension package contents (VCI profiles, IR, vehicle definitions) | Author. The operator is responsible only up to ingestion validation and provenance assurance (11.1) |
+| Correctness of extension package contents (IR, vehicle definitions) | Author. The operator is responsible only up to ingestion validation and provenance assurance (11.1) |
+| VCI profiles and their installation on devices (9.3) | Author for the contents; the operator's package management or software distribution service for delivery and updates |
 | Business screens and operational flows | Framework user |
 | UNECE R156 processes (SUMS) | System operator. The framework provides mechanisms for recording, version management and auditing, but does not operate the process |
 | Authenticity of ECU flash data | OEM (verified by the ECU) |

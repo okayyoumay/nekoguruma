@@ -15,7 +15,7 @@
     "id": {
       "type": "string",
       "pattern": "^[a-z0-9]+(\\.[a-z0-9-]+)+$",
-      "description": "Reverse-domain format. Example: com.example.vci.xyz"
+      "description": "Reverse-domain format. Example: com.example.ir.xyz"
     },
     "version": {
       "type": "string",
@@ -23,7 +23,7 @@
     },
     "kind": {
       "type": "string",
-      "enum": ["vciProfile", "ir", "screen", "recordTemplate", "message", "unit"]
+      "enum": ["ir", "screen", "recordTemplate", "message", "unit"]
     },
     "displayName": { "type": "string" },
     "description": { "type": "string" },

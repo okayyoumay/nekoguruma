@@ -110,7 +110,7 @@ continue that agent with `SendMessage` rather than spawning a fresh one.
 
 Handle **every** finding of the round before pushing; one push per round, never one per
 finding. A round where every finding was declined (2d) or answered by pointing at an earlier
-reply changes no file: skip the checks below and the push, never make an empty commit, and go straight to
+reply changes no file: skip checks 1 to 4 below and the push (still do check 5, the base), never make an empty commit, and go straight to
 the replies in Step 4. Re-request a review of the unchanged head only if the round contained a
 newly declined finding; a round whose findings were all answered earlier ends the loop, so go
 to Step 5 after the replies. Never re-request the same head twice.
@@ -177,7 +177,10 @@ Step 0 is done:
 3. **CI on the current head.** Wait for the check runs of the commit you are handing over and
    require them to pass (`get_check_runs`); the local checks in Step 3 do not cover the Windows
    tests or the worker targets. A PR that skips `ci.yml` (see "CI facts") needs only
-   `repo-checks` to pass. A red run sends you back to fixing it per CLAUDE.md.
+   `repo-checks` to pass. A red run sends you back to fixing it per CLAUDE.md. Also check the
+   base, even after a no-change round: `git fetch origin main`, and if the PR is behind or
+   conflicts (`mergeable_state: "dirty"`), merge `main` per Step 3.5 and go back through
+   Steps 3 and 4, since a check run on the old head says nothing about the merged tree.
 4. **Hand over.** Mark the PR ready for review and tell Yoko in the project thread that it is
    ready, listing anything accepted as a limitation and anything added to the backlog. Yoko
    reviews and merges; do not merge. Stay subscribed to the PR until it is merged or closed.

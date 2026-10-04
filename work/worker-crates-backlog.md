@@ -28,19 +28,6 @@ Most priorities here were set under the earlier scale these crates were develope
 - **P2** (`edge-case-hunter` review, ADR-204/PR #116, pre-existing hazard -- not introduced by ADR-204, only noticed while verifying an ADR-204 fix): `rpc_subscribe_event` (`service/rpc_primitive.rs`) commits its `self.subscriptions` bookkeeping (`self.subscriptions.lock().await.insert(key, stream_tx)` -- which can also evict and cancel a prior live subscriber for the same `(module, cll)` key) *before* the irreversible native `register_event_callback` call, which happens after a separate, later `self.api.lock().await`. If the gRPC request is dropped/cancelled while waiting on that second lock, the subscription slot is left registered with no native callback ever installed -- the CLL's subscription is silently dead (no events will ever arrive) until the spawned finalizer task's `stream_tx.closed()` eventually fires, and even then the finalizer only calls `unregister_event_callback` (a no-op here, since none was ever registered) and never removes the stale entry from `self.subscriptions` itself. This is the mirror image of the cancellation-window bug ADR-204's own `rpc_start_com_primitive` fix closed (bookkeeping-then-native-effect ordering instead of native-effect-then-bookkeeping) -- the same fix shape (commit the bookkeeping only once no further `.await` remains before it, or vice versa: do the native call first) likely applies here too. Not investigated or scoped here.
 - **P2** (`edge-case-hunter` review, ADR-204/PR #116): the cancellation-window fix in `rpc_start_com_primitive` (reordering `cop_tags`'s lock acquisition to before the native call, so no `.await` remains between the native side effect and the tag reconcile) has no test isolating its own contribution -- the existing `cop_tag` tests (`start_com_primitive_accepts_max_length_cop_tag`, `start_com_primitive_rejects_oversized_cop_tag`, `subscribe_event_echoes_cop_tag_racing_start_response`, all in `tests/grpc_mock.rs`) exercise size validation and event/response ordering, but none simulates a cancelled/dropped RPC future while `cop_tags` is contended, and none exercises "a reused `(module, cll, cop)` handle echoes a stale prior occupant's tag" -- the fix's correctness rests on direct code reading (confirmed independently, twice), not a fail-without/pass-with test. A targeted regression (hold `cop_tags` locked from a spawned task, drop the `rpc_start_com_primitive` future while it blocks acquiring `cop_tags`, assert the map is left consistent) would close this.
 
-### Known Flaky Tests
-
-- **Cross-process test-harness startup race (ADR-195).** `tests/grpc_mock.rs`'s
-  `TestServer::start` and `src/service/rpc.rs`'s `set_mock_library_path_config`
-  both wrote a fixed-path temp config file and set the process-global
-  `VCI_CONFIG_PATH` env var, which two separate `cargo test` processes could
-  race on concurrently (no cross-process synchronization existed for either
-  helper). Fixed the same way as the equivalent `j2534-0404-service` race
-  (see that package's `docs/implementation-notes.md` "Resolved (2026-08-27)"
-  entry for the full investigation): the temp config path is now
-  per-process-unique, via `std::process::id()`. Test-infrastructure-only
-  change; no production code touched.
-
 ## `iso22900-sys`
 
 ### Prioritized Backlog
@@ -79,61 +66,17 @@ margin theory — stop widening and instrument instead (see the
 `receive_only_cyclic_reap_gated_by_exhaustive_drain_not_just_a_poll_running`
 entry below for a worked example).
 
-- **`tests/grpc_mock/j1939.rs` full-module flakiness (round 15, `edge-case-hunter` finding, not yet root-caused).** Repeated full-module runs
-  (`cargo test -p j2534-0404-service --test grpc_mock -- j1939::`) intermittently fail a DIFFERENT, seemingly unrelated test each time (observed:
-  `optional_startcomm_message_sends_with_the_claimed_source_address`, `repeat_slot_stop_condition_wildcards_pgn_and_destination_exact_matches_source_address`,
-  `cancelling_the_optional_startcomm_message_after_a_successful_claim_stops_its_own_repeat_slots`, `coptupdateparam_rejects_tester_source_address_off_the_live_claim`)
-  roughly 1-in-3 runs, always passing again on immediate rerun and in isolation. Confirmed via `git stash` to reproduce identically on the pre-round-15 tree
-  (47 tests, before that round's two fixes) — not a regression introduced by round 15's `j1939_negotiation_engaged` flag or the `CP_J1939TargetAddress`
-  execution-time re-check. Not yet investigated further: the varying failing test each run suggests a shared-state or timing-margin issue specific to this
-  file's own suite (possibly interacting with its module doc's own documented "Item 2... inherently timing-sensitive" caveat, or a distinct root cause) rather
-  than any one test's own bug. Worth a dedicated look next time full-suite flakiness needs chasing in this file specifically, following the same isolation-first
-  triage this section's other entries use.
-- **`discovery.rs`'s `discovery_mock_call_counter` serial group has incomplete coverage
-  (PR #101 round 10, `cargo-runner` triage after an initial SIGSEGV report that itself did not
-  reproduce across 5+ attempts and is NOT this entry).** `device_epoch_bump_invalidates_a_stale_cache_entry`
-  and its sibling `device_info_*`/`device_epoch_*` tests are correctly tagged
-  `#[serial(discovery_mock_call_counter)]` to serialize against each other's reads of
-  `get_device_info_call_count()`, a process-global counter in the dynamically-loaded mock `.so`
-  (shared by every test in this binary that loads the same path). But `enforce_discovery_capability`'s
-  own tests just above them in the same file (e.g. `enforce_discovery_capability_rejects_swcan_when_device_reports_unsupported`,
-  the `DeviceAccess::AlreadyOpen` arm) exercise the SAME underlying native `GET_DEVICE_INFO` call via
-  `discovery_device_info_with_open_device` -- a different wrapper reaching the identical mock
-  counter -- without carrying that tag at all. Under `cargo test --workspace --lib --bins
-  --test-threads=16`, this untagged path can interleave with a `discovery_mock_call_counter`-tagged
-  test's own before/after window, producing a spurious "expected N calls, got N+1" failure
-  (observed on `device_epoch_bump_invalidates_a_stale_cache_entry`). Confirmed unrelated to this
-  PR's own TP2.0 broadcast-periodic changes by tracing every call path to the shared counter by
-  hand: `discovery.rs`/`enforce_discovery_capability`/`discovery_device_info_with_open_device` are
-  untouched by this PR (whose diff is confined to `rpc_misc.rs`/`rpc_primitive.rs`/`events.rs`'s
-  TP2.0 broadcast-periodic tracking and this doc/ADR-192), and `enforce_discovery_capability` is
-  called only from `rpc_misc.rs`/`rpc_link.rs` connect/ioctl handlers neither this PR nor its new
-  tests touch. A `cargo-runner` A/B comparison across commits read a scheduling-probability shift
-  (more tests in the same process shifting thread interleaving) as a "regression" between commits,
-  but the underlying missing-serial-tag defect provably predates and is independent of this PR's
-  changes -- it would be exposed by ANY change that added enough tests to this same binary, not
-  specifically by anything in this PR's diff. Not fixed here (out of scope for a TP2.0-focused PR):
-  the real fix is auditing every `enforce_discovery_capability_*`/`discovery_device_info_with_open_device`-touching
-  test in this file and adding the missing `#[serial(discovery_mock_call_counter)]` tags, a
-  same-file mechanical sweep worth its own small PR.
-- **`tests/grpc_mock/tp20.rs::abandoned_entrys_quarantine_releases_even_after_its_owner_cll_is_gone` on Windows CI.** Failed once in
-  the `core (windows-latest)` job of a docs-only change (2026-10-04, 1229 of 1230 `grpc_mock` tests passed): the assertion at
-  `tp20.rs:2368` ("CLL A's own CoptStartcomm should finish ... not hang") timed out. The test waits 3000 ms for a `Finished` status
-  that only arrives after the service's own ~2 s local TP2.0 deadline, so the margin is about 1 s under a loaded runner. The same
-  crate code passed on `main`'s Windows run, and three isolated Linux runs pass in about 3 s. Confirm with
-  `cargo test -p j2534-0404-service --test grpc_mock -- tp20::abandoned_entrys_quarantine_releases_even_after_its_owner_cll_is_gone`
-  repeated, ideally on Windows under full-suite load. Cause not confirmed; check the margin against the ADR-149 guideline in
-  `tests/grpc_mock/harness.rs` before widening it.
-- **`p3_gap::tester_present_reqrsp_due_snapshot_reads_live_not_frozen_resolved` (`tests/grpc_mock/p3_gap.rs`).**
-  Symptom: the assertion that the second due-triggered tester-present send after the
-  `CP_TesterPresentReqRsp` flip arrives within 280 ms fails with a wait just over it (303.8 ms
-  observed) on the `core (windows-latest)` CI job, while the full `grpc_mock` suite runs in
-  parallel. Seen 2026-10-04 on a commit that changed no Rust code; the CI run for the same commit
-  on the `pull_request` event passed. Confirm in isolation with
-  `cargo test -p j2534-0404-service --test grpc_mock -- p3_gap::tester_present_reqrsp_due_snapshot_reads_live_not_frozen_resolved`
-  run several times. Cause not investigated: the fixed 280 ms bound leaves little margin over the
-  scheduled send interval on a loaded Windows runner; the guideline in `tests/grpc_mock/harness.rs`'s
-  module doc (ADR-149) applies.
+- **`tests/grpc_mock/j1939.rs` full-module flakiness (not root-caused, no longer reproduces).** Repeated full-module runs
+  (`cargo test -p j2534-0404-service --test grpc_mock -- j1939::`) used to fail a different, seemingly unrelated test about 1 run in 3
+  (observed: `optional_startcomm_message_sends_with_the_claimed_source_address`,
+  `repeat_slot_stop_condition_wildcards_pgn_and_destination_exact_matches_source_address`,
+  `cancelling_the_optional_startcomm_message_after_a_successful_claim_stops_its_own_repeat_slots`,
+  `coptupdateparam_rejects_tester_source_address_off_the_live_claim`), each passing on rerun and in isolation. That was with 47 tests,
+  before ADR-195 made the test config path per-process. On the current tree (79 tests) 18 consecutive full-module runs passed on Linux,
+  12 of them with three CPU-bound busy loops running alongside, and 8 more passed as 4 rounds of two processes running the module at
+  the same time. A varying failing test fits the cross-process config race ADR-195 fixed (two `cargo test` processes started at
+  once), but that is not confirmed. Delete this entry if it does not recur; if it does, record the failing test and whether another
+  test process was running.
 
 See "Resolved" below for this list's history.
 
@@ -360,6 +303,7 @@ production race exists — each test's flakiness was a test-side defect:
   dependence found and removed (ADR-149), as was done for the StopComm queue tests that held the
   queue with a `CoptDelay` on their own CLL. Done when the Windows job runs
   tests in parallel and is green.
+- **P2**: `j2534-0404-service` lib tests set process-global error injections in the dynamically-loaded mock (`__mock_set_stop_periodic_message_error` in `src/service/rpc_misc.rs`, `rpc_module.rs`, `rpc_primitive.rs`; `__mock_set_stop_filter_error`; `__mock_set_stop_repeat_message_error`). Under `cargo test` (several test threads, one process) any untagged test that issues the same native call while one of these is armed gets the injected error. The setters of `stop_periodic_message_error` share `#[serial(tp20_stop_periodic_call_counter)]`, but nothing keeps untagged callers of `PassThruStopPeriodicMsg` out of that window; the other two setters were not audited. Not observed failing (13 parallel `--test-threads=16` lib runs passed); found while fixing the exact-delta call-counter flakes, which moved to the mock's per-thread counters (`j2534-0404-mock/docs/testing-guide.md`, "Call Counters"). nextest (CI) runs each test in its own process and is unaffected. Likely fix: make the injections per-thread like those counters, after checking that every setter's native call runs on the setting test's thread. Done when: no lib test can observe another test's injected error, and the serial group is renamed or removed to match what it still protects.
 - **P3** (`design-advisor` audit, ADR-222 round 4, PR #141 — pre-existing, not introduced or
   worsened by that ADR): if a dual-channel-mode CLL's own ADR-046 companion channel fails to open
   (or the FD-under-DualChannel case), `LogicalLinkState::uudt_channel_id` stays `None` while

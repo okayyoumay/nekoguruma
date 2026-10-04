@@ -66,6 +66,15 @@
 //!   meaningfully below the interval's un-overridden default, so a
 //!   regression where the override silently didn't take effect is still
 //!   caught rather than passing inside a too-generous window.
+//! - **A live ComParam change must land before the poll task blocks.**
+//!   The per-channel poll task both sends tester-present and executes
+//!   queued COPs such as `CoptUpdateparam`, and it does not execute them
+//!   while it sits in a P3 gap wait. A test that changes a ComParam between
+//!   two periodic sends and asserts on how the next send behaves needs the
+//!   change (all of its round trips) to fit, with the margin above, inside
+//!   the interval before the next send falls due. Otherwise the change is
+//!   applied one send late and the assertion fails by exactly the gap. Size
+//!   the interval for the round trips, then size the gap above it.
 //!
 //! ## A sixth, distinct flaky-test cause: shared startup state, not timing
 //!

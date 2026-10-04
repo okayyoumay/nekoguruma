@@ -3044,6 +3044,7 @@ exported_fn!(PassThruStartPeriodicMsg(
 exported_fn!(PassThruStopPeriodicMsg(channel_id: u32, msg_id: u32) -> c_long {
     let mut guard = state().lock().expect("mock state poisoned");
     guard.counters.stop_periodic += 1;
+    THREAD_COUNTERS.with(|c| c.stop_periodic.set(c.stop_periodic.get() + 1));
     // Error injection (`__mock_set_stop_periodic_message_error`): checked
     // before the real `channel.periodic_msgs.remove(...)` below, mirroring
     // `stop_repeat_message_error`'s identical convention -- a forced failure
@@ -3747,6 +3748,7 @@ exported_fn!(PassThruIoctl(
             || x == IOCTL_CLEAR_FUNCT_MSG_LOOKUP_TABLE => {
             if x == IOCTL_CLEAR_TX_BUFFER {
                 state().lock().expect("mock state poisoned").counters.clear_tx_buffer += 1;
+                THREAD_COUNTERS.with(|c| c.clear_tx_buffer.set(c.clear_tx_buffer.get() + 1));
             }
             if x == IOCTL_CLEAR_PERIODIC_MSGS {
                 let mut guard = state().lock().expect("mock state poisoned");
@@ -3841,6 +3843,7 @@ exported_fn!(PassThruIoctl(
                 .expect("mock state poisoned")
                 .counters
                 .get_device_info += 1;
+            THREAD_COUNTERS.with(|c| c.get_device_info.set(c.get_device_info.get() + 1));
             let params = unsafe {
                 std::slice::from_raw_parts_mut(list.ParamPtr, list.NumOfParams as usize)
             };
@@ -5827,6 +5830,46 @@ exported_fn!(__mock_get_fast_init_count() -> usize {
 
 exported_fn!(__mock_get_get_device_info_count() -> usize {
     state().lock().expect("mock state poisoned").counters.get_device_info
+});
+
+/// Per-thread twins of a few `MockState::counters` fields. Each counts only
+/// the calls made on the calling thread, and `__mock_reset` does not clear
+/// them. The process-wide counters are shared by every test in a process,
+/// so a test that asserts an exact before/after delta on one sees other
+/// tests' calls whenever they run in parallel (`cargo test`). A test that
+/// issues its native calls on its own thread (a current-thread
+/// `#[tokio::test]` driving the service directly) reads these instead, via
+/// the `__mock_get_*_count_on_current_thread` exports.
+#[derive(Default)]
+struct ThreadCounters {
+    get_device_info: std::cell::Cell<usize>,
+    stop_periodic: std::cell::Cell<usize>,
+    clear_tx_buffer: std::cell::Cell<usize>,
+}
+
+thread_local! {
+    static THREAD_COUNTERS: ThreadCounters = ThreadCounters::default();
+}
+
+exported_fn!(
+    /// `IOCTL_GET_DEVICE_INFO` calls made on the calling thread. See
+    /// `ThreadCounters`.
+    __mock_get_get_device_info_count_on_current_thread() -> usize {
+    THREAD_COUNTERS.with(|c| c.get_device_info.get())
+});
+
+exported_fn!(
+    /// `PassThruStopPeriodicMsg` calls made on the calling thread. See
+    /// `ThreadCounters`.
+    __mock_get_stop_periodic_count_on_current_thread() -> usize {
+    THREAD_COUNTERS.with(|c| c.stop_periodic.get())
+});
+
+exported_fn!(
+    /// `PassThruIoctl(CLEAR_TX_BUFFER)` calls made on the calling thread.
+    /// See `ThreadCounters`.
+    __mock_get_clear_tx_buffer_count_on_current_thread() -> usize {
+    THREAD_COUNTERS.with(|c| c.clear_tx_buffer.get())
 });
 
 exported_fn!(__mock_get_get_protocol_info_count() -> usize {

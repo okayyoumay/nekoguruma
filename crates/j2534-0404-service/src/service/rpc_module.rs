@@ -1240,24 +1240,26 @@ mod tests {
         }
     }
 
-    /// Process-global count of every `PassThruStopPeriodicMsg` call made so
-    /// far, on any channel -- incremented unconditionally by the mock before
+    /// Count of the `PassThruStopPeriodicMsg` calls made so far on this
+    /// thread, on any channel -- incremented unconditionally by the mock before
     /// it even checks whether `channel_id` is a channel it actually knows
     /// about (`j2534-0404-mock/src/lib.rs`'s own `PassThruStopPeriodicMsg`),
     /// so it is a faithful "was this native call actually issued" signal
     /// even against this file's fabricated `RMD_CHANNEL_ID` (never registered
-    /// with the mock via a real `PassThruConnect`). Needs the same
-    /// `#[serial(tp20_stop_periodic_call_counter)]` group every other user of
-    /// this counter across the crate already joins, since it is one shared
-    /// process-global value.
+    /// with the mock via a real `PassThruConnect`). Per-thread rather than
+    /// the mock's process-wide count, so other tests running in parallel
+    /// cannot move it (see `discovery.rs::tests::get_device_info_call_count`).
+    /// The tests that read it stay in the `#[serial(tp20_stop_periodic_call_counter)]`
+    /// group because that group also serializes the process-global
+    /// `__mock_set_stop_periodic_message_error` injection.
     fn stop_periodic_call_count() -> usize {
         let lib_path = j2534_0404_mock::mock_library_path().expect("mock cdylib should be built");
         unsafe {
             let lib = j2534_0404_sys::libloading::Library::new(&lib_path)
                 .expect("mock library should be loadable");
             let f: j2534_0404_sys::libloading::Symbol<unsafe extern "system" fn() -> usize> = lib
-                .get(b"__mock_get_stop_periodic_count\0")
-                .expect("__mock_get_stop_periodic_count should be exported");
+                .get(b"__mock_get_stop_periodic_count_on_current_thread\0")
+                .expect("__mock_get_stop_periodic_count_on_current_thread should be exported");
             f()
         }
     }

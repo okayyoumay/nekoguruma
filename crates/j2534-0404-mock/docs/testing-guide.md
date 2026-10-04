@@ -167,6 +167,18 @@ All back-door functions are exported with C ABI using the `__mock_` prefix. They
 | `__mock_get_get_device_info_count()` | Number of `IOCTL_GET_DEVICE_INFO` calls (ADR-153) |
 | `__mock_get_get_protocol_info_count()` | Number of `IOCTL_GET_PROTOCOL_INFO` calls, including calls rejected with `ERR_INVALID_PROTOCOL_ID` (ADR-153) |
 
+These counters are process-wide: every test in a process shares them, so a test that asserts an exact
+before/after delta sees other tests' calls when tests run in parallel (`cargo test` runs a binary's tests on
+several threads). For that case three calls also have a per-thread counter, which counts only the calls made on
+the calling thread and is not cleared by `__mock_reset`. A current-thread `#[tokio::test]` that drives the
+service directly makes its native calls on its own thread, so its delta on these is exact:
+
+| Function | Description |
+|----------|-------------|
+| `__mock_get_get_device_info_count_on_current_thread()` | `IOCTL_GET_DEVICE_INFO` calls made on the calling thread |
+| `__mock_get_stop_periodic_count_on_current_thread()` | `PassThruStopPeriodicMsg` calls made on the calling thread |
+| `__mock_get_clear_tx_buffer_count_on_current_thread()` | `PassThruIoctl(CLEAR_TX_BUFFER)` calls made on the calling thread |
+
 ### Connect-Flags Log Inspection
 
 The `Flags` argument of every successful `PassThruConnect` is recorded in call

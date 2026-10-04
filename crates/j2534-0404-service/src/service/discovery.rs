@@ -830,28 +830,34 @@ mod tests {
     use std::sync::Arc;
 
     use j2534_0404_sys::libloading::{Library, Symbol};
-    use serial_test::serial;
     use tokio::sync::Mutex;
 
-    /// Reads `IOCTL_GET_DEVICE_INFO`'s call counter through a fresh
-    /// `libloading::Library` handle, not the safe `j2534_0404_mock::
-    /// mock_get_get_device_info_count()` helper: that helper reads the
-    /// *caller's own statically-linked* copy of `MockState`, a different
+    /// Reads the mock's count of `IOCTL_GET_DEVICE_INFO` calls made on the
+    /// current thread, through a fresh `libloading::Library` handle rather
+    /// than a safe `j2534_0404_mock::mock_get_*` helper: those helpers read
+    /// the *caller's own statically-linked* copy of `MockState`, a different
     /// instance from the one the dynamically-loaded `.so` `service.api`
     /// actually mutates (`j2534-0404-mock/docs/testing-guide.md`'s "Loading
-    /// the Mock in Tests" section) -- confirmed the hard way, by every
-    /// counter-based assertion below reading a stuck `0` before this fix.
-    /// Loading the identical file path again resolves to the same shared
-    /// object (same section), so this observes what `service.api`'s calls
-    /// actually mutated. Mirrors `tests/grpc_mock/harness.rs`'s
-    /// `MockBackdoor::open_count`.
+    /// the Mock in Tests" section). Loading the identical file path again
+    /// resolves to the same shared object, so this observes what
+    /// `service.api`'s calls actually did. Mirrors
+    /// `tests/grpc_mock/harness.rs`'s `MockBackdoor::open_count`.
+    ///
+    /// Per-thread, not the process-wide `__mock_get_get_device_info_count`:
+    /// every `#[tokio::test]` here runs on its own current-thread runtime,
+    /// so its native calls happen on its own thread. A process-wide count
+    /// also moved whenever any other test in this binary that reaches
+    /// `GET_DEVICE_INFO` (through `enforce_discovery_capability`,
+    /// `check_chx_capacity` or an RPC handler) ran in parallel, which broke
+    /// the exact before/after deltas below under `cargo test`. Delta-measured
+    /// all the same, since earlier tests may have run on a reused thread.
     fn get_device_info_call_count() -> usize {
         let lib_path = j2534_0404_mock::mock_library_path().expect("mock cdylib should be built");
         unsafe {
             let lib = Library::new(&lib_path).expect("mock library should be loadable");
             let f: Symbol<unsafe extern "system" fn() -> usize> = lib
-                .get(b"__mock_get_get_device_info_count\0")
-                .expect("__mock_get_get_device_info_count should be exported");
+                .get(b"__mock_get_get_device_info_count_on_current_thread\0")
+                .expect("__mock_get_get_device_info_count_on_current_thread should be exported");
             f()
         }
     }
@@ -951,13 +957,7 @@ mod tests {
         );
     }
 
-    // `#[serial]`: this test issues a real `GET_DEVICE_INFO` native call
-    // (opted-in module), incrementing the same process-global mock counter
-    // the tests below read via `get_device_info_call_count()`; running it
-    // concurrently with one of those could land its call inside the other's
-    // before/after window (Codex review on PR #25).
     #[tokio::test]
-    #[serial(discovery_mock_call_counter)]
     async fn device_info_reports_supported_for_a_base_protocol() {
         let service = service_with_pname(Some("J2534-2:mock")).await;
         let result = service
@@ -978,9 +978,6 @@ mod tests {
         assert_eq!(result.value, 0x0004_0001);
     }
 
-    // `#[serial]`: same rationale as `device_info_reports_supported_for_a_base_protocol`
-    // above (Codex review on PR #25).
-    //
     // Was keyed on `DEVICE_INFO_J1939_SUPPORTED` until the mechanical
     // extension of ADR-211's/ADR-212's established pattern
     // (`j2534-0404-mock`'s `IOCTL_GET_DEVICE_INFO` handler gaining a J1939
@@ -993,7 +990,6 @@ mod tests {
     // arm in the mock's handler answers it, so it still falls through to
     // the handler's own `_ => Supported = 0` default).
     #[tokio::test]
-    #[serial(discovery_mock_call_counter)]
     async fn device_info_reports_not_supported_for_a_j2534_2_only_capability() {
         let service = service_with_pname(Some("J2534-2:mock")).await;
         let result = service
@@ -1029,7 +1025,6 @@ mod tests {
     /// reported unsupported, same as pin 0 on the real
     /// `IOCTL_READ_J1962PIN_VOLTAGE` handler.
     #[tokio::test]
-    #[serial(discovery_mock_call_counter)]
     async fn device_info_reports_supported_for_j1962_pin_voltage_read() {
         let service = service_with_pname(Some("J2534-2:mock")).await;
         let supported = service
@@ -1095,7 +1090,6 @@ mod tests {
     /// on the SAE J1962 connector, in addition to pin 15's pre-existing
     /// J2534-1-era support. Bit 0 = pin 1, so pin 9's bit is bit 8.
     #[tokio::test]
-    #[serial(discovery_mock_call_counter)]
     async fn device_info_reports_supported_for_short_to_gnd_j1962_pin_9() {
         let service = service_with_pname(Some("J2534-2:mock")).await;
         let input_value = 1u32 << 8;
@@ -1116,7 +1110,6 @@ mod tests {
     /// Same as `device_info_reports_supported_for_short_to_gnd_j1962_pin_9`,
     /// for pin 15 (bit 14) -- the pre-existing J2534-1-era pin.
     #[tokio::test]
-    #[serial(discovery_mock_call_counter)]
     async fn device_info_reports_supported_for_short_to_gnd_j1962_pin_15() {
         let service = service_with_pname(Some("J2534-2:mock")).await;
         let input_value = 1u32 << 14;
@@ -1134,7 +1127,6 @@ mod tests {
     /// A pin other than 9 or 15 (pin 1, bit 0) must not be reported
     /// supported for short-to-ground on the SAE J1962 connector.
     #[tokio::test]
-    #[serial(discovery_mock_call_counter)]
     async fn device_info_reports_not_supported_for_short_to_gnd_j1962_other_pin() {
         let service = service_with_pname(Some("J2534-2:mock")).await;
         let input_value = 1u32;
@@ -1152,7 +1144,6 @@ mod tests {
     /// No bit set is not a valid single-pin selector and must not be
     /// reported supported.
     #[tokio::test]
-    #[serial(discovery_mock_call_counter)]
     async fn device_info_reports_not_supported_for_short_to_gnd_j1962_zero_bits() {
         let service = service_with_pname(Some("J2534-2:mock")).await;
         let result = raw_device_info_query(
@@ -1171,7 +1162,6 @@ mod tests {
     /// independently supported -- the query is answering "is THIS pin
     /// supported", not "is any bit in this bitmap a supported pin".
     #[tokio::test]
-    #[serial(discovery_mock_call_counter)]
     async fn device_info_reports_not_supported_for_short_to_gnd_j1962_multiple_bits() {
         let service = service_with_pname(Some("J2534-2:mock")).await;
         let input_value = (1u32 << 8) | (1u32 << 14);
@@ -1191,7 +1181,6 @@ mod tests {
     /// in the HIGH nibble-pair (`0xHHHHLLLL`), so pin 9's bit is bit 24
     /// (`16 + 8`).
     #[tokio::test]
-    #[serial(discovery_mock_call_counter)]
     async fn device_info_reports_supported_for_pgm_voltage_j1962_pin_9() {
         let service = service_with_pname(Some("J2534-2:mock")).await;
         let input_value = 1u32 << (16 + 8);
@@ -1209,7 +1198,6 @@ mod tests {
     /// Same as `device_info_reports_supported_for_pgm_voltage_j1962_pin_9`,
     /// for pin 15 (bit 30, `16 + 14`) -- the pre-existing J2534-1-era pin.
     #[tokio::test]
-    #[serial(discovery_mock_call_counter)]
     async fn device_info_reports_supported_for_pgm_voltage_j1962_pin_15() {
         let service = service_with_pname(Some("J2534-2:mock")).await;
         let input_value = 1u32 << (16 + 14);
@@ -1227,7 +1215,6 @@ mod tests {
     /// A pin other than 9 or 15 (pin 1, bit 16) must not be reported
     /// supported for programming voltage on the SAE J1962 connector.
     #[tokio::test]
-    #[serial(discovery_mock_call_counter)]
     async fn device_info_reports_not_supported_for_pgm_voltage_j1962_other_pin() {
         let service = service_with_pname(Some("J2534-2:mock")).await;
         let input_value = 1u32 << 16;
@@ -1242,21 +1229,12 @@ mod tests {
         assert_eq!(result.value, input_value);
     }
 
-    // `#[serial]`: shared with `device_epoch_bump_invalidates_a_stale_cache_entry`
-    // below -- both read `get_device_info_call_count()`, a process-global
-    // counter in the dynamically-loaded mock `.so` (shared across every test
-    // in this binary that loads the same path). Running them concurrently
-    // could have one test's native call land between the other's `before`/
-    // `after` reads, producing a spurious failure unrelated to either test's
-    // own logic (mirrors `events.rs`'s `module_clock_reset_tests` rationale).
     #[tokio::test]
-    #[serial(discovery_mock_call_counter)]
     async fn device_info_cache_hit_avoids_a_second_native_call() {
         let service = service_with_pname(Some("J2534-2:mock")).await;
         let parameter = j2534_0404_sys::bindings::DEVICE_INFO_CAN_SUPPORTED;
-        // Delta-measured against the mock's call counter, not an absolute
-        // value: `MockState` is a process-global singleton shared by every
-        // test in this binary. The counter is the only reliable proof that
+        // Delta-measured against the mock's per-thread call counter (see
+        // `get_device_info_call_count`). The counter is the only reliable proof that
         // a "hit" really skipped the native call -- closing the device (the
         // previous approach) doesn't work, since `ensure_open_device_for`
         // lazily reopens rather than failing on a closed/absent device
@@ -1293,12 +1271,7 @@ mod tests {
     /// miss). With `module_handle` in the key, module 1's cached entry is
     /// simply invisible to a module-2 lookup, so the miss path runs and
     /// correctly rejects instead.
-    ///
-    /// `#[serial]`: the module-1 lookup below issues a real `GET_DEVICE_INFO`
-    /// call against the same process-global mock counter the exact-delta
-    /// cache tests read (Codex review, round 2 on PR #25).
     #[tokio::test]
-    #[serial(discovery_mock_call_counter)]
     async fn device_info_cache_does_not_leak_across_modules() {
         let service = service_with_modules(vec![Some("J2534-2:one"), Some("J2534-2:two")]).await;
         let parameter = j2534_0404_sys::bindings::DEVICE_INFO_CAN_SUPPORTED;
@@ -1324,7 +1297,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial(discovery_mock_call_counter)]
     async fn device_epoch_bump_invalidates_a_stale_cache_entry() {
         let service = service_with_pname(Some("J2534-2:mock")).await;
         let parameter = j2534_0404_sys::bindings::DEVICE_INFO_CAN_SUPPORTED;

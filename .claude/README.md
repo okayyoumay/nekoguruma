@@ -125,7 +125,9 @@ prompts) and the repository check scripts (`check-work-refs.sh`, `check-adr-inde
 prompts.
 
 `ask` rules make force pushes and `git reset --hard` prompt even in auto mode, and `deny` rules
-keep `.env` files and private keys (`*.pem`, `*.key`) out of Claude's reads. Personal
+keep `.env` files and private keys (`*.pem`, `*.key`) out of Claude's reads. `target/` is
+denied too: build output is large and never the source of truth, and the read tools (`Read`,
+`Grep`, `Glob`) would otherwise pull it into context. Personal
 overrides go in `.claude/settings.local.json` (gitignored).
 
 Hooks:

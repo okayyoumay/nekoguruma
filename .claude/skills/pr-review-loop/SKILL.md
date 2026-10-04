@@ -24,6 +24,11 @@ PR, and after every fix push, post a top-level PR comment whose whole body is `@
 Codex reacts 👀 on the trigger comment when it starts, then posts a review with inline comments,
 or reacts 👍 when it has nothing to report.
 
+A review wakes the session as a PR event; a reaction does not. So right after posting the
+trigger, schedule a one-shot check-in about 15 minutes later (`send_later`) and delete it if a
+review arrives first. At the check-in, read the trigger comment's reactions (Step 1) to see
+whether Codex reacted 👍 (a clean round) or never started (below).
+
 **Codex not available.** If the trigger comment still has no 👀 and no review 15 minutes after
 it was posted (and after CI on that commit has finished, whichever is later; a PR that skips
 `ci.yml` finishes CI in seconds, so the time limit is what counts there), Codex is not enabled
@@ -42,12 +47,19 @@ everything:
 
 ```
 pull_request_read(method="get_review_comments", owner, repo, pullNumber, perPage=100)
-pull_request_read(method="get_reviews", owner, repo, pullNumber)
+pull_request_read(method="get_reviews", owner, repo, pullNumber, perPage=100)
+pull_request_read(method="get_comments", owner, repo, pullNumber, perPage=100)
 ```
 
 - **All pages.** `get_review_comments` returns at most 100 threads per call. While its
   `pageInfo.hasNextPage` is true, call it again with `after` set to `pageInfo.endCursor`; the
-  current round's findings can be on a later page.
+  current round's findings can be on a later page. `get_reviews` and `get_comments` page by
+  number (their default page size is 30): ask for 100 and read the next `page` while a page
+  comes back full.
+- **Trigger reactions.** `get_comments` returns the top-level comments with their reaction
+  counts, which is where Codex's 👀 and 👍 on the latest `@codex review` comment show up. The
+  counts carry no user names; nobody else reacts on Claude's own trigger comments, so a 👍 there
+  is Codex's. If a human did react on it, post a fresh trigger instead of guessing.
 - **Which commit a thread reviews.** Threads carry no commit SHA. Reviews do (`commit_id`), and a
   Codex review's inline comments are created at the same moment the review is submitted. Match
   each thread's first comment `created_at` to a review's `submitted_at` to learn the commit it
@@ -115,6 +127,9 @@ the replies and the re-request in Step 4.
 - React on the finding's comment: 👍 when fixed (2a, 2b), 👎 when accepted as a limitation or
   declined (2c, 2d).
 - Every reply ends with the attribution footer GitHub posts from Claude carry.
+- Never write `@codex` in a thread reply, not even quoted in backticks: Codex treats it as a
+  task request on that thread and answers with a setup notice instead of a review. Refer to
+  "the re-request" or "the trigger comment" instead. Such a notice needs no answer.
 - Only after every thread of the round has its reply, post `@codex review` as its own comment
   (Step 0), then go back to Step 1.
 

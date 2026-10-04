@@ -31,7 +31,8 @@ for this repository (it is switched on per
 repository in the Codex settings on chatgpt.com, which only Yoko can do). Say so once in the
 thread, do not post the trigger again on this PR, and run the fallback review instead:
 `edge-case-hunter` on the whole PR diff (`git diff origin/main...HEAD`), whatever the diff's
-size. Route its findings with the same guide, then go to Step 5.
+size. Route its findings with the same guide and take any fix through Steps 3 and 4 (verify,
+commit, push, reply), leaving out the `@codex review` re-request; then go to Step 5.
 
 ## Step 1: find out what the review found
 
@@ -58,9 +59,13 @@ pull_request_read(method="get_reviews", owner, repo, pullNumber)
   and worded differently. Match findings by their claim, not by location or wording. A finding
   already fixed, accepted or declined gets a reply pointing at the earlier answer, not a new
   investigation.
-- **Clean round** means: Codex reacted 👍 or its review says it found no major issues, *and*
-  there is no new inline thread on the current head commit. A "Reviewed commit: …" summary with
-  no approving words is not clean; check the threads.
+- **Clean round** means: the clean signal is about the current head, *and* there is no new
+  inline thread on the current head commit. The signal is either Codex's 👍 on the
+  `@codex review` comment posted after the latest push (a 👍 on an earlier trigger comment
+  belongs to an earlier head), or a Codex review whose `commit_id` is the current head and that
+  says it found no major issues. An older head's clean signal never counts, even while the new
+  review has not arrived yet. A "Reviewed commit: …" summary with no approving words is not
+  clean; check the threads.
 
 ## Step 2: route each new finding
 
@@ -140,10 +145,14 @@ When a round is clean (or the fallback review in Step 0 is done):
    count after a later qualifying fix. If this step edits a file, go back through Steps 3 and 4.
 2. **Resolve the threads** that were fixed, accepted or declined (`resolve_review_thread`, with
    the thread `id` from `get_review_comments`). Codex never resolves its own threads.
-3. **Hand over.** Mark the PR ready for review and tell Yoko in the project thread that it is
+3. **CI on the current head.** Wait for the check runs of the commit you are handing over and
+   require them to pass (`get_check_runs`); the local checks in Step 3 do not cover the Windows
+   tests or the worker targets. A PR that skips `ci.yml` (see "CI facts") needs only
+   `repo-checks` to pass. A red run sends you back to fixing it per CLAUDE.md.
+4. **Hand over.** Mark the PR ready for review and tell Yoko in the project thread that it is
    ready, listing anything accepted as a limitation and anything added to the backlog. Yoko
    reviews and merges; do not merge. Stay subscribed to the PR until it is merged or closed.
-4. If one ADR was amended three or more times in the loop, mention that rewriting its Decision
+5. If one ADR was amended three or more times in the loop, mention that rewriting its Decision
    section in one piece may now read better than the appended amendments.
 
 ## When the loop itself has a gap

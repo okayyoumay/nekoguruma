@@ -146,6 +146,11 @@ run on main. Pull requests that change only documentation, `work/` or `.claude/`
 `repo-checks.yml` always runs. Do not run cross-target builds locally unless asked; CI covers
 them.
 
+Compiler warnings fail CI: `core-linux`, `core-windows` and `worker-check` build with
+`RUSTFLAGS=-D warnings`, and `core-linux` runs `cargo fmt --check`. Silence a warning for code that
+is unused only until later work lands with `#[expect(..., reason = "...")]`, not `#[allow]`, so
+the attribute fails the build once the code is used and gets removed.
+
 ## Pull requests
 
 1. Work on the branch you were given; open the pull request as a draft and fill in

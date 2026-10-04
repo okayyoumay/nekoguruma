@@ -26,9 +26,11 @@ or reacts 👍 when it has nothing to report.
 
 A review wakes the session as a PR event; a reaction does not. So right after posting the
 trigger, schedule a one-shot check-in about 15 minutes later (`send_later`). Keep it even when a
-review arrives first: inline comments can land after the summary, so a round is judged clean
-only from a read at least five minutes after the review was submitted (reschedule the check-in
-to that point if it would fire sooner). At the check-in, read the trigger comment's reactions (Step 1) to see
+review arrives first: inline comments can land after the summary, so a round is settled only
+by a read at least five minutes after its review was submitted (reschedule the check-in to that
+point if it would fire sooner). You may start investigating findings earlier, but both the
+round's push and a clean verdict wait for that settled read, so late findings join the same
+round. At the check-in, read the trigger comment's reactions (Step 1) to see
 whether Codex reacted 👍 (a clean round) or never started (below).
 
 **Codex not available.** If the trigger comment still has no 👀 and no review 15 minutes after
@@ -38,8 +40,10 @@ for this repository (it is switched on per
 repository in the Codex settings on chatgpt.com, which only Yoko can do). Say so once in the
 thread, do not post the trigger again on this PR, and run the fallback review instead:
 `edge-case-hunter` on the whole PR diff (`git diff origin/main...HEAD`), whatever the diff's
-size. Route its findings with the same guide and take any fix through Steps 3 and 4 (verify,
-commit, push, reply), leaving out the `@codex review` re-request; then go to Step 5.
+size. Route its findings with the same guide and take any fix through Step 3 and the commit and
+push of Step 4. These findings have no review threads, so skip the per-thread replies, reactions
+and the re-request; instead post one PR comment listing each finding, its route and the commit
+that fixed it (or the ADR or backlog item for 2c, the trace for 2d). Then go to Step 5.
 
 ## Step 1: find out what the review found
 

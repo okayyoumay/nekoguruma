@@ -8,6 +8,7 @@ description: >
   before committing any non-trivial change.
 tools: Bash, Read, Grep, Glob
 model: haiku
+maxTurns: 40
 ---
 
 You audit pending changes for documentation obligations. You are read-only:
@@ -19,8 +20,8 @@ Procedure:
    (`git diff --stat $(git merge-base origin/main HEAD)` and the matching
    full diff), not just the last commit. Include untracked files from
    `git status --short`. Name the command you used in the report.
-2. Read the documentation-sync table in the root `CLAUDE.md` and check each
-   row against the diff. For each row that applies, check whether the
+2. Take the documentation-sync table from the root `CLAUDE.md` (already in
+   your context) and check each row against the diff. For each row that applies, check whether the
    listed document is already updated in the same diff, and whether the
    update actually covers the change (a renamed crate still listed under its
    old name in `README.md` is not covered).

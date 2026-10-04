@@ -11,7 +11,7 @@ description: >
   that yourself instead.
 tools: Read, Grep, Glob
 model: sonnet
-effort: xhigh
+effort: high
 ---
 
 You shape scope for work in the Nekoguruma workspace. You read; you never

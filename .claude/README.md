@@ -19,13 +19,21 @@ so a top-tier session model adds cost rather than capability unless the user ask
 | `code-scout` | haiku | read-only | Fan-out searches across many crates or docs; returns conclusions and `path:line`, never file dumps |
 | `cargo-runner` | haiku | Bash + read-only | Builds, tests, clippy and fmt with long output; returns a compact pass/fail summary. Never edits files |
 | `doc-sync-checker` | haiku | Bash (git read) + read-only | Pre-commit audit of the diff against CLAUDE.md's documentation-sync table, the `work/` rule and the spec copyright rule |
-| `scope-shaper` | sonnet (xhigh) | read-only | Turns a fuzzy or oversized request into a minimal scope with acceptance criteria |
-| `implementer` | sonnet (high) | Bash + edit | Code, tests and doc edits from a distilled brief |
+| `scope-shaper` | sonnet (high) | read-only | Turns a fuzzy or oversized request into a minimal scope with acceptance criteria |
+| `implementer` | sonnet (medium) | Bash + edit | Code, tests and doc edits from a distilled brief |
 | `edge-case-hunter` | sonnet (xhigh) | Bash + read-only | Verification pass before commit: boundaries, error paths, concurrency, protocol corner cases, interruption/resume, missing tests |
 | `design-advisor` | fable (high) | Bash (git read) + read-only | Escalation for decisions that are expensive to get wrong |
 
-Haiku agents carry no `effort` key (unsupported on that tier). `design-advisor` pins
-`effort: high` so a session-level override cannot push the costliest path higher.
+Haiku agents carry no `effort` key (unsupported on that tier). On Sonnet, `medium` is the
+model's default and fits implementation from a distilled brief; `high` and `xhigh` are kept for
+the two judgment passes (scoping, edge-case hunting), where depth is what the call pays for.
+`design-advisor` pins `effort: high` so a session-level override cannot push the costliest path
+higher.
+
+Custom agents load `CLAUDE.md` into their context at every spawn. `code-scout` and
+`cargo-runner` set `omitClaudeMd: true`, since their prompts carry everything they need and
+they are spawned most often. The three Haiku agents set `maxTurns` as a guard against a
+runaway search or polling loop; an agent that reaches it returns a partial report.
 
 ## Task size decides the pipeline
 
@@ -61,6 +69,9 @@ delegated (the final commit and push) or a single targeted read to check an agen
 ## Working rules
 
 - **Batch, don't re-spawn.** Put related sub-questions into one agent call.
+- **Resume for follow-ups.** A follow-up question to an agent that already did the reading
+  goes to that agent with `SendMessage`: it keeps its context and prompt cache, where a new
+  spawn re-reads everything. (Built-in `Explore` and `Plan` cannot be resumed.)
 - **Bounded replies.** Every agent caps its report size; raw logs and file bodies stay out of the
   main conversation.
 - **No speculative expensive builds.** Cross-target builds, `--features bindgen` and full
@@ -69,6 +80,22 @@ delegated (the final commit and push) or a single targeted read to check an agen
 - **Check agent claims.** A claim that decides the outcome (a test passed, a file has no other
   callers, the spec requires X) is checked with one targeted read or command before it is
   relied on.
+
+## Built-in agents
+
+Claude Code also offers built-in agents. They are not pinned by this configuration, so route
+around the expensive ones:
+
+- **`Explore`** runs on the session model (Opus by default). For read-only searches, use
+  `code-scout` (Haiku) instead; use `Explore` only when the user asks for it.
+- **`Plan`, `general-purpose` and `claude`** use `CLAUDE_CODE_SUBAGENT_MODEL`, which
+  `settings.json` sets to `sonnet`. Prefer a project agent when one fits the task.
+- Forks (`/subtask`) inherit the session model and history. They reuse the parent's prompt
+  cache, so they suit a short side task that needs the conversation's context; for anything
+  that a brief can describe, a pinned agent is cheaper.
+
+The project agents' `model:` keys take precedence over the environment variable, so the
+pipeline above is unchanged by it.
 
 ## Skills
 
@@ -84,10 +111,14 @@ Project skills live in `.claude/skills/`:
 
 Skills run in the main conversation at the session model. Where an agent covers the same ground
 (build/test sweeps, doc-sync audits, verification), prefer the agent.
+A skill that only reads a lot and reports a short result runs forked instead (`context: fork`
+with a pinned `model`): `next-task` reads the whole backlog in a read-only Sonnet fork, so the
+backlog files never enter the main conversation.
 
 ## Permissions and hooks
 
-`settings.json` pre-allows read-only git commands, the standard cargo verbs (check, build, test,
+`settings.json` sets `CLAUDE_CODE_SUBAGENT_MODEL=sonnet` for the unpinned built-in agents (see
+"Built-in agents") and pre-allows read-only git commands, the standard cargo verbs (check, build, test,
 clippy, metadata, tree, and `fmt --check` only; plain `cargo fmt` rewrites sources, so it
 prompts) and the repository check scripts (`check-work-refs.sh`, `check-adr-index.sh`,
 `check-backlog.sh`). Anything that mutates state outside `target/` still

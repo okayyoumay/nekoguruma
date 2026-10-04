@@ -43,7 +43,9 @@ thread, do not post the trigger again on this PR, and run the fallback review in
 size. Route its findings with the same guide and take any fix through Step 3 and the commit and
 push of Step 4. These findings have no review threads, so skip the per-thread replies, reactions
 and the re-request; instead post one PR comment listing each finding, its route and the commit
-that fixed it (or the ADR or backlog item for 2c, the trace for 2d). Then go to Step 5.
+that fixed it (or the ADR or backlog item for 2c, the trace for 2d). If a fix was pushed, run
+the fallback review again on the new head, whatever its size, and repeat until a pass reports no
+new finding. Then go to Step 5.
 
 **Codex started but never finished.** If the trigger comment has 👀 but neither 👍 nor a review
 at the check-in, schedule one more check-in 15 minutes later. If that one still finds no result,
@@ -112,8 +114,9 @@ Handle **every** finding of the round before pushing; one push per round, never 
 finding. A round where every finding was declined (2d) or answered by pointing at an earlier
 reply changes no file: skip checks 1 to 4 below and the push (still do check 5, the base), never make an empty commit, and go straight to
 the replies in Step 4. Re-request a review of the unchanged head only if the round contained a
-newly declined finding; a round whose findings were all answered earlier ends the loop, so go
-to Step 5 after the replies. Never re-request the same head twice.
+newly declined finding *and* this head has not been re-requested after a no-change round
+before. Otherwise the loop ends: go to Step 5 after the replies. So the same head is
+re-requested at most once.
 
 1. Run what CLAUDE.md's "Building and testing" lists, delegated to `cargo-runner` when the output
    is long. Run the whole changed crate (`cargo test -p <crate>` runs unit and integration

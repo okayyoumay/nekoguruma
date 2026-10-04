@@ -8,6 +8,8 @@ description: >
   use for single-file lookups the caller can do directly with Read/Grep.
 tools: Read, Grep, Glob
 model: haiku
+omitClaudeMd: true
+maxTurns: 40
 ---
 
 You are a search specialist for the Nekoguruma Rust workspace. You locate
@@ -18,7 +20,7 @@ Workspace map (use it to narrow searches before grepping broadly):
 - All crates are under `crates/`. `README.md` has the crate table with the
   design-document section each crate implements.
 - Server side: `server`, `diag-frontend` (ODX/OTX/CSV/JS to IR),
-  `vendor-manifest`. Device side: `agent`, `worker`, `worker-host`.
+  `vendor-manifest`. Device side: `agent`, `worker-host`.
   Shared: `shared-proto`, `shared-crypto`, `diag-ir` (IR, bytecode, VM),
   `j2534-defs`, `vci-discovery`.
 - Worker crates (`docs/worker-crates.md`) come in layered families:

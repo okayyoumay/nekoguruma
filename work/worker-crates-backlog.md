@@ -66,17 +66,21 @@ margin theory — stop widening and instrument instead (see the
 `receive_only_cyclic_reap_gated_by_exhaustive_drain_not_just_a_poll_running`
 entry below for a worked example).
 
-- **`tests/grpc_mock/j1939.rs` full-module flakiness (not root-caused, no longer reproduces).** Repeated full-module runs
-  (`cargo test -p j2534-0404-service --test grpc_mock -- j1939::`) used to fail a different, seemingly unrelated test about 1 run in 3
-  (observed: `optional_startcomm_message_sends_with_the_claimed_source_address`,
+- **`tests/grpc_mock/j1939.rs`: four tests that failed intermittently in full-module runs, cause not found.** Repeated full-module runs
+  (`cargo test -p j2534-0404-service --test grpc_mock -- j1939::`) used to fail a different test about 1 run in 3 (observed:
+  `optional_startcomm_message_sends_with_the_claimed_source_address`,
   `repeat_slot_stop_condition_wildcards_pgn_and_destination_exact_matches_source_address`,
   `cancelling_the_optional_startcomm_message_after_a_successful_claim_stops_its_own_repeat_slots`,
-  `coptupdateparam_rejects_tester_source_address_off_the_live_claim`), each passing on rerun and in isolation. That was with 47 tests,
-  before ADR-195 made the test config path per-process. On the current tree (79 tests) 18 consecutive full-module runs passed on Linux,
-  12 of them with three CPU-bound busy loops running alongside, and 8 more passed as 4 rounds of two processes running the module at
-  the same time. A varying failing test fits the cross-process config race ADR-195 fixed (two `cargo test` processes started at
-  once), but that is not confirmed. Delete this entry if it does not recur; if it does, record the failing test and whether another
-  test process was running.
+  `coptupdateparam_rejects_tester_source_address_off_the_live_claim`), each passing on rerun and in isolation, with 47 tests and
+  before ADR-195 made the test config path per-process. On the current tree (79 tests) 18 consecutive runs passed on Linux, 12 of
+  them under CPU load, plus 8 as two processes running the module at once. Ruled out by reading the code: a backdoor toggle leaking
+  into the next test (`TestServer::try_start_with_extra_config` calls `__mock_reset` first, which resets all of `MockState`), a
+  previous test's poll task outliving it (each `#[tokio::test]` drops its runtime, and with it every spawned task, when the test
+  ends), and a mock repeat worker writing after a reset (it checks `REPEAT_WORKER_EPOCH` under the same state lock `__mock_reset`
+  bumps it under). The one cause found in this file (`claim_retries_the_next_candidate_after_the_first_is_lost` racing the
+  global claim-lost toggle) is fixed and does not explain these four. The cross-process config race ADR-195 fixed fits a varying
+  failing test but is unconfirmed. Delete this entry if it does not recur; if it does, record the failing test, the panic message
+  and whether another test process was running.
 
 See "Resolved" below for this list's history.
 

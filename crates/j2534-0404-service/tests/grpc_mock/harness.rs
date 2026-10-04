@@ -1521,6 +1521,23 @@ impl MockBackdoor {
         }
     }
 
+    /// Makes only the next `count` J1939 claim attempts (on any channel)
+    /// resolve `J1939_ADDRESS_LOST`; later ones claim normally. Unlike
+    /// [`Self::set_j1939_claim_lost`], the test sets this once before the
+    /// claim starts, so "the first candidate loses, the second wins" does not
+    /// depend on the test acting between two candidates (the service issues
+    /// the next one within one poll tick). `0` clears it, as does `reset()`.
+    pub(crate) fn set_j1939_claim_lost_count(&self, count: u32) {
+        unsafe {
+            let f: Symbol<unsafe extern "system" fn(u32) -> c_long> = self
+                .lib
+                .get(b"__mock_set_j1939_claim_lost_count\0")
+                .expect("__mock_set_j1939_claim_lost_count should be exported");
+            let rc = f(count);
+            assert_eq!(rc, NC, "__mock_set_j1939_claim_lost_count should succeed");
+        }
+    }
+
     /// ADR-180 Decision 21 regression coverage (design-advisor consult,
     /// Codex review PR #72): forces every subsequent `IOCTL_PROTECT_J1939_
     /// ADDR` claim attempt (non-cancel form) on every channel to return

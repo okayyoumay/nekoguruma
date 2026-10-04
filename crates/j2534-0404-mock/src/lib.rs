@@ -2291,6 +2291,15 @@ struct MockState {
     /// per-channel/per-address -- this mock's simplest simulation of an
     /// otherwise-real, non-blocking, address-agnostic device response).
     j1939_claim_lost: bool,
+    /// Set via `__mock_set_j1939_claim_lost_count`: the number of upcoming
+    /// `IOCTL_PROTECT_J1939_ADDR` claim attempts (non-cancel form, on a known
+    /// channel, that produce an indication) that resolve
+    /// `J1939_ADDRESS_LOST`. Each such attempt uses up one; at `0` (the
+    /// default after `__mock_reset`) claims behave normally unless
+    /// `j1939_claim_lost` is set. Unlike that global toggle, this makes
+    /// "only the first candidate loses" deterministic: the test sets it
+    /// before the claim starts and never has to race the retry loop.
+    j1939_claim_lost_remaining: u32,
     /// SAE J2534-2 clause 11 GM UART Protocol (ADR-189/Phase 8), set via
     /// `__mock_set_gm_uart_supported`: `true` forces `IOCTL_GET_DEVICE_INFO`'s
     /// `DEVICE_INFO_GM_UART_SUPPORTED` arm to report `Supported = 0` instead
@@ -4496,10 +4505,17 @@ exported_fn!(PassThruIoctl(
                 return ERR_INVALID_IOCTL_VALUE as c_long;
             }
             let is_cancel = name.iter().all(|&b| b == 0);
-            let claimed = !guard.j1939_claim_lost;
             // ADR-180 Decision 21 regression coverage: see
             // `j1939_claim_no_indication`'s own field doc.
             let no_indication = guard.j1939_claim_no_indication;
+            let loses_from_count = !is_cancel
+                && !no_indication
+                && guard.j1939_claim_lost_remaining > 0
+                && guard.channels.contains_key(&channel_id);
+            if loses_from_count {
+                guard.j1939_claim_lost_remaining -= 1;
+            }
+            let claimed = !(guard.j1939_claim_lost || loses_from_count);
             // ADR-180 Decision 22 regression coverage: see
             // `j1939_cancel_error`'s own field doc.
             let cancel_error = guard.j1939_cancel_error;
@@ -5474,6 +5490,22 @@ exported_fn!(
     __mock_set_j1939_claim_lost(lost: u32) -> c_long {
     let mut guard = state().lock().expect("mock state poisoned");
     guard.j1939_claim_lost = lost != 0;
+    no_error()
+});
+
+exported_fn!(
+    /// SAE J2534-2 clause 16 SAE J1939 Protocol: makes only the next
+    /// `count` `IOCTL_PROTECT_J1939_ADDR` claim attempts (non-cancel form,
+    /// on a known channel, that produce an indication) resolve
+    /// `J1939_ADDRESS_LOST`; later attempts claim normally. Replaces any
+    /// remaining count; `count == 0` clears it (the default after
+    /// `__mock_reset`). Use this instead of toggling
+    /// `__mock_set_j1939_claim_lost` mid-claim when a test needs a specific
+    /// candidate to win: the service issues the next candidate within one
+    /// poll tick, faster than a test can react.
+    __mock_set_j1939_claim_lost_count(count: u32) -> c_long {
+    let mut guard = state().lock().expect("mock state poisoned");
+    guard.j1939_claim_lost_remaining = count;
     no_error()
 });
 

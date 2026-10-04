@@ -31,7 +31,8 @@ pub const DID_SPARE_PART_NUMBER: u16 = 0xF187;
 pub const DID_SOFTWARE_VERSION: u16 = 0xF189;
 pub const DID_VIN: u16 = 0xF190;
 /// Simulator-specific DID (system supplier range) reporting the flash state, so that a resume can
-/// start with a state check (8.2.5). Record: phase code (1 byte) + block number (4 bytes, big endian).
+/// start with a state check (8.2.5). Record: phase code (1 byte), block number (4 bytes) and
+/// bytes received of the current download (4 bytes), big endian.
 pub const DID_FLASH_STATE: u16 = 0xFD00;
 
 /// eraseMemory routine (Annex F).
@@ -81,8 +82,9 @@ pub struct EcuConfig {
     pub sw_version: String,
     /// Simulated response delay (ms). Used for testing the P2 timeout boundary.
     pub response_delay_ms: u32,
-    /// Stop responding at the specified block number (injects an interruption).
-    /// Block numbers count TransferData blocks from 1 across the whole download.
+    /// Stop responding at the specified block number (injects an interruption, once: the field is
+    /// cleared when it fires). Block numbers count TransferData blocks from 1 across the whole
+    /// download.
     pub drop_at_block: Option<u32>,
     /// Whether to require security access.
     pub require_security_access: bool,
@@ -172,8 +174,9 @@ struct Download {
     received: u32,
     /// blockSequenceCounter the next new block must carry.
     expected_bsc: u8,
-    /// blockSequenceCounter of the last stored block, for accepting a repeated request.
+    /// blockSequenceCounter and length of the last stored block, for accepting a repeated request.
     last_bsc: Option<u8>,
+    last_len: u32,
 }
 
 pub struct SimEcu {
@@ -341,6 +344,7 @@ impl SimEcu {
         self.session = Session::Default;
         self.lock_security();
         self.failed_attempts = 0;
+        self.gateway_authenticated = false;
         self.interrupt_transfer();
     }
 

@@ -21,6 +21,7 @@ General behaviour (clause 7.7):
   the NRC.
 - The suppressPosRspMsgIndicationBit suppresses positive responses only.
 - For functionally addressed requests, NRCs 11, 7F, 12, 7E and 31 are not sent (clause 7.7.1).
+- A supported SubFunction is available in every session its service is, so NRC 7E is not produced.
 - Response pending (NRC 78) and busy (NRC 21) are not produced: every service completes within the
   request. Response delays belong to the VCI side.
 
@@ -45,12 +46,14 @@ Any other SID gets NRC 11. The session timeout (S3) is not simulated: a non-defa
 until a session change, an ECU reset or `reconnect()`.
 
 Every DiagnosticSessionControl request relocks security, including a restart of the active
-session. Leaving the programming session while a download runs interrupts the download (see
-below).
+session. Because a running download depends on the unlocked state, every session start, a
+restart of the programming session included, interrupts it (see below).
 
 Services 2E, 31, 34, 36 and 37 need gateway authentication when `EcuConfig::require_gateway_auth`
 is set; NRC 34 is returned until `SimEcu::gateway_authenticated` is set (there is no
-Authentication service in the simulator).
+Authentication service in the simulator). The check is a service-level one at the position of
+the general behaviour figure (clause 7.7.2), so it comes before each service's own length and
+range checks. A power cycle, ECU reset or `reconnect()` clears the authentication.
 
 ## Data identifiers
 
@@ -60,18 +63,20 @@ Authentication service in the simulator).
 | F187 | `EcuConfig::part_number` |
 | F189 | `EcuConfig::sw_version` |
 | F190 | `EcuConfig::vin`; writable as 17 ASCII alphanumeric bytes, behind security access |
-| FD00 | flash state: phase code (1 byte) + block number (4 bytes, big endian) |
+| FD00 | flash state: phase code (1 byte), block number (4 bytes), bytes received of the current download (4 bytes), big endian |
 
 FD00 phase codes: 00 idle, 01 erased, 02 transferring (next block), 03 transfer complete,
-04 verified, 05 interrupted (last stored block). It is the state check a resume starts with
-(design 8.2.5).
+04 verified, 05 interrupted (last stored block). The received byte count is zero when no
+download is open. It is the state check a resume starts with (design 8.2.5): the resume address
+is the download start plus the received count.
 
 ## Security access
 
 One level (01/02). The seed is 4 bytes, deterministic per `SimEcu` instance and never zero; the
 expected key is `seed XOR 5A5A5A5A` (`SimEcu::key_for_seed`). The handling follows the state chart
-in Annex I with a fresh seed for every requestSeed (no static seed). A seed answers exactly one
-sendKey, whether the key is right, wrong or malformed; a sendKey without a seed gets NRC 24.
+in Annex I with a fresh seed for every requestSeed (no static seed). Any SecurityAccess request
+other than a successful requestSeed discards the pending seed (Annex I, transition 9): a seed
+answers exactly one sendKey, and a sendKey without a seed gets NRC 24.
 The third false key in a row returns NRC 36 and starts the delay timer; requestSeed then returns
 NRC 37 until `SimEcu::expire_security_delay()` is called (the simulator has no clock). A power
 cycle or ECU reset clears the false-attempt counter but not an active delay. With
@@ -87,18 +92,19 @@ cycle or ECU reset clears the false-attempt counter but not an active delay. Wit
 - RequestDownload accepts addresses in `FLASH_START .. FLASH_START + FLASH_SIZE` and needs an
   erased flash; otherwise NRC 22. The positive response reports maxNumberOfBlockLength
   `MAX_BLOCK_LENGTH` (whole TransferData request).
-- TransferData repeating the previous blockSequenceCounter is answered again without storing the
-  data twice.
+- TransferData repeating the previous blockSequenceCounter with the same data is answered again
+  without storing the data twice, also after the last block. The same counter with different data
+  gets NRC 73.
 
 ## Interruption and resume
 
 `EcuConfig::drop_at_block = Some(n)` makes the ECU drop block `n` (counted from 1 over the whole
-download) and answer nothing until `reconnect()`. `reconnect()`, ECUReset and leaving the
+download) and answer nothing until `reconnect()`. It fires once: the field is cleared when it does. `reconnect()`, ECUReset and leaving the
 programming session turn a running download into the interrupted state, keeping the data already
 stored.
 
 A download resumes with a RequestDownload whose address and size cover exactly the part not yet
 received; the blockSequenceCounter starts again at 1. Any other RequestDownload in the interrupted
 state gets NRC 22, and the client must erase and start over. A download interrupted after its last
-block but before RequestTransferExit cannot resume this way (the remaining size is zero) and also
-needs a new erase.
+block but before RequestTransferExit has nothing left to send; RequestTransferExit closes it
+directly.

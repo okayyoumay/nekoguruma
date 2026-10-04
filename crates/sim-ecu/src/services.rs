@@ -39,22 +39,16 @@ fn positive(sid: u8, data: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Common checks for a request with a SubFunction parameter (clause 7.7.3.1): minimum length,
-/// SubFunction supported at all, SubFunction supported in the active session.
-fn sub_function(
-    message: &[u8],
-    supported: impl Fn(u8) -> bool,
-    supported_in_session: impl Fn(u8) -> bool,
-) -> Result<SubFunction, Nrc> {
+/// Common checks for a request with a SubFunction parameter (clause 7.7.3.1): minimum length and
+/// SubFunction supported. Every supported SubFunction is available in every session the service
+/// is, so NRC 7E is never produced.
+fn sub_function(message: &[u8], supported: impl Fn(u8) -> bool) -> Result<SubFunction, Nrc> {
     if message.len() < 2 {
         return Err(Nrc::IncorrectMessageLengthOrInvalidFormat);
     }
     let value = message[1] & !SUPPRESS_POS_RSP;
     if !supported(value) {
         return Err(Nrc::SubFunctionNotSupported);
-    }
-    if !supported_in_session(value) {
-        return Err(Nrc::SubFunctionNotSupportedInActiveSession);
     }
     Ok(SubFunction {
         value,
@@ -74,6 +68,8 @@ fn be_uint(bytes: &[u8]) -> u64 {
 impl SimEcu {
     /// General server response behaviour (clause 7.7.2, Figure 5): service supported,
     /// authentication, service supported in the active session; then the service itself.
+    /// Gateway authentication is a service-level check at the Figure 5 position, so it comes
+    /// before the length and range checks of the individual services.
     pub(crate) fn dispatch(&mut self, sid: u8, message: &[u8]) -> ServiceResult {
         let in_session = match sid {
             SID_DIAGNOSTIC_SESSION_CONTROL
@@ -128,17 +124,16 @@ impl SimEcu {
     // ------------------------------------------------------------ 0x10 (clause 9.2)
 
     fn diagnostic_session_control(&mut self, message: &[u8]) -> ServiceResult {
-        let sf = sub_function(message, |v| Session::from_code(v).is_some(), |_| true)?;
+        let sf = sub_function(message, |v| Session::from_code(v).is_some())?;
         if message.len() != 2 {
             return Err(Nrc::IncorrectMessageLengthOrInvalidFormat);
         }
         let target = Session::from_code(sf.value).expect("checked by sub_function");
         // Every session start, including a restart of the active one, relocks security
-        // (clause 9.2.1, transitions c and d). Leaving the programming session stops a transfer.
+        // (clause 9.2.1, transitions c and d). A running download depends on the unlocked state,
+        // so any session start interrupts it.
         self.lock_security();
-        if target != Session::Programming {
-            self.interrupt_transfer();
-        }
+        self.interrupt_transfer();
         self.session = target;
         let p2 = P2_SERVER_MAX_MS.to_be_bytes();
         let p2_star = P2_STAR_SERVER_MAX_10MS.to_be_bytes();
@@ -155,7 +150,7 @@ impl SimEcu {
 
     fn ecu_reset(&mut self, message: &[u8]) -> ServiceResult {
         // hardReset, keyOffOnReset, softReset. Rapid power shutdown is not simulated.
-        let sf = sub_function(message, |v| matches!(v, 0x01..=0x03), |_| true)?;
+        let sf = sub_function(message, |v| matches!(v, 0x01..=0x03))?;
         if message.len() != 2 {
             return Err(Nrc::IncorrectMessageLengthOrInvalidFormat);
         }
@@ -168,8 +163,11 @@ impl SimEcu {
     // ------------------------------------------------------------ 0x27 (clause 9.4)
 
     fn security_access(&mut self, message: &[u8]) -> ServiceResult {
+        // Any SecurityAccess request ends the wait for a key: only a positive requestSeed issues
+        // a new seed, and every other outcome discards the pending one (Annex I, transition 9).
+        let pending_seed = self.pending_seed.take();
         // One security level: requestSeed 0x01 / sendKey 0x02.
-        let sf = sub_function(message, |v| matches!(v, 0x01 | 0x02), |_| true)?;
+        let sf = sub_function(message, |v| matches!(v, 0x01 | 0x02))?;
         if sf.value == 0x01 {
             // No securityAccessDataRecord is supported.
             if message.len() != 2 {
@@ -180,7 +178,6 @@ impl SimEcu {
             }
             // An already unlocked level answers with an all-zero seed; a locked level never does.
             let seed = if self.security_unlocked {
-                self.pending_seed = None;
                 0
             } else {
                 let seed = self.next_seed();
@@ -196,7 +193,7 @@ impl SimEcu {
 
         // A seed answers exactly one sendKey, right, wrong or malformed. Without a seed, any
         // sendKey is out of sequence (Annex I, transitions 4, 7 and 9).
-        let Some(seed) = self.pending_seed.take() else {
+        let Some(seed) = pending_seed else {
             return Err(Nrc::RequestSequenceError);
         };
         if message.len() != 6 {
@@ -228,7 +225,7 @@ impl SimEcu {
     // ------------------------------------------------------------ 0x3E (clause 9.7)
 
     fn tester_present(&mut self, message: &[u8]) -> ServiceResult {
-        let sf = sub_function(message, |v| v == 0x00, |_| true)?;
+        let sf = sub_function(message, |v| v == 0x00)?;
         if message.len() != 2 {
             return Err(Nrc::IncorrectMessageLengthOrInvalidFormat);
         }
@@ -268,7 +265,12 @@ impl SimEcu {
             DID_SPARE_PART_NUMBER => Some(self.config.part_number.as_bytes().to_vec()),
             DID_SOFTWARE_VERSION => Some(self.config.sw_version.as_bytes().to_vec()),
             DID_VIN => Some(self.config.vin.as_bytes().to_vec()),
-            DID_FLASH_STATE => Some(self.flash.encode().to_vec()),
+            DID_FLASH_STATE => {
+                let received = self.download.map_or(0, |dl| dl.received);
+                let mut record = self.flash.encode().to_vec();
+                record.extend_from_slice(&received.to_be_bytes());
+                Some(record)
+            }
             _ => None,
         }
     }
@@ -324,7 +326,7 @@ impl SimEcu {
 
     fn read_dtc_information(&mut self, message: &[u8]) -> ServiceResult {
         // reportNumberOfDTCByStatusMask, reportDTCByStatusMask, reportSupportedDTCs.
-        let sf = sub_function(message, |v| matches!(v, 0x01 | 0x02 | 0x0A), |_| true)?;
+        let sf = sub_function(message, |v| matches!(v, 0x01 | 0x02 | 0x0A))?;
         let expected_len = if sf.value == 0x0A { 2 } else { 3 };
         if message.len() != expected_len {
             return Err(Nrc::IncorrectMessageLengthOrInvalidFormat);
@@ -460,6 +462,7 @@ impl SimEcu {
                     received: 0,
                     expected_bsc: 1,
                     last_bsc: None,
+                    last_len: 0,
                 });
                 1
             }
@@ -470,6 +473,7 @@ impl SimEcu {
                 self.download = Some(Download {
                     expected_bsc: 1,
                     last_bsc: None,
+                    last_len: 0,
                     ..dl
                 });
                 last_block + 1
@@ -502,7 +506,12 @@ impl SimEcu {
         let bsc = message[1];
         let data = &message[2..];
         // A repeated request (its response was lost) is answered again without storing twice.
+        // A block that reuses the previous counter with different data is a sequence error.
         if dl.last_bsc == Some(bsc) {
+            let last = &self.image[self.image.len() - dl.last_len as usize..];
+            if last != data {
+                return Err(Nrc::WrongBlockSequenceCounter);
+            }
             return Ok(Some(positive(SID_TRANSFER_DATA, &[bsc])));
         }
         if dl.received == dl.size {
@@ -515,13 +524,15 @@ impl SimEcu {
             return Err(Nrc::WrongBlockSequenceCounter);
         }
         if self.config.drop_at_block == Some(next_block) {
-            // Injected interruption: the block is lost and the ECU goes quiet.
+            // Injected interruption (once): the block is lost and the ECU goes quiet.
+            self.config.drop_at_block = None;
             self.silent = true;
             return Ok(None);
         }
         self.image.extend_from_slice(data);
         dl.received += data.len() as u32;
         dl.last_bsc = Some(bsc);
+        dl.last_len = data.len() as u32;
         dl.expected_bsc = bsc.wrapping_add(1);
         self.download = Some(dl);
         self.flash = FlashPhase::Transferring {
@@ -533,7 +544,10 @@ impl SimEcu {
     // ------------------------------------------------------------ 0x37 (clause 14.5)
 
     fn request_transfer_exit(&mut self, message: &[u8]) -> ServiceResult {
-        let (FlashPhase::Transferring { .. }, Some(dl)) = (self.flash, self.download) else {
+        // A download interrupted after its last block can still be closed: all data is stored.
+        let (FlashPhase::Transferring { .. } | FlashPhase::Interrupted { .. }, Some(dl)) =
+            (self.flash, self.download)
+        else {
             return Err(Nrc::RequestSequenceError);
         };
         if dl.received < dl.size {

@@ -753,12 +753,13 @@ fn dropped_block_interrupts_and_the_transfer_resumes() {
     // The ECU stays silent until it is reconnected.
     assert_eq!(ecu.request(&[0x3E, 0x00]), SimResponse::NoResponse);
 
-    ecu.config.drop_at_block = None;
+    // The injected drop fires once.
+    assert_eq!(ecu.config.drop_at_block, None);
     ecu.reconnect();
     assert_eq!(ecu.session, Session::Default);
     assert_eq!(
         ecu.request(&[0x22, 0xFD, 0x00]),
-        pos(&[0x62, 0xFD, 0x00, 0x05, 0, 0, 0, 2])
+        pos(&[0x62, 0xFD, 0x00, 0x05, 0, 0, 0, 2, 0, 0, 0, 4])
     );
 
     enter(&mut ecu, Session::Programming);
@@ -787,4 +788,299 @@ fn leaving_the_programming_session_interrupts_the_transfer() {
     ecu.request(&transfer(1, &[0; 2]));
     enter(&mut ecu, Session::Default);
     assert_eq!(ecu.flash, FlashPhase::Interrupted { last_block: 1 });
+}
+
+fn read_flash_state(ecu: &mut SimEcu) -> Vec<u8> {
+    let SimResponse::Positive(bytes) = ecu.request(&[0x22, 0xFD, 0x00]) else {
+        panic!("FD00 read failed");
+    };
+    bytes[3..].to_vec()
+}
+
+/// Programming session and unlocked again after an interruption.
+fn back_in_programming(ecu: &mut SimEcu) {
+    enter(ecu, Session::Programming);
+    unlock(ecu);
+}
+
+// ---------------------------------------------------------------- Review follow-ups
+
+#[test]
+fn any_failed_security_request_discards_the_pending_seed() {
+    for bad in [&[0x27, 0x01, 0xAA][..], &[0x27, 0x03], &[0x27]] {
+        let mut ecu = ecu();
+        enter(&mut ecu, Session::Extended);
+        let SimResponse::Positive(seed) = ecu.request(&[0x27, 0x01]) else {
+            panic!("requestSeed failed");
+        };
+        assert!(matches!(ecu.request(bad), SimResponse::Negative { .. }));
+        let seed = u32::from_be_bytes([seed[2], seed[3], seed[4], seed[5]]);
+        let key = SimEcu::key_for_seed(seed).to_be_bytes();
+        assert_eq!(
+            ecu.request(&[0x27, 0x02, key[0], key[1], key[2], key[3]]),
+            neg(0x27, Nrc::RequestSequenceError),
+            "after {bad:02X?}"
+        );
+    }
+}
+
+#[test]
+fn successful_unlock_resets_the_false_attempt_counter() {
+    let mut ecu = ecu();
+    enter(&mut ecu, Session::Extended);
+    let fail = |ecu: &mut SimEcu| {
+        ecu.request(&[0x27, 0x01]);
+        ecu.request(&[0x27, 0x02, 0, 0, 0, 0])
+    };
+    for _ in 1..MAX_SECURITY_ATTEMPTS {
+        assert_eq!(fail(&mut ecu), neg(0x27, Nrc::InvalidKey));
+    }
+    unlock(&mut ecu);
+    enter(&mut ecu, Session::Extended);
+    for _ in 1..MAX_SECURITY_ATTEMPTS {
+        assert_eq!(fail(&mut ecu), neg(0x27, Nrc::InvalidKey));
+    }
+}
+
+#[test]
+fn suppressed_positive_responses_still_change_state() {
+    let mut ecu = ecu();
+    assert_eq!(ecu.request(&[0x10, 0x82]), SimResponse::NoResponse);
+    assert_eq!(ecu.session, Session::Programming);
+
+    let SimResponse::Positive(seed) = ecu.request(&[0x27, 0x01]) else {
+        panic!("requestSeed failed");
+    };
+    let seed = u32::from_be_bytes([seed[2], seed[3], seed[4], seed[5]]);
+    let key = SimEcu::key_for_seed(seed).to_be_bytes();
+    assert_eq!(
+        ecu.request(&[0x27, 0x82, key[0], key[1], key[2], key[3]]),
+        SimResponse::NoResponse
+    );
+    assert!(ecu.security_unlocked);
+
+    assert_eq!(
+        ecu.request(&[0x31, 0x81, 0xFF, 0x00]),
+        SimResponse::NoResponse
+    );
+    assert_eq!(ecu.flash, FlashPhase::Erased);
+
+    assert_eq!(ecu.request(&[0x11, 0x81]), SimResponse::NoResponse);
+    assert_eq!(ecu.session, Session::Default);
+}
+
+#[test]
+fn functional_addressing_suppresses_snsias() {
+    assert_eq!(
+        ecu().request_with(Addressing::Functional, &[0x27, 0x01]),
+        SimResponse::NoResponse
+    );
+}
+
+#[test]
+fn routine_control_checks_security_before_sub_function() {
+    let mut ecu = ecu();
+    enter(&mut ecu, Session::Programming);
+    assert_eq!(
+        ecu.request(&[0x31, 0x02, 0xFF, 0x00]),
+        neg(0x31, Nrc::SecurityAccessDenied)
+    );
+}
+
+#[test]
+fn request_transfer_exit_checks_sequence_before_length() {
+    let mut ecu = ready_to_download();
+    assert_eq!(
+        ecu.request(&[0x37, 0x00]),
+        neg(0x37, Nrc::RequestSequenceError)
+    );
+}
+
+#[test]
+fn read_dtc_information_mask_matches_any_common_bit() {
+    let mut ecu = ecu();
+    // 0x41 shares bit 0 with the first DTC (0x09) and bit 6 with the second (0x50).
+    assert_eq!(
+        ecu.request(&[0x19, 0x01, 0x41]),
+        pos(&[0x59, 0x01, 0xFF, 0x01, 0x00, 0x02])
+    );
+    assert_eq!(
+        ecu.request(&[0x19, 0x01, 0x20]),
+        pos(&[0x59, 0x01, 0xFF, 0x01, 0x00, 0x00])
+    );
+}
+
+#[test]
+fn read_data_by_identifier_boundaries() {
+    let mut ecu = SimEcu::new(EcuConfig {
+        vin: "V".repeat(MAX_RESPONSE_LENGTH - 3),
+        ..config()
+    });
+    // Eight DIDs is the limit, not over it.
+    let eight: Vec<u8> = std::iter::once(0x22)
+        .chain([0xF1, 0x86].repeat(MAX_DIDS_PER_READ))
+        .collect();
+    assert!(matches!(ecu.request(&eight), SimResponse::Positive(_)));
+    // SID + DID + record is exactly the longest response.
+    let SimResponse::Positive(bytes) = ecu.request(&[0x22, 0xF1, 0x90]) else {
+        panic!("VIN read failed");
+    };
+    assert_eq!(bytes.len(), MAX_RESPONSE_LENGTH);
+}
+
+#[test]
+fn write_data_by_identifier_rejects_a_long_vin() {
+    let mut ecu = ecu();
+    enter(&mut ecu, Session::Extended);
+    unlock(&mut ecu);
+    assert_eq!(
+        ecu.request(&write_vin(b"1HGCM82633A0043521")),
+        neg(0x2E, Nrc::IncorrectMessageLengthOrInvalidFormat)
+    );
+}
+
+#[test]
+fn request_download_accepts_the_end_of_flash() {
+    let mut ecu = ready_to_download();
+    assert!(matches!(
+        ecu.request(&request_download(FLASH_START + FLASH_SIZE - 8, 8)),
+        SimResponse::Positive(_)
+    ));
+}
+
+#[test]
+fn transfer_data_accepts_a_block_of_max_length() {
+    let mut ecu = ready_to_download();
+    let data_len = usize::from(MAX_BLOCK_LENGTH) - 2;
+    ecu.request(&request_download(0, data_len as u32));
+    assert_eq!(
+        ecu.request(&transfer(1, &vec![0x5A; data_len])),
+        pos(&[0x76, 0x01])
+    );
+}
+
+#[test]
+fn transfer_data_checks_memory_size_before_the_counter() {
+    let mut ecu = ready_to_download();
+    ecu.request(&request_download(0, 4));
+    assert_eq!(
+        ecu.request(&transfer(2, &[0; 5])),
+        neg(0x36, Nrc::TransferDataSuspended)
+    );
+}
+
+#[test]
+fn transfer_data_repeat_of_the_final_block_is_accepted() {
+    let mut ecu = ready_to_download();
+    ecu.request(&request_download(0, 2));
+    assert_eq!(ecu.request(&transfer(1, &[1, 2])), pos(&[0x76, 0x01]));
+    assert_eq!(ecu.request(&transfer(1, &[1, 2])), pos(&[0x76, 0x01]));
+    assert_eq!(ecu.request(&[0x37]), pos(&[0x77]));
+}
+
+#[test]
+fn transfer_data_repeat_with_different_data_is_rejected() {
+    let mut ecu = ready_to_download();
+    ecu.request(&request_download(0, 8));
+    ecu.request(&transfer(1, &[1, 2]));
+    assert_eq!(
+        ecu.request(&transfer(1, &[9, 9, 9, 9])),
+        neg(0x36, Nrc::WrongBlockSequenceCounter)
+    );
+    assert_eq!(ecu.image(), &[1, 2]);
+}
+
+#[test]
+fn flash_state_did_reports_each_phase() {
+    let mut ecu = ready_to_download();
+    assert_eq!(read_flash_state(&mut ecu), [0x01, 0, 0, 0, 0, 0, 0, 0, 0]);
+    ecu.request(&request_download(0, 4));
+    ecu.request(&transfer(1, &[0; 3]));
+    assert_eq!(read_flash_state(&mut ecu), [0x02, 0, 0, 0, 2, 0, 0, 0, 3]);
+    ecu.request(&transfer(2, &[0]));
+    ecu.request(&[0x37]);
+    assert_eq!(read_flash_state(&mut ecu), [0x03, 0, 0, 0, 0, 0, 0, 0, 0]);
+    ecu.request(&[0x31, 0x01, 0xFF, 0x01]);
+    assert_eq!(read_flash_state(&mut ecu), [0x04, 0, 0, 0, 0, 0, 0, 0, 0]);
+}
+
+#[test]
+fn resume_requires_both_the_remaining_address_and_size() {
+    let mut ecu = ready_to_download();
+    ecu.request(&request_download(0x40, 8));
+    ecu.request(&transfer(1, &[1, 2]));
+    ecu.reconnect();
+    back_in_programming(&mut ecu);
+    assert_eq!(
+        ecu.request(&request_download(0x42, 8)),
+        neg(0x34, Nrc::ConditionsNotCorrect)
+    );
+    assert_eq!(
+        ecu.request(&request_download(0x40, 6)),
+        neg(0x34, Nrc::ConditionsNotCorrect)
+    );
+    assert!(matches!(
+        ecu.request(&request_download(0x42, 6)),
+        SimResponse::Positive(_)
+    ));
+}
+
+#[test]
+fn resume_after_ecu_reset_restarts_the_counter_at_one() {
+    // One block stored with counter 1; after the resume, counter 1 is a new block, not a repeat.
+    let mut ecu = ready_to_download();
+    ecu.request(&request_download(0, 4));
+    ecu.request(&transfer(1, &[1, 2]));
+    assert_eq!(ecu.request(&[0x11, 0x01]), pos(&[0x51, 0x01]));
+    assert_eq!(ecu.flash, FlashPhase::Interrupted { last_block: 1 });
+    back_in_programming(&mut ecu);
+    ecu.request(&request_download(2, 2));
+    assert_eq!(ecu.request(&transfer(1, &[3, 4])), pos(&[0x76, 0x01]));
+    assert_eq!(ecu.request(&[0x37]), pos(&[0x77]));
+    assert_eq!(ecu.image(), &[1, 2, 3, 4]);
+}
+
+#[test]
+fn interrupted_after_the_last_block_can_still_exit() {
+    let mut ecu = ready_to_download();
+    ecu.request(&request_download(0, 4));
+    ecu.request(&transfer(1, &[1, 2, 3, 4]));
+    ecu.reconnect();
+    back_in_programming(&mut ecu);
+    assert_eq!(read_flash_state(&mut ecu), [0x05, 0, 0, 0, 1, 0, 0, 0, 4]);
+    assert_eq!(ecu.request(&[0x37]), pos(&[0x77]));
+    assert_eq!(ecu.flash, FlashPhase::TransferComplete);
+}
+
+#[test]
+fn erase_from_interrupted_discards_the_partial_image() {
+    let mut ecu = ready_to_download();
+    ecu.request(&request_download(0, 8));
+    ecu.request(&transfer(1, &[1, 2]));
+    ecu.reconnect();
+    back_in_programming(&mut ecu);
+    assert_eq!(
+        ecu.request(&[0x31, 0x01, 0xFF, 0x00]),
+        pos(&[0x71, 0x01, 0xFF, 0x00])
+    );
+    assert_eq!(ecu.flash, FlashPhase::Erased);
+    assert!(ecu.image().is_empty());
+    assert_eq!(ecu.request(&[0x37]), neg(0x37, Nrc::RequestSequenceError));
+}
+
+#[test]
+fn restarting_the_programming_session_interrupts_the_transfer() {
+    let mut ecu = ready_to_download();
+    ecu.request(&request_download(0, 4));
+    ecu.request(&transfer(1, &[0; 2]));
+    enter(&mut ecu, Session::Programming);
+    assert_eq!(ecu.flash, FlashPhase::Interrupted { last_block: 1 });
+}
+
+#[test]
+fn reconnect_clears_gateway_authentication() {
+    let mut ecu = ecu();
+    ecu.gateway_authenticated = true;
+    ecu.reconnect();
+    assert!(!ecu.gateway_authenticated);
 }

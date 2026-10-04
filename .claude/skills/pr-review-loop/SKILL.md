@@ -34,7 +34,11 @@ round's push and a clean verdict wait for that settled read, so late findings jo
 round. At the check-in, read the trigger comment's reactions (Step 1) to see
 whether Codex reacted 👍 (a clean round) or never started (below).
 
-**Codex not available.** If the trigger comment still has no 👀 and no review at the check-in
+Only a result posted after the latest trigger comment counts for that trigger: its 👍, or a
+Codex review or "no major issues" comment submitted after it. An older review of the same head
+is not a result.
+
+**Codex not available.** If the trigger comment still has no 👀 and no result at the check-in
 (15 minutes after it was posted; CI does not matter here), Codex is not enabled for this
 repository (it is switched on per
 repository in the Codex settings on chatgpt.com, which only Yoko can do). Say so once in the
@@ -47,8 +51,8 @@ that fixed it (or the ADR or backlog item for 2c, the trace for 2d). If a fix wa
 the fallback review again on the new head, whatever its size, and repeat until a pass reports no
 new finding. Then go to Step 5.
 
-**Codex started but never finished.** If the trigger comment has 👀 but neither 👍 nor a review
-at the check-in, schedule one more check-in 15 minutes later. If that one still finds no result,
+**Codex started but never finished.** If the trigger comment has 👀 but no result at the
+check-in, schedule one more check-in 15 minutes later. If that one still finds no result,
 treat the round as stalled: tell Yoko once in the thread, and run the same fallback review as
 above for this head instead of re-requesting. A later push may request Codex again as usual.
 

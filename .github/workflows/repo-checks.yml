@@ -15,7 +15,7 @@ jobs:
   repo-checks:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: scripts/check-work-refs.sh
       - run: scripts/check-adr-index.sh
       - run: scripts/check-backlog.sh

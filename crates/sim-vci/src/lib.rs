@@ -20,12 +20,14 @@ pub type PassThruUlong = std::os::raw::c_ulong;
 
 /// Calling convention. stdcall on Windows x86 only, standard C elsewhere.
 #[cfg(all(windows, target_arch = "x86"))]
+#[expect(unused_macros, reason = "the exports do not use it yet")]
 macro_rules! passthru_abi {
     () => {
         "stdcall"
     };
 }
 #[cfg(not(all(windows, target_arch = "x86")))]
+#[expect(unused_macros, reason = "the exports do not use it yet")]
 macro_rules! passthru_abi {
     () => {
         "C"

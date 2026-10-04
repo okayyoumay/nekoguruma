@@ -22,7 +22,8 @@ PR, and after every fix push, post a top-level PR comment whose whole body is `@
 (`add_issue_comment`, `issue_number` = PR number). Nothing else goes in that comment.
 
 Codex reacts 👀 on the trigger comment when it starts, then posts a review with inline comments,
-or reacts 👍 when it has nothing to report.
+or, when it has nothing to report, reacts 👍 or posts a top-level comment saying it found no
+major issues.
 
 A review wakes the session as a PR event; a reaction does not. So right after posting the
 trigger, schedule a one-shot check-in about 15 minutes later (`send_later`). Keep it even when a
@@ -88,7 +89,9 @@ pull_request_read(method="get_comments", owner, repo, pullNumber, perPage=100)
   inline thread on the current head commit. The signal is either Codex's 👍 on the
   `@codex review` comment posted after the latest push (a 👍 on an earlier trigger comment
   belongs to an earlier head), or a Codex review whose `commit_id` is the current head and that
-  says it found no major issues. An older head's clean signal never counts, even while the new
+  says it found no major issues, or a top-level Codex comment (from `get_comments`) saying it
+  found no major issues whose "Reviewed commit" is the current head (it gives a short SHA; compare
+  it as a prefix). An older head's clean signal never counts, even while the new
   review has not arrived yet. A "Reviewed commit: …" summary with no approving words is not
   clean; check the threads.
 

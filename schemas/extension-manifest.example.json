@@ -1,13 +1,13 @@
 {
   "schemaVersion": 1,
-  "id": "com.example.vci.ex4000",
+  "id": "com.example.ir.engine-ecu",
   "version": "1.2.0",
-  "kind": "vciProfile",
-  "displayName": "Example EX-4000 Profile",
+  "kind": "ir",
+  "displayName": "Example Engine ECU Definitions",
   "coreVersionRange": ">=0.1.0 <0.3.0",
   "files": [
     {
-      "path": "vci-profile.json",
+      "path": "engine-ecu.ir.json",
       "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
       "sizeBytes": 1024,
       "mediaType": "application/json"

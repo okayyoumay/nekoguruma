@@ -176,7 +176,7 @@ Each device's operating mode is fixed to exactly one of "user mode" or "device m
 ```mermaid
 flowchart LR
     VN["Supplier / OEM<br/>Signed and encrypted"]
-    EXT["Extension author<br/>VCI profile / ODX/OTX"]
+    EXT["Extension author<br/>ODX/OTX"]
     ADM["Admin"]
     SRV["Server"]
     AGT["Agent"]
@@ -221,7 +221,8 @@ All are cached in an area that cannot be modified with user privileges. Deletion
 
 ### 4.2 Extension Packages
 
-- VCI profiles, IR, screen and report definitions, message text, unit systems (9.2)
+- IR, screen and report definitions, message text, unit systems (9.2)
+- VCI profiles are not extension packages: they are installed on the device outside this software (9.3)
 - The server verifies them on ingestion and signs them with the operator's distribution key (ingestion signature. 11.1)
 - The agent lazily fetches only what it needs. The initial sync scope follows 9.4
 - The delivery path is shared with ECU artifacts (HTTPS data channel), but re-signing and fetch scope differ
@@ -553,14 +554,7 @@ Confirmation level (6.3) and two-person approval. The server decides the require
 
 J2534 on Linux **reuses the Windows API definitions as-is**. Function signatures and structures are common as per the standard; OS differences appear only in the discovery path. Since Linux has no common registration store equivalent to the registry, registration information is defined in a format specific to this software.
 
-**Search paths** (XDG-compliant)
-
-| Path | Purpose | Written by |
-|---|---|---|
-| `/etc/nekoguruma/j2534/` | System-wide | Administrator |
-| `$XDG_CONFIG_HOME/nekoguruma/j2534/` (default `~/.config/nekoguruma/j2534/`) | Per user | User |
-
-The precedence when a definition with the same name exists in both is to be documented explicitly.
+**Search path**: `/etc/nekoguruma/j2534/` only, written by the administrator, in both operating modes. Per-user locations (such as `$XDG_CONFIG_HOME`) are not supported. The directory is fixed at build time; a runtime override exists only in debug builds, for tests (ADR-228).
 
 **Format**: One file per VCI (TOML or JSON). A single large file would have installers from multiple vendors editing the same file and conflicting, so the granularity matches the registry's one key per VCI.
 
@@ -580,7 +574,7 @@ The precedence when a definition with the same name exists in both is to be docu
 2. This software ships templates for known vendors
 3. Vendors are asked to register in this format
 
-The agent provides a generation helper. It actually `dlopen`s the specified .so, checks for the presence of J2534 symbols (`PassThruOpen` etc.), and then writes out the definition file.
+The agent provides a generation helper, run with administrator rights. It actually `dlopen`s the specified .so, checks for the presence of J2534 symbols (`PassThruOpen` etc.), and then writes out the definition file.
 
 **OS differences absorbed on the worker side**
 
@@ -616,14 +610,13 @@ Basis for the inference: AArch64's AAPCS64 matches x86_64's System V ABI in that
 - If an Authenticode signature is present, also verify the signer
 - Load by absolute path (`LoadLibraryEx` / `dlopen`)
 
-**Trusted search paths (by mode)**
+**Trusted locations**
 
-On Windows, the basis for trust is that HKLM can be modified only by administrators. Per-user paths on Linux lack this premise, so the trust scope is defined per mode.
+On Windows, the basis for trust is that HKLM can be modified only by administrators. Linux gets the same premise by reading registration definitions only from `/etc/nekoguruma/j2534/` (7.1.1), in both modes. The locations of every file that decides which library is loaded (registration definitions, the worker service's configuration file) are fixed at build time. They are not taken from environment variables or command-line arguments, so another process cannot redirect a worker to a different file; a runtime override is compiled into debug builds only, for tests (ADR-228).
 
-| Mode | Search paths read |
-|---|---|
-| Device mode | `/etc/nekoguruma/j2534/` only (per-user paths are ignored) |
-| User mode | Both. However, verify that the definition file and .so are not writable by other regular users |
+**One resolver, checked where the library is loaded**
+
+Resolving a VCI name to a library path, and the checks above, live in one shared crate used by both the agent and the worker services. The agent uses it for discovery and to report loadability in `capabilities` (9.5); the worker service resolves the name it was started with through the same code and runs the checks itself immediately before loading, so the file that is checked is the file that is loaded.
 
 ### 7.3 ABI Detection and Worker Selection
 
@@ -661,7 +654,7 @@ flowchart TD
 - Emulation of a different architecture is out of scope (Linux)
 - The launch test runs through the worker service itself, not through a separate probe binary: the agent launches the service for the detected ABI, connects the module and calls `GetVersion`, which the j2534-0404 service answers with `PassThruReadVersion`. The test therefore exercises the same binary, FFI layer and `long_size` that the job will use, and each ABI ships one worker binary per library kind
 
-**Implementation** (`crates/worker-host`): `abi::detect_file` reads the header and returns the ABI name of the 7.1.2 table. Worker binaries are installed as `<workers>/<ABI name>/<service binary>`, and `WorkerLayout::find` reports a missing build as `UNSUPPORTED_ABI`. The J2534 `long_size` (definition file value, else the 7.1.2 default from `Abi::default_long_size`) is passed to the j2534-0404 service in the `NGR_J2534_LONG_SIZE` environment variable; its sys layer converts between 32-bit and 64-bit structures at the FFI boundary.
+**Implementation** (`crates/worker-host`): the agent starts a worker service with the VCI's library name only; the service resolves the path itself (7.2). `abi::detect_file` reads the header and returns the ABI name of the 7.1.2 table. Worker binaries are installed as `<workers>/<ABI name>/<service binary>`, and `WorkerLayout::find` reports a missing build as `UNSUPPORTED_ABI`. The J2534 `long_size` (definition file value, else the 7.1.2 default from `Abi::default_long_size`) is passed to the j2534-0404 service in the `NGR_J2534_LONG_SIZE` environment variable; its sys layer converts between 32-bit and 64-bit structures at the FFI boundary.
 
 ### 7.4 IPC
 
@@ -1003,7 +996,7 @@ The core has no knowledge whatsoever of specific VCIs or vehicle models.
 
 | Extension point | Form | Location | When added |
 |---|---|---|---|
-| VCI profile | Data (declarative) | Agent | No redistribution needed |
+| VCI profile | Data (declarative) | Agent (installed outside this software; 9.3) | No redistribution needed |
 | Vehicle/ECU definitions (IR declaration part) | Data | Agent | No redistribution needed |
 | Procedure definitions (IR procedure part) | Data | Agent | No redistribution needed |
 | Screen/report definitions | Data | Server | No redistribution needed |
@@ -1030,6 +1023,8 @@ VCI-specific differences are expressed declaratively. Whereas the registration d
 | Constraints | Threading constraints, whether multiple devices can be opened concurrently (8.8.1), minimum monitoring period (measured), default ring buffer retention time (4.6) |
 | Operational info | Whether it works in device mode, who performs signature verification (11.2) |
 
+**Distribution**: VCI profiles are not distributed through extension packages (9.4) and are not written by the agent. They are local files at fixed, administrator-only locations (7.2), installed and updated outside this software, for example by a package management or software distribution service. This covers both the profile data the agent reads and the per-library settings the worker services read from their own configuration file (for example the CAN channel mode and vendor IOCTL layouts). Their trust rests on the location being writable by administrators only, not on the ingestion signature (11.1) (ADR-228).
+
 Whether this can be turned into data determines the success of the framework approach. When a quirk is found that requires code to handle, first consider whether it can be generalized as a profile item.
 
 ### 9.4 Common Extension Package Format
@@ -1037,11 +1032,11 @@ Whether this can be turned into data determines the success of the framework app
 Even across different kinds, a single distribution mechanism is used.
 
 - **Structure**: extension manifest (ID, version, supported core version range, dependencies, hash of each file) + content files. This is distinct from the ECU artifact manifest (11.2) and the IR manifest (8.2.6); where the text needs to distinguish them, a qualifier is added
-- **ID**: namespaces are separated using reverse-domain notation (`com.example.vci.xyz`)
+- **ID**: namespaces are separated using reverse-domain notation (`com.example.ir.xyz`)
 - **Signing**: the manifest is signed with the operator's distribution key (ingestion signature; 11.1). Individual author keys are not registered on the agent
 - **Compatibility**: the core reports its schema versions and supported features via `capabilities`, and does not load out-of-range extensions, reporting the reason instead
 - **Conflict resolution**: the priority when multiple extensions apply to the same target (organization-defined > bundled, etc.) is documented explicitly
-- **Initial sync scope**: right after new registration, data for all vehicle models is not delivered; only manifests and common definitions are fetched. Model-specific IR and VCI profiles are lazily fetched once the target is determined. When offline work is planned, targets are specified in advance and prefetched (5.7)
+- **Initial sync scope**: right after new registration, data for all vehicle models is not delivered; only manifests and common definitions are fetched. Model-specific IR is lazily fetched once the target is determined. When offline work is planned, targets are specified in advance and prefetched (5.7)
 - **License records**: the manifest records the origin and license scope (organization-internal only / redistributable, etc.). License terms themselves are a matter of individual contracts; the system's requirement is that "the redistribution scope of ingested data can be controlled". A setting restricts distribution to within the tenant, and origin and license at ingestion time can be audited
 
 ### 9.5 capabilities (Contract Between Agent and Server)
@@ -1152,7 +1147,7 @@ There are two kinds of ingestion targets, with different paths and handling.
 | Target | Examples | Re-signing | Distribution to agent |
 |---|---|---|---|
 | ECU artifacts | Flash data, configuration values | No (bytes are not modified) | Prefetched at job issuance or by advance designation (4.1) |
-| Extension packages | VCI profiles, IR, screen/report definitions, message text, unit systems | Yes (ingestion signature) | Only what is needed, lazily fetched (9.4) |
+| Extension packages | IR, screen/report definitions, message text, unit systems | Yes (ingestion signature) | Only what is needed, lazily fetched (9.4) |
 
 Both are ingested by the server and managed as immutable versions. Below, 11.1 covers the trust model common to both, and 11.2 covers ingestion processing specific to ECU artifacts. For the extension package format and manifest, see 9.4.
 
@@ -1163,7 +1158,7 @@ Each signed object differs in what is guaranteed, the basis of trust and the rev
 | Signed object | Signer | Agent's basis of trust | What is guaranteed | Key rotation |
 |---|---|---|---|---|
 | ECU flash data | OEM (provider) | Verified by the ECU itself | Authenticity of the data | OEM-managed |
-| Extension packages (VCI profiles, IR, screen definitions, message text) | System operator's distribution key | Root key embedded in the agent | Provenance (ingested under the operator's control and not tampered with) | Agent update |
+| Extension packages (IR, screen definitions, message text) | System operator's distribution key | Root key embedded in the agent | Provenance (ingested under the operator's control and not tampered with) | Agent update |
 | Job instructions | Server's instruction key | Key received at registration | Target VCI, vehicle, approval record, expiry | Re-registration |
 
 **Ingestion signature**: having extension authors (VCI vendors, OEMs, organizations) sign with their own keys would make the set of keys to register on agents grow without bound, breaking the key distribution principle. Therefore, extensions received from authors are verified on the server side and then **re-signed with the operator's distribution key**.
@@ -1395,7 +1390,8 @@ Since this is provided as a framework, the scope of responsibility is made expli
 | Scope | Responsibility |
 |---|---|
 | Core, UI framework, non-replaceable admin screens, signing and key management | Framework provider |
-| Correctness of extension package contents (VCI profiles, IR, vehicle definitions) | Author. The operator is responsible only up to ingestion validation and provenance assurance (11.1) |
+| Correctness of extension package contents (IR, vehicle definitions) | Author. The operator is responsible only up to ingestion validation and provenance assurance (11.1) |
+| VCI profiles and their installation on devices (9.3) | Author for the contents; the operator's package management or software distribution service for delivery and updates |
 | Business screens and operational flows | Framework user |
 | UNECE R156 processes (SUMS) | System operator. The framework provides mechanisms for recording, version management and auditing, but does not operate the process |
 | Authenticity of ECU flash data | OEM (verified by the ECU) |

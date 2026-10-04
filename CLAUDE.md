@@ -152,9 +152,13 @@ them.
    `.github/pull_request_template.md`.
 2. Drive CI to green. A failure is fixed at its root cause; never skip, disable or loosen a test
    to get green.
-3. Before marking the PR ready, check that nothing deferred during the work exists only in the
+3. Run the automated review loop with the `pr-review-loop` skill: request a Codex review
+   (`@codex review`), fix or answer every finding, and re-request until a round is clean. If
+   Codex is not enabled for the repository, the skill falls back to an `edge-case-hunter` pass
+   over the whole diff.
+4. Before marking the PR ready, check that nothing deferred during the work exists only in the
    conversation: every follow-up is either done in the PR or added to the backlog (`backlog`
    skill). Items the PR finishes are closed in the same PR.
-4. Yoko reviews and merges. Do not merge your own PR unless asked.
+5. Yoko reviews and merges. Do not merge your own PR unless asked.
 
 Commit messages and PR descriptions follow the same copyright rule as the code.

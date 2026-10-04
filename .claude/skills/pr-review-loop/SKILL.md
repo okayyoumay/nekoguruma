@@ -8,8 +8,8 @@ argument-hint: "<PR number>"
 
 CLAUDE.md's "Pull requests" section says when this loop runs; this skill is how. The reviewer is
 the Codex GitHub App (`chatgpt-codex-connector[bot]`). It runs outside GitHub Actions, so review
-rounds cost no Actions minutes, but every fix push starts a CI run that does, which is why every
-round ends in exactly one push.
+rounds cost no Actions minutes, but every fix push starts a CI run that does, which is why a
+round ends in at most one push.
 
 The finding-by-finding decision guide is in
 [reference/finding-routing.md](reference/finding-routing.md). Read it before acting on a
@@ -41,9 +41,19 @@ everything:
 
 ```
 pull_request_read(method="get_review_comments", owner, repo, pullNumber, perPage=100)
+pull_request_read(method="get_reviews", owner, repo, pullNumber)
 ```
 
-- **New or re-surfaced?** Compare each thread's commit and time with the PR head. Codex re-raises
+- **All pages.** `get_review_comments` returns at most 100 threads per call. While its
+  `pageInfo.hasNextPage` is true, call it again with `after` set to `pageInfo.endCursor`; the
+  current round's findings can be on a later page.
+- **Which commit a thread reviews.** Threads carry no commit SHA. Reviews do (`commit_id`), and a
+  Codex review's inline comments are created at the same moment the review is submitted. Match
+  each thread's first comment `created_at` to a review's `submitted_at` to learn the commit it
+  reviewed. The comment ID for replies is the number at the end of the comment's `html_url`
+  (`#discussion_r<ID>`).
+
+- **New or re-surfaced?** Compare each thread's reviewed commit (above) with the PR head. Codex re-raises
   an unchanged finding when nearby code moves, sometimes anchored on a different line or file
   and worded differently. Match findings by their claim, not by location or wording. A finding
   already fixed, accepted or declined gets a reply pointing at the earlier answer, not a new
@@ -71,7 +81,9 @@ continue that agent with `SendMessage` rather than spawning a fresh one.
 ## Step 3: verify before the push
 
 Handle **every** finding of the round before pushing; one push per round, never one per
-finding.
+finding. A round where every finding was declined (2d) or answered by pointing at an earlier
+reply changes no file: skip the checks below and the push, never make an empty commit, and go straight to
+the replies and the re-request in Step 4.
 
 1. Run what CLAUDE.md's "Building and testing" lists, delegated to `cargo-runner` when the output
    is long. Run the whole changed crate (`cargo test -p <crate>` runs unit and integration
@@ -92,7 +104,7 @@ finding.
 ## Step 4: commit, push, answer, re-request
 
 - The commit message explains the bug and why the fix is right, not "address review feedback".
-- After the push, reply on **each** finding's own thread in a couple of sentences: what changed,
+- After the push (if the round has one), reply on **each** finding's own thread in a couple of sentences: what changed,
   or why not (with the ADR or backlog item for 2c, the trace for 2d). Take the comment ID from a
   `get_review_comments` result fetched in this turn, never from memory.
 - React on the finding's comment: 👍 when fixed (2a, 2b), 👎 when accepted as a limitation or
@@ -121,8 +133,9 @@ When a round is clean (or the fallback review in Step 0 is done):
 
 1. **Nothing deferred only in the conversation.** Go through the loop's history: follow-ups any
    agent or you called "deferred", "out of scope" or "worth a separate look", `design-advisor`
-   flags of latent gaps, and every 2c limitation. Each one is either fixed in this PR or added
-   with the `backlog` skill. Check also that `edge-case-hunter` has run against the diff as it
+   flags of latent gaps, and every 2c limitation. Each one is fixed in this PR, added with the
+   `backlog` skill, or (for a 2c limitation not worth closing later) recorded in its ADR's
+   Consequences as 2c requires; that ADR bullet is enough, and it needs no backlog item. Check also that `edge-case-hunter` has run against the diff as it
    stands now, if the diff met its gate at any point; a run against an earlier revision does not
    count after a later qualifying fix. If this step edits a file, go back through Steps 3 and 4.
 2. **Resolve the threads** that were fixed, accepted or declined (`resolve_review_thread`, with

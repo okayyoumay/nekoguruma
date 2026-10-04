@@ -178,9 +178,10 @@ Step 0 is done:
    require them to pass (`get_check_runs`); the local checks in Step 3 do not cover the Windows
    tests or the worker targets. A PR that skips `ci.yml` (see "CI facts") needs only
    `repo-checks` to pass. A red run sends you back to fixing it per CLAUDE.md. Also check the
-   base, even after a no-change round: `git fetch origin main`, and if the PR is behind or
-   conflicts (`mergeable_state: "dirty"`), merge `main` per Step 3.5 and go back through
-   Steps 3 and 4, since a check run on the old head says nothing about the merged tree.
+   base, even after a no-change round: if the PR conflicts with `main`
+   (`mergeable_state: "dirty"`), merge `main` per Step 3.5 and go back through Steps 3 and 4,
+   since a check run on the old head says nothing about the merged tree. Being merely behind
+   `main` is fine; the ruleset does not require an up-to-date branch.
 4. **Hand over.** Mark the PR ready for review and tell Yoko in the project thread that it is
    ready, listing anything accepted as a limitation and anything added to the backlog. Yoko
    reviews and merges; do not merge. Stay subscribed to the PR until it is merged or closed.

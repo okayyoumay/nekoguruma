@@ -25,8 +25,10 @@ Codex reacts 👀 on the trigger comment when it starts, then posts a review wit
 or reacts 👍 when it has nothing to report.
 
 A review wakes the session as a PR event; a reaction does not. So right after posting the
-trigger, schedule a one-shot check-in about 15 minutes later (`send_later`) and delete it if a
-review arrives first. At the check-in, read the trigger comment's reactions (Step 1) to see
+trigger, schedule a one-shot check-in about 15 minutes later (`send_later`). Keep it even when a
+review arrives first: inline comments can land after the summary, so a round is judged clean
+only from a read at least five minutes after the review was submitted (reschedule the check-in
+to that point if it would fire sooner). At the check-in, read the trigger comment's reactions (Step 1) to see
 whether Codex reacted 👍 (a clean round) or never started (below).
 
 **Codex not available.** If the trigger comment still has no 👀 and no review 15 minutes after
@@ -100,7 +102,9 @@ continue that agent with `SendMessage` rather than spawning a fresh one.
 Handle **every** finding of the round before pushing; one push per round, never one per
 finding. A round where every finding was declined (2d) or answered by pointing at an earlier
 reply changes no file: skip the checks below and the push, never make an empty commit, and go straight to
-the replies and the re-request in Step 4.
+the replies in Step 4. Re-request a review of the unchanged head only if the round contained a
+newly declined finding; a round whose findings were all answered earlier ends the loop, so go
+to Step 5 after the replies. Never re-request the same head twice.
 
 1. Run what CLAUDE.md's "Building and testing" lists, delegated to `cargo-runner` when the output
    is long. Run the whole changed crate (`cargo test -p <crate>` runs unit and integration
@@ -131,7 +135,7 @@ the replies and the re-request in Step 4.
   task request on that thread and answers with a setup notice instead of a review. Refer to
   "the re-request" or "the trigger comment" instead. Such a notice needs no answer.
 - Only after every thread of the round has its reply, post `@codex review` as its own comment
-  (Step 0), then go back to Step 1.
+  (Step 0), then go back to Step 1. A no-change round re-requests only as Step 3 allows.
 
 ## CI facts
 
@@ -149,7 +153,8 @@ the replies and the re-request in Step 4.
 
 ## Step 5: close out
 
-When a round is clean (or the fallback review in Step 0 is done):
+When a round is clean, a no-change round ended the loop (Step 3), or the fallback review in
+Step 0 is done:
 
 1. **Nothing deferred only in the conversation.** Go through the loop's history: follow-ups any
    agent or you called "deferred", "out of scope" or "worth a separate look", `design-advisor`

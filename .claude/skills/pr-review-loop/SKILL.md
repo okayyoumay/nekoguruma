@@ -45,6 +45,11 @@ push of Step 4. These findings have no review threads, so skip the per-thread re
 and the re-request; instead post one PR comment listing each finding, its route and the commit
 that fixed it (or the ADR or backlog item for 2c, the trace for 2d). Then go to Step 5.
 
+**Codex started but never finished.** If the trigger comment has 👀 but neither 👍 nor a review
+at the check-in, schedule one more check-in 15 minutes later. If that one still finds no result,
+treat the round as stalled: tell Yoko once in the thread, and run the same fallback review as
+above for this head instead of re-requesting. A later push may request Codex again as usual.
+
 ## Step 1: find out what the review found
 
 A review's summary comment is not evidence of a clean round. Findings arrive as separate inline

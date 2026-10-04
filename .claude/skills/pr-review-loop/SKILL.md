@@ -24,8 +24,10 @@ PR, and after every fix push, post a top-level PR comment whose whole body is `@
 Codex reacts 👀 on the trigger comment when it starts, then posts a review with inline comments,
 or reacts 👍 when it has nothing to report.
 
-**Codex not available.** If the trigger comment gets no 👀 and no review by the time CI on the
-same commit has finished, Codex is not enabled for this repository (it is switched on per
+**Codex not available.** If the trigger comment still has no 👀 and no review 15 minutes after
+it was posted (and after CI on that commit has finished, whichever is later; a PR that skips
+`ci.yml` finishes CI in seconds, so the time limit is what counts there), Codex is not enabled
+for this repository (it is switched on per
 repository in the Codex settings on chatgpt.com, which only Yoko can do). Say so once in the
 thread, do not post the trigger again on this PR, and run the fallback review instead:
 `edge-case-hunter` on the whole PR diff (`git diff origin/main...HEAD`), whatever the diff's

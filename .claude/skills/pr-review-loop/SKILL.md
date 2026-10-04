@@ -73,10 +73,11 @@ pull_request_read(method="get_comments", owner, repo, pullNumber, perPage=100)
   counts, which is where Codex's 👀 and 👍 on the latest `@codex review` comment show up. The
   counts carry no user names; nobody else reacts on Claude's own trigger comments, so a 👍 there
   is Codex's. If a human did react on it, post a fresh trigger instead of guessing.
-- **Which commit a thread reviews.** Threads carry no commit SHA. Reviews do (`commit_id`), and a
-  Codex review's inline comments are created at the same moment the review is submitted. Match
-  each thread's first comment `created_at` to a review's `submitted_at` to learn the commit it
-  reviewed. The comment ID for replies is the number at the end of the comment's `html_url`
+- **Which commit a thread reviews.** Threads carry no commit SHA. Reviews do (`commit_id`). A
+  review's inline comments are created no later than the review is submitted (for Codex, at the
+  same moment; a human's pending review can be submitted later), so the thread belongs to the
+  earliest review by the same author submitted at or after the thread's first comment
+  `created_at`. That review's `commit_id` is the commit the thread reviewed. The comment ID for replies is the number at the end of the comment's `html_url`
   (`#discussion_r<ID>`).
 
 - **New or re-surfaced?** Compare each thread's reviewed commit (above) with the PR head. Codex re-raises

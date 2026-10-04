@@ -147,7 +147,8 @@ run on main. Pull requests that change only documentation, `work/` or `.claude/`
 them.
 
 Compiler warnings fail CI: `core-linux`, `core-windows` and `worker-check` build with
-`RUSTFLAGS=-D warnings`, and `core-linux` runs `cargo fmt --check`. Silence a warning for code that
+`RUSTFLAGS=-D warnings`, and `core-linux` runs `cargo fmt --check`. Clippy is not run in CI
+(it would add a build to every pull request); run it locally before pushing. Silence a warning for code that
 is unused only until later work lands with `#[expect(..., reason = "...")]`, not `#[allow]`, so
 the attribute fails the build once the code is used and gets removed.
 

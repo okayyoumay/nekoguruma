@@ -28,7 +28,8 @@ public release, so write review comments as if they were already public.
 
 - **Copied standard text.** ISO 22900-2, SAE J2534-1, SAE J2534-2 and ISO 14229-1 are
   copyrighted. Any passage that reads as copied from one of them, quoted or not, at any length,
-  in code comments, `docs/`, ADRs, commit messages or the PR description. Citations must give
+  anywhere the repository stores it: code comments, string literals, test fixtures, schemas and
+  other data files, `docs/`, ADRs, commit messages and the PR description. Citations must give
   the clause or section number and paraphrase. Do not quote standard text in your own review
   comments either; describe the requirement in your own words.
 - **Secrets or private infrastructure** in committed files: credentials, keys, tokens, internal
@@ -57,6 +58,8 @@ public release, so write review comments as if they were already public.
     regenerated bindings in the same PR (stale bindings). Proto regeneration is never deferred.
   - FFI hand edit: a change to `crates/*-sys/src/bindings/*.rs` without a header change. No
     exception applies.
+  - FFI missing target: a target added to the target-ABI list in `docs/worker-crates.md` (or to
+    a CI target list) without its committed `src/bindings/{target}.rs` in every `*-sys` crate.
   - FFI stale bindings: a header change without regenerated bindings. This one case is
     accepted when the same PR records the deferred regeneration as a backlog item in `work/`;
     a note in the PR description alone is not enough.
@@ -72,9 +75,11 @@ public release, so write review comments as if they were already public.
   its theme entry; a duplicate ADR number; or a change that contradicts an accepted ADR without
   superseding it or annotating its Status line. Plain bug fixes and refactors without behaviour
   change need no ADR.
-- **Naming**: a new crate, binary or command without the `ngr` prefix; documentation not in
-  English; a new documentation file (under `docs/`, a crate's `docs/`, or anywhere else) whose
-  name is not kebab-case. Exceptions: ADRs (`ADR-{NNN}-{short-slug}.md`, plus `INDEX.md` and
+- **Naming**: a new crate, binary or command without the `ngr` prefix; a new path or
+  configuration directory named after the project that does not use the full lowercase name
+  `nekoguruma` (for example `ngr/` or `Nekoguruma/`); documentation not in English; a new
+  documentation file (under `docs/`, a crate's `docs/`, or anywhere else) whose name is not
+  kebab-case. Exceptions: ADRs (`ADR-{NNN}-{short-slug}.md`, plus `INDEX.md` and
   `TEMPLATE.md` in `docs/adr/`) and conventional upper-case files such as `README.md`.
 - **Spec citations**: a citation of a standard without its clause or section number, or an
   ISO 22900-2 citation that does not say whether it targets the 2009 or the 2022 edition.

@@ -34,8 +34,8 @@ default P1 cap, a P2 pick means nothing eligible is left, so stop. Take its pick
   available (see step 3);
 - will not fit in one pull request (record a split with the `backlog` skill instead, and pick
   again);
-- was reported stale (close it with the `backlog` skill in this iteration's PR, or as its own
-  small PR, and pick again).
+- was reported stale (close it with the `backlog` skill and pick again; the edit rides along as
+  described under "Backlog edits" below).
 
 Then take its alternative under the same rules. If neither works, stop: nothing unblocked is left
 within the cap.
@@ -49,18 +49,24 @@ If the work shows that the item needs something the loop cannot supply, do not g
 `Blocked on:` clause into the item with the `backlog` skill, using the forms in `work/README.md`
 (`Blocked on: Yoko's decision on ...` for a design choice that the specs and ADRs leave open),
 add it to the run's skipped list, discard the branch's other changes, and go back to step 2. A
-skipped item does not count against the run's item count. Keep the `Blocked on:` edit on the
-branch: it goes into the next loop PR. If the run stops before another PR is opened, open a
-backlog-only loop PR with these edits (step 4) and hand it to Yoko before the final report, so a
-later run does not pick the same items again. The run is unattended, so follow
+skipped item does not count against the run's item count; its `Blocked on:` edit is kept as
+described under "Backlog edits" below. The run is unattended, so follow
 `unattended-clarification` rather than waiting for an answer.
+
+### Backlog edits
+
+Backlog edits made while picking (a stale item closed, a split recorded, a `Blocked on:` clause
+added) stay on the branch and go into the next loop PR. If the run stops before another PR is
+opened, open a backlog-only loop PR with them (step 4) and hand it to Yoko before the final
+report, so a later run does not pick the same items again.
 
 ## 4. Pull request
 
 Open the PR as a draft with the `backlog-loop` label. Run `scripts/classify-pr-risk.sh` and copy
 its output into the PR description under a "Risk (shadow)" heading. The verdict is recorded only
 to compare it later with Yoko's own judgement; it changes nothing about who merges. Then run
-`pr-review-loop` until it hands the PR to Yoko.
+`pr-review-loop`. Before it hands the PR to Yoko, run the classifier again on the final head and
+replace the section if review fixes changed the verdict or its reasons.
 
 ## 5. Wait for the merge, then continue
 

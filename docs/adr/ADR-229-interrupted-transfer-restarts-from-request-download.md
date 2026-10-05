@@ -42,15 +42,15 @@ responsible for them, in the same way that business screens are theirs (design 9
    would be refused with a sequence error, an erase could run while the old download is still
    open, and services the checks rely on (such as ReadDataByIdentifier) may not be available. A
    restart therefore runs in this order:
-   1. Checks that need no ECU service. After an agent crash or power loss the restart is a new
-      run on this device, and the OS-level locks of the interrupted run were released with it,
+   1. Checks that need no ECU service. After an agent crash or a loss of the device's own
+      power the restart is a new run on this device, and the OS-level locks of the interrupted run were released with it,
       so before anything goes through the VCI the agent takes the per-VCI lock and the device's
       single reprogramming slot again (design 8.8 and 8.8.1), and it promotes the per-VCI lock
       to the per-vehicle lock as soon as a VIN read first matches the job's VIN, in step 2 or,
       when step 2 could not read it, in step 3, and before anything after that match; while
       another job holds either, the restart waits, and it expires at the start deadline like any
-      job. After a worker crash or a VCI disconnect the agent process survives and its job
-      still holds these guards (and the per-vehicle lock, if it already had it), so the
+      job. After a worker crash, a VCI disconnect or a loss of the vehicle's or ECU's supply
+      alone, the agent process survives and its job still holds these guards (and the per-vehicle lock, if it already had it), so the
       restart keeps them rather than taking them again, which would leave it waiting on its
       own locks. Then it checks the start deadline, the resume
       limit per stage, the interruptibility attribute (item 1) and the supply voltage read
@@ -113,8 +113,8 @@ responsible for them, in the same way that business screens are theirs (design 9
       precondition fails or cannot be established, in the post-transfer case just excluded,
       when the ECU refuses the reset, and when the reset gets no response so that its outcome is
       unknown. Passive teardown means the agent stops sending TesterPresent and
-      waits for the session timeout the procedure declares plus a margin (the framework has no
-      built-in default, since the value is ECU-specific).
+      waits for the session timeout the procedure declares plus the margin it also declares
+      (the framework has no built-in default for either, since both are ECU-specific).
 
       After either kind of teardown, or directly in the completed case above, the agent confirms that the ECU is back in its default
       session by reading the active-session data identifier F186 (ISO 14229-1 Annex C). This is
@@ -224,14 +224,14 @@ responsible for them, in the same way that business screens are theirs (design 9
   reconnection within the session timer, is lost on reset or session end, and a repeated block
   with the previous counter value is accepted without being written again. The recovery tests
   cover a fast reconnection (within the session timer) as well as a restart after it expired.
-- The IR has no fields yet for the session timeout a procedure declares, the response that
+- The IR has no fields yet for the session timeout a procedure declares and the margin added to it before a passive teardown is confirmed, the response that
   means no valid application is present, the retry limit for the recovery version read, the ECU startup time after a reset and the length of the window in which the session confirmation is retried, the
   resume limit of each stage (the stage it applies to and its maximum; `VmState` today keeps
   a single `resume_count` and no section or flash session declares a maximum), or a
   required external power supply (item 2; `FlashSession` today declares only the voltage
   range, ignition, engine-off and vehicle-stopped preconditions), nor a mapping that names
   which of the procedure's services and response fields yield the VIN, the hardware part
-  number and the software version (these identifiers can be OEM-specific); all eight are
+  number and the software version (these identifiers can be OEM-specific); all nine are
   added together with the write-job journal, along with the runtime input that reports whether the supply is
   connected. Until then a procedure cannot require the supply, and the voltage range is the
   only power check a restart can make. Without a declared

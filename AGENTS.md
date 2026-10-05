@@ -66,8 +66,11 @@ comments are public too.
   superseding it or annotating its Status line. Plain bug fixes and refactors without behaviour
   change need no ADR.
 - **Naming**: a new crate, binary or command without the `ngr` prefix; documentation not in
-  English; a new file under `docs/` whose name is not kebab-case (ADRs use
-  `ADR-{NNN}-{short-slug}.md`).
+  English; a new documentation file (under `docs/`, a crate's `docs/`, or anywhere else) whose
+  name is not kebab-case. Exceptions: ADRs (`ADR-{NNN}-{short-slug}.md`, plus `INDEX.md` and
+  `TEMPLATE.md` in `docs/adr/`) and conventional upper-case files such as `README.md`.
+- **Spec citations**: a citation of a standard without its clause or section number, or an
+  ISO 22900-2 citation that does not say whether it targets the 2009 or the 2022 edition.
 - **Temporary-file references**: a permanent file (anything outside `work/`) that names a
   specific file inside `work/`. Naming the folder itself or `work/README.md` is fine.
   `work/` is temporary working material, and open items belong there, not in permanent docs.
@@ -100,8 +103,7 @@ comments are public too.
   rests on one.
 - When a finding depends on what a standard requires and you cannot read the standard, still
   report it, but name the standard, edition and clause and say that the claim needs checking
-  against the text; do not state the requirement as fact. ISO 22900-2 exists in a 2009 and a
-  2022 edition; code and docs say which one they target.
+  against the text; do not state the requirement as fact.
 - One finding per root cause. Do not repeat a finding already answered on the PR unless the new
   code reintroduces it.
 - Write in English.

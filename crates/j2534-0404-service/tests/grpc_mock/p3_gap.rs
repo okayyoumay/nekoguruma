@@ -720,7 +720,7 @@ async fn tester_present_reqrsp_live_flip_takes_effect_on_next_due_send() {
 /// `CP_P3Func`-gapped, mirroring
 /// `tester_present_reqrsp_0_due_sends_are_func_gapped_from_each_other`. A
 /// `CoptUpdateparam` then flips `CP_TesterPresentReqRsp` to `1`, well ahead of
-/// the CLL's own ~50ms `CP_TesterPresentTime` interval elapsing again; per
+/// the CLL's own 500ms `CP_TesterPresentTime` interval elapsing again; per
 /// `same_wire_behavior`, this does not re-arm/resend tester-present, so
 /// `resolved.expects_response` is never refreshed.
 ///
@@ -735,8 +735,20 @@ async fn tester_present_reqrsp_live_flip_takes_effect_on_next_due_send() {
 /// the due-snapshot keeps reading the frozen `resolved.expects_response =
 /// false` from the `CP_TesterPresentReqRsp = 0` arm forever, forcing
 /// `this_requires_no_response = true` and gapping that second send to
-/// ~300ms; post-fix, it reads the live (now `1`) value, so the send is not
-/// gapped and fires promptly on the ~50ms cadence.
+/// ~1000ms; post-fix, it reads the live (now `1`) value, so the send is not
+/// gapped and fires on the 500ms cadence.
+///
+/// Timing: the poll task that sends tester-present also executes the queued
+/// `CoptUpdateparam`, and it is blocked for the whole `CP_P3Func` gap wait of
+/// the first send after the flip. The flip therefore has to land before that
+/// send falls due, one `CP_TesterPresentTime` after the previous send, or
+/// that send's `still_due` read sees the stale value too and the send under
+/// test is gapped whatever the due-snapshot reads. The flip takes two
+/// client round trips (`SetComParam`, `StartComPrimitive`), so the interval
+/// is 500ms (about 3x two `GRPC_ROUND_TRIP_OVERHEAD_CEILING_MS` round trips,
+/// ADR-149), and `CP_P3Func` is 1000ms so that a gapped send stays 250ms
+/// above the 750ms bound and well within `wait_for_written_count`'s 2s
+/// wait. With a 50ms interval a slow runner missed that window.
 #[tokio::test]
 #[serial]
 async fn tester_present_reqrsp_due_snapshot_reads_live_not_frozen_resolved() {
@@ -748,7 +760,7 @@ async fn tester_present_reqrsp_due_snapshot_reads_live_not_frozen_resolved() {
         j2534_0404::ISO15765,
         &[
             (j2534_0404::DATA_RATE, 500_000),
-            (CP_P3_FUNC, 300_000),
+            (CP_P3_FUNC, 1_000_000),
             (CP_REQUEST_ADDR_MODE, 2),
             (CP_CAN_FUNC_REQ_ID, 0x7DF),
             (CP_TESTER_PRESENT_ADDR_MODE, 1),
@@ -762,7 +774,7 @@ async fn tester_present_reqrsp_due_snapshot_reads_live_not_frozen_resolved() {
         vec![0x3E],
     )
     .await;
-    set_com_param_unum32(&mut client, cll_handle, CP_TESTER_PRESENT_TIME, 50_000).await;
+    set_com_param_unum32(&mut client, cll_handle, CP_TESTER_PRESENT_TIME, 500_000).await;
     // CP_TesterPresentReqRsp starts at its default (0).
     set_com_param_unum32(&mut client, cll_handle, CP_TESTER_PRESENT_HANDLING, 1).await;
     promote_via_update_param(&mut client, cll_handle).await;
@@ -788,7 +800,7 @@ async fn tester_present_reqrsp_due_snapshot_reads_live_not_frozen_resolved() {
 
     // Flip CP_TesterPresentReqRsp live, via CoptUpdateparam -- issued directly
     // (not via promote_via_update_param's own settling sleep), well ahead of
-    // the ~50ms CP_TesterPresentTime interval elapsing again.
+    // the 500ms CP_TesterPresentTime interval elapsing again.
     set_com_param_unum32(&mut client, cll_handle, CP_TESTER_PRESENT_REQ_RSP, 1).await;
     client
         .start_com_primitive(StartComPrimitiveRequest {
@@ -823,7 +835,7 @@ async fn tester_present_reqrsp_due_snapshot_reads_live_not_frozen_resolved() {
     let elapsed = server.backdoor.written_gap(MOCK_CHANNEL_ID, 2, 3);
 
     assert!(
-        elapsed < std::time::Duration::from_millis(280),
+        elapsed < std::time::Duration::from_millis(750),
         "the second due-triggered send after the CP_TesterPresentReqRsp flip should not be \
          CP_P3Func-gapped -- the due-snapshot itself must read the live CP_TesterPresentReqRsp \
          value, not the frozen resolved.expects_response from the reqrsp=0 arm (waited {elapsed:?})"

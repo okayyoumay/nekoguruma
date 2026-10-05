@@ -1,8 +1,11 @@
 name: CI
 
 # Pull requests run through `pull_request` only; `push` is limited to main so a PR commit is not
-# built twice. Changes that touch only documentation, `work/` or `.claude/` skip this workflow;
-# the repository checks that cover those files are in repo-checks.yml.
+# built twice. Changes that touch only documentation, `work/` or `.claude/` skip the build jobs;
+# the repository checks that cover those files are in repo-checks.yml. On main the push filter
+# below skips the whole workflow. Pull requests cannot use a workflow-level filter: the jobs are
+# required status checks in the main ruleset, and a workflow that never starts leaves them pending
+# forever, while a job skipped by `if:` counts as passed. The `changes` job decides instead.
 on:
   push:
     branches: [main]
@@ -12,11 +15,6 @@ on:
       - 'work/**'
       - '.claude/**'
   pull_request:
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
-      - 'work/**'
-      - '.claude/**'
   workflow_dispatch:
 
 # A new push to a pull request cancels the run for its previous commit.
@@ -33,19 +31,54 @@ permissions:
   contents: read
 
 jobs:
+  # Whether a pull request changes anything besides documentation, `work/` and `.claude/`
+  # (the same paths the push filter ignores). Always true outside pull requests. The jobs that
+  # depend on it run whenever it did not succeed (`always()`, so even when the run is cancelled
+  # while it is still going), so a failed or cancelled filter can never turn the required checks
+  # into skipped (and therefore passing) jobs.
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - id: filter
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [ "$EVENT" != pull_request ] ||
+             git diff --name-only "$BASE" HEAD | grep -qvE '(\.md$|^docs/|^work/|^\.claude/)'; then
+            echo code=true >> "$GITHUB_OUTPUT"
+          else
+            echo code=false >> "$GITHUB_OUTPUT"
+          fi
+
   # Server and agent are 64-bit only.
   # Linux: one process per test with nextest, so tests that are #[serial] under `cargo test` run in
   # parallel (.config/nextest.toml). nextest does not run doc tests, hence the separate --doc step.
   # Build caches are saved from main only; pull requests restore them.
+  # Compiler warnings fail core-linux, core-windows and worker-check (RUSTFLAGS), which build the
+  # code anyway, so the check costs no extra build. The release builds on main leave it out: zig's
+  # linker prints a warning of its own.
   core-linux:
+    needs: changes
+    if: ${{ always() && (needs.changes.result != 'success' || needs.changes.outputs.code == 'true') }}
     runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -D warnings
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@nextest
+      - run: cargo fmt --all -- --check
       - run: cargo nextest run --workspace --locked --exclude sim-vci --profile ci
       - run: cargo test --workspace --locked --exclude sim-vci --doc
 
@@ -54,11 +87,14 @@ jobs:
   # of the tests and of the Windows time) is left out: it has no Windows-specific code, and Linux
   # runs it on every pull request. main runs everything.
   core-windows:
+    needs: changes
+    if: ${{ always() && (needs.changes.result != 'success' || needs.changes.outputs.code == 'true') }}
     runs-on: windows-latest
     env:
       EXCLUDE: ${{ github.event_name == 'pull_request' && '--exclude j2534-0404-service' || '' }}
+      RUSTFLAGS: -D warnings
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -72,14 +108,19 @@ jobs:
   # Worker has 6 targets (12.1). On pull requests they are only type-checked, all on one Linux
   # runner: no crate compiles C code, so checking needs no cross toolchain or linker. The full
   # release builds (worker-linux, worker-windows) run on main.
+  # RUSTFLAGS replaces the gnullvm `rustflags` in .cargo/config.toml (+crt-static); that does not
+  # matter for a type check, which links nothing.
   worker-check:
+    needs: changes
+    if: ${{ always() && (needs.changes.result != 'success' || needs.changes.outputs.code == 'true') }}
     runs-on: ubuntu-latest
     env:
+      RUSTFLAGS: -D warnings
       TARGETS: >-
         x86_64-unknown-linux-gnu i686-unknown-linux-gnu aarch64-unknown-linux-gnu
         armv7-unknown-linux-gnueabihf x86_64-pc-windows-gnullvm i686-pc-windows-gnullvm
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-gnu,i686-unknown-linux-gnu,aarch64-unknown-linux-gnu,armv7-unknown-linux-gnueabihf,x86_64-pc-windows-gnullvm,i686-pc-windows-gnullvm
@@ -103,13 +144,15 @@ jobs:
           - aarch64-unknown-linux-gnu   # linux-arm64 (ABI interpretation is inferred. 7.1.2)
           - armv7-unknown-linux-gnueabihf # linux-armhf (same as above)
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
+          # One cache per target; with a shared key the matrix jobs race to save it.
+          cache-key: ${{ matrix.target }}
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-zigbuild
@@ -132,7 +175,7 @@ jobs:
           - x86_64-pc-windows-gnullvm   # win-x64
           - i686-pc-windows-gnullvm     # win-x86
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -162,9 +205,11 @@ jobs:
   # Verify ABI interpretation via a worker service x VCI simulator round trip.
   # Include ARM via QEMU user mode (real hardware tested separately).
   abi-roundtrip:
+    needs: changes
+    if: ${{ always() && (needs.changes.result != 'success' || needs.changes.outputs.code == 'true') }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: i686-unknown-linux-gnu

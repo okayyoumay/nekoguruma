@@ -66,6 +66,15 @@
 //!   meaningfully below the interval's un-overridden default, so a
 //!   regression where the override silently didn't take effect is still
 //!   caught rather than passing inside a too-generous window.
+//! - **A live ComParam change must land before the poll task blocks.**
+//!   The per-channel poll task both sends tester-present and executes
+//!   queued COPs such as `CoptUpdateparam`, and it does not execute them
+//!   while it sits in a P3 gap wait. A test that changes a ComParam between
+//!   two periodic sends and asserts on how the next send behaves needs the
+//!   change (all of its round trips) to fit, with the margin above, inside
+//!   the interval before the next send falls due. Otherwise the change is
+//!   applied one send late and the assertion fails by exactly the gap. Size
+//!   the interval for the round trips, then size the gap above it.
 //!
 //! ## A sixth, distinct flaky-test cause: shared startup state, not timing
 //!
@@ -1509,6 +1518,35 @@ impl MockBackdoor {
                 .expect("__mock_set_j1939_claim_lost should be exported");
             let rc = f(lost as u32);
             assert_eq!(rc, NC, "__mock_set_j1939_claim_lost should succeed");
+        }
+    }
+
+    /// Makes only the next `count` J1939 claim attempts (on any channel)
+    /// resolve `J1939_ADDRESS_LOST`; later ones claim normally. Unlike
+    /// [`Self::set_j1939_claim_lost`], the test sets this once before the
+    /// claim starts, so "the first candidate loses, the second wins" does not
+    /// depend on the test acting between two candidates (the service issues
+    /// the next one within one poll tick). `0` clears it, as does `reset()`.
+    pub(crate) fn set_j1939_claim_lost_count(&self, count: u32) {
+        unsafe {
+            let f: Symbol<unsafe extern "system" fn(u32) -> c_long> = self
+                .lib
+                .get(b"__mock_set_j1939_claim_lost_count\0")
+                .expect("__mock_set_j1939_claim_lost_count should be exported");
+            let rc = f(count);
+            assert_eq!(rc, NC, "__mock_set_j1939_claim_lost_count should succeed");
+        }
+    }
+
+    /// How many of the attempts armed by [`Self::set_j1939_claim_lost_count`]
+    /// have not been made yet.
+    pub(crate) fn j1939_claim_lost_remaining(&self) -> u32 {
+        unsafe {
+            let f: Symbol<unsafe extern "system" fn() -> u32> = self
+                .lib
+                .get(b"__mock_get_j1939_claim_lost_remaining\0")
+                .expect("__mock_get_j1939_claim_lost_remaining should be exported");
+            f()
         }
     }
 

@@ -10027,7 +10027,6 @@ mod clear_periodic_msgs_epoch_gating_tests {
     use std::sync::Arc;
 
     use j2534_0404_sys::libloading::{Library, Symbol};
-    use serial_test::serial;
     use tokio::sync::Mutex;
     use tonic::Request;
 
@@ -10689,9 +10688,11 @@ mod clear_periodic_msgs_epoch_gating_tests {
         })
     }
 
-    /// Reads the mock's cumulative, cross-channel `PassThruIoctl
-    /// (CLEAR_TX_BUFFER)` call counter (`__mock_get_clear_tx_buffer_count`,
-    /// same shared dynamically-loaded cdylib instance this module's `service`
+    /// Reads the mock's per-thread, cross-channel `PassThruIoctl
+    /// (CLEAR_TX_BUFFER)` call counter (`__mock_get_clear_tx_buffer_count_on_current_thread`,
+    /// per-thread so other tests running in parallel cannot move it -- see
+    /// `discovery.rs::tests::get_device_info_call_count`; same shared
+    /// dynamically-loaded cdylib instance this module's `service`
     /// already holds open -- see `set_stop_periodic_message_error`'s own doc
     /// comment in `terminate_tp20_broadcast_periodic_for_suspension_tests`
     /// for why a fresh `Library::new` on the identical path still resolves
@@ -10706,8 +10707,8 @@ mod clear_periodic_msgs_epoch_gating_tests {
         unsafe {
             let lib = Library::new(&lib_path).expect("mock library should be loadable");
             let f: Symbol<unsafe extern "system" fn() -> usize> = lib
-                .get(b"__mock_get_clear_tx_buffer_count\0")
-                .expect("__mock_get_clear_tx_buffer_count should be exported");
+                .get(b"__mock_get_clear_tx_buffer_count_on_current_thread\0")
+                .expect("__mock_get_clear_tx_buffer_count_on_current_thread should be exported");
             f()
         }
     }
@@ -10721,12 +10722,8 @@ mod clear_periodic_msgs_epoch_gating_tests {
     /// queue`'s native hardware clear is optional (its RPC always returns
     /// `Ok(())` either way), so the only way to observe whether the gate
     /// actually skipped the native call is the mock's own call counter --
-    /// see `clear_tx_buffer_count`'s own doc comment. `#[serial]`'d against
-    /// that same shared, process-global mock counter, mirroring this file's
-    /// own `tp20_stop_periodic_call_counter` precedent
-    /// (`terminate_tp20_broadcast_periodic_for_suspension_tests`).
+    /// see `clear_tx_buffer_count`'s own doc comment.
     #[tokio::test]
-    #[serial(clear_tx_buffer_counter)]
     async fn ioctl_clear_tx_queue_skips_the_native_call_for_a_hard_errored_cll() {
         let mut link = link_with_periodic(0);
         link.tp20_broadcast_periodic = None;

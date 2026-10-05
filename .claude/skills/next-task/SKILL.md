@@ -2,12 +2,21 @@
 name: next-task
 description: Recommend what to work on next in nekoguruma by surveying the whole backlog in work/ (project-wide and worker-crate files). Use when the user asks what to do next, what the top priority is, or which open item to pick up. Produces one pick plus one alternative, not a full list.
 argument-hint: "[area or crate to focus on]"
+context: fork
+agent: Explore
+model: sonnet
+effort: medium
+background: false
 ---
 
 # Next task
 
 Give one recommendation the user can act on, with the reasoning, not an
 inventory. For a plain list of open items, just read the backlog files.
+
+This skill runs as a forked read-only subagent on Sonnet: the backlog files
+are large, and only the recommendation comes back to the main conversation.
+Focus area, if the user gave one: $ARGUMENTS
 
 ## Steps
 

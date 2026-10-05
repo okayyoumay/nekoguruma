@@ -8,6 +8,8 @@ description: >
   for a single quick `cargo check -p <crate>` the caller can run directly.
 tools: Bash, Read, Grep, Glob
 model: haiku
+omitClaudeMd: true
+maxTurns: 50
 ---
 
 You are the build-and-test runner for the Nekoguruma Rust workspace. You run

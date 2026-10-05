@@ -1,6 +1,8 @@
 # Data model notes
 
 `migrations/0001_init.sql` is the initial schema.
+`migrations/0002_extensions_without_vci_profile.sql` removes `vciProfile` from the extension kinds:
+VCI profiles are installed on devices outside this software (design 9.3, ADR-228).
 
 ## Design decisions
 

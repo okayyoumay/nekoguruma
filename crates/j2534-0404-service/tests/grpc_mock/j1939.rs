@@ -31,27 +31,14 @@
 //! frame, read back via `MockBackdoor::written_data`. This also directly
 //! serves this file's own message-framing coverage (item 6 below).
 //!
-//! **Item 2 (retry-over-the-candidate-list on a LOST first candidate) is
-//! written using the backdoor, but is inherently timing-sensitive in a way
-//! this harness cannot fully eliminate, and is flagged as such rather than
-//! presented as a clean deterministic test.** `j2534-0404-mock`'s
-//! `__mock_set_j1939_claim_lost` is a single GLOBAL toggle (every channel,
-//! every address), not per-address and not call-counted -- there is no mock
-//! surface to make ONLY the first of several `IOCTL_PROTECT_J1939_ADDR`
-//! attempts lose. The retry loop (`run_j1939_claim_loop`) issues each
-//! candidate back-to-back once the previous one resolves, and a candidate's
-//! own resolution takes at least one internal `POLL_INTERVAL_MS` (10 ms)
-//! tick -- there is no client-observable signal (RPC ack, `SubscribeEvent`)
-//! precise enough to straddle that ~10 ms server-internal window reliably:
-//! this harness's own documented round-trip ceiling under load
-//! (`GRPC_ROUND_TRIP_OVERHEAD_CEILING_MS`, ADR-149) is *larger* than the
-//! window itself. The test below flips the toggle back to `false`
-//! immediately after the `StartComPrimitive` RPC ack returns (the earliest
-//! point this test can act), which should in practice land before the
-//! second candidate's own attempt is issued, but is not a hard guarantee.
-//! The assertions are structured so a missed window fails loudly (the COP
-//! not finishing cleanly, or the wrong candidate being claimed) rather than
-//! silently passing on the wrong candidate.
+//! **Item 2 (retry-over-the-candidate-list on a LOST first candidate)** uses
+//! `__mock_set_j1939_claim_lost_count(1)`, set before `CoptStartcomm`: only
+//! the first `IOCTL_PROTECT_J1939_ADDR` attempt loses, so which candidate
+//! wins does not depend on timing. (Toggling the global
+//! `__mock_set_j1939_claim_lost` off after the `StartComPrimitive` ack, as
+//! this test once did, raced the retry loop, which issues the next
+//! candidate within one internal `POLL_INTERVAL_MS` tick, and failed under
+//! load.)
 
 use serial_test::serial;
 use tonic::Code;
@@ -652,12 +639,10 @@ async fn connecting_and_starting_comm_claims_the_preferred_address() {
     server.shutdown().await;
 }
 
-/// Item 2 (retry-over-the-candidate-list on a LOST first candidate) --
-/// see this file's module doc for the inherent timing caveat.
-/// `__mock_set_j1939_claim_lost(true)` is set before `CoptStartcomm`, forcing
-/// the first `CP_J1939PreferredAddress` candidate (0x80) to lose, and
-/// flipped back to `false` immediately once the RPC ack returns -- letting
-/// the second candidate (0x81) claim successfully.
+/// Item 2 (retry-over-the-candidate-list on a LOST first candidate):
+/// `__mock_set_j1939_claim_lost_count(1)` is set before `CoptStartcomm`, so
+/// the first `CP_J1939PreferredAddress` candidate (0x80) loses and the
+/// second (0x81) claims successfully.
 #[tokio::test]
 #[serial]
 async fn claim_retries_the_next_candidate_after_the_first_is_lost() {
@@ -685,18 +670,10 @@ async fn claim_retries_the_next_candidate_after_the_first_is_lost() {
         .expect("subscribe_event should succeed")
         .into_inner();
 
-    server.backdoor.set_j1939_claim_lost(true);
+    server.backdoor.set_j1939_claim_lost_count(1);
     start_comm(&mut client, cll_handle)
         .await
         .expect("start_com_primitive(CoptStartcomm) should succeed");
-    // Flip back to `false` as soon as this test can possibly act, so the
-    // SECOND candidate's own IOCTL_PROTECT_J1939_ADDR issue (which the
-    // service dispatches back-to-back once the first candidate's Lost
-    // outcome resolves, ~1 POLL_INTERVAL_MS/10ms later) evaluates under the
-    // cleared toggle. See this file's module doc for why this cannot be a
-    // hard guarantee with the mock's current (global, not per-address)
-    // toggle.
-    server.backdoor.set_j1939_claim_lost(false);
 
     let mut finished = false;
     let mut saw_init_error = false;
@@ -717,14 +694,15 @@ async fn claim_retries_the_next_candidate_after_the_first_is_lost() {
         finished
     })
     .await;
-    assert!(
-        finished,
-        "CoptStartcomm should finish -- if this fails, the retry likely raced past both \
-         candidates before the backdoor was cleared (see this file's module doc)"
-    );
+    assert!(finished, "CoptStartcomm should finish");
     assert!(
         !saw_init_error,
         "the claim should have succeeded on the second candidate, not exhausted the list"
+    );
+    assert_eq!(
+        server.backdoor.j1939_claim_lost_remaining(),
+        0,
+        "the first candidate's claim attempt should have been made, and lost"
     );
 
     drop(events);
@@ -742,8 +720,7 @@ async fn claim_retries_the_next_candidate_after_the_first_is_lost() {
 }
 
 /// Item 3: every candidate losing (a single-candidate list, forced to lose
-/// via the backdoor for the whole test -- no mid-flight timing dependency,
-/// unlike item 2 above) exhausts the retry list and fails the StartComm COP:
+/// via the backdoor for the whole test) exhausts the retry list and fails the StartComm COP:
 /// `PduErrEvtInitError` followed by `PduCopstFinished`, mirroring
 /// `startcomm_comparam.rs`'s own K-line init-failure assertion shape
 /// (ADR-077).

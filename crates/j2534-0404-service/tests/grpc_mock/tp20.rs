@@ -36,6 +36,15 @@ use crate::harness::*;
 /// shape UART Echo Byte/Honda DIAG-H/J1708/J1939 already use).
 const TP2_0_RESOURCE_ID: u32 = 0x025F;
 
+/// How long a test waits for a `CoptStartcomm` that no indication ever
+/// answers (`__mock_set_tp20_no_indication` armed) to reach `Finished`.
+/// That only happens once the service's own fixed 2 s local wait deadline
+/// (`TP20_CONNECTION_TIMEOUT_MS` in `src/service/events_tp20_connection.rs`)
+/// elapses and the abandoned attempt is torn down, so the wait is that
+/// deadline plus margin. A 1 s margin was too little on a loaded Windows
+/// runner; 3 s is still far below anything that would hide a real hang.
+const ABANDON_WAIT_MS: u64 = 2_000 + 3_000;
+
 /// D-PDU `CP_TP20ChannelSetupCanId` ComParam ID
 /// (`service_params::PARAM_TP20_CHANNEL_SETUP_CAN_ID`, 0x80C9): packs into
 /// Table 78 bytes 0-3 of `IOCTL_REQUEST_CONNECTION`'s request.
@@ -2204,7 +2213,7 @@ async fn abandoned_connection_request_quarantines_its_rx_id_against_an_immediate
     wait_for_cop_executing(&mut client, first_cop_handle).await;
 
     assert!(
-        wait_for_event(&mut events, 3000, |item| matches!(
+        wait_for_event(&mut events, ABANDON_WAIT_MS, |item| matches!(
             item.data,
             Some(event_item::Data::CopStatus(status))
                 if status == PduComPrimitiveStatus::PduCopstFinished as i32
@@ -2366,7 +2375,7 @@ async fn abandoned_entrys_quarantine_releases_even_after_its_owner_cll_is_gone()
         .expect("cop_handle should be present");
     wait_for_cop_executing(&mut client, cop_handle).await;
     assert!(
-        wait_for_event(&mut events_a, 3000, |item| matches!(
+        wait_for_event(&mut events_a, ABANDON_WAIT_MS, |item| matches!(
             item.data,
             Some(event_item::Data::CopStatus(status))
                 if status == PduComPrimitiveStatus::PduCopstFinished as i32
@@ -2690,7 +2699,7 @@ async fn abandoned_entrys_established_outcome_stays_quarantined_until_the_follow
         .expect("cop_handle should be present");
     wait_for_cop_executing(&mut client, cop_handle).await;
     assert!(
-        wait_for_event(&mut events_a, 3000, |item| matches!(
+        wait_for_event(&mut events_a, ABANDON_WAIT_MS, |item| matches!(
             item.data,
             Some(event_item::Data::CopStatus(status))
                 if status == PduComPrimitiveStatus::PduCopstFinished as i32

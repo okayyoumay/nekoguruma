@@ -1240,24 +1240,28 @@ mod tests {
         }
     }
 
-    /// Process-global count of every `PassThruStopPeriodicMsg` call made so
-    /// far, on any channel -- incremented unconditionally by the mock before
+    /// Count of the `PassThruStopPeriodicMsg` calls made so far on this
+    /// thread, on any channel -- incremented unconditionally by the mock before
     /// it even checks whether `channel_id` is a channel it actually knows
     /// about (`j2534-0404-mock/src/lib.rs`'s own `PassThruStopPeriodicMsg`),
     /// so it is a faithful "was this native call actually issued" signal
     /// even against this file's fabricated `RMD_CHANNEL_ID` (never registered
-    /// with the mock via a real `PassThruConnect`). Needs the same
-    /// `#[serial(tp20_stop_periodic_call_counter)]` group every other user of
-    /// this counter across the crate already joins, since it is one shared
-    /// process-global value.
+    /// with the mock via a real `PassThruConnect`). Per-thread rather than
+    /// the mock's process-wide count, so other tests running in parallel
+    /// cannot move it (see `discovery.rs::tests::get_device_info_call_count`).
+    /// The tests that read it stay in the `#[serial(tp20_stop_periodic_call_counter)]`
+    /// group because the tests that arm the process-global
+    /// `__mock_set_stop_periodic_message_error` injection are in it too, so
+    /// none of them sees another's injected error. (Untagged callers of
+    /// `PassThruStopPeriodicMsg` elsewhere in the crate are not covered.)
     fn stop_periodic_call_count() -> usize {
         let lib_path = j2534_0404_mock::mock_library_path().expect("mock cdylib should be built");
         unsafe {
             let lib = j2534_0404_sys::libloading::Library::new(&lib_path)
                 .expect("mock library should be loadable");
             let f: j2534_0404_sys::libloading::Symbol<unsafe extern "system" fn() -> usize> = lib
-                .get(b"__mock_get_stop_periodic_count\0")
-                .expect("__mock_get_stop_periodic_count should be exported");
+                .get(b"__mock_get_stop_periodic_count_on_current_thread\0")
+                .expect("__mock_get_stop_periodic_count_on_current_thread should be exported");
             f()
         }
     }
@@ -1270,7 +1274,7 @@ mod tests {
     /// its own (see `rpc_module_disconnect`'s own doc comment at the
     /// collection site for the full rationale/precedent this supersedes).
     /// Proves that attempt actually fires -- `stop_periodic_call_count()`
-    /// increments by at least one -- while keeping every pre-existing
+    /// increments by exactly one -- while keeping every pre-existing
     /// assertion from the superseded test unchanged: the call still
     /// succeeds without panicking, and every map this teardown touches still
     /// ends up empty exactly as an ordinary `ModuleDisconnect` would leave
@@ -1302,15 +1306,11 @@ mod tests {
                  live on the torn-down CLL",
             );
 
-        assert!(
-            stop_periodic_call_count() > before,
-            "a committed broadcast periodic on a still-live (non-dead) SharedChannel must get an \
-             explicit best-effort PassThruStopPeriodicMsg attempt of its own -- `>=`, not `==`, \
-             since `stop_periodic_call_count()` is a process-global counter this crate's other, \
-             unserialized tests can also legitimately increment while this test's own window is \
-             open (observed empirically: this assertion flaked under the full crate-wide suite \
-             with a strict `==`), so only the monotonic \"at least one more call happened\" \
-             direction is safe to assert here"
+        assert_eq!(
+            stop_periodic_call_count(),
+            before + 1,
+            "a committed broadcast periodic on a still-live (non-dead) SharedChannel must get \
+             exactly one explicit best-effort PassThruStopPeriodicMsg attempt of its own"
         );
         assert!(
             service.logical_links.lock().await.is_empty(),
@@ -1381,23 +1381,13 @@ mod tests {
 
     /// A minimal `tracing::Subscriber` that records whether any WARN-level
     /// event with a target containing `module_path_needle` was observed.
-    /// Deliberately does NOT rely on this crate's shared, process-global
-    /// mock call-count backdoors (`stop_periodic_call_count()` and
-    /// siblings): those are read-only windows onto a SINGLE shared counter
-    /// every OTHER test in this crate's suite can also legitimately
-    /// increment, on its own thread, at any moment -- exactly the source of
-    /// this file's own `module_disconnect_issues_a_best_effort_periodic_
-    /// stop_for_a_committed_broadcast_before_teardown`-adjacent flake this
-    /// round-18 test suite hit empirically under the full crate-wide
-    /// `cargo test` run (a strict `stop_periodic_call_count() == before`
-    /// intermittently failed with other tests' calls counted in). Setting
+    /// Observes the warning itself rather than a mock call count. Setting
     /// this subscriber as the THREAD-LOCAL default (`tracing::subscriber::
     /// set_default`) around one `#[tokio::test]`'s single, un-spawned
     /// `current_thread`-runtime task observes only events emitted by code
     /// running on THIS test's own OS thread -- every other concurrently
     /// running test in the suite runs on its own separate OS thread with
-    /// its own separate tracing dispatch, so this is immune to the exact
-    /// class of cross-test interference the shared counter is not.
+    /// its own separate tracing dispatch, so other tests cannot interfere.
     struct WarnCapture {
         saw_matching_warn: std::sync::Arc<std::sync::atomic::AtomicBool>,
         module_path_needle: &'static str,
@@ -1434,10 +1424,7 @@ mod tests {
     /// error`) so that an incorrectly-NOT-skipped attempt would be loudly
     /// `warn!`-logged from `rpc_module.rs` itself; a `WarnCapture` subscriber
     /// set as this test's own thread-local default proves no such warning
-    /// fired -- see that struct's own doc comment for why this, not the
-    /// shared `stop_periodic_call_count()` counter other tests in this
-    /// module use, is the robust way to prove a skip (a negative claim)
-    /// specifically.
+    /// fired.
     #[tokio::test]
     #[serial(tp20_stop_periodic_call_counter)]
     async fn module_disconnect_skips_the_best_effort_stop_for_an_already_dead_channel() {

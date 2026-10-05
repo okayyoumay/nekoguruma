@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://example.com/schemas/vci-profile.schema.json",
   "title": "VCI Profile",
-  "description": "Design document 9.3. Whereas the registration definition (7.1) states 'where the library is', this declares 'how to handle that VCI'. Whether this can be expressed as data decides whether the framework approach succeeds.",
+  "description": "Design document 9.3. Whereas the registration definition (7.1) states 'where the library is', this declares 'how to handle that VCI'. Whether this can be expressed as data decides whether the framework approach succeeds. Installed on the device outside this software, not distributed as an extension package (9.3, ADR-228).",
   "type": "object",
   "required": ["schemaVersion", "match", "standard"],
   "additionalProperties": false,

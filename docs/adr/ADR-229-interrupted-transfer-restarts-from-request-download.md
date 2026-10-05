@@ -237,10 +237,15 @@ responsible for them, in the same way that business screens are theirs (design 9
   is only advisory (design 8.8), and a counter alone does not stop a failed device that
   reconnects from recovering the same ECU while another device performs the handover. The
   server refuses a reservation while another device holds an unexpired lease, a handover
-  starts only after the failed device's lease has expired, and the recovering agent renews its
-  lease, presenting its generation, immediately before each step that changes the ECU
-  (ECUReset, the replay of the pre-erase steps, erase, RequestDownload) and stops without
-  sending that step if the renewal is refused or cannot be confirmed. An agent without a
+  starts only after the failed device's lease has expired. A write job holds such a lease from
+  its first step that changes the ECU until it ends, on its first run as well as on a
+  recovery, so a device that is merely slow is never handed over while it still writes. The
+  agent renews the lease, presenting its generation, before every request that changes the
+  ECU (ECUReset, the replay of the pre-erase steps, erase, RequestDownload, each TransferData
+  block, RequestTransferExit and the post-transfer steps) and in the background at an interval
+  well inside the expiry; once the remaining lease time without a confirmed renewal is shorter
+  than the longest such request can take, it sends no further ECU-changing request and the
+  job is interrupted at that point, to be recovered by whichever device holds the next lease. An agent without a
   configured server has no handover and needs no lease.
 - Because every recovery on an agent with a configured server reserves its attempt there
   first, a write job interrupted

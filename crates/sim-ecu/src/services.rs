@@ -130,10 +130,13 @@ impl SimEcu {
         }
         let target = Session::from_code(sf.value).expect("checked by sub_function");
         // Every session start, including a restart of the active one, relocks security
-        // (clause 9.2.1, transitions c and d). A running download depends on the unlocked state,
-        // so any session start interrupts it.
+        // (clause 9.2.1, transitions c and d). A running download stops when the new session
+        // does not support it, or when it was opened behind security access, which the relock
+        // takes away; otherwise it carries on.
         self.lock_security();
-        self.interrupt_transfer();
+        if target != Session::Programming || self.config.require_security_access {
+            self.interrupt_transfer();
+        }
         self.session = target;
         let p2 = P2_SERVER_MAX_MS.to_be_bytes();
         let p2_star = P2_STAR_SERVER_MAX_10MS.to_be_bytes();

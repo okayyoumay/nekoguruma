@@ -46,14 +46,18 @@ Any other SID gets NRC 11. The session timeout (S3) is not simulated: a non-defa
 until a session change, an ECU reset or `reconnect()`.
 
 Every DiagnosticSessionControl request relocks security, including a restart of the active
-session. Because a running download depends on the unlocked state, every session start, a
-restart of the programming session included, interrupts it (see below).
+session. A running download is interrupted (see below) by any session other than programming,
+and also by a restart of the programming session when `EcuConfig::require_security_access` is
+set, since the download was opened behind the security access that the relock takes away.
+Without security access, a restart of the programming session leaves the download running.
+A rejected DiagnosticSessionControl request changes nothing.
 
 Services 2E, 31, 34, 36 and 37 need gateway authentication when `EcuConfig::require_gateway_auth`
 is set; NRC 34 is returned until `SimEcu::gateway_authenticated` is set (there is no
 Authentication service in the simulator). The check is a service-level one at the position of
 the general behaviour figure (clause 7.7.2), so it comes before each service's own length and
-range checks. A power cycle, ECU reset or `reconnect()` clears the authentication.
+range checks. Authentication is the gateway's state, not the ECU's, so a power cycle, ECU reset
+or `reconnect()` of the simulated ECU leaves it as it is.
 
 ## Data identifiers
 
@@ -99,9 +103,9 @@ cycle or ECU reset clears the false-attempt counter but not an active delay. Wit
 ## Interruption and resume
 
 `EcuConfig::drop_at_block = Some(n)` makes the ECU drop block `n` (counted from 1 over the whole
-download) and answer nothing until `reconnect()`. It fires once: the field is cleared when it does. `reconnect()`, ECUReset and leaving the
-programming session turn a running download into the interrupted state, keeping the data already
-stored.
+download) and answer nothing until `reconnect()`. It fires once: the field is cleared when it does. `reconnect()`, ECUReset and the
+session changes described above turn a running download into the interrupted state, keeping the
+data already stored.
 
 A download resumes with a RequestDownload whose address and size cover exactly the part not yet
 received; the blockSequenceCounter starts again at 1. Any other RequestDownload in the interrupted

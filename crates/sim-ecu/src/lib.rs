@@ -344,7 +344,6 @@ impl SimEcu {
         self.session = Session::Default;
         self.lock_security();
         self.failed_attempts = 0;
-        self.gateway_authenticated = false;
         self.interrupt_transfer();
     }
 

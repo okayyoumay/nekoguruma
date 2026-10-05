@@ -1078,9 +1078,159 @@ fn restarting_the_programming_session_interrupts_the_transfer() {
 }
 
 #[test]
-fn reconnect_clears_gateway_authentication() {
-    let mut ecu = ecu();
+fn restarting_the_programming_session_keeps_an_unsecured_transfer() {
+    let mut ecu = SimEcu::new(EcuConfig {
+        require_security_access: false,
+        ..config()
+    });
+    enter(&mut ecu, Session::Programming);
+    ecu.request(&[0x31, 0x01, 0xFF, 0x00]);
+    ecu.request(&request_download(0, 4));
+    ecu.request(&transfer(1, &[1, 2]));
+    enter(&mut ecu, Session::Programming);
+    assert_eq!(ecu.flash, FlashPhase::Transferring { next_block: 2 });
+    assert_eq!(ecu.request(&transfer(2, &[3, 4])), pos(&[0x76, 0x02]));
+    // Leaving the programming session still interrupts it.
+    ecu.request(&request_download(0, 4));
+    enter(&mut ecu, Session::Extended);
+    assert_eq!(
+        ecu.request(&[0x37]),
+        neg(0x37, Nrc::ServiceNotSupportedInActiveSession)
+    );
+}
+
+#[test]
+fn rejected_session_control_changes_nothing() {
+    let mut ecu = ready_to_download();
+    ecu.request(&request_download(0, 4));
+    ecu.request(&transfer(1, &[0; 2]));
+    assert_eq!(
+        ecu.request(&[0x10, 0x04]),
+        neg(0x10, Nrc::SubFunctionNotSupported)
+    );
+    assert_eq!(
+        ecu.request(&[0x10, 0x02, 0x00]),
+        neg(0x10, Nrc::IncorrectMessageLengthOrInvalidFormat)
+    );
+    assert!(ecu.security_unlocked);
+    assert_eq!(ecu.flash, FlashPhase::Transferring { next_block: 2 });
+}
+
+#[test]
+fn gateway_authentication_survives_an_ecu_reset_and_the_transfer_resumes() {
+    let mut ecu = SimEcu::new(EcuConfig {
+        require_gateway_auth: true,
+        drop_at_block: Some(2),
+        ..config()
+    });
     ecu.gateway_authenticated = true;
+    enter(&mut ecu, Session::Programming);
+    unlock(&mut ecu);
+    ecu.request(&[0x31, 0x01, 0xFF, 0x00]);
+    ecu.request(&request_download(0, 4));
+    ecu.request(&transfer(1, &[1, 2]));
+    assert_eq!(ecu.request(&transfer(2, &[3, 4])), SimResponse::NoResponse);
     ecu.reconnect();
-    assert!(!ecu.gateway_authenticated);
+    assert_eq!(ecu.request(&[0x11, 0x01]), pos(&[0x51, 0x01]));
+    assert!(ecu.gateway_authenticated);
+    back_in_programming(&mut ecu);
+    assert!(matches!(
+        ecu.request(&request_download(2, 2)),
+        SimResponse::Positive(_)
+    ));
+    assert_eq!(ecu.request(&transfer(1, &[3, 4])), pos(&[0x76, 0x01]));
+}
+
+#[test]
+fn transfer_data_needs_gateway_authentication() {
+    let mut ecu = ready_to_download();
+    ecu.request(&request_download(0, 4));
+    ecu.config.require_gateway_auth = true;
+    assert_eq!(
+        ecu.request(&transfer(1, &[0; 2])),
+        neg(0x36, Nrc::AuthenticationRequired)
+    );
+}
+
+#[test]
+fn session_change_and_reset_discard_the_pending_seed() {
+    for reset in [&[0x10, 0x03][..], &[0x11, 0x01]] {
+        let mut ecu = ecu();
+        enter(&mut ecu, Session::Extended);
+        let SimResponse::Positive(seed) = ecu.request(&[0x27, 0x01]) else {
+            panic!("requestSeed failed");
+        };
+        assert!(matches!(ecu.request(reset), SimResponse::Positive(_)));
+        enter(&mut ecu, Session::Extended);
+        let seed = u32::from_be_bytes([seed[2], seed[3], seed[4], seed[5]]);
+        let key = SimEcu::key_for_seed(seed).to_be_bytes();
+        assert_eq!(
+            ecu.request(&[0x27, 0x02, key[0], key[1], key[2], key[3]]),
+            neg(0x27, Nrc::RequestSequenceError),
+            "after {reset:02X?}"
+        );
+    }
+}
+
+#[test]
+fn a_wrong_key_consumes_the_seed() {
+    let mut ecu = ecu();
+    enter(&mut ecu, Session::Extended);
+    let SimResponse::Positive(seed) = ecu.request(&[0x27, 0x01]) else {
+        panic!("requestSeed failed");
+    };
+    assert_eq!(
+        ecu.request(&[0x27, 0x02, 0, 0, 0, 0]),
+        neg(0x27, Nrc::InvalidKey)
+    );
+    let seed = u32::from_be_bytes([seed[2], seed[3], seed[4], seed[5]]);
+    let key = SimEcu::key_for_seed(seed).to_be_bytes();
+    assert_eq!(
+        ecu.request(&[0x27, 0x02, key[0], key[1], key[2], key[3]]),
+        neg(0x27, Nrc::RequestSequenceError)
+    );
+}
+
+#[test]
+fn a_second_request_seed_replaces_the_first() {
+    let mut ecu = ecu();
+    enter(&mut ecu, Session::Extended);
+    let SimResponse::Positive(first) = ecu.request(&[0x27, 0x01]) else {
+        panic!("requestSeed failed");
+    };
+    assert!(matches!(
+        ecu.request(&[0x27, 0x01]),
+        SimResponse::Positive(_)
+    ));
+    let first = u32::from_be_bytes([first[2], first[3], first[4], first[5]]);
+    let key = SimEcu::key_for_seed(first).to_be_bytes();
+    assert_eq!(
+        ecu.request(&[0x27, 0x02, key[0], key[1], key[2], key[3]]),
+        neg(0x27, Nrc::InvalidKey)
+    );
+}
+
+#[test]
+fn request_transfer_exit_from_interrupted_needs_all_data() {
+    let mut ecu = ready_to_download();
+    ecu.request(&request_download(0, 4));
+    ecu.request(&transfer(1, &[0; 2]));
+    ecu.reconnect();
+    back_in_programming(&mut ecu);
+    assert_eq!(ecu.request(&[0x37]), neg(0x37, Nrc::RequestSequenceError));
+    assert_eq!(ecu.flash, FlashPhase::Interrupted { last_block: 1 });
+}
+
+#[test]
+fn transfer_data_repeat_compares_against_the_last_block() {
+    let mut ecu = ready_to_download();
+    ecu.request(&request_download(0, 6));
+    ecu.request(&transfer(1, &[1, 2, 3, 4]));
+    assert_eq!(ecu.request(&transfer(2, &[5, 6])), pos(&[0x76, 0x02]));
+    assert_eq!(ecu.request(&transfer(2, &[5, 6])), pos(&[0x76, 0x02]));
+    assert_eq!(
+        ecu.request(&transfer(2, &[1, 2])),
+        neg(0x36, Nrc::WrongBlockSequenceCounter)
+    );
+    assert_eq!(ecu.image(), &[1, 2, 3, 4, 5, 6]);
 }

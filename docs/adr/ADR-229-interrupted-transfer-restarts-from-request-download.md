@@ -259,9 +259,11 @@ responsible for them, in the same way that business screens are theirs (design 9
   device performs the handover. Ownership moves to the receiving device only when the
   operator confirms on the server that the failed device is disconnected from the vehicle (or
   powered off); from then on the failed device's reservations are refused, so it sends nothing
-  further to the ECU. The transfer also starts a new ownership generation, and the server
-  applies a job-state change or checkpoint summary only when it comes from the current owner
-  under the current generation; anything the former owner sends later, such as messages
+  further to the ECU. The transfer also starts a new ownership generation. The generation is
+  part of the signed job instruction and is carried by every job-state message, checkpoint
+  summary and reservation the agent sends, and the server applies one only when both the
+  device and the generation match the current ones exactly, so a message queued under an
+  earlier generation is refused even if ownership has since returned to the same device; anything the former owner sends later, such as messages
   queued while it was offline, is kept only as audit data (with its uploaded journal) and
   never overwrites the receiver's state or summary. Fencing by operator confirmation was chosen over a time-limited lease
   renewed during the write, because a lease would make every write on a server-connected

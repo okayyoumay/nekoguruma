@@ -44,7 +44,8 @@ branch; if that is not the branch this session was given, tell the maintainer an
 
 ## 1. Check before each iteration
 
-List the open pull requests with the `backlog-loop` label. If one belongs to this run, resume
+List the open loop PRs: those whose title starts with `[backlog-loop]` or that carry the
+`backlog-loop` label. If one belongs to this run, resume
 it as described under "Run state" instead of going on. If one belongs to another run, stop the
 run and go to "Final report" (one item at a time).
 
@@ -97,12 +98,13 @@ give the same answer), or after five calls.
 
 Commit the backlog edits so far (see "Backlog edits") or, if there are none, an empty commit
 (`git commit --allow-empty`) naming the item, push, and open the draft PR right away (step 5's
-first paragraph). The open labelled PR is what tells any other session that an item is in
+first paragraph). The open loop PR is what tells any other session that an item is in
 progress.
 
-Once the PR carries the label, list the open `backlog-loop` PRs again. If one of them has a lower
-number than this one (two runs started together), close this one with a comment naming the
-other, and stop the run. The same check follows every loop PR this skill opens, including a
+Then list the open loop PRs again (title prefix or label, as in step 1). The title prefix is set
+when the PR is created, so this does not depend on when either PR got its label. If one of them
+has a lower number than this one (two runs started together), close this one with a comment
+naming the other, and stop the run. The same check follows every loop PR this skill opens, including a
 backlog-only PR.
 
 ## 4. Implement
@@ -117,7 +119,7 @@ leave open), and put the item on the skipped list. Commit that edit, then revert
 iteration's implementation changes with a new commit. All backlog edits stay: those made while
 picking, the new clause and any follow-up items; if the item itself was already closed, restore
 it first so the clause has an item to attach to (no history rewrite), turn the PR into a
-backlog-only PR (retitle it; it keeps the label), take it through step 5, and count it on the
+backlog-only PR (retitle it, keeping the `[backlog-loop]` prefix and the label), take it through step 5, and count it on the
 backlog-only list. A skipped item does not count against the items left. The run is unattended,
 so follow `unattended-clarification` rather than waiting for an answer.
 
@@ -127,13 +129,14 @@ Edits to the backlog made while picking (a stale item closed, a split recorded, 
 or removed) are committed on the branch and go into this iteration's PR. If the run stops before
 a PR carries them, open a backlog-only loop PR with them and take it through step 5 before the
 final report, so a later run does not pick the same items again. Never do this while another
-labelled PR is open. That PR ends the run: mark it "final" in the run state; when it merges,
+loop PR is open. That PR ends the run: mark it "final" in the run state; when it merges,
 nothing restarts, and the next run starts only when the maintainer asks.
 
 ## 5. Pull request
 
-The PR is a draft with the `backlog-loop` label. Create the label first if the repository does
-not have it, and check that the PR carries it; without it, step 1 cannot see the open item.
+The PR is a draft whose title starts with `[backlog-loop]`, set when it is created, and it
+carries the `backlog-loop` label. Create the label first if the repository does not have it, and
+check that the PR carries it.
 
 Run `scripts/classify-pr-risk.sh` (after the fetch in step 1) and copy its output into the PR description under a
 "Risk (shadow)" heading. The verdict is recorded only to compare it later with the maintainer's

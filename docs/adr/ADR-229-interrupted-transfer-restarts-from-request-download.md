@@ -99,10 +99,12 @@ responsible for them, in the same way that business screens are theirs (design 9
       After either kind of teardown, or directly in the completed case above, the agent confirms that the ECU is back in its default
       session, for example by reading the active-session data identifier F186 (ISO 14229-1
       Annex C). An ECU that has just accepted a reset may not answer while it restarts, so
-      whenever a reset was sent and may have been accepted (it was acknowledged, or its
-      response was lost), the agent first waits the startup time the procedure declares, after
-      the session timeout when the teardown was passive, and then retries the read within a
-      bounded window (the reset response's power-down time,
+      after either kind of teardown the agent first waits the startup time the procedure
+      declares, after the session timeout when the teardown was passive, and then retries the
+      read within a bounded window. This applies to a passive teardown too, because a reset may
+      have been accepted without its response being recorded, whether it was the teardown reset
+      or an ECUReset among the procedure's own post-transfer steps, so the journal cannot rule
+      out that the ECU is restarting (the reset response's power-down time,
       when the ECU reports one, extends the wait). If it still cannot confirm the default
       session, the job ends in `OnSiteInterventionRequired`. Step 3
       never starts before this confirmation.

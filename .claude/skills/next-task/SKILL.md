@@ -32,7 +32,8 @@ The arguments may name a focus area, and two optional inputs used by
    Leave out every item named in `skip=`, and every item with a
    `Blocked on:` clause unless the blocker is resolved (say so if you find
    one that is). Go to P2 only if no P0/P1 item is left after that and the
-   cap (if given) allows P2.
+   cap (if given) allows P2; an item that step 3 finds stale does not
+   count as left, so recheck P2 then.
 3. **Verify the top candidates are still open.** For each of the best two
    or three, check the code or docs the item cites (one or two targeted
    reads or a quick `git log` on the paths). A finished item is not a

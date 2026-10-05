@@ -51,19 +51,24 @@ that fixed it (or the ADR or backlog item for 2c, the trace for 2d). If a fix wa
 the fallback review again on the new head, whatever its size, and repeat until a pass reports no
 new finding. Then go to Step 5.
 
-**Codex usage limit.** If Codex answers the trigger with a message that its usage limit is
-reached, it is enabled but cannot review for now; this is not "Codex not available". Say so once
-in the thread, schedule a one-shot check-in five hours after that message (`send_later`), and end
-the turn; keep handling CI and other review events meanwhile. At the check-in, post the trigger
-again. If Codex reports the limit again, do not wait a second time: ask the maintainer in the
-thread with a decision card (`ask_decision` where the session has it) which way to go, with the
-fallback review as the recommendation:
+**Codex usage limit.** If `chatgpt-codex-connector[bot]` answers the latest trigger with a
+message that its usage limit is reached, Codex is enabled but cannot review for now; this is not
+"Codex not available", even though the trigger has no 👀 and no result. Say so once in the
+thread, post one PR comment saying the review waits for Codex until a given UTC time (a resumed
+session reads it there), schedule a one-shot check-in five hours after the limit message
+(`send_later`), and end the turn. Meanwhile keep handling CI and other review events, but post no
+trigger after a push; the check-in posts one for the head as it is then. If the bot answers that
+trigger with the limit again, do not wait a second time: ask the maintainer in the thread with a
+decision card (`ask_decision` where the session has it) which way to go, with the fallback review
+as the recommendation, and record on the PR that the question is open:
 
-- run the fallback review below now;
+- run the fallback review (under "Codex not available" above) now; then this PR posts no
+  further trigger;
 - wait another five hours for Codex;
-- hand the PR over without an automated review.
+- hand the PR over without an automated review: go to Step 5 and say so in the hand-off.
 
-Work stops on this PR until the maintainer answers.
+Work stops on this PR until the maintainer answers. Once they answer, delete the pending
+check-in if it has not fired yet (`delete_trigger`).
 
 **Codex started but never finished.** If the trigger comment has 👀 but no result at the
 check-in, schedule one more check-in 15 minutes later. If that one still finds no result,
@@ -198,8 +203,9 @@ re-requested at most once.
 
 ## Step 5: close out
 
-When a round is clean, a no-change round ended the loop (Step 3), or the fallback review in
-Step 0 is done:
+When a round is clean, a no-change round ended the loop (Step 3), the fallback review in Step 0
+is done, or the maintainer chose to hand over without an automated review (Step 0, "Codex usage
+limit"):
 
 1. **Nothing deferred only in the conversation.** Go through the loop's history: follow-ups any
    agent or you called "deferred", "out of scope" or "worth a separate look", `design-advisor`

@@ -31,30 +31,40 @@ be edited. That section is the only source of the state. A PR belongs to this ru
 
 A run resumes in a new session from the hand-off, or when the maintainer asks it to go on and
 names the PR (`pr=<n>`). It reads the state from that PR, subscribes to the PR's activity, and
-goes on by the PR's state:
+goes on by the PR's state. To work on an open PR it must be able to push to that PR's head
+branch; if that is not the branch this session was given, tell the maintainer and stop instead.
 
 - a draft still being worked returns to step 4, or to step 5 if the item is implemented;
 - an open PR already handed to the maintainer goes to step 6;
 - a merged PR whose merge is already in the merged list goes to step 1; one not yet recorded
   goes to step 6's merge handling;
+- a closed, unmerged PR not marked "final" goes to step 1;
 - a closed or merged PR marked "final" ends the run: write the final report if it was not
   written yet.
 
 ## 1. Check before each iteration
 
-First `git fetch origin main` and bring the branch you were given up to date by merging
-`origin/main` into it. Do not reset it or force-push: both need approval, and the run is
-unattended. If the merge conflicts, abort it and stop the run. If the branch still carries
-changes that never reached `main` (from a PR that was closed unmerged), remove them with a new
-commit so that `git diff origin/main` is empty. Every later step, including a stop, starts from
-this clean branch.
+List the open pull requests with the `backlog-loop` label. If one belongs to this run, resume
+it as described under "Run state" instead of going on. If one belongs to another run, stop the
+run and go to "Final report" (one item at a time).
+
+Otherwise no open PR depends on the branch, so reset its content to `main` without rewriting
+history (the run is unattended, and a reset or force-push needs approval): `git fetch origin
+main`, then record a merge of `origin/main` whose tree is exactly `origin/main`'s:
+
+```sh
+git merge -s ours --no-commit origin/main
+git read-tree -u --reset origin/main
+git commit -m "Start from origin/main"
+```
+
+This cannot conflict, and it drops anything the branch still carries from a PR that was closed
+unmerged. Every later step, including a stop, starts from this clean branch.
 
 Then stop the run and go to "Final report" if any of these holds:
 
 - no items are left;
 - the latest CI run on `main` failed (a red `main` is P0 work, outside the loop);
-- an open pull request carries the `backlog-loop` label and does not belong to this run (one
-  item at a time). An open PR of this run is resumed as described under "Run state";
 - this run's current PR was closed without being merged. Add `Blocked on: the maintainer's
   reason for closing PR #<n>` to its item as a backlog edit (see "Backlog edits"), so no later
   run picks it again, and report the close;
@@ -73,6 +83,7 @@ pick and the alternative that passes these checks:
 - **Too big.** It does not fit in one pull request: record the split with the `backlog` skill and
   skip it.
 - **Stale.** `next-task` reports it as already done: close it with the `backlog` skill and skip it.
+  Close every other item `next-task` lists as stale the same way.
 
 When neither passes, run `next-task` again with the longer skipped list. Stop the run when it
 answers "Nothing eligible", when a call added nothing to the skipped list (the next call would
@@ -133,10 +144,12 @@ End the turn. While the PR is open, any wake other than its merge or close (a re
 result, a comment) is handled by `pr-review-loop`, and the turn ends again; it does not start
 step 1.
 
-When the PR is merged, record it in the run state of its description first (merged list, items
-left decreased; a backlog-only PR does not count), then copy the state forward and go to step 1.
-A PR marked "final" is the exception: its merge or close changes nothing. When it is closed without merging, go to step 1, which stops
-the run.
+A PR marked "final" ends the run whether it is merged or closed: write the final report if it
+was not written yet, and do nothing else.
+
+For any other PR: when it is merged, record it in the run state of its description first (merged
+list, items left decreased; a backlog-only PR does not count), then copy the state forward and go
+to step 1. When it is closed without merging, go to step 1, which stops the run.
 
 Each item should start with a small context. If the session can start a fresh session for the
 next iteration (for example a project coordinator that opens a new thread), hand off there with
@@ -156,5 +169,4 @@ One message to the maintainer:
   maintainer can act on now as a question that can be answered in a word, with a
   recommendation; for the rest (another precondition is still open), give only their count;
 - why the run stopped (no items left, nothing eligible within the cap or five `next-task` calls
-  without a pick, `main` red, a conflict merging `origin/main`, another loop PR open or a lost
-  claim race, a PR closed without merging, or three backlog-only PRs).
+  without a pick, `main` red, another loop PR open or a lost claim race, a PR closed without merging, or three backlog-only PRs).

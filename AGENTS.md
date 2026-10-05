@@ -42,8 +42,13 @@ comments are public too.
 - **Correctness**: logic errors, panics reachable from external input (gRPC, Web API, vendor
   library return values), unchecked FFI results, lost or duplicated messages, races and
   deadlocks, resource leaks across worker restarts.
-- **`unsafe` placement**: new `unsafe` code outside the `*-sys` crates and the safe wrapper
-  crates (`iso22900`, `j2534-0404`). Services and everything above them call the wrappers.
+- **`unsafe` placement**: FFI calls belong in the `*-sys` crates and the safe wrappers
+  (`iso22900`, `j2534-0404`). Flag new `unsafe` in a crate with no FFI role (server, agent,
+  diagnostic-logic and shared crates), and a new direct vendor-library call in a `*-service`
+  crate for an operation the wrapper already offers. `unsafe` is expected in the FFI mocks
+  (`iso22900-mock`, `j2534-0404-mock`) and `sim-vci`, which export a C ABI, in worker code and
+  tests that load such a library, and in narrow operating-system API calls (for example the
+  Windows Shell or Event Log); there, flag only unsound code.
 - **Generated code out of step with its source**: the committed bindings must match their
   source in both directions.
   - Proto: a change to `crates/vci-service-interface/src/bindings/vci.service.rs` without the

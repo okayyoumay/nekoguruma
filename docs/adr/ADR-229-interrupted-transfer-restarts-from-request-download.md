@@ -65,7 +65,13 @@ responsible for them, in the same way that business screens are theirs (design 9
       of the flash session, with their guards (programming session, security access, and any
       pre-programming steps the procedure defines, such as CommunicationControl,
       ControlDTCSetting or prerequisite routines; design 8.9), because the teardown discards the
-      state they established. Then erase and RequestDownload.
+      state they established. Immediately before the erase, every execution precondition of
+      design 8.9 that the procedure declares is checked again (for a flash session: the voltage
+      range, ignition on, engine off, vehicle stopped, and the power supply check), since
+      conditions may have changed while the agent was down and the `Interrupted -> Writing`
+      transition does not pass through pre-validation again. If any fails, the job does not
+      erase and ends in `OnSiteInterventionRequired`, reporting the failed condition. Then erase
+      and RequestDownload.
    A handover to another device (8.2.5) follows the same order.
 3. **Block checkpoints are progress, not a resume origin.** The journal still records each
    confirmed block, for progress display and for the checkpoint summary used for handover to

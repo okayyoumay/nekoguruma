@@ -45,9 +45,14 @@ responsible for them, in the same way that business screens are theirs (design 9
    1. Checks that need no ECU service: the start deadline, the resume limit per stage, the
       interruptibility attribute (item 1) and the supply voltage read through the VCI. If the
       limit allows another resume, the agent increments the stage's resume count and commits it
-      to the journal before it sends anything to the ECU, so a crash during recovery cannot reload
-      the old count and resume past the limit (the handover counterpart is the server-side
-      increment below).
+      to the journal, and also reserves the attempt on the server by incrementing the server's
+      per-stage count atomically and checking it against the limit, all before it sends anything
+      to the ECU. The journal commit keeps a crash during recovery from reloading the old count;
+      the server reservation keeps a handover from starting on a count that misses attempts this
+      device made but never published. If the server cannot be reached, the agent waits for it
+      until the start deadline and then ends the job in `OnSiteInterventionRequired`. Recovery is
+      rare and this happens before anything is sent to the ECU, so the network dependence costs
+      only availability, unlike the RequestTransferExit acknowledgement rejected below.
    2. Identity, safety, then teardown. The agent never sends an ECUReset to an ECU it has not
       identified, because the VCI may now be connected to a different vehicle, nor to a vehicle
       that may be running. It first tries to read the VIN, which changes nothing on the ECU. Only
@@ -115,7 +120,9 @@ responsible for them, in the same way that business screens are theirs (design 9
       one recorded before the erase, or the ECU conclusively reports that it has none (a
       response the procedure declares to mean that no valid application is present, such as a
       specific negative response code), the transfer still needs to be redone and the job goes
-      on to step 4. No answer, or any other negative response, proves nothing, since the
+      on to step 4. No answer, any other negative response, or a positive response whose version
+      cannot be decoded (for example truncated or malformed metadata left by the interrupted
+      write) proves nothing, since the
       response of an ECU holding an unexpected version may simply have been lost: the agent
       retries the read within the procedure's retry limit, and if it stays inconclusive the job
       ends in `OnSiteInterventionRequired`. The journal's record of the post-transfer steps decides, not the version
@@ -145,9 +152,11 @@ responsible for them, in the same way that business screens are theirs (design 9
    access to the failed device's journal, so the checkpoint summary sent to the server carries
    the recorded ECU hardware part number, the pre-erase software version, the RequestTransferExit
    intent marker, the post-transfer progress and the number of resumes already made per stage
-   (so the resume limit of step 1 holds across devices; because the summary can lag, the
-   receiving agent increments that count atomically on the server, and checks it against the
-   limit, before it starts a handover recovery, rather than trusting the count it read) along with the VIN, and
+   (so the resume limit of step 1 holds across devices; because every recovery attempt,
+   including the failed device's own, is reserved on the server before anything is sent to the
+   ECU, the server count includes them all, and the receiving agent increments that count
+   atomically on the server, and checks it against the limit, before it starts a handover
+   recovery, rather than trusting the count it read) along with the VIN, and
    the receiving agent compares against those values. The summary can lag behind the failed
    device's journal (the device may fail after committing the marker locally and sending the
    request, but before the updated summary reaches the server), so on a handover an absent

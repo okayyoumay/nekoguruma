@@ -105,8 +105,9 @@ responsible for them, in the same way that business screens are theirs (design 9
       update was lost, the job skips the restart and continues with read-back verification. If
       it shows the intended version but those steps are not recorded as complete, the image is
       not treated as validated and the job goes on to step 4, whose full transfer runs the
-      post-transfer steps again in the procedure's order; a procedure may instead declare its
-      own post-transfer recovery sequence for this case (item 4). If the software version is the
+      post-transfer steps again in the procedure's order. The reference implementation has no
+      validation-only recovery for this case; the IR has no way to declare one, and an ECU that
+      needs it is served by the framework user's own procedure (item 4). If the software version is the
       one recorded before the erase, or the ECU conclusively reports that it has none (a
       response the procedure declares to mean that no valid application is present, such as a
       specific negative response code), the transfer still needs to be redone and the job goes

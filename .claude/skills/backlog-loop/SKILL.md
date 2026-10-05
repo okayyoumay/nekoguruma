@@ -9,7 +9,8 @@ argument-hint: "[max items, default 3] [lowest priority to include: P1 (default)
 
 One iteration is one backlog item and one pull request. Iterations run strictly one after
 another: the next one starts only after the maintainer has merged the previous PR. Claude never
-merges, and never works on two loop items at once.
+merges, and never works on two loop items at once. ADR-230 records why claims, run state and the
+branch reset work the way they do.
 
 Arguments: $ARGUMENTS. To start a run: the number of items for this run (default 3), then the
 lowest priority to include: P1 (default: P0, P1 and the `Known Flaky Tests` entries) or P2. P3

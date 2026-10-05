@@ -58,12 +58,14 @@ thread, post one PR comment saying the review waits for Codex, checked hourly un
 time five hours after the limit message (a resumed session reads it there), schedule a one-shot
 check-in an hour later (`send_later`), and end the turn. Meanwhile keep handling CI and other
 review events, but post no trigger after a push; each hourly check-in posts one trigger for the
-head as it is then, with its usual 15-minute check-in. If the bot answers that trigger with the
-limit again before the five hours are up, schedule the next hourly check-in and post nothing
-else. If it still answers with the limit once the five hours are up, do not wait again on your
-own: ask the maintainer in the thread with a decision card (`ask_decision` where the session has
-it) which way to go, with the fallback review as the recommendation, and record on the PR that
-the question is open:
+head as it is then, with its usual 15-minute check-in. Whenever the bot answers a trigger with
+the limit, first delete that trigger's 15-minute check-in if it has not fired yet
+(`delete_trigger`), so only one check-in is ever pending. If the limit comes again before the
+five hours are up, schedule the next hourly check-in and post nothing else. If the bot still
+answers with the limit once the five hours are up, do not wait again on your own: ask the
+maintainer in the thread with a decision card (`ask_decision` where the session has it) which way
+to go, with the fallback review as the recommendation, and record on the PR that the question is
+open:
 
 - run the fallback review (under "Codex not available" above) now; then this PR posts no
   further trigger;

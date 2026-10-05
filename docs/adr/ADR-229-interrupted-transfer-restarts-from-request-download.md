@@ -45,8 +45,9 @@ responsible for them, in the same way that business screens are theirs (design 9
    1. Checks that need no ECU service. A restart is a new run on this device, and the OS-level
       locks of the interrupted run were released with it, so before anything goes through the
       VCI the agent takes the per-VCI lock and the device's single reprogramming slot again
-      (design 8.8 and 8.8.1), and it promotes the per-VCI lock to the per-vehicle lock once
-      step 2 has matched the VIN; while another job holds either, the restart waits, and it
+      (design 8.8 and 8.8.1), and it promotes the per-VCI lock to the per-vehicle lock as
+      soon as a VIN read first matches the job's VIN, in step 2 or, when step 2 could not read it,
+      in step 3, and before anything after that match; while another job holds either, the restart waits, and it
       expires at the start deadline like any job. Then it checks the start deadline, the resume
       limit per stage, the interruptibility attribute (item 1) and the supply voltage read
       through the VCI. If the

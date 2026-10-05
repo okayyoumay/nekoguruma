@@ -140,7 +140,9 @@ responsible for them, in the same way that business screens are theirs (design 9
    access to the failed device's journal, so the checkpoint summary sent to the server carries
    the recorded ECU hardware part number, the pre-erase software version, the RequestTransferExit
    intent marker, the post-transfer progress and the number of resumes already made per stage
-   (so the resume limit of step 1 holds across devices) along with the VIN, and
+   (so the resume limit of step 1 holds across devices; because the summary can lag, the
+   receiving agent increments that count atomically on the server, and checks it against the
+   limit, before it starts a handover recovery, rather than trusting the count it read) along with the VIN, and
    the receiving agent compares against those values. The summary can lag behind the failed
    device's journal (the device may fail after committing the marker locally and sending the
    request, but before the updated summary reaches the server), so on a handover an absent

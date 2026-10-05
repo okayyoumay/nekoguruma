@@ -46,8 +46,9 @@ comments are public too.
   crates (`iso22900`, `j2534-0404`). Services and everything above them call the wrappers.
 - **Generated code edited by hand**: changes to proto bindings in `crates/vci-service-interface`
   without the matching `service.proto` change, or to `crates/*-sys/src/bindings/*.rs` without a
-  header change. A header change committed without regenerated bindings is also P1 unless the PR
-  says the regeneration was deferred.
+  header change. A header change committed without regenerated bindings is also P1 unless the
+  same PR records the deferred regeneration as a backlog item in `work/`; a note in the PR
+  description alone is not enough.
 - **Documentation out of sync**: the PR changes an area without updating the document CLAUDE.md's
   "Documentation sync" table assigns to it (for example a `service.proto` change without
   `docs/rpc-api-guide.md`, a server API change without `api/openapi.yaml`, a database change
@@ -78,15 +79,16 @@ comments are public too.
   though; flag those.
 - `todo!()` placeholders or short `TODO` comments in code. Flag only a TODO list or "not done
   yet" section added to a permanent document.
-- Spec interpretations you cannot check. When a finding depends on what a standard requires,
-  name the standard, edition and clause, and say that the claim needs checking against the
-  text. ISO 22900-2 exists in a 2009 and a 2022 edition; code and docs say which one they target.
 
 ### How to write findings
 
 - Lead with the failure scenario: the input or state, and the wrong result.
 - Point at the line in the current diff, and cite the design section or ADR when the finding
   rests on one.
+- When a finding depends on what a standard requires and you cannot read the standard, still
+  report it, but name the standard, edition and clause and say that the claim needs checking
+  against the text; do not state the requirement as fact. ISO 22900-2 exists in a 2009 and a
+  2022 edition; code and docs say which one they target.
 - One finding per root cause. Do not repeat a finding already answered on the PR unless the new
   code reintroduces it.
 - Write in English.

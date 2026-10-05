@@ -239,10 +239,15 @@ responsible for them, in the same way that business screens are theirs (design 9
   required external power supply (item 2; `FlashSession` today declares only the voltage
   range, ignition, engine-off and vehicle-stopped preconditions), nor a mapping that names
   which of the procedure's services and response fields yield the VIN, the hardware part
-  number and the software version (these identifiers can be OEM-specific); all nine are
+  number, the software version and the engine, vehicle-speed and ignition states that the
+  declared safety preconditions test, each with the value or range that satisfies it (these
+  identifiers can be OEM-specific; a state that is not read from the ECU comes from a runtime
+  input instead, as the external supply does); all nine are
   added together with the write-job journal, along with the runtime input that reports whether the supply is
   connected. Until then a procedure cannot require the supply, and the voltage range is the
-  only power check a restart can make. Without a declared
+  only power check a restart can make. A declared safety precondition whose source is not
+  mapped cannot be established, so the restart treats it as failed: no ECUReset is sent and
+  the job ends in `OnSiteInterventionRequired` before any erase. Without a declared
   limit the read is not retried. Until a procedure declares the latter, no response to the software
   version read counts as conclusive and an interruption after erase ends in
   `OnSiteInterventionRequired`.
@@ -260,8 +265,8 @@ responsible for them, in the same way that business screens are theirs (design 9
   operator confirms on the server that the failed device is disconnected from the vehicle (or
   powered off); from then on the failed device's reservations are refused, so it sends nothing
   further to the ECU. The transfer also starts a new ownership generation. The generation is
-  part of the signed job instruction and is carried by every job-state message, checkpoint
-  summary and reservation the agent sends, and the server applies one only when both the
+  part of the signed job instruction and is carried by every job-scoped message the agent
+  sends (job state, progress, HMI requests, checkpoint summaries and reservations), and the server applies one only when both the
   device and the generation match the current ones exactly, so a message queued under an
   earlier generation is refused even if ownership has since returned to the same device; anything the former owner sends later, such as messages
   queued while it was offline, is kept only as audit data (with its uploaded journal) and

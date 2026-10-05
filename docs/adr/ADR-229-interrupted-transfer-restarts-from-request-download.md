@@ -139,7 +139,8 @@ responsible for them, in the same way that business screens are theirs (design 9
    A handover to another device (8.2.5) follows the same order. The receiving agent has no
    access to the failed device's journal, so the checkpoint summary sent to the server carries
    the recorded ECU hardware part number, the pre-erase software version, the RequestTransferExit
-   intent marker and the post-transfer progress along with the VIN, and
+   intent marker, the post-transfer progress and the number of resumes already made per stage
+   (so the resume limit of step 1 holds across devices) along with the VIN, and
    the receiving agent compares against those values. The summary can lag behind the failed
    device's journal (the device may fail after committing the marker locally and sending the
    request, but before the updated summary reaches the server), so on a handover an absent
@@ -176,11 +177,11 @@ responsible for them, in the same way that business screens are theirs (design 9
   with the previous counter value is accepted without being written again. The recovery tests
   cover a fast reconnection (within the session timer) as well as a restart after it expired.
 - The IR has no fields yet for the session timeout a procedure declares, the response that
-  means no valid application is present, the retry limit for the recovery version read, the ECU startup time after a reset, or a
+  means no valid application is present, the retry limit for the recovery version read, the ECU startup time after a reset and the length of the window in which the session confirmation is retried, or a
   required external power supply (item 2; `FlashSession` today declares only the voltage
   range, ignition, engine-off and vehicle-stopped preconditions), nor a mapping that names
   which of the procedure's services and response fields yield the VIN, the hardware part
-  number and the software version (these identifiers can be OEM-specific); all six are
+  number and the software version (these identifiers can be OEM-specific); all seven are
   added together with the write-job journal, along with the runtime input that reports whether the supply is
   connected. Until then a procedure cannot require the supply, and the voltage range is the
   only power check a restart can make. Without a declared

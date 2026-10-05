@@ -61,7 +61,11 @@ responsible for them, in the same way that business screens are theirs (design 9
       excluded: when the journal shows that RequestTransferExit had been sent but does not record
       the procedure's post-transfer steps (such as CheckMemory) as complete, the agent sends no
       ECUReset, because a reset at that point could activate an image the procedure has not yet
-      validated.
+      validated. So that a crash between sending RequestTransferExit and recording its response
+      cannot hide this case, the agent commits an intent marker for RequestTransferExit to the
+      journal before it transmits the request (write-ahead); a journal without that marker
+      proves the request was never sent. The marker is part of the checkpoint summary used for
+      handover, like the recorded identity below.
 
       In every other case it tears down passively: when the ECU does not answer the VIN read or
       answers it with a negative response (for example because it is still inside the old
@@ -113,7 +117,8 @@ responsible for them, in the same way that business screens are theirs (design 9
       and RequestDownload.
    A handover to another device (8.2.5) follows the same order. The receiving agent has no
    access to the failed device's journal, so the checkpoint summary sent to the server carries
-   the recorded ECU hardware part number and pre-erase software version along with the VIN, and
+   the recorded ECU hardware part number, the pre-erase software version, the RequestTransferExit
+   intent marker and the post-transfer progress along with the VIN, and
    the receiving agent compares against those values.
 3. **Block checkpoints are progress, not a resume origin.** The journal still records each
    confirmed block, for progress display and for the checkpoint summary used for handover to

@@ -245,7 +245,10 @@ responsible for them, in the same way that business screens are theirs (design 9
   starting a write offline (design 5.7). An agent without a configured server has no handover
   and no ownership record. The operator's confirmation is an operation of the server's Web
   API, limited to operators authorized for the job and written to the audit log; it is added
-  together with the reservation operation.
+  together with the reservation operation. Because a signed job instruction names the agent
+  and the VCI it runs on, the transfer also issues a new signed instruction bound to the
+  receiving agent and VCI, after the same signing, approval and compatibility checks as a new
+  job; the receiving agent never runs the failed device's instruction.
 - Because every recovery on an agent with a configured server reserves its attempt there
   first, a write job interrupted
   while the device is offline (design 5.7 lets jobs start offline) does not restart until the

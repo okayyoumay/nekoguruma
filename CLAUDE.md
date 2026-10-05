@@ -52,7 +52,7 @@ The format, the P0-P3 scale and the file list are in `work/README.md` ("Backlog 
 - `next-task`: recommend what to pick up next
 - `backlog-triage` (run on request only): clean up stale, duplicate or mis-prioritized items
 - `backlog-loop` (run on request only): work through the backlog one item and one pull request
-  at a time; the next item starts only after Yoko merges the previous PR
+  at a time; the next item starts only after the maintainer merges the previous PR
 
 ### Documentation sync
 
@@ -168,7 +168,7 @@ the attribute fails the build once the code is used and gets removed.
 4. Before marking the PR ready, check that nothing deferred during the work exists only in the
    conversation: every follow-up is either done in the PR or added to the backlog (`backlog`
    skill). Items the PR finishes are closed in the same PR.
-5. Yoko reviews and merges. Do not merge your own PR unless asked.
+5. The maintainer (the repository owner) reviews and merges. Do not merge your own PR unless asked.
 
 Commit messages and PR descriptions follow the same copyright rule as the code.
 

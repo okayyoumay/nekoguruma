@@ -108,8 +108,8 @@ Project skills live in `.claude/skills/`:
 | `backlog` | Adding, updating and closing backlog items in `work/` |
 | `next-task` | Recommending the next item to work on (one pick plus one alternative) |
 | `backlog-triage` | Cleaning up the backlog; manual only (`/backlog-triage`) |
-| `pr-review-loop` | Driving the Codex review cycle on a PR Claude opened, up to handing it to Yoko |
-| `backlog-loop` | Working through the backlog one item and one PR at a time, waiting for Yoko's merge between items; manual only |
+| `pr-review-loop` | Driving the Codex review cycle on a PR Claude opened, up to handing it to the maintainer |
+| `backlog-loop` | Working through the backlog one item and one PR at a time, waiting for the maintainer's merge between items; manual only |
 
 Skills run in the main conversation at the session model. Where an agent covers the same ground
 (build/test sweeps, doc-sync audits, verification), prefer the agent.

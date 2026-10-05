@@ -1,13 +1,13 @@
 ---
 name: backlog-loop
-description: Work through the nekoguruma backlog one item at a time. Pick the next unblocked item, implement it in one pull request, run pr-review-loop, hand the PR to Yoko, and start the next item only after she merges it. Use when Yoko asks to work through the backlog, or to continue a running loop after a loop PR was merged.
+description: Work through the nekoguruma backlog one item at a time. Pick the next unblocked item, implement it in one pull request, run pr-review-loop, hand the PR to the maintainer, and start the next item only after the maintainer merges it. Use when the maintainer asks to work through the backlog, or to continue a running loop after a loop PR was merged.
 argument-hint: "[max items, default 3] [lowest priority to include: P1 (default) or P2]"
 ---
 
 # Backlog loop
 
 One iteration is one backlog item and one pull request. Iterations run strictly one after
-another: the next one starts only after Yoko has merged the previous PR. Claude never merges,
+another: the next one starts only after the maintainer has merged the previous PR. Claude never merges,
 and never works on two loop items at once.
 
 Arguments: $ARGUMENTS. The first is the number of items for this run (default 3); the second is
@@ -23,7 +23,7 @@ Stop the run and go to "Final report" if any of these holds:
 - the run's item count is used up;
 - the latest CI run on `main` failed (a red `main` is P0 work, outside the loop);
 - an open pull request carries the `backlog-loop` label (one item at a time: wait for it);
-- the previous loop PR was closed without being merged (ask Yoko why before going on).
+- the previous loop PR was closed without being merged (ask the maintainer why before going on).
 
 ## 2. Pick
 
@@ -47,7 +47,7 @@ documentation sync, ADRs). Close the item with the `backlog` skill in the same P
 
 If the work shows that the item needs something the loop cannot supply, do not guess. Write a
 `Blocked on:` clause into the item with the `backlog` skill, using the forms in `work/README.md`
-(`Blocked on: Yoko's decision on ...` for a design choice that the specs and ADRs leave open),
+(`Blocked on: the maintainer's decision on ...` for a design choice that the specs and ADRs leave open),
 add it to the run's skipped list, discard the branch's other changes, and go back to step 2. A
 skipped item does not count against the run's item count; its `Blocked on:` edit is kept as
 described under "Backlog edits" below. The run is unattended, so follow
@@ -57,15 +57,15 @@ described under "Backlog edits" below. The run is unattended, so follow
 
 Backlog edits made while picking (a stale item closed, a split recorded, a `Blocked on:` clause
 added) stay on the branch and go into the next loop PR. If the run stops before another PR is
-opened, open a backlog-only loop PR with them (step 4) and hand it to Yoko before the final
+opened, open a backlog-only loop PR with them (step 4) and hand it to the maintainer before the final
 report, so a later run does not pick the same items again.
 
 ## 4. Pull request
 
 Open the PR as a draft with the `backlog-loop` label. Run `scripts/classify-pr-risk.sh` and copy
 its output into the PR description under a "Risk (shadow)" heading. The verdict is recorded only
-to compare it later with Yoko's own judgement; it changes nothing about who merges. Then run
-`pr-review-loop`. Before it hands the PR to Yoko, run the classifier again on the final head and
+to compare it later with the maintainer's own judgement; it changes nothing about who merges. Then run
+`pr-review-loop`. Before it hands the PR to the maintainer, run the classifier again on the final head and
 replace the section if review fixes changed the verdict or its reasons.
 
 ## 5. Wait for the merge, then continue
@@ -76,16 +76,16 @@ green (step 1) and refresh the branch from `main`.
 Each item should start with a small context. If the session can start a fresh session for the
 next iteration (for example a project coordinator that opens a new thread, or a scheduled
 trigger), hand off there with a message such as "backlog-loop continue: 2 items left, cap P1",
-followed by the merged, skipped and Yoko-waiting lists so far. Otherwise continue in this
+followed by the merged, skipped and maintainer-waiting lists so far. Otherwise continue in this
 session.
 
 ## Final report
 
-One message to Yoko:
+One message to the maintainer:
 
 - the PRs merged in this run, each with its shadow risk verdict;
 - the items skipped and why;
-- everything that waits on Yoko: every backlog item with `Blocked on: Yoko's decision`, plus the
-  items blocked on a purchase or hardware she could supply. Write each decision as a question she
+- everything that waits on the maintainer: every backlog item with `Blocked on: the maintainer's decision`, plus the
+  items blocked on a purchase or hardware the maintainer could supply. Write each decision as a question the maintainer
   can answer in a word, with a recommendation;
 - why the run stopped (item count used up, nothing unblocked left, `main` red, a PR closed).

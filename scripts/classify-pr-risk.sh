@@ -6,13 +6,15 @@
 #
 # LOW means every changed file is on the allowlist below, i.e. the pull
 # request's own CI covers everything the change can affect; for tests that
-# means new test files only. Anything else is HIGH: when in doubt, the answer
+# means new files that Cargo itself lists as integration-test targets
+# (`cargo metadata`, so cargo and jq must be installed). Anything else is
+# HIGH: when in doubt, the answer
 # is HIGH.
 #
 # Usage: scripts/classify-pr-risk.sh [base-ref]   (default: origin/main)
 # Prints the verdict on the first line, then one "- reason" line per rule
 # that made it HIGH (or one line saying why it is LOW). Exit status is 0 for
-# both verdicts; 2 means the diff could not be computed.
+# both verdicts; 2 means the diff or the test targets could not be computed.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -26,9 +28,15 @@ if ! merge_base="$(git merge-base "$base" HEAD 2>/dev/null)"; then
   exit 2
 fi
 
-# The `members = [...]` list of the base's root Cargo.toml, one entry per line.
-workspace_members="$(git show "$merge_base:Cargo.toml" 2>/dev/null |
-  awk '/^members *= *\[/ {on = 1; next} on && /^\]/ {exit} on' || true)"
+# Integration-test targets Cargo discovers on HEAD, as repository-relative
+# paths. Asking Cargo avoids re-implementing its discovery rules (helper
+# modules, dot-prefixed names, crates outside the workspace).
+if ! test_targets="$(cargo metadata --no-deps --format-version 1 --offline 2>/dev/null |
+  jq -r '.workspace_root as $r | .packages[].targets[]
+    | select(.kind | index("test")) | .src_path | ltrimstr($r + "/")')"; then
+  echo "cannot list the workspace's test targets (cargo metadata or jq failed)" >&2
+  exit 2
+fi
 
 # Plain, unquoted diff output whatever the user's git configuration says.
 gitd() { git -c core.quotePath=false diff --no-color --no-ext-diff "$@"; }
@@ -49,18 +57,9 @@ is_low_path() {
   is_crate_test "$1"
 }
 
-# A file Cargo discovers as an integration-test target on its own:
-# crates/<crate>/tests/<name>.rs or crates/<crate>/tests/<name>/main.rs, where
-# <name> does not start with a dot (Cargo skips those). Any other file under
-# tests/ is a module that only runs if a target pulls it in,
-# so CI may never compile it. case patterns let * cross "/", so a regex
-# anchors each component.
-# The crate must also be a workspace member on the base (the root Cargo.toml
-# lists members explicitly), or `cargo test --workspace` never sees the file;
-# a change to Cargo.toml itself is HIGH anyway.
+# A file that is itself an integration-test target (see test_targets above).
 is_crate_test() {
-  [[ "$1" =~ ^crates/([^/]+)/tests/[^/.][^/]*\.rs$ || "$1" =~ ^crates/([^/]+)/tests/[^/.][^/]*/main\.rs$ ]] || return 1
-  grep -Fq "\"crates/${BASH_REMATCH[1]}\"" <<<"$workspace_members"
+  grep -Fxq -- "$1" <<<"$test_targets"
 }
 
 reasons=()

@@ -51,6 +51,8 @@ The format, the P0-P3 scale and the file list are in `work/README.md` ("Backlog 
   residual as a new item) when it is done
 - `next-task`: recommend what to pick up next
 - `backlog-triage` (run on request only): clean up stale, duplicate or mis-prioritized items
+- `backlog-loop` (run on request only): work through the backlog one item and one pull request
+  at a time; the next item starts only after Yoko merges the previous PR
 
 ### Documentation sync
 

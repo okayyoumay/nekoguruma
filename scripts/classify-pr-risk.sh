@@ -8,8 +8,7 @@
 # request's own CI covers everything the change can affect; for tests that
 # means new files that Cargo itself lists as integration-test targets
 # (`cargo metadata`, so cargo and jq must be installed). Anything else is
-# HIGH: when in doubt, the answer
-# is HIGH.
+# HIGH: when in doubt, the answer is HIGH.
 #
 # Usage: scripts/classify-pr-risk.sh [base-ref]   (default: origin/main)
 # Prints the verdict on the first line, then one "- reason" line per rule

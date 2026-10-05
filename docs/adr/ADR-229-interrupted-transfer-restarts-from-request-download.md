@@ -30,7 +30,13 @@ responsible for them, in the same way that business screens are theirs (design 9
 1. **Restart from RequestDownload.** When a transfer that has started is interrupted (agent crash
    or restart, worker crash, VCI disconnect, power loss), the resumed job first runs
    the state check and VIN verification of design 8.2.5. If those pass, it redoes the transfer
-   from its erase and RequestDownload. It never continues from a later block.
+   from its erase and RequestDownload. It never continues from a later block. This applies only
+   where the procedure's interruptibility attribute allows automatic resumption (8.10.1): an
+   interruption inside a section marked "recovery required on interruption" (for a flash
+   session, every step from `recovery_required_from_step` on, which defaults to the start of
+   erase) ends the job in `OnSiteInterventionRequired` instead, as design 5.6 and 8.10.1 already
+   require. A procedure that allows a restart says so by its attribute; the M1 reference procedure
+   against `sim-ecu`, whose bootloader stays intact, is one.
 2. **Tear down the old transfer first.** A crash or a short disconnect does not necessarily end
    the transfer on the ECU: if the agent reconnects before the ECU's session timer expires, the
    ECU can still hold the old download, and a new RequestDownload would be refused with a
@@ -58,6 +64,9 @@ responsible for them, in the same way that business screens are theirs (design 9
   reconnection within the session timer, is lost on reset or session end, and a repeated block
   with the previous counter value is accepted without being written again. The recovery tests
   cover a fast reconnection (within the session timer) as well as a restart after it expired.
+- With the schema default, a flash session never restarts automatically once erase has begun;
+  the restart rule takes effect only for procedures whose authors declare that the ECU can be
+  reprogrammed again after such an interruption.
 - An interrupted transfer of a large image is resent in full, which costs time. The resume limit
   per stage (8.2.5) still applies, so repeated failures end in on-site intervention rather than
   an endless loop.

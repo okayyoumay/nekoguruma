@@ -49,11 +49,12 @@ responsible for them, in the same way that business screens are theirs (design 9
       that may be running. It first tries to read the VIN, which changes nothing on the ECU. Only
       a VIN that is read and decoded and differs from the job's VIN counts as a mismatch, and the
       job aborts. A matching VIN identifies the vehicle, not the ECU the VCI addresses, so the
-      agent next reads that ECU's variant identification (design 8.9.1: part number and current
-      software version), which also changes nothing. The part number must equal the one the job
-      targets, and the software version must equal either the version recorded before the erase
-      or the intended image's version. If the VIN and the ECU identity match, the agent checks
-      the safety preconditions of design 8.9 that the procedure declares (engine off, vehicle
+      agent next reads that ECU's hardware identity, which also changes nothing: its ECU hardware
+      part number (design 8.9.1 variant identification), recorded in the journal before the
+      erase. The software version is not part of this identity, because an ECU whose application
+      was erased may stop reporting it while its bootloader still answers; it is used only by the
+      state check in step 3. If the VIN and the hardware identity match, the agent checks the
+      safety preconditions of design 8.9 that the procedure declares (engine off, vehicle
       stopped, ignition state) as far as it can without changing anything on the vehicle. Only
       when they all hold does it end any download
       the ECU may still hold with an ECUReset (ISO 14229-1 clause 9.3), which takes the ECU out of
@@ -61,10 +62,9 @@ responsible for them, in the same way that business screens are theirs (design 9
 
       In every other case it tears down passively: when the ECU does not answer the VIN read or
       answers it with a negative response (for example because it is still inside the old
-      download and does not allow the service there), when the ECU identity read gets no answer,
-      a negative response or a value that differs from the job's target, when a safety
-      precondition fails or cannot
-      be established, when the ECU refuses the reset, and when the reset gets no response so that
+      download and does not allow the service there), when the hardware identity read gets no
+      answer, a negative response or a value that differs from the journal's, when a safety
+      precondition fails or cannot be established, when the ECU refuses the reset, and when the reset gets no response so that
       its outcome is unknown. Passive teardown means the agent stops sending TesterPresent and
       waits for the session timeout the procedure declares plus a margin (the framework has no
       built-in default, since the value is ECU-specific).
@@ -77,14 +77,17 @@ responsible for them, in the same way that business screens are theirs (design 9
       to the job's VIN before anything else happens; this is required again even when step 2
       already matched it. A decoded VIN that differs aborts the job, and any other outcome (no
       answer, a negative response, an undecodable value) ends it in `OnSiteInterventionRequired`.
-      The ECU identity of step 2 is likewise required again here and is authoritative: a decoded
-      part number that differs from the job's target aborts the job, and any other failure to
-      establish it (no answer, a negative response, an undecodable value, or a software version
-      that is neither the recorded pre-erase version nor the intended one) ends it in
-      `OnSiteInterventionRequired`. Then the ECU state check of design 8.2.5, which includes reading back the ECU software
-      version: if it shows that the intended image is already installed (the transfer and
-      RequestTransferExit completed, but the response or the journal update was lost), the job
-      skips the restart and continues with read-back verification.
+      The hardware identity of step 2 is likewise required again here and is authoritative: a
+      decoded hardware part number that differs from the journal's aborts the job, and any other
+      failure to establish it (no answer, a negative response, an undecodable value) ends it in
+      `OnSiteInterventionRequired`. Then the ECU state check of design 8.2.5, which includes
+      reading back the ECU software version. If it shows that the intended image is already
+      installed (the transfer and RequestTransferExit completed, but the response or the journal
+      update was lost), the job skips the restart and continues with read-back verification. If
+      it shows the version recorded before the erase, or the ECU reports no software version
+      (no answer or a negative response, as when the application is invalid), the transfer still needs to be redone and the job goes on to
+      step 4. Any other decoded version means something other than this job changed the ECU, and
+      the job ends in `OnSiteInterventionRequired`.
    4. Re-entry: the procedure's own steps that lead up to the erase are replayed from the start
       of the flash session, with their guards (programming session, security access, and any
       pre-programming steps the procedure defines, such as CommunicationControl,

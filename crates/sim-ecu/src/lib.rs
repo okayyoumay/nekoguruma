@@ -177,7 +177,7 @@ struct Download {
     /// blockSequenceCounter and length of the last stored block, for accepting a repeated request.
     last_bsc: Option<u8>,
     last_len: u32,
-    /// Whether the RequestDownload that opened or resumed the transfer passed a security check.
+    /// Whether the transfer was opened or resumed with `require_security_access` set.
     secured: bool,
 }
 

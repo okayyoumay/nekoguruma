@@ -1265,3 +1265,24 @@ fn restart_decision_follows_how_the_download_was_opened() {
     enter(&mut ecu, Session::Programming);
     assert_eq!(ecu.flash, FlashPhase::Interrupted { last_block: 1 });
 }
+
+#[test]
+fn a_resumed_download_takes_its_secured_state_from_the_resume() {
+    for (flag_at_resume, expected) in [
+        (true, FlashPhase::Interrupted { last_block: 1 }),
+        (false, FlashPhase::Transferring { next_block: 2 }),
+    ] {
+        let mut ecu = ready_to_download();
+        ecu.request(&request_download(0, 6));
+        ecu.request(&transfer(1, &[1, 2]));
+        ecu.reconnect();
+        ecu.config.require_security_access = flag_at_resume;
+        back_in_programming(&mut ecu);
+        assert!(matches!(
+            ecu.request(&request_download(2, 4)),
+            SimResponse::Positive(_)
+        ));
+        enter(&mut ecu, Session::Programming);
+        assert_eq!(ecu.flash, expected, "flag at resume: {flag_at_resume}");
+    }
+}

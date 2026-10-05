@@ -28,24 +28,34 @@ responsible for them, in the same way that business screens are theirs (design 9
 ## Decision
 
 1. **Restart from RequestDownload.** When a transfer that has started is interrupted (agent crash
-   or restart, worker crash, VCI disconnect, power loss), the resumed job first runs
-   the state check and VIN verification of design 8.2.5. If those pass, it redoes the transfer
-   from its erase and RequestDownload. It never continues from a later block. This applies only
-   where the procedure's interruptibility attribute allows automatic resumption (8.10.1): an
-   interruption inside a section marked "recovery required on interruption" (for a flash
-   session, every step from `recovery_required_from_step` on, which defaults to the start of
-   erase) ends the job in `OnSiteInterventionRequired` instead, as design 5.6 and 8.10.1 already
-   require. A procedure that allows a restart says so by its attribute; the M1 reference procedure
-   against `sim-ecu`, whose bootloader stays intact, is one.
-2. **Tear down the old transfer first.** A crash or a short disconnect does not necessarily end
-   the transfer on the ECU: if the agent reconnects before the ECU's session timer expires, the
-   ECU can still hold the old download, and a new RequestDownload would be refused with a
-   sequence error, or an erase would run while the old download is still open. Before the
-   restart, the agent therefore ends any download the ECU may still hold with an ECUReset
-   (ISO 14229-1 clause 9.3), which takes the ECU out of its non-default session, and then
-   re-enters the programming session and repeats security access. If the ECU refuses the reset,
-   the agent stops sending TesterPresent and waits for the session timer to expire before
-   re-entering. Only then does it erase and send RequestDownload.
+   or restart, worker crash, VCI disconnect, power loss), the resumed job redoes the transfer from
+   its erase and RequestDownload, in the order of item 2. It never continues from a later block.
+   This applies only where the procedure's interruptibility attribute allows automatic resumption
+   (8.10.1): an interruption inside a section marked "recovery required on interruption" (for a
+   flash session, every step from `recovery_required_from_step` on, which defaults to the start
+   of erase) ends the job in `OnSiteInterventionRequired` instead, as design 5.6 and 8.10.1
+   already require. A procedure that allows a restart says so by its attribute; the M1 reference
+   procedure against `sim-ecu`, whose bootloader stays intact, is one.
+2. **Order of a restart: tear down, then check, then erase.** A crash or a short disconnect does
+   not necessarily end the transfer on the ECU: if the agent reconnects before the ECU's session
+   timer expires, the ECU can still hold the old download. While it does, a new RequestDownload
+   would be refused with a sequence error, an erase could run while the old download is still
+   open, and services the checks rely on (such as ReadDataByIdentifier) may not be available. A
+   restart therefore runs in this order:
+   1. Checks that need no ECU service: the start deadline, the resume limit per stage, the
+      interruptibility attribute (item 1) and the supply voltage read through the VCI.
+   2. Teardown. The agent ends any download the ECU may still hold with an ECUReset (ISO 14229-1
+      clause 9.3), which takes the ECU out of its non-default session. If the ECU refuses the
+      reset or does not answer, the agent stops sending TesterPresent, waits for the session
+      timeout the procedure declares plus a margin (the framework has no built-in default, since
+      the value is ECU-specific), and then confirms that the ECU is back in its default session,
+      for example by reading the active-session data identifier F186 (ISO 14229-1 Annex C). If
+      it cannot confirm that, the job ends in `OnSiteInterventionRequired`. The reset is sent
+      before the VIN is verified; it changes no memory, and nothing destructive happens before
+      step 3.
+   3. Service-dependent checks in the default session: VIN verification and the ECU state check
+      of design 8.2.5. A mismatch aborts the job.
+   4. Re-entry: the programming session and security access again, then erase and RequestDownload.
 3. **Block checkpoints are progress, not a resume origin.** The journal still records each
    confirmed block, for progress display and for the checkpoint summary used for handover to
    another device (8.2.5). Repeating a block after a lost response remains the block sequence
@@ -64,6 +74,8 @@ responsible for them, in the same way that business screens are theirs (design 9
   reconnection within the session timer, is lost on reset or session end, and a repeated block
   with the previous counter value is accepted without being written again. The recovery tests
   cover a fast reconnection (within the session timer) as well as a restart after it expired.
+- The IR has no field yet for the session timeout a procedure declares (item 2); it is added
+  together with the write-job journal.
 - With the schema default, a flash session never restarts automatically once erase has begun;
   the restart rule takes effect only for procedures whose authors declare that the ECU can be
   reprogrammed again after such an interruption.

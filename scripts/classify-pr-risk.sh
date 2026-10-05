@@ -26,6 +26,13 @@ if ! merge_base="$(git merge-base "$base" HEAD 2>/dev/null)"; then
   exit 2
 fi
 
+# Plain, unquoted diff output whatever the user's git configuration says.
+gitd() { git -c core.quotePath=false diff --no-color --no-ext-diff "$@"; }
+
+if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+  echo "note: uncommitted changes are not classified; only $merge_base..HEAD is" >&2
+fi
+
 # Paths whose changes the pull request's own CI fully covers.
 is_low_path() {
   case "$1" in
@@ -33,10 +40,15 @@ is_low_path() {
     crates/*-sys/*) return 1 ;;
     # CI excludes sim-vci from the test runs (CLAUDE.md, "Building and testing").
     crates/sim-vci/*) return 1 ;;
-    crates/*/tests/*) return 0 ;;
     docs/glossary.md) return 0 ;;
-    *) return 1 ;;
   esac
+  is_crate_test "$1"
+}
+
+# A file directly in a crate's tests/ directory tree (crates/<crate>/tests/...).
+# case patterns let * cross "/", so a regex anchors the crate component.
+is_crate_test() {
+  [[ "$1" =~ ^crates/[^/]+/tests/ ]]
 }
 
 reasons=()
@@ -56,19 +68,22 @@ while IFS=$'\t' read -r status path rest; do
   if ! is_low_path "$target"; then
     reasons+=("changes $target, which is not on the low-risk allowlist")
   elif [ "${status:0:1}" != A ]; then
-    case "$target" in
-      # Editing an existing test can drop or disable it (removed lines,
-      # #[ignore], #[cfg(any())], a loosened assertion) without CI noticing;
-      # only new test files are low risk.
-      crates/*/tests/*) reasons+=("modifies the existing test file $target") ;;
-    esac
+    # Editing an existing test can drop or disable it (removed lines,
+    # #[ignore], #[cfg(any())], a loosened assertion) without CI noticing;
+    # only new test files are low risk.
+    if is_crate_test "$target"; then
+      reasons+=("modifies the existing test file $target")
+    fi
   fi
-done < <(git diff --name-status "$merge_base" HEAD)
+done < <(gitd --name-status "$merge_base" HEAD)
 
-while IFS=$'\t' read -r added removed _; do
-  [ "$added" = "-" ] && continue
+while IFS=$'\t' read -r added removed path; do
+  if [ "$added" = "-" ]; then
+    reasons+=("changes the binary file $path")
+    continue
+  fi
   lines=$((lines + added + removed))
-done < <(git diff --numstat "$merge_base" HEAD)
+done < <(gitd --numstat "$merge_base" HEAD)
 
 if [ "$files" -gt "$max_files" ]; then
   reasons+=("changes $files files (limit $max_files)")
@@ -76,11 +91,13 @@ fi
 if [ "$lines" -gt "$max_lines" ]; then
   reasons+=("changes $lines lines (limit $max_lines)")
 fi
+# An added attribute that mentions ignore or cfg can switch a test off
+# (#[ignore], #[cfg_attr(..., ignore)], #![cfg(any())], #[cfg(windows)]).
 # grep -c reads the whole diff; grep -q could exit early and fail git diff
 # with SIGPIPE under pipefail, hiding the match.
-ignored="$(git diff "$merge_base" HEAD -- '*.rs' | grep -cE '^\+.*#\[ignore' || true)"
-if [ "${ignored:-0}" -gt 0 ]; then
-  reasons+=("adds #[ignore] to a test")
+gated="$(gitd "$merge_base" HEAD -- '*.rs' | grep -cE '^\+.*#!?\[.*(ignore|cfg)' || true)"
+if [ "${gated:-0}" -gt 0 ]; then
+  reasons+=("adds an attribute with ignore or cfg to Rust code")
 fi
 
 if [ "$files" -eq 0 ]; then

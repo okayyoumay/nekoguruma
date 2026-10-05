@@ -242,7 +242,11 @@ responsible for them, in the same way that business screens are theirs (design 9
   number, the software version and the engine, vehicle-speed and ignition states that the
   declared safety preconditions test, each with the value or range that satisfies it (these
   identifiers can be OEM-specific; a state that is not read from the ECU comes from a runtime
-  input instead, as the external supply does); all nine are
+  input instead, as the external supply does), nor the recovery boundaries of each flash
+  session: where the replayable steps leading up to the erase begin and where the erase
+  begins, so the runtime replays exactly that range and checks the preconditions again at the
+  erase boundary (today `Section` has only start and end positions and `FlashSession`'s steps
+  are not linked to the bytecode); all ten are
   added together with the write-job journal, along with the runtime input that reports whether the supply is
   connected. Until then a procedure cannot require the supply, and the voltage range is the
   only power check a restart can make. A declared safety precondition whose source is not

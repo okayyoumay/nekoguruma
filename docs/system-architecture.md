@@ -358,6 +358,9 @@ stateDiagram-v2
     Writing --> Interrupted: power loss, crash, forced termination
     Interrupted --> Writing: resumed from journal after restart
     Interrupted --> OnSiteInterventionRequired: cannot resume
+    Interrupted --> Expired: start deadline passed before recovery (ADR-229)
+    Interrupted --> ReadBackVerification: intended image installed and post-transfer steps journaled (ADR-229)
+    Interrupted --> Failed: VIN or ECU hardware identity mismatch on re-verification (aborted, ADR-229)
     ReadBackVerification --> Completed
     ReadBackVerification --> Failed
     Completed --> [*]

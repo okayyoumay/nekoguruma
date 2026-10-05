@@ -45,13 +45,15 @@ while IFS=$'\t' read -r status path rest; do
   [ -n "$status" ] || continue
   files=$((files + 1))
   case "$status" in
+    A* | M*) ;;
     D*) reasons+=("deletes $path") ;;
     R*) reasons+=("renames $path to $rest") ;;
+    *) reasons+=("changes $path with git status $status (copy, type change or other)") ;;
   esac
   target="${rest:-$path}"
   if ! is_low_path "$target"; then
     reasons+=("changes $target, which is not on the low-risk allowlist")
-  elif [ "${status:0:1}" = M ]; then
+  elif [ "${status:0:1}" != A ]; then
     case "$target" in
       # Editing an existing test can drop or disable it (removed lines,
       # #[ignore], #[cfg(any())], a loosened assertion) without CI noticing;

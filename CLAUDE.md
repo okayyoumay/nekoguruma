@@ -168,3 +168,7 @@ the attribute fails the build once the code is used and gets removed.
 5. Yoko reviews and merges. Do not merge your own PR unless asked.
 
 Commit messages and PR descriptions follow the same copyright rule as the code.
+
+Codex reviews against the "Review guidelines" section of [AGENTS.md](AGENTS.md), which restates
+the rules above as review priorities. When a rule in this file changes, update that section in
+the same pull request.

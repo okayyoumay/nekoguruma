@@ -243,7 +243,9 @@ responsible for them, in the same way that business screens are theirs (design 9
   renewed during the write, because a lease would make every write on a server-connected
   device, the first run included, depend on the network for its whole duration and rule out
   starting a write offline (design 5.7). An agent without a configured server has no handover
-  and no ownership record.
+  and no ownership record. The operator's confirmation is an operation of the server's Web
+  API, limited to operators authorized for the job and written to the audit log; it is added
+  together with the reservation operation.
 - Because every recovery on an agent with a configured server reserves its attempt there
   first, a write job interrupted
   while the device is offline (design 5.7 lets jobs start offline) does not restart until the

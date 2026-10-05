@@ -45,10 +45,13 @@ is_low_path() {
   is_crate_test "$1"
 }
 
-# A file directly in a crate's tests/ directory tree (crates/<crate>/tests/...).
-# case patterns let * cross "/", so a regex anchors the crate component.
+# A file Cargo discovers as an integration-test target on its own:
+# crates/<crate>/tests/<name>.rs or crates/<crate>/tests/<name>/main.rs. Any
+# other file under tests/ is a module that only runs if a target pulls it in,
+# so CI may never compile it. case patterns let * cross "/", so a regex
+# anchors each component.
 is_crate_test() {
-  [[ "$1" =~ ^crates/[^/]+/tests/ ]]
+  [[ "$1" =~ ^crates/[^/]+/tests/[^/]+\.rs$ || "$1" =~ ^crates/[^/]+/tests/[^/]+/main\.rs$ ]]
 }
 
 reasons=()

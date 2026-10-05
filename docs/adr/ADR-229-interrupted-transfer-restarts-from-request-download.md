@@ -99,7 +99,10 @@ responsible for them, in the same way that business screens are theirs (design 9
       transition does not pass through pre-validation again. If any fails, the job does not
       erase and ends in `OnSiteInterventionRequired`, reporting the failed condition. Then erase
       and RequestDownload.
-   A handover to another device (8.2.5) follows the same order.
+   A handover to another device (8.2.5) follows the same order. The receiving agent has no
+   access to the failed device's journal, so the checkpoint summary sent to the server carries
+   the recorded ECU hardware part number and pre-erase software version along with the VIN, and
+   the receiving agent compares against those values.
 3. **Block checkpoints are progress, not a resume origin.** The journal still records each
    confirmed block, for progress display and for the checkpoint summary used for handover to
    another device (8.2.5). Repeating a block after a lost response remains the block sequence

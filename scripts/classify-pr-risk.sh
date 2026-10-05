@@ -31,6 +31,8 @@ is_low_path() {
   case "$1" in
     work/*) return 0 ;;
     crates/*-sys/*) return 1 ;;
+    # CI excludes sim-vci from the test runs (CLAUDE.md, "Building and testing").
+    crates/sim-vci/*) return 1 ;;
     crates/*/tests/*) return 0 ;;
     docs/glossary.md) return 0 ;;
     *) return 1 ;;

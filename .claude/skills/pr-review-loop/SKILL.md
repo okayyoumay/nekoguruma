@@ -67,8 +67,9 @@ as the recommendation, and record on the PR that the question is open:
 - wait another five hours for Codex;
 - hand the PR over without an automated review: go to Step 5 and say so in the hand-off.
 
-Work stops on this PR until the maintainer answers. Once they answer, delete the pending
-check-in if it has not fired yet (`delete_trigger`).
+Work stops on this PR until the maintainer answers. Once they answer, record the answer on the
+PR (for "wait", with the new UTC time, and schedule that check-in), and delete the 15-minute
+check-in of the second trigger if it has not fired yet (`delete_trigger`).
 
 **Codex started but never finished.** If the trigger comment has 👀 but no result at the
 check-in, schedule one more check-in 15 minutes later. If that one still finds no result,

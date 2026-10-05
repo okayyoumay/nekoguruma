@@ -48,9 +48,13 @@ List the open pull requests with the `backlog-loop` label. If one belongs to thi
 it as described under "Run state" instead of going on. If one belongs to another run, stop the
 run and go to "Final report" (one item at a time).
 
-Otherwise no open PR depends on the branch, so reset its content to `main` without rewriting
-history (the run is unattended, and a reset or force-push needs approval): `git fetch origin
-main`, then record a merge of `origin/main` whose tree is exactly `origin/main`'s:
+Otherwise reset the branch's content to `main` without rewriting history (the run is
+unattended, and a reset or force-push needs approval). This discards everything on the branch,
+so first check that nothing else needs it: stop and tell the maintainer if `git status
+--porcelain` prints anything, or if any open PR, labelled or not, has this branch as its head.
+Then `git fetch origin main`. If `git diff --quiet HEAD origin/main` succeeds, the branch already
+matches and there is nothing to do; otherwise record a merge of `origin/main` whose tree is
+exactly `origin/main`'s:
 
 ```sh
 git merge -s ours --no-commit origin/main

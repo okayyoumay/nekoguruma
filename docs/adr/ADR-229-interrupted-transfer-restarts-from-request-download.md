@@ -54,7 +54,10 @@ responsible for them, in the same way that business screens are theirs (design 9
       before the VIN is verified; it changes no memory, and nothing destructive happens before
       step 3.
    3. Service-dependent checks in the default session: VIN verification and the ECU state check
-      of design 8.2.5. A mismatch aborts the job.
+      of design 8.2.5. A VIN mismatch aborts the job. The state check includes reading back the
+      ECU software version: if it shows that the intended image is already installed (the
+      transfer and RequestTransferExit completed, but the response or the journal update was
+      lost), the job skips the restart and continues with read-back verification.
    4. Re-entry: the programming session and security access again, then erase and RequestDownload.
 3. **Block checkpoints are progress, not a resume origin.** The journal still records each
    confirmed block, for progress display and for the checkpoint summary used for handover to

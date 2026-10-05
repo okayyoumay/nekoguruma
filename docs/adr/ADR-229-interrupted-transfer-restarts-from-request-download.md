@@ -180,7 +180,11 @@ responsible for them, in the same way that business screens are theirs (design 9
       a second time, since the replay takes time and conditions may change during it. If any fails, the job does not
       erase and ends in `OnSiteInterventionRequired`, reporting the failed condition. Then erase
       and RequestDownload.
-   A handover to another device (8.2.5) follows the same order. The receiving agent has no
+   A handover to another device (8.2.5) follows the same order. The receiving agent holds
+   none of the failed device's guards, so like a restart after an agent crash it first takes
+   its own per-VCI lock and its device's reprogramming slot, waiting while another job holds
+   them, and promotes to the per-vehicle lock at the first VIN match, before anything goes
+   through its VCI. The receiving agent has no
    access to the failed device's journal, so the checkpoint summary sent to the server carries
    the recorded ECU hardware part number, the pre-erase software version, the RequestTransferExit
    intent marker, the post-transfer progress and the number of resumes already made per stage

@@ -33,8 +33,9 @@ permissions:
 jobs:
   # Whether a pull request changes anything besides documentation, `work/` and `.claude/`
   # (the same paths the push filter ignores). Always true outside pull requests. The jobs that
-  # depend on it run whenever it did not succeed, so a broken filter can never turn the required
-  # checks into skipped (and therefore passing) jobs.
+  # depend on it run whenever it did not succeed (`always()`, so even when the run is cancelled
+  # while it is still going), so a failed or cancelled filter can never turn the required checks
+  # into skipped (and therefore passing) jobs.
   changes:
     runs-on: ubuntu-latest
     outputs:
@@ -64,7 +65,7 @@ jobs:
   # linker prints a warning of its own.
   core-linux:
     needs: changes
-    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.code == 'true') }}
+    if: ${{ always() && (needs.changes.result != 'success' || needs.changes.outputs.code == 'true') }}
     runs-on: ubuntu-latest
     env:
       RUSTFLAGS: -D warnings
@@ -87,7 +88,7 @@ jobs:
   # runs it on every pull request. main runs everything.
   core-windows:
     needs: changes
-    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.code == 'true') }}
+    if: ${{ always() && (needs.changes.result != 'success' || needs.changes.outputs.code == 'true') }}
     runs-on: windows-latest
     env:
       EXCLUDE: ${{ github.event_name == 'pull_request' && '--exclude j2534-0404-service' || '' }}
@@ -111,7 +112,7 @@ jobs:
   # matter for a type check, which links nothing.
   worker-check:
     needs: changes
-    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.code == 'true') }}
+    if: ${{ always() && (needs.changes.result != 'success' || needs.changes.outputs.code == 'true') }}
     runs-on: ubuntu-latest
     env:
       RUSTFLAGS: -D warnings
@@ -205,7 +206,7 @@ jobs:
   # Include ARM via QEMU user mode (real hardware tested separately).
   abi-roundtrip:
     needs: changes
-    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.code == 'true') }}
+    if: ${{ always() && (needs.changes.result != 'success' || needs.changes.outputs.code == 'true') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5

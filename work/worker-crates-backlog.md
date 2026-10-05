@@ -357,6 +357,9 @@ production race exists — each test's flakiness was a test-side defect:
   with `"J2534-2:"` should be treated now that SAE J2534-2 clause 5's "no assumption can be made"
   case applies to it. Non-blocking — every shipped J2534-2 phase's own `pname` opt-in reads
   correctly regardless.
+  Blocked on: a design decision on whether `config.rs` validates the `"J2534-2:"` `pname` prefix
+  at load time and how a `pname` without it is treated (`docs/j2534-2-support-plan.md` section 4
+  design question 1, never decided by ADR-152).
 - **P3** (`edge-case-hunter` finding, PR #106 round 2 verification pass, test-coverage gap, not a
   live defect): `ioctl_clear_tx_queue`'s regression test
   (`ioctl_clear_tx_queue_skips_the_native_call_for_a_hard_errored_cll`, `rpc_misc.rs`) builds its
@@ -790,6 +793,9 @@ production race exists — each test's flakiness was a test-side defect:
   failure (e.g. the device rejects a malformed candidate outright) is treated the same way -- this
   candidate's attempt failed, advance and retry -- rather than failing the whole claim loop. Neither
   was chased further here; worth settling explicitly if this mechanism is revisited.
+  Blocked on: a design decision on whether a J1939 claim candidate that times out or fails to
+  issue advances to the next candidate or fails the whole claim loop (ADR-179 left both readings
+  open).
 - **P3** (test-coverage gap, preserved from a completed backlog entry removed during the 2026-08-18
   backlog cleanup; Codex review finding, PR #79): `run_j1939_claim_loop`'s `timed_out_without_indication`
   path (Decision 2's original mechanism, plus its round-20/21 corrections) still has no direct
@@ -947,6 +953,8 @@ production race exists — each test's flakiness was a test-side defect:
   convention, the least spec-grounded default this codebase has picked so far. Revisit if a
   primary SAE J1708 electrical-layer reference (a wiring standard, OEM service documentation, or
   equivalent) becomes available in this workspace.
+  Blocked on: a primary SAE J1708 electrical-layer reference (a wiring standard or OEM service
+  documentation), which is not available.
 - **P3** (`edge-case-hunter`, ADR-172 PR, pre-existing question surfaced while verifying the
   SW-CAN speed-transition withhold, not introduced by that fix): whether `can_channel_mode =
   "native-mixed"` (ADR-160) combined with an SW-CAN or FT-CAN resource could ever let a genuinely
@@ -1362,7 +1370,7 @@ production race exists — each test's flakiness was a test-side defect:
 - **P3** (ADR-102, accepted limitation, not fixed): tester-present's own response-discard path (`poll_rx_inner`'s `tester_present_discard` check, ADR-088/ADR-099) never runs the RC-handling/pending-response extension `CoptSendrecv`'s `wait_for_expected_response_inner` uses -- a `7F 3E 78` reply to a tester-present send is simply discarded (content case (a), same as any other matched reply) without extending the discard window the way a `CoptSendrecv` COP would extend its own deadline on 0x78, potentially letting the ECU's eventual real reply arrive after the window has already closed and leak through undiscarded. Wiring RC78 reload semantics into the discard path is a distinct design question (tester-present has no COP/ComPrimitive of its own to extend a deadline on) deferred out of this ADR's scope.
 - **P2**: Expand ComParam support for CP_SamplesPerBit (still unsupported; no J2534-1 equivalent). CP_UartConfig now decodes into `DATA_BITS`+`PARITY` for the 6 J2534 v04.04-representable values (ADR-071); 2-stop-bit and 9-data-bit encodings remain unsupported (`SetComParam` rejects them — no J2534-1 equivalent exists).
 - **P3** (accepted test-coverage gap, found while fixing the J1850 addressing allow-list gap, not chased further, low risk): the wire-level tests for J1850 addressing overrides (`j1850vpw_set_com_param_overrides_physical_addressing_on_wire`/`j1850pwm_set_com_param_overrides_functional_addressing_on_wire`) only cover VPW-physical and PWM-functional end-to-end; VPW-functional and PWM-physical are untested at the wire level (both are covered at the unit allow-list level by `j1850_addressing_params_allowed_for_both_j1850_variants`).
-- **P2**: `CP_ExtendedTiming` (0x8050) is get/settable but never applied to hardware. ISO 22900-2 defines extended timing for ISO 14230-2 (key-byte-gated timing set), so adapter-layer support is in scope (revising ADR-076's out-of-scope rationale); implementation deferred pending additional information — key-byte inspection to detect extended-timing support, and the mapping of extended timing values onto J2534 SET_CONFIG timing parameters.
+- **P2**: `CP_ExtendedTiming` (0x8050) is get/settable but never applied to hardware. ISO 22900-2 defines extended timing for ISO 14230-2 (key-byte-gated timing set), so adapter-layer support is in scope (revising ADR-076's out-of-scope rationale); implementation deferred pending additional information — key-byte inspection to detect extended-timing support, and the mapping of extended timing values onto J2534 SET_CONFIG timing parameters. Blocked on: ISO 14230-2, which is not available, to define key-byte detection and the mapping of extended timing onto J2534 `SET_CONFIG` parameters.
 - **P2** (ADR-099, found while writing that ADR's regression tests, not fixed there): `route_frame` (`events.rs`) only routes an incoming frame to a CLL when its CAN ID matches a configured `UniqueRespIdTable` entry's `CP_CanRespUSDTId`/`CP_CanRespUUDTId`, or unconditionally when the table is empty (ADR-007's no-table wildcard mode). Tester-present's own TX CAN ID (`CP_CanPhysReqId`/`CP_CanFuncReqId`-derived, a *request* identifier) is never itself a table entry for the common physically-addressed case, so ADR-099's TX-side discard (`tx_can_id`) is reachable in practice only when the table is empty or the TX CAN ID happens to coincide with a configured response ID — a genuine TX_DONE/CONFIG_LOOPBACK echo on a physically-addressed CLL with a non-empty table is already dropped by routing before it reaches the discard check at all, so no leak survives either way, but the protection ADR-099 added is narrower than `tx_can_id`'s existence alone suggests. Closing this would mean teaching `route_frame` to also match `CP_CanPhysReqId`/`CP_CanFuncReqId`, a routing-layer design question (would it also change delivery of *content* frames on those IDs, not just indication frames?) out of scope for a discard-mechanism fix.
 - **P3** (ADR-139, accepted residual, not fixed): `ioctl_reset`'s (`rpc_misc.rs`) per-target `cancel_held_tx_items` loop lacks the same `shared_channels`-holding protection against a concurrent Disconnect+Connect race that ADR-139 closed for `handle_channel_hard_error`/`rpc_module_disconnect`, but needs a fully independent, precisely-timed concurrent Disconnect+Connect to matter (`PDU_IOCTL_RESET`'s own client-issued-reset semantics narrow the reachable window). Deferred pending a concrete repro or a future audit pass.
 - **P3** (edge-case-hunter finding against ADR-139's diff, pre-existing, NOT introduced or fixed by ADR-139 -- the loop body it flags is byte-for-byte unchanged, only `chans`'s hold duration around it was widened): a CLL with both a primary channel and a UUDT companion channel (ADR-046) has two independent per-physical-channel poll tasks; if each independently detects a hard error close together, two serialized `handle_channel_hard_error` invocations both match the same `cll_handle` -- the first via `l.channel_id`, the second via the still-unset `l.uudt_channel_id` (or vice versa; each invocation only clears the one field matching its own `channel_id`, per the function's own comment). The widened `shared_channels` hold from this ADR correctly serializes the two invocations, and `cancel_link_cops` itself is idempotent for COP cancellation (the second invocation's scan finds nothing left in `primitives`, no duplicate `PduCopstCancelled`). But `send_error_event`/`send_cll_status` are unconditional and the second invocation still fires a duplicate `PDU_ERR_EVT_LOST_COMM_TO_VCI` + `PDU_CLLST_OFFLINE` pair for a CLL that is already offline; `send_module_status(PduModstNotAvail)`/`send_system_info(ModuleListChg)` at the tail likewise re-fire redundantly at the module level. Not fixed here (a distinct bug from the one ADR-139 closes, out of scope for that PR) and not covered by any existing test (nothing exercises independent primary+companion hard errors racing on one CLL). Recorded here per this codebase's own convention rather than left only in review history.
@@ -1425,6 +1433,8 @@ production race exists — each test's flakiness was a test-side defect:
   CAN-ID bytes pass through the destination-address-drop transform unchanged, byte for byte). A
   real vendor DLL's reassembled-response CAN ID is genuinely unverifiable without real J1939
   hardware. See ADR-200's Consequences section for the full analysis.
+  Blocked on: real J1939 hardware and a vendor DLL to observe which CAN ID a reassembled
+  multi-frame response reports on a RawMode CLL.
 - **P3** (ADR-185, found while scoping Stage 1/Stage 2's per-phase parameter mapping, not part of
   either stage's own call-site list): each Stage-1-wired family's `DEVICE_INFO_*_SIMULTANEOUS`
   companion bit (SWCAN/FT-CAN/UART Echo Byte/Honda DIAG-H/J1708/Analog Inputs/GM UART, ADR-189/Phase
@@ -1448,6 +1458,8 @@ production race exists — each test's flakiness was a test-side defect:
   allowlist is even warranted is itself an open question ADR-189 left unresolved -- not fixed here.
   No assigned phase; would need a `design-advisor` consult (or a spec-clarity finding) to decide
   whether a closed allowlist is warranted at all before implementation starts.
+  Blocked on: a design decision on whether GM UART needs a closed ComParam allowlist in
+  `comparam_support.rs` (ADR-189 left it unresolved).
 - **P3** (found by `edge-case-hunter`'s review of the round-1 `BECOME_MASTER` `spawn_blocking` fix,
   PR #98, test-coverage gap, not fixed): no test exercises the actual concurrency property
   `ioctl_become_master`'s `spawn_blocking` dispatch provides -- that a concurrent RPC needing
@@ -1544,6 +1556,8 @@ production race exists — each test's flakiness was a test-side defect:
   alternate set, so the ordinary `dlc_pins`-overlap check in `rows_conflict` already reports this
   pair as conflicting; no FT-CAN entry was needed in `peer_closed_set_extra_pins`. See
   `resources.rs`'s `peer_closed_set_extra_pins` doc comment for the full investigation.)
+  Blocked on: a design decision on what a pin conflict means for protocols whose alternate pins
+  cannot be enumerated (UART Echo Byte, J1708).
 - **P3** (found while fixing [ADR-202](../docs/adr/ADR-202-j1850-unique-id-comparam-reclassification.md)'s
   J1850 `PDU_PC_UNIQUE_ID` reclassification, deliberately deferred, not fixed there): ISO 22900-2:2022
   Table B.11 scopes `CP_MidRespId` exclusively to SAE J1708 (its own column mark, distinct from every
@@ -1609,6 +1623,8 @@ production race exists — each test's flakiness was a test-side defect:
   same gap, unrecorded as a separate entry per ADR-207's own Consequences), out of scope for a
   single-family ADR to settle unilaterally. Not investigated or scoped here beyond confirming the gap
   and its true (repo-wide) extent.
+  Blocked on: a design decision on whether RawMode is valid on `_CHx` links, for all protocol
+  families or only some (ADR-196, ADR-198 and ADR-200 do not address it).
 - **P3** (Codex review, ADR-206's PR #117, verified pre-existing since Phase 5/ADR-179): the mock's
   `IOCTL_GET_DEVICE_INFO` has no arm for `DEVICE_INFO_J1939_SUPPORTED` at all -- it falls through to
   `Supported = 0` by construction, unlike GM UART's own dedicated arm or the flat `chx_capacity`-packed

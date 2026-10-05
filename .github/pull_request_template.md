@@ -31,10 +31,10 @@ After:
 
 <!-- Tick each line, or say why it does not hold. -->
 
-- [ ] No standard text is copied anywhere in this PR, including commit messages and this description; standards are cited by clause and paraphrased.
+- [ ] No standard text is copied anywhere in this PR, including commit messages and this description; standards are cited by clause or section number and paraphrased, and ISO 22900-2 citations name the 2009 or 2022 edition.
 - [ ] No secrets, credentials or internal hostnames.
 - [ ] Generated code: proto bindings regenerated with `service.proto`; FFI bindings not hand-edited, and a deferred FFI regeneration is recorded in the backlog. (N/A if untouched.)
-- [ ] Write, flash and routine-control jobs keep the preconditions and safety guards of `docs/system-architecture.md` 5.5, 5.6 and 8.9. (N/A if untouched.)
+- [ ] Write, flash and routine-control jobs keep the preconditions and safety guards of `docs/system-architecture.md` 5.5, 5.6 and 8.9, and the authorization and approval levels of section 6. (N/A if untouched.)
 
 ## Test plan
 

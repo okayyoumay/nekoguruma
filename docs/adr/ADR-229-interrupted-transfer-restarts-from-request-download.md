@@ -150,8 +150,12 @@ responsible for them, in the same way that business screens are theirs (design 9
 
 ## Consequences
 
-- The reference implementation works with any ECU that implements the standard download
-  services. `sim-ecu` only needs the standard behaviour: the download state survives a client
+- The reference implementation's automatic recovery works with an ECU that implements the
+  standard download services and, in its default session, answers ReadDataByIdentifier for
+  the VIN, its hardware part number, its software version and the active session (F186), and
+  ECUReset. An ECU that lacks any of these can still be programmed, but an interrupted
+  transfer on it ends in `OnSiteInterventionRequired`. `sim-ecu` provides all of them and
+  otherwise only needs the standard behaviour: the download state survives a client
   reconnection within the session timer, is lost on reset or session end, and a repeated block
   with the previous counter value is accepted without being written again. The recovery tests
   cover a fast reconnection (within the session timer) as well as a restart after it expired.

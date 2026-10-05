@@ -47,7 +47,10 @@ responsible for them, in the same way that business screens are theirs (design 9
       limit allows another resume, the agent increments the stage's resume count and commits it
       to the journal, and also reserves the attempt on the server by incrementing the server's
       per-stage count atomically and checking it against the limit, all before it sends anything
-      to the ECU. The journal commit keeps a crash during recovery from reloading the old count;
+      to the ECU. The agent journals a key for the attempt before it reserves, and the server
+      reservation is idempotent on that key, so a reservation whose response was lost is retried
+      under the same key and never consumes a second attempt. The journal commit keeps a crash
+      during recovery from reloading the old count;
       the server reservation keeps a handover from starting on a count that misses attempts this
       device made but never published. If the server cannot be reached, the agent waits for it
       until the start deadline and then ends the job in `OnSiteInterventionRequired`. Recovery is
@@ -94,9 +97,11 @@ responsible for them, in the same way that business screens are theirs (design 9
 
       After either kind of teardown, or directly in the completed case above, the agent confirms that the ECU is back in its default
       session, for example by reading the active-session data identifier F186 (ISO 14229-1
-      Annex C). An ECU that has just acknowledged a reset may not answer while it restarts, so
-      after an active reset the agent first waits the startup time the procedure declares and
-      then retries the read within a bounded window (the reset response's power-down time,
+      Annex C). An ECU that has just accepted a reset may not answer while it restarts, so
+      whenever a reset was sent and may have been accepted (it was acknowledged, or its
+      response was lost), the agent first waits the startup time the procedure declares, after
+      the session timeout when the teardown was passive, and then retries the read within a
+      bounded window (the reset response's power-down time,
       when the ECU reports one, extends the wait). If it still cannot confirm the default
       session, the job ends in `OnSiteInterventionRequired`. Step 3
       never starts before this confirmation.

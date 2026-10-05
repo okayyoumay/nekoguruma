@@ -699,6 +699,11 @@ async fn claim_retries_the_next_candidate_after_the_first_is_lost() {
         !saw_init_error,
         "the claim should have succeeded on the second candidate, not exhausted the list"
     );
+    assert_eq!(
+        server.backdoor.j1939_claim_lost_remaining(),
+        0,
+        "the first candidate's claim attempt should have been made, and lost"
+    );
 
     drop(events);
 

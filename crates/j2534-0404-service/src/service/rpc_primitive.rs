@@ -7922,11 +7922,10 @@ mod tp20_broadcast_periodic_api_fence_tests {
     ///    never race an in-flight `PassThruStartPeriodicMsg`.
     ///
     /// Joins the `tp20_stop_periodic_call_counter` serial group: the teardown
-    /// issues a real `PassThruStopPeriodicMsg`, which bumps the mock's
-    /// PROCESS-GLOBAL `__mock_get_stop_periodic_count` that
-    /// `cancel_takes_the_sentinel_under_the_fence_without_a_native_stop`
-    /// asserts on. (This test's own assertions use `live_periodic_msg_count`,
-    /// which is channel-keyed and would need no guard by itself.)
+    /// issues a real `PassThruStopPeriodicMsg`, which must not run while
+    /// another test in the group has `__mock_set_stop_periodic_message_error`
+    /// armed. (This test's own assertions use `live_periodic_msg_count`,
+    /// which is channel-keyed.)
     #[tokio::test]
     #[serial(tp20_stop_periodic_call_counter)]
     async fn disconnect_takes_the_entry_atomically_and_fences_only_the_native_stop() {

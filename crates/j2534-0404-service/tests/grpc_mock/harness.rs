@@ -1538,6 +1538,18 @@ impl MockBackdoor {
         }
     }
 
+    /// How many of the attempts armed by [`Self::set_j1939_claim_lost_count`]
+    /// have not been made yet.
+    pub(crate) fn j1939_claim_lost_remaining(&self) -> u32 {
+        unsafe {
+            let f: Symbol<unsafe extern "system" fn() -> u32> = self
+                .lib
+                .get(b"__mock_get_j1939_claim_lost_remaining\0")
+                .expect("__mock_get_j1939_claim_lost_remaining should be exported");
+            f()
+        }
+    }
+
     /// ADR-180 Decision 21 regression coverage (design-advisor consult,
     /// Codex review PR #72): forces every subsequent `IOCTL_PROTECT_J1939_
     /// ADDR` claim attempt (non-cancel form) on every channel to return

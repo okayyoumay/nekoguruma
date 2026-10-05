@@ -735,7 +735,7 @@ async fn tester_present_reqrsp_live_flip_takes_effect_on_next_due_send() {
 /// the due-snapshot keeps reading the frozen `resolved.expects_response =
 /// false` from the `CP_TesterPresentReqRsp = 0` arm forever, forcing
 /// `this_requires_no_response = true` and gapping that second send to
-/// ~1200ms; post-fix, it reads the live (now `1`) value, so the send is not
+/// ~1000ms; post-fix, it reads the live (now `1`) value, so the send is not
 /// gapped and fires on the 500ms cadence.
 ///
 /// Timing: the poll task that sends tester-present also executes the queued
@@ -746,8 +746,9 @@ async fn tester_present_reqrsp_live_flip_takes_effect_on_next_due_send() {
 /// test is gapped whatever the due-snapshot reads. The flip takes two
 /// client round trips (`SetComParam`, `StartComPrimitive`), so the interval
 /// is 500ms (about 3x two `GRPC_ROUND_TRIP_OVERHEAD_CEILING_MS` round trips,
-/// ADR-149), and `CP_P3Func` is 1200ms so that a gapped send stays far from
-/// the 850ms bound. With a 50ms interval a slow runner missed that window.
+/// ADR-149), and `CP_P3Func` is 1000ms so that a gapped send stays 250ms
+/// above the 750ms bound and well within `wait_for_written_count`'s 2s
+/// wait. With a 50ms interval a slow runner missed that window.
 #[tokio::test]
 #[serial]
 async fn tester_present_reqrsp_due_snapshot_reads_live_not_frozen_resolved() {
@@ -759,7 +760,7 @@ async fn tester_present_reqrsp_due_snapshot_reads_live_not_frozen_resolved() {
         j2534_0404::ISO15765,
         &[
             (j2534_0404::DATA_RATE, 500_000),
-            (CP_P3_FUNC, 1_200_000),
+            (CP_P3_FUNC, 1_000_000),
             (CP_REQUEST_ADDR_MODE, 2),
             (CP_CAN_FUNC_REQ_ID, 0x7DF),
             (CP_TESTER_PRESENT_ADDR_MODE, 1),
@@ -834,7 +835,7 @@ async fn tester_present_reqrsp_due_snapshot_reads_live_not_frozen_resolved() {
     let elapsed = server.backdoor.written_gap(MOCK_CHANNEL_ID, 2, 3);
 
     assert!(
-        elapsed < std::time::Duration::from_millis(850),
+        elapsed < std::time::Duration::from_millis(750),
         "the second due-triggered send after the CP_TesterPresentReqRsp flip should not be \
          CP_P3Func-gapped -- the due-snapshot itself must read the live CP_TesterPresentReqRsp \
          value, not the frozen resolved.expects_response from the reqrsp=0 arm (waited {elapsed:?})"

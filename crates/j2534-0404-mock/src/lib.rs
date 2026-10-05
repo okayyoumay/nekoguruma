@@ -4508,10 +4508,10 @@ exported_fn!(PassThruIoctl(
             // ADR-180 Decision 21 regression coverage: see
             // `j1939_claim_no_indication`'s own field doc.
             let no_indication = guard.j1939_claim_no_indication;
-            let loses_from_count = !is_cancel
-                && !no_indication
-                && guard.j1939_claim_lost_remaining > 0
-                && guard.channels.contains_key(&channel_id);
+            // The channel is known here: the lookup at the top of this arm
+            // already returned `err_channel()` for an unknown one.
+            let loses_from_count =
+                !is_cancel && !no_indication && guard.j1939_claim_lost_remaining > 0;
             if loses_from_count {
                 guard.j1939_claim_lost_remaining -= 1;
             }
@@ -5507,6 +5507,14 @@ exported_fn!(
     let mut guard = state().lock().expect("mock state poisoned");
     guard.j1939_claim_lost_remaining = count;
     no_error()
+});
+
+exported_fn!(
+    /// How many forced-LOST claim attempts set by
+    /// `__mock_set_j1939_claim_lost_count` are still unused. A test reads
+    /// it back to prove the attempts it armed were actually made.
+    __mock_get_j1939_claim_lost_remaining() -> u32 {
+    state().lock().expect("mock state poisoned").j1939_claim_lost_remaining
 });
 
 exported_fn!(
@@ -8111,6 +8119,69 @@ mod tests {
             let mut num = 1u32;
             let write_rc = unsafe { PassThruWriteMsgs(channel_id, &mut msg, &mut num, 0) };
             assert_eq!(write_rc, ERR_ADDRESS_NOT_CLAIMED as c_long);
+        }
+    );
+
+    serial_test!(
+        fn protect_j1939_addr_lost_count_loses_only_the_armed_attempts() {
+            let channel_id = connect_j1939_channel_with_pins();
+            assert_eq!(
+                unsafe { __mock_set_j1939_claim_lost_count(1) },
+                STATUS_NOERROR as c_long
+            );
+
+            // A cancel does not use up the count.
+            assert_eq!(
+                protect_j1939_addr(channel_id, 0x80, [0; 8]),
+                STATUS_NOERROR as c_long
+            );
+            assert_eq!(unsafe { __mock_get_j1939_claim_lost_remaining() }, 1);
+
+            assert_eq!(
+                protect_j1939_addr(channel_id, 0x80, [1; 8]),
+                STATUS_NOERROR as c_long
+            );
+            let (rx_status, data) = read_one_msg(channel_id).expect("first attempt indication");
+            assert_eq!(
+                rx_status & RX_FLAG_J1939_ADDRESS_LOST,
+                RX_FLAG_J1939_ADDRESS_LOST
+            );
+            assert_eq!(data, vec![0x80]);
+            assert_eq!(unsafe { __mock_get_j1939_claim_lost_remaining() }, 0);
+
+            assert_eq!(
+                protect_j1939_addr(channel_id, 0x81, [1; 8]),
+                STATUS_NOERROR as c_long
+            );
+            let (rx_status, data) = read_one_msg(channel_id).expect("second attempt indication");
+            assert_eq!(
+                rx_status & RX_FLAG_J1939_ADDRESS_CLAIMED,
+                RX_FLAG_J1939_ADDRESS_CLAIMED
+            );
+            assert_eq!(data, vec![0x81]);
+        }
+    );
+
+    serial_test!(
+        fn per_thread_counters_see_only_their_own_threads_calls() {
+            let stop_on_this_thread =
+                || unsafe { __mock_get_stop_periodic_count_on_current_thread() };
+            let before = stop_on_this_thread();
+            // Unknown channel: the call fails, but is still counted.
+            unsafe { PassThruStopPeriodicMsg(0xDEAD, 1) };
+            std::thread::spawn(|| unsafe {
+                PassThruStopPeriodicMsg(0xDEAD, 1);
+                PassThruStopPeriodicMsg(0xDEAD, 1);
+            })
+            .join()
+            .unwrap();
+            assert_eq!(stop_on_this_thread(), before + 1);
+            mock_reset();
+            assert_eq!(
+                stop_on_this_thread(),
+                before + 1,
+                "__mock_reset must not clear the per-thread counters"
+            );
         }
     );
 

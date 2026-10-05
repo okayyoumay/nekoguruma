@@ -43,7 +43,11 @@ responsible for them, in the same way that business screens are theirs (design 9
    open, and services the checks rely on (such as ReadDataByIdentifier) may not be available. A
    restart therefore runs in this order:
    1. Checks that need no ECU service: the start deadline, the resume limit per stage, the
-      interruptibility attribute (item 1) and the supply voltage read through the VCI.
+      interruptibility attribute (item 1) and the supply voltage read through the VCI. If the
+      limit allows another resume, the agent increments the stage's resume count and commits it
+      to the journal before it sends anything to the ECU, so a crash during recovery cannot reload
+      the old count and resume past the limit (the handover counterpart is the server-side
+      increment below).
    2. Identity, safety, then teardown. The agent never sends an ECUReset to an ECU it has not
       identified, because the VCI may now be connected to a different vehicle, nor to a vehicle
       that may be running. It first tries to read the VIN, which changes nothing on the ECU. Only

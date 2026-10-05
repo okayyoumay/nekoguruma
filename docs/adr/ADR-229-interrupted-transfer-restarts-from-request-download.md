@@ -245,8 +245,10 @@ responsible for them, in the same way that business screens are theirs (design 9
 - The server has no operation yet for reserving a recovery attempt. It needs one that
   atomically increments the per-stage resume count, checks it against the limit and is
   idempotent on the attempt key, backed by durable storage of the per-stage counts and of the
-  attempt keys with uniqueness on job, stage and key; it is added together with the write-job
-  journal.
+  attempt keys with uniqueness on job, stage and key. It is added with the server side of
+  recovery and handover, once the server's control channel exists, not with the agent's
+  write-job journal: an agent without a configured server recovers on its journal count
+  alone, so the journal does not depend on it.
 - The server also records which device owns the job, and the reservation is refused to any
   other device. The per-VIN server lock is only advisory (design 8.8), and a counter alone
   does not stop a failed device that comes back from recovering the same ECU while another

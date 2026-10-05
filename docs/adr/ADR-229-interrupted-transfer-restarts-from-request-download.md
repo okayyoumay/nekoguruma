@@ -61,7 +61,10 @@ responsible for them, in the same way that business screens are theirs (design 9
       excluded: when the journal shows that RequestTransferExit had been sent but does not record
       the procedure's post-transfer steps (such as CheckMemory) as complete, the agent sends no
       ECUReset, because a reset at that point could activate an image the procedure has not yet
-      validated. So that a crash between sending RequestTransferExit and recording its response
+      validated. When the journal records the post-transfer steps (including the procedure's
+      own ECUReset) as complete, no download is left to tear down: the agent sends no reset and
+      no further teardown and goes straight to the default-session confirmation below, so a
+      freshly initialized ECU is not reset again before verification. So that a crash between sending RequestTransferExit and recording its response
       cannot hide this case, the agent commits an intent marker for RequestTransferExit to the
       journal before it transmits the request (write-ahead); a journal without that marker
       proves the request was never sent. The marker is part of the checkpoint summary used for
@@ -77,7 +80,7 @@ responsible for them, in the same way that business screens are theirs (design 9
       waits for the session timeout the procedure declares plus a margin (the framework has no
       built-in default, since the value is ECU-specific).
 
-      After either kind of teardown the agent confirms that the ECU is back in its default
+      After either kind of teardown, or directly in the completed case above, the agent confirms that the ECU is back in its default
       session, for example by reading the active-session data identifier F186 (ISO 14229-1
       Annex C). If it cannot confirm that, the job ends in `OnSiteInterventionRequired`. Step 3
       never starts before this confirmation.
@@ -104,15 +107,18 @@ responsible for them, in the same way that business screens are theirs (design 9
       versions are the same, and the job skips the restart only if those steps are recorded as
       complete; otherwise it redoes the transfer. Any other decoded version means something other than this job changed the ECU, and
       the job ends in `OnSiteInterventionRequired`.
-   4. Re-entry: the procedure's own steps that lead up to the erase are replayed from the start
+   4. Re-entry: before anything else in this step, every execution precondition of design 8.9
+      that the procedure declares is validated (for a flash session: the voltage range, ignition
+      on, engine off, vehicle stopped, and the power supply check), since conditions may have
+      changed while the agent was down and the `Interrupted -> Writing` transition does not pass
+      through pre-validation again; if any fails, the job ends in `OnSiteInterventionRequired`
+      before the programming session or any side-effecting setup step is replayed. Then the
+      procedure's own steps that lead up to the erase are replayed from the start
       of the flash session, with their guards (programming session, security access, and any
       pre-programming steps the procedure defines, such as CommunicationControl,
       ControlDTCSetting or prerequisite routines; design 8.9), because the teardown discards the
-      state they established. Immediately before the erase, every execution precondition of
-      design 8.9 that the procedure declares is checked again (for a flash session: the voltage
-      range, ignition on, engine off, vehicle stopped, and the power supply check), since
-      conditions may have changed while the agent was down and the `Interrupted -> Writing`
-      transition does not pass through pre-validation again. If any fails, the job does not
+      state they established. Immediately before the erase the same preconditions are checked
+      a second time, since the replay takes time and conditions may change during it. If any fails, the job does not
       erase and ends in `OnSiteInterventionRequired`, reporting the failed condition. Then erase
       and RequestDownload.
    A handover to another device (8.2.5) follows the same order. The receiving agent has no

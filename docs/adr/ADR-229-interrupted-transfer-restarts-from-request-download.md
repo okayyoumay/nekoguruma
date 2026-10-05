@@ -125,7 +125,14 @@ responsible for them, in the same way that business screens are theirs (design 9
    access to the failed device's journal, so the checkpoint summary sent to the server carries
    the recorded ECU hardware part number, the pre-erase software version, the RequestTransferExit
    intent marker and the post-transfer progress along with the VIN, and
-   the receiving agent compares against those values.
+   the receiving agent compares against those values. The summary can lag behind the failed
+   device's journal (the device may fail after committing the marker locally and sending the
+   request, but before the updated summary reaches the server), so on a handover an absent
+   marker proves nothing: the receiving agent never sends the step 2 ECUReset and always tears
+   down passively, unless the summary records the post-transfer steps as complete, in which
+   case it goes straight to the default-session confirmation as on the same device. Requiring
+   a server acknowledgement before each RequestTransferExit was rejected, because it would make
+   the transfer depend on the network at that point.
 3. **Block checkpoints are progress, not a resume origin.** The journal still records each
    confirmed block, for progress display and for the checkpoint summary used for handover to
    another device (8.2.5). Repeating a block after a lost response remains the block sequence

@@ -27,15 +27,24 @@ responsible for them, in the same way that business screens are theirs (design 9
 
 ## Decision
 
-1. **Restart from RequestDownload.** When a transfer has started and the ECU-side transfer ended
-   (agent crash or restart, worker crash, VCI disconnect, power loss), the resumed job first runs
+1. **Restart from RequestDownload.** When a transfer that has started is interrupted (agent crash
+   or restart, worker crash, VCI disconnect, power loss), the resumed job first runs
    the state check and VIN verification of design 8.2.5. If those pass, it redoes the transfer
    from its erase and RequestDownload. It never continues from a later block.
-2. **Block checkpoints are progress, not a resume origin.** The journal still records each
+2. **Tear down the old transfer first.** A crash or a short disconnect does not necessarily end
+   the transfer on the ECU: if the agent reconnects before the ECU's session timer expires, the
+   ECU can still hold the old download, and a new RequestDownload would be refused with a
+   sequence error, or an erase would run while the old download is still open. Before the
+   restart, the agent therefore ends any download the ECU may still hold with an ECUReset
+   (ISO 14229-1 clause 9.3), which takes the ECU out of its non-default session, and then
+   re-enters the programming session and repeats security access. If the ECU refuses the reset,
+   the agent stops sending TesterPresent and waits for the session timer to expire before
+   re-entering. Only then does it erase and send RequestDownload.
+3. **Block checkpoints are progress, not a resume origin.** The journal still records each
    confirmed block, for progress display and for the checkpoint summary used for handover to
    another device (8.2.5). Repeating a block after a lost response remains the block sequence
    counter's job inside one transfer.
-3. **Split of responsibility.** The framework provides the mechanisms: the journal, the state
+4. **Split of responsibility.** The framework provides the mechanisms: the journal, the state
    check before resuming, the idempotency and interruptibility attributes (8.2.5, 8.10.1) and the
    guarantee that a write job ends in a state defined by design 5.6. The bundled write and
    recovery procedures are a reference implementation that uses only standard services. Recovery
@@ -45,9 +54,10 @@ responsible for them, in the same way that business screens are theirs (design 9
 ## Consequences
 
 - The reference implementation works with any ECU that implements the standard download
-  services. `sim-ecu` only needs the standard behaviour: the download state is lost on reset or
-  session end, and a repeated block with the previous counter value is accepted without being
-  written again.
+  services. `sim-ecu` only needs the standard behaviour: the download state survives a client
+  reconnection within the session timer, is lost on reset or session end, and a repeated block
+  with the previous counter value is accepted without being written again. The recovery tests
+  cover a fast reconnection (within the session timer) as well as a restart after it expired.
 - An interrupted transfer of a large image is resent in full, which costs time. The resume limit
   per stage (8.2.5) still applies, so repeated failures end in on-site intervention rather than
   an endless loop.

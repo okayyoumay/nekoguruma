@@ -245,9 +245,11 @@ responsible for them, in the same way that business screens are theirs (design 9
   declared safety preconditions test, each with the value or range that satisfies it (these
   identifiers can be OEM-specific; a state that is not read from the ECU comes from a runtime
   input instead, as the external supply does), nor the recovery boundaries of each flash
-  session: where the replayable steps leading up to the erase begin and where the erase
-  begins, so the runtime replays exactly that range and checks the preconditions again at the
-  erase boundary (today `Section` has only start and end positions and `FlashSession`'s steps
+  session: where the replayable steps leading up to the erase begin, where the erase begins,
+  where RequestTransferExit is sent and where the procedure's post-transfer steps end, so the
+  runtime replays exactly the pre-erase range, checks the preconditions again at the erase
+  boundary, and journals the post-transfer steps as complete only when execution reaches
+  their end boundary (today `Section` has only start and end positions and `FlashSession`'s steps
   are not linked to the bytecode), nor a way for a flash session to declare that no step
   requires on-site intervention (today `recovery_required_from_step` is a step number that
   defaults to the start of erase and has no value for "none", so the M1 reference procedure of

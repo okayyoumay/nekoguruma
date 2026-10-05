@@ -55,7 +55,8 @@ responsible for them, in the same way that business screens are theirs (design 9
       was erased may stop reporting it while its bootloader still answers; it is used only by the
       state check in step 3. If the VIN and the hardware identity match, the agent checks the
       safety preconditions of design 8.9 that the procedure declares (engine off, vehicle
-      stopped, ignition state) as far as it can without changing anything on the vehicle. Only
+      stopped, ignition state, and the supply voltage and external power supply, since a reset
+      can leave a partially programmed ECU depending on stable power) as far as it can without changing anything on the vehicle. Only
       when they all hold does it end any download the ECU may still hold with an ECUReset
       (ISO 14229-1 clause 9.3), which takes the ECU out of its non-default session. One case is
       excluded: when the journal shows that RequestTransferExit had been sent but does not record

@@ -62,9 +62,11 @@ responsible for them, in the same way that business screens are theirs (design 9
       the procedure's post-transfer steps (such as CheckMemory) as complete, the agent sends no
       ECUReset, because a reset at that point could activate an image the procedure has not yet
       validated. When the journal records the post-transfer steps (including the procedure's
-      own ECUReset) as complete, no download is left to tear down: the agent sends no reset and
-      no further teardown and goes straight to the default-session confirmation below, so a
-      freshly initialized ECU is not reset again before verification. So that a crash between sending RequestTransferExit and recording its response
+      own ECUReset) as complete, no download is left to tear down and the agent sends no reset,
+      so a freshly initialized ECU is not reset again before verification. If the default-session
+      confirmation below succeeds at once, it continues from there; if the ECU is still in a
+      non-default session (for example because the procedure's steps end without an ECUReset),
+      the agent tears down passively before confirming. So that a crash between sending RequestTransferExit and recording its response
       cannot hide this case, the agent commits an intent marker for RequestTransferExit to the
       journal before it transmits the request (write-ahead); a journal without that marker
       proves the request was never sent. The marker is part of the checkpoint summary used for

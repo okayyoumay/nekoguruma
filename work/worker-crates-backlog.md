@@ -505,6 +505,10 @@ production race exists — each test's flakiness was a test-side defect:
   question ADR-188 §1 does not explicitly settle either way. Pre-existing before round 26, not
   widened in blast radius by it. Needs a `design-advisor` consult if pursued, not a unilateral
   guess.
+  Done when: the reading is recorded in an ADR (or an ADR-188 amendment) and
+  `ioctl_start_msg_filter` and the mock follow it for TP2.0, with a test. Blocked on: Yoko's
+  decision on whether SAE J2534-2 clause 19 forbids all filters on a TP2.0 channel or only the
+  service's automatic pass-all filter (ADR-188 section 1 does not settle it).
 - **P3** (Codex review fix, PR #97, ADR-188 Fix Z, 23rd round, test-coverage gap, not fixed): no
   `grpc_mock` end-to-end regression test proves `reconcile_established_tp20_loss`'s own round-23
   race fix -- that a concurrent `CoptStopcomm`/`Disconnect`/`Destroy` winning the race against this

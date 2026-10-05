@@ -56,16 +56,20 @@ responsible for them, in the same way that business screens are theirs (design 9
       state check in step 3. If the VIN and the hardware identity match, the agent checks the
       safety preconditions of design 8.9 that the procedure declares (engine off, vehicle
       stopped, ignition state) as far as it can without changing anything on the vehicle. Only
-      when they all hold does it end any download
-      the ECU may still hold with an ECUReset (ISO 14229-1 clause 9.3), which takes the ECU out of
-      its non-default session.
+      when they all hold does it end any download the ECU may still hold with an ECUReset
+      (ISO 14229-1 clause 9.3), which takes the ECU out of its non-default session. One case is
+      excluded: when the journal shows that RequestTransferExit had been sent but does not record
+      the procedure's post-transfer steps (such as CheckMemory) as complete, the agent sends no
+      ECUReset, because a reset at that point could activate an image the procedure has not yet
+      validated.
 
       In every other case it tears down passively: when the ECU does not answer the VIN read or
       answers it with a negative response (for example because it is still inside the old
       download and does not allow the service there), when the hardware identity read gets no
       answer, a negative response or a value that differs from the journal's, when a safety
-      precondition fails or cannot be established, when the ECU refuses the reset, and when the reset gets no response so that
-      its outcome is unknown. Passive teardown means the agent stops sending TesterPresent and
+      precondition fails or cannot be established, in the post-transfer case just excluded,
+      when the ECU refuses the reset, and when the reset gets no response so that its outcome is
+      unknown. Passive teardown means the agent stops sending TesterPresent and
       waits for the session timeout the procedure declares plus a margin (the framework has no
       built-in default, since the value is ECU-specific).
 
@@ -82,11 +86,16 @@ responsible for them, in the same way that business screens are theirs (design 9
       failure to establish it (no answer, a negative response, an undecodable value) ends it in
       `OnSiteInterventionRequired`. Then the ECU state check of design 8.2.5, which includes
       reading back the ECU software version. If it shows that the intended image is already
-      installed (the transfer and RequestTransferExit completed, but the response or the journal
-      update was lost), the job skips the restart and continues with read-back verification. If
-      it shows the version recorded before the erase, or the ECU reports no software version
-      (no answer or a negative response, as when the application is invalid), the transfer still needs to be redone and the job goes on to
-      step 4. Any other decoded version means something other than this job changed the ECU, and
+      installed and the journal records the procedure's post-transfer steps (such as CheckMemory
+      and the procedure's own ECUReset) as complete, so that only a response or the journal
+      update was lost, the job skips the restart and continues with read-back verification. If
+      it shows the intended version but those steps are not recorded as complete, the image is
+      not treated as validated and the job goes on to step 4, whose full transfer runs the
+      post-transfer steps again in the procedure's order; a procedure may instead declare its
+      own post-transfer recovery sequence for this case (item 4). If the software version is the
+      one recorded before the erase, or the ECU reports none (no answer or a negative response,
+      as when the application is invalid), the transfer still needs to be redone and the job goes
+      on to step 4. Any other decoded version means something other than this job changed the ECU, and
       the job ends in `OnSiteInterventionRequired`.
    4. Re-entry: the procedure's own steps that lead up to the erase are replayed from the start
       of the flash session, with their guards (programming session, security access, and any

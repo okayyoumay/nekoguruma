@@ -1274,7 +1274,7 @@ mod tests {
     /// its own (see `rpc_module_disconnect`'s own doc comment at the
     /// collection site for the full rationale/precedent this supersedes).
     /// Proves that attempt actually fires -- `stop_periodic_call_count()`
-    /// increments by at least one -- while keeping every pre-existing
+    /// increments by exactly one -- while keeping every pre-existing
     /// assertion from the superseded test unchanged: the call still
     /// succeeds without panicking, and every map this teardown touches still
     /// ends up empty exactly as an ordinary `ModuleDisconnect` would leave
@@ -1424,10 +1424,7 @@ mod tests {
     /// error`) so that an incorrectly-NOT-skipped attempt would be loudly
     /// `warn!`-logged from `rpc_module.rs` itself; a `WarnCapture` subscriber
     /// set as this test's own thread-local default proves no such warning
-    /// fired -- see that struct's own doc comment for why this, not the
-    /// shared `stop_periodic_call_count()` counter other tests in this
-    /// module use, is the robust way to prove a skip (a negative claim)
-    /// specifically.
+    /// fired.
     #[tokio::test]
     #[serial(tp20_stop_periodic_call_counter)]
     async fn module_disconnect_skips_the_best_effort_stop_for_an_already_dead_channel() {

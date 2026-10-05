@@ -8167,7 +8167,7 @@ mod tests {
             let stop_on_this_thread =
                 || unsafe { __mock_get_stop_periodic_count_on_current_thread() };
             let before = stop_on_this_thread();
-            // Unknown channel: the call fails, but is still counted.
+            // Unknown channel: the call still succeeds, and is counted.
             unsafe { PassThruStopPeriodicMsg(0xDEAD, 1) };
             std::thread::spawn(|| unsafe {
                 PassThruStopPeriodicMsg(0xDEAD, 1);
@@ -8176,7 +8176,7 @@ mod tests {
             .join()
             .unwrap();
             assert_eq!(stop_on_this_thread(), before + 1);
-            mock_reset();
+            assert_eq!(unsafe { __mock_reset() }, STATUS_NOERROR as c_long);
             assert_eq!(
                 stop_on_this_thread(),
                 before + 1,

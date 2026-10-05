@@ -172,8 +172,9 @@ before/after delta sees other tests' calls when tests run in parallel (`cargo te
 several threads). For that case three calls also have a per-thread counter, which counts only the calls made on
 the calling thread and is not cleared by `__mock_reset`. A current-thread `#[tokio::test]` that drives the
 service directly makes its native calls on its own thread, so its delta on these is exact. A call the service
-moves to another thread (`spawn_blocking`, as `IOCTL_BECOME_MASTER` is) is not counted at all, so an "unchanged"
-assertion on these counters passes vacuously for such a call; pair it with a test that expects the count to rise:
+makes on another thread (for example through `spawn_blocking`) is counted on that thread, not on the test's, so
+an "unchanged" assertion would pass without proving anything for it; pair such an assertion with a test that
+expects the count to rise:
 
 | Function | Description |
 |----------|-------------|

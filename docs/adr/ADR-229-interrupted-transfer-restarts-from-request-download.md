@@ -111,8 +111,10 @@ responsible for them, in the same way that business screens are theirs (design 9
       built-in default, since the value is ECU-specific).
 
       After either kind of teardown, or directly in the completed case above, the agent confirms that the ECU is back in its default
-      session, for example by reading the active-session data identifier F186 (ISO 14229-1
-      Annex C). An ECU that has just accepted a reset may not answer while it restarts, so
+      session by reading the active-session data identifier F186 (ISO 14229-1 Annex C). This is
+      the reference implementation's only confirmation query, so the IR needs no mapping for it;
+      an ECU that does not answer it, or answers it with a session other than the default one,
+      is not confirmed. An ECU that has just accepted a reset may not answer while it restarts, so
       in every case, after either kind of teardown and on the completed path that sends no reset,
       the agent first waits the startup time the procedure declares, after the session timeout
       when the teardown was passive, and then retries the read within a bounded window. This

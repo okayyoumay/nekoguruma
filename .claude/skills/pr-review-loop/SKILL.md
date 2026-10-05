@@ -178,9 +178,9 @@ re-requested at most once.
 - Every job failing within seconds with no runner assigned is an Actions capacity or budget
   problem, not a code failure. Re-run once to confirm, then stop and tell Yoko; more retries
   only spend minutes.
-- PRs that change only documentation, `work/` or `.claude/` skip `ci.yml`, so their required
-  checks stay pending and Yoko merges them with the ruleset bypass. That is expected, not a CI
-  failure.
+- PRs that change only documentation, `work/` or `.claude/` run only the `changes` job of
+  `ci.yml`; the build jobs show as skipped, which counts as passed for the required checks. That
+  is expected, not a CI failure.
 
 ## Step 5: close out
 
@@ -198,8 +198,8 @@ Step 0 is done:
    the thread `id` from `get_review_comments`). Codex never resolves its own threads.
 3. **CI on the current head.** Wait for the check runs of the commit you are handing over and
    require them to pass (`get_check_runs`); the local checks in Step 3 do not cover the Windows
-   tests or the worker targets. A PR that skips `ci.yml` (see "CI facts") needs only
-   `repo-checks` to pass. A red run sends you back to fixing it per CLAUDE.md. Also check the
+   tests or the worker targets. On a PR whose build jobs are skipped (see "CI facts"),
+   `changes` and `repo-checks` passing is enough. A red run sends you back to fixing it per CLAUDE.md. Also check the
    base, even after a no-change round: if the PR conflicts with `main`
    (`mergeable_state: "dirty"`), merge `main` per Step 3.5 and go back through Steps 3 and 4,
    since a check run on the old head says nothing about the merged tree. Being merely behind

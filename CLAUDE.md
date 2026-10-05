@@ -142,7 +142,8 @@ timing-sensitive to run in parallel on the Windows runner, so the `core-windows`
 CI (`.github/workflows/ci.yml`) also checks the worker crates for six targets and runs
 `scripts/abi-roundtrip.sh`. On pull requests the worker targets are only type-checked
 (`cargo check --target`); the release builds (cargo-zigbuild for Linux, llvm-mingw for the `*-pc-windows-gnullvm` Windows targets, all on Linux)
-run on main. Pull requests that change only documentation, `work/` or `.claude/` skip `ci.yml`;
+run on main. On pull requests that change only documentation, `work/` or `.claude/`, the
+`changes` job in `ci.yml` skips the build jobs, which then count as passed required checks;
 `repo-checks.yml` always runs. Do not run cross-target builds locally unless asked; CI covers
 them.
 

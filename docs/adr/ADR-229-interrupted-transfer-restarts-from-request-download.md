@@ -95,7 +95,10 @@ responsible for them, in the same way that business screens are theirs (design 9
       own post-transfer recovery sequence for this case (item 4). If the software version is the
       one recorded before the erase, or the ECU reports none (no answer or a negative response,
       as when the application is invalid), the transfer still needs to be redone and the job goes
-      on to step 4. Any other decoded version means something other than this job changed the ECU, and
+      on to step 4. The journal's record of the post-transfer steps decides, not the version
+      alone: when a job reflashes the version already installed, the pre-erase and intended
+      versions are the same, and the job skips the restart only if those steps are recorded as
+      complete; otherwise it redoes the transfer. Any other decoded version means something other than this job changed the ECU, and
       the job ends in `OnSiteInterventionRequired`.
    4. Re-entry: the procedure's own steps that lead up to the erase are replayed from the start
       of the flash session, with their guards (programming session, security access, and any

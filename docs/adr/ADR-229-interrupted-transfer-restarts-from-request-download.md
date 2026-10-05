@@ -170,9 +170,10 @@ responsible for them, in the same way that business screens are theirs (design 9
   reconnection within the session timer, is lost on reset or session end, and a repeated block
   with the previous counter value is accepted without being written again. The recovery tests
   cover a fast reconnection (within the session timer) as well as a restart after it expired.
-- The IR has no fields yet for the session timeout a procedure declares or for the response
-  that means no valid application is present (item 2); both are added together with the
-  write-job journal. Until a procedure declares the latter, no response to the software
+- The IR has no fields yet for the session timeout a procedure declares, the response that
+  means no valid application is present, or the retry limit for the recovery version read
+  (item 2); all three are added together with the write-job journal. Without a declared
+  limit the read is not retried. Until a procedure declares the latter, no response to the software
   version read counts as conclusive and an interruption after erase ends in
   `OnSiteInterventionRequired`.
 - With the schema default, a flash session never restarts automatically once erase has begun;

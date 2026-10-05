@@ -56,9 +56,18 @@ comments are public too.
 - **Documentation out of sync**: the PR changes an area without updating the document CLAUDE.md's
   "Documentation sync" table assigns to it (for example a `service.proto` change without
   `docs/rpc-api-guide.md`, a server API change without `api/openapi.yaml`, a database change
-  without a new file in `db/migrations/`). A doc that now contradicts the code is P1.
-- **ADRs**: a new ADR missing its row in `docs/adr/INDEX.md` or its theme entry, a duplicate ADR
-  number, or a change that contradicts an accepted ADR without superseding or annotating it.
+  without a new file in `db/migrations/`). A doc that now contradicts the code is P1, and so is
+  renumbering or removing a section of `docs/system-architecture.md`, which code and docs cite by
+  number.
+- **ADRs**: a non-obvious design decision (data structure, concurrency model, state machine,
+  protocol interpretation, trust boundary) or a spec requirement that drives the code in a
+  surprising way, introduced without an ADR; a new ADR missing its row in `docs/adr/INDEX.md` or
+  its theme entry; a duplicate ADR number; or a change that contradicts an accepted ADR without
+  superseding it or annotating its Status line. Plain bug fixes and refactors without behaviour
+  change need no ADR.
+- **Naming**: a new crate, binary or command without the `ngr` prefix; documentation not in
+  English; a new file under `docs/` whose name is not kebab-case (ADRs use
+  `ADR-{NNN}-{short-slug}.md`).
 - **Temporary-file references**: a permanent file (anything outside `work/`) that names a
   specific file inside `work/`. Naming the folder itself or `work/README.md` is fine.
   `work/` is temporary working material, and open items belong there, not in permanent docs.

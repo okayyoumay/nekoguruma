@@ -13,7 +13,8 @@
 # Usage: scripts/classify-pr-risk.sh [base-ref]   (default: origin/main)
 # Prints the verdict on the first line, then one "- reason" line per rule
 # that made it HIGH (or one line saying why it is LOW). Exit status is 0 for
-# both verdicts; 2 means the diff or the test targets could not be computed.
+# both verdicts; 2 means the diff or the test targets could not be computed
+# (no merge base, a dirty working tree, or cargo metadata failing).
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -24,6 +25,13 @@ max_lines=800
 
 if ! merge_base="$(git merge-base "$base" HEAD 2>/dev/null)"; then
   echo "cannot find a merge base with $base" >&2
+  exit 2
+fi
+
+# cargo metadata reads the working tree, so it must match HEAD, the revision
+# CI checks out and the diff below classifies.
+if [ -n "$(git status --porcelain)" ]; then
+  echo "the working tree has uncommitted or untracked changes; commit or remove them first" >&2
   exit 2
 fi
 
@@ -40,9 +48,6 @@ fi
 # Plain, unquoted diff output whatever the user's git configuration says.
 gitd() { git -c core.quotePath=false diff --no-color --no-ext-diff "$@"; }
 
-if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
-  echo "note: uncommitted changes are not classified; only $merge_base..HEAD is" >&2
-fi
 
 # Paths whose changes the pull request's own CI fully covers.
 is_low_path() {

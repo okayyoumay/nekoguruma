@@ -42,8 +42,14 @@ responsible for them, in the same way that business screens are theirs (design 9
    would be refused with a sequence error, an erase could run while the old download is still
    open, and services the checks rely on (such as ReadDataByIdentifier) may not be available. A
    restart therefore runs in this order:
-   1. Checks that need no ECU service: the start deadline, the resume limit per stage, the
-      interruptibility attribute (item 1) and the supply voltage read through the VCI. If the
+   1. Checks that need no ECU service. A restart is a new run on this device, and the OS-level
+      locks of the interrupted run were released with it, so before anything goes through the
+      VCI the agent takes the per-VCI lock and the device's single reprogramming slot again
+      (design 8.8 and 8.8.1), and it promotes the per-VCI lock to the per-vehicle lock once
+      step 2 has matched the VIN; while another job holds either, the restart waits, and it
+      expires at the start deadline like any job. Then it checks the start deadline, the resume
+      limit per stage, the interruptibility attribute (item 1) and the supply voltage read
+      through the VCI. If the
       limit allows another resume, the agent increments the stage's resume count and commits it
       to the journal, and also reserves the attempt on the server by incrementing the server's
       per-stage count atomically and checking it against the limit, all before it sends anything
@@ -226,6 +232,16 @@ responsible for them, in the same way that business screens are theirs (design 9
   idempotent on the attempt key, backed by durable storage of the per-stage counts and of the
   attempt keys with uniqueness on job, stage and key; it is added together with the write-job
   journal.
+- The same operation grants the reserving device an exclusive recovery lease for the job, with
+  an expiry and a fencing generation that increases with every grant. The per-VIN server lock
+  is only advisory (design 8.8), and a counter alone does not stop a failed device that
+  reconnects from recovering the same ECU while another device performs the handover. The
+  server refuses a reservation while another device holds an unexpired lease, a handover
+  starts only after the failed device's lease has expired, and the recovering agent renews its
+  lease, presenting its generation, immediately before each step that changes the ECU
+  (ECUReset, the replay of the pre-erase steps, erase, RequestDownload) and stops without
+  sending that step if the renewal is refused or cannot be confirmed. An agent without a
+  configured server has no handover and needs no lease.
 - Because every recovery on an agent with a configured server reserves its attempt there
   first, a write job interrupted
   while the device is offline (design 5.7 lets jobs start offline) does not restart until the

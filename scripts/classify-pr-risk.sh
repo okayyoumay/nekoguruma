@@ -64,7 +64,10 @@ fi
 if [ "$lines" -gt "$max_lines" ]; then
   reasons+=("changes $lines lines (limit $max_lines)")
 fi
-if git diff "$merge_base" HEAD -- '*.rs' | grep -qE '^\+.*#\[ignore'; then
+# grep -c reads the whole diff; grep -q could exit early and fail git diff
+# with SIGPIPE under pipefail, hiding the match.
+ignored="$(git diff "$merge_base" HEAD -- '*.rs' | grep -cE '^\+.*#\[ignore' || true)"
+if [ "${ignored:-0}" -gt 0 ]; then
   reasons+=("adds #[ignore] to a test")
 fi
 

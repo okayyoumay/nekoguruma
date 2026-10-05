@@ -1,7 +1,7 @@
 ---
 name: backlog-loop
 description: Work through the nekoguruma backlog one item at a time. Pick the next unblocked item, implement it in one pull request, run pr-review-loop, hand the PR to Yoko, and start the next item only after she merges it. Use when Yoko asks to work through the backlog, or to continue a running loop after a loop PR was merged.
-argument-hint: "[max items, default 3] [lowest priority to include, default P1]"
+argument-hint: "[max items, default 3] [lowest priority to include: P1 (default) or P2]"
 ---
 
 # Backlog loop
@@ -11,7 +11,8 @@ another: the next one starts only after Yoko has merged the previous PR. Claude 
 and never works on two loop items at once.
 
 Arguments: $ARGUMENTS. The first is the number of items for this run (default 3); the second is
-the lowest priority to include (default P1, so P0, P1 and the `Known Flaky Tests` entries).
+the lowest priority to include: P1 (default: P0, P1 and the `Known Flaky Tests` entries) or P2.
+P3 items are not worked by the loop; `next-task` never ranks them while higher items are open.
 When continuing a run, the hand-off message (step 5) carries the remaining count, the priority
 cap and the lists gathered so far.
 
@@ -26,7 +27,8 @@ Stop the run and go to "Final report" if any of these holds:
 
 ## 2. Pick
 
-Run `next-task`, limited to the priority cap. Take its pick, unless the pick:
+Run `next-task`. It offers P2 items only once no P0 or P1 item is left in scope; with the
+default P1 cap, a P2 pick means nothing eligible is left, so stop. Take its pick, unless the pick:
 
 - has a `Blocked on:` clause, or turns out to need a decision, a document or hardware that is not
   available (see step 3);
@@ -47,7 +49,10 @@ If the work shows that the item needs something the loop cannot supply, do not g
 `Blocked on:` clause into the item with the `backlog` skill, using the forms in `work/README.md`
 (`Blocked on: Yoko's decision on ...` for a design choice that the specs and ADRs leave open),
 add it to the run's skipped list, discard the branch's other changes, and go back to step 2. A
-skipped item does not count against the run's item count. The run is unattended, so follow
+skipped item does not count against the run's item count. Keep the `Blocked on:` edit on the
+branch: it goes into the next loop PR. If the run stops before another PR is opened, open a
+backlog-only loop PR with these edits (step 4) and hand it to Yoko before the final report, so a
+later run does not pick the same items again. The run is unattended, so follow
 `unattended-clarification` rather than waiting for an answer.
 
 ## 4. Pull request

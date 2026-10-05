@@ -232,21 +232,17 @@ responsible for them, in the same way that business screens are theirs (design 9
   idempotent on the attempt key, backed by durable storage of the per-stage counts and of the
   attempt keys with uniqueness on job, stage and key; it is added together with the write-job
   journal.
-- The same operation grants the reserving device an exclusive recovery lease for the job, with
-  an expiry and a fencing generation that increases with every grant. The per-VIN server lock
-  is only advisory (design 8.8), and a counter alone does not stop a failed device that
-  reconnects from recovering the same ECU while another device performs the handover. The
-  server refuses a reservation while another device holds an unexpired lease, a handover
-  starts only after the failed device's lease has expired. A write job holds such a lease from
-  its first step that changes the ECU until it ends, on its first run as well as on a
-  recovery, so a device that is merely slow is never handed over while it still writes. The
-  agent renews the lease, presenting its generation, before every request that changes the
-  ECU (ECUReset, the replay of the pre-erase steps, erase, RequestDownload, each TransferData
-  block, RequestTransferExit and the post-transfer steps) and in the background at an interval
-  well inside the expiry; once the remaining lease time without a confirmed renewal is shorter
-  than the longest such request can take, it sends no further ECU-changing request and the
-  job is interrupted at that point, to be recovered by whichever device holds the next lease. An agent without a
-  configured server has no handover and needs no lease.
+- The server also records which device owns the job, and the reservation is refused to any
+  other device. The per-VIN server lock is only advisory (design 8.8), and a counter alone
+  does not stop a failed device that comes back from recovering the same ECU while another
+  device performs the handover. Ownership moves to the receiving device only when the
+  operator confirms on the server that the failed device is disconnected from the vehicle (or
+  powered off); from then on the failed device's reservations are refused, so it sends nothing
+  further to the ECU. Fencing by operator confirmation was chosen over a time-limited lease
+  renewed during the write, because a lease would make every write on a server-connected
+  device, the first run included, depend on the network for its whole duration and rule out
+  starting a write offline (design 5.7). An agent without a configured server has no handover
+  and no ownership record.
 - Because every recovery on an agent with a configured server reserves its attempt there
   first, a write job interrupted
   while the device is offline (design 5.7 lets jobs start offline) does not restart until the

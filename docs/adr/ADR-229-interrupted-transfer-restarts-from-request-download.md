@@ -52,7 +52,10 @@ responsible for them, in the same way that business screens are theirs (design 9
       under the same key and never consumes a second attempt. The journal commit keeps a crash
       during recovery from reloading the old count;
       the server reservation keeps a handover from starting on a count that misses attempts this
-      device made but never published. If the server cannot be reached, the agent waits for it
+      device made but never published. An agent deployed without a server (the standalone
+      setup of milestone M1, before the server exists) has no handover either, so there the
+      journal count alone enforces the limit and no reservation is made. If a configured server
+      cannot be reached, the agent waits for it
       until the start deadline; once that passes, the job ends as expired, like any job past
       its start deadline (design 8.2.5). Recovery is
       rare and this happens before anything is sent to the ECU, so the network dependence costs
@@ -78,7 +81,7 @@ responsible for them, in the same way that business screens are theirs (design 9
       validated. When the journal records the post-transfer steps (including the procedure's
       own ECUReset) as complete, no download is left to tear down and the agent sends no reset,
       so a freshly initialized ECU is not reset again before verification. If the default-session
-      confirmation below succeeds at once, it continues from there; if the ECU is still in a
+      confirmation below succeeds, it continues from there; if the ECU is still in a
       non-default session (for example because the procedure's steps end without an ECUReset),
       the agent tears down passively before confirming. So that a crash between sending RequestTransferExit and recording its response
       cannot hide this case, the agent commits an intent marker for RequestTransferExit to the
@@ -99,10 +102,12 @@ responsible for them, in the same way that business screens are theirs (design 9
       After either kind of teardown, or directly in the completed case above, the agent confirms that the ECU is back in its default
       session, for example by reading the active-session data identifier F186 (ISO 14229-1
       Annex C). An ECU that has just accepted a reset may not answer while it restarts, so
-      after either kind of teardown the agent first waits the startup time the procedure
-      declares, after the session timeout when the teardown was passive, and then retries the
-      read within a bounded window. This applies to a passive teardown too, because a reset may
-      have been accepted without its response being recorded, whether it was the teardown reset
+      in every case, after either kind of teardown and on the completed path that sends no reset,
+      the agent first waits the startup time the procedure declares, after the session timeout
+      when the teardown was passive, and then retries the read within a bounded window. This
+      applies to a passive teardown and to the completed path too, because a reset may have been
+      accepted, or recorded as complete just before the crash, while the ECU is still restarting,
+      whether it was the teardown reset
       or an ECUReset among the procedure's own post-transfer steps, so the journal cannot rule
       out that the ECU is restarting (the reset response's power-down time,
       when the ECU reports one, extends the wait). If it still cannot confirm the default
@@ -217,7 +222,8 @@ responsible for them, in the same way that business screens are theirs (design 9
   idempotent on the attempt key, backed by durable storage of the per-stage counts and of the
   attempt keys with uniqueness on job, stage and key; it is added together with the write-job
   journal.
-- Because every recovery reserves its attempt on the server first, a write job interrupted
+- Because every recovery on an agent with a configured server reserves its attempt there
+  first, a write job interrupted
   while the device is offline (design 5.7 lets jobs start offline) does not restart until the
   server is reachable again, and expires if its start deadline passes first.
 - With the schema default, a flash session never restarts automatically once erase has begun;

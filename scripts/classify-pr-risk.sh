@@ -5,8 +5,8 @@
 # merge anything.
 #
 # LOW means every changed file is on the allowlist below, i.e. the pull
-# request's own CI covers everything the change can affect. Anything else is
-# HIGH: when in doubt, the answer is HIGH.
+# request's own CI covers everything the change can affect, and test files
+# only gain lines. Anything else is HIGH: when in doubt, the answer is HIGH.
 #
 # Usage: scripts/classify-pr-risk.sh [base-ref]   (default: origin/main)
 # Prints the verdict on the first line, then one "- reason" line per rule
@@ -53,10 +53,19 @@ while IFS=$'\t' read -r status path rest; do
   fi
 done < <(git diff --name-status "$merge_base" HEAD)
 
-while IFS=$'\t' read -r added removed _; do
+while IFS=$'\t' read -r added removed path; do
   [ "$added" = "-" ] && continue
   lines=$((lines + added + removed))
-done < <(git diff --numstat "$merge_base" HEAD)
+  # A test change is low risk only if it adds; a removed line could be a
+  # dropped test or a loosened assertion, which CI cannot notice.
+  case "$path" in
+    crates/*/tests/*)
+      if [ "$removed" -gt 0 ]; then
+        reasons+=("removes $removed lines from $path")
+      fi
+      ;;
+  esac
+done < <(git diff --numstat --no-renames "$merge_base" HEAD)
 
 if [ "$files" -gt "$max_files" ]; then
   reasons+=("changes $files files (limit $max_files)")
@@ -76,7 +85,7 @@ if [ "$files" -eq 0 ]; then
   echo "- no changes against $base"
 elif [ "${#reasons[@]}" -eq 0 ]; then
   echo "LOW"
-  echo "- $files files, $lines lines, all on the low-risk allowlist (work/, crate tests, glossary)"
+  echo "- $files files, $lines lines, all on the low-risk allowlist (work/, added crate tests, glossary)"
 else
   echo "HIGH"
   printf -- '- %s\n' "${reasons[@]}"

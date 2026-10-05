@@ -85,7 +85,11 @@ responsible for them, in the same way that business screens are theirs (design 9
 
       After either kind of teardown, or directly in the completed case above, the agent confirms that the ECU is back in its default
       session, for example by reading the active-session data identifier F186 (ISO 14229-1
-      Annex C). If it cannot confirm that, the job ends in `OnSiteInterventionRequired`. Step 3
+      Annex C). An ECU that has just acknowledged a reset may not answer while it restarts, so
+      after an active reset the agent first waits the startup time the procedure declares and
+      then retries the read within a bounded window (the reset response's power-down time,
+      when the ECU reports one, extends the wait). If it still cannot confirm the default
+      session, the job ends in `OnSiteInterventionRequired`. Step 3
       never starts before this confirmation.
    3. Service-dependent checks in the default session. The VIN must be read, decoded and equal
       to the job's VIN before anything else happens; this is required again even when step 2
@@ -172,11 +176,11 @@ responsible for them, in the same way that business screens are theirs (design 9
   with the previous counter value is accepted without being written again. The recovery tests
   cover a fast reconnection (within the session timer) as well as a restart after it expired.
 - The IR has no fields yet for the session timeout a procedure declares, the response that
-  means no valid application is present, the retry limit for the recovery version read, or a
+  means no valid application is present, the retry limit for the recovery version read, the ECU startup time after a reset, or a
   required external power supply (item 2; `FlashSession` today declares only the voltage
   range, ignition, engine-off and vehicle-stopped preconditions), nor a mapping that names
   which of the procedure's services and response fields yield the VIN, the hardware part
-  number and the software version (these identifiers can be OEM-specific); all five are
+  number and the software version (these identifiers can be OEM-specific); all six are
   added together with the write-job journal, along with the runtime input that reports whether the supply is
   connected. Until then a procedure cannot require the supply, and the voltage range is the
   only power check a restart can make. Without a declared

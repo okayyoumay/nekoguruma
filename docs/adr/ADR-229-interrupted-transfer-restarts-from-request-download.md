@@ -51,11 +51,13 @@ responsible for them, in the same way that business screens are theirs (design 9
       non-default session. Only a VIN that is read and decoded and differs from the job's VIN counts
       as a mismatch, and the job aborts. If the ECU does not answer the read or answers it with a
       negative response (for example because it is still inside the old download and does not
-      allow the service there), or refuses the reset, the agent tears down passively: it stops sending TesterPresent, waits for the session
+      allow the service there), or refuses the reset, or the reset gets no response so that its outcome is unknown, the agent tears down passively: it stops sending TesterPresent, waits for the session
       timeout the procedure declares plus a margin (the framework has no built-in default, since
       the value is ECU-specific), and then confirms that the ECU is back in its default session,
       for example by reading the active-session data identifier F186 (ISO 14229-1 Annex C). If
-      it cannot confirm that, the job ends in `OnSiteInterventionRequired`.
+      it cannot confirm that, the job ends in `OnSiteInterventionRequired`. The same
+      confirmation of the default session follows a reset that was answered positively; step 3
+      never starts before it.
    3. Service-dependent checks in the default session: VIN verification (again, if the passive
       teardown was used) and the ECU state check of design 8.2.5. A VIN mismatch aborts the job. The state check includes reading back the
       ECU software version: if it shows that the intended image is already installed (the

@@ -48,9 +48,10 @@ responsible for them, in the same way that business screens are theirs (design 9
       identified, because the VCI may now be connected to a different vehicle. It first tries to
       read the VIN, which changes nothing on the ECU. If the VIN matches, it ends any download the
       ECU may still hold with an ECUReset (ISO 14229-1 clause 9.3), which takes the ECU out of its
-      non-default session. If the VIN does not match, the job aborts. If the ECU does not answer
-      the read (for example because it is still inside the old download), or refuses the reset,
-      the agent tears down passively: it stops sending TesterPresent, waits for the session
+      non-default session. Only a VIN that is read and decoded and differs from the job's VIN counts
+      as a mismatch, and the job aborts. If the ECU does not answer the read or answers it with a
+      negative response (for example because it is still inside the old download and does not
+      allow the service there), or refuses the reset, the agent tears down passively: it stops sending TesterPresent, waits for the session
       timeout the procedure declares plus a margin (the framework has no built-in default, since
       the value is ECU-specific), and then confirms that the ECU is back in its default session,
       for example by reading the active-session data identifier F186 (ISO 14229-1 Annex C). If
@@ -60,7 +61,11 @@ responsible for them, in the same way that business screens are theirs (design 9
       ECU software version: if it shows that the intended image is already installed (the
       transfer and RequestTransferExit completed, but the response or the journal update was
       lost), the job skips the restart and continues with read-back verification.
-   4. Re-entry: the programming session and security access again, then erase and RequestDownload.
+   4. Re-entry: the procedure's own steps that lead up to the erase are replayed from the start
+      of the flash session, with their guards (programming session, security access, and any
+      pre-programming steps the procedure defines, such as CommunicationControl,
+      ControlDTCSetting or prerequisite routines; design 8.9), because the teardown discards the
+      state they established. Then erase and RequestDownload.
    A handover to another device (8.2.5) follows the same order.
 3. **Block checkpoints are progress, not a resume origin.** The journal still records each
    confirmed block, for progress display and for the checkpoint summary used for handover to

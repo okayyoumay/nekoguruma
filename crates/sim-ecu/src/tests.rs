@@ -1234,3 +1234,34 @@ fn transfer_data_repeat_compares_against_the_last_block() {
     );
     assert_eq!(ecu.image(), &[1, 2, 3, 4, 5, 6]);
 }
+
+#[test]
+fn leaving_the_programming_session_interrupts_an_unsecured_transfer() {
+    for session in [Session::Default, Session::Extended] {
+        let mut ecu = SimEcu::new(EcuConfig {
+            require_security_access: false,
+            ..config()
+        });
+        enter(&mut ecu, Session::Programming);
+        ecu.request(&[0x31, 0x01, 0xFF, 0x00]);
+        ecu.request(&request_download(0, 6));
+        ecu.request(&transfer(1, &[1, 2]));
+        enter(&mut ecu, session);
+        assert_eq!(
+            ecu.flash,
+            FlashPhase::Interrupted { last_block: 1 },
+            "{session:?}"
+        );
+    }
+}
+
+#[test]
+fn restart_decision_follows_how_the_download_was_opened() {
+    // Opened behind security access: a restart interrupts it even if the flag is cleared later.
+    let mut ecu = ready_to_download();
+    ecu.request(&request_download(0, 4));
+    ecu.request(&transfer(1, &[1, 2]));
+    ecu.config.require_security_access = false;
+    enter(&mut ecu, Session::Programming);
+    assert_eq!(ecu.flash, FlashPhase::Interrupted { last_block: 1 });
+}

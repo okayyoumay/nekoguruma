@@ -47,9 +47,10 @@ until a session change, an ECU reset or `reconnect()`.
 
 Every DiagnosticSessionControl request relocks security, including a restart of the active
 session. A running download is interrupted (see below) by any session other than programming,
-and also by a restart of the programming session when `EcuConfig::require_security_access` is
-set, since the download was opened behind the security access that the relock takes away.
-Without security access, a restart of the programming session leaves the download running.
+and also by a restart of the programming session when the download was opened (or resumed)
+with `EcuConfig::require_security_access` set, since it then depends on the security access the
+relock takes away. A download opened with the flag unset keeps running across a restart of the
+programming session, with its blockSequenceCounter and block numbering continuing.
 A rejected DiagnosticSessionControl request changes nothing.
 
 Services 2E, 31, 34, 36 and 37 need gateway authentication when `EcuConfig::require_gateway_auth`

@@ -177,6 +177,8 @@ struct Download {
     /// blockSequenceCounter and length of the last stored block, for accepting a repeated request.
     last_bsc: Option<u8>,
     last_len: u32,
+    /// Whether the RequestDownload that opened or resumed the transfer passed a security check.
+    secured: bool,
 }
 
 pub struct SimEcu {
@@ -184,6 +186,7 @@ pub struct SimEcu {
     pub session: Session,
     pub flash: FlashPhase,
     pub security_unlocked: bool,
+    /// Set by the test to stand for a gateway authentication; the ECU never clears it.
     pub gateway_authenticated: bool,
     pub dtcs: Vec<DtcRecord>,
     seed_counter: u32,
@@ -291,7 +294,8 @@ impl SimEcu {
     }
 
     /// Simulates reconnection after a power loss or communication loss.
-    /// The session and unlock state are lost, but flash progress is retained.
+    /// The session and unlock state are lost, but flash progress is retained. Gateway
+    /// authentication is the gateway's state and is kept.
     pub fn reconnect(&mut self) {
         self.silent = false;
         self.power_cycle();

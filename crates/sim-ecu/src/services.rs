@@ -134,7 +134,8 @@ impl SimEcu {
         // does not support it, or when it was opened behind security access, which the relock
         // takes away; otherwise it carries on.
         self.lock_security();
-        if target != Session::Programming || self.config.require_security_access {
+        let secured = self.download.is_some_and(|dl| dl.secured);
+        if target != Session::Programming || secured {
             self.interrupt_transfer();
         }
         self.session = target;
@@ -466,6 +467,7 @@ impl SimEcu {
                     expected_bsc: 1,
                     last_bsc: None,
                     last_len: 0,
+                    secured: self.config.require_security_access,
                 });
                 1
             }
@@ -477,6 +479,7 @@ impl SimEcu {
                     expected_bsc: 1,
                     last_bsc: None,
                     last_len: 0,
+                    secured: self.config.require_security_access,
                     ..dl
                 });
                 last_block + 1

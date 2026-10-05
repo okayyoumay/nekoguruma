@@ -159,14 +159,22 @@ responsible for them, in the same way that business screens are theirs (design 9
 - The reference implementation's automatic recovery works with an ECU that implements the
   standard download services and, in its default session, answers ReadDataByIdentifier for
   the VIN, its hardware part number, its software version and the active session (F186)
-  (ECUReset is optional, since passive teardown covers its absence). An ECU that lacks any of these can still be programmed, but an interrupted
+  (ECUReset is optional, since passive teardown covers its absence), and whose software
+  version read, while an interrupted transfer is pending, gives either the pre-erase version,
+  the intended version or the no-application response the procedure declares. An ECU whose
+  version read exposes partially written metadata instead gives a value that is neither, and
+  the job ends in `OnSiteInterventionRequired`, because that value cannot be told apart from a
+  change made by something else. An ECU that lacks any of these can still be programmed, but an interrupted
   transfer on it ends in `OnSiteInterventionRequired`. `sim-ecu` provides all of them and
   otherwise only needs the standard behaviour: the download state survives a client
   reconnection within the session timer, is lost on reset or session end, and a repeated block
   with the previous counter value is accepted without being written again. The recovery tests
   cover a fast reconnection (within the session timer) as well as a restart after it expired.
-- The IR has no field yet for the session timeout a procedure declares (item 2); it is added
-  together with the write-job journal.
+- The IR has no fields yet for the session timeout a procedure declares or for the response
+  that means no valid application is present (item 2); both are added together with the
+  write-job journal. Until a procedure declares the latter, no response to the software
+  version read counts as conclusive and an interruption after erase ends in
+  `OnSiteInterventionRequired`.
 - With the schema default, a flash session never restarts automatically once erase has begun;
   the restart rule takes effect only for procedures whose authors declare that the ECU can be
   reprogrammed again after such an interruption.

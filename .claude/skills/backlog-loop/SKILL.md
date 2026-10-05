@@ -55,15 +55,29 @@ Otherwise reset the branch's content to `main` without rewriting history (the ru
 unattended, and a reset or force-push needs approval). This discards everything on the branch,
 so first check that nothing else needs it: stop and tell the maintainer if `git status
 --porcelain` prints anything, or if any open PR, labelled or not, has this branch as its head.
-Then `git fetch origin main`. If `git diff --quiet HEAD origin/main` succeeds, the branch already
-matches and there is nothing to do; otherwise record a merge of `origin/main` whose tree is
-exactly `origin/main`'s:
+Then `git fetch origin main` and make the branch's content exactly `origin/main`'s, with
+`origin/main` in its history. Equal trees are not enough: after a squash merge the branch can
+hold the same files on a different history, and every diff against `main` (the PR's, the risk
+classifier's) would then show the previous iteration's changes again.
 
-```sh
-git merge -s ours --no-commit origin/main
-git read-tree -u --reset origin/main
-git commit -m "Start from origin/main"
-```
+- If `git merge-base --is-ancestor origin/main HEAD` succeeds and `git diff --quiet HEAD
+  origin/main` succeeds, the branch already matches: nothing to do.
+- If `origin/main` is not in HEAD's history, record a merge of it whose tree is exactly
+  `origin/main`'s (a merge commit is created even when the trees are already equal):
+
+  ```sh
+  git merge -s ours --no-commit origin/main
+  git read-tree -u --reset origin/main
+  git commit -m "Start from origin/main"
+  ```
+
+- If `origin/main` is in HEAD's history but the trees differ (the branch still carries commits
+  of its own), there is nothing to merge; reset the content with an ordinary commit:
+
+  ```sh
+  git read-tree -u --reset origin/main
+  git commit -m "Start from origin/main"
+  ```
 
 This cannot conflict, and it drops anything the branch still carries from a PR that was closed
 unmerged. Every later step, including a stop, starts from this clean branch.

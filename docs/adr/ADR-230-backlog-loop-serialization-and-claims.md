@@ -43,10 +43,17 @@ history rewrites, which need approval in an unattended session.
    `pr=<n>` and acts on that PR's state (draft, handed over, merged, closed, "final").
 4. **A "final" PR ends the run** whether it is merged or closed. Nothing restarts after it; the
    next run starts only when the maintainer asks.
-5. **Each iteration starts from `main` by a merge, not a reset.** The branch records a merge of
-   `origin/main` whose tree is exactly `origin/main`'s (`merge -s ours`, then `read-tree --reset`).
+5. **Each iteration starts from `main` by a merge, not a reset.** The branch ends up with exactly
+   `origin/main`'s tree and with `origin/main` in its history.
+   - When `origin/main` is not an ancestor, the branch records a merge of it whose tree is
+     `origin/main`'s (`merge -s ours`, then `read-tree --reset`). This happens even when the trees
+     already match, because a squash-merged previous PR leaves equal trees on a different
+     history, and diffs against `main` would show that PR's changes again.
+   - When `origin/main` is already an ancestor, an ordinary commit resets the content.
+   - When it is an ancestor and the trees match, nothing is done.
+
    This cannot conflict and needs no force push. It runs only when the working tree is clean and
-   no open PR uses the branch, and it is skipped when the branch already matches `main`.
+   no open PR uses the branch.
 6. **Stop conditions are explicit:**
    - no items left;
    - `main` red;

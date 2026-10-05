@@ -217,11 +217,13 @@ responsible for them, in the same way that business screens are theirs (design 9
   with the previous counter value is accepted without being written again. The recovery tests
   cover a fast reconnection (within the session timer) as well as a restart after it expired.
 - The IR has no fields yet for the session timeout a procedure declares, the response that
-  means no valid application is present, the retry limit for the recovery version read, the ECU startup time after a reset and the length of the window in which the session confirmation is retried, or a
+  means no valid application is present, the retry limit for the recovery version read, the ECU startup time after a reset and the length of the window in which the session confirmation is retried, the
+  resume limit of each stage (the stage it applies to and its maximum; `VmState` today keeps
+  a single `resume_count` and no section or flash session declares a maximum), or a
   required external power supply (item 2; `FlashSession` today declares only the voltage
   range, ignition, engine-off and vehicle-stopped preconditions), nor a mapping that names
   which of the procedure's services and response fields yield the VIN, the hardware part
-  number and the software version (these identifiers can be OEM-specific); all seven are
+  number and the software version (these identifiers can be OEM-specific); all eight are
   added together with the write-job journal, along with the runtime input that reports whether the supply is
   connected. Until then a procedure cannot require the supply, and the voltage range is the
   only power check a restart can make. Without a declared

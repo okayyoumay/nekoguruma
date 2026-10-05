@@ -49,7 +49,11 @@ responsible for them, in the same way that business screens are theirs (design 9
       per-stage count atomically and checking it against the limit, all before it sends anything
       to the ECU. The agent journals a key for the attempt before it reserves, and the server
       reservation is idempotent on that key, so a reservation whose response was lost is retried
-      under the same key and never consumes a second attempt. The journal commit keeps a crash
+      under the same key and never consumes a second attempt. Once the server confirms the
+      reservation, the agent journals that confirmation before its first request to the ECU; on a
+      later restart a key whose confirmation is journaled is retired and a new attempt gets a new
+      key, so a crash after recovery traffic began always consumes an attempt, while a key without
+      a journaled confirmation is retried as above. The journal commit keeps a crash
       during recovery from reloading the old count;
       the server reservation keeps a handover from starting on a count that misses attempts this
       device made but never published. An agent deployed without a server (the standalone

@@ -4449,7 +4449,7 @@ async fn mode_0_periodic_tick_not_starved_by_tx_held_backlog_drain() {
     set_com_param_unum32(&mut client, cll_a, CP_TESTER_PRESENT_ADDR_MODE, 1).await;
     set_com_param_unum32(&mut client, cll_a, CP_CAN_FUNC_REQ_ID, 0x7DF).await;
     set_com_param_bytes(&mut client, cll_a, CP_TESTER_PRESENT_MESSAGE, vec![0x11]).await;
-    set_com_param_unum32(&mut client, cll_a, CP_TESTER_PRESENT_TIME, 100_000).await;
+    set_com_param_unum32(&mut client, cll_a, CP_TESTER_PRESENT_TIME, 50_000).await;
     set_com_param_unum32(&mut client, cll_a, CP_TESTER_PRESENT_HANDLING, 1).await;
     client
         .connect_com_logical_link(ConnectComLogicalLinkRequest {
@@ -4492,16 +4492,29 @@ async fn mode_0_periodic_tick_not_starved_by_tx_held_backlog_drain() {
         .await
         .expect("PDU_IOCTL_SUSPEND_TX_QUEUE should succeed");
 
-    // Pre-queue ~30 physically-addressed, zero-response CoptSendrecvs on the
-    // suspended cll_b: each is dequeued from tx_rx almost immediately and
-    // diverted straight into tx_held (never reaching the mock while
+    // Pre-queue DRAIN_ITEMS physically-addressed, zero-response CoptSendrecvs
+    // on the suspended cll_b: each is dequeued from tx_rx almost immediately
+    // and diverted straight into tx_held (never reaching the mock while
     // suspended), rather than occupying tx_rx/the outer select the way the
-    // ADR-094 test's un-suspended pressure does.
-    for _ in 0..30 {
+    // ADR-094 test's un-suspended pressure does. Each drained item then waits
+    // out cll_b's 25ms CP_P3Phys, so the drain lasts roughly
+    // DRAIN_ITEMS * 25ms (about 1.5s) -- long enough that the sample below
+    // sits well inside it even when the platform's timer granularity (about
+    // 15.6ms on Windows) stretches each wait to about 31ms.
+    //
+    // The tester-present period (50ms) and the sample point are chosen so the
+    // expected count is large (about 12) against a starved count of exactly 0.
+    // The assertion only has to tell those two apart, so it requires half the
+    // ideal count rather than sitting a single send below it: a margin of one
+    // send is smaller than one timer tick on a loaded Windows runner.
+    const DRAIN_ITEMS: usize = 60;
+    const SAMPLE_AFTER_RESUME_MS: u64 = 600;
+    const MIN_ADDITIONAL_A_FRAMES: usize = 6;
+    for _ in 0..DRAIN_ITEMS {
         start_send_recv(&mut client, cll_b, vec![0x01, 0x00], 0).await;
     }
 
-    // Give the poll task ample time to dequeue and divert all 30 into
+    // Give the poll task ample time to dequeue and divert all of them into
     // cll_b's tx_held backlog. cll_a's own mode-0 tester-present keeps
     // firing throughout this window (sharing the same physical channel), so
     // check for the ABSENCE of cll_b's own CAN ID specifically, not a raw
@@ -4535,26 +4548,26 @@ async fn mode_0_periodic_tick_not_starved_by_tx_held_backlog_drain() {
         .await
         .expect("PDU_IOCTL_RESUME_TX_QUEUE should succeed");
 
-    // Sample well INSIDE the ~725ms drain_tx_held_backlog window (comfortably
+    // Sample well INSIDE the ~1.5s drain_tx_held_backlog window (comfortably
     // before it can have finished), so any additional cll_a frames counted
     // here can only have come from a per-item dispatch inside that one,
     // still-in-progress `drain_tx_held_backlog` call -- not from the outer
     // loop's own post-select tick, which cannot run again until the whole
     // ResumeWake-triggered drain call returns.
-    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(SAMPLE_AFTER_RESUME_MS)).await;
     let mid_drain_a_frame_count = count_a_frames(&server);
 
     assert!(
-        mid_drain_a_frame_count - baseline_a_frame_count >= 3,
-        "expected at least 3 additional due-triggered mode-0 tester-present sends from cll_a \
-         within 400ms of resuming cll_b's TX queue (well inside the ~725ms tx_held drain \
-         window), got {baseline_a_frame_count} before resume and {mid_drain_a_frame_count} \
-         400ms after -- drain_tx_held_backlog appears to be starving the RX-poll/tester-present \
-         tick while it drains cll_b's backlog"
+        mid_drain_a_frame_count - baseline_a_frame_count >= MIN_ADDITIONAL_A_FRAMES,
+        "expected at least {MIN_ADDITIONAL_A_FRAMES} additional due-triggered mode-0 \
+         tester-present sends from cll_a within {SAMPLE_AFTER_RESUME_MS}ms of resuming cll_b's \
+         TX queue (well inside the ~1.5s tx_held drain window), got {baseline_a_frame_count} \
+         before resume and {mid_drain_a_frame_count} after -- drain_tx_held_backlog appears to \
+         be starving the RX-poll/tester-present tick while it drains cll_b's backlog"
     );
 
     // Let the rest of the drain (and any settle) finish before shutdown.
-    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
 
     drop(events_a);
     server.shutdown().await;

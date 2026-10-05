@@ -51,6 +51,20 @@ that fixed it (or the ADR or backlog item for 2c, the trace for 2d). If a fix wa
 the fallback review again on the new head, whatever its size, and repeat until a pass reports no
 new finding. Then go to Step 5.
 
+**Codex usage limit.** If Codex answers the trigger with a message that its usage limit is
+reached, it is enabled but cannot review for now; this is not "Codex not available". Say so once
+in the thread, schedule a one-shot check-in five hours after that message (`send_later`), and end
+the turn; keep handling CI and other review events meanwhile. At the check-in, post the trigger
+again. If Codex reports the limit again, do not wait a second time: ask the maintainer in the
+thread with a decision card (`ask_decision` where the session has it) which way to go, with the
+fallback review as the recommendation:
+
+- run the fallback review below now;
+- wait another five hours for Codex;
+- hand the PR over without an automated review.
+
+Work stops on this PR until the maintainer answers.
+
 **Codex started but never finished.** If the trigger comment has 👀 but no result at the
 check-in, schedule one more check-in 15 minutes later. If that one still finds no result,
 treat the round as stalled: tell the maintainer once in the thread, and run the same fallback review as

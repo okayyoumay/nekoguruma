@@ -53,7 +53,8 @@ responsible for them, in the same way that business screens are theirs (design 9
       during recovery from reloading the old count;
       the server reservation keeps a handover from starting on a count that misses attempts this
       device made but never published. If the server cannot be reached, the agent waits for it
-      until the start deadline and then ends the job in `OnSiteInterventionRequired`. Recovery is
+      until the start deadline; once that passes, the job ends as expired, like any job past
+      its start deadline (design 8.2.5). Recovery is
       rare and this happens before anything is sent to the ECU, so the network dependence costs
       only availability, unlike the RequestTransferExit acknowledgement rejected below.
    2. Identity, safety, then teardown. The agent never sends an ECUReset to an ECU it has not
@@ -209,6 +210,14 @@ responsible for them, in the same way that business screens are theirs (design 9
   limit the read is not retried. Until a procedure declares the latter, no response to the software
   version read counts as conclusive and an interruption after erase ends in
   `OnSiteInterventionRequired`.
+- The server has no operation yet for reserving a recovery attempt. It needs one that
+  atomically increments the per-stage resume count, checks it against the limit and is
+  idempotent on the attempt key, backed by durable storage of the per-stage counts and of the
+  attempt keys with uniqueness on job, stage and key; it is added together with the write-job
+  journal.
+- Because every recovery reserves its attempt on the server first, a write job interrupted
+  while the device is offline (design 5.7 lets jobs start offline) does not restart until the
+  server is reachable again, and expires if its start deadline passes first.
 - With the schema default, a flash session never restarts automatically once erase has begun;
   the restart rule takes effect only for procedures whose authors declare that the ECU can be
   reprogrammed again after such an interruption.

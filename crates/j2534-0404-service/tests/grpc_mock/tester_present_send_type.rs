@@ -4497,19 +4497,16 @@ async fn mode_0_periodic_tick_not_starved_by_tx_held_backlog_drain() {
     // and diverted straight into tx_held (never reaching the mock while
     // suspended), rather than occupying tx_rx/the outer select the way the
     // ADR-094 test's un-suspended pressure does. Each drained item then waits
-    // out cll_b's 25ms CP_P3Phys, so the drain lasts roughly
-    // DRAIN_ITEMS * 25ms (about 1.5s) -- long enough that the sample below
-    // sits well inside it even when the platform's timer granularity (about
-    // 15.6ms on Windows) stretches each wait to about 31ms.
+    // out cll_b's 25ms CP_P3Phys.
     //
-    // The tester-present period (50ms) and the sample point are chosen so the
-    // expected count is large (about 12) against a starved count of exactly 0.
-    // The assertion only has to tell those two apart, so it requires half the
-    // ideal count rather than sitting a single send below it: a margin of one
-    // send is smaller than one timer tick on a loaded Windows runner.
+    // The assertion below is on the ORDER of frames on the wire, not on how
+    // many cll_a frames arrive in a wall-clock window. A count over a window
+    // depends on the platform timer (a 25ms wait stretches to about 31ms with
+    // the 15.6ms Windows granularity) and on how long a loaded runner stalls
+    // the poll task, so any threshold loose enough to be reliable there also
+    // lets a degraded drain through. A stall lengthens one item's wait but
+    // leaves the order of the frames unchanged.
     const DRAIN_ITEMS: usize = 60;
-    const SAMPLE_AFTER_RESUME_MS: u64 = 600;
-    const MIN_ADDITIONAL_A_FRAMES: usize = 6;
     for _ in 0..DRAIN_ITEMS {
         start_send_recv(&mut client, cll_b, vec![0x01, 0x00], 0).await;
     }
@@ -4529,45 +4526,63 @@ async fn mode_0_periodic_tick_not_starved_by_tx_held_backlog_drain() {
         "no cll_b sends should reach the wire while its TX queue is suspended"
     );
 
-    // Baseline, captured just before resume: covers every fire that happened
-    // organically before the drain even starts (arm-time send, plus any
-    // regular ticks during the suspend/enqueue/settle window above, none of
-    // which exercise Fix D at all -- the outer poll loop's own tick is
-    // completely unblocked until `drain_tx_held_backlog`'s own loop actually
-    // starts running below).
-    let expected_a_prefix = 0x7DF_u32.to_be_bytes();
-    let count_a_frames = |server: &TestServer| -> usize {
-        let total = server.backdoor.written_count(MOCK_CHANNEL_ID);
-        (0..total)
-            .filter(|&i| server.backdoor.written_data(MOCK_CHANNEL_ID, i)[..4] == expected_a_prefix)
-            .count()
-    };
-    let baseline_a_frame_count = count_a_frames(&server);
+    // Only frames written from here on belong to the drain.
+    let first_drain_index = server.backdoor.written_count(MOCK_CHANNEL_ID);
 
     io_ctl_cll(&mut client, cll_b, resume_id)
         .await
         .expect("PDU_IOCTL_RESUME_TX_QUEUE should succeed");
 
-    // Sample well INSIDE the ~1.5s drain_tx_held_backlog window (comfortably
-    // before it can have finished), so any additional cll_a frames counted
-    // here can only have come from a per-item dispatch inside that one,
-    // still-in-progress `drain_tx_held_backlog` call -- not from the outer
-    // loop's own post-select tick, which cannot run again until the whole
-    // ResumeWake-triggered drain call returns.
-    tokio::time::sleep(std::time::Duration::from_millis(SAMPLE_AFTER_RESUME_MS)).await;
-    let mid_drain_a_frame_count = count_a_frames(&server);
+    // Wait for the whole backlog to reach the wire. The drain runs inside one
+    // `drain_tx_held_backlog` call, so the outer loop's own post-select tick
+    // cannot run until it returns: any cll_a frame between two cll_b frames
+    // can only have come from the per-item `run_due_tick_duties` call.
+    let drain_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    let drain_frames: Vec<bool> = loop {
+        let total = server.backdoor.written_count(MOCK_CHANNEL_ID);
+        let frames: Vec<bool> = (first_drain_index..total)
+            .map(|i| server.backdoor.written_data(MOCK_CHANNEL_ID, i)[..4] == expected_b_prefix)
+            .collect();
+        if frames.iter().filter(|&&is_b| is_b).count() >= DRAIN_ITEMS {
+            break frames;
+        }
+        assert!(
+            tokio::time::Instant::now() < drain_deadline,
+            "cll_b's backlog should drain after PDU_IOCTL_RESUME_TX_QUEUE, got {} of \
+             {DRAIN_ITEMS} frames",
+            frames.iter().filter(|&&is_b| is_b).count()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    };
 
+    // The longest run of cll_b frames with no cll_a frame between them. With
+    // a 50ms tester-present period and a 25ms wait per item, a due send
+    // follows every 2nd or 3rd item (the check runs after each item, and
+    // each item takes at least 25ms). A starved drain gives DRAIN_ITEMS, a
+    // drain that checks only every other item or stalls at its start gives
+    // 4 or more.
+    const MAX_B_RUN: usize = 3;
+    let mut longest_b_run = 0;
+    let mut current_b_run = 0;
+    for &is_b in &drain_frames {
+        if is_b {
+            current_b_run += 1;
+            longest_b_run = longest_b_run.max(current_b_run);
+        } else {
+            current_b_run = 0;
+        }
+    }
     assert!(
-        mid_drain_a_frame_count - baseline_a_frame_count >= MIN_ADDITIONAL_A_FRAMES,
-        "expected at least {MIN_ADDITIONAL_A_FRAMES} additional due-triggered mode-0 \
-         tester-present sends from cll_a within {SAMPLE_AFTER_RESUME_MS}ms of resuming cll_b's \
-         TX queue (well inside the ~1.5s tx_held drain window), got {baseline_a_frame_count} \
-         before resume and {mid_drain_a_frame_count} after -- drain_tx_held_backlog appears to \
-         be starving the RX-poll/tester-present tick while it drains cll_b's backlog"
+        longest_b_run <= MAX_B_RUN,
+        "expected a due mode-0 tester-present send from cll_a at least every {MAX_B_RUN} drained \
+         cll_b items (50ms period, 25ms per item), but {longest_b_run} cll_b frames went out in a \
+         row -- drain_tx_held_backlog appears to be starving or throttling the \
+         RX-poll/tester-present tick while it drains cll_b's backlog"
     );
-
-    // Let the rest of the drain (and any settle) finish before shutdown.
-    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    assert!(
+        drain_frames.iter().any(|&is_b| !is_b),
+        "cll_a's tester-present should send during the drain"
+    );
 
     drop(events_a);
     server.shutdown().await;

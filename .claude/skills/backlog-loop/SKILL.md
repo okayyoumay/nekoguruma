@@ -44,8 +44,9 @@ branch; if that is not the branch this session was given, tell the maintainer an
 
 ## 1. Check before each iteration
 
-List the open loop PRs: those whose title starts with `[backlog-loop]` or that carry the
-`backlog-loop` label. If one belongs to this run, resume
+List the open loop PRs: those that carry the `backlog-loop` label, or whose title starts with
+`[backlog-loop]` and whose head branch is in this repository (not a fork). Loop PRs always come
+from branches here, and anyone can choose a fork PR's title. If one belongs to this run, resume
 it as described under "Run state" instead of going on. If one belongs to another run, stop the
 run and go to "Final report" (one item at a time).
 
@@ -103,8 +104,8 @@ progress.
 
 Then list the open loop PRs again (title prefix or label, as in step 1). The title prefix is set
 when the PR is created, so this does not depend on when either PR got its label. If one of them
-has a lower number than this one (two runs started together), close this one with a comment
-naming the other, and stop the run. The same check follows every loop PR this skill opens, including a
+has a lower number than this one (two runs started together), mark this one "final" in its run
+state, close it with a comment naming the other, and stop the run. The same check follows every loop PR this skill opens, including a
 backlog-only PR.
 
 ## 4. Implement

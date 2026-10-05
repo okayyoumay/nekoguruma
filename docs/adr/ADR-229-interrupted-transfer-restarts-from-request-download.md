@@ -92,9 +92,11 @@ responsible for them, in the same way that business screens are theirs (design 9
       validated. When the journal records the post-transfer steps (including the procedure's
       own ECUReset) as complete, no download is left to tear down and the agent sends no reset,
       so a freshly initialized ECU is not reset again before verification. If the default-session
-      confirmation below succeeds, it continues from there; if the ECU is still in a
-      non-default session (for example because the procedure's steps end without an ECUReset),
-      the agent tears down passively before confirming. So that a crash between sending RequestTransferExit and recording its response
+      confirmation below succeeds, it continues from there. If it does not, because the ECU
+      reports a non-default session or because it does not answer F186 or refuses it (an ECU
+      can reject the identifier outside its default session, for example when the procedure's
+      steps end without an ECUReset), the agent tears down passively and then repeats the
+      confirmation once, so only a failure after that teardown ends in on-site intervention. So that a crash between sending RequestTransferExit and recording its response
       cannot hide this case, the agent commits an intent marker for RequestTransferExit to the
       journal before it transmits the request (write-ahead); a journal without that marker
       proves the request was never sent. The marker is part of the checkpoint summary used for

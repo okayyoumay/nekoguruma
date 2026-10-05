@@ -29,10 +29,10 @@ The arguments may name a focus area, and two optional inputs used by
    on it, but still note a P0 elsewhere.
 2. **Collect candidates**: all P0 items, then P1 items. Every entry under a
    `Known Flaky Tests` section is a P1 candidate too (`work/README.md`).
-   Go to P2 only if
-   there are no P0/P1 items in scope and the cap (if given) allows P2.
-   Leave out every item named in `skip=`. Skip items with a `Blocked on:` clause
-   unless the blocker is resolved (say so if you find one that is).
+   Leave out every item named in `skip=`, and every item with a
+   `Blocked on:` clause unless the blocker is resolved (say so if you find
+   one that is). Go to P2 only if no P0/P1 item is left after that and the
+   cap (if given) allows P2.
 3. **Verify the top candidates are still open.** For each of the best two
    or three, check the code or docs the item cites (one or two targeted
    reads or a quick `git log` on the paths). A finished item is not a

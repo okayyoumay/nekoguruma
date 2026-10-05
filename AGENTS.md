@@ -44,11 +44,15 @@ comments are public too.
   deadlocks, resource leaks across worker restarts.
 - **`unsafe` placement**: new `unsafe` code outside the `*-sys` crates and the safe wrapper
   crates (`iso22900`, `j2534-0404`). Services and everything above them call the wrappers.
-- **Generated code edited by hand**: changes to proto bindings in `crates/vci-service-interface`
-  without the matching `service.proto` change, or to `crates/*-sys/src/bindings/*.rs` without a
-  header change. A header change committed without regenerated bindings is also P1 unless the
-  same PR records the deferred regeneration as a backlog item in `work/`; a note in the PR
-  description alone is not enough.
+- **Generated code out of step with its source**: the committed bindings must match their
+  source in both directions.
+  - Proto: a change to `crates/vci-service-interface/src/bindings/vci.service.rs` without the
+    matching `service.proto` change (hand edit), or a `service.proto` change without the
+    regenerated bindings in the same PR (stale bindings). Proto regeneration is never deferred.
+  - FFI: a change to `crates/*-sys/src/bindings/*.rs` without a header change (hand edit), or a
+    header change without regenerated bindings, unless the same PR records the deferred
+    regeneration as a backlog item in `work/`; a note in the PR description alone is not
+    enough.
 - **Documentation out of sync**: the PR changes an area without updating the document CLAUDE.md's
   "Documentation sync" table assigns to it (for example a `service.proto` change without
   `docs/rpc-api-guide.md`, a server API change without `api/openapi.yaml`, a database change

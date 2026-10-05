@@ -1,0 +1,57 @@
+# ADR-229: Interrupted Transfers Restart from RequestDownload; Write Procedures Are a Reference Implementation
+
+**Date:** 2026-10-05
+**Status:** Accepted
+**Affects:** `docs/system-architecture.md` (8.2.5, 16.1), `crates/agent` (write-job journal), `crates/sim-ecu` (flash state), `crates/diag-ir` (resume model)
+
+## Context
+
+A write job that downloads data to an ECU can be interrupted part-way through the transfer: the
+agent crashes or the PC restarts, the worker crashes, the VCI is disconnected, or the power
+fails. Design 5.6 requires such a job to resume from its journal or to end in a defined state,
+and design 8.2.5 set the journal's checkpoints for flash transfers at block granularity. The
+open question was where the resumed transfer starts.
+
+ISO 14229-1 (2026 edition) gives the client no standard way to continue a download from a later
+block. The TransferData block sequence counter (clause 14.4) is there so that the ECU can tell a
+block the client repeated after a lost response from a new block, and answer the repeat without
+writing it again. The counter starts over with every RequestDownload, and the download state does
+not survive an ECU reset or the end of the programming session. Continuing from the block after
+the last confirmed one would need ECU-specific behaviour, such as accepting a RequestDownload for
+the remaining address range without a new erase. Whether a given ECU allows that is a vendor
+question (design 17, "Items to Confirm Early").
+
+The write and recovery procedures that ship with this software serve as a reference
+implementation. In production, the framework user owns the procedures they run and is
+responsible for them, in the same way that business screens are theirs (design 9.6, 16.1).
+
+## Decision
+
+1. **Restart from RequestDownload.** When a transfer has started and the ECU-side transfer ended
+   (agent crash or restart, worker crash, VCI disconnect, power loss), the resumed job first runs
+   the state check and VIN verification of design 8.2.5. If those pass, it redoes the transfer
+   from its erase and RequestDownload. It never continues from a later block.
+2. **Block checkpoints are progress, not a resume origin.** The journal still records each
+   confirmed block, for progress display and for the checkpoint summary used for handover to
+   another device (8.2.5). Repeating a block after a lost response remains the block sequence
+   counter's job inside one transfer.
+3. **Split of responsibility.** The framework provides the mechanisms: the journal, the state
+   check before resuming, the idempotency and interruptibility attributes (8.2.5, 8.10.1) and the
+   guarantee that a write job ends in a state defined by design 5.6. The bundled write and
+   recovery procedures are a reference implementation that uses only standard services. Recovery
+   strategies that depend on a particular ECU, such as continuing from a later address, are the
+   framework user's to write as their own procedures, on top of the same mechanisms.
+
+## Consequences
+
+- The reference implementation works with any ECU that implements the standard download
+  services. `sim-ecu` only needs the standard behaviour: the download state is lost on reset or
+  session end, and a repeated block with the previous counter value is accepted without being
+  written again.
+- An interrupted transfer of a large image is resent in full, which costs time. The resume limit
+  per stage (8.2.5) still applies, so repeated failures end in on-site intervention rather than
+  an endless loop.
+- A framework user who adds an ECU-specific continuation is responsible for its correctness
+  against that ECU. The framework does not check it beyond the attributes and the state check.
+- Design 16.1 lists production write and recovery procedures as the framework user's
+  responsibility.

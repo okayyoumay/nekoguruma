@@ -799,7 +799,7 @@ For each cause of interruption, the resume origin and whether resumption is poss
 |---|---|---|---|
 | Loss of communication with server | Retained | Continue (wait only) | Seed-key computation, OEM authentication and HMI requests enter a wait state. S3 keep-alive continues |
 | Worker crash | Retained | From the diagnostic primitive instruction | Worker restart, reload, vehicle reconnection. Reads are resent; flash transfers re-establish the session |
-| Agent crash / PC restart | Lost | Latest checkpoint in the journal | Before writing starts, from the start of the procedure. During transfer, query the ECU state to decide |
+| Agent crash / PC restart | Lost | Latest checkpoint in the journal | Before writing starts, from the start of the procedure. During transfer, query the ECU state to decide; a transfer that has started is redone from its RequestDownload (below) |
 | Logoff / shutdown | Lost | Same as above | Prevented by suppression measures, but forced termination cannot be prevented. Device mode is unaffected by logoff |
 | Power loss, cable disconnection, low voltage | Lost | Same as above, but ECU-side feasibility is a separate issue | Rewrite possible if the bootloader is intact. If corrupted, on-site intervention (the reason the power supply unit is checked as a precondition) |
 
@@ -811,7 +811,8 @@ For each cause of interruption, the resume origin and whether resumption is poss
 
 **Key design points**
 
-- **Checkpoint granularity**: As a guideline, per block for flash transfers and per diagnostic primitive call otherwise. Too fine and journal writes hurt performance; too coarse and rollbacks become large
+- **Checkpoint granularity**: As a guideline, per block for flash transfers and per diagnostic primitive call otherwise. Too fine and journal writes hurt performance; too coarse and rollbacks become large. Block checkpoints record progress (for display and for the handover summary below); they are not a resume origin
+- **Interrupted transfers restart from RequestDownload** (ADR-229): ISO 14229-1 has no standard way to continue a download after the ECU has reset or left its programming session. Its TransferData block sequence counter (14.4) only lets the ECU recognize a block repeated after a lost response, and it starts over with every RequestDownload. A transfer interrupted by anything that ends the transfer on the ECU side (agent crash, power loss, worker crash, VCI disconnect) is therefore redone from its erase and RequestDownload, after the state check. Continuing from a later address is ECU-specific; a framework user who needs it writes it as their own procedure on top of the same journal and state check
 - **Idempotency attribute**: Each diagnostic primitive carries an attribute indicating "whether re-execution is safe" (reads are safe, routine control depends on content, transfer start requires care). The VM follows this attribute to decide whether to re-execute or to decide based on a state query
 - **Resume always starts with a state check**: Do not blindly continue from the recorded position; first ask the ECU for its current state and reconcile it with the record
 - **Handover to another device**: Since the journal is local to the device, resumption on the same device is impossible if the device fails. A checkpoint summary (job ID, stage reached, target VIN and ECU, version being written) is sent to the server so that an agent on another device can take over. Handover also starts with a state check, and a VIN match is mandatory
@@ -1393,6 +1394,7 @@ Since this is provided as a framework, the scope of responsibility is made expli
 | Correctness of extension package contents (IR, vehicle definitions) | Author. The operator is responsible only up to ingestion validation and provenance assurance (11.1) |
 | VCI profiles and their installation on devices (9.3) | Author for the contents; the operator's package management or software distribution service for delivery and updates |
 | Business screens and operational flows | Framework user |
+| Write and recovery procedures used in production (ECU-specific programming sequences, resume strategies) | Framework user. The framework provides the journal, the state check before resuming, the idempotency and interruptibility attributes (8.2.5, 8.10.1) and the guarantee that a write job ends in a defined state (5.6); its own write and recovery procedures are a reference implementation (ADR-229) |
 | UNECE R156 processes (SUMS) | System operator. The framework provides mechanisms for recording, version management and auditing, but does not operate the process |
 | Authenticity of ECU flash data | OEM (verified by the ECU) |
 

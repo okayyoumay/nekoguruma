@@ -20,10 +20,17 @@ A run starts only when the maintainer asks for one, or from the previous iterati
 
 ## Run state
 
-The run's state is: items left, the priority cap, and three lists (merged PRs with their shadow
-risk verdicts, skipped items with the reason, and backlog-only PRs). Keep it in a "Loop run"
-section of the current loop PR's description and update it at every step that changes it, so it
-survives a compacted conversation or a fresh session.
+The run's state is: a run id (the UTC time the run started), the current PR number, items left,
+the priority cap, and three lists (merged PRs with their shadow risk verdicts, skipped items with
+the reason, and backlog-only PRs). Keep it in a "Loop run" section of the current loop PR's
+description and update it at every step that changes it, so it survives a compacted conversation
+or a fresh session. A PR belongs to this run only when its "Loop run" section carries this run's
+id.
+
+A run that resumes in a new session (from the hand-off, or when the maintainer asks it to go on)
+reads the state from the PR named in the hand-off, subscribes to that PR's activity, and goes on
+by the PR's state: a draft still being worked returns to step 4 (or step 5 if the item is
+implemented); a PR already handed to the maintainer goes to step 6.
 
 ## 1. Check before each iteration
 
@@ -31,22 +38,24 @@ Stop the run and go to "Final report" if any of these holds:
 
 - no items are left;
 - the latest CI run on `main` failed (a red `main` is P0 work, outside the loop);
-- an open pull request carries the `backlog-loop` label and it is not this run's current PR
-  (one item at a time). If it is this run's current PR (named in its "Loop run" section, for
-  example after a fresh session picked up the hand-off), go to step 6 for it instead;
-- this run's previous loop PR (from the run state) was closed without being merged. Put its
-  item on the skipped list so the run does not pick it again, and report the close;
+- an open pull request carries the `backlog-loop` label and does not belong to this run (one
+  item at a time). An open PR of this run is resumed as described under "Run state";
+- this run's current PR was closed without being merged. Add `Blocked on: the maintainer's
+  reason for closing PR #<n>` to its item as a backlog edit (see "Backlog edits"), so no later
+  run picks it again, and report the close;
 - this run has opened three backlog-only PRs (step 4), so the remaining items need the
   maintainer more than the loop.
 
-Then fetch `origin main` and bring the branch you were given up to date by merging `main` into
-it. Do not reset it or force-push: both need approval, and the run is unattended.
+Then `git fetch origin main` and bring the branch you were given up to date by merging
+`origin/main` into it. Do not reset it or force-push: both need approval, and the run is
+unattended. If the merge conflicts, abort it and stop the run. If the branch still carries
+changes that never reached `main` (from a PR that was closed unmerged), remove them with a new
+commit so that `git diff origin/main` is empty before the pick.
 
 ## 2. Pick
 
-Run `next-task` with an argument that names the priority cap and lists the items on the run's
-skipped list, asking it to leave those out (`next-task` sees nothing but its argument). Still
-check its answer: leave out every skipped item and every item below the cap, for the pick and
+Run `next-task` with `cap=<cap>` and `skip=` followed by the items on the run's skipped list
+(`next-task` sees nothing but its arguments). Still check its answer: leave out every skipped item and every item below the cap, for the pick and
 the alternative alike. Take the first of
 the pick and the alternative that passes these checks:
 
@@ -57,7 +66,8 @@ the pick and the alternative that passes these checks:
 - **Stale.** `next-task` reports it as already done: close it with the `backlog` skill and skip it.
 
 When neither passes, run `next-task` again with the longer skipped list. Stop the run when it
-returns nothing eligible, or when five calls in a row gave nothing eligible.
+answers "Nothing eligible", when a call added nothing to the skipped list (the next call would
+give the same answer), or after five calls.
 
 ## 3. Claim the item
 
@@ -66,8 +76,10 @@ Commit the backlog edits so far (see "Backlog edits") or, if there are none, an 
 first paragraph). The open labelled PR is what tells any other session that an item is in
 progress.
 
-Then list the open `backlog-loop` PRs again. If another one was opened before this one (two runs
-started together), close this one with a comment naming the other, and stop the run.
+Once the PR carries the label, list the open `backlog-loop` PRs again. If one of them has a lower
+number than this one (two runs started together), close this one with a comment naming the
+other, and stop the run. The same check follows every loop PR this skill opens, including a
+backlog-only PR.
 
 ## 4. Implement
 
@@ -78,7 +90,8 @@ If the work shows that the item needs something the loop cannot supply, do not g
 `Blocked on:` clause to the item with the `backlog` skill, using the forms in `work/README.md`
 (`Blocked on: the maintainer's decision on ...` for a design choice that the specs and ADRs
 leave open), and put the item on the skipped list. Commit that edit, then revert this
-iteration's changes other than backlog edits with a new commit (no history rewrite), turn the PR into a
+iteration's other changes with a new commit (if the item was already closed, restore it: only
+the new clause and any follow-up items stay) (no history rewrite), turn the PR into a
 backlog-only PR (retitle it; it keeps the label), take it through step 5, and count it on the
 backlog-only list. A skipped item does not count against the items left. The run is unattended,
 so follow `unattended-clarification` rather than waiting for an answer.
@@ -89,7 +102,8 @@ Edits to the backlog made while picking (a stale item closed, a split recorded, 
 or removed) are committed on the branch and go into this iteration's PR. If the run stops before
 a PR carries them, open a backlog-only loop PR with them and take it through step 5 before the
 final report, so a later run does not pick the same items again. Never do this while another
-labelled PR is open; in that case there are no such edits, because step 1 runs before any pick.
+labelled PR is open. That PR ends the run: when it merges, nothing restarts, and the next run
+starts only when the maintainer asks.
 
 ## 5. Pull request
 
@@ -115,7 +129,8 @@ the run.
 
 Each item should start with a small context. If the session can start a fresh session for the
 next iteration (for example a project coordinator that opens a new thread), hand off there with
-the command `/backlog-loop <items left> <cap>` followed by the run state. Otherwise continue in
+the command `/backlog-loop <items left> <cap>` followed by the run id and the current PR
+number. Otherwise continue in
 this session.
 
 ## Final report
@@ -127,8 +142,8 @@ One message to the maintainer:
 - the items skipped and why;
 - everything that waits on the maintainer: every backlog item whose `Blocked on:` clause
   names the maintainer anywhere, not only at its start (a decision, a purchase, a search, a
-  setting), plus the items
-  blocked on hardware the maintainer could supply. Write each decision as a question that can be
-  answered in a word, with a recommendation;
+  setting), plus the items blocked on hardware the maintainer could supply. Write each one the
+  maintainer can act on now as a question that can be answered in a word, with a
+  recommendation; for the rest (another precondition is still open), give only their count;
 - why the run stopped (no items left, nothing unblocked within the cap, `main` red, another loop
   PR open, a PR closed without merging, or three backlog-only PRs).

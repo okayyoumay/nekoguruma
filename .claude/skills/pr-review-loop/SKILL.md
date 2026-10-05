@@ -148,7 +148,7 @@ re-requested at most once.
    that cites a clause against `vehicle-comm-specs` for runs of six or more consecutive words
    (`doc-sync-checker` does this). A search for quotation marks alone misses unquoted copies.
    Include untracked files (`git status --short --untracked-files=all`).
-5. **Base branch.** `git fetch origin main`. In a round that pushes, merge `main` into the branch
+5. **Base branch.** `git fetch origin main`. In a round that pushes, merge `origin/main` into the branch
    if it moved and run checks 1 to 4 on the merged tree; a PR that conflicts with its base gets
    no CI run at all. In a no-change round, merge only if the PR conflicts with `main`; that merge
    makes it a changed round, so run checks 1 to 4 and push it.

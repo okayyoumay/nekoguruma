@@ -117,7 +117,7 @@ responsible for them, in the same way that business screens are theirs (design 9
       changed while the agent was down and the `Interrupted -> Writing` transition does not pass
       through pre-validation again. The one exception is the current-software-version match of
       design 8.9.1: during a restart it is replaced by the step 3 rules (the pre-erase version,
-      the intended version or no reported version are acceptable), because an erased
+      the intended version or the declared no-application response are acceptable), because an erased
       application may no longer report a version; the VIN and hardware part number match of
       8.9.1 still applies, as established in step 3. If any precondition fails, the job ends in `OnSiteInterventionRequired`
       before the programming session or any side-effecting setup step is replayed. Then the

@@ -50,15 +50,16 @@ is_low_path() {
 }
 
 # A file Cargo discovers as an integration-test target on its own:
-# crates/<crate>/tests/<name>.rs or crates/<crate>/tests/<name>/main.rs. Any
-# other file under tests/ is a module that only runs if a target pulls it in,
+# crates/<crate>/tests/<name>.rs or crates/<crate>/tests/<name>/main.rs, where
+# <name> does not start with a dot (Cargo skips those). Any other file under
+# tests/ is a module that only runs if a target pulls it in,
 # so CI may never compile it. case patterns let * cross "/", so a regex
 # anchors each component.
 # The crate must also be a workspace member on the base (the root Cargo.toml
 # lists members explicitly), or `cargo test --workspace` never sees the file;
 # a change to Cargo.toml itself is HIGH anyway.
 is_crate_test() {
-  [[ "$1" =~ ^crates/([^/]+)/tests/[^/]+\.rs$ || "$1" =~ ^crates/([^/]+)/tests/[^/]+/main\.rs$ ]] || return 1
+  [[ "$1" =~ ^crates/([^/]+)/tests/[^/.][^/]*\.rs$ || "$1" =~ ^crates/([^/]+)/tests/[^/.][^/]*/main\.rs$ ]] || return 1
   grep -Fq "\"crates/${BASH_REMATCH[1]}\"" <<<"$workspace_members"
 }
 

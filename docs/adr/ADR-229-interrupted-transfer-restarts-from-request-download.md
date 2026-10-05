@@ -44,21 +44,24 @@ responsible for them, in the same way that business screens are theirs (design 9
    restart therefore runs in this order:
    1. Checks that need no ECU service: the start deadline, the resume limit per stage, the
       interruptibility attribute (item 1) and the supply voltage read through the VCI.
-   2. Teardown. The agent ends any download the ECU may still hold with an ECUReset (ISO 14229-1
-      clause 9.3), which takes the ECU out of its non-default session. If the ECU refuses the
-      reset or does not answer, the agent stops sending TesterPresent, waits for the session
+   2. Identity, then teardown. The agent never sends an ECUReset to an ECU it has not
+      identified, because the VCI may now be connected to a different vehicle. It first tries to
+      read the VIN, which changes nothing on the ECU. If the VIN matches, it ends any download the
+      ECU may still hold with an ECUReset (ISO 14229-1 clause 9.3), which takes the ECU out of its
+      non-default session. If the VIN does not match, the job aborts. If the ECU does not answer
+      the read (for example because it is still inside the old download), or refuses the reset,
+      the agent tears down passively: it stops sending TesterPresent, waits for the session
       timeout the procedure declares plus a margin (the framework has no built-in default, since
       the value is ECU-specific), and then confirms that the ECU is back in its default session,
       for example by reading the active-session data identifier F186 (ISO 14229-1 Annex C). If
-      it cannot confirm that, the job ends in `OnSiteInterventionRequired`. The reset is sent
-      before the VIN is verified; it changes no memory, and nothing destructive happens before
-      step 3.
-   3. Service-dependent checks in the default session: VIN verification and the ECU state check
-      of design 8.2.5. A VIN mismatch aborts the job. The state check includes reading back the
+      it cannot confirm that, the job ends in `OnSiteInterventionRequired`.
+   3. Service-dependent checks in the default session: VIN verification (again, if the passive
+      teardown was used) and the ECU state check of design 8.2.5. A VIN mismatch aborts the job. The state check includes reading back the
       ECU software version: if it shows that the intended image is already installed (the
       transfer and RequestTransferExit completed, but the response or the journal update was
       lost), the job skips the restart and continues with read-back verification.
    4. Re-entry: the programming session and security access again, then erase and RequestDownload.
+   A handover to another device (8.2.5) follows the same order.
 3. **Block checkpoints are progress, not a resume origin.** The journal still records each
    confirmed block, for progress display and for the checkpoint summary used for handover to
    another device (8.2.5). Repeating a block after a lost response remains the block sequence

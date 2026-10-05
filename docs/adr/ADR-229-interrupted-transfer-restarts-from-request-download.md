@@ -111,7 +111,11 @@ responsible for them, in the same way that business screens are theirs (design 9
       that the procedure declares is validated (for a flash session: the voltage range, ignition
       on, engine off, vehicle stopped, and the power supply check), since conditions may have
       changed while the agent was down and the `Interrupted -> Writing` transition does not pass
-      through pre-validation again; if any fails, the job ends in `OnSiteInterventionRequired`
+      through pre-validation again. The one exception is the current-software-version match of
+      design 8.9.1: during a restart it is replaced by the step 3 rules (the pre-erase version,
+      the intended version or no reported version are acceptable), because an erased
+      application may no longer report a version; the VIN and hardware part number match of
+      8.9.1 still applies, as established in step 3. If any precondition fails, the job ends in `OnSiteInterventionRequired`
       before the programming session or any side-effecting setup step is replayed. Then the
       procedure's own steps that lead up to the erase are replayed from the start
       of the flash session, with their guards (programming session, security access, and any

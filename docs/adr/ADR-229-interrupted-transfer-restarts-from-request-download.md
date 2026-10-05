@@ -100,9 +100,13 @@ responsible for them, in the same way that business screens are theirs (design 9
       not treated as validated and the job goes on to step 4, whose full transfer runs the
       post-transfer steps again in the procedure's order; a procedure may instead declare its
       own post-transfer recovery sequence for this case (item 4). If the software version is the
-      one recorded before the erase, or the ECU reports none (no answer or a negative response,
-      as when the application is invalid), the transfer still needs to be redone and the job goes
-      on to step 4. The journal's record of the post-transfer steps decides, not the version
+      one recorded before the erase, or the ECU conclusively reports that it has none (a
+      response the procedure declares to mean that no valid application is present, such as a
+      specific negative response code), the transfer still needs to be redone and the job goes
+      on to step 4. No answer, or any other negative response, proves nothing, since the
+      response of an ECU holding an unexpected version may simply have been lost: the agent
+      retries the read within the procedure's retry limit, and if it stays inconclusive the job
+      ends in `OnSiteInterventionRequired`. The journal's record of the post-transfer steps decides, not the version
       alone: when a job reflashes the version already installed, the pre-erase and intended
       versions are the same, and the job skips the restart only if those steps are recorded as
       complete; otherwise it redoes the transfer. Any other decoded version means something other than this job changed the ECU, and

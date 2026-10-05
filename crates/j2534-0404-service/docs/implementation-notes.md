@@ -3406,8 +3406,9 @@ up-to-1790-byte buffer straight through, no service-side segmentation.
 **Mock support** (`j2534-0404-mock`): simulates `IOCTL_PROTECT_J1939_ADDR`
 (claim/cancel forms, 254/255 rejection, synchronous RX-queue delivery of
 the CLAIMED indication) and the native `ERR_ADDRESS_NOT_CLAIMED` write
-check; a `__mock_set_j1939_claim_lost` backdoor forces the next claim
-attempt to lose, for testing the retry-list behavior.
+check; a `__mock_set_j1939_claim_lost` backdoor forces every claim
+attempt to lose, and `__mock_set_j1939_claim_lost_count(n)` only the next
+`n`, for testing the retry-list behavior.
 
 Deferred, matching every prior phase's precedent unless noted: `_CHx`
 Additional Channels; `CONFIG_J1939_PINS` (the SAE J1939-13 connector — the

@@ -2291,6 +2291,15 @@ struct MockState {
     /// per-channel/per-address -- this mock's simplest simulation of an
     /// otherwise-real, non-blocking, address-agnostic device response).
     j1939_claim_lost: bool,
+    /// Set via `__mock_set_j1939_claim_lost_count`: the number of upcoming
+    /// `IOCTL_PROTECT_J1939_ADDR` claim attempts (non-cancel form, on a known
+    /// channel, that produce an indication) that resolve
+    /// `J1939_ADDRESS_LOST`. Each such attempt uses up one; at `0` (the
+    /// default after `__mock_reset`) claims behave normally unless
+    /// `j1939_claim_lost` is set. Unlike that global toggle, this makes
+    /// "only the first candidate loses" deterministic: the test sets it
+    /// before the claim starts and never has to race the retry loop.
+    j1939_claim_lost_remaining: u32,
     /// SAE J2534-2 clause 11 GM UART Protocol (ADR-189/Phase 8), set via
     /// `__mock_set_gm_uart_supported`: `true` forces `IOCTL_GET_DEVICE_INFO`'s
     /// `DEVICE_INFO_GM_UART_SUPPORTED` arm to report `Supported = 0` instead
@@ -3044,6 +3053,7 @@ exported_fn!(PassThruStartPeriodicMsg(
 exported_fn!(PassThruStopPeriodicMsg(channel_id: u32, msg_id: u32) -> c_long {
     let mut guard = state().lock().expect("mock state poisoned");
     guard.counters.stop_periodic += 1;
+    THREAD_COUNTERS.with(|c| c.stop_periodic.set(c.stop_periodic.get() + 1));
     // Error injection (`__mock_set_stop_periodic_message_error`): checked
     // before the real `channel.periodic_msgs.remove(...)` below, mirroring
     // `stop_repeat_message_error`'s identical convention -- a forced failure
@@ -3747,6 +3757,7 @@ exported_fn!(PassThruIoctl(
             || x == IOCTL_CLEAR_FUNCT_MSG_LOOKUP_TABLE => {
             if x == IOCTL_CLEAR_TX_BUFFER {
                 state().lock().expect("mock state poisoned").counters.clear_tx_buffer += 1;
+                THREAD_COUNTERS.with(|c| c.clear_tx_buffer.set(c.clear_tx_buffer.get() + 1));
             }
             if x == IOCTL_CLEAR_PERIODIC_MSGS {
                 let mut guard = state().lock().expect("mock state poisoned");
@@ -3841,6 +3852,7 @@ exported_fn!(PassThruIoctl(
                 .expect("mock state poisoned")
                 .counters
                 .get_device_info += 1;
+            THREAD_COUNTERS.with(|c| c.get_device_info.set(c.get_device_info.get() + 1));
             let params = unsafe {
                 std::slice::from_raw_parts_mut(list.ParamPtr, list.NumOfParams as usize)
             };
@@ -4493,10 +4505,17 @@ exported_fn!(PassThruIoctl(
                 return ERR_INVALID_IOCTL_VALUE as c_long;
             }
             let is_cancel = name.iter().all(|&b| b == 0);
-            let claimed = !guard.j1939_claim_lost;
             // ADR-180 Decision 21 regression coverage: see
             // `j1939_claim_no_indication`'s own field doc.
             let no_indication = guard.j1939_claim_no_indication;
+            // The channel is known here: the lookup at the top of this arm
+            // already returned `err_channel()` for an unknown one.
+            let loses_from_count =
+                !is_cancel && !no_indication && guard.j1939_claim_lost_remaining > 0;
+            if loses_from_count {
+                guard.j1939_claim_lost_remaining -= 1;
+            }
+            let claimed = !(guard.j1939_claim_lost || loses_from_count);
             // ADR-180 Decision 22 regression coverage: see
             // `j1939_cancel_error`'s own field doc.
             let cancel_error = guard.j1939_cancel_error;
@@ -5475,6 +5494,30 @@ exported_fn!(
 });
 
 exported_fn!(
+    /// SAE J2534-2 clause 16 SAE J1939 Protocol: makes only the next
+    /// `count` `IOCTL_PROTECT_J1939_ADDR` claim attempts (non-cancel form,
+    /// on a known channel, that produce an indication) resolve
+    /// `J1939_ADDRESS_LOST`; later attempts claim normally. Replaces any
+    /// remaining count; `count == 0` clears it (the default after
+    /// `__mock_reset`). Use this instead of toggling
+    /// `__mock_set_j1939_claim_lost` mid-claim when a test needs a specific
+    /// candidate to win: the service issues the next candidate within one
+    /// poll tick, faster than a test can react.
+    __mock_set_j1939_claim_lost_count(count: u32) -> c_long {
+    let mut guard = state().lock().expect("mock state poisoned");
+    guard.j1939_claim_lost_remaining = count;
+    no_error()
+});
+
+exported_fn!(
+    /// How many forced-LOST claim attempts set by
+    /// `__mock_set_j1939_claim_lost_count` are still unused. A test reads
+    /// it back to prove the attempts it armed were actually made.
+    __mock_get_j1939_claim_lost_remaining() -> u32 {
+    state().lock().expect("mock state poisoned").j1939_claim_lost_remaining
+});
+
+exported_fn!(
     /// SAE J2534-2 clause 11 GM UART Protocol (ADR-189/Phase 8): `supported
     /// == 0` forces `IOCTL_GET_DEVICE_INFO`'s `DEVICE_INFO_GM_UART_SUPPORTED`
     /// arm to report `Supported = 0` on every subsequent call, instead of
@@ -5827,6 +5870,46 @@ exported_fn!(__mock_get_fast_init_count() -> usize {
 
 exported_fn!(__mock_get_get_device_info_count() -> usize {
     state().lock().expect("mock state poisoned").counters.get_device_info
+});
+
+/// Per-thread twins of a few `MockState::counters` fields. Each counts only
+/// the calls made on the calling thread, and `__mock_reset` does not clear
+/// them. The process-wide counters are shared by every test in a process,
+/// so a test that asserts an exact before/after delta on one sees other
+/// tests' calls whenever they run in parallel (`cargo test`). A test that
+/// issues its native calls on its own thread (a current-thread
+/// `#[tokio::test]` driving the service directly) reads these instead, via
+/// the `__mock_get_*_count_on_current_thread` exports.
+#[derive(Default)]
+struct ThreadCounters {
+    get_device_info: std::cell::Cell<usize>,
+    stop_periodic: std::cell::Cell<usize>,
+    clear_tx_buffer: std::cell::Cell<usize>,
+}
+
+thread_local! {
+    static THREAD_COUNTERS: ThreadCounters = ThreadCounters::default();
+}
+
+exported_fn!(
+    /// `IOCTL_GET_DEVICE_INFO` calls made on the calling thread. See
+    /// `ThreadCounters`.
+    __mock_get_get_device_info_count_on_current_thread() -> usize {
+    THREAD_COUNTERS.with(|c| c.get_device_info.get())
+});
+
+exported_fn!(
+    /// `PassThruStopPeriodicMsg` calls made on the calling thread. See
+    /// `ThreadCounters`.
+    __mock_get_stop_periodic_count_on_current_thread() -> usize {
+    THREAD_COUNTERS.with(|c| c.stop_periodic.get())
+});
+
+exported_fn!(
+    /// `PassThruIoctl(CLEAR_TX_BUFFER)` calls made on the calling thread.
+    /// See `ThreadCounters`.
+    __mock_get_clear_tx_buffer_count_on_current_thread() -> usize {
+    THREAD_COUNTERS.with(|c| c.clear_tx_buffer.get())
 });
 
 exported_fn!(__mock_get_get_protocol_info_count() -> usize {
@@ -8036,6 +8119,69 @@ mod tests {
             let mut num = 1u32;
             let write_rc = unsafe { PassThruWriteMsgs(channel_id, &mut msg, &mut num, 0) };
             assert_eq!(write_rc, ERR_ADDRESS_NOT_CLAIMED as c_long);
+        }
+    );
+
+    serial_test!(
+        fn protect_j1939_addr_lost_count_loses_only_the_armed_attempts() {
+            let channel_id = connect_j1939_channel_with_pins();
+            assert_eq!(
+                unsafe { __mock_set_j1939_claim_lost_count(1) },
+                STATUS_NOERROR as c_long
+            );
+
+            // A cancel does not use up the count.
+            assert_eq!(
+                protect_j1939_addr(channel_id, 0x80, [0; 8]),
+                STATUS_NOERROR as c_long
+            );
+            assert_eq!(unsafe { __mock_get_j1939_claim_lost_remaining() }, 1);
+
+            assert_eq!(
+                protect_j1939_addr(channel_id, 0x80, [1; 8]),
+                STATUS_NOERROR as c_long
+            );
+            let (rx_status, data) = read_one_msg(channel_id).expect("first attempt indication");
+            assert_eq!(
+                rx_status & RX_FLAG_J1939_ADDRESS_LOST,
+                RX_FLAG_J1939_ADDRESS_LOST
+            );
+            assert_eq!(data, vec![0x80]);
+            assert_eq!(unsafe { __mock_get_j1939_claim_lost_remaining() }, 0);
+
+            assert_eq!(
+                protect_j1939_addr(channel_id, 0x81, [1; 8]),
+                STATUS_NOERROR as c_long
+            );
+            let (rx_status, data) = read_one_msg(channel_id).expect("second attempt indication");
+            assert_eq!(
+                rx_status & RX_FLAG_J1939_ADDRESS_CLAIMED,
+                RX_FLAG_J1939_ADDRESS_CLAIMED
+            );
+            assert_eq!(data, vec![0x81]);
+        }
+    );
+
+    serial_test!(
+        fn per_thread_counters_see_only_their_own_threads_calls() {
+            let stop_on_this_thread =
+                || unsafe { __mock_get_stop_periodic_count_on_current_thread() };
+            let before = stop_on_this_thread();
+            // Unknown channel: the call still succeeds, and is counted.
+            unsafe { PassThruStopPeriodicMsg(0xDEAD, 1) };
+            std::thread::spawn(|| unsafe {
+                PassThruStopPeriodicMsg(0xDEAD, 1);
+                PassThruStopPeriodicMsg(0xDEAD, 1);
+            })
+            .join()
+            .unwrap();
+            assert_eq!(stop_on_this_thread(), before + 1);
+            assert_eq!(unsafe { __mock_reset() }, STATUS_NOERROR as c_long);
+            assert_eq!(
+                stop_on_this_thread(),
+                before + 1,
+                "__mock_reset must not clear the per-thread counters"
+            );
         }
     );
 

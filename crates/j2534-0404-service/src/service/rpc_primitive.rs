@@ -6793,8 +6793,8 @@ mod tp20_broadcast_periodic_api_fence_tests {
         unsafe {
             let lib = Library::new(&lib_path).expect("mock library should be loadable");
             let f: Symbol<unsafe extern "system" fn() -> usize> = lib
-                .get(b"__mock_get_stop_periodic_count\0")
-                .expect("__mock_get_stop_periodic_count should be exported");
+                .get(b"__mock_get_stop_periodic_count_on_current_thread\0")
+                .expect("__mock_get_stop_periodic_count_on_current_thread should be exported");
             f()
         }
     }
@@ -7922,11 +7922,10 @@ mod tp20_broadcast_periodic_api_fence_tests {
     ///    never race an in-flight `PassThruStartPeriodicMsg`.
     ///
     /// Joins the `tp20_stop_periodic_call_counter` serial group: the teardown
-    /// issues a real `PassThruStopPeriodicMsg`, which bumps the mock's
-    /// PROCESS-GLOBAL `__mock_get_stop_periodic_count` that
-    /// `cancel_takes_the_sentinel_under_the_fence_without_a_native_stop`
-    /// asserts on. (This test's own assertions use `live_periodic_msg_count`,
-    /// which is channel-keyed and would need no guard by itself.)
+    /// issues a real `PassThruStopPeriodicMsg`, which must not run while
+    /// another test in the group has `__mock_set_stop_periodic_message_error`
+    /// armed. (This test's own assertions use `live_periodic_msg_count`,
+    /// which is channel-keyed.)
     #[tokio::test]
     #[serial(tp20_stop_periodic_call_counter)]
     async fn disconnect_takes_the_entry_atomically_and_fences_only_the_native_stop() {
@@ -8044,19 +8043,22 @@ mod finalize_or_orphan_broadcast_periodic_start_tests {
     use super::rollback_stop_comm_pending_tests::{TEST_HANDLE, service_with_one_link};
     use super::*;
 
-    /// Reads `PassThruStopPeriodicMsg`'s call counter through a fresh
-    /// `libloading::Library` handle, not a statically-linked copy -- mirrors
-    /// `discovery.rs::tests::get_device_info_call_count`'s own documented
-    /// rationale: a fresh `Library::new` on the identical path resolves to
-    /// the SAME dynamically-loaded shared object `service.api` itself
-    /// mutates, not a separate statically-linked copy of `MockState`.
+    /// Reads the mock's per-thread `PassThruStopPeriodicMsg` call counter
+    /// through a fresh `libloading::Library` handle, not a statically-linked
+    /// copy -- mirrors `discovery.rs::tests::get_device_info_call_count`'s
+    /// own documented rationale: a fresh `Library::new` on the identical path
+    /// resolves to the SAME dynamically-loaded shared object `service.api`
+    /// itself mutates, not a separate statically-linked copy of `MockState`.
+    /// Per-thread for the same reason as that function: the process-wide
+    /// count also moves whenever another test in this binary stops a
+    /// periodic message in parallel, which broke the exact deltas below.
     fn stop_periodic_call_count() -> usize {
         let lib_path = j2534_0404_mock::mock_library_path().expect("mock cdylib should be built");
         unsafe {
             let lib = Library::new(&lib_path).expect("mock library should be loadable");
             let f: Symbol<unsafe extern "system" fn() -> usize> = lib
-                .get(b"__mock_get_stop_periodic_count\0")
-                .expect("__mock_get_stop_periodic_count should be exported");
+                .get(b"__mock_get_stop_periodic_count_on_current_thread\0")
+                .expect("__mock_get_stop_periodic_count_on_current_thread should be exported");
             f()
         }
     }
@@ -8842,8 +8844,8 @@ mod rpc_cancel_com_primitive_zero_message_id_tests {
         unsafe {
             let lib = Library::new(&lib_path).expect("mock library should be loadable");
             let f: Symbol<unsafe extern "system" fn() -> usize> = lib
-                .get(b"__mock_get_stop_periodic_count\0")
-                .expect("__mock_get_stop_periodic_count should be exported");
+                .get(b"__mock_get_stop_periodic_count_on_current_thread\0")
+                .expect("__mock_get_stop_periodic_count_on_current_thread should be exported");
             f()
         }
     }

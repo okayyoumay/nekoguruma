@@ -35,7 +35,9 @@ responsible for them, in the same way that business screens are theirs (design 9
    flash session, every step from `recovery_required_from_step` on, which defaults to the start
    of erase) ends the job in `OnSiteInterventionRequired` instead, as design 5.6 and 8.10.1
    already require. A procedure that allows a restart says so by its attribute; the M1 reference
-   procedure against `sim-ecu`, whose bootloader stays intact, is one.
+   procedure against `sim-ecu`, whose bootloader stays intact, is one. For a flash session that
+   means declaring that no step requires on-site intervention, which the IR cannot express yet
+   (see Consequences).
 2. **Order of a restart: tear down, then check, then erase.** A crash or a short disconnect does
    not necessarily end the transfer on the ECU: if the agent reconnects before the ECU's session
    timer expires, the ECU can still hold the old download. While it does, a new RequestDownload
@@ -246,7 +248,10 @@ responsible for them, in the same way that business screens are theirs (design 9
   session: where the replayable steps leading up to the erase begin and where the erase
   begins, so the runtime replays exactly that range and checks the preconditions again at the
   erase boundary (today `Section` has only start and end positions and `FlashSession`'s steps
-  are not linked to the bytecode); all ten are
+  are not linked to the bytecode), nor a way for a flash session to declare that no step
+  requires on-site intervention (today `recovery_required_from_step` is a step number that
+  defaults to the start of erase and has no value for "none", so the M1 reference procedure of
+  item 1 cannot allow a restart after erase); all eleven are
   added together with the write-job journal, along with the runtime input that reports whether the supply is
   connected. Until then a procedure cannot require the supply, and the voltage range is the
   only power check a restart can make. A declared safety precondition whose source is not

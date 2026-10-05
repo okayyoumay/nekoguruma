@@ -249,6 +249,35 @@ responsible for them, in the same way that business screens are theirs (design 9
   and the VCI it runs on, the transfer also issues a new signed instruction bound to the
   receiving agent and VCI, after the same signing, approval and compatibility checks as a new
   job; the receiving agent never runs the failed device's instruction.
+- A false confirmation is not prevented. An operator can confirm that the failed device is
+  disconnected while it is still writing, and both devices may then access the same ECU.
+  Neither a minimum time without contact from the failed device nor a second approval is
+  required before a handover. Simultaneous access that gets past the framework's own guards
+  (the device locks, the job ownership on the server and the interference detection of
+  design 8.8) is left to the operators' procedures and to defences on the vehicle side. Those
+  differ by transport: DoIP lets an ECU accept one active tester at a time, while UDS on CAN
+  generally has no such arbitration, so on CAN vehicles the procedure is the only defence.
+  This follows design 8.8, which already holds that complete exclusivity is impossible
+  because third-party tools can always be connected, and the premise of item 4 that
+  production procedures are the framework user's responsibility.
+- Misuse is made detectable instead, by records that only system administrators can audit.
+  The server keeps them append-only, and operators cannot change them. The handover record
+  holds the confirming operator, the time, both devices, and the failed device's last
+  contact with the server at the moment of confirmation, so contact after the confirmation
+  shows that it was false. A failed device that reconnects uploads its journal, and the
+  journal is protected against tampering so that what it uploads can be trusted. Every VIN
+  and ECU hardware identity that either device reads is recorded, including mismatches and
+  aborted reads, and the server alerts the administrators when one job reports more than one
+  VIN or when a job aborts on a VIN mismatch after a handover.
+- Because every signed instruction, including the one reissued at a handover, is bound to one
+  VIN, a false confirmation cannot be used to reprogram a second vehicle with one approval:
+  the receiving device stops at the VIN check, the failed device re-reads the VIN on every
+  recovery, and moving a VCI to another vehicle during a transfer meets an ECU that holds no
+  download and is stopped by the interference detection. Two cases remain outside the
+  system: hardware placed between the VCI and the vehicle that reports a false VIN (a
+  physical attack, not addressed), and an image copied off the device and written with a
+  third-party tool, which protection of artifacts at rest on the device would have to
+  address.
 - Because every recovery on an agent with a configured server reserves its attempt there
   first, a write job interrupted
   while the device is offline (design 5.7 lets jobs start offline) does not restart until the

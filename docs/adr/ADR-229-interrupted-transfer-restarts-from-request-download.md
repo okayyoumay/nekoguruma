@@ -259,7 +259,11 @@ responsible for them, in the same way that business screens are theirs (design 9
   device performs the handover. Ownership moves to the receiving device only when the
   operator confirms on the server that the failed device is disconnected from the vehicle (or
   powered off); from then on the failed device's reservations are refused, so it sends nothing
-  further to the ECU. Fencing by operator confirmation was chosen over a time-limited lease
+  further to the ECU. The transfer also starts a new ownership generation, and the server
+  applies a job-state change or checkpoint summary only when it comes from the current owner
+  under the current generation; anything the former owner sends later, such as messages
+  queued while it was offline, is kept only as audit data (with its uploaded journal) and
+  never overwrites the receiver's state or summary. Fencing by operator confirmation was chosen over a time-limited lease
   renewed during the write, because a lease would make every write on a server-connected
   device, the first run included, depend on the network for its whole duration and rule out
   starting a write offline (design 5.7). An agent without a configured server has no handover

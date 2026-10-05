@@ -105,7 +105,10 @@ progress.
 Then list the open loop PRs again (title prefix or label, as in step 1). The title prefix is set
 when the PR is created, so this does not depend on when either PR got its label. If one of them
 has a lower number than this one (two runs started together), mark this one "final" in its run
-state, close it with a comment naming the other, and stop the run. The same check follows every loop PR this skill opens, including a
+state, close it with a comment naming the other, and stop the run. Backlog edits made while
+picking are dropped with it on purpose: the winning run, or a later one, finds the same stale,
+too-big or unblocked items with the same checks and makes those edits again. The final report
+lists the dropped edits. The same check follows every loop PR this skill opens, including a
 backlog-only PR.
 
 ## 4. Implement

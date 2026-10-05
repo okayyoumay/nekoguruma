@@ -196,7 +196,11 @@ responsible for them, in the same way that business screens are theirs (design 9
    down passively, unless the summary records the post-transfer steps as complete, in which
    case it goes straight to the default-session confirmation as on the same device. Requiring
    a server acknowledgement before each RequestTransferExit was rejected, because it would make
-   the transfer depend on the network at that point.
+   the transfer depend on the network at that point. The same lag can leave the summary
+   without the recorded hardware part number or the pre-erase software version (for example
+   after an offline write, or a crash before the upload). The receiving agent then has nothing
+   to compare the ECU's identity or version against, so a handover whose summary lacks either
+   value ends in `OnSiteInterventionRequired` before anything is sent to the ECU.
 3. **Block checkpoints are progress, not a resume origin.** The journal still records each
    confirmed block, for progress display and for the checkpoint summary used for handover to
    another device (8.2.5). Repeating a block after a lost response remains the block sequence

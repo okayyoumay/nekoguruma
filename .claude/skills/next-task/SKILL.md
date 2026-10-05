@@ -1,7 +1,7 @@
 ---
 name: next-task
 description: Recommend what to work on next in nekoguruma by surveying the whole backlog in work/ (project-wide and worker-crate files). Use when the user asks what to do next, what the top priority is, or which open item to pick up. Produces one pick plus one alternative, not a full list.
-argument-hint: "[area or crate to focus on]"
+argument-hint: "[area or crate to focus on] [cap=P1|P2] [skip=<items to leave out>]"
 context: fork
 agent: Explore
 model: sonnet
@@ -16,7 +16,11 @@ inventory. For a plain list of open items, just read the backlog files.
 
 This skill runs as a forked read-only subagent on Sonnet: the backlog files
 are large, and only the recommendation comes back to the main conversation.
-Focus area, if the user gave one: $ARGUMENTS
+Arguments, if any: $ARGUMENTS
+
+The arguments may name a focus area, and two optional inputs used by
+`backlog-loop`: `cap=P1` or `cap=P2` (never recommend an item below it) and
+`skip=` followed by items to leave out entirely.
 
 ## Steps
 
@@ -25,9 +29,11 @@ Focus area, if the user gave one: $ARGUMENTS
    on it, but still note a P0 elsewhere.
 2. **Collect candidates**: all P0 items, then P1 items. Every entry under a
    `Known Flaky Tests` section is a P1 candidate too (`work/README.md`).
-   Go to P2 only if
-   there are no P0/P1 items in scope. Skip items with a `Blocked on:` clause
-   unless the blocker is resolved (say so if you find one that is).
+   Leave out every item named in `skip=`, and every item with a
+   `Blocked on:` clause unless the blocker is resolved (say so if you find
+   one that is). Go to P2 only if no P0/P1 item is left after that and the
+   cap (if given) allows P2; an item that step 3 finds stale does not
+   count as left, so recheck P2 then.
 3. **Verify the top candidates are still open.** For each of the best two
    or three, check the code or docs the item cites (one or two targeted
    reads or a quick `git log` on the paths). A finished item is not a
@@ -45,6 +51,9 @@ Focus area, if the user gave one: $ARGUMENTS
    - **First step**: where to start (paths, design section, ADR).
    - **Alternative**: one other item and when it would be the better choice.
    - **Stale items found**: any item that turned out already done.
+
+   When no item is eligible (everything in scope is done, blocked, below
+   the cap or skipped), say exactly "Nothing eligible" instead of a pick.
 
 Do not edit the backlog in this skill; recommend only. If the user then
 asks to start the pick, work on it normally.

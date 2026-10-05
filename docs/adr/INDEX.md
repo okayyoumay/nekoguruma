@@ -217,6 +217,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-226](ADR-226-vci-service-manager-client-authorization.md) | `vci-service-manager` Client Authorization — Peer-Identity Trust Root over Local IPC, Manager-Minted Session Tokens for TCP | Accepted | `vci-service-manager` main, Cargo.toml, docs |
 | [ADR-227](ADR-227-windows-workers-target-gnullvm.md) | Windows Workers Target `*-pc-windows-gnullvm`, Cross-Built on Linux | Accepted | CI, `.cargo/config.toml`, worker target docs |
 | [ADR-228](ADR-228-fixed-library-resolution-locations.md) | Library Resolution from Fixed Locations, Shared by Agent and Worker | Accepted | design 7.1.1 / 7.2 / 7.3, `vci-discovery`, `vci-service-config`, worker services |
+| [ADR-230](ADR-230-backlog-loop-serialization-and-claims.md) | Backlog Loop Runs One Item at a Time, with PR-Based Claims and Run State | Accepted | `.claude/skills/backlog-loop`, `next-task`, `scripts/classify-pr-risk.sh` |
 
 ## Status Legend
 
@@ -258,7 +259,7 @@ ADR-052 (loopback-only binding this ADR's auth mechanism relies on), ADR-220 (`g
 ADR-108, ADR-227
 
 ### Development Tooling & CI
-ADR-109 (amended by ADR-113), ADR-113, ADR-119 (dual-implementation sync duty relaxed to same-PR by ADR-155), ADR-136 (publication consolidated by ADR-141), ADR-141 (item 6's atomicity boundary relaxed by ADR-155), ADR-142 (item 1's check-6(c) atomicity boundary relaxed to same-PR by ADR-155), ADR-144, ADR-145, ADR-149, ADR-154 (item 1's/Consequences' same-commit duty wording relaxed to same-PR by ADR-155), ADR-155, ADR-163, ADR-195, ADR-227
+ADR-109 (amended by ADR-113), ADR-113, ADR-119 (dual-implementation sync duty relaxed to same-PR by ADR-155), ADR-136 (publication consolidated by ADR-141), ADR-141 (item 6's atomicity boundary relaxed by ADR-155), ADR-142 (item 1's check-6(c) atomicity boundary relaxed to same-PR by ADR-155), ADR-144, ADR-145, ADR-149, ADR-154 (item 1's/Consequences' same-commit duty wording relaxed to same-PR by ADR-155), ADR-155, ADR-163, ADR-195, ADR-227, ADR-230
 
 ### Timestamps / Clock
 ADR-057 (amended by ADR-102), ADR-120, ADR-143

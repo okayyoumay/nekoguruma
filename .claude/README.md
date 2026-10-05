@@ -108,7 +108,8 @@ Project skills live in `.claude/skills/`:
 | `backlog` | Adding, updating and closing backlog items in `work/` |
 | `next-task` | Recommending the next item to work on (one pick plus one alternative) |
 | `backlog-triage` | Cleaning up the backlog; manual only (`/backlog-triage`) |
-| `pr-review-loop` | Driving the Codex review cycle on a PR Claude opened, up to handing it to Yoko |
+| `pr-review-loop` | Driving the Codex review cycle on a PR Claude opened, up to handing it to the maintainer |
+| `backlog-loop` | Working through the backlog one item and one PR at a time, waiting for the maintainer's merge between items; manual only |
 
 Skills run in the main conversation at the session model. Where an agent covers the same ground
 (build/test sweeps, doc-sync audits, verification), prefer the agent.
@@ -122,7 +123,7 @@ backlog files never enter the main conversation.
 "Built-in agents") and pre-allows read-only git commands, the standard cargo verbs (check, build, test,
 clippy, metadata, tree, and `fmt --check` only; plain `cargo fmt` rewrites sources, so it
 prompts) and the repository check scripts (`check-work-refs.sh`, `check-adr-index.sh`,
-`check-backlog.sh`). Anything that mutates state outside `target/` still
+`check-backlog.sh`, `classify-pr-risk.sh`). Anything that mutates state outside `target/` still
 prompts.
 
 `ask` rules make force pushes and `git reset --hard` prompt even in auto mode, and `deny` rules

@@ -161,11 +161,10 @@ the attribute fails the build once the code is used and gets removed.
    `.github/pull_request_template.md`.
 2. Drive CI to green. A failure is fixed at its root cause; never skip, disable or loosen a test
    to get green.
-3. Run the automated review loop with the `pr-review-loop` skill: request a Codex review
-   (`@codex review`), fix or answer every finding, and re-request until a round is clean. If
-   Codex is not enabled for the repository, the skill falls back to an `edge-case-hunter` pass
-   over the whole diff. If Codex reports its usage limit, the skill asks again every hour for
-   five hours; if the limit still holds, the maintainer chooses how to go on.
+3. Run the automated review loop with the `pr-review-loop` skill: request a review from GitHub
+   Copilot, fix or answer every finding, and re-request until a round is clean. If Copilot code
+   review is not available, or its monthly quota is used up, the skill falls back to an
+   `edge-case-hunter` pass over the whole diff and tells the maintainer.
 4. Before marking the PR ready, check that nothing deferred during the work exists only in the
    conversation: every follow-up is either done in the PR or added to the backlog (`backlog`
    skill). Items the PR finishes are closed in the same PR.
@@ -173,6 +172,7 @@ the attribute fails the build once the code is used and gets removed.
 
 Commit messages and PR descriptions follow the same copyright rule as the code.
 
-Codex reviews against the "Review guidelines" section of [AGENTS.md](AGENTS.md), which restates
-the rules above as review priorities. When a rule in this file changes, update that section in
-the same pull request.
+Copilot reviews against [.github/copilot-instructions.md](.github/copilot-instructions.md) and
+the path-specific files in `.github/instructions/`, which restate the rules above as review
+priorities. Copilot reads only the first 4,000 characters of each file, so keep each one under
+that. When a rule in this file changes, update those files in the same pull request.

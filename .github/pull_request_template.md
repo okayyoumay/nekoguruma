@@ -29,7 +29,7 @@ After:
 
 ## Checks
 
-<!-- Tick each line, or say why it does not hold. The full rules are in AGENTS.md's "Review guidelines". -->
+<!-- Tick each line, or say why it does not hold. The full rules are in `.github/copilot-instructions.md` and `.github/instructions/`. -->
 
 - [ ] No standard text is copied anywhere in this PR, including commit messages and this description; standards are cited by clause or section number and paraphrased, and ISO 22900-2 citations name the 2009 or 2022 edition.
 - [ ] No secrets or private infrastructure details (credentials, keys, tokens, internal hostnames or addresses).

@@ -833,3 +833,54 @@ fn filter_and_write_validation_edges() {
         );
     }
 }
+
+/// A segmented request needs a filter that sends to it and receives from the partner answering
+/// there; a pattern-equals-flow-control filter (functional) never authorizes one.
+#[test]
+fn segmented_writes_need_the_partner_filter() {
+    let _f = fixture();
+    let long = |can_id| msg(can_id, &[0x2E, 0xF1, 0x90, 1, 2, 3, 4, 5]);
+    for (pattern, flow_control, target, expected) in [
+        // Flow control to the ECU, but the pattern is not the ECU's response ID.
+        (
+            0x700,
+            ECU_PHYSICAL_REQUEST_ID,
+            ECU_PHYSICAL_REQUEST_ID,
+            ERR_NO_FLOW_CONTROL,
+        ),
+        // A functional filter: single frames only.
+        (
+            FUNCTIONAL_REQUEST_ID,
+            FUNCTIONAL_REQUEST_ID,
+            FUNCTIONAL_REQUEST_ID,
+            ERR_NO_FLOW_CONTROL,
+        ),
+        // The partner filter.
+        (
+            ECU_RESPONSE_ID,
+            ECU_PHYSICAL_REQUEST_ID,
+            ECU_PHYSICAL_REQUEST_ID,
+            STATUS_NOERROR,
+        ),
+        // No simulated responder on 0x710: any distinct pattern will do.
+        (0x718, 0x710, 0x710, STATUS_NOERROR),
+    ] {
+        let mut channel = 0;
+        assert_eq!(
+            unsafe { PassThruConnect(DEVICE_ID, ISO15765, 0, 500_000, &mut channel) },
+            STATUS_NOERROR
+        );
+        assert_eq!(
+            start_filter(channel, pattern, flow_control).0,
+            STATUS_NOERROR
+        );
+        let m = long(target);
+        let mut n = 1;
+        assert_eq!(
+            unsafe { PassThruWriteMsgs(channel, &m, &mut n, 100) },
+            expected,
+            "{pattern:#x}/{flow_control:#x} -> {target:#x}"
+        );
+        assert_eq!(PassThruDisconnect(channel), STATUS_NOERROR);
+    }
+}

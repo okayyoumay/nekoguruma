@@ -53,8 +53,11 @@ ISO 15765 channels follow clause 7.2.9 and Appendix A for flow-control filters:
   what it receives: a filter started while a response is delayed lets it in, one stopped before
   it appears keeps it out, and a response kept out stays lost when a filter is started later.
 - A request longer than a single frame (more than 7 payload bytes) needs a filter whose
-  flow-control ID is the request's CAN ID; without one it is not sent and the write returns
-  `ERR_NO_FLOW_CONTROL`. Single frames need no filter.
+  flow-control ID is the request's CAN ID and whose pattern ID is the partner answering there
+  (`7E8` for `7E0`; any other ID for an address nobody simulates), since the partner's flow
+  control arrives on the pattern ID. A filter with the same pattern and flow-control ID serves
+  functional single frames only (ADR-055). Without such a filter the request is not sent and
+  the write returns `ERR_NO_FLOW_CONTROL`. Single frames need no filter.
 
 ## Messages
 

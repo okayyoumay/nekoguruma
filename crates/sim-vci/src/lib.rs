@@ -135,6 +135,14 @@ fn request_id_of(response_id: u32) -> u32 {
     }
 }
 
+/// The response ID of the simulated responder listening on `request_id`, if any.
+fn response_id_of(request_id: u32) -> Option<u32> {
+    match request_id {
+        ECU_PHYSICAL_REQUEST_ID => Some(ECU_RESPONSE_ID),
+        _ => None,
+    }
+}
+
 /// A response the ECU has produced, readable from `ready_at` on.
 struct Pending {
     ready_at: Instant,
@@ -204,9 +212,17 @@ impl Channel {
         self.filters = probe.filters;
     }
 
-    /// Whether a segmented message may be sent to `can_id`.
+    /// Whether a segmented message may be sent to `can_id`: a filter must send to it and
+    /// receive from the partner that answers there, since the partner's flow control for the
+    /// first frame arrives on the pattern ID (J2534-1 7.2.9, Appendix A). A filter whose pattern
+    /// and flow-control IDs are the same serves functional single frames only. For an ID no
+    /// simulated responder listens on, the partner is unknown and any distinct pattern is taken.
     fn can_segment_to(&self, can_id: u32) -> bool {
-        self.filters.values().any(|f| f.flow_control == can_id)
+        self.filters.values().any(|f| {
+            f.flow_control == can_id
+                && f.pattern != f.flow_control
+                && response_id_of(can_id).is_none_or(|response| response == f.pattern)
+        })
     }
 }
 

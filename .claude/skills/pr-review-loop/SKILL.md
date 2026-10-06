@@ -33,11 +33,8 @@ says "Findings: None".
 
 A submitted review wakes the session as a PR event. Still, right after the request, schedule a
 one-shot check-in about 15 minutes later (`send_later`) as a safety net for a review that never
-comes. Keep it even when the review arrives first: inline comments can land after the summary,
-so a round is settled only by a read at least five minutes after its review was submitted
-(reschedule the check-in to that point if it would fire sooner). You may start investigating
-findings earlier, but both the round's push and a clean verdict wait for that settled read, so
-late findings join the same round.
+comes. Copilot submits its inline comments together with the review, so once the review is
+in, read it and act on it right away, and delete that check-in (`delete_trigger`).
 
 Only a Copilot review submitted after the latest request, with `commit_id` equal to the current
 head, counts as that request's result. An older review of the same head is not a result.

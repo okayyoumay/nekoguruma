@@ -163,7 +163,7 @@ the attribute fails the build once the code is used and gets removed.
    to get green.
 3. Run the automated review loop with the `pr-review-loop` skill: request a review from GitHub
    Copilot, fix or answer every finding, and re-request until a round is clean. If Copilot code
-   review is not available, or its monthly quota is used up, the skill falls back to an
+   review is not available, or the owner's Copilot budget is used up, the skill falls back to an
    `edge-case-hunter` pass over the whole diff and tells the maintainer.
 4. Before marking the PR ready, check that nothing deferred during the work exists only in the
    conversation: every follow-up is either done in the PR or added to the backlog (`backlog`

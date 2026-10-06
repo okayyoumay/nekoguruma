@@ -34,7 +34,12 @@ responsible for them, in the same way that business screens are theirs (design 9
    (8.10.1): an interruption inside a section marked "recovery required on interruption" (for a
    flash session, every step from `recovery_required_from_step` on, which defaults to the start
    of erase) ends the job in `OnSiteInterventionRequired` instead, as design 5.6 and 8.10.1
-   already require. A procedure that allows a restart says so by its attribute; the M1 reference
+   already require. The interruption point used for this check is the later of the last
+   confirmed step and the request guarded by the newest write-ahead intent marker in the journal
+   (transfer start or RequestTransferExit, item 2): a crash after such a request was sent but
+   before its response was recorded counts as an interruption at that request, so a lost
+   response cannot place it before `recovery_required_from_step` and lead to an automatic
+   restart the procedure prohibits. A procedure that allows a restart says so by its attribute; the M1 reference
    procedure against `sim-ecu`, whose bootloader stays intact, is one. For a flash session that
    means declaring that no step requires on-site intervention, which the IR cannot express yet
    (see Consequences).

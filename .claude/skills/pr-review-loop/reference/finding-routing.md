@@ -9,7 +9,7 @@ confirmed new (Step 1) and you have read the code it points at. Pick exactly one
 there is no design trade-off.
 
 **Not when:** the finding has the same *shape* as one already fixed in this PR, whoever found
-the first one (an earlier Codex round, `edge-case-hunter`, or you while implementing). A second
+the first one (an earlier Copilot round, `edge-case-hunter`, or you while implementing). A second
 instance means the design that needed the first fix may be wrong; that is a 2b question even if
 each fix is one line.
 
@@ -95,8 +95,8 @@ lock or `.await` structure that makes one closable.
 - add a bullet to the relevant ADR's Consequences section with why it cannot close and what the
   bounded impact is (or a new ADR if none covers the mechanism);
 - if closing it later is still worth doing, add a backlog item with the `backlog` skill;
-- reply on the thread with the reasoning and react 👎;
-- when Codex re-raises it after nearby edits, reply with a pointer to the ADR bullet.
+- reply on the thread with the reasoning;
+- when Copilot re-raises it after nearby edits, reply with a pointer to the ADR bullet.
 
 ## 2d. Decline: the mechanism does not happen
 
@@ -110,4 +110,4 @@ safety net a fix would have given, so the bar is higher than for 2a or 2c.
 - **Trace exhaustively.** The bar is "no code path can realize this": enumerate every call site
   of the function involved, not just the path the finding names.
 - **Record the trace.** Put the citation trail in the PR reply, and in the related ADR when the
-  same claim is likely to come up again. React 👎.
+  same claim is likely to come up again.

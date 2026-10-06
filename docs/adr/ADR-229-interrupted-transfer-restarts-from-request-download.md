@@ -60,7 +60,10 @@ responsible for them, in the same way that business screens are theirs (design 9
       limit allows another resume, the agent increments the stage's resume count and commits it
       to the journal, and also reserves the attempt on the server by incrementing the server's
       per-stage count atomically and checking it against the limit, all before it sends anything
-      to the ECU. The agent journals a key for the attempt before it reserves, and the server
+      to the ECU. The incremented count and a new key for the attempt are committed to the
+      journal in one atomic update, so a crash cannot leave a counted attempt without its key;
+      a restart that finds an unconfirmed key retries that attempt rather than counting another.
+      The agent journals the key before it reserves, and the server
       reservation is idempotent on that key, so a reservation whose response was lost is retried
       under the same key and never consumes a second attempt. Once the server confirms the
       reservation, the agent journals that confirmation before its first request to the ECU; on a

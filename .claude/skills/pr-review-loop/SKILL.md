@@ -73,9 +73,9 @@ request Copilot again as usual.
 
 ## Step 1: find out what the review found
 
-A review's summary comment is not evidence of a clean round. Findings arrive as separate inline
-review comments, sometimes later than the summary. Each time a review event arrives, read
-everything:
+A review's headline verdict is not evidence of a clean round. Copilot submits its inline
+comments and its summary as one review, and its findings are spread over both: inline threads
+and summary sections. Each time a review event arrives, read all of it:
 
 ```
 pull_request_read(method="get_review_comments", owner, repo, pullNumber, perPage=100)

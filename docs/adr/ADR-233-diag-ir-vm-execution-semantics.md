@@ -38,6 +38,7 @@ No IR programs, transpiler or journals existed when this was decided, so `VmStat
    - `VmState::checkpoint` and `resume_count` are left to the write-job journal.
 4. **Waits are a step outcome.**
    - `hmi_request` and `security_access` return `Ok(None)` while no answer has arrived (8.2.5 lists both as waits while the server is unreachable). `step` then returns `StepOutcome::Waiting(WaitingOn::Hmi | WaitingOn::SeedKey)` without changing the state.
+   - `record_input` does the same and also reports `WaitingOn::Hmi`, because design 4.3.1 treats record template input as a kind of HMI request.
    - `wait` returns `Ok(false)` until its time has passed, reported as `WaitingOn::Timer`. A `Wait` therefore never blocks inside `step`, and the runner can keep servicing cancellation and the S3 keep-alive (8.2.5) while it waits.
    - The caller steps again later and the same call is made again.
    - Each of these calls carries an `inquiry` number, which is the state's `steps` counter. It does not change while the VM waits, after a host error, or across a resume at the same instruction. It does change when a later instruction runs, including the same instruction reached again in a loop. The host uses it to tell a poll of an open inquiry from a new one. Returning an answer closes the inquiry. The VM itself has no pending flag.

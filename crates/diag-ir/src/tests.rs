@@ -14,6 +14,8 @@ struct MockHost {
     responses: VecDeque<Result<Vec<u8>, MockError>>,
     keys: VecDeque<Option<Vec<u8>>>,
     hmi: VecDeque<Option<Vec<u8>>>,
+    /// Answers to `record_input`; when empty, `responses` is used.
+    records: VecDeque<Option<Vec<u8>>>,
     /// Answers to `wait`; an empty queue means the time has passed.
     timers: VecDeque<bool>,
     fail_next: bool,
@@ -88,9 +90,18 @@ impl DiagHost for MockHost {
         self.fail()?;
         Ok(self.hmi.pop_front().flatten())
     }
-    fn record_input(&mut self, template: &[u8]) -> Result<Vec<u8>, MockError> {
+    fn record_input(
+        &mut self,
+        inquiry: u64,
+        template: &[u8],
+    ) -> Result<Option<Vec<u8>>, MockError> {
         self.calls.push(format!("record {template:02x?}"));
-        self.response()
+        self.inquiries.push(inquiry);
+        if let Some(answer) = self.records.pop_front() {
+            self.fail()?;
+            return Ok(answer);
+        }
+        self.response().map(Some)
     }
     fn monitor_capture(&mut self, back_millis: u32) -> Result<(), MockError> {
         self.calls.push(format!("capture {back_millis}"));
@@ -1154,4 +1165,27 @@ fn unusual_values_round_trip() {
         panic!("not a float")
     };
     assert!(zero.is_sign_negative());
+}
+
+/// Record template input is a kind of HMI request (4.3.1): it waits without blocking and keeps
+/// its inquiry while the operator has not answered.
+#[test]
+fn record_input_waits_for_the_operator() {
+    let program = prog(vec![Op::RecordInput { template: 0 }], vec![b"tpl".to_vec()]);
+    let mut vm = Vm::new(&program);
+    let mut host = MockHost {
+        records: VecDeque::from([None, None, Some(b"42".to_vec())]),
+        ..MockHost::default()
+    };
+    let before = postcard::to_allocvec(&vm.state).unwrap();
+    for _ in 0..2 {
+        assert_eq!(
+            vm.step(&program, &mut host).unwrap(),
+            StepOutcome::Waiting(WaitingOn::Hmi)
+        );
+        assert_eq!(postcard::to_allocvec(&vm.state).unwrap(), before);
+    }
+    assert_eq!(vm.step(&program, &mut host).unwrap(), StepOutcome::Finished);
+    assert_eq!(vm.state.stack, [Value::Bytes(b"42".to_vec())]);
+    assert_eq!(host.inquiries, [0, 0, 0]);
 }

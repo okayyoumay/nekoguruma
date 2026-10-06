@@ -252,7 +252,13 @@ pub trait DiagHost {
     fn wait(&mut self, inquiry: u64, millis: u32) -> Result<bool, Self::Error>;
     /// `Ok(None)` means no answer yet; `inquiry` as for [`DiagHost::security_access`].
     fn hmi_request(&mut self, inquiry: u64, form: &[u8]) -> Result<Option<Vec<u8>>, Self::Error>;
-    fn record_input(&mut self, template: &[u8]) -> Result<Vec<u8>, Self::Error>;
+    /// Asks the operator to fill in a record template (4.3.1), a kind of HMI request: `Ok(None)`
+    /// means no answer yet; `inquiry` as for [`DiagHost::security_access`].
+    fn record_input(
+        &mut self,
+        inquiry: u64,
+        template: &[u8],
+    ) -> Result<Option<Vec<u8>>, Self::Error>;
     fn monitor_capture(&mut self, back_millis: u32) -> Result<(), Self::Error>;
     fn log(&mut self, level: u8, message: &str);
 }
@@ -529,8 +535,13 @@ impl Vm {
             Op::RecordInput { template } => {
                 let template = constant(program, *template)?;
                 self.check_room(0, 1)?;
-                let input = host.record_input(template).map_err(StepError::Host)?;
-                self.push(Value::Bytes(input))?;
+                match host
+                    .record_input(inquiry, template)
+                    .map_err(StepError::Host)?
+                {
+                    Some(input) => self.push(Value::Bytes(input))?,
+                    None => return Ok(Executed::Waiting(WaitingOn::Hmi)),
+                }
             }
             Op::MonitorCapture { back_millis } => host
                 .monitor_capture(*back_millis)
@@ -717,7 +728,7 @@ pub enum StepOutcome {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaitingOn {
-    /// An HMI request has not been answered.
+    /// An HMI request, or a record template input (4.3.1), has not been answered.
     Hmi,
     /// The key for a security access seed has not arrived from the server.
     SeedKey,

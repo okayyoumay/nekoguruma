@@ -121,8 +121,12 @@ responsible for them, in the same way that business screens are theirs (design 9
       erase) is transmitted, the agent commits a transfer-start intent marker, so a crash after
       the ECU accepted that request but before its response was recorded still counts as an
       interrupted transfer and takes this restart order, never a plain start that would erase
-      while an old download may be open. Both markers are part of the checkpoint summary used
-      for handover, like the recorded identity below.
+      while an old download may be open. Each transfer attempt starts clean: the journal update
+      that commits a new transfer-start marker also clears the previous attempt's
+      RequestTransferExit marker and post-transfer progress, so neither the journal nor a summary
+      can show the current attempt as past RequestTransferExit because of an earlier one. Both
+      markers are part of the checkpoint summary used for handover, like the recorded identity
+      below.
 
       In every other case it tears down passively: when the ECU does not answer the VIN read or
       answers it with a negative response (for example because it is still inside the old

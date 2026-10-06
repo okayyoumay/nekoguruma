@@ -230,7 +230,13 @@ responsible for them, in the same way that business screens are theirs (design 9
    request, but before the updated summary reaches the server), so on a handover an absent
    marker proves nothing: the receiving agent never sends the step 2 ECUReset and always tears
    down passively, unless the summary records the post-transfer steps as complete, in which
-   case it goes straight to the default-session confirmation as on the same device. The same
+   case it goes straight to the default-session confirmation as on the same device. That
+   exception holds only for a summary of the job's latest attempt: every summary names the
+   server-reserved attempt it was written under (none for the original run), and the server
+   marks a summary stale once a later attempt has been reserved for the job. A recovery may have
+   cleared the completed progress locally and started a new erase without uploading the cleared
+   summary, so in a stale summary the post-transfer steps count as not complete and both intent
+   markers as possibly set: the receiving agent tears down passively and redoes the transfer. The same
    holds for the transfer-start marker: a handed-over job whose summary lacks it may still
    have had its first erase or RequestDownload accepted, so the receiving agent never treats it
    as a plain start but always takes this restart order, passive teardown first. Requiring

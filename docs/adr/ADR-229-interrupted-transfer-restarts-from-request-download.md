@@ -174,8 +174,8 @@ responsible for them, in the same way that business screens are theirs (design 9
       application may no longer report a version; the VIN and hardware part number match of
       8.9.1 still applies, as established in step 3. If any precondition fails, the job ends in `OnSiteInterventionRequired`
       before the programming session or any side-effecting setup step is replayed. Then the
-      procedure's own steps that lead up to the erase are replayed from the start
-      of the flash session, with their guards (programming session, security access, and any
+      procedure's own steps that lead up to the erase are replayed, from the recovery entry
+      boundary the flash session declares (Consequences) up to its erase boundary, with their guards (programming session, security access, and any
       pre-programming steps the procedure defines, such as CommunicationControl,
       ControlDTCSetting or prerequisite routines; design 8.9), because the teardown discards the
       state they established. Immediately before the erase the same preconditions are checked

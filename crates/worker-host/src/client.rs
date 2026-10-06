@@ -37,6 +37,21 @@ impl BearerAuth {
             subject: subject.into(),
         }
     }
+
+    /// Adds a token minted at `now` to `request`.
+    fn authorize<T>(
+        &self,
+        mut request: tonic::Request<T>,
+        now: SystemTime,
+    ) -> Result<tonic::Request<T>, tonic::Status> {
+        let (token, _exp) = token::mint(&self.key, &self.subject, now);
+        let mut value = MetadataValue::try_from(format!("Bearer {token}"))
+            .map_err(|_| tonic::Status::internal("bearer token is not a valid header value"))?;
+        // Keeps the token out of Debug output and the HPACK dynamic table.
+        value.set_sensitive(true);
+        request.metadata_mut().insert("authorization", value);
+        Ok(request)
+    }
 }
 
 impl std::fmt::Debug for BearerAuth {
@@ -49,15 +64,8 @@ impl std::fmt::Debug for BearerAuth {
 }
 
 impl Interceptor for BearerAuth {
-    fn call(
-        &mut self,
-        mut request: tonic::Request<()>,
-    ) -> Result<tonic::Request<()>, tonic::Status> {
-        let (token, _exp) = token::mint(&self.key, &self.subject, SystemTime::now());
-        let value = MetadataValue::try_from(format!("Bearer {token}"))
-            .map_err(|_| tonic::Status::internal("bearer token is not a valid header value"))?;
-        request.metadata_mut().insert("authorization", value);
-        Ok(request)
+    fn call(&mut self, request: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
+        self.authorize(request, SystemTime::now())
     }
 }
 
@@ -146,19 +154,39 @@ mod tests {
 
     const KEY: [u8; 32] = [3u8; 32];
 
+    fn bearer_token(request: &tonic::Request<()>) -> String {
+        let value = request
+            .metadata()
+            .get("authorization")
+            .expect("authorization header");
+        assert!(value.is_sensitive());
+        value
+            .to_str()
+            .unwrap()
+            .strip_prefix("Bearer ")
+            .expect("Bearer scheme")
+            .to_owned()
+    }
+
     #[test]
     fn interceptor_adds_a_token_the_listener_accepts() {
         let mut auth = BearerAuth::new(KEY, TOKEN_SUBJECT);
-        let request = auth.call(tonic::Request::new(())).unwrap();
-        let header = request
-            .metadata()
-            .get("authorization")
-            .expect("authorization header")
-            .to_str()
-            .unwrap();
-        let token = header.strip_prefix("Bearer ").expect("Bearer scheme");
-        token::verify(&KEY, token, SystemTime::now()).unwrap();
-        assert!(token::verify(&[4u8; 32], token, SystemTime::now()).is_err());
+        let token = bearer_token(&auth.call(tonic::Request::new(())).unwrap());
+        token::verify(&KEY, &token, SystemTime::now()).unwrap();
+        assert!(token::verify(&[4u8; 32], &token, SystemTime::now()).is_err());
+    }
+
+    /// Each call gets a token valid at its own time, so a client older than the token lifetime
+    /// keeps working.
+    #[test]
+    fn each_call_gets_a_token_minted_at_call_time() {
+        let auth = BearerAuth::new(KEY, TOKEN_SUBJECT);
+        let start = SystemTime::now();
+        let later = start + Duration::from_secs(token::TOKEN_TTL_SECS + 1);
+        let first = bearer_token(&auth.authorize(tonic::Request::new(()), start).unwrap());
+        let second = bearer_token(&auth.authorize(tonic::Request::new(()), later).unwrap());
+        assert!(token::verify(&KEY, &first, later).is_err());
+        token::verify(&KEY, &second, later).unwrap();
     }
 
     #[test]
@@ -182,7 +210,7 @@ mod tests {
             "not a valid authority".to_owned(),
             listener.local_addr().unwrap().to_string(),
         ];
-        connect(&endpoints, KEY, &ConnectOptions::default())
+        timeout(connect(&endpoints, KEY, &ConnectOptions::default()))
             .await
             .expect("the second, reachable endpoint should be used");
         assert!(matches!(
@@ -191,18 +219,39 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn connect_reports_an_unreachable_endpoint() {
-        // Bind and drop a listener so the port is very likely closed.
+    /// A port that is very likely closed: bound, then released.
+    fn closed_port() -> String {
         let port = std::net::TcpListener::bind("127.0.0.1:0")
             .unwrap()
             .local_addr()
             .unwrap()
             .port();
-        let endpoints = [format!("127.0.0.1:{port}")];
+        format!("127.0.0.1:{port}")
+    }
+
+    /// Bounds a connect attempt, so a change that makes `connect` wait for the server's HTTP/2
+    /// preface fails the test instead of hanging it.
+    async fn timeout<F: std::future::Future>(future: F) -> F::Output {
+        tokio::time::timeout(Duration::from_secs(10), future)
+            .await
+            .expect("connect should finish")
+    }
+
+    #[tokio::test]
+    async fn connect_reports_an_unreachable_endpoint() {
+        let endpoints = [closed_port()];
         assert!(matches!(
-            connect(&endpoints, KEY, &ConnectOptions::default()).await,
+            timeout(connect(&endpoints, KEY, &ConnectOptions::default())).await,
             Err(ConnectError::Unreachable { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn connect_falls_back_after_an_unreachable_endpoint() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoints = [closed_port(), listener.local_addr().unwrap().to_string()];
+        timeout(connect(&endpoints, KEY, &ConnectOptions::default()))
+            .await
+            .expect("the second, reachable endpoint should be used");
     }
 }

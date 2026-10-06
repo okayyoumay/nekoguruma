@@ -48,7 +48,12 @@ async fn worker_host_client_authenticates_with_minted_tokens() {
         std::path::Path::new(env!("CARGO_BIN_EXE_j2534-0404-service")),
         ServiceKind::J2534V0404,
         TEST_LIBRARY_NAME,
-        &LaunchOptions::default(),
+        // Generous timeouts for a debug binary on a busy CI runner.
+        &LaunchOptions {
+            startup_timeout: Duration::from_secs(20),
+            request_timeout: Duration::from_secs(5),
+            ..LaunchOptions::default()
+        },
     )
     .await
     .expect("worker should launch");
@@ -63,6 +68,22 @@ async fn worker_host_client_authenticates_with_minted_tokens() {
         .expect("an authenticated call should succeed")
         .into_inner();
     assert!(modules.module_id_list.is_some());
+
+    // Every reported endpoint (IPv4 and, where the host has it, IPv6 loopback) accepts an
+    // authenticated client on its own.
+    for endpoint in worker.endpoints() {
+        let mut client = connect(
+            std::slice::from_ref(endpoint),
+            *worker.auth_key(),
+            &ConnectOptions::default(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("client should connect to {endpoint}: {e}"));
+        client
+            .get_module_ids(GetModuleIdsRequest {})
+            .await
+            .unwrap_or_else(|e| panic!("an authenticated call to {endpoint} should succeed: {e}"));
+    }
 
     let mut anonymous = VciServiceClient::connect(format!("http://{}", worker.endpoints()[0]))
         .await

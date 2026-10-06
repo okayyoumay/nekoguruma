@@ -59,6 +59,7 @@ Workspace skeleton (step 1): every crate goes as far as type and boundary defini
 ## Worker services (`docs/worker-crates.md`, `crates/worker-host`)
 
 - **P1**: `long_size = 8` end to end is only unit-tested with fake 64-bit functions. `sim-vci` uses `c_ulong` on Linux but exports only 8 of the 14 functions the service needs; add the missing stubs and run the service against it in CI. `PassThruStartMsgFilter` should then require a flow-control filter before ISO 15765 responses are queued (J2534-1 7.2.5), which `sim-vci` skips today (`crates/sim-vci/docs/simulated-vci.md`).
+- **P2**: The worker gRPC client (`crates/worker-host/src/client.rs`, `connect`) has no RPC deadline and no HTTP/2 keep-alive. `connect` succeeds as soon as TCP connects, so a wedged worker (or a non-gRPC listener) on the first endpoint stops the fallback from moving on, and the first RPC then blocks forever (found by an edge-case review: a listener that accepts and never speaks gives `Ok`). Decide per-call deadlines for unary RPCs (not `SubscribeEvent`) and keep-alive settings, ideally together with the agent's job runner. Done when: a test against a listener that never answers gets an error within the configured time.
 - **P3**: Vendor IOCTLs with data are rejected in 64-bit mode (layout unknown); add a VCI profile entry (design 9.3) for them. Blocked on: a vendor that needs one.
 - **P3**: J2534 v05.00 workers are not covered. A standalone service manager is not planned (the agent takes that role).
 

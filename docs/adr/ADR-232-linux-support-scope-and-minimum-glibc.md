@@ -2,7 +2,7 @@
 
 **Date:** 2026-10-06
 **Status:** Accepted
-**Affects:** design 2 (Assumptions), 7.1.2, 12.1, 17; `.github/workflows/ci.yml` (`worker-linux`)
+**Affects:** design 2 (Assumptions), 7.1.2, 7.3, 12.1, 17; `.github/workflows/ci.yml` (`worker-linux`)
 
 ## Context
 
@@ -21,11 +21,15 @@ version the Rust standard library supports on these targets, so no lower floor i
 
 ## Decision
 
-1. **Cover as much as current support allows.** Linux is a supported platform on all four
-   worker targets, and the workers are built and shipped for each of them.
+1. **Cover as much as current support allows.** Linux is a supported platform on the two host
+   architectures design 7.3 defines, x86_64 and aarch64, and all four worker ABIs are built and
+   shipped: x86_64 and aarch64 for 64-bit vendor libraries, and i686 and armhf for 32-bit
+   vendor libraries on those hosts. A 32-bit-only host is not a supported host.
 2. **Minimum glibc 2.17.** The `worker-linux` release builds link against glibc 2.17 through
    `cargo-zigbuild`'s target suffix (`<triple>.2.17`), so one binary per target runs on every
-   distribution from RHEL 7 on. Raising the floor is a new decision, taken when a dependency or
+   glibc-based distribution from RHEL 7 on whose kernel meets the Rust standard library's
+   Linux floor (3.2; RHEL 7 ships 3.10). Distributions built on another C library, such as
+   musl, are not covered. Raising the floor is a new decision, taken when a dependency or
    Rust itself requires it.
 3. **The level of backing is reported, not hidden.** x86_64 and i686 use this project's own
    definition (7.1.2); aarch64 and armhf stay "inferred" until a vendor library is confirmed on

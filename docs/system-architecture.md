@@ -52,7 +52,7 @@ D-PDU API and J2534 terms used by the worker crates are defined in `glossary.md`
 
 ### Assumptions
 
-- Target OS: Windows / Linux. Linux is supported on x86_64, i686, aarch64 and armhf with glibc 2.17 or later (ADR-232). On Linux, J2534 reuses the Windows API definitions as-is; only registration information such as library locations uses a definition specific to this software (7.1.1)
+- Target OS: Windows / Linux. Linux hosts are x86_64 and aarch64 (with i686 and armhf workers for 32-bit vendor libraries, 7.3), on glibc-based distributions with glibc 2.17 or later and kernel 3.2 or later (ADR-232). On Linux, J2534 reuses the Windows API definitions as-is; only registration information such as library locations uses a definition specific to this software (7.1.1)
 - Vendor library standards: J2534 (PassThru) and ISO 22900 (D-PDU API). Adapters are structured as two kinds, one per standard, plus absorption of vendor-specific quirks
 - Vendor libraries may be a mix of 32-bit and 64-bit (J2534 DLLs are mostly 32-bit, so an x86 worker is required). ARM may also be included
 - Whether and how vendor libraries communicate over the network is not our concern (outside the system's guarantees)

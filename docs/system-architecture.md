@@ -672,7 +672,7 @@ The worker services use two channels:
 
 The gRPC calls are described in `rpc-api-guide.md`, and the mapping of the D-PDU API onto J2534 in `j2534-0404-architecture.md`. Design decisions of the worker crates are recorded as ADRs in `adr/` (index: `adr/INDEX.md`).
 
-The agent generates a 32-byte key per worker instance and hands it over only through stdin. The gRPC listener accepts only bearer tokens signed with that key (HMAC-SHA256), so another local process cannot drive the worker even though the port is reachable.
+The agent generates a 32-byte key per worker instance and hands it over only through stdin. The gRPC listener accepts only bearer tokens signed with that key (HMAC-SHA256), so another local process cannot drive the worker even though the port is reachable. The agent's gRPC client mints a short-lived token from the key for every call, so the key itself is never sent over the socket.
 
 ---
 

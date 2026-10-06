@@ -10,6 +10,8 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 base64 = { workspace = true }
 getrandom = { workspace = true }
+tonic = "0.14.6"
+vci-service-interface = { workspace = true }
 
 # Test double for the service stdio protocol, used by tests/service.rs.
 [[bin]]

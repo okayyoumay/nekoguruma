@@ -3,7 +3,9 @@
 pub use vci_service_config as config;
 pub mod jsonrpc;
 mod logging;
-pub mod token;
+/// The bearer-token format lives with the gRPC interface so that clients can
+/// mint tokens without depending on this crate.
+pub use vci_service_interface::token;
 pub mod vci_server;
 
 pub type BoxError = Box<dyn std::error::Error>;

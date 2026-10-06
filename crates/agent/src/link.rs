@@ -131,16 +131,28 @@ pub async fn open(
     deadline: Duration,
 ) -> Result<Link, HostError> {
     config.validate()?;
-    let module_handle = unary(
+    let modules = unary(
         deadline,
         "GetModuleIds",
         client.get_module_ids(GetModuleIdsRequest {}),
     )
     .await?
     .module_id_list
-    .and_then(|list| list.module_data.into_iter().next())
-    .and_then(|data| data.module_handle)
-    .ok_or(HostError::Setup("the worker reports no module"))?;
+    .map(|list| list.module_data)
+    .unwrap_or_default();
+    // Choosing among several VCIs on one worker is not supported yet; refuse rather than
+    // connect to whichever the worker lists first.
+    let module_handle = match modules.as_slice() {
+        [only] => only
+            .module_handle
+            .ok_or(HostError::Setup("the worker's module has no handle"))?,
+        [] => return Err(HostError::Setup("the worker reports no module")),
+        _ => {
+            return Err(HostError::Setup(
+                "the worker reports several modules; choosing one is not supported yet",
+            ));
+        }
+    };
     let connected = unary(
         deadline,
         "ModuleConnect",
@@ -329,7 +341,8 @@ async fn teardown(
     .await
     .map(drop);
     disconnect_module(client, module_handle, deadline).await;
-    disconnected.or(destroyed)
+    // The first failure, after both steps were tried.
+    disconnected.and(destroyed)
 }
 
 async fn disconnect_module(

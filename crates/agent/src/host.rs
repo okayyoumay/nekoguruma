@@ -286,6 +286,10 @@ impl Progress {
             {
                 self.response = Some(result.data_bytes);
             }
+            // A receive timeout means the ECU did not answer (or did not accept the rest of a
+            // segmented request), which is `NoResponse`, not a failed transmission.
+            Some(event_item::Data::ErrorData(code))
+                if code == PduErrorEvent::PduErrEvtRxTimeout as i32 => {}
             Some(event_item::Data::ErrorData(code)) => self.error = Some(code),
             Some(event_item::Data::CopStatus(status))
                 if status == PduComPrimitiveStatus::PduCopstFinished as i32
@@ -613,6 +617,15 @@ mod tests {
         };
         assert_eq!(code, lost);
         assert!(error.to_string().contains("LOST_COMM_TO_VCI"), "{error}");
+        // A receive timeout is no response, not a failed primitive.
+        let timeout = PduErrorEvent::PduErrEvtRxTimeout as i32;
+        assert!(matches!(
+            outcome(vec![
+                event(Some(COP), event_item::Data::ErrorData(timeout)),
+                event(Some(COP), status(PduComPrimitiveStatus::PduCopstFinished)),
+            ]),
+            Some(Err(HostError::NoResponse))
+        ));
         // Nothing ends the primitive yet.
         assert!(outcome(vec![event(Some(COP), result(&[0x62]))]).is_none());
     }

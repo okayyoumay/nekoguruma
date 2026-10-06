@@ -36,13 +36,13 @@ The worker client sets no deadline on unary calls, so a wedged worker would bloc
    - A request for several DIDs is matched on the SID alone, since the standard does not fix the order of the DIDs in the response. UDS responses carry no sequence number, so a second answer to the same request (an ECU answering twice) cannot be told apart from the first.
    - A negative response is `Ok` with its bytes (`7F`, SID, NRC); the procedure inspects it.
    - Response pending (0x78) is the worker's job. The link sets `CP_RC78Handling`, and `CP_RCByteOffset` to 2, the code's position in a negative response; the worker looks for the code only at that offset. The host also never takes a `7F SID 78` result as the final response, so a chain that ends without one is not handed to the procedure as its answer.
-   - No final response is an error, and the VM state then still points at the primitive (ADR-233 item 1). The send-receive deadline passing, or the primitive ending without one, gives `Err(HostError::NoResponse)`. When the worker reported an error event for the primitive (a transmit error, a lost VCI), the error is `HostError::PrimitiveFailed` with that event, since the request may not have been sent.
+   - No final response is an error, and the VM state then still points at the primitive (ADR-233 item 1). The send-receive deadline passing, or the primitive ending without one, gives `Err(HostError::NoResponse)`, also when the worker reported a receive timeout (`PDU_ERR_EVT_RX_TIMEOUT`, which it also uses when a segmented request's flow control never came). When the worker reported an error event for the primitive (a transmit error, a lost VCI), the error is `HostError::PrimitiveFailed` with that event, since the request may not have been sent.
 4. **Link set-up before the first step.** `LinkConfig` carries:
    - protocol short name, baud rate, physical request and response CAN identifiers;
    - P2, P2* and the 0x78 completion timeout. The IR `Protocol` table does not carry these timings yet.
 
    `LinkConfig::validate` refuses a zero timing (the worker reads it as "no limit", or as a 0x78 window that ends at once), a timing that does not fit the worker's microsecond ComParams, and a CAN identifier above 29 bits. `link::open` then runs the usage sequence of `docs/rpc-api-guide.md` before step 0:
-   - GetModuleIds, ModuleConnect and GetResourceIds for the protocol, then CreateComLogicalLink;
+   - GetModuleIds, ModuleConnect and GetResourceIds for the protocol, then CreateComLogicalLink. The worker must report exactly one module: choosing among several VCIs on one worker is not supported yet, so the link is refused rather than opened on whichever module comes first;
    - SetComParam for the baud rate and timings, with ComParam IDs resolved through GetObjectId;
    - SetUniqueRespIdTable with the two identifiers, which makes the J2534 service install the flow-control filter (ADR-234);
    - ConnectComLogicalLink, then SubscribeEvent on the link.
@@ -54,7 +54,7 @@ The worker client sets no deadline on unary calls, so a wedged worker would bloc
    - A send-receive gets P2 plus the 0x78 completion timeout plus P2* plus 2 s. The worker's worst case is P2 plus the completion timeout, so its own timeouts fire first unless sending the request takes more than the margin.
    - The event stream itself is unbounded. A general deadline for unary calls inside `worker-host` is separate work.
 7. **The minimal runner holds no policy yet.**
-   - `run_program` checks the program against the VM (schema version) before it opens the link, so a program this agent cannot run never reaches the bus.
+   - Before it opens the link, `run_program` checks the program's schema version against the VM and runs the policy scan of item 8. A program that fails either never reaches the bus. A program that passes can still stop later at an unsupported primitive (item 5), after earlier reads have gone out.
    - A VM or host error ends the job, reporting the `pc` of the failed instruction, and `JobLimits::max_steps` bounds the step count. The job does not repeat anything.
    - Dropping the `run_program` future cancels the job. The thread checks the flag before opening the link and before every instruction. The call or primitive in flight finishes (a send-receive can take up to its ceiling), nothing the job owns is dropped mid-sequence, and the link is closed. Runtime shutdown is the exception: the thread's calls then fail, and the worker process releases the device when it exits.
    - Journaling, idempotency and section policy (ADR-229, ADR-233 items 2 and 3) belong to a later runner, which wraps the same step loop.

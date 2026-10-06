@@ -19,7 +19,9 @@ fi
 
 SYMBOLS=(
   PassThruOpen PassThruClose PassThruConnect PassThruDisconnect
-  PassThruReadMsgs PassThruWriteMsgs PassThruIoctl PassThruReadVersion
+  PassThruReadMsgs PassThruWriteMsgs PassThruStartPeriodicMsg PassThruStopPeriodicMsg
+  PassThruStartMsgFilter PassThruStopMsgFilter PassThruSetProgrammingVoltage
+  PassThruReadVersion PassThruGetLastError PassThruIoctl
 )
 
 exported="$(nm -D --defined-only "$LIB")"

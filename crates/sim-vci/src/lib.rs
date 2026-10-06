@@ -34,11 +34,11 @@ macro_rules! passthru_abi {
     };
 }
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
-use j2534_defs::consts::{connect_flag, protocol, status};
+use j2534_defs::consts::{connect_flag, filter, protocol, status, tx_flag};
 use sim_ecu::{Addressing, EcuConfig, SimEcu};
 
 pub const STATUS_NOERROR: PassThruUlong = status::STATUS_NOERROR as PassThruUlong;
@@ -53,6 +53,26 @@ pub const ERR_INVALID_MSG: PassThruUlong = status::ERR_INVALID_MSG as PassThruUl
 pub const ERR_BUFFER_EMPTY: PassThruUlong = status::ERR_BUFFER_EMPTY as PassThruUlong;
 pub const ERR_MSG_PROTOCOL_ID: PassThruUlong = status::ERR_MSG_PROTOCOL_ID as PassThruUlong;
 pub const ERR_INVALID_DEVICE_ID: PassThruUlong = status::ERR_INVALID_DEVICE_ID as PassThruUlong;
+pub const ERR_INVALID_FILTER_ID: PassThruUlong = status::ERR_INVALID_FILTER_ID as PassThruUlong;
+pub const ERR_INVALID_MSG_ID: PassThruUlong = status::ERR_INVALID_MSG_ID as PassThruUlong;
+pub const ERR_NO_FLOW_CONTROL: PassThruUlong = status::ERR_NO_FLOW_CONTROL as PassThruUlong;
+pub const ERR_NOT_UNIQUE: PassThruUlong = status::ERR_NOT_UNIQUE as PassThruUlong;
+pub const ERR_EXCEEDED_LIMIT: PassThruUlong = status::ERR_EXCEEDED_LIMIT as PassThruUlong;
+
+/// Filters each channel accepts (J2534-1 7.2.9 asks for at least ten).
+pub const MAX_FILTERS: usize = 10;
+
+/// Largest ISO 15765 payload that fits a single frame on classic CAN with normal addressing;
+/// longer requests are segmented and need a flow-control filter.
+pub const SINGLE_FRAME_MAX: usize = 7;
+
+/// Strings `PassThruReadVersion` reports.
+pub const FIRMWARE_VERSION: &str = "NGR-SIM 1.0";
+pub const DLL_VERSION: &str = concat!("sim-vci ", env!("CARGO_PKG_VERSION"));
+pub const API_VERSION: &str = "04.04";
+
+/// What `PassThruGetLastError` reports: the simulator keeps no error descriptions.
+pub const LAST_ERROR_TEXT: &str = "sim-vci: no error description";
 
 /// Size of `PASSTHRU_MSG::data`.
 pub const MAX_MSG_DATA: usize = 4128;
@@ -94,10 +114,40 @@ struct Pending {
     data: Vec<u8>,
 }
 
+/// A flow-control filter (J2534-1 7.2.9): receive from `pattern`, send to `flow_control`.
+#[derive(Clone, Copy)]
+struct FlowControlFilter {
+    pattern: u32,
+    flow_control: u32,
+}
+
 struct Channel {
     protocol_id: PassThruUlong,
     /// Ordered by `ready_at`: the order in which the responses appear on the bus.
     rx: VecDeque<Pending>,
+    filters: BTreeMap<PassThruUlong, FlowControlFilter>,
+    next_filter: PassThruUlong,
+}
+
+impl Channel {
+    fn new(protocol_id: PassThruUlong) -> Self {
+        Self {
+            protocol_id,
+            rx: VecDeque::new(),
+            filters: BTreeMap::new(),
+            next_filter: 1,
+        }
+    }
+
+    /// Whether a message from `can_id` may enter the receive queue.
+    fn receives(&self, can_id: u32) -> bool {
+        self.filters.values().any(|f| f.pattern == can_id)
+    }
+
+    /// Whether a segmented message may be sent to `can_id`.
+    fn can_segment_to(&self, can_id: u32) -> bool {
+        self.filters.values().any(|f| f.flow_control == can_id)
+    }
 }
 
 /// State of the simulated device and the vehicle behind it.
@@ -203,31 +253,46 @@ impl Bus {
         }
     }
 
-    /// Hands one ISO 15765 message to the ECU and queues its response on `channel_id`.
-    fn transmit(&mut self, channel_id: PassThruUlong, data: &[u8]) {
+    /// Hands one ISO 15765 message to the ECU and queues its response on `channel_id`, if the
+    /// channel has a flow-control filter for the response ID. A segmented request needs a
+    /// filter whose flow-control ID is the request's ID (J2534-1 7.2.9); without one it is not
+    /// sent and `ERR_NO_FLOW_CONTROL` is returned.
+    fn transmit(&mut self, channel_id: PassThruUlong, data: &[u8]) -> Result<(), PassThruUlong> {
         let (id, payload) = data.split_at(CAN_ID_LEN);
-        let addressing = match u32::from_be_bytes([id[0], id[1], id[2], id[3]]) {
+        let can_id = u32::from_be_bytes([id[0], id[1], id[2], id[3]]);
+        let channel = self
+            .channels
+            .get(&channel_id)
+            .ok_or(ERR_INVALID_CHANNEL_ID)?;
+        if payload.len() > SINGLE_FRAME_MAX && !channel.can_segment_to(can_id) {
+            return Err(ERR_NO_FLOW_CONTROL);
+        }
+        let addressing = match can_id {
             ECU_PHYSICAL_REQUEST_ID => Addressing::Physical,
             FUNCTIONAL_REQUEST_ID => Addressing::Functional,
             // No simulated ECU listens on this ID.
-            _ => return,
+            _ => return Ok(()),
         };
         let Some(ecu) = self.ecu.as_mut() else {
-            return;
+            return Ok(());
         };
         let before = ecu.power_cycles();
         let exchange = ecu.exchange(addressing, payload);
         let power_cycle = ecu.power_cycles();
         self.after_ecu_change(before);
         let Some(bytes) = exchange.response.to_bytes() else {
-            return;
+            return Ok(());
         };
         let mut data = ECU_RESPONSE_ID.to_be_bytes().to_vec();
         data.extend_from_slice(&bytes);
         let ready_at = Instant::now() + Duration::from_millis(exchange.delay_ms.into());
         let Some(channel) = self.channels.get_mut(&channel_id) else {
-            return;
+            return Ok(());
         };
+        // The ECU answered on the bus, but the device discards a frame no filter lets in.
+        if !channel.receives(ECU_RESPONSE_ID) {
+            return Ok(());
+        }
         let at = channel.rx.partition_point(|p| p.ready_at <= ready_at);
         channel.rx.insert(
             at,
@@ -237,6 +302,7 @@ impl Bus {
                 data,
             },
         );
+        Ok(())
     }
 }
 
@@ -266,15 +332,43 @@ fn reset(config: EcuConfig) {
 
 /// Side-effect-free function the worker calls right after loading (7.3).
 /// If the ABI interpretation is wrong, this surfaces as garbage values or a crash.
+///
+/// # Safety
+/// Each pointer must be null or valid for a write of 80 bytes, the buffer size J2534-1 gives.
 #[unsafe(no_mangle)]
-pub extern "C" fn PassThruReadVersion(
-    _device_id: PassThruUlong,
-    _firmware_version: *mut c_char,
-    _dll_version: *mut c_char,
-    _api_version: *mut c_char,
+pub unsafe extern "C" fn PassThruReadVersion(
+    device_id: PassThruUlong,
+    firmware_version: *mut c_char,
+    dll_version: *mut c_char,
+    api_version: *mut c_char,
 ) -> PassThruUlong {
-    // TODO: write fixed strings (the caller's buffers are 80 bytes).
+    if !lock().device_ok(device_id) {
+        return ERR_INVALID_DEVICE_ID;
+    }
+    if firmware_version.is_null() || dll_version.is_null() || api_version.is_null() {
+        return ERR_NULL_PARAMETER;
+    }
+    // SAFETY: checked for null above; the caller guarantees 80 writable bytes each.
+    unsafe {
+        write_c_string(firmware_version, FIRMWARE_VERSION);
+        write_c_string(dll_version, DLL_VERSION);
+        write_c_string(api_version, API_VERSION);
+    }
     STATUS_NOERROR
+}
+
+/// Writes `text` NUL-terminated, cut to the 80-byte buffers of the J2534 string outputs.
+///
+/// # Safety
+/// `out` must be valid for a write of 80 bytes.
+unsafe fn write_c_string(out: *mut c_char, text: &str) {
+    const BUFFER: usize = 80;
+    let bytes = &text.as_bytes()[..text.len().min(BUFFER - 1)];
+    // SAFETY: the caller guarantees `BUFFER` writable bytes; at most that many are written.
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr().cast::<c_char>(), out, bytes.len());
+        out.add(bytes.len()).write(0);
+    }
 }
 
 /// Opens the simulated device and, on the first open of the process, powers up the ECU with the
@@ -342,13 +436,7 @@ pub unsafe extern "C" fn PassThruConnect(
     }
     let id = bus.next_channel;
     bus.next_channel += 1;
-    bus.channels.insert(
-        id,
-        Channel {
-            protocol_id,
-            rx: VecDeque::new(),
-        },
-    );
+    bus.channels.insert(id, Channel::new(protocol_id));
     // SAFETY: checked for null above; the caller guarantees it is writable.
     unsafe { channel_id.write(id) };
     STATUS_NOERROR
@@ -470,7 +558,9 @@ pub unsafe extern "C" fn PassThruWriteMsgs(
         if !(CAN_ID_LEN + 1..=MAX_MSG_DATA).contains(&size) {
             break ERR_INVALID_MSG;
         }
-        bus.transmit(channel_id, &msg.data[..size]);
+        if let Err(status) = bus.transmit(channel_id, &msg.data[..size]) {
+            break status;
+        }
         sent += 1;
     };
     // SAFETY: as above.
@@ -479,6 +569,147 @@ pub unsafe extern "C" fn PassThruWriteMsgs(
         notify();
     }
     status
+}
+
+/// Starts a flow-control filter, the only filter type ISO 15765 channels take (J2534-1 7.2.9).
+/// The simulator supports normal 11-bit addressing, so each message is a 4-byte CAN ID; the
+/// mask must select the whole ID. A channel then receives only from pattern IDs and sends
+/// segmented messages only to flow-control IDs of its filters.
+///
+/// # Safety
+/// The message pointers must be null or valid for reads, and `filter_id` null or valid for a
+/// write.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PassThruStartMsgFilter(
+    channel_id: PassThruUlong,
+    filter_type: PassThruUlong,
+    mask: *const PassThruMsg,
+    pattern: *const PassThruMsg,
+    flow_control: *const PassThruMsg,
+    filter_id: *mut PassThruUlong,
+) -> PassThruUlong {
+    let mut bus = lock();
+    let Some(channel) = bus.channels.get_mut(&channel_id) else {
+        return ERR_INVALID_CHANNEL_ID;
+    };
+    if filter_type != filter::FLOW_CONTROL_FILTER as PassThruUlong {
+        return ERR_INVALID_FILTER_ID;
+    }
+    if mask.is_null() || pattern.is_null() || flow_control.is_null() || filter_id.is_null() {
+        return ERR_NULL_PARAMETER;
+    }
+    // SAFETY: checked for null above; the caller guarantees they are readable.
+    let (mask, pattern, flow_control) = unsafe { (&*mask, &*pattern, &*flow_control) };
+    let messages = [mask, pattern, flow_control];
+    if messages
+        .iter()
+        .any(|m| m.protocol_id != channel.protocol_id)
+    {
+        return ERR_MSG_PROTOCOL_ID;
+    }
+    if messages
+        .iter()
+        .any(|m| m.data_size != mask.data_size || m.tx_flags != mask.tx_flags)
+    {
+        return ERR_INVALID_MSG;
+    }
+    if mask.tx_flags & tx_flag::TX_FLAG_ISO15765_ADDR_TYPE as PassThruUlong != 0 {
+        // Extended addressing.
+        return ERR_NOT_SUPPORTED;
+    }
+    if mask.data_size as usize != CAN_ID_LEN || mask.data[..CAN_ID_LEN] != [0xFF; CAN_ID_LEN] {
+        return ERR_INVALID_MSG;
+    }
+    let id = |m: &PassThruMsg| u32::from_be_bytes([m.data[0], m.data[1], m.data[2], m.data[3]]);
+    let new = FlowControlFilter {
+        pattern: id(pattern),
+        flow_control: id(flow_control),
+    };
+    // Pattern and flow-control IDs must not appear in another filter; a filter may use one ID
+    // for both, to receive functionally addressed single frames.
+    if channel.filters.values().any(|f| {
+        [f.pattern, f.flow_control].contains(&new.pattern)
+            || [f.pattern, f.flow_control].contains(&new.flow_control)
+    }) {
+        return ERR_NOT_UNIQUE;
+    }
+    if channel.filters.len() >= MAX_FILTERS {
+        return ERR_EXCEEDED_LIMIT;
+    }
+    let id = channel.next_filter;
+    channel.next_filter += 1;
+    channel.filters.insert(id, new);
+    // SAFETY: checked for null above; the caller guarantees it is writable.
+    unsafe { filter_id.write(id) };
+    STATUS_NOERROR
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn PassThruStopMsgFilter(
+    channel_id: PassThruUlong,
+    filter_id: PassThruUlong,
+) -> PassThruUlong {
+    let mut bus = lock();
+    let Some(channel) = bus.channels.get_mut(&channel_id) else {
+        return ERR_INVALID_CHANNEL_ID;
+    };
+    match channel.filters.remove(&filter_id) {
+        Some(_) => STATUS_NOERROR,
+        None => ERR_INVALID_FILTER_ID,
+    }
+}
+
+/// Periodic messages are not simulated.
+#[unsafe(no_mangle)]
+pub extern "C" fn PassThruStartPeriodicMsg(
+    channel_id: PassThruUlong,
+    _msg: *const PassThruMsg,
+    _msg_id: *mut PassThruUlong,
+    _interval: PassThruUlong,
+) -> PassThruUlong {
+    if !lock().channels.contains_key(&channel_id) {
+        return ERR_INVALID_CHANNEL_ID;
+    }
+    ERR_NOT_SUPPORTED
+}
+
+/// No periodic message can exist, so every ID is invalid.
+#[unsafe(no_mangle)]
+pub extern "C" fn PassThruStopPeriodicMsg(
+    channel_id: PassThruUlong,
+    _msg_id: PassThruUlong,
+) -> PassThruUlong {
+    if !lock().channels.contains_key(&channel_id) {
+        return ERR_INVALID_CHANNEL_ID;
+    }
+    ERR_INVALID_MSG_ID
+}
+
+/// The simulated device has no programmable pins; any request on an open device succeeds.
+#[unsafe(no_mangle)]
+pub extern "C" fn PassThruSetProgrammingVoltage(
+    device_id: PassThruUlong,
+    _pin: PassThruUlong,
+    _voltage: PassThruUlong,
+) -> PassThruUlong {
+    if !lock().device_ok(device_id) {
+        return ERR_INVALID_DEVICE_ID;
+    }
+    STATUS_NOERROR
+}
+
+/// Writes [`LAST_ERROR_TEXT`]: the simulator keeps no error descriptions.
+///
+/// # Safety
+/// `description` must be null or valid for a write of 80 bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PassThruGetLastError(description: *mut c_char) -> PassThruUlong {
+    if description.is_null() {
+        return ERR_NULL_PARAMETER;
+    }
+    // SAFETY: checked for null above; the caller guarantees 80 writable bytes.
+    unsafe { write_c_string(description, LAST_ERROR_TEXT) };
+    STATUS_NOERROR
 }
 
 #[unsafe(no_mangle)]

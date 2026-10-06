@@ -16,7 +16,33 @@ below refer to SAE J2534-1 (v04.04).
   restart starts a fresh ECU.
 - `PassThruConnect` accepts `ISO15765` with 11-bit CAN IDs only; any other protocol, or the
   29-bit ID flag, gets `ERR_NOT_SUPPORTED`. Channel IDs count up from 1. `PassThruClose` drops
-  every channel together with its unread responses; `PassThruDisconnect` drops one.
+  every channel together with its filters and unread responses; `PassThruDisconnect` drops one.
+- All 14 J2534 v04.04 functions are exported, so `j2534-0404-service` loads the library like a
+  vendor's. `PassThruReadVersion` reports firmware `NGR-SIM 1.0`, DLL `sim-vci <crate version>`
+  and API `04.04` on an open device. `PassThruGetLastError` always reports a fixed text: the
+  simulator keeps no error descriptions. `PassThruSetProgrammingVoltage` accepts any request on
+  an open device, since no pins are simulated. Periodic messages are not simulated:
+  `PassThruStartPeriodicMsg` returns `ERR_NOT_SUPPORTED`, and `PassThruStopPeriodicMsg`
+  `ERR_INVALID_MSG_ID`.
+
+## Filters
+
+ISO 15765 channels follow clause 7.2.9 and Appendix A for flow-control filters:
+
+- Only `FLOW_CONTROL_FILTER` is accepted; `PASS_FILTER` and `BLOCK_FILTER` get
+  `ERR_INVALID_FILTER_ID`.
+- The mask, pattern and flow-control messages must have the same size and TxFlags, and the mask
+  must select the whole 4-byte CAN ID (`ERR_INVALID_MSG` otherwise). Extended addressing is not
+  simulated (`ERR_NOT_SUPPORTED`).
+- A pattern or flow-control ID already used by another filter of the channel gets
+  `ERR_NOT_UNIQUE`; one filter may use the same ID for both. A channel takes ten filters, the
+  minimum the clause asks for (`ERR_EXCEEDED_LIMIT` beyond).
+- A response enters the receive queue only if a filter's pattern ID is the response's CAN ID.
+  The ECU still answers on the bus without one, so a later filter does not bring back a missed
+  response.
+- A request longer than a single frame (more than 7 payload bytes) needs a filter whose
+  flow-control ID is the request's CAN ID; without one it is not sent and the write returns
+  `ERR_NO_FLOW_CONTROL`. Single frames need no filter.
 
 ## Messages
 
@@ -46,8 +72,9 @@ suppressed, silent ECU) never appears, nor does one still being delayed when the
 
 Simplifications:
 
-- No flow-control filter is needed before responses are queued, and no TxDone indications or
-  loopback messages are generated.
+- No TxDone indications or loopback messages are generated, and segmentation itself (flow
+  control frames, separation time) is not simulated: a request or response of any length moves
+  as one message.
 - `RxStatus` is always zero. The timestamp is the moment the response appeared on the bus
   (after its delay), in microseconds since the library was first used.
 
@@ -56,3 +83,10 @@ Simplifications:
 The faults of `sim_ecu::Fault` act on the ECU behind the VCI as described in `sim-ecu`'s document;
 `sim-vci` applies the resulting delay or missing response on the read side. Today they can be
 armed only from `sim-vci`'s own unit tests.
+
+## Tests
+
+`sim-vci`'s unit tests call the exports directly. `j2534-0404-service`'s
+`tests/sim_vci_end_to_end.rs` loads the built cdylib through the real service, launched by
+`worker-host` with the platform's `unsigned long` width (8 bytes on Linux x86_64), and reads the
+VIN over an ISO 15765 link.

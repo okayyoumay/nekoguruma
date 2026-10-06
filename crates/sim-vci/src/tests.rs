@@ -29,6 +29,10 @@ fn setup(config: EcuConfig) -> Fixture {
         unsafe { PassThruConnect(device, ISO15765, 0, 500_000, &mut channel) },
         STATUS_NOERROR
     );
+    assert_eq!(
+        start_filter(channel, ECU_RESPONSE_ID, ECU_PHYSICAL_REQUEST_ID).0,
+        STATUS_NOERROR
+    );
     Fixture {
         _serial: serial,
         channel,
@@ -45,6 +49,38 @@ fn msg(can_id: u32, payload: &[u8]) -> PassThruMsg {
     m.data[..4].copy_from_slice(&can_id.to_be_bytes());
     m.data[4..4 + payload.len()].copy_from_slice(payload);
     m.data_size = (4 + payload.len()) as PassThruUlong;
+    m
+}
+
+/// Starts a flow-control filter receiving from `pattern` and sending to `flow_control`.
+fn start_filter(
+    channel: PassThruUlong,
+    pattern: u32,
+    flow_control: u32,
+) -> (PassThruUlong, PassThruUlong) {
+    let mask = msg_bytes(&[0xFF; 4]);
+    let pattern = msg_bytes(&pattern.to_be_bytes());
+    let flow_control = msg_bytes(&flow_control.to_be_bytes());
+    let mut id = 0;
+    let status = unsafe {
+        PassThruStartMsgFilter(
+            channel,
+            filter::FLOW_CONTROL_FILTER as PassThruUlong,
+            &mask,
+            &pattern,
+            &flow_control,
+            &mut id,
+        )
+    };
+    (status, id)
+}
+
+/// An ISO 15765 message holding exactly `data`.
+fn msg_bytes(data: &[u8]) -> PassThruMsg {
+    let mut m = empty_msg();
+    m.protocol_id = ISO15765;
+    m.data[..data.len()].copy_from_slice(data);
+    m.data_size = data.len() as PassThruUlong;
     m
 }
 
@@ -273,6 +309,10 @@ fn the_ecu_keeps_its_state_across_close_and_open() {
         unsafe { PassThruConnect(device, ISO15765, 0, 500_000, &mut channel) },
         STATUS_NOERROR
     );
+    assert_eq!(
+        start_filter(channel, ECU_RESPONSE_ID, ECU_PHYSICAL_REQUEST_ID).0,
+        STATUS_NOERROR
+    );
     // The old channel and its unread response are gone.
     assert_eq!(read(f.channel, 1, 0).0, ERR_INVALID_CHANNEL_ID);
     write(channel, ECU_PHYSICAL_REQUEST_ID, &[0x22, 0xF1, 0x86]);
@@ -417,4 +457,184 @@ fn timestamps_mark_when_each_response_appeared() {
     // Read together, but the delayed response appeared about 200 ms after the other.
     let gap = buf[1].timestamp.wrapping_sub(buf[0].timestamp);
     assert!((100_000..=200_000).contains(&gap), "gap {gap} us");
+}
+
+/// J2534-1 7.2.9: an ISO 15765 channel receives only what a flow-control filter lets in, and a
+/// segmented request needs a filter whose flow-control ID is the request's.
+#[test]
+fn flow_control_filters_gate_reception_and_segmented_sends() {
+    let f = fixture();
+    let mut channel = 0;
+    assert_eq!(
+        unsafe { PassThruConnect(DEVICE_ID, ISO15765, 0, 500_000, &mut channel) },
+        STATUS_NOERROR
+    );
+    // Without a filter the ECU answers on the bus, but nothing is received.
+    write(channel, ECU_PHYSICAL_REQUEST_ID, &[0x22, 0xF1, 0x86]);
+    assert_eq!(read(channel, 1, 50).0, ERR_BUFFER_EMPTY);
+    // A segmented request is refused without a matching flow-control ID, sent with one.
+    let long = msg(ECU_PHYSICAL_REQUEST_ID, &[0x2E, 0xF1, 0x90, 1, 2, 3, 4, 5]);
+    let mut n = 1;
+    assert_eq!(
+        unsafe { PassThruWriteMsgs(channel, &long, &mut n, 100) },
+        ERR_NO_FLOW_CONTROL
+    );
+    assert_eq!(n, 0);
+    let (status, id) = start_filter(channel, ECU_RESPONSE_ID, ECU_PHYSICAL_REQUEST_ID);
+    assert_eq!(status, STATUS_NOERROR);
+    let mut n = 1;
+    assert_eq!(
+        unsafe { PassThruWriteMsgs(channel, &long, &mut n, 100) },
+        STATUS_NOERROR
+    );
+    assert_eq!(n, 1);
+    assert_eq!(read(channel, 1, 100).0, STATUS_NOERROR);
+    // Stopping the filter stops reception again.
+    assert_eq!(PassThruStopMsgFilter(channel, id), STATUS_NOERROR);
+    assert_eq!(PassThruStopMsgFilter(channel, id), ERR_INVALID_FILTER_ID);
+    write(channel, ECU_PHYSICAL_REQUEST_ID, &[0x22, 0xF1, 0x86]);
+    assert_eq!(read(channel, 1, 50).0, ERR_BUFFER_EMPTY);
+    // The fixture's own channel is unaffected.
+    write(f.channel, ECU_PHYSICAL_REQUEST_ID, &[0x22, 0xF1, 0x86]);
+    assert_eq!(read(f.channel, 1, 100).0, STATUS_NOERROR);
+}
+
+#[test]
+fn flow_control_filters_are_validated() {
+    let f = fixture();
+    let ch = f.channel;
+    let call = |kind: u32, mask: &[u8], pattern: &[u8], flow: &[u8]| {
+        let (mask, pattern, flow) = (msg_bytes(mask), msg_bytes(pattern), msg_bytes(flow));
+        let mut id = 0;
+        unsafe {
+            PassThruStartMsgFilter(ch, kind as PassThruUlong, &mask, &pattern, &flow, &mut id)
+        }
+    };
+    let ff = [0xFF; 4];
+    let id = |v: u32| v.to_be_bytes();
+    let fc = filter::FLOW_CONTROL_FILTER;
+    // Only flow-control filters on ISO 15765.
+    assert_eq!(
+        call(filter::PASS_FILTER, &ff, &id(0x700), &id(0x701)),
+        ERR_INVALID_FILTER_ID
+    );
+    // The mask must select the whole 4-byte CAN ID, and all three messages must match in size.
+    assert_eq!(
+        call(fc, &[0xFF, 0xFF, 0xFF, 0x00], &id(0x700), &id(0x701)),
+        ERR_INVALID_MSG
+    );
+    assert_eq!(
+        call(fc, &[0xFF; 5], &[0, 0, 7, 0, 1], &[0, 0, 7, 1, 1]),
+        ERR_INVALID_MSG
+    );
+    assert_eq!(call(fc, &ff, &[0, 0, 7, 0, 1], &id(0x701)), ERR_INVALID_MSG);
+    // IDs already used by the fixture's filter (7E8 / 7E0) are not unique.
+    assert_eq!(
+        call(fc, &ff, &id(ECU_RESPONSE_ID), &id(0x701)),
+        ERR_NOT_UNIQUE
+    );
+    assert_eq!(
+        call(fc, &ff, &id(0x700), &id(ECU_PHYSICAL_REQUEST_ID)),
+        ERR_NOT_UNIQUE
+    );
+    // Pattern and flow-control IDs may be the same within one filter (functional reception).
+    assert_eq!(call(fc, &ff, &id(0x7DF), &id(0x7DF)), STATUS_NOERROR);
+    // Ten filters per channel; the fixture and the one above use two.
+    for n in 0..8 {
+        assert_eq!(
+            call(fc, &ff, &id(0x600 + n), &id(0x680 + n)),
+            STATUS_NOERROR
+        );
+    }
+    assert_eq!(call(fc, &ff, &id(0x610), &id(0x690)), ERR_EXCEEDED_LIMIT);
+    // Null pointers and unknown channels.
+    let mut id_out = 0;
+    let m = msg_bytes(&ff);
+    assert_eq!(
+        unsafe {
+            PassThruStartMsgFilter(ch, fc as PassThruUlong, &m, &m, ptr::null(), &mut id_out)
+        },
+        ERR_NULL_PARAMETER
+    );
+    assert_eq!(
+        unsafe { PassThruStartMsgFilter(99, fc as PassThruUlong, &m, &m, &m, &mut id_out) },
+        ERR_INVALID_CHANNEL_ID
+    );
+    assert_eq!(PassThruStopMsgFilter(99, 1), ERR_INVALID_CHANNEL_ID);
+}
+
+#[test]
+fn version_and_other_exports() {
+    let f = fixture();
+    let mut fw = [1 as c_char; 80];
+    let mut dll = [1 as c_char; 80];
+    let mut api = [1 as c_char; 80];
+    assert_eq!(
+        unsafe {
+            PassThruReadVersion(
+                DEVICE_ID,
+                fw.as_mut_ptr(),
+                dll.as_mut_ptr(),
+                api.as_mut_ptr(),
+            )
+        },
+        STATUS_NOERROR
+    );
+    let text = |b: &[c_char; 80]| {
+        unsafe { std::ffi::CStr::from_ptr(b.as_ptr()) }
+            .to_str()
+            .unwrap()
+            .to_owned()
+    };
+    assert_eq!(text(&fw), FIRMWARE_VERSION);
+    assert_eq!(text(&dll), DLL_VERSION);
+    assert_eq!(text(&api), API_VERSION);
+    assert_eq!(
+        unsafe { PassThruReadVersion(7, fw.as_mut_ptr(), dll.as_mut_ptr(), api.as_mut_ptr()) },
+        ERR_INVALID_DEVICE_ID
+    );
+    assert_eq!(
+        unsafe {
+            PassThruReadVersion(
+                DEVICE_ID,
+                ptr::null_mut(),
+                dll.as_mut_ptr(),
+                api.as_mut_ptr(),
+            )
+        },
+        ERR_NULL_PARAMETER
+    );
+
+    let mut desc = [1 as c_char; 80];
+    assert_eq!(
+        unsafe { PassThruGetLastError(desc.as_mut_ptr()) },
+        STATUS_NOERROR
+    );
+    assert_eq!(text(&desc), LAST_ERROR_TEXT);
+    assert_eq!(
+        unsafe { PassThruGetLastError(ptr::null_mut()) },
+        ERR_NULL_PARAMETER
+    );
+
+    assert_eq!(
+        PassThruSetProgrammingVoltage(DEVICE_ID, 15, 5000),
+        STATUS_NOERROR
+    );
+    assert_eq!(
+        PassThruSetProgrammingVoltage(7, 15, 5000),
+        ERR_INVALID_DEVICE_ID
+    );
+
+    let m = msg(ECU_PHYSICAL_REQUEST_ID, &[0x3E, 0x80]);
+    let mut msg_id = 0;
+    assert_eq!(
+        PassThruStartPeriodicMsg(f.channel, &m, &mut msg_id, 2000),
+        ERR_NOT_SUPPORTED
+    );
+    assert_eq!(PassThruStopPeriodicMsg(f.channel, 1), ERR_INVALID_MSG_ID);
+    assert_eq!(
+        PassThruStartPeriodicMsg(99, &m, &mut msg_id, 2000),
+        ERR_INVALID_CHANNEL_ID
+    );
+    assert_eq!(PassThruStopPeriodicMsg(99, 1), ERR_INVALID_CHANNEL_ID);
 }

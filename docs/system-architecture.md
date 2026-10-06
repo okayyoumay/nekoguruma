@@ -244,7 +244,8 @@ Covers time-series data, snapshots, and self-diagnostic data.
 - Work record corrections are recorded as operations of `{target, base value, new value, reason, editor}`
 - Annotations are independent records; additions never conflict with each other
 - Only work records need three-way merge, so concurrent-edit conflicts are substantially reduced
-- Time series are chunked by time, and display data is downsampled by min/max
+- Time series are stored as the responses received from the vehicle (records: response bytes, monotonic timestamp, source), chunked by time; signals are decoded from them with the decode plans of the IR that produced the recording (8.2.2), and display data is downsampled by min/max from the decoded signals (ADR-236)
+- Scale for the initial implementation: fastest period 10 ms per request, up to 64 KiB/s of response bytes per monitoring session or acquisition job, and up to 1 hour of time series per acquisition job (ADR-236)
 
 **Retention period**: Determined from both business needs (the statutory retention period for maintenance records) and the personal-data nature of VINs. For deletion requests, job execution records (audit logs) must be retained even if raw data is deleted, so a mechanism is provided to redact only the VIN-containing parts.
 
@@ -279,8 +280,8 @@ The classification of acquired data corresponds to diagnostic data: time series 
 
 Monitoring is display-only, but to meet the need to "keep the waveform from the moment the symptom appeared," a **function to commit any interval as acquired data** is provided.
 
-- **Extraction from ring buffer**: The agent holds samples during monitoring in a ring buffer for a fixed duration. When the user performs a capture operation, the interval going back from that moment is extracted as acquired data (the trigger can be applied after the fact)
-- **Retention time**: The default retention time is determined from the VCI profile's minimum update period and the amount of memory. Excess is discarded oldest first
+- **Extraction from ring buffer**: The agent holds the received records (4.3) during monitoring in a ring buffer for a fixed duration. When the user performs a capture operation, the interval going back from that moment is extracted as acquired data (the trigger can be applied after the fact)
+- **Retention time**: The default retention time is determined from the VCI profile's minimum update period and the amount of memory, up to 10 minutes (ADR-236). Excess is discarded oldest first
 - **Treated the same as acquired data**: The captured interval is immutable as raw data and uploaded via the same path as ordinary acquired data. Not editable; annotations only (4.3)
 - **Metadata**: Records the capture operation time, the extracted interval, the path (WebRTC direct / via server), and the measured update interval. Because frames may be dropped on the display-only path, whether samples are missing is also recorded
 - **Automatic capture**: A procedure definition (IR) can instruct capture when a condition is met (e.g., a threshold is exceeded)
@@ -1136,6 +1137,7 @@ The adapter statically declares its delivery style, whether vehicle-side time is
 - Time is taken from a monotonic clock (QPC / `CLOCK_MONOTONIC`), and its correspondence to wall-clock time is recorded only once at session start
 - Each frame carries a sequence number, timestamp and time source
 - When sending backs up, old frames are dropped and the latest values take priority
+- A session is limited to 64 KiB/s of response bytes (ADR-236). When the requested signals exceed it, the agent reports the longer intervals (lower sampling rates) it will use together with the measured achievable interval
 
 ### 10.4 Subscription from Multiple Browsers and Capture Operations
 
@@ -1445,7 +1447,6 @@ Items listed here are limited to those that **cannot be resolved by extension pa
 
 | # | Item | Impact | Notes |
 |---|---|---|---|
-| P1 | Scale of time-series data (sampling period, capture duration, channel count) | Raw data storage format, downsampling implementation | Version the chunk format so that migration to a columnar format is possible later |
 | P2 | Support for Windows on ARM | Adding a worker ABI | Adding a worker build target requires a core update. Availability of vendor ARM64 native drivers is a prerequisite |
 | P4 | Whether there are quirks VCI profiles cannot absorb | Premise of the extension model | If a quirk that cannot be expressed declaratively is found, a core change is needed. First consider whether it can be generalized as a profile item (9.3) |
 | P5 | Quantifying non-functional requirements | Entire system | Availability target, screen response time and concurrency caps are undecided. Configuration by scale (Section 15) only shows the approach |

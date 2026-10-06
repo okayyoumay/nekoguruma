@@ -185,8 +185,11 @@ responsible for them, in the same way that business screens are theirs (design 9
       and the ECU is now in its programming session, where those reads may not be available.
       Each state checked here must come from a source the procedure declares usable in the
       programming session (a service the ECU answers in that session, or a runtime input from
-      the VCI or the agent); a procedure that allows a restart without such a source for every
-      one of them is rejected when it is loaded, not discovered at the erase boundary. If any
+      the VCI or the agent), while the full check at the start of step 4 runs in the default
+      session and needs a source usable there; the procedure may declare one source for both or
+      a separate one for each session. A procedure that allows a restart without a usable source
+      for every checked state in both sessions is rejected when it is loaded, not discovered
+      during recovery. If any
       check fails, the job does not erase and ends in `OnSiteInterventionRequired`, reporting
       the failed condition. Then erase and RequestDownload.
    A handover to another device (8.2.5) follows the same order. The receiving agent holds
@@ -251,8 +254,8 @@ responsible for them, in the same way that business screens are theirs (design 9
   number, the software version and the engine, vehicle-speed and ignition states that the
   declared safety preconditions test, each with the value or range that satisfies it (these
   identifiers can be OEM-specific; a state that is not read from the ECU comes from a runtime
-  input instead, as the external supply does, and the mapping says whether each source is
-  usable in the programming session, for the second check of item 2 step 4), nor the recovery boundaries of each flash
+  input instead, as the external supply does, and the mapping gives each state a source for the default session and one for the
+  programming session, which may be the same, for the two checks of item 2 step 4), nor the recovery boundaries of each flash
   session: where the replayable steps leading up to the erase begin, where the erase begins,
   where RequestTransferExit is sent and where the procedure's post-transfer steps end, so the
   runtime replays exactly the pre-erase range, checks the preconditions again at the erase

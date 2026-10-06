@@ -61,7 +61,9 @@ impl LinkConfig {
             }
         }
         if self.tx_id > MAX_CAN_ID || self.rx_id > MAX_CAN_ID {
-            return Err(HostError::Setup("a CAN ID does not fit 29 bits"));
+            return Err(HostError::Setup(
+                "only 11-bit CAN IDs are supported: the link does not set the ID format yet",
+            ));
         }
         Ok(())
     }
@@ -80,7 +82,9 @@ impl LinkConfig {
 
 /// Longest timing the worker's microsecond ComParams can hold.
 pub const MAX_TIMING_MS: u32 = u32::MAX / 1_000;
-const MAX_CAN_ID: u32 = 0x1FFF_FFFF;
+/// 11-bit IDs only: a 29-bit ID needs `CP_CanPhysReqFormat` / `CP_CanRespUSDTFormat`, which
+/// `open` does not set yet.
+const MAX_CAN_ID: u32 = 0x7FF;
 
 /// Where the response code sits in a negative response: `7F`, SID, code.
 const RC_BYTE_OFFSET: u32 = 2;

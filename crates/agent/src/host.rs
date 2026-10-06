@@ -310,7 +310,7 @@ impl Progress {
 /// A negative response with code 0x78 (requestCorrectlyReceived-ResponsePending, ISO 14229-1:2026
 /// annex A.1).
 fn is_response_pending(response: &[u8]) -> bool {
-    matches!(response, [0x7F, _, 0x78])
+    matches!(response, [0x7F, _, 0x78, ..])
 }
 
 impl DiagHost for WorkerHost {
@@ -440,7 +440,7 @@ mod tests {
         good.validate().unwrap();
         LinkConfig {
             p2_max_ms: crate::link::MAX_TIMING_MS,
-            tx_id: 0x1FFF_FFFF,
+            tx_id: 0x7FF,
             ..good.clone()
         }
         .validate()
@@ -462,8 +462,13 @@ mod tests {
                 rc78_completion_ms: crate::link::MAX_TIMING_MS + 1,
                 ..good.clone()
             },
+            // 29-bit IDs need the ID format set on the link, which it does not do yet.
             LinkConfig {
-                rx_id: 0x2000_0000,
+                rx_id: 0x800,
+                ..good.clone()
+            },
+            LinkConfig {
+                tx_id: 0x18DA_10F1,
                 ..good.clone()
             },
         ] {
@@ -603,6 +608,7 @@ mod tests {
         assert!(matches!(
             outcome(vec![
                 event(Some(COP), result(&[0x7F, 0x22, 0x78])),
+                event(Some(COP), result(&[0x7F, 0x22, 0x78, 0x00])),
                 event(Some(COP), status(PduComPrimitiveStatus::PduCopstFinished)),
             ]),
             Some(Err(HostError::NoResponse))

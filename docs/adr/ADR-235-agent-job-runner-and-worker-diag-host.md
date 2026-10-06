@@ -41,7 +41,7 @@ The worker client sets no deadline on unary calls, so a wedged worker would bloc
    - protocol short name, baud rate, physical request and response CAN identifiers;
    - P2, P2* and the 0x78 completion timeout. The IR `Protocol` table does not carry these timings yet.
 
-   `LinkConfig::validate` refuses a zero timing (the worker reads it as "no limit", or as a 0x78 window that ends at once), a timing that does not fit the worker's microsecond ComParams, and a CAN identifier above 29 bits. `link::open` then runs the usage sequence of `docs/rpc-api-guide.md` before step 0:
+   `LinkConfig::validate` refuses a zero timing (the worker reads it as "no limit", or as a 0x78 window that ends at once), a timing that does not fit the worker's microsecond ComParams, and a CAN identifier above 11 bits: a 29-bit identifier needs the ID format ComParams, which the link does not set yet. `link::open` then runs the usage sequence of `docs/rpc-api-guide.md` before step 0:
    - GetModuleIds, ModuleConnect and GetResourceIds for the protocol, then CreateComLogicalLink. The worker must report exactly one module: choosing among several VCIs on one worker is not supported yet, so the link is refused rather than opened on whichever module comes first;
    - SetComParam for the baud rate and timings, with ComParam IDs resolved through GetObjectId;
    - SetUniqueRespIdTable with the two identifiers, which makes the J2534 service install the flow-control filter (ADR-234);

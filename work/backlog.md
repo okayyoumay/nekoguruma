@@ -37,7 +37,7 @@ Workspace skeleton (step 1): every crate goes as far as type and boundary defini
 
 ## Data model (`db/`)
 
-- **P2**: Partition granularity: monthly is assumed; finalize once scale is decided. Blocked on: design 17 P1 and P5.
+- **P2**: Partition granularity: monthly is assumed; finalize once the non-functional targets are decided (design 17 P1 is settled by ADR-236). Blocked on: design 17 P5.
 - **P2**: `vehicle_locks` expiry: derive the default for `expires_at` from the expected duration of each job kind.
 - **P2**: `retain_until` logic for the statutory retention period of maintenance records. Blocked on: design 17 P7.
 - **P2**: `ir_documents` lookup has only a GIN index on part numbers. ECU-VARIANT-PATTERN matching happens on the agent side; verify with real data whether this is enough server-side filtering.

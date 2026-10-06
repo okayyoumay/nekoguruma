@@ -296,7 +296,11 @@ responsible for them, in the same way that business screens are theirs (design 9
   (design 5.3) keys on the job ID and the ownership generation together, so when ownership
   returns to a device that ran the job before, the newly signed instruction under the higher
   generation is accepted as a new command, while a resent instruction of the same or an
-  earlier generation is still ignored as a duplicate. Fencing by operator confirmation was chosen over a time-limited lease
+  earlier generation is still ignored as a duplicate. The recovery journal is keyed the same
+  way: a device that gets the job back starts a new journal for the new generation from the
+  checkpoint summary the handover carries, like any receiving device, and never resumes from
+  its own journal of the earlier generation, whose facts (such as a missing RequestTransferExit
+  marker) may be out of date; that old journal is kept only to be uploaded for audit. Fencing by operator confirmation was chosen over a time-limited lease
   renewed during the write, because a lease would make every write on a server-connected
   device, the first run included, depend on the network for its whole duration and rule out
   starting a write offline (design 5.7). An agent without a configured server has no handover

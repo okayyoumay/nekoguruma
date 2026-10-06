@@ -317,7 +317,7 @@ Channels are separated so that bulk transfers do not clog the control channel. F
 
 ### 5.3 Handling Disconnections
 
-- Commands are idempotent. The agent ACKs receipt, records the job ID and the ownership generation (ADR-229) in the journal, and ignores duplicates: a command whose job ID it has recorded under the same or a later generation
+- Commands are idempotent. The agent ACKs receipt, records the job ID and the ownership generation (ADR-229) in the journal, and ignores duplicates: a command whose job ID it has recorded under the same or a later generation; recovery state is likewise journaled per job ID and generation, so a device that gets a job back recovers from the handover's checkpoint summary, not from its older journal
 - Jobs have a start deadline; expired commands are not executed but reported
 - Events are delivered reliably via a sequence-numbered Outbox; the server deduplicates by "agent ID + sequence number"
 - On reconnection, the state of incomplete jobs is reconciled (not everything is resent; see 15.1 for scale-specific handling). Reconnection uses exponential backoff + jitter

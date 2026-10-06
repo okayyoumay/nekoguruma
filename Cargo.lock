@@ -1634,6 +1634,7 @@ name = "sim-vci"
 version = "0.1.0"
 dependencies = [
  "j2534-defs",
+ "serde_json",
  "sim-ecu",
 ]
 

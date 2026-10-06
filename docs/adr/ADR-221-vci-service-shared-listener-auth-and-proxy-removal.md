@@ -1,7 +1,7 @@
 # ADR-221: `vci-service`'s Shared gRPC Listener Gains Bearer-Token Auth and gRPC-Web; `vci-service-manager`'s Proxy Is Removed
 
 **Date:** 2026-09-09
-**Status:** Accepted (Decision item 7's route-preservation for `DELETE /vci-libs/{id}/endpoint` superseded by ADR-225, which removes that route entirely; Consequences' native-client-enrollment and unauthenticated-admin-route accepted residuals closed by ADR-226)
+**Status:** Accepted (Decision item 7's route-preservation for `DELETE /vci-libs/{id}/endpoint` superseded by ADR-225, which removes that route entirely; Consequences' native-client-enrollment and unauthenticated-admin-route accepted residuals closed by ADR-226; manager-side token minting (Decision paragraph and Mechanism item 6) superseded for the agent by ADR-231, which mints tokens in-process)
 **Affects:** `vci-service-launcher` (`vci_server.rs`, `jsonrpc/dispatch.rs`), `vci-service-manager` main (spawn, routing, `InstanceStatus`), `docs/QUICKSTART.md`, `docs/worker-crates.md`, `docs/glossary.md`, `docs/rpc-api-guide.md`, `vci-service-manager/docs/implementation-notes.md`, `docs/adr/ADR-220-vci-service-manager-grpc-endpoint-selection.md`, `docs/adr/INDEX.md`
 
 ## Context

@@ -2,8 +2,9 @@
 //!
 //! The worker's listener accepts only bearer tokens signed with the per-instance key the agent
 //! provisioned over stdin (ADR-221). [`BearerAuth`] mints a fresh token from that key for every
-//! call, so a long-lived client never presents an expired token and the key itself never leaves
-//! the agent process.
+//! call, so a long-lived client never presents an expired token. The key is held only by the agent
+//! and the worker it was provisioned to; it never travels over the gRPC socket. The agent is
+//! both the key holder and the only client, so it mints its own tokens (ADR-231).
 
 use std::time::{Duration, SystemTime};
 
@@ -95,21 +96,25 @@ pub enum ConnectError {
 
 /// Connects to the first reachable endpoint in `endpoints` (as reported by `get_status`, e.g.
 /// `127.0.0.1:54321` or `[::1]:54321`) and authenticates every call with tokens minted from
-/// `key`.
+/// `key`. A malformed or unreachable entry is skipped; if none connects, the error of the last
+/// entry is returned.
 pub async fn connect(
     endpoints: &[String],
     key: [u8; 32],
     options: &ConnectOptions,
 ) -> Result<WorkerClient, ConnectError> {
-    let mut last_error = None;
+    let mut last_error = ConnectError::NoEndpoint;
     for endpoint in endpoints {
-        let uri = format!("http://{endpoint}");
-        let channel = Endpoint::from_shared(uri)
-            .map_err(|source| ConnectError::InvalidEndpoint {
-                endpoint: endpoint.clone(),
-                source,
-            })?
-            .connect_timeout(options.connect_timeout);
+        let channel = match Endpoint::from_shared(format!("http://{endpoint}")) {
+            Ok(channel) => channel.connect_timeout(options.connect_timeout),
+            Err(source) => {
+                last_error = ConnectError::InvalidEndpoint {
+                    endpoint: endpoint.clone(),
+                    source,
+                };
+                continue;
+            }
+        };
         match channel.connect().await {
             Ok(channel) => {
                 return Ok(VciServiceClient::with_interceptor(
@@ -117,13 +122,15 @@ pub async fn connect(
                     BearerAuth::new(key, TOKEN_SUBJECT),
                 ));
             }
-            Err(source) => last_error = Some((endpoint.clone(), source)),
+            Err(source) => {
+                last_error = ConnectError::Unreachable {
+                    endpoint: endpoint.clone(),
+                    source,
+                }
+            }
         }
     }
-    match last_error {
-        Some((endpoint, source)) => Err(ConnectError::Unreachable { endpoint, source }),
-        None => Err(ConnectError::NoEndpoint),
-    }
+    Err(last_error)
 }
 
 impl WorkerProcess {
@@ -165,6 +172,22 @@ mod tests {
         assert!(matches!(
             connect(&[], KEY, &ConnectOptions::default()).await,
             Err(ConnectError::NoEndpoint)
+        ));
+    }
+
+    #[tokio::test]
+    async fn connect_skips_a_malformed_endpoint() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoints = [
+            "not a valid authority".to_owned(),
+            listener.local_addr().unwrap().to_string(),
+        ];
+        connect(&endpoints, KEY, &ConnectOptions::default())
+            .await
+            .expect("the second, reachable endpoint should be used");
+        assert!(matches!(
+            connect(&endpoints[..1], KEY, &ConnectOptions::default()).await,
+            Err(ConnectError::InvalidEndpoint { .. })
         ));
     }
 

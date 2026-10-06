@@ -28,7 +28,7 @@ The agent starts one service process per library, built for the library's ABI (d
 hands it a per-instance key over stdin. The gRPC listener binds to loopback only and accepts only
 bearer tokens signed with that key (ADR-052, ADR-221). The agent's client (`worker-host`'s
 `client` module) mints a fresh token from the key for every call; the token format is defined once
-in `vci-service-interface` (`token` module), which both the client and the listener use.
+in `vci-service-interface` (`token` module), which both the client and the listener use (ADR-231).
 
 | Layer | ISO 22900 | J2534 v04.04 | Shared |
 |---|---|---|---|

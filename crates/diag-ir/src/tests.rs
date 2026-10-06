@@ -97,9 +97,9 @@ impl DiagHost for MockHost {
     ) -> Result<Option<Vec<u8>>, MockError> {
         self.calls.push(format!("record {template:02x?}"));
         self.inquiries.push(inquiry);
-        if let Some(answer) = self.records.pop_front() {
+        if !self.records.is_empty() {
             self.fail()?;
-            return Ok(answer);
+            return Ok(self.records.pop_front().flatten());
         }
         self.response().map(Some)
     }
@@ -1010,7 +1010,7 @@ fn resumed_state_is_checked() {
     let mut vm = Vm::resume(state.clone());
     assert!(matches!(
         vm.step(&program, &mut MockHost::default()),
-        Err(StepError::Vm(VmError::BadPc(999)))
+        Err(StepError::Vm(VmError::BadReturnPc(999)))
     ));
     assert_eq!(vm.state, state);
 
@@ -1041,13 +1041,29 @@ fn resumed_state_is_checked() {
         call_stack: vec![frame(1), frame(3)],
         ..base.clone()
     };
+    // The damaged frame is not the top one, so `Ret` would not reach it for a while.
+    let bad_lower_return = VmState {
+        call_stack: vec![frame(3), frame(1)],
+        ..base.clone()
+    };
+    // A finished state that breaks an invariant is refused, not reported finished.
+    let finished_oversized = VmState {
+        stack: vec![Value::I64(0); MAX_STACK + 1],
+        pc: 2,
+        ..base.clone()
+    };
     for (state, expected) in [
         (oversized_stack, VmError::StackOverflow),
         (deep_calls, VmError::CallDepthExceeded),
-        (bad_return, VmError::BadPc(3)),
+        (bad_return, VmError::BadReturnPc(3)),
+        (bad_lower_return, VmError::BadReturnPc(3)),
+        (finished_oversized, VmError::StackOverflow),
     ] {
         let before = postcard::to_allocvec(&state).unwrap();
         let mut vm = Vm::resume(state);
+        // The runner sees the refusal before it journals anything for the instruction.
+        assert_eq!(vm.check_state(&primitive), Err(expected.clone()));
+        assert_eq!(vm.current_op(&primitive), Err(expected.clone()));
         let mut host = MockHost {
             forbidden: true,
             ..MockHost::default()
@@ -1167,25 +1183,51 @@ fn unusual_values_round_trip() {
     assert!(zero.is_sign_negative());
 }
 
-/// Record template input is a kind of HMI request (4.3.1): it waits without blocking and keeps
-/// its inquiry while the operator has not answered.
+/// Record template input is a kind of HMI request (4.3.1): it waits without blocking, keeps its
+/// inquiry while the operator has not answered, and gets a new one when reached again.
 #[test]
 fn record_input_waits_for_the_operator() {
-    let program = prog(vec![Op::RecordInput { template: 0 }], vec![b"tpl".to_vec()]);
+    // Two passes over one RecordInput, each answered on the second poll.
+    let code = vec![
+        i(0),
+        Op::StoreGlobal(0),
+        Op::RecordInput { template: 0 }, // 2
+        Op::Pop,
+        Op::LoadGlobal(0),
+        i(1),
+        Op::Add,
+        Op::Dup,
+        Op::StoreGlobal(0),
+        i(2),
+        Op::CmpLt,
+        Op::JumpIfFalse(13),
+        Op::Jump(2),
+    ];
+    let program = prog(code, vec![b"tpl".to_vec()]);
     let mut vm = Vm::new(&program);
     let mut host = MockHost {
-        records: VecDeque::from([None, None, Some(b"42".to_vec())]),
+        records: VecDeque::from([None, Some(b"a".to_vec()), None, Some(b"b".to_vec())]),
         ..MockHost::default()
     };
-    let before = postcard::to_allocvec(&vm.state).unwrap();
-    for _ in 0..2 {
-        assert_eq!(
-            vm.step(&program, &mut host).unwrap(),
-            StepOutcome::Waiting(WaitingOn::Hmi)
-        );
-        assert_eq!(postcard::to_allocvec(&vm.state).unwrap(), before);
+    let mut waits = 0;
+    loop {
+        let before = postcard::to_allocvec(&vm.state).unwrap();
+        match vm.step(&program, &mut host).unwrap() {
+            StepOutcome::Continue => {}
+            StepOutcome::Finished => break,
+            StepOutcome::Waiting(on) => {
+                assert_eq!(on, WaitingOn::Hmi);
+                assert_eq!(postcard::to_allocvec(&vm.state).unwrap(), before);
+                waits += 1;
+            }
+        }
     }
-    assert_eq!(vm.step(&program, &mut host).unwrap(), StepOutcome::Finished);
-    assert_eq!(vm.state.stack, [Value::Bytes(b"42".to_vec())]);
-    assert_eq!(host.inquiries, [0, 0, 0]);
+    assert_eq!(waits, 2);
+    let q = &host.inquiries;
+    assert_eq!(q.len(), 4);
+    assert!(
+        q[0] == q[1] && q[2] == q[3] && q[0] != 0 && q[0] < q[2],
+        "{q:?}"
+    );
+    assert!(host.records.is_empty());
 }

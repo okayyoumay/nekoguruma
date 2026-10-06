@@ -293,13 +293,58 @@ impl Vm {
 
     /// The instruction the next [`Vm::step`] executes, or `None` when the program has finished.
     /// The job runner uses it to journal an intent marker before a primitive is sent (ADR-229).
+    ///
+    /// It fails exactly when [`Vm::step`] would refuse the state, so the runner never journals
+    /// an intent for an instruction that will not run.
     pub fn current_op<'p>(&self, program: &'p Program) -> Result<Option<&'p Op>, VmError> {
-        let pc = self.state.pc as usize;
-        match pc.cmp(&program.code.len()) {
-            std::cmp::Ordering::Less => Ok(Some(&program.code[pc])),
-            std::cmp::Ordering::Equal => Ok(None),
-            std::cmp::Ordering::Greater => Err(VmError::BadPc(self.state.pc)),
+        self.check_state(program)?;
+        Ok(program.code.get(self.state.pc as usize))
+    }
+
+    /// Checks everything [`Vm::step`] checks before it runs an instruction (ADR-233), so the
+    /// job runner can validate a state restored from the journal before it acts on it.
+    ///
+    /// A resumed state is not trusted: besides the schema, program size and step counter, this
+    /// checks the invariants the instructions otherwise maintain themselves (stack size, call
+    /// depth, every frame's return position and `pc`), so a damaged or edited journal can
+    /// neither exceed the limits nor jump outside the program. The contents of values and
+    /// variable slots need no check, since every instruction checks the types it uses. A
+    /// finished state that breaks an invariant is refused too, rather than reported finished.
+    pub fn check_state(&self, program: &Program) -> Result<(), VmError> {
+        if program.schema_version != IR_SCHEMA_VERSION {
+            return Err(VmError::SchemaMismatch {
+                program: program.schema_version,
+                runtime: IR_SCHEMA_VERSION,
+            });
         }
+        if self.state.schema_version != program.schema_version {
+            return Err(VmError::StateSchemaMismatch {
+                program: program.schema_version,
+                state: self.state.schema_version,
+            });
+        }
+        // Positions are u32 in the bytecode and the state.
+        if u32::try_from(program.code.len()).is_err() {
+            return Err(VmError::ProgramTooLarge);
+        }
+        if self.state.steps == u64::MAX {
+            return Err(VmError::StepLimit);
+        }
+        if self.state.stack.len() > MAX_STACK {
+            return Err(VmError::StackOverflow);
+        }
+        if self.state.call_stack.len() > MAX_CALL_DEPTH {
+            return Err(VmError::CallDepthExceeded);
+        }
+        for frame in &self.state.call_stack {
+            if frame.return_pc as usize > program.code.len() {
+                return Err(VmError::BadReturnPc(frame.return_pc));
+            }
+        }
+        if self.state.pc as usize > program.code.len() {
+            return Err(VmError::BadPc(self.state.pc));
+        }
+        Ok(())
     }
 
     /// Executes one instruction (ADR-233).
@@ -314,28 +359,6 @@ impl Vm {
         program: &Program,
         host: &mut H,
     ) -> Result<StepOutcome, StepError<H::Error>> {
-        if program.schema_version != IR_SCHEMA_VERSION {
-            return Err(VmError::SchemaMismatch {
-                program: program.schema_version,
-                runtime: IR_SCHEMA_VERSION,
-            }
-            .into());
-        }
-        if self.state.schema_version != program.schema_version {
-            return Err(VmError::StateSchemaMismatch {
-                program: program.schema_version,
-                state: self.state.schema_version,
-            }
-            .into());
-        }
-        // Positions are u32 in the bytecode and the state.
-        if u32::try_from(program.code.len()).is_err() {
-            return Err(VmError::ProgramTooLarge.into());
-        }
-        if self.state.steps == u64::MAX {
-            return Err(VmError::StepLimit.into());
-        }
-        self.check_restored_state(program)?;
         let Some(op) = self.current_op(program)? else {
             return Ok(StepOutcome::Finished);
         };
@@ -429,7 +452,7 @@ impl Vm {
             }
             Op::Ret => {
                 match self.state.call_stack.pop() {
-                    // The return position was checked by `check_restored_state` or `Call`.
+                    // The return position was checked by `check_state` or `Call`.
                     Some(frame) => {
                         self.state.locals = frame.locals;
                         self.state.pc = frame.return_pc;
@@ -554,24 +577,6 @@ impl Vm {
         }
         self.state.pc = next;
         Ok(Executed::Done)
-    }
-
-    /// A resumed state is not trusted (ADR-233): checks the invariants that the instructions
-    /// otherwise maintain themselves, so a state from a damaged or edited journal cannot exceed
-    /// the limits or jump outside the program. `pc` is checked by [`Vm::current_op`]; the
-    /// contents of values and variable slots need no check, since every instruction checks
-    /// the types it uses.
-    fn check_restored_state(&self, program: &Program) -> Result<(), VmError> {
-        if self.state.stack.len() > MAX_STACK {
-            return Err(VmError::StackOverflow);
-        }
-        if self.state.call_stack.len() > MAX_CALL_DEPTH {
-            return Err(VmError::CallDepthExceeded);
-        }
-        for frame in &self.state.call_stack {
-            jump_target(program, frame.return_pc)?;
-        }
-        Ok(())
     }
 
     /// The top `n` values, deepest first, or [`VmError::StackUnderflow`].
@@ -756,6 +761,8 @@ pub enum VmError {
     StepLimit,
     #[error("invalid instruction position: {0}")]
     BadPc(u32),
+    #[error("call frame returns to an invalid position: {0}")]
+    BadReturnPc(u32),
     #[error("stack underflow")]
     StackUnderflow,
     #[error("stack overflow")]

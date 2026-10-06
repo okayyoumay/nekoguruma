@@ -35,6 +35,7 @@ No IR programs, transpiler or journals existed when this was decided, so `VmStat
 3. **The caller journals.**
    - `DiagHost::checkpoint` is removed. A checkpoint written inside `step` would either come after the state advanced (a failed write would break item 1) or be unable to precede the request (ADR-229's intent markers).
    - The runner writes the journal around `step`, using two helpers. `Vm::current_op` shows the next instruction before it runs. `Op::is_diagnostic_primitive` tells whether that instruction goes to the host.
+   - `Vm::current_op` fails exactly when `step` would refuse the state (item 9), so the runner never journals an intent marker for a request that is not sent. `Vm::check_state` runs the same checks on their own, so the runner can validate a state restored from the journal before it starts any recovery that touches the ECU.
    - `VmState::checkpoint` and `resume_count` are left to the write-job journal.
 4. **Waits are a step outcome.**
    - `hmi_request` and `security_access` return `Ok(None)` while no answer has arrived (8.2.5 lists both as waits while the server is unreachable). `step` then returns `StepOutcome::Waiting(WaitingOn::Hmi | WaitingOn::SeedKey)` without changing the state.
@@ -60,12 +61,19 @@ No IR programs, transpiler or journals existed when this was decided, so `VmStat
    - Primitives that return data push it as `Bytes`.
    - HMI forms, record templates and log messages are constant-pool indexes. A log message must be valid UTF-8, because the server's dry run at ingestion (12.1) should find a bad constant, not the vehicle.
 8. **Limits.** The operand stack holds at most 1024 values (`MAX_STACK`) and calls nest at most 64 deep (`MAX_CALL_DEPTH`). `step` has no step budget; the runner owns the loop. `VmState::steps` counts completed instructions across resumption, for audit (8.2.3) and for any limit the runner enforces.
-9. **Checks before each step.**
+9. **Checks before each step.** `Vm::check_state` holds all of them; `step` and `current_op` run it first.
    - `step` refuses a program whose schema version differs from the runtime's (`SchemaMismatch`).
    - It refuses a state whose version differs from the program's (`StateSchemaMismatch`).
    - It refuses a program too long for `u32` positions (`ProgramTooLarge`).
    - It refuses a state whose step counter is exhausted (`StepLimit`).
-   - A resumed state is not trusted. Before any instruction, including a host-calling one, `step` checks the invariants the instructions otherwise maintain themselves. The stack must be within `MAX_STACK`, the call stack within `MAX_CALL_DEPTH`, and every frame's return position inside the program. Together with the `pc` check, a damaged or edited journal can neither exceed the limits nor jump outside the program. Values and variable slots need no check, because every instruction checks the types it uses.
+   - A resumed state is not trusted. Before any instruction, including a host-calling one, `step` checks the invariants the instructions otherwise maintain themselves:
+     - the stack is within `MAX_STACK`;
+     - the call stack is within `MAX_CALL_DEPTH`;
+     - every frame's return position is inside the program (`BadReturnPc`, kept apart from `BadPc` so a damaged frame can be told from a damaged `pc`);
+     - `pc` is inside the program.
+   - A damaged or edited journal therefore can neither break the stack and call-depth limits nor jump outside the program.
+   - A finished state (`pc` at the end) that breaks one of these is refused rather than reported finished.
+   - Values and variable slots need no check, because every instruction checks the types it uses. The length of slot vectors and of `Bytes` values is not bounded on restore either; no instruction relies on it, and the journaled size is a separate open question.
 10. **Encoding.** `Op` and `VmState` are stored with postcard, which encodes an enum variant by its index. The order of `Op`'s variants is therefore part of the stored format, and a test pins it. `Op::is_diagnostic_primitive` is an exhaustive match, so a new instruction cannot be added without classifying it.
 
 ## Consequences

@@ -1,5 +1,5 @@
 ---
-applyTo: "**/*.rs,**/*.proto,**/*.h,**/Cargo.toml,**/build.rs"
+applyTo: "**/*.rs,**/*.proto,**/*.h,**/Cargo.toml,**/build.rs,docs/worker-crates.md,.github/workflows/**"
 ---
 
 # Review guidelines: Rust code, proto and FFI
@@ -32,5 +32,3 @@ Flag as P1:
   `nekoguruma` (for example `ngr/` or `Nekoguruma/`).
 - **Out-of-scope targets**: Windows workers target `*-pc-windows-gnullvm` only (ADR-227). An MSVC
   worker target or MSVC-only build path is P1.
-- **Spec citations in comments**: a standard cited without its clause or section number, or an
-  ISO 22900-2 citation that does not say whether it targets the 2009 or 2022 edition.

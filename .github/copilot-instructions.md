@@ -30,6 +30,9 @@ More rules for Rust, documentation and CI files are in `.github/instructions/`.
   interpretation, trust boundary) or a surprising spec-driven behaviour without an ADR; a new
   ADR without its `docs/adr/INDEX.md` row and theme entry; a duplicate ADR number; a change that
   contradicts an accepted ADR without superseding it or annotating its Status line.
+- **Spec citations**, anywhere (code, docs, scripts, commit messages, the PR description): a
+  standard cited without its clause or section number, or an ISO 22900-2 citation that does not
+  say whether it targets the 2009 or the 2022 edition.
 - **Temporary-file references**: a file outside `work/` naming a specific file inside `work/`
   (the folder itself and `work/README.md` are fine). Open items belong in `work/`.
 - **Tests weakened**: a test skipped, ignored, deleted or loosened to pass CI, or `#[serial]`
@@ -38,8 +41,9 @@ More rules for Rust, documentation and CI files are in `.github/instructions/`.
 ## Do not flag
 
 - What `cargo fmt` and `cargo clippy` report.
-- PR numbers, review rounds and agent names in existing worker-crate comments (provenance). Do
-  flag new text that adds such references.
+- PR numbers, review rounds and agent names in older ADRs, notes and code comments, including
+  the worker crates' (provenance from earlier history). Do flag new text that adds such
+  references.
 - `todo!()` or short `TODO` comments in code. Flag only a TODO list added to a permanent doc.
 
 ## Writing findings

@@ -6,9 +6,6 @@ applyTo: "**/*.md,api/**,schemas/**,db/**"
 
 Flag as P1:
 
-- **Spec citations**: a standard cited without its clause or section number, or an ISO 22900-2
-  citation that does not say whether it targets the 2009 or 2022 edition. Copied standard text
-  is P0 (see the repository-wide instructions).
 - **Naming**: documentation not in English; a new documentation file (under `docs/`, a crate's
   `docs/`, or anywhere else) whose name is not kebab-case. Exceptions: ADRs
   (`ADR-{NNN}-{short-slug}.md`, plus `INDEX.md` and `TEMPLATE.md` in `docs/adr/`) and

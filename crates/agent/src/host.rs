@@ -147,6 +147,7 @@ impl WorkerHost {
     }
 
     async fn send_recv_async(&mut self, request: Vec<u8>) -> Result<Vec<u8>, HostError> {
+        let sid = *request.first().ok_or(HostError::BadService(0))?;
         let start = StartComPrimitiveRequest {
             cop_tag: None,
             cll_handle: Some(self.link.cll_handle),
@@ -157,14 +158,9 @@ impl WorkerHost {
                 num_send_cycles: 1,
                 num_receive_cycles: 1,
                 temp_param_update: 0,
-                // Any response from the ECU ends the primitive.
-                expected_response_array: vec![ExpectedResponseData {
-                    acceptance_id: 0,
-                    response_type: 0,
-                    mask_data: vec![0x00],
-                    pattern_data: vec![0x00],
-                    unique_resp_ids: vec![],
-                }],
+                // Only an answer to this request ends the primitive, so an unsolicited frame
+                // or a late answer to an earlier request cannot.
+                expected_response_array: expected_responses(sid),
                 tx_flag: None,
             }),
         };
@@ -184,7 +180,7 @@ impl WorkerHost {
 
         let events = &mut self.link.events;
         let wait = async {
-            let mut progress = Progress::default();
+            let mut progress = Progress::new(sid);
             loop {
                 let notification = events
                     .message()
@@ -209,14 +205,52 @@ impl WorkerHost {
     }
 }
 
+/// The positive response to `sid` (its ID plus 0x40) and the negative one (`7F`, `sid`).
+fn expected_responses(sid: u8) -> Vec<ExpectedResponseData> {
+    let expected = |response_type, mask: &[u8], pattern: Vec<u8>| ExpectedResponseData {
+        response_type,
+        acceptance_id: 0,
+        mask_data: mask.to_vec(),
+        pattern_data: pattern,
+        unique_resp_ids: vec![],
+    };
+    vec![
+        expected(0, &[0xFF], vec![positive_sid(sid)]),
+        expected(1, &[0xFF, 0xFF], vec![0x7F, sid]),
+    ]
+}
+
+fn positive_sid(sid: u8) -> u8 {
+    sid.wrapping_add(0x40)
+}
+
+/// Whether `response` answers a request with this SID: positive, or a complete negative
+/// response.
+fn answers(sid: u8, response: &[u8]) -> bool {
+    match response {
+        [first, ..] if *first == positive_sid(sid) => true,
+        [0x7F, nsid, _, ..] => *nsid == sid,
+        _ => false,
+    }
+}
+
 /// What the events of one send-receive have shown so far.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Progress {
+    sid: u8,
     response: Option<Vec<u8>>,
     error: Option<i32>,
 }
 
 impl Progress {
+    fn new(sid: u8) -> Self {
+        Self {
+            sid,
+            response: None,
+            error: None,
+        }
+    }
+
     /// Takes one event; returns the outcome once the primitive `cop` has ended.
     fn on_event(
         &mut self,
@@ -230,8 +264,11 @@ impl Progress {
         match item.data {
             // A response pending the worker passes on is not the final response (ADR-235
             // item 3).
+            // A response pending the worker passes on, and anything that does not answer this
+            // request, is not the final response (ADR-235 item 3).
             Some(event_item::Data::ResultData(result))
-                if !is_response_pending(&result.data_bytes) =>
+                if answers(self.sid, &result.data_bytes)
+                    && !is_response_pending(&result.data_bytes) =>
             {
                 self.response = Some(result.data_bytes);
             }
@@ -446,7 +483,7 @@ mod tests {
 
     /// Feeds `events` and returns the outcome of the first that ends the primitive.
     fn outcome(events: Vec<EventItem>) -> Option<Result<Vec<u8>, HostError>> {
-        let mut progress = Progress::default();
+        let mut progress = Progress::new(0x22);
         events
             .into_iter()
             .find_map(|item| progress.on_event(item, COP))
@@ -473,6 +510,38 @@ mod tests {
     }
 
     #[test]
+    fn only_answers_to_the_request_are_its_result() {
+        // A late answer to another service, a negative response to one, and a truncated
+        // negative response do not answer ReadDataByIdentifier.
+        let got = outcome(vec![
+            event(Some(COP), result(&[0x50, 0x03])),
+            event(Some(COP), result(&[0x7F, 0x10, 0x22])),
+            event(Some(COP), result(&[0x7F, 0x22])),
+            event(Some(COP), status(PduComPrimitiveStatus::PduCopstFinished)),
+        ]);
+        assert!(matches!(got, Some(Err(HostError::NoResponse))), "{got:?}");
+        assert!(answers(0x22, &[0x62, 0xF1, 0x90]));
+        assert!(answers(0x22, &[0x7F, 0x22, 0x31]));
+        assert!(answers(0xFF, &[0x3F]));
+    }
+
+    #[test]
+    fn the_worker_is_asked_for_answers_to_the_request_only() {
+        let expected = expected_responses(0x22);
+        let patterns: Vec<_> = expected
+            .iter()
+            .map(|e| (e.mask_data.as_slice(), e.pattern_data.as_slice()))
+            .collect();
+        assert_eq!(
+            patterns,
+            [
+                (&[0xFF][..], &[0x62][..]),
+                (&[0xFF, 0xFF][..], &[0x7F, 0x22][..])
+            ]
+        );
+    }
+
+    #[test]
     fn a_negative_response_is_a_result() {
         let got = outcome(vec![
             event(Some(COP), result(&[0x7F, 0x22, 0x31])),
@@ -486,7 +555,7 @@ mod tests {
         // Only a response pending arrived before the primitive ended.
         assert!(matches!(
             outcome(vec![
-                event(Some(COP), result(&[0x7F, 0x31, 0x78])),
+                event(Some(COP), result(&[0x7F, 0x22, 0x78])),
                 event(Some(COP), status(PduComPrimitiveStatus::PduCopstFinished)),
             ]),
             Some(Err(HostError::NoResponse))

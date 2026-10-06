@@ -1286,3 +1286,153 @@ fn a_resumed_download_takes_its_secured_state_from_the_resume() {
         assert_eq!(ecu.flash, expected, "flag at resume: {flag_at_resume}");
     }
 }
+
+// ---------------------------------------------------------------- Fault injection (13.4)
+
+#[test]
+fn exchange_reports_the_configured_response_delay() {
+    let mut ecu = SimEcu::new(EcuConfig {
+        response_delay_ms: 20,
+        ..config()
+    });
+    assert_eq!(
+        ecu.exchange(Addressing::Physical, &[0x3E, 0x00]),
+        Exchange {
+            response: pos(&[0x7E, 0x00]),
+            delay_ms: 20
+        }
+    );
+    // A suppressed response has no delay.
+    assert_eq!(
+        ecu.exchange(Addressing::Physical, &[0x3E, 0x80]),
+        Exchange {
+            response: SimResponse::NoResponse,
+            delay_ms: 0
+        }
+    );
+}
+
+#[test]
+fn delay_response_fault_delays_only_the_next_response() {
+    let mut ecu = SimEcu::new(EcuConfig {
+        response_delay_ms: 20,
+        ..config()
+    });
+    ecu.inject(Fault::DelayResponse { ms: 100 });
+    ecu.inject(Fault::DelayResponse { ms: 5 });
+    let first = ecu.exchange(Addressing::Physical, &[0x3E, 0x00]);
+    assert_eq!(first.response, pos(&[0x7E, 0x00]));
+    assert_eq!(first.delay_ms, 125);
+    assert_eq!(
+        ecu.exchange(Addressing::Physical, &[0x3E, 0x00]).delay_ms,
+        20
+    );
+    assert!(ecu.armed_faults().is_empty());
+}
+
+#[test]
+fn drop_response_fault_keeps_the_state_change() {
+    let mut ecu = ecu();
+    ecu.inject(Fault::DropResponse);
+    // The session change takes effect although its response is lost.
+    assert_eq!(ecu.request(&[0x10, 0x03]), SimResponse::NoResponse);
+    assert_eq!(ecu.session, Session::Extended);
+    // Only one response is lost.
+    assert_eq!(
+        ecu.request(&[0x22, 0xF1, 0x86]),
+        pos(&[0x62, 0xF1, 0x86, 0x03])
+    );
+}
+
+#[test]
+fn drop_response_fault_on_a_block_lets_the_client_repeat_it() {
+    let mut ecu = ready_to_download();
+    ecu.request(&request_download(0, 4));
+    ecu.inject(Fault::DropResponse);
+    assert_eq!(ecu.request(&transfer(1, &[1, 2])), SimResponse::NoResponse);
+    // The repeated block is answered without storing it twice.
+    assert_eq!(ecu.request(&transfer(1, &[1, 2])), pos(&[0x76, 0x01]));
+    assert_eq!(ecu.request(&transfer(2, &[3, 4])), pos(&[0x76, 0x02]));
+    assert_eq!(ecu.image(), &[1, 2, 3, 4]);
+}
+
+#[test]
+fn bus_error_fault_loses_the_request() {
+    let mut ecu = ecu();
+    ecu.inject(Fault::BusError);
+    assert_eq!(ecu.request(&[0x10, 0x03]), SimResponse::NoResponse);
+    // The request never reached the ECU.
+    assert_eq!(ecu.session, Session::Default);
+    assert_eq!(
+        ecu.request(&[0x10, 0x03]),
+        pos(&[0x50, 0x03, 0x00, 0x32, 0x01, 0xF4])
+    );
+    assert_eq!(ecu.session, Session::Extended);
+}
+
+#[test]
+fn power_loss_fault_interrupts_the_transfer_until_reconnect() {
+    let mut ecu = ready_to_download();
+    ecu.request(&request_download(0, 6));
+    ecu.request(&transfer(1, &[1, 2]));
+    ecu.inject(Fault::PowerLoss);
+    assert_eq!(ecu.session, Session::Default);
+    assert!(!ecu.security_unlocked);
+    assert_eq!(ecu.flash, FlashPhase::Interrupted { last_block: 1 });
+    assert_eq!(ecu.request(&[0x3E, 0x00]), SimResponse::NoResponse);
+
+    ecu.reconnect();
+    assert_eq!(ecu.request(&[0x3E, 0x00]), pos(&[0x7E, 0x00]));
+    // Flash progress survives the power loss.
+    assert_eq!(read_flash_state(&mut ecu), [0x05, 0, 0, 0, 1, 0, 0, 0, 2]);
+}
+
+#[test]
+fn corrupt_block_fault_fails_that_block_once() {
+    let mut ecu = ready_to_download();
+    ecu.request(&request_download(0, 6));
+    ecu.inject(Fault::CorruptBlock { block: 2 });
+    assert_eq!(ecu.request(&transfer(1, &[1, 2])), pos(&[0x76, 0x01]));
+    assert_eq!(
+        ecu.request(&transfer(2, &[3, 4])),
+        neg(0x36, Nrc::GeneralProgrammingFailure)
+    );
+    // Nothing was stored, so the same block is accepted when sent again.
+    assert_eq!(ecu.image(), &[1, 2]);
+    assert_eq!(ecu.flash, FlashPhase::Transferring { next_block: 2 });
+    assert_eq!(ecu.request(&transfer(2, &[3, 4])), pos(&[0x76, 0x02]));
+    assert_eq!(ecu.request(&transfer(3, &[5, 6])), pos(&[0x76, 0x03]));
+    assert_eq!(ecu.request(&[0x37]), pos(&[0x77]));
+    assert_eq!(ecu.image(), &[1, 2, 3, 4, 5, 6]);
+    assert!(ecu.armed_faults().is_empty());
+}
+
+#[test]
+fn faults_stay_armed_while_the_ecu_is_silent() {
+    let mut ecu = ecu();
+    ecu.inject(Fault::PowerLoss);
+    ecu.inject(Fault::BusError);
+    assert_eq!(ecu.request(&[0x3E, 0x00]), SimResponse::NoResponse);
+    assert_eq!(ecu.armed_faults(), &[Fault::BusError]);
+    ecu.reconnect();
+    assert_eq!(ecu.request(&[0x3E, 0x00]), SimResponse::NoResponse);
+    assert_eq!(ecu.request(&[0x3E, 0x00]), pos(&[0x7E, 0x00]));
+}
+
+#[test]
+fn power_cycles_count_resets_power_loss_and_reconnect() {
+    let mut ecu = ecu();
+    assert_eq!(ecu.power_cycles(), 0);
+    // A rejected reset does not restart the ECU; a suppressed one does.
+    assert_eq!(
+        ecu.request(&[0x11, 0x04]),
+        neg(0x11, Nrc::SubFunctionNotSupported)
+    );
+    assert_eq!(ecu.power_cycles(), 0);
+    assert_eq!(ecu.request(&[0x11, 0x81]), SimResponse::NoResponse);
+    assert_eq!(ecu.power_cycles(), 1);
+    ecu.inject(Fault::PowerLoss);
+    assert_eq!(ecu.power_cycles(), 2);
+    ecu.reconnect();
+    assert_eq!(ecu.power_cycles(), 3);
+}

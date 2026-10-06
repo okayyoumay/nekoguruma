@@ -52,7 +52,7 @@ D-PDU API and J2534 terms used by the worker crates are defined in `glossary.md`
 
 ### Assumptions
 
-- Target OS: Windows / Linux. On Linux, J2534 reuses the Windows API definitions as-is; only registration information such as library locations uses a definition specific to this software (7.1.1)
+- Target OS: Windows / Linux. Linux hosts are x86_64 and aarch64 (with i686 and armhf workers for 32-bit vendor libraries, 7.3), on glibc-based distributions with glibc 2.17 or later and kernel 3.2 or later (ADR-232). On Linux, J2534 reuses the Windows API definitions as-is; only registration information such as library locations uses a definition specific to this software (7.1.1)
 - Vendor library standards: J2534 (PassThru) and ISO 22900 (D-PDU API). Adapters are structured as two kinds, one per standard, plus absorption of vendor-specific quirks
 - Vendor libraries may be a mix of 32-bit and 64-bit (J2534 DLLs are mostly 32-bit, so an x86 worker is required). ARM may also be included
 - Whether and how vendor libraries communicate over the network is not our concern (outside the system's guarantees)
@@ -1237,7 +1237,7 @@ Signature verification is needed on both server and agent, and is consolidated i
 ### 12.1 Implementation Notes
 
 - Catch panics with `catch_unwind` so they do not cross the FFI boundary
-- Workers are cross-built on Linux for 6 targets (Windows: x64 / x86 as `*-pc-windows-gnullvm` with llvm-mingw, ADR-227; Linux: x86_64 / i686 / arm64 / armhf; glibc version specified with `cargo-zigbuild`)
+- Workers are cross-built on Linux for 6 targets (Windows: x64 / x86 as `*-pc-windows-gnullvm` with llvm-mingw, ADR-227; Linux: x86_64 / i686 / arm64 / armhf, linked against glibc 2.17 with `cargo-zigbuild`'s target suffix, ADR-232)
 - 32-bit workers statically link libstdc++ / libgcc and dynamically link only glibc (fully static linking is impossible because of `dlopen`)
 - Do not declare dependencies on i386 / armhf packages
 - The `diag-ir` VM also runs on the server side, validating procedure definitions at ingestion with a dry run (execution with vehicle access mocked)
@@ -1443,7 +1443,6 @@ Items listed here are limited to those that **cannot be resolved by extension pa
 |---|---|---|---|
 | P1 | Scale of time-series data (sampling period, capture duration, channel count) | Raw data storage format, downsampling implementation | Version the chunk format so that migration to a columnar format is possible later |
 | P2 | Support for Windows on ARM | Adding a worker ABI | Adding a worker build target requires a core update. Availability of vendor ARM64 native drivers is a prerequisite |
-| P3 | Practical scope of Linux support | Supported platforms | Registration info can use our own definition (7.1.1), but this depends on whether vendors provide Linux libraries. ARM Linux is even more limited |
 | P4 | Whether there are quirks VCI profiles cannot absorb | Premise of the extension model | If a quirk that cannot be expressed declaratively is found, a core change is needed. First consider whether it can be generalized as a profile item (9.3) |
 | P5 | Quantifying non-functional requirements | Entire system | Availability target, screen response time and concurrency caps are undecided. Configuration by scale (Section 15) only shows the approach |
 | P6 | Tenant / contract management | Server | Commercial offering requires contract plans, usage limits and billing. Currently only the existence of a tenant ID is specified |

@@ -220,6 +220,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-229](ADR-229-interrupted-transfer-restarts-from-request-download.md) | Interrupted Transfers Restart from RequestDownload; Write Procedures Are a Reference Implementation | Accepted | design 8.2.5 / 16.1, `agent` journal, `sim-ecu` |
 | [ADR-230](ADR-230-backlog-loop-serialization-and-claims.md) | Backlog Loop Runs One Item at a Time, with PR-Based Claims and Run State | Accepted | `.claude/skills/backlog-loop`, `next-task`, `scripts/classify-pr-risk.sh` |
 | [ADR-231](ADR-231-agent-mints-worker-tokens-in-process.md) | The Agent Mints Worker Bearer Tokens In-Process | Accepted | `worker-host` client, `vci-service-interface` token |
+| [ADR-232](ADR-232-linux-support-scope-and-minimum-glibc.md) | Linux Support Scope and Minimum glibc 2.17 | Accepted | design 2 / 7.1.2 / 12.1 / 17, `worker-linux` CI job |
 
 ## Status Legend
 
@@ -258,7 +259,7 @@ ADR-032, ADR-073, ADR-220 (Decision item 5's `proxy_to_instance` mechanism remov
 ADR-052 (loopback-only binding this ADR's auth mechanism relies on), ADR-220 (`grpc_endpoint`/`SocketAddr` clients now connect to directly, per this ADR's proxy removal), ADR-221 (Decision item 7's route-preservation for `DELETE /vci-libs/{id}/endpoint` superseded by ADR-225; native-client-enrollment and unauthenticated-admin-route accepted residuals closed by ADR-226; manager-side token minting superseded for the agent by ADR-231), ADR-226, ADR-228, ADR-231
 
 ### FFI Bindings & Target ABI
-ADR-108, ADR-227
+ADR-108, ADR-227, ADR-232
 
 ### Development Tooling & CI
 ADR-109 (amended by ADR-113), ADR-113, ADR-119 (dual-implementation sync duty relaxed to same-PR by ADR-155), ADR-136 (publication consolidated by ADR-141), ADR-141 (item 6's atomicity boundary relaxed by ADR-155), ADR-142 (item 1's check-6(c) atomicity boundary relaxed to same-PR by ADR-155), ADR-144, ADR-145, ADR-149, ADR-154 (item 1's/Consequences' same-commit duty wording relaxed to same-PR by ADR-155), ADR-155, ADR-163, ADR-195, ADR-227, ADR-230

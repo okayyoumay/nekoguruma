@@ -38,7 +38,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
-use j2534_defs::consts::{connect_flag, filter, protocol, status, tx_flag};
+use j2534_defs::consts::{connect_flag, filter, ioctl, protocol, status, tx_flag};
 use sim_ecu::{Addressing, EcuConfig, SimEcu};
 
 pub const STATUS_NOERROR: PassThruUlong = status::STATUS_NOERROR as PassThruUlong;
@@ -58,6 +58,21 @@ pub const ERR_INVALID_MSG_ID: PassThruUlong = status::ERR_INVALID_MSG_ID as Pass
 pub const ERR_NO_FLOW_CONTROL: PassThruUlong = status::ERR_NO_FLOW_CONTROL as PassThruUlong;
 pub const ERR_NOT_UNIQUE: PassThruUlong = status::ERR_NOT_UNIQUE as PassThruUlong;
 pub const ERR_EXCEEDED_LIMIT: PassThruUlong = status::ERR_EXCEEDED_LIMIT as PassThruUlong;
+pub const ERR_PIN_INVALID: PassThruUlong = status::ERR_PIN_INVALID as PassThruUlong;
+
+/// `PassThruSetProgrammingVoltage` values (J2534-1 7.2.11).
+pub const SHORT_TO_GROUND: PassThruUlong = 0xFFFF_FFFE;
+pub const VOLTAGE_OFF: PassThruUlong = 0xFFFF_FFFF;
+/// Pins that take a programming voltage; pin 15 can only be shorted to ground.
+const PROGRAMMING_PINS: [PassThruUlong; 7] = [0, 6, 9, 11, 12, 13, 14];
+const GROUND_PIN: PassThruUlong = 15;
+
+/// Largest 11-bit CAN ID.
+const MAX_CAN_ID: u32 = 0x7FF;
+
+/// TxFlags for 29-bit IDs and extended addressing, which the simulated channel does not use.
+const UNSUPPORTED_TX_FLAGS: PassThruUlong =
+    (tx_flag::TX_FLAG_CAN_29BIT_ID | tx_flag::TX_FLAG_ISO15765_ADDR_TYPE) as PassThruUlong;
 
 /// Filters each channel accepts (J2534-1 7.2.9 asks for at least ten).
 pub const MAX_FILTERS: usize = 10;
@@ -106,12 +121,29 @@ pub const FUNCTIONAL_REQUEST_ID: u32 = 0x7DF;
 /// Length of the CAN ID at the start of an ISO 15765 message.
 const CAN_ID_LEN: usize = 4;
 
+/// The CAN ID at the start of an ISO 15765 message (at least `CAN_ID_LEN` bytes).
+fn can_id_of(data: &[u8]) -> u32 {
+    u32::from_be_bytes([data[0], data[1], data[2], data[3]])
+}
+
+/// The request ID a simulated responder listens on, where flow control for its segmented
+/// responses goes.
+fn request_id_of(response_id: u32) -> u32 {
+    match response_id {
+        ECU_RESPONSE_ID => ECU_PHYSICAL_REQUEST_ID,
+        _ => u32::MAX,
+    }
+}
+
 /// A response the ECU has produced, readable from `ready_at` on.
 struct Pending {
     ready_at: Instant,
     /// `SimEcu::power_cycles` when the response was produced.
     power_cycle: u64,
     data: Vec<u8>,
+    /// Whether the filters let the response in. Decided once it has appeared on the bus, with
+    /// the filters of that moment (`Channel::settle`).
+    accepted: bool,
 }
 
 /// A flow-control filter (J2534-1 7.2.9): receive from `pattern`, send to `flow_control`.
@@ -139,9 +171,37 @@ impl Channel {
         }
     }
 
-    /// Whether a message from `can_id` may enter the receive queue.
-    fn receives(&self, can_id: u32) -> bool {
-        self.filters.values().any(|f| f.pattern == can_id)
+    /// Whether a message from `can_id` with `payload_len` bytes after the CAN ID may enter the
+    /// receive queue. A single frame needs a filter with that pattern ID. A segmented message
+    /// also needs the filter's flow-control ID to be the sender's request ID, since the device
+    /// answers its first frame with flow control there (J2534-1 7.2.9, Appendix A); a filter
+    /// whose pattern and flow-control IDs are the same receives single frames only.
+    fn receives(&self, can_id: u32, payload_len: usize) -> bool {
+        self.filters.values().any(|f| {
+            f.pattern == can_id
+                && (payload_len <= SINGLE_FRAME_MAX
+                    || (f.flow_control != f.pattern && f.flow_control == request_id_of(can_id)))
+        })
+    }
+
+    /// Decides every response that has appeared on the bus by `now` and is not decided yet,
+    /// with the current filters, and drops those the filters keep out. Called before anything
+    /// reads the queue or changes the filters, so each response is judged by the filters that
+    /// were in place when it appeared.
+    fn settle(&mut self, now: Instant) {
+        let filters = std::mem::take(&mut self.filters);
+        let probe = Channel {
+            filters,
+            ..Channel::new(self.protocol_id)
+        };
+        self.rx.retain_mut(|p| {
+            if p.ready_at > now || p.accepted {
+                return true;
+            }
+            p.accepted = probe.receives(can_id_of(&p.data), p.data.len() - CAN_ID_LEN);
+            p.accepted
+        });
+        self.filters = probe.filters;
     }
 
     /// Whether a segmented message may be sent to `can_id`.
@@ -159,6 +219,8 @@ struct Bus {
     channels: HashMap<PassThruUlong, Channel>,
     next_channel: PassThruUlong,
     epoch: Instant,
+    /// Pin carrying a programming voltage, if any (J2534-1 7.2.11 allows one at a time).
+    programming_pin: Option<PassThruUlong>,
 }
 
 static BUS: OnceLock<(Mutex<Bus>, Condvar)> = OnceLock::new();
@@ -172,6 +234,7 @@ fn bus() -> &'static (Mutex<Bus>, Condvar) {
                 channels: HashMap::new(),
                 next_channel: 1,
                 epoch: Instant::now(),
+                programming_pin: None,
             }),
             Condvar::new(),
         )
@@ -259,7 +322,7 @@ impl Bus {
     /// sent and `ERR_NO_FLOW_CONTROL` is returned.
     fn transmit(&mut self, channel_id: PassThruUlong, data: &[u8]) -> Result<(), PassThruUlong> {
         let (id, payload) = data.split_at(CAN_ID_LEN);
-        let can_id = u32::from_be_bytes([id[0], id[1], id[2], id[3]]);
+        let can_id = can_id_of(id);
         let channel = self
             .channels
             .get(&channel_id)
@@ -289,10 +352,6 @@ impl Bus {
         let Some(channel) = self.channels.get_mut(&channel_id) else {
             return Ok(());
         };
-        // The ECU answered on the bus, but the device discards a frame no filter lets in.
-        if !channel.receives(ECU_RESPONSE_ID) {
-            return Ok(());
-        }
         let at = channel.rx.partition_point(|p| p.ready_at <= ready_at);
         channel.rx.insert(
             at,
@@ -300,6 +359,7 @@ impl Bus {
                 ready_at,
                 power_cycle,
                 data,
+                accepted: false,
             },
         );
         Ok(())
@@ -330,8 +390,9 @@ fn reset(config: EcuConfig) {
 
 // ---------------------------------------------------------------- Exports
 
-/// Side-effect-free function the worker calls right after loading (7.3).
-/// If the ABI interpretation is wrong, this surfaces as garbage values or a crash.
+/// Side-effect-free function the worker's launch test calls once the device is open (design
+/// 7.3; J2534-1 7.2.12 allows it only after `PassThruOpen`). If the ABI interpretation is wrong,
+/// this surfaces as garbage values or a crash.
 ///
 /// # Safety
 /// Each pointer must be null or valid for a write of 80 bytes, the buffer size J2534-1 gives.
@@ -406,6 +467,7 @@ pub extern "C" fn PassThruClose(device_id: PassThruUlong) -> PassThruUlong {
     }
     bus.device_open = false;
     bus.channels.clear();
+    bus.programming_pin = None;
     notify();
     STATUS_NOERROR
 }
@@ -484,6 +546,7 @@ pub unsafe extern "C" fn PassThruReadMsgs(
             break ERR_INVALID_CHANNEL_ID;
         };
         let now = Instant::now();
+        channel.settle(now);
         while read < wanted && channel.rx.front().is_some_and(|p| p.ready_at <= now) {
             let pending = channel.rx.pop_front().expect("front checked above");
             let mut msg = PassThruMsg {
@@ -555,7 +618,9 @@ pub unsafe extern "C" fn PassThruWriteMsgs(
             break ERR_MSG_PROTOCOL_ID;
         }
         let size = msg.data_size as usize;
-        if !(CAN_ID_LEN + 1..=MAX_MSG_DATA).contains(&size) {
+        if !(CAN_ID_LEN + 1..=MAX_MSG_DATA).contains(&size)
+            || msg.tx_flags & UNSUPPORTED_TX_FLAGS != 0
+        {
             break ERR_INVALID_MSG;
         }
         if let Err(status) = bus.transmit(channel_id, &msg.data[..size]) {
@@ -592,6 +657,7 @@ pub unsafe extern "C" fn PassThruStartMsgFilter(
     let Some(channel) = bus.channels.get_mut(&channel_id) else {
         return ERR_INVALID_CHANNEL_ID;
     };
+    channel.settle(Instant::now());
     if filter_type != filter::FLOW_CONTROL_FILTER as PassThruUlong {
         return ERR_INVALID_FILTER_ID;
     }
@@ -613,18 +679,20 @@ pub unsafe extern "C" fn PassThruStartMsgFilter(
     {
         return ERR_INVALID_MSG;
     }
-    if mask.tx_flags & tx_flag::TX_FLAG_ISO15765_ADDR_TYPE as PassThruUlong != 0 {
-        // Extended addressing.
-        return ERR_NOT_SUPPORTED;
+    // The channel uses 11-bit IDs and normal addressing: no 29-bit IDs, no extended address.
+    if mask.tx_flags & UNSUPPORTED_TX_FLAGS != 0 {
+        return ERR_INVALID_MSG;
     }
     if mask.data_size as usize != CAN_ID_LEN || mask.data[..CAN_ID_LEN] != [0xFF; CAN_ID_LEN] {
         return ERR_INVALID_MSG;
     }
-    let id = |m: &PassThruMsg| u32::from_be_bytes([m.data[0], m.data[1], m.data[2], m.data[3]]);
     let new = FlowControlFilter {
-        pattern: id(pattern),
-        flow_control: id(flow_control),
+        pattern: can_id_of(&pattern.data),
+        flow_control: can_id_of(&flow_control.data),
     };
+    if new.pattern > MAX_CAN_ID || new.flow_control > MAX_CAN_ID {
+        return ERR_INVALID_MSG;
+    }
     // Pattern and flow-control IDs must not appear in another filter; a filter may use one ID
     // for both, to receive functionally addressed single frames.
     if channel.filters.values().any(|f| {
@@ -636,8 +704,12 @@ pub unsafe extern "C" fn PassThruStartMsgFilter(
     if channel.filters.len() >= MAX_FILTERS {
         return ERR_EXCEEDED_LIMIT;
     }
-    let id = channel.next_filter;
-    channel.next_filter += 1;
+    // IDs are reused only after wrapping around, and never while still in use.
+    let mut id = channel.next_filter;
+    while id == 0 || channel.filters.contains_key(&id) {
+        id = id.wrapping_add(1);
+    }
+    channel.next_filter = id.wrapping_add(1);
     channel.filters.insert(id, new);
     // SAFETY: checked for null above; the caller guarantees it is writable.
     unsafe { filter_id.write(id) };
@@ -653,6 +725,7 @@ pub extern "C" fn PassThruStopMsgFilter(
     let Some(channel) = bus.channels.get_mut(&channel_id) else {
         return ERR_INVALID_CHANNEL_ID;
     };
+    channel.settle(Instant::now());
     match channel.filters.remove(&filter_id) {
         Some(_) => STATUS_NOERROR,
         None => ERR_INVALID_FILTER_ID,
@@ -685,17 +758,46 @@ pub extern "C" fn PassThruStopPeriodicMsg(
     ERR_INVALID_MSG_ID
 }
 
-/// The simulated device has no programmable pins; any request on an open device succeeds.
+/// Keeps track of the programming pin by the rules of J2534-1 7.2.11; nothing is driven. One pin
+/// at a time carries 5 to 20 V (switch it off before using another), and pin 15 can only be
+/// shorted to ground. A voltage outside the valid values gets `ERR_FAILED`, since the clause
+/// names no code for it.
 #[unsafe(no_mangle)]
 pub extern "C" fn PassThruSetProgrammingVoltage(
     device_id: PassThruUlong,
-    _pin: PassThruUlong,
-    _voltage: PassThruUlong,
+    pin: PassThruUlong,
+    voltage: PassThruUlong,
 ) -> PassThruUlong {
-    if !lock().device_ok(device_id) {
+    let mut bus = lock();
+    if !bus.device_ok(device_id) {
         return ERR_INVALID_DEVICE_ID;
     }
-    STATUS_NOERROR
+    if pin == GROUND_PIN {
+        return match voltage {
+            SHORT_TO_GROUND | VOLTAGE_OFF => STATUS_NOERROR,
+            _ => ERR_PIN_INVALID,
+        };
+    }
+    if !PROGRAMMING_PINS.contains(&pin) {
+        return ERR_PIN_INVALID;
+    }
+    match voltage {
+        VOLTAGE_OFF => {
+            if bus.programming_pin == Some(pin) {
+                bus.programming_pin = None;
+            }
+            STATUS_NOERROR
+        }
+        SHORT_TO_GROUND => ERR_PIN_INVALID,
+        5000..=20000 => match bus.programming_pin {
+            Some(other) if other != pin => ERR_PIN_INVALID,
+            _ => {
+                bus.programming_pin = Some(pin);
+                STATUS_NOERROR
+            }
+        },
+        _ => ERR_FAILED,
+    }
 }
 
 /// Writes [`LAST_ERROR_TEXT`]: the simulator keeps no error descriptions.
@@ -712,14 +814,33 @@ pub unsafe extern "C" fn PassThruGetLastError(description: *mut c_char) -> PassT
     STATUS_NOERROR
 }
 
+/// `CLEAR_MSG_FILTERS` and `CLEAR_RX_BUFFER` act on a channel's filters and receive queue
+/// (J2534-1 7.3). Every other IOCTL is accepted and does nothing.
 #[unsafe(no_mangle)]
 pub extern "C" fn PassThruIoctl(
-    _handle_id: PassThruUlong,
-    _ioctl_id: PassThruUlong,
+    handle_id: PassThruUlong,
+    ioctl_id: PassThruUlong,
     _input: *mut c_void,
     _output: *mut c_void,
 ) -> PassThruUlong {
-    // TODO: return READ_VBATT (voltage). Used for the precondition tests in 8.9.1.
+    const CLEAR_MSG_FILTERS: PassThruUlong = ioctl::IOCTL_CLEAR_MSG_FILTERS as PassThruUlong;
+    const CLEAR_RX_BUFFER: PassThruUlong = ioctl::IOCTL_CLEAR_RX_BUFFER as PassThruUlong;
+    if ioctl_id != CLEAR_MSG_FILTERS && ioctl_id != CLEAR_RX_BUFFER {
+        // TODO: return READ_VBATT (voltage). Used for the precondition tests in 8.9.1.
+        return STATUS_NOERROR;
+    }
+    let mut bus = lock();
+    let Some(channel) = bus.channels.get_mut(&handle_id) else {
+        return ERR_INVALID_CHANNEL_ID;
+    };
+    let now = Instant::now();
+    channel.settle(now);
+    if ioctl_id == CLEAR_MSG_FILTERS {
+        channel.filters.clear();
+    } else {
+        // Responses already on the bus are discarded; ones still being delayed arrive later.
+        channel.rx.retain(|p| p.ready_at > now);
+    }
     STATUS_NOERROR
 }
 

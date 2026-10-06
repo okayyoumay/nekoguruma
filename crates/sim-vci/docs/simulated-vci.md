@@ -20,10 +20,17 @@ below refer to SAE J2534-1 (v04.04).
 - All 14 J2534 v04.04 functions are exported, so `j2534-0404-service` loads the library like a
   vendor's. `PassThruReadVersion` reports firmware `NGR-SIM 1.0`, DLL `sim-vci <crate version>`
   and API `04.04` on an open device. `PassThruGetLastError` always reports a fixed text: the
-  simulator keeps no error descriptions. `PassThruSetProgrammingVoltage` accepts any request on
-  an open device, since no pins are simulated. Periodic messages are not simulated:
+  simulator keeps no error descriptions. `PassThruSetProgrammingVoltage` drives nothing but keeps
+  track of the pins by the rules of clause 7.2.11: 5 to 20 V on one of pins 0, 6, 9 and 11 to 14
+  at a time (switch it off before using another pin), pin 15 shorted to ground only
+  (`ERR_PIN_INVALID` otherwise), and `ERR_FAILED` for a voltage outside those values, for which
+  the clause names no code. Closing the device switches every pin off. Periodic messages are not
+  simulated:
   `PassThruStartPeriodicMsg` returns `ERR_NOT_SUPPORTED`, and `PassThruStopPeriodicMsg`
   `ERR_INVALID_MSG_ID`.
+- `PassThruIoctl` implements `CLEAR_MSG_FILTERS` (removes the channel's filters) and
+  `CLEAR_RX_BUFFER` (drops the responses already received; ones still being delayed arrive
+  later) on a channel. Every other IOCTL is accepted and does nothing.
 
 ## Filters
 
@@ -32,14 +39,19 @@ ISO 15765 channels follow clause 7.2.9 and Appendix A for flow-control filters:
 - Only `FLOW_CONTROL_FILTER` is accepted; `PASS_FILTER` and `BLOCK_FILTER` get
   `ERR_INVALID_FILTER_ID`.
 - The mask, pattern and flow-control messages must have the same size and TxFlags, and the mask
-  must select the whole 4-byte CAN ID (`ERR_INVALID_MSG` otherwise). Extended addressing is not
-  simulated (`ERR_NOT_SUPPORTED`).
-- A pattern or flow-control ID already used by another filter of the channel gets
-  `ERR_NOT_UNIQUE`; one filter may use the same ID for both. A channel takes ten filters, the
+  must select the whole 4-byte CAN ID (`ERR_INVALID_MSG` otherwise). The channel uses 11-bit IDs
+  and normal addressing, so a filter with the 29-bit or extended-address TxFlag, or an ID above
+  `7FF`, gets `ERR_INVALID_MSG`; so does a written message with either flag.
+- A pattern or flow-control ID already used by another filter of the channel, in either role,
+  gets `ERR_NOT_UNIQUE`; one filter may use the same ID for both. A channel takes ten filters, the
   minimum the clause asks for (`ERR_EXCEEDED_LIMIT` beyond).
 - A response enters the receive queue only if a filter's pattern ID is the response's CAN ID.
-  The ECU still answers on the bus without one, so a later filter does not bring back a missed
-  response.
+  A segmented response (more than 7 bytes after the CAN ID) also needs that filter's flow-control
+  ID to be `7E0`, where the device would send flow control to the ECU; a filter whose pattern and
+  flow-control IDs are the same receives single frames only.
+- Filters judge a response when it appears on the bus (after its delay), as a device filters
+  what it receives: a filter started while a response is delayed lets it in, one stopped before
+  it appears keeps it out, and a response kept out stays lost when a filter is started later.
 - A request longer than a single frame (more than 7 payload bytes) needs a filter whose
   flow-control ID is the request's CAN ID; without one it is not sent and the write returns
   `ERR_NO_FLOW_CONTROL`. Single frames need no filter.

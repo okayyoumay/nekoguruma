@@ -616,15 +616,6 @@ fn version_and_other_exports() {
         ERR_NULL_PARAMETER
     );
 
-    assert_eq!(
-        PassThruSetProgrammingVoltage(DEVICE_ID, 15, 5000),
-        STATUS_NOERROR
-    );
-    assert_eq!(
-        PassThruSetProgrammingVoltage(7, 15, 5000),
-        ERR_INVALID_DEVICE_ID
-    );
-
     let m = msg(ECU_PHYSICAL_REQUEST_ID, &[0x3E, 0x80]);
     let mut msg_id = 0;
     assert_eq!(
@@ -637,4 +628,208 @@ fn version_and_other_exports() {
         ERR_INVALID_CHANNEL_ID
     );
     assert_eq!(PassThruStopPeriodicMsg(99, 1), ERR_INVALID_CHANNEL_ID);
+}
+
+/// J2534-1 7.2.11: one programming pin at a time, valid pins and voltages, pin 15 ground only.
+#[test]
+fn programming_voltage_follows_the_pin_rules() {
+    let _f = fixture();
+    let set = |pin, voltage| PassThruSetProgrammingVoltage(DEVICE_ID, pin, voltage);
+    assert_eq!(set(12, 18000), STATUS_NOERROR);
+    // Another pin while 12 is on, until 12 is switched off.
+    assert_eq!(set(13, 18000), ERR_PIN_INVALID);
+    assert_eq!(set(12, VOLTAGE_OFF), STATUS_NOERROR);
+    assert_eq!(set(13, 5000), STATUS_NOERROR);
+    assert_eq!(set(13, 20000), STATUS_NOERROR);
+    // Pin 15 is shorted to ground alongside, never driven.
+    assert_eq!(set(15, SHORT_TO_GROUND), STATUS_NOERROR);
+    assert_eq!(set(15, 12000), ERR_PIN_INVALID);
+    assert_eq!(set(13, SHORT_TO_GROUND), ERR_PIN_INVALID);
+    // Pins and voltages outside the lists.
+    assert_eq!(set(7, 12000), ERR_PIN_INVALID);
+    assert_eq!(set(13, 4999), ERR_FAILED);
+    assert_eq!(set(13, 20001), ERR_FAILED);
+    assert_eq!(
+        PassThruSetProgrammingVoltage(7, 13, 12000),
+        ERR_INVALID_DEVICE_ID
+    );
+    // Closing the device switches everything off.
+    assert_eq!(PassThruClose(DEVICE_ID), STATUS_NOERROR);
+    let mut device = 0;
+    assert_eq!(
+        unsafe { PassThruOpen(ptr::null(), &mut device) },
+        STATUS_NOERROR
+    );
+    assert_eq!(set(12, 12000), STATUS_NOERROR);
+}
+
+/// `CLEAR_MSG_FILTERS` removes the channel's filters, so the same IDs can be installed again, and
+/// `CLEAR_RX_BUFFER` drops responses already received.
+#[test]
+fn ioctl_clears_filters_and_the_receive_buffer() {
+    let f = fixture();
+    let clear = |id: u32| {
+        PassThruIoctl(
+            f.channel,
+            id as PassThruUlong,
+            ptr::null_mut(),
+            ptr::null_mut(),
+        )
+    };
+    write(f.channel, ECU_PHYSICAL_REQUEST_ID, &[0x22, 0xF1, 0x86]);
+    std::thread::sleep(Duration::from_millis(20));
+    assert_eq!(clear(ioctl::IOCTL_CLEAR_RX_BUFFER), STATUS_NOERROR);
+    assert_eq!(read(f.channel, 1, 0).0, ERR_BUFFER_EMPTY);
+
+    assert_eq!(clear(ioctl::IOCTL_CLEAR_MSG_FILTERS), STATUS_NOERROR);
+    write(f.channel, ECU_PHYSICAL_REQUEST_ID, &[0x22, 0xF1, 0x86]);
+    assert_eq!(read(f.channel, 1, 50).0, ERR_BUFFER_EMPTY);
+    assert_eq!(
+        start_filter(f.channel, ECU_RESPONSE_ID, ECU_PHYSICAL_REQUEST_ID).0,
+        STATUS_NOERROR
+    );
+    write(f.channel, ECU_PHYSICAL_REQUEST_ID, &[0x22, 0xF1, 0x86]);
+    assert_eq!(read(f.channel, 1, 100).0, STATUS_NOERROR);
+
+    assert_eq!(
+        PassThruIoctl(
+            99,
+            ioctl::IOCTL_CLEAR_MSG_FILTERS as PassThruUlong,
+            ptr::null_mut(),
+            ptr::null_mut()
+        ),
+        ERR_INVALID_CHANNEL_ID
+    );
+}
+
+/// A segmented response is received only through a filter whose flow-control ID is the ECU's
+/// request ID, where flow control for it goes; a pattern-equals-flow-control filter receives
+/// single frames only.
+#[test]
+fn segmented_responses_need_flow_control_to_the_ecu() {
+    let _f = fixture();
+    let vin_request = [0x22, 0xF1, 0x90]; // 20-byte response
+    let short_request = [0x22, 0xF1, 0x86]; // 4-byte response
+    for (flow_control, receives_vin) in [
+        (ECU_RESPONSE_ID, false),
+        (0x7E1, false),
+        (ECU_PHYSICAL_REQUEST_ID, true),
+    ] {
+        let mut channel = 0;
+        assert_eq!(
+            unsafe { PassThruConnect(DEVICE_ID, ISO15765, 0, 500_000, &mut channel) },
+            STATUS_NOERROR
+        );
+        assert_eq!(
+            start_filter(channel, ECU_RESPONSE_ID, flow_control).0,
+            STATUS_NOERROR
+        );
+        write(channel, ECU_PHYSICAL_REQUEST_ID, &short_request);
+        assert_eq!(read(channel, 1, 100).0, STATUS_NOERROR, "{flow_control:#x}");
+        write(channel, ECU_PHYSICAL_REQUEST_ID, &vin_request);
+        let expected = if receives_vin {
+            STATUS_NOERROR
+        } else {
+            ERR_BUFFER_EMPTY
+        };
+        assert_eq!(read(channel, 1, 50).0, expected, "{flow_control:#x}");
+        assert_eq!(PassThruDisconnect(channel), STATUS_NOERROR);
+    }
+}
+
+/// Filters judge a response when it appears on the bus, not when the request is written.
+#[test]
+fn filters_apply_when_the_response_appears() {
+    let _f = setup(EcuConfig {
+        response_delay_ms: 100,
+        ..default_ecu_config()
+    });
+    let mut channel = 0;
+    assert_eq!(
+        unsafe { PassThruConnect(DEVICE_ID, ISO15765, 0, 500_000, &mut channel) },
+        STATUS_NOERROR
+    );
+    // A filter started while the response is delayed lets it in.
+    write(channel, ECU_PHYSICAL_REQUEST_ID, &[0x22, 0xF1, 0x86]);
+    let (status, id) = start_filter(channel, ECU_RESPONSE_ID, ECU_PHYSICAL_REQUEST_ID);
+    assert_eq!(status, STATUS_NOERROR);
+    assert_eq!(read(channel, 1, 500).0, STATUS_NOERROR);
+    // A filter stopped while the response is delayed keeps it out.
+    write(channel, ECU_PHYSICAL_REQUEST_ID, &[0x22, 0xF1, 0x86]);
+    assert_eq!(PassThruStopMsgFilter(channel, id), STATUS_NOERROR);
+    assert_eq!(read(channel, 1, 300).0, ERR_BUFFER_EMPTY);
+    // A response that appeared while a filter was in place stays readable after it stops.
+    let (status, id) = start_filter(channel, ECU_RESPONSE_ID, ECU_PHYSICAL_REQUEST_ID);
+    assert_eq!(status, STATUS_NOERROR);
+    write(channel, ECU_PHYSICAL_REQUEST_ID, &[0x22, 0xF1, 0x86]);
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(PassThruStopMsgFilter(channel, id), STATUS_NOERROR);
+    assert_eq!(read(channel, 1, 0).0, STATUS_NOERROR);
+}
+
+#[test]
+fn filter_and_write_validation_edges() {
+    let f = fixture();
+    let ch = f.channel;
+    let fc = filter::FLOW_CONTROL_FILTER as PassThruUlong;
+    let start = |mask: PassThruMsg, pattern: PassThruMsg, flow: PassThruMsg| {
+        let mut id = 0;
+        unsafe { PassThruStartMsgFilter(ch, fc, &mask, &pattern, &flow, &mut id) }
+    };
+    let ff = || msg_bytes(&[0xFF; 4]);
+    let id = |v: u32| msg_bytes(&v.to_be_bytes());
+    // An ID may not reappear in another filter in the other role either (fixture: 7E8 / 7E0).
+    assert_eq!(
+        start(ff(), id(ECU_PHYSICAL_REQUEST_ID), id(0x701)),
+        ERR_NOT_UNIQUE
+    );
+    assert_eq!(start(ff(), id(0x700), id(ECU_RESPONSE_ID)), ERR_NOT_UNIQUE);
+    // TxFlags must match across the three messages.
+    let mut flagged = id(0x701);
+    flagged.tx_flags = 0x40;
+    assert_eq!(start(ff(), id(0x700), flagged), ERR_INVALID_MSG);
+    // Protocol must be the channel's.
+    let mut other = id(0x700);
+    other.protocol_id = protocol::PROTOCOL_CAN as PassThruUlong;
+    assert_eq!(start(ff(), other, id(0x701)), ERR_MSG_PROTOCOL_ID);
+    // 29-bit IDs, extended addressing and IDs beyond 11 bits are not used on this channel.
+    for flag in [
+        tx_flag::TX_FLAG_CAN_29BIT_ID,
+        tx_flag::TX_FLAG_ISO15765_ADDR_TYPE,
+    ] {
+        let with = |mut m: PassThruMsg| {
+            m.tx_flags = flag as PassThruUlong;
+            m
+        };
+        assert_eq!(
+            start(with(ff()), with(id(0x700)), with(id(0x701))),
+            ERR_INVALID_MSG
+        );
+        let mut request = msg(ECU_PHYSICAL_REQUEST_ID, &[0x22, 0xF1, 0x86]);
+        request.tx_flags = flag as PassThruUlong;
+        let mut n = 1;
+        assert_eq!(
+            unsafe { PassThruWriteMsgs(ch, &request, &mut n, 100) },
+            ERR_INVALID_MSG
+        );
+        assert_eq!(n, 0);
+    }
+    assert_eq!(start(ff(), id(0x800), id(0x701)), ERR_INVALID_MSG);
+    assert_eq!(start(ff(), id(0x700), id(0x800)), ERR_INVALID_MSG);
+
+    // A 7-byte payload is a single frame and needs no filter; 8 bytes do.
+    let mut bare = 0;
+    assert_eq!(
+        unsafe { PassThruConnect(DEVICE_ID, ISO15765, 0, 500_000, &mut bare) },
+        STATUS_NOERROR
+    );
+    for (len, expected) in [(7, STATUS_NOERROR), (8, ERR_NO_FLOW_CONTROL)] {
+        let m = msg(ECU_PHYSICAL_REQUEST_ID, &vec![0x31; len]);
+        let mut n = 1;
+        assert_eq!(
+            unsafe { PassThruWriteMsgs(bare, &m, &mut n, 100) },
+            expected,
+            "{len}"
+        );
+    }
 }

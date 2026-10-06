@@ -106,13 +106,31 @@ async fn wait_finished(
     result
 }
 
+/// Removes the temporary config file however the test ends.
+struct TempFile(PathBuf);
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 #[tokio::test]
 async fn service_reads_the_vin_from_sim_vci() {
+    // A wedged service must fail the test, not hang the CI job: unary calls
+    // have no deadline of their own.
+    tokio::time::timeout(Duration::from_secs(120), read_the_vin())
+        .await
+        .expect("the end-to-end flow should finish in time");
+}
+
+async fn read_the_vin() {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system clock should be after unix epoch")
         .as_nanos();
     let config_path = std::env::temp_dir().join(format!("j2534-0404-service-{nanos}-sim-vci.toml"));
+    let config = TempFile(config_path.clone());
     std::fs::write(
         &config_path,
         format!(
@@ -299,5 +317,5 @@ async fn service_reads_the_vin_from_sim_vci() {
         .stop(Duration::from_secs(5))
         .await
         .expect("worker should stop");
-    let _ = std::fs::remove_file(&config_path);
+    drop(config);
 }

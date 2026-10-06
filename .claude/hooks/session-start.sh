@@ -16,7 +16,7 @@ Reminder of repository rules (CLAUDE.md):
 - Open items and TODO notes go in work/; permanent files never name files inside work/.
 - Update the documents in CLAUDE.md's documentation-sync table in the same PR.
 - Reserve an ADR number (adr-number-reservation skill) before writing it anywhere.
-- Never copy ISO 22900 / SAE J2534 text verbatim; cite the clause and paraphrase.
+- Never copy standard text (ISO 22900, SAE J2534, ISO 14229 or any other) verbatim; cite the clause and paraphrase.
 MSG
   exit 0
 fi

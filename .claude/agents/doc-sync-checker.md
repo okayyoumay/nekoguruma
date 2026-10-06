@@ -41,11 +41,13 @@ Procedure:
    the diff finishes work that a backlog item describes (search the backlog
    files for the identifiers the diff touches), report that the item must be
    closed in the same PR.
-5. Spec copyright: for prose in the diff that sits next to an ISO 22900 or
-   SAE J2534 clause citation, check whether it reproduces the spec's
-   wording. When the sibling `vehicle-comm-specs` checkout is available
-   (usually `../vehicle-comm-specs`), search it for a distinctive run of
-   eight or more consecutive words from the prose. Report a match as a
+5. Spec copyright: for prose in the diff that sits next to a clause
+   citation of any standard (ISO 22900-2, SAE J2534, ISO 14229,
+   ISO 15765-2, ISO 22901-1, ISO 17978 or another), check whether it
+   reproduces the spec's wording. When the sibling `vehicle-comm-specs`
+   checkout is available (usually `../vehicle-comm-specs`), search every
+   document in it for a run of six or more consecutive words from the
+   prose. Report a match as a
    violation; report a passage you could not check as "spot-check
    manually". Quotation marks are not required for a match.
 6. Stale references: for each identifier the diff renames or removes

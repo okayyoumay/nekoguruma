@@ -16,8 +16,8 @@ paths:
 - Design decisions are cited as `ADR-NNN`; check `docs/adr/INDEX.md` for the
   area before changing behaviour, and align with or explicitly supersede the
   ADR.
-- Spec citations: cite ISO 22900-2 / SAE J2534 by clause number and
-  paraphrase. Note which ISO 22900-2 edition (2009 or 2022) a statement
+- Spec citations: cite ISO 22900-2, SAE J2534 and other standards (e.g.
+  ISO 15765-2, ISO 14229) by clause number and paraphrase. Note which ISO 22900-2 edition (2009 or 2022) a statement
   targets.
 - Existing comments and notes mention PR numbers, review rounds and agent
   names from these crates' earlier history. Read them as provenance; do not

@@ -44,8 +44,8 @@ Working rules:
 - Update documents only as the brief directs, but do report any document
   you noticed the change makes stale (CLAUDE.md's documentation-sync
   table).
-- Never copy ISO 22900 / SAE J2534 text verbatim into code comments or docs;
-  cite the clause number and paraphrase.
+- Never copy standard text (ISO 22900, SAE J2534, ISO 14229 or any other)
+  verbatim into code comments or docs; cite the clause number and paraphrase.
 - Open items you discover go in your report as follow-ups, not as notes in
   permanent documents. Write each as a ready-to-add backlog item: priority
   (P0-P3, scale in `work/README.md`), what is missing, where, and "Done

@@ -74,7 +74,10 @@ responsible for them, in the same way that business screens are theirs (design 9
       the server reservation keeps a handover from starting on a count that misses attempts this
       device made but never published. An agent deployed without a server (the standalone
       setup of milestone M1, before the server exists) has no handover either, so there the
-      journal count alone enforces the limit and no reservation is made. If a configured server
+      journal count alone enforces the limit and no reservation is made. Retrying an unconfirmed
+      key applies only to server-backed reservations: a standalone agent makes no attempt key,
+      so every restart there increments and commits the count before its first ECU request,
+      and repeated crashes reach the limit. If a configured server
       cannot be reached, the agent waits for it
       until the start deadline; once that passes, the job ends as expired, like any job past
       its start deadline (design 8.2.5). Recovery is

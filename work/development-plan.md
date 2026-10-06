@@ -4,24 +4,24 @@
 
 Milestones from the current skeleton to a deployable product. Each milestone has a goal, its scope (by design-document section) and exit criteria a reviewer can check. The individual work items live in `backlog.md` and `worker-crates-backlog.md`; this file only says which milestone they belong to. When a milestone finishes, delete its section, move any lasting decision into `docs/system-architecture.md` or an ADR, and name the next milestone in `backlog.md`'s Status section (that is what P1 means).
 
-Order of work: the device side first (M1, M2), because interruption safety (R5) and the IR runtime are the riskiest parts and can be verified without a server. The server and UI follow on the local deployment profile (M3, M4), which needs no cloud. Features that depend on standards we do not hold yet (ODX/OTX, SOVD/ExVe) come last.
+Order of work: the device side first (M1, M2), because interruption safety (R5) and the IR runtime are the riskiest parts and can be verified without a server. The server and UI follow on the local deployment profile (M3, M4), which needs no cloud. Standard formats and external APIs (ODX/OTX, SOVD/ExVe) come last; OTX and ExVe are not held yet.
 
-Standards: `vehicle-comm-specs` holds SAE J2534-1 (v04.04), SAE J2534-2 (DEC2020), ISO 22900-2 (2009 and 2022) and ISO 14229-1 (2026 edition). Clause numbers below for ISO 14229-1 refer to the 2026 edition. Standards marked "not held" still have to be obtained.
+Standards: `vehicle-comm-specs` holds SAE J2534-1 (v04.04), SAE J2534-2 (DEC2020), ISO 22900-2 (2009 and 2022), ISO 14229-1 (2026 edition), ISO 14229-2 (2021 edition), ISO 15765-2 (2024 edition), ISO 22901-1 (2008 edition) and ISO 17978-1/-2/-3 (2026 edition). Clause numbers below for ISO 14229-1 refer to the 2026 edition. Standards marked "not held" still have to be obtained.
 
 ## Overview
 
 | Milestone | Goal | Main crates | Standards needed |
 |---|---|---|---|
 | M1 Local E2E | agent -> worker -> `sim-vci` -> `sim-ecu` works on the worker targets, including an interrupted-write resume | `agent`, `worker-host`, `sim-vci`, `sim-ecu`, `diag-ir`, worker crates | J2534-1, J2534-2, ISO 22900-2, ISO 14229-1 (all held) |
-| M2 Diagnostic runtime | Diagnostic procedures defined as data (proprietary CSV + JS format) run end to end | `diag-ir`, `diag-frontend`, worker L1 (ISO-TP, UDS), `agent` L2 | ISO 14229-1 (held); ISO 14229-2, ISO 15765-2 (not held) |
+| M2 Diagnostic runtime | Diagnostic procedures defined as data (proprietary CSV + JS format) run end to end | `diag-ir`, `diag-frontend`, worker L1 (ISO-TP, UDS), `agent` L2 | ISO 14229-1, ISO 14229-2, ISO 15765-2 (all held) |
 | M3 Server and job control (local profile) | A job created through the Web API is executed by the agent over the control channel and its result is stored | `server`, `agent`, `shared-proto`, `shared-crypto`, `db/` | none (RFC/IT specs only) |
 | M4 Web UI and acquired data | Operators run jobs and view/edit acquired data in the browser; offline start works | UI framework, reference UI, `server` | none |
 | M5 Real-time monitoring | Monitoring at the 10 ms target, interval capture, multiple subscribers | `agent`, worker, `server`, UI | none |
 | M6 Trust, approval and reprogramming | Signed packages and artifacts, approval levels, ECU reprogramming with preconditions | `shared-crypto`, `vendor-manifest`, `agent`, `server` | ISO 14229-1 clause 16 (held); SAE J3138 (not held) |
-| M7 Standard formats and external API | ODX/PDX and OTX ingestion; SOVD / ExVe compatible endpoints | `diag-frontend`, `server` | ISO 22901-1 (ODX), ISO 13209 (OTX), ISO 17978 (SOVD), ISO 20077/20078 (none held) |
+| M7 Standard formats and external API | ODX/PDX and OTX ingestion; SOVD / ExVe compatible endpoints | `diag-frontend`, `server` | ISO 22901-1 (ODX), ISO 17978 (SOVD) (held); ISO 13209 (OTX), ISO 20077/20078 (not held) |
 | M8 Cloud deployment and field validation | Standard (cloud) deployment, scale measures for size S, validation with real VCIs | `server`, deployment, CI | UNECE R155/R156 as needed (free to obtain) |
 
-M5 and M6 do not depend on each other; their order can be swapped. M7 can start as soon as the standards are obtained, in parallel with M5/M6.
+M5 and M6 do not depend on each other; their order can be swapped. M7's ODX and SOVD parts can start in parallel with M5/M6; its OTX and ExVe parts wait on those standards.
 
 ## M1 Local E2E (current milestone)
 
@@ -42,7 +42,7 @@ M5 and M6 do not depend on each other; their order can be swapped. M7 can start 
 3. A write job interrupted at each injected fault (power loss during transfer, worker crash, VCI disconnect) resumes from the journal or ends in a defined failure state, never in an undefined one (design 5.6 state diagram), with a test per fault.
 4. No P1 item for M1 remains open in `backlog.md` or `worker-crates-backlog.md`.
 
-**Risk.** ISO 14229-1 defines the services but not the session-layer timing (P2 / P2* and response-pending handling), which is in ISO 14229-2 (not held). `sim-ecu` uses fixed, configurable timing values in M1; they are checked against ISO 14229-2 in M2.
+**Risk.** ISO 14229-1 defines the services but not the session-layer timing (P2 / P2* and response-pending handling), which is in ISO 14229-2 (held, 2021 edition). `sim-ecu` uses fixed, configurable timing values in M1; they are checked against ISO 14229-2 in M2.
 
 ## M2 Diagnostic runtime
 
@@ -50,7 +50,7 @@ M5 and M6 do not depend on each other; their order can be swapped. M7 can start 
 
 **Scope.**
 
-- Worker L1: ISO-TP (ISO 15765-2, not held) and UDS client behaviour on both the J2534 and D-PDU workers (design 8.1): session-layer timing and response pending from ISO 14229-2 (not held; existing worker ADRs already cite its timing clause), request/response handling per ISO 14229-1 clause 7.
+- Worker L1: ISO-TP (ISO 15765-2) and UDS client behaviour on both the J2534 and D-PDU workers (design 8.1): session-layer timing and response pending from ISO 14229-2 (existing worker ADRs already cite its timing clause), request/response handling per ISO 14229-1 clause 7.
 - Agent L2 primitives (design 8.1) built on ISO 14229-1: read/write DID (10.2, 10.7) with the DID ranges in Annex C.1, read DTC with the status-mask bits and DTC formats in Annex D.2 / D.4, routine control (13.2, Annex F), security access (9.4). The 2026 edition also defines the Authentication service (9.6, certificate exchange and challenge-response) as an alternative to seed/key; L2 keeps the security step replaceable so it can be added in M6.
 - `diag-ir`: declaration part in FlatBuffers with pre-expanded decode plans and COMPU-METHOD conversions (8.2.2); the full procedure-part instruction set (8.2.4); resume model (8.2.5); interruptibility attributes (8.10.1).
 - `diag-frontend`: the proprietary format first, CSV tables + JavaScript subset -> IR (8.4), because it needs no purchased standard. Dry-run validation with vehicle access mocked (12.1).
@@ -114,7 +114,7 @@ M5 and M6 do not depend on each other; their order can be swapped. M7 can start 
 
 ## M7 Standard formats and external API
 
-**Goal.** ODX/PDX and OTX as the primary vehicle-knowledge formats (R14), and SOVD / ExVe compatible external endpoints (R13, design 8.7). Starts when the standards are obtained.
+**Goal.** ODX/PDX and OTX as the primary vehicle-knowledge formats (R14), and SOVD / ExVe compatible external endpoints (R13, design 8.7). The ODX and SOVD parts can start now; OTX and ExVe wait on ISO 13209 and ISO 20077/20078.
 
 **Exit criteria.**
 
@@ -134,7 +134,7 @@ M5 and M6 do not depend on each other; their order can be swapped. M7 can start 
 
 These change the plan's scope or order; each is a design-17 item or a purchase.
 
-- Standards purchase: ISO 14229-2 and ISO 15765-2 before M2; SAE J3138 before M6; ISO 22901-1 (ODX) and the other M7 standards before M7. ISO 14229-1 is held (2026 edition).
+- Standards purchase: SAE J3138 before M6; ISO 13209 (OTX) and ISO 20077/20078 (ExVe) before M7. The M1 and M2 standards, ISO 22901-1 (ODX) and ISO 17978 (SOVD) are held.
 - Order of M5 and M6.
 - Design 17 P3 (practical scope of Linux support) affects how much of M1's Linux path is kept as a supported product feature rather than a test path.
 - Design 17 P5 (non-functional targets) before M8.

@@ -1373,3 +1373,67 @@ fn current_op_and_step_agree_on_primitives() {
         );
     }
 }
+
+/// A check that is too strict would be shared by `current_op` and `step`, so they would agree
+/// on refusing a valid call. Every primitive, right at the stack limit it can run at, must still
+/// be accepted and reach the host exactly once.
+#[test]
+fn primitives_run_at_the_stack_limit() {
+    let cases = [
+        (Op::ServiceRequest { service: 1 }, MAX_STACK),
+        (Op::RoutineControl { routine: 1, sub: 1 }, MAX_STACK),
+        (Op::SecurityAccess { level: 1 }, MAX_STACK),
+        (Op::FlashTransfer { block: 0 }, MAX_STACK),
+        (
+            Op::Log {
+                level: 0,
+                message: 0,
+            },
+            MAX_STACK,
+        ),
+        (Op::Wait { millis: 1 }, MAX_STACK),
+        (Op::MonitorCapture { back_millis: 1 }, MAX_STACK),
+        (Op::ReadDtc { mask: 1 }, MAX_STACK - 1),
+        (Op::HmiRequest { form: 0 }, MAX_STACK - 1),
+        (Op::RecordInput { template: 0 }, MAX_STACK - 1),
+    ];
+    // The list covers every diagnostic primitive once.
+    let kinds: std::collections::HashSet<_> = cases
+        .iter()
+        .map(|(op, _)| std::mem::discriminant(op))
+        .collect();
+    assert_eq!(kinds.len(), cases.len());
+    assert!(cases.iter().all(|(op, _)| op.is_diagnostic_primitive()));
+    assert_eq!(
+        cases.len(),
+        primitive_programs().len() + 1,
+        "every primitive plus Log"
+    );
+
+    for (op, depth) in cases {
+        let mut stack = vec![Value::I64(0); depth];
+        if let Some(top) = stack.last_mut() {
+            *top = Value::Bytes(vec![0x41]);
+        }
+        let program = prog(vec![op.clone()], vec![b"ok".to_vec()]);
+        let mut vm = Vm::resume(VmState {
+            stack,
+            ..Vm::new(&program).state
+        });
+        let mut host = MockHost {
+            responses: VecDeque::from([Ok(vec![1])]),
+            keys: VecDeque::from([Some(vec![2])]),
+            hmi: VecDeque::from([Some(vec![3])]),
+            records: VecDeque::from([Some(vec![4])]),
+            ..MockHost::default()
+        };
+        assert_eq!(vm.current_op(&program), Ok(Some(&op)), "{op:?}");
+        assert_eq!(
+            vm.step(&program, &mut host).unwrap(),
+            StepOutcome::Finished,
+            "{op:?}"
+        );
+        assert_eq!(host.calls.len() + host.logs.len(), 1, "{op:?}");
+        assert!(vm.state.stack.len() <= MAX_STACK, "{op:?}");
+    }
+}

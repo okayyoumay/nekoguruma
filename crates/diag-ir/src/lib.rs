@@ -295,7 +295,7 @@ impl Vm {
     /// The job runner uses it to journal an intent marker before a primitive is sent (ADR-229).
     ///
     /// It runs [`Vm::check_state`] and, for a diagnostic primitive, the checks [`Vm::step`] makes
-    /// before it calls the host. So for a primitive, `Ok(Some(op))` means the next `step` reaches
+    /// before it calls the host (operand, constant, UTF-8, room for an answer that is pushed). So for a primitive, `Ok(Some(op))` means the next `step` reaches
     /// the host (ADR-233): the runner never journals an intent for a request that is not sent.
     /// Other instructions can still fail in `step` (arithmetic, types, limits); no intent
     /// precedes them.
@@ -586,11 +586,10 @@ impl Vm {
         program: &'a Program,
     ) -> Result<HostInput<'a>, VmError> {
         Ok(match op {
-            // Send the bytes on top of the stack and replace them with the answer.
+            // Send the bytes on top of the stack and replace them with the answer, which needs
+            // no room.
             Op::ServiceRequest { .. } | Op::RoutineControl { .. } | Op::SecurityAccess { .. } => {
-                let operand = self.bytes_operand()?;
-                self.check_room(1, 1)?;
-                HostInput::Bytes(operand)
+                HostInput::Bytes(self.bytes_operand()?)
             }
             // Send the bytes on top of the stack, which are then dropped.
             Op::FlashTransfer { .. } => HostInput::Bytes(self.bytes_operand()?),
@@ -672,7 +671,7 @@ impl Vm {
 
     /// Checks that popping `pop` values and pushing `push` stays within [`MAX_STACK`].
     fn check_room(&self, pop: usize, push: usize) -> Result<(), VmError> {
-        if self.state.stack.len() - pop + push > MAX_STACK {
+        if self.state.stack.len().saturating_sub(pop) + push > MAX_STACK {
             return Err(VmError::StackOverflow);
         }
         Ok(())

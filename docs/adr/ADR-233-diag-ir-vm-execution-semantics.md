@@ -37,8 +37,9 @@ No IR programs, transpiler or journals existed when this was decided, so `VmStat
    - The runner writes the journal around `step`, using two helpers. `Vm::current_op` shows the next instruction before it runs. `Op::is_diagnostic_primitive` tells whether that instruction goes to the host.
    - Two invariants let the runner journal an intent marker safely (ADR-229), and both are tested:
      - `step` returns a VM error only before any host call. After the call, an instruction only stores the answer, and the room for it was checked beforehand.
-     - For a diagnostic primitive, `Vm::current_op` returns the instruction only if the next `step` reaches the host. It runs the state checks of item 9 and the primitive's own pre-host checks (operand present and of type `Bytes`, constant index, valid UTF-8, stack room for the answer).
-   - These checks have one source, an exhaustive `match` shared by `current_op` and `step`, so the two cannot drift. A new instruction must declare its checks there before it compiles.
+     - For a diagnostic primitive, `Vm::current_op` returns the instruction only if the next `step` reaches the host. It runs the state checks of item 9 and the primitive's own pre-host checks (operand present and of type `Bytes`, constant index, valid UTF-8, stack room for an answer that is pushed rather than replacing the operand).
+   - These checks have one source, an exhaustive `match` shared by `current_op` and `step`, so the two cannot disagree. A new instruction must be listed there, and in `Op::is_diagnostic_primitive`, before it compiles.
+   - The compiler cannot check that the two lists classify an instruction the same way, or that the checks are neither too weak nor too strict. Tests cover that for every primitive: a valid call at the stack limit reaches the host exactly once, and each invalid setup is refused by both.
    - So the runner never journals an intent for a request that is not sent. Other instructions can still fail in `step`; no intent precedes them.
    - `Vm::check_state` runs the state checks on their own, so the runner can validate a state restored from the journal before it starts any recovery that touches the ECU.
    - `VmState::checkpoint` and `resume_count` are left to the write-job journal.

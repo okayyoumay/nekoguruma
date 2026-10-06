@@ -221,6 +221,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-230](ADR-230-backlog-loop-serialization-and-claims.md) | Backlog Loop Runs One Item at a Time, with PR-Based Claims and Run State | Accepted | `.claude/skills/backlog-loop`, `next-task`, `scripts/classify-pr-risk.sh` |
 | [ADR-231](ADR-231-agent-mints-worker-tokens-in-process.md) | The Agent Mints Worker Bearer Tokens In-Process | Accepted | `worker-host` client, `vci-service-interface` token |
 | [ADR-232](ADR-232-linux-support-scope-and-minimum-glibc.md) | Linux Support Scope and Minimum glibc 2.17 | Accepted | design 2 / 7.1.2 / 12.1 / 17, `worker-linux` CI job |
+| [ADR-233](ADR-233-diag-ir-vm-execution-semantics.md) | diag-ir VM Execution Semantics | Accepted | `diag-ir` VM |
 
 ## Status Legend
 
@@ -268,4 +269,4 @@ ADR-109 (amended by ADR-113), ADR-113, ADR-119 (dual-implementation sync duty re
 ADR-057 (amended by ADR-102), ADR-120, ADR-143
 
 ### Write Jobs & Resume
-ADR-229
+ADR-229, ADR-233

@@ -1,0 +1,730 @@
+use std::collections::VecDeque;
+
+use super::*;
+
+#[derive(Debug, thiserror::Error)]
+#[error("mock host failure")]
+struct MockError;
+
+/// Records every call. Answers come from queues; an empty queue is a host error, `None` in the
+/// pending queues means "not answered yet".
+#[derive(Default)]
+struct MockHost {
+    calls: Vec<String>,
+    responses: VecDeque<Result<Vec<u8>, MockError>>,
+    keys: VecDeque<Option<Vec<u8>>>,
+    hmi: VecDeque<Option<Vec<u8>>>,
+    fail_next: bool,
+    logs: Vec<(u8, String)>,
+}
+
+impl MockHost {
+    fn fail(&mut self) -> Result<(), MockError> {
+        if std::mem::take(&mut self.fail_next) {
+            Err(MockError)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn response(&mut self) -> Result<Vec<u8>, MockError> {
+        self.responses.pop_front().unwrap_or(Err(MockError))
+    }
+}
+
+impl DiagHost for MockHost {
+    type Error = MockError;
+
+    fn service_request(&mut self, service: u16, payload: &[u8]) -> Result<Vec<u8>, MockError> {
+        self.calls
+            .push(format!("service {service:#x} {payload:02x?}"));
+        self.response()
+    }
+    fn read_dtc(&mut self, mask: u8) -> Result<Vec<u8>, MockError> {
+        self.calls.push(format!("read_dtc {mask:#x}"));
+        self.response()
+    }
+    fn routine_control(
+        &mut self,
+        routine: u16,
+        sub: u8,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, MockError> {
+        self.calls
+            .push(format!("routine {routine:#x} {sub} {payload:02x?}"));
+        self.response()
+    }
+    fn security_access(&mut self, level: u8, seed: &[u8]) -> Result<Option<Vec<u8>>, MockError> {
+        self.calls.push(format!("security {level} {seed:02x?}"));
+        self.fail()?;
+        Ok(self.keys.pop_front().flatten())
+    }
+    fn flash_transfer(&mut self, block: u32, data: &[u8]) -> Result<(), MockError> {
+        self.calls.push(format!("flash {block} {data:02x?}"));
+        self.fail()
+    }
+    fn wait(&mut self, millis: u32) -> Result<(), MockError> {
+        self.calls.push(format!("wait {millis}"));
+        self.fail()
+    }
+    fn hmi_request(&mut self, form: &[u8]) -> Result<Option<Vec<u8>>, MockError> {
+        self.calls.push(format!("hmi {form:02x?}"));
+        self.fail()?;
+        Ok(self.hmi.pop_front().flatten())
+    }
+    fn record_input(&mut self, template: &[u8]) -> Result<Vec<u8>, MockError> {
+        self.calls.push(format!("record {template:02x?}"));
+        self.response()
+    }
+    fn monitor_capture(&mut self, back_millis: u32) -> Result<(), MockError> {
+        self.calls.push(format!("capture {back_millis}"));
+        self.fail()
+    }
+    fn log(&mut self, level: u8, message: &str) {
+        self.logs.push((level, message.to_owned()));
+    }
+}
+
+fn prog(code: Vec<Op>, constants: Vec<Vec<u8>>) -> Program {
+    Program {
+        schema_version: IR_SCHEMA_VERSION,
+        code,
+        constants,
+        sections: Vec::new(),
+        source_map: Vec::new(),
+    }
+}
+
+/// Steps until the program finishes, failing on anything else.
+fn run(vm: &mut Vm, program: &Program, host: &mut MockHost) {
+    for _ in 0..10_000 {
+        match vm.step(program, host).expect("step should succeed") {
+            StepOutcome::Continue => {}
+            StepOutcome::Finished => return,
+            StepOutcome::Waiting(on) => panic!("unexpected wait on {on:?}"),
+        }
+    }
+    panic!("program did not finish");
+}
+
+/// Runs `code` with an empty host and returns the final stack.
+fn eval(code: Vec<Op>) -> Vec<Value> {
+    let program = prog(code, Vec::new());
+    let mut vm = Vm::new(&program);
+    run(&mut vm, &program, &mut MockHost::default());
+    vm.state.stack
+}
+
+/// Steps once, expects a VM error and checks that the state did not change.
+fn expect_vm_error(code: Vec<Op>, constants: Vec<Vec<u8>>, steps_before: usize) -> VmError {
+    let program = prog(code, constants);
+    let mut vm = Vm::new(&program);
+    let mut host = MockHost::default();
+    for _ in 0..steps_before {
+        vm.step(&program, &mut host).unwrap();
+    }
+    let before = postcard::to_allocvec(&vm.state).unwrap();
+    let error = match vm.step(&program, &mut host) {
+        Err(StepError::Vm(e)) => e,
+        other => panic!("expected a VM error, got {other:?}"),
+    };
+    assert_eq!(
+        postcard::to_allocvec(&vm.state).unwrap(),
+        before,
+        "state changed on error"
+    );
+    error
+}
+
+fn i(v: i64) -> Op {
+    Op::PushI64(v)
+}
+
+#[test]
+fn integer_and_float_arithmetic() {
+    assert_eq!(
+        eval(vec![
+            i(7),
+            i(3),
+            Op::Sub,
+            i(4),
+            Op::Mul,
+            i(5),
+            Op::Div,
+            i(1),
+            Op::Add
+        ]),
+        [Value::I64(4)]
+    );
+    assert_eq!(
+        eval(vec![
+            Op::PushF64(1.5),
+            Op::PushF64(2.0),
+            Op::Mul,
+            Op::PushF64(0.0),
+            Op::Div
+        ]),
+        [Value::F64(f64::INFINITY)]
+    );
+}
+
+#[test]
+fn arithmetic_errors_leave_the_state_unchanged() {
+    assert_eq!(
+        expect_vm_error(vec![i(i64::MAX), i(1), Op::Add], vec![], 2),
+        VmError::Overflow
+    );
+    assert_eq!(
+        expect_vm_error(vec![i(i64::MIN), i(-1), Op::Div], vec![], 2),
+        VmError::Overflow
+    );
+    assert_eq!(
+        expect_vm_error(vec![i(1), i(0), Op::Div], vec![], 2),
+        VmError::DivisionByZero
+    );
+    assert_eq!(
+        expect_vm_error(vec![i(1), Op::PushF64(1.0), Op::Add], vec![], 2),
+        VmError::TypeMismatch
+    );
+    assert_eq!(
+        expect_vm_error(vec![i(1), Op::Add], vec![], 1),
+        VmError::StackUnderflow
+    );
+}
+
+#[test]
+fn bitwise_and_shifts() {
+    assert_eq!(
+        eval(vec![
+            i(0b1100),
+            i(0b1010),
+            Op::BitAnd,
+            i(0b0001),
+            Op::BitOr,
+            i(0b1111),
+            Op::BitXor
+        ]),
+        [Value::I64(0b0110)]
+    );
+    // Shifts work on the bit pattern: Shr is logical, Shl drops bits without an error.
+    assert_eq!(eval(vec![i(-1), i(60), Op::Shr]), [Value::I64(0xF)]);
+    assert_eq!(eval(vec![i(1), i(63), Op::Shl]), [Value::I64(i64::MIN)]);
+    assert_eq!(eval(vec![i(3), i(63), Op::Shl]), [Value::I64(i64::MIN)]);
+    assert_eq!(
+        expect_vm_error(vec![i(1), i(64), Op::Shl], vec![], 2),
+        VmError::ShiftOutOfRange(64)
+    );
+    assert_eq!(
+        expect_vm_error(vec![i(1), i(-1), Op::Shr], vec![], 2),
+        VmError::ShiftOutOfRange(-1)
+    );
+}
+
+#[test]
+fn comparisons() {
+    const T: Value = Value::Bool(true);
+    const F: Value = Value::Bool(false);
+    assert_eq!(eval(vec![i(2), i(2), Op::CmpEq]), [T]);
+    assert_eq!(eval(vec![i(1), i(2), Op::CmpLt]), [T]);
+    assert_eq!(eval(vec![i(1), i(2), Op::CmpGt]), [F]);
+    assert_eq!(
+        eval(vec![
+            Op::PushF64(f64::NAN),
+            Op::PushF64(f64::NAN),
+            Op::CmpEq
+        ]),
+        [F]
+    );
+    assert_eq!(eval(vec![i(1), i(1), Op::CmpEq, Op::Not]), [F]);
+    let bytes = prog(
+        vec![Op::PushBytes(0), Op::PushBytes(1), Op::CmpEq],
+        vec![vec![1, 2], vec![1, 2]],
+    );
+    let mut vm = Vm::new(&bytes);
+    run(&mut vm, &bytes, &mut MockHost::default());
+    assert_eq!(vm.state.stack, [T]);
+    assert_eq!(
+        expect_vm_error(vec![i(1), Op::PushF64(1.0), Op::CmpEq], vec![], 2),
+        VmError::TypeMismatch
+    );
+    assert_eq!(
+        expect_vm_error(
+            vec![Op::PushBytes(0), Op::PushBytes(0), Op::CmpLt],
+            vec![vec![]],
+            2
+        ),
+        VmError::TypeMismatch
+    );
+    assert_eq!(
+        expect_vm_error(vec![i(0), Op::Not], vec![], 1),
+        VmError::TypeMismatch
+    );
+}
+
+#[test]
+fn stack_operations() {
+    assert_eq!(
+        eval(vec![i(1), i(2), Op::Swap, Op::Dup, Op::Pop]),
+        [Value::I64(2), Value::I64(1)]
+    );
+}
+
+#[test]
+fn loop_with_conditional_jump() {
+    // global0 = 0; while global0 < 5 { global0 += 1 }; push global0
+    let code = vec![
+        i(0),
+        Op::StoreGlobal(0),
+        Op::LoadGlobal(0), // 2
+        i(5),
+        Op::CmpLt,
+        Op::JumpIfFalse(11),
+        Op::LoadGlobal(0),
+        i(1),
+        Op::Add,
+        Op::StoreGlobal(0),
+        Op::Jump(2),
+        Op::LoadGlobal(0), // 11
+    ];
+    assert_eq!(eval(code), [Value::I64(5)]);
+    assert_eq!(
+        expect_vm_error(vec![i(1), Op::JumpIfFalse(0)], vec![], 1),
+        VmError::TypeMismatch
+    );
+    assert_eq!(
+        expect_vm_error(vec![Op::Jump(2)], vec![], 0),
+        VmError::BadPc(2)
+    );
+    // A jump to the end finishes the program.
+    assert_eq!(eval(vec![Op::Jump(2), i(1)]), []);
+}
+
+#[test]
+fn calls_keep_locals_per_frame() {
+    // local0 = 10; call sub; push local0 + returned value. sub: local0 = 32; push local0; ret
+    let code = vec![
+        i(10),
+        Op::StoreLocal(0),
+        Op::Call(7),
+        Op::LoadLocal(0),
+        Op::Add,
+        Op::Ret, // top-level return ends the program
+        i(99),   // never reached
+        i(32),   // 7: sub
+        Op::StoreLocal(0),
+        Op::LoadLocal(0),
+        Op::Ret,
+    ];
+    assert_eq!(eval(code), [Value::I64(42)]);
+    // A subroutine does not see its caller's locals.
+    assert_eq!(
+        expect_vm_error(
+            vec![
+                i(1),
+                Op::StoreLocal(0),
+                Op::Call(4),
+                Op::Ret,
+                Op::LoadLocal(0)
+            ],
+            vec![],
+            3
+        ),
+        VmError::UndefinedVariable(0)
+    );
+    assert_eq!(
+        expect_vm_error(vec![Op::LoadGlobal(3)], vec![], 0),
+        VmError::UndefinedVariable(3)
+    );
+}
+
+#[test]
+fn call_depth_is_limited() {
+    let program = prog(vec![Op::Call(0)], Vec::new());
+    let mut vm = Vm::new(&program);
+    let mut host = MockHost::default();
+    for _ in 0..MAX_CALL_DEPTH {
+        vm.step(&program, &mut host).unwrap();
+    }
+    let before = vm.state.clone();
+    assert!(matches!(
+        vm.step(&program, &mut host),
+        Err(StepError::Vm(VmError::CallDepthExceeded))
+    ));
+    assert_eq!(vm.state, before);
+}
+
+#[test]
+fn byte_indexing() {
+    let program = prog(
+        vec![
+            Op::PushBytes(0),
+            i(1),
+            i(0xAB),
+            Op::IndexSet,
+            Op::Dup,
+            i(1),
+            Op::IndexGet,
+        ],
+        vec![vec![0, 0, 0]],
+    );
+    let mut vm = Vm::new(&program);
+    run(&mut vm, &program, &mut MockHost::default());
+    assert_eq!(
+        vm.state.stack,
+        [Value::Bytes(vec![0, 0xAB, 0]), Value::I64(0xAB)]
+    );
+
+    let constants = || vec![vec![0u8; 2]];
+    assert_eq!(
+        expect_vm_error(vec![Op::PushBytes(0), i(2), Op::IndexGet], constants(), 2),
+        VmError::IndexOutOfRange(2)
+    );
+    assert_eq!(
+        expect_vm_error(vec![Op::PushBytes(0), i(-1), Op::IndexGet], constants(), 2),
+        VmError::IndexOutOfRange(-1)
+    );
+    assert_eq!(
+        expect_vm_error(
+            vec![Op::PushBytes(0), i(0), i(256), Op::IndexSet],
+            constants(),
+            3
+        ),
+        VmError::ByteOutOfRange(256)
+    );
+    assert_eq!(
+        expect_vm_error(vec![i(0), i(0), Op::IndexGet], vec![], 2),
+        VmError::TypeMismatch
+    );
+}
+
+#[test]
+fn diagnostic_primitives_reach_the_host() {
+    let program = prog(
+        vec![
+            Op::PushBytes(0),
+            Op::ServiceRequest { service: 0x22 },
+            Op::ReadDtc { mask: 0x08 },
+            Op::PushBytes(1),
+            Op::RoutineControl {
+                routine: 0xFF00,
+                sub: 1,
+            },
+            Op::PushBytes(1),
+            Op::FlashTransfer { block: 3 },
+            Op::Wait { millis: 50 },
+            Op::RecordInput { template: 2 },
+            Op::MonitorCapture { back_millis: 500 },
+            Op::Log {
+                level: 2,
+                message: 3,
+            },
+        ],
+        vec![vec![0xF1, 0x90], vec![0xAA], vec![7], b"done".to_vec()],
+    );
+    let mut host = MockHost {
+        responses: VecDeque::from([
+            Ok(vec![0x62, 0xF1, 0x90]),
+            Ok(vec![0x59]),
+            Ok(vec![0x71]),
+            Ok(vec![0x01]),
+        ]),
+        ..MockHost::default()
+    };
+    let mut vm = Vm::new(&program);
+    run(&mut vm, &program, &mut host);
+    assert_eq!(
+        host.calls,
+        [
+            "service 0x22 [f1, 90]",
+            "read_dtc 0x8",
+            "routine 0xff00 1 [aa]",
+            "flash 3 [aa]",
+            "wait 50",
+            "record [07]",
+            "capture 500",
+        ]
+    );
+    assert_eq!(host.logs, [(2, "done".to_owned())]);
+    assert_eq!(
+        vm.state.stack,
+        [
+            Value::Bytes(vec![0x62, 0xF1, 0x90]),
+            Value::Bytes(vec![0x59]),
+            Value::Bytes(vec![0x71]),
+            Value::Bytes(vec![0x01]),
+        ]
+    );
+    assert_eq!(vm.state.steps, 11);
+}
+
+/// 8.2.5: after a worker crash or VCI disconnect the VM state is retained and execution resumes
+/// from the diagnostic primitive, so a failed primitive must leave the state untouched.
+#[test]
+fn host_error_leaves_the_state_on_the_primitive() {
+    let program = prog(
+        vec![Op::PushBytes(0), Op::ServiceRequest { service: 0x22 }],
+        vec![vec![0xF1, 0x90]],
+    );
+    let mut vm = Vm::new(&program);
+    let mut host = MockHost::default();
+    vm.step(&program, &mut host).unwrap();
+    let before = postcard::to_allocvec(&vm.state).unwrap();
+    host.responses.push_back(Err(MockError));
+    assert!(matches!(
+        vm.step(&program, &mut host),
+        Err(StepError::Host(MockError))
+    ));
+    assert_eq!(postcard::to_allocvec(&vm.state).unwrap(), before);
+
+    host.responses.push_back(Ok(vec![0x62]));
+    assert_eq!(vm.step(&program, &mut host).unwrap(), StepOutcome::Finished);
+    assert_eq!(host.calls.len(), 2, "the primitive is sent again");
+    assert_eq!(vm.state.stack, [Value::Bytes(vec![0x62])]);
+
+    for code in [
+        vec![Op::PushBytes(0), Op::FlashTransfer { block: 0 }],
+        vec![Op::PushBytes(0), Op::Wait { millis: 1 }],
+        vec![Op::PushBytes(0), Op::MonitorCapture { back_millis: 1 }],
+    ] {
+        let primitive = prog(code, vec![vec![1]]);
+        let mut vm = Vm::new(&primitive);
+        let mut host = MockHost::default();
+        vm.step(&primitive, &mut host).unwrap();
+        let before = vm.state.clone();
+        host.fail_next = true;
+        assert!(matches!(
+            vm.step(&primitive, &mut host),
+            Err(StepError::Host(_))
+        ));
+        assert_eq!(vm.state, before);
+    }
+}
+
+#[test]
+fn hmi_and_seed_key_wait_without_changing_the_state() {
+    let program = prog(
+        vec![
+            Op::HmiRequest { form: 0 },
+            Op::PushBytes(1),
+            Op::SecurityAccess { level: 1 },
+        ],
+        vec![b"form".to_vec(), vec![0x12, 0x34]],
+    );
+    let mut vm = Vm::new(&program);
+    let mut host = MockHost {
+        hmi: VecDeque::from([None, Some(b"ok".to_vec())]),
+        keys: VecDeque::from([None, None, Some(vec![0xBE, 0xEF])]),
+        ..MockHost::default()
+    };
+
+    let initial = vm.state.clone();
+    assert_eq!(
+        vm.step(&program, &mut host).unwrap(),
+        StepOutcome::Waiting(WaitingOn::Hmi)
+    );
+    assert_eq!(vm.state, initial);
+    assert_eq!(vm.step(&program, &mut host).unwrap(), StepOutcome::Continue);
+    vm.step(&program, &mut host).unwrap();
+
+    let before = vm.state.clone();
+    for _ in 0..2 {
+        assert_eq!(
+            vm.step(&program, &mut host).unwrap(),
+            StepOutcome::Waiting(WaitingOn::SeedKey)
+        );
+        assert_eq!(vm.state, before);
+    }
+    assert_eq!(vm.step(&program, &mut host).unwrap(), StepOutcome::Finished);
+    assert_eq!(
+        vm.state.stack,
+        [Value::Bytes(b"ok".to_vec()), Value::Bytes(vec![0xBE, 0xEF])]
+    );
+    assert_eq!(vm.state.steps, 3, "waiting steps are not counted");
+}
+
+/// Checks the VM can make before the host call fail without calling the host, so a host answer
+/// is never thrown away.
+#[test]
+fn vm_checks_run_before_the_host_is_called() {
+    let mut code = vec![i(0); MAX_STACK];
+    code.push(Op::ReadDtc { mask: 0xFF });
+    let program = prog(code, Vec::new());
+    let mut vm = Vm::new(&program);
+    let mut host = MockHost::default();
+    for _ in 0..MAX_STACK {
+        vm.step(&program, &mut host).unwrap();
+    }
+    assert!(matches!(
+        vm.step(&program, &mut host),
+        Err(StepError::Vm(VmError::StackOverflow))
+    ));
+    assert!(host.calls.is_empty());
+
+    for (code, constants, expected) in [
+        (
+            vec![i(1), Op::ServiceRequest { service: 0x22 }],
+            vec![],
+            VmError::TypeMismatch,
+        ),
+        (
+            vec![i(0), Op::ServiceRequest { service: 0x22 }],
+            vec![],
+            VmError::TypeMismatch,
+        ),
+        (
+            vec![i(0), Op::HmiRequest { form: 9 }],
+            vec![],
+            VmError::BadConstant(9),
+        ),
+        (
+            vec![i(0), Op::RecordInput { template: 9 }],
+            vec![],
+            VmError::BadConstant(9),
+        ),
+        (
+            vec![
+                i(0),
+                Op::Log {
+                    level: 0,
+                    message: 0,
+                },
+            ],
+            vec![vec![0xFF]],
+            VmError::InvalidUtf8(0),
+        ),
+        (
+            vec![i(0), Op::FlashTransfer { block: 0 }],
+            vec![],
+            VmError::TypeMismatch,
+        ),
+    ] {
+        assert_eq!(expect_vm_error(code, constants, 1), expected);
+    }
+    assert_eq!(
+        expect_vm_error(vec![Op::PushBytes(5)], vec![], 0),
+        VmError::BadConstant(5)
+    );
+}
+
+#[test]
+fn stack_depth_is_limited() {
+    let program = prog(vec![i(0); MAX_STACK + 1], Vec::new());
+    let mut vm = Vm::new(&program);
+    let mut host = MockHost::default();
+    for _ in 0..MAX_STACK {
+        vm.step(&program, &mut host).unwrap();
+    }
+    assert!(matches!(
+        vm.step(&program, &mut host),
+        Err(StepError::Vm(VmError::StackOverflow))
+    ));
+}
+
+#[test]
+fn finished_program_stays_finished() {
+    let program = prog(vec![i(1)], Vec::new());
+    let mut vm = Vm::new(&program);
+    let mut host = MockHost::default();
+    assert_eq!(vm.step(&program, &mut host).unwrap(), StepOutcome::Finished);
+    let after = vm.state.clone();
+    assert_eq!(vm.step(&program, &mut host).unwrap(), StepOutcome::Finished);
+    assert_eq!(vm.state, after);
+    assert_eq!(vm.current_op(&program), Ok(None));
+
+    vm.state.pc = 5;
+    assert!(matches!(
+        vm.step(&program, &mut host),
+        Err(StepError::Vm(VmError::BadPc(5)))
+    ));
+    assert_eq!(vm.current_op(&program), Err(VmError::BadPc(5)));
+}
+
+#[test]
+fn current_op_names_the_next_instruction() {
+    let program = prog(vec![i(1), Op::ReadDtc { mask: 1 }], Vec::new());
+    let mut vm = Vm::new(&program);
+    assert_eq!(vm.current_op(&program), Ok(Some(&i(1))));
+    assert!(!i(1).is_diagnostic_primitive());
+    vm.step(&program, &mut MockHost::default()).unwrap();
+    let op = vm.current_op(&program).unwrap().unwrap();
+    assert!(op.is_diagnostic_primitive());
+}
+
+#[test]
+fn schema_versions_must_match() {
+    let mut newer = prog(vec![i(1)], Vec::new());
+    newer.schema_version = IR_SCHEMA_VERSION + 1;
+    let mut vm = Vm::new(&newer);
+    assert!(matches!(
+        vm.step(&newer, &mut MockHost::default()),
+        Err(StepError::Vm(VmError::SchemaMismatch { .. }))
+    ));
+
+    let current = prog(vec![i(1)], Vec::new());
+    let mut state = Vm::new(&current).state;
+    state.schema_version = IR_SCHEMA_VERSION + 1;
+    let mut vm = Vm::resume(state);
+    assert!(matches!(
+        vm.step(&current, &mut MockHost::default()),
+        Err(StepError::Vm(VmError::SchemaMismatch { .. }))
+    ));
+}
+
+/// 8.2.5: an agent crash resumes from the journaled state. Serializing the state at every
+/// instruction boundary and resuming from the bytes must give the same result as an
+/// uninterrupted run.
+#[test]
+fn state_round_trips_through_postcard_at_every_boundary() {
+    let code = vec![
+        i(3),
+        Op::StoreGlobal(0),
+        Op::PushF64(0.5),
+        Op::Pop,
+        Op::LoadGlobal(0), // 4: loop
+        i(0),
+        Op::CmpGt,
+        Op::JumpIfFalse(20),
+        Op::PushBytes(0),
+        Op::Call(22),
+        Op::Pop,
+        Op::LoadGlobal(0),
+        i(1),
+        Op::Sub,
+        Op::StoreGlobal(0),
+        Op::Jump(4),
+        i(0),
+        i(0),
+        i(0),
+        i(0),
+        Op::LoadGlobal(0), // 20
+        Op::Ret,
+        Op::StoreLocal(0), // 22: sub
+        Op::LoadLocal(0),
+        Op::ServiceRequest { service: 0x22 },
+        Op::Ret,
+    ];
+    let program = prog(code, vec![vec![0xF1, 0x90]]);
+    let new_host = || MockHost {
+        responses: (0..3).map(|n| Ok(vec![0x62, n])).collect(),
+        ..MockHost::default()
+    };
+
+    let mut straight = Vm::new(&program);
+    let mut host = new_host();
+    run(&mut straight, &program, &mut host);
+    assert_eq!(host.calls.len(), 3);
+
+    let mut host = new_host();
+    let mut vm = Vm::new(&program);
+    loop {
+        let bytes = postcard::to_allocvec(&vm.state).unwrap();
+        let restored: VmState = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(restored, vm.state);
+        vm = Vm::resume(restored);
+        if vm.step(&program, &mut host).unwrap() == StepOutcome::Finished {
+            break;
+        }
+    }
+    assert_eq!(vm.state, straight.state);
+    assert_eq!(vm.state.stack, [Value::I64(0)]);
+}

@@ -31,6 +31,10 @@ pub enum HostError {
     EventStreamEnded,
     #[error("no response from the ECU")]
     NoResponse,
+    /// The worker dropped events of the link, so the primitive's outcome is unknown: the
+    /// request may have been answered.
+    #[error("the worker lost events of the link")]
+    EventsLost,
     /// The primitive ended without a response after the worker reported this error event
     /// (for example a transmit error or a lost VCI), so the request may not have been sent.
     #[error("the primitive failed: {}", error_event_name(*.0))]
@@ -191,11 +195,7 @@ impl WorkerHost {
                         status: Box::new(status),
                     })?
                     .ok_or(HostError::EventStreamEnded)?;
-                let Some(event_notification::EventData::Item(item)) = notification.event_data
-                else {
-                    continue;
-                };
-                if let Some(done) = progress.on_event(item, cop) {
+                if let Some(done) = progress.on_notification(notification.event_data, cop) {
                     return done;
                 }
             }
@@ -263,6 +263,21 @@ impl Progress {
         match response {
             [0x7F, sid, _, ..] => *sid == self.sid,
             _ => response.starts_with(&self.positive_prefix),
+        }
+    }
+
+    /// Takes one notification from the link's event stream; returns the outcome once the
+    /// primitive `cop` has ended, or at once if the worker reports lost events.
+    fn on_notification(
+        &mut self,
+        data: Option<event_notification::EventData>,
+        cop: ComPrimitiveHandle,
+    ) -> Option<Result<Vec<u8>, HostError>> {
+        match data {
+            Some(event_notification::EventData::Item(item)) => self.on_event(item, cop),
+            // A dropped event may have been this primitive's response or end.
+            Some(event_notification::EventData::Lost(_)) => Some(Err(HostError::EventsLost)),
+            None => None,
         }
     }
 
@@ -591,6 +606,31 @@ mod tests {
                 (&[0xFF, 0xFF][..], &[0x7F, 0x22][..])
             ]
         );
+    }
+
+    #[test]
+    fn lost_events_end_the_primitive_at_once() {
+        let mut progress = Progress::for_request(&[0x22, 0xF1, 0x90]).unwrap();
+        assert!(
+            progress
+                .on_notification(
+                    Some(event_notification::EventData::Item(event(
+                        Some(COP),
+                        result(&[0x62])
+                    ))),
+                    COP
+                )
+                .is_none()
+        );
+        assert!(matches!(
+            progress.on_notification(
+                Some(event_notification::EventData::Lost(
+                    vci_service_interface::LostEventItemNotification {}
+                )),
+                COP
+            ),
+            Some(Err(HostError::EventsLost))
+        ));
     }
 
     #[test]

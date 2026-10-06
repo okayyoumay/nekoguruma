@@ -23,10 +23,16 @@ obligations on vehicle makers or on repair and inspection businesses, not on dia
 - **European Union.** Regulation (EU) 2018/858, Annex X (amended by Delegated Regulation (EU)
   2021/1244), requires makers to give independent operators non-discriminatory access to OBD
   data and repair and maintenance information (RMI), including diagnosis and reprogramming with
-  standard pass-thru interfaces. Access to security-related RMI (immobiliser, key programming,
-  theft protection) goes through SERMI: a conformity assessment body accredits the business and
-  its staff. The accredited staff member holds the credential (currently in a wallet app) and
-  presents it interactively to the maker's portal, which then grants the session. The Data Act
+  standard pass-thru interfaces. Delegated Regulation (EU) 2026/699 (in force since June 2026,
+  with obligations phased in until 2028) adds an appendix to Annex X that lets makers protect OBD
+  and on-board access with security measures such as a secure gateway. Within limits it sets, a
+  maker may authenticate the diagnostic tool and its manufacturer, the independent operator when
+  the access changes the vehicle, and in some cases the employee; standardized access to OBD data
+  and RMI must remain. Access to security-related RMI (immobiliser, key programming, theft
+  protection) goes through SERMI: conformity assessment bodies are accredited, and they approve
+  the repair business and authorise its employees. The authorised employee holds the credential
+  (currently in a wallet app) and presents it interactively to the maker's portal, which then
+  grants the session. The Data Act
   (applicable since September 2025) obliges makers, as data holders, to make vehicle data
   available to the user and to third parties the user names, and binds those third parties to
   purpose limitation, no onward disclosure beyond what the user agreed and security of the data.
@@ -58,7 +64,9 @@ markets are chosen. The maintainer chose A.
    data (SAE J1979 / ISO 15031-5 on ISO 15765-4, SAE J1979-2, and WWH-OBD per ISO 27145) is
    provided as a standard vehicle-knowledge package: L3 data in the IR (8.1, 8.2), distributed and
    signed like any other extension package, running on the shared L2 primitives. The system does
-   not depend on a maker's ODX for these reads.
+   not depend on a maker's ODX for these reads. Classic generic OBD starts with ISO 15765-4 (CAN);
+   the older transports ISO 15031-5 also runs on (ISO 9141-2, ISO 14230-4, SAE J1850), which the
+   workers already support, follow as separate work in the same package.
 3. **Reprogramming routes stay within the existing design.** The system's own reprogramming jobs
    (5.6, 8.2.5) use VCIs through the J2534 and D-PDU API workers. The system does not present
    itself as a J2534 or D-PDU API library to a maker's own reprogramming application; when such an
@@ -66,14 +74,20 @@ markets are chosen. The maintainer chose A.
    out of scope.
 4. **Security-related access goes through the OEM authentication provider.** SERMI and similar
    maker schemes are handled by the OEM authentication provider extension point (9.2) under the
-   rules of 8.10. The credential stays with the accredited staff member (for SERMI, in their
+   rules of 8.10. The credential stays with the authorised employee (for SERMI, in their
    wallet) and is presented by that person to the maker's portal; neither the server, the provider
    nor the agent holds or relays it. When the scheme needs that interactive step, the provider
    shows the operator the portal's prompt (for example a QR code to scan with the wallet) through
    a server-originated operator prompt in the web UI, and waits for the portal's grant. The HMI
    request path of 8.6 is agent-originated and is not used for this. The prompt carries only the
    portal's challenge, never the credential. The audit log records which operator ran the
-   operation and the authorization reference the provider returns.
+   operation and the authorization reference the provider returns. Authentication of the
+   diagnostic tool or of the business by a maker's secure gateway (2026/699) also goes through the
+   provider. For that purpose the tool manufacturer is the framework user that ships a product
+   built on the framework, not the framework; the framework user registers the product with the
+   makers, and its tool credentials are server-side keys kept like the seed-key secrets of 8.10.
+   Such registration is a maker access condition, not the inspection-tool certification of
+   item 1.
 5. **Retention periods are operator settings.** Statutory retention periods for maintenance
    records and update records differ by jurisdiction. The framework provides a configurable
    retention period per tenant and record kind and ships no jurisdiction-specific defaults; the
@@ -92,8 +106,9 @@ markets are chosen. The maintainer chose A.
 - The server needs an operator prompt that a server-side provider can raise, with correlation to
   the waiting job, a timeout, and behaviour when the operator's browser reconnects. Section 8.6
   covers only agent-originated requests.
-- The responsibility table in 16.1 gains a row: certification, accreditation and statutory
-  retention periods are the operator's.
+- The responsibility table in 16.1 gains a row: certification, SERMI approval and authorisation,
+  registration with makers' secure gateways, statutory retention periods and data-recipient
+  duties belong to the operator or the framework user.
 - A business that wants to use the system for statutory inspection cannot do so without the
   separate decision in item 1.
 - Japan's current inspection scan tool requirements were not found in public sources during the

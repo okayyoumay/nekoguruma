@@ -38,6 +38,7 @@ Workspace skeleton (step 1): every crate goes as far as type and boundary defini
 ## Data model (`db/`)
 
 - **P2**: Partition granularity: monthly is assumed; finalize once the non-functional targets are decided (design 17 P1 is settled by ADR-236). Blocked on: design 17 P5.
+- **P2**: Retention of software update records (UNECE R156 records, the job execution records of write jobs): an operator setting per tenant, separate from maintenance records (ADR-237, design 4.3, 16.2). Done when: update records carry a `retain_until` derived from that setting, and a test shows a maintenance-record deletion leaves them in place.
 - **P2**: `vehicle_locks` expiry: derive the default for `expires_at` from the expected duration of each job kind.
 - **P2**: `retain_until` logic for the retention period of maintenance records: an operator setting per tenant and record kind, with no jurisdiction-specific defaults (ADR-237, design 4.3). Done when: the setting exists, `retain_until` is derived from it when a record is stored, and a test covers a changed setting.
 - **P2**: `ir_documents` lookup has only a GIN index on part numbers. ECU-VARIANT-PATTERN matching happens on the agent side; verify with real data whether this is enough server-side filtering.
@@ -88,6 +89,7 @@ Workspace skeleton (step 1): every crate goes as far as type and boundary defini
 ## Standards and project
 
 - **P2**: Generic OBD, classic (ADR-237, design 8.1, 16.2): SAE J1979 / ISO 15031-5 reads on ISO 15765-4 as a standard vehicle-knowledge package, including functional requests answered by several ECUs at L1/L2. Planned with M7 (`work/development-plan.md`). Done when: the supported PIDs, current data and stored DTCs are read from two simulated ECUs answering one functional request. Blocked on: obtaining SAE J1979, ISO 15031-5 and ISO 15765-4.
+- **P3**: Generic OBD, classic on older transports (ADR-237): the classic item's reads on ISO 9141-2, ISO 14230-4 and SAE J1850 (both PWM and VPW), which the workers already support. Done when: the classic item's reads run on each of these transports against a simulated ECU. Blocked on: obtaining SAE J1979 and ISO 15031-5, the classic generic OBD item, and `sim-ecu` support for a non-CAN transport.
 - **P2**: Generic OBD on UDS (ADR-237): SAE J1979-2 reads in the same package, on the functional-request support of the classic item. Done when: the supported data identifiers (DIDs), current data and stored DTCs are read over UDS against `sim-ecu`. Blocked on: obtaining SAE J1979-2, and the classic generic OBD item.
 - **P2**: WWH-OBD (ADR-237): ISO 27145 reads in the same package. Done when: the supported data identifiers (DIDs), current data and stored DTCs are read against `sim-ecu`. Blocked on: obtaining ISO 27145, and the classic generic OBD item.
 - **P2**: Obtain sample ODX/PDX data. The `crates/diag-ir/schema/` items (variable-length fields, TABLE, DID hierarchy) wait on real ODX data; the standard itself (ISO 22901-1, 2008 edition) is already in `vehicle-comm-specs`. Done when: at least one sample ODX/PDX file is available to the project. Blocked on: the maintainer obtaining sample data.

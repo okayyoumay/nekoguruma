@@ -6,10 +6,6 @@ applyTo: "**/*.md,api/**,schemas/**,db/**"
 
 Flag as P1:
 
-- **Naming**: documentation not in English; a new documentation file (under `docs/`, a crate's
-  `docs/`, or anywhere else) whose name is not kebab-case. Exceptions: ADRs
-  (`ADR-{NNN}-{short-slug}.md`, plus `INDEX.md` and `TEMPLATE.md` in `docs/adr/`) and
-  conventional upper-case files such as `README.md`.
 - **Design-document section numbers**: renumbering or removing a section of
   `docs/system-architecture.md`. Code and docs cite it by number.
 - **Schemas**: a change to `schemas/*.schema.json` without the matching `*.example.json`.

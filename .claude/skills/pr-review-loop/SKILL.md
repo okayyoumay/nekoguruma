@@ -67,9 +67,11 @@ from Step 1.
 no review of the current head, schedule one more check-in 15 minutes later. Decide this from the
 reviews alone: while the review runs, Copilot can already be gone from the PR's requested
 reviewers, so that list says nothing about whether a review is coming. If that one
-still finds no review, treat the round as stalled: tell the maintainer once in the thread, and
-run the same fallback review as above for this head instead of re-requesting. A later push may
-request Copilot again as usual.
+still finds no review, treat the round as stalled: tell the maintainer once in the thread and
+run one fallback pass (as under "Copilot not available") on this head instead of re-requesting.
+A stall is transient, so unlike the two cases above it does not end Copilot reviews on this PR:
+if that pass leads to a fix, push it and request Copilot on the new head as usual (Step 0)
+instead of running the fallback again; if it finds nothing, go to Step 5.
 
 ## Step 1: find out what the review found
 

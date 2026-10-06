@@ -33,6 +33,12 @@ More rules for Rust, documentation and CI files are in `.github/instructions/`.
 - **Spec citations**, anywhere (code, docs, scripts, commit messages, the PR description): a
   standard cited without its clause or section number, or an ISO 22900-2 citation that does not
   say whether it targets the 2009 or the 2022 edition.
+- **Naming**, in any file type: a new crate, binary or command without the `ngr` prefix; a new
+  path or configuration directory named after the project that does not use the full lowercase
+  name `nekoguruma` (for example `ngr/` or `Nekoguruma/`); documentation not in English; a new
+  documentation file, in any format, whose name is not kebab-case. Exceptions: ADRs
+  (`ADR-{NNN}-{short-slug}.md`, plus `INDEX.md` and `TEMPLATE.md` in `docs/adr/`) and
+  conventional upper-case files such as `README.md`.
 - **Temporary-file references**: a file outside `work/` naming a specific file inside `work/`
   (the folder itself and `work/README.md` are fine). Open items belong in `work/`.
 - **Tests weakened**: a test skipped, ignored, deleted or loosened to pass CI, or `#[serial]`

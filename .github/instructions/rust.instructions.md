@@ -27,8 +27,5 @@ Flag as P1:
     description is not enough.
 - **Warnings silenced the wrong way**: `#[allow(...)]` for code that is unused only until later
   work lands. Use `#[expect(..., reason = "...")]`, which fails once the code is used.
-- **Naming**: a new crate, binary or command without the `ngr` prefix; a new path or
-  configuration directory named after the project that does not use the full lowercase name
-  `nekoguruma` (for example `ngr/` or `Nekoguruma/`).
 - **Out-of-scope targets**: Windows workers target `*-pc-windows-gnullvm` only (ADR-227). An MSVC
   worker target or MSVC-only build path is P1.

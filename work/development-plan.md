@@ -4,7 +4,7 @@
 
 Milestones from the current skeleton to a deployable product. Each milestone has a goal, its scope (by design-document section) and exit criteria a reviewer can check. The individual work items live in `backlog.md` and `worker-crates-backlog.md`; this file only says which milestone they belong to. When a milestone finishes, delete its section, move any lasting decision into `docs/system-architecture.md` or an ADR, and name the next milestone in `backlog.md`'s Status section (that is what P1 means).
 
-Order of work: the device side first (M1, M2), because interruption safety (R5) and the IR runtime are the riskiest parts and can be verified without a server. The server and UI follow on the local deployment profile (M3, M4), which needs no cloud. The ODX and SOVD parts of M7 can start alongside M5/M6, since those standards are held; the OTX and ExVe parts come last, once ISO 13209 and ISO 20077/20078 are obtained.
+Order of work: the device side first (M1, M2), because interruption safety (R5) and the IR runtime are the riskiest parts and can be verified without a server. The server and UI follow on the local deployment profile (M3, M4), which needs no cloud. Trust, approval and reprogramming (M6) come before real-time monitoring (M5), so the highest-risk job type continues directly from the M1/M2 interrupted-write work and signing is in place before M7 ingests extension packages. The ODX and SOVD parts of M7 can start alongside M5/M6, since those standards are held; the OTX and ExVe parts come last, once ISO 13209 and ISO 20077/20078 are obtained.
 
 Standards: `vehicle-comm-specs` holds SAE J2534-1 (v04.04), SAE J2534-2 (DEC2020), ISO 22900-2 (2009 and 2022), ISO 14229-1 (2026 edition), ISO 14229-2 (2021 edition), ISO 15765-2 (2024 edition), ISO 22901-1 (2008 edition) and ISO 17978-1/-2/-3 (2026 edition). Clause numbers below for ISO 14229-1 refer to the 2026 edition. Standards marked "not held" still have to be obtained.
 
@@ -16,12 +16,12 @@ Standards: `vehicle-comm-specs` holds SAE J2534-1 (v04.04), SAE J2534-2 (DEC2020
 | M2 Diagnostic runtime | Diagnostic procedures defined as data (proprietary CSV + JS format) run end to end | `diag-ir`, `diag-frontend`, worker L1 (ISO-TP, UDS), `agent` L2 | ISO 14229-1, ISO 14229-2, ISO 15765-2 (all held) |
 | M3 Server and job control (local profile) | A job created through the Web API is executed by the agent over the control channel and its result is stored | `server`, `agent`, `shared-proto`, `shared-crypto`, `db/` | none (RFC/IT specs only) |
 | M4 Web UI and acquired data | Operators run jobs and view/edit acquired data in the browser; offline start works | UI framework, reference UI, `server` | none |
-| M5 Real-time monitoring | Monitoring at the 10 ms target, interval capture, multiple subscribers | `agent`, worker, `server`, UI | none |
 | M6 Trust, approval and reprogramming | Signed packages and artifacts, approval levels, ECU reprogramming with preconditions | `shared-crypto`, `vendor-manifest`, `agent`, `server` | ISO 14229-1 clause 16 (held); SAE J3138 (not held) |
+| M5 Real-time monitoring | Monitoring at the 10 ms target, interval capture, multiple subscribers | `agent`, worker, `server`, UI | none |
 | M7 Standard formats and external API | ODX/PDX and OTX ingestion; SOVD / ExVe compatible endpoints | `diag-frontend`, `server` | ISO 22901-1 (ODX), ISO 17978 (SOVD) (held); ISO 13209 (OTX), ISO 20077/20078 (not held) |
 | M8 Cloud deployment and field validation | Standard (cloud) deployment, scale measures for size S, validation with real VCIs | `server`, deployment, CI | UNECE R155/R156 as needed (free to obtain) |
 
-M5 and M6 do not depend on each other; their order can be swapped. M7's ODX and SOVD parts can start in parallel with M5/M6; its OTX and ExVe parts wait on those standards.
+M5 and M6 do not depend on each other; M6 comes first (maintainer's decision, 2026-10-06). M5 needs design 17 P1 (time-series scale) decided before it starts. M7's ODX and SOVD parts can start in parallel with M5/M6; its OTX and ExVe parts wait on those standards.
 
 ## M1 Local E2E (current milestone)
 
@@ -90,16 +90,6 @@ M5 and M6 do not depend on each other; their order can be swapped. M7's ODX and 
 1. A browser end-to-end test (Playwright) runs an acquisition against the simulators, edits a record-template field, and sees the change from a second session.
 2. With the server unreachable, a pre-fetched acquisition job starts from the cached UI over the local connection and syncs once the server is back.
 
-## M5 Real-time monitoring
-
-**Goal.** Monitoring per design 10: WebRTC direct path with server fallback, the 10 ms target measured at the 99th percentile, capture of any interval as acquired data (R18), multiple subscribers (R19).
-
-**Exit criteria.**
-
-1. A monitoring session against the simulators reports the measured achievable interval and the p99 arrival interval (10.3).
-2. A captured interval is stored as acquired data with its metadata (4.6).
-3. A second browser subscribes through the server path while the first uses the direct path (10.4).
-
 ## M6 Trust, approval and reprogramming
 
 **Goal.** The trust model and the highest-risk job type are complete: three trust layers (11.1), extension packages and VCI profiles (9.3, 9.4), artifact ingestion (11.2), approval levels and two-person approval (6.3, 6.8), journal encryption and agent key protection (5.5, 16.3), ECU reprogramming with preconditions and safety guards (8.9, 8.9.1), seed/key and OEM authentication path (8.10).
@@ -111,6 +101,16 @@ M5 and M6 do not depend on each other; their order can be swapped. M7's ODX and 
 1. Unsigned or wrongly signed packages, artifacts and job instructions are each rejected, with a test per layer.
 2. An ECU reprogramming job runs the ISO 14229-1 clause 16 sequence against `sim-ecu`'s flash state machine, recovers from each of the four fault classes in clause 16.4 per design 5.6, and is refused when a precondition (8.9.1) is not met.
 3. A two-person approval flow blocks reprogramming on an unattended device until the second approval.
+
+## M5 Real-time monitoring
+
+**Goal.** Monitoring per design 10: WebRTC direct path with server fallback, the 10 ms target measured at the 99th percentile, capture of any interval as acquired data (R18), multiple subscribers (R19).
+
+**Exit criteria.**
+
+1. A monitoring session against the simulators reports the measured achievable interval and the p99 arrival interval (10.3).
+2. A captured interval is stored as acquired data with its metadata (4.6).
+3. A second browser subscribes through the server path while the first uses the direct path (10.4).
 
 ## M7 Standard formats and external API
 
@@ -135,5 +135,5 @@ M5 and M6 do not depend on each other; their order can be swapped. M7's ODX and 
 These change the plan's scope or order; each is a design-17 item or a purchase.
 
 - Standards purchase: SAE J3138 before M6; ISO 13209 (OTX) and ISO 20077/20078 (ExVe) before M7's OTX and ExVe parts start. The M1 and M2 standards, ISO 22901-1 (ODX) and ISO 17978 (SOVD) are held.
-- Order of M5 and M6.
+- Design 17 P1 (time-series scale) before M5.
 - Design 17 P5 (non-functional targets) before M8.

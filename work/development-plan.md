@@ -21,7 +21,7 @@ Standards: `vehicle-comm-specs` holds SAE J2534-1 (v04.04), SAE J2534-2 (DEC2020
 | M7 Standard formats and external API | ODX/PDX and OTX ingestion; SOVD / ExVe compatible endpoints | `diag-frontend`, `server` | ISO 22901-1 (ODX), ISO 17978 (SOVD) (held); ISO 13209 (OTX), ISO 20077/20078 (not held) |
 | M8 Cloud deployment and field validation | Standard (cloud) deployment, scale measures for size S, validation with real VCIs | `server`, deployment, CI | UNECE R155/R156 as needed (free to obtain) |
 
-M5 and M6 do not depend on each other; M6 comes first (maintainer's decision, 2026-10-06). M5 needs design 17 P1 (time-series scale) decided before it starts. M7's ODX converter and SOVD endpoints can be developed in parallel with M5/M6; ingesting ODX-derived IR as extension packages waits on M6's package signing, and the OTX and ExVe parts wait on those standards.
+M5 and M6 do not depend on each other; M6 comes first (maintainer's decision, 2026-10-06). M7's ODX converter and SOVD endpoints can be developed in parallel with M5/M6; ingesting ODX-derived IR as extension packages waits on M6's package signing, and the OTX and ExVe parts wait on those standards.
 
 ## M1 Local E2E (current milestone)
 
@@ -135,5 +135,4 @@ M5 and M6 do not depend on each other; M6 comes first (maintainer's decision, 20
 These change the plan's scope or order; each is a design-17 item or a purchase.
 
 - Standards purchase: SAE J3138 before M6; ISO 13209 (OTX) and ISO 20077/20078 (ExVe) before M7's OTX and ExVe parts start. The M1 and M2 standards, ISO 22901-1 (ODX) and ISO 17978 (SOVD) are held.
-- Design 17 P1 (time-series scale) before M5.
 - Design 17 P5 (non-functional targets) before M8.

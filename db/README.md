@@ -12,8 +12,9 @@ It leads the composite primary keys, which also prepares for future sharding (th
 
 **Do not store raw data bodies in the DB**
 `dataset_chunks` holds only object storage keys and hashes.
-`chunk_format` carries a format version so that, once P1 (scale undecided) is settled,
-we can migrate to a columnar format.
+`chunk_format` carries a format version. The first version, `records/1`, stores the
+responses received from the vehicle with their timestamps (ADR-236); a columnar format for
+longer recordings can be added later as a new version without migrating existing chunks.
 
 **Store signed instructions in jobs**
 Do not re-sign on every delivery. Resends carry the same bytes, which keeps

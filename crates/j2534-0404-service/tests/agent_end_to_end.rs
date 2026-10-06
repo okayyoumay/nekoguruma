@@ -68,16 +68,8 @@ fn program() -> Program {
     }
 }
 
-// The job's VM runs on a blocking thread that blocks on the runtime for every primitive.
-#[tokio::test(flavor = "multi_thread")]
-async fn agent_job_reads_the_vin_from_sim_vci() {
-    // A wedged service must fail the test, not hang the CI job.
-    tokio::time::timeout(Duration::from_secs(120), run_the_job())
-        .await
-        .expect("the end-to-end flow should finish in time");
-}
-
-async fn run_the_job() {
+#[test]
+fn agent_job_reads_the_vin_from_sim_vci() {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system clock should be after unix epoch")
@@ -92,8 +84,8 @@ async fn run_the_job() {
         ),
     )
     .expect("test config file should be writable");
-    // SAFETY: this test binary runs only this test, and no other thread has started reading
-    // the environment yet.
+    // SAFETY: this test binary runs only this test, and the runtime, the only other source of
+    // threads here, is built below, so nothing reads the environment concurrently.
     unsafe {
         std::env::set_var("VCI_CONFIG_PATH", &config_path);
         std::env::remove_var("VCI_SERVICE_INSECURE_NO_AUTH");
@@ -101,6 +93,20 @@ async fn run_the_job() {
         std::env::remove_var("NGR_SIM_ECU_CONFIG");
     }
 
+    // The job's VM runs on a blocking thread that blocks on the runtime for every primitive,
+    // so the runtime must be multi-threaded.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    // A wedged service must fail the test, not hang the CI job.
+    runtime
+        .block_on(async { tokio::time::timeout(Duration::from_secs(120), run_the_job()).await })
+        .expect("the end-to-end flow should finish in time");
+    drop(config);
+}
+
+async fn run_the_job() {
     let worker = WorkerProcess::launch(
         std::path::Path::new(env!("CARGO_BIN_EXE_j2534-0404-service")),
         ServiceKind::J2534V0404,
@@ -142,5 +148,4 @@ async fn run_the_job() {
         .stop(Duration::from_secs(5))
         .await
         .expect("worker should stop");
-    drop(config);
 }

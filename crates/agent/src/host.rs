@@ -165,9 +165,11 @@ impl WorkerHost {
             }),
         };
         // One deadline from the request to the end of the primitive.
-        let deadline = tokio::time::Instant::now() + self.timings.send_recv;
+        let now = tokio::time::Instant::now();
+        let deadline = now + self.timings.send_recv;
+        // Starting the primitive counts against the same budget.
         let cop = unary(
-            self.timings.unary,
+            self.timings.unary.min(self.timings.send_recv),
             "StartComPrimitive",
             self.client.start_com_primitive(start),
         )

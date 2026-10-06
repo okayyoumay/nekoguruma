@@ -1231,3 +1231,145 @@ fn record_input_waits_for_the_operator() {
     );
     assert!(host.records.is_empty());
 }
+
+/// ADR-233: for a diagnostic primitive, `current_op` succeeds only if `step` reaches the host,
+/// so a runner never journals an intent for a request that is not sent. Every invalid setup is
+/// refused by both, with the same error and without a host call; every valid one reaches the
+/// host exactly once.
+#[test]
+fn current_op_and_step_agree_on_primitives() {
+    let full = || vec![i(0); MAX_STACK];
+    let with = |mut setup: Vec<Op>, op: Op| {
+        setup.push(op);
+        setup
+    };
+    let invalid: Vec<(Vec<Op>, Vec<Vec<u8>>, VmError)> = vec![
+        (
+            vec![Op::ServiceRequest { service: 1 }],
+            vec![],
+            VmError::StackUnderflow,
+        ),
+        (
+            with(vec![i(1)], Op::ServiceRequest { service: 1 }),
+            vec![],
+            VmError::TypeMismatch,
+        ),
+        (
+            with(vec![i(1)], Op::RoutineControl { routine: 1, sub: 1 }),
+            vec![],
+            VmError::TypeMismatch,
+        ),
+        (
+            with(vec![i(1)], Op::SecurityAccess { level: 1 }),
+            vec![],
+            VmError::TypeMismatch,
+        ),
+        (
+            with(vec![i(1)], Op::FlashTransfer { block: 0 }),
+            vec![],
+            VmError::TypeMismatch,
+        ),
+        (
+            vec![Op::FlashTransfer { block: 0 }],
+            vec![],
+            VmError::StackUnderflow,
+        ),
+        (
+            with(full(), Op::ReadDtc { mask: 1 }),
+            vec![],
+            VmError::StackOverflow,
+        ),
+        (
+            vec![Op::HmiRequest { form: 0 }],
+            vec![],
+            VmError::BadConstant(0),
+        ),
+        (
+            with(full(), Op::HmiRequest { form: 0 }),
+            vec![vec![]],
+            VmError::StackOverflow,
+        ),
+        (
+            vec![Op::RecordInput { template: 3 }],
+            vec![],
+            VmError::BadConstant(3),
+        ),
+        (
+            with(full(), Op::RecordInput { template: 0 }),
+            vec![vec![]],
+            VmError::StackOverflow,
+        ),
+        (
+            vec![Op::Log {
+                level: 0,
+                message: 0,
+            }],
+            vec![vec![0xFF]],
+            VmError::InvalidUtf8(0),
+        ),
+        (
+            vec![Op::Log {
+                level: 0,
+                message: 1,
+            }],
+            vec![],
+            VmError::BadConstant(1),
+        ),
+    ];
+    for (code, constants, expected) in invalid {
+        let setup_steps = code.len() - 1;
+        let program = prog(code, constants);
+        let mut vm = Vm::new(&program);
+        let mut host = MockHost::default();
+        for _ in 0..setup_steps {
+            vm.step(&program, &mut host).unwrap();
+        }
+        host.forbidden = true;
+        let before = postcard::to_allocvec(&vm.state).unwrap();
+        assert_eq!(vm.current_op(&program), Err(expected.clone()));
+        assert!(
+            matches!(vm.step(&program, &mut host), Err(StepError::Vm(ref e)) if *e == expected),
+            "{expected:?}"
+        );
+        assert_eq!(
+            postcard::to_allocvec(&vm.state).unwrap(),
+            before,
+            "{expected:?}"
+        );
+    }
+
+    let mut valid: Vec<(Op, Program)> = primitive_programs();
+    valid.push((
+        Op::Log {
+            level: 1,
+            message: 1,
+        },
+        prog(
+            vec![
+                i(0),
+                Op::Log {
+                    level: 1,
+                    message: 1,
+                },
+            ],
+            vec![vec![], b"ok".to_vec()],
+        ),
+    ));
+    for (op, program) in valid {
+        let mut vm = Vm::new(&program);
+        let mut host = MockHost {
+            responses: VecDeque::from([Ok(vec![1])]),
+            keys: VecDeque::from([Some(vec![2])]),
+            hmi: VecDeque::from([Some(vec![3])]),
+            ..MockHost::default()
+        };
+        vm.step(&program, &mut host).unwrap();
+        assert_eq!(vm.current_op(&program), Ok(Some(&op)));
+        vm.step(&program, &mut host).unwrap();
+        assert_eq!(
+            host.calls.len() + host.logs.len(),
+            1,
+            "{op:?} should reach the host once"
+        );
+    }
+}

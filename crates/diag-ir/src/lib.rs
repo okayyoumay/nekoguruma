@@ -294,11 +294,18 @@ impl Vm {
     /// The instruction the next [`Vm::step`] executes, or `None` when the program has finished.
     /// The job runner uses it to journal an intent marker before a primitive is sent (ADR-229).
     ///
-    /// It fails exactly when [`Vm::step`] would refuse the state, so the runner never journals
-    /// an intent for an instruction that will not run.
+    /// It runs [`Vm::check_state`] and, for a diagnostic primitive, the checks [`Vm::step`] makes
+    /// before it calls the host. So for a primitive, `Ok(Some(op))` means the next `step` reaches
+    /// the host (ADR-233): the runner never journals an intent for a request that is not sent.
+    /// Other instructions can still fail in `step` (arithmetic, types, limits); no intent
+    /// precedes them.
     pub fn current_op<'p>(&self, program: &'p Program) -> Result<Option<&'p Op>, VmError> {
         self.check_state(program)?;
-        Ok(program.code.get(self.state.pc as usize))
+        let op = program.code.get(self.state.pc as usize);
+        if let Some(op) = op {
+            self.check_primitive(op, program)?;
+        }
+        Ok(op)
     }
 
     /// Checks everything [`Vm::step`] checks before it runs an instruction (ADR-233), so the
@@ -384,6 +391,9 @@ impl Vm {
         let next = self.state.pc + 1;
         // Unchanged until the instruction completes, so it identifies a waiting inquiry.
         let inquiry = self.state.steps;
+        // Every check a primitive needs before the host call, shared with `current_op`. Nothing
+        // after a host call below can fail, so a `VmError` always means the host was not called.
+        let input = self.check_primitive(op, program)?;
         match op {
             Op::PushI64(v) => self.push(Value::I64(*v))?,
             Op::PushF64(v) => self.push(Value::F64(*v))?,
@@ -506,31 +516,24 @@ impl Vm {
             }
 
             Op::ServiceRequest { service } => {
-                let payload = self.bytes_operand()?;
-                self.check_room(1, 1)?;
                 let response = host
-                    .service_request(*service, payload)
+                    .service_request(*service, input.bytes())
                     .map_err(StepError::Host)?;
                 self.replace(1, Value::Bytes(response));
             }
             Op::ReadDtc { mask } => {
-                self.check_room(0, 1)?;
                 let response = host.read_dtc(*mask).map_err(StepError::Host)?;
-                self.push(Value::Bytes(response))?;
+                self.push_checked(Value::Bytes(response));
             }
             Op::RoutineControl { routine, sub } => {
-                let payload = self.bytes_operand()?;
-                self.check_room(1, 1)?;
                 let response = host
-                    .routine_control(*routine, *sub, payload)
+                    .routine_control(*routine, *sub, input.bytes())
                     .map_err(StepError::Host)?;
                 self.replace(1, Value::Bytes(response));
             }
             Op::SecurityAccess { level } => {
-                let seed = self.bytes_operand()?;
-                self.check_room(1, 1)?;
                 match host
-                    .security_access(inquiry, *level, seed)
+                    .security_access(inquiry, *level, input.bytes())
                     .map_err(StepError::Host)?
                 {
                     Some(key) => self.replace(1, Value::Bytes(key)),
@@ -538,8 +541,8 @@ impl Vm {
                 }
             }
             Op::FlashTransfer { block } => {
-                let data = self.bytes_operand()?;
-                host.flash_transfer(*block, data).map_err(StepError::Host)?;
+                host.flash_transfer(*block, input.bytes())
+                    .map_err(StepError::Host)?;
                 self.state.stack.pop();
             }
             Op::Wait { millis } => {
@@ -547,36 +550,107 @@ impl Vm {
                     return Ok(Executed::Waiting(WaitingOn::Timer));
                 }
             }
-            Op::HmiRequest { form } => {
-                let form = constant(program, *form)?;
-                self.check_room(0, 1)?;
-                match host.hmi_request(inquiry, form).map_err(StepError::Host)? {
-                    Some(answer) => self.push(Value::Bytes(answer))?,
+            Op::HmiRequest { .. } => {
+                match host
+                    .hmi_request(inquiry, input.bytes())
+                    .map_err(StepError::Host)?
+                {
+                    Some(answer) => self.push_checked(Value::Bytes(answer)),
                     None => return Ok(Executed::Waiting(WaitingOn::Hmi)),
                 }
             }
-            Op::RecordInput { template } => {
-                let template = constant(program, *template)?;
-                self.check_room(0, 1)?;
+            Op::RecordInput { .. } => {
                 match host
-                    .record_input(inquiry, template)
+                    .record_input(inquiry, input.bytes())
                     .map_err(StepError::Host)?
                 {
-                    Some(input) => self.push(Value::Bytes(input))?,
+                    Some(answer) => self.push_checked(Value::Bytes(answer)),
                     None => return Ok(Executed::Waiting(WaitingOn::Hmi)),
                 }
             }
             Op::MonitorCapture { back_millis } => host
                 .monitor_capture(*back_millis)
                 .map_err(StepError::Host)?,
-            Op::Log { level, message } => {
-                let message = std::str::from_utf8(constant(program, *message)?)
-                    .map_err(|_| VmError::InvalidUtf8(*message))?;
-                host.log(*level, message);
-            }
+            Op::Log { level, .. } => host.log(*level, input.text()),
         }
         self.state.pc = next;
         Ok(Executed::Done)
+    }
+
+    /// The checks a diagnostic primitive needs before the host is called, and what it sends.
+    /// Shared by [`Vm::current_op`] and `execute`, so the two cannot drift; exhaustive, so a new
+    /// instruction must declare its checks here.
+    fn check_primitive<'a>(
+        &'a self,
+        op: &Op,
+        program: &'a Program,
+    ) -> Result<HostInput<'a>, VmError> {
+        Ok(match op {
+            // Send the bytes on top of the stack and replace them with the answer.
+            Op::ServiceRequest { .. } | Op::RoutineControl { .. } | Op::SecurityAccess { .. } => {
+                let operand = self.bytes_operand()?;
+                self.check_room(1, 1)?;
+                HostInput::Bytes(operand)
+            }
+            // Send the bytes on top of the stack, which are then dropped.
+            Op::FlashTransfer { .. } => HostInput::Bytes(self.bytes_operand()?),
+            // Push the answer.
+            Op::ReadDtc { .. } => {
+                self.check_room(0, 1)?;
+                HostInput::Nothing
+            }
+            // Send a constant and push the answer.
+            Op::HmiRequest { form: index } | Op::RecordInput { template: index } => {
+                let bytes = constant(program, *index)?;
+                self.check_room(0, 1)?;
+                HostInput::Bytes(bytes)
+            }
+            Op::Log { message, .. } => HostInput::Text(
+                std::str::from_utf8(constant(program, *message)?)
+                    .map_err(|_| VmError::InvalidUtf8(*message))?,
+            ),
+            Op::Wait { .. } | Op::MonitorCapture { .. } => HostInput::Nothing,
+            // Not a diagnostic primitive: checked during execution.
+            Op::PushI64(_)
+            | Op::PushF64(_)
+            | Op::PushBytes(_)
+            | Op::Pop
+            | Op::Dup
+            | Op::Swap
+            | Op::Add
+            | Op::Sub
+            | Op::Mul
+            | Op::Div
+            | Op::BitAnd
+            | Op::BitOr
+            | Op::BitXor
+            | Op::Shl
+            | Op::Shr
+            | Op::CmpEq
+            | Op::CmpLt
+            | Op::CmpGt
+            | Op::Not
+            | Op::Jump(_)
+            | Op::JumpIfFalse(_)
+            | Op::Call(_)
+            | Op::Ret
+            | Op::LoadLocal(_)
+            | Op::StoreLocal(_)
+            | Op::LoadGlobal(_)
+            | Op::StoreGlobal(_)
+            | Op::IndexGet
+            | Op::IndexSet => HostInput::Nothing,
+        })
+    }
+
+    /// Pushes a host answer whose room [`Vm::check_primitive`] already checked; cannot fail, so
+    /// nothing after a host call can.
+    fn push_checked(&mut self, value: Value) {
+        debug_assert!(
+            self.state.stack.len() < MAX_STACK,
+            "room checked before the host call"
+        );
+        self.state.stack.push(value);
     }
 
     /// The top `n` values, deepest first, or [`VmError::StackUnderflow`].
@@ -621,6 +695,29 @@ impl Vm {
 enum Executed {
     Done,
     Waiting(WaitingOn),
+}
+
+/// What a diagnostic primitive passes to the host, validated by `check_primitive`.
+enum HostInput<'a> {
+    Nothing,
+    Bytes(&'a [u8]),
+    Text(&'a str),
+}
+
+impl<'a> HostInput<'a> {
+    fn bytes(&self) -> &'a [u8] {
+        match self {
+            HostInput::Bytes(bytes) => bytes,
+            _ => unreachable!("check_primitive returns bytes for this instruction"),
+        }
+    }
+
+    fn text(&self) -> &'a str {
+        match self {
+            HostInput::Text(text) => text,
+            _ => unreachable!("check_primitive returns text for this instruction"),
+        }
+    }
 }
 
 fn constant(program: &Program, index: u32) -> Result<&[u8], VmError> {

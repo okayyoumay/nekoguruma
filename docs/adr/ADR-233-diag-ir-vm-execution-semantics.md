@@ -35,7 +35,12 @@ No IR programs, transpiler or journals existed when this was decided, so `VmStat
 3. **The caller journals.**
    - `DiagHost::checkpoint` is removed. A checkpoint written inside `step` would either come after the state advanced (a failed write would break item 1) or be unable to precede the request (ADR-229's intent markers).
    - The runner writes the journal around `step`, using two helpers. `Vm::current_op` shows the next instruction before it runs. `Op::is_diagnostic_primitive` tells whether that instruction goes to the host.
-   - `Vm::current_op` fails exactly when `step` would refuse the state (item 9), so the runner never journals an intent marker for a request that is not sent. `Vm::check_state` runs the same checks on their own, so the runner can validate a state restored from the journal before it starts any recovery that touches the ECU.
+   - Two invariants let the runner journal an intent marker safely (ADR-229), and both are tested:
+     - `step` returns a VM error only before any host call. After the call, an instruction only stores the answer, and the room for it was checked beforehand.
+     - For a diagnostic primitive, `Vm::current_op` returns the instruction only if the next `step` reaches the host. It runs the state checks of item 9 and the primitive's own pre-host checks (operand present and of type `Bytes`, constant index, valid UTF-8, stack room for the answer).
+   - These checks have one source, an exhaustive `match` shared by `current_op` and `step`, so the two cannot drift. A new instruction must declare its checks there before it compiles.
+   - So the runner never journals an intent for a request that is not sent. Other instructions can still fail in `step`; no intent precedes them.
+   - `Vm::check_state` runs the state checks on their own, so the runner can validate a state restored from the journal before it starts any recovery that touches the ECU.
    - `VmState::checkpoint` and `resume_count` are left to the write-job journal.
 4. **Waits are a step outcome.**
    - `hmi_request` and `security_access` return `Ok(None)` while no answer has arrived (8.2.5 lists both as waits while the server is unreachable). `step` then returns `StepOutcome::Waiting(WaitingOn::Hmi | WaitingOn::SeedKey)` without changing the state.

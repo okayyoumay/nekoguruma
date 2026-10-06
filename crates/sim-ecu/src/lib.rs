@@ -195,8 +195,11 @@ pub struct SimEcu {
     security_delay_active: bool,
     download: Option<Download>,
     image: Vec<u8>,
-    /// Set by `drop_at_block`: the ECU answers nothing until [`SimEcu::reconnect`].
+    /// Set by `drop_at_block` and [`Fault::PowerLoss`]: the ECU answers nothing until
+    /// [`SimEcu::reconnect`].
     silent: bool,
+    /// Faults armed by [`SimEcu::inject`] that have not fired yet, in injection order.
+    armed: Vec<Fault>,
 }
 
 // ---------------------------------------------------------------- Responses
@@ -270,6 +273,23 @@ impl SimResponse {
     }
 }
 
+/// A response and the delay before it is sent, from [`SimEcu::exchange`].
+#[derive(Debug, PartialEq, Eq)]
+pub struct Exchange {
+    pub response: SimResponse,
+    /// Milliseconds between the request and the response. Zero when there is no response.
+    pub delay_ms: u32,
+}
+
+impl Exchange {
+    fn none() -> Self {
+        Self {
+            response: SimResponse::NoResponse,
+            delay_ms: 0,
+        }
+    }
+}
+
 /// Result of a service handler: `Ok(None)` means no message is sent.
 type ServiceResult = Result<Option<Vec<u8>>, Nrc>;
 
@@ -290,6 +310,7 @@ impl SimEcu {
             download: None,
             image: Vec::new(),
             silent: false,
+            armed: Vec::new(),
         }
     }
 
@@ -325,9 +346,64 @@ impl SimEcu {
 
     /// Handles one request. `message` starts with the SID.
     pub fn request_with(&mut self, addressing: Addressing, message: &[u8]) -> SimResponse {
+        self.exchange(addressing, message).response
+    }
+
+    /// Handles one request and reports how long after the request the response goes out.
+    /// The simulator has no clock: the delay is for the VCI side to apply. It is
+    /// `EcuConfig::response_delay_ms` plus any [`Fault::DelayResponse`] that fires on this request.
+    pub fn exchange(&mut self, addressing: Addressing, message: &[u8]) -> Exchange {
         if self.silent {
-            return SimResponse::NoResponse;
+            return Exchange::none();
         }
+        if self.take_armed(|f| matches!(f, Fault::BusError)).is_some() {
+            // The request never reaches the ECU.
+            return Exchange::none();
+        }
+        let mut delay_ms = self.config.response_delay_ms;
+        while let Some(Fault::DelayResponse { ms }) =
+            self.take_armed(|f| matches!(f, Fault::DelayResponse { .. }))
+        {
+            delay_ms = delay_ms.saturating_add(ms);
+        }
+        let response = self.respond(addressing, message);
+        if self
+            .take_armed(|f| matches!(f, Fault::DropResponse))
+            .is_some()
+        {
+            // The request was handled; only its response is lost.
+            return Exchange::none();
+        }
+        if response == SimResponse::NoResponse {
+            return Exchange::none();
+        }
+        Exchange { response, delay_ms }
+    }
+
+    /// Arms a fault (13.4). [`Fault::PowerLoss`] takes effect at once; the others fire on a later
+    /// request, once each, as described on each variant.
+    pub fn inject(&mut self, fault: Fault) {
+        match fault {
+            Fault::PowerLoss => {
+                self.power_cycle();
+                self.silent = true;
+            }
+            _ => self.armed.push(fault),
+        }
+    }
+
+    /// Faults armed by [`SimEcu::inject`] that have not fired yet.
+    pub fn armed_faults(&self) -> &[Fault] {
+        &self.armed
+    }
+
+    /// Removes and returns the first armed fault matching `pred`.
+    fn take_armed(&mut self, pred: impl Fn(&Fault) -> bool) -> Option<Fault> {
+        let i = self.armed.iter().position(pred)?;
+        Some(self.armed.remove(i))
+    }
+
+    fn respond(&mut self, addressing: Addressing, message: &[u8]) -> SimResponse {
         let Some(&sid) = message.first() else {
             return SimResponse::NoResponse;
         };
@@ -368,12 +444,21 @@ impl SimEcu {
 
 // ---------------------------------------------------------------- Fault injection
 
-/// Events injected during tests. Corresponds to 13.4 "injecting delays, disconnects, crashes, and write failures".
-#[derive(Debug, Clone, Copy)]
+/// Events injected during tests with [`SimEcu::inject`]. Corresponds to 13.4 "injecting delays,
+/// disconnects, crashes, and write failures".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fault {
+    /// The response to the next request goes out `ms` later than configured.
     DelayResponse { ms: u32 },
+    /// The next request is handled (its state changes apply) but its response is lost.
     DropResponse,
+    /// The ECU loses power now: session, security and a running transfer are lost as in a power
+    /// cycle, and the ECU answers nothing until [`SimEcu::reconnect`].
     PowerLoss,
+    /// The next request is lost on the bus: the ECU neither handles nor answers it.
     BusError,
+    /// Writing TransferData block `block` (counted from 1 over the whole download, as
+    /// `EcuConfig::drop_at_block`) fails: the ECU answers NRC 72 and stores nothing, so the
+    /// client may send the block again. Fires when that block arrives.
     CorruptBlock { block: u32 },
 }

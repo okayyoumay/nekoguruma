@@ -4,7 +4,7 @@
 use crate::{
     DID_ACTIVE_DIAGNOSTIC_SESSION, DID_FLASH_STATE, DID_SOFTWARE_VERSION, DID_SPARE_PART_NUMBER,
     DID_VIN, DTC_STATUS_AFTER_CLEAR, DTC_STATUS_AVAILABILITY_MASK, Download, FLASH_SIZE,
-    FLASH_START, FlashPhase, MAX_BLOCK_LENGTH, MAX_DIDS_PER_READ, MAX_RESPONSE_LENGTH,
+    FLASH_START, Fault, FlashPhase, MAX_BLOCK_LENGTH, MAX_DIDS_PER_READ, MAX_RESPONSE_LENGTH,
     MAX_SECURITY_ATTEMPTS, Nrc, P2_SERVER_MAX_MS, P2_STAR_SERVER_MAX_10MS,
     POSITIVE_RESPONSE_OFFSET, RID_CHECK_PROGRAMMING_DEPENDENCIES, RID_ERASE_MEMORY,
     SUPPRESS_POS_RSP, ServiceResult, Session, SimEcu,
@@ -534,6 +534,13 @@ impl SimEcu {
             self.config.drop_at_block = None;
             self.silent = true;
             return Ok(None);
+        }
+        if self
+            .take_armed(|f| *f == Fault::CorruptBlock { block: next_block })
+            .is_some()
+        {
+            // Injected write failure: nothing is stored and the counter does not advance.
+            return Err(Nrc::GeneralProgrammingFailure);
         }
         self.image.extend_from_slice(data);
         dl.received += data.len() as u32;

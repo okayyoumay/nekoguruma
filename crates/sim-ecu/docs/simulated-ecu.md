@@ -13,7 +13,9 @@ expect. Anything not listed follows the clause of the service.
 `SimEcu::request(message)` handles a physically addressed request; `request_with(addressing,
 message)` takes the addressing mode. `message` is the A_Data starting with the SID. The result is a
 `SimResponse`: a positive response (response SID included), a negative response (`7F SID NRC`
-via `to_bytes()`), or no response.
+via `to_bytes()`), or no response. `exchange(addressing, message)` returns the same response
+together with the delay before it is sent (`EcuConfig::response_delay_ms` plus any injected
+delay); the simulator has no clock, so the VCI side (`sim-vci`) applies it.
 
 General behaviour (clause 7.7):
 
@@ -23,7 +25,7 @@ General behaviour (clause 7.7):
 - For functionally addressed requests, NRCs 11, 7F, 12, 7E and 31 are not sent (clause 7.7.1).
 - A supported SubFunction is available in every session its service is, so NRC 7E is not produced.
 - Response pending (NRC 78) and busy (NRC 21) are not produced: every service completes within the
-  request. Response delays belong to the VCI side.
+  request. Response delays are reported by `exchange()` and applied by the VCI side.
 
 ## Services and sessions
 
@@ -113,3 +115,18 @@ received; the blockSequenceCounter starts again at 1. Any other RequestDownload 
 state gets NRC 22, and the client must erase and start over. A download interrupted after its last
 block but before RequestTransferExit has nothing left to send; RequestTransferExit closes it
 directly.
+
+## Fault injection
+
+`SimEcu::inject(fault)` arms one of the faults design 13.4 asks for. Each fires once.
+
+| `Fault` | Effect |
+|---|---|
+| `DelayResponse { ms }` | The response to the next request goes out `ms` later; added to `response_delay_ms` in `exchange()` |
+| `DropResponse` | The next request is handled and its state changes apply, but its response is lost |
+| `BusError` | The next request is lost on the bus: neither handled nor answered |
+| `PowerLoss` | Immediate: session, security and a running transfer are lost as in a power cycle (flash progress is kept), and the ECU answers nothing until `reconnect()` |
+| `CorruptBlock { block }` | Writing TransferData block `block` (numbered as for `drop_at_block`) fails: NRC 72 (clause 14.4), nothing is stored and the blockSequenceCounter does not advance, so the client may send the block again |
+
+While the ECU is silent (after `PowerLoss` or `drop_at_block`), requests do not reach it and the
+armed faults stay armed. `armed_faults()` lists the faults that have not fired yet.

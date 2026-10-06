@@ -69,9 +69,11 @@ markets are chosen. The maintainer chose A.
    rules of 8.10. The credential stays with the accredited staff member (for SERMI, in their
    wallet) and is presented by that person to the maker's portal; neither the server, the provider
    nor the agent holds or relays it. When the scheme needs that interactive step, the provider
-   asks the operator through the HMI request path (8.6) and waits for the portal's grant, as for
-   any OEM authentication. The audit log records which operator ran the operation and the
-   authorization reference the provider returns.
+   shows the operator the portal's prompt (for example a QR code to scan with the wallet) through
+   a server-originated operator prompt in the web UI, and waits for the portal's grant. The HMI
+   request path of 8.6 is agent-originated and is not used for this. The prompt carries only the
+   portal's challenge, never the credential. The audit log records which operator ran the
+   operation and the authorization reference the provider returns.
 5. **Retention periods are operator settings.** Statutory retention periods for maintenance
    records and update records differ by jurisdiction. The framework provides a configurable
    retention period per tenant and record kind and ships no jurisdiction-specific defaults; the
@@ -87,6 +89,9 @@ markets are chosen. The maintainer chose A.
 - Generic OBD needs functional (broadcast) requests answered by several ECUs at L1/L2, and the
   standards that define the generic services and identifiers (SAE J1979, J1979-2, ISO 15031-5,
   ISO 15765-4, ISO 27145), none of which is held yet.
+- The server needs an operator prompt that a server-side provider can raise, with correlation to
+  the waiting job, a timeout, and behaviour when the operator's browser reconnects. Section 8.6
+  covers only agent-originated requests.
 - The responsibility table in 16.1 gains a row: certification, accreditation and statutory
   retention periods are the operator's.
 - A business that wants to use the system for statutory inspection cannot do so without the

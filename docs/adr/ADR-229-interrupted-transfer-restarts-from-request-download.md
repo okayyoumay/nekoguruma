@@ -233,7 +233,9 @@ responsible for them, in the same way that business screens are theirs (design 9
    case it goes straight to the default-session confirmation as on the same device. That
    exception holds only for a summary of the job's latest attempt: every summary names the
    server-reserved attempt it was written under (none for the original run), and the server
-   marks a summary stale once a later attempt has been reserved for the job. A recovery may have
+   marks a summary stale when, at the handover, the failed device's ownership generation had
+   reserved a later attempt than the one the summary names (the receiving agent's own
+   reservation, made under the new generation, does not count). A recovery may have
    cleared the completed progress locally and started a new erase without uploading the cleared
    summary, so in a stale summary the post-transfer steps count as not complete and both intent
    markers as possibly set: the receiving agent tears down passively and redoes the transfer. The same

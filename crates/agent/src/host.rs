@@ -37,6 +37,8 @@ pub enum HostError {
     PrimitiveFailed(i32),
     #[error("service {0:#x} is not a UDS service ID")]
     BadService(u16),
+    #[error("service {0:#x} is not allowed: this agent sends only read-only requests")]
+    NotAllowed(u16),
     #[error("{0} is not supported by this agent yet")]
     Unsupported(&'static str),
     #[error("link setup: {0}")]
@@ -257,6 +259,7 @@ impl DiagHost for WorkerHost {
     type Error = HostError;
 
     fn service_request(&mut self, service: u16, payload: &[u8]) -> Result<Vec<u8>, HostError> {
+        crate::policy::check_service(service)?;
         let request = service_request_bytes(service, payload)?;
         self.send_recv(request)
     }
@@ -265,13 +268,14 @@ impl DiagHost for WorkerHost {
         self.send_recv(read_dtc_bytes(mask))
     }
 
+    // Refused until the policy layer exists (ADR-235 item 8).
     fn routine_control(
         &mut self,
-        routine: u16,
-        sub: u8,
-        payload: &[u8],
+        _routine: u16,
+        _sub: u8,
+        _payload: &[u8],
     ) -> Result<Vec<u8>, HostError> {
-        self.send_recv(routine_control_bytes(routine, sub, payload))
+        Err(HostError::NotAllowed(0x31))
     }
 
     // Never `Ok(None)`: that means "still waiting" and the VM would wait forever (ADR-235

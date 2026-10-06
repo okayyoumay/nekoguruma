@@ -15,6 +15,7 @@ use worker_host::client::WorkerClient;
 
 use crate::host::{HostError, Timings, WorkerHost};
 use crate::link::{self, LinkConfig};
+use crate::policy;
 
 /// Bounds of a job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +57,12 @@ pub enum JobError {
     Unanswerable(WaitingOn),
     #[error("the procedure ran {0} steps without finishing")]
     StepLimit(u64),
+    #[error("instruction {pc} is refused: {source}")]
+    Refused {
+        pc: u32,
+        #[source]
+        source: HostError,
+    },
     #[error("the job was cancelled")]
     Cancelled,
     #[error("the job thread panicked")]
@@ -66,12 +73,13 @@ pub enum JobError {
 /// the final VM state; the procedure's results are on its stack.
 ///
 /// Must be called on a multi-threaded runtime: the VM runs on a blocking thread that blocks on
-/// the runtime for every primitive. The link is closed however the job ends, also when the
-/// procedure panics; a failure to close it is logged, since it does not change the results.
-/// Dropping the returned future cancels the job: the primitive in flight finishes, no further
-/// instruction runs, and the link is closed.
+/// the runtime for every primitive. That thread opens the link, runs the program and closes the
+/// link, so no future holding worker resources is ever dropped halfway. The link is closed
+/// however the job ends, also when the procedure panics; a failure to close it is logged, since
+/// it does not change the results. Dropping the returned future cancels the job: the call or
+/// primitive in flight finishes, no further instruction runs, and the link is closed.
 pub async fn run_program(
-    mut client: WorkerClient,
+    client: WorkerClient,
     config: &LinkConfig,
     program: Program,
     limits: JobLimits,
@@ -84,34 +92,53 @@ pub async fn run_program(
     Vm::new(&program)
         .check_state(&program)
         .map_err(|source| JobError::Vm { pc: 0, source })?;
-    let timings = Timings::for_link(config);
-    let link = link::open(&mut client, config, timings.unary)
-        .await
-        .map_err(JobError::Link)?;
-    let host = WorkerHost::new(handle.clone(), client, link, timings);
+    policy::check_program(&program).map_err(|(pc, source)| JobError::Refused { pc, source })?;
+    let config = config.clone();
 
     let cancel = CancelOnDrop(Arc::new(AtomicBool::new(false)));
     let cancelled = Arc::clone(&cancel.0);
     tokio::task::spawn_blocking(move || {
-        let mut host = host;
-        let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            run_on(&program, &mut host, limits, &cancelled)
+        std::panic::catch_unwind(AssertUnwindSafe(|| {
+            run_job(handle, client, &config, &program, limits, &cancelled)
         }))
-        .unwrap_or(Err(JobError::Panicked));
-        let (mut client, link) = host.into_parts();
-        // Closing on a runtime that is shutting down can panic; the job's result stands.
-        let closed = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            handle.block_on(link::close(&mut client, link, timings.unary))
-        }));
-        match closed {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => tracing::warn!(%error, "could not close the link"),
-            Err(_) => tracing::warn!("closing the link panicked"),
-        }
-        result
+        .unwrap_or(Err(JobError::Panicked))
     })
     .await
     .unwrap_or(Err(JobError::Panicked))
+}
+
+/// The whole job, on the blocking thread: open, run, close.
+fn run_job(
+    handle: Handle,
+    mut client: WorkerClient,
+    config: &LinkConfig,
+    program: &Program,
+    limits: JobLimits,
+    cancelled: &AtomicBool,
+) -> Result<VmState, JobError> {
+    if cancelled.load(Ordering::Relaxed) {
+        return Err(JobError::Cancelled);
+    }
+    let timings = Timings::for_link(config);
+    let link = handle
+        .block_on(link::open(&mut client, config, timings.unary))
+        .map_err(JobError::Link)?;
+    let mut host = WorkerHost::new(handle.clone(), client, link, timings);
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        run_on(program, &mut host, limits, cancelled)
+    }))
+    .unwrap_or(Err(JobError::Panicked));
+    let (mut client, link) = host.into_parts();
+    // Closing on a runtime that is shutting down can panic; the job's result stands.
+    let closed = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        handle.block_on(link::close(&mut client, link, timings.unary))
+    }));
+    match closed {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::warn!(%error, "could not close the link"),
+        Err(_) => tracing::warn!("closing the link panicked"),
+    }
+    result
 }
 
 /// Sets the flag when the job's future is dropped.
@@ -319,14 +346,68 @@ mod tests {
         assert_eq!(host.requests, 1);
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn a_current_thread_runtime_is_refused() {
-        // Refused before the client is used, so a client that connects nowhere will do.
+    /// A client for a port nothing listens on: any RPC fails, so a test that gets past the
+    /// checks of `run_program` ends in `JobError::Link`.
+    fn unreachable_client() -> WorkerClient {
         let channel = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
-        let client = vci_service_interface::vci_service_client::VciServiceClient::with_interceptor(
+        vci_service_interface::vci_service_client::VciServiceClient::with_interceptor(
             channel,
             worker_host::client::BearerAuth::new([0; 32], "test"),
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_program_with_a_refused_request_never_reaches_the_worker() {
+        let code = vec![
+            Op::PushBytes(0),
+            Op::ServiceRequest { service: 0x22 },
+            Op::ServiceRequest { service: 0x2E },
+        ];
+        let result = run_program(
+            unreachable_client(),
+            &LinkConfig::iso15765(0x7E0, 0x7E8),
+            program(code),
+            JobLimits::default(),
+        )
+        .await;
+        assert!(
+            matches!(
+                result,
+                Err(JobError::Refused {
+                    pc: 2,
+                    source: HostError::NotAllowed(0x2E)
+                })
+            ),
+            "{result:?}"
         );
+        // Without the check, the same job reaches the worker.
+        let result = run_program(
+            unreachable_client(),
+            &LinkConfig::iso15765(0x7E0, 0x7E8),
+            program(two_requests()[..2].to_vec()),
+            JobLimits::default(),
+        )
+        .await;
+        assert!(matches!(result, Err(JobError::Link(_))), "{result:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_job_dropped_at_once_stops_before_the_worker() {
+        let config = LinkConfig::iso15765(0x7E0, 0x7E8);
+        let job = run_program(
+            unreachable_client(),
+            &config,
+            program(two_requests()[..2].to_vec()),
+            JobLimits::default(),
+        );
+        // Polled once, so the blocking thread is spawned, then dropped.
+        assert!(tokio::time::timeout(Duration::ZERO, job).await.is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_current_thread_runtime_is_refused() {
+        // Refused before the client is used.
+        let client = unreachable_client();
         assert!(matches!(
             run_program(
                 client,

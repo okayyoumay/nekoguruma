@@ -141,14 +141,20 @@ pub async fn open(
     .and_then(|list| list.module_data.into_iter().next())
     .and_then(|data| data.module_handle)
     .ok_or(HostError::Setup("the worker reports no module"))?;
-    unary(
+    let connected = unary(
         deadline,
         "ModuleConnect",
         client.module_connect(ModuleConnectRequest {
             module_handle: Some(module_handle),
         }),
     )
-    .await?;
+    .await;
+    if let Err(error) = connected {
+        // The connect may have completed on the worker after the deadline. Disconnecting a
+        // module that is not connected changes nothing.
+        disconnect_module(client, module_handle, deadline).await;
+        return Err(error);
+    }
 
     let cll_handle = match create_link(client, config, deadline, module_handle).await {
         Ok(cll_handle) => cll_handle,

@@ -174,5 +174,5 @@ Commit messages and PR descriptions follow the same copyright rule as the code.
 
 Copilot reviews against [.github/copilot-instructions.md](.github/copilot-instructions.md) and
 the path-specific files in `.github/instructions/`, which restate the rules above as review
-priorities. Copilot reads only the first 4,000 characters of each file, so keep each one under
-that. When a rule in this file changes, update those files in the same pull request.
+priorities; a path-specific file applies only to the files its `applyTo` globs match. When a
+rule in this file changes, update those files in the same pull request.

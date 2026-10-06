@@ -25,14 +25,20 @@ obligations on vehicle makers or on repair and inspection businesses, not on dia
   data and repair and maintenance information (RMI), including diagnosis and reprogramming with
   standard pass-thru interfaces. Access to security-related RMI (immobiliser, key programming,
   theft protection) goes through SERMI: a conformity assessment body accredits the business and
-  its staff, and the maker's portal checks that accreditation. The Data Act and Euro 7 do not yet
-  add requirements on tools.
+  its staff. The accredited staff member holds the credential (currently in a wallet app) and
+  presents it interactively to the maker's portal, which then grants the session. The Data Act
+  (applicable since September 2025) obliges makers, as data holders, to make vehicle data
+  available to the user and to third parties the user names, and binds those third parties to
+  purpose limitation, no onward disclosure beyond what the user agreed and security of the data.
+  A business that uses this system to receive data that way is such a third party; the software
+  itself is not. Euro 7 does not yet add requirements on tools.
 - **Japan.** OBD inspection (from October 2024, imported vehicles from October 2025) reads
   specified DTCs with an application provided by the National Agency for Automobile and Land
   Transport Technology, run on a scan tool that meets the inspection requirements. Specified
   maintenance (tokutei seibi) certifies the repair business, not its tools.
 
-So the system is directly regulated only if it seeks certification as an inspection tool.
+So the software is directly regulated as a tool only if it seeks certification as an inspection
+tool; the duties of a data recipient fall on the operator that runs it.
 Everything else is a question of whether the system can use the access routes that the
 regulations force makers to open: generic OBD, reprogramming through standard pass-thru
 interfaces, and security-related functions behind the maker's authentication.
@@ -60,16 +66,21 @@ markets are chosen. The maintainer chose A.
    out of scope.
 4. **Security-related access goes through the OEM authentication provider.** SERMI and similar
    maker schemes are handled by the OEM authentication provider extension point (9.2) under the
-   rules of 8.10. Accreditations and certificates belong to the business and its staff and stay
-   with the maker's portal or the provider; the system does not hold them. The audit log records
-   which operator ran the operation and the authorization reference the provider returns.
+   rules of 8.10. The credential stays with the accredited staff member (for SERMI, in their
+   wallet) and is presented by that person to the maker's portal; neither the server, the provider
+   nor the agent holds or relays it. When the scheme needs that interactive step, the provider
+   asks the operator through the HMI request path (8.6) and waits for the portal's grant, as for
+   any OEM authentication. The audit log records which operator ran the operation and the
+   authorization reference the provider returns.
 5. **Retention periods are operator settings.** Statutory retention periods for maintenance
    records and update records differ by jurisdiction. The framework provides a configurable
    retention period per tenant and record kind and ships no jurisdiction-specific defaults; the
    operator sets them (16.1).
-6. **Regulations without tool requirements are watched, not implemented.** Data-access rules
-   such as the EU Data Act and Euro 7's on-board monitoring are revisited when they place
-   requirements on diagnostic tools.
+6. **Data-recipient duties are the operator's.** When an operator receives vehicle data under
+   the EU Data Act, the recipient's duties (purpose limitation, onward disclosure, security) are
+   the operator's (16.1); the framework supports them with the existing access control, audit
+   log, retention and deletion mechanisms (4.3, 16.2) and adds no Data Act-specific function.
+   Euro 7's on-board monitoring is revisited when it places requirements on diagnostic tools.
 
 ## Consequences
 

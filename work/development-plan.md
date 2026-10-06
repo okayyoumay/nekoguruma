@@ -120,6 +120,7 @@ M5 and M6 do not depend on each other; M6 comes first (maintainer's decision, 20
 
 1. A sample PDX converts to the same IR shape as the M2 proprietary-format definition for the same ECU, and runs against `sim-ecu`.
 2. The SOVD resource mapping (L4) serves data reads for that ECU.
+3. The generic OBD package reads supported PIDs, current data and stored DTCs against `sim-ecu` for each generic OBD family whose standard is held (SAE J1979 classic, J1979-2, ISO 27145).
 
 ## M8 Cloud deployment and field validation
 

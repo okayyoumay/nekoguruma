@@ -1404,7 +1404,7 @@ Since this is provided as a framework, the scope of responsibility is made expli
 | Business screens and operational flows | Framework user |
 | Write and recovery procedures used in production (ECU-specific programming sequences, resume strategies) | Framework user. The framework provides the journal, the state check before resuming, the idempotency and interruptibility attributes (8.2.5, 8.10.1) and the guarantee that a write job ends in a defined state (5.6); its own write and recovery procedures are a reference implementation (ADR-229) |
 | UNECE R156 processes (SUMS) | System operator. The framework provides mechanisms for recording, version management and auditing, but does not operate the process |
-| Regulatory certification and accreditation (inspection-tool certification, SERMI accreditation of businesses and staff) and statutory retention periods | System operator. The framework is not certified as an inspection tool; it provides the OEM authentication provider extension point and configurable retention periods (ADR-237) |
+| Regulatory certification and accreditation (inspection-tool certification, SERMI accreditation of businesses and staff), statutory retention periods and data-recipient duties under the EU Data Act | System operator. The framework is not certified as an inspection tool; it provides the OEM authentication provider extension point and configurable retention periods (ADR-237) |
 | Authenticity of ECU flash data | OEM (verified by the ECU) |
 
 A configuration that is always connected and acts on remote instructions may raise the same concerns as monitoring software or remote administration tools. Legal treatment varies by jurisdiction and contract form, so the following is an organization of issues; final judgment requires review by legal counsel.
@@ -1436,10 +1436,11 @@ Vehicle regulations place their obligations on vehicle makers and on repair and 
 | US CARB / EPA OBD (SAE J1979, J1979-2) | Vehicle makers | Generic OBD reads are a standard vehicle-knowledge package (8.1). Certification as a CARB OBD test tool is out of scope |
 | US CARB service information rules, state right-to-repair laws | Vehicle makers | Makers offer reprogramming through J2534 pass-thru devices. The system's own jobs use VCIs through its workers; it is not a J2534 library for a maker's application (8.8 only detects such use). TMC RP1210 is out of scope |
 | EU Regulation 2018/858 Annex X (OBD and RMI access) | Vehicle makers | Same generic OBD and pass-thru routes as above |
-| EU SERMI (security-related RMI) | Businesses and their staff (accreditation) | Handled by the OEM authentication provider (9.2, 8.10). Accreditations stay with the maker's portal or the provider; the audit log records the operator and the authorization reference |
+| EU SERMI (security-related RMI) | Businesses and their staff (accreditation) | Handled by the OEM authentication provider (9.2, 8.10). The credential stays with the accredited staff member, who presents it to the maker's portal; the provider asks for that step through the HMI request path (8.6) and never holds the credential. The audit log records the operator and the authorization reference |
 | Japan OBD inspection | Inspection businesses, with the government-provided inspection application and qualifying scan tools | Out of scope as an inspection tool |
 | Japan specified maintenance (tokutei seibi) | Repair businesses (certification) | No requirement on the system; maintenance records are kept under operator-set retention periods (4.3) |
-| EU Data Act, Euro 7 | Vehicle makers | No tool requirements yet; revisited when there are |
+| EU Data Act (applicable since September 2025) | Vehicle makers (data holders) and the third parties that receive data at the user's request | An operator receiving data that way carries the recipient's duties (purpose limitation, onward disclosure, security); the framework supports them with access control, audit and retention (4.3) |
+| EU Euro 7 | Vehicle makers | No tool requirements yet; revisited when there are |
 
 ### 16.3 Security Issues
 

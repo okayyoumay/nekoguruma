@@ -215,7 +215,10 @@ responsible for them, in the same way that business screens are theirs (design 9
    request, but before the updated summary reaches the server), so on a handover an absent
    marker proves nothing: the receiving agent never sends the step 2 ECUReset and always tears
    down passively, unless the summary records the post-transfer steps as complete, in which
-   case it goes straight to the default-session confirmation as on the same device. Requiring
+   case it goes straight to the default-session confirmation as on the same device. The same
+   holds for the transfer-start marker: a handed-over job whose summary lacks it may still
+   have had its first erase or RequestDownload accepted, so the receiving agent never treats it
+   as a plain start but always takes this restart order, passive teardown first. Requiring
    a server acknowledgement before each RequestTransferExit was rejected, because it would make
    the transfer depend on the network at that point. The same lag can leave the summary
    without the recorded hardware part number or the pre-erase software version (for example

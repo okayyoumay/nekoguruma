@@ -26,12 +26,13 @@ public release, so write review comments as if they were already public.
 
 ### What to flag as P0
 
-- **Copied standard text.** ISO 22900-2, SAE J2534-1, SAE J2534-2 and ISO 14229-1 are
-  copyrighted. Any passage that reads as copied from one of them, quoted or not, at any length,
-  anywhere the repository stores it: code comments, string literals, test fixtures, schemas and
-  other data files, `docs/`, ADRs, commit messages and the PR description. Citations must give
-  the clause or section number and paraphrase. Do not quote standard text in your own review
-  comments either; describe the requirement in your own words.
+- **Copied standard text.** ISO 22900-2, SAE J2534-1, SAE J2534-2, ISO 14229-1, ISO 14229-2,
+  ISO 15765-2, ISO 22901-1 and ISO 17978 are copyrighted, as is any other standard. Any passage
+  that reads as copied from one of them, quoted or not, at any length, anywhere the repository stores
+  it: code comments, string literals, test fixtures, schemas and other data files, `docs/`, ADRs,
+  commit messages and the PR description. Citations must give the clause or section number and
+  paraphrase. Do not quote standard text in your own review comments either; describe the
+  requirement in your own words.
 - **Secrets or private infrastructure** in committed files: credentials, keys, tokens, internal
   hostnames.
 - **Vehicle-safety regressions**: a change that lets a write, flash or routine-control job run

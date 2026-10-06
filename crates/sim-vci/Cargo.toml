@@ -8,4 +8,5 @@ crate-type = ["cdylib"]
 
 [dependencies]
 sim-ecu.workspace = true
+serde_json.workspace = true
 j2534-defs.workspace = true

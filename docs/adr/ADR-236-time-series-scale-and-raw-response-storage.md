@@ -13,7 +13,9 @@ version so that the format can change later; this ADR fixes the first version an
 
 The achievable rate is set by the vehicle, not by this system:
 
-- A UDS read is one request and one response per data identifier. With classic CAN at 500 kbit/s,
+- Polling one data identifier at a time, each UDS read is one request and one response. (A
+  ReadDataByIdentifier request may name several identifiers and get one combined response, which
+  saves round trips but not bus time for the response bytes.) With classic CAN at 500 kbit/s,
   a 303-byte response (150 two-byte values in one DID) needs about 44 ISO-TP frames, roughly
   12 ms of bus time alone, and 20-50 ms per read once ECU and VCI latency are added. CAN FD
   brings the same response down to about five frames.
@@ -62,7 +64,7 @@ of data. The maintainer chose A, with the limits expressed in raw bytes rather t
    - time series recorded by one acquisition job: up to 1 hour.
 
    At session start the agent checks the requested set against the throughput limit along with
-   the measured achievable interval (10.3) and reports the reduced intervals it will use when the
+   the measured achievable interval (10.3) and reports the longer intervals it will use when the
    request exceeds it.
 4. **Chunk format, version 1** (`chunk_format = "records/1"`): a chunk holds a source table
    (source identifier to ECU and request) and the records of one time window in arrival order,

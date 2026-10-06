@@ -1135,7 +1135,7 @@ The adapter statically declares its delivery style, whether vehicle-side time is
 - Time is taken from a monotonic clock (QPC / `CLOCK_MONOTONIC`), and its correspondence to wall-clock time is recorded only once at session start
 - Each frame carries a sequence number, timestamp and time source
 - When sending backs up, old frames are dropped and the latest values take priority
-- A session is limited to 64 KiB/s of response bytes (ADR-236). When the requested signals exceed it, the agent reports the reduced intervals it will use together with the measured achievable interval
+- A session is limited to 64 KiB/s of response bytes (ADR-236). When the requested signals exceed it, the agent reports the longer intervals (lower sampling rates) it will use together with the measured achievable interval
 
 ### 10.4 Subscription from Multiple Browsers and Capture Operations
 

@@ -36,7 +36,7 @@ below refer to SAE J2534-1 (v04.04).
 
 ## Filters
 
-ISO 15765 channels follow clause 7.2.9 and Appendix A for flow-control filters:
+ISO 15765 channels follow clause 7.2.9 and Appendix A for flow-control filters (ADR-234):
 
 - Only `FLOW_CONTROL_FILTER` is accepted; `PASS_FILTER` and `BLOCK_FILTER` get
   `ERR_INVALID_FILTER_ID`.

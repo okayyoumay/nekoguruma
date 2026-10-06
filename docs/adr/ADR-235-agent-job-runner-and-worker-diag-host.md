@@ -67,6 +67,7 @@ The worker client sets no deadline on unary calls, so a wedged worker would bloc
 ## Consequences
 
 - A procedure that changes the session, writes, clears DTCs, runs routines or resets the ECU is refused before the link opens, with its `pc`. The end-to-end test reads only.
+- The worker ends a send-receive at the first frame that matches its expected response, and it compares only as many bytes as the frame holds. A malformed answer shorter than the pattern (for example a lone `62`) therefore ends the primitive. The host then rejects it, and the job fails with `NoResponse` instead of waiting for a complete answer. The failure is safe (the job stops, it never takes the wrong result), and it needs an ECU that sends malformed frames, so the worker's matching is left as it is.
 - A cancelled job's thread keeps the worker after its future is gone: it finishes the call or primitive in flight (up to the send-receive ceiling) and then closes the link, and closing disconnects the module, which releases every link on it. A caller that drops a job must not start another on the same worker until that thread has ended. `run_program` cannot express that yet; the job scheduler has to (backlog).
 
 - One job holds one blocking-pool thread for its whole run. That is fine for one job per VCI, but the agent's job scheduler must bound concurrent jobs.

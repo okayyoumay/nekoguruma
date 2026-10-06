@@ -56,7 +56,6 @@ Workspace skeleton (step 1): every crate goes as far as type and boundary defini
 - **P2**: `REG_EXPAND_SZ`: `FunctionLibrary` is returned unexpanded; expansion per library bitness (design 7.1) is still to do.
 - **P2**: Wiring: `agent` does not call `vci-discovery` yet.
 - **P3**: COMPARAM mapping covers J2534-1 base protocols only. J2534-2 cases (CAN FD, J1939, TP2.0, SW/FT CAN, pin-switched variants beyond the plain `_PS` IDs) exist in `j2534-0404-service` and can be carried over when needed.
-- **P3**: `sim-vci` and `j2534-0404-mock` are both J2534 cdylib mocks; decide whether `sim-vci` builds on the full mock.
 
 ## Worker services (`docs/worker-crates.md`, `crates/worker-host`)
 

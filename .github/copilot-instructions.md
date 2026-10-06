@@ -42,6 +42,7 @@ reviewing.
   | Database | a new file in `db/migrations/`, plus `db/README.md` |
   | New domain term | `docs/glossary.md` |
   | Crate scope, policy or detailed design | that crate's `crates/<crate>/docs/*.md` |
+  | Non-obvious design decision | a new ADR (see the ADR rule below) |
 - **ADRs**: a non-obvious decision (data structure, concurrency model, state machine, protocol
   interpretation, trust boundary) or a surprising spec-driven behaviour without an ADR; a new
   ADR without its `docs/adr/INDEX.md` row and theme entry; a duplicate ADR number; a change that

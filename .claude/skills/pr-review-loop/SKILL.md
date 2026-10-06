@@ -166,7 +166,9 @@ re-requested at most once.
    test fixtures, schemas and other data files, commit messages), check that none of it was copied from a standard (ISO 22900-2, SAE J2534,
    ISO 14229, ISO 15765-2, ISO 22901-1, ISO 17978 or any other), whether or not it cites one:
    compare each touched block against `vehicle-comm-specs` for runs of six or more consecutive
-   words (`doc-sync-checker` does this). A citation or a standard's name only tells you where to
+   words as a first screen, then compare shorter passages that read like specification wording
+   against the clause they describe, since the rule applies at any length (`doc-sync-checker`
+   does both). A citation or a standard's name only tells you where to
    look first. Give `doc-sync-checker` the PR description and the draft message of the round's
    commit, which are not in the diff; check any later edit to either the same way before
    committing or updating the PR. A search for quotation marks alone misses unquoted copies.

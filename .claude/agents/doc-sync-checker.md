@@ -53,9 +53,13 @@ Procedure:
    you. If the caller gives neither, say so in the report. When the
    sibling `vehicle-comm-specs` checkout is available (usually
    `../vehicle-comm-specs`), search every document in it for a run of six
-   or more consecutive words from the prose. Report a match as a
-   violation; report a passage you could not check as "spot-check
-   manually". Quotation marks are not required for a match.
+   or more consecutive words from the prose. That search is only the first
+   screen: the rule applies at any length, so also compare shorter
+   passages that read like specification wording (a definition, a
+   requirement sentence, a table caption) against the clause they cite or
+   describe. Report a match as a violation; report a passage you could not
+   check as "spot-check manually". Quotation marks are not required for a
+   match.
 6. Stale references: for each identifier the diff renames or removes
    (crate, file, function, config key, ADR number), grep the repository
    (excluding `target/` and `Cargo.lock`) for leftover mentions in docs and

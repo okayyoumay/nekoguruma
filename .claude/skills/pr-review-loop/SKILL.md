@@ -173,7 +173,9 @@ re-requested at most once.
    ISO 14229, ISO 15765-2, ISO 22901-1, ISO 17978 or any other), whether or not it cites one:
    compare each touched block against `vehicle-comm-specs` for runs of six or more consecutive
    words (`doc-sync-checker` does this). A citation or a standard's name only tells you where to
-   look first. A search for quotation marks alone misses unquoted copies.
+   look first. Give `doc-sync-checker` the PR description and the draft message of the round's
+   commit, which are not in the diff; check any later edit to either the same way before
+   committing or updating the PR. A search for quotation marks alone misses unquoted copies.
    Include untracked files (`git status --short --untracked-files=all`).
 5. **Base branch.** `git fetch origin main`. In a round that pushes, merge `origin/main` into the branch
    if it moved and run checks 1 to 4 on the merged tree; a PR that conflicts with its base gets

@@ -41,12 +41,15 @@ Procedure:
    the diff finishes work that a backlog item describes (search the backlog
    files for the identifiers the diff touches), report that the item must be
    closed in the same PR.
-5. Spec copyright: check whether any prose the diff adds (comments,
-   docs, ADRs, string literals, commit messages) reproduces the wording of
+5. Spec copyright: check whether any added prose reproduces the wording of
    a standard (ISO 22900-2, SAE J2534, ISO 14229, ISO 15765-2,
    ISO 22901-1, ISO 17978 or another), whether or not it cites one; a
    clause citation or a standard's name only tells you where to look
-   first. When the sibling `vehicle-comm-specs` checkout is available
+   first. Added prose means the diff's comments, docs, ADRs and string
+   literals, plus text the diff does not contain: the branch's commit
+   messages (`git log --format=%B $(git merge-base origin/main HEAD)..HEAD`),
+   and the PR description and any draft commit message the caller gives
+   you. If the caller gives neither, say so in the report. When the sibling `vehicle-comm-specs` checkout is available
    (usually `../vehicle-comm-specs`), search every document in it for a
    run of six or more consecutive words from the prose. Report a match as a
    violation; report a passage you could not check as "spot-check

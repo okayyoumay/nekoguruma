@@ -169,7 +169,7 @@ re-requested at most once.
 3. Run `doc-sync-checker` when the fix changes behaviour a document describes, an ADR, or a spec
    citation. A fix to a mechanism an ADR documents updates that ADR in the same PR.
 4. **Spec text.** When the fix adds or rewords prose (comments, docs, ADRs, string literals,
-   commit messages), check that none of it was copied from a standard (ISO 22900-2, SAE J2534,
+   test fixtures, schemas and other data files, commit messages), check that none of it was copied from a standard (ISO 22900-2, SAE J2534,
    ISO 14229, ISO 15765-2, ISO 22901-1, ISO 17978 or any other), whether or not it cites one:
    compare each touched block against `vehicle-comm-specs` for runs of six or more consecutive
    words (`doc-sync-checker` does this). A citation or a standard's name only tells you where to

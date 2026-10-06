@@ -32,3 +32,5 @@ j2534-0404-sys = { workspace = true }
 serde_json = "1"
 serial_test = "3"
 worker-host = { workspace = true }
+# Built for tests/sim_vci_end_to_end.rs, which loads the cdylib; not linked.
+sim-vci = { path = "../sim-vci" }

@@ -1,8 +1,8 @@
 //! [`DiagHost`] on top of the worker gRPC client (ADR-235).
 //!
-//! The VM is synchronous and the worker client asynchronous. The runner moves the VM and this
-//! host onto a blocking thread, and each primitive blocks on its gRPC calls through the
-//! runtime's [`Handle`] (item 1).
+//! The VM is synchronous and the worker client asynchronous. The runner builds this host on the
+//! job's blocking thread, and each primitive blocks on its gRPC calls through the runtime's
+//! [`Handle`] (item 1).
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -138,7 +138,10 @@ impl WorkerHost {
 
     /// Sends `request` on the link and returns the whole final response (positive, or a
     /// negative `7F` response), or [`HostError::NoResponse`] if the ECU did not answer.
+    ///
+    /// Every request leaves through here, so the policy is checked here (ADR-235 item 8).
     fn send_recv(&mut self, request: Vec<u8>) -> Result<Vec<u8>, HostError> {
+        crate::policy::check_request(&request)?;
         let handle = self.handle.clone();
         handle.block_on(self.send_recv_async(request))
     }
@@ -259,7 +262,6 @@ impl DiagHost for WorkerHost {
     type Error = HostError;
 
     fn service_request(&mut self, service: u16, payload: &[u8]) -> Result<Vec<u8>, HostError> {
-        crate::policy::check_service(service)?;
         let request = service_request_bytes(service, payload)?;
         self.send_recv(request)
     }

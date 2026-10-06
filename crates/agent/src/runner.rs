@@ -74,10 +74,12 @@ pub enum JobError {
 ///
 /// Must be called on a multi-threaded runtime: the VM runs on a blocking thread that blocks on
 /// the runtime for every primitive. That thread opens the link, runs the program and closes the
-/// link, so no future holding worker resources is ever dropped halfway. The link is closed
-/// however the job ends, also when the procedure panics; a failure to close it is logged, since
-/// it does not change the results. Dropping the returned future cancels the job: the call or
-/// primitive in flight finishes, no further instruction runs, and the link is closed.
+/// link, so no future holding worker resources is ever dropped halfway. Once open, the link is
+/// closed however the job ends, also when the procedure panics; a failure to close it is
+/// logged, since it does not change the results. Dropping the returned future cancels the job:
+/// the call or primitive in flight finishes, no further instruction runs, and the link is
+/// closed. That happens after the future is gone, so a caller that dropped it must not hand
+/// the worker to another job yet (ADR-235 consequences).
 pub async fn run_program(
     client: WorkerClient,
     config: &LinkConfig,
@@ -104,7 +106,14 @@ pub async fn run_program(
         .unwrap_or(Err(JobError::Panicked))
     })
     .await
-    .unwrap_or(Err(JobError::Panicked))
+    .unwrap_or_else(|error| {
+        Err(if error.is_cancelled() {
+            // The runtime is shutting down.
+            JobError::Cancelled
+        } else {
+            JobError::Panicked
+        })
+    })
 }
 
 /// The whole job, on the blocking thread: open, run, close.
@@ -392,16 +401,33 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_job_dropped_at_once_stops_before_the_worker() {
-        let config = LinkConfig::iso15765(0x7E0, 0x7E8);
-        let job = run_program(
-            unreachable_client(),
-            &config,
-            program(two_requests()[..2].to_vec()),
-            JobLimits::default(),
-        );
-        // Polled once, so the blocking thread is spawned, then dropped.
-        assert!(tokio::time::timeout(Duration::ZERO, job).await.is_err());
+    async fn a_job_cancelled_before_it_starts_never_reaches_the_worker() {
+        let handle = Handle::current();
+        let result = tokio::task::spawn_blocking(move || {
+            let config = LinkConfig::iso15765(0x7E0, 0x7E8);
+            let program = program(two_requests());
+            // Without the check, opening the link fails against the unreachable client.
+            run_job(
+                handle,
+                unreachable_client(),
+                &config,
+                &program,
+                JobLimits::default(),
+                &AtomicBool::new(true),
+            )
+        })
+        .await
+        .unwrap();
+        assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
+    }
+
+    #[test]
+    fn dropping_the_job_future_sets_the_cancel_flag() {
+        let guard = CancelOnDrop(Arc::new(AtomicBool::new(false)));
+        let flag = Arc::clone(&guard.0);
+        assert!(!flag.load(Ordering::Relaxed));
+        drop(guard);
+        assert!(flag.load(Ordering::Relaxed));
     }
 
     #[tokio::test(flavor = "current_thread")]

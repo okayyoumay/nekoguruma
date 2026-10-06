@@ -89,6 +89,8 @@ const CAN_ID_LEN: usize = 4;
 /// A response the ECU has produced, readable from `ready_at` on.
 struct Pending {
     ready_at: Instant,
+    /// `SimEcu::power_cycles` when the response was produced.
+    power_cycle: u64,
     data: Vec<u8>,
 }
 
@@ -137,6 +139,12 @@ fn millis(ms: PassThruUlong) -> Duration {
     Duration::from_millis(ms as u64)
 }
 
+/// Microseconds from `epoch` (first use of the library) to `at`, the moment a response appeared
+/// on the bus. Wraps as J2534 timestamps do.
+fn timestamp(epoch: Instant, at: Instant) -> PassThruUlong {
+    at.saturating_duration_since(epoch).as_micros() as PassThruUlong
+}
+
 /// Wakes reads waiting for a response.
 fn notify() {
     bus().1.notify_all();
@@ -175,9 +183,24 @@ impl Bus {
         self.device_open && device_id == DEVICE_ID
     }
 
-    /// Microseconds since the library was first used, as J2534 timestamps wrap.
-    fn timestamp(&self) -> PassThruUlong {
-        self.epoch.elapsed().as_micros() as PassThruUlong
+    fn power_cycles(&self) -> u64 {
+        self.ecu.as_ref().map_or(0, SimEcu::power_cycles)
+    }
+
+    /// Call after anything that may have power-cycled the ECU, with the count from before it.
+    /// Responses still being delayed by then were never sent, so they are discarded; responses
+    /// already on the bus stay in the receive buffer.
+    fn after_ecu_change(&mut self, power_cycles_before: u64) {
+        let current = self.power_cycles();
+        if current == power_cycles_before {
+            return;
+        }
+        let now = Instant::now();
+        for channel in self.channels.values_mut() {
+            channel
+                .rx
+                .retain(|p| p.ready_at <= now || p.power_cycle == current);
+        }
     }
 
     /// Hands one ISO 15765 message to the ECU and queues its response on `channel_id`.
@@ -192,7 +215,10 @@ impl Bus {
         let Some(ecu) = self.ecu.as_mut() else {
             return;
         };
+        let before = ecu.power_cycles();
         let exchange = ecu.exchange(addressing, payload);
+        let power_cycle = ecu.power_cycles();
+        self.after_ecu_change(before);
         let Some(bytes) = exchange.response.to_bytes() else {
             return;
         };
@@ -203,7 +229,14 @@ impl Bus {
             return;
         };
         let at = channel.rx.partition_point(|p| p.ready_at <= ready_at);
-        channel.rx.insert(at, Pending { ready_at, data });
+        channel.rx.insert(
+            at,
+            Pending {
+                ready_at,
+                power_cycle,
+                data,
+            },
+        );
     }
 }
 
@@ -212,9 +245,12 @@ impl Bus {
 #[cfg(test)]
 fn with_ecu<R>(f: impl FnOnce(&mut SimEcu) -> R) -> R {
     let mut bus = lock();
-    f(bus
+    let before = bus.power_cycles();
+    let result = f(bus
         .ecu
-        .get_or_insert_with(|| SimEcu::new(default_ecu_config())))
+        .get_or_insert_with(|| SimEcu::new(default_ecu_config())));
+    bus.after_ecu_change(before);
+    result
 }
 
 /// Replaces the simulated vehicle with a fresh ECU and closes the device.
@@ -355,7 +391,7 @@ pub unsafe extern "C" fn PassThruReadMsgs(
     let mut bus = lock();
     let mut read = 0;
     let status = loop {
-        let timestamp = bus.timestamp();
+        let epoch = bus.epoch;
         let Some(channel) = bus.channels.get_mut(&channel_id) else {
             break ERR_INVALID_CHANNEL_ID;
         };
@@ -366,7 +402,7 @@ pub unsafe extern "C" fn PassThruReadMsgs(
                 protocol_id: channel.protocol_id,
                 rx_status: 0,
                 tx_flags: 0,
-                timestamp,
+                timestamp: timestamp(epoch, pending.ready_at),
                 data_size: pending.data.len() as PassThruUlong,
                 extra_data_index: pending.data.len() as PassThruUlong,
                 data: [0; MAX_MSG_DATA],

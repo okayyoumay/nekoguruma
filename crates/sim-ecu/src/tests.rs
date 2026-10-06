@@ -1418,3 +1418,21 @@ fn faults_stay_armed_while_the_ecu_is_silent() {
     assert_eq!(ecu.request(&[0x3E, 0x00]), SimResponse::NoResponse);
     assert_eq!(ecu.request(&[0x3E, 0x00]), pos(&[0x7E, 0x00]));
 }
+
+#[test]
+fn power_cycles_count_resets_power_loss_and_reconnect() {
+    let mut ecu = ecu();
+    assert_eq!(ecu.power_cycles(), 0);
+    // A rejected reset does not restart the ECU; a suppressed one does.
+    assert_eq!(
+        ecu.request(&[0x11, 0x04]),
+        neg(0x11, Nrc::SubFunctionNotSupported)
+    );
+    assert_eq!(ecu.power_cycles(), 0);
+    assert_eq!(ecu.request(&[0x11, 0x81]), SimResponse::NoResponse);
+    assert_eq!(ecu.power_cycles(), 1);
+    ecu.inject(Fault::PowerLoss);
+    assert_eq!(ecu.power_cycles(), 2);
+    ecu.reconnect();
+    assert_eq!(ecu.power_cycles(), 3);
+}

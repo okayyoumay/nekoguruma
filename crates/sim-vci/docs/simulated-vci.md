@@ -41,13 +41,15 @@ so a delayed response can be overtaken by a later one. `PassThruReadMsgs` follow
 with a zero timeout it returns at once; otherwise it waits until the requested number of messages
 is read or the timeout passes. Reading nothing gives `ERR_BUFFER_EMPTY`; reading fewer than
 requested with a non-zero timeout gives `ERR_TIMEOUT`. A response the ECU does not send (dropped,
-suppressed, silent ECU) never appears.
+suppressed, silent ECU) never appears, nor does one still being delayed when the ECU power-cycles
+(power loss, ECU reset, reconnection); responses already on the bus stay readable.
 
 Simplifications:
 
 - No flow-control filter is needed before responses are queued, and no TxDone indications or
   loopback messages are generated.
-- `RxStatus` is always zero; the timestamp is microseconds since the library was first used.
+- `RxStatus` is always zero. The timestamp is the moment the response appeared on the bus
+  (after its delay), in microseconds since the library was first used.
 
 ## Fault injection
 

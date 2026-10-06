@@ -371,3 +371,50 @@ fn a_maximal_timeout_does_not_overflow() {
     );
     assert_eq!(n, 1);
 }
+
+#[test]
+fn a_power_loss_discards_responses_not_yet_sent() {
+    let f = fixture();
+    write(f.channel, ECU_PHYSICAL_REQUEST_ID, &[0x3E, 0x00]);
+    with_ecu(|ecu| ecu.inject(Fault::DelayResponse { ms: 100 }));
+    write(f.channel, ECU_PHYSICAL_REQUEST_ID, &[0x22, 0xF1, 0x86]);
+    with_ecu(|ecu| ecu.inject(Fault::PowerLoss));
+    // The undelayed response was already on the bus; the delayed one was never sent.
+    assert_eq!(
+        read(f.channel, 2, 300),
+        (ERR_TIMEOUT, vec![response(&[0x7E, 0x00])])
+    );
+}
+
+#[test]
+fn an_ecu_reset_response_survives_its_own_reset() {
+    let f = setup(EcuConfig {
+        response_delay_ms: 200,
+        ..default_ecu_config()
+    });
+    write(f.channel, ECU_PHYSICAL_REQUEST_ID, &[0x3E, 0x00]);
+    write(f.channel, ECU_PHYSICAL_REQUEST_ID, &[0x11, 0x01]);
+    // The reset discards the TesterPresent response still being delayed, not its own.
+    assert_eq!(
+        read(f.channel, 2, 600),
+        (ERR_TIMEOUT, vec![response(&[0x51, 0x01])])
+    );
+}
+
+#[test]
+fn timestamps_mark_when_each_response_appeared() {
+    let f = fixture();
+    with_ecu(|ecu| ecu.inject(Fault::DelayResponse { ms: 200 }));
+    write(f.channel, ECU_PHYSICAL_REQUEST_ID, &[0x3E, 0x00]);
+    write(f.channel, ECU_PHYSICAL_REQUEST_ID, &[0x3E, 0x00]);
+    std::thread::sleep(Duration::from_millis(300));
+    let mut buf = [empty_msg(), empty_msg()];
+    let mut n = 2;
+    assert_eq!(
+        unsafe { PassThruReadMsgs(f.channel, buf.as_mut_ptr(), &mut n, 0) },
+        STATUS_NOERROR
+    );
+    // Read together, but the delayed response appeared about 200 ms after the other.
+    let gap = buf[1].timestamp.wrapping_sub(buf[0].timestamp);
+    assert!((100_000..=200_000).contains(&gap), "gap {gap} us");
+}

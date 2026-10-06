@@ -200,6 +200,8 @@ pub struct SimEcu {
     silent: bool,
     /// Faults armed by [`SimEcu::inject`] that have not fired yet, in injection order.
     armed: Vec<Fault>,
+    /// Power cycles so far (power loss, ECU reset, reconnection).
+    power_cycles: u64,
 }
 
 // ---------------------------------------------------------------- Responses
@@ -311,6 +313,7 @@ impl SimEcu {
             image: Vec::new(),
             silent: false,
             armed: Vec::new(),
+            power_cycles: 0,
         }
     }
 
@@ -392,6 +395,12 @@ impl SimEcu {
         }
     }
 
+    /// Number of power cycles (power loss, ECU reset, [`SimEcu::reconnect`]) so far. A response
+    /// the VCI side is still delaying when this changes was never sent.
+    pub fn power_cycles(&self) -> u64 {
+        self.power_cycles
+    }
+
     /// Faults armed by [`SimEcu::inject`] that have not fired yet.
     pub fn armed_faults(&self) -> &[Fault] {
         &self.armed
@@ -421,6 +430,7 @@ impl SimEcu {
     /// The false-attempt counter starts again at zero (Annex I, transition 1); an active
     /// security delay keeps running, as if the delay were restarted on power-up.
     fn power_cycle(&mut self) {
+        self.power_cycles += 1;
         self.session = Session::Default;
         self.lock_security();
         self.failed_attempts = 0;

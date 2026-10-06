@@ -54,7 +54,6 @@ No IR programs, transpiler or journals existed when this was decided, so `VmStat
    - `Ret` at the top level sets `pc` to the end of the code, so "finished" is a property of the state and stepping a finished VM changes nothing.
    - Locals and globals are `Option` slots: reading an unset slot is an error, and a store grows the vector.
    - A jump or call target may equal the code length (ending the program). A larger target is `BadPc`.
-   - A resumed state is not trusted: `Ret` checks the frame's return position before using it.
 7. **Primitive operands.**
    - The primitives that send data take it as `Bytes` from the top of the stack: service request payload, routine control payload, seed, flash block.
    - Primitives that return data push it as `Bytes`.
@@ -65,6 +64,7 @@ No IR programs, transpiler or journals existed when this was decided, so `VmStat
    - It refuses a state whose version differs from the program's (`StateSchemaMismatch`).
    - It refuses a program too long for `u32` positions (`ProgramTooLarge`).
    - It refuses a state whose step counter is exhausted (`StepLimit`).
+   - A resumed state is not trusted. Before any instruction, including a host-calling one, `step` checks the invariants the instructions otherwise maintain themselves. The stack must be within `MAX_STACK`, the call stack within `MAX_CALL_DEPTH`, and every frame's return position inside the program. Together with the `pc` check, a damaged or edited journal can neither exceed the limits nor jump outside the program. Values and variable slots need no check, because every instruction checks the types it uses.
 10. **Encoding.** `Op` and `VmState` are stored with postcard, which encodes an enum variant by its index. The order of `Op`'s variants is therefore part of the stored format, and a test pins it. `Op::is_diagnostic_primitive` is an exhaustive match, so a new instruction cannot be added without classifying it.
 
 ## Consequences

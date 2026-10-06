@@ -1003,6 +1003,62 @@ fn resumed_state_is_checked() {
     ));
     assert_eq!(vm.state, state);
 
+    // Limits and return positions are checked before any instruction, host-calling ones
+    // included, and the host is never asked.
+    let primitive = prog(
+        vec![
+            Op::MonitorCapture { back_millis: 1 },
+            Op::Wait { millis: 1 },
+        ],
+        vec![],
+    );
+    let base = Vm::new(&primitive).state;
+    let frame = |return_pc| Frame {
+        return_pc,
+        locals: Vec::new(),
+    };
+    let oversized_stack = VmState {
+        stack: vec![Value::I64(0); MAX_STACK + 1],
+        ..base.clone()
+    };
+    let deep_calls = VmState {
+        call_stack: (0..=MAX_CALL_DEPTH).map(|_| frame(1)).collect(),
+        pc: 1,
+        ..base.clone()
+    };
+    let bad_return = VmState {
+        call_stack: vec![frame(1), frame(3)],
+        ..base.clone()
+    };
+    for (state, expected) in [
+        (oversized_stack, VmError::StackOverflow),
+        (deep_calls, VmError::CallDepthExceeded),
+        (bad_return, VmError::BadPc(3)),
+    ] {
+        let before = postcard::to_allocvec(&state).unwrap();
+        let mut vm = Vm::resume(state);
+        let mut host = MockHost {
+            forbidden: true,
+            ..MockHost::default()
+        };
+        assert!(
+            matches!(vm.step(&primitive, &mut host), Err(StepError::Vm(ref e)) if *e == expected),
+            "{expected:?}"
+        );
+        assert_eq!(
+            postcard::to_allocvec(&vm.state).unwrap(),
+            before,
+            "{expected:?}"
+        );
+    }
+    // The limits themselves are allowed.
+    let mut vm = Vm::resume(VmState {
+        stack: vec![Value::I64(0); MAX_STACK],
+        call_stack: (0..MAX_CALL_DEPTH).map(|_| frame(2)).collect(),
+        ..base
+    });
+    vm.step(&primitive, &mut MockHost::default()).unwrap();
+
     let mut state = Vm::new(&program).state;
     state.steps = u64::MAX;
     let mut vm = Vm::resume(state.clone());

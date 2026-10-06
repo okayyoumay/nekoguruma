@@ -329,6 +329,7 @@ impl Vm {
         if self.state.steps == u64::MAX {
             return Err(VmError::StepLimit.into());
         }
+        self.check_restored_state(program)?;
         let Some(op) = self.current_op(program)? else {
             return Ok(StepOutcome::Finished);
         };
@@ -421,13 +422,11 @@ impl Vm {
                 return Ok(Executed::Done);
             }
             Op::Ret => {
-                match self.state.call_stack.last() {
+                match self.state.call_stack.pop() {
+                    // The return position was checked by `check_restored_state` or `Call`.
                     Some(frame) => {
-                        // A resumed state is not trusted to hold a valid return position.
-                        let return_pc = jump_target(program, frame.return_pc)?;
-                        let frame = self.state.call_stack.pop().expect("checked above");
                         self.state.locals = frame.locals;
-                        self.state.pc = return_pc;
+                        self.state.pc = frame.return_pc;
                     }
                     // A return from the top level ends the program.
                     None => self.state.pc = program.code.len() as u32,
@@ -544,6 +543,24 @@ impl Vm {
         }
         self.state.pc = next;
         Ok(Executed::Done)
+    }
+
+    /// A resumed state is not trusted (ADR-233): checks the invariants that the instructions
+    /// otherwise maintain themselves, so a state from a damaged or edited journal cannot exceed
+    /// the limits or jump outside the program. `pc` is checked by [`Vm::current_op`]; the
+    /// contents of values and variable slots need no check, since every instruction checks
+    /// the types it uses.
+    fn check_restored_state(&self, program: &Program) -> Result<(), VmError> {
+        if self.state.stack.len() > MAX_STACK {
+            return Err(VmError::StackOverflow);
+        }
+        if self.state.call_stack.len() > MAX_CALL_DEPTH {
+            return Err(VmError::CallDepthExceeded);
+        }
+        for frame in &self.state.call_stack {
+            jump_target(program, frame.return_pc)?;
+        }
+        Ok(())
     }
 
     /// The top `n` values, deepest first, or [`VmError::StackUnderflow`].

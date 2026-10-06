@@ -4,7 +4,7 @@
 
 Milestones from the current skeleton to a deployable product. Each milestone has a goal, its scope (by design-document section) and exit criteria a reviewer can check. The individual work items live in `backlog.md` and `worker-crates-backlog.md`; this file only says which milestone they belong to. When a milestone finishes, delete its section, move any lasting decision into `docs/system-architecture.md` or an ADR, and name the next milestone in `backlog.md`'s Status section (that is what P1 means).
 
-Order of work: the device side first (M1, M2), because interruption safety (R5) and the IR runtime are the riskiest parts and can be verified without a server. The server and UI follow on the local deployment profile (M3, M4), which needs no cloud. Standard formats and external APIs (ODX/OTX, SOVD/ExVe) come last; OTX and ExVe are not held yet.
+Order of work: the device side first (M1, M2), because interruption safety (R5) and the IR runtime are the riskiest parts and can be verified without a server. The server and UI follow on the local deployment profile (M3, M4), which needs no cloud. The ODX and SOVD parts of M7 can start alongside M5/M6, since those standards are held; the OTX and ExVe parts come last, once ISO 13209 and ISO 20077/20078 are obtained.
 
 Standards: `vehicle-comm-specs` holds SAE J2534-1 (v04.04), SAE J2534-2 (DEC2020), ISO 22900-2 (2009 and 2022), ISO 14229-1 (2026 edition), ISO 14229-2 (2021 edition), ISO 15765-2 (2024 edition), ISO 22901-1 (2008 edition) and ISO 17978-1/-2/-3 (2026 edition). Clause numbers below for ISO 14229-1 refer to the 2026 edition. Standards marked "not held" still have to be obtained.
 
@@ -134,7 +134,7 @@ M5 and M6 do not depend on each other; their order can be swapped. M7's ODX and 
 
 These change the plan's scope or order; each is a design-17 item or a purchase.
 
-- Standards purchase: SAE J3138 before M6; ISO 13209 (OTX) and ISO 20077/20078 (ExVe) before M7. The M1 and M2 standards, ISO 22901-1 (ODX) and ISO 17978 (SOVD) are held.
+- Standards purchase: SAE J3138 before M6; ISO 13209 (OTX) and ISO 20077/20078 (ExVe) before M7's OTX and ExVe parts start. The M1 and M2 standards, ISO 22901-1 (ODX) and ISO 17978 (SOVD) are held.
 - Order of M5 and M6.
 - Design 17 P3 (practical scope of Linux support) affects how much of M1's Linux path is kept as a supported product feature rather than a test path.
 - Design 17 P5 (non-functional targets) before M8.

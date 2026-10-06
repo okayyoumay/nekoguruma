@@ -105,8 +105,13 @@ responsible for them, in the same way that business screens are theirs (design 9
       confirmation once, so only a failure after that teardown ends in on-site intervention. So that a crash between sending RequestTransferExit and recording its response
       cannot hide this case, the agent commits an intent marker for RequestTransferExit to the
       journal before it transmits the request (write-ahead); a journal without that marker
-      proves the request was never sent. The marker is part of the checkpoint summary used for
-      handover, like the recorded identity below.
+      proves the request was never sent. The same write-ahead rule covers the start of the
+      transfer: before the first erase request (or RequestDownload, when the procedure does not
+      erase) is transmitted, the agent commits a transfer-start intent marker, so a crash after
+      the ECU accepted that request but before its response was recorded still counts as an
+      interrupted transfer and takes this restart order, never a plain start that would erase
+      while an old download may be open. Both markers are part of the checkpoint summary used
+      for handover, like the recorded identity below.
 
       In every other case it tears down passively: when the ECU does not answer the VIN read or
       answers it with a negative response (for example because it is still inside the old

@@ -40,9 +40,10 @@ in, read it and act on it right away, and delete that check-in (`delete_trigger`
 Only a Copilot review submitted after the latest request, with `commit_id` equal to the current
 head, counts as that request's result. An older review of the same head is not a result.
 
-**Never write `@copilot`** in a PR comment, review reply or commit message, not even quoted in
-backticks: it asks the Copilot coding agent to work on the PR, and it may push commits to the
-branch. Write "Copilot" without the `@`.
+**Never write an at-sign mention of Copilot** (`@copilot`, in any capitalization) in a PR
+comment, review reply or commit message, not even quoted in backticks: it asks the Copilot
+coding agent to work on the PR, and it may push commits to the branch. Write "Copilot" without
+the `@`.
 
 **Copilot not available.** Only a request call that fails because Copilot code review is not
 enabled for the owner's account or this repository means Copilot cannot review here (turning it on is a Copilot plan and settings change only the owner can make). Say so once
@@ -178,7 +179,7 @@ re-requested at most once.
   or why not (with the ADR or backlog item for 2c, the trace for 2d). Take the comment ID from a
   `get_review_comments` result fetched in this turn, never from memory.
 - Every reply ends with the attribution footer GitHub posts from Claude carry.
-- Never write `@copilot` in a thread reply (Step 0).
+- Never mention Copilot with an at-sign, in any capitalization, in a thread reply (Step 0).
 - Answer summary-only findings (Step 1) in one PR comment, since they have no thread.
 - Only after every thread of the round has its reply, request a Copilot review again (Step 0),
   then go back to Step 1. A no-change round re-requests only as Step 3 allows.

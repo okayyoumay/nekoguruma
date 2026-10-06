@@ -796,6 +796,8 @@ No instructions are defined that correspond to external access (files, network, 
 
 Each instruction is atomic: it either completes or leaves the VM state unchanged, and a failed diagnostic primitive leaves the state on that primitive, so the resume origins in 8.2.5 hold at every instruction boundary. A wait for the server (seed-key, HMI including record template input) or for a `Wait` instruction's time is reported as a waiting outcome without changing the state, so the runner stays responsive. The VM holds no resume policy and writes no journal; the job runner decides whether a primitive may be repeated and journals around each step. Types are strict and integer arithmetic is checked. The full semantics are in ADR-233.
 
+The agent runs the VM on a blocking thread per job, and its host turns each diagnostic primitive into calls on the worker's D-PDU API (7.4) on a link set up before the first instruction. `ServiceRequest` names the UDS service identifier and returns the whole final response; a negative response is a result for the procedure, and a response pending (0x78) is absorbed by the worker. That contract is in ADR-235.
+
 #### 8.2.5 Resume Model
 
 For each cause of interruption, the resume origin and whether resumption is possible are defined (corresponding to the interruption countermeasures in chapter 5).

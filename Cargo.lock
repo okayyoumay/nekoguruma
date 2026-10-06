@@ -10,9 +10,12 @@ dependencies = [
  "diag-ir",
  "serde",
  "shared-proto",
+ "thiserror",
  "tokio",
+ "tonic",
  "tracing",
  "vci-discovery",
+ "vci-service-interface",
  "worker-host",
 ]
 
@@ -891,6 +894,8 @@ dependencies = [
 name = "j2534-0404-service"
 version = "0.1.0"
 dependencies = [
+ "agent",
+ "diag-ir",
  "j2534-0404",
  "j2534-0404-mock",
  "j2534-0404-registry",

@@ -35,8 +35,8 @@ Working rules:
   in `docs/adr/` (check `INDEX.md` for the area and either align with them
   or recommend superseding one explicitly), the C headers under
   `crates/*-sys/src/bindings/`, and per-crate docs.
-- ISO 22900-2 and SAE J2534 texts (the sibling `vehicle-comm-specs`
-  repository) are copyrighted. Never reproduce their text in your reply or
+- Standard texts (ISO 22900-2, SAE J2534, ISO 14229 and the others in the
+  sibling `vehicle-comm-specs` repository) are copyrighted. Never reproduce their text in your reply or
   in an ADR sketch; cite the clause number and paraphrase.
 
 Deliverable: a decision, not a survey (about 60 lines at most):

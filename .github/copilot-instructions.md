@@ -7,10 +7,12 @@ More rules for Rust, documentation and CI files are in `.github/instructions/`.
 
 ## P0
 
-- **Copied standard text.** ISO 22900-2, SAE J2534-1/-2 and ISO 14229-1 are copyrighted. Flag any
-  passage that reads as copied from them, quoted or not, at any length, anywhere: comments,
-  strings, fixtures, data files, docs, ADRs, commit messages, the PR description. Citations give
-  the clause number and paraphrase. Never quote standard text in your own comments.
+- **Copied standard text.** ISO 22900-2, SAE J2534-1/-2, ISO 14229-1, ISO 14229-2,
+  ISO 15765-2, ISO 22901-1 and ISO 17978 are copyrighted, as is any other standard. Flag any
+  passage that reads as copied from one of them, quoted or not, at any length, anywhere:
+  comments, strings, fixtures, data files, docs, ADRs, commit messages, the PR description.
+  Citations give the clause number and paraphrase. Never quote standard text in your own
+  comments.
 - **Secrets or private infrastructure**: credentials, keys, tokens, internal hostnames.
 - **Vehicle safety**: a write, flash or routine-control job that can run without the
   preconditions and guards of design 5.5, 5.6 and 8.9, or that bypasses the authorization and

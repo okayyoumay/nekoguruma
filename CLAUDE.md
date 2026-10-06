@@ -98,12 +98,13 @@ read them as provenance, and do not cite such history in new text.
 
 ### Spec references and copyright
 
-ISO 22900-2 (2009 and 2022 editions), SAE J2534-1 (v04.04), SAE J2534-2 and ISO 14229-1 (2026
-edition) are available as converted text in the sibling `vehicle-comm-specs` repository (add it
+ISO 22900-2 (2009 and 2022 editions), SAE J2534-1 (v04.04), SAE J2534-2, ISO 14229-1 (2026
+edition), ISO 14229-2 (2021), ISO 15765-2 (2024), ISO 22901-1 (2008) and ISO 17978-1/-2/-3
+(2026) are available as converted text in the sibling `vehicle-comm-specs` repository (add it
 to the session with `add_repo` if it is missing). Check which edition a finding targets before citing it.
 
-These standards are copyrighted. **Never copy their text verbatim**, at any length, into anything
-this repository stores: code comments, `docs/`, ADRs, commit messages, PR or issue bodies. Cite
+These standards, and any other standard, are copyrighted. **Never copy their text verbatim**, at
+any length, into anything this repository stores: code comments, `docs/`, ADRs, commit messages, PR or issue bodies. Cite
 the clause or section number and paraphrase in your own words.
 
 ### Generated code

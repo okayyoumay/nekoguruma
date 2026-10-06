@@ -14,12 +14,18 @@ struct MockHost {
     responses: VecDeque<Result<Vec<u8>, MockError>>,
     keys: VecDeque<Option<Vec<u8>>>,
     hmi: VecDeque<Option<Vec<u8>>>,
+    /// Answers to `wait`; an empty queue means the time has passed.
+    timers: VecDeque<bool>,
     fail_next: bool,
+    /// Panic if any host method is called.
+    forbidden: bool,
+    inquiries: Vec<u64>,
     logs: Vec<(u8, String)>,
 }
 
 impl MockHost {
     fn fail(&mut self) -> Result<(), MockError> {
+        assert!(!self.forbidden, "the host must not be called");
         if std::mem::take(&mut self.fail_next) {
             Err(MockError)
         } else {
@@ -28,6 +34,7 @@ impl MockHost {
     }
 
     fn response(&mut self) -> Result<Vec<u8>, MockError> {
+        self.fail()?;
         self.responses.pop_front().unwrap_or(Err(MockError))
     }
 }
@@ -54,8 +61,14 @@ impl DiagHost for MockHost {
             .push(format!("routine {routine:#x} {sub} {payload:02x?}"));
         self.response()
     }
-    fn security_access(&mut self, level: u8, seed: &[u8]) -> Result<Option<Vec<u8>>, MockError> {
+    fn security_access(
+        &mut self,
+        inquiry: u64,
+        level: u8,
+        seed: &[u8],
+    ) -> Result<Option<Vec<u8>>, MockError> {
         self.calls.push(format!("security {level} {seed:02x?}"));
+        self.inquiries.push(inquiry);
         self.fail()?;
         Ok(self.keys.pop_front().flatten())
     }
@@ -63,12 +76,15 @@ impl DiagHost for MockHost {
         self.calls.push(format!("flash {block} {data:02x?}"));
         self.fail()
     }
-    fn wait(&mut self, millis: u32) -> Result<(), MockError> {
+    fn wait(&mut self, inquiry: u64, millis: u32) -> Result<bool, MockError> {
         self.calls.push(format!("wait {millis}"));
-        self.fail()
+        self.inquiries.push(inquiry);
+        self.fail()?;
+        Ok(self.timers.pop_front().unwrap_or(true))
     }
-    fn hmi_request(&mut self, form: &[u8]) -> Result<Option<Vec<u8>>, MockError> {
+    fn hmi_request(&mut self, inquiry: u64, form: &[u8]) -> Result<Option<Vec<u8>>, MockError> {
         self.calls.push(format!("hmi {form:02x?}"));
+        self.inquiries.push(inquiry);
         self.fail()?;
         Ok(self.hmi.pop_front().flatten())
     }
@@ -81,6 +97,7 @@ impl DiagHost for MockHost {
         self.fail()
     }
     fn log(&mut self, level: u8, message: &str) {
+        assert!(!self.forbidden, "the host must not be called");
         self.logs.push((level, message.to_owned()));
     }
 }
@@ -361,17 +378,24 @@ fn byte_indexing() {
             i(1),
             i(0xAB),
             Op::IndexSet,
-            Op::Dup,
             i(1),
             Op::IndexGet,
+            Op::Swap,
+            i(2),
+            Op::IndexGet,
         ],
-        vec![vec![0, 0, 0]],
+        vec![vec![0, 0, 7]],
     );
     let mut vm = Vm::new(&program);
     run(&mut vm, &program, &mut MockHost::default());
+    // IndexGet leaves the bytes in place and pushes the byte above them.
     assert_eq!(
         vm.state.stack,
-        [Value::Bytes(vec![0, 0xAB, 0]), Value::I64(0xAB)]
+        [
+            Value::I64(0xAB),
+            Value::Bytes(vec![0, 0xAB, 7]),
+            Value::I64(7)
+        ]
     );
 
     let constants = || vec![vec![0u8; 2]];
@@ -664,9 +688,13 @@ fn schema_versions_must_match() {
     let mut state = Vm::new(&current).state;
     state.schema_version = IR_SCHEMA_VERSION + 1;
     let mut vm = Vm::resume(state);
+    let expected = VmError::StateSchemaMismatch {
+        program: IR_SCHEMA_VERSION,
+        state: IR_SCHEMA_VERSION + 1,
+    };
     assert!(matches!(
         vm.step(&current, &mut MockHost::default()),
-        Err(StepError::Vm(VmError::SchemaMismatch { .. }))
+        Err(StepError::Vm(e)) if e == expected
     ));
 }
 
@@ -727,4 +755,347 @@ fn state_round_trips_through_postcard_at_every_boundary() {
     }
     assert_eq!(vm.state, straight.state);
     assert_eq!(vm.state.stack, [Value::I64(0)]);
+}
+
+/// Every host-calling primitive, set up so that the next step calls the host.
+fn primitive_programs() -> Vec<(Op, Program)> {
+    let constants = vec![vec![0x22], b"text".to_vec()];
+    let with_bytes = |op: Op| {
+        (
+            op.clone(),
+            prog(vec![Op::PushBytes(0), op], constants.clone()),
+        )
+    };
+    let alone = |op: Op| (op.clone(), prog(vec![i(0), op], constants.clone()));
+    vec![
+        with_bytes(Op::ServiceRequest { service: 0x22 }),
+        alone(Op::ReadDtc { mask: 0xFF }),
+        with_bytes(Op::RoutineControl { routine: 1, sub: 1 }),
+        with_bytes(Op::SecurityAccess { level: 1 }),
+        with_bytes(Op::FlashTransfer { block: 0 }),
+        alone(Op::Wait { millis: 10 }),
+        alone(Op::HmiRequest { form: 1 }),
+        alone(Op::RecordInput { template: 1 }),
+        alone(Op::MonitorCapture { back_millis: 10 }),
+    ]
+}
+
+/// 8.2.5 for every primitive: a host error leaves the state byte-identical and a retry
+/// completes the instruction.
+#[test]
+fn every_primitive_is_atomic_on_host_error() {
+    for (op, program) in primitive_programs() {
+        let mut vm = Vm::new(&program);
+        let mut host = MockHost {
+            responses: VecDeque::from([Err(MockError), Ok(vec![1])]),
+            keys: VecDeque::from([Some(vec![2])]),
+            hmi: VecDeque::from([Some(vec![3])]),
+            ..MockHost::default()
+        };
+        vm.step(&program, &mut host).unwrap();
+        let before = postcard::to_allocvec(&vm.state).unwrap();
+        // Queue-driven primitives fail on the queued error; the others on `fail_next`.
+        host.fail_next = !matches!(
+            op,
+            Op::ServiceRequest { .. }
+                | Op::ReadDtc { .. }
+                | Op::RoutineControl { .. }
+                | Op::RecordInput { .. }
+        );
+        assert!(
+            matches!(vm.step(&program, &mut host), Err(StepError::Host(_))),
+            "{op:?} should report the host error"
+        );
+        assert_eq!(
+            postcard::to_allocvec(&vm.state).unwrap(),
+            before,
+            "{op:?} changed the state"
+        );
+        assert_eq!(
+            vm.step(&program, &mut host).unwrap(),
+            StepOutcome::Finished,
+            "{op:?} should complete on retry"
+        );
+        assert_eq!(vm.state.steps, 2, "{op:?}");
+        assert_eq!(vm.state.pc, 2, "{op:?}");
+    }
+}
+
+/// With a full stack, a primitive that pushes an answer fails before the host is asked, so an
+/// answer is never thrown away.
+#[test]
+fn full_stack_is_detected_before_the_host_is_asked() {
+    for op in [
+        Op::ReadDtc { mask: 0xFF },
+        Op::HmiRequest { form: 0 },
+        Op::RecordInput { template: 0 },
+    ] {
+        let mut code = vec![i(0); MAX_STACK];
+        code.push(op.clone());
+        let program = prog(code, vec![vec![1]]);
+        let mut vm = Vm::new(&program);
+        let mut host = MockHost::default();
+        for _ in 0..MAX_STACK {
+            vm.step(&program, &mut host).unwrap();
+        }
+        host.forbidden = true;
+        let before = postcard::to_allocvec(&vm.state).unwrap();
+        assert!(
+            matches!(
+                vm.step(&program, &mut host),
+                Err(StepError::Vm(VmError::StackOverflow))
+            ),
+            "{op:?}"
+        );
+        assert_eq!(postcard::to_allocvec(&vm.state).unwrap(), before, "{op:?}");
+    }
+}
+
+#[test]
+fn primitive_classification_covers_every_instruction() {
+    let primitives: Vec<Op> = primitive_programs().into_iter().map(|(op, _)| op).collect();
+    let all = [
+        i(0),
+        Op::PushF64(0.0),
+        Op::PushBytes(0),
+        Op::Pop,
+        Op::Dup,
+        Op::Swap,
+        Op::Add,
+        Op::Sub,
+        Op::Mul,
+        Op::Div,
+        Op::BitAnd,
+        Op::BitOr,
+        Op::BitXor,
+        Op::Shl,
+        Op::Shr,
+        Op::CmpEq,
+        Op::CmpLt,
+        Op::CmpGt,
+        Op::Not,
+        Op::Jump(0),
+        Op::JumpIfFalse(0),
+        Op::Call(0),
+        Op::Ret,
+        Op::LoadLocal(0),
+        Op::StoreLocal(0),
+        Op::LoadGlobal(0),
+        Op::StoreGlobal(0),
+        Op::IndexGet,
+        Op::IndexSet,
+        Op::ServiceRequest { service: 0 },
+        Op::ReadDtc { mask: 0 },
+        Op::RoutineControl { routine: 0, sub: 0 },
+        Op::SecurityAccess { level: 0 },
+        Op::FlashTransfer { block: 0 },
+        Op::Wait { millis: 0 },
+        Op::HmiRequest { form: 0 },
+        Op::RecordInput { template: 0 },
+        Op::MonitorCapture { back_millis: 0 },
+        Op::Log {
+            level: 0,
+            message: 0,
+        },
+    ];
+    for (index, op) in all.iter().enumerate() {
+        // The postcard encoding starts with the variant index, so this also pins the variant
+        // order: reordering `Op` would change every stored program (ADR-233).
+        assert_eq!(
+            postcard::to_allocvec(op).unwrap()[0] as usize,
+            index,
+            "{op:?} moved"
+        );
+        let expected = matches!(op, Op::Log { .. })
+            || primitives
+                .iter()
+                .any(|p| std::mem::discriminant(p) == std::mem::discriminant(op));
+        assert_eq!(op.is_diagnostic_primitive(), expected, "{op:?}");
+    }
+}
+
+#[test]
+fn more_arithmetic_and_comparison_edges() {
+    assert_eq!(
+        expect_vm_error(vec![i(i64::MAX), i(2), Op::Mul], vec![], 2),
+        VmError::Overflow
+    );
+    assert_eq!(
+        expect_vm_error(vec![i(i64::MIN), i(1), Op::Sub], vec![], 2),
+        VmError::Overflow
+    );
+    // Integer division truncates toward zero.
+    assert_eq!(eval(vec![i(-7), i(2), Op::Div]), [Value::I64(-3)]);
+    assert_eq!(eval(vec![i(-1), i(63), Op::Shr]), [Value::I64(1)]);
+    assert_eq!(eval(vec![i(5), i(0), Op::Shl]), [Value::I64(5)]);
+    let t = || Value::Bool(true);
+    let f = || Value::Bool(false);
+    assert_eq!(
+        eval(vec![Op::PushF64(1.0), Op::PushF64(2.0), Op::CmpLt]),
+        [t()]
+    );
+    assert_eq!(
+        eval(vec![Op::PushF64(1.0), Op::PushF64(2.0), Op::CmpGt]),
+        [f()]
+    );
+    assert_eq!(
+        eval(vec![Op::PushF64(2.0), Op::PushF64(1.0), Op::CmpGt]),
+        [t()]
+    );
+    assert_eq!(eval(vec![i(2), i(1), Op::CmpLt]), [f()]);
+    // NaN is unordered.
+    for op in [Op::CmpLt, Op::CmpGt] {
+        assert_eq!(
+            eval(vec![Op::PushF64(f64::NAN), Op::PushF64(1.0), op]),
+            [f()]
+        );
+    }
+}
+
+#[test]
+fn branch_targets_are_checked_and_may_end_the_program() {
+    assert_eq!(
+        expect_vm_error(vec![Op::Call(2)], vec![], 0),
+        VmError::BadPc(2)
+    );
+    let program = prog(
+        vec![i(1), i(1), Op::CmpEq, Op::Not, Op::JumpIfFalse(9)],
+        vec![],
+    );
+    let mut vm = Vm::new(&program);
+    for _ in 0..4 {
+        vm.step(&program, &mut MockHost::default()).unwrap();
+    }
+    let before = vm.state.clone();
+    assert!(matches!(
+        vm.step(&program, &mut MockHost::default()),
+        Err(StepError::Vm(VmError::BadPc(9)))
+    ));
+    assert_eq!(vm.state, before);
+
+    // A false condition jumping to the end, and a call to the end, finish the program.
+    assert_eq!(
+        eval(vec![i(1), i(2), Op::CmpEq, Op::JumpIfFalse(5), i(9)]),
+        []
+    );
+    let program = prog(vec![Op::Call(1)], vec![]);
+    let mut vm = Vm::new(&program);
+    assert_eq!(
+        vm.step(&program, &mut MockHost::default()).unwrap(),
+        StepOutcome::Finished
+    );
+}
+
+/// A resumed state is not trusted: a frame returning outside the program fails without
+/// changing the state, and an exhausted step counter stops the VM.
+#[test]
+fn resumed_state_is_checked() {
+    let program = prog(vec![Op::Ret], vec![]);
+    let mut state = Vm::new(&program).state;
+    state.call_stack.push(Frame {
+        return_pc: 999,
+        locals: Vec::new(),
+    });
+    let mut vm = Vm::resume(state.clone());
+    assert!(matches!(
+        vm.step(&program, &mut MockHost::default()),
+        Err(StepError::Vm(VmError::BadPc(999)))
+    ));
+    assert_eq!(vm.state, state);
+
+    let mut state = Vm::new(&program).state;
+    state.steps = u64::MAX;
+    let mut vm = Vm::resume(state.clone());
+    assert!(matches!(
+        vm.step(&program, &mut MockHost::default()),
+        Err(StepError::Vm(VmError::StepLimit))
+    ));
+    assert_eq!(vm.state, state);
+}
+
+/// The inquiry passed to the host stays the same while a wait is polled and changes when the
+/// same instruction is reached again.
+#[test]
+fn waits_carry_a_stable_inquiry() {
+    // Two passes over one HmiRequest, then a Wait that is polled twice.
+    let code = vec![
+        i(0),
+        Op::StoreGlobal(0),
+        Op::HmiRequest { form: 0 }, // 2
+        Op::Pop,
+        Op::LoadGlobal(0),
+        i(1),
+        Op::Add,
+        Op::Dup,
+        Op::StoreGlobal(0),
+        i(2),
+        Op::CmpLt,
+        Op::JumpIfFalse(13),
+        Op::Jump(2),
+        Op::Wait { millis: 100 }, // 13
+    ];
+    let program = prog(code, vec![b"form".to_vec()]);
+    let mut vm = Vm::new(&program);
+    let mut host = MockHost {
+        hmi: VecDeque::from([None, Some(vec![1]), None, None, Some(vec![2])]),
+        timers: VecDeque::from([false, false, true]),
+        ..MockHost::default()
+    };
+    let mut waits = Vec::new();
+    loop {
+        match vm.step(&program, &mut host).unwrap() {
+            StepOutcome::Continue => {}
+            StepOutcome::Finished => break,
+            StepOutcome::Waiting(on) => waits.push(on),
+        }
+    }
+    use WaitingOn::{Hmi, Timer};
+    assert_eq!(waits, [Hmi, Hmi, Hmi, Timer, Timer]);
+    let i = &host.inquiries;
+    assert_eq!(i.len(), 8);
+    assert!(i[0] == i[1] && i[2] == i[3] && i[3] == i[4] && i[5] == i[6] && i[6] == i[7]);
+    assert!(i[0] < i[2] && i[2] < i[5], "{i:?}");
+}
+
+/// Values that are easy to get wrong in serialization survive a round trip bit for bit.
+#[test]
+fn unusual_values_round_trip() {
+    let state = VmState {
+        schema_version: IR_SCHEMA_VERSION,
+        pc: 3,
+        stack: vec![
+            Value::F64(f64::NAN),
+            Value::F64(-0.0),
+            Value::I64(i64::MIN),
+            Value::I64(i64::MAX),
+            Value::Bool(false),
+            Value::Bytes(Vec::new()),
+        ],
+        locals: vec![None, Some(Value::I64(1))],
+        globals: vec![Some(Value::Bytes(vec![0xFF; 3])), None],
+        call_stack: vec![Frame {
+            return_pc: 2,
+            locals: vec![Some(Value::F64(f64::INFINITY)), None],
+        }],
+        steps: u64::MAX - 1,
+        checkpoint: Some(Checkpoint {
+            pc: 1,
+            section: 0,
+            vin: Some("VIN".into()),
+            artifact_digest: None,
+            at: "2026-10-06T00:00:00Z".into(),
+        }),
+        resume_count: 2,
+    };
+    let bytes = postcard::to_allocvec(&state).unwrap();
+    let restored: VmState = postcard::from_bytes(&bytes).unwrap();
+    assert_eq!(postcard::to_allocvec(&restored).unwrap(), bytes);
+    let Value::F64(nan) = restored.stack[0] else {
+        panic!("not a float")
+    };
+    assert_eq!(nan.to_bits(), f64::NAN.to_bits());
+    let Value::F64(zero) = restored.stack[1] else {
+        panic!("not a float")
+    };
+    assert!(zero.is_sign_negative());
 }

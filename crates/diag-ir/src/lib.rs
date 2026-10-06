@@ -115,19 +115,48 @@ impl Op {
     /// Whether this instruction goes through [`DiagHost`]. The job runner journals around these
     /// (8.2.5 checkpoint granularity, ADR-233).
     pub fn is_diagnostic_primitive(&self) -> bool {
-        matches!(
-            self,
+        // Exhaustive on purpose: a new instruction must be classified here.
+        match self {
             Op::ServiceRequest { .. }
-                | Op::ReadDtc { .. }
-                | Op::RoutineControl { .. }
-                | Op::SecurityAccess { .. }
-                | Op::FlashTransfer { .. }
-                | Op::Wait { .. }
-                | Op::HmiRequest { .. }
-                | Op::RecordInput { .. }
-                | Op::MonitorCapture { .. }
-                | Op::Log { .. }
-        )
+            | Op::ReadDtc { .. }
+            | Op::RoutineControl { .. }
+            | Op::SecurityAccess { .. }
+            | Op::FlashTransfer { .. }
+            | Op::Wait { .. }
+            | Op::HmiRequest { .. }
+            | Op::RecordInput { .. }
+            | Op::MonitorCapture { .. }
+            | Op::Log { .. } => true,
+            Op::PushI64(_)
+            | Op::PushF64(_)
+            | Op::PushBytes(_)
+            | Op::Pop
+            | Op::Dup
+            | Op::Swap
+            | Op::Add
+            | Op::Sub
+            | Op::Mul
+            | Op::Div
+            | Op::BitAnd
+            | Op::BitOr
+            | Op::BitXor
+            | Op::Shl
+            | Op::Shr
+            | Op::CmpEq
+            | Op::CmpLt
+            | Op::CmpGt
+            | Op::Not
+            | Op::Jump(_)
+            | Op::JumpIfFalse(_)
+            | Op::Call(_)
+            | Op::Ret
+            | Op::LoadLocal(_)
+            | Op::StoreLocal(_)
+            | Op::LoadGlobal(_)
+            | Op::StoreGlobal(_)
+            | Op::IndexGet
+            | Op::IndexSet => false,
+        }
     }
 }
 
@@ -139,6 +168,9 @@ pub const MAX_STACK: usize = 1024;
 pub const MAX_CALL_DEPTH: usize = 64;
 
 /// Written to the journal in its entirety (8.2.5). Serialized with postcard.
+///
+/// `PartialEq` compares floats by value, so a state holding NaN is not equal to itself; compare
+/// the postcard bytes to check that a state did not change.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VmState {
     pub schema_version: u32,
@@ -201,13 +233,25 @@ pub trait DiagHost {
     ) -> Result<Vec<u8>, Self::Error>;
     /// The seed is sent to the server and a key is received (8.10). `Ok(None)` means the key has
     /// not arrived yet (for example while the server is unreachable, 8.2.5); the VM then waits and
-    /// the same request is made again on the next step. The host keeps track of what it already
-    /// asked.
-    fn security_access(&mut self, level: u8, seed: &[u8]) -> Result<Option<Vec<u8>>, Self::Error>;
+    /// makes the same call again on a later step.
+    ///
+    /// `inquiry` identifies the request: it stays the same while the VM waits on it (and after a
+    /// host error or a resume from the journal at the same instruction), and a later instruction,
+    /// including the same instruction reached again in a loop, gets a new one. Returning `Some`
+    /// closes the inquiry.
+    fn security_access(
+        &mut self,
+        inquiry: u64,
+        level: u8,
+        seed: &[u8],
+    ) -> Result<Option<Vec<u8>>, Self::Error>;
     fn flash_transfer(&mut self, block: u32, data: &[u8]) -> Result<(), Self::Error>;
-    fn wait(&mut self, millis: u32) -> Result<(), Self::Error>;
-    /// `Ok(None)` means no answer yet; see [`DiagHost::security_access`].
-    fn hmi_request(&mut self, form: &[u8]) -> Result<Option<Vec<u8>>, Self::Error>;
+    /// Returns `Ok(true)` once `millis` have passed since the first call for `inquiry`, and
+    /// `Ok(false)` before that, so the job runner stays responsive (cancellation, keep-alive)
+    /// while a procedure waits. `inquiry` as for [`DiagHost::security_access`].
+    fn wait(&mut self, inquiry: u64, millis: u32) -> Result<bool, Self::Error>;
+    /// `Ok(None)` means no answer yet; `inquiry` as for [`DiagHost::security_access`].
+    fn hmi_request(&mut self, inquiry: u64, form: &[u8]) -> Result<Option<Vec<u8>>, Self::Error>;
     fn record_input(&mut self, template: &[u8]) -> Result<Vec<u8>, Self::Error>;
     fn monitor_capture(&mut self, back_millis: u32) -> Result<(), Self::Error>;
     fn log(&mut self, level: u8, message: &str);
@@ -272,11 +316,18 @@ impl Vm {
             .into());
         }
         if self.state.schema_version != program.schema_version {
-            return Err(VmError::SchemaMismatch {
+            return Err(VmError::StateSchemaMismatch {
                 program: program.schema_version,
-                runtime: self.state.schema_version,
+                state: self.state.schema_version,
             }
             .into());
+        }
+        // Positions are u32 in the bytecode and the state.
+        if u32::try_from(program.code.len()).is_err() {
+            return Err(VmError::ProgramTooLarge.into());
+        }
+        if self.state.steps == u64::MAX {
+            return Err(VmError::StepLimit.into());
         }
         let Some(op) = self.current_op(program)? else {
             return Ok(StepOutcome::Finished);
@@ -301,6 +352,8 @@ impl Vm {
         host: &mut H,
     ) -> Result<Executed, StepError<H::Error>> {
         let next = self.state.pc + 1;
+        // Unchanged until the instruction completes, so it identifies a waiting inquiry.
+        let inquiry = self.state.steps;
         match op {
             Op::PushI64(v) => self.push(Value::I64(*v))?,
             Op::PushF64(v) => self.push(Value::F64(*v))?,
@@ -368,10 +421,13 @@ impl Vm {
                 return Ok(Executed::Done);
             }
             Op::Ret => {
-                match self.state.call_stack.pop() {
+                match self.state.call_stack.last() {
                     Some(frame) => {
+                        // A resumed state is not trusted to hold a valid return position.
+                        let return_pc = jump_target(program, frame.return_pc)?;
+                        let frame = self.state.call_stack.pop().expect("checked above");
                         self.state.locals = frame.locals;
-                        self.state.pc = frame.return_pc;
+                        self.state.pc = return_pc;
                     }
                     // A return from the top level ends the program.
                     None => self.state.pc = program.code.len() as u32,
@@ -398,13 +454,14 @@ impl Vm {
                 store(&mut self.state.globals, *slot, value);
             }
             Op::IndexGet => {
+                // The bytes stay on the stack, so reading several bytes needs no copies.
                 let [Value::Bytes(bytes), Value::I64(index)] = self.top(2)? else {
                     return Err(VmError::TypeMismatch.into());
                 };
                 let byte = *bytes
                     .get(byte_index(*index, bytes.len())?)
                     .expect("checked by byte_index");
-                self.replace(2, Value::I64(byte.into()));
+                self.replace(1, Value::I64(byte.into()));
             }
             Op::IndexSet => {
                 let [Value::Bytes(bytes), Value::I64(index), Value::I64(value)] = self.top(3)?
@@ -445,7 +502,7 @@ impl Vm {
                 let seed = self.bytes_operand()?;
                 self.check_room(1, 1)?;
                 match host
-                    .security_access(*level, seed)
+                    .security_access(inquiry, *level, seed)
                     .map_err(StepError::Host)?
                 {
                     Some(key) => self.replace(1, Value::Bytes(key)),
@@ -457,11 +514,15 @@ impl Vm {
                 host.flash_transfer(*block, data).map_err(StepError::Host)?;
                 self.state.stack.pop();
             }
-            Op::Wait { millis } => host.wait(*millis).map_err(StepError::Host)?,
+            Op::Wait { millis } => {
+                if !host.wait(inquiry, *millis).map_err(StepError::Host)? {
+                    return Ok(Executed::Waiting(WaitingOn::Timer));
+                }
+            }
             Op::HmiRequest { form } => {
                 let form = constant(program, *form)?;
                 self.check_room(0, 1)?;
-                match host.hmi_request(form).map_err(StepError::Host)? {
+                match host.hmi_request(inquiry, form).map_err(StepError::Host)? {
                     Some(answer) => self.push(Value::Bytes(answer))?,
                     None => return Ok(Executed::Waiting(WaitingOn::Hmi)),
                 }
@@ -643,13 +704,15 @@ pub enum WaitingOn {
     Hmi,
     /// The key for a security access seed has not arrived from the server.
     SeedKey,
+    /// A `Wait` instruction's time has not passed.
+    Timer,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum StepError<E: std::error::Error + 'static> {
     #[error(transparent)]
     Vm(#[from] VmError),
-    #[error("host: {0}")]
+    #[error("host error")]
     Host(#[source] E),
 }
 
@@ -657,6 +720,12 @@ pub enum StepError<E: std::error::Error + 'static> {
 pub enum VmError {
     #[error("schema version mismatch: program={program}, runtime={runtime}")]
     SchemaMismatch { program: u32, runtime: u32 },
+    #[error("state was saved for schema version {state}, program has {program}")]
+    StateSchemaMismatch { program: u32, state: u32 },
+    #[error("program has more instructions than a u32 position can address")]
+    ProgramTooLarge,
+    #[error("step counter exhausted")]
+    StepLimit,
     #[error("invalid instruction position: {0}")]
     BadPc(u32),
     #[error("stack underflow")]

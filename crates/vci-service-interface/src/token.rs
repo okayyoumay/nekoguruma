@@ -1,8 +1,9 @@
-//! Bearer-token format shared by `vci-service-manager` (mints tokens) and
-//! `vci-service-launcher`'s shared gRPC listener (verifies tokens), per
-//! ADR-221. Both sides must agree byte-for-byte on this format, so it lives
-//! in exactly one place and the manager depends on this crate to mint,
-//! rather than re-implementing the HMAC construction itself.
+//! Bearer-token format of the worker gRPC listener (ADR-221). The agent
+//! (`worker-host`) mints tokens from the per-instance key it provisions over
+//! the stdio control channel; `vci-service-launcher`'s shared listener
+//! verifies them with the same key. Both sides must agree byte-for-byte on
+//! this format, so it lives in exactly one place: this crate, which both the
+//! client and the service already depend on for the gRPC interface.
 //!
 //! Token shape: `vci1.<base64url(payload_json)>.<base64url(HMAC-SHA256(key, payload_json))>`
 //! where `payload_json` is `{"exp": <unix_secs>, "iat": <unix_secs>, "sub": "<opaque label>"}`.

@@ -7,9 +7,9 @@
 //! - [`abi`]: determine the ABI of a vendor library from its PE / ELF header (7.3)
 //! - [`service`]: locate the matching service binary, launch it, provision its auth key and
 //!   obtain its gRPC endpoints over the stdio JSON-RPC control channel (7.4)
-//!
-//! The gRPC client (the D-PDU API surface of `vci-service-interface`) is not
-//! part of this crate yet.
+//! - [`client`]: connect a D-PDU API gRPC client (`vci-service-interface`) to a running worker,
+//!   authenticated with bearer tokens minted from its auth key (7.4, ADR-221)
 
 pub mod abi;
+pub mod client;
 pub mod service;

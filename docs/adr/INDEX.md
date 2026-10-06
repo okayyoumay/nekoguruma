@@ -210,7 +210,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-218](ADR-218-comparam-structfield-vendor-struct-size-resolution.md) | `iso22900-service` ComParam STRUCTFIELD Support — Standard Struct Types, and a Size-Resolution Algorithm for Vendor Struct Types | Accepted and implemented | `iso22900-service` convert, `vci-service-config`, docs |
 | [ADR-219](ADR-219-j2534-0404-vendor-ioctl-config-passthrough.md) | `j2534-0404-service` Vendor IoctlID/ConfigParameterID Passthrough (0x10000+) | Accepted (implemented) | `j2534-0404-service` rpc_misc/comparam_id/comparam_support/service_params/config/service, `vci-service-config`, `j2534-0404`, `j2534-0404-mock`, docs |
 | [ADR-220](ADR-220-vci-service-manager-grpc-endpoint-selection.md) | `vci-service-manager` Conforms to the `endpoints`-Based `get_status` Contract (Fixes the Always-Fails Real-Instance Startup Bug) | Accepted | `vci-service-manager` main, docs; `iso22900-service` docs |
-| [ADR-221](ADR-221-vci-service-shared-listener-auth-and-proxy-removal.md) | `vci-service`'s Shared gRPC Listener Gains Bearer-Token Auth and gRPC-Web; `vci-service-manager`'s Proxy Is Removed | Accepted (Decision item 7's route-preservation for `DELETE /vci-libs/{id}/endpoint` superseded by ADR-225) | `vci-service-launcher` vci_server/jsonrpc; `vci-service-manager` main, docs |
+| [ADR-221](ADR-221-vci-service-shared-listener-auth-and-proxy-removal.md) | `vci-service`'s Shared gRPC Listener Gains Bearer-Token Auth and gRPC-Web; `vci-service-manager`'s Proxy Is Removed | Accepted (Decision item 7's route-preservation for `DELETE /vci-libs/{id}/endpoint` superseded by ADR-225; manager-side token minting superseded for the agent by ADR-231) | `vci-service-launcher` vci_server/jsonrpc; `vci-service-manager` main, docs |
 | [ADR-222](ADR-222-uniquerespid-can-width-disambiguation.md) | `UniqueRespIdTable` RX Matching Gains CAN-ID-Width Disambiguation for Contended Ids | Accepted | `j2534-0404-service` events/events_rx_routing, tests/grpc_mock, docs |
 | [ADR-223](ADR-223-registryviewmode-all-empty-view-list-fallback.md) | `RegistryViewMode::All` Falls Back to `Native` When No Architecture-Specific View Exists | Accepted | `j2534-0404-registry`, `iso22900-registry` |
 | [ADR-224](ADR-224-vci-service-manager-instance-lifecycle-single-flight.md) | `vci-service-manager` Instance Lifecycle Gains a Single-Flight State Machine | Accepted | `vci-service-manager` main |
@@ -219,6 +219,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-228](ADR-228-fixed-library-resolution-locations.md) | Library Resolution from Fixed Locations, Shared by Agent and Worker | Accepted | design 7.1.1 / 7.2 / 7.3, `vci-discovery`, `vci-service-config`, worker services |
 | [ADR-229](ADR-229-interrupted-transfer-restarts-from-request-download.md) | Interrupted Transfers Restart from RequestDownload; Write Procedures Are a Reference Implementation | Accepted | design 8.2.5 / 16.1, `agent` journal, `sim-ecu` |
 | [ADR-230](ADR-230-backlog-loop-serialization-and-claims.md) | Backlog Loop Runs One Item at a Time, with PR-Based Claims and Run State | Accepted | `.claude/skills/backlog-loop`, `next-task`, `scripts/classify-pr-risk.sh` |
+| [ADR-231](ADR-231-agent-mints-worker-tokens-in-process.md) | The Agent Mints Worker Bearer Tokens In-Process | Accepted | `worker-host` client, `vci-service-interface` token |
 
 ## Status Legend
 
@@ -254,7 +255,7 @@ ADR-031
 ADR-032, ADR-073, ADR-220 (Decision item 5's `proxy_to_instance` mechanism removed by ADR-221), ADR-225
 
 ### vci-service Authentication & Trust Boundary
-ADR-052 (loopback-only binding this ADR's auth mechanism relies on), ADR-220 (`grpc_endpoint`/`SocketAddr` clients now connect to directly, per this ADR's proxy removal), ADR-221 (Decision item 7's route-preservation for `DELETE /vci-libs/{id}/endpoint` superseded by ADR-225; native-client-enrollment and unauthenticated-admin-route accepted residuals closed by ADR-226), ADR-226, ADR-228
+ADR-052 (loopback-only binding this ADR's auth mechanism relies on), ADR-220 (`grpc_endpoint`/`SocketAddr` clients now connect to directly, per this ADR's proxy removal), ADR-221 (Decision item 7's route-preservation for `DELETE /vci-libs/{id}/endpoint` superseded by ADR-225; native-client-enrollment and unauthenticated-admin-route accepted residuals closed by ADR-226; manager-side token minting superseded for the agent by ADR-231), ADR-226, ADR-228, ADR-231
 
 ### FFI Bindings & Target ABI
 ADR-108, ADR-227

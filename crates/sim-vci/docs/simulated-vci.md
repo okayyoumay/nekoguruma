@@ -18,7 +18,9 @@ below refer to SAE J2534-1 (v04.04).
   29-bit ID flag, gets `ERR_NOT_SUPPORTED`. Channel IDs count up from 1. `PassThruClose` drops
   every channel together with its filters and unread responses; `PassThruDisconnect` drops one.
 - All 14 J2534 v04.04 functions are exported, so `j2534-0404-service` loads the library like a
-  vendor's. `PassThruReadVersion` reports firmware `NGR-SIM 1.0`, DLL `sim-vci <crate version>`
+  vendor's on the targets where the exports' calling convention matches; the end-to-end test runs
+  on the host target. On Windows x86 the exports still use the C calling convention, not the
+  stdcall a vendor DLL uses there, so the service cannot load that build yet. `PassThruReadVersion` reports firmware `NGR-SIM 1.0`, DLL `sim-vci <crate version>`
   and API `04.04` on an open device. `PassThruGetLastError` always reports a fixed text: the
   simulator keeps no error descriptions. `PassThruSetProgrammingVoltage` drives nothing but keeps
   track of the pins by the rules of clause 7.2.11: 5 to 20 V on one of pins 0, 6, 9 and 11 to 14
@@ -56,7 +58,8 @@ ISO 15765 channels follow clause 7.2.9 and Appendix A for flow-control filters:
   flow-control ID is the request's CAN ID and whose pattern ID is the partner answering there
   (`7E8` for `7E0`; any other ID for an address nobody simulates), since the partner's flow
   control arrives on the pattern ID. A filter with the same pattern and flow-control ID serves
-  functional single frames only (ADR-055). Without such a filter the request is not sent and
+  functional single frames only, and a request to the functional ID `7DF` is never segmented,
+  whatever the filters (ADR-055). Without such a filter the request is not sent and
   the write returns `ERR_NO_FLOW_CONTROL`. Single frames need no filter.
 
 ## Messages

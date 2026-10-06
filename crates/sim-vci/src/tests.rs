@@ -855,6 +855,13 @@ fn segmented_writes_need_the_partner_filter() {
             FUNCTIONAL_REQUEST_ID,
             ERR_NO_FLOW_CONTROL,
         ),
+        // Functional requests are never segmented, whatever the filter.
+        (
+            0x700,
+            FUNCTIONAL_REQUEST_ID,
+            FUNCTIONAL_REQUEST_ID,
+            ERR_NO_FLOW_CONTROL,
+        ),
         // The partner filter.
         (
             ECU_RESPONSE_ID,

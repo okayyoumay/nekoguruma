@@ -215,9 +215,13 @@ impl Channel {
     /// Whether a segmented message may be sent to `can_id`: a filter must send to it and
     /// receive from the partner that answers there, since the partner's flow control for the
     /// first frame arrives on the pattern ID (J2534-1 7.2.9, Appendix A). A filter whose pattern
-    /// and flow-control IDs are the same serves functional single frames only. For an ID no
-    /// simulated responder listens on, the partner is unknown and any distinct pattern is taken.
+    /// and flow-control IDs are the same serves functional single frames only, and a functional
+    /// request is never segmented (ADR-055). For an ID no simulated responder listens on, the
+    /// partner is unknown and any distinct pattern is taken.
     fn can_segment_to(&self, can_id: u32) -> bool {
+        if can_id == FUNCTIONAL_REQUEST_ID {
+            return false;
+        }
         self.filters.values().any(|f| {
             f.flow_control == can_id
                 && f.pattern != f.flow_control

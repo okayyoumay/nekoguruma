@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 use diag_ir::DiagHost;
 use tokio::runtime::Handle;
 use vci_service_interface::{
-    ComOperationType, ComPrimitiveCtrlData, ExpectedResponseData, PduComPrimitiveStatus,
-    StartComPrimitiveRequest, event_item, event_notification,
+    ComOperationType, ComPrimitiveCtrlData, ComPrimitiveHandle, EventItem, ExpectedResponseData,
+    PduComPrimitiveStatus, PduErrorEvent, StartComPrimitiveRequest, event_item, event_notification,
 };
 use worker_host::client::WorkerClient;
 
@@ -31,6 +31,10 @@ pub enum HostError {
     EventStreamEnded,
     #[error("no response from the ECU")]
     NoResponse,
+    /// The primitive ended without a response after the worker reported this error event
+    /// (for example a transmit error or a lost VCI), so the request may not have been sent.
+    #[error("the primitive failed: {}", error_event_name(*.0))]
+    PrimitiveFailed(i32),
     #[error("service {0:#x} is not a UDS service ID")]
     BadService(u16),
     #[error("{0} is not supported by this agent yet")]
@@ -39,7 +43,13 @@ pub enum HostError {
     Setup(&'static str),
 }
 
-/// Calls a unary RPC with a deadline (ADR-235 item 5).
+fn error_event_name(code: i32) -> String {
+    PduErrorEvent::try_from(code)
+        .map(|event| event.as_str_name().to_owned())
+        .unwrap_or_else(|_| format!("error event {code:#x}"))
+}
+
+/// Calls a unary RPC with a deadline (ADR-235 item 6).
 pub(crate) async fn unary<T>(
     deadline: Duration,
     rpc: &'static str,
@@ -157,11 +167,15 @@ impl WorkerHost {
             self.client.start_com_primitive(start),
         )
         .await?
-        .cop_handle;
+        .cop_handle
+        // Without a handle, events of no primitive would match.
+        .ok_or(HostError::Setup(
+            "StartComPrimitive returned no primitive handle",
+        ))?;
 
         let events = &mut self.link.events;
         let wait = async {
-            let mut response = None;
+            let mut progress = Progress::default();
             loop {
                 let notification = events
                     .message()
@@ -175,21 +189,8 @@ impl WorkerHost {
                 else {
                     continue;
                 };
-                // Events of earlier primitives (or none) are not this request's.
-                if item.cop_handle != cop {
-                    continue;
-                }
-                match item.data {
-                    Some(event_item::Data::ResultData(result)) => {
-                        response = Some(result.data_bytes);
-                    }
-                    Some(event_item::Data::CopStatus(status))
-                        if status == PduComPrimitiveStatus::PduCopstFinished as i32
-                            || status == PduComPrimitiveStatus::PduCopstCancelled as i32 =>
-                    {
-                        return response.ok_or(HostError::NoResponse);
-                    }
-                    _ => {}
+                if let Some(done) = progress.on_event(item, cop) {
+                    return done;
                 }
             }
         };
@@ -197,6 +198,55 @@ impl WorkerHost {
             .await
             .map_err(|_| HostError::NoResponse)?
     }
+}
+
+/// What the events of one send-receive have shown so far.
+#[derive(Debug, Default)]
+struct Progress {
+    response: Option<Vec<u8>>,
+    error: Option<i32>,
+}
+
+impl Progress {
+    /// Takes one event; returns the outcome once the primitive `cop` has ended.
+    fn on_event(
+        &mut self,
+        item: EventItem,
+        cop: ComPrimitiveHandle,
+    ) -> Option<Result<Vec<u8>, HostError>> {
+        // Events of earlier primitives, and of none, are not this request's.
+        if item.cop_handle != Some(cop) {
+            return None;
+        }
+        match item.data {
+            // A response pending the worker passes on is not the final response (ADR-235
+            // item 3).
+            Some(event_item::Data::ResultData(result))
+                if !is_response_pending(&result.data_bytes) =>
+            {
+                self.response = Some(result.data_bytes);
+            }
+            Some(event_item::Data::ErrorData(code)) => self.error = Some(code),
+            Some(event_item::Data::CopStatus(status))
+                if status == PduComPrimitiveStatus::PduCopstFinished as i32
+                    || status == PduComPrimitiveStatus::PduCopstCancelled as i32 =>
+            {
+                return Some(match (self.response.take(), self.error) {
+                    (Some(response), _) => Ok(response),
+                    (None, Some(code)) => Err(HostError::PrimitiveFailed(code)),
+                    (None, None) => Err(HostError::NoResponse),
+                });
+            }
+            _ => {}
+        }
+        None
+    }
+}
+
+/// A negative response with code 0x78 (requestCorrectlyReceived-ResponsePending, ISO 14229-1
+/// annex A).
+fn is_response_pending(response: &[u8]) -> bool {
+    matches!(response, [0x7F, _, 0x78])
 }
 
 impl DiagHost for WorkerHost {
@@ -221,7 +271,7 @@ impl DiagHost for WorkerHost {
     }
 
     // Never `Ok(None)`: that means "still waiting" and the VM would wait forever (ADR-235
-    // item 4).
+    // item 5).
     fn security_access(
         &mut self,
         _inquiry: u64,
@@ -311,11 +361,137 @@ mod tests {
     }
 
     #[test]
-    fn send_recv_ceiling_covers_the_0x78_chain() {
+    fn send_recv_ceiling_covers_p2_and_the_0x78_chain() {
         let config = LinkConfig::iso15765(0x7E0, 0x7E8);
         assert_eq!(
             Timings::for_link(&config).send_recv,
-            Duration::from_millis(25_000 + 5_000 + 2_000)
+            Duration::from_millis(1_000 + 25_000 + 5_000 + 2_000)
         );
+    }
+
+    #[test]
+    fn link_configs_with_unusable_values_are_refused() {
+        let good = LinkConfig::iso15765(0x7E0, 0x7E8);
+        good.validate().unwrap();
+        LinkConfig {
+            p2_max_ms: crate::link::MAX_TIMING_MS,
+            tx_id: 0x1FFF_FFFF,
+            ..good.clone()
+        }
+        .validate()
+        .unwrap();
+        for bad in [
+            LinkConfig {
+                p2_max_ms: 0,
+                ..good.clone()
+            },
+            LinkConfig {
+                p2_star_ms: 0,
+                ..good.clone()
+            },
+            LinkConfig {
+                rc78_completion_ms: 0,
+                ..good.clone()
+            },
+            LinkConfig {
+                rc78_completion_ms: crate::link::MAX_TIMING_MS + 1,
+                ..good.clone()
+            },
+            LinkConfig {
+                rx_id: 0x2000_0000,
+                ..good.clone()
+            },
+        ] {
+            assert!(
+                matches!(bad.validate(), Err(HostError::Setup(_))),
+                "{bad:?}"
+            );
+        }
+    }
+
+    const COP: ComPrimitiveHandle = ComPrimitiveHandle {
+        module_handle: 1,
+        cll_handle: 1,
+        cop_handle: 7,
+    };
+
+    fn event(cop: Option<ComPrimitiveHandle>, data: event_item::Data) -> EventItem {
+        EventItem {
+            cop_handle: cop,
+            data: Some(data),
+            ..EventItem::default()
+        }
+    }
+
+    fn result(bytes: &[u8]) -> event_item::Data {
+        event_item::Data::ResultData(vci_service_interface::ResultData {
+            data_bytes: bytes.to_vec(),
+            ..Default::default()
+        })
+    }
+
+    fn status(status: PduComPrimitiveStatus) -> event_item::Data {
+        event_item::Data::CopStatus(status as i32)
+    }
+
+    /// Feeds `events` and returns the outcome of the first that ends the primitive.
+    fn outcome(events: Vec<EventItem>) -> Option<Result<Vec<u8>, HostError>> {
+        let mut progress = Progress::default();
+        events
+            .into_iter()
+            .find_map(|item| progress.on_event(item, COP))
+    }
+
+    #[test]
+    fn the_last_response_of_the_primitive_is_its_result() {
+        let other = ComPrimitiveHandle {
+            cop_handle: 6,
+            ..COP
+        };
+        let got = outcome(vec![
+            // An earlier primitive's late events, and events of no primitive, are skipped.
+            event(Some(other), result(&[0x50, 0x01])),
+            event(Some(other), status(PduComPrimitiveStatus::PduCopstFinished)),
+            event(None, result(&[0x7F, 0x10, 0x11])),
+            event(None, status(PduComPrimitiveStatus::PduCopstFinished)),
+            event(Some(COP), status(PduComPrimitiveStatus::PduCopstExecuting)),
+            event(Some(COP), result(&[0x7F, 0x22, 0x78])),
+            event(Some(COP), result(&[0x62, 0xF1, 0x90])),
+            event(Some(COP), status(PduComPrimitiveStatus::PduCopstFinished)),
+        ]);
+        assert_eq!(got.unwrap().unwrap(), [0x62, 0xF1, 0x90]);
+    }
+
+    #[test]
+    fn a_negative_response_is_a_result() {
+        let got = outcome(vec![
+            event(Some(COP), result(&[0x7F, 0x22, 0x31])),
+            event(Some(COP), status(PduComPrimitiveStatus::PduCopstCancelled)),
+        ]);
+        assert_eq!(got.unwrap().unwrap(), [0x7F, 0x22, 0x31]);
+    }
+
+    #[test]
+    fn a_primitive_without_a_final_response_fails() {
+        // Only a response pending arrived before the primitive ended.
+        assert!(matches!(
+            outcome(vec![
+                event(Some(COP), result(&[0x7F, 0x31, 0x78])),
+                event(Some(COP), status(PduComPrimitiveStatus::PduCopstFinished)),
+            ]),
+            Some(Err(HostError::NoResponse))
+        ));
+        let lost = PduErrorEvent::PduErrEvtLostCommToVci as i32;
+        let failed = outcome(vec![
+            event(Some(COP), event_item::Data::ErrorData(lost)),
+            event(Some(COP), status(PduComPrimitiveStatus::PduCopstCancelled)),
+        ]);
+        let Some(Err(error @ HostError::PrimitiveFailed(code))) = failed else {
+            panic!("{failed:?}");
+        };
+        assert_eq!(code, lost);
+        assert!(error.to_string().contains("LOST_COMM_TO_VCI"), "{error}");
+        // Nothing ends the primitive yet.
+        assert!(outcome(vec![event(Some(COP), result(&[0x62]))]).is_none());
     }
 }

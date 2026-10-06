@@ -1,12 +1,13 @@
-//! The communication link of a job (ADR-235 item 3).
+//! The communication link of a job (ADR-235 item 4).
 
 use std::time::Duration;
 
 use tonic::Streaming;
 use vci_service_interface::{
     ComLogicalLinkHandle, ConnectComLogicalLinkRequest, CreateComLogicalLinkRequest,
-    DisconnectComLogicalLinkRequest, EcuUniqueRespData, EventNotification, GetModuleIdsRequest,
-    GetObjectIdRequest, GetResourceIdsRequest, ModuleConnectRequest, ObjectType, ParamItem,
+    DestroyComLogicalLinkRequest, DisconnectComLogicalLinkRequest, EcuUniqueRespData,
+    EventNotification, GetModuleIdsRequest, GetObjectIdRequest, GetResourceIdsRequest,
+    ModuleConnectRequest, ModuleDisconnectRequest, ModuleHandle, ObjectType, ParamItem,
     PduParamClass, ResourceData, SetComParamRequest, SetUniqueRespIdTableRequest,
     SubscribeEventRequest, UniqueRespIdTableItem, create_com_logical_link_request, param_item,
     resource_data, subscribe_event_request,
@@ -15,8 +16,7 @@ use worker_host::client::WorkerClient;
 
 use crate::host::{HostError, unary};
 
-/// What a job's link needs, with the field names of the IR declaration's `Protocol`
-/// (`crates/diag-ir/schema/ir.fbs`), so a loaded declaration can fill it directly.
+/// What a job's link needs. Until procedures declare their timings, the caller fills it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinkConfig {
     /// D-PDU protocol name, e.g. `ISO15765`.
@@ -48,16 +48,45 @@ impl LinkConfig {
         }
     }
 
-    /// How long a send-receive may take before the host gives up: the whole 0x78 chain, one
-    /// more P2*, and a margin for the worker (ADR-235 item 5).
+    /// Refuses values the worker would read differently from the host: a zero timing turns a
+    /// limit off or makes every response pending expire at once, and a timing above
+    /// [`MAX_TIMING_MS`] does not fit the worker's microsecond ComParams.
+    pub fn validate(&self) -> Result<(), HostError> {
+        for timing in [self.p2_max_ms, self.p2_star_ms, self.rc78_completion_ms] {
+            if timing == 0 || timing > MAX_TIMING_MS {
+                return Err(HostError::Setup(
+                    "P2, P2* and the 0x78 completion timeout must be 1 ms to 4294967 ms",
+                ));
+            }
+        }
+        if self.tx_id > MAX_CAN_ID || self.rx_id > MAX_CAN_ID {
+            return Err(HostError::Setup("a CAN ID does not fit 29 bits"));
+        }
+        Ok(())
+    }
+
+    /// How long a send-receive may take before the host gives up: the first response window,
+    /// the whole 0x78 chain, one more P2*, and a margin for the worker and the transmission of
+    /// the request (ADR-235 item 6).
     pub fn send_recv_ceiling(&self) -> Duration {
-        Duration::from_millis(u64::from(self.rc78_completion_ms) + u64::from(self.p2_star_ms))
-            + Duration::from_secs(2)
+        Duration::from_millis(
+            u64::from(self.p2_max_ms)
+                + u64::from(self.rc78_completion_ms)
+                + u64::from(self.p2_star_ms),
+        ) + Duration::from_secs(2)
     }
 }
 
+/// Longest timing the worker's microsecond ComParams can hold.
+pub const MAX_TIMING_MS: u32 = u32::MAX / 1_000;
+const MAX_CAN_ID: u32 = 0x1FFF_FFFF;
+
+/// Where the response code sits in a negative response: `7F`, SID, code.
+const RC_BYTE_OFFSET: u32 = 2;
+
 /// An open link: the logical link on the worker and the event stream its primitives report on.
 pub struct Link {
+    pub module_handle: ModuleHandle,
     pub cll_handle: ComLogicalLinkHandle,
     pub events: Streaming<EventNotification>,
 }
@@ -70,6 +99,7 @@ fn param(id: u32, class: PduParamClass, value: u32) -> ParamItem {
     }
 }
 
+/// `ms` is at most [`MAX_TIMING_MS`] after [`LinkConfig::validate`].
 fn micros(ms: u32) -> u32 {
     ms.saturating_mul(1_000)
 }
@@ -91,13 +121,15 @@ async fn comparam_id(
 }
 
 /// Opens the first module, creates a logical link for `config`, sets its ComParams and the
-/// response ID table, connects it and subscribes to its events (ADR-235 item 3). The worker
-/// answers 0x78 itself (`CP_RC78Handling`), so the procedure only sees final responses.
+/// response ID table, connects it and subscribes to its events (ADR-235 item 4). The worker
+/// answers 0x78 itself (`CP_RC78Handling`), so the procedure only sees final responses. If a
+/// step fails, what was already opened is closed again.
 pub async fn open(
     client: &mut WorkerClient,
     config: &LinkConfig,
     deadline: Duration,
 ) -> Result<Link, HostError> {
+    config.validate()?;
     let module_handle = unary(
         deadline,
         "GetModuleIds",
@@ -117,6 +149,32 @@ pub async fn open(
     )
     .await?;
 
+    let cll_handle = match create_link(client, config, deadline, module_handle).await {
+        Ok(cll_handle) => cll_handle,
+        Err(error) => {
+            disconnect_module(client, module_handle, deadline).await;
+            return Err(error);
+        }
+    };
+    match set_up_link(client, config, deadline, cll_handle).await {
+        Ok(events) => Ok(Link {
+            module_handle,
+            cll_handle,
+            events,
+        }),
+        Err(error) => {
+            let _ = teardown(client, module_handle, cll_handle, deadline).await;
+            Err(error)
+        }
+    }
+}
+
+async fn create_link(
+    client: &mut WorkerClient,
+    config: &LinkConfig,
+    deadline: Duration,
+    module_handle: ModuleHandle,
+) -> Result<ComLogicalLinkHandle, HostError> {
     let resource_id = unary(
         deadline,
         "GetResourceIds",
@@ -137,7 +195,7 @@ pub async fn open(
     .and_then(|data| data.resource_id_array.into_iter().next())
     .ok_or(HostError::Setup("no resource for the protocol"))?;
 
-    let cll_handle = unary(
+    unary(
         deadline,
         "CreateComLogicalLink",
         client.create_com_logical_link(CreateComLogicalLinkRequest {
@@ -150,13 +208,22 @@ pub async fn open(
     )
     .await?
     .cll_handle
-    .ok_or(HostError::Setup("no logical link handle"))?;
+    .ok_or(HostError::Setup("no logical link handle"))
+}
 
+async fn set_up_link(
+    client: &mut WorkerClient,
+    config: &LinkConfig,
+    deadline: Duration,
+    cll_handle: ComLogicalLinkHandle,
+) -> Result<Streaming<EventNotification>, HostError> {
     for (name, value) in [
         ("CP_Baudrate", config.baud_rate),
         ("CP_P2Max", micros(config.p2_max_ms)),
         ("CP_P2Star", micros(config.p2_star_ms)),
         ("CP_RC78Handling", 1),
+        // The worker finds a response pending only at this offset.
+        ("CP_RCByteOffset", RC_BYTE_OFFSET),
         (
             "CP_RC78CompletionTimeout",
             micros(config.rc78_completion_ms),
@@ -203,30 +270,75 @@ pub async fn open(
     )
     .await?;
 
-    let events = unary(
+    unary(
         deadline,
         "SubscribeEvent",
         client.subscribe_event(SubscribeEventRequest {
             handle: Some(subscribe_event_request::Handle::CllHandle(cll_handle)),
         }),
     )
-    .await?;
-    Ok(Link { cll_handle, events })
+    .await
 }
 
-/// Disconnects the logical link.
+/// Disconnects and destroys the logical link and disconnects the module.
 pub async fn close(
     client: &mut WorkerClient,
-    link: &Link,
+    link: Link,
     deadline: Duration,
 ) -> Result<(), HostError> {
-    unary(
+    let Link {
+        module_handle,
+        cll_handle,
+        events,
+    } = link;
+    drop(events);
+    teardown(client, module_handle, cll_handle, deadline).await
+}
+
+/// Runs every step even after one fails, and returns the first failure.
+async fn teardown(
+    client: &mut WorkerClient,
+    module_handle: ModuleHandle,
+    cll_handle: ComLogicalLinkHandle,
+    deadline: Duration,
+) -> Result<(), HostError> {
+    // A link that was never connected refuses the disconnect; destroying it still works.
+    let disconnected = unary(
         deadline,
         "DisconnectComLogicalLink",
         client.disconnect_com_logical_link(DisconnectComLogicalLinkRequest {
-            cll_handle: Some(link.cll_handle),
+            cll_handle: Some(cll_handle),
         }),
     )
-    .await?;
-    Ok(())
+    .await
+    .map(drop);
+    let destroyed = unary(
+        deadline,
+        "DestroyComLogicalLink",
+        client.destroy_com_logical_link(DestroyComLogicalLinkRequest {
+            cll_handle: Some(cll_handle),
+        }),
+    )
+    .await
+    .map(drop);
+    disconnect_module(client, module_handle, deadline).await;
+    disconnected.or(destroyed)
+}
+
+async fn disconnect_module(
+    client: &mut WorkerClient,
+    module_handle: ModuleHandle,
+    deadline: Duration,
+) {
+    let result = unary(
+        deadline,
+        "ModuleDisconnect",
+        client.module_disconnect(ModuleDisconnectRequest {
+            module_handle: Some(module_handle),
+        }),
+    )
+    .await;
+    if let Err(error) = result {
+        tracing::warn!(%error, "could not disconnect the module");
+    }
 }

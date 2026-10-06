@@ -136,5 +136,4 @@ These change the plan's scope or order; each is a design-17 item or a purchase.
 
 - Standards purchase: SAE J3138 before M6; ISO 13209 (OTX) and ISO 20077/20078 (ExVe) before M7's OTX and ExVe parts start. The M1 and M2 standards, ISO 22901-1 (ODX) and ISO 17978 (SOVD) are held.
 - Order of M5 and M6.
-- Design 17 P3 (practical scope of Linux support) affects how much of M1's Linux path is kept as a supported product feature rather than a test path.
 - Design 17 P5 (non-functional targets) before M8.

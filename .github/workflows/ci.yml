@@ -132,7 +132,7 @@ jobs:
             cargo check --locked -p sim-vci -p j2534-0404-service -p iso22900-service --target "$target"
           done
 
-  # Linux targets: glibc version is pinned with cargo-zigbuild.
+  # Linux targets: linked against glibc 2.17 through cargo-zigbuild's target suffix (ADR-232).
   worker-linux:
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
@@ -160,7 +160,7 @@ jobs:
         with:
           key: ${{ matrix.target }}
       # j2534-0404-service / iso22900-service: service binaries used as workers (docs/worker-crates.md)
-      - run: cargo zigbuild --locked -p sim-vci -p j2534-0404-service -p iso22900-service --target ${{ matrix.target }} --release
+      - run: cargo zigbuild --locked -p sim-vci -p j2534-0404-service -p iso22900-service --target ${{ matrix.target }}.2.17 --release
 
   # Windows targets are *-pc-windows-gnullvm, cross-built on Linux with the llvm-mingw toolchain
   # (clang, lld and the mingw-w64 import libraries). .cargo/config.toml links libunwind

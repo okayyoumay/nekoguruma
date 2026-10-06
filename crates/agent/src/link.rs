@@ -35,7 +35,8 @@ pub struct LinkConfig {
 }
 
 impl LinkConfig {
-    /// UDS on CAN with the legacy ISO 15765-4 IDs of the first ECU (7E0 / 7E8) at 500 kbit/s.
+    /// UDS on CAN at 500 kbit/s with the given request and response IDs (for example the
+    /// common 7E0 / 7E8 pair).
     pub fn iso15765(tx_id: u32, rx_id: u32) -> Self {
         Self {
             protocol_short_name: "ISO15765".to_owned(),

@@ -29,7 +29,7 @@ The worker client sets no deadline on unary calls, so a wedged worker would bloc
 2. **`ServiceRequest { service }`**
    - `service` is the UDS service identifier. The request on the wire is that byte followed by the operand bytes, so values above 0xFF fail with `HostError::BadService`.
    - The result is the whole final response message (A_Data with the CAN identifier removed), as one `COPT_SENDRECV` primitive returns it.
-   - `ReadDtc { mask }` sends ReadDTCInformation, reportDTCByStatusMask (ISO 14229-1 clause 11.3), and returns the raw response; decoding it is the procedure's job.
+   - `ReadDtc { mask }` sends ReadDTCInformation, reportDTCByStatusMask (ISO 14229-1:2026 clause 11.3), and returns the raw response; decoding it is the procedure's job.
    - `RoutineControl { routine, sub }` sends RoutineControl with the routine identifier big-endian.
 3. **Responses**
    - A negative response is `Ok` with its bytes (`7F`, SID, NRC); the procedure inspects it.

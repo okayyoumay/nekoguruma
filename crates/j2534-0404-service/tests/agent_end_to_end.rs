@@ -2,7 +2,7 @@
 #![cfg(debug_assertions)]
 //! An agent job end to end without hardware (ADR-235): `worker-host` launches the real
 //! `j2534-0404-service` binary against the `sim-vci` cdylib, and `agent::run_program` runs a
-//! diag-ir procedure on an ISO 15765 link to the simulated ECU behind it.
+//! diag-ir procedure on a CAN link to the simulated ECU behind it.
 //!
 //! This file holds a single test, so the process-wide `VCI_CONFIG_PATH` it sets for the
 //! spawned service cannot race with another test.

@@ -93,12 +93,14 @@ pub fn service_request_bytes(service: u16, payload: &[u8]) -> Result<Vec<u8>, Ho
     Ok(request)
 }
 
-/// ReadDTCInformation, reportDTCByStatusMask (ISO 14229-1 service 0x19, sub-function 0x02).
+/// ReadDTCInformation (0x19), sub-function reportDTCByStatusMask (0x02); ISO 14229-1:2026
+/// clause 11.3.
 pub fn read_dtc_bytes(mask: u8) -> Vec<u8> {
     vec![0x19, 0x02, mask]
 }
 
-/// RoutineControl (ISO 14229-1 service 0x31): sub-function, routine identifier, option record.
+/// RoutineControl (0x31): sub-function, routine identifier, option record; ISO 14229-1:2026
+/// clause 13.2.
 pub fn routine_control_bytes(routine: u16, sub: u8, payload: &[u8]) -> Vec<u8> {
     let mut request = vec![0x31, sub];
     request.extend_from_slice(&routine.to_be_bytes());
@@ -161,6 +163,8 @@ impl WorkerHost {
                 tx_flag: None,
             }),
         };
+        // One deadline from the request to the end of the primitive.
+        let deadline = tokio::time::Instant::now() + self.timings.send_recv;
         let cop = unary(
             self.timings.unary,
             "StartComPrimitive",
@@ -194,7 +198,7 @@ impl WorkerHost {
                 }
             }
         };
-        tokio::time::timeout(self.timings.send_recv, wait)
+        tokio::time::timeout_at(deadline, wait)
             .await
             .map_err(|_| HostError::NoResponse)?
     }
@@ -243,8 +247,8 @@ impl Progress {
     }
 }
 
-/// A negative response with code 0x78 (requestCorrectlyReceived-ResponsePending, ISO 14229-1
-/// annex A).
+/// A negative response with code 0x78 (requestCorrectlyReceived-ResponsePending, ISO 14229-1:2026
+/// annex A.1).
 fn is_response_pending(response: &[u8]) -> bool {
     matches!(response, [0x7F, _, 0x78])
 }

@@ -147,7 +147,7 @@ impl WorkerHost {
     }
 
     async fn send_recv_async(&mut self, request: Vec<u8>) -> Result<Vec<u8>, HostError> {
-        let sid = *request.first().ok_or(HostError::BadService(0))?;
+        let mut progress = Progress::for_request(&request)?;
         let start = StartComPrimitiveRequest {
             cop_tag: None,
             cll_handle: Some(self.link.cll_handle),
@@ -160,7 +160,7 @@ impl WorkerHost {
                 temp_param_update: 0,
                 // Only an answer to this request ends the primitive, so an unsolicited frame
                 // or a late answer to an earlier request cannot.
-                expected_response_array: expected_responses(sid),
+                expected_response_array: expected_responses(&progress),
                 tx_flag: None,
             }),
         };
@@ -182,7 +182,6 @@ impl WorkerHost {
 
         let events = &mut self.link.events;
         let wait = async {
-            let mut progress = Progress::new(sid);
             loop {
                 let notification = events
                     .message()
@@ -207,8 +206,8 @@ impl WorkerHost {
     }
 }
 
-/// The positive response to `sid` (its ID plus 0x40) and the negative one (`7F`, `sid`).
-fn expected_responses(sid: u8) -> Vec<ExpectedResponseData> {
+/// The positive and the negative response to the request `progress` waits for.
+fn expected_responses(progress: &Progress) -> Vec<ExpectedResponseData> {
     let expected = |response_type, mask: &[u8], pattern: Vec<u8>| ExpectedResponseData {
         response_type,
         acceptance_id: 0,
@@ -216,23 +215,24 @@ fn expected_responses(sid: u8) -> Vec<ExpectedResponseData> {
         pattern_data: pattern,
         unique_resp_ids: vec![],
     };
+    let prefix = &progress.positive_prefix;
     vec![
-        expected(0, &[0xFF], vec![positive_sid(sid)]),
-        expected(1, &[0xFF, 0xFF], vec![0x7F, sid]),
+        expected(0, &vec![0xFF; prefix.len()], prefix.clone()),
+        expected(1, &[0xFF, 0xFF], vec![0x7F, progress.sid]),
     ]
 }
 
-fn positive_sid(sid: u8) -> u8 {
-    sid.wrapping_add(0x40)
-}
-
-/// Whether `response` answers a request with this SID: positive, or a complete negative
-/// response.
-fn answers(sid: u8, response: &[u8]) -> bool {
-    match response {
-        [first, ..] if *first == positive_sid(sid) => true,
-        [0x7F, nsid, _, ..] => *nsid == sid,
-        _ => false,
+/// How a positive response to `request` begins: the SID plus 0x40, then what the server echoes
+/// of the request (ISO 14229-1:2026 clauses 9.7, 10.2 and 11.3). A sub-function is echoed
+/// without its suppress bit. A DID is matched only when one was requested, since the
+/// standard does not fix the order of several in the response.
+fn positive_prefix(request: &[u8]) -> Vec<u8> {
+    match request {
+        [0x22, hi, lo] => vec![0x62, *hi, *lo],
+        [0x19, sub, ..] => vec![0x59, sub & 0x7F],
+        [0x3E, sub, ..] => vec![0x7E, sub & 0x7F],
+        [sid, ..] => vec![sid.wrapping_add(0x40)],
+        [] => Vec::new(),
     }
 }
 
@@ -240,16 +240,29 @@ fn answers(sid: u8, response: &[u8]) -> bool {
 #[derive(Debug)]
 struct Progress {
     sid: u8,
+    positive_prefix: Vec<u8>,
     response: Option<Vec<u8>>,
     error: Option<i32>,
 }
 
 impl Progress {
-    fn new(sid: u8) -> Self {
-        Self {
+    fn for_request(request: &[u8]) -> Result<Self, HostError> {
+        let sid = *request.first().ok_or(HostError::BadService(0))?;
+        Ok(Self {
             sid,
+            positive_prefix: positive_prefix(request),
             response: None,
             error: None,
+        })
+    }
+
+    /// Whether `response` answers the request: a positive response that begins as expected,
+    /// or a complete negative response for its SID. Stricter than the worker's match, which
+    /// also accepts a response shorter than the pattern.
+    fn answers(&self, response: &[u8]) -> bool {
+        match response {
+            [0x7F, sid, _, ..] => *sid == self.sid,
+            _ => response.starts_with(&self.positive_prefix),
         }
     }
 
@@ -269,8 +282,7 @@ impl Progress {
             // A response pending the worker passes on, and anything that does not answer this
             // request, is not the final response (ADR-235 item 3).
             Some(event_item::Data::ResultData(result))
-                if answers(self.sid, &result.data_bytes)
-                    && !is_response_pending(&result.data_bytes) =>
+                if self.answers(&result.data_bytes) && !is_response_pending(&result.data_bytes) =>
             {
                 self.response = Some(result.data_bytes);
             }
@@ -485,7 +497,11 @@ mod tests {
 
     /// Feeds `events` and returns the outcome of the first that ends the primitive.
     fn outcome(events: Vec<EventItem>) -> Option<Result<Vec<u8>, HostError>> {
-        let mut progress = Progress::new(0x22);
+        outcome_for(&[0x22, 0xF1, 0x90], events)
+    }
+
+    fn outcome_for(request: &[u8], events: Vec<EventItem>) -> Option<Result<Vec<u8>, HostError>> {
+        let mut progress = Progress::for_request(request).unwrap();
         events
             .into_iter()
             .find_map(|item| progress.on_event(item, COP))
@@ -522,14 +538,39 @@ mod tests {
             event(Some(COP), status(PduComPrimitiveStatus::PduCopstFinished)),
         ]);
         assert!(matches!(got, Some(Err(HostError::NoResponse))), "{got:?}");
-        assert!(answers(0x22, &[0x62, 0xF1, 0x90]));
-        assert!(answers(0x22, &[0x7F, 0x22, 0x31]));
-        assert!(answers(0xFF, &[0x3F]));
+    }
+
+    #[test]
+    fn a_positive_response_must_echo_the_request() {
+        // A positive response for another DID does not end a VIN read.
+        let got = outcome(vec![
+            event(Some(COP), result(&[0x62, 0xF1, 0x86, 0x01])),
+            event(Some(COP), result(&[0x62, 0xF1, 0x90, 0x4E])),
+            event(Some(COP), status(PduComPrimitiveStatus::PduCopstFinished)),
+        ]);
+        assert_eq!(got.unwrap().unwrap(), [0x62, 0xF1, 0x90, 0x4E]);
+
+        let answers = |request: &[u8], response: &[u8]| {
+            Progress::for_request(request).unwrap().answers(response)
+        };
+        assert!(answers(&[0x22, 0xF1, 0x90], &[0x62, 0xF1, 0x90]));
+        assert!(!answers(&[0x22, 0xF1, 0x90], &[0x62, 0xF1]));
+        assert!(answers(&[0x22, 0xF1, 0x90], &[0x7F, 0x22, 0x31]));
+        // Several DIDs: any positive response to the service.
+        assert!(answers(
+            &[0x22, 0xF1, 0x90, 0xF1, 0x86],
+            &[0x62, 0xF1, 0x86, 0x01]
+        ));
+        assert!(answers(&[0x19, 0x02, 0x08], &[0x59, 0x02, 0xFF]));
+        assert!(!answers(&[0x19, 0x02, 0x08], &[0x59, 0x03, 0xFF]));
+        assert!(answers(&[0x3E, 0x00], &[0x7E, 0x00]));
+        assert!(answers(&[0x3E, 0x80], &[0x7E, 0x00]));
+        assert!(answers(&[0xFF], &[0x3F]));
     }
 
     #[test]
     fn the_worker_is_asked_for_answers_to_the_request_only() {
-        let expected = expected_responses(0x22);
+        let expected = expected_responses(&Progress::for_request(&[0x22, 0xF1, 0x90]).unwrap());
         let patterns: Vec<_> = expected
             .iter()
             .map(|e| (e.mask_data.as_slice(), e.pattern_data.as_slice()))
@@ -537,7 +578,7 @@ mod tests {
         assert_eq!(
             patterns,
             [
-                (&[0xFF][..], &[0x62][..]),
+                (&[0xFF, 0xFF, 0xFF][..], &[0x62, 0xF1, 0x90][..]),
                 (&[0xFF, 0xFF][..], &[0x7F, 0x22][..])
             ]
         );

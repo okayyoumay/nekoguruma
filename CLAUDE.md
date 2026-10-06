@@ -176,4 +176,7 @@ Commit messages and PR descriptions follow the same copyright rule as the code.
 Copilot reviews against [.github/copilot-instructions.md](.github/copilot-instructions.md) and
 the path-specific files in `.github/instructions/`, which restate the rules above as review
 priorities; a path-specific file applies only to the files its `applyTo` globs match. When a
-rule in this file changes, update those files in the same pull request.
+rule in this file changes, update those files in the same pull request; the "Documentation sync"
+table is copied into `.github/copilot-instructions.md`. Copilot code review also reads the skills
+in `.claude/skills/` when it judges them relevant, so the repository-wide file tells it that those
+skills are not review rules.

@@ -203,8 +203,8 @@ responsible for them, in the same way that business screens are theirs (design 9
    waiting while another job holds them, and promotes to the per-vehicle lock immediately after
    the first VIN read that matches, before any further ECU traffic. The receiving agent has no
    access to the failed device's journal, so the checkpoint summary sent to the server carries
-   the recorded ECU hardware part number, the pre-erase software version, the RequestTransferExit
-   intent marker, the post-transfer progress and the number of resumes already made per stage
+   the recorded ECU hardware part number, the pre-erase software version, the transfer-start
+   and RequestTransferExit intent markers, the post-transfer progress and the number of resumes already made per stage
    (so the resume limit of step 1 holds across devices; because every recovery attempt,
    including the failed device's own, is reserved on the server before anything is sent to the
    ECU, the server count includes them all, and the receiving agent increments that count

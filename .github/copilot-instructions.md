@@ -3,7 +3,10 @@
 Nekoguruma (NGR) is vehicle diagnostic software in Rust (crates under `crates/`). Repository rules
 are in `CLAUDE.md`; the design document is `docs/system-architecture.md`, cited by section number.
 The repository is MIT-licensed and will be public: write review comments as if already public.
-More rules for Rust, documentation and CI files are in `.github/instructions/`.
+More rules for Rust, documentation and CI files are in `.github/instructions/`. The skills in
+`.claude/skills/` are workflows for the sessions that write pull requests (for example
+`pr-review-loop` answers your findings); they are not review rules, so do not apply them when
+reviewing.
 
 ## P0
 
@@ -23,11 +26,22 @@ More rules for Rust, documentation and CI files are in `.github/instructions/`.
 - **Correctness**: logic errors, panics reachable from external input (gRPC, Web API, vendor
   library return values), unchecked FFI results, lost or duplicated messages, races, deadlocks,
   leaks across worker restarts.
-- **Documentation out of sync**: a change without the document `CLAUDE.md`'s "Documentation
-  sync" table assigns to it (e.g. `service.proto` without `docs/rpc-api-guide.md`, a server API
-  change without `api/openapi.yaml`, a database change without a new `db/migrations/` file). A
-  doc that contradicts the code, or a renumbered or removed section of
-  `docs/system-architecture.md`, is P1.
+- **Documentation out of sync**: a change without the matching document update in the same
+  pull request. A doc that contradicts the code, or a renumbered or removed section of
+  `docs/system-architecture.md`, is P1. The mapping (the same as `CLAUDE.md`'s "Documentation
+  sync" table):
+
+  | Change | Document |
+  |---|---|
+  | Design, behaviour, data flow, security model | `docs/system-architecture.md` |
+  | Crate added, removed, renamed or re-scoped | `README.md` workspace table, and `docs/worker-crates.md` for worker crates |
+  | Worker gRPC interface (`crates/vci-service-interface/src/proto/service.proto`) | `docs/rpc-api-guide.md` |
+  | J2534 v04.04 adapter (`j2534-0404-service`) | `docs/j2534-0404-architecture.md`, `docs/j2534-2-support-plan.md` |
+  | Server Web API / event stream | `api/openapi.yaml`, `api/asyncapi.yaml` |
+  | JSON schemas | `schemas/*.schema.json` and the matching `*.example.json` |
+  | Database | a new file in `db/migrations/`, plus `db/README.md` |
+  | New domain term | `docs/glossary.md` |
+  | Crate scope, policy or detailed design | that crate's `crates/<crate>/docs/*.md` |
 - **ADRs**: a non-obvious decision (data structure, concurrency model, state machine, protocol
   interpretation, trust boundary) or a surprising spec-driven behaviour without an ADR; a new
   ADR without its `docs/adr/INDEX.md` row and theme entry; a duplicate ADR number; a change that

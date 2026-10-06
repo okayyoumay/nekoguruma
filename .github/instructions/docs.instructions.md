@@ -13,4 +13,5 @@ Flag as P1:
   `**Status:**` line was not updated (`Superseded by ADR-{NNN}`, or an annotation for a partial
   supersession).
 - **Rule drift**: a change to a rule in `CLAUDE.md` without the matching change to the review
-  guidelines in `.github/copilot-instructions.md` or `.github/instructions/`.
+  guidelines in `.github/copilot-instructions.md` or `.github/instructions/`, including a change
+  to the "Documentation sync" table that `.github/copilot-instructions.md` copies.

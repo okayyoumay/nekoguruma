@@ -26,10 +26,11 @@ automatic Copilot reviews in a ruleset; they would run on every push and spend m
 credits on heads the loop does not need reviewed. Leave the review effort at the owner's
 default; do not raise it.
 
-Copilot's review appears in the PR's reviews within a few minutes as a "Commented" review
-(Copilot never approves or requests changes) whose summary says how many files it reviewed,
-with its findings as inline comments in the same review. When it finds nothing, the summary
-says "Findings: None".
+Copilot's review appears in the PR's reviews within a few minutes. A review with findings is a
+"Commented" review whose summary lists them, with most of them also as inline comments in the
+same review. A review that finds nothing is usually an "Approved" review whose summary says
+"Findings: None"; that approval is Copilot's, not the maintainer's, and never replaces the
+maintainer's review.
 
 A submitted review wakes the session as a PR event. Still, right after the request, schedule a
 one-shot check-in about 15 minutes later (`send_later`) as a safety net for a review that never

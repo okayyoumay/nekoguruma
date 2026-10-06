@@ -292,7 +292,11 @@ responsible for them, in the same way that business screens are theirs (design 9
   device and the generation match the current ones exactly, so a message queued under an
   earlier generation is refused even if ownership has since returned to the same device; anything the former owner sends later, such as messages
   queued while it was offline, is kept only as audit data (with its uploaded journal) and
-  never overwrites the receiver's state or summary. Fencing by operator confirmation was chosen over a time-limited lease
+  never overwrites the receiver's state or summary. The agent's duplicate-command check
+  (design 5.3) keys on the job ID and the ownership generation together, so when ownership
+  returns to a device that ran the job before, the newly signed instruction under the higher
+  generation is accepted as a new command, while a resent instruction of the same or an
+  earlier generation is still ignored as a duplicate. Fencing by operator confirmation was chosen over a time-limited lease
   renewed during the write, because a lease would make every write on a server-connected
   device, the first run included, depend on the network for its whole duration and rule out
   starting a write offline (design 5.7). An agent without a configured server has no handover

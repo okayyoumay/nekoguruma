@@ -314,8 +314,8 @@ responsible for them, in the same way that business screens are theirs (design 9
   does not stop a failed device that comes back from recovering the same ECU while another
   device performs the handover. Ownership moves to the receiving device only when the
   operator confirms on the server that the failed device is disconnected from the vehicle (or
-  powered off); from then on the failed device's reservations are refused, so it sends nothing
-  further to the ECU. The transfer also starts a new ownership generation. The generation is
+  powered off); from then on the failed device's reservations are refused, so it cannot start
+  a recovery (a job it had not started yet is the residual below). The transfer also starts a new ownership generation. The generation is
   part of the signed job instruction and is carried by every job-scoped message the agent
   sends (job state, progress, HMI requests, checkpoint summaries and reservations), and the server applies one only when both the
   device and the generation match the current ones exactly, so a message queued under an
@@ -350,6 +350,15 @@ responsible for them, in the same way that business screens are theirs (design 9
   This follows design 8.8, which already holds that complete exclusivity is impossible
   because third-party tools can always be connected, and the premise of item 4 that
   production procedures are the framework user's responsibility.
+- A job the failed device had fetched but not started is not fenced either. A device that
+  holds a prefetched offline package (design 5.7) and comes back after the handover can start
+  that write offline while the package is still valid, because a first start reserves no
+  attempt and its signed instruction cannot show that ownership has moved. Fencing it would
+  need a server check before every start, which rules out starting offline, the same
+  trade-off that rejected the lease above. Like a false confirmation, it is left to the
+  operators' procedures (a device confirmed as disconnected is not reconnected to the vehicle)
+  and bounded by the short validity of offline packages; the server alerts the administrators
+  when a former owner reports any activity on a job after its handover.
 - Misuse is made detectable instead, by records that only system administrators can audit.
   The server keeps them append-only, and operators cannot change them. The handover record
   holds the confirming operator, the time, both devices, and the failed device's last

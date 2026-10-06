@@ -46,10 +46,8 @@ head, counts as that request's result. An older review of the same head is not a
 backticks: it asks the Copilot coding agent to work on the PR, and it may push commits to the
 branch. Write "Copilot" without the `@`.
 
-**Copilot not available.** If the request call fails because Copilot code review is not enabled
-for the owner's account or this repository, or the check-in finds no Copilot review after the
-latest request and Copilot is not among the PR's requested reviewers, Copilot cannot review
-here (turning it on is a Copilot plan and settings change only the owner can make). Say so once
+**Copilot not available.** Only a request call that fails because Copilot code review is not
+enabled for the owner's account or this repository means Copilot cannot review here (turning it on is a Copilot plan and settings change only the owner can make). Say so once
 in the thread, do not request Copilot again on this PR, and run the fallback review instead:
 `edge-case-hunter` on the whole PR diff (`git diff origin/main...HEAD`), whatever the diff's
 size. Route its findings with the same guide and take any fix through Step 3 and the commit and
@@ -68,8 +66,10 @@ the fallback review under "Copilot not available" above right away. If the maint
 says the budget is back, request Copilot again on the head as it is then and continue the loop
 from Step 1.
 
-**Copilot requested but never finished.** If Copilot is still among the requested reviewers at
-the check-in but there is no review, schedule one more check-in 15 minutes later. If that one
+**Copilot requested but never finished.** If the request call succeeded but the check-in finds
+no review of the current head, schedule one more check-in 15 minutes later. Decide this from the
+reviews alone: while the review runs, Copilot can already be gone from the PR's requested
+reviewers, so that list says nothing about whether a review is coming. If that one
 still finds no review, treat the round as stalled: tell the maintainer once in the thread, and
 run the same fallback review as above for this head instead of re-requesting. A later push may
 request Copilot again as usual.

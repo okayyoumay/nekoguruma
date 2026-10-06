@@ -247,7 +247,7 @@ Covers time-series data, snapshots, and self-diagnostic data.
 - Time series are stored as the responses received from the vehicle (records: response bytes, monotonic timestamp, source), chunked by time; signals are decoded from them with the decode plans of the IR that produced the recording (8.2.2), and display data is downsampled by min/max from the decoded signals (ADR-236)
 - Scale for the initial implementation: fastest period 10 ms per request, up to 64 KiB/s of response bytes per monitoring session or acquisition job, and up to 1 hour of time series per acquisition job (ADR-236)
 
-**Retention period**: Determined from both business needs (the statutory retention period for maintenance records) and the personal-data nature of VINs. For deletion requests, job execution records (audit logs) must be retained even if raw data is deleted, so a mechanism is provided to redact only the VIN-containing parts.
+**Retention period**: Determined from both business needs (the statutory retention period for maintenance records) and the personal-data nature of VINs. Statutory periods differ by jurisdiction, so the retention period is an operator setting per tenant and record kind, with no jurisdiction-specific defaults (ADR-237). For deletion requests, job execution records (audit logs) must be retained even if raw data is deleted, so a mechanism is provided to redact only the VIN-containing parts.
 
 #### 4.3.1 Record Templates
 
@@ -690,7 +690,7 @@ Diagnostic sequences are implemented in-house. The layers are separated so that 
 | L0 Transport | J2534 / D-PDU API | Worker | Implementation per standard |
 | L1 Protocol | ISO 15765-2, UDS (ISO 14229), DoIP in future | Worker | Protocol implementation |
 | L2 Diagnostic primitives | RDBID, ReadDTC, RoutineControl, security access, reprogramming procedure building blocks | Agent | Shared implementation |
-| L3 Vehicle knowledge | ECU variant definitions, service definitions, conversion formulas, procedure definitions | Distributed as data in intermediate representation | Front end per supply format |
+| L3 Vehicle knowledge | ECU variant definitions, service definitions, conversion formulas, procedure definitions; generic OBD as a standard package (ADR-237) | Distributed as data in intermediate representation | Front end per supply format |
 | L4 Service | Mapping to the SOVD resource model | Server | Mapping implementation |
 | L5 API | SOVD / ExVe compatible endpoints | Server | External contract |
 
@@ -1014,7 +1014,7 @@ The core has no knowledge whatsoever of specific VCIs or vehicle models.
 
 Report output as a maintenance record (PDF, etc.) is generated from screen/report definitions. The unit system is held as an operator setting and does not affect raw data (raw data keeps the raw values as captured).
 | Supply-format frontend | Code | Server | Server update |
-| OEM authentication provider | Code | Server | Server update |
+| OEM authentication provider (including access schemes for security-related functions such as SERMI; ADR-237) | Code | Server | Server update |
 | Transport standard (new API) | Code | Worker | Agent update |
 
 ### 9.3 VCI Profile
@@ -1404,6 +1404,7 @@ Since this is provided as a framework, the scope of responsibility is made expli
 | Business screens and operational flows | Framework user |
 | Write and recovery procedures used in production (ECU-specific programming sequences, resume strategies) | Framework user. The framework provides the journal, the state check before resuming, the idempotency and interruptibility attributes (8.2.5, 8.10.1) and the guarantee that a write job ends in a defined state (5.6); its own write and recovery procedures are a reference implementation (ADR-229) |
 | UNECE R156 processes (SUMS) | System operator. The framework provides mechanisms for recording, version management and auditing, but does not operate the process |
+| Regulatory certification and accreditation (inspection-tool certification, SERMI accreditation of businesses and staff) and statutory retention periods | System operator. The framework is not certified as an inspection tool; it provides the OEM authentication provider extension point and configurable retention periods (ADR-237) |
 | Authenticity of ECU flash data | OEM (verified by the ECU) |
 
 A configuration that is always connected and acts on remote instructions may raise the same concerns as monitoring software or remote administration tools. Legal treatment varies by jurisdiction and contract form, so the following is an organization of issues; final judgment requires review by legal counsel.
@@ -1425,6 +1426,20 @@ A configuration that is always connected and acts on remote instructions may rai
 - **Handling of VINs**: a VIN may be considered personal data. Since it is included in captured data metadata, it is covered by retention periods and deletion requests. Audit logs must be retained even on deletion, so only the VIN portion is anonymized (4.3)
 - **Rights to vehicle model definition data**: licensing and redistributability of OEM-supplied ODX / PDX depend on individual contracts. The system responds by recording the licensed scope and restricting distribution targets (9.4)
 - **SAE J3138**: guidelines on the impact of diagnostic tools on vehicle networks
+
+#### Regulatory Scope
+
+Vehicle regulations place their obligations on vehicle makers and on repair and inspection businesses. The system uses the access routes those regulations require makers to open, and is not certified as a regulated inspection tool (ADR-237).
+
+| Regulation | Obligation on | How the system relates |
+|---|---|---|
+| US CARB / EPA OBD (SAE J1979, J1979-2) | Vehicle makers | Generic OBD reads are a standard vehicle-knowledge package (8.1). Certification as a CARB OBD test tool is out of scope |
+| US CARB service information rules, state right-to-repair laws | Vehicle makers | Makers offer reprogramming through J2534 pass-thru devices. The system's own jobs use VCIs through its workers; it is not a J2534 library for a maker's application (8.8 only detects such use). TMC RP1210 is out of scope |
+| EU Regulation 2018/858 Annex X (OBD and RMI access) | Vehicle makers | Same generic OBD and pass-thru routes as above |
+| EU SERMI (security-related RMI) | Businesses and their staff (accreditation) | Handled by the OEM authentication provider (9.2, 8.10). Accreditations stay with the maker's portal or the provider; the audit log records the operator and the authorization reference |
+| Japan OBD inspection | Inspection businesses, with the government-provided inspection application and qualifying scan tools | Out of scope as an inspection tool |
+| Japan specified maintenance (tokutei seibi) | Repair businesses (certification) | No requirement on the system; maintenance records are kept under operator-set retention periods (4.3) |
+| EU Data Act, Euro 7 | Vehicle makers | No tool requirements yet; revisited when there are |
 
 ### 16.3 Security Issues
 
@@ -1449,7 +1464,6 @@ Items listed here are limited to those that **cannot be resolved by extension pa
 | P4 | Whether there are quirks VCI profiles cannot absorb | Premise of the extension model | If a quirk that cannot be expressed declaratively is found, a core change is needed. First consider whether it can be generalized as a profile item (9.3) |
 | P5 | Quantifying non-functional requirements | Entire system | Availability target, screen response time and concurrency caps are undecided. Configuration by scale (Section 15) only shows the approach |
 | P6 | Tenant / contract management | Server | Commercial offering requires contract plans, usage limits and billing. Currently only the existence of a tenant ID is specified |
-| P7 | Scope of regulations to support | Functional requirements | Whether to support US CARB / EPA generic scan tool requirements and EU repairer access regulations depends on target markets |
 
 ### Matters Handled by Extensions (Excluded from Undecided Items)
 

@@ -39,7 +39,7 @@ Workspace skeleton (step 1): every crate goes as far as type and boundary defini
 
 - **P2**: Partition granularity: monthly is assumed; finalize once the non-functional targets are decided (design 17 P1 is settled by ADR-236). Blocked on: design 17 P5.
 - **P2**: `vehicle_locks` expiry: derive the default for `expires_at` from the expected duration of each job kind.
-- **P2**: `retain_until` logic for the statutory retention period of maintenance records. Blocked on: design 17 P7.
+- **P2**: `retain_until` logic for the retention period of maintenance records: an operator setting per tenant and record kind, with no jurisdiction-specific defaults (ADR-237, design 4.3). Done when: the setting exists, `retain_until` is derived from it when a record is stored, and a test covers a changed setting.
 - **P2**: `ir_documents` lookup has only a GIN index on part numbers. ECU-VARIANT-PATTERN matching happens on the agent side; verify with real data whether this is enough server-side filtering.
 - **P2**: Seed data: role definitions, the default confirmation level, and preset defaults.
 
@@ -83,6 +83,7 @@ Workspace skeleton (step 1): every crate goes as far as type and boundary defini
 
 ## Standards and project
 
+- **P2**: Generic OBD as a standard vehicle-knowledge package (ADR-237, design 8.1, 16.2): generic OBD reads (SAE J1979 / ISO 15031-5 on ISO 15765-4, SAE J1979-2, WWH-OBD per ISO 27145) as IR data on the shared L2 primitives, with functional requests answered by several ECUs at L1/L2. Planned with M7 (`work/development-plan.md`). Done when: a generic OBD read of supported PIDs and stored DTCs runs against `sim-ecu` from the package. Blocked on: obtaining SAE J1979, J1979-2, ISO 15031-5, ISO 15765-4 and ISO 27145.
 - **P2**: Obtain sample ODX/PDX data. The `crates/diag-ir/schema/` items (variable-length fields, TABLE, DID hierarchy) wait on real ODX data; the standard itself (ISO 22901-1, 2008 edition) is already in `vehicle-comm-specs`. Done when: at least one sample ODX/PDX file is available to the project. Blocked on: the maintainer obtaining sample data.
 - **P2**: Trademark search for "Nekoguruma" and "NGR" (J-PlatPat, classes 9 and 42) before any public release. The session network cannot reach J-PlatPat. Done when: the result is recorded and the name is kept or changed. Blocked on: the maintainer running the search.
 - **P2**: Public release of the repository. The repository was recreated on 2026-10-04 from a single clean commit (the earlier history, which carried verbatim standard quotes, stays private in `nekoguruma-old`), under the MIT license. Before switching visibility to public, enable Actions approval for fork pull requests, a read-only default `GITHUB_TOKEN`, secret scanning with push protection, Dependabot alerts and a branch ruleset for `main`. Done when: those settings are on and the repository is public. Blocked on: the trademark search above and the maintainer switching the visibility.

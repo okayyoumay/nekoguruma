@@ -2,7 +2,7 @@
 
 **Date:** 2026-10-06
 **Status:** Accepted
-**Affects:** design 8.1, 9.2, 16.1, 16.2, 17 (P7 removed); `db/` retention (`retain_until`); generic OBD vehicle-knowledge package (not yet implemented)
+**Affects:** design 8.1, 9.2, 16.1, 16.2, 17 (P7 removed); `db/` retention (`retain_until`); generic OBD vehicle-knowledge package
 
 ## Context
 

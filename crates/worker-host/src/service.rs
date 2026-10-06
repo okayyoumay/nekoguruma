@@ -9,7 +9,8 @@
 //!   tokens with; `get_status` reports the loopback gRPC endpoints; `stop` shuts down.
 //! - Closing stdin also shuts the service down.
 //!
-//! The auth key is generated here and never leaves the agent (ADR-221).
+//! The auth key is generated here and is held only by the agent and the worker it is provisioned
+//! to; it never travels over the gRPC socket (ADR-221, ADR-231).
 //!
 //! The width of J2534 `unsigned long` is passed to the j2534-0404 service through
 //! [`LONG_SIZE_ENV`]; its sys layer converts at the FFI boundary (`docs/worker-crates.md`).

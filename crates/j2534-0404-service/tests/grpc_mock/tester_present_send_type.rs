@@ -4555,33 +4555,74 @@ async fn mode_0_periodic_tick_not_starved_by_tx_held_backlog_drain() {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     };
 
-    // The longest run of cll_b frames with no cll_a frame between them. With
-    // a 50ms tester-present period and a 25ms wait per item, a due send
-    // follows every 2nd or 3rd item (the check runs after each item, and
-    // each item takes at least 25ms). A starved drain gives DRAIN_ITEMS, a
-    // drain that checks only every other item or stalls at its start gives
-    // 4 or more.
+    // Split the drain into runs of cll_b frames separated by cll_a frames:
+    // the leading run (before the first cll_a frame), the interior runs
+    // (between two cll_a frames) and the trailing run.
+    //
+    // Why 3 is the hard bound for every run: cll_b's CP_P3Phys wait is
+    // anchored on the previous cll_b write, not on the start of the item and
+    // not on cll_a's send. Right after a cll_a send, the next cll_b item may
+    // already be partly waited out, and the due check after the second item
+    // (50ms after the send) races with the overhead of the tick itself, so a
+    // run of 2 is the usual result and a run of 3 happens when a hiccup of a
+    // few milliseconds lands in that window (the same thing happens once at
+    // the start, depending on how long before the resume cll_a last sent).
+    // After a third item the send is always due, so no run is longer.
     const MAX_B_RUN: usize = 3;
-    let mut longest_b_run = 0;
-    let mut current_b_run = 0;
+    let mut runs = Vec::new();
+    let mut current_run = 0;
     for &is_b in &drain_frames {
         if is_b {
-            current_b_run += 1;
-            longest_b_run = longest_b_run.max(current_b_run);
+            current_run += 1;
         } else {
-            current_b_run = 0;
+            runs.push(current_run);
+            current_run = 0;
         }
     }
+    let trailing_run = current_run;
+    let a_frames = runs.len();
+    assert!(
+        a_frames > 0,
+        "cll_a's tester-present should send during the drain, but {DRAIN_ITEMS} cll_b frames \
+         went out with none between them -- drain_tx_held_backlog is starving the \
+         RX-poll/tester-present tick while it drains cll_b's backlog"
+    );
+    let leading_run = runs[0];
+    let interior_runs = &runs[1..];
+    let longest_b_run = runs
+        .iter()
+        .copied()
+        .chain([trailing_run])
+        .max()
+        .unwrap_or_default();
     assert!(
         longest_b_run <= MAX_B_RUN,
         "expected a due mode-0 tester-present send from cll_a at least every {MAX_B_RUN} drained \
          cll_b items (50ms period, 25ms per item), but {longest_b_run} cll_b frames went out in a \
-         row -- drain_tx_held_backlog appears to be starving or throttling the \
-         RX-poll/tester-present tick while it drains cll_b's backlog"
+         row (leading {leading_run}, interior {interior_runs:?}, trailing {trailing_run}) -- \
+         drain_tx_held_backlog appears to be starving the RX-poll/tester-present tick while it \
+         drains cll_b's backlog"
     );
+
+    // A drain that ticks only after every 3rd item gives B,B,B,A over and
+    // over: every run is 3, which the hard bound above allows. The unregressed
+    // service reaches 3 only when a hiccup lands in that window, a few times
+    // at most in 29 cycles, and never because of the order of the work, which
+    // a stalled runner does not change. Allow at most a quarter of the
+    // interior runs to be 3 (the same hiccup, or the pre-resume phase noted
+    // above); a throttled tick makes all of them 3.
+    let interior_threes = interior_runs
+        .iter()
+        .filter(|&&run| run == MAX_B_RUN)
+        .count();
     assert!(
-        drain_frames.iter().any(|&is_b| !is_b),
-        "cll_a's tester-present should send during the drain"
+        interior_threes * 4 <= interior_runs.len(),
+        "expected most of the cll_b runs between two cll_a tester-present sends to be 2 (50ms \
+         period, 25ms per item), but {interior_threes} of {} were {MAX_B_RUN} (leading \
+         {leading_run}, interior {interior_runs:?}, trailing {trailing_run}) -- \
+         drain_tx_held_backlog appears to run the RX-poll/tester-present tick only every \
+         {MAX_B_RUN}rd item",
+        interior_runs.len()
     );
 
     drop(events_a);

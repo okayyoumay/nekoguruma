@@ -1,5 +1,5 @@
 ---
-applyTo: ".github/workflows/**,.config/**,scripts/**"
+applyTo: ".github/workflows/**,.config/**,.cargo/**,scripts/**"
 ---
 
 # Review guidelines: CI and scripts

@@ -67,7 +67,9 @@ from Step 1.
 **Copilot requested but never finished.** If the request call succeeded but the check-in finds
 no review of the current head, schedule one more check-in 15 minutes later. Decide this from the
 reviews alone: while the review runs, Copilot can already be gone from the PR's requested
-reviewers, so that list says nothing about whether a review is coming. If that one
+reviewers, so that list says nothing about whether a review is coming. The review runs as a
+check run named `copilot-pull-request-reviewer` (`get_check_runs`); while it is still in
+progress, schedule the next check-in instead of counting the round as stalled. If that one
 still finds no review, treat the round as stalled: tell the maintainer once in the thread and
 run one fallback pass (as under "Copilot not available") on this head instead of re-requesting.
 A stall is transient, so unlike the two cases above it does not end Copilot reviews on this PR:

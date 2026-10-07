@@ -30,8 +30,9 @@ General behaviour (clause 7.7):
 - The suppressPosRspMsgIndicationBit suppresses positive responses only.
 - For functionally addressed requests, NRCs 11, 7F, 12, 7E and 31 are not sent (clause 7.7.1).
 - A supported SubFunction is available in every session its service is, so NRC 7E is not produced.
-- Response pending (NRC 78) and busy (NRC 21) are not produced: every service completes within the
-  request. Response delays are reported by `exchange()` and applied by the VCI side.
+- Every service completes within the request, so busy (NRC 21) is never produced, and response
+  pending (NRC 78) only when a test injects it (`Fault::ResponsePending`, below). Response delays
+  are reported by `exchange()` and applied by the VCI side.
 
 ## Services and sessions
 
@@ -161,6 +162,16 @@ numbers contradict each other or exceed the flash window, which the ECU itself n
 | `BusError` | The next request is lost on the bus: neither handled nor answered |
 | `PowerLoss` | Immediate: session, security and a running transfer are lost as in a power cycle (flash progress is kept), and the ECU answers nothing until `reconnect()` |
 | `CorruptBlock { block }` | Writing TransferData block `block` (numbered as for `drop_at_block`) fails: NRC 72 (clause 14.4), nothing is stored and the blockSequenceCounter does not advance, so the client may send the block again |
+| `ResponsePending { count, interval_ms }` | The next request the ECU answers gets `count` response pending messages (`7F SID 78`, Annex A.1) before its response: the first when the response was due, the others `interval_ms` apart, and the response `interval_ms` after the last. `exchange()` lists them in `Exchange::pending` with their delays; tS3_Server restarts when the final response goes out. A request without a response leaves the fault armed; with `DropResponse` the messages still go out and only the final response is lost. `count` is capped at `MAX_RESPONSE_PENDING` (1000); zero uses the fault up without sending any |
+
+`ResponsePending` simplifies what a server does around NRC 78 (Annex A.1, clause 7.7.3):
+
+- A request with the suppress bit set gets no chain: a server that sends NRC 78 must then send a
+  final response even for such a request, a sequence the simulator cannot produce.
+- The chain can precede any final response, also a negative one a server would have given at
+  once (NRC 11, 12 or 13), although NRC 78 says the request was accepted.
+- During the chain the ECU answers other requests at once, and the request's own effect (an ECU
+  reset, for one) applies at the start of the chain, not at its end.
 
 While the ECU is silent (after `PowerLoss` or `drop_at_block`), requests do not reach it and the
 armed faults stay armed. `armed_faults()` lists the faults that have not fired yet.

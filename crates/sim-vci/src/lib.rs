@@ -593,25 +593,30 @@ impl Bus {
         // A request the next process must know about fails if it cannot be recorded; its
         // response is then not sent either.
         self.save_ecu()?;
-        let Some(bytes) = exchange.response.to_bytes() else {
-            return Ok(());
-        };
-        let mut data = ECU_RESPONSE_ID.to_be_bytes().to_vec();
-        data.extend_from_slice(&bytes);
-        let ready_at = Instant::now() + Duration::from_millis(exchange.delay_ms.into());
         let Some(channel) = self.channels.get_mut(&channel_id) else {
             return Ok(());
         };
-        let at = channel.rx.partition_point(|p| p.ready_at <= ready_at);
-        channel.rx.insert(
-            at,
-            Pending {
-                ready_at,
-                power_cycle,
-                data,
-                accepted: false,
-            },
-        );
+        // Response pending messages (NRC 78) first, then the response itself.
+        let now = Instant::now();
+        let final_response = exchange
+            .response
+            .to_bytes()
+            .map(|bytes| (exchange.delay_ms, bytes));
+        for (delay_ms, bytes) in exchange.pending.into_iter().chain(final_response) {
+            let mut data = ECU_RESPONSE_ID.to_be_bytes().to_vec();
+            data.extend_from_slice(&bytes);
+            let ready_at = now + Duration::from_millis(delay_ms.into());
+            let at = channel.rx.partition_point(|p| p.ready_at <= ready_at);
+            channel.rx.insert(
+                at,
+                Pending {
+                    ready_at,
+                    power_cycle,
+                    data,
+                    accepted: false,
+                },
+            );
+        }
         Ok(())
     }
 }

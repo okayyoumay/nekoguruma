@@ -8,7 +8,7 @@
 # NGR_CODE_SCANNING_TOKEN is sent when set. The raw API response is never printed.
 #
 # Exit status: 0 ok; 2 usage; 3 not authorized (401/403); 4 list: no analysis of main (404);
-# 5 any other API or network error; 6 show: no such alert (404).
+# 5 rate limit or any other API or network error; 6 show: no such alert (404).
 set -euo pipefail
 
 usage() { echo "usage: $0 list | show <alert number>" >&2; exit 2; }
@@ -23,7 +23,7 @@ trap 'rm -rf "$tmp"' EXIT
 # status to an exit status. The token goes to curl on stdin (printf is a builtin), so it never
 # appears in a process's command line.
 get() {
-  local -a cmd=(curl -sS -o "$2" -w '%{http_code}'
+  local -a cmd=(curl -sS -o "$2" -D "$tmp/headers" -w '%{http_code}'
     -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28"
     "https://api.github.com/repos/$repo/$1")
   local status
@@ -35,7 +35,12 @@ get() {
   fi
   case "$status" in
     200) ;;
-    401|403) echo "HTTP $status: not authorized to read code scanning alerts (check NGR_CODE_SCANNING_TOKEN)" >&2; exit 3 ;;
+    403) if grep -qi '^x-ratelimit-remaining: *0' "$tmp/headers" \
+          || jq -e '.message | test("rate limit"; "i")' "$2" >/dev/null 2>&1; then
+           echo "HTTP 403: GitHub API rate limit; try again later" >&2; exit 5
+         fi
+         echo "HTTP 403: not authorized to read code scanning alerts (check NGR_CODE_SCANNING_TOKEN)" >&2; exit 3 ;;
+    401) echo "HTTP $status: not authorized to read code scanning alerts (check NGR_CODE_SCANNING_TOKEN)" >&2; exit 3 ;;
     404) echo "HTTP 404: $(jq -r '.message // "not found"' "$2" 2>/dev/null)" >&2; exit "$3" ;;
     *) echo "HTTP $status: $(jq -r '.message // "unexpected response"' "$2" 2>/dev/null)" >&2; exit 5 ;;
   esac
@@ -56,6 +61,7 @@ case "${1:-}" in
       | sort_by(
           ({"critical": 0, "high": 1, "medium": 2, "low": 3}[.rule.security_severity_level // ""] // 4),
           ({"error": 0, "warning": 1, "note": 2}[.rule.severity // ""] // 3),
+          .created_at,
           .number)
       | .[]
       | [ .number,

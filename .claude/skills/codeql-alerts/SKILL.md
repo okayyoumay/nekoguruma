@@ -32,7 +32,7 @@ Never print the token or write it to a file. Exit statuses:
 - 3 (401 or 403): the token is missing, expired or lacks the permission. Tell the maintainer
   that in one message and stop.
 - 4 (404 from `list`): code scanning has not analysed `main` yet. Report and stop.
-- 5: another API or network error. Report the message it printed and stop.
+- 5: a rate limit, or another API or network error. Report the message it printed and stop.
 - 6 (404 from `show`): no alert has that number. Report the number and stop.
 - 0 with no rows: report "no open CodeQL alerts" and stop.
 
@@ -41,6 +41,7 @@ Never print the token or write it to a file. Exit statuses:
 Stop and go to "Report" if any of these holds:
 
 - this run has fixed as many alerts as its maximum;
+- every open alert in the list is on this run's skipped list;
 - an open PR whose head branch is in this repository has a title starting with `[codeql]` or
   `[backlog-loop]`, or carries the `codeql` or `backlog-loop` label. Tasks run one at a time,
   across both loops;
@@ -53,8 +54,8 @@ including its checks that nothing else needs the branch.
 ## 3. Pick
 
 Take the first row of the list that is not on this run's skipped list; the script already
-orders the rows by security severity, then severity, then age. `alert=<n>` goes first if it is
-still open.
+orders the rows by security severity, then severity, then creation time, oldest first.
+`alert=<n>` goes first if it is still open.
 
 ## 4. Verify
 

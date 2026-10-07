@@ -82,10 +82,14 @@ rename, directory sync) and an append-only log of records.
   which needs no format change.
 - A checksum failure in the very last frame is indistinguishable from a torn write and is cut
   off. A synced frame is not torn by a crash, so this needs damage to the storage itself.
-- Later records count only as a run of whole records with consecutive numbers that ends exactly
-  at the end of the file. A torn record whose payload (a VM state can hold any bytes) contains
-  such a run, cut exactly at its end, reads as corrupt: the cautious outcome, since a corrupt
-  journal stops the job rather than losing committed markers.
+- Later records are a run of whole records with consecutive numbers after the frame that does
+  not read back. Beyond the extent that frame's own length claims, any such run counts, so a
+  newest commit torn after earlier damage does not hide the records in between. Inside that
+  extent (a VM state can hold any bytes, so a torn record's payload can contain whole frames),
+  a run counts only if it ends exactly at the end of the file; a torn record cut exactly at the
+  end of such a nested run reads as corrupt, the cautious outcome, since a corrupt journal
+  stops the job rather than losing committed markers. Damage that leaves a length pointing past
+  later records and a newest commit torn at the same time still cuts those records.
 - Durability on Windows rests on `FlushFileBuffers` of the new file also covering its directory
   entry (NTFS logs the entry with the file's metadata). The crash tests end the process, which
   checks the format's recovery, not the storage under a power loss.

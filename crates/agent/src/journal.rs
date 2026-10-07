@@ -700,7 +700,7 @@ fn load(bytes: &[u8], key: &JobKey) -> Result<Loaded, JournalError> {
             // One unfinished commit leaves at most one frame, and no record after it.
             FrameRead::Torn
                 if bytes.len() - offset <= FRAME_HEADER + MAX_FRAME as usize
-                    && !record_follows(bytes, offset + 1, state.records) =>
+                    && !record_follows(bytes, offset, state.records) =>
             {
                 break;
             }
@@ -729,30 +729,39 @@ fn load(bytes: &[u8], key: &JobKey) -> Result<Loaded, JournalError> {
     Ok(Loaded { state, len: offset })
 }
 
-/// Whether committed records numbered `records` or later follow from `from` on: a run of whole
-/// records with consecutive numbers that ends exactly at the end of the file. A damaged length
+/// Whether committed records numbered `records` or later follow the frame at `torn` that does
+/// not read back: a run of whole records with consecutive numbers after it. A damaged length
 /// field or a zeroed region reads like a torn frame, but records committed after it show that
-/// it is damage, not an unfinished commit. Requiring the run to reach the end keeps a frame
-/// that happens to lie inside a torn record's payload (a VM state can hold any bytes) from
-/// counting, since an unfinished write does not stop on a frame boundary of its payload.
-fn record_follows(bytes: &[u8], from: usize, records: u64) -> bool {
-    (from..bytes.len()).any(|start| {
+/// it is damage, not an unfinished commit.
+///
+/// A frame can also lie inside a torn record's payload (a VM state can hold any bytes). Inside
+/// the extent the torn frame's own length claims, a run therefore counts only if it ends
+/// exactly at the end of the file, which a write cut inside a payload does not leave unless it
+/// stops exactly on a nested frame's end. Beyond that extent, a run counts however it ends, so
+/// a newest commit torn after earlier damage does not hide the records in between.
+fn record_follows(bytes: &[u8], torn: usize, records: u64) -> bool {
+    let claimed_end = bytes[torn..]
+        .first_chunk::<4>()
+        .map(|len| u32::from_le_bytes(*len))
+        .filter(|len| (1..=MAX_FRAME).contains(len))
+        .map_or(torn + 1, |len| torn + FRAME_HEADER + len as usize);
+    (torn + 1..bytes.len()).any(|start| {
         let mut offset = start;
         let mut expected = None;
         while let FrameRead::Ok { payload, next } = read_frame(bytes, offset) {
             let Ok(entry) = postcard::from_bytes::<Entry>(payload) else {
-                return false;
+                break;
             };
             if entry.seq < records || expected.is_some_and(|seq| entry.seq != seq) {
-                return false;
+                break;
             }
-            expected = Some(entry.seq + 1);
+            let Some(following) = entry.seq.checked_add(1) else {
+                break;
+            };
+            expected = Some(following);
             offset = next;
-            if offset == bytes.len() {
-                return true;
-            }
         }
-        false
+        expected.is_some() && (offset == bytes.len() || start >= claimed_end)
     })
 }
 
@@ -1172,6 +1181,80 @@ mod tests {
                 *bytes,
                 "damage {index} is left in place"
             );
+        }
+    }
+
+    /// Earlier damage, records committed after it, then a newest commit that was torn: the
+    /// records in between still make the journal corrupt.
+    #[test]
+    fn damage_followed_by_records_and_a_torn_tail_is_corrupt() {
+        let dir = TempDir::new();
+        let mut journal = Journal::create(&dir.0, &key()).expect("create");
+        journal
+            .commit_ecu_hardware_part_number(b"HW-1")
+            .expect("commit");
+        let damaged = journal.store.len as usize;
+        journal
+            .commit_transfer_start(STAGE, at(3, 11))
+            .expect("commit");
+        journal
+            .commit_transfer_exit_intent(at(5, 20))
+            .expect("commit");
+        let end = journal.store.len as usize;
+        journal
+            .commit_step(at(5, 20), Some(&[0x33; 40]))
+            .expect("commit");
+        drop(journal);
+        let full = fs::read(path(&dir)).expect("read");
+        for (name, change) in [("length zeroed", [0u8; 4]), ("length too large", [0xFF; 4])] {
+            // The newest commit stopped halfway.
+            let mut bytes = full[..end + (full.len() - end) / 2].to_vec();
+            bytes[damaged..damaged + 4].copy_from_slice(&change);
+            fs::write(path(&dir), &bytes).expect("write");
+            assert!(
+                matches!(
+                    Journal::open(&dir.0, &key()),
+                    Err(JournalError::Corrupt { .. })
+                ),
+                "{name}"
+            );
+            assert_eq!(fs::read(path(&dir)).expect("read"), bytes, "{name}");
+        }
+    }
+
+    /// A record numbered at the very end of the range is garbage, not a reason to panic.
+    #[test]
+    fn a_record_numbered_u64_max_does_not_panic() {
+        let dir = TempDir::new();
+        let mut journal = Journal::create(&dir.0, &key()).expect("create");
+        journal
+            .commit_ecu_hardware_part_number(b"HW-1")
+            .expect("commit");
+        let damaged = journal.store.len as usize;
+        journal
+            .commit_ecu_hardware_part_number(b"HW-2")
+            .expect("commit");
+        drop(journal);
+        let mut bytes = fs::read(path(&dir)).expect("read");
+        bytes[damaged..damaged + 4].fill(0);
+        for tail_complete in [true, false] {
+            let mut file = bytes.clone();
+            push_frame(
+                &mut file,
+                &encode(&Entry {
+                    seq: u64::MAX,
+                    at_unix_ms: 0,
+                    record: Record::PostTransferComplete,
+                })
+                .expect("encode"),
+            )
+            .expect("frame");
+            if !tail_complete {
+                file.extend_from_slice(&[9, 0, 0, 0]);
+            }
+            fs::write(path(&dir), &file).expect("write");
+            // Either outcome is a defined one; the call must return.
+            let _ = Journal::open(&dir.0, &key());
         }
     }
 

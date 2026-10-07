@@ -11,12 +11,17 @@ name: CodeQL alert hand-off
 on:
   schedule:
     - cron: "47 23 * * 2" # Wednesday 08:47 JST
-  code_scanning_alert:
-    # A merged fix or a dismissal frees the loop for the next alert.
-    types: [fixed, closed_by_user]
+  # A merged fix frees the loop for the next alert. Actions has no code scanning alert event, so
+  # the job runs when CodeQL default setup (workflow name "CodeQL") finishes analysing a push to
+  # main, and continues only when that commit merged a codeql PR.
+  workflow_run:
+    workflows: [CodeQL]
+    types: [completed]
+    branches: [main]
   workflow_dispatch:
 
 permissions:
+  contents: read
   security-events: read
   pull-requests: read
 
@@ -26,7 +31,11 @@ concurrency:
 
 jobs:
   handoff:
-    if: github.event_name != 'code_scanning_alert' || github.event.ref == 'refs/heads/main'
+    # An analysis that did not succeed leaves the alerts stale: send nothing. (Default setup's
+    # runs report the event `dynamic`, not `push`; the merged-PR check below does the filtering.)
+    if: >-
+      github.event_name != 'workflow_run'
+      || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     env:
@@ -41,6 +50,20 @@ jobs:
           if [ -z "$ROUTINE_ID" ] || [ -z "$ROUTINE_TOKEN" ]; then
             echo "::notice::NGR_CODEQL_ROUTINE_ID or NGR_CODEQL_ROUTINE_TOKEN is not set; nothing sent."
             exit 0
+          fi
+
+          # After an analysis of main, continue only if the analysed commit merged a codeql PR
+          # from this repository.
+          if [ "$GITHUB_EVENT_NAME" = workflow_run ]; then
+            sha=$(jq -r .workflow_run.head_sha "$GITHUB_EVENT_PATH")
+            merged=$(gh api "repos/$REPO/commits/$sha/pulls" \
+              --jq '[.[] | select(.merged_at != null and .head.repo.full_name == env.REPO
+                                  and (.labels | map(.name) | index("codeql")))] | length')
+            if [ "$merged" -eq 0 ]; then
+              echo "The analysed commit did not merge a codeql PR; nothing sent."
+              exit 0
+            fi
+            sleep 30 # alert states update shortly after the analysis upload
           fi
 
           # One task at a time across both loops (ADR-243): while a loop PR is open, the routine

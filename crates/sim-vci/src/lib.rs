@@ -347,8 +347,9 @@ impl Bus {
         self.device_open && device_id == self.device_id
     }
 
-    /// Whether the open device is lost, so every call but `PassThruOpen` fails with
-    /// `ERR_DEVICE_NOT_CONNECTED`. With no device open, only `PassThruOpen` needs the VCI.
+    /// Whether the open device is lost: every call but `PassThruGetLastError` then fails with
+    /// `ERR_DEVICE_NOT_CONNECTED`, and `PassThruClose` on the lost device also releases it. With
+    /// no device open, an unplugged VCI fails only `PassThruOpen`, which checks it itself.
     fn unreachable(&self) -> bool {
         self.device_lost
     }

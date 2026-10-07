@@ -1895,3 +1895,120 @@ fn a_dropped_reset_response_still_times_the_restarted_delay() {
     clock.advance(ms(1));
     assert!(!ecu.security_delay_active());
 }
+
+// ---------------------------------------------------------------- Snapshot and restore
+
+/// Programming session, unlocked, two 2-byte blocks of a 6-byte download stored, on `clock`.
+fn mid_download(clock: &ManualClock) -> SimEcu {
+    let mut ecu = SimEcu::with_clock(config(), clock.clone());
+    enter(&mut ecu, Session::Programming);
+    unlock(&mut ecu);
+    assert!(matches!(
+        ecu.request(&[0x31, 0x01, 0xFF, 0x00]),
+        SimResponse::Positive(_)
+    ));
+    assert!(matches!(
+        ecu.request(&request_download(0, 6)),
+        SimResponse::Positive(_)
+    ));
+    for (bsc, data) in [(1, [0xAA, 0xBB]), (2, [0xCC, 0xDD])] {
+        assert!(matches!(
+            ecu.request(&transfer(bsc, &data)),
+            SimResponse::Positive(_)
+        ));
+    }
+    ecu
+}
+
+/// A snapshot after a round trip through JSON, as another process would read it.
+fn reread(snapshot: &EcuSnapshot) -> EcuSnapshot {
+    serde_json::from_str(&serde_json::to_string(snapshot).expect("snapshot serializes"))
+        .expect("snapshot deserializes")
+}
+
+#[test]
+fn a_restored_ecu_continues_the_download() {
+    let clock = ManualClock::default();
+    let snapshot = reread(&mid_download(&clock).snapshot());
+
+    // The new process's clock has its own origin.
+    let later = ManualClock::default();
+    later.advance(ms(60_000));
+    let mut ecu = SimEcu::restore(snapshot, later, Duration::ZERO);
+    assert_eq!(ecu.session, Session::Programming);
+    assert!(ecu.security_unlocked);
+    assert_eq!(ecu.flash, FlashPhase::Transferring { next_block: 3 });
+    assert_eq!(ecu.image(), [0xAA, 0xBB, 0xCC, 0xDD]);
+    // The block sequence counter goes on where it stopped, and the download completes.
+    assert_eq!(ecu.request(&transfer(3, &[0xEE, 0xFF])), pos(&[0x76, 0x03]));
+    assert_eq!(ecu.request(&[0x37]), pos(&[0x77]));
+    assert_eq!(ecu.image(), [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
+}
+
+#[test]
+fn time_between_snapshot_and_restore_counts_against_s3() {
+    let clock = ManualClock::default();
+    let mut ecu = mid_download(&clock);
+    clock.advance(ms(1_000));
+    let snapshot = ecu.snapshot();
+
+    // Still within tS3_Server: the session goes on, and times out when the rest has passed.
+    let later = ManualClock::default();
+    let mut restored = SimEcu::restore(snapshot.clone(), later.clone(), ms(3_000));
+    assert_eq!(restored.session, Session::Programming);
+    later.advance(ms(999));
+    restored.check_timers();
+    assert_eq!(restored.session, Session::Programming);
+    later.advance(ms(1));
+    restored.check_timers();
+    assert_eq!(restored.session, Session::Default);
+    assert_eq!(restored.flash, FlashPhase::Interrupted { last_block: 2 });
+
+    // Past tS3_Server: the session has ended by the time the ECU is restored.
+    let mut late = SimEcu::restore(snapshot, ManualClock::default(), ms(4_000));
+    assert_eq!(late.session, Session::Default);
+    assert!(!late.security_unlocked);
+    assert_eq!(reported_session(&mut late), 0x01);
+    let SimResponse::Positive(state) = late.request(&[0x22, 0xFD, 0x00]) else {
+        panic!("FD00 should be readable");
+    };
+    assert_eq!(
+        state[3..8],
+        FlashPhase::Interrupted { last_block: 2 }.encode()
+    );
+}
+
+#[test]
+fn a_restored_security_delay_runs_out_on_time() {
+    let (mut ecu, clock) = ecu_with_clock(EcuConfig {
+        security_delay_ms: Some(10_000),
+        ..config()
+    });
+    enter(&mut ecu, Session::Extended);
+    for _ in 0..MAX_SECURITY_ATTEMPTS {
+        let _ = ecu.request(&[0x27, 0x01]);
+        let _ = ecu.request(&[0x27, 0x02, 0, 0, 0, 0]);
+    }
+    assert!(ecu.security_delay_active());
+    clock.advance(ms(4_000));
+    let snapshot = reread(&ecu.snapshot());
+
+    let later = ManualClock::default();
+    let mut restored = SimEcu::restore(snapshot, later.clone(), ms(5_000));
+    assert!(restored.security_delay_active());
+    later.advance(ms(1_000));
+    assert!(!restored.security_delay_active());
+}
+
+#[test]
+fn a_restored_ecu_keeps_its_faults_and_counters() {
+    let (mut ecu, _clock) = ecu_with_clock(config());
+    ecu.inject(Fault::DropResponse);
+    ecu.reconnect();
+    let snapshot = reread(&ecu.snapshot());
+    let mut restored = SimEcu::restore(snapshot, ManualClock::default(), Duration::ZERO);
+    assert_eq!(restored.power_cycles(), 1);
+    // The armed fault still fires on the next request.
+    assert_eq!(restored.request(&[0x3E, 0x00]), SimResponse::NoResponse);
+    assert_eq!(restored.request(&[0x3E, 0x00]), pos(&[0x7E, 0x00]));
+}

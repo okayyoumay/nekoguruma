@@ -16,7 +16,8 @@ below refer to SAE J2534-1 (v04.04).
   the configuration sets `s3_server_ms`) without a request, as on a vehicle.
 - The ECU lives as long as the process: `PassThruClose` and a new `PassThruOpen` keep its
   flash state, and its session too if the device is opened again within tS3_Server, as a vehicle
-  keeps its state while the tester disconnects. A process restart starts a fresh ECU.
+  keeps its state while the tester disconnects. A process restart starts a fresh ECU, unless
+  `NGR_SIM_ECU_STATE` names a state file ("ECU state across processes" below).
 - `PassThruConnect` accepts `ISO15765` with 11-bit CAN IDs only; any other protocol, or the
   29-bit ID flag, gets `ERR_NOT_SUPPORTED`. Channel IDs count up from 1. `PassThruClose` drops
   every channel together with its filters and unread responses; `PassThruDisconnect` drops one.
@@ -46,6 +47,26 @@ below refer to SAE J2534-1 (v04.04).
   power loss or a VCI disconnect leave it alone, so a test that simulates low supply sets it
   itself.
   Every other IOCTL is accepted and does nothing.
+
+## ECU state across processes
+
+When `NGR_SIM_ECU_STATE` names a file, the ECU outlives the process that loaded the library, as
+a vehicle outlives a crashed worker (ADR-241):
+
+- The first time the process needs the ECU, it continues from the file if the file exists;
+  `NGR_SIM_ECU_CONFIG` is then not read, since the file holds the configuration as it stands.
+  Otherwise the ECU starts from the configuration, and the file is written.
+- The whole ECU is kept (`sim_ecu::EcuSnapshot`): session, security, flash phase, download and
+  image, software versions, DTCs, armed faults and the power-cycle count. Its timers keep
+  running while no process has the library loaded: the file records the wall-clock time of the
+  write, and the time since then counts against tS3_Server and the security delay.
+- The file is rewritten after every change to the ECU (each request it handles, each control
+  command that touches it), through a temporary file renamed over it. If it cannot be written,
+  the call returns `ERR_FAILED`, and a request's response is not delivered. A file that cannot be
+  read, or was written by another format version, makes `PassThruOpen` fail with `ERR_FAILED`.
+- The VCI side is not kept: channels, filters, unread responses, the battery voltage and the
+  device ID start fresh in the new process.
+- One process at a time may use a state file.
 
 ## Filters
 
@@ -173,4 +194,8 @@ answer that itself once its own polling has seen the loss); the next job then op
 again and reads the VIN. Since the service may answer for a lost module itself (ADR-131),
 `tests/sim_vci_library.rs` loads the cdylib into its own process through the `j2534-0404`
 wrapper and checks the device-loss rules without the service: lost after the unplug, still
-lost after the replug, released by the close, and a new device ID on the next open.
+lost after the replug, released by the close, and a new device ID on the next open. `tests/sim_vci_restart.rs`
+runs each step in its own process with a state file: one starts a download and exits without
+closing anything, the next reads the running transfer and the programming session (DIDs FD00
+and F186), and one started after tS3_Server reads the interrupted transfer in the default
+session.

@@ -12,7 +12,7 @@ Workspace skeleton (step 1): every crate goes as far as type and boundary defini
 
 - `shared-proto`: type definitions for job specs, states, failure codes, capabilities
 - `diag-ir`: instruction set, section attributes (interruptibility, idempotency), VM state, `DiagHost` trait
-- `sim-vci`: J2534 exported functions and `PASSTHRU_MSG`, switching of `unsigned long` width
+- `sim-vci`: J2534 exported functions and `PASSTHRU_MSG`, switching of `unsigned long` width; the ECU state can be kept in a file across worker processes (ADR-241)
 - `sim-ecu`: UDS services for M1 (session, reset, security access, DIDs, DTCs, routines, download) with flash state, resume and fault injection; `sim-vci` delegates ISO 15765 traffic to it
 - `j2534-defs`: J2534 constants, protocol name resolution, COMPARAM -> SET_CONFIG mapping (tested)
 - `vci-discovery`: J2534 registry discovery (Windows), D-PDU API root file parsing (tested)
@@ -22,7 +22,6 @@ Workspace skeleton (step 1): every crate goes as far as type and boundary defini
 
 ## Simulators and core logic
 
-- **P1**: `sim-vci` keeps the simulated ECU in the process that loads it (`crates/sim-vci/src/lib.rs`, `crates/sim-vci/docs/simulated-vci.md`), so a worker crash or restart loses the ECU's flash state and the "worker crash mid-transfer follows the same restart order" test of the write-job journal item cannot run (design 5.6, ADR-229). Done when: the ECU state survives a restart of the process that loads `sim-vci` (for example by running `sim-ecu` in a separate process or persisting its state), and a test restarts that process mid-transfer and reads the interrupted flash state (DID FD00).
 - **P1**: Verify the ABI interpretation table (design 7.1.2) on the six worker targets in CI. Today the `abi-roundtrip` job in `.github/workflows/ci.yml` builds only `i686-unknown-linux-gnu` and `scripts/abi-roundtrip.sh` only checks that `libsim_vci.so` exports the 14 J2534 symbols and its control function; nothing calls the library on that target and `qemu-user` is installed but unused. `sim-vci`'s `PassThruReadVersion` reports fixed strings, and `crates/j2534-0404-service/tests/sim_vci_end_to_end.rs` already checks them through the service on the host target only. The launch test runs through `j2534-0404-service` (design 7.3: `GetVersion` -> `PassThruReadVersion`). Done when: a CI job runs `j2534-0404-service` built for each of the six targets against `sim-vci` built for the same target (ARM under qemu-user, Windows on the Windows runner) and checks the returned version strings and `unsigned long` width.
 - **P1**: Interruption/resumption scenario tests: power loss during transfer, reconnection, state check, resume (design 5.3 / 5.6).
 - **P2**: `sim-vci` simulates a VCI disconnect (ADR-238) but not a VCI crash (design 13.4), where the device fails while still plugged in. Decide what a crashed VCI reports (for example `ERR_FAILED` from every call, or no responses) once a test needs behaviour that differs from a disconnect. Done when: a control command crashes the simulated VCI and a test through the worker sees the chosen behaviour.

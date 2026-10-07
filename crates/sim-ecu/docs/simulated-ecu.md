@@ -144,6 +144,11 @@ state gets NRC 22, and the client must erase and start over. A download interrup
 block but before RequestTransferExit has nothing left to send; RequestTransferExit closes it
 directly.
 
+`SimEcu::snapshot()` records the whole ECU as an `EcuSnapshot` (serde), and
+`SimEcu::restore(snapshot, clock, elapsed)` rebuilds it on another clock, as it was `elapsed`
+after the snapshot: running timers have that much less to go, and one that has run out takes
+effect at once. `sim-vci` uses this to keep the ECU across worker processes (ADR-241).
+
 ## Fault injection
 
 `SimEcu::inject(fault)` arms one of the faults design 13.4 asks for. Each fires once.

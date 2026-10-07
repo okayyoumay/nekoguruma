@@ -1408,3 +1408,93 @@ fn the_ecu_session_times_out_in_real_time() {
         (STATUS_NOERROR, vec![response(&[0x62, 0xF1, 0x86, 0x01])])
     );
 }
+
+// ---------------------------------------------------------------- State file (ADR-241)
+
+/// A state file path in a fresh temporary directory, removed when dropped.
+struct StateDir(PathBuf);
+
+impl StateDir {
+    fn new(name: &str) -> Self {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after unix epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("sim-vci-state-{name}-{nanos}"));
+        std::fs::create_dir_all(&dir).expect("temporary directory should be writable");
+        Self(dir)
+    }
+
+    fn file(&self) -> PathBuf {
+        self.0.join("ecu.state")
+    }
+}
+
+impl Drop for StateDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[test]
+fn the_state_file_round_trips_the_ecu() {
+    let dir = StateDir::new("round-trip");
+    let mut ecu = SimEcu::new(default_ecu_config());
+    assert!(matches!(
+        ecu.request(&[0x10, 0x03]),
+        sim_ecu::SimResponse::Positive(_)
+    ));
+    save_ecu_state(&dir.file(), &mut ecu).expect("the state should be written");
+    assert!(!dir.0.join("ecu.state.tmp").exists());
+
+    let loaded = load_ecu_state(&dir.file()).expect("the state should load");
+    assert_eq!(loaded.session, Session::Extended);
+    assert_eq!(loaded.config.vin, "NGRSIMECU00000001");
+}
+
+#[test]
+fn a_damaged_or_foreign_state_file_is_refused() {
+    let dir = StateDir::new("refused");
+    std::fs::write(dir.file(), b"not a state file").expect("file should be writable");
+    assert!(load_ecu_state(&dir.file()).is_none());
+
+    let mut ecu = SimEcu::new(default_ecu_config());
+    let other_version = StateFile {
+        version: STATE_FILE_VERSION + 1,
+        saved_at_ms: unix_ms(SystemTime::now()),
+        ecu: ecu.snapshot(),
+    };
+    std::fs::write(
+        dir.file(),
+        postcard::to_allocvec(&other_version).expect("state should encode"),
+    )
+    .expect("file should be writable");
+    assert!(load_ecu_state(&dir.file()).is_none());
+}
+
+#[test]
+fn time_since_the_write_counts_against_the_session() {
+    let dir = StateDir::new("elapsed");
+    let mut ecu = SimEcu::new(EcuConfig {
+        s3_server_ms: Some(1_000),
+        ..default_ecu_config()
+    });
+    assert!(matches!(
+        ecu.request(&[0x10, 0x03]),
+        sim_ecu::SimResponse::Positive(_)
+    ));
+    let mut state = StateFile {
+        version: STATE_FILE_VERSION,
+        saved_at_ms: unix_ms(SystemTime::now()),
+        ecu: ecu.snapshot(),
+    };
+    // Written two seconds ago: tS3_Server ran out in the meantime.
+    state.saved_at_ms -= 2_000;
+    std::fs::write(
+        dir.file(),
+        postcard::to_allocvec(&state).expect("state should encode"),
+    )
+    .expect("file should be writable");
+    let loaded = load_ecu_state(&dir.file()).expect("the state should load");
+    assert_eq!(loaded.session, Session::Default);
+}

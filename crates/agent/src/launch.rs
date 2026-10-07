@@ -50,12 +50,16 @@ const RESOLUTIONS: &[Resolution] = &[
     },
 ];
 
-#[cfg(all(windows, not(target_arch = "x86_64")))]
+#[cfg(all(windows, target_arch = "x86"))]
 const RESOLUTIONS: &[Resolution] = &[Resolution {
     arch: Some("x86"),
     view: RegistryViewMode::Native,
     abi: Some(Abi::WinX86),
 }];
+
+// `vci_service_launcher::vci_server::current_arch` knows no other Windows architecture.
+#[cfg(all(windows, not(any(target_arch = "x86_64", target_arch = "x86"))))]
+compile_error!("no j2534-0404 worker build is defined for this Windows architecture");
 
 #[cfg(not(windows))]
 const RESOLUTIONS: &[Resolution] = &[Resolution {
@@ -175,6 +179,24 @@ mod tests {
                 .map(|(_, path)| PathBuf::from(path))
                 .ok_or_else(|| RegistryError::NotFound(vci.to_owned()))
         }
+    }
+
+    /// Each build must read what that worker build reads: its `current_arch` key and, for the
+    /// x86 build, the 32-bit view a WOW64 process sees as its own.
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[test]
+    fn windows_x64_agent_reads_both_builds_explicitly() {
+        let table: Vec<_> = RESOLUTIONS
+            .iter()
+            .map(|r| (r.arch, r.view, r.abi))
+            .collect();
+        assert_eq!(
+            table,
+            [
+                (Some("x86_x64"), RegistryViewMode::W64, Some(Abi::WinX64)),
+                (Some("x86"), RegistryViewMode::W32, Some(Abi::WinX86)),
+            ]
+        );
     }
 
     #[test]

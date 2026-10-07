@@ -32,7 +32,9 @@ picks will load. Design 7.1 also asks for both registry views to be named explic
 3. Order on 64-bit Windows: the x64 build, then the x86 build. A VCI with a library in both
    views runs on the native x64 build, which needs no WOW64 layer. A 32-bit Windows agent
    tries only the x86 build. On Linux there is one lookup, without an architecture key, and
-   the build follows the header's ABI.
+   the build follows the header's ABI. The order does not depend on which builds are
+   installed: a host is expected to carry both builds (design 7.3), and a missing one fails as
+   `UNSUPPORTED_ABI` rather than falling through to the other.
 4. The agent passes the ABI's default `long_size` (7.1.2) to the worker.
 
 Alternatives not taken:
@@ -53,5 +55,8 @@ Alternatives not taken:
   because `j2534-0404-registry` exposes explicit views only to 64-bit builds.
 - A vendor library whose `long_size` differs from the 7.1.2 default cannot be used until the
   agent reads the registration definition or the VCI profile override.
+- A library of an ABI the agent cannot detect or has no build order for ends as a resolution
+  failure whose reasons name the ABI, not as a typed `UNSUPPORTED_ABI`; a caller that must report
+  the reason code (the daemon's `capabilities`, 9.5) needs a typed variant.
 - The ordering is one constant per platform (`RESOLUTIONS`); the selection logic is unit-tested
   with a fake lookup and header reader.

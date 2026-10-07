@@ -66,6 +66,8 @@ Reading ISO 22901-1 against the old schema:
    several services) once. Nested DIDs and cascading tables are a `Select` inside a selected
    layout; `Field` gets no parent-child link. ENV-DATA-DESC items fit the same shapes (a layout
    holding one `Select` keyed by the DTC), and a TABLE-ENTRY is inlined from the row it names.
+   In a request only `Group`, `Repeat` with `UntilEndOfPdu` and `Select` occur, because
+   END-OF-PDU-FIELD is the only FIELD kind ODX allows there (7.3.6.10.1, 7.3.6.10.6).
 4. **Monitoring stays flat.** `MonitorSet` fields must have a fixed position, a `Fixed` length
    and no shape. The frontend rejects a monitor set that needs more, so the 10 ms walk of design
    10.3 is unchanged.

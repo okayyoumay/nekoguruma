@@ -12,8 +12,10 @@ and stored in `EcuDocument.procedure` in postcard-serialized form.
 ## Design decisions
 
 **Pre-expand decode plans**
-`Field` holds bit offset, width, endianness and conversion method flatly. Because the layout is not
-interpreted at runtime, even 10ms-interval monitoring only needs to walk the array.
+`Field` holds bit offset, width, endianness and conversion method flatly. ODX layouts are resolved
+at import, and monitor sets are always flat, so 10ms-interval monitoring only needs to walk the
+array. Other requests and responses can also refer to nested layouts, which the general decoder
+follows (next section).
 
 **Nest only what depends on the message (ADR-242)**
 Field lengths follow ODX's coded-type kinds (fixed, from another field, leading length prefix,

@@ -2,9 +2,11 @@
 //
 // Policy:
 //  - Whatever the input format (ODX/OTX, CSV+JS), the frontend normalizes it into this shape (8.2)
-//  - Response decoding is not interpreted at runtime; it is expanded into flat arrays at import time.
-//    Variable lengths stay attributes of a flat field; only repetitions, keyed selections and
-//    structures placed or sized at runtime refer to nested layouts (ADR-242)
+//  - ODX layouts are resolved at import time into flat field arrays. Monitor sets are always
+//    flat, so they are decoded by walking an array. Other requests and responses may also contain
+//    repetitions, keyed selections and structures placed or sized at runtime, which refer to
+//    nested layouts that the general decoder follows (ADR-242); variable lengths stay attributes
+//    of a flat field
 //  - Split into one file per ECU variant, identified by hash (8.2.6)
 //
 // Generate: flatc --rust --gen-object-api -o src/generated schema/ir.fbs
@@ -253,7 +255,9 @@ table Request {
   // Fixed byte sequence (sub-function etc. after the SID)
   prefix: [uint8];
   // Where parameters are embedded. Shapes allowed here: Group, Repeat with UntilEndOfPdu,
-  // and Select keyed by a parameter the procedure supplies (a TABLE-KEY that names the whole TABLE)
+  // and Select keyed by a parameter the procedure supplies (a TABLE-KEY that names the whole TABLE).
+  // These are the request forms ODX has: of its FIELD kinds only END-OF-PDU-FIELD may appear in
+  // a request (ISO 22901-1 7.3.6.10.1, 7.3.6.10.6)
   params: [Field];
 }
 

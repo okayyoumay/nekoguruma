@@ -101,7 +101,8 @@ runner in M1.
    When any plan allows a restart, every identity source must be declared, every declared
    precondition must have a source for both sessions, the plan must give a session timeout
    and a resume limit, and no section marked unsafe to repeat (ADR-233) may lie in the range a
-   restart replays. Unknown fields in a JSON program are refused, so a misspelt key cannot
+   restart replays or redoes: from the plan's entry up to its recovery-required point, the
+   transfer and post-transfer steps included. Unknown fields in a JSON program are refused, so a misspelt key cannot
    drop a precondition silently.
 7. **Schema version 2.** The postcard encodings of `Program` and `VmState` change, so
    `IR_SCHEMA_VERSION` becomes 2. A version 1 program fails to decode or is refused by its

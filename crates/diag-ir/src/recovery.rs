@@ -560,10 +560,12 @@ impl Program {
                 });
             }
         }
+        // A restart replays everything from the entry up to the recovery point: the pre-erase
+        // steps, the transfer and the post-transfer steps it redoes.
         if plan.allows_restart() {
             for (section, s) in self.sections.iter().enumerate() {
                 if matches!(s.idempotency, Idempotency::Unsafe)
-                    && s.start_pc.max(b.entry_pc) < s.end_pc.min(b.erase_pc)
+                    && s.start_pc.max(b.entry_pc) < s.end_pc.min(from)
                 {
                     return Err(ProgramError::UnsafeSectionInReplay {
                         flash_session,

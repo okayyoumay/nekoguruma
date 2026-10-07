@@ -1843,6 +1843,7 @@ fn a_recovery_section_must_not_lie_in_the_restartable_range() {
     let mut program = recovery_program();
     program.sections.push(Section {
         interruptible: Interruptible::No,
+        idempotency: Idempotency::Safe,
         ..recovery_section(1, 5)
     });
     program.sections.push(recovery_section(7, 9));
@@ -2277,12 +2278,22 @@ fn a_restartable_plan_does_not_replay_an_unsafe_section() {
             section: 0
         })
     );
-    // A safe section, or an unsafe one after the erase, is fine.
+    // A safe section is fine; an unsafe one after the erase is redone with the transfer.
     program.sections[0].idempotency = Idempotency::Safe;
+    assert_eq!(program.validate(), Ok(()));
     program.sections.push(Section {
         interruptible: Interruptible::Yes,
-        ..recovery_section(1, 4)
+        ..recovery_section(3, 4)
     });
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::UnsafeSectionInReplay {
+            flash_session: 1,
+            section: 1
+        })
+    );
+    // From the recovery point on, nothing is replayed: an unsafe section there is fine.
+    program.flash[0].recovery_required = RecoveryRequired::FromPc(3);
     assert_eq!(program.validate(), Ok(()));
     // The plan does not allow a restart, so nothing is replayed.
     let mut program = recovery_program();

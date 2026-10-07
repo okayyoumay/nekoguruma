@@ -74,7 +74,9 @@ table CompuTextTable {
 
 // One COMPU-SCALE of a TEXTTABLE: internal values lower..upper (inclusive) map to the text.
 // A single value has lower == upper. Entries may overlap; the first matching entry in array
-// order wins, as in ODX, so a decoder must not sort or binary-search them.
+// order wins, as ODX specifies for overlapping scales (ISO 22901-1 (2008) 7.3.6.6.1, 7.3.6.6.7),
+// so a decoder must not sort or binary-search them. Limits are integers: the frontend turns
+// ODX's open interval ends into closed ones and rejects a TEXTTABLE on a Float internal value.
 table TextEntry {
   lower: int64;
   upper: int64;
@@ -129,7 +131,7 @@ enum Termination : byte {
 // Where a field starts within its layout. The layout of a request or response starts at the
 // SID byte (offset 0, prefix included); a Layout starts at its own first byte. bit_offset is
 // byte position * 8 + bit position, the bit position counting from the least significant bit
-// of that byte, as ODX does.
+// of that byte, as ODX does (ISO 22901-1 (2008) 7.3.6.3).
 enum Placement : byte {
   Absolute = 0,       // bit_offset bits from the start of the layout
   AfterPrevious = 1,  // the byte edge after the previous field of the layout ends (the layout's
@@ -238,7 +240,8 @@ table Repeat {
 // The Select field is placed where the chosen layout starts; the key is a separate field.
 // Keys are compared as internal values; the frontend converts ODX's physical limits and KEYs
 // through the key's COMPU-METHOD and rejects keys it cannot convert. Byte and string keys of up
-// to 8 bytes are compared like byte and string markers (see Repeat).
+// to 8 bytes are compared like byte and string markers (see Repeat). Keys and markers of a
+// Float internal type are rejected, since case limits and markers are integers.
 table Select {
   key_field_id: uint32;       // decoded before the Select field
   cases: [SelectCase];        // non-overlapping (the frontend rejects overlaps)

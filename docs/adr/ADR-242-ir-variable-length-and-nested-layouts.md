@@ -52,7 +52,7 @@ Reading ISO 22901-1 against the old schema:
    layout) or `AfterPrevious` (the byte edge after the previous field, plus a bit position),
    matching an ODX parameter without BYTE-POSITION. The top-level layout of a request or response
    starts at the SID byte; a nested layout starts at its own first byte. Bit positions count
-   from the least significant bit of a byte, as in ODX. Array order is decode order, and the
+   from the least significant bit of a byte, as in ODX (7.3.6.3). Array order is decode order, and the
    end of a nested field is the end of its last decoded item or layout.
 3. **Flatten what is static, nest only what the message decides.** A STRUCTURE whose position
    and size are known at import is inlined into the enclosing layout, as before. Everything else
@@ -74,10 +74,13 @@ Reading ISO 22901-1 against the old schema:
 5. **Keys and markers are compared as internal values.** The frontend converts ODX's physical
    KEYs, MUX case limits and end-marker TERMINATION-VALUE through the key's COMPU-METHOD into
    inclusive ranges of internal values, honouring the first-match order of overlapping TEXTTABLE
-   scales, and rejects a key or marker it cannot convert (including a marker that needs more
-   than one range). A byte-field or string key or marker is compared for equality on its bytes,
-   read as a big-endian integer; one longer than 8 bytes is rejected. The agent then needs no inverse conversion at runtime. A static TABLE-KEY (one that names a single TABLE-ROW) is a constant: the frontend
-   inlines the key bytes and the row's data and emits no `Select`.
+   scales (7.3.6.6.1, 7.3.6.6.7), and rejects a key or marker it cannot convert (including a
+   marker that needs more than one range, and any key or marker of a Float internal type, since
+   the limits are integers). A byte-field or string key or marker is compared for equality on
+   its bytes, read as a big-endian integer; one longer than 8 bytes is rejected. The agent then
+   needs no inverse conversion at runtime. A static TABLE-KEY (one that names a single
+   TABLE-ROW) is a constant: the frontend inlines the key bytes and the row's data and emits no
+   `Select`.
 6. **Counts and keys are ordinary fields decoded first.** ODX places the item count of a
    DYNAMIC-LENGTH-FIELD and the switch key of a MUX inside the complex DOP, at positions
    relative to it, and starts the items or the chosen case at a further offset (OFFSET, the MUX
@@ -95,7 +98,8 @@ Reading ISO 22901-1 against the old schema:
    and more than 65,536 decoded values in one message.
 8. **TEXTTABLE entries are ranges.** `TextEntry` holds `lower` and `upper` (inclusive) instead
    of one value, matching COMPU-SCALEs with differing limits. Entries keep their ODX order and
-   the first match wins.
+   the first match wins (7.3.6.6.1). The limits stay integers: open interval ends become closed
+   ones, and a TEXTTABLE on a Float internal value is rejected by the frontend.
 
 ## Consequences
 

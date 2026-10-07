@@ -44,9 +44,10 @@ rename, directory sync) and an append-only log of records.
    until it. A resume record closes the attempt it interrupted: that attempt takes no more
    blocks, exit marker, post-transfer progress or completion, since the steps that follow
    belong to the recovery, and only a new transfer-start marker opens a transfer again.
-4. **The folded state is the summary.** Reading the journal folds its records into
-   `RecoveryFacts`, which is also the checkpoint summary sent for handover, so the summary
-   carries the facts unchanged. Records that contradict the facts (a block outside a transfer, a
+4. **The folded state is the journal's part of the summary.** Reading the journal folds its
+   records into `RecoveryFacts`, which the checkpoint summary sent for handover carries
+   unchanged, next to what the job itself names (target VIN and ECU, the version being written,
+   the stage reached; design 8.2.5). Records that contradict the facts (a block outside a transfer, a
    second exit marker, a step that does not come after the last one, a pre-erase version after a
    transfer started, a resume count that does not count one more) are refused when committed and
    make a journal corrupt when read back. The hardware part number cannot change once a transfer

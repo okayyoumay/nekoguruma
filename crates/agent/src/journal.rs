@@ -4,8 +4,8 @@
 //! the completed steps, the last confirmed block, the ECU identity, the per-stage resume counts
 //! and the write-ahead intent markers. Each commit appends one checksummed frame and syncs the
 //! file before it returns, so a crash or a power loss leaves every commit that returned `Ok`
-//! readable. Reading the file back folds the records into [`RecoveryFacts`], which is also the
-//! checkpoint summary a handover carries.
+//! readable. Reading the file back folds the records into [`RecoveryFacts`], which a handover's
+//! checkpoint summary carries unchanged.
 //!
 //! Layout: the magic, the format version (`u32` LE), then frames of `len: u32 LE`,
 //! `crc32: u32 LE` and a postcard payload of `len` bytes. The first frame is the [`JobKey`]
@@ -54,8 +54,10 @@ pub struct StepRef {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct StageId(pub u32);
 
-/// What a restart, or a device that takes the job over, needs to know (ADR-229). It is both the
-/// state the journal folds its records into and the checkpoint summary sent for handover.
+/// What a restart, or a device that takes the job over, needs to know from the journal
+/// (ADR-229). It is the state the journal folds its records into, and the journal's part of the
+/// checkpoint summary sent for handover, carried unchanged; the summary adds what the job itself
+/// names (target VIN and ECU, the version being written, the stage reached; design 8.2.5).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecoveryFacts {
     pub key: JobKey,
@@ -478,6 +480,10 @@ impl<S: Store> Journal<S> {
         at: StepRef,
         vm_state: Option<&[u8]>,
     ) -> Result<(), JournalError> {
+        // Refused before it is copied: a state this large cannot fit a frame.
+        if vm_state.is_some_and(|state| state.len() > MAX_FRAME as usize) {
+            return Err(JournalError::TooLarge);
+        }
         self.commit(Record::Step {
             at,
             vm_state: vm_state.map(<[u8]>::to_vec),
@@ -1377,11 +1383,17 @@ mod tests {
     #[test]
     fn an_oversized_record_is_refused_without_poisoning() {
         let mut j = memory();
-        let blob = vec![0u8; MAX_FRAME as usize];
-        assert!(matches!(
-            j.commit_step(at(1, 1), Some(&blob)),
-            Err(JournalError::TooLarge)
-        ));
+        // Too large for a frame on its own, and too large once framed with its record.
+        for len in [MAX_FRAME as usize + 1, MAX_FRAME as usize] {
+            let blob = vec![0u8; len];
+            assert!(
+                matches!(
+                    j.commit_step(at(1, 1), Some(&blob)),
+                    Err(JournalError::TooLarge)
+                ),
+                "{len}"
+            );
+        }
         j.commit_step(at(1, 1), Some(b"vm"))
             .expect("a smaller one fits");
     }

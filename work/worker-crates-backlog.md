@@ -12,6 +12,7 @@ Most priorities here were set under the earlier scale these crates were develope
 
 - **P2**: `iso22900-mock`'s `PDUIoCtl` (`crates/iso22900-mock/src/lib.rs`) takes the IOCTL command ID as `T_PDU_IT`, while the header `crates/iso22900-sys/src/bindings/d_pdu_api_func.h` and the bindings' `DPduApiSys::PDUIoCtl` declare `UNUM32`. Both are 32-bit integers, so calls work, but `crates/iso22900-mock/tests/abi_parity.rs` has to check `PDUIoCtl` by layout instead of by signature. Done when: the mock's parameter is `UNUM32` (converted to `T_PDU_IT` inside where it is compared), `PDUIoCtl` is in that test's signature list and its layout-only test is removed.
 - **P2**: Document parallel-test constraints and recommended reset strategy.
+- **P2**: Pull-request CI never compiles `crates/iso22900-mock/tests/abi_parity.rs` for a target where the mock's `exported_fn!` picks `extern "stdcall"` (Windows x86): `core-windows` is x86_64 and `worker-check` in `.github/workflows/ci.yml` runs `cargo check` on the services without their tests, so a calling-convention drift between the mock and the `iso22900-sys` bindings there would merge unnoticed (it type-checked locally with `cargo check -p iso22900-mock --tests --target i686-pc-windows-gnullvm` when the test was added). Done when: `worker-check` (or another pull-request job) runs that command for `i686-pc-windows-gnullvm`.
 
 ## `iso22900-service`
 

@@ -10,6 +10,7 @@
 //! callback type is checked through `PDURegisterEventCallback`, whose
 //! parameter is the bindings' `CALLBACKFNC`.
 
+use std::collections::BTreeSet;
 use std::marker::PhantomData;
 
 use iso22900_sys::bindings::{DPduApiSys, T_PDU_IT, UNUM32};
@@ -24,11 +25,35 @@ fn field_type<F>(_field: fn(&DPduApiSys) -> F) -> PhantomData<F> {
 /// pointer type instead of `F` being inferred from the export.
 fn coerces_to<F>(_field: PhantomData<F>, _export: F) {}
 
+/// Checks each export and returns the names it checked.
 macro_rules! assert_parity {
     ($($name:ident),* $(,)?) => {{
         $(coerces_to(field_type(|api| api.$name), iso22900_mock::$name);)*
-        [$(stringify!($name)),*].len()
+        [$(stringify!($name)),*]
     }};
+}
+
+/// The C header the bindings are generated from. Bindgen generates a
+/// `DPduApiSys` entry point for every `PDU*` function it declares
+/// (`crates/iso22900-sys/build.rs`), so it lists every entry point.
+const API_HEADER: &str = include_str!("../../iso22900-sys/src/bindings/d_pdu_api_func.h");
+
+/// Names of the functions the header declares: each `PDU...` identifier
+/// directly followed by `(`.
+fn header_functions() -> BTreeSet<&'static str> {
+    let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let mut names = BTreeSet::new();
+    for (at, _) in API_HEADER.match_indices("PDU") {
+        if API_HEADER[..at].chars().next_back().is_some_and(ident) {
+            continue;
+        }
+        let rest = &API_HEADER[at..];
+        let len = rest.find(|c: char| !ident(c)).unwrap_or(rest.len());
+        if rest[len..].starts_with('(') {
+            names.insert(&rest[..len]);
+        }
+    }
+    names
 }
 
 #[test]
@@ -63,9 +88,13 @@ fn every_exported_function_matches_its_binding() {
         PDUModuleDisconnect,
         PDUGetTimestamp,
     );
-    // Every entry point of the bindings' `DPduApiSys` is listed above, except
-    // `PDUIoCtl` (next test).
-    assert_eq!(checked, 28);
+    let listed: BTreeSet<&str> = checked.iter().copied().collect();
+    assert_eq!(listed.len(), checked.len(), "a name is listed twice");
+    // Every function the header declares is checked, `PDUIoCtl` by the next
+    // test, so a new entry point cannot be left out.
+    let mut covered = listed;
+    covered.insert("PDUIoCtl");
+    assert_eq!(covered, header_functions());
 }
 
 /// `PDUIoCtl` is the one export that differs from its binding: the header

@@ -69,7 +69,8 @@ runner in M1.
    - `post_transfer_end_pc`: reaching it journals the post-transfer steps as complete.
 
    A plan's range is a region execution enters only at `entry_pc` and leaves only at
-   `post_transfer_end_pc`: it contains no call or return, nothing calls into it, nothing jumps
+   `post_transfer_end_pc`, and only at the top level: no subroutine can reach it, by jumping
+   or falling through. It contains no call or return, nothing calls into it, nothing jumps
    into it except to `entry_pc`, and nothing inside jumps out of it. Inside, no jump skips the
    erase or, after a routine-control erase, the RequestDownload, leaves the transfer backwards
    past the erase, or returns from the post-transfer steps to anything but the erase (a redone

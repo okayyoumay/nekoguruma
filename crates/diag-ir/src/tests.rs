@@ -2076,6 +2076,46 @@ fn transfer_data_must_follow_the_request_download() {
     }
 }
 
+/// A plan runs only at the top level: a subroutine that can reach it, by jumping or falling
+/// through, would return to its call site after the plan ran.
+#[test]
+fn a_subroutine_cannot_reach_a_plan() {
+    // The subroutine at 6 jumps to the plan's entry.
+    let program = flow_program(|c| {
+        c[6] = Op::Jump(0);
+        c[9] = Op::Call(6);
+    });
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::PlanInSubroutine {
+            flash_session: 1,
+            pc: 9
+        })
+    );
+    // A subroutine after the plan that returns without reaching it is fine.
+    let program = flow_program(|c| {
+        c[7] = Op::Ret;
+        c[9] = Op::Call(6);
+    });
+    assert_eq!(program.validate(), Ok(()));
+    // A subroutine before the plan that falls through into it.
+    let mut program = flow_program(|_| {});
+    program.code.insert(0, Op::Pop);
+    let b = &mut program.flash[0].boundaries;
+    b.entry_pc += 1;
+    b.erase_pc += 1;
+    b.transfer_exit_pc += 1;
+    b.post_transfer_end_pc += 1;
+    program.code[10] = Op::Call(0);
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::PlanInSubroutine {
+            flash_session: 1,
+            pc: 10
+        })
+    );
+}
+
 #[test]
 fn a_backward_jump_does_not_cross_the_recovery_point() {
     // FromPc(4): the jump at 4 back to the erase crosses it; a jump at 2 does not.

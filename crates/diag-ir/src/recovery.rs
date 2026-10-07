@@ -317,6 +317,10 @@ pub enum ProgramError {
     MissingRequestDownload { flash_session: u32 },
     #[error("flash session {flash_session}: the transfer at {pc} comes before the RequestDownload")]
     TransferBeforeRequestDownload { flash_session: u32, pc: u32 },
+    #[error(
+        "flash session {flash_session}: the subroutine called at {pc} can reach the plan; a plan runs only at the top level"
+    )]
+    PlanInSubroutine { flash_session: u32, pc: u32 },
 }
 
 fn is_erase(op: Option<&Op>) -> bool {
@@ -580,6 +584,32 @@ impl Program {
     /// The plan's range is a single-entry region whose stages follow in order: no call or
     /// return inside, no way in except at the entry, and jumps inside only where the stage they
     /// sit in allows.
+    /// Whether execution starting at `start` inside a subroutine can reach a pc for which
+    /// `target` holds, following fallthrough and jumps and stopping at a return. A call made on
+    /// the way returns to the next instruction, so it continues there.
+    fn reaches(&self, start: u32, target: &impl Fn(u32) -> bool) -> bool {
+        let mut seen = vec![false; self.code.len()];
+        let mut pending = vec![start];
+        while let Some(pc) = pending.pop() {
+            let Some(op) = self.code.get(pc as usize) else {
+                continue;
+            };
+            if std::mem::replace(&mut seen[pc as usize], true) {
+                continue;
+            }
+            if target(pc) {
+                return true;
+            }
+            match *op {
+                Op::Ret => {}
+                Op::Jump(to) => pending.push(to),
+                Op::JumpIfFalse(to) => pending.extend([to, pc + 1]),
+                _ => pending.push(pc + 1),
+            }
+        }
+        false
+    }
+
     fn validate_control_flow(&self, plan: &FlashRecovery) -> Result<(), ProgramError> {
         let flash_session = plan.flash_session;
         let b = &plan.boundaries;
@@ -631,6 +661,19 @@ impl Program {
                     }
                 }
                 _ => {}
+            }
+        }
+        // A plan runs only at the top level: no subroutine may reach it, by falling through or
+        // jumping. Its return would otherwise take execution back to the call site, before the
+        // recovery point, after the plan had run.
+        for (index, op) in self.code.iter().enumerate() {
+            if let Op::Call(target) = *op
+                && self.reaches(target, &inside)
+            {
+                return Err(ProgramError::PlanInSubroutine {
+                    flash_session,
+                    pc: index as u32,
+                });
             }
         }
         Ok(())

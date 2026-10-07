@@ -16,6 +16,10 @@ with no embedded NUL — is the consuming service's responsibility), and
 standalone service-manager runtime settings (`manager_config`, ADR-073 —
 `bind`/`root_path`/`ipc` (`ipc` added by ADR-226 for the local IPC listener
 endpoint) from the flat `[config.manager]` table, no priority hierarchy),
+the J2534 registration-definition directory (`j2534_definition_dir()`,
+ADR-228 — `/etc/nekoguruma/j2534` by default, fixed at build time through
+`NGR_J2534_DEFINITION_DIR` and resolved against the same fixed system
+directory as `system_config_dir()`, never against a `config-root-*` root),
 and a fixed, platform-specific system config directory
 (`system_config_dir()`, ADR-226 SS3 amendment — `%ProgramData%\vci-service-launcher`
 on Windows, `/private/etc/vci-service-launcher` on macOS,

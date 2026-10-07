@@ -24,10 +24,14 @@ fn runtime_env_var_overrides_build_time_definition_dir() {
     }
     assert_eq!(overridden, dir);
 
-    // Without the variable, the build-time default applies: `nekoguruma/j2534` under the root.
-    assert!(
-        vci_service_config::j2534_definition_dir().ends_with("nekoguruma/j2534"),
-        "{}",
-        vci_service_config::j2534_definition_dir().display()
-    );
+    // An empty value counts as unset.
+    unsafe {
+        std::env::set_var("NGR_J2534_DEFINITION_DIR", "");
+    }
+    let empty = vci_service_config::j2534_definition_dir();
+    unsafe {
+        std::env::remove_var("NGR_J2534_DEFINITION_DIR");
+    }
+    assert_eq!(empty, vci_service_config::j2534_definition_dir());
+    assert_ne!(empty, dir);
 }

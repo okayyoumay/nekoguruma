@@ -223,6 +223,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-232](ADR-232-linux-support-scope-and-minimum-glibc.md) | Linux Support Scope and Minimum glibc 2.17 | Accepted | design 2 / 7.1.2 / 12.1 / 17, `worker-linux` CI job |
 | [ADR-233](ADR-233-diag-ir-vm-execution-semantics.md) | diag-ir VM Execution Semantics | Accepted | `diag-ir` VM |
 | [ADR-234](ADR-234-sim-vci-flow-control-filter-model.md) | sim-vci Flow-Control Filter Model | Accepted | `sim-vci` filters, writes, reads, IOCTLs |
+| [ADR-235](ADR-235-agent-job-runner-and-worker-diag-host.md) | Agent Job Runner and the Worker-Backed DiagHost | Accepted | `agent` runner, host, link |
 | [ADR-236](ADR-236-time-series-scale-and-raw-response-storage.md) | Time-Series Scale and Raw-Response Storage | Accepted | design 4.3 / 4.6 / 10.3 / 17, `dataset_chunks.chunk_format` |
 | [ADR-237](ADR-237-regulatory-scope-access-routes-without-tool-certification.md) | Regulatory Scope: Use the Access Routes Regulations Open, Without Tool Certification | Accepted | design 8.1 / 9.2 / 16.1 / 16.2 / 17, `db/` retention |
 
@@ -272,7 +273,7 @@ ADR-109 (amended by ADR-113), ADR-113, ADR-119 (dual-implementation sync duty re
 ADR-057 (amended by ADR-102), ADR-120, ADR-143
 
 ### Write Jobs & Resume
-ADR-229, ADR-233
+ADR-229, ADR-233, ADR-235
 
 ### Acquired Data & Monitoring
 ADR-236

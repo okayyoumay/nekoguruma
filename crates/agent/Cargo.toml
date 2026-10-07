@@ -3,12 +3,22 @@ name = "agent"
 version.workspace = true
 edition.workspace = true
 
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "ngr-agent"
+path = "src/main.rs"
+
 [dependencies]
 shared-proto.workspace = true
 diag-ir.workspace = true
 vci-discovery.workspace = true
 worker-host.workspace = true
+vci-service-interface.workspace = true
 tokio.workspace = true
+tonic = "0.14.6"
 axum.workspace = true
 serde.workspace = true
+thiserror.workspace = true
 tracing.workspace = true

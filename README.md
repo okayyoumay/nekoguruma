@@ -20,7 +20,7 @@ Cargo workspace corresponding to the design document `docs/system-architecture.m
 | `j2534-defs` | ABI-independent J2534 constants, protocol names, COMPARAM mapping | 8.5 |
 | `vci-discovery` | Discovery of J2534 devices and D-PDU API implementations | 7.1 |
 | `server` | Web API, jobs, distribution management, GW | 3.2 |
-| `agent` | Discovery, job execution, journal | 3.3 |
+| `agent` | Discovery, job execution, journal; library plus the `ngr-agent` binary | 3.3 |
 | `worker-host` | ABI detection from the library header, launching worker services, authenticated gRPC client | 7.3 / 7.4 |
 | `iso22900*`, `j2534-0404*`, `vci-service-*` | J2534 / D-PDU API FFI, wrappers, discovery, mocks and the gRPC worker services (`docs/worker-crates.md`) | 3.4 / 7.1.2 / 7.4 |
 | `sim-vci` | cdylib exposing J2534 (mock) | 13.4 |

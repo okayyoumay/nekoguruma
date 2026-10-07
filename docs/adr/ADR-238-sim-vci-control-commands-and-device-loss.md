@@ -53,8 +53,9 @@ the J2534 API, as it would on a vendor library. So a test needs a channel into a
 - A test can arm any `sim_ecu::Fault`, reconnect the ECU and unplug the VCI through the worker;
   `tests/sim_vci_control.rs` in `j2534-0404-service` does each through the worker, including
   a disconnect while a link is open and the recovery that follows.
-- The control directory is read on every J2534 call while the variable is set. That costs one
-  directory listing per call, which only tests pay.
+- While the variable is set, the control directory is listed on every J2534 call and every
+  20 ms of a waiting `PassThruReadMsgs` (about 50 listings per second of waiting). Only tests
+  set the variable, so only they pay for it.
 - A VCI crash (firmware failure, as opposed to a pulled cable) is not simulated; it would need
   its own command once a test needs behaviour that differs from a disconnect.
 - The ECU still lives in the worker process, so a worker crash loses it; the control channel does

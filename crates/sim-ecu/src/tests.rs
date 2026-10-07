@@ -2182,6 +2182,25 @@ fn a_dropped_response_still_follows_its_response_pending_messages() {
 }
 
 #[test]
+fn response_pending_counts_are_capped_and_zero_sends_none() {
+    let mut ecu = SimEcu::new(config());
+    ecu.inject(Fault::ResponsePending {
+        count: u32::MAX,
+        interval_ms: 0,
+    });
+    let exchange = ecu.exchange(Addressing::Physical, &[0x3E, 0x00]);
+    assert_eq!(exchange.pending.len(), MAX_RESPONSE_PENDING as usize);
+    ecu.inject(Fault::ResponsePending {
+        count: 0,
+        interval_ms: 100,
+    });
+    let exchange = ecu.exchange(Addressing::Physical, &[0x3E, 0x00]);
+    assert!(exchange.pending.is_empty());
+    assert_eq!(exchange.delay_ms, 0);
+    assert!(ecu.armed_faults().is_empty());
+}
+
+#[test]
 fn response_pending_fault_parses_from_json() {
     let fault: Fault =
         serde_json::from_str(r#"{"response_pending": {"count": 2, "interval_ms": 300}}"#)

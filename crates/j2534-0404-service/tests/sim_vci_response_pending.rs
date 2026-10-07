@@ -1,10 +1,11 @@
 // Relies on the debug-only runtime VCI_CONFIG_PATH override; see ADR-073.
 #![cfg(debug_assertions)]
 //! Response pending (NRC 0x78) end to end: `sim-ecu` answers the agent's request with 0x78
-//! several times before the final response, and the worker absorbs the chain with the link
-//! settings the agent sets (`CP_RC78Handling`, `CP_RCByteOffset`, `CP_P2Star`,
-//! `CP_RC78CompletionTimeout`), so the procedure sees only the final response (ADR-235). A
-//! chain that outlasts the completion timeout ends the job with `NoResponse`.
+//! several times before the final response. The worker keeps the request open through the
+//! chain with the link settings the agent sets (`CP_RC78Handling`, `CP_RCByteOffset`,
+//! `CP_P2Star`, `CP_RC78CompletionTimeout`), and the agent host skips the 0x78s the worker
+//! passes on, so the procedure sees only the final response (ADR-235). A chain that outlasts
+//! the completion timeout ends the job with `NoResponse`.
 //!
 //! This file holds a single test, so the process-wide environment it sets for the spawned
 //! service cannot race with another test.
@@ -162,19 +163,20 @@ async fn jobs(control_dir: &Path) {
     let mut vin = vec![0x62, 0xF1, 0x90];
     vin.extend_from_slice(VIN);
 
-    // Four 0x78s, 400 ms apart: the final response comes 1.6 s after the request, past P2
-    // (1 s), so the job only gets it if the worker restarts its timer with P2* (5 s) on each
-    // 0x78. The chain stays inside the completion timeout (25 s), and the procedure gets only
-    // the VIN.
+    // Two 0x78s, 1.5 s apart, and the final response 1.5 s after the second: every gap is
+    // longer than P2 (1 s) and shorter than P2* (5 s), so the job only gets the VIN if the
+    // worker restarts its timer with P2* on each 0x78. The chain stays inside the completion
+    // timeout (25 s). The worker passes the 0x78s on as results, and the agent host skips
+    // them, so the procedure gets only the VIN.
     let config = LinkConfig::iso15765(0x7E0, 0x7E8);
-    arm_response_pending(control_dir, "001", 4, 400);
+    arm_response_pending(control_dir, "001", 2, 1_500);
     let start = Instant::now();
     let state = run(&client, &config)
         .await
         .expect("the job should get the final response");
     assert_eq!(state.stack, [Value::Bytes(vin.clone())], "{state:?}");
     assert!(
-        start.elapsed() >= Duration::from_millis(1_600),
+        start.elapsed() >= Duration::from_millis(3_000),
         "the final response follows the chain: {:?}",
         start.elapsed()
     );

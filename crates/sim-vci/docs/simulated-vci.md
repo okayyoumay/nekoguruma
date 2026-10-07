@@ -207,6 +207,7 @@ runs each step in its own process with a state file: one starts a download and e
 closing anything, the next reads the running transfer and the programming session (DIDs FD00
 and F186), and one started after tS3_Server reads the interrupted transfer in the default
 session. `tests/sim_vci_response_pending.rs` runs agent jobs through the worker
-while `sim-ecu` answers with response pending: a chain that ends after P2 still delivers only the
-final response to the procedure, because the worker restarts its timer with P2* on each 0x78, and
-a chain that outlasts the link's 0x78 completion timeout ends the job with `NoResponse`.
+while `sim-ecu` answers with response pending. In a chain whose gaps are longer than P2 and
+shorter than P2*, the job still gets the final response: the worker restarts its timer with P2*
+on each 0x78, and the agent host skips the 0x78s the worker passes on. A chain that outlasts the
+link's 0x78 completion timeout ends the job with `NoResponse`.

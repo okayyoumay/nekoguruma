@@ -58,6 +58,10 @@ pub const MAX_DIDS_PER_READ: usize = 8;
 /// Longest response the simulated transport can carry (ISO-TP on classical CAN).
 pub const MAX_RESPONSE_LENGTH: usize = 4095;
 
+/// Most response pending messages one [`Fault::ResponsePending`] sends; larger counts are
+/// capped, so a test cannot make the VCI side queue an unbounded chain.
+pub const MAX_RESPONSE_PENDING: u32 = 1_000;
+
 /// False sendKey attempts that activate the security delay timer.
 pub const MAX_SECURITY_ATTEMPTS: u8 = 3;
 
@@ -717,14 +721,15 @@ impl SimEcu {
             self.take_armed(|f| matches!(f, Fault::ResponsePending { .. }))
         {
             let sid = message[0];
-            for i in 0..count {
+            for i in 0..count.min(MAX_RESPONSE_PENDING) {
                 let at = delay_ms.saturating_add(interval_ms.saturating_mul(i));
                 pending.push((
                     at,
                     vec![NEGATIVE_RESPONSE_SID, sid, Nrc::ResponsePending as u8],
                 ));
             }
-            delay_ms = delay_ms.saturating_add(interval_ms.saturating_mul(count));
+            delay_ms = delay_ms
+                .saturating_add(interval_ms.saturating_mul(count.min(MAX_RESPONSE_PENDING)));
         }
         if dropped {
             // The request was handled; only its response is lost.
@@ -848,6 +853,7 @@ pub enum Fault {
     /// The next request the ECU answers gets `count` response pending messages (NRC 78) before
     /// its response: the first when the response was due, the others `interval_ms` apart, and
     /// the response `interval_ms` after the last. A request without a response (suppressed, or
-    /// not for this ECU to answer) leaves the fault armed.
+    /// not for this ECU to answer) leaves the fault armed. `count` is capped at
+    /// [`MAX_RESPONSE_PENDING`]; zero uses the fault up without sending any.
     ResponsePending { count: u32, interval_ms: u32 },
 }

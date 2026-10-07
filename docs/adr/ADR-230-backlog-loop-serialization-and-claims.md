@@ -1,7 +1,7 @@
 # ADR-230: Backlog Loop Runs One Item at a Time, with PR-Based Claims and Run State
 
 **Date:** 2026-10-05
-**Status:** Accepted
+**Status:** Accepted (Decision items 1-2's claim set extended to `codeql-alerts` PRs by ADR-243)
 **Affects:** `.claude/skills/backlog-loop/SKILL.md`, `.claude/skills/next-task/SKILL.md`, `scripts/classify-pr-risk.sh`
 
 ## Context

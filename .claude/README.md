@@ -132,6 +132,7 @@ Project skills live in `.claude/skills/`:
 | `backlog-triage` | Cleaning up the backlog; manual only (`/backlog-triage`) |
 | `pr-review-loop` | Driving the Copilot review cycle on a PR Claude opened, up to handing it to the maintainer |
 | `backlog-loop` | Working through the backlog one item and one PR at a time, waiting for the maintainer's merge between items; manual only |
+| `codeql-alerts` | Fixing open CodeQL code scanning alerts one alert and one PR at a time, from the alert list the CodeQL alert hand-off workflow sends to its routine |
 
 Skills run in the main conversation at the session model. Where an agent covers the same ground
 (build/test sweeps, doc-sync audits, verification), prefer the agent.

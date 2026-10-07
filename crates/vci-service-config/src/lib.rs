@@ -335,7 +335,8 @@ fn config_file_path() -> PathBuf {
     // Path to the config file: either relative to the selected root, or an
     // absolute path that bypasses root resolution entirely. Defaults to the
     // build-time value embedded via VCI_CONFIG_PATH (default:
-    // "vci-service-launcher/config.toml"). In debug builds only
+    // "nekoguruma/config.toml", so `/etc/nekoguruma/config.toml` on Linux,
+    // ADR-228). In debug builds only
     // (`debug_assertions`, see ADR-073), a runtime VCI_CONFIG_PATH
     // environment variable takes precedence when set, letting IDE debug
     // launch configurations (see .vscode/launch.json) point at a dedicated
@@ -348,6 +349,23 @@ fn config_file_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(CONFIG_PATH));
     #[cfg(not(debug_assertions))]
     let path = PathBuf::from(CONFIG_PATH);
+    resolve_config_path(&path)
+}
+
+/// Directory of the J2534 registration definitions on Linux (design 7.1.1): one file per VCI,
+/// written by the administrator. Fixed at build time like the configuration file (ADR-228):
+/// `NGR_J2534_DEFINITION_DIR` at build time, relative to the selected root (default
+/// `nekoguruma/j2534`, so `/etc/nekoguruma/j2534` on Linux) or absolute. In debug builds only
+/// (ADR-073), a runtime `NGR_J2534_DEFINITION_DIR` takes precedence, so tests can point it at a
+/// directory of their own; release builds read no environment variable here.
+pub fn j2534_definition_dir() -> PathBuf {
+    const DEFINITION_DIR: &str = env!("NGR_J2534_DEFINITION_DIR");
+    #[cfg(debug_assertions)]
+    let path = std::env::var_os("NGR_J2534_DEFINITION_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFINITION_DIR));
+    #[cfg(not(debug_assertions))]
+    let path = PathBuf::from(DEFINITION_DIR);
     resolve_config_path(&path)
 }
 
@@ -401,10 +419,11 @@ fn config_root_impl() -> PathBuf {
     windows_known_folder_root()
 }
 
-/// Non-Windows without `config-root-exe-dir`: filesystem root `/`.
+/// Non-Windows without `config-root-exe-dir`: `/etc`, writable by the administrator only
+/// (ADR-228).
 #[cfg(all(not(windows), not(feature = "config-root-exe-dir")))]
 fn config_root_impl() -> PathBuf {
-    PathBuf::from("/")
+    PathBuf::from("/etc")
 }
 
 // ── Windows known-folder helper ───────────────────────────────────────────────
@@ -1133,7 +1152,7 @@ pub fn manager_config() -> ManagerConfig {
 /// admin-oriented Windows option isn't even any better: applying that same
 /// check to an ordinary path under `config_root()`'s other two Windows
 /// options (`FOLDERID_ProgramFiles`/`FOLDERID_ProgramFilesX86`) or its
-/// non-Windows default (the bare filesystem root `/`) also fails, for a
+/// non-Windows default root (`/etc`, before ADR-228 the bare filesystem root `/`) also fails, for a
 /// second, independent reason unrelated to which folder was picked -- see
 /// `vci-service-manager`'s own Windows `AccessCheck` mask fix (ADR-226 SS3
 /// amendment) and its macOS residual (`/` is a sealed, read-only system
@@ -1297,6 +1316,29 @@ mod tests {
         // Without an arch match (arch=None), falls through to priority 3 (api+lib).
         let no_arch = find_logging_config("iso22900", None, "mylib");
         assert_eq!(no_arch.level.as_deref(), Some("debug"));
+    }
+
+    /// The release defaults: both files under `nekoguruma` in the root, so
+    /// `/etc/nekoguruma/...` on Linux (ADR-228).
+    #[test]
+    fn default_locations_are_under_nekoguruma_in_the_root() {
+        assert_eq!(env!("VCI_CONFIG_PATH"), "nekoguruma/config.toml");
+        assert_eq!(env!("NGR_J2534_DEFINITION_DIR"), "nekoguruma/j2534");
+        let root = Path::new("/some/root");
+        let _guard = test_support::set(root);
+        // Unless a debug run overrides them, the files resolve under the root.
+        if std::env::var_os("VCI_CONFIG_PATH").is_none() {
+            assert_eq!(config_file_path(), root.join("nekoguruma/config.toml"));
+        }
+        if std::env::var_os("NGR_J2534_DEFINITION_DIR").is_none() {
+            assert_eq!(j2534_definition_dir(), root.join("nekoguruma/j2534"));
+        }
+    }
+
+    #[cfg(all(not(windows), not(feature = "config-root-exe-dir")))]
+    #[test]
+    fn the_linux_root_is_etc() {
+        assert_eq!(config_root_impl(), PathBuf::from("/etc"));
     }
 
     #[test]

@@ -83,9 +83,12 @@ configuration, not a running service.
   exactly as they existed in `vci-service-launcher` before extraction, since
   `iso22900-service` and `j2534-0404-service` forward
   them by name in their own `Cargo.toml`.
-- Preserve the default `VCI_CONFIG_PATH` build-time value
-  (`vci-service-launcher/config.toml`) and the deployed file locations
-  (`%ProgramData%\vci-service-launcher\config.toml`,
-  `/etc/vci-service-launcher/config.toml`) — these describe an existing
-  on-disk deployment layout, not this crate's name, and changing them would
-  break already-deployed installs.
+- The default `VCI_CONFIG_PATH` build-time value is `nekoguruma/config.toml`,
+  resolved against `/etc` on Linux and the selected known folder on Windows
+  (`%ProgramData%\nekoguruma\config.toml` by default), the fixed,
+  administrator-only locations of ADR-228. The registration-definition
+  directory (`j2534_definition_dir()`, `NGR_J2534_DEFINITION_DIR`, default
+  `nekoguruma/j2534`) is fixed the same way. Each has a runtime override in
+  debug builds only (ADR-073). Before ADR-228 the default was
+  `vci-service-launcher/config.toml`, which the Linux root `/` turned into
+  `/vci-service-launcher/config.toml`.

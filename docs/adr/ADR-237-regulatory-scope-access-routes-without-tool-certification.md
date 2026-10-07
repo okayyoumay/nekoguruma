@@ -23,8 +23,9 @@ obligations on vehicle makers or on repair and inspection businesses, not on dia
 - **European Union.** Regulation (EU) 2018/858, Annex X (amended by Delegated Regulation (EU)
   2021/1244), requires makers to give independent operators non-discriminatory access to OBD
   data and repair and maintenance information (RMI), including diagnosis and reprogramming with
-  standard pass-thru interfaces. Delegated Regulation (EU) 2026/699 (in force since June 2026,
-  with obligations phased in until 2028) adds an appendix to Annex X that lets makers protect OBD
+  standard pass-thru interfaces. Delegated Regulation (EU) 2026/699 (in force since June 2026;
+  its secure-access rules apply from then, and only some of the makers' information-provision
+  duties are staged until 2028) adds an appendix to Annex X that lets makers protect OBD
   and on-board access with security measures such as a secure gateway. Within limits it sets, a
   maker may authenticate the diagnostic tool and its manufacturer, the independent operator when
   the access changes the vehicle, and in some cases the employee; standardized access to OBD data

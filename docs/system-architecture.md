@@ -1429,7 +1429,7 @@ A configuration that is always connected and acts on remote instructions may rai
 
 #### Regulatory Scope
 
-Vehicle regulations place their obligations on vehicle makers and on repair and inspection businesses. The system uses the access routes those regulations require makers to open, and is not certified as a regulated inspection tool (ADR-237).
+Vehicle regulations place their obligations on vehicle makers and on repair and inspection businesses, and on a tool maker only when it seeks approval as a regulated inspection tool, which this decision excludes. The system uses the access routes those regulations require makers to open, and is not certified as a regulated inspection tool (ADR-237).
 
 | Regulation | Obligation on | How the system relates |
 |---|---|---|

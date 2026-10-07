@@ -39,7 +39,7 @@ macro_rules! assert_parity {
 const API_HEADER: &str = include_str!("../../iso22900-sys/src/bindings/d_pdu_api_func.h");
 
 /// Names of the functions the header declares: each `PDU...` identifier
-/// directly followed by `(`.
+/// followed by `(`, with or without whitespace in between.
 fn header_functions() -> BTreeSet<&'static str> {
     let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
     let mut names = BTreeSet::new();
@@ -49,7 +49,7 @@ fn header_functions() -> BTreeSet<&'static str> {
         }
         let rest = &API_HEADER[at..];
         let len = rest.find(|c: char| !ident(c)).unwrap_or(rest.len());
-        if rest[len..].starts_with('(') {
+        if rest[len..].trim_start().starts_with('(') {
             names.insert(&rest[..len]);
         }
     }

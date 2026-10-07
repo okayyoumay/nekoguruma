@@ -225,10 +225,17 @@ fn disconnecting_the_module_frees_its_callbacks() {
     assert_eq!(calls(&a), 0);
 }
 
-/// Forces the interleaving the race test can only hope for: a callback is
-/// running on one thread when another thread unregisters it. The unregister
-/// must wait for the callback to return, and then drop the closure, so a
-/// closure is never freed while it runs.
+/// Holds a callback inside its delivery on one thread while another thread
+/// unregisters it: the unregister must wait for the callback to return, and
+/// only then drop the closure, so a closure is never freed while it runs.
+///
+/// The callback stays blocked until the unregistering thread has reported
+/// that it is calling `unregister_event_callback`, and for `STILL_BLOCKED`
+/// after that, so the unregister has reached the callback registry's lock
+/// before the callback returns unless that thread is descheduled between the
+/// report and the lock for the whole window. Proving that it waits at the
+/// lock itself would need a hook inside the wrapper; the assertions hold
+/// either way, so the test never fails spuriously.
 #[test]
 fn unregistering_during_a_delivery_waits_for_the_callback_to_return() {
     let f = Fixture::new();
@@ -255,11 +262,13 @@ fn unregistering_during_a_delivery_waits_for_the_callback_to_return() {
         .recv_timeout(DEADLINE)
         .expect("the callback should be called");
 
+    let (calling_tx, calling_rx) = mpsc::channel();
     let (unregistered_tx, unregistered_rx) = mpsc::channel();
     let unregisterer = {
         let api = Arc::clone(&f.api);
         let (module, link) = (f.module, f.link);
         thread::spawn(move || {
+            calling_tx.send(()).expect("the test should be waiting");
             api.unregister_event_callback(module, link)
                 .expect("unregistering should succeed");
             unregistered_tx
@@ -267,6 +276,9 @@ fn unregistering_during_a_delivery_waits_for_the_callback_to_return() {
                 .expect("the test should be waiting");
         })
     };
+    calling_rx
+        .recv_timeout(DEADLINE)
+        .expect("the unregistering thread should start");
     assert!(
         unregistered_rx.recv_timeout(STILL_BLOCKED).is_err(),
         "unregistering should wait while the callback runs"

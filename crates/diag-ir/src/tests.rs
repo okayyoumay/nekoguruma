@@ -1617,11 +1617,88 @@ fn download_instructions_belong_to_a_transfer_range() {
             program.validate(),
             Err(ProgramError::DownloadOutsidePlan { pc: 4 })
         );
-        // Between erase and transfer exit.
+        // Between erase and transfer exit, where only the declared exit may be a
+        // RequestTransferExit.
         let mut program = recovery_program();
+        let exit = op == Op::ServiceRequest { service: 0x37 };
         program.code[2] = op;
-        assert_eq!(program.validate(), Ok(()));
+        if exit {
+            assert_eq!(
+                program.validate(),
+                Err(ProgramError::UndeclaredTransferBoundary {
+                    flash_session: 1,
+                    pc: 2
+                })
+            );
+        } else {
+            assert_eq!(program.validate(), Ok(()));
+        }
     }
+}
+
+/// The journal's markers guard only the declared boundaries, so a plan holds one
+/// RequestDownload and one RequestTransferExit.
+#[test]
+fn a_plan_holds_one_request_download_and_one_transfer_exit() {
+    // A second RequestDownload after the one that follows the erase.
+    let mut program = recovery_program();
+    program.code[2] = Op::ServiceRequest { service: 0x34 };
+    assert_eq!(program.validate(), Ok(()));
+    program.code[1] = Op::ServiceRequest { service: 0x34 };
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::UndeclaredTransferBoundary {
+            flash_session: 1,
+            pc: 2
+        })
+    );
+    // A RequestTransferExit before the declared one.
+    let mut program = recovery_program();
+    program.code[2] = Op::ServiceRequest { service: 0x37 };
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::UndeclaredTransferBoundary {
+            flash_session: 1,
+            pc: 2
+        })
+    );
+}
+
+/// A reversed or out-of-code section would read as empty in the overlap checks.
+#[test]
+fn sections_must_lie_in_the_code_in_order() {
+    for (start_pc, end_pc) in [(3, 2), (0, 11)] {
+        let mut program = recovery_program();
+        program.sections.push(Section {
+            start_pc,
+            end_pc,
+            interruptible: Interruptible::RecoveryRequired,
+            idempotency: Idempotency::Safe,
+            expected_millis: 0,
+        });
+        assert_eq!(
+            program.validate(),
+            Err(ProgramError::InvalidSection { section: 0 }),
+            "{start_pc}..{end_pc}"
+        );
+    }
+}
+
+/// Every declared precondition is checked before the procedure starts, so it needs a
+/// default-session source even when no plan allows a restart.
+#[test]
+fn a_declared_precondition_needs_a_default_session_source() {
+    let mut program = prog(vec![Op::Pop], Vec::new());
+    program.preconditions.engine = Some(precondition(None, Some(SVC)));
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::UnmappedPrecondition {
+            kind: PreconditionKind::Engine,
+            session: SessionKind::Default
+        })
+    );
+    program.preconditions.engine = Some(precondition(Some(SVC), None));
+    assert_eq!(program.validate(), Ok(()));
 }
 
 #[test]

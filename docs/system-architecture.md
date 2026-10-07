@@ -949,7 +949,7 @@ Operation with multiple VCIs connected to a single device, handling multiple veh
 
 ### 8.9 Execution Preconditions and Safety Guards
 
-Procedure definitions in the IR declaratively carry **execution preconditions**, which the runtime verifies before execution. Each precondition names its source per session (an ECU service field or a runtime input) and the values that satisfy it, in the procedure part (ADR-245). If they are not met, execution does not proceed and the reason is displayed. Since conditions are part of the sequence definition, they can be added per vehicle model via extensions.
+Procedure definitions in the IR declaratively carry **execution preconditions**, which the runtime verifies before execution. Each precondition names the values that satisfy it and its source (an ECU service field or a runtime input) for the default session, plus one for the programming session when a restart can check it again there, in the procedure part (ADR-245). If they are not met, execution does not proceed and the reason is displayed. Since conditions are part of the sequence definition, they can be added per vehicle model via extensions.
 
 - Zero vehicle speed, park state, engine off, minimum battery voltage, etc.
 - Compliance with SAE J3138 (guidelines on the impact of diagnostic tools on vehicle networks) is ensured here

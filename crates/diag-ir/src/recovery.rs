@@ -206,7 +206,8 @@ pub struct RecoveryBoundaries {
 pub struct RecoveryTiming {
     /// How long the ECU keeps the session alive without traffic.
     pub session_timeout_millis: u32,
-    /// Time kept back from the session timeout for tearing the session down.
+    /// Time added after the session timeout before a passive teardown is confirmed, so the
+    /// ECU's session has certainly expired (ADR-229). Never subtracted from the timeout.
     pub teardown_margin_millis: u32,
     /// How long the ECU takes to answer again after a reset.
     pub ecu_startup_millis: u32,
@@ -299,6 +300,12 @@ pub enum ProgramError {
     MissingSessionTimeout { flash_session: u32 },
     #[error("flash session {flash_session}: the resume limit is zero")]
     ZeroResumeLimit { flash_session: u32 },
+    #[error("section {section} does not lie within the code with its start before its end")]
+    InvalidSection { section: usize },
+    #[error(
+        "flash session {flash_session}: instruction {pc} is a second RequestDownload or a RequestTransferExit the plan does not declare"
+    )]
+    UndeclaredTransferBoundary { flash_session: u32, pc: u32 },
 }
 
 fn is_erase(op: Option<&Op>) -> bool {
@@ -340,6 +347,12 @@ impl Program {
     /// when some plan allows a restart ([`FlashRecovery::allows_restart`]); a program whose
     /// plans never allow one is not asked for what only a restart reads.
     pub fn validate(&self) -> Result<(), ProgramError> {
+        // The overlap checks below would read a reversed section as empty.
+        for (section, s) in self.sections.iter().enumerate() {
+            if s.start_pc > s.end_pc || s.end_pc as usize > self.code.len() {
+                return Err(ProgramError::InvalidSection { section });
+            }
+        }
         for (index, plan) in self.flash.iter().enumerate() {
             self.validate_plan(plan)?;
             for other in &self.flash[..index] {
@@ -409,6 +422,14 @@ impl Program {
                 (SessionKind::Default, precondition.default_session),
                 (SessionKind::Programming, precondition.programming_session),
             ];
+            // Every declared precondition is checked before the procedure starts, in the
+            // default session; the programming-session source is read only by a restart.
+            if precondition.default_session.is_none() {
+                return Err(ProgramError::UnmappedPrecondition {
+                    kind,
+                    session: SessionKind::Default,
+                });
+            }
             for (session, source) in sessions {
                 match source {
                     Some(Source::RuntimeInput(input)) if !input.reports(kind) => {
@@ -477,6 +498,22 @@ impl Program {
                 flash_session,
                 pc: b.transfer_exit_pc,
             });
+        }
+        // One RequestDownload and one RequestTransferExit per plan: the journal's markers
+        // guard only the declared boundaries.
+        let mut downloads = 0;
+        for pc in b.erase_pc..=b.transfer_exit_pc {
+            let undeclared = match self.code[pc as usize] {
+                Op::ServiceRequest { service: 0x34 } => {
+                    downloads += 1;
+                    downloads > 1
+                }
+                Op::ServiceRequest { service: 0x37 } => pc != b.transfer_exit_pc,
+                _ => false,
+            };
+            if undeclared {
+                return Err(ProgramError::UndeclaredTransferBoundary { flash_session, pc });
+            }
         }
         if let Some(NoApplication::Nrc(nrc @ (0x00 | 0x78))) = plan.no_application {
             return Err(ProgramError::InvalidNoApplicationNrc { flash_session, nrc });

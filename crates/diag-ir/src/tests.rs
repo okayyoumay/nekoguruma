@@ -1995,6 +1995,54 @@ fn a_jump_after_the_exit_redoes_the_transfer_or_goes_on() {
     }
 }
 
+/// A call from at or after the recovery point back before it would run the plan again before
+/// the point, so it is refused like a backward jump.
+#[test]
+fn a_backward_call_does_not_cross_the_recovery_point() {
+    let mut program = flow_program(|c| c[7] = Op::Call(0));
+    program.flash[0].recovery_required = RecoveryRequired::FromPc(4);
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::BackwardJumpAcrossRecovery {
+            flash_session: 1,
+            pc: 7
+        })
+    );
+    // Without a recovery point the same call is only refused for entering the plan.
+    let program = flow_program(|c| c[7] = Op::Call(0));
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::ControlFlowIntoPlan {
+            flash_session: 1,
+            pc: 7
+        })
+    );
+}
+
+/// Between a routine-control erase and the RequestDownload after it, a jump may not land
+/// past the RequestDownload: RequestTransferExit would follow an erase with no download.
+#[test]
+fn a_jump_after_the_erase_cannot_skip_the_request_download() {
+    let program_with = |jump: u32| {
+        let mut program = flow_program(|c| {
+            c[2] = Op::Jump(jump);
+            c[3] = Op::ServiceRequest { service: 0x34 };
+            c[4] = Op::ServiceRequest { service: 0x37 };
+        });
+        program.flash[0].boundaries.transfer_exit_pc = 4;
+        program
+    };
+    assert_eq!(
+        program_with(4).validate(),
+        Err(ProgramError::JumpOutOfRecovery {
+            flash_session: 1,
+            pc: 2
+        })
+    );
+    assert_eq!(program_with(3).validate(), Ok(()));
+    assert_eq!(program_with(1).validate(), Ok(()));
+}
+
 #[test]
 fn a_backward_jump_does_not_cross_the_recovery_point() {
     // FromPc(4): the jump at 4 back to the erase crosses it; a jump at 2 does not.

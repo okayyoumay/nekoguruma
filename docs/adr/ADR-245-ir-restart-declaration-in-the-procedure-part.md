@@ -69,13 +69,14 @@ runner in M1.
    - `post_transfer_end_pc`: reaching it journals the post-transfer steps as complete.
 
    A plan's range is a region execution enters only at `entry_pc` and leaves only at
-   `post_transfer_end_pc`: it contains no call or return, nothing jumps or calls into it
-   except to `entry_pc`, and nothing inside jumps out of it. Inside, no jump skips the erase,
-   leaves the transfer backwards past the erase, returns from the post-transfer steps to
-   anything but the erase (a redone transfer), or crosses the recovery-required point
-   backwards. So every erase passes its transfer-start marker, every RequestTransferExit its
-   own marker, every run reaches the end boundary, and a position orders the interruption
-   point as the journal's step count does.
+   `post_transfer_end_pc`: it contains no call or return, nothing calls into it, nothing jumps
+   into it except to `entry_pc`, and nothing inside jumps out of it. Inside, no jump skips the
+   erase or, after a routine-control erase, the RequestDownload, leaves the transfer backwards
+   past the erase, or returns from the post-transfer steps to anything but the erase (a redone
+   transfer). No jump or call anywhere crosses the recovery-required point backwards. So every
+   erase passes its transfer-start marker, every RequestTransferExit its own marker, every run
+   reaches the end boundary, and a position orders the interruption point as the journal's
+   step count does.
 5. **Resume limit per stage.** Each plan names the journal stage it counts against (ADR-244)
    and that stage's limit. `VmState` loses `checkpoint` and `resume_count`, which the journal
    owns (ADR-244 item 6, ADR-233 item 3).

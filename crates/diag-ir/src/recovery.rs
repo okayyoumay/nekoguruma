@@ -260,7 +260,9 @@ pub enum ProgramError {
     ContradictoryInterruptibility { flash_session: u32, section: usize },
     #[error("flash session {flash_session}: the jump at {pc} leaves the recovery range backwards")]
     JumpOutOfRecovery { flash_session: u32, pc: u32 },
-    #[error("flash session {flash_session}: the jump at {pc} crosses the recovery point backwards")]
+    #[error(
+        "flash session {flash_session}: the jump or call at {pc} crosses the recovery point backwards"
+    )]
     BackwardJumpAcrossRecovery { flash_session: u32, pc: u32 },
     #[error("flash session {flash_session}: the call or return at {pc} is inside the plan")]
     CallOrReturnInPlan { flash_session: u32, pc: u32 },
@@ -572,9 +574,22 @@ impl Program {
         let flash_session = plan.flash_session;
         let b = &plan.boundaries;
         let inside = |pc: u32| (b.entry_pc..b.post_transfer_end_pc).contains(&pc);
+        // The plan's one RequestDownload (`validate_plan` checks there is exactly one).
+        let download_pc = (b.erase_pc..=b.transfer_exit_pc)
+            .find(|&pc| matches!(self.code[pc as usize], Op::ServiceRequest { service: 0x34 }))
+            .unwrap_or(b.erase_pc);
         for (index, op) in self.code.iter().enumerate() {
             let pc = index as u32;
             let from_inside = inside(pc);
+            // Neither a jump nor a call may take execution from at or after the recovery
+            // point back before it: the pc would no longer order the interruption point.
+            if let Op::Jump(target) | Op::JumpIfFalse(target) | Op::Call(target) = *op
+                && let RecoveryRequired::FromPc(from) = plan.recovery_required
+                && pc >= from
+                && target < from
+            {
+                return Err(ProgramError::BackwardJumpAcrossRecovery { flash_session, pc });
+            }
             match *op {
                 Op::Call(_) | Op::Ret if from_inside => {
                     return Err(ProgramError::CallOrReturnInPlan { flash_session, pc });
@@ -590,6 +605,10 @@ impl Program {
                     } else {
                         let allowed = if pc < b.erase_pc {
                             target >= b.entry_pc && target <= b.erase_pc
+                        } else if pc < download_pc {
+                            // Between an erase and the RequestDownload after it, a jump may
+                            // not skip the RequestDownload.
+                            target >= b.erase_pc && target <= download_pc
                         } else if pc < b.transfer_exit_pc {
                             target >= b.erase_pc && target <= b.transfer_exit_pc
                         } else {
@@ -599,12 +618,6 @@ impl Program {
                         if !allowed {
                             return Err(ProgramError::JumpOutOfRecovery { flash_session, pc });
                         }
-                    }
-                    if let RecoveryRequired::FromPc(from) = plan.recovery_required
-                        && pc >= from
-                        && target < from
-                    {
-                        return Err(ProgramError::BackwardJumpAcrossRecovery { flash_session, pc });
                     }
                 }
                 _ => {}

@@ -1007,7 +1007,8 @@ fn a_vci_unplugged_while_closed_only_fails_the_open_until_plugged_back() {
         unsafe { PassThruOpen(ptr::null(), &mut device) },
         ERR_DEVICE_NOT_CONNECTED
     );
-    // With no device open, the other calls fail as they do for any closed device.
+    // With no device open, calls that take a device or channel ID fail as they do for any
+    // closed device.
     assert_eq!(PassThruClose(DEVICE_ID), ERR_INVALID_DEVICE_ID);
     assert_eq!(PassThruDisconnect(f.channel), ERR_INVALID_CHANNEL_ID);
     assert_eq!(control(r#"{"command": "connect_vci"}"#), STATUS_NOERROR);

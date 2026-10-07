@@ -39,9 +39,10 @@ the J2534 API, as it would on a vendor library. So a test needs a channel into a
    a waiting read ends with it. The device stays lost after the VCI is plugged back in, until
    `PassThruClose` on that device, which releases it and still reports the error. The next
    `PassThruOpen` then returns a new device ID. With no device open there is nothing to lose:
-   an unplugged VCI only makes `PassThruOpen` fail, and the other calls answer as for any
-   closed device (`ERR_INVALID_DEVICE_ID`, `ERR_INVALID_CHANNEL_ID`, clause 7.2.1), so the
-   error is not sticky there and the open succeeds once the VCI is back.
+   an unplugged VCI only makes `PassThruOpen` fail, and the other calls answer as they do with
+   no device open (calls that take a device or channel ID get `ERR_INVALID_DEVICE_ID` or
+   `ERR_INVALID_CHANNEL_ID`, clause 7.2.1), so the error is not sticky there and the open
+   succeeds once the VCI is back.
    The ECU behind the VCI keeps its state through all of this, as a vehicle does when the
    tester's cable is pulled.
 

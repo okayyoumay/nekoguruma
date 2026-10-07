@@ -139,7 +139,9 @@ Following clause 6.10.1, the device stays lost after the VCI is plugged back in,
 `PassThruClose` on that device, which releases it (with its channels and unread responses) and
 still reports the error. The next `PassThruOpen` returns a new device ID. With no device open,
 an unplugged VCI only makes `PassThruOpen` fail with `ERR_DEVICE_NOT_CONNECTED`; the other calls
-fail as they do for any closed device, and the open succeeds once the VCI is back. The ECU keeps
+answer as they do with no device open (a device or channel ID gets `ERR_INVALID_DEVICE_ID` or
+`ERR_INVALID_CHANNEL_ID`, while an IOCTL the simulator ignores and `PassThruGetLastError` still
+succeed), and the open succeeds once the VCI is back. The ECU keeps
 its state throughout.
 
 A VCI crash, as opposed to a disconnect, is not simulated.

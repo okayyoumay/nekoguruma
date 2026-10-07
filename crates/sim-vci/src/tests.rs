@@ -1217,11 +1217,12 @@ fn a_write_to_an_unknown_channel_reports_nothing_sent() {
 }
 
 #[test]
-fn a_control_file_being_applied_is_not_applied_again() {
+fn a_leftover_claimed_file_is_not_picked_up() {
     let f = fixture();
     let dir = ControlDir::new("claim");
     // A file left in its claimed state, as when deleting it after applying failed, is not
-    // picked up again.
+    // scanned again. (That the claim happens before the apply is checked by the test with a
+    // blocked claim.)
     std::fs::write(
         dir.0.join("001.applying"),
         r#"{"command": "inject_fault", "fault": "power_loss"}"#,

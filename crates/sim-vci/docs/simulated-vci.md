@@ -20,9 +20,10 @@ below refer to SAE J2534-1 (v04.04).
   every channel together with its filters and unread responses; `PassThruDisconnect` drops one.
 - All 14 J2534 v04.04 functions are exported (with the control function `NgrSimVciControl`,
   "Control" below), so `j2534-0404-service` loads the library like a vendor's on the targets
-  where the exports' calling convention matches; the end-to-end test runs on the host target. On Windows x86 the exports still use the C calling convention, not the
-  stdcall a vendor DLL uses there, so the service cannot load that build yet. `PassThruReadVersion` reports firmware `NGR-SIM 1.0`, DLL `sim-vci <crate version>`
-  and API `04.04` on an open device. `PassThruGetLastError` always reports a fixed text: the
+  where the exports' calling convention matches; the end-to-end test runs on the host target.
+  On Windows x86 the exports still use the C calling convention, not the stdcall a vendor DLL
+  uses there, so the service cannot load that build yet. `PassThruReadVersion` reports firmware
+  `NGR-SIM 1.0`, DLL `sim-vci <crate version>` and API `04.04` on an open device. `PassThruGetLastError` always reports a fixed text: the
   simulator keeps no error descriptions. `PassThruSetProgrammingVoltage` drives nothing but keeps
   track of the pins by the rules of clause 7.2.11: 5 to 20 V on one of pins 0, 6, 9 and 11 to 14
   at a time (switch it off before using another pin), pin 15 shorted to ground only
@@ -126,8 +127,8 @@ as the first `PassThruOpen` does. There are two ways to send one:
   except `PassThruGetLastError`, and every 20 ms while `PassThruReadMsgs` waits,
   `sim-vci` applies the `*.json` files there in file-name order. It claims each file by renaming
   it to `*.applying` before reading it, so a command is applied at most once (a file it cannot
-  claim is tried again at the next call, and the files after it wait until it is applied), and deletes it once applied; a file it cannot read,
-  parse or apply is renamed to `*.rejected`. Write each file as UTF-8 without a byte-order mark,
+  claim is tried again at the next call, and the files after it wait until it is applied), and
+  deletes it once applied; a file it cannot read, parse or apply is renamed to `*.rejected`. Write each file as UTF-8 without a byte-order mark,
   under another name (such as `*.tmp`), and rename it when complete, so it is never read
   half-written. Name the files so that their order is the order to apply them in (`001.json`,
   `002.json`, ...).

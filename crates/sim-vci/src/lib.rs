@@ -407,8 +407,9 @@ impl Bus {
     /// Applies the `*.json` command files in the control directory, in file-name order. Each
     /// file is claimed by renaming it to `*.applying` first, so a command is applied at most
     /// once even if the file cannot be deleted afterwards; a file that cannot be claimed is
-    /// left for a later call, and the files after it wait with it. A file applied is deleted; one that cannot be read, parsed or
-    /// applied is renamed to `*.rejected`, so the test can see it failed.
+    /// left for a later call, and the files after it wait with it. A file applied is deleted;
+    /// one that cannot be read, parsed or applied is renamed to `*.rejected`, so the test can
+    /// see it failed.
     fn apply_control_files(&mut self) {
         let Some(dir) = &self.control_dir else {
             return;
@@ -583,8 +584,8 @@ pub unsafe extern "C" fn NgrSimVciControl(command: *const c_char) -> PassThruUlo
     else {
         return ERR_FAILED;
     };
-    // The control directory is left for the next J2534 call, so the two ways in never reorder
-    // each other's commands.
+    // The command takes effect now; the control directory is left for the next J2534 call. The
+    // two ways in are not ordered against each other.
     match lock_bus().apply(command) {
         Ok(()) => STATUS_NOERROR,
         Err(status) => status,

@@ -80,6 +80,9 @@ fn read_vin() -> Program {
         constants: vec![vec![0xF1, 0x90]],
         sections: Vec::new(),
         source_map: Vec::new(),
+        identity: Default::default(),
+        preconditions: Default::default(),
+        flash: Vec::new(),
     }
 }
 

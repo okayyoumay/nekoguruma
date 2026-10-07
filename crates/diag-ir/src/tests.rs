@@ -120,6 +120,9 @@ fn prog(code: Vec<Op>, constants: Vec<Vec<u8>>) -> Program {
         constants,
         sections: Vec::new(),
         source_map: Vec::new(),
+        identity: Default::default(),
+        preconditions: Default::default(),
+        flash: Vec::new(),
     }
 }
 
@@ -1161,14 +1164,6 @@ fn unusual_values_round_trip() {
             locals: vec![Some(Value::F64(f64::INFINITY)), None],
         }],
         steps: u64::MAX - 1,
-        checkpoint: Some(Checkpoint {
-            pc: 1,
-            section: 0,
-            vin: Some("VIN".into()),
-            artifact_digest: None,
-            at: "2026-10-06T00:00:00Z".into(),
-        }),
-        resume_count: 2,
     };
     let bytes = postcard::to_allocvec(&state).unwrap();
     let restored: VmState = postcard::from_bytes(&bytes).unwrap();
@@ -1436,4 +1431,442 @@ fn primitives_run_at_the_stack_limit() {
         assert_eq!(host.calls.len() + host.logs.len(), 1, "{op:?}");
         assert!(vm.state.stack.len() <= MAX_STACK, "{op:?}");
     }
+}
+
+// ---------------------------------------------------------------- Restart declaration (ADR-245)
+
+/// The encodings changed in schema 2; a program or state of version 1 must be refused.
+#[test]
+fn schema_version_one_is_refused() {
+    let mut old = prog(vec![i(1)], Vec::new());
+    old.schema_version = 1;
+    assert!(matches!(
+        Vm::new(&old).check_state(&old),
+        Err(VmError::SchemaMismatch { program: 1, .. })
+    ));
+    let current = prog(vec![i(1)], Vec::new());
+    let mut state = Vm::new(&current).state;
+    state.schema_version = 1;
+    assert!(matches!(
+        Vm::resume(state).check_state(&current),
+        Err(VmError::StateSchemaMismatch { state: 1, .. })
+    ));
+}
+
+const SVC: Source = Source::EcuService {
+    service_id: 1,
+    field_id: 1,
+};
+
+fn precondition(default: Option<Source>, programming: Option<Source>) -> Precondition {
+    Precondition {
+        satisfied: Satisfied { lower: 0, upper: 0 },
+        default_session: default,
+        programming_session: programming,
+    }
+}
+
+fn plan(flash_session: u32, stage: u32, entry: u32) -> FlashRecovery {
+    FlashRecovery {
+        flash_session,
+        stage,
+        max_resumes: 3,
+        recovery_required: RecoveryRequired::Never,
+        boundaries: RecoveryBoundaries {
+            entry_pc: entry,
+            erase_pc: entry + 1,
+            transfer_exit_pc: entry + 3,
+            post_transfer_end_pc: entry + 5,
+        },
+        timing: RecoveryTiming {
+            session_timeout_millis: 5000,
+            teardown_margin_millis: 500,
+            ecu_startup_millis: 2000,
+            confirmation_window_millis: 10_000,
+        },
+        version_read_retries: 2,
+        no_application: Some(NoApplication::Nrc(0x22)),
+    }
+}
+
+/// Ten instructions; requests at 1, 3, 6 and 8 and no jumps.
+fn recovery_code() -> Vec<Op> {
+    let request = Op::ServiceRequest { service: 0x31 };
+    let mut code = vec![Op::Pop; 10];
+    for pc in [1, 3, 6, 8] {
+        code[pc] = request.clone();
+    }
+    code
+}
+
+fn recovery_program() -> Program {
+    let mut program = prog(recovery_code(), Vec::new());
+    program.identity = IdentitySources {
+        vin: Some(SVC),
+        hardware_part_number: Some(SVC),
+        software_version: Some(SVC),
+    };
+    program.flash.push(plan(1, 1, 0));
+    program
+}
+
+fn mutate_plan(f: impl FnOnce(&mut FlashRecovery)) -> Program {
+    let mut program = recovery_program();
+    f(&mut program.flash[0]);
+    program
+}
+
+#[test]
+fn a_program_without_a_declaration_is_valid() {
+    assert_eq!(prog(recovery_code(), Vec::new()).validate(), Ok(()));
+    assert_eq!(recovery_program().validate(), Ok(()));
+}
+
+/// The done-when case: a plan that allows a restart needs every declared precondition mapped
+/// for both sessions; a plan that does not allow one needs none of that.
+#[test]
+fn a_restartable_plan_needs_every_precondition_mapped_for_both_sessions() {
+    let mut program = recovery_program();
+    program.preconditions.engine = Some(precondition(Some(SVC), None));
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::UnmappedPrecondition {
+            kind: PreconditionKind::Engine,
+            session: SessionKind::Programming,
+        })
+    );
+    program.preconditions.engine = Some(precondition(Some(SVC), Some(SVC)));
+    assert_eq!(program.validate(), Ok(()));
+
+    // Intervention from the erase on: no restart is allowed, so the mapping is not asked for.
+    let mut no_restart = recovery_program();
+    no_restart.preconditions.engine = Some(precondition(Some(SVC), None));
+    no_restart.flash[0].recovery_required = RecoveryRequired::FromPc(1);
+    assert!(!no_restart.flash[0].allows_restart());
+    assert_eq!(no_restart.validate(), Ok(()));
+
+    // From the transfer exit on: restart before it is allowed, so it is refused again.
+    no_restart.flash[0].recovery_required = RecoveryRequired::FromPc(3);
+    assert!(no_restart.flash[0].allows_restart());
+    assert!(matches!(
+        no_restart.validate(),
+        Err(ProgramError::UnmappedPrecondition { .. })
+    ));
+}
+
+#[test]
+fn boundaries_must_be_in_order_inside_the_code() {
+    for edit in [
+        (|b: &mut RecoveryBoundaries| b.entry_pc = 2) as fn(&mut RecoveryBoundaries),
+        |b| b.erase_pc = b.transfer_exit_pc,
+        |b| b.transfer_exit_pc = b.post_transfer_end_pc,
+        |b| b.post_transfer_end_pc = 11,
+    ] {
+        let program = mutate_plan(|p| edit(&mut p.boundaries));
+        assert_eq!(
+            program.validate(),
+            Err(ProgramError::BoundaryOutOfOrder { flash_session: 1 })
+        );
+    }
+}
+
+#[test]
+fn erase_and_transfer_exit_must_be_requests() {
+    let mut program = recovery_program();
+    program.code[1] = Op::Pop;
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::BoundaryNotARequest {
+            flash_session: 1,
+            pc: 1
+        })
+    );
+    let mut program = recovery_program();
+    program.code[3] = Op::Pop;
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::BoundaryNotARequest {
+            flash_session: 1,
+            pc: 3
+        })
+    );
+    // A routine control counts as a request.
+    let mut program = recovery_program();
+    program.code[3] = Op::RoutineControl { routine: 1, sub: 1 };
+    assert_eq!(program.validate(), Ok(()));
+}
+
+#[test]
+fn plans_must_be_distinct_and_apart() {
+    let mut program = recovery_program();
+    program.flash.push(plan(1, 2, 5));
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::DuplicateFlashSession(1))
+    );
+
+    let mut program = recovery_program();
+    program.flash.push(plan(2, 1, 5));
+    assert_eq!(program.validate(), Err(ProgramError::DuplicateStage(1)));
+
+    let mut program = recovery_program();
+    program.code[5] = Op::ServiceRequest { service: 0x31 };
+    program.code[7] = Op::ServiceRequest { service: 0x31 };
+    program.flash.push(plan(2, 2, 4));
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::OverlappingFlashRecoveries { a: 1, b: 2 })
+    );
+
+    // Adjacent ranges do not overlap.
+    let mut program = recovery_program();
+    program.flash.push(plan(2, 2, 5));
+    assert_eq!(program.validate(), Ok(()));
+}
+
+#[test]
+fn the_recovery_position_must_lie_in_the_plan() {
+    for pc in [0, 6] {
+        let mut program = recovery_program();
+        program.flash[0].boundaries.entry_pc = 1;
+        program.flash[0].recovery_required = RecoveryRequired::FromPc(pc);
+        // 5 is the exclusive end, so 5 is allowed and 6 is not; 0 is before the entry.
+        assert_eq!(
+            program.validate(),
+            Err(ProgramError::RecoveryRequiredOutOfRange {
+                flash_session: 1,
+                pc
+            })
+        );
+    }
+    let mut program = recovery_program();
+    program.flash[0].recovery_required = RecoveryRequired::FromPc(5);
+    assert_eq!(program.validate(), Ok(()));
+}
+
+fn recovery_section(start_pc: u32, end_pc: u32) -> Section {
+    Section {
+        start_pc,
+        end_pc,
+        interruptible: Interruptible::RecoveryRequired,
+        idempotency: Idempotency::Unsafe,
+        expected_millis: 0,
+    }
+}
+
+#[test]
+fn a_recovery_section_must_not_lie_in_the_restartable_range() {
+    // Never: the whole plan is restartable.
+    let mut program = recovery_program();
+    program.sections.push(recovery_section(4, 5));
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::ContradictoryInterruptibility {
+            flash_session: 1,
+            section: 0
+        })
+    );
+    // FromPc(3): a section from 3 on is consistent, one before it is not.
+    let mut program = recovery_program();
+    program.flash[0].recovery_required = RecoveryRequired::FromPc(3);
+    program.sections.push(recovery_section(3, 5));
+    assert_eq!(program.validate(), Ok(()));
+    program.sections.push(recovery_section(2, 4));
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::ContradictoryInterruptibility {
+            flash_session: 1,
+            section: 1
+        })
+    );
+    // Other interruptibility and sections outside the plan are fine.
+    let mut program = recovery_program();
+    program.sections.push(Section {
+        interruptible: Interruptible::No,
+        ..recovery_section(1, 5)
+    });
+    program.sections.push(recovery_section(7, 9));
+    assert_eq!(program.validate(), Ok(()));
+}
+
+#[test]
+fn a_jump_must_not_leave_the_recovery_range_backwards() {
+    let mut program = prog(recovery_code(), Vec::new());
+    program.identity = recovery_program().identity;
+    program.flash.push(plan(1, 1, 2));
+    program.code[2] = Op::Pop;
+    program.code[3] = Op::ServiceRequest { service: 0x31 };
+    program.code[5] = Op::ServiceRequest { service: 0x31 };
+    // A jump before the erase is replayed, so it may go anywhere.
+    program.code[2] = Op::Jump(0);
+    assert_eq!(program.validate(), Ok(()));
+    // A jump inside the range that stays at or after the entry is fine.
+    program.code[4] = Op::Jump(2);
+    assert_eq!(program.validate(), Ok(()));
+    program.code[4] = Op::JumpIfFalse(1);
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::JumpOutOfRecovery {
+            flash_session: 1,
+            pc: 4
+        })
+    );
+    program.code[4] = Op::Jump(0);
+    assert!(matches!(
+        program.validate(),
+        Err(ProgramError::JumpOutOfRecovery { pc: 4, .. })
+    ));
+}
+
+#[test]
+fn sources_are_checked() {
+    let mut program = recovery_program();
+    program.preconditions.voltage_mv = Some(Precondition {
+        satisfied: Satisfied { lower: 2, upper: 1 },
+        ..precondition(Some(SVC), Some(SVC))
+    });
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::EmptyRange(PreconditionKind::Voltage))
+    );
+
+    let mut program = recovery_program();
+    program.preconditions.ignition = Some(precondition(
+        Some(Source::RuntimeInput(RuntimeInput::EngineRunning)),
+        Some(SVC),
+    ));
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::InputDoesNotReport {
+            kind: PreconditionKind::Ignition,
+            input: RuntimeInput::EngineRunning
+        })
+    );
+    program.preconditions.ignition = Some(precondition(
+        Some(Source::RuntimeInput(RuntimeInput::IgnitionOn)),
+        Some(SVC),
+    ));
+    assert_eq!(program.validate(), Ok(()));
+
+    let mut program = recovery_program();
+    program.identity.vin = Some(Source::RuntimeInput(RuntimeInput::IgnitionOn));
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::IdentityFromRuntimeInput(IdentityKind::Vin))
+    );
+
+    for (service_id, field_id) in [(0, 1), (1, 0)] {
+        let zero = Source::EcuService {
+            service_id,
+            field_id,
+        };
+        let mut program = recovery_program();
+        program.identity.software_version = Some(zero);
+        assert_eq!(
+            program.validate(),
+            Err(ProgramError::ZeroId {
+                owner: SourceOwner::Identity(IdentityKind::SoftwareVersion)
+            })
+        );
+        let mut program = recovery_program();
+        program.preconditions.vehicle_speed = Some(precondition(Some(SVC), Some(zero)));
+        assert_eq!(
+            program.validate(),
+            Err(ProgramError::ZeroId {
+                owner: SourceOwner::Precondition {
+                    kind: PreconditionKind::VehicleSpeed,
+                    session: SessionKind::Programming
+                }
+            })
+        );
+    }
+}
+
+#[test]
+fn a_restartable_plan_needs_the_identity_timeout_and_resume_limit() {
+    for kind in [
+        IdentityKind::Vin,
+        IdentityKind::HardwarePartNumber,
+        IdentityKind::SoftwareVersion,
+    ] {
+        let mut program = recovery_program();
+        match kind {
+            IdentityKind::Vin => program.identity.vin = None,
+            IdentityKind::HardwarePartNumber => program.identity.hardware_part_number = None,
+            IdentityKind::SoftwareVersion => program.identity.software_version = None,
+        }
+        assert_eq!(
+            program.validate(),
+            Err(ProgramError::MissingIdentitySource(kind))
+        );
+        // No restart allowed: not required.
+        program.flash[0].recovery_required = RecoveryRequired::FromPc(1);
+        assert_eq!(program.validate(), Ok(()));
+    }
+
+    let program = mutate_plan(|p| p.timing.session_timeout_millis = 0);
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::MissingSessionTimeout { flash_session: 1 })
+    );
+    let program = mutate_plan(|p| p.max_resumes = 0);
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::ZeroResumeLimit { flash_session: 1 })
+    );
+    // No application declared stays legal.
+    let program = mutate_plan(|p| p.no_application = None);
+    assert_eq!(program.validate(), Ok(()));
+}
+
+#[test]
+fn runtime_inputs_report_their_own_precondition_only() {
+    let pairs = [
+        (
+            RuntimeInput::SupplyVoltageMillivolts,
+            PreconditionKind::Voltage,
+        ),
+        (
+            RuntimeInput::ExternalSupplyConnected,
+            PreconditionKind::ExternalSupply,
+        ),
+        (RuntimeInput::IgnitionOn, PreconditionKind::Ignition),
+        (RuntimeInput::EngineRunning, PreconditionKind::Engine),
+        (
+            RuntimeInput::VehicleSpeedKmh,
+            PreconditionKind::VehicleSpeed,
+        ),
+    ];
+    for (a, kind_a) in pairs {
+        for (_, kind_b) in pairs {
+            assert_eq!(a.reports(kind_b), kind_a == kind_b, "{a:?} {kind_b:?}");
+        }
+    }
+}
+
+#[test]
+fn a_full_declaration_round_trips_through_postcard() {
+    let mut program = recovery_program();
+    program.preconditions = Preconditions {
+        voltage_mv: Some(Precondition {
+            satisfied: Satisfied {
+                lower: 12_000,
+                upper: 15_000,
+            },
+            default_session: Some(Source::RuntimeInput(RuntimeInput::SupplyVoltageMillivolts)),
+            programming_session: Some(SVC),
+        }),
+        engine: Some(precondition(Some(SVC), Some(SVC))),
+        ..Preconditions::default()
+    };
+    program.flash[0].recovery_required = RecoveryRequired::FromPc(4);
+    program.sections.push(recovery_section(4, 5));
+    assert_eq!(program.validate(), Ok(()));
+    let bytes = postcard::to_allocvec(&program).unwrap();
+    let restored: Program = postcard::from_bytes(&bytes).unwrap();
+    assert_eq!(restored.identity, program.identity);
+    assert_eq!(restored.preconditions, program.preconditions);
+    assert_eq!(restored.flash, program.flash);
+    assert_eq!(restored.validate(), Ok(()));
+    assert_eq!(postcard::to_allocvec(&restored).unwrap(), bytes);
 }

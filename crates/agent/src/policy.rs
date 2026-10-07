@@ -140,6 +140,9 @@ mod tests {
             constants: Vec::new(),
             sections: Vec::new(),
             source_map: Vec::new(),
+            identity: Default::default(),
+            preconditions: Default::default(),
+            flash: Vec::new(),
         }
     }
 

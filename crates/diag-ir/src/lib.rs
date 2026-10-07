@@ -3,9 +3,14 @@
 //! - Declaration part: FlatBuffers (see the separate .fbs file). This file handles the procedure part.
 //! - Procedure part: custom bytecode VM. The entire execution state must be serializable (8.2.3).
 
+mod recovery;
+
+pub use recovery::*;
 use serde::{Deserialize, Serialize};
 
-pub const IR_SCHEMA_VERSION: u32 = 1;
+/// 2: `Program` gained the restart declaration (`identity`, `preconditions`, `flash`, ADR-245)
+/// and `VmState` lost `checkpoint` and `resume_count`, so both postcard encodings changed.
+pub const IR_SCHEMA_VERSION: u32 = 2;
 
 // ---------------------------------------------------------------- Instructions
 
@@ -73,6 +78,15 @@ pub struct Program {
     pub sections: Vec<Section>,
     /// 8.4: mapping table from bytecode back to the original source.
     pub source_map: Vec<SourceSpan>,
+    /// Where the identity of the ECU is read from, for the restart order (ADR-229, ADR-245).
+    #[serde(default)]
+    pub identity: IdentitySources,
+    /// Sources of the declared flash preconditions (8.9, ADR-245).
+    #[serde(default)]
+    pub preconditions: Preconditions,
+    /// Recovery plans, one per flash session (8.10.1, ADR-245). [`Program::validate`] checks them.
+    #[serde(default)]
+    pub flash: Vec<FlashRecovery>,
 }
 
 /// Interruptibility sections from 8.10.1. Expressed with the same mechanism as the idempotency attribute of the resume model (8.2.5).
@@ -183,9 +197,6 @@ pub struct VmState {
     /// Instructions completed so far. Survives resumption; used for audit and for step limits
     /// the job runner may enforce.
     pub steps: u64,
-    /// Most recently completed checkpoint. Resumption starts here, after a state check.
-    pub checkpoint: Option<Checkpoint>,
-    pub resume_count: u16,
 }
 
 /// A suspended caller: where to return to and its locals.
@@ -201,16 +212,6 @@ pub enum Value {
     F64(f64),
     Bool(bool),
     Bytes(Vec<u8>),
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Checkpoint {
-    pub pc: u32,
-    pub section: u32,
-    /// Version and target being written. A VIN match is required before resuming (8.2.5).
-    pub vin: Option<String>,
-    pub artifact_digest: Option<String>,
-    pub at: String, // RFC3339 (correspondence with the monotonic clock is recorded separately)
 }
 
 // ---------------------------------------------------------------- Host boundary
@@ -280,8 +281,6 @@ impl Vm {
                 globals: Vec::new(),
                 call_stack: Vec::new(),
                 steps: 0,
-                checkpoint: None,
-                resume_count: 0,
             },
         }
     }
@@ -883,8 +882,6 @@ pub enum VmError {
     IndexOutOfRange(i64),
     #[error("byte value out of range: {0}")]
     ByteOutOfRange(i64),
-    #[error("resume count limit reached")]
-    ResumeLimit,
 }
 
 #[cfg(test)]

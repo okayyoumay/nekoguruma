@@ -113,6 +113,11 @@ pub struct EcuConfig {
     /// How long the security delay timer runs, in ms. [`DEFAULT_SECURITY_DELAY_MS`] when unset.
     #[serde(default)]
     pub security_delay_ms: Option<u32>,
+    /// The software version a verified download installs: F189 reports it from the next power
+    /// cycle (ECU reset, power loss or [`SimEcu::reconnect`]) on. `None` leaves F189 at
+    /// [`Self::sw_version`].
+    #[serde(default)]
+    pub downloaded_sw_version: Option<String>,
 }
 
 // ---------------------------------------------------------------- Clock
@@ -253,6 +258,11 @@ pub struct SimEcu {
     /// Set by the test to stand for a gateway authentication; the ECU never clears it.
     pub gateway_authenticated: bool,
     pub dtcs: Vec<DtcRecord>,
+    /// The software version F189 reports. Starts as [`EcuConfig::sw_version`].
+    pub running_sw_version: String,
+    /// The version a verified download installs at the next power cycle; cleared by an erase
+    /// or a failed check.
+    pending_sw_version: Option<String>,
     seed_counter: u32,
     pending_seed: Option<u32>,
     failed_attempts: u8,
@@ -377,6 +387,7 @@ impl SimEcu {
     /// An ECU whose timers run on `clock`.
     pub fn with_clock(config: EcuConfig, clock: impl Clock + 'static) -> Self {
         let dtcs = config.dtcs.clone();
+        let running_sw_version = config.sw_version.clone();
         Self {
             config,
             session: Session::Default,
@@ -384,6 +395,8 @@ impl SimEcu {
             security_unlocked: false,
             gateway_authenticated: false,
             dtcs,
+            running_sw_version,
+            pending_sw_version: None,
             seed_counter: 0,
             pending_seed: None,
             failed_attempts: 0,
@@ -595,7 +608,8 @@ impl SimEcu {
 
     /// Session, security and transfer state after a power cycle or ECU reset.
     /// The false-attempt counter starts again at zero (Annex I, transition 1); an active
-    /// security delay starts again for its full length, as on power-up.
+    /// security delay starts again for its full length, as on power-up. A verified download
+    /// becomes the running software.
     fn power_cycle(&mut self) {
         // A delay that ran out before the power cycle stays over, whether or not a request
         // arrived in the meantime to notice it.
@@ -611,6 +625,9 @@ impl SimEcu {
             self.start_security_delay();
         }
         self.interrupt_transfer();
+        if let Some(version) = self.pending_sw_version.take() {
+            self.running_sw_version = version;
+        }
     }
 
     fn lock_security(&mut self) {

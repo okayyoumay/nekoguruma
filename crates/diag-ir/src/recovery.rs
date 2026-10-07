@@ -242,8 +242,10 @@ pub enum ProgramError {
         "flash session {flash_session}: boundaries must satisfy entry <= erase < transfer exit < post-transfer end <= code length"
     )]
     BoundaryOutOfOrder { flash_session: u32 },
-    #[error("flash session {flash_session}: instruction {pc} is not a diagnostic request")]
-    BoundaryNotARequest { flash_session: u32, pc: u32 },
+    #[error(
+        "flash session {flash_session}: instruction {pc} is not the request this boundary needs (erase: a routine control or RequestDownload; transfer exit: RequestTransferExit)"
+    )]
+    WrongBoundaryInstruction { flash_session: u32, pc: u32 },
     #[error("flash session {0} has more than one recovery plan")]
     DuplicateFlashSession(u32),
     #[error("stage {0} is used by more than one recovery plan")]
@@ -300,12 +302,16 @@ pub enum ProgramError {
     MissingSessionTimeout { flash_session: u32 },
     #[error("flash session {flash_session}: the resume limit is zero")]
     ZeroResumeLimit { flash_session: u32 },
-    #[error("section {section} does not lie within the code with its start before its end")]
+    #[error("section {section} is empty, reversed or reaches past the code")]
     InvalidSection { section: usize },
     #[error(
         "flash session {flash_session}: instruction {pc} is a second RequestDownload or a RequestTransferExit the plan does not declare"
     )]
     UndeclaredTransferBoundary { flash_session: u32, pc: u32 },
+    #[error(
+        "flash session {flash_session}: the plan has no RequestDownload before its transfer exit"
+    )]
+    MissingRequestDownload { flash_session: u32 },
 }
 
 fn is_erase(op: Option<&Op>) -> bool {
@@ -340,8 +346,11 @@ fn check_ids(source: Source, owner: SourceOwner) -> Result<(), ProgramError> {
 }
 
 impl Program {
-    /// Checks the restart declaration (ADR-245). The instructions themselves are not checked
-    /// here; see [`crate::Vm::check_state`].
+    /// Checks the restart declaration (ADR-245): the sections, each plan's boundaries and the
+    /// instructions at them, where download instructions sit, the control flow into, inside
+    /// and out of each plan, and the identity and precondition sources. It does not check the
+    /// schema version or the program's size ([`crate::Vm::check_state`]) or each instruction's
+    /// operands, which fail when the VM reaches them.
     ///
     /// The restart rules (identity sources, session mapping, timeout, resume limit) apply only
     /// when some plan allows a restart ([`FlashRecovery::allows_restart`]); a program whose
@@ -349,7 +358,7 @@ impl Program {
     pub fn validate(&self) -> Result<(), ProgramError> {
         // The overlap checks below would read a reversed section as empty.
         for (section, s) in self.sections.iter().enumerate() {
-            if s.start_pc > s.end_pc || s.end_pc as usize > self.code.len() {
+            if s.start_pc >= s.end_pc || s.end_pc as usize > self.code.len() {
                 return Err(ProgramError::InvalidSection { section });
             }
         }
@@ -488,13 +497,13 @@ impl Program {
             return Err(ProgramError::BoundaryOutOfOrder { flash_session });
         }
         if !is_erase(self.code.get(b.erase_pc as usize)) {
-            return Err(ProgramError::BoundaryNotARequest {
+            return Err(ProgramError::WrongBoundaryInstruction {
                 flash_session,
                 pc: b.erase_pc,
             });
         }
         if !is_transfer_exit(self.code.get(b.transfer_exit_pc as usize)) {
-            return Err(ProgramError::BoundaryNotARequest {
+            return Err(ProgramError::WrongBoundaryInstruction {
                 flash_session,
                 pc: b.transfer_exit_pc,
             });
@@ -514,6 +523,10 @@ impl Program {
             if undeclared {
                 return Err(ProgramError::UndeclaredTransferBoundary { flash_session, pc });
             }
+        }
+        // An erase that is not a RequestDownload must be followed by one.
+        if downloads == 0 {
+            return Err(ProgramError::MissingRequestDownload { flash_session });
         }
         if let Some(NoApplication::Nrc(nrc @ (0x00 | 0x78))) = plan.no_application {
             return Err(ProgramError::InvalidNoApplicationNrc { flash_session, nrc });

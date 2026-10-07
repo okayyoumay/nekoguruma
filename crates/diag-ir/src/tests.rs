@@ -1496,6 +1496,7 @@ fn recovery_code() -> Vec<Op> {
     for pc in [1, 6] {
         code[pc] = Op::RoutineControl { routine: 1, sub: 1 };
     }
+    code[2] = Op::ServiceRequest { service: 0x34 };
     code[3] = Op::ServiceRequest { service: 0x37 };
     code
 }
@@ -1584,7 +1585,7 @@ fn erase_and_transfer_exit_must_be_the_right_requests() {
         program.code[pc as usize] = op;
         assert_eq!(
             program.validate(),
-            Err(ProgramError::BoundaryNotARequest {
+            Err(ProgramError::WrongBoundaryInstruction {
                 flash_session: 1,
                 pc
             })
@@ -1593,6 +1594,24 @@ fn erase_and_transfer_exit_must_be_the_right_requests() {
     // The download request starts a plan that does not erase.
     let mut program = recovery_program();
     program.code[1] = Op::ServiceRequest { service: 0x34 };
+    program.code[2] = Op::Pop;
+    assert_eq!(program.validate(), Ok(()));
+}
+
+#[test]
+fn a_plan_needs_a_request_download() {
+    // A RoutineControl erase with no RequestDownload before the exit.
+    let mut program = recovery_program();
+    program.code[2] = Op::Pop;
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::MissingRequestDownload { flash_session: 1 })
+    );
+    program.code[2] = Op::ServiceRequest { service: 0x34 };
+    assert_eq!(program.validate(), Ok(()));
+    // An erase that is itself the RequestDownload is enough.
+    program.code[1] = Op::ServiceRequest { service: 0x34 };
+    program.code[2] = Op::Pop;
     assert_eq!(program.validate(), Ok(()));
 }
 
@@ -1617,17 +1636,25 @@ fn download_instructions_belong_to_a_transfer_range() {
             program.validate(),
             Err(ProgramError::DownloadOutsidePlan { pc: 4 })
         );
-        // Between erase and transfer exit, where only the declared exit may be a
-        // RequestTransferExit.
+        // Between the RequestDownload and the transfer exit (moved to 4), where only the
+        // declared exit may be a RequestTransferExit and no second RequestDownload may sit.
         let mut program = recovery_program();
-        let exit = op == Op::ServiceRequest { service: 0x37 };
-        program.code[2] = op;
-        if exit {
+        program.code[4] = Op::ServiceRequest { service: 0x37 };
+        program.code[3] = op.clone();
+        program.flash[0].boundaries.transfer_exit_pc = 4;
+        program.flash[0].boundaries.post_transfer_end_pc = 5;
+        let undeclared = matches!(
+            op,
+            Op::ServiceRequest {
+                service: 0x34 | 0x37
+            }
+        );
+        if undeclared {
             assert_eq!(
                 program.validate(),
                 Err(ProgramError::UndeclaredTransferBoundary {
                     flash_session: 1,
-                    pc: 2
+                    pc: 3
                 })
             );
         } else {
@@ -1684,6 +1711,19 @@ fn sections_must_lie_in_the_code_in_order() {
     }
 }
 
+#[test]
+fn an_empty_section_is_invalid() {
+    let mut program = recovery_program();
+    program.sections.push(Section {
+        interruptible: Interruptible::Yes,
+        ..recovery_section(2, 2)
+    });
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::InvalidSection { section: 0 })
+    );
+}
+
 /// Every declared precondition is checked before the procedure starts, so it needs a
 /// default-session source even when no plan allows a restart.
 #[test]
@@ -1701,10 +1741,17 @@ fn a_declared_precondition_needs_a_default_session_source() {
     assert_eq!(program.validate(), Ok(()));
 }
 
+/// The instructions a second plan at entry 5 needs: RoutineControl erase at 6 (already there),
+/// RequestDownload at 7, transfer exit at 8.
+fn second_plan_ops(program: &mut Program) {
+    program.code[7] = Op::ServiceRequest { service: 0x34 };
+    program.code[8] = Op::ServiceRequest { service: 0x37 };
+}
+
 #[test]
 fn plans_must_be_distinct_and_apart() {
     let mut program = recovery_program();
-    program.code[8] = Op::ServiceRequest { service: 0x37 };
+    second_plan_ops(&mut program);
     program.flash.push(plan(1, 2, 5));
     assert_eq!(
         program.validate(),
@@ -1712,12 +1759,13 @@ fn plans_must_be_distinct_and_apart() {
     );
 
     let mut program = recovery_program();
-    program.code[8] = Op::ServiceRequest { service: 0x37 };
+    second_plan_ops(&mut program);
     program.flash.push(plan(2, 1, 5));
     assert_eq!(program.validate(), Err(ProgramError::DuplicateStage(1)));
 
     let mut program = recovery_program();
     program.code[5] = Op::RoutineControl { routine: 1, sub: 1 };
+    program.code[6] = Op::ServiceRequest { service: 0x34 };
     program.code[7] = Op::ServiceRequest { service: 0x37 };
     program.flash.push(plan(2, 2, 4));
     assert_eq!(
@@ -1727,7 +1775,7 @@ fn plans_must_be_distinct_and_apart() {
 
     // Adjacent ranges do not overlap.
     let mut program = recovery_program();
-    program.code[8] = Op::ServiceRequest { service: 0x37 };
+    second_plan_ops(&mut program);
     program.flash.push(plan(2, 2, 5));
     assert_eq!(program.validate(), Ok(()));
 }
@@ -1825,12 +1873,12 @@ fn flow_error(program: &Program, pc: u32) -> Option<ProgramError> {
 #[test]
 fn a_plan_contains_no_call_or_return() {
     for op in [Op::Call(9), Op::Ret] {
-        let program = flow_program(|c| c[2] = op.clone());
+        let program = flow_program(|c| c[4] = op.clone());
         assert_eq!(
             program.validate(),
             Err(ProgramError::CallOrReturnInPlan {
                 flash_session: 1,
-                pc: 2
+                pc: 4
             })
         );
         // Outside the plan they are fine.
@@ -1891,6 +1939,7 @@ fn a_jump_before_the_erase_cannot_skip_it() {
     let mut program = recovery_program();
     program.code = vec![Op::Pop; 12];
     program.code[3] = Op::RoutineControl { routine: 1, sub: 1 };
+    program.code[4] = Op::ServiceRequest { service: 0x34 };
     program.code[5] = Op::ServiceRequest { service: 0x37 };
     program.flash[0].boundaries = RecoveryBoundaries {
         entry_pc: 0,
@@ -1911,11 +1960,17 @@ fn a_jump_before_the_erase_cannot_skip_it() {
 fn a_jump_in_the_transfer_stays_between_erase_and_exit() {
     // erase 1, transfer exit 3: pc 2 is in the transfer.
     for target in [1, 2, 3] {
-        let program = flow_program(|c| c[2] = Op::Jump(target));
+        let program = flow_program(|c| {
+            c[1] = Op::ServiceRequest { service: 0x34 };
+            c[2] = Op::Jump(target);
+        });
         assert_eq!(program.validate(), Ok(()), "target {target}");
     }
     for target in [0, 4, 5] {
-        let program = flow_program(|c| c[2] = Op::JumpIfFalse(target));
+        let program = flow_program(|c| {
+            c[1] = Op::ServiceRequest { service: 0x34 };
+            c[2] = Op::JumpIfFalse(target);
+        });
         assert_eq!(
             flow_error(&program, 2),
             Some(ProgramError::JumpOutOfRecovery {
@@ -1952,7 +2007,10 @@ fn a_backward_jump_does_not_cross_the_recovery_point() {
             pc: 4
         })
     );
-    let mut program = flow_program(|c| c[2] = Op::Jump(1));
+    let mut program = flow_program(|c| {
+        c[1] = Op::ServiceRequest { service: 0x34 };
+        c[2] = Op::Jump(1);
+    });
     program.flash[0].recovery_required = RecoveryRequired::FromPc(4);
     assert_eq!(program.validate(), Ok(()));
     // A jump at the point itself that stays at or after it is fine.
@@ -2239,4 +2297,60 @@ fn unknown_keys_in_a_program_are_refused() {
     // A misspelt key must not be read as "nothing declared".
     assert!(serde_json::from_str::<Program>(&json(r#","precondition":{}"#)).is_err());
     assert!(serde_json::from_str::<Program>(&json(r#","preconditions":{"engin":null}"#)).is_err());
+}
+
+/// The layout of `VmState` in schema 1, which had a checkpoint and a resume count at the end.
+#[derive(serde::Serialize)]
+struct V1State {
+    schema_version: u32,
+    pc: u32,
+    stack: Vec<Value>,
+    locals: Vec<Option<Value>>,
+    globals: Vec<Option<Value>>,
+    call_stack: Vec<Frame>,
+    steps: u64,
+    checkpoint: Option<V1Checkpoint>,
+    resume_count: u16,
+}
+
+#[derive(serde::Serialize)]
+struct V1Checkpoint {
+    pc: u32,
+    section: u32,
+    vin: Option<String>,
+    artifact_digest: Option<String>,
+    at: String,
+}
+
+/// A journaled schema 1 state decodes (postcard ignores the trailing bytes) but is refused by
+/// the schema check, so the removed fields cannot cause a resume from a stale layout.
+#[test]
+fn a_version_one_state_still_decodes_and_is_refused() {
+    let old = V1State {
+        schema_version: 1,
+        pc: 1,
+        stack: vec![Value::I64(7)],
+        locals: vec![None],
+        globals: Vec::new(),
+        call_stack: Vec::new(),
+        steps: 4,
+        checkpoint: Some(V1Checkpoint {
+            pc: 1,
+            section: 0,
+            vin: Some("VIN".into()),
+            artifact_digest: None,
+            at: "2026-10-06T00:00:00Z".into(),
+        }),
+        resume_count: 2,
+    };
+    let bytes = postcard::to_allocvec(&old).unwrap();
+    let (state, rest) = postcard::take_from_bytes::<VmState>(&bytes).unwrap();
+    assert!(!rest.is_empty());
+    assert!(postcard::from_bytes::<VmState>(&bytes).is_ok());
+    assert_eq!(state.schema_version, 1);
+    let current = prog(vec![i(1), i(2)], Vec::new());
+    assert!(matches!(
+        Vm::resume(state).check_state(&current),
+        Err(VmError::StateSchemaMismatch { state: 1, .. })
+    ));
 }

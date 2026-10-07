@@ -17,10 +17,11 @@ interpreted at runtime, even 10ms-interval monitoring only needs to walk the arr
 
 **Nest only what depends on the message (ADR-242)**
 Field lengths follow ODX's coded-type kinds (fixed, from another field, leading length prefix,
-terminated), and a field may be placed after the previous one instead of at a fixed offset.
-Repetitions and keyed selections (ODX FIELDs, MUX, TABLE-KEY with TABLE-STRUCT, which is how
-DID tables and nested DIDs appear) refer to a `Layout` in `EcuVariant.layouts`. Static
-STRUCTUREs are still inlined, and monitor sets stay fully flat.
+terminated) and stay attributes of a flat field, which may be placed after the previous one
+instead of at a fixed offset. Repetitions, keyed selections (ODX FIELDs, MUX, TABLE-KEY with
+TABLE-STRUCT, which is how DID tables and nested DIDs appear) and structures placed or sized at
+runtime refer to a `Layout` in `EcuVariant.layouts`. Static STRUCTUREs are still inlined, and
+monitor sets stay fully flat.
 
 **Separate conversion formulas by kind**
 ODX COMPU-METHOD has a limited set of kinds, so there is no general-purpose expression engine.

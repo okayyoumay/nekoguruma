@@ -3,8 +3,8 @@
 // Policy:
 //  - Whatever the input format (ODX/OTX, CSV+JS), the frontend normalizes it into this shape (8.2)
 //  - Response decoding is not interpreted at runtime; it is expanded into flat arrays at import time.
-//    Only shapes that depend on the message itself (variable lengths, repetitions, keyed
-//    selections) stay as references to nested layouts (ADR-242)
+//    Variable lengths stay attributes of a flat field; only repetitions, keyed selections and
+//    structures placed or sized at runtime refer to nested layouts (ADR-242)
 //  - Split into one file per ECU variant, identified by hash (8.2.6)
 //
 // Generate: flatc --rust --gen-object-api -o src/generated schema/ir.fbs
@@ -71,7 +71,8 @@ table CompuTextTable {
 }
 
 // One COMPU-SCALE of a TEXTTABLE: internal values lower..upper (inclusive) map to the text.
-// A single value has lower == upper.
+// A single value has lower == upper. Entries may overlap; the first matching entry in array
+// order wins, as in ODX, so a decoder must not sort or binary-search them.
 table TextEntry {
   lower: int64;
   upper: int64;
@@ -100,41 +101,57 @@ table CompuBytecode {
 // ---------------------------------------------------------------- Decode plan
 
 // How a field's length is found (the ODX DIAG-CODED-TYPE kinds, ISO 22901-1 7.3.6.2).
+// LeadingLength and Terminated apply only to Bytes, Ascii, Utf8 and Unicode2 fields, which
+// start at a byte edge; a Unicode2 field's lengths are even.
 enum LengthKind : byte {
   Fixed = 0,          // bit_length bits (STANDARD-LENGTH-TYPE)
   FromField = 1,      // the physical value of field length_field_id, in bits (PARAM-LENGTH-INFO-TYPE)
-  LeadingLength = 2,  // a bit_length-bit prefix holds the length in bytes; the value starts at the
-                      // next byte edge and the prefix is not part of it (LEADING-LENGTH-INFO-TYPE)
+  LeadingLength = 2,  // a bit_length-bit prefix, read in the field's byte_order, holds the length
+                      // in bytes; the value starts at the next byte edge and excludes the prefix
+                      // (LEADING-LENGTH-INFO-TYPE)
   Terminated = 3,     // min_bytes to max_bytes, ended early by `termination` (MIN-MAX-LENGTH-TYPE)
 }
 
-// What ends a Terminated field before max_bytes. Termination bytes inside the first min_bytes
-// belong to the value. A Zero or HexFF termination byte is not part of the value but is
-// consumed: an AfterPrevious field that follows starts after it.
+// What ends a Terminated field before max_bytes. Within the first min_bytes a termination
+// byte is ordinary data. A Zero or HexFF terminator is dropped from the value but still
+// consumed, so an AfterPrevious field that follows starts after it. A value that reaches
+// max_bytes has no terminator.
 enum Termination : byte {
   EndOfPdu = 0,  // the end of the message; with max_bytes = 0 this is "all remaining bytes"
   Zero = 1,      // a 0x00 byte (a 0x0000 character for Unicode2)
   HexFF = 2,     // a 0xFF byte (a 0xFFFF character for Unicode2)
 }
 
-// Where a field starts within its layout (a request, a response, or a Layout below).
+// Where a field starts within its layout. The layout of a request or response starts at the
+// SID byte (offset 0, prefix included); a Layout starts at its own first byte. bit_offset is
+// byte position * 8 + bit position, the bit position counting from the least significant bit
+// of that byte, as ODX does.
 enum Placement : byte {
   Absolute = 0,       // bit_offset bits from the start of the layout
-  AfterPrevious = 1,  // the byte edge after the previous field of the layout ends, plus
-                      // bit_offset (0-7); an ODX PARAM without BYTE-POSITION
+  AfterPrevious = 1,  // the byte edge after the previous field of the layout ends (the layout's
+                      // start, after the prefix at top level, for the first field), plus a bit
+                      // position of 0-7 in bit_offset; an ODX PARAM without BYTE-POSITION.
+                      // A shaped field's end is the end of its last decoded item or layout
 }
 
-// A nested layout whose shape depends on the message (see "Nested layouts" below).
+// A nested layout whose position, size or shape is known only from the message
+// (see "Nested layouts" below).
 union Shape {
   Repeat,
   Select,
+  Group,
 }
 
 // Flattened response layout. Monitoring obtains physical values just by walking
 // this array (to meet the 10ms target in 10.3). A field with a fixed position, a Fixed length
 // and no shape is all monitoring ever sees (MonitorSet).
+// Array order is decode order. A field that another field refers to (length, count, key)
+// comes first; the frontend rejects ODX data where moving it would change which field an
+// AfterPrevious field follows.
 table Field {
-  id: uint32;                 // stable ID for references, unique within the ECU variant, from 1
+  // Stable ID for references, from 1. It names the definition, not an occurrence: a field in a
+  // layout used at several places, or copied into a MonitorSet, keeps the same id
+  id: uint32;
   short_name: string;
   placement: Placement = Absolute;
   bit_offset: uint32;
@@ -146,41 +163,50 @@ table Field {
   compu: Compu;
   unit_id: uint32 = 0;        // unit system is resolved on the extension side (9.2)
   // FromField: the field holding the length. It is decoded before this one, in the same layout
-  // or an enclosing one; inside a repeated item, the same item's instance is meant
+  // or an enclosing one; inside a repeated item, the same item's occurrence is meant
   length_field_id: uint32 = 0;
-  // Terminated only. max_bytes = 0 means no maximum
+  // Terminated only. max_bytes = 0 means no maximum; otherwise min_bytes <= max_bytes
   min_bytes: uint32 = 0;
   max_bytes: uint32 = 0;
   termination: Termination = EndOfPdu;
-  // Absent: a single value decoded by kind and compu. Otherwise a nested layout whose shape
-  // depends on the message (ADR-242); kind and compu are then unused
+  // Absent: a single value decoded by kind and compu. Otherwise a nested layout (ADR-242);
+  // kind, compu and the length attributes are then unused, and the field starts at a byte edge
   shape: Shape;
 }
 
 // ---------------------------------------------------------------- Nested layouts (ADR-242)
 
 // A group of fields decoded together: an ODX STRUCTURE, or the data of a TABLE-ROW, that a
-// Repeat or Select refers to. A STRUCTURE whose position and size are known at import is not a
-// Layout: its fields are inlined into the enclosing layout with their positions adjusted.
+// Repeat, Select or Group refers to. A STRUCTURE whose position and size are known at import is
+// not a Layout: its fields are inlined into the enclosing layout with their positions adjusted.
 // Field positions are relative to the start of the layout, which starts at a byte edge.
+// Decoding fails if the fields reach past byte_size.
 table Layout {
-  id: uint32;                 // from 1; 0 means "no layout" in references
+  id: uint32 (key);           // from 1; 0 means "no layout" in references
   short_name: string;
   byte_size: uint32 = 0;      // BYTE-SIZE; 0 = the extent of the decoded fields
   fields: [Field];
 }
 
+// One occurrence of a layout whose start or size is known only at runtime: a STRUCTURE after a
+// variable-length field or with a variable-length member, or a FIELD or MUX that is not at a
+// fixed position (its count or key and its items are then positioned inside the group).
+table Group {
+  layout_id: uint32;
+}
+
 // How many items a Repeat has (the ODX FIELD kinds, 7.3.6.10.3 to 7.3.6.10.6).
 enum RepeatCount : byte {
-  Fixed = 0,          // fixed_count items, item_byte_size bytes apart (STATIC-FIELD)
+  Fixed = 0,          // fixed_count items, item_byte_size (> 0) bytes apart (STATIC-FIELD)
   FromField = 1,      // the physical value of count_field_id (DYNAMIC-LENGTH-FIELD)
   UntilMarker = 2,    // until `marker` matches or the message ends (DYNAMIC-ENDMARKER-FIELD)
   UntilEndOfPdu = 3,  // until the message ends (END-OF-PDU-FIELD)
 }
 
-// A layout repeated a number of times known only from the message. Items follow each other at
-// byte edges, starting where the Repeat field is placed. An item that consumes no bytes ends
-// the repetition, so a repetition always terminates.
+// A layout repeated a number of times known only from the message. The first item starts where
+// the Repeat field is placed. Fixed items are item_byte_size apart and decoding fails if one
+// reaches past that; the other kinds start each item at the byte edge after the previous one.
+// An item that consumes no bytes ends the repetition, so a repetition always terminates.
 table Repeat {
   layout_id: uint32;
   count: RepeatCount;
@@ -189,9 +215,9 @@ table Repeat {
   // FromField: decoded before the Repeat field (the frontend places ODX's
   // DETERMINE-NUMBER-OF-ITEMS as an ordinary field ahead of it)
   count_field_id: uint32 = 0;
-  // UntilMarker: before each item, `marker` is decoded at the current position (Absolute,
-  // offset 0); an internal value within marker_lower..marker_upper (inclusive) ends the
-  // repetition without consuming those bytes
+  // UntilMarker: before each item, `marker` (Absolute, offset 0, Fixed length, no shape) is
+  // decoded at the current position; an internal value within marker_lower..marker_upper
+  // (inclusive) ends the repetition and those bytes are left for the next field
   marker: Field;
   marker_lower: int64;
   marker_upper: int64;
@@ -203,18 +229,19 @@ table Repeat {
 
 // One layout chosen by a key read from the message: an ODX MUX, or a TABLE-KEY with its
 // TABLE-STRUCT (7.3.6.10.7, 7.3.6.11), which is how DID tables and nested DIDs are expressed.
+// The Select field is placed where the chosen layout starts; the key is a separate field.
 // Keys are compared as internal values; the frontend converts ODX's physical limits and KEYs
 // through the key's COMPU-METHOD and rejects keys it cannot convert.
 table Select {
   key_field_id: uint32;       // decoded before the Select field
-  cases: [SelectCase];
+  cases: [SelectCase];        // non-overlapping (the frontend rejects overlaps)
   has_default: bool = false;  // whether an unmatched key is accepted
-  default_layout_id: uint32 = 0;  // the layout of the default case; 0 = no data
+  default_layout_id: uint32 = 0;  // has_default only: the default case's layout; 0 = no data
 }
 
 table SelectCase {
   short_name: string;
-  lower: int64;               // inclusive; a single key has lower == upper
+  lower: int64;               // inclusive, lower <= upper; a single key has lower == upper
   upper: int64;
   layout_id: uint32 = 0;      // 0 = the key is valid but carries no data
 }
@@ -225,8 +252,8 @@ table Request {
   sid: uint8;
   // Fixed byte sequence (sub-function etc. after the SID)
   prefix: [uint8];
-  // Where parameters are embedded. A Select here is keyed by a parameter the procedure
-  // supplies (a TABLE-KEY that names the whole TABLE)
+  // Where parameters are embedded. Shapes allowed here: Group, Repeat with UntilEndOfPdu,
+  // and Select keyed by a parameter the procedure supplies (a TABLE-KEY that names the whole TABLE)
   params: [Field];
 }
 
@@ -351,7 +378,7 @@ table EcuVariant {
   services: [Service];
   dtcs: [DtcDefinition];
   flash_sessions: [FlashSession];
-  // Targets of Repeat and Select fields (ADR-242)
+  // Targets of Repeat, Select and Group fields, sorted by id (ADR-242)
   layouts: [Layout];
 
   // Decode plans pre-expanded for monitoring (10.2)

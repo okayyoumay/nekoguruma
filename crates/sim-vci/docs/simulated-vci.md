@@ -122,8 +122,8 @@ as the first `PassThruOpen` does. There are two ways to send one:
   ECU configuration it cannot read. It does not look at the control directory, whose files wait
   for the next J2534 call.
 - `NGR_SIM_VCI_CONTROL_DIR` names a directory, read once when the library is first called. For
-  a test driving a worker process that loaded the library. At the start of every call into the
-  library except `PassThruGetLastError`, and every 20 ms while `PassThruReadMsgs` waits,
+  a test driving a worker process that loaded the library. At the start of every J2534 call
+  except `PassThruGetLastError`, and every 20 ms while `PassThruReadMsgs` waits,
   `sim-vci` applies the `*.json` files there in file-name order. It claims each file by renaming
   it to `*.applying` before reading it, so a command is applied at most once (a file it cannot
   claim is tried again at the next call), and deletes it once applied; a file it cannot read,
@@ -152,4 +152,5 @@ A VCI crash, as opposed to a disconnect, is not simulated.
 VIN over an ISO 15765 link. Its `tests/sim_vci_control.rs` runs agent jobs against the same setup
 and sends control commands through `NGR_SIM_VCI_CONTROL_DIR`: an ECU power loss and
 reconnection, a VCI disconnect between jobs, and one while a link is open, after which
-`GetVersion` reports the lost device until the next job closes and reopens it.
+`GetVersion` reports the lost device, even after the VCI is back, until the test closes the
+link; the next job then opens the device again and reads the VIN.

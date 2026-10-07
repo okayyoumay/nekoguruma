@@ -132,7 +132,7 @@ Project skills live in `.claude/skills/`:
 | `backlog-triage` | Cleaning up the backlog; manual only (`/backlog-triage`) |
 | `pr-review-loop` | Driving the Copilot review cycle on a PR Claude opened, up to handing it to the maintainer |
 | `backlog-loop` | Working through the backlog one item and one PR at a time, waiting for the maintainer's merge between items; manual only |
-| `codeql-alerts` | Fixing open CodeQL code scanning alerts one alert and one PR at a time, waiting for the maintainer's merge between alerts; on request or from the weekly routine |
+| `codeql-alerts` | Fixing open CodeQL code scanning alerts one alert and one PR at a time, from the alert list the CodeQL alert hand-off workflow sends to its routine |
 
 Skills run in the main conversation at the session model. Where an agent covers the same ground
 (build/test sweeps, doc-sync audits, verification), prefer the agent.
@@ -146,7 +146,7 @@ backlog files never enter the main conversation.
 "Built-in agents") and pre-allows read-only git commands, the standard cargo verbs (check, build, test,
 clippy, metadata, tree, and `fmt --check` only; plain `cargo fmt` rewrites sources, so it
 prompts) and the repository check scripts (`check-work-refs.sh`, `check-adr-index.sh`,
-`check-backlog.sh`, `classify-pr-risk.sh`, `codeql-alerts.sh`). Anything that mutates state outside `target/` still
+`check-backlog.sh`, `classify-pr-risk.sh`). Anything that mutates state outside `target/` still
 prompts.
 
 `ask` rules make force pushes and `git reset --hard` prompt even in auto mode, and `deny` rules

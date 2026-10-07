@@ -22,7 +22,7 @@ so a top-tier session model adds cost rather than capability unless the user ask
 | `scope-shaper` | sonnet (high) | read-only | Turns a fuzzy or oversized request into a minimal scope with acceptance criteria |
 | `implementer` | sonnet (medium) | Bash + edit | Code, tests and doc edits from a distilled brief |
 | `edge-case-hunter` | opus (high) | Bash + read-only | Verification pass before commit: boundaries, error paths, concurrency, protocol corner cases, interruption/resume, missing tests |
-| `design-advisor` | fable (high) | Bash (git read) + read-only | Escalation for decisions that are expensive to get wrong |
+| `design-advisor` | fable (xhigh) | Bash (git read) + read-only | Escalation for decisions that are expensive to get wrong |
 
 Each tier is used for what it does best, following the official model descriptions
 ([model overview](https://platform.claude.com/docs/en/about-claude/models/overview),
@@ -46,7 +46,9 @@ when a new model generation ships, since the price ratios between tiers move:
   generations did.
 - **Fable** (`design-advisor`): the top tier, which the official guidance aims at root-cause
   investigations and architecture decisions. It is reserved for the gated escalation path and
-  pins `effort: high` so a session-level override cannot push the costliest path higher.
+  runs at `xhigh`: it is spawned rarely, with a distilled brief, and depth is what the call pays
+  for (requirement interpretation, cross-crate design, ADR-worthy choices). The effort is pinned
+  so a session-level override cannot move the costliest path.
 
 Custom agents load `CLAUDE.md` into their context at every spawn. `code-scout` and
 `cargo-runner` set `omitClaudeMd: true`, since their prompts carry everything they need and

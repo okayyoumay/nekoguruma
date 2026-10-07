@@ -45,7 +45,7 @@ jobs:
 
           # One task at a time across both loops (ADR-243): while a loop PR is open, the routine
           # would only stop again, so do not start it.
-          claims=$(gh pr list --repo "$REPO" --state open --limit 100 \
+          claims=$(gh pr list --repo "$REPO" --state open --limit 1000 \
             --json number,title,labels,isCrossRepository \
             --jq '[.[] | select((.labels | map(.name) | any(. == "codeql" or . == "backlog-loop"))
                      or ((.isCrossRepository | not)
@@ -66,9 +66,15 @@ jobs:
           fi
 
           # Most urgent first; keep only the fields the skill uses, and stay well under the fire
-          # request's 64 KiB text limit by dropping the least urgent alerts.
+          # request's 64 KiB text limit by dropping the least urgent alerts. High and critical
+          # alerts go only as numbers in `private`: the skill never fixes them in a public PR, so
+          # they must not take the room the alerts it can fix need.
           jq -s -c --arg repo "$REPO" '
             add
+            | (map(select(.rule.security_severity_level == "critical"
+                          or .rule.security_severity_level == "high")) | map(.number) | sort) as $private
+            | map(select(.rule.security_severity_level != "critical"
+                         and .rule.security_severity_level != "high"))
             | sort_by(
                 ({"critical": 0, "high": 1, "medium": 2, "low": 3}[.rule.security_severity_level // ""] // 4),
                 ({"error": 0, "warning": 1, "note": 2}[.rule.severity // ""] // 3),
@@ -84,7 +90,8 @@ jobs:
                 message: (.most_recent_instance.message.text // "" | .[0:300]),
                 created_at
               })
-            | {repository: $repo, ref: "refs/heads/main", total: length, alerts: .}' alerts.json > payload.json
+            | {repository: $repo, ref: "refs/heads/main", total: (length + ($private | length)),
+               private: $private, alerts: .}' alerts.json > payload.json
           while [ "$(wc -c < payload.json)" -gt 60000 ]; do
             jq -c '.alerts |= .[0:(length * 3 / 4 | floor)]' payload.json > p.tmp && mv p.tmp payload.json
           done

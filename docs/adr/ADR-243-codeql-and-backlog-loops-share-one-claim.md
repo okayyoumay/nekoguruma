@@ -36,7 +36,9 @@ lets two runs that start together both pass it.
    routine through the routine API, passing a trimmed list as the fire request's text. It runs
    weekly and when an alert on `main` is fixed or dismissed, and does not fire while a PR in the
    claim set is open, so a merged fix leads straight to the next alert. The list goes only into
-   the request, never into the public log or an artifact.
+   the request, never into the public log or an artifact. High and critical alerts travel only
+   as numbers, so however many there are, they never crowd out of the trimmed list the alerts a
+   run can fix.
 
 ## Alternatives considered
 

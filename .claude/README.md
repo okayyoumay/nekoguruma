@@ -34,7 +34,7 @@ when a new model generation ships, since the price ratios between tiers move:
   running commands). It is the cheapest tier, has a 200K context window and carries no
   `effort` key (unsupported there), so it gets the agents whose output needs no judgment.
 - **Sonnet** (`scope-shaper`, `implementer`, `doc-sync-checker`): everyday reasoning at a
-  quarter of the top tier's price. `implementer` runs at `medium`, which fits implementation
+  fifth of the top tier's price. `implementer` runs at `medium`, which fits implementation
   from a distilled brief; `scope-shaper` at `high` for the scoping judgment. `doc-sync-checker`
   runs here rather than on Haiku because its audit is judgment (is an ADR needed, does a
   sentence read like spec wording, does a document update really cover the change) over a whole

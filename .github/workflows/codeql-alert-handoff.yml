@@ -89,15 +89,17 @@ jobs:
             jq -c '.alerts |= .[0:(length * 3 / 4 | floor)]' payload.json > p.tmp && mv p.tmp payload.json
           done
 
-          # The response and the payload stay out of the log.
-          status=$(jq -n -c --rawfile text payload.json '{text: $text}' \
+          # The response and the payload stay out of the log. The token reaches curl on stdin
+          # (printf is a builtin), so it never appears in a process's command line.
+          jq -n -c --rawfile text payload.json '{text: $text}' > body.json
+          status=$(printf 'Authorization: Bearer %s\n' "$ROUTINE_TOKEN" \
             | curl -sS -o /dev/null -w '%{http_code}' \
                 -X POST "https://api.anthropic.com/v1/claude_code/routines/$ROUTINE_ID/fire" \
-                -H "Authorization: Bearer $ROUTINE_TOKEN" \
+                -H @- \
                 -H "anthropic-beta: experimental-cc-routine-2026-04-01" \
                 -H "anthropic-version: 2023-06-01" \
                 -H "Content-Type: application/json" \
-                --data-binary @-)
-          rm -f alerts.json payload.json
+                --data-binary @body.json)
+          rm -f alerts.json payload.json body.json
           echo "Sent $count open alerts; routine fire returned HTTP $status."
           [ "$status" -ge 200 ] && [ "$status" -lt 300 ]

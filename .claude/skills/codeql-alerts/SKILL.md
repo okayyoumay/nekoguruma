@@ -27,7 +27,9 @@ alerts.
 The Claude GitHub App cannot read code scanning alerts, so the script sends the fine-grained
 personal access token in `NGR_CODE_SCANNING_TOKEN` when it is set: limited to this repository,
 with only the "Code scanning alerts: Read-only" permission, stored in the cloud environment.
-Never print the token or write it to a file. Exit statuses:
+The same token can instead be a network secret for `api.github.com` limited to the path
+`/repos/<owner>/<repo>/code-scanning/` (with the hyphen); the proxy then adds the header and
+the variable stays unset. Never print the token or write it to a file. Exit statuses:
 
 - 3 (401 or 403): the token is missing, expired or lacks the permission. Tell the maintainer
   that in one message and stop.

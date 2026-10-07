@@ -232,6 +232,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-241](ADR-241-sim-ecu-state-file.md) | Simulated ECU State Kept in a File Across Worker Processes | Accepted | `sim-ecu` snapshot, `sim-vci` `NGR_SIM_ECU_STATE` |
 | [ADR-242](ADR-242-ir-variable-length-and-nested-layouts.md) | IR Variable-Length Fields and Nested Layouts | Accepted | `diag-ir` declaration schema (`ir.fbs`) |
 | [ADR-243](ADR-243-codeql-and-backlog-loops-share-one-claim.md) | The CodeQL and Backlog Loops Share One PR-Based Claim | Accepted | `.claude/skills/codeql-alerts`, `backlog-loop` |
+| [ADR-244](ADR-244-write-job-journal-format.md) | Write-Job Journal as an Append-Only Record Log | Accepted | `agent` write-job journal |
 
 ## Status Legend
 
@@ -279,7 +280,7 @@ ADR-109 (amended by ADR-113), ADR-113, ADR-119 (dual-implementation sync duty re
 ADR-057 (amended by ADR-102), ADR-120, ADR-143, ADR-239
 
 ### Write Jobs & Resume
-ADR-229, ADR-233, ADR-235, ADR-241
+ADR-229, ADR-233, ADR-235, ADR-241, ADR-244
 
 ### Diagnostic IR
 ADR-233, ADR-242

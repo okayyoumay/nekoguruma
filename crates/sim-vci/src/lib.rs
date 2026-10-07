@@ -20,21 +20,8 @@ pub type PassThruUlong = u32;
 #[cfg(not(windows))]
 pub type PassThruUlong = std::os::raw::c_ulong;
 
-/// Calling convention. stdcall on Windows x86 only, standard C elsewhere.
-#[cfg(all(windows, target_arch = "x86"))]
-#[expect(unused_macros, reason = "the exports do not use it yet")]
-macro_rules! passthru_abi {
-    () => {
-        "stdcall"
-    };
-}
-#[cfg(not(all(windows, target_arch = "x86")))]
-#[expect(unused_macros, reason = "the exports do not use it yet")]
-macro_rules! passthru_abi {
-    () => {
-        "C"
-    };
-}
+// Calling convention (7.1.2): every export is `extern "system"`, which is stdcall (`WINAPI`) on
+// Windows x86, as in a vendor DLL, and the standard C convention on every other target.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
@@ -587,7 +574,7 @@ enum Command {
 /// # Safety
 /// `command` must be null or a valid NUL-terminated string.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn NgrSimVciControl(command: *const c_char) -> PassThruUlong {
+pub unsafe extern "system" fn NgrSimVciControl(command: *const c_char) -> PassThruUlong {
     if command.is_null() {
         return ERR_NULL_PARAMETER;
     }
@@ -617,7 +604,7 @@ pub unsafe extern "C" fn NgrSimVciControl(command: *const c_char) -> PassThruUlo
 /// # Safety
 /// Each pointer must be null or valid for a write of 80 bytes, the buffer size J2534-1 gives.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn PassThruReadVersion(
+pub unsafe extern "system" fn PassThruReadVersion(
     device_id: PassThruUlong,
     firmware_version: *mut c_char,
     dll_version: *mut c_char,
@@ -663,7 +650,7 @@ unsafe fn write_c_string(out: *mut c_char, text: &str) {
 /// # Safety
 /// `device_id` must be null or valid for a write.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn PassThruOpen(
+pub unsafe extern "system" fn PassThruOpen(
     _name: *const c_void,
     device_id: *mut PassThruUlong,
 ) -> PassThruUlong {
@@ -688,7 +675,7 @@ pub unsafe extern "C" fn PassThruOpen(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn PassThruClose(device_id: PassThruUlong) -> PassThruUlong {
+pub extern "system" fn PassThruClose(device_id: PassThruUlong) -> PassThruUlong {
     let mut bus = lock();
     if bus.device_lost && bus.device_ok(device_id) {
         // Closing is how the application recovers from a lost device; the call still reports
@@ -713,7 +700,7 @@ pub extern "C" fn PassThruClose(device_id: PassThruUlong) -> PassThruUlong {
 /// # Safety
 /// `channel_id` must be null or valid for a write.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn PassThruConnect(
+pub unsafe extern "system" fn PassThruConnect(
     device_id: PassThruUlong,
     protocol_id: PassThruUlong,
     flags: PassThruUlong,
@@ -744,7 +731,7 @@ pub unsafe extern "C" fn PassThruConnect(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn PassThruDisconnect(channel_id: PassThruUlong) -> PassThruUlong {
+pub extern "system" fn PassThruDisconnect(channel_id: PassThruUlong) -> PassThruUlong {
     let mut bus = match lock_connected() {
         Ok(bus) => bus,
         Err(status) => return status,
@@ -763,7 +750,7 @@ pub extern "C" fn PassThruDisconnect(channel_id: PassThruUlong) -> PassThruUlong
 /// `num_msgs` must be null or valid for reads and writes, and `msgs` null or valid for writes of
 /// `*num_msgs` messages.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn PassThruReadMsgs(
+pub unsafe extern "system" fn PassThruReadMsgs(
     channel_id: PassThruUlong,
     msgs: *mut PassThruMsg,
     num_msgs: *mut PassThruUlong,
@@ -850,7 +837,7 @@ pub unsafe extern "C" fn PassThruReadMsgs(
 /// `num_msgs` must be null or valid for reads and writes, and `msgs` null or valid for reads of
 /// `*num_msgs` messages.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn PassThruWriteMsgs(
+pub unsafe extern "system" fn PassThruWriteMsgs(
     channel_id: PassThruUlong,
     msgs: *const PassThruMsg,
     num_msgs: *mut PassThruUlong,
@@ -914,7 +901,7 @@ pub unsafe extern "C" fn PassThruWriteMsgs(
 /// The message pointers must be null or valid for reads, and `filter_id` null or valid for a
 /// write.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn PassThruStartMsgFilter(
+pub unsafe extern "system" fn PassThruStartMsgFilter(
     channel_id: PassThruUlong,
     filter_type: PassThruUlong,
     mask: *const PassThruMsg,
@@ -989,7 +976,7 @@ pub unsafe extern "C" fn PassThruStartMsgFilter(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn PassThruStopMsgFilter(
+pub extern "system" fn PassThruStopMsgFilter(
     channel_id: PassThruUlong,
     filter_id: PassThruUlong,
 ) -> PassThruUlong {
@@ -1009,7 +996,7 @@ pub extern "C" fn PassThruStopMsgFilter(
 
 /// Periodic messages are not simulated.
 #[unsafe(no_mangle)]
-pub extern "C" fn PassThruStartPeriodicMsg(
+pub extern "system" fn PassThruStartPeriodicMsg(
     channel_id: PassThruUlong,
     _msg: *const PassThruMsg,
     _msg_id: *mut PassThruUlong,
@@ -1027,7 +1014,7 @@ pub extern "C" fn PassThruStartPeriodicMsg(
 
 /// No periodic message can exist, so every ID is invalid.
 #[unsafe(no_mangle)]
-pub extern "C" fn PassThruStopPeriodicMsg(
+pub extern "system" fn PassThruStopPeriodicMsg(
     channel_id: PassThruUlong,
     _msg_id: PassThruUlong,
 ) -> PassThruUlong {
@@ -1046,7 +1033,7 @@ pub extern "C" fn PassThruStopPeriodicMsg(
 /// shorted to ground. A voltage outside the valid values gets `ERR_FAILED`, since the clause
 /// names no code for it.
 #[unsafe(no_mangle)]
-pub extern "C" fn PassThruSetProgrammingVoltage(
+pub extern "system" fn PassThruSetProgrammingVoltage(
     device_id: PassThruUlong,
     pin: PassThruUlong,
     voltage: PassThruUlong,
@@ -1091,7 +1078,7 @@ pub extern "C" fn PassThruSetProgrammingVoltage(
 /// # Safety
 /// `description` must be null or valid for a write of 80 bytes.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn PassThruGetLastError(description: *mut c_char) -> PassThruUlong {
+pub unsafe extern "system" fn PassThruGetLastError(description: *mut c_char) -> PassThruUlong {
     if description.is_null() {
         return ERR_NULL_PARAMETER;
     }
@@ -1108,7 +1095,7 @@ pub unsafe extern "C" fn PassThruGetLastError(description: *mut c_char) -> PassT
 /// # Safety
 /// For `READ_VBATT`, `output` must be null or valid for a write of an `unsigned long`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn PassThruIoctl(
+pub unsafe extern "system" fn PassThruIoctl(
     handle_id: PassThruUlong,
     ioctl_id: PassThruUlong,
     _input: *mut c_void,

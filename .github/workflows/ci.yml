@@ -191,6 +191,9 @@ jobs:
         with:
           key: ${{ matrix.target }}
       - run: cargo build --locked -p sim-vci -p j2534-0404-service -p iso22900-service --target ${{ matrix.target }} --release
+      # sim-vci's exports must carry the plain J2534 names (stdcall on win-x86, 7.1.2).
+      - name: Check sim-vci exports
+        run: PROFILE=release ./scripts/abi-roundtrip.sh ${{ matrix.target }}
       - name: Check DLL imports
         run: |
           for exe in target/${{ matrix.target }}/release/*.exe; do

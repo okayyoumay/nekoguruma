@@ -39,9 +39,9 @@ Most priorities here were set under the earlier scale these crates were develope
 ### Prioritized Backlog
 
 - **P1**: Add regression checks for target-specific callback/function-pointer ABI handling.
-- **P1**: Expand callback lifecycle tests, including register/unregister race scenarios.
 - **P1**: Document borrowed vs owned item lifetime rules with concrete examples.
 - **P2**: Consolidate and publish an explicit error mapping table.
+- **P3**: `crates/iso22900/tests/callback_lifecycle.rs`'s `unregistering_during_a_delivery_waits_for_the_callback_to_return` can only make it near-certain, not prove, that `DPduApi::unregister_event_callback` (`crates/iso22900/src/lib.rs`) is waiting on the callback registry's lock before the blocked callback returns: the test waits until the unregistering thread reports it is about to call it, then for a fixed window. Forcing the interleaving needs a test-only hook in the wrapper that fires just before the lock is taken (for example behind a test feature), which a new test file alone cannot add. Done when: the test synchronizes on such a hook and releases the callback only after it fired.
 
 ## `j2534-0404-service`
 

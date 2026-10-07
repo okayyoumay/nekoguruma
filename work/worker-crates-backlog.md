@@ -11,7 +11,6 @@ Most priorities here were set under the earlier scale these crates were develope
 ### Prioritized Backlog
 
 - **P1**: Add ABI parity checks for exported callbacks and function signatures.
-- **P1**: Add repeated construct/destruct cleanup regression tests.
 - **P2**: Document parallel-test constraints and recommended reset strategy.
 
 ## `iso22900-service`

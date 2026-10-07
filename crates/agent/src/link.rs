@@ -49,8 +49,9 @@ impl LinkConfig {
         }
     }
 
-    /// Refuses values the worker would read differently from the host: a zero timing turns a
-    /// limit off or makes every response pending expire at once, and a timing above
+    /// Refuses values the worker would read differently from the host: the worker replaces a
+    /// zero P2 or P2* with its own default and reads a zero 0x78 completion timeout as no
+    /// limit, while the host would compute its deadline from zero; and a timing above
     /// [`MAX_TIMING_MS`] does not fit the worker's microsecond ComParams.
     pub fn validate(&self) -> Result<(), HostError> {
         for timing in [self.p2_max_ms, self.p2_star_ms, self.rc78_completion_ms] {
@@ -125,7 +126,7 @@ async fn comparam_id(
     )
 }
 
-/// Opens the first module, creates a logical link for `config`, sets its ComParams and the
+/// Opens the worker's only module (several are refused), creates a logical link for `config`, sets its ComParams and the
 /// response ID table, connects it and subscribes to its events (ADR-235 item 4). The worker
 /// answers 0x78 itself (`CP_RC78Handling`), so the procedure only sees final responses. If a
 /// step fails, what was already opened is closed again.

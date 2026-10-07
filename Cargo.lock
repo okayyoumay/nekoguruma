@@ -8,7 +8,9 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "diag-ir",
+ "j2534-0404-registry",
  "serde",
+ "serde_json",
  "shared-proto",
  "thiserror",
  "tokio",

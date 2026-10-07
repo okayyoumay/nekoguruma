@@ -505,13 +505,20 @@ impl SimEcu {
             return Exchange::none();
         }
         let power_cycles = self.power_cycles;
+        let delay_before = self.security_delay_until;
         let (exchange, sent_after_ms) = self.handle(addressing, message);
         if self.power_cycles != power_cycles {
             // The ECU applies a reset at once, but on a vehicle it follows the response, so a
-            // security delay the reset restarts runs from when the response goes out.
-            let shift = Duration::from_millis(sent_after_ms.into());
-            if let Some(until) = &mut self.security_delay_until {
-                *until = until.saturating_add(shift);
+            // security delay the reset restarts runs from when the response goes out, and one
+            // that runs out before then stays over.
+            let reset_at = self
+                .clock
+                .now()
+                .saturating_add(Duration::from_millis(sent_after_ms.into()));
+            if delay_before.is_some_and(|until| until <= reset_at) {
+                self.expire_security_delay();
+            } else if let Some(until) = &mut self.security_delay_until {
+                *until = until.saturating_add(Duration::from_millis(sent_after_ms.into()));
             }
         }
         // Any request that reaches the ECU restarts tS3_Server, supported or not.

@@ -1751,3 +1751,56 @@ fn a_delay_restarted_by_an_ecu_reset_runs_from_its_response() {
     clock.advance(ms(1));
     assert!(!ecu.security_delay_active());
 }
+
+#[test]
+fn a_delayed_reset_does_not_revive_a_delay_that_ends_before_its_response() {
+    let (mut ecu, clock) = ecu_with_clock(EcuConfig {
+        security_delay_ms: Some(2_000),
+        response_delay_ms: 500,
+        ..config()
+    });
+    enter(&mut ecu, Session::Extended);
+    exceed_attempts(&mut ecu);
+    // The delay ends at 2000 ms; the reset response goes out at 2400 ms.
+    clock.advance(ms(1_900));
+    ecu.exchange(Addressing::Physical, &[0x11, 0x01]);
+    clock.advance(ms(600));
+    assert!(!ecu.security_delay_active());
+}
+
+#[test]
+fn responses_pending_at_a_power_loss_do_not_hold_a_later_session() {
+    let (mut ecu, clock) = ecu_with_clock(EcuConfig {
+        s3_server_ms: Some(1_000),
+        ..config()
+    });
+    enter(&mut ecu, Session::Extended);
+    ecu.inject(Fault::DelayResponse { ms: 10_000 });
+    assert_eq!(
+        ecu.exchange(Addressing::Physical, &[0x3E, 0x00]).delay_ms,
+        10_000
+    );
+    ecu.inject(Fault::PowerLoss);
+    ecu.reconnect();
+    enter(&mut ecu, Session::Extended);
+    clock.advance(ms(1_000));
+    ecu.check_timers();
+    assert_eq!(ecu.session, Session::Default);
+}
+
+#[test]
+fn a_dropped_reset_response_still_times_the_restarted_delay() {
+    let (mut ecu, clock) = ecu_with_clock(EcuConfig {
+        security_delay_ms: Some(2_000),
+        response_delay_ms: 500,
+        ..config()
+    });
+    enter(&mut ecu, Session::Extended);
+    exceed_attempts(&mut ecu);
+    ecu.inject(Fault::DropResponse);
+    assert_eq!(ecu.request(&[0x11, 0x01]), SimResponse::NoResponse);
+    clock.advance(ms(2_499));
+    assert!(ecu.security_delay_active());
+    clock.advance(ms(1));
+    assert!(!ecu.security_delay_active());
+}

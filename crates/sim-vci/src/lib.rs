@@ -287,8 +287,8 @@ fn lock() -> MutexGuard<'static, Bus> {
     bus
 }
 
-/// [`lock`] for a J2534 call that needs the device: fails with `ERR_DEVICE_NOT_CONNECTED` while
-/// the VCI is unplugged or the device is lost (J2534-1 6.10.1).
+/// [`lock`] for a J2534 call: fails with `ERR_DEVICE_NOT_CONNECTED` while the device is lost
+/// (J2534-1 6.10.1).
 fn lock_connected() -> Result<MutexGuard<'static, Bus>, PassThruUlong> {
     let bus = lock();
     if bus.unreachable() {
@@ -347,8 +347,10 @@ impl Bus {
         self.device_open && device_id == self.device_id
     }
 
+    /// Whether the open device is lost, so every call but `PassThruOpen` fails with
+    /// `ERR_DEVICE_NOT_CONNECTED`. With no device open, only `PassThruOpen` needs the VCI.
     fn unreachable(&self) -> bool {
-        !self.vci_present || self.device_lost
+        self.device_lost
     }
 
     /// Closes the device: its channels go with their filters and unread responses, and every
@@ -396,9 +398,11 @@ impl Bus {
         Ok(())
     }
 
-    /// Applies the `*.json` command files in the control directory, in file-name order. A file
-    /// applied is deleted; one that cannot be read, parsed or applied is renamed to
-    /// `*.rejected`, so it is not tried again and the test can see it failed.
+    /// Applies the `*.json` command files in the control directory, in file-name order. Each
+    /// file is claimed by renaming it to `*.applying` first, so a command is applied at most
+    /// once even if the file cannot be deleted afterwards; a file that cannot be claimed is
+    /// left for a later call. A file applied is deleted; one that cannot be read, parsed or
+    /// applied is renamed to `*.rejected`, so the test can see it failed.
     fn apply_control_files(&mut self) {
         let Some(dir) = &self.control_dir else {
             return;
@@ -412,14 +416,18 @@ impl Bus {
             .collect();
         files.sort();
         for path in files {
-            let applied = std::fs::read_to_string(&path)
+            let claimed = path.with_extension("applying");
+            if std::fs::rename(&path, &claimed).is_err() {
+                continue;
+            }
+            let applied = std::fs::read_to_string(&claimed)
                 .ok()
                 .and_then(|text| serde_json::from_str::<Command>(&text).ok())
                 .is_some_and(|command| self.apply(command).is_ok());
             if applied {
-                let _ = std::fs::remove_file(&path);
+                let _ = std::fs::remove_file(&claimed);
             } else {
-                let _ = std::fs::rename(&path, path.with_extension("rejected"));
+                let _ = std::fs::rename(&claimed, path.with_extension("rejected"));
             }
         }
     }
@@ -638,6 +646,9 @@ pub unsafe extern "C" fn PassThruOpen(
         Ok(bus) => bus,
         Err(status) => return status,
     };
+    if !bus.vci_present {
+        return ERR_DEVICE_NOT_CONNECTED;
+    }
     if device_id.is_null() {
         return ERR_NULL_PARAMETER;
     }
@@ -732,8 +743,14 @@ pub unsafe extern "C" fn PassThruReadMsgs(
     num_msgs: *mut PassThruUlong,
     timeout: PassThruUlong,
 ) -> PassThruUlong {
-    // An unreachable device is reported by the loop below, which also sets `*num_msgs`.
     let mut bus = lock();
+    if bus.unreachable() {
+        if !num_msgs.is_null() {
+            // SAFETY: checked for null; the caller guarantees it is valid.
+            unsafe { num_msgs.write(0) };
+        }
+        return ERR_DEVICE_NOT_CONNECTED;
+    }
     if msgs.is_null() || num_msgs.is_null() {
         return ERR_NULL_PARAMETER;
     }
@@ -814,18 +831,24 @@ pub unsafe extern "C" fn PassThruWriteMsgs(
     _timeout: PassThruUlong,
 ) -> PassThruUlong {
     let mut bus = lock();
+    // Nothing is sent when the call fails before the first message.
+    let fail = |status| {
+        if !num_msgs.is_null() {
+            // SAFETY: checked for null; the caller guarantees it is valid.
+            unsafe { num_msgs.write(0) };
+        }
+        status
+    };
+    if bus.unreachable() {
+        return fail(ERR_DEVICE_NOT_CONNECTED);
+    }
     if msgs.is_null() || num_msgs.is_null() {
         return ERR_NULL_PARAMETER;
     }
     // SAFETY: checked for null above; the caller guarantees it is valid.
     let wanted = unsafe { num_msgs.read() } as usize;
-    if bus.unreachable() {
-        // SAFETY: as above.
-        unsafe { num_msgs.write(0) };
-        return ERR_DEVICE_NOT_CONNECTED;
-    }
     let Some(protocol_id) = bus.channels.get(&channel_id).map(|c| c.protocol_id) else {
-        return ERR_INVALID_CHANNEL_ID;
+        return fail(ERR_INVALID_CHANNEL_ID);
     };
     let mut sent = 0;
     let status = loop {

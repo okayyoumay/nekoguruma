@@ -458,7 +458,7 @@ impl SimEcu {
 /// disconnects, crashes, and write failures". Serialized in snake case (`"power_loss"`,
 /// `{"delay_response": {"ms": 500}}`), the form `sim-vci`'s control commands take.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum Fault {
     /// The response to the next request goes out `ms` later than configured.
     DelayResponse { ms: u32 },

@@ -114,7 +114,7 @@ A control command is a JSON object tagged by `command`:
 | `{"command": "disconnect_vci"}` | unplugs the VCI |
 | `{"command": "connect_vci"}` | plugs it back in |
 
-Unknown commands and unknown fields are rejected. A command that needs the ECU creates it first,
+Unknown commands and unknown fields, in the command or in the fault, are rejected. A command that needs the ECU creates it first,
 as the first `PassThruOpen` does. There are two ways to send one:
 
 - `NgrSimVciControl(const char *command)` applies one command in the calling process and returns
@@ -122,19 +122,24 @@ as the first `PassThruOpen` does. There are two ways to send one:
   ECU configuration it cannot read.
 - `NGR_SIM_VCI_CONTROL_DIR` names a directory, read once when the library is first called. For
   a test driving a worker process that loaded the library. At the start of every call into the
-  library, and every 20 ms while `PassThruReadMsgs` waits, `sim-vci` applies the `*.json` files
-  there in file-name order and deletes each one; a file it cannot read, parse or apply is
-  renamed to `*.rejected`. Write each file under another name (such as `*.tmp`) and rename it,
-  so it is never read half-written, and name the files so that their order is the order to
-  apply them in (`001.json`, `002.json`, ...).
+  library except `PassThruGetLastError`, and every 20 ms while `PassThruReadMsgs` waits,
+  `sim-vci` applies the `*.json` files there in file-name order. It claims each file by renaming
+  it to `*.applying` before reading it, so a command is applied at most once (a file it cannot
+  claim is tried again at the next call), and deletes it once applied; a file it cannot read,
+  parse or apply is renamed to `*.rejected`. Write each file as UTF-8 without a byte-order mark,
+  under another name (such as `*.tmp`), and rename it when complete, so it is never read
+  half-written. Name the files so that their order is the order to apply them in (`001.json`,
+  `002.json`, ...).
 
-While the VCI is unplugged, every function except `PassThruGetLastError` returns
-`ERR_DEVICE_NOT_CONNECTED`, and a waiting `PassThruReadMsgs` returns with it at once. Following
-clause 6.10.1, a device that was open when the VCI went away stays lost after it is plugged back
-in: every call returns `ERR_DEVICE_NOT_CONNECTED` until `PassThruClose` on that device, which
-releases it (with its channels and unread responses) and still reports the error. The next
-`PassThruOpen` returns a new device ID. A device that was closed when the VCI went away can be
-opened again as soon as it is back. The ECU keeps its state throughout.
+If the device is open when the VCI is unplugged, the device is lost: every function except
+`PassThruGetLastError` returns `ERR_DEVICE_NOT_CONNECTED`, before checking its arguments, and a
+waiting `PassThruReadMsgs` returns with it at once, reporting the messages it had already read.
+Following clause 6.10.1, the device stays lost after the VCI is plugged back in, until
+`PassThruClose` on that device, which releases it (with its channels and unread responses) and
+still reports the error. The next `PassThruOpen` returns a new device ID. With no device open,
+an unplugged VCI only makes `PassThruOpen` fail with `ERR_DEVICE_NOT_CONNECTED`; the other calls
+fail as they do for any closed device, and the open succeeds once the VCI is back. The ECU keeps
+its state throughout.
 
 A VCI crash, as opposed to a disconnect, is not simulated.
 

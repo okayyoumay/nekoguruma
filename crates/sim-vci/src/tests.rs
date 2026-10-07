@@ -998,8 +998,8 @@ fn a_lost_device_stays_lost_until_closed_and_reopens_with_a_new_id() {
 }
 
 #[test]
-fn a_vci_unplugged_while_closed_only_blocks_until_plugged_back() {
-    let _f = fixture();
+fn a_vci_unplugged_while_closed_only_fails_the_open_until_plugged_back() {
+    let f = fixture();
     assert_eq!(PassThruClose(DEVICE_ID), STATUS_NOERROR);
     assert_eq!(control(r#"{"command": "disconnect_vci"}"#), STATUS_NOERROR);
     let mut device = 0;
@@ -1007,7 +1007,9 @@ fn a_vci_unplugged_while_closed_only_blocks_until_plugged_back() {
         unsafe { PassThruOpen(ptr::null(), &mut device) },
         ERR_DEVICE_NOT_CONNECTED
     );
-    assert_eq!(PassThruClose(DEVICE_ID), ERR_DEVICE_NOT_CONNECTED);
+    // With no device open, the other calls fail as they do for any closed device.
+    assert_eq!(PassThruClose(DEVICE_ID), ERR_INVALID_DEVICE_ID);
+    assert_eq!(PassThruDisconnect(f.channel), ERR_INVALID_CHANNEL_ID);
     assert_eq!(control(r#"{"command": "connect_vci"}"#), STATUS_NOERROR);
     assert_eq!(
         unsafe { PassThruOpen(ptr::null(), &mut device) },
@@ -1024,9 +1026,12 @@ fn a_disconnect_ends_a_waiting_read() {
         std::thread::sleep(Duration::from_millis(50));
         control(r#"{"command": "disconnect_vci"}"#)
     });
-    assert_eq!(read(f.channel, 1, 5000), (ERR_DEVICE_NOT_CONNECTED, vec![]));
-    assert!(start.elapsed() < Duration::from_millis(4000));
+    let result = read(f.channel, 1, 5000);
+    let elapsed = start.elapsed();
+    // Joined before asserting, so a failure cannot unplug the VCI under the next test.
     assert_eq!(unplug.join().expect("no panic"), STATUS_NOERROR);
+    assert_eq!(result, (ERR_DEVICE_NOT_CONNECTED, vec![]));
+    assert!(elapsed < Duration::from_millis(4000));
 }
 
 /// A fresh, empty control directory, removed when the test ends.
@@ -1101,8 +1106,138 @@ fn a_control_file_reaches_a_waiting_read() {
         std::fs::write(&tmp, r#"{"command": "disconnect_vci"}"#).expect("command file");
         std::fs::rename(&tmp, path.join("001.json")).expect("rename");
     });
-    assert_eq!(read(f.channel, 1, 5000), (ERR_DEVICE_NOT_CONNECTED, vec![]));
-    assert!(start.elapsed() < Duration::from_millis(4000));
+    let result = read(f.channel, 1, 5000);
+    let elapsed = start.elapsed();
     unplug.join().expect("no panic");
+    assert_eq!(result, (ERR_DEVICE_NOT_CONNECTED, vec![]));
+    assert!(elapsed < Duration::from_millis(4000));
     assert!(dir.files().is_empty());
+}
+
+#[test]
+fn every_call_but_get_last_error_fails_on_a_lost_device() {
+    let f = fixture();
+    assert_eq!(control(r#"{"command": "disconnect_vci"}"#), STATUS_NOERROR);
+    assert_eq!(control(r#"{"command": "connect_vci"}"#), STATUS_NOERROR);
+    let m = msg(ECU_PHYSICAL_REQUEST_ID, &[0x3E, 0x00]);
+    let mask = msg_bytes(&[0xFF; 4]);
+    let mut out = 0;
+    let mut version = [[0 as c_char; 80]; 3];
+    let [fw, dll, api] = &mut version;
+    let calls: [(&str, PassThruUlong); 13] = [
+        ("Open", unsafe { PassThruOpen(ptr::null(), &mut out) }),
+        ("Connect", unsafe {
+            PassThruConnect(DEVICE_ID, ISO15765, 0, 500_000, &mut out)
+        }),
+        ("Disconnect", PassThruDisconnect(f.channel)),
+        ("ReadMsgs", read(f.channel, 1, 0).0),
+        ("ReadMsgs(null)", unsafe {
+            PassThruReadMsgs(f.channel, ptr::null_mut(), ptr::null_mut(), 0)
+        }),
+        ("WriteMsgs(null)", unsafe {
+            PassThruWriteMsgs(f.channel, ptr::null(), ptr::null_mut(), 0)
+        }),
+        (
+            "StartPeriodicMsg",
+            PassThruStartPeriodicMsg(f.channel, &m, &mut out, 100),
+        ),
+        ("StopPeriodicMsg", PassThruStopPeriodicMsg(f.channel, 1)),
+        ("StartMsgFilter", unsafe {
+            PassThruStartMsgFilter(
+                f.channel,
+                filter::FLOW_CONTROL_FILTER as PassThruUlong,
+                &mask,
+                &mask,
+                &mask,
+                &mut out,
+            )
+        }),
+        ("StopMsgFilter", PassThruStopMsgFilter(f.channel, 1)),
+        (
+            "SetProgrammingVoltage",
+            PassThruSetProgrammingVoltage(DEVICE_ID, 6, 12_000),
+        ),
+        ("ReadVersion", unsafe {
+            PassThruReadVersion(
+                DEVICE_ID,
+                fw.as_mut_ptr(),
+                dll.as_mut_ptr(),
+                api.as_mut_ptr(),
+            )
+        }),
+        (
+            "Ioctl",
+            PassThruIoctl(f.channel, 0, ptr::null_mut(), ptr::null_mut()),
+        ),
+    ];
+    for (name, status) in calls {
+        assert_eq!(status, ERR_DEVICE_NOT_CONNECTED, "{name}");
+    }
+    let mut n = 1;
+    assert_eq!(
+        unsafe { PassThruWriteMsgs(f.channel, &m, &mut n, 100) },
+        ERR_DEVICE_NOT_CONNECTED
+    );
+    assert_eq!(n, 0);
+    let mut text = [0 as c_char; 80];
+    assert_eq!(
+        unsafe { PassThruGetLastError(text.as_mut_ptr()) },
+        STATUS_NOERROR
+    );
+    assert_eq!(PassThruClose(DEVICE_ID), ERR_DEVICE_NOT_CONNECTED);
+}
+
+#[test]
+fn a_disconnect_during_a_read_reports_the_messages_already_read() {
+    let f = fixture();
+    write(f.channel, ECU_PHYSICAL_REQUEST_ID, &[0x3E, 0x00]);
+    let unplug = std::thread::spawn(|| {
+        std::thread::sleep(Duration::from_millis(100));
+        control(r#"{"command": "disconnect_vci"}"#)
+    });
+    let result = read(f.channel, 2, 5000);
+    assert_eq!(unplug.join().expect("no panic"), STATUS_NOERROR);
+    assert_eq!(
+        result,
+        (ERR_DEVICE_NOT_CONNECTED, vec![response(&[0x7E, 0x00])])
+    );
+}
+
+#[test]
+fn a_write_to_an_unknown_channel_reports_nothing_sent() {
+    let _f = fixture();
+    let m = msg(ECU_PHYSICAL_REQUEST_ID, &[0x3E, 0x00]);
+    let mut n = 1;
+    assert_eq!(
+        unsafe { PassThruWriteMsgs(99, &m, &mut n, 100) },
+        ERR_INVALID_CHANNEL_ID
+    );
+    assert_eq!(n, 0);
+}
+
+#[test]
+fn a_control_file_being_applied_is_not_applied_again() {
+    let f = fixture();
+    let dir = ControlDir::new("claim");
+    // A file left in its claimed state, as when deleting it after applying failed, is not
+    // picked up again.
+    std::fs::write(
+        dir.0.join("001.applying"),
+        r#"{"command": "inject_fault", "fault": "power_loss"}"#,
+    )
+    .expect("claimed file");
+    write(f.channel, ECU_PHYSICAL_REQUEST_ID, &[0x3E, 0x00]);
+    assert_eq!(with_ecu(|ecu| ecu.power_cycles()), 0);
+    assert_eq!(dir.files(), ["001.applying"]);
+}
+
+#[test]
+fn faults_with_unknown_fields_are_rejected() {
+    let _f = fixture();
+    assert_eq!(
+        control(
+            r#"{"command": "inject_fault", "fault": {"delay_response": {"ms": 5, "extra": 1}}}"#
+        ),
+        ERR_FAILED
+    );
 }

@@ -201,8 +201,10 @@ async fn inject(control_dir: &Path) {
     tokio::time::sleep(Duration::from_millis(300)).await;
     send(control_dir, "006", r#"{"command": "disconnect_vci"}"#);
     let lost = job.await.expect("the job task should not panic");
+    // Normally the job is waiting for the response by then; on a slow runner the disconnect
+    // may come while it still opens its link.
     assert!(
-        matches!(lost, Err(JobError::Host { pc: 1, .. })),
+        matches!(lost, Err(JobError::Host { pc: 1, .. } | JobError::Link(_))),
         "{lost:?}"
     );
     // Closing the lost device and opening it again recovers once the VCI is back

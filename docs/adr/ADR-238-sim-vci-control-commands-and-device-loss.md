@@ -20,24 +20,27 @@ the J2534 API, as it would on a vendor library. So a test needs a channel into a
 1. **Commands as JSON.** A control command is a JSON object tagged by `command`:
    `inject_fault` (with a `sim_ecu::Fault` in snake case, such as `"power_loss"` or
    `{"delay_response": {"ms": 500}}`), `reconnect_ecu`, `disconnect_vci` and `connect_vci`.
-   Unknown commands and unknown fields are rejected.
+   Unknown commands and unknown fields, in the command or in the fault, are rejected.
 2. **Two ways in.** The extra export `NgrSimVciControl(const char *command)` applies one command,
    for a test that loads the library into its own process. For a worker process,
-   `NGR_SIM_VCI_CONTROL_DIR` names a directory: at the start of every J2534 call, and every
-   20 ms while `PassThruReadMsgs` waits, `sim-vci` applies the `*.json` files there in file-name
-   order and deletes each one; a file it cannot read, parse or apply is renamed to
-   `*.rejected`. A test writes each file under another name and renames it, so a half-written
-   file is never read.
+   `NGR_SIM_VCI_CONTROL_DIR` names a directory: at the start of every J2534 call except
+   `PassThruGetLastError`, and every 20 ms while `PassThruReadMsgs` waits, `sim-vci` applies
+   the `*.json` files there in file-name order. It claims each file by renaming it before
+   reading it, so a command is applied at most once even if the file cannot be deleted
+   afterwards; a file it cannot read, parse or apply is renamed to `*.rejected`. A test writes
+   each file under another name and renames it, so a half-written file is never read.
    Files rather than a socket keep the library free of threads of its own (a thread would have
    to stop before the library is unloaded) and need nothing beyond `std`. A command takes effect
    at the next J2534 call, which is what a test needs: the call it makes next through the
    worker is the first to see the fault.
-3. **Device loss follows J2534-1 6.10.1.** While the VCI is unplugged, every function except
-   `PassThruGetLastError` returns `ERR_DEVICE_NOT_CONNECTED`, and a waiting read ends with it. If
-   the device was open when the VCI went away, the device stays lost after the VCI is plugged
-   back in: every call keeps returning the error until `PassThruClose` on that device, which
-   releases it and still reports the error. The next `PassThruOpen` then returns a new device
-   ID. A device that was closed when the VCI went away only fails to open until it is back.
+3. **Device loss follows J2534-1 6.10.1.** If the device is open when the VCI is unplugged, it
+   is lost: every function except `PassThruGetLastError` returns `ERR_DEVICE_NOT_CONNECTED`, and
+   a waiting read ends with it. The device stays lost after the VCI is plugged back in, until
+   `PassThruClose` on that device, which releases it and still reports the error. The next
+   `PassThruOpen` then returns a new device ID. With no device open there is nothing to lose:
+   an unplugged VCI only makes `PassThruOpen` fail, and the other calls answer as for any
+   closed device (`ERR_INVALID_DEVICE_ID`, `ERR_INVALID_CHANNEL_ID`, clause 7.2.1), so the
+   error is not sticky there and the open succeeds once the VCI is back.
    The ECU behind the VCI keeps its state through all of this, as a vehicle does when the
    tester's cable is pulled.
 

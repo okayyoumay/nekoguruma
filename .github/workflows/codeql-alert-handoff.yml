@@ -88,54 +88,58 @@ jobs:
             exit 0
           fi
 
-          # Most urgent first; keep only the fields the skill uses, and stay well under the fire
-          # request's 64 KiB text limit by dropping the least urgent alerts. High and critical
-          # alerts go in `private` with the same details: the skill never fixes them in a public
-          # PR. Each list has its own share of the room, so neither crowds out the other.
-          jq -s -c --arg repo "$REPO" '
+          # Keep only the fields the skill uses and stay under the fire request's 64 KiB text
+          # limit. High and critical alerts go in `private` with the same details, in a share of
+          # their own (at most 28000 bytes), so neither list crowds out the other; `alerts` gets
+          # the rest of 58000 bytes. `alerts` keeps its most urgent part, since a fixed or
+          # dismissed alert makes room for the next. Private alerts can stay open longer, so
+          # when they do not all fit, each run starts its window further along the list (by run
+          # number) and every one is sent over successive runs.
+          jq -s -c --arg repo "$REPO" --argjson run "$GITHUB_RUN_NUMBER" '
             def high: .rule.security_severity_level == "critical"
                       or .rule.security_severity_level == "high";
-            def slim:
+            def urgency:
               sort_by(
-                ({"critical": 0, "high": 1, "medium": 2, "low": 3}[.rule.security_severity_level // ""] // 4),
-                ({"error": 0, "warning": 1, "note": 2}[.rule.severity // ""] // 3),
-                .created_at, .number)
-              | map({
-                  number,
-                  rule: .rule.id,
-                  security_severity: .rule.security_severity_level,
-                  severity: .rule.severity,
-                  path: .most_recent_instance.location.path,
-                  start_line: .most_recent_instance.location.start_line,
-                  end_line: .most_recent_instance.location.end_line,
-                  message: (.most_recent_instance.message.text // "" | .[0:300]),
-                  created_at
-                });
+                ({"critical": 0, "high": 1, "medium": 2, "low": 3}[.security_severity // ""] // 4),
+                ({"error": 0, "warning": 1, "note": 2}[.severity // ""] // 3),
+                .created_at, .number);
+            def slim:
+              map({
+                number,
+                rule: .rule.id,
+                security_severity: .rule.security_severity_level,
+                severity: .rule.severity,
+                path: .most_recent_instance.location.path,
+                start_line: .most_recent_instance.location.start_line,
+                end_line: .most_recent_instance.location.end_line,
+                message: (.most_recent_instance.message.text // "" | .[0:300]),
+                created_at
+              }) | urgency;
+            # The longest prefix whose JSON fits in $budget bytes.
+            def fit($budget):
+              reduce .[] as $a ({out: [], size: 2, full: false};
+                if .full then .
+                else ($a | tojson | utf8bytelength + 1) as $n
+                  | if .size + $n > $budget then .full = true
+                    else .out += [$a] | .size += $n end
+                end) | .out;
             add
+            | (map(select(high)) | slim) as $p
+            | (map(select(high | not)) | slim) as $rest
+            | ($p | fit(28000) | length) as $k
+            | (if $k < ($p | length)
+                 then (($run - 1) * $k % ($p | length)) as $o
+                      | ($p[$o:] + $p[:$o]) | fit(28000) | urgency
+                 else $p end) as $private
             | {repository: $repo, ref: "refs/heads/main", total: length,
-               private_total: (map(select(high)) | length),
-               private: (map(select(high)) | slim),
-               alerts: (map(select(high | not)) | slim)}' alerts.json > payload.json
-          # Trim each list to 30000 bytes at most, then the whole payload to 60000. `alerts` keeps
-          # its most urgent part, since a fixed or dismissed alert makes room for the next. The
-          # private alerts stay open until fixed privately, so when they do not all fit, each run
-          # sends the next window of them (by run number) instead of the same first part.
-          full_private=$(jq -c .private payload.json)
-          for list in private alerts; do
-            while [ "$(jq -c --arg l "$list" '.[$l]' payload.json | wc -c)" -gt 30000 ]; do
-              jq -c --arg l "$list" '.[$l] |= .[0:(length * 3 / 4 | floor)]' payload.json > p.tmp \
-                && mv p.tmp payload.json
-            done
-          done
-          jq -c --argjson all "$full_private" --argjson run "$GITHUB_RUN_NUMBER" '
-            (.private | length) as $k
-            | if $k > 0 and $k < ($all | length) then
-                (($run - 1) * $k % ($all | length)) as $o
-                | .private = (($all + $all)[$o:$o + $k])
-              else . end' payload.json > p.tmp && mv p.tmp payload.json
-          while [ "$(wc -c < payload.json)" -gt 60000 ]; do
-            jq -c '.alerts |= .[0:(length * 3 / 4 | floor)]' payload.json > p.tmp && mv p.tmp payload.json
-          done
+               private_total: ($p | length), private: $private, alerts: []}
+            | (tojson | utf8bytelength) as $used
+            | .alerts = ($rest | fit(58000 - $used))' alerts.json > payload.json
+          size=$(wc -c < payload.json)
+          if [ "$size" -gt 60000 ]; then
+            echo "::error::The alert payload is $size bytes, over the 60000-byte budget."
+            exit 1
+          fi
 
           # The response and the payload stay out of the log. The token reaches curl on stdin
           # (printf is a builtin), so it never appears in a process's command line.

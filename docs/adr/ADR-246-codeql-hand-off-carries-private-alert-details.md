@@ -19,8 +19,9 @@ request; they never reach the workflow log, an artifact or the repository, which
 1. **Same details for every alert.** The payload's `private` list carries the same fields as
    `alerts` (number, rule, severities, place, message, creation time), plus `private_total`,
    the count of all open high and critical alerts.
-2. **Separate shares of the payload.** Each list is trimmed to half the payload budget before
-   the whole payload is trimmed, so neither list crowds out the other. High and critical alerts
+2. **Separate shares of the payload.** The high and critical list gets a byte budget of its
+   own and the other list the rest of the payload budget, each filled whole alert by whole
+   alert, so neither list crowds out the other. High and critical alerts
    stay open until they are fixed privately, so a fixed first part would starve the rest: when
    they do not all fit, each run sends the next window of them, chosen by the workflow's run
    number, and over successive runs every one is sent.

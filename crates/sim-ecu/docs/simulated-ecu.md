@@ -84,7 +84,7 @@ or `reconnect()` of the simulated ECU leaves it as it is.
 |---|---|
 | F186 | active session (diagnosticSessionType value) |
 | F187 | `EcuConfig::part_number` |
-| F189 | `EcuConfig::sw_version` |
+| F189 | the running software version (`SimEcu::running_sw_version`): `EcuConfig::sw_version` at power-up, then the version of the last verified download (below) |
 | F190 | `EcuConfig::vin`; writable as 17 ASCII alphanumeric bytes, behind security access |
 | FD00 | flash state: phase code (1 byte), block number (4 bytes), bytes received of the current download (4 bytes), big endian |
 
@@ -118,6 +118,12 @@ when an earlier SecurityAccess failed on a single false key; the simulator does 
 - `FF01` checkProgrammingDependencies is the integrity check after RequestTransferExit. Its
   routineStatusRecord is one byte: 00 image correct (state becomes verified), 01 image incorrect
   (`EcuConfig::fail_checksum`).
+- A download that passes the check installs `EcuConfig::downloaded_sw_version` (when set): F189
+  keeps reporting the old version until the next power cycle (ECU reset, power loss or
+  `reconnect()`) and the new one from then on. An erase or a failed check before that power
+  cycle withdraws the install. This lets a test read back the version after an interruption
+  between the transfer and its verification, as the state check of design 8.2.5 does: a
+  restart before the check still reports the old version, one after it the new one.
 - RequestDownload accepts addresses in `FLASH_START .. FLASH_START + FLASH_SIZE` and needs an
   erased flash; otherwise NRC 22. The positive response reports maxNumberOfBlockLength
   `MAX_BLOCK_LENGTH` (whole TransferData request).

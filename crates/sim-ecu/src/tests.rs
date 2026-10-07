@@ -567,6 +567,92 @@ fn routine_control_check_reports_a_bad_image() {
     assert_eq!(ecu.flash, FlashPhase::TransferComplete);
 }
 
+/// Erases, downloads one block and runs the check routine on an ECU that installs version
+/// "0043"; returns the check routine's status byte.
+fn download_new_version(ecu: &mut SimEcu) -> u8 {
+    enter(ecu, Session::Programming);
+    unlock(ecu);
+    ecu.request(&[0x31, 0x01, 0xFF, 0x00]);
+    ecu.request(&request_download(0, 1));
+    ecu.request(&transfer(1, &[0xAA]));
+    assert_eq!(ecu.request(&[0x37]), pos(&[0x77]));
+    match ecu.request(&[0x31, 0x01, 0xFF, 0x01]) {
+        SimResponse::Positive(bytes) => bytes[4],
+        r => panic!("{r:?}"),
+    }
+}
+
+fn read_sw_version(ecu: &mut SimEcu) -> SimResponse {
+    ecu.request(&[0x22, 0xF1, 0x89])
+}
+
+fn new_version_config() -> EcuConfig {
+    EcuConfig {
+        downloaded_sw_version: Some("0043".into()),
+        ..config()
+    }
+}
+
+#[test]
+fn a_verified_download_reports_its_version_after_an_ecu_reset() {
+    let mut ecu = SimEcu::new(new_version_config());
+    assert_eq!(download_new_version(&mut ecu), 0x00);
+    // The old software runs until the ECU restarts.
+    assert_eq!(read_sw_version(&mut ecu), pos(b"\x62\xF1\x890042"));
+    assert_eq!(ecu.request(&[0x11, 0x01]), pos(&[0x51, 0x01]));
+    assert_eq!(read_sw_version(&mut ecu), pos(b"\x62\xF1\x890043"));
+    assert_eq!(ecu.running_sw_version, "0043");
+}
+
+#[test]
+fn a_verified_download_reports_its_version_after_a_power_loss() {
+    let mut ecu = SimEcu::new(new_version_config());
+    assert_eq!(download_new_version(&mut ecu), 0x00);
+    ecu.inject(Fault::PowerLoss);
+    ecu.reconnect();
+    assert_eq!(read_sw_version(&mut ecu), pos(b"\x62\xF1\x890043"));
+}
+
+#[test]
+fn a_failed_check_or_an_erase_keeps_the_old_version() {
+    let mut ecu = SimEcu::new(EcuConfig {
+        fail_checksum: true,
+        ..new_version_config()
+    });
+    assert_eq!(download_new_version(&mut ecu), 0x01);
+    ecu.request(&[0x11, 0x01]);
+    assert_eq!(read_sw_version(&mut ecu), pos(b"\x62\xF1\x890042"));
+
+    // A verified image erased before the restart is never installed.
+    let mut ecu = SimEcu::new(new_version_config());
+    assert_eq!(download_new_version(&mut ecu), 0x00);
+    assert_eq!(
+        ecu.request(&[0x31, 0x01, 0xFF, 0x00]),
+        pos(&[0x71, 0x01, 0xFF, 0x00])
+    );
+    ecu.request(&[0x11, 0x01]);
+    assert_eq!(read_sw_version(&mut ecu), pos(b"\x62\xF1\x890042"));
+
+    // A check that fails after an earlier one passed withdraws the pending install.
+    let mut ecu = SimEcu::new(new_version_config());
+    assert_eq!(download_new_version(&mut ecu), 0x00);
+    ecu.config.fail_checksum = true;
+    assert_eq!(
+        ecu.request(&[0x31, 0x01, 0xFF, 0x01]),
+        pos(&[0x71, 0x01, 0xFF, 0x01, 0x01])
+    );
+    ecu.request(&[0x11, 0x01]);
+    assert_eq!(read_sw_version(&mut ecu), pos(b"\x62\xF1\x890042"));
+}
+
+#[test]
+fn without_a_downloaded_version_f189_stays_at_the_configured_one() {
+    let mut ecu = ecu();
+    assert_eq!(download_new_version(&mut ecu), 0x00);
+    ecu.request(&[0x11, 0x01]);
+    assert_eq!(read_sw_version(&mut ecu), pos(b"\x62\xF1\x890042"));
+}
+
 #[test]
 fn routine_control_nrcs() {
     let mut ecu = ecu();

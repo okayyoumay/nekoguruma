@@ -269,7 +269,7 @@ impl SimEcu {
         match did {
             DID_ACTIVE_DIAGNOSTIC_SESSION => Some(vec![self.session.code()]),
             DID_SPARE_PART_NUMBER => Some(self.config.part_number.as_bytes().to_vec()),
-            DID_SOFTWARE_VERSION => Some(self.config.sw_version.as_bytes().to_vec()),
+            DID_SOFTWARE_VERSION => Some(self.running_sw_version.as_bytes().to_vec()),
             DID_VIN => Some(self.config.vin.as_bytes().to_vec()),
             DID_FLASH_STATE => {
                 let received = self.download.map_or(0, |dl| dl.received);
@@ -400,6 +400,7 @@ impl SimEcu {
                 self.flash = FlashPhase::Erased;
                 self.download = None;
                 self.image.clear();
+                self.pending_sw_version = None;
                 reply(
                     &sf,
                     positive(SID_ROUTINE_CONTROL, &[sf.value, rid_bytes[0], rid_bytes[1]]),
@@ -418,9 +419,11 @@ impl SimEcu {
                 // routineStatusRecord: 0x00 = image correct, 0x01 = image incorrect.
                 let status = if self.config.fail_checksum {
                     self.flash = FlashPhase::TransferComplete;
+                    self.pending_sw_version = None;
                     0x01
                 } else {
                     self.flash = FlashPhase::Verified;
+                    self.pending_sw_version = self.config.downloaded_sw_version.clone();
                     0x00
                 };
                 reply(

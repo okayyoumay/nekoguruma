@@ -10,8 +10,10 @@ use diag_ir::{Op, Program};
 
 use crate::host::HostError;
 
-/// ReadDTCInformation, ReadDataByIdentifier and TesterPresent: they change nothing on the ECU.
-pub const READ_ONLY_SERVICES: &[u8] = &[0x19, 0x22, 0x3E];
+/// ReadDTCInformation and ReadDataByIdentifier: they change nothing on the ECU. TesterPresent
+/// is left out: it keeps the ECU's current session alive, which a job may only do once it owns
+/// that session.
+pub const READ_ONLY_SERVICES: &[u8] = &[0x19, 0x22];
 
 /// Whether a request with this service ID may be sent. A value that is not a UDS service ID
 /// fails as [`HostError::BadService`].
@@ -95,11 +97,11 @@ mod tests {
 
     #[test]
     fn only_read_only_services_pass() {
-        for sid in [0x19, 0x22, 0x3E] {
+        for sid in [0x19, 0x22] {
             check_service(sid).unwrap();
         }
         for sid in [
-            0x10, 0x11, 0x14, 0x27, 0x28, 0x2E, 0x2F, 0x31, 0x34, 0x36, 0x37, 0x85,
+            0x10, 0x11, 0x14, 0x27, 0x28, 0x2E, 0x2F, 0x31, 0x34, 0x36, 0x37, 0x3E, 0x85,
         ] {
             assert!(
                 matches!(check_service(sid), Err(HostError::NotAllowed(s)) if s == sid),

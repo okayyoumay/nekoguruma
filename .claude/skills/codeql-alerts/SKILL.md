@@ -99,8 +99,10 @@ description from the template: the alert number and rule id, and how the fix rem
 flagged path. Describe the weakness in terms of the code, without a ready-made exploit.
 
 Then run `pr-review-loop`. Before it hands the PR to the maintainer, also check the `CodeQL`
-check run on the PR's head (from the `github-advanced-security` app): it must have concluded
-`success` and report no new alerts. If it reports new alerts, they are findings of this round.
+check run on the PR's head (from the `github-advanced-security` app): it must have completed and
+its output must report no new alerts. Its conclusion can be `success` or `neutral` for a clean
+result; read the output, not the conclusion. If it reports new alerts, they are findings of this
+round.
 
 ## 6. Wait for the merge, then continue
 

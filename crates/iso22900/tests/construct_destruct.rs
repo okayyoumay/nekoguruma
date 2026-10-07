@@ -119,11 +119,15 @@ fn start_primitive(api: &DPduApi, module: ModuleHandle, link: ComLogicalLinkHand
     .expect("start primitive should succeed");
 }
 
+#[allow(
+    clippy::unnecessary_cast,
+    reason = "the binding's error codes are i32 on Windows MSVC and u32 elsewhere"
+)]
 fn assert_queue_empty(api: &DPduApi, module: ModuleHandle, link: ComLogicalLinkHandle) {
     match api.get_event_item(module, link) {
         Err(DPduApiError::PduError(code)) => assert_eq!(
             code,
-            E_PDU_ERROR::PDU_ERR_EVENT_QUEUE_EMPTY.0,
+            E_PDU_ERROR::PDU_ERR_EVENT_QUEUE_EMPTY.0 as u32,
             "an earlier instance's events should not reach a new one"
         ),
         Err(other) => panic!("unexpected error {other}"),

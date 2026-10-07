@@ -93,6 +93,17 @@ trap 'rm -rf "$(dirname "$LAUNCHER")"' EXIT
   echo ' "$@"'
 } >"$LAUNCHER"
 chmod +x "$LAUNCHER"
+if [[ "$PROFILE" != debug ]]; then
+  echo "error: LAUNCH=1 needs debug builds (the test's config override is debug-only, ADR-073)" >&2
+  exit 1
+fi
+# The test must run, not be filtered or compiled out: require exactly one passed test.
+OUTPUT="$(dirname "$LAUNCHER")/test.log"
 NGR_ABI_SERVICE="$LAUNCHER" NGR_ABI_LIBRARY="$PWD/$LIB" NGR_ABI_EXPECT="$ABI" \
-  cargo test --locked -p j2534-0404-service --test sim_vci_end_to_end -- --nocapture
+  cargo test --locked -p j2534-0404-service --test sim_vci_end_to_end -- \
+  --exact service_reads_the_vin_from_sim_vci --nocapture 2>&1 | tee "$OUTPUT"
+if ! grep -q '^test result: ok. 1 passed;' "$OUTPUT"; then
+  echo "ABI launch test: FAILED for $TARGET ($ABI): the test did not run and pass" >&2
+  exit 1
+fi
 echo "ABI launch test: passed for $TARGET ($ABI)"

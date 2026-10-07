@@ -205,8 +205,6 @@ jobs:
             fi
           done
 
-  # Verify ABI interpretation via a worker service x VCI simulator round trip.
-  # Include ARM via QEMU user mode (real hardware tested separately).
   # ABI interpretation table (7.1.2) on the Linux worker targets: each target's
   # j2534-0404-service is launched against sim-vci built for the same target (ARM under
   # qemu-user) with the table's `unsigned long` width, and reads the VIN through it

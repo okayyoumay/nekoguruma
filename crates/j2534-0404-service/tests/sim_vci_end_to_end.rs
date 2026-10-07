@@ -2,12 +2,15 @@
 #![cfg(debug_assertions)]
 //! End to end without hardware (design 13.4): `worker-host` launches the real
 //! `j2534-0404-service` binary against the `sim-vci` cdylib, with the
-//! `unsigned long` width of the platform, and a gRPC client reads the VIN
+//! `unsigned long` width of the library's ABI, and a gRPC client reads the VIN
 //! (DID F190) from the simulated ECU behind it over an ISO 15765 link.
 //!
 //! The service is launched with the `unsigned long` width the ABI interpretation table (design
-//! 7.1.2) gives for the library's ABI, read from its file header, so the VIN only arrives if
-//! the table matches the library. On Linux x86_64 that is 8 bytes.
+//! 7.1.2) gives for the library's ABI, read from its file header. The table's width is also
+//! checked against the library's data model (a Linux library's `unsigned long` is as wide as a
+//! pointer, a Windows library's is 4 bytes), because a 32-bit service has no 8-byte mode: it
+//! would fall back to 4 and still read the VIN. On a 64-bit target a wrong width fails the VIN
+//! read. On Linux x86_64 the width is 8 bytes.
 //!
 //! By default the test runs the service and library built for the host. To check another
 //! worker target (`scripts/abi-roundtrip.sh`), the environment names that target's build:
@@ -69,6 +72,20 @@ fn target_build() -> (PathBuf, PathBuf) {
             sim_vci_path(),
         ),
         _ => panic!("NGR_ABI_SERVICE and NGR_ABI_LIBRARY are set together"),
+    }
+}
+
+/// The width of `unsigned long` in the library's data model, read from its header without the
+/// ABI table: a Linux library is LP64 or ILP32 (as wide as its ELF class), a Windows library is
+/// LLP64 or ILP32 (4 bytes either way).
+fn data_model_long_size(library: &std::path::Path) -> u8 {
+    let header =
+        std::fs::read(library).unwrap_or_else(|error| panic!("{}: {error}", library.display()));
+    match header.as_slice() {
+        [0x7F, b'E', b'L', b'F', 1, ..] => 4,
+        [0x7F, b'E', b'L', b'F', 2, ..] => 8,
+        [b'M', b'Z', ..] => 4,
+        _ => panic!("{} is neither ELF nor PE", library.display()),
     }
 }
 
@@ -158,6 +175,12 @@ async fn read_the_vin() {
     let abi = library_abi(&library);
     // The width of J2534 `unsigned long` the ABI interpretation table gives (design 7.1.2).
     let long_size = abi.default_long_size();
+    assert_eq!(
+        long_size,
+        data_model_long_size(&library),
+        "the ABI table's unsigned long width for {} differs from the library's data model",
+        abi.name()
+    );
     println!(
         "{} on {} with unsigned long = {long_size} bytes",
         library.display(),
@@ -217,8 +240,8 @@ async fn read_the_vin() {
         .await
         .expect("module_connect");
 
-    // PassThruReadVersion's strings arrive through the service, so the
-    // `unsigned long` width and string handling match on both sides.
+    // PassThruReadVersion's strings arrive through the service. This checks string handling
+    // only: the version call passes no `unsigned long`, so the VIN read below checks the width.
     let version = client
         .get_version(GetVersionRequest {
             module_handle: Some(module_handle),

@@ -13,7 +13,7 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, mpsc};
+use std::sync::{Arc, Barrier, Mutex, MutexGuard, mpsc};
 use std::thread;
 use std::time::Duration;
 
@@ -29,6 +29,13 @@ const MOCK_RESOURCE_ID: u32 = 2001;
 
 /// Register/unregister and start/drain rounds in the race test.
 const RACE_ROUNDS: usize = 200;
+
+/// How long a step that should finish may take before the test fails, so a
+/// deadlock fails the test instead of hanging the CI job.
+const DEADLINE: Duration = Duration::from_secs(60);
+
+/// How long the test watches a step that must stay blocked.
+const STILL_BLOCKED: Duration = Duration::from_millis(200);
 
 static SERIAL: Mutex<()> = Mutex::new(());
 
@@ -218,17 +225,87 @@ fn disconnecting_the_module_frees_its_callbacks() {
     assert_eq!(calls(&a), 0);
 }
 
+/// Forces the interleaving the race test can only hope for: a callback is
+/// running on one thread when another thread unregisters it. The unregister
+/// must wait for the callback to return, and then drop the closure, so a
+/// closure is never freed while it runs.
+#[test]
+fn unregistering_during_a_delivery_waits_for_the_callback_to_return() {
+    let f = Fixture::new();
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let alive = Arc::new(());
+    let in_callback = Arc::clone(&alive);
+    f.api
+        .register_event_callback(f.module, f.link, move |_| {
+            let _keep = &in_callback;
+            entered_tx.send(()).expect("the test should be waiting");
+            release_rx
+                .recv_timeout(DEADLINE)
+                .expect("the test should release the callback");
+        })
+        .expect("callback registration should succeed");
+
+    let deliverer = {
+        let api = Arc::clone(&f.api);
+        let (module, link) = (f.module, f.link);
+        thread::spawn(move || start(&api, module, link))
+    };
+    entered_rx
+        .recv_timeout(DEADLINE)
+        .expect("the callback should be called");
+
+    let (unregistered_tx, unregistered_rx) = mpsc::channel();
+    let unregisterer = {
+        let api = Arc::clone(&f.api);
+        let (module, link) = (f.module, f.link);
+        thread::spawn(move || {
+            api.unregister_event_callback(module, link)
+                .expect("unregistering should succeed");
+            unregistered_tx
+                .send(())
+                .expect("the test should be waiting");
+        })
+    };
+    assert!(
+        unregistered_rx.recv_timeout(STILL_BLOCKED).is_err(),
+        "unregistering should wait while the callback runs"
+    );
+    assert_eq!(Arc::strong_count(&alive), 2, "the running closure is kept");
+
+    release_tx.send(()).expect("the callback should be waiting");
+    unregistered_rx
+        .recv_timeout(DEADLINE)
+        .expect("unregistering should finish once the callback returns");
+    deliverer
+        .join()
+        .expect("the delivering thread should not panic");
+    unregisterer
+        .join()
+        .expect("the unregistering thread should not panic");
+    assert_eq!(
+        Arc::strong_count(&alive),
+        1,
+        "the closure should be dropped"
+    );
+}
+
+/// Stress coverage on top of the forced interleaving above: both threads
+/// start together and run many rounds.
 #[test]
 fn registration_racing_with_event_delivery_neither_deadlocks_nor_leaks() {
     let f = Fixture::new();
     let a = counter();
     let (done_tx, done_rx) = mpsc::channel();
+    let start_together = Arc::new(Barrier::new(2));
 
     let registrar = {
         let api = Arc::clone(&f.api);
         let (module, link, a) = (f.module, f.link, Arc::clone(&a));
         let done = done_tx.clone();
+        let barrier = Arc::clone(&start_together);
         thread::spawn(move || {
+            barrier.wait();
             for _ in 0..RACE_ROUNDS {
                 register_counter(&api, module, link, &a);
                 api.unregister_event_callback(module, link)
@@ -240,7 +317,9 @@ fn registration_racing_with_event_delivery_neither_deadlocks_nor_leaks() {
     let deliverer = {
         let api = Arc::clone(&f.api);
         let (module, link) = (f.module, f.link);
+        let barrier = Arc::clone(&start_together);
         thread::spawn(move || {
+            barrier.wait();
             for _ in 0..RACE_ROUNDS {
                 start_and_drain(&api, module, link);
             }
@@ -251,7 +330,7 @@ fn registration_racing_with_event_delivery_neither_deadlocks_nor_leaks() {
         // A deadlock between the callback map and the library would hang
         // here, so a lost wake-up fails the test instead of the CI job.
         done_rx
-            .recv_timeout(Duration::from_secs(60))
+            .recv_timeout(DEADLINE)
             .expect("both threads should finish without deadlocking");
     }
     registrar

@@ -344,9 +344,7 @@ fn config_file_path() -> PathBuf {
     // variable here and use solely the build-time embedded value.
     const CONFIG_PATH: &str = env!("VCI_CONFIG_PATH");
     #[cfg(debug_assertions)]
-    let path = std::env::var_os("VCI_CONFIG_PATH")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
+    let path = runtime_override(std::env::var_os("VCI_CONFIG_PATH"))
         .unwrap_or_else(|| PathBuf::from(CONFIG_PATH));
     #[cfg(not(debug_assertions))]
     let path = PathBuf::from(CONFIG_PATH);
@@ -365,9 +363,7 @@ fn config_file_path() -> PathBuf {
 pub fn j2534_definition_dir() -> PathBuf {
     const DEFINITION_DIR: &str = env!("NGR_J2534_DEFINITION_DIR");
     #[cfg(debug_assertions)]
-    let path = std::env::var_os("NGR_J2534_DEFINITION_DIR")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
+    let path = runtime_override(std::env::var_os("NGR_J2534_DEFINITION_DIR"))
         .unwrap_or_else(|| PathBuf::from(DEFINITION_DIR));
     #[cfg(not(debug_assertions))]
     let path = PathBuf::from(DEFINITION_DIR);
@@ -376,6 +372,14 @@ pub fn j2534_definition_dir() -> PathBuf {
     } else {
         fixed_system_root().join(path)
     }
+}
+
+/// A debug-only runtime override (ADR-073) from an environment variable's value: none when
+/// the variable is unset or empty, so an empty value falls back to the build-time location
+/// instead of resolving to the root itself.
+#[cfg(debug_assertions)]
+fn runtime_override(value: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    value.filter(|value| !value.is_empty()).map(PathBuf::from)
 }
 
 /// The administrator-only system configuration directory of the platform, whatever
@@ -1355,6 +1359,19 @@ mod tests {
         assert_eq!(
             j2534_definition_dir(),
             fixed_system_root().join("nekoguruma/j2534")
+        );
+    }
+
+    /// An unset or empty override leaves the build-time location in place, for both
+    /// `VCI_CONFIG_PATH` and `NGR_J2534_DEFINITION_DIR`.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn an_empty_runtime_override_counts_as_unset() {
+        assert_eq!(runtime_override(None), None);
+        assert_eq!(runtime_override(Some("".into())), None);
+        assert_eq!(
+            runtime_override(Some("/tmp/dev.toml".into())),
+            Some(PathBuf::from("/tmp/dev.toml"))
         );
     }
 

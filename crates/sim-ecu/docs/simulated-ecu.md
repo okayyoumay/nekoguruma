@@ -147,7 +147,8 @@ directly.
 `SimEcu::snapshot()` records the whole ECU as an `EcuSnapshot` (serde), and
 `SimEcu::restore(snapshot, clock, elapsed)` rebuilds it on another clock, as it was `elapsed`
 after the snapshot: running timers have that much less to go, and one that has run out takes
-effect at once. `sim-vci` uses this to keep the ECU across worker processes (ADR-241).
+effect at once. It refuses (`InvalidSnapshot`) a snapshot whose download, image and block
+numbers contradict each other or exceed the flash window, which the ECU itself never produces. `sim-vci` uses this to keep the ECU across worker processes (ADR-241).
 
 ## Fault injection
 

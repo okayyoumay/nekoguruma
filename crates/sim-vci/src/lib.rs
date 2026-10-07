@@ -131,20 +131,28 @@ fn unix_ms(at: SystemTime) -> u64 {
 }
 
 /// The ECU the state file at `path` holds, with the time since it was written counted against
-/// its timers. `None` if the file cannot be read or is not a state file of this version.
-fn load_ecu_state(path: &Path) -> Option<SimEcu> {
-    let bytes = std::fs::read(path).ok()?;
-    let state: StateFile = postcard::from_bytes(&bytes).ok()?;
+/// its timers: `Ok(None)` if there is no such file, `Err(())` if it cannot be read (for any other
+/// reason than not existing), is not a state file of this version, or holds a state the ECU
+/// could not have been in.
+fn load_ecu_state(path: &Path) -> Result<Option<SimEcu>, ()> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(()),
+    };
+    let state: StateFile = postcard::from_bytes(&bytes).map_err(|_| ())?;
     if state.version != STATE_FILE_VERSION {
-        return None;
+        return Err(());
     }
     // A wall clock set back since the write counts as no time passed.
     let elapsed = unix_ms(SystemTime::now()).saturating_sub(state.saved_at_ms);
-    Some(SimEcu::restore(
+    SimEcu::restore(
         state.ecu,
         SystemClock::default(),
         Duration::from_millis(elapsed),
-    ))
+    )
+    .map(Some)
+    .map_err(|_| ())
 }
 
 /// Writes `ecu`'s state to `path`, through a temporary file renamed over it, so a process killed
@@ -440,9 +448,13 @@ impl Bus {
     /// read, or the new ECU's state cannot be written.
     fn ecu(&mut self) -> Result<&mut SimEcu, PassThruUlong> {
         if self.ecu.is_none() {
-            let ecu = match &self.state_path {
-                Some(path) if path.exists() => load_ecu_state(path).ok_or(ERR_FAILED)?,
-                _ => SimEcu::new(load_ecu_config().ok_or(ERR_FAILED)?),
+            let restored = match &self.state_path {
+                Some(path) => load_ecu_state(path).map_err(|()| ERR_FAILED)?,
+                None => None,
+            };
+            let ecu = match restored {
+                Some(ecu) => ecu,
+                None => SimEcu::new(load_ecu_config().ok_or(ERR_FAILED)?),
             };
             self.ecu = Some(ecu);
             if let Err(status) = self.save_ecu() {

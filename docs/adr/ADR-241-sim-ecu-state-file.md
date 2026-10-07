@@ -46,8 +46,12 @@ Two ways out were open:
    cannot go on past a state the next process would not see. A new ECU whose state cannot be
    written is not created. Replacing the file is retried briefly when Windows reports it in use
    (a scanner holding the new file).
-6. **Encoding.** postcard, with a format version; a file of another version, or one that cannot
-   be decoded, makes `PassThruOpen` fail with `ERR_FAILED`.
+6. **Encoding and checks.** postcard, with a format version. Only a missing file starts a fresh
+   ECU. A path that cannot be read for another reason, a file of another version, one that
+   cannot be decoded, or one whose download, image and block numbers contradict each other
+   (checked by `SimEcu::restore`, since the services index the image by them) fails the call
+   that first needs the ECU with `ERR_FAILED`, rather than replacing the file or panicking
+   inside the library later.
 
 ## Consequences
 

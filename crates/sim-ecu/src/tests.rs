@@ -1934,7 +1934,7 @@ fn a_restored_ecu_continues_the_download() {
     // The new process's clock has its own origin.
     let later = ManualClock::default();
     later.advance(ms(60_000));
-    let mut ecu = SimEcu::restore(snapshot, later, Duration::ZERO);
+    let mut ecu = SimEcu::restore(snapshot, later, Duration::ZERO).expect("valid snapshot");
     assert_eq!(ecu.session, Session::Programming);
     assert!(ecu.security_unlocked);
     assert_eq!(ecu.flash, FlashPhase::Transferring { next_block: 3 });
@@ -1954,7 +1954,8 @@ fn time_between_snapshot_and_restore_counts_against_s3() {
 
     // Still within tS3_Server: the session goes on, and times out when the rest has passed.
     let later = ManualClock::default();
-    let mut restored = SimEcu::restore(snapshot.clone(), later.clone(), ms(3_000));
+    let mut restored =
+        SimEcu::restore(snapshot.clone(), later.clone(), ms(3_000)).expect("valid snapshot");
     assert_eq!(restored.session, Session::Programming);
     later.advance(ms(999));
     restored.check_timers();
@@ -1965,7 +1966,8 @@ fn time_between_snapshot_and_restore_counts_against_s3() {
     assert_eq!(restored.flash, FlashPhase::Interrupted { last_block: 2 });
 
     // Past tS3_Server: the session has ended by the time the ECU is restored.
-    let mut late = SimEcu::restore(snapshot, ManualClock::default(), ms(4_000));
+    let mut late =
+        SimEcu::restore(snapshot, ManualClock::default(), ms(4_000)).expect("valid snapshot");
     assert_eq!(late.session, Session::Default);
     assert!(!late.security_unlocked);
     assert_eq!(reported_session(&mut late), 0x01);
@@ -1994,7 +1996,7 @@ fn a_restored_security_delay_runs_out_on_time() {
     let snapshot = reread(&ecu.snapshot());
 
     let later = ManualClock::default();
-    let mut restored = SimEcu::restore(snapshot, later.clone(), ms(5_000));
+    let mut restored = SimEcu::restore(snapshot, later.clone(), ms(5_000)).expect("valid snapshot");
     assert!(restored.security_delay_active());
     later.advance(ms(1_000));
     assert!(!restored.security_delay_active());
@@ -2006,7 +2008,8 @@ fn a_restored_ecu_keeps_its_faults_and_counters() {
     ecu.inject(Fault::DropResponse);
     ecu.reconnect();
     let snapshot = reread(&ecu.snapshot());
-    let mut restored = SimEcu::restore(snapshot, ManualClock::default(), Duration::ZERO);
+    let mut restored =
+        SimEcu::restore(snapshot, ManualClock::default(), Duration::ZERO).expect("valid snapshot");
     assert_eq!(restored.power_cycles(), 1);
     // The armed fault still fires on the next request.
     assert_eq!(restored.request(&[0x3E, 0x00]), SimResponse::NoResponse);
@@ -2045,17 +2048,67 @@ fn restore_brings_back_every_field() {
         last_len: 0x10,
         secured: true,
     });
-    ecu.image = vec![1, 2, 3];
+    // As much as the download has received.
+    ecu.image = vec![7; 0x20];
     ecu.silent = true;
     ecu.armed = vec![Fault::DropResponse, Fault::CorruptBlock { block: 5 }];
     ecu.power_cycles = 3;
     let snapshot = ecu.snapshot();
 
-    let mut restored = SimEcu::restore(reread(&snapshot), ManualClock::default(), Duration::ZERO);
+    let mut restored = SimEcu::restore(reread(&snapshot), ManualClock::default(), Duration::ZERO)
+        .expect("valid snapshot");
     let json = |snapshot: &EcuSnapshot| serde_json::to_string(snapshot).expect("serializes");
     assert_eq!(json(&restored.snapshot()), json(&snapshot));
     // The timers were recorded as the time left.
     assert_eq!(restored.s3_deadline, Some(ms(3_000)));
     assert_eq!(restored.security_delay_until, Some(ms(8_000)));
     assert_eq!(restored.last_response_at, ms(500));
+}
+
+#[test]
+fn restore_refuses_a_snapshot_that_contradicts_itself() {
+    let clock = ManualClock::default();
+    let good = mid_download(&clock).snapshot();
+    let restore = |snapshot: EcuSnapshot| {
+        SimEcu::restore(snapshot, ManualClock::default(), Duration::ZERO).map(|_| ())
+    };
+    assert_eq!(restore(good.clone()), Ok(()));
+
+    let mut short_image = good.clone();
+    short_image.image.pop();
+    let mut long_last_block = good.clone();
+    long_last_block
+        .download
+        .as_mut()
+        .expect("download")
+        .last_len = 99;
+    let mut past_the_end = good.clone();
+    past_the_end.download.as_mut().expect("download").start = FLASH_SIZE - 1;
+    let mut over_received = good.clone();
+    over_received.download.as_mut().expect("download").received = 7;
+    let mut no_download = good.clone();
+    no_download.download = None;
+    let mut last_block = good.clone();
+    last_block.flash = FlashPhase::Transferring {
+        next_block: u32::MAX,
+    };
+    let mut huge = good;
+    huge.download = None;
+    huge.flash = FlashPhase::Idle;
+    huge.image = vec![0; FLASH_SIZE as usize + 1];
+    for snapshot in [
+        short_image,
+        long_last_block,
+        past_the_end,
+        over_received,
+        no_download,
+        last_block,
+        huge,
+    ] {
+        assert!(
+            restore(snapshot.clone()).is_err(),
+            "{:?}",
+            snapshot.download
+        );
+    }
 }

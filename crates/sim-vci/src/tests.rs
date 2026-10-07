@@ -1447,7 +1447,9 @@ fn the_state_file_round_trips_the_ecu() {
     save_ecu_state(&dir.file(), &mut ecu).expect("the state should be written");
     assert!(!dir.0.join("ecu.state.tmp").exists());
 
-    let loaded = load_ecu_state(&dir.file()).expect("the state should load");
+    let loaded = load_ecu_state(&dir.file())
+        .expect("the state should load")
+        .expect("the file exists");
     assert_eq!(loaded.session, Session::Extended);
     assert_eq!(loaded.config.vin, "NGRSIMECU00000001");
 }
@@ -1455,8 +1457,16 @@ fn the_state_file_round_trips_the_ecu() {
 #[test]
 fn a_damaged_or_foreign_state_file_is_refused() {
     let dir = StateDir::new("refused");
+    assert!(
+        matches!(load_ecu_state(&dir.file()), Ok(None)),
+        "no file yet"
+    );
+    // A directory where the file should be cannot be read, which is not the same as no file.
+    std::fs::create_dir(dir.file()).expect("directory should be created");
+    assert!(load_ecu_state(&dir.file()).is_err());
+    std::fs::remove_dir(dir.file()).expect("directory should be removed");
     std::fs::write(dir.file(), b"not a state file").expect("file should be writable");
-    assert!(load_ecu_state(&dir.file()).is_none());
+    assert!(load_ecu_state(&dir.file()).is_err());
 
     let mut ecu = SimEcu::new(default_ecu_config());
     let other_version = StateFile {
@@ -1469,7 +1479,7 @@ fn a_damaged_or_foreign_state_file_is_refused() {
         postcard::to_allocvec(&other_version).expect("state should encode"),
     )
     .expect("file should be writable");
-    assert!(load_ecu_state(&dir.file()).is_none());
+    assert!(load_ecu_state(&dir.file()).is_err());
 }
 
 #[test]
@@ -1495,6 +1505,8 @@ fn time_since_the_write_counts_against_the_session() {
         postcard::to_allocvec(&state).expect("state should encode"),
     )
     .expect("file should be writable");
-    let loaded = load_ecu_state(&dir.file()).expect("the state should load");
+    let loaded = load_ecu_state(&dir.file())
+        .expect("the state should load")
+        .expect("the file exists");
     assert_eq!(loaded.session, Session::Default);
 }

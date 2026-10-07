@@ -313,6 +313,62 @@ pub struct EcuSnapshot {
     power_cycles: u64,
 }
 
+/// Why [`SimEcu::restore`] refused a snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvalidSnapshot(&'static str);
+
+impl std::fmt::Display for InvalidSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "invalid ECU snapshot: {}", self.0)
+    }
+}
+
+impl std::error::Error for InvalidSnapshot {}
+
+impl EcuSnapshot {
+    /// The invariants the services rely on: what TransferData and RequestDownload index or add
+    /// up must hold, as it does in a snapshot the ECU itself took.
+    fn check(&self) -> Result<(), InvalidSnapshot> {
+        let invalid = |reason| Err(InvalidSnapshot(reason));
+        let image_len = self.image.len() as u64;
+        if image_len > u64::from(FLASH_SIZE) {
+            return invalid("the image is larger than the flash window");
+        }
+        if let Some(dl) = &self.download {
+            let flash_end = u64::from(FLASH_START) + u64::from(FLASH_SIZE);
+            if dl.size == 0
+                || u64::from(dl.start) < u64::from(FLASH_START)
+                || u64::from(dl.start) + u64::from(dl.size) > flash_end
+            {
+                return invalid("the download lies outside the flash window");
+            }
+            if dl.received > dl.size || u64::from(dl.received) != image_len {
+                return invalid("the bytes received disagree with the download or the image");
+            }
+            if dl.last_len > dl.received || (dl.last_bsc.is_none() && dl.last_len != 0) {
+                return invalid("the last block is longer than the data received");
+            }
+        }
+        match self.flash {
+            FlashPhase::Transferring { next_block } => {
+                if self.download.is_none() || next_block == 0 || next_block == u32::MAX {
+                    return invalid("a running transfer without a download or a valid block");
+                }
+            }
+            FlashPhase::Interrupted { last_block } => {
+                if self.download.is_none() || last_block == u32::MAX {
+                    return invalid("an interrupted transfer without a download or a valid block");
+                }
+            }
+            FlashPhase::Idle
+            | FlashPhase::Erased
+            | FlashPhase::TransferComplete
+            | FlashPhase::Verified => {}
+        }
+        Ok(())
+    }
+}
+
 // ---------------------------------------------------------------- Responses
 
 /// ISO 14229 NRCs (Annex A.1). Used as expected values in tests.
@@ -548,7 +604,16 @@ impl SimEcu {
     /// The ECU `snapshot` recorded, with its timers on `clock`, `elapsed` after the snapshot was
     /// taken: every running timer has `elapsed` less to go, and one that has run out by then
     /// takes effect at once (a session that timed out has ended when this returns).
-    pub fn restore(snapshot: EcuSnapshot, clock: impl Clock + 'static, elapsed: Duration) -> Self {
+    ///
+    /// A snapshot comes from a file another process wrote, so it is checked first: one whose
+    /// download, image or block numbers contradict each other, or exceed the flash window, is
+    /// refused rather than left to fail a later request.
+    pub fn restore(
+        snapshot: EcuSnapshot,
+        clock: impl Clock + 'static,
+        elapsed: Duration,
+    ) -> Result<Self, InvalidSnapshot> {
+        snapshot.check()?;
         let now = clock.now();
         let at = |left: Duration| now.saturating_add(left.saturating_sub(elapsed));
         let mut ecu = Self::with_clock(snapshot.config, clock);
@@ -571,7 +636,7 @@ impl SimEcu {
         ecu.armed = snapshot.armed;
         ecu.power_cycles = snapshot.power_cycles;
         ecu.check_timers();
-        ecu
+        Ok(ecu)
     }
 
     /// Data stored by TransferData since the last erase.

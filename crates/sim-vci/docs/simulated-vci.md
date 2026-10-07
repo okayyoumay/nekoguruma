@@ -65,9 +65,10 @@ a vehicle outlives a crashed worker (ADR-241):
   the call returns `ERR_FAILED`, and a request's response is not delivered; the change itself
   has taken effect in this process, so a control file whose change cannot be written is renamed
   `*.rejected` although it was applied. If the state of a new ECU cannot be written, the ECU is
-  not created, and every call that needs it fails until it can be. A file that cannot be read,
-  or was written by another format version, makes the call that first needs the ECU
-  (`PassThruOpen` or a control command) fail with `ERR_FAILED`.
+  not created, and every call that needs it fails until it can be. Only a file that does not
+  exist starts a fresh ECU: a path that cannot be read for any other reason, a file of another
+  format version, or one whose state contradicts itself (`SimEcu::restore` refuses it) makes the
+  call that first needs the ECU (`PassThruOpen` or a control command) fail with `ERR_FAILED`.
 - Replacing the file is retried briefly when Windows reports it in use.
 - The VCI side is not kept: channels, filters, unread responses, the battery voltage and the
   device ID start fresh in the new process.

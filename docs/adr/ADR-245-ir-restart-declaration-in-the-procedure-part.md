@@ -83,6 +83,8 @@ runner in M1.
    owns (ADR-244 item 6, ADR-233 item 3).
 6. **Checked at every load.** `Program::validate` checks the declaration, and the agent's
    `check_program` runs it before the program reaches a worker. It checks that:
+   - the program declares at most 64 plans, so the checks below, each a pass over the code
+     per plan, stay linear in the code's length;
    - every section lies inside the code with its start before its end;
    - the boundaries are ordered and inside the code;
    - a plan holds one RequestDownload, no transfer before it and no RequestTransferExit but

@@ -2127,6 +2127,20 @@ fn many_calls_validate_in_linear_time() {
     assert_eq!(program.validate(), Ok(()));
 }
 
+/// Each plan's checks pass over the whole code, so the number of plans is capped.
+#[test]
+fn the_number_of_plans_is_capped() {
+    let mut program = recovery_program();
+    let extra = program.flash[0].clone();
+    program.flash.resize(MAX_FLASH_RECOVERIES + 1, extra);
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::TooManyFlashRecoveries {
+            count: MAX_FLASH_RECOVERIES + 1
+        })
+    );
+}
+
 #[test]
 fn a_backward_jump_does_not_cross_the_recovery_point() {
     // FromPc(4): the jump at 4 back to the erase crosses it; a jump at 2 does not.

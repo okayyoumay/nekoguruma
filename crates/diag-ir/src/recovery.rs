@@ -321,7 +321,16 @@ pub enum ProgramError {
         "flash session {flash_session}: the subroutine called at {pc} can reach the plan; a plan runs only at the top level"
     )]
     PlanInSubroutine { flash_session: u32, pc: u32 },
+    #[error(
+        "the program declares {count} recovery plans; at most {MAX_FLASH_RECOVERIES} are allowed"
+    )]
+    TooManyFlashRecoveries { count: usize },
 }
+
+/// The most recovery plans a program may declare. Each plan's checks pass over the whole code
+/// once, so the cap keeps loading linear in the code's length; a procedure has one plan per
+/// flash session, and an ECU has a handful of those at most.
+pub const MAX_FLASH_RECOVERIES: usize = 64;
 
 fn is_erase(op: Option<&Op>) -> bool {
     matches!(
@@ -365,6 +374,11 @@ impl Program {
     /// when some plan allows a restart ([`FlashRecovery::allows_restart`]); a program whose
     /// plans never allow one is not asked for what only a restart reads.
     pub fn validate(&self) -> Result<(), ProgramError> {
+        if self.flash.len() > MAX_FLASH_RECOVERIES {
+            return Err(ProgramError::TooManyFlashRecoveries {
+                count: self.flash.len(),
+            });
+        }
         // The overlap checks below would read a reversed section as empty.
         for (section, s) in self.sections.iter().enumerate() {
             if s.start_pc >= s.end_pc || s.end_pc as usize > self.code.len() {

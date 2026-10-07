@@ -2116,6 +2116,17 @@ fn a_subroutine_cannot_reach_a_plan() {
     );
 }
 
+/// The subroutine check is one pass per plan, not one walk per call: a program with many calls
+/// validates at once (a walk per call would visit every instruction for each of them).
+#[test]
+fn many_calls_validate_in_linear_time() {
+    let mut program = flow_program(|c| c[7] = Op::Ret);
+    program
+        .code
+        .extend(std::iter::repeat_n(Op::Call(6), 200_000));
+    assert_eq!(program.validate(), Ok(()));
+}
+
 #[test]
 fn a_backward_jump_does_not_cross_the_recovery_point() {
     // FromPc(4): the jump at 4 back to the erase crosses it; a jump at 2 does not.

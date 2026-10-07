@@ -584,30 +584,40 @@ impl Program {
     /// The plan's range is a single-entry region whose stages follow in order: no call or
     /// return inside, no way in except at the entry, and jumps inside only where the stage they
     /// sit in allows.
-    /// Whether execution starting at `start` inside a subroutine can reach a pc for which
-    /// `target` holds, following fallthrough and jumps and stopping at a return. A call made on
-    /// the way returns to the next instruction, so it continues there.
-    fn reaches(&self, start: u32, target: &impl Fn(u32) -> bool) -> bool {
-        let mut seen = vec![false; self.code.len()];
-        let mut pending = vec![start];
-        while let Some(pc) = pending.pop() {
-            let Some(op) = self.code.get(pc as usize) else {
-                continue;
+    /// For each pc, whether execution from there can reach a pc for which `target` holds,
+    /// following fallthrough and jumps and stopping at a return; a call made on the way returns
+    /// to the next instruction, so it continues there. One backward pass over the code, so a
+    /// program with many calls is checked in linear time.
+    fn reaching(&self, target: &impl Fn(u32) -> bool) -> Vec<bool> {
+        let len = self.code.len();
+        let mut predecessors = vec![Vec::new(); len];
+        for (index, op) in self.code.iter().enumerate() {
+            let pc = index as u32;
+            let successors: &[u32] = match *op {
+                Op::Ret => &[],
+                Op::Jump(to) => &[to],
+                Op::JumpIfFalse(to) => &[to, pc + 1],
+                _ => &[pc + 1],
             };
-            if std::mem::replace(&mut seen[pc as usize], true) {
-                continue;
-            }
-            if target(pc) {
-                return true;
-            }
-            match *op {
-                Op::Ret => {}
-                Op::Jump(to) => pending.push(to),
-                Op::JumpIfFalse(to) => pending.extend([to, pc + 1]),
-                _ => pending.push(pc + 1),
+            for &next in successors {
+                if (next as usize) < len {
+                    predecessors[next as usize].push(pc);
+                }
             }
         }
-        false
+        let mut reaches = vec![false; len];
+        let mut pending: Vec<u32> = (0..len as u32).filter(|&pc| target(pc)).collect();
+        for &pc in &pending {
+            reaches[pc as usize] = true;
+        }
+        while let Some(pc) = pending.pop() {
+            for &before in &predecessors[pc as usize] {
+                if !std::mem::replace(&mut reaches[before as usize], true) {
+                    pending.push(before);
+                }
+            }
+        }
+        reaches
     }
 
     fn validate_control_flow(&self, plan: &FlashRecovery) -> Result<(), ProgramError> {
@@ -666,9 +676,10 @@ impl Program {
         // A plan runs only at the top level: no subroutine may reach it, by falling through or
         // jumping. Its return would otherwise take execution back to the call site, before the
         // recovery point, after the plan had run.
+        let reaches_plan = self.reaching(&inside);
         for (index, op) in self.code.iter().enumerate() {
             if let Op::Call(target) = *op
-                && self.reaches(target, &inside)
+                && reaches_plan.get(target as usize).copied().unwrap_or(false)
             {
                 return Err(ProgramError::PlanInSubroutine {
                     flash_session,

@@ -24,7 +24,10 @@ so a top-tier session model adds cost rather than capability unless the user ask
 | `edge-case-hunter` | opus (high) | Bash + read-only | Verification pass before commit: boundaries, error paths, concurrency, protocol corner cases, interruption/resume, missing tests |
 | `design-advisor` | fable (high) | Bash (git read) + read-only | Escalation for decisions that are expensive to get wrong |
 
-Each tier is used for what it does best:
+Each tier is used for what it does best, following the official model descriptions
+([model overview](https://platform.claude.com/docs/en/about-claude/models/overview),
+[Claude Code model configuration](https://code.claude.com/docs/en/model-config)); re-check them
+when a new model generation ships, since the price ratios between tiers move:
 
 - **Haiku** (`code-scout`, `cargo-runner`): mechanical work with a short report (locating code,
   running commands). It is the cheapest tier, has a 200K context window and carries no
@@ -41,8 +44,9 @@ Each tier is used for what it does best:
   call. Opus at `high` reasons more reliably about reachability and ordering than Sonnet at
   `xhigh`, and the current Opus costs about twice Sonnet, not five times as earlier
   generations did.
-- **Fable** (`design-advisor`): the top tier, reserved for the gated escalation path. It pins
-  `effort: high` so a session-level override cannot push the costliest path higher.
+- **Fable** (`design-advisor`): the top tier, which the official guidance aims at root-cause
+  investigations and architecture decisions. It is reserved for the gated escalation path and
+  pins `effort: high` so a session-level override cannot push the costliest path higher.
 
 Custom agents load `CLAUDE.md` into their context at every spawn. `code-scout` and
 `cargo-runner` set `omitClaudeMd: true`, since their prompts carry everything they need and

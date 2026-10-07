@@ -1689,7 +1689,6 @@ production race exists — each test's flakiness was a test-side defect:
 
 ### Prioritized Backlog
 
-- **P1**: Add protobuf round-trip compatibility tests for high-risk messages.
 - **P1**: Add explicit evolution notes for reserved/deprecated fields.
 - **P2**: Add a minimal client usage sample aligned with latest schema.
 

@@ -58,6 +58,10 @@ pub const MAX_DIDS_PER_READ: usize = 8;
 /// Longest response the simulated transport can carry (ISO-TP on classical CAN).
 pub const MAX_RESPONSE_LENGTH: usize = 4095;
 
+/// Most response pending messages one [`Fault::ResponsePending`] sends; larger counts are
+/// capped, so a test cannot make the VCI side queue an unbounded chain.
+pub const MAX_RESPONSE_PENDING: u32 = 1_000;
+
 /// False sendKey attempts that activate the security delay timer.
 pub const MAX_SECURITY_ATTEMPTS: u8 = 3;
 
@@ -446,6 +450,9 @@ pub struct Exchange {
     pub response: SimResponse,
     /// Milliseconds between the request and the response. Zero when there is no response.
     pub delay_ms: u32,
+    /// Response pending messages (`7F SID 78`) sent before the response, each with its delay
+    /// from the request in milliseconds, in order ([`Fault::ResponsePending`]).
+    pub pending: Vec<(u32, Vec<u8>)>,
 }
 
 impl Exchange {
@@ -453,6 +460,7 @@ impl Exchange {
         Self {
             response: SimResponse::NoResponse,
             delay_ms: 0,
+            pending: Vec::new(),
         }
     }
 }
@@ -656,7 +664,8 @@ impl SimEcu {
 
     /// Handles one request and reports how long after the request the response goes out, for the
     /// VCI side to apply. The delay is `EcuConfig::response_delay_ms` plus any
-    /// [`Fault::DelayResponse`] that fires on this request.
+    /// [`Fault::DelayResponse`] that fires on this request, plus the response pending messages
+    /// of a [`Fault::ResponsePending`] that fires on it.
     pub fn exchange(&mut self, addressing: Addressing, message: &[u8]) -> Exchange {
         self.check_timers();
         if self.silent {
@@ -705,11 +714,37 @@ impl SimEcu {
         if response == SimResponse::NoResponse {
             return (Exchange::none(), 0);
         }
+        // Response pending messages (NRC 78, Annex A.1) go out from the original delay on,
+        // and the response follows the last of them.
+        let mut pending = Vec::new();
+        if let Some(Fault::ResponsePending { count, interval_ms }) =
+            self.take_armed(|f| matches!(f, Fault::ResponsePending { .. }))
+        {
+            let sid = message[0];
+            for i in 0..count.min(MAX_RESPONSE_PENDING) {
+                let at = delay_ms.saturating_add(interval_ms.saturating_mul(i));
+                pending.push((
+                    at,
+                    vec![NEGATIVE_RESPONSE_SID, sid, Nrc::ResponsePending as u8],
+                ));
+            }
+            delay_ms = delay_ms
+                .saturating_add(interval_ms.saturating_mul(count.min(MAX_RESPONSE_PENDING)));
+        }
         if dropped {
             // The request was handled; only its response is lost.
-            return (Exchange::none(), delay_ms);
+            let exchange = Exchange {
+                pending,
+                ..Exchange::none()
+            };
+            return (exchange, delay_ms);
         }
-        (Exchange { response, delay_ms }, delay_ms)
+        let exchange = Exchange {
+            response,
+            delay_ms,
+            pending,
+        };
+        (exchange, delay_ms)
     }
 
     /// Arms a fault (13.4). [`Fault::PowerLoss`] takes effect at once; the others fire on a later
@@ -815,4 +850,10 @@ pub enum Fault {
     /// `EcuConfig::drop_at_block`) fails: the ECU answers NRC 72 and stores nothing, so the
     /// client may send the block again. Fires when that block arrives.
     CorruptBlock { block: u32 },
+    /// The next request the ECU answers gets `count` response pending messages (NRC 78) before
+    /// its response: the first when the response was due, the others `interval_ms` apart, and
+    /// the response `interval_ms` after the last. A request without a response (suppressed, or
+    /// not for this ECU to answer) leaves the fault armed. `count` is capped at
+    /// [`MAX_RESPONSE_PENDING`]; zero uses the fault up without sending any.
+    ResponsePending { count: u32, interval_ms: u32 },
 }

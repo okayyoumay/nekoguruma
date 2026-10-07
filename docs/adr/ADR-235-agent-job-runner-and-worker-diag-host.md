@@ -123,4 +123,4 @@ Two further problems:
   - Two jobs must never run on one worker at the same time, because the first to finish would release the other's link.
   - `run_program` takes a cloneable client and enforces neither. The job scheduler must hold a per-worker guard (backlog).
 - The link supports only `ISO15765` with 11-bit identifiers. It sets no CAN frame padding and no addressing format. `sim-ecu` needs none of them, but real ECUs may.
-- The end-to-end test runs `run_program` against the real `j2534-0404-service` binary, `sim-vci` and `sim-ecu`. It checks a positive and a negative response, both returned as `Ok`. `sim-ecu` never sends 0x78, so the response-pending path through the worker has no end-to-end test yet (backlog).
+- The end-to-end test runs `run_program` against the real `j2534-0404-service` binary, `sim-vci` and `sim-ecu`. It checks a positive and a negative response, both returned as `Ok`. The response-pending path through the worker is tested end to end in `tests/sim_vci_response_pending.rs`, with 0x78 chains injected into `sim-ecu` (`Fault::ResponsePending`).

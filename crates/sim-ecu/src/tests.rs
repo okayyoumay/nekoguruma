@@ -1385,7 +1385,8 @@ fn exchange_reports_the_configured_response_delay() {
         ecu.exchange(Addressing::Physical, &[0x3E, 0x00]),
         Exchange {
             response: pos(&[0x7E, 0x00]),
-            delay_ms: 20
+            delay_ms: 20,
+            pending: Vec::new(),
         }
     );
     // A suppressed response has no delay.
@@ -1393,7 +1394,8 @@ fn exchange_reports_the_configured_response_delay() {
         ecu.exchange(Addressing::Physical, &[0x3E, 0x80]),
         Exchange {
             response: SimResponse::NoResponse,
-            delay_ms: 0
+            delay_ms: 0,
+            pending: Vec::new(),
         }
     );
 }
@@ -2111,4 +2113,103 @@ fn restore_refuses_a_snapshot_that_contradicts_itself() {
             snapshot.download
         );
     }
+}
+
+#[test]
+fn response_pending_fault_precedes_the_response_with_nrc_78() {
+    let mut ecu = SimEcu::new(EcuConfig {
+        response_delay_ms: 20,
+        ..config()
+    });
+    ecu.inject(Fault::ResponsePending {
+        count: 3,
+        interval_ms: 100,
+    });
+    // Suppressed: nothing goes out, and the fault waits for a request that is answered.
+    assert_eq!(
+        ecu.exchange(Addressing::Physical, &[0x3E, 0x80]),
+        Exchange::none()
+    );
+    let pending = |at| (at, vec![0x7F, 0x22, 0x78]);
+    assert_eq!(
+        ecu.exchange(Addressing::Physical, &[0x22, 0xF1, 0x90])
+            .pending,
+        [pending(20), pending(120), pending(220)]
+    );
+    // Once only.
+    assert!(ecu.armed_faults().is_empty());
+    assert_eq!(
+        ecu.exchange(Addressing::Physical, &[0x3E, 0x00]),
+        Exchange {
+            response: pos(&[0x7E, 0x00]),
+            delay_ms: 20,
+            pending: Vec::new(),
+        }
+    );
+}
+
+#[test]
+fn response_pending_delays_the_response_and_s3() {
+    let (mut ecu, clock) = ecu_with_clock(config());
+    enter(&mut ecu, Session::Extended);
+    ecu.inject(Fault::ResponsePending {
+        count: 2,
+        interval_ms: 1_000,
+    });
+    let exchange = ecu.exchange(Addressing::Physical, &[0x3E, 0x00]);
+    assert_eq!(exchange.delay_ms, 2_000);
+    assert_eq!(exchange.response, pos(&[0x7E, 0x00]));
+    // tS3_Server runs from when the final response goes out.
+    clock.advance(ms(2_000 + u64::from(DEFAULT_S3_SERVER_MS) - 1));
+    ecu.check_timers();
+    assert_eq!(ecu.session, Session::Extended);
+    clock.advance(ms(1));
+    ecu.check_timers();
+    assert_eq!(ecu.session, Session::Default);
+}
+
+#[test]
+fn a_dropped_response_still_follows_its_response_pending_messages() {
+    let mut ecu = SimEcu::new(config());
+    ecu.inject(Fault::ResponsePending {
+        count: 1,
+        interval_ms: 50,
+    });
+    ecu.inject(Fault::DropResponse);
+    let exchange = ecu.exchange(Addressing::Physical, &[0x3E, 0x00]);
+    assert_eq!(exchange.response, SimResponse::NoResponse);
+    assert_eq!(exchange.pending, [(0, vec![0x7F, 0x3E, 0x78])]);
+}
+
+#[test]
+fn response_pending_counts_are_capped_and_zero_sends_none() {
+    let mut ecu = SimEcu::new(config());
+    ecu.inject(Fault::ResponsePending {
+        count: u32::MAX,
+        interval_ms: 0,
+    });
+    let exchange = ecu.exchange(Addressing::Physical, &[0x3E, 0x00]);
+    assert_eq!(exchange.pending.len(), MAX_RESPONSE_PENDING as usize);
+    ecu.inject(Fault::ResponsePending {
+        count: 0,
+        interval_ms: 100,
+    });
+    let exchange = ecu.exchange(Addressing::Physical, &[0x3E, 0x00]);
+    assert!(exchange.pending.is_empty());
+    assert_eq!(exchange.delay_ms, 0);
+    assert!(ecu.armed_faults().is_empty());
+}
+
+#[test]
+fn response_pending_fault_parses_from_json() {
+    let fault: Fault =
+        serde_json::from_str(r#"{"response_pending": {"count": 2, "interval_ms": 300}}"#)
+            .expect("fault should parse");
+    assert_eq!(
+        fault,
+        Fault::ResponsePending {
+            count: 2,
+            interval_ms: 300
+        }
+    );
 }

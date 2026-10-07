@@ -15,8 +15,8 @@ the maintainer's call.
 Claude sessions cannot read code scanning alerts: the session proxy sends the Claude GitHub
 App's credential on every `api.github.com` request, and that app has no code scanning
 permission. So `.github/workflows/codeql-alert-handoff.yml` reads the alerts with its own
-token and fires this skill's routine with the list. It runs weekly, on request, and after a
-`codeql` PR merges (once CodeQL has re-analysed the merge commit), and it does not fire while a
+token and fires this skill's routine with the list. It runs weekly, on request, and when CodeQL
+has successfully re-analysed a commit on `main` that merged a `codeql` PR, and it does not fire while a
 claim-set PR (step 2) is open, so a merged fix leads to the next alert without waiting for the
 weekly run.
 
@@ -110,9 +110,8 @@ round.
 ## 6. After the hand-off
 
 End the turn. While the PR is open, any wake other than its merge or close is handled by
-`pr-review-loop`. Nothing more is needed when it is merged: the merge runs the hand-off
-workflow, which waits for CodeQL to re-analyse `main`, and the next payload starts the next
-alert.
+`pr-review-loop`. Nothing more is needed when it is merged: once CodeQL has re-analysed the
+merge commit, the hand-off workflow runs, and the next payload starts the next alert.
 If that payload still lists the alert, step 3 reports it.
 
 ## Resume

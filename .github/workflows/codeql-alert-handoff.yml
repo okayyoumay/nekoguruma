@@ -11,15 +11,17 @@ name: CodeQL alert hand-off
 on:
   schedule:
     - cron: "47 23 * * 2" # Wednesday 08:47 JST
-  # A merged fix frees the loop for the next alert. Actions has no code scanning alert event,
-  # so the job waits for CodeQL to re-analyse the merge commit instead.
-  pull_request:
-    types: [closed]
+  # A merged fix frees the loop for the next alert. Actions has no code scanning alert event, so
+  # the job runs when CodeQL default setup (workflow name "CodeQL") finishes analysing a push to
+  # main, and continues only when that commit merged a codeql PR.
+  workflow_run:
+    workflows: [CodeQL]
+    types: [completed]
     branches: [main]
   workflow_dispatch:
 
 permissions:
-  actions: read
+  contents: read
   security-events: read
   pull-requests: read
 
@@ -29,13 +31,13 @@ concurrency:
 
 jobs:
   handoff:
+    # An analysis that did not succeed leaves the alerts stale: send nothing.
     if: >-
-      github.event_name != 'pull_request'
-      || (github.event.pull_request.merged
-          && !github.event.pull_request.head.repo.fork
-          && contains(github.event.pull_request.labels.*.name, 'codeql'))
+      github.event_name != 'workflow_run'
+      || (github.event.workflow_run.event == 'push'
+          && github.event.workflow_run.conclusion == 'success')
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 5
     env:
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}
@@ -50,23 +52,18 @@ jobs:
             exit 0
           fi
 
-          # After a merged fix, wait for CodeQL default setup to analyse the merge commit, so
-          # the list no longer carries the fixed alert.
-          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
-            sha=$(jq -r .pull_request.merge_commit_sha "$GITHUB_EVENT_PATH")
-            for _ in $(seq 1 60); do
-              state=$(gh api "repos/$REPO/actions/runs?head_sha=$sha&per_page=100" \
-                --jq '[.workflow_runs[] | select(.path | startswith("dynamic/github-code-scanning/codeql"))]
-                      | if length == 0 then "pending"
-                        elif all(.status == "completed") then "done" else "pending" end')
-              [ "$state" = done ] && break
-              sleep 30
-            done
-            if [ "$state" != done ]; then
-              echo "::warning::CodeQL has not finished analysing the merge commit; nothing sent."
+          # After an analysis of main, continue only if the analysed commit merged a codeql PR
+          # from this repository.
+          if [ "$GITHUB_EVENT_NAME" = workflow_run ]; then
+            sha=$(jq -r .workflow_run.head_sha "$GITHUB_EVENT_PATH")
+            merged=$(gh api "repos/$REPO/commits/$sha/pulls" \
+              --jq '[.[] | select(.merged_at != null and .head.repo.full_name == env.REPO
+                                  and (.labels | map(.name) | index("codeql")))] | length')
+            if [ "$merged" -eq 0 ]; then
+              echo "The analysed commit did not merge a codeql PR; nothing sent."
               exit 0
             fi
-            sleep 60 # alert states update shortly after the analysis upload
+            sleep 30 # alert states update shortly after the analysis upload
           fi
 
           # One task at a time across both loops (ADR-243): while a loop PR is open, the routine

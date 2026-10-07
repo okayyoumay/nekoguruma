@@ -122,7 +122,7 @@ pub struct LoggingConfig {
 /// ```toml
 /// output = "stderr"
 /// output = "null"
-/// output = { file = "C:/ProgramData/vci-service-launcher/logs/service.log" }
+/// output = { file = "C:/ProgramData/nekoguruma/logs/service.log" }
 /// ```
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
@@ -335,7 +335,8 @@ fn config_file_path() -> PathBuf {
     // Path to the config file: either relative to the selected root, or an
     // absolute path that bypasses root resolution entirely. Defaults to the
     // build-time value embedded via VCI_CONFIG_PATH (default:
-    // "vci-service-launcher/config.toml"). In debug builds only
+    // "nekoguruma/config.toml", so `/etc/nekoguruma/config.toml` on Linux,
+    // ADR-228). In debug builds only
     // (`debug_assertions`, see ADR-073), a runtime VCI_CONFIG_PATH
     // environment variable takes precedence when set, letting IDE debug
     // launch configurations (see .vscode/launch.json) point at a dedicated
@@ -343,12 +344,60 @@ fn config_file_path() -> PathBuf {
     // variable here and use solely the build-time embedded value.
     const CONFIG_PATH: &str = env!("VCI_CONFIG_PATH");
     #[cfg(debug_assertions)]
-    let path = std::env::var_os("VCI_CONFIG_PATH")
-        .map(PathBuf::from)
+    let path = runtime_override(std::env::var_os("VCI_CONFIG_PATH"))
         .unwrap_or_else(|| PathBuf::from(CONFIG_PATH));
     #[cfg(not(debug_assertions))]
     let path = PathBuf::from(CONFIG_PATH);
     resolve_config_path(&path)
+}
+
+/// Directory of the J2534 registration definitions on Linux (design 7.1.1): one file per VCI,
+/// written by the administrator. Fixed at build time (ADR-228): `NGR_J2534_DEFINITION_DIR` at
+/// build time, either absolute or relative to the fixed system directory of
+/// [`fixed_system_root`] (default `nekoguruma/j2534`, so `/etc/nekoguruma/j2534` on Linux).
+/// Unlike the configuration file, no `config-root-*` feature moves it: definitions are read
+/// from the administrator's directory in every build and mode (ADR-228 Decision 2). In debug
+/// builds only (ADR-073), a non-empty runtime `NGR_J2534_DEFINITION_DIR` takes precedence, so
+/// tests can point it at a directory of their own; release builds read no environment variable
+/// here.
+pub fn j2534_definition_dir() -> PathBuf {
+    const DEFINITION_DIR: &str = env!("NGR_J2534_DEFINITION_DIR");
+    #[cfg(debug_assertions)]
+    let path = runtime_override(std::env::var_os("NGR_J2534_DEFINITION_DIR"))
+        .unwrap_or_else(|| PathBuf::from(DEFINITION_DIR));
+    #[cfg(not(debug_assertions))]
+    let path = PathBuf::from(DEFINITION_DIR);
+    if path.is_absolute() {
+        path
+    } else {
+        fixed_system_root().join(path)
+    }
+}
+
+/// A debug-only runtime override (ADR-073) from an environment variable's value: none when
+/// the variable is unset or empty, so an empty value falls back to the build-time location
+/// instead of resolving to the root itself.
+#[cfg(debug_assertions)]
+fn runtime_override(value: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    value.filter(|value| !value.is_empty()).map(PathBuf::from)
+}
+
+/// The administrator-only system configuration directory of the platform, whatever
+/// `config-root-*` features the build has: `%ProgramData%` on Windows, `/private/etc` on macOS
+/// (`/etc` is a symlink there), `/etc` on every other Unix.
+fn fixed_system_root() -> PathBuf {
+    #[cfg(windows)]
+    {
+        known_folder(&windows_sys::Win32::UI::Shell::FOLDERID_ProgramData)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        PathBuf::from("/private/etc")
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        PathBuf::from("/etc")
+    }
 }
 
 /// Resolves `config_path` against the selected root, unless `config_path` is
@@ -372,7 +421,7 @@ fn resolve_config_path(config_path: &Path) -> PathBuf {
 ///
 /// In test builds, checks a `#[cfg(test)]`-only thread-local override first
 /// (see `test_support` below) so unit tests never touch the real exe
-/// directory, a real Windows known folder, or `/`. In non-test builds this
+/// directory, a real Windows known folder, or `/etc`. In non-test builds this
 /// call is optimized away entirely (the whole `#[cfg(test)]` block does not
 /// exist), so production behavior and codegen are unchanged.
 fn config_root() -> PathBuf {
@@ -401,10 +450,11 @@ fn config_root_impl() -> PathBuf {
     windows_known_folder_root()
 }
 
-/// Non-Windows without `config-root-exe-dir`: filesystem root `/`.
+/// Non-Windows without `config-root-exe-dir`: `/etc`, writable by the administrator only
+/// (ADR-228).
 #[cfg(all(not(windows), not(feature = "config-root-exe-dir")))]
 fn config_root_impl() -> PathBuf {
-    PathBuf::from("/")
+    PathBuf::from("/etc")
 }
 
 // ── Windows known-folder helper ───────────────────────────────────────────────
@@ -1133,11 +1183,11 @@ pub fn manager_config() -> ManagerConfig {
 /// admin-oriented Windows option isn't even any better: applying that same
 /// check to an ordinary path under `config_root()`'s other two Windows
 /// options (`FOLDERID_ProgramFiles`/`FOLDERID_ProgramFilesX86`) or its
-/// non-Windows default (the bare filesystem root `/`) also fails, for a
-/// second, independent reason unrelated to which folder was picked -- see
-/// `vci-service-manager`'s own Windows `AccessCheck` mask fix (ADR-226 SS3
-/// amendment) and its macOS residual (`/` is a sealed, read-only system
-/// volume on Catalina+). `system_config_dir()` sidesteps all of that by
+/// non-Windows default root also failed when this function was written (it was the bare
+/// filesystem root `/` before ADR-228 moved it to `/etc`), for a second, independent reason
+/// unrelated to which folder was picked -- see `vci-service-manager`'s own Windows
+/// `AccessCheck` mask fix (ADR-226 SS3 amendment) and its macOS residual (`/` is a sealed,
+/// read-only system volume on Catalina+, and `/etc` is a symlink there). `system_config_dir()` sidesteps all of that by
 /// always resolving to one FIXED, admin-writable-only location per
 /// platform, never selected by a Cargo feature. Currently the sole caller is
 /// `vci-service-manager`, to locate `vci-clients.toml` (ADR-226 SS3).
@@ -1156,19 +1206,7 @@ pub fn manager_config() -> ManagerConfig {
 ///   check would otherwise reject the very first ancestor it walks.
 /// - Every other Unix: `/etc/vci-service-launcher`.
 pub fn system_config_dir() -> PathBuf {
-    #[cfg(windows)]
-    {
-        known_folder(&windows_sys::Win32::UI::Shell::FOLDERID_ProgramData)
-            .join("vci-service-launcher")
-    }
-    #[cfg(target_os = "macos")]
-    {
-        PathBuf::from("/private/etc/vci-service-launcher")
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        PathBuf::from("/etc/vci-service-launcher")
-    }
+    fixed_system_root().join("vci-service-launcher")
 }
 
 // ── Test-only config_root() override ───────────────────────────────────────
@@ -1297,6 +1335,57 @@ mod tests {
         // Without an arch match (arch=None), falls through to priority 3 (api+lib).
         let no_arch = find_logging_config("iso22900", None, "mylib");
         assert_eq!(no_arch.level.as_deref(), Some("debug"));
+    }
+
+    /// The release defaults (ADR-228): the configuration file under `nekoguruma` in the
+    /// selected root, and the registration definitions under `nekoguruma` in the fixed system
+    /// directory, whatever root a test or a `config-root-*` feature selects. A developer who
+    /// exported either variable while building gets a different embedded value; the test then
+    /// says so and checks nothing.
+    #[test]
+    fn default_locations_are_under_nekoguruma() {
+        let defaults = env!("VCI_CONFIG_PATH") == "nekoguruma/config.toml"
+            && env!("NGR_J2534_DEFINITION_DIR") == "nekoguruma/j2534";
+        // Cargo puts `rustc-env` values into the test process's environment as well, so a
+        // variable holding the embedded value is no override.
+        let overridden = |name: &str, embedded: &str| {
+            std::env::var_os(name).is_some_and(|value| !value.is_empty() && value != embedded)
+        };
+        let runtime_overrides = overridden("VCI_CONFIG_PATH", env!("VCI_CONFIG_PATH"))
+            || overridden("NGR_J2534_DEFINITION_DIR", env!("NGR_J2534_DEFINITION_DIR"));
+        if !defaults || runtime_overrides {
+            eprintln!("skipped: VCI_CONFIG_PATH or NGR_J2534_DEFINITION_DIR is set");
+            return;
+        }
+        let root = Path::new("/some/root");
+        let _guard = test_support::set(root);
+        assert_eq!(config_file_path(), root.join("nekoguruma/config.toml"));
+        // The selected root does not move the definitions.
+        assert_eq!(
+            j2534_definition_dir(),
+            fixed_system_root().join("nekoguruma/j2534")
+        );
+    }
+
+    /// An unset or empty override leaves the build-time location in place, for both
+    /// `VCI_CONFIG_PATH` and `NGR_J2534_DEFINITION_DIR`.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn an_empty_runtime_override_counts_as_unset() {
+        assert_eq!(runtime_override(None), None);
+        assert_eq!(runtime_override(Some("".into())), None);
+        assert_eq!(
+            runtime_override(Some("/tmp/dev.toml".into())),
+            Some(PathBuf::from("/tmp/dev.toml"))
+        );
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn the_unix_roots_are_etc() {
+        assert_eq!(fixed_system_root(), PathBuf::from("/etc"));
+        #[cfg(not(feature = "config-root-exe-dir"))]
+        assert_eq!(config_root_impl(), PathBuf::from("/etc"));
     }
 
     #[test]

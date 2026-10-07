@@ -1,7 +1,7 @@
 # ADR-033: Extract Config File Loading into `vci-service-config`
 
 **Date:** 2026-07-02
-**Status:** Accepted
+**Status:** Accepted (kept default config locations superseded by ADR-228)
 **Affects:** `vci-service-launcher` (new dependency, `src/lib.rs`, `Cargo.toml`, `build.rs` removed), `vci-service-config` (new crate), `Cargo.toml` (workspace)
 
 ## Context

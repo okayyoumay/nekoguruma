@@ -16,6 +16,10 @@ with no embedded NUL — is the consuming service's responsibility), and
 standalone service-manager runtime settings (`manager_config`, ADR-073 —
 `bind`/`root_path`/`ipc` (`ipc` added by ADR-226 for the local IPC listener
 endpoint) from the flat `[config.manager]` table, no priority hierarchy),
+the J2534 registration-definition directory (`j2534_definition_dir()`,
+ADR-228 — `/etc/nekoguruma/j2534` by default, fixed at build time through
+`NGR_J2534_DEFINITION_DIR` and resolved against the same fixed system
+directory as `system_config_dir()`, never against a `config-root-*` root),
 and a fixed, platform-specific system config directory
 (`system_config_dir()`, ADR-226 SS3 amendment — `%ProgramData%\vci-service-launcher`
 on Windows, `/private/etc/vci-service-launcher` on macOS,
@@ -83,9 +87,12 @@ configuration, not a running service.
   exactly as they existed in `vci-service-launcher` before extraction, since
   `iso22900-service` and `j2534-0404-service` forward
   them by name in their own `Cargo.toml`.
-- Preserve the default `VCI_CONFIG_PATH` build-time value
-  (`vci-service-launcher/config.toml`) and the deployed file locations
-  (`%ProgramData%\vci-service-launcher\config.toml`,
-  `/etc/vci-service-launcher/config.toml`) — these describe an existing
-  on-disk deployment layout, not this crate's name, and changing them would
-  break already-deployed installs.
+- The default `VCI_CONFIG_PATH` build-time value is `nekoguruma/config.toml`,
+  resolved against `/etc` on Linux and the selected known folder on Windows
+  (`%ProgramData%\nekoguruma\config.toml` by default), the fixed,
+  administrator-only locations of ADR-228. The registration-definition
+  directory (`j2534_definition_dir()`, `NGR_J2534_DEFINITION_DIR`, default
+  `nekoguruma/j2534`) is fixed the same way. Each has a runtime override in
+  debug builds only (ADR-073). Before ADR-228 the default was
+  `vci-service-launcher/config.toml`, which the Linux root `/` turned into
+  `/vci-service-launcher/config.toml`.

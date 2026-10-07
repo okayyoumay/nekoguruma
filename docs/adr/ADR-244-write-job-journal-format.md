@@ -81,6 +81,10 @@ rename, directory sync) and an append-only log of records.
   which needs no format change.
 - A checksum failure in the very last frame is indistinguishable from a torn write and is cut
   off. A synced frame is not torn by a crash, so this needs damage to the storage itself.
+- Later records count only as a run of whole records with consecutive numbers that ends exactly
+  at the end of the file. A torn record whose payload (a VM state can hold any bytes) contains
+  such a run, cut exactly at its end, reads as corrupt: the cautious outcome, since a corrupt
+  journal stops the job rather than losing committed markers.
 - Durability on Windows rests on `FlushFileBuffers` of the new file also covering its directory
   entry (NTFS logs the entry with the file's metadata). The crash tests end the process, which
   checks the format's recovery, not the storage under a power loss.

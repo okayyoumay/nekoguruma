@@ -723,19 +723,35 @@ fn load(bytes: &[u8], key: &JobKey) -> Result<Loaded, JournalError> {
     Ok(Loaded { state, len: offset })
 }
 
-/// Whether a whole record numbered `records` or later starts anywhere from `from` on. A damaged
-/// length field or a zeroed region reads like a torn frame, but records committed after it
-/// show that it is damage, not an unfinished commit.
+/// Whether committed records numbered `records` or later follow from `from` on: a run of whole
+/// records with consecutive numbers that ends exactly at the end of the file. A damaged length
+/// field or a zeroed region reads like a torn frame, but records committed after it show that
+/// it is damage, not an unfinished commit. Requiring the run to reach the end keeps a frame
+/// that happens to lie inside a torn record's payload (a VM state can hold any bytes) from
+/// counting, since an unfinished write does not stop on a frame boundary of its payload.
 fn record_follows(bytes: &[u8], from: usize, records: u64) -> bool {
-    (from..bytes.len()).any(|offset| match read_frame(bytes, offset) {
-        FrameRead::Ok { payload, .. } => {
-            postcard::from_bytes::<Entry>(payload).is_ok_and(|entry| entry.seq >= records)
+    (from..bytes.len()).any(|start| {
+        let mut offset = start;
+        let mut expected = None;
+        while let FrameRead::Ok { payload, next } = read_frame(bytes, offset) {
+            let Ok(entry) = postcard::from_bytes::<Entry>(payload) else {
+                return false;
+            };
+            if entry.seq < records || expected.is_some_and(|seq| entry.seq != seq) {
+                return false;
+            }
+            expected = Some(entry.seq + 1);
+            offset = next;
+            if offset == bytes.len() {
+                return true;
+            }
         }
-        _ => false,
+        false
     })
 }
 
-/// CRC-32 (IEEE 802.3, reflected, as zlib computes it).
+/// CRC-32 with the reflected polynomial 0xEDB88320, initial value and final XOR all ones (the
+/// checksum zlib's `crc32` computes).
 fn crc32(bytes: &[u8]) -> u32 {
     const TABLE: [u32; 256] = {
         let mut table = [0u32; 256];
@@ -1151,6 +1167,64 @@ mod tests {
                 "damage {index} is left in place"
             );
         }
+    }
+
+    /// A torn step whose VM state holds the bytes of a whole frame is still a torn tail.
+    #[test]
+    fn a_frame_inside_a_torn_payload_is_not_a_later_record() {
+        let dir = TempDir::new();
+        let mut journal = Journal::create(&dir.0, &key()).expect("create");
+        journal
+            .commit_ecu_hardware_part_number(b"HW-1")
+            .expect("commit");
+        let committed = journal.state().clone();
+        let before = journal.store.len as usize;
+        let mut nested = Vec::new();
+        let entry = Entry {
+            seq: 1,
+            at_unix_ms: 0,
+            record: Record::Block { block: 0 },
+        };
+        push_frame(&mut nested, &encode(&entry).expect("encode")).expect("frame");
+        let mut vm_state = nested.clone();
+        vm_state.extend_from_slice(&[0x55; 32]);
+        journal
+            .commit_step(at(1, 1), Some(&vm_state))
+            .expect("commit");
+        drop(journal);
+        let bytes = fs::read(path(&dir)).expect("read");
+        let nested_at = before
+            + bytes[before..]
+                .windows(nested.len())
+                .position(|window| window == nested)
+                .expect("the nested frame is in the file");
+        // The step's write stopped inside or after the nested frame.
+        for cut in [
+            nested_at + 3,
+            nested_at + nested.len() - 1,
+            nested_at + nested.len() + 1,
+            nested_at + nested.len() + 7,
+        ] {
+            fs::write(path(&dir), &bytes[..cut]).expect("write");
+            let journal = Journal::open(&dir.0, &key()).expect("a torn tail");
+            assert_eq!(journal.state(), &committed, "cut {cut}");
+            assert_eq!(
+                fs::metadata(path(&dir)).expect("metadata").len(),
+                before as u64
+            );
+        }
+        // Stopped exactly at the nested frame's end, the frame cannot be told from a committed
+        // record: the journal reads as corrupt, the cautious outcome, and is left untouched.
+        let cut = nested_at + nested.len();
+        fs::write(path(&dir), &bytes[..cut]).expect("write");
+        assert!(matches!(
+            Journal::open(&dir.0, &key()),
+            Err(JournalError::Corrupt { .. })
+        ));
+        assert_eq!(
+            fs::metadata(path(&dir)).expect("metadata").len(),
+            cut as u64
+        );
     }
 
     #[test]

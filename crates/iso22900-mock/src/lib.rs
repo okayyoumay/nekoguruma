@@ -17,6 +17,10 @@ const MOCK_TIMESTAMP: UNUM32 = 4242;
 const MOCK_VERSION_TAG: &[u8] = b"iso22900-mock\0";
 const MOCK_VEHICLE_NAME: &[u8] = b"mock-vehicle\0";
 
+/// IOCTL command id for which `PDUIoCtl` reports success without filling in the output item,
+/// so tests can check how the wrapper handles a library that returns a null item.
+pub const MOCK_IOCTL_NULL_OUTPUT: UNUM32 = 0x7FFF_FF00;
+
 #[derive(Clone, Copy)]
 struct PendingEvent {
     h_mod: UNUM32,
@@ -361,6 +365,9 @@ exported_fn!(PDUDestruct() -> T_PDU_ERROR {
 });
 
 exported_fn!(PDUIoCtl(_h_mod: UNUM32, _h_cll: UNUM32, io_ctl_command_id: T_PDU_IT, p_input_data: *mut PDU_DATA_ITEM, p_output_data: *mut *mut PDU_DATA_ITEM) -> T_PDU_ERROR {
+    if io_ctl_command_id.0 == MOCK_IOCTL_NULL_OUTPUT {
+        return no_error();
+    }
     if !p_output_data.is_null() {
         let input_type = if p_input_data.is_null() {
             io_ctl_command_id

@@ -589,8 +589,8 @@ impl DPduApi {
     pub fn get_module_ids(&self) -> Result<ApiItem<'_, BorrowedModuleItem>, DPduApiError> {
         let mut item_ptr = ptr::null_mut();
         check(unsafe { self.sys.PDUGetModuleIds(&mut item_ptr) })?;
-        let item = unsafe { &*item_ptr.cast::<BorrowedModuleItem>() };
-        ApiItem::new(item, &self.sys, item_ptr.cast())
+        // SAFETY: on success the library returns an item of this type, or null (rejected).
+        unsafe { ApiItem::from_raw(&self.sys, item_ptr.cast()) }
     }
 
     /// Queries resource status for a list of `(module, resource)` pairs.
@@ -615,8 +615,8 @@ impl DPduApi {
             self.sys
                 .PDUGetResourceIds(module_handle.0, &mut descriptor.ffi, &mut item_ptr)
         })?;
-        let item = unsafe { &*item_ptr.cast::<BorrowedResourceIdItem>() };
-        ApiItem::new(item, &self.sys, item_ptr.cast())
+        // SAFETY: on success the library returns an item of this type, or null (rejected).
+        unsafe { ApiItem::from_raw(&self.sys, item_ptr.cast()) }
     }
 
     /// Returns modules currently conflicting with a resource.
@@ -649,8 +649,8 @@ impl DPduApi {
             self.sys
                 .PDUGetConflictingResources(resource_id.0, &mut module_item, &mut item_ptr)
         })?;
-        let item = unsafe { &*item_ptr.cast::<BorrowedResourceConflictItem>() };
-        ApiItem::new(item, &self.sys, item_ptr.cast())
+        // SAFETY: on success the library returns an item of this type, or null (rejected).
+        unsafe { ApiItem::from_raw(&self.sys, item_ptr.cast()) }
     }
 
     /// Creates a communication logical link using a resource id or descriptor.
@@ -782,8 +782,8 @@ impl DPduApi {
                 &mut item_ptr,
             )
         })?;
-        let item = unsafe { &*item_ptr.cast::<BorrowedParamItem>() };
-        ApiItem::new(item, &self.sys, item_ptr.cast())
+        // SAFETY: on success the library returns an item of this type, or null (rejected).
+        unsafe { ApiItem::from_raw(&self.sys, item_ptr.cast()) }
     }
 
     /// Writes a COM parameter.
@@ -913,8 +913,8 @@ impl DPduApi {
             self.sys
                 .PDUGetEventItem(module_handle.0, logical_link_handle.0, &mut item_ptr)
         })?;
-        let item = unsafe { &*item_ptr.cast::<BorrowedEventItem>() };
-        ApiItem::new(item, &self.sys, item_ptr.cast())
+        // SAFETY: on success the library returns an item of this type, or null (rejected).
+        unsafe { ApiItem::from_raw(&self.sys, item_ptr.cast()) }
     }
 
     /// Registers an event callback for a specific `(module, link)` pair.
@@ -1021,8 +1021,8 @@ impl DPduApi {
             self.sys
                 .PDUGetUniqueRespIdTable(module_handle.0, logical_link_handle.0, &mut item_ptr)
         })?;
-        let item = unsafe { &*item_ptr.cast::<BorrowedUniqueRespIdTableItem>() };
-        ApiItem::new(item, &self.sys, item_ptr.cast())
+        // SAFETY: on success the library returns an item of this type, or null (rejected).
+        unsafe { ApiItem::from_raw(&self.sys, item_ptr.cast()) }
     }
 
     /// Replaces the unique-response-id table with provided entries.
@@ -1061,8 +1061,8 @@ impl DPduApi {
                 &mut output_ptr,
             )
         })?;
-        let output = unsafe { &*output_ptr.cast::<BorrowedDataItem>() };
-        ApiItem::new(output, &self.sys, output_ptr.cast())
+        // SAFETY: on success the library returns an item of this type, or null (rejected).
+        unsafe { ApiItem::from_raw(&self.sys, output_ptr.cast()) }
     }
 
     /// Executes an IOCTL that does not return output item data.

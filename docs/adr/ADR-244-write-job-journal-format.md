@@ -41,23 +41,34 @@ rename, directory sync) and an append-only log of records.
    key together. A transfer-start record replaces the whole transfer attempt, so the previous
    attempt's exit marker, post-transfer progress and last block go with it. Post-transfer
    completion is its own record; steps after the exit marker count as post-transfer progress
-   until it.
+   until it. A resume record closes the attempt it interrupted: that attempt takes no more
+   blocks, exit marker, post-transfer progress or completion, since the steps that follow
+   belong to the recovery, and only a new transfer-start marker opens a transfer again.
 4. **The folded state is the summary.** Reading the journal folds its records into
    `RecoveryFacts`, which is also the checkpoint summary sent for handover, so the summary
    carries the facts unchanged. Records that contradict the facts (a block outside a transfer, a
    second exit marker, a step that does not come after the last one, a pre-erase version after a
    transfer started, a resume count that does not count one more) are refused when committed and
-   make a journal corrupt when read back.
+   make a journal corrupt when read back. The hardware part number cannot change once a transfer
+   started, since a restart compares the ECU against it, like the pre-erase version, which
+   cannot be recorded after that point at all.
 5. **Torn tail versus corruption.** Only what one unfinished commit can leave is cut off when
    the journal is opened: a last frame that runs past the end of the file, or a last frame
-   that fails its checksum, within one maximum frame of the end. A frame that fails its
+   that fails its checksum, within one maximum frame of the end, and only when no whole record
+   that would come next starts anywhere after it. A damaged length field or a zeroed region
+   (a common failure of flash media at power loss) reads like a torn frame; the records
+   committed after it show that it is damage, and the journal is then corrupt and left
+   untouched, so its write-ahead markers are never cut away. A frame that fails its
    checksum with more data after it, a record that does not decode or is out of sequence, a
    header that does not read back, another job's header or a format version this build does
    not know is an error, never skipped or repaired. The header is synced under a temporary name
-   and then linked to the journal's name, so a journal file always has its header.
+   and then linked to the journal's name, so a journal file always has its header. Only the
+   journal's writer opens it for writing (and may cut a torn tail); any other reader, such as a
+   summary or an audit upload, reads it without changing it.
 6. **The journal owns checkpoints and resume counts.** `VmState`'s `checkpoint` and
    `resume_count` (ADR-233 item 3 left their keeping to the journal) are not used; the VM state
-   travels as an opaque postcard blob a step record may carry.
+   travels as an opaque postcard blob a step record may carry, and reads back with the step it
+   was taken after.
 7. **The journal only records.** Committing a marker before the request it guards, ending the
    job when a commit fails, and the restart order itself belong to the job runner. The
    journal's directory is a parameter; stage identifiers are opaque numbers the IR gives a
@@ -73,9 +84,17 @@ rename, directory sync) and an append-only log of records.
 - Durability on Windows rests on `FlushFileBuffers` of the new file also covering its directory
   entry (NTFS logs the entry with the file's metadata). The crash tests end the process, which
   checks the format's recovery, not the storage under a power loss.
-- Creating a journal needs hard links (ext4, NTFS); a file system without them fails the
-  creation.
-- Nothing locks the file: one journal per job and generation is the job scheduler's duty.
+- Creating a journal needs hard links (ext4, NTFS); a file system without them (FAT, exFAT)
+  fails the creation.
+- Nothing locks the file (a lock in `std` needs a newer Rust than the workspace's minimum): one
+  writer per job and generation is the job scheduler's duty, and a second writer cutting a
+  frame the first is still writing would lose it.
+- Poisoning lasts as long as the open journal. After a failed sync, the agent ends the job; an
+  agent restarted in the same boot may read back a frame the OS still caches but never wrote,
+  which at worst shows a write-ahead marker for a request that was not sent, so the restart
+  takes the more cautious path.
+- A new-generation journal starts empty; starting it from a handover's checkpoint summary
+  needs a record that carries the summary, added with the handover itself.
 - Journal protection (design 5.5) fits the format: a value in the header's protection field and
   a per-frame MAC and encrypted payload, with the length and checksum left in the clear so a
   torn tail can be cut off without the key.

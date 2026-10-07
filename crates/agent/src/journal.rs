@@ -104,14 +104,18 @@ impl RecoveryFacts {
                     return Err("a step must come after the last step");
                 }
                 self.last_step = Some(*at);
-                if let Some(exit) = self.transfer.as_mut().and_then(|t| t.exit.as_mut())
+                if let Some(transfer) = self.transfer.as_mut()
+                    && !transfer.interrupted
+                    && let Some(exit) = transfer.exit.as_mut()
                     && !exit.complete
                 {
                     exit.last_post_step = Some(*at);
                 }
             }
             Record::Block { block } => {
-                let transfer = self.transfer.as_mut().ok_or("a block needs a transfer")?;
+                let transfer = self
+                    .open_transfer()
+                    .ok_or("a block needs an open transfer")?;
                 if transfer.exit.is_some() {
                     return Err("a block cannot follow RequestTransferExit");
                 }
@@ -121,6 +125,14 @@ impl RecoveryFacts {
                 transfer.last_block = Some(*block);
             }
             Record::EcuHardwarePartNumber(value) => {
+                // A restart compares the ECU against this value, so it cannot change once the
+                // ECU may hold a partial image.
+                if self.transfer.is_some() && self.ecu_hardware_part_number.as_ref() != Some(value)
+                {
+                    return Err(
+                        "the hardware part number cannot change after the transfer started",
+                    );
+                }
                 self.ecu_hardware_part_number = Some(value.clone());
             }
             Record::PreEraseSoftwareVersion(value) => {
@@ -149,6 +161,11 @@ impl RecoveryFacts {
                     Err(index) => self.resume_counts.insert(index, (*stage, next)),
                 }
                 self.attempt_key = attempt_key.clone();
+                // The attempt in progress ended with the interruption: steps from here on
+                // belong to the recovery, not to its transfer or post-transfer steps.
+                if let Some(transfer) = self.transfer.as_mut() {
+                    transfer.interrupted = true;
+                }
             }
             Record::TransferStart { stage, at } => {
                 if !after_last_step(at, self) {
@@ -161,6 +178,7 @@ impl RecoveryFacts {
                     started_at: *at,
                     last_block: None,
                     exit: None,
+                    interrupted: false,
                 });
             }
             Record::TransferExitIntent { at } => {
@@ -168,9 +186,8 @@ impl RecoveryFacts {
                     return Err("a marker must come after the last step");
                 }
                 let transfer = self
-                    .transfer
-                    .as_mut()
-                    .ok_or("RequestTransferExit needs a transfer")?;
+                    .open_transfer()
+                    .ok_or("RequestTransferExit needs an open transfer")?;
                 if transfer.exit.is_some() {
                     return Err("RequestTransferExit is already marked");
                 }
@@ -181,11 +198,9 @@ impl RecoveryFacts {
                 });
             }
             Record::PostTransferComplete => {
-                let exit = self
-                    .transfer
-                    .as_mut()
-                    .and_then(|t| t.exit.as_mut())
-                    .ok_or("post-transfer completion needs RequestTransferExit")?;
+                let exit = self.open_transfer().and_then(|t| t.exit.as_mut()).ok_or(
+                    "post-transfer completion needs RequestTransferExit in an open transfer",
+                )?;
                 if exit.complete {
                     return Err("the post-transfer steps are already complete");
                 }
@@ -193,6 +208,13 @@ impl RecoveryFacts {
             }
         }
         Ok(())
+    }
+
+    /// The transfer attempt, unless a resume interrupted it.
+    fn open_transfer(&mut self) -> Option<&mut TransferAttempt> {
+        self.transfer
+            .as_mut()
+            .filter(|transfer| !transfer.interrupted)
     }
 }
 
@@ -205,6 +227,9 @@ pub struct TransferAttempt {
     /// The last confirmed block (progress only, ADR-229 item 3).
     pub last_block: Option<u32>,
     pub exit: Option<TransferExit>,
+    /// A resume came after the marker: this attempt takes no more blocks or post-transfer
+    /// progress, and only a new transfer-start marker opens another.
+    pub interrupted: bool,
 }
 
 /// The RequestTransferExit marker and the post-transfer progress after it.
@@ -222,8 +247,9 @@ pub struct TransferExit {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JournalState {
     pub facts: RecoveryFacts,
-    /// The newest VM state a step record carried (postcard `VmState`, opaque here).
-    pub last_vm_state: Option<Vec<u8>>,
+    /// The newest VM state a step record carried (postcard `VmState`, opaque here), with the
+    /// step it was taken after.
+    pub last_vm_state: Option<(StepRef, Vec<u8>)>,
     /// Records in the journal.
     pub records: u64,
 }
@@ -340,8 +366,13 @@ impl Journal<FileStore> {
             created_unix_ms: unix_ms(),
         };
         push_frame(&mut bytes, &encode(&header)?)?;
+        // A temporary file left by an earlier attempt that crashed holds no commits.
+        match fs::remove_file(&tmp) {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error.into()),
+            _ => {}
+        }
         let written = (|| {
-            let mut file = File::create(&tmp)?;
+            let mut file = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
             file.write_all(&bytes)?;
             file.sync_all()
         })();
@@ -360,6 +391,8 @@ impl Journal<FileStore> {
         }
         sync_dir(dir)?;
         let file = OpenOptions::new().read(true).write(true).open(&path)?;
+        // Where the directory cannot be synced, the file's own sync covers its entry.
+        file.sync_all()?;
         Ok(Self {
             store: FileStore {
                 file,
@@ -377,17 +410,13 @@ impl Journal<FileStore> {
     /// Opens the journal of `key` in `dir` and reads it back. A frame left half-written by a
     /// commit that never returned is cut off; anything else that does not read back is
     /// [`JournalError::Corrupt`].
+    ///
+    /// Only the writer of a journal opens it: nothing locks the file, and cutting off a frame
+    /// that another process is still writing would lose it. Other readers use
+    /// [`Journal::read`].
     pub fn open(dir: &Path, key: &JobKey) -> Result<Self, JournalError> {
         let path = journal_path(dir, key)?;
-        let mut file = match OpenOptions::new().read(true).write(true).open(&path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Err(JournalError::NotFound);
-            }
-            Err(error) => return Err(error.into()),
-        };
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)?;
+        let (file, bytes) = read_file(&path, true)?;
         let loaded = load(&bytes, key)?;
         if loaded.len < bytes.len() {
             tracing::warn!(
@@ -407,6 +436,30 @@ impl Journal<FileStore> {
             poisoned: false,
         })
     }
+}
+
+impl Journal {
+    /// Reads the journal of `key` in `dir` without changing it: a half-written last frame is
+    /// left in place and not counted. For readers other than the journal's writer (a summary,
+    /// an audit upload).
+    pub fn read(dir: &Path, key: &JobKey) -> Result<JournalState, JournalError> {
+        let (_, bytes) = read_file(&journal_path(dir, key)?, false)?;
+        Ok(load(&bytes, key)?.state)
+    }
+}
+
+/// Opens `path` and reads it whole.
+fn read_file(path: &Path, write: bool) -> Result<(File, Vec<u8>), JournalError> {
+    let mut file = match OpenOptions::new().read(true).write(write).open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(JournalError::NotFound);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok((file, bytes))
 }
 
 impl<S: Store> Journal<S> {
@@ -507,11 +560,11 @@ impl<S: Store> Journal<S> {
         }
         self.state.facts = facts;
         if let Record::Step {
+            at,
             vm_state: Some(vm_state),
-            ..
         } = entry.record
         {
-            self.state.last_vm_state = Some(vm_state);
+            self.state.last_vm_state = Some((at, vm_state));
         }
         self.state.records += 1;
         Ok(())
@@ -638,8 +691,13 @@ fn load(bytes: &[u8], key: &JobKey) -> Result<Loaded, JournalError> {
     while offset < bytes.len() {
         let (payload, next) = match read_frame(bytes, offset) {
             FrameRead::Ok { payload, next } => (payload, next),
-            // One unfinished commit leaves at most one frame.
-            FrameRead::Torn if bytes.len() - offset <= FRAME_HEADER + MAX_FRAME as usize => break,
+            // One unfinished commit leaves at most one frame, and no record after it.
+            FrameRead::Torn
+                if bytes.len() - offset <= FRAME_HEADER + MAX_FRAME as usize
+                    && !record_follows(bytes, offset + 1, state.records) =>
+            {
+                break;
+            }
             FrameRead::Torn => return Err(corrupt(offset, "a record does not read back")),
             FrameRead::Bad => return Err(corrupt(offset, "a record fails its checksum")),
         };
@@ -653,16 +711,28 @@ fn load(bytes: &[u8], key: &JobKey) -> Result<Loaded, JournalError> {
             .apply(&entry.record)
             .map_err(|reason| corrupt(offset, reason))?;
         if let Record::Step {
+            at,
             vm_state: Some(vm_state),
-            ..
         } = entry.record
         {
-            state.last_vm_state = Some(vm_state);
+            state.last_vm_state = Some((at, vm_state));
         }
         state.records += 1;
         offset = next;
     }
     Ok(Loaded { state, len: offset })
+}
+
+/// Whether a whole record numbered `records` or later starts anywhere from `from` on. A damaged
+/// length field or a zeroed region reads like a torn frame, but records committed after it
+/// show that it is damage, not an unfinished commit.
+fn record_follows(bytes: &[u8], from: usize, records: u64) -> bool {
+    (from..bytes.len()).any(|offset| match read_frame(bytes, offset) {
+        FrameRead::Ok { payload, .. } => {
+            postcard::from_bytes::<Entry>(payload).is_ok_and(|entry| entry.seq >= records)
+        }
+        _ => false,
+    })
 }
 
 /// CRC-32 (IEEE 802.3, reflected, as zlib computes it).
@@ -785,11 +855,12 @@ mod tests {
                 started_at: at(3, 30),
                 last_block: Some(0),
                 exit: None,
+                interrupted: false,
             })
         );
         assert_eq!(
-            reopened.state().last_vm_state.as_deref(),
-            Some(&b"vm-2"[..])
+            reopened.state().last_vm_state,
+            Some((at(3, 30), b"vm-2".to_vec()))
         );
         assert_eq!(reopened.state().records, 14);
     }
@@ -1019,10 +1090,165 @@ mod tests {
                 started_at: at(3, 3),
                 last_block: None,
                 exit: None,
+                interrupted: false,
             })
         );
         assert_eq!(facts.resume_counts, [(STAGE, 1)]);
         assert_eq!(facts.last_step, Some(at(5, 2)));
+    }
+
+    /// A damaged length field or a zeroed region reads like a torn frame, but the records
+    /// committed after it must not be cut off with it.
+    #[test]
+    fn damage_with_records_after_it_is_not_a_torn_tail() {
+        let dir = TempDir::new();
+        let mut journal = Journal::create(&dir.0, &key()).expect("create");
+        let header_end = journal.store.len as usize;
+        journal
+            .commit_ecu_hardware_part_number(b"HW-1")
+            .expect("commit");
+        let second = journal.store.len as usize;
+        journal
+            .commit_transfer_start(STAGE, at(3, 11))
+            .expect("commit");
+        let third = journal.store.len as usize;
+        journal.commit_block(0).expect("commit");
+        journal
+            .commit_transfer_exit_intent(at(5, 20))
+            .expect("commit");
+        drop(journal);
+        let good = fs::read(path(&dir)).expect("read");
+
+        let mut damaged = Vec::new();
+        // One bit of the transfer-start frame's length.
+        let mut bytes = good.clone();
+        bytes[second] ^= 0x01;
+        damaged.push(bytes);
+        // Its length zeroed.
+        let mut bytes = good.clone();
+        bytes[second..second + 4].fill(0);
+        damaged.push(bytes);
+        // A length larger than a frame can be.
+        let mut bytes = good.clone();
+        bytes[second..second + 4].fill(0xFF);
+        damaged.push(bytes);
+        // Two whole records zeroed.
+        let mut bytes = good.clone();
+        bytes[header_end..third].fill(0);
+        damaged.push(bytes);
+        for (index, bytes) in damaged.iter().enumerate() {
+            fs::write(path(&dir), bytes).expect("write");
+            assert!(
+                matches!(
+                    Journal::open(&dir.0, &key()),
+                    Err(JournalError::Corrupt { .. })
+                ),
+                "damage {index}"
+            );
+            assert_eq!(
+                fs::read(path(&dir)).expect("read"),
+                *bytes,
+                "damage {index} is left in place"
+            );
+        }
+    }
+
+    #[test]
+    fn read_leaves_a_torn_tail_in_place() {
+        let dir = TempDir::new();
+        let mut journal = Journal::create(&dir.0, &key()).expect("create");
+        journal
+            .commit_ecu_hardware_part_number(b"HW-1")
+            .expect("commit");
+        let committed = journal.state().clone();
+        drop(journal);
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(path(&dir))
+            .expect("open");
+        file.write_all(&[7, 0, 0, 0, 1]).expect("append");
+        drop(file);
+        let before = fs::read(path(&dir)).expect("read");
+        assert_eq!(Journal::read(&dir.0, &key()).expect("read"), committed);
+        assert_eq!(fs::read(path(&dir)).expect("read"), before);
+        assert!(matches!(
+            Journal::read(
+                &dir.0,
+                &JobKey {
+                    generation: 9,
+                    ..key()
+                }
+            ),
+            Err(JournalError::NotFound)
+        ));
+    }
+
+    /// After a resume, the interrupted attempt takes no more progress: the recovery's steps are
+    /// not its post-transfer steps, and only a new transfer-start marker opens a transfer.
+    #[test]
+    fn a_resume_closes_the_interrupted_attempt() {
+        for exit_marked in [false, true] {
+            let mut j = memory();
+            j.commit_transfer_start(STAGE, at(3, 11)).expect("start");
+            j.commit_block(0).expect("block");
+            if exit_marked {
+                j.commit_transfer_exit_intent(at(5, 20)).expect("exit");
+                j.commit_step(at(5, 20), None).expect("post step");
+            }
+            let before = j.summary().transfer.expect("transfer");
+            j.commit_resume(STAGE, None).expect("resume");
+            // A replayed pre-erase step.
+            j.commit_step(at(1, 21), None).expect("step");
+            let refused = |result: Result<(), JournalError>| {
+                assert!(
+                    matches!(result, Err(JournalError::Invariant(_))),
+                    "{result:?}"
+                );
+            };
+            refused(j.commit_block(1));
+            refused(j.commit_transfer_exit_intent(at(5, 22)));
+            refused(j.commit_post_transfer_complete());
+            assert_eq!(
+                j.summary().transfer,
+                Some(TransferAttempt {
+                    interrupted: true,
+                    ..before
+                }),
+                "exit marked: {exit_marked}"
+            );
+            j.commit_transfer_start(STAGE, at(3, 22))
+                .expect("new attempt");
+            j.commit_block(0).expect("block of the new attempt");
+        }
+    }
+
+    #[test]
+    fn the_hardware_part_number_is_fixed_once_the_transfer_started() {
+        let mut j = memory();
+        j.commit_ecu_hardware_part_number(b"HW-A")
+            .expect("first read");
+        j.commit_ecu_hardware_part_number(b"HW-B")
+            .expect("before the transfer");
+        j.commit_transfer_start(STAGE, at(3, 1)).expect("start");
+        j.commit_ecu_hardware_part_number(b"HW-B")
+            .expect("the same value again");
+        assert!(matches!(
+            j.commit_ecu_hardware_part_number(b"HW-A"),
+            Err(JournalError::Invariant(_))
+        ));
+        assert_eq!(
+            j.summary().ecu_hardware_part_number.as_deref(),
+            Some(&b"HW-B"[..])
+        );
+    }
+
+    #[test]
+    fn the_vm_state_names_its_step() {
+        let mut j = memory();
+        j.commit_step(at(2, 10), Some(b"vm-1")).expect("step");
+        j.commit_step(at(5, 20), None)
+            .expect("step without a state");
+        assert_eq!(j.state().last_vm_state, Some((at(2, 10), b"vm-1".to_vec())));
     }
 
     #[derive(Default)]

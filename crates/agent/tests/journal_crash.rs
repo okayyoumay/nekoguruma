@@ -104,15 +104,33 @@ fn temp_dir(name: &str) -> TempDir {
     TempDir(dir)
 }
 
+/// The points [`check_named_point`] spells out.
+const NAMED_POINTS: [&str; 13] = [
+    "created",
+    "pre-erase version",
+    "resume",
+    "programming session",
+    "transfer-start marker",
+    "block 1",
+    "block 2",
+    "RequestTransferExit marker",
+    "CheckMemory",
+    "post-transfer complete",
+    "second resume",
+    "second transfer-start marker",
+    "second block 0",
+];
+
 /// What the journal must hold after `commits` commits, spelled out for the points the restart
-/// order depends on.
-fn check_named_points(commits: usize, facts: &RecoveryFacts) {
+/// order depends on. Returns the point's name if it is one of them.
+fn check_named_point(commits: usize, facts: &RecoveryFacts) -> Option<&'static str> {
     let first_transfer = |last_block, exit| {
         Some(TransferAttempt {
             stage: STAGE,
             started_at: at(3, 11),
             last_block,
             exit,
+            interrupted: false,
         })
     };
     let exit = |last_post_step, complete| {
@@ -178,7 +196,15 @@ fn check_named_points(commits: usize, facts: &RecoveryFacts) {
             facts.transfer,
             first_transfer(Some(2), exit(Some(at(6, 21)), true))
         ),
+        // The resume closes the first attempt.
         "second resume" => {
+            assert_eq!(
+                facts.transfer,
+                Some(TransferAttempt {
+                    interrupted: true,
+                    ..first_transfer(Some(2), exit(Some(at(6, 21)), true)).expect("some")
+                })
+            );
             assert_eq!(facts.resume_counts, [(STAGE, 2)]);
             assert_eq!(facts.attempt_key.as_deref(), Some(&b"attempt-2"[..]));
         }
@@ -191,13 +217,22 @@ fn check_named_points(commits: usize, facts: &RecoveryFacts) {
                     started_at: at(3, 30),
                     last_block: None,
                     exit: None,
+                    interrupted: false,
                 })
             );
             assert_eq!(facts.resume_counts, [(STAGE, 2)]);
             assert_eq!(facts.last_step, Some(at(6, 21)));
         }
-        _ => {}
+        "second block 0" => assert_eq!(
+            facts
+                .transfer
+                .as_ref()
+                .and_then(|transfer| transfer.last_block),
+            Some(0)
+        ),
+        _ => return None,
     }
+    Some(name)
 }
 
 #[test]
@@ -212,6 +247,7 @@ fn the_journal_reads_back_after_a_crash_at_each_commit() {
         std::process::abort();
     }
 
+    let mut checked = Vec::new();
     for commits in 0..=SCRIPT.len() {
         let crashed = temp_dir("crashed");
         let output = Command::new(std::env::current_exe().expect("test executable path"))
@@ -239,6 +275,7 @@ fn the_journal_reads_back_after_a_crash_at_each_commit() {
             "after {commits} commits"
         );
         assert_eq!(journal.state().records, commits as u64);
-        check_named_points(commits, &facts);
+        checked.extend(check_named_point(commits, &facts));
     }
+    assert_eq!(checked, NAMED_POINTS, "every named point is reached");
 }

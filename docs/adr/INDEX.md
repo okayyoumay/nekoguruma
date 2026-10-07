@@ -230,6 +230,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-239](ADR-239-sim-ecu-session-timer-and-injectable-clock.md) | sim-ecu Session Timer and Injectable Clock | Accepted | `sim-ecu` clock, tS3_Server, security delay |
 | [ADR-240](ADR-240-agent-worker-build-selection.md) | Agent Worker-Build Selection by Per-Build Library Resolution | Accepted | `agent` launch, `ngr-agent run` |
 | [ADR-241](ADR-241-sim-ecu-state-file.md) | Simulated ECU State Kept in a File Across Worker Processes | Accepted | `sim-ecu` snapshot, `sim-vci` `NGR_SIM_ECU_STATE` |
+| [ADR-242](ADR-242-ir-variable-length-and-nested-layouts.md) | IR Variable-Length Fields and Nested Layouts | Accepted | `diag-ir` declaration schema (`ir.fbs`) |
 
 ## Status Legend
 
@@ -278,6 +279,9 @@ ADR-057 (amended by ADR-102), ADR-120, ADR-143, ADR-239
 
 ### Write Jobs & Resume
 ADR-229, ADR-233, ADR-235, ADR-241
+
+### Diagnostic IR
+ADR-233, ADR-242
 
 ### Acquired Data & Monitoring
 ADR-236

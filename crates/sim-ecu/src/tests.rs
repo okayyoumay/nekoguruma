@@ -1700,11 +1700,10 @@ fn s3_runs_from_when_a_dropped_response_would_have_gone_out() {
 fn timers_do_not_overflow_at_the_end_of_time() {
     let (mut ecu, clock) = ecu_with_clock(config());
     clock.advance(Duration::MAX);
-    // Starting either timer saturates instead of panicking. (They then expire at once.)
+    // Starting either timer saturates instead of panicking; both then expire at once.
     enter(&mut ecu, Session::Extended);
-    for _ in 0..MAX_SECURITY_ATTEMPTS {
-        ecu.request(&[0x27, 0x01]);
-        ecu.request(&[0x27, 0x02, 0, 0, 0, 0]);
-    }
+    ecu.start_security_delay();
     ecu.check_timers();
+    assert_eq!(ecu.session, Session::Default);
+    assert!(!ecu.security_delay_active());
 }

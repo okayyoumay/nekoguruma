@@ -53,7 +53,8 @@ General behaviour (clause 7.7):
 Any other SID gets NRC 11.
 
 A non-default session times out after tS3_Server without a request (`EcuConfig::s3_server_ms`,
-5000 ms by default, the value ISO 14229-2 (2021) gives). The timer restarts with every request
+5000 ms by default, the value ISO 14229-2 (2021) clause 9.5, Table 5, gives). Following Table 6
+of that clause (ADR-239), the timer restarts with every request
 that reaches the ECU, whatever the service and whether it is supported, and runs from when the
 response goes out (after its delay), also when that response is then lost (`Fault::DropResponse`),
 or from the request when no response is sent; a request lost on the bus does not restart it.
@@ -99,8 +100,8 @@ in Annex I with a fresh seed for every requestSeed (no static seed). Any Securit
 other than a successful requestSeed discards the pending seed (Annex I, transition 9): a seed
 answers exactly one sendKey, and a sendKey without a seed gets NRC 24.
 The third false key in a row returns NRC 36 and starts the delay timer; requestSeed then returns
-NRC 37 until the delay has run (`EcuConfig::security_delay_ms`, 10000 ms by default; the length is
-the vehicle manufacturer's choice) or a test calls `SimEcu::expire_security_delay()`.
+NRC 37 until the delay has run (`EcuConfig::security_delay_ms`, 10000 ms by default; clause 9.4.1
+leaves the length to the vehicle manufacturer) or a test calls `SimEcu::expire_security_delay()`.
 `security_delay_active()` reports whether it is running. A power cycle or ECU reset clears the
 false-attempt counter and starts a delay that is still running again for its full length; one that
 has already run out stays over. Clause 9.4.1 also asks a server that supports the delay to start it

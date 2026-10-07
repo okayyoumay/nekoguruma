@@ -61,12 +61,12 @@ pub const MAX_RESPONSE_LENGTH: usize = 4095;
 /// False sendKey attempts that activate the security delay timer.
 pub const MAX_SECURITY_ATTEMPTS: u8 = 3;
 
-/// tS3_Server when `EcuConfig::s3_server_ms` is unset: the value ISO 14229-2 (2021) gives for
-/// how long a non-default session stays active without a request.
+/// tS3_Server when `EcuConfig::s3_server_ms` is unset: the value ISO 14229-2 (2021) clause 9.5
+/// (Table 5) gives for how long a non-default session stays active without a request.
 pub const DEFAULT_S3_SERVER_MS: u32 = 5_000;
 
-/// Security delay when `EcuConfig::security_delay_ms` is unset. ISO 14229-1 leaves the length to
-/// the vehicle manufacturer.
+/// Security delay when `EcuConfig::security_delay_ms` is unset. ISO 14229-1 (2026) clause 9.4.1
+/// leaves the length to the vehicle manufacturer.
 pub const DEFAULT_SECURITY_DELAY_MS: u32 = 10_000;
 
 /// Value the simulator XORs with the seed to form the expected key.
@@ -456,7 +456,7 @@ impl SimEcu {
 
     /// Restarts tS3_Server after a request was handled: it runs from when the response goes out
     /// (`delay_ms` from now), or from now when there is none, and only in a non-default session
-    /// (ISO 14229-2 (2021), session timing).
+    /// (ISO 14229-2 (2021) clause 9.5, Table 6; ADR-239).
     fn restart_s3(&mut self, delay_ms: u32) {
         self.s3_deadline = (self.session != Session::Default).then(|| {
             let s3 = self.config.s3_server_ms.unwrap_or(DEFAULT_S3_SERVER_MS);

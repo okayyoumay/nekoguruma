@@ -1,8 +1,6 @@
-//! `ngr-agent`: the device-side agent (design 3.3). The job runner lives in the `agent` library;
-//! the daemon around it (server connection, discovery, job intake) is not written yet.
-//!
-//! `ngr-agent run` runs one IR program on a VCI and prints the final VM state as JSON
-//! (`crates/agent/docs/ngr-agent.md`).
+//! `ngr-agent`: the device-side agent (design 3.3). The job runner lives in the `agent` library.
+//! The binary's one command, `ngr-agent run`, runs one IR program on a VCI and prints the final
+//! VM state as JSON (`crates/agent/docs/ngr-agent.md`).
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -10,7 +8,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use agent::launch::launch_j2534_worker;
-use agent::{JobLimits, LinkConfig, run_program};
+use agent::{JobLimits, LinkConfig, check_program, run_program};
 use diag_ir::Program;
 use worker_host::service::{LaunchOptions, WorkerLayout};
 
@@ -25,8 +23,8 @@ options:
   --program <file>     IR program file (JSON)
   --workers <dir>      worker binaries, laid out as <dir>/<ABI name>/<binary>
                        (default: the 'workers' directory next to ngr-agent)
-  --tx-id <id>         physical request CAN ID, hex (default 7E0)
-  --rx-id <id>         response CAN ID, hex (default 7E8)";
+  --tx-id <id>         physical request CAN ID, 11-bit hex (default 7E0)
+  --rx-id <id>         response CAN ID, 11-bit hex (default 7E8)";
 
 /// How long a stopping worker may take to close its link before it is killed.
 const STOP_GRACE: Duration = Duration::from_secs(5);
@@ -36,8 +34,7 @@ struct RunArgs {
     vci: String,
     program: PathBuf,
     workers: Option<PathBuf>,
-    tx_id: u32,
-    rx_id: u32,
+    link: LinkConfig,
 }
 
 fn main() -> ExitCode {
@@ -104,12 +101,13 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<RunArgs, Strin
             _ => return Err(format!("unknown option {flag:?}")),
         }
     }
+    let link = LinkConfig::iso15765(tx_id, rx_id);
+    link.validate().map_err(|error| error.to_string())?;
     Ok(RunArgs {
         vci: vci.ok_or("--vci is required")?,
         program: program.ok_or("--program is required")?,
         workers,
-        tx_id,
-        rx_id,
+        link,
     })
 }
 
@@ -120,7 +118,12 @@ fn parse_can_id(flag: &str, value: &OsString) -> Result<u32, String> {
         .strip_prefix("0x")
         .or_else(|| text.strip_prefix("0X"))
         .unwrap_or(text);
-    u32::from_str_radix(digits, 16).map_err(|_| format!("{flag} {value:?} is not a hex CAN ID"))
+    let invalid = || format!("{flag} {value:?} is not a hex CAN ID");
+    // `from_str_radix` would also take a sign.
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(invalid());
+    }
+    u32::from_str_radix(digits, 16).map_err(|_| invalid())
 }
 
 /// The `workers` directory next to the running executable.
@@ -139,19 +142,18 @@ async fn run(args: RunArgs) -> Result<String, String> {
         .map_err(|error| format!("cannot read {}: {error}", args.program.display()))?;
     let program: Program = serde_json::from_str(&text)
         .map_err(|error| format!("{} is not an IR program: {error}", args.program.display()))?;
+    // A program the job would refuse does not need a worker.
+    check_program(&program).map_err(|error| format!("job failed: {error}"))?;
     let workers = WorkerLayout {
         root: match args.workers {
             Some(root) => root,
             None => default_workers()?,
         },
     };
-    let config = LinkConfig::iso15765(args.tx_id, args.rx_id);
-    config.validate().map_err(|error| error.to_string())?;
-
     let worker = launch_j2534_worker(&args.vci, &workers, &LaunchOptions::default())
         .await
         .map_err(|error| error.to_string())?;
-    let result = run_program(worker.client, &config, program, JobLimits::default()).await;
+    let result = run_program(worker.client, &args.link, program, JobLimits::default()).await;
     // The job has closed its link whatever the result; a failed stop does not change it.
     if let Err(error) = worker.process.stop(STOP_GRACE).await {
         eprintln!("ngr-agent: worker did not stop cleanly: {error}");
@@ -176,8 +178,7 @@ mod tests {
                 vci: "sim-vci".to_owned(),
                 program: PathBuf::from("p.json"),
                 workers: None,
-                tx_id: 0x7E0,
-                rx_id: 0x7E8,
+                link: LinkConfig::iso15765(0x7E0, 0x7E8),
             })
         );
     }
@@ -189,9 +190,9 @@ mod tests {
             "--workers",
             "w",
             "--tx-id",
-            "0x18DA10F1",
+            "0x7DF",
             "--rx-id",
-            "18daf110",
+            "7e9",
             "--program",
             "p.json",
             "--vci",
@@ -199,7 +200,7 @@ mod tests {
         ])
         .expect("valid arguments");
         assert_eq!(args.workers, Some(PathBuf::from("w")));
-        assert_eq!((args.tx_id, args.rx_id), (0x18DA_10F1, 0x18DA_F110));
+        assert_eq!((args.link.tx_id, args.link.rx_id), (0x7DF, 0x7E9));
     }
 
     #[test]
@@ -211,6 +212,10 @@ mod tests {
             &["run", "--vci", "x"],
             &["run", "--vci"],
             &["run", "--vci", "x", "--program", "p", "--tx-id", "7G0"],
+            &["run", "--vci", "x", "--program", "p", "--tx-id", "+7E0"],
+            &["run", "--vci", "x", "--program", "p", "--tx-id", "0x"],
+            // 29-bit IDs need the link to set the ID format.
+            &["run", "--vci", "x", "--program", "p", "--rx-id", "18DAF110"],
             &["run", "--vci", "x", "--program", "p", "--verbose", "1"],
         ] {
             assert!(parse(args).is_err(), "{args:?}");

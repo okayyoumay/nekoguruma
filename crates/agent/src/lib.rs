@@ -18,4 +18,4 @@ pub mod runner;
 
 pub use host::{HostError, Timings, WorkerHost};
 pub use link::{Link, LinkConfig};
-pub use runner::{JobError, JobLimits, run_program};
+pub use runner::{JobError, JobLimits, check_program, run_program};

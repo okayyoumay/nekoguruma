@@ -69,6 +69,17 @@ pub enum JobError {
     Panicked,
 }
 
+/// The checks [`run_program`] makes before it touches the worker: the program must be one this
+/// VM can run, and the policy must allow every request in it. A caller can make them before it
+/// launches a worker for the job.
+pub fn check_program(program: &Program) -> Result<(), JobError> {
+    // A program this VM cannot run must not reach the bus.
+    Vm::new(program)
+        .check_state(program)
+        .map_err(|source| JobError::Vm { pc: 0, source })?;
+    policy::check_program(program).map_err(|(pc, source)| JobError::Refused { pc, source })
+}
+
 /// Opens a link with `config`, runs `program` on it to the end and closes the link. Returns
 /// the final VM state; the procedure's results are on its stack.
 ///
@@ -90,11 +101,7 @@ pub async fn run_program(
     if handle.runtime_flavor() == RuntimeFlavor::CurrentThread {
         return Err(JobError::CurrentThreadRuntime);
     }
-    // A program this VM cannot run must not reach the bus.
-    Vm::new(&program)
-        .check_state(&program)
-        .map_err(|source| JobError::Vm { pc: 0, source })?;
-    policy::check_program(&program).map_err(|(pc, source)| JobError::Refused { pc, source })?;
+    check_program(&program)?;
     let config = config.clone();
 
     let cancel = CancelOnDrop(Arc::new(AtomicBool::new(false)));

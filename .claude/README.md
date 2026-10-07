@@ -9,8 +9,9 @@ covers how sessions split work between agents and keep cost down.
 
 Every agent pins its model, so the pipeline behaves the same whatever model the main session
 runs. Sonnet is enough for every orchestration duty here (classifying a task, writing briefs,
-reviewing agent reports, deciding). The expensive judgment steps are pinned to `design-advisor`,
-so a top-tier session model adds cost rather than capability unless the user asks for one.
+reviewing agent reports, deciding). The expensive judgment steps are pinned to `edge-case-hunter`
+(Opus) and `design-advisor` (Fable), so a top-tier session model adds cost rather than
+capability unless the user asks for one.
 
 ## Agents
 

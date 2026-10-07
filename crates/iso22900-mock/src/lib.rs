@@ -365,7 +365,7 @@ exported_fn!(PDUDestruct() -> T_PDU_ERROR {
 });
 
 exported_fn!(PDUIoCtl(_h_mod: UNUM32, _h_cll: UNUM32, io_ctl_command_id: T_PDU_IT, p_input_data: *mut PDU_DATA_ITEM, p_output_data: *mut *mut PDU_DATA_ITEM) -> T_PDU_ERROR {
-    if io_ctl_command_id.0 == MOCK_IOCTL_NULL_OUTPUT {
+    if io_ctl_command_id.0 as UNUM32 == MOCK_IOCTL_NULL_OUTPUT {
         return no_error();
     }
     if !p_output_data.is_null() {

@@ -1,7 +1,7 @@
 # ADR-243: The CodeQL and Backlog Loops Share One PR-Based Claim
 
 **Date:** 2026-10-07
-**Status:** Accepted
+**Status:** Accepted (Decision item 4's number-only hand-off of high and critical alerts superseded by ADR-246)
 **Affects:** `.claude/skills/codeql-alerts/SKILL.md`, `.claude/skills/backlog-loop/SKILL.md`, `.github/workflows/codeql-alert-handoff.yml`
 
 ## Context
@@ -38,10 +38,9 @@ lets two runs that start together both pass it.
    that merged a `codeql` PR (Actions has no code scanning alert event, so it follows the
    CodeQL workflow's completion instead), and does not fire while a PR
    in the claim set is open, so a merged fix leads straight to the next alert. The list goes only into
-   the request, never into the public log or an artifact. High and critical alerts travel with
-   the same details in a separate list with its own share of the payload, so they never crowd
-   out the alerts a run can fix in a public PR; the run verifies them but reports them only
-   inside the project, never in a PR, issue, commit or repository file.
+   the request, never into the public log or an artifact. High and critical alerts travel only
+   as numbers, so however many there are, they never crowd out of the trimmed list the alerts a
+   run can fix.
 
 ## Alternatives considered
 

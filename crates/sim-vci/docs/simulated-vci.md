@@ -166,4 +166,7 @@ reconnection, the battery voltage through `PDU_IOCTL_READ_VBATT` before and afte
 `set_battery_voltage`, a VCI disconnect between jobs, and one while a link is open, after which
 `GetVersion` fails, also after the VCI is back, until the test closes the link (the service may
 answer that itself once its own polling has seen the loss); the next job then opens the device
-again and reads the VIN.
+again and reads the VIN. Since the service may answer for a lost module itself (ADR-131),
+`tests/sim_vci_library.rs` loads the cdylib into its own process through the `j2534-0404`
+wrapper and checks the device-loss rules without the service: lost after the unplug, still
+lost after the replug, released by the close, and a new device ID on the next open.

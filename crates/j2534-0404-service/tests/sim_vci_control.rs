@@ -133,8 +133,7 @@ async fn read_vbatt(client: &mut WorkerClient, link: &Link) -> u32 {
 /// `ERR_DEVICE_NOT_CONNECTED`, or the service's own polling hit that error first and marked the
 /// module as having lost the VCI (ADR-131), so it answers without calling the library. Which
 /// one comes first is timing; both mean the device is lost. That the loss outlasts replugging
-/// at the library level is checked by `sim-vci`'s unit tests, which CI does not run yet (see
-/// the backlog).
+/// at the library level is checked without the service in `tests/sim_vci_library.rs`.
 async fn assert_device_not_connected(client: &mut WorkerClient, link: &Link) {
     let result = client
         .get_version(GetVersionRequest {

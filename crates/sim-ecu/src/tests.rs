@@ -1764,7 +1764,12 @@ fn a_delayed_reset_does_not_revive_a_delay_that_ends_before_its_response() {
     // The delay ends at 2000 ms; the reset response goes out at 2400 ms.
     clock.advance(ms(1_900));
     ecu.exchange(Addressing::Physical, &[0x11, 0x01]);
-    clock.advance(ms(600));
+    // Still running until its own end, then over and not restarted.
+    clock.advance(ms(99));
+    assert!(ecu.security_delay_active());
+    clock.advance(ms(1));
+    assert!(!ecu.security_delay_active());
+    clock.advance(ms(500));
     assert!(!ecu.security_delay_active());
 }
 

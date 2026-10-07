@@ -34,8 +34,9 @@ lets two runs that start together both pass it.
 4. **A workflow hands the alerts over.** `.github/workflows/codeql-alert-handoff.yml` reads the
    open alerts on `main` with its own `security-events: read` token and fires the skill's Claude
    routine through the routine API, passing a trimmed list as the fire request's text. It runs
-   weekly and when an alert on `main` is fixed or dismissed, and does not fire while a PR in the
-   claim set is open, so a merged fix leads straight to the next alert. The list goes only into
+   weekly, on request, and when a `codeql` PR merges (after waiting for CodeQL to re-analyse the
+   merge commit, since Actions has no code scanning alert event), and does not fire while a PR
+   in the claim set is open, so a merged fix leads straight to the next alert. The list goes only into
    the request, never into the public log or an artifact. High and critical alerts travel only
    as numbers, so however many there are, they never crowd out of the trimmed list the alerts a
    run can fix.

@@ -15,9 +15,10 @@ the maintainer's call.
 Claude sessions cannot read code scanning alerts: the session proxy sends the Claude GitHub
 App's credential on every `api.github.com` request, and that app has no code scanning
 permission. So `.github/workflows/codeql-alert-handoff.yml` reads the alerts with its own
-token and fires this skill's routine with the list. It runs weekly and whenever an alert on
-`main` is fixed or dismissed, and it does not fire while a claim-set PR (step 2) is open, so a
-merged fix leads to the next alert without waiting for the weekly run.
+token and fires this skill's routine with the list. It runs weekly, on request, and after a
+`codeql` PR merges (once CodeQL has re-analysed the merge commit), and it does not fire while a
+claim-set PR (step 2) is open, so a merged fix leads to the next alert without waiting for the
+weekly run.
 
 Arguments: $ARGUMENTS. `alert=<n>` works that alert first if the list has it. `pr=<n>` resumes
 at that PR (see "Resume").
@@ -109,8 +110,9 @@ round.
 ## 6. After the hand-off
 
 End the turn. While the PR is open, any wake other than its merge or close is handled by
-`pr-review-loop`. Nothing more is needed when it is merged: CodeQL re-analyses `main`, the
-alert's `fixed` event runs the hand-off workflow, and the next payload starts the next alert.
+`pr-review-loop`. Nothing more is needed when it is merged: the merge runs the hand-off
+workflow, which waits for CodeQL to re-analyse `main`, and the next payload starts the next
+alert.
 If that payload still lists the alert, step 3 reports it.
 
 ## Resume
@@ -127,7 +129,8 @@ report:
 - the PR opened, with its alert number and rule;
 - each newly skipped alert with its reason. For an alert you recommend dismissing, write it as
   a question answerable in a word, with the recommended dismissal reason; the maintainer
-  dismisses it in the repository's Security tab, which also starts the next run;
+  dismisses it in the repository's Security tab and can start the next run with "CodeQL alert
+  hand-off" in the Actions tab (otherwise the weekly run picks it up);
 - the alert numbers in `private` that this session has not reported before;
 - the number of open alerts (`total`);
 - why the run stopped, if it did not open a PR.

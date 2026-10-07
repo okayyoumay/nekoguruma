@@ -139,7 +139,9 @@ Simplifications:
 ## Fault injection
 
 The faults of `sim_ecu::Fault` act on the ECU behind the VCI as described in `sim-ecu`'s document;
-`sim-vci` applies the resulting delay or missing response on the read side. Tests arm them, and
+`sim-vci` applies the resulting delay or missing response on the read side. The response pending
+messages of `ResponsePending` are queued on the channel like responses, each at its own delay,
+ahead of the final response. Tests arm them, and
 unplug the VCI, with control commands (ADR-238).
 
 ## Control
@@ -148,7 +150,7 @@ A control command is a JSON object tagged by `command`:
 
 | Command | Effect |
 |---|---|
-| `{"command": "inject_fault", "fault": F}` | `SimEcu::inject(F)`; `F` is a `sim_ecu::Fault` in snake case: `"power_loss"`, `"drop_response"`, `"bus_error"`, `{"delay_response": {"ms": 500}}`, `{"corrupt_block": {"block": 3}}` |
+| `{"command": "inject_fault", "fault": F}` | `SimEcu::inject(F)`; `F` is a `sim_ecu::Fault` in snake case: `"power_loss"`, `"drop_response"`, `"bus_error"`, `{"delay_response": {"ms": 500}}`, `{"corrupt_block": {"block": 3}}`, `{"response_pending": {"count": 2, "interval_ms": 300}}` |
 | `{"command": "reconnect_ecu"}` | `SimEcu::reconnect`, which ends a power loss |
 | `{"command": "disconnect_vci"}` | unplugs the VCI |
 | `{"command": "connect_vci"}` | plugs it back in |
@@ -204,4 +206,7 @@ lost after the replug, released by the close, and a new device ID on the next op
 runs each step in its own process with a state file: one starts a download and exits without
 closing anything, the next reads the running transfer and the programming session (DIDs FD00
 and F186), and one started after tS3_Server reads the interrupted transfer in the default
-session.
+session. `tests/sim_vci_response_pending.rs` runs agent jobs through the worker
+while `sim-ecu` answers with response pending: a chain that ends after P2 still delivers only the
+final response to the procedure, because the worker restarts its timer with P2* on each 0x78, and
+a chain that outlasts the link's 0x78 completion timeout ends the job with `NoResponse`.

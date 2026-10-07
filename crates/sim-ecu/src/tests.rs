@@ -1436,3 +1436,376 @@ fn power_cycles_count_resets_power_loss_and_reconnect() {
     ecu.reconnect();
     assert_eq!(ecu.power_cycles(), 3);
 }
+
+// ---------------------------------------------------------------- Timers
+
+/// An ECU on a manual clock, and the clock to advance it with.
+fn ecu_with_clock(config: EcuConfig) -> (SimEcu, ManualClock) {
+    let clock = ManualClock::default();
+    (SimEcu::with_clock(config, clock.clone()), clock)
+}
+
+fn ms(ms: u64) -> Duration {
+    Duration::from_millis(ms)
+}
+
+/// The active session as reported by DID F186.
+fn reported_session(ecu: &mut SimEcu) -> u8 {
+    let SimResponse::Positive(r) = ecu.request(&[0x22, 0xF1, 0x86]) else {
+        panic!("F186 should be readable");
+    };
+    r[3]
+}
+
+#[test]
+fn a_non_default_session_falls_back_after_s3_without_requests() {
+    let (mut ecu, clock) = ecu_with_clock(config());
+    enter(&mut ecu, Session::Extended);
+    unlock(&mut ecu);
+    clock.advance(ms(u64::from(DEFAULT_S3_SERVER_MS) - 1));
+    ecu.check_timers();
+    assert_eq!(ecu.session, Session::Extended);
+    clock.advance(ms(1));
+    ecu.check_timers();
+    assert_eq!(ecu.session, Session::Default);
+    // Security is relocked with the session change.
+    assert!(!ecu.security_unlocked);
+    assert_eq!(reported_session(&mut ecu), Session::Default.code());
+}
+
+#[test]
+fn every_request_restarts_s3() {
+    let (mut ecu, clock) = ecu_with_clock(EcuConfig {
+        s3_server_ms: Some(1_000),
+        ..config()
+    });
+    enter(&mut ecu, Session::Extended);
+    // TesterPresent, an unsupported service and a negative response all keep the session.
+    for request in [&[0x3E, 0x00][..], &[0x85, 0x01], &[0x22, 0x12, 0x34]] {
+        clock.advance(ms(900));
+        ecu.request(request);
+    }
+    clock.advance(ms(900));
+    assert_eq!(reported_session(&mut ecu), Session::Extended.code());
+    // Suppressed TesterPresent too.
+    clock.advance(ms(900));
+    assert_eq!(ecu.request(&[0x3E, 0x80]), SimResponse::NoResponse);
+    clock.advance(ms(999));
+    ecu.check_timers();
+    assert_eq!(ecu.session, Session::Extended);
+    clock.advance(ms(1));
+    ecu.check_timers();
+    assert_eq!(ecu.session, Session::Default);
+}
+
+#[test]
+fn s3_runs_from_when_the_response_goes_out() {
+    let (mut ecu, clock) = ecu_with_clock(EcuConfig {
+        s3_server_ms: Some(1_000),
+        response_delay_ms: 300,
+        ..config()
+    });
+    let exchange = ecu.exchange(Addressing::Physical, &[0x10, 0x03]);
+    assert_eq!(exchange.delay_ms, 300);
+    clock.advance(ms(1_299));
+    ecu.check_timers();
+    assert_eq!(ecu.session, Session::Extended);
+    clock.advance(ms(1));
+    ecu.check_timers();
+    assert_eq!(ecu.session, Session::Default);
+}
+
+#[test]
+fn requests_lost_before_the_ecu_do_not_restart_s3() {
+    let (mut ecu, clock) = ecu_with_clock(EcuConfig {
+        s3_server_ms: Some(1_000),
+        ..config()
+    });
+    enter(&mut ecu, Session::Extended);
+    clock.advance(ms(900));
+    ecu.inject(Fault::BusError);
+    assert_eq!(ecu.request(&[0x3E, 0x00]), SimResponse::NoResponse);
+    clock.advance(ms(100));
+    ecu.check_timers();
+    assert_eq!(ecu.session, Session::Default);
+}
+
+#[test]
+fn an_s3_timeout_interrupts_a_download() {
+    let clock = ManualClock::default();
+    let mut ecu = SimEcu::with_clock(config(), clock.clone());
+    enter(&mut ecu, Session::Programming);
+    unlock(&mut ecu);
+    assert!(matches!(
+        ecu.request(&[0x31, 0x01, 0xFF, 0x00]),
+        SimResponse::Positive(_)
+    ));
+    assert!(matches!(
+        ecu.request(&[0x34, 0x00, 0x44, 0, 0, 0, 0, 0, 0, 0, 4]),
+        SimResponse::Positive(_)
+    ));
+    assert!(matches!(
+        ecu.request(&[0x36, 0x01, 0xAA, 0xBB]),
+        SimResponse::Positive(_)
+    ));
+    clock.advance(ms(u64::from(DEFAULT_S3_SERVER_MS)));
+    ecu.check_timers();
+    assert_eq!(ecu.session, Session::Default);
+    assert_eq!(ecu.flash, FlashPhase::Interrupted { last_block: 1 });
+}
+
+#[test]
+fn the_default_session_has_no_s3_timer() {
+    let (mut ecu, clock) = ecu_with_clock(config());
+    clock.advance(ms(60_000));
+    assert_eq!(reported_session(&mut ecu), Session::Default.code());
+}
+
+/// Three false keys in a row, which start the security delay.
+fn exceed_attempts(ecu: &mut SimEcu) {
+    for _ in 0..MAX_SECURITY_ATTEMPTS {
+        assert!(matches!(
+            ecu.request(&[0x27, 0x01]),
+            SimResponse::Positive(_)
+        ));
+        ecu.request(&[0x27, 0x02, 0, 0, 0, 0]);
+    }
+    assert!(ecu.security_delay_active());
+}
+
+#[test]
+fn the_security_delay_ends_after_the_configured_time() {
+    let (mut ecu, clock) = ecu_with_clock(EcuConfig {
+        security_delay_ms: Some(2_000),
+        ..config()
+    });
+    enter(&mut ecu, Session::Extended);
+    exceed_attempts(&mut ecu);
+    clock.advance(ms(1_000));
+    assert_eq!(
+        ecu.request(&[0x27, 0x01]),
+        neg(0x27, Nrc::RequiredTimeDelayNotExpired)
+    );
+    clock.advance(ms(999));
+    assert!(ecu.security_delay_active());
+    clock.advance(ms(1));
+    assert!(!ecu.security_delay_active());
+    unlock(&mut ecu);
+}
+
+#[test]
+fn the_default_security_delay_is_used_when_none_is_configured() {
+    let (mut ecu, clock) = ecu_with_clock(config());
+    enter(&mut ecu, Session::Extended);
+    exceed_attempts(&mut ecu);
+    clock.advance(ms(u64::from(DEFAULT_SECURITY_DELAY_MS) - 1));
+    assert!(ecu.security_delay_active());
+    clock.advance(ms(1));
+    assert!(!ecu.security_delay_active());
+}
+
+#[test]
+fn a_power_cycle_restarts_a_running_security_delay() {
+    let (mut ecu, clock) = ecu_with_clock(EcuConfig {
+        security_delay_ms: Some(2_000),
+        ..config()
+    });
+    enter(&mut ecu, Session::Extended);
+    exceed_attempts(&mut ecu);
+    clock.advance(ms(1_500));
+    assert!(matches!(
+        ecu.request(&[0x11, 0x01]),
+        SimResponse::Positive(_)
+    ));
+    clock.advance(ms(1_999));
+    assert!(ecu.security_delay_active());
+    clock.advance(ms(1));
+    assert!(!ecu.security_delay_active());
+}
+
+#[test]
+fn timer_settings_are_optional_in_json() {
+    let config: EcuConfig = serde_json::from_str(
+        r#"{"vin": "V", "part_number": "P", "sw_version": "S", "response_delay_ms": 0,
+            "drop_at_block": null, "require_security_access": false,
+            "require_gateway_auth": false, "fail_checksum": false}"#,
+    )
+    .expect("a configuration without timer settings parses");
+    assert_eq!(
+        (config.s3_server_ms, config.security_delay_ms),
+        (None, None)
+    );
+}
+
+#[test]
+fn a_power_cycle_does_not_revive_a_security_delay_that_ran_out() {
+    for request_while_off in [false, true] {
+        let (mut ecu, clock) = ecu_with_clock(EcuConfig {
+            security_delay_ms: Some(2_000),
+            ..config()
+        });
+        enter(&mut ecu, Session::Extended);
+        exceed_attempts(&mut ecu);
+        ecu.inject(Fault::PowerLoss);
+        // The delay restarts with the power loss and runs while the ECU is off.
+        clock.advance(ms(2_500));
+        if request_while_off {
+            assert_eq!(ecu.request(&[0x3E, 0x00]), SimResponse::NoResponse);
+        }
+        ecu.reconnect();
+        assert!(
+            !ecu.security_delay_active(),
+            "request while off: {request_while_off}"
+        );
+        enter(&mut ecu, Session::Extended);
+        unlock(&mut ecu);
+    }
+}
+
+#[test]
+fn a_reconnect_restarts_a_security_delay_still_running() {
+    let (mut ecu, clock) = ecu_with_clock(EcuConfig {
+        security_delay_ms: Some(2_000),
+        ..config()
+    });
+    enter(&mut ecu, Session::Extended);
+    exceed_attempts(&mut ecu);
+    clock.advance(ms(1_500));
+    ecu.reconnect();
+    clock.advance(ms(1_999));
+    assert!(ecu.security_delay_active());
+    clock.advance(ms(1));
+    assert!(!ecu.security_delay_active());
+}
+
+#[test]
+fn s3_runs_from_when_a_dropped_response_would_have_gone_out() {
+    let (mut ecu, clock) = ecu_with_clock(EcuConfig {
+        s3_server_ms: Some(1_000),
+        ..config()
+    });
+    enter(&mut ecu, Session::Extended);
+    ecu.inject(Fault::DelayResponse { ms: 4_000 });
+    ecu.inject(Fault::DropResponse);
+    assert_eq!(ecu.request(&[0x3E, 0x00]), SimResponse::NoResponse);
+    clock.advance(ms(4_999));
+    ecu.check_timers();
+    assert_eq!(ecu.session, Session::Extended);
+    clock.advance(ms(1));
+    ecu.check_timers();
+    assert_eq!(ecu.session, Session::Default);
+}
+
+#[test]
+fn timers_do_not_overflow_at_the_end_of_time() {
+    let (mut ecu, clock) = ecu_with_clock(config());
+    clock.advance(Duration::MAX);
+    // Starting either timer saturates instead of panicking; both then expire at once.
+    enter(&mut ecu, Session::Extended);
+    ecu.start_security_delay();
+    ecu.check_timers();
+    assert_eq!(ecu.session, Session::Default);
+    assert!(!ecu.security_delay_active());
+}
+
+#[test]
+fn s3_waits_for_a_delayed_response_overtaken_by_a_later_one() {
+    let (mut ecu, clock) = ecu_with_clock(EcuConfig {
+        s3_server_ms: Some(1_000),
+        ..config()
+    });
+    enter(&mut ecu, Session::Extended);
+    ecu.inject(Fault::DelayResponse { ms: 3_000 });
+    assert_eq!(
+        ecu.exchange(Addressing::Physical, &[0x3E, 0x00]).delay_ms,
+        3_000
+    );
+    // An immediate response to a later request goes out first.
+    assert_eq!(
+        ecu.exchange(Addressing::Physical, &[0x3E, 0x00]).delay_ms,
+        0
+    );
+    clock.advance(ms(3_999));
+    ecu.check_timers();
+    assert_eq!(ecu.session, Session::Extended);
+    clock.advance(ms(1));
+    ecu.check_timers();
+    assert_eq!(ecu.session, Session::Default);
+}
+
+#[test]
+fn a_delay_restarted_by_an_ecu_reset_runs_from_its_response() {
+    let (mut ecu, clock) = ecu_with_clock(EcuConfig {
+        security_delay_ms: Some(2_000),
+        response_delay_ms: 500,
+        ..config()
+    });
+    enter(&mut ecu, Session::Extended);
+    exceed_attempts(&mut ecu);
+    assert_eq!(
+        ecu.exchange(Addressing::Physical, &[0x11, 0x01]).delay_ms,
+        500
+    );
+    clock.advance(ms(2_499));
+    assert!(ecu.security_delay_active());
+    clock.advance(ms(1));
+    assert!(!ecu.security_delay_active());
+}
+
+#[test]
+fn a_delayed_reset_does_not_revive_a_delay_that_ends_before_its_response() {
+    let (mut ecu, clock) = ecu_with_clock(EcuConfig {
+        security_delay_ms: Some(2_000),
+        response_delay_ms: 500,
+        ..config()
+    });
+    enter(&mut ecu, Session::Extended);
+    exceed_attempts(&mut ecu);
+    // The delay ends at 2000 ms; the reset response goes out at 2400 ms.
+    clock.advance(ms(1_900));
+    ecu.exchange(Addressing::Physical, &[0x11, 0x01]);
+    // Still running until its own end, then over and not restarted.
+    clock.advance(ms(99));
+    assert!(ecu.security_delay_active());
+    clock.advance(ms(1));
+    assert!(!ecu.security_delay_active());
+    clock.advance(ms(500));
+    assert!(!ecu.security_delay_active());
+}
+
+#[test]
+fn responses_pending_at_a_power_loss_do_not_hold_a_later_session() {
+    let (mut ecu, clock) = ecu_with_clock(EcuConfig {
+        s3_server_ms: Some(1_000),
+        ..config()
+    });
+    enter(&mut ecu, Session::Extended);
+    ecu.inject(Fault::DelayResponse { ms: 10_000 });
+    assert_eq!(
+        ecu.exchange(Addressing::Physical, &[0x3E, 0x00]).delay_ms,
+        10_000
+    );
+    ecu.inject(Fault::PowerLoss);
+    ecu.reconnect();
+    enter(&mut ecu, Session::Extended);
+    clock.advance(ms(1_000));
+    ecu.check_timers();
+    assert_eq!(ecu.session, Session::Default);
+}
+
+#[test]
+fn a_dropped_reset_response_still_times_the_restarted_delay() {
+    let (mut ecu, clock) = ecu_with_clock(EcuConfig {
+        security_delay_ms: Some(2_000),
+        response_delay_ms: 500,
+        ..config()
+    });
+    enter(&mut ecu, Session::Extended);
+    exceed_attempts(&mut ecu);
+    ecu.inject(Fault::DropResponse);
+    assert_eq!(ecu.request(&[0x11, 0x01]), SimResponse::NoResponse);
+    clock.advance(ms(2_499));
+    assert!(ecu.security_delay_active());
+    clock.advance(ms(1));
+    assert!(!ecu.security_delay_active());
+}

@@ -322,6 +322,60 @@ mod tests {
     }
 
     #[test]
+    fn a_restartable_plan_with_an_unmapped_precondition_is_refused() {
+        let source = diag_ir::Source::EcuService {
+            service_id: 1,
+            field_id: 1,
+        };
+        let mut bad = program(vec![
+            Op::Pop,
+            Op::RoutineControl { routine: 1, sub: 1 },
+            Op::Pop,
+            Op::ServiceRequest { service: 0x37 },
+            Op::Pop,
+        ]);
+        bad.identity = diag_ir::IdentitySources {
+            vin: Some(source),
+            hardware_part_number: Some(source),
+            software_version: Some(source),
+        };
+        bad.preconditions.engine = Some(diag_ir::Precondition {
+            satisfied: diag_ir::Satisfied { lower: 0, upper: 0 },
+            default_session: Some(source),
+            programming_session: None,
+        });
+        bad.flash.push(diag_ir::FlashRecovery {
+            flash_session: 1,
+            stage: 1,
+            max_resumes: 1,
+            recovery_required: diag_ir::RecoveryRequired::Never,
+            boundaries: diag_ir::RecoveryBoundaries {
+                entry_pc: 0,
+                erase_pc: 1,
+                transfer_exit_pc: 3,
+                post_transfer_end_pc: 5,
+            },
+            timing: diag_ir::RecoveryTiming {
+                session_timeout_millis: 5000,
+                teardown_margin_millis: 0,
+                ecu_startup_millis: 0,
+                confirmation_window_millis: 0,
+            },
+            version_read_retries: 0,
+            no_application: None,
+        });
+        assert!(matches!(
+            check_program(&bad),
+            Err(JobError::Program(
+                diag_ir::ProgramError::UnmappedPrecondition {
+                    kind: diag_ir::PreconditionKind::Engine,
+                    session: diag_ir::SessionKind::Programming,
+                }
+            ))
+        ));
+    }
+
+    #[test]
     fn a_program_runs_to_the_end() {
         let mut host = FakeHost::default();
         let state = run(two_requests(), 4, &mut host).unwrap();

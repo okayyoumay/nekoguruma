@@ -8,12 +8,13 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Interruptible, Op, Program};
+use crate::{Idempotency, Interruptible, Op, Program};
 
 // ---------------------------------------------------------------- Sources
 
 /// Where a value is read from when the agent checks the vehicle before a restart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum Source {
     /// A field of a diagnostic service response. Both ids start at 1 (`Service` and `Field` in
     /// the declaration part, `ir.fbs`).
@@ -24,6 +25,7 @@ pub enum Source {
 
 /// A vehicle fact the agent supplies without asking the ECU.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum RuntimeInput {
     SupplyVoltageMillivolts,
     ExternalSupplyConnected,
@@ -54,6 +56,7 @@ impl RuntimeInput {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum PreconditionKind {
     Voltage,
     ExternalSupply,
@@ -63,6 +66,7 @@ pub enum PreconditionKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum IdentityKind {
     Vin,
     HardwarePartNumber,
@@ -71,6 +75,7 @@ pub enum IdentityKind {
 
 /// The diagnostic session a precondition source is valid in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum SessionKind {
     Default,
     Programming,
@@ -79,6 +84,7 @@ pub enum SessionKind {
 /// Where the identity of the ECU is read from. These must be service sources: a runtime input
 /// says nothing about the ECU.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IdentitySources {
     pub vin: Option<Source>,
     pub hardware_part_number: Option<Source>,
@@ -87,6 +93,7 @@ pub struct IdentitySources {
 
 /// A flash precondition (8.9) as the restart reads it back.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Precondition {
     /// The internal values that count as satisfied, inclusive on both ends. A single value has
     /// `lower == upper`.
@@ -98,6 +105,7 @@ pub struct Precondition {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Satisfied {
     pub lower: i64,
     pub upper: i64,
@@ -105,6 +113,7 @@ pub struct Satisfied {
 
 /// Preconditions a program declares. A precondition that is `None` is not checked.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Preconditions {
     pub voltage_mv: Option<Precondition>,
     pub external_supply: Option<Precondition>,
@@ -132,6 +141,7 @@ impl Preconditions {
 
 /// The recovery plan of one flash session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FlashRecovery {
     /// `FlashSession.id` in the declaration part (`ir.fbs`).
     pub flash_session: u32,
@@ -165,15 +175,18 @@ impl FlashRecovery {
 
 /// From where an interruption needs on-site intervention (8.10.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum RecoveryRequired {
     /// No interruption of the session needs it.
     Never,
-    /// An interruption at or after this instruction does.
+    /// An interruption at or after this instruction does. Must lie in
+    /// `entry_pc..post_transfer_end_pc`.
     FromPc(u32),
 }
 
 /// Instruction positions that divide a flash session into the stages the restart distinguishes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RecoveryBoundaries {
     /// Where the replayable steps before the erase begin; a restart replays from here.
     pub entry_pc: u32,
@@ -187,6 +200,9 @@ pub struct RecoveryBoundaries {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+/// Durations in milliseconds, as `u32`. Part 3 of the restart work adds further timings, in
+/// `u64`, next to these.
 pub struct RecoveryTiming {
     /// How long the ECU keeps the session alive without traffic.
     pub session_timeout_millis: u32,
@@ -201,6 +217,7 @@ pub struct RecoveryTiming {
 /// How an ECU without a valid application answers the identity read. An enum so a
 /// positive-response form can be added later.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum NoApplication {
     /// A negative response with this code.
     Nrc(u8),
@@ -240,6 +257,26 @@ pub enum ProgramError {
     ContradictoryInterruptibility { flash_session: u32, section: usize },
     #[error("flash session {flash_session}: the jump at {pc} leaves the recovery range backwards")]
     JumpOutOfRecovery { flash_session: u32, pc: u32 },
+    #[error("flash session {flash_session}: the jump at {pc} crosses the recovery point backwards")]
+    BackwardJumpAcrossRecovery { flash_session: u32, pc: u32 },
+    #[error("flash session {flash_session}: the call or return at {pc} is inside the plan")]
+    CallOrReturnInPlan { flash_session: u32, pc: u32 },
+    #[error(
+        "flash session {flash_session}: the jump or call at {pc} enters the plan past its entry"
+    )]
+    ControlFlowIntoPlan { flash_session: u32, pc: u32 },
+    #[error("the download instruction at {pc} is outside every plan's transfer range")]
+    DownloadOutsidePlan { pc: u32 },
+    #[error(
+        "flash session {flash_session}: section {section} is unsafe to replay but the restart replays it"
+    )]
+    UnsafeSectionInReplay { flash_session: u32, section: usize },
+    #[error(
+        "flash session {flash_session}: {nrc:#04x} is not a usable no-application response code"
+    )]
+    InvalidNoApplicationNrc { flash_session: u32, nrc: u8 },
+    #[error("{0:?} precondition is a flag; its range must lie within 0..=1")]
+    FlagRangeOutOfDomain(PreconditionKind),
     #[error("{0:?} precondition has an empty range")]
     EmptyRange(PreconditionKind),
     #[error("{kind:?} precondition cannot be read from {input:?}")]
@@ -264,10 +301,24 @@ pub enum ProgramError {
     ZeroResumeLimit { flash_session: u32 },
 }
 
-fn is_request(op: Option<&Op>) -> bool {
+fn is_erase(op: Option<&Op>) -> bool {
     matches!(
         op,
-        Some(Op::ServiceRequest { .. } | Op::RoutineControl { .. })
+        Some(Op::RoutineControl { .. } | Op::ServiceRequest { service: 0x34 })
+    )
+}
+
+fn is_transfer_exit(op: Option<&Op>) -> bool {
+    matches!(op, Some(Op::ServiceRequest { service: 0x37 }))
+}
+
+/// Instructions that belong to a download, which only a plan's transfer range may hold.
+fn is_download(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::ServiceRequest {
+            service: 0x34 | 0x36 | 0x37
+        } | Op::FlashTransfer { .. }
     )
 }
 
@@ -308,6 +359,16 @@ impl Program {
             }
         }
 
+        for (index, op) in self.code.iter().enumerate() {
+            let pc = index as u32;
+            let in_transfer = self.flash.iter().any(|plan| {
+                (plan.boundaries.erase_pc..=plan.boundaries.transfer_exit_pc).contains(&pc)
+            });
+            if is_download(op) && !in_transfer {
+                return Err(ProgramError::DownloadOutsidePlan { pc });
+            }
+        }
+
         let identity = [
             (IdentityKind::Vin, self.identity.vin),
             (
@@ -334,6 +395,15 @@ impl Program {
             };
             if precondition.satisfied.lower > precondition.satisfied.upper {
                 return Err(ProgramError::EmptyRange(kind));
+            }
+            let is_flag = matches!(
+                kind,
+                PreconditionKind::ExternalSupply
+                    | PreconditionKind::Ignition
+                    | PreconditionKind::Engine
+            );
+            if is_flag && (precondition.satisfied.lower < 0 || precondition.satisfied.upper > 1) {
+                return Err(ProgramError::FlagRangeOutOfDomain(kind));
             }
             let sessions = [
                 (SessionKind::Default, precondition.default_session),
@@ -396,15 +466,25 @@ impl Program {
         {
             return Err(ProgramError::BoundaryOutOfOrder { flash_session });
         }
-        for pc in [b.erase_pc, b.transfer_exit_pc] {
-            if !is_request(self.code.get(pc as usize)) {
-                return Err(ProgramError::BoundaryNotARequest { flash_session, pc });
-            }
+        if !is_erase(self.code.get(b.erase_pc as usize)) {
+            return Err(ProgramError::BoundaryNotARequest {
+                flash_session,
+                pc: b.erase_pc,
+            });
+        }
+        if !is_transfer_exit(self.code.get(b.transfer_exit_pc as usize)) {
+            return Err(ProgramError::BoundaryNotARequest {
+                flash_session,
+                pc: b.transfer_exit_pc,
+            });
+        }
+        if let Some(NoApplication::Nrc(nrc @ (0x00 | 0x78))) = plan.no_application {
+            return Err(ProgramError::InvalidNoApplicationNrc { flash_session, nrc });
         }
         let from = match plan.recovery_required {
             RecoveryRequired::Never => b.post_transfer_end_pc,
             RecoveryRequired::FromPc(pc) => {
-                if pc < b.entry_pc || pc > b.post_transfer_end_pc {
+                if pc < b.entry_pc || pc >= b.post_transfer_end_pc {
                     return Err(ProgramError::RecoveryRequiredOutOfRange { flash_session, pc });
                 }
                 pc
@@ -412,9 +492,7 @@ impl Program {
         };
         for (section, s) in self.sections.iter().enumerate() {
             if matches!(s.interruptible, Interruptible::RecoveryRequired)
-                && s.start_pc < s.end_pc
-                && s.start_pc < from
-                && s.end_pc > b.entry_pc
+                && s.start_pc.max(b.entry_pc) < s.end_pc.min(from)
             {
                 return Err(ProgramError::ContradictoryInterruptibility {
                     flash_session,
@@ -422,11 +500,64 @@ impl Program {
                 });
             }
         }
-        for pc in b.erase_pc..b.post_transfer_end_pc {
-            if let Some(Op::Jump(target) | Op::JumpIfFalse(target)) = self.code.get(pc as usize)
-                && *target < b.entry_pc
-            {
-                return Err(ProgramError::JumpOutOfRecovery { flash_session, pc });
+        if plan.allows_restart() {
+            for (section, s) in self.sections.iter().enumerate() {
+                if matches!(s.idempotency, Idempotency::Unsafe)
+                    && s.start_pc.max(b.entry_pc) < s.end_pc.min(b.erase_pc)
+                {
+                    return Err(ProgramError::UnsafeSectionInReplay {
+                        flash_session,
+                        section,
+                    });
+                }
+            }
+        }
+        self.validate_control_flow(plan)
+    }
+
+    /// The plan's range is a single-entry region whose stages follow in order: no call or
+    /// return inside, no way in except at the entry, and jumps inside only where the stage they
+    /// sit in allows.
+    fn validate_control_flow(&self, plan: &FlashRecovery) -> Result<(), ProgramError> {
+        let flash_session = plan.flash_session;
+        let b = &plan.boundaries;
+        let inside = |pc: u32| (b.entry_pc..b.post_transfer_end_pc).contains(&pc);
+        for (index, op) in self.code.iter().enumerate() {
+            let pc = index as u32;
+            let from_inside = inside(pc);
+            match *op {
+                Op::Call(_) | Op::Ret if from_inside => {
+                    return Err(ProgramError::CallOrReturnInPlan { flash_session, pc });
+                }
+                Op::Call(target) if inside(target) => {
+                    return Err(ProgramError::ControlFlowIntoPlan { flash_session, pc });
+                }
+                Op::Jump(target) | Op::JumpIfFalse(target) => {
+                    if !from_inside {
+                        if target > b.entry_pc && target < b.post_transfer_end_pc {
+                            return Err(ProgramError::ControlFlowIntoPlan { flash_session, pc });
+                        }
+                    } else {
+                        let allowed = if pc < b.erase_pc {
+                            target >= b.entry_pc && target <= b.erase_pc
+                        } else if pc < b.transfer_exit_pc {
+                            target >= b.erase_pc && target <= b.transfer_exit_pc
+                        } else {
+                            target == b.erase_pc
+                                || (target > b.transfer_exit_pc && target <= b.post_transfer_end_pc)
+                        };
+                        if !allowed {
+                            return Err(ProgramError::JumpOutOfRecovery { flash_session, pc });
+                        }
+                    }
+                    if let RecoveryRequired::FromPc(from) = plan.recovery_required
+                        && pc >= from
+                        && target < from
+                    {
+                        return Err(ProgramError::BackwardJumpAcrossRecovery { flash_session, pc });
+                    }
+                }
+                _ => {}
             }
         }
         Ok(())

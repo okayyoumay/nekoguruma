@@ -71,6 +71,7 @@ pub enum Op {
 // ---------------------------------------------------------------- Program
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Program {
     pub schema_version: u32,
     pub code: Vec<Op>,

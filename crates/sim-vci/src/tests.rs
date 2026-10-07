@@ -224,6 +224,75 @@ fn an_injected_delay_holds_back_only_that_response() {
 }
 
 #[test]
+fn response_pending_messages_arrive_before_the_response() {
+    let f = fixture();
+    with_ecu(|ecu| {
+        ecu.inject(Fault::ResponsePending {
+            count: 2,
+            interval_ms: 100,
+        })
+    });
+    write(f.channel, ECU_PHYSICAL_REQUEST_ID, &[0x3E, 0x00]);
+    let start = Instant::now();
+    assert_eq!(
+        read(f.channel, 3, 1000),
+        (
+            STATUS_NOERROR,
+            vec![
+                response(&[0x7F, 0x3E, 0x78]),
+                response(&[0x7F, 0x3E, 0x78]),
+                response(&[0x7E, 0x00]),
+            ]
+        )
+    );
+    // The last response pending goes out 100 ms after the first, and the response 100 ms later.
+    assert!(
+        start.elapsed() >= Duration::from_millis(190),
+        "{:?}",
+        start.elapsed()
+    );
+}
+
+#[test]
+fn an_ecu_reset_keeps_its_own_response_pending_chain() {
+    let f = fixture();
+    with_ecu(|ecu| {
+        ecu.inject(Fault::ResponsePending {
+            count: 1,
+            interval_ms: 50,
+        })
+    });
+    // The reset power-cycles the ECU, but its own messages follow it.
+    write(f.channel, ECU_PHYSICAL_REQUEST_ID, &[0x11, 0x01]);
+    assert_eq!(
+        read(f.channel, 2, 1000),
+        (
+            STATUS_NOERROR,
+            vec![response(&[0x7F, 0x11, 0x78]), response(&[0x51, 0x01])]
+        )
+    );
+}
+
+#[test]
+fn a_power_loss_mid_chain_drops_what_had_not_gone_out() {
+    let f = fixture();
+    with_ecu(|ecu| {
+        ecu.inject(Fault::ResponsePending {
+            count: 3,
+            interval_ms: 200,
+        })
+    });
+    write(f.channel, ECU_PHYSICAL_REQUEST_ID, &[0x3E, 0x00]);
+    // The first 0x78 is on the bus at once; the ECU then loses power.
+    assert_eq!(
+        read(f.channel, 1, 100),
+        (STATUS_NOERROR, vec![response(&[0x7F, 0x3E, 0x78])])
+    );
+    with_ecu(|ecu| ecu.inject(Fault::PowerLoss));
+    assert_eq!(read(f.channel, 1, 800), (ERR_BUFFER_EMPTY, vec![]));
+}
+
+#[test]
 fn a_dropped_response_times_out_but_the_request_took_effect() {
     let f = fixture();
     with_ecu(|ecu| ecu.inject(Fault::DropResponse));

@@ -5,8 +5,15 @@
 //! `unsigned long` width of the platform, and a gRPC client reads the VIN
 //! (DID F190) from the simulated ECU behind it over an ISO 15765 link.
 //!
-//! On Linux x86_64 `unsigned long` is 8 bytes, so this also runs the service's
-//! `long_size = 8` conversion against a real library.
+//! The service is launched with the `unsigned long` width the ABI interpretation table (design
+//! 7.1.2) gives for the library's ABI, read from its file header, so the VIN only arrives if
+//! the table matches the library. On Linux x86_64 that is 8 bytes.
+//!
+//! By default the test runs the service and library built for the host. To check another
+//! worker target (`scripts/abi-roundtrip.sh`), the environment names that target's build:
+//! `NGR_ABI_SERVICE` (the service binary, or a launcher that runs it, for example under
+//! qemu-user), `NGR_ABI_LIBRARY` (`sim-vci` built for the same target) and `NGR_ABI_EXPECT`
+//! (the ABI name the library must have, so a wrong build fails the test).
 //!
 //! This file holds a single test, so the process-wide `VCI_CONFIG_PATH` it
 //! sets for the spawned service cannot race with another test.
@@ -24,6 +31,7 @@ use vci_service_interface::{
     UniqueRespIdTableItem, create_com_logical_link_request, event_item, event_notification,
     param_item, resource_data, subscribe_event_request,
 };
+use worker_host::abi::Abi;
 use worker_host::client::{ConnectOptions, WorkerClient};
 use worker_host::service::{LaunchOptions, ServiceKind, WorkerProcess};
 
@@ -48,13 +56,30 @@ fn sim_vci_path() -> PathBuf {
     path
 }
 
-/// Width of J2534 `unsigned long` in `sim-vci` on this platform.
-fn long_size() -> u8 {
-    if cfg!(windows) {
-        4
-    } else {
-        std::mem::size_of::<std::os::raw::c_ulong>() as u8
+/// The service and library under test: the host build, or the target build the environment
+/// names (see the module docs).
+fn target_build() -> (PathBuf, PathBuf) {
+    match (
+        std::env::var_os("NGR_ABI_SERVICE"),
+        std::env::var_os("NGR_ABI_LIBRARY"),
+    ) {
+        (Some(service), Some(library)) => (service.into(), library.into()),
+        (None, None) => (
+            PathBuf::from(env!("CARGO_BIN_EXE_j2534-0404-service")),
+            sim_vci_path(),
+        ),
+        _ => panic!("NGR_ABI_SERVICE and NGR_ABI_LIBRARY are set together"),
     }
+}
+
+/// The library's ABI, read from its header, checked against `NGR_ABI_EXPECT` when it is set.
+fn library_abi(library: &std::path::Path) -> Abi {
+    let abi = worker_host::abi::detect_file(library)
+        .unwrap_or_else(|error| panic!("{}: {error}", library.display()));
+    if let Ok(expected) = std::env::var("NGR_ABI_EXPECT") {
+        assert_eq!(abi.name(), expected, "{}", library.display());
+    }
+    abi
 }
 
 fn param(id: u32, class: PduParamClass, value: u32) -> ParamItem {
@@ -129,13 +154,22 @@ async fn read_the_vin() {
         .duration_since(UNIX_EPOCH)
         .expect("system clock should be after unix epoch")
         .as_nanos();
+    let (service, library) = target_build();
+    let abi = library_abi(&library);
+    // The width of J2534 `unsigned long` the ABI interpretation table gives (design 7.1.2).
+    let long_size = abi.default_long_size();
+    println!(
+        "{} on {} with unsigned long = {long_size} bytes",
+        library.display(),
+        abi.name()
+    );
     let config_path = std::env::temp_dir().join(format!("j2534-0404-service-{nanos}-sim-vci.toml"));
     let config = TempFile(config_path.clone());
     std::fs::write(
         &config_path,
         format!(
             "[config.apis.j2534-0404.libs.{LIBRARY_NAME:?}]\nlibrary_path = {:?}\n",
-            sim_vci_path().display().to_string()
+            library.display().to_string()
         ),
     )
     .expect("test config file should be writable");
@@ -149,14 +183,14 @@ async fn read_the_vin() {
     }
 
     let worker = WorkerProcess::launch(
-        std::path::Path::new(env!("CARGO_BIN_EXE_j2534-0404-service")),
+        &service,
         ServiceKind::J2534V0404,
         LIBRARY_NAME,
         // Generous timeouts for a debug binary on a busy CI runner.
         &LaunchOptions {
             startup_timeout: Duration::from_secs(20),
             request_timeout: Duration::from_secs(5),
-            long_size: Some(long_size()),
+            long_size: Some(long_size),
             ..LaunchOptions::default()
         },
     )

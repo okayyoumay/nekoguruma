@@ -22,8 +22,10 @@ below refer to SAE J2534-1 (v04.04).
   29-bit ID flag, gets `ERR_NOT_SUPPORTED`. Channel IDs count up from 1. `PassThruClose` drops
   every channel together with its filters and unread responses; `PassThruDisconnect` drops one.
 - All 14 J2534 v04.04 functions are exported (with the control function `NgrSimVciControl`,
-  "Control" below), so `j2534-0404-service` loads the library like a vendor's; the end-to-end
-  test runs on the host target. Every export uses the platform's J2534 calling convention
+  "Control" below), so `j2534-0404-service` loads the library like a vendor's. The end-to-end
+  test (`tests/sim_vci_end_to_end.rs`) runs on the host target, and `scripts/abi-roundtrip.sh`
+  (`LAUNCH=1`) runs it against the service and library built for each Linux worker target, ARM
+  under qemu-user, with the `unsigned long` width the ABI table gives (design 7.1.2). Every export uses the platform's J2534 calling convention
   (`extern "system"`: stdcall on Windows x86, the standard C convention elsewhere, design
   7.1.2) under its plain name. `scripts/abi-roundtrip.sh` checks the names on each build it is
   given, including the Windows release builds on `main`, where a decorated stdcall name

@@ -57,7 +57,8 @@ A non-default session times out after tS3_Server without a request (`EcuConfig::
 of that clause (ADR-239), the timer restarts with every request
 that reaches the ECU, whatever the service and whether it is supported, and runs from when the
 response goes out (after its delay), also when that response is then lost (`Fault::DropResponse`),
-or from the request when no response is sent; a request lost on the bus does not restart it.
+or from the request when no response is sent; when responses overtake each other, it runs from
+the last one to go out. A request lost on the bus does not restart it.
 Timers keep running while the ECU is powered off or silent. When it expires, the ECU falls back to the default session as
 for a change to it: security is relocked and a running download is interrupted. The default
 session has no timer. An ECU reset or `reconnect()` also ends a non-default session.

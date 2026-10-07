@@ -28,7 +28,9 @@ time line that stand for those events.
    their outcome). The timer runs from when the response finishes going out, which the simulator
    takes as the request time plus the response delay it reports. A response that is then lost
    (`Fault::DropResponse`) counts as sent, since the server finished sending it. When no response
-   is sent (suppressed, or none due), it runs from the request. A request lost on the bus
+   is sent (suppressed, or none due), it runs from the request. Responses can go out in a
+   different order from their requests (a delayed one overtaken by a later, immediate one), so
+   the timer runs from the last response still to go out. A request lost on the bus
    (`Fault::BusError`) never reaches the ECU and does not restart it. The default session has no
    timer. Expiry has the effect of a change to the default session: security is relocked and a
    running download is interrupted.

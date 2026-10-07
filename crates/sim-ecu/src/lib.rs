@@ -261,6 +261,10 @@ pub struct SimEcu {
     /// When the non-default session times out (tS3_Server), on [`Self::clock`]'s time line.
     /// `None` in the default session.
     s3_deadline: Option<Duration>,
+    /// When the last response handed to the VCI side goes out, on [`Self::clock`]'s time line.
+    /// A response delayed past a later request's response still restarts tS3_Server when it
+    /// goes out.
+    last_response_at: Duration,
     clock: Box<dyn Clock>,
     download: Option<Download>,
     image: Vec<u8>,
@@ -385,6 +389,7 @@ impl SimEcu {
             failed_attempts: 0,
             security_delay_until: None,
             s3_deadline: None,
+            last_response_at: Duration::ZERO,
             clock: Box::new(clock),
             download: None,
             image: Vec::new(),
@@ -458,11 +463,17 @@ impl SimEcu {
     /// (`delay_ms` from now), or from now when there is none, and only in a non-default session
     /// (ISO 14229-2 (2021) clause 9.5, Table 6; ADR-239).
     fn restart_s3(&mut self, delay_ms: u32) {
+        let sent_at = self
+            .clock
+            .now()
+            .saturating_add(Duration::from_millis(delay_ms.into()));
+        // Responses can go out in a different order from their requests; the timer restarts
+        // when the last one of them has gone out.
+        self.last_response_at = self.last_response_at.max(sent_at);
+        let s3 = self.config.s3_server_ms.unwrap_or(DEFAULT_S3_SERVER_MS);
         self.s3_deadline = (self.session != Session::Default).then(|| {
-            let s3 = self.config.s3_server_ms.unwrap_or(DEFAULT_S3_SERVER_MS);
-            self.clock
-                .now()
-                .saturating_add(Duration::from_millis(u64::from(delay_ms) + u64::from(s3)))
+            self.last_response_at
+                .saturating_add(Duration::from_millis(s3.into()))
         });
     }
 
@@ -576,6 +587,8 @@ impl SimEcu {
         self.power_cycles += 1;
         self.session = Session::Default;
         self.s3_deadline = None;
+        // Responses still being delayed are never sent (the VCI side discards them).
+        self.last_response_at = self.clock.now();
         self.lock_security();
         self.failed_attempts = 0;
         if self.security_delay_until.is_some() {

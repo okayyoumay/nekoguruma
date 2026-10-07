@@ -1707,3 +1707,28 @@ fn timers_do_not_overflow_at_the_end_of_time() {
     assert_eq!(ecu.session, Session::Default);
     assert!(!ecu.security_delay_active());
 }
+
+#[test]
+fn s3_waits_for_a_delayed_response_overtaken_by_a_later_one() {
+    let (mut ecu, clock) = ecu_with_clock(EcuConfig {
+        s3_server_ms: Some(1_000),
+        ..config()
+    });
+    enter(&mut ecu, Session::Extended);
+    ecu.inject(Fault::DelayResponse { ms: 3_000 });
+    assert_eq!(
+        ecu.exchange(Addressing::Physical, &[0x3E, 0x00]).delay_ms,
+        3_000
+    );
+    // An immediate response to a later request goes out first.
+    assert_eq!(
+        ecu.exchange(Addressing::Physical, &[0x3E, 0x00]).delay_ms,
+        0
+    );
+    clock.advance(ms(3_999));
+    ecu.check_timers();
+    assert_eq!(ecu.session, Session::Extended);
+    clock.advance(ms(1));
+    ecu.check_timers();
+    assert_eq!(ecu.session, Session::Default);
+}

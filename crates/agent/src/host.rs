@@ -475,6 +475,11 @@ mod tests {
                 rc78_completion_ms: crate::link::MAX_TIMING_MS + 1,
                 ..good.clone()
             },
+            // Raw CAN carries no UDS, so the read-only policy would mean nothing there.
+            LinkConfig {
+                protocol_short_name: "CAN".to_owned(),
+                ..good.clone()
+            },
             // 29-bit IDs need the ID format set on the link, which it does not do yet.
             LinkConfig {
                 rx_id: 0x800,

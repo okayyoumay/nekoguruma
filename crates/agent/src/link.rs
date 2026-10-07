@@ -39,7 +39,7 @@ impl LinkConfig {
     /// common 7E0 / 7E8 pair).
     pub fn iso15765(tx_id: u32, rx_id: u32) -> Self {
         Self {
-            protocol_short_name: "ISO15765".to_owned(),
+            protocol_short_name: PROTOCOL_ISO15765.to_owned(),
             baud_rate: 500_000,
             tx_id,
             rx_id,
@@ -54,6 +54,14 @@ impl LinkConfig {
     /// limit, while the host would compute its deadline from zero; and a timing above
     /// [`MAX_TIMING_MS`] does not fit the worker's microsecond ComParams.
     pub fn validate(&self) -> Result<(), HostError> {
+        // The read-only policy judges UDS service IDs, and the link set-up (flow-control table,
+        // response pending handling) is for UDS on the `ISO15765` protocol. On any other, raw
+        // CAN for example, the same bytes would not be UDS requests.
+        if self.protocol_short_name != PROTOCOL_ISO15765 {
+            return Err(HostError::Setup(
+                "only the ISO15765 protocol (UDS on CAN) is supported",
+            ));
+        }
         for timing in [self.p2_max_ms, self.p2_star_ms, self.rc78_completion_ms] {
             if timing == 0 || timing > MAX_TIMING_MS {
                 return Err(HostError::Setup(
@@ -80,6 +88,9 @@ impl LinkConfig {
         ) + Duration::from_secs(2)
     }
 }
+
+/// The one protocol the runner supports.
+pub const PROTOCOL_ISO15765: &str = "ISO15765";
 
 /// Longest timing the worker's microsecond ComParams can hold.
 pub const MAX_TIMING_MS: u32 = u32::MAX / 1_000;

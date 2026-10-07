@@ -223,8 +223,8 @@ table Repeat {
   count_field_id: uint32 = 0;
   // UntilMarker: before each item, `marker` (Absolute, offset 0, Fixed length, no shape) is
   // decoded at the current position; an internal value within marker_lower..marker_upper
-  // (inclusive) ends the repetition and those bytes are left for the next field. A Bytes, Ascii
-  // or Utf8 marker of up to 8 bytes is compared as its bytes read as a big-endian integer
+  // (inclusive) ends the repetition and those bytes are left for the next field. A Bytes, Ascii,
+  // Utf8 or Unicode2 marker of up to 8 bytes is compared as its bytes read as a big-endian integer
   // (stored bit for bit in int64), with lower == upper
   marker: Field;
   marker_lower: int64;

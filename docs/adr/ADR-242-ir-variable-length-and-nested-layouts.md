@@ -72,8 +72,9 @@ Reading ISO 22901-1 against the old schema:
    and no shape. The frontend rejects a monitor set that needs more, so the 10 ms walk of design
    10.3 is unchanged.
 5. **Keys and markers are compared as internal values.** The frontend converts ODX's physical
-   KEYs, MUX case limits and end-marker TERMINATION-VALUE through the key's COMPU-METHOD into
-   inclusive ranges of internal values, honouring the first-match order of overlapping TEXTTABLE
+   KEYs and MUX case limits through the key field's COMPU-METHOD, and an end-marker
+   TERMINATION-VALUE through the marker field's own COMPU-METHOD, into inclusive ranges of
+   internal values, honouring the first-match order of overlapping TEXTTABLE
    scales (7.3.6.6.1, 7.3.6.6.7), and rejects a key or marker it cannot convert (including a
    marker that needs more than one range, and any key or marker of a Float internal type, since
    the limits are integers). A byte-field or string key or marker is compared for equality on

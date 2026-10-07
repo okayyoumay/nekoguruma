@@ -7,8 +7,8 @@
 # The Claude GitHub App cannot read code scanning alerts, so a read-only fine-grained token in
 # NGR_CODE_SCANNING_TOKEN is sent when set. The raw API response is never printed.
 #
-# Exit status: 0 ok; 2 usage; 3 not authorized (401/403); 4 no analysis or alert (404);
-# 5 any other API or network error.
+# Exit status: 0 ok; 2 usage; 3 not authorized (401/403); 4 list: no analysis of main (404);
+# 5 any other API or network error; 6 show: no such alert (404).
 set -euo pipefail
 
 usage() { echo "usage: $0 list | show <alert number>" >&2; exit 2; }
@@ -19,18 +19,24 @@ repo=$(git remote get-url origin | sed -E 's#\.git$##; s#^.*[:/]([^/:]+/[^/]+)$#
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
-# get <path and query> <output file>: fetch one API page, map the HTTP status to an exit status.
+# get <path and query> <output file> <exit status for 404>: fetch one API page and map the HTTP
+# status to an exit status. The token goes to curl on stdin (printf is a builtin), so it never
+# appears in a process's command line.
 get() {
-  local -a auth=()
-  [ -n "${NGR_CODE_SCANNING_TOKEN:-}" ] && auth=(-H "Authorization: Bearer $NGR_CODE_SCANNING_TOKEN")
+  local -a cmd=(curl -sS -o "$2" -w '%{http_code}'
+    -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28"
+    "https://api.github.com/repos/$repo/$1")
   local status
-  status=$(curl -sS -o "$2" -w '%{http_code}' "${auth[@]}" \
-    -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" \
-    "https://api.github.com/repos/$repo/$1") || { echo "request failed" >&2; exit 5; }
+  if [ -n "${NGR_CODE_SCANNING_TOKEN:-}" ]; then
+    status=$(printf 'Authorization: Bearer %s\n' "$NGR_CODE_SCANNING_TOKEN" | "${cmd[@]}" -H @-) \
+      || { echo "request failed" >&2; exit 5; }
+  else
+    status=$("${cmd[@]}") || { echo "request failed" >&2; exit 5; }
+  fi
   case "$status" in
     200) ;;
     401|403) echo "HTTP $status: not authorized to read code scanning alerts (check NGR_CODE_SCANNING_TOKEN)" >&2; exit 3 ;;
-    404) echo "HTTP 404: $(jq -r '.message // "not found"' "$2" 2>/dev/null)" >&2; exit 4 ;;
+    404) echo "HTTP 404: $(jq -r '.message // "not found"' "$2" 2>/dev/null)" >&2; exit "$3" ;;
     *) echo "HTTP $status: $(jq -r '.message // "unexpected response"' "$2" 2>/dev/null)" >&2; exit 5 ;;
   esac
 }
@@ -40,7 +46,7 @@ case "${1:-}" in
     [ $# -eq 1 ] || usage
     page=1
     while :; do
-      get "code-scanning/alerts?state=open&ref=refs/heads/main&tool_name=CodeQL&per_page=100&page=$page" "$tmp/page-$page.json"
+      get "code-scanning/alerts?state=open&ref=refs/heads/main&tool_name=CodeQL&per_page=100&page=$page" "$tmp/page-$page.json" 4
       [ "$(jq length "$tmp/page-$page.json")" -lt 100 ] && break
       page=$((page + 1))
     done
@@ -61,7 +67,7 @@ case "${1:-}" in
     ;;
   show)
     [ $# -eq 2 ] && [[ "$2" =~ ^[0-9]+$ ]] || usage
-    get "code-scanning/alerts/$2" "$tmp/alert.json"
+    get "code-scanning/alerts/$2" "$tmp/alert.json" 6
     jq -r '
       "number: \(.number)",
       "state: \(.state)",

@@ -31,8 +31,9 @@ Never print the token or write it to a file. Exit statuses:
 
 - 3 (401 or 403): the token is missing, expired or lacks the permission. Tell the maintainer
   that in one message and stop.
-- 4 (404): code scanning has not analysed `main` yet. Report and stop.
+- 4 (404 from `list`): code scanning has not analysed `main` yet. Report and stop.
 - 5: another API or network error. Report the message it printed and stop.
+- 6 (404 from `show`): no alert has that number. Report the number and stop.
 - 0 with no rows: report "no open CodeQL alerts" and stop.
 
 ## 2. Check before each alert

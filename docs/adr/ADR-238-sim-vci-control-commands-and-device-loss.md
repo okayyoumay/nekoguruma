@@ -22,7 +22,8 @@ the J2534 API, as it would on a vendor library. So a test needs a channel into a
    `{"delay_response": {"ms": 500}}`), `reconnect_ecu`, `disconnect_vci` and `connect_vci`.
    Unknown commands and unknown fields, in the command or in the fault, are rejected.
 2. **Two ways in.** The extra export `NgrSimVciControl(const char *command)` applies one command,
-   for a test that loads the library into its own process. For a worker process,
+   for a test that loads the library into its own process; it leaves the control directory
+   alone, so commands sent the two ways are never reordered by each other. For a worker process,
    `NGR_SIM_VCI_CONTROL_DIR` names a directory: at the start of every J2534 call except
    `PassThruGetLastError`, and every 20 ms while `PassThruReadMsgs` waits, `sim-vci` applies
    the `*.json` files there in file-name order. It claims each file by renaming it before
@@ -47,7 +48,8 @@ the J2534 API, as it would on a vendor library. So a test needs a channel into a
 ## Consequences
 
 - A test can arm any `sim_ecu::Fault`, reconnect the ECU and unplug the VCI through the worker;
-  `tests/sim_vci_control.rs` in `j2534-0404-service` does each through an agent job.
+  `tests/sim_vci_control.rs` in `j2534-0404-service` does each through the worker, including
+  a disconnect while a link is open and the recovery that follows.
 - The control directory is read on every J2534 call while the variable is set. That costs one
   directory listing per call, which only tests pay.
 - A VCI crash (firmware failure, as opposed to a pulled cable) is not simulated; it would need

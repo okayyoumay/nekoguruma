@@ -119,7 +119,8 @@ as the first `PassThruOpen` does. There are two ways to send one:
 
 - `NgrSimVciControl(const char *command)` applies one command in the calling process and returns
   `STATUS_NOERROR`, `ERR_NULL_PARAMETER`, or `ERR_FAILED` for a command it cannot parse or an
-  ECU configuration it cannot read.
+  ECU configuration it cannot read. It does not look at the control directory, whose files wait
+  for the next J2534 call.
 - `NGR_SIM_VCI_CONTROL_DIR` names a directory, read once when the library is first called. For
   a test driving a worker process that loaded the library. At the start of every call into the
   library except `PassThruGetLastError`, and every 20 ms while `PassThruReadMsgs` waits,
@@ -149,5 +150,6 @@ A VCI crash, as opposed to a disconnect, is not simulated.
 `tests/sim_vci_end_to_end.rs` loads the built cdylib through the real service, launched by
 `worker-host` with the platform's `unsigned long` width (8 bytes on Linux x86_64), and reads the
 VIN over an ISO 15765 link. Its `tests/sim_vci_control.rs` runs agent jobs against the same setup
-and sends control commands through `NGR_SIM_VCI_CONTROL_DIR` between and during them: an ECU
-power loss and reconnection, and VCI disconnects with the device closed and open.
+and sends control commands through `NGR_SIM_VCI_CONTROL_DIR`: an ECU power loss and
+reconnection, a VCI disconnect between jobs, and one while a link is open, after which
+`GetVersion` reports the lost device until the next job closes and reopens it.

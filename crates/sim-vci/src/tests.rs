@@ -1241,3 +1241,21 @@ fn faults_with_unknown_fields_are_rejected() {
         ERR_FAILED
     );
 }
+
+#[test]
+fn the_control_export_leaves_the_control_directory_for_the_next_call() {
+    let f = fixture();
+    let dir = ControlDir::new("export");
+    dir.send(
+        "001",
+        r#"{"command": "inject_fault", "fault": "power_loss"}"#,
+    );
+    assert_eq!(control(r#"{"command": "reconnect_ecu"}"#), STATUS_NOERROR);
+    assert_eq!(dir.files(), ["001.json"]);
+    // `with_ecu` would apply the file, so the count is read without it.
+    assert_eq!(lock_bus().power_cycles(), 1);
+    // The power loss arrives with the next call and leaves the ECU silent.
+    write(f.channel, ECU_PHYSICAL_REQUEST_ID, &[0x3E, 0x00]);
+    assert!(dir.files().is_empty());
+    assert_eq!(read(f.channel, 1, 20), (ERR_BUFFER_EMPTY, vec![]));
+}

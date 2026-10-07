@@ -3,8 +3,8 @@
 //! Faults injected into `sim-vci` from outside the worker process (ADR-238): `worker-host`
 //! launches the real `j2534-0404-service` binary against the `sim-vci` cdylib, with
 //! `NGR_SIM_VCI_CONTROL_DIR` naming a directory, and this test drops control commands there
-//! between and during agent jobs: a power loss of the ECU, its reconnection, and VCI
-//! disconnects with the device closed and open.
+//! between agent jobs and while a link is open: a power loss of the ECU, its reconnection, and
+//! VCI disconnects with the device closed and open.
 //!
 //! This file holds a single test, so the process-wide environment it sets for the spawned
 //! service cannot race with another test.
@@ -12,8 +12,9 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use agent::{JobError, JobLimits, LinkConfig, run_program};
+use agent::{JobError, JobLimits, Link, LinkConfig, link, run_program};
 use diag_ir::{IR_SCHEMA_VERSION, Op, Program, Value, VmState};
+use vci_service_interface::GetVersionRequest;
 use worker_host::client::{ConnectOptions, WorkerClient};
 use worker_host::service::{LaunchOptions, ServiceKind, WorkerProcess};
 
@@ -78,14 +79,36 @@ fn read_vin() -> Program {
     }
 }
 
+/// The link each job opens.
+fn link_config() -> LinkConfig {
+    LinkConfig::iso15765(0x7E0, 0x7E8)
+}
+/// Deadline of each call while the test drives a link itself.
+const DEADLINE: Duration = Duration::from_secs(5);
+
 async fn run(client: &WorkerClient) -> Result<VmState, JobError> {
     run_program(
         client.clone(),
-        &LinkConfig::iso15765(0x7E0, 0x7E8),
+        &link_config(),
         read_vin(),
         JobLimits::default(),
     )
     .await
+}
+
+/// `GetVersion` reaches `PassThruReadVersion` on the open device; on a lost device it fails
+/// with `ERR_DEVICE_NOT_CONNECTED`.
+async fn assert_device_not_connected(client: &mut WorkerClient, link: &Link) {
+    let result = client
+        .get_version(GetVersionRequest {
+            module_handle: Some(link.module_handle),
+        })
+        .await;
+    let status = result.expect_err("GetVersion should fail on a lost device");
+    assert!(
+        status.message().contains("ERR_DEVICE_NOT_CONNECTED"),
+        "{status:?}"
+    );
 }
 
 #[test]
@@ -188,28 +211,19 @@ async fn inject(control_dir: &Path) {
         .expect("the job after replugging should finish");
     assert_eq!(state.stack, [Value::Bytes(vin.clone())], "{state:?}");
 
-    // The VCI is unplugged while a job waits for a delayed response.
-    send(
-        control_dir,
-        "005",
-        r#"{"command": "inject_fault", "fault": {"delay_response": {"ms": 1000}}}"#,
-    );
-    let job = tokio::spawn({
-        let client = client.clone();
-        async move { run(&client).await }
-    });
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    send(control_dir, "006", r#"{"command": "disconnect_vci"}"#);
-    let lost = job.await.expect("the job task should not panic");
-    // Normally the job is waiting for the response by then; on a slow runner the disconnect
-    // may come while it still opens its link.
-    assert!(
-        matches!(lost, Err(JobError::Host { pc: 1, .. } | JobError::Link(_))),
-        "{lost:?}"
-    );
-    // Closing the lost device and opening it again recovers once the VCI is back
-    // (J2534-1 6.10.1); the service does both when the next job opens its link.
-    send(control_dir, "007", r#"{"command": "connect_vci"}"#);
+    // The VCI is unplugged while a link is open, so the device is open when the command is
+    // applied: the device is lost, and stays lost after the VCI is back (J2534-1 6.10.1).
+    let mut link_client = client.clone();
+    let link = link::open(&mut link_client, &link_config(), DEADLINE)
+        .await
+        .expect("the link should open");
+    send(control_dir, "005", r#"{"command": "disconnect_vci"}"#);
+    assert_device_not_connected(&mut link_client, &link).await;
+    send(control_dir, "006", r#"{"command": "connect_vci"}"#);
+    assert_device_not_connected(&mut link_client, &link).await;
+    // Closing the link closes the lost device; the close itself still reports the loss.
+    let _ = link::close(&mut link_client, link, DEADLINE).await;
+    // The next job opens the device again, which gets a new device ID, and recovers.
     let state = run(&client)
         .await
         .expect("the job after recovery should finish");

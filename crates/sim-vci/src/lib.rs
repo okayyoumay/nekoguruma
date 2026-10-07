@@ -279,12 +279,17 @@ fn bus() -> &'static (Mutex<Bus>, Condvar) {
     })
 }
 
-/// Locks the bus and applies the pending control command files. A panic in one call must not
-/// wedge every later call, so a poisoned lock is taken over.
+/// Locks the bus and applies the pending control command files.
 fn lock() -> MutexGuard<'static, Bus> {
-    let mut bus = bus().0.lock().unwrap_or_else(|e| e.into_inner());
+    let mut bus = lock_bus();
     bus.apply_control_files();
     bus
+}
+
+/// Locks the bus without looking at the control directory. A panic in one call must not wedge
+/// every later call, so a poisoned lock is taken over.
+fn lock_bus() -> MutexGuard<'static, Bus> {
+    bus().0.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// [`lock`] for a J2534 call: fails with `ERR_DEVICE_NOT_CONNECTED` while the device is lost
@@ -577,7 +582,9 @@ pub unsafe extern "C" fn NgrSimVciControl(command: *const c_char) -> PassThruUlo
     else {
         return ERR_FAILED;
     };
-    match lock().apply(command) {
+    // The control directory is left for the next J2534 call, so the two ways in never reorder
+    // each other's commands.
+    match lock_bus().apply(command) {
         Ok(()) => STATUS_NOERROR,
         Err(status) => status,
     }

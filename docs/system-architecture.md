@@ -1290,7 +1290,7 @@ Such operations are hidden in the UI from the outset and are also stated explici
 ### 13.4 Testing Use
 
 - **Simulator adapter (VCI side)**: supports the 3 data-passing methods, 32-bit/64-bit builds, and injection of delays, disconnects, crashes and write failures
-- **Vehicle simulator (ECU side)**: simulates responses to UDS services, negative response codes, flash session state transitions, response delays and no-response, security access seed generation, and the diagnostic session timeout (S3) and security access delay timers. Essential for interruption/resume testing. Combined with the VCI-side simulator, CI runs without real hardware
+- **Vehicle simulator (ECU side)**: simulates responses to UDS services, negative response codes, flash session state transitions (a verified download changes the reported software version from the next ECU restart on, so the 8.2.5 state check can tell a restart before verification from one after it), response delays and no-response, security access seed generation, and the diagnostic session timeout (S3) and security access delay timers. Essential for interruption/resume testing. Combined with the VCI-side simulator, CI runs without real hardware
 - **Network fault injection**: reproduce disconnects and slow links with Toxiproxy or similar
 - **Clock substitution**: for testing start deadlines and execution time windows, and the vehicle simulator's timers, which run on an injectable clock (ADR-239)
 - **CI matrix**: OS x worker ABI x operating mode

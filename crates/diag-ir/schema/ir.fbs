@@ -103,8 +103,10 @@ table CompuBytecode {
 // ---------------------------------------------------------------- Decode plan
 
 // How a field's length is found (the ODX DIAG-CODED-TYPE kinds, ISO 22901-1 7.3.6.2).
-// LeadingLength and Terminated apply only to Bytes, Ascii, Utf8 and Unicode2 fields, which
-// start at a byte edge; a Unicode2 field's lengths are even.
+// LeadingLength and Terminated apply only to Bytes, Ascii, Utf8 and Unicode2 fields, whose value
+// starts at a byte edge; a Unicode2 field's lengths are even. A Terminated field starts at a byte
+// edge, while a LeadingLength prefix is extracted like a field of its own and may start at any
+// bit position (bit_offset).
 enum LengthKind : byte {
   Fixed = 0,          // bit_length bits (STANDARD-LENGTH-TYPE)
   FromField = 1,      // the physical value of field length_field_id, in bits (PARAM-LENGTH-INFO-TYPE)

@@ -116,13 +116,23 @@ jobs:
                private_total: (map(select(high)) | length),
                private: (map(select(high)) | slim),
                alerts: (map(select(high | not)) | slim)}' alerts.json > payload.json
-          # Trim each list to 30000 bytes at most, then the whole payload to 60000.
+          # Trim each list to 30000 bytes at most, then the whole payload to 60000. `alerts` keeps
+          # its most urgent part, since a fixed or dismissed alert makes room for the next. The
+          # private alerts stay open until fixed privately, so when they do not all fit, each run
+          # sends the next window of them (by run number) instead of the same first part.
+          full_private=$(jq -c .private payload.json)
           for list in private alerts; do
             while [ "$(jq -c --arg l "$list" '.[$l]' payload.json | wc -c)" -gt 30000 ]; do
               jq -c --arg l "$list" '.[$l] |= .[0:(length * 3 / 4 | floor)]' payload.json > p.tmp \
                 && mv p.tmp payload.json
             done
           done
+          jq -c --argjson all "$full_private" --argjson run "$GITHUB_RUN_NUMBER" '
+            (.private | length) as $k
+            | if $k > 0 and $k < ($all | length) then
+                (($run - 1) * $k % ($all | length)) as $o
+                | .private = (($all + $all)[$o:$o + $k])
+              else . end' payload.json > p.tmp && mv p.tmp payload.json
           while [ "$(wc -c < payload.json)" -gt 60000 ]; do
             jq -c '.alerts |= .[0:(length * 3 / 4 | floor)]' payload.json > p.tmp && mv p.tmp payload.json
           done

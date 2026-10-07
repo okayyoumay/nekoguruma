@@ -20,7 +20,10 @@ request; they never reach the workflow log, an artifact or the repository, which
    `alerts` (number, rule, severities, place, message, creation time), plus `private_total`,
    the count of all open high and critical alerts.
 2. **Separate shares of the payload.** Each list is trimmed to half the payload budget before
-   the whole payload is trimmed, so neither list crowds out the other.
+   the whole payload is trimmed, so neither list crowds out the other. High and critical alerts
+   stay open until they are fixed privately, so a fixed first part would starve the rest: when
+   they do not all fit, each run sends the next window of them, chosen by the workflow's run
+   number, and over successive runs every one is sent.
 3. **Verified, reported inside the project only.** The run verifies high and critical alerts
    like any other. It never opens a PR, issue, branch or commit for them and never writes their
    details to a repository file or a GitHub comment. A false positive is reported with a
@@ -40,4 +43,4 @@ request; they never reach the workflow log, an artifact or the repository, which
 - High and critical alert details live in the routine session's conversation and in the
   project's thread, both visible only to project members.
 - A trimmed `private` list leaves some alerts unverified in a run; the report names how many,
-  and the next run picks them up.
+  and later runs send the next windows.

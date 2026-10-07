@@ -547,7 +547,7 @@ impl SimEcu {
 
     /// The ECU `snapshot` recorded, with its timers on `clock`, `elapsed` after the snapshot was
     /// taken: every running timer has `elapsed` less to go, and one that has run out by then
-    /// takes effect at the next request, as if no time had passed while nobody asked.
+    /// takes effect at once (a session that timed out has ended when this returns).
     pub fn restore(snapshot: EcuSnapshot, clock: impl Clock + 'static, elapsed: Duration) -> Self {
         let now = clock.now();
         let at = |left: Duration| now.saturating_add(left.saturating_sub(elapsed));

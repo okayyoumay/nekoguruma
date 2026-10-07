@@ -43,7 +43,9 @@ Two ways out were open:
    the same file at once is not supported.
 5. **A failed write fails the call.** If the state cannot be written, the J2534 call that
    changed the ECU returns `ERR_FAILED`, and a request's response is not delivered, so a test
-   cannot go on past a state the next process would not see.
+   cannot go on past a state the next process would not see. A new ECU whose state cannot be
+   written is not created. Replacing the file is retried briefly when Windows reports it in use
+   (a scanner holding the new file).
 6. **Encoding.** postcard, with a format version; a file of another version, or one that cannot
    be decoded, makes `PassThruOpen` fail with `ERR_FAILED`.
 

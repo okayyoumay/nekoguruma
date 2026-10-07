@@ -101,7 +101,9 @@ pub struct PassThruMsg {
 // ---------------------------------------------------------------- Simulated bus
 
 /// Environment variable naming a JSON file with the `sim_ecu::EcuConfig` of the simulated ECU.
-/// Read on the first `PassThruOpen` of the process; without it a built-in configuration is used.
+/// Read when the process first needs the ECU (the first `PassThruOpen` or control command),
+/// unless the ECU continues from a state file ([`ECU_STATE_ENV`]); without it a built-in
+/// configuration is used.
 pub const ECU_CONFIG_ENV: &str = "NGR_SIM_ECU_CONFIG";
 
 /// Environment variable naming a file that keeps the simulated ECU's state across processes
@@ -157,7 +159,18 @@ fn save_ecu_state(path: &Path, ecu: &mut SimEcu) -> std::io::Result<()> {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
     std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, path)
+    // On Windows another process (a virus scanner, for one) can hold the new file open for a
+    // moment, and replacing it then fails; try again a few times before giving up.
+    let mut attempts = 0;
+    loop {
+        match std::fs::rename(&tmp, path) {
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied && attempts < 10 => {
+                attempts += 1;
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            result => return result,
+        }
+    }
 }
 
 /// The device ID the first `PassThruOpen` returns. The simulator has one device; it gets a new
@@ -432,7 +445,12 @@ impl Bus {
                 _ => SimEcu::new(load_ecu_config().ok_or(ERR_FAILED)?),
             };
             self.ecu = Some(ecu);
-            self.save_ecu()?;
+            if let Err(status) = self.save_ecu() {
+                // Not created after all: the next call tries again, and fails the same way
+                // until the state can be written.
+                self.ecu = None;
+                return Err(status);
+            }
         }
         Ok(self.ecu.as_mut().expect("created above"))
     }
@@ -722,8 +740,8 @@ unsafe fn write_c_string(out: *mut c_char, text: &str) {
     }
 }
 
-/// Opens the simulated device and, on the first open of the process, powers up the ECU with the
-/// configuration from `NGR_SIM_ECU_CONFIG`.
+/// Opens the simulated device. If the process has no ECU yet, the ECU continues from the state
+/// file (`NGR_SIM_ECU_STATE`) or powers up with the configuration from `NGR_SIM_ECU_CONFIG`.
 ///
 /// # Safety
 /// `device_id` must be null or valid for a write.

@@ -5,7 +5,7 @@
 //! wrapper: the test executable starts itself again with [`STEP_ENV`] set. One child starts a
 //! download and exits without closing anything, as a crashing worker would; the next ones read
 //! the flash state (DID FD00) and the session (DID F186) the ECU kept, before and after
-//! tS3_Server has run out.
+//! tS3_Server has run out. A fault armed by a control command in one process fires in the next.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -152,6 +152,39 @@ fn run_step(step: &str) {
                 flash_state(0x05, 2, 2 * BLOCK_LEN as u32)
             );
         }
+        "arm" => {
+            // The control file is applied at the start of the next J2534 call; this one reads
+            // nothing.
+            let control =
+                Path::new(&std::env::var_os("NGR_SIM_VCI_CONTROL_DIR").expect("set")).to_path_buf();
+            let tmp = control.join("001.tmp");
+            std::fs::write(
+                &tmp,
+                r#"{"command": "inject_fault", "fault": "drop_response"}"#,
+            )
+            .expect("control file should be writable");
+            std::fs::rename(&tmp, control.join("001.json")).expect("control file renamed");
+            let _ = api.read_messages(channel, 1, 0);
+            assert!(
+                std::fs::read_dir(&control)
+                    .expect("control directory")
+                    .next()
+                    .is_none(),
+                "the command should be applied"
+            );
+            std::process::exit(0);
+        }
+        "armed" => {
+            // The fault armed in the previous process drops this response, and only this one.
+            api.write_messages(
+                channel,
+                &mut [message(&can(REQUEST_ID, &[0x3E, 0x00]))],
+                1_000,
+            )
+            .expect("the request should be sent");
+            assert!(api.read_messages(channel, 1, 500).is_err(), "dropped");
+            assert_eq!(request(&api, channel, &[0x3E, 0x00]), [0x7E, 0x00]);
+        }
         other => panic!("unknown step {other:?}"),
     }
 }
@@ -164,7 +197,7 @@ fn run_child(step: &str, dir: &Path) {
         .env("NGR_SIM_ECU_CONFIG", dir.join("ecu.json"))
         .env("NGR_SIM_ECU_STATE", dir.join("ecu.state"))
         .env("NGR_J2534_LONG_SIZE", long_size().to_string())
-        .env_remove("NGR_SIM_VCI_CONTROL_DIR")
+        .env("NGR_SIM_VCI_CONTROL_DIR", dir.join("control"))
         .status()
         .expect("the child process should start");
     assert!(status.success(), "step {step:?} failed: {status}");
@@ -181,7 +214,7 @@ fn sim_ecu_state_survives_a_restart_of_the_loading_process() {
         .expect("system clock should be after unix epoch")
         .as_nanos();
     let dir = TempDir(std::env::temp_dir().join(format!("sim-vci-restart-{nanos}")));
-    std::fs::create_dir(&dir.0).expect("temporary directory should be created");
+    std::fs::create_dir_all(dir.0.join("control")).expect("temporary directory should be created");
     std::fs::write(
         dir.0.join("ecu.json"),
         format!(
@@ -202,4 +235,6 @@ fn sim_ecu_state_survives_a_restart_of_the_loading_process() {
     // process holding the library.
     std::thread::sleep(Duration::from_millis(S3_MS + 500));
     run_child("after-s3", &dir.0);
+    run_child("arm", &dir.0);
+    run_child("armed", &dir.0);
 }

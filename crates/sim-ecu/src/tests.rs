@@ -2012,3 +2012,50 @@ fn a_restored_ecu_keeps_its_faults_and_counters() {
     assert_eq!(restored.request(&[0x3E, 0x00]), SimResponse::NoResponse);
     assert_eq!(restored.request(&[0x3E, 0x00]), pos(&[0x7E, 0x00]));
 }
+
+#[test]
+fn restore_brings_back_every_field() {
+    let clock = ManualClock::default();
+    clock.advance(ms(1_000));
+    let mut ecu = SimEcu::with_clock(config(), clock.clone());
+    // Every field away from its power-up value.
+    ecu.config.drop_at_block = Some(9);
+    ecu.session = Session::Programming;
+    ecu.flash = FlashPhase::Transferring { next_block: 4 };
+    ecu.security_unlocked = true;
+    ecu.gateway_authenticated = true;
+    ecu.dtcs.push(DtcRecord {
+        dtc: 0x12_34_56,
+        status: 0x01,
+    });
+    ecu.running_sw_version = "0043".into();
+    ecu.pending_sw_version = Some("0044".into());
+    ecu.seed_counter = 7;
+    ecu.pending_seed = Some(0x1234);
+    ecu.failed_attempts = 2;
+    ecu.security_delay_until = Some(ms(9_000));
+    ecu.s3_deadline = Some(ms(4_000));
+    ecu.last_response_at = ms(1_500);
+    ecu.download = Some(Download {
+        start: 0x100,
+        size: 0x40,
+        received: 0x20,
+        expected_bsc: 4,
+        last_bsc: Some(3),
+        last_len: 0x10,
+        secured: true,
+    });
+    ecu.image = vec![1, 2, 3];
+    ecu.silent = true;
+    ecu.armed = vec![Fault::DropResponse, Fault::CorruptBlock { block: 5 }];
+    ecu.power_cycles = 3;
+    let snapshot = ecu.snapshot();
+
+    let mut restored = SimEcu::restore(reread(&snapshot), ManualClock::default(), Duration::ZERO);
+    let json = |snapshot: &EcuSnapshot| serde_json::to_string(snapshot).expect("serializes");
+    assert_eq!(json(&restored.snapshot()), json(&snapshot));
+    // The timers were recorded as the time left.
+    assert_eq!(restored.s3_deadline, Some(ms(3_000)));
+    assert_eq!(restored.security_delay_until, Some(ms(8_000)));
+    assert_eq!(restored.last_response_at, ms(500));
+}

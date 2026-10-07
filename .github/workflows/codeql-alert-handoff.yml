@@ -93,8 +93,8 @@ jobs:
           # their own (at most 28000 bytes), so neither list crowds out the other; `alerts` gets
           # the rest of 58000 bytes. `alerts` keeps its most urgent part, since a fixed or
           # dismissed alert makes room for the next. Private alerts can stay open longer, so
-          # when they do not all fit, each run starts its window further along the list (by run
-          # number) and every one is sent over successive runs.
+          # their list is split into pages that each fit the share, and each run sends the next
+          # page (by run number): every one is sent over successive runs.
           jq -s -c --arg repo "$REPO" --argjson run "$GITHUB_RUN_NUMBER" '
             def high: .rule.security_severity_level == "critical"
                       or .rule.security_severity_level == "high";
@@ -123,14 +123,20 @@ jobs:
                   | if .size + $n > $budget then .full = true
                     else .out += [$a] | .size += $n end
                 end) | .out;
+            # Consecutive pages whose JSON each fits in $budget bytes, covering every alert.
+            def pages($budget):
+              reduce .[] as $a ({pages: [], cur: [], size: 2};
+                ($a | tojson | utf8bytelength + 1) as $n
+                | if .size + $n > $budget and (.cur | length) > 0
+                  then .pages += [.cur] | .cur = [$a] | .size = 2 + $n
+                  else .cur += [$a] | .size += $n end)
+              | .pages + (if (.cur | length) > 0 then [.cur] else [] end);
             add
             | (map(select(high)) | slim) as $p
             | (map(select(high | not)) | slim) as $rest
-            | ($p | fit(28000) | length) as $k
-            | (if $k < ($p | length)
-                 then (($run - 1) * $k % ($p | length)) as $o
-                      | ($p[$o:] + $p[:$o]) | fit(28000) | urgency
-                 else $p end) as $private
+            | ($p | pages(28000)) as $pg
+            | (if ($pg | length) == 0 then []
+               else $pg[($run - 1) % ($pg | length)] end) as $private
             | {repository: $repo, ref: "refs/heads/main", total: length,
                private_total: ($p | length), private: $private, alerts: []}
             | (tojson | utf8bytelength) as $used

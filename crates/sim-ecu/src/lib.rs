@@ -234,7 +234,7 @@ impl FlashPhase {
 }
 
 /// An accepted RequestDownload. Survives a reconnection so that the transfer can resume.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 struct Download {
     /// Start address and total size of the image, from the first RequestDownload.
     start: u32,
@@ -285,6 +285,88 @@ pub struct SimEcu {
     armed: Vec<Fault>,
     /// Power cycles so far (power loss, ECU reset, reconnection).
     power_cycles: u64,
+}
+
+/// The whole state of a [`SimEcu`], from [`SimEcu::snapshot`]. Timers are kept as the time left
+/// when the snapshot was taken, since the clock they ran on ends with the process.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EcuSnapshot {
+    config: EcuConfig,
+    session: Session,
+    flash: FlashPhase,
+    security_unlocked: bool,
+    gateway_authenticated: bool,
+    dtcs: Vec<DtcRecord>,
+    running_sw_version: String,
+    pending_sw_version: Option<String>,
+    seed_counter: u32,
+    pending_seed: Option<u32>,
+    failed_attempts: u8,
+    security_delay_left: Option<Duration>,
+    s3_left: Option<Duration>,
+    /// How long until the last response handed to the VCI side goes out (zero if it has).
+    last_response_in: Duration,
+    download: Option<Download>,
+    image: Vec<u8>,
+    silent: bool,
+    armed: Vec<Fault>,
+    power_cycles: u64,
+}
+
+/// Why [`SimEcu::restore`] refused a snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvalidSnapshot(&'static str);
+
+impl std::fmt::Display for InvalidSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "invalid ECU snapshot: {}", self.0)
+    }
+}
+
+impl std::error::Error for InvalidSnapshot {}
+
+impl EcuSnapshot {
+    /// The invariants the services rely on: what TransferData and RequestDownload index or add
+    /// up must hold, as it does in a snapshot the ECU itself took.
+    fn check(&self) -> Result<(), InvalidSnapshot> {
+        let invalid = |reason| Err(InvalidSnapshot(reason));
+        let image_len = self.image.len() as u64;
+        if image_len > u64::from(FLASH_SIZE) {
+            return invalid("the image is larger than the flash window");
+        }
+        if let Some(dl) = &self.download {
+            let flash_end = u64::from(FLASH_START) + u64::from(FLASH_SIZE);
+            if dl.size == 0
+                || u64::from(dl.start) < u64::from(FLASH_START)
+                || u64::from(dl.start) + u64::from(dl.size) > flash_end
+            {
+                return invalid("the download lies outside the flash window");
+            }
+            if dl.received > dl.size || u64::from(dl.received) != image_len {
+                return invalid("the bytes received disagree with the download or the image");
+            }
+            if dl.last_len > dl.received || (dl.last_bsc.is_none() && dl.last_len != 0) {
+                return invalid("the last block is longer than the data received");
+            }
+        }
+        match self.flash {
+            FlashPhase::Transferring { next_block } => {
+                if self.download.is_none() || next_block == 0 || next_block == u32::MAX {
+                    return invalid("a running transfer without a download or a valid block");
+                }
+            }
+            FlashPhase::Interrupted { last_block } => {
+                if self.download.is_none() || last_block == u32::MAX {
+                    return invalid("an interrupted transfer without a download or a valid block");
+                }
+            }
+            FlashPhase::Idle
+            | FlashPhase::Erased
+            | FlashPhase::TransferComplete
+            | FlashPhase::Verified => {}
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------- Responses
@@ -488,6 +570,73 @@ impl SimEcu {
             self.last_response_at
                 .saturating_add(Duration::from_millis(s3.into()))
         });
+    }
+
+    /// Everything the ECU holds, for [`SimEcu::restore`] in another process (ADR-241). Timers
+    /// that have run out are applied first; the running ones are recorded as the time left.
+    pub fn snapshot(&mut self) -> EcuSnapshot {
+        self.check_timers();
+        let now = self.clock.now();
+        let left = |at: Duration| at.saturating_sub(now);
+        EcuSnapshot {
+            config: self.config.clone(),
+            session: self.session,
+            flash: self.flash,
+            security_unlocked: self.security_unlocked,
+            gateway_authenticated: self.gateway_authenticated,
+            dtcs: self.dtcs.clone(),
+            running_sw_version: self.running_sw_version.clone(),
+            pending_sw_version: self.pending_sw_version.clone(),
+            seed_counter: self.seed_counter,
+            pending_seed: self.pending_seed,
+            failed_attempts: self.failed_attempts,
+            security_delay_left: self.security_delay_until.map(left),
+            s3_left: self.s3_deadline.map(left),
+            last_response_in: left(self.last_response_at),
+            download: self.download,
+            image: self.image.clone(),
+            silent: self.silent,
+            armed: self.armed.clone(),
+            power_cycles: self.power_cycles,
+        }
+    }
+
+    /// The ECU `snapshot` recorded, with its timers on `clock`, `elapsed` after the snapshot was
+    /// taken: every running timer has `elapsed` less to go, and one that has run out by then
+    /// takes effect at once (a session that timed out has ended when this returns).
+    ///
+    /// A snapshot comes from a file another process wrote, so it is checked first: one whose
+    /// download, image or block numbers contradict each other, or exceed the flash window, is
+    /// refused rather than left to fail a later request.
+    pub fn restore(
+        snapshot: EcuSnapshot,
+        clock: impl Clock + 'static,
+        elapsed: Duration,
+    ) -> Result<Self, InvalidSnapshot> {
+        snapshot.check()?;
+        let now = clock.now();
+        let at = |left: Duration| now.saturating_add(left.saturating_sub(elapsed));
+        let mut ecu = Self::with_clock(snapshot.config, clock);
+        ecu.session = snapshot.session;
+        ecu.flash = snapshot.flash;
+        ecu.security_unlocked = snapshot.security_unlocked;
+        ecu.gateway_authenticated = snapshot.gateway_authenticated;
+        ecu.dtcs = snapshot.dtcs;
+        ecu.running_sw_version = snapshot.running_sw_version;
+        ecu.pending_sw_version = snapshot.pending_sw_version;
+        ecu.seed_counter = snapshot.seed_counter;
+        ecu.pending_seed = snapshot.pending_seed;
+        ecu.failed_attempts = snapshot.failed_attempts;
+        ecu.security_delay_until = snapshot.security_delay_left.map(at);
+        ecu.s3_deadline = snapshot.s3_left.map(at);
+        ecu.last_response_at = at(snapshot.last_response_in);
+        ecu.download = snapshot.download;
+        ecu.image = snapshot.image;
+        ecu.silent = snapshot.silent;
+        ecu.armed = snapshot.armed;
+        ecu.power_cycles = snapshot.power_cycles;
+        ecu.check_timers();
+        Ok(ecu)
     }
 
     /// Data stored by TransferData since the last erase.

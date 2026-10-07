@@ -1895,3 +1895,220 @@ fn a_dropped_reset_response_still_times_the_restarted_delay() {
     clock.advance(ms(1));
     assert!(!ecu.security_delay_active());
 }
+
+// ---------------------------------------------------------------- Snapshot and restore
+
+/// Programming session, unlocked, two 2-byte blocks of a 6-byte download stored, on `clock`.
+fn mid_download(clock: &ManualClock) -> SimEcu {
+    let mut ecu = SimEcu::with_clock(config(), clock.clone());
+    enter(&mut ecu, Session::Programming);
+    unlock(&mut ecu);
+    assert!(matches!(
+        ecu.request(&[0x31, 0x01, 0xFF, 0x00]),
+        SimResponse::Positive(_)
+    ));
+    assert!(matches!(
+        ecu.request(&request_download(0, 6)),
+        SimResponse::Positive(_)
+    ));
+    for (bsc, data) in [(1, [0xAA, 0xBB]), (2, [0xCC, 0xDD])] {
+        assert!(matches!(
+            ecu.request(&transfer(bsc, &data)),
+            SimResponse::Positive(_)
+        ));
+    }
+    ecu
+}
+
+/// A snapshot after a round trip through JSON, as another process would read it.
+fn reread(snapshot: &EcuSnapshot) -> EcuSnapshot {
+    serde_json::from_str(&serde_json::to_string(snapshot).expect("snapshot serializes"))
+        .expect("snapshot deserializes")
+}
+
+#[test]
+fn a_restored_ecu_continues_the_download() {
+    let clock = ManualClock::default();
+    let snapshot = reread(&mid_download(&clock).snapshot());
+
+    // The new process's clock has its own origin.
+    let later = ManualClock::default();
+    later.advance(ms(60_000));
+    let mut ecu = SimEcu::restore(snapshot, later, Duration::ZERO).expect("valid snapshot");
+    assert_eq!(ecu.session, Session::Programming);
+    assert!(ecu.security_unlocked);
+    assert_eq!(ecu.flash, FlashPhase::Transferring { next_block: 3 });
+    assert_eq!(ecu.image(), [0xAA, 0xBB, 0xCC, 0xDD]);
+    // The block sequence counter goes on where it stopped, and the download completes.
+    assert_eq!(ecu.request(&transfer(3, &[0xEE, 0xFF])), pos(&[0x76, 0x03]));
+    assert_eq!(ecu.request(&[0x37]), pos(&[0x77]));
+    assert_eq!(ecu.image(), [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
+}
+
+#[test]
+fn time_between_snapshot_and_restore_counts_against_s3() {
+    let clock = ManualClock::default();
+    let mut ecu = mid_download(&clock);
+    clock.advance(ms(1_000));
+    let snapshot = ecu.snapshot();
+
+    // Still within tS3_Server: the session goes on, and times out when the rest has passed.
+    let later = ManualClock::default();
+    let mut restored =
+        SimEcu::restore(snapshot.clone(), later.clone(), ms(3_000)).expect("valid snapshot");
+    assert_eq!(restored.session, Session::Programming);
+    later.advance(ms(999));
+    restored.check_timers();
+    assert_eq!(restored.session, Session::Programming);
+    later.advance(ms(1));
+    restored.check_timers();
+    assert_eq!(restored.session, Session::Default);
+    assert_eq!(restored.flash, FlashPhase::Interrupted { last_block: 2 });
+
+    // Past tS3_Server: the session has ended by the time the ECU is restored.
+    let mut late =
+        SimEcu::restore(snapshot, ManualClock::default(), ms(4_000)).expect("valid snapshot");
+    assert_eq!(late.session, Session::Default);
+    assert!(!late.security_unlocked);
+    assert_eq!(reported_session(&mut late), 0x01);
+    let SimResponse::Positive(state) = late.request(&[0x22, 0xFD, 0x00]) else {
+        panic!("FD00 should be readable");
+    };
+    assert_eq!(
+        state[3..8],
+        FlashPhase::Interrupted { last_block: 2 }.encode()
+    );
+}
+
+#[test]
+fn a_restored_security_delay_runs_out_on_time() {
+    let (mut ecu, clock) = ecu_with_clock(EcuConfig {
+        security_delay_ms: Some(10_000),
+        ..config()
+    });
+    enter(&mut ecu, Session::Extended);
+    for _ in 0..MAX_SECURITY_ATTEMPTS {
+        let _ = ecu.request(&[0x27, 0x01]);
+        let _ = ecu.request(&[0x27, 0x02, 0, 0, 0, 0]);
+    }
+    assert!(ecu.security_delay_active());
+    clock.advance(ms(4_000));
+    let snapshot = reread(&ecu.snapshot());
+
+    let later = ManualClock::default();
+    let mut restored = SimEcu::restore(snapshot, later.clone(), ms(5_000)).expect("valid snapshot");
+    assert!(restored.security_delay_active());
+    later.advance(ms(1_000));
+    assert!(!restored.security_delay_active());
+}
+
+#[test]
+fn a_restored_ecu_keeps_its_faults_and_counters() {
+    let (mut ecu, _clock) = ecu_with_clock(config());
+    ecu.inject(Fault::DropResponse);
+    ecu.reconnect();
+    let snapshot = reread(&ecu.snapshot());
+    let mut restored =
+        SimEcu::restore(snapshot, ManualClock::default(), Duration::ZERO).expect("valid snapshot");
+    assert_eq!(restored.power_cycles(), 1);
+    // The armed fault still fires on the next request.
+    assert_eq!(restored.request(&[0x3E, 0x00]), SimResponse::NoResponse);
+    assert_eq!(restored.request(&[0x3E, 0x00]), pos(&[0x7E, 0x00]));
+}
+
+#[test]
+fn restore_brings_back_every_field() {
+    let clock = ManualClock::default();
+    clock.advance(ms(1_000));
+    let mut ecu = SimEcu::with_clock(config(), clock.clone());
+    // Every field away from its power-up value.
+    ecu.config.drop_at_block = Some(9);
+    ecu.session = Session::Programming;
+    ecu.flash = FlashPhase::Transferring { next_block: 4 };
+    ecu.security_unlocked = true;
+    ecu.gateway_authenticated = true;
+    ecu.dtcs.push(DtcRecord {
+        dtc: 0x12_34_56,
+        status: 0x01,
+    });
+    ecu.running_sw_version = "0043".into();
+    ecu.pending_sw_version = Some("0044".into());
+    ecu.seed_counter = 7;
+    ecu.pending_seed = Some(0x1234);
+    ecu.failed_attempts = 2;
+    ecu.security_delay_until = Some(ms(9_000));
+    ecu.s3_deadline = Some(ms(4_000));
+    ecu.last_response_at = ms(1_500);
+    ecu.download = Some(Download {
+        start: 0x100,
+        size: 0x40,
+        received: 0x20,
+        expected_bsc: 4,
+        last_bsc: Some(3),
+        last_len: 0x10,
+        secured: true,
+    });
+    // As much as the download has received.
+    ecu.image = vec![7; 0x20];
+    ecu.silent = true;
+    ecu.armed = vec![Fault::DropResponse, Fault::CorruptBlock { block: 5 }];
+    ecu.power_cycles = 3;
+    let snapshot = ecu.snapshot();
+
+    let mut restored = SimEcu::restore(reread(&snapshot), ManualClock::default(), Duration::ZERO)
+        .expect("valid snapshot");
+    let json = |snapshot: &EcuSnapshot| serde_json::to_string(snapshot).expect("serializes");
+    assert_eq!(json(&restored.snapshot()), json(&snapshot));
+    // The timers were recorded as the time left.
+    assert_eq!(restored.s3_deadline, Some(ms(3_000)));
+    assert_eq!(restored.security_delay_until, Some(ms(8_000)));
+    assert_eq!(restored.last_response_at, ms(500));
+}
+
+#[test]
+fn restore_refuses_a_snapshot_that_contradicts_itself() {
+    let clock = ManualClock::default();
+    let good = mid_download(&clock).snapshot();
+    let restore = |snapshot: EcuSnapshot| {
+        SimEcu::restore(snapshot, ManualClock::default(), Duration::ZERO).map(|_| ())
+    };
+    assert_eq!(restore(good.clone()), Ok(()));
+
+    let mut short_image = good.clone();
+    short_image.image.pop();
+    let mut long_last_block = good.clone();
+    long_last_block
+        .download
+        .as_mut()
+        .expect("download")
+        .last_len = 99;
+    let mut past_the_end = good.clone();
+    past_the_end.download.as_mut().expect("download").start = FLASH_SIZE - 1;
+    let mut over_received = good.clone();
+    over_received.download.as_mut().expect("download").received = 7;
+    let mut no_download = good.clone();
+    no_download.download = None;
+    let mut last_block = good.clone();
+    last_block.flash = FlashPhase::Transferring {
+        next_block: u32::MAX,
+    };
+    let mut huge = good;
+    huge.download = None;
+    huge.flash = FlashPhase::Idle;
+    huge.image = vec![0; FLASH_SIZE as usize + 1];
+    for snapshot in [
+        short_image,
+        long_last_block,
+        past_the_end,
+        over_received,
+        no_download,
+        last_block,
+        huge,
+    ] {
+        assert!(
+            restore(snapshot.clone()).is_err(),
+            "{:?}",
+            snapshot.download
+        );
+    }
+}

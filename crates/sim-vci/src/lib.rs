@@ -10,7 +10,7 @@
 
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_void};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// J2534 `unsigned long`.
 /// Windows is LLP64, so it is 32-bit even on 64-bit; Linux / AArch64 are LP64, so it is 64-bit.
@@ -25,11 +25,11 @@ pub type PassThruUlong = std::os::raw::c_ulong;
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use j2534_defs::consts::{connect_flag, filter, ioctl, protocol, status, tx_flag};
-use serde::Deserialize;
-use sim_ecu::{Addressing, EcuConfig, Fault, SimEcu};
+use serde::{Deserialize, Serialize};
+use sim_ecu::{Addressing, EcuConfig, EcuSnapshot, Fault, SimEcu, SystemClock};
 
 pub const STATUS_NOERROR: PassThruUlong = status::STATUS_NOERROR as PassThruUlong;
 pub const ERR_NOT_SUPPORTED: PassThruUlong = status::ERR_NOT_SUPPORTED as PassThruUlong;
@@ -101,8 +101,85 @@ pub struct PassThruMsg {
 // ---------------------------------------------------------------- Simulated bus
 
 /// Environment variable naming a JSON file with the `sim_ecu::EcuConfig` of the simulated ECU.
-/// Read on the first `PassThruOpen` of the process; without it a built-in configuration is used.
+/// Read when the process first needs the ECU (the first `PassThruOpen` or control command),
+/// unless the ECU continues from a state file ([`ECU_STATE_ENV`]); without it a built-in
+/// configuration is used.
 pub const ECU_CONFIG_ENV: &str = "NGR_SIM_ECU_CONFIG";
+
+/// Environment variable naming a file that keeps the simulated ECU's state across processes
+/// (ADR-241). Read when the process first needs the ECU: if the file exists, the ECU continues
+/// from it (and `NGR_SIM_ECU_CONFIG` is not read); otherwise the ECU starts fresh. Rewritten
+/// after every change to the ECU. Without it the ECU lives only as long as the process.
+pub const ECU_STATE_ENV: &str = "NGR_SIM_ECU_STATE";
+
+/// Format of the state file; a file of another version is refused.
+const STATE_FILE_VERSION: u32 = 1;
+
+/// The contents of the [`ECU_STATE_ENV`] file (postcard).
+#[derive(Serialize, Deserialize)]
+struct StateFile {
+    version: u32,
+    /// Wall-clock time of the write, in milliseconds since the Unix epoch: the time until the
+    /// next process reads it counts against the ECU's timers.
+    saved_at_ms: u64,
+    ecu: EcuSnapshot,
+}
+
+fn unix_ms(at: SystemTime) -> u64 {
+    at.duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis().try_into().unwrap_or(u64::MAX))
+}
+
+/// The ECU the state file at `path` holds, with the time since it was written counted against
+/// its timers: `Ok(None)` if there is no such file, `Err(())` if it cannot be read (for any other
+/// reason than not existing), is not a state file of this version, or holds a state the ECU
+/// could not have been in.
+fn load_ecu_state(path: &Path) -> Result<Option<SimEcu>, ()> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(()),
+    };
+    let state: StateFile = postcard::from_bytes(&bytes).map_err(|_| ())?;
+    if state.version != STATE_FILE_VERSION {
+        return Err(());
+    }
+    // A wall clock set back since the write counts as no time passed.
+    let elapsed = unix_ms(SystemTime::now()).saturating_sub(state.saved_at_ms);
+    SimEcu::restore(
+        state.ecu,
+        SystemClock::default(),
+        Duration::from_millis(elapsed),
+    )
+    .map(Some)
+    .map_err(|_| ())
+}
+
+/// Writes `ecu`'s state to `path`, through a temporary file renamed over it, so a process killed
+/// while writing leaves the previous state.
+fn save_ecu_state(path: &Path, ecu: &mut SimEcu) -> std::io::Result<()> {
+    let state = StateFile {
+        version: STATE_FILE_VERSION,
+        saved_at_ms: unix_ms(SystemTime::now()),
+        ecu: ecu.snapshot(),
+    };
+    let bytes = postcard::to_allocvec(&state).map_err(std::io::Error::other)?;
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    std::fs::write(&tmp, bytes)?;
+    // On Windows another process (a virus scanner, for one) can hold the new file open for a
+    // moment, and replacing it then fails; try again a few times before giving up.
+    let mut attempts = 0;
+    loop {
+        match std::fs::rename(&tmp, path) {
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied && attempts < 10 => {
+                attempts += 1;
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            result => return result,
+        }
+    }
+}
 
 /// The device ID the first `PassThruOpen` returns. The simulator has one device; it gets a new
 /// ID only when it is opened again after it was lost (`ERR_DEVICE_NOT_CONNECTED`).
@@ -248,6 +325,8 @@ struct Bus {
     control_dir: Option<PathBuf>,
     /// Battery voltage `READ_VBATT` reports, in millivolts.
     battery_mv: u32,
+    /// File the ECU's state is kept in across processes ([`ECU_STATE_ENV`]).
+    state_path: Option<PathBuf>,
 }
 
 static BUS: OnceLock<(Mutex<Bus>, Condvar)> = OnceLock::new();
@@ -267,6 +346,7 @@ fn bus() -> &'static (Mutex<Bus>, Condvar) {
                 programming_pin: None,
                 control_dir: std::env::var_os(CONTROL_DIR_ENV).map(PathBuf::from),
                 battery_mv: DEFAULT_BATTERY_MV,
+                state_path: std::env::var_os(ECU_STATE_ENV).map(PathBuf::from),
             }),
             Condvar::new(),
         )
@@ -362,13 +442,38 @@ impl Bus {
         notify();
     }
 
-    /// The simulated ECU, created with the configuration from `NGR_SIM_ECU_CONFIG` if the
-    /// process has none yet. `ERR_FAILED` if that configuration cannot be read.
+    /// The simulated ECU. If the process has none yet, it continues from the state file
+    /// ([`ECU_STATE_ENV`]) when there is one, and is otherwise created with the configuration
+    /// from `NGR_SIM_ECU_CONFIG`. `ERR_FAILED` if the state file or the configuration cannot be
+    /// read, or the new ECU's state cannot be written.
     fn ecu(&mut self) -> Result<&mut SimEcu, PassThruUlong> {
         if self.ecu.is_none() {
-            self.ecu = Some(SimEcu::new(load_ecu_config().ok_or(ERR_FAILED)?));
+            let restored = match &self.state_path {
+                Some(path) => load_ecu_state(path).map_err(|()| ERR_FAILED)?,
+                None => None,
+            };
+            let ecu = match restored {
+                Some(ecu) => ecu,
+                None => SimEcu::new(load_ecu_config().ok_or(ERR_FAILED)?),
+            };
+            self.ecu = Some(ecu);
+            if let Err(status) = self.save_ecu() {
+                // Not created after all: the next call tries again, and fails the same way
+                // until the state can be written.
+                self.ecu = None;
+                return Err(status);
+            }
         }
         Ok(self.ecu.as_mut().expect("created above"))
+    }
+
+    /// Writes the ECU's state to the state file, if there is one. `ERR_FAILED` if it cannot be
+    /// written; the ECU keeps its new state in this process either way.
+    fn save_ecu(&mut self) -> Result<(), PassThruUlong> {
+        match (&self.state_path, &mut self.ecu) {
+            (Some(path), Some(ecu)) => save_ecu_state(path, ecu).map_err(|_| ERR_FAILED),
+            _ => Ok(()),
+        }
     }
 
     /// Applies one control command.
@@ -399,7 +504,7 @@ impl Bus {
         let before = ecu.power_cycles();
         f(ecu);
         self.after_ecu_change(before);
-        Ok(())
+        self.save_ecu()
     }
 
     /// Applies the `*.json` command files in the control directory, in file-name order. Each
@@ -485,6 +590,9 @@ impl Bus {
         let exchange = ecu.exchange(addressing, payload);
         let power_cycle = ecu.power_cycles();
         self.after_ecu_change(before);
+        // A request the next process must know about fails if it cannot be recorded; its
+        // response is then not sent either.
+        self.save_ecu()?;
         let Some(bytes) = exchange.response.to_bytes() else {
             return Ok(());
         };
@@ -644,8 +752,8 @@ unsafe fn write_c_string(out: *mut c_char, text: &str) {
     }
 }
 
-/// Opens the simulated device and, on the first open of the process, powers up the ECU with the
-/// configuration from `NGR_SIM_ECU_CONFIG`.
+/// Opens the simulated device. If the process has no ECU yet, the ECU continues from the state
+/// file (`NGR_SIM_ECU_STATE`) or powers up with the configuration from `NGR_SIM_ECU_CONFIG`.
 ///
 /// # Safety
 /// `device_id` must be null or valid for a write.

@@ -229,6 +229,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-238](ADR-238-sim-vci-control-commands-and-device-loss.md) | sim-vci Control Commands and Device Loss | Accepted | `sim-vci` control export and directory, `ERR_DEVICE_NOT_CONNECTED` |
 | [ADR-239](ADR-239-sim-ecu-session-timer-and-injectable-clock.md) | sim-ecu Session Timer and Injectable Clock | Accepted | `sim-ecu` clock, tS3_Server, security delay |
 | [ADR-240](ADR-240-agent-worker-build-selection.md) | Agent Worker-Build Selection by Per-Build Library Resolution | Accepted | `agent` launch, `ngr-agent run` |
+| [ADR-241](ADR-241-sim-ecu-state-file.md) | Simulated ECU State Kept in a File Across Worker Processes | Accepted | `sim-ecu` snapshot, `sim-vci` `NGR_SIM_ECU_STATE` |
 
 ## Status Legend
 
@@ -270,13 +271,13 @@ ADR-052 (loopback-only binding this ADR's auth mechanism relies on), ADR-220 (`g
 ADR-108, ADR-227, ADR-232
 
 ### Development Tooling & CI
-ADR-109 (amended by ADR-113), ADR-113, ADR-119 (dual-implementation sync duty relaxed to same-PR by ADR-155), ADR-136 (publication consolidated by ADR-141), ADR-141 (item 6's atomicity boundary relaxed by ADR-155), ADR-142 (item 1's check-6(c) atomicity boundary relaxed to same-PR by ADR-155), ADR-144, ADR-145, ADR-149, ADR-154 (item 1's/Consequences' same-commit duty wording relaxed to same-PR by ADR-155), ADR-155, ADR-163, ADR-195, ADR-227, ADR-230, ADR-238
+ADR-109 (amended by ADR-113), ADR-113, ADR-119 (dual-implementation sync duty relaxed to same-PR by ADR-155), ADR-136 (publication consolidated by ADR-141), ADR-141 (item 6's atomicity boundary relaxed by ADR-155), ADR-142 (item 1's check-6(c) atomicity boundary relaxed to same-PR by ADR-155), ADR-144, ADR-145, ADR-149, ADR-154 (item 1's/Consequences' same-commit duty wording relaxed to same-PR by ADR-155), ADR-155, ADR-163, ADR-195, ADR-227, ADR-230, ADR-238, ADR-241
 
 ### Timestamps / Clock
 ADR-057 (amended by ADR-102), ADR-120, ADR-143, ADR-239
 
 ### Write Jobs & Resume
-ADR-229, ADR-233, ADR-235
+ADR-229, ADR-233, ADR-235, ADR-241
 
 ### Acquired Data & Monitoring
 ADR-236

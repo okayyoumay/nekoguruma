@@ -15,7 +15,13 @@ message)` takes the addressing mode. `message` is the A_Data starting with the S
 `SimResponse`: a positive response (response SID included), a negative response (`7F SID NRC`
 via `to_bytes()`), or no response. `exchange(addressing, message)` returns the same response
 together with the delay before it is sent (`EcuConfig::response_delay_ms` plus any injected
-delay); the simulator has no clock, so the VCI side (`sim-vci`) applies it.
+delay); the VCI side (`sim-vci`) applies it.
+
+The ECU's own timers (the session timeout and the security delay, below) run on a `Clock`.
+`SimEcu::new` uses real time (`SystemClock`); `SimEcu::with_clock(config, clock)` takes another,
+such as a `ManualClock` that moves only when a test calls `advance` (design 13.4, clock
+substitution). Timers are evaluated when the next request arrives, or when a test calls
+`check_timers()` before reading the state directly.
 
 General behaviour (clause 7.7):
 
@@ -44,8 +50,15 @@ General behaviour (clause 7.7):
 | 37 | RequestTransferExit | programming | no parameter record |
 | 3E | TesterPresent | all | 00 |
 
-Any other SID gets NRC 11. The session timeout (S3) is not simulated: a non-default session lasts
-until a session change, an ECU reset or `reconnect()`.
+Any other SID gets NRC 11.
+
+A non-default session times out after tS3_Server without a request (`EcuConfig::s3_server_ms`,
+5000 ms by default, the value ISO 14229-2 (2021) gives). The timer restarts with every request
+that reaches the ECU, whatever the service and whether it is supported, and runs from when the
+response goes out (after its delay), or from the request when there is no response; a request
+lost on the bus does not restart it. When it expires, the ECU falls back to the default session as
+for a change to it: security is relocked and a running download is interrupted. The default
+session has no timer. An ECU reset or `reconnect()` also ends a non-default session.
 
 Every DiagnosticSessionControl request relocks security, including a restart of the active
 session. A running download is interrupted (see below) by any session other than programming,
@@ -85,8 +98,10 @@ in Annex I with a fresh seed for every requestSeed (no static seed). Any Securit
 other than a successful requestSeed discards the pending seed (Annex I, transition 9): a seed
 answers exactly one sendKey, and a sendKey without a seed gets NRC 24.
 The third false key in a row returns NRC 36 and starts the delay timer; requestSeed then returns
-NRC 37 until `SimEcu::expire_security_delay()` is called (the simulator has no clock). A power
-cycle or ECU reset clears the false-attempt counter but not an active delay. With
+NRC 37 until the delay has run (`EcuConfig::security_delay_ms`, 10000 ms by default; the length is
+the vehicle manufacturer's choice) or a test calls `SimEcu::expire_security_delay()`.
+`security_delay_active()` reports whether it is running. A power cycle or ECU reset clears the
+false-attempt counter and starts an active delay again for its full length. With
 `EcuConfig::require_security_access` unset, secured operations do not check the lock state.
 
 ## Routines and download

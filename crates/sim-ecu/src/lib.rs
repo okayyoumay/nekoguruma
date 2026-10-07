@@ -9,6 +9,9 @@
 //! the seed/key algorithm, the session each service is available in) are listed in
 //! `crates/sim-ecu/docs/simulated-ecu.md`.
 
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
 use serde::{Deserialize, Serialize};
 
 mod services;
@@ -58,6 +61,14 @@ pub const MAX_RESPONSE_LENGTH: usize = 4095;
 /// False sendKey attempts that activate the security delay timer.
 pub const MAX_SECURITY_ATTEMPTS: u8 = 3;
 
+/// tS3_Server when `EcuConfig::s3_server_ms` is unset: the value ISO 14229-2 (2021) gives for
+/// how long a non-default session stays active without a request.
+pub const DEFAULT_S3_SERVER_MS: u32 = 5_000;
+
+/// Security delay when `EcuConfig::security_delay_ms` is unset. ISO 14229-1 leaves the length to
+/// the vehicle manufacturer.
+pub const DEFAULT_SECURITY_DELAY_MS: u32 = 10_000;
+
 /// Value the simulator XORs with the seed to form the expected key.
 pub const SECURITY_KEY_MASK: u32 = 0x5A5A_5A5A;
 
@@ -95,6 +106,59 @@ pub struct EcuConfig {
     /// DTCs stored in the ECU at power-up.
     #[serde(default)]
     pub dtcs: Vec<DtcRecord>,
+    /// tS3_Server in ms: how long a non-default session stays active without a request.
+    /// [`DEFAULT_S3_SERVER_MS`] when unset.
+    #[serde(default)]
+    pub s3_server_ms: Option<u32>,
+    /// How long the security delay timer runs, in ms. [`DEFAULT_SECURITY_DELAY_MS`] when unset.
+    #[serde(default)]
+    pub security_delay_ms: Option<u32>,
+}
+
+// ---------------------------------------------------------------- Clock
+
+/// The time source of the ECU's timers (design 13.4, clock substitution). [`SimEcu::new`] uses
+/// [`SystemClock`]; tests that need to control time use [`ManualClock`].
+pub trait Clock: Send {
+    /// Time elapsed since a fixed origin. Never goes backwards.
+    fn now(&self) -> Duration;
+}
+
+/// Real time, measured from when the clock was created.
+pub struct SystemClock {
+    origin: Instant,
+}
+
+impl Default for SystemClock {
+    fn default() -> Self {
+        Self {
+            origin: Instant::now(),
+        }
+    }
+}
+
+impl Clock for SystemClock {
+    fn now(&self) -> Duration {
+        self.origin.elapsed()
+    }
+}
+
+/// A clock that moves only when [`ManualClock::advance`] is called. Clones share the same time,
+/// so a test keeps one clone and hands another to [`SimEcu::with_clock`].
+#[derive(Clone, Default)]
+pub struct ManualClock(Arc<Mutex<Duration>>);
+
+impl ManualClock {
+    pub fn advance(&self, by: Duration) {
+        let mut now = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        *now = now.saturating_add(by);
+    }
+}
+
+impl Clock for ManualClock {
+    fn now(&self) -> Duration {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -192,7 +256,12 @@ pub struct SimEcu {
     seed_counter: u32,
     pending_seed: Option<u32>,
     failed_attempts: u8,
-    security_delay_active: bool,
+    /// When the running security delay ends, on [`Self::clock`]'s time line.
+    security_delay_until: Option<Duration>,
+    /// When the non-default session times out (tS3_Server), on [`Self::clock`]'s time line.
+    /// `None` in the default session.
+    s3_deadline: Option<Duration>,
+    clock: Box<dyn Clock>,
     download: Option<Download>,
     image: Vec<u8>,
     /// Set by `drop_at_block` and [`Fault::PowerLoss`]: the ECU answers nothing until
@@ -296,7 +365,13 @@ impl Exchange {
 type ServiceResult = Result<Option<Vec<u8>>, Nrc>;
 
 impl SimEcu {
+    /// An ECU whose timers run on real time ([`SystemClock`]).
     pub fn new(config: EcuConfig) -> Self {
+        Self::with_clock(config, SystemClock::default())
+    }
+
+    /// An ECU whose timers run on `clock`.
+    pub fn with_clock(config: EcuConfig, clock: impl Clock + 'static) -> Self {
         let dtcs = config.dtcs.clone();
         Self {
             config,
@@ -308,7 +383,9 @@ impl SimEcu {
             seed_counter: 0,
             pending_seed: None,
             failed_attempts: 0,
-            security_delay_active: false,
+            security_delay_until: None,
+            s3_deadline: None,
+            clock: Box::new(clock),
             download: None,
             image: Vec::new(),
             silent: false,
@@ -330,11 +407,57 @@ impl SimEcu {
         seed ^ SECURITY_KEY_MASK
     }
 
-    /// Ends the security delay timer started by too many false keys. The simulator has no clock
-    /// of its own; tests call this to stand for the delay running out.
+    /// Ends the security delay timer started by too many false keys at once, as if it had run
+    /// out.
     pub fn expire_security_delay(&mut self) {
-        self.security_delay_active = false;
+        self.security_delay_until = None;
         self.failed_attempts = 0;
+    }
+
+    /// Whether the security delay timer is running.
+    pub fn security_delay_active(&mut self) -> bool {
+        self.check_timers();
+        self.security_delay_until.is_some()
+    }
+
+    /// Applies the timers that have run out by now: a non-default session whose tS3_Server
+    /// expired falls back to the default session, and an expired security delay ends.
+    /// [`SimEcu::exchange`] does this before it handles a request; a test that reads the state
+    /// directly after advancing its clock calls it first.
+    pub fn check_timers(&mut self) {
+        let now = self.clock.now();
+        if self.s3_deadline.is_some_and(|deadline| now >= deadline) {
+            self.s3_deadline = None;
+            if self.session != Session::Default {
+                // The same as a change to the default session: security is relocked and a
+                // running download stops (clause 9.2.1).
+                self.lock_security();
+                self.interrupt_transfer();
+                self.session = Session::Default;
+            }
+        }
+        if self.security_delay_until.is_some_and(|until| now >= until) {
+            self.expire_security_delay();
+        }
+    }
+
+    /// Starts the security delay timer for its full length.
+    pub(crate) fn start_security_delay(&mut self) {
+        let delay = self
+            .config
+            .security_delay_ms
+            .unwrap_or(DEFAULT_SECURITY_DELAY_MS);
+        self.security_delay_until = Some(self.clock.now() + Duration::from_millis(delay.into()));
+    }
+
+    /// Restarts tS3_Server after a request was handled: it runs from when the response goes out
+    /// (`delay_ms` from now), or from now when there is none, and only in a non-default session
+    /// (ISO 14229-2 (2021), session timing).
+    fn restart_s3(&mut self, delay_ms: u32) {
+        self.s3_deadline = (self.session != Session::Default).then(|| {
+            let s3 = self.config.s3_server_ms.unwrap_or(DEFAULT_S3_SERVER_MS);
+            self.clock.now() + Duration::from_millis(u64::from(delay_ms) + u64::from(s3))
+        });
     }
 
     /// Data stored by TransferData since the last erase.
@@ -356,6 +479,7 @@ impl SimEcu {
     /// The simulator has no clock: the delay is for the VCI side to apply. It is
     /// `EcuConfig::response_delay_ms` plus any [`Fault::DelayResponse`] that fires on this request.
     pub fn exchange(&mut self, addressing: Addressing, message: &[u8]) -> Exchange {
+        self.check_timers();
         if self.silent {
             return Exchange::none();
         }
@@ -363,6 +487,14 @@ impl SimEcu {
             // The request never reaches the ECU.
             return Exchange::none();
         }
+        let exchange = self.handle(addressing, message);
+        // Any request that reaches the ECU restarts tS3_Server, supported or not.
+        self.restart_s3(exchange.delay_ms);
+        exchange
+    }
+
+    /// [`SimEcu::exchange`] for a request that has reached the ECU.
+    fn handle(&mut self, addressing: Addressing, message: &[u8]) -> Exchange {
         let mut delay_ms = self.config.response_delay_ms;
         while let Some(Fault::DelayResponse { ms }) =
             self.take_armed(|f| matches!(f, Fault::DelayResponse { .. }))
@@ -428,12 +560,16 @@ impl SimEcu {
 
     /// Session, security and transfer state after a power cycle or ECU reset.
     /// The false-attempt counter starts again at zero (Annex I, transition 1); an active
-    /// security delay keeps running, as if the delay were restarted on power-up.
+    /// security delay starts again for its full length, as on power-up.
     fn power_cycle(&mut self) {
         self.power_cycles += 1;
         self.session = Session::Default;
+        self.s3_deadline = None;
         self.lock_security();
         self.failed_attempts = 0;
+        if self.security_delay_until.is_some() {
+            self.start_security_delay();
+        }
         self.interrupt_transfer();
     }
 

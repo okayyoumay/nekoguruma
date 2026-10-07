@@ -12,6 +12,8 @@ below refer to SAE J2534-1 (v04.04).
   `sim_ecu::EcuConfig` read from the JSON file named by `NGR_SIM_ECU_CONFIG`, or with a built-in
   configuration (VIN `NGRSIMECU00000001`, part number `NGR-SIM-ECU`, software version `1.0.0`)
   when the variable is unset. An unreadable or invalid file makes the open fail with `ERR_FAILED`.
+  The ECU's timers run on real time, so a non-default session ends after tS3_Server (5 s unless
+  the configuration sets `s3_server_ms`) without a request, as on a vehicle.
 - The ECU lives as long as the process: `PassThruClose` and a new `PassThruOpen` keep its
   session and flash state, as a vehicle keeps its state while the tester disconnects. A process
   restart starts a fresh ECU.

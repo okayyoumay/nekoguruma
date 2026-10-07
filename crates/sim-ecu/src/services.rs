@@ -177,7 +177,7 @@ impl SimEcu {
             if message.len() != 2 {
                 return Err(Nrc::IncorrectMessageLengthOrInvalidFormat);
             }
-            if self.security_delay_active {
+            if self.security_delay_until.is_some() {
                 return Err(Nrc::RequiredTimeDelayNotExpired);
             }
             // An already unlocked level answers with an all-zero seed; a locked level never does.
@@ -207,7 +207,7 @@ impl SimEcu {
         if key != Self::key_for_seed(seed) {
             self.failed_attempts = self.failed_attempts.saturating_add(1);
             if self.failed_attempts >= MAX_SECURITY_ATTEMPTS {
-                self.security_delay_active = true;
+                self.start_security_delay();
                 return Err(Nrc::ExceededNumberOfAttempts);
             }
             return Err(Nrc::InvalidKey);

@@ -668,7 +668,7 @@ fn programming_voltage_follows_the_pin_rules() {
 #[test]
 fn ioctl_clears_filters_and_the_receive_buffer() {
     let f = fixture();
-    let clear = |id: u32| {
+    let clear = |id: u32| unsafe {
         PassThruIoctl(
             f.channel,
             id as PassThruUlong,
@@ -692,12 +692,14 @@ fn ioctl_clears_filters_and_the_receive_buffer() {
     assert_eq!(read(f.channel, 1, 100).0, STATUS_NOERROR);
 
     assert_eq!(
-        PassThruIoctl(
-            99,
-            ioctl::IOCTL_CLEAR_MSG_FILTERS as PassThruUlong,
-            ptr::null_mut(),
-            ptr::null_mut()
-        ),
+        unsafe {
+            PassThruIoctl(
+                99,
+                ioctl::IOCTL_CLEAR_MSG_FILTERS as PassThruUlong,
+                ptr::null_mut(),
+                ptr::null_mut(),
+            )
+        },
         ERR_INVALID_CHANNEL_ID
     );
 }
@@ -966,7 +968,7 @@ fn a_lost_device_stays_lost_until_closed_and_reopens_with_a_new_id() {
     assert_eq!(n, 0);
     assert_eq!(read(f.channel, 1, 0), (ERR_DEVICE_NOT_CONNECTED, vec![]));
     assert_eq!(
-        PassThruIoctl(f.channel, 0, ptr::null_mut(), ptr::null_mut()),
+        unsafe { PassThruIoctl(f.channel, 0, ptr::null_mut(), ptr::null_mut()) },
         ERR_DEVICE_NOT_CONNECTED
     );
     let mut device = 0;
@@ -1166,10 +1168,9 @@ fn every_call_but_get_last_error_fails_on_a_lost_device() {
                 api.as_mut_ptr(),
             )
         }),
-        (
-            "Ioctl",
-            PassThruIoctl(f.channel, 0, ptr::null_mut(), ptr::null_mut()),
-        ),
+        ("Ioctl", unsafe {
+            PassThruIoctl(f.channel, 0, ptr::null_mut(), ptr::null_mut())
+        }),
     ];
     for (name, status) in calls {
         assert_eq!(status, ERR_DEVICE_NOT_CONNECTED, "{name}");
@@ -1286,4 +1287,74 @@ fn a_control_file_that_cannot_be_claimed_holds_back_the_files_after_it() {
         read(f.channel, 1, 1000),
         (STATUS_NOERROR, vec![response(&[0x7E, 0x00])])
     );
+}
+
+// ---------------------------------------------------------------- Battery voltage
+
+/// `READ_VBATT` on `device`: the status and the voltage written.
+fn read_vbatt(device: PassThruUlong) -> (PassThruUlong, PassThruUlong) {
+    let mut millivolts: PassThruUlong = 0;
+    let status = unsafe {
+        PassThruIoctl(
+            device,
+            ioctl::IOCTL_READ_VBATT as PassThruUlong,
+            ptr::null_mut(),
+            (&mut millivolts as *mut PassThruUlong).cast(),
+        )
+    };
+    (status, millivolts)
+}
+
+#[test]
+fn read_vbatt_reports_the_configured_voltage() {
+    let _f = fixture();
+    assert_eq!(read_vbatt(DEVICE_ID), (STATUS_NOERROR, 12_000));
+    assert_eq!(
+        control(r#"{"command": "set_battery_voltage", "millivolts": 11500}"#),
+        STATUS_NOERROR
+    );
+    assert_eq!(read_vbatt(DEVICE_ID), (STATUS_NOERROR, 11_500));
+    // Rounded to a tenth of a volt (J2534-1 7.3.3).
+    assert_eq!(
+        control(r#"{"command": "set_battery_voltage", "millivolts": 9349}"#),
+        STATUS_NOERROR
+    );
+    assert_eq!(read_vbatt(DEVICE_ID), (STATUS_NOERROR, 9_300));
+    assert_eq!(
+        control(r#"{"command": "set_battery_voltage", "millivolts": 9350}"#),
+        STATUS_NOERROR
+    );
+    assert_eq!(read_vbatt(DEVICE_ID), (STATUS_NOERROR, 9_400));
+}
+
+#[test]
+fn read_vbatt_checks_the_device_and_the_output() {
+    let f = fixture();
+    // It takes the device ID, not a channel ID.
+    assert_eq!(read_vbatt(f.channel + 100).0, ERR_INVALID_DEVICE_ID);
+    assert_eq!(
+        unsafe {
+            PassThruIoctl(
+                DEVICE_ID,
+                ioctl::IOCTL_READ_VBATT as PassThruUlong,
+                ptr::null_mut(),
+                ptr::null_mut(),
+            )
+        },
+        ERR_NULL_PARAMETER
+    );
+    assert_eq!(PassThruClose(DEVICE_ID), STATUS_NOERROR);
+    assert_eq!(read_vbatt(DEVICE_ID).0, ERR_INVALID_DEVICE_ID);
+}
+
+#[test]
+fn set_battery_voltage_rejects_a_missing_or_negative_value() {
+    let _f = fixture();
+    for command in [
+        r#"{"command": "set_battery_voltage"}"#,
+        r#"{"command": "set_battery_voltage", "millivolts": -1}"#,
+        r#"{"command": "set_battery_voltage", "volts": 12}"#,
+    ] {
+        assert_eq!(control(command), ERR_FAILED, "{command}");
+    }
 }

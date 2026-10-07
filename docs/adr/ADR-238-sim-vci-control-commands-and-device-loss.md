@@ -19,7 +19,8 @@ the J2534 API, as it would on a vendor library. So a test needs a channel into a
 
 1. **Commands as JSON.** A control command is a JSON object tagged by `command`:
    `inject_fault` (with a `sim_ecu::Fault` in snake case, such as `"power_loss"` or
-   `{"delay_response": {"ms": 500}}`), `reconnect_ecu`, `disconnect_vci` and `connect_vci`.
+   `{"delay_response": {"ms": 500}}`), `reconnect_ecu`, `disconnect_vci`, `connect_vci` and
+   `set_battery_voltage` (the voltage `READ_VBATT` reports).
    Unknown commands and unknown fields, in the command or in the fault, are rejected.
 2. **Two ways in.** The extra export `NgrSimVciControl(const char *command)` applies one command,
    for a test that loads the library into its own process. It takes effect at once and leaves

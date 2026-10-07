@@ -18,7 +18,7 @@ Standards: `vehicle-comm-specs` holds SAE J2534-1 (v04.04), SAE J2534-2 (DEC2020
 | M4 Web UI and acquired data | Operators run jobs and view/edit acquired data in the browser; offline start works | UI framework, reference UI, `server` | none |
 | M6 Trust, approval and reprogramming | Signed packages and artifacts, approval levels, ECU reprogramming with preconditions | `shared-crypto`, `vendor-manifest`, `agent`, `server` | ISO 14229-1 clause 16 (held); SAE J3138 (not held) |
 | M5 Real-time monitoring | Monitoring at the 10 ms target, interval capture, multiple subscribers | `agent`, worker, `server`, UI | none |
-| M7 Standard formats and external API | ODX/PDX and OTX ingestion; SOVD / ExVe compatible endpoints | `diag-frontend`, `server` | ISO 22901-1 (ODX), ISO 17978 (SOVD) (held); ISO 13209 (OTX), ISO 20077/20078 (not held) |
+| M7 Standard formats and external API | ODX/PDX and OTX ingestion; SOVD / ExVe compatible endpoints; generic OBD package | `diag-frontend`, `server`; for generic OBD also `agent` (L2), worker L1 (functional requests), `diag-ir` and `sim-ecu` | ISO 22901-1 (ODX), ISO 17978 (SOVD) (held); ISO 13209 (OTX), ISO 20077/20078, SAE J1979 / J1979-2, ISO 15031-5, ISO 15765-4, ISO 27145 (not held) |
 | M8 Cloud deployment and field validation | Standard (cloud) deployment, scale measures for size S, validation with real VCIs | `server`, deployment, CI | UNECE R155/R156 as needed (free to obtain) |
 
 M5 and M6 do not depend on each other; M6 comes first (maintainer's decision, 2026-10-06). M7's ODX converter and SOVD endpoints can be developed in parallel with M5/M6; ingesting ODX-derived IR as extension packages waits on M6's package signing, and the OTX and ExVe parts wait on those standards.
@@ -114,12 +114,13 @@ M5 and M6 do not depend on each other; M6 comes first (maintainer's decision, 20
 
 ## M7 Standard formats and external API
 
-**Goal.** ODX/PDX and OTX as the primary vehicle-knowledge formats (R14), and SOVD / ExVe compatible external endpoints (R13, design 8.7). The ODX converter and SOVD endpoints can start now; ingesting ODX-derived IR as extension packages waits on M6's package signing (11.1); OTX and ExVe wait on ISO 13209 and ISO 20077/20078.
+**Goal.** ODX/PDX and OTX as the primary vehicle-knowledge formats (R14), and SOVD / ExVe compatible external endpoints (R13, design 8.7). The ODX converter and SOVD endpoints can start now; ingesting ODX-derived IR as extension packages waits on M6's package signing (11.1); OTX and ExVe wait on ISO 13209 and ISO 20077/20078. Generic OBD (SAE J1979, J1979-2, WWH-OBD) ships as a standard vehicle-knowledge package once those standards are held (ADR-237).
 
 **Exit criteria.**
 
 1. A sample PDX converts to the same IR shape as the M2 proprietary-format definition for the same ECU, and runs against `sim-ecu`.
 2. The SOVD resource mapping (L4) serves data reads for that ECU.
+3. The generic OBD package reads the supported data identifiers (PIDs for classic SAE J1979, DIDs for J1979-2 and ISO 27145), current data and stored DTCs against `sim-ecu`, for each generic OBD family whose standard is held.
 
 ## M8 Cloud deployment and field validation
 
@@ -134,5 +135,5 @@ M5 and M6 do not depend on each other; M6 comes first (maintainer's decision, 20
 
 These change the plan's scope or order; each is a design-17 item or a purchase.
 
-- Standards purchase: SAE J3138 before M6; ISO 13209 (OTX) and ISO 20077/20078 (ExVe) before M7's OTX and ExVe parts start. The M1 and M2 standards, ISO 22901-1 (ODX) and ISO 17978 (SOVD) are held.
+- Standards purchase: SAE J3138 before M6; ISO 13209 (OTX) and ISO 20077/20078 (ExVe) before M7's OTX and ExVe parts start; SAE J1979, J1979-2, ISO 15031-5, ISO 15765-4 and ISO 27145 before M7's generic OBD package. The M1 and M2 standards, ISO 22901-1 (ODX) and ISO 17978 (SOVD) are held.
 - Design 17 P5 (non-functional targets) before M8.

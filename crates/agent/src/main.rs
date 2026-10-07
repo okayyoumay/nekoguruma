@@ -258,8 +258,6 @@ mod tests {
                 locals: vec![Some(Value::F64(f64::MAX))],
             }],
             steps: 0,
-            checkpoint: None,
-            resume_count: 0,
         };
         assert!(!holds_non_finite_float(&finite));
 

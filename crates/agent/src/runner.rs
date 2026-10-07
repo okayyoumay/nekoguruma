@@ -47,6 +47,8 @@ pub enum JobError {
         #[source]
         source: VmError,
     },
+    #[error("the program is refused: {0}")]
+    Program(#[from] diag_ir::ProgramError),
     #[error("primitive failed at {pc}: {source}")]
     Host {
         pc: u32,
@@ -70,14 +72,16 @@ pub enum JobError {
 }
 
 /// The checks [`run_program`] makes before it touches the worker: the program's schema version and
-/// size must suit this VM (`Vm::check_state`), and the policy must allow every request in it.
-/// A caller can make them before it launches a worker for the job. The instructions themselves
-/// are not validated: a bad operand, such as a missing constant, fails when the VM reaches it.
+/// size must suit this VM (`Vm::check_state`), its restart declaration must hold
+/// (`Program::validate`), and the policy must allow every request in it.
+/// A caller can make them before it launches a worker for the job. Operands are not checked
+/// exhaustively: a bad one, such as a missing constant, fails when the VM reaches it.
 pub fn check_program(program: &Program) -> Result<(), JobError> {
     // A program this VM cannot run must not reach the bus.
     Vm::new(program)
         .check_state(program)
         .map_err(|source| JobError::Vm { pc: 0, source })?;
+    program.validate()?;
     policy::check_program(program).map_err(|(pc, source)| JobError::Refused { pc, source })
 }
 
@@ -262,6 +266,9 @@ mod tests {
             constants: vec![vec![0x01]],
             sections: Vec::new(),
             source_map: Vec::new(),
+            identity: Default::default(),
+            preconditions: Default::default(),
+            flash: Vec::new(),
         }
     }
 
@@ -280,6 +287,92 @@ mod tests {
             Op::PushBytes(0),
             Op::ServiceRequest { service: 0x10 },
         ]
+    }
+
+    #[test]
+    fn a_program_with_an_invalid_declaration_is_refused() {
+        let mut bad = program(two_requests());
+        bad.flash.push(diag_ir::FlashRecovery {
+            flash_session: 1,
+            stage: 1,
+            max_resumes: 1,
+            recovery_required: diag_ir::RecoveryRequired::Never,
+            boundaries: diag_ir::RecoveryBoundaries {
+                entry_pc: 0,
+                erase_pc: 3,
+                transfer_exit_pc: 2,
+                post_transfer_end_pc: 4,
+            },
+            timing: diag_ir::RecoveryTiming {
+                session_timeout_millis: 5000,
+                teardown_margin_millis: 0,
+                ecu_startup_millis: 0,
+                confirmation_window_millis: 0,
+            },
+            version_read_retries: 0,
+            no_application: None,
+        });
+        assert!(matches!(
+            check_program(&bad),
+            Err(JobError::Program(
+                diag_ir::ProgramError::BoundaryOutOfOrder { flash_session: 1 }
+            ))
+        ));
+        assert!(check_program(&program(Vec::new())).is_ok());
+    }
+
+    #[test]
+    fn a_restartable_plan_with_an_unmapped_precondition_is_refused() {
+        let source = diag_ir::Source::EcuService {
+            service_id: 1,
+            field_id: 1,
+        };
+        let mut bad = program(vec![
+            Op::Pop,
+            Op::RoutineControl { routine: 1, sub: 1 },
+            Op::ServiceRequest { service: 0x34 },
+            Op::ServiceRequest { service: 0x37 },
+            Op::Pop,
+        ]);
+        bad.identity = diag_ir::IdentitySources {
+            vin: Some(source),
+            hardware_part_number: Some(source),
+            software_version: Some(source),
+        };
+        bad.preconditions.engine = Some(diag_ir::Precondition {
+            satisfied: diag_ir::Satisfied { lower: 0, upper: 0 },
+            default_session: Some(source),
+            programming_session: None,
+        });
+        bad.flash.push(diag_ir::FlashRecovery {
+            flash_session: 1,
+            stage: 1,
+            max_resumes: 1,
+            recovery_required: diag_ir::RecoveryRequired::Never,
+            boundaries: diag_ir::RecoveryBoundaries {
+                entry_pc: 0,
+                erase_pc: 1,
+                transfer_exit_pc: 3,
+                post_transfer_end_pc: 5,
+            },
+            timing: diag_ir::RecoveryTiming {
+                session_timeout_millis: 5000,
+                teardown_margin_millis: 0,
+                ecu_startup_millis: 0,
+                confirmation_window_millis: 0,
+            },
+            version_read_retries: 0,
+            no_application: None,
+        });
+        assert!(matches!(
+            check_program(&bad),
+            Err(JobError::Program(
+                diag_ir::ProgramError::UnmappedPrecondition {
+                    kind: diag_ir::PreconditionKind::Engine,
+                    session: diag_ir::SessionKind::Programming,
+                }
+            ))
+        ));
     }
 
     #[test]

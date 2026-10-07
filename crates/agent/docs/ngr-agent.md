@@ -23,7 +23,8 @@ command line rather than from the program.
 Steps (`agent::check_program`, `agent::launch::launch_j2534_worker`, then `agent::run_program`):
 
 1. Read the program and check it (`agent::check_program`): a program whose schema version or
-   size this VM does not accept, or one with a request outside the read-only policy, fails here,
+   size this VM does not accept, one whose restart declaration `Program::validate` refuses
+   (ADR-245), or one with a request outside the read-only policy, fails here,
    before any worker starts. A bad operand, such as a missing constant, fails only when the VM
    reaches it, after the worker has started.
 2. Resolve the VCI name the way each worker build would resolve it on its side

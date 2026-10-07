@@ -37,13 +37,13 @@ vehicle model definitions and separates display concerns. Localization does not 
 `ComParam` holds only values; the mapping to `PassThruConnect` flags and `PassThruIoctl` lives
 on the worker side (8.5). Differences between the D-PDU API and J2534 are kept out of the IR.
 
-**Hold flash preconditions as data**
-Voltage range, ignition and vehicle speed conditions are declared in `FlashSession`. The runtime
-verifies them before execution and does not execute if they are not met (8.9).
-
-**recovery_required_from_step**
-Declares from which step onward "an interruption requires on-site intervention". The default is from the start of erase onward.
-This is the source for the section attributes (8.10.1).
+**Restart declaration in the procedure part**
+`FlashSession` holds only the flash description (steps and segments). The preconditions (voltage,
+external supply, ignition, engine, vehicle speed) with their sources and satisfying values, the
+identity sources, and each flash session's recovery plan (boundaries in the bytecode, the point
+from which an interruption requires on-site intervention, timing, retry and resume limits) are
+procedure-part data in `Program` (`src/recovery.rs`), checked by `Program::validate` when a
+program is loaded (8.9, 8.10.1; ADR-245). A plan refers to its `FlashSession` by id.
 
 ## Generation
 

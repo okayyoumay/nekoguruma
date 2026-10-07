@@ -1,7 +1,7 @@
 # ADR-233: diag-ir VM Execution Semantics
 
 **Date:** 2026-10-06
-**Status:** Accepted
+**Status:** Accepted (item 3's `VmState::checkpoint` and `resume_count` removed by ADR-245)
 **Affects:** `diag-ir` (`src/lib.rs`: `Vm::step`, `VmState`, `DiagHost`, `StepOutcome`, `VmError`), `docs/system-architecture.md` 8.2.4
 
 ## Context

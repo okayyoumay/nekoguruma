@@ -75,6 +75,9 @@ fn program() -> Program {
         constants: vec![vec![0xF1, 0x90], vec![0x12, 0x34]],
         sections: Vec::new(),
         source_map: Vec::new(),
+        identity: Default::default(),
+        preconditions: Default::default(),
+        flash: Vec::new(),
     }
 }
 

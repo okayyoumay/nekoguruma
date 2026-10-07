@@ -359,14 +359,16 @@ table FlashSession {
   short_name: string;
   steps: [FlashStep];
   segments: [FlashSegment];
-  // Preconditions (8.9). Not executed if they are not met
-  min_voltage_mv: uint32 = 0;
-  max_voltage_mv: uint32 = 0;
-  require_ignition_on: bool = true;
-  require_engine_off: bool = true;
-  require_vehicle_stopped: bool = true;
-  // Whether an interruption in this range requires on-site intervention (8.10.1)
-  recovery_required_from_step: uint8 = 2; // default: from the start of erase onward
+  // The recovery plan, the preconditions (8.9) and the sources they are read from are
+  // procedure-part data (Program.flash, Program.preconditions in diag-ir), referenced by this id
+  // (ADR-245). The fields below are no longer read; they stay, deprecated, so the slots of the
+  // fields that follow them in encoded data keep their place.
+  min_voltage_mv: uint32 = 0 (deprecated);
+  max_voltage_mv: uint32 = 0 (deprecated);
+  require_ignition_on: bool = true (deprecated);
+  require_engine_off: bool = true (deprecated);
+  require_vehicle_stopped: bool = true (deprecated);
+  recovery_required_from_step: uint8 = 2 (deprecated);
 }
 
 // ---------------------------------------------------------------- ECU variants

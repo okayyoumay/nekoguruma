@@ -95,6 +95,9 @@ Ethernet-based diagnostic transport (ISO 13400). Supported by D-PDU API but not 
 
 ---
 
+**Flash recovery plan** (IR)  
+The procedure part's declaration of how an interrupted flash session restarts (`diag_ir::FlashRecovery`, ADR-245): the flash session it covers, the journal stage and its resume limit, the **recovery boundaries**, the point from which an interruption requires on-site intervention (or none), the session timeout, teardown margin, ECU startup time and confirmation window, the version-read retry limit and the response that means no application is present. `Program::validate` checks it at load (ADR-229, ADR-245).
+
 ## E–G
 
 **ECU** — Electronic Control Unit  
@@ -294,6 +297,12 @@ The ISO 15765-2 (ISO-TP) flow-control parameter that tells the sender the minimu
 A ComParam data type whose value is an array of same-sized struct entries, the layout selected by a `ComParamStructType` discriminant (`T_PDU_CPST`). Three struct types are ISO 22900-2 standard (`PDU_CPST_SESSION_TIMING`/`PDU_CPST_ACCESS_TIMING`/`PDU_CPST_TLS_VERSION_AND_CIPHER`, values `0x1`-`0x3`); any other value is vendor/tool-specific, with no spec-defined layout. `iso22900-service` maps the three standard types 1:1 onto the gRPC proto's typed `ParamStructfield` list variants (`session_timing`/`access_timing`/`tls_version_and_cipher`), using `size_of` of the corresponding native struct as the entry size. A vendor struct type instead uses `ParamStructfield.vendor_specific` (`ParamVendorSpecificStruct`): `type_url` carries the `ComParamStructType` discriminant as `"pdu-cpst:0x<8 lowercase hex digits>"`, and `value` is the vendor's native struct-array bytes verbatim, since the D-PDU API gives `iso22900-service` no metadata to reinterpret them. Because a native `PDUGetComParam` call for a vendor struct type returns only an entry count, not the entry byte-size, `GetComParam`/`GetUniqueRespIdTable` resolve `size_of_entry` from a per-library `vendor_struct_types` table in `config.toml` alone (see `vci-service-config`'s `find_vendor_struct_type_size`), failing `FAILED_PRECONDITION` if unconfigured — an unconfigured vendor struct type's read fails loudly by design, never fabricating a size. `SetComParam`/`SetUniqueRespIdTable` consult the identical config for a non-empty vendor STRUCTFIELD write, requiring the declared `size_of_entry` to match exactly (`INVALID_ARGUMENT` otherwise); config is the sole source for both directions, since a successful native write never validates the caller's declared size against the connected library's real layout, so an earlier process-lifetime write cache was removed (Codex-review-found local heap-disclosure fix, ADR-218 amendment). See ADR-218.
 
 ---
+
+**Recovery boundary** (IR)  
+One of a **flash recovery plan**'s four positions in the bytecode: where the replayable pre-erase steps begin, the erase (or RequestDownload when there is no erase) that the transfer-start marker precedes, the RequestTransferExit that its marker precedes, and the end of the post-transfer steps, where they are journaled as complete (ADR-245).
+
+**Runtime input** (IR)  
+A state the agent or the VCI reports rather than an ECU service: supply voltage, external supply connected, ignition, engine running, vehicle speed. A precondition's source in the procedure part names either a runtime input or an ECU service field; an identity source is always an ECU service field (`diag_ir::Source`, ADR-245).
 
 ## T–U
 

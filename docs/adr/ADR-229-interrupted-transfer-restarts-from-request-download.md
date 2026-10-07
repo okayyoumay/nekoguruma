@@ -1,7 +1,7 @@
 # ADR-229: Interrupted Transfers Restart from RequestDownload; Write Procedures Are a Reference Implementation
 
 **Date:** 2026-10-05
-**Status:** Accepted
+**Status:** Accepted (item 1's `recovery_required_from_step` replaced by ADR-245's recovery-required point; the fields the Consequences list as missing are declared as ADR-245 describes)
 **Affects:** `docs/system-architecture.md` (8.2.5, 16.1), `crates/agent` (write-job journal), `crates/sim-ecu` (flash state), `crates/diag-ir` (resume model)
 
 ## Context

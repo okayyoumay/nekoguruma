@@ -40,6 +40,9 @@ fn write_program(dir: &Path, code: Vec<Op>) -> PathBuf {
         constants: vec![vec![0xF1, 0x90]],
         sections: Vec::new(),
         source_map: Vec::new(),
+        identity: Default::default(),
+        preconditions: Default::default(),
+        flash: Vec::new(),
     };
     let path = dir.join("program.json");
     std::fs::write(

@@ -120,6 +120,9 @@ fn prog(code: Vec<Op>, constants: Vec<Vec<u8>>) -> Program {
         constants,
         sections: Vec::new(),
         source_map: Vec::new(),
+        identity: Default::default(),
+        preconditions: Default::default(),
+        flash: Vec::new(),
     }
 }
 
@@ -1161,14 +1164,6 @@ fn unusual_values_round_trip() {
             locals: vec![Some(Value::F64(f64::INFINITY)), None],
         }],
         steps: u64::MAX - 1,
-        checkpoint: Some(Checkpoint {
-            pc: 1,
-            section: 0,
-            vin: Some("VIN".into()),
-            artifact_digest: None,
-            at: "2026-10-06T00:00:00Z".into(),
-        }),
-        resume_count: 2,
     };
     let bytes = postcard::to_allocvec(&state).unwrap();
     let restored: VmState = postcard::from_bytes(&bytes).unwrap();
@@ -1436,4 +1431,1082 @@ fn primitives_run_at_the_stack_limit() {
         assert_eq!(host.calls.len() + host.logs.len(), 1, "{op:?}");
         assert!(vm.state.stack.len() <= MAX_STACK, "{op:?}");
     }
+}
+
+// ---------------------------------------------------------------- Restart declaration (ADR-245)
+
+/// The encodings changed in schema 2; a program or state of version 1 must be refused.
+#[test]
+fn schema_version_one_is_refused() {
+    let mut old = prog(vec![i(1)], Vec::new());
+    old.schema_version = 1;
+    assert!(matches!(
+        Vm::new(&old).check_state(&old),
+        Err(VmError::SchemaMismatch { program: 1, .. })
+    ));
+    let current = prog(vec![i(1)], Vec::new());
+    let mut state = Vm::new(&current).state;
+    state.schema_version = 1;
+    assert!(matches!(
+        Vm::resume(state).check_state(&current),
+        Err(VmError::StateSchemaMismatch { state: 1, .. })
+    ));
+}
+
+const SVC: Source = Source::EcuService {
+    service_id: 1,
+    field_id: 1,
+};
+
+fn precondition(default: Option<Source>, programming: Option<Source>) -> Precondition {
+    Precondition {
+        satisfied: Satisfied { lower: 0, upper: 0 },
+        default_session: default,
+        programming_session: programming,
+    }
+}
+
+fn plan(flash_session: u32, stage: u32, entry: u32) -> FlashRecovery {
+    FlashRecovery {
+        flash_session,
+        stage,
+        max_resumes: 3,
+        recovery_required: RecoveryRequired::Never,
+        boundaries: RecoveryBoundaries {
+            entry_pc: entry,
+            erase_pc: entry + 1,
+            transfer_exit_pc: entry + 3,
+            post_transfer_end_pc: entry + 5,
+        },
+        timing: RecoveryTiming {
+            session_timeout_millis: 5000,
+            teardown_margin_millis: 500,
+            ecu_startup_millis: 2000,
+            confirmation_window_millis: 10_000,
+        },
+        version_read_retries: 2,
+        no_application: Some(NoApplication::Nrc(0x22)),
+    }
+}
+
+/// Ten instructions; the erase request at 1 (and 6, where a second plan would start) and the
+/// transfer exit at 3, no jumps.
+fn recovery_code() -> Vec<Op> {
+    let mut code = vec![Op::Pop; 10];
+    for pc in [1, 6] {
+        code[pc] = Op::RoutineControl { routine: 1, sub: 1 };
+    }
+    code[2] = Op::ServiceRequest { service: 0x34 };
+    code[3] = Op::ServiceRequest { service: 0x37 };
+    code
+}
+
+fn recovery_program() -> Program {
+    let mut program = prog(recovery_code(), Vec::new());
+    program.identity = IdentitySources {
+        vin: Some(SVC),
+        hardware_part_number: Some(SVC),
+        software_version: Some(SVC),
+    };
+    program.flash.push(plan(1, 1, 0));
+    program
+}
+
+fn mutate_plan(f: impl FnOnce(&mut FlashRecovery)) -> Program {
+    let mut program = recovery_program();
+    f(&mut program.flash[0]);
+    program
+}
+
+#[test]
+fn a_program_without_a_declaration_is_valid() {
+    assert_eq!(prog(vec![Op::Pop; 4], Vec::new()).validate(), Ok(()));
+    assert_eq!(recovery_program().validate(), Ok(()));
+}
+
+/// The done-when case: a plan that allows a restart needs every declared precondition mapped
+/// for both sessions; a plan that does not allow one needs none of that.
+#[test]
+fn a_restartable_plan_needs_every_precondition_mapped_for_both_sessions() {
+    let mut program = recovery_program();
+    program.preconditions.engine = Some(precondition(Some(SVC), None));
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::UnmappedPrecondition {
+            kind: PreconditionKind::Engine,
+            session: SessionKind::Programming,
+        })
+    );
+    program.preconditions.engine = Some(precondition(Some(SVC), Some(SVC)));
+    assert_eq!(program.validate(), Ok(()));
+
+    // Intervention from the erase on: no restart is allowed, so the mapping is not asked for.
+    let mut no_restart = recovery_program();
+    no_restart.preconditions.engine = Some(precondition(Some(SVC), None));
+    no_restart.flash[0].recovery_required = RecoveryRequired::FromPc(1);
+    assert!(!no_restart.flash[0].allows_restart());
+    assert_eq!(no_restart.validate(), Ok(()));
+
+    // From the transfer exit on: restart before it is allowed, so it is refused again.
+    no_restart.flash[0].recovery_required = RecoveryRequired::FromPc(3);
+    assert!(no_restart.flash[0].allows_restart());
+    assert!(matches!(
+        no_restart.validate(),
+        Err(ProgramError::UnmappedPrecondition { .. })
+    ));
+}
+
+#[test]
+fn boundaries_must_be_in_order_inside_the_code() {
+    for edit in [
+        (|b: &mut RecoveryBoundaries| b.entry_pc = 2) as fn(&mut RecoveryBoundaries),
+        |b| b.erase_pc = b.transfer_exit_pc,
+        |b| b.transfer_exit_pc = b.post_transfer_end_pc,
+        |b| b.post_transfer_end_pc = 11,
+    ] {
+        let program = mutate_plan(|p| edit(&mut p.boundaries));
+        assert_eq!(
+            program.validate(),
+            Err(ProgramError::BoundaryOutOfOrder { flash_session: 1 })
+        );
+    }
+}
+
+#[test]
+fn erase_and_transfer_exit_must_be_the_right_requests() {
+    for (pc, op) in [
+        (1, Op::Pop),
+        (1, Op::ServiceRequest { service: 0x31 }),
+        (3, Op::Pop),
+        (3, Op::RoutineControl { routine: 1, sub: 1 }),
+        (3, Op::ServiceRequest { service: 0x36 }),
+    ] {
+        let mut program = recovery_program();
+        program.code[pc as usize] = op;
+        assert_eq!(
+            program.validate(),
+            Err(ProgramError::WrongBoundaryInstruction {
+                flash_session: 1,
+                pc
+            })
+        );
+    }
+    // The download request starts a plan that does not erase.
+    let mut program = recovery_program();
+    program.code[1] = Op::ServiceRequest { service: 0x34 };
+    program.code[2] = Op::Pop;
+    assert_eq!(program.validate(), Ok(()));
+}
+
+#[test]
+fn a_plan_needs_a_request_download() {
+    // A RoutineControl erase with no RequestDownload before the exit.
+    let mut program = recovery_program();
+    program.code[2] = Op::Pop;
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::MissingRequestDownload { flash_session: 1 })
+    );
+    program.code[2] = Op::ServiceRequest { service: 0x34 };
+    assert_eq!(program.validate(), Ok(()));
+    // An erase that is itself the RequestDownload is enough.
+    program.code[1] = Op::ServiceRequest { service: 0x34 };
+    program.code[2] = Op::Pop;
+    assert_eq!(program.validate(), Ok(()));
+}
+
+#[test]
+fn download_instructions_belong_to_a_transfer_range() {
+    for op in [
+        Op::ServiceRequest { service: 0x34 },
+        Op::ServiceRequest { service: 0x36 },
+        Op::ServiceRequest { service: 0x37 },
+        Op::FlashTransfer { block: 0 },
+    ] {
+        // No plan at all.
+        let program = prog(vec![op.clone()], Vec::new());
+        assert_eq!(
+            program.validate(),
+            Err(ProgramError::DownloadOutsidePlan { pc: 0 })
+        );
+        // After the plan's transfer exit.
+        let mut program = recovery_program();
+        program.code[4] = op.clone();
+        assert_eq!(
+            program.validate(),
+            Err(ProgramError::DownloadOutsidePlan { pc: 4 })
+        );
+        // Between the RequestDownload and the transfer exit (moved to 4), where only the
+        // declared exit may be a RequestTransferExit and no second RequestDownload may sit.
+        let mut program = recovery_program();
+        program.code[4] = Op::ServiceRequest { service: 0x37 };
+        program.code[3] = op.clone();
+        program.flash[0].boundaries.transfer_exit_pc = 4;
+        program.flash[0].boundaries.post_transfer_end_pc = 5;
+        let undeclared = matches!(
+            op,
+            Op::ServiceRequest {
+                service: 0x34 | 0x37
+            }
+        );
+        if undeclared {
+            assert_eq!(
+                program.validate(),
+                Err(ProgramError::UndeclaredTransferBoundary {
+                    flash_session: 1,
+                    pc: 3
+                })
+            );
+        } else {
+            assert_eq!(program.validate(), Ok(()));
+        }
+    }
+}
+
+/// The journal's markers guard only the declared boundaries, so a plan holds one
+/// RequestDownload and one RequestTransferExit.
+#[test]
+fn a_plan_holds_one_request_download_and_one_transfer_exit() {
+    // A second RequestDownload after the one that follows the erase.
+    let mut program = recovery_program();
+    program.code[2] = Op::ServiceRequest { service: 0x34 };
+    assert_eq!(program.validate(), Ok(()));
+    program.code[1] = Op::ServiceRequest { service: 0x34 };
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::UndeclaredTransferBoundary {
+            flash_session: 1,
+            pc: 2
+        })
+    );
+    // A RequestTransferExit before the declared one.
+    let mut program = recovery_program();
+    program.code[2] = Op::ServiceRequest { service: 0x37 };
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::UndeclaredTransferBoundary {
+            flash_session: 1,
+            pc: 2
+        })
+    );
+}
+
+/// A reversed or out-of-code section would read as empty in the overlap checks.
+#[test]
+fn sections_must_lie_in_the_code_in_order() {
+    for (start_pc, end_pc) in [(3, 2), (0, 11)] {
+        let mut program = recovery_program();
+        program.sections.push(Section {
+            start_pc,
+            end_pc,
+            interruptible: Interruptible::RecoveryRequired,
+            idempotency: Idempotency::Safe,
+            expected_millis: 0,
+        });
+        assert_eq!(
+            program.validate(),
+            Err(ProgramError::InvalidSection { section: 0 }),
+            "{start_pc}..{end_pc}"
+        );
+    }
+}
+
+#[test]
+fn an_empty_section_is_invalid() {
+    let mut program = recovery_program();
+    program.sections.push(Section {
+        interruptible: Interruptible::Yes,
+        ..recovery_section(2, 2)
+    });
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::InvalidSection { section: 0 })
+    );
+}
+
+/// Every declared precondition is checked before the procedure starts, so it needs a
+/// default-session source even when no plan allows a restart.
+#[test]
+fn a_declared_precondition_needs_a_default_session_source() {
+    let mut program = prog(vec![Op::Pop], Vec::new());
+    program.preconditions.engine = Some(precondition(None, Some(SVC)));
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::UnmappedPrecondition {
+            kind: PreconditionKind::Engine,
+            session: SessionKind::Default
+        })
+    );
+    program.preconditions.engine = Some(precondition(Some(SVC), None));
+    assert_eq!(program.validate(), Ok(()));
+}
+
+/// The instructions a second plan at entry 5 needs: RoutineControl erase at 6 (already there),
+/// RequestDownload at 7, transfer exit at 8.
+fn second_plan_ops(program: &mut Program) {
+    program.code[7] = Op::ServiceRequest { service: 0x34 };
+    program.code[8] = Op::ServiceRequest { service: 0x37 };
+}
+
+#[test]
+fn plans_must_be_distinct_and_apart() {
+    let mut program = recovery_program();
+    second_plan_ops(&mut program);
+    program.flash.push(plan(1, 2, 5));
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::DuplicateFlashSession(1))
+    );
+
+    let mut program = recovery_program();
+    second_plan_ops(&mut program);
+    program.flash.push(plan(2, 1, 5));
+    assert_eq!(program.validate(), Err(ProgramError::DuplicateStage(1)));
+
+    let mut program = recovery_program();
+    program.code[5] = Op::RoutineControl { routine: 1, sub: 1 };
+    program.code[6] = Op::ServiceRequest { service: 0x34 };
+    program.code[7] = Op::ServiceRequest { service: 0x37 };
+    program.flash.push(plan(2, 2, 4));
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::OverlappingFlashRecoveries { a: 1, b: 2 })
+    );
+
+    // Adjacent ranges do not overlap.
+    let mut program = recovery_program();
+    second_plan_ops(&mut program);
+    program.flash.push(plan(2, 2, 5));
+    assert_eq!(program.validate(), Ok(()));
+}
+
+#[test]
+fn the_recovery_position_must_lie_in_the_plan() {
+    // Before the entry, at the exclusive end and past it.
+    for pc in [0, 5, 6] {
+        let mut program = recovery_program();
+        if pc == 0 {
+            program.flash[0].boundaries.entry_pc = 1;
+        }
+        program.flash[0].recovery_required = RecoveryRequired::FromPc(pc);
+        assert_eq!(
+            program.validate(),
+            Err(ProgramError::RecoveryRequiredOutOfRange {
+                flash_session: 1,
+                pc
+            })
+        );
+    }
+    for pc in [0, 4] {
+        let mut program = recovery_program();
+        program.flash[0].recovery_required = RecoveryRequired::FromPc(pc);
+        assert_eq!(program.validate(), Ok(()));
+    }
+}
+
+fn recovery_section(start_pc: u32, end_pc: u32) -> Section {
+    Section {
+        start_pc,
+        end_pc,
+        interruptible: Interruptible::RecoveryRequired,
+        idempotency: Idempotency::Unsafe,
+        expected_millis: 0,
+    }
+}
+
+#[test]
+fn a_recovery_section_must_not_lie_in_the_restartable_range() {
+    // Never: the whole plan is restartable.
+    let mut program = recovery_program();
+    program.sections.push(recovery_section(4, 5));
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::ContradictoryInterruptibility {
+            flash_session: 1,
+            section: 0
+        })
+    );
+    // FromPc(3): a section from 3 on is consistent, one before it is not.
+    let mut program = recovery_program();
+    program.flash[0].recovery_required = RecoveryRequired::FromPc(3);
+    program.sections.push(recovery_section(3, 5));
+    assert_eq!(program.validate(), Ok(()));
+    program.sections.push(recovery_section(2, 4));
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::ContradictoryInterruptibility {
+            flash_session: 1,
+            section: 1
+        })
+    );
+    // Other interruptibility and sections outside the plan are fine.
+    let mut program = recovery_program();
+    program.sections.push(Section {
+        interruptible: Interruptible::No,
+        idempotency: Idempotency::Safe,
+        ..recovery_section(1, 5)
+    });
+    program.sections.push(recovery_section(7, 9));
+    assert_eq!(program.validate(), Ok(()));
+}
+
+/// A plan at 0..10 (erase 1, transfer exit 3, end 5 for `recovery_program`); `edit` places the
+/// instructions under test.
+fn flow_program(edit: impl FnOnce(&mut Vec<Op>)) -> Program {
+    let mut program = recovery_program();
+    program.code.resize(12, Op::Pop);
+    edit(&mut program.code);
+    program
+}
+
+fn flow_error(program: &Program, pc: u32) -> Option<ProgramError> {
+    match program.validate() {
+        Err(
+            e @ (ProgramError::JumpOutOfRecovery { pc: p, .. }
+            | ProgramError::ControlFlowIntoPlan { pc: p, .. }
+            | ProgramError::CallOrReturnInPlan { pc: p, .. }
+            | ProgramError::BackwardJumpAcrossRecovery { pc: p, .. }),
+        ) if p == pc => Some(e),
+        _ => None,
+    }
+}
+
+#[test]
+fn a_plan_contains_no_call_or_return() {
+    for op in [Op::Call(9), Op::Ret] {
+        let program = flow_program(|c| c[4] = op.clone());
+        assert_eq!(
+            program.validate(),
+            Err(ProgramError::CallOrReturnInPlan {
+                flash_session: 1,
+                pc: 4
+            })
+        );
+        // Outside the plan they are fine.
+        let program = flow_program(|c| c[7] = op.clone());
+        assert_eq!(program.validate(), Ok(()));
+    }
+}
+
+#[test]
+fn a_plan_is_entered_only_at_its_entry() {
+    // From outside, a jump into the middle is refused; the entry and the end are fine.
+    for target in [1, 3, 4] {
+        for op in [Op::Jump(target), Op::JumpIfFalse(target)] {
+            let program = flow_program(|c| c[7] = op.clone());
+            assert_eq!(
+                program.validate(),
+                Err(ProgramError::ControlFlowIntoPlan {
+                    flash_session: 1,
+                    pc: 7
+                })
+            );
+        }
+    }
+    for target in [0, 5, 6, 11] {
+        let program = flow_program(|c| c[7] = Op::Jump(target));
+        assert_eq!(program.validate(), Ok(()));
+    }
+    // A call into the plan is refused, entry included: the plan is not a subroutine.
+    for target in [0, 2, 4] {
+        let program = flow_program(|c| c[7] = Op::Call(target));
+        assert_eq!(
+            program.validate(),
+            Err(ProgramError::ControlFlowIntoPlan {
+                flash_session: 1,
+                pc: 7
+            })
+        );
+    }
+    let program = flow_program(|c| c[7] = Op::Call(9));
+    assert_eq!(program.validate(), Ok(()));
+}
+
+#[test]
+fn a_jump_inside_a_plan_stays_in_it() {
+    // Leaving forward by one is fine, further or backwards is not (from the last stage).
+    let program = flow_program(|c| c[4] = Op::Jump(5));
+    assert_eq!(program.validate(), Ok(()));
+    let program = flow_program(|c| c[4] = Op::Jump(6));
+    assert!(flow_error(&program, 4).is_some());
+}
+
+#[test]
+fn a_jump_before_the_erase_cannot_skip_it() {
+    // The replayed steps may loop among themselves and may reach the erase.
+    let program = flow_program(|c| c[0] = Op::Jump(1));
+    assert_eq!(program.validate(), Ok(()));
+    // With more room before the erase.
+    let mut program = recovery_program();
+    program.code = vec![Op::Pop; 12];
+    program.code[3] = Op::RoutineControl { routine: 1, sub: 1 };
+    program.code[4] = Op::ServiceRequest { service: 0x34 };
+    program.code[5] = Op::ServiceRequest { service: 0x37 };
+    program.flash[0].boundaries = RecoveryBoundaries {
+        entry_pc: 0,
+        erase_pc: 3,
+        transfer_exit_pc: 5,
+        post_transfer_end_pc: 7,
+    };
+    program.code[1] = Op::Jump(0);
+    program.code[0] = Op::JumpIfFalse(3);
+    assert_eq!(program.validate(), Ok(()));
+    program.code[1] = Op::Jump(4);
+    assert!(flow_error(&program, 1).is_some());
+    program.code[1] = Op::Jump(7);
+    assert!(flow_error(&program, 1).is_some());
+}
+
+#[test]
+fn a_jump_in_the_transfer_stays_between_erase_and_exit() {
+    // erase 1, transfer exit 3: pc 2 is in the transfer.
+    for target in [1, 2, 3] {
+        let program = flow_program(|c| {
+            c[1] = Op::ServiceRequest { service: 0x34 };
+            c[2] = Op::Jump(target);
+        });
+        assert_eq!(program.validate(), Ok(()), "target {target}");
+    }
+    for target in [0, 4, 5] {
+        let program = flow_program(|c| {
+            c[1] = Op::ServiceRequest { service: 0x34 };
+            c[2] = Op::JumpIfFalse(target);
+        });
+        assert_eq!(
+            flow_error(&program, 2),
+            Some(ProgramError::JumpOutOfRecovery {
+                flash_session: 1,
+                pc: 2
+            }),
+            "target {target}"
+        );
+    }
+}
+
+#[test]
+fn a_jump_after_the_exit_redoes_the_transfer_or_goes_on() {
+    // Exit at 3, end 5: pc 4 is after the exit.
+    for target in [1, 5] {
+        let program = flow_program(|c| c[4] = Op::Jump(target));
+        assert_eq!(program.validate(), Ok(()), "target {target}");
+    }
+    for target in [0, 2, 3] {
+        let program = flow_program(|c| c[4] = Op::Jump(target));
+        assert!(flow_error(&program, 4).is_some(), "target {target}");
+    }
+}
+
+/// A call from at or after the recovery point back before it would run the plan again before
+/// the point, so it is refused like a backward jump.
+#[test]
+fn a_backward_call_does_not_cross_the_recovery_point() {
+    let mut program = flow_program(|c| c[7] = Op::Call(0));
+    program.flash[0].recovery_required = RecoveryRequired::FromPc(4);
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::BackwardJumpAcrossRecovery {
+            flash_session: 1,
+            pc: 7
+        })
+    );
+    // Without a recovery point the same call is only refused for entering the plan.
+    let program = flow_program(|c| c[7] = Op::Call(0));
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::ControlFlowIntoPlan {
+            flash_session: 1,
+            pc: 7
+        })
+    );
+}
+
+/// Between a routine-control erase and the RequestDownload after it, a jump may not land
+/// past the RequestDownload: RequestTransferExit would follow an erase with no download.
+#[test]
+fn a_jump_after_the_erase_cannot_skip_the_request_download() {
+    let program_with = |jump: u32| {
+        let mut program = flow_program(|c| {
+            c[2] = Op::Jump(jump);
+            c[3] = Op::ServiceRequest { service: 0x34 };
+            c[4] = Op::ServiceRequest { service: 0x37 };
+        });
+        program.flash[0].boundaries.transfer_exit_pc = 4;
+        program
+    };
+    assert_eq!(
+        program_with(4).validate(),
+        Err(ProgramError::JumpOutOfRecovery {
+            flash_session: 1,
+            pc: 2
+        })
+    );
+    assert_eq!(program_with(3).validate(), Ok(()));
+    assert_eq!(program_with(1).validate(), Ok(()));
+}
+
+/// After a routine-control erase, no block may be sent before the RequestDownload.
+#[test]
+fn transfer_data_must_follow_the_request_download() {
+    for op in [
+        Op::ServiceRequest { service: 0x36 },
+        Op::FlashTransfer { block: 0 },
+    ] {
+        let mut program = flow_program(|c| {
+            c[2] = op.clone();
+            c[3] = Op::ServiceRequest { service: 0x34 };
+            c[4] = Op::ServiceRequest { service: 0x37 };
+        });
+        program.flash[0].boundaries.transfer_exit_pc = 4;
+        assert_eq!(
+            program.validate(),
+            Err(ProgramError::TransferBeforeRequestDownload {
+                flash_session: 1,
+                pc: 2
+            }),
+            "{op:?}"
+        );
+        // After the RequestDownload it is the transfer itself.
+        let mut program = flow_program(|c| {
+            c[2] = Op::ServiceRequest { service: 0x34 };
+            c[3] = op.clone();
+            c[4] = Op::ServiceRequest { service: 0x37 };
+        });
+        program.flash[0].boundaries.transfer_exit_pc = 4;
+        assert_eq!(program.validate(), Ok(()), "{op:?}");
+    }
+}
+
+/// A plan runs only at the top level: a subroutine that can reach it, by jumping or falling
+/// through, would return to its call site after the plan ran.
+#[test]
+fn a_subroutine_cannot_reach_a_plan() {
+    // The subroutine at 6 jumps to the plan's entry.
+    let program = flow_program(|c| {
+        c[6] = Op::Jump(0);
+        c[9] = Op::Call(6);
+    });
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::PlanInSubroutine {
+            flash_session: 1,
+            pc: 9
+        })
+    );
+    // A subroutine after the plan that returns without reaching it is fine.
+    let program = flow_program(|c| {
+        c[7] = Op::Ret;
+        c[9] = Op::Call(6);
+    });
+    assert_eq!(program.validate(), Ok(()));
+    // A subroutine before the plan that falls through into it.
+    let mut program = flow_program(|_| {});
+    program.code.insert(0, Op::Pop);
+    let b = &mut program.flash[0].boundaries;
+    b.entry_pc += 1;
+    b.erase_pc += 1;
+    b.transfer_exit_pc += 1;
+    b.post_transfer_end_pc += 1;
+    program.code[10] = Op::Call(0);
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::PlanInSubroutine {
+            flash_session: 1,
+            pc: 10
+        })
+    );
+}
+
+/// The subroutine check is one pass per plan, not one walk per call: a program with many calls
+/// validates at once (a walk per call would visit every instruction for each of them).
+#[test]
+fn many_calls_validate_in_linear_time() {
+    let mut program = flow_program(|c| c[7] = Op::Ret);
+    program
+        .code
+        .extend(std::iter::repeat_n(Op::Call(6), 200_000));
+    assert_eq!(program.validate(), Ok(()));
+}
+
+/// Each plan's checks pass over the whole code, so the number of plans is capped.
+#[test]
+fn the_number_of_plans_is_capped() {
+    let mut program = recovery_program();
+    let extra = program.flash[0].clone();
+    program.flash.resize(MAX_FLASH_RECOVERIES + 1, extra);
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::TooManyFlashRecoveries {
+            count: MAX_FLASH_RECOVERIES + 1
+        })
+    );
+}
+
+#[test]
+fn a_backward_jump_does_not_cross_the_recovery_point() {
+    // FromPc(4): the jump at 4 back to the erase crosses it; a jump at 2 does not.
+    let mut program = flow_program(|c| c[4] = Op::Jump(1));
+    program.flash[0].recovery_required = RecoveryRequired::FromPc(4);
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::BackwardJumpAcrossRecovery {
+            flash_session: 1,
+            pc: 4
+        })
+    );
+    let mut program = flow_program(|c| {
+        c[1] = Op::ServiceRequest { service: 0x34 };
+        c[2] = Op::Jump(1);
+    });
+    program.flash[0].recovery_required = RecoveryRequired::FromPc(4);
+    assert_eq!(program.validate(), Ok(()));
+    // A jump at the point itself that stays at or after it is fine.
+    let mut program = flow_program(|c| c[4] = Op::Jump(5));
+    program.flash[0].recovery_required = RecoveryRequired::FromPc(4);
+    assert_eq!(program.validate(), Ok(()));
+    // A loop outside the plan that contains the whole plan crosses the point too.
+    let mut program = flow_program(|c| c[7] = Op::Jump(0));
+    program.flash[0].recovery_required = RecoveryRequired::FromPc(4);
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::BackwardJumpAcrossRecovery {
+            flash_session: 1,
+            pc: 7
+        })
+    );
+}
+
+#[test]
+fn sources_are_checked() {
+    let mut program = recovery_program();
+    program.preconditions.voltage_mv = Some(Precondition {
+        satisfied: Satisfied { lower: 2, upper: 1 },
+        ..precondition(Some(SVC), Some(SVC))
+    });
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::EmptyRange(PreconditionKind::Voltage))
+    );
+
+    let mut program = recovery_program();
+    program.preconditions.ignition = Some(precondition(
+        Some(Source::RuntimeInput(RuntimeInput::EngineRunning)),
+        Some(SVC),
+    ));
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::InputDoesNotReport {
+            kind: PreconditionKind::Ignition,
+            input: RuntimeInput::EngineRunning
+        })
+    );
+    program.preconditions.ignition = Some(precondition(
+        Some(Source::RuntimeInput(RuntimeInput::IgnitionOn)),
+        Some(SVC),
+    ));
+    assert_eq!(program.validate(), Ok(()));
+
+    let mut program = recovery_program();
+    program.identity.vin = Some(Source::RuntimeInput(RuntimeInput::IgnitionOn));
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::IdentityFromRuntimeInput(IdentityKind::Vin))
+    );
+
+    for (service_id, field_id) in [(0, 1), (1, 0)] {
+        let zero = Source::EcuService {
+            service_id,
+            field_id,
+        };
+        let mut program = recovery_program();
+        program.identity.software_version = Some(zero);
+        assert_eq!(
+            program.validate(),
+            Err(ProgramError::ZeroId {
+                owner: SourceOwner::Identity(IdentityKind::SoftwareVersion)
+            })
+        );
+        let mut program = recovery_program();
+        program.preconditions.vehicle_speed = Some(precondition(Some(SVC), Some(zero)));
+        assert_eq!(
+            program.validate(),
+            Err(ProgramError::ZeroId {
+                owner: SourceOwner::Precondition {
+                    kind: PreconditionKind::VehicleSpeed,
+                    session: SessionKind::Programming
+                }
+            })
+        );
+    }
+}
+
+#[test]
+fn a_restartable_plan_needs_the_identity_timeout_and_resume_limit() {
+    for kind in [
+        IdentityKind::Vin,
+        IdentityKind::HardwarePartNumber,
+        IdentityKind::SoftwareVersion,
+    ] {
+        let mut program = recovery_program();
+        match kind {
+            IdentityKind::Vin => program.identity.vin = None,
+            IdentityKind::HardwarePartNumber => program.identity.hardware_part_number = None,
+            IdentityKind::SoftwareVersion => program.identity.software_version = None,
+        }
+        assert_eq!(
+            program.validate(),
+            Err(ProgramError::MissingIdentitySource(kind))
+        );
+        // No restart allowed: not required.
+        program.flash[0].recovery_required = RecoveryRequired::FromPc(1);
+        assert_eq!(program.validate(), Ok(()));
+    }
+
+    let program = mutate_plan(|p| p.timing.session_timeout_millis = 0);
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::MissingSessionTimeout { flash_session: 1 })
+    );
+    let program = mutate_plan(|p| p.max_resumes = 0);
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::ZeroResumeLimit { flash_session: 1 })
+    );
+    // No application declared stays legal.
+    let program = mutate_plan(|p| p.no_application = None);
+    assert_eq!(program.validate(), Ok(()));
+}
+
+#[test]
+fn runtime_inputs_report_their_own_precondition_only() {
+    let pairs = [
+        (
+            RuntimeInput::SupplyVoltageMillivolts,
+            PreconditionKind::Voltage,
+        ),
+        (
+            RuntimeInput::ExternalSupplyConnected,
+            PreconditionKind::ExternalSupply,
+        ),
+        (RuntimeInput::IgnitionOn, PreconditionKind::Ignition),
+        (RuntimeInput::EngineRunning, PreconditionKind::Engine),
+        (
+            RuntimeInput::VehicleSpeedKmh,
+            PreconditionKind::VehicleSpeed,
+        ),
+    ];
+    for (a, kind_a) in pairs {
+        for (_, kind_b) in pairs {
+            assert_eq!(a.reports(kind_b), kind_a == kind_b, "{a:?} {kind_b:?}");
+        }
+    }
+}
+
+#[test]
+fn a_full_declaration_round_trips_through_postcard() {
+    let mut program = recovery_program();
+    program.preconditions = Preconditions {
+        voltage_mv: Some(Precondition {
+            satisfied: Satisfied {
+                lower: 12_000,
+                upper: 15_000,
+            },
+            default_session: Some(Source::RuntimeInput(RuntimeInput::SupplyVoltageMillivolts)),
+            programming_session: Some(SVC),
+        }),
+        engine: Some(precondition(Some(SVC), Some(SVC))),
+        ..Preconditions::default()
+    };
+    program.flash[0].recovery_required = RecoveryRequired::FromPc(4);
+    program.sections.push(recovery_section(4, 5));
+    assert_eq!(program.validate(), Ok(()));
+    let bytes = postcard::to_allocvec(&program).unwrap();
+    let restored: Program = postcard::from_bytes(&bytes).unwrap();
+    assert_eq!(restored.identity, program.identity);
+    assert_eq!(restored.preconditions, program.preconditions);
+    assert_eq!(restored.flash, program.flash);
+    assert_eq!(restored.validate(), Ok(()));
+    assert_eq!(postcard::to_allocvec(&restored).unwrap(), bytes);
+}
+
+#[test]
+fn a_restartable_plan_does_not_replay_an_unsafe_section() {
+    let unsafe_section = Section {
+        interruptible: Interruptible::Yes,
+        ..recovery_section(0, 1)
+    };
+    let mut program = recovery_program();
+    program.sections.push(unsafe_section.clone());
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::UnsafeSectionInReplay {
+            flash_session: 1,
+            section: 0
+        })
+    );
+    // A safe section is fine; an unsafe one after the erase is redone with the transfer.
+    program.sections[0].idempotency = Idempotency::Safe;
+    assert_eq!(program.validate(), Ok(()));
+    program.sections.push(Section {
+        interruptible: Interruptible::Yes,
+        ..recovery_section(3, 4)
+    });
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::UnsafeSectionInReplay {
+            flash_session: 1,
+            section: 1
+        })
+    );
+    // From the recovery point on, nothing is replayed: an unsafe section there is fine.
+    program.flash[0].recovery_required = RecoveryRequired::FromPc(3);
+    assert_eq!(program.validate(), Ok(()));
+    // The plan does not allow a restart, so nothing is replayed.
+    let mut program = recovery_program();
+    program.sections.push(unsafe_section);
+    program.flash[0].recovery_required = RecoveryRequired::FromPc(1);
+    assert_eq!(program.validate(), Ok(()));
+}
+
+#[test]
+fn an_empty_restartable_range_contradicts_nothing() {
+    let mut program = recovery_program();
+    program.flash[0].recovery_required = RecoveryRequired::FromPc(0);
+    program.sections.push(recovery_section(0, 5));
+    assert_eq!(program.validate(), Ok(()));
+    // One step later the section overlaps the restartable range.
+    program.flash[0].recovery_required = RecoveryRequired::FromPc(1);
+    assert!(matches!(
+        program.validate(),
+        Err(ProgramError::ContradictoryInterruptibility { .. })
+    ));
+}
+
+#[test]
+fn the_no_application_response_code_must_be_usable() {
+    for nrc in [0x00, 0x78] {
+        let program = mutate_plan(|p| p.no_application = Some(NoApplication::Nrc(nrc)));
+        assert_eq!(
+            program.validate(),
+            Err(ProgramError::InvalidNoApplicationNrc {
+                flash_session: 1,
+                nrc
+            })
+        );
+    }
+    let program = mutate_plan(|p| p.no_application = Some(NoApplication::Nrc(0x7F)));
+    assert_eq!(program.validate(), Ok(()));
+}
+
+#[test]
+fn flag_preconditions_range_over_zero_and_one() {
+    for (lower, upper, ok) in [
+        (0, 0, true),
+        (1, 1, true),
+        (0, 1, true),
+        (-1, 0, false),
+        (0, 2, false),
+    ] {
+        for kind in [
+            PreconditionKind::ExternalSupply,
+            PreconditionKind::Ignition,
+            PreconditionKind::Engine,
+        ] {
+            let mut program = recovery_program();
+            let flag = Some(Precondition {
+                satisfied: Satisfied { lower, upper },
+                ..precondition(Some(SVC), Some(SVC))
+            });
+            match kind {
+                PreconditionKind::ExternalSupply => program.preconditions.external_supply = flag,
+                PreconditionKind::Ignition => program.preconditions.ignition = flag,
+                _ => program.preconditions.engine = flag,
+            }
+            let expected = if ok {
+                Ok(())
+            } else {
+                Err(ProgramError::FlagRangeOutOfDomain(kind))
+            };
+            assert_eq!(program.validate(), expected, "{kind:?} {lower}..{upper}");
+        }
+    }
+    // Measured values are not limited.
+    let mut program = recovery_program();
+    program.preconditions.voltage_mv = Some(Precondition {
+        satisfied: Satisfied {
+            lower: 11_000,
+            upper: 16_000,
+        },
+        ..precondition(Some(SVC), Some(SVC))
+    });
+    assert_eq!(program.validate(), Ok(()));
+}
+
+#[test]
+fn unknown_keys_in_a_program_are_refused() {
+    let json = |extra: &str| {
+        format!(
+            r#"{{"schema_version":2,"code":[],"constants":[],"sections":[],"source_map":[]{extra}}}"#
+        )
+    };
+    assert!(serde_json::from_str::<Program>(&json("")).is_ok());
+    assert!(serde_json::from_str::<Program>(&json(r#","preconditions":{}"#)).is_ok());
+    // A misspelt key must not be read as "nothing declared".
+    assert!(serde_json::from_str::<Program>(&json(r#","precondition":{}"#)).is_err());
+    assert!(serde_json::from_str::<Program>(&json(r#","preconditions":{"engin":null}"#)).is_err());
+}
+
+/// The layout of `VmState` in schema 1, which had a checkpoint and a resume count at the end.
+#[derive(serde::Serialize)]
+struct V1State {
+    schema_version: u32,
+    pc: u32,
+    stack: Vec<Value>,
+    locals: Vec<Option<Value>>,
+    globals: Vec<Option<Value>>,
+    call_stack: Vec<Frame>,
+    steps: u64,
+    checkpoint: Option<V1Checkpoint>,
+    resume_count: u16,
+}
+
+#[derive(serde::Serialize)]
+struct V1Checkpoint {
+    pc: u32,
+    section: u32,
+    vin: Option<String>,
+    artifact_digest: Option<String>,
+    at: String,
+}
+
+/// A journaled schema 1 state decodes (postcard ignores the trailing bytes) but is refused by
+/// the schema check, so the removed fields cannot cause a resume from a stale layout.
+#[test]
+fn a_version_one_state_still_decodes_and_is_refused() {
+    let old = V1State {
+        schema_version: 1,
+        pc: 1,
+        stack: vec![Value::I64(7)],
+        locals: vec![None],
+        globals: Vec::new(),
+        call_stack: Vec::new(),
+        steps: 4,
+        checkpoint: Some(V1Checkpoint {
+            pc: 1,
+            section: 0,
+            vin: Some("VIN".into()),
+            artifact_digest: None,
+            at: "2026-10-06T00:00:00Z".into(),
+        }),
+        resume_count: 2,
+    };
+    let bytes = postcard::to_allocvec(&old).unwrap();
+    let (state, rest) = postcard::take_from_bytes::<VmState>(&bytes).unwrap();
+    assert!(!rest.is_empty());
+    assert!(postcard::from_bytes::<VmState>(&bytes).is_ok());
+    assert_eq!(state.schema_version, 1);
+    let current = prog(vec![i(1), i(2)], Vec::new());
+    assert!(matches!(
+        Vm::resume(state).check_state(&current),
+        Err(VmError::StateSchemaMismatch { state: 1, .. })
+    ));
 }

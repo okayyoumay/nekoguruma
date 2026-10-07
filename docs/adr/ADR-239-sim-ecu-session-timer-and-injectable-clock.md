@@ -49,7 +49,11 @@ time line that stand for those events.
 - A response that `sim-vci` discards because the ECU power-cycles while it is still delayed does
   not count as sent: the power cycle resets the record of pending responses. It makes no
   difference to the session, which the power cycle ends anyway.
-- An ECU reset takes effect when its response has gone out, so a security delay it restarts runs
-  from then, not from the request.
+- On a server, an ECU reset follows its response (ISO 14229-1 (2026) clause 9.3.1 recommends
+  answering first). The simulator applies the reset's state change at once, when it handles the
+  request, as it did before this decision; only the timers follow the response: a security delay
+  the reset restarts runs from when the response goes out. A request that arrives while a delayed
+  reset response is still pending therefore already sees the reset state. That is a known
+  simplification.
 - Clause 9.4.1 also asks a server that supports the delay to start it at power-up after a single
   earlier false key. The simulator does not; this is recorded as a known gap.

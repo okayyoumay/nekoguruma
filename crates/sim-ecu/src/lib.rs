@@ -507,8 +507,8 @@ impl SimEcu {
         let power_cycles = self.power_cycles;
         let (exchange, sent_after_ms) = self.handle(addressing, message);
         if self.power_cycles != power_cycles {
-            // An ECU reset takes effect once its response has gone out, so a security delay it
-            // restarts runs from then.
+            // The ECU applies a reset at once, but on a vehicle it follows the response, so a
+            // security delay the reset restarts runs from when the response goes out.
             let shift = Duration::from_millis(sent_after_ms.into());
             if let Some(until) = &mut self.security_delay_until {
                 *until = until.saturating_add(shift);

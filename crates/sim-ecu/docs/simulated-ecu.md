@@ -105,8 +105,10 @@ NRC 37 until the delay has run (`EcuConfig::security_delay_ms`, 10000 ms by defa
 leaves the length to the vehicle manufacturer) or a test calls `SimEcu::expire_security_delay()`.
 `security_delay_active()` reports whether it is running. A power cycle or ECU reset clears the
 false-attempt counter and starts a delay that is still running again for its full length (after an
-ECU reset, from when its response goes out); one that has already run out stays over. Clause 9.4.1 also asks a server that supports the delay to start it
-at power-up when an earlier SecurityAccess failed on a single false key; the simulator does not. With
+ECU reset, from when its response goes out; the reset itself is applied at once, so a request
+arriving before a delayed reset response already sees the reset state); one that has already run
+out stays over. Clause 9.4.1 also asks a server that supports the delay to start it at power-up
+when an earlier SecurityAccess failed on a single false key; the simulator does not. With
 `EcuConfig::require_security_access` unset, secured operations do not check the lock state.
 
 ## Routines and download

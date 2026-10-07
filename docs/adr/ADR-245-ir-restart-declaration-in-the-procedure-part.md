@@ -37,8 +37,8 @@ runner in M1.
 
    A plan names its `FlashSession` by id. In `ir.fbs`, `FlashSession` keeps only the flash
    description (steps and segments). Its precondition flags and `recovery_required_from_step`
-   are removed, so every field has one home and nothing has to be kept in sync between the two
-   parts. The boundaries are bytecode positions, and design 8.2.1 places retries in the
+   are marked deprecated (their slots stay reserved), so every field has one home and nothing
+   has to be kept in sync between the two parts. The boundaries are bytecode positions, and design 8.2.1 places retries in the
    procedure part, so the procedure part is their natural home as well. One `EcuDocument`
    carries one variant and one program, so per-ECU values such as the session timeout are not
    repeated across procedures.
@@ -57,36 +57,52 @@ runner in M1.
    replaces the step number.
    - A plan allows a restart when it is `Never`, or when its point lies after the erase.
    - At run time, on-site intervention applies when the interruption point is at or after
-     that point, or inside a section marked `RecoveryRequired` (8.10.1); the stricter rule wins.
+     that point and before the plan's end, or inside a section marked `RecoveryRequired`
+     (8.10.1); the stricter rule wins. The point lies inside the plan, before its end.
    - A plan that contradicts a section is refused when the program is loaded.
 4. **Boundaries.** A plan has four positions in the bytecode:
    - `entry_pc`: where the replayable pre-erase steps begin;
-   - `erase_pc`: the first erase request, or the RequestDownload when the procedure does not
-     erase. The transfer-start marker is committed before it;
+   - `erase_pc`: the first erase request (a routine control), or the RequestDownload when the
+     procedure does not erase. The transfer-start marker is committed before it;
    - `transfer_exit_pc`: the RequestTransferExit, which its marker precedes;
    - `post_transfer_end_pc`: reaching it journals the post-transfer steps as complete.
 
-   A jump from inside the erase-to-end range back before `entry_pc` is refused, so a position
-   orders the interruption point as the journal's step count does.
+   A plan's range is a region execution enters only at `entry_pc` and leaves only at
+   `post_transfer_end_pc`: it contains no call or return, nothing jumps or calls into it
+   except to `entry_pc`, and nothing inside jumps out of it. Inside, no jump skips the erase,
+   leaves the transfer backwards past the erase, returns from the post-transfer steps to
+   anything but the erase (a redone transfer), or crosses the recovery-required point
+   backwards. So every erase passes its transfer-start marker, every RequestTransferExit its
+   own marker, every run reaches the end boundary, and a position orders the interruption
+   point as the journal's step count does.
 5. **Resume limit per stage.** Each plan names the journal stage it counts against (ADR-244)
    and that stage's limit. `VmState` loses `checkpoint` and `resume_count`, which the journal
    owns (ADR-244 item 6, ADR-233 item 3).
 6. **Checked at every load.** `Program::validate` checks the declaration, and the agent's
    `check_program` runs it before the program reaches a worker. It checks that:
    - the boundaries are ordered and inside the code;
-   - `erase_pc` and `transfer_exit_pc` are diagnostic requests;
+   - `erase_pc` is a routine control or a RequestDownload, and `transfer_exit_pc` a
+     RequestTransferExit;
+   - download requests and flash transfers appear only between a plan's erase and its
+     RequestTransferExit, so a program that downloads without a plan is refused;
+   - control flow keeps each plan a single-entry region as item 4 describes;
    - plans do not overlap or repeat a flash session or a stage;
    - the recovery-required point lies inside the plan;
    - plans and sections do not contradict each other;
-   - ranges are not empty and ids are not zero;
-   - a runtime input reports the state it is mapped to.
+   - ranges are not empty, a yes/no state's range lies within 0 and 1, and ids are not zero;
+   - a runtime input reports the state it is mapped to;
+   - the no-application response is not 0x00 or the response-pending code.
 
    When any plan allows a restart, every identity source must be declared, every declared
-   precondition must have a source for both sessions, and the plan must give a session timeout
-   and a resume limit.
+   precondition must have a source for both sessions, the plan must give a session timeout
+   and a resume limit, and no section marked unsafe to repeat (ADR-233) may lie in the range a
+   restart replays. Unknown fields in a JSON program are refused, so a misspelt key cannot
+   drop a precondition silently.
 7. **Schema version 2.** The postcard encodings of `Program` and `VmState` change, so
-   `IR_SCHEMA_VERSION` becomes 2. A program or a journaled VM state of version 1 is refused,
-   not decoded by accident. The new fields default when absent from JSON.
+   `IR_SCHEMA_VERSION` becomes 2. A version 1 program fails to decode or is refused by its
+   version. A journaled version 1 VM state can still decode, since postcard ignores the bytes
+   of the removed fields, so it is refused by `Vm::check_state`, which a restart runs on any
+   state it restores. The new fields default when absent from JSON.
 
 ## Consequences
 
@@ -102,3 +118,4 @@ runner in M1.
 - A frontend writes preconditions into the program, not into the declaration part.
 - The response that means "no application" is an enum with one form, a negative response code,
   so a positive-response form can be appended.
+- The restart order adds timings in 64-bit arithmetic; the declaration does not bound their sum.

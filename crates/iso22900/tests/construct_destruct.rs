@@ -49,11 +49,11 @@ impl Mock {
         mock
     }
 
-    /// Calls a back-door export that takes no arguments. With no arguments
-    /// the C and stdcall conventions agree, so one signature serves every
-    /// target.
+    /// Calls a back-door export that takes no arguments. The mock exports
+    /// them as stdcall on Windows x86 and as C elsewhere, which is what
+    /// `extern "system"` names on each target.
     fn call<R>(&self, name: &str) -> R {
-        let symbol: Symbol<'_, unsafe extern "C" fn() -> R> =
+        let symbol: Symbol<'_, unsafe extern "system" fn() -> R> =
             unsafe { self.library.get(name.as_bytes()) }
                 .unwrap_or_else(|e| panic!("mock should export {name}: {e}"));
         unsafe { symbol() }

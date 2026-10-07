@@ -9,6 +9,7 @@ dependencies = [
  "axum",
  "diag-ir",
  "j2534-0404-registry",
+ "postcard",
  "serde",
  "serde_json",
  "shared-proto",

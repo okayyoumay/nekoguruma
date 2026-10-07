@@ -336,7 +336,7 @@ Channels are separated so that bulk transfers do not clog the control channel. F
 - Windows: `SetThreadExecutionState`, `ShutdownBlockReasonCreate` (`PRESHUTDOWN` for services)
 - Linux: logind inhibitor locks, `loginctl enable-linger`
 - Exclusive locks on the VCI and vehicle (8.8)
-- Preparation of all data before writing, journaling of each step, read-back verification
+- Preparation of all data before writing, journaling of each step, read-back verification. The journal is an append-only log per job and ownership generation, each record synced before the commit returns (ADR-244)
 
 **Journal protection**: The journal and local cache contain VINs and diagnostic results. They are encrypted with a key protected by the OS credential store and bound to the device when a TPM is available. Once job completion and sync completion are confirmed, the body is deleted, leaving only the job ID and a result summary. If revocation of the agent key is detected, the local cache and journal are erased.
 

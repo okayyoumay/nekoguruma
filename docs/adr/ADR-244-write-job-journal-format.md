@@ -1,0 +1,82 @@
+# ADR-244: Write-Job Journal as an Append-Only Record Log
+
+**Date:** 2026-10-07
+**Status:** Accepted
+**Affects:** `crates/agent/src/journal.rs`, `crates/agent/tests/journal_crash.rs`, `docs/system-architecture.md` (5.5)
+
+## Context
+
+ADR-229 restarts an interrupted transfer in a fixed order that reads its inputs from the
+agent's journal: the last confirmed step, the ECU hardware part number and the pre-erase
+software version, a transfer-start intent marker committed before the first erase or
+RequestDownload, a RequestTransferExit intent marker committed before that request, the
+post-transfer progress, and the per-stage resume count with the attempt key it was committed
+with. Two of its updates must be atomic: a resume count with its attempt key, and a new
+transfer-start marker with the clearing of the previous attempt's exit marker and post-transfer
+progress. The same facts form the checkpoint summary a handover carries (design 8.2.5), and the
+journal of a failed device is uploaded for audit (ADR-229), so its history matters as well as
+its latest state. A flash transfer commits once per block, thousands of times, on ext4 and NTFS,
+and a commit that returned must survive a crash or a loss of the device's power.
+
+The options were a whole-state snapshot replaced on every commit (temporary file, sync,
+rename, directory sync) and an append-only log of records.
+
+## Decision
+
+1. **An append-only log, one file per job and ownership generation.** The file
+   `{job_id}.g{generation}.journal` starts with a magic, a format version and a header frame
+   naming the job and generation; every later frame is one record. A frame is its payload's
+   length, a CRC-32 of the payload, and the payload (postcard). Record variants are only ever
+   appended, since postcard encodes the variant index (as ADR-233 item 10 does for the IR). A
+   log appends a few dozen bytes per block, where a snapshot would rewrite the whole state, VM
+   state included, and it keeps the history the audit upload needs. The ownership generation
+   in the name follows ADR-229: a device that gets a job back starts a new journal.
+2. **One commit is one frame and one sync.** A commit appends its frame and syncs the file
+   before it returns; the facts the journal reports change only after that. Appending to an
+   existing file needs no rename, so no commit depends on rename durability, which `std` does
+   not provide on Windows. A failed write or sync poisons the journal: it takes no more
+   records, since a failed sync can drop data the OS had accepted and a later commit would then
+   claim what was lost.
+3. **Atomic updates are single records.** A resume record carries the new count and the attempt
+   key together. A transfer-start record replaces the whole transfer attempt, so the previous
+   attempt's exit marker, post-transfer progress and last block go with it. Post-transfer
+   completion is its own record; steps after the exit marker count as post-transfer progress
+   until it.
+4. **The folded state is the summary.** Reading the journal folds its records into
+   `RecoveryFacts`, which is also the checkpoint summary sent for handover, so the summary
+   carries the facts unchanged. Records that contradict the facts (a block outside a transfer, a
+   second exit marker, a step that does not come after the last one, a pre-erase version after a
+   transfer started, a resume count that does not count one more) are refused when committed and
+   make a journal corrupt when read back.
+5. **Torn tail versus corruption.** Only what one unfinished commit can leave is cut off when
+   the journal is opened: a last frame that runs past the end of the file, or a last frame
+   that fails its checksum, within one maximum frame of the end. A frame that fails its
+   checksum with more data after it, a record that does not decode or is out of sequence, a
+   header that does not read back, another job's header or a format version this build does
+   not know is an error, never skipped or repaired. The header is synced under a temporary name
+   and then linked to the journal's name, so a journal file always has its header.
+6. **The journal owns checkpoints and resume counts.** `VmState`'s `checkpoint` and
+   `resume_count` (ADR-233 item 3 left their keeping to the journal) are not used; the VM state
+   travels as an opaque postcard blob a step record may carry.
+7. **The journal only records.** Committing a marker before the request it guards, ending the
+   job when a commit fails, and the restart order itself belong to the job runner. The
+   journal's directory is a parameter; stage identifiers are opaque numbers the IR gives a
+   meaning.
+
+## Consequences
+
+- Every block costs a sync. On slow storage this can bound the transfer rate; the semantics
+  allow block records to be synced in batches (block checkpoints are progress, ADR-229 item 3),
+  which needs no format change.
+- A checksum failure in the very last frame is indistinguishable from a torn write and is cut
+  off. A synced frame is not torn by a crash, so this needs damage to the storage itself.
+- Durability on Windows rests on `FlushFileBuffers` of the new file also covering its directory
+  entry (NTFS logs the entry with the file's metadata). The crash tests end the process, which
+  checks the format's recovery, not the storage under a power loss.
+- Creating a journal needs hard links (ext4, NTFS); a file system without them fails the
+  creation.
+- Nothing locks the file: one journal per job and generation is the job scheduler's duty.
+- Journal protection (design 5.5) fits the format: a value in the header's protection field and
+  a per-frame MAC and encrypted payload, with the length and checksum left in the clear so a
+  torn tail can be cut off without the key.
+- A record is at most 1 MiB, which also bounds a VM state blob in one step record.

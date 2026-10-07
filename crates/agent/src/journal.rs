@@ -1,0 +1,1121 @@
+//! Write-job journal (design 5.5, 8.2.5; ADR-229, ADR-244).
+//!
+//! One append-only file per job and ownership generation records what a write job has done:
+//! the completed steps, the last confirmed block, the ECU identity, the per-stage resume counts
+//! and the write-ahead intent markers. Each commit appends one checksummed frame and syncs the
+//! file before it returns, so a crash or a power loss leaves every commit that returned `Ok`
+//! readable. Reading the file back folds the records into [`RecoveryFacts`], which is also the
+//! checkpoint summary a handover carries.
+//!
+//! Layout: the magic, the format version (`u32` LE), then frames of `len: u32 LE`,
+//! `crc32: u32 LE` and a postcard payload of `len` bytes. The first frame is the [`JobKey`]
+//! header; every later frame is one record.
+//!
+//! The journal only records. Committing a marker before the request it guards, and ending the
+//! job when a commit fails, are the runner's duties (ADR-244).
+
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
+use shared_proto::JobId;
+
+/// The journal format this build writes and reads.
+pub const FORMAT_VERSION: u32 = 1;
+/// The largest frame payload, in bytes. A record that would exceed it is refused.
+pub const MAX_FRAME: u32 = 1 << 20;
+
+const MAGIC: [u8; 8] = *b"NGRJRNL\0";
+/// Magic and format version.
+const PREAMBLE: usize = MAGIC.len() + 4;
+/// Length and CRC in front of each payload.
+const FRAME_HEADER: usize = 8;
+
+/// The journal of one job under one ownership generation (ADR-229: a device that gets a job
+/// back starts a new journal for the new generation).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobKey {
+    pub job_id: JobId,
+    pub generation: u64,
+}
+
+/// A diagnostic primitive: `pc` is its instruction and `steps` is `VmState::steps` before it
+/// runs, which keeps counting across resumes, so it orders steps even when a loop repeats `pc`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StepRef {
+    pub pc: u32,
+    pub steps: u64,
+}
+
+/// A stage that has its own resume count. The IR gives it a meaning; the journal only keeps
+/// stages apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct StageId(pub u32);
+
+/// What a restart, or a device that takes the job over, needs to know (ADR-229). It is both the
+/// state the journal folds its records into and the checkpoint summary sent for handover.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryFacts {
+    pub key: JobKey,
+    /// The last completed step.
+    pub last_step: Option<StepRef>,
+    /// The hardware part number as the ECU answered it (the field's bytes, undecoded).
+    pub ecu_hardware_part_number: Option<Vec<u8>>,
+    /// The software version read before the first erase (the field's bytes, undecoded).
+    pub pre_erase_software_version: Option<Vec<u8>>,
+    /// Resumes made per stage, sorted by stage.
+    pub resume_counts: Vec<(StageId, u16)>,
+    /// The key of the current resume attempt; `None` for the original run.
+    pub attempt_key: Option<Vec<u8>>,
+    /// The latest transfer attempt.
+    pub transfer: Option<TransferAttempt>,
+}
+
+impl RecoveryFacts {
+    fn new(key: JobKey) -> Self {
+        Self {
+            key,
+            last_step: None,
+            ecu_hardware_part_number: None,
+            pre_erase_software_version: None,
+            resume_counts: Vec::new(),
+            attempt_key: None,
+            transfer: None,
+        }
+    }
+
+    /// The resumes made in `stage`.
+    pub fn resume_count(&self, stage: StageId) -> u16 {
+        self.resume_counts
+            .iter()
+            .find(|(id, _)| *id == stage)
+            .map_or(0, |(_, count)| *count)
+    }
+
+    /// Applies `record`, or leaves the facts unchanged and says why it does not fit.
+    fn apply(&mut self, record: &Record) -> Result<(), &'static str> {
+        let after_last_step =
+            |at: &StepRef, facts: &Self| facts.last_step.is_none_or(|last| at.steps > last.steps);
+        match record {
+            Record::Step { at, .. } => {
+                if !after_last_step(at, self) {
+                    return Err("a step must come after the last step");
+                }
+                self.last_step = Some(*at);
+                if let Some(exit) = self.transfer.as_mut().and_then(|t| t.exit.as_mut())
+                    && !exit.complete
+                {
+                    exit.last_post_step = Some(*at);
+                }
+            }
+            Record::Block { block } => {
+                let transfer = self.transfer.as_mut().ok_or("a block needs a transfer")?;
+                if transfer.exit.is_some() {
+                    return Err("a block cannot follow RequestTransferExit");
+                }
+                if transfer.last_block.is_some_and(|last| *block <= last) {
+                    return Err("blocks must increase");
+                }
+                transfer.last_block = Some(*block);
+            }
+            Record::EcuHardwarePartNumber(value) => {
+                self.ecu_hardware_part_number = Some(value.clone());
+            }
+            Record::PreEraseSoftwareVersion(value) => {
+                if self.transfer.is_some() {
+                    return Err("the pre-erase version must come before the transfer");
+                }
+                self.pre_erase_software_version = Some(value.clone());
+            }
+            Record::Resume {
+                stage,
+                count,
+                attempt_key,
+            } => {
+                let next = self
+                    .resume_count(*stage)
+                    .checked_add(1)
+                    .ok_or("the resume count is at its maximum")?;
+                if *count != next {
+                    return Err("a resume must count one more");
+                }
+                match self
+                    .resume_counts
+                    .binary_search_by_key(stage, |(id, _)| *id)
+                {
+                    Ok(index) => self.resume_counts[index].1 = next,
+                    Err(index) => self.resume_counts.insert(index, (*stage, next)),
+                }
+                self.attempt_key = attempt_key.clone();
+            }
+            Record::TransferStart { stage, at } => {
+                if !after_last_step(at, self) {
+                    return Err("a marker must come after the last step");
+                }
+                // A new attempt starts clean: the previous exit marker and post-transfer
+                // progress go with the previous attempt (ADR-229).
+                self.transfer = Some(TransferAttempt {
+                    stage: *stage,
+                    started_at: *at,
+                    last_block: None,
+                    exit: None,
+                });
+            }
+            Record::TransferExitIntent { at } => {
+                if !after_last_step(at, self) {
+                    return Err("a marker must come after the last step");
+                }
+                let transfer = self
+                    .transfer
+                    .as_mut()
+                    .ok_or("RequestTransferExit needs a transfer")?;
+                if transfer.exit.is_some() {
+                    return Err("RequestTransferExit is already marked");
+                }
+                transfer.exit = Some(TransferExit {
+                    intent_at: *at,
+                    last_post_step: None,
+                    complete: false,
+                });
+            }
+            Record::PostTransferComplete => {
+                let exit = self
+                    .transfer
+                    .as_mut()
+                    .and_then(|t| t.exit.as_mut())
+                    .ok_or("post-transfer completion needs RequestTransferExit")?;
+                if exit.complete {
+                    return Err("the post-transfer steps are already complete");
+                }
+                exit.complete = true;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One transfer attempt, from its transfer-start marker on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransferAttempt {
+    pub stage: StageId,
+    /// The erase or RequestDownload the marker was committed before.
+    pub started_at: StepRef,
+    /// The last confirmed block (progress only, ADR-229 item 3).
+    pub last_block: Option<u32>,
+    pub exit: Option<TransferExit>,
+}
+
+/// The RequestTransferExit marker and the post-transfer progress after it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransferExit {
+    /// The RequestTransferExit the marker was committed before.
+    pub intent_at: StepRef,
+    /// The last step completed after the marker, until the post-transfer steps complete.
+    pub last_post_step: Option<StepRef>,
+    /// The post-transfer steps reached their end boundary.
+    pub complete: bool,
+}
+
+/// Everything read back from a journal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JournalState {
+    pub facts: RecoveryFacts,
+    /// The newest VM state a step record carried (postcard `VmState`, opaque here).
+    pub last_vm_state: Option<Vec<u8>>,
+    /// Records in the journal.
+    pub records: u64,
+}
+
+/// One journal record. Variants are only ever appended: postcard encodes the variant index.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+enum Record {
+    Step {
+        at: StepRef,
+        vm_state: Option<Vec<u8>>,
+    },
+    Block {
+        block: u32,
+    },
+    EcuHardwarePartNumber(Vec<u8>),
+    PreEraseSoftwareVersion(Vec<u8>),
+    Resume {
+        stage: StageId,
+        count: u16,
+        attempt_key: Option<Vec<u8>>,
+    },
+    TransferStart {
+        stage: StageId,
+        at: StepRef,
+    },
+    TransferExitIntent {
+        at: StepRef,
+    },
+    PostTransferComplete,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Header {
+    key: JobKey,
+    /// 0: none. MAC and encryption get their own values (design 5.5).
+    protection: u8,
+    created_unix_ms: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Entry {
+    seq: u64,
+    at_unix_ms: u64,
+    record: Record,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum JournalError {
+    #[error("no journal for this job and generation")]
+    NotFound,
+    #[error("a journal for this job and generation already exists")]
+    AlreadyExists,
+    #[error("job ID {0:?} cannot name a journal file")]
+    InvalidJobId(String),
+    #[error("journal I/O failed: {0}")]
+    Io(#[from] io::Error),
+    #[error("an earlier commit failed; the journal takes no more records")]
+    Poisoned,
+    #[error("journal format version {0} is not supported")]
+    UnsupportedVersion(u32),
+    #[error("the journal belongs to another job or generation")]
+    WrongJob,
+    #[error("the journal is corrupt at byte {offset}: {reason}")]
+    Corrupt { offset: u64, reason: &'static str },
+    #[error("the record does not fit the journal: {0}")]
+    Invariant(&'static str),
+    #[error("the record is larger than a journal frame")]
+    TooLarge,
+}
+
+/// Where commits go. A commit is durable once `append_sync` returns `Ok`.
+pub trait Store {
+    fn append_sync(&mut self, bytes: &[u8]) -> io::Result<()>;
+}
+
+/// The journal file.
+pub struct FileStore {
+    file: File,
+    len: u64,
+}
+
+impl Store for FileStore {
+    fn append_sync(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.file.seek(SeekFrom::Start(self.len))?;
+        self.file.write_all(bytes)?;
+        self.file.sync_all()?;
+        self.len += bytes.len() as u64;
+        Ok(())
+    }
+}
+
+/// An open journal. Every `commit_*` returns only after the record is durable, and changes
+/// [`Journal::state`] only then. After a failed write the journal is poisoned: a failed sync
+/// can drop data the OS had accepted, so a later commit could claim what was lost.
+pub struct Journal<S = FileStore> {
+    store: S,
+    state: JournalState,
+    poisoned: bool,
+}
+
+impl Journal<FileStore> {
+    /// Creates the journal of `key` in `dir`. The file appears complete or not at all: the
+    /// header is written and synced under a temporary name, then linked to the journal's name,
+    /// which fails if that name exists.
+    pub fn create(dir: &Path, key: &JobKey) -> Result<Self, JournalError> {
+        let path = journal_path(dir, key)?;
+        let tmp = path.with_extension("journal.tmp");
+        let mut bytes = Vec::with_capacity(64);
+        bytes.extend_from_slice(&MAGIC);
+        bytes.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+        let header = Header {
+            key: key.clone(),
+            protection: 0,
+            created_unix_ms: unix_ms(),
+        };
+        push_frame(&mut bytes, &encode(&header)?)?;
+        let written = (|| {
+            let mut file = File::create(&tmp)?;
+            file.write_all(&bytes)?;
+            file.sync_all()
+        })();
+        if let Err(error) = written {
+            let _ = fs::remove_file(&tmp);
+            return Err(error.into());
+        }
+        let linked = fs::hard_link(&tmp, &path);
+        let _ = fs::remove_file(&tmp);
+        match linked {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                return Err(JournalError::AlreadyExists);
+            }
+            Err(error) => return Err(error.into()),
+        }
+        sync_dir(dir)?;
+        let file = OpenOptions::new().read(true).write(true).open(&path)?;
+        Ok(Self {
+            store: FileStore {
+                file,
+                len: bytes.len() as u64,
+            },
+            state: JournalState {
+                facts: RecoveryFacts::new(key.clone()),
+                last_vm_state: None,
+                records: 0,
+            },
+            poisoned: false,
+        })
+    }
+
+    /// Opens the journal of `key` in `dir` and reads it back. A frame left half-written by a
+    /// commit that never returned is cut off; anything else that does not read back is
+    /// [`JournalError::Corrupt`].
+    pub fn open(dir: &Path, key: &JobKey) -> Result<Self, JournalError> {
+        let path = journal_path(dir, key)?;
+        let mut file = match OpenOptions::new().read(true).write(true).open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(JournalError::NotFound);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        let loaded = load(&bytes, key)?;
+        if loaded.len < bytes.len() {
+            tracing::warn!(
+                path = %path.display(),
+                cut = bytes.len() - loaded.len,
+                "journal ends in a frame its commit did not finish; cutting it off"
+            );
+            file.set_len(loaded.len as u64)?;
+            file.sync_all()?;
+        }
+        Ok(Self {
+            store: FileStore {
+                file,
+                len: loaded.len as u64,
+            },
+            state: loaded.state,
+            poisoned: false,
+        })
+    }
+}
+
+impl<S: Store> Journal<S> {
+    pub fn state(&self) -> &JournalState {
+        &self.state
+    }
+
+    /// The checkpoint summary for handover: the facts, unchanged.
+    pub fn summary(&self) -> RecoveryFacts {
+        self.state.facts.clone()
+    }
+
+    /// Records a completed step and, optionally, the VM state after it.
+    pub fn commit_step(
+        &mut self,
+        at: StepRef,
+        vm_state: Option<&[u8]>,
+    ) -> Result<(), JournalError> {
+        self.commit(Record::Step {
+            at,
+            vm_state: vm_state.map(<[u8]>::to_vec),
+        })
+    }
+
+    /// Records a block the ECU confirmed, counted from the start of the transfer.
+    pub fn commit_block(&mut self, block: u32) -> Result<(), JournalError> {
+        self.commit(Record::Block { block })
+    }
+
+    pub fn commit_ecu_hardware_part_number(&mut self, value: &[u8]) -> Result<(), JournalError> {
+        self.commit(Record::EcuHardwarePartNumber(value.to_vec()))
+    }
+
+    /// Records the software version read before the erase; refused once a transfer started.
+    pub fn commit_pre_erase_software_version(&mut self, value: &[u8]) -> Result<(), JournalError> {
+        self.commit(Record::PreEraseSoftwareVersion(value.to_vec()))
+    }
+
+    /// Counts a resume of `stage` and records the attempt's key with it in one record, and
+    /// returns the new count. Committed before the resume's first request to the ECU.
+    pub fn commit_resume(
+        &mut self,
+        stage: StageId,
+        attempt_key: Option<&[u8]>,
+    ) -> Result<u16, JournalError> {
+        let count =
+            self.state
+                .facts
+                .resume_count(stage)
+                .checked_add(1)
+                .ok_or(JournalError::Invariant(
+                    "the resume count is at its maximum",
+                ))?;
+        self.commit(Record::Resume {
+            stage,
+            count,
+            attempt_key: attempt_key.map(<[u8]>::to_vec),
+        })?;
+        Ok(count)
+    }
+
+    /// The transfer-start marker, committed before the first erase or RequestDownload of an
+    /// attempt is sent. It clears the previous attempt's exit marker and post-transfer progress.
+    pub fn commit_transfer_start(
+        &mut self,
+        stage: StageId,
+        at: StepRef,
+    ) -> Result<(), JournalError> {
+        self.commit(Record::TransferStart { stage, at })
+    }
+
+    /// The RequestTransferExit marker, committed before the request is sent.
+    pub fn commit_transfer_exit_intent(&mut self, at: StepRef) -> Result<(), JournalError> {
+        self.commit(Record::TransferExitIntent { at })
+    }
+
+    /// Records that the post-transfer steps reached their end boundary.
+    pub fn commit_post_transfer_complete(&mut self) -> Result<(), JournalError> {
+        self.commit(Record::PostTransferComplete)
+    }
+
+    fn commit(&mut self, record: Record) -> Result<(), JournalError> {
+        if self.poisoned {
+            return Err(JournalError::Poisoned);
+        }
+        let mut facts = self.state.facts.clone();
+        facts.apply(&record).map_err(JournalError::Invariant)?;
+        let entry = Entry {
+            seq: self.state.records,
+            at_unix_ms: unix_ms(),
+            record,
+        };
+        let mut frame = Vec::new();
+        push_frame(&mut frame, &encode(&entry)?)?;
+        if let Err(error) = self.store.append_sync(&frame) {
+            self.poisoned = true;
+            return Err(error.into());
+        }
+        self.state.facts = facts;
+        if let Record::Step {
+            vm_state: Some(vm_state),
+            ..
+        } = entry.record
+        {
+            self.state.last_vm_state = Some(vm_state);
+        }
+        self.state.records += 1;
+        Ok(())
+    }
+}
+
+/// `{job_id}.g{generation}.journal` in `dir`. The job ID must be a plain name (a UUID is).
+fn journal_path(dir: &Path, key: &JobKey) -> Result<PathBuf, JournalError> {
+    let id = &key.job_id.0;
+    if id.is_empty()
+        || id.len() > 64
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return Err(JournalError::InvalidJobId(id.clone()));
+    }
+    Ok(dir.join(format!("{id}.g{}.journal", key.generation)))
+}
+
+/// Makes a new directory entry durable. NTFS logs the entry with the file's metadata, which
+/// the file's own sync covers.
+fn sync_dir(dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    File::open(dir)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
+}
+
+fn unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as u64)
+}
+
+fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, JournalError> {
+    postcard::to_allocvec(value).map_err(|_| JournalError::TooLarge)
+}
+
+fn push_frame(out: &mut Vec<u8>, payload: &[u8]) -> Result<(), JournalError> {
+    let len = u32::try_from(payload.len())
+        .ok()
+        .filter(|len| *len <= MAX_FRAME)
+        .ok_or(JournalError::TooLarge)?;
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(&crc32(payload).to_le_bytes());
+    out.extend_from_slice(payload);
+    Ok(())
+}
+
+/// How a frame at some offset reads.
+enum FrameRead<'a> {
+    Ok {
+        payload: &'a [u8],
+        next: usize,
+    },
+    /// What a commit that never finished can leave: the frame runs past the end of the file,
+    /// or it is the last thing in the file and fails its checksum (zeros or old data where the
+    /// write did not land).
+    Torn,
+    /// A complete frame that fails its checksum with more bytes after it, which no single
+    /// unfinished commit leaves.
+    Bad,
+}
+
+fn read_frame(bytes: &[u8], offset: usize) -> FrameRead<'_> {
+    let rest = &bytes[offset..];
+    let Some((head, body)) = rest.split_first_chunk::<FRAME_HEADER>() else {
+        return FrameRead::Torn;
+    };
+    let len = u32::from_le_bytes([head[0], head[1], head[2], head[3]]);
+    let crc = u32::from_le_bytes([head[4], head[5], head[6], head[7]]);
+    if len == 0 || len > MAX_FRAME || len as usize > body.len() {
+        return FrameRead::Torn;
+    }
+    let payload = &body[..len as usize];
+    let next = offset + FRAME_HEADER + payload.len();
+    if crc32(payload) == crc {
+        FrameRead::Ok { payload, next }
+    } else if next == bytes.len() {
+        FrameRead::Torn
+    } else {
+        FrameRead::Bad
+    }
+}
+
+struct Loaded {
+    state: JournalState,
+    /// Bytes up to the end of the last whole frame.
+    len: usize,
+}
+
+fn load(bytes: &[u8], key: &JobKey) -> Result<Loaded, JournalError> {
+    let corrupt = |offset: usize, reason| JournalError::Corrupt {
+        offset: offset as u64,
+        reason,
+    };
+    if bytes.len() < PREAMBLE || bytes[..MAGIC.len()] != MAGIC {
+        return Err(corrupt(0, "not a journal"));
+    }
+    let version = u32::from_le_bytes(bytes[MAGIC.len()..PREAMBLE].try_into().expect("four bytes"));
+    if version != FORMAT_VERSION {
+        return Err(JournalError::UnsupportedVersion(version));
+    }
+    // `create` makes the header durable before the file has its name, so it is never torn.
+    let FrameRead::Ok { payload, next } = read_frame(bytes, PREAMBLE) else {
+        return Err(corrupt(PREAMBLE, "the header does not read back"));
+    };
+    let header: Header = postcard::from_bytes(payload)
+        .map_err(|_| corrupt(PREAMBLE, "the header does not decode"))?;
+    if header.key != *key {
+        return Err(JournalError::WrongJob);
+    }
+    if header.protection != 0 {
+        return Err(corrupt(PREAMBLE, "unknown protection"));
+    }
+    let mut state = JournalState {
+        facts: RecoveryFacts::new(header.key),
+        last_vm_state: None,
+        records: 0,
+    };
+    let mut offset = next;
+    while offset < bytes.len() {
+        let (payload, next) = match read_frame(bytes, offset) {
+            FrameRead::Ok { payload, next } => (payload, next),
+            // One unfinished commit leaves at most one frame.
+            FrameRead::Torn if bytes.len() - offset <= FRAME_HEADER + MAX_FRAME as usize => break,
+            FrameRead::Torn => return Err(corrupt(offset, "a record does not read back")),
+            FrameRead::Bad => return Err(corrupt(offset, "a record fails its checksum")),
+        };
+        let entry: Entry = postcard::from_bytes(payload)
+            .map_err(|_| corrupt(offset, "a record does not decode"))?;
+        if entry.seq != state.records {
+            return Err(corrupt(offset, "a record is out of sequence"));
+        }
+        state
+            .facts
+            .apply(&entry.record)
+            .map_err(|reason| corrupt(offset, reason))?;
+        if let Record::Step {
+            vm_state: Some(vm_state),
+            ..
+        } = entry.record
+        {
+            state.last_vm_state = Some(vm_state);
+        }
+        state.records += 1;
+        offset = next;
+    }
+    Ok(Loaded { state, len: offset })
+}
+
+/// CRC-32 (IEEE 802.3, reflected, as zlib computes it).
+fn crc32(bytes: &[u8]) -> u32 {
+    const TABLE: [u32; 256] = {
+        let mut table = [0u32; 256];
+        let mut index = 0;
+        while index < 256 {
+            let mut crc = index as u32;
+            let mut bit = 0;
+            while bit < 8 {
+                crc = if crc & 1 != 0 {
+                    0xEDB8_8320 ^ (crc >> 1)
+                } else {
+                    crc >> 1
+                };
+                bit += 1;
+            }
+            table[index] = crc;
+            index += 1;
+        }
+        table
+    };
+    !bytes.iter().fold(!0u32, |crc, byte| {
+        TABLE[((crc ^ u32::from(*byte)) & 0xFF) as usize] ^ (crc >> 8)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            static COUNT: AtomicU32 = AtomicU32::new(0);
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "ngr-journal-{nanos}-{}",
+                COUNT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(&path).expect("temporary directory");
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn key() -> JobKey {
+        JobKey {
+            job_id: JobId("0190f5a8-7c2e-7d4b-9a6e-3f1c2b4d5e6f".to_owned()),
+            generation: 1,
+        }
+    }
+
+    fn at(pc: u32, steps: u64) -> StepRef {
+        StepRef { pc, steps }
+    }
+
+    const STAGE: StageId = StageId(1);
+
+    /// Every kind of commit, in a write job's order, with a second attempt at the end.
+    fn script<S: Store>(journal: &mut Journal<S>, mut after_each: impl FnMut(&Journal<S>)) {
+        type Commit<S> = fn(&mut Journal<S>) -> Result<(), JournalError>;
+        let commits: [Commit<S>; 14] = [
+            |j| j.commit_ecu_hardware_part_number(b"HW-1"),
+            |j| j.commit_pre_erase_software_version(b"1.0.0"),
+            |j| j.commit_step(at(2, 10), Some(b"vm-1")),
+            |j| j.commit_transfer_start(STAGE, at(3, 11)),
+            |j| j.commit_step(at(3, 11), None),
+            |j| j.commit_block(0),
+            |j| j.commit_block(1),
+            |j| j.commit_transfer_exit_intent(at(5, 20)),
+            |j| j.commit_step(at(5, 20), None),
+            |j| j.commit_post_transfer_complete(),
+            |j| j.commit_resume(STAGE, Some(b"attempt-1")).map(drop),
+            |j| j.commit_transfer_start(STAGE, at(3, 30)),
+            |j| j.commit_step(at(3, 30), Some(b"vm-2")),
+            |j| j.commit_block(0),
+        ];
+        for commit in commits {
+            commit(journal).expect("the script commits");
+            after_each(journal);
+        }
+    }
+
+    fn path(dir: &TempDir) -> PathBuf {
+        journal_path(&dir.0, &key()).expect("valid key")
+    }
+
+    #[test]
+    fn crc32_matches_the_check_value() {
+        assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+    }
+
+    #[test]
+    fn reads_back_what_it_committed() {
+        let dir = TempDir::new();
+        let mut journal = Journal::create(&dir.0, &key()).expect("create");
+        script(&mut journal, |_| {});
+        let reopened = Journal::open(&dir.0, &key()).expect("open");
+        assert_eq!(reopened.state(), journal.state());
+        assert_eq!(reopened.summary(), journal.summary());
+        let facts = reopened.summary();
+        assert_eq!(facts.resume_counts, [(STAGE, 1)]);
+        assert_eq!(facts.attempt_key.as_deref(), Some(&b"attempt-1"[..]));
+        assert_eq!(
+            facts.transfer,
+            Some(TransferAttempt {
+                stage: STAGE,
+                started_at: at(3, 30),
+                last_block: Some(0),
+                exit: None,
+            })
+        );
+        assert_eq!(
+            reopened.state().last_vm_state.as_deref(),
+            Some(&b"vm-2"[..])
+        );
+        assert_eq!(reopened.state().records, 14);
+    }
+
+    /// Every prefix of the file reads back as the state after its last whole frame: the
+    /// prefixes are what a crash during an append can leave.
+    #[test]
+    fn every_cut_reads_back_as_the_last_whole_commit() {
+        let dir = TempDir::new();
+        let mut journal = Journal::create(&dir.0, &key()).expect("create");
+        let mut boundaries = vec![(journal.store.len as usize, journal.state().clone())];
+        script(&mut journal, |j| {
+            boundaries.push((j.store.len as usize, j.state().clone()));
+        });
+        let bytes = fs::read(path(&dir)).expect("read");
+        assert_eq!(bytes.len(), boundaries.last().expect("some").0);
+        for cut in 0..=bytes.len() {
+            let loaded = load(&bytes[..cut], &key());
+            match boundaries.iter().rev().find(|(len, _)| *len <= cut) {
+                None => assert!(
+                    matches!(loaded, Err(JournalError::Corrupt { .. })),
+                    "cut {cut}"
+                ),
+                Some((len, state)) => {
+                    let loaded = loaded.unwrap_or_else(|error| panic!("cut {cut}: {error}"));
+                    assert_eq!((loaded.len, &loaded.state), (*len, state), "cut {cut}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_torn_tail_is_cut_off_and_the_journal_continues() {
+        for tail in [vec![0u8; 64], vec![0xA5; 3], {
+            // A whole frame whose payload did not land.
+            let mut frame = Vec::new();
+            push_frame(&mut frame, &[1, 2, 3, 4]).expect("frame");
+            frame[FRAME_HEADER..].fill(0);
+            frame
+        }] {
+            let dir = TempDir::new();
+            let mut journal = Journal::create(&dir.0, &key()).expect("create");
+            journal.commit_block(0).expect_err("no transfer yet");
+            journal
+                .commit_ecu_hardware_part_number(b"HW-1")
+                .expect("commit");
+            let committed = journal.state().clone();
+            drop(journal);
+            let mut file = OpenOptions::new()
+                .append(true)
+                .open(path(&dir))
+                .expect("open");
+            file.write_all(&tail).expect("append");
+            drop(file);
+
+            let mut journal = Journal::open(&dir.0, &key()).expect("open");
+            assert_eq!(journal.state(), &committed, "{tail:02X?}");
+            journal
+                .commit_pre_erase_software_version(b"1.0.0")
+                .expect("commit after the cut");
+            let reopened = Journal::open(&dir.0, &key()).expect("reopen");
+            assert_eq!(reopened.state(), journal.state());
+        }
+    }
+
+    #[test]
+    fn a_damaged_record_with_records_after_it_is_corrupt() {
+        let dir = TempDir::new();
+        let mut journal = Journal::create(&dir.0, &key()).expect("create");
+        let header_end = journal.store.len as usize;
+        script(&mut journal, |_| {});
+        let mut bytes = fs::read(path(&dir)).expect("read");
+        // The first record's payload.
+        bytes[header_end + FRAME_HEADER] ^= 0x40;
+        fs::write(path(&dir), &bytes).expect("write");
+        assert!(matches!(
+            Journal::open(&dir.0, &key()),
+            Err(JournalError::Corrupt { offset, .. }) if offset == header_end as u64
+        ));
+    }
+
+    #[test]
+    fn refuses_a_file_it_cannot_trust() {
+        let dir = TempDir::new();
+        drop(Journal::create(&dir.0, &key()).expect("create"));
+        let good = fs::read(path(&dir)).expect("read");
+
+        let other = JobKey {
+            generation: 2,
+            ..key()
+        };
+        fs::copy(path(&dir), journal_path(&dir.0, &other).expect("key")).expect("copy");
+        assert!(matches!(
+            Journal::open(&dir.0, &other),
+            Err(JournalError::WrongJob)
+        ));
+
+        let mut newer = good.clone();
+        newer[MAGIC.len()..PREAMBLE].copy_from_slice(&2u32.to_le_bytes());
+        fs::write(path(&dir), &newer).expect("write");
+        assert!(matches!(
+            Journal::open(&dir.0, &key()),
+            Err(JournalError::UnsupportedVersion(2))
+        ));
+
+        let mut foreign = good.clone();
+        foreign[0] = b'X';
+        fs::write(path(&dir), &foreign).expect("write");
+        assert!(matches!(
+            Journal::open(&dir.0, &key()),
+            Err(JournalError::Corrupt { offset: 0, .. })
+        ));
+
+        // A header cut short is not a torn tail: `create` never leaves one.
+        fs::write(path(&dir), &good[..good.len() - 1]).expect("write");
+        assert!(matches!(
+            Journal::open(&dir.0, &key()),
+            Err(JournalError::Corrupt { .. })
+        ));
+    }
+
+    #[test]
+    fn create_and_open_check_the_file() {
+        let dir = TempDir::new();
+        assert!(matches!(
+            Journal::open(&dir.0, &key()),
+            Err(JournalError::NotFound)
+        ));
+        drop(Journal::create(&dir.0, &key()).expect("create"));
+        assert!(matches!(
+            Journal::create(&dir.0, &key()),
+            Err(JournalError::AlreadyExists)
+        ));
+        let names: Vec<_> = fs::read_dir(&dir.0)
+            .expect("list")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+        assert_eq!(names, [path(&dir).file_name().expect("name").to_owned()]);
+        for id in ["", "../x", "a/b", "a.b", "a\\b"] {
+            let key = JobKey {
+                job_id: JobId(id.to_owned()),
+                generation: 0,
+            };
+            assert!(
+                matches!(
+                    Journal::create(&dir.0, &key),
+                    Err(JournalError::InvalidJobId(_))
+                ),
+                "{id:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn records_out_of_order_are_refused() {
+        let dir = TempDir::new();
+        let mut j = Journal::create(&dir.0, &key()).expect("create");
+        let refused = |result: Result<(), JournalError>| {
+            assert!(
+                matches!(result, Err(JournalError::Invariant(_))),
+                "{result:?}"
+            );
+        };
+        refused(j.commit_block(0));
+        refused(j.commit_transfer_exit_intent(at(1, 1)));
+        refused(j.commit_post_transfer_complete());
+        j.commit_step(at(1, 5), None).expect("step");
+        refused(j.commit_step(at(1, 5), None));
+        refused(j.commit_transfer_start(STAGE, at(2, 4)));
+        j.commit_transfer_start(STAGE, at(2, 6)).expect("start");
+        refused(j.commit_pre_erase_software_version(b"1.0.0"));
+        j.commit_block(3).expect("block");
+        refused(j.commit_block(3));
+        j.commit_transfer_exit_intent(at(3, 7)).expect("exit");
+        refused(j.commit_block(4));
+        refused(j.commit_transfer_exit_intent(at(3, 8)));
+        j.commit_post_transfer_complete().expect("complete");
+        refused(j.commit_post_transfer_complete());
+        // A step after completion is not post-transfer progress.
+        j.commit_step(at(4, 9), None).expect("step");
+        let exit = j.summary().transfer.and_then(|t| t.exit).expect("exit");
+        assert_eq!((exit.last_post_step, exit.complete), (None, true));
+
+        let refused_state = j.state().clone();
+        let records = j.state().records;
+        let reopened = Journal::open(&dir.0, &key()).expect("open");
+        assert_eq!(reopened.state(), &refused_state);
+        assert_eq!(reopened.state().records, records);
+    }
+
+    #[test]
+    fn the_resume_count_stops_at_its_maximum() {
+        let mut facts = RecoveryFacts::new(key());
+        facts.resume_counts = vec![(STAGE, u16::MAX)];
+        let mut j = Journal {
+            store: Memory::default(),
+            state: JournalState {
+                facts,
+                last_vm_state: None,
+                records: 0,
+            },
+            poisoned: false,
+        };
+        assert!(matches!(
+            j.commit_resume(STAGE, None),
+            Err(JournalError::Invariant(_))
+        ));
+        assert_eq!(j.commit_resume(StageId(2), None).expect("resume"), 1);
+        assert!(j.store.0.len() == 1);
+    }
+
+    #[test]
+    fn a_new_transfer_start_clears_the_exit_marker_and_post_transfer_progress() {
+        let mut j = memory();
+        j.commit_resume(STAGE, None).expect("resume");
+        j.commit_transfer_start(STAGE, at(3, 1)).expect("start");
+        j.commit_block(0).expect("block");
+        j.commit_transfer_exit_intent(at(5, 2)).expect("exit");
+        j.commit_step(at(5, 2), None).expect("post step");
+        assert!(j.summary().transfer.and_then(|t| t.exit).is_some());
+        j.commit_transfer_start(STAGE, at(3, 3)).expect("restart");
+        let facts = j.summary();
+        assert_eq!(
+            facts.transfer,
+            Some(TransferAttempt {
+                stage: STAGE,
+                started_at: at(3, 3),
+                last_block: None,
+                exit: None,
+            })
+        );
+        assert_eq!(facts.resume_counts, [(STAGE, 1)]);
+        assert_eq!(facts.last_step, Some(at(5, 2)));
+    }
+
+    #[derive(Default)]
+    struct Memory(Vec<Vec<u8>>);
+
+    impl Store for Memory {
+        fn append_sync(&mut self, bytes: &[u8]) -> io::Result<()> {
+            self.0.push(bytes.to_vec());
+            Ok(())
+        }
+    }
+
+    fn memory() -> Journal<Memory> {
+        Journal {
+            store: Memory::default(),
+            state: JournalState {
+                facts: RecoveryFacts::new(key()),
+                last_vm_state: None,
+                records: 0,
+            },
+            poisoned: false,
+        }
+    }
+
+    struct Failing;
+
+    impl Store for Failing {
+        fn append_sync(&mut self, _: &[u8]) -> io::Result<()> {
+            Err(io::Error::other("disk full"))
+        }
+    }
+
+    #[test]
+    fn a_failed_write_changes_nothing_and_poisons_the_journal() {
+        let mut j = Journal {
+            store: Failing,
+            state: memory().state,
+            poisoned: false,
+        };
+        let before = j.state().clone();
+        assert!(matches!(
+            j.commit_transfer_start(STAGE, at(1, 1)),
+            Err(JournalError::Io(_))
+        ));
+        assert_eq!(j.state(), &before);
+        assert!(matches!(
+            j.commit_step(at(1, 1), None),
+            Err(JournalError::Poisoned)
+        ));
+    }
+
+    #[test]
+    fn an_oversized_record_is_refused_without_poisoning() {
+        let mut j = memory();
+        let blob = vec![0u8; MAX_FRAME as usize];
+        assert!(matches!(
+            j.commit_step(at(1, 1), Some(&blob)),
+            Err(JournalError::TooLarge)
+        ));
+        j.commit_step(at(1, 1), Some(b"vm"))
+            .expect("a smaller one fits");
+    }
+
+    /// postcard encodes the variant index: a reordered or removed variant would misread every
+    /// journal already written.
+    #[test]
+    fn record_variants_keep_their_index() {
+        let records = [
+            Record::Step {
+                at: at(0, 0),
+                vm_state: None,
+            },
+            Record::Block { block: 0 },
+            Record::EcuHardwarePartNumber(Vec::new()),
+            Record::PreEraseSoftwareVersion(Vec::new()),
+            Record::Resume {
+                stage: STAGE,
+                count: 1,
+                attempt_key: None,
+            },
+            Record::TransferStart {
+                stage: STAGE,
+                at: at(0, 0),
+            },
+            Record::TransferExitIntent { at: at(0, 0) },
+            Record::PostTransferComplete,
+        ];
+        for (index, record) in records.iter().enumerate() {
+            assert_eq!(
+                postcard::to_allocvec(record).expect("encode")[0] as usize,
+                index,
+                "{record:?}"
+            );
+        }
+    }
+}

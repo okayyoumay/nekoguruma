@@ -75,8 +75,8 @@ Reading ISO 22901-1 against the old schema:
    KEYs, MUX case limits and end-marker TERMINATION-VALUE through the key's COMPU-METHOD into
    inclusive ranges of internal values, honouring the first-match order of overlapping TEXTTABLE
    scales, and rejects a key or marker it cannot convert (including a marker that needs more
-   than one range, and keys wider than 64 bits). The agent then needs no inverse conversion at
-   runtime. A static TABLE-KEY (one that names a single TABLE-ROW) is a constant: the frontend
+   than one range). A byte-field or string key or marker is compared for equality on its bytes,
+   read as a big-endian integer; one longer than 8 bytes is rejected. The agent then needs no inverse conversion at runtime. A static TABLE-KEY (one that names a single TABLE-ROW) is a constant: the frontend
    inlines the key bytes and the row's data and emits no `Select`.
 6. **Counts and keys are ordinary fields decoded first.** ODX places the item count of a
    DYNAMIC-LENGTH-FIELD and the switch key of a MUX inside the complex DOP, at positions

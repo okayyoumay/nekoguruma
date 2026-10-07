@@ -221,7 +221,9 @@ table Repeat {
   count_field_id: uint32 = 0;
   // UntilMarker: before each item, `marker` (Absolute, offset 0, Fixed length, no shape) is
   // decoded at the current position; an internal value within marker_lower..marker_upper
-  // (inclusive) ends the repetition and those bytes are left for the next field
+  // (inclusive) ends the repetition and those bytes are left for the next field. A Bytes, Ascii
+  // or Utf8 marker of up to 8 bytes is compared as its bytes read as a big-endian integer
+  // (stored bit for bit in int64), with lower == upper
   marker: Field;
   marker_lower: int64;
   marker_upper: int64;
@@ -235,7 +237,8 @@ table Repeat {
 // TABLE-STRUCT (7.3.6.10.7, 7.3.6.11), which is how DID tables and nested DIDs are expressed.
 // The Select field is placed where the chosen layout starts; the key is a separate field.
 // Keys are compared as internal values; the frontend converts ODX's physical limits and KEYs
-// through the key's COMPU-METHOD and rejects keys it cannot convert.
+// through the key's COMPU-METHOD and rejects keys it cannot convert. Byte and string keys of up
+// to 8 bytes are compared like byte and string markers (see Repeat).
 table Select {
   key_field_id: uint32;       // decoded before the Select field
   cases: [SelectCase];        // non-overlapping (the frontend rejects overlaps)

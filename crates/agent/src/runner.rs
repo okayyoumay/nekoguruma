@@ -69,9 +69,10 @@ pub enum JobError {
     Panicked,
 }
 
-/// The checks [`run_program`] makes before it touches the worker: the program must be one this
-/// VM can run, and the policy must allow every request in it. A caller can make them before it
-/// launches a worker for the job.
+/// The checks [`run_program`] makes before it touches the worker: the program's schema version and
+/// size must suit this VM (`Vm::check_state`), and the policy must allow every request in it.
+/// A caller can make them before it launches a worker for the job. The instructions themselves
+/// are not validated: a bad operand, such as a missing constant, fails when the VM reaches it.
 pub fn check_program(program: &Program) -> Result<(), JobError> {
     // A program this VM cannot run must not reach the bus.
     Vm::new(program)

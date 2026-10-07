@@ -22,8 +22,10 @@ command line rather than from the program.
 
 Steps (`agent::check_program`, `agent::launch::launch_j2534_worker`, then `agent::run_program`):
 
-1. Read the program and check it: a program the VM cannot run, or one with a request outside
-   the read-only policy, fails here, before any worker starts.
+1. Read the program and check it (`agent::check_program`): a program whose schema version or
+   size this VM does not accept, or one with a request outside the read-only policy, fails here,
+   before any worker starts. A bad operand, such as a missing constant, fails only when the VM
+   reaches it, after the worker has started.
 2. Resolve the VCI name the way each worker build would resolve it on its side
    (`j2534_0404_registry`): a `library_path` entry in `config.toml` under that build's
    architecture key, else at api level, else the build's registry view. The first build whose
@@ -48,7 +50,7 @@ Steps (`agent::check_program`, `agent::launch::launch_j2534_worker`, then `agent
 | Exit status | Meaning | Output |
 |---|---|---|
 | 0 | The program ran to its end | The final `diag_ir::VmState` as one line of JSON on stdout. A negative response is a value on the stack, not a failure |
-| 1 | Reading the program, launching the worker or the job failed | The reason on stderr |
+| 1 | Reading the program, launching the worker or the job failed, or the final state holds a non-finite float (infinity or NaN), which JSON cannot represent | The reason on stderr |
 | 2 | Invalid command line | The error and the usage on stderr |
 
 The worker's own log goes to stderr.

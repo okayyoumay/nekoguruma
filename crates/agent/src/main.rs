@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use agent::launch::launch_j2534_worker;
 use agent::{JobLimits, LinkConfig, check_program, run_program};
-use diag_ir::Program;
+use diag_ir::{Program, Value, VmState};
 use worker_host::service::{LaunchOptions, WorkerLayout};
 
 const USAGE: &str = "\
@@ -159,7 +159,30 @@ async fn run(args: RunArgs) -> Result<String, String> {
         eprintln!("ngr-agent: worker did not stop cleanly: {error}");
     }
     let state = result.map_err(|error| format!("job failed: {error}"))?;
+    // serde_json would print such a value as `null`, which no longer reads back as the state.
+    if holds_non_finite_float(&state) {
+        return Err(
+            "the final state holds a non-finite float, which JSON cannot represent".to_owned(),
+        );
+    }
     serde_json::to_string(&state).map_err(|error| format!("cannot print the result: {error}"))
+}
+
+/// Whether any value in `state` is an infinite or NaN `F64`.
+fn holds_non_finite_float(state: &VmState) -> bool {
+    let frames = state.call_stack.iter().flat_map(|frame| &frame.locals);
+    state
+        .stack
+        .iter()
+        .chain(
+            state
+                .locals
+                .iter()
+                .chain(&state.globals)
+                .chain(frames)
+                .flatten(),
+        )
+        .any(|value| matches!(value, Value::F64(number) if !number.is_finite()))
 }
 
 #[cfg(test)]
@@ -219,6 +242,37 @@ mod tests {
             &["run", "--vci", "x", "--program", "p", "--verbose", "1"],
         ] {
             assert!(parse(args).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn finds_non_finite_floats_anywhere_in_the_state() {
+        let finite = VmState {
+            schema_version: 0,
+            pc: 0,
+            stack: vec![Value::F64(1.5), Value::Bytes(vec![1])],
+            locals: vec![None, Some(Value::F64(-0.0))],
+            globals: vec![Some(Value::I64(1))],
+            call_stack: vec![diag_ir::Frame {
+                return_pc: 0,
+                locals: vec![Some(Value::F64(f64::MAX))],
+            }],
+            steps: 0,
+            checkpoint: None,
+            resume_count: 0,
+        };
+        assert!(!holds_non_finite_float(&finite));
+
+        let mut stack = finite.clone();
+        stack.stack.push(Value::F64(f64::INFINITY));
+        let mut global = finite.clone();
+        global.globals.push(Some(Value::F64(f64::NAN)));
+        let mut frame = finite.clone();
+        frame.call_stack[0]
+            .locals
+            .push(Some(Value::F64(f64::NEG_INFINITY)));
+        for state in [stack, global, frame] {
+            assert!(holds_non_finite_float(&state), "{state:?}");
         }
     }
 }

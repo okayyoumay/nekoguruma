@@ -2043,6 +2043,38 @@ fn a_jump_after_the_erase_cannot_skip_the_request_download() {
     assert_eq!(program_with(1).validate(), Ok(()));
 }
 
+/// After a routine-control erase, no block may be sent before the RequestDownload.
+#[test]
+fn transfer_data_must_follow_the_request_download() {
+    for op in [
+        Op::ServiceRequest { service: 0x36 },
+        Op::FlashTransfer { block: 0 },
+    ] {
+        let mut program = flow_program(|c| {
+            c[2] = op.clone();
+            c[3] = Op::ServiceRequest { service: 0x34 };
+            c[4] = Op::ServiceRequest { service: 0x37 };
+        });
+        program.flash[0].boundaries.transfer_exit_pc = 4;
+        assert_eq!(
+            program.validate(),
+            Err(ProgramError::TransferBeforeRequestDownload {
+                flash_session: 1,
+                pc: 2
+            }),
+            "{op:?}"
+        );
+        // After the RequestDownload it is the transfer itself.
+        let mut program = flow_program(|c| {
+            c[2] = Op::ServiceRequest { service: 0x34 };
+            c[3] = op.clone();
+            c[4] = Op::ServiceRequest { service: 0x37 };
+        });
+        program.flash[0].boundaries.transfer_exit_pc = 4;
+        assert_eq!(program.validate(), Ok(()), "{op:?}");
+    }
+}
+
 #[test]
 fn a_backward_jump_does_not_cross_the_recovery_point() {
     // FromPc(4): the jump at 4 back to the erase crosses it; a jump at 2 does not.

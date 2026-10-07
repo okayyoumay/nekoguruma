@@ -211,7 +211,8 @@ pub struct RecoveryTiming {
     pub teardown_margin_millis: u32,
     /// How long the ECU takes to answer again after a reset.
     pub ecu_startup_millis: u32,
-    /// How long after the transfer a confirmation of the result is awaited.
+    /// How long the restart keeps retrying to confirm that the ECU is back in its default
+    /// session (data identifier F186), after the startup time or a passive teardown (ADR-229).
     pub confirmation_window_millis: u32,
 }
 
@@ -314,6 +315,8 @@ pub enum ProgramError {
         "flash session {flash_session}: the plan has no RequestDownload before its transfer exit"
     )]
     MissingRequestDownload { flash_session: u32 },
+    #[error("flash session {flash_session}: the transfer at {pc} comes before the RequestDownload")]
+    TransferBeforeRequestDownload { flash_session: u32, pc: u32 },
 }
 
 fn is_erase(op: Option<&Op>) -> bool {
@@ -520,6 +523,11 @@ impl Program {
                     downloads > 1
                 }
                 Op::ServiceRequest { service: 0x37 } => pc != b.transfer_exit_pc,
+                Op::ServiceRequest { service: 0x36 } | Op::FlashTransfer { .. }
+                    if downloads == 0 =>
+                {
+                    return Err(ProgramError::TransferBeforeRequestDownload { flash_session, pc });
+                }
                 _ => false,
             };
             if undeclared {

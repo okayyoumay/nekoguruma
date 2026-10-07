@@ -302,7 +302,7 @@ A ComParam data type whose value is an array of same-sized struct entries, the l
 One of a **flash recovery plan**'s four positions in the bytecode: where the replayable pre-erase steps begin, the erase (or RequestDownload when there is no erase) that the transfer-start marker precedes, the RequestTransferExit that its marker precedes, and the end of the post-transfer steps, where they are journaled as complete (ADR-245).
 
 **Runtime input** (IR)  
-A state the agent or the VCI reports rather than an ECU service: supply voltage, external supply connected, ignition, engine running, vehicle speed. A precondition or identity source in the procedure part names either a runtime input or an ECU service field (`diag_ir::Source`, ADR-245).
+A state the agent or the VCI reports rather than an ECU service: supply voltage, external supply connected, ignition, engine running, vehicle speed. A precondition's source in the procedure part names either a runtime input or an ECU service field; an identity source is always an ECU service field (`diag_ir::Source`, ADR-245).
 
 ## T–U
 

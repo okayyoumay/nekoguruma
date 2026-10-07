@@ -84,7 +84,8 @@ runner in M1.
    `check_program` runs it before the program reaches a worker. It checks that:
    - every section lies inside the code with its start before its end;
    - the boundaries are ordered and inside the code;
-   - a plan holds one RequestDownload and no RequestTransferExit but its declared one;
+   - a plan holds one RequestDownload, no transfer before it and no RequestTransferExit but
+     its declared one;
    - `erase_pc` is a routine control or a RequestDownload, and `transfer_exit_pc` a
      RequestTransferExit;
    - download requests and flash transfers appear only between a plan's erase and its

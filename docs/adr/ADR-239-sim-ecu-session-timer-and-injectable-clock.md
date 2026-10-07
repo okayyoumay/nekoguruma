@@ -46,8 +46,10 @@ time line that stand for those events.
 - `sim-vci`'s ECU runs on real time, so sessions there time out after 5 s without a request, as
   on a vehicle. Tests that hold a non-default session through `sim-vci` send TesterPresent or set
   a longer `s3_server_ms` in `NGR_SIM_ECU_CONFIG`.
-- Because the restart point is computed from the reported delay, a response that `sim-vci` later
-  discards (a power cycle while it is still delayed) still counts as sent for tS3_Server. The ECU
-  has power-cycled by then, which ends the session anyway.
+- A response that `sim-vci` discards because the ECU power-cycles while it is still delayed does
+  not count as sent: the power cycle resets the record of pending responses. It makes no
+  difference to the session, which the power cycle ends anyway.
+- An ECU reset takes effect when its response has gone out, so a security delay it restarts runs
+  from then, not from the request.
 - Clause 9.4.1 also asks a server that supports the delay to start it at power-up after a single
   earlier false key. The simulator does not; this is recorded as a known gap.

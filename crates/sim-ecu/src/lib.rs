@@ -504,7 +504,16 @@ impl SimEcu {
             // The request never reaches the ECU.
             return Exchange::none();
         }
+        let power_cycles = self.power_cycles;
         let (exchange, sent_after_ms) = self.handle(addressing, message);
+        if self.power_cycles != power_cycles {
+            // An ECU reset takes effect once its response has gone out, so a security delay it
+            // restarts runs from then.
+            let shift = Duration::from_millis(sent_after_ms.into());
+            if let Some(until) = &mut self.security_delay_until {
+                *until = until.saturating_add(shift);
+            }
+        }
         // Any request that reaches the ECU restarts tS3_Server, supported or not.
         self.restart_s3(sent_after_ms);
         exchange

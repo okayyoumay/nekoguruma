@@ -104,8 +104,8 @@ The third false key in a row returns NRC 36 and starts the delay timer; requestS
 NRC 37 until the delay has run (`EcuConfig::security_delay_ms`, 10000 ms by default; clause 9.4.1
 leaves the length to the vehicle manufacturer) or a test calls `SimEcu::expire_security_delay()`.
 `security_delay_active()` reports whether it is running. A power cycle or ECU reset clears the
-false-attempt counter and starts a delay that is still running again for its full length; one that
-has already run out stays over. Clause 9.4.1 also asks a server that supports the delay to start it
+false-attempt counter and starts a delay that is still running again for its full length (after an
+ECU reset, from when its response goes out); one that has already run out stays over. Clause 9.4.1 also asks a server that supports the delay to start it
 at power-up when an earlier SecurityAccess failed on a single false key; the simulator does not. With
 `EcuConfig::require_security_access` unset, secured operations do not check the lock state.
 

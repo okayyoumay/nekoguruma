@@ -1732,3 +1732,22 @@ fn s3_waits_for_a_delayed_response_overtaken_by_a_later_one() {
     ecu.check_timers();
     assert_eq!(ecu.session, Session::Default);
 }
+
+#[test]
+fn a_delay_restarted_by_an_ecu_reset_runs_from_its_response() {
+    let (mut ecu, clock) = ecu_with_clock(EcuConfig {
+        security_delay_ms: Some(2_000),
+        response_delay_ms: 500,
+        ..config()
+    });
+    enter(&mut ecu, Session::Extended);
+    exceed_attempts(&mut ecu);
+    assert_eq!(
+        ecu.exchange(Addressing::Physical, &[0x11, 0x01]).delay_ms,
+        500
+    );
+    clock.advance(ms(2_499));
+    assert!(ecu.security_delay_active());
+    clock.advance(ms(1));
+    assert!(!ecu.security_delay_active());
+}

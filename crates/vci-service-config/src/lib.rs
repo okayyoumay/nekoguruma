@@ -1346,8 +1346,13 @@ mod tests {
     fn default_locations_are_under_nekoguruma() {
         let defaults = env!("VCI_CONFIG_PATH") == "nekoguruma/config.toml"
             && env!("NGR_J2534_DEFINITION_DIR") == "nekoguruma/j2534";
-        let runtime_overrides = std::env::var_os("VCI_CONFIG_PATH").is_some()
-            || std::env::var_os("NGR_J2534_DEFINITION_DIR").is_some();
+        // Cargo puts `rustc-env` values into the test process's environment as well, so a
+        // variable holding the embedded value is no override.
+        let overridden = |name: &str, embedded: &str| {
+            std::env::var_os(name).is_some_and(|value| !value.is_empty() && value != embedded)
+        };
+        let runtime_overrides = overridden("VCI_CONFIG_PATH", env!("VCI_CONFIG_PATH"))
+            || overridden("NGR_J2534_DEFINITION_DIR", env!("NGR_J2534_DEFINITION_DIR"));
         if !defaults || runtime_overrides {
             eprintln!("skipped: VCI_CONFIG_PATH or NGR_J2534_DEFINITION_DIR is set");
             return;

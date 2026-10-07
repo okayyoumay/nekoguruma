@@ -86,6 +86,8 @@ Then stop the run and go to "Final report" if any of these holds:
 
 - no items are left;
 - the latest CI run on `main` failed (a red `main` is P0 work, outside the loop);
+- an open `codeql-alerts` PR exists (title prefix `[codeql]` or the `codeql` label, head branch
+  in this repository): tasks run one at a time, across both loops;
 - this run's current PR was closed without being merged. Add `Blocked on: the maintainer's
   reason for closing PR #<n>` to its item as a backlog edit (see "Backlog edits"), so no later
   run picks it again, and report the close;

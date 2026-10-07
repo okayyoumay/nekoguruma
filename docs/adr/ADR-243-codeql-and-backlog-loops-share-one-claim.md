@@ -1,7 +1,7 @@
 # ADR-243: The CodeQL and Backlog Loops Share One PR-Based Claim
 
 **Date:** 2026-10-07
-**Status:** Accepted
+**Status:** Accepted (Decision item 3's skipping of high and critical alerts and item 4's number-only hand-off of them superseded by ADR-246)
 **Affects:** `.claude/skills/codeql-alerts/SKILL.md`, `.claude/skills/backlog-loop/SKILL.md`, `.github/workflows/codeql-alert-handoff.yml`
 
 ## Context

@@ -38,7 +38,7 @@ Workspace skeleton (step 1): every crate goes as far as type and boundary defini
 ## Data model (`db/`)
 
 - **P2**: Partition granularity: monthly is assumed; finalize once the non-functional targets are decided (design 17 P1 is settled by ADR-236). Blocked on: design 17 P5.
-- **P2**: Retention of software update records (UNECE R156 records, the job execution records of write jobs): an operator setting per tenant, separate from maintenance records (ADR-237, design 4.3, 16.2). Done when: update records carry a `retain_until` derived from that setting, and a test shows a maintenance-record deletion leaves them in place.
+- **P2**: Retention of write-job audit records (the job execution records of ECU writes; UNECE R156 evidence retention stays with the vehicle maker's SUMS): an operator setting per tenant, separate from maintenance records (ADR-237, design 4.3, 16.2). Done when: write-job audit records carry a `retain_until` derived from that setting, and a test shows a maintenance-record deletion leaves them in place.
 - **P2**: `vehicle_locks` expiry: derive the default for `expires_at` from the expected duration of each job kind.
 - **P2**: `retain_until` logic for the retention period of maintenance records: an operator setting per tenant and record kind, with no jurisdiction-specific defaults (ADR-237, design 4.3). Done when: the setting exists, `retain_until` is derived from it when a record is stored, and a test covers a changed setting.
 - **P2**: `ir_documents` lookup has only a GIN index on part numbers. ECU-VARIANT-PATTERN matching happens on the agent side; verify with real data whether this is enough server-side filtering.

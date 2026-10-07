@@ -90,7 +90,8 @@ markets are chosen. The maintainer chose A.
    Such registration is a maker access condition, not the inspection-tool certification of
    item 1.
 5. **Retention periods are operator settings.** Statutory retention periods for maintenance
-   records and update records differ by jurisdiction. The framework provides a configurable
+   records and for the audit records of write jobs differ by jurisdiction (UNECE R156 evidence
+   retention is the vehicle maker's, under its own SUMS). The framework provides a configurable
    retention period per tenant and record kind and ships no jurisdiction-specific defaults; the
    operator sets them (16.1).
 6. **Data-recipient duties are the operator's.** When an operator receives vehicle data under
@@ -112,5 +113,5 @@ markets are chosen. The maintainer chose A.
   duties belong to the operator or the framework user.
 - A business that wants to use the system for statutory inspection cannot do so without the
   separate decision in item 1.
-- Japan's current inspection scan tool requirements were not found in public sources during the
-  survey; they are needed only if item 1 is revisited.
+- Japan's current inspection scan tool requirements were not reviewed for this decision; they
+  are needed only if item 1 is revisited.

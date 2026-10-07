@@ -15,8 +15,8 @@ below refer to SAE J2534-1 (v04.04).
   The ECU's timers run on real time, so a non-default session ends after tS3_Server (5 s unless
   the configuration sets `s3_server_ms`) without a request, as on a vehicle.
 - The ECU lives as long as the process: `PassThruClose` and a new `PassThruOpen` keep its
-  session and flash state, as a vehicle keeps its state while the tester disconnects. A process
-  restart starts a fresh ECU.
+  flash state, and its session too if the device is opened again within tS3_Server, as a vehicle
+  keeps its state while the tester disconnects. A process restart starts a fresh ECU.
 - `PassThruConnect` accepts `ISO15765` with 11-bit CAN IDs only; any other protocol, or the
   29-bit ID flag, gets `ERR_NOT_SUPPORTED`. Channel IDs count up from 1. `PassThruClose` drops
   every channel together with its filters and unread responses; `PassThruDisconnect` drops one.

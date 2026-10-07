@@ -1382,3 +1382,31 @@ fn read_vbatt_on_a_lost_device_reports_the_loss_before_checking_arguments() {
         ERR_DEVICE_NOT_CONNECTED
     );
 }
+
+// ---------------------------------------------------------------- ECU timers
+
+#[test]
+fn the_ecu_session_times_out_in_real_time() {
+    let f = setup(EcuConfig {
+        s3_server_ms: Some(100),
+        ..default_ecu_config()
+    });
+    write(f.channel, ECU_PHYSICAL_REQUEST_ID, &[0x10, 0x03]);
+    assert_eq!(read(f.channel, 1, 1000).0, STATUS_NOERROR);
+    // TesterPresent within tS3 keeps the session.
+    std::thread::sleep(Duration::from_millis(50));
+    write(f.channel, ECU_PHYSICAL_REQUEST_ID, &[0x3E, 0x00]);
+    assert_eq!(read(f.channel, 1, 1000).0, STATUS_NOERROR);
+    write(f.channel, ECU_PHYSICAL_REQUEST_ID, &[0x22, 0xF1, 0x86]);
+    assert_eq!(
+        read(f.channel, 1, 1000),
+        (STATUS_NOERROR, vec![response(&[0x62, 0xF1, 0x86, 0x03])])
+    );
+    // Without a request for longer than tS3, the ECU is back in the default session.
+    std::thread::sleep(Duration::from_millis(250));
+    write(f.channel, ECU_PHYSICAL_REQUEST_ID, &[0x22, 0xF1, 0x86]);
+    assert_eq!(
+        read(f.channel, 1, 1000),
+        (STATUS_NOERROR, vec![response(&[0x62, 0xF1, 0x86, 0x01])])
+    );
+}

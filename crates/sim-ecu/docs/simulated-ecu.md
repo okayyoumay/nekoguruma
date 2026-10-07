@@ -55,8 +55,9 @@ Any other SID gets NRC 11.
 A non-default session times out after tS3_Server without a request (`EcuConfig::s3_server_ms`,
 5000 ms by default, the value ISO 14229-2 (2021) gives). The timer restarts with every request
 that reaches the ECU, whatever the service and whether it is supported, and runs from when the
-response goes out (after its delay), or from the request when there is no response; a request
-lost on the bus does not restart it. When it expires, the ECU falls back to the default session as
+response goes out (after its delay), also when that response is then lost (`Fault::DropResponse`),
+or from the request when no response is sent; a request lost on the bus does not restart it.
+Timers keep running while the ECU is powered off or silent. When it expires, the ECU falls back to the default session as
 for a change to it: security is relocked and a running download is interrupted. The default
 session has no timer. An ECU reset or `reconnect()` also ends a non-default session.
 
@@ -101,7 +102,9 @@ The third false key in a row returns NRC 36 and starts the delay timer; requestS
 NRC 37 until the delay has run (`EcuConfig::security_delay_ms`, 10000 ms by default; the length is
 the vehicle manufacturer's choice) or a test calls `SimEcu::expire_security_delay()`.
 `security_delay_active()` reports whether it is running. A power cycle or ECU reset clears the
-false-attempt counter and starts an active delay again for its full length. With
+false-attempt counter and starts a delay that is still running again for its full length; one that
+has already run out stays over. Clause 9.4.1 also asks a server that supports the delay to start it
+at power-up when an earlier SecurityAccess failed on a single false key; the simulator does not. With
 `EcuConfig::require_security_access` unset, secured operations do not check the lock state.
 
 ## Routines and download

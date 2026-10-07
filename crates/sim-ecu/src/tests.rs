@@ -1636,3 +1636,75 @@ fn timer_settings_are_optional_in_json() {
         (None, None)
     );
 }
+
+#[test]
+fn a_power_cycle_does_not_revive_a_security_delay_that_ran_out() {
+    for request_while_off in [false, true] {
+        let (mut ecu, clock) = ecu_with_clock(EcuConfig {
+            security_delay_ms: Some(2_000),
+            ..config()
+        });
+        enter(&mut ecu, Session::Extended);
+        exceed_attempts(&mut ecu);
+        ecu.inject(Fault::PowerLoss);
+        // The delay restarts with the power loss and runs while the ECU is off.
+        clock.advance(ms(2_500));
+        if request_while_off {
+            assert_eq!(ecu.request(&[0x3E, 0x00]), SimResponse::NoResponse);
+        }
+        ecu.reconnect();
+        assert!(
+            !ecu.security_delay_active(),
+            "request while off: {request_while_off}"
+        );
+        enter(&mut ecu, Session::Extended);
+        unlock(&mut ecu);
+    }
+}
+
+#[test]
+fn a_reconnect_restarts_a_security_delay_still_running() {
+    let (mut ecu, clock) = ecu_with_clock(EcuConfig {
+        security_delay_ms: Some(2_000),
+        ..config()
+    });
+    enter(&mut ecu, Session::Extended);
+    exceed_attempts(&mut ecu);
+    clock.advance(ms(1_500));
+    ecu.reconnect();
+    clock.advance(ms(1_999));
+    assert!(ecu.security_delay_active());
+    clock.advance(ms(1));
+    assert!(!ecu.security_delay_active());
+}
+
+#[test]
+fn s3_runs_from_when_a_dropped_response_would_have_gone_out() {
+    let (mut ecu, clock) = ecu_with_clock(EcuConfig {
+        s3_server_ms: Some(1_000),
+        ..config()
+    });
+    enter(&mut ecu, Session::Extended);
+    ecu.inject(Fault::DelayResponse { ms: 4_000 });
+    ecu.inject(Fault::DropResponse);
+    assert_eq!(ecu.request(&[0x3E, 0x00]), SimResponse::NoResponse);
+    clock.advance(ms(4_999));
+    ecu.check_timers();
+    assert_eq!(ecu.session, Session::Extended);
+    clock.advance(ms(1));
+    ecu.check_timers();
+    assert_eq!(ecu.session, Session::Default);
+}
+
+#[test]
+fn timers_do_not_overflow_at_the_end_of_time() {
+    let (mut ecu, clock) = ecu_with_clock(config());
+    clock.advance(Duration::MAX);
+    // Starting either timer saturates instead of panicking. (They then expire at once.)
+    enter(&mut ecu, Session::Extended);
+    for _ in 0..MAX_SECURITY_ATTEMPTS {
+        ecu.request(&[0x27, 0x01]);
+        ecu.request(&[0x27, 0x02, 0, 0, 0, 0]);
+    }
+    ecu.check_timers();
+}

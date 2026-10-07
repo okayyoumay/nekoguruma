@@ -447,7 +447,11 @@ impl SimEcu {
             .config
             .security_delay_ms
             .unwrap_or(DEFAULT_SECURITY_DELAY_MS);
-        self.security_delay_until = Some(self.clock.now() + Duration::from_millis(delay.into()));
+        self.security_delay_until = Some(
+            self.clock
+                .now()
+                .saturating_add(Duration::from_millis(delay.into())),
+        );
     }
 
     /// Restarts tS3_Server after a request was handled: it runs from when the response goes out
@@ -456,7 +460,9 @@ impl SimEcu {
     fn restart_s3(&mut self, delay_ms: u32) {
         self.s3_deadline = (self.session != Session::Default).then(|| {
             let s3 = self.config.s3_server_ms.unwrap_or(DEFAULT_S3_SERVER_MS);
-            self.clock.now() + Duration::from_millis(u64::from(delay_ms) + u64::from(s3))
+            self.clock
+                .now()
+                .saturating_add(Duration::from_millis(u64::from(delay_ms) + u64::from(s3)))
         });
     }
 
@@ -475,9 +481,9 @@ impl SimEcu {
         self.exchange(addressing, message).response
     }
 
-    /// Handles one request and reports how long after the request the response goes out.
-    /// The simulator has no clock: the delay is for the VCI side to apply. It is
-    /// `EcuConfig::response_delay_ms` plus any [`Fault::DelayResponse`] that fires on this request.
+    /// Handles one request and reports how long after the request the response goes out, for the
+    /// VCI side to apply. The delay is `EcuConfig::response_delay_ms` plus any
+    /// [`Fault::DelayResponse`] that fires on this request.
     pub fn exchange(&mut self, addressing: Addressing, message: &[u8]) -> Exchange {
         self.check_timers();
         if self.silent {
@@ -487,14 +493,16 @@ impl SimEcu {
             // The request never reaches the ECU.
             return Exchange::none();
         }
-        let exchange = self.handle(addressing, message);
+        let (exchange, sent_after_ms) = self.handle(addressing, message);
         // Any request that reaches the ECU restarts tS3_Server, supported or not.
-        self.restart_s3(exchange.delay_ms);
+        self.restart_s3(sent_after_ms);
         exchange
     }
 
-    /// [`SimEcu::exchange`] for a request that has reached the ECU.
-    fn handle(&mut self, addressing: Addressing, message: &[u8]) -> Exchange {
+    /// [`SimEcu::exchange`] for a request that has reached the ECU. Also returns when the
+    /// response finished going out, in ms from now: tS3_Server restarts then, even for a
+    /// response lost on the way ([`Fault::DropResponse`]), and at once when none is sent.
+    fn handle(&mut self, addressing: Addressing, message: &[u8]) -> (Exchange, u32) {
         let mut delay_ms = self.config.response_delay_ms;
         while let Some(Fault::DelayResponse { ms }) =
             self.take_armed(|f| matches!(f, Fault::DelayResponse { .. }))
@@ -502,17 +510,17 @@ impl SimEcu {
             delay_ms = delay_ms.saturating_add(ms);
         }
         let response = self.respond(addressing, message);
-        if self
+        let dropped = self
             .take_armed(|f| matches!(f, Fault::DropResponse))
-            .is_some()
-        {
-            // The request was handled; only its response is lost.
-            return Exchange::none();
-        }
+            .is_some();
         if response == SimResponse::NoResponse {
-            return Exchange::none();
+            return (Exchange::none(), 0);
         }
-        Exchange { response, delay_ms }
+        if dropped {
+            // The request was handled; only its response is lost.
+            return (Exchange::none(), delay_ms);
+        }
+        (Exchange { response, delay_ms }, delay_ms)
     }
 
     /// Arms a fault (13.4). [`Fault::PowerLoss`] takes effect at once; the others fire on a later
@@ -562,6 +570,9 @@ impl SimEcu {
     /// The false-attempt counter starts again at zero (Annex I, transition 1); an active
     /// security delay starts again for its full length, as on power-up.
     fn power_cycle(&mut self) {
+        // A delay that ran out before the power cycle stays over, whether or not a request
+        // arrived in the meantime to notice it.
+        self.check_timers();
         self.power_cycles += 1;
         self.session = Session::Default;
         self.s3_deadline = None;

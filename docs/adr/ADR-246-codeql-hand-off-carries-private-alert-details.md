@@ -24,8 +24,10 @@ request; they never reach the workflow log, an artifact or the repository, which
    alert, so neither list crowds out the other. High and critical alerts
    stay open until they are fixed privately, so a fixed first part would starve the rest: when
    they do not all fit, their list is split into consecutive pages that each fit the budget,
-   each run sends the next page, chosen by the workflow's run number, and over successive runs
-   every one is sent.
+   and each run sends one page picked at random, so over successive runs every one is sent.
+   The workflow's run number is not used to pick the page: runs that exit early also advance
+   it, so some pages could be skipped every time, and a stored cursor would need state the
+   workflow cannot keep reliably.
 3. **Verified, reported inside the project only.** The run verifies high and critical alerts
    like any other. It never opens a PR, issue, branch or commit for them and never writes their
    details to a repository file or a GitHub comment. A false positive is reported with a

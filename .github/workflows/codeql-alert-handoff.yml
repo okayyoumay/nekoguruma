@@ -93,9 +93,11 @@ jobs:
           # their own (at most 28000 bytes), so neither list crowds out the other; `alerts` gets
           # the rest of 58000 bytes. `alerts` keeps its most urgent part, since a fixed or
           # dismissed alert makes room for the next. Private alerts can stay open longer, so
-          # their list is split into pages that each fit the share, and each run sends the next
-          # page (by run number): every one is sent over successive runs.
-          jq -s -c --arg repo "$REPO" --argjson run "$GITHUB_RUN_NUMBER" '
+          # their list is split into pages that each fit the share, and each run sends a page
+          # chosen at random. The run number would not do: runs that exit early also advance it,
+          # so some pages could be skipped every time. A random pick needs no stored state and
+          # sends every page sooner or later.
+          jq -s -c --arg repo "$REPO" --argjson pick "$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')" '
             def high: .rule.security_severity_level == "critical"
                       or .rule.security_severity_level == "high";
             def urgency:
@@ -136,7 +138,7 @@ jobs:
             | (map(select(high | not)) | slim) as $rest
             | ($p | pages(28000)) as $pg
             | (if ($pg | length) == 0 then []
-               else $pg[($run - 1) % ($pg | length)] end) as $private
+               else $pg[$pick % ($pg | length)] end) as $private
             | {repository: $repo, ref: "refs/heads/main", total: length,
                private_total: ($p | length), private: $private, alerts: []}
             | (tojson | utf8bytelength) as $used

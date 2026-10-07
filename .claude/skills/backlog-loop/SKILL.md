@@ -86,8 +86,8 @@ Then stop the run and go to "Final report" if any of these holds:
 
 - no items are left;
 - the latest CI run on `main` failed (a red `main` is P0 work, outside the loop);
-- an open `codeql-alerts` PR exists (title prefix `[codeql]` or the `codeql` label, head branch
-  in this repository): tasks run one at a time, across both loops;
+- an open `codeql-alerts` PR exists (the `codeql` label, or the title prefix `[codeql]` with a
+  head branch in this repository; ADR-243): tasks run one at a time, across both loops;
 - this run's current PR was closed without being merged. Add `Blocked on: the maintainer's
   reason for closing PR #<n>` to its item as a backlog edit (see "Backlog edits"), so no later
   run picks it again, and report the close;
@@ -120,8 +120,8 @@ first paragraph). The open loop PR is what tells any other session that an item 
 progress.
 
 Then list the open loop PRs again (title prefix or label, as in step 1), together with the open
-`codeql-alerts` PRs (title prefix `[codeql]` or the `codeql` label, head branch in this
-repository; ADR-243). The title prefix is set when the PR is created, so this does not depend on
+`codeql-alerts` PRs (the `codeql` label, or the title prefix `[codeql]` with a head branch in
+this repository; ADR-243). The title prefix is set when the PR is created, so this does not depend on
 when either PR got its label. If one of them has a lower number than this one (two runs started together), mark this one "final" in its run
 state, close it with a comment naming the other, and stop the run. Backlog edits made while
 picking are dropped with it on purpose: the winning run, or a later one, finds the same stale,

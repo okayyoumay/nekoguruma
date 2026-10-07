@@ -44,9 +44,9 @@ Stop and go to "Report" if any of these holds:
 
 - this run has fixed as many alerts as its maximum;
 - every open alert in the list is on this run's skipped list;
-- an open PR whose head branch is in this repository has a title starting with `[codeql]` or
-  `[backlog-loop]`, or carries the `codeql` or `backlog-loop` label. Tasks run one at a time,
-  across both loops;
+- an open PR is in the claim set (ADR-243): it carries the `codeql` or `backlog-loop` label, or
+  its head branch is in this repository and its title starts with `[codeql]` or
+  `[backlog-loop]`. Tasks run one at a time, across both loops;
 - the latest CI run on `main` failed (a red `main` is P0 work, outside this loop);
 - this run's previous PR was closed without being merged.
 
@@ -88,8 +88,7 @@ push, and open the draft PR at once. The title starts with `[codeql]` and names 
 the place, e.g. `[codeql] rust/cleartext-logging: redact the VIN in agent logs`; add the
 `codeql` label (create it if the repository does not have it).
 
-Then list the open PRs from branches in this repository whose title starts with `[codeql]` or
-`[backlog-loop]`, or that carry the `codeql` or `backlog-loop` label. If one has a lower number
+Then list the open PRs in the claim set again (as in step 2). If one has a lower number
 than this PR, two runs started together: close this PR with a comment naming the other, and go
 to "Report".
 
@@ -111,10 +110,10 @@ round.
 End the turn. While the PR is open, any wake other than its merge or close is handled by
 `pr-review-loop`.
 
-When the PR is merged, record it in the run state, wait for CodeQL to analyse the new `main`
-(the `Analyze` checks on the merge commit), then run `scripts/codeql-alerts.sh show <n>`: the
-alert should now be `fixed`. If it is still open, report that and stop rather than retrying.
-Otherwise go to step 1. When the PR is closed without merging, go to step 2, which stops the
+When the PR is merged, wait for CodeQL to analyse the new `main` (the `Analyze` checks on the
+merge commit), then run `scripts/codeql-alerts.sh show <n>`: the alert should now be `fixed`.
+If it is still open, report that and stop rather than retrying. Otherwise record the alert as
+fixed in the run state, and only then go to step 1. When the PR is closed without merging, go to step 2, which stops the
 run.
 
 ## Run state
@@ -124,7 +123,8 @@ with reasons. Keep it in a "CodeQL run" section of the current PR's description 
 whenever it changes; a merged PR's description can still be edited. To resume with `pr=<n>`,
 read the state from that PR and subscribe to its activity, then go on by its state: open, run
 `pr-review-loop` on it (step 5's last paragraph still applies); merged, step 6's merge handling
-unless the state already records the merge, then step 1; closed without merging, "Report".
+unless the state already records the alert as fixed, then step 1; closed without merging,
+"Report".
 
 ## Report
 

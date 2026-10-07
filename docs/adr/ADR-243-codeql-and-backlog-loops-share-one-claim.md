@@ -16,9 +16,10 @@ lets two runs that start together both pass it.
 
 ## Decision
 
-1. **One claim set.** The open PRs from branches in this repository whose title starts with
-   `[backlog-loop]` or `[codeql]`, or that carry the `backlog-loop` or `codeql` label, form a
-   single claim set. Either loop stops before starting work while any of them is open (other
+1. **One claim set.** The open PRs that carry the `backlog-loop` or `codeql` label, or whose
+   head branch is in this repository and whose title starts with `[backlog-loop]` or `[codeql]`,
+   form a single claim set. As in ADR-230, the head-branch condition guards only the title
+   prefix, which anyone can choose for a fork PR; a label needs write access to set. Either loop stops before starting work while any of them is open (other
    than its own run's PR).
 2. **Claim before work, lower number wins.** Each loop opens its draft PR (with an empty commit
    if there is nothing to commit yet) before implementing anything, then lists the claim set

@@ -8,7 +8,9 @@
 //!   cargo build -p sim-vci --target i686-pc-windows-msvc    (win-x86)
 //!   cargo build -p sim-vci --target x86_64-unknown-linux-gnu (linux-x86_64)
 
+use std::ffi::CStr;
 use std::os::raw::{c_char, c_void};
+use std::path::PathBuf;
 
 /// J2534 `unsigned long`.
 /// Windows is LLP64, so it is 32-bit even on 64-bit; Linux / AArch64 are LP64, so it is 64-bit.
@@ -39,7 +41,8 @@ use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use j2534_defs::consts::{connect_flag, filter, ioctl, protocol, status, tx_flag};
-use sim_ecu::{Addressing, EcuConfig, SimEcu};
+use serde::Deserialize;
+use sim_ecu::{Addressing, EcuConfig, Fault, SimEcu};
 
 pub const STATUS_NOERROR: PassThruUlong = status::STATUS_NOERROR as PassThruUlong;
 pub const ERR_NOT_SUPPORTED: PassThruUlong = status::ERR_NOT_SUPPORTED as PassThruUlong;
@@ -110,7 +113,8 @@ pub struct PassThruMsg {
 /// Read on the first `PassThruOpen` of the process; without it a built-in configuration is used.
 pub const ECU_CONFIG_ENV: &str = "NGR_SIM_ECU_CONFIG";
 
-/// The device ID `PassThruOpen` returns. The simulator has one device.
+/// The device ID the first `PassThruOpen` returns. The simulator has one device; it gets a new
+/// ID only when it is opened again after it was lost (`ERR_DEVICE_NOT_CONNECTED`).
 pub const DEVICE_ID: PassThruUlong = 1;
 
 /// 11-bit CAN IDs of the simulated ECU (ISO 15765-4 legacy OBD identifiers of the first ECU).
@@ -236,11 +240,21 @@ struct Bus {
     /// keeps its state while the device is closed and opened again.
     ecu: Option<SimEcu>,
     device_open: bool,
+    /// ID of the open device, or the one the next `PassThruOpen` returns.
+    device_id: PassThruUlong,
+    /// Whether the VCI is plugged in (`Command::DisconnectVci`, `Command::ConnectVci`).
+    vci_present: bool,
+    /// Set when the VCI goes away while the device is open. Every call then returns
+    /// `ERR_DEVICE_NOT_CONNECTED`, even once the VCI is back, until `PassThruClose` releases
+    /// the device (J2534-1 6.10.1).
+    device_lost: bool,
     channels: HashMap<PassThruUlong, Channel>,
     next_channel: PassThruUlong,
     epoch: Instant,
     /// Pin carrying a programming voltage, if any (J2534-1 7.2.11 allows one at a time).
     programming_pin: Option<PassThruUlong>,
+    /// Directory control command files are taken from ([`CONTROL_DIR_ENV`]).
+    control_dir: Option<PathBuf>,
 }
 
 static BUS: OnceLock<(Mutex<Bus>, Condvar)> = OnceLock::new();
@@ -251,19 +265,36 @@ fn bus() -> &'static (Mutex<Bus>, Condvar) {
             Mutex::new(Bus {
                 ecu: None,
                 device_open: false,
+                device_id: DEVICE_ID,
+                vci_present: true,
+                device_lost: false,
                 channels: HashMap::new(),
                 next_channel: 1,
                 epoch: Instant::now(),
                 programming_pin: None,
+                control_dir: std::env::var_os(CONTROL_DIR_ENV).map(PathBuf::from),
             }),
             Condvar::new(),
         )
     })
 }
 
-/// A panic in one call must not wedge every later call, so a poisoned lock is taken over.
+/// Locks the bus and applies the pending control command files. A panic in one call must not
+/// wedge every later call, so a poisoned lock is taken over.
 fn lock() -> MutexGuard<'static, Bus> {
-    bus().0.lock().unwrap_or_else(|e| e.into_inner())
+    let mut bus = bus().0.lock().unwrap_or_else(|e| e.into_inner());
+    bus.apply_control_files();
+    bus
+}
+
+/// [`lock`] for a J2534 call that needs the device: fails with `ERR_DEVICE_NOT_CONNECTED` while
+/// the VCI is unplugged or the device is lost (J2534-1 6.10.1).
+fn lock_connected() -> Result<MutexGuard<'static, Bus>, PassThruUlong> {
+    let bus = lock();
+    if bus.unreachable() {
+        return Err(ERR_DEVICE_NOT_CONNECTED);
+    }
+    Ok(bus)
 }
 
 /// `PassThruUlong` is `u32` on Windows and `u64` elsewhere, so the cast is a no-op on some targets.
@@ -313,7 +344,84 @@ fn load_ecu_config() -> Option<EcuConfig> {
 
 impl Bus {
     fn device_ok(&self, device_id: PassThruUlong) -> bool {
-        self.device_open && device_id == DEVICE_ID
+        self.device_open && device_id == self.device_id
+    }
+
+    fn unreachable(&self) -> bool {
+        !self.vci_present || self.device_lost
+    }
+
+    /// Closes the device: its channels go with their filters and unread responses, and every
+    /// programming pin is switched off.
+    fn close_device(&mut self) {
+        self.device_open = false;
+        self.channels.clear();
+        self.programming_pin = None;
+        notify();
+    }
+
+    /// The simulated ECU, created with the configuration from `NGR_SIM_ECU_CONFIG` if the
+    /// process has none yet. `ERR_FAILED` if that configuration cannot be read.
+    fn ecu(&mut self) -> Result<&mut SimEcu, PassThruUlong> {
+        if self.ecu.is_none() {
+            self.ecu = Some(SimEcu::new(load_ecu_config().ok_or(ERR_FAILED)?));
+        }
+        Ok(self.ecu.as_mut().expect("created above"))
+    }
+
+    /// Applies one control command.
+    fn apply(&mut self, command: Command) -> Result<(), PassThruUlong> {
+        match command {
+            Command::InjectFault { fault } => self.change_ecu(|ecu| ecu.inject(fault)),
+            Command::ReconnectEcu {} => self.change_ecu(SimEcu::reconnect),
+            Command::DisconnectVci {} => {
+                self.vci_present = false;
+                self.device_lost |= self.device_open;
+                // Reads waiting for a response return at once.
+                notify();
+                Ok(())
+            }
+            Command::ConnectVci {} => {
+                self.vci_present = true;
+                Ok(())
+            }
+        }
+    }
+
+    fn change_ecu(&mut self, f: impl FnOnce(&mut SimEcu)) -> Result<(), PassThruUlong> {
+        let ecu = self.ecu()?;
+        let before = ecu.power_cycles();
+        f(ecu);
+        self.after_ecu_change(before);
+        Ok(())
+    }
+
+    /// Applies the `*.json` command files in the control directory, in file-name order. A file
+    /// applied is deleted; one that cannot be read, parsed or applied is renamed to
+    /// `*.rejected`, so it is not tried again and the test can see it failed.
+    fn apply_control_files(&mut self) {
+        let Some(dir) = &self.control_dir else {
+            return;
+        };
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        let mut files: Vec<PathBuf> = entries
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+            .collect();
+        files.sort();
+        for path in files {
+            let applied = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|text| serde_json::from_str::<Command>(&text).ok())
+                .is_some_and(|command| self.apply(command).is_ok());
+            if applied {
+                let _ = std::fs::remove_file(&path);
+            } else {
+                let _ = std::fs::rename(&path, path.with_extension("rejected"));
+            }
+        }
     }
 
     fn power_cycles(&self) -> u64 {
@@ -386,7 +494,8 @@ impl Bus {
     }
 }
 
-/// Runs `f` on the simulated ECU, creating it with `config` if the process has none yet.
+/// Runs `f` on the simulated ECU, creating it with the built-in configuration if the process has
+/// none yet.
 /// Lets tests inspect the ECU and inject faults (`sim_ecu::Fault`) between J2534 calls.
 #[cfg(test)]
 fn with_ecu<R>(f: impl FnOnce(&mut SimEcu) -> R) -> R {
@@ -405,7 +514,64 @@ fn reset(config: EcuConfig) {
     let mut bus = lock();
     bus.ecu = Some(SimEcu::new(config));
     bus.device_open = false;
+    bus.device_id = DEVICE_ID;
+    bus.vci_present = true;
+    bus.device_lost = false;
     bus.channels.clear();
+    bus.programming_pin = None;
+    bus.control_dir = None;
+}
+
+// ---------------------------------------------------------------- Control
+
+/// Environment variable naming a directory `sim-vci` takes control commands from, so that a
+/// test can reach the library inside the worker process that loaded it (ADR-238). Read once,
+/// on the first call into the library.
+pub const CONTROL_DIR_ENV: &str = "NGR_SIM_VCI_CONTROL_DIR";
+
+/// How often a waiting `PassThruReadMsgs` looks for control files.
+const CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// A control command, as JSON: `{"command": "inject_fault", "fault": "power_loss"}`,
+/// `{"command": "reconnect_ecu"}`, `{"command": "disconnect_vci"}`, `{"command": "connect_vci"}`.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
+enum Command {
+    /// Arms a `sim_ecu::Fault` on the ECU (`SimEcu::inject`).
+    InjectFault { fault: Fault },
+    /// `SimEcu::reconnect`: ends a power loss.
+    ReconnectEcu {},
+    /// Unplugs the VCI: J2534 calls return `ERR_DEVICE_NOT_CONNECTED`.
+    DisconnectVci {},
+    /// Plugs the VCI back in. A device that was open when it went away stays lost until it is
+    /// closed (J2534-1 6.10.1).
+    ConnectVci {},
+}
+
+/// Applies one control command, given as the JSON a control file holds. For a test that loads
+/// the library into its own process; a worker process is reached through [`CONTROL_DIR_ENV`].
+/// Returns `ERR_FAILED` for a command that cannot be parsed, or an ECU that cannot be created.
+///
+/// # Safety
+/// `command` must be null or a valid NUL-terminated string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn NgrSimVciControl(command: *const c_char) -> PassThruUlong {
+    if command.is_null() {
+        return ERR_NULL_PARAMETER;
+    }
+    // SAFETY: checked for null above; the caller guarantees a NUL-terminated string.
+    let text = unsafe { CStr::from_ptr(command) };
+    let Some(command) = text
+        .to_str()
+        .ok()
+        .and_then(|text| serde_json::from_str::<Command>(text).ok())
+    else {
+        return ERR_FAILED;
+    };
+    match lock().apply(command) {
+        Ok(()) => STATUS_NOERROR,
+        Err(status) => status,
+    }
 }
 
 // ---------------------------------------------------------------- Exports
@@ -423,9 +589,14 @@ pub unsafe extern "C" fn PassThruReadVersion(
     dll_version: *mut c_char,
     api_version: *mut c_char,
 ) -> PassThruUlong {
-    if !lock().device_ok(device_id) {
+    let bus = match lock_connected() {
+        Ok(bus) => bus,
+        Err(status) => return status,
+    };
+    if !bus.device_ok(device_id) {
         return ERR_INVALID_DEVICE_ID;
     }
+    drop(bus);
     if firmware_version.is_null() || dll_version.is_null() || api_version.is_null() {
         return ERR_NULL_PARAMETER;
     }
@@ -463,32 +634,40 @@ pub unsafe extern "C" fn PassThruOpen(
     device_id: *mut PassThruUlong,
 ) -> PassThruUlong {
     // TODO: make multiple opens configurable (for verifying 9.3 "whether multiple devices can be opened simultaneously").
+    let mut bus = match lock_connected() {
+        Ok(bus) => bus,
+        Err(status) => return status,
+    };
     if device_id.is_null() {
         return ERR_NULL_PARAMETER;
     }
-    let mut bus = lock();
-    if bus.ecu.is_none() {
-        let Some(config) = load_ecu_config() else {
-            return ERR_FAILED;
-        };
-        bus.ecu = Some(SimEcu::new(config));
+    if let Err(status) = bus.ecu() {
+        return status;
     }
     bus.device_open = true;
     // SAFETY: checked for null above; the caller guarantees it is writable.
-    unsafe { device_id.write(DEVICE_ID) };
+    unsafe { device_id.write(bus.device_id) };
     STATUS_NOERROR
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn PassThruClose(device_id: PassThruUlong) -> PassThruUlong {
     let mut bus = lock();
+    if bus.device_lost && bus.device_ok(device_id) {
+        // Closing is how the application recovers from a lost device; the call still reports
+        // the loss, and the next open gets a new device ID (J2534-1 6.10.1).
+        bus.close_device();
+        bus.device_lost = false;
+        bus.device_id = bus.device_id.wrapping_add(1).max(1);
+        return ERR_DEVICE_NOT_CONNECTED;
+    }
+    if bus.unreachable() {
+        return ERR_DEVICE_NOT_CONNECTED;
+    }
     if !bus.device_ok(device_id) {
         return ERR_INVALID_DEVICE_ID;
     }
-    bus.device_open = false;
-    bus.channels.clear();
-    bus.programming_pin = None;
-    notify();
+    bus.close_device();
     STATUS_NOERROR
 }
 
@@ -504,7 +683,10 @@ pub unsafe extern "C" fn PassThruConnect(
     _baud_rate: PassThruUlong,
     channel_id: *mut PassThruUlong,
 ) -> PassThruUlong {
-    let mut bus = lock();
+    let mut bus = match lock_connected() {
+        Ok(bus) => bus,
+        Err(status) => return status,
+    };
     if !bus.device_ok(device_id) {
         return ERR_INVALID_DEVICE_ID;
     }
@@ -526,7 +708,10 @@ pub unsafe extern "C" fn PassThruConnect(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn PassThruDisconnect(channel_id: PassThruUlong) -> PassThruUlong {
-    let mut bus = lock();
+    let mut bus = match lock_connected() {
+        Ok(bus) => bus,
+        Err(status) => return status,
+    };
     if bus.channels.remove(&channel_id).is_none() {
         return ERR_INVALID_CHANNEL_ID;
     }
@@ -547,6 +732,8 @@ pub unsafe extern "C" fn PassThruReadMsgs(
     num_msgs: *mut PassThruUlong,
     timeout: PassThruUlong,
 ) -> PassThruUlong {
+    // An unreachable device is reported by the loop below, which also sets `*num_msgs`.
+    let mut bus = lock();
     if msgs.is_null() || num_msgs.is_null() {
         return ERR_NULL_PARAMETER;
     }
@@ -558,9 +745,11 @@ pub unsafe extern "C" fn PassThruReadMsgs(
     let deadline = now
         .checked_add(millis(timeout))
         .unwrap_or(now + Duration::from_secs(365 * 24 * 3600));
-    let mut bus = lock();
     let mut read = 0;
     let status = loop {
+        if bus.unreachable() {
+            break ERR_DEVICE_NOT_CONNECTED;
+        }
         let epoch = bus.epoch;
         let Some(channel) = bus.channels.get_mut(&channel_id) else {
             break ERR_INVALID_CHANNEL_ID;
@@ -597,7 +786,13 @@ pub unsafe extern "C" fn PassThruReadMsgs(
             .rx
             .front()
             .map_or(deadline, |p| p.ready_at.min(deadline));
+        // A control command may arrive while the read waits (a VCI disconnect ends it).
+        let wake = match bus.control_dir {
+            Some(_) => wake.min(now + CONTROL_POLL_INTERVAL),
+            None => wake,
+        };
         bus = wait(bus, wake.saturating_duration_since(now));
+        bus.apply_control_files();
     };
     // SAFETY: as above.
     unsafe { num_msgs.write(read as PassThruUlong) };
@@ -618,12 +813,17 @@ pub unsafe extern "C" fn PassThruWriteMsgs(
     num_msgs: *mut PassThruUlong,
     _timeout: PassThruUlong,
 ) -> PassThruUlong {
+    let mut bus = lock();
     if msgs.is_null() || num_msgs.is_null() {
         return ERR_NULL_PARAMETER;
     }
     // SAFETY: checked for null above; the caller guarantees it is valid.
     let wanted = unsafe { num_msgs.read() } as usize;
-    let mut bus = lock();
+    if bus.unreachable() {
+        // SAFETY: as above.
+        unsafe { num_msgs.write(0) };
+        return ERR_DEVICE_NOT_CONNECTED;
+    }
     let Some(protocol_id) = bus.channels.get(&channel_id).map(|c| c.protocol_id) else {
         return ERR_INVALID_CHANNEL_ID;
     };
@@ -673,7 +873,10 @@ pub unsafe extern "C" fn PassThruStartMsgFilter(
     flow_control: *const PassThruMsg,
     filter_id: *mut PassThruUlong,
 ) -> PassThruUlong {
-    let mut bus = lock();
+    let mut bus = match lock_connected() {
+        Ok(bus) => bus,
+        Err(status) => return status,
+    };
     let Some(channel) = bus.channels.get_mut(&channel_id) else {
         return ERR_INVALID_CHANNEL_ID;
     };
@@ -741,7 +944,10 @@ pub extern "C" fn PassThruStopMsgFilter(
     channel_id: PassThruUlong,
     filter_id: PassThruUlong,
 ) -> PassThruUlong {
-    let mut bus = lock();
+    let mut bus = match lock_connected() {
+        Ok(bus) => bus,
+        Err(status) => return status,
+    };
     let Some(channel) = bus.channels.get_mut(&channel_id) else {
         return ERR_INVALID_CHANNEL_ID;
     };
@@ -760,7 +966,11 @@ pub extern "C" fn PassThruStartPeriodicMsg(
     _msg_id: *mut PassThruUlong,
     _interval: PassThruUlong,
 ) -> PassThruUlong {
-    if !lock().channels.contains_key(&channel_id) {
+    let bus = match lock_connected() {
+        Ok(bus) => bus,
+        Err(status) => return status,
+    };
+    if !bus.channels.contains_key(&channel_id) {
         return ERR_INVALID_CHANNEL_ID;
     }
     ERR_NOT_SUPPORTED
@@ -772,7 +982,11 @@ pub extern "C" fn PassThruStopPeriodicMsg(
     channel_id: PassThruUlong,
     _msg_id: PassThruUlong,
 ) -> PassThruUlong {
-    if !lock().channels.contains_key(&channel_id) {
+    let bus = match lock_connected() {
+        Ok(bus) => bus,
+        Err(status) => return status,
+    };
+    if !bus.channels.contains_key(&channel_id) {
         return ERR_INVALID_CHANNEL_ID;
     }
     ERR_INVALID_MSG_ID
@@ -788,7 +1002,10 @@ pub extern "C" fn PassThruSetProgrammingVoltage(
     pin: PassThruUlong,
     voltage: PassThruUlong,
 ) -> PassThruUlong {
-    let mut bus = lock();
+    let mut bus = match lock_connected() {
+        Ok(bus) => bus,
+        Err(status) => return status,
+    };
     if !bus.device_ok(device_id) {
         return ERR_INVALID_DEVICE_ID;
     }
@@ -845,11 +1062,14 @@ pub extern "C" fn PassThruIoctl(
 ) -> PassThruUlong {
     const CLEAR_MSG_FILTERS: PassThruUlong = ioctl::IOCTL_CLEAR_MSG_FILTERS as PassThruUlong;
     const CLEAR_RX_BUFFER: PassThruUlong = ioctl::IOCTL_CLEAR_RX_BUFFER as PassThruUlong;
+    let mut bus = match lock_connected() {
+        Ok(bus) => bus,
+        Err(status) => return status,
+    };
     if ioctl_id != CLEAR_MSG_FILTERS && ioctl_id != CLEAR_RX_BUFFER {
         // TODO: return READ_VBATT (voltage). Used for the precondition tests in 8.9.1.
         return STATUS_NOERROR;
     }
-    let mut bus = lock();
     let Some(channel) = bus.channels.get_mut(&handle_id) else {
         return ERR_INVALID_CHANNEL_ID;
     };

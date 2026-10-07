@@ -7,7 +7,8 @@ below refer to SAE J2534-1 (v04.04).
 
 ## Device and channels
 
-- `PassThruOpen` returns device ID 1. On the first open of the process it creates the ECU with the
+- `PassThruOpen` returns device ID 1, and a new ID only after a lost device was closed (see
+  "Control"). On the first open of the process it creates the ECU with the
   `sim_ecu::EcuConfig` read from the JSON file named by `NGR_SIM_ECU_CONFIG`, or with a built-in
   configuration (VIN `NGRSIMECU00000001`, part number `NGR-SIM-ECU`, software version `1.0.0`)
   when the variable is unset. An unreadable or invalid file makes the open fail with `ERR_FAILED`.
@@ -17,9 +18,9 @@ below refer to SAE J2534-1 (v04.04).
 - `PassThruConnect` accepts `ISO15765` with 11-bit CAN IDs only; any other protocol, or the
   29-bit ID flag, gets `ERR_NOT_SUPPORTED`. Channel IDs count up from 1. `PassThruClose` drops
   every channel together with its filters and unread responses; `PassThruDisconnect` drops one.
-- All 14 J2534 v04.04 functions are exported, so `j2534-0404-service` loads the library like a
-  vendor's on the targets where the exports' calling convention matches; the end-to-end test runs
-  on the host target. On Windows x86 the exports still use the C calling convention, not the
+- All 14 J2534 v04.04 functions are exported (with the control function `NgrSimVciControl`,
+  "Control" below), so `j2534-0404-service` loads the library like a vendor's on the targets
+  where the exports' calling convention matches; the end-to-end test runs on the host target. On Windows x86 the exports still use the C calling convention, not the
   stdcall a vendor DLL uses there, so the service cannot load that build yet. `PassThruReadVersion` reports firmware `NGR-SIM 1.0`, DLL `sim-vci <crate version>`
   and API `04.04` on an open device. `PassThruGetLastError` always reports a fixed text: the
   simulator keeps no error descriptions. `PassThruSetProgrammingVoltage` drives nothing but keeps
@@ -99,12 +100,49 @@ Simplifications:
 ## Fault injection
 
 The faults of `sim_ecu::Fault` act on the ECU behind the VCI as described in `sim-ecu`'s document;
-`sim-vci` applies the resulting delay or missing response on the read side. Today they can be
-armed only from `sim-vci`'s own unit tests.
+`sim-vci` applies the resulting delay or missing response on the read side. Tests arm them, and
+unplug the VCI, with control commands (ADR-238).
+
+## Control
+
+A control command is a JSON object tagged by `command`:
+
+| Command | Effect |
+|---|---|
+| `{"command": "inject_fault", "fault": F}` | `SimEcu::inject(F)`; `F` is a `sim_ecu::Fault` in snake case: `"power_loss"`, `"drop_response"`, `"bus_error"`, `{"delay_response": {"ms": 500}}`, `{"corrupt_block": {"block": 3}}` |
+| `{"command": "reconnect_ecu"}` | `SimEcu::reconnect`, which ends a power loss |
+| `{"command": "disconnect_vci"}` | unplugs the VCI |
+| `{"command": "connect_vci"}` | plugs it back in |
+
+Unknown commands and unknown fields are rejected. A command that needs the ECU creates it first,
+as the first `PassThruOpen` does. There are two ways to send one:
+
+- `NgrSimVciControl(const char *command)` applies one command in the calling process and returns
+  `STATUS_NOERROR`, `ERR_NULL_PARAMETER`, or `ERR_FAILED` for a command it cannot parse or an
+  ECU configuration it cannot read.
+- `NGR_SIM_VCI_CONTROL_DIR` names a directory, read once when the library is first called. For
+  a test driving a worker process that loaded the library. At the start of every call into the
+  library, and every 20 ms while `PassThruReadMsgs` waits, `sim-vci` applies the `*.json` files
+  there in file-name order and deletes each one; a file it cannot read, parse or apply is
+  renamed to `*.rejected`. Write each file under another name (such as `*.tmp`) and rename it,
+  so it is never read half-written, and name the files so that their order is the order to
+  apply them in (`001.json`, `002.json`, ...).
+
+While the VCI is unplugged, every function except `PassThruGetLastError` returns
+`ERR_DEVICE_NOT_CONNECTED`, and a waiting `PassThruReadMsgs` returns with it at once. Following
+clause 6.10.1, a device that was open when the VCI went away stays lost after it is plugged back
+in: every call returns `ERR_DEVICE_NOT_CONNECTED` until `PassThruClose` on that device, which
+releases it (with its channels and unread responses) and still reports the error. The next
+`PassThruOpen` returns a new device ID. A device that was closed when the VCI went away can be
+opened again as soon as it is back. The ECU keeps its state throughout.
+
+A VCI crash, as opposed to a disconnect, is not simulated.
 
 ## Tests
 
 `sim-vci`'s unit tests call the exports directly. `j2534-0404-service`'s
 `tests/sim_vci_end_to_end.rs` loads the built cdylib through the real service, launched by
 `worker-host` with the platform's `unsigned long` width (8 bytes on Linux x86_64), and reads the
-VIN over an ISO 15765 link.
+VIN over an ISO 15765 link. Its `tests/sim_vci_control.rs` runs agent jobs against the same setup
+and sends control commands through `NGR_SIM_VCI_CONTROL_DIR` between and during them: an ECU
+power loss and reconnection, and VCI disconnects with the device closed and open.

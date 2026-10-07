@@ -891,3 +891,218 @@ fn segmented_writes_need_the_partner_filter() {
         assert_eq!(PassThruDisconnect(channel), STATUS_NOERROR);
     }
 }
+
+// ---------------------------------------------------------------- Control
+
+/// Applies `command` through the control export.
+fn control(command: &str) -> PassThruUlong {
+    let command = std::ffi::CString::new(command).expect("no NUL in the command");
+    unsafe { NgrSimVciControl(command.as_ptr()) }
+}
+
+#[test]
+fn the_control_export_arms_faults_and_reconnects_the_ecu() {
+    let f = fixture();
+    assert_eq!(
+        control(r#"{"command": "inject_fault", "fault": {"delay_response": {"ms": 50}}}"#),
+        STATUS_NOERROR
+    );
+    assert_eq!(
+        with_ecu(|ecu| ecu.armed_faults().to_vec()),
+        [Fault::DelayResponse { ms: 50 }]
+    );
+    assert_eq!(
+        control(r#"{"command": "inject_fault", "fault": "power_loss"}"#),
+        STATUS_NOERROR
+    );
+    write(f.channel, ECU_PHYSICAL_REQUEST_ID, &[0x3E, 0x00]);
+    assert_eq!(read(f.channel, 1, 20), (ERR_BUFFER_EMPTY, vec![]));
+    assert_eq!(control(r#"{"command": "reconnect_ecu"}"#), STATUS_NOERROR);
+    write(f.channel, ECU_PHYSICAL_REQUEST_ID, &[0x3E, 0x00]);
+    assert_eq!(
+        read(f.channel, 1, 1000),
+        (STATUS_NOERROR, vec![response(&[0x7E, 0x00])])
+    );
+}
+
+#[test]
+fn the_control_export_rejects_what_it_cannot_parse() {
+    let _f = fixture();
+    assert_eq!(unsafe { NgrSimVciControl(ptr::null()) }, ERR_NULL_PARAMETER);
+    for command in [
+        "",
+        "not json",
+        r#"{"command": "explode"}"#,
+        r#"{"command": "inject_fault", "fault": "melt"}"#,
+        r#"{"command": "reconnect_ecu", "extra": 1}"#,
+    ] {
+        assert_eq!(control(command), ERR_FAILED, "{command}");
+    }
+}
+
+#[test]
+fn a_lost_device_stays_lost_until_closed_and_reopens_with_a_new_id() {
+    let f = fixture();
+    assert_eq!(control(r#"{"command": "disconnect_vci"}"#), STATUS_NOERROR);
+    let mut version = [[0 as c_char; 80]; 3];
+    let [fw, dll, api] = &mut version;
+    assert_eq!(
+        unsafe {
+            PassThruReadVersion(
+                DEVICE_ID,
+                fw.as_mut_ptr(),
+                dll.as_mut_ptr(),
+                api.as_mut_ptr(),
+            )
+        },
+        ERR_DEVICE_NOT_CONNECTED
+    );
+    let m = msg(ECU_PHYSICAL_REQUEST_ID, &[0x3E, 0x00]);
+    let mut n = 1;
+    assert_eq!(
+        unsafe { PassThruWriteMsgs(f.channel, &m, &mut n, 100) },
+        ERR_DEVICE_NOT_CONNECTED
+    );
+    assert_eq!(n, 0);
+    assert_eq!(read(f.channel, 1, 0), (ERR_DEVICE_NOT_CONNECTED, vec![]));
+    assert_eq!(
+        PassThruIoctl(f.channel, 0, ptr::null_mut(), ptr::null_mut()),
+        ERR_DEVICE_NOT_CONNECTED
+    );
+    let mut device = 0;
+    assert_eq!(
+        unsafe { PassThruOpen(ptr::null(), &mut device) },
+        ERR_DEVICE_NOT_CONNECTED
+    );
+    // Plugged back in, the device stays lost until it is closed (J2534-1 6.10.1).
+    assert_eq!(control(r#"{"command": "connect_vci"}"#), STATUS_NOERROR);
+    assert_eq!(read(f.channel, 1, 0), (ERR_DEVICE_NOT_CONNECTED, vec![]));
+    assert_eq!(PassThruClose(DEVICE_ID + 1), ERR_DEVICE_NOT_CONNECTED);
+    assert_eq!(PassThruClose(DEVICE_ID), ERR_DEVICE_NOT_CONNECTED);
+    assert_eq!(read(f.channel, 1, 0), (ERR_INVALID_CHANNEL_ID, vec![]));
+    assert_eq!(
+        unsafe { PassThruOpen(ptr::null(), &mut device) },
+        STATUS_NOERROR
+    );
+    assert_eq!(device, DEVICE_ID + 1);
+    let mut channel = 0;
+    assert_eq!(
+        unsafe { PassThruConnect(DEVICE_ID, ISO15765, 0, 500_000, &mut channel) },
+        ERR_INVALID_DEVICE_ID
+    );
+    assert_eq!(
+        unsafe { PassThruConnect(device, ISO15765, 0, 500_000, &mut channel) },
+        STATUS_NOERROR
+    );
+    assert_eq!(PassThruClose(device), STATUS_NOERROR);
+}
+
+#[test]
+fn a_vci_unplugged_while_closed_only_blocks_until_plugged_back() {
+    let _f = fixture();
+    assert_eq!(PassThruClose(DEVICE_ID), STATUS_NOERROR);
+    assert_eq!(control(r#"{"command": "disconnect_vci"}"#), STATUS_NOERROR);
+    let mut device = 0;
+    assert_eq!(
+        unsafe { PassThruOpen(ptr::null(), &mut device) },
+        ERR_DEVICE_NOT_CONNECTED
+    );
+    assert_eq!(PassThruClose(DEVICE_ID), ERR_DEVICE_NOT_CONNECTED);
+    assert_eq!(control(r#"{"command": "connect_vci"}"#), STATUS_NOERROR);
+    assert_eq!(
+        unsafe { PassThruOpen(ptr::null(), &mut device) },
+        STATUS_NOERROR
+    );
+    assert_eq!(device, DEVICE_ID);
+}
+
+#[test]
+fn a_disconnect_ends_a_waiting_read() {
+    let f = fixture();
+    let start = Instant::now();
+    let unplug = std::thread::spawn(|| {
+        std::thread::sleep(Duration::from_millis(50));
+        control(r#"{"command": "disconnect_vci"}"#)
+    });
+    assert_eq!(read(f.channel, 1, 5000), (ERR_DEVICE_NOT_CONNECTED, vec![]));
+    assert!(start.elapsed() < Duration::from_millis(4000));
+    assert_eq!(unplug.join().expect("no panic"), STATUS_NOERROR);
+}
+
+/// A fresh, empty control directory, removed when the test ends.
+struct ControlDir(PathBuf);
+
+impl ControlDir {
+    fn new(name: &str) -> Self {
+        let dir =
+            std::env::temp_dir().join(format!("sim-vci-control-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("control directory");
+        lock().control_dir = Some(dir.clone());
+        Self(dir)
+    }
+
+    /// Writes a command file the way a test should: under a temporary name, then renamed.
+    fn send(&self, name: &str, command: &str) {
+        let tmp = self.0.join(format!("{name}.tmp"));
+        std::fs::write(&tmp, command).expect("command file");
+        std::fs::rename(&tmp, self.0.join(format!("{name}.json"))).expect("rename");
+    }
+
+    fn files(&self) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(&self.0)
+            .expect("control directory")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+}
+
+impl Drop for ControlDir {
+    fn drop(&mut self) {
+        lock().control_dir = None;
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[test]
+fn control_files_apply_in_name_order_at_the_next_call() {
+    let f = fixture();
+    let dir = ControlDir::new("order");
+    // Reconnecting before the power loss would leave the ECU silent.
+    dir.send("002", r#"{"command": "reconnect_ecu"}"#);
+    dir.send(
+        "001",
+        r#"{"command": "inject_fault", "fault": "power_loss"}"#,
+    );
+    dir.send("003", r#"{"command": "inject_fault", "fault": "melt"}"#);
+    // Not applied before a call into the library.
+    assert_eq!(dir.files(), ["001.json", "002.json", "003.json"]);
+    write(f.channel, ECU_PHYSICAL_REQUEST_ID, &[0x3E, 0x00]);
+    assert_eq!(dir.files(), ["003.rejected"]);
+    // The power loss and the reconnection.
+    assert_eq!(with_ecu(|ecu| ecu.power_cycles()), 2);
+    assert_eq!(
+        read(f.channel, 1, 1000),
+        (STATUS_NOERROR, vec![response(&[0x7E, 0x00])])
+    );
+}
+
+#[test]
+fn a_control_file_reaches_a_waiting_read() {
+    let f = fixture();
+    let dir = ControlDir::new("wait");
+    let start = Instant::now();
+    let path = dir.0.clone();
+    let unplug = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(50));
+        let tmp = path.join("001.tmp");
+        std::fs::write(&tmp, r#"{"command": "disconnect_vci"}"#).expect("command file");
+        std::fs::rename(&tmp, path.join("001.json")).expect("rename");
+    });
+    assert_eq!(read(f.channel, 1, 5000), (ERR_DEVICE_NOT_CONNECTED, vec![]));
+    assert!(start.elapsed() < Duration::from_millis(4000));
+    unplug.join().expect("no panic");
+    assert!(dir.files().is_empty());
+}

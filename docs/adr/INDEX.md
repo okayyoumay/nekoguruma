@@ -226,6 +226,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-235](ADR-235-agent-job-runner-and-worker-diag-host.md) | Agent Job Runner and the Worker-Backed DiagHost | Accepted | `agent` runner, host, link |
 | [ADR-236](ADR-236-time-series-scale-and-raw-response-storage.md) | Time-Series Scale and Raw-Response Storage | Accepted | design 4.3 / 4.6 / 10.3 / 17, `dataset_chunks.chunk_format` |
 | [ADR-237](ADR-237-regulatory-scope-access-routes-without-tool-certification.md) | Regulatory Scope: Use the Access Routes Regulations Open, Without Tool Certification | Accepted | design 8.1 / 9.2 / 16.1 / 16.2 / 17, `db/` retention |
+| [ADR-238](ADR-238-sim-vci-control-commands-and-device-loss.md) | sim-vci Control Commands and Device Loss | Accepted | `sim-vci` control export and directory, `ERR_DEVICE_NOT_CONNECTED` |
 
 ## Status Legend
 
@@ -267,7 +268,7 @@ ADR-052 (loopback-only binding this ADR's auth mechanism relies on), ADR-220 (`g
 ADR-108, ADR-227, ADR-232
 
 ### Development Tooling & CI
-ADR-109 (amended by ADR-113), ADR-113, ADR-119 (dual-implementation sync duty relaxed to same-PR by ADR-155), ADR-136 (publication consolidated by ADR-141), ADR-141 (item 6's atomicity boundary relaxed by ADR-155), ADR-142 (item 1's check-6(c) atomicity boundary relaxed to same-PR by ADR-155), ADR-144, ADR-145, ADR-149, ADR-154 (item 1's/Consequences' same-commit duty wording relaxed to same-PR by ADR-155), ADR-155, ADR-163, ADR-195, ADR-227, ADR-230
+ADR-109 (amended by ADR-113), ADR-113, ADR-119 (dual-implementation sync duty relaxed to same-PR by ADR-155), ADR-136 (publication consolidated by ADR-141), ADR-141 (item 6's atomicity boundary relaxed by ADR-155), ADR-142 (item 1's check-6(c) atomicity boundary relaxed to same-PR by ADR-155), ADR-144, ADR-145, ADR-149, ADR-154 (item 1's/Consequences' same-commit duty wording relaxed to same-PR by ADR-155), ADR-155, ADR-163, ADR-195, ADR-227, ADR-230, ADR-238
 
 ### Timestamps / Clock
 ADR-057 (amended by ADR-102), ADR-120, ADR-143

@@ -2,7 +2,7 @@
 # ABI round-trip check between the worker service and the VCI simulator (7.1.2, 13.4).
 #
 # Current scope: verifies that the sim-vci cdylib built for the target exports
-# every J2534 entry point the worker service resolves.
+# every J2534 entry point the worker service resolves, and its control function.
 # TODO: run the 7.3 launch test (j2534-0404-service -> GetVersion ->
 #       PassThruReadVersion) against the library and compare the returned
 #       version strings. Run ARM targets under qemu-user.
@@ -22,6 +22,8 @@ SYMBOLS=(
   PassThruReadMsgs PassThruWriteMsgs PassThruStartPeriodicMsg PassThruStopPeriodicMsg
   PassThruStartMsgFilter PassThruStopMsgFilter PassThruSetProgrammingVoltage
   PassThruReadVersion PassThruGetLastError PassThruIoctl
+  # Not J2534: the simulator's control function (ADR-238).
+  NgrSimVciControl
 )
 
 exported="$(nm -D --defined-only "$LIB")"
@@ -37,4 +39,4 @@ if [[ $missing -ne 0 ]]; then
   echo "ABI round-trip: FAILED ($LIB)" >&2
   exit 1
 fi
-echo "ABI round-trip: all ${#SYMBOLS[@]} J2534 exports present in $LIB"
+echo "ABI round-trip: all ${#SYMBOLS[@]} exports present in $LIB"

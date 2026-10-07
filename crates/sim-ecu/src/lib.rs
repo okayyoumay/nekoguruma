@@ -455,8 +455,10 @@ impl SimEcu {
 // ---------------------------------------------------------------- Fault injection
 
 /// Events injected during tests with [`SimEcu::inject`]. Corresponds to 13.4 "injecting delays,
-/// disconnects, crashes, and write failures".
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// disconnects, crashes, and write failures". Serialized in snake case (`"power_loss"`,
+/// `{"delay_response": {"ms": 500}}`), the form `sim-vci`'s control commands take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Fault {
     /// The response to the next request goes out `ms` later than configured.
     DelayResponse { ms: u32 },

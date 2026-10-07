@@ -21,10 +21,12 @@ below refer to SAE J2534-1 (v04.04).
   29-bit ID flag, gets `ERR_NOT_SUPPORTED`. Channel IDs count up from 1. `PassThruClose` drops
   every channel together with its filters and unread responses; `PassThruDisconnect` drops one.
 - All 14 J2534 v04.04 functions are exported (with the control function `NgrSimVciControl`,
-  "Control" below), so `j2534-0404-service` loads the library like a vendor's on the targets
-  where the exports' calling convention matches; the end-to-end test runs on the host target.
-  On Windows x86 the exports still use the C calling convention, not the stdcall a vendor DLL
-  uses there, so the service cannot load that build yet. `PassThruReadVersion` reports firmware
+  "Control" below), so `j2534-0404-service` loads the library like a vendor's; the end-to-end
+  test runs on the host target. Every export uses the platform's J2534 calling convention
+  (`extern "system"`: stdcall on Windows x86, the standard C convention elsewhere, design
+  7.1.2) under its plain name. `scripts/abi-roundtrip.sh` checks the names on each build it is
+  given, including the Windows release builds on `main`, where a decorated stdcall name
+  (`_Name@N`) would fail it. `PassThruReadVersion` reports firmware
   `NGR-SIM 1.0`, DLL `sim-vci <crate version>` and API `04.04` on an open device. `PassThruGetLastError` always reports a fixed text: the
   simulator keeps no error descriptions. `PassThruSetProgrammingVoltage` drives nothing but keeps
   track of the pins by the rules of clause 7.2.11: 5 to 20 V on one of pins 0, 6, 9 and 11 to 14
@@ -128,7 +130,7 @@ A control command is a JSON object tagged by `command`:
 Unknown commands and unknown fields, in the command or in the fault, are rejected. A command that needs the ECU creates it first,
 as the first `PassThruOpen` does. There are two ways to send one:
 
-- `NgrSimVciControl(const char *command)` applies one command in the calling process and returns
+- `NgrSimVciControl(const char *command)` (the same calling convention as the J2534 exports) applies one command in the calling process and returns
   `STATUS_NOERROR`, `ERR_NULL_PARAMETER`, or `ERR_FAILED` for a command it cannot parse or an
   ECU configuration it cannot read. It does not look at the control directory, whose files wait
   for the next J2534 call.

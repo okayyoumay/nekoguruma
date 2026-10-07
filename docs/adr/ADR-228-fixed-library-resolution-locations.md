@@ -57,8 +57,12 @@ checked file and the loaded file can differ.
 - Release-build tests that need a different configuration location (for example a launch test
   against `sim-vci` on the cross-built targets) need either a debug build or a build with a test
   location embedded.
-- The worker services' current default configuration location is a placeholder that resolves to
-  the filesystem root on Linux; it has to move under `/etc/nekoguruma/`.
+- The worker services' configuration file is `/etc/nekoguruma/config.toml` on Linux and
+  `%ProgramData%\nekoguruma\config.toml` on Windows by default (`vci-service-config`, build-time
+  `VCI_CONFIG_PATH`), replacing a placeholder that resolved to the filesystem root on Linux. The
+  registration-definition directory is fixed the same way (`j2534_definition_dir()`, build-time
+  `NGR_J2534_DEFINITION_DIR`, default `/etc/nekoguruma/j2534`), each with a debug-only runtime
+  override.
 - A VCI profile fix can no longer be pushed to agents from the server; it reaches devices only
   through the operator's package management. The server's extension-package ingestion no longer
   handles VCI profiles.

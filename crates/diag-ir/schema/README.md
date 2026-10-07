@@ -12,8 +12,18 @@ and stored in `EcuDocument.procedure` in postcard-serialized form.
 ## Design decisions
 
 **Pre-expand decode plans**
-`Field` holds bit offset, width, endianness and conversion method flatly. Because the layout is not
-interpreted at runtime, even 10ms-interval monitoring only needs to walk the array.
+`Field` holds bit offset, width, endianness and conversion method flatly. ODX layouts are resolved
+at import, and monitor sets are always flat, so 10ms-interval monitoring only needs to walk the
+array. Other requests and responses can also refer to nested layouts, which the general decoder
+follows (next section).
+
+**Nest only what depends on the message (ADR-242)**
+Field lengths follow ODX's coded-type kinds (fixed, from another field, leading length prefix,
+terminated) and stay attributes of a flat field, which may be placed after the previous one
+instead of at a fixed offset. Repetitions, keyed selections (ODX FIELDs, MUX, TABLE-KEY with
+TABLE-STRUCT, which is how DID tables and nested DIDs appear) and structures placed or sized at
+runtime refer to a `Layout` in `EcuVariant.layouts`. Static STRUCTUREs are still inlined, and
+monitor sets stay fully flat.
 
 **Separate conversion formulas by kind**
 ODX COMPU-METHOD has a limited set of kinds, so there is no general-purpose expression engine.
@@ -43,4 +53,5 @@ flatc --rust --gen-object-api -o src/generated schema/ir.fbs
 
 Generated code is placed in `src/generated` and committed to the repository (so the build environment
 does not require flatc). When the schema changes, bump `IR_SCHEMA_VERSION` and
-have the agent report its supported version via `capabilities` (9.5).
+have the agent report its supported version via `capabilities` (9.5). Until the declaration part
+is first generated, nothing encodes it, so the schema changes without a version bump.

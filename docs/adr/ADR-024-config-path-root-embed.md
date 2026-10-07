@@ -1,7 +1,7 @@
 # ADR-024: Build-time Configuration of the Config File Root
 
 **Date:** 2026-06-30
-**Status:** Accepted
+**Status:** Accepted (default `VCI_CONFIG_PATH` and the non-Windows root superseded by ADR-228)
 **Affects:** `vci-service-launcher/build.rs`, `vci-service-launcher/Cargo.toml`, `vci-service-launcher/src/config.rs`, `iso22900-service/Cargo.toml`, `j2534-0404-service/Cargo.toml`, `.vscode/launch.json`
 
 ## Context

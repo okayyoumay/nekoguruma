@@ -13,8 +13,19 @@ Each service looks for a single TOML file at startup:
 
 | Platform | Path |
 |----------|------|
-| Windows | `%ProgramData%\vci-service-launcher\config.toml` (typically `C:\ProgramData\vci-service-launcher\config.toml`) |
-| Linux | `/etc/vci-service-launcher/config.toml` |
+| Windows | `%ProgramData%\nekoguruma\config.toml` (typically `C:\ProgramData\nekoguruma\config.toml`) |
+| Linux and other Unix | `/etc/nekoguruma/config.toml` (`/private/etc` is where `/etc` points on macOS) |
+
+These are the locations of a build with the default features, fixed at build time and writable
+by administrators only (ADR-228). A `config-root-*` feature moves the root: with
+`config-root-exe-dir` the file is `nekoguruma/config.toml` next to the executable, and with
+`config-root-win-local-app-data` or `config-root-win-roaming-app-data` it is in the user's own
+profile, which the user can write.
+
+The J2534 registration definitions on Linux (design 7.1.1) are read from
+`/etc/nekoguruma/j2534/` in every build: no `config-root-*` feature moves them
+(`j2534_definition_dir()`; `NGR_J2534_DEFINITION_DIR` at build time, with a runtime override in
+debug builds only).
 
 If the file does not exist, all logging defaults to `stderr` at the `info` level. Parse errors in the file are printed to `stderr` and defaults are used.
 
@@ -76,7 +87,7 @@ output = "eventlog"
 library_path = "C:/Program Files/Vendor/mylib-x86_x64.dll"   # optional
 [config.apis.<api-name>.arch.<arch-name>.libs.<library-name>.logging]
 level  = "trace"
-output = { file = "C:/ProgramData/vci-service-launcher/logs/specific-lib.log" }
+output = { file = "C:/ProgramData/nekoguruma/logs/specific-lib.log" }
 ```
 
 ### Field: `level`

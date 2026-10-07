@@ -39,7 +39,6 @@ Most priorities here were set under the earlier scale these crates were develope
 ### Prioritized Backlog
 
 - **P1**: Add regression checks for target-specific callback/function-pointer ABI handling.
-- **P1**: Expand callback lifecycle tests, including register/unregister race scenarios.
 - **P1**: Document borrowed vs owned item lifetime rules with concrete examples.
 - **P2**: Consolidate and publish an explicit error mapping table.
 

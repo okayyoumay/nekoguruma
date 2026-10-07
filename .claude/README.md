@@ -18,22 +18,37 @@ so a top-tier session model adds cost rather than capability unless the user ask
 |---|---|---|---|
 | `code-scout` | haiku | read-only | Fan-out searches across many crates or docs; returns conclusions and `path:line`, never file dumps |
 | `cargo-runner` | haiku | Bash + read-only | Builds, tests, clippy and fmt with long output; returns a compact pass/fail summary. Never edits files |
-| `doc-sync-checker` | haiku | Bash (git read) + read-only | Pre-commit audit of the diff against CLAUDE.md's documentation-sync table, the `work/` rule and the spec copyright rule |
+| `doc-sync-checker` | sonnet (medium) | Bash (git read) + read-only | Pre-commit audit of the diff against CLAUDE.md's documentation-sync table, the `work/` rule and the spec copyright rule |
 | `scope-shaper` | sonnet (high) | read-only | Turns a fuzzy or oversized request into a minimal scope with acceptance criteria |
 | `implementer` | sonnet (medium) | Bash + edit | Code, tests and doc edits from a distilled brief |
-| `edge-case-hunter` | sonnet (xhigh) | Bash + read-only | Verification pass before commit: boundaries, error paths, concurrency, protocol corner cases, interruption/resume, missing tests |
+| `edge-case-hunter` | opus (high) | Bash + read-only | Verification pass before commit: boundaries, error paths, concurrency, protocol corner cases, interruption/resume, missing tests |
 | `design-advisor` | fable (high) | Bash (git read) + read-only | Escalation for decisions that are expensive to get wrong |
 
-Haiku agents carry no `effort` key (unsupported on that tier). On Sonnet, `medium` is the
-model's default and fits implementation from a distilled brief; `high` and `xhigh` are kept for
-the two judgment passes (scoping, edge-case hunting), where depth is what the call pays for.
-`design-advisor` pins `effort: high` so a session-level override cannot push the costliest path
-higher.
+Each tier is used for what it does best:
+
+- **Haiku** (`code-scout`, `cargo-runner`): mechanical work with a short report (locating code,
+  running commands). It is the cheapest tier, has a 200K context window and carries no
+  `effort` key (unsupported there), so it gets the agents whose output needs no judgment.
+- **Sonnet** (`scope-shaper`, `implementer`, `doc-sync-checker`): everyday reasoning at a
+  quarter of the top tier's price. `implementer` runs at `medium`, which fits implementation
+  from a distilled brief; `scope-shaper` at `high` for the scoping judgment. `doc-sync-checker`
+  runs here rather than on Haiku because its audit is judgment (is an ADR needed, does a
+  sentence read like spec wording, does a document update really cover the change) over a whole
+  PR diff plus spec searches, which also needs the larger context window; `medium` is enough
+  for a checklist audit.
+- **Opus** (`edge-case-hunter`): the verification pass runs only on gated diffs (protocol
+  semantics, concurrency, FFI, trust boundaries), where a missed case costs more than the
+  call. Opus at `high` reasons more reliably about reachability and ordering than Sonnet at
+  `xhigh`, and the current Opus costs about twice Sonnet, not five times as earlier
+  generations did.
+- **Fable** (`design-advisor`): the top tier, reserved for the gated escalation path. It pins
+  `effort: high` so a session-level override cannot push the costliest path higher.
 
 Custom agents load `CLAUDE.md` into their context at every spawn. `code-scout` and
 `cargo-runner` set `omitClaudeMd: true`, since their prompts carry everything they need and
-they are spawned most often. The three Haiku agents set `maxTurns` as a guard against a
-runaway search or polling loop; an agent that reaches it returns a partial report.
+they are spawned most often. The two Haiku agents and `doc-sync-checker` set `maxTurns` as a
+guard against a runaway search or polling loop; an agent that reaches it returns a partial
+report.
 
 ## Task size decides the pipeline
 

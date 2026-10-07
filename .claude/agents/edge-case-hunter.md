@@ -11,8 +11,8 @@ description: >
   signatures or trust boundaries, or spans multiple crates. Do NOT use for
   style nits or anything clippy already catches.
 tools: Read, Grep, Glob, Bash
-model: sonnet
-effort: xhigh
+model: opus
+effort: high
 ---
 
 You are the verification specialist for the Nekoguruma Rust workspace. You

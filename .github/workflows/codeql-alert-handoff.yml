@@ -31,11 +31,11 @@ concurrency:
 
 jobs:
   handoff:
-    # An analysis that did not succeed leaves the alerts stale: send nothing.
+    # An analysis that did not succeed leaves the alerts stale: send nothing. (Default setup's
+    # runs report the event `dynamic`, not `push`; the merged-PR check below does the filtering.)
     if: >-
       github.event_name != 'workflow_run'
-      || (github.event.workflow_run.event == 'push'
-          && github.event.workflow_run.conclusion == 'success')
+      || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     env:

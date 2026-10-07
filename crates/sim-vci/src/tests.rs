@@ -1329,9 +1329,16 @@ fn read_vbatt_reports_the_configured_voltage() {
 
 #[test]
 fn read_vbatt_checks_the_device_and_the_output() {
-    let f = fixture();
-    // It takes the device ID, not a channel ID.
-    assert_eq!(read_vbatt(f.channel + 100).0, ERR_INVALID_DEVICE_ID);
+    let _f = fixture();
+    // It takes the device ID, not a channel ID: open a second channel, whose ID differs from
+    // the device ID.
+    let mut channel = 0;
+    assert_eq!(
+        unsafe { PassThruConnect(DEVICE_ID, ISO15765, 0, 500_000, &mut channel) },
+        STATUS_NOERROR
+    );
+    assert_ne!(channel, DEVICE_ID);
+    assert_eq!(read_vbatt(channel).0, ERR_INVALID_DEVICE_ID);
     assert_eq!(
         unsafe {
             PassThruIoctl(
@@ -1357,4 +1364,21 @@ fn set_battery_voltage_rejects_a_missing_or_negative_value() {
     ] {
         assert_eq!(control(command), ERR_FAILED, "{command}");
     }
+}
+
+#[test]
+fn read_vbatt_on_a_lost_device_reports_the_loss_before_checking_arguments() {
+    let _f = fixture();
+    assert_eq!(control(r#"{"command": "disconnect_vci"}"#), STATUS_NOERROR);
+    assert_eq!(
+        unsafe {
+            PassThruIoctl(
+                DEVICE_ID,
+                ioctl::IOCTL_READ_VBATT as PassThruUlong,
+                ptr::null_mut(),
+                ptr::null_mut(),
+            )
+        },
+        ERR_DEVICE_NOT_CONNECTED
+    );
 }

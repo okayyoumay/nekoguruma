@@ -37,7 +37,10 @@ below refer to SAE J2534-1 (v04.04).
   later) on a channel, and `READ_VBATT` on the device: it takes the device ID
   (`ERR_INVALID_DEVICE_ID` for any other, `ERR_NULL_PARAMETER` for a null output) and writes
   the battery voltage on pin 16 in millivolts, rounded to a tenth of a volt (clause 7.3.3). The
-  voltage is 12.0 V until a test sets another with `set_battery_voltage` ("Control" below).
+  voltage is 12.0 V until a test sets another with `set_battery_voltage` ("Control" below),
+  and stays at that value for the life of the process: closing and opening the device, an ECU
+  power loss or a VCI disconnect leave it alone, so a test that simulates low supply sets it
+  itself.
   Every other IOCTL is accepted and does nothing.
 
 ## Filters

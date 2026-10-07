@@ -16,7 +16,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use agent::{JobError, JobLimits, Link, LinkConfig, link, run_program};
 use diag_ir::{IR_SCHEMA_VERSION, Op, Program, Value, VmState};
 use vci_service_interface::{
-    GetObjectIdRequest, GetVersionRequest, IoCtlRequest, ObjectType, data_item, io_ctl_request,
+    GetObjectIdRequest, GetVersionRequest, IoCtlRequest, ObjectType, PduError, data_item,
+    error_detail_from_status, io_ctl_request,
 };
 use worker_host::client::{ConnectOptions, WorkerClient};
 use worker_host::service::{LaunchOptions, ServiceKind, WorkerProcess};
@@ -132,7 +133,8 @@ async fn read_vbatt(client: &mut WorkerClient, link: &Link) -> u32 {
 /// `ERR_DEVICE_NOT_CONNECTED`, or the service's own polling hit that error first and marked the
 /// module as having lost the VCI (ADR-131), so it answers without calling the library. Which
 /// one comes first is timing; both mean the device is lost. That the loss outlasts replugging
-/// at the library level is checked by `sim-vci`'s unit tests.
+/// at the library level is checked by `sim-vci`'s unit tests, which CI does not run yet (see
+/// the backlog).
 async fn assert_device_not_connected(client: &mut WorkerClient, link: &Link) {
     let result = client
         .get_version(GetVersionRequest {
@@ -140,10 +142,14 @@ async fn assert_device_not_connected(client: &mut WorkerClient, link: &Link) {
         })
         .await;
     let status = result.expect_err("GetVersion should fail on a lost device");
-    let message = status.message();
+    // ERR_DEVICE_NOT_CONNECTED maps to PDU_ERR_COMM_PC_TO_VCI_FAILED; a module the service
+    // marked as having lost the VCI is PDU_ERR_MODULE_NOT_CONNECTED.
+    let pdu_error = error_detail_from_status(&status)
+        .map(|detail| detail.pdu_error)
+        .unwrap_or_else(|| panic!("no error detail in {status:?}"));
     assert!(
-        message.contains("ERR_DEVICE_NOT_CONNECTED")
-            || message.contains("lost communication with the VCI"),
+        pdu_error == PduError::PduErrCommPcToVciFailed as i32
+            || pdu_error == PduError::PduErrModuleNotConnected as i32,
         "{status:?}"
     );
 }

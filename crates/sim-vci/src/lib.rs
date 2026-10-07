@@ -545,6 +545,7 @@ fn reset(config: EcuConfig) {
     bus.vci_present = true;
     bus.device_lost = false;
     bus.channels.clear();
+    bus.next_channel = 1;
     bus.programming_pin = None;
     bus.control_dir = None;
     bus.battery_mv = DEFAULT_BATTERY_MV;

@@ -52,7 +52,8 @@ the J2534 API, as it would on a vendor library. So a test needs a channel into a
 
 ## Consequences
 
-- A test can arm any `sim_ecu::Fault`, reconnect the ECU and unplug the VCI through the worker;
+- A test can arm any `sim_ecu::Fault`, reconnect the ECU, unplug the VCI and set the battery
+  voltage `READ_VBATT` reports through the worker;
   `tests/sim_vci_control.rs` in `j2534-0404-service` does each through the worker, including
   a disconnect while a link is open and the recovery that follows.
 - While the variable is set, the control directory is listed on every J2534 call and every

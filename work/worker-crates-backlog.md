@@ -10,7 +10,7 @@ Most priorities here were set under the earlier scale these crates were develope
 
 ### Prioritized Backlog
 
-- **P1**: Add ABI parity checks for exported callbacks and function signatures.
+- **P2**: `iso22900-mock`'s `PDUIoCtl` (`crates/iso22900-mock/src/lib.rs`) takes the IOCTL command ID as `T_PDU_IT`, while the header `crates/iso22900-sys/src/bindings/d_pdu_api_func.h` and the bindings' `DPduApiSys::PDUIoCtl` declare `UNUM32`. Both are 32-bit integers, so calls work, but `crates/iso22900-mock/tests/abi_parity.rs` has to check `PDUIoCtl` by layout instead of by signature. Done when: the mock's parameter is `UNUM32` (converted to `T_PDU_IT` inside where it is compared), `PDUIoCtl` is in that test's signature list and its layout-only test is removed.
 - **P2**: Document parallel-test constraints and recommended reset strategy.
 
 ## `iso22900-service`

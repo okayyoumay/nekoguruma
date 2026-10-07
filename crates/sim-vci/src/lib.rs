@@ -92,6 +92,10 @@ pub const API_VERSION: &str = "04.04";
 /// What `PassThruGetLastError` reports: the simulator keeps no error descriptions.
 pub const LAST_ERROR_TEXT: &str = "sim-vci: no error description";
 
+/// Battery voltage on pin 16 of the J1962 connector until a test sets another
+/// (`Command::SetBatteryVoltage`), in millivolts.
+pub const DEFAULT_BATTERY_MV: u32 = 12_000;
+
 /// Size of `PASSTHRU_MSG::data`.
 pub const MAX_MSG_DATA: usize = 4128;
 
@@ -255,6 +259,8 @@ struct Bus {
     programming_pin: Option<PassThruUlong>,
     /// Directory control command files are taken from ([`CONTROL_DIR_ENV`]).
     control_dir: Option<PathBuf>,
+    /// Battery voltage `READ_VBATT` reports, in millivolts.
+    battery_mv: u32,
 }
 
 static BUS: OnceLock<(Mutex<Bus>, Condvar)> = OnceLock::new();
@@ -273,6 +279,7 @@ fn bus() -> &'static (Mutex<Bus>, Condvar) {
                 epoch: Instant::now(),
                 programming_pin: None,
                 control_dir: std::env::var_os(CONTROL_DIR_ENV).map(PathBuf::from),
+                battery_mv: DEFAULT_BATTERY_MV,
             }),
             Condvar::new(),
         )
@@ -391,6 +398,10 @@ impl Bus {
             }
             Command::ConnectVci {} => {
                 self.vci_present = true;
+                Ok(())
+            }
+            Command::SetBatteryVoltage { millivolts } => {
+                self.battery_mv = millivolts;
                 Ok(())
             }
         }
@@ -534,8 +545,10 @@ fn reset(config: EcuConfig) {
     bus.vci_present = true;
     bus.device_lost = false;
     bus.channels.clear();
+    bus.next_channel = 1;
     bus.programming_pin = None;
     bus.control_dir = None;
+    bus.battery_mv = DEFAULT_BATTERY_MV;
 }
 
 // ---------------------------------------------------------------- Control
@@ -549,7 +562,8 @@ pub const CONTROL_DIR_ENV: &str = "NGR_SIM_VCI_CONTROL_DIR";
 const CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 /// A control command, as JSON: `{"command": "inject_fault", "fault": "power_loss"}`,
-/// `{"command": "reconnect_ecu"}`, `{"command": "disconnect_vci"}`, `{"command": "connect_vci"}`.
+/// `{"command": "reconnect_ecu"}`, `{"command": "disconnect_vci"}`, `{"command": "connect_vci"}`,
+/// `{"command": "set_battery_voltage", "millivolts": 11500}`.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 enum Command {
@@ -562,6 +576,8 @@ enum Command {
     /// Plugs the VCI back in. A device that was open when it went away stays lost until it is
     /// closed (J2534-1 6.10.1).
     ConnectVci {},
+    /// Sets the battery voltage `READ_VBATT` reports, in millivolts.
+    SetBatteryVoltage { millivolts: u32 },
 }
 
 /// Applies one control command, given as the JSON a control file holds. For a test that loads
@@ -1085,22 +1101,43 @@ pub unsafe extern "C" fn PassThruGetLastError(description: *mut c_char) -> PassT
 }
 
 /// `CLEAR_MSG_FILTERS` and `CLEAR_RX_BUFFER` act on a channel's filters and receive queue
-/// (J2534-1 7.3). Every other IOCTL is accepted and does nothing.
+/// (J2534-1 7.3). `READ_VBATT` takes the device ID and reports the battery voltage in
+/// millivolts, rounded to a tenth of a volt (7.3.3). Every other IOCTL is accepted and does
+/// nothing.
+///
+/// # Safety
+/// For `READ_VBATT`, `output` must be null or valid for a write of an `unsigned long`.
 #[unsafe(no_mangle)]
-pub extern "C" fn PassThruIoctl(
+pub unsafe extern "C" fn PassThruIoctl(
     handle_id: PassThruUlong,
     ioctl_id: PassThruUlong,
     _input: *mut c_void,
-    _output: *mut c_void,
+    output: *mut c_void,
 ) -> PassThruUlong {
     const CLEAR_MSG_FILTERS: PassThruUlong = ioctl::IOCTL_CLEAR_MSG_FILTERS as PassThruUlong;
     const CLEAR_RX_BUFFER: PassThruUlong = ioctl::IOCTL_CLEAR_RX_BUFFER as PassThruUlong;
+    const READ_VBATT: PassThruUlong = ioctl::IOCTL_READ_VBATT as PassThruUlong;
     let mut bus = match lock_connected() {
         Ok(bus) => bus,
         Err(status) => return status,
     };
+    if ioctl_id == READ_VBATT {
+        if !bus.device_ok(handle_id) {
+            return ERR_INVALID_DEVICE_ID;
+        }
+        if output.is_null() {
+            return ERR_NULL_PARAMETER;
+        }
+        let millivolts = bus.battery_mv.saturating_add(50) / 100 * 100;
+        // SAFETY: checked for null above; the caller guarantees it is writable.
+        unsafe {
+            output
+                .cast::<PassThruUlong>()
+                .write(millivolts as PassThruUlong)
+        };
+        return STATUS_NOERROR;
+    }
     if ioctl_id != CLEAR_MSG_FILTERS && ioctl_id != CLEAR_RX_BUFFER {
-        // TODO: return READ_VBATT (voltage). Used for the precondition tests in 8.9.1.
         return STATUS_NOERROR;
     }
     let Some(channel) = bus.channels.get_mut(&handle_id) else {

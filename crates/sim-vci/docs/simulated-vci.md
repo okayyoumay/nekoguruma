@@ -34,7 +34,14 @@ below refer to SAE J2534-1 (v04.04).
   `ERR_INVALID_MSG_ID`.
 - `PassThruIoctl` implements `CLEAR_MSG_FILTERS` (removes the channel's filters) and
   `CLEAR_RX_BUFFER` (drops the responses already received; ones still being delayed arrive
-  later) on a channel. Every other IOCTL is accepted and does nothing.
+  later) on a channel, and `READ_VBATT` on the device: it takes the device ID
+  (`ERR_INVALID_DEVICE_ID` for any other, `ERR_NULL_PARAMETER` for a null output) and writes
+  the battery voltage on pin 16 in millivolts, rounded to a tenth of a volt (clause 7.3.3). The
+  voltage is 12.0 V until a test sets another with `set_battery_voltage` ("Control" below),
+  and stays at that value for the life of the process: closing and opening the device, an ECU
+  power loss or a VCI disconnect leave it alone, so a test that simulates low supply sets it
+  itself.
+  Every other IOCTL is accepted and does nothing.
 
 ## Filters
 
@@ -114,6 +121,7 @@ A control command is a JSON object tagged by `command`:
 | `{"command": "reconnect_ecu"}` | `SimEcu::reconnect`, which ends a power loss |
 | `{"command": "disconnect_vci"}` | unplugs the VCI |
 | `{"command": "connect_vci"}` | plugs it back in |
+| `{"command": "set_battery_voltage", "millivolts": N}` | sets the battery voltage `READ_VBATT` reports (default 12000) |
 
 Unknown commands and unknown fields, in the command or in the fault, are rejected. A command that needs the ECU creates it first,
 as the first `PassThruOpen` does. There are two ways to send one:
@@ -154,6 +162,11 @@ A VCI crash, as opposed to a disconnect, is not simulated.
 `worker-host` with the platform's `unsigned long` width (8 bytes on Linux x86_64), and reads the
 VIN over an ISO 15765 link. Its `tests/sim_vci_control.rs` runs agent jobs against the same setup
 and sends control commands through `NGR_SIM_VCI_CONTROL_DIR`: an ECU power loss and
-reconnection, a VCI disconnect between jobs, and one while a link is open, after which
-`GetVersion` reports the lost device, even after the VCI is back, until the test closes the
-link; the next job then opens the device again and reads the VIN.
+reconnection, the battery voltage through `PDU_IOCTL_READ_VBATT` before and after
+`set_battery_voltage`, a VCI disconnect between jobs, and one while a link is open, after which
+`GetVersion` fails, also after the VCI is back, until the test closes the link (the service may
+answer that itself once its own polling has seen the loss); the next job then opens the device
+again and reads the VIN. Since the service may answer for a lost module itself (ADR-131),
+`tests/sim_vci_library.rs` loads the cdylib into its own process through the `j2534-0404`
+wrapper and checks the device-loss rules without the service: lost after the unplug, still
+lost after the replug, released by the close, and a new device ID on the next open.

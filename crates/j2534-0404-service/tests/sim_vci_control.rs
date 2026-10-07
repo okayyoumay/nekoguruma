@@ -3,8 +3,9 @@
 //! Faults injected into `sim-vci` from outside the worker process (ADR-238): `worker-host`
 //! launches the real `j2534-0404-service` binary against the `sim-vci` cdylib, with
 //! `NGR_SIM_VCI_CONTROL_DIR` naming a directory, and this test drops control commands there
-//! between agent jobs and while a link is open: a power loss of the ECU, its reconnection, and
-//! VCI disconnects with the device closed and open.
+//! between agent jobs and while a link is open: a power loss of the ECU, its reconnection, a
+//! battery voltage read through `READ_VBATT`, and VCI disconnects with the device closed and
+//! open.
 //!
 //! This file holds a single test, so the process-wide environment it sets for the spawned
 //! service cannot race with another test.
@@ -14,7 +15,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agent::{JobError, JobLimits, Link, LinkConfig, link, run_program};
 use diag_ir::{IR_SCHEMA_VERSION, Op, Program, Value, VmState};
-use vci_service_interface::GetVersionRequest;
+use vci_service_interface::{
+    GetObjectIdRequest, GetVersionRequest, IoCtlRequest, ObjectType, PduError, data_item,
+    error_detail_from_status, io_ctl_request,
+};
 use worker_host::client::{ConnectOptions, WorkerClient};
 use worker_host::service::{LaunchOptions, ServiceKind, WorkerProcess};
 
@@ -96,8 +100,40 @@ async fn run(client: &WorkerClient) -> Result<VmState, JobError> {
     .await
 }
 
-/// `GetVersion` reaches `PassThruReadVersion` on the open device; on a lost device it fails
-/// with `ERR_DEVICE_NOT_CONNECTED`.
+/// Battery voltage the worker reports through `PDU_IOCTL_READ_VBATT`, in millivolts.
+async fn read_vbatt(client: &mut WorkerClient, link: &Link) -> u32 {
+    let id = client
+        .get_object_id(GetObjectIdRequest {
+            object_type: ObjectType::ObjtIoCtrl as i32,
+            shortname: "PDU_IOCTL_READ_VBATT".to_owned(),
+        })
+        .await
+        .expect("PDU_IOCTL_READ_VBATT should be known")
+        .into_inner()
+        .pdu_object_id;
+    let output = client
+        .io_ctl(IoCtlRequest {
+            handle: Some(io_ctl_request::Handle::ModuleHandle(link.module_handle)),
+            io_ctrl_command: Some(io_ctl_request::IoCtrlCommand::IoCtrlCommandId(id)),
+            input_data: None,
+            has_output: true,
+        })
+        .await
+        .expect("PDU_IOCTL_READ_VBATT should succeed")
+        .into_inner()
+        .output_data
+        .and_then(|item| item.data);
+    match output {
+        Some(data_item::Data::Unum32Value(millivolts)) => millivolts,
+        other => panic!("unexpected READ_VBATT output {other:?}"),
+    }
+}
+
+/// `GetVersion` fails on a lost device. Either it reaches `PassThruReadVersion`, which returns
+/// `ERR_DEVICE_NOT_CONNECTED`, or the service's own polling hit that error first and marked the
+/// module as having lost the VCI (ADR-131), so it answers without calling the library. Which
+/// one comes first is timing; both mean the device is lost. That the loss outlasts replugging
+/// at the library level is checked without the service in `tests/sim_vci_library.rs`.
 async fn assert_device_not_connected(client: &mut WorkerClient, link: &Link) {
     let result = client
         .get_version(GetVersionRequest {
@@ -105,8 +141,14 @@ async fn assert_device_not_connected(client: &mut WorkerClient, link: &Link) {
         })
         .await;
     let status = result.expect_err("GetVersion should fail on a lost device");
+    // ERR_DEVICE_NOT_CONNECTED maps to PDU_ERR_COMM_PC_TO_VCI_FAILED; a module the service
+    // marked as having lost the VCI is PDU_ERR_MODULE_NOT_CONNECTED.
+    let pdu_error = error_detail_from_status(&status)
+        .map(|detail| detail.pdu_error)
+        .unwrap_or_else(|| panic!("no error detail in {status:?}"));
     assert!(
-        status.message().contains("ERR_DEVICE_NOT_CONNECTED"),
+        pdu_error == PduError::PduErrCommPcToVciFailed as i32
+            || pdu_error == PduError::PduErrModuleNotConnected as i32,
         "{status:?}"
     );
 }
@@ -217,9 +259,19 @@ async fn inject(control_dir: &Path) {
     let link = link::open(&mut link_client, &link_config(), DEADLINE)
         .await
         .expect("the link should open");
-    send(control_dir, "005", r#"{"command": "disconnect_vci"}"#);
+    // READ_VBATT reaches sim-vci through PDU_IOCTL_READ_VBATT, and a control command changes
+    // what it reports.
+    assert_eq!(read_vbatt(&mut link_client, &link).await, 12_000);
+    send(
+        control_dir,
+        "005",
+        r#"{"command": "set_battery_voltage", "millivolts": 11500}"#,
+    );
+    assert_eq!(read_vbatt(&mut link_client, &link).await, 11_500);
+
+    send(control_dir, "006", r#"{"command": "disconnect_vci"}"#);
     assert_device_not_connected(&mut link_client, &link).await;
-    send(control_dir, "006", r#"{"command": "connect_vci"}"#);
+    send(control_dir, "007", r#"{"command": "connect_vci"}"#);
     assert_device_not_connected(&mut link_client, &link).await;
     // Closing the link closes the lost device; the close itself still reports the loss.
     let _ = link::close(&mut link_client, link, DEADLINE).await;

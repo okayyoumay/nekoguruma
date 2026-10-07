@@ -407,7 +407,7 @@ impl Bus {
     /// Applies the `*.json` command files in the control directory, in file-name order. Each
     /// file is claimed by renaming it to `*.applying` first, so a command is applied at most
     /// once even if the file cannot be deleted afterwards; a file that cannot be claimed is
-    /// left for a later call. A file applied is deleted; one that cannot be read, parsed or
+    /// left for a later call, and the files after it wait with it. A file applied is deleted; one that cannot be read, parsed or
     /// applied is renamed to `*.rejected`, so the test can see it failed.
     fn apply_control_files(&mut self) {
         let Some(dir) = &self.control_dir else {
@@ -424,7 +424,8 @@ impl Bus {
         for path in files {
             let claimed = path.with_extension("applying");
             if std::fs::rename(&path, &claimed).is_err() {
-                continue;
+                // Later files wait behind it, so commands never run out of order.
+                break;
             }
             let applied = std::fs::read_to_string(&claimed)
                 .ok()

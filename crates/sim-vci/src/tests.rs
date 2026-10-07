@@ -1260,3 +1260,29 @@ fn the_control_export_leaves_the_control_directory_for_the_next_call() {
     assert!(dir.files().is_empty());
     assert_eq!(read(f.channel, 1, 20), (ERR_BUFFER_EMPTY, vec![]));
 }
+
+#[test]
+fn a_control_file_that_cannot_be_claimed_holds_back_the_files_after_it() {
+    let f = fixture();
+    let dir = ControlDir::new("blocked");
+    // A directory under the claimed name makes the rename fail on every platform.
+    std::fs::create_dir(dir.0.join("001.applying")).expect("blocking directory");
+    dir.send(
+        "001",
+        r#"{"command": "inject_fault", "fault": "power_loss"}"#,
+    );
+    dir.send("002", r#"{"command": "reconnect_ecu"}"#);
+    write(f.channel, ECU_PHYSICAL_REQUEST_ID, &[0x3E, 0x00]);
+    assert_eq!(dir.files(), ["001.applying", "001.json", "002.json"]);
+    assert_eq!(lock_bus().power_cycles(), 0);
+    // Once the claim works, both apply in order: the ECU loses power and then reconnects.
+    std::fs::remove_dir(dir.0.join("001.applying")).expect("remove blocking directory");
+    assert_eq!(read(f.channel, 1, 1000).0, STATUS_NOERROR);
+    assert!(dir.files().is_empty());
+    assert_eq!(lock_bus().power_cycles(), 2);
+    write(f.channel, ECU_PHYSICAL_REQUEST_ID, &[0x3E, 0x00]);
+    assert_eq!(
+        read(f.channel, 1, 1000),
+        (STATUS_NOERROR, vec![response(&[0x7E, 0x00])])
+    );
+}

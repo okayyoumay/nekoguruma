@@ -126,7 +126,7 @@ as the first `PassThruOpen` does. There are two ways to send one:
   except `PassThruGetLastError`, and every 20 ms while `PassThruReadMsgs` waits,
   `sim-vci` applies the `*.json` files there in file-name order. It claims each file by renaming
   it to `*.applying` before reading it, so a command is applied at most once (a file it cannot
-  claim is tried again at the next call), and deletes it once applied; a file it cannot read,
+  claim is tried again at the next call, and the files after it wait until it is applied), and deletes it once applied; a file it cannot read,
   parse or apply is renamed to `*.rejected`. Write each file as UTF-8 without a byte-order mark,
   under another name (such as `*.tmp`), and rename it when complete, so it is never read
   half-written. Name the files so that their order is the order to apply them in (`001.json`,

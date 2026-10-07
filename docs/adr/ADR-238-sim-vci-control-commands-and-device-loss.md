@@ -28,7 +28,8 @@ the J2534 API, as it would on a vendor library. So a test needs a channel into a
    `PassThruGetLastError`, and every 20 ms while `PassThruReadMsgs` waits, `sim-vci` applies
    the `*.json` files there in file-name order. It claims each file by renaming it before
    reading it, so a command is applied at most once even if the file cannot be deleted
-   afterwards; a file it cannot read, parse or apply is renamed to `*.rejected`. A test writes
+   afterwards, and stops at a file it cannot claim, so no later command overtakes it; a file
+   it cannot read, parse or apply is renamed to `*.rejected`. A test writes
    each file under another name and renames it, so a half-written file is never read.
    Files rather than a socket keep the library free of threads of its own (a thread would have
    to stop before the library is unloaded) and need nothing beyond `std`. A command takes effect
@@ -40,9 +41,10 @@ the J2534 API, as it would on a vendor library. So a test needs a channel into a
    `PassThruClose` on that device, which releases it and still reports the error. The next
    `PassThruOpen` then returns a new device ID. With no device open there is nothing to lose:
    an unplugged VCI only makes `PassThruOpen` fail, and the other calls answer as they do with
-   no device open (calls that take a device or channel ID get `ERR_INVALID_DEVICE_ID` or
-   `ERR_INVALID_CHANNEL_ID`, clause 7.2.1), so the error is not sticky there and the open
-   succeeds once the VCI is back.
+   no device open (a device or channel ID gets `ERR_INVALID_DEVICE_ID` or
+   `ERR_INVALID_CHANNEL_ID`, clause 7.2.1, except in an IOCTL the simulator ignores, which
+   succeeds without checking it), so the error is not sticky there and the open succeeds once
+   the VCI is back.
    The ECU behind the VCI keeps its state through all of this, as a vehicle does when the
    tester's cable is pulled.
 

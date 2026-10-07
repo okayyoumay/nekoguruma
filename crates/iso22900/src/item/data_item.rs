@@ -11,15 +11,27 @@ pub struct ApiItem<'a, Item> {
 }
 
 impl<'a, Item> ApiItem<'a, Item> {
-    pub(crate) fn new(
-        item: &'a Item,
+    /// Wraps an item pointer that a D-PDU function returned through an output parameter.
+    ///
+    /// The null check comes before the pointer is turned into a reference, so a library that
+    /// reports success without filling in the item yields `NullPointer` instead of undefined
+    /// behaviour.
+    ///
+    /// # Safety
+    ///
+    /// `raw` must be null or point to a live item of type `Item` that stays valid until it is
+    /// passed to `PDUDestroyItem`.
+    pub(crate) unsafe fn from_raw(
         sys: &'a DPduApiSys,
         raw: *mut PDU_ITEM,
     ) -> Result<Self, DPduApiError> {
+        let raw = NonNull::new(raw).ok_or(DPduApiError::NullPointer("PDU item"))?;
+        // SAFETY: `raw` is non-null, and the caller guarantees it points to a live `Item`.
+        let item = unsafe { raw.cast::<Item>().as_ref() };
         Ok(Self {
             item,
             sys,
-            raw: NonNull::new(raw).ok_or(DPduApiError::NullPointer("PDU item"))?,
+            raw,
             _marker: PhantomData,
         })
     }

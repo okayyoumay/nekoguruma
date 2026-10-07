@@ -74,7 +74,7 @@ unsafe { libloading::Library::new(&lib_path).unwrap().get::<fn()>(b"__mock_reset
 | `PDUGetUniqueRespIdTable` | Returns empty table. |
 | `PDUSetUniqueRespIdTable` | Always succeeds. |
 | `PDUGetTimestamp` | Returns `MOCK_TIMESTAMP` = 4242. |
-| `PDUIoCtl` | Returns `PDU_STATUS_NOERROR` for most commands; `PDU_ERR_VALUE_NOT_SUPPORTED` for unsupported. |
+| `PDUIoCtl` | Returns `PDU_STATUS_NOERROR` for most commands; `PDU_ERR_VALUE_NOT_SUPPORTED` for unsupported. For `MOCK_IOCTL_NULL_OUTPUT` it returns `PDU_STATUS_NOERROR` and leaves the output item null. |
 | `PDUDestroyItem` | Frees heap-allocated PDU items. |
 
 ### Event Delivery
@@ -144,6 +144,7 @@ The `rlib` portion exports the following Rust functions for use in test setup:
 | `MOCK_LOGICAL_LINK_HANDLE` | 3001 | Base CLL handle (first `PDUCreateComLogicalLink`) |
 | `MOCK_COM_PRIMITIVE_HANDLE` | 4001 | Base COP handle (first `PDUStartComPrimitive`) |
 | `MOCK_TIMESTAMP` | 4242 | Timestamp returned by `PDUGetTimestamp` |
+| `MOCK_IOCTL_NULL_OUTPUT` | `0x7FFF_FF00` | IOCTL command id that succeeds without an output item (public, for null-item tests) |
 
 ---
 

@@ -88,21 +88,25 @@ jobs:
             exit 0
           fi
 
-          # Most urgent first; keep only the fields the skill uses, and stay well under the fire
-          # request's 64 KiB text limit by dropping the least urgent alerts. High and critical
-          # alerts go only as numbers in `private`: the skill never fixes them in a public PR, so
-          # they must not take the room the alerts it can fix need.
-          jq -s -c --arg repo "$REPO" '
-            add
-            | (map(select(.rule.security_severity_level == "critical"
-                          or .rule.security_severity_level == "high")) | map(.number) | sort) as $private
-            | map(select(.rule.security_severity_level != "critical"
-                         and .rule.security_severity_level != "high"))
-            | sort_by(
-                ({"critical": 0, "high": 1, "medium": 2, "low": 3}[.rule.security_severity_level // ""] // 4),
-                ({"error": 0, "warning": 1, "note": 2}[.rule.severity // ""] // 3),
-                .created_at, .number)
-            | map({
+          # Keep only the fields the skill uses and stay under the fire request's 64 KiB text
+          # limit. High and critical alerts go in `private` with the same details, in a share of
+          # their own (at most 28000 bytes), so neither list crowds out the other; `alerts` gets
+          # the rest of 58000 bytes. `alerts` keeps its most urgent part, since a fixed or
+          # dismissed alert makes room for the next. Private alerts can stay open longer, so
+          # their list is split into pages that each fit the share, and each run sends a page
+          # chosen at random. The run number would not do: runs that exit early also advance it,
+          # so some pages could be skipped every time. A random pick needs no stored state and
+          # sends every page sooner or later.
+          jq -s -c --arg repo "$REPO" --argjson pick "$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')" '
+            def high: .rule.security_severity_level == "critical"
+                      or .rule.security_severity_level == "high";
+            def urgency:
+              sort_by(
+                ({"critical": 0, "high": 1, "medium": 2, "low": 3}[.security_severity // ""] // 4),
+                ({"error": 0, "warning": 1, "note": 2}[.severity // ""] // 3),
+                .created_at, .number);
+            def slim:
+              map({
                 number,
                 rule: .rule.id,
                 security_severity: .rule.security_severity_level,
@@ -112,12 +116,38 @@ jobs:
                 end_line: .most_recent_instance.location.end_line,
                 message: (.most_recent_instance.message.text // "" | .[0:300]),
                 created_at
-              })
-            | {repository: $repo, ref: "refs/heads/main", total: (length + ($private | length)),
-               private: $private, alerts: .}' alerts.json > payload.json
-          while [ "$(wc -c < payload.json)" -gt 60000 ]; do
-            jq -c '.alerts |= .[0:(length * 3 / 4 | floor)]' payload.json > p.tmp && mv p.tmp payload.json
-          done
+              }) | urgency;
+            # The longest prefix whose JSON fits in $budget bytes.
+            def fit($budget):
+              reduce .[] as $a ({out: [], size: 2, full: false};
+                if .full then .
+                else ($a | tojson | utf8bytelength + 1) as $n
+                  | if .size + $n > $budget then .full = true
+                    else .out += [$a] | .size += $n end
+                end) | .out;
+            # Consecutive pages whose JSON each fits in $budget bytes, covering every alert.
+            def pages($budget):
+              reduce .[] as $a ({pages: [], cur: [], size: 2};
+                ($a | tojson | utf8bytelength + 1) as $n
+                | if .size + $n > $budget and (.cur | length) > 0
+                  then .pages += [.cur] | .cur = [$a] | .size = 2 + $n
+                  else .cur += [$a] | .size += $n end)
+              | .pages + (if (.cur | length) > 0 then [.cur] else [] end);
+            add
+            | (map(select(high)) | slim) as $p
+            | (map(select(high | not)) | slim) as $rest
+            | ($p | pages(28000)) as $pg
+            | (if ($pg | length) == 0 then []
+               else $pg[$pick % ($pg | length)] end) as $private
+            | {repository: $repo, ref: "refs/heads/main", total: length,
+               private_total: ($p | length), private: $private, alerts: []}
+            | (tojson | utf8bytelength) as $used
+            | .alerts = ($rest | fit(58000 - $used))' alerts.json > payload.json
+          size=$(wc -c < payload.json)
+          if [ "$size" -gt 60000 ]; then
+            echo "::error::The alert payload is $size bytes, over the 60000-byte budget."
+            exit 1
+          fi
 
           # The response and the payload stay out of the log. The token reaches curl on stdin
           # (printf is a builtin), so it never appears in a process's command line.

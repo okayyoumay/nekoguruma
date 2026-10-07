@@ -1,4 +1,4 @@
-use iso22900::{DPduApi, ModuleHandle};
+use iso22900::{ComLogicalLinkHandle, DPduApi, DPduApiError, ModuleHandle};
 
 #[test]
 fn mock_library_supports_basic_wrapper_calls() {
@@ -24,4 +24,19 @@ fn mock_library_supports_basic_wrapper_calls() {
         .get_timestamp(module_handle)
         .expect("timestamp should succeed");
     assert_eq!(timestamp, 4242);
+}
+
+#[test]
+fn io_ctl_with_null_output_item_is_an_error() {
+    let path = iso22900_mock::mock_library_path()
+        .expect("mock library should be discoverable after build");
+    let api = DPduApi::new(&path).expect("mock library should load");
+
+    let result = api.io_ctl_with_output(
+        ModuleHandle(1001),
+        ComLogicalLinkHandle(3001),
+        iso22900_mock::MOCK_IOCTL_NULL_OUTPUT,
+        None,
+    );
+    assert!(matches!(result, Err(DPduApiError::NullPointer(_))));
 }

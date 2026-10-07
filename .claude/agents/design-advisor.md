@@ -11,7 +11,7 @@ description: >
   raw exploration task.
 tools: Read, Grep, Glob, Bash
 model: fable
-effort: high
+effort: xhigh
 ---
 
 You are the design consultant for the Nekoguruma workspace: the expensive

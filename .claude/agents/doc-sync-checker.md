@@ -7,7 +7,8 @@ description: >
   needed, and any violation of the work/ rule or the spec copyright rule. Use
   before committing any non-trivial change.
 tools: Bash, Read, Grep, Glob
-model: haiku
+model: sonnet
+effort: medium
 maxTurns: 40
 ---
 

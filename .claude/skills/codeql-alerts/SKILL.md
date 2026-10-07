@@ -62,8 +62,8 @@ orders the rows by security severity, then severity, then creation time, oldest 
 Read the alert with `scripts/codeql-alerts.sh show <n>`, then the code at its location on
 `main`. Decide which case holds:
 
-- **Real.** The flagged path can be reached with the input or state the rule describes. Go to
-  step 5.
+- **Real.** The flagged path can be reached with the input or state the rule describes, and the
+  security severity is below high. Go to step 5.
 - **False positive or not worth fixing.** The path cannot be reached, the input is trusted by
   design (cite the section of `docs/system-architecture.md` that says so), or the code is test
   or example code where the issue cannot matter. Put the alert on the skipped list with a
@@ -78,18 +78,25 @@ Read the alert with `scripts/codeql-alerts.sh show <n>`, then the code at its lo
 
 When the case is not clear, follow `unattended-clarification` and skip the alert; do not guess.
 
-## 5. Fix and open the pull request
+## 5. Claim, fix and open the pull request
+
+Claim the alert before fixing it, the way `backlog-loop` claims an item (ADR-230, extended to
+both loops by ADR-243): commit an empty commit naming the alert (`git commit --allow-empty`),
+push, and open the draft PR at once. The title starts with `[codeql]` and names the rule and
+the place, e.g. `[codeql] rust/cleartext-logging: redact the VIN in agent logs`; add the
+`codeql` label (create it if the repository does not have it).
+
+Then list the open PRs from branches in this repository whose title starts with `[codeql]` or
+`[backlog-loop]`, or that carry the `codeql` or `backlog-loop` label. If one has a lower number
+than this PR, two runs started together: close this PR with a comment naming the other, and go
+to "Report".
 
 Fix the cause with the smallest change that removes the flagged behaviour, following
 CLAUDE.md and `.claude/README.md` (task size, agents, documentation sync, ADRs). Add a test that
 fails without the fix where the behaviour can be tested. Never silence the alert instead: no
-suppression comments, no query or path exclusions, and no weakened check.
-
-Open a draft PR from the template. The title starts with `[codeql]` and names the rule and the
-place, e.g. `[codeql] rust/cleartext-logging: redact the VIN in agent logs`; add the `codeql`
-label (create it if the repository does not have it). The description names the alert number
-and rule id and says how the fix removes the flagged path. Describe the weakness in terms of
-the code, without a ready-made exploit.
+suppression comments, no query or path exclusions, and no weakened check. Fill in the PR
+description from the template: the alert number and rule id, and how the fix removes the
+flagged path. Describe the weakness in terms of the code, without a ready-made exploit.
 
 Then run `pr-review-loop`. Before it hands the PR to the maintainer, also check the `CodeQL`
 check run on the PR's head (from the `github-advanced-security` app): it must have concluded

@@ -63,3 +63,12 @@ agree. With `config-root-exe-dir`, the worker reads the file next to its own bui
 `--workers`; with `config-root-win-program-files`, a 32-bit worker sees `Program Files (x86)`.
 In both cases the agent can resolve a different library than the worker loads; build the
 agent and the workers with the same root.
+
+## Write-job journal
+
+The `agent` library's `journal` module keeps the write-job journal (design 5.5, ADR-244): one
+append-only file, `{job_id}.g{generation}.journal`, per job and ownership generation, in a
+directory the caller passes. Every commit is synced before it returns. The journal only
+records; committing an intent marker before the request it guards, and stopping the job when a
+commit fails, are the job runner's duties. `ngr-agent run` sends read-only requests and keeps no
+journal.

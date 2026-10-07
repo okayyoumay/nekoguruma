@@ -158,7 +158,9 @@ impl SimEcu {
         if message.len() != 2 {
             return Err(Nrc::IncorrectMessageLengthOrInvalidFormat);
         }
-        // The response goes out before the reset takes effect (recommended by clause 9.3.1).
+        // A server answers before it resets (recommended by clause 9.3.1). The simulator builds
+        // the response first but applies the reset at once; only its timers follow the
+        // response (ADR-239).
         let response = positive(SID_ECU_RESET, &[sf.value]);
         self.power_cycle();
         reply(&sf, response)

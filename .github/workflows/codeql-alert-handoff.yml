@@ -1,0 +1,135 @@
+name: CodeQL alert hand-off
+
+# Sends the open CodeQL alerts on main to the Claude routine that runs the codeql-alerts skill
+# (.claude/skills/codeql-alerts). Claude sessions cannot read code scanning alerts, so this
+# workflow reads them with its own token and passes a trimmed list in the routine's fire request.
+# The alerts are never written to the log or to an artifact: the repository is public.
+#
+# Setup: repository variable NGR_CODEQL_ROUTINE_ID (the routine's trig_... id) and repository
+# secret NGR_CODEQL_ROUTINE_TOKEN (the routine's API trigger token). Without them the job only
+# prints a notice.
+on:
+  schedule:
+    - cron: "47 23 * * 2" # Wednesday 08:47 JST
+  # A merged fix frees the loop for the next alert. Actions has no code scanning alert event, so
+  # the job runs when CodeQL default setup (workflow name "CodeQL") finishes analysing a push to
+  # main, and continues only when that commit merged a codeql PR.
+  workflow_run:
+    workflows: [CodeQL]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: read
+  pull-requests: read
+
+concurrency:
+  group: codeql-alert-handoff
+  cancel-in-progress: false
+
+jobs:
+  handoff:
+    # An analysis that did not succeed leaves the alerts stale: send nothing. (Default setup's
+    # runs report the event `dynamic`, not `push`; the merged-PR check below does the filtering.)
+    if: >-
+      github.event_name != 'workflow_run'
+      || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      ROUTINE_ID: ${{ vars.NGR_CODEQL_ROUTINE_ID }}
+      ROUTINE_TOKEN: ${{ secrets.NGR_CODEQL_ROUTINE_TOKEN }}
+    steps:
+      - name: Hand the open alerts to the routine
+        run: |
+          set -euo pipefail
+          if [ -z "$ROUTINE_ID" ] || [ -z "$ROUTINE_TOKEN" ]; then
+            echo "::notice::NGR_CODEQL_ROUTINE_ID or NGR_CODEQL_ROUTINE_TOKEN is not set; nothing sent."
+            exit 0
+          fi
+
+          # After an analysis of main, continue only if the analysed commit merged a codeql PR
+          # from this repository.
+          if [ "$GITHUB_EVENT_NAME" = workflow_run ]; then
+            sha=$(jq -r .workflow_run.head_sha "$GITHUB_EVENT_PATH")
+            merged=$(gh api "repos/$REPO/commits/$sha/pulls" \
+              --jq '[.[] | select(.merged_at != null and .head.repo.full_name == env.REPO
+                                  and (.labels | map(.name) | index("codeql")))] | length')
+            if [ "$merged" -eq 0 ]; then
+              echo "The analysed commit did not merge a codeql PR; nothing sent."
+              exit 0
+            fi
+            sleep 30 # alert states update shortly after the analysis upload
+          fi
+
+          # One task at a time across both loops (ADR-243): while a loop PR is open, the routine
+          # would only stop again, so do not start it.
+          claims=$(gh pr list --repo "$REPO" --state open --limit 1000 \
+            --json number,title,labels,isCrossRepository \
+            --jq '[.[] | select((.labels | map(.name) | any(. == "codeql" or . == "backlog-loop"))
+                     or ((.isCrossRepository | not)
+                         and (.title | startswith("[codeql]") or startswith("[backlog-loop]"))))
+                   | .number] | length')
+          if [ "$claims" -gt 0 ]; then
+            echo "A codeql or backlog-loop PR is open; nothing sent."
+            exit 0
+          fi
+
+          gh api --paginate \
+            "repos/$REPO/code-scanning/alerts?state=open&ref=refs/heads/main&tool_name=CodeQL&per_page=100" \
+            > alerts.json
+          count=$(jq -s 'add | length' alerts.json)
+          if [ "$count" -eq 0 ]; then
+            echo "No open CodeQL alerts on main; nothing sent."
+            exit 0
+          fi
+
+          # Most urgent first; keep only the fields the skill uses, and stay well under the fire
+          # request's 64 KiB text limit by dropping the least urgent alerts. High and critical
+          # alerts go only as numbers in `private`: the skill never fixes them in a public PR, so
+          # they must not take the room the alerts it can fix need.
+          jq -s -c --arg repo "$REPO" '
+            add
+            | (map(select(.rule.security_severity_level == "critical"
+                          or .rule.security_severity_level == "high")) | map(.number) | sort) as $private
+            | map(select(.rule.security_severity_level != "critical"
+                         and .rule.security_severity_level != "high"))
+            | sort_by(
+                ({"critical": 0, "high": 1, "medium": 2, "low": 3}[.rule.security_severity_level // ""] // 4),
+                ({"error": 0, "warning": 1, "note": 2}[.rule.severity // ""] // 3),
+                .created_at, .number)
+            | map({
+                number,
+                rule: .rule.id,
+                security_severity: .rule.security_severity_level,
+                severity: .rule.severity,
+                path: .most_recent_instance.location.path,
+                start_line: .most_recent_instance.location.start_line,
+                end_line: .most_recent_instance.location.end_line,
+                message: (.most_recent_instance.message.text // "" | .[0:300]),
+                created_at
+              })
+            | {repository: $repo, ref: "refs/heads/main", total: (length + ($private | length)),
+               private: $private, alerts: .}' alerts.json > payload.json
+          while [ "$(wc -c < payload.json)" -gt 60000 ]; do
+            jq -c '.alerts |= .[0:(length * 3 / 4 | floor)]' payload.json > p.tmp && mv p.tmp payload.json
+          done
+
+          # The response and the payload stay out of the log. The token reaches curl on stdin
+          # (printf is a builtin), so it never appears in a process's command line.
+          jq -n -c --rawfile text payload.json '{text: $text}' > body.json
+          status=$(printf 'Authorization: Bearer %s\n' "$ROUTINE_TOKEN" \
+            | curl -sS -o /dev/null -w '%{http_code}' \
+                -X POST "https://api.anthropic.com/v1/claude_code/routines/$ROUTINE_ID/fire" \
+                -H @- \
+                -H "anthropic-beta: experimental-cc-routine-2026-04-01" \
+                -H "anthropic-version: 2023-06-01" \
+                -H "Content-Type: application/json" \
+                --data-binary @body.json)
+          rm -f alerts.json payload.json body.json
+          echo "Sent $count open alerts; routine fire returned HTTP $status."
+          [ "$status" -ge 200 ] && [ "$status" -lt 300 ]

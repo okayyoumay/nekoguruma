@@ -23,7 +23,8 @@
       "Bash(scripts/check-adr-index.sh)",
       "Bash(scripts/check-backlog.sh)",
       "Bash(scripts/classify-pr-risk.sh)",
-      "Bash(scripts/classify-pr-risk.sh *)"
+      "Bash(scripts/classify-pr-risk.sh *)",
+      "Bash(scripts/codeql-alerts.sh *)"
     ],
     "ask": [
       "Bash(git push --force *)",

@@ -14,32 +14,26 @@ after the maintainer has merged the previous PR. Claude never merges, and never 
 alert: dismissing is the maintainer's call.
 
 Arguments: $ARGUMENTS. A number is the most alerts to fix in this run (default 3). `alert=<n>`
-works that alert first. `pr=<n>` resumes a run at its current PR: go to step 6.
+works that alert first. `pr=<n>` resumes a run at its current PR (see "Run state").
 
 ## 1. Read the alerts
 
-```sh
-repo=$(git remote get-url origin | sed -E 's#\.git$##; s#^.*[:/]([^/:]+/[^/]+)$#\1#')
-auth=()
-[ -n "${NGR_CODE_SCANNING_TOKEN:-}" ] && auth=(-H "Authorization: Bearer $NGR_CODE_SCANNING_TOKEN")
-curl -sS "${auth[@]}" -H "Accept: application/vnd.github+json" \
-  "https://api.github.com/repos/$repo/code-scanning/alerts?state=open&ref=refs/heads/main&tool_name=CodeQL&per_page=100"
-```
+Run `scripts/codeql-alerts.sh list`. It prints the open CodeQL alerts on `main` as a table
+(number, security severity, severity, rule, location), most urgent first, and never the raw API
+response. `scripts/codeql-alerts.sh show <n>` prints one alert's state, location, message and
+the rule's help. Read the list again at the start of every iteration; a merge can fix or add
+alerts.
 
-Check that `repo` came out as `owner/name` before using it. The Claude GitHub App cannot read
-code scanning alerts, so the request needs a fine-grained personal access token limited to this
-repository with the "Code scanning alerts: Read-only" permission, stored in the cloud
-environment as `NGR_CODE_SCANNING_TOKEN` (or as a network secret for `api.github.com`). Never
-print the token or write it to a file.
+The Claude GitHub App cannot read code scanning alerts, so the script sends the fine-grained
+personal access token in `NGR_CODE_SCANNING_TOKEN` when it is set: limited to this repository,
+with only the "Code scanning alerts: Read-only" permission, stored in the cloud environment.
+Never print the token or write it to a file. Exit statuses:
 
-- `403` or `401`: the token is missing, expired or lacks the permission. Tell the maintainer
+- 3 (401 or 403): the token is missing, expired or lacks the permission. Tell the maintainer
   that in one message and stop.
-- `404` with "no analysis found": code scanning has not analysed `main` yet. Report and stop.
-- An empty list: report "no open CodeQL alerts" and stop.
-
-From each alert keep only `number`, `rule.id`, `rule.security_severity_level`,
-`rule.severity`, `most_recent_instance.location` (path and lines) and
-`most_recent_instance.message.text`. Do not keep the raw response in the conversation.
+- 4 (404): code scanning has not analysed `main` yet. Report and stop.
+- 5: another API or network error. Report the message it printed and stop.
+- 0 with no rows: report "no open CodeQL alerts" and stop.
 
 ## 2. Check before each alert
 
@@ -57,15 +51,14 @@ including its checks that nothing else needs the branch.
 
 ## 3. Pick
 
-Leave out the alerts on this run's skipped list. Order the rest by
-`rule.security_severity_level` (critical, high, medium, low, none), then `rule.severity`
-(error, warning, note), then by number, oldest first, and take the first. `alert=<n>` goes
-first if it is still open.
+Take the first row of the list that is not on this run's skipped list; the script already
+orders the rows by security severity, then severity, then age. `alert=<n>` goes first if it is
+still open.
 
 ## 4. Verify
 
-Read the code at the alert's location on `main` and the rule's help (`rule.id`; the API's
-`GET .../code-scanning/alerts/<n>` returns `rule.help`). Decide which case holds:
+Read the alert with `scripts/codeql-alerts.sh show <n>`, then the code at its location on
+`main`. Decide which case holds:
 
 - **Real.** The flagged path can be reached with the input or state the rule describes. Go to
   step 5.
@@ -105,13 +98,20 @@ check run on the PR's head (from the `github-advanced-security` app): it must ha
 End the turn. While the PR is open, any wake other than its merge or close is handled by
 `pr-review-loop`.
 
-When the PR is merged, wait for CodeQL to analyse the new `main` (the `Analyze` check runs on
-the merge commit), then read the alert again: it should now be `fixed`. If it is still open,
-report that and stop rather than retrying. Otherwise go to step 2. When the PR is closed
-without merging, go to step 2, which stops the run.
+When the PR is merged, record it in the run state, wait for CodeQL to analyse the new `main`
+(the `Analyze` checks on the merge commit), then run `scripts/codeql-alerts.sh show <n>`: the
+alert should now be `fixed`. If it is still open, report that and stop rather than retrying.
+Otherwise go to step 1. When the PR is closed without merging, go to step 2, which stops the
+run.
 
-A run keeps its state (alerts fixed, skipped list with reasons) in a "CodeQL run" section of
-its current PR's description, so `pr=<n>` can resume it in a fresh session.
+## Run state
+
+The run's state is the run's maximum, the alerts fixed (with their PRs) and the skipped list
+with reasons. Keep it in a "CodeQL run" section of the current PR's description and update it
+whenever it changes; a merged PR's description can still be edited. To resume with `pr=<n>`,
+read the state from that PR and subscribe to its activity, then go on by its state: open, run
+`pr-review-loop` on it (step 5's last paragraph still applies); merged, step 6's merge handling
+unless the state already records the merge, then step 1; closed without merging, "Report".
 
 ## Report
 

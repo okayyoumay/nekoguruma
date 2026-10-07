@@ -168,14 +168,14 @@ pub async fn open(
     if let Err(error) = connected {
         // The connect may have completed on the worker after the deadline. Disconnecting a
         // module that is not connected changes nothing.
-        disconnect_module(client, module_handle, deadline).await;
+        let _ = disconnect_module(client, module_handle, deadline).await;
         return Err(error);
     }
 
     let cll_handle = match create_link(client, config, deadline, module_handle).await {
         Ok(cll_handle) => cll_handle,
         Err(error) => {
-            disconnect_module(client, module_handle, deadline).await;
+            let _ = disconnect_module(client, module_handle, deadline).await;
             return Err(error);
         }
     };
@@ -344,16 +344,16 @@ async fn teardown(
     )
     .await
     .map(drop);
-    disconnect_module(client, module_handle, deadline).await;
-    // The first failure, after both steps were tried.
-    disconnected.and(destroyed)
+    let module_disconnected = disconnect_module(client, module_handle, deadline).await;
+    // The first failure, after every step was tried.
+    disconnected.and(destroyed).and(module_disconnected)
 }
 
 async fn disconnect_module(
     client: &mut WorkerClient,
     module_handle: ModuleHandle,
     deadline: Duration,
-) {
+) -> Result<(), HostError> {
     let result = unary(
         deadline,
         "ModuleDisconnect",
@@ -361,8 +361,10 @@ async fn disconnect_module(
             module_handle: Some(module_handle),
         }),
     )
-    .await;
-    if let Err(error) = result {
+    .await
+    .map(drop);
+    if let Err(error) = &result {
         tracing::warn!(%error, "could not disconnect the module");
     }
+    result
 }

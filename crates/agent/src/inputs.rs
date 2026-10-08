@@ -6,9 +6,10 @@
 //!
 //! - [`Source::RuntimeInput`]: a fact the agent supplies itself, through [`RuntimeInputs`].
 //!   [`crate::WorkerHost`] answers the supply voltage from the VCI (`PDU_IOCTL_READ_VBATT`) and
-//!   reports every other input as [`Reading::CannotBeEstablished`], since no current VCI offers
-//!   a source for them (ADR-238). [`FixedInputs`] holds fixed readings, for tests and for later
-//!   wiring.
+//!   reports every other input as [`Reading::CannotBeEstablished`]: the worker interface gives
+//!   the agent no way to read external supply, ignition, engine state or vehicle speed, and
+//!   `sim-vci` simulates only the battery voltage (ADR-238). [`FixedInputs`] holds fixed
+//!   readings, for tests and for later wiring.
 //! - [`Source::EcuService`]: a field of a diagnostic response, located through a
 //!   [`ServiceSources`] table. The table stands in until the declaration part has a decoder
 //!   (ADR-245, consequences).
@@ -260,6 +261,11 @@ pub enum TableError {
          request ([0x22, hi, lo], offset 2) is supported"
     )]
     Unsupported { service_id: u32, field_id: u32 },
+    #[error(
+        "service {service_id} field {field_id}: ids start at 1, and a field is 1 byte or longer \
+         (at most 8 for an integer)"
+    )]
+    BadField { service_id: u32, field_id: u32 },
 }
 
 /// The table that maps `EcuService` sources to requests and response fields.
@@ -277,6 +283,13 @@ impl TryFrom<Vec<ServiceField>> for ServiceSources {
             let (service_id, field_id) = (field.service_id, field.field_id);
             if !matches!(field.request.as_slice(), [0x22, _, _]) || field.offset != 2 {
                 return Err(TableError::Unsupported {
+                    service_id,
+                    field_id,
+                });
+            }
+            let too_long = field.encoding == Encoding::UnsignedBigEndian && field.length > 8;
+            if service_id == 0 || field_id == 0 || field.length == 0 || too_long {
+                return Err(TableError::BadField {
                     service_id,
                     field_id,
                 });
@@ -761,6 +774,36 @@ mod tests {
             ));
         }
         assert!(ServiceSources::new(vec![vin_field()]).is_ok());
+    }
+
+    #[test]
+    fn impossible_ids_and_widths_are_refused() {
+        let integer = |length| ServiceField {
+            length,
+            encoding: Encoding::UnsignedBigEndian,
+            ..vin_field()
+        };
+        for field in [
+            ServiceField {
+                service_id: 0,
+                ..vin_field()
+            },
+            ServiceField {
+                field_id: 0,
+                ..vin_field()
+            },
+            ServiceField {
+                length: 0,
+                ..vin_field()
+            },
+            integer(9),
+        ] {
+            assert!(matches!(
+                ServiceSources::new(vec![field]),
+                Err(TableError::BadField { .. })
+            ));
+        }
+        assert!(ServiceSources::new(vec![integer(8)]).is_ok());
     }
 
     #[test]

@@ -98,10 +98,18 @@ backlog_blocks() {
       run = ""
       if (ind < 4 && match(line, /^(```+|~~~+)/)) run = substr(line, 1, RLENGTH)
     }
+    function closes(f) {
+      return run != "" && substr(run, 1, 1) == substr(f, 1, 1) &&
+        length(run) >= length(f) && substr(line, length(run) + 1) ~ /^[ \t]*$/
+    }
+    # An indented fence inside an item belongs to the item up to its close.
+    item != "" && ifence != "" {
+      if (closes(ifence)) ifence = ""
+      item = item gap "\037" $0; gap = ""; next
+    }
+    item != "" && ind > 0 && run != "" { ifence = run; item = item gap "\037" $0; gap = ""; next }
     fence != "" {
-      rest = substr(line, length(run) + 1)
-      if (run != "" && substr(run, 1, 1) == substr(fence, 1, 1) &&
-        length(run) >= length(fence) && rest ~ /^[ \t]*$/) fence = ""
+      if (closes(fence)) fence = ""
       out("O", path, $0); next
     }
     run != "" { flush(); fence = run; out("O", path, $0); next }
@@ -227,10 +235,18 @@ compare_blocks() {
 # change.
 work_deleted=()
 work_added=()
+# Prints lf, crlf or mixed for the text on standard input.
+eol_style() {
+  awk '{ n++; if (/\r$/) c++ } END { print (c == 0 ? "lf" : c == n ? "crlf" : "mixed") }'
+}
 work_tmp="$(mktemp -d)"
 trap 'rm -rf "$work_tmp"' EXIT
 check_work_backlog() {
   local path="$1" out line
+  # A change of line endings is hidden once carriage returns are dropped.
+  if [ "$(git show "$merge_base:$path" | eol_style)" != "$(git show "HEAD:$path" | eol_style)" ]; then
+    reasons+=("changes the line endings of $path")
+  fi
   # A mode-only change (an executable bit) has no text to compare.
   if [ "$(git ls-tree "$merge_base" -- "$path" | cut -d' ' -f1)" != \
     "$(git ls-tree HEAD -- "$path" | cut -d' ' -f1)" ]; then

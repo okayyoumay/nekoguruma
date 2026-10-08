@@ -68,6 +68,10 @@ base_backlog() {
 - **P2**: Fifth item. Done when: five.
 
   A second paragraph of the fifth item.
+
+  ```text
+- **P1**: Code inside the fifth item, not an item.
+  ```
 EOF
 }
 
@@ -195,7 +199,11 @@ expect "adding a section with a repeated subsection heading is LOW" LOW
 
 setup
 edit '/Fifth item/,$d'
-expect "deleting a two-paragraph item is LOW" LOW
+expect "deleting an item with a second paragraph and a fenced block is LOW" LOW
+
+setup
+sed -i 's/$/\r/' "$backlog"
+expect "converting a backlog file to CRLF is HIGH" HIGH "changes the line endings"
 
 setup
 edit '/^## Area three$/,$d'

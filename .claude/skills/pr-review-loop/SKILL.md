@@ -20,7 +20,8 @@ finding.
 
 ## Step 0: request a review
 
-After opening the PR, and after every fix push, request a review from Copilot:
+After opening the PR, and after every fix push that Step 4's re-request rule lets through,
+request a review from Copilot:
 `request_copilot_review(owner, repo, pullNumber)`. This works on draft PRs. Do not set up
 automatic Copilot reviews in a ruleset; they would run on every push and spend minutes and
 credits on heads the loop does not need reviewed. Leave the review effort at the owner's
@@ -76,7 +77,8 @@ review counts toward the stall. If that one
 still finds no review, treat the round as stalled: tell the maintainer once in the thread and
 run one fallback pass (as under "Copilot not available") on this head instead of re-requesting.
 A stall is transient, so unlike the two cases above it does not end Copilot reviews on this PR:
-if that pass leads to a fix, push it and request Copilot on the new head as usual (Step 0)
+if that pass leads to a fix, push it and request Copilot on the new head when Step 4's re-request
+rule lets it through (Step 0)
 instead of running the fallback again; if it finds nothing, go to Step 5.
 
 ## Step 1: find out what the review found
@@ -199,15 +201,14 @@ least one of these holds:
 - the round fixed a finding Copilot rated above Low (Medium, High or Critical), or one whose
   severity you cannot read from the review;
 - the round's fix went through `design-advisor` (2b);
-- the push changes executable or build files: `*.rs`, `*.proto`, `*.h`, `build.rs`,
-  `Cargo.toml`, `Cargo.lock`, anything under `scripts/`, `.github/workflows/`, `.config/` or
-  `.cargo/`;
+- the push changes any file that is not Markdown (`*.md`): code, scripts, hooks, workflows,
+  build and configuration files, schemas, examples and other data files all count;
 - the round merged `main` and resolved a conflict.
 
 Read the severity from the badge next to each finding in the review summary (its image alt text
 is "Low severity", "Medium severity" and so on); an inline comment whose finding does not appear
 in the summary counts as unreadable. A round that meets none of the conditions fixed only
-Low-rated findings in documentation, `work/` or `.claude/` prose: its fix still passes every
+Low-rated findings, in Markdown files only: its fix still passes every
 Step 3 check, and the loop then ends without a re-request. Step 5 reports those findings as
 fixed after the last Copilot review.
 

@@ -28,30 +28,31 @@ the number of re-reviews is the lever available to the session.
 
 1. **Re-request only when the fix needs another look.** After a round that pushed a fix, the
    loop re-requests a Copilot review only when the round fixed a finding Copilot rated above Low
-   (or whose rating cannot be read), the fix went through `design-advisor`, the push changes
-   executable or build files (Rust, proto, C headers, build scripts, Cargo manifests and lock
-   file, `scripts/`, workflows, `.config/`, `.cargo/`), or the round merged `main` and resolved
-   a conflict. Otherwise the loop ends after the round's replies and goes to close-out. The
-   skill lists the exact file set.
+   (or whose rating cannot be read), the fix went through `design-advisor`, the push changes any
+   file that is not Markdown, or the round merged `main` and resolved a conflict. Otherwise the
+   loop ends after the round's replies and goes to close-out. Defining the exempt set as
+   Markdown only, rather than listing executable file types, keeps a newly added kind of
+   executable or data file on the re-review side by default.
 2. **Unreviewed fixes stay visible.** Such a round's fix still passes every local check of the
    skill's Step 3 (including `edge-case-hunter` when its gate applies). The pull request
    description and the hand-over message to the maintainer name the findings fixed after the
    last Copilot review, so the maintainer's review covers them.
 3. **Ask Copilot to converge.** `.github/copilot-instructions.md` asks Copilot to report
    everything in its first review, and on a re-review to limit new findings to code changed
-   since its previous review plus P0 and P1 findings anywhere, giving only a count for new
-   low-severity findings on unchanged code.
+   since its previous review plus P0 and P1 findings anywhere. P0 and P1 findings are reported
+   whatever severity Copilot gives them; only other new low-severity findings on unchanged code
+   are reduced to a count.
 
 The severity comes from Copilot's own rating in the review summary, not from Claude's judgment,
 so the session cannot talk itself out of a re-review for a finding Copilot considered important.
 
 ## Consequences
 
-- Loops like the backlog re-triage above end once the remaining findings are Low-rated prose
+- Loops like the backlog re-triage above end once the remaining findings are Low-rated Markdown
   fixes. Medium-rated findings still trigger a re-review, so the saving on such loops depends on
   the convergence instruction (Decision item 3) as well; its effect on Copilot is to be judged
   from the next pull requests.
-- A Low-rated prose fix can merge without Copilot having seen it. The maintainer's review is the
+- A Low-rated Markdown fix can merge without Copilot having seen it. The maintainer's review is the
   remaining check, which is why Decision item 2 names those fixes.
 - Copilot may still report low-severity findings on unchanged code despite Decision item 3; the
   loop then fixes them and, under item 1, does not re-request for them alone.

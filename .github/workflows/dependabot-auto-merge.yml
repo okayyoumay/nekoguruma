@@ -2,8 +2,9 @@ name: Dependabot auto-merge
 
 # Turns on GitHub auto-merge for Dependabot's grouped Cargo minor/patch pull request
 # (`cargo-minor-patch` in .github/dependabot.yml), so it is squash-merged once main's required
-# checks pass. Every other Dependabot pull request (Cargo major or 0.x updates, GitHub Actions,
-# security updates) and every human pull request is left for the maintainer to merge.
+# checks pass. Every other Dependabot pull request (Cargo updates Cargo treats as breaking, such as
+# 1.x -> 2.0 or 0.22 -> 0.23, GitHub Actions, security updates) and every human pull request is
+# left for the maintainer to merge. ADR-248 records the trust boundary.
 # Needs "Allow auto-merge" turned on in the repository settings.
 #
 # pull_request_target, not pull_request: GitHub runs a Dependabot-triggered pull_request workflow

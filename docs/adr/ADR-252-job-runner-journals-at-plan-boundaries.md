@@ -26,7 +26,9 @@ is no step before it.
    - at `transfer_exit_pc`: the RequestTransferExit marker.
 
    An arrival is counted once: a timer wait that polls the same instruction does not commit
-   again.
+   again. Before any of this, `Vm::current_op` runs the VM's own checks of the instruction
+   (ADR-233 item 3), so an instruction the VM refuses before it reaches the host fails with no
+   marker committed for it.
 2. **Progress is committed when an instruction completes.**
    - A `FlashTransfer` commits its block under the host's running index (ADR-250).
    - Every diagnostic primitive inside a plan's range (`entry_pc` up to, not including,

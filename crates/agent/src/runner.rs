@@ -297,6 +297,13 @@ where
         if std::mem::take(&mut arrived)
             && let Some(journal) = journal.as_deref_mut()
         {
+            // An intent marker is only journaled for a request the next step sends: the VM's
+            // own checks run first (ADR-233 item 3), so an instruction it refuses fails here,
+            // with no marker before it.
+            vm.current_op(program).map_err(|source| JobError::Vm {
+                pc: vm.state.pc,
+                source,
+            })?;
             journal.arrive(program, &vm.state, host)?;
         }
         let pc = vm.state.pc;
@@ -1033,6 +1040,38 @@ mod tests {
         let vm_state: VmState = postcard::from_bytes(bytes).unwrap();
         assert_eq!((vm_state.pc, vm_state.steps), (ENTRY, 3));
         assert!(vm_state.stack.is_empty());
+    }
+
+    /// An erase or RequestTransferExit that the VM refuses before it reaches the host (here an
+    /// operand of the wrong type) fails with no marker before it (ADR-233 item 3).
+    #[test]
+    fn a_refused_boundary_instruction_gets_no_marker() {
+        for (operand, boundary) in [(ERASE - 1, ERASE), (EXIT - 1, EXIT)] {
+            let mut program = flash_program();
+            program.code[operand as usize] = Op::PushI64(1);
+            let commits = Rc::new(Cell::new(0));
+            let mut host = FlashHost::new(Rc::clone(&commits));
+            let mut journal = counting_journal(&commits, None);
+            let result = run_on(
+                &program,
+                &mut host,
+                JobLimits::default(),
+                &AtomicBool::new(false),
+                Some(&mut journal),
+            );
+            assert!(
+                matches!(result, Err(JobError::Vm { pc, .. }) if pc == boundary),
+                "{result:?}"
+            );
+            let facts = &journal.journal().state().facts;
+            if boundary == ERASE {
+                assert!(facts.transfer.is_none());
+                assert!(!host.sent().iter().any(|s| matches!(s, Sent::Routine(_))));
+            } else {
+                assert!(facts.transfer.as_ref().unwrap().exit.is_none());
+                assert!(!host.sent().contains(&Sent::Service(0x37, vec![0x01])));
+            }
+        }
     }
 
     /// A post-transfer step is recorded, and the completion is committed with the step that

@@ -2,7 +2,8 @@
 //!
 //! For a procedure with a flash recovery plan, the runner commits to the journal in two places.
 //!
-//! When execution arrives at an instruction, before it runs ([`JobJournal::arrive`]):
+//! When execution arrives at an instruction, before it runs and once the VM's own checks of it
+//! passed (`Vm::current_op`, ADR-233 item 3) ([`JobJournal::arrive`]):
 //! - at a plan's `entry_pc`, once per job and before its first transfer: the ECU hardware part
 //!   number and software version, read through the sources the program declares;
 //! - at `erase_pc`: the transfer-start marker;

@@ -302,8 +302,8 @@ clear, unconditionally, regardless of `ref_count`.
   `no_response_required` regression pair. All changes verified with explicit
   fail-without/pass-with proof per check (reverting the P3 classification fix, the re-arm gate
   change, and the discard-windowing change independently each reproduced exactly one test failure).
-- One additional test (`send_type_1_no_periodic_start_and_fires_one_shot_after_idle`) joins the
-  existing known-flaky-under-parallel-load list in
-  `j2534-0404-service/docs/implementation-notes.md` — same timing-window category as the two
-  pre-existing entries there, reproducible failure only under full-suite contention, passes reliably
+- One additional test (`send_type_1_no_periodic_start_and_fires_one_shot_after_idle`) joined the
+  known-flaky-under-parallel-load tests of the time — same timing-window category as the two
+  entries listed then (its later fix is cause 3 in `j2534-0404-service/docs/implementation-notes.md`'s
+  "Test-suite reliability: past flaky-test root causes" section), reproducible failure only under full-suite contention, passes reliably
   in isolation.

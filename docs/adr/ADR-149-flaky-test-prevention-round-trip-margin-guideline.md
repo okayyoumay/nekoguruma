@@ -8,8 +8,9 @@
 
 `j2534-0404-service/docs/implementation-notes.md`'s "Test-suite
 reliability: past flaky-test root causes" section records five flaky-test
-incidents in `tests/grpc_mock/`, each independently diagnosed and fixed
-(2026-07-22, 2026-07-28). Reviewing them together (rather than as isolated fixes)
+incidents in `tests/grpc_mock/` (its causes 1 to 5), each independently
+diagnosed and fixed (2026-07-22, 2026-07-28). Where this ADR refers to
+incidents 1, 3 and 4, they are that section's causes 4, 5 and 3. Reviewing them together (rather than as isolated fixes)
 surfaced three recurring write-time causes and one wrong fix attempt:
 
 1. Wall-clock margin that didn't account for round-trip/event-propagation
@@ -54,7 +55,7 @@ Codex-review-documented.
    holds the write-time guideline, next to a new
    `GRPC_ROUND_TRIP_OVERHEAD_CEILING_MS` constant that centralizes the
    previously-scattered ~85ms figure. `.claude/agents/implementer.md` and
-   the worker-crate backlog's Known-Flaky-Tests preamble get a bare
+   `implementation-notes.md`'s "Test-suite reliability" section get a bare
    pointer to it, not a restated copy — flaky tests in this codebase's
    history were written across many PRs, including sessions that never
    pass through `implementer`'s own briefs, so `implementer.md` cannot be
@@ -91,8 +92,7 @@ Codex-review-documented.
    weakening in incident 4) and the Known-Flaky-Tests triage protocol
    (`.claude/agents/cargo-runner.md`) remain the actual backstops.
 7. **A distinct triage lesson (not a write-time rule) is recorded in
-   `implementation-notes.md`'s "Test-suite reliability" section (and the
-   worker-crate backlog's preamble), not folded into the four rules
+   `implementation-notes.md`'s "Test-suite reliability" section, not folded into the four rules
    above:** if widening a suspected timing margin makes a test fail *more*
    often or deterministically, that disproves the margin theory —
    instrument rather than keep widening (incident 3's actual diagnosis

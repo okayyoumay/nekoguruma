@@ -30,9 +30,9 @@
 //! ## Writing new timing-sensitive tests (ADR-149)
 //!
 //! Five flaky-test incidents in this file's siblings (see
-//! `docs/implementation-notes.md`'s "Known Flaky Tests" / "Resolved"
-//! history) resolved to three write-time causes and one wrong fix
-//! attempt. Follow these when a new test waits on a timer, an idle
+//! `docs/implementation-notes.md`'s "Test-suite reliability: past
+//! flaky-test root causes" section) resolved to three write-time causes
+//! and one wrong fix attempt. Follow these when a new test waits on a timer, an idle
 //! interval, or a deadline, **or** asserts against shared/queued state
 //! (an event queue, a per-entity counter) that a concurrent, unrelated
 //! entity could also satisfy:
@@ -83,17 +83,17 @@
 //! insufficient wall-clock margin: concurrent `TestServer::start*` calls
 //! racing on shared process-global state (a fixed temp config file path and
 //! the `VCI_CONFIG_PATH` env var). See [`TestServer::try_start_with_extra_config`]'s
-//! doc comment and `docs/implementation-notes.md`'s "Known Flaky Tests" /
-//! "Resolved (2026-08-07)" entry for the full mechanism and the original fix
-//! (`VCI_CONFIG_STARTUP_LOCK`). None of the margin/deadline/scoping
+//! doc comment and `docs/implementation-notes.md`'s "Test-suite reliability:
+//! past flaky-test root causes" section (cause 6) for the full mechanism and
+//! the original fix (`VCI_CONFIG_STARTUP_LOCK`). None of the margin/deadline/scoping
 //! guidelines above apply to this class of bug -- widening a timing margin
 //! does nothing for a data race on shared state.
 //!
-//! That 2026-08-07 fix was later found to be incomplete: `VCI_CONFIG_STARTUP_LOCK`
+//! That first fix was later found to be incomplete: `VCI_CONFIG_STARTUP_LOCK`
 //! only serializes concurrent *threads* within a single test process -- it does
 //! nothing against two separate `cargo test` processes racing on the same fixed
-//! config file path. See `docs/implementation-notes.md`'s "Resolved (2026-08-27)"
-//! entry and ADR-195 for the cross-process fix (a per-process-unique config
+//! config file path. See the same `docs/implementation-notes.md` section
+//! and ADR-195 for the cross-process fix (a per-process-unique config
 //! path), applied in [`TestServer::try_start_with_extra_config`] below.
 
 use std::os::raw::{c_long, c_void};
@@ -1745,7 +1745,8 @@ impl TestServer {
     /// **Serialized against every other concurrent `TestServer::start*` call
     /// in this binary via [`VCI_CONFIG_STARTUP_LOCK`]** (a sixth flaky-test
     /// root cause beyond the five ADR-149 already covers, see the module doc
-    /// above and `docs/implementation-notes.md`'s "Known Flaky Tests"):
+    /// above and `docs/implementation-notes.md`'s "Test-suite reliability: past
+    /// flaky-test root causes" section):
     /// `config_path`/`VCI_CONFIG_PATH` are both process-global mutable state
     /// -- a fixed temp-file path, written non-atomically via `std::fs::write`,
     /// and an environment variable (`unsafe` to set since Rust 1.82+ for

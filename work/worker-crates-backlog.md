@@ -61,9 +61,10 @@ this list in the first place.
 
 Triage note: if widening a suspected timing margin makes a test fail
 *more* often (or deterministically) rather than less, that disproves the
-margin theory — stop widening and instrument instead (see the
+margin theory — stop widening and instrument instead (see
 `receive_only_cyclic_reap_gated_by_exhaustive_drain_not_just_a_poll_running`
-entry below for a worked example).
+in the "Test-suite reliability: past flaky-test root causes" section of
+`crates/j2534-0404-service/docs/implementation-notes.md` for a worked example).
 
 - **`tests/grpc_mock/j1939.rs`: four tests that failed intermittently in full-module runs, cause not found.** Repeated full-module runs
   (`cargo test -p j2534-0404-service --test grpc_mock -- j1939::`) used to fail a different test about 1 run in 3 (observed:
@@ -81,208 +82,8 @@ entry below for a worked example).
   failing test but is unconfirmed. Delete this entry if it does not recur; if it does, record the failing test, the panic message
   and whether another test process was running.
 
-See "Resolved" below for this list's history.
-
-#### Resolved (2026-08-07)
-
-- **Process-global test-harness startup race** (a sixth flaky-test root
-  cause, distinct in kind from the five ADR-149 timing-margin entries
-  below — this one is a genuine concurrent read/write race on shared
-  process state, not a wall-clock margin problem). Observed as
-  intermittent `RegistryUnsupported` (`"registry lookup is only supported
-  on Windows"`) panics from `TestServer::start*` calls during full-suite
-  parallel `cargo test -p j2534-0404-service` runs, not reproducible in
-  isolation. Root cause: `TestServer::try_start_with_extra_config()`
-  (`tests/grpc_mock/harness.rs`) writes a fixed-path temp config file and
-  sets the `VCI_CONFIG_PATH` env var, both process-global mutable state,
-  then calls `J2534Service::new`, which reads them back synchronously
-  (via `vci-service-config`) before its first `.await`. `#[serial]` only
-  serializes a test against other `#[serial]`-tagged tests, not against
-  the large majority of non-`#[serial]` tests, which run in true parallel
-  OS threads under the default `cargo test` harness — so two concurrent
-  `start*` calls could interleave their file/env writes and reads with no
-  synchronization. `vci-service-config::load_toml_config` treats a
-  resulting torn/corrupted read as "nothing configured"
-  (`TomlConfig::default()`, warning-only `eprintln!`) rather than
-  propagating a parse error, so `library_path` silently resolved to
-  `None`, falling through to real Windows-registry auto-discovery, which
-  immediately errors on any non-Windows platform. Fixed by adding a
-  process-wide `VCI_CONFIG_STARTUP_LOCK: tokio::sync::Mutex<()>` in
-  `harness.rs`, held across the file write, env var set, and
-  `J2534Service::new(...).await` call in
-  `TestServer::try_start_with_extra_config` — the sole entry point all
-  `TestServer::start*` helpers funnel through. See that function's own
-  doc comment for the full mechanism. This is a test-infrastructure-only
-  fix; no production code changed.
-
-  **Correction/supersession (ADR-195):** this fix addressed only the
-  intra-process case — `VCI_CONFIG_STARTUP_LOCK` is a per-process Rust
-  static, so it did nothing against two separate `cargo test` processes
-  racing on the same fixed config file path. A same-day-unrelated
-  investigation months later (2026-08-27) found the fix incomplete for
-  exactly that reason; see the "Resolved (2026-08-27)" entry below and
-  ADR-195 for the cross-process fix.
-
-#### Resolved (2026-08-27)
-
-- **Cross-process test-harness startup race (ADR-195).** The
-  2026-08-07 fix above (`VCI_CONFIG_STARTUP_LOCK`) only ever serialized
-  concurrent *threads* within a single test process; it left the exact
-  same fixed-path temp config file and `VCI_CONFIG_PATH` env var racy
-  across two separate `cargo test` *processes* (e.g. two different test
-  binaries, or the same binary invoked twice concurrently), since the
-  lock is a per-process Rust static with no cross-process visibility.
-  Found via a design-advisor investigation triggered by rotating
-  flakiness observed across `repeat_message.rs`, `additional_channels.rs`,
-  `j1939.rs`, `tp20.rs`, and `response_distribution.rs` during unrelated
-  verification work — initially misdiagnosed as two or three separate,
-  distinct flakiness clusters, and briefly suspected to be a
-  poll-task-shutdown-ordering race in `spawn_channel_poll_task`/
-  `TestServer::shutdown()`; that specific hypothesis was investigated and
-  empirically refuted via instrumented reproduction before the real
-  cross-process cause was found (worth noting here so a future reader
-  doesn't re-chase the same dead end). Confirmed by running two
-  `cargo test` processes concurrently against the pre-fix tree, which
-  reliably reproduced the 2026-08-07 entry's exact failure signature
-  (`RegistryUnsupported`/`"registry lookup is only supported on
-  Windows"` panics) along with other rotating spurious failures from
-  tests silently getting the WRONG config (e.g. missing `modules`/
-  `can_channel_mode` entries belonging to the other process's test).
-  Fixed by making the temp config path per-process-unique (via
-  `std::process::id()`) at all four call sites sharing this pattern
-  across the workspace: `tests/grpc_mock/harness.rs`'s
-  `TestServer::try_start_with_extra_config` (this file, alongside the
-  existing `VCI_CONFIG_STARTUP_LOCK`), `tests/live_grpc_flow.rs`'s
-  `resolve_library_name`, and `iso22900-service`'s
-  `tests/grpc_mock.rs::TestServer::start` and
-  `src/service/rpc.rs::set_mock_library_path_config`. This is a
-  test-infrastructure-only change; no production code touched. The
-  `tests/grpc_mock/j1939.rs` "full-module flakiness (round 15, not yet
-  root-caused)" entry above is a plausible but *unconfirmed* candidate
-  for this same mechanism — left as-is, not claimed resolved by this fix.
-
-#### Resolved (2026-07-28)
-
-Both entries below were run down to a specific, confirmed test-side cause
-(not a production race) via dynamic reproduction (isolated repeats,
-temporary production-code instrumentation later fully reverted) plus a
-static read-through of the relevant production mechanism:
-
-- `tests/grpc_mock/stopcomm_data_tx.rs::stopcomm_disconnect_then_reconnect_same_channel_suppresses_stale_final_transmit`
-  (originally observed 2026-07-24, ADR-123 Codex-review round-3
-  verification pass — failed once in 3 full parallel `cargo test -p
-  j2534-0404-service` runs): the production guard this test exercises
-  (`handle_stop_comm`'s post-`wait_for_p3_gap` `still_on_this_channel`
-  re-check, `events.rs`) was confirmed correct by direct inspection — it
-  re-reads `connect_generation` under the same `logical_links` critical
-  section as the transmit it guards, a sound check-then-act with no TOCTOU
-  window. The flake was purely a test-side timing-margin defect, the same
-  class already fixed in the 2026-07-22 entries below: the test seeds a
-  300ms `CP_P3Phys` gap, sleeps 150ms (leaving only 150ms of margin), then
-  does a disconnect **and** a reconnect — two sequential gRPC round trips
-  — before the gap deadline elapses. The sibling test
-  `stopcomm_disconnect_racing_the_p3_gap_wait_suppresses_the_final_transmit`
-  uses the identical 150/300ms margin successfully because it does only
-  ONE round trip (disconnect only); this test's extra reconnect call
-  roughly doubles the round-trip time that has to fit inside the same
-  150ms window, which round-trip overhead measured elsewhere in this file
-  (up to ~85ms per round trip) can exceed under load. Fixed by widening
-  `CP_P3Phys` to 800ms (keeping the initial 150ms sleep, so the remaining
-  margin grows from 150ms to 650ms) and the post-reconnect settle sleep
-  from 250ms to 700ms. Verified: 5/5 isolated reruns passed (~1.54s each,
-  consistent), plus a full `grpc_mock` suite run and the untouched sibling
-  test, both green.
-
-- `tests/grpc_mock/cop_ctrl_cycles.rs::receive_only_cyclic_reap_gated_by_exhaustive_drain_not_just_a_poll_running`
-  (originally observed 2026-07-28, CI on PR #3, after the
-  queue-policy-field-ownership refactor, ADR-140 — failed once on CI; a
-  50-run isolated rerun separately measured a pre-existing ~4% flake rate
-  unrelated to that refactor). An initial attempt to fix this the same way
-  as the entry above (widening the wall-clock margins 6x) instead made the
-  test fail **deterministically** (5/5), which disproved the margin theory
-  and forced a real investigation: temporary instrumentation (`eprintln!`
-  in both the test and `reap_expired_cyclic_registrants`/`poll_rx_inner`,
-  since fully reverted — `git diff` against `src/` is clean) showed cop_a's
-  own registrant never satisfied `is_cyclic_reap_sound` during the run, so
-  the "cop_a must not be reaped" assertion was never actually observing
-  cop_a's own state. The real bug: this test's `is_finished` predicate was
-  unfiltered by `cop_handle` (matches ANY cop's `PduCopstFinished`), and
-  `set_unique_resp_table_and_promote` (called before `subscribe`) issues
-  its own `CoptUpdateparam` COP that executes and finishes essentially
-  immediately — its terminal events sit queued in the CLL's own event
-  buffer (populated regardless of subscriber presence) from before
-  `subscribe` is ever called, and are replayed as the first events any new
-  subscription reads. Delivering that backlog over the gRPC stream measured
-  consistently at ~40ms in this environment, so the original 40ms
-  checkpoint was unknowingly racing that unrelated COP's own stale terminal
-  event, not cop_a's — explaining the historical failure and the 4% flake
-  rate as a race against backlog-replay latency, not against the
-  exhaustive-drain timing the test is meant to exercise. Fixed by filtering
-  every `is_finished` check in this test to cop_a's own `cop_handle`,
-  matching the pattern the neighbouring
-  `cyclic_reap_defers_until_the_uudt_companion_channels_watermark_also_catches_up`
-  test already uses (`is_finished_for_cop_a`). The wall-clock margins were
-  also kept widened (6x: 100ms deadline, ~300ms drain window, 200ms/50ms
-  checkpoints) as an independent, additional safety margin against the
-  original tight-tick-margin concern, now that the predicate bug no longer
-  masks whether that margin was ever the deciding factor. Verified: 5/5
-  isolated reruns passed (~0.52s each), plus a full `grpc_mock` suite run
-  and the companion test, both green.
-
-#### Resolved (2026-07-22)
-
-Three timing-window tests around idle/software tester-present dispatch in
-`tests/grpc_mock/tester_present_send_type.rs` were previously listed here.
-All three were run down to a specific, confirmed cause (not just "insufficient
-margin, unconfirmed") via dynamic reproduction (isolated repeats, full-package
-runs under simulated CPU load, and full-*workspace* `cargo test --workspace`
-runs with the machine deliberately oversubscribed) plus a static read-through
-of the production dispatch code (`events.rs`'s `dispatch_due_tester_present`,
-`tester_present_due_reference`, the ADR-093 `TesterPresentState::Armed`
-unification, and every `last_bus_activity` write site) confirming no
-production race exists — each test's flakiness was a test-side defect:
-
-- `send_type_1_idle_timer_resets_on_prior_bus_traffic`: chained blind
-  `tokio::time::sleep(40ms)`/`sleep(35ms)` calls against an 80ms interval left
-  only ~5ms of margin before the original arm-to-deadline fire, which ordinary
-  RPC/event round-trip overhead (measured elsewhere in this file at up to
-  ~85ms) reliably ate into (~27% failure rate, 4/15 isolated runs). Fixed by
-  switching to an anchored `tokio::time::sleep_until` deadline pattern (300ms
-  interval, reset at 150ms, check at 380ms, 225ms final threshold) mirroring
-  `kline_five_baud_init_stamps_last_bus_activity_deferring_mode_1_sibling`'s
-  already-stable structure. Verified stable across 40/40 isolated runs and 3
-  consecutive full-suite runs (356/356 tests each) under simulated CPU load.
-- `kline_five_baud_init_stamps_last_bus_activity_deferring_mode_1_sibling`:
-  its one historical failure (2026-07-16, during ADR-093's implementation)
-  occurred on a since-superseded test body that had the identical ~5ms-margin
-  defect above (confirmed via `git show` of the commit at that time); the
-  current body already uses the anchored `sleep_until` pattern and has zero
-  reproductions across all dynamic verification, including full-workspace
-  runs under heavy CPU oversubscription. No code change needed; the entry
-  described a defect that had already been fixed by the time it was written
-  down.
-- `send_type_1_no_periodic_start_and_fires_one_shot_after_idle`: had a real
-  structural race, distinct from the two above — its first assertion
-  (`written_count(MOCK_CHANNEL_ID) == 1`, checked right after
-  `wait_for_cop_finished`) compared a count against a 50ms idle interval, but
-  the client only learns the immediate ADR-084 send happened via an
-  event-propagation/gRPC round trip that can itself exceed 50ms (measured
-  elsewhere in this file at up to ~85ms) — so the second, idle-triggered
-  frame could legitimately have already landed by the time the `== 1` check
-  ran. First attempted fix relaxed that check to `>= 1`, but a Codex review
-  correctly flagged that this silently defeated the check's actual purpose:
-  a regression where `CoptStartcomm` stops sending synchronously (only
-  sending on the idle timer instead) would, once `wait_for_cop_finished`
-  happened to take longer than the interval, still pass `>= 1` (and the
-  payload check) on that delayed frame, no longer distinguishing it from a
-  genuine arm-time send. Corrected fix instead widens `CP_TesterPresentTime`
-  itself (50ms → 300ms, matching the other two entries' interval) so `== 1`
-  has enough margin over the ~85ms of round-trip overhead to stay meaningful
-  without racing it; the elapsed bounds were rescaled to match (225ms lower /
-  1500ms upper — the upper bound deliberately kept well below the preset's
-  un-overridden 2s default, so a "the override didn't take effect"
-  regression is still caught). Verified stable across 25/25 isolated runs
-  and a full module regression pass (39/39) after the correction.
+Past root causes and their fixes: `crates/j2534-0404-service/docs/implementation-notes.md`, section
+"Test-suite reliability: past flaky-test root causes".
 
 ### Prioritized Backlog
 
@@ -400,7 +201,7 @@ production race exists — each test's flakiness was a test-side defect:
   single-bug-fix PR's scope; revisit if a third protocol needs the same treatment.
 - **P3** (ADR-195, design-advisor investigation, accepted residual, not fixed here): while ruling
   out the poll-task-shutdown-ordering hypothesis during the ADR-195 cross-process race
-  investigation (see "Resolved (2026-08-27)" above), the mock cdylib's `spawn_repeat_worker`
+  investigation (ADR-195), the mock cdylib's `spawn_repeat_worker`
   (`j2534-0404-mock/src/lib.rs`, around line 1250) was found to have no protection against the
   cdylib itself being `dlclose`'d while its detached, `std::thread::spawn`-launched repeat-message
   worker thread is still running — plausibly consistent with a prior one-off, never-reproduced

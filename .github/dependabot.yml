@@ -3,6 +3,8 @@
 # gets its own, since it can change behaviour. All GitHub Actions updates, majors included, arrive
 # as one grouped pull request. A new release is proposed only after it has been out for a week
 # (cooldown), so a compromised or yanked release has time to surface.
+# The cargo-minor-patch group's pull request is auto-merged once the required checks pass
+# (.github/workflows/dependabot-auto-merge.yml); every other update waits for the maintainer.
 # Security updates are separate: they follow the repository's Dependabot alert settings and
 # ignore the schedule, grouping and cooldown below.
 version: 2

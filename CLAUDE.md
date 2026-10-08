@@ -169,6 +169,11 @@ requests (`.github/dependabot.yml`); main runs it on every push that is not docu
 check it locally with `cargo +<rust-version> check --workspace --all-targets --locked` when you
 use a recently stabilized language or library feature.
 
+`dependabot-auto-merge.yml` turns on GitHub auto-merge (squash) for Dependabot's grouped Cargo
+minor/patch pull request only, so it merges once the required checks pass (ADR-248). Dependabot's
+other pull requests (Cargo updates Cargo treats as breaking, such as 0.22 to 0.23, and GitHub
+Actions) wait for the maintainer like any other.
+
 Compiler warnings fail CI: `core-linux`, `core-windows` and `worker-check` build with
 `RUSTFLAGS=-D warnings`, and `core-linux` runs `cargo fmt --check`. Clippy is not run in CI
 (it would add a build to every pull request); run it locally before pushing. Silence a warning for code that
@@ -189,6 +194,8 @@ the attribute fails the build once the code is used and gets removed.
    conversation: every follow-up is either done in the PR or added to the backlog (`backlog`
    skill). Items the PR finishes are closed in the same PR.
 5. The maintainer (the repository owner) reviews and merges. Do not merge your own PR unless asked.
+   The one exception is Dependabot's grouped Cargo minor/patch pull request, which merges itself
+   ("Building and testing" above, ADR-248).
 
 Commit messages and PR descriptions follow the same copyright rule as the code.
 

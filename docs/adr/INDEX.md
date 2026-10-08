@@ -237,6 +237,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-245](ADR-245-ir-restart-declaration-in-the-procedure-part.md) | The IR's Restart Declaration Lives in the Procedure Part | Accepted | `diag-ir` `Program` restart declaration, `ir.fbs` `FlashSession` |
 | [ADR-246](ADR-246-codeql-hand-off-carries-private-alert-details.md) | The CodeQL Hand-Off Carries High and Critical Alert Details Privately | Accepted | `.github/workflows/codeql-alert-handoff.yml`, `.claude/skills/codeql-alerts` |
 | [ADR-247](ADR-247-debug-builds-may-write-to-sim-vci.md) | Debug Builds May Send Write Requests to `sim-vci` | Accepted | `agent` policy, link, host, runner |
+| [ADR-248](ADR-248-dependabot-auto-merge-trust-boundary.md) | Dependabot's Cargo Minor/Patch Group Merges Itself | Accepted | `.github/workflows/dependabot-auto-merge.yml`, `.github/dependabot.yml` |
 
 ## Status Legend
 
@@ -561,6 +562,7 @@ the predecessor repository these ADRs came from.
 - ADR-241
 - ADR-243 (Decision item 3's skipping of high and critical alerts and item 4's number-only hand-off of them superseded by ADR-246)
 - ADR-246
+- ADR-248
 
 ### Timestamps / Clock
 - ADR-057 (amended by ADR-102)

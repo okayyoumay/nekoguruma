@@ -1,0 +1,55 @@
+name: Dependabot auto-merge
+
+# Turns on GitHub auto-merge for Dependabot's grouped Cargo minor/patch pull request
+# (`cargo-minor-patch` in .github/dependabot.yml), so it is squash-merged once main's required
+# checks pass. Every other Dependabot pull request (Cargo updates Cargo treats as breaking, such as
+# 1.x -> 2.0 or 0.22 -> 0.23, GitHub Actions, security updates) and every human pull request is
+# left for the maintainer to merge. ADR-248 records the trust boundary.
+# Needs "Allow auto-merge" turned on in the repository settings.
+#
+# pull_request_target, not pull_request: GitHub runs a Dependabot-triggered pull_request workflow
+# like one from a fork, with a read-only token that `permissions` cannot raise, so it cannot turn
+# on auto-merge. pull_request_target runs this file as it is on main with a write token; the job is
+# limited to Dependabot's own pull requests and must never check out or run code from them.
+on: pull_request_target
+
+permissions: {}
+
+# One run at a time per pull request, so a run for an older push cannot finish after a newer one.
+concurrency:
+  group: dependabot-auto-merge-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  enable-auto-merge:
+    if: github.event.pull_request.user.login == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      # Someone other than Dependabot pushed to the branch: auto-merge stays on after such a push,
+      # so turn it off and leave the pull request to the maintainer.
+      # A failure here fails the job; only "not enabled" is skipped.
+      - if: github.actor != 'dependabot[bot]'
+        run: |
+          enabled="$(gh pr view "$PR_URL" --json autoMergeRequest --jq '.autoMergeRequest != null')"
+          if [ "$enabled" = true ]; then
+            gh pr merge --disable-auto "$PR_URL"
+          fi
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - id: metadata
+        if: github.actor == 'dependabot[bot]'
+        uses: dependabot/fetch-metadata@v3
+      # Selecting by group rather than by update type: the update type can call a 0.x bump such as
+      # 0.22 -> 0.23 minor, while Cargo treats it as breaking and dependabot.yml keeps
+      # it out of the group.
+      - if: github.actor == 'dependabot[bot]' && steps.metadata.outputs.package-ecosystem == 'cargo' && steps.metadata.outputs.dependency-group == 'cargo-minor-patch'
+        # Bound to the commit Dependabot pushed: if the branch has moved on, the call fails.
+        run: gh pr merge --auto --squash --match-head-commit "$HEAD_SHA" "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

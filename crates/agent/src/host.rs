@@ -41,7 +41,9 @@ pub enum HostError {
     PrimitiveFailed(i32),
     #[error("service {0:#x} is not a UDS service ID")]
     BadService(u16),
-    #[error("service {0:#x} is not allowed: this agent sends only read-only requests")]
+    #[error(
+        "service {0:#x} is not allowed: the agent's request policy refuses it (ADR-235 item 8, ADR-247)"
+    )]
     NotAllowed(u16),
     #[error("{0} is not supported by this agent yet")]
     Unsupported(&'static str),

@@ -108,7 +108,16 @@ pub struct Link {
     pub cll_handle: ComLogicalLinkHandle,
     pub events: Streaming<EventNotification>,
     /// What the job may send on this link: decided from the VCI the module reports (ADR-247).
-    pub permission: Permission,
+    /// Not public: only [`open`] may decide it, so a library caller cannot grant a link to a
+    /// real VCI the simulator permission.
+    pub(crate) permission: Permission,
+}
+
+impl Link {
+    /// What the job may send on this link.
+    pub fn permission(&self) -> Permission {
+        self.permission
+    }
 }
 
 fn param(id: u32, class: PduParamClass, value: u32) -> ParamItem {

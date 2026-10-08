@@ -36,9 +36,13 @@ The options were:
    simulator permission does not exist in the code, so no input can unlock it.
 2. **How the simulator is identified.** After `ModuleConnect` and before it creates the logical
    link, a debug agent reads the module's version (`GetVersion`). The VCI counts as `sim-vci`
-   only when both version strings carry `sim-vci`'s prefixes:
+   only when the answer comes from `j2534-0404-service` and carries `sim-vci`'s version strings:
+   - the vendor name is `j2534-0404` and the API name `J2534`, which only that worker reports,
+     since another worker maps its own version data to the same fields;
    - the firmware version starts with `NGR-SIM `;
    - the library version starts with `sim-vci `.
+
+   The permission belongs to the link and cannot be set from outside the agent crate.
 
    Any other VCI, including one whose version cannot be read, leaves the job read-only. A
    release agent does not read the version.
@@ -63,8 +67,8 @@ The options were:
 
 - An M1 procedure against the simulators can change sessions, reset the ECU, write identifiers
   and run routines. The interrupted-write work can build on this permission.
-- A real VCI whose library reported `sim-vci`'s version prefixes would be treated as the
-  simulator in a debug build. Debug builds are developer builds, and the prefixes are
+- A real VCI whose library reported `sim-vci`'s version prefixes through
+  `j2534-0404-service` would be treated as the simulator in a debug build. Debug builds are developer builds, and the prefixes are
   `sim-vci`'s own strings, so this needs a deliberately misleading library. Release builds are
   not affected.
 - A debug agent makes one more call (`GetVersion`) per job before it creates the link.

@@ -46,13 +46,26 @@ pub fn build_ceiling() -> Permission {
     Permission::ReadOnly
 }
 
+/// What `j2534-0404-service` puts in `VersionData::vendor_name` and `pdu_api_sw_name`.
+#[cfg(debug_assertions)]
+const J2534_SERVICE_VENDOR_NAME: &str = "j2534-0404";
+#[cfg(debug_assertions)]
+const J2534_SERVICE_PDU_API_SW_NAME: &str = "J2534";
+
 /// The permission for the VCI a worker reports (ADR-247): the simulator one only when the
 /// firmware and DLL names are those `sim-vci` reports through `j2534-0404-service` (`hw_name`
-/// carries the firmware version string, `fw_name` the DLL version string); anything else,
+/// carries the firmware version string, `fw_name` the DLL version string) and that service
+/// itself answered (it sets `vendor_name` and `pdu_api_sw_name` to constants). The last two
+/// matter because another worker, `iso22900-service`, fills `hw_name` and `fw_name` from other
+/// sources, so the meaning of those two fields holds only for the J2534 worker. Anything else,
 /// including a vendor interface, is read-only. Debug builds only: a release build never asks.
 #[cfg(debug_assertions)]
 pub fn identify(version: &vci_service_interface::VersionData) -> Permission {
-    if version.hw_name.starts_with("NGR-SIM ") && version.fw_name.starts_with("sim-vci ") {
+    if version.hw_name.starts_with("NGR-SIM ")
+        && version.fw_name.starts_with("sim-vci ")
+        && version.vendor_name == J2534_SERVICE_VENDOR_NAME
+        && version.pdu_api_sw_name == J2534_SERVICE_PDU_API_SW_NAME
+    {
         Permission::Simulator
     } else {
         Permission::ReadOnly
@@ -319,9 +332,20 @@ mod tests {
         }
 
         fn version(hw_name: &str, fw_name: &str) -> VersionData {
+            version_from(hw_name, fw_name, "j2534-0404", "J2534")
+        }
+
+        fn version_from(
+            hw_name: &str,
+            fw_name: &str,
+            vendor_name: &str,
+            pdu_api_sw_name: &str,
+        ) -> VersionData {
             VersionData {
                 hw_name: hw_name.to_owned(),
                 fw_name: fw_name.to_owned(),
+                vendor_name: vendor_name.to_owned(),
+                pdu_api_sw_name: pdu_api_sw_name.to_owned(),
                 ..VersionData::default()
             }
         }
@@ -332,6 +356,23 @@ mod tests {
                 identify(&version("NGR-SIM 1.0", "sim-vci 0.1.0")),
                 Permission::Simulator
             );
+            // The right version strings from a worker other than j2534-0404-service.
+            for (vendor, api) in [
+                ("", ""),
+                ("j2534-0404", ""),
+                ("", "J2534"),
+                ("iso22900", "J2534"),
+                ("j2534-0404", "ISO 22900-2"),
+                ("J2534-0404", "J2534"),
+                ("j2534-0404 ", "J2534"),
+                ("j2534-0404", "j2534"),
+            ] {
+                assert_eq!(
+                    identify(&version_from("NGR-SIM 1.0", "sim-vci 0.1.0", vendor, api)),
+                    Permission::ReadOnly,
+                    "{vendor:?} / {api:?}"
+                );
+            }
             for (hw, fw) in [
                 ("NGR-SIM 1.0", ""),
                 ("", "sim-vci 0.1.0"),

@@ -52,8 +52,9 @@ The options were:
    - Every request is still checked in the host's `send_recv`, against the permission the link
      carries.
 4. **What the simulator permission covers.** It covers `ServiceRequest` with any service ID and
-   `RoutineControl`, which the host now sends as a RoutineControl request. `SecurityAccess` and
-   `FlashTransfer` stay refused, because the host does not implement them yet.
+   `RoutineControl`, which the host now sends as a RoutineControl request. A `ServiceRequest`
+   may therefore carry a SecurityAccess or a download request too. The dedicated `SecurityAccess`
+   and `FlashTransfer` instructions stay refused, because the host does not implement them yet.
 5. **Replaced, not extended.** The policy layer of design 5.5, 5.6, 6 and 8.9 replaces this
    permission. A job is then allowed by its signed, approved instruction and its preconditions,
    not by the VCI it runs on. This ADR grants no permission against a real VCI in any build.

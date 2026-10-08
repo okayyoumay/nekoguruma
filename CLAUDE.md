@@ -77,7 +77,8 @@ Documentation is written in English and file names are kebab-case.
 
 ADRs live in `docs/adr/` as `ADR-{NNN}-{short-slug}.md` and follow
 [docs/adr/TEMPLATE.md](docs/adr/TEMPLATE.md). Each new ADR gets a row in `docs/adr/INDEX.md`'s
-main table and an entry under the matching theme section at the bottom of that file.
+main table and an entry under the matching theme section at the bottom of that file: one
+`- ADR-{NNN}` line per ADR, in numeric order, with any status annotation after it in parentheses.
 
 Write an ADR when a design choice is non-obvious (data structure, concurrency model, state
 machine, protocol interpretation, trust boundary), when a prior ADR is revised, or when a spec

@@ -45,7 +45,7 @@ reviewing.
   | Non-obvious design decision | a new ADR (see the ADR rule below) |
 - **ADRs**: a non-obvious decision (data structure, concurrency model, state machine, protocol
   interpretation, trust boundary) or a surprising spec-driven behaviour without an ADR; a new
-  ADR without its `docs/adr/INDEX.md` row and theme entry; a duplicate ADR number; a change that
+  ADR without its `docs/adr/INDEX.md` row and theme entry (one line per ADR, in numeric order); a duplicate ADR number; a change that
   contradicts an accepted ADR without superseding it or annotating its Status line.
 - **Spec citations**, anywhere (code, docs, scripts, commit messages, the PR description): a
   standard cited without its clause or section number, or an ISO 22900-2 citation that does not

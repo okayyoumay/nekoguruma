@@ -5,6 +5,8 @@ description: Atomically reserve a unique ADR number before writing any ADR in ne
 
 # ADR number reservation
 
+The design and its alternatives are recorded in ADR-119.
+
 Two parallel sessions computing "max + 1 over `docs/adr/`" pick the same
 number, and the duplicate merges silently: the files have different slugs, so
 git never conflicts on them. ADR numbers are cited from code and documents,
@@ -47,12 +49,13 @@ Rules:
 ## Step 3: write the ADR
 
 Create `docs/adr/ADR-{NNN}-{short-slug}.md` from `docs/adr/TEMPLATE.md`, add
-the `INDEX.md` row in numeric order and the theme-section entry, and run
-`scripts/check-adr-index.sh`.
+the `INDEX.md` row in numeric order and the theme-section entry (its own
+`- ADR-{NNN}` line, in numeric order), and run `scripts/check-adr-index.sh`.
 
 Parallel ADR pull requests still produce ordinary line conflicts in
-`INDEX.md` (all append at the bottom of the table). Resolve them by keeping
-both sides' rows in numeric order, then run `scripts/check-adr-index.sh`.
+`INDEX.md`: all append at the bottom of the table, and two that add to the
+same theme both append at its end. Resolve them by keeping both sides' lines
+in numeric order, then run `scripts/check-adr-index.sh`.
 
 ## Cleanup
 

@@ -48,11 +48,10 @@ instruction would be an IR schema change (ADR-245 item 7).
    number of blocks the ECU confirmed, which rises through the transfer without wrapping at
    255. Any failed block ends the transfer, so the journal records each block as it is
    confirmed; after a failure the ECU may hold one block more than the last one recorded.
-   `Some(0)` means a
-   transfer started with no confirmed block, not a block number. The write-job journal
-   (ADR-244) records this index, not the operand and not the wire counter. It is a `u64`
-   while `Journal::commit_block` takes a `u32`, so the journaling runner converts it and never
-   commits 0.
+   `Some(0)` means a transfer started with no confirmed block, not a block number. The
+   write-job journal (ADR-244) records this index, not the operand and not the wire counter.
+   It is a `u64` while `Journal::commit_block` takes a `u32`, so the journaling runner
+   converts it and never commits 0.
 6. **Policy.** The simulator permission of ADR-247 covers the `FlashTransfer` instruction, as it
    covers `RoutineControl`, and the read-only permission refuses it (service 0x36). This amends
    ADR-247 Decision item 4: only the refusal of `FlashTransfer` is superseded. The

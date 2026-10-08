@@ -265,6 +265,14 @@ mod tests {
                 "{refused:?}"
             );
         }
+        let refused = check_program(
+            &program(vec![Op::PushBytes(0), Op::ServiceRequest { service: 0x36 }]),
+            READ_ONLY,
+        );
+        assert!(
+            matches!(refused, Err((1, HostError::UseFlashTransfer))),
+            "{refused:?}"
+        );
     }
 
     #[cfg(debug_assertions)]

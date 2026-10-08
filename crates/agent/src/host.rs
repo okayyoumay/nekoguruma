@@ -281,9 +281,9 @@ impl WorkerHost {
     /// The number of TransferData blocks the ECU confirmed since the last RequestDownload sent
     /// through this host, which is also the 1-based index of the last confirmed block. Any
     /// failed block ends the transfer (`None`), so the journal must have recorded each block as
-    /// it was confirmed; the ECU may hold one block more than the last one recorded. `Some(0)` means a
-    /// transfer started with no confirmed block yet (it is not a block number); `None` means no
-    /// transfer is tracked (none started, or it ended, ADR-250).
+    /// it was confirmed; the ECU may hold one block more than the last one recorded. `Some(0)`
+    /// means a transfer started with no confirmed block yet (it is not a block number); `None`
+    /// means no transfer is tracked (none started, or it ended, ADR-250).
     ///
     /// This rising index, not the IR operand, is what the write-job journal records for a block
     /// (ADR-244). It is a `u64`, while `Journal::commit_block` takes a `u32`: the journaling

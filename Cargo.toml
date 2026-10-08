@@ -70,7 +70,7 @@ portable-atomic = "1"
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["ws"] }
 base64 = "0.23"
-getrandom = "0.3"
+getrandom = "0.4"
 
 # Agent: discovery (7.1)
 roxmltree = "0.21"

@@ -169,6 +169,10 @@ requests (`.github/dependabot.yml`); main runs it on every push that is not docu
 check it locally with `cargo +<rust-version> check --workspace --all-targets --locked` when you
 use a recently stabilized language or library feature.
 
+`dependabot-auto-merge.yml` turns on GitHub auto-merge (squash) for Dependabot's grouped Cargo
+minor/patch pull request only, so it merges once the required checks pass. Dependabot's other pull
+requests (Cargo major and 0.x updates, GitHub Actions) wait for the maintainer like any other.
+
 Compiler warnings fail CI: `core-linux`, `core-windows` and `worker-check` build with
 `RUSTFLAGS=-D warnings`, and `core-linux` runs `cargo fmt --check`. Clippy is not run in CI
 (it would add a build to every pull request); run it locally before pushing. Silence a warning for code that

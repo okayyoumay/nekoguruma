@@ -1,0 +1,30 @@
+name: Dependabot auto-merge
+
+# Turns on GitHub auto-merge for Dependabot's grouped Cargo minor/patch pull request
+# (`cargo-minor-patch` in .github/dependabot.yml), so it is squash-merged once main's required
+# checks pass. Every other Dependabot pull request (Cargo major or 0.x updates, GitHub Actions,
+# security updates) and every human pull request is left for the maintainer to merge.
+# Needs "Allow auto-merge" turned on in the repository settings.
+on: pull_request
+
+permissions: {}
+
+jobs:
+  enable-auto-merge:
+    # Checking the actor too means a human push to a Dependabot branch does not trigger it.
+    if: github.event.pull_request.user.login == 'dependabot[bot]' && github.actor == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - id: metadata
+        uses: dependabot/fetch-metadata@v3
+      # Selecting by group rather than by update type: the update type can call a 0.x bump such as
+      # 0.22 -> 0.23 minor, while Cargo treats it as breaking and dependabot.yml keeps
+      # it out of the group.
+      - if: steps.metadata.outputs.package-ecosystem == 'cargo' && steps.metadata.outputs.dependency-group == 'cargo-minor-patch'
+        run: gh pr merge --auto --squash "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

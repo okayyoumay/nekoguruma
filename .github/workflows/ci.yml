@@ -191,6 +191,17 @@ jobs:
         with:
           key: ${{ matrix.target }}
       - run: cargo build --locked -p sim-vci -p j2534-0404-service -p iso22900-service --target ${{ matrix.target }} --release
+      # Debug builds for abi-roundtrip-windows (the launch test's config override is debug-only,
+      # ADR-073).
+      - run: cargo build --locked -p sim-vci -p j2534-0404-service --target ${{ matrix.target }}
+      - uses: actions/upload-artifact@v5
+        with:
+          name: abi-launch-${{ matrix.target }}
+          path: |
+            target/${{ matrix.target }}/debug/sim_vci.dll
+            target/${{ matrix.target }}/debug/j2534-0404-service.exe
+          if-no-files-found: error
+          retention-days: 1
       # sim-vci's exports must carry the plain J2534 names (stdcall on win-x86, 7.1.2).
       - name: Check sim-vci exports
         run: PROFILE=release ./scripts/abi-roundtrip.sh ${{ matrix.target }}
@@ -243,6 +254,36 @@ jobs:
       - run: |
           for target in $TARGETS; do
             cargo zigbuild --locked -p sim-vci -p j2534-0404-service --target "$target.2.17"
+            LAUNCH=1 ./scripts/abi-roundtrip.sh "$target"
+          done
+
+  # ABI interpretation table (7.1.2) on the Windows worker targets: the debug builds that
+  # worker-windows cross-compiles are launched on a Windows runner (win-x86 under WOW64) by the
+  # same test as abi-roundtrip (scripts/abi-roundtrip.sh, LAUNCH=1, under Git Bash), with the
+  # table's `unsigned long` width. It needs worker-windows, so like it, it runs on main only.
+  abi-roundtrip-windows:
+    needs: worker-windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: abi-roundtrip-windows
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: actions/download-artifact@v5
+        with:
+          name: abi-launch-x86_64-pc-windows-gnullvm
+          path: target/x86_64-pc-windows-gnullvm/debug
+      - uses: actions/download-artifact@v5
+        with:
+          name: abi-launch-i686-pc-windows-gnullvm
+          path: target/i686-pc-windows-gnullvm/debug
+      # The export check needs llvm-objdump, which the runner's LLVM provides.
+      - shell: bash
+        run: |
+          export PATH="$PATH:/c/Program Files/LLVM/bin"
+          for target in x86_64-pc-windows-gnullvm i686-pc-windows-gnullvm; do
             LAUNCH=1 ./scripts/abi-roundtrip.sh "$target"
           done
 

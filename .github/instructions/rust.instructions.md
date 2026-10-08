@@ -29,3 +29,10 @@ Flag as P1:
   work lands. Use `#[expect(..., reason = "...")]`, which fails once the code is used.
 - **Out-of-scope targets**: Windows workers target `*-pc-windows-gnullvm` only (ADR-227). An MSVC
   worker target or MSVC-only build path is P1.
+- **Interrupted transfers resumed mid-download**: code that resumes an interrupted flash
+  transfer (agent or worker crash, VCI disconnect, power loss) from a later block, or from the
+  last journaled block, instead of redoing it from the erase and RequestDownload (ADR-229
+  item 1). Also flag a restart that skips ADR-229's order (teardown, then the identity and
+  precondition checks, then erase), or that ignores the journal's write-ahead intent markers
+  when it decides where the interruption happened, so a lost response could lead to an
+  automatic restart that the procedure's recovery-required point forbids.

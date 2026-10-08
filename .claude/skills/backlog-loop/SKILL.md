@@ -160,8 +160,18 @@ The PR is a draft whose title starts with `[backlog-loop]`, set when it is creat
 carries the `backlog-loop` label. Create the label first if the repository does not have it, and
 check that the PR carries it.
 
-Run `scripts/classify-pr-risk.sh` (after the fetch in step 1) and copy its output into the PR description under a
-"Risk (shadow)" heading. The verdict is recorded only to compare it later with the maintainer's
+Run the classifier (after the fetch in step 1) with the claimed item and copy its output into
+the PR description under a "Risk (shadow)" heading. The claim is the item's first physical line,
+the one starting with `- `, as it reads on the PR's base. Read it from the file rather than
+typing it, since backticks and quotes in item text would be mangled or run by the shell:
+
+```sh
+claim="$(git show origin/main:<backlog file> | sed -n '<line number>p')"
+scripts/classify-pr-risk.sh --claimed-item "$claim"
+```
+
+Without the option, when the claim names no item or several, or when the PR deletes any other
+item, the verdict is HIGH. The verdict is recorded only to compare it later with the maintainer's
 own judgement; it changes nothing about who merges. If the script exits with status 2, write
 "not classified" and the reason it printed. Then run `pr-review-loop`. Before it hands the PR
 to the maintainer, run the classifier again on the final head and replace the section if the

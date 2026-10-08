@@ -48,6 +48,20 @@ Steps (`agent::check_program`, `agent::launch::launch_j2534_worker`, then `agent
    the worker. The policy is read-only, except that a debug build may send any request once
    the worker's VCI has identified itself as `sim-vci` (ADR-247); a program that needs more
    than the VCI allows is refused after the link opens, before its first instruction runs.
+   On that permission the `FlashTransfer` instruction also works (ADR-250); `SecurityAccess`
+   stays refused.
+
+## Data transfer
+
+`FlashTransfer` sends one TransferData request (service 0x36) per instruction and requires a
+positive response that echoes the block sequence counter; a negative response or a wrong echo
+fails the job (ADR-250). The instruction's `block` operand is constant per instruction, so the
+host ignores it and keeps its own count of the blocks of the transfer: the counter is 1 for the
+first block after a RequestDownload (0x34) or RequestUpload (0x35) sent through the host
+(a `ServiceRequest` answered positively), rises by one per accepted block and continues at 0
+after 0xFF (ISO 14229-1:2026 clause 14.4). A `FlashTransfer` with no such request before it is
+an error and sends nothing. `WorkerHost::transfer_block_index` gives the count of accepted
+blocks, which the write-job journal records (ADR-244).
 
 ## Output and exit status
 

@@ -74,37 +74,43 @@ is_crate_test() {
 # headings the block sits under (joined by "\036"), a tab, the text. An item
 # (I) is a top-level "- **P0**" .. "- **P3**" bullet in an item section, or
 # any top-level bullet in a Known Flaky Tests section, with its indented
-# continuation lines joined by "\037". Headings are H, blank lines B,
-# everything else (the header line, prose, Status bullets) O. As in
-# scripts/check-backlog.sh, a Status, Unverified Assumptions or Resolved
-# section and everything below it is not an item list, also when it is
-# nested in a Known Flaky Tests section.
+# continuation lines (also after a blank line) joined by "\037". Headings are
+# H, blank lines B, everything else (the header line, prose, Status bullets,
+# fenced code) O. As in scripts/check-backlog.sh, a Status, Unverified
+# Assumptions or Resolved section and everything below it is not an item
+# list, also when it is nested in a Known Flaky Tests section. Carriage
+# returns are dropped.
 backlog_blocks() {
   awk '
     function flush() { if (item != "") { print "I\t" path "\t" item; item = "" } }
+    { sub(/\r$/, "") }
+    /^```/ { flush(); fence = !fence; print "O\t" path "\t" $0; next }
+    fence { print "O\t" path "\t" $0; next }
     /^#+ / {
       flush()
       level = index($0, " ") - 1
       while (depth && lvl[depth] >= level) depth--
+      path = ""
+      for (d = 1; d <= depth; d++) path = path (d > 1 ? "\036" : "") head[d]
       print "H\t" path "\t" $0
       lvl[++depth] = level; head[depth] = $0
       if ($0 ~ /^#+ (Status|Unverified Assumptions|Resolved)/) kind[depth] = "exempt"
       else if ($0 ~ /^#+ Known Flaky Tests/) kind[depth] = "flaky"
       else kind[depth] = ""
-      sect = ""; path = ""
+      sect = ""
       for (d = 1; d <= depth; d++) {
         if (kind[d] == "exempt") sect = "exempt"
         else if (kind[d] == "flaky" && sect == "") sect = "flaky"
-        path = path (d > 1 ? "\036" : "") head[d]
       }
+      path = path (depth > 1 ? "\036" : "") $0
       next
     }
-    /^[ \t]+[^ \t]/ && item != "" { item = item "\037" $0; next }
-    { flush() }
-    /^[ \t]*$/ { print "B\t" path "\t"; next }
+    /^[ \t]*$/ { if (item != "") gap = gap "\037"; else print "B\t" path "\t"; next }
+    /^[ \t]+[^ \t]/ && item != "" { item = item gap "\037" $0; gap = ""; next }
+    { flush(); gap = "" }
     /^- / && ((sect == "" && $0 ~ /^- \*\*P[0-3]\*\*/) || sect == "flaky") { item = $0; next }
     { print "O\t" path "\t" $0 }
-    END { flush() }
+    END { flush(); print "E\t\t" }
   '
 }
 
@@ -112,28 +118,47 @@ backlog_blocks() {
 # file); blank lines are ignored. Prints one "deleted <item>" line for every
 # whole item removed and one "added <item>" line for every item added, then
 # one "reason <text>" line for every other kind of change:
-# - a removed or changed line that is not a whole item;
+# - a removed or changed line that is not a whole item, except a heading
+#   whose whole section is removed along with it (closing the last item);
 # - an added line that is neither an item nor a heading;
 # - blocks that kept their text but changed their order or the headings they
 #   sit under (an item moved to another section, or a heading inserted above
 #   existing items).
-# An item rewritten in place shows as one deleted and one added item, as
+# The last line is "end"; the caller treats its absence as a failure. An
+# item rewritten in place shows as one deleted and one added item, as
 # closing an item and adding its residual does; the limit of one deletion
 # bounds that case.
 compare_blocks() {
   awk -F'\t' '
     FNR == 1 { pass++ }
     $1 == "B" { next }
+    $1 == "E" { ends++; next }
     { k = $1 "\t" $3 }
-    pass == 1 { old[++no] = $0; okey[no] = k; cold[k]++; next }
-    { new[++nn] = $0; nkey[nn] = k; cnew[k]++ }
+    pass == 1 { old[++no] = $0; okey[no] = k; cold[k]++; fold[$0]++; next }
+    { new[++nn] = $0; nkey[nn] = k; cnew[k]++; fnew[$0]++ }
     function short(b) { b = substr(b, 3); gsub(/\037/, " ", b); return substr(b, 1, 70) }
+    function hlevel(b) { return index(substr(b, 3), " ") - 1 }
+    function min(x, y) { return x < y ? x : y }
     END {
+      if (ends != 2) exit 1
+      for (k in cold) if (cold[k] > cnew[k]) gone[k] = 1
       for (k in cold) {
         extra = cold[k] - cnew[k]
         if (extra <= 0) continue
-        if (substr(k, 1, 1) == "I") while (extra-- > 0) print "deleted " substr(k, 3)
-        else print "reason removes or changes a line that is not a whole item: " short(k)
+        if (substr(k, 1, 1) == "I") { while (extra-- > 0) print "deleted " substr(k, 3); continue }
+        if (substr(k, 1, 1) == "H") {
+          # A removed heading is fine when everything in its section goes too.
+          emptied = 1
+          for (i = 1; i <= no; i++) if (okey[i] == k) {
+            L = hlevel(k)
+            for (j = i + 1; j <= no; j++) {
+              if (substr(okey[j], 1, 1) == "H" && hlevel(okey[j]) <= L) break
+              if (!gone[okey[j]] || substr(okey[j], 1, 1) == "O") emptied = 0
+            }
+          }
+          if (emptied) continue
+        }
+        print "reason removes or changes a line that is not a whole item: " short(k)
       }
       for (k in cnew) {
         extra = cnew[k] - cold[k]
@@ -142,13 +167,20 @@ compare_blocks() {
         if (t == "I") while (extra-- > 0) print "added " substr(k, 3)
         else if (t != "H") print "reason adds a line that is neither an item nor a heading: " short(k)
       }
-      # The blocks both versions share must keep their order and the headings
-      # they sit under.
-      for (i = 1; i <= no; i++) if (keep[okey[i]]++ < cnew[okey[i]]) a[++na] = i
-      for (i = 1; i <= nn; i++) if (seen[nkey[i]]++ < cold[nkey[i]]) b[++nb] = i
-      for (i = 1; i <= na; i++) if (old[a[i]] != new[b[i]]) {
-        print "reason moves items or sections: " short(nkey[b[i]]); break
+      # A block both versions keep must stay under the same headings ...
+      for (f in fold) kept[substr(f, 1, 1) "\t" substr(f, index(substr(f, 3), "\t") + 3)] += min(fold[f], fnew[f])
+      for (k in cold) if (cnew[k] && kept[k] < min(cold[k], cnew[k])) {
+        print "reason moves items or sections: " short(k); moved = 1; break
       }
+      # ... and in the same order.
+      if (!moved) {
+        for (i = 1; i <= no; i++) if (keep[old[i]]++ < fnew[old[i]]) a[++na] = i
+        for (i = 1; i <= nn; i++) if (seen[new[i]]++ < fold[new[i]]) b[++nb] = i
+        for (i = 1; i <= na; i++) if (old[a[i]] != new[b[i]]) {
+          print "reason moves items or sections: " short(nkey[b[i]]); break
+        }
+      }
+      print "end"
     }
   ' "$1" "$2"
 }
@@ -156,23 +188,29 @@ compare_blocks() {
 # work/ edits: only modified backlog files are checked here; is_low_path and
 # the status checks below already make any other work/ change HIGH. The
 # deleted and added items of all files are collected, so that an item moved
-# from one backlog file to another is not taken for a closed item.
+# from one backlog file to another is not taken for a closed item. A step
+# that fails stops the script with status 2 rather than reading as no
+# change.
 work_deleted=()
 work_added=()
+work_tmp="$(mktemp -d)"
+trap 'rm -rf "$work_tmp"' EXIT
 check_work_backlog() {
-  local path="$1" before after line
-  before="$(mktemp)"
-  after="$(mktemp)"
-  git show "$merge_base:$path" | backlog_blocks >"$before"
-  git show "HEAD:$path" | backlog_blocks >"$after"
+  local path="$1" out line
+  if ! git show "$merge_base:$path" | backlog_blocks >"$work_tmp/before" ||
+    ! git show "HEAD:$path" | backlog_blocks >"$work_tmp/after" ||
+    ! out="$(compare_blocks "$work_tmp/before" "$work_tmp/after")" ||
+    [ "${out##*$'\n'}" != end ]; then
+    echo "cannot compare the backlog file $path" >&2
+    exit 2
+  fi
   while IFS= read -r line; do
     case "$line" in
       "deleted "*) work_deleted+=("${line#deleted }") ;;
       "added "*) work_added+=("${line#added }") ;;
       "reason "*) reasons+=("$path: ${line#reason }") ;;
     esac
-  done < <(compare_blocks "$before" "$after")
-  rm -f "$before" "$after"
+  done <<<"$out"
 }
 
 reasons=()

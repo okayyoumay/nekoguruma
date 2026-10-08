@@ -44,6 +44,12 @@ base_backlog() {
 #### Resolved
 
 - **`an_old_flaky_test`**: fixed, kept as history.
+
+## Area three
+
+- **P2**: Fifth item. Done when: five.
+
+  A second paragraph of the fifth item.
 EOF
 }
 
@@ -148,6 +154,59 @@ expect "editing work/README.md is HIGH" HIGH "not on the low-risk allowlist"
 setup
 printf '> **TEMPORARY WORKING MATERIAL.** New.\n\n## A\n\n- **P1**: x.\n' >"$w/new-backlog.md"
 expect "adding a backlog file is HIGH" HIGH "adds the backlog file"
+
+setup
+edit '/^## Area two$/i ## Area new\n\n- **P2**: New item.\n'
+expect "adding a section in the middle of a file is LOW" LOW
+
+setup
+edit '/^## Area two$/i ## Area zero\n\n### Known Flaky Tests\n'
+expect "adding a section with a repeated subsection heading is LOW" LOW
+
+setup
+edit '/Fifth item/,$d'
+expect "deleting a two-paragraph item is LOW" LOW
+
+setup
+edit '/^## Area three$/,$d'
+expect "closing a section's last item and removing its heading is LOW" LOW
+
+setup
+edit '/^## Area two$/d'
+expect "removing a heading whose section stays is HIGH" HIGH "not a whole item: ## Area two"
+
+setup
+edit '/First item/d'
+sed -i '/Fourth item/d' "$other"
+expect "deleting one item in each of two files is HIGH" HIGH "deletes 2 backlog items"
+
+setup
+git mv "$other" "$w/renamed-backlog.md"
+expect "renaming a backlog file is HIGH" HIGH "renames"
+
+setup
+git rm -q "$other"
+expect "deleting a backlog file is HIGH" HIGH "deletes $other"
+
+# A comparison step that fails must not read as "no change": with awk
+# failing for the comparison (the only awk call with -F), two deleted items
+# must give exit status 2, not LOW.
+setup
+edit '/First item/d;/Third item/d'
+git add -A
+git commit -q -m "awk fails"
+mkdir -p "$tmp/shim"
+real_awk="$(command -v awk)"
+printf '#!/bin/sh\ncase "$1" in -F*) exit 2 ;; esac\nexec %s "$@"\n' "$real_awk" >"$tmp/shim/awk"
+chmod +x "$tmp/shim/awk"
+status=0
+PATH="$tmp/shim:$PATH" scripts/classify-pr-risk.sh base >/dev/null 2>&1 || status=$?
+if [ "$status" -eq 2 ]; then
+  echo "ok: a failing comparison exits with status 2"
+else
+  echo "FAIL: a failing comparison exits with status 2: got status $status" >&2
+  failures=$((failures + 1))
+fi
 
 if [ "$failures" -ne 0 ]; then
   echo "error: $failures classify-pr-risk.sh test case(s) failed" >&2

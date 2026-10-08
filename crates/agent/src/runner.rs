@@ -1,19 +1,24 @@
 //! Runs a procedure on a link (ADR-235).
 //!
-//! The minimal runner: no journal, no server, no section policy. A host error ends the job;
-//! the VM state then still points at the failed primitive (ADR-233 item 1), which a journaling
-//! runner will use to decide whether to repeat it.
+//! No server and no section policy. A host error ends the job; the VM state then still points
+//! at the failed primitive (ADR-233 item 1). [`run_program_journaled`] also writes the
+//! write-job journal at a flash recovery plan's boundaries (`journaling`, ADR-252).
 
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use diag_ir::{DiagHost, Program, StepError, StepOutcome, Vm, VmError, VmState, WaitingOn};
+use diag_ir::{
+    DiagHost, IdentityKind, Program, StepError, StepOutcome, Vm, VmError, VmState, WaitingOn,
+};
 use tokio::runtime::{Handle, RuntimeFlavor};
 use worker_host::client::WorkerClient;
 
-use crate::host::{HostError, Timings, WorkerHost};
+use crate::host::{HostError, Timings, TransferProgress, WorkerHost};
+use crate::inputs::RuntimeInputs;
+use crate::journal::{JournalError, StepRef, Store};
+use crate::journaling::{JobJournal, JournalSetup};
 use crate::link::{self, LinkConfig};
 use crate::policy::{self, Permission};
 
@@ -67,6 +72,10 @@ pub enum JobError {
     },
     #[error("the job was cancelled")]
     Cancelled,
+    #[error("journal: {0}")]
+    Journal(#[from] JournalError),
+    #[error("the ECU's {identity:?} could not be read at {pc}, so the plan does not start")]
+    IdentityUnreadable { pc: u32, identity: IdentityKind },
     #[error("the job thread panicked")]
     Panicked,
 }
@@ -112,7 +121,38 @@ pub async fn run_program(
     program: Program,
     limits: JobLimits,
 ) -> Result<VmState, JobError> {
-    run_program_within(client, config, program, limits, policy::build_ceiling()).await
+    run_program_within(
+        client,
+        config,
+        program,
+        limits,
+        policy::build_ceiling(),
+        None,
+    )
+    .await
+}
+
+/// [`run_program`] that also writes the write-job journal for a program with a flash recovery
+/// plan (ADR-244, ADR-252): the journal of `journal.key` is created in `journal.dir` before the
+/// link opens, and the runner commits to it at the plan's boundaries (`journaling`). A commit
+/// that fails ends the job before the request it guards is sent. A program without a plan
+/// keeps no journal and creates no file.
+pub async fn run_program_journaled(
+    client: WorkerClient,
+    config: &LinkConfig,
+    program: Program,
+    limits: JobLimits,
+    journal: JournalSetup,
+) -> Result<VmState, JobError> {
+    run_program_within(
+        client,
+        config,
+        program,
+        limits,
+        policy::build_ceiling(),
+        Some(journal),
+    )
+    .await
 }
 
 /// [`run_program`] with the build's ceiling given, so tests can run under a lower one.
@@ -122,6 +162,7 @@ async fn run_program_within(
     program: Program,
     limits: JobLimits,
     ceiling: Permission,
+    journal: Option<JournalSetup>,
 ) -> Result<VmState, JobError> {
     let handle = Handle::current();
     if handle.runtime_flavor() == RuntimeFlavor::CurrentThread {
@@ -134,7 +175,9 @@ async fn run_program_within(
     let cancelled = Arc::clone(&cancel.0);
     tokio::task::spawn_blocking(move || {
         std::panic::catch_unwind(AssertUnwindSafe(|| {
-            run_job(handle, client, &config, &program, limits, &cancelled)
+            run_job(
+                handle, client, &config, &program, limits, &cancelled, journal,
+            )
         }))
         .unwrap_or(Err(JobError::Panicked))
     })
@@ -157,10 +200,16 @@ fn run_job(
     program: &Program,
     limits: JobLimits,
     cancelled: &AtomicBool,
+    journal: Option<JournalSetup>,
 ) -> Result<VmState, JobError> {
     if cancelled.load(Ordering::Relaxed) {
         return Err(JobError::Cancelled);
     }
+    // Before the link opens: a job that cannot keep its journal sends nothing.
+    let mut journal = match journal {
+        Some(setup) if !program.flash.is_empty() => Some(JobJournal::create(setup)?),
+        _ => None,
+    };
     let timings = Timings::for_link(config);
     let link = handle
         .block_on(link::open(&mut client, config, timings.unary))
@@ -173,7 +222,7 @@ fn run_job(
     }
     let mut host = WorkerHost::new(handle.clone(), client, link, timings);
     let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        run_on(program, &mut host, limits, cancelled)
+        run_on(program, &mut host, limits, cancelled, journal.as_mut())
     }))
     .unwrap_or(Err(JobError::Panicked));
     let (mut client, link) = host.into_parts();
@@ -204,15 +253,26 @@ impl Drop for CancelOnDrop {
     }
 }
 
-/// The step loop, on the blocking thread.
-fn run_on<H: DiagHost<Error = HostError>>(
+/// The step loop, on the blocking thread. With a journal, it commits at the plan's boundaries
+/// each time execution arrives at an instruction, before that instruction runs, and after a
+/// completed instruction (`journaling`).
+fn run_on<H, S>(
     program: &Program,
     host: &mut H,
     limits: JobLimits,
     cancelled: &AtomicBool,
-) -> Result<VmState, JobError> {
+    mut journal: Option<&mut JobJournal<S>>,
+) -> Result<VmState, JobError>
+where
+    H: DiagHost<Error = HostError> + RuntimeInputs + TransferProgress,
+    S: Store,
+{
     let wait_poll = limits.wait_poll.max(Duration::from_millis(1));
     let mut vm = Vm::new(program);
+    // The completed step that brought execution to the current instruction, and whether the
+    // journal has seen this arrival yet (a timer wait polls the same instruction again).
+    let mut previous: Option<StepRef> = None;
+    let mut arrived = true;
     loop {
         if cancelled.load(Ordering::Relaxed) {
             return Err(JobError::Cancelled);
@@ -220,10 +280,34 @@ fn run_on<H: DiagHost<Error = HostError>>(
         if vm.state.steps >= limits.max_steps {
             return Err(JobError::StepLimit(vm.state.steps));
         }
+        if std::mem::take(&mut arrived)
+            && let Some(journal) = journal.as_deref_mut()
+        {
+            journal.arrive(program, &vm.state, previous, host)?;
+        }
         let pc = vm.state.pc;
-        match vm.step(program, host) {
+        let at = StepRef {
+            pc,
+            steps: vm.state.steps,
+        };
+        let outcome = vm.step(program, host);
+        if vm.state.steps > at.steps {
+            // The instruction completed.
+            if let Some(journal) = journal.as_deref_mut() {
+                journal.completed(program, pc, host)?;
+            }
+            previous = Some(at);
+            arrived = true;
+        }
+        match outcome {
             Ok(StepOutcome::Continue) => {}
-            Ok(StepOutcome::Finished) => return Ok(vm.state),
+            Ok(StepOutcome::Finished) => {
+                // The end of the code can be a plan's post-transfer end.
+                if arrived && let Some(journal) = journal.as_deref_mut() {
+                    journal.arrive(program, &vm.state, previous, host)?;
+                }
+                return Ok(vm.state);
+            }
             Ok(StepOutcome::Waiting(WaitingOn::Timer)) => std::thread::sleep(wait_poll),
             Ok(StepOutcome::Waiting(on)) => return Err(JobError::Unanswerable(on)),
             Err(StepError::Vm(source)) => return Err(JobError::Vm { pc, source }),
@@ -234,6 +318,9 @@ fn run_on<H: DiagHost<Error = HostError>>(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
     use diag_ir::{IR_SCHEMA_VERSION, Op, Value};
 
     use super::*;
@@ -292,6 +379,28 @@ mod tests {
         fn log(&mut self, _: u8, _: &str) {}
     }
 
+    impl RuntimeInputs for FakeHost {
+        fn read(&mut self, _: diag_ir::RuntimeInput) -> Result<crate::inputs::Reading, HostError> {
+            Ok(crate::inputs::Reading::CannotBeEstablished)
+        }
+    }
+
+    impl TransferProgress for FakeHost {
+        fn transfer_block_index(&self) -> Option<u64> {
+            None
+        }
+    }
+
+    /// `run_on` without a journal.
+    fn run_plain(
+        program: &Program,
+        host: &mut FakeHost,
+        limits: JobLimits,
+        cancelled: &AtomicBool,
+    ) -> Result<VmState, JobError> {
+        run_on(program, host, limits, cancelled, None::<&mut JobJournal>)
+    }
+
     fn program(code: Vec<Op>) -> Program {
         Program {
             schema_version: IR_SCHEMA_VERSION,
@@ -310,7 +419,7 @@ mod tests {
             max_steps,
             ..JobLimits::default()
         };
-        run_on(&program(code), host, limits, &AtomicBool::new(false))
+        run_plain(&program(code), host, limits, &AtomicBool::new(false))
     }
 
     fn two_requests() -> Vec<Op> {
@@ -437,7 +546,7 @@ mod tests {
             ..JobLimits::default()
         };
         let program = program(vec![Op::Wait { millis: 5 }]);
-        run_on(&program, &mut host, limits, &AtomicBool::new(false)).unwrap();
+        run_plain(&program, &mut host, limits, &AtomicBool::new(false)).unwrap();
         assert_eq!(host.waits, 3);
     }
 
@@ -478,7 +587,7 @@ mod tests {
             ..FakeHost::default()
         };
         assert!(matches!(
-            run_on(
+            run_plain(
                 &program(two_requests()),
                 &mut host,
                 JobLimits::default(),
@@ -487,6 +596,482 @@ mod tests {
             Err(JobError::Cancelled)
         ));
         assert_eq!(host.requests, 1);
+    }
+
+    // ------------------------------------------------------------ journaling (ADR-252)
+
+    /// Counts the journal's commits in a cell the host reads, and fails the commit numbered
+    /// `fail_at` (1-based).
+    struct CountingStore {
+        commits: Rc<Cell<u64>>,
+        fail_at: Option<u64>,
+    }
+
+    impl Store for CountingStore {
+        fn append_sync(&mut self, _: &[u8]) -> std::io::Result<()> {
+            if self.fail_at == Some(self.commits.get() + 1) {
+                return Err(std::io::Error::other("disk full"));
+            }
+            self.commits.set(self.commits.get() + 1);
+            Ok(())
+        }
+    }
+
+    /// What a [`FlashHost`] was asked to do.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Sent {
+        Service(u16, Vec<u8>),
+        Routine(u16),
+        Block,
+    }
+
+    /// An ECU that downloads: it answers ReadDataByIdentifier F191 and F195, accepts every
+    /// other request and every block, and counts the blocks since the last RequestDownload as
+    /// the worker's host does. It logs each request with the journal commits made before it.
+    struct FlashHost {
+        commits: Rc<Cell<u64>>,
+        log: Vec<(Sent, u64)>,
+        transfer: Option<u64>,
+        /// The answer to F195; `None` answers it negatively.
+        software_version: Option<Vec<u8>>,
+    }
+
+    impl FlashHost {
+        fn new(commits: Rc<Cell<u64>>) -> Self {
+            Self {
+                commits,
+                log: Vec::new(),
+                transfer: None,
+                software_version: Some(b"SW01".to_vec()),
+            }
+        }
+
+        fn sent(&self) -> Vec<Sent> {
+            self.log.iter().map(|(sent, _)| sent.clone()).collect()
+        }
+    }
+
+    impl RuntimeInputs for FlashHost {
+        fn read(&mut self, _: diag_ir::RuntimeInput) -> Result<crate::inputs::Reading, HostError> {
+            Ok(crate::inputs::Reading::CannotBeEstablished)
+        }
+    }
+
+    impl TransferProgress for FlashHost {
+        fn transfer_block_index(&self) -> Option<u64> {
+            self.transfer
+        }
+    }
+
+    impl DiagHost for FlashHost {
+        type Error = HostError;
+
+        fn service_request(&mut self, service: u16, payload: &[u8]) -> Result<Vec<u8>, HostError> {
+            self.log
+                .push((Sent::Service(service, payload.to_vec()), self.commits.get()));
+            match (service, payload) {
+                (0x22, [0xF1, 0x91]) => Ok([&[0x62, 0xF1, 0x91][..], b"HW01"].concat()),
+                (0x22, [0xF1, 0x95]) => Ok(match &self.software_version {
+                    Some(version) => [&[0x62, 0xF1, 0x95][..], version].concat(),
+                    None => vec![0x7F, 0x22, 0x31],
+                }),
+                (0x34, _) => {
+                    self.transfer = Some(0);
+                    Ok(vec![0x74])
+                }
+                (0x37, _) => {
+                    self.transfer = None;
+                    Ok(vec![0x77])
+                }
+                _ => Ok(vec![service as u8 + 0x40]),
+            }
+        }
+        fn read_dtc(&mut self, _: u8) -> Result<Vec<u8>, HostError> {
+            Err(HostError::NoResponse)
+        }
+        fn routine_control(&mut self, routine: u16, _: u8, _: &[u8]) -> Result<Vec<u8>, HostError> {
+            self.log.push((Sent::Routine(routine), self.commits.get()));
+            Ok(vec![0x71])
+        }
+        fn security_access(
+            &mut self,
+            _: u64,
+            _: u8,
+            _: &[u8],
+        ) -> Result<Option<Vec<u8>>, HostError> {
+            Err(HostError::Unsupported("SecurityAccess"))
+        }
+        fn flash_transfer(&mut self, _: u32, _: &[u8]) -> Result<(), HostError> {
+            self.log.push((Sent::Block, self.commits.get()));
+            let count = self.transfer.as_mut().ok_or(HostError::NoTransferActive)?;
+            *count += 1;
+            Ok(())
+        }
+        fn wait(&mut self, _: u64, _: u32) -> Result<bool, HostError> {
+            Ok(true)
+        }
+        fn hmi_request(&mut self, _: u64, _: &[u8]) -> Result<Option<Vec<u8>>, HostError> {
+            Ok(None)
+        }
+        fn record_input(&mut self, _: u64, _: &[u8]) -> Result<Option<Vec<u8>>, HostError> {
+            Err(HostError::Unsupported("RecordInput"))
+        }
+        fn monitor_capture(&mut self, _: u32) -> Result<(), HostError> {
+            Err(HostError::Unsupported("MonitorCapture"))
+        }
+        fn log(&mut self, _: u8, _: &str) {}
+    }
+
+    const ENTRY: u32 = 3;
+    const ERASE: u32 = 4;
+    const EXIT: u32 = 16;
+
+    /// A programming session, then a plan: entry at 3, a routine-control erase at 4, a
+    /// RequestDownload, three blocks, RequestTransferExit at 16, and the end of the code as the
+    /// post-transfer end.
+    fn flash_program() -> Program {
+        let mut code = vec![
+            Op::PushBytes(0),
+            Op::ServiceRequest { service: 0x10 },
+            Op::Pop,
+            Op::PushBytes(0),
+            Op::RoutineControl {
+                routine: 0xFF00,
+                sub: 1,
+            },
+            Op::Pop,
+            Op::PushBytes(0),
+            Op::ServiceRequest { service: 0x34 },
+            Op::Pop,
+        ];
+        for _ in 0..3 {
+            code.extend([Op::PushBytes(0), Op::FlashTransfer { block: 1 }]);
+        }
+        code.extend([
+            Op::PushBytes(0),
+            Op::ServiceRequest { service: 0x37 },
+            Op::Pop,
+        ]);
+        let mut program = program(code);
+        let ecu = |field_id| diag_ir::Source::EcuService {
+            service_id: 1,
+            field_id,
+        };
+        program.identity = diag_ir::IdentitySources {
+            vin: Some(ecu(3)),
+            hardware_part_number: Some(ecu(1)),
+            software_version: Some(ecu(2)),
+        };
+        program.flash.push(diag_ir::FlashRecovery {
+            flash_session: 1,
+            stage: 7,
+            max_resumes: 1,
+            recovery_required: diag_ir::RecoveryRequired::Never,
+            boundaries: diag_ir::RecoveryBoundaries {
+                entry_pc: ENTRY,
+                erase_pc: ERASE,
+                transfer_exit_pc: EXIT,
+                post_transfer_end_pc: program.code.len() as u32,
+            },
+            timing: diag_ir::RecoveryTiming {
+                session_timeout_millis: 5000,
+                teardown_margin_millis: 0,
+                ecu_startup_millis: 0,
+                confirmation_window_millis: 0,
+            },
+            version_read_retries: 0,
+            no_application: None,
+        });
+        program.validate().expect("the fixture is a valid program");
+        program
+    }
+
+    fn identity_sources() -> crate::inputs::ServiceSources {
+        let field = |field_id, did: u8| crate::inputs::ServiceField {
+            service_id: 1,
+            field_id,
+            request: vec![0x22, 0xF1, did],
+            offset: 2,
+            length: 4,
+            encoding: crate::inputs::Encoding::Ascii,
+        };
+        crate::inputs::ServiceSources::new(vec![field(1, 0x91), field(2, 0x95)]).unwrap()
+    }
+
+    fn job_key() -> crate::journal::JobKey {
+        crate::journal::JobKey {
+            job_id: shared_proto::JobId("0190f5a8-7c2e-7d4b-9a6e-3f1c2b4d5e6f".to_owned()),
+            generation: 1,
+        }
+    }
+
+    fn counting_journal(
+        commits: &Rc<Cell<u64>>,
+        fail_at: Option<u64>,
+    ) -> JobJournal<CountingStore> {
+        let store = CountingStore {
+            commits: Rc::clone(commits),
+            fail_at,
+        };
+        JobJournal::new(
+            crate::journal::Journal::on_store(store, job_key()),
+            identity_sources(),
+        )
+    }
+
+    fn run_flash<S: Store>(
+        host: &mut FlashHost,
+        journal: &mut JobJournal<S>,
+    ) -> Result<VmState, JobError> {
+        run_on(
+            &flash_program(),
+            host,
+            JobLimits::default(),
+            &AtomicBool::new(false),
+            Some(journal),
+        )
+    }
+
+    /// Each marker is committed before the request it guards, the identity before the erase,
+    /// and each block after the ECU confirmed it.
+    #[test]
+    fn the_journal_commits_come_before_the_requests_they_guard() {
+        let commits = Rc::new(Cell::new(0));
+        let mut host = FlashHost::new(Rc::clone(&commits));
+        let mut journal = counting_journal(&commits, None);
+        run_flash(&mut host, &mut journal).unwrap();
+        // Commits: 1 the VM state at the entry, 2 the hardware part number, 3 the software
+        // version, 4 the transfer start, 5-7 the blocks, 8 the exit marker, 9 the completion.
+        assert_eq!(
+            host.log,
+            [
+                (Sent::Service(0x10, vec![0x01]), 0),
+                (Sent::Service(0x22, vec![0xF1, 0x91]), 1),
+                (Sent::Service(0x22, vec![0xF1, 0x95]), 2),
+                (Sent::Routine(0xFF00), 4),
+                (Sent::Service(0x34, vec![0x01]), 4),
+                (Sent::Block, 4),
+                (Sent::Block, 5),
+                (Sent::Block, 6),
+                (Sent::Service(0x37, vec![0x01]), 8),
+            ]
+        );
+        assert_eq!(commits.get(), 9);
+        let facts = &journal.journal().state().facts;
+        let transfer = facts.transfer.as_ref().unwrap();
+        assert_eq!(transfer.last_block, Some(3));
+        assert!(transfer.exit.as_ref().unwrap().complete);
+    }
+
+    #[test]
+    fn a_failed_transfer_start_commit_ends_the_job_before_the_erase() {
+        let commits = Rc::new(Cell::new(0));
+        let mut host = FlashHost::new(Rc::clone(&commits));
+        let mut journal = counting_journal(&commits, Some(4));
+        let result = run_flash(&mut host, &mut journal);
+        assert!(
+            matches!(result, Err(JobError::Journal(JournalError::Io(_)))),
+            "{result:?}"
+        );
+        assert_eq!(
+            host.sent(),
+            [
+                Sent::Service(0x10, vec![0x01]),
+                Sent::Service(0x22, vec![0xF1, 0x91]),
+                Sent::Service(0x22, vec![0xF1, 0x95]),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_failed_exit_marker_commit_ends_the_job_before_request_transfer_exit() {
+        let commits = Rc::new(Cell::new(0));
+        let mut host = FlashHost::new(Rc::clone(&commits));
+        let mut journal = counting_journal(&commits, Some(8));
+        let result = run_flash(&mut host, &mut journal);
+        assert!(
+            matches!(result, Err(JobError::Journal(JournalError::Io(_)))),
+            "{result:?}"
+        );
+        assert_eq!(host.sent().last(), Some(&Sent::Block));
+        assert!(
+            !host
+                .sent()
+                .iter()
+                .any(|sent| *sent == Sent::Service(0x37, vec![0x01]))
+        );
+    }
+
+    #[test]
+    fn a_failed_block_commit_ends_the_job_before_the_next_block() {
+        let commits = Rc::new(Cell::new(0));
+        let mut host = FlashHost::new(Rc::clone(&commits));
+        let mut journal = counting_journal(&commits, Some(6));
+        assert!(matches!(
+            run_flash(&mut host, &mut journal),
+            Err(JobError::Journal(JournalError::Io(_)))
+        ));
+        let blocks = host.sent().iter().filter(|s| **s == Sent::Block).count();
+        assert_eq!(blocks, 2);
+    }
+
+    #[test]
+    fn an_unreadable_identity_ends_the_job_before_the_erase() {
+        let commits = Rc::new(Cell::new(0));
+        let mut host = FlashHost::new(Rc::clone(&commits));
+        host.software_version = None;
+        let mut journal = counting_journal(&commits, None);
+        let result = run_flash(&mut host, &mut journal);
+        assert!(
+            matches!(
+                result,
+                Err(JobError::IdentityUnreadable {
+                    pc: ENTRY,
+                    identity: IdentityKind::SoftwareVersion
+                })
+            ),
+            "{result:?}"
+        );
+        assert!(!host.sent().iter().any(|s| matches!(s, Sent::Routine(_))));
+        let facts = &journal.journal().state().facts;
+        assert_eq!(
+            facts.ecu_hardware_part_number.as_deref(),
+            Some(&b"HW01"[..])
+        );
+        assert!(facts.transfer.is_none());
+    }
+
+    /// The done-when case: a journal file written by a job reads back with the markers, the
+    /// rising blocks, the identity and the VM state at the entry boundary.
+    #[test]
+    fn a_journaled_job_reads_back_from_its_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "ngr-runner-journal-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let setup = JournalSetup {
+            dir: dir.clone(),
+            key: job_key(),
+            sources: identity_sources(),
+        };
+        let mut journal = JobJournal::create(setup).unwrap();
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        let result = run_flash(&mut host, &mut journal);
+        drop(journal);
+        let state = crate::journal::Journal::read(&dir, &job_key());
+        let _ = std::fs::remove_dir_all(&dir);
+        result.unwrap();
+        let state = state.unwrap();
+        let facts = &state.facts;
+        assert_eq!(
+            facts.ecu_hardware_part_number.as_deref(),
+            Some(&b"HW01"[..])
+        );
+        assert_eq!(
+            facts.pre_erase_software_version.as_deref(),
+            Some(&b"SW01"[..])
+        );
+        let transfer = facts.transfer.as_ref().unwrap();
+        assert_eq!(transfer.stage, crate::journal::StageId(7));
+        // Instructions 0 to 3 ran before the erase, one step each.
+        assert_eq!(
+            transfer.started_at,
+            StepRef {
+                pc: ERASE,
+                steps: 4
+            }
+        );
+        assert_eq!(transfer.last_block, Some(3));
+        let exit = transfer.exit.as_ref().unwrap();
+        assert_eq!(
+            exit.intent_at,
+            StepRef {
+                pc: EXIT,
+                steps: 16
+            }
+        );
+        assert!(exit.complete);
+        // The VM state at the entry, on the step before it.
+        let (step, bytes) = state.last_vm_state.as_ref().unwrap();
+        assert_eq!(
+            *step,
+            StepRef {
+                pc: ENTRY - 1,
+                steps: 2
+            }
+        );
+        let vm_state: VmState = postcard::from_bytes(bytes).unwrap();
+        assert_eq!((vm_state.pc, vm_state.steps), (ENTRY, 3));
+        assert!(vm_state.stack.is_empty());
+    }
+
+    /// A job that starts at the plan's entry has its initial state there: no step record.
+    #[test]
+    fn a_job_that_starts_at_the_entry_records_no_state() {
+        let mut program = flash_program();
+        // Drop the programming session: the plan starts the program.
+        program.code.drain(..3);
+        let plan = &mut program.flash[0].boundaries;
+        plan.entry_pc -= 3;
+        plan.erase_pc -= 3;
+        plan.transfer_exit_pc -= 3;
+        plan.post_transfer_end_pc -= 3;
+        program.validate().unwrap();
+        let commits = Rc::new(Cell::new(0));
+        let mut host = FlashHost::new(Rc::clone(&commits));
+        let mut journal = counting_journal(&commits, None);
+        run_on(
+            &program,
+            &mut host,
+            JobLimits::default(),
+            &AtomicBool::new(false),
+            Some(&mut journal),
+        )
+        .unwrap();
+        let state = journal.journal().state();
+        assert_eq!(state.last_vm_state, None);
+        assert_eq!(state.facts.transfer.as_ref().unwrap().last_block, Some(3));
+        // Identity 2, transfer start 1, blocks 3, exit 1, completion 1.
+        assert_eq!(commits.get(), 8);
+    }
+
+    #[test]
+    fn a_program_without_a_plan_keeps_no_journal() {
+        let dir =
+            std::env::temp_dir().join(format!("ngr-runner-no-journal-{}", std::process::id()));
+        let setup = JournalSetup {
+            dir: dir.clone(),
+            key: job_key(),
+            sources: identity_sources(),
+        };
+        // Fails at the link the link opens, after the journal decision: no file appears.
+        let result = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let handle = Handle::current();
+                tokio::task::spawn_blocking(move || {
+                    run_job(
+                        handle,
+                        unreachable_client(),
+                        &LinkConfig::iso15765(0x7E0, 0x7E8),
+                        &program(two_requests()),
+                        JobLimits::default(),
+                        &AtomicBool::new(false),
+                        Some(setup),
+                    )
+                })
+                .await
+                .unwrap()
+            });
+        assert!(matches!(result, Err(JobError::Link(_))), "{result:?}");
+        assert!(!dir.exists());
     }
 
     /// A client for a port nothing listens on: any RPC fails, so a test that gets past the
@@ -512,6 +1097,7 @@ mod tests {
             program(code.clone()),
             JobLimits::default(),
             Permission::ReadOnly,
+            None,
         )
         .await;
         assert!(
@@ -531,6 +1117,7 @@ mod tests {
             program(two_requests()[..2].to_vec()),
             JobLimits::default(),
             Permission::ReadOnly,
+            None,
         )
         .await;
         assert!(matches!(result, Err(JobError::Link(_))), "{result:?}");
@@ -553,6 +1140,7 @@ mod tests {
             program(code.clone()),
             JobLimits::default(),
             Permission::Simulator,
+            None,
         )
         .await;
         assert!(matches!(result, Err(JobError::Link(_))), "{result:?}");
@@ -602,6 +1190,7 @@ mod tests {
                 &program,
                 JobLimits::default(),
                 &AtomicBool::new(true),
+                None,
             )
         })
         .await

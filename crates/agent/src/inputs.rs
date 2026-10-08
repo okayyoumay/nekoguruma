@@ -361,15 +361,46 @@ where
     }
 }
 
-/// Extracts `field` from `response` to the request with service `sid`.
-fn decode_field(field: &ServiceField, sid: u8, response: &[u8]) -> Reading {
+/// Reads the raw bytes of an `EcuService` field, for the write-job journal, which records the
+/// ECU's identity as the ECU answered it (ADR-244, ADR-252). The request and the checks are
+/// those of [`resolve_source`], and the field must also decode; `None` is a source that
+/// [`resolve_source`] would read as anything but a value, and every runtime input, which has
+/// no field bytes.
+pub fn read_field_bytes<H>(
+    source: Source,
+    table: &ServiceSources,
+    host: &mut H,
+) -> Result<Option<Vec<u8>>, HostError>
+where
+    H: DiagHost<Error = HostError>,
+{
+    let Source::EcuService {
+        service_id,
+        field_id,
+    } = source
+    else {
+        return Ok(None);
+    };
+    let Some(field) = table.get(service_id, field_id) else {
+        return Ok(None);
+    };
+    let Some((&sid, payload)) = field.request.split_first() else {
+        return Ok(None);
+    };
+    let response = host.service_request(u16::from(sid), payload)?;
+    Ok(extract_field(field, sid, &response)
+        .filter(|bytes| decode_bytes(field, bytes).is_known())
+        .map(<[u8]>::to_vec))
+}
+
+/// The bytes of `field` in `response` to the request with service `sid`, if the response is
+/// exactly the positive SID, the echo and the field.
+fn extract_field<'a>(field: &ServiceField, sid: u8, response: &'a [u8]) -> Option<&'a [u8]> {
     // A positive response carries the SID plus 0x40 (ISO 14229-1:2026 clause 7.4); a negative
     // one starts with 0x7F.
-    let Some((&first, rest)) = response.split_first() else {
-        return Reading::CannotBeDecoded;
-    };
+    let (&first, rest) = response.split_first()?;
     if first != sid.wrapping_add(0x40) {
-        return Reading::CannotBeDecoded;
+        return None;
     }
     let params = &field.request[1..];
     // Exactly the echo, then the field: nothing missing, nothing extra.
@@ -377,9 +408,19 @@ fn decode_field(field: &ServiceField, sid: u8, response: &[u8]) -> Reading {
         || field.offset.checked_add(field.length) != Some(rest.len())
         || rest[..field.offset] != *params
     {
-        return Reading::CannotBeDecoded;
+        return None;
     }
-    let bytes = &rest[field.offset..];
+    Some(&rest[field.offset..])
+}
+
+/// Extracts `field` from `response` to the request with service `sid`.
+fn decode_field(field: &ServiceField, sid: u8, response: &[u8]) -> Reading {
+    extract_field(field, sid, response)
+        .map_or(Reading::CannotBeDecoded, |bytes| decode_bytes(field, bytes))
+}
+
+/// Turns the bytes of `field` into a reading by its encoding.
+fn decode_bytes(field: &ServiceField, bytes: &[u8]) -> Reading {
     match field.encoding {
         Encoding::UnsignedBigEndian => {
             if bytes.is_empty() || bytes.len() > 8 {
@@ -605,6 +646,44 @@ mod tests {
     #[expect(dead_code, reason = "only has to compile")]
     fn worker_host_resolves_any_source(host: &mut crate::WorkerHost, source: Source) {
         let _ = resolve_source(source, &ServiceSources::default(), host);
+    }
+
+    #[test]
+    fn field_bytes_are_the_raw_field_of_a_decodable_answer() {
+        let mut host = Fake::answering(&[0x62, 0xF1, 0x00, 0x01, 0x02]);
+        let bytes = read_field_bytes(ecu(2, 1), &table(), &mut host).unwrap();
+        assert_eq!(bytes.as_deref(), Some(&[0x01, 0x02][..]));
+        assert_eq!(host.sent, [(0x22, vec![0xF1, 0x00])]);
+        let mut host = Fake::answering(&vin_response(b"WVWZZZ1JZXW000001"));
+        let bytes = read_field_bytes(ecu(1, 1), &table(), &mut host).unwrap();
+        assert_eq!(bytes.as_deref(), Some(&b"WVWZZZ1JZXW000001"[..]));
+        // Whatever reads as anything but a value gives no bytes.
+        for response in [
+            vin_response(b"                 "),
+            vec![0x7F, 0x22, 0x31],
+            vin_response(b"WVWZZZ1JZXW00000"),
+        ] {
+            let mut host = Fake::answering(&response);
+            assert_eq!(
+                read_field_bytes(ecu(1, 1), &table(), &mut host).unwrap(),
+                None
+            );
+        }
+        let mut host = Fake::answering(&[]);
+        assert_eq!(
+            read_field_bytes(ecu(9, 1), &table(), &mut host).unwrap(),
+            None
+        );
+        assert_eq!(
+            read_field_bytes(
+                Source::RuntimeInput(RuntimeInput::SupplyVoltageMillivolts),
+                &table(),
+                &mut host
+            )
+            .unwrap(),
+            None
+        );
+        assert!(host.sent.is_empty());
     }
 
     #[test]

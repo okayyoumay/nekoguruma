@@ -10,16 +10,22 @@
 //! RequestDownload before it cannot pass the program validator, so the host's refusal is a unit
 //! test in `crates/agent/src/host.rs`.)
 //!
+//! The job runs with the write-job journal (ADR-252): the ECU's part number and software
+//! version are read at the plan's entry, and the journal reads back with every block, the
+//! RequestTransferExit marker and the post-transfer completion.
+//!
 //! This file holds a single test, so the process-wide `VCI_CONFIG_PATH` it sets for the
 //! spawned service cannot race with another test.
 
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use agent::{JobLimits, LinkConfig, run_program};
+use agent::inputs::{Encoding, ServiceField, ServiceSources};
+use agent::journal::{JobKey, Journal};
+use agent::{JobLimits, JournalSetup, LinkConfig, run_program_journaled};
 use diag_ir::{
-    FlashRecovery, IR_SCHEMA_VERSION, Op, Program, RecoveryBoundaries, RecoveryRequired,
-    RecoveryTiming, Value,
+    FlashRecovery, IR_SCHEMA_VERSION, IdentitySources, Op, Program, RecoveryBoundaries,
+    RecoveryRequired, RecoveryTiming, Source, Value,
 };
 use worker_host::client::ConnectOptions;
 use worker_host::service::{LaunchOptions, ServiceKind, WorkerProcess};
@@ -30,6 +36,10 @@ const RID_ERASE_MEMORY: u16 = 0xFF00;
 /// More one-byte blocks than the counter holds before it wraps (255), and past its second wrap
 /// point of 0x00 (block 256) so the counter is 0x00 and 0x01 again.
 const BLOCKS: u32 = 300;
+/// The simulated ECU's part number and software version (`sim_ecu::DID_SPARE_PART_NUMBER`,
+/// `sim_ecu::DID_SOFTWARE_VERSION`), as the ECU config below sets them.
+const PART_NUMBER: &[u8] = b"NGR-SIM-ECU";
+const SW_VERSION: &[u8] = b"1.0.0";
 
 /// `sim-vci` is a dev-dependency, so cargo builds its cdylib into the same `deps` directory
 /// as this test executable.
@@ -123,9 +133,52 @@ fn download_program() -> Program {
         constants,
         sections: Vec::new(),
         source_map: Vec::new(),
-        identity: Default::default(),
+        identity: IdentitySources {
+            vin: None,
+            hardware_part_number: Some(Source::EcuService {
+                service_id: 1,
+                field_id: 1,
+            }),
+            software_version: Some(Source::EcuService {
+                service_id: 1,
+                field_id: 2,
+            }),
+        },
         preconditions: Default::default(),
         flash,
+    }
+}
+
+/// The identity fields: ReadDataByIdentifier F187 and F189, as long as the ECU's values.
+fn identity_sources() -> ServiceSources {
+    let field = |field_id, did: u16, length| ServiceField {
+        service_id: 1,
+        field_id,
+        request: [&[0x22][..], &did.to_be_bytes()].concat(),
+        offset: 2,
+        length,
+        encoding: Encoding::Ascii,
+    };
+    ServiceSources::new(vec![
+        field(1, 0xF187, PART_NUMBER.len()),
+        field(2, 0xF189, SW_VERSION.len()),
+    ])
+    .expect("identity table")
+}
+
+fn job_key() -> JobKey {
+    JobKey {
+        job_id: shared_proto::JobId("0190f5a8-7c2e-7d4b-9a6e-3f1c2b4d5e70".to_owned()),
+        generation: 1,
+    }
+}
+
+/// Removes the temporary journal directory however the test ends.
+struct TempDir(PathBuf);
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
@@ -139,6 +192,9 @@ fn agent_job_downloads_more_blocks_than_the_counter_holds() {
     let ecu_path = std::env::temp_dir().join(format!("agent-flash-{nanos}-ecu.json"));
     let _config = TempFile(config_path.clone());
     let _ecu = TempFile(ecu_path.clone());
+    let journal_dir = std::env::temp_dir().join(format!("agent-flash-{nanos}-journal"));
+    std::fs::create_dir_all(&journal_dir).expect("journal directory");
+    let _journal = TempDir(journal_dir.clone());
     std::fs::write(
         &config_path,
         format!(
@@ -170,11 +226,29 @@ fn agent_job_downloads_more_blocks_than_the_counter_holds() {
         .expect("runtime");
     // A wedged service must fail the test, not hang the CI job.
     runtime
-        .block_on(async { tokio::time::timeout(Duration::from_secs(120), run_the_job()).await })
+        .block_on(async {
+            tokio::time::timeout(Duration::from_secs(120), run_the_job(journal_dir.clone())).await
+        })
         .expect("the flow should finish in time");
+
+    let journal = Journal::read(&journal_dir, &job_key()).expect("the job's journal");
+    let facts = &journal.facts;
+    assert_eq!(facts.ecu_hardware_part_number.as_deref(), Some(PART_NUMBER));
+    assert_eq!(
+        facts.pre_erase_software_version.as_deref(),
+        Some(SW_VERSION)
+    );
+    let transfer = facts.transfer.as_ref().expect("a transfer-start marker");
+    assert_eq!(transfer.started_at.pc, 3);
+    assert_eq!(transfer.last_block, Some(BLOCKS));
+    let exit = transfer
+        .exit
+        .as_ref()
+        .expect("a RequestTransferExit marker");
+    assert!(exit.complete);
 }
 
-async fn run_the_job() {
+async fn run_the_job(journal_dir: PathBuf) {
     let worker = WorkerProcess::launch(
         std::path::Path::new(env!("CARGO_BIN_EXE_j2534-0404-service")),
         ServiceKind::J2534V0404,
@@ -189,7 +263,7 @@ async fn run_the_job() {
     .await
     .expect("worker should launch");
 
-    let state = run_program(
+    let state = run_program_journaled(
         worker
             .connect(&ConnectOptions::default())
             .await
@@ -197,6 +271,11 @@ async fn run_the_job() {
         &LinkConfig::iso15765(0x7E0, 0x7E8),
         download_program(),
         JobLimits::default(),
+        JournalSetup {
+            dir: journal_dir,
+            key: job_key(),
+            sources: identity_sources(),
+        },
     )
     .await
     .expect("the download job should finish");

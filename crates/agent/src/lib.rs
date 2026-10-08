@@ -4,6 +4,7 @@
 //! - [`link`]: the communication link a job runs on, set up through the worker's D-PDU API
 //!   before the procedure starts
 //! - [`host`]: [`diag_ir::DiagHost`] on top of the worker gRPC client
+//! - [`inputs`]: the runtime inputs and service fields a restart reads (ADR-229, ADR-245)
 //! - [`journal`]: the write-job journal a restart resumes from (ADR-244)
 //! - [`policy`]: which requests the runner may send (read-only, except on the simulator in a debug build)
 //! - [`runner`]: runs a [`diag_ir::Program`] to its end on a link
@@ -12,6 +13,7 @@
 //! deadlines, the sync/async bridge) is ADR-235.
 
 pub mod host;
+pub mod inputs;
 pub mod journal;
 pub mod launch;
 pub mod link;

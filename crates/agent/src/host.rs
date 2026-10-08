@@ -124,6 +124,8 @@ pub struct WorkerHost {
     timings: Timings,
     /// When each `Wait` inquiry started.
     waits: HashMap<u64, Instant>,
+    /// The worker's `PDU_IOCTL_READ_VBATT` id, or that it has none, once looked up.
+    vbatt_id: crate::inputs::VbattId,
 }
 
 impl WorkerHost {
@@ -134,6 +136,7 @@ impl WorkerHost {
             link,
             timings,
             waits: HashMap::new(),
+            vbatt_id: crate::inputs::VbattId::Unknown,
         }
     }
 
@@ -326,6 +329,28 @@ impl Progress {
 /// annex A.1).
 fn is_response_pending(response: &[u8]) -> bool {
     matches!(response, [0x7F, _, 0x78, ..])
+}
+
+/// The supply voltage comes from the VCI; the worker interface has no defined source for the
+/// other inputs.
+impl crate::inputs::RuntimeInputs for WorkerHost {
+    fn read(&mut self, input: diag_ir::RuntimeInput) -> Result<crate::inputs::Reading, HostError> {
+        use crate::inputs::Reading;
+        use diag_ir::RuntimeInput;
+        match input {
+            RuntimeInput::SupplyVoltageMillivolts => crate::inputs::read_supply_voltage(
+                &self.handle,
+                &mut self.client,
+                &self.link,
+                &mut self.vbatt_id,
+                self.timings.unary,
+            ),
+            RuntimeInput::ExternalSupplyConnected
+            | RuntimeInput::IgnitionOn
+            | RuntimeInput::EngineRunning
+            | RuntimeInput::VehicleSpeedKmh => Ok(Reading::CannotBeEstablished),
+        }
+    }
 }
 
 impl DiagHost for WorkerHost {

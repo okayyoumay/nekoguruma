@@ -43,7 +43,8 @@ The arguments may name a focus area, and two optional inputs used by
    - priority;
    - whether other items depend on it (it unblocks more work);
    - whether it is on the path of the current milestone (the project-wide
-     backlog's Status section);
+     backlog's Status section); a development-process item (`work/README.md`)
+     counts as on the path;
    - size: prefer the item that fits in one pull request.
 5. **Report** (about 15 lines):
    - **Pick**: the item, in a sentence, with its file and section.

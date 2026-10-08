@@ -34,7 +34,11 @@ format" section first. Permanent files never name a backlog file or item.
    decision, a vendor, real data or another item, add a `Blocked on:` clause
    instead of lowering the priority. P0 is only for real harm (ECU or
    vehicle damage, lost write or journal state, a broken trust boundary) or
-   work that stops everything else. When unsure between two levels, pick the
+   work that stops everything else. A development-process item (backlog
+   and priority rules, documentation and ADR conventions, `CLAUDE.md`,
+   `.claude/` agents, skills and rules, review guidelines; defined in
+   `work/README.md`) is P1 whatever the milestone, unless it meets P0, and
+   goes in the project-wide backlog's "Development process" section. When unsure between two levels, pick the
    higher one and say so in your report.
 5. **Place it** in priority order within the section.
 6. Run `scripts/check-backlog.sh`.

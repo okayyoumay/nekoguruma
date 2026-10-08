@@ -88,17 +88,19 @@ errors; a check treats them as failed. A failure of the transport stays a `HostE
 - Runtime inputs (`RuntimeInputs`, implemented by `WorkerHost`, which is also the sender, so
   `resolve_source(source, &table, &mut host)` takes one value): the supply voltage is read
   through the worker's IoCtl RPC. The host looks up the id of `PDU_IOCTL_READ_VBATT` by name
-  (`GetObjectId`, IOCTL object type) on first use and keeps it; a VCI that does not know the
-  name offers no voltage and reads "cannot be established". External supply, ignition, engine
+  (`GetObjectId`, IOCTL object type) on first use and keeps it. When the J2534 worker does not
+  know the name, the VCI offers no voltage and the input reads "cannot be established"; a D-PDU
+  worker reports an unknown name as an internal error, which stays a `HostError`. External supply, ignition, engine
   running and vehicle speed have no source on the current VCIs (ADR-238) and read the same
   way. `FixedInputs` holds fixed readings for tests.
 - Service fields: `ServiceSources` is a table from `(service_id, field_id)` to the request
   (SID first), the offset after the response SID, the length and the encoding (unsigned
   big-endian integer, or printable ASCII). It is a stand-in until the declaration part has a
-  decoder (ADR-245, consequences). Building a table refuses a duplicate id pair and a request
-  SID outside 0x10..=0x3E. The response must be exactly the positive SID, the request's
-  parameters echoed (the offset equals their length, so a request that reads several
-  identifiers is refused) and the field. A source missing from the table, a negative, short or
+  decoder (ADR-245, consequences). Until then a table accepts only single-identifier
+  ReadDataByIdentifier entries (request `[0x22, hi, lo]`, offset 2): other services do not echo
+  their request in a form the table can check, and a request for several identifiers lets the
+  ECU leave some out. Building a table also refuses a duplicate id pair. The response must be
+  exactly the positive SID, the echoed identifier and the field. A source missing from the table, a negative, short or
   long response, a wrong echo, or a field that does not fit its encoding reads as "cannot be
   decoded". ASCII text keeps surrounding spaces as they are; a field of only spaces, or with
   any byte outside 0x20 to 0x7E, cannot be decoded.

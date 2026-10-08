@@ -132,8 +132,10 @@ impl RuntimeInputs for FixedInputs {
 }
 
 /// Reads the supply voltage from the VCI of `link`. The IOCTL id is resolved by name on the
-/// first call and kept in `cached_id`. A VCI that does not know the name offers no voltage:
-/// [`Reading::CannotBeEstablished`]. Blocks on `handle`, like the host's other primitives.
+/// first call and kept in `cached_id`. When the J2534 worker does not know the name, the VCI
+/// offers no voltage: [`Reading::CannotBeEstablished`]. A D-PDU worker reports an unknown name
+/// as an internal error, which stays a [`HostError`] (it fails the check all the same). Blocks
+/// on `handle`, like the host's other primitives.
 pub(crate) fn read_supply_voltage(
     handle: &Handle,
     client: &mut WorkerClient,
@@ -202,10 +204,12 @@ pub enum Encoding {
 
 /// Where one `EcuService` field is and how to read it.
 ///
-/// The response must be exactly the positive SID, the request's parameters echoed, and the
-/// field: so `offset` must equal the request's length minus the SID (a request that reads
-/// several identifiers is refused), the echoed bytes must equal the request's, and nothing may
-/// follow the field.
+/// Until the declaration part has a decoder, only one form is accepted: a ReadDataByIdentifier
+/// (0x22) request for a single data identifier, `[0x22, hi, lo]`, with `offset` 2. Other
+/// services do not echo their request in a form this table can check, and a request for
+/// several identifiers lets the ECU leave some out. The response must be exactly the positive
+/// SID, the echoed identifier and the field: the echo must equal the request's, and nothing
+/// may follow the field.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServiceField {
@@ -213,11 +217,10 @@ pub struct ServiceField {
     pub service_id: u32,
     /// `Source::EcuService::field_id` (starts at 1).
     pub field_id: u32,
-    /// The whole request, SID first (as `host::service_request_bytes` builds it). The SID must
-    /// lie in 0x10..=0x3E, so its positive response cannot be taken for a 0x7F negative one.
+    /// The whole request, SID first (as `host::service_request_bytes` builds it): `[0x22, hi,
+    /// lo]`.
     pub request: Vec<u8>,
-    /// Bytes between the response SID and the field: the echo of the request's parameters
-    /// (such as the data identifier). Equals `request.len() - 1`.
+    /// Bytes between the response SID and the field: the echoed data identifier, so 2.
     pub offset: usize,
     /// Length of the field in bytes.
     pub length: usize,
@@ -230,9 +233,10 @@ pub enum TableError {
     #[error("service {service_id} field {field_id} is declared twice")]
     Duplicate { service_id: u32, field_id: u32 },
     #[error(
-        "service {service_id} field {field_id}: the request is empty or its SID is not 0x10..=0x3E"
+        "service {service_id} field {field_id}: only a single-identifier ReadDataByIdentifier \
+         request ([0x22, hi, lo], offset 2) is supported"
     )]
-    BadSid { service_id: u32, field_id: u32 },
+    Unsupported { service_id: u32, field_id: u32 },
 }
 
 /// The table that maps `EcuService` sources to requests and response fields.
@@ -248,8 +252,8 @@ impl TryFrom<Vec<ServiceField>> for ServiceSources {
     fn try_from(fields: Vec<ServiceField>) -> Result<Self, TableError> {
         for (index, field) in fields.iter().enumerate() {
             let (service_id, field_id) = (field.service_id, field.field_id);
-            if !matches!(field.request.first(), Some(0x10..=0x3E)) {
-                return Err(TableError::BadSid {
+            if !matches!(field.request.as_slice(), [0x22, _, _]) || field.offset != 2 {
+                return Err(TableError::Unsupported {
                     service_id,
                     field_id,
                 });
@@ -275,8 +279,8 @@ impl From<ServiceSources> for Vec<ServiceField> {
 }
 
 impl ServiceSources {
-    /// Builds a table; refuses a duplicate `(service_id, field_id)` and a request whose SID is
-    /// outside 0x10..=0x3E.
+    /// Builds a table; refuses a duplicate `(service_id, field_id)` and any entry that is not a
+    /// single-identifier ReadDataByIdentifier request with offset 2.
     pub fn new(fields: Vec<ServiceField>) -> Result<Self, TableError> {
         Self::try_from(fields)
     }
@@ -599,17 +603,18 @@ mod tests {
     }
 
     #[test]
-    fn a_request_reading_several_identifiers_is_not_decoded() {
-        let field = ServiceField {
-            request: vec![0x22, 0xF1, 0x90, 0xF1, 0x86],
-            ..vin_field()
-        };
-        let table = ServiceSources::new(vec![field]).unwrap();
-        let mut host = Fake::answering(&vin_response(b"WVWZZZ1JZXW000001"));
-        assert_eq!(
-            resolve_source(ecu(1, 1), &table, &mut host).unwrap(),
-            Reading::CannotBeDecoded
-        );
+    fn a_request_reading_several_identifiers_is_refused() {
+        for offset in [2, 4] {
+            let field = ServiceField {
+                request: vec![0x22, 0xF1, 0x90, 0xF1, 0x86],
+                offset,
+                ..vin_field()
+            };
+            assert!(matches!(
+                ServiceSources::new(vec![field]),
+                Err(TableError::Unsupported { .. })
+            ));
+        }
     }
 
     #[test]
@@ -690,30 +695,28 @@ mod tests {
     }
 
     #[test]
-    fn a_request_sid_outside_the_uds_range_is_refused() {
-        for request in [
-            vec![],
-            vec![0x0F, 0x01],
-            vec![0x3F],
-            vec![0x7F, 0x22],
-            vec![0x62, 0xF1],
+    fn only_a_single_identifier_read_is_accepted() {
+        for (request, offset) in [
+            (vec![], 0),
+            (vec![0x3E, 0x00], 1),
+            (vec![0x19, 0x01, 0xFF], 2),
+            (vec![0x31, 0x01, 0x02, 0x03], 3),
+            (vec![0x3F, 0xF1, 0x90], 2),
+            (vec![0x22, 0xF1], 1),
+            (vec![0x22, 0xF1, 0x90], 0),
+            (vec![0x22, 0xF1, 0x90], 3),
         ] {
             let field = ServiceField {
                 request,
-                offset: 0,
+                offset,
                 ..vin_field()
             };
             assert!(matches!(
                 ServiceSources::new(vec![field]),
-                Err(TableError::BadSid { .. })
-            ),);
+                Err(TableError::Unsupported { .. })
+            ));
         }
-        let ok = ServiceField {
-            request: vec![0x3E],
-            offset: 0,
-            ..vin_field()
-        };
-        assert!(ServiceSources::new(vec![ok]).is_ok());
+        assert!(ServiceSources::new(vec![vin_field()]).is_ok());
     }
 
     #[test]

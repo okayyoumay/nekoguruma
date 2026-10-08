@@ -29,3 +29,19 @@ Flag as P1:
   work lands. Use `#[expect(..., reason = "...")]`, which fails once the code is used.
 - **Out-of-scope targets**: Windows workers target `*-pc-windows-gnullvm` only (ADR-227). An MSVC
   worker target or MSVC-only build path is P1.
+- **Interrupted-transfer recovery that departs from ADR-229**, in the framework and the bundled
+  reference recovery:
+  - continuing an interrupted flash transfer from a later or the last journaled block instead of
+    redoing it from the erase, or from the RequestDownload when the procedure does not erase
+    (items 1 and 3);
+  - an ECUReset sent before the VIN and the ECU hardware identity have matched and the declared
+    safety preconditions hold (item 2, step 2);
+  - an erase before the identity, state and precondition checks that follow the
+    default-session confirmation;
+  - placing the interruption without the journal's write-ahead intent markers, so a lost
+    response could start an automatic restart that the procedure's recovery-required point
+    forbids.
+
+  An ECU-specific recovery written as the framework user's own procedure may continue from a
+  later address (item 4). Flag it only if it bypasses the journal, the state check before
+  resuming or the interruptibility attributes.

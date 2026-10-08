@@ -210,14 +210,15 @@ jobs:
   # qemu-user) with the table's `unsigned long` width, and reads the VIN through it
   # (scripts/abi-roundtrip.sh, LAUNCH=1). Debug builds keep the test's config override
   # (ADR-073); zigbuild links them against glibc 2.17 like the release builds (ADR-232).
+  # Pull requests check one 4-byte and one 8-byte target (i686, and aarch64 under qemu-user)
+  # to keep the job's minutes down; main checks all four. The job runs on every code change
+  # either way, since it is a required check.
   abi-roundtrip:
     needs: changes
     if: ${{ always() && (needs.changes.result != 'success' || needs.changes.outputs.code == 'true') }}
     runs-on: ubuntu-latest
     env:
-      TARGETS: >-
-        x86_64-unknown-linux-gnu i686-unknown-linux-gnu aarch64-unknown-linux-gnu
-        armv7-unknown-linux-gnueabihf
+      TARGETS: ${{ github.event_name == 'pull_request' && 'i686-unknown-linux-gnu aarch64-unknown-linux-gnu' || 'x86_64-unknown-linux-gnu i686-unknown-linux-gnu aarch64-unknown-linux-gnu armv7-unknown-linux-gnueabihf' }}
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable

@@ -40,6 +40,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       code: ${{ steps.filter.outputs.code }}
+      deps: ${{ steps.filter.outputs.deps }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -48,12 +49,24 @@ jobs:
         env:
           EVENT: ${{ github.event_name }}
           BASE: ${{ github.event.pull_request.base.sha }}
+        # The diff runs on its own line so that a failing `git diff` fails the step (bash -e)
+        # instead of reading as "no matching files"; the jobs below then run anyway.
         run: |
-          if [ "$EVENT" != pull_request ] ||
-             git diff --name-only "$BASE" HEAD | grep -qvE '(\.md$|^docs/|^work/|^\.claude/)'; then
+          if [ "$EVENT" != pull_request ]; then
+            echo code=true >> "$GITHUB_OUTPUT"
+            echo deps=true >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          files="$(git diff --name-only "$BASE" HEAD)"
+          if grep -qvE '(\.md$|^docs/|^work/|^\.claude/)' <<< "$files"; then
             echo code=true >> "$GITHUB_OUTPUT"
           else
             echo code=false >> "$GITHUB_OUTPUT"
+          fi
+          if grep -qE '(^|/)Cargo\.(toml|lock)$|^\.cargo/' <<< "$files"; then
+            echo deps=true >> "$GITHUB_OUTPUT"
+          else
+            echo deps=false >> "$GITHUB_OUTPUT"
           fi
 
   # Server and agent are 64-bit only.
@@ -131,6 +144,31 @@ jobs:
           for target in $TARGETS; do
             cargo check --locked -p sim-vci -p j2534-0404-service -p iso22900-service --target "$target"
           done
+
+  # The workspace `rust-version` (Cargo.toml) is the oldest Rust the code must build with; every
+  # other job uses stable. On pull requests this runs only when a manifest, the lockfile or
+  # .cargo/ changes (Dependabot updates among them), since that is what usually raises the
+  # minimum; main runs it on every push that starts this workflow (the `paths-ignore` above skips
+  # documentation-only pushes), so code that needs a newer compiler shows up there.
+  # Warnings are not denied: an older compiler can warn about lints it does not know yet.
+  msrv:
+    needs: changes
+    if: ${{ always() && (needs.changes.result != 'success' || needs.changes.outputs.deps == 'true') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # The version is read from the checked-out Cargo.toml, so it is checked to be a plain version
+      # number before it reaches a command line.
+      - run: |
+          version="$(sed -n 's/^rust-version *= *"\([0-9.]*\)"$/\1/p' Cargo.toml)"
+          echo "$version" | grep -qxE '[0-9]+\.[0-9]+(\.[0-9]+)?'
+          rustup toolchain install "$version" --profile minimal
+          rustup default "$version"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo check --workspace --all-targets --locked
 
   # Linux targets: linked against glibc 2.17 through cargo-zigbuild's target suffix (ADR-232).
   worker-linux:

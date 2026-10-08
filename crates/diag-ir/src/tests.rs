@@ -1860,15 +1860,15 @@ fn flow_program(edit: impl FnOnce(&mut Vec<Op>)) -> Program {
 }
 
 fn flow_error(program: &Program, pc: u32) -> Option<ProgramError> {
-    match program.validate() {
-        Err(
-            e @ (ProgramError::JumpOutOfRecovery { pc: p, .. }
-            | ProgramError::ControlFlowIntoPlan { pc: p, .. }
-            | ProgramError::CallOrReturnInPlan { pc: p, .. }
-            | ProgramError::BackwardJumpAcrossRecovery { pc: p, .. }),
-        ) if p == pc => Some(e),
-        _ => None,
-    }
+    let e = program.validate().err()?;
+    let p = match &e {
+        ProgramError::JumpOutOfRecovery { pc: p, .. }
+        | ProgramError::ControlFlowIntoPlan { pc: p, .. }
+        | ProgramError::CallOrReturnInPlan { pc: p, .. }
+        | ProgramError::BackwardJumpAcrossRecovery { pc: p, .. } => *p,
+        _ => return None,
+    };
+    (p == pc).then_some(e)
 }
 
 #[test]

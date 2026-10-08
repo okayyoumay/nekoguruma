@@ -23,7 +23,9 @@ the user named, if any.
    - **Wrong priority**: re-prioritize against the table in
      `work/README.md` and the current milestone. Items carried over from the
      worker crates' earlier scale need this most (their P3 meant "lower
-     priority", not "nice to have").
+     priority", not "nice to have"). A development-process item below P1
+     goes up to P1 and moves to the "Development process" section
+     (`work/README.md`).
    - **Blocked**: an item lowered only because it waits on something gets
      its real priority back plus a `Blocked on:` clause; a resolved blocker
      is removed.

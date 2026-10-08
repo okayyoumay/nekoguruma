@@ -14,7 +14,9 @@ paths:
   work that stops everything; P1 means needed for the current milestone
   (the project-wide backlog's Status section); waiting items get a
   `Blocked on:` clause rather than a lower priority. Entries under `Known Flaky
-  Tests` count as P1. Use the `backlog` skill to add or close items.
+  Tests` count as P1, and so do development-process items (backlog and
+  priority rules, documentation and ADR conventions, `CLAUDE.md`, `.claude/`,
+  review guidelines; `work/README.md` defines them). Use the `backlog` skill to add or close items.
 - A finished item is deleted, not checked off, struck through or moved to a
   "resolved" list. Before deleting, move any lasting decision into the
   permanent document it belongs to, and keep any still-open remainder as its

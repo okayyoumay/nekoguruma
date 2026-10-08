@@ -8,7 +8,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-roxmltree = "0.18"
+roxmltree = "0.21"
 url = "2.2"
 vci-service-config = { workspace = true }
 tracing = { workspace = true }

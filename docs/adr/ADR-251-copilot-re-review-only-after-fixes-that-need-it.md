@@ -28,8 +28,10 @@ the number of re-reviews is the lever available to the session.
 
 1. **Re-request only when the fix needs another look.** After a round that pushed a fix, the
    loop re-requests a Copilot review only when the round fixed a finding Copilot rated above Low
-   (or whose rating cannot be read), the fix went through `design-advisor`, the push changes any
-   file that is not Markdown, or the round merged `main` and resolved a conflict. Otherwise the
+   (or whose rating cannot be read), the fix went through `design-advisor`, the round newly
+   declined a finding (which gets the same one follow-up review it gets in a round that changes
+   nothing), the push changes any file that is not Markdown, or the round merged `main` and
+   resolved a conflict. Otherwise the
    loop ends after the round's replies and goes to close-out. Defining the exempt set as
    Markdown only, rather than listing executable file types, keeps a newly added kind of
    executable or data file on the re-review side by default.

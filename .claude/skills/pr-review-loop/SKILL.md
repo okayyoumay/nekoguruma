@@ -207,6 +207,7 @@ least one of these holds:
 - the round fixed a finding Copilot rated above Low (Medium, High or Critical), or one whose
   severity you cannot read from the review;
 - the round's fix went through `design-advisor` (2b);
+- the round newly declined a finding (2d), as a no-change round with one would (Step 3);
 - the push changes any file that is not Markdown (`*.md`): code, scripts, hooks, workflows,
   build and configuration files, schemas, examples and other data files all count;
 - the round merged `main` and resolved a conflict.

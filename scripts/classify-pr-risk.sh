@@ -346,7 +346,7 @@ if [ "$claimed_given" -eq 1 ]; then
         claimed_found=$((claimed_found + 1))
       fi
     done <<<"$blocks"
-  done < <(git ls-tree --name-only "$merge_base" work/)
+  done < <(git ls-tree -r --name-only "$merge_base" -- work/)
   if [ "$claimed_found" -eq 0 ]; then
     reasons+=("the claimed item is not an item of a backlog file on $base: ${claimed:0:70}")
   elif [ "$claimed_found" -gt 1 ]; then

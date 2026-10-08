@@ -167,6 +167,31 @@ sed -i '$d' "$other"
 expect "a claim whose first line matches two items is HIGH" HIGH "matches 2 items"
 
 setup
+printf -- '- **P1**: First item. Done when: one.\n' >>"$other"
+git add -A
+git commit -q -m "same first line in two files"
+git branch -f base
+claim="- **P1**: First item. Done when: one."
+sed -i '$d' "$other"
+expect "a claim whose first line is in two files is HIGH" HIGH "matches 2 items"
+
+setup
+claim="- **P1**: First item. Done when: one."
+edit '/First item/d'
+printf -- '- **P1**: First item. Done when: one.\n' >>"$other"
+expect "moving the claimed item to another backlog file is HIGH" HIGH "moves a backlog item to another backlog file"
+
+setup
+mkdir -p "$w/sub"
+printf '> **TEMPORARY WORKING MATERIAL.** Nested.\n\n## Area seven\n\n- **P1**: First item. Done when: one.\n' >"$w/sub/nested-backlog.md"
+git add -A
+git commit -q -m "nested backlog"
+git branch -f base
+claim="- **P1**: First item. Done when: one."
+sed -i '$d' "$w/sub/nested-backlog.md"
+expect "a claim that also names an item in a nested backlog file is HIGH" HIGH "matches 2 items"
+
+setup
 claim="- **P1**: First item. Done when: one."
 edit '/First item/d'
 edit '/Third item/a - **P2**: A residual. Done when: four.'

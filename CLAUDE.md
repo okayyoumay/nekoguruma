@@ -90,6 +90,12 @@ without behaviour change need none.
 the `adr-number-reservation` skill (it creates `adr-reservation/{NNN}` via the GitHub API).
 `scripts/check-adr-index.sh` (CI) fails on duplicate numbers or `INDEX.md` drift.
 
+**Index conflicts:** two pull requests that each add an ADR both append to the end of
+`INDEX.md`'s table, and to the same theme list when they share a theme, so they conflict there.
+This is accepted (the maintainer's decision; the index stays hand-maintained): resolve the
+conflict when it appears by merging `main`, keeping both sides' lines in numeric order, and
+running `scripts/check-adr-index.sh`.
+
 When superseding an ADR, set its `**Status:**` to `Superseded by ADR-{NNN}`; for a partial
 supersession, annotate instead, e.g. `Accepted (Decision item 2 superseded by ADR-{NNN})`.
 

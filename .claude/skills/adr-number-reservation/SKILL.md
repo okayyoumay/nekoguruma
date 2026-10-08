@@ -52,10 +52,11 @@ Create `docs/adr/ADR-{NNN}-{short-slug}.md` from `docs/adr/TEMPLATE.md`, add
 the `INDEX.md` row in numeric order and the theme-section entry (its own
 `- ADR-{NNN}` line, in numeric order), and run `scripts/check-adr-index.sh`.
 
-Parallel ADR pull requests still produce ordinary line conflicts in
-`INDEX.md`: all append at the bottom of the table, and two that add to the
-same theme both append at its end. Resolve them by keeping both sides' lines
-in numeric order, then run `scripts/check-adr-index.sh`.
+Parallel ADR pull requests produce ordinary line conflicts in `INDEX.md`:
+all append at the bottom of the table, and two that add to the same theme
+both append at its end. These conflicts are accepted (CLAUDE.md, "Index
+conflicts"). Resolve them when they appear by merging `main`, keeping both
+sides' lines in numeric order, then run `scripts/check-adr-index.sh`.
 
 ## Cleanup
 

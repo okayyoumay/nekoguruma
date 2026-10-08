@@ -332,6 +332,9 @@ fi
 # so that a mistyped claim cannot match nothing and pass, and an ambiguous
 # one cannot cover two items. Items are compared by their
 # first line as backlog_blocks writes it (tabs as \035).
+# backlog_blocks drops carriage returns, so a line read from a CRLF file
+# compares without its trailing one.
+claimed="${claimed%$'\r'}"
 claimed_key="${claimed//$'\t'/$'\035'}"
 if [ "$claimed_given" -eq 1 ]; then
   claimed_found=0

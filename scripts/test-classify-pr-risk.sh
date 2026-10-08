@@ -323,7 +323,9 @@ sed -i 's/$/\r/' "$backlog"
 git add -A
 git commit -q -m "crlf"
 git branch -f base
-claim="- **P1**: First item. Done when: one."
+# The claim is read from the file the way the backlog-loop skill does, so it
+# keeps the carriage return.
+claim="$(git show "base:$backlog" | sed -n '/First item/p')"
 edit '/First item/d'
 expect "deleting one item from a CRLF file is LOW" LOW
 

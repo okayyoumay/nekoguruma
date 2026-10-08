@@ -32,7 +32,7 @@ toml = { workspace = true }
 # windows-sys is always available on Windows (used for SHGetKnownFolderPath and
 # CoTaskMemFree in config-root resolution); it is never compiled on non-Windows targets.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.52", features = [
+windows-sys = { version = "0.61", features = [
     "Win32_System_Com",
     "Win32_UI_Shell",
     "Win32_Foundation",

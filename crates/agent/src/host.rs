@@ -45,11 +45,12 @@ pub enum HostError {
         "service {0:#x} is not allowed: the agent's request policy refuses it (ADR-235 item 8, ADR-247)"
     )]
     NotAllowed(u16),
-    /// A FlashTransfer with no RequestDownload or RequestUpload sent through this host before
-    /// it, so there is no block counter to derive (ADR-250).
-    #[error("FlashTransfer needs a RequestDownload or RequestUpload sent first (ADR-250)")]
+    /// A FlashTransfer with no tracked transfer: no positive RequestDownload sent through this
+    /// host before it, or the transfer has ended, so there is no block counter to derive
+    /// (ADR-250).
+    #[error("FlashTransfer needs a positive RequestDownload sent first (ADR-250)")]
     NoTransferActive,
-    /// The ECU answered TransferData with a negative response (or another service's response).
+    /// The ECU answered TransferData with a negative response.
     #[error("the ECU refused TransferData block {block}: {response:02X?}")]
     TransferRefused { block: u64, response: Vec<u8> },
     /// The positive TransferData response did not echo the counter that was sent.
@@ -139,7 +140,8 @@ pub fn routine_control_bytes(routine: u16, sub: u8, payload: &[u8]) -> Vec<u8> {
 /// is derived (ADR-250).
 ///
 /// ISO 14229-1:2026 clause 14.4: the counter is 1 for the first TransferData after a
-/// RequestDownload or RequestUpload, rises by one per request, and after 0xFF continues at 0x00.
+/// RequestDownload (or RequestUpload), rises by one per request, and after 0xFF continues at
+/// 0x00. The host begins a transfer only on a positive RequestDownload.
 /// The IR's `FlashTransfer` operand is constant per instruction, so it cannot carry this.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct TransferCounter {
@@ -181,12 +183,12 @@ impl TransferCounter {
     /// Takes the outcome of sending block `index` with counter `counter`.
     ///
     /// - A positive response echoing the counter counts the block.
-    /// - A negative response, or a positive one that does not echo the counter, ends the
-    ///   tracked transfer: whether the ECU kept the data depends on the ECU, so a same-counter
-    ///   retry is not safe, and a new RequestDownload is needed.
-    /// - No response (a timeout, lost events, a transport failure) leaves the count, so a
-    ///   retry sends the same counter. Clause 14.4 has the server accept a repeat of the
-    ///   previous counter, which is what makes that retry possible after a lost response.
+    /// - Anything else ends the tracked transfer, and a new RequestDownload is needed: a
+    ///   negative response, a positive one that does not echo the counter, and no response
+    ///   at all (a timeout, lost events, a transport failure). Whether the ECU kept the data
+    ///   is unknown in each case (a missing response may hide a negative one), and the ECU may
+    ///   acknowledge a repeat of the previous counter without writing it (clause 14.4), so a
+    ///   same-counter retry could leave a gap.
     fn after_block(
         &mut self,
         index: u64,
@@ -204,7 +206,10 @@ impl TransferCounter {
                     Err(error)
                 }
             },
-            Err(error) => Err(error),
+            Err(error) => {
+                self.accepted = None;
+                Err(error)
+            }
         }
     }
 }
@@ -274,8 +279,9 @@ impl WorkerHost {
     }
 
     /// The number of TransferData blocks the ECU confirmed since the last RequestDownload sent
-    /// through this host, which is also the 1-based index of the last confirmed block. It is a
-    /// lower bound: after a lost response the ECU may hold one block more. `Some(0)` means a
+    /// through this host, which is also the 1-based index of the last confirmed block. Any
+    /// failed block ends the transfer (`None`), so the journal must have recorded each block as
+    /// it was confirmed; the ECU may hold one block more than the last one recorded. `Some(0)` means a
     /// transfer started with no confirmed block yet (it is not a block number); `None` means no
     /// transfer is tracked (none started, or it ended, ADR-250).
     ///
@@ -766,27 +772,20 @@ mod tests {
     }
 
     #[test]
-    fn only_a_missing_response_lets_a_block_be_retried_with_the_same_counter() {
-        let mut counter = begun();
-        confirm(&mut counter, 1);
-        for lost in [
-            HostError::NoResponse,
-            HostError::EventsLost,
-            HostError::WorkerUnresponsive("StartComPrimitive"),
+    fn any_failed_block_ends_the_transfer() {
+        for failure in [
+            Err(HostError::NoResponse),
+            Err(HostError::EventsLost),
+            Err(HostError::WorkerUnresponsive("StartComPrimitive")),
+            Ok(vec![0x7F, 0x36, 0x73]),
+            Ok(vec![0x76, 0x03]),
         ] {
-            let result = counter.after_block(2, 0x02, Err(lost));
-            assert!(result.is_err());
-            assert_eq!(counter.accepted, Some(1));
-            assert_eq!(counter.next().unwrap(), (2, 0x02));
+            let mut counter = begun();
+            confirm(&mut counter, 1);
+            assert!(counter.after_block(2, 0x02, failure).is_err());
+            assert_eq!(counter.accepted, None);
+            assert!(matches!(counter.next(), Err(HostError::NoTransferActive)));
         }
-        // A negative response or a wrong echo ends the transfer: a new RequestDownload is needed.
-        let refused = counter.after_block(2, 0x02, Ok(vec![0x7F, 0x36, 0x73]));
-        assert!(matches!(refused, Err(HostError::TransferRefused { .. })));
-        assert_eq!(counter.accepted, None);
-        let mut counter = begun();
-        let wrong = counter.after_block(1, 0x01, Ok(vec![0x76, 0x02]));
-        assert!(matches!(wrong, Err(HostError::TransferEchoMismatch { .. })));
-        assert_eq!(counter.accepted, None);
     }
 
     #[test]

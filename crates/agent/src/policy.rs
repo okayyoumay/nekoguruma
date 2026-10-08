@@ -98,6 +98,9 @@ pub fn check_program(program: &Program, permission: Permission) -> Result<(), (u
     for (pc, op) in program.code.iter().enumerate() {
         // Exhaustive, so a new instruction that sends something cannot slip past.
         let refused = match op {
+            // TransferData goes through `FlashTransfer` and the host's block count (ADR-250),
+            // whatever the permission; refused here so it fails before anything is erased.
+            Op::ServiceRequest { service: 0x36 } => Some(HostError::UseFlashTransfer),
             Op::ServiceRequest { service } => check_service(*service, permission).err(),
             // Always ReadDTCInformation.
             Op::ReadDtc { .. } => None,
@@ -320,6 +323,19 @@ mod tests {
             );
             assert!(
                 matches!(refused, Err((1, HostError::NotAllowed(0x27)))),
+                "{refused:?}"
+            );
+            // TransferData only through FlashTransfer, refused before the link opens.
+            let refused = check_program(
+                &program(vec![
+                    Op::ServiceRequest { service: 0x34 },
+                    Op::PushBytes(0),
+                    Op::ServiceRequest { service: 0x36 },
+                ]),
+                SIMULATOR,
+            );
+            assert!(
+                matches!(refused, Err((2, HostError::UseFlashTransfer))),
                 "{refused:?}"
             );
             let refused = check_program(

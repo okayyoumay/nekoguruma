@@ -61,10 +61,11 @@ first block after a RequestDownload (0x34, a `ServiceRequest` answered positivel
 the host, rises by one per confirmed block and continues at 0 after 0xFF (ISO 14229-1:2026
 clause 14.4). Only a positive 0x34 begins a transfer. RequestUpload (0x35), RequestTransferExit
 (0x37), RequestFileTransfer (0x38), DiagnosticSessionControl (0x10) and ECUReset (0x11) end it
-whatever the response, and so does a negative TransferData response or a wrong echo (a new
-RequestDownload is needed). After no response the count stays, so a retry repeats the counter.
+whatever the response, and so does any failed block: a negative TransferData response, a wrong
+echo or no response (a new RequestDownload is needed; a same-counter retry could leave a gap).
 A `FlashTransfer` with no tracked transfer is an error and sends nothing, and a
-`ServiceRequest` for 0x36 is refused. `WorkerHost::transfer_block_index` gives the number of
+`ServiceRequest` for 0x36 is refused, both before the link opens (`check_program`) and by
+the host. `WorkerHost::transfer_block_index` gives the number of
 confirmed blocks (`Some(0)`: started, none yet), which the write-job journal records
 (ADR-244); it is a `u64`, so the journaling runner converts it for `commit_block` and never
 commits 0.

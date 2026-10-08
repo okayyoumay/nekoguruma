@@ -259,7 +259,7 @@ jobs:
           for exe in target/${{ matrix.target }}/release/*.exe; do
             echo "$exe"
             llvm-objdump -p "$exe" | grep 'DLL Name' | tee "$RUNNER_TEMP/imports.txt"
-            if grep -Eiv 'DLL Name: (kernel32|ntdll|ucrtbase|advapi32|ws2_32|bcrypt|bcryptprimitives|userenv|user32|ole32|oleaut32|shell32|secur32|crypt32|ncrypt|iphlpapi|dbghelp|psapi|synchronization|api-ms-win-[a-z0-9-]+)\.dll' "$RUNNER_TEMP/imports.txt"; then
+            if grep -Eiv 'DLL Name: (kernel32|ntdll|ucrtbase|advapi32|ws2_32|bcrypt|bcryptprimitives|userenv|user32|ole32|combase|oleaut32|shell32|secur32|crypt32|ncrypt|iphlpapi|dbghelp|psapi|synchronization|api-ms-win-[a-z0-9-]+)\.dll' "$RUNNER_TEMP/imports.txt"; then
               echo "::error::$exe imports a DLL that Windows does not provide"
               exit 1
             fi

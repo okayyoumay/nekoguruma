@@ -19,7 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       # Always evaluate main, even when started manually from another ref.
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           ref: main
       - name: Delete reservation branches whose ADR has merged

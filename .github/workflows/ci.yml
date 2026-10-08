@@ -42,7 +42,7 @@ jobs:
       code: ${{ steps.filter.outputs.code }}
       deps: ${{ steps.filter.outputs.deps }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - id: filter
@@ -83,7 +83,7 @@ jobs:
     env:
       RUSTFLAGS: -D warnings
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -107,7 +107,7 @@ jobs:
       EXCLUDE: ${{ github.event_name == 'pull_request' && '--exclude j2534-0404-service' || '' }}
       RUSTFLAGS: -D warnings
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -133,7 +133,7 @@ jobs:
         x86_64-unknown-linux-gnu i686-unknown-linux-gnu aarch64-unknown-linux-gnu
         armv7-unknown-linux-gnueabihf x86_64-pc-windows-gnullvm i686-pc-windows-gnullvm
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-gnu,i686-unknown-linux-gnu,aarch64-unknown-linux-gnu,armv7-unknown-linux-gnueabihf,x86_64-pc-windows-gnullvm,i686-pc-windows-gnullvm
@@ -156,7 +156,7 @@ jobs:
     if: ${{ always() && (needs.changes.result != 'success' || needs.changes.outputs.deps == 'true') }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       # The version is read from the checked-out Cargo.toml, so it is checked to be a plain version
       # number before it reaches a command line.
       - run: |
@@ -182,7 +182,7 @@ jobs:
           - aarch64-unknown-linux-gnu   # linux-arm64 (ABI interpretation is inferred. 7.1.2)
           - armv7-unknown-linux-gnueabihf # linux-armhf (same as above)
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -213,7 +213,7 @@ jobs:
           - x86_64-pc-windows-gnullvm   # win-x64
           - i686-pc-windows-gnullvm     # win-x86
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -241,7 +241,7 @@ jobs:
             --target ${{ matrix.target }} --message-format=json |
             jq -r 'select(.reason == "compiler-artifact" and .profile.test and .target.name == "sim_vci_end_to_end") | .executable')"
           cp "$exe" target/${{ matrix.target }}/debug/sim_vci_end_to_end.exe
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v6
         with:
           name: abi-launch-${{ matrix.target }}
           path: |
@@ -280,7 +280,7 @@ jobs:
     env:
       TARGETS: ${{ github.event_name == 'pull_request' && 'i686-unknown-linux-gnu aarch64-unknown-linux-gnu' || 'x86_64-unknown-linux-gnu i686-unknown-linux-gnu aarch64-unknown-linux-gnu armv7-unknown-linux-gnueabihf' }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-gnu,i686-unknown-linux-gnu,aarch64-unknown-linux-gnu,armv7-unknown-linux-gnueabihf
@@ -315,12 +315,12 @@ jobs:
     needs: worker-windows
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/download-artifact@v5
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v7
         with:
           name: abi-launch-x86_64-pc-windows-gnullvm
           path: target/x86_64-pc-windows-gnullvm/debug
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v7
         with:
           name: abi-launch-i686-pc-windows-gnullvm
           path: target/i686-pc-windows-gnullvm/debug

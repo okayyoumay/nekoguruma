@@ -51,36 +51,25 @@ from branches here, and anyone can choose a fork PR's title. If one belongs to t
 it as described under "Run state" instead of going on. If one belongs to another run, stop the
 run and go to "Final report" (one item at a time).
 
-Otherwise reset the branch's content to `main` without rewriting history (the run is
-unattended, and a reset or force-push needs approval). This discards everything on the branch,
-so first check that nothing else needs it: stop and tell the maintainer if `git status
---porcelain` prints anything, or if any open PR, labelled or not, has this branch as its head.
-Then `git fetch origin main` and make the branch's content exactly `origin/main`'s, with
-`origin/main` in its history. Equal trees are not enough: after a squash merge the branch can
-hold the same files on a different history, and every diff against `main` (the PR's, the risk
-classifier's) would then show the previous iteration's changes again.
+Otherwise start the branch afresh from `origin/main`, locally and on the remote (ADR-249). This
+discards everything on the local branch, so first check that nothing else needs it: stop and
+tell the maintainer if `git status --porcelain` prints anything, or if any open PR, labelled or
+not, has this branch as its head. Then:
 
-- If `git merge-base --is-ancestor origin/main HEAD` succeeds and `git diff --quiet HEAD
-  origin/main` succeeds, the branch already matches: nothing to do.
-- If `origin/main` is not in HEAD's history, record a merge of it whose tree is exactly
-  `origin/main`'s (a merge commit is created even when the trees are already equal):
+```sh
+git fetch origin
+git checkout -B <branch> origin/main
+git push -u origin <branch>
+```
 
-  ```sh
-  git merge -s ours --no-commit origin/main
-  git read-tree -u --reset origin/main
-  git commit -m "Start from origin/main"
-  ```
-
-- If `origin/main` is in HEAD's history but the trees differ (the branch still carries commits
-  of its own), there is nothing to merge; reset the content with an ordinary commit:
-
-  ```sh
-  git read-tree -u --reset origin/main
-  git commit -m "Start from origin/main"
-  ```
-
-This cannot conflict, and it drops anything the branch still carries from a PR that was closed
-unmerged. Every later step, including a stop, starts from this clean branch.
+The repository deletes a PR's head branch when the PR merges, so after a merged iteration the
+push creates the branch anew and its history is exactly `origin/main`'s: the next PR lists only
+its own commits, and no diff against `main` shows the previous iteration's changes. Never
+force-push. A rejected push means the remote branch survived with commits that are not on
+`main` (the previous PR was closed without merging, or something else pushed to it): stop the run, go to "Final report", and ask
+the maintainer to delete the remote branch. List there any backlog edit the stop could not
+push, such as the `Blocked on:` clause for a PR closed unmerged. Every later step starts from
+this fresh branch.
 
 Then stop the run and go to "Final report" if any of these holds:
 

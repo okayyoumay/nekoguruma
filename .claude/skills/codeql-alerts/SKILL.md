@@ -52,8 +52,8 @@ Stop and go to "Report" if any of these holds:
 - every alert in both lists is one this session already reported and the maintainer has not
   answered.
 
-Then reset the branch's content to `origin/main` exactly as `backlog-loop` step 1 describes,
-including its checks that nothing else needs the branch.
+Then start the branch afresh from `origin/main` exactly as `backlog-loop` step 1 describes,
+including its checks that nothing else needs the branch and its stop when the push is rejected.
 
 ## 3. Pick
 

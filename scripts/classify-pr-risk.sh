@@ -73,7 +73,8 @@ is_crate_test() {
 # Prints one backlog file as blocks, one per line: the type, a tab, the
 # headings the block sits under (joined by "\036"), a tab, the text. An item
 # (I) is a top-level "- **P0**" .. "- **P3**" bullet in an item section (a
-# bullet outside every "##" area, such as under the file's "#" title, is O),
+# bullet with no "##" area heading above it, such as one under the file's
+# "#" title or under a "###" heading placed directly below that title, is O),
 # or
 # any top-level bullet in a Known Flaky Tests section, with its indented
 # continuation lines (also after a blank line) joined by "\037". Headings are
@@ -101,7 +102,7 @@ backlog_blocks() {
       else kind[depth] = ""
       sect = ""; area = 0
       for (d = 1; d <= depth; d++) {
-        if (lvl[d] >= 2) area = 1
+        if (lvl[d] == 2) area = 1
         if (kind[d] == "exempt") sect = "exempt"
         else if (kind[d] == "flaky" && sect == "") sect = "flaky"
       }
@@ -154,8 +155,10 @@ compare_blocks() {
         if (substr(k, 1, 1) == "I") { while (extra-- > 0) print "deleted " substr(k, 3); continue }
         if (substr(k, 1, 1) == "H") {
           # A removed heading is fine when everything in its section goes too.
+          # Each removed occurrence is checked under its own parent headings,
+          # since subsection headings such as Prioritized Backlog repeat.
           emptied = 1
-          for (i = 1; i <= no; i++) if (okey[i] == k) {
+          for (i = 1; i <= no; i++) if (okey[i] == k && cnt(fnew, old[i]) < fold[old[i]]) {
             L = hlevel(k)
             for (j = i + 1; j <= no; j++) {
               if (substr(okey[j], 1, 1) == "H" && hlevel(okey[j]) <= L) break
@@ -212,6 +215,11 @@ work_tmp="$(mktemp -d)"
 trap 'rm -rf "$work_tmp"' EXIT
 check_work_backlog() {
   local path="$1" out line
+  # A mode-only change (an executable bit) has no text to compare.
+  if [ "$(git ls-tree "$merge_base" -- "$path" | cut -d' ' -f1)" != \
+    "$(git ls-tree HEAD -- "$path" | cut -d' ' -f1)" ]; then
+    reasons+=("changes the file mode of $path")
+  fi
   if ! git show "$merge_base:$path" | backlog_blocks >"$work_tmp/before" ||
     ! git show "HEAD:$path" | backlog_blocks >"$work_tmp/after" ||
     ! out="$(compare_blocks "$work_tmp/before" "$work_tmp/after")" ||

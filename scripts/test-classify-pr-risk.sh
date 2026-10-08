@@ -33,6 +33,11 @@ base_backlog() {
 - **P1**: First item. Done when: one.
 - **P2**: Second item. Done when: two.
 
+```text
+## Resolved
+- **P1**: Not an item, inside a fence.
+```
+
 ## Area two
 
 - **P1**: Third item. Done when: three.
@@ -197,6 +202,39 @@ expect "renaming a backlog file is HIGH" HIGH "renames"
 setup
 git rm -q "$other"
 expect "deleting a backlog file is HIGH" HIGH "deletes $other"
+
+setup
+edit '/^## Status$/i ### Orphan subsection\n\n- **P1**: An item under a subsection with no area.\n'
+expect "adding a priority bullet under a subsection with no area is HIGH" HIGH "neither an item nor a heading"
+
+setup
+printf '\n## Area five\n\n### Prioritized Backlog\n\n- **P2**: Sixth item.\n' >>"$other"
+printf '\n## Area six\n\n### Prioritized Backlog\n\n- **P2**: Seventh item.\n' >>"$other"
+git add -A
+git commit -q -m "repeated subsections"
+git branch -f base
+sed -i '/^## Area five$/,/Sixth item/d' "$other"
+expect "closing the last item under a repeated subsection heading is LOW" LOW
+
+setup
+chmod +x "$backlog"
+expect "changing only a backlog file's mode is HIGH" HIGH "changes the file mode"
+
+setup
+sed -i 's/$/\r/' "$backlog"
+git add -A
+git commit -q -m "crlf"
+git branch -f base
+edit '/First item/d'
+expect "deleting one item from a CRLF file is LOW" LOW
+
+setup
+edit '/Not an item, inside a fence/d'
+expect "deleting a bullet inside a code fence is HIGH" HIGH "not a whole item"
+
+setup
+edit '/Third item/d'
+expect "deleting an item after a fence holding a Resolved heading is LOW" LOW
 
 # A comparison step that fails must not read as "no change": with awk
 # failing for the comparison (the only awk call with -F), two deleted items

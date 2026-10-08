@@ -38,6 +38,17 @@ base_backlog() {
 - **P1**: Not an item, inside a fence.
 ```
 
+  ~~~~
+- **P1**: Not an item, inside an indented tilde fence.
+  ```
+- **P1**: Not an item, a shorter backtick run does not close it.
+  ~~~~
+
+````md
+- **P1**: Not an item, inside a four-backtick fence.
+```
+````
+
 ## Area two
 
 - **P1**: Third item. Done when: three.
@@ -231,6 +242,18 @@ expect "deleting one item from a CRLF file is LOW" LOW
 setup
 edit '/Not an item, inside a fence/d'
 expect "deleting a bullet inside a code fence is HIGH" HIGH "not a whole item"
+
+setup
+edit '/inside an indented tilde fence/d'
+expect "deleting a bullet inside an indented tilde fence is HIGH" HIGH "not a whole item"
+
+setup
+edit '/a shorter backtick run does not close it/d'
+expect "deleting a bullet after a non-matching fence line is HIGH" HIGH "not a whole item"
+
+setup
+edit '/inside a four-backtick fence/d'
+expect "deleting a bullet inside a four-backtick fence is HIGH" HIGH "not a whole item"
 
 setup
 edit '/Third item/d'

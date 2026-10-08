@@ -87,8 +87,21 @@ backlog_blocks() {
   awk '
     function flush() { if (item != "") { print "I\t" path "\t" item; item = "" } }
     { sub(/\r$/, "") }
-    /^```/ { flush(); fence = !fence; print "O\t" path "\t" $0; next }
-    fence { print "O\t" path "\t" $0; next }
+    # A fence opens with three or more backticks or tildes after up to three
+    # spaces, and closes with at least as many of the same character.
+    {
+      line = $0; ind = 0
+      while (ind < 4 && substr(line, 1, 1) == " ") { line = substr(line, 2); ind++ }
+      run = ""
+      if (ind < 4 && match(line, /^(```+|~~~+)/)) run = substr(line, 1, RLENGTH)
+    }
+    fence != "" {
+      rest = substr(line, length(run) + 1)
+      if (run != "" && substr(run, 1, 1) == substr(fence, 1, 1) &&
+        length(run) >= length(fence) && rest ~ /^[ \t]*$/) fence = ""
+      print "O\t" path "\t" $0; next
+    }
+    run != "" { flush(); fence = run; print "O\t" path "\t" $0; next }
     /^#+ / {
       flush()
       level = index($0, " ") - 1

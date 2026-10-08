@@ -40,6 +40,10 @@ theme_errors="$(
     /^## / { in_themes = 0; next }
     /^### / { theme = substr($0, 5); prev = 0; next }
     /^[[:space:]]*$/ { next }
+    /^- ADR-[0-9][0-9][0-9]( \(.*\))?$/ && theme == "" {
+      printf "%s is listed before any theme heading\n", $2
+      next
+    }
     /^- ADR-[0-9][0-9][0-9]( \(.*\))?$/ {
       n = substr($2, 5, 3) + 0
       if (n <= prev) printf "theme \"%s\": ADR-%03d is not after ADR-%03d (keep numeric order, one entry per ADR)\n", theme, n, prev

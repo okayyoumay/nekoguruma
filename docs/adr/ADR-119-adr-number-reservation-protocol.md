@@ -64,7 +64,8 @@ Alternatives considered:
 ## Consequences
 
 - Parallel sessions can no longer take the same ADR number: the race is decided on the server at
-  reservation time, and numbering stays contiguous.
+  reservation time. Numbering is not guaranteed to stay contiguous: an abandoned reservation, or
+  a number abandoned by the check after creation, leaves a gap that is never filled.
 - Sessions cannot delete branches, so an abandoned reservation (an ADR that never merges) leaves
   a branch the cleanup never removes. A person deletes it on GitHub; until then the number stays
   used. The skill says to tell the user when this happens.

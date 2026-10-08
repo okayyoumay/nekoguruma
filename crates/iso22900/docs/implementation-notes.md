@@ -17,6 +17,7 @@ Safe Rust wrapper layer for D-PDU operations over low-level bindings from iso229
 - Preserve strong handle newtypes to avoid cross-handle misuse.
 - Require tests for new encode/decode paths and error mapping branches.
 - Keep callback trampoline signatures synchronized with mock and sys crates.
+- The event callback trampoline (`src/events.rs`) is passed to `PDURegisterEventCallback` as the bindings' `CALLBACKFNC` type, so a calling-convention or signature mismatch with the bindings is a compile error on that target. CI's `worker-check` job type-checks `iso22900-service`, and with it this crate, on all six worker targets, so no separate runtime ABI test is needed for the trampoline. The mock's exports are checked against the bindings separately by `crates/iso22900-mock/tests/abi_parity.rs`.
 
 ## Change Checklist
 

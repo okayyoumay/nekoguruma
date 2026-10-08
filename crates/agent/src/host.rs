@@ -483,8 +483,6 @@ fn is_response_pending(response: &[u8]) -> bool {
     matches!(response, [0x7F, _, 0x78, ..])
 }
 
-/// The supply voltage comes from the VCI; the worker interface has no defined source for the
-/// other inputs.
 /// A host that counts the TransferData blocks the ECU confirmed (ADR-250), which the
 /// journaling runner records (ADR-252).
 pub trait TransferProgress {
@@ -498,6 +496,8 @@ impl TransferProgress for WorkerHost {
     }
 }
 
+/// The supply voltage comes from the VCI; the worker interface has no defined source for the
+/// other inputs.
 impl crate::inputs::RuntimeInputs for WorkerHost {
     fn read(&mut self, input: diag_ir::RuntimeInput) -> Result<crate::inputs::Reading, HostError> {
         use crate::inputs::Reading;

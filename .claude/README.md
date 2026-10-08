@@ -146,7 +146,7 @@ backlog files never enter the main conversation.
 "Built-in agents") and pre-allows read-only git commands, the standard cargo verbs (check, build, test,
 clippy, metadata, tree, and `fmt --check` only; plain `cargo fmt` rewrites sources, so it
 prompts) and the repository check scripts (`check-work-refs.sh`, `check-adr-index.sh`,
-`check-backlog.sh`, `classify-pr-risk.sh`). Anything that mutates state outside `target/` still
+`check-backlog.sh`, `classify-pr-risk.sh` and its test `test-classify-pr-risk.sh`). Anything that mutates state outside `target/` still
 prompts.
 
 `ask` rules make force pushes and `git reset --hard` prompt even in auto mode, and `deny` rules

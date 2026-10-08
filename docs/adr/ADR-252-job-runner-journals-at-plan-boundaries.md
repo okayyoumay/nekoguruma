@@ -33,9 +33,13 @@ is no step before it.
      `post_transfer_end_pc`) commits a step record, so the journal's last step orders the
      interruption point (ADR-229 item 1, ADR-245 item 4) and records the post-transfer
      progress (ADR-244 item 3). A recovery-required point can lie anywhere in the plan, after
-     the RequestDownload or among the post-transfer steps, so a step record after every
-     primitive is what keeps a later restart from placing an interruption before it. A block
-     therefore costs two records: the block and its step.
+     the RequestDownload or among the post-transfer steps, so a primitive that completed at or
+     after it is always on record. A block therefore costs two records: the block and its step.
+     Only the erase and RequestTransferExit are written ahead of their requests: a request sent
+     whose response was lost leaves the last step on the primitive before it, so the
+     interruption point of ADR-229 item 1 can fall before a recovery-required point that a
+     later request crossed. How a restart treats the primitives after the last step is the
+     restart's to decide.
    - A step that brings execution to a plan's `entry_pc` commits its step record with the VM
      state after it (ADR-244 item 6), which is the state the restart replays from.
    - A step that brings execution to a plan's `post_transfer_end_pc`, after its exit marker,

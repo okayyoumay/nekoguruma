@@ -1530,3 +1530,7 @@ Only if the archived keyed-stop design becomes runtime behavior again:
 
 - **P2**: `cargo audit` flags `scc` 2.4.0 (unsound `Array::insert`), pulled in by the `serial_test` dev-dependency of `iso22900-service` and `j2534-0404-service`. The fix needs `serial_test` 4.x: bump it, check that `#[serial]` is unchanged, and confirm the advisory is gone. Not a runtime dependency of any shipped binary.
 
+
+### `libloading` 0.8 -> 0.9 (`iso22900-sys`, `j2534-0404-sys`)
+
+- **P3**: Both `-sys` crates stay on `libloading` 0.8, and `.github/dependabot.yml` ignores 0.9 and later. In 0.9, `Library::new` takes an `AsFilename` path instead of `AsRef<OsStr>`, but the loader that bindgen generates into `src/bindings/*.rs` (`Library::new(path)` with `P: AsRef<OsStr>`) still uses the old bound in bindgen 0.73.2, so the committed bindings stop compiling; `j2534-0404-sys`'s hand-written `abi.rs` loader (`Api::new`) needs the same change. Upgrading now would mean post-processing bindgen's output and regenerating every target's bindings, which the maintainer declined on 2026-10-08. Done when: both crates build with `libloading` 0.9 (or later) through regenerated bindings, and the `ignore` entry is removed from `.github/dependabot.yml`. Blocked on: a bindgen release whose dynamic-loading output compiles against `libloading` 0.9.

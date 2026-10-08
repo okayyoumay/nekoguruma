@@ -24,6 +24,12 @@ updates:
     groups:
       cargo-minor-patch:
         update-types: [minor, patch]
+    ignore:
+      # libloading 0.9 changed Library::new's path bound, and the loader code bindgen generates
+      # into the committed -sys bindings does not compile against it yet. Remove once the
+      # bindings are regenerated with a bindgen release that supports 0.9.
+      - dependency-name: libloading
+        versions: [">=0.9"]
 
   - package-ecosystem: github-actions
     directory: /

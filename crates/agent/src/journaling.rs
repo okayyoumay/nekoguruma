@@ -1,27 +1,32 @@
 //! The job runner's write-job journal (design 5.5, 8.2.5; ADR-229, ADR-244, ADR-252).
 //!
-//! For a procedure with a flash recovery plan, the runner commits to the journal at the plan's
-//! boundaries, each time execution arrives at one and before its instruction runs:
+//! For a procedure with a flash recovery plan, the runner commits to the journal in two places.
 //!
-//! - at `entry_pc`: the VM state, on a step record of the step that brought execution there
-//!   (none when the job starts there: the state is then the program's initial one); and,
-//!   while no transfer has started in this job, the ECU hardware part number and software
-//!   version, read through the sources the program declares;
+//! When execution arrives at an instruction, before it runs ([`JobJournal::arrive`]):
+//! - at a plan's `entry_pc`, once per job and before its first transfer: the ECU hardware part
+//!   number and software version, read through the sources the program declares;
 //! - at `erase_pc`: the transfer-start marker;
-//! - after each `FlashTransfer` the ECU confirmed: the block, by the host's running index;
-//! - at `transfer_exit_pc`: the RequestTransferExit marker;
-//! - at `post_transfer_end_pc`: the post-transfer completion.
+//! - at `transfer_exit_pc`: the RequestTransferExit marker.
 //!
-//! A commit that fails, or an identity that cannot be read, ends the job before the instruction
-//! at that boundary runs, so the request a marker guards is never sent without it (ADR-244
-//! item 7).
+//! When an instruction completes ([`JobJournal::completed`]):
+//! - a `FlashTransfer`: the block, by the host's running index;
+//! - a diagnostic primitive inside a plan's range: a step record, so the journal's last step
+//!   orders the interruption point (ADR-229 item 1, ADR-245 item 4);
+//! - a step that brings execution to a plan's `entry_pc`: a step record with the VM state
+//!   after it (none when the job starts at the entry: the state is then the program's initial
+//!   one);
+//! - a step that brings execution to a plan's `post_transfer_end_pc` after its exit marker: the
+//!   post-transfer completion.
+//!
+//! A commit that fails, or an identity that cannot be read, ends the job before the next
+//! instruction runs, so the request a marker guards is never sent without it (ADR-244 item 7).
 
 use std::path::PathBuf;
 
-use diag_ir::{DiagHost, IdentityKind, Op, Program, VmState};
+use diag_ir::{DiagHost, FlashRecovery, IdentityKind, NoApplication, Op, Program, VmState};
 
 use crate::host::{HostError, TransferProgress};
-use crate::inputs::{ServiceSources, read_field_bytes};
+use crate::inputs::{FieldBytes, ServiceSources, read_field_bytes};
 use crate::journal::{FileStore, JobKey, Journal, JournalError, StageId, StepRef, Store};
 use crate::runner::JobError;
 
@@ -39,23 +44,33 @@ pub struct JournalSetup {
 pub(crate) struct JobJournal<S = FileStore> {
     journal: Journal<S>,
     sources: ServiceSources,
+    /// The identity was read for this job.
+    identity_read: bool,
 }
 
 impl JobJournal {
     /// Creates the job's journal. An existing journal of the same key is an error: resuming
     /// one is the restart's work, not a first run's.
     pub(crate) fn create(setup: JournalSetup) -> Result<Self, JournalError> {
-        Ok(Self {
-            journal: Journal::create(&setup.dir, &setup.key)?,
-            sources: setup.sources,
-        })
+        Ok(Self::with(
+            Journal::create(&setup.dir, &setup.key)?,
+            setup.sources,
+        ))
     }
 }
 
 impl<S: Store> JobJournal<S> {
+    fn with(journal: Journal<S>, sources: ServiceSources) -> Self {
+        Self {
+            journal,
+            sources,
+            identity_read: false,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn new(journal: Journal<S>, sources: ServiceSources) -> Self {
-        Self { journal, sources }
+        Self::with(journal, sources)
     }
 
     #[cfg(test)]
@@ -63,14 +78,12 @@ impl<S: Store> JobJournal<S> {
         &self.journal
     }
 
-    /// Commits what the boundaries at `state.pc` call for. Called once each time execution
-    /// arrives at an instruction, before it runs; `previous` is the step that brought it there,
-    /// `None` at the start of the job.
+    /// Commits the markers and the identity the boundaries at `state.pc` call for. Called once
+    /// each time execution arrives at an instruction, before it runs.
     pub(crate) fn arrive<H>(
         &mut self,
         program: &Program,
         state: &VmState,
-        previous: Option<StepRef>,
         host: &mut H,
     ) -> Result<(), JobError>
     where
@@ -81,24 +94,16 @@ impl<S: Store> JobJournal<S> {
             pc,
             steps: state.steps,
         };
-        // A plan's end can be the next plan's entry: complete the one before entering the next.
-        for plan in &program.flash {
-            if pc == plan.boundaries.post_transfer_end_pc && self.post_transfer_open(plan.stage) {
-                self.journal.commit_post_transfer_complete()?;
-            }
-        }
         for plan in &program.flash {
             let b = &plan.boundaries;
-            if pc == b.entry_pc {
-                if let Some(previous) = previous {
-                    let encoded = postcard::to_allocvec(state)
-                        .map_err(|_| JournalError::Invariant("the VM state does not encode"))?;
-                    self.journal.commit_step(previous, Some(&encoded))?;
-                }
-                // The pre-erase version belongs before the job's first transfer (ADR-244 item 4).
-                if self.journal.state().facts.transfer.is_none() {
-                    self.record_identity(program, pc, host)?;
-                }
+            // The pre-erase version belongs before the job's first transfer (ADR-244 item 4),
+            // and a second read could fall in a session the ECU refuses it in.
+            if pc == b.entry_pc
+                && !self.identity_read
+                && self.journal.state().facts.transfer.is_none()
+            {
+                self.record_identity(program, plan, pc, host)?;
+                self.identity_read = true;
             }
             if pc == b.erase_pc {
                 self.journal
@@ -111,17 +116,39 @@ impl<S: Store> JobJournal<S> {
         Ok(())
     }
 
-    /// Commits what the instruction at `pc` calls for once it completed: a `FlashTransfer`
-    /// records the block the ECU confirmed.
+    /// Commits what the step `at` calls for once it completed; `after` is the VM state after it.
     pub(crate) fn completed<H: TransferProgress>(
         &mut self,
         program: &Program,
-        pc: u32,
+        at: StepRef,
+        after: &VmState,
         host: &H,
     ) -> Result<(), JobError> {
-        if let Some(Op::FlashTransfer { .. }) = program.code.get(pc as usize) {
+        let op = program.code.get(at.pc as usize);
+        if let Some(Op::FlashTransfer { .. }) = op {
             let block = block_number(host.transfer_block_index())?;
             self.journal.commit_block(block)?;
+        }
+        let enters = program
+            .flash
+            .iter()
+            .any(|plan| plan.boundaries.entry_pc == after.pc);
+        let inside = program.flash.iter().any(|plan| {
+            (plan.boundaries.entry_pc..plan.boundaries.post_transfer_end_pc).contains(&at.pc)
+        });
+        if enters {
+            let encoded = postcard::to_allocvec(after)
+                .map_err(|_| JournalError::Invariant("the VM state does not encode"))?;
+            self.journal.commit_step(at, Some(&encoded))?;
+        } else if inside && op.is_some_and(Op::is_diagnostic_primitive) {
+            self.journal.commit_step(at, None)?;
+        }
+        for plan in &program.flash {
+            if after.pc == plan.boundaries.post_transfer_end_pc
+                && self.post_transfer_open(plan.stage)
+            {
+                self.journal.commit_post_transfer_complete()?;
+            }
         }
         Ok(())
     }
@@ -143,10 +170,13 @@ impl<S: Store> JobJournal<S> {
 
     /// Reads and commits the hardware part number and the software version from the sources
     /// the program declares. A declared source that gives no value ends the job: a restart
-    /// compares the ECU against these values (ADR-229 item 2), so nothing is erased without them.
+    /// compares the ECU against these values (ADR-229 item 2), so nothing is erased without
+    /// them. The one exception is a software version answered with the plan's declared
+    /// "no valid application" response: there is no version to record, and the job goes on.
     fn record_identity<H>(
         &mut self,
         program: &Program,
+        plan: &FlashRecovery,
         pc: u32,
         host: &mut H,
     ) -> Result<(), JobError>
@@ -165,14 +195,23 @@ impl<S: Store> JobJournal<S> {
         ];
         for (identity, source) in declared {
             let Some(source) = source else { continue };
-            let value = read_field_bytes(source, &self.sources, host)
-                .map_err(|source| JobError::Host { pc, source })?
-                .ok_or(JobError::IdentityUnreadable { pc, identity })?;
-            match identity {
-                IdentityKind::HardwarePartNumber => {
+            let read = read_field_bytes(source, &self.sources, host).map_err(|source| {
+                JobError::IdentityRead {
+                    pc,
+                    identity,
+                    source,
+                }
+            })?;
+            match (identity, read) {
+                (IdentityKind::HardwarePartNumber, FieldBytes::Field(value)) => {
                     self.journal.commit_ecu_hardware_part_number(&value)?;
                 }
-                _ => self.journal.commit_pre_erase_software_version(&value)?,
+                (IdentityKind::SoftwareVersion, FieldBytes::Field(value)) => {
+                    self.journal.commit_pre_erase_software_version(&value)?;
+                }
+                (IdentityKind::SoftwareVersion, FieldBytes::Negative(nrc))
+                    if plan.no_application == Some(NoApplication::Nrc(nrc)) => {}
+                _ => return Err(JobError::IdentityUnreadable { pc, identity }),
             }
         }
         Ok(())

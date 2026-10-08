@@ -103,25 +103,30 @@ commit fails, are the job runner's duties.
 
 `agent::run_program_journaled` is the runner that keeps it (ADR-252). It takes a
 `JournalSetup` (directory, job key, and the `ServiceSources` table for the ECU's identity) and,
-for a program with a flash recovery plan, creates the journal before the link opens; a program
-without a plan keeps none. Each time execution arrives at a plan's boundary, before that
-instruction runs, it commits:
+for a program with a flash recovery plan, creates the journal once the link is open and the
+policy allows the program, before anything is sent to the ECU; a program without a plan keeps
+none. Each time execution arrives at a plan's boundary, before that instruction runs, it
+commits:
 
-- at the entry: the VM state, on the record of the step that brought execution there (none
-  when the job starts at the entry, whose state is the program's initial one); and, before the
-  job's first transfer, the hardware part number and software version, read as raw field
-  bytes (`inputs::read_field_bytes`) through the sources the program declares;
+- at the entry, once per job and before its first transfer: the hardware part number and
+  software version, read as raw field bytes (`inputs::read_field_bytes`) through the sources
+  the program declares. A software version answered with the plan's declared "no valid
+  application" response is not recorded, and the job goes on;
 - at the erase: the transfer-start marker;
-- at RequestTransferExit: its marker;
-- at the post-transfer end: the completion.
+- at RequestTransferExit: its marker.
 
-After each `FlashTransfer` it commits the block under the host's running index
-(`TransferProgress`, ADR-250). A commit that fails, or a declared identity source that gives no
-value (`JobError::IdentityUnreadable`), ends the job before the boundary's instruction runs, so a
-guarded request is never sent without its marker and nothing is erased without the identity.
-`ngr-agent run` uses
-`run_program` and keeps no journal; it sends read-only requests, or any request to `sim-vci` in
-a debug build (ADR-247).
+When an instruction completes, it commits the block of a `FlashTransfer`, under the host's
+running index (`TransferProgress`, ADR-250); a step record for every diagnostic primitive inside
+a plan's range; the VM state on the record of a step that brings execution to a plan's entry
+(none when the job starts at the entry, whose state is the program's initial one); and the
+post-transfer completion with the step that reaches the plan's post-transfer end. A commit that
+fails, or a declared identity source that gives no value (`JobError::IdentityUnreadable`, or
+`JobError::IdentityRead` when the read cannot be sent), ends the job before the next
+instruction runs, so a guarded request is never sent without its marker and nothing is erased
+without the identity.
+
+`ngr-agent run` uses `run_program` and keeps no journal; it sends read-only requests, or any
+request to `sim-vci` in a debug build (ADR-247).
 
 ## Restart inputs
 

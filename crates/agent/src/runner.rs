@@ -76,6 +76,13 @@ pub enum JobError {
     Journal(#[from] JournalError),
     #[error("the ECU's {identity:?} could not be read at {pc}, so the plan does not start")]
     IdentityUnreadable { pc: u32, identity: IdentityKind },
+    #[error("reading the ECU's {identity:?} at {pc} failed: {source}")]
+    IdentityRead {
+        pc: u32,
+        identity: IdentityKind,
+        #[source]
+        source: HostError,
+    },
     #[error("the job thread panicked")]
     Panicked,
 }
@@ -133,10 +140,11 @@ pub async fn run_program(
 }
 
 /// [`run_program`] that also writes the write-job journal for a program with a flash recovery
-/// plan (ADR-244, ADR-252): the journal of `journal.key` is created in `journal.dir` before the
-/// link opens, and the runner commits to it at the plan's boundaries (`journaling`). A commit
-/// that fails ends the job before the request it guards is sent. A program without a plan
-/// keeps no journal and creates no file.
+/// plan (ADR-244, ADR-252): the journal of `journal.key` is created in `journal.dir` once the
+/// link is open and the policy allows the program, before anything is sent to the ECU, and the
+/// runner commits to it at the plan's boundaries (`journaling`). A commit that fails ends the
+/// job before the request it guards is sent. A program without a plan keeps no journal and
+/// creates no file.
 pub async fn run_program_journaled(
     client: WorkerClient,
     config: &LinkConfig,
@@ -205,11 +213,6 @@ fn run_job(
     if cancelled.load(Ordering::Relaxed) {
         return Err(JobError::Cancelled);
     }
-    // Before the link opens: a job that cannot keep its journal sends nothing.
-    let mut journal = match journal {
-        Some(setup) if !program.flash.is_empty() => Some(JobJournal::create(setup)?),
-        _ => None,
-    };
     let timings = Timings::for_link(config);
     let link = handle
         .block_on(link::open(&mut client, config, timings.unary))
@@ -220,6 +223,18 @@ fn run_job(
         close_logged(&handle, &mut client, link, timings.unary);
         return Err(error);
     }
+    // Still before anything is sent: a job that cannot keep its journal sends nothing. A link
+    // that fails to open, or a program the link refuses, leaves no journal behind.
+    let mut journal = match journal {
+        Some(setup) if !program.flash.is_empty() => match JobJournal::create(setup) {
+            Ok(journal) => Some(journal),
+            Err(error) => {
+                close_logged(&handle, &mut client, link, timings.unary);
+                return Err(error.into());
+            }
+        },
+        _ => None,
+    };
     let mut host = WorkerHost::new(handle.clone(), client, link, timings);
     let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
         run_on(program, &mut host, limits, cancelled, journal.as_mut())
@@ -253,9 +268,9 @@ impl Drop for CancelOnDrop {
     }
 }
 
-/// The step loop, on the blocking thread. With a journal, it commits at the plan's boundaries
-/// each time execution arrives at an instruction, before that instruction runs, and after a
-/// completed instruction (`journaling`).
+/// The step loop, on the blocking thread. With a journal, it commits the plan's markers each
+/// time execution arrives at an instruction, before that instruction runs, and what a completed
+/// instruction calls for right after it (`journaling`).
 fn run_on<H, S>(
     program: &Program,
     host: &mut H,
@@ -269,9 +284,8 @@ where
 {
     let wait_poll = limits.wait_poll.max(Duration::from_millis(1));
     let mut vm = Vm::new(program);
-    // The completed step that brought execution to the current instruction, and whether the
-    // journal has seen this arrival yet (a timer wait polls the same instruction again).
-    let mut previous: Option<StepRef> = None;
+    // Whether the journal has seen this arrival yet (a timer wait polls the same instruction
+    // again).
     let mut arrived = true;
     loop {
         if cancelled.load(Ordering::Relaxed) {
@@ -283,7 +297,7 @@ where
         if std::mem::take(&mut arrived)
             && let Some(journal) = journal.as_deref_mut()
         {
-            journal.arrive(program, &vm.state, previous, host)?;
+            journal.arrive(program, &vm.state, host)?;
         }
         let pc = vm.state.pc;
         let at = StepRef {
@@ -294,20 +308,13 @@ where
         if vm.state.steps > at.steps {
             // The instruction completed.
             if let Some(journal) = journal.as_deref_mut() {
-                journal.completed(program, pc, host)?;
+                journal.completed(program, at, &vm.state, host)?;
             }
-            previous = Some(at);
             arrived = true;
         }
         match outcome {
             Ok(StepOutcome::Continue) => {}
-            Ok(StepOutcome::Finished) => {
-                // The end of the code can be a plan's post-transfer end.
-                if arrived && let Some(journal) = journal.as_deref_mut() {
-                    journal.arrive(program, &vm.state, previous, host)?;
-                }
-                return Ok(vm.state);
-            }
+            Ok(StepOutcome::Finished) => return Ok(vm.state),
             Ok(StepOutcome::Waiting(WaitingOn::Timer)) => std::thread::sleep(wait_poll),
             Ok(StepOutcome::Waiting(on)) => return Err(JobError::Unanswerable(on)),
             Err(StepError::Vm(source)) => return Err(JobError::Vm { pc, source }),
@@ -840,8 +847,10 @@ mod tests {
         let mut host = FlashHost::new(Rc::clone(&commits));
         let mut journal = counting_journal(&commits, None);
         run_flash(&mut host, &mut journal).unwrap();
-        // Commits: 1 the VM state at the entry, 2 the hardware part number, 3 the software
-        // version, 4 the transfer start, 5-7 the blocks, 8 the exit marker, 9 the completion.
+        // Commits: 1 the step into the entry with the VM state, 2 the hardware part number,
+        // 3 the software version, 4 the transfer start, 5 the erase's step, 6 the
+        // RequestDownload's step, 7-12 each block and its step, 13 the exit marker, 14
+        // RequestTransferExit's step, 15 the completion.
         assert_eq!(
             host.log,
             [
@@ -849,14 +858,14 @@ mod tests {
                 (Sent::Service(0x22, vec![0xF1, 0x91]), 1),
                 (Sent::Service(0x22, vec![0xF1, 0x95]), 2),
                 (Sent::Routine(0xFF00), 4),
-                (Sent::Service(0x34, vec![0x01]), 4),
-                (Sent::Block, 4),
-                (Sent::Block, 5),
+                (Sent::Service(0x34, vec![0x01]), 5),
                 (Sent::Block, 6),
-                (Sent::Service(0x37, vec![0x01]), 8),
+                (Sent::Block, 8),
+                (Sent::Block, 10),
+                (Sent::Service(0x37, vec![0x01]), 13),
             ]
         );
-        assert_eq!(commits.get(), 9);
+        assert_eq!(commits.get(), 15);
         let facts = &journal.journal().state().facts;
         let transfer = facts.transfer.as_ref().unwrap();
         assert_eq!(transfer.last_block, Some(3));
@@ -887,7 +896,7 @@ mod tests {
     fn a_failed_exit_marker_commit_ends_the_job_before_request_transfer_exit() {
         let commits = Rc::new(Cell::new(0));
         let mut host = FlashHost::new(Rc::clone(&commits));
-        let mut journal = counting_journal(&commits, Some(8));
+        let mut journal = counting_journal(&commits, Some(13));
         let result = run_flash(&mut host, &mut journal);
         assert!(
             matches!(result, Err(JobError::Journal(JournalError::Io(_)))),
@@ -906,7 +915,8 @@ mod tests {
     fn a_failed_block_commit_ends_the_job_before_the_next_block() {
         let commits = Rc::new(Cell::new(0));
         let mut host = FlashHost::new(Rc::clone(&commits));
-        let mut journal = counting_journal(&commits, Some(6));
+        // The second block's commit.
+        let mut journal = counting_journal(&commits, Some(9));
         assert!(matches!(
             run_flash(&mut host, &mut journal),
             Err(JobError::Journal(JournalError::Io(_)))
@@ -996,6 +1006,21 @@ mod tests {
             }
         );
         assert!(exit.complete);
+        // The last step is RequestTransferExit's, which counts as post-transfer progress.
+        assert_eq!(
+            facts.last_step,
+            Some(StepRef {
+                pc: EXIT,
+                steps: 16
+            })
+        );
+        assert_eq!(
+            exit.last_post_step,
+            Some(StepRef {
+                pc: EXIT,
+                steps: 16
+            })
+        );
         // The VM state at the entry, on the step before it.
         let (step, bytes) = state.last_vm_state.as_ref().unwrap();
         assert_eq!(
@@ -1008,6 +1033,173 @@ mod tests {
         let vm_state: VmState = postcard::from_bytes(bytes).unwrap();
         assert_eq!((vm_state.pc, vm_state.steps), (ENTRY, 3));
         assert!(vm_state.stack.is_empty());
+    }
+
+    /// A post-transfer step is recorded, and the completion is committed with the step that
+    /// reaches the end, even when the job stops right there (here at its step limit).
+    #[test]
+    fn the_post_transfer_steps_and_their_completion_are_recorded() {
+        let mut program = flash_program();
+        // RequestTransferExit, its Pop, then this routine's operand.
+        let check_memory = EXIT + 3;
+        program.code.extend([
+            Op::PushBytes(0),
+            Op::RoutineControl {
+                routine: 0xFF01,
+                sub: 1,
+            },
+            Op::Pop,
+            // After the plan.
+            Op::PushI64(1),
+            Op::Pop,
+        ]);
+        let end = check_memory + 2;
+        program.flash[0].boundaries.post_transfer_end_pc = end;
+        program.validate().unwrap();
+        let commits = Rc::new(Cell::new(0));
+        let mut host = FlashHost::new(Rc::clone(&commits));
+        let mut journal = counting_journal(&commits, None);
+        let limits = JobLimits {
+            // Every instruction is one step, so the job stops on arriving at the end.
+            max_steps: u64::from(end),
+            ..JobLimits::default()
+        };
+        let result = run_on(
+            &program,
+            &mut host,
+            limits,
+            &AtomicBool::new(false),
+            Some(&mut journal),
+        );
+        assert!(matches!(result, Err(JobError::StepLimit(_))), "{result:?}");
+        let facts = &journal.journal().state().facts;
+        let exit = facts.transfer.as_ref().unwrap().exit.as_ref().unwrap();
+        assert_eq!(
+            exit.last_post_step,
+            Some(StepRef {
+                pc: check_memory,
+                steps: u64::from(check_memory)
+            })
+        );
+        assert!(exit.complete);
+    }
+
+    /// The software version answered with the plan's declared "no valid application" response
+    /// is not recorded, and the job goes on; another negative response ends it.
+    #[test]
+    fn an_ecu_without_an_application_is_flashed_without_a_version() {
+        let mut program = flash_program();
+        program.flash[0].no_application = Some(diag_ir::NoApplication::Nrc(0x31));
+        let commits = Rc::new(Cell::new(0));
+        let mut host = FlashHost::new(Rc::clone(&commits));
+        host.software_version = None;
+        let mut journal = counting_journal(&commits, None);
+        run_on(
+            &program,
+            &mut host,
+            JobLimits::default(),
+            &AtomicBool::new(false),
+            Some(&mut journal),
+        )
+        .unwrap();
+        let facts = &journal.journal().state().facts;
+        assert_eq!(facts.pre_erase_software_version, None);
+        assert_eq!(
+            facts.ecu_hardware_part_number.as_deref(),
+            Some(&b"HW01"[..])
+        );
+        assert!(
+            facts
+                .transfer
+                .as_ref()
+                .unwrap()
+                .exit
+                .as_ref()
+                .unwrap()
+                .complete
+        );
+
+        program.flash[0].no_application = Some(diag_ir::NoApplication::Nrc(0x22));
+        let mut host = FlashHost::new(Rc::clone(&commits));
+        host.software_version = None;
+        let mut journal = counting_journal(&commits, None);
+        let result = run_on(
+            &program,
+            &mut host,
+            JobLimits::default(),
+            &AtomicBool::new(false),
+            Some(&mut journal),
+        );
+        assert!(
+            matches!(
+                result,
+                Err(JobError::IdentityUnreadable {
+                    identity: IdentityKind::SoftwareVersion,
+                    ..
+                })
+            ),
+            "{result:?}"
+        );
+    }
+
+    /// Arriving at the entry again before the transfer (a loop the validator allows) does not
+    /// read the identity a second time.
+    #[test]
+    fn the_identity_is_read_once_per_job() {
+        let program = flash_program();
+        let commits = Rc::new(Cell::new(0));
+        let mut host = FlashHost::new(Rc::clone(&commits));
+        let mut journal = counting_journal(&commits, None);
+        let mut vm = Vm::new(&program);
+        vm.state.pc = ENTRY;
+        journal.arrive(&program, &vm.state, &mut host).unwrap();
+        vm.state.steps = 10;
+        journal.arrive(&program, &vm.state, &mut host).unwrap();
+        let reads = host
+            .sent()
+            .iter()
+            .filter(|sent| matches!(sent, Sent::Service(0x22, _)))
+            .count();
+        assert_eq!(reads, 2);
+        assert_eq!(commits.get(), 2);
+    }
+
+    /// An entry that is also the erase: the step into it carries the VM state, then the
+    /// identity and the transfer-start marker follow, in that order.
+    #[test]
+    fn an_entry_at_the_erase_records_the_state_then_the_marker() {
+        let mut program = flash_program();
+        program.flash[0].boundaries.entry_pc = ERASE;
+        program.validate().unwrap();
+        let commits = Rc::new(Cell::new(0));
+        let mut host = FlashHost::new(Rc::clone(&commits));
+        let mut journal = counting_journal(&commits, None);
+        run_on(
+            &program,
+            &mut host,
+            JobLimits::default(),
+            &AtomicBool::new(false),
+            Some(&mut journal),
+        )
+        .unwrap();
+        let state = journal.journal().state();
+        let (step, _) = state.last_vm_state.as_ref().unwrap();
+        assert_eq!(
+            *step,
+            StepRef {
+                pc: ERASE - 1,
+                steps: 3
+            }
+        );
+        let transfer = state.facts.transfer.as_ref().unwrap();
+        assert_eq!(
+            transfer.started_at,
+            StepRef {
+                pc: ERASE,
+                steps: 4
+            }
+        );
+        assert_eq!(transfer.last_block, Some(3));
     }
 
     /// A job that starts at the plan's entry has its initial state there: no step record.
@@ -1036,8 +1228,104 @@ mod tests {
         let state = journal.journal().state();
         assert_eq!(state.last_vm_state, None);
         assert_eq!(state.facts.transfer.as_ref().unwrap().last_block, Some(3));
-        // Identity 2, transfer start 1, blocks 3, exit 1, completion 1.
-        assert_eq!(commits.get(), 8);
+        // Identity 2, transfer start 1, erase and RequestDownload steps 2, blocks and their
+        // steps 6, exit 1, its step 1, completion 1.
+        assert_eq!(commits.get(), 14);
+    }
+
+    /// Two plans where the first one's end is the second one's entry: the first completes before
+    /// the second starts, and the identity is not read again for the second.
+    #[test]
+    fn adjacent_plans_complete_one_before_starting_the_next() {
+        let mut program = flash_program();
+        let len = program.code.len() as u32;
+        let plan_code: Vec<Op> = program.code[ENTRY as usize..].to_vec();
+        program.code.extend(plan_code);
+        let mut second = program.flash[0].clone();
+        second.flash_session = 2;
+        second.stage = 8;
+        let shift = len - ENTRY;
+        let b = &mut second.boundaries;
+        b.entry_pc += shift;
+        b.erase_pc += shift;
+        b.transfer_exit_pc += shift;
+        b.post_transfer_end_pc += shift;
+        program.flash.push(second);
+        program.validate().unwrap();
+        let commits = Rc::new(Cell::new(0));
+        let mut host = FlashHost::new(Rc::clone(&commits));
+        let mut journal = counting_journal(&commits, None);
+        run_on(
+            &program,
+            &mut host,
+            JobLimits::default(),
+            &AtomicBool::new(false),
+            Some(&mut journal),
+        )
+        .unwrap();
+        // The first plan: 14 records up to RequestTransferExit's step, then the step into the
+        // second plan's entry (with the VM state) and the first plan's completion. The second:
+        // transfer start, 2 steps, 6 for the blocks, exit marker, its step, completion.
+        assert_eq!(commits.get(), 16 + 12);
+        let routines: Vec<u64> = host
+            .log
+            .iter()
+            .filter(|(sent, _)| matches!(sent, Sent::Routine(_)))
+            .map(|(_, commits)| *commits)
+            .collect();
+        assert_eq!(routines, [4, 17]);
+        let reads = host
+            .sent()
+            .iter()
+            .filter(|sent| matches!(sent, Sent::Service(0x22, _)))
+            .count();
+        assert_eq!(reads, 2);
+        let transfer = journal.journal().state().facts.transfer.clone().unwrap();
+        assert_eq!(transfer.stage, crate::journal::StageId(8));
+        assert!(transfer.exit.unwrap().complete);
+    }
+
+    /// A link that fails to open leaves no journal behind, so the job can be tried again.
+    #[test]
+    fn a_job_whose_link_fails_leaves_no_journal() {
+        let dir = std::env::temp_dir().join(format!(
+            "ngr-runner-link-fails-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let setup = JournalSetup {
+            dir: dir.clone(),
+            key: job_key(),
+            sources: identity_sources(),
+        };
+        let result = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let handle = Handle::current();
+                tokio::task::spawn_blocking(move || {
+                    run_job(
+                        handle,
+                        unreachable_client(),
+                        &LinkConfig::iso15765(0x7E0, 0x7E8),
+                        &flash_program(),
+                        JobLimits::default(),
+                        &AtomicBool::new(false),
+                        Some(setup),
+                    )
+                })
+                .await
+                .unwrap()
+            });
+        let left = std::fs::read_dir(&dir).unwrap().count();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(matches!(result, Err(JobError::Link(_))), "{result:?}");
+        assert_eq!(left, 0);
     }
 
     #[test]

@@ -16,6 +16,7 @@ trap 'rm -rf "$tmp"' EXIT
 # does not name a file in work/ (scripts/check-work-refs.sh).
 w=work
 backlog="$w/backlog.md"
+other="$w/other-backlog.md"
 
 base_backlog() {
   cat <<'EOF'
@@ -39,6 +40,10 @@ base_backlog() {
 - **`a_flaky_test`: fails one run in ten.**
   Confirm with a loop in isolation.
   Cause unknown.
+
+#### Resolved
+
+- **`an_old_flaky_test`**: fixed, kept as history.
 EOF
 }
 
@@ -54,6 +59,7 @@ setup() {
   : >src/lib.rs
   printf 'target/\nCargo.lock\n' >.gitignore
   base_backlog >"$backlog"
+  printf '> **TEMPORARY WORKING MATERIAL.** Second backlog.\n\n## Area four\n\n- **P1**: Fourth item.\n' >"$other"
   printf '> **TEMPORARY WORKING MATERIAL.** Rules.\n' >"$w/README.md"
   git add -A
   git commit -q -m base
@@ -123,11 +129,24 @@ edit '/Third item/a - **P2**: Second item. Done when: two.'
 expect "moving an item to another section is HIGH" HIGH "moves items or sections"
 
 setup
+edit '/an_old_flaky_test/d'
+expect "deleting a nested Resolved entry is HIGH" HIGH "not a whole item: - **\`an_old_flaky_test"
+
+setup
+edit '/Second item/i ### Known Flaky Tests (moved here)\n'
+expect "a heading inserted above existing items is HIGH" HIGH "moves items or sections"
+
+setup
+edit '/Second item/d'
+printf -- '- **P2**: Second item. Done when: two.\n' >>"$other"
+expect "moving an item to another backlog file is HIGH" HIGH "moves a backlog item to another backlog file"
+
+setup
 printf 'More rules.\n' >>"$w/README.md"
 expect "editing work/README.md is HIGH" HIGH "not on the low-risk allowlist"
 
 setup
-printf '> **TEMPORARY WORKING MATERIAL.** New.\n\n## A\n\n- **P1**: x.\n' >"$w/other-backlog.md"
+printf '> **TEMPORARY WORKING MATERIAL.** New.\n\n## A\n\n- **P1**: x.\n' >"$w/new-backlog.md"
 expect "adding a backlog file is HIGH" HIGH "adds the backlog file"
 
 if [ "$failures" -ne 0 ]; then

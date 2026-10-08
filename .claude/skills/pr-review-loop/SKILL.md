@@ -226,10 +226,21 @@ Step 0 is done:
    (`mergeable_state: "dirty"`), merge `main` per Step 3.5 and go back through Steps 3 and 4,
    since a check run on the old head says nothing about the merged tree. Being merely behind
    `main` is fine; the ruleset does not require an up-to-date branch.
-4. **Hand over.** Mark the PR ready for review and tell the maintainer in the project thread that it is
+4. **Refresh the description.** Before handing over, bring the PR description up to date with what
+   GitHub reports for the head you are handing over, also when the first round was clean and
+   nothing else in the description changed:
+   - the test plan's CI line: ticked only when every check run of that head passed in step 3,
+     naming the head commit;
+   - the review summary: each Copilot round and its outcome (`get_reviews`), and any
+     `edge-case-hunter` pass;
+   - any line the loop's fixes made untrue, such as a test count or a list of changes.
+
+   Send the whole description with the update, never only the changed section; an update
+   replaces the body.
+5. **Hand over.** Mark the PR ready for review and tell the maintainer in the project thread that it is
    ready, listing anything accepted as a limitation and anything added to the backlog. The maintainer
    reviews and merges; do not merge. Stay subscribed to the PR until it is merged or closed.
-5. If one ADR was amended three or more times in the loop, mention that rewriting its Decision
+6. If one ADR was amended three or more times in the loop, mention that rewriting its Decision
    section in one piece may now read better than the appended amendments.
 
 ## When the loop itself has a gap

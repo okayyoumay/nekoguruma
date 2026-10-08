@@ -347,7 +347,7 @@ the predecessor repository these ADRs came from.
 - ADR-028
 - ADR-042
 - ADR-062 (`CAN_29BIT_ID`/`ISO15765_ADDR_TYPE` discard rule scoped to RawMode=OFF by ADR-196)
-- ADR-067
+- ADR-067 (amended by ADR-110)
 - ADR-069 (amended; partially superseded by ADR-106; extended by ADR-156)
 - ADR-070
 - ADR-078 (superseded)
@@ -385,7 +385,7 @@ the predecessor repository these ADRs came from.
 - ADR-083 (partially superseded by ADR-093)
 - ADR-084 (partially superseded by ADR-093; amended by ADR-137)
 - ADR-088 (amended; partially superseded by ADR-093; extended by ADR-099)
-- ADR-093
+- ADR-093 (its "ADR-010 fully superseded" claim narrowed to tester-present by ADR-192)
 - ADR-096
 - ADR-099
 - ADR-137
@@ -408,8 +408,8 @@ the predecessor repository these ADRs came from.
 - ADR-157 (`to_j2534_config_id` translation contract narrowly superseded by ADR-158)
 - ADR-158 (PR #30 round-1 ISO15765-rejection correction narrowly superseded by ADR-159; Decision item 1's `channel_index.is_some()` rejection superseded by ADR-213)
 - ADR-159 (Decision 3's functional-SF-limit conservatism widened by ADR-169; Decision item 5's `channel_index.is_some()` rejection superseded, and Decision item 7's `_CHx`-capacity Discovery deferral fulfilled, by ADR-213)
-- ADR-164
-- ADR-168
+- ADR-164 (Decision's SW `_CHx` Additional Channels deferral fulfilled by ADR-212)
+- ADR-168 (Seventh correction's Accepted residual on the general clause 6 dual-wire pin-pair-completeness gap resolved by ADR-201; Decision item 7's `_CHx` deferral fulfilled by ADR-211)
 - ADR-170 (Decision 8's legacy single-byte heuristic amended by ADR-183; Decision 1's `UART_ECHO_BYTE_CHx` deferral fulfilled by ADR-207; Consequences' `UEB_T*` access-path residual closed by ADR-216)
 - ADR-174 (Decision item 1's `HONDA_DIAGH_CHx` deferral fulfilled by ADR-208)
 - ADR-175 (Decision item 1's `J1708_CHx` deferral fulfilled by ADR-209)
@@ -474,9 +474,9 @@ the predecessor repository these ADRs came from.
 - ADR-046
 - ADR-047
 - ADR-065 (`ISO9141_NO_CHECKSUM` derivation for a RawMode=ON K-line CLL added by ADR-198)
-- ADR-160
-- ADR-164
-- ADR-168
+- ADR-160 (Consequences' `CAN_MIXED_FORMAT_ALL_FRAMES` deferral fulfilled by ADR-217)
+- ADR-164 (Decision's SW `_CHx` Additional Channels deferral fulfilled by ADR-212)
+- ADR-168 (Seventh correction's Accepted residual on the general clause 6 dual-wire pin-pair-completeness gap resolved by ADR-201; Decision item 7's `_CHx` deferral fulfilled by ADR-211)
 - ADR-172 (bit-16 `HV_RX` untagged-delivery half tagged by ADR-191; bit-17/18 withhold unchanged)
 - ADR-217 (Consequences' `DualChannel`-primary cross-row role-attribution residual closed by ADR-222)
 

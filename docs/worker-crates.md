@@ -197,9 +197,13 @@ worker is built for:
 | `i686-unknown-linux-gnu`, `armv7-unknown-linux-gnueabihf`, `armv5te-unknown-linux-gnueabi` | 32-bit Linux |
 
 Regenerate with `cargo build -p <crate> --features bindgen --target <target>` after a header
-edit (libclang 18; cross targets without a sysroot need
-`BINDGEN_EXTRA_CLANG_ARGS=-ffreestanding`). Without the feature the build expects the committed
-file and fails if it is missing. CI builds both services for six of these targets.
+edit (libclang 18; a cross Linux target needs its libc headers, for example
+`BINDGEN_EXTRA_CLANG_ARGS_<target>=--sysroot=/usr/<gnu-triple>` with Ubuntu's
+`libc6-dev-*-cross` packages, or `BINDGEN_EXTRA_CLANG_ARGS=-ffreestanding` without a sysroot).
+`Cargo.lock` resolves bindgen's `syn` to 2.x, the major version `prettyplease` 0.2 uses; if a
+lockfile update moves bindgen to `syn` 3, the `bindgen` feature no longer compiles (the normal
+build, which uses the committed files, is unaffected). Without the feature the build expects the
+committed file and fails if it is missing. CI builds both services for six of these targets.
 
 D-PDU API enums (`E_PDU_*` newtypes) are `c_int` on `*-windows-msvc` and `c_uint` elsewhere
 (ADR-108), so code and tests must not assume one signedness; literals such as `0x8000_xxxx` are

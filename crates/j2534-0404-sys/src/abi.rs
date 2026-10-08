@@ -380,7 +380,7 @@ mod long64 {
     impl Api {
         pub unsafe fn new<P: AsRef<OsStr>>(path: P) -> Result<Self, libloading::Error> {
             unsafe {
-                let lib = libloading::Library::new(path)?;
+                let lib = libloading::Library::new(path.as_ref())?;
                 macro_rules! sym {
                     ($name:literal) => {
                         *lib.get($name)?

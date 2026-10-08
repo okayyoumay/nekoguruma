@@ -14,4 +14,4 @@ vci-service-config = { workspace = true }
 tracing = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
-winreg = "0.10"
+winreg = "0.55"

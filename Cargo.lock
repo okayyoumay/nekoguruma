@@ -794,7 +794,7 @@ dependencies = [
  "roxmltree",
  "tracing",
  "url",
- "winreg 0.55.0",
+ "winreg",
 ]
 
 [[package]]
@@ -813,7 +813,7 @@ dependencies = [
  "tracing",
  "url",
  "vci-service-config",
- "winreg 0.10.1",
+ "winreg",
 ]
 
 [[package]]
@@ -891,7 +891,7 @@ dependencies = [
  "tempfile",
  "tracing",
  "vci-service-config",
- "winreg 0.55.0",
+ "winreg",
 ]
 
 [[package]]
@@ -2152,7 +2152,7 @@ version = "0.1.0"
 dependencies = [
  "roxmltree",
  "thiserror",
- "winreg 0.55.0",
+ "winreg",
 ]
 
 [[package]]
@@ -2239,28 +2239,6 @@ checksum = "b67efb37e106e55ce722a510d6b5f9c17f083e5fc79afc2badeb12cc313d9487"
 dependencies = [
  "wit-bindgen",
 ]
-
-[[package]]
-name = "winapi"
-version = "0.3.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5c839a674fcd7a98952e593242ea400abe93992746761e38641405d28b00f419"
-dependencies = [
- "winapi-i686-pc-windows-gnu",
- "winapi-x86_64-pc-windows-gnu",
-]
-
-[[package]]
-name = "winapi-i686-pc-windows-gnu"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac3b87c63620426dd9b991e5ce0329eff545bccbbb34f3be09ff6fb6ab51b7b6"
-
-[[package]]
-name = "winapi-x86_64-pc-windows-gnu"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "712e227841d057c1ee1cd2fb22fa7e5a5461ae8e48fa2ca79ec42cfc1931183f"
 
 [[package]]
 name = "windows-link"
@@ -2357,15 +2335,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df79d97927682d2fd8adb29682d1140b343be4ac0f08fd68b7765d9c059d3945"
 dependencies = [
  "memchr",
-]
-
-[[package]]
-name = "winreg"
-version = "0.10.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "80d0f4e272c85def139476380b12f9ac60926689dd2e01d4923222f40580869d"
-dependencies = [
- "winapi",
 ]
 
 [[package]]

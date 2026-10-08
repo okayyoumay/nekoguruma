@@ -76,4 +76,8 @@ Alternatives considered:
 - `adr-reservation/*` branches appear in the branch list while ADRs are in flight. They carry no
   commits and are short-lived; CI does not run on them.
 - Unlike the predecessor repository, this repository has no workflow that reserves a number
-  without an agent; a person reserves one by creating the branch in the GitHub UI.
+  without an agent; a person reserves one by creating the branch in the GitHub UI. The
+  predecessor's version of this ADR therefore had a duty this one does not: keeping that
+  workflow and the skill in sync. ADR-155's Status line and its Decision item 4 relax that
+  duty (same pull request instead of same commit). Here only the skill implements the
+  procedure, so the duty and ADR-155's relaxation of it do not apply.

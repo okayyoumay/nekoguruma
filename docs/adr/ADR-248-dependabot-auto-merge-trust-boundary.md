@@ -11,8 +11,9 @@ Dependabot opens a weekly grouped pull request for Cargo minor and patch updates
 (`cargo-minor-patch`) and one pull request per update that Cargo treats as breaking (a new major
 version, or a 0.x minor bump such as 0.22 to 0.23). Until now the maintainer merged every one of
 them by hand. The grouped minor/patch updates are routine: they are semver-compatible, and main's
-required checks (`repo-checks`, `core-linux`, `core-windows`, `worker-check`, `abi-roundtrip`)
-build and test them like any other change.
+required checks (`repo-checks`, `core-linux`, `core-windows`, `worker-check`, `abi-roundtrip`,
+and `msrv`, which runs whenever a manifest or the lockfile changes) build and test them like any
+other change.
 
 Turning on GitHub auto-merge for a pull request needs a token with write access. GitHub runs a
 `pull_request` workflow started by Dependabot like a fork run: its token is read-only and the
@@ -31,9 +32,11 @@ request, would run untrusted code with write access.
    the update type `dependabot/fetch-metadata` reports: that type can call a 0.x bump "minor"
    while Cargo treats it as breaking, and `dependabot.yml` already keeps such bumps out of the
    group.
-3. The workflow runs on `pull_request_target` and acts only when both the pull request's author
-   and the triggering actor are `dependabot[bot]`. Checking the actor means that a human push to
-   a Dependabot branch does not start it.
+3. The workflow runs on `pull_request_target` for pull requests whose author is
+   `dependabot[bot]`, and turns auto-merge on only when the triggering actor is Dependabot too.
+   GitHub keeps auto-merge on after a push by someone with write access, so when anyone else
+   pushes to the branch the workflow turns auto-merge off instead, and the pull request waits for
+   the maintainer.
 4. The workflow never checks out or runs anything from the pull request. It only reads
    Dependabot's metadata and calls `gh pr merge --auto`. Copilot review treats breaking this rule,
    or widening the workflow beyond the group, as P1 (`.github/instructions/ci.instructions.md`).

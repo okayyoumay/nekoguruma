@@ -17,19 +17,26 @@ permissions: {}
 
 jobs:
   enable-auto-merge:
-    # Checking the actor too means a human push to a Dependabot branch does not trigger it.
-    if: github.event.pull_request.user.login == 'dependabot[bot]' && github.actor == 'dependabot[bot]'
+    if: github.event.pull_request.user.login == 'dependabot[bot]'
     runs-on: ubuntu-latest
     permissions:
       contents: write
       pull-requests: write
     steps:
+      # Someone other than Dependabot pushed to the branch: auto-merge stays on after such a push,
+      # so turn it off and leave the pull request to the maintainer.
+      - if: github.actor != 'dependabot[bot]'
+        run: gh pr merge --disable-auto "$PR_URL" || true
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - id: metadata
+        if: github.actor == 'dependabot[bot]'
         uses: dependabot/fetch-metadata@v3
       # Selecting by group rather than by update type: the update type can call a 0.x bump such as
       # 0.22 -> 0.23 minor, while Cargo treats it as breaking and dependabot.yml keeps
       # it out of the group.
-      - if: steps.metadata.outputs.package-ecosystem == 'cargo' && steps.metadata.outputs.dependency-group == 'cargo-minor-patch'
+      - if: github.actor == 'dependabot[bot]' && steps.metadata.outputs.package-ecosystem == 'cargo' && steps.metadata.outputs.dependency-group == 'cargo-minor-patch'
         run: gh pr merge --auto --squash "$PR_URL"
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}

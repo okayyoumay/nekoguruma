@@ -194,6 +194,8 @@ the attribute fails the build once the code is used and gets removed.
    conversation: every follow-up is either done in the PR or added to the backlog (`backlog`
    skill). Items the PR finishes are closed in the same PR.
 5. The maintainer (the repository owner) reviews and merges. Do not merge your own PR unless asked.
+   The one exception is Dependabot's grouped Cargo minor/patch pull request, which merges itself
+   ("Building and testing" above, ADR-248).
 
 Commit messages and PR descriptions follow the same copyright rule as the code.
 

@@ -21,5 +21,6 @@ Flag as P1:
   get CI green.
 - **Dependabot auto-merge**: `dependabot-auto-merge.yml` runs on `pull_request_target` with a
   write token, so any step that checks out or runs code from the pull request is P1, as is
-  widening it beyond Dependabot's `cargo-minor-patch` group (other Dependabot updates and all
+  widening it beyond Dependabot's `cargo-minor-patch` group, or dropping the step that turns
+  auto-merge off after a push by anyone other than Dependabot (other Dependabot updates and all
   human pull requests are merged by the maintainer).

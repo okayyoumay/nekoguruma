@@ -5,6 +5,8 @@ description: Atomically reserve a unique ADR number before writing any ADR in ne
 
 # ADR number reservation
 
+The design and its alternatives are recorded in ADR-119.
+
 Two parallel sessions computing "max + 1 over `docs/adr/`" pick the same
 number, and the duplicate merges silently: the files have different slugs, so
 git never conflicts on them. ADR numbers are cited from code and documents,

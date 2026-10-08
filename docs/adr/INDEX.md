@@ -115,6 +115,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-116](ADR-116-txflagraw-iso-22900-2-d21-layout.md) | `TxFlagRaw` Is the ISO 22900-2 D.2.1 Byte-Array Layout, Not a Native J2534 `TxFlags` u32 | Accepted | `j2534-0404-service` rpc_primitive, `vci-service-interface` proto, bindings |
 | [ADR-117](ADR-117-pdu-copst-idle-vs-waiting.md) | `PDU_COPST_IDLE` vs. `PDU_COPST_WAITING` — `CopEntry` Dispatch Tracking (Supersedes ADR-021) | Accepted (A2-24 SubscribeEvent gap closed by ADR-118) | `j2534-0404-service` service, events, rpc_primitive |
 | [ADR-118](ADR-118-cyclic-cop-status-events.md) | Cyclic CoptSendrecv Status Events — EXECUTING/WAITING on Every Cycle Boundary | Accepted | `j2534-0404-service` events, service, rpc_primitive |
+| [ADR-119](ADR-119-adr-number-reservation-protocol.md) | Atomic ADR Number Reservation via `adr-reservation/{NNN}` Branches | Accepted | `docs/adr/` numbering, `adr-number-reservation` skill, `scripts/check-adr-index.sh`, `adr-reservation-cleanup.yml` |
 | [ADR-120](ADR-120-synthetic-timestamp-clock-unification.md) | `j2534-0404-service` Synthetic Timestamps Move to a Single Boot-Relative Microsecond Clock (ISO 22900-2 §9.1.6.1) | Accepted | `j2534-0404-service` events, rpc_primitive, rpc_module, service |
 | [ADR-121](ADR-121-isotp-tx-n-wftmax-enforcement.md) | Software ISO-TP TX Driver Enforces N_WFTmax (`CP_CanMaxNumWaitFrames`) | **Superseded by ADR-124** | `j2534-0404-service` service, events, rpc_primitive |
 | [ADR-122](ADR-122-remove-zero-mask-pass-all-flow-control-filter.md) | Remove the Zero-Mask Pass-All FLOW_CONTROL_FILTER Fallback on ISO15765 Channels (amends ADR-039, ADR-048) | Accepted | `j2534-0404-service` service, rpc_link, rpc_misc |
@@ -245,7 +246,8 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | Superseded by ADR-NNN | Replaced by a later ADR. Reference only. |
 
 A number with no file in this directory is unused: no ADR with that number is part of this
-repository, and no new ADR takes it. Older ADRs may still mention such numbers as provenance.
+repository, and no new ADR takes it. Older ADRs may still mention such numbers as provenance, from
+the predecessor repository these ADRs came from.
 
 ## Classification by Theme
 
@@ -547,6 +549,7 @@ repository, and no new ADR takes it. Older ADRs may still mention such numbers a
 - ADR-232
 
 ### Development Tooling & CI
+- ADR-119
 - ADR-149
 - ADR-155
 - ADR-163

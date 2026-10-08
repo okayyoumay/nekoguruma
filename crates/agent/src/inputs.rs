@@ -5,9 +5,10 @@
 //! turns a source into a [`Reading`]:
 //!
 //! - [`Source::RuntimeInput`]: a fact the agent supplies itself, through [`RuntimeInputs`].
-//!   [`LinkInputs`] answers the supply voltage from the VCI (`PDU_IOCTL_READ_VBATT`) and reports
-//!   every other input as [`Reading::CannotBeEstablished`], since no current VCI offers a source
-//!   for them (ADR-238). [`FixedInputs`] holds fixed readings, for tests and for later wiring.
+//!   [`crate::WorkerHost`] answers the supply voltage from the VCI (`PDU_IOCTL_READ_VBATT`) and
+//!   reports every other input as [`Reading::CannotBeEstablished`], since no current VCI offers
+//!   a source for them (ADR-238). [`FixedInputs`] holds fixed readings, for tests and for later
+//!   wiring.
 //! - [`Source::EcuService`]: a field of a diagnostic response, located through a
 //!   [`ServiceSources`] table. The table stands in until the declaration part has a decoder
 //!   (ADR-245, consequences).
@@ -22,16 +23,17 @@ use std::time::Duration;
 use diag_ir::{DiagHost, RuntimeInput, Source};
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
-use vci_service_interface::{DataItem, IoCtlRequest, data_item, io_ctl_request};
+use vci_service_interface::{
+    DataItem, GetObjectIdRequest, IoCtlRequest, ObjectType, data_item, io_ctl_request,
+};
 use worker_host::client::WorkerClient;
 
 use crate::host::{HostError, unary};
 use crate::link::Link;
 
 /// D-PDU API IOCTL `PDU_IOCTL_READ_VBATT`: the battery voltage in millivolts, answered as an
-/// unsigned 32-bit value. The numeric id is the worker's (`PDU_IOCTL_BASE + 0x06`); the worker
-/// takes the command by id.
-const IOCTL_READ_VBATT: u32 = 0x2900_0006;
+/// unsigned 32-bit value. Its id is looked up by this name through `GetObjectId`.
+const IOCTL_READ_VBATT_NAME: &str = "PDU_IOCTL_READ_VBATT";
 
 /// What one read of a source gave.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,60 +131,50 @@ impl RuntimeInputs for FixedInputs {
     }
 }
 
-/// Runtime inputs backed by the worker's link. Borrows what [`crate::WorkerHost::inputs`] lends;
-/// like the host, it blocks on the runtime's [`Handle`], so call it from the job's blocking
-/// thread.
-pub struct LinkInputs<'a> {
-    handle: &'a Handle,
-    client: &'a mut WorkerClient,
-    link: &'a Link,
+/// Reads the supply voltage from the VCI of `link`. The IOCTL id is resolved by name on the
+/// first call and kept in `cached_id`. A VCI that does not know the name offers no voltage:
+/// [`Reading::CannotBeEstablished`]. Blocks on `handle`, like the host's other primitives.
+pub(crate) fn read_supply_voltage(
+    handle: &Handle,
+    client: &mut WorkerClient,
+    link: &Link,
+    cached_id: &mut Option<u32>,
     deadline: Duration,
-}
-
-impl<'a> LinkInputs<'a> {
-    pub fn new(
-        handle: &'a Handle,
-        client: &'a mut WorkerClient,
-        link: &'a Link,
-        deadline: Duration,
-    ) -> Self {
-        Self {
-            handle,
-            client,
-            link,
-            deadline,
+) -> Result<Reading, HostError> {
+    let id = match *cached_id {
+        Some(id) => id,
+        None => {
+            let request = GetObjectIdRequest {
+                object_type: ObjectType::ObjtIoCtrl as i32,
+                shortname: IOCTL_READ_VBATT_NAME.to_owned(),
+            };
+            let found = handle.block_on(unary(
+                deadline,
+                "GetObjectId",
+                client.get_object_id(request),
+            ));
+            match found {
+                Ok(response) => *cached_id.insert(response.pdu_object_id),
+                Err(HostError::Rpc { status, .. })
+                    if matches!(
+                        status.code(),
+                        tonic::Code::NotFound | tonic::Code::InvalidArgument
+                    ) =>
+                {
+                    return Ok(Reading::CannotBeEstablished);
+                }
+                Err(error) => return Err(error),
+            }
         }
-    }
-
-    fn read_supply_voltage(&mut self) -> Result<Reading, HostError> {
-        let request = IoCtlRequest {
-            handle: Some(io_ctl_request::Handle::ModuleHandle(
-                self.link.module_handle,
-            )),
-            io_ctrl_command: Some(io_ctl_request::IoCtrlCommand::IoCtrlCommandId(
-                IOCTL_READ_VBATT,
-            )),
-            input_data: None,
-            has_output: true,
-        };
-        let response =
-            self.handle
-                .block_on(unary(self.deadline, "IoCtl", self.client.io_ctl(request)))?;
-        Ok(voltage_from_data(response.output_data.as_ref()))
-    }
-}
-
-impl RuntimeInputs for LinkInputs<'_> {
-    fn read(&mut self, input: RuntimeInput) -> Result<Reading, HostError> {
-        match input {
-            RuntimeInput::SupplyVoltageMillivolts => self.read_supply_voltage(),
-            // No current VCI offers these (ADR-238).
-            RuntimeInput::ExternalSupplyConnected
-            | RuntimeInput::IgnitionOn
-            | RuntimeInput::EngineRunning
-            | RuntimeInput::VehicleSpeedKmh => Ok(Reading::CannotBeEstablished),
-        }
-    }
+    };
+    let request = IoCtlRequest {
+        handle: Some(io_ctl_request::Handle::ModuleHandle(link.module_handle)),
+        io_ctrl_command: Some(io_ctl_request::IoCtrlCommand::IoCtrlCommandId(id)),
+        input_data: None,
+        has_output: true,
+    };
+    let response = handle.block_on(unary(deadline, "IoCtl", client.io_ctl(request)))?;
+    Ok(voltage_from_data(response.output_data.as_ref()))
 }
 
 /// The millivolts a `READ_VBATT` answer carries: an unsigned 32-bit item. Anything else (no
@@ -202,11 +194,18 @@ fn voltage_from_data(data: Option<&DataItem>) -> Reading {
 pub enum Encoding {
     /// An unsigned big-endian integer of 1 to 8 bytes that fits an `i64`.
     UnsignedBigEndian,
-    /// Printable ASCII (0x20 to 0x7E). Other bytes, padding included, make it undecodable.
+    /// Printable ASCII (0x20 to 0x7E), at least one non-space character. Spaces around the text
+    /// are kept as they are (no trimming); any other byte, padding such as 0x00 included, makes
+    /// the field undecodable.
     Ascii,
 }
 
 /// Where one `EcuService` field is and how to read it.
+///
+/// The response must be exactly the positive SID, the request's parameters echoed, and the
+/// field: so `offset` must equal the request's length minus the SID (a request that reads
+/// several identifiers is refused), the echoed bytes must equal the request's, and nothing may
+/// follow the field.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServiceField {
@@ -214,31 +213,72 @@ pub struct ServiceField {
     pub service_id: u32,
     /// `Source::EcuService::field_id` (starts at 1).
     pub field_id: u32,
-    /// The whole request, SID first (as `host::service_request_bytes` builds it).
+    /// The whole request, SID first (as `host::service_request_bytes` builds it). The SID must
+    /// lie in 0x10..=0x3E, so its positive response cannot be taken for a 0x7F negative one.
     pub request: Vec<u8>,
-    /// Bytes to skip after the response SID, such as the echoed data identifier.
+    /// Bytes between the response SID and the field: the echo of the request's parameters
+    /// (such as the data identifier). Equals `request.len() - 1`.
     pub offset: usize,
     /// Length of the field in bytes.
     pub length: usize,
     pub encoding: Encoding,
 }
 
+/// Why a table was refused.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum TableError {
+    #[error("service {service_id} field {field_id} is declared twice")]
+    Duplicate { service_id: u32, field_id: u32 },
+    #[error(
+        "service {service_id} field {field_id}: the request is empty or its SID is not 0x10..=0x3E"
+    )]
+    BadSid { service_id: u32, field_id: u32 },
+}
+
 /// The table that maps `EcuService` sources to requests and response fields.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
+#[serde(try_from = "Vec<ServiceField>", into = "Vec<ServiceField>")]
 pub struct ServiceSources {
     fields: Vec<ServiceField>,
 }
 
-impl ServiceSources {
-    pub fn new(fields: Vec<ServiceField>) -> Self {
-        Self { fields }
-    }
+impl TryFrom<Vec<ServiceField>> for ServiceSources {
+    type Error = TableError;
 
-    /// Adds a field. A later entry for the same ids is never reached: the first wins.
-    pub fn with(mut self, field: ServiceField) -> Self {
-        self.fields.push(field);
-        self
+    fn try_from(fields: Vec<ServiceField>) -> Result<Self, TableError> {
+        for (index, field) in fields.iter().enumerate() {
+            let (service_id, field_id) = (field.service_id, field.field_id);
+            if !matches!(field.request.first(), Some(0x10..=0x3E)) {
+                return Err(TableError::BadSid {
+                    service_id,
+                    field_id,
+                });
+            }
+            if fields[..index]
+                .iter()
+                .any(|f| f.service_id == service_id && f.field_id == field_id)
+            {
+                return Err(TableError::Duplicate {
+                    service_id,
+                    field_id,
+                });
+            }
+        }
+        Ok(Self { fields })
+    }
+}
+
+impl From<ServiceSources> for Vec<ServiceField> {
+    fn from(table: ServiceSources) -> Self {
+        table.fields
+    }
+}
+
+impl ServiceSources {
+    /// Builds a table; refuses a duplicate `(service_id, field_id)` and a request whose SID is
+    /// outside 0x10..=0x3E.
+    pub fn new(fields: Vec<ServiceField>) -> Result<Self, TableError> {
+        Self::try_from(fields)
     }
 
     pub fn get(&self, service_id: u32, field_id: u32) -> Option<&ServiceField> {
@@ -248,22 +288,22 @@ impl ServiceSources {
     }
 }
 
-/// Reads one source: a runtime input through `inputs`, an `EcuService` field through `table` by
-/// sending its request with `host`. A source the table lacks, a negative or short response and
-/// a field that does not fit its encoding give [`Reading::CannotBeDecoded`]; a failure to send
-/// or receive is the host's error.
-pub fn resolve_source<H, I>(
+/// Reads one source with one value that is both the sender and the runtime inputs (the
+/// [`crate::WorkerHost`]): a runtime input through [`RuntimeInputs`], an `EcuService` field
+/// through `table` by sending its request. A source the table lacks, a negative response, a
+/// response that is short, long, or does not echo the request, and a field that does not fit
+/// its encoding give [`Reading::CannotBeDecoded`]; a failure to send or receive is the
+/// host's error.
+pub fn resolve_source<H>(
     source: Source,
     table: &ServiceSources,
     host: &mut H,
-    inputs: &mut I,
 ) -> Result<Reading, HostError>
 where
-    H: DiagHost<Error = HostError>,
-    I: RuntimeInputs + ?Sized,
+    H: DiagHost<Error = HostError> + RuntimeInputs,
 {
     match source {
-        Source::RuntimeInput(input) => inputs.read(input),
+        Source::RuntimeInput(input) => host.read(input),
         Source::EcuService {
             service_id,
             field_id,
@@ -290,13 +330,15 @@ fn decode_field(field: &ServiceField, sid: u8, response: &[u8]) -> Reading {
     if first != sid.wrapping_add(0x40) {
         return Reading::CannotBeDecoded;
     }
-    let Some(bytes) = field
-        .offset
-        .checked_add(field.length)
-        .and_then(|end| rest.get(field.offset..end))
-    else {
+    let params = &field.request[1..];
+    // Exactly the echo, then the field: nothing missing, nothing extra.
+    if field.offset != params.len()
+        || field.offset.checked_add(field.length) != Some(rest.len())
+        || rest[..field.offset] != *params
+    {
         return Reading::CannotBeDecoded;
-    };
+    }
+    let bytes = &rest[field.offset..];
     match field.encoding {
         Encoding::UnsignedBigEndian => {
             if bytes.is_empty() || bytes.len() > 8 {
@@ -306,7 +348,8 @@ fn decode_field(field: &ServiceField, sid: u8, response: &[u8]) -> Reading {
             i64::try_from(value).map_or(Reading::CannotBeDecoded, Reading::Value)
         }
         Encoding::Ascii => {
-            if bytes.is_empty() || !bytes.iter().all(|b| (0x20..=0x7E).contains(b)) {
+            if !bytes.iter().all(|b| (0x20..=0x7E).contains(b)) || bytes.iter().all(|b| *b == b' ')
+            {
                 return Reading::CannotBeDecoded;
             }
             Reading::Text(String::from_utf8_lossy(bytes).into_owned())
@@ -388,10 +431,12 @@ mod tests {
         );
     }
 
-    /// Answers every request with the next scripted response and records the requests.
+    /// Answers every request with the next scripted response, records the requests, and
+    /// supplies fixed runtime inputs.
     struct Fake {
         responses: Vec<Result<Vec<u8>, HostError>>,
         sent: Vec<(u16, Vec<u8>)>,
+        inputs: FixedInputs,
     }
 
     impl Fake {
@@ -399,7 +444,14 @@ mod tests {
             Self {
                 responses: vec![Ok(response.to_vec())],
                 sent: Vec::new(),
+                inputs: FixedInputs::new(),
             }
+        }
+    }
+
+    impl RuntimeInputs for Fake {
+        fn read(&mut self, input: RuntimeInput) -> Result<Reading, HostError> {
+            self.inputs.read(input)
         }
     }
 
@@ -442,30 +494,36 @@ mod tests {
         fn log(&mut self, _: u8, _: &str) {}
     }
 
+    fn vin_field() -> ServiceField {
+        // Service 1, field 1: the VIN, data identifier F190, 17 characters after the echo.
+        ServiceField {
+            service_id: 1,
+            field_id: 1,
+            request: vec![0x22, 0xF1, 0x90],
+            offset: 2,
+            length: 17,
+            encoding: Encoding::Ascii,
+        }
+    }
+
     fn table() -> ServiceSources {
-        ServiceSources::default()
-            // Service 1, field 1: the VIN, data identifier F190, 17 characters after the echo.
-            .with(ServiceField {
-                service_id: 1,
-                field_id: 1,
-                request: vec![0x22, 0xF1, 0x90],
-                offset: 2,
-                length: 17,
-                encoding: Encoding::Ascii,
-            })
+        ServiceSources::new(vec![
+            vin_field(),
             // Service 2, field 1: a two-byte counter at data identifier F100.
-            .with(ServiceField {
+            ServiceField {
                 service_id: 2,
                 field_id: 1,
                 request: vec![0x22, 0xF1, 0x00],
                 offset: 2,
                 length: 2,
                 encoding: Encoding::UnsignedBigEndian,
-            })
+            },
+        ])
+        .unwrap()
     }
 
     fn resolve(source: Source, host: &mut Fake) -> Reading {
-        resolve_source(source, &table(), host, &mut FixedInputs::new()).unwrap()
+        resolve_source(source, &table(), host).unwrap()
     }
 
     fn ecu(service_id: u32, field_id: u32) -> Source {
@@ -473,6 +531,18 @@ mod tests {
             service_id,
             field_id,
         }
+    }
+
+    fn vin_response(vin: &[u8]) -> Vec<u8> {
+        let mut response = vec![0x62, 0xF1, 0x90];
+        response.extend_from_slice(vin);
+        response
+    }
+
+    /// The real host serves as sender and inputs in one call (compile-level check).
+    #[expect(dead_code, reason = "only has to compile")]
+    fn worker_host_resolves_any_source(host: &mut crate::WorkerHost, source: Source) {
+        let _ = resolve_source(source, &ServiceSources::default(), host);
     }
 
     #[test]
@@ -484,10 +554,7 @@ mod tests {
 
     #[test]
     fn an_ascii_field_is_read_as_text() {
-        let vin = b"WVWZZZ1JZXW000001";
-        let mut response = vec![0x62, 0xF1, 0x90];
-        response.extend_from_slice(vin);
-        let mut host = Fake::answering(&response);
+        let mut host = Fake::answering(&vin_response(b"WVWZZZ1JZXW000001"));
         assert_eq!(
             resolve(ecu(1, 1), &mut host),
             Reading::Text("WVWZZZ1JZXW000001".to_owned())
@@ -518,11 +585,48 @@ mod tests {
     }
 
     #[test]
-    fn non_ascii_bytes_cannot_be_decoded() {
-        let mut response = vec![0x62, 0xF1, 0x90];
-        response.extend_from_slice(b"WVWZZZ1JZXW00000\xE9");
+    fn trailing_bytes_cannot_be_decoded() {
+        let mut host = Fake::answering(&vin_response(b"WVWZZZ1JZXW000001X"));
+        assert_eq!(resolve(ecu(1, 1), &mut host), Reading::CannotBeDecoded);
+    }
+
+    #[test]
+    fn a_response_for_another_identifier_cannot_be_decoded() {
+        let mut response = vec![0x62, 0xF1, 0x86];
+        response.extend_from_slice(b"WVWZZZ1JZXW000001");
         let mut host = Fake::answering(&response);
         assert_eq!(resolve(ecu(1, 1), &mut host), Reading::CannotBeDecoded);
+    }
+
+    #[test]
+    fn a_request_reading_several_identifiers_is_not_decoded() {
+        let field = ServiceField {
+            request: vec![0x22, 0xF1, 0x90, 0xF1, 0x86],
+            ..vin_field()
+        };
+        let table = ServiceSources::new(vec![field]).unwrap();
+        let mut host = Fake::answering(&vin_response(b"WVWZZZ1JZXW000001"));
+        assert_eq!(
+            resolve_source(ecu(1, 1), &table, &mut host).unwrap(),
+            Reading::CannotBeDecoded
+        );
+    }
+
+    #[test]
+    fn non_ascii_bytes_cannot_be_decoded() {
+        let mut host = Fake::answering(&vin_response(b"WVWZZZ1JZXW00000\xE9"));
+        assert_eq!(resolve(ecu(1, 1), &mut host), Reading::CannotBeDecoded);
+    }
+
+    #[test]
+    fn an_all_space_text_cannot_be_decoded_but_padding_is_kept() {
+        let mut host = Fake::answering(&vin_response(&[b' '; 17]));
+        assert_eq!(resolve(ecu(1, 1), &mut host), Reading::CannotBeDecoded);
+        let mut host = Fake::answering(&vin_response(b"WVWZZZ1JZXW0000  "));
+        assert_eq!(
+            resolve(ecu(1, 1), &mut host),
+            Reading::Text("WVWZZZ1JZXW0000  ".to_owned())
+        );
     }
 
     #[test]
@@ -530,32 +634,33 @@ mod tests {
         let mut host = Fake {
             responses: vec![Err(HostError::NoResponse)],
             sent: Vec::new(),
+            inputs: FixedInputs::new(),
         };
-        let got = resolve_source(ecu(1, 1), &table(), &mut host, &mut FixedInputs::new());
+        let got = resolve_source(ecu(1, 1), &table(), &mut host);
         assert!(matches!(got, Err(HostError::NoResponse)));
     }
 
     #[test]
     fn a_runtime_input_source_goes_to_the_inputs() {
-        let mut inputs = FixedInputs::new().with(RuntimeInput::IgnitionOn, Reading::Value(1));
         let mut host = Fake::answering(&[]);
-        let read = |source, inputs: &mut FixedInputs, host: &mut Fake| {
-            resolve_source(source, &table(), host, inputs).unwrap()
-        };
+        host.inputs = FixedInputs::new().with(RuntimeInput::IgnitionOn, Reading::Value(1));
+        let table = table();
         assert_eq!(
-            read(
+            resolve_source(
                 Source::RuntimeInput(RuntimeInput::IgnitionOn),
-                &mut inputs,
+                &table,
                 &mut host
-            ),
+            )
+            .unwrap(),
             Reading::Value(1)
         );
         assert_eq!(
-            read(
+            resolve_source(
                 Source::RuntimeInput(RuntimeInput::EngineRunning),
-                &mut inputs,
+                &table,
                 &mut host
-            ),
+            )
+            .unwrap(),
             Reading::CannotBeEstablished
         );
         assert!(host.sent.is_empty());
@@ -571,30 +676,71 @@ mod tests {
     }
 
     #[test]
+    fn a_table_with_a_duplicate_is_refused() {
+        let err = ServiceSources::new(vec![vin_field(), vin_field()]).unwrap_err();
+        assert_eq!(
+            err,
+            TableError::Duplicate {
+                service_id: 1,
+                field_id: 1
+            }
+        );
+        let json = serde_json::to_string(&vec![vin_field(), vin_field()]).unwrap();
+        assert!(serde_json::from_str::<ServiceSources>(&json).is_err());
+    }
+
+    #[test]
+    fn a_request_sid_outside_the_uds_range_is_refused() {
+        for request in [
+            vec![],
+            vec![0x0F, 0x01],
+            vec![0x3F],
+            vec![0x7F, 0x22],
+            vec![0x62, 0xF1],
+        ] {
+            let field = ServiceField {
+                request,
+                offset: 0,
+                ..vin_field()
+            };
+            assert!(matches!(
+                ServiceSources::new(vec![field]),
+                Err(TableError::BadSid { .. })
+            ),);
+        }
+        let ok = ServiceField {
+            request: vec![0x3E],
+            offset: 0,
+            ..vin_field()
+        };
+        assert!(ServiceSources::new(vec![ok]).is_ok());
+    }
+
+    #[test]
     fn integer_fields_that_do_not_fit_are_refused() {
         let field = |length| ServiceField {
             service_id: 1,
             field_id: 1,
-            request: vec![0x22, 0, 1],
+            request: vec![0x22],
             offset: 0,
             length,
             encoding: Encoding::UnsignedBigEndian,
         };
-        let response = [vec![0x62], vec![0xFF; 9]].concat();
+        let response = |len| [vec![0x62], vec![0xFF; len]].concat();
         assert_eq!(
-            decode_field(&field(9), 0x22, &response),
+            decode_field(&field(9), 0x22, &response(9)),
             Reading::CannotBeDecoded
         );
         assert_eq!(
-            decode_field(&field(0), 0x22, &response),
+            decode_field(&field(0), 0x22, &response(0)),
             Reading::CannotBeDecoded
         );
         assert_eq!(
-            decode_field(&field(8), 0x22, &response),
+            decode_field(&field(8), 0x22, &response(8)),
             Reading::CannotBeDecoded
         );
         assert_eq!(
-            decode_field(&field(7), 0x22, &response),
+            decode_field(&field(7), 0x22, &response(7)),
             Reading::Value(0x00FF_FFFF_FFFF_FFFF)
         );
     }

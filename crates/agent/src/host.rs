@@ -124,6 +124,8 @@ pub struct WorkerHost {
     timings: Timings,
     /// When each `Wait` inquiry started.
     waits: HashMap<u64, Instant>,
+    /// The worker's id of `PDU_IOCTL_READ_VBATT`, once looked up.
+    vbatt_id: Option<u32>,
 }
 
 impl WorkerHost {
@@ -134,22 +136,13 @@ impl WorkerHost {
             link,
             timings,
             waits: HashMap::new(),
+            vbatt_id: None,
         }
     }
 
     /// Gives back the client and the link, to close it.
     pub fn into_parts(self) -> (WorkerClient, Link) {
         (self.client, self.link)
-    }
-
-    /// The runtime inputs the link can supply (supply voltage through the VCI).
-    pub fn inputs(&mut self) -> crate::inputs::LinkInputs<'_> {
-        crate::inputs::LinkInputs::new(
-            &self.handle,
-            &mut self.client,
-            &self.link,
-            self.timings.unary,
-        )
     }
 
     /// Sends `request` on the link and returns the whole final response (positive, or a
@@ -336,6 +329,27 @@ impl Progress {
 /// annex A.1).
 fn is_response_pending(response: &[u8]) -> bool {
     matches!(response, [0x7F, _, 0x78, ..])
+}
+
+/// The supply voltage comes from the VCI; no current VCI offers the other inputs (ADR-238).
+impl crate::inputs::RuntimeInputs for WorkerHost {
+    fn read(&mut self, input: diag_ir::RuntimeInput) -> Result<crate::inputs::Reading, HostError> {
+        use crate::inputs::Reading;
+        use diag_ir::RuntimeInput;
+        match input {
+            RuntimeInput::SupplyVoltageMillivolts => crate::inputs::read_supply_voltage(
+                &self.handle,
+                &mut self.client,
+                &self.link,
+                &mut self.vbatt_id,
+                self.timings.unary,
+            ),
+            RuntimeInput::ExternalSupplyConnected
+            | RuntimeInput::IgnitionOn
+            | RuntimeInput::EngineRunning
+            | RuntimeInput::VehicleSpeedKmh => Ok(Reading::CannotBeEstablished),
+        }
+    }
 }
 
 impl DiagHost for WorkerHost {

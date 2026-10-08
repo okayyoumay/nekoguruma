@@ -132,43 +132,65 @@ impl RuntimeInputs for FixedInputs {
     }
 }
 
+/// What the host knows about the VCI's `READ_VBATT` IOCTL. The lookup runs once per host (one
+/// job on one link); its outcome, "unsupported" included, is kept, so a later worker failure
+/// cannot turn an input the VCI does not offer into an error.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum VbattId {
+    /// Not looked up yet.
+    #[default]
+    Unknown,
+    /// The worker does not know the name: the VCI offers no voltage.
+    Unsupported,
+    Id(u32),
+}
+
+/// The cache entry a `GetObjectId` result gives. A J2534 worker answers an unknown name with
+/// `NotFound` or `InvalidArgument`; any other failure stays an error and is not cached.
+fn vbatt_lookup(found: Result<u32, HostError>) -> Result<VbattId, HostError> {
+    match found {
+        Ok(id) => Ok(VbattId::Id(id)),
+        Err(HostError::Rpc { status, .. })
+            if matches!(
+                status.code(),
+                tonic::Code::NotFound | tonic::Code::InvalidArgument
+            ) =>
+        {
+            Ok(VbattId::Unsupported)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// Reads the supply voltage from the VCI of `link`. The IOCTL id is resolved by name on the
-/// first call and kept in `cached_id`. When the J2534 worker does not know the name, the VCI
-/// offers no voltage: [`Reading::CannotBeEstablished`]. A D-PDU worker reports an unknown name
-/// as an internal error, which stays a [`HostError`] (it fails the check all the same). Blocks
-/// on `handle`, like the host's other primitives.
+/// first call and kept in `cached`, together with an "unsupported" outcome. When the J2534
+/// worker does not know the name, the VCI offers no voltage: [`Reading::CannotBeEstablished`].
+/// A D-PDU worker reports an unknown name as an internal error, which stays a [`HostError`]
+/// (it fails the check all the same). Blocks on `handle`, like the host's other primitives.
 pub(crate) fn read_supply_voltage(
     handle: &Handle,
     client: &mut WorkerClient,
     link: &Link,
-    cached_id: &mut Option<u32>,
+    cached: &mut VbattId,
     deadline: Duration,
 ) -> Result<Reading, HostError> {
-    let id = match *cached_id {
-        Some(id) => id,
-        None => {
-            let request = GetObjectIdRequest {
-                object_type: ObjectType::ObjtIoCtrl as i32,
-                shortname: IOCTL_READ_VBATT_NAME.to_owned(),
-            };
-            let found = handle.block_on(unary(
+    if *cached == VbattId::Unknown {
+        let request = GetObjectIdRequest {
+            object_type: ObjectType::ObjtIoCtrl as i32,
+            shortname: IOCTL_READ_VBATT_NAME.to_owned(),
+        };
+        let found = handle
+            .block_on(unary(
                 deadline,
                 "GetObjectId",
                 client.get_object_id(request),
-            ));
-            match found {
-                Ok(response) => *cached_id.insert(response.pdu_object_id),
-                Err(HostError::Rpc { status, .. })
-                    if matches!(
-                        status.code(),
-                        tonic::Code::NotFound | tonic::Code::InvalidArgument
-                    ) =>
-                {
-                    return Ok(Reading::CannotBeEstablished);
-                }
-                Err(error) => return Err(error),
-            }
-        }
+            ))
+            .map(|response| response.pdu_object_id);
+        *cached = vbatt_lookup(found)?;
+    }
+    let id = match *cached {
+        VbattId::Id(id) => id,
+        VbattId::Unsupported | VbattId::Unknown => return Ok(Reading::CannotBeEstablished),
     };
     let request = IoCtlRequest {
         handle: Some(io_ctl_request::Handle::ModuleHandle(link.module_handle)),
@@ -409,6 +431,27 @@ mod tests {
     #[test]
     fn vehicle_speed_is_reported_or_cannot_be_established() {
         fixed_reports(RuntimeInput::VehicleSpeedKmh, 87);
+    }
+
+    #[test]
+    fn an_unknown_vbatt_name_is_cached_as_unsupported() {
+        let rpc = |code| {
+            Err(HostError::Rpc {
+                rpc: "GetObjectId",
+                status: Box::new(tonic::Status::new(code, "no such object")),
+            })
+        };
+        assert_eq!(vbatt_lookup(Ok(7)).unwrap(), VbattId::Id(7));
+        assert_eq!(
+            vbatt_lookup(rpc(tonic::Code::NotFound)).unwrap(),
+            VbattId::Unsupported
+        );
+        assert_eq!(
+            vbatt_lookup(rpc(tonic::Code::InvalidArgument)).unwrap(),
+            VbattId::Unsupported
+        );
+        assert!(vbatt_lookup(rpc(tonic::Code::Unavailable)).is_err());
+        assert_eq!(VbattId::default(), VbattId::Unknown);
     }
 
     #[test]

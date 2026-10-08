@@ -124,8 +124,8 @@ pub struct WorkerHost {
     timings: Timings,
     /// When each `Wait` inquiry started.
     waits: HashMap<u64, Instant>,
-    /// The worker's id of `PDU_IOCTL_READ_VBATT`, once looked up.
-    vbatt_id: Option<u32>,
+    /// The worker's `PDU_IOCTL_READ_VBATT` id, or that it has none, once looked up.
+    vbatt_id: crate::inputs::VbattId,
 }
 
 impl WorkerHost {
@@ -136,7 +136,7 @@ impl WorkerHost {
             link,
             timings,
             waits: HashMap::new(),
-            vbatt_id: None,
+            vbatt_id: crate::inputs::VbattId::Unknown,
         }
     }
 

@@ -14,8 +14,9 @@
 //!   (ADR-245, consequences).
 //!
 //! "Cannot be established" and "cannot be decoded" are readings, not errors. A caller treats
-//! either as a failed check (ADR-229). Only a failure of the transport is an error
-//! ([`HostError`]).
+//! either as a failed check (ADR-229). A failure to reach or use the worker (a transport
+//! failure, a refused RPC, a request the policy refuses) is an error ([`HostError`]), which
+//! fails the check as well.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -74,8 +75,8 @@ impl Reading {
 
 /// The runtime inputs of the agent (`diag_ir::RuntimeInput`).
 pub trait RuntimeInputs {
-    /// Reads `input`. An input without a source gives [`Reading::CannotBeEstablished`]; only
-    /// a transport failure is an error.
+    /// Reads `input`. An input without a source gives [`Reading::CannotBeEstablished`]; a
+    /// failure to reach or use the worker is an error.
     fn read(&mut self, input: RuntimeInput) -> Result<Reading, HostError>;
 }
 

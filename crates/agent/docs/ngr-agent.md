@@ -83,16 +83,19 @@ requests, or any request to `sim-vci` in a debug build (ADR-247).
 The `inputs` module supplies what an interrupted-write restart reads (design 8.2.5, 8.9;
 ADR-229, ADR-245 item 2). `resolve_source` reads one `diag_ir::Source` and gives a `Reading`:
 an integer, a text, `CannotBeEstablished` or `CannotBeDecoded`. The last two are readings, not
-errors; a check treats them as failed. A failure of the transport stays a `HostError`.
+errors; a check treats them as failed. A failure to reach or use the worker (a transport
+failure, a refused RPC or a request the policy refuses) stays a `HostError`, which fails the
+check as well.
 
 - Runtime inputs (`RuntimeInputs`, implemented by `WorkerHost`, which is also the sender, so
   `resolve_source(source, &table, &mut host)` takes one value): the supply voltage is read
   through the worker's IoCtl RPC. The host looks up the id of `PDU_IOCTL_READ_VBATT` by name
   (`GetObjectId`, IOCTL object type) on first use and keeps it. When the J2534 worker does not
-  know the name, the VCI offers no voltage and the input reads "cannot be established"; a D-PDU
-  worker reports an unknown name as an internal error, which stays a `HostError`. External supply, ignition, engine
-  running and vehicle speed have no source on the current VCIs (ADR-238) and read the same
-  way. `FixedInputs` holds fixed readings for tests.
+  know the name, the VCI offers no voltage and the input reads "cannot be established"; a
+  D-PDU worker reports an unknown name as an internal error, which stays a `HostError`.
+  External supply, ignition, engine running and vehicle speed have no source on the current
+  VCIs (ADR-238) and read "cannot be established". `FixedInputs` holds fixed readings for
+  tests.
 - Service fields: `ServiceSources` is a table from `(service_id, field_id)` to the request
   (SID first), the offset after the response SID, the length and the encoding (unsigned
   big-endian integer, or printable ASCII). It is a stand-in until the declaration part has a
@@ -100,7 +103,7 @@ errors; a check treats them as failed. A failure of the transport stays a `HostE
   ReadDataByIdentifier entries (request `[0x22, hi, lo]`, offset 2): other services do not echo
   their request in a form the table can check, and a request for several identifiers lets the
   ECU leave some out. Building a table also refuses a duplicate id pair. The response must be
-  exactly the positive SID, the echoed identifier and the field. A source missing from the table, a negative, short or
-  long response, a wrong echo, or a field that does not fit its encoding reads as "cannot be
-  decoded". ASCII text keeps surrounding spaces as they are; a field of only spaces, or with
-  any byte outside 0x20 to 0x7E, cannot be decoded.
+  exactly the positive SID, the echoed identifier and the field. A source missing from the
+  table, a negative, short or long response, a wrong echo, or a field that does not fit its
+  encoding reads as "cannot be decoded". ASCII text keeps surrounding spaces as they are; a
+  field of only spaces, or with any byte outside 0x20 to 0x7E, cannot be decoded.

@@ -264,141 +264,228 @@ the predecessor repository these ADRs came from.
 - ADR-161
 - ADR-204 (`cll_tag` field removed)
 
-### COP / ComPrimitive Execution
+### COP Lifecycle & Status
 - ADR-002
+- ADR-021 (superseded by ADR-117)
+- ADR-053
+- ADR-058
+- ADR-059
+- ADR-085
+- ADR-086
+- ADR-087
+- ADR-111
+- ADR-112
+- ADR-117 (A2-24 SubscribeEvent gap closed by ADR-118)
+- ADR-118
+- ADR-128
+- ADR-140
+- ADR-143
+- ADR-180
+- ADR-182
+- ADR-204 (`cop_tag` added to `StartComPrimitiveRequest`/`EventItem`)
+- ADR-205 (hardens ADR-204's `cop_tag` correctness invariant: capture at liveness, never look up at emission; Decision item 1's operational definition sharpened, round 5, to also cover the entry-absence-flattened-into-tag-absence idiom and checking liveness after an irreversible side effect)
+
+### Response Matching & Binding
 - ADR-003
 - ADR-006
 - ADR-009
 - ADR-014
 - ADR-018
-- ADR-021 (superseded by ADR-117)
 - ADR-022 (ErrorData claim corrected by ADR-112)
-- ADR-044 (superseded by ADR-110)
+- ADR-061 (superseded)
+- ADR-097 (superseded)
+- ADR-098 (residual closed by ADR-143; RxFlag byte-1 scheme extended by ADR-146; amended by ADR-151; ADR-061-inherited RxStatus-CAN-ID premise narrowed by ADR-222)
+- ADR-100 (amended by ADR-151; Decision §4's `-1`-only `CP_CyclicRespTimeout` scope and Stage 3 boundary for created-receive-only COPs narrowly superseded by ADR-182)
+- ADR-101
+- ADR-148 (amended)
+- ADR-151
+- ADR-162
+- ADR-197
+
+### TX Message Construction
 - ADR-049
 - ADR-050 (RawMode=OFF scoping annotated by ADR-196)
 - ADR-051 (RawMode=OFF scoping annotated by ADR-196)
-- ADR-053
 - ADR-054
 - ADR-055 (extended by ADR-169)
-- ADR-056
-- ADR-057 (amended by ADR-102)
-- ADR-058
-- ADR-059
-- ADR-060 (RC21/23 request-time floor corrected by ADR-125)
-- ADR-061 (superseded)
 - ADR-062 (`CAN_29BIT_ID`/`ISO15765_ADDR_TYPE` discard rule scoped to RawMode=OFF by ADR-196)
+- ADR-116
+- ADR-121 (superseded by ADR-124)
+- ADR-124
+- ADR-166
+- ADR-167
+- ADR-169
+- ADR-171
+
+### ComParam Resolution Timing
+- ADR-044 (superseded by ADR-110)
 - ADR-063 (superseded)
 - ADR-064 (superseded)
 - ADR-066 (superseded)
 - ADR-067 (amended by ADR-110)
 - ADR-068
+- ADR-110
+
+### Poll Task & TX Queue
+- ADR-081
+- ADR-094
+- ADR-095
+- ADR-123
+- ADR-147
+- ADR-161
+- ADR-193
+
+### RawMode / ChecksumMode
+- ADR-196 (Decision item 1's protocol allowlist extended to hardware K-line, and Decision item 3b's `AccessTimingConfig::with_request` claim superseded, by ADR-198; allowlist further extended to SAE J1850/J1939 by ADR-200)
+- ADR-198 (Consequences' Repeat Messaging RawMode-rejection residual closed by ADR-199; Phase 3 residual closed by ADR-200)
+- ADR-200
+
+### ComParam Model & Mapping
+- ADR-017 (superseded by ADR-152)
+- ADR-023 (`ChannelKey` shape superseded by ADR-156)
+- ADR-027
+- ADR-028
+- ADR-042
+- ADR-062 (`CAN_29BIT_ID`/`ISO15765_ADDR_TYPE` discard rule scoped to RawMode=OFF by ADR-196)
+- ADR-067 (amended by ADR-110)
+- ADR-069 (amended; partially superseded by ADR-106; extended by ADR-156)
+- ADR-070
+- ADR-078 (superseded)
+- ADR-079 (items 12-13 superseded by ADR-114; item 15 superseded by ADR-135, then ADR-187)
+- ADR-103
+- ADR-106
+- ADR-114
+- ADR-116
+- ADR-130
+- ADR-133
+- ADR-148 (amended)
+- ADR-151
+- ADR-169
+- ADR-181
+- ADR-184
+- ADR-202 (its own RX-side per-ECU URID tagging limitation resolved by ADR-203)
+- ADR-204 (first invocation of ADR-178's "genuinely new RPC-level semantics" carve-out; ADR-178's own default policy otherwise unchanged)
+- ADR-218 (`iso22900-service`)
+- ADR-219 (`j2534-0404-service`)
+
+### Timing & Response Pending
+- ADR-018
+- ADR-037
+- ADR-056
+- ADR-057 (amended by ADR-102)
+- ADR-060 (RC21/23 request-time floor corrected by ADR-125)
+- ADR-102
+- ADR-104
+- ADR-125
+- ADR-146 (extended by ADR-150)
+- ADR-150
+
+### Tester Present
+- ADR-010 (superseded for tester-present by ADR-093; its shared-channel periodic-message-leak discipline reinstated for TP2.0 broadcast re-trigger by ADR-192)
+- ADR-083 (partially superseded by ADR-093)
+- ADR-084 (partially superseded by ADR-093; amended by ADR-137)
+- ADR-088 (amended; partially superseded by ADR-093; extended by ADR-099)
+- ADR-093 (its "ADR-010 fully superseded" claim narrowed to tester-present by ADR-192)
+- ADR-096
+- ADR-099
+- ADR-137
+- ADR-138
+- ADR-215
+
+### K-Line / UART Initialization
+- ADR-071
+- ADR-072
+- ADR-074
 - ADR-075
 - ADR-076 (legacy-path unconditional key-byte delivery narrowed by ADR-183 for PROTOCOL_UART_ECHO_BYTE_PS)
 - ADR-077
-- ADR-081
-- ADR-083 (partially superseded by ADR-093)
-- ADR-084 (partially superseded by ADR-093; amended by ADR-137)
-- ADR-085
-- ADR-086
-- ADR-087
-- ADR-088 (amended; partially superseded by ADR-093; extended by ADR-099)
-- ADR-093
-- ADR-094
-- ADR-095
-- ADR-096
-- ADR-097 (superseded)
-- ADR-098 (residual closed by ADR-143; RxFlag byte-1 scheme extended by ADR-146; amended by ADR-151; ADR-061-inherited RxStatus-CAN-ID premise narrowed by ADR-222)
-- ADR-099
-- ADR-100 (amended by ADR-151; Decision §4's `-1`-only `CP_CyclicRespTimeout` scope and Stage 3 boundary for created-receive-only COPs narrowly superseded by ADR-182)
-- ADR-101
-- ADR-102
-- ADR-110
-- ADR-111
-- ADR-112
-- ADR-116
-- ADR-117 (A2-24 SubscribeEvent gap closed by ADR-118)
-- ADR-118
-- ADR-123
-- ADR-125
-- ADR-128
-- ADR-137
-- ADR-138
-- ADR-140
-- ADR-143
-- ADR-146 (extended by ADR-150)
-- ADR-147
-- ADR-148 (amended)
-- ADR-150
-- ADR-151
-- ADR-161
-- ADR-162
-- ADR-166
-- ADR-167
-- ADR-169
-- ADR-171
-- ADR-180
-- ADR-182
 - ADR-183
-- ADR-193
-- ADR-196 (Decision item 1's protocol allowlist extended to hardware K-line, and Decision item 3b's `AccessTimingConfig::with_request` claim superseded, by ADR-198; allowlist further extended to SAE J1850/J1939 by ADR-200)
-- ADR-197
-- ADR-198 (Consequences' Repeat Messaging RawMode-rejection residual closed by ADR-199; Phase 3 residual closed by ADR-200)
-- ADR-200
-- ADR-204 (`cop_tag` added to `StartComPrimitiveRequest`/`EventItem`)
-- ADR-205 (hardens ADR-204's `cop_tag` correctness invariant: capture at liveness, never look up at emission; Decision item 1's operational definition sharpened, round 5, to also cover the entry-absence-flattened-into-tag-absence idiom and checking liveness after an irreversible side effect)
 
-### Channel Sharing & Filtering
+### J2534-2 Optional Features
+- ADR-152
+- ADR-153
+- ADR-156 (Phase 2a's `hw_protocol_id` handling corrected by ADR-157; Decision 3's `channel_index` proto-field mechanism superseded by ADR-178)
+- ADR-157 (`to_j2534_config_id` translation contract narrowly superseded by ADR-158)
+- ADR-158 (PR #30 round-1 ISO15765-rejection correction narrowly superseded by ADR-159; Decision item 1's `channel_index.is_some()` rejection superseded by ADR-213)
+- ADR-159 (Decision 3's functional-SF-limit conservatism widened by ADR-169; Decision item 5's `channel_index.is_some()` rejection superseded, and Decision item 7's `_CHx`-capacity Discovery deferral fulfilled, by ADR-213)
+- ADR-164 (Decision's SW `_CHx` Additional Channels deferral fulfilled by ADR-212)
+- ADR-168 (Seventh correction's Accepted residual on the general clause 6 dual-wire pin-pair-completeness gap resolved by ADR-201; Decision item 7's `_CHx` deferral fulfilled by ADR-211)
+- ADR-170 (Decision 8's legacy single-byte heuristic amended by ADR-183; Decision 1's `UART_ECHO_BYTE_CHx` deferral fulfilled by ADR-207; Consequences' `UEB_T*` access-path residual closed by ADR-216)
+- ADR-174 (Decision item 1's `HONDA_DIAGH_CHx` deferral fulfilled by ADR-208)
+- ADR-175 (Decision item 1's `J1708_CHx` deferral fulfilled by ADR-209)
+- ADR-176 (`IODeviceConfigList`/`IODeviceConfigEntry` `DataItem` shape superseded by ADR-178)
+- ADR-177 (`analog_sample_rate` request-field mechanism superseded by ADR-178; Consequences' remaining-parameters access-path residual closed by ADR-216)
+- ADR-178
+- ADR-179 (Decision 3's claim-registration atomicity/timeout-cancel mechanism and optional-CoptStartcomm-message scoping superseded by ADR-180; Decision 9's note amended by ADR-184; Decision 1's `J1939_CHx` deferral fulfilled by ADR-206)
+- ADR-185
+- ADR-188 (Stage 7b's passive-connection client-surface deferral fulfilled by ADR-190; Consequences §7's RxFlag-forwarding deferral resolved by ADR-191; §5's Stage 7c fulfilled by ADR-192; §7's `TP2_0_CHx` deferral fulfilled by ADR-210)
+- ADR-189
+- ADR-190 (its own "no client-visible establish/loss event" residual resolved by ADR-191)
+- ADR-191
+- ADR-192 (Decision item 2's in-flight-reservation/terminator-race mechanism superseded by ADR-193)
+- ADR-194
+- ADR-201
+- ADR-206
+- ADR-207
+- ADR-208
+- ADR-209
+- ADR-210
+- ADR-211 (Decision item 5's CAN FD/ISO15765-on-CAN-FD deferral fulfilled by ADR-213)
+- ADR-212
+- ADR-213
+- ADR-216
+
+### Message Filters
 - ADR-005 (superseded)
-- ADR-007 (J1939 source-address matching added by ADR-184)
 - ADR-008 (superseded)
-- ADR-010 (superseded for tester-present by ADR-093; its shared-channel periodic-message-leak discipline reinstated for TP2.0 broadcast re-trigger by ADR-192)
-- ADR-011
 - ADR-038 (superseded)
 - ADR-039 (pass-all fallback removed by ADR-122)
 - ADR-040 (partially superseded)
 - ADR-041
-- ADR-043
-- ADR-046
-- ADR-047
 - ADR-048 (extended by ADR-122)
-- ADR-065 (`ISO9141_NO_CHECKSUM` derivation for a RawMode=ON K-line CLL added by ADR-198)
-- ADR-068
-- ADR-070
-- ADR-079 (items 12-13 superseded by ADR-114; item 15 superseded by ADR-135, then ADR-187)
+- ADR-114
+- ADR-122
+- ADR-129
+- ADR-234
+
+### Channel Sharing & Locking
+- ADR-010 (superseded for tester-present by ADR-093; its shared-channel periodic-message-leak discipline reinstated for TP2.0 broadcast re-trigger by ADR-192)
+- ADR-011
 - ADR-080
 - ADR-081
 - ADR-082 (amended by ADR-129)
-- ADR-083 (partially superseded by ADR-093)
-- ADR-084 (partially superseded by ADR-093)
-- ADR-093 (its "ADR-010 fully superseded" claim narrowed to tester-present by ADR-192)
-- ADR-114
-- ADR-121 (superseded by ADR-124)
-- ADR-122
 - ADR-123
-- ADR-124
 - ADR-127
-- ADR-129
 - ADR-134
 - ADR-139
-- ADR-147
-- ADR-160
 - ADR-161
+
+### RX Routing
+- ADR-007 (J1939 source-address matching added by ADR-184)
+- ADR-043
+- ADR-068
 - ADR-162
-- ADR-164
-- ADR-165 (Condition-semantics paraphrase, Decision 6, and rounds-7/8/17 condition-0 carve-outs superseded by ADR-173; Decision 2's `IORepeatMessageSetup` `DataItem` variant superseded by ADR-178; round-4/5 FD_CAN_PS repeat-message padding and round-6 TX-size-range mechanism superseded by ADR-186; Decision 3's response-header/mask composition mechanism scoped to RawMode=OFF CLLs by ADR-199)
-- ADR-168
-- ADR-172 (bit-16 `HV_RX` untagged-delivery half tagged by ADR-191; bit-17/18 withhold unchanged)
-- ADR-173
 - ADR-180
 - ADR-184
-- ADR-186
-- ADR-192 (Decision item 2's in-flight-reservation/terminator-race mechanism superseded by ADR-193)
-- ADR-199 (Decision item 3's response-template addressing reuse superseded by ADR-214)
 - ADR-203
-- ADR-214
-- ADR-217 (Consequences' `DualChannel`-primary cross-row role-attribution residual closed by ADR-222)
 - ADR-222
-- ADR-234
+
+### CAN Channel Modes
+- ADR-046
+- ADR-047
+- ADR-065 (`ISO9141_NO_CHECKSUM` derivation for a RawMode=ON K-line CLL added by ADR-198)
+- ADR-160 (Consequences' `CAN_MIXED_FORMAT_ALL_FRAMES` deferral fulfilled by ADR-217)
+- ADR-164 (Decision's SW `_CHx` Additional Channels deferral fulfilled by ADR-212)
+- ADR-168 (Seventh correction's Accepted residual on the general clause 6 dual-wire pin-pair-completeness gap resolved by ADR-201; Decision item 7's `_CHx` deferral fulfilled by ADR-211)
+- ADR-172 (bit-16 `HV_RX` untagged-delivery half tagged by ADR-191; bit-17/18 withhold unchanged)
+- ADR-217 (Consequences' `DualChannel`-primary cross-row role-attribution residual closed by ADR-222)
+
+### Repeat Messaging
+- ADR-165 (Condition-semantics paraphrase, Decision 6, and rounds-7/8/17 condition-0 carve-outs superseded by ADR-173; Decision 2's `IORepeatMessageSetup` `DataItem` variant superseded by ADR-178; round-4/5 FD_CAN_PS repeat-message padding and round-6 TX-size-range mechanism superseded by ADR-186; Decision 3's response-header/mask composition mechanism scoped to RawMode=OFF CLLs by ADR-199)
+- ADR-173
+- ADR-186
+- ADR-199 (Decision item 3's response-template addressing reuse superseded by ADR-214)
+- ADR-214
 
 ### Error Handling
 - ADR-004 (superseded)
@@ -421,92 +508,6 @@ the predecessor repository these ADRs came from.
 - ADR-135 (superseded by ADR-187)
 - ADR-139
 - ADR-187
-
-### Protocol / ComParam Scope
-- ADR-017 (superseded by ADR-152)
-- ADR-023 (`ChannelKey` shape superseded by ADR-156)
-- ADR-027
-- ADR-028
-- ADR-037
-- ADR-042
-- ADR-056
-- ADR-060 (RC21/23 request-time floor corrected by ADR-125)
-- ADR-062 (`CAN_29BIT_ID`/`ISO15765_ADDR_TYPE` discard rule scoped to RawMode=OFF by ADR-196)
-- ADR-067
-- ADR-069 (amended; partially superseded by ADR-106; extended by ADR-156)
-- ADR-070
-- ADR-071
-- ADR-072
-- ADR-074
-- ADR-075
-- ADR-076 (legacy-path unconditional key-byte delivery narrowed by ADR-183 for PROTOCOL_UART_ECHO_BYTE_PS)
-- ADR-077
-- ADR-078 (superseded)
-- ADR-079 (items 12-13 superseded by ADR-114; item 15 superseded by ADR-135, then ADR-187)
-- ADR-083 (partially superseded by ADR-093)
-- ADR-084 (partially superseded by ADR-093; amended by ADR-137)
-- ADR-088 (amended; partially superseded by ADR-093; extended by ADR-099)
-- ADR-093
-- ADR-099
-- ADR-100
-- ADR-102
-- ADR-103
-- ADR-104
-- ADR-106
-- ADR-114
-- ADR-116
-- ADR-121 (superseded by ADR-124)
-- ADR-124
-- ADR-125
-- ADR-130
-- ADR-133
-- ADR-137
-- ADR-138
-- ADR-146 (extended by ADR-150)
-- ADR-148 (amended)
-- ADR-150
-- ADR-151
-- ADR-152
-- ADR-153
-- ADR-156 (Phase 2a's `hw_protocol_id` handling corrected by ADR-157; Decision 3's `channel_index` proto-field mechanism superseded by ADR-178)
-- ADR-157 (`to_j2534_config_id` translation contract narrowly superseded by ADR-158)
-- ADR-158 (PR #30 round-1 ISO15765-rejection correction narrowly superseded by ADR-159; Decision item 1's `channel_index.is_some()` rejection superseded by ADR-213)
-- ADR-159 (Decision 3's functional-SF-limit conservatism widened by ADR-169; Decision item 5's `channel_index.is_some()` rejection superseded, and Decision item 7's `_CHx`-capacity Discovery deferral fulfilled, by ADR-213)
-- ADR-164 (Decision's SW `_CHx` Additional Channels deferral fulfilled by ADR-212)
-- ADR-168 (Seventh correction's Accepted residual on the general clause 6 dual-wire pin-pair-completeness gap resolved by ADR-201; Decision item 7's `_CHx` deferral fulfilled by ADR-211)
-- ADR-169
-- ADR-170 (Decision 8's legacy single-byte heuristic amended by ADR-183; Decision 1's `UART_ECHO_BYTE_CHx` deferral fulfilled by ADR-207; Consequences' `UEB_T*` access-path residual closed by ADR-216)
-- ADR-174 (Decision item 1's `HONDA_DIAGH_CHx` deferral fulfilled by ADR-208)
-- ADR-175 (Decision item 1's `J1708_CHx` deferral fulfilled by ADR-209)
-- ADR-176 (`IODeviceConfigList`/`IODeviceConfigEntry` `DataItem` shape superseded by ADR-178)
-- ADR-177 (`analog_sample_rate` request-field mechanism superseded by ADR-178; Consequences' remaining-parameters access-path residual closed by ADR-216)
-- ADR-178
-- ADR-179 (Decision 3's claim-registration atomicity/timeout-cancel mechanism and optional-CoptStartcomm-message scoping superseded by ADR-180; Decision 9's note amended by ADR-184; Decision 1's `J1939_CHx` deferral fulfilled by ADR-206)
-- ADR-181
-- ADR-183
-- ADR-184
-- ADR-185
-- ADR-188 (Stage 7b's passive-connection client-surface deferral fulfilled by ADR-190; Consequences §7's RxFlag-forwarding deferral resolved by ADR-191; §5's Stage 7c fulfilled by ADR-192; §7's `TP2_0_CHx` deferral fulfilled by ADR-210)
-- ADR-189
-- ADR-190 (its own "no client-visible establish/loss event" residual resolved by ADR-191)
-- ADR-191
-- ADR-192
-- ADR-194
-- ADR-201
-- ADR-202 (its own RX-side per-ECU URID tagging limitation resolved by ADR-203)
-- ADR-204 (first invocation of ADR-178's "genuinely new RPC-level semantics" carve-out; ADR-178's own default policy otherwise unchanged)
-- ADR-206
-- ADR-207
-- ADR-208
-- ADR-209
-- ADR-210
-- ADR-211 (Decision item 5's CAN FD/ISO15765-on-CAN-FD deferral fulfilled by ADR-213)
-- ADR-212
-- ADR-213
-- ADR-215
-- ADR-216
-- ADR-218 (`iso22900-service`)
-- ADR-219 (`j2534-0404-service`)
 
 ### Configuration & Deployment
 - ADR-024 (default `VCI_CONFIG_PATH` and the non-Windows root superseded by ADR-228)

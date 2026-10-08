@@ -93,6 +93,7 @@ setup() {
   git commit -q -m base
   git branch base
   git checkout -q -b change
+  claim=""
 }
 
 failures=0
@@ -103,7 +104,11 @@ expect() {
   local name="$1" want="$2" reason="${3:-}" out
   git add -A
   git commit -q -m "$name"
-  out="$(scripts/classify-pr-risk.sh base)"
+  if [ -n "$claim" ]; then
+    out="$(scripts/classify-pr-risk.sh --claimed-item "$claim" base)"
+  else
+    out="$(scripts/classify-pr-risk.sh base)"
+  fi
   if [ "$(head -n1 <<<"$out")" != "$want" ] ||
     { [ -n "$reason" ] && ! grep -qF -- "$reason" <<<"$out"; }; then
     echo "FAIL: $name: expected $want${reason:+ with \"$reason\"}, got:" >&2
@@ -118,16 +123,48 @@ expect() {
 edit() { sed -i "$1" "$backlog"; }
 
 setup
+claim="- **P1**: First item. Done when: one."
 edit '/First item/d'
 expect "deleting one item is LOW" LOW
 
 setup
+edit '/First item/d'
+expect "deleting an item with no claimed item is HIGH" HIGH "no claimed item was given"
+
+setup
+claim="- **P1**: Third item. Done when: three."
+edit '/First item/d'
+expect "deleting an item other than the claimed one is HIGH" HIGH "other than the claimed one: - **P1**: First item"
+
+setup
+claim="- **P1**: First item, mistyped."
+edit '/Third item/a - **P2**: A new item.'
+expect "a claimed item that is not on the base is HIGH" HIGH "not an item of a backlog file"
+
+setup
+claim="- **P1**: Not an item, inside a fence."
+edit '/Third item/a - **P2**: A new item.'
+expect "a claimed line that is not an item is HIGH" HIGH "not an item of a backlog file"
+
+setup
+claim="- **P1**: First item. Done when: one."
+edit 's/First item. Done when: one./First item, rewritten. Done when: one./'
+expect "rewriting the claimed item in place is LOW" LOW
+
+setup
+claim="- **P2**: Second item. Done when: two."
+edit 's/First item. Done when: one./First item, rewritten. Done when: one./'
+expect "rewriting an item other than the claimed one is HIGH" HIGH "other than the claimed one"
+
+setup
+claim="- **P1**: First item. Done when: one."
 edit '/First item/d'
 edit '/Third item/a - **P2**: A residual. Done when: four.'
 edit '$a\\n## Area three\n\n- **P3**: New item. Done when: five.'
 expect "deleting one item and adding items and a section is LOW" LOW
 
 setup
+claim="- **\`a_flaky_test\`: fails one run in ten.**"
 edit '/a_flaky_test/,/Cause unknown/d'
 expect "deleting a whole flaky-test entry is LOW" LOW
 
@@ -198,6 +235,7 @@ edit '/^## Area two$/i ## Area zero\n\n### Known Flaky Tests\n'
 expect "adding a section with a repeated subsection heading is LOW" LOW
 
 setup
+claim="- **P2**: Fifth item. Done when: five."
 edit '/Fifth item/,$d'
 expect "deleting an item with a second paragraph and a fenced block is LOW" LOW
 
@@ -206,6 +244,7 @@ sed -i 's/$/\r/' "$backlog"
 expect "converting a backlog file to CRLF is HIGH" HIGH "changes the line endings"
 
 setup
+claim="- **P2**: Fifth item. Done when: five."
 edit '/^## Area three$/,$d'
 expect "closing a section's last item and removing its heading is LOW" LOW
 
@@ -236,6 +275,7 @@ printf '\n## Area six\n\n### Prioritized Backlog\n\n- **P2**: Seventh item.\n' >
 git add -A
 git commit -q -m "repeated subsections"
 git branch -f base
+claim="- **P2**: Sixth item."
 sed -i '/^## Area five$/,/Sixth item/d' "$other"
 expect "closing the last item under a repeated subsection heading is LOW" LOW
 
@@ -248,6 +288,7 @@ sed -i 's/$/\r/' "$backlog"
 git add -A
 git commit -q -m "crlf"
 git branch -f base
+claim="- **P1**: First item. Done when: one."
 edit '/First item/d'
 expect "deleting one item from a CRLF file is LOW" LOW
 
@@ -268,6 +309,7 @@ edit '/inside a four-backtick fence/d'
 expect "deleting a bullet inside a four-backtick fence is HIGH" HIGH "not a whole item"
 
 setup
+claim="- **P1**: Third item. Done when: three."
 edit '/Third item/d'
 expect "deleting an item after a fence holding a Resolved heading is LOW" LOW
 

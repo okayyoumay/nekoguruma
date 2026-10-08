@@ -160,8 +160,10 @@ The PR is a draft whose title starts with `[backlog-loop]`, set when it is creat
 carries the `backlog-loop` label. Create the label first if the repository does not have it, and
 check that the PR carries it.
 
-Run `scripts/classify-pr-risk.sh` (after the fetch in step 1) and copy its output into the PR description under a
-"Risk (shadow)" heading. The verdict is recorded only to compare it later with the maintainer's
+Run `scripts/classify-pr-risk.sh --claimed-item "<line>"` (after the fetch in step 1), where
+`<line>` is the first line of the claimed backlog item exactly as it reads on `origin/main`, and
+copy its output into the PR description under a "Risk (shadow)" heading. Without the option, or
+when the PR deletes any other item, the verdict is HIGH. The verdict is recorded only to compare it later with the maintainer's
 own judgement; it changes nothing about who merges. If the script exits with status 2, write
 "not classified" and the reason it printed. Then run `pr-review-loop`. Before it hands the PR
 to the maintainer, run the classifier again on the final head and replace the section if the

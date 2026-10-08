@@ -9,10 +9,15 @@
 # means new files that Cargo itself lists as integration-test targets
 # (`cargo metadata`, so cargo and jq must be installed). Under work/ only
 # edits to the existing backlog files that add items (and headings) and
-# delete at most one item in total are low risk (see check_work_backlog).
-# Anything else is HIGH: when in doubt, the answer is HIGH.
+# delete at most one item in total, the item the pull request claims, are
+# low risk (see check_work_backlog). Anything else is HIGH: when in doubt,
+# the answer is HIGH.
 #
-# Usage: scripts/classify-pr-risk.sh [base-ref]   (default: origin/main)
+# Usage: scripts/classify-pr-risk.sh [--claimed-item LINE] [base-ref]
+#   LINE is the first line of the backlog item the pull request works on,
+#   exactly as it reads on the base (the "- **P1**: ..." line). A deleted
+#   item is low risk only when it is that item; without the option every
+#   deleted item makes the verdict HIGH. base-ref defaults to origin/main.
 # Prints the verdict on the first line, then one "- reason" line per rule
 # that made it HIGH (or one line saying why it is LOW). Exit status is 0 for
 # both verdicts; 2 means the diff or the test targets could not be computed
@@ -21,6 +26,20 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+claimed=""
+claimed_given=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --claimed-item)
+      [ $# -ge 2 ] || { echo "--claimed-item needs a value" >&2; exit 2; }
+      claimed="$2"
+      claimed_given=1
+      shift 2
+      ;;
+    -*) echo "unknown option $1" >&2; exit 2 ;;
+    *) break ;;
+  esac
+done
 base="${1:-origin/main}"
 max_files=20
 max_lines=800
@@ -309,6 +328,36 @@ done < <(gitd --numstat "$merge_base" HEAD)
 if [ "${#work_deleted[@]}" -gt 1 ]; then
   reasons+=("deletes ${#work_deleted[@]} backlog items (limit 1: the item the pull request finished)")
 fi
+# The claimed item must be an item of a backlog file on the base, so that a
+# mistyped claim cannot match nothing and pass. Items are compared by their
+# first line as backlog_blocks writes it (tabs as \035).
+claimed_key="${claimed//$'\t'/$'\035'}"
+if [ "$claimed_given" -eq 1 ]; then
+  claimed_found=0
+  while IFS= read -r f; do
+    case "$f" in work/*backlog.md) ;; *) continue ;; esac
+    if ! blocks="$(git show "$merge_base:$f" | backlog_blocks)"; then
+      echo "cannot read the backlog file $f on $base" >&2
+      exit 2
+    fi
+    while IFS=$'\t' read -r t _ text; do
+      if [ "$t" = I ] && [ "${text%%$'\037'*}" = "$claimed_key" ]; then
+        claimed_found=1
+      fi
+    done <<<"$blocks"
+  done < <(git ls-tree --name-only "$merge_base" work/)
+  if [ "$claimed_found" -eq 0 ]; then
+    reasons+=("the claimed item is not an item of a backlog file on $base: ${claimed:0:70}")
+  fi
+fi
+for item in ${work_deleted[@]+"${work_deleted[@]}"}; do
+  shown="${item//$'\037'/ }"
+  if [ "$claimed_given" -eq 0 ]; then
+    reasons+=("deletes a backlog item, but no claimed item was given (--claimed-item): ${shown:0:70}")
+  elif [ "${item%%$'\037'*}" != "$claimed_key" ]; then
+    reasons+=("deletes a backlog item other than the claimed one: ${shown:0:70}")
+  fi
+done
 for item in ${work_deleted[@]+"${work_deleted[@]}"}; do
   for added_item in ${work_added[@]+"${work_added[@]}"}; do
     if [ "$item" = "$added_item" ]; then

@@ -240,6 +240,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-248](ADR-248-dependabot-auto-merge-trust-boundary.md) | Dependabot's Cargo Minor/Patch Group Merges Itself | Accepted | `.github/workflows/dependabot-auto-merge.yml`, `.github/dependabot.yml` |
 | [ADR-249](ADR-249-backlog-loop-iterations-start-from-a-fresh-branch.md) | Backlog Loop Iterations Start from a Fresh Branch at `origin/main` | Accepted | `.claude/skills/backlog-loop` (step 1), `codeql-alerts` |
 | [ADR-250](ADR-250-agent-host-flash-transfer.md) | The Agent Host Implements FlashTransfer with Its Own Block Count | Accepted | `agent` host, policy; `diag-ir` plan validation |
+| [ADR-251](ADR-251-copilot-re-review-only-after-fixes-that-need-it.md) | Copilot Re-Review Only After Fixes That Need It | Accepted | `.claude/skills/pr-review-loop` (Steps 0, 4-5), `.github/copilot-instructions.md`, `CLAUDE.md` |
 
 ## Status Legend
 
@@ -566,6 +567,7 @@ the predecessor repository these ADRs came from.
 - ADR-246
 - ADR-248
 - ADR-249
+- ADR-251
 
 ### Timestamps / Clock
 - ADR-057 (amended by ADR-102)

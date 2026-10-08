@@ -77,4 +77,12 @@ reviewing.
   and say the claim needs checking; do not state the requirement as fact.
 - One finding per root cause. Do not repeat a finding already answered on the PR unless new
   code reintroduces it.
+- Report everything you find in your first review of a pull request; do not hold findings back
+  for a later round.
+- On a re-review, report findings in code changed since your previous review; anywhere else,
+  report P0 or P1 findings whatever severity you would give them, and any finding you rate
+  Medium or higher. Only the remaining new findings, those you rate Low on code that has not
+  changed since your previous review and that are not P0 or P1, are not raised; if you notice
+  any, give only their number in the summary. Each re-review
+  is requested on purpose and spends the owner's AI credits, so it should converge.
 - Write in English.

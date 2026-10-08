@@ -85,7 +85,10 @@ is_crate_test() {
 # returns are dropped.
 backlog_blocks() {
   awk '
-    function flush() { if (item != "") { print "I\t" path "\t" item; item = "" } }
+    # Tabs separate the fields, so a tab inside a heading or a line is
+    # written as "\035".
+    function out(t, p, x) { gsub(/\t/, "\035", p); gsub(/\t/, "\035", x); print t "\t" p "\t" x }
+    function flush() { if (item != "") { out("I", path, item); item = "" } }
     { sub(/\r$/, "") }
     # A fence opens with three or more backticks or tildes after up to three
     # spaces, and closes with at least as many of the same character.
@@ -99,16 +102,16 @@ backlog_blocks() {
       rest = substr(line, length(run) + 1)
       if (run != "" && substr(run, 1, 1) == substr(fence, 1, 1) &&
         length(run) >= length(fence) && rest ~ /^[ \t]*$/) fence = ""
-      print "O\t" path "\t" $0; next
+      out("O", path, $0); next
     }
-    run != "" { flush(); fence = run; print "O\t" path "\t" $0; next }
+    run != "" { flush(); fence = run; out("O", path, $0); next }
     /^#+ / {
       flush()
       level = index($0, " ") - 1
       while (depth && lvl[depth] >= level) depth--
       path = ""
       for (d = 1; d <= depth; d++) path = path (d > 1 ? "\036" : "") head[d]
-      print "H\t" path "\t" $0
+      out("H", path, $0)
       lvl[++depth] = level; head[depth] = $0
       if ($0 ~ /^#+ (Status|Unverified Assumptions|Resolved)/) kind[depth] = "exempt"
       else if ($0 ~ /^#+ Known Flaky Tests/) kind[depth] = "flaky"
@@ -122,11 +125,11 @@ backlog_blocks() {
       path = path (depth > 1 ? "\036" : "") $0
       next
     }
-    /^[ \t]*$/ { if (item != "") gap = gap "\037"; else print "B\t" path "\t"; next }
+    /^[ \t]*$/ { if (item != "") gap = gap "\037"; else out("B", path, ""); next }
     /^[ \t]+[^ \t]/ && item != "" { item = item gap "\037" $0; gap = ""; next }
     { flush(); gap = "" }
     /^- / && area && ((sect == "" && $0 ~ /^- \*\*P[0-3]\*\*/) || sect == "flaky") { item = $0; next }
-    { print "O\t" path "\t" $0 }
+    { out("O", path, $0) }
     END { flush(); print "E\t\t" }
   '
 }

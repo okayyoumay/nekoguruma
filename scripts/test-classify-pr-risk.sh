@@ -161,6 +161,10 @@ edit '/Second item/i ### Known Flaky Tests (moved here)\n'
 expect "a heading inserted above existing items is HIGH" HIGH "moves items or sections"
 
 setup
+edit '/Second item/i ### Sub\tx\n'
+expect "a heading with a tab inserted above existing items is HIGH" HIGH "moves items or sections"
+
+setup
 edit '/Second item/d'
 printf -- '- **P2**: Second item. Done when: two.\n' >>"$other"
 expect "moving an item to another backlog file is HIGH" HIGH "moves a backlog item to another backlog file"

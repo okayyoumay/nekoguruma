@@ -69,7 +69,7 @@ portable-atomic = "1"
 # Server / agent
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["ws"] }
-base64 = "0.22"
+base64 = "0.23"
 getrandom = "0.3"
 
 # Agent: discovery (7.1)

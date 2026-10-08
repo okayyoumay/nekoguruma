@@ -53,6 +53,8 @@ fn write_program(dir: &Path, code: Vec<Op>) -> PathBuf {
     path
 }
 
+// Only the debug-only tests read the VIN through a worker.
+#[cfg(debug_assertions)]
 fn read_vin(dir: &Path) -> PathBuf {
     write_program(
         dir,
@@ -108,6 +110,25 @@ fn unreadable_program_exits_with_1() {
 #[test]
 fn refused_program_exits_with_1_before_resolving_the_vci() {
     let temp = TempDir::new("refused");
+    // SecurityAccess is refused in every build: the host does not implement it (ADR-247).
+    let program = write_program(
+        &temp.0,
+        vec![Op::PushBytes(0), Op::SecurityAccess { level: 1 }],
+    );
+    let output = ngr_agent()
+        .args(["run", "--vci", "none", "--program"])
+        .arg(program)
+        .output()
+        .expect("ngr-agent should run");
+    assert_fails_with(output, "refused");
+}
+
+/// A release build refuses every write before a worker starts (ADR-235 item 8, ADR-247); a
+/// debug build allows them on the simulator, so it cannot refuse them up front.
+#[cfg(not(debug_assertions))]
+#[test]
+fn a_write_is_refused_before_resolving_the_vci_in_a_release_build() {
+    let temp = TempDir::new("refused-write");
     // WriteDataByIdentifier is outside the read-only policy.
     let program = write_program(
         &temp.0,

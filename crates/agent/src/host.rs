@@ -145,7 +145,7 @@ impl WorkerHost {
     ///
     /// Every request leaves through here, so the policy is checked here (ADR-235 item 8).
     fn send_recv(&mut self, request: Vec<u8>) -> Result<Vec<u8>, HostError> {
-        crate::policy::check_request(&request)?;
+        crate::policy::check_request(&request, self.link.permission)?;
         let handle = self.handle.clone();
         handle.block_on(self.send_recv_async(request))
     }
@@ -338,14 +338,14 @@ impl DiagHost for WorkerHost {
         self.send_recv(read_dtc_bytes(mask))
     }
 
-    // Refused until the policy layer exists (ADR-235 item 8).
+    // Goes through `send_recv`, so the link's permission decides (ADR-235 item 8, ADR-247).
     fn routine_control(
         &mut self,
-        _routine: u16,
-        _sub: u8,
-        _payload: &[u8],
+        routine: u16,
+        sub: u8,
+        payload: &[u8],
     ) -> Result<Vec<u8>, HostError> {
-        Err(HostError::NotAllowed(0x31))
+        self.send_recv(routine_control_bytes(routine, sub, payload))
     }
 
     // Never `Ok(None)`: that means "still waiting" and the VM would wait forever (ADR-235

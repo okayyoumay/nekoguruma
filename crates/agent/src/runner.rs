@@ -15,7 +15,7 @@ use worker_host::client::WorkerClient;
 
 use crate::host::{HostError, Timings, WorkerHost};
 use crate::link::{self, LinkConfig};
-use crate::policy;
+use crate::policy::{self, Permission};
 
 /// Bounds of a job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,16 +73,23 @@ pub enum JobError {
 
 /// The checks [`run_program`] makes before it touches the worker: the program's schema version and
 /// size must suit this VM (`Vm::check_state`), its restart declaration must hold
-/// (`Program::validate`), and the policy must allow every request in it.
-/// A caller can make them before it launches a worker for the job. Operands are not checked
+/// (`Program::validate`), and the policy must allow every request in it at `permission`
+/// (ADR-247). A caller can make them before it launches a worker for the job, with
+/// [`policy::build_ceiling`] since the VCI is not known yet. Operands are not checked
 /// exhaustively: a bad one, such as a missing constant, fails when the VM reaches it.
-pub fn check_program(program: &Program) -> Result<(), JobError> {
+pub fn check_program(program: &Program, permission: Permission) -> Result<(), JobError> {
     // A program this VM cannot run must not reach the bus.
     Vm::new(program)
         .check_state(program)
         .map_err(|source| JobError::Vm { pc: 0, source })?;
     program.validate()?;
-    policy::check_program(program).map_err(|(pc, source)| JobError::Refused { pc, source })
+    refuse_beyond(program, permission)
+}
+
+/// The policy part of [`check_program`].
+fn refuse_beyond(program: &Program, permission: Permission) -> Result<(), JobError> {
+    policy::check_program(program, permission)
+        .map_err(|(pc, source)| JobError::Refused { pc, source })
 }
 
 /// Opens a link with `config`, runs `program` on it to the end and closes the link. Returns
@@ -96,17 +103,31 @@ pub fn check_program(program: &Program) -> Result<(), JobError> {
 /// the call or primitive in flight finishes, no further instruction runs, and the link is
 /// closed. That happens after the future is gone, so a caller that dropped it must not hand
 /// the worker to another job yet (ADR-235 consequences).
+///
+/// The program is checked against [`policy::build_ceiling`] before anything opens and against
+/// the link's own permission once the VCI is known (ADR-247).
 pub async fn run_program(
     client: WorkerClient,
     config: &LinkConfig,
     program: Program,
     limits: JobLimits,
 ) -> Result<VmState, JobError> {
+    run_program_within(client, config, program, limits, policy::build_ceiling()).await
+}
+
+/// [`run_program`] with the build's ceiling given, so tests can run under a lower one.
+async fn run_program_within(
+    client: WorkerClient,
+    config: &LinkConfig,
+    program: Program,
+    limits: JobLimits,
+    ceiling: Permission,
+) -> Result<VmState, JobError> {
     let handle = Handle::current();
     if handle.runtime_flavor() == RuntimeFlavor::CurrentThread {
         return Err(JobError::CurrentThreadRuntime);
     }
-    check_program(&program)?;
+    check_program(&program, ceiling)?;
     let config = config.clone();
 
     let cancel = CancelOnDrop(Arc::new(AtomicBool::new(false)));
@@ -144,22 +165,34 @@ fn run_job(
     let link = handle
         .block_on(link::open(&mut client, config, timings.unary))
         .map_err(JobError::Link)?;
+    // The VCI is known now. Nothing has been sent to the ECU yet, so a program that needs more
+    // than this link allows is refused with no effect on it.
+    if let Err(error) = refuse_beyond(program, link.permission) {
+        close_logged(&handle, &mut client, link, timings.unary);
+        return Err(error);
+    }
     let mut host = WorkerHost::new(handle.clone(), client, link, timings);
     let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
         run_on(program, &mut host, limits, cancelled)
     }))
     .unwrap_or(Err(JobError::Panicked));
     let (mut client, link) = host.into_parts();
-    // Closing on a runtime that is shutting down can panic; the job's result stands.
+    close_logged(&handle, &mut client, link, timings.unary);
+    result
+}
+
+/// Closes the link; the job's result stands whether or not that works, so a failure is only
+/// logged.
+fn close_logged(handle: &Handle, client: &mut WorkerClient, link: link::Link, deadline: Duration) {
+    // Closing on a runtime that is shutting down can panic.
     let closed = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        handle.block_on(link::close(&mut client, link, timings.unary))
+        handle.block_on(link::close(client, link, deadline))
     }));
     match closed {
         Ok(Ok(())) => {}
         Ok(Err(error)) => tracing::warn!(%error, "could not close the link"),
         Err(_) => tracing::warn!("closing the link panicked"),
     }
-    result
 }
 
 /// Sets the flag when the job's future is dropped.
@@ -313,12 +346,12 @@ mod tests {
             no_application: None,
         });
         assert!(matches!(
-            check_program(&bad),
+            check_program(&bad, Permission::ReadOnly),
             Err(JobError::Program(
                 diag_ir::ProgramError::BoundaryOutOfOrder { flash_session: 1 }
             ))
         ));
-        assert!(check_program(&program(Vec::new())).is_ok());
+        assert!(check_program(&program(Vec::new()), Permission::ReadOnly).is_ok());
     }
 
     #[test]
@@ -365,7 +398,7 @@ mod tests {
             no_application: None,
         });
         assert!(matches!(
-            check_program(&bad),
+            check_program(&bad, Permission::ReadOnly),
             Err(JobError::Program(
                 diag_ir::ProgramError::UnmappedPrecondition {
                     kind: diag_ir::PreconditionKind::Engine,
@@ -473,11 +506,12 @@ mod tests {
             Op::ServiceRequest { service: 0x22 },
             Op::ServiceRequest { service: 0x2E },
         ];
-        let result = run_program(
+        let result = run_program_within(
             unreachable_client(),
             &LinkConfig::iso15765(0x7E0, 0x7E8),
-            program(code),
+            program(code.clone()),
             JobLimits::default(),
+            Permission::ReadOnly,
         )
         .await;
         assert!(
@@ -491,14 +525,67 @@ mod tests {
             "{result:?}"
         );
         // Without the check, the same job reaches the worker.
-        let result = run_program(
+        let result = run_program_within(
             unreachable_client(),
             &LinkConfig::iso15765(0x7E0, 0x7E8),
             program(two_requests()[..2].to_vec()),
             JobLimits::default(),
+            Permission::ReadOnly,
         )
         .await;
         assert!(matches!(result, Err(JobError::Link(_))), "{result:?}");
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_program_with_a_write_reaches_the_worker_under_the_simulator_ceiling() {
+        let code = vec![
+            Op::PushBytes(0),
+            Op::ServiceRequest { service: 0x2E },
+            Op::RoutineControl {
+                routine: 0xFF01,
+                sub: 1,
+            },
+        ];
+        let result = run_program_within(
+            unreachable_client(),
+            &LinkConfig::iso15765(0x7E0, 0x7E8),
+            program(code.clone()),
+            JobLimits::default(),
+            Permission::Simulator,
+        )
+        .await;
+        assert!(matches!(result, Err(JobError::Link(_))), "{result:?}");
+        // The public entry point uses the build's ceiling, which a debug build sets to it.
+        let result = run_program(
+            unreachable_client(),
+            &LinkConfig::iso15765(0x7E0, 0x7E8),
+            program(code),
+            JobLimits::default(),
+        )
+        .await;
+        assert!(matches!(result, Err(JobError::Link(_))), "{result:?}");
+    }
+
+    #[test]
+    fn the_link_permission_refuses_what_the_ceiling_let_through() {
+        let write = program(vec![
+            Op::PushBytes(0),
+            Op::ServiceRequest { service: 0x22 },
+            Op::RoutineControl { routine: 1, sub: 1 },
+        ]);
+        assert!(matches!(
+            refuse_beyond(&write, Permission::ReadOnly),
+            Err(JobError::Refused {
+                pc: 2,
+                source: HostError::NotAllowed(0x31)
+            })
+        ));
+        assert!(
+            refuse_beyond(&program(two_requests()[..2].to_vec()), Permission::ReadOnly).is_ok()
+        );
+        #[cfg(debug_assertions)]
+        assert!(refuse_beyond(&write, Permission::Simulator).is_ok());
     }
 
     #[tokio::test(flavor = "multi_thread")]

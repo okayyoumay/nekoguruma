@@ -2,6 +2,7 @@
 name = "vci-discovery"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 roxmltree.workspace = true

@@ -49,15 +49,21 @@ jobs:
         env:
           EVENT: ${{ github.event_name }}
           BASE: ${{ github.event.pull_request.base.sha }}
+        # The diff runs on its own line so that a failing `git diff` fails the step (bash -e)
+        # instead of reading as "no matching files"; the jobs below then run anyway.
         run: |
-          if [ "$EVENT" != pull_request ] ||
-             git diff --name-only "$BASE" HEAD | grep -qvE '(\.md$|^docs/|^work/|^\.claude/)'; then
+          if [ "$EVENT" != pull_request ]; then
+            echo code=true >> "$GITHUB_OUTPUT"
+            echo deps=true >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          files="$(git diff --name-only "$BASE" HEAD)"
+          if grep -qvE '(\.md$|^docs/|^work/|^\.claude/)' <<< "$files"; then
             echo code=true >> "$GITHUB_OUTPUT"
           else
             echo code=false >> "$GITHUB_OUTPUT"
           fi
-          if [ "$EVENT" != pull_request ] ||
-             git diff --name-only "$BASE" HEAD | grep -qE '(^|/)Cargo\.(toml|lock)$|^\.cargo/'; then
+          if grep -qE '(^|/)Cargo\.(toml|lock)$|^\.cargo/' <<< "$files"; then
             echo deps=true >> "$GITHUB_OUTPUT"
           else
             echo deps=false >> "$GITHUB_OUTPUT"
@@ -142,7 +148,8 @@ jobs:
   # The workspace `rust-version` (Cargo.toml) is the oldest Rust the code must build with; every
   # other job uses stable. On pull requests this runs only when a manifest, the lockfile or
   # .cargo/ changes (Dependabot updates among them), since that is what usually raises the
-  # minimum; main runs it on every push, so code that needs a newer compiler shows up there.
+  # minimum; main runs it on every push that starts this workflow (the `paths-ignore` above skips
+  # documentation-only pushes), so code that needs a newer compiler shows up there.
   # Warnings are not denied: an older compiler can warn about lints it does not know yet.
   msrv:
     needs: changes

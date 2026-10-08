@@ -164,9 +164,10 @@ them.
 The `msrv` job checks the workspace with the Rust version in `Cargo.toml`'s `rust-version`
 (`cargo check --workspace --all-targets`); every other job uses stable. On pull requests it runs
 only when a `Cargo.toml`, `Cargo.lock` or `.cargo/` changes, which covers Dependabot's update pull
-requests (`.github/dependabot.yml`); main runs it on every push. Code that needs a newer compiler
-therefore shows up on main; check it locally with `cargo +<rust-version> check --workspace
---all-targets --locked` when you use a recently stabilized language or library feature.
+requests (`.github/dependabot.yml`); main runs it on every push that is not documentation-only
+(the workflow's `paths-ignore`). Code that needs a newer compiler therefore shows up on main;
+check it locally with `cargo +<rust-version> check --workspace --all-targets --locked` when you
+use a recently stabilized language or library feature.
 
 Compiler warnings fail CI: `core-linux`, `core-windows` and `worker-check` build with
 `RUSTFLAGS=-D warnings`, and `core-linux` runs `cargo fmt --check`. Clippy is not run in CI

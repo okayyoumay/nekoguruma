@@ -143,8 +143,11 @@ timing-sensitive to run in parallel on the Windows runner, so the `core-windows`
 `j2534-0404-service`, which has no Windows-specific code; main runs every test on Windows.
 
 CI (`.github/workflows/ci.yml`) also checks the worker crates for six targets and runs
-`scripts/abi-roundtrip.sh`. On pull requests the worker targets are only type-checked
-(`cargo check --target`); the release builds (cargo-zigbuild for Linux, llvm-mingw for the `*-pc-windows-gnullvm` Windows targets, all on Linux)
+`scripts/abi-roundtrip.sh`, which launches `j2534-0404-service` against `sim-vci` built in debug
+for a Linux worker target (ARM under qemu-user) with the ABI table's `unsigned long` width. On
+pull requests the six worker targets are type-checked (`worker-check`, `cargo check --target`) and
+`abi-roundtrip` launches the i686 and aarch64 builds; main launches all four Linux targets, and the
+release builds (cargo-zigbuild for Linux, llvm-mingw for the `*-pc-windows-gnullvm` Windows targets, all on Linux)
 run on main. On pull requests that change only documentation, `work/` or `.claude/`, the
 `changes` job in `ci.yml` skips the build jobs, which then count as passed required checks;
 `repo-checks.yml` always runs. Do not run cross-target builds locally unless asked; CI covers

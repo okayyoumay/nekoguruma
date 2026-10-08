@@ -48,6 +48,30 @@ Steps (`agent::check_program`, `agent::launch::launch_j2534_worker`, then `agent
    the worker. The policy is read-only, except that a debug build may send any request once
    the worker's VCI has identified itself as `sim-vci` (ADR-247); a program that needs more
    than the VCI allows is refused after the link opens, before its first instruction runs.
+   On that permission the `FlashTransfer` instruction also works (ADR-250); `SecurityAccess`
+   stays refused.
+
+## Data transfer
+
+`FlashTransfer` sends one TransferData request (service 0x36) per instruction and requires a
+positive response that echoes the block sequence counter; a negative response or a wrong echo
+fails the job (ADR-250). The instruction's `block` operand is constant per instruction, so the
+host ignores it and keeps its own count of the blocks of the transfer: the counter is 1 for the
+first block after a RequestDownload (0x34, a `ServiceRequest` answered positively) sent through
+the host, rises by one per confirmed block and continues at 0 after 0xFF (ISO 14229-1:2026
+clause 14.4). Only a positive 0x34 begins a transfer. RequestUpload (0x35), RequestTransferExit
+(0x37), RequestFileTransfer (0x38), DiagnosticSessionControl (0x10) and ECUReset (0x11) end it
+whatever the response, and so does any failed block: a negative TransferData response, a wrong
+echo or no response (a new RequestDownload is needed; a same-counter retry could leave a gap).
+A `FlashTransfer` with no tracked transfer is an error and sends nothing, and a
+`ServiceRequest` for 0x36 is refused, both before the link opens (`check_program`) and by
+the host. `Program::validate` refuses a plan with 0x10, 0x11, 0x35 or 0x38 between its
+RequestDownload and RequestTransferExit, or with a jump from the transfer back to the
+RequestDownload or before it, so a valid program does not end its transfer before the
+RequestTransferExit (ADR-250). `WorkerHost::transfer_block_index` gives the number of
+confirmed blocks (`Some(0)`: started, none yet), which the write-job journal records
+(ADR-244); it is a `u64`, so the journaling runner converts it for `commit_block` and never
+commits 0.
 
 ## Output and exit status
 

@@ -21,7 +21,8 @@ pub enum Permission {
     /// Only [`READ_ONLY_SERVICES`] (ADR-235 item 8).
     ReadOnly,
     /// Any request the host implements, on the simulated VCI of a debug build (ADR-247).
-    /// SecurityAccess and FlashTransfer are still refused: the host has no implementation yet.
+    /// The `FlashTransfer` instruction is covered too (ADR-250). The `SecurityAccess`
+    /// instruction is still refused: the host has no implementation yet.
     #[cfg(debug_assertions)]
     Simulator,
 }
@@ -97,6 +98,9 @@ pub fn check_program(program: &Program, permission: Permission) -> Result<(), (u
     for (pc, op) in program.code.iter().enumerate() {
         // Exhaustive, so a new instruction that sends something cannot slip past.
         let refused = match op {
+            // TransferData goes through `FlashTransfer` and the host's block count (ADR-250),
+            // whatever the permission; refused here so it fails before anything is erased.
+            Op::ServiceRequest { service: 0x36 } => Some(HostError::UseFlashTransfer),
             Op::ServiceRequest { service } => check_service(*service, permission).err(),
             // Always ReadDTCInformation.
             Op::ReadDtc { .. } => None,
@@ -106,9 +110,14 @@ pub fn check_program(program: &Program, permission: Permission) -> Result<(), (u
                 #[cfg(debug_assertions)]
                 Permission::Simulator => None,
             },
-            // The host implements neither yet, whatever the permission.
+            // The host does not implement it yet, whatever the permission.
             Op::SecurityAccess { .. } => Some(HostError::NotAllowed(0x27)),
-            Op::FlashTransfer { .. } => Some(HostError::NotAllowed(0x36)),
+            // TransferData rewrites the ECU's memory: simulator only (ADR-250).
+            Op::FlashTransfer { .. } => match permission {
+                Permission::ReadOnly => Some(HostError::NotAllowed(0x36)),
+                #[cfg(debug_assertions)]
+                Permission::Simulator => None,
+            },
             // Answered by the agent or the server; nothing reaches the ECU.
             Op::Wait { .. }
             | Op::HmiRequest { .. }
@@ -256,6 +265,14 @@ mod tests {
                 "{refused:?}"
             );
         }
+        let refused = check_program(
+            &program(vec![Op::PushBytes(0), Op::ServiceRequest { service: 0x36 }]),
+            READ_ONLY,
+        );
+        assert!(
+            matches!(refused, Err((1, HostError::UseFlashTransfer))),
+            "{refused:?}"
+        );
     }
 
     #[cfg(debug_assertions)]
@@ -292,7 +309,7 @@ mod tests {
         }
 
         #[test]
-        fn routines_pass_but_security_access_and_flash_transfer_do_not() {
+        fn routines_and_flash_transfer_pass_but_security_access_does_not() {
             check_program(
                 &program(vec![
                     Op::PushBytes(0),
@@ -302,20 +319,33 @@ mod tests {
                         routine: 0xFF01,
                         sub: 1,
                     },
+                    Op::PushBytes(0),
+                    Op::FlashTransfer { block: 0 },
                 ]),
                 SIMULATOR,
             )
             .unwrap();
-            for (op, sid) in [
-                (Op::SecurityAccess { level: 1 }, 0x27),
-                (Op::FlashTransfer { block: 0 }, 0x36),
-            ] {
-                let refused = check_program(&program(vec![Op::PushBytes(0), op]), SIMULATOR);
-                assert!(
-                    matches!(refused, Err((1, HostError::NotAllowed(s))) if s == sid),
-                    "{refused:?}"
-                );
-            }
+            let refused = check_program(
+                &program(vec![Op::PushBytes(0), Op::SecurityAccess { level: 1 }]),
+                SIMULATOR,
+            );
+            assert!(
+                matches!(refused, Err((1, HostError::NotAllowed(0x27)))),
+                "{refused:?}"
+            );
+            // TransferData only through FlashTransfer, refused before the link opens.
+            let refused = check_program(
+                &program(vec![
+                    Op::ServiceRequest { service: 0x34 },
+                    Op::PushBytes(0),
+                    Op::ServiceRequest { service: 0x36 },
+                ]),
+                SIMULATOR,
+            );
+            assert!(
+                matches!(refused, Err((2, HostError::UseFlashTransfer))),
+                "{refused:?}"
+            );
             let refused = check_program(
                 &program(vec![Op::ServiceRequest { service: 0x122 }]),
                 SIMULATOR,

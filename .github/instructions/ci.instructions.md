@@ -12,7 +12,8 @@ Flag as P1:
   build caching.
 - **Required checks**: a change that lets a required check be skipped and so pass without
   running, or that renames or removes a job the branch ruleset requires (`repo-checks`,
-  `core-linux`, `core-windows`, `worker-check`, `abi-roundtrip`).
+  `core-linux`, `core-windows`, `worker-check`, `abi-roundtrip`, `msrv`). `msrv` is skipped on
+  pull requests that change no `Cargo.toml`, `Cargo.lock` or `.cargo/` file; that skip is intended.
 - **Out-of-scope targets**: Windows workers target `*-pc-windows-gnullvm` only (ADR-227). An MSVC
   worker target or MSVC-only build path is P1.
 - **Tests weakened**: excluding tests, adding `--skip` filters or loosening a nextest profile to

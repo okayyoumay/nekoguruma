@@ -9,6 +9,6 @@ rustflags = ["-C", "target-feature=+crt-static"]
 # Prefer dependency versions that support the workspace's `rust-version`, so `cargo update` (and
 # Dependabot, which runs it) does not raise the minimum Rust version when a compatible version
 # exists. This is only a preference: when no compatible version satisfies a requirement, Cargo
-# still picks an incompatible one, and CI builds only with stable, so it would not notice.
+# still picks an incompatible one; the `msrv` job in .github/workflows/ci.yml catches that.
 [resolver]
 incompatible-rust-versions = "fallback"

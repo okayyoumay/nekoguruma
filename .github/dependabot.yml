@@ -1,7 +1,8 @@
 # Weekly version updates for the Cargo workspace and the GitHub Actions in .github/workflows.
-# Minor and patch updates arrive as one grouped pull request per ecosystem; major updates get a
-# pull request each, since they can change behaviour. A new release is proposed only after it
-# has been out for a week (cooldown), so a compromised or yanked release has time to surface.
+# Cargo minor and patch updates arrive as one grouped pull request, and each major Cargo update
+# gets its own, since it can change behaviour. All GitHub Actions updates, majors included, arrive
+# as one grouped pull request. A new release is proposed only after it has been out for a week
+# (cooldown), so a compromised or yanked release has time to surface.
 # Security updates are separate: they follow the repository's Dependabot alert settings and
 # ignore the schedule, grouping and cooldown below.
 version: 2

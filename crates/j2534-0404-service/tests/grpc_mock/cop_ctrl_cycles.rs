@@ -3938,8 +3938,9 @@ async fn handle_delay_reaps_a_siblings_cancelled_detached_registrant() {
 /// backlog over the gRPC stream measured consistently at ~40ms in this
 /// environment, so the ORIGINAL 40ms checkpoint was unknowingly racing that
 /// unrelated COP's own stale terminal event, not cop_a's -- explaining both
-/// the historical 2026-07-28 CI failure and the 4% isolated-rerun rate (see
-/// `docs/implementation-notes.md`'s Known Flaky Tests section) as a race
+/// the historical CI failure and the 4% isolated-rerun rate (see
+/// `docs/implementation-notes.md`'s "Test-suite reliability: past
+/// flaky-test root causes" section) as a race
 /// against backlog-replay latency, not against the exhaustive-drain timing
 /// this test is meant to exercise. Confirmed by direct instrumentation
 /// (temporary `eprintln!`s in both this test and `reap_expired_cyclic_

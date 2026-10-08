@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Checks docs/adr/: no duplicate ADR numbers, INDEX.md links every ADR file
-# and nothing else, and its theme sections list one existing ADR per line in
-# numeric order (one line per ADR keeps two pull requests that add to the
+# and nothing else, its theme sections list one existing ADR per line in
+# numeric order, and every ADR has at least one theme entry (one line per ADR keeps two pull requests that add to the
 # same theme from editing the same line). A duplicate number never conflicts in git (the two
 # files have different slugs), so this is the backstop for the number
 # reservation procedure (.claude/skills/adr-number-reservation/SKILL.md).
@@ -66,4 +66,15 @@ while IFS= read -r line; do
       ;;
   esac
 done <<<"$theme_errors"
+if ! grep -q '^## Classification by Theme$' docs/adr/INDEX.md; then
+  echo "docs/adr/INDEX.md has no \"Classification by Theme\" section" >&2
+  status=1
+fi
+for f in docs/adr/ADR-*.md; do
+  adr="$(sed -n 's/^\(ADR-[0-9][0-9]*\)-.*/\1/p' <<<"${f##*/}")"
+  if ! grep -q "^ADR $adr\$" <<<"$theme_errors"; then
+    echo "docs/adr/INDEX.md has no theme entry for $adr" >&2
+    status=1
+  fi
+done
 exit "$status"

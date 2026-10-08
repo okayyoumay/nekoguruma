@@ -38,10 +38,10 @@ the number of re-reviews is the lever available to the session.
    description and the hand-over message to the maintainer name the findings fixed after the
    last Copilot review, so the maintainer's review covers them.
 3. **Ask Copilot to converge.** `.github/copilot-instructions.md` asks Copilot to report
-   everything in its first review, and on a re-review to limit new findings to code changed
-   since its previous review plus P0 and P1 findings anywhere. P0 and P1 findings are reported
-   whatever severity Copilot gives them; only other new low-severity findings on unchanged code
-   are reduced to a count.
+   everything in its first review. On a re-review it reports findings in changed code, and on
+   unchanged code it reports P0 and P1 findings (whatever severity it gives them) and anything
+   it rates Medium or higher. Only Low-rated findings on unchanged code that are neither P0 nor
+   P1 are reduced to a count, so the convergence never hides a more serious finding.
 
 The severity comes from Copilot's own rating in the review summary, not from Claude's judgment,
 so the session cannot talk itself out of a re-review for a finding Copilot considered important.

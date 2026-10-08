@@ -93,9 +93,9 @@ check as well.
   (`GetObjectId`, IOCTL object type) on first use and keeps it. When the J2534 worker does not
   know the name, the VCI offers no voltage and the input reads "cannot be established"; a
   D-PDU worker reports an unknown name as an internal error, which stays a `HostError`.
-  The worker interface gives the agent no way to read external supply, ignition, engine
-  running or vehicle speed (`sim-vci` simulates only the battery voltage, ADR-238), so they read
-  "cannot be established". `FixedInputs` holds fixed readings for tests.
+  The worker interface has no defined source for external supply, ignition, engine running or
+  vehicle speed: raw pin voltages and analog inputs carry no agreed meaning for them, and
+  `sim-vci` simulates only the battery voltage (ADR-238). So they read "cannot be established". `FixedInputs` holds fixed readings for tests.
 - Service fields: `ServiceSources` is a table from `(service_id, field_id)` to the request
   (SID first), the offset after the response SID, the length and the encoding (unsigned
   big-endian integer, or printable ASCII). It is a stand-in until the declaration part has a

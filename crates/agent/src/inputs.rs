@@ -6,9 +6,10 @@
 //!
 //! - [`Source::RuntimeInput`]: a fact the agent supplies itself, through [`RuntimeInputs`].
 //!   [`crate::WorkerHost`] answers the supply voltage from the VCI (`PDU_IOCTL_READ_VBATT`) and
-//!   reports every other input as [`Reading::CannotBeEstablished`]: the worker interface gives
-//!   the agent no way to read external supply, ignition, engine state or vehicle speed, and
-//!   `sim-vci` simulates only the battery voltage (ADR-238). [`FixedInputs`] holds fixed
+//!   reports every other input as [`Reading::CannotBeEstablished`]: the worker interface has no
+//!   defined source for external supply, ignition, engine state or vehicle speed (raw pin
+//!   voltages and analog inputs carry no agreed meaning for them), and `sim-vci` simulates only
+//!   the battery voltage (ADR-238). [`FixedInputs`] holds fixed
 //!   readings, for tests and for later wiring.
 //! - [`Source::EcuService`]: a field of a diagnostic response, located through a
 //!   [`ServiceSources`] table. The table stands in until the declaration part has a decoder

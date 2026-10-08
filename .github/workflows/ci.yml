@@ -167,7 +167,7 @@ jobs:
   # statically, so the binaries need no DLL beyond those Windows itself provides; the last step
   # checks that.
   worker-windows:
-    if: true # TEMPORARY: verify on the pull request; removed before review
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     strategy:
       matrix:

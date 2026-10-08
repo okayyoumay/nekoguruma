@@ -22,6 +22,8 @@ base_backlog() {
   cat <<'EOF'
 > **TEMPORARY WORKING MATERIAL.** Scratch backlog for the classifier test.
 
+# Backlog
+
 ## Status
 
 - `crate-a`: a status bullet, not an item
@@ -156,8 +158,12 @@ printf '> **TEMPORARY WORKING MATERIAL.** New.\n\n## A\n\n- **P1**: x.\n' >"$w/n
 expect "adding a backlog file is HIGH" HIGH "adds the backlog file"
 
 setup
-edit '/^## Status$/i - **P1**: An item before any heading.\n'
+edit '/^# Backlog$/i - **P1**: An item before any heading.\n'
 expect "adding a priority bullet before the first heading is HIGH" HIGH "neither an item nor a heading"
+
+setup
+edit '/^## Status$/i - **P1**: An item under the title, outside every area.\n'
+expect "adding a priority bullet under the title is HIGH" HIGH "neither an item nor a heading"
 
 setup
 edit '/^## Area two$/i ## Area new\n\n- **P2**: New item.\n'

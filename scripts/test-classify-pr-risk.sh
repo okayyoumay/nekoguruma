@@ -156,6 +156,10 @@ printf '> **TEMPORARY WORKING MATERIAL.** New.\n\n## A\n\n- **P1**: x.\n' >"$w/n
 expect "adding a backlog file is HIGH" HIGH "adds the backlog file"
 
 setup
+edit '/^## Status$/i - **P1**: An item before any heading.\n'
+expect "adding a priority bullet before the first heading is HIGH" HIGH "neither an item nor a heading"
+
+setup
 edit '/^## Area two$/i ## Area new\n\n- **P2**: New item.\n'
 expect "adding a section in the middle of a file is LOW" LOW
 

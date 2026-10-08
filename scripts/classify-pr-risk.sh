@@ -72,7 +72,8 @@ is_crate_test() {
 
 # Prints one backlog file as blocks, one per line: the type, a tab, the
 # headings the block sits under (joined by "\036"), a tab, the text. An item
-# (I) is a top-level "- **P0**" .. "- **P3**" bullet in an item section, or
+# (I) is a top-level "- **P0**" .. "- **P3**" bullet in an item section (a
+# bullet before the first heading is in no section and is O), or
 # any top-level bullet in a Known Flaky Tests section, with its indented
 # continuation lines (also after a blank line) joined by "\037". Headings are
 # H, blank lines B, everything else (the header line, prose, Status bullets,
@@ -108,7 +109,7 @@ backlog_blocks() {
     /^[ \t]*$/ { if (item != "") gap = gap "\037"; else print "B\t" path "\t"; next }
     /^[ \t]+[^ \t]/ && item != "" { item = item gap "\037" $0; gap = ""; next }
     { flush(); gap = "" }
-    /^- / && ((sect == "" && $0 ~ /^- \*\*P[0-3]\*\*/) || sect == "flaky") { item = $0; next }
+    /^- / && depth && ((sect == "" && $0 ~ /^- \*\*P[0-3]\*\*/) || sect == "flaky") { item = $0; next }
     { print "O\t" path "\t" $0 }
     END { flush(); print "E\t\t" }
   '

@@ -103,11 +103,12 @@ fn library_abi(library: &std::path::Path) -> Abi {
 /// The service binary must be built for the library's ABI. A launcher script (a target run under
 /// qemu-user) is not checked; the script that writes it names the target's build.
 fn check_service_abi(service: &std::path::Path, abi: Abi) {
-    let mut magic = [0u8; 4];
-    let read = std::fs::File::open(service)
-        .and_then(|mut file| std::io::Read::read(&mut file, &mut magic))
+    // Up to four bytes, however many reads that takes: a short read must not skip the check.
+    let mut magic = Vec::with_capacity(4);
+    std::fs::File::open(service)
+        .and_then(|file| std::io::Read::read_to_end(&mut std::io::Read::take(file, 4), &mut magic))
         .unwrap_or_else(|error| panic!("{}: {error}", service.display()));
-    if magic[..read].starts_with(b"\x7FELF") || magic[..read].starts_with(b"MZ") {
+    if magic.starts_with(b"\x7FELF") || magic.starts_with(b"MZ") {
         let service_abi = worker_host::abi::detect_file(service)
             .unwrap_or_else(|error| panic!("{}: {error}", service.display()));
         assert_eq!(

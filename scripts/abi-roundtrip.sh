@@ -15,7 +15,10 @@
 # (ARM targets under qemu-user, with the target's libraries from the cross
 # sysroot); a Windows target runs on a Windows host under Git Bash (win-x86
 # under WOW64). Both crates must be built for the target in the debug profile,
-# which keeps the VCI_CONFIG_PATH override the test uses (ADR-073).
+# which keeps the VCI_CONFIG_PATH override the test uses (ADR-073). With
+# ABI_TEST set to a prebuilt end-to-end test executable (built with
+# `cargo test --no-run` for any target the host runs), the script runs that
+# instead of building the test with cargo, so the host needs no Rust toolchain.
 set -euo pipefail
 
 TARGET="${1:-i686-unknown-linux-gnu}"
@@ -123,9 +126,13 @@ case "$TARGET" in
 esac
 # The test must run, not be filtered or compiled out: require exactly one passed test.
 OUTPUT="$WORK/test.log"
+if [[ -n "${ABI_TEST:-}" ]]; then
+  TEST=("$ABI_TEST")
+else
+  TEST=(cargo test --locked -p j2534-0404-service --test sim_vci_end_to_end --)
+fi
 NGR_ABI_SERVICE="$SERVICE" NGR_ABI_LIBRARY="$LIBRARY" NGR_ABI_EXPECT="$ABI" \
-  cargo test --locked -p j2534-0404-service --test sim_vci_end_to_end -- \
-  --exact service_reads_the_vin_from_sim_vci --nocapture 2>&1 | tee "$OUTPUT"
+  "${TEST[@]}" --exact service_reads_the_vin_from_sim_vci --nocapture 2>&1 | tee "$OUTPUT"
 if ! grep -q '^test result: ok. 1 passed;' "$OUTPUT"; then
   echo "ABI launch test: FAILED for $TARGET ($ABI): the test did not run and pass" >&2
   exit 1

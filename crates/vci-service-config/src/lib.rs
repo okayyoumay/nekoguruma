@@ -544,9 +544,9 @@ fn known_folder(rfid: &windows_sys::core::GUID) -> PathBuf {
 
     let mut path_ptr: *mut u16 = std::ptr::null_mut();
     // SAFETY: `rfid` is a reference to a valid GUID constant; `path_ptr` is
-    // initialised to null and will be populated by the API; passing 0 for the
+    // initialised to null and will be populated by the API; passing a null
     // access token requests the current-user context.
-    let hr = unsafe { SHGetKnownFolderPath(rfid, 0, 0, &mut path_ptr) };
+    let hr = unsafe { SHGetKnownFolderPath(rfid, 0, std::ptr::null_mut(), &mut path_ptr) };
     if hr != 0 {
         panic!("SHGetKnownFolderPath failed: HRESULT {hr:#010x}");
     }

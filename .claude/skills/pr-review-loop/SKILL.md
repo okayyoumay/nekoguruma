@@ -27,6 +27,12 @@ automatic Copilot reviews in a ruleset; they would run on every push and spend m
 credits on heads the loop does not need reviewed. Leave the review effort at the owner's
 default; do not raise it.
 
+**PRs that change only `work/` (ADR-251).** If every file the PR changes against `main` is under
+`work/`, request no Copilot review. `scripts/check-backlog.sh` and `scripts/check-work-refs.sh`
+(which `repo-checks.yml` also runs) cover the backlog format; run them and the Step 3 checks
+that apply, then go to Step 5. If a later push makes the PR change any file outside `work/`,
+request Copilot at that point and run the loop as usual from Step 1.
+
 Copilot's review appears in the PR's reviews within a few minutes. A review with findings is a
 "Commented" review whose summary lists them, with most of them also as inline comments in the
 same review. A review that finds nothing is usually an "Approved" review whose summary says
@@ -229,7 +235,8 @@ fixed after the last Copilot review.
 ## Step 5: close out
 
 When a round is clean, a no-change round ended the loop (Step 3), a pushed round ended it
-without a re-request (Step 4), or the fallback review in Step 0 is done:
+without a re-request (Step 4), a PR that changes only `work/` skipped Copilot (Step 0), or the
+fallback review in Step 0 is done:
 
 1. **Nothing deferred only in the conversation.** Go through the loop's history: follow-ups any
    agent or you called "deferred", "out of scope" or "worth a separate look", `design-advisor`

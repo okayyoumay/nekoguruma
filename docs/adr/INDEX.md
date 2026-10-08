@@ -239,7 +239,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-247](ADR-247-debug-builds-may-write-to-sim-vci.md) | Debug Builds May Send Write Requests to `sim-vci` | Accepted | `agent` policy, link, host, runner |
 | [ADR-248](ADR-248-dependabot-auto-merge-trust-boundary.md) | Dependabot's Cargo Minor/Patch Group Merges Itself | Accepted | `.github/workflows/dependabot-auto-merge.yml`, `.github/dependabot.yml` |
 | [ADR-249](ADR-249-backlog-loop-iterations-start-from-a-fresh-branch.md) | Backlog Loop Iterations Start from a Fresh Branch at `origin/main` | Accepted | `.claude/skills/backlog-loop` (step 1), `codeql-alerts` |
-| [ADR-251](ADR-251-copilot-re-review-only-after-fixes-that-need-it.md) | Copilot Re-Review Only After Fixes That Need It | Accepted | `.claude/skills/pr-review-loop` (Steps 4-5), `.github/copilot-instructions.md`, `CLAUDE.md` |
+| [ADR-251](ADR-251-copilot-re-review-only-after-fixes-that-need-it.md) | Copilot Re-Review Only After Fixes That Need It | Accepted | `.claude/skills/pr-review-loop` (Steps 0, 4-5), `.github/copilot-instructions.md`, `CLAUDE.md` |
 
 ## Status Legend
 

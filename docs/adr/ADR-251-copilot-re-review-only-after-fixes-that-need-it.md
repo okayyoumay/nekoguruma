@@ -2,7 +2,7 @@
 
 **Date:** 2026-10-08
 **Status:** Accepted
-**Affects:** `.claude/skills/pr-review-loop/SKILL.md` (Steps 4 and 5), `.github/copilot-instructions.md` ("Writing findings"), `CLAUDE.md` ("Pull requests")
+**Affects:** `.claude/skills/pr-review-loop/SKILL.md` (Steps 0, 4 and 5), `.github/copilot-instructions.md` ("Writing findings"), `CLAUDE.md` ("Pull requests")
 
 ## Context
 
@@ -43,12 +43,21 @@ the number of re-reviews is the lever available to the session.
    it rates Medium or higher. Only Low-rated findings on unchanged code that are neither P0 nor
    P1 are reduced to a count, so the convergence never hides a more serious finding.
 
+4. **No Copilot review for `work/`-only pull requests.** A pull request whose every changed
+   file is under `work/` gets no Copilot review at all. Those files are temporary task lists
+   whose format `scripts/check-backlog.sh` and `scripts/check-work-refs.sh` already check in
+   CI, and the maintainer reviews their content. Once a push makes the pull request change any
+   file outside `work/`, the normal loop starts.
+
 The severity comes from Copilot's own rating in the review summary, not from Claude's judgment,
 so the session cannot talk itself out of a re-review for a finding Copilot considered important.
 
 ## Consequences
 
-- Loops like the backlog re-triage above end once the remaining findings are Low-rated Markdown
+- Backlog re-triage pull requests like the one above, which change only `work/`, now cost no
+  Copilot review (Decision item 4). Copilot's findings on them (duplicated or bundled items,
+  stale counts in the description) are left to the maintainer's review.
+- Other loops end once the remaining findings are Low-rated Markdown
   fixes. Medium-rated findings still trigger a re-review, so the saving on such loops depends on
   the convergence instruction (Decision item 3) as well; its effect on Copilot is to be judged
   from the next pull requests.

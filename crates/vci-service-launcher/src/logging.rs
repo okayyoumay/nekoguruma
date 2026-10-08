@@ -158,11 +158,18 @@ mod eventlog {
 
     // ── Layer implementation (Windows only) ───────────────────────────────────
 
-    // In windows-sys 0.52, HANDLE = isize, which is Send + Sync — no wrapper needed.
+    // HANDLE is a raw pointer, which is neither Send nor Sync, but tracing layers must be both.
     #[cfg(windows)]
     struct EventLogLayer {
         handle: windows_sys::Win32::Foundation::HANDLE,
     }
+
+    // SAFETY: the handle is an event log handle owned by this layer and closed only in `Drop`.
+    // `ReportEventW` may be called on it from any thread, concurrently.
+    #[cfg(windows)]
+    unsafe impl Send for EventLogLayer {}
+    #[cfg(windows)]
+    unsafe impl Sync for EventLogLayer {}
 
     #[cfg(windows)]
     impl EventLogLayer {
@@ -174,7 +181,7 @@ mod eventlog {
                     source_wide.as_ptr(),
                 )
             };
-            if handle == 0 {
+            if handle.is_null() {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(Self { handle })

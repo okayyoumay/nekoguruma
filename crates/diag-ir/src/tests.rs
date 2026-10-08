@@ -2044,6 +2044,36 @@ fn a_jump_after_the_erase_cannot_skip_the_request_download() {
     assert_eq!(program_with(1).validate(), Ok(()));
 }
 
+/// Between the RequestDownload and the RequestTransferExit, no request may end the transfer
+/// (ADR-250); before the RequestDownload, the same requests are allowed.
+#[test]
+fn no_request_may_end_the_transfer_before_its_exit() {
+    for service in [0x10, 0x11, 0x35, 0x38] {
+        let mut program = flow_program(|c| {
+            c[2] = Op::ServiceRequest { service: 0x34 };
+            c[3] = Op::ServiceRequest { service };
+            c[4] = Op::ServiceRequest { service: 0x37 };
+        });
+        program.flash[0].boundaries.transfer_exit_pc = 4;
+        assert_eq!(
+            program.validate(),
+            Err(ProgramError::TransferInterrupted {
+                flash_session: 1,
+                pc: 3,
+                service
+            }),
+            "{service:#04x}"
+        );
+        let mut program = flow_program(|c| {
+            c[2] = Op::ServiceRequest { service };
+            c[3] = Op::ServiceRequest { service: 0x34 };
+            c[4] = Op::ServiceRequest { service: 0x37 };
+        });
+        program.flash[0].boundaries.transfer_exit_pc = 4;
+        assert_eq!(program.validate(), Ok(()), "{service:#04x}");
+    }
+}
+
 /// After a routine-control erase, no block may be sent before the RequestDownload.
 #[test]
 fn transfer_data_must_follow_the_request_download() {

@@ -2,7 +2,7 @@
 
 **Date:** 2026-10-08
 **Status:** Accepted
-**Affects:** `agent` (`src/host.rs`, `src/policy.rs`), `j2534-0404-service` (`tests/agent_flash_transfer.rs`), ADR-247 Decision item 4
+**Affects:** `agent` (`src/host.rs`, `src/policy.rs`), `diag-ir` (`src/recovery.rs`), `j2534-0404-service` (`tests/agent_flash_transfer.rs`), ADR-245 item 6, ADR-247 Decision item 4
 
 ## Context
 
@@ -56,6 +56,12 @@ instruction would be an IR schema change (ADR-245 item 7).
    covers `RoutineControl`, and the read-only permission refuses it (service 0x36). This amends
    ADR-247 Decision item 4: only the refusal of `FlashTransfer` is superseded. The
    `SecurityAccess` instruction stays refused, because the host still has no implementation.
+7. **The validator keeps a plan's transfer whole.** `Program::validate` refuses a flash
+   recovery plan with DiagnosticSessionControl (0x10), ECUReset (0x11), RequestUpload (0x35)
+   or RequestFileTransfer (0x38) between its RequestDownload and its RequestTransferExit
+   (`ProgramError::TransferInterrupted`). Each of them ends the host's tracked transfer (item
+   3), so a later `FlashTransfer` would fail only after the erase. This adds a check to the
+   list of ADR-245 item 6; before the RequestDownload they stay allowed.
 
 ## Consequences
 
@@ -71,7 +77,7 @@ instruction would be an IR schema change (ADR-245 item 7).
 - A `ServiceRequest` for TransferData (0x36) is refused before the link opens
   (`policy::check_program`), not only by the host, so a program carrying one fails before
   anything is erased.
-- DiagnosticSessionControl, ECUReset, RequestUpload or RequestFileTransfer between the
-  RequestDownload and the transfer's end ends the host's tracked transfer even when the ECU
-  keeps its own, so a later `FlashTransfer` fails the job after the erase. That fails safe;
-  rejecting such a program before it runs is left to the validator.
+- A program with DiagnosticSessionControl, ECUReset, RequestUpload or RequestFileTransfer
+  inside a plan's transfer is refused when it loads (item 7), before anything is erased. A
+  program that downloads is always inside a plan (ADR-245 item 6), so the host's end rules
+  of item 3 apply at run time only to requests the validator already let through.

@@ -1,7 +1,7 @@
 # ADR-245: The IR's Restart Declaration Lives in the Procedure Part
 
 **Date:** 2026-10-07
-**Status:** Accepted
+**Status:** Accepted (item 6 extended by ADR-250)
 **Affects:** `crates/diag-ir` (`src/recovery.rs`, `Program`, `VmState`, `IR_SCHEMA_VERSION`, `schema/ir.fbs` `FlashSession`), `crates/agent` (`check_program`), `docs/system-architecture.md` (8.2.5, 8.9)
 
 ## Context
@@ -89,6 +89,8 @@ runner in M1.
    - the boundaries are ordered and inside the code;
    - a plan holds one RequestDownload, no transfer before it and no RequestTransferExit but
      its declared one;
+   - between the RequestDownload and the RequestTransferExit, no DiagnosticSessionControl,
+     ECUReset, RequestUpload or RequestFileTransfer ends the transfer (added by ADR-250);
    - `erase_pc` is a routine control or a RequestDownload, and `transfer_exit_pc` a
      RequestTransferExit;
    - download requests and flash transfers appear only between a plan's erase and its

@@ -318,6 +318,14 @@ pub enum ProgramError {
     #[error("flash session {flash_session}: the transfer at {pc} comes before the RequestDownload")]
     TransferBeforeRequestDownload { flash_session: u32, pc: u32 },
     #[error(
+        "flash session {flash_session}: service {service:#04x} at {pc} ends the transfer between the RequestDownload and the RequestTransferExit"
+    )]
+    TransferInterrupted {
+        flash_session: u32,
+        pc: u32,
+        service: u16,
+    },
+    #[error(
         "flash session {flash_session}: the subroutine called at {pc} can reach the plan; a plan runs only at the top level"
     )]
     PlanInSubroutine { flash_session: u32, pc: u32 },
@@ -545,6 +553,17 @@ impl Program {
                     if downloads == 0 =>
                 {
                     return Err(ProgramError::TransferBeforeRequestDownload { flash_session, pc });
+                }
+                // A session change, a reset, an upload or a file transfer ends the transfer the
+                // agent's host tracks (ADR-250), so a later block would fail after the erase.
+                Op::ServiceRequest {
+                    service: service @ (0x10 | 0x11 | 0x35 | 0x38),
+                } if downloads > 0 => {
+                    return Err(ProgramError::TransferInterrupted {
+                        flash_session,
+                        pc,
+                        service,
+                    });
                 }
                 _ => false,
             };

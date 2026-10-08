@@ -7,8 +7,10 @@
 # LOW means every changed file is on the allowlist below, i.e. the pull
 # request's own CI covers everything the change can affect; for tests that
 # means new files that Cargo itself lists as integration-test targets
-# (`cargo metadata`, so cargo and jq must be installed). Anything else is
-# HIGH: when in doubt, the answer is HIGH.
+# (`cargo metadata`, so cargo and jq must be installed). Under work/ only
+# edits to the existing backlog files that add items (and headings) and
+# delete at most one item in total are low risk (see check_work_backlog).
+# Anything else is HIGH: when in doubt, the answer is HIGH.
 #
 # Usage: scripts/classify-pr-risk.sh [base-ref]   (default: origin/main)
 # Prints the verdict on the first line, then one "- reason" line per rule
@@ -52,7 +54,9 @@ gitd() { git -c core.quotePath=false diff --no-color --no-ext-diff "$@"; }
 # Paths whose changes the pull request's own CI fully covers.
 is_low_path() {
   case "$1" in
-    work/*) return 0 ;;
+    # check_work_backlog below decides about the edits themselves.
+    work/*backlog.md) return 0 ;;
+    work/*) return 1 ;;
     crates/*-sys/*) return 1 ;;
     # CI excludes sim-vci from the test runs (CLAUDE.md, "Building and testing").
     crates/sim-vci/*) return 1 ;;
@@ -64,6 +68,90 @@ is_low_path() {
 # A file that is itself an integration-test target (see test_targets above).
 is_crate_test() {
   grep -Fxq -- "$1" <<<"$test_targets"
+}
+
+# Prints one backlog file as blocks, one per line: the type, a tab, the text.
+# An item (I) is a top-level "- **P0**" .. "- **P3**" bullet in an item
+# section, or any top-level bullet in a Known Flaky Tests section, with its
+# indented continuation lines joined by "\037". Headings are H, blank lines B,
+# everything else (the header line, prose, Status bullets) O. Sections are
+# found as in scripts/check-backlog.sh.
+backlog_blocks() {
+  awk '
+    function flush() { if (item != "") { print "I\t" item; item = "" } }
+    /^#+ / {
+      flush()
+      level = index($0, " ") - 1
+      if (sect && level <= sect_level) sect = ""
+      if (!sect && $0 ~ /^#+ (Status|Unverified Assumptions|Known Flaky Tests|Resolved)/) {
+        sect = ($0 ~ /Known Flaky Tests/) ? "flaky" : "exempt"; sect_level = level
+      }
+      print "H\t" $0; next
+    }
+    /^[ \t]+[^ \t]/ && item != "" { item = item "\037" $0; next }
+    { flush() }
+    /^[ \t]*$/ { print "B\t"; next }
+    /^- / && ((sect == "" && $0 ~ /^- \*\*P[0-3]\*\*/) || sect == "flaky") { item = $0; next }
+    { print "O\t" $0 }
+    END { flush() }
+  '
+}
+
+# Compares a backlog file's blocks before (first file) and after (second
+# file). Prints "deleted <n>" for the number of whole items removed, then one
+# "reason <text>" line for every other kind of change: a removed or changed
+# line that is not a whole item, an added line that is neither an item nor a
+# heading, and blocks that kept their text but changed their order (an item
+# moved to another section). Blank lines are ignored. An item rewritten in
+# place shows as one deleted and one added item, as closing an item and
+# adding its residual does; the limit of one deletion bounds that case.
+compare_blocks() {
+  awk -F'\t' '
+    FNR == 1 { pass++ }
+    $1 == "B" { next }
+    pass == 1 { old[++no] = $0; cold[$0]++; next }
+    { new[++nn] = $0; cnew[$0]++ }
+    function short(b) { b = substr(b, 3); gsub(/\037/, " ", b); return substr(b, 1, 70) }
+    END {
+      for (k in cold) {
+        extra = cold[k] - cnew[k]
+        if (extra <= 0) continue
+        if (substr(k, 1, 1) == "I") deleted += extra
+        else print "reason removes or changes a line that is not a whole item: " short(k)
+      }
+      for (k in cnew) {
+        extra = cnew[k] - cold[k]
+        if (extra <= 0) continue
+        t = substr(k, 1, 1)
+        if (t != "I" && t != "H") print "reason adds a line that is neither an item nor a heading: " short(k)
+      }
+      # The blocks both versions share must keep their order.
+      for (i = 1; i <= no; i++) if (keep[old[i]]++ < cnew[old[i]]) a[++na] = old[i]
+      for (i = 1; i <= nn; i++) if (seen[new[i]]++ < cold[new[i]]) b[++nb] = new[i]
+      for (i = 1; i <= na; i++) if (a[i] != b[i]) {
+        print "reason moves items or sections: " short(b[i]); break
+      }
+      print "deleted " deleted + 0
+    }
+  ' "$1" "$2"
+}
+
+# work/ edits: only modified backlog files are checked here; is_low_path and
+# the status checks below already make any other work/ change HIGH.
+work_deleted=0
+check_work_backlog() {
+  local path="$1" before after line
+  before="$(mktemp)"
+  after="$(mktemp)"
+  git show "$merge_base:$path" | backlog_blocks >"$before"
+  git show "HEAD:$path" | backlog_blocks >"$after"
+  while IFS= read -r line; do
+    case "$line" in
+      "deleted "*) work_deleted=$((work_deleted + ${line#deleted })) ;;
+      "reason "*) reasons+=("$path: ${line#reason }") ;;
+    esac
+  done < <(compare_blocks "$before" "$after")
+  rm -f "$before" "$after"
 }
 
 reasons=()
@@ -80,6 +168,10 @@ while IFS=$'\t' read -r status path rest; do
     *) reasons+=("changes $path with git status $status (copy, type change or other)") ;;
   esac
   target="${rest:-$path}"
+  case "$status:$target" in
+    M*:work/*backlog.md) check_work_backlog "$target" ;;
+    A*:work/*backlog.md) reasons+=("adds the backlog file $target") ;;
+  esac
   if ! is_low_path "$target"; then
     reasons+=("changes $target, which is not on the low-risk allowlist")
   elif [ "${status:0:1}" != A ]; then
@@ -100,6 +192,9 @@ while IFS=$'\t' read -r added removed path; do
   lines=$((lines + added + removed))
 done < <(gitd --numstat "$merge_base" HEAD)
 
+if [ "$work_deleted" -gt 1 ]; then
+  reasons+=("deletes $work_deleted backlog items (limit 1: the item the pull request finished)")
+fi
 if [ "$files" -gt "$max_files" ]; then
   reasons+=("changes $files files (limit $max_files)")
 fi
@@ -120,7 +215,7 @@ if [ "$files" -eq 0 ]; then
   echo "- no changes against $base"
 elif [ "${#reasons[@]}" -eq 0 ]; then
   echo "LOW"
-  echo "- $files files, $lines lines, all on the low-risk allowlist (work/, new crate test files, glossary)"
+  echo "- $files files, $lines lines, all on the low-risk allowlist (work/ backlog items added or one deleted, new crate test files, glossary)"
 else
   echo "HIGH"
   printf -- '- %s\n' "${reasons[@]}"

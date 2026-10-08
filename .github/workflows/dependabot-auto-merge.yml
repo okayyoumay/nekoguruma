@@ -5,7 +5,12 @@ name: Dependabot auto-merge
 # checks pass. Every other Dependabot pull request (Cargo major or 0.x updates, GitHub Actions,
 # security updates) and every human pull request is left for the maintainer to merge.
 # Needs "Allow auto-merge" turned on in the repository settings.
-on: pull_request
+#
+# pull_request_target, because a pull_request run started by Dependabot gets a read-only token that
+# cannot turn on auto-merge. That trigger runs this file as it is on main with a write token, so the
+# job must never check out or run anything from the pull request; it only reads Dependabot's
+# metadata.
+on: pull_request_target
 
 permissions: {}
 

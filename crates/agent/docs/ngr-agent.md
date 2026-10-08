@@ -77,3 +77,20 @@ the journal for writing; other readers use `Journal::read`, which never changes 
 records; committing an intent marker before the request it guards, and stopping the job when a
 commit fails, are the job runner's duties. `ngr-agent run` keeps no journal; it sends read-only
 requests, or any request to `sim-vci` in a debug build (ADR-247).
+
+## Restart inputs
+
+The `inputs` module supplies what an interrupted-write restart reads (design 8.2.5, 8.9;
+ADR-229, ADR-245 item 2). `resolve_source` reads one `diag_ir::Source` and gives a `Reading`:
+an integer, a text, `CannotBeEstablished` or `CannotBeDecoded`. The last two are readings, not
+errors; a check treats them as failed. A failure of the transport stays a `HostError`.
+
+- Runtime inputs (`RuntimeInputs`): `WorkerHost::inputs()` reports the supply voltage through
+  the worker's IoCtl RPC (`PDU_IOCTL_READ_VBATT` on the link's module). External supply,
+  ignition, engine running and vehicle speed have no source on the current VCIs (ADR-238) and
+  read as "cannot be established". `FixedInputs` holds fixed readings for tests.
+- Service fields: `ServiceSources` is a table from `(service_id, field_id)` to the request
+  (SID first), the offset after the response SID, the length and the encoding (unsigned
+  big-endian integer, or printable ASCII). It is a stand-in until the declaration part has a
+  decoder (ADR-245, consequences). A source missing from the table, a negative or too short
+  response, or a field that does not fit its encoding reads as "cannot be decoded".

@@ -142,6 +142,16 @@ impl WorkerHost {
         (self.client, self.link)
     }
 
+    /// The runtime inputs the link can supply (supply voltage through the VCI).
+    pub fn inputs(&mut self) -> crate::inputs::LinkInputs<'_> {
+        crate::inputs::LinkInputs::new(
+            &self.handle,
+            &mut self.client,
+            &self.link,
+            self.timings.unary,
+        )
+    }
+
     /// Sends `request` on the link and returns the whole final response (positive, or a
     /// negative `7F` response), or [`HostError::NoResponse`] if the ECU did not answer.
     ///

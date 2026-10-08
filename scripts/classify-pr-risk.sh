@@ -138,12 +138,15 @@ compare_blocks() {
     { new[++nn] = $0; nkey[nn] = k; cnew[k]++; fnew[$0]++ }
     function short(b) { b = substr(b, 3); gsub(/\037/, " ", b); return substr(b, 1, 70) }
     function hlevel(b) { return index(substr(b, 3), " ") - 1 }
+    # Counts are read through cnt() so that no missing element is created
+    # or used uninitialized; awks differ there (gawk 5.2 can even crash).
+    function cnt(arr, key) { return (key in arr) ? arr[key] + 0 : 0 }
     function min(x, y) { return x < y ? x : y }
     END {
-      if (ends != 2) exit 1
-      for (k in cold) if (cold[k] > cnew[k]) gone[k] = 1
+      if (ends + 0 != 2) exit 1
+      for (k in cold) if (cold[k] > cnt(cnew, k)) gone[k] = 1
       for (k in cold) {
-        extra = cold[k] - cnew[k]
+        extra = cold[k] - cnt(cnew, k)
         if (extra <= 0) continue
         if (substr(k, 1, 1) == "I") { while (extra-- > 0) print "deleted " substr(k, 3); continue }
         if (substr(k, 1, 1) == "H") {
@@ -153,7 +156,7 @@ compare_blocks() {
             L = hlevel(k)
             for (j = i + 1; j <= no; j++) {
               if (substr(okey[j], 1, 1) == "H" && hlevel(okey[j]) <= L) break
-              if (!gone[okey[j]] || substr(okey[j], 1, 1) == "O") emptied = 0
+              if (!(okey[j] in gone) || substr(okey[j], 1, 1) == "O") emptied = 0
             }
           }
           if (emptied) continue
@@ -161,21 +164,30 @@ compare_blocks() {
         print "reason removes or changes a line that is not a whole item: " short(k)
       }
       for (k in cnew) {
-        extra = cnew[k] - cold[k]
+        extra = cnew[k] - cnt(cold, k)
         if (extra <= 0) continue
         t = substr(k, 1, 1)
         if (t == "I") while (extra-- > 0) print "added " substr(k, 3)
         else if (t != "H") print "reason adds a line that is neither an item nor a heading: " short(k)
       }
       # A block both versions keep must stay under the same headings ...
-      for (f in fold) kept[substr(f, 1, 1) "\t" substr(f, index(substr(f, 3), "\t") + 3)] += min(fold[f], fnew[f])
-      for (k in cold) if (cnew[k] && kept[k] < min(cold[k], cnew[k])) {
+      for (f in fold) {
+        k = substr(f, 1, 1) "\t" substr(f, index(substr(f, 3), "\t") + 3)
+        kept[k] = cnt(kept, k) + min(fold[f], cnt(fnew, f))
+      }
+      for (k in cold) if (cnt(cnew, k) && cnt(kept, k) < min(cold[k], cnt(cnew, k))) {
         print "reason moves items or sections: " short(k); moved = 1; break
       }
       # ... and in the same order.
       if (!moved) {
-        for (i = 1; i <= no; i++) if (keep[old[i]]++ < fnew[old[i]]) a[++na] = i
-        for (i = 1; i <= nn; i++) if (seen[new[i]]++ < fold[new[i]]) b[++nb] = i
+        for (i = 1; i <= no; i++) {
+          c = cnt(keep, old[i]); keep[old[i]] = c + 1
+          if (c < cnt(fnew, old[i])) a[++na] = i
+        }
+        for (i = 1; i <= nn; i++) {
+          c = cnt(seen, new[i]); seen[new[i]] = c + 1
+          if (c < cnt(fold, new[i])) b[++nb] = i
+        }
         for (i = 1; i <= na; i++) if (old[a[i]] != new[b[i]]) {
           print "reason moves items or sections: " short(nkey[b[i]]); break
         }

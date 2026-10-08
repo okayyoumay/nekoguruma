@@ -6,11 +6,11 @@ name: Dependabot auto-merge
 # security updates) and every human pull request is left for the maintainer to merge.
 # Needs "Allow auto-merge" turned on in the repository settings.
 #
-# pull_request_target, because a pull_request run started by Dependabot gets a read-only token that
-# cannot turn on auto-merge. That trigger runs this file as it is on main with a write token, so the
-# job must never check out or run anything from the pull request; it only reads Dependabot's
-# metadata.
-on: pull_request_target
+# This follows GitHub's documented Dependabot auto-merge pattern: a pull_request run started by
+# Dependabot gets a read-only token by default, and the job-level `permissions` below raise it to
+# what auto-merge needs. pull_request_target is avoided on purpose: it would run with a write token
+# on every pull request, including ones from forks. The job never checks out the pull request.
+on: pull_request
 
 permissions: {}
 

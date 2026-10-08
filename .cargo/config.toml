@@ -5,3 +5,8 @@ rustflags = ["-C", "target-feature=+crt-static"]
 
 [target.i686-pc-windows-gnullvm]
 rustflags = ["-C", "target-feature=+crt-static"]
+
+# Resolve dependencies to versions that support the workspace's `rust-version` where one exists,
+# so `cargo update` (and Dependabot, which runs it) does not raise the minimum Rust version.
+[resolver]
+incompatible-rust-versions = "fallback"

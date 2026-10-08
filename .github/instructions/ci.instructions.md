@@ -19,3 +19,7 @@ Flag as P1:
   worker target or MSVC-only build path is P1.
 - **Tests weakened**: excluding tests, adding `--skip` filters or loosening a nextest profile to
   get CI green.
+- **Dependabot auto-merge**: `dependabot-auto-merge.yml` runs on `pull_request_target` with a
+  write token, so any step that checks out or runs code from the pull request is P1, as is
+  widening it beyond Dependabot's `cargo-minor-patch` group (other Dependabot updates and all
+  human pull requests are merged by the maintainer).

@@ -36,7 +36,9 @@ request, would run untrusted code with write access.
    `dependabot[bot]`, and turns auto-merge on only when the triggering actor is Dependabot too.
    GitHub keeps auto-merge on after a push by someone with write access, so when anyone else
    pushes to the branch the workflow turns auto-merge off instead, and the pull request waits for
-   the maintainer.
+   the maintainer. Runs for one pull request are serialized, and enabling auto-merge is bound to
+   the commit Dependabot pushed, so a run for an older push cannot turn it back on for a newer
+   head. A failure to turn it off fails the job.
 4. The workflow never checks out or runs anything from the pull request. It only reads
    Dependabot's metadata and calls `gh pr merge --auto`. Copilot review treats breaking this rule,
    or widening the workflow beyond the group, as P1 (`.github/instructions/ci.instructions.md`).

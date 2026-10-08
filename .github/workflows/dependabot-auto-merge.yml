@@ -15,6 +15,11 @@ on: pull_request_target
 
 permissions: {}
 
+# One run at a time per pull request, so a run for an older push cannot finish after a newer one.
+concurrency:
+  group: dependabot-auto-merge-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
 jobs:
   enable-auto-merge:
     if: github.event.pull_request.user.login == 'dependabot[bot]'
@@ -25,8 +30,13 @@ jobs:
     steps:
       # Someone other than Dependabot pushed to the branch: auto-merge stays on after such a push,
       # so turn it off and leave the pull request to the maintainer.
+      # A failure here fails the job; only "not enabled" is skipped.
       - if: github.actor != 'dependabot[bot]'
-        run: gh pr merge --disable-auto "$PR_URL" || true
+        run: |
+          enabled="$(gh pr view "$PR_URL" --json autoMergeRequest --jq '.autoMergeRequest != null')"
+          if [ "$enabled" = true ]; then
+            gh pr merge --disable-auto "$PR_URL"
+          fi
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -37,7 +47,9 @@ jobs:
       # 0.22 -> 0.23 minor, while Cargo treats it as breaking and dependabot.yml keeps
       # it out of the group.
       - if: github.actor == 'dependabot[bot]' && steps.metadata.outputs.package-ecosystem == 'cargo' && steps.metadata.outputs.dependency-group == 'cargo-minor-patch'
-        run: gh pr merge --auto --squash "$PR_URL"
+        # Bound to the commit Dependabot pushed: if the branch has moved on, the call fails.
+        run: gh pr merge --auto --squash --match-head-commit "$HEAD_SHA" "$PR_URL"
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

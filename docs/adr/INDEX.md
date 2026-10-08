@@ -244,6 +244,9 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | Accepted | Currently in effect. The implementation follows this decision. |
 | Superseded by ADR-NNN | Replaced by a later ADR. Reference only. |
 
+A number with no file in this directory is unused: no ADR with that number is part of this
+repository, and no new ADR takes it. Older ADRs may still mention such numbers as provenance.
+
 ## Classification by Theme
 
 ### CLL Lifecycle
@@ -526,14 +529,9 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 - ADR-228
 - ADR-240
 
-### J2534 v05.00 Subsystem
-- ADR-031
-
 ### vci-service-manager Process Startup
-- ADR-032
 - ADR-073
 - ADR-220 (Decision item 5's `proxy_to_instance` mechanism removed by ADR-221)
-- ADR-225
 
 ### vci-service Authentication & Trust Boundary
 - ADR-052 (loopback-only binding this ADR's auth mechanism relies on)
@@ -549,16 +547,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 - ADR-232
 
 ### Development Tooling & CI
-- ADR-109 (amended by ADR-113)
-- ADR-113
-- ADR-119 (dual-implementation sync duty relaxed to same-PR by ADR-155)
-- ADR-136 (publication consolidated by ADR-141)
-- ADR-141 (item 6's atomicity boundary relaxed by ADR-155)
-- ADR-142 (item 1's check-6(c) atomicity boundary relaxed to same-PR by ADR-155)
-- ADR-144
-- ADR-145
 - ADR-149
-- ADR-154 (item 1's/Consequences' same-commit duty wording relaxed to same-PR by ADR-155)
 - ADR-155
 - ADR-163
 - ADR-195

@@ -157,6 +157,16 @@ edit 's/First item. Done when: one./First item, rewritten. Done when: one./'
 expect "rewriting an item other than the claimed one is HIGH" HIGH "other than the claimed one"
 
 setup
+printf '\n## Area five\n\n- **P2**: Same first line.\n  First continuation.\n- **P2**: Same first line.\n  Second continuation.\n' >>"$other"
+git add -A
+git commit -q -m "duplicate first lines"
+git branch -f base
+claim="- **P2**: Same first line."
+sed -i '/Second continuation/d' "$other"
+sed -i '$d' "$other"
+expect "a claim whose first line matches two items is HIGH" HIGH "matches 2 items"
+
+setup
 claim="- **P1**: First item. Done when: one."
 edit '/First item/d'
 edit '/Third item/a - **P2**: A residual. Done when: four.'

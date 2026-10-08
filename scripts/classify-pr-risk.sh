@@ -328,8 +328,9 @@ done < <(gitd --numstat "$merge_base" HEAD)
 if [ "${#work_deleted[@]}" -gt 1 ]; then
   reasons+=("deletes ${#work_deleted[@]} backlog items (limit 1: the item the pull request finished)")
 fi
-# The claimed item must be an item of a backlog file on the base, so that a
-# mistyped claim cannot match nothing and pass. Items are compared by their
+# The claimed item must be exactly one item of the backlog files on the base,
+# so that a mistyped claim cannot match nothing and pass, and an ambiguous
+# one cannot cover two items. Items are compared by their
 # first line as backlog_blocks writes it (tabs as \035).
 claimed_key="${claimed//$'\t'/$'\035'}"
 if [ "$claimed_given" -eq 1 ]; then
@@ -342,12 +343,16 @@ if [ "$claimed_given" -eq 1 ]; then
     fi
     while IFS=$'\t' read -r t _ text; do
       if [ "$t" = I ] && [ "${text%%$'\037'*}" = "$claimed_key" ]; then
-        claimed_found=1
+        claimed_found=$((claimed_found + 1))
       fi
     done <<<"$blocks"
   done < <(git ls-tree --name-only "$merge_base" work/)
   if [ "$claimed_found" -eq 0 ]; then
     reasons+=("the claimed item is not an item of a backlog file on $base: ${claimed:0:70}")
+  elif [ "$claimed_found" -gt 1 ]; then
+    # Items are matched by their first line, so a claim that names several
+    # items cannot tell which one the pull request may delete.
+    reasons+=("the claimed item's first line matches $claimed_found items on $base: ${claimed:0:70}")
   fi
 fi
 for item in ${work_deleted[@]+"${work_deleted[@]}"}; do

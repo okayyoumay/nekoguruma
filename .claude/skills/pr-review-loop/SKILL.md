@@ -1,6 +1,6 @@
 ---
 name: pr-review-loop
-description: Drive the automated review cycle on a nekoguruma pull request Claude opened. Request a GitHub Copilot review, verify what each finding actually claims, route it (fix, design-advisor escalation, accepted limitation, or decline), push one verified fix per round and re-request review until the review is clean, then hand the PR to the maintainer. Use after opening a PR, and whenever a Copilot review or review comment arrives on one.
+description: Drive the automated review cycle on a nekoguruma pull request Claude opened. Request a GitHub Copilot review, verify what each finding actually claims, route it (fix, design-advisor escalation, accepted limitation, or decline), push one verified fix per round and re-request review until the review is clean or the remaining fixes need no re-review, then hand the PR to the maintainer. Use after opening a PR, and whenever a Copilot review or review comment arrives on one.
 argument-hint: "<PR number>"
 ---
 
@@ -187,8 +187,29 @@ re-requested at most once.
 - Every reply ends with the attribution footer GitHub posts from Claude carry.
 - Never mention Copilot with an at-sign, in any capitalization, in a thread reply (Step 0).
 - Answer summary-only findings (Step 1) in one PR comment, since they have no thread.
-- Only after every thread of the round has its reply, request a Copilot review again (Step 0),
-  then go back to Step 1. A no-change round re-requests only as Step 3 allows.
+- Only after every thread of the round has its reply, decide whether to request a Copilot review
+  again (below). If so, request it (Step 0) and go back to Step 1; if not, go to Step 5. A
+  no-change round re-requests only as Step 3 allows.
+
+**When a pushed round re-requests (ADR-251).** Every Copilot re-review reads the whole diff
+again and spends AI credits at the full rate, and it tends to add one more minor finding on code
+the PR did not change each time. So a round that pushed a fix re-requests a review only when at
+least one of these holds:
+
+- the round fixed a finding Copilot rated above Low (Medium, High or Critical), or one whose
+  severity you cannot read from the review;
+- the round's fix went through `design-advisor` (2b);
+- the push changes executable or build files: `*.rs`, `*.proto`, `*.h`, `build.rs`,
+  `Cargo.toml`, `Cargo.lock`, anything under `scripts/`, `.github/workflows/`, `.config/` or
+  `.cargo/`;
+- the round merged `main` and resolved a conflict.
+
+Read the severity from the badge next to each finding in the review summary (its image alt text
+is "Low severity", "Medium severity" and so on); an inline comment whose finding does not appear
+in the summary counts as unreadable. A round that meets none of the conditions fixed only
+Low-rated findings in documentation, `work/` or `.claude/` prose: its fix still passes every
+Step 3 check, and the loop then ends without a re-request. Step 5 reports those findings as
+fixed after the last Copilot review.
 
 ## CI facts
 
@@ -206,8 +227,8 @@ re-requested at most once.
 
 ## Step 5: close out
 
-When a round is clean, a no-change round ended the loop (Step 3), or the fallback review in
-Step 0 is done:
+When a round is clean, a no-change round ended the loop (Step 3), a pushed round ended it
+without a re-request (Step 4), or the fallback review in Step 0 is done:
 
 1. **Nothing deferred only in the conversation.** Go through the loop's history: follow-ups any
    agent or you called "deferred", "out of scope" or "worth a separate look", `design-advisor`
@@ -231,14 +252,16 @@ Step 0 is done:
    nothing else in the description changed:
    - the test plan's CI line: ticked only when every check run of that head passed in step 3,
      naming the head commit;
-   - the review summary: each Copilot round and its outcome (`get_reviews`), and any
-     `edge-case-hunter` pass;
+   - the review summary: each Copilot round and its outcome (`get_reviews`), any
+     `edge-case-hunter` pass, and the Low-rated findings fixed after the last Copilot review
+     when the loop ended without a re-request (Step 4);
    - any line the loop's fixes made untrue, such as a test count or a list of changes.
 
    Send the whole description with the update, never only the changed section; an update
    replaces the body.
 5. **Hand over.** Mark the PR ready for review and tell the maintainer in the project thread that it is
-   ready, listing anything accepted as a limitation and anything added to the backlog. The maintainer
+   ready, listing anything accepted as a limitation, anything added to the backlog, and any
+   fix Copilot did not review because the loop ended without a re-request. The maintainer
    reviews and merges; do not merge. Stay subscribed to the PR until it is merged or closed.
 6. If one ADR was amended three or more times in the loop, mention that rewriting its Decision
    section in one piece may now read better than the appended amendments.

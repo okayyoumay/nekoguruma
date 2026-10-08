@@ -223,7 +223,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-232](ADR-232-linux-support-scope-and-minimum-glibc.md) | Linux Support Scope and Minimum glibc 2.17 | Accepted | design 2 / 7.1.2 / 12.1 / 17, `worker-linux` CI job |
 | [ADR-233](ADR-233-diag-ir-vm-execution-semantics.md) | diag-ir VM Execution Semantics | Accepted (item 3's `VmState` fields removed by ADR-245) | `diag-ir` VM |
 | [ADR-234](ADR-234-sim-vci-flow-control-filter-model.md) | sim-vci Flow-Control Filter Model | Accepted | `sim-vci` filters, writes, reads, IOCTLs |
-| [ADR-235](ADR-235-agent-job-runner-and-worker-diag-host.md) | Agent Job Runner and the Worker-Backed DiagHost | Accepted | `agent` runner, host, link |
+| [ADR-235](ADR-235-agent-job-runner-and-worker-diag-host.md) | Agent Job Runner and the Worker-Backed DiagHost | Accepted (item 8 relaxed for debug builds against `sim-vci` by ADR-247) | `agent` runner, host, link |
 | [ADR-236](ADR-236-time-series-scale-and-raw-response-storage.md) | Time-Series Scale and Raw-Response Storage | Accepted | design 4.3 / 4.6 / 10.3 / 17, `dataset_chunks.chunk_format` |
 | [ADR-237](ADR-237-regulatory-scope-access-routes-without-tool-certification.md) | Regulatory Scope: Use the Access Routes Regulations Open, Without Tool Certification | Accepted | design 8.1 / 9.2 / 16.1 / 16.2 / 17, `db/` retention |
 | [ADR-238](ADR-238-sim-vci-control-commands-and-device-loss.md) | sim-vci Control Commands and Device Loss | Accepted | `sim-vci` control export and directory, `ERR_DEVICE_NOT_CONNECTED` |
@@ -235,6 +235,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-244](ADR-244-write-job-journal-format.md) | Write-Job Journal as an Append-Only Record Log | Accepted | `agent` write-job journal |
 | [ADR-245](ADR-245-ir-restart-declaration-in-the-procedure-part.md) | The IR's Restart Declaration Lives in the Procedure Part | Accepted | `diag-ir` `Program` restart declaration, `ir.fbs` `FlashSession` |
 | [ADR-246](ADR-246-codeql-hand-off-carries-private-alert-details.md) | The CodeQL Hand-Off Carries High and Critical Alert Details Privately | Accepted | `.github/workflows/codeql-alert-handoff.yml`, `.claude/skills/codeql-alerts` |
+| [ADR-247](ADR-247-debug-builds-may-write-to-sim-vci.md) | Debug Builds May Send Write Requests to `sim-vci` | Accepted | `agent` policy, link, host, runner |
 
 ## Status Legend
 
@@ -282,7 +283,7 @@ ADR-109 (amended by ADR-113), ADR-113, ADR-119 (dual-implementation sync duty re
 ADR-057 (amended by ADR-102), ADR-120, ADR-143, ADR-239
 
 ### Write Jobs & Resume
-ADR-229 (item 1's `recovery_required_from_step` replaced by ADR-245), ADR-233 (item 3's `VmState` fields removed by ADR-245), ADR-235, ADR-241, ADR-244, ADR-245
+ADR-229 (item 1's `recovery_required_from_step` replaced by ADR-245), ADR-233 (item 3's `VmState` fields removed by ADR-245), ADR-235 (item 8 relaxed for debug builds against `sim-vci` by ADR-247), ADR-241, ADR-244, ADR-245, ADR-247
 
 ### Diagnostic IR
 ADR-233 (item 3's `VmState` fields removed by ADR-245), ADR-242, ADR-245

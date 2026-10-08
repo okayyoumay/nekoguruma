@@ -4,6 +4,9 @@
 //! `j2534-0404-service` binary against the `sim-vci` cdylib, and `agent::run_program` runs a
 //! diag-ir procedure on a CAN link to the simulated ECU behind it.
 //!
+//! A second job switches the ECU to its programming session and runs a routine, which only a
+//! debug build allows and only on the simulator (ADR-247).
+//!
 //! This file holds a single test, so the process-wide `VCI_CONFIG_PATH` it sets for the
 //! spawned service cannot race with another test.
 
@@ -18,6 +21,8 @@ use worker_host::service::{LaunchOptions, ServiceKind, WorkerProcess};
 const LIBRARY_NAME: &str = "sim-vci";
 /// The simulated ECU's built-in VIN (`crates/sim-vci/docs/simulated-vci.md`).
 const VIN: &[u8] = b"NGRSIMECU00000001";
+/// The simulated ECU's check-programming-dependencies routine (`sim_ecu::RID_CHECK_PROGRAMMING_DEPENDENCIES`).
+const RID_CHECK_PROGRAMMING_DEPENDENCIES: u16 = 0xFF01;
 
 /// `sim-vci` is a dev-dependency, so cargo builds its cdylib into the same `deps` directory
 /// as this test executable.
@@ -63,6 +68,29 @@ fn program() -> Program {
             Op::ServiceRequest { service: 0x22 },
         ],
         constants: vec![vec![0xF1, 0x90], vec![0x12, 0x34]],
+        sections: Vec::new(),
+        source_map: Vec::new(),
+        identity: Default::default(),
+        preconditions: Default::default(),
+        flash: Vec::new(),
+    }
+}
+
+/// Switches to the programming session (ISO 14229-1:2026 clause 9.2), then starts the check
+/// programming dependencies routine, which exists only in that session.
+fn write_program() -> Program {
+    Program {
+        schema_version: IR_SCHEMA_VERSION,
+        code: vec![
+            Op::PushBytes(0),
+            Op::ServiceRequest { service: 0x10 },
+            Op::PushBytes(1),
+            Op::RoutineControl {
+                routine: RID_CHECK_PROGRAMMING_DEPENDENCIES,
+                sub: 0x01,
+            },
+        ],
+        constants: vec![vec![0x02], Vec::new()],
         sections: Vec::new(),
         source_map: Vec::new(),
         identity: Default::default(),
@@ -146,6 +174,29 @@ async fn run_the_job() {
         [Value::Bytes(vin), Value::Bytes(vec![0x7F, 0x22, 0x31])],
         "{state:?}"
     );
+
+    // The link of the first job is closed, so the worker can serve the next one. The agent
+    // identified `sim-vci` from the module's version, which lets this job write.
+    let state = run_program(
+        worker
+            .connect(&ConnectOptions::default())
+            .await
+            .expect("client should connect"),
+        &LinkConfig::iso15765(0x7E0, 0x7E8),
+        write_program(),
+        JobLimits::default(),
+    )
+    .await
+    .expect("the write job should finish");
+    let [Value::Bytes(session), Value::Bytes(routine)] = state.stack.as_slice() else {
+        panic!("{state:?}");
+    };
+    // Positive response to the session change, echoing the sub-function and the timing.
+    assert!(session.starts_with(&[0x50, 0x02]), "{state:?}");
+    // The routine ran in the programming session and got past the session and sub-function
+    // checks; without an image transferred it ends in a request sequence error (0x24) instead
+    // of the request out of range (0x31) it answers in the default session.
+    assert_eq!(routine, &[0x7F, 0x31, 0x24], "{state:?}");
 
     worker
         .stop(Duration::from_secs(5))

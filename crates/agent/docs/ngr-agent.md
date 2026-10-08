@@ -24,7 +24,8 @@ Steps (`agent::check_program`, `agent::launch::launch_j2534_worker`, then `agent
 
 1. Read the program and check it (`agent::check_program`): a program whose schema version or
    size this VM does not accept, one whose restart declaration `Program::validate` refuses
-   (ADR-245), or one with a request outside the read-only policy, fails here,
+   (ADR-245), or one with a request this build may never send (a release build sends only
+   read-only requests; ADR-235 item 8, ADR-247), fails here,
    before any worker starts. A bad operand, such as a missing constant, fails only when the VM
    reaches it, after the worker has started.
 2. Resolve the VCI name the way each worker build would resolve it on its side
@@ -43,8 +44,10 @@ Steps (`agent::check_program`, `agent::launch::launch_j2534_worker`, then `agent
 4. Launch the service with the library name and the ABI's default `long_size` (design 7.1.2;
    always the default, whatever a registration definition declares), provision its
    auth key and connect the gRPC client (design 7.4).
-5. Run the program under the read-only policy and the default job limits (ADR-235), then stop
-   the worker.
+5. Run the program under the request policy and the default job limits (ADR-235), then stop
+   the worker. The policy is read-only, except that a debug build may send any request once
+   the worker's VCI has identified itself as `sim-vci` (ADR-247); a program that needs more
+   than the VCI allows is refused after the link opens, before its first instruction runs.
 
 ## Output and exit status
 
@@ -72,5 +75,5 @@ append-only file, `{job_id}.g{generation}.journal`, per job and ownership genera
 directory the caller passes. Every commit is synced before it returns. Only the job's writer opens
 the journal for writing; other readers use `Journal::read`, which never changes the file. The journal only
 records; committing an intent marker before the request it guards, and stopping the job when a
-commit fails, are the job runner's duties. `ngr-agent run` sends read-only requests and keeps no
-journal.
+commit fails, are the job runner's duties. `ngr-agent run` keeps no journal; it sends read-only
+requests, or any request to `sim-vci` in a debug build (ADR-247).

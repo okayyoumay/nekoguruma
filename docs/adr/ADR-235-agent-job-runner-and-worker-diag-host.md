@@ -1,7 +1,7 @@
 # ADR-235: Agent Job Runner and the Worker-Backed DiagHost
 
 **Date:** 2026-10-06
-**Status:** Accepted
+**Status:** Accepted (item 8 relaxed for debug builds against `sim-vci` by ADR-247)
 **Affects:** `agent` (`src/runner.rs`, `src/host.rs`, `src/link.rs`, `src/policy.rs`), `j2534-0404-service` (`tests/agent_end_to_end.rs`), `docs/system-architecture.md` 3.3 / 8.2.4
 
 ## Context

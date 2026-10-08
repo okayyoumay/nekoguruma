@@ -8,6 +8,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use agent::launch::launch_j2534_worker;
+use agent::policy::build_ceiling;
 use agent::{JobLimits, LinkConfig, check_program, run_program};
 use diag_ir::{Program, Value, VmState};
 use worker_host::service::{LaunchOptions, WorkerLayout};
@@ -143,7 +144,7 @@ async fn run(args: RunArgs) -> Result<String, String> {
     let program: Program = serde_json::from_str(&text)
         .map_err(|error| format!("{} is not an IR program: {error}", args.program.display()))?;
     // A program the job would refuse does not need a worker.
-    check_program(&program).map_err(|error| format!("job failed: {error}"))?;
+    check_program(&program, build_ceiling()).map_err(|error| format!("job failed: {error}"))?;
     let workers = WorkerLayout {
         root: match args.workers {
             Some(root) => root,

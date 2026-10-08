@@ -15,6 +15,7 @@ use vci_service_interface::{
 use worker_host::client::WorkerClient;
 
 use crate::host::{HostError, unary};
+use crate::policy::Permission;
 
 /// What a job's link needs. Until procedures declare their timings, the caller fills it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,6 +107,17 @@ pub struct Link {
     pub module_handle: ModuleHandle,
     pub cll_handle: ComLogicalLinkHandle,
     pub events: Streaming<EventNotification>,
+    /// What the job may send on this link: decided from the VCI the module reports (ADR-247).
+    /// Not public: only [`open`] may decide it, so a library caller cannot grant a link to a
+    /// real VCI the simulator permission.
+    pub(crate) permission: Permission,
+}
+
+impl Link {
+    /// What the job may send on this link.
+    pub fn permission(&self) -> Permission {
+        self.permission
+    }
 }
 
 fn param(id: u32, class: PduParamClass, value: u32) -> ParamItem {
@@ -184,6 +196,8 @@ pub async fn open(
         return Err(error);
     }
 
+    let permission = vci_permission(client, deadline, module_handle).await;
+
     let cll_handle = match create_link(client, config, deadline, module_handle).await {
         Ok(cll_handle) => cll_handle,
         Err(error) => {
@@ -196,12 +210,52 @@ pub async fn open(
             module_handle,
             cll_handle,
             events,
+            permission,
         }),
         Err(error) => {
             let _ = teardown(client, module_handle, cll_handle, deadline).await;
             Err(error)
         }
     }
+}
+
+/// What a job may send through this module (ADR-247). A debug build asks the worker which VCI
+/// it fronts, since only the simulator may be written to. A VCI whose version cannot be read
+/// is not the simulator: the job stays read-only, as it would in a release build.
+#[cfg(debug_assertions)]
+async fn vci_permission(
+    client: &mut WorkerClient,
+    deadline: Duration,
+    module_handle: ModuleHandle,
+) -> Permission {
+    let version = unary(
+        deadline,
+        "GetVersion",
+        client.get_version(vci_service_interface::GetVersionRequest {
+            module_handle: Some(module_handle),
+        }),
+    )
+    .await;
+    match version {
+        Ok(response) => response
+            .version_data
+            .as_ref()
+            .map_or(Permission::ReadOnly, crate::policy::identify),
+        Err(error) => {
+            tracing::warn!(%error, "could not read the VCI's version; the job stays read-only");
+            Permission::ReadOnly
+        }
+    }
+}
+
+/// A release build never asks: its links are read-only whatever the VCI (ADR-247).
+#[cfg(not(debug_assertions))]
+async fn vci_permission(
+    _client: &mut WorkerClient,
+    _deadline: Duration,
+    _module_handle: ModuleHandle,
+) -> Permission {
+    Permission::ReadOnly
 }
 
 async fn create_link(
@@ -325,6 +379,7 @@ pub async fn close(
         module_handle,
         cll_handle,
         events,
+        permission: _,
     } = link;
     drop(events);
     teardown(client, module_handle, cll_handle, deadline).await

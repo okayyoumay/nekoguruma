@@ -2,7 +2,7 @@
 
 **Date:** 2026-10-08
 **Status:** Accepted
-**Affects:** `agent` (`src/host.rs`, `src/policy.rs`), `diag-ir` (`src/recovery.rs`), `j2534-0404-service` (`tests/agent_flash_transfer.rs`), ADR-245 item 6, ADR-247 Decision item 4
+**Affects:** `agent` (`src/host.rs`, `src/policy.rs`), `diag-ir` (`src/recovery.rs`), `j2534-0404-service` (`tests/agent_flash_transfer.rs`), ADR-245 items 4 and 6, ADR-247 Decision item 4
 
 ## Context
 
@@ -56,12 +56,19 @@ instruction would be an IR schema change (ADR-245 item 7).
    covers `RoutineControl`, and the read-only permission refuses it (service 0x36). This amends
    ADR-247 Decision item 4: only the refusal of `FlashTransfer` is superseded. The
    `SecurityAccess` instruction stays refused, because the host still has no implementation.
-7. **The validator keeps a plan's transfer whole.** `Program::validate` refuses a flash
-   recovery plan with DiagnosticSessionControl (0x10), ECUReset (0x11), RequestUpload (0x35)
-   or RequestFileTransfer (0x38) between its RequestDownload and its RequestTransferExit
-   (`ProgramError::TransferInterrupted`). Each of them ends the host's tracked transfer (item
-   3), so a later `FlashTransfer` would fail only after the erase. This adds a check to the
-   list of ADR-245 item 6; before the RequestDownload they stay allowed.
+7. **The validator keeps a plan's transfer whole.** Each of DiagnosticSessionControl (0x10),
+   ECUReset (0x11), RequestUpload (0x35) and RequestFileTransfer (0x38) ends the host's
+   tracked transfer (item 3), and a second RequestDownload starts it over without a new
+   erase, so `Program::validate` keeps them out of a running transfer:
+   - it refuses any of the four between a plan's RequestDownload and its RequestTransferExit
+     (`ProgramError::TransferInterrupted`);
+   - a jump inside the transfer may not go back to the RequestDownload or before it
+     (`ProgramError::JumpOutOfRecovery`). Before, ADR-245 item 4 let it go back as far as the
+     erase, so a loop could re-run a RequestDownload, or one of the four requests placed
+     between a routine-control erase and the RequestDownload, mid-transfer.
+
+   Before the RequestDownload the four requests stay allowed, since execution cannot return
+   there once the transfer has begun. This amends ADR-245 items 4 and 6.
 
 ## Consequences
 
@@ -77,7 +84,10 @@ instruction would be an IR schema change (ADR-245 item 7).
 - A `ServiceRequest` for TransferData (0x36) is refused before the link opens
   (`policy::check_program`), not only by the host, so a program carrying one fails before
   anything is erased.
-- A program with DiagnosticSessionControl, ECUReset, RequestUpload or RequestFileTransfer
-  inside a plan's transfer is refused when it loads (item 7), before anything is erased. A
-  program that downloads is always inside a plan (ADR-245 item 6), so the host's end rules
-  of item 3 apply at run time only to requests the validator already let through.
+- A program that could run DiagnosticSessionControl, ECUReset, RequestUpload,
+  RequestFileTransfer or a second RequestDownload while its transfer runs is refused when it
+  loads (item 7), before anything is erased. Download requests appear only inside a plan
+  (ADR-245 item 6), so a valid program reaches the host's end rules of item 3 only through
+  the plan's own RequestTransferExit.
+- A procedure cannot retry the transfer by looping back to its RequestDownload; a retry is a
+  restart from the erase (ADR-229).

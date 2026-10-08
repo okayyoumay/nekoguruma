@@ -693,7 +693,10 @@ impl Program {
                             // not skip the RequestDownload.
                             target >= b.erase_pc && target <= download_pc
                         } else if pc < b.transfer_exit_pc {
-                            target >= b.erase_pc && target <= b.transfer_exit_pc
+                            // Within the transfer, a jump stays after the RequestDownload: going
+                            // back to it or before it would send a second RequestDownload, or
+                            // a request that ends the transfer, mid-transfer (ADR-250).
+                            target > download_pc && target <= b.transfer_exit_pc
                         } else {
                             target == b.erase_pc
                                 || (target > b.transfer_exit_pc && target <= b.post_transfer_end_pc)

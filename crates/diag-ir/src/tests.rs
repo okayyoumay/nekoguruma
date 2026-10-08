@@ -1958,16 +1958,17 @@ fn a_jump_before_the_erase_cannot_skip_it() {
 }
 
 #[test]
-fn a_jump_in_the_transfer_stays_between_erase_and_exit() {
-    // erase 1, transfer exit 3: pc 2 is in the transfer.
-    for target in [1, 2, 3] {
+fn a_jump_in_the_transfer_stays_after_the_request_download() {
+    // erase and RequestDownload 1, transfer exit 3: pc 2 is in the transfer. Going back to the
+    // RequestDownload would send a second one mid-transfer (ADR-250).
+    for target in [2, 3] {
         let program = flow_program(|c| {
             c[1] = Op::ServiceRequest { service: 0x34 };
             c[2] = Op::Jump(target);
         });
         assert_eq!(program.validate(), Ok(()), "target {target}");
     }
-    for target in [0, 4, 5] {
+    for target in [0, 1, 4, 5] {
         let program = flow_program(|c| {
             c[1] = Op::ServiceRequest { service: 0x34 };
             c[2] = Op::JumpIfFalse(target);
@@ -2071,6 +2072,30 @@ fn no_request_may_end_the_transfer_before_its_exit() {
         });
         program.flash[0].boundaries.transfer_exit_pc = 4;
         assert_eq!(program.validate(), Ok(()), "{service:#04x}");
+    }
+}
+
+/// A request allowed before the RequestDownload cannot be reached again from the transfer: a
+/// loop back to it, or to the RequestDownload, is refused (ADR-250).
+#[test]
+fn the_transfer_cannot_loop_back_to_the_request_download_or_before_it() {
+    for target in [1, 2, 3] {
+        let mut program = flow_program(|c| {
+            c[2] = Op::ServiceRequest { service: 0x10 };
+            c[3] = Op::ServiceRequest { service: 0x34 };
+            c[4] = Op::JumpIfFalse(target);
+            c[5] = Op::ServiceRequest { service: 0x37 };
+        });
+        program.flash[0].boundaries.transfer_exit_pc = 5;
+        program.flash[0].boundaries.post_transfer_end_pc = 6;
+        assert_eq!(
+            program.validate(),
+            Err(ProgramError::JumpOutOfRecovery {
+                flash_session: 1,
+                pc: 4
+            }),
+            "target {target}"
+        );
     }
 }
 
@@ -2185,7 +2210,7 @@ fn a_backward_jump_does_not_cross_the_recovery_point() {
     );
     let mut program = flow_program(|c| {
         c[1] = Op::ServiceRequest { service: 0x34 };
-        c[2] = Op::Jump(1);
+        c[2] = Op::Jump(2);
     });
     program.flash[0].recovery_required = RecoveryRequired::FromPc(4);
     assert_eq!(program.validate(), Ok(()));

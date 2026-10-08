@@ -1,7 +1,7 @@
 # ADR-245: The IR's Restart Declaration Lives in the Procedure Part
 
 **Date:** 2026-10-07
-**Status:** Accepted (item 6 extended by ADR-250)
+**Status:** Accepted (items 4 and 6 amended by ADR-250)
 **Affects:** `crates/diag-ir` (`src/recovery.rs`, `Program`, `VmState`, `IR_SCHEMA_VERSION`, `schema/ir.fbs` `FlashSession`), `crates/agent` (`check_program`), `docs/system-architecture.md` (8.2.5, 8.9)
 
 ## Context
@@ -73,7 +73,8 @@ runner in M1.
    or falling through. It contains no call or return, nothing calls into it, nothing jumps
    into it except to `entry_pc`, and nothing inside jumps out of it. Inside, no jump skips the
    erase or, after a routine-control erase, the RequestDownload, leaves the transfer backwards
-   past the erase, or returns from the post-transfer steps to anything but the erase (a redone
+   past the erase (since ADR-250: goes from the transfer back to the RequestDownload or
+   before it), or returns from the post-transfer steps to anything but the erase (a redone
    transfer). No jump or call anywhere crosses the recovery-required point backwards. So every
    erase passes its transfer-start marker, every RequestTransferExit its own marker, every run
    reaches the end boundary, and a position orders the interruption point as the journal's
@@ -90,7 +91,8 @@ runner in M1.
    - a plan holds one RequestDownload, no transfer before it and no RequestTransferExit but
      its declared one;
    - between the RequestDownload and the RequestTransferExit, no DiagnosticSessionControl,
-     ECUReset, RequestUpload or RequestFileTransfer ends the transfer (added by ADR-250);
+     ECUReset, RequestUpload or RequestFileTransfer ends the transfer, and no jump in the
+     transfer goes back to the RequestDownload or before it (added by ADR-250);
    - `erase_pc` is a routine control or a RequestDownload, and `transfer_exit_pc` a
      RequestTransferExit;
    - download requests and flash transfers appear only between a plan's erase and its

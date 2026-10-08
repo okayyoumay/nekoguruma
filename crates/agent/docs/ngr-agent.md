@@ -66,7 +66,9 @@ echo or no response (a new RequestDownload is needed; a same-counter retry could
 A `FlashTransfer` with no tracked transfer is an error and sends nothing, and a
 `ServiceRequest` for 0x36 is refused, both before the link opens (`check_program`) and by
 the host. `Program::validate` refuses a plan with 0x10, 0x11, 0x35 or 0x38 between its
-RequestDownload and RequestTransferExit, so a valid program never ends its own transfer. `WorkerHost::transfer_block_index` gives the number of
+RequestDownload and RequestTransferExit, or with a jump from the transfer back to the
+RequestDownload or before it, so a valid program does not end its transfer before the
+RequestTransferExit (ADR-250). `WorkerHost::transfer_block_index` gives the number of
 confirmed blocks (`Some(0)`: started, none yet), which the write-job journal records
 (ADR-244); it is a `u64`, so the journaling runner converts it for `commit_block` and never
 commits 0.

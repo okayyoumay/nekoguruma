@@ -61,6 +61,9 @@ pub enum HostError {
         counter: u8,
         response: Vec<u8>,
     },
+    /// A `ServiceRequest` for TransferData: the block counter belongs to `FlashTransfer`.
+    #[error("TransferData (0x36) must be sent with FlashTransfer, not ServiceRequest (ADR-250)")]
+    UseFlashTransfer,
     #[error("{0} is not supported by this agent yet")]
     Unsupported(&'static str),
     #[error("link setup: {0}")]
@@ -140,20 +143,33 @@ pub fn routine_control_bytes(routine: u16, sub: u8, payload: &[u8]) -> Vec<u8> {
 /// The IR's `FlashTransfer` operand is constant per instruction, so it cannot carry this.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct TransferCounter {
-    /// Blocks the ECU has accepted since the last RequestDownload / RequestUpload; `None`
-    /// before any.
+    /// Blocks the ECU confirmed since the last RequestDownload; `None` when no transfer is
+    /// tracked.
     accepted: Option<u64>,
 }
 
 impl TransferCounter {
-    /// A RequestDownload / RequestUpload was answered positively: a new transfer begins.
-    fn begin(&mut self) {
-        self.accepted = Some(0);
-    }
-
-    /// A RequestDownload / RequestUpload was sent but not (known to be) accepted.
-    fn end(&mut self) {
-        self.accepted = None;
+    /// Updates the tracked transfer after a `ServiceRequest` was sent; `outcome` is the whole
+    /// response, or `Err` when there was none or sending failed.
+    ///
+    /// - RequestDownload (0x34) answered positively begins a transfer at count 0, so a second
+    ///   one mid-transfer starts over. Any other outcome leaves no transfer.
+    /// - RequestUpload (0x35), RequestTransferExit (0x37), RequestFileTransfer (0x38),
+    ///   DiagnosticSessionControl (0x10) and ECUReset (0x11) end the tracked transfer whatever
+    ///   the response: FlashTransfer would discard upload data, and the other four end or
+    ///   invalidate the server's transfer (ADR-250).
+    /// - Other services leave it as it is.
+    fn after_request(&mut self, request: &[u8], outcome: Result<&[u8], ()>) {
+        match request.first() {
+            Some(0x34) => {
+                self.accepted = match outcome {
+                    Ok([0x74, ..]) => Some(0),
+                    _ => None,
+                };
+            }
+            Some(0x35 | 0x37 | 0x38 | 0x10 | 0x11) => self.accepted = None,
+            _ => {}
+        }
     }
 
     /// The 1-based index of the block to send next, and its wire counter.
@@ -162,10 +178,34 @@ impl TransferCounter {
         Ok((index, wire_counter(index)))
     }
 
-    /// The block `index` was accepted. A block that failed is not counted, so a retry repeats
-    /// the same counter, which the ECU accepts (clause 14.4).
-    fn accept(&mut self, index: u64) {
-        self.accepted = Some(index);
+    /// Takes the outcome of sending block `index` with counter `counter`.
+    ///
+    /// - A positive response echoing the counter counts the block.
+    /// - A negative response, or a positive one that does not echo the counter, ends the
+    ///   tracked transfer: whether the ECU kept the data depends on the ECU, so a same-counter
+    ///   retry is not safe, and a new RequestDownload is needed.
+    /// - No response (a timeout, lost events, a transport failure) leaves the count, so a
+    ///   retry sends the same counter. Clause 14.4 has the server accept a repeat of the
+    ///   previous counter, which is what makes that retry possible after a lost response.
+    fn after_block(
+        &mut self,
+        index: u64,
+        counter: u8,
+        outcome: Result<Vec<u8>, HostError>,
+    ) -> Result<(), HostError> {
+        match outcome {
+            Ok(response) => match check_transfer_response(index, counter, response) {
+                Ok(()) => {
+                    self.accepted = Some(index);
+                    Ok(())
+                }
+                Err(error) => {
+                    self.accepted = None;
+                    Err(error)
+                }
+            },
+            Err(error) => Err(error),
+        }
     }
 }
 
@@ -173,6 +213,15 @@ impl TransferCounter {
 /// 0xFF, 0x00, 0x01, ... (clause 14.4).
 fn wire_counter(index: u64) -> u8 {
     (index % 256) as u8
+}
+
+/// A `ServiceRequest` must not carry TransferData: a repeated counter could be acknowledged
+/// without the data being written, so every block goes through `flash_transfer`'s count.
+fn refuse_transfer_data(request: &[u8]) -> Result<(), HostError> {
+    match request.first() {
+        Some(0x36) => Err(HostError::UseFlashTransfer),
+        _ => Ok(()),
+    }
 }
 
 /// TransferData (0x36): the counter, then the data; clause 14.4.
@@ -195,16 +244,6 @@ fn check_transfer_response(block: u64, counter: u8, response: Vec<u8>) -> Result
         }),
         _ => Err(HostError::TransferRefused { block, response }),
     }
-}
-
-/// Whether the request starts a transfer, resetting the server's block counter: RequestDownload and
-/// RequestUpload.
-fn request_sid_positive(service: u16) -> u8 {
-    (service as u8).wrapping_add(0x40)
-}
-
-fn starts_transfer(request: &[u8]) -> bool {
-    matches!(request.first(), Some(0x34 | 0x35))
 }
 
 /// The VM's host for one job on one link.
@@ -234,10 +273,15 @@ impl WorkerHost {
         }
     }
 
-    /// The number of TransferData blocks the ECU has accepted since the last RequestDownload or
-    /// RequestUpload sent through this host (the 1-based index of the last accepted block), or
-    /// `None` when no transfer was started. This rising index, not the IR operand, is what the
-    /// write-job journal records for a block (ADR-244, ADR-250).
+    /// The number of TransferData blocks the ECU confirmed since the last RequestDownload sent
+    /// through this host, which is also the 1-based index of the last confirmed block. It is a
+    /// lower bound: after a lost response the ECU may hold one block more. `Some(0)` means a
+    /// transfer started with no confirmed block yet (it is not a block number); `None` means no
+    /// transfer is tracked (none started, or it ended, ADR-250).
+    ///
+    /// This rising index, not the IR operand, is what the write-job journal records for a block
+    /// (ADR-244). It is a `u64`, while `Journal::commit_block` takes a `u32`: the journaling
+    /// runner must convert it and never commit 0.
     pub fn transfer_block_index(&self) -> Option<u64> {
         self.transfer.accepted
     }
@@ -460,17 +504,12 @@ impl DiagHost for WorkerHost {
 
     fn service_request(&mut self, service: u16, payload: &[u8]) -> Result<Vec<u8>, HostError> {
         let request = service_request_bytes(service, payload)?;
-        let starts = starts_transfer(&request);
-        if starts {
-            // Whatever happens next, the earlier transfer is over.
-            self.transfer.end();
-        }
-        let response = self.send_recv(request)?;
-        // A positive response to RequestDownload / RequestUpload: the server's counter is 1.
-        if starts && response.first() == Some(&(request_sid_positive(service))) {
-            self.transfer.begin();
-        }
-        Ok(response)
+        // Every TransferData goes through the block counter of `flash_transfer`.
+        refuse_transfer_data(&request)?;
+        let response = self.send_recv(request.clone());
+        self.transfer
+            .after_request(&request, response.as_deref().map_err(|_| ()));
+        response
     }
 
     fn read_dtc(&mut self, mask: u8) -> Result<Vec<u8>, HostError> {
@@ -502,10 +541,8 @@ impl DiagHost for WorkerHost {
     // rises and wraps, so the counter comes from the host's own running count (ADR-250).
     fn flash_transfer(&mut self, _block: u32, data: &[u8]) -> Result<(), HostError> {
         let (index, counter) = self.transfer.next()?;
-        let response = self.send_recv(transfer_data_bytes(counter, data))?;
-        check_transfer_response(index, counter, response)?;
-        self.transfer.accept(index);
-        Ok(())
+        let outcome = self.send_recv(transfer_data_bytes(counter, data));
+        self.transfer.after_block(index, counter, outcome)
     }
 
     fn wait(&mut self, inquiry: u64, millis: u32) -> Result<bool, HostError> {
@@ -642,49 +679,128 @@ mod tests {
         }
     }
 
+    /// A counter with a transfer begun by a positive RequestDownload.
+    fn begun() -> TransferCounter {
+        let mut counter = TransferCounter::default();
+        counter.after_request(&[0x34, 0x00, 0x44], Ok(&[0x74, 0x20, 0x01, 0x02]));
+        counter
+    }
+
+    fn confirm(counter: &mut TransferCounter, index: u64) {
+        let (next, wire) = counter.next().unwrap();
+        assert_eq!(next, index);
+        counter
+            .after_block(next, wire, Ok(vec![0x76, wire]))
+            .unwrap();
+    }
+
     #[test]
     fn the_wire_counter_starts_at_one_and_wraps_after_ff_to_zero() {
-        let mut counter = TransferCounter::default();
-        assert_eq!(counter.accepted, None);
+        let counter = TransferCounter::default();
         assert!(matches!(counter.next(), Err(HostError::NoTransferActive)));
-        counter.begin();
+        let mut counter = begun();
+        assert_eq!(counter.accepted, Some(0));
         assert_eq!(counter.next().unwrap(), (1, 0x01));
         for index in 1..=255 {
-            counter.accept(index);
+            confirm(&mut counter, index);
         }
         assert_eq!(counter.next().unwrap(), (256, 0x00));
-        counter.accept(256);
+        confirm(&mut counter, 256);
         assert_eq!(counter.next().unwrap(), (257, 0x01));
-        counter.accept(511);
-        assert_eq!(counter.next().unwrap(), (512, 0x00));
-        // Past a u32 block count.
         assert_eq!(wire_counter(u64::from(u32::MAX) + 1), 0x00);
         assert_eq!(wire_counter(254), 0xFE);
         assert_eq!(wire_counter(255), 0xFF);
     }
 
     #[test]
-    fn a_failed_block_is_repeated_with_the_same_counter_and_a_new_transfer_restarts_at_one() {
+    fn a_download_request_begins_a_transfer_only_when_answered_positively() {
+        let download = [0x34, 0x00, 0x44];
         let mut counter = TransferCounter::default();
-        counter.begin();
-        counter.accept(1);
-        assert_eq!(counter.next().unwrap(), (2, 0x02));
-        // Nothing accepted: the retry asks for the same block.
-        assert_eq!(counter.next().unwrap(), (2, 0x02));
-        counter.begin();
+        counter.after_request(&download, Ok(&[0x7F, 0x34, 0x22]));
+        assert_eq!(counter.accepted, None);
+        counter.after_request(&download, Ok(&[0x74, 0x20, 0x01, 0x02]));
+        assert_eq!(counter.accepted, Some(0));
+        confirm(&mut counter, 1);
+        confirm(&mut counter, 2);
+        // A second download mid-transfer starts over.
+        counter.after_request(&download, Ok(&[0x74, 0x20]));
+        assert_eq!(counter.accepted, Some(0));
         assert_eq!(counter.next().unwrap(), (1, 0x01));
-        counter.end();
-        assert!(matches!(counter.next(), Err(HostError::NoTransferActive)));
+        // A failed one leaves no transfer, as does no response.
+        confirm(&mut counter, 1);
+        counter.after_request(&download, Ok(&[0x7F, 0x34, 0x22]));
+        assert_eq!(counter.accepted, None);
+        counter.after_request(&download, Ok(&[0x74, 0x20]));
+        counter.after_request(&download, Err(()));
+        assert_eq!(counter.accepted, None);
+        // A response of another service does not begin one.
+        counter.after_request(&download, Ok(&[0x77]));
+        assert_eq!(counter.accepted, None);
     }
 
     #[test]
-    fn only_download_and_upload_requests_start_a_transfer() {
-        assert!(starts_transfer(&[0x34, 0x00, 0x44]));
-        assert!(starts_transfer(&[0x35, 0x00, 0x44]));
-        for request in [&[0x36, 0x01][..], &[0x37], &[0x22, 0xF1, 0x90], &[]] {
-            assert!(!starts_transfer(request), "{request:02X?}");
+    fn these_requests_end_the_tracked_transfer_whatever_the_response() {
+        // RequestUpload never begins one either.
+        let mut counter = TransferCounter::default();
+        counter.after_request(&[0x35, 0x00, 0x44], Ok(&[0x75, 0x20, 0x01]));
+        assert_eq!(counter.accepted, None);
+        for request in [
+            &[0x35, 0x00, 0x44][..],
+            &[0x37],
+            &[0x38, 0x01],
+            &[0x10, 0x01],
+            &[0x11, 0x01],
+        ] {
+            for outcome in [Ok(&[0x7F, request[0], 0x22][..]), Ok(&[0x00][..]), Err(())] {
+                let mut counter = begun();
+                counter.after_request(request, outcome);
+                assert_eq!(counter.accepted, None, "{request:02X?}");
+                assert!(matches!(counter.next(), Err(HostError::NoTransferActive)));
+            }
         }
-        assert_eq!(request_sid_positive(0x34), 0x74);
+        // Other services leave it.
+        let mut counter = begun();
+        counter.after_request(&[0x22, 0xF1, 0x90], Ok(&[0x62, 0xF1, 0x90]));
+        counter.after_request(&[0x31, 0x01, 0xFF, 0x00], Err(()));
+        assert_eq!(counter.accepted, Some(0));
+    }
+
+    #[test]
+    fn only_a_missing_response_lets_a_block_be_retried_with_the_same_counter() {
+        let mut counter = begun();
+        confirm(&mut counter, 1);
+        for lost in [
+            HostError::NoResponse,
+            HostError::EventsLost,
+            HostError::WorkerUnresponsive("StartComPrimitive"),
+        ] {
+            let result = counter.after_block(2, 0x02, Err(lost));
+            assert!(result.is_err());
+            assert_eq!(counter.accepted, Some(1));
+            assert_eq!(counter.next().unwrap(), (2, 0x02));
+        }
+        // A negative response or a wrong echo ends the transfer: a new RequestDownload is needed.
+        let refused = counter.after_block(2, 0x02, Ok(vec![0x7F, 0x36, 0x73]));
+        assert!(matches!(refused, Err(HostError::TransferRefused { .. })));
+        assert_eq!(counter.accepted, None);
+        let mut counter = begun();
+        let wrong = counter.after_block(1, 0x01, Ok(vec![0x76, 0x02]));
+        assert!(matches!(wrong, Err(HostError::TransferEchoMismatch { .. })));
+        assert_eq!(counter.accepted, None);
+    }
+
+    #[test]
+    fn a_service_request_cannot_carry_transfer_data() {
+        assert!(matches!(
+            refuse_transfer_data(&[0x36, 0x01, 0xAA]),
+            Err(HostError::UseFlashTransfer)
+        ));
+        refuse_transfer_data(&[0x34, 0x00]).unwrap();
+        refuse_transfer_data(&[0x37]).unwrap();
+    }
+
+    #[test]
+    fn transfer_data_bytes_carry_the_counter_first() {
         assert_eq!(transfer_data_bytes(0x00, &[1, 2]), [0x36, 0x00, 1, 2]);
     }
 

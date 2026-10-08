@@ -57,11 +57,17 @@ Steps (`agent::check_program`, `agent::launch::launch_j2534_worker`, then `agent
 positive response that echoes the block sequence counter; a negative response or a wrong echo
 fails the job (ADR-250). The instruction's `block` operand is constant per instruction, so the
 host ignores it and keeps its own count of the blocks of the transfer: the counter is 1 for the
-first block after a RequestDownload (0x34) or RequestUpload (0x35) sent through the host
-(a `ServiceRequest` answered positively), rises by one per accepted block and continues at 0
-after 0xFF (ISO 14229-1:2026 clause 14.4). A `FlashTransfer` with no such request before it is
-an error and sends nothing. `WorkerHost::transfer_block_index` gives the count of accepted
-blocks, which the write-job journal records (ADR-244).
+first block after a RequestDownload (0x34, a `ServiceRequest` answered positively) sent through
+the host, rises by one per confirmed block and continues at 0 after 0xFF (ISO 14229-1:2026
+clause 14.4). Only a positive 0x34 begins a transfer. RequestUpload (0x35), RequestTransferExit
+(0x37), RequestFileTransfer (0x38), DiagnosticSessionControl (0x10) and ECUReset (0x11) end it
+whatever the response, and so does a negative TransferData response or a wrong echo (a new
+RequestDownload is needed). After no response the count stays, so a retry repeats the counter.
+A `FlashTransfer` with no tracked transfer is an error and sends nothing, and a
+`ServiceRequest` for 0x36 is refused. `WorkerHost::transfer_block_index` gives the number of
+confirmed blocks (`Some(0)`: started, none yet), which the write-job journal records
+(ADR-244); it is a `u64`, so the journaling runner converts it for `commit_block` and never
+commits 0.
 
 ## Output and exit status
 

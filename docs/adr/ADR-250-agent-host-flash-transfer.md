@@ -25,21 +25,33 @@ instruction would be an IR schema change (ADR-245 item 7).
    A negative response, another service's answer or a wrong echo is a host error (the job
    fails; nothing is assumed accepted).
 2. **The wire counter comes from the host's running count.** The host counts the blocks the ECU
-   accepted since the last RequestDownload or RequestUpload. The next block has index
-   `count + 1` and the wire counter `index mod 256`: 1 for the first block, 0xFF for the 255th,
-   0x00 for the 256th, then 0x01 again. A block that fails is not counted, so a retry repeats
-   the same counter, which the standard obliges the server to accept.
-3. **The count resets on a download or upload request.** A `ServiceRequest` with service 0x34
-   or 0x35 sent through the host ends the earlier transfer, and a positive response starts a
-   new one at count 0. A `FlashTransfer` with no transfer started on this host is an error and
-   sends nothing, so a resumed job cannot send blocks with a guessed counter: it restarts from
-   RequestDownload (ADR-229).
+   confirmed since the last RequestDownload. The next block has index `count + 1` and the wire
+   counter `index mod 256`: 1 for the first block, 0xFF for the 255th, 0x00 for the 256th, then
+   0x01 again. Retries depend on the outcome of a block:
+   - A positive response that echoes the counter counts the block.
+   - No response (timeout, lost events, transport failure) leaves the count, so a retry sends
+     the same counter. Clause 14.4 has the server accept a repeat of the previous counter
+     after a lost response, which makes this retry possible.
+   - A negative response, or a positive one that does not echo the counter, ends the tracked
+     transfer. Whether the ECU kept the data of a refused block depends on the ECU, so a
+     same-counter retry is not safe; a new RequestDownload is needed (ADR-229).
+3. **What begins and ends the tracked transfer.** Only a `ServiceRequest` with service 0x34
+   answered positively begins it, at count 0; a second one mid-transfer starts over. These end
+   it whatever the response: RequestUpload (0x35, which never begins one, since `FlashTransfer`
+   would discard upload data), RequestTransferExit (0x37), RequestFileTransfer (0x38),
+   DiagnosticSessionControl (0x10) and ECUReset (0x11); so does a failed or unanswered 0x34. A
+   `FlashTransfer` with no tracked transfer is an error and sends nothing, so a resumed job
+   cannot send blocks with a guessed counter. A `ServiceRequest` for TransferData (0x36) is
+   refused by the host, so every block goes through the count.
 4. **The IR operand `block` is ignored by the host.** It is constant per instruction and carries
    no information the running count lacks. The IR is unchanged.
 5. **The journal records the running index.** `WorkerHost::transfer_block_index` gives the
-   index of the last accepted block, which rises monotonically through the transfer without
-   wrapping at 255. The write-job journal (ADR-244) records that, not the operand and not the
-   wire counter.
+   number of blocks the ECU confirmed, which rises through the transfer without wrapping at
+   255. It is a lower bound: after a lost response the ECU may hold one more. `Some(0)` means a
+   transfer started with no confirmed block, not a block number. The write-job journal
+   (ADR-244) records this index, not the operand and not the wire counter. It is a `u64`
+   while `Journal::commit_block` takes a `u32`, so the journaling runner converts it and never
+   commits 0.
 6. **Policy.** The simulator permission of ADR-247 covers the `FlashTransfer` instruction, as it
    covers `RoutineControl`, and the read-only permission refuses it (service 0x36). This amends
    ADR-247 Decision item 4: only the refusal of `FlashTransfer` is superseded. The
@@ -51,7 +63,7 @@ instruction would be an IR schema change (ADR-245 item 7).
   TransferData blocks, RequestTransferExit. A release agent still cannot transfer.
 - A transfer longer than 255 blocks works; the integration test transfers more blocks than the
   counter holds before it wraps.
-- RequestFileTransfer (0x38) also resets the server's counter, but the host does not track it
-  as a transfer start: it is not used by any procedure.
-- A repeated block after a lost response is not repeated by the host itself; the VM's host
-  error ends the job and the restart rules of ADR-229 apply.
+- RequestFileTransfer (0x38) also resets the server's counter, but the host does not begin a
+  transfer on it; it only ends the tracked one.
+- The host does not repeat a block itself; a lost response is a host error that ends the job,
+  and the restart rules of ADR-229 apply. A retry by a caller keeps the same counter.

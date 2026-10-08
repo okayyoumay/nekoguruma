@@ -277,3 +277,13 @@ ls -la /tmp/iso22900-service-stop-*.sock
 - **Existing Servers**: Can coexist if on different identifiers or library names (different keys)
 - **Migration**: No data migration needed; key computed on-the-fly from registry
 
+
+## If Keyed Stop Is Reintroduced
+
+The archived design is not runtime behavior. Bringing it back would also need:
+
+- dedicated lifecycle modules split out of the stdio JSON-RPC server, with integration tests of keyed stop through the stdio path;
+- keyed descriptor passing for systemd socket activation;
+- logging of key-to-PID mappings;
+- on Unix, restricting stop-signal senders by OS user or group;
+- on Windows, named-event inheritance rules that isolate child instances.

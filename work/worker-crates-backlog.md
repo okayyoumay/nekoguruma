@@ -1493,41 +1493,27 @@ Past root causes and their fixes: `crates/j2534-0404-service/docs/implementation
 
 ### Prioritized Backlog
 
-- **P1**: Add explicit evolution notes for reserved/deprecated fields.
-- **P2**: Add a minimal client usage sample aligned with latest schema.
+- **P2**: `crates/vci-service-interface/docs/proto-rules.md` says only that "a few fields may use reserved or skipped tag numbers" ("Existing Exceptions"), with no rule for retiring a field, although `crates/vci-service-interface/src/proto/service.proto` already does it (`reserved 5;` and `reserved "cll_tag";`). Done when: `proto-rules.md` has a section on field evolution that says how a field is retired (reserve both its number and its name, never reuse them), whether the `deprecated` option is used, and how `docs/rpc-api-guide.md` records the change.
+- **P3**: Neither `crates/vci-service-interface` nor `docs/rpc-api-guide.md` has a minimal client example; the guide's code blocks show a header sample, the handle tree and a call sequence only. Done when: a short client example (a doc test or a file under the crate's `examples/`) connects to a worker and makes one call with the current generated types, and the guide links to it.
 
 ## Cross-crate items
 
 ### `iso22900-service`: SubscribeEvent shutdown (`crates/iso22900-service/docs/subscribe-event-shutdown.md`)
 
-- **P2**: Add an integration test that checks for callback leaks after repeated subscribe/terminate cycles.
-- **P2**: Document the expected status codes (`cancelled` vs `aborted`) in `docs/rpc-api-guide.md`.
-- **P3**: If the note's assumptions stop holding, reintroduce explicit unregister calls in `terminate_subscription*` and re-test the race behavior.
-- **P3**: Add metrics/logging for subscription termination count and finalizer unregister outcomes.
-
-### `iso22900-service`: keyed instance stop (`crates/iso22900-service/docs/keyed-stop-design.md`)
-
-Only if the archived keyed-stop design becomes runtime behavior again:
-
-- **P3**: Reintroduce dedicated lifecycle modules from `src/jsonrpc.rs`, with integration coverage of keyed stop through the stdio server path.
-- **P3**: Socket activation (systemd): keyed descriptor passing.
-- **P3**: Log key-to-PID mappings.
-- **P3**: Restrict stop-signal senders by OS user/group on Unix.
-- **P3**: Windows: named event inheritance to isolate child instances.
+- **P2**: No test checks that repeated `SubscribeEvent` cycles ended by the client cancelling the stream leave no event callback registered on `iso22900-service`; that path unregisters in the finalizer of `rpc_subscribe_event` (`crates/iso22900-service/src/service/rpc_primitive.rs`) once `stream_tx.closed()` fires. `crates/iso22900-service/tests/grpc_mock.rs` subscribes once per test, and `iso22900-mock` (`crates/iso22900-mock/src/lib.rs`) keeps a single callback slot with no register/unregister counters. Done when: the mock counts registrations and unregistrations behind a `__mock_` getter (added if not yet present), and a test runs several subscribe-then-cancel cycles and asserts the mock's register and unregister counts balance.
+- **P2**: No test checks that repeated `SubscribeEvent` cycles ended by destroying the CLL leave no event callback registered on `iso22900-service`; that path goes through `terminate_subscription` (`crates/iso22900-service/src/service/rpc.rs`), which by policy does not unregister and relies on the native API to drop the callback with the link (`crates/iso22900-service/docs/subscribe-event-shutdown.md`). `crates/iso22900-service/tests/grpc_mock.rs` subscribes once per test, and `iso22900-mock` (`crates/iso22900-mock/src/lib.rs`) keeps a single callback slot with no register/unregister counters. Done when: the mock counts registrations and unregistrations behind a `__mock_` getter (added if not yet present), and a test runs several subscribe-then-destroy cycles and asserts no callback stays registered.
+- **P2**: `docs/rpc-api-guide.md` ("`SubscribeEvent` Streaming Behavior") documents only the `Cancelled` status sent when the CLL is destroyed. `iso22900-service` also ends streams with `Status::cancelled` on module disconnect (`terminate_subscriptions_for_module`), on shutdown (`remove_subscriptions` in `crates/iso22900-service/src/service/rpc.rs`) and when a new subscription replaces one for the same link (`rpc_subscribe_event` in `crates/iso22900-service/src/service/rpc_primitive.rs`); it never sends `Aborted`. Done when: the guide lists each of these terminations with the status the client receives.
+- **P3**: `iso22900-service` logs nothing when it terminates `SubscribeEvent` streams (`terminate_stream_sender` and its callers in `crates/iso22900-service/src/service/rpc.rs`) or when the stream finalizer in `rpc_subscribe_event` (`crates/iso22900-service/src/service/rpc_primitive.rs`) unregisters a callback. Done when: each termination and each finalizer unregister logs a structured `tracing` event with the module and link handles and the outcome.
 
 ### Windows tests on the gnullvm ABI (ADR-227)
 
-- **P2**: Run the Windows CI tests for `x86_64-pc-windows-gnullvm` instead of the runner's default MSVC host target, so they exercise the ABI the Windows workers ship with (ADR-227). Needs llvm-mingw on the Windows runner and a check that the `grpc_mock` harness finds the mock libraries under `target/<triple>/`.
+- **P2**: The `core-windows` job in `.github/workflows/ci.yml` runs the Windows tests for the runner's default MSVC host target, so they do not exercise the `x86_64-pc-windows-gnullvm` ABI the Windows workers ship with (ADR-227, Consequences). Done when: the job installs llvm-mingw, runs the tests with `--target x86_64-pc-windows-gnullvm`, and the `grpc_mock` harnesses find the mock libraries under `target/x86_64-pc-windows-gnullvm/`.
 
 ### `j2534-0404-service`: conformance audit Part B (`crates/j2534-0404-service/docs/iso22900-2-conformance-audit.md`)
 
-- **P2**: Triage the 25 ADR-documented deviations in Part B (mostly expected to be accepted as-is; see the Part B triage column).
+- **P2**: Part B row B10 of `crates/j2534-0404-service/docs/iso22900-2-conformance-audit.md` (ADR-056): `j2534-0404-service` stores the per-ECU overrides `CP_P2Star_Ecu` and `CP_P2Max_Ecu` but never applies them; the audit's suggested triage is "Backlog". Done when: the per-ECU values are applied where the service uses P2 and P2* timing, with a test, or the audit row and ADR-056 record why they stay unapplied.
+- **P2**: Part B row B20 of `crates/j2534-0404-service/docs/iso22900-2-conformance-audit.md` (ADR-105): `ERR_EXCEEDED_LIMIT` and `ERR_BUFFER_OVERFLOW` map onto `PDU_ERR_RESOURCE_ERROR` (`crates/j2534-0404-service/src/error.rs`), a code that Annex D.3 of ISO 22900-2:2009 (the edition the audit was made against) marks as not used by the D-PDU API; the audit suggests revisiting it, and the 2022 edition, which the project targets, has not been checked for this row. Done when: the row is checked against Annex D.3 of ISO 22900-2:2022, and the mapping is changed to a code that edition allows (with a test) or ADR-105 records why this one stays.
 
 ### `sim-vci` and `j2534-0404-mock`: two J2534 cdylib mocks
 
 - **P3**: `sim-vci` and `j2534-0404-mock` are both J2534 cdylib mocks; decide whether `sim-vci` builds on the full mock. Obstacles found in an analysis on 2026-10-06: (1) `unsigned long` width: the mock exports the `j2534-0404-sys` binding types, always 32-bit (`docs/worker-crates.md`, "`unsigned long` width"), while `sim-vci` uses the native `c_ulong` on 64-bit Linux (`crates/sim-vci/src/lib.rs`, `PassThruUlong`) because it is the counterpart for `NGR_J2534_LONG_SIZE=8`; building on the mock would lose that unless the mock (about 11,000 lines) is made width-generic. (2) CI cost: `sim-vci` is cross-checked for the six worker targets and release-built on main (`.github/workflows/ci.yml`), the mock only for host tests; merging cross-builds the whole mock and raises Actions minutes. (3) Two response models: the mock answers internally (loopback echo, fixed per-protocol replies, `__mock_*` injection), `sim-vci` hands ISO-TP requests to `sim-ecu`; a merge needs a rule for which one answers a channel, and existing mock tests depend on today's behaviour. (4) Test control and global state: the mock has about 75 `__mock_*` back-door exports and a per-test `__mock_reset` (`crates/j2534-0404-mock/docs/testing-guide.md`); `sim-vci` configures one process-wide ECU from `NGR_SIM_ECU_CONFIG`. (5) Dependency direction: the mock is a dev-dependency of `j2534-0404-service`, so pulling `sim-ecu` into it makes the worker test double depend on the vehicle simulator. Likely outcome (inferred, not decided): keep both, and share only small pieces such as constants via `j2534-defs` (the calling convention needs nothing shared: `sim-vci` declares its exports `extern "system"`, the mock uses its `exported_fn!` macro). Done when: the decision (merge, share parts, or keep separate) is recorded in `crates/sim-vci/docs/simulated-vci.md` and `docs/worker-crates.md`, and any agreed sharing is implemented. Blocked on: the maintainer's decision on merging, sharing parts, or keeping the two separate.
-
-### `serial_test` 3.x -> 4.x (RUSTSEC-2026-0205)
-
-- **P2**: `cargo audit` flags `scc` 2.4.0 (unsound `Array::insert`), pulled in by the `serial_test` dev-dependency of `iso22900-service` and `j2534-0404-service`. The fix needs `serial_test` 4.x: bump it, check that `#[serial]` is unchanged, and confirm the advisory is gone. Not a runtime dependency of any shipped binary.
-

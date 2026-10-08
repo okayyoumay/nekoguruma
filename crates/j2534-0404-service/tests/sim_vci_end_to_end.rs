@@ -16,7 +16,8 @@
 //! worker target (`scripts/abi-roundtrip.sh`), the environment names that target's build:
 //! `NGR_ABI_SERVICE` (the service binary, or a launcher that runs it, for example under
 //! qemu-user), `NGR_ABI_LIBRARY` (`sim-vci` built for the same target) and `NGR_ABI_EXPECT`
-//! (the ABI name the library must have, so a wrong build fails the test).
+//! (the ABI name the library must have, so a wrong build fails the test). A service binary
+//! named there must have the library's ABI too.
 //!
 //! This file holds a single test, so the process-wide `VCI_CONFIG_PATH` it
 //! sets for the spawned service cannot race with another test.
@@ -99,6 +100,25 @@ fn library_abi(library: &std::path::Path) -> Abi {
     abi
 }
 
+/// The service binary must be built for the library's ABI. A launcher script (a target run under
+/// qemu-user) is not checked; the script that writes it names the target's build.
+fn check_service_abi(service: &std::path::Path, abi: Abi) {
+    let mut magic = [0u8; 4];
+    let read = std::fs::File::open(service)
+        .and_then(|mut file| std::io::Read::read(&mut file, &mut magic))
+        .unwrap_or_else(|error| panic!("{}: {error}", service.display()));
+    if magic[..read].starts_with(b"\x7FELF") || magic[..read].starts_with(b"MZ") {
+        let service_abi = worker_host::abi::detect_file(service)
+            .unwrap_or_else(|error| panic!("{}: {error}", service.display()));
+        assert_eq!(
+            service_abi.name(),
+            abi.name(),
+            "{} is not built for the library's ABI",
+            service.display()
+        );
+    }
+}
+
 fn param(id: u32, class: PduParamClass, value: u32) -> ParamItem {
     ParamItem {
         id: Some(vci_service_interface::param_item::Id::ParamId(id)),
@@ -173,6 +193,7 @@ async fn read_the_vin() {
         .as_nanos();
     let (service, library) = target_build();
     let abi = library_abi(&library);
+    check_service_abi(&service, abi);
     // The width of J2534 `unsigned long` the ABI interpretation table gives (design 7.1.2).
     let long_size = abi.default_long_size();
     assert_eq!(

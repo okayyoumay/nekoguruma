@@ -201,7 +201,8 @@ jobs:
             target/${{ matrix.target }}/debug/sim_vci.dll
             target/${{ matrix.target }}/debug/j2534-0404-service.exe
           if-no-files-found: error
-          retention-days: 1
+          # Long enough to re-run abi-roundtrip-windows alone after a failure.
+          retention-days: 7
       # sim-vci's exports must carry the plain J2534 names (stdcall on win-x86, 7.1.2).
       - name: Check sim-vci exports
         run: PROFILE=release ./scripts/abi-roundtrip.sh ${{ matrix.target }}

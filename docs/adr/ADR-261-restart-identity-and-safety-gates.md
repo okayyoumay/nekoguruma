@@ -89,6 +89,8 @@ Three points are not settled by ADR-229 or the design:
 - The journal holds the target VIN in the clear until the journal's protection (design 5.5)
   encrypts it. Design 5.5 already places VINs in the journal, under its retention and deletion
   rules, which is what ADR-256 item 6 found missing for a lock file's name.
+  The maintainer accepted this on 2026-10-09 on one condition: no caller outside tests passes a
+  target VIN (`JournalSetup::vin`) until the journal's protection has landed.
 - A journal written before the `TargetVin` record names no VIN: it resumes only with none, and
   a restart from it takes the passive teardown.
 - `Journal::create` takes the target VIN. ADR-244's record set gains `TargetVin`, which must

@@ -106,7 +106,8 @@ commit fails, are the job runner's duties.
 for a program with a flash recovery plan, creates the journal once the link is open and the
 policy allows the program, before anything is sent to the ECU; a program without a plan keeps
 none. A journal that already exists ends the job with nothing sent: a job that ran before goes
-on through `resume_program_journaled` ("Restart entry" below). Each time execution arrives at a plan's boundary, before that instruction runs, it
+on through `resume_program_journaled` ("Restart entry" below). Each time execution arrives at a
+plan's boundary, before that instruction runs, it
 commits:
 
 - at the entry, once per job and before its first transfer: the hardware part number and
@@ -161,7 +162,7 @@ anything is sent to the ECU, it opens the job's journal (`Journal::open`) and cl
 
 | Decision | What the runner does |
 |---|---|
-| plain start | runs the program from its start on the same journal; its step count starts at `restart::next_steps`, after the journal's last record, and the identity is read again. A program without a plan and without a journal runs without one |
+| plain start | runs the program from its start on the same journal; its step count starts at `restart::next_steps`, after the journal's last record, and the identity is read again. A program without a plan runs without a journal, when it has none or one that records no transfer |
 | `OnSiteInterventionRequired` | ends in `JobError::OnSiteInterventionRequired` with the classification's reason; nothing is sent |
 | `Restart` | runs `restart::check_before_ecu`, then ends in `JobError::OnSiteInterventionRequired(RestartOrderUnavailable)`, because the rest of the restart order (teardown, ECU state check, replay) does not run in the agent; nothing is sent to the ECU |
 

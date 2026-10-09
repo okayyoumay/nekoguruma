@@ -45,8 +45,10 @@ These questions are left open by ADR-229 and ADR-253:
 3. **A plain start goes on with the existing journal.** The program runs from its start on the
    opened journal, and its step count starts at `restart::next_steps`, so its records come
    after the old ones. The identity is read and committed again, which the journal allows while
-   no transfer has started. A program without a flash recovery plan and without a journal runs
-   without one, as a first run would (ADR-252 item 7).
+   no transfer has started. A program without a flash recovery plan keeps no journal (ADR-252
+   item 7): it runs without one when it has none, or when the one it has records no transfer.
+   A journal that does not read back ends in on-site intervention whatever the program, as
+   `classify` decides.
 4. **Step 1 of an interrupted transfer** (`restart::check_before_ecu`) runs in this order:
    1. **The resume limit.** A stage whose journal count has reached the plan's `max_resumes`
       ends in `ResumeLimitReached`.
@@ -88,7 +90,12 @@ These questions are left open by ADR-229 and ADR-253:
 - A program that declares a voltage range cannot be restarted on a VCI that reports no supply
   voltage: J2534 workers without `READ_VBATT` read it as "cannot be established". This errs on
   the side of on-site intervention.
-- A restarted job's step count goes on across runs, so `JobLimits::max_steps` bounds all of a
-  job's runs together (ADR-253 item 3).
+- A resumed run's step count continues from the journal's last record, so
+  `JobLimits::max_steps` also counts the earlier runs' steps up to that record (ADR-253 item 3).
+- A plain start writes no VM state when it starts at a plan's entry (ADR-252 item 6). For a plan
+  whose entry is instruction 0, the newest state in the journal can then be one an earlier run
+  took on a jump back to the entry, with that run's locals and stack. `classify` would hand that
+  state to a later restart as its entry state. A restart that passes step 1 sends nothing
+  (item 5), so nothing uses it yet; the replay to the erase must not start from it.
 - `ngr-agent run` keeps no journal and has no resume. Only library callers reach
   `resume_program_journaled`.

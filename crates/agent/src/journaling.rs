@@ -85,6 +85,11 @@ impl<S: Store> JobJournal<S> {
         &self.journal
     }
 
+    #[cfg(test)]
+    pub(crate) fn into_journal(self) -> Journal<S> {
+        self.journal
+    }
+
     /// Commits the markers and the identity the boundaries at `state.pc` call for. Called once
     /// each time execution arrives at an instruction, before it runs. A cancel stops it before
     /// each identity read (the runner's contract: no request after the one in flight).

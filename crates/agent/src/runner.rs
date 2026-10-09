@@ -782,6 +782,8 @@ mod tests {
         /// The supply voltage the VCI reports; `None` reports none.
         voltage: Option<i64>,
         voltage_reads: u32,
+        /// Reading the voltage fails, as a worker that cannot be reached would.
+        voltage_fails: bool,
     }
 
     impl FlashHost {
@@ -795,6 +797,7 @@ mod tests {
                 lose_routine: None,
                 voltage: None,
                 voltage_reads: 0,
+                voltage_fails: false,
             }
         }
 
@@ -808,6 +811,10 @@ mod tests {
             &mut self,
             input: diag_ir::RuntimeInput,
         ) -> Result<crate::inputs::Reading, HostError> {
+            if input == diag_ir::RuntimeInput::SupplyVoltageMillivolts && self.voltage_fails {
+                self.voltage_reads += 1;
+                return Err(HostError::NoResponse);
+            }
             Ok(match (input, self.voltage) {
                 (diag_ir::RuntimeInput::SupplyVoltageMillivolts, Some(millivolts)) => {
                     self.voltage_reads += 1;
@@ -1740,6 +1747,51 @@ mod tests {
         assert_eq!(left, 0);
     }
 
+    /// A resume whose link fails neither opens nor creates a journal: the job that ran before
+    /// keeps the journal it left.
+    #[test]
+    fn a_resume_whose_link_fails_leaves_the_journal_as_it_was() {
+        let program = flash_program();
+        let dir = journal_dir("resume-link-fails");
+        interrupted(&program, &dir);
+        let before = std::fs::read(
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path(),
+        )
+        .unwrap();
+        let setup = file_setup(&dir);
+        let result = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let handle = Handle::current();
+                tokio::task::spawn_blocking(move || {
+                    run_job(
+                        handle,
+                        unreachable_client(),
+                        &LinkConfig::iso15765(0x7E0, 0x7E8),
+                        &program,
+                        JobLimits::default(),
+                        &AtomicBool::new(false),
+                        Some(JournalMode::Resume(setup)),
+                    )
+                })
+                .await
+                .unwrap()
+            });
+        assert!(matches!(result, Err(JobError::Link(_))), "{result:?}");
+        let files: Vec<_> = std::fs::read_dir(&dir).unwrap().collect();
+        assert_eq!(files.len(), 1);
+        let after = std::fs::read(files[0].as_ref().unwrap().path()).unwrap();
+        assert_eq!(after, before);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn a_program_without_a_plan_keeps_no_journal() {
         let dir =
@@ -1943,6 +1995,48 @@ mod tests {
             std::fs::remove_dir_all(&dir).unwrap();
         }
 
+        // The range is inclusive at both ends.
+        for millivolts in [11_000, 15_000] {
+            let dir = journal_dir("resume-voltage-edge");
+            interrupted(&program, &dir);
+            let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+            host.voltage = Some(millivolts);
+            let result = resume(&program, &dir, &mut host, false);
+            assert!(
+                matches!(
+                    result,
+                    Err(JobError::OnSiteInterventionRequired(
+                        OnSiteReason::RestartOrderUnavailable { .. }
+                    ))
+                ),
+                "{millivolts}: {result:?}"
+            );
+            assert_eq!(resumes(&dir), 1);
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+
+        // A worker that cannot be asked gives no reading.
+        let dir = journal_dir("resume-voltage-error");
+        interrupted(&program, &dir);
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        host.voltage_fails = true;
+        let result = resume(&program, &dir, &mut host, false);
+        assert!(
+            matches!(
+                result,
+                Err(JobError::OnSiteInterventionRequired(
+                    OnSiteReason::SupplyVoltage {
+                        millivolts: None,
+                        ..
+                    }
+                ))
+            ),
+            "{result:?}"
+        );
+        assert_eq!(host.voltage_reads, 1);
+        assert_eq!(resumes(&dir), 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+
         let program = flash_program();
         let dir = journal_dir("resume-no-voltage");
         interrupted(&program, &dir);
@@ -1976,6 +2070,52 @@ mod tests {
         assert_eq!(host.sent(), []);
         assert_eq!(resumes(&dir), 0);
         std::fs::remove_dir_all(&dir).unwrap();
+
+        // Without a voltage range, the cancel is caught before the commit.
+        let program = flash_program();
+        let dir = journal_dir("resume-cancel-no-voltage");
+        interrupted(&program, &dir);
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        let result = resume(&program, &dir, &mut host, true);
+        assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
+        assert_eq!(resumes(&dir), 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A resume count that cannot be committed ends the job with nothing sent.
+    #[test]
+    fn a_failed_resume_commit_ends_the_job_with_nothing_sent() {
+        let program = flash_program();
+        let interrupted_journal = |fail_at| {
+            let commits = Rc::new(Cell::new(0));
+            let mut host = FlashHost::new(Rc::clone(&commits));
+            host.lose_routine = Some(0xFF00);
+            let mut journal = counting_journal(&commits, fail_at);
+            let result = run_on(
+                &program,
+                &mut host,
+                JobLimits::default(),
+                &AtomicBool::new(false),
+                Some(&mut journal),
+            );
+            assert!(matches!(result, Err(JobError::Host { pc: ERASE, .. })));
+            (journal.into_journal(), commits.get())
+        };
+        let (_, first_run_commits) = interrupted_journal(None);
+        // The same run again, on a store that fails the next commit: the resume's.
+        let (journal, commits) = interrupted_journal(Some(first_run_commits + 1));
+        assert_eq!(commits, first_run_commits);
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        let result = resume_on(
+            &program,
+            &mut host,
+            JobLimits::default(),
+            &AtomicBool::new(false),
+            Ok(journal),
+            identity_sources(),
+        );
+        assert!(matches!(result, Err(JobError::Journal(_))), "{result:?}");
+        assert_eq!(host.sent(), []);
     }
 
     /// A job stopped before its erase starts again on the same journal, its records coming

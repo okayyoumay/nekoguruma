@@ -96,7 +96,9 @@ fn waiting_program() -> Program {
         Op::PushBytes(0),
         Op::ServiceRequest { service: 0x22 },
         Op::Pop,
-        Op::Wait { millis: 3_000 },
+        Op::Wait {
+            millis: WAIT.as_millis() as u32,
+        },
         Op::PushBytes(0),
         Op::ServiceRequest { service: 0x22 },
     ])
@@ -168,8 +170,8 @@ fn a_link_that_cannot_be_closed_keeps_the_guards_until_the_worker_is_gone() {
     unsafe {
         std::env::set_var("VCI_CONFIG_PATH", &paths.config);
         std::env::set_var("NGR_SIM_VCI_CONTROL_DIR", &paths.control_dir);
-        // The ECU's state file is rewritten after every request it handles, which tells this
-        // test when the first request is done.
+        // The ECU's state file appears when the job's open creates the ECU, which tells this
+        // test when the job has started.
         std::env::set_var("NGR_SIM_ECU_STATE", &paths.ecu_state);
         std::env::remove_var("VCI_SERVICE_INSECURE_NO_AUTH");
         // The simulated ECU uses its built-in configuration.
@@ -199,20 +201,21 @@ fn a_link_that_cannot_be_closed_keeps_the_guards_until_the_worker_is_gone() {
     drop(paths);
 }
 
-/// Waits until the ECU's state file changes after it first exists: the first request was
-/// handled.
+/// How long the program waits between its two requests.
+const WAIT: Duration = Duration::from_secs(6);
+/// How long after the ECU exists the VCI is unplugged: long enough for the rest of the open and
+/// the first request, well inside [`WAIT`].
+const UNPLUG_AFTER: Duration = Duration::from_secs(2);
+
+/// Waits until the job's open has created the ECU (`sim-vci` writes its state file then), and
+/// [`UNPLUG_AFTER`] more. The file is also rewritten on every request, so its content cannot
+/// tell the first request from the creation without a race; a fixed point inside the program's
+/// wait can.
 async fn wait_for_first_request(ecu_state: &Path) {
-    let mut seen = None;
-    loop {
-        if let Ok(content) = std::fs::read(ecu_state) {
-            match &seen {
-                None => seen = Some(content),
-                Some(first) if *first != content => return,
-                Some(_) => {}
-            }
-        }
+    while !ecu_state.exists() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+    tokio::time::sleep(UNPLUG_AFTER).await;
 }
 
 async fn flow(control_dir: &Path, ecu_state: &Path, setup: GuardSetup) {

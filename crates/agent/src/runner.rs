@@ -359,9 +359,24 @@ fn run_job(
         return Err(JobError::Cancelled);
     }
     let timings = Timings::for_link(config);
-    let link = handle
-        .block_on(link::open(&mut client, config, timings.unary))
-        .map_err(JobError::Link)?;
+    // An open that fails partway closes what it opened; when even that fails, or the open
+    // panics, the worker may still hold the module or the link (ADR-258).
+    let opened = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        handle.block_on(link::open_tracked(&mut client, config, timings.unary))
+    }));
+    let link = match opened {
+        Ok(Ok(link)) => link,
+        Ok(Err(failure)) => {
+            if !failure.cleaned_up {
+                mark_link_unconfirmed(&guards);
+            }
+            return Err(JobError::Link(failure.error));
+        }
+        Err(_) => {
+            mark_link_unconfirmed(&guards);
+            return Err(JobError::Panicked);
+        }
+    };
     let permission = link.permission;
     // Declared before the host, which owns the link's event stream: on a panic the stream is
     // dropped first, then the link is closed.
@@ -450,14 +465,14 @@ impl OpenLink {
             Ok(Err(error)) => tracing::warn!(%error, "could not close the link"),
             Err(_) => tracing::warn!("closing the link panicked"),
         }
-        if let Some(guards) = self
-            .guards
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_mut()
-        {
-            guards.mark_link_unconfirmed();
-        }
+        mark_link_unconfirmed(&self.guards);
+    }
+}
+
+/// Marks the guards in `slot`: the worker may still hold the job's link (ADR-258).
+fn mark_link_unconfirmed(slot: &GuardSlot) {
+    if let Some(guards) = slot.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        guards.mark_link_unconfirmed();
     }
 }
 
@@ -2787,10 +2802,13 @@ mod tests {
 
     // ------------------------------------------------------------ closing the link (ADR-258)
 
-    /// A worker that answers the RPCs a link needs and records them. `fail_disconnect` makes the
+    /// A worker that answers the RPCs a link needs and records them. `fail_open` makes the link's
+    /// connect fail and the module's disconnect too, as a VCI unplugged during the open does.
+    /// `fail_disconnect` makes the
     /// logical link's disconnect fail, as a VCI that was unplugged does.
     struct FakeWorker {
         fail_disconnect: bool,
+        fail_open: bool,
         calls: Arc<Mutex<Vec<&'static str>>>,
     }
 
@@ -2835,6 +2853,9 @@ mod tests {
             _: tonic::Request<vci_service_interface::ModuleDisconnectRequest>,
         ) -> Result<tonic::Response<vci_service_interface::Response>, tonic::Status> {
             self.note("ModuleDisconnect");
+            if self.fail_open {
+                return Err(tonic::Status::failed_precondition("device not connected"));
+            }
             Ok(tonic::Response::new(Default::default()))
         }
         async fn get_version(
@@ -2909,6 +2930,10 @@ mod tests {
             &self,
             _: tonic::Request<vci_service_interface::ConnectComLogicalLinkRequest>,
         ) -> Result<tonic::Response<vci_service_interface::Response>, tonic::Status> {
+            self.note("ConnectComLogicalLink");
+            if self.fail_open {
+                return Err(tonic::Status::failed_precondition("device not connected"));
+            }
             Ok(tonic::Response::new(Default::default()))
         }
         async fn disconnect_com_logical_link(
@@ -3015,9 +3040,17 @@ mod tests {
     /// Serves a [`FakeWorker`] on a loopback port; returns a client for it and the log of the
     /// RPCs it recorded.
     async fn fake_worker(fail_disconnect: bool) -> (WorkerClient, Arc<Mutex<Vec<&'static str>>>) {
+        fake_worker_with(fail_disconnect, false).await
+    }
+
+    async fn fake_worker_with(
+        fail_disconnect: bool,
+        fail_open: bool,
+    ) -> (WorkerClient, Arc<Mutex<Vec<&'static str>>>) {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let service = FakeWorker {
             fail_disconnect,
+            fail_open,
             calls: Arc::clone(&calls),
         };
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
@@ -3099,6 +3132,27 @@ mod tests {
             "{result:?}"
         );
         assert!(guards.link_unconfirmed());
+        guards.worker_gone();
+    }
+
+    /// An open that fails after the module connected, and cannot disconnect it again, leaves
+    /// the module possibly connected: the guards come back marked (ADR-258).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_open_that_cannot_clean_up_marks_the_guards() {
+        let (client, calls) = fake_worker_with(false, true).await;
+        let (result, mut guards) = run_program(
+            client,
+            &LinkConfig::iso15765(0x7E0, 0x7E8),
+            program(Vec::new()),
+            JobLimits::default(),
+            vci_only_guards("open-fails"),
+        )
+        .await;
+        assert!(matches!(result, Err(JobError::Link(_))), "{result:?}");
+        assert!(guards.link_unconfirmed());
+        let calls = calls.lock().unwrap().clone();
+        assert!(calls.contains(&"ConnectComLogicalLink"), "{calls:?}");
+        assert!(calls.contains(&"ModuleDisconnect"), "{calls:?}");
         guards.worker_gone();
     }
 

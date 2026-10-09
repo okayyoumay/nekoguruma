@@ -254,7 +254,9 @@ impl WorkerProcess {
             .map_err(|_| ServiceError::Timeout("control response"))?
     }
 
-    /// Asks the worker to stop and waits up to `grace` for it to exit; kills it if it does not.
+    /// Asks the worker to stop, then waits up to `grace` for it to exit; kills it if it does
+    /// not. The request itself can take up to the launch options' `request_timeout` before the
+    /// grace period starts.
     /// `Ok` means the child was reaped, so no process of this worker is left holding the VCI:
     /// [`Stopped::Exited`] when it exited by itself, [`Stopped::Killed`] when it had to be
     /// killed. A stop request that failed or timed out does not make the result an `Err`, since

@@ -158,13 +158,44 @@ pub async fn open(
     config: &LinkConfig,
     deadline: Duration,
 ) -> Result<Link, HostError> {
-    config.validate()?;
+    open_tracked(client, config, deadline)
+        .await
+        .map_err(|failure| failure.error)
+}
+
+/// A link that failed to open.
+#[derive(Debug)]
+pub(crate) struct OpenFailure {
+    pub(crate) error: HostError,
+    /// Whether what the open had already opened on the worker was closed again, or nothing was
+    /// opened. When it is false the worker may still hold the module or the link (ADR-258).
+    pub(crate) cleaned_up: bool,
+}
+
+impl OpenFailure {
+    /// A failure before anything was opened on the worker.
+    fn clean(error: HostError) -> Self {
+        Self {
+            error,
+            cleaned_up: true,
+        }
+    }
+}
+
+/// [`open`], also telling whether a failed open left anything open on the worker.
+pub(crate) async fn open_tracked(
+    client: &mut WorkerClient,
+    config: &LinkConfig,
+    deadline: Duration,
+) -> Result<Link, OpenFailure> {
+    config.validate().map_err(OpenFailure::clean)?;
     let modules = unary(
         deadline,
         "GetModuleIds",
         client.get_module_ids(GetModuleIdsRequest {}),
     )
-    .await?
+    .await
+    .map_err(OpenFailure::clean)?
     .module_id_list
     .map(|list| list.module_data)
     .unwrap_or_default();
@@ -173,12 +204,18 @@ pub async fn open(
     let module_handle = match modules.as_slice() {
         [only] => only
             .module_handle
-            .ok_or(HostError::Setup("the worker's module has no handle"))?,
-        [] => return Err(HostError::Setup("the worker reports no module")),
+            .ok_or(OpenFailure::clean(HostError::Setup(
+                "the worker's module has no handle",
+            )))?,
+        [] => {
+            return Err(OpenFailure::clean(HostError::Setup(
+                "the worker reports no module",
+            )));
+        }
         _ => {
-            return Err(HostError::Setup(
+            return Err(OpenFailure::clean(HostError::Setup(
                 "the worker reports several modules; choosing one is not supported yet",
-            ));
+            )));
         }
     };
     let connected = unary(
@@ -191,9 +228,12 @@ pub async fn open(
     .await;
     if let Err(error) = connected {
         // The connect may have completed on the worker after the deadline. Disconnecting a
-        // module that is not connected changes nothing.
-        let _ = disconnect_module(client, module_handle, deadline).await;
-        return Err(error);
+        // module that is not connected changes nothing; when that disconnect fails too, the
+        // module is not known to be disconnected.
+        let cleaned_up = disconnect_module(client, module_handle, deadline)
+            .await
+            .is_ok();
+        return Err(OpenFailure { error, cleaned_up });
     }
 
     let permission = vci_permission(client, deadline, module_handle).await;
@@ -201,8 +241,10 @@ pub async fn open(
     let cll_handle = match create_link(client, config, deadline, module_handle).await {
         Ok(cll_handle) => cll_handle,
         Err(error) => {
-            let _ = disconnect_module(client, module_handle, deadline).await;
-            return Err(error);
+            let cleaned_up = disconnect_module(client, module_handle, deadline)
+                .await
+                .is_ok();
+            return Err(OpenFailure { error, cleaned_up });
         }
     };
     match set_up_link(client, config, deadline, cll_handle).await {
@@ -213,8 +255,10 @@ pub async fn open(
             permission,
         }),
         Err(error) => {
-            let _ = teardown(client, module_handle, cll_handle, deadline).await;
-            Err(error)
+            let cleaned_up = teardown(client, module_handle, cll_handle, deadline)
+                .await
+                .is_ok();
+            Err(OpenFailure { error, cleaned_up })
         }
     }
 }

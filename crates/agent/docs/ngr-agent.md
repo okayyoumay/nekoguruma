@@ -49,8 +49,8 @@ Steps (`agent::check_program`, `agent::guards::JobGuards`, `agent::launch::launc
    always the default, whatever a registration definition declares), provision its
    auth key and connect the gRPC client (design 7.4).
 6. Run the program under the request policy and the default job limits (ADR-235), then stop
-   the worker and release the guards. A worker that ignores the stop request is killed after
-   5 s and reported on stderr. When the job's link was not confirmed closed and the worker
+   the worker and release the guards. The stop request may take up to 2 s to be answered; a
+   worker that has not exited 5 s after that is killed and reported on stderr. When the job's link was not confirmed closed and the worker
    cannot be stopped either, the run fails with "the worker may still hold the VCI", and the
    locks stay held until the process exits (ADR-258). The policy is read-only, except that a debug build may send any request once
    the worker's VCI has identified itself as `sim-vci` (ADR-247); a program that needs more
@@ -226,8 +226,9 @@ VCI name has 1 to `MAX_VCI_NAME` (100) bytes. The lock directory is one per devi
 shared by every agent process on it whichever user it runs as: each of them must be able to
 create files in it and read the lock files there (lock files are opened read-only).
 
-A run whose link close fails, panics or runs during an unwind gives its guards back marked
-(`JobGuards::link_unconfirmed`), whatever the job's own result (ADR-258). Marked guards refuse
+A run whose link close fails or panics, or whose open fails partway and cannot close what it
+had opened, gives its guards back marked (`JobGuards::link_unconfirmed`), whatever the job's
+own result (ADR-258). Marked guards refuse
 another run (`JobError::LinkUnconfirmed`), and dropping them keeps their locks until the
 process exits. The caller stops the worker that held the link (`WorkerProcess::stop`, which
 returns `Ok` only once the child is reaped) and then calls `JobGuards::worker_gone`, before the

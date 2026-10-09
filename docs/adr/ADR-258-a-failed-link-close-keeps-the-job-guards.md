@@ -22,7 +22,10 @@ safe.
 ## Decision
 
 1. **The guards carry an unconfirmed-link state.** The runner marks the guards when the close
-   of the job's link fails, panics, or runs during an unwind. A run on guards that are already
+   of the job's link fails or panics. It also marks them when an open fails partway and the
+   open's own cleanup of what it had opened fails too, or when the open panics: the worker may
+   then still hold the module or the link. A close that succeeds is confirmed, also when it
+   runs during an unwind. A run on guards that are already
    marked is refused before anything opens (`JobError::LinkUnconfirmed`). A flag in the
    returned value was rejected: a caller that ignored it would drop the guards, which is the
    bug itself. Keeping the guards inside the runner until the worker restarts was rejected
@@ -35,9 +38,12 @@ safe.
    never released and an error in the log, not a VCI two jobs share.
 3. **A reaped worker process confirms the link closed.** The logical link and the module
    connection are objects of the worker process. Once it is reaped, the OS has closed the vendor
-   library's handles. `WorkerProcess::stop` returns `Stopped::Exited` or `Stopped::Killed`.
+   library's handles. A vendor library that hands the device to a separate device-server
+   process can keep it claimed for a while after its client is gone; that is item 6's
+   residual. `WorkerProcess::stop` returns `Stopped::Exited` or `Stopped::Killed`.
    It returns an error only when waiting for or killing the child failed, which leaves the
-   child's state unknown. A failed or timed-out stop request followed by an exit or a kill is
+   child's state unknown. The stop request is answered within the worker's request timeout,
+   and the grace period starts after it. A failed or timed-out stop request followed by an exit or a kill is
    no longer an error.
 4. **`ngr-agent run` stops the worker, then releases the guards.** On `Ok` from `stop` it calls
    `worker_gone` and drops the guards; a killed worker is reported on stderr. When `stop` fails
@@ -47,12 +53,14 @@ safe.
    in a guard that closes it exactly once, on a normal return, on an error and during an unwind.
    A panic after the open, for example while the host is built, therefore still closes the link
    or marks the guards.
-6. **An agent killed without running its exit path is a residual.** Its locks are released by
-   the OS (ADR-256 item 1) while its orphaned worker tears the link down on stdin EOF. This is
-   accepted:
+6. **Some releases stay residual.** An agent killed without running its exit path has its
+   locks released by the OS (ADR-256 item 1) while its orphaned worker tears the link down on
+   stdin EOF. The same happens when `ngr-agent run` ends after a failed stop with an
+   unconfirmed link (item 4), and when a vendor device-server process outlives the worker
+   (item 3). This is accepted:
    - The window is bounded by that teardown.
    - A second open of a device still held usually fails, so the next job detects it
-     (`JobError::Link`).
+     (`JobError::Link`), as design 8.8 asks of the layers it cannot prevent.
    - Letting the worker inherit the lock descriptors would work on Unix only, since Windows
      ties a lock to the process that took it. It would also split the one mechanism ADR-256
      item 1 chose.

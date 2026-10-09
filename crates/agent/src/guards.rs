@@ -12,9 +12,9 @@
 //! exclude each other, which is safe. A bucket file is never created for one VIN alone: files
 //! are created only by a sweep over all 4096, empty, in a fixed order, whichever VIN triggered it
 //! (a `take_vehicle` that finds its bucket's file or `vehicle-fff.lock` missing). The sweep
-//! syncs the directory, then creates `vehicle-fff.lock` last, so that file's presence means the
-//! other 4095 entries were committed first (NTFS commits directory entries in creation order
-//! without a sync). A set a crash, a failed sync or someone else's file left partial is decided
+//! creates `vehicle-fff.lock` last, so that file's presence means the other 4095 entries were
+//! committed first: on Unix the directory is synced before `vehicle-fff.lock` is created; on
+//! Windows no sync is made and NTFS's ordering of directory entries is relied on. A set a crash, a failed sync or someone else's file left partial is decided
 //! by the file system's write order, not by a VIN; a complete set is the normal outcome, not an
 //! invariant (ADR-262 item 2). The listing is the same on every device and says nothing about
 //! the vehicles seen. A job holds one vehicle (a well-formed VIN): taking that VIN again
@@ -86,6 +86,10 @@ pub enum GuardError {
     LinkUnconfirmed,
     #[error("the lock file {0} is not a regular file")]
     NotAFile(PathBuf),
+    /// A vehicle lock file that is not a regular file. It carries no path: the name is the
+    /// VIN-derived bucket, which stays out of messages (ADR-262).
+    #[error("a vehicle lock file is not a regular file")]
+    NotAVehicleFile,
 }
 
 /// How many vehicle lock files a lock directory has (ADR-262).
@@ -95,7 +99,6 @@ const VEHICLE_BUCKETS: u32 = 0x1000;
 /// reprogramming slot, and once [`JobGuards::take_vehicle`] ran the vehicle's lock. Dropping it releases them, unless the link of the job that used them is
 /// unconfirmed (see [`JobGuards::link_unconfirmed`]). It is not `Clone`, so one set of guards
 /// serves one run at a time.
-#[derive(Debug)]
 pub struct JobGuards {
     _vci: LockFile,
     _slot: Option<LockFile>,
@@ -239,6 +242,18 @@ impl JobGuards {
     }
 }
 
+/// Reports only what is held: the directory, the bucket, the VIN and file paths stay out.
+impl std::fmt::Debug for JobGuards {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JobGuards")
+            .field("vci", &true)
+            .field("slot", &self.holds_slot())
+            .field("vehicle", &self.holds_vehicle())
+            .field("link_unconfirmed", &self.link_unconfirmed)
+            .finish()
+    }
+}
+
 impl Drop for JobGuards {
     fn drop(&mut self) {
         if self.link_unconfirmed {
@@ -275,7 +290,11 @@ impl LockFile {
         poll: Duration,
         cancelled: &AtomicBool,
     ) -> Result<Self, GuardError> {
-        Self::lock(open_read_only(path)?, poll, cancelled)
+        let file = open_read_only(path).map_err(|error| match error {
+            GuardError::NotAFile(_) => GuardError::NotAVehicleFile,
+            other => other,
+        })?;
+        Self::lock(file, poll, cancelled)
     }
 
     fn lock(file: File, poll: Duration, cancelled: &AtomicBool) -> Result<Self, GuardError> {
@@ -393,8 +412,8 @@ fn vehicle_creation_order() -> impl Iterator<Item = u16> {
 }
 
 /// Creates the empty vehicle lock files, all of them whichever VIN asked and none for one VIN
-/// alone (ADR-262 item 2): buckets 0x000 to 0xffe in order, then a directory sync (Unix; a
-/// directory cannot be opened for syncing elsewhere), then `vehicle-fff.lock`, then a second
+/// alone (ADR-262 item 2): buckets 0x000 to 0xffe in order, then a directory sync (Unix only;
+/// on Windows none is made and NTFS's ordering of directory entries is relied on), then `vehicle-fff.lock`, then a second
 /// sync. Its presence therefore means the rest were committed first, also to a take that races
 /// this sweep. A file that exists already is left as it is.
 fn create_vehicle_files(dir: &Path) -> Result<(), GuardError> {
@@ -1033,7 +1052,11 @@ mod tests {
             guards.take_vehicle(&second, POLL, &never),
             Err(GuardError::OtherVehicleHeld)
         ));
-        assert!(!format!("{guards:?}").contains(first.as_str()));
+        let shown = format!("{guards:?}");
+        let bucket = format!("{:x}", vehicle_bucket(&first));
+        for hidden in [first.as_str(), bucket.as_str(), "vehicle-"] {
+            assert!(!shown.contains(hidden), "{hidden}: {shown}");
+        }
         drop(guards);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1135,7 +1158,10 @@ mod tests {
             })
         };
         let result = guards.take_vehicle(&vin(VIN_A), POLL, &cancelled);
-        assert!(matches!(result, Err(GuardError::NotAFile(_))), "{result:?}");
+        assert!(
+            matches!(result, Err(GuardError::NotAVehicleFile)),
+            "{result:?}"
+        );
         cancelled.store(true, Ordering::Relaxed);
         timer.join().unwrap();
         drop(guards);

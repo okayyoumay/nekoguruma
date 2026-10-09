@@ -70,14 +70,15 @@ which is what ADR-256 item 6 forbids.
 
 6. **Lock files must be regular files.** Every lock file (`vci-*.lock`, `reprogramming.lock` and
    the bucket files) is opened without following a symbolic link and without blocking, and the
-   opened handle must be a regular file before it is locked (`GuardError::NotAFile`); on Windows
-   a reparse point is refused. An entry someone else put at a lock file's path (a symbolic link,
-   a FIFO, a device) then fails the take instead of being followed or hanging outside the cancel
-   loop. This closes the uncancellable wait and locking through a link; it does not harden the
-   multi-user model, since an agent user who wants to bypass the guards can run a job without
-   them (ADR-257) and the first user to create a lock file owns it. The bucket sweep multiplied
-   the names someone could pre-create by 4096, which is why the shared open path is hardened
-   here.
+   opened handle must be a regular file before it is locked (`GuardError::NotAFile`, or
+   `GuardError::NotAVehicleFile` for a bucket file, which names no path so that no bucket
+   appears in an error); on Windows a reparse point is refused. An entry someone else put at a
+   lock file's path (a symbolic link, a FIFO, a device) then fails the take instead of being
+   followed or hanging outside the cancel loop. This closes the uncancellable wait and locking
+   through a link; it does not harden the multi-user model, since an agent user who wants to
+   bypass the guards can run a job without them (ADR-257) and the first user to create a lock
+   file owns it. The bucket sweep multiplied the names someone could pre-create by 4096, which
+   is why the shared open path is hardened here.
 
 ## Consequences
 
@@ -99,7 +100,8 @@ which is what ADR-256 item 6 forbids.
   hole at once, whose creation time then says only that some vehicle of the lost buckets arrived
   then.
 - The agent writes nothing VIN-derived to the device: no lock file's name, existence or content
-  depends on a VIN. Two residuals remain. While a job runs, the locked bucket is visible to
+  depends on a VIN. Neither `JobGuards`' `Debug` output nor the guards' errors name a bucket, so
+  no log keeps one. Two residuals remain. While a job runs, the locked bucket is visible to
   anyone who can inspect open files, like the job's process itself. On a Windows volume that
   maintains last-access times (off by default on system volumes of 128 GB and more since Windows
   10 version 1803, and off before), a bucket file may keep the time it was last opened for a

@@ -244,7 +244,8 @@ process dies, so a crashed run never blocks the next one, and the files are neve
   4096 buckets: `k` is the first two bytes of SHA-256 over the VIN, read big-endian, masked to
   their low 12 bits (a digest starting `84 b1` gives `vehicle-4b1.lock`). When its bucket file
   or the last bucket file (`vehicle-fff.lock`) is missing, the call first creates every missing
-  bucket file, in order, and creates `vehicle-fff.lock` last, after syncing the directory, so no
+  bucket file, in order, and creates `vehicle-fff.lock` last (on Unix after syncing the
+  directory; on Windows, where no directory sync is made, NTFS keeps the creation order), so no
   bucket file is ever created for one VIN alone and neither a file's name nor the directory's
   content reveals a VIN (ADR-262). Two vehicles in one bucket exclude each other, which delays a
   job about once in 4096 concurrent pairs. Taking the vehicle the guards already hold returns at
@@ -252,8 +253,9 @@ process dies, so a crashed run never blocks the next one, and the files are neve
   `link_unconfirmed`. `JobGuards::holds_vehicle` tells whether they hold one.
 - Every lock file must be a regular file. It is opened without following a symbolic link and
   without blocking, and a symbolic link, FIFO, device or (on Windows) reparse point at its path
-  fails the take (`GuardError::NotAFile`, or an I/O error) instead of being followed or hanging
-  (ADR-262 item 6).
+  fails the take (`GuardError::NotAFile`, or `GuardError::NotAVehicleFile` for a bucket file,
+  which names no path so that no bucket appears in an error, or an I/O error) instead of being
+  followed or hanging (ADR-262 item 6).
 - Locks are always taken in the order VCI, then slot, then vehicle, and held until the
   `JobGuards` is dropped.
 

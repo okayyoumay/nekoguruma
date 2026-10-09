@@ -212,15 +212,16 @@ files are never deleted.
 
 Every entry point (`run_program`, `run_program_journaled`, `resume_program_journaled`) takes
 the guards by value and returns them with the run's result, so two runs can never use one set
-at once. A program that writes, run on guards without the slot, ends in
-`JobError::NoReprogrammingSlot` before anything opens. A new run after an agent crash or a loss of the
+at once. A program that writes and that this build allows (a debug build, on the simulator),
+run on guards without the slot, ends in `JobError::NoReprogrammingSlot` before anything opens;
+a release build refuses every writing program first (`JobError::Refused`). A new run after an agent crash or a loss of the
 device's power takes them with `JobGuards::take` before it calls the runner, so a duplicate
 resume of the same job waits there without opening a link. A dropped future releases them only
 once the job thread has ended. A job that survives a worker crash, a VCI disconnect or a loss
 of the vehicle's supply alone gets them back, still held, and passes them to its next run. A
 VCI name has 1 to `MAX_VCI_NAME` (100) bytes. The lock directory is one per device,
-shared by every agent process on it whichever user it runs as, and its files must be writable
-by all of them. `ngr-agent run` takes the guards from `--locks` and `--vci` before it runs the
+shared by every agent process on it whichever user it runs as: each of them must be able to
+create files in it and read the lock files there (lock files are opened read-only). `ngr-agent run` takes the guards from `--locks` and `--vci` before it runs the
 program, and holds them until the run ends.
 
 ## Restart inputs

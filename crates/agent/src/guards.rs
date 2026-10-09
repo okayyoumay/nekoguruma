@@ -129,16 +129,26 @@ impl LockFile {
 impl LockFile {
     /// Opens the lock file read-only, so a file another user created (with that user's default
     /// permissions) can be locked as long as it can be read: an OS lock needs no write access.
-    /// Only a missing file is created.
+    /// Only a missing file is created, atomically: when another process creates it first, the
+    /// read-only open is tried again rather than opening that file for writing.
     fn open(path: &Path) -> io::Result<File> {
-        match OpenOptions::new().read(true).open(path) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => OpenOptions::new()
+        let mut tries = 0;
+        loop {
+            match OpenOptions::new().read(true).open(path) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                opened => return opened,
+            }
+            match OpenOptions::new()
                 .read(true)
                 .write(true)
-                .create(true)
-                .truncate(false)
-                .open(path),
-            opened => opened,
+                .create_new(true)
+                .open(path)
+            {
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists && tries < 3 => {
+                    tries += 1;
+                }
+                created => return created,
+            }
         }
     }
 }

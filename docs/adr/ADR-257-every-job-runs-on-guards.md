@@ -34,8 +34,10 @@ runner also needs a way to know which kind of job it runs.
    - The caller takes them before it calls, so a job waits for its guards before anything
      goes through the VCI.
    - The runner keeps its handle until after the link is closed, for every job.
-   - A writing program run on guards without the slot ends in
-     `JobError::NoReprogrammingSlot` before anything opens.
+   - A writing program that the build's ceiling allows, run on guards without the slot,
+     ends in `JobError::NoReprogrammingSlot` before anything opens. The ceiling check comes
+     first, so a release build, which allows no write, refuses such a program as
+     `JobError::Refused` instead.
 4. **`ngr-agent run` takes the guards itself.**
    - **Where.** It reads the lock directory from `--locks <dir>`, by default a `locks`
      directory next to the executable, as `--workers` does.
@@ -50,7 +52,9 @@ runner also needs a way to know which kind of job it runs.
 - ADR-256's consequence that first runs open the link without the per-VCI lock no longer holds.
 - `run_program` and `run_program_journaled` change their signatures; their callers in the
   repository (the CLI and the `j2534-0404-service` tests) take guards.
-- Lock files are opened read-only, and created only when missing. An OS lock needs no write
+- Lock files are opened read-only, and created only when missing, atomically (`create_new`;
+  a file another process created first is opened read-only). This replaces ADR-256 item 1's
+  requirement that every agent process open the lock files for writing. An OS lock needs no write
   access, so a file one user created, with that user's default permissions, still excludes and
   is excluded by every other user who can read it.
 - The lock directory must let every agent user on the device create files in it, and must

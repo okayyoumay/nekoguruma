@@ -28,6 +28,8 @@ and the two stay separate crates (ADR-260). They differ where it matters:
   when the variable is unset. An unreadable or invalid file makes the open fail with `ERR_FAILED`.
   The ECU's timers run on real time, so a non-default session ends after tS3_Server (5 s unless
   the configuration sets `s3_server_ms`) without a request, as on a vehicle.
+  After an ECUReset it also answers nothing for `startup_ms` when the configuration sets it
+  (`crates/sim-ecu/docs/simulated-ecu.md`); the requests in that time get no response.
 - The ECU lives as long as the process: `PassThruClose` and a new `PassThruOpen` keep its
   flash state, and its session too if the device is opened again within tS3_Server, as a vehicle
   keeps its state while the tester disconnects. A process restart starts a fresh ECU, unless
@@ -83,7 +85,9 @@ a vehicle outlives a crashed worker (ADR-241):
   `*.rejected` although it was applied. If the state of a new ECU cannot be written, the ECU is
   not created, and every call that needs it fails until it can be. Only a file that does not
   exist starts a fresh ECU: a path that cannot be read for any other reason, a file of another
-  format version, or one whose state contradicts itself (`SimEcu::restore` refuses it) makes the
+  format version (the version is checked before the rest is decoded; any change to the encoded
+  ECU state, such as `startup_ms`, gets a new version, so a file written by an older build is
+  refused rather than misread), or one whose state contradicts itself (`SimEcu::restore` refuses it) makes the
   call that first needs the ECU (`PassThruOpen` or a control command) fail with `ERR_FAILED`.
 - Replacing the file is retried briefly when Windows reports it in use.
 - The VCI side is not kept: channels, filters, unread responses, the battery voltage and the

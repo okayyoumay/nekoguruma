@@ -1928,6 +1928,148 @@ fn a_dropped_reset_response_still_times_the_restarted_delay() {
     assert!(!ecu.security_delay_active());
 }
 
+// ---------------------------------------------------------------- Startup after an ECUReset
+
+#[test]
+fn an_ecu_answers_nothing_while_starting_up_after_a_reset() {
+    let (mut ecu, clock) = ecu_with_clock(EcuConfig {
+        startup_ms: Some(300),
+        ..config()
+    });
+    enter(&mut ecu, Session::Extended);
+    // The reset itself is answered; the startup runs from its response.
+    assert!(matches!(
+        ecu.request(&[0x11, 0x01]),
+        SimResponse::Positive(_)
+    ));
+    assert_eq!(ecu.power_cycles(), 1);
+    clock.advance(ms(299));
+    assert_eq!(ecu.request(&[0x22, 0xF1, 0x86]), SimResponse::NoResponse);
+    clock.advance(ms(1));
+    assert_eq!(reported_session(&mut ecu), 0x01);
+}
+
+#[test]
+fn a_request_lost_during_the_startup_fires_no_armed_fault() {
+    let (mut ecu, clock) = ecu_with_clock(EcuConfig {
+        startup_ms: Some(100),
+        ..config()
+    });
+    ecu.request(&[0x11, 0x01]);
+    ecu.inject(Fault::BusError);
+    assert_eq!(ecu.request(&[0x3E, 0x00]), SimResponse::NoResponse);
+    assert_eq!(ecu.armed_faults(), &[Fault::BusError]);
+    clock.advance(ms(100));
+    // The armed fault is still there and now takes the next request.
+    assert_eq!(ecu.request(&[0x3E, 0x00]), SimResponse::NoResponse);
+    assert!(ecu.armed_faults().is_empty());
+    assert!(matches!(
+        ecu.request(&[0x3E, 0x00]),
+        SimResponse::Positive(_)
+    ));
+}
+
+#[test]
+fn the_startup_runs_from_the_response_and_also_after_a_lost_one() {
+    let (mut ecu, clock) = ecu_with_clock(EcuConfig {
+        startup_ms: Some(100),
+        response_delay_ms: 50,
+        ..config()
+    });
+    ecu.inject(Fault::DropResponse);
+    assert_eq!(ecu.request(&[0x11, 0x01]), SimResponse::NoResponse);
+    // The response would go out after 50 ms, so the ECU is up 150 ms after the request.
+    clock.advance(ms(149));
+    assert_eq!(ecu.request(&[0x3E, 0x00]), SimResponse::NoResponse);
+    clock.advance(ms(1));
+    assert!(matches!(
+        ecu.request(&[0x3E, 0x00]),
+        SimResponse::Positive(_)
+    ));
+}
+
+#[test]
+fn no_startup_is_the_default_and_reconnect_starts_none() {
+    let (mut ecu, _clock) = ecu_with_clock(config());
+    ecu.request(&[0x11, 0x01]);
+    assert!(matches!(
+        ecu.request(&[0x3E, 0x00]),
+        SimResponse::Positive(_)
+    ));
+
+    let (mut ecu, _clock) = ecu_with_clock(EcuConfig {
+        startup_ms: Some(1_000),
+        ..config()
+    });
+    ecu.inject(Fault::PowerLoss);
+    ecu.reconnect();
+    assert!(matches!(
+        ecu.request(&[0x3E, 0x00]),
+        SimResponse::Positive(_)
+    ));
+    // A reconnect ends a startup in progress.
+    ecu.request(&[0x11, 0x01]);
+    assert_eq!(ecu.request(&[0x3E, 0x00]), SimResponse::NoResponse);
+    ecu.reconnect();
+    assert!(matches!(
+        ecu.request(&[0x3E, 0x00]),
+        SimResponse::Positive(_)
+    ));
+}
+
+#[test]
+fn a_startup_in_progress_survives_a_snapshot() {
+    let (mut ecu, clock) = ecu_with_clock(EcuConfig {
+        startup_ms: Some(500),
+        ..config()
+    });
+    ecu.request(&[0x11, 0x01]);
+    clock.advance(ms(100));
+    let snapshot = ecu.snapshot();
+    let json = serde_json::to_string(&snapshot).unwrap();
+    // A snapshot written before the field existed still reads.
+    let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert!(value.as_object_mut().unwrap().contains_key("startup_left"));
+    let snapshot: EcuSnapshot = serde_json::from_str(&json).unwrap();
+    let clock = ManualClock::default();
+    let mut restored = SimEcu::restore(snapshot, clock.clone(), ms(100)).unwrap();
+    // 400 ms of the startup were left after the snapshot, 100 of them passed meanwhile.
+    clock.advance(ms(299));
+    assert_eq!(restored.request(&[0x3E, 0x00]), SimResponse::NoResponse);
+    clock.advance(ms(1));
+    assert!(matches!(
+        restored.request(&[0x3E, 0x00]),
+        SimResponse::Positive(_)
+    ));
+    value.as_object_mut().unwrap().remove("startup_left");
+    let old: EcuSnapshot = serde_json::from_value(value).unwrap();
+    assert!(SimEcu::restore(old, ManualClock::default(), ms(0)).is_ok());
+}
+
+#[test]
+fn a_reset_with_response_pending_starts_up_after_the_chain() {
+    let (mut ecu, clock) = ecu_with_clock(EcuConfig {
+        startup_ms: Some(500),
+        ..config()
+    });
+    ecu.inject(Fault::ResponsePending {
+        count: 2,
+        interval_ms: 1_000,
+    });
+    let exchange = ecu.exchange(Addressing::Physical, &[0x11, 0x01]);
+    assert_eq!(exchange.delay_ms, 2_000);
+    // The chain runs 2000 ms and the startup 500 ms after it; all requests in between are lost.
+    for at in [100, 1_999, 2_499] {
+        clock.advance(ms(at) - clock.now());
+        assert_eq!(ecu.request(&[0x3E, 0x00]), SimResponse::NoResponse, "{at}");
+    }
+    clock.advance(ms(1));
+    assert!(matches!(
+        ecu.request(&[0x3E, 0x00]),
+        SimResponse::Positive(_)
+    ));
+}
+
 // ---------------------------------------------------------------- Snapshot and restore
 
 /// Programming session, unlocked, two 2-byte blocks of a 6-byte download stored, on `clock`.

@@ -247,11 +247,15 @@ pub async fn run_program_journaled(
 ///   ADR-264): it sends one ECUReset when the gates allow it and the journal shows no
 ///   RequestTransferExit intent, and otherwise waits out the plan's session timeout plus
 ///   margin, sending nothing (a cancel during the wait is [`JobError::Cancelled`]); a journal
-///   with the post-transfer steps complete gets neither. The rest of the restart order (the
-///   default-session confirmation and on) does not run in this agent, so the job then ends in
+///   with the post-transfer steps complete gets neither. `restart::confirm_default_session`
+///   then waits the ECU's startup time and reads F186 until the ECU reports its default session
+///   (step 2b-2, ADR-265), with one passive teardown and one more attempt when the first fails
+///   after a reset or on the completed path; an ECU that cannot be confirmed ends the job in
+///   [`JobError::OnSiteInterventionRequired`] (`DefaultSessionNotConfirmed`). The rest of the
+///   restart order (step 3 on) does not run in this agent, so a confirmed job ends in
 ///   [`JobError::OnSiteInterventionRequired`] (`RestartOrderUnavailable`, carrying the
-///   teardown's outcome), or in [`JobError::IdentityMismatch`] when the ECU's VIN is another
-///   vehicle's;
+///   teardown's outcome and the confirmation), or in [`JobError::IdentityMismatch`] when the
+///   ECU's VIN is another vehicle's;
 /// - a journal that rules a restart out, or a missing or unreadable one for a program with a
 ///   plan, ends the job in on-site intervention with nothing sent.
 ///
@@ -531,8 +535,9 @@ impl Drop for CancelOnDrop {
 /// Goes on with a job from its journal as `Journal::open` gave it (ADR-255; see
 /// [`resume_program_journaled`]). Nothing is sent to the ECU before the classification and the
 /// checks of `restart::check_before_ecu` passed; then `restart::check_gates` sends only
-/// ReadDataByIdentifier requests (ADR-229 item 2 step 2), and `restart::teardown` sends at most
-/// one ECUReset (step 2b-1, ADR-264). `vin` is the job's target VIN. Once
+/// ReadDataByIdentifier requests (ADR-229 item 2 step 2), `restart::teardown` sends at most
+/// one ECUReset (step 2b-1, ADR-264), and `restart::confirm_default_session` reads F186
+/// (step 2b-2, ADR-265). `vin` is the job's target VIN. Once
 /// the ECU's VIN matched it, the gates promote `guards` to the per-vehicle lock (ADR-263; see
 /// [`promote_to_vehicle`]).
 #[expect(
@@ -603,10 +608,19 @@ where
                     "the restart point names no plan of the program",
                 )))?;
             let teardown = restart::teardown(gate, &point, &plan.timing, host, poll, cancelled)?;
+            let confirmed = restart::confirm_default_session(
+                point.flash_session,
+                teardown.clone(),
+                &plan.timing,
+                host,
+                poll,
+                cancelled,
+            )?;
             Err(JobError::OnSiteInterventionRequired(
                 OnSiteReason::RestartOrderUnavailable {
                     flash_session: point.flash_session,
                     teardown,
+                    confirmed,
                 },
             ))
         }
@@ -1062,6 +1076,19 @@ mod tests {
         Trailing,
     }
 
+    /// How a [`FlashHost`] answers a read of F186 (the active session).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum SessionAnswer {
+        /// The default session.
+        Default,
+        /// This session value (for example 0x03, the extended session).
+        Other(u8),
+        /// A negative response with this code.
+        Refuse(u8),
+        /// No answer.
+        NoAnswer,
+    }
+
     /// An ECU that downloads: it answers ReadDataByIdentifier F191 and F195, accepts every
     /// other request and every block, and counts the blocks since the last RequestDownload as
     /// the worker's host does. It logs each request with the journal commits made before it.
@@ -1093,13 +1120,21 @@ mod tests {
         /// The readings of the runtime inputs other than the supply voltage, which `voltage`
         /// answers; an input not set is `CannotBeEstablished`.
         inputs: crate::inputs::FixedInputs,
-        /// Every ReadDataByIdentifier request is also pushed here, for a test that looks at the
-        /// host while the job runs on another thread.
+        /// Every request is also pushed here, for a test that looks at the host while the job
+        /// runs on another thread.
         mirror: Option<Arc<Mutex<Vec<Sent>>>>,
         /// The answer to ECUReset.
         reset: ResetAnswer,
         /// A service whose response is lost.
         lose_service: Option<u16>,
+        /// The answers to the first reads of F186, one per read; later reads get `session`.
+        session_script: std::collections::VecDeque<SessionAnswer>,
+        /// The answer to F186 when the script is used up.
+        session: SessionAnswer,
+        /// When each read of F186 arrived.
+        session_reads: Vec<std::time::Instant>,
+        /// When the last ECUReset arrived.
+        reset_at: Option<std::time::Instant>,
     }
 
     impl FlashHost {
@@ -1122,11 +1157,21 @@ mod tests {
                 mirror: None,
                 reset: ResetAnswer::Positive,
                 lose_service: None,
+                session_script: std::collections::VecDeque::new(),
+                session: SessionAnswer::Default,
+                session_reads: Vec::new(),
+                reset_at: None,
             }
         }
 
+        /// What was sent, without the reads of F186 (the restart's default-session
+        /// confirmation, which `session_reads` counts).
         fn sent(&self) -> Vec<Sent> {
-            self.log.iter().map(|(sent, _)| sent.clone()).collect()
+            self.log
+                .iter()
+                .map(|(sent, _)| sent.clone())
+                .filter(|sent| *sent != read_of([0xF1, 0x86]))
+                .collect()
         }
     }
 
@@ -1189,13 +1234,16 @@ mod tests {
                 return Err(HostError::NoResponse);
             }
             match (service, payload) {
-                (0x11, _) => match self.reset {
-                    ResetAnswer::Positive => Ok(vec![0x51, payload[0]]),
-                    ResetAnswer::Refuse(nrc) => Ok(vec![0x7F, 0x11, nrc]),
-                    ResetAnswer::NoAnswer => Err(HostError::NoResponse),
-                    ResetAnswer::Garbled => Ok(vec![0x51]),
-                    ResetAnswer::Trailing => Ok(vec![0x51, 0x01, 0x00]),
-                },
+                (0x11, _) => {
+                    self.reset_at = Some(std::time::Instant::now());
+                    match self.reset {
+                        ResetAnswer::Positive => Ok(vec![0x51, payload[0]]),
+                        ResetAnswer::Refuse(nrc) => Ok(vec![0x7F, 0x11, nrc]),
+                        ResetAnswer::NoAnswer => Err(HostError::NoResponse),
+                        ResetAnswer::Garbled => Ok(vec![0x51]),
+                        ResetAnswer::Trailing => Ok(vec![0x51, 0x01, 0x00]),
+                    }
+                }
                 (0x22, [0xF1, 0x90]) => Ok(match &self.vin {
                     Some(vin) => [&[0x62, 0xF1, 0x90][..], vin].concat(),
                     None => vec![0x7F, 0x22, 0x31],
@@ -1204,6 +1252,15 @@ mod tests {
                     Some(hardware) => [&[0x62, 0xF1, 0x91][..], hardware].concat(),
                     None => vec![0x7F, 0x22, 0x31],
                 }),
+                (0x22, [0xF1, 0x86]) => {
+                    self.session_reads.push(std::time::Instant::now());
+                    match self.session_script.pop_front().unwrap_or(self.session) {
+                        SessionAnswer::Default => Ok(vec![0x62, 0xF1, 0x86, 0x01]),
+                        SessionAnswer::Other(value) => Ok(vec![0x62, 0xF1, 0x86, value]),
+                        SessionAnswer::Refuse(nrc) => Ok(vec![0x7F, 0x22, nrc]),
+                        SessionAnswer::NoAnswer => Err(HostError::NoResponse),
+                    }
+                }
                 (0x22, [0xF1, 0x95]) => Ok(match &self.software_version {
                     Some(version) => [&[0x62, 0xF1, 0x95][..], version].concat(),
                     None => vec![0x7F, 0x22, 0x31],
@@ -2550,7 +2607,8 @@ mod tests {
                 Err(JobError::OnSiteInterventionRequired(
                     OnSiteReason::RestartOrderUnavailable {
                         flash_session: 1,
-                        teardown: restart::Teardown::Reset
+                        teardown: restart::Teardown::Reset,
+                        ..
                     }
                 ))
             ),
@@ -2585,6 +2643,7 @@ mod tests {
             "{result:?}"
         );
         assert_eq!(host.sent(), []);
+        assert!(host.session_reads.is_empty());
         assert_eq!(host.voltage_reads, 0);
         assert_eq!(resumes(&dir), 1);
         std::fs::remove_dir_all(&dir).unwrap();
@@ -2611,6 +2670,7 @@ mod tests {
                 "{voltage:?}: {result:?}"
             );
             assert_eq!(host.sent(), []);
+            assert!(host.session_reads.is_empty());
             assert_eq!(resumes(&dir), 0);
             std::fs::remove_dir_all(&dir).unwrap();
         }
@@ -2689,6 +2749,7 @@ mod tests {
         assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
         assert_eq!(host.voltage_reads, 0);
         assert_eq!(host.sent(), []);
+        assert!(host.session_reads.is_empty());
         assert_eq!(resumes(&dir), 0);
         std::fs::remove_dir_all(&dir).unwrap();
 
@@ -2761,6 +2822,7 @@ mod tests {
             Err(JobError::OnSiteInterventionRequired(OnSiteReason::RestartOrderUnavailable {
                 flash_session: 1,
                 teardown,
+                ..
             })) => teardown.clone(),
             other => panic!("{other:?}"),
         }
@@ -2831,6 +2893,7 @@ mod tests {
         assert!(!text.contains("vehicle-"), "{text}");
         assert!(!text.contains(&bucket), "{text}");
         assert_eq!(host.sent(), [read_of([0xF1, 0x90])]);
+        assert!(host.session_reads.is_empty());
     }
 
     #[test]
@@ -3325,6 +3388,473 @@ mod tests {
         assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
         assert!(started.elapsed() < Duration::from_secs(40));
         assert_eq!(host.sent(), [read_of([0xF1, 0x90])]);
+        assert!(host.session_reads.is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // ------------------------------- default-session confirmation (ADR-229 item 2 step 2b-2)
+
+    /// The teardown and the confirmation a restart ended in. Fails the test on any other result.
+    fn confirmed_of(
+        result: &Result<VmState, JobError>,
+    ) -> (restart::Teardown, restart::Confirmation) {
+        match result {
+            Err(JobError::OnSiteInterventionRequired(OnSiteReason::RestartOrderUnavailable {
+                flash_session: 1,
+                teardown,
+                confirmed,
+            })) => (teardown.clone(), *confirmed),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The teardown of a restart whose ECU could not be confirmed in its default session. Fails
+    /// the test on any other result.
+    fn not_confirmed_of(result: &Result<VmState, JobError>) -> restart::Teardown {
+        match result {
+            Err(JobError::OnSiteInterventionRequired(
+                OnSiteReason::DefaultSessionNotConfirmed {
+                    flash_session: 1,
+                    teardown,
+                },
+            )) => teardown.clone(),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// `flash_program` with the post-transfer check and then `tail` after the plan's end.
+    fn program_with_tail(tail: impl IntoIterator<Item = Op>) -> Program {
+        let (mut program, check) = program_with_check(diag_ir::RecoveryRequired::Never);
+        program.code.extend(tail);
+        assert_eq!(program.flash[0].boundaries.post_transfer_end_pc, check + 2);
+        program.validate().unwrap();
+        program
+    }
+
+    /// A routine after the plan's end, whose response a first run loses.
+    fn completed_path_program() -> Program {
+        program_with_tail([
+            Op::PushBytes(0),
+            Op::RoutineControl {
+                routine: 0xFF02,
+                sub: 1,
+            },
+            Op::Pop,
+        ])
+    }
+
+    /// `program`'s timing for the confirmation, in ms.
+    fn confirmation_timing(mut program: Program, startup: u32, window: u32) -> Program {
+        program.flash[0].timing.ecu_startup_millis = startup;
+        program.flash[0].timing.confirmation_window_millis = window;
+        program
+    }
+
+    /// The three first reads of F186 that fail a confirmation: a refusal, no answer and another
+    /// session.
+    fn failed_session_reads() -> [(&'static str, SessionAnswer); 3] {
+        [
+            ("refused", SessionAnswer::Refuse(0x22)),
+            ("no answer", SessionAnswer::NoAnswer),
+            ("another session", SessionAnswer::Other(0x03)),
+        ]
+    }
+
+    #[test]
+    fn a_restart_confirms_the_default_session_after_an_accepted_reset() {
+        let (result, host, _) = restart_after(
+            &flash_program(),
+            |host| host.lose_routine = Some(0xFF00),
+            |_| {},
+        );
+        assert_eq!(
+            confirmed_of(&result),
+            (
+                restart::Teardown::Reset,
+                restart::Confirmation {
+                    after_passive_retry: false
+                }
+            )
+        );
+        assert_eq!(host.session_reads.len(), 1);
+        assert_eq!(host.sent().last(), Some(&reset_sent()));
+    }
+
+    /// A refused ECUReset makes the teardown passive; the ECU is then confirmed, with no
+    /// second passive teardown.
+    #[test]
+    fn a_passive_teardown_is_followed_by_the_confirmation() {
+        let (result, host, elapsed) = restart_after(
+            &flash_program(),
+            |host| host.lose_routine = Some(0xFF00),
+            |host| host.reset = ResetAnswer::Refuse(0x22),
+        );
+        assert_eq!(
+            confirmed_of(&result),
+            (
+                passive(restart::PassiveCause::ResetRefused { nrc: 0x22 }),
+                restart::Confirmation {
+                    after_passive_retry: false
+                }
+            )
+        );
+        assert_eq!(host.session_reads.len(), 1);
+        assert!(elapsed >= session_wait(), "{elapsed:?}");
+    }
+
+    /// A passive teardown whose confirmation fails ends the job at once: no second passive
+    /// teardown and no second attempt.
+    #[test]
+    fn a_passive_teardown_whose_confirmation_fails_is_not_repeated() {
+        for (name, answer) in failed_session_reads() {
+            let (result, host, _) = restart_after(
+                &flash_program(),
+                |host| host.lose_routine = Some(0xFF00),
+                |host| {
+                    host.vin = None;
+                    host.session = answer;
+                },
+            );
+            assert_eq!(
+                not_confirmed_of(&result),
+                passive_gate(restart::PassiveReason::VinNotEstablished),
+                "{name}"
+            );
+            assert_eq!(host.session_reads.len(), 1, "{name}");
+        }
+    }
+
+    /// After an accepted reset, a first confirmation that fails gets exactly one passive
+    /// teardown and one more attempt; a second that fails ends in on-site intervention.
+    #[test]
+    fn a_failed_confirmation_after_a_reset_gets_one_passive_teardown_and_one_more_attempt() {
+        for (name, answer) in failed_session_reads() {
+            let (result, host, elapsed) = restart_after(
+                &flash_program(),
+                |host| host.lose_routine = Some(0xFF00),
+                |host| host.session_script = [answer].into(),
+            );
+            assert_eq!(
+                confirmed_of(&result),
+                (
+                    restart::Teardown::Reset,
+                    restart::Confirmation {
+                        after_passive_retry: true
+                    }
+                ),
+                "{name}"
+            );
+            assert_eq!(host.session_reads.len(), 2, "{name}");
+            // The passive wait lies between the two attempts.
+            let gap = host.session_reads[1] - host.session_reads[0];
+            assert!(gap >= session_wait(), "{name}: {gap:?}");
+            assert!(elapsed >= session_wait(), "{name}: {elapsed:?}");
+
+            let (result, host, _) = restart_after(
+                &flash_program(),
+                |host| host.lose_routine = Some(0xFF00),
+                |host| host.session = answer,
+            );
+            assert_eq!(
+                not_confirmed_of(&result),
+                restart::Teardown::Reset,
+                "{name}"
+            );
+            assert_eq!(host.session_reads.len(), 2, "{name}");
+        }
+    }
+
+    /// The window retries the read: a refusal and another session before the default one still
+    /// confirm in the first attempt.
+    #[test]
+    fn the_window_retries_failed_reads() {
+        let program = confirmation_timing(flash_program(), 0, 5_000);
+        let (result, host, _) = restart_after(
+            &program,
+            |host| host.lose_routine = Some(0xFF00),
+            |host| {
+                host.session_script = [
+                    SessionAnswer::Refuse(0x22),
+                    SessionAnswer::NoAnswer,
+                    SessionAnswer::Other(0x03),
+                ]
+                .into();
+            },
+        );
+        assert_eq!(
+            confirmed_of(&result).1,
+            restart::Confirmation {
+                after_passive_retry: false
+            }
+        );
+        assert_eq!(host.session_reads.len(), 4);
+    }
+
+    /// An ECU that does not answer F186 at all ends in on-site intervention after the window.
+    #[test]
+    fn an_ecu_that_does_not_answer_f186_cannot_be_confirmed() {
+        let program = confirmation_timing(flash_program(), 0, 40);
+        let (result, host, elapsed) = restart_after(
+            &program,
+            |host| host.lose_routine = Some(0xFF00),
+            |host| host.session = SessionAnswer::NoAnswer,
+        );
+        assert_eq!(not_confirmed_of(&result), restart::Teardown::Reset);
+        // Both attempts read for the window (every 10 ms), with the passive wait between them.
+        assert!(
+            host.session_reads.len() >= 4,
+            "{}",
+            host.session_reads.len()
+        );
+        assert!(
+            elapsed >= session_wait() + Duration::from_millis(80),
+            "{elapsed:?}"
+        );
+    }
+
+    /// An ECU that refuses the reset and leaves the confirmation unanswered.
+    #[test]
+    fn an_ecu_that_refuses_the_reset_and_cannot_be_confirmed_needs_on_site_intervention() {
+        for reset in [ResetAnswer::Refuse(0x22), ResetAnswer::NoAnswer] {
+            let (result, host, _) = restart_after(
+                &flash_program(),
+                |host| host.lose_routine = Some(0xFF00),
+                |host| {
+                    host.reset = reset;
+                    host.session = SessionAnswer::Other(0x03);
+                },
+            );
+            assert!(
+                matches!(
+                    not_confirmed_of(&result),
+                    restart::Teardown::Passive(
+                        restart::PassiveCause::ResetRefused { .. }
+                            | restart::PassiveCause::ResetOutcomeUnknown
+                    )
+                ),
+                "{result:?}"
+            );
+            assert_eq!(host.session_reads.len(), 1);
+        }
+    }
+
+    /// On the completed path nothing was reset: a first read that is refused, times out or
+    /// reports another session gets the passive teardown and is confirmed on the second.
+    fn completed_path_retry(answer: SessionAnswer) {
+        let program = completed_path_program();
+        let (result, host, elapsed) = restart_after(
+            &program,
+            |host| host.lose_routine = Some(0xFF02),
+            |host| host.session_script = [answer].into(),
+        );
+        assert_eq!(
+            confirmed_of(&result),
+            (
+                restart::Teardown::CompletedPath,
+                restart::Confirmation {
+                    after_passive_retry: true
+                }
+            )
+        );
+        assert_eq!(host.session_reads.len(), 2);
+        assert!(!host.sent().contains(&reset_sent()));
+        assert!(elapsed >= session_wait(), "{elapsed:?}");
+        let gap = host.session_reads[1] - host.session_reads[0];
+        assert!(gap >= session_wait(), "{gap:?}");
+
+        // Still failing after the passive teardown: on-site intervention.
+        let (result, host, _) = restart_after(
+            &program,
+            |host| host.lose_routine = Some(0xFF02),
+            |host| host.session = answer,
+        );
+        assert_eq!(not_confirmed_of(&result), restart::Teardown::CompletedPath);
+        assert_eq!(host.session_reads.len(), 2);
+    }
+
+    #[test]
+    fn a_refused_first_read_on_the_completed_path_is_retried_after_the_passive_teardown() {
+        completed_path_retry(SessionAnswer::Refuse(0x22));
+    }
+
+    #[test]
+    fn an_unanswered_first_read_on_the_completed_path_is_retried_after_the_passive_teardown() {
+        completed_path_retry(SessionAnswer::NoAnswer);
+    }
+
+    #[test]
+    fn a_non_default_first_read_on_the_completed_path_is_retried_after_the_passive_teardown() {
+        completed_path_retry(SessionAnswer::Other(0x03));
+    }
+
+    /// An interruption right after the procedure's own ECUReset was recorded as complete still
+    /// waits the startup time before the first read.
+    #[test]
+    fn the_startup_time_passes_before_the_first_read_after_a_post_transfer_reset() {
+        let program = confirmation_timing(
+            program_with_tail([
+                Op::PushBytes(0),
+                Op::ServiceRequest { service: 0x11 },
+                Op::Pop,
+            ]),
+            80,
+            0,
+        );
+        let dir = journal_dir("resume-startup-wait");
+        let result = first_run(&program, &dir, JobLimits::default(), |host| {
+            host.lose_service = Some(0x11);
+        });
+        assert!(matches!(result, Err(JobError::Host { .. })), "{result:?}");
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        let started = std::time::Instant::now();
+        let result = resume(&program, &dir, &mut host, false);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(
+            confirmed_of(&result),
+            (
+                restart::Teardown::CompletedPath,
+                restart::Confirmation {
+                    after_passive_retry: false
+                }
+            )
+        );
+        assert_eq!(host.session_reads.len(), 1);
+        let waited = host.session_reads[0] - started;
+        assert!(waited >= Duration::from_millis(80), "{waited:?}");
+    }
+
+    const STARTUP_MS: u64 = 80;
+
+    /// [`restart_after`] on `program`, also giving when the restart began (the journal's first
+    /// run is over by then), as the lower bound of every time in it.
+    fn restart_started(
+        program: &Program,
+        prepare_first: impl FnOnce(&mut FlashHost),
+        prepare_restart: impl FnOnce(&mut FlashHost),
+    ) -> (Result<VmState, JobError>, FlashHost, std::time::Instant) {
+        let dir = journal_dir("resume-startup");
+        let result = first_run(program, &dir, JobLimits::default(), prepare_first);
+        assert!(matches!(result, Err(JobError::Host { .. })), "{result:?}");
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        prepare_restart(&mut host);
+        let started = std::time::Instant::now();
+        let result = resume(program, &dir, &mut host, false);
+        std::fs::remove_dir_all(&dir).unwrap();
+        (result, host, started)
+    }
+
+    /// After an accepted reset, the first read comes the startup time after the reset was sent.
+    #[test]
+    fn the_startup_time_passes_between_the_reset_and_the_first_read() {
+        let program = confirmation_timing(flash_program(), STARTUP_MS as u32, 0);
+        let (result, host, _) =
+            restart_started(&program, |host| host.lose_routine = Some(0xFF00), |_| {});
+        assert_eq!(confirmed_of(&result).0, restart::Teardown::Reset);
+        let waited = host.session_reads[0] - host.reset_at.expect("a reset was sent");
+        assert!(waited >= Duration::from_millis(STARTUP_MS), "{waited:?}");
+    }
+
+    /// After a passive teardown, the first read comes the startup time after the passive wait.
+    #[test]
+    fn the_startup_time_passes_after_the_passive_wait_before_the_first_read() {
+        let program = confirmation_timing(flash_program(), STARTUP_MS as u32, 0);
+        let (result, host, started) = restart_started(
+            &program,
+            |host| host.lose_routine = Some(0xFF00),
+            |host| host.reset = ResetAnswer::Refuse(0x22),
+        );
+        assert!(!confirmed_of(&result).1.after_passive_retry);
+        let waited = host.session_reads[0] - started;
+        assert!(
+            waited >= session_wait() + Duration::from_millis(STARTUP_MS),
+            "{waited:?}"
+        );
+    }
+
+    /// The retry after the passive teardown waits the startup time as well.
+    #[test]
+    fn the_retry_waits_the_passive_teardown_and_the_startup_time() {
+        let program = confirmation_timing(flash_program(), STARTUP_MS as u32, 0);
+        let (result, host, started) = restart_started(
+            &program,
+            |host| host.lose_routine = Some(0xFF00),
+            |host| host.session_script = [SessionAnswer::Other(0x03)].into(),
+        );
+        assert!(confirmed_of(&result).1.after_passive_retry);
+        assert_eq!(host.session_reads.len(), 2);
+        let first = host.session_reads[0] - started;
+        assert!(first >= Duration::from_millis(STARTUP_MS), "{first:?}");
+        let gap = host.session_reads[1] - host.session_reads[0];
+        assert!(
+            gap >= session_wait() + Duration::from_millis(STARTUP_MS),
+            "{gap:?}"
+        );
+    }
+
+    /// The window counts from the end of the startup wait: a startup longer than the window
+    /// still leaves the window's reads, in both attempts.
+    #[test]
+    fn the_window_counts_from_the_end_of_the_startup_wait() {
+        let program = confirmation_timing(flash_program(), STARTUP_MS as u32, 30);
+        let (result, host, started) = restart_started(
+            &program,
+            |host| host.lose_routine = Some(0xFF00),
+            |host| host.session = SessionAnswer::Other(0x03),
+        );
+        assert_eq!(not_confirmed_of(&result), restart::Teardown::Reset);
+        // At least two reads per attempt (every 10 ms for 30 ms); had the startup used up the
+        // window, each attempt would read once.
+        assert!(
+            host.session_reads.len() >= 4,
+            "{}",
+            host.session_reads.len()
+        );
+        let first = host.session_reads[0] - started;
+        assert!(first >= Duration::from_millis(STARTUP_MS), "{first:?}");
+    }
+
+    /// A cancel during the passive wait between the two attempts ends the job with one read made.
+    #[test]
+    fn a_cancel_during_the_passive_wait_between_the_attempts_cancels_the_restart() {
+        let mut program = flash_program();
+        program.flash[0].timing.session_timeout_millis = 60_000;
+        let dir = journal_dir("resume-between-attempts");
+        interrupted(&program, &dir);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        host.session_script = [SessionAnswer::Other(0x03)].into();
+        let mirror = Arc::new(Mutex::new(Vec::new()));
+        host.mirror = Some(Arc::clone(&mirror));
+        let canceller = {
+            let (cancelled, mirror) = (Arc::clone(&cancelled), Arc::clone(&mirror));
+            std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(20);
+                while !mirror.lock().unwrap().contains(&read_of([0xF1, 0x86]))
+                    && std::time::Instant::now() < deadline
+                {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                std::thread::sleep(Duration::from_millis(10));
+                cancelled.store(true, Ordering::Relaxed);
+            })
+        };
+        let limits = JobLimits {
+            wait_poll: Duration::from_millis(2),
+            ..JobLimits::default()
+        };
+        let result = resume_on(
+            &program,
+            &mut host,
+            limits,
+            &cancelled,
+            Journal::open(&dir, &job_key()),
+            identity_sources(),
+            Some(&target()),
+            &dir_slot(&dir),
+        );
+        canceller.join().unwrap();
+        assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
+        assert_eq!(host.session_reads.len(), 1);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -3367,6 +3897,7 @@ mod tests {
                 "{recorded:?} {named:?}: {result:?}"
             );
             assert_eq!(host.sent(), []);
+            assert!(host.session_reads.is_empty());
             assert_eq!(resumes(&dir), 0);
             std::fs::remove_dir_all(&dir).unwrap();
         }
@@ -3400,6 +3931,7 @@ mod tests {
         );
         assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
         assert_eq!(host.sent(), [read_of([0xF1, 0x90]), read_of([0xF1, 0x91])]);
+        assert!(host.session_reads.is_empty());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -3424,6 +3956,7 @@ mod tests {
         );
         assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
         assert_eq!(host.sent(), [read_of([0xF1, 0x90])]);
+        assert!(host.session_reads.is_empty());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -3559,7 +4092,12 @@ mod tests {
         assert_eq!(teardown_of(&result), restart::Teardown::Reset);
         assert_eq!(
             *mirror.lock().unwrap(),
-            [read_of([0xF1, 0x90]), read_of([0xF1, 0x91]), reset_sent()]
+            [
+                read_of([0xF1, 0x90]),
+                read_of([0xF1, 0x91]),
+                reset_sent(),
+                read_of([0xF1, 0x86])
+            ]
         );
         let guards = slot.lock().unwrap().take().unwrap();
         assert!(guards.holds_vehicle());
@@ -3684,6 +4222,7 @@ mod tests {
         assert!(!text.contains("vehicle-"), "{text}");
         assert!(!text.contains(&bucket), "{text}");
         assert_eq!(host.sent(), [read_of([0xF1, 0x90])]);
+        assert!(host.session_reads.is_empty());
         let guards = slot.lock().unwrap().take().unwrap();
         assert!(!guards.holds_vehicle());
         std::fs::remove_dir_all(&dir).unwrap();
@@ -3700,6 +4239,7 @@ mod tests {
         let result = resume_in(&program, &dir, &mut host, false, Some(TARGET_VIN), &slot);
         assert!(matches!(result, Err(JobError::GuardsMissing)), "{result:?}");
         assert_eq!(host.sent(), [read_of([0xF1, 0x90])]);
+        assert!(host.session_reads.is_empty());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -3719,6 +4259,7 @@ mod tests {
             "{result:?}"
         );
         assert_eq!(host.sent(), []);
+        assert!(host.session_reads.is_empty());
         assert_eq!(host.voltage_reads, 0);
         drop(held);
         assert_eq!(resumes(&dir), 0);
@@ -3767,6 +4308,7 @@ mod tests {
         );
         assert!(matches!(result, Err(JobError::Journal(_))), "{result:?}");
         assert_eq!(host.sent(), []);
+        assert!(host.session_reads.is_empty());
     }
 
     /// A job stopped before its erase starts again on the same journal, its records coming
@@ -3817,6 +4359,7 @@ mod tests {
             "{result:?}"
         );
         assert_eq!(host.sent(), []);
+        assert!(host.session_reads.is_empty());
 
         drop(Journal::create(&dir, &job_key(), None).unwrap());
         std::fs::write(journal_file(&dir), b"not a journal").unwrap();
@@ -3831,6 +4374,7 @@ mod tests {
             "{result:?}"
         );
         assert_eq!(host.sent(), []);
+        assert!(host.session_reads.is_empty());
         std::fs::remove_dir_all(&dir).unwrap();
 
         let plain = program_without_plan();

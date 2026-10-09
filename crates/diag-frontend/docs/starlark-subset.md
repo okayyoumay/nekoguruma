@@ -82,7 +82,7 @@ Bytes (built-in functions, since Starlark's `bytes` type has few methods):
 (returns new bytes; bytes have value semantics in the IR).
 For `read_uint` and `write_uint`, `offset` counts bytes from the start of `b`, `bits` is a
 constant multiple of 8 from 8 to 56 (so every value fits a non-negative `I64`), and the bytes are
-big-endian, the byte order of UDS. A field that is not byte-aligned, or little-endian, is read
+big-endian (this helper's fixed encoding). A field that is not byte-aligned, or little-endian, is read
 through the declaration part's decode plan instead. An `offset` that runs past the end of `b`, or
 a `v` outside 0 to 2^`bits` - 1, is an error at run time. Both are built from `IndexGet`,
 `IndexSet`, shifts and `BitOr`.
@@ -157,6 +157,7 @@ field that stores them.
 | `form_id`, `template_id` | `str` naming the form or record template |
 | `level` of `diag.log` | `int`, 0 to 255 |
 | `params` of `diag.hmi` | dict whose values are all constants (3.2) |
+| `session_id` | `int` naming a flash session declared in the declaration part (`FlashSession` in `ir.fbs`); an unknown session is rejected (`STAR_UNKNOWN_FLASH_SESSION`) |
 
 A `diag.wait` whose duration is only known at run time needs a stack-operand variant of `Wait`.
 
@@ -379,8 +380,9 @@ lists every violation it finds.
   AST, not its evaluator. Walk the AST to detect 2.3
 - Detection uses an "allowlist approach". Unknown node kinds are rejected as
   `STAR_UNSUPPORTED_SYNTAX` so that nothing slips through by oversight
-- Comment annotations (4.2, 4.5, 4.6) are read from the source with their line numbers and
-  attached to the following statement, since the AST does not keep comments
+- Comment annotations (4.2, 4.5, 4.6) are taken from the comment tokens the parser's lexer
+  reports, never from raw source lines, so `# @` inside a string literal is not an annotation.
+  Each annotation is attached by its line to the following statement
 - Constant folding is done during bytecode generation
 - After generation, verify with a dry run on the `diag-ir` VM (vehicle access mocked) (12.1)
 

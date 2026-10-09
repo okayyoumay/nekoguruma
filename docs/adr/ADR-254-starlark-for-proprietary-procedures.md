@@ -61,8 +61,9 @@ The maintainer asked which language fits the IR best. Candidates compared:
   mostly constructs Starlark authors rarely use. Procedure authors write Python-like code.
 - Loop limits stay: `for` over a non-constant `range` or a run-time value still gets an
   embedded iteration limit, since a bound read from a response can be very large.
-- `starlark_syntax` does not keep comments in its AST, so the annotations are read from the
-  source by line and attached to the following statement.
+- The annotations are comments, so the transpiler takes them from the comment tokens the
+  parser's lexer reports (never from raw source lines, where `# @` could sit inside a string)
+  and attaches each by its line to the following statement.
 - Floor division needs the remainder and negation instructions the IR does not have yet
   (ADR-233 consequences); the transpiler's first procedures need them anyway.
 - The `diag` API is wider than the current instruction set: `diag.fail`, `diag.ecu_info` and

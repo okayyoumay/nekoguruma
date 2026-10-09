@@ -58,10 +58,10 @@ pub(crate) struct JobJournal<S = FileStore> {
 }
 
 impl JobJournal {
-    /// Creates the job's journal. An existing journal of the same key is an error: resuming
-    /// one is the restart's work, not a first run's.
+    /// Creates the job's journal. An existing journal of the same key is an error: a job that
+    /// ran before goes on through `resume_program_journaled`, not a first run.
     pub(crate) fn create(setup: JournalSetup) -> Result<Self, JournalError> {
-        Ok(Self::with(
+        Ok(Self::new(
             Journal::create(&setup.dir, &setup.key)?,
             setup.sources,
         ))
@@ -69,7 +69,9 @@ impl JobJournal {
 }
 
 impl<S: Store> JobJournal<S> {
-    fn with(journal: Journal<S>, sources: ServiceSources) -> Self {
+    /// Commits a job's run to `journal`: a new one, or an existing one a plain start goes on
+    /// with (ADR-255).
+    pub(crate) fn new(journal: Journal<S>, sources: ServiceSources) -> Self {
         Self {
             journal,
             sources,
@@ -79,13 +81,13 @@ impl<S: Store> JobJournal<S> {
     }
 
     #[cfg(test)]
-    pub(crate) fn new(journal: Journal<S>, sources: ServiceSources) -> Self {
-        Self::with(journal, sources)
+    pub(crate) fn journal(&self) -> &Journal<S> {
+        &self.journal
     }
 
     #[cfg(test)]
-    pub(crate) fn journal(&self) -> &Journal<S> {
-        &self.journal
+    pub(crate) fn into_journal(self) -> Journal<S> {
+        self.journal
     }
 
     /// Commits the markers and the identity the boundaries at `state.pc` call for. Called once

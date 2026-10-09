@@ -4,16 +4,21 @@
 //! [`classify`] reads what a job's write-job journal says about the job's last run, together
 //! with the program, and decides how the job may go on: a plain start, the restart order of
 //! ADR-229 item 2 for an interrupted transfer, or on-site intervention. It contacts nothing; the
-//! restart itself (resume limit, voltage read, teardown) acts on its answer.
+//! restart itself acts on its answer. [`check_before_ecu`] makes the restart's checks that need
+//! no ECU service (the resume limit and the supply voltage) and counts the resume (ADR-255).
 //!
 //! The interruption point is the latest of the last completed step and the requests the
 //! journal wrote ahead (the transfer-start and RequestTransferExit markers, and the request
 //! intent of ADR-253), by step count, so a crash after a guarded request was sent but before its
 //! response was recorded is placed at that request.
 
-use diag_ir::{Interruptible, Program, RecoveryRequired, Vm, VmError, VmState};
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::journal::{JournalError, JournalState, RecoveryFacts, StepRef};
+use diag_ir::{Interruptible, Program, RecoveryRequired, RuntimeInput, Vm, VmError, VmState};
+
+use crate::inputs::{Reading, RuntimeInputs};
+use crate::journal::{Journal, JournalError, JournalState, RecoveryFacts, StageId, StepRef, Store};
+use crate::runner::JobError;
 
 /// How a job whose journal exists goes on.
 #[derive(Debug, Clone, PartialEq)]
@@ -66,6 +71,23 @@ pub enum OnSiteReason {
     /// The transfer's plan never allows a restart (`FlashRecovery::allows_restart`), so the
     /// program need not declare what a restart reads (ADR-245 item 6).
     RestartNotAllowed { flash_session: u32 },
+    /// The stage was resumed as often as its plan allows (design 8.2.5, ADR-229 item 2 step 1).
+    ResumeLimitReached {
+        flash_session: u32,
+        resumes: u16,
+        max: u16,
+    },
+    /// The supply voltage the VCI reports is outside the range the program declares, or the VCI
+    /// gives none (`None`): no reading, an undecodable one, or a failure to ask the worker.
+    SupplyVoltage {
+        flash_session: u32,
+        millivolts: Option<i64>,
+    },
+    /// The restart passed the checks that need no ECU service and its resume was counted, but
+    /// the rest of ADR-229's restart order (teardown, the ECU state check, the replay to the
+    /// erase) does not run in this agent, so the job stops before it sends anything to the ECU
+    /// (ADR-255).
+    RestartOrderUnavailable { flash_session: u32 },
 }
 
 /// Decides how the job of `program` goes on, from its journal as `Journal::read` (or
@@ -140,6 +162,85 @@ pub fn classify(
         entry_state,
         facts: facts.clone(),
     }))
+}
+
+/// The checks of ADR-229 item 2 step 1 that need no ECU service, then the resume count, for an
+/// agent without a server (ADR-255). In this order:
+/// - the resume limit: a stage resumed `max_resumes` times needs on-site intervention;
+/// - the supply voltage, read through the VCI (`RuntimeInput::SupplyVoltageMillivolts`), when
+///   the program declares a voltage range: a reading outside it, or no reading, needs on-site
+///   intervention. A program that declares none is not checked here;
+/// - the resume count, incremented and committed to `journal` with no attempt key, since a
+///   standalone agent reserves nothing on a server.
+///
+/// A failed check counts no resume. A cancel stops it before the voltage read, right after it
+/// (whatever it gave) and before the commit. Returns the new count. Nothing here contacts the ECU.
+pub(crate) fn check_before_ecu<H, S>(
+    program: &Program,
+    point: &RestartPoint,
+    journal: &mut Journal<S>,
+    host: &mut H,
+    cancelled: &AtomicBool,
+) -> Result<u16, JobError>
+where
+    H: RuntimeInputs,
+    S: Store,
+{
+    let flash_session = point.flash_session;
+    let plan = program
+        .flash
+        .iter()
+        .find(|plan| plan.flash_session == flash_session)
+        // `classify` took the point from one of the program's plans.
+        .ok_or(JobError::Journal(JournalError::Invariant(
+            "the restart point names no plan of the program",
+        )))?;
+    let stage = StageId(plan.stage);
+    let resumes = journal.state().facts.resume_count(stage);
+    if resumes >= plan.max_resumes {
+        return Err(JobError::OnSiteInterventionRequired(
+            OnSiteReason::ResumeLimitReached {
+                flash_session,
+                resumes,
+                max: plan.max_resumes,
+            },
+        ));
+    }
+    if let Some(range) = program
+        .preconditions
+        .voltage_mv
+        .as_ref()
+        .map(|p| p.satisfied)
+    {
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(JobError::Cancelled);
+        }
+        let reading = host.read(RuntimeInput::SupplyVoltageMillivolts);
+        // A cancel during the read is a cancel, whatever the read gave.
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(JobError::Cancelled);
+        }
+        let millivolts = match reading {
+            Ok(Reading::Value(millivolts)) => Some(millivolts),
+            Ok(_) => None,
+            Err(error) => {
+                tracing::warn!(%error, "the supply voltage could not be read");
+                None
+            }
+        };
+        if !millivolts.is_some_and(|mv| (range.lower..=range.upper).contains(&mv)) {
+            return Err(JobError::OnSiteInterventionRequired(
+                OnSiteReason::SupplyVoltage {
+                    flash_session,
+                    millivolts,
+                },
+            ));
+        }
+    }
+    if cancelled.load(Ordering::Relaxed) {
+        return Err(JobError::Cancelled);
+    }
+    Ok(journal.commit_resume(stage, None)?)
 }
 
 /// The step count a run that goes on with `state`'s journal starts from: one more than any

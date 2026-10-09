@@ -337,6 +337,10 @@ pub enum JournalError {
     Invariant(&'static str),
     #[error("the record is larger than a journal frame")]
     TooLarge,
+    /// Another `Journal` of this job and generation is open for writing, in this process or
+    /// another (ADR-255).
+    #[error("the journal is open for writing elsewhere")]
+    InUse,
 }
 
 /// Where commits go. A commit is durable once `append_sync` returns `Ok`.
@@ -344,10 +348,34 @@ pub trait Store {
     fn append_sync(&mut self, bytes: &[u8]) -> io::Result<()>;
 }
 
-/// The journal file.
+/// The journal file, and the writer lock held for as long as it is open.
 pub struct FileStore {
     file: File,
     len: u64,
+    _writer: WriterLock,
+}
+
+/// An exclusive OS lock on the journal's sidecar `.journal.lock` file (ADR-255). It makes the
+/// `Journal` that holds it the journal's only writer. The OS drops the lock with the file handle,
+/// also when the process dies, so a crashed run never blocks the next one. The sidecar is
+/// never deleted: a process that locked a recreated file would not exclude one still holding
+/// the old one. It is a separate file so that [`Journal::read`] works while a job writes, also
+/// where file locks are mandatory (Windows).
+struct WriterLock(#[expect(dead_code, reason = "held only for its lock")] File);
+
+impl WriterLock {
+    fn take(journal: &Path) -> Result<Self, JournalError> {
+        let file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(journal.with_extension("journal.lock"))?;
+        match file.try_lock() {
+            Ok(()) => Ok(Self(file)),
+            Err(fs::TryLockError::WouldBlock) => Err(JournalError::InUse),
+            Err(fs::TryLockError::Error(error)) => Err(error.into()),
+        }
+    }
 }
 
 impl Store for FileStore {
@@ -372,9 +400,11 @@ pub struct Journal<S = FileStore> {
 impl Journal<FileStore> {
     /// Creates the journal of `key` in `dir`. The file appears complete or not at all: the
     /// header is written and synced under a temporary name, then linked to the journal's name,
-    /// which fails if that name exists.
+    /// which fails if that name exists. The journal's writer lock is taken first, so another
+    /// writer of the same job gets [`JournalError::InUse`].
     pub fn create(dir: &Path, key: &JobKey) -> Result<Self, JournalError> {
         let path = journal_path(dir, key)?;
+        let writer = WriterLock::take(&path)?;
         let tmp = path.with_extension("journal.tmp");
         let mut bytes = Vec::with_capacity(64);
         bytes.extend_from_slice(&MAGIC);
@@ -416,6 +446,7 @@ impl Journal<FileStore> {
             store: FileStore {
                 file,
                 len: bytes.len() as u64,
+                _writer: writer,
             },
             state: JournalState {
                 facts: RecoveryFacts::new(key.clone()),
@@ -430,11 +461,20 @@ impl Journal<FileStore> {
     /// commit that never returned is cut off; anything else that does not read back is
     /// [`JournalError::Corrupt`].
     ///
-    /// Only the writer of a journal opens it: nothing locks the file, and cutting off a frame
-    /// that another process is still writing would lose it. Other readers use
-    /// [`Journal::read`].
+    /// Only the writer of a journal opens it: the journal's writer lock is taken before the file
+    /// is read, so a second writer of the same job gets [`JournalError::InUse`] and never cuts off
+    /// a frame the first one is writing (ADR-255). Other readers use [`Journal::read`], which
+    /// takes no lock. A missing journal is [`JournalError::NotFound`] and leaves no lock file.
     pub fn open(dir: &Path, key: &JobKey) -> Result<Self, JournalError> {
         let path = journal_path(dir, key)?;
+        match fs::metadata(&path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(JournalError::NotFound);
+            }
+            Err(error) => return Err(error.into()),
+            Ok(_) => {}
+        }
+        let writer = WriterLock::take(&path)?;
         let (file, bytes) = read_file(&path, true)?;
         let loaded = load(&bytes, key)?;
         if loaded.len < bytes.len() {
@@ -450,6 +490,7 @@ impl Journal<FileStore> {
             store: FileStore {
                 file,
                 len: loaded.len as u64,
+                _writer: writer,
             },
             state: loaded.state,
             poisoned: false,
@@ -910,9 +951,11 @@ mod tests {
         let dir = TempDir::new();
         let mut journal = Journal::create(&dir.0, &key()).expect("create");
         script(&mut journal, |_| {});
+        let (state, summary) = (journal.state().clone(), journal.summary());
+        drop(journal);
         let reopened = Journal::open(&dir.0, &key()).expect("open");
-        assert_eq!(reopened.state(), journal.state());
-        assert_eq!(reopened.summary(), journal.summary());
+        assert_eq!(reopened.state(), &state);
+        assert_eq!(reopened.summary(), summary);
         let facts = reopened.summary();
         assert_eq!(facts.resume_counts, [(STAGE, 1)]);
         assert_eq!(facts.attempt_key.as_deref(), Some(&b"attempt-1"[..]));
@@ -989,8 +1032,10 @@ mod tests {
             journal
                 .commit_pre_erase_software_version(b"1.0.0")
                 .expect("commit after the cut");
+            let state = journal.state().clone();
+            drop(journal);
             let reopened = Journal::open(&dir.0, &key()).expect("reopen");
-            assert_eq!(reopened.state(), journal.state());
+            assert_eq!(reopened.state(), &state);
         }
     }
 
@@ -1000,6 +1045,7 @@ mod tests {
         let mut journal = Journal::create(&dir.0, &key()).expect("create");
         let header_end = journal.store.len as usize;
         script(&mut journal, |_| {});
+        drop(journal);
         let mut bytes = fs::read(path(&dir)).expect("read");
         // The first record's payload.
         bytes[header_end + FRAME_HEADER] ^= 0x40;
@@ -1062,11 +1108,23 @@ mod tests {
             Journal::create(&dir.0, &key()),
             Err(JournalError::AlreadyExists)
         ));
-        let names: Vec<_> = fs::read_dir(&dir.0)
+        // The journal and its writer lock's sidecar; no temporary file is left.
+        let mut names: Vec<_> = fs::read_dir(&dir.0)
             .expect("list")
             .map(|entry| entry.expect("entry").file_name())
             .collect();
-        assert_eq!(names, [path(&dir).file_name().expect("name").to_owned()]);
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                path(&dir).file_name().expect("name").to_owned(),
+                path(&dir)
+                    .with_extension("journal.lock")
+                    .file_name()
+                    .expect("name")
+                    .to_owned(),
+            ]
+        );
         for id in ["", "../x", "a/b", "a.b", "a\\b"] {
             let key = JobKey {
                 job_id: JobId(id.to_owned()),
@@ -1114,6 +1172,7 @@ mod tests {
 
         let refused_state = j.state().clone();
         let records = j.state().records;
+        drop(j);
         let reopened = Journal::open(&dir.0, &key()).expect("open");
         assert_eq!(reopened.state(), &refused_state);
         assert_eq!(reopened.state().records, records);
@@ -1465,8 +1524,47 @@ mod tests {
         let dir = TempDir::new();
         let mut journal = Journal::create(&dir.0, &key()).expect("create");
         journal.commit_intent(at(7, 70)).expect("intent");
+        drop(journal);
         let reopened = Journal::open(&dir.0, &key()).expect("open");
         assert_eq!(reopened.summary().last_intent, Some(at(7, 70)));
+    }
+
+    /// One writer per journal (ADR-255): a second `create` or `open` while a journal is open
+    /// is refused without touching the file, and works once the writer is gone. Readers are
+    /// not locked out.
+    #[test]
+    fn a_journal_has_one_writer() {
+        let dir = TempDir::new();
+        let mut journal = Journal::create(&dir.0, &key()).expect("create");
+        journal
+            .commit_ecu_hardware_part_number(b"HW")
+            .expect("commit");
+        let bytes = fs::read(path(&dir)).expect("read");
+        assert!(matches!(
+            Journal::open(&dir.0, &key()),
+            Err(JournalError::InUse)
+        ));
+        assert!(matches!(
+            Journal::create(&dir.0, &key()),
+            Err(JournalError::InUse)
+        ));
+        assert_eq!(fs::read(path(&dir)).expect("read"), bytes);
+        assert_eq!(
+            Journal::read(&dir.0, &key()).expect("read").facts,
+            journal.summary()
+        );
+        drop(journal);
+        assert!(matches!(
+            Journal::create(&dir.0, &key()),
+            Err(JournalError::AlreadyExists)
+        ));
+        let reopened = Journal::open(&dir.0, &key()).expect("open after the writer is gone");
+        assert!(matches!(
+            Journal::open(&dir.0, &key()),
+            Err(JournalError::InUse)
+        ));
+        drop(reopened);
+        Journal::open(&dir.0, &key()).expect("open again");
     }
 
     #[test]

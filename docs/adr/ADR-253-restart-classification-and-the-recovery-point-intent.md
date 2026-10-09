@@ -1,7 +1,7 @@
 # ADR-253: Restart Classification and a Write-Ahead Intent at the Recovery-Required Point
 
 **Date:** 2026-10-09
-**Status:** Accepted
+**Status:** Accepted (item 4's wiring into the runner decided by ADR-255)
 **Affects:** `agent` (`src/restart.rs`, `src/journaling.rs`, `src/journal.rs`), ADR-244 (record set), ADR-252 item 2
 
 ## Context

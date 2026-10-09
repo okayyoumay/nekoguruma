@@ -209,7 +209,8 @@ async fn run(args: RunArgs) -> Result<String, String> {
     )
     .await;
     // The job has closed its link whatever the result, unless its guards say otherwise
-    // (ADR-258). A stop that reaped the worker means no process holds the VCI any more.
+    // (ADR-258). A stop that reaped the worker means the worker no longer holds the link; a
+    // vendor device server may still hold the device a while, which the next open detects.
     match worker.process.stop(STOP_GRACE).await {
         Ok(Stopped::Exited) => guards.worker_gone(),
         Ok(Stopped::Killed) => {

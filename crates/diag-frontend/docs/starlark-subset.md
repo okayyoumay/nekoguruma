@@ -79,7 +79,13 @@ Lists: none in version 1 (lists are constants, 2.5)
 
 Bytes (built-in functions, since Starlark's `bytes` type has few methods):
 `to_hex(b)` `from_hex(s)` `read_uint(b, offset, bits)` `write_uint(b, offset, bits, v)`
-(returns new bytes; bytes have value semantics in the IR)
+(returns new bytes; bytes have value semantics in the IR).
+For `read_uint` and `write_uint`, `offset` counts bytes from the start of `b`, `bits` is a
+constant multiple of 8 from 8 to 56 (so every value fits a non-negative `I64`), and the bytes are
+big-endian, the byte order of UDS. A field that is not byte-aligned, or little-endian, is read
+through the declaration part's decode plan instead. An `offset` that runs past the end of `b`, or
+a `v` outside 0 to 2^`bits` - 1, is an error at run time. Both are built from `IndexGet`,
+`IndexSet`, shifts and `BitOr`.
 
 String functions and `int`/`float`/`str` conversions that take a run-time value need the
 instructions listed in 2.5; with constant arguments they are evaluated at ingestion.
@@ -260,9 +266,13 @@ def main():
 
 - `int` maps to the IR's `I64`. Starlark integers are unbounded, so a value outside the 64-bit
   range is an error at run time, consistent with the IR's checked arithmetic (ADR-233)
-- `//` and `%` follow Starlark: floor division and a remainder with the sign of the divisor.
-  The IR's integer division truncates toward zero (ADR-233), so the transpiler emits the
-  correction for operands of different signs
+- `//` and `%` on two `int` operands follow Starlark: floor division and a remainder with the
+  sign of the divisor. The IR's integer division truncates toward zero (ADR-233), so the
+  transpiler corrects the result only when the remainder is non-zero and the operands have
+  different signs (`-7 // 2` is `-4`, while `-4 // 2` stays `-2`)
+- `//` and `%` with a `float` operand need floor and remainder instructions for `F64` that the
+  IR does not have; they are rejected (`STAR_NOT_LOWERABLE`) unless both operands are constants,
+  which are folded at ingestion
 - `/` is float division and always yields `F64`
 - `>>` is arithmetic in Starlark, while the IR's `Shr` is logical (ADR-233). The transpiler
   lowers `x >> n` as `x >> n` for `x >= 0` and as `~((~x) >> n)` for negative `x` (the complement
@@ -279,6 +289,12 @@ def main():
 
 Interruptibility (8.10.1) is specified with comment annotations. Ranges without a specification
 are `interruptible: yes`.
+
+Every comment whose text starts with `@` is an annotation. An annotation that is not one of the
+forms in 4.2, 4.5 and 4.6, has an unknown or misspelled keyword or attribute, or leaves a
+`@section` without its `@endsection` (or the reverse) is rejected at ingestion
+(`STAR_BAD_ANNOTATION`), so a typo such as `# @section uninteruptible` cannot silently leave a
+range interruptible.
 
 ```python
     # @section uninterruptible expected=120000
@@ -300,10 +316,15 @@ indentation.
 ### 4.6 Specifying Idempotency
 
 Behavior on resume (8.2.5) is specified with annotations. When omitted, the per-API default is
-used: `Safe` for `read_dtc`, `ecu_info`, `precondition`, and `request` whose service is a read
-(ReadDataByIdentifier, ReadDTCInformation); `CheckState` for `routine` and `flash_transfer`;
-`Unsafe` for every other `request`, since a service the transpiler does not classify may change
-ECU state.
+used:
+
+| Call | Default |
+|---|---|
+| `request` with a read service (ReadDataByIdentifier, ReadDTCInformation), `read_dtc`, `ecu_info`, `precondition` | `Safe` |
+| `wait`, `capture`, `log` | `Safe` (no ECU state changes) |
+| `hmi`, `record` | `Safe`: a repeat at the same instruction keeps its inquiry number, so the host treats it as a poll of the open inquiry, not a new one (ADR-233) |
+| `security_access`, `routine`, `flash_transfer` | `CheckState` (a repeated security access starts again from a new seed request) |
+| any other `request` | `Unsafe`, since a service the transpiler does not classify may change ECU state |
 
 ```python
     # @idempotency unsafe

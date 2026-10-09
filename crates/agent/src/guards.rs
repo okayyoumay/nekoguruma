@@ -1167,4 +1167,38 @@ mod tests {
         drop(guards);
         let _ = fs::remove_dir_all(&dir);
     }
+
+    /// A file symlink at a lock file's path is refused, not followed (ADR-262 item 6). Creating
+    /// a symlink needs a privilege (or Developer Mode); when the OS says it is not held (error
+    /// 1314), the test reports that and returns, since the runners that enforce it run as admin.
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_symlink_is_not_followed_as_a_lock_file() {
+        let dir = dir("win-symlink");
+        let never = AtomicBool::new(false);
+        fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("target");
+        fs::write(&target, b"").unwrap();
+        let bucket = vehicle_bucket(&vin(VIN_A));
+        for link in [vci_path(&dir, "VCI-1"), vehicle_path(&dir, bucket)] {
+            match std::os::windows::fs::symlink_file(&target, &link) {
+                Ok(()) => {}
+                Err(error) if error.raw_os_error() == Some(1314) => {
+                    eprintln!("skipped: no privilege to create symlinks: {error}");
+                    let _ = fs::remove_dir_all(&dir);
+                    return;
+                }
+                Err(error) => panic!("symlink_file failed: {error}"),
+            }
+        }
+        assert!(JobGuards::take_vci_only(&setup(&dir, "VCI-1"), POLL, &never).is_err());
+        let mut guards = JobGuards::take_vci_only(&setup(&dir, "VCI-2"), POLL, &never).unwrap();
+        assert!(guards.take_vehicle(&vin(VIN_A), POLL, &never).is_err());
+        assert!(!guards.holds_vehicle());
+        // Neither refused take locked the target the links point at.
+        let other = File::open(&target).unwrap();
+        other.try_lock().expect("the target was not locked");
+        drop((other, guards));
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

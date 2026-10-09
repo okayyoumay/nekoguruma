@@ -15,7 +15,7 @@ Cargo workspace corresponding to the design document `docs/system-architecture.m
 | `shared-proto` | Commands, events, capabilities, job types | 5.1 / 5.3 / 9.5 |
 | `shared-crypto` | Signature verification for all 3 trust layers | 11.1 |
 | `diag-ir` | IR schema, bytecode, VM | 8.2 |
-| `diag-frontend` | ODX/OTX parser, CSV + JS->IR conversion (server only) | 8.3 / 8.4 |
+| `diag-frontend` | ODX/OTX parser, CSV + Starlark->IR conversion (server only) | 8.3 / 8.4 |
 | `vendor-manifest` | Manifest parser for ECU distribution packages | 11.2 |
 | `j2534-defs` | ABI-independent J2534 constants, protocol names, COMPARAM mapping | 8.5 |
 | `vci-discovery` | Discovery of J2534 devices and D-PDU API implementations | 7.1 |

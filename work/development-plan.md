@@ -13,7 +13,7 @@ Standards: `vehicle-comm-specs` holds SAE J2534-1 (v04.04), SAE J2534-2 (DEC2020
 | Milestone | Goal | Main crates | Standards needed |
 |---|---|---|---|
 | M1 Local E2E | agent -> worker -> `sim-vci` -> `sim-ecu` works on the worker targets, including an interrupted-write resume | `agent`, `worker-host`, `sim-vci`, `sim-ecu`, `diag-ir`, worker crates | J2534-1, J2534-2, ISO 22900-2, ISO 14229-1 (all held) |
-| M2 Diagnostic runtime | Diagnostic procedures defined as data (proprietary CSV + JS format) run end to end | `diag-ir`, `diag-frontend`, worker L1 (ISO-TP, UDS), `agent` L2 | ISO 14229-1, ISO 14229-2, ISO 15765-2 (all held) |
+| M2 Diagnostic runtime | Diagnostic procedures defined as data (proprietary CSV + Starlark format) run end to end | `diag-ir`, `diag-frontend`, worker L1 (ISO-TP, UDS), `agent` L2 | ISO 14229-1, ISO 14229-2, ISO 15765-2 (all held) |
 | M3 Server and job control (local profile) | A job created through the Web API is executed by the agent over the control channel and its result is stored | `server`, `agent`, `shared-proto`, `shared-crypto`, `db/` | none (RFC/IT specs only) |
 | M4 Web UI and acquired data | Operators run jobs and view/edit acquired data in the browser; offline start works | UI framework, reference UI, `server` | none |
 | M6 Trust, approval and reprogramming | Signed packages and artifacts, approval levels, ECU reprogramming with preconditions | `shared-crypto`, `vendor-manifest`, `agent`, `server` | ISO 14229-1 clause 16 (held); SAE J3138 (not held) |
@@ -53,12 +53,12 @@ M5 and M6 do not depend on each other; M6 comes first (maintainer's decision, 20
 - Worker L1: ISO-TP (ISO 15765-2) and UDS client behaviour on both the J2534 and D-PDU workers (design 8.1): session-layer timing and response pending from ISO 14229-2 (existing worker ADRs already cite its timing clause), request/response handling per ISO 14229-1 clause 7.
 - Agent L2 primitives (design 8.1) built on ISO 14229-1: read/write DID (10.2, 10.7) with the DID ranges in Annex C.1, read DTC with the status-mask bits and DTC formats in Annex D.2 / D.4, routine control (13.2, Annex F), security access (9.4). The 2026 edition also defines the Authentication service (9.6, certificate exchange and challenge-response) as an alternative to seed/key; L2 keeps the security step replaceable so it can be added in M6.
 - `diag-ir`: declaration part in FlatBuffers with pre-expanded decode plans and COMPU-METHOD conversions (8.2.2); the full procedure-part instruction set (8.2.4); resume model (8.2.5); interruptibility attributes (8.10.1).
-- `diag-frontend`: the proprietary format first, CSV tables + JavaScript subset -> IR (8.4), because it needs no purchased standard. Dry-run validation with vehicle access mocked (12.1).
+- `diag-frontend`: the proprietary format first, CSV tables + Starlark subset -> IR (8.4), because it needs no purchased standard. Dry-run validation with vehicle access mocked (12.1).
 - COMPARAM mapping on the J2534 side for the base protocols (8.5).
 
 **Exit criteria.**
 
-1. A CSV + JS definition of one ECU (variant identification, a few DIDs with conversions, DTC read, one routine) is converted to IR and runs against `sim-ecu` through both worker kinds (J2534 and D-PDU mock).
+1. A CSV + Starlark definition of one ECU (variant identification, a few DIDs with conversions, DTC read, one routine) is converted to IR and runs against `sim-ecu` through both worker kinds (J2534 and D-PDU mock).
 2. IR golden tests (definition -> IR -> request bytes and decoded values) and a fuzz target for malformed IR run in CI (12.1).
 3. A procedure interrupted mid-run resumes at the IR level according to its section attributes (8.2.5, 8.10.1).
 

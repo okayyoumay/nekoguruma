@@ -242,6 +242,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-250](ADR-250-agent-host-flash-transfer.md) | The Agent Host Implements FlashTransfer with Its Own Block Count | Accepted | `agent` host, policy; `diag-ir` plan validation |
 | [ADR-251](ADR-251-copilot-re-review-only-after-fixes-that-need-it.md) | Copilot Re-Review Only After Fixes That Need It | Accepted | `.claude/skills/pr-review-loop` (Steps 0, 4-5), `.github/copilot-instructions.md`, `CLAUDE.md` |
 | [ADR-252](ADR-252-job-runner-journals-at-plan-boundaries.md) | The Job Runner Journals at the Flash Recovery Plan's Boundaries | Accepted | `agent` runner, journaling, inputs |
+| [ADR-254](ADR-254-starlark-for-proprietary-procedures.md) | Starlark Replaces JavaScript as the Proprietary Procedure Language | Accepted | `diag-frontend` subset spec, design 8.4, `ir.fbs` `source_format` |
 
 ## Status Legend
 
@@ -591,6 +592,7 @@ the predecessor repository these ADRs came from.
 - ADR-233 (item 3's `VmState` fields removed by ADR-245)
 - ADR-242
 - ADR-245 (items 4 and 6 amended by ADR-250)
+- ADR-254
 
 ### Acquired Data & Monitoring
 - ADR-236

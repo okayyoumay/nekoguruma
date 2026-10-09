@@ -285,6 +285,13 @@ fn run_job(
     if cancelled.load(Ordering::Relaxed) {
         return Err(JobError::Cancelled);
     }
+    // A resumed job's guards stay held until the end of this function, after the link is
+    // closed: declared first, this handle is dropped last, so even a caller whose future is gone
+    // cannot hand the VCI to another job while this one still tears its link down.
+    let _guards: Option<GuardSlot> = match &journal {
+        Some(JournalMode::Resume(_, slot)) => Some(Arc::clone(slot)),
+        _ => None,
+    };
     let timings = Timings::for_link(config);
     let link = handle
         .block_on(link::open(&mut client, config, timings.unary))
@@ -303,8 +310,7 @@ fn run_job(
             let mut journal = JobJournal::create(setup)?;
             run_on(program, &mut host, limits, cancelled, Some(&mut journal))
         }
-        // The guards in `JournalMode::Resume` live until this match ends, which is the job's end.
-        Some(JournalMode::Resume(setup, _guards)) => resume_on(
+        Some(JournalMode::Resume(setup, _)) => resume_on(
             program,
             &mut host,
             limits,
@@ -1906,6 +1912,40 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
         );
         assert!(matches!(result, Err(JobError::Link(_))), "{result:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `resume_program_journaled` gives the guards back, still held, also when it returns before
+    /// the job starts (here: a current-thread runtime).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_resume_that_cannot_start_gives_the_guards_back() {
+        let dir = journal_dir("resume-early");
+        let (result, guards) = resume_program_journaled(
+            unreachable_client(),
+            &LinkConfig::iso15765(0x7E0, 0x7E8),
+            flash_program(),
+            JobLimits::default(),
+            file_setup(&dir),
+            take_guards(&dir),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(JobError::CurrentThreadRuntime)),
+            "{result:?}"
+        );
+        // Still held: another taker waits until it is cancelled.
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let waiter = {
+            let (dir, cancelled) = (dir.clone(), Arc::clone(&cancelled));
+            std::thread::spawn(move || {
+                JobGuards::take(&guard_setup(&dir), Duration::from_millis(1), &cancelled).map(drop)
+            })
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!waiter.is_finished(), "the guards are still held");
+        cancelled.store(true, Ordering::Relaxed);
+        assert!(waiter.join().unwrap().is_err());
+        drop(guards);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

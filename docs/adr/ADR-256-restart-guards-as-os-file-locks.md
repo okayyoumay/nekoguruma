@@ -90,6 +90,10 @@ Several things are not settled by the design:
 - First runs (`run_program`, `run_program_journaled`) still open the link without the
   per-VCI lock. A first run and a resume of another job can therefore share a VCI. A job that
   only reads needs the per-VCI lock without the slot, which `JobGuards::take` does not offer.
+- `run_job` holds its handle on the guard slot until after the link is closed, so even a
+  dropped future never releases the guards while the link is still being torn down. A close
+  that fails is only logged, though: the caller still gets the guards back and may release them
+  while the worker holds the link.
 - Lock files stay in the lock directory: one per VCI and per vehicle the device has seen,
   plus the slot.
 - A lock directory on a file system without OS file locks fails every job that takes a

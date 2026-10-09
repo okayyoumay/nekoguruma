@@ -106,6 +106,11 @@ impl<S: Store> JobJournal<S> {
         };
         for plan in &program.flash {
             let b = &plan.boundaries;
+            // Execution that comes back to the entry runs the plan again, recovery point included.
+            if pc == b.entry_pc {
+                self.past_recovery_point
+                    .retain(|stage| *stage != plan.stage);
+            }
             // The pre-erase version belongs before the job's first transfer (ADR-244 item 4),
             // and a second read could fall in a session the ECU refuses it in.
             if pc == b.entry_pc

@@ -44,6 +44,8 @@ Two ways to close this were considered:
    - One intent per plan is enough. The validator forbids any jump or call from at or past the
      point back before it (ADR-245 item 4), so execution never crosses the point again.
    - Any primitive counts, including a `Wait`. That errs on the side of on-site intervention.
+   - Execution that comes back to a plan's entry (which the validator allows only when the
+     point is the entry itself) runs the plan again and writes its intent again.
    - A cancelled job commits no intent. A request the VM refuses after the intent (a check only
      `step` makes) or a cancel after it leaves an intent for a request that was not sent, which
      also errs on the side of on-site intervention.
@@ -64,14 +66,20 @@ Two ways to close this were considered:
      section. This check comes before the next two, so it holds whether or not a transfer
      started.
      - The journal records no steps after a plan, so a plan that ran to its end leaves its last
-       step on its last primitive, past the point. When the journal records that plan's
-       post-transfer completion, execution got beyond its end, and the point does not count.
+       step on its last primitive, past the point. The post-transfer completion is committed with
+       the step that reached the end, and the journal stops updating the transfer's last
+       post-transfer step there. When the newest transfer is complete and the point is no later
+       than that step, the point is taken to be at the plan's end. A later point, such as a step
+       back into the plan's entry, stands as it is. A resume record changes no step count, so it
+       does not undo this.
      - The journal places a point only inside a plan, or on the step into a plan's entry, so
        only a section there can be found this way.
    - **No transfer-start marker**: a plain start, since nothing was erased.
    - **A transfer-start marker**: the restart order for the plan with the marker's stage. The
      marker alone is enough, so a lost erase response is an interrupted transfer. A stage the
-     program does not declare ends in on-site intervention.
+     program does not declare ends in on-site intervention, and so does a plan that never allows
+     a restart (`FlashRecovery::allows_restart`), since its program need not declare what a
+     restart reads (ADR-245 item 6).
 
    A restart replays from the plan's entry, so it needs the VM state there.
    - That state is the newest one the journal holds (ADR-252: taken on the step into the entry).
@@ -81,8 +89,9 @@ Two ways to close this were considered:
      refused before anything is sent.
    - Its step count is set to one more than any record's in the journal (`restart::next_steps`),
      since the journal orders records by step count and refuses one that does not come after
-     the last; `StepRef::steps` keeps counting across resumes. A plain start on an existing
-     journal continues from the same count.
+     the last; `StepRef::steps` keeps counting across resumes, and the state with its new count
+     is checked again. A plain start on an existing journal continues from the same count. A
+     job's step limit (`JobLimits::max_steps`) then counts across its runs.
 4. **The outcome lives in the classification.** `OnSiteInterventionRequired` is a variant of
    `RestartDecision`, with a reason. Wiring it into the job runner's result belongs to the
    restart entry, together with the resume limit and the voltage read.

@@ -60,6 +60,9 @@ pub enum OnSiteReason {
     MissingEntryState { flash_session: u32 },
     /// The VM state at the entry does not decode, or fails `Vm::check_state` (ADR-245 item 7).
     InvalidEntryState(String),
+    /// The transfer's plan never allows a restart (`FlashRecovery::allows_restart`), so the
+    /// program need not declare what a restart reads (ADR-245 item 6).
+    RestartNotAllowed { flash_session: u32 },
 }
 
 /// Decides how the job of `program` goes on, from its journal as `Journal::read` (or
@@ -81,7 +84,7 @@ pub fn classify(
     let facts = &state.facts;
     let interrupted_at = interruption_point(facts);
     if let Some(at) = interrupted_at
-        && let Some(reason) = recovery_required(program, facts, at)
+        && let Some(reason) = recovery_required(program, effective_point(program, facts, at))
     {
         return RestartDecision::OnSiteInterventionRequired(reason);
     }
@@ -97,6 +100,11 @@ pub fn classify(
             transfer.stage.0,
         ));
     };
+    if !plan.allows_restart() {
+        return RestartDecision::OnSiteInterventionRequired(OnSiteReason::RestartNotAllowed {
+            flash_session: plan.flash_session,
+        });
+    }
     let entry_state = match entry_state(program, state, plan.boundaries.entry_pc) {
         Ok(entry_state) => entry_state,
         Err(reason) => {
@@ -108,8 +116,14 @@ pub fn classify(
             });
         }
     };
+    // The restart's records come after the journal's last one; the counter must stay usable.
     let mut entry_state = entry_state;
     entry_state.steps = next_steps(state);
+    if let Err(error) = Vm::resume(entry_state.clone()).check_state(program) {
+        return RestartDecision::OnSiteInterventionRequired(OnSiteReason::InvalidEntryState(
+            error.to_string(),
+        ));
+    }
     RestartDecision::Restart(Box::new(RestartPoint {
         flash_session: plan.flash_session,
         interrupted_at,
@@ -157,29 +171,42 @@ pub fn interruption_point(facts: &RecoveryFacts) -> Option<StepRef> {
     .max_by_key(|at| at.steps)
 }
 
+/// Where the interruption at `at` actually is. The journal records no steps after a plan, so a
+/// plan that ran to its end leaves its last step inside the plan; its post-transfer completion,
+/// committed with the step that reached the end, says execution got past it. A point no later
+/// than that step (the completed transfer's last post-transfer step, which the journal stops
+/// updating at the completion) is at the plan's end. A later point, such as a step back into the
+/// plan's entry, stands as it is. A resume record changes no step count, so it does not undo
+/// this.
+fn effective_point(program: &Program, facts: &RecoveryFacts, at: StepRef) -> StepRef {
+    let Some(transfer) = &facts.transfer else {
+        return at;
+    };
+    let Some(exit) = transfer.exit.as_ref().filter(|exit| exit.complete) else {
+        return at;
+    };
+    let last = exit.last_post_step.unwrap_or(exit.intent_at);
+    match program
+        .flash
+        .iter()
+        .find(|plan| plan.stage == transfer.stage.0)
+    {
+        Some(plan) if at.steps <= last.steps => StepRef {
+            pc: plan.boundaries.post_transfer_end_pc,
+            steps: at.steps,
+        },
+        _ => at,
+    }
+}
+
 /// Why an interruption at `at` rules out a restart, if it does: at or past a plan's
 /// recovery-required point and before its end, or inside a section marked `RecoveryRequired`.
-///
-/// A plan whose post-transfer completion the journal records was left at its end: the journal
-/// records no steps after a plan, so its last step stays on the plan's last primitive, and the
-/// completion is what says execution got past it. Sections are checked only where the journal
-/// can place a point: inside a plan, or on the step into a plan's entry.
-fn recovery_required(
-    program: &Program,
-    facts: &RecoveryFacts,
-    at: StepRef,
-) -> Option<OnSiteReason> {
-    let completed = |stage: u32| {
-        facts.transfer.as_ref().is_some_and(|transfer| {
-            transfer.stage.0 == stage
-                && !transfer.interrupted
-                && transfer.exit.as_ref().is_some_and(|exit| exit.complete)
-        })
-    };
+/// Sections are found only where the journal can place a point: inside a plan, on the step into
+/// a plan's entry, or at a completed plan's end.
+fn recovery_required(program: &Program, at: StepRef) -> Option<OnSiteReason> {
     for plan in &program.flash {
         if let RecoveryRequired::FromPc(from) = plan.recovery_required
             && (from..plan.boundaries.post_transfer_end_pc).contains(&at.pc)
-            && !completed(plan.stage)
         {
             return Some(OnSiteReason::RecoveryRequiredPoint {
                 flash_session: plan.flash_session,
@@ -527,6 +554,98 @@ mod tests {
             decide(&other, &j),
             RestartDecision::OnSiteInterventionRequired(OnSiteReason::UnknownStage(7))
         );
+    }
+
+    /// A resume record after the completion does not undo it: the restart that committed the
+    /// resume and crashed before any new record is still past the plan's end.
+    #[test]
+    fn a_resume_after_the_completion_keeps_the_plan_left() {
+        let program = program(RecoveryRequired::FromPc(CHECK));
+        let mut j = journal_until(&program, END);
+        j.commit_post_transfer_complete().unwrap();
+        j.commit_resume(StageId(7), None).unwrap();
+        assert!(matches!(decide(&program, &j), RestartDecision::Restart(_)));
+    }
+
+    /// Coming back into the plan after it completed puts the point inside it again.
+    #[test]
+    fn a_step_back_into_a_completed_plan_counts_again() {
+        let mut program = program(RecoveryRequired::FromPc(ENTRY));
+        program.code[9] = Op::Jump(ENTRY);
+        let mut j = journal_until(&program, END);
+        j.commit_post_transfer_complete().unwrap();
+        // The jump at 9 into the entry, then the entry's own primitive.
+        j.commit_step(
+            StepRef { pc: 9, steps: 9 },
+            Some(&entry_state(&program, IR_SCHEMA_VERSION)),
+        )
+        .unwrap();
+        j.commit_step(
+            StepRef {
+                pc: ENTRY,
+                steps: 10,
+            },
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            decide(&program, &j),
+            RestartDecision::OnSiteInterventionRequired(OnSiteReason::RecoveryRequiredPoint { .. })
+        ));
+    }
+
+    /// A `RecoveryRequired` section over a completed plan's tail does not catch a crash after
+    /// the plan's end.
+    #[test]
+    fn a_section_over_a_completed_plans_tail_does_not_refuse_the_restart() {
+        let mut program = program(RecoveryRequired::FromPc(CHECK));
+        program.sections.push(Section {
+            start_pc: CHECK,
+            end_pc: END,
+            interruptible: Interruptible::RecoveryRequired,
+            idempotency: Idempotency::Safe,
+            expected_millis: 0,
+        });
+        let mut j = journal_until(&program, END);
+        assert!(matches!(
+            decide(&program, &j),
+            RestartDecision::OnSiteInterventionRequired(_)
+        ));
+        j.commit_post_transfer_complete().unwrap();
+        assert!(matches!(decide(&program, &j), RestartDecision::Restart(_)));
+    }
+
+    /// A plan that never allows a restart gets none, even past its end.
+    #[test]
+    fn a_plan_that_never_restarts_needs_on_site_intervention() {
+        let program = program(RecoveryRequired::FromPc(ERASE));
+        let mut j = journal_until(&program, END);
+        j.commit_post_transfer_complete().unwrap();
+        assert_eq!(
+            decide(&program, &j),
+            RestartDecision::OnSiteInterventionRequired(OnSiteReason::RestartNotAllowed {
+                flash_session: 1
+            })
+        );
+    }
+
+    /// A step count the journal leaves no room after is refused before anything is sent.
+    #[test]
+    fn an_exhausted_step_count_needs_on_site_intervention() {
+        let program = program(RecoveryRequired::Never);
+        let mut j = journal_until(&program, EXIT);
+        j.commit_step(
+            StepRef {
+                pc: EXIT,
+                steps: u64::MAX - 1,
+            },
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            decide(&program, &j),
+            RestartDecision::OnSiteInterventionRequired(OnSiteReason::InvalidEntryState(_))
+        ));
     }
 
     /// The interruption point is the latest of the last step and the requests written ahead.

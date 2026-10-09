@@ -86,6 +86,11 @@ pub enum JobError {
         #[source]
         source: HostError,
     },
+    /// The ECU's identity decodes to another vehicle or ECU than the job's; the job is aborted
+    /// (design 5.6 Interrupted -> Failed, ADR-229 item 2). The message carries no identity
+    /// value (design 16.2).
+    #[error("the ECU's {identity:?} is not the job's, so the job is aborted")]
+    IdentityMismatch { identity: IdentityKind },
     /// The job must not go on automatically (design 5.6, 8.2.5, 8.10.1): it ends here and
     /// waits for someone on site.
     #[error("the job needs on-site intervention: {0:?}")]
@@ -214,11 +219,15 @@ pub async fn run_program_journaled(
 ///   after the journal's last record (`restart::next_steps`); a program without a flash
 ///   recovery plan and without a journal runs without one;
 /// - an interrupted transfer makes the checks of `restart::check_before_ecu` (resume limit,
-///   supply voltage) and commits the incremented resume count; the rest of the restart order
-///   does not run in this agent, so the job then ends in
-///   [`JobError::OnSiteInterventionRequired`] with nothing sent to the ECU;
+///   supply voltage), commits the incremented resume count and makes the gates of
+///   `restart::check_gates` (ADR-229 item 2 step 2, ADR-261), which send only
+///   ReadDataByIdentifier requests through the declared sources and read runtime inputs, nothing
+///   that changes the ECU. The rest of the restart order does not run in this agent, so the job
+///   then ends in [`JobError::OnSiteInterventionRequired`] (`RestartOrderUnavailable`, carrying
+///   the gates' decision), or in [`JobError::IdentityMismatch`] when the ECU's VIN is another
+///   vehicle's;
 /// - a journal that rules a restart out, or a missing or unreadable one for a program with a
-///   plan, ends the job the same way, also with nothing sent.
+///   plan, ends the job in on-site intervention with nothing sent.
 ///
 /// `guards` are taken and returned as for [`run_program`]. After an agent crash or a loss of the
 /// device's power, the new run takes them with `JobGuards::take` before it calls this, waiting
@@ -411,6 +420,7 @@ fn run_job(
             cancelled,
             Journal::open(&setup.dir, &setup.key),
             setup.sources,
+            setup.vin.as_ref(),
         ),
         _ => run_on(
             program,
@@ -493,7 +503,8 @@ impl Drop for CancelOnDrop {
 
 /// Goes on with a job from its journal as `Journal::open` gave it (ADR-255; see
 /// [`resume_program_journaled`]). Nothing is sent to the ECU before the classification and the
-/// checks of `restart::check_before_ecu` passed.
+/// checks of `restart::check_before_ecu` passed; then `restart::check_gates` sends only
+/// ReadDataByIdentifier requests (ADR-229 item 2 step 2). `vin` is the job's target VIN.
 fn resume_on<H, S>(
     program: &Program,
     host: &mut H,
@@ -501,6 +512,7 @@ fn resume_on<H, S>(
     cancelled: &AtomicBool,
     opened: Result<Journal<S>, JournalError>,
     sources: crate::inputs::ServiceSources,
+    vin: Option<&crate::journal::Vin>,
 ) -> Result<VmState, JobError>
 where
     H: DiagHost<Error = HostError> + RuntimeInputs + TransferProgress,
@@ -509,6 +521,15 @@ where
     // Another run of this job holds the journal: it, not this one, goes on with the job.
     if let Err(JournalError::InUse) = opened {
         return Err(JobError::Journal(JournalError::InUse));
+    }
+    // A resume names the VIN the job's first run recorded, or the job's own data changed
+    // (ADR-261): nothing is sent and no resume is counted.
+    if let Ok(journal) = &opened
+        && journal.state().facts.target_vin.as_ref() != vin
+    {
+        return Err(JobError::OnSiteInterventionRequired(
+            OnSiteReason::TargetVinDiffers,
+        ));
     }
     match restart::classify(program, opened.as_ref().map(Journal::state)) {
         RestartDecision::OnSiteInterventionRequired(reason) => {
@@ -534,9 +555,11 @@ where
             // `classify` restarts only from a journal it read.
             let mut journal = opened?;
             restart::check_before_ecu(program, &point, &mut journal, host, cancelled)?;
+            let teardown = restart::check_gates(program, &point, &sources, host, cancelled)?;
             Err(JobError::OnSiteInterventionRequired(
                 OnSiteReason::RestartOrderUnavailable {
                     flash_session: point.flash_session,
+                    teardown,
                 },
             ))
         }
@@ -959,6 +982,16 @@ mod tests {
         voltage_fails: bool,
         /// Set while the voltage is read, as a dropped job future would.
         cancel_on_voltage: Option<Arc<AtomicBool>>,
+        /// The answer to F190 (the VIN); `None` answers it negatively.
+        vin: Option<Vec<u8>>,
+        /// Identifiers whose ReadDataByIdentifier fails, as a worker that cannot be reached
+        /// would.
+        fail_reads: Vec<[u8; 2]>,
+        /// The answer to F191 (the hardware part number); `None` answers it negatively.
+        hardware: Option<Vec<u8>>,
+        /// The readings of the runtime inputs other than the supply voltage, which `voltage`
+        /// answers; an input not set is `CannotBeEstablished`.
+        inputs: crate::inputs::FixedInputs,
     }
 
     impl FlashHost {
@@ -974,6 +1007,10 @@ mod tests {
                 voltage_reads: 0,
                 voltage_fails: false,
                 cancel_on_voltage: None,
+                fail_reads: Vec::new(),
+                vin: Some(TARGET_VIN.as_bytes().to_vec()),
+                hardware: Some(b"HW01".to_vec()),
+                inputs: crate::inputs::FixedInputs::new(),
             }
         }
 
@@ -1005,7 +1042,7 @@ mod tests {
                     self.voltage_reads += 1;
                     crate::inputs::Reading::CannotBeEstablished
                 }
-                _ => crate::inputs::Reading::CannotBeEstablished,
+                _ => return self.inputs.read(input),
             })
         }
     }
@@ -1028,8 +1065,18 @@ mod tests {
             {
                 flag.store(true, Ordering::Relaxed);
             }
+            if service == 0x22 && self.fail_reads.iter().any(|did| payload == did) {
+                return Err(HostError::NoResponse);
+            }
             match (service, payload) {
-                (0x22, [0xF1, 0x91]) => Ok([&[0x62, 0xF1, 0x91][..], b"HW01"].concat()),
+                (0x22, [0xF1, 0x90]) => Ok(match &self.vin {
+                    Some(vin) => [&[0x62, 0xF1, 0x90][..], vin].concat(),
+                    None => vec![0x7F, 0x22, 0x31],
+                }),
+                (0x22, [0xF1, 0x91]) => Ok(match &self.hardware {
+                    Some(hardware) => [&[0x62, 0xF1, 0x91][..], hardware].concat(),
+                    None => vec![0x7F, 0x22, 0x31],
+                }),
                 (0x22, [0xF1, 0x95]) => Ok(match &self.software_version {
                     Some(version) => [&[0x62, 0xF1, 0x95][..], version].concat(),
                     None => vec![0x7F, 0x22, 0x31],
@@ -1148,16 +1195,24 @@ mod tests {
         program
     }
 
+    /// The VIN the jobs of the fixture target, and the one the fixture ECU answers by default.
+    const TARGET_VIN: &str = "WDB12345678901234";
+
     fn identity_sources() -> crate::inputs::ServiceSources {
-        let field = |field_id, did: u8| crate::inputs::ServiceField {
+        let field = |field_id, did: u8, length| crate::inputs::ServiceField {
             service_id: 1,
             field_id,
             request: vec![0x22, 0xF1, did],
             offset: 2,
-            length: 4,
+            length,
             encoding: crate::inputs::Encoding::Ascii,
         };
-        crate::inputs::ServiceSources::new(vec![field(1, 0x91), field(2, 0x95)]).unwrap()
+        crate::inputs::ServiceSources::new(vec![
+            field(1, 0x91, 4),
+            field(2, 0x95, 4),
+            field(3, 0x90, 17),
+        ])
+        .unwrap()
     }
 
     fn job_key() -> crate::journal::JobKey {
@@ -1323,6 +1378,7 @@ mod tests {
             dir: dir.clone(),
             key: job_key(),
             sources: identity_sources(),
+            vin: None,
         };
         let mut journal = JobJournal::create(setup).unwrap();
         let mut host = FlashHost::new(Rc::new(Cell::new(0)));
@@ -1901,6 +1957,7 @@ mod tests {
             dir: dir.clone(),
             key: job_key(),
             sources: identity_sources(),
+            vin: None,
         };
         let slot = vci_only_slot("link-fails");
         let result = tokio::runtime::Builder::new_multi_thread()
@@ -2145,6 +2202,7 @@ mod tests {
             dir: dir.clone(),
             key: job_key(),
             sources: identity_sources(),
+            vin: None,
         };
         // Fails when the link opens, before the journal would be created: no file appears.
         let slot = vci_only_slot("no-journal");
@@ -2206,11 +2264,21 @@ mod tests {
         dir
     }
 
+    fn target() -> crate::journal::Vin {
+        crate::journal::Vin::new(TARGET_VIN.to_owned())
+    }
+
     fn file_setup(dir: &std::path::Path) -> JournalSetup {
+        file_setup_for(dir, Some(TARGET_VIN))
+    }
+
+    /// The setup of a job that targets `vin`.
+    fn file_setup_for(dir: &std::path::Path, vin: Option<&str>) -> JournalSetup {
         JournalSetup {
             dir: dir.to_owned(),
             key: job_key(),
             sources: identity_sources(),
+            vin: vin.map(|vin| crate::journal::Vin::new(vin.to_owned())),
         }
     }
 
@@ -2221,9 +2289,20 @@ mod tests {
         limits: JobLimits,
         prepare: impl FnOnce(&mut FlashHost),
     ) -> Result<VmState, JobError> {
+        first_run_for(program, dir, limits, Some(TARGET_VIN), prepare)
+    }
+
+    /// [`first_run`] for a job that targets `vin`.
+    fn first_run_for(
+        program: &Program,
+        dir: &std::path::Path,
+        limits: JobLimits,
+        vin: Option<&str>,
+        prepare: impl FnOnce(&mut FlashHost),
+    ) -> Result<VmState, JobError> {
         let mut host = FlashHost::new(Rc::new(Cell::new(0)));
         prepare(&mut host);
-        let mut journal = JobJournal::create(file_setup(dir)).unwrap();
+        let mut journal = JobJournal::create(file_setup_for(dir, vin)).unwrap();
         run_on(
             program,
             &mut host,
@@ -2235,7 +2314,12 @@ mod tests {
 
     /// A first run whose erase response is lost: an interrupted transfer.
     fn interrupted(program: &Program, dir: &std::path::Path) {
-        let result = first_run(program, dir, JobLimits::default(), |host| {
+        interrupted_for(program, dir, Some(TARGET_VIN));
+    }
+
+    /// [`interrupted`] for a job that targets `vin`.
+    fn interrupted_for(program: &Program, dir: &std::path::Path, vin: Option<&str>) {
+        let result = first_run_for(program, dir, JobLimits::default(), vin, |host| {
             host.lose_routine = Some(0xFF00);
         });
         assert!(
@@ -2250,6 +2334,17 @@ mod tests {
         host: &mut FlashHost,
         cancelled: bool,
     ) -> Result<VmState, JobError> {
+        resume_for(program, dir, host, cancelled, Some(TARGET_VIN))
+    }
+
+    /// [`resume`] for a job that targets `vin`.
+    fn resume_for(
+        program: &Program,
+        dir: &std::path::Path,
+        host: &mut FlashHost,
+        cancelled: bool,
+        vin: Option<&str>,
+    ) -> Result<VmState, JobError> {
         resume_on(
             program,
             host,
@@ -2257,7 +2352,13 @@ mod tests {
             &AtomicBool::new(cancelled),
             Journal::open(dir, &job_key()),
             identity_sources(),
+            vin.map(|vin| crate::journal::Vin::new(vin.to_owned()))
+                .as_ref(),
         )
+    }
+
+    fn read_of(did: [u8; 2]) -> Sent {
+        Sent::Service(0x22, did.to_vec())
     }
 
     /// The journal file in `dir`, beside its writer lock's sidecar.
@@ -2292,13 +2393,18 @@ mod tests {
             matches!(
                 result,
                 Err(JobError::OnSiteInterventionRequired(
-                    OnSiteReason::RestartOrderUnavailable { flash_session: 1 }
+                    OnSiteReason::RestartOrderUnavailable {
+                        flash_session: 1,
+                        teardown: restart::TeardownGate::ResetAllowed
+                    }
                 ))
             ),
             "{result:?}"
         );
-        assert_eq!(host.sent(), []);
-        assert_eq!(host.voltage_reads, 1);
+        // Only the gates' ReadDataByIdentifier requests: the VIN, then the hardware identity.
+        assert_eq!(host.sent(), [read_of([0xF1, 0x90]), read_of([0xF1, 0x91])]);
+        // Read by step 1 and again by the gates.
+        assert_eq!(host.voltage_reads, 2);
         assert_eq!(resumes(&dir), 1);
         let facts = Journal::read(&dir, &job_key()).unwrap().facts;
         assert_eq!(facts.attempt_key, None);
@@ -2444,6 +2550,7 @@ mod tests {
                 &cancelled,
                 Journal::open(&dir, &job_key()),
                 identity_sources(),
+                Some(&target()),
             );
             assert!(
                 matches!(result, Err(JobError::Cancelled)),
@@ -2462,6 +2569,463 @@ mod tests {
         let result = resume(&program, &dir, &mut host, true);
         assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
         assert_eq!(resumes(&dir), 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // ---------------------------------------------- restart gates (ADR-229 item 2 step 2)
+
+    /// A first run interrupted at the erase, then a restart of `program` on a host `prepare`
+    /// sets up, for a job that targets `vin`. Gives the result and the host.
+    fn restart_with(
+        program: &Program,
+        vin: Option<&str>,
+        prepare: impl FnOnce(&mut FlashHost),
+    ) -> (Result<VmState, JobError>, FlashHost) {
+        let dir = journal_dir("resume-gates");
+        interrupted_for(program, &dir, vin);
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        host.voltage = Some(12_600);
+        prepare(&mut host);
+        let result = resume_for(program, &dir, &mut host, false, vin);
+        std::fs::remove_dir_all(&dir).unwrap();
+        (result, host)
+    }
+
+    /// The teardown a restart ended in. Fails the test on any other result.
+    fn teardown_of(result: &Result<VmState, JobError>) -> restart::TeardownGate {
+        match result {
+            Err(JobError::OnSiteInterventionRequired(OnSiteReason::RestartOrderUnavailable {
+                flash_session: 1,
+                teardown,
+            })) => teardown.clone(),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// `flash_program` declaring the engine precondition (a flag that must be 0) with these
+    /// sources.
+    fn flash_program_with_engine(
+        default_session: diag_ir::Source,
+        programming_session: diag_ir::Source,
+    ) -> Program {
+        let mut program = flash_program();
+        program.preconditions.engine = Some(diag_ir::Precondition {
+            satisfied: diag_ir::Satisfied { lower: 0, upper: 0 },
+            default_session: Some(default_session),
+            programming_session: Some(programming_session),
+        });
+        program.validate().expect("the fixture is a valid program");
+        program
+    }
+
+    fn input(input: diag_ir::RuntimeInput) -> diag_ir::Source {
+        diag_ir::Source::RuntimeInput(input)
+    }
+
+    /// Nothing but ReadDataByIdentifier requests was sent: no ECUReset, no routine, no block.
+    fn assert_only_reads(host: &FlashHost) {
+        assert!(
+            host.sent()
+                .iter()
+                .all(|sent| matches!(sent, Sent::Service(0x22, _))),
+            "{:?}",
+            host.sent()
+        );
+    }
+
+    /// A VIN that decodes to another vehicle's aborts the job; nothing after the VIN read is
+    /// sent, and the error does not carry the VIN.
+    #[test]
+    fn a_vin_mismatch_aborts_the_restart_after_the_vin_read() {
+        let (result, host) = restart_with(&flash_program(), Some(TARGET_VIN), |host| {
+            host.vin = Some(b"WDB99999999999999".to_vec());
+        });
+        let Err(error @ JobError::IdentityMismatch { identity }) = &result else {
+            panic!("{result:?}");
+        };
+        assert_eq!(*identity, IdentityKind::Vin);
+        assert!(!format!("{error} {error:?}").contains("WDB"));
+        assert_eq!(host.sent(), [read_of([0xF1, 0x90])]);
+    }
+
+    #[test]
+    fn a_vin_that_cannot_be_read_leaves_the_teardown_passive() {
+        let passive = restart::TeardownGate::PassiveOnly(restart::PassiveReason::VinNotEstablished);
+        // A negative response.
+        let (result, host) = restart_with(&flash_program(), Some(TARGET_VIN), |host| {
+            host.vin = None;
+        });
+        assert_eq!(teardown_of(&result), passive);
+        assert_eq!(host.sent(), [read_of([0xF1, 0x90])]);
+
+        // A VIN field that is blank, so not text.
+        let (result, _) = restart_with(&flash_program(), Some(TARGET_VIN), |host| {
+            host.vin = Some(vec![b' '; 17]);
+        });
+        assert_eq!(teardown_of(&result), passive);
+
+        // The program declares no VIN source.
+        let mut no_source = flash_program();
+        no_source.identity.vin = None;
+        let (result, host) = restart_with(&no_source, Some(TARGET_VIN), |_| {});
+        assert_eq!(teardown_of(&result), passive);
+        assert_eq!(host.sent(), []);
+    }
+
+    #[test]
+    fn a_job_without_a_vin_reads_nothing_and_stays_passive() {
+        let (result, host) = restart_with(&flash_program(), None, |_| {});
+        assert_eq!(
+            teardown_of(&result),
+            restart::TeardownGate::PassiveOnly(restart::PassiveReason::VinNotEstablished)
+        );
+        assert_eq!(host.sent(), []);
+    }
+
+    #[test]
+    fn a_hardware_identity_that_differs_or_cannot_be_read_leaves_the_teardown_passive() {
+        use restart::{PassiveReason, TeardownGate::PassiveOnly};
+        // The journal recorded HW01.
+        let (result, host) = restart_with(&flash_program(), Some(TARGET_VIN), |host| {
+            host.hardware = Some(b"HW02".to_vec());
+        });
+        assert_eq!(
+            teardown_of(&result),
+            PassiveOnly(PassiveReason::HardwareIdentityDiffers)
+        );
+        assert_eq!(host.sent(), [read_of([0xF1, 0x90]), read_of([0xF1, 0x91])]);
+
+        let (result, _) = restart_with(&flash_program(), Some(TARGET_VIN), |host| {
+            host.hardware = None;
+        });
+        assert_eq!(
+            teardown_of(&result),
+            PassiveOnly(PassiveReason::HardwareIdentityNotEstablished)
+        );
+
+        // No source declared: nothing is compared.
+        let mut no_source = flash_program();
+        no_source.identity.hardware_part_number = None;
+        let (result, host) = restart_with(&no_source, Some(TARGET_VIN), |_| {});
+        assert_eq!(
+            teardown_of(&result),
+            PassiveOnly(PassiveReason::HardwareIdentityNotEstablished)
+        );
+        assert_eq!(host.sent(), [read_of([0xF1, 0x90])]);
+    }
+
+    #[test]
+    fn a_precondition_that_fails_or_cannot_be_established_leaves_the_teardown_passive() {
+        use diag_ir::{PreconditionKind, RuntimeInput};
+        use restart::{PassiveReason, TeardownGate::PassiveOnly};
+        let engine = PassiveOnly(PassiveReason::Precondition(PreconditionKind::Engine));
+
+        // The engine runs.
+        let program = flash_program_with_engine(
+            input(RuntimeInput::EngineRunning),
+            input(RuntimeInput::EngineRunning),
+        );
+        let (result, host) = restart_with(&program, Some(TARGET_VIN), |host| {
+            host.inputs = crate::inputs::FixedInputs::new().with(
+                RuntimeInput::EngineRunning,
+                crate::inputs::Reading::Value(1),
+            );
+        });
+        assert_eq!(teardown_of(&result), engine);
+        assert_only_reads(&host);
+
+        // The VCI has no source for it.
+        let (result, _) = restart_with(&program, Some(TARGET_VIN), |_| {});
+        assert_eq!(teardown_of(&result), engine);
+
+        // A value out of range fails at once: the programming-session source, here a field of
+        // the VIN request, is not read (the VIN and the hardware identity were read once).
+        let program = flash_program_with_engine(
+            input(RuntimeInput::EngineRunning),
+            diag_ir::Source::EcuService {
+                service_id: 1,
+                field_id: 3,
+            },
+        );
+        let (result, host) = restart_with(&program, Some(TARGET_VIN), |host| {
+            host.inputs = crate::inputs::FixedInputs::new().with(
+                RuntimeInput::EngineRunning,
+                crate::inputs::Reading::Value(1),
+            );
+        });
+        assert_eq!(teardown_of(&result), engine);
+        assert_eq!(host.sent(), [read_of([0xF1, 0x90]), read_of([0xF1, 0x91])]);
+
+        // A source the table lacks cannot be established; no request is sent for it.
+        let missing = |field_id| diag_ir::Source::EcuService {
+            service_id: 1,
+            field_id,
+        };
+        let program = flash_program_with_engine(missing(8), missing(9));
+        let (result, host) = restart_with(&program, Some(TARGET_VIN), |_| {});
+        assert_eq!(teardown_of(&result), engine);
+        assert_eq!(host.sent(), [read_of([0xF1, 0x90]), read_of([0xF1, 0x91])]);
+    }
+
+    /// The ECU may still be in its programming session, so a precondition the default-session
+    /// source cannot give is read through the programming-session one.
+    #[test]
+    fn a_precondition_falls_back_to_the_programming_session_source() {
+        use diag_ir::RuntimeInput;
+        // The default-session source is not in the table; the other gives an in-range value.
+        let program = flash_program_with_engine(
+            diag_ir::Source::EcuService {
+                service_id: 1,
+                field_id: 8,
+            },
+            input(RuntimeInput::EngineRunning),
+        );
+        let (result, host) = restart_with(&program, Some(TARGET_VIN), |host| {
+            host.inputs = crate::inputs::FixedInputs::new().with(
+                RuntimeInput::EngineRunning,
+                crate::inputs::Reading::Value(0),
+            );
+        });
+        assert_eq!(teardown_of(&result), restart::TeardownGate::ResetAllowed);
+        assert_only_reads(&host);
+    }
+
+    /// Every gate passes, with all five preconditions declared: the reset is allowed.
+    #[test]
+    fn a_restart_whose_gates_all_pass_may_reset() {
+        use diag_ir::RuntimeInput as I;
+        let mut program = flash_program();
+        let declare = |input: I, lower, upper| {
+            let source = Some(diag_ir::Source::RuntimeInput(input));
+            Some(diag_ir::Precondition {
+                satisfied: diag_ir::Satisfied { lower, upper },
+                default_session: source,
+                programming_session: source,
+            })
+        };
+        let p = &mut program.preconditions;
+        p.voltage_mv = declare(I::SupplyVoltageMillivolts, 11_000, 15_000);
+        p.external_supply = declare(I::ExternalSupplyConnected, 1, 1);
+        p.ignition = declare(I::IgnitionOn, 0, 0);
+        p.engine = declare(I::EngineRunning, 0, 0);
+        p.vehicle_speed = declare(I::VehicleSpeedKmh, 0, 0);
+        program.validate().expect("the fixture is a valid program");
+        let fixed = |speed| {
+            crate::inputs::FixedInputs::new()
+                .with(I::ExternalSupplyConnected, crate::inputs::Reading::Value(1))
+                .with(I::IgnitionOn, crate::inputs::Reading::Value(0))
+                .with(I::EngineRunning, crate::inputs::Reading::Value(0))
+                .with(I::VehicleSpeedKmh, crate::inputs::Reading::Value(speed))
+        };
+        let (result, host) = restart_with(&program, Some(TARGET_VIN), |host| {
+            host.inputs = fixed(0);
+        });
+        assert_eq!(teardown_of(&result), restart::TeardownGate::ResetAllowed);
+        assert_only_reads(&host);
+
+        // The last one in the order fails.
+        let (result, _) = restart_with(&program, Some(TARGET_VIN), |host| {
+            host.inputs = fixed(5);
+        });
+        assert_eq!(
+            teardown_of(&result),
+            restart::TeardownGate::PassiveOnly(restart::PassiveReason::Precondition(
+                diag_ir::PreconditionKind::VehicleSpeed
+            ))
+        );
+    }
+
+    #[test]
+    fn a_worker_failure_in_a_gate_read_leaves_the_teardown_passive() {
+        use diag_ir::{PreconditionKind, RuntimeInput};
+        use restart::{PassiveReason, TeardownGate::PassiveOnly};
+        let (result, _) = restart_with(&flash_program(), Some(TARGET_VIN), |host| {
+            host.fail_reads = vec![[0xF1, 0x90]];
+        });
+        assert_eq!(
+            teardown_of(&result),
+            PassiveOnly(PassiveReason::VinNotEstablished)
+        );
+        let (result, _) = restart_with(&flash_program(), Some(TARGET_VIN), |host| {
+            host.fail_reads = vec![[0xF1, 0x91]];
+        });
+        assert_eq!(
+            teardown_of(&result),
+            PassiveOnly(PassiveReason::HardwareIdentityNotEstablished)
+        );
+        // A precondition read through the ECU, with the programming-session source giving
+        // nothing either.
+        let ecu = |field_id| diag_ir::Source::EcuService {
+            service_id: 1,
+            field_id,
+        };
+        let program = flash_program_with_engine(ecu(2), input(RuntimeInput::EngineRunning));
+        let (result, _) = restart_with(&program, Some(TARGET_VIN), |host| {
+            host.fail_reads = vec![[0xF1, 0x95]];
+        });
+        assert_eq!(
+            teardown_of(&result),
+            PassiveOnly(PassiveReason::Precondition(PreconditionKind::Engine))
+        );
+    }
+
+    /// A worker failure on the default-session read fails the gate; the programming-session
+    /// source, which would give an in-range value, is not tried (ADR-261 item 5).
+    #[test]
+    fn a_failed_precondition_read_does_not_fall_back() {
+        use diag_ir::{PreconditionKind, RuntimeInput};
+        let program = flash_program_with_engine(
+            diag_ir::Source::EcuService {
+                service_id: 1,
+                field_id: 2,
+            },
+            input(RuntimeInput::EngineRunning),
+        );
+        let (result, _) = restart_with(&program, Some(TARGET_VIN), |host| {
+            host.fail_reads = vec![[0xF1, 0x95]];
+            host.inputs = crate::inputs::FixedInputs::new().with(
+                RuntimeInput::EngineRunning,
+                crate::inputs::Reading::Value(0),
+            );
+        });
+        assert_eq!(
+            teardown_of(&result),
+            restart::TeardownGate::PassiveOnly(restart::PassiveReason::Precondition(
+                PreconditionKind::Engine
+            ))
+        );
+    }
+
+    #[test]
+    fn a_vin_source_the_table_lacks_leaves_the_teardown_passive() {
+        let mut program = flash_program();
+        program.identity.vin = Some(diag_ir::Source::EcuService {
+            service_id: 1,
+            field_id: 9,
+        });
+        let (result, host) = restart_with(&program, Some(TARGET_VIN), |_| {});
+        assert_eq!(
+            teardown_of(&result),
+            restart::TeardownGate::PassiveOnly(restart::PassiveReason::VinNotEstablished)
+        );
+        assert_eq!(host.sent(), []);
+    }
+
+    /// A VIN that is not well-formed never aborts the job, whichever side it is on.
+    #[test]
+    fn a_malformed_vin_is_not_established_and_never_aborts() {
+        let passive = restart::TeardownGate::PassiveOnly(restart::PassiveReason::VinNotEstablished);
+        for answer in [
+            "wdb12345678901234",
+            "WDB1234567890123O",
+            "WDB 2345678901234",
+        ] {
+            assert_eq!(answer.len(), 17);
+            let (result, host) = restart_with(&flash_program(), Some(TARGET_VIN), |host| {
+                host.vin = Some(answer.as_bytes().to_vec());
+            });
+            assert_eq!(teardown_of(&result), passive, "{answer}");
+            assert_eq!(host.sent(), [read_of([0xF1, 0x90])]);
+        }
+        let (result, host) = restart_with(&flash_program(), Some("SHORT"), |_| {});
+        assert_eq!(teardown_of(&result), passive);
+        assert_eq!(host.sent(), []);
+    }
+
+    #[test]
+    fn the_journal_setup_debug_output_hides_the_vin() {
+        let dir = journal_dir("debug-vin");
+        let setup = file_setup(&dir);
+        assert!(setup.vin.is_some());
+        assert!(!format!("{setup:?}").contains(TARGET_VIN));
+        let journal = JobJournal::create(setup).unwrap();
+        let state = journal.journal().state();
+        assert!(state.facts.target_vin.is_some());
+        assert!(!format!("{state:?} {:?}", state.facts).contains(TARGET_VIN));
+        drop(journal);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A resume that names another target VIN than the journal recorded, or one where either
+    /// side names none, is on-site intervention: nothing is sent and no resume is counted.
+    #[test]
+    fn a_resume_naming_another_target_vin_sends_nothing_and_counts_nothing() {
+        let program = flash_program();
+        let cases: [(Option<&str>, Option<&str>); 3] = [
+            (Some(TARGET_VIN), Some("WDB99999999999999")),
+            (Some(TARGET_VIN), None),
+            (None, Some(TARGET_VIN)),
+        ];
+        for (recorded, named) in cases {
+            let dir = journal_dir("resume-vin-differs");
+            interrupted_for(&program, &dir, recorded);
+            let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+            let result = resume_for(&program, &dir, &mut host, false, named);
+            assert!(
+                matches!(
+                    result,
+                    Err(JobError::OnSiteInterventionRequired(
+                        OnSiteReason::TargetVinDiffers
+                    ))
+                ),
+                "{recorded:?} {named:?}: {result:?}"
+            );
+            assert_eq!(host.sent(), []);
+            assert_eq!(resumes(&dir), 0);
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+        // The same VIN goes on to the gates.
+        let dir = journal_dir("resume-vin-same");
+        interrupted(&program, &dir);
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        let result = resume(&program, &dir, &mut host, false);
+        assert_eq!(teardown_of(&result), restart::TeardownGate::ResetAllowed);
+        assert_eq!(resumes(&dir), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_cancel_during_the_hardware_read_cancels_the_restart() {
+        let dir = journal_dir("resume-gates-cancel-hw");
+        let program = flash_program();
+        interrupted(&program, &dir);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        host.cancel_on_read = Some(([0xF1, 0x91], Arc::clone(&cancelled)));
+        let result = resume_on(
+            &program,
+            &mut host,
+            JobLimits::default(),
+            &cancelled,
+            Journal::open(&dir, &job_key()),
+            identity_sources(),
+            Some(&target()),
+        );
+        assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
+        assert_eq!(host.sent(), [read_of([0xF1, 0x90]), read_of([0xF1, 0x91])]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A cancel during the VIN read is a cancel, whatever the read gave.
+    #[test]
+    fn a_cancel_during_the_vin_read_cancels_the_restart() {
+        let dir = journal_dir("resume-gates-cancel");
+        let program = flash_program();
+        interrupted(&program, &dir);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        host.cancel_on_read = Some(([0xF1, 0x90], Arc::clone(&cancelled)));
+        let result = resume_on(
+            &program,
+            &mut host,
+            JobLimits::default(),
+            &cancelled,
+            Journal::open(&dir, &job_key()),
+            identity_sources(),
+            Some(&target()),
+        );
+        assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
+        assert_eq!(host.sent(), [read_of([0xF1, 0x90])]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -2495,7 +3059,13 @@ mod tests {
             let commits = Rc::new(Cell::new(0));
             let mut host = FlashHost::new(Rc::clone(&commits));
             host.lose_routine = Some(0xFF00);
-            let mut journal = counting_journal(&commits, fail_at);
+            let store = CountingStore {
+                commits: Rc::clone(&commits),
+                fail_at,
+            };
+            let mut inner = crate::journal::Journal::on_store(store, job_key());
+            inner.commit_target_vin(&target()).unwrap();
+            let mut journal = JobJournal::new(inner, identity_sources());
             let result = run_on(
                 &program,
                 &mut host,
@@ -2518,6 +3088,7 @@ mod tests {
             &AtomicBool::new(false),
             Ok(journal),
             identity_sources(),
+            Some(&target()),
         );
         assert!(matches!(result, Err(JobError::Journal(_))), "{result:?}");
         assert_eq!(host.sent(), []);
@@ -2572,7 +3143,7 @@ mod tests {
         );
         assert_eq!(host.sent(), []);
 
-        drop(Journal::create(&dir, &job_key()).unwrap());
+        drop(Journal::create(&dir, &job_key(), None).unwrap());
         std::fs::write(journal_file(&dir), b"not a journal").unwrap();
         let result = resume(&program, &dir, &mut host, false);
         assert!(

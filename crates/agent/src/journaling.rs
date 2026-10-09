@@ -33,7 +33,7 @@ use diag_ir::{
 
 use crate::host::{HostError, TransferProgress};
 use crate::inputs::{FieldBytes, ServiceSources, read_field_bytes};
-use crate::journal::{FileStore, JobKey, Journal, JournalError, StageId, StepRef, Store};
+use crate::journal::{FileStore, JobKey, Journal, JournalError, StageId, StepRef, Store, Vin};
 use crate::runner::JobError;
 
 /// Where a job keeps its journal, under which key, and how it reads the ECU's identity.
@@ -44,6 +44,11 @@ pub struct JournalSetup {
     pub key: JobKey,
     /// The table that maps the program's identity sources to requests (`inputs`).
     pub sources: ServiceSources,
+    /// The VIN the job targets. A first run records it as the journal's first record, and a
+    /// resume must name the same one (ADR-261); the restart's gates compare the ECU's VIN
+    /// against it. `None` when the job names none: a restart then never counts the vehicle as
+    /// identified. It is personal data (design 16.2) and is never logged or put in an error.
+    pub vin: Option<Vin>,
 }
 
 /// A job's open journal and what it needs to commit at the plan's boundaries.
@@ -62,7 +67,7 @@ impl JobJournal {
     /// ran before goes on through `resume_program_journaled`, not a first run.
     pub(crate) fn create(setup: JournalSetup) -> Result<Self, JournalError> {
         Ok(Self::new(
-            Journal::create(&setup.dir, &setup.key)?,
+            Journal::create(&setup.dir, &setup.key, setup.vin.as_ref())?,
             setup.sources,
         ))
     }

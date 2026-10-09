@@ -303,6 +303,7 @@ async fn run_the_job(journal_dir: PathBuf) {
             dir: journal_dir,
             key: job_key(),
             sources: identity_sources(),
+            vin: None,
         },
         job_guards(true),
     )

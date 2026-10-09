@@ -113,7 +113,10 @@ commits:
   the program declares. A software version answered with the plan's declared "no valid
   application" response is not recorded, and the job goes on;
 - at the erase: the transfer-start marker;
-- at RequestTransferExit: its marker.
+- at RequestTransferExit: its marker;
+- at the first diagnostic primitive at or past a plan's recovery-required point that is neither
+  of those: a request intent, so a crash before its response still places the interruption
+  there (ADR-253).
 
 When an instruction completes, it commits the block of a `FlashTransfer`, under the host's
 running index (`TransferProgress`, ADR-250); a step record for every diagnostic primitive inside
@@ -127,6 +130,25 @@ without the identity.
 
 `ngr-agent run` uses `run_program` and keeps no journal; it sends read-only requests, or any
 request to `sim-vci` in a debug build (ADR-247).
+
+## Restart classification
+
+`agent::restart::classify` reads a job's journal with the program and decides, without
+contacting anything, how the job goes on (ADR-253). The interruption point is the latest, by
+step count, of the last completed step, the two transfer markers and the last request intent.
+
+| Journal | Decision |
+|---|---|
+| none (`NotFound`) | plain start |
+| unreadable (corrupt, unknown format version, another job, I/O) | `OnSiteInterventionRequired` |
+| interruption point at or past a plan's recovery-required point and before its end, or inside a `RecoveryRequired` section | `OnSiteInterventionRequired` |
+| no transfer-start marker | plain start |
+| transfer-start marker | `Restart`, for the plan of the marker's stage, with the VM state at its entry |
+
+A restart's entry state is the newest state the journal holds, or the program's initial state
+when the job started at the entry. It must decode, pass `Vm::check_state` and stand at the
+plan's entry; otherwise, or for a stage the program does not declare, the decision is
+`OnSiteInterventionRequired`.
 
 ## Restart inputs
 

@@ -73,6 +73,9 @@ pub struct RecoveryFacts {
     pub attempt_key: Option<Vec<u8>>,
     /// The latest transfer attempt.
     pub transfer: Option<TransferAttempt>,
+    /// The newest request intent: a request at or past a plan's recovery-required point that is
+    /// neither the erase nor RequestTransferExit, journaled before it is sent (ADR-253).
+    pub last_intent: Option<StepRef>,
 }
 
 impl RecoveryFacts {
@@ -85,6 +88,7 @@ impl RecoveryFacts {
             resume_counts: Vec::new(),
             attempt_key: None,
             transfer: None,
+            last_intent: None,
         }
     }
 
@@ -199,6 +203,15 @@ impl RecoveryFacts {
                     complete: false,
                 });
             }
+            Record::Intent { at } => {
+                if !after_last_step(at, self) {
+                    return Err("a marker must come after the last step");
+                }
+                if self.last_intent.is_some_and(|last| at.steps <= last.steps) {
+                    return Err("intents must come in step order");
+                }
+                self.last_intent = Some(*at);
+            }
             Record::PostTransferComplete => {
                 let exit = self.open_transfer().and_then(|t| t.exit.as_mut()).ok_or(
                     "post-transfer completion needs RequestTransferExit in an open transfer",
@@ -281,6 +294,10 @@ enum Record {
         at: StepRef,
     },
     PostTransferComplete,
+    /// Appended for ADR-253.
+    Intent {
+        at: StepRef,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -559,6 +576,12 @@ impl<S: Store> Journal<S> {
     /// Records that the post-transfer steps reached their end boundary.
     pub fn commit_post_transfer_complete(&mut self) -> Result<(), JournalError> {
         self.commit(Record::PostTransferComplete)
+    }
+
+    /// A request intent, committed before a request at or past a plan's recovery-required point
+    /// is sent, so a crash before its response still places the interruption at it (ADR-253).
+    pub fn commit_intent(&mut self, at: StepRef) -> Result<(), JournalError> {
+        self.commit(Record::Intent { at })
     }
 
     fn commit(&mut self, record: Record) -> Result<(), JournalError> {
@@ -1417,6 +1440,33 @@ mod tests {
             j.summary().ecu_hardware_part_number.as_deref(),
             Some(&b"HW-B"[..])
         );
+    }
+
+    /// A request intent comes after the last step, in step order, and reads back from the file.
+    #[test]
+    fn a_request_intent_is_ordered_and_reads_back() {
+        let mut j = memory();
+        j.commit_step(at(2, 10), None).expect("step");
+        assert!(matches!(
+            j.commit_intent(at(3, 10)),
+            Err(JournalError::Invariant(_))
+        ));
+        j.commit_intent(at(3, 11)).expect("intent after the step");
+        assert!(matches!(
+            j.commit_intent(at(4, 11)),
+            Err(JournalError::Invariant(_))
+        ));
+        assert_eq!(j.summary().last_intent, Some(at(3, 11)));
+        // A step after the intent's request completed does not clear it.
+        j.commit_step(at(3, 11), None)
+            .expect("the request's own step");
+        assert_eq!(j.summary().last_intent, Some(at(3, 11)));
+
+        let dir = TempDir::new();
+        let mut journal = Journal::create(&dir.0, &key()).expect("create");
+        journal.commit_intent(at(7, 70)).expect("intent");
+        let reopened = Journal::open(&dir.0, &key()).expect("open");
+        assert_eq!(reopened.summary().last_intent, Some(at(7, 70)));
     }
 
     #[test]

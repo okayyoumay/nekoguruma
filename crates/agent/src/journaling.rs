@@ -25,7 +25,9 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use diag_ir::{DiagHost, FlashRecovery, IdentityKind, NoApplication, Op, Program, VmState};
+use diag_ir::{
+    DiagHost, FlashRecovery, IdentityKind, NoApplication, Op, Program, RecoveryRequired, VmState,
+};
 
 use crate::host::{HostError, TransferProgress};
 use crate::inputs::{FieldBytes, ServiceSources, read_field_bytes};
@@ -48,6 +50,9 @@ pub(crate) struct JobJournal<S = FileStore> {
     sources: ServiceSources,
     /// The identity was read for this job.
     identity_read: bool,
+    /// Stages whose recovery-required point the journal already places the interruption at or
+    /// past (an intent, or the erase or RequestTransferExit marker at or past it).
+    past_recovery_point: Vec<u32>,
 }
 
 impl JobJournal {
@@ -67,6 +72,7 @@ impl<S: Store> JobJournal<S> {
             journal,
             sources,
             identity_read: false,
+            past_recovery_point: Vec::new(),
         }
     }
 
@@ -115,6 +121,27 @@ impl<S: Store> JobJournal<S> {
             }
             if pc == b.transfer_exit_pc {
                 self.journal.commit_transfer_exit_intent(at)?;
+            }
+            // The first primitive at or past the recovery-required point is written ahead, so a
+            // crash before its response still places the interruption there (ADR-253). The
+            // validator keeps execution from going back across the point (ADR-245 item 4), so
+            // once is enough; the erase and RequestTransferExit markers already do it.
+            if let RecoveryRequired::FromPc(from) = plan.recovery_required
+                && (from..b.post_transfer_end_pc).contains(&pc)
+                && !self.past_recovery_point.contains(&plan.stage)
+            {
+                let marked = pc == b.erase_pc || pc == b.transfer_exit_pc;
+                if !marked
+                    && program
+                        .code
+                        .get(pc as usize)
+                        .is_some_and(Op::is_diagnostic_primitive)
+                {
+                    self.journal.commit_intent(at)?;
+                }
+                if marked || self.journal.state().facts.last_intent == Some(at) {
+                    self.past_recovery_point.push(plan.stage);
+                }
             }
         }
         Ok(())

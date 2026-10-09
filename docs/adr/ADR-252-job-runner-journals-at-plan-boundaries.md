@@ -1,7 +1,7 @@
 # ADR-252: The Job Runner Journals at the Flash Recovery Plan's Boundaries
 
 **Date:** 2026-10-08
-**Status:** Accepted
+**Status:** Accepted (item 2's open point decided by ADR-253)
 **Affects:** `agent` (`src/runner.rs`, `src/journaling.rs`, `src/inputs.rs`, `src/host.rs`), `j2534-0404-service` (`tests/agent_flash_transfer.rs`)
 
 ## Context

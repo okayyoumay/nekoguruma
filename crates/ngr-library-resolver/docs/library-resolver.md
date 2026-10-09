@@ -6,17 +6,17 @@ references: 7.1 (discovery), 7.1.1 (Linux registration definition) and 7.2 (libr
 
 ## Layout
 
-The crate has one module per standard (ADR-266 Decision item 5). Each module holds that
-standard's discovery chain and its types, and keeps the operating-system differences inside: the
+The crate has one module per standard and, for J2534, per version (ADR-266 Decision item 5).
+Each module holds that API's discovery chain and its types, and keeps the operating-system differences inside: the
 same call resolves a name on every platform. What does not depend on the standard, such as the
 7.2 checks, belongs at the crate root.
 
 | Module | Standard | Linux | Windows |
 |---|---|---|---|
-| `j2534` | SAE J2534-1 v04.04 | definition files (below) | registry, through `j2534-0404-registry` |
+| `j2534_0404` | SAE J2534-1 v04.04 | definition files (below) | registry, through `j2534-0404-registry` |
 
-The rest of this document describes the `j2534` module; the names below are in it
-(`j2534::resolve`, `j2534::ResolveError`, ...).
+The rest of this document describes the `j2534_0404` module; the names below are in it
+(`j2534_0404::resolve`, `j2534_0404::ResolveError`, ...).
 
 ## Scope
 

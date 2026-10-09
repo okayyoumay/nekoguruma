@@ -23,7 +23,7 @@ Cargo workspace corresponding to the design document `docs/system-architecture.m
 | `agent` | Discovery, job execution, journal; library plus the `ngr-agent` binary | 3.3 |
 | `worker-host` | ABI detection from the library header, launching worker services, authenticated gRPC client | 7.3 / 7.4 |
 | `iso22900*`, `j2534-0404*`, `vci-service-*` | J2534 / D-PDU API FFI, wrappers, discovery, mocks and the gRPC worker services (`docs/worker-crates.md`) | 3.4 / 7.1.2 / 7.4 |
-| `ngr-library-resolver` | Resolves a VCI name to its vendor library, one module per standard (J2534: Linux definition files, Windows registry) | 7.1 / 7.1.1 / 7.2 |
+| `ngr-library-resolver` | Resolves a VCI name to its vendor library, one module per standard and version (J2534 v04.04: Linux definition files, Windows registry) | 7.1 / 7.1.1 / 7.2 |
 | `sim-vci` | cdylib exposing J2534 (mock) | 13.4 |
 | `sim-ecu` | Simulation of UDS responses and flash state transitions | 13.4 |
 

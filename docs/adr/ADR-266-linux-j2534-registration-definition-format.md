@@ -45,10 +45,12 @@ services. Nothing reads the definitions yet.
    platform, so the format is tested everywhere, and resolves through them on Linux and
    through the registry lookup of `j2534-0404-registry` on Windows. The 7.2 checks and moving
    the existing lookups into it come later; until then its users keep their own lookups.
-5. **One module per standard.** The J2534 resolution is the crate's `j2534` module
-   (`j2534::resolve`, `j2534::Definition`, ...), not its root. Each standard's discovery chain
-   (7.1) differs, and so does what a resolution returns: a D-PDU API library is found through
-   the root and module description files, not a J2534 definition. A module per standard keeps
+5. **One module per standard and version.** The J2534 v04.04 resolution is the crate's
+   `j2534_0404` module (`j2534_0404::resolve`, `j2534_0404::Definition`, ...), not its root,
+   named like the `j2534-0404-*` crates. Each API's discovery chain (7.1) differs, and so does
+   what a resolution returns: a D-PDU API library is found through the root and module
+   description files, not a J2534 definition, and J2534 v05.00 is a different API from
+   v04.04, so it gets a module of its own rather than a version switch inside this one. A module per standard keeps
    each one's types apart, keeps the operating-system differences inside that module behind
    one call that is the same on every platform, and leaves the crate root to what does not
    depend on the standard, such as the 7.2 checks. The split is made while nothing calls the
@@ -62,7 +64,10 @@ services. Nothing reads the definitions yet.
   added here when a need appears.
 - A definition with an unknown key from a newer format is refused by an older build rather
   than half understood.
-- A standard added to the crate becomes a sibling module; callers name the standard they
+- The definition format and directory of this ADR are J2534 v04.04's. Whether a v05.00
+  library on Linux needs a definition, and in which directory or with which keys, is decided
+  with that module.
+- A standard or version added to the crate becomes a sibling module; callers name the standard they
   resolve for, which they know from the worker they start.
 - Until the switch-over, `vci-discovery` and `j2534-0404-registry` keep their own Windows
   lookups, so the crate's Windows resolution duplicates theirs for a while.

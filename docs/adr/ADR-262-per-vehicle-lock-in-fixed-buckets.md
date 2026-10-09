@@ -38,21 +38,20 @@ which is what ADR-256 item 6 forbids.
    share each file, so a name reveals 12 bits of a public hash and does not identify a vehicle.
    SHA-256 comes from the `sha2` crate, which the workspace already builds; the standard
    library's hasher is not stable across releases.
-2. **No bucket file is ever created for one VIN alone.** When the file of the bucket a job
-   needs, or the last bucket file (`vehicle-fff.lock`), is missing, `take_vehicle` creates every
-   missing bucket file in bucket order before it opens its own, and creates `vehicle-fff.lock`
-   last, after syncing the directory on Unix, so that its presence means the other files were
-   committed first (NTFS commits directory entries in creation order without a sync). The
-   invariant is that which files exist never depends on a VIN: a file is only ever created as
-   part of a sweep over all 4096, and the sweep is the same whichever VIN triggered it. A
-   complete set is the normal outcome, not the invariant. A crash, a power loss, a failed sync
-   or a file someone else created can leave the set partial; what survives is decided by the
-   file system's write order, not by a VIN. A later take whose file exists locks it and creates
-   nothing; one whose file is missing sweeps again. The listing of a directory in which a
-   vehicle lock was ever taken therefore says nothing about the vehicles seen there; created one
-   by one, the existence of a bucket file would hint whether a given vehicle had been there.
-   Jobs that never take a vehicle lock create none of these files. The files stay empty and,
-   like the other lock files, are never deleted.
+2. **No bucket file is ever created for one VIN alone.** Before it opens its bucket,
+   `take_vehicle` lists the lock directory and counts the bucket files (`vehicle-` followed by
+   exactly three lowercase hex digits and `.lock`). When fewer than 4096 are present, it creates
+   every missing one, in bucket order, and syncs the directory on Unix, a best-effort step for
+   durability only; then it opens its own. Whether a sweep runs therefore depends on the
+   directory's state alone, never on the VIN, on every platform: a set left partial by a crash,
+   a power loss, a failed sweep or a file someone else created is completed by the next take
+   whichever vehicle it serves. The directory's listing says nothing about the vehicles seen
+   there; the creation times of refilled files say only that some vehicle lock was taken then.
+   No completion marker is inferred from creation order, and no file system ordering guarantee
+   is relied on. Listing the directory requires read permission on it for every agent user, in
+   addition to ADR-257's requirements; on Unix the guards refuse a directory that group or
+   others may write but not read. Jobs that never take a vehicle lock create none of these
+   files. The files stay empty and, like the other lock files, are never deleted.
 3. **It is taken last, by `JobGuards::take_vehicle`.** The lock order becomes VCI, then the
    reprogramming slot when the job holds one, then the vehicle. Guards with or without the slot
    may take it. The wait polls and stops on a cancel like the other guards (ADR-256 item 3);
@@ -94,11 +93,10 @@ which is what ADR-256 item 6 forbids.
   are created with the default permissions of the user whose take creates them, like the other
   lock files; the directory's permissions for every agent user remain an installation
   requirement (ADR-257).
-- A sweep whose directory sync fails leaves `vehicle-fff.lock` uncreated and fails that take;
-  the next take sweeps and syncs again. On a file system without a metadata journal a crash can
-  lose an arbitrary subset of the files; the next take that misses its own file recreates every
-  hole at once, whose creation time then says only that some vehicle of the lost buckets arrived
-  then.
+- A sweep that fails partway leaves a partial set; the next take sweeps again. The cost of the
+  trigger is one directory listing per `take_vehicle`. A shared lock directory that cannot be
+  listed (for example mode `1733`) is refused on Unix, and fails the first vehicle lock with a
+  permission error elsewhere; the installation must make it readable by every agent user.
 - The agent writes nothing VIN-derived to the device: no lock file's name, existence or content
   depends on a VIN. Neither `JobGuards`' `Debug` output nor the guards' errors name a bucket, so
   no log keeps one. Two residuals remain. While a job runs, the locked bucket is visible to

@@ -9,17 +9,14 @@
 //! named without keeping the VIN on the device (ADR-256 item 6): the VIN is hashed into one of 4096
 //! fixed buckets (the low 12 bits of the first two bytes of the SHA-256 digest, read big-endian),
 //! `vehicle-{k:03x}.lock`, so two VINs may share a bucket and then exclude each other, which is
-//! safe. A bucket file is never created for one VIN alone: files are created only by a sweep over
-//! all 4096, empty, in a fixed order, whichever VIN triggered it (a `take_vehicle` that finds its
-//! bucket's file or `vehicle-fff.lock` missing). The sweep creates `vehicle-fff.lock` last, so that
-//! file's presence means the other 4095 entries were committed first: on Unix the directory is
-//! synced before `vehicle-fff.lock` is created; on Windows no sync is made and NTFS's ordering of
-//! directory entries is relied on. A set a crash, a failed sync or someone else's file left partial
-//! is decided by the file system's write order, not by a VIN; a complete set is the normal outcome,
-//! not an invariant (ADR-262 item 2). The listing never depends on which VIN triggered a sweep, so
-//! it says nothing about the vehicles seen. A job holds one vehicle (a well-formed VIN): taking
-//! that VIN again succeeds without touching the file, and any other VIN, also one of the same
-//! bucket, is refused.
+//! safe. The files are created by a sweep over all 4096, empty, which a `take_vehicle` runs when
+//! the directory holds fewer than 4096 files named exactly `vehicle-` and three lower-case hex
+//! digits and `.lock`. Whether a sweep runs depends only on the directory's state, never on the
+//! VIN, so the listing says nothing about the vehicles seen; no write-ordering guarantee of the
+//! file system is relied on, and the Unix directory sync at the end of a sweep is best-effort
+//! durability. The directory must therefore be listable by every agent user (ADR-262 item 2). A
+//! job holds one vehicle (a well-formed VIN): taking that VIN again succeeds without touching the
+//! file, and any other VIN, also one of the same bucket, is refused.
 //!
 //! Each is an exclusive OS lock (`File::try_lock`) on its own file in a lock directory the
 //! caller names. The OS releases a lock with its file handle, also when the process dies, so a
@@ -192,12 +189,10 @@ impl JobGuards {
         cancelled: &AtomicBool,
     ) -> Result<LockFile, GuardError> {
         let path = vehicle_path(&self.dir, bucket);
-        // The set is created in order, so a present last file means a creation ran to its end.
-        let last = vehicle_path(&self.dir, (VEHICLE_BUCKETS - 1) as u16);
-        if !path.try_exists()? || !last.try_exists()? {
-            if cancelled.load(Ordering::Relaxed) {
-                return Err(GuardError::Cancelled);
-            }
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(GuardError::Cancelled);
+        }
+        if count_vehicle_files(&self.dir)? < VEHICLE_BUCKETS as usize {
             create_vehicle_files(&self.dir)?;
         }
         LockFile::wait_existing(&path, poll, cancelled)
@@ -382,7 +377,8 @@ fn open_read_only(path: &Path) -> Result<File, GuardError> {
 
 /// Creates the lock directory if it is missing, writable by its owner only, and refuses one in
 /// which another user could delete or replace a lock file another job holds: such a file's path
-/// would then name a new file, which a second job could lock at the same time.
+/// would then name a new file, which a second job could lock at the same time. A class that may
+/// write the directory must also be able to read it, so every user can count the vehicle files.
 #[cfg(unix)]
 fn prepare_dir(dir: &Path) -> Result<(), GuardError> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -394,7 +390,11 @@ fn prepare_dir(dir: &Path) -> Result<(), GuardError> {
     let mode = fs::metadata(dir)?.permissions().mode();
     let shared = mode & 0o022 != 0;
     let sticky = mode & 0o1000 != 0;
-    if shared && !sticky {
+    // Every agent user must be able to list the directory (the vehicle files are counted), so a
+    // class that may write it must also read it.
+    let unreadable =
+        (mode & 0o020 != 0 && mode & 0o040 == 0) || (mode & 0o002 != 0 && mode & 0o004 == 0);
+    if (shared && !sticky) || unreadable {
         return Err(GuardError::UnsafeDir(dir.to_owned()));
     }
     Ok(())
@@ -407,38 +407,46 @@ fn prepare_dir(dir: &Path) -> Result<(), GuardError> {
     Ok(())
 }
 
-/// The order the sweep creates the vehicle lock files in: every bucket once, `0xfff` last.
-fn vehicle_creation_order() -> impl Iterator<Item = u16> {
-    (0..VEHICLE_BUCKETS).map(|bucket| bucket as u16)
+/// Counts the entries of `dir` named exactly like a vehicle lock file: `vehicle-`, three
+/// lower-case hex digits, `.lock`. Other names (other case, other length, `vci-*`) are ignored.
+fn count_vehicle_files(dir: &Path) -> Result<usize, GuardError> {
+    let mut count = 0;
+    for entry in fs::read_dir(dir)? {
+        let name = entry?.file_name();
+        let is_bucket = name
+            .to_str()
+            .and_then(|name| name.strip_prefix("vehicle-"))
+            .and_then(|rest| rest.strip_suffix(".lock"))
+            .is_some_and(|digits| {
+                digits.len() == 3
+                    && digits
+                        .bytes()
+                        .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+            });
+        count += usize::from(is_bucket);
+    }
+    Ok(count)
 }
 
-/// Creates the empty vehicle lock files, all of them whichever VIN asked and none for one VIN
-/// alone (ADR-262 item 2): buckets 0x000 to 0xffe in order, then a directory sync (Unix only;
-/// on Windows none is made and NTFS's ordering of directory entries is relied on), then `vehicle-fff.lock`, then a second
-/// sync. Its presence therefore means the rest were committed first, also to a take that races
-/// this sweep. A file that exists already is left as it is.
+/// Creates the empty vehicle lock files, all 4096 in bucket order whichever VIN asked, then
+/// syncs the directory (Unix only, best-effort durability; none on Windows). Whether it runs
+/// depends only on the directory's state (the count of bucket files), and no ordering guarantee
+/// of the file system is relied on (ADR-262 item 2). A file that exists already is left as it is.
 fn create_vehicle_files(dir: &Path) -> Result<(), GuardError> {
-    let create = |bucket: u16| match OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(vehicle_path(dir, bucket))
-    {
-        Ok(_) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
-        Err(error) => Err(GuardError::from(error)),
-    };
-    let sync = || -> Result<(), GuardError> {
-        #[cfg(unix)]
-        File::open(dir)?.sync_all()?;
-        Ok(())
-    };
-    let last = (VEHICLE_BUCKETS - 1) as u16;
-    for bucket in vehicle_creation_order().filter(|&bucket| bucket != last) {
-        create(bucket)?;
+    for bucket in 0..VEHICLE_BUCKETS {
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(vehicle_path(dir, bucket as u16))
+        {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
     }
-    sync()?;
-    create(last)?;
-    sync()
+    #[cfg(unix)]
+    File::open(dir)?.sync_all()?;
+    Ok(())
 }
 
 /// The bucket of a VIN: the low 12 bits of the first two bytes of its SHA-256 digest, read
@@ -1079,20 +1087,6 @@ mod tests {
     }
 
     #[test]
-    fn a_set_without_the_last_file_is_completed() {
-        let dir = dir("partial-own-only");
-        fs::create_dir_all(&dir).unwrap();
-        let bucket = vehicle_bucket(&vin(VIN_A));
-        fs::write(vehicle_path(&dir, bucket), b"").unwrap();
-        let never = AtomicBool::new(false);
-        let mut guards = JobGuards::take_vci_only(&setup(&dir, "VCI-1"), POLL, &never).unwrap();
-        guards.take_vehicle(&vin(VIN_A), POLL, &never).unwrap();
-        assert_eq!(vehicle_files(&dir), VEHICLE_BUCKETS as usize);
-        drop(guards);
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
     fn a_cancelled_take_creates_no_vehicle_files() {
         let dir = dir("vehicle-cancel-early");
         let never = AtomicBool::new(false);
@@ -1105,12 +1099,84 @@ mod tests {
     }
 
     #[test]
-    fn the_sweep_creates_the_sentinel_last() {
-        let order: Vec<u16> = vehicle_creation_order().collect();
-        assert_eq!(order.len(), VEHICLE_BUCKETS as usize);
-        assert_eq!(order.last(), Some(&0xfff));
-        let distinct: std::collections::HashSet<_> = order.iter().collect();
-        assert_eq!(distinct.len(), order.len());
+    fn a_hole_in_the_set_is_refilled_by_a_take_for_another_bucket() {
+        let dir = dir("vehicle-hole");
+        let never = AtomicBool::new(false);
+        let mut first = JobGuards::take_vci_only(&setup(&dir, "VCI-1"), POLL, &never).unwrap();
+        first.take_vehicle(&vin(VIN_A), POLL, &never).unwrap();
+        drop(first);
+        let hole = (0..VEHICLE_BUCKETS as u16)
+            .find(|&k| k != vehicle_bucket(&vin(VIN_A)) && k != vehicle_bucket(&vin(VIN_B)))
+            .unwrap();
+        fs::remove_file(vehicle_path(&dir, hole)).unwrap();
+        let mut second = JobGuards::take_vci_only(&setup(&dir, "VCI-1"), POLL, &never).unwrap();
+        second.take_vehicle(&vin(VIN_B), POLL, &never).unwrap();
+        assert_eq!(vehicle_files(&dir), VEHICLE_BUCKETS as usize);
+        assert!(vehicle_path(&dir, hole).exists());
+        drop(second);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_complete_set_is_left_as_it_is() {
+        let dir = dir("vehicle-complete");
+        let never = AtomicBool::new(false);
+        let mut guards = JobGuards::take_vci_only(&setup(&dir, "VCI-1"), POLL, &never).unwrap();
+        guards.take_vehicle(&vin(VIN_A), POLL, &never).unwrap();
+        drop(guards);
+        let before = listing(&dir);
+        let mut again = JobGuards::take_vci_only(&setup(&dir, "VCI-1"), POLL, &never).unwrap();
+        again.take_vehicle(&vin(VIN_B), POLL, &never).unwrap();
+        assert_eq!(listing(&dir), before);
+        drop(again);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Names that are not exactly `vehicle-` + three lower-case hex digits + `.lock` do not count.
+    #[test]
+    fn the_count_ignores_names_that_are_not_buckets() {
+        let dir = dir("vehicle-decoys");
+        let never = AtomicBool::new(false);
+        let mut guards = JobGuards::take_vci_only(&setup(&dir, "VCI-1"), POLL, &never).unwrap();
+        guards.take_vehicle(&vin(VIN_A), POLL, &never).unwrap();
+        drop(guards);
+        let hole = 0x123;
+        fs::remove_file(vehicle_path(&dir, hole)).unwrap();
+        for decoy in ["vehicle-ABC.lock", "vehicle-12.lock", "vehicle-1234.lock"] {
+            fs::write(dir.join(decoy), b"").unwrap();
+        }
+        assert_eq!(
+            count_vehicle_files(&dir).unwrap(),
+            VEHICLE_BUCKETS as usize - 1
+        );
+        let mut guards = JobGuards::take_vci_only(&setup(&dir, "VCI-1"), POLL, &never).unwrap();
+        guards.take_vehicle(&vin(VIN_A), POLL, &never).unwrap();
+        assert!(vehicle_path(&dir, hole).exists());
+        assert_eq!(count_vehicle_files(&dir).unwrap(), VEHICLE_BUCKETS as usize);
+        drop(guards);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_writable_but_unreadable_directory_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = dir("unreadable");
+        let never = AtomicBool::new(false);
+        drop(JobGuards::take_vci_only(&setup(&dir, "VCI-1"), POLL, &never).unwrap());
+        for mode in [0o1733, 0o1722, 0o1702, 0o1730] {
+            fs::set_permissions(&dir, fs::Permissions::from_mode(mode)).unwrap();
+            assert!(
+                matches!(
+                    JobGuards::take_vci_only(&setup(&dir, "VCI-1"), POLL, &never),
+                    Err(GuardError::UnsafeDir(_))
+                ),
+                "{mode:o} is refused"
+            );
+        }
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]

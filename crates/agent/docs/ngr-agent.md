@@ -15,7 +15,7 @@ ngr-agent run --vci <name> --program <file> [--workers <dir>] [--locks <dir>] [-
 | `--vci` | J2534 v04.04 library name, as the worker service resolves it (registry key on Windows, `library_path` entry in the service's `config.toml`) |
 | `--program` | IR program file: a `diag_ir::Program` serialized as JSON |
 | `--workers` | Directory of worker builds, laid out as `<dir>/<ABI name>/j2534-0404-service[.exe]` (design 7.3). Default: `workers` next to the `ngr-agent` executable |
-| `--locks` | The device's lock directory for the job's guards ("Job guards" below), as an absolute path. Default: `locks` next to the `ngr-agent` executable. Lock files are opened read-only, so a file another user created still locks. The agent creates a missing directory writable by its owner only, so a device whose agents run as several users needs it prepared beforehand: writable by all of them, and with the sticky bit (or an equivalent ACL) so that no user can delete another's lock files (ADR-257). On Unix a directory that group or others may write without the sticky bit is refused |
+| `--locks` | The device's lock directory for the job's guards ("Job guards" below), as an absolute path. Default: `locks` next to the `ngr-agent` executable. Lock files are opened read-only, so a file another user created still locks. The agent creates a missing directory writable by its owner only, so a device whose agents run as several users needs it prepared beforehand: writable by all of them, and with the sticky bit (or an equivalent ACL) so that no user can delete another's lock files (ADR-257). It must also be readable by every agent user, since the per-vehicle lock lists it (ADR-262). On Unix a directory that group or others may write without the sticky bit, or without being readable by them, is refused |
 | `--tx-id`, `--rx-id` | Physical request and response CAN IDs in hex, with or without `0x`. Default `7E0` / `7E8`. Only 11-bit IDs: the link does not set the CAN ID format |
 
 The link is UDS on ISO 15765 at 500 kbit/s (`LinkConfig::iso15765`), with the CAN IDs from the
@@ -242,15 +242,14 @@ process dies, so a crashed run never blocks the next one, and the files are neve
 - `JobGuards::take_vehicle(vin, poll, cancelled)` takes the per-vehicle lock, on guards with or
   without the slot, for a well-formed VIN only (`GuardError::InvalidVin`). The file is one of
   4096 buckets: `k` is the first two bytes of SHA-256 over the VIN, read big-endian, masked to
-  their low 12 bits (a digest starting `84 b1` gives `vehicle-4b1.lock`). When its bucket file
-  or the last bucket file (`vehicle-fff.lock`) is missing, the call first creates every missing
-  bucket file, in order, and creates `vehicle-fff.lock` last (on Unix after syncing the
-  directory; on Windows, where no directory sync is made, NTFS keeps the creation order), so no
-  bucket file is ever created for one VIN alone and neither a file's name nor the directory's
-  content reveals a VIN (ADR-262). Two vehicles in one bucket exclude each other, which delays a
-  job about once in 4096 concurrent pairs. Taking the vehicle the guards already hold returns at
-  once; another VIN is refused (`GuardError::OtherVehicleHeld`), as are guards marked
-  `link_unconfirmed`. `JobGuards::holds_vehicle` tells whether they hold one.
+  their low 12 bits (a digest starting `84 b1` gives `vehicle-4b1.lock`). Before it opens its
+  bucket, the call lists the lock directory and, when fewer than 4096 bucket files are present,
+  creates every missing one in bucket order (syncing the directory on Unix), so whether files
+  are created depends only on the directory's state, never on the VIN, and neither a file's name
+  nor the directory's content reveals a VIN (ADR-262). Two vehicles in one bucket exclude each
+  other, which delays a job about once in 4096 concurrent pairs. Taking the vehicle the guards
+  already hold returns at once; another VIN is refused (`GuardError::OtherVehicleHeld`), as are
+  guards marked `link_unconfirmed`. `JobGuards::holds_vehicle` tells whether they hold one.
 - Every lock file must be a regular file. It is opened without following a symbolic link and
   without blocking, and a symbolic link, FIFO, device or (on Windows) reparse point at its path
   fails the take (`GuardError::NotAFile`, or `GuardError::NotAVehicleFile` for a bucket file,
@@ -270,7 +269,8 @@ once the job thread has ended. A job that survives a worker crash, a VCI disconn
 of the vehicle's supply alone gets them back, still held, and passes them to its next run. A
 VCI name has 1 to `MAX_VCI_NAME` (100) bytes. The lock directory is one per device,
 shared by every agent process on it whichever user it runs as: each of them must be able to
-create files in it and read the lock files there (lock files are opened read-only).
+create files in it, list it (the per-vehicle lock counts its bucket files, ADR-262) and read the
+lock files there (lock files are opened read-only).
 
 A run whose link close fails or panics, or whose open fails partway and cannot close what it
 had opened, gives its guards back marked (`JobGuards::link_unconfirmed`), whatever the job's
@@ -282,8 +282,8 @@ guards serve another run or are released. The runner closes the link exactly onc
 path after it opened, a panic included. An agent killed without running its exit path still
 frees its locks while its orphaned worker tears the link down on stdin EOF; the next open of
 a device still held usually fails. On Unix
-the guards refuse a directory that group or others may write unless it has the sticky bit
-(`GuardError::UnsafeDir`): another user could otherwise delete a lock file a job holds, and a
+the guards refuse a directory that group or others may write unless it has the sticky bit and
+those users may also read it (`GuardError::UnsafeDir`): another user could otherwise delete a lock file a job holds, and a
 second job would lock the new file at the same path. A directory the guards create is writable
 by its owner only. `ngr-agent run` takes the guards from `--locks` and `--vci` before it runs the
 program, and holds them until the run ends.

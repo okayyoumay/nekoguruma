@@ -255,7 +255,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-263](ADR-263-restart-promotes-to-the-per-vehicle-lock.md) | The Restart Promotes to the Per-Vehicle Lock at Its VIN Match | Accepted | `agent` restart, runner |
 | [ADR-264](ADR-264-restart-teardown.md) | The Restart's Teardown Sends One Hard Reset or Waits Out the Session | Accepted (item 5's ending amended by ADR-265) | `agent` restart, runner; `sim-ecu` |
 | [ADR-265](ADR-265-restart-default-session-confirmation.md) | The Restart Confirms the Default Session, with One Passive Retry | Accepted | `agent` restart, runner; `sim-ecu` |
-| [ADR-266](ADR-266-linux-j2534-registration-definition-format.md) | Linux J2534 Registration Definitions Are TOML Files Keyed Like the Windows Registry | Accepted | `ngr-library-resolver`, design 7.1.1 |
+| [ADR-266](ADR-266-linux-j2534-registration-definition-format.md) | Linux J2534 Registration Definitions Are TOML Files Keyed Like the Windows Registry | Accepted | `ngr-library-resolver`, design 7.1.1, 7.2 |
 
 ## Status Legend
 

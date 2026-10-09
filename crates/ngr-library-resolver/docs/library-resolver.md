@@ -2,12 +2,26 @@
 
 `ngr-library-resolver` turns a VCI name into the vendor library to load. It is the shared
 implementation of ADR-228 (Decision item 4); the Linux definition format is ADR-266. Design
-references: 7.1.1 (Linux registration definition) and 7.2 (library trust).
+references: 7.1 (discovery), 7.1.1 (Linux registration definition) and 7.2 (library trust).
+
+## Layout
+
+The crate has one module per standard (ADR-266 Decision item 5). Each module holds that
+standard's discovery chain and its types, and keeps the operating-system differences inside: the
+same call resolves a name on every platform. What does not depend on the standard, such as the
+7.2 checks, belongs at the crate root.
+
+| Module | Standard | Linux | Windows |
+|---|---|---|---|
+| `j2534` | SAE J2534-1 v04.04 | definition files (below) | registry, through `j2534-0404-registry` |
+
+The rest of this document describes the `j2534` module; the names below are in it
+(`j2534::resolve`, `j2534::ResolveError`, ...).
 
 ## Scope
 
-- In scope: reading Linux definition files, validating them, matching a VCI name, and on Windows
-  looking the name up in the registry (through `j2534-0404-registry`).
+- In scope: reading Linux J2534 definition files, validating them, matching a VCI name, and on
+  Windows looking the name up in the registry (through `j2534-0404-registry`).
 - Not in scope yet: the writability and signer checks of 7.2, and the callers (`j2534-0404-service`,
   `agent`, `vci-discovery`) still use their own lookups.
 

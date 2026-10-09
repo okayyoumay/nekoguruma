@@ -22,7 +22,7 @@ pub enum Permission {
     ReadOnly,
     /// Any request the host implements, on the simulated VCI of a debug build (ADR-247).
     /// The `FlashTransfer` instruction is covered too (ADR-250). The `SecurityAccess`
-    /// instruction is still refused: the host has no implementation yet.
+    /// instruction is still refused: a standalone agent has no key source (ADR-259).
     #[cfg(debug_assertions)]
     Simulator,
 }
@@ -110,7 +110,7 @@ pub fn check_program(program: &Program, permission: Permission) -> Result<(), (u
                 #[cfg(debug_assertions)]
                 Permission::Simulator => None,
             },
-            // The host does not implement it yet, whatever the permission.
+            // A standalone agent has no key source, whatever the permission (ADR-259).
             Op::SecurityAccess { .. } => Some(HostError::NotAllowed(0x27)),
             // TransferData rewrites the ECU's memory: simulator only (ADR-250).
             Op::FlashTransfer { .. } => match permission {

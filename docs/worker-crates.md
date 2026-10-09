@@ -131,7 +131,7 @@ which is kept with the project's working material rather than in the design docu
 | Role | J2534 v04.04 mock implementation for testing/CI |
 | Responsibility | Fake implementation of C-ABI-compatible PassThru functions |
 | Build artifacts | `cdylib` (native DLL) + `rlib` |
-| Notes | On Windows the DLL pins itself (`GetModuleHandleExW` with `PIN`) before starting a repeat-message worker thread, because tests unload the library while that thread may still run. Both mocks look for the built library in the nearest ancestor `target/` directory |
+| Notes | On Windows the DLL pins itself (`GetModuleHandleExW` with `PIN`) before starting a repeat-message worker thread, because tests unload the library while that thread may still run. Both mocks look for the built library in the nearest ancestor `target/` directory. It stays separate from `sim-vci`, the simulated VCI the agent's end-to-end tests load: the two differ in `unsigned long` width, response model, test control and CI scope (`crates/sim-vci/docs/simulated-vci.md`) |
 
 #### `j2534-0404-registry`
 | Item | Description |

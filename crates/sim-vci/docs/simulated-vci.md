@@ -5,6 +5,20 @@ library, so the agent -> worker -> VCI path runs in CI without hardware (design 
 API sits one simulated ECU from `sim-ecu` (`crates/sim-ecu/docs/simulated-ecu.md`). Clause numbers
 below refer to SAE J2534-1 (v04.04).
 
+`sim-vci` does not build on `j2534-0404-mock`, the J2534 test double for the worker's own tests,
+and the two stay separate crates. They differ where it matters:
+
+- **`unsigned long` width.** The mock exports the `j2534-0404-sys` binding types, always 32-bit.
+  `sim-vci` uses the native `c_ulong` on 64-bit Linux, as the counterpart of
+  `NGR_J2534_LONG_SIZE=8` (`docs/worker-crates.md`, "`unsigned long` width").
+- **Responses.** The mock answers itself, for example with a loopback echo or per-protocol
+  fixed replies. `sim-vci` hands ISO-TP requests to `sim-ecu`.
+- **Test control.** The mock is driven per test through its `__mock_*` exports and reset.
+  `sim-vci` holds one process-wide ECU, driven by control commands.
+- **CI cost and dependencies.** `sim-vci` is cross-checked for every worker target, the mock is
+  built for host tests only. Building one on the other would cross-build the whole mock, and
+  would make the worker's test double depend on the vehicle simulator.
+
 ## Device and channels
 
 - `PassThruOpen` returns device ID 1, and a new ID only after a lost device was closed (see

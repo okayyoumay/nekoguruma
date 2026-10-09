@@ -545,8 +545,9 @@ impl DiagHost for WorkerHost {
         self.send_recv(routine_control_bytes(routine, sub, payload))
     }
 
-    // Never `Ok(None)`: that means "still waiting" and the VM would wait forever (ADR-235
-    // item 5).
+    // Refused: an agent without a server has no key source, and the policy already refuses
+    // the instruction before the link opens (ADR-259). Never `Ok(None)`: that means "still
+    // waiting" and the VM would wait forever (ADR-235 item 5).
     fn security_access(
         &mut self,
         _inquiry: u64,

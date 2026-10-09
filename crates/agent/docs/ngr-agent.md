@@ -56,7 +56,7 @@ Steps (`agent::check_program`, `agent::guards::JobGuards`, `agent::launch::launc
    the worker's VCI has identified itself as `sim-vci` (ADR-247); a program that needs more
    than the VCI allows is refused after the link opens, before its first instruction runs.
    On that permission the `FlashTransfer` instruction also works (ADR-250); `SecurityAccess`
-   stays refused.
+   stays refused, since an agent without a server has no key source (design 8.10, ADR-259).
 
 ## Data transfer
 

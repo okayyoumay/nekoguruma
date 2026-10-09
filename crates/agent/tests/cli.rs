@@ -110,7 +110,7 @@ fn unreadable_program_exits_with_1() {
 #[test]
 fn refused_program_exits_with_1_before_resolving_the_vci() {
     let temp = TempDir::new("refused");
-    // SecurityAccess is refused in every build: the host does not implement it (ADR-247).
+    // SecurityAccess is refused in every build: a standalone agent has no key source (ADR-259).
     let program = write_program(
         &temp.0,
         vec![Op::PushBytes(0), Op::SecurityAccess { level: 1 }],

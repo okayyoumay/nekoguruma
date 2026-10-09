@@ -37,13 +37,29 @@ use crate::journal::{FileStore, JobKey, Journal, JournalError, StageId, StepRef,
 use crate::runner::JobError;
 
 /// Where a job keeps its journal, under which key, and how it reads the ECU's identity.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct JournalSetup {
     /// The directory of the journal file (ADR-244 item 7).
     pub dir: PathBuf,
     pub key: JobKey,
     /// The table that maps the program's identity sources to requests (`inputs`).
     pub sources: ServiceSources,
+    /// The VIN the job targets, which a restart compares the ECU's against (ADR-229 item 2
+    /// step 2, ADR-261). `None` when the job names none: a restart then never counts the vehicle
+    /// as identified. It is personal data (design 16.2) and is never logged or put in an error.
+    pub vin: Option<String>,
+}
+
+// Written by hand so that `{:?}` never shows the VIN.
+impl std::fmt::Debug for JournalSetup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JournalSetup")
+            .field("dir", &self.dir)
+            .field("key", &self.key)
+            .field("sources", &self.sources)
+            .field("vin", &self.vin.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 /// A job's open journal and what it needs to commit at the plan's boundaries.

@@ -6,6 +6,10 @@
 //! ADR-229 item 2 for an interrupted transfer, or on-site intervention. It contacts nothing; the
 //! restart itself acts on its answer. `check_before_ecu` makes the restart's checks that need
 //! no ECU service (the resume limit and the supply voltage) and counts the resume (ADR-255).
+//! `check_gates` then makes the identity and safety gates of ADR-229 item 2 step 2 (ADR-261):
+//! the VIN, the hardware identity and the declared preconditions, which decide whether the
+//! teardown may use an ECUReset or must be passive. It sends only ReadDataByIdentifier requests
+//! through the declared sources.
 //!
 //! The interruption point is the latest of the last completed step and the requests the
 //! journal wrote ahead (the transfer-start and RequestTransferExit markers, and the request
@@ -14,9 +18,14 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use diag_ir::{Interruptible, Program, RecoveryRequired, RuntimeInput, Vm, VmError, VmState};
+use diag_ir::{
+    DiagHost, IdentityKind, Interruptible, Precondition, PreconditionKind, Program,
+    RecoveryRequired, RuntimeInput, Source, Vm, VmError, VmState,
+};
 
-use crate::inputs::{Reading, RuntimeInputs};
+use crate::host::HostError;
+use crate::inputs::{FieldBytes, Reading, RuntimeInputs, ServiceSources};
+use crate::inputs::{read_field_bytes, resolve_source};
 use crate::journal::{Journal, JournalError, JournalState, RecoveryFacts, StageId, StepRef, Store};
 use crate::runner::JobError;
 
@@ -83,11 +92,43 @@ pub enum OnSiteReason {
         flash_session: u32,
         millivolts: Option<i64>,
     },
-    /// The restart passed the checks that need no ECU service and its resume was counted, but
-    /// the rest of ADR-229's restart order (teardown, the ECU state check, the replay to the
-    /// erase) does not run in this agent, so the job stops before it sends anything to the ECU
-    /// (ADR-255).
-    RestartOrderUnavailable { flash_session: u32 },
+    /// The restart passed step 1 (the checks that need no ECU service, and its resume was
+    /// counted) and the gates of step 2, which gave `teardown`. The teardown and the rest of
+    /// ADR-229's restart order (the ECU state check, the replay to the erase) do not run in this
+    /// agent, so the job stops before it sends anything that changes the ECU (ADR-255, ADR-261).
+    RestartOrderUnavailable {
+        flash_session: u32,
+        teardown: TeardownGate,
+    },
+}
+
+/// What the gates of ADR-229 item 2 step 2 allow the restart's teardown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TeardownGate {
+    /// The VIN and the hardware identity match and every declared precondition holds: the
+    /// teardown may end the download with an ECUReset.
+    ResetAllowed,
+    /// A gate did not pass: the teardown is passive (the agent stops TesterPresent and waits
+    /// out the session timeout), with no ECUReset.
+    PassiveOnly(PassiveReason),
+}
+
+/// The first gate that did not pass. No VIN is kept in it (design 16.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PassiveReason {
+    /// The ECU's VIN could not be compared with the job's: the job names none, the program
+    /// declares no source, or the read gave no answer, a negative response, or a value that is
+    /// not text, or the worker failed.
+    VinNotEstablished,
+    /// The hardware identity could not be compared: no source is declared, the journal holds
+    /// none, or the read gave no answer, a negative response, an unreadable field, or the
+    /// worker failed.
+    HardwareIdentityNotEstablished,
+    /// The ECU's hardware identity differs from the one the journal recorded.
+    HardwareIdentityDiffers,
+    /// The precondition failed or could not be established, including a source the agent cannot
+    /// resolve.
+    Precondition(PreconditionKind),
 }
 
 /// Decides how the job of `program` goes on, from its journal as `Journal::read` (or
@@ -241,6 +282,142 @@ where
         return Err(JobError::Cancelled);
     }
     Ok(journal.commit_resume(stage, None)?)
+}
+
+/// Runs `read` with a cancel check before and after it, as `check_before_ecu` does: a cancel
+/// during the read is a cancel, whatever the read gave.
+fn cancellable<T>(cancelled: &AtomicBool, read: impl FnOnce() -> T) -> Result<T, JobError> {
+    if cancelled.load(Ordering::Relaxed) {
+        return Err(JobError::Cancelled);
+    }
+    let result = read();
+    if cancelled.load(Ordering::Relaxed) {
+        return Err(JobError::Cancelled);
+    }
+    Ok(result)
+}
+
+/// The identity and safety gates of ADR-229 item 2 step 2 (ADR-261), which decide whether the
+/// restart's teardown may end the download with an ECUReset. In this order, stopping at the
+/// first that does not pass:
+/// - the VIN: the ECU's, read through the program's source, must equal `vin`, the VIN the job
+///   targets. A job that names none, a program that declares no source, and a read that gives
+///   no text (no answer, a negative response, an undecodable field, a worker failure) leave the
+///   vehicle unidentified: [`PassiveReason::VinNotEstablished`], and nothing is read for a job
+///   with no VIN. A VIN that decodes but differs aborts the job
+///   ([`JobError::IdentityMismatch`]), since the ECU is another vehicle's;
+/// - the hardware identity: the ECU's, read as raw field bytes, must equal the journal's, which
+///   was recorded before the erase;
+/// - each declared precondition, in the order voltage, external supply, ignition, engine,
+///   vehicle speed: its value must lie in the declared range. The ECU's session is not known
+///   yet (it may still be in its programming session), so the default-session source is read
+///   first and the programming-session source only when that gives no value. A value outside
+///   the range fails at once.
+///
+/// A cancel stops it before and right after every read. Nothing here sends anything but
+/// ReadDataByIdentifier requests through the declared sources, and reads of runtime inputs. No
+/// VIN is put in a log message or a result.
+pub(crate) fn check_gates<H>(
+    program: &Program,
+    point: &RestartPoint,
+    sources: &ServiceSources,
+    vin: Option<&str>,
+    host: &mut H,
+    cancelled: &AtomicBool,
+) -> Result<TeardownGate, JobError>
+where
+    H: DiagHost<Error = HostError> + RuntimeInputs,
+{
+    let passive = |reason| Ok(TeardownGate::PassiveOnly(reason));
+
+    // The VIN.
+    let (Some(target), Some(source)) = (vin, program.identity.vin) else {
+        return passive(PassiveReason::VinNotEstablished);
+    };
+    match cancellable(cancelled, || resolve_source(source, sources, host))? {
+        Ok(Reading::Text(text)) if text == target => {}
+        Ok(Reading::Text(_)) => {
+            return Err(JobError::IdentityMismatch {
+                identity: IdentityKind::Vin,
+            });
+        }
+        Ok(_) => return passive(PassiveReason::VinNotEstablished),
+        Err(error) => {
+            tracing::warn!(%error, "the ECU's VIN could not be read");
+            return passive(PassiveReason::VinNotEstablished);
+        }
+    }
+
+    // The hardware identity.
+    let (Some(recorded), Some(source)) = (
+        point.facts.ecu_hardware_part_number.as_deref(),
+        program.identity.hardware_part_number,
+    ) else {
+        return passive(PassiveReason::HardwareIdentityNotEstablished);
+    };
+    match cancellable(cancelled, || read_field_bytes(source, sources, host))? {
+        Ok(FieldBytes::Field(bytes)) if bytes == recorded => {}
+        Ok(FieldBytes::Field(_)) => return passive(PassiveReason::HardwareIdentityDiffers),
+        Ok(_) => return passive(PassiveReason::HardwareIdentityNotEstablished),
+        Err(error) => {
+            tracing::warn!(%error, "the ECU's hardware identity could not be read");
+            return passive(PassiveReason::HardwareIdentityNotEstablished);
+        }
+    }
+
+    // The safety preconditions.
+    let declared = &program.preconditions;
+    for (kind, precondition) in [
+        (PreconditionKind::Voltage, &declared.voltage_mv),
+        (PreconditionKind::ExternalSupply, &declared.external_supply),
+        (PreconditionKind::Ignition, &declared.ignition),
+        (PreconditionKind::Engine, &declared.engine),
+        (PreconditionKind::VehicleSpeed, &declared.vehicle_speed),
+    ] {
+        let Some(precondition) = precondition else {
+            continue;
+        };
+        if !precondition_holds(precondition, kind, sources, host, cancelled)? {
+            return passive(PassiveReason::Precondition(kind));
+        }
+    }
+    Ok(TeardownGate::ResetAllowed)
+}
+
+/// Whether `precondition` holds: the first source that gives a value decides, the
+/// default-session one before the programming-session one (skipped when it is the same source).
+fn precondition_holds<H>(
+    precondition: &Precondition,
+    kind: PreconditionKind,
+    sources: &ServiceSources,
+    host: &mut H,
+    cancelled: &AtomicBool,
+) -> Result<bool, JobError>
+where
+    H: DiagHost<Error = HostError> + RuntimeInputs,
+{
+    let range = precondition.satisfied.lower..=precondition.satisfied.upper;
+    let mut previous: Option<Source> = None;
+    for source in [
+        precondition.default_session,
+        precondition.programming_session,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if previous == Some(source) {
+            continue;
+        }
+        previous = Some(source);
+        match cancellable(cancelled, || resolve_source(source, sources, host))? {
+            Ok(Reading::Value(value)) => return Ok(range.contains(&value)),
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(%error, ?kind, "a safety precondition could not be read");
+            }
+        }
+    }
+    Ok(false)
 }
 
 /// The step count a run that goes on with `state`'s journal starts from: one more than any

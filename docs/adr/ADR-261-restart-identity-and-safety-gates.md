@@ -58,7 +58,8 @@ Three points are not settled by ADR-229 or the design:
    gate leaves only the passive teardown, whose own confirmation fails if the worker stays
    unreachable.
 6. **No VIN in errors or logs.** `IdentityMismatch` names the identity that differs, not its
-   values, and the gates log no VIN (design 5.5, 16.2).
+   values, the gates log no VIN, and `JournalSetup`'s `Debug` output redacts it (design 5.5,
+   16.2).
 
 ## Consequences
 

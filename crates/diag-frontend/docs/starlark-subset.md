@@ -100,7 +100,7 @@ onto them as follows; anything else exists only at ingestion.
 | `bytes` | `Bytes` | |
 | `str` | constant only, or UTF-8 `Bytes` when built at run time | A string built at run time (concatenation, `%` formatting, `str(x)`) needs the concatenation and conversion instructions the IR does not have yet |
 | `list` | none | List literals are constants: a `for` over one is unrolled, and an index into one must be a constant. No mutation |
-| `dict` | none | A dict literal appears only as a `params` argument (3.1), which the transpiler encodes into the request bytes. The response (3.5) is accessed only through literal key chains, which the transpiler resolves to the response bytes and the declaration part's decode plan for each field |
+| `dict` | none | A dict literal appears only as a `params` argument (3.1), which the transpiler encodes into the request bytes. The response (3.4) is accessed only through literal key chains, which the transpiler resolves to the response bytes and the declaration part's decode plan for each field |
 | `None` | none | Not supported in version 1 (`STAR_UNSUPPORTED_SYNTAX`) |
 
 A construct whose lowering needs an instruction the IR does not have yet is rejected at
@@ -176,7 +176,7 @@ instruction exists, the transpiler rejects calls to it (`STAR_API_NOT_AVAILABLE`
 | `diag.precondition` | none yet | |
 | `diag.fail` | none yet | |
 
-### 3.4 Synchronous Calls
+### 3.3 Synchronous Calls
 
 Internally these involve waiting. Starlark has no `async`, and none is needed: the VM maps the
 calls to instructions that report a waiting outcome, so procedures are written as plain calls.
@@ -187,7 +187,7 @@ def main():
     diag.log(1, res["fields"]["vin"])
 ```
 
-### 3.5 Response Shape
+### 3.4 Response Shape
 
 A dict with fixed keys:
 
@@ -292,14 +292,18 @@ are `interruptible: yes`.
 | `# @section uninterruptible` | `No` |
 | `# @section recoveryRequired` | `RecoveryRequired` |
 
-`expected=<millis>` is the expected duration. It is compared with the remaining OEM
+`expected=<millis>` is the expected duration, an integer from 0 to 2^32 - 1; a value outside that
+range is rejected (`STAR_ARGUMENT_OUT_OF_RANGE`). It is compared with the remaining OEM
 authentication time (8.10.1). A section starts and ends in the same function body, at the same
 indentation.
 
 ### 4.6 Specifying Idempotency
 
 Behavior on resume (8.2.5) is specified with annotations. When omitted, the per-API default is
-used (`Safe` for reads; `CheckState` for `routine` and `flash_transfer`).
+used: `Safe` for `read_dtc`, `ecu_info`, `precondition`, and `request` whose service is a read
+(ReadDataByIdentifier, ReadDTCInformation); `CheckState` for `routine` and `flash_transfer`;
+`Unsafe` for every other `request`, since a service the transpiler does not classify may change
+ECU state.
 
 ```python
     # @idempotency unsafe
@@ -316,7 +320,11 @@ source.
 
 ## 5. Error Reporting
 
-**All violations are listed**. Do not stop at the first one.
+**All subset violations are listed**. Do not stop at the first one.
+
+A syntax error is different: the parser (6) stops at the first one and returns no AST, so a file
+that does not parse reports that single error. Subset validation runs on a file that parses and
+lists every violation it finds.
 
 ```json
 {

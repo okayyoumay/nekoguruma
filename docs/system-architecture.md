@@ -560,7 +560,7 @@ J2534 on Linux **reuses the Windows API definitions as-is**. Function signatures
 
 **Search path**: `/etc/nekoguruma/j2534/` only, written by the administrator, in both operating modes. Per-user locations (such as `$XDG_CONFIG_HOME`) are not supported. The directory is fixed at build time; a runtime override exists only in debug builds, for tests (ADR-228).
 
-**Format**: One file per VCI (TOML or JSON). A single large file would have installers from multiple vendors editing the same file and conflicting, so the granularity matches the registry's one key per VCI.
+**Format**: One TOML file per VCI, with keys named as the Windows registry values (ADR-266). A single large file would have installers from multiple vendors editing the same file and conflicting, so the granularity matches the registry's one key per VCI.
 
 **Fields**: Mapped to the Windows registry values, with field names matching the value names, so that discovery results map onto the same structure.
 
@@ -569,7 +569,7 @@ J2534 on Linux **reuses the Windows API definitions as-is**. Function signatures
 | `Name` / `Vendor` | For display |
 | `FunctionLibrary` | Absolute path of the .so |
 | Supported protocols and capability flags | Correspond to the respective Windows values |
-| `long_size` | Width of `unsigned long` in the vendor implementation (see below) |
+| `LongSize` | Width of `unsigned long` in the vendor implementation (see below) |
 | Additional search paths | For resolving dependent libraries (optional) |
 
 **Creating definition files**: There is no guarantee that vendor installers will write definitions specific to this software, so operation takes one of the following forms.
@@ -583,7 +583,7 @@ The agent provides a generation helper, run with administrator rights. It actual
 **OS differences absorbed on the worker side**
 
 - **Calling convention**: Windows uses `WINAPI` (`stdcall` on x86), Linux uses the standard C convention. They are identical on x86_64 but differ on x86 workers
-- **Width of `unsigned long`**: The J2534 API uses `unsigned long` extensively. On Windows it is 32bit even on 64bit; on Linux x86_64 it is 64bit. Since vendor implementations interpret this differently, it must be stated explicitly via `long_size` in the definition file
+- **Width of `unsigned long`**: The J2534 API uses `unsigned long` extensively. On Windows it is 32bit even on 64bit; on Linux x86_64 it is 64bit. Since vendor implementations interpret this differently, it must be stated explicitly via `LongSize` in the definition file
 - **Structure alignment**: The packing of `PASSTHRU_MSG` etc. is specified explicitly on the worker side
 - **Dependency resolution**: A .so depends on rpath / `LD_LIBRARY_PATH`. Handled via the additional search paths in the definition file
 

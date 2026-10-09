@@ -26,6 +26,7 @@ pub mod restart;
 pub mod runner;
 
 pub use host::{HostError, Timings, WorkerHost};
+pub use journal::Vin;
 pub use journaling::JournalSetup;
 pub use link::{Link, LinkConfig};
 pub use runner::{

@@ -26,6 +26,7 @@ use diag_ir::{
 use crate::host::HostError;
 use crate::inputs::{FieldBytes, Reading, RuntimeInputs, ServiceSources};
 use crate::inputs::{read_field_bytes, resolve_source};
+use crate::journal::Vin;
 use crate::journal::{Journal, JournalError, JournalState, RecoveryFacts, StageId, StepRef, Store};
 use crate::runner::JobError;
 
@@ -92,6 +93,10 @@ pub enum OnSiteReason {
         flash_session: u32,
         millivolts: Option<i64>,
     },
+    /// The resume names another target VIN than the journal recorded at the job's first run
+    /// (none included), so the job's own data changed between runs. Nothing is sent and no
+    /// resume is counted (ADR-261).
+    TargetVinDiffers,
     /// The restart passed step 1 (the checks that need no ECU service, and its resume was
     /// counted) and the gates of step 2, which gave `teardown`. The teardown and the rest of
     /// ADR-229's restart order (the ECU state check, the replay to the erase) do not run in this
@@ -307,8 +312,8 @@ fn cancellable<T>(cancelled: &AtomicBool, read: impl FnOnce() -> T) -> Result<T,
 /// The identity and safety gates of ADR-229 item 2 step 2 (ADR-261), which decide whether the
 /// restart's teardown may end the download with an ECUReset. In this order, stopping at the
 /// first that does not pass:
-/// - the VIN: the ECU's, read through the program's source, must equal `vin`, the VIN the job
-///   targets. A job that names none or a VIN that is not well-formed (`is_vin`), a program that
+/// - the VIN: the ECU's, read through the program's source, must equal the VIN the job
+///   targets, which the journal recorded at the job's first run (`RecoveryFacts::target_vin`). A job that names none or a VIN that is not well-formed (`is_vin`), a program that
 ///   declares no source, a source the table does not map, and a read that gives no well-formed
 ///   VIN (no answer, a negative response, an undecodable, padded or lower-case field, a worker
 ///   failure) leave the vehicle unidentified: [`PassiveReason::VinNotEstablished`], and nothing
@@ -333,7 +338,6 @@ pub(crate) fn check_gates<H>(
     program: &Program,
     point: &RestartPoint,
     sources: &ServiceSources,
-    vin: Option<&str>,
     host: &mut H,
     cancelled: &AtomicBool,
 ) -> Result<TeardownGate, JobError>
@@ -346,7 +350,15 @@ where
     }
 
     // The VIN.
-    let (Some(target), Some(source)) = (vin.filter(|vin| is_vin(vin)), program.identity.vin) else {
+    let (Some(target), Some(source)) = (
+        point
+            .facts
+            .target_vin
+            .as_ref()
+            .map(Vin::as_str)
+            .filter(|vin| is_vin(vin)),
+        program.identity.vin,
+    ) else {
         return passive(PassiveReason::VinNotEstablished);
     };
     match cancellable(cancelled, || resolve_source(source, sources, host))? {

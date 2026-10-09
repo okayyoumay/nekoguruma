@@ -113,7 +113,8 @@ commit fails, are the job runner's duties.
 
 `agent::run_program_journaled` is the runner that keeps it (ADR-252). It takes a
 `JournalSetup` (directory, job key, the `ServiceSources` table for the ECU's identity, and
-the VIN the job targets, which a restart compares against) and the job's guards ("Job guards"
+the VIN the job targets, which a first run records as the journal's first record and a
+restart compares against) and the job's guards ("Job guards"
 below), which it returns with the result, and,
 for a program with a flash recovery plan, creates the journal once the link is open and the
 policy allows the program, before anything is sent to the ECU; a program without a plan keeps
@@ -195,12 +196,17 @@ at the limit. A second resume of a job whose journal another run holds ends in
 deadline (a server's job instruction carries it) and a server reservation are not part of this
 entry.
 
+Before the classification, a resume whose `JournalSetup::vin` differs from the target VIN the
+journal recorded at the first run (none included) ends in
+`OnSiteInterventionRequired(TargetVinDiffers)`, with nothing sent and no resume counted
+(ADR-261).
+
 `check_gates` is ADR-229 item 2 step 2 before the teardown (ADR-261). It reads only, and stops
 at the first gate that does not hold:
 
-1. The VIN, through the program's VIN source, against the VIN the job names
-   (`JournalSetup::vin`). A well-formed VIN (17 characters, each a digit or an upper-case letter
-   other than I, O and Q) other than the job's ends the job in `JobError::IdentityMismatch`. No
+1. The VIN, through the program's VIN source, against the VIN the job names (the journal's
+   target VIN). A well-formed VIN (17 characters, each a digit or an upper-case letter other
+   than I, O and Q) other than the job's ends the job in `JobError::IdentityMismatch`. No
    answer, a negative response, text that is not a well-formed VIN, or a job that names no
    well-formed VIN (which reads nothing) gives `PassiveOnly(VinNotEstablished)`.
 2. The ECU's hardware part number, against the bytes the journal recorded before the erase. A

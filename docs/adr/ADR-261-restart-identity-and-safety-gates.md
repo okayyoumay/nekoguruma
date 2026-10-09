@@ -2,7 +2,7 @@
 
 **Date:** 2026-10-09
 **Status:** Accepted
-**Affects:** `agent` (`src/restart.rs`, `src/runner.rs`, `src/journaling.rs`, `docs/ngr-agent.md`), ADR-255 item 5
+**Affects:** `agent` (`src/restart.rs`, `src/runner.rs`, `src/journaling.rs`, `src/journal.rs`, `docs/ngr-agent.md`), ADR-244, ADR-255 item 5
 
 ## Context
 
@@ -29,10 +29,19 @@ Three points are not settled by ADR-229 or the design:
 
 ## Decision
 
-1. **The job names its target VIN.** `JournalSetup` carries `vin: Option<String>`, the VIN
-   the job targets, as the job's own data beside the journal's facts (ADR-244 item 4). The
-   journal does not record it. A job that names none is never counted as identified: its
-   restart takes the passive teardown without reading anything.
+1. **The job names its target VIN, and the journal records it at creation.** `JournalSetup`
+   carries `vin: Option<Vin>`, the VIN the job targets. A first run writes it as the journal's
+   first record (`Record::TargetVin`), in the same write that creates the file, so a journal
+   exists with its target or not at all. A resume must name the same VIN, none included; one
+   that does not ends in `OnSiteInterventionRequired(TargetVinDiffers)` before the
+   classification, with nothing sent and no resume counted, since the job's own data changed
+   between runs and the connected vehicle may be one the job never targeted. The resume input
+   keeps its VIN, so a wrong journal (a reused job id, a wrong directory) is caught as well as a
+   wrong caller. The gates then compare the ECU's VIN against the journal's, as they compare the
+   hardware part number. A job that names none is never counted as identified: its restart takes
+   the passive teardown without reading anything. `Vin`'s `Debug` output is redacted. The record
+   is a consistency check between the job's runs, not tamper evidence; that comes with the
+   journal's protection (design 5.5).
 2. **The gates give a decision; the teardown acts on it.** `restart::check_gates` runs after
    `check_before_ecu` and returns a `TeardownGate`: `ResetAllowed`, or `PassiveOnly` with the
    first gate that did not hold (`PassiveReason`). `ResetAllowed` means the gates do not rule a
@@ -66,8 +75,7 @@ Three points are not settled by ADR-229 or the design:
    gate leaves only the passive teardown, whose own confirmation fails if the worker stays
    unreachable.
 6. **No VIN in errors or logs.** `IdentityMismatch` names the identity that differs, not its
-   values, the gates log no VIN, and `JournalSetup`'s `Debug` output redacts it (design 5.5,
-   16.2).
+   values, the gates log no VIN, and `Vin`'s `Debug` output redacts it (design 5.5, 16.2).
 
 ## Consequences
 
@@ -78,6 +86,13 @@ Three points are not settled by ADR-229 or the design:
   RequestTransferExit remain to be built on this decision.
 - The promotion to the per-vehicle lock at the first matching VIN (ADR-229 item 2, ADR-256
   item 6) is not part of the gates; it needs the per-vehicle lock first.
+- The journal holds the target VIN in the clear until the journal's protection (design 5.5)
+  encrypts it. Design 5.5 already places VINs in the journal, under its retention and deletion
+  rules, which is what ADR-256 item 6 found missing for a lock file's name.
+- A journal written before the `TargetVin` record names no VIN: it resumes only with none, and
+  a restart from it takes the passive teardown.
+- `Journal::create` takes the target VIN. ADR-244's record set gains `TargetVin`, which must
+  be the first record and appears at most once.
 - A placeholder that a bootloader may answer after an erase and that happens to be a
   well-formed VIN (for example seventeen zeros) still aborts the job. Nothing tells it apart
   from another vehicle's VIN; the job ends without a reset either way.

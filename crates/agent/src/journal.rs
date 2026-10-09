@@ -54,6 +54,28 @@ pub struct StepRef {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct StageId(pub u32);
 
+/// The VIN a job targets. It is personal data (design 16.2): `Debug` hides it, there is no
+/// `Display`, and callers use [`Vin::as_str`] only to compare. The journal keeps it as given;
+/// `restart` decides whether it is well-formed.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Vin(String);
+
+impl Vin {
+    pub fn new(vin: String) -> Self {
+        Self(vin)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for Vin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Vin(<redacted>)")
+    }
+}
+
 /// What a restart, or a device that takes the job over, needs to know from the journal
 /// (ADR-229). It is the state the journal folds its records into, and the journal's part of the
 /// checkpoint summary sent for handover, carried unchanged; the summary adds what the job itself
@@ -76,6 +98,9 @@ pub struct RecoveryFacts {
     /// The newest request intent: a request at or past a plan's recovery-required point that is
     /// neither the erase nor RequestTransferExit, journaled before it is sent (ADR-253).
     pub last_intent: Option<StepRef>,
+    /// The VIN the job targeted at its first run, recorded before any other record, so a resume
+    /// can tell that the job's own data changed (ADR-261). `None` when the job named none.
+    pub target_vin: Option<Vin>,
 }
 
 impl RecoveryFacts {
@@ -89,6 +114,7 @@ impl RecoveryFacts {
             attempt_key: None,
             transfer: None,
             last_intent: None,
+            target_vin: None,
         }
     }
 
@@ -105,6 +131,14 @@ impl RecoveryFacts {
         let after_last_step =
             |at: &StepRef, facts: &Self| facts.last_step.is_none_or(|last| at.steps > last.steps);
         match record {
+            Record::TargetVin(vin) => {
+                // Every other record changes the facts, so unchanged facts mean none came
+                // before; a second target VIN finds the first.
+                if *self != Self::new(self.key.clone()) {
+                    return Err("the target VIN must be the first record, and at most one");
+                }
+                self.target_vin = Some(vin.clone());
+            }
             Record::Step { at, .. } => {
                 if !after_last_step(at, self) {
                     return Err("a step must come after the last step");
@@ -298,6 +332,8 @@ enum Record {
     Intent {
         at: StepRef,
     },
+    /// The job's target VIN; only before any other record.
+    TargetVin(Vin),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -401,8 +437,14 @@ impl Journal<FileStore> {
     /// Creates the journal of `key` in `dir`. The file appears complete or not at all: the
     /// header is written and synced under a temporary name, then linked to the journal's name,
     /// which fails if that name exists. The journal's writer lock is taken first, so another
-    /// writer of the same job gets [`JournalError::InUse`].
-    pub fn create(dir: &Path, key: &JobKey) -> Result<Self, JournalError> {
+    /// writer of the same job gets [`JournalError::InUse`]. The job's `target_vin`, when it names
+    /// one, is the first record and is part of the same write, so the journal exists with it or
+    /// not at all.
+    pub fn create(
+        dir: &Path,
+        key: &JobKey,
+        target_vin: Option<&Vin>,
+    ) -> Result<Self, JournalError> {
         let path = journal_path(dir, key)?;
         let writer = WriterLock::take(&path)?;
         let tmp = path.with_extension("journal.tmp");
@@ -415,6 +457,19 @@ impl Journal<FileStore> {
             created_unix_ms: unix_ms(),
         };
         push_frame(&mut bytes, &encode(&header)?)?;
+        let mut facts = RecoveryFacts::new(key.clone());
+        let mut records = 0;
+        if let Some(vin) = target_vin {
+            let record = Record::TargetVin(vin.clone());
+            facts.apply(&record).map_err(JournalError::Invariant)?;
+            let entry = Entry {
+                seq: 0,
+                at_unix_ms: unix_ms(),
+                record,
+            };
+            push_frame(&mut bytes, &encode(&entry)?)?;
+            records = 1;
+        }
         // A temporary file left by an earlier attempt that crashed holds no commits.
         match fs::remove_file(&tmp) {
             Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error.into()),
@@ -449,9 +504,9 @@ impl Journal<FileStore> {
                 _writer: writer,
             },
             state: JournalState {
-                facts: RecoveryFacts::new(key.clone()),
+                facts,
                 last_vm_state: None,
-                records: 0,
+                records,
             },
             poisoned: false,
         })
@@ -535,6 +590,12 @@ impl<S: Store> Journal<S> {
             },
             poisoned: false,
         }
+    }
+
+    /// Records the target VIN on a journal made by `on_store`, for tests.
+    #[cfg(test)]
+    pub(crate) fn commit_target_vin(&mut self, vin: &Vin) -> Result<(), JournalError> {
+        self.commit(Record::TargetVin(vin.clone()))
     }
 
     pub fn state(&self) -> &JournalState {
@@ -949,7 +1010,7 @@ mod tests {
     #[test]
     fn reads_back_what_it_committed() {
         let dir = TempDir::new();
-        let mut journal = Journal::create(&dir.0, &key()).expect("create");
+        let mut journal = Journal::create(&dir.0, &key(), None).expect("create");
         script(&mut journal, |_| {});
         let (state, summary) = (journal.state().clone(), journal.summary());
         drop(journal);
@@ -981,7 +1042,7 @@ mod tests {
     #[test]
     fn every_cut_reads_back_as_the_last_whole_commit() {
         let dir = TempDir::new();
-        let mut journal = Journal::create(&dir.0, &key()).expect("create");
+        let mut journal = Journal::create(&dir.0, &key(), None).expect("create");
         let mut boundaries = vec![(journal.store.len as usize, journal.state().clone())];
         script(&mut journal, |j| {
             boundaries.push((j.store.len as usize, j.state().clone()));
@@ -1013,7 +1074,7 @@ mod tests {
             frame
         }] {
             let dir = TempDir::new();
-            let mut journal = Journal::create(&dir.0, &key()).expect("create");
+            let mut journal = Journal::create(&dir.0, &key(), None).expect("create");
             journal.commit_block(0).expect_err("no transfer yet");
             journal
                 .commit_ecu_hardware_part_number(b"HW-1")
@@ -1042,7 +1103,7 @@ mod tests {
     #[test]
     fn a_damaged_record_with_records_after_it_is_corrupt() {
         let dir = TempDir::new();
-        let mut journal = Journal::create(&dir.0, &key()).expect("create");
+        let mut journal = Journal::create(&dir.0, &key(), None).expect("create");
         let header_end = journal.store.len as usize;
         script(&mut journal, |_| {});
         drop(journal);
@@ -1059,7 +1120,7 @@ mod tests {
     #[test]
     fn refuses_a_file_it_cannot_trust() {
         let dir = TempDir::new();
-        drop(Journal::create(&dir.0, &key()).expect("create"));
+        drop(Journal::create(&dir.0, &key(), None).expect("create"));
         let good = fs::read(path(&dir)).expect("read");
 
         let other = JobKey {
@@ -1103,9 +1164,9 @@ mod tests {
             Journal::open(&dir.0, &key()),
             Err(JournalError::NotFound)
         ));
-        drop(Journal::create(&dir.0, &key()).expect("create"));
+        drop(Journal::create(&dir.0, &key(), None).expect("create"));
         assert!(matches!(
-            Journal::create(&dir.0, &key()),
+            Journal::create(&dir.0, &key(), None),
             Err(JournalError::AlreadyExists)
         ));
         // The journal and its writer lock's sidecar; no temporary file is left.
@@ -1132,7 +1193,7 @@ mod tests {
             };
             assert!(
                 matches!(
-                    Journal::create(&dir.0, &key),
+                    Journal::create(&dir.0, &key, None),
                     Err(JournalError::InvalidJobId(_))
                 ),
                 "{id:?}"
@@ -1141,9 +1202,87 @@ mod tests {
     }
 
     #[test]
+    fn the_target_vin_is_the_first_record_and_reads_back() {
+        let dir = TempDir::new();
+        let vin = Vin::new("WDB12345678901234".to_owned());
+        let mut j = Journal::create(&dir.0, &key(), Some(&vin)).expect("create");
+        assert_eq!(j.state().facts.target_vin.as_ref(), Some(&vin));
+        assert_eq!(j.state().records, 1);
+        // A second target VIN is refused.
+        assert!(matches!(
+            j.commit_target_vin(&vin),
+            Err(JournalError::Invariant(_))
+        ));
+        j.commit_step(at(1, 1), None).expect("step");
+        drop(j);
+        let state = Journal::read(&dir.0, &key()).expect("read back");
+        assert_eq!(state.facts.target_vin, Some(vin.clone()));
+        assert_eq!(state.records, 2);
+        // No VIN in any debug output.
+        assert!(!format!("{state:?} {:?}", state.facts).contains("WDB"));
+
+        // A journal made without one has none.
+        let dir = TempDir::new();
+        drop(Journal::create(&dir.0, &key(), None).expect("create"));
+        assert_eq!(
+            Journal::read(&dir.0, &key())
+                .expect("read")
+                .facts
+                .target_vin,
+            None
+        );
+    }
+
+    #[test]
+    fn a_target_vin_after_another_record_is_refused() {
+        let vin = Vin::new("WDB12345678901234".to_owned());
+        let mut j = memory();
+        j.commit_step(at(1, 1), None).expect("step");
+        assert!(matches!(
+            j.commit_target_vin(&vin),
+            Err(JournalError::Invariant(_))
+        ));
+        // Not tied to the first sequence number: a journal that starts with it takes no second.
+        let mut j = memory();
+        j.commit_target_vin(&vin).expect("first");
+        assert!(matches!(
+            j.commit_target_vin(&vin),
+            Err(JournalError::Invariant(_))
+        ));
+        j.commit_step(at(1, 1), None).expect("step");
+    }
+
+    /// A file whose second record is a target VIN does not read back.
+    #[test]
+    fn a_file_with_a_late_target_vin_is_corrupt() {
+        let dir = TempDir::new();
+        let vin = Vin::new("WDB12345678901234".to_owned());
+        let mut j = Journal::create(&dir.0, &key(), None).expect("create");
+        j.commit_step(at(1, 1), None).expect("step");
+        drop(j);
+        let mut frame = Vec::new();
+        let entry = Entry {
+            seq: 1,
+            at_unix_ms: 0,
+            record: Record::TargetVin(vin),
+        };
+        push_frame(&mut frame, &encode(&entry).expect("encode")).expect("frame");
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(path(&dir))
+            .expect("open");
+        file.write_all(&frame).expect("append");
+        drop(file);
+        assert!(matches!(
+            Journal::read(&dir.0, &key()),
+            Err(JournalError::Corrupt { .. })
+        ));
+    }
+
+    #[test]
     fn records_out_of_order_are_refused() {
         let dir = TempDir::new();
-        let mut j = Journal::create(&dir.0, &key()).expect("create");
+        let mut j = Journal::create(&dir.0, &key(), None).expect("create");
         let refused = |result: Result<(), JournalError>| {
             assert!(
                 matches!(result, Err(JournalError::Invariant(_))),
@@ -1229,7 +1368,7 @@ mod tests {
     #[test]
     fn damage_with_records_after_it_is_not_a_torn_tail() {
         let dir = TempDir::new();
-        let mut journal = Journal::create(&dir.0, &key()).expect("create");
+        let mut journal = Journal::create(&dir.0, &key(), None).expect("create");
         let header_end = journal.store.len as usize;
         journal
             .commit_ecu_hardware_part_number(b"HW-1")
@@ -1285,7 +1424,7 @@ mod tests {
     #[test]
     fn damage_followed_by_records_and_a_torn_tail_is_corrupt() {
         let dir = TempDir::new();
-        let mut journal = Journal::create(&dir.0, &key()).expect("create");
+        let mut journal = Journal::create(&dir.0, &key(), None).expect("create");
         journal
             .commit_ecu_hardware_part_number(b"HW-1")
             .expect("commit");
@@ -1322,7 +1461,7 @@ mod tests {
     #[test]
     fn a_record_numbered_u64_max_does_not_panic() {
         let dir = TempDir::new();
-        let mut journal = Journal::create(&dir.0, &key()).expect("create");
+        let mut journal = Journal::create(&dir.0, &key(), None).expect("create");
         journal
             .commit_ecu_hardware_part_number(b"HW-1")
             .expect("commit");
@@ -1358,7 +1497,7 @@ mod tests {
     #[test]
     fn a_frame_inside_a_torn_payload_is_not_a_later_record() {
         let dir = TempDir::new();
-        let mut journal = Journal::create(&dir.0, &key()).expect("create");
+        let mut journal = Journal::create(&dir.0, &key(), None).expect("create");
         journal
             .commit_ecu_hardware_part_number(b"HW-1")
             .expect("commit");
@@ -1415,7 +1554,7 @@ mod tests {
     #[test]
     fn read_leaves_a_torn_tail_in_place() {
         let dir = TempDir::new();
-        let mut journal = Journal::create(&dir.0, &key()).expect("create");
+        let mut journal = Journal::create(&dir.0, &key(), None).expect("create");
         journal
             .commit_ecu_hardware_part_number(b"HW-1")
             .expect("commit");
@@ -1522,7 +1661,7 @@ mod tests {
         assert_eq!(j.summary().last_intent, Some(at(3, 11)));
 
         let dir = TempDir::new();
-        let mut journal = Journal::create(&dir.0, &key()).expect("create");
+        let mut journal = Journal::create(&dir.0, &key(), None).expect("create");
         journal.commit_intent(at(7, 70)).expect("intent");
         drop(journal);
         let reopened = Journal::open(&dir.0, &key()).expect("open");
@@ -1535,7 +1674,7 @@ mod tests {
     #[test]
     fn a_journal_has_one_writer() {
         let dir = TempDir::new();
-        let mut journal = Journal::create(&dir.0, &key()).expect("create");
+        let mut journal = Journal::create(&dir.0, &key(), None).expect("create");
         journal
             .commit_ecu_hardware_part_number(b"HW")
             .expect("commit");
@@ -1545,7 +1684,7 @@ mod tests {
             Err(JournalError::InUse)
         ));
         assert!(matches!(
-            Journal::create(&dir.0, &key()),
+            Journal::create(&dir.0, &key(), None),
             Err(JournalError::InUse)
         ));
         assert_eq!(fs::read(path(&dir)).expect("read"), bytes);
@@ -1555,7 +1694,7 @@ mod tests {
         );
         drop(journal);
         assert!(matches!(
-            Journal::create(&dir.0, &key()),
+            Journal::create(&dir.0, &key(), None),
             Err(JournalError::AlreadyExists)
         ));
         let reopened = Journal::open(&dir.0, &key()).expect("open after the writer is gone");

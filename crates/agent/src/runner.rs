@@ -420,7 +420,7 @@ fn run_job(
             cancelled,
             Journal::open(&setup.dir, &setup.key),
             setup.sources,
-            setup.vin.as_deref(),
+            setup.vin.as_ref(),
         ),
         _ => run_on(
             program,
@@ -512,7 +512,7 @@ fn resume_on<H, S>(
     cancelled: &AtomicBool,
     opened: Result<Journal<S>, JournalError>,
     sources: crate::inputs::ServiceSources,
-    vin: Option<&str>,
+    vin: Option<&crate::journal::Vin>,
 ) -> Result<VmState, JobError>
 where
     H: DiagHost<Error = HostError> + RuntimeInputs + TransferProgress,
@@ -521,6 +521,15 @@ where
     // Another run of this job holds the journal: it, not this one, goes on with the job.
     if let Err(JournalError::InUse) = opened {
         return Err(JobError::Journal(JournalError::InUse));
+    }
+    // A resume names the VIN the job's first run recorded, or the job's own data changed
+    // (ADR-261): nothing is sent and no resume is counted.
+    if let Ok(journal) = &opened
+        && journal.state().facts.target_vin.as_ref() != vin
+    {
+        return Err(JobError::OnSiteInterventionRequired(
+            OnSiteReason::TargetVinDiffers,
+        ));
     }
     match restart::classify(program, opened.as_ref().map(Journal::state)) {
         RestartDecision::OnSiteInterventionRequired(reason) => {
@@ -546,7 +555,7 @@ where
             // `classify` restarts only from a journal it read.
             let mut journal = opened?;
             restart::check_before_ecu(program, &point, &mut journal, host, cancelled)?;
-            let teardown = restart::check_gates(program, &point, &sources, vin, host, cancelled)?;
+            let teardown = restart::check_gates(program, &point, &sources, host, cancelled)?;
             Err(JobError::OnSiteInterventionRequired(
                 OnSiteReason::RestartOrderUnavailable {
                     flash_session: point.flash_session,
@@ -2255,12 +2264,21 @@ mod tests {
         dir
     }
 
+    fn target() -> crate::journal::Vin {
+        crate::journal::Vin::new(TARGET_VIN.to_owned())
+    }
+
     fn file_setup(dir: &std::path::Path) -> JournalSetup {
+        file_setup_for(dir, Some(TARGET_VIN))
+    }
+
+    /// The setup of a job that targets `vin`.
+    fn file_setup_for(dir: &std::path::Path, vin: Option<&str>) -> JournalSetup {
         JournalSetup {
             dir: dir.to_owned(),
             key: job_key(),
             sources: identity_sources(),
-            vin: Some(TARGET_VIN.to_owned()),
+            vin: vin.map(|vin| crate::journal::Vin::new(vin.to_owned())),
         }
     }
 
@@ -2271,9 +2289,20 @@ mod tests {
         limits: JobLimits,
         prepare: impl FnOnce(&mut FlashHost),
     ) -> Result<VmState, JobError> {
+        first_run_for(program, dir, limits, Some(TARGET_VIN), prepare)
+    }
+
+    /// [`first_run`] for a job that targets `vin`.
+    fn first_run_for(
+        program: &Program,
+        dir: &std::path::Path,
+        limits: JobLimits,
+        vin: Option<&str>,
+        prepare: impl FnOnce(&mut FlashHost),
+    ) -> Result<VmState, JobError> {
         let mut host = FlashHost::new(Rc::new(Cell::new(0)));
         prepare(&mut host);
-        let mut journal = JobJournal::create(file_setup(dir)).unwrap();
+        let mut journal = JobJournal::create(file_setup_for(dir, vin)).unwrap();
         run_on(
             program,
             &mut host,
@@ -2285,7 +2314,12 @@ mod tests {
 
     /// A first run whose erase response is lost: an interrupted transfer.
     fn interrupted(program: &Program, dir: &std::path::Path) {
-        let result = first_run(program, dir, JobLimits::default(), |host| {
+        interrupted_for(program, dir, Some(TARGET_VIN));
+    }
+
+    /// [`interrupted`] for a job that targets `vin`.
+    fn interrupted_for(program: &Program, dir: &std::path::Path, vin: Option<&str>) {
+        let result = first_run_for(program, dir, JobLimits::default(), vin, |host| {
             host.lose_routine = Some(0xFF00);
         });
         assert!(
@@ -2318,7 +2352,8 @@ mod tests {
             &AtomicBool::new(cancelled),
             Journal::open(dir, &job_key()),
             identity_sources(),
-            vin,
+            vin.map(|vin| crate::journal::Vin::new(vin.to_owned()))
+                .as_ref(),
         )
     }
 
@@ -2515,7 +2550,7 @@ mod tests {
                 &cancelled,
                 Journal::open(&dir, &job_key()),
                 identity_sources(),
-                Some(TARGET_VIN),
+                Some(&target()),
             );
             assert!(
                 matches!(result, Err(JobError::Cancelled)),
@@ -2547,7 +2582,7 @@ mod tests {
         prepare: impl FnOnce(&mut FlashHost),
     ) -> (Result<VmState, JobError>, FlashHost) {
         let dir = journal_dir("resume-gates");
-        interrupted(program, &dir);
+        interrupted_for(program, &dir, vin);
         let mut host = FlashHost::new(Rc::new(Cell::new(0)));
         host.voltage = Some(12_600);
         prepare(&mut host);
@@ -2899,9 +2934,54 @@ mod tests {
 
     #[test]
     fn the_journal_setup_debug_output_hides_the_vin() {
-        let setup = file_setup(std::path::Path::new("/tmp/x"));
+        let dir = journal_dir("debug-vin");
+        let setup = file_setup(&dir);
         assert!(setup.vin.is_some());
         assert!(!format!("{setup:?}").contains(TARGET_VIN));
+        let journal = JobJournal::create(setup).unwrap();
+        let state = journal.journal().state();
+        assert!(state.facts.target_vin.is_some());
+        assert!(!format!("{state:?} {:?}", state.facts).contains(TARGET_VIN));
+        drop(journal);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A resume that names another target VIN than the journal recorded, or one where either
+    /// side names none, is on-site intervention: nothing is sent and no resume is counted.
+    #[test]
+    fn a_resume_naming_another_target_vin_sends_nothing_and_counts_nothing() {
+        let program = flash_program();
+        let cases: [(Option<&str>, Option<&str>); 3] = [
+            (Some(TARGET_VIN), Some("WDB99999999999999")),
+            (Some(TARGET_VIN), None),
+            (None, Some(TARGET_VIN)),
+        ];
+        for (recorded, named) in cases {
+            let dir = journal_dir("resume-vin-differs");
+            interrupted_for(&program, &dir, recorded);
+            let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+            let result = resume_for(&program, &dir, &mut host, false, named);
+            assert!(
+                matches!(
+                    result,
+                    Err(JobError::OnSiteInterventionRequired(
+                        OnSiteReason::TargetVinDiffers
+                    ))
+                ),
+                "{recorded:?} {named:?}: {result:?}"
+            );
+            assert_eq!(host.sent(), []);
+            assert_eq!(resumes(&dir), 0);
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+        // The same VIN goes on to the gates.
+        let dir = journal_dir("resume-vin-same");
+        interrupted(&program, &dir);
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        let result = resume(&program, &dir, &mut host, false);
+        assert_eq!(teardown_of(&result), restart::TeardownGate::ResetAllowed);
+        assert_eq!(resumes(&dir), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -2919,7 +2999,7 @@ mod tests {
             &cancelled,
             Journal::open(&dir, &job_key()),
             identity_sources(),
-            Some(TARGET_VIN),
+            Some(&target()),
         );
         assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
         assert_eq!(host.sent(), [read_of([0xF1, 0x90]), read_of([0xF1, 0x91])]);
@@ -2942,7 +3022,7 @@ mod tests {
             &cancelled,
             Journal::open(&dir, &job_key()),
             identity_sources(),
-            Some(TARGET_VIN),
+            Some(&target()),
         );
         assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
         assert_eq!(host.sent(), [read_of([0xF1, 0x90])]);
@@ -2979,7 +3059,13 @@ mod tests {
             let commits = Rc::new(Cell::new(0));
             let mut host = FlashHost::new(Rc::clone(&commits));
             host.lose_routine = Some(0xFF00);
-            let mut journal = counting_journal(&commits, fail_at);
+            let store = CountingStore {
+                commits: Rc::clone(&commits),
+                fail_at,
+            };
+            let mut inner = crate::journal::Journal::on_store(store, job_key());
+            inner.commit_target_vin(&target()).unwrap();
+            let mut journal = JobJournal::new(inner, identity_sources());
             let result = run_on(
                 &program,
                 &mut host,
@@ -3002,7 +3088,7 @@ mod tests {
             &AtomicBool::new(false),
             Ok(journal),
             identity_sources(),
-            Some(TARGET_VIN),
+            Some(&target()),
         );
         assert!(matches!(result, Err(JobError::Journal(_))), "{result:?}");
         assert_eq!(host.sent(), []);
@@ -3057,7 +3143,7 @@ mod tests {
         );
         assert_eq!(host.sent(), []);
 
-        drop(Journal::create(&dir, &job_key()).unwrap());
+        drop(Journal::create(&dir, &job_key(), None).unwrap());
         std::fs::write(journal_file(&dir), b"not a journal").unwrap();
         let result = resume(&program, &dir, &mut host, false);
         assert!(

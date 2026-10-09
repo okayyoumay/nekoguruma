@@ -116,11 +116,13 @@ pub enum OnSiteReason {
     /// Step 3a could not establish an identity in the default session (ADR-229 item 2 step 3):
     /// the ECU gave no answer, a negative response or an undecodable value, or the journal or the
     /// program lacks what the comparison needs. `identity` is the one that failed; the VIN is
-    /// checked first, the hardware identity only after the VIN matched. A decoded identity that
-    /// differs is not this reason but [`JobError::IdentityMismatch`].
+    /// checked first, the hardware identity only after the VIN matched. `teardown` is how the
+    /// download was ended first, so the technician knows whether an ECUReset was sent. A decoded
+    /// identity that differs is not this reason but [`JobError::IdentityMismatch`].
     IdentityNotEstablished {
         flash_session: u32,
         identity: IdentityKind,
+        teardown: Teardown,
     },
     /// The ECU could not be confirmed back in its default session (ADR-229 item 2 step 2b-2,
     /// ADR-265): the confirmation failed, and so did the one after the passive teardown, or the
@@ -499,12 +501,14 @@ where
 ///   journal's. Different bytes are [`JobError::IdentityMismatch`]; anything else is
 ///   [`OnSiteReason::IdentityNotEstablished`].
 ///
-/// A cancel stops it at the start, before and right after every read. Nothing here sends anything
-/// but ReadDataByIdentifier requests through the declared sources. No VIN is put in a log message
+/// `teardown` is the step 2b-1 outcome, which every [`OnSiteReason::IdentityNotEstablished`]
+/// carries. A cancel stops it at the start, before and right after every read. Nothing here sends
+/// anything but ReadDataByIdentifier requests through the declared sources. No VIN is put in a log message
 /// or a result (design 16.2).
 pub(crate) fn check_identity<H>(
     program: &Program,
     point: &RestartPoint,
+    teardown: &Teardown,
     sources: &ServiceSources,
     host: &mut H,
     cancelled: &AtomicBool,
@@ -518,6 +522,7 @@ where
             OnSiteReason::IdentityNotEstablished {
                 flash_session: point.flash_session,
                 identity,
+                teardown: teardown.clone(),
             },
         ))
     };

@@ -285,11 +285,12 @@ sources, with a cancel check at the start and around each read:
   `JobError::IdentityMismatch { identity: Vin }`. Anything else (no target VIN or no declared
   source, no answer, a negative response, a value that is not a well-formed VIN, a worker
   failure) ends it in `OnSiteInterventionRequired(IdentityNotEstablished { flash_session,
-  identity: Vin })`;
+  identity: Vin, teardown })`, where `teardown` is step 2b-1's outcome, so the technician
+  knows whether an ECUReset was sent;
 - the hardware identity, only after the VIN matched: the raw field bytes must equal the
   journal's. Different bytes end the job in `IdentityMismatch { identity: HardwarePartNumber }`,
   and anything else (no recorded value or source, no answer, a negative response, a worker
-  failure) in `IdentityNotEstablished { identity: HardwarePartNumber }`.
+  failure) in `IdentityNotEstablished { identity: HardwarePartNumber, teardown }`.
 
 A job that passes ends in `RestartOrderUnavailable { flash_session, teardown, confirmed }`. The
 reads put no VIN in a log message or a result.

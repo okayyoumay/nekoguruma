@@ -623,9 +623,15 @@ where
                 poll,
                 cancelled,
             )?;
-            restart::check_identity(program, &point, &sources, host, cancelled, |vin| {
-                promote_to_vehicle(guards, vin, poll, cancelled)
-            })?;
+            restart::check_identity(
+                program,
+                &point,
+                &teardown,
+                &sources,
+                host,
+                cancelled,
+                |vin| promote_to_vehicle(guards, vin, poll, cancelled),
+            )?;
             Err(JobError::OnSiteInterventionRequired(
                 OnSiteReason::RestartOrderUnavailable {
                     flash_session: point.flash_session,
@@ -3007,27 +3013,36 @@ mod tests {
         let mut no_source = flash_program();
         no_source.identity.vin = None;
         let (result, host) = restart_with(&no_source, Some(TARGET_VIN), |_| {});
-        assert_not_established(&result, IdentityKind::Vin);
+        assert_eq!(
+            assert_not_established(&result, IdentityKind::Vin),
+            passive_gate(restart::PassiveReason::VinNotEstablished)
+        );
         assert_eq!(host.sent(), []);
     }
 
     /// The restart ended in on-site intervention because step 3a could not establish `identity`.
-    fn assert_not_established(result: &Result<VmState, JobError>, identity: IdentityKind) {
-        assert!(
-            matches!(
-                result,
-                Err(JobError::OnSiteInterventionRequired(
-                    OnSiteReason::IdentityNotEstablished { flash_session: 1, identity: got }
-                )) if *got == identity
-            ),
-            "{result:?}"
-        );
+    /// Gives the teardown the reason carries.
+    fn assert_not_established(
+        result: &Result<VmState, JobError>,
+        identity: IdentityKind,
+    ) -> restart::Teardown {
+        match result {
+            Err(JobError::OnSiteInterventionRequired(OnSiteReason::IdentityNotEstablished {
+                flash_session: 1,
+                identity: got,
+                teardown,
+            })) if *got == identity => teardown.clone(),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
     fn a_job_without_a_vin_reads_nothing_and_establishes_nothing() {
         let (result, host) = restart_with(&flash_program(), None, |_| {});
-        assert_not_established(&result, IdentityKind::Vin);
+        assert_eq!(
+            assert_not_established(&result, IdentityKind::Vin),
+            passive_gate(restart::PassiveReason::VinNotEstablished)
+        );
         assert_eq!(host.sent(), []);
     }
 
@@ -3065,7 +3080,10 @@ mod tests {
         let mut no_source = flash_program();
         no_source.identity.hardware_part_number = None;
         let (result, host) = restart_with(&no_source, Some(TARGET_VIN), |_| {});
-        assert_not_established(&result, IdentityKind::HardwarePartNumber);
+        assert_eq!(
+            assert_not_established(&result, IdentityKind::HardwarePartNumber),
+            passive_gate(restart::PassiveReason::HardwareIdentityNotEstablished)
+        );
         assert_eq!(host.sent(), [read_of([0xF1, 0x90]), read_of([0xF1, 0x90])]);
     }
 
@@ -3275,7 +3293,10 @@ mod tests {
             field_id: 9,
         });
         let (result, host) = restart_with(&program, Some(TARGET_VIN), |_| {});
-        assert_not_established(&result, IdentityKind::Vin);
+        assert_eq!(
+            assert_not_established(&result, IdentityKind::Vin),
+            passive_gate(restart::PassiveReason::VinNotEstablished)
+        );
         assert_eq!(host.sent(), []);
     }
 
@@ -3293,11 +3314,19 @@ mod tests {
                 host.vin_script = [IdAnswer::value(answer)].into();
             });
             assert_eq!(teardown_of(&result), passive, "{answer}");
-            assert_eq!(host.sent().first(), Some(&read_of([0xF1, 0x90])));
+            // The gates' read of the malformed VIN, then step 3a's good one and its hardware read.
+            assert_eq!(
+                host.sent(),
+                [read_vin(), read_vin(), read_hardware()],
+                "{answer}"
+            );
         }
         // A target VIN that is not well-formed is not read for at all.
         let (result, host) = restart_with(&flash_program(), Some("SHORT"), |_| {});
-        assert_not_established(&result, IdentityKind::Vin);
+        assert_eq!(
+            assert_not_established(&result, IdentityKind::Vin),
+            passive_gate(restart::PassiveReason::VinNotEstablished)
+        );
         assert_eq!(host.sent(), []);
     }
 
@@ -3422,8 +3451,18 @@ mod tests {
                 passive(restart::PassiveCause::ResetOutcomeUnknown),
                 "{answer:?}"
             );
-            // The reset is the third request: after the gates' reads, before step 3a's.
-            assert_eq!(host.sent().get(2), Some(&reset_sent()), "{answer:?}");
+            // The reset comes after the gates' reads and before step 3a's.
+            assert_eq!(
+                host.sent(),
+                [
+                    read_vin(),
+                    read_hardware(),
+                    reset_sent(),
+                    read_vin(),
+                    read_hardware()
+                ],
+                "{answer:?}"
+            );
             assert!(elapsed >= session_wait(), "{answer:?}: {elapsed:?}");
         }
     }
@@ -3632,7 +3671,16 @@ mod tests {
             )
         );
         assert_eq!(host.session_reads.len(), 1);
-        assert_eq!(host.sent().get(2), Some(&reset_sent()));
+        assert_eq!(
+            host.sent(),
+            [
+                read_vin(),
+                read_hardware(),
+                reset_sent(),
+                read_vin(),
+                read_hardware()
+            ]
+        );
     }
 
     /// A refused ECUReset makes the teardown passive; the ECU is then confirmed, with no
@@ -4156,6 +4204,7 @@ mod tests {
         let result = restart::check_identity(
             program,
             &point,
+            &restart::Teardown::Reset,
             &identity_sources(),
             &mut host,
             &AtomicBool::new(false),
@@ -4233,7 +4282,8 @@ mod tests {
                 let text = format!("{error} {error:?}");
                 assert!(!text.contains("WDB"), "{name}: {text}");
             } else {
-                assert_not_established(&result, IdentityKind::Vin);
+                let teardown = assert_not_established(&result, IdentityKind::Vin);
+                assert_eq!(teardown, restart::Teardown::Reset, "{name}");
             }
             assert_eq!(
                 full_log(&host),
@@ -4275,6 +4325,9 @@ mod tests {
             ("different", IdAnswer::value("HW02"), true),
             ("refused", IdAnswer::Refuse, false),
             ("worker failure", IdAnswer::Fail, false),
+            // Shorter than the 4 bytes the table declares, and bytes that are not ASCII text.
+            ("short", IdAnswer::value("HW0"), false),
+            ("undecodable", IdAnswer::Value(vec![0x00; 4]), false),
         ];
         for (name, answer, differs) in cases {
             let (result, host) = restart_with(&flash_program(), Some(TARGET_VIN), |host| {
@@ -4291,7 +4344,8 @@ mod tests {
                     "{name}: {result:?}"
                 );
             } else {
-                assert_not_established(&result, IdentityKind::HardwarePartNumber);
+                let teardown = assert_not_established(&result, IdentityKind::HardwarePartNumber);
+                assert_eq!(teardown, restart::Teardown::Reset, "{name}");
             }
             assert_eq!(
                 full_log(&host),
@@ -4316,12 +4370,17 @@ mod tests {
         assert_eq!(promotions, 1);
     }
 
+    /// [`assert_not_established`] for step 3a on its own, which was given `Teardown::Reset`.
     fn assert_not_established_check(result: &Result<(), JobError>, identity: IdentityKind) {
         assert!(
             matches!(
                 result,
                 Err(JobError::OnSiteInterventionRequired(
-                    OnSiteReason::IdentityNotEstablished { flash_session: 1, identity: got }
+                    OnSiteReason::IdentityNotEstablished {
+                        flash_session: 1,
+                        identity: got,
+                        teardown: restart::Teardown::Reset,
+                    }
                 )) if *got == identity
             ),
             "{result:?}"
@@ -4381,6 +4440,7 @@ mod tests {
         let result = restart::check_identity(
             &program,
             &point,
+            &restart::Teardown::Reset,
             &identity_sources(),
             &mut host,
             &AtomicBool::new(false),
@@ -4404,6 +4464,7 @@ mod tests {
             let result = restart::check_identity(
                 &program,
                 &point,
+                &restart::Teardown::Reset,
                 &identity_sources(),
                 host,
                 cancelled,
@@ -4466,6 +4527,65 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// Step 2 cannot read the VIN and takes no lock; another job holds the vehicle. Step 3a's
+    /// matching VIN read makes the restart wait in the promotion: nothing more is sent (no hardware
+    /// read) and the guard slot is not locked. A cancel then ends it in `Cancelled`, with the
+    /// guards back in the slot and without the vehicle.
+    #[test]
+    fn step_3a_waits_for_the_vehicle_and_a_cancel_ends_the_wait() {
+        let program = flash_program();
+        let dir = journal_dir("identity-wait");
+        interrupted(&program, &dir);
+        let _other = other_job_holding_the_vehicle(&dir);
+        let slot: GuardSlot = Arc::new(Mutex::new(Some(take_guards(&dir))));
+        let mirror = Arc::new(Mutex::new(Vec::new()));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let job = {
+            let (program, dir) = (program.clone(), dir.clone());
+            let (slot, mirror, cancelled) = (
+                Arc::clone(&slot),
+                Arc::clone(&mirror),
+                Arc::clone(&cancelled),
+            );
+            std::thread::spawn(move || {
+                let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+                host.mirror = Some(mirror);
+                host.vin_script = [IdAnswer::Refuse].into();
+                resume_on(
+                    &program,
+                    &mut host,
+                    JobLimits::default(),
+                    &cancelled,
+                    Journal::open(&dir, &job_key()),
+                    identity_sources(),
+                    Some(&target()),
+                    &slot,
+                )
+            })
+        };
+
+        // The guards are out of the slot, which can be locked: the job waits for the vehicle.
+        wait_until(|| slot.try_lock().is_ok_and(|slot| slot.is_none()));
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!job.is_finished());
+        let sent = mirror.lock().unwrap().clone();
+        assert_eq!(
+            sent,
+            [read_vin(), read_of([0xF1, 0x86]), read_vin()],
+            "no hardware read while the job waits"
+        );
+
+        cancelled.store(true, Ordering::Relaxed);
+        let result = job.join().unwrap();
+        assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
+        assert_eq!(*mirror.lock().unwrap(), sent);
+        let guards = slot.lock().unwrap().take().unwrap();
+        assert!(!guards.holds_vehicle());
+        assert!(guards.holds_slot());
+        drop(guards);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// Step 2 already promoted: step 3a promotes again, and guards that hold the vehicle go on at
     /// once (the restart is not blocked by its own lock).
     #[test]
@@ -4481,6 +4601,7 @@ mod tests {
         let result = restart::check_identity(
             &program,
             &point,
+            &restart::Teardown::Reset,
             &identity_sources(),
             &mut host,
             &AtomicBool::new(false),

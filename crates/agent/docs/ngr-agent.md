@@ -112,8 +112,9 @@ changes the file. The journal only records; committing an intent marker before t
 commit fails, are the job runner's duties.
 
 `agent::run_program_journaled` is the runner that keeps it (ADR-252). It takes a
-`JournalSetup` (directory, job key, and the `ServiceSources` table for the ECU's identity) and
-the job's guards ("Job guards" below), which it returns with the result, and,
+`JournalSetup` (directory, job key, the `ServiceSources` table for the ECU's identity, and
+the VIN the job targets, which a restart compares against) and the job's guards ("Job guards"
+below), which it returns with the result, and,
 for a program with a flash recovery plan, creates the journal once the link is open and the
 policy allows the program, before anything is sent to the ECU; a program without a plan keeps
 none. A journal that already exists ends the job with nothing sent: a job that ran before goes
@@ -176,7 +177,7 @@ ECU, it opens the job's journal (`Journal::open`) and classifies it.
 |---|---|
 | plain start | runs the program from its start on the same journal; its step count starts at `restart::next_steps`, after the journal's last record, and the identity is read again. A program without a plan runs without a journal, when it has none or one that records no transfer |
 | `OnSiteInterventionRequired` | ends in `JobError::OnSiteInterventionRequired` with the classification's reason; nothing is sent |
-| `Restart` | runs `restart::check_before_ecu`, then ends in `JobError::OnSiteInterventionRequired(RestartOrderUnavailable)`, because the rest of the restart order (teardown, ECU state check, replay) does not run in the agent; nothing is sent to the ECU |
+| `Restart` | runs `restart::check_before_ecu`, then the gates of `restart::check_gates`, then ends in `JobError::OnSiteInterventionRequired(RestartOrderUnavailable)` carrying the gates' decision, because the rest of the restart order (teardown, ECU state check, replay) does not run in the agent; only the gates' reads reach the ECU |
 
 `check_before_ecu` is the part of ADR-229 item 2 step 1 that an agent without a server makes:
 
@@ -193,6 +194,27 @@ at the limit. A second resume of a job whose journal another run holds ends in
 `JobError::Journal(JournalError::InUse)` before the classification, with nothing sent. The start
 deadline (a server's job instruction carries it) and a server reservation are not part of this
 entry.
+
+`check_gates` is ADR-229 item 2 step 2 before the teardown (ADR-261). It reads only, and stops
+at the first gate that does not hold:
+
+1. The VIN, through the program's VIN source, against the VIN the job names
+   (`JournalSetup::vin`). A VIN that decodes to another vehicle ends the job in
+   `JobError::IdentityMismatch`. No answer, a negative response, a value that does not decode,
+   or a job that names no VIN (which reads nothing) gives `PassiveOnly(VinNotEstablished)`.
+2. The ECU's hardware part number, against the bytes the journal recorded before the erase. A
+   different one gives `PassiveOnly(HardwareIdentityDiffers)`, one that cannot be read (or no
+   recorded value) `PassiveOnly(HardwareIdentityNotEstablished)`. It aborts only in the later
+   check in the default session.
+3. Each declared safety precondition (voltage, external supply, ignition, engine, vehicle
+   speed), from its default-session source and, when that gives no value, from a different
+   programming-session source, since the ECU's session is not known yet. A value outside the
+   declared range, or none (no source, an unmapped one, no answer), gives
+   `PassiveOnly(Precondition(kind))`.
+
+When all hold the decision is `ResetAllowed`. A failure to use the worker during a read counts
+as a read that gave no value. Neither the error nor the log carries a VIN. A cancel stops the
+gates before and after each read.
 
 ## Job guards
 

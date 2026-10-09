@@ -30,7 +30,8 @@ use crate::restart::{self, OnSiteReason, RestartDecision};
 pub struct JobLimits {
     /// Steps after which the job is stopped, against a procedure that never ends.
     pub max_steps: u64,
-    /// Pause between polls of a `Wait` instruction; at least 1 ms is used.
+    /// Pause between polls of a `Wait` instruction, and between attempts of a restart's wait for
+    /// the per-vehicle lock (ADR-263); at least 1 ms is used.
     pub wait_poll: Duration,
 }
 
@@ -105,8 +106,8 @@ pub enum JobError {
     #[error("the job thread panicked")]
     Panicked,
     /// A restart could not take the per-vehicle lock right after the ECU's VIN matched
-    /// (ADR-263): the lock file failed, the guards cannot take a vehicle, or they were not in
-    /// the job's slot. Only ReadDataByIdentifier requests were sent by then, so ending the job
+    /// (ADR-263): the lock file failed or the guards cannot take a vehicle (an empty guard slot
+    /// is [`JobError::GuardsMissing`]). Only ReadDataByIdentifier requests were sent by then, so ending the job
     /// here leaves the ECU unchanged. A cancel during the wait is [`JobError::Cancelled`]. The
     /// message carries no VIN (design 16.2).
     #[error("the per-vehicle lock could not be taken: {0}")]
@@ -2090,6 +2091,18 @@ mod tests {
         }
     }
 
+    /// A slot holding VCI-only guards in `dir`'s lock directory, which the test removes with
+    /// `dir`: a restart whose VIN matches sweeps the 4096 vehicle lock files into it.
+    fn dir_slot(dir: &std::path::Path) -> GuardSlot {
+        let guards = JobGuards::take_vci_only(
+            &guard_setup(dir),
+            Duration::from_millis(1),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        Arc::new(Mutex::new(Some(guards)))
+    }
+
     /// A slot holding VCI-only guards in a lock directory of its own, for a test that calls
     /// `run_job` directly.
     fn vci_only_slot(tag: &str) -> GuardSlot {
@@ -2425,7 +2438,7 @@ mod tests {
         cancelled: bool,
         vin: Option<&str>,
     ) -> Result<VmState, JobError> {
-        resume_in(program, dir, host, cancelled, vin, &vci_only_slot("resume"))
+        resume_in(program, dir, host, cancelled, vin, &dir_slot(dir))
     }
 
     /// [`resume_for`] with the job's guard slot given.
@@ -2644,7 +2657,7 @@ mod tests {
                 Journal::open(&dir, &job_key()),
                 identity_sources(),
                 Some(&target()),
-                &vci_only_slot("resume-cancel"),
+                &dir_slot(&dir),
             );
             assert!(
                 matches!(result, Err(JobError::Cancelled)),
@@ -2738,7 +2751,11 @@ mod tests {
             panic!("{result:?}");
         };
         assert_eq!(*identity, IdentityKind::Vin);
-        assert!(!format!("{error} {error:?}").contains("WDB"));
+        let text = format!("{error} {error:?}");
+        let bucket = format!("{:03x}", crate::guards::vehicle_bucket(&target()));
+        assert!(!text.contains("WDB"), "{text}");
+        assert!(!text.contains("vehicle-"), "{text}");
+        assert!(!text.contains(&bucket), "{text}");
         assert_eq!(host.sent(), [read_of([0xF1, 0x90])]);
     }
 
@@ -3094,7 +3111,7 @@ mod tests {
             Journal::open(&dir, &job_key()),
             identity_sources(),
             Some(&target()),
-            &vci_only_slot("resume"),
+            &dir_slot(&dir),
         );
         assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
         assert_eq!(host.sent(), [read_of([0xF1, 0x90]), read_of([0xF1, 0x91])]);
@@ -3118,7 +3135,7 @@ mod tests {
             Journal::open(&dir, &job_key()),
             identity_sources(),
             Some(&target()),
-            &vci_only_slot("resume"),
+            &dir_slot(&dir),
         );
         assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
         assert_eq!(host.sent(), [read_of([0xF1, 0x90])]);
@@ -3376,7 +3393,11 @@ mod tests {
         let Err(error @ JobError::VehicleLock(_)) = &result else {
             panic!("{result:?}");
         };
-        assert!(!format!("{error} {error:?}").contains("WDB"));
+        let text = format!("{error} {error:?}");
+        let bucket = format!("{:03x}", crate::guards::vehicle_bucket(&target()));
+        assert!(!text.contains("WDB"), "{text}");
+        assert!(!text.contains("vehicle-"), "{text}");
+        assert!(!text.contains(&bucket), "{text}");
         assert_eq!(host.sent(), [read_of([0xF1, 0x90])]);
         let guards = slot.lock().unwrap().take().unwrap();
         assert!(!guards.holds_vehicle());
@@ -3532,7 +3553,12 @@ mod tests {
         let mut host = FlashHost::new(Rc::new(Cell::new(0)));
         resume(&plain, &dir, &mut host, false).expect("the program runs");
         assert_eq!(host.sent().len(), 2);
-        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        // Only the guards' lock directory: no journal was created.
+        let entries: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, ["locks"]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

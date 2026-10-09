@@ -1,7 +1,7 @@
 # ADR-228: Library Resolution from Fixed Locations, Shared by Agent and Worker
 
 **Date:** 2026-10-04
-**Status:** Accepted
+**Status:** Accepted (the Linux definition format and the shared crate's name settled by ADR-266)
 **Affects:** `docs/system-architecture.md` (4, 4.2, 7.1.1, 7.2, 7.3, 9.2, 9.3, 9.4, 11, 11.1, 16.1), `api/openapi.yaml`, `schemas/extension-manifest.*`, `db/migrations/0002_extensions_without_vci_profile.sql`, `crates/vci-discovery`, `crates/vci-service-config`, `crates/j2534-0404-registry`, `crates/worker-host`, worker services
 
 ## Context

@@ -15,7 +15,7 @@ ngr-agent run --vci <name> --program <file> [--workers <dir>] [--locks <dir>] [-
 | `--vci` | J2534 v04.04 library name, as the worker service resolves it (registry key on Windows, `library_path` entry in the service's `config.toml`) |
 | `--program` | IR program file: a `diag_ir::Program` serialized as JSON |
 | `--workers` | Directory of worker builds, laid out as `<dir>/<ABI name>/j2534-0404-service[.exe]` (design 7.3). Default: `workers` next to the `ngr-agent` executable |
-| `--locks` | The device's lock directory for the job's guards ("Job guards" below), as an absolute path. Default: `locks` next to the `ngr-agent` executable. Lock files are opened read-only, so a file another user created still locks. The agent creates a missing directory writable by its owner only, so a device whose agents run as several users needs it prepared beforehand: writable by all of them, and with the sticky bit (or an equivalent ACL) so that no user can delete another's lock files (ADR-257). It must also be readable by every agent user, since the per-vehicle lock lists it (ADR-262). On Unix a directory that group or others may write without the sticky bit, or without being readable by them, is refused |
+| `--locks` | The device's lock directory for the job's guards ("Job guards" below), as an absolute path. Default: `locks` next to the `ngr-agent` executable. Lock files are opened read-only, so a file another user created still locks. The agent creates a missing directory writable by its owner only, so a device whose agents run as several users needs it prepared beforehand: writable by all of them, and with the sticky bit (or an equivalent ACL) so that no user can delete another's lock files (ADR-257). It must also be readable by every agent user, since the per-vehicle lock lists it, and on Unix support hard links, with which it creates its files (ADR-262). On Unix a directory that group or others may write without the sticky bit, or without being readable by them, is refused |
 | `--tx-id`, `--rx-id` | Physical request and response CAN IDs in hex, with or without `0x`. Default `7E0` / `7E8`. Only 11-bit IDs: the link does not set the CAN ID format |
 
 The link is UDS on ISO 15765 at 500 kbit/s (`LinkConfig::iso15765`), with the CAN IDs from the
@@ -244,8 +244,9 @@ process dies, so a crashed run never blocks the next one, and the files are neve
   4096 buckets: `k` is the first two bytes of SHA-256 over the VIN, read big-endian, masked to
   their low 12 bits (a digest starting `84 b1` gives `vehicle-4b1.lock`). Before it opens its
   bucket, the call lists the lock directory and, when fewer than 4096 bucket files are present,
-  creates every missing one in bucket order (on Unix readable by everyone whatever the umask,
-  then a best-effort directory sync whose failure is only logged), so whether files
+  creates every missing one in bucket order (on Unix each made readable by everyone whatever
+  the umask before it is hard-linked to its name, then a best-effort directory sync whose
+  failure is only logged), so whether files
   are created depends only on the directory's state, never on the VIN, and neither a file's name
   nor the directory's content reveals a VIN (ADR-262). Two vehicles in one bucket exclude each
   other, which delays a job about once in 4096 concurrent pairs. Taking the vehicle the guards

@@ -43,11 +43,15 @@ which is what ADR-256 item 6 forbids.
    exactly three lowercase hex digits and `.lock`). When fewer than 4096 are present, it creates
    every missing one, in bucket order, and syncs the directory on Unix, a best-effort step for
    durability only (a failed sync is logged and does not fail the take); then it opens its own.
-   On Unix each file it creates is made readable by everyone (mode `0644`) whatever the
-   creating user's umask, since one sweep creates the file of every vehicle: an umask of `077`
-   would otherwise lock every other agent user out of every vehicle lock until an administrator
-   changed the files. The files are empty and their names carry nothing, and the directory's
-   permissions still decide who can reach them. Whether a sweep runs therefore depends on the
+   On Unix each file it creates is readable by everyone (mode `0644`) whatever the creating
+   user's umask, since one sweep creates the file of every vehicle: a umask of `077` would
+   otherwise lock every other agent user out of every vehicle lock until an administrator
+   changed the files. A file gets its name only with its final mode: it is created as a staging
+   file, given its mode and hard-linked to the bucket's name, which fails if the name exists, so
+   a crash never leaves a bucket with the creator's umask; at most a staging file remains, which
+   nothing counts or opens. The lock directory must therefore support hard links on Unix. The
+   files are empty and their names carry nothing, and the directory's permissions still decide
+   who can reach them. Whether a sweep runs therefore depends on the
    directory's state alone, never on the VIN, on every platform: a set left partial by a crash,
    a power loss, a failed sweep or a file someone else created is completed by the next take
    whichever vehicle it serves. The directory's listing says nothing about the vehicles seen

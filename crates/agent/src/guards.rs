@@ -14,9 +14,11 @@
 //! digits and `.lock`. Whether a sweep runs depends only on the directory's state, never on the
 //! VIN, so the listing says nothing about the vehicles seen; no write-ordering guarantee of the
 //! file system is relied on, and the Unix directory sync at the end of a sweep is best-effort
-//! durability. The directory must therefore be listable by every agent user (ADR-262 item 2). A
-//! job holds one vehicle (a well-formed VIN): taking that VIN again succeeds without touching the
-//! file, and any other VIN, also one of the same bucket, is refused.
+//! durability. On Unix each file is readable by everyone before it gets its name (a staging file,
+//! hard-linked to it). The directory must therefore be listable by every agent user and, on Unix,
+//! support hard links (ADR-262 item 2). A job holds one vehicle (a well-formed VIN): taking that
+//! VIN again succeeds without touching the file, and any other VIN, also one of the same bucket,
+//! is refused.
 //!
 //! Each is an exclusive OS lock (`File::try_lock`) on its own file in a lock directory the
 //! caller names. The OS releases a lock with its file handle, also when the process dies, so a
@@ -436,38 +438,81 @@ fn count_vehicle_files(dir: &Path) -> Result<usize, GuardError> {
     Ok(count)
 }
 
-/// Creates the empty vehicle lock files, all 4096 in bucket order whichever VIN asked, each
-/// readable by everyone on Unix, then syncs the directory (Unix only, best-effort durability: a
-/// failed sync is logged and does not fail the take; none on Windows). Whether it runs
-/// depends only on the directory's state (the count of bucket files), and no ordering guarantee
-/// of the file system is relied on (ADR-262 item 2). A file that exists already is left as it is.
+/// Creates the empty vehicle lock files, all 4096 in bucket order whichever VIN asked, then
+/// syncs the directory (Unix only, best-effort durability: a failed sync is logged and does not
+/// fail the take; none on Windows). Whether it runs depends only on the directory's state (the
+/// count of bucket files), and no ordering guarantee of the file system is relied on (ADR-262
+/// item 2). A file that exists already is left as it is.
 fn create_vehicle_files(dir: &Path) -> Result<(), GuardError> {
     for bucket in 0..VEHICLE_BUCKETS {
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(vehicle_path(dir, bucket as u16))
-        {
-            // On Unix the new file is made readable by everyone whatever the creator's umask:
-            // one sweep creates every bucket, so a umask of 077 would otherwise lock other agent
-            // users out of every vehicle. The file is empty and its name says nothing; who may
-            // reach it is decided by the directory's permissions (ADR-262 item 2).
-            #[cfg(unix)]
-            Ok(file) => {
-                use std::os::unix::fs::PermissionsExt;
-                file.set_permissions(std::fs::Permissions::from_mode(0o644))?;
-            }
-            #[cfg(not(unix))]
-            Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error.into()),
-        }
+        create_vehicle_file(dir, bucket as u16)?;
     }
     #[cfg(unix)]
     if let Err(error) = File::open(dir).and_then(|dir| dir.sync_all()) {
         tracing::warn!(%error, "the lock directory could not be synced after the vehicle lock files were created");
     }
     Ok(())
+}
+
+/// Creates one bucket file unless it exists. On Unix the file appears under its name only once it
+/// is readable by everyone, whatever the creator's umask: it is made as a staging file, given mode
+/// `0644` and then hard-linked to the bucket's name, which fails if the name exists. One sweep
+/// creates every bucket, so a file published with a umask of 077, also by a sweep that crashed
+/// before fixing its mode, would lock the other agent users out of that bucket for good. The file
+/// is empty and its name says nothing; who may reach it is decided by the directory's permissions
+/// (ADR-262 item 2). A crash leaves at most one staging file, which nothing counts or opens.
+#[cfg(unix)]
+fn create_vehicle_file(dir: &Path, bucket: u16) -> Result<(), GuardError> {
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::AtomicU64;
+    static STAGING: AtomicU64 = AtomicU64::new(0);
+
+    let target = vehicle_path(dir, bucket);
+    if fs::symlink_metadata(&target).is_ok() {
+        return Ok(());
+    }
+    let (staging, file) = loop {
+        let name = format!(
+            ".vehicle-staging-{}-{}.tmp",
+            std::process::id(),
+            STAGING.fetch_add(1, Ordering::Relaxed)
+        );
+        let staging = dir.join(name);
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staging)
+        {
+            Ok(file) => break (staging, file),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    };
+    let linked = file
+        .set_permissions(fs::Permissions::from_mode(0o644))
+        .and_then(|()| match fs::hard_link(&staging, &target) {
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+            other => other,
+        });
+    drop(file);
+    let removed = fs::remove_file(&staging);
+    linked?;
+    removed?;
+    Ok(())
+}
+
+/// Creates one bucket file unless it exists. On Windows it inherits the directory's ACL.
+#[cfg(not(unix))]
+fn create_vehicle_file(dir: &Path, bucket: u16) -> Result<(), GuardError> {
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(vehicle_path(dir, bucket))
+    {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// The bucket of a VIN: the low 12 bits of the first two bytes of its SHA-256 digest, read
@@ -1170,6 +1215,11 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o777, 0o644, "bucket {bucket:03x}");
         }
+        let staging: Vec<_> = listing(&dir)
+            .into_iter()
+            .filter(|name| name.contains("staging"))
+            .collect();
+        assert!(staging.is_empty(), "staging files left: {staging:?}");
         drop(guards);
         let _ = fs::remove_dir_all(&dir);
     }

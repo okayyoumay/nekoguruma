@@ -244,7 +244,8 @@ process dies, so a crashed run never blocks the next one, and the files are neve
   4096 buckets: `k` is the first two bytes of SHA-256 over the VIN, read big-endian, masked to
   their low 12 bits (a digest starting `84 b1` gives `vehicle-4b1.lock`). Before it opens its
   bucket, the call lists the lock directory and, when fewer than 4096 bucket files are present,
-  creates every missing one in bucket order (syncing the directory on Unix), so whether files
+  creates every missing one in bucket order (on Unix readable by everyone whatever the umask,
+  then a best-effort directory sync whose failure is only logged), so whether files
   are created depends only on the directory's state, never on the VIN, and neither a file's name
   nor the directory's content reveals a VIN (ADR-262). Two vehicles in one bucket exclude each
   other, which delays a job about once in 4096 concurrent pairs. Taking the vehicle the guards

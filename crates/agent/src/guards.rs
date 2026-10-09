@@ -436,8 +436,9 @@ fn count_vehicle_files(dir: &Path) -> Result<usize, GuardError> {
     Ok(count)
 }
 
-/// Creates the empty vehicle lock files, all 4096 in bucket order whichever VIN asked, then
-/// syncs the directory (Unix only, best-effort durability; none on Windows). Whether it runs
+/// Creates the empty vehicle lock files, all 4096 in bucket order whichever VIN asked, each
+/// readable by everyone on Unix, then syncs the directory (Unix only, best-effort durability: a
+/// failed sync is logged and does not fail the take; none on Windows). Whether it runs
 /// depends only on the directory's state (the count of bucket files), and no ordering guarantee
 /// of the file system is relied on (ADR-262 item 2). A file that exists already is left as it is.
 fn create_vehicle_files(dir: &Path) -> Result<(), GuardError> {
@@ -447,13 +448,25 @@ fn create_vehicle_files(dir: &Path) -> Result<(), GuardError> {
             .create_new(true)
             .open(vehicle_path(dir, bucket as u16))
         {
+            // On Unix the new file is made readable by everyone whatever the creator's umask:
+            // one sweep creates every bucket, so a umask of 077 would otherwise lock other agent
+            // users out of every vehicle. The file is empty and its name says nothing; who may
+            // reach it is decided by the directory's permissions (ADR-262 item 2).
+            #[cfg(unix)]
+            Ok(file) => {
+                use std::os::unix::fs::PermissionsExt;
+                file.set_permissions(std::fs::Permissions::from_mode(0o644))?;
+            }
+            #[cfg(not(unix))]
             Ok(_) => {}
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error.into()),
         }
     }
     #[cfg(unix)]
-    File::open(dir)?.sync_all()?;
+    if let Err(error) = File::open(dir).and_then(|dir| dir.sync_all()) {
+        tracing::warn!(%error, "the lock directory could not be synced after the vehicle lock files were created");
+    }
     Ok(())
 }
 
@@ -1137,6 +1150,27 @@ mod tests {
         again.take_vehicle(&vin(VIN_B), POLL, &never).unwrap();
         assert_eq!(listing(&dir), before);
         drop(again);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Every bucket file a sweep creates is readable by everyone, whatever the umask, so one
+    /// user's sweep does not lock the other agent users out of every vehicle (ADR-262 item 2).
+    #[cfg(unix)]
+    #[test]
+    fn the_swept_files_are_readable_by_everyone() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = dir("vehicle-modes");
+        let never = AtomicBool::new(false);
+        let mut guards = JobGuards::take_vci_only(&setup(&dir, "VCI-1"), POLL, &never).unwrap();
+        guards.take_vehicle(&vin(VIN_A), POLL, &never).unwrap();
+        for bucket in [0, 0x4b1, 0xfff] {
+            let mode = fs::metadata(vehicle_path(&dir, bucket))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o644, "bucket {bucket:03x}");
+        }
+        drop(guards);
         let _ = fs::remove_dir_all(&dir);
     }
 

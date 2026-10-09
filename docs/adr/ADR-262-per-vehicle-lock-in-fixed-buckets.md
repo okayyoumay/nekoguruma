@@ -42,7 +42,12 @@ which is what ADR-256 item 6 forbids.
    `take_vehicle` lists the lock directory and counts the bucket files (`vehicle-` followed by
    exactly three lowercase hex digits and `.lock`). When fewer than 4096 are present, it creates
    every missing one, in bucket order, and syncs the directory on Unix, a best-effort step for
-   durability only; then it opens its own. Whether a sweep runs therefore depends on the
+   durability only (a failed sync is logged and does not fail the take); then it opens its own.
+   On Unix each file it creates is made readable by everyone (mode `0644`) whatever the
+   creating user's umask, since one sweep creates the file of every vehicle: an umask of `077`
+   would otherwise lock every other agent user out of every vehicle lock until an administrator
+   changed the files. The files are empty and their names carry nothing, and the directory's
+   permissions still decide who can reach them. Whether a sweep runs therefore depends on the
    directory's state alone, never on the VIN, on every platform: a set left partial by a crash,
    a power loss, a failed sweep or a file someone else created is completed by the next take
    whichever vehicle it serves. The directory's listing says nothing about the vehicles seen
@@ -90,12 +95,12 @@ which is what ADR-256 item 6 forbids.
   so a long job on that vehicle (or bucket), such as monitoring, delays every reprogramming on
   the device until it ends.
 - The lock directory holds 4096 more empty files once a job has taken a vehicle lock there. They
-  are created with the default permissions of the user whose take creates them, like the other
-  lock files; the directory's permissions for every agent user remain an installation
-  requirement (ADR-257).
+  are owned by the user whose take creates them and, on Unix, readable by everyone (item 2); on
+  Windows they inherit the directory's ACL like the other lock files. The directory's
+  permissions for every agent user remain an installation requirement (ADR-257).
 - A sweep that fails partway leaves a partial set; the next take sweeps again. The cost of the
   trigger is one directory listing per `take_vehicle`. A shared lock directory that cannot be
-  listed (for example mode `1733`) is refused on Unix, and fails the first vehicle lock with a
+  listed (for example mode `1733`) is refused on Unix, and fails every vehicle lock with a
   permission error elsewhere; the installation must make it readable by every agent user.
 - The agent writes nothing VIN-derived to the device: no lock file's name, existence or content
   depends on a VIN. Neither `JobGuards`' `Debug` output nor the guards' errors name a bucket, so

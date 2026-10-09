@@ -173,8 +173,8 @@ pub fn classify(
 /// - the resume count, incremented and committed to `journal` with no attempt key, since a
 ///   standalone agent reserves nothing on a server.
 ///
-/// A failed check counts no resume. A cancel stops it before the voltage read and before the
-/// commit. Returns the new count. Nothing here contacts the ECU.
+/// A failed check counts no resume. A cancel stops it before the voltage read, right after it
+/// (whatever it gave) and before the commit. Returns the new count. Nothing here contacts the ECU.
 pub(crate) fn check_before_ecu<H, S>(
     program: &Program,
     point: &RestartPoint,
@@ -215,7 +215,12 @@ where
         if cancelled.load(Ordering::Relaxed) {
             return Err(JobError::Cancelled);
         }
-        let millivolts = match host.read(RuntimeInput::SupplyVoltageMillivolts) {
+        let reading = host.read(RuntimeInput::SupplyVoltageMillivolts);
+        // A cancel during the read is a cancel, whatever the read gave.
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(JobError::Cancelled);
+        }
+        let millivolts = match reading {
             Ok(Reading::Value(millivolts)) => Some(millivolts),
             Ok(_) => None,
             Err(error) => {

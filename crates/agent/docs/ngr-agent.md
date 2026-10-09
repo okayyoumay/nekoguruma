@@ -178,8 +178,8 @@ anything is sent to the ECU, it opens the job's journal (`Journal::open`) and cl
    step uses no ECU service. A reading outside the range, or none, ends in `SupplyVoltage`.
 3. The resume count, incremented and committed with no attempt key.
 
-A failed check counts no resume, and a cancel stops it before the voltage read and before the
-commit. Each crash during a recovery therefore consumes one attempt, and repeated crashes stop
+A failed check counts no resume, and a cancel stops it before the voltage read, right after it
+(whatever the read gave) and before the commit. Each crash during a recovery therefore consumes one attempt, and repeated crashes stop
 at the limit. A second resume of a job whose journal another run holds ends in
 `JobError::Journal(JournalError::InUse)` before the classification, with nothing sent. The start
 deadline (a server's job instruction carries it), the per-VCI lock, the reprogramming slot and a

@@ -791,6 +791,8 @@ mod tests {
         voltage_reads: u32,
         /// Reading the voltage fails, as a worker that cannot be reached would.
         voltage_fails: bool,
+        /// Set while the voltage is read, as a dropped job future would.
+        cancel_on_voltage: Option<Arc<AtomicBool>>,
     }
 
     impl FlashHost {
@@ -805,6 +807,7 @@ mod tests {
                 voltage: None,
                 voltage_reads: 0,
                 voltage_fails: false,
+                cancel_on_voltage: None,
             }
         }
 
@@ -818,6 +821,11 @@ mod tests {
             &mut self,
             input: diag_ir::RuntimeInput,
         ) -> Result<crate::inputs::Reading, HostError> {
+            if input == diag_ir::RuntimeInput::SupplyVoltageMillivolts
+                && let Some(flag) = &self.cancel_on_voltage
+            {
+                flag.store(true, Ordering::Relaxed);
+            }
             if input == diag_ir::RuntimeInput::SupplyVoltageMillivolts && self.voltage_fails {
                 self.voltage_reads += 1;
                 return Err(HostError::NoResponse);
@@ -2061,7 +2069,8 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// A cancel stops a restart before the voltage read, with no resume counted.
+    /// A cancel stops a restart before the voltage read, during it, or before the commit, with no
+    /// resume counted.
     #[test]
     fn a_cancelled_restart_counts_no_resume() {
         let program = flash_program_with_voltage();
@@ -2075,6 +2084,32 @@ mod tests {
         assert_eq!(host.sent(), []);
         assert_eq!(resumes(&dir), 0);
         std::fs::remove_dir_all(&dir).unwrap();
+
+        // A cancel during the read wins over what the read gave, failed or in range.
+        for fails in [true, false] {
+            let dir = journal_dir("resume-cancel-during-read");
+            interrupted(&program, &dir);
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+            host.voltage = Some(12_600);
+            host.voltage_fails = fails;
+            host.cancel_on_voltage = Some(Arc::clone(&cancelled));
+            let result = resume_on(
+                &program,
+                &mut host,
+                JobLimits::default(),
+                &cancelled,
+                Journal::open(&dir, &job_key()),
+                identity_sources(),
+            );
+            assert!(
+                matches!(result, Err(JobError::Cancelled)),
+                "{fails}: {result:?}"
+            );
+            assert_eq!(host.voltage_reads, 1);
+            assert_eq!(resumes(&dir), 0);
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
 
         // Without a voltage range, the cancel is caught before the commit.
         let program = flash_program();

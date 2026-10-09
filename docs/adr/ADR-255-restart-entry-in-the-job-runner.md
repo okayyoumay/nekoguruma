@@ -72,7 +72,8 @@ different lengths would leave a corrupt tail.
    3. **The resume count.** `Journal::commit_resume` increments it, with no attempt key.
 
    A failed check counts no resume, so a job stopped by low voltage keeps its attempts for
-   when the supply is fixed. A cancel stops step 1 before the voltage read and before the
+   when the supply is fixed. A cancel stops step 1 before the voltage read, right after it
+   (whatever the read gave, so a cancel is never reported as a voltage failure) and before the
    commit.
 
    The start deadline arrives with a server's job instruction (design 5.2). A standalone run

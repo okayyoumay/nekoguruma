@@ -103,15 +103,24 @@ pub enum OnSiteReason {
     /// resume is counted (ADR-261).
     TargetVinDiffers,
     /// The restart passed step 1 (the checks that need no ECU service, and its resume was
-    /// counted), the gates of step 2, the teardown of step 2b-1 (`teardown`) and the
-    /// default-session confirmation of step 2b-2 (`confirmed`). Step 3 (the service-dependent
-    /// checks) and the rest of ADR-229's restart order (the ECU state check, the replay to the
-    /// erase) do not run in this agent yet, so the job stops before it sends anything further that
-    /// changes the ECU (ADR-255, ADR-261, ADR-264, ADR-265).
+    /// counted), the gates of step 2, the teardown of step 2b-1 (`teardown`), the
+    /// default-session confirmation of step 2b-2 (`confirmed`) and the identity checks of step 3a
+    /// (`check_identity`). Step 3b (the ECU state check) and the rest of ADR-229's restart order
+    /// (the replay to the erase) do not run in this agent yet, so the job stops before it sends
+    /// anything further that changes the ECU (ADR-255, ADR-261, ADR-264, ADR-265).
     RestartOrderUnavailable {
         flash_session: u32,
         teardown: Teardown,
         confirmed: Confirmation,
+    },
+    /// Step 3a could not establish an identity in the default session (ADR-229 item 2 step 3):
+    /// the ECU gave no answer, a negative response or an undecodable value, or the journal or the
+    /// program lacks what the comparison needs. `identity` is the one that failed; the VIN is
+    /// checked first, the hardware identity only after the VIN matched. A decoded identity that
+    /// differs is not this reason but [`JobError::IdentityMismatch`].
+    IdentityNotEstablished {
+        flash_session: u32,
+        identity: IdentityKind,
     },
     /// The ECU could not be confirmed back in its default session (ADR-229 item 2 step 2b-2,
     /// ADR-265): the confirmation failed, and so did the one after the passive teardown, or the
@@ -475,6 +484,93 @@ where
         }
     }
     Ok(TeardownGate::ResetAllowed)
+}
+
+/// The identity checks of ADR-229 item 2 step 3a, run in the default session after
+/// `confirm_default_session`. In this order, stopping at the first that does not pass:
+/// - the VIN, required again even when step 2 matched it: the ECU's, read through the program's
+///   source, must equal the journal's target VIN. A well-formed equal VIN calls `promote` with
+///   the target VIN (always: guards that already hold the vehicle return at once, and guards that
+///   do not, because step 2 could not read the VIN, take the lock here); a well-formed VIN that
+///   differs is [`JobError::IdentityMismatch`]; anything else (no target VIN or no declared
+///   source, no answer, a negative response, a value that is not a well-formed VIN, a worker
+///   failure) is [`OnSiteReason::IdentityNotEstablished`];
+/// - the hardware identity, only after the VIN matched: the raw field bytes must equal the
+///   journal's. Different bytes are [`JobError::IdentityMismatch`]; anything else is
+///   [`OnSiteReason::IdentityNotEstablished`].
+///
+/// A cancel stops it at the start, before and right after every read. Nothing here sends anything
+/// but ReadDataByIdentifier requests through the declared sources. No VIN is put in a log message
+/// or a result (design 16.2).
+pub(crate) fn check_identity<H>(
+    program: &Program,
+    point: &RestartPoint,
+    sources: &ServiceSources,
+    host: &mut H,
+    cancelled: &AtomicBool,
+    promote: impl FnOnce(&Vin) -> Result<(), JobError>,
+) -> Result<(), JobError>
+where
+    H: DiagHost<Error = HostError> + RuntimeInputs,
+{
+    let not_established = |identity| {
+        Err(JobError::OnSiteInterventionRequired(
+            OnSiteReason::IdentityNotEstablished {
+                flash_session: point.flash_session,
+                identity,
+            },
+        ))
+    };
+    if cancelled.load(Ordering::Relaxed) {
+        return Err(JobError::Cancelled);
+    }
+
+    // The VIN.
+    let (Some(target_vin), Some(source)) = (
+        point
+            .facts
+            .target_vin
+            .as_ref()
+            .filter(|vin| Vin::is_well_formed_text(vin.as_str())),
+        program.identity.vin,
+    ) else {
+        return not_established(IdentityKind::Vin);
+    };
+    let target = target_vin.as_str();
+    match cancellable(cancelled, || resolve_source(source, sources, host))? {
+        Ok(Reading::Text(text)) if Vin::is_well_formed_text(&text) && text == target => {
+            promote(target_vin)?;
+        }
+        Ok(Reading::Text(text)) if Vin::is_well_formed_text(&text) => {
+            return Err(JobError::IdentityMismatch {
+                identity: IdentityKind::Vin,
+            });
+        }
+        Ok(_) => return not_established(IdentityKind::Vin),
+        Err(error) => {
+            tracing::warn!(%error, "the ECU's VIN could not be read after the restart");
+            return not_established(IdentityKind::Vin);
+        }
+    }
+
+    // The hardware identity.
+    let (Some(recorded), Some(source)) = (
+        point.facts.ecu_hardware_part_number.as_deref(),
+        program.identity.hardware_part_number,
+    ) else {
+        return not_established(IdentityKind::HardwarePartNumber);
+    };
+    match cancellable(cancelled, || read_field_bytes(source, sources, host))? {
+        Ok(FieldBytes::Field(bytes)) if bytes == recorded => Ok(()),
+        Ok(FieldBytes::Field(_)) => Err(JobError::IdentityMismatch {
+            identity: IdentityKind::HardwarePartNumber,
+        }),
+        Ok(_) => not_established(IdentityKind::HardwarePartNumber),
+        Err(error) => {
+            tracing::warn!(%error, "the ECU's hardware identity could not be read after the restart");
+            not_established(IdentityKind::HardwarePartNumber)
+        }
+    }
 }
 
 /// The restart's teardown (ADR-229 item 2 step 2b-1, ADR-264), run on the gates' decision `gate`.

@@ -76,6 +76,11 @@ pub enum GuardError {
          give it the sticky bit, or make it writable by its owner only"
     )]
     UnsafeDir(PathBuf),
+    #[error(
+        "the lock directory {0} may be written but not listed by other users: give every user \
+         who may write it read permission as well, since the per-vehicle lock lists it"
+    )]
+    UnlistableDir(PathBuf),
     #[error("the guards already hold the lock of another vehicle: a job serves one vehicle")]
     OtherVehicleHeld,
     #[error("the VIN is not well-formed, so it cannot name a vehicle lock")]
@@ -394,8 +399,11 @@ fn prepare_dir(dir: &Path) -> Result<(), GuardError> {
     // class that may write it must also read it.
     let unreadable =
         (mode & 0o020 != 0 && mode & 0o040 == 0) || (mode & 0o002 != 0 && mode & 0o004 == 0);
-    if (shared && !sticky) || unreadable {
+    if shared && !sticky {
         return Err(GuardError::UnsafeDir(dir.to_owned()));
+    }
+    if unreadable {
+        return Err(GuardError::UnlistableDir(dir.to_owned()));
     }
     Ok(())
 }
@@ -1170,7 +1178,7 @@ mod tests {
             assert!(
                 matches!(
                     JobGuards::take_vci_only(&setup(&dir, "VCI-1"), POLL, &never),
-                    Err(GuardError::UnsafeDir(_))
+                    Err(GuardError::UnlistableDir(_))
                 ),
                 "{mode:o} is refused"
             );

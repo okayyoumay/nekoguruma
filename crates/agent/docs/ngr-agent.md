@@ -272,21 +272,21 @@ shared by every agent process on it whichever user it runs as: each of them must
 create files in it, list it (the per-vehicle lock counts its bucket files, ADR-262) and read the
 lock files there (lock files are opened read-only).
 
-A run whose link close fails or panics, or whose open fails partway and cannot close what it
-had opened, gives its guards back marked (`JobGuards::link_unconfirmed`), whatever the job's
-own result (ADR-258). Marked guards refuse
-another run (`JobError::LinkUnconfirmed`), and dropping them keeps their locks until the
-process exits. The caller stops the worker that held the link (`WorkerProcess::stop`, which
-returns `Ok` only once the child is reaped) and then calls `JobGuards::worker_gone`, before the
-guards serve another run or are released. The runner closes the link exactly once on every
-path after it opened, a panic included. An agent killed without running its exit path still
-frees its locks while its orphaned worker tears the link down on stdin EOF; the next open of
-a device still held usually fails. On Unix
-the guards refuse a directory that group or others may write unless it has the sticky bit and
-those users may also read it (`GuardError::UnsafeDir`): another user could otherwise delete a lock file a job holds, and a
-second job would lock the new file at the same path. A directory the guards create is writable
-by its owner only. `ngr-agent run` takes the guards from `--locks` and `--vci` before it runs the
-program, and holds them until the run ends.
+A run whose link close fails or panics, or whose open fails partway and cannot close what it had
+opened, gives its guards back marked (`JobGuards::link_unconfirmed`), whatever the job's own
+result (ADR-258). Marked guards refuse another run (`JobError::LinkUnconfirmed`), and dropping
+them keeps their locks until the process exits. The caller stops the worker that held the link
+(`WorkerProcess::stop`, which returns `Ok` only once the child is reaped) and then calls
+`JobGuards::worker_gone`, before the guards serve another run or are released. The runner closes
+the link exactly once on every path after it opened, a panic included. An agent killed without
+running its exit path still frees its locks while its orphaned worker tears the link down on
+stdin EOF; the next open of a device still held usually fails. On Unix the guards refuse a
+directory that group or others may write unless it has the sticky bit and those users may also
+read it (`GuardError::UnsafeDir`, or `GuardError::UnlistableDir` for a sticky directory they
+cannot read): another user could otherwise delete a lock file a job holds, and a second job
+would lock the new file at the same path. A directory the guards create is writable by its owner
+only. `ngr-agent run` takes the guards from `--locks` and `--vci` before it runs the program,
+and holds them until the run ends.
 
 ## Restart inputs
 

@@ -96,6 +96,9 @@ pub enum OnSiteReason {
     /// counted) and the gates of step 2, which gave `teardown`. The teardown and the rest of
     /// ADR-229's restart order (the ECU state check, the replay to the erase) do not run in this
     /// agent, so the job stops before it sends anything that changes the ECU (ADR-255, ADR-261).
+    /// `ResetAllowed` rules out only the gates: the teardown still applies the journal's
+    /// exclusions of step 2 (RequestTransferExit journaled without the post-transfer steps
+    /// complete, the completed path).
     RestartOrderUnavailable {
         flash_session: u32,
         teardown: TeardownGate,
@@ -105,8 +108,11 @@ pub enum OnSiteReason {
 /// What the gates of ADR-229 item 2 step 2 allow the restart's teardown.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TeardownGate {
-    /// The VIN and the hardware identity match and every declared precondition holds: the
-    /// teardown may end the download with an ECUReset.
+    /// The VIN and the hardware identity match and every declared precondition holds: the gates
+    /// do not rule out an ECUReset. The teardown still applies the journal's exclusions of
+    /// ADR-229 item 2 step 2 (no reset once RequestTransferExit was journaled without the
+    /// post-transfer steps complete, and none on the completed path); those are the
+    /// teardown's, not the gates'.
     ResetAllowed,
     /// A gate did not pass: the teardown is passive (the agent stops TesterPresent and waits
     /// out the session timeout), with no ECUReset.
@@ -116,9 +122,10 @@ pub enum TeardownGate {
 /// The first gate that did not pass. No VIN is kept in it (design 16.2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PassiveReason {
-    /// The ECU's VIN could not be compared with the job's: the job names none, the program
-    /// declares no source, or the read gave no answer, a negative response, or a value that is
-    /// not text, or the worker failed.
+    /// The ECU's VIN could not be compared with the job's: the job names none or a VIN that is
+    /// not well-formed, the program declares no source, the table does not map it, or the read
+    /// gave no answer, a negative response, a value that is not a well-formed VIN, or the
+    /// worker failed.
     VinNotEstablished,
     /// The hardware identity could not be compared: no source is declared, the journal holds
     /// none, or the read gave no answer, a negative response, an unreadable field, or the
@@ -301,10 +308,11 @@ fn cancellable<T>(cancelled: &AtomicBool, read: impl FnOnce() -> T) -> Result<T,
 /// restart's teardown may end the download with an ECUReset. In this order, stopping at the
 /// first that does not pass:
 /// - the VIN: the ECU's, read through the program's source, must equal `vin`, the VIN the job
-///   targets. A job that names none, a program that declares no source, and a read that gives
-///   no text (no answer, a negative response, an undecodable field, a worker failure) leave the
-///   vehicle unidentified: [`PassiveReason::VinNotEstablished`], and nothing is read for a job
-///   with no VIN. A VIN that decodes but differs aborts the job
+///   targets. A job that names none or a VIN that is not well-formed (`is_vin`), a program that
+///   declares no source, a source the table does not map, and a read that gives no well-formed
+///   VIN (no answer, a negative response, an undecodable, padded or lower-case field, a worker
+///   failure) leave the vehicle unidentified: [`PassiveReason::VinNotEstablished`], and nothing
+///   is read for a job with no usable VIN. Only a well-formed VIN that differs aborts the job
 ///   ([`JobError::IdentityMismatch`]), since the ECU is another vehicle's;
 /// - the hardware identity: the ECU's, read as raw field bytes, must equal the journal's, which
 ///   was recorded before the erase;
@@ -314,7 +322,11 @@ fn cancellable<T>(cancelled: &AtomicBool, read: impl FnOnce() -> T) -> Result<T,
 ///   first and the programming-session source only when that gives no value. A value outside
 ///   the range fails at once.
 ///
-/// A cancel stops it before and right after every read. Nothing here sends anything but
+/// `ResetAllowed` rules out nothing but the gates: the teardown still applies the journal's
+/// exclusions of step 2 (no reset once RequestTransferExit was journaled without the
+/// post-transfer steps complete, none on the completed path).
+///
+/// A cancel stops it at the start, before and right after every read. Nothing here sends anything but
 /// ReadDataByIdentifier requests through the declared sources, and reads of runtime inputs. No
 /// VIN is put in a log message or a result.
 pub(crate) fn check_gates<H>(
@@ -329,14 +341,17 @@ where
     H: DiagHost<Error = HostError> + RuntimeInputs,
 {
     let passive = |reason| Ok(TeardownGate::PassiveOnly(reason));
+    if cancelled.load(Ordering::Relaxed) {
+        return Err(JobError::Cancelled);
+    }
 
     // The VIN.
-    let (Some(target), Some(source)) = (vin, program.identity.vin) else {
+    let (Some(target), Some(source)) = (vin.filter(|vin| is_vin(vin)), program.identity.vin) else {
         return passive(PassiveReason::VinNotEstablished);
     };
     match cancellable(cancelled, || resolve_source(source, sources, host))? {
-        Ok(Reading::Text(text)) if text == target => {}
-        Ok(Reading::Text(_)) => {
+        Ok(Reading::Text(text)) if is_vin(&text) && text == target => {}
+        Ok(Reading::Text(text)) if is_vin(&text) => {
             return Err(JobError::IdentityMismatch {
                 identity: IdentityKind::Vin,
             });
@@ -382,6 +397,15 @@ where
         }
     }
     Ok(TeardownGate::ResetAllowed)
+}
+
+/// Whether `text` is a well-formed VIN: 17 characters, each an ASCII digit or upper-case
+/// letter other than I, O and Q (the character set of ISO 3779).
+fn is_vin(text: &str) -> bool {
+    text.len() == 17
+        && text.bytes().all(|b| {
+            b.is_ascii_digit() || (b.is_ascii_uppercase() && !matches!(b, b'I' | b'O' | b'Q'))
+        })
 }
 
 /// Whether `precondition` holds: the first source that gives a value decides, the

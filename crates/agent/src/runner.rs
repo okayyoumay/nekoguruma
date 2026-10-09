@@ -971,6 +971,9 @@ mod tests {
         cancel_on_voltage: Option<Arc<AtomicBool>>,
         /// The answer to F190 (the VIN); `None` answers it negatively.
         vin: Option<Vec<u8>>,
+        /// Identifiers whose ReadDataByIdentifier fails, as a worker that cannot be reached
+        /// would.
+        fail_reads: Vec<[u8; 2]>,
         /// The answer to F191 (the hardware part number); `None` answers it negatively.
         hardware: Option<Vec<u8>>,
         /// The readings of the runtime inputs other than the supply voltage, which `voltage`
@@ -991,6 +994,7 @@ mod tests {
                 voltage_reads: 0,
                 voltage_fails: false,
                 cancel_on_voltage: None,
+                fail_reads: Vec::new(),
                 vin: Some(TARGET_VIN.as_bytes().to_vec()),
                 hardware: Some(b"HW01".to_vec()),
                 inputs: crate::inputs::FixedInputs::new(),
@@ -1047,6 +1051,9 @@ mod tests {
                 && payload == did
             {
                 flag.store(true, Ordering::Relaxed);
+            }
+            if service == 0x22 && self.fail_reads.iter().any(|did| payload == did) {
+                return Err(HostError::NoResponse);
             }
             match (service, payload) {
                 (0x22, [0xF1, 0x90]) => Ok(match &self.vin {
@@ -2612,7 +2619,7 @@ mod tests {
         assert_eq!(teardown_of(&result), passive);
         assert_eq!(host.sent(), [read_of([0xF1, 0x90])]);
 
-        // A VIN that is not text (blank), and one the job does not name.
+        // A VIN field that is blank, so not text.
         let (result, _) = restart_with(&flash_program(), Some(TARGET_VIN), |host| {
             host.vin = Some(vec![b' '; 17]);
         });
@@ -2787,6 +2794,105 @@ mod tests {
                 diag_ir::PreconditionKind::VehicleSpeed
             ))
         );
+    }
+
+    #[test]
+    fn a_worker_failure_in_a_gate_read_leaves_the_teardown_passive() {
+        use diag_ir::{PreconditionKind, RuntimeInput};
+        use restart::{PassiveReason, TeardownGate::PassiveOnly};
+        let (result, _) = restart_with(&flash_program(), Some(TARGET_VIN), |host| {
+            host.fail_reads = vec![[0xF1, 0x90]];
+        });
+        assert_eq!(
+            teardown_of(&result),
+            PassiveOnly(PassiveReason::VinNotEstablished)
+        );
+        let (result, _) = restart_with(&flash_program(), Some(TARGET_VIN), |host| {
+            host.fail_reads = vec![[0xF1, 0x91]];
+        });
+        assert_eq!(
+            teardown_of(&result),
+            PassiveOnly(PassiveReason::HardwareIdentityNotEstablished)
+        );
+        // A precondition read through the ECU, with the programming-session source giving
+        // nothing either.
+        let ecu = |field_id| diag_ir::Source::EcuService {
+            service_id: 1,
+            field_id,
+        };
+        let program = flash_program_with_engine(ecu(2), input(RuntimeInput::EngineRunning));
+        let (result, _) = restart_with(&program, Some(TARGET_VIN), |host| {
+            host.fail_reads = vec![[0xF1, 0x95]];
+        });
+        assert_eq!(
+            teardown_of(&result),
+            PassiveOnly(PassiveReason::Precondition(PreconditionKind::Engine))
+        );
+    }
+
+    #[test]
+    fn a_vin_source_the_table_lacks_leaves_the_teardown_passive() {
+        let mut program = flash_program();
+        program.identity.vin = Some(diag_ir::Source::EcuService {
+            service_id: 1,
+            field_id: 9,
+        });
+        let (result, host) = restart_with(&program, Some(TARGET_VIN), |_| {});
+        assert_eq!(
+            teardown_of(&result),
+            restart::TeardownGate::PassiveOnly(restart::PassiveReason::VinNotEstablished)
+        );
+        assert_eq!(host.sent(), []);
+    }
+
+    /// A VIN that is not well-formed never aborts the job, whichever side it is on.
+    #[test]
+    fn a_malformed_vin_is_not_established_and_never_aborts() {
+        let passive = restart::TeardownGate::PassiveOnly(restart::PassiveReason::VinNotEstablished);
+        for answer in [
+            "wdb12345678901234",
+            "WDB1234567890123O",
+            "WDB 2345678901234",
+        ] {
+            assert_eq!(answer.len(), 17);
+            let (result, host) = restart_with(&flash_program(), Some(TARGET_VIN), |host| {
+                host.vin = Some(answer.as_bytes().to_vec());
+            });
+            assert_eq!(teardown_of(&result), passive, "{answer}");
+            assert_eq!(host.sent(), [read_of([0xF1, 0x90])]);
+        }
+        let (result, host) = restart_with(&flash_program(), Some("SHORT"), |_| {});
+        assert_eq!(teardown_of(&result), passive);
+        assert_eq!(host.sent(), []);
+    }
+
+    #[test]
+    fn the_journal_setup_debug_output_hides_the_vin() {
+        let setup = file_setup(std::path::Path::new("/tmp/x"));
+        assert!(setup.vin.is_some());
+        assert!(!format!("{setup:?}").contains(TARGET_VIN));
+    }
+
+    #[test]
+    fn a_cancel_during_the_hardware_read_cancels_the_restart() {
+        let dir = journal_dir("resume-gates-cancel-hw");
+        let program = flash_program();
+        interrupted(&program, &dir);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        host.cancel_on_read = Some(([0xF1, 0x91], Arc::clone(&cancelled)));
+        let result = resume_on(
+            &program,
+            &mut host,
+            JobLimits::default(),
+            &cancelled,
+            Journal::open(&dir, &job_key()),
+            identity_sources(),
+            Some(TARGET_VIN),
+        );
+        assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
+        assert_eq!(host.sent(), [read_of([0xF1, 0x90]), read_of([0xF1, 0x91])]);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// A cancel during the VIN read is a cancel, whatever the read gave.

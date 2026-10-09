@@ -51,8 +51,8 @@ Several things are not settled by the design:
    it. A cancel ends the wait with nothing taken, and the caller gets `GuardError::Cancelled`.
    A blocking lock call could not be cancelled. A standalone agent has no start deadline, so
    the wait has no other end (ADR-255 item 4).
-4. **Fixed lock order: VCI, then slot.** Every job takes them in this order and holds
-   them until it ends. A job therefore never waits for a lock that comes before one it holds,
+4. **Fixed lock order: VCI, then slot.** A job that takes guards (today, a resumed write job)
+   takes them in this order and holds them until it ends. A job therefore never waits for a lock that comes before one it holds,
    and two jobs cannot each hold what the other waits for.
 5. **The caller owns the guards; a run borrows them by value.** `resume_program_journaled`
    takes a `JobGuards` and returns it with the run's result. A resume therefore cannot run
@@ -93,8 +93,7 @@ Several things are not settled by the design:
   dropped future never releases the guards while the link is still being torn down. A close
   that fails is only logged, though: the caller still gets the guards back and may release them
   while the worker holds the link.
-- Lock files stay in the lock directory: one per VCI and per vehicle the device has seen,
-  plus the slot.
+- Lock files stay in the lock directory: one per VCI the device has seen, plus the slot.
 - A lock directory on a file system without OS file locks fails every job that takes a
   guard.
 - The locks only work between jobs on one device that use the same lock directory. That is

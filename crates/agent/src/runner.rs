@@ -219,11 +219,15 @@ pub async fn run_program_journaled(
 ///   after the journal's last record (`restart::next_steps`); a program without a flash
 ///   recovery plan and without a journal runs without one;
 /// - an interrupted transfer makes the checks of `restart::check_before_ecu` (resume limit,
-///   supply voltage) and commits the incremented resume count; the rest of the restart order
-///   does not run in this agent, so the job then ends in
-///   [`JobError::OnSiteInterventionRequired`] with nothing sent to the ECU;
+///   supply voltage), commits the incremented resume count and makes the gates of
+///   `restart::check_gates` (ADR-229 item 2 step 2, ADR-261), which send only
+///   ReadDataByIdentifier requests through the declared sources and read runtime inputs, nothing
+///   that changes the ECU. The rest of the restart order does not run in this agent, so the job
+///   then ends in [`JobError::OnSiteInterventionRequired`] (`RestartOrderUnavailable`, carrying
+///   the gates' decision), or in [`JobError::IdentityMismatch`] when the ECU's VIN is another
+///   vehicle's;
 /// - a journal that rules a restart out, or a missing or unreadable one for a program with a
-///   plan, ends the job the same way, also with nothing sent.
+///   plan, ends the job in on-site intervention with nothing sent.
 ///
 /// `guards` are taken and returned as for [`run_program`]. After an agent crash or a loss of the
 /// device's power, the new run takes them with `JobGuards::take` before it calls this, waiting
@@ -2827,6 +2831,33 @@ mod tests {
         assert_eq!(
             teardown_of(&result),
             PassiveOnly(PassiveReason::Precondition(PreconditionKind::Engine))
+        );
+    }
+
+    /// A worker failure on the default-session read fails the gate; the programming-session
+    /// source, which would give an in-range value, is not tried (ADR-261 item 5).
+    #[test]
+    fn a_failed_precondition_read_does_not_fall_back() {
+        use diag_ir::{PreconditionKind, RuntimeInput};
+        let program = flash_program_with_engine(
+            diag_ir::Source::EcuService {
+                service_id: 1,
+                field_id: 2,
+            },
+            input(RuntimeInput::EngineRunning),
+        );
+        let (result, _) = restart_with(&program, Some(TARGET_VIN), |host| {
+            host.fail_reads = vec![[0xF1, 0x95]];
+            host.inputs = crate::inputs::FixedInputs::new().with(
+                RuntimeInput::EngineRunning,
+                crate::inputs::Reading::Value(0),
+            );
+        });
+        assert_eq!(
+            teardown_of(&result),
+            restart::TeardownGate::PassiveOnly(restart::PassiveReason::Precondition(
+                PreconditionKind::Engine
+            ))
         );
     }
 

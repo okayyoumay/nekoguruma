@@ -400,7 +400,7 @@ where
 }
 
 /// Whether `text` is a well-formed VIN: 17 characters, each an ASCII digit or upper-case
-/// letter other than I, O and Q (the character set of ISO 3779).
+/// letter other than I, O and Q.
 fn is_vin(text: &str) -> bool {
     text.len() == 17
         && text.bytes().all(|b| {
@@ -410,6 +410,8 @@ fn is_vin(text: &str) -> bool {
 
 /// Whether `precondition` holds: the first source that gives a value decides, the
 /// default-session one before the programming-session one (skipped when it is the same source).
+/// Only a reading that is not a value falls back to the other source; a failure to use the
+/// worker fails the gate at once (ADR-261 item 5).
 fn precondition_holds<H>(
     precondition: &Precondition,
     kind: PreconditionKind,
@@ -438,6 +440,7 @@ where
             Ok(_) => {}
             Err(error) => {
                 tracing::warn!(%error, ?kind, "a safety precondition could not be read");
+                return Ok(false);
             }
         }
     }

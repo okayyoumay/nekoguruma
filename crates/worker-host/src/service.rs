@@ -254,22 +254,38 @@ impl WorkerProcess {
             .map_err(|_| ServiceError::Timeout("control response"))?
     }
 
-    /// Asks the worker to stop and waits for it to exit; kills it if it does not.
-    pub async fn stop(mut self, grace: Duration) -> Result<(), ServiceError> {
-        let requested = self.request("stop", None).await;
+    /// Asks the worker to stop, then waits up to `grace` for it to exit; kills it if it does
+    /// not. The request itself can take up to the launch options' `request_timeout` before the
+    /// grace period starts.
+    /// `Ok` means the child was reaped, so no process of this worker is left holding the VCI:
+    /// [`Stopped::Exited`] when it exited by itself, [`Stopped::Killed`] when it had to be
+    /// killed. A stop request that failed or timed out does not make the result an `Err`, since
+    /// the wait and the kill that follow decide what became of the child. `Err` only when that
+    /// wait or kill failed, so the child's state is unknown.
+    pub async fn stop(mut self, grace: Duration) -> Result<Stopped, ServiceError> {
+        // The outcome of the request does not matter: the child is waited for either way.
+        let _ = self.request("stop", None).await;
         match tokio::time::timeout(grace, self.child.wait()).await {
             Ok(status) => {
                 status?;
+                Ok(Stopped::Exited)
             }
             Err(_) => {
+                // Tokio's `kill` also waits for the child, so it is reaped when this returns.
                 self.child.kill().await?;
+                Ok(Stopped::Killed)
             }
         }
-        match requested {
-            Ok(_) | Err(ServiceError::Exited) => Ok(()),
-            Err(e) => Err(e),
-        }
     }
+}
+
+/// How [`WorkerProcess::stop`] ended a worker that is now gone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stopped {
+    /// The worker exited within the grace period.
+    Exited,
+    /// The worker did not exit in time and was killed.
+    Killed,
 }
 
 fn parse_response(response: Value) -> Result<Value, ServiceError> {

@@ -13,7 +13,7 @@ use agent::launch::launch_j2534_worker;
 use agent::policy::{build_ceiling, writes};
 use agent::{JobLimits, LinkConfig, check_program, run_program};
 use diag_ir::{Program, Value, VmState};
-use worker_host::service::{LaunchOptions, WorkerLayout};
+use worker_host::service::{LaunchOptions, Stopped, WorkerLayout};
 
 const USAGE: &str = "\
 usage: ngr-agent run --vci <name> --program <file> [options]
@@ -200,7 +200,7 @@ async fn run(args: RunArgs) -> Result<String, String> {
     let worker = launch_j2534_worker(&args.vci, &workers, &LaunchOptions::default())
         .await
         .map_err(|error| error.to_string())?;
-    let (result, guards) = run_program(
+    let (result, mut guards) = run_program(
         worker.client,
         &args.link,
         program,
@@ -208,11 +208,25 @@ async fn run(args: RunArgs) -> Result<String, String> {
         guards,
     )
     .await;
-    // The job has closed its link whatever the result; a failed stop does not change it.
-    if let Err(error) = worker.process.stop(STOP_GRACE).await {
-        eprintln!("ngr-agent: worker did not stop cleanly: {error}");
+    // The job has closed its link whatever the result, unless its guards say otherwise
+    // (ADR-258). A stop that reaped the worker means the worker no longer holds the link; a
+    // vendor device server may still hold the device a while, which the next open detects.
+    match worker.process.stop(STOP_GRACE).await {
+        Ok(Stopped::Exited) => guards.worker_gone(),
+        Ok(Stopped::Killed) => {
+            eprintln!("ngr-agent: the worker did not stop in time and was killed");
+            guards.worker_gone();
+        }
+        // The worker's state is unknown: with an unconfirmed link, the guards stay locked when
+        // dropped, until this process exits.
+        Err(error) if guards.link_unconfirmed() => {
+            drop(guards);
+            return Err(format!("the worker may still hold the VCI: {error}"));
+        }
+        Err(error) => eprintln!("ngr-agent: worker did not stop cleanly: {error}"),
     }
-    // Released only now, with the worker gone: the VCI is free for the next job.
+    // Released only now: either the worker was reaped, or its stop failed after a confirmed
+    // close, so its link is closed either way.
     drop(guards);
     let state = result.map_err(|error| format!("job failed: {error}"))?;
     // serde_json would print such a value as `null`, which no longer reads back as the state.

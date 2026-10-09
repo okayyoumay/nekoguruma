@@ -17,6 +17,11 @@
 //! directory that group or others may write must have the sticky bit, or the guards refuse it
 //! (ADR-257). A directory the guards create is writable by its owner only.
 //!
+//! A job whose link could not be confirmed closed marks its guards ([`JobGuards::link_unconfirmed`],
+//! ADR-258): the worker may still hold the VCI, so dropping them would let another job in on a
+//! busy device. Marked guards keep their OS locks when dropped, until the process exits or
+//! [`JobGuards::worker_gone`] clears the mark.
+//!
 //! Locks are always taken in the same order (VCI, then slot when wanted), so two jobs that wait on each
 //! other cannot both hold what the other needs. Waiting polls `try_lock` and stops when the job
 //! is cancelled.
@@ -57,12 +62,14 @@ pub enum GuardError {
 }
 
 /// The guards one job holds: the per-VCI lock, and for a job that reprograms also the
-/// reprogramming slot. Dropping it releases them. It is not `Clone`, so one set of guards serves
-/// one run at a time.
+/// reprogramming slot. Dropping it releases them, unless the link of the job that used them is
+/// unconfirmed (see [`JobGuards::link_unconfirmed`]). It is not `Clone`, so one set of guards
+/// serves one run at a time.
 #[derive(Debug)]
 pub struct JobGuards {
     _vci: LockFile,
     _slot: Option<LockFile>,
+    link_unconfirmed: bool,
 }
 
 impl JobGuards {
@@ -79,6 +86,7 @@ impl JobGuards {
         Ok(Self {
             _vci: vci,
             _slot: Some(slot),
+            link_unconfirmed: false,
         })
     }
 
@@ -92,12 +100,35 @@ impl JobGuards {
         Ok(Self {
             _vci: Self::take_vci(setup, poll, cancelled)?,
             _slot: None,
+            link_unconfirmed: false,
         })
     }
 
     /// Whether these guards hold the device's reprogramming slot.
     pub fn holds_slot(&self) -> bool {
         self._slot.is_some()
+    }
+
+    /// Whether the job that used these guards could not confirm its link closed (ADR-258): the
+    /// worker may still hold the VCI. Such guards are not released when dropped, and no run
+    /// takes them, until [`JobGuards::worker_gone`].
+    pub fn link_unconfirmed(&self) -> bool {
+        self.link_unconfirmed
+    }
+
+    /// Records that the link was not confirmed closed. Sticky: only [`JobGuards::worker_gone`]
+    /// clears it.
+    pub(crate) fn mark_link_unconfirmed(&mut self) {
+        self.link_unconfirmed = true;
+    }
+
+    /// Clears the unconfirmed-link mark, so dropping the guards releases the locks again. Call it
+    /// only once the worker process that held the link has exited, for example after
+    /// `WorkerProcess::stop` returned `Ok`. That process no longer holds the link then; it does
+    /// not prove the VCI free, since a vendor device-server process can keep the device claimed
+    /// a while longer (ADR-258 items 3 and 6), which the next open detects.
+    pub fn worker_gone(&mut self) {
+        self.link_unconfirmed = false;
     }
 
     fn take_vci(
@@ -113,9 +144,26 @@ impl JobGuards {
     }
 }
 
+impl Drop for JobGuards {
+    fn drop(&mut self) {
+        if self.link_unconfirmed {
+            // Closing the files would release the locks (ADR-258); the OS releases them when
+            // this process exits.
+            tracing::error!(
+                "dropping job guards whose link was not confirmed closed: the VCI's lock \
+                 stays held until the agent exits"
+            );
+            self._vci.leak();
+            if let Some(slot) = &mut self._slot {
+                slot.leak();
+            }
+        }
+    }
+}
+
 /// A file whose exclusive OS lock this process holds while the value lives.
 #[derive(Debug)]
-struct LockFile(#[expect(dead_code, reason = "held only for its lock")] File);
+struct LockFile(Option<File>);
 
 impl LockFile {
     /// Locks `path`, waiting `poll` (at least 1 ms) between tries while another handle holds it.
@@ -127,7 +175,7 @@ impl LockFile {
                 return Err(GuardError::Cancelled);
             }
             match file.try_lock() {
-                Ok(()) => return Ok(Self(file)),
+                Ok(()) => return Ok(Self(Some(file))),
                 Err(fs::TryLockError::WouldBlock) => std::thread::sleep(poll),
                 Err(fs::TryLockError::Error(error)) => return Err(error.into()),
             }
@@ -136,6 +184,13 @@ impl LockFile {
 }
 
 impl LockFile {
+    /// Keeps the lock past the value's life: the file is never closed by this process.
+    fn leak(&mut self) {
+        if let Some(file) = self.0.take() {
+            std::mem::forget(file);
+        }
+    }
+
     /// Opens the lock file read-only, so a file another user created (with that user's default
     /// permissions) can be locked as long as it can be read: an OS lock needs no write access.
     /// Only a missing file is created, atomically: when another process creates it first, the
@@ -319,6 +374,33 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// Guards marked unconfirmed keep their locks when dropped, until `worker_gone` (ADR-258).
+    #[test]
+    fn unconfirmed_guards_keep_their_locks_until_the_worker_is_gone() {
+        let dir = dir("unconfirmed");
+        let never = AtomicBool::new(false);
+        let mut guards =
+            JobGuards::take_vci_only(&setup(&dir, "VCI-1"), POLL, &never).expect("first job");
+        assert!(!guards.link_unconfirmed());
+        guards.mark_link_unconfirmed();
+        assert!(guards.link_unconfirmed());
+        let other = setup(&dir, "VCI-1");
+        let waiter = std::thread::spawn(move || {
+            JobGuards::take_vci_only(&other, POLL, &AtomicBool::new(false))
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!waiter.is_finished(), "marked guards still exclude");
+        guards.worker_gone();
+        assert!(!guards.link_unconfirmed());
+        drop(guards);
+        let taken = waiter
+            .join()
+            .unwrap()
+            .expect("taken once the worker is gone");
+        drop(taken);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn only_a_full_take_holds_the_slot() {
         let dir = dir("holds-slot");
@@ -372,6 +454,28 @@ mod tests {
             drop(take().unwrap_or_else(|error| panic!("{mode:o} is safe: {error}")));
         }
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Marked guards that are dropped by mistake keep their locks: the files are never closed,
+    /// so another handle cannot lock them while this process lives (ADR-258).
+    #[test]
+    fn dropped_unconfirmed_guards_keep_their_locks() {
+        let dir = dir("dropped-unconfirmed");
+        let never = AtomicBool::new(false);
+        let mut guards = JobGuards::take(&setup(&dir, "VCI-1"), POLL, &never).expect("first job");
+        guards.mark_link_unconfirmed();
+        drop(guards);
+        for path in [vci_path(&dir, "VCI-1"), dir.join("reprogramming.lock")] {
+            let other = File::open(&path).unwrap();
+            assert!(
+                matches!(other.try_lock(), Err(fs::TryLockError::WouldBlock)),
+                "{} is still locked",
+                path.display()
+            );
+        }
+        // The leaked handles stay open until the test process exits, so the directory may not
+        // be removable yet (Windows).
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// A lock file another user created, which this one may only read, still locks (ADR-257).

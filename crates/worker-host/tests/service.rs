@@ -4,7 +4,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use base64::Engine as _;
-use worker_host::service::{LaunchOptions, ServiceError, ServiceKind, WorkerProcess};
+use worker_host::service::{LaunchOptions, ServiceError, ServiceKind, Stopped, WorkerProcess};
 
 fn fake() -> &'static Path {
     Path::new(env!("CARGO_BIN_EXE_fake-vci-service"))
@@ -34,7 +34,25 @@ async fn launch_provisions_key_and_reports_endpoints() {
         worker.request("no_such_method", None).await,
         Err(ServiceError::Rpc { code: -32601, .. })
     ));
-    worker.stop(Duration::from_secs(2)).await.unwrap();
+    assert_eq!(
+        worker.stop(Duration::from_secs(2)).await.unwrap(),
+        Stopped::Exited
+    );
+}
+
+/// A worker that never answers the stop request is killed after the grace period, and the
+/// failed request does not make the stop an error.
+#[tokio::test]
+async fn stop_kills_a_worker_that_ignores_the_request() {
+    let options = LaunchOptions {
+        request_timeout: Duration::from_millis(200),
+        ..LaunchOptions::default()
+    };
+    let worker = WorkerProcess::launch(fake(), ServiceKind::J2534V0404, "ignore-stop", &options)
+        .await
+        .unwrap();
+    let stopped = worker.stop(Duration::from_millis(300)).await;
+    assert!(matches!(stopped, Ok(Stopped::Killed)), "{stopped:?}");
 }
 
 #[tokio::test]

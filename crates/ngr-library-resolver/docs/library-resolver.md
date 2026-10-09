@@ -13,7 +13,7 @@ same call resolves a name on every platform. What does not depend on the standar
 
 | Module | Standard | Linux | Windows |
 |---|---|---|---|
-| `j2534_0404` | SAE J2534-1 v04.04 | definition files (below) | registry, through `j2534-0404-registry` |
+| `j2534_0404` | SAE J2534-1 v04.04 (registry: §9.2) | definition files (below) | registry, through `j2534-0404-registry` |
 
 The rest of this document describes the `j2534_0404` module; the names below are in it
 (`j2534_0404::resolve`, `j2534_0404::ResolveError`, ...).

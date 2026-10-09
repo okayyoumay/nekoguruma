@@ -621,7 +621,7 @@ On Windows, the basis for trust is that HKLM can be modified only by administrat
 
 **One resolver, checked where the library is loaded**
 
-Resolving a VCI name to a library path, and the checks above, live in one shared crate used by both the agent and the worker services. The agent uses it for discovery and to report loadability in `capabilities` (9.5); the worker service resolves the name it was started with through the same code and runs the checks itself immediately before loading, so the file that is checked is the file that is loaded. The crate holds one module per standard and J2534 version (J2534 v04.04, ISO 22900), each keeping the operating-system differences of that standard's discovery chain (7.1) behind one interface; the checks are shared by the standards (ADR-266).
+Resolving a VCI name to a library path, and the checks above, live in one shared crate used by both the agent and the worker services. The agent uses it for discovery and to report loadability in `capabilities` (9.5); the worker service resolves the name it was started with through the same code and runs the checks itself immediately before loading, so the file that is checked is the file that is loaded. The crate holds one module per standard and J2534 version (J2534 v04.04; ISO 22900-2 D-PDU API, whose root and module description files are in its installation clause and Annex F: 9.7 in the 2009 edition, 8.7 in the 2022 edition), each keeping the operating-system differences of that standard's discovery chain (7.1) behind one interface; the checks are shared by the standards (ADR-266).
 
 ### 7.3 ABI Detection and Worker Selection
 

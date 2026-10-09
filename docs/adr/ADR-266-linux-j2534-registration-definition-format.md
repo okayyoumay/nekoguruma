@@ -6,8 +6,9 @@
 
 ## Context
 
-On Windows a J2534 library is found through the registry: one key per device, with values
-such as `Name`, `Vendor`, `FunctionLibrary` and one value per supported protocol. Design
+On Windows a J2534 library is found through the registry (SAE J2534-1 v04.04 §9.2): one key
+per device, with values such as `Name`, `Vendor`, `FunctionLibrary` and one value per supported
+protocol. Design
 7.1.1 gives Linux the equivalent as registration definitions, one file per VCI in the fixed
 directory `j2534_definition_dir()` (`/etc/nekoguruma/j2534` by default, ADR-228 item 2), and
 lists their content: name, vendor, the absolute path of the library, the supported protocols

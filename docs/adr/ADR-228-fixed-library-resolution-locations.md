@@ -66,5 +66,7 @@ checked file and the loaded file can differ.
 - A VCI profile fix can no longer be pushed to agents from the server; it reaches devices only
   through the operator's package management. The server's extension-package ingestion no longer
   handles VCI profiles.
-- The shared resolver crate does not exist yet. `vci-discovery`, `vci-service-config` and
-  `j2534-0404-registry` each hold part of the logic today and are consolidated into it.
+- The shared resolver crate did not exist when this ADR was accepted; ADR-266 creates it as
+  `ngr-library-resolver`. The lookups that `vci-discovery`, `vci-service-config`,
+  `j2534-0404-registry` and `iso22900-registry` hold are consolidated into it as their callers
+  switch over.

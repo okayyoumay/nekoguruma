@@ -468,7 +468,8 @@ where
 /// A passive teardown waits `timing.session_timeout_millis + timing.teardown_margin_millis` and
 /// sends nothing meanwhile: the agent runs no TesterPresent, so there is none to stop. The wait
 /// sleeps in steps of `poll` and checks `cancelled` at the start of each; a cancel ends it in
-/// [`JobError::Cancelled`], also before the reset is sent or right after its answer.
+/// [`JobError::Cancelled`]. A cancel before the reset is sent sends none; one that arrives while
+/// the reset is on its way does not hide an accepted reset.
 pub(crate) fn teardown<H>(
     gate: TeardownGate,
     point: &RestartPoint,
@@ -492,13 +493,21 @@ where
     } else if let TeardownGate::PassiveOnly(reason) = gate {
         PassiveCause::Gate(reason)
     } else {
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(JobError::Cancelled);
+        }
         // ECUReset, sub-function hardReset; the suppress bit is not set, so a positive
-        // response comes back.
-        match cancellable(cancelled, || host.service_request(0x11, &[0x01]))? {
+        // response comes back. Once it is sent, a cancel no longer hides its outcome: an
+        // accepted reset is reported as such, and a cancel ends only the wait that follows a
+        // refused or unknown one.
+        match host.service_request(0x11, &[0x01]) {
             Ok(response) => match response.as_slice() {
                 [0x51, 0x01, ..] => return Ok(Teardown::Reset),
                 [0x7F, 0x11, nrc] if *nrc != 0x78 => PassiveCause::ResetRefused { nrc: *nrc },
-                _ => PassiveCause::ResetOutcomeUnknown,
+                other => {
+                    tracing::warn!(answer = ?other, "the ECUReset got no usable answer");
+                    PassiveCause::ResetOutcomeUnknown
+                }
             },
             Err(error) => {
                 tracing::warn!(%error, "the ECUReset got no usable answer");
@@ -506,11 +515,9 @@ where
             }
         }
     };
-    let total = Duration::from_millis(u64::from(
-        timing
-            .session_timeout_millis
-            .saturating_add(timing.teardown_margin_millis),
-    ));
+    let total = Duration::from_millis(
+        u64::from(timing.session_timeout_millis) + u64::from(timing.teardown_margin_millis),
+    );
     let deadline = Instant::now() + total;
     loop {
         if cancelled.load(Ordering::Relaxed) {
@@ -690,6 +697,8 @@ mod tests {
         FlashRecovery, IR_SCHEMA_VERSION, Idempotency, Op, RecoveryBoundaries, RecoveryTiming,
         Section,
     };
+
+    use std::sync::Arc;
 
     use super::*;
     use crate::journal::{JobKey, Journal, StageId, Store};
@@ -1100,7 +1109,7 @@ mod tests {
 
     /// A `DiagHost` over a simulated ECU: a request it does not answer is `NoResponse`. Only
     /// `service_request` is used by the teardown.
-    struct SimHost(sim_ecu::SimEcu);
+    struct SimHost(sim_ecu::SimEcu, Option<Arc<AtomicBool>>);
 
     impl DiagHost for SimHost {
         type Error = HostError;
@@ -1108,10 +1117,12 @@ mod tests {
         fn service_request(&mut self, service: u16, payload: &[u8]) -> Result<Vec<u8>, HostError> {
             let mut request = vec![u8::try_from(service).unwrap()];
             request.extend_from_slice(payload);
-            self.0
-                .request(&request)
-                .to_bytes()
-                .ok_or(HostError::NoResponse)
+            let response = self.0.request(&request).to_bytes();
+            // A test's cancel that arrives while the request is on its way.
+            if let Some(cancel) = &self.1 {
+                cancel.store(true, Ordering::Relaxed);
+            }
+            response.ok_or(HostError::NoResponse)
         }
         fn read_dtc(&mut self, _: u8) -> Result<Vec<u8>, HostError> {
             Err(HostError::Unsupported("ReadDtc"))
@@ -1154,7 +1165,7 @@ mod tests {
             "{response:?}"
         );
         assert_eq!(ecu.session, sim_ecu::Session::Extended);
-        SimHost(ecu)
+        SimHost(ecu, None)
     }
 
     /// The restart point of a journal interrupted at the erase, or at RequestTransferExit.
@@ -1200,6 +1211,91 @@ mod tests {
         assert_eq!(host.0.power_cycles(), 1);
         assert_eq!(host.0.session, sim_ecu::Session::Default);
         assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
+    }
+
+    /// A cancel set before the teardown sends no reset.
+    #[test]
+    fn a_cancel_before_the_reset_sends_none() {
+        let (_, point) = point_at(ERASE);
+        let mut host = ecu_in_session();
+        let result = teardown(
+            TeardownGate::ResetAllowed,
+            &point,
+            &TIMING,
+            &mut host,
+            Duration::from_millis(1),
+            &AtomicBool::new(true),
+        );
+        assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
+        assert_eq!(host.0.power_cycles(), 0);
+        assert_eq!(host.0.session, sim_ecu::Session::Extended);
+    }
+
+    /// A cancel that arrives while the reset is on its way does not hide that the ECU accepted
+    /// it; after a refused reset it ends the wait.
+    #[test]
+    fn a_cancel_during_the_reset_keeps_its_outcome() {
+        let (_, point) = point_at(ERASE);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut host = ecu_in_session();
+        host.1 = Some(Arc::clone(&cancelled));
+        let result = teardown(
+            TeardownGate::ResetAllowed,
+            &point,
+            &TIMING,
+            &mut host,
+            Duration::from_millis(1),
+            &cancelled,
+        );
+        assert_eq!(result.unwrap(), Teardown::Reset);
+        assert_eq!(host.0.power_cycles(), 1);
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut host = ecu_in_session();
+        host.0.inject(sim_ecu::Fault::NegativeResponse {
+            nrc: sim_ecu::Nrc::ConditionsNotCorrect,
+        });
+        host.1 = Some(Arc::clone(&cancelled));
+        let result = teardown(
+            TeardownGate::ResetAllowed,
+            &point,
+            &TIMING,
+            &mut host,
+            Duration::from_millis(1),
+            &cancelled,
+        );
+        assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
+    }
+
+    /// Timeout and margin are added without wrapping or saturating at 32 bits.
+    #[test]
+    fn the_passive_wait_is_not_cut_short_by_large_timings() {
+        let (_, point) = point_at(ERASE);
+        let timing = RecoveryTiming {
+            session_timeout_millis: u32::MAX,
+            teardown_margin_millis: u32::MAX,
+            ..TIMING
+        };
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let canceller = {
+            let cancelled = Arc::clone(&cancelled);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(20));
+                cancelled.store(true, Ordering::Relaxed);
+            })
+        };
+        let mut host = ecu_in_session();
+        let result = teardown(
+            TeardownGate::PassiveOnly(PassiveReason::VinNotEstablished),
+            &point,
+            &timing,
+            &mut host,
+            Duration::from_millis(1),
+            &cancelled,
+        );
+        canceller.join().unwrap();
+        // Still waiting when cancelled: the wait was not computed as zero or wrapped short.
+        assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
     }
 
     #[test]

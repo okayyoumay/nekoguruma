@@ -179,4 +179,5 @@ armed faults stay armed. `armed_faults()` lists the faults that have not fired y
 `power_cycles()` counts power cycles (power loss, ECU reset, `reconnect()`); the VCI side uses it
 to discard responses it was still delaying when the ECU lost power or reset.
 `Fault` serializes in snake case (`"power_loss"`, `{"delay_response": {"ms": 500}}`), the form
-`sim-vci`'s control commands take.
+`sim-vci`'s control commands take. A response code is named the same way, not by its number:
+`{"negative_response": {"nrc": "conditions_not_correct"}}`.

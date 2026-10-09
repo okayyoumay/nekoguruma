@@ -3289,10 +3289,18 @@ mod tests {
             wait_poll: Duration::from_millis(2),
             ..JobLimits::default()
         };
+        // The cancel comes once the VIN read was sent, so it lands in the passive wait however
+        // long the journal's commits before it take.
+        let mirror = Arc::new(Mutex::new(Vec::new()));
+        host.mirror = Some(Arc::clone(&mirror));
         let canceller = {
-            let cancelled = Arc::clone(&cancelled);
+            let (cancelled, mirror) = (Arc::clone(&cancelled), Arc::clone(&mirror));
             std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(30));
+                let deadline = std::time::Instant::now() + Duration::from_secs(20);
+                while mirror.lock().unwrap().is_empty() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                std::thread::sleep(Duration::from_millis(10));
                 cancelled.store(true, Ordering::Relaxed);
             })
         };
@@ -3309,7 +3317,7 @@ mod tests {
         );
         canceller.join().unwrap();
         assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
-        assert!(started.elapsed() < Duration::from_secs(30));
+        assert!(started.elapsed() < Duration::from_secs(40));
         assert_eq!(host.sent(), [read_of([0xF1, 0x90])]);
         std::fs::remove_dir_all(&dir).unwrap();
     }

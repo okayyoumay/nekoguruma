@@ -44,7 +44,9 @@ Points the design and ADR-229 leave open:
    take the passive teardown; the reset is not repeated.
 4. **The passive teardown waits.** Since the agent runs no TesterPresent, there is nothing to
    stop: the passive teardown sends nothing for the declared session timeout plus the margin,
-   in steps of the job's poll interval, and a cancel ends the wait. An accepted reset is not
+   in steps of the job's poll interval, and a cancel ends the wait. A cancel before the reset
+   is sent sends none; one that arrives while the reset is on its way does not hide an accepted
+   reset, which is reported as `Teardown::Reset`. An accepted reset is not
    followed by a wait here: the ECU's startup time belongs to the confirmation.
 5. **The outcome is carried.** `RestartOrderUnavailable` now carries the teardown that ran
    (`Teardown::Reset`, `Teardown::Passive(cause)` or `Teardown::CompletedPath`) instead of the
@@ -60,7 +62,8 @@ Points the design and ADR-229 leave open:
   passes a target VIN yet, so outside tests the gates never allow it and the teardown is
   always passive.
 - A passive teardown holds the job, its link and its locks for the declared session timeout
-  plus the margin.
+  plus the margin. Nothing but a cancel bounds that wait: the values come from the signed
+  procedure, as the session timeout itself does.
 - The reset type is fixed. An ECU that refuses a hard reset is torn down passively, which is
   slower but safe.
 - The teardown is not journaled: a crash during it leads to another restart, which runs the

@@ -38,6 +38,9 @@ A SAE J2534-2 protocol ID (e.g. `PROTOCOL_CAN_CH5`) representing a base protocol
 **channel_index**  
 The resolved `1..=128` index value for one of up to 128 same-protocol **Additional Channels**, now computed by decomposing a directly-named **`_CHx` protocol variant**, or (SAE J2610 SCI only) by parsing a **compound-name grammar** suffix (the field-based `ResourceData.channel_index` input route was removed by ADR-178; this is no longer a proto field, only the internal `LogicalLinkState.channel_index`'s resolved value). Mutually exclusive with **pin_select**/`dlc_pin_data` (Pin Selection). See `resources.rs::chx_protocol_id`/`chx_base_protocol_id`, ADR-156 Decision 3, ADR-178.
 
+**Completed path** (agent restart, ADR-229, ADR-264)  
+An interrupted flash session whose journal records the post-transfer steps (such as CheckMemory) as complete. Its restart sends no ECUReset and does not tear down first: it confirms the ECU's default session, and waits out the session timeout only if that confirmation fails. See **Passive teardown**.
+
 **compound-name grammar**  
 `names.rs`'s `"<resolvable-name>_CH<n>"` string form (case-insensitive, `n` a decimal `1..=128`), accepted only in `CreateComLogicalLinkRequest.ResourceName` and `RscData.protocol_name` — never in the numeric `ResourceId`/`protocol_id` routes. Tried only after whole-string resolution against the existing table/alias/numeric routes fails, so a plain canonical name is unaffected. Added by ADR-178's Codex-review fix specifically to let SAE J2610 SCI's four native variants (which otherwise all collapse onto one shared `_CHx` numeric block) still be individually selectable on an **Additional Channel** — the head resolves through the same name lookup a plain name uses, preserving the exact variant, while the suffix supplies the requested index. See **Additional Channels**, **channel_index**, ADR-178.
 
@@ -207,6 +210,9 @@ Governs a COP's receive phase: `0` = no response required at all — the cycle c
 ---
 
 ## P–R
+
+**Passive teardown** (agent restart, ADR-229, ADR-264)  
+The way a restart ends a download the ECU may still hold without sending ECUReset: the agent sends nothing for the session timeout plus the margin the procedure declares (`RecoveryTiming`), so the ECU falls back to its default session on its own. Used when a gate fails, when a RequestTransferExit was journaled, and when the ECU refuses the reset or its answer is lost. See **Completed path**.
 
 **PassThru** — J2534 PassThru API  
 The function interface exported by a J2534 DLL: `PassThruOpen`, `PassThruConnect`, `PassThruReadMsgs`, `PassThruWriteMsgs`, `PassThruIoctl`, etc.

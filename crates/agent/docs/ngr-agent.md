@@ -250,6 +250,10 @@ process dies, so a crashed run never blocks the next one, and the files are neve
   job about once in 4096 concurrent pairs. Taking the vehicle the guards already hold returns at
   once; another VIN is refused (`GuardError::OtherVehicleHeld`), as are guards marked
   `link_unconfirmed`. `JobGuards::holds_vehicle` tells whether they hold one.
+- Every lock file must be a regular file. It is opened without following a symbolic link and
+  without blocking, and a symbolic link, FIFO, device or (on Windows) reparse point at its path
+  fails the take (`GuardError::NotAFile`, or an I/O error) instead of being followed or hanging
+  (ADR-262 item 6).
 - Locks are always taken in the order VCI, then slot, then vehicle, and held until the
   `JobGuards` is dropped.
 

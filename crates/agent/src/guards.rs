@@ -23,7 +23,10 @@
 //! Each is an exclusive OS lock (`File::try_lock`) on its own file in a lock directory the
 //! caller names. The OS releases a lock with its file handle, also when the process dies, so a
 //! crashed agent never blocks the restart that follows it. The files are never deleted: a
-//! process that locked a recreated file would not exclude one still holding the old one.
+//! process that locked a recreated file would not exclude one still holding the old one. A lock
+//! file must be a regular file: an entry that is a symlink, FIFO, device or (Windows) reparse
+//! point fails the take ([`GuardError::NotAFile`] or the open's error) instead of being followed
+//! or blocking the open (ADR-262 item 6).
 //!
 //! On Unix the lock directory must stop users deleting or replacing each other's lock files: a
 //! directory that group or others may write must have the sticky bit, or the guards refuse it
@@ -81,6 +84,8 @@ pub enum GuardError {
     InvalidVin,
     #[error("the guards' link is unconfirmed closed, so they take no new lock (ADR-258)")]
     LinkUnconfirmed,
+    #[error("the lock file {0} is not a regular file")]
+    NotAFile(PathBuf),
 }
 
 /// How many vehicle lock files a lock directory has (ADR-262).
@@ -270,7 +275,7 @@ impl LockFile {
         poll: Duration,
         cancelled: &AtomicBool,
     ) -> Result<Self, GuardError> {
-        Self::lock(OpenOptions::new().read(true).open(path)?, poll, cancelled)
+        Self::lock(open_read_only(path)?, poll, cancelled)
     }
 
     fn lock(file: File, poll: Duration, cancelled: &AtomicBool) -> Result<Self, GuardError> {
@@ -300,11 +305,11 @@ impl LockFile {
     /// permissions) can be locked as long as it can be read: an OS lock needs no write access.
     /// Only a missing file is created, atomically: when another process creates it first, the
     /// read-only open is tried again rather than opening that file for writing.
-    fn open(path: &Path) -> io::Result<File> {
+    fn open(path: &Path) -> Result<File, GuardError> {
         let mut tries = 0;
         loop {
-            match OpenOptions::new().read(true).open(path) {
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            match open_read_only(path) {
+                Err(GuardError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {}
                 opened => return opened,
             }
             match OpenOptions::new()
@@ -316,10 +321,43 @@ impl LockFile {
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists && tries < 3 => {
                     tries += 1;
                 }
-                created => return created,
+                created => return Ok(created?),
             }
         }
     }
+}
+
+/// Opens an existing lock file read-only without following a symlink or blocking on a FIFO, and
+/// requires a regular file (ADR-262 item 6). `O_NONBLOCK` and `O_NOCTTY` keep a FIFO or a
+/// terminal device from stalling or capturing the open; the type check then refuses them.
+fn open_read_only(path: &Path) -> Result<File, GuardError> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_FLAG_OPEN_REPARSE_POINT: open a reparse point itself, not its target.
+        options.custom_flags(0x0020_0000);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    #[cfg(windows)]
+    let reparse = {
+        use std::os::windows::fs::MetadataExt;
+        // FILE_ATTRIBUTE_REPARSE_POINT
+        metadata.file_attributes() & 0x400 != 0
+    };
+    #[cfg(not(windows))]
+    let reparse = false;
+    if reparse || !metadata.file_type().is_file() {
+        return Err(GuardError::NotAFile(path.to_owned()));
+    }
+    Ok(file)
 }
 
 /// Creates the lock directory if it is missing, writable by its owner only, and refuses one in
@@ -1049,5 +1087,58 @@ mod tests {
         assert_eq!(order.last(), Some(&0xfff));
         let distinct: std::collections::HashSet<_> = order.iter().collect();
         assert_eq!(distinct.len(), order.len());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_is_not_followed_as_a_lock_file() {
+        let dir = dir("symlink");
+        let never = AtomicBool::new(false);
+        fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("target");
+        fs::write(&target, b"").unwrap();
+        let bucket = vehicle_bucket(&vin(VIN_A));
+        std::os::unix::fs::symlink(&target, vehicle_path(&dir, bucket)).unwrap();
+        std::os::unix::fs::symlink(&target, vci_path(&dir, "VCI-1")).unwrap();
+        assert!(JobGuards::take_vci_only(&setup(&dir, "VCI-1"), POLL, &never).is_err());
+        let mut guards = JobGuards::take_vci_only(&setup(&dir, "VCI-2"), POLL, &never).unwrap();
+        // The sweep leaves the symlink alone and creates the rest; only this bucket fails.
+        assert!(guards.take_vehicle(&vin(VIN_A), POLL, &never).is_err());
+        assert!(
+            fs::symlink_metadata(vehicle_path(&dir, bucket))
+                .unwrap()
+                .is_symlink()
+        );
+        assert_eq!(vehicle_files(&dir), VEHICLE_BUCKETS as usize);
+        guards.take_vehicle(&vin(VIN_B), POLL, &never).unwrap();
+        drop(guards);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_lock_file_fails_the_take_promptly() {
+        let dir = dir("fifo");
+        let never = AtomicBool::new(false);
+        fs::create_dir_all(&dir).unwrap();
+        let path = vehicle_path(&dir, vehicle_bucket(&vin(VIN_A)));
+        let c_path = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        // SAFETY: `c_path` is a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        let mut guards = JobGuards::take_vci_only(&setup(&dir, "VCI-1"), POLL, &never).unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let timer = {
+            let cancelled = Arc::clone(&cancelled);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_secs(2));
+                cancelled.store(true, Ordering::Relaxed);
+            })
+        };
+        let result = guards.take_vehicle(&vin(VIN_A), POLL, &cancelled);
+        assert!(matches!(result, Err(GuardError::NotAFile(_))), "{result:?}");
+        cancelled.store(true, Ordering::Relaxed);
+        timer.join().unwrap();
+        drop(guards);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

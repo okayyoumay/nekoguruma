@@ -2,7 +2,7 @@
 
 **Date:** 2026-10-09
 **Status:** Accepted
-**Affects:** `agent` (`src/guards.rs`, `src/journal.rs`, `src/restart.rs`, `docs/ngr-agent.md`), `Cargo.toml` (`sha2`), design 8.8, ADR-256 item 6
+**Affects:** `agent` (`src/guards.rs`, `src/journal.rs`, `src/restart.rs`, `docs/ngr-agent.md`), `Cargo.toml` (`sha2`), design 8.8, ADR-256 items 1 and 6, ADR-257
 
 ## Context
 
@@ -68,6 +68,17 @@ which is what ADR-256 item 6 forbids.
    disagree on either share a directory without excluding each other. A change needs a new
    file prefix and counts as a breaking change of the lock protocol.
 
+6. **Lock files must be regular files.** Every lock file (`vci-*.lock`, `reprogramming.lock` and
+   the bucket files) is opened without following a symbolic link and without blocking, and the
+   opened handle must be a regular file before it is locked (`GuardError::NotAFile`); on Windows
+   a reparse point is refused. An entry someone else put at a lock file's path (a symbolic link,
+   a FIFO, a device) then fails the take instead of being followed or hanging outside the cancel
+   loop. This closes the uncancellable wait and locking through a link; it does not harden the
+   multi-user model, since an agent user who wants to bypass the guards can run a job without
+   them (ADR-257) and the first user to create a lock file owns it. The bucket sweep multiplied
+   the names someone could pre-create by 4096, which is why the shared open path is hardened
+   here.
+
 ## Consequences
 
 - Two vehicles whose VINs fall in the same bucket exclude each other: a job waits for the other
@@ -86,9 +97,17 @@ which is what ADR-256 item 6 forbids.
   the next take sweeps and syncs again. On a file system without a metadata journal a crash can
   lose an arbitrary subset of the files; the next take that misses its own file recreates every
   hole at once, whose creation time then says only that some vehicle of the lost buckets arrived
-  then. Windows may record a bucket file's last-access time on open where the volume keeps it;
-  Linux records none, since the files are never read.
-- No VIN-derived fact is stored on the device, so the maintainer's condition on ADR-261 (no
-  target VIN passed outside tests before the journal's protection) is unaffected.
+  then.
+- The agent writes nothing VIN-derived to the device: no lock file's name, existence or content
+  depends on a VIN. Two residuals remain. While a job runs, the locked bucket is visible to
+  anyone who can inspect open files, like the job's process itself. On a Windows volume that
+  maintains last-access times (off by default on system volumes of 128 GB and more since Windows
+  10 version 1803, and off before), a bucket file may keep the time it was last opened for a
+  lock, if NTFS counts an open without a read as access; this is to be measured, and suppressed
+  per handle if it does. Either residual is 12 bits of a public hash with a time: it narrows a
+  candidate list an observer already has by a factor of 4096 and identifies no vehicle without
+  one, and the next lock on the bucket overwrites it. Linux keeps none: atime moves on reads,
+  and the files are never read. The maintainer's condition on ADR-261 concerns the target VIN
+  itself and is unaffected.
 - The restart's promotion to the vehicle lock at the first matching VIN, and the first run's
   VIN match among the execution preconditions (design 8.9.1), call `take_vehicle` later.

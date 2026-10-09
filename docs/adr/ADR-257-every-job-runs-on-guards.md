@@ -1,7 +1,7 @@
 # ADR-257: Every Job Runs on Guards It Holds
 
 **Date:** 2026-10-09
-**Status:** Accepted
+**Status:** Accepted (lock files must be regular files since ADR-262 item 6)
 **Affects:** `agent` (`src/guards.rs`, `src/runner.rs`, `src/policy.rs`, `src/main.rs`), `j2534-0404-service` (tests), ADR-256
 
 ## Context

@@ -102,6 +102,11 @@ which is what ADR-256 item 6 forbids.
   are owned by the user whose take creates them and, on Unix, readable by everyone (item 2); on
   Windows they inherit the directory's ACL like the other lock files. The directory's
   permissions for every agent user remain an installation requirement (ADR-257).
+- The staging file is not synced before it is linked: a power loss during a sweep could
+  persist a bucket's name but not its mode only on a file system that does not commit metadata
+  changes in order, which ext4, XFS and btrfs do. Other agent users would then fail that bucket
+  with a permission error until an administrator changed its mode. Syncing every staging file
+  would cost up to 4096 synchronous writes in the first vehicle lock, which is not worth this.
 - A sweep that fails partway leaves a partial set; the next take sweeps again. The cost of the
   trigger is one directory listing per `take_vehicle`. A shared lock directory that cannot be
   listed (for example mode `1733`) is refused on Unix, and fails every vehicle lock with a

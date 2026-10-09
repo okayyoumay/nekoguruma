@@ -31,21 +31,23 @@ which is what ADR-256 item 6 forbids.
 
 1. **The vehicle lock is one of 4096 fixed files.** The lock of a VIN is the OS lock on
    `vehicle-{k:03x}.lock`, where `k` is the first two bytes of SHA-256 over the VIN's 17 ASCII
-   bytes, big-endian, masked to 12 bits. Only a well-formed VIN (17 characters, each a digit or
+   bytes, read big-endian and masked to their low 12 bits (a digest starting `84 b1` gives
+   `vehicle-4b1.lock`). Only a well-formed VIN (17 characters, each a digit or
    an upper-case letter other than I, O and Q, the form ADR-261 compares) is accepted
    (`GuardError::InvalidVin`), so two jobs on one vehicle always hash the same bytes. Many VINs
    share each file, so a name reveals 12 bits of a public hash and does not identify a vehicle.
    SHA-256 comes from the `sha2` crate, which the workspace already builds; the standard
    library's hasher is not stable across releases.
-2. **A bucket file is never created alone.** When the file of the bucket a job needs is
-   missing, `take_vehicle` first creates all 4096 bucket files and syncs the directory, then
-   locks its own. The directory's content is then the same on every device that ever took a
-   vehicle lock and does not show which buckets were used; created one by one, the existence of
-   a bucket file would hint whether a given vehicle had been there. A set left partial (by a
-   crash or a power loss) is completed by the next take whose bucket file is missing; a file
-   that someone else created on its own reveals nothing about this device's jobs. Jobs that never take a
-   vehicle lock create none of these files. The files stay empty and, like the other lock
-   files, are never deleted.
+2. **A bucket file is never created alone.** When the file of the bucket a job needs, or the
+   last bucket file (`vehicle-fff.lock`), is missing, `take_vehicle` first creates all 4096
+   bucket files in bucket order and syncs the directory, then locks its own. The directory's
+   content is then the same on every device that ever took a vehicle lock and does not show
+   which buckets were used; created one by one, the existence of a bucket file would hint
+   whether a given vehicle had been there. A set left partial by a crash, a power loss or a
+   failed creation is a prefix in bucket order, which says nothing about a VIN, and the next
+   take completes it; a file that someone else created on its own reveals nothing about this
+   device's jobs. Jobs that never take a vehicle lock create none of these files. The files stay
+   empty and, like the other lock files, are never deleted.
 3. **It is taken last, by `JobGuards::take_vehicle`.** The lock order becomes VCI, then the
    reprogramming slot when the job holds one, then the vehicle. Guards with or without the slot
    may take it. The wait polls and stops on a cancel like the other guards (ADR-256 item 3);
@@ -71,10 +73,10 @@ which is what ADR-256 item 6 forbids.
 - A job that holds the reprogramming slot and waits for its vehicle keeps the slot meanwhile,
   so a long job on that vehicle (or bucket), such as monitoring, delays every reprogramming on
   the device until it ends.
-- The lock directory holds 4096 more empty files once a job has taken a vehicle lock there.
-  They are created with the preparing user's default permissions, like the other lock files;
-  the directory's permissions for every agent user remain an installation requirement
-  (ADR-257).
+- The lock directory holds 4096 more empty files once a job has taken a vehicle lock there. They
+  are created with the default permissions of the user whose take creates them, like the other
+  lock files; the directory's permissions for every agent user remain an installation
+  requirement (ADR-257).
 - No VIN-derived fact is stored on the device, so the maintainer's condition on ADR-261 (no
   target VIN passed outside tests before the journal's protection) is unaffected.
 - The restart's promotion to the vehicle lock at the first matching VIN, and the first run's

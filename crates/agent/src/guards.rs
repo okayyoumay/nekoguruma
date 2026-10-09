@@ -7,9 +7,10 @@
 //!
 //! The per-vehicle lock of design 8.8's two-stage locking ([`JobGuards::take_vehicle`], ADR-262)
 //! is named without keeping the VIN on the device (ADR-256 item 6): the VIN is hashed into one
-//! of 4096 fixed buckets, `vehicle-{k:03x}.lock`, so two VINs may share a bucket and then
+//! of 4096 fixed buckets (the low 12 bits of the first two bytes of the SHA-256 digest, read
+//! big-endian), `vehicle-{k:03x}.lock`, so two VINs may share a bucket and then
 //! exclude each other, which is safe. The first `take_vehicle` that finds its bucket's file
-//! missing creates all 4096, empty, and syncs the directory before it opens any of them, so a
+//! or the last one (`vehicle-fff.lock`, created last) missing creates all 4096, empty, and syncs the directory before it opens any of them, so a
 //! bucket file never exists alone and the listing is the same on every device, saying nothing
 //! about the vehicles seen. A job holds one vehicle (a well-formed VIN): taking that VIN again
 //! succeeds without touching the file, and any other VIN, also one of the same bucket, is refused.
@@ -177,7 +178,12 @@ impl JobGuards {
         cancelled: &AtomicBool,
     ) -> Result<LockFile, GuardError> {
         let path = vehicle_path(&self.dir, bucket);
-        if !path.try_exists()? {
+        // The set is created in order, so a present last file means a creation ran to its end.
+        let last = vehicle_path(&self.dir, (VEHICLE_BUCKETS - 1) as u16);
+        if !path.try_exists()? || !last.try_exists()? {
+            if cancelled.load(Ordering::Relaxed) {
+                return Err(GuardError::Cancelled);
+            }
             create_vehicle_files(&self.dir)?;
         }
         LockFile::wait_existing(&path, poll, cancelled)
@@ -359,7 +365,8 @@ fn create_vehicle_files(dir: &Path) -> Result<(), GuardError> {
     Ok(())
 }
 
-/// The bucket of a VIN: 12 bits of its SHA-256, so the device keeps no VIN (ADR-262).
+/// The bucket of a VIN: the low 12 bits of the first two bytes of its SHA-256 digest, read
+/// big-endian (a digest starting 84 b1 gives 0x4b1), so the device keeps no VIN (ADR-262).
 fn vehicle_bucket(vin: &Vin) -> u16 {
     let digest = Sha256::digest(vin.as_str().as_bytes());
     u16::from_be_bytes([digest[0], digest[1]]) & 0x0fff
@@ -836,7 +843,7 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// The bucket is 12 bits of the VIN's SHA-256; a changed hash or slice fails this.
+    /// The bucket is the low 12 bits of the digest's first two bytes, big-endian; a changed hash or slice fails this.
     #[test]
     fn the_vehicle_bucket_is_fixed() {
         let digest = Sha256::digest(VIN_A.as_bytes());
@@ -987,6 +994,32 @@ mod tests {
         ));
         assert!(!guards.holds_vehicle());
         guards.worker_gone();
+        drop(guards);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_set_without_the_last_file_is_completed() {
+        let dir = dir("partial-own-only");
+        fs::create_dir_all(&dir).unwrap();
+        let bucket = vehicle_bucket(&vin(VIN_A));
+        fs::write(vehicle_path(&dir, bucket), b"").unwrap();
+        let never = AtomicBool::new(false);
+        let mut guards = JobGuards::take_vci_only(&setup(&dir, "VCI-1"), POLL, &never).unwrap();
+        guards.take_vehicle(&vin(VIN_A), POLL, &never).unwrap();
+        assert_eq!(vehicle_files(&dir), VEHICLE_BUCKETS as usize);
+        drop(guards);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_cancelled_take_creates_no_vehicle_files() {
+        let dir = dir("vehicle-cancel-early");
+        let never = AtomicBool::new(false);
+        let mut guards = JobGuards::take_vci_only(&setup(&dir, "VCI-1"), POLL, &never).unwrap();
+        let result = guards.take_vehicle(&vin(VIN_A), POLL, &AtomicBool::new(true));
+        assert!(matches!(result, Err(GuardError::Cancelled)), "{result:?}");
+        assert_eq!(vehicle_files(&dir), 0);
         drop(guards);
         let _ = fs::remove_dir_all(&dir);
     }

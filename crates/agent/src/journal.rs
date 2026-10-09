@@ -56,7 +56,8 @@ pub struct StageId(pub u32);
 
 /// The VIN a job targets. It is personal data (design 16.2): `Debug` hides it, there is no
 /// `Display`, and callers use [`Vin::as_str`] only to compare. The journal keeps it as given;
-/// `restart` decides whether it is well-formed.
+/// [`Vin::is_well_formed`] is the rule for whether it is well-formed, used by the
+/// restart's gates and the job guards (ADR-261, ADR-262).
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Vin(String);
 

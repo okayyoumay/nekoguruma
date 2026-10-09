@@ -483,6 +483,19 @@ fn is_response_pending(response: &[u8]) -> bool {
     matches!(response, [0x7F, _, 0x78, ..])
 }
 
+/// A host that counts the TransferData blocks the ECU confirmed (ADR-250), which the
+/// journaling runner records (ADR-252).
+pub trait TransferProgress {
+    /// See [`WorkerHost::transfer_block_index`].
+    fn transfer_block_index(&self) -> Option<u64>;
+}
+
+impl TransferProgress for WorkerHost {
+    fn transfer_block_index(&self) -> Option<u64> {
+        WorkerHost::transfer_block_index(self)
+    }
+}
+
 /// The supply voltage comes from the VCI; the worker interface has no defined source for the
 /// other inputs.
 impl crate::inputs::RuntimeInputs for WorkerHost {

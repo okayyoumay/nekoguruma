@@ -361,15 +361,65 @@ where
     }
 }
 
-/// Extracts `field` from `response` to the request with service `sid`.
-fn decode_field(field: &ServiceField, sid: u8, response: &[u8]) -> Reading {
+/// What [`read_field_bytes`] got for a field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FieldBytes {
+    /// The field's raw bytes, from a response [`resolve_source`] would read as a value.
+    Field(Vec<u8>),
+    /// A negative response to the field's request, with its response code.
+    Negative(u8),
+    /// Anything else: a source the table lacks, a runtime input (which has no field bytes), or
+    /// a positive response that does not carry a field that decodes.
+    Unreadable,
+}
+
+/// Reads the raw bytes of an `EcuService` field, for the write-job journal, which records the
+/// ECU's identity as the ECU answered it (ADR-244, ADR-252). The request and the checks are
+/// those of [`resolve_source`], and the field must also decode under its encoding. A negative
+/// response is told apart, so a caller can recognise a declared answer such as "no valid
+/// application" (design 8.2.5).
+pub fn read_field_bytes<H>(
+    source: Source,
+    table: &ServiceSources,
+    host: &mut H,
+) -> Result<FieldBytes, HostError>
+where
+    H: DiagHost<Error = HostError>,
+{
+    let Source::EcuService {
+        service_id,
+        field_id,
+    } = source
+    else {
+        return Ok(FieldBytes::Unreadable);
+    };
+    let Some(field) = table.get(service_id, field_id) else {
+        return Ok(FieldBytes::Unreadable);
+    };
+    let Some((&sid, payload)) = field.request.split_first() else {
+        return Ok(FieldBytes::Unreadable);
+    };
+    let response = host.service_request(u16::from(sid), payload)?;
+    if let [0x7F, echoed, nrc] = response[..]
+        && echoed == sid
+    {
+        return Ok(FieldBytes::Negative(nrc));
+    }
+    Ok(extract_field(field, sid, &response)
+        .filter(|bytes| decode_bytes(field, bytes).is_known())
+        .map_or(FieldBytes::Unreadable, |bytes| {
+            FieldBytes::Field(bytes.to_vec())
+        }))
+}
+
+/// The bytes of `field` in `response` to the request with service `sid`, if the response is
+/// exactly the positive SID, the echo and the field.
+fn extract_field<'a>(field: &ServiceField, sid: u8, response: &'a [u8]) -> Option<&'a [u8]> {
     // A positive response carries the SID plus 0x40 (ISO 14229-1:2026 clause 7.4); a negative
     // one starts with 0x7F.
-    let Some((&first, rest)) = response.split_first() else {
-        return Reading::CannotBeDecoded;
-    };
+    let (&first, rest) = response.split_first()?;
     if first != sid.wrapping_add(0x40) {
-        return Reading::CannotBeDecoded;
+        return None;
     }
     let params = &field.request[1..];
     // Exactly the echo, then the field: nothing missing, nothing extra.
@@ -377,9 +427,19 @@ fn decode_field(field: &ServiceField, sid: u8, response: &[u8]) -> Reading {
         || field.offset.checked_add(field.length) != Some(rest.len())
         || rest[..field.offset] != *params
     {
-        return Reading::CannotBeDecoded;
+        return None;
     }
-    let bytes = &rest[field.offset..];
+    Some(&rest[field.offset..])
+}
+
+/// Extracts `field` from `response` to the request with service `sid`.
+fn decode_field(field: &ServiceField, sid: u8, response: &[u8]) -> Reading {
+    extract_field(field, sid, response)
+        .map_or(Reading::CannotBeDecoded, |bytes| decode_bytes(field, bytes))
+}
+
+/// Turns the bytes of `field` into a reading by its encoding.
+fn decode_bytes(field: &ServiceField, bytes: &[u8]) -> Reading {
     match field.encoding {
         Encoding::UnsignedBigEndian => {
             if bytes.is_empty() || bytes.len() > 8 {
@@ -605,6 +665,47 @@ mod tests {
     #[expect(dead_code, reason = "only has to compile")]
     fn worker_host_resolves_any_source(host: &mut crate::WorkerHost, source: Source) {
         let _ = resolve_source(source, &ServiceSources::default(), host);
+    }
+
+    #[test]
+    fn field_bytes_are_the_raw_field_of_a_decodable_answer() {
+        let read = |source, response: &[u8]| {
+            let mut host = Fake::answering(response);
+            let bytes = read_field_bytes(source, &table(), &mut host).unwrap();
+            (bytes, host.sent)
+        };
+        let (bytes, sent) = read(ecu(2, 1), &[0x62, 0xF1, 0x00, 0x01, 0x02]);
+        assert_eq!(bytes, FieldBytes::Field(vec![0x01, 0x02]));
+        assert_eq!(sent, [(0x22, vec![0xF1, 0x00])]);
+        let (bytes, _) = read(ecu(1, 1), &vin_response(b"WVWZZZ1JZXW000001"));
+        assert_eq!(bytes, FieldBytes::Field(b"WVWZZZ1JZXW000001".to_vec()));
+        // A negative response keeps its code; one for another service does not count.
+        assert_eq!(
+            read(ecu(1, 1), &[0x7F, 0x22, 0x31]).0,
+            FieldBytes::Negative(0x31)
+        );
+        assert_eq!(
+            read(ecu(1, 1), &[0x7F, 0x2E, 0x31]).0,
+            FieldBytes::Unreadable
+        );
+        // A response that does not read as a value gives no bytes.
+        for response in [
+            vin_response(b"                 "),
+            vin_response(b"WVWZZZ1JZXW00000"),
+            vec![0x7F, 0x22, 0x31, 0x00],
+        ] {
+            assert_eq!(read(ecu(1, 1), &response).0, FieldBytes::Unreadable);
+        }
+        // Nothing is sent for a source without a request.
+        let (bytes, sent) = read(ecu(9, 1), &[]);
+        assert_eq!(bytes, FieldBytes::Unreadable);
+        assert!(sent.is_empty());
+        let (bytes, sent) = read(
+            Source::RuntimeInput(RuntimeInput::SupplyVoltageMillivolts),
+            &[],
+        );
+        assert_eq!(bytes, FieldBytes::Unreadable);
+        assert!(sent.is_empty());
     }
 
     #[test]

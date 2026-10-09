@@ -908,6 +908,7 @@ dependencies = [
  "portable-atomic",
  "serde_json",
  "serial_test",
+ "shared-proto",
  "sim-vci",
  "tokio",
  "tokio-stream",

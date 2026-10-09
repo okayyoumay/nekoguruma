@@ -465,6 +465,20 @@ fn read_file(path: &Path, write: bool) -> Result<(File, Vec<u8>), JournalError> 
 }
 
 impl<S: Store> Journal<S> {
+    /// A new, empty journal of `key` on `store`, for tests of the code that commits to it.
+    #[cfg(test)]
+    pub(crate) fn on_store(store: S, key: JobKey) -> Self {
+        Self {
+            store,
+            state: JournalState {
+                facts: RecoveryFacts::new(key),
+                last_vm_state: None,
+                records: 0,
+            },
+            poisoned: false,
+        }
+    }
+
     pub fn state(&self) -> &JournalState {
         &self.state
     }

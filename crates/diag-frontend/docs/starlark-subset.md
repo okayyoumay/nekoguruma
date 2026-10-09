@@ -135,11 +135,24 @@ diag.fail(code, detail)                 # Abnormal end of the procedure
 
 `params` is a dict literal with string keys.
 
-Arguments that the instruction holds as a fixed field (service, DTC mask, routine and its
-sub-function, security level, wait and capture durations, form, template and log level) must be
-constant at ingestion and fit the field's integer width (`u8`, `u16` or `u32` as in `Op`);
-otherwise the call is rejected (`STAR_NON_CONSTANT_ARGUMENT`). A `diag.wait` whose duration is
-only known at run time needs a stack-operand variant of `Wait`.
+Arguments that the instruction holds as a fixed field must be constant at ingestion and in the
+range below; otherwise the call is rejected (`STAR_NON_CONSTANT_ARGUMENT` or
+`STAR_ARGUMENT_OUT_OF_RANGE`). The ranges are those of the values themselves, not of the `Op`
+field that stores them.
+
+| Argument | Type and range |
+|---|---|
+| `service_id` | `int`, 0x00 to 0xFF (a UDS service identifier; ADR-235 item 2) |
+| `mask` | `int`, 0x00 to 0xFF |
+| `routine_id` | `int`, 0x0000 to 0xFFFF |
+| `sub` | `int`, 0x00 to 0xFF |
+| `level` | `int`, odd, 0x01 to 0xFD (the seed sub-function; the key is sent with `level + 1`) |
+| `millis`, `back_millis` | `int`, 0 to 2^32 - 1 |
+| `form_id`, `template_id` | `str` naming the form or record template |
+| `level` of `diag.log` | `int`, 0 to 255 |
+| `params` of `diag.hmi` | dict whose values are all constants (3.2) |
+
+A `diag.wait` whose duration is only known at run time needs a stack-operand variant of `Wait`.
 
 ### 3.2 Lowering
 
@@ -155,8 +168,8 @@ instruction exists, the transpiler rejects calls to it (`STAR_API_NOT_AVAILABLE`
 | `diag.security_access` | `ServiceRequest`, `SecurityAccess`, `ServiceRequest` | expands to three steps: the seed request (SecurityAccess service, odd sub-function `level`), `SecurityAccess`, which turns the seed (bytes) into the key through the host, and the send-key request (sub-function `level + 1`) carrying that key; a negative response to either request ends the call like a failed `diag.request` |
 | `diag.flash_transfer` | `FlashTransfer` | one block (bytes) per instruction; the call expands to a loop over the flash session's blocks |
 | `diag.wait` | `Wait` | none |
-| `diag.hmi` | `HmiRequest` | form parameters (bytes) built from `params` |
-| `diag.record` | `RecordInput` | request bytes for the record template |
+| `diag.hmi` | `HmiRequest` | none: the instruction sends a constant, so the transpiler encodes the form and its constant `params` into one constant-pool entry; parameters known only at run time need a variant that takes them from the stack |
+| `diag.record` | `RecordInput` | none: the template reference is a constant-pool entry |
 | `diag.capture` | `MonitorCapture` | none |
 | `diag.log` | `Log` | none; the message is a constant, so a message built at run time needs a log instruction that takes it from the stack |
 | `diag.ecu_info` | none yet | |
@@ -204,8 +217,9 @@ the CSV table side, so a `fields` key is checked against the declaration part at
 
 ### 4.2 Loop Limits
 
-Every loop is a `for` over a finite sequence. A `range` whose bound is not a constant, and a
-`for` over a value read at runtime (such as response bytes), gets a runtime limit embedded:
+Every loop is a `for` over a finite sequence. A constant list is unrolled (2.5). A `range` whose
+bound is not a constant, such as `range(len(b))` over response bytes (Starlark bytes are not
+iterable themselves), gets a runtime limit embedded:
 
 ```python
 # @maxIterations 100
@@ -250,6 +264,14 @@ def main():
   The IR's integer division truncates toward zero (ADR-233), so the transpiler emits the
   correction for operands of different signs
 - `/` is float division and always yields `F64`
+- `>>` is arithmetic in Starlark, while the IR's `Shr` is logical (ADR-233). The transpiler
+  lowers `x >> n` as `x >> n` for `x >= 0` and as `~((~x) >> n)` for negative `x` (the complement
+  is `BitXor` with -1), which gives the arithmetic result with the existing instructions
+- `<<` must not lose bits, since a Starlark integer would grow instead, but the IR's `Shl` drops
+  shifted-out bits. A `<<` with a run-time operand needs an overflow-checked shift and is
+  rejected (`STAR_NOT_LOWERABLE`) until one exists; constant operands are folded at ingestion
+- A shift count outside 0 to 63 is an error at run time. Starlark accepts larger right shifts;
+  this subset does not
 - No implicit conversion between `int` and `float` beyond what Starlark itself does for
   mixed arithmetic; the transpiler inserts the conversion instructions explicitly
 

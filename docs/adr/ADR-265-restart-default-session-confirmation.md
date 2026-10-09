@@ -51,5 +51,11 @@ Points ADR-229 leaves open:
   two startup waits, two windows and one passive teardown before it gives up.
 - An ECU that reports a non-default session for the whole window is treated like one that does
   not answer: both get the passive retry when no passive teardown ran.
+- ADR-229 lets a power-down time in the reset's response extend the startup wait. None is
+  applied: the teardown accepts only a hard reset's positive response, which carries none, and
+  the response to an ECUReset among the procedure's own post-transfer steps is not journaled,
+  so a restart on the completed path does not know it.
+- ADR-229 item 2 ended a failed confirmation after an accepted reset in on-site intervention at
+  once; item 3 here adds the passive retry there too, as for the completed path.
 - Nothing about the confirmation is journaled: a crash during it leads to another restart, which
   runs the gates, the teardown and the confirmation again.

@@ -218,7 +218,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-226](ADR-226-vci-service-manager-client-authorization.md) | `vci-service-manager` Client Authorization — Peer-Identity Trust Root over Local IPC, Manager-Minted Session Tokens for TCP | Accepted | `vci-service-manager` main, Cargo.toml, docs |
 | [ADR-227](ADR-227-windows-workers-target-gnullvm.md) | Windows Workers Target `*-pc-windows-gnullvm`, Cross-Built on Linux | Accepted | CI, `.cargo/config.toml`, worker target docs |
 | [ADR-228](ADR-228-fixed-library-resolution-locations.md) | Library Resolution from Fixed Locations, Shared by Agent and Worker | Accepted | design 7.1.1 / 7.2 / 7.3, `vci-discovery`, `vci-service-config`, worker services |
-| [ADR-229](ADR-229-interrupted-transfer-restarts-from-request-download.md) | Interrupted Transfers Restart from RequestDownload; Write Procedures Are a Reference Implementation | Accepted (item 1's `recovery_required_from_step` replaced by ADR-245) | design 8.2.5 / 16.1, `agent` journal, `sim-ecu` |
+| [ADR-229](ADR-229-interrupted-transfer-restarts-from-request-download.md) | Interrupted Transfers Restart from RequestDownload; Write Procedures Are a Reference Implementation | Accepted (item 1's `recovery_required_from_step` replaced by ADR-245; item 2's failed confirmation after an accepted reset gets one passive retry since ADR-265) | design 8.2.5 / 16.1, `agent` journal, `sim-ecu` |
 | [ADR-230](ADR-230-backlog-loop-serialization-and-claims.md) | Backlog Loop Runs One Item at a Time, with PR-Based Claims and Run State | Accepted (Decision items 1-2's claim set extended to `codeql-alerts` PRs by ADR-243; Decision item 5 superseded by ADR-249) | `.claude/skills/backlog-loop`, `next-task`, `scripts/classify-pr-risk.sh` |
 | [ADR-231](ADR-231-agent-mints-worker-tokens-in-process.md) | The Agent Mints Worker Bearer Tokens In-Process | Accepted | `worker-host` client, `vci-service-interface` token |
 | [ADR-232](ADR-232-linux-support-scope-and-minimum-glibc.md) | Linux Support Scope and Minimum glibc 2.17 | Accepted | design 2 / 7.1.2 / 12.1 / 17, `worker-linux` CI job |
@@ -591,7 +591,7 @@ the predecessor repository these ADRs came from.
 - ADR-239
 
 ### Write Jobs & Resume
-- ADR-229 (item 1's `recovery_required_from_step` replaced by ADR-245)
+- ADR-229 (item 1's `recovery_required_from_step` replaced by ADR-245; item 2's failed confirmation after an accepted reset gets one passive retry since ADR-265)
 - ADR-233 (item 3's `VmState` fields removed by ADR-245)
 - ADR-235 (item 8 relaxed for debug builds against `sim-vci` by ADR-247)
 - ADR-241

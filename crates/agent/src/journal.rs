@@ -1066,7 +1066,8 @@ mod tests {
             let bytes = fs::read(path(&dir)).expect("read");
             assert_eq!(bytes.len(), boundaries.last().expect("some").0);
             if target_vin.is_some() {
-                // A cut inside the VIN frame leaves the header alone: an empty journal.
+                // A cut inside the VIN frame models storage damage (a crash cannot tear it:
+                // `create` syncs it with the header): the header alone, an empty journal.
                 let FrameRead::Ok { next, .. } = read_frame(&bytes, PREAMBLE) else {
                     panic!("header");
                 };
@@ -1087,33 +1088,43 @@ mod tests {
                     Some((len, state)) => {
                         let loaded = loaded.unwrap_or_else(|error| panic!("cut {cut}: {error}"));
                         assert_eq!((loaded.len, &loaded.state), (*len, state), "cut {cut}");
-                        // Past the VIN frame, the VIN survives every cut.
-                        if target_vin.is_some() && state.records > 0 {
-                            assert_eq!(loaded.state.facts.target_vin.as_ref(), target_vin);
-                        }
                     }
                 }
             }
         }
     }
 
-    /// Documented behaviour: a power loss that leaves the VIN frame as the last frame with its
-    /// payload unwritten reads back as an empty journal, with no VIN. No later record was
-    /// durable, so no transfer can have started (ADR-261).
+    /// Documented behaviour: storage damage that zeroes the VIN frame while it is the last
+    /// frame reads like a torn tail, so the journal reads back as empty, with no VIN. A crash
+    /// cannot cause it: `create` syncs the frame with the header before the file has its name
+    /// (ADR-261). Either part of the frame may be zeroed, or all of it.
     #[test]
-    fn a_torn_target_vin_frame_reads_back_as_an_empty_journal() {
-        let dir = TempDir::new();
-        let vin = Vin::new("WDB12345678901234".to_owned());
-        drop(Journal::create(&dir.0, &key(), Some(&vin)).expect("create"));
-        let mut bytes = fs::read(path(&dir)).expect("read");
-        let FrameRead::Ok { next, .. } = read_frame(&bytes, PREAMBLE) else {
-            panic!("header");
-        };
-        bytes[next + FRAME_HEADER..].fill(0);
-        let loaded = load(&bytes, &key()).expect("a torn tail reads back");
-        assert_eq!(loaded.len, next);
-        assert_eq!(loaded.state.facts.target_vin, None);
-        assert_eq!(loaded.state.records, 0);
+    fn a_damaged_target_vin_frame_reads_back_as_an_empty_journal() {
+        for whole in [false, true] {
+            let dir = TempDir::new();
+            let vin = Vin::new("WDB12345678901234".to_owned());
+            drop(Journal::create(&dir.0, &key(), Some(&vin)).expect("create"));
+            let mut bytes = fs::read(path(&dir)).expect("read");
+            let FrameRead::Ok { next, .. } = read_frame(&bytes, PREAMBLE) else {
+                panic!("header");
+            };
+            let from = if whole { next } else { next + FRAME_HEADER };
+            bytes[from..].fill(0);
+            let loaded = load(&bytes, &key()).expect("a torn tail reads back");
+            assert_eq!(loaded.len, next);
+            assert_eq!(loaded.state.facts.target_vin, None);
+            assert_eq!(loaded.state.records, 0);
+
+            // The writer's open cuts the file off at the header, and the next record is the
+            // journal's first (sequence number 0).
+            fs::write(path(&dir), &bytes).expect("damage");
+            let mut journal = Journal::open(&dir.0, &key()).expect("open");
+            assert_eq!(fs::metadata(path(&dir)).expect("meta").len(), next as u64);
+            journal.commit_step(at(1, 1), None).expect("first record");
+            drop(journal);
+            let state = Journal::read(&dir.0, &key()).expect("read back");
+            assert_eq!((state.records, state.facts.target_vin), (1, None));
+        }
     }
 
     #[test]

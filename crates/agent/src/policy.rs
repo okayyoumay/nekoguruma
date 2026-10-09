@@ -161,6 +161,12 @@ pub fn check_program(program: &Program, permission: Permission) -> Result<(), (u
     Ok(())
 }
 
+/// Whether the program sends anything a read-only job may not (ADR-257), so it needs the
+/// reprogramming slot.
+pub fn writes(program: &Program) -> bool {
+    check_program(program, Permission::ReadOnly).is_err()
+}
+
 #[cfg(test)]
 mod tests {
     use diag_ir::IR_SCHEMA_VERSION;
@@ -273,6 +279,26 @@ mod tests {
             matches!(refused, Err((1, HostError::UseFlashTransfer))),
             "{refused:?}"
         );
+    }
+
+    #[test]
+    fn a_program_writes_when_a_read_only_job_may_not_send_it() {
+        assert!(!writes(&program(vec![
+            Op::PushBytes(0),
+            Op::ServiceRequest { service: 0x22 },
+            Op::ReadDtc { mask: 0x08 },
+        ])));
+        assert!(!writes(&program(Vec::new())));
+        for op in [
+            Op::ServiceRequest { service: 0x2E },
+            Op::RoutineControl {
+                routine: 0xFF00,
+                sub: 1,
+            },
+            Op::FlashTransfer { block: 0 },
+        ] {
+            assert!(writes(&program(vec![Op::PushBytes(0), op])));
+        }
     }
 
     #[cfg(debug_assertions)]

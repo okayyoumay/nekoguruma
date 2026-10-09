@@ -1,9 +1,9 @@
 //! Restart guards (design 8.8, 8.8.1; ADR-229 item 2 step 1, ADR-256).
 //!
-//! On one device, a job holds:
-//! - the lock of the VCI it uses (per-VCI lock);
+//! On one device, every job holds the lock of the VCI it uses (per-VCI lock), and a job that
+//! reprograms also holds:
 //! - the device's single reprogramming slot, since only one ECU is reprogrammed at a time per
-//!   device.
+//!   device. A job that only reads ([`JobGuards::take_vci_only`]) does not take it.
 //!
 //! The per-vehicle lock of design 8.8's two-stage locking is not here: its lock would have to
 //! be named after the vehicle without keeping its VIN on the device (ADR-256 item 6).
@@ -13,7 +13,7 @@
 //! crashed agent never blocks the restart that follows it. The files are never deleted: a
 //! process that locked a recreated file would not exclude one still holding the old one.
 //!
-//! Locks are always taken in the same order (VCI, then slot), so two jobs that wait on each
+//! Locks are always taken in the same order (VCI, then slot when wanted), so two jobs that wait on each
 //! other cannot both hold what the other needs. Waiting polls `try_lock` and stops when the job
 //! is cancelled.
 
@@ -47,12 +47,13 @@ pub enum GuardError {
     InvalidVci(String),
 }
 
-/// The guards one job holds: the per-VCI lock and the reprogramming slot. Dropping it releases
-/// them. It is not `Clone`, so one set of guards serves one run at a time.
+/// The guards one job holds: the per-VCI lock, and for a job that reprograms also the
+/// reprogramming slot. Dropping it releases them. It is not `Clone`, so one set of guards serves
+/// one run at a time.
 #[derive(Debug)]
 pub struct JobGuards {
     _vci: LockFile,
-    _slot: LockFile,
+    _slot: Option<LockFile>,
 }
 
 impl JobGuards {
@@ -64,16 +65,42 @@ impl JobGuards {
         poll: Duration,
         cancelled: &AtomicBool,
     ) -> Result<Self, GuardError> {
+        let vci = Self::take_vci(setup, poll, cancelled)?;
+        let slot = LockFile::wait(&setup.dir.join("reprogramming.lock"), poll, cancelled)?;
+        Ok(Self {
+            _vci: vci,
+            _slot: Some(slot),
+        })
+    }
+
+    /// Takes only the per-VCI lock of `setup.vci`, for a job that does not reprogram. Waits and
+    /// validates like [`JobGuards::take`].
+    pub fn take_vci_only(
+        setup: &GuardSetup,
+        poll: Duration,
+        cancelled: &AtomicBool,
+    ) -> Result<Self, GuardError> {
+        Ok(Self {
+            _vci: Self::take_vci(setup, poll, cancelled)?,
+            _slot: None,
+        })
+    }
+
+    /// Whether these guards hold the device's reprogramming slot.
+    pub fn holds_slot(&self) -> bool {
+        self._slot.is_some()
+    }
+
+    fn take_vci(
+        setup: &GuardSetup,
+        poll: Duration,
+        cancelled: &AtomicBool,
+    ) -> Result<LockFile, GuardError> {
         if setup.vci.is_empty() || setup.vci.len() > MAX_VCI_NAME {
             return Err(GuardError::InvalidVci(setup.vci.clone()));
         }
         fs::create_dir_all(&setup.dir)?;
-        let vci = LockFile::wait(&vci_path(&setup.dir, &setup.vci), poll, cancelled)?;
-        let slot = LockFile::wait(&setup.dir.join("reprogramming.lock"), poll, cancelled)?;
-        Ok(Self {
-            _vci: vci,
-            _slot: slot,
-        })
+        LockFile::wait(&vci_path(&setup.dir, &setup.vci), poll, cancelled)
     }
 }
 
@@ -186,6 +213,67 @@ mod tests {
             .unwrap();
         vci2.try_lock().expect("VCI-2's lock is free again");
         drop((vci2, _held));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The VCI-only guards hold the VCI lock: a second job on the VCI waits for them.
+    #[test]
+    fn vci_only_guards_hold_the_vci_lock() {
+        let dir = dir("vci-only-wait");
+        let held = JobGuards::take_vci_only(&setup(&dir, "VCI-1"), POLL, &AtomicBool::new(false))
+            .expect("first job");
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let other = setup(&dir, "VCI-1");
+        let waiter = {
+            let cancelled = Arc::clone(&cancelled);
+            std::thread::spawn(move || JobGuards::take_vci_only(&other, POLL, &cancelled))
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!waiter.is_finished(), "the second job must wait");
+        cancelled.store(true, Ordering::Relaxed);
+        let taken = waiter.join().unwrap();
+        assert!(matches!(taken, Err(GuardError::Cancelled)), "{taken:?}");
+
+        let waiter = {
+            let other = setup(&dir, "VCI-1");
+            std::thread::spawn(move || {
+                JobGuards::take_vci_only(&other, POLL, &AtomicBool::new(false))
+            })
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!waiter.is_finished(), "still waiting");
+        drop(held);
+        waiter.join().unwrap().expect("taken once released");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// VCI-only guards leave the reprogramming slot free for a job on another VCI.
+    #[test]
+    fn vci_only_guards_leave_the_slot_free() {
+        let dir = dir("vci-only-slot");
+        let _held = JobGuards::take_vci_only(&setup(&dir, "VCI-1"), POLL, &AtomicBool::new(false))
+            .expect("read job");
+        let writer = JobGuards::take(&setup(&dir, "VCI-2"), POLL, &AtomicBool::new(false))
+            .expect("the slot is free");
+        assert!(writer.holds_slot());
+        drop((writer, _held));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn only_a_full_take_holds_the_slot() {
+        let dir = dir("holds-slot");
+        let never = AtomicBool::new(false);
+        let full = JobGuards::take(&setup(&dir, "VCI-1"), POLL, &never).unwrap();
+        assert!(full.holds_slot());
+        drop(full);
+        let vci_only = JobGuards::take_vci_only(&setup(&dir, "VCI-1"), POLL, &never).unwrap();
+        assert!(!vci_only.holds_slot());
+        assert!(matches!(
+            JobGuards::take_vci_only(&setup(&dir, ""), POLL, &never),
+            Err(GuardError::InvalidVci(_))
+        ));
+        drop(vci_only);
         fs::remove_dir_all(&dir).unwrap();
     }
 

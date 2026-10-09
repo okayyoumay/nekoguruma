@@ -45,8 +45,11 @@ Steps (`agent::check_program`, `agent::launch::launch_j2534_worker`, then `agent
 4. Launch the service with the library name and the ABI's default `long_size` (design 7.1.2;
    always the default, whatever a registration definition declares), provision its
    auth key and connect the gRPC client (design 7.4).
-5. Run the program under the request policy and the default job limits (ADR-235), then stop
-   the worker. The policy is read-only, except that a debug build may send any request once
+5. Take the job's guards from the `--locks` directory, named by `--vci` ("Job guards" below):
+   the per-VCI lock, plus the reprogramming slot when the program writes (`policy::writes`).
+   The run waits here while another job on the device holds them.
+6. Run the program under the request policy and the default job limits (ADR-235), then stop
+   the worker and release the guards. The policy is read-only, except that a debug build may send any request once
    the worker's VCI has identified itself as `sim-vci` (ADR-247); a program that needs more
    than the VCI allows is refused after the link opens, before its first instruction runs.
    On that permission the `FlashTransfer` instruction also works (ADR-250); `SecurityAccess`
@@ -106,7 +109,8 @@ changes the file. The journal only records; committing an intent marker before t
 commit fails, are the job runner's duties.
 
 `agent::run_program_journaled` is the runner that keeps it (ADR-252). It takes a
-`JournalSetup` (directory, job key, and the `ServiceSources` table for the ECU's identity) and,
+`JournalSetup` (directory, job key, and the `ServiceSources` table for the ECU's identity) and
+the job's guards ("Job guards" below), which it returns with the result, and,
 for a program with a flash recovery plan, creates the journal once the link is open and the
 policy allows the program, before anything is sent to the ECU; a program without a plan keeps
 none. A journal that already exists ends the job with nothing sent: a job that ran before goes
@@ -160,9 +164,8 @@ plan's entry; otherwise, or for a stage the program does not declare, the decisi
 
 ## Restart entry
 
-`agent::resume_program_journaled` takes the arguments of `run_program_journaled` and the job's
-restart guards (`JobGuards`, "Job guards" below), for a job that ran before (ADR-255), and
-returns the guards with its result.
+`agent::resume_program_journaled` takes the same arguments as `run_program_journaled`,
+guards included, for a job that ran before (ADR-255), and returns the guards with its result.
 Once the link is open and the policy allows the program, and before anything is sent to the
 ECU, it opens the job's journal (`Journal::open`) and classifies it.
 

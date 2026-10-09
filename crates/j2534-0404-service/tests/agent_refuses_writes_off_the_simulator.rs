@@ -12,8 +12,10 @@
 //! This file holds a single test, so the process-wide `VCI_CONFIG_PATH` it sets for the
 //! spawned service cannot race with another test.
 
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use agent::guards::{GuardSetup, JobGuards};
 use agent::policy::READ_ONLY_SERVICES;
 use agent::{HostError, JobError, JobLimits, LinkConfig, run_program};
 use diag_ir::{IR_SCHEMA_VERSION, Op, Program};
@@ -89,6 +91,32 @@ fn agent_refuses_a_write_on_a_vci_that_is_not_the_simulator() {
     drop(config);
 }
 
+/// Guards for one job, in a lock directory of this call's own: the slot is device-wide, so
+/// jobs of parallel tests must not share a directory. `writes` takes the reprogramming slot.
+fn job_guards(writes: bool) -> JobGuards {
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock should be after unix epoch")
+        .as_nanos();
+    let setup = GuardSetup {
+        dir: std::env::temp_dir().join(format!(
+            "agent-refuses-locks-{}-{nanos}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        )),
+        vci: "agent-refuses-vci".to_owned(),
+    };
+    let never = AtomicBool::new(false);
+    let poll = Duration::from_millis(10);
+    if writes {
+        JobGuards::take(&setup, poll, &never)
+    } else {
+        JobGuards::take_vci_only(&setup, poll, &never)
+    }
+    .expect("guards should be free")
+}
+
 async fn run_the_job() {
     let worker = WorkerProcess::launch(
         std::path::Path::new(env!("CARGO_BIN_EXE_j2534-0404-service")),
@@ -109,14 +137,17 @@ async fn run_the_job() {
         .expect("client should connect");
 
     assert!(!READ_ONLY_SERVICES.contains(&0x10));
-    let error = run_program(
+    // The program writes, so its guards hold the slot: the refusal below is the policy's, not
+    // the missing slot's.
+    let (result, _guards) = run_program(
         client,
         &LinkConfig::iso15765(0x7E0, 0x7E8),
         program(),
         JobLimits::default(),
+        job_guards(true),
     )
-    .await
-    .expect_err("the write should be refused");
+    .await;
+    let error = result.expect_err("the write should be refused");
     // The debug build's ceiling lets the program through before anything opens, so this is the
     // check after the link is open: it refuses at the session change, and the read before it
     // never ran (a read on the mock's channel would have failed the job another way).

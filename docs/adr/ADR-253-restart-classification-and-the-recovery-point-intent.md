@@ -44,6 +44,9 @@ Two ways to close this were considered:
    - One intent per plan is enough. The validator forbids any jump or call from at or past the
      point back before it (ADR-245 item 4), so execution never crosses the point again.
    - Any primitive counts, including a `Wait`. That errs on the side of on-site intervention.
+   - A cancelled job commits no intent. A request the VM refuses after the intent (a check only
+     `step` makes) or a cancel after it leaves an intent for a request that was not sent, which
+     also errs on the side of on-site intervention.
 2. **The interruption point** is the latest, by step count, of these records:
    - the last completed step;
    - the transfer-start marker;
@@ -60,6 +63,11 @@ Two ways to close this were considered:
      at or past a plan's `FromPc` and before its end, or a point inside a `RecoveryRequired`
      section. This check comes before the next two, so it holds whether or not a transfer
      started.
+     - The journal records no steps after a plan, so a plan that ran to its end leaves its last
+       step on its last primitive, past the point. When the journal records that plan's
+       post-transfer completion, execution got beyond its end, and the point does not count.
+     - The journal places a point only inside a plan, or on the step into a plan's entry, so
+       only a section there can be found this way.
    - **No transfer-start marker**: a plain start, since nothing was erased.
    - **A transfer-start marker**: the restart order for the plan with the marker's stage. The
      marker alone is enough, so a lost erase response is an interrupted transfer. A stage the
@@ -71,6 +79,10 @@ Two ways to close this were considered:
    - It must decode, pass `Vm::check_state`, and stand at the plan's entry. Otherwise the job
      needs on-site intervention, so a version 1 state, which still decodes (ADR-245 item 7), is
      refused before anything is sent.
+   - Its step count is set to one more than any record's in the journal (`restart::next_steps`),
+     since the journal orders records by step count and refuses one that does not come after
+     the last; `StepRef::steps` keeps counting across resumes. A plain start on an existing
+     journal continues from the same count.
 4. **The outcome lives in the classification.** `OnSiteInterventionRequired` is a variant of
    `RestartDecision`, with a reason. Wiring it into the job runner's result belongs to the
    restart entry, together with the resume limit and the voltage read.
@@ -86,5 +98,8 @@ Two ways to close this were considered:
   steps. The journal's newest VM state is then the second plan's entry, while its transfer is the
   first plan's. The classification refuses that pairing (`MissingEntryState`), so such a job
   ends in on-site intervention rather than a restart.
+- A `RecoveryRequired` section outside every plan is not found: the runner journals nothing
+  there, so a crash after a request in it was sent but before its response reads as a plain
+  start.
 - `RecoveryFacts`, the journal's part of the handover summary (ADR-244 item 4), gains
   `last_intent`, so a receiving device sees the intent too.

@@ -137,6 +137,10 @@ impl<S: Store> JobJournal<S> {
                         .get(pc as usize)
                         .is_some_and(Op::is_diagnostic_primitive)
                 {
+                    // A cancelled job sends nothing more, so it leaves no intent either.
+                    if cancelled.load(Ordering::Relaxed) {
+                        return Err(JobError::Cancelled);
+                    }
                     self.journal.commit_intent(at)?;
                 }
                 if marked || self.journal.state().facts.last_intent == Some(at) {

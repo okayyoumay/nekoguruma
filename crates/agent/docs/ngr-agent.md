@@ -141,14 +141,15 @@ step count, of the last completed step, the two transfer markers and the last re
 |---|---|
 | none (`NotFound`) | plain start |
 | unreadable (corrupt, unknown format version, another job, I/O) | `OnSiteInterventionRequired` |
-| interruption point at or past a plan's recovery-required point and before its end, or inside a `RecoveryRequired` section | `OnSiteInterventionRequired` |
+| interruption point at or past a plan's recovery-required point and before its end (unless the journal records that plan's post-transfer completion), or inside a `RecoveryRequired` section the journal can place it in (inside a plan, or the step into a plan's entry) | `OnSiteInterventionRequired` |
 | no transfer-start marker | plain start |
 | transfer-start marker | `Restart`, for the plan of the marker's stage, with the VM state at its entry |
 
 A restart's entry state is the newest state the journal holds, or the program's initial state
 when the job started at the entry. It must decode, pass `Vm::check_state` and stand at the
 plan's entry; otherwise, or for a stage the program does not declare, the decision is
-`OnSiteInterventionRequired`.
+`OnSiteInterventionRequired`. Its step count continues after the journal's last record
+(`restart::next_steps`), so the restart's records come after the old ones.
 
 ## Restart inputs
 

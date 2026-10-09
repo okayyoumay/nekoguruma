@@ -34,7 +34,9 @@ pub struct RestartPoint {
     /// The interruption point, if the journal records one.
     pub interrupted_at: Option<StepRef>,
     /// The VM state at the plan's entry, checked against the program, which the restart's
-    /// replay starts from.
+    /// replay starts from. Its step count continues after the journal's last record
+    /// ([`next_steps`]), since the journal orders records by it and refuses one that does not
+    /// come after the last.
     pub entry_state: VmState,
     /// The journal's facts, which the later restart steps compare against.
     pub facts: RecoveryFacts,
@@ -79,7 +81,7 @@ pub fn classify(
     let facts = &state.facts;
     let interrupted_at = interruption_point(facts);
     if let Some(at) = interrupted_at
-        && let Some(reason) = recovery_required(program, at)
+        && let Some(reason) = recovery_required(program, facts, at)
     {
         return RestartDecision::OnSiteInterventionRequired(reason);
     }
@@ -106,12 +108,37 @@ pub fn classify(
             });
         }
     };
+    let mut entry_state = entry_state;
+    entry_state.steps = next_steps(state);
     RestartDecision::Restart(Box::new(RestartPoint {
         flash_session: plan.flash_session,
         interrupted_at,
         entry_state,
         facts: facts.clone(),
     }))
+}
+
+/// The step count a run that goes on with `state`'s journal starts from: one more than any
+/// record's, so its first record comes after the last one (ADR-244 item 4), whether it is a
+/// restart or a plain start on an existing journal. `StepRef::steps` keeps counting across
+/// resumes.
+pub fn next_steps(state: &JournalState) -> u64 {
+    let facts = &state.facts;
+    let transfer = facts.transfer.as_ref();
+    let exit = transfer.and_then(|t| t.exit.as_ref());
+    [
+        facts.last_step,
+        transfer.map(|t| t.started_at),
+        exit.map(|e| e.intent_at),
+        exit.and_then(|e| e.last_post_step),
+        facts.last_intent,
+        state.last_vm_state.as_ref().map(|(at, _)| *at),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|at| at.steps.saturating_add(1))
+    .max()
+    .unwrap_or(0)
 }
 
 /// The latest of the last completed step and the requests written ahead, by step count. A
@@ -132,10 +159,27 @@ pub fn interruption_point(facts: &RecoveryFacts) -> Option<StepRef> {
 
 /// Why an interruption at `at` rules out a restart, if it does: at or past a plan's
 /// recovery-required point and before its end, or inside a section marked `RecoveryRequired`.
-fn recovery_required(program: &Program, at: StepRef) -> Option<OnSiteReason> {
+///
+/// A plan whose post-transfer completion the journal records was left at its end: the journal
+/// records no steps after a plan, so its last step stays on the plan's last primitive, and the
+/// completion is what says execution got past it. Sections are checked only where the journal
+/// can place a point: inside a plan, or on the step into a plan's entry.
+fn recovery_required(
+    program: &Program,
+    facts: &RecoveryFacts,
+    at: StepRef,
+) -> Option<OnSiteReason> {
+    let completed = |stage: u32| {
+        facts.transfer.as_ref().is_some_and(|transfer| {
+            transfer.stage.0 == stage
+                && !transfer.interrupted
+                && transfer.exit.as_ref().is_some_and(|exit| exit.complete)
+        })
+    };
     for plan in &program.flash {
         if let RecoveryRequired::FromPc(from) = plan.recovery_required
             && (from..plan.boundaries.post_transfer_end_pc).contains(&at.pc)
+            && !completed(plan.stage)
         {
             return Some(OnSiteReason::RecoveryRequiredPoint {
                 flash_session: plan.flash_session,
@@ -317,7 +361,25 @@ mod tests {
         assert_eq!(point.flash_session, 1);
         assert_eq!(point.interrupted_at, Some(at(ERASE)));
         assert_eq!(point.entry_state.pc, ENTRY);
-        assert_eq!(point.entry_state.steps, u64::from(ENTRY));
+        // The step count goes on after the journal's last record, the marker at the erase.
+        assert_eq!(point.entry_state.steps, u64::from(ERASE) + 1);
+        assert_eq!(next_steps(j.state()), u64::from(ERASE) + 1);
+    }
+
+    /// The point found by review: a plan with a recovery-required point that ran to its end
+    /// leaves its last step on its last primitive, past the point; the completion record says
+    /// execution got beyond it, so a later crash is not refused for the point.
+    #[test]
+    fn a_completed_plan_does_not_need_on_site_intervention_for_its_point() {
+        let program = program(RecoveryRequired::FromPc(CHECK));
+        // The run reached the end: its last step is the check, past the point.
+        let mut j = journal_until(&program, END);
+        assert!(matches!(
+            decide(&program, &j),
+            RestartDecision::OnSiteInterventionRequired(OnSiteReason::RecoveryRequiredPoint { .. })
+        ));
+        j.commit_post_transfer_complete().unwrap();
+        assert!(matches!(decide(&program, &j), RestartDecision::Restart(_)));
     }
 
     #[test]
@@ -363,8 +425,9 @@ mod tests {
 
     #[test]
     fn a_point_in_a_recovery_required_section_needs_on_site_intervention() {
+        // The section ends at the plan's entry; the journal places the point on the step into
+        // the entry (pc 1), the only place before a plan it records.
         let mut program = program(RecoveryRequired::Never);
-        program.flash.clear();
         program.sections.push(Section {
             start_pc: 0,
             end_pc: 2,

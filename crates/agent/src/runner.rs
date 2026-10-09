@@ -1252,6 +1252,55 @@ mod tests {
         let (commits, intent) = count(&program);
         assert_eq!(commits, baseline + 1);
         assert_eq!(intent.map(|at| at.pc), Some(download));
+        // From an instruction that is not a primitive (the check's operand): the intent lands on
+        // the next primitive, the check.
+        let (program, check) = program_with_check(diag_ir::RecoveryRequired::Never);
+        let mut program = program;
+        program.flash[0].recovery_required = diag_ir::RecoveryRequired::FromPc(check - 1);
+        program.validate().unwrap();
+        let (commits, intent) = count(&program);
+        assert_eq!(commits, baseline + 1);
+        assert_eq!(intent.map(|at| at.pc), Some(check));
+    }
+
+    /// Two plans, each with its own recovery-required point: each writes its own intent once.
+    #[test]
+    fn each_plan_writes_its_recovery_point_ahead() {
+        let mut program = flash_program();
+        let len = program.code.len() as u32;
+        let plan_code: Vec<Op> = program.code[ENTRY as usize..].to_vec();
+        program.code.extend(plan_code);
+        let download = ERASE + 3;
+        program.flash[0].recovery_required = diag_ir::RecoveryRequired::FromPc(download);
+        let mut second = program.flash[0].clone();
+        second.flash_session = 2;
+        second.stage = 8;
+        let shift = len - ENTRY;
+        let b = &mut second.boundaries;
+        b.entry_pc += shift;
+        b.erase_pc += shift;
+        b.transfer_exit_pc += shift;
+        b.post_transfer_end_pc += shift;
+        second.recovery_required = diag_ir::RecoveryRequired::FromPc(download + shift);
+        program.flash.push(second);
+        program.validate().unwrap();
+        let commits = Rc::new(Cell::new(0));
+        let mut host = FlashHost::new(Rc::clone(&commits));
+        let mut journal = counting_journal(&commits, None);
+        run_on(
+            &program,
+            &mut host,
+            JobLimits::default(),
+            &AtomicBool::new(false),
+            Some(&mut journal),
+        )
+        .unwrap();
+        // The adjacent-plans count (16 + 12) plus one intent per plan.
+        assert_eq!(commits.get(), 16 + 12 + 2);
+        assert_eq!(
+            journal.journal().state().facts.last_intent.map(|at| at.pc),
+            Some(download + shift)
+        );
     }
 
     /// A post-transfer step is recorded, and the completion is committed with the step that

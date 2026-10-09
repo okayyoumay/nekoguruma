@@ -190,18 +190,17 @@ entry.
 ## Restart guards
 
 The `guards` module holds a job's exclusive locks on the device (design 8.8, 8.8.1; ADR-256):
-the per-VCI lock, the device's single reprogramming slot and, once a VIN read matches the job's
-VIN, the per-vehicle lock. Each is an OS lock (`File::try_lock`) on a file in the device's lock
-directory: `vci-{hex name}.lock`, `reprogramming.lock` and `vehicle-{hex VIN}.lock`. The OS
+the per-VCI lock and the device's single reprogramming slot. Each is an OS lock
+(`File::try_lock`) on a file in the device's lock directory: `vci-{hex name}.lock` and
+`reprogramming.lock`. The per-vehicle lock is not here: its file must not carry the VIN
+(ADR-256 item 6). The OS
 releases a lock when its process dies, so a crashed run never blocks the next one, and the
 files are never deleted.
 
 - `JobGuards::take(GuardSetup { dir, vci }, poll, cancelled)` takes the per-VCI lock, then the
   slot. It waits while another job holds either, retrying every `poll`, and stops on a cancel
   (`GuardError::Cancelled`).
-- `JobGuards::promote(vin, ...)` takes the per-vehicle lock the same way. The same VIN again
-  does nothing; another VIN is refused. A job's promotions run one at a time.
-- Locks are always taken in the order VCI, slot, vehicle, and held until the `JobGuards` is
+- Locks are always taken in the order VCI, then slot, and held until the `JobGuards` is
   dropped.
 
 `resume_program_journaled` takes the guards by value and returns them with the run's result,

@@ -939,7 +939,7 @@ The targets form 3 tiers: VCI (communication interface) -> vehicle bus -> ECU.
 | Server | Per-VIN soft lock (recording running jobs and warning) | Does not work offline |
 | Vehicle | Check session state and bus conditions on connection | Detection, not prevention |
 
-- **Two-stage locking**: First take a per-VCI lock, then after reading the VIN, promote to a per-vehicle lock. Before the VIN is obtained, only the per-VCI lock is effective (addresses the ordering problem that the lock target cannot be identified yet). The agent implements the per-VCI lock, the per-vehicle lock and the device's reprogramming slot (8.8.1) as OS locks on files in a device lock directory, which the OS releases when a process dies, and takes them in that fixed order (ADR-256)
+- **Two-stage locking**: First take a per-VCI lock, then after reading the VIN, promote to a per-vehicle lock. Before the VIN is obtained, only the per-VCI lock is effective (addresses the ordering problem that the lock target cannot be identified yet). The agent implements the per-VCI lock and the device's reprogramming slot (8.8.1) as OS locks on files in a device lock directory, which the OS releases when a process dies, taken in that order (ADR-256); a per-vehicle lock file must not carry a recoverable VIN, since lock files stay on the device
 - **Monitoring during writes**: Response timeouts and bus anomalies during flash transfer are treated as signs of interference from another tool, and the job is aborted at an interruptible position
 
 #### 8.8.1 Concurrent Work with Multiple VCIs and Multiple Vehicles

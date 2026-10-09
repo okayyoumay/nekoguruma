@@ -30,14 +30,13 @@ Several things are not settled by the design:
    - `vci-{hex name}.lock` for each VCI, whose name has 1 to 100 bytes so that the file name
      stays within the 255-byte limit of common file systems (`GuardError::InvalidVci`
      otherwise);
-   - `reprogramming.lock` for the slot;
-   - `vehicle-{hex VIN}.lock` for each vehicle.
+   - `reprogramming.lock` for the slot.
    - **Why a file lock.** The kernel releases the lock with the handle, also when the process
      dies, so a crashed run never blocks its restart. One mechanism serves Linux and Windows
      without platform code. A named mutex (`Global\`) would need Windows-only
      code and has no Linux counterpart.
-   - **Hex names.** The VCI's name and the VIN are hex-encoded into the file name, so any
-     name within the length limits gives a valid and distinct file.
+   - **Hex names.** The VCI's name is hex-encoded into the file name, so any name within the
+     length limit gives a valid and distinct file.
    - **Never deleted.** A process that locked a recreated file would not exclude one still
      holding the old one.
    - **One directory per device.** Every agent process on the device, whichever user it runs
@@ -47,15 +46,12 @@ Several things are not settled by the design:
 2. **The caller names the VCI.** `LinkConfig` does not identify the VCI; the worker the job
    talks to does. `GuardSetup { dir, vci }` carries the name the device uses for it, for
    example the one `ngr-agent run --vci` takes. Two jobs on one VCI must give the same name.
-3. **Waiting polls, and a cancel stops it.** `JobGuards::take` and `JobGuards::promote` try
-   the lock, sleep for the given poll (at least 1 ms, so a zero never spins), and try again
-   while another job holds it. Promotions of one job run one at a time, so two at once never
-   wait on each other's file lock; the guards' VIN can still be read during a promotion's
-   wait. A
-   cancel ends the wait with nothing taken, and the caller gets `GuardError::Cancelled`.
+3. **Waiting polls, and a cancel stops it.** `JobGuards::take` tries each lock, sleeps for the
+   given poll (at least 1 ms, so a zero never spins), and tries again while another job holds
+   it. A cancel ends the wait with nothing taken, and the caller gets `GuardError::Cancelled`.
    A blocking lock call could not be cancelled. A standalone agent has no start deadline, so
    the wait has no other end (ADR-255 item 4).
-4. **Fixed lock order: VCI, slot, vehicle.** Every job takes them in this order and holds
+4. **Fixed lock order: VCI, then slot.** Every job takes them in this order and holds
    them until it ends. A job therefore never waits for a lock that comes before one it holds,
    and two jobs cannot each hold what the other waits for.
 5. **The caller owns the guards; a run borrows them by value.** `resume_program_journaled`
@@ -75,10 +71,13 @@ Several things are not settled by the design:
    - Taking them inside the runner was rejected: the runner's return would release them, so
      a worker crash would hand the slot to another job while this ECU may still be in its
      programming session.
-6. **The per-vehicle promotion is available, not yet called.** `JobGuards::promote(vin)` takes
-   the vehicle's lock and keeps it with the job's other guards. A second call with the same
-   VIN does nothing; another VIN is refused. Restart steps 2 and 3 call it at the first VIN
-   match (ADR-229 item 2).
+6. **The per-vehicle lock is left to the restart's identity steps.** Its lock file would be
+   named after the vehicle and, like the others, kept on the device. A name that holds the VIN,
+   even hex-encoded, would keep VINs on the device outside the retention and deletion rules
+   that apply to them (design 5.5, 16.2). The per-vehicle lock therefore comes with restart
+   steps 2 and 3, which promote to it at the first VIN match (ADR-229 item 2), together with a
+   file name from which the VIN cannot be recovered. It is taken after the slot, keeping the
+   order of item 4.
 
 ## Consequences
 

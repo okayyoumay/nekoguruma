@@ -1,7 +1,7 @@
 # ADR-252: The Job Runner Journals at the Flash Recovery Plan's Boundaries
 
 **Date:** 2026-10-08
-**Status:** Accepted
+**Status:** Accepted (item 2's open point decided by ADR-253)
 **Affects:** `agent` (`src/runner.rs`, `src/journaling.rs`, `src/inputs.rs`, `src/host.rs`), `j2534-0404-service` (`tests/agent_flash_transfer.rs`)
 
 ## Context
@@ -23,7 +23,8 @@ is no step before it.
    - at `entry_pc`, once per job and only before the job's first transfer: the identity
      (item 3);
    - at `erase_pc`: the transfer-start marker, with the plan's stage;
-   - at `transfer_exit_pc`: the RequestTransferExit marker.
+   - at `transfer_exit_pc`: the RequestTransferExit marker;
+   - before the first primitive at or past `FromPc`: the intent that ADR-253 adds.
 
    An arrival is counted once: a timer wait that polls the same instruction does not commit
    again. Before any of this, `Vm::current_op` runs the VM's own checks of the instruction
@@ -40,8 +41,9 @@ is no step before it.
      Only the erase and RequestTransferExit are written ahead of their requests: a request sent
      whose response was lost leaves the last step on the primitive before it, so the
      interruption point of ADR-229 item 1 can fall before a recovery-required point that a
-     later request crossed. How a restart treats the primitives after the last step is the
-     restart's to decide.
+     later request crossed. ADR-253 closes this: it adds a third write-ahead record, an intent
+     before the first primitive at or past the recovery-required point, and decides how a
+     restart reads it.
    - A step that brings execution to a plan's `entry_pc` commits its step record with the VM
      state after it (ADR-244 item 6), which is the state the restart replays from.
    - A step that brings execution to a plan's `post_transfer_end_pc`, after its exit marker,

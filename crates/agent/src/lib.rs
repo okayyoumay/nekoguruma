@@ -19,6 +19,7 @@ mod journaling;
 pub mod launch;
 pub mod link;
 pub mod policy;
+pub mod restart;
 pub mod runner;
 
 pub use host::{HostError, Timings, WorkerHost};

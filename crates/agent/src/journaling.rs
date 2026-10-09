@@ -7,7 +7,9 @@
 //! - at a plan's `entry_pc`, once per job and before its first transfer: the ECU hardware part
 //!   number and software version, read through the sources the program declares;
 //! - at `erase_pc`: the transfer-start marker;
-//! - at `transfer_exit_pc`: the RequestTransferExit marker.
+//! - at `transfer_exit_pc`: the RequestTransferExit marker;
+//! - at the first diagnostic primitive at or past a plan's recovery-required point that is
+//!   neither of those, once per pass through the plan: a request intent (ADR-253).
 //!
 //! When an instruction completes ([`JobJournal::completed`]):
 //! - a `FlashTransfer`: the block, by the host's running index;
@@ -25,7 +27,9 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use diag_ir::{DiagHost, FlashRecovery, IdentityKind, NoApplication, Op, Program, VmState};
+use diag_ir::{
+    DiagHost, FlashRecovery, IdentityKind, NoApplication, Op, Program, RecoveryRequired, VmState,
+};
 
 use crate::host::{HostError, TransferProgress};
 use crate::inputs::{FieldBytes, ServiceSources, read_field_bytes};
@@ -48,6 +52,9 @@ pub(crate) struct JobJournal<S = FileStore> {
     sources: ServiceSources,
     /// The identity was read for this job.
     identity_read: bool,
+    /// Stages whose recovery-required point the journal already places the interruption at or
+    /// past (an intent, or the erase or RequestTransferExit marker at or past it).
+    past_recovery_point: Vec<u32>,
 }
 
 impl JobJournal {
@@ -67,6 +74,7 @@ impl<S: Store> JobJournal<S> {
             journal,
             sources,
             identity_read: false,
+            past_recovery_point: Vec::new(),
         }
     }
 
@@ -100,6 +108,11 @@ impl<S: Store> JobJournal<S> {
         };
         for plan in &program.flash {
             let b = &plan.boundaries;
+            // Execution that comes back to the entry runs the plan again, recovery point included.
+            if pc == b.entry_pc {
+                self.past_recovery_point
+                    .retain(|stage| *stage != plan.stage);
+            }
             // The pre-erase version belongs before the job's first transfer (ADR-244 item 4),
             // and a second read could fall in a session the ECU refuses it in.
             if pc == b.entry_pc
@@ -115,6 +128,31 @@ impl<S: Store> JobJournal<S> {
             }
             if pc == b.transfer_exit_pc {
                 self.journal.commit_transfer_exit_intent(at)?;
+            }
+            // The first primitive at or past the recovery-required point is written ahead, so a
+            // crash before its response still places the interruption there (ADR-253). The
+            // validator keeps execution from going back across the point (ADR-245 item 4), so
+            // once is enough; the erase and RequestTransferExit markers already do it.
+            if let RecoveryRequired::FromPc(from) = plan.recovery_required
+                && (from..b.post_transfer_end_pc).contains(&pc)
+                && !self.past_recovery_point.contains(&plan.stage)
+            {
+                let marked = pc == b.erase_pc || pc == b.transfer_exit_pc;
+                if !marked
+                    && program
+                        .code
+                        .get(pc as usize)
+                        .is_some_and(Op::is_diagnostic_primitive)
+                {
+                    // A cancelled job sends nothing more, so it leaves no intent either.
+                    if cancelled.load(Ordering::Relaxed) {
+                        return Err(JobError::Cancelled);
+                    }
+                    self.journal.commit_intent(at)?;
+                }
+                if marked || self.journal.state().facts.last_intent == Some(at) {
+                    self.past_recovery_point.push(plan.stage);
+                }
             }
         }
         Ok(())

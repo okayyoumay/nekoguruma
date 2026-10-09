@@ -656,6 +656,8 @@ mod tests {
         /// Set when a ReadDataByIdentifier for this identifier arrives, as a dropped job
         /// future would.
         cancel_on_read: Option<([u8; 2], Arc<AtomicBool>)>,
+        /// A routine whose response is lost.
+        lose_routine: Option<u16>,
     }
 
     impl FlashHost {
@@ -666,6 +668,7 @@ mod tests {
                 transfer: None,
                 software_version: Some(b"SW01".to_vec()),
                 cancel_on_read: None,
+                lose_routine: None,
             }
         }
 
@@ -720,6 +723,9 @@ mod tests {
         }
         fn routine_control(&mut self, routine: u16, _: u8, _: &[u8]) -> Result<Vec<u8>, HostError> {
             self.log.push((Sent::Routine(routine), self.commits.get()));
+            if self.lose_routine == Some(routine) {
+                return Err(HostError::NoResponse);
+            }
             Ok(vec![0x71])
         }
         fn security_access(
@@ -1119,6 +1125,182 @@ mod tests {
                 assert!(!host.sent().iter().any(|s| matches!(s, Sent::Routine(_))));
             }
         }
+    }
+
+    /// `flash_program` with a post-transfer CheckMemory routine (0xFF01) after the exit, and the
+    /// plan's end after it.
+    fn program_with_check(recovery_required: diag_ir::RecoveryRequired) -> (Program, u32) {
+        let mut program = flash_program();
+        // RequestTransferExit, its Pop, then this routine's operand.
+        let check = EXIT + 3;
+        program.code.extend([
+            Op::PushBytes(0),
+            Op::RoutineControl {
+                routine: 0xFF01,
+                sub: 1,
+            },
+            Op::Pop,
+        ]);
+        program.flash[0].boundaries.post_transfer_end_pc = check + 2;
+        program.flash[0].recovery_required = recovery_required;
+        program.validate().unwrap();
+        (program, check)
+    }
+
+    /// The done-when cases, end to end: a job whose erase response is lost leaves a journal that
+    /// classifies as an interrupted transfer; one whose response to the request at the
+    /// recovery-required point is lost leaves one that classifies as on-site intervention,
+    /// because the request's intent was journaled before it was sent (ADR-253).
+    #[test]
+    fn a_lost_response_classifies_from_the_journal_the_job_left() {
+        use crate::restart::{OnSiteReason, RestartDecision, classify};
+
+        let (program, check) = program_with_check(diag_ir::RecoveryRequired::Never);
+        let commits = Rc::new(Cell::new(0));
+        let mut host = FlashHost::new(Rc::clone(&commits));
+        host.lose_routine = Some(0xFF00);
+        let mut journal = counting_journal(&commits, None);
+        let result = run_on(
+            &program,
+            &mut host,
+            JobLimits::default(),
+            &AtomicBool::new(false),
+            Some(&mut journal),
+        );
+        assert!(
+            matches!(result, Err(JobError::Host { pc: ERASE, .. })),
+            "{result:?}"
+        );
+        let decision = classify(&program, Ok(journal.journal().state()));
+        let RestartDecision::Restart(point) = decision else {
+            panic!("{decision:?}");
+        };
+        assert_eq!(
+            point.interrupted_at,
+            Some(StepRef {
+                pc: ERASE,
+                steps: 4
+            })
+        );
+        assert_eq!(point.entry_state.pc, ENTRY);
+
+        let (program, check2) = program_with_check(diag_ir::RecoveryRequired::FromPc(check));
+        assert_eq!(check, check2);
+        let commits = Rc::new(Cell::new(0));
+        let mut host = FlashHost::new(Rc::clone(&commits));
+        host.lose_routine = Some(0xFF01);
+        let mut journal = counting_journal(&commits, None);
+        let result = run_on(
+            &program,
+            &mut host,
+            JobLimits::default(),
+            &AtomicBool::new(false),
+            Some(&mut journal),
+        );
+        assert!(
+            matches!(result, Err(JobError::Host { pc, .. }) if pc == check),
+            "{result:?}"
+        );
+        // The intent is the commit right before the routine was sent.
+        let (_, commits_before) = host
+            .log
+            .iter()
+            .find(|(sent, _)| *sent == Sent::Routine(0xFF01))
+            .unwrap();
+        assert_eq!(
+            journal.journal().state().facts.last_intent.map(|at| at.pc),
+            Some(check)
+        );
+        assert_eq!(*commits_before, commits.get());
+        assert!(matches!(
+            classify(&program, Ok(journal.journal().state())),
+            RestartDecision::OnSiteInterventionRequired(OnSiteReason::RecoveryRequiredPoint {
+                flash_session: 1,
+                ..
+            })
+        ));
+    }
+
+    /// A recovery-required point at the erase or at RequestTransferExit is covered by its marker
+    /// and adds no intent; one past them adds exactly one, before the first primitive there.
+    #[test]
+    fn the_recovery_point_is_written_ahead_once() {
+        let count = |program: &Program| {
+            let commits = Rc::new(Cell::new(0));
+            let mut host = FlashHost::new(Rc::clone(&commits));
+            let mut journal = counting_journal(&commits, None);
+            run_on(
+                program,
+                &mut host,
+                JobLimits::default(),
+                &AtomicBool::new(false),
+                Some(&mut journal),
+            )
+            .unwrap();
+            (commits.get(), journal.journal().state().facts.last_intent)
+        };
+        let (plain, _) = program_with_check(diag_ir::RecoveryRequired::Never);
+        let (baseline, none) = count(&plain);
+        assert_eq!(none, None);
+        for from in [ERASE, EXIT] {
+            let (program, _) = program_with_check(diag_ir::RecoveryRequired::FromPc(from));
+            assert_eq!(count(&program), (baseline, None), "from {from}");
+        }
+        // From the RequestDownload: one intent there, none for the blocks after it.
+        let download = ERASE + 3;
+        let (program, _) = program_with_check(diag_ir::RecoveryRequired::FromPc(download));
+        let (commits, intent) = count(&program);
+        assert_eq!(commits, baseline + 1);
+        assert_eq!(intent.map(|at| at.pc), Some(download));
+        // From an instruction that is not a primitive (the check's operand): the intent lands on
+        // the next primitive, the check.
+        let (program, check) = program_with_check(diag_ir::RecoveryRequired::Never);
+        let mut program = program;
+        program.flash[0].recovery_required = diag_ir::RecoveryRequired::FromPc(check - 1);
+        program.validate().unwrap();
+        let (commits, intent) = count(&program);
+        assert_eq!(commits, baseline + 1);
+        assert_eq!(intent.map(|at| at.pc), Some(check));
+    }
+
+    /// Two plans, each with its own recovery-required point: each writes its own intent once.
+    #[test]
+    fn each_plan_writes_its_recovery_point_ahead() {
+        let mut program = flash_program();
+        let len = program.code.len() as u32;
+        let plan_code: Vec<Op> = program.code[ENTRY as usize..].to_vec();
+        program.code.extend(plan_code);
+        let download = ERASE + 3;
+        program.flash[0].recovery_required = diag_ir::RecoveryRequired::FromPc(download);
+        let mut second = program.flash[0].clone();
+        second.flash_session = 2;
+        second.stage = 8;
+        let shift = len - ENTRY;
+        let b = &mut second.boundaries;
+        b.entry_pc += shift;
+        b.erase_pc += shift;
+        b.transfer_exit_pc += shift;
+        b.post_transfer_end_pc += shift;
+        second.recovery_required = diag_ir::RecoveryRequired::FromPc(download + shift);
+        program.flash.push(second);
+        program.validate().unwrap();
+        let commits = Rc::new(Cell::new(0));
+        let mut host = FlashHost::new(Rc::clone(&commits));
+        let mut journal = counting_journal(&commits, None);
+        run_on(
+            &program,
+            &mut host,
+            JobLimits::default(),
+            &AtomicBool::new(false),
+            Some(&mut journal),
+        )
+        .unwrap();
+        // The adjacent-plans count (16 + 12) plus one intent per plan.
+        assert_eq!(commits.get(), 16 + 12 + 2);
+        assert_eq!(
+            journal.journal().state().facts.last_intent.map(|at| at.pc),
+            Some(download + shift)
+        );
     }
 
     /// A post-transfer step is recorded, and the completion is committed with the step that

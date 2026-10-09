@@ -1,7 +1,7 @@
 # ADR-244: Write-Job Journal as an Append-Only Record Log
 
 **Date:** 2026-10-07
-**Status:** Accepted
+**Status:** Accepted (record set extended by ADR-253)
 **Affects:** `crates/agent/src/journal.rs`, `crates/agent/tests/journal_crash.rs`, `docs/system-architecture.md` (5.5)
 
 ## Context

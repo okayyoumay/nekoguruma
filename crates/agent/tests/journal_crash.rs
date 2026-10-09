@@ -156,6 +156,7 @@ fn check_named_point(commits: usize, facts: &RecoveryFacts) -> Option<&'static s
                 resume_counts: Vec::new(),
                 attempt_key: None,
                 transfer: None,
+                last_intent: None,
             }
         ),
         "pre-erase version" => {

@@ -2046,6 +2046,30 @@ fn a_startup_in_progress_survives_a_snapshot() {
     assert!(SimEcu::restore(old, ManualClock::default(), ms(0)).is_ok());
 }
 
+#[test]
+fn a_reset_with_response_pending_starts_up_after_the_chain() {
+    let (mut ecu, clock) = ecu_with_clock(EcuConfig {
+        startup_ms: Some(500),
+        ..config()
+    });
+    ecu.inject(Fault::ResponsePending {
+        count: 2,
+        interval_ms: 1_000,
+    });
+    let exchange = ecu.exchange(Addressing::Physical, &[0x11, 0x01]);
+    assert_eq!(exchange.delay_ms, 2_000);
+    // The chain runs 2000 ms and the startup 500 ms after it; all requests in between are lost.
+    for at in [100, 1_999, 2_499] {
+        clock.advance(ms(at) - clock.now());
+        assert_eq!(ecu.request(&[0x3E, 0x00]), SimResponse::NoResponse, "{at}");
+    }
+    clock.advance(ms(1));
+    assert!(matches!(
+        ecu.request(&[0x3E, 0x00]),
+        SimResponse::Positive(_)
+    ));
+}
+
 // ---------------------------------------------------------------- Snapshot and restore
 
 /// Programming session, unlocked, two 2-byte blocks of a 6-byte download stored, on `clock`.

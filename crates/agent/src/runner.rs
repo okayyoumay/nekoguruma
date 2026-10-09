@@ -1120,8 +1120,8 @@ mod tests {
         /// The readings of the runtime inputs other than the supply voltage, which `voltage`
         /// answers; an input not set is `CannotBeEstablished`.
         inputs: crate::inputs::FixedInputs,
-        /// Every request but the reads of F186 is also pushed here (as in `sent`), for a test
-        /// that looks at the host while the job runs on another thread.
+        /// Every request is also pushed here, for a test that looks at the host while the job
+        /// runs on another thread.
         mirror: Option<Arc<Mutex<Vec<Sent>>>>,
         /// The answer to ECUReset.
         reset: ResetAnswer,
@@ -1133,6 +1133,8 @@ mod tests {
         session: SessionAnswer,
         /// When each read of F186 arrived.
         session_reads: Vec<std::time::Instant>,
+        /// When the last ECUReset arrived.
+        reset_at: Option<std::time::Instant>,
     }
 
     impl FlashHost {
@@ -1158,6 +1160,7 @@ mod tests {
                 session_script: std::collections::VecDeque::new(),
                 session: SessionAnswer::Default,
                 session_reads: Vec::new(),
+                reset_at: None,
             }
         }
 
@@ -1212,9 +1215,7 @@ mod tests {
         fn service_request(&mut self, service: u16, payload: &[u8]) -> Result<Vec<u8>, HostError> {
             self.log
                 .push((Sent::Service(service, payload.to_vec()), self.commits.get()));
-            if let Some(mirror) = &self.mirror
-                && !(service == 0x22 && payload == [0xF1, 0x86])
-            {
+            if let Some(mirror) = &self.mirror {
                 mirror
                     .lock()
                     .unwrap()
@@ -1233,13 +1234,16 @@ mod tests {
                 return Err(HostError::NoResponse);
             }
             match (service, payload) {
-                (0x11, _) => match self.reset {
-                    ResetAnswer::Positive => Ok(vec![0x51, payload[0]]),
-                    ResetAnswer::Refuse(nrc) => Ok(vec![0x7F, 0x11, nrc]),
-                    ResetAnswer::NoAnswer => Err(HostError::NoResponse),
-                    ResetAnswer::Garbled => Ok(vec![0x51]),
-                    ResetAnswer::Trailing => Ok(vec![0x51, 0x01, 0x00]),
-                },
+                (0x11, _) => {
+                    self.reset_at = Some(std::time::Instant::now());
+                    match self.reset {
+                        ResetAnswer::Positive => Ok(vec![0x51, payload[0]]),
+                        ResetAnswer::Refuse(nrc) => Ok(vec![0x7F, 0x11, nrc]),
+                        ResetAnswer::NoAnswer => Err(HostError::NoResponse),
+                        ResetAnswer::Garbled => Ok(vec![0x51]),
+                        ResetAnswer::Trailing => Ok(vec![0x51, 0x01, 0x00]),
+                    }
+                }
                 (0x22, [0xF1, 0x90]) => Ok(match &self.vin {
                     Some(vin) => [&[0x62, 0xF1, 0x90][..], vin].concat(),
                     None => vec![0x7F, 0x22, 0x31],
@@ -2639,6 +2643,7 @@ mod tests {
             "{result:?}"
         );
         assert_eq!(host.sent(), []);
+        assert!(host.session_reads.is_empty());
         assert_eq!(host.voltage_reads, 0);
         assert_eq!(resumes(&dir), 1);
         std::fs::remove_dir_all(&dir).unwrap();
@@ -2665,6 +2670,7 @@ mod tests {
                 "{voltage:?}: {result:?}"
             );
             assert_eq!(host.sent(), []);
+            assert!(host.session_reads.is_empty());
             assert_eq!(resumes(&dir), 0);
             std::fs::remove_dir_all(&dir).unwrap();
         }
@@ -2743,6 +2749,7 @@ mod tests {
         assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
         assert_eq!(host.voltage_reads, 0);
         assert_eq!(host.sent(), []);
+        assert!(host.session_reads.is_empty());
         assert_eq!(resumes(&dir), 0);
         std::fs::remove_dir_all(&dir).unwrap();
 
@@ -2886,6 +2893,7 @@ mod tests {
         assert!(!text.contains("vehicle-"), "{text}");
         assert!(!text.contains(&bucket), "{text}");
         assert_eq!(host.sent(), [read_of([0xF1, 0x90])]);
+        assert!(host.session_reads.is_empty());
     }
 
     #[test]
@@ -3380,6 +3388,7 @@ mod tests {
         assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
         assert!(started.elapsed() < Duration::from_secs(40));
         assert_eq!(host.sent(), [read_of([0xF1, 0x90])]);
+        assert!(host.session_reads.is_empty());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -3714,6 +3723,141 @@ mod tests {
         assert!(waited >= Duration::from_millis(80), "{waited:?}");
     }
 
+    const STARTUP_MS: u64 = 80;
+
+    /// [`restart_after`] on `program`, also giving when the restart began (the journal's first
+    /// run is over by then), as the lower bound of every time in it.
+    fn restart_started(
+        program: &Program,
+        prepare_first: impl FnOnce(&mut FlashHost),
+        prepare_restart: impl FnOnce(&mut FlashHost),
+    ) -> (Result<VmState, JobError>, FlashHost, std::time::Instant) {
+        let dir = journal_dir("resume-startup");
+        let result = first_run(program, &dir, JobLimits::default(), prepare_first);
+        assert!(matches!(result, Err(JobError::Host { .. })), "{result:?}");
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        prepare_restart(&mut host);
+        let started = std::time::Instant::now();
+        let result = resume(program, &dir, &mut host, false);
+        std::fs::remove_dir_all(&dir).unwrap();
+        (result, host, started)
+    }
+
+    /// After an accepted reset, the first read comes the startup time after the reset was sent.
+    #[test]
+    fn the_startup_time_passes_between_the_reset_and_the_first_read() {
+        let program = confirmation_timing(flash_program(), STARTUP_MS as u32, 0);
+        let (result, host, _) =
+            restart_started(&program, |host| host.lose_routine = Some(0xFF00), |_| {});
+        assert_eq!(confirmed_of(&result).0, restart::Teardown::Reset);
+        let waited = host.session_reads[0] - host.reset_at.expect("a reset was sent");
+        assert!(waited >= Duration::from_millis(STARTUP_MS), "{waited:?}");
+    }
+
+    /// After a passive teardown, the first read comes the startup time after the passive wait.
+    #[test]
+    fn the_startup_time_passes_after_the_passive_wait_before_the_first_read() {
+        let program = confirmation_timing(flash_program(), STARTUP_MS as u32, 0);
+        let (result, host, started) = restart_started(
+            &program,
+            |host| host.lose_routine = Some(0xFF00),
+            |host| host.reset = ResetAnswer::Refuse(0x22),
+        );
+        assert!(!confirmed_of(&result).1.after_passive_retry);
+        let waited = host.session_reads[0] - started;
+        assert!(
+            waited >= session_wait() + Duration::from_millis(STARTUP_MS),
+            "{waited:?}"
+        );
+    }
+
+    /// The retry after the passive teardown waits the startup time as well.
+    #[test]
+    fn the_retry_waits_the_passive_teardown_and_the_startup_time() {
+        let program = confirmation_timing(flash_program(), STARTUP_MS as u32, 0);
+        let (result, host, started) = restart_started(
+            &program,
+            |host| host.lose_routine = Some(0xFF00),
+            |host| host.session_script = [SessionAnswer::Other(0x03)].into(),
+        );
+        assert!(confirmed_of(&result).1.after_passive_retry);
+        assert_eq!(host.session_reads.len(), 2);
+        let first = host.session_reads[0] - started;
+        assert!(first >= Duration::from_millis(STARTUP_MS), "{first:?}");
+        let gap = host.session_reads[1] - host.session_reads[0];
+        assert!(
+            gap >= session_wait() + Duration::from_millis(STARTUP_MS),
+            "{gap:?}"
+        );
+    }
+
+    /// The window counts from the end of the startup wait: a startup longer than the window
+    /// still leaves the window's reads, in both attempts.
+    #[test]
+    fn the_window_counts_from_the_end_of_the_startup_wait() {
+        let program = confirmation_timing(flash_program(), STARTUP_MS as u32, 30);
+        let (result, host, started) = restart_started(
+            &program,
+            |host| host.lose_routine = Some(0xFF00),
+            |host| host.session = SessionAnswer::Other(0x03),
+        );
+        assert_eq!(not_confirmed_of(&result), restart::Teardown::Reset);
+        // At least two reads per attempt (every 10 ms for 30 ms); had the startup used up the
+        // window, each attempt would read once.
+        assert!(
+            host.session_reads.len() >= 4,
+            "{}",
+            host.session_reads.len()
+        );
+        let first = host.session_reads[0] - started;
+        assert!(first >= Duration::from_millis(STARTUP_MS), "{first:?}");
+    }
+
+    /// A cancel during the passive wait between the two attempts ends the job with one read made.
+    #[test]
+    fn a_cancel_during_the_passive_wait_between_the_attempts_cancels_the_restart() {
+        let mut program = flash_program();
+        program.flash[0].timing.session_timeout_millis = 60_000;
+        let dir = journal_dir("resume-between-attempts");
+        interrupted(&program, &dir);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        host.session_script = [SessionAnswer::Other(0x03)].into();
+        let mirror = Arc::new(Mutex::new(Vec::new()));
+        host.mirror = Some(Arc::clone(&mirror));
+        let canceller = {
+            let (cancelled, mirror) = (Arc::clone(&cancelled), Arc::clone(&mirror));
+            std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(20);
+                while !mirror.lock().unwrap().contains(&read_of([0xF1, 0x86]))
+                    && std::time::Instant::now() < deadline
+                {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                std::thread::sleep(Duration::from_millis(10));
+                cancelled.store(true, Ordering::Relaxed);
+            })
+        };
+        let limits = JobLimits {
+            wait_poll: Duration::from_millis(2),
+            ..JobLimits::default()
+        };
+        let result = resume_on(
+            &program,
+            &mut host,
+            limits,
+            &cancelled,
+            Journal::open(&dir, &job_key()),
+            identity_sources(),
+            Some(&target()),
+            &dir_slot(&dir),
+        );
+        canceller.join().unwrap();
+        assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
+        assert_eq!(host.session_reads.len(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn the_journal_setup_debug_output_hides_the_vin() {
         let dir = journal_dir("debug-vin");
@@ -3753,6 +3897,7 @@ mod tests {
                 "{recorded:?} {named:?}: {result:?}"
             );
             assert_eq!(host.sent(), []);
+            assert!(host.session_reads.is_empty());
             assert_eq!(resumes(&dir), 0);
             std::fs::remove_dir_all(&dir).unwrap();
         }
@@ -3786,6 +3931,7 @@ mod tests {
         );
         assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
         assert_eq!(host.sent(), [read_of([0xF1, 0x90]), read_of([0xF1, 0x91])]);
+        assert!(host.session_reads.is_empty());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -3810,6 +3956,7 @@ mod tests {
         );
         assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
         assert_eq!(host.sent(), [read_of([0xF1, 0x90])]);
+        assert!(host.session_reads.is_empty());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -3945,7 +4092,12 @@ mod tests {
         assert_eq!(teardown_of(&result), restart::Teardown::Reset);
         assert_eq!(
             *mirror.lock().unwrap(),
-            [read_of([0xF1, 0x90]), read_of([0xF1, 0x91]), reset_sent()]
+            [
+                read_of([0xF1, 0x90]),
+                read_of([0xF1, 0x91]),
+                reset_sent(),
+                read_of([0xF1, 0x86])
+            ]
         );
         let guards = slot.lock().unwrap().take().unwrap();
         assert!(guards.holds_vehicle());
@@ -4070,6 +4222,7 @@ mod tests {
         assert!(!text.contains("vehicle-"), "{text}");
         assert!(!text.contains(&bucket), "{text}");
         assert_eq!(host.sent(), [read_of([0xF1, 0x90])]);
+        assert!(host.session_reads.is_empty());
         let guards = slot.lock().unwrap().take().unwrap();
         assert!(!guards.holds_vehicle());
         std::fs::remove_dir_all(&dir).unwrap();
@@ -4086,6 +4239,7 @@ mod tests {
         let result = resume_in(&program, &dir, &mut host, false, Some(TARGET_VIN), &slot);
         assert!(matches!(result, Err(JobError::GuardsMissing)), "{result:?}");
         assert_eq!(host.sent(), [read_of([0xF1, 0x90])]);
+        assert!(host.session_reads.is_empty());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -4105,6 +4259,7 @@ mod tests {
             "{result:?}"
         );
         assert_eq!(host.sent(), []);
+        assert!(host.session_reads.is_empty());
         assert_eq!(host.voltage_reads, 0);
         drop(held);
         assert_eq!(resumes(&dir), 0);
@@ -4153,6 +4308,7 @@ mod tests {
         );
         assert!(matches!(result, Err(JobError::Journal(_))), "{result:?}");
         assert_eq!(host.sent(), []);
+        assert!(host.session_reads.is_empty());
     }
 
     /// A job stopped before its erase starts again on the same journal, its records coming
@@ -4203,6 +4359,7 @@ mod tests {
             "{result:?}"
         );
         assert_eq!(host.sent(), []);
+        assert!(host.session_reads.is_empty());
 
         drop(Journal::create(&dir, &job_key(), None).unwrap());
         std::fs::write(journal_file(&dir), b"not a journal").unwrap();
@@ -4217,6 +4374,7 @@ mod tests {
             "{result:?}"
         );
         assert_eq!(host.sent(), []);
+        assert!(host.session_reads.is_empty());
         std::fs::remove_dir_all(&dir).unwrap();
 
         let plain = program_without_plan();

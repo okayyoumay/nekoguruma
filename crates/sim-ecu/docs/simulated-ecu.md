@@ -173,6 +173,8 @@ numbers contradict each other or exceed the flash window, which the ECU itself n
   once (NRC 11, 12 or 13), although NRC 78 says the request was accepted.
 - During the chain the ECU answers other requests at once, and the request's own effect (an ECU
   reset, for one) applies at the start of the chain, not at its end.
+  The exception is an ECU reset with `EcuConfig::startup_ms` set: its startup runs from when
+  the final response goes out, so the requests during the chain and the startup are all lost.
 
 After an ECUReset the ECU can start up before it answers again (`EcuConfig::startup_ms`, unset
 by default: it answers at once). The reset itself is answered as usual; for `startup_ms` from

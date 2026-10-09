@@ -645,6 +645,7 @@ where
         cancelled,
     )?;
     let deadline = Instant::now() + Duration::from_millis(timing.confirmation_window_millis.into());
+    let mut failed_reads = 0u32;
     loop {
         if cancelled.load(Ordering::Relaxed) {
             return Err(JobError::Cancelled);
@@ -652,16 +653,29 @@ where
         // ReadDataByIdentifier F186 (ActiveDiagnosticSession); 0x01 is the default session.
         match host.service_request(0x22, &[0xF1, 0x86]) {
             Ok(response) if response == [0x62, 0xF1, 0x86, 0x01] => return Ok(true),
-            Ok(other) => {
-                tracing::warn!(answer = ?other, "the session read did not confirm the default session")
-            }
-            Err(error) => tracing::warn!(%error, "the session read got no usable answer"),
+            Ok(other) => log_failed_read(failed_reads, format_args!("answer {other:02X?}")),
+            Err(error) => log_failed_read(failed_reads, format_args!("{error}")),
         }
+        failed_reads += 1;
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
+            tracing::warn!(
+                failed_reads,
+                "the default session was not confirmed within the window"
+            );
             return Ok(false);
         }
         std::thread::sleep(remaining.min(poll));
+    }
+}
+
+/// Logs a failed F186 read: the first of an attempt at warn, later ones at debug, so a long
+/// window does not flood the log. `failed_before` counts the attempt's earlier failed reads.
+fn log_failed_read(failed_before: u32, what: std::fmt::Arguments<'_>) {
+    if failed_before == 0 {
+        tracing::warn!("the session read did not confirm the default session: {what}");
+    } else {
+        tracing::debug!("the session read did not confirm the default session: {what}");
     }
 }
 
@@ -1623,17 +1637,18 @@ mod tests {
             startup_ms: Some(100),
             ..sim_ecu::EcuConfig::default()
         });
-        let started = Instant::now();
         let (result, _) = run_teardown(TeardownGate::ResetAllowed, &point, &mut host);
         assert_eq!(result.unwrap(), Teardown::Reset);
-        let confirmed = confirm(
-            Teardown::Reset,
-            &CONFIRM_TIMING,
-            &mut host,
-            &AtomicBool::new(false),
-        );
+        // The declared startup covers the ECU's silence, so the startup wait alone takes the
+        // confirmation past it: without that wait the reads would succeed earlier.
+        let timing = RecoveryTiming {
+            ecu_startup_millis: 150,
+            ..CONFIRM_TIMING
+        };
+        let started = Instant::now();
+        let confirmed = confirm(Teardown::Reset, &timing, &mut host, &AtomicBool::new(false));
         assert_eq!(confirmed.unwrap(), CONFIRMED);
-        assert!(started.elapsed() >= Duration::from_millis(100));
+        assert!(started.elapsed() >= Duration::from_millis(150));
     }
 
     /// The ECUReset's response is lost while the ECU restarts: the outcome is unknown, the
@@ -1653,13 +1668,15 @@ mod tests {
             Teardown::Passive(PassiveCause::ResetOutcomeUnknown)
         );
         assert_eq!(host.0.power_cycles(), 1);
-        let confirmed = confirm(
-            teardown,
-            &CONFIRM_TIMING,
-            &mut host,
-            &AtomicBool::new(false),
-        );
+        let timing = RecoveryTiming {
+            ecu_startup_millis: 80,
+            ..CONFIRM_TIMING
+        };
+        let started = Instant::now();
+        let confirmed = confirm(teardown, &timing, &mut host, &AtomicBool::new(false));
         assert_eq!(confirmed.unwrap(), CONFIRMED);
+        // The startup wait is not skipped, whatever the silence left.
+        assert!(started.elapsed() >= Duration::from_millis(80));
     }
 
     /// The completed path after the procedure's own ECUReset and an agent crash: the ECU is
@@ -1677,14 +1694,18 @@ mod tests {
             host.0.request(&[0x11, 0x01]),
             sim_ecu::SimResponse::Positive(_)
         ));
+        let timing = RecoveryTiming {
+            ecu_startup_millis: 150,
+            ..CONFIRM_TIMING
+        };
         let confirmed = confirm(
             Teardown::CompletedPath,
-            &CONFIRM_TIMING,
+            &timing,
             &mut host,
             &AtomicBool::new(false),
         );
         assert_eq!(confirmed.unwrap(), CONFIRMED);
-        assert!(started.elapsed() >= Duration::from_millis(120));
+        assert!(started.elapsed() >= Duration::from_millis(150));
     }
 
     /// An ECU that stays in a non-default session or never answers cannot be confirmed; the

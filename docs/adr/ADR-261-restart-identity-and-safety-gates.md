@@ -93,6 +93,15 @@ Three points are not settled by ADR-229 or the design:
   a restart from it takes the passive teardown.
 - `Journal::create` takes the target VIN. ADR-244's record set gains `TargetVin`, which must
   be the first record and appears at most once.
+- The target VIN record shares the creation write with the header and is synced before the
+  file has its name, so a crash cannot tear it. Storage damage that zeroes it while it is still
+  the journal's last frame reads as a torn tail and is cut off (ADR-244 item 5), as the same
+  damage would cut any other last frame. Such a journal has no records and names no VIN: it
+  classifies as a plain start either way, a resume naming the job's VIN ends in
+  `TargetVinDiffers`, and one naming none runs the program from its start as a first run would.
+  The job's generation then has no VIN, so a later interrupted transfer gets only the passive
+  teardown. A header flag could make this case corrupt instead, at the price of a format version
+  bump and a two-version reader, for an ending that is already fail-safe; this is accepted.
 - A placeholder that a bootloader may answer after an erase and that happens to be a
   well-formed VIN (for example seventeen zeros) still aborts the job. Nothing tells it apart
   from another vehicle's VIN; the job ends without a reset either way.

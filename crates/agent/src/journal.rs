@@ -132,10 +132,10 @@ impl RecoveryFacts {
             |at: &StepRef, facts: &Self| facts.last_step.is_none_or(|last| at.steps > last.steps);
         match record {
             Record::TargetVin(vin) => {
-                // Every other record changes the facts, so unchanged facts mean none came
-                // before; a second target VIN finds the first.
-                if *self != Self::new(self.key.clone()) {
-                    return Err("the target VIN must be the first record, and at most one");
+                // Where it may appear is `target_vin_allowed`'s rule; a second one is refused
+                // here as well.
+                if self.target_vin.is_some() {
+                    return Err("the target VIN is already set");
                 }
                 self.target_vin = Some(vin.clone());
             }
@@ -690,8 +690,7 @@ impl<S: Store> Journal<S> {
         if self.poisoned {
             return Err(JournalError::Poisoned);
         }
-        // The target VIN is the journal's first record, by count.
-        if matches!(record, Record::TargetVin(_)) && self.state.records != 0 {
+        if matches!(record, Record::TargetVin(_)) && !target_vin_allowed(self.state.records) {
             return Err(JournalError::Invariant(
                 "the target VIN must be the first record",
             ));
@@ -720,6 +719,12 @@ impl<S: Store> Journal<S> {
         self.state.records += 1;
         Ok(())
     }
+}
+
+/// Whether a target VIN may be the next record, with `records_so_far` records before it: only as
+/// the journal's first record, on commit and on read-back alike.
+fn target_vin_allowed(records_so_far: u64) -> bool {
+    records_so_far == 0
 }
 
 /// `{job_id}.g{generation}.journal` in `dir`. The job ID must be a plain name (a UUID is).
@@ -857,7 +862,7 @@ fn load(bytes: &[u8], key: &JobKey) -> Result<Loaded, JournalError> {
         if entry.seq != state.records {
             return Err(corrupt(offset, "a record is out of sequence"));
         }
-        if matches!(entry.record, Record::TargetVin(_)) && state.records != 0 {
+        if matches!(entry.record, Record::TargetVin(_)) && !target_vin_allowed(state.records) {
             return Err(corrupt(offset, "the target VIN must be the first record"));
         }
         state
@@ -1289,7 +1294,8 @@ mod tests {
             j.commit_target_vin(&vin),
             Err(JournalError::Invariant(_))
         ));
-        // Not tied to the first sequence number: a journal that starts with it takes no second.
+        // The rule is tied to being the first record by design: a journal that starts with it
+        // takes no second.
         let mut j = memory();
         j.commit_target_vin(&vin).expect("first");
         assert!(matches!(

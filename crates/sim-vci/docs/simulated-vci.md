@@ -6,7 +6,7 @@ API sits one simulated ECU from `sim-ecu` (`crates/sim-ecu/docs/simulated-ecu.md
 below refer to SAE J2534-1 (v04.04).
 
 `sim-vci` does not build on `j2534-0404-mock`, the J2534 test double for the worker's own tests,
-and the two stay separate crates. They differ where it matters:
+and the two stay separate crates (ADR-260). They differ where it matters:
 
 - **`unsigned long` width.** The mock exports the `j2534-0404-sys` binding types, always 32-bit.
   `sim-vci` uses the native `c_ulong` on 64-bit Linux, as the counterpart of

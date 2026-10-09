@@ -517,12 +517,12 @@ fn create_vehicle_file(dir: &Path, bucket: u16) -> Result<(), GuardError> {
 
 /// The bucket of a VIN: the low 12 bits of the first two bytes of its SHA-256 digest, read
 /// big-endian (a digest starting 84 b1 gives 0x4b1), so the device keeps no VIN (ADR-262).
-fn vehicle_bucket(vin: &Vin) -> u16 {
+pub(crate) fn vehicle_bucket(vin: &Vin) -> u16 {
     let digest = Sha256::digest(vin.as_str().as_bytes());
     u16::from_be_bytes([digest[0], digest[1]]) & 0x0fff
 }
 
-fn vehicle_path(dir: &Path, bucket: u16) -> PathBuf {
+pub(crate) fn vehicle_path(dir: &Path, bucket: u16) -> PathBuf {
     dir.join(format!("vehicle-{bucket:03x}.lock"))
 }
 

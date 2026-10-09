@@ -9,10 +9,15 @@
 //! is named without keeping the VIN on the device (ADR-256 item 6): the VIN is hashed into one
 //! of 4096 fixed buckets (the low 12 bits of the first two bytes of the SHA-256 digest, read
 //! big-endian), `vehicle-{k:03x}.lock`, so two VINs may share a bucket and then
-//! exclude each other, which is safe. The first `take_vehicle` that finds its bucket's file
-//! or the last one (`vehicle-fff.lock`, created last) missing creates all 4096, empty, and syncs the directory before it opens any of them, so a
-//! bucket file never exists alone and the listing is the same on every device, saying nothing
-//! about the vehicles seen. A job holds one vehicle (a well-formed VIN): taking that VIN again
+//! exclude each other, which is safe. A bucket file is never created for one VIN alone: files
+//! are created only by a sweep over all 4096, empty, in a fixed order, whichever VIN triggered it
+//! (a `take_vehicle` that finds its bucket's file or `vehicle-fff.lock` missing). The sweep
+//! syncs the directory, then creates `vehicle-fff.lock` last, so that file's presence means the
+//! other 4095 entries were committed first (NTFS commits directory entries in creation order
+//! without a sync). A set a crash, a failed sync or someone else's file left partial is decided
+//! by the file system's write order, not by a VIN; a complete set is the normal outcome, not an
+//! invariant (ADR-262 item 2). The listing is the same on every device and says nothing about
+//! the vehicles seen. A job holds one vehicle (a well-formed VIN): taking that VIN again
 //! succeeds without touching the file, and any other VIN, also one of the same bucket, is refused.
 //!
 //! Each is an exclusive OS lock (`File::try_lock`) on its own file in a lock directory the
@@ -344,25 +349,38 @@ fn prepare_dir(dir: &Path) -> Result<(), GuardError> {
     Ok(())
 }
 
-/// Creates all the empty vehicle lock files in bucket order, then syncs the directory, so a
-/// bucket file is never created alone: the caller found its own missing (ADR-262). A file that
-/// exists already is left as it is.
+/// The order the sweep creates the vehicle lock files in: every bucket once, `0xfff` last.
+fn vehicle_creation_order() -> impl Iterator<Item = u16> {
+    (0..VEHICLE_BUCKETS).map(|bucket| bucket as u16)
+}
+
+/// Creates the empty vehicle lock files, all of them whichever VIN asked and none for one VIN
+/// alone (ADR-262 item 2): buckets 0x000 to 0xffe in order, then a directory sync (Unix; a
+/// directory cannot be opened for syncing elsewhere), then `vehicle-fff.lock`, then a second
+/// sync. Its presence therefore means the rest were committed first, also to a take that races
+/// this sweep. A file that exists already is left as it is.
 fn create_vehicle_files(dir: &Path) -> Result<(), GuardError> {
-    for bucket in 0..VEHICLE_BUCKETS {
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(vehicle_path(dir, bucket as u16))
-        {
-            Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error.into()),
-        }
+    let create = |bucket: u16| match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(vehicle_path(dir, bucket))
+    {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(GuardError::from(error)),
+    };
+    let sync = || -> Result<(), GuardError> {
+        #[cfg(unix)]
+        File::open(dir)?.sync_all()?;
+        Ok(())
+    };
+    let last = (VEHICLE_BUCKETS - 1) as u16;
+    for bucket in vehicle_creation_order().filter(|&bucket| bucket != last) {
+        create(bucket)?;
     }
-    // Best effort off Unix: a directory cannot be opened for syncing there.
-    #[cfg(unix)]
-    File::open(dir)?.sync_all()?;
-    Ok(())
+    sync()?;
+    create(last)?;
+    sync()
 }
 
 /// The bucket of a VIN: the low 12 bits of the first two bytes of its SHA-256 digest, read
@@ -1022,5 +1040,14 @@ mod tests {
         assert_eq!(vehicle_files(&dir), 0);
         drop(guards);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_sweep_creates_the_sentinel_last() {
+        let order: Vec<u16> = vehicle_creation_order().collect();
+        assert_eq!(order.len(), VEHICLE_BUCKETS as usize);
+        assert_eq!(order.last(), Some(&0xfff));
+        let distinct: std::collections::HashSet<_> = order.iter().collect();
+        assert_eq!(distinct.len(), order.len());
     }
 }

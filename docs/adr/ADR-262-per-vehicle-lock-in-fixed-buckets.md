@@ -38,16 +38,21 @@ which is what ADR-256 item 6 forbids.
    share each file, so a name reveals 12 bits of a public hash and does not identify a vehicle.
    SHA-256 comes from the `sha2` crate, which the workspace already builds; the standard
    library's hasher is not stable across releases.
-2. **A bucket file is never created alone.** When the file of the bucket a job needs, or the
-   last bucket file (`vehicle-fff.lock`), is missing, `take_vehicle` first creates all 4096
-   bucket files in bucket order and syncs the directory, then locks its own. The directory's
-   content is then the same on every device that ever took a vehicle lock and does not show
-   which buckets were used; created one by one, the existence of a bucket file would hint
-   whether a given vehicle had been there. A set left partial by a crash, a power loss or a
-   failed creation is a prefix in bucket order, which says nothing about a VIN, and the next
-   take completes it; a file that someone else created on its own reveals nothing about this
-   device's jobs. Jobs that never take a vehicle lock create none of these files. The files stay
-   empty and, like the other lock files, are never deleted.
+2. **No bucket file is ever created for one VIN alone.** When the file of the bucket a job
+   needs, or the last bucket file (`vehicle-fff.lock`), is missing, `take_vehicle` creates every
+   missing bucket file in bucket order before it opens its own, and creates `vehicle-fff.lock`
+   last, after syncing the directory on Unix, so that its presence means the other files were
+   committed first (NTFS commits directory entries in creation order without a sync). The
+   invariant is that which files exist never depends on a VIN: a file is only ever created as
+   part of a sweep over all 4096, and the sweep is the same whichever VIN triggered it. A
+   complete set is the normal outcome, not the invariant. A crash, a power loss, a failed sync
+   or a file someone else created can leave the set partial; what survives is decided by the
+   file system's write order, not by a VIN. A later take whose file exists locks it and creates
+   nothing; one whose file is missing sweeps again. The listing of a directory in which a
+   vehicle lock was ever taken therefore says nothing about the vehicles seen there; created one
+   by one, the existence of a bucket file would hint whether a given vehicle had been there.
+   Jobs that never take a vehicle lock create none of these files. The files stay empty and,
+   like the other lock files, are never deleted.
 3. **It is taken last, by `JobGuards::take_vehicle`.** The lock order becomes VCI, then the
    reprogramming slot when the job holds one, then the vehicle. Guards with or without the slot
    may take it. The wait polls and stops on a cancel like the other guards (ADR-256 item 3);
@@ -77,6 +82,12 @@ which is what ADR-256 item 6 forbids.
   are created with the default permissions of the user whose take creates them, like the other
   lock files; the directory's permissions for every agent user remain an installation
   requirement (ADR-257).
+- A sweep whose directory sync fails leaves `vehicle-fff.lock` uncreated and fails that take;
+  the next take sweeps and syncs again. On a file system without a metadata journal a crash can
+  lose an arbitrary subset of the files; the next take that misses its own file recreates every
+  hole at once, whose creation time then says only that some vehicle of the lost buckets arrived
+  then. Windows may record a bucket file's last-access time on open where the volume keeps it;
+  Linux records none, since the files are never read.
 - No VIN-derived fact is stored on the device, so the maintainer's condition on ADR-261 (no
   target VIN passed outside tests before the journal's protection) is unaffected.
 - The restart's promotion to the vehicle lock at the first matching VIN, and the first run's

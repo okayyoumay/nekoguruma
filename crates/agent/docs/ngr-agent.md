@@ -249,8 +249,9 @@ gates before and after each read.
    request, a final response-pending code, or any other answer gives
    `Passive(ResetOutcomeUnknown)`.
 
-A passive teardown sends nothing (the agent runs no TesterPresent, so there is none to stop)
-and waits the flash session's `session_timeout_millis + teardown_margin_millis`, in steps of the
+A passive teardown sends nothing further (when it follows a refused or unknown ECUReset, that
+reset was the last request; the agent runs no TesterPresent, so there is none to stop) and
+waits the flash session's `session_timeout_millis + teardown_margin_millis`, in steps of the
 job's `wait_poll`; a cancel during the wait ends the job in `JobError::Cancelled`.
 `RestartOrderUnavailable` carries the outcome.
 

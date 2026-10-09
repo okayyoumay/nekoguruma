@@ -2,7 +2,7 @@
 
 **Date:** 2026-10-09
 **Status:** Accepted
-**Affects:** `agent` (`src/restart.rs`, `src/runner.rs`, `docs/ngr-agent.md`), `sim-ecu` (`Fault`, `docs/simulated-ecu.md`), ADR-229 item 2, ADR-261 item 2
+**Affects:** `agent` (`src/restart.rs`, `src/runner.rs`, `docs/ngr-agent.md`), `sim-ecu` (`Fault`, `docs/simulated-ecu.md`), ADR-229 item 2, ADR-255 item 5, ADR-261 item 2
 
 ## Context
 
@@ -43,7 +43,8 @@ Points the design and ADR-229 leave open:
    answer that is neither positive nor negative is `ResetOutcomeUnknown`, and is logged. Both
    take the passive teardown; the reset is not repeated.
 4. **The passive teardown waits.** Since the agent runs no TesterPresent, there is nothing to
-   stop: the passive teardown sends nothing for the declared session timeout plus the margin,
+   stop: the passive teardown sends nothing further (after a refused or unknown reset, the reset
+   was the last request) for the declared session timeout plus the margin,
    in steps of the job's poll interval, and a cancel ends the wait. A cancel before the reset
    is sent sends none; one that arrives while the reset is on its way does not hide an accepted
    reset, which is reported as `Teardown::Reset`. An accepted reset is not

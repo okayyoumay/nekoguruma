@@ -1056,6 +1056,8 @@ mod tests {
         NoAnswer,
         /// A positive-looking answer that does not echo the sub-function.
         Garbled,
+        /// A positive response with a byte after the sub-function, which a hard reset's has not.
+        Trailing,
     }
 
     /// An ECU that downloads: it answers ReadDataByIdentifier F191 and F195, accepts every
@@ -1190,6 +1192,7 @@ mod tests {
                     ResetAnswer::Refuse(nrc) => Ok(vec![0x7F, 0x11, nrc]),
                     ResetAnswer::NoAnswer => Err(HostError::NoResponse),
                     ResetAnswer::Garbled => Ok(vec![0x51]),
+                    ResetAnswer::Trailing => Ok(vec![0x51, 0x01, 0x00]),
                 },
                 (0x22, [0xF1, 0x90]) => Ok(match &self.vin {
                     Some(vin) => [&[0x62, 0xF1, 0x90][..], vin].concat(),
@@ -3200,6 +3203,7 @@ mod tests {
         for answer in [
             ResetAnswer::NoAnswer,
             ResetAnswer::Garbled,
+            ResetAnswer::Trailing,
             ResetAnswer::Refuse(0x78),
         ] {
             let (result, host, elapsed) = restart_after(

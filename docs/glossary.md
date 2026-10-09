@@ -212,7 +212,7 @@ Governs a COP's receive phase: `0` = no response required at all — the cycle c
 ## P–R
 
 **Passive teardown** (agent restart, ADR-229, ADR-264)  
-The way a restart ends a download the ECU may still hold without sending ECUReset: the agent sends nothing for the session timeout plus the margin the procedure declares (`RecoveryTiming`), so the ECU falls back to its default session on its own. Used when a gate fails, when a RequestTransferExit was journaled, and when the ECU refuses the reset or its answer is lost. See **Completed path**.
+The way a restart ends a download the ECU may still hold when no accepted ECUReset ends it: the agent sends nothing further for the session timeout plus the margin the procedure declares (`RecoveryTiming`), so the ECU falls back to its default session on its own. It replaces the reset when a gate fails or a RequestTransferExit was journaled, and follows a reset that was sent when the ECU refuses it or its answer is lost. See **Completed path**.
 
 **PassThru** — J2534 PassThru API  
 The function interface exported by a J2534 DLL: `PassThruOpen`, `PassThruConnect`, `PassThruReadMsgs`, `PassThruWriteMsgs`, `PassThruIoctl`, etc.

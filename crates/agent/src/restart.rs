@@ -150,8 +150,9 @@ pub enum Teardown {
     /// The ECU accepted an ECUReset (hardReset). The ECU's startup time and the confirmation
     /// that it is back in its default session belong to the next step, so nothing waited.
     Reset,
-    /// No ECUReset was sent; the agent waited out the ECU's session timeout plus the plan's
-    /// margin, sending nothing, so the ECU's session has expired.
+    /// No accepted ECUReset ended the download: the reset was ruled out, refused or got no
+    /// usable answer. The agent then waited out the ECU's session timeout plus the plan's
+    /// margin, sending nothing further, so the ECU's session has expired.
     Passive(PassiveCause),
     /// The journal shows the post-transfer steps complete: no reset and no wait, since the
     /// default-session confirmation of step 2b-2 comes first and only its failure makes the
@@ -466,7 +467,8 @@ where
 ///   ([`PassiveCause::ResetRefused`], [`PassiveCause::ResetOutcomeUnknown`]).
 ///
 /// A passive teardown waits `timing.session_timeout_millis + timing.teardown_margin_millis` and
-/// sends nothing meanwhile: the agent runs no TesterPresent, so there is none to stop. The wait
+/// sends nothing further meanwhile (after a refused or unknown reset, the reset was the last
+/// request): the agent runs no TesterPresent, so there is none to stop. The wait
 /// sleeps in steps of `poll` and checks `cancelled` at the start of each; a cancel ends it in
 /// [`JobError::Cancelled`]. A cancel before the reset is sent sends none; one that arrives while
 /// the reset is on its way does not hide an accepted reset.
@@ -502,7 +504,8 @@ where
         // refused or unknown one.
         match host.service_request(0x11, &[0x01]) {
             Ok(response) => match response.as_slice() {
-                [0x51, 0x01, ..] => return Ok(Teardown::Reset),
+                // The positive response of a hard reset carries nothing after its sub-function.
+                [0x51, 0x01] => return Ok(Teardown::Reset),
                 [0x7F, 0x11, nrc] if *nrc != 0x78 => PassiveCause::ResetRefused { nrc: *nrc },
                 other => {
                     tracing::warn!(answer = ?other, "the ECUReset got no usable answer");

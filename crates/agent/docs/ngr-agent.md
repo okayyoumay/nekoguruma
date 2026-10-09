@@ -97,8 +97,11 @@ agent and the workers with the same root.
 The `agent` library's `journal` module keeps the write-job journal (design 5.5, ADR-244): one
 append-only file, `{job_id}.g{generation}.journal`, per job and ownership generation, in a
 directory the caller passes. Every commit is synced before it returns. Only the job's writer opens
-the journal for writing; other readers use `Journal::read`, which never changes the file. The journal only
-records; committing an intent marker before the request it guards, and stopping the job when a
+the journal for writing: `Journal::create` and `Journal::open` take an exclusive OS lock on the
+sidecar `{job_id}.g{generation}.journal.lock` and hold it while the journal is open, so a second
+writer gets `JournalError::InUse` (ADR-255). The lock goes with the process, so a crashed run
+never blocks the next one. Other readers use `Journal::read`, which takes no lock and never
+changes the file. The journal only records; committing an intent marker before the request it guards, and stopping the job when a
 commit fails, are the job runner's duties.
 
 `agent::run_program_journaled` is the runner that keeps it (ADR-252). It takes a
@@ -177,8 +180,10 @@ anything is sent to the ECU, it opens the job's journal (`Journal::open`) and cl
 
 A failed check counts no resume, and a cancel stops it before the voltage read and before the
 commit. Each crash during a recovery therefore consumes one attempt, and repeated crashes stop
-at the limit. The start deadline (a server's job instruction carries it), the OS-level locks
-and a server reservation are not part of this entry.
+at the limit. A second resume of a job whose journal another run holds ends in
+`JobError::Journal(JournalError::InUse)` before the classification, with nothing sent. The start
+deadline (a server's job instruction carries it), the per-VCI lock, the reprogramming slot and a
+server reservation are not part of this entry.
 
 ## Restart inputs
 

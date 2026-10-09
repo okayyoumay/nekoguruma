@@ -191,7 +191,10 @@ pub async fn run_program_journaled(
 /// - a journal that rules a restart out, or a missing or unreadable one for a program with a
 ///   plan, ends the job the same way, also with nothing sent.
 ///
-/// Locks, the start deadline and a server reservation are not taken here.
+/// The journal's writer lock is held while the job runs, so a second resume of the same job
+/// ends in `JobError::Journal(JournalError::InUse)` with nothing sent (ADR-255). The per-VCI
+/// lock, the reprogramming slot, the start deadline and a server reservation are not taken
+/// here.
 pub async fn resume_program_journaled(
     client: WorkerClient,
     config: &LinkConfig,
@@ -338,6 +341,10 @@ where
     H: DiagHost<Error = HostError> + RuntimeInputs + TransferProgress,
     S: Store,
 {
+    // Another run of this job holds the journal: it, not this one, goes on with the job.
+    if let Err(JournalError::InUse) = opened {
+        return Err(JobError::Journal(JournalError::InUse));
+    }
     match restart::classify(program, opened.as_ref().map(Journal::state)) {
         RestartDecision::OnSiteInterventionRequired(reason) => {
             Err(JobError::OnSiteInterventionRequired(reason))
@@ -1754,15 +1761,7 @@ mod tests {
         let program = flash_program();
         let dir = journal_dir("resume-link-fails");
         interrupted(&program, &dir);
-        let before = std::fs::read(
-            std::fs::read_dir(&dir)
-                .unwrap()
-                .next()
-                .unwrap()
-                .unwrap()
-                .path(),
-        )
-        .unwrap();
+        let before = std::fs::read(journal_file(&dir)).unwrap();
         let setup = file_setup(&dir);
         let result = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -1785,10 +1784,7 @@ mod tests {
                 .unwrap()
             });
         assert!(matches!(result, Err(JobError::Link(_))), "{result:?}");
-        let files: Vec<_> = std::fs::read_dir(&dir).unwrap().collect();
-        assert_eq!(files.len(), 1);
-        let after = std::fs::read(files[0].as_ref().unwrap().path()).unwrap();
-        assert_eq!(after, before);
+        assert_eq!(std::fs::read(journal_file(&dir)).unwrap(), before);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1911,6 +1907,15 @@ mod tests {
             Journal::open(dir, &job_key()),
             identity_sources(),
         )
+    }
+
+    /// The journal file in `dir`, beside its writer lock's sidecar.
+    fn journal_file(dir: &std::path::Path) -> std::path::PathBuf {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.extension().is_some_and(|ext| ext == "journal"))
+            .expect("a journal file")
     }
 
     fn resumes(dir: &std::path::Path) -> u16 {
@@ -2082,6 +2087,28 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// A second resume of a job whose journal another run holds ends with nothing sent and no
+    /// on-site verdict: the other run goes on with the job (ADR-255).
+    #[test]
+    fn a_resume_of_a_job_another_run_holds_sends_nothing() {
+        let program = flash_program_with_voltage();
+        let dir = journal_dir("resume-in-use");
+        interrupted(&program, &dir);
+        let held = Journal::open(&dir, &job_key()).unwrap();
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        host.voltage = Some(12_600);
+        let result = resume(&program, &dir, &mut host, false);
+        assert!(
+            matches!(result, Err(JobError::Journal(JournalError::InUse))),
+            "{result:?}"
+        );
+        assert_eq!(host.sent(), []);
+        assert_eq!(host.voltage_reads, 0);
+        drop(held);
+        assert_eq!(resumes(&dir), 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// A resume count that cannot be committed ends the job with nothing sent.
     #[test]
     fn a_failed_resume_commit_ends_the_job_with_nothing_sent() {
@@ -2168,13 +2195,7 @@ mod tests {
         assert_eq!(host.sent(), []);
 
         drop(Journal::create(&dir, &job_key()).unwrap());
-        let file = std::fs::read_dir(&dir)
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap()
-            .path();
-        std::fs::write(&file, b"not a journal").unwrap();
+        std::fs::write(journal_file(&dir), b"not a journal").unwrap();
         let result = resume(&program, &dir, &mut host, false);
         assert!(
             matches!(

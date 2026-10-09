@@ -2,7 +2,7 @@
 
 **Date:** 2026-10-09
 **Status:** Accepted
-**Affects:** `agent` (`src/runner.rs`, `src/restart.rs`, `src/journaling.rs`, `src/lib.rs`), ADR-253 item 4
+**Affects:** `agent` (`src/runner.rs`, `src/restart.rs`, `src/journaling.rs`, `src/journal.rs`, `src/lib.rs`), `Cargo.toml` (`rust-version`), ADR-253 item 4, ADR-244 (the no-lock consequence)
 
 ## Context
 
@@ -24,6 +24,14 @@ These questions are left open by ADR-229 and ADR-253:
 - which voltage source step 1 reads and which range it is checked against;
 - what a failed voltage check leads to;
 - what a restart that passes step 1 does while the later steps of the restart order do not exist.
+
+ADR-244 left the journal without a lock and made one writer per job and generation the job
+scheduler's duty, and no scheduler exists. While only `Journal::create` opened a journal for
+writing, a second writer could not arise, since a second create of the same key fails. A resume
+opens an existing journal, so two resumes of one job could both write it. The file store appends
+at the length it remembers, so two writers overwrite each other's frames. Two resume records of
+the same length would then collapse into one, undercounting the resume limit, and records of
+different lengths would leave a corrupt tail.
 
 ## Decision
 
@@ -81,6 +89,22 @@ These questions are left open by ADR-229 and ADR-253:
 6. **Nothing is sent before the decision.** The worker host exists from the link's opening,
    but no request reaches the ECU before the classification and step 1 have passed. A journal
    that cannot be opened or read sends nothing.
+7. **The journal has one writer, held by an OS lock.** `Journal::create` and `Journal::open` take
+   an exclusive OS lock (`File::try_lock`) on a sidecar `{job_id}.g{generation}.journal.lock`
+   before they touch the journal. `open` checks that the journal exists first, so a missing one
+   leaves no sidecar. The lock is held until the `Journal` is dropped or the process ends.
+   - **Why a sidecar.** Locks on Windows are mandatory, so locking the journal itself would
+     shut out `Journal::read`, the reader that takes no lock.
+   - **Never deleted.** A process that locked a recreated sidecar would not exclude one still
+     holding the old file.
+   - **Contention.** A second writer gets `JournalError::InUse` without reading or truncating
+     anything. `resume_program_journaled` ends with `JobError::Journal(InUse)` before it
+     classifies. Contention means another run is handling the job, so it is not an on-site
+     verdict.
+   - **Try, not wait.** The lock is tried, not waited for: a duplicate of the same job must not
+     queue up and run the restart a second time. ADR-229's waiting applies to guards that
+     another job holds.
+   - **MSRV.** The workspace's minimum Rust version becomes 1.89, which has `File::try_lock`.
 
 ## Consequences
 
@@ -99,3 +123,10 @@ These questions are left open by ADR-229 and ADR-253:
   (item 5), so nothing uses it yet; the replay to the erase must not start from it.
 - `ngr-agent run` keeps no journal and has no resume. Only library callers reach
   `resume_program_journaled`.
+- The OS releases the journal's lock when a run crashes, so a restart never waits on a dead run.
+  Sidecar `.lock` files stay in the journal directory.
+- A duplicate resume refused by the journal lock has already opened and closed the link to its
+  VCI, because the journal is opened after the link. Keeping two jobs off one VCI is the per-VCI
+  lock's work (design 8.8).
+- A journal directory on a file system without OS file locks (some network file systems) fails
+  every create and open. The journal belongs on the device (design 5.5).

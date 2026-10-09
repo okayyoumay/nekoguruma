@@ -5,10 +5,17 @@
 //! (`vci_service_config::j2534_definition_dir()`); on Windows the registry is used. The
 //! definition format, matching rules and error cases are in `docs/library-resolver.md`.
 //!
+//! `Name` is the VCI identifier callers resolve; on Windows it corresponds to the device's
+//! registry key name. A leftover copy of a definition with the same `Name` makes resolution
+//! ambiguous. On Windows `resolve` reads only the native registry view; use `resolve_on_registry`
+//! per view when both are needed (mode `All` returns the first hit and does not detect a name
+//! present in both views).
+//!
 //! This crate only resolves. The writability and signer checks of 7.2 are not performed here.
 
 use std::{
-    fs, io,
+    fs,
+    io::{self, Read},
     path::{Path, PathBuf},
 };
 
@@ -16,7 +23,7 @@ use tracing::{debug, warn};
 
 mod definition;
 
-pub use definition::{Definition, DefinitionError, PROTOCOL_KEYS};
+pub use definition::{Definition, DefinitionError, MAX_DEFINITION_SIZE, PROTOCOL_KEYS};
 
 /// Where a [`Resolved`] entry came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,7 +66,7 @@ pub enum ResolveError {
         source: io::Error,
     },
     /// No registration with this name exists.
-    #[error("VCI '{name}' not found ({skipped_invalid} invalid definition file(s) were skipped)")]
+    #[error("VCI '{name}' not found{}", skipped_note(*skipped_invalid))]
     NotFound {
         /// The requested name.
         name: String,
@@ -81,10 +88,13 @@ pub enum ResolveError {
     /// The registry lookup failed.
     #[cfg(windows)]
     #[error("registry lookup failed: {0}")]
-    Registry(j2534_0404_registry::RegistryError),
+    Registry(#[source] j2534_0404_registry::RegistryError),
 }
 
-/// Reads every `*.toml` file directly in `dir`; other entries are ignored.
+/// Reads every regular file directly in `dir` whose extension is exactly `toml`; other entries
+/// are ignored. A file named just `.toml` has no extension and is ignored; hidden files such as
+/// `.x.toml` are read. A `.toml` entry that is a symlink or directory is invalid
+/// ([`DefinitionError::NotARegularFile`]). Files over [`MAX_DEFINITION_SIZE`] are invalid.
 ///
 /// A missing directory yields no definitions. Any other failure to list it is an error.
 /// Invalid files are returned in [`Definitions::invalid`] and logged at warn level.
@@ -109,18 +119,22 @@ pub fn read_definitions(dir: &Path) -> Result<Definitions, ResolveError> {
             source,
         })?;
         let path = entry.path();
-        if path.extension().is_some_and(|e| e == "toml") && path.is_file() {
-            files.push(path);
+        if path.extension().is_some_and(|e| e == "toml") {
+            // `DirEntry::file_type` does not follow symlinks.
+            let regular = entry.file_type().is_ok_and(|t| t.is_file());
+            files.push((path, regular));
         }
     }
     files.sort();
 
     let mut out = Definitions::default();
-    for path in files {
-        match fs::read_to_string(&path)
-            .map_err(DefinitionError::from)
-            .and_then(|text| Definition::parse(&text))
-        {
+    for (path, regular) in files {
+        let parsed = if regular {
+            read_limited(&path).and_then(|text| Definition::parse(&text))
+        } else {
+            Err(DefinitionError::NotARegularFile)
+        };
+        match parsed {
             Ok(def) => out.valid.push((path, def)),
             Err(error) => {
                 warn!(file = %path.display(), %error, "skipping invalid J2534 definition");
@@ -129,6 +143,30 @@ pub fn read_definitions(dir: &Path) -> Result<Definitions, ResolveError> {
         }
     }
     Ok(out)
+}
+
+fn skipped_note(n: usize) -> String {
+    if n > 0 {
+        format!(" ({n} invalid definition file(s) were skipped)")
+    } else {
+        String::new()
+    }
+}
+
+/// Reads a definition file, refusing more than [`MAX_DEFINITION_SIZE`] bytes.
+fn read_limited(path: &Path) -> Result<String, DefinitionError> {
+    let file = fs::File::open(path)?;
+    if file.metadata()?.len() > MAX_DEFINITION_SIZE {
+        return Err(DefinitionError::TooLarge);
+    }
+    // The file may grow after the metadata check, so the read is bounded as well.
+    let mut text = String::new();
+    file.take(MAX_DEFINITION_SIZE + 1)
+        .read_to_string(&mut text)?;
+    if text.len() as u64 > MAX_DEFINITION_SIZE {
+        return Err(DefinitionError::TooLarge);
+    }
+    Ok(text)
 }
 
 /// Resolves `name` against the definitions in `dir`.

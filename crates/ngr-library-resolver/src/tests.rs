@@ -115,6 +115,166 @@ fn reject_relative_search_path() {
     ));
 }
 
+#[test]
+fn reject_wrong_type_keys() {
+    for bad in ["LongSize = \"8\"\n", "LongSize = true\n", "CAN = \"1\"\n"] {
+        let text = format!("{}{bad}", minimal("X"));
+        assert!(
+            matches!(Definition::parse(&text), Err(DefinitionError::Syntax(_))),
+            "{bad}"
+        );
+    }
+}
+
+#[test]
+fn reject_whitespace_names() {
+    assert!(matches!(
+        Definition::parse(&minimal("   ")),
+        Err(DefinitionError::EmptyName)
+    ));
+    for name in [" X", "X ", "X\\t"] {
+        assert!(
+            matches!(
+                Definition::parse(&minimal(name)),
+                Err(DefinitionError::NameWhitespace)
+            ),
+            "{name:?}"
+        );
+    }
+}
+
+#[test]
+fn reject_bad_library_text() {
+    let nul = "Name = \"X\"\nFunctionLibrary = \"/a\\u0000b\"\n";
+    assert!(matches!(
+        Definition::parse(nul),
+        Err(DefinitionError::NulInPath {
+            key: "FunctionLibrary"
+        })
+    ));
+    let ws = format!(
+        "Name = \"X\"\nFunctionLibrary = \" {}\"\n",
+        abs("x").display()
+    );
+    assert!(ws.contains("= \" "));
+    assert!(matches!(
+        Definition::parse(&ws.replace('\\', "/")),
+        Err(DefinitionError::PathWhitespace { .. })
+    ));
+    let dotdot = format!(
+        "Name = \"X\"\nFunctionLibrary = {}\n",
+        lit(&abs("a").join("..").join("x.so"))
+    );
+    assert!(matches!(
+        Definition::parse(&dotdot),
+        Err(DefinitionError::ParentDirInPath { .. })
+    ));
+}
+
+#[test]
+fn reject_bad_search_path_text() {
+    let nul = format!("{}SearchPaths = [\"/a\\u0000\"]\n", minimal("X"));
+    assert!(matches!(
+        Definition::parse(&nul),
+        Err(DefinitionError::NulInPath { key: "SearchPaths" })
+    ));
+    let ws = format!("{}SearchPaths = [\"/a \"]\n", minimal("X"));
+    assert!(matches!(
+        Definition::parse(&ws),
+        Err(DefinitionError::PathWhitespace { .. })
+    ));
+    let dotdot = format!(
+        "{}SearchPaths = [{}]\n",
+        minimal("X"),
+        lit(&abs("a").join(".."))
+    );
+    assert!(matches!(
+        Definition::parse(&dotdot),
+        Err(DefinitionError::ParentDirInPath { .. })
+    ));
+}
+
+#[test]
+fn oversized_file_is_invalid() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut text = minimal("Big");
+    text.push_str(&format!("# {}\n", "x".repeat(MAX_DEFINITION_SIZE as usize)));
+    fs::write(dir.path().join("big.toml"), text).unwrap();
+    let defs = read_definitions(dir.path()).unwrap();
+    assert!(defs.valid.is_empty());
+    assert!(matches!(defs.invalid[0].1, DefinitionError::TooLarge));
+}
+
+#[test]
+fn directory_named_toml_is_invalid_and_bare_dot_toml_ignored() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir(dir.path().join("d.toml")).unwrap();
+    fs::write(dir.path().join(".toml"), minimal("Bare")).unwrap();
+    fs::write(dir.path().join(".hidden.toml"), minimal("Hidden")).unwrap();
+    let defs = read_definitions(dir.path()).unwrap();
+    assert_eq!(defs.valid.len(), 1);
+    assert_eq!(defs.valid[0].1.name, "Hidden");
+    assert_eq!(defs.invalid.len(), 1);
+    assert!(matches!(
+        defs.invalid[0].1,
+        DefinitionError::NotARegularFile
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_toml_is_invalid() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("real.txt");
+    fs::write(&target, minimal("Linked")).unwrap();
+    std::os::unix::fs::symlink(&target, dir.path().join("link.toml")).unwrap();
+    let defs = read_definitions(dir.path()).unwrap();
+    assert!(defs.valid.is_empty());
+    assert!(matches!(
+        defs.invalid[0].1,
+        DefinitionError::NotARegularFile
+    ));
+    assert!(matches!(
+        resolve_in_dir(dir.path(), "Linked"),
+        Err(ResolveError::NotFound {
+            skipped_invalid: 1,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn results_are_sorted_by_path() {
+    let dir = tempfile::tempdir().unwrap();
+    for f in ["m", "z", "b", "q", "a", "x"] {
+        fs::write(dir.path().join(format!("{f}.toml")), minimal("Same")).unwrap();
+    }
+    fs::write(dir.path().join("0bad.toml"), "junk").unwrap();
+    let defs = read_definitions(dir.path()).unwrap();
+    let paths: Vec<_> = defs.valid.iter().map(|(p, _)| p.clone()).collect();
+    let mut sorted = paths.clone();
+    sorted.sort();
+    assert_eq!(paths, sorted);
+    match resolve_in_dir(dir.path(), "Same") {
+        Err(ResolveError::Ambiguous { files, .. }) => assert_eq!(files, sorted),
+        other => panic!("unexpected result: {other:?}"),
+    }
+}
+
+#[test]
+fn not_found_message_mentions_skipped_only_when_nonzero() {
+    let none = ResolveError::NotFound {
+        name: "X".into(),
+        skipped_invalid: 0,
+    };
+    assert_eq!(none.to_string(), "VCI 'X' not found");
+    let some = ResolveError::NotFound {
+        name: "X".into(),
+        skipped_invalid: 2,
+    };
+    assert!(some.to_string().contains("2 invalid"));
+}
+
 fn fixture() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     let p = dir.path();
@@ -137,7 +297,8 @@ fn read_definitions_splits_valid_and_invalid() {
     let defs = read_definitions(dir.path()).unwrap();
     let names: Vec<_> = defs.valid.iter().map(|(_, d)| d.name.as_str()).collect();
     assert_eq!(names, ["One", "Two"]);
-    assert_eq!(defs.invalid.len(), 1);
+    // `bad.toml` and the directory `sub.toml`.
+    assert_eq!(defs.invalid.len(), 2);
     assert!(defs.invalid[0].0.ends_with("bad.toml"));
 }
 
@@ -162,7 +323,7 @@ fn resolve_in_dir_not_found_counts_skipped_files() {
             skipped_invalid,
         }) => {
             assert_eq!(name, "Typo");
-            assert_eq!(skipped_invalid, 1);
+            assert_eq!(skipped_invalid, 2);
         }
         other => panic!("unexpected result: {other:?}"),
     }

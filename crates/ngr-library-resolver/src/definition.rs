@@ -1,6 +1,9 @@
 //! Parsing and validation of one Linux registration definition (7.1.1, ADR-266).
 
-use std::{io, path::PathBuf};
+use std::{
+    io,
+    path::{Component, Path, PathBuf},
+};
 
 use serde::Deserialize;
 
@@ -17,6 +20,9 @@ pub const PROTOCOL_KEYS: &[&str] = &[
     "SCI_B_ENGINE",
     "SCI_B_TRANS",
 ];
+
+/// Largest definition file accepted, in bytes.
+pub const MAX_DEFINITION_SIZE: u64 = 64 * 1024;
 
 /// A validated registration definition (one VCI).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,6 +55,37 @@ pub enum DefinitionError {
     /// `Name` is empty.
     #[error("`Name` is empty")]
     EmptyName,
+    /// `Name` has leading or trailing whitespace (it is refused, not trimmed).
+    #[error("`Name` has leading or trailing whitespace")]
+    NameWhitespace,
+    /// A `.toml` entry that is not a regular file (a symlink, a directory, ...).
+    #[error("not a regular file")]
+    NotARegularFile,
+    /// The file is larger than [`MAX_DEFINITION_SIZE`].
+    #[error("definition is larger than {MAX_DEFINITION_SIZE} bytes")]
+    TooLarge,
+    /// A path value contains a NUL character.
+    #[error("`{key}` contains a NUL character")]
+    NulInPath {
+        /// The key (`FunctionLibrary` or `SearchPaths`).
+        key: &'static str,
+    },
+    /// A path value has leading or trailing whitespace.
+    #[error("`{key}` has leading or trailing whitespace: {value:?}")]
+    PathWhitespace {
+        /// The key (`FunctionLibrary` or `SearchPaths`).
+        key: &'static str,
+        /// The offending value.
+        value: String,
+    },
+    /// A path value has a `..` component.
+    #[error("`{key}` contains a `..` component: {value}")]
+    ParentDirInPath {
+        /// The key (`FunctionLibrary` or `SearchPaths`).
+        key: &'static str,
+        /// The offending value.
+        value: String,
+    },
     /// `FunctionLibrary` is not an absolute path.
     #[error("`FunctionLibrary` is not an absolute path: {}", .0.display())]
     RelativeLibrary(PathBuf),
@@ -109,9 +146,13 @@ impl Definition {
     /// Parses and validates the text of one definition file.
     pub fn parse(text: &str) -> Result<Definition, DefinitionError> {
         let raw: Raw = toml::from_str(text)?;
-        if raw.name.is_empty() {
+        if raw.name.trim().is_empty() {
             return Err(DefinitionError::EmptyName);
         }
+        if raw.name != raw.name.trim() {
+            return Err(DefinitionError::NameWhitespace);
+        }
+        check_path_text("FunctionLibrary", &raw.function_library)?;
         let library = PathBuf::from(&raw.function_library);
         if !library.is_absolute() {
             return Err(DefinitionError::RelativeLibrary(library));
@@ -144,6 +185,7 @@ impl Definition {
         };
         let mut search_paths = Vec::with_capacity(raw.search_paths.len());
         for entry in raw.search_paths {
+            check_path_text("SearchPaths", &entry)?;
             let path = PathBuf::from(entry);
             if !path.is_absolute() {
                 return Err(DefinitionError::RelativeSearchPath(path));
@@ -160,4 +202,27 @@ impl Definition {
             search_paths,
         })
     }
+}
+
+/// Rejects NUL, surrounding whitespace and `..` components in a path value.
+fn check_path_text(key: &'static str, value: &str) -> Result<(), DefinitionError> {
+    if value.contains('\0') {
+        return Err(DefinitionError::NulInPath { key });
+    }
+    if value != value.trim() {
+        return Err(DefinitionError::PathWhitespace {
+            key,
+            value: value.to_owned(),
+        });
+    }
+    if Path::new(value)
+        .components()
+        .any(|c| c == Component::ParentDir)
+    {
+        return Err(DefinitionError::ParentDirInPath {
+            key,
+            value: value.to_owned(),
+        });
+    }
+    Ok(())
 }

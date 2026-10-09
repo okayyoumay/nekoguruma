@@ -1,6 +1,6 @@
 //! Test double for the stdio control channel of the worker service binaries.
 //! Not shipped. The library name selects the behavior: `startup-error`, `never-running`,
-//! anything else starts normally.
+//! `ignore-stop` (a stop request is never answered and the process never exits), anything else starts normally.
 
 use std::io::{BufRead, Write};
 
@@ -56,6 +56,9 @@ fn main() {
                 json!({"long_size": std::env::var("NGR_J2534_LONG_SIZE").ok()}),
                 false,
             ),
+            "stop" if mode == "ignore-stop" => loop {
+                std::thread::sleep(std::time::Duration::from_secs(3600));
+            },
             "stop" => (json!({"stopped": true}), true),
             _ => {
                 writeln!(out, "{}", json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32601, "message": "method not found"}})).unwrap();

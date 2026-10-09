@@ -386,7 +386,7 @@ pub async fn close(
 }
 
 /// Runs every step even after one fails, and returns the first failure.
-async fn teardown(
+pub(crate) async fn teardown(
     client: &mut WorkerClient,
     module_handle: ModuleHandle,
     cll_handle: ComLogicalLinkHandle,

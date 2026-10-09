@@ -92,6 +92,11 @@ pub enum JobError {
     OnSiteInterventionRequired(OnSiteReason),
     #[error("the program writes, but its guards do not hold the device's reprogramming slot")]
     NoReprogrammingSlot,
+    #[error(
+        "the job's guards hold a link that was not confirmed closed; stop the worker and call \
+         `JobGuards::worker_gone` first"
+    )]
+    LinkUnconfirmed,
     #[error("the job thread panicked")]
     Panicked,
 }
@@ -137,7 +142,10 @@ fn refuse_beyond(program: &Program, permission: Permission) -> Result<(), JobErr
 /// the runtime for every primitive. That thread opens the link, runs the program and closes the
 /// link, so no future holding worker resources is ever dropped halfway. Once open, the link is
 /// closed however the job ends, also when the procedure panics; a failure to close it is
-/// logged, since it does not change the results. Dropping the returned future cancels the job:
+/// logged and does not change the results, but it marks the returned guards
+/// ([`JobGuards::link_unconfirmed`], ADR-258): the worker may still hold the VCI, so the guards
+/// keep their locks and a run refuses them with [`JobError::LinkUnconfirmed`] until
+/// [`JobGuards::worker_gone`]. Dropping the returned future cancels the job:
 /// the call or primitive in flight finishes, no further instruction runs, and the link is
 /// closed. That happens after the future is gone, so a caller that dropped it must not hand
 /// the worker to another job yet (ADR-235 consequences).
@@ -284,6 +292,16 @@ async fn run_program_within(
     if handle.runtime_flavor() == RuntimeFlavor::CurrentThread {
         return Err(JobError::CurrentThreadRuntime);
     }
+    // Guards whose last link was not confirmed closed may still have a worker on the VCI
+    // (ADR-258): nothing opens on them.
+    if guards
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(JobGuards::link_unconfirmed)
+    {
+        return Err(JobError::LinkUnconfirmed);
+    }
     check_program(&program, ceiling)?;
     // A program that writes needs the device's reprogramming slot (design 8.8.1, ADR-257).
     let holds_slot = guards
@@ -332,10 +350,11 @@ fn run_job(
     journal: Option<JournalMode>,
     guards: GuardSlot,
 ) -> Result<VmState, JobError> {
-    // The job's guards stay held until the end of this function, after the link is closed:
-    // declared first, this handle is dropped last, so even a caller whose future is gone
-    // cannot hand the VCI to another job while this one still tears its link down.
-    let _guards = guards;
+    // The job's guards stay held until the end of this function, after the link is closed
+    // (`OpenLink`, declared below, closes it on every way out, a panic included): declared
+    // first, this handle is dropped last, so even a caller whose future is gone cannot hand the
+    // VCI to another job while this one still tears its link down.
+    let _guards = Arc::clone(&guards);
     if cancelled.load(Ordering::Relaxed) {
         return Err(JobError::Cancelled);
     }
@@ -343,15 +362,28 @@ fn run_job(
     let link = handle
         .block_on(link::open(&mut client, config, timings.unary))
         .map_err(JobError::Link)?;
+    let permission = link.permission;
+    // Declared before the host, which owns the link's event stream: on a panic the stream is
+    // dropped first, then the link is closed.
+    let open_link = OpenLink {
+        handle: handle.clone(),
+        client: client.clone(),
+        module_handle: link.module_handle,
+        cll_handle: link.cll_handle,
+        deadline: timings.unary,
+        guards,
+        closed: false,
+    };
+    let mut host = WorkerHost::new(handle.clone(), client, link, timings);
     // The VCI is known now. Nothing has been sent to the ECU yet, so a program that needs more
     // than this link allows is refused with no effect on it.
-    if let Err(error) = refuse_beyond(program, link.permission) {
-        close_logged(&handle, &mut client, link, timings.unary);
+    if let Err(error) = refuse_beyond(program, permission) {
+        drop(host);
+        open_link.close();
         return Err(error);
     }
     // Still before anything is sent: a job that cannot keep its journal sends nothing. A link
     // that fails to open, or a program the link refuses, leaves no journal behind.
-    let mut host = WorkerHost::new(handle.clone(), client, link, timings);
     let result = std::panic::catch_unwind(AssertUnwindSafe(|| match journal {
         Some(JournalMode::Create(setup)) if !program.flash.is_empty() => {
             let mut journal = JobJournal::create(setup)?;
@@ -374,22 +406,64 @@ fn run_job(
         ),
     }))
     .unwrap_or(Err(JobError::Panicked));
-    let (mut client, link) = host.into_parts();
-    close_logged(&handle, &mut client, link, timings.unary);
+    // The event stream goes before the link is closed.
+    drop(host);
+    open_link.close();
     result
 }
 
-/// Closes the link; the job's result stands whether or not that works, so a failure is only
-/// logged.
-fn close_logged(handle: &Handle, client: &mut WorkerClient, link: link::Link, deadline: Duration) {
-    // Closing on a runtime that is shutting down can panic.
-    let closed = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        handle.block_on(link::close(client, link, deadline))
-    }));
-    match closed {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => tracing::warn!(%error, "could not close the link"),
-        Err(_) => tracing::warn!("closing the link panicked"),
+/// A link that is open on the worker. It is closed exactly once, by [`OpenLink::close`] or, when
+/// the job panics, by `Drop`. The job's result stands whether or not that works; a failure is
+/// logged and marks the job's guards (`JobGuards::mark_link_unconfirmed`, ADR-258), since the
+/// worker may then still hold the VCI.
+struct OpenLink {
+    handle: Handle,
+    client: WorkerClient,
+    module_handle: vci_service_interface::ModuleHandle,
+    cll_handle: vci_service_interface::ComLogicalLinkHandle,
+    deadline: Duration,
+    guards: GuardSlot,
+    closed: bool,
+}
+
+impl OpenLink {
+    /// Closes the link. The link's event stream must be dropped before.
+    fn close(mut self) {
+        self.teardown();
+    }
+
+    fn teardown(&mut self) {
+        if std::mem::replace(&mut self.closed, true) {
+            return;
+        }
+        // Closing on a runtime that is shutting down can panic.
+        let closed = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            self.handle.block_on(link::teardown(
+                &mut self.client,
+                self.module_handle,
+                self.cll_handle,
+                self.deadline,
+            ))
+        }));
+        match closed {
+            Ok(Ok(())) => return,
+            Ok(Err(error)) => tracing::warn!(%error, "could not close the link"),
+            Err(_) => tracing::warn!("closing the link panicked"),
+        }
+        if let Some(guards) = self
+            .guards
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+        {
+            guards.mark_link_unconfirmed();
+        }
+    }
+}
+
+impl Drop for OpenLink {
+    fn drop(&mut self) {
+        self.teardown();
     }
 }
 
@@ -545,6 +619,7 @@ mod tests {
     use std::rc::Rc;
 
     use diag_ir::{IR_SCHEMA_VERSION, Op, Value};
+    use vci_service_interface::{ComLogicalLinkHandle, ModuleHandle};
 
     use super::*;
 
@@ -2708,5 +2783,356 @@ mod tests {
         )
         .await;
         assert!(matches!(result, Err(JobError::CurrentThreadRuntime)));
+    }
+
+    // ------------------------------------------------------------ closing the link (ADR-258)
+
+    /// A worker that answers the RPCs a link needs and records them. `fail_disconnect` makes the
+    /// logical link's disconnect fail, as a VCI that was unplugged does.
+    struct FakeWorker {
+        fail_disconnect: bool,
+        calls: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl FakeWorker {
+        fn note(&self, rpc: &'static str) {
+            self.calls.lock().unwrap().push(rpc);
+        }
+    }
+
+    fn unimplemented<T>() -> Result<tonic::Response<T>, tonic::Status> {
+        Err(tonic::Status::unimplemented("not part of the fake"))
+    }
+
+    #[tonic::codegen::async_trait]
+    impl vci_service_interface::vci_service_server::VciService for FakeWorker {
+        async fn get_module_ids(
+            &self,
+            _: tonic::Request<vci_service_interface::GetModuleIdsRequest>,
+        ) -> Result<tonic::Response<vci_service_interface::ModuleIdsResponse>, tonic::Status>
+        {
+            self.note("GetModuleIds");
+            Ok(tonic::Response::new(
+                vci_service_interface::ModuleIdsResponse {
+                    module_id_list: Some(vci_service_interface::ModuleItem {
+                        module_data: vec![vci_service_interface::ModuleData {
+                            module_handle: Some(ModuleHandle { module_handle: 1 }),
+                            ..Default::default()
+                        }],
+                    }),
+                },
+            ))
+        }
+        async fn module_connect(
+            &self,
+            _: tonic::Request<vci_service_interface::ModuleConnectRequest>,
+        ) -> Result<tonic::Response<vci_service_interface::Response>, tonic::Status> {
+            self.note("ModuleConnect");
+            Ok(tonic::Response::new(Default::default()))
+        }
+        async fn module_disconnect(
+            &self,
+            _: tonic::Request<vci_service_interface::ModuleDisconnectRequest>,
+        ) -> Result<tonic::Response<vci_service_interface::Response>, tonic::Status> {
+            self.note("ModuleDisconnect");
+            Ok(tonic::Response::new(Default::default()))
+        }
+        async fn get_version(
+            &self,
+            _: tonic::Request<vci_service_interface::GetVersionRequest>,
+        ) -> Result<tonic::Response<vci_service_interface::VersionResponse>, tonic::Status>
+        {
+            // The link stays read-only.
+            unimplemented()
+        }
+        async fn get_timestamp(
+            &self,
+            _: tonic::Request<vci_service_interface::GetTimestampRequest>,
+        ) -> Result<tonic::Response<vci_service_interface::TimestampResponse>, tonic::Status>
+        {
+            unimplemented()
+        }
+        async fn get_resource_status(
+            &self,
+            _: tonic::Request<vci_service_interface::GetResourceStatusRequest>,
+        ) -> Result<tonic::Response<vci_service_interface::ResourceStatusResponse>, tonic::Status>
+        {
+            unimplemented()
+        }
+        async fn get_resource_ids(
+            &self,
+            _: tonic::Request<vci_service_interface::GetResourceIdsRequest>,
+        ) -> Result<tonic::Response<vci_service_interface::ResourceIdsResponse>, tonic::Status>
+        {
+            Ok(tonic::Response::new(
+                vci_service_interface::ResourceIdsResponse {
+                    resource_id_list: Some(vci_service_interface::ResourceIdItem {
+                        resource_id_data_array: vec![vci_service_interface::ResourceIdItemData {
+                            module_handle: None,
+                            resource_id_array: vec![1],
+                        }],
+                    }),
+                },
+            ))
+        }
+        async fn get_conflicting_resources(
+            &self,
+            _: tonic::Request<vci_service_interface::GetConflictingResourcesRequest>,
+        ) -> Result<
+            tonic::Response<vci_service_interface::ConflictingResourcesResponse>,
+            tonic::Status,
+        > {
+            unimplemented()
+        }
+        async fn create_com_logical_link(
+            &self,
+            _: tonic::Request<vci_service_interface::CreateComLogicalLinkRequest>,
+        ) -> Result<tonic::Response<vci_service_interface::ComLogicalLinkResponse>, tonic::Status>
+        {
+            Ok(tonic::Response::new(
+                vci_service_interface::ComLogicalLinkResponse {
+                    cll_handle: Some(ComLogicalLinkHandle {
+                        module_handle: 1,
+                        cll_handle: 1,
+                    }),
+                },
+            ))
+        }
+        async fn destroy_com_logical_link(
+            &self,
+            _: tonic::Request<vci_service_interface::DestroyComLogicalLinkRequest>,
+        ) -> Result<tonic::Response<vci_service_interface::Response>, tonic::Status> {
+            self.note("DestroyComLogicalLink");
+            Ok(tonic::Response::new(Default::default()))
+        }
+        async fn connect_com_logical_link(
+            &self,
+            _: tonic::Request<vci_service_interface::ConnectComLogicalLinkRequest>,
+        ) -> Result<tonic::Response<vci_service_interface::Response>, tonic::Status> {
+            Ok(tonic::Response::new(Default::default()))
+        }
+        async fn disconnect_com_logical_link(
+            &self,
+            _: tonic::Request<vci_service_interface::DisconnectComLogicalLinkRequest>,
+        ) -> Result<tonic::Response<vci_service_interface::Response>, tonic::Status> {
+            self.note("DisconnectComLogicalLink");
+            if self.fail_disconnect {
+                return Err(tonic::Status::failed_precondition("device not connected"));
+            }
+            Ok(tonic::Response::new(Default::default()))
+        }
+        async fn lock_resource(
+            &self,
+            _: tonic::Request<vci_service_interface::LockResourceRequest>,
+        ) -> Result<tonic::Response<vci_service_interface::Response>, tonic::Status> {
+            unimplemented()
+        }
+        async fn unlock_resource(
+            &self,
+            _: tonic::Request<vci_service_interface::UnlockResourceRequest>,
+        ) -> Result<tonic::Response<vci_service_interface::Response>, tonic::Status> {
+            unimplemented()
+        }
+        async fn get_com_param(
+            &self,
+            _: tonic::Request<vci_service_interface::GetComParamRequest>,
+        ) -> Result<tonic::Response<vci_service_interface::ComParamResponse>, tonic::Status>
+        {
+            unimplemented()
+        }
+        async fn set_com_param(
+            &self,
+            _: tonic::Request<vci_service_interface::SetComParamRequest>,
+        ) -> Result<tonic::Response<vci_service_interface::Response>, tonic::Status> {
+            Ok(tonic::Response::new(Default::default()))
+        }
+        async fn start_com_primitive(
+            &self,
+            _: tonic::Request<vci_service_interface::StartComPrimitiveRequest>,
+        ) -> Result<tonic::Response<vci_service_interface::ComPrimitiveResponse>, tonic::Status>
+        {
+            self.note("StartComPrimitive");
+            unimplemented()
+        }
+        async fn cancel_com_primitive(
+            &self,
+            _: tonic::Request<vci_service_interface::CancelComPrimitiveRequest>,
+        ) -> Result<tonic::Response<vci_service_interface::Response>, tonic::Status> {
+            unimplemented()
+        }
+        async fn get_status(
+            &self,
+            _: tonic::Request<vci_service_interface::GetStatusRequest>,
+        ) -> Result<tonic::Response<vci_service_interface::StatusResponse>, tonic::Status> {
+            unimplemented()
+        }
+        async fn get_event_item(
+            &self,
+            _: tonic::Request<vci_service_interface::GetEventItemRequest>,
+        ) -> Result<tonic::Response<vci_service_interface::EventItemResponse>, tonic::Status>
+        {
+            unimplemented()
+        }
+        type SubscribeEventStream = tonic::codegen::tokio_stream::Pending<
+            Result<vci_service_interface::EventNotification, tonic::Status>,
+        >;
+        async fn subscribe_event(
+            &self,
+            _: tonic::Request<vci_service_interface::SubscribeEventRequest>,
+        ) -> Result<tonic::Response<Self::SubscribeEventStream>, tonic::Status> {
+            Ok(tonic::Response::new(tonic::codegen::tokio_stream::pending()))
+        }
+        async fn io_ctl(
+            &self,
+            _: tonic::Request<vci_service_interface::IoCtlRequest>,
+        ) -> Result<tonic::Response<vci_service_interface::IoCtlResponse>, tonic::Status> {
+            unimplemented()
+        }
+        async fn get_object_id(
+            &self,
+            _: tonic::Request<vci_service_interface::GetObjectIdRequest>,
+        ) -> Result<tonic::Response<vci_service_interface::ObjectIdResponse>, tonic::Status>
+        {
+            Ok(tonic::Response::new(
+                vci_service_interface::ObjectIdResponse { pdu_object_id: 1 },
+            ))
+        }
+        async fn get_unique_resp_id_table(
+            &self,
+            _: tonic::Request<vci_service_interface::GetUniqueRespIdTableRequest>,
+        ) -> Result<tonic::Response<vci_service_interface::UniqueRespIdTableResponse>, tonic::Status>
+        {
+            unimplemented()
+        }
+        async fn set_unique_resp_id_table(
+            &self,
+            _: tonic::Request<vci_service_interface::SetUniqueRespIdTableRequest>,
+        ) -> Result<tonic::Response<vci_service_interface::Response>, tonic::Status> {
+            Ok(tonic::Response::new(Default::default()))
+        }
+    }
+
+    /// Serves a [`FakeWorker`] on a loopback port; returns a client for it and the log of the
+    /// RPCs it recorded.
+    async fn fake_worker(fail_disconnect: bool) -> (WorkerClient, Arc<Mutex<Vec<&'static str>>>) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let service = FakeWorker {
+            fail_disconnect,
+            calls: Arc::clone(&calls),
+        };
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let incoming = tonic::codegen::tokio_stream::wrappers::TcpListenerStream::new(listener);
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(
+                    vci_service_interface::vci_service_server::VciServiceServer::new(service),
+                )
+                .serve_with_incoming(incoming),
+        );
+        let channel = tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{port}"))
+            .unwrap()
+            .connect_lazy();
+        let client = vci_service_interface::vci_service_client::VciServiceClient::with_interceptor(
+            channel,
+            worker_host::client::BearerAuth::new([0; 32], "test"),
+        );
+        (client, calls)
+    }
+
+    /// A link whose disconnect fails is not confirmed closed: the job's result stands, and the
+    /// guards it returns say so and keep their locks.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_close_marks_the_guards_and_keeps_the_result() {
+        let (client, calls) = fake_worker(true).await;
+        let (result, mut guards) = run_program(
+            client,
+            &LinkConfig::iso15765(0x7E0, 0x7E8),
+            program(Vec::new()),
+            JobLimits::default(),
+            vci_only_guards("close-fails"),
+        )
+        .await;
+        result.expect("the program has nothing to fail");
+        assert!(guards.link_unconfirmed());
+        let calls = calls.lock().unwrap().clone();
+        assert!(calls.contains(&"DisconnectComLogicalLink"), "{calls:?}");
+        // Every step of the close was tried.
+        assert!(calls.contains(&"ModuleDisconnect"), "{calls:?}");
+        guards.worker_gone();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_confirmed_close_leaves_the_guards_unmarked() {
+        let (client, calls) = fake_worker(false).await;
+        let (result, guards) = run_program(
+            client,
+            &LinkConfig::iso15765(0x7E0, 0x7E8),
+            program(Vec::new()),
+            JobLimits::default(),
+            vci_only_guards("close-works"),
+        )
+        .await;
+        result.expect("the program has nothing to fail");
+        assert!(!guards.link_unconfirmed());
+        let calls = calls.lock().unwrap().clone();
+        assert!(calls.contains(&"ModuleDisconnect"), "{calls:?}");
+    }
+
+    /// The close also runs, and also marks, when the job fails: its own error is what the run
+    /// returns.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_close_after_a_failed_job_keeps_the_jobs_error() {
+        let (client, _calls) = fake_worker(true).await;
+        let (result, mut guards) = run_program(
+            client,
+            &LinkConfig::iso15765(0x7E0, 0x7E8),
+            program(two_requests()[..2].to_vec()),
+            JobLimits::default(),
+            vci_only_guards("job-and-close-fail"),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(JobError::Host { pc: 1, .. })),
+            "{result:?}"
+        );
+        assert!(guards.link_unconfirmed());
+        guards.worker_gone();
+    }
+
+    /// Guards whose link was not confirmed closed are refused before anything opens, until
+    /// `worker_gone`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unconfirmed_guards_are_refused_until_the_worker_is_gone() {
+        let (client, calls) = fake_worker(false).await;
+        let mut guards = vci_only_guards("refused-unconfirmed");
+        guards.mark_link_unconfirmed();
+        let (result, mut guards) = run_program(
+            client.clone(),
+            &LinkConfig::iso15765(0x7E0, 0x7E8),
+            program(Vec::new()),
+            JobLimits::default(),
+            guards,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(JobError::LinkUnconfirmed)),
+            "{result:?}"
+        );
+        assert!(guards.link_unconfirmed());
+        assert!(calls.lock().unwrap().is_empty(), "nothing was sent");
+        guards.worker_gone();
+        let (result, guards) = run_program(
+            client,
+            &LinkConfig::iso15765(0x7E0, 0x7E8),
+            program(Vec::new()),
+            JobLimits::default(),
+            guards,
+        )
+        .await;
+        result.expect("runs once the worker is gone");
+        assert!(!guards.link_unconfirmed());
     }
 }

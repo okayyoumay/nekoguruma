@@ -2,7 +2,7 @@
 
 **Date:** 2026-10-09
 **Status:** Accepted
-**Affects:** `agent` (`src/restart.rs`, `src/runner.rs`, `docs/ngr-agent.md`), `sim-ecu` (`EcuConfig::startup_ms`, `docs/simulated-ecu.md`), ADR-229 item 2, ADR-264 item 5
+**Affects:** `agent` (`src/restart.rs`, `src/runner.rs`, `docs/ngr-agent.md`), `sim-ecu` (`EcuConfig::startup_ms`, `docs/simulated-ecu.md`), design 8.2.5, ADR-229 item 2, ADR-264 item 5
 
 ## Context
 

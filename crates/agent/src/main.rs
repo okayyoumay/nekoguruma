@@ -106,6 +106,9 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<RunArgs, Strin
             }
             "--program" => program = Some(PathBuf::from(value)),
             "--workers" => workers = Some(PathBuf::from(value)),
+            "--locks" if value.is_empty() => {
+                return Err("--locks needs a directory".to_owned());
+            }
             "--locks" => locks = Some(PathBuf::from(value)),
             "--tx-id" => tx_id = parse_can_id(&flag, &value)?,
             "--rx-id" => rx_id = parse_can_id(&flag, &value)?,
@@ -167,11 +170,14 @@ async fn run(args: RunArgs) -> Result<String, String> {
     check_program(&program, build_ceiling()).map_err(|error| format!("job failed: {error}"))?;
     // The per-VCI lock, and the reprogramming slot for a program that writes (design 8.8.1). The
     // wait polls a file lock, so it runs off the runtime's threads; nothing cancels it here.
+    // An absolute path, so runs from different working directories share one lock set.
+    let dir = match args.locks {
+        Some(dir) => std::path::absolute(&dir)
+            .map_err(|error| format!("--locks {}: {error}", dir.display()))?,
+        None => default_locks()?,
+    };
     let setup = GuardSetup {
-        dir: match args.locks {
-            Some(dir) => dir,
-            None => default_locks()?,
-        },
+        dir,
         vci: args.vci.clone(),
     };
     let writes = writes(&program);
@@ -296,6 +302,7 @@ mod tests {
             &["run", "--vci", "x", "--program", "p", "--rx-id", "18DAF110"],
             &["run", "--vci", "x", "--program", "p", "--verbose", "1"],
             &["run", "--vci", "x", "--program", "p", "--locks"],
+            &["run", "--vci", "x", "--program", "p", "--locks", ""],
         ] {
             assert!(parse(args).is_err(), "{args:?}");
         }

@@ -1,4 +1,4 @@
-//! Restart guards (design 8.8, 8.8.1; ADR-229 item 2 step 1, ADR-256).
+//! Job guards (design 8.8, 8.8.1; ADR-229 item 2 step 1, ADR-256, ADR-257).
 //!
 //! On one device, every job holds the lock of the VCI it uses (per-VCI lock), and a job that
 //! reprograms also holds:

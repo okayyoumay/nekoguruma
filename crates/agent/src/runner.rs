@@ -145,7 +145,7 @@ fn refuse_beyond(program: &Program, permission: Permission) -> Result<(), JobErr
 /// The program is checked against [`policy::build_ceiling`] before anything opens and against
 /// the link's own permission once the VCI is known (ADR-247).
 ///
-/// `guards` are the job's restart guards (`guards::JobGuards`, ADR-256, design 8.8.1). The
+/// `guards` are the job's guards (`guards::JobGuards`, ADR-256, ADR-257, design 8.8.1). The
 /// caller takes them before it calls: `JobGuards::take` for a program that writes
 /// (`policy::writes`), `JobGuards::take_vci_only` for one that only reads. A writing program on
 /// guards without the reprogramming slot ends in [`JobError::NoReprogrammingSlot`], checked

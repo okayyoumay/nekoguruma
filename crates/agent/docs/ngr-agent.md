@@ -15,13 +15,13 @@ ngr-agent run --vci <name> --program <file> [--workers <dir>] [--locks <dir>] [-
 | `--vci` | J2534 v04.04 library name, as the worker service resolves it (registry key on Windows, `library_path` entry in the service's `config.toml`) |
 | `--program` | IR program file: a `diag_ir::Program` serialized as JSON |
 | `--workers` | Directory of worker builds, laid out as `<dir>/<ABI name>/j2534-0404-service[.exe]` (design 7.3). Default: `workers` next to the `ngr-agent` executable |
-| `--locks` | The device's lock directory for the job's guards ("Job guards" below). Default: `locks` next to the `ngr-agent` executable; it must be writable by every agent user on the device |
+| `--locks` | The device's lock directory for the job's guards ("Job guards" below), made absolute; an empty value is refused. Default: `locks` next to the `ngr-agent` executable. The agent creates the directory and its files with the process's default permissions, so a device whose agents run as several users needs it created beforehand, writable by all of them |
 | `--tx-id`, `--rx-id` | Physical request and response CAN IDs in hex, with or without `0x`. Default `7E0` / `7E8`. Only 11-bit IDs: the link does not set the CAN ID format |
 
 The link is UDS on ISO 15765 at 500 kbit/s (`LinkConfig::iso15765`), with the CAN IDs from the
 command line rather than from the program.
 
-Steps (`agent::check_program`, `agent::launch::launch_j2534_worker`, then `agent::run_program`):
+Steps (`agent::check_program`, `agent::guards::JobGuards`, `agent::launch::launch_j2534_worker`, then `agent::run_program`):
 
 1. Read the program and check it (`agent::check_program`): a program whose schema version or
    size this VM does not accept, one whose restart declaration `Program::validate` refuses
@@ -29,7 +29,10 @@ Steps (`agent::check_program`, `agent::launch::launch_j2534_worker`, then `agent
    read-only requests; ADR-235 item 8, ADR-247), fails here,
    before any worker starts. A bad operand, such as a missing constant, fails only when the VM
    reaches it, after the worker has started.
-2. Resolve the VCI name the way each worker build would resolve it on its side
+2. Take the job's guards from the `--locks` directory, named by `--vci` ("Job guards" below):
+   the per-VCI lock, plus the reprogramming slot when the program writes (`policy::writes`).
+   The run waits here while another job on the device holds them.
+3. Resolve the VCI name the way each worker build would resolve it on its side
    (`j2534_0404_registry`): a `library_path` entry in `config.toml` under that build's
    architecture key, else at api level, else the build's registry view. The first build whose
    library header (`worker_host::abi::detect_file`) matches the build's own ABI is chosen, so
@@ -40,14 +43,11 @@ Steps (`agent::check_program`, `agent::launch::launch_j2534_worker`, then `agent
    - Windows x86 agent: the x86 build only, so a 64-bit library is not found.
    - Linux: one lookup without an architecture key; the registry does not apply, so the
      library needs a `library_path` entry, and the build follows the header's ABI.
-3. Pick the service build for that ABI with `WorkerLayout::find`. A missing build fails as
+4. Pick the service build for that ABI with `WorkerLayout::find`. A missing build fails as
    `UNSUPPORTED_ABI`.
-4. Launch the service with the library name and the ABI's default `long_size` (design 7.1.2;
+5. Launch the service with the library name and the ABI's default `long_size` (design 7.1.2;
    always the default, whatever a registration definition declares), provision its
    auth key and connect the gRPC client (design 7.4).
-5. Take the job's guards from the `--locks` directory, named by `--vci` ("Job guards" below):
-   the per-VCI lock, plus the reprogramming slot when the program writes (`policy::writes`).
-   The run waits here while another job on the device holds them.
 6. Run the program under the request policy and the default job limits (ADR-235), then stop
    the worker and release the guards. The policy is read-only, except that a debug build may send any request once
    the worker's VCI has identified itself as `sim-vci` (ADR-247); a program that needs more

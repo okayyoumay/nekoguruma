@@ -169,6 +169,8 @@ fn unknown_vci_exits_with_1() {
         .arg(read_vin(&temp.0))
         .arg("--workers")
         .arg(&temp.0)
+        .arg("--locks")
+        .arg(temp.0.join("locks"))
         .env("VCI_CONFIG_PATH", config)
         .output()
         .expect("ngr-agent should run");
@@ -186,8 +188,55 @@ fn missing_worker_build_exits_with_1() {
         .arg(read_vin(&temp.0))
         .arg("--workers")
         .arg(temp.0.join("empty"))
+        .arg("--locks")
+        .arg(temp.0.join("locks"))
         .env("VCI_CONFIG_PATH", config)
         .output()
         .expect("ngr-agent should run");
     assert_fails_with(output, "no worker bundled for ABI");
+}
+
+/// `ngr-agent run` takes the per-VCI lock before it resolves the VCI, and waits while another
+/// job holds it (ADR-257).
+#[cfg(debug_assertions)]
+#[test]
+fn a_run_waits_for_the_vci_lock() {
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+
+    use agent::guards::{GuardSetup, JobGuards};
+
+    let temp = TempDir::new("vci-lock");
+    let config = write_config(&temp.0, None);
+    let locks = temp.0.join("locks");
+    let held = JobGuards::take_vci_only(
+        &GuardSetup {
+            dir: locks.clone(),
+            vci: "test-vci".to_owned(),
+        },
+        Duration::from_millis(1),
+        &AtomicBool::new(false),
+    )
+    .expect("the test takes the VCI lock");
+    let mut child = ngr_agent()
+        .args(["run", "--vci", "test-vci", "--program"])
+        .arg(read_vin(&temp.0))
+        .arg("--workers")
+        .arg(&temp.0)
+        .arg("--locks")
+        .arg(&locks)
+        .env("VCI_CONFIG_PATH", config)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("ngr-agent should start");
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        child.try_wait().expect("the run's status").is_none(),
+        "the run waits for the VCI lock"
+    );
+    drop(held);
+    // With the lock free, the run goes on and fails at the VCI, which the config does not name.
+    let output = child.wait_with_output().expect("ngr-agent should end");
+    assert_fails_with(output, "cannot resolve the library of VCI \"test-vci\"");
 }

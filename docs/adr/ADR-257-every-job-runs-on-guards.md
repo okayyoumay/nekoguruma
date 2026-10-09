@@ -25,8 +25,8 @@ runner also needs a way to know which kind of job it runs.
    - `JobGuards::holds_slot` tells them apart.
 2. **A job writes when the read-only policy refuses it.** `policy::writes(program)` is true when
    `policy::check_program` at `Permission::ReadOnly` finds an instruction it would refuse. Such
-   a program needs the slot. Instructions that are always refused, such as `SecurityAccess`,
-   also count as writes, which errs on the side of the slot.
+   a program needs the slot. A program with a flash recovery plan always writes: a valid plan
+   has a RequestDownload and a RequestTransferExit.
 3. **Every entry point requires guards and gives them back.**
    - All three entry points take a `JobGuards` by value and return it with the result, as
      ADR-256 item 5 does for the resume: `run_program`, `run_program_journaled` and
@@ -36,8 +36,12 @@ runner also needs a way to know which kind of job it runs.
    - The runner keeps its handle until after the link is closed, for every job.
    - A writing program run on guards without the slot ends in
      `JobError::NoReprogrammingSlot` before anything opens.
-4. **`ngr-agent run` takes the guards itself.** It reads the lock directory from `--locks
-   <dir>`, by default a `locks` directory next to the executable, as `--workers` does. It names
+4. **`ngr-agent run` takes the guards itself.**
+   - **Where.** It reads the lock directory from `--locks <dir>`, by default a `locks`
+     directory next to the executable, as `--workers` does. An empty value is refused.
+   - **Absolute.** The path is made absolute, so runs from different working directories
+     share one lock set.
+   - **When.** It takes the guards right after the program check, before it resolves the VCI. It names
    the VCI by its `--vci` argument and takes `take` or `take_vci_only` by `policy::writes`. It
    holds the guards for the run.
 
@@ -46,6 +50,16 @@ runner also needs a way to know which kind of job it runs.
 - ADR-256's consequence that first runs open the link without the per-VCI lock no longer holds.
 - `run_program` and `run_program_journaled` change their signatures; their callers in the
   repository (the CLI and the `j2534-0404-service` tests) take guards.
-- The default lock directory next to the executable must be writable by every agent user on
-  the device (ADR-256 item 1). An installation where it is not passes `--locks`.
+- The lock directory must be writable by every agent user on the device (ADR-256 item 1).
+  The agent creates the directory and its files with the process's default permissions. On a
+  device whose agents run as several users, the installation therefore creates it
+  beforehand, writable by all of them, or every run names one with `--locks`. A user who
+  cannot open a lock file fails at once instead of waiting.
+- A job that only reads can still wait for another VCI's reprogramming, because of the lock
+  order of ADR-256 item 4: a writer on VCI-1 takes VCI-1's lock and then waits for the slot,
+  which a writer on VCI-2 holds, and a read on VCI-1 then waits for VCI-1's lock. The wait
+  ends with that reprogramming. Taking the slot first would make every writer hold the
+  device's slot while it waits for its VCI, which costs more.
+- The guards exclude jobs by the VCI name their caller gives. A caller that drives
+  `link::open` and `WorkerHost` directly, or names a VCI differently, is not excluded.
 - Tests that run jobs in parallel use separate lock directories, since the slot is per device.

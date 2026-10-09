@@ -130,6 +130,9 @@ fn ngr_agent_runs_a_program_file_on_sim_vci() {
         .arg(&program_path)
         .arg("--workers")
         .arg(&workers)
+        // Its own lock directory, not the one next to the shared target directory's binary.
+        .arg("--locks")
+        .arg(root.join("locks"))
         .env("VCI_CONFIG_PATH", &config_path)
         .env_remove("VCI_SERVICE_INSECURE_NO_AUTH")
         // The simulated ECU uses its built-in configuration.

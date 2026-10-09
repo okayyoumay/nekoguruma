@@ -2,7 +2,8 @@
 //!
 //! No server and no section policy. A host error ends the job; the VM state then still points
 //! at the failed primitive (ADR-233 item 1). [`run_program_journaled`] also writes the
-//! write-job journal at a flash recovery plan's boundaries (`journaling`, ADR-252).
+//! write-job journal at a flash recovery plan's boundaries (`journaling`, ADR-252), and
+//! [`resume_program_journaled`] goes on with a job whose journal exists (`restart`, ADR-255).
 
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
@@ -17,10 +18,11 @@ use worker_host::client::WorkerClient;
 
 use crate::host::{HostError, Timings, TransferProgress, WorkerHost};
 use crate::inputs::RuntimeInputs;
-use crate::journal::{JournalError, StepRef, Store};
+use crate::journal::{Journal, JournalError, StepRef, Store};
 use crate::journaling::{JobJournal, JournalSetup};
 use crate::link::{self, LinkConfig};
 use crate::policy::{self, Permission};
+use crate::restart::{self, OnSiteReason, RestartDecision};
 
 /// Bounds of a job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,8 +85,20 @@ pub enum JobError {
         #[source]
         source: HostError,
     },
+    /// The job must not go on automatically (design 5.6, 8.2.5, 8.10.1): it ends here and
+    /// waits for someone on site.
+    #[error("the job needs on-site intervention: {0:?}")]
+    OnSiteInterventionRequired(OnSiteReason),
     #[error("the job thread panicked")]
     Panicked,
+}
+
+/// What a job does with its journal.
+enum JournalMode {
+    /// A first run: the journal is created, and one that exists is an error.
+    Create(JournalSetup),
+    /// A job that ran before: its journal is opened and classified (`restart`).
+    Resume(JournalSetup),
 }
 
 /// The checks [`run_program`] makes before it touches the worker: the program's schema version and
@@ -158,7 +172,40 @@ pub async fn run_program_journaled(
         program,
         limits,
         policy::build_ceiling(),
-        Some(journal),
+        Some(JournalMode::Create(journal)),
+    )
+    .await
+}
+
+/// Goes on with a job that ran before, from the journal [`run_program_journaled`] wrote under
+/// `journal.key` (ADR-255). Once the link is open and the policy allows the program, and before
+/// anything is sent to the ECU, the journal is opened and classified (`restart::classify`,
+/// ADR-253):
+/// - a plain start runs the program from its start on the same journal, its step count going on
+///   after the journal's last record (`restart::next_steps`); a program without a flash
+///   recovery plan and without a journal runs without one;
+/// - an interrupted transfer makes the checks of `restart::check_before_ecu` (resume limit,
+///   supply voltage) and commits the incremented resume count; the rest of the restart order
+///   does not run in this agent, so the job then ends in
+///   [`JobError::OnSiteInterventionRequired`] with nothing sent to the ECU;
+/// - a journal that rules a restart out, or a missing or unreadable one for a program with a
+///   plan, ends the job the same way, also with nothing sent.
+///
+/// Locks, the start deadline and a server reservation are not taken here.
+pub async fn resume_program_journaled(
+    client: WorkerClient,
+    config: &LinkConfig,
+    program: Program,
+    limits: JobLimits,
+    journal: JournalSetup,
+) -> Result<VmState, JobError> {
+    run_program_within(
+        client,
+        config,
+        program,
+        limits,
+        policy::build_ceiling(),
+        Some(JournalMode::Resume(journal)),
     )
     .await
 }
@@ -170,7 +217,7 @@ async fn run_program_within(
     program: Program,
     limits: JobLimits,
     ceiling: Permission,
-    journal: Option<JournalSetup>,
+    journal: Option<JournalMode>,
 ) -> Result<VmState, JobError> {
     let handle = Handle::current();
     if handle.runtime_flavor() == RuntimeFlavor::CurrentThread {
@@ -208,7 +255,7 @@ fn run_job(
     program: &Program,
     limits: JobLimits,
     cancelled: &AtomicBool,
-    journal: Option<JournalSetup>,
+    journal: Option<JournalMode>,
 ) -> Result<VmState, JobError> {
     if cancelled.load(Ordering::Relaxed) {
         return Err(JobError::Cancelled);
@@ -225,19 +272,27 @@ fn run_job(
     }
     // Still before anything is sent: a job that cannot keep its journal sends nothing. A link
     // that fails to open, or a program the link refuses, leaves no journal behind.
-    let mut journal = match journal {
-        Some(setup) if !program.flash.is_empty() => match JobJournal::create(setup) {
-            Ok(journal) => Some(journal),
-            Err(error) => {
-                close_logged(&handle, &mut client, link, timings.unary);
-                return Err(error.into());
-            }
-        },
-        _ => None,
-    };
     let mut host = WorkerHost::new(handle.clone(), client, link, timings);
-    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        run_on(program, &mut host, limits, cancelled, journal.as_mut())
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| match journal {
+        Some(JournalMode::Create(setup)) if !program.flash.is_empty() => {
+            let mut journal = JobJournal::create(setup)?;
+            run_on(program, &mut host, limits, cancelled, Some(&mut journal))
+        }
+        Some(JournalMode::Resume(setup)) => resume_on(
+            program,
+            &mut host,
+            limits,
+            cancelled,
+            Journal::open(&setup.dir, &setup.key),
+            setup.sources,
+        ),
+        _ => run_on(
+            program,
+            &mut host,
+            limits,
+            cancelled,
+            None::<&mut JobJournal>,
+        ),
     }))
     .unwrap_or(Err(JobError::Panicked));
     let (mut client, link) = host.into_parts();
@@ -268,6 +323,54 @@ impl Drop for CancelOnDrop {
     }
 }
 
+/// Goes on with a job from its journal as `Journal::open` gave it (ADR-255; see
+/// [`resume_program_journaled`]). Nothing is sent to the ECU before the classification and the
+/// checks of `restart::check_before_ecu` passed.
+fn resume_on<H, S>(
+    program: &Program,
+    host: &mut H,
+    limits: JobLimits,
+    cancelled: &AtomicBool,
+    opened: Result<Journal<S>, JournalError>,
+    sources: crate::inputs::ServiceSources,
+) -> Result<VmState, JobError>
+where
+    H: DiagHost<Error = HostError> + RuntimeInputs + TransferProgress,
+    S: Store,
+{
+    match restart::classify(program, opened.as_ref().map(Journal::state)) {
+        RestartDecision::OnSiteInterventionRequired(reason) => {
+            Err(JobError::OnSiteInterventionRequired(reason))
+        }
+        RestartDecision::PlainStart => match opened {
+            Ok(journal) if !program.flash.is_empty() => {
+                let first_step = restart::next_steps(journal.state());
+                let mut journal = JobJournal::new(journal, sources);
+                run_on_from(
+                    program,
+                    host,
+                    limits,
+                    cancelled,
+                    Some(&mut journal),
+                    first_step,
+                )
+            }
+            // A program without a plan keeps no journal (ADR-252 item 7).
+            _ => run_on(program, host, limits, cancelled, None::<&mut JobJournal<S>>),
+        },
+        RestartDecision::Restart(point) => {
+            // `classify` restarts only from a journal it read.
+            let mut journal = opened?;
+            restart::check_before_ecu(program, &point, &mut journal, host, cancelled)?;
+            Err(JobError::OnSiteInterventionRequired(
+                OnSiteReason::RestartOrderUnavailable {
+                    flash_session: point.flash_session,
+                },
+            ))
+        }
+    }
+}
+
 /// The step loop, on the blocking thread. With a journal, it commits the plan's markers each
 /// time execution arrives at an instruction, before that instruction runs, and what a completed
 /// instruction calls for right after it (`journaling`).
@@ -276,7 +379,24 @@ fn run_on<H, S>(
     host: &mut H,
     limits: JobLimits,
     cancelled: &AtomicBool,
+    journal: Option<&mut JobJournal<S>>,
+) -> Result<VmState, JobError>
+where
+    H: DiagHost<Error = HostError> + RuntimeInputs + TransferProgress,
+    S: Store,
+{
+    run_on_from(program, host, limits, cancelled, journal, 0)
+}
+
+/// [`run_on`] from the program's start with the step count at `first_step`, so a run on an
+/// existing journal records its steps after the journal's last one.
+fn run_on_from<H, S>(
+    program: &Program,
+    host: &mut H,
+    limits: JobLimits,
+    cancelled: &AtomicBool,
     mut journal: Option<&mut JobJournal<S>>,
+    first_step: u64,
 ) -> Result<VmState, JobError>
 where
     H: DiagHost<Error = HostError> + RuntimeInputs + TransferProgress,
@@ -284,6 +404,7 @@ where
 {
     let wait_poll = limits.wait_poll.max(Duration::from_millis(1));
     let mut vm = Vm::new(program);
+    vm.state.steps = first_step;
     // Whether the journal has seen this arrival yet (a timer wait polls the same instruction
     // again).
     let mut arrived = true;
@@ -658,6 +779,9 @@ mod tests {
         cancel_on_read: Option<([u8; 2], Arc<AtomicBool>)>,
         /// A routine whose response is lost.
         lose_routine: Option<u16>,
+        /// The supply voltage the VCI reports; `None` reports none.
+        voltage: Option<i64>,
+        voltage_reads: u32,
     }
 
     impl FlashHost {
@@ -669,6 +793,8 @@ mod tests {
                 software_version: Some(b"SW01".to_vec()),
                 cancel_on_read: None,
                 lose_routine: None,
+                voltage: None,
+                voltage_reads: 0,
             }
         }
 
@@ -678,8 +804,21 @@ mod tests {
     }
 
     impl RuntimeInputs for FlashHost {
-        fn read(&mut self, _: diag_ir::RuntimeInput) -> Result<crate::inputs::Reading, HostError> {
-            Ok(crate::inputs::Reading::CannotBeEstablished)
+        fn read(
+            &mut self,
+            input: diag_ir::RuntimeInput,
+        ) -> Result<crate::inputs::Reading, HostError> {
+            Ok(match (input, self.voltage) {
+                (diag_ir::RuntimeInput::SupplyVoltageMillivolts, Some(millivolts)) => {
+                    self.voltage_reads += 1;
+                    crate::inputs::Reading::Value(millivolts)
+                }
+                (diag_ir::RuntimeInput::SupplyVoltageMillivolts, None) => {
+                    self.voltage_reads += 1;
+                    crate::inputs::Reading::CannotBeEstablished
+                }
+                _ => crate::inputs::Reading::CannotBeEstablished,
+            })
         }
     }
 
@@ -1589,7 +1728,7 @@ mod tests {
                         &flash_program(),
                         JobLimits::default(),
                         &AtomicBool::new(false),
-                        Some(setup),
+                        Some(JournalMode::Create(setup)),
                     )
                 })
                 .await
@@ -1625,7 +1764,7 @@ mod tests {
                         &program(two_requests()),
                         JobLimits::default(),
                         &AtomicBool::new(false),
-                        Some(setup),
+                        Some(JournalMode::Create(setup)),
                     )
                 })
                 .await
@@ -1633,6 +1772,293 @@ mod tests {
             });
         assert!(matches!(result, Err(JobError::Link(_))), "{result:?}");
         assert!(!dir.exists());
+    }
+
+    // ------------------------------------------------------------ resume (ADR-255)
+
+    /// `flash_program` with a declared supply-voltage range of 11 to 15 V, read from the VCI.
+    fn flash_program_with_voltage() -> Program {
+        let mut program = flash_program();
+        let vbatt = Some(diag_ir::Source::RuntimeInput(
+            diag_ir::RuntimeInput::SupplyVoltageMillivolts,
+        ));
+        program.preconditions.voltage_mv = Some(diag_ir::Precondition {
+            satisfied: diag_ir::Satisfied {
+                lower: 11_000,
+                upper: 15_000,
+            },
+            default_session: vbatt,
+            programming_session: vbatt,
+        });
+        program.validate().expect("the fixture is a valid program");
+        program
+    }
+
+    fn journal_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "ngr-runner-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn file_setup(dir: &std::path::Path) -> JournalSetup {
+        JournalSetup {
+            dir: dir.to_owned(),
+            key: job_key(),
+            sources: identity_sources(),
+        }
+    }
+
+    /// A first run that writes its journal in `dir`, on a host `prepare` sets up.
+    fn first_run(
+        program: &Program,
+        dir: &std::path::Path,
+        limits: JobLimits,
+        prepare: impl FnOnce(&mut FlashHost),
+    ) -> Result<VmState, JobError> {
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        prepare(&mut host);
+        let mut journal = JobJournal::create(file_setup(dir)).unwrap();
+        run_on(
+            program,
+            &mut host,
+            limits,
+            &AtomicBool::new(false),
+            Some(&mut journal),
+        )
+    }
+
+    /// A first run whose erase response is lost: an interrupted transfer.
+    fn interrupted(program: &Program, dir: &std::path::Path) {
+        let result = first_run(program, dir, JobLimits::default(), |host| {
+            host.lose_routine = Some(0xFF00);
+        });
+        assert!(
+            matches!(result, Err(JobError::Host { pc: ERASE, .. })),
+            "{result:?}"
+        );
+    }
+
+    fn resume(
+        program: &Program,
+        dir: &std::path::Path,
+        host: &mut FlashHost,
+        cancelled: bool,
+    ) -> Result<VmState, JobError> {
+        resume_on(
+            program,
+            host,
+            JobLimits::default(),
+            &AtomicBool::new(cancelled),
+            Journal::open(dir, &job_key()),
+            identity_sources(),
+        )
+    }
+
+    fn resumes(dir: &std::path::Path) -> u16 {
+        Journal::read(dir, &job_key())
+            .unwrap()
+            .facts
+            .resume_count(crate::journal::StageId(7))
+    }
+
+    /// The done-when cases: a restart commits its resume before anything reaches the ECU, and
+    /// each restart of a job that keeps crashing in recovery counts one more until the limit
+    /// stops it, all on the journal alone (no attempt key).
+    #[test]
+    fn each_restart_counts_a_resume_until_the_limit_with_nothing_sent() {
+        let program = flash_program_with_voltage();
+        let dir = journal_dir("resume-limit");
+        interrupted(&program, &dir);
+
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        host.voltage = Some(12_600);
+        let result = resume(&program, &dir, &mut host, false);
+        assert!(
+            matches!(
+                result,
+                Err(JobError::OnSiteInterventionRequired(
+                    OnSiteReason::RestartOrderUnavailable { flash_session: 1 }
+                ))
+            ),
+            "{result:?}"
+        );
+        assert_eq!(host.sent(), []);
+        assert_eq!(host.voltage_reads, 1);
+        assert_eq!(resumes(&dir), 1);
+        let facts = Journal::read(&dir, &job_key()).unwrap().facts;
+        assert_eq!(facts.attempt_key, None);
+
+        // The agent crashed again during that recovery: the plan allows one resume.
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        host.voltage = Some(12_600);
+        let result = resume(&program, &dir, &mut host, false);
+        assert!(
+            matches!(
+                result,
+                Err(JobError::OnSiteInterventionRequired(
+                    OnSiteReason::ResumeLimitReached {
+                        flash_session: 1,
+                        resumes: 1,
+                        max: 1
+                    }
+                ))
+            ),
+            "{result:?}"
+        );
+        assert_eq!(host.sent(), []);
+        assert_eq!(host.voltage_reads, 0);
+        assert_eq!(resumes(&dir), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A voltage outside the declared range, or none from the VCI, stops the restart before the
+    /// count; a program that declares no range is not checked.
+    #[test]
+    fn the_supply_voltage_is_checked_before_the_resume_is_counted() {
+        let program = flash_program_with_voltage();
+        for voltage in [Some(10_999), Some(15_001), None] {
+            let dir = journal_dir("resume-voltage");
+            interrupted(&program, &dir);
+            let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+            host.voltage = voltage;
+            let result = resume(&program, &dir, &mut host, false);
+            assert!(
+                matches!(
+                    result,
+                    Err(JobError::OnSiteInterventionRequired(
+                        OnSiteReason::SupplyVoltage { flash_session: 1, millivolts }
+                    )) if millivolts == voltage
+                ),
+                "{voltage:?}: {result:?}"
+            );
+            assert_eq!(host.sent(), []);
+            assert_eq!(resumes(&dir), 0);
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+
+        let program = flash_program();
+        let dir = journal_dir("resume-no-voltage");
+        interrupted(&program, &dir);
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        let result = resume(&program, &dir, &mut host, false);
+        assert!(
+            matches!(
+                result,
+                Err(JobError::OnSiteInterventionRequired(
+                    OnSiteReason::RestartOrderUnavailable { .. }
+                ))
+            ),
+            "{result:?}"
+        );
+        assert_eq!(host.voltage_reads, 0);
+        assert_eq!(resumes(&dir), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A cancel stops a restart before the voltage read, with no resume counted.
+    #[test]
+    fn a_cancelled_restart_counts_no_resume() {
+        let program = flash_program_with_voltage();
+        let dir = journal_dir("resume-cancel");
+        interrupted(&program, &dir);
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        host.voltage = Some(12_600);
+        let result = resume(&program, &dir, &mut host, true);
+        assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
+        assert_eq!(host.voltage_reads, 0);
+        assert_eq!(host.sent(), []);
+        assert_eq!(resumes(&dir), 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A job stopped before its erase starts again on the same journal, its records coming
+    /// after the old ones.
+    #[test]
+    fn a_plain_start_goes_on_with_the_existing_journal() {
+        let program = flash_program();
+        let dir = journal_dir("resume-plain");
+        // Stops on arriving at the erase, after the identity reads and the step into the entry.
+        let limits = JobLimits {
+            max_steps: u64::from(ERASE),
+            ..JobLimits::default()
+        };
+        let result = first_run(&program, &dir, limits, |_| {});
+        assert!(matches!(result, Err(JobError::StepLimit(_))), "{result:?}");
+        let before = Journal::read(&dir, &job_key()).unwrap();
+        assert!(before.facts.transfer.is_none());
+        let first_step = restart::next_steps(&before);
+        assert!(first_step > 0);
+
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        let state = resume(&program, &dir, &mut host, false).expect("the program runs");
+        assert_eq!(state.steps, first_step + program.code.len() as u64);
+        assert!(host.sent().contains(&Sent::Routine(0xFF00)));
+        let after = Journal::read(&dir, &job_key()).unwrap();
+        let transfer = after.facts.transfer.as_ref().expect("a transfer");
+        assert!(transfer.started_at.steps >= first_step);
+        assert!(transfer.exit.as_ref().is_some_and(|exit| exit.complete));
+        assert_eq!(after.facts.resume_count(crate::journal::StageId(7)), 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A program with a plan whose journal is missing or does not read back needs on-site
+    /// intervention, with nothing sent; one without a plan and without a journal runs.
+    #[test]
+    fn a_missing_or_unreadable_journal_sends_nothing() {
+        let program = flash_program();
+        let dir = journal_dir("resume-missing");
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        let result = resume(&program, &dir, &mut host, false);
+        assert!(
+            matches!(
+                result,
+                Err(JobError::OnSiteInterventionRequired(
+                    OnSiteReason::MissingJournal
+                ))
+            ),
+            "{result:?}"
+        );
+        assert_eq!(host.sent(), []);
+
+        drop(Journal::create(&dir, &job_key()).unwrap());
+        let file = std::fs::read_dir(&dir)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        std::fs::write(&file, b"not a journal").unwrap();
+        let result = resume(&program, &dir, &mut host, false);
+        assert!(
+            matches!(
+                result,
+                Err(JobError::OnSiteInterventionRequired(
+                    OnSiteReason::UnreadableJournal(_)
+                ))
+            ),
+            "{result:?}"
+        );
+        assert_eq!(host.sent(), []);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        let plain = program_without_plan();
+        let dir = journal_dir("resume-no-plan");
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        resume(&plain, &dir, &mut host, false).expect("the program runs");
+        assert_eq!(host.sent().len(), 2);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn program_without_plan() -> Program {
+        program(two_requests())
     }
 
     /// A client for a port nothing listens on: any RPC fails, so a test that gets past the

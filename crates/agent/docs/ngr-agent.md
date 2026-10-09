@@ -105,7 +105,8 @@ commit fails, are the job runner's duties.
 `JournalSetup` (directory, job key, and the `ServiceSources` table for the ECU's identity) and,
 for a program with a flash recovery plan, creates the journal once the link is open and the
 policy allows the program, before anything is sent to the ECU; a program without a plan keeps
-none. Each time execution arrives at a plan's boundary, before that instruction runs, it
+none. A journal that already exists ends the job with nothing sent: a job that ran before goes
+on through `resume_program_journaled` ("Restart entry" below). Each time execution arrives at a plan's boundary, before that instruction runs, it
 commits:
 
 - at the entry, once per job and before its first transfer: the hardware part number and
@@ -151,6 +152,32 @@ when the job started at the entry. It must decode, pass `Vm::check_state` and st
 plan's entry; otherwise, or for a stage the program does not declare, the decision is
 `OnSiteInterventionRequired`. Its step count continues after the journal's last record
 (`restart::next_steps`), so the restart's records come after the old ones.
+
+## Restart entry
+
+`agent::resume_program_journaled` takes the same arguments as `run_program_journaled`, for a job
+that ran before (ADR-255). Once the link is open and the policy allows the program, and before
+anything is sent to the ECU, it opens the job's journal (`Journal::open`) and classifies it.
+
+| Decision | What the runner does |
+|---|---|
+| plain start | runs the program from its start on the same journal; its step count starts at `restart::next_steps`, after the journal's last record, and the identity is read again. A program without a plan and without a journal runs without one |
+| `OnSiteInterventionRequired` | ends in `JobError::OnSiteInterventionRequired` with the classification's reason; nothing is sent |
+| `Restart` | runs `restart::check_before_ecu`, then ends in `JobError::OnSiteInterventionRequired(RestartOrderUnavailable)`, because the rest of the restart order (teardown, ECU state check, replay) does not run in the agent; nothing is sent to the ECU |
+
+`check_before_ecu` is the part of ADR-229 item 2 step 1 that an agent without a server makes:
+
+1. The resume limit. A stage whose count in the journal has reached the plan's `max_resumes`
+   ends in `ResumeLimitReached`.
+2. The supply voltage, when the program declares a voltage range. It is read from the VCI as
+   `RuntimeInput::SupplyVoltageMillivolts`, whatever sources the program declares, since this
+   step uses no ECU service. A reading outside the range, or none, ends in `SupplyVoltage`.
+3. The resume count, incremented and committed with no attempt key.
+
+A failed check counts no resume, and a cancel stops it before the voltage read and before the
+commit. Each crash during a recovery therefore consumes one attempt, and repeated crashes stop
+at the limit. The start deadline (a server's job instruction carries it), the OS-level locks
+and a server reservation are not part of this entry.
 
 ## Restart inputs
 

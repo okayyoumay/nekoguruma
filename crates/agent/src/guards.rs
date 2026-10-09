@@ -124,7 +124,9 @@ impl JobGuards {
 
     /// Clears the unconfirmed-link mark, so dropping the guards releases the locks again. Call it
     /// only once the worker process that held the link has exited, for example after
-    /// `WorkerProcess::stop` returned `Ok`: no process holds the VCI then.
+    /// `WorkerProcess::stop` returned `Ok`. That process no longer holds the link then; it does
+    /// not prove the VCI free, since a vendor device-server process can keep the device claimed
+    /// a while longer (ADR-258 items 3 and 6), which the next open detects.
     pub fn worker_gone(&mut self) {
         self.link_unconfirmed = false;
     }
@@ -452,6 +454,28 @@ mod tests {
             drop(take().unwrap_or_else(|error| panic!("{mode:o} is safe: {error}")));
         }
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Marked guards that are dropped by mistake keep their locks: the files are never closed,
+    /// so another handle cannot lock them while this process lives (ADR-258).
+    #[test]
+    fn dropped_unconfirmed_guards_keep_their_locks() {
+        let dir = dir("dropped-unconfirmed");
+        let never = AtomicBool::new(false);
+        let mut guards = JobGuards::take(&setup(&dir, "VCI-1"), POLL, &never).expect("first job");
+        guards.mark_link_unconfirmed();
+        drop(guards);
+        for path in [vci_path(&dir, "VCI-1"), dir.join("reprogramming.lock")] {
+            let other = File::open(&path).unwrap();
+            assert!(
+                matches!(other.try_lock(), Err(fs::TryLockError::WouldBlock)),
+                "{} is still locked",
+                path.display()
+            );
+        }
+        // The leaked handles stay open until the test process exits, so the directory may not
+        // be removable yet (Windows).
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// A lock file another user created, which this one may only read, still locks (ADR-257).

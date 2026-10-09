@@ -224,7 +224,8 @@ async fn run(args: RunArgs) -> Result<String, String> {
         }
         Err(error) => eprintln!("ngr-agent: worker did not stop cleanly: {error}"),
     }
-    // Released only now, with the worker gone: the VCI is free for the next job.
+    // Released only now: either the worker was reaped, or its stop failed after a confirmed
+    // close, so its link is closed either way.
     drop(guards);
     let state = result.map_err(|error| format!("job failed: {error}"))?;
     // serde_json would print such a value as `null`, which no longer reads back as the state.

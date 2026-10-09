@@ -25,10 +25,10 @@ The maintainer asked which language fits the IR best. Candidates compared:
   language specification): its base language has no `while`, forbids recursion, has no
   exceptions or classes, is deterministic and hermetic, and has int, float, string, bytes,
   list and dict types without implicit conversion.
-- **OTX (ISO 13209)**: the standard procedure language for diagnostics and the closest match to
-  the procedure part, but it is an XML exchange format rather than a language people write by
-  hand, and it is already planned as a separate frontend (M7, 8.3). The standard is not held
-  yet.
+- **OTX**: already planned as its own frontend (design 8.3, milestone M7), and an XML exchange
+  format rather than a language people write by hand. The standard is not held yet, so how
+  closely it matches the procedure part cannot be checked; it does not replace a hand-written
+  format either way.
 - **Lua**: execution state can only be persisted at a coroutine yield (Pluto, Eris), and the
   language has unbounded loops and recursion.
 - **Rhai** and similar embedded Rust languages: no suspend/resume, general-purpose control flow.
@@ -45,8 +45,8 @@ The maintainer asked which language fits the IR best. Candidates compared:
    `def main()`. Base Starlark's restrictions (no `while`, no recursion) are kept; options some
    implementations offer to lift them are rejected.
 4. The subset removes only what the VM cannot represent: `lambda` and nested `def`, functions as
-   values, comprehensions (version 1), `load`, keyword/default/variadic parameters of user
-   functions, dict access with computed keys, `fail` (replaced by `diag.fail` so every
+   values, comprehensions and `set` (version 1), `load`, keyword/default/variadic parameters of
+   user functions, dict access with computed keys, `fail` (replaced by `diag.fail` so every
    abnormal end carries a code) and reflection built-ins. The full list, the `diag` API and the
    comment annotations for section attributes and idempotency are in
    `crates/diag-frontend/docs/starlark-subset.md`.
@@ -65,6 +65,10 @@ The maintainer asked which language fits the IR best. Candidates compared:
   source by line and attached to the following statement.
 - Floor division needs the remainder and negation instructions the IR does not have yet
   (ADR-233 consequences); the transpiler's first procedures need them anyway.
+- The `diag` API is wider than the current instruction set: `diag.fail`, `diag.ecu_info` and
+  `diag.precondition` have no instruction, and `Log` takes only a constant message. The subset
+  specification lists how each call lowers; a call whose instruction does not exist yet is
+  rejected at ingestion until the variant is appended.
 - Users who already know JavaScript lose that familiarity; Starlark's Python syntax is the
   more common one in tooling and test automation, which is accepted.
 - M2's exit criterion becomes "a CSV + Starlark definition of one ECU". The differential test

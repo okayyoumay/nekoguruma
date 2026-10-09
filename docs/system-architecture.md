@@ -879,7 +879,7 @@ flowchart LR
 | Top-level `def` and calls to it | `load` (one file per procedure) |
 | List, dict and bytes literals (static); dict access with literal keys | Comprehensions, `*args` / `**kwargs`, keyword and default parameters |
 | Diagnostic primitive API calls | `fail`, `print` and reflection built-ins (replaced by `diag.fail` and `diag.log`) |
-| Built-in string, number and bytes functions (limited list) | Type annotations, `set` |
+| Built-in string, number and bytes functions (limited list) | Type annotations (not base Starlark), `set` |
 
 **Conversion rules**
 

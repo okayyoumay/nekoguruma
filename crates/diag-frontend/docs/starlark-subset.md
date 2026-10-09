@@ -10,8 +10,8 @@ Runtime behavior is exactly the same as IR derived from ODX/OTX.
 
 The base language is Starlark as defined by the language specification in the
 `bazelbuild/starlark` repository. Extensions that some implementations offer behind options
-(`while`, recursion, `set`, type annotations, top-level `for` and `if`) are not part of the
-base language and are rejected.
+(`while`, recursion, type annotations, top-level `for` and `if`) are not part of the base
+language and are rejected, as are some base-language features this subset leaves out (2.3).
 
 ---
 
@@ -21,7 +21,7 @@ base language and are rejected.
 |---|---|
 | Reject anything that cannot be resolved statically | The VM has no instructions for dynamic resolution at runtime |
 | Guarantee that execution is finite | So execution never stalls inside an uninterruptible section (8.10.1) |
-| Preserve determinism | So execution can be reproduced from the audit log (R156) |
+| Preserve determinism | So execution can be reproduced from the audit log (8.2.3) |
 | Report all violations at import time | Avoid discovering unsupported constructs at runtime |
 
 Starlark already provides most of this: it has no `while`, no recursion, no exceptions, no
@@ -63,7 +63,8 @@ A file without `main` is rejected (`STAR_NO_MAIN`).
 | `while`, recursion | Not base Starlark; execution must stay finite | `STAR_UNBOUNDED_NOT_ALLOWED` |
 | Top-level statements other than constant assignments and `def` | The procedure runs from `main` only | `STAR_TOPLEVEL_STATEMENT_NOT_ALLOWED` |
 | `*args`, `**kwargs`, default and keyword-only parameters, keyword arguments to user functions | Not supported in version 1 | `STAR_UNSUPPORTED_SYNTAX` |
-| Type annotations, `set` | Not base Starlark | `STAR_UNSUPPORTED_SYNTAX` |
+| Type annotations | Not base Starlark | `STAR_UNSUPPORTED_SYNTAX` |
+| `set` | No IR value type for it; not supported in version 1 | `STAR_UNSUPPORTED_SYNTAX` |
 | Dict access with a computed key `d[expr]` | Key cannot be resolved statically (list and bytes indexing are allowed) | `STAR_DYNAMIC_KEY_NOT_ALLOWED` |
 | `fail` | Use `diag.fail` (4.3) so every abnormal end carries a code | `STAR_FAIL_NOT_ALLOWED` |
 | `print`, `getattr`, `hasattr`, `dir` | Output goes through `diag.log`; reflection cannot be resolved statically | `STAR_BUILTIN_NOT_ALLOWED` |
@@ -89,8 +90,9 @@ pairs are **not supported** in version 1. Use `for` with an index instead.
 
 ### 3.1 Overview
 
-Provided as functions of the predeclared `diag` module. Each function maps 1:1 to a `diag-ir`
-instruction (8.2.4).
+Provided as functions of the predeclared `diag` module. Each function lowers to one `diag-ir`
+diagnostic primitive (8.2.4, `Op` in `crates/diag-ir/src/lib.rs`), preceded by the instructions
+that push its run-time operands.
 
 ```python
 diag.request(service_id, params)        # Execute service -> response
@@ -110,7 +112,29 @@ diag.fail(code, detail)                 # Abnormal end of the procedure
 
 `params` is a dict literal with string keys.
 
-### 3.2 Synchronous Calls
+### 3.2 Lowering
+
+The instruction set does not cover this whole API yet. Missing instructions are added by
+appending `Op` variants, which keeps existing programs valid (ADR-233); until a function's
+instruction exists, the transpiler rejects calls to it (`STAR_API_NOT_AVAILABLE`).
+
+| Function | Instruction | Run-time operands |
+|---|---|---|
+| `diag.request` | `ServiceRequest` | request payload (bytes) built from `params` |
+| `diag.read_dtc` | `ReadDtc` | none |
+| `diag.routine` | `RoutineControl` | routine control payload (bytes) built from `params` |
+| `diag.security_access` | `SecurityAccess` | the seed (bytes) read by the preceding seed request; the call expands to that request followed by the instruction |
+| `diag.flash_transfer` | `FlashTransfer` | one block (bytes) per instruction; the call expands to a loop over the flash session's blocks |
+| `diag.wait` | `Wait` | none |
+| `diag.hmi` | `HmiRequest` | none |
+| `diag.record` | `RecordInput` | none |
+| `diag.capture` | `MonitorCapture` | none |
+| `diag.log` | `Log` | none; the message is a constant, so a message built at run time needs a log instruction that takes it from the stack |
+| `diag.ecu_info` | none yet | |
+| `diag.precondition` | none yet | |
+| `diag.fail` | none yet | |
+
+### 3.3 Synchronous Calls
 
 Internally these involve waiting. Starlark has no `async`, and none is needed: the VM maps the
 calls to instructions that report a waiting outcome, so procedures are written as plain calls.
@@ -121,7 +145,7 @@ def main():
     diag.log(1, res["fields"]["vin"])
 ```
 
-### 3.3 Response Shape
+### 3.4 Response Shape
 
 A dict with fixed keys:
 
@@ -161,7 +185,8 @@ for i in range(count):
 ```
 
 Without the annotation, the default (1000) is applied and reported as a warning.
-When the limit is reached, the VM stops with `LoopLimitExceeded`.
+The limit is a counter the transpiler emits around the loop; when it is reached, the procedure
+ends as if `diag.fail("LOOP_LIMIT_EXCEEDED", ...)` had been called at that point (3.2).
 
 A polling loop is written as a bounded `for` with `break`:
 

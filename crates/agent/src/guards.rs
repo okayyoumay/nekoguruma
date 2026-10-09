@@ -29,9 +29,13 @@ pub struct GuardSetup {
     /// The device's lock directory, shared by every job on the device.
     pub dir: PathBuf,
     /// The VCI's name, as the device names it (for example the name `ngr-agent run --vci`
-    /// takes). Two jobs on one VCI must give the same name.
+    /// takes), of 1 to [`MAX_VCI_NAME`] bytes. Two jobs on one VCI must give the same name.
     pub vci: String,
 }
+
+/// The longest VCI name a lock file can carry: hex-encoded, with its prefix and extension, it
+/// stays within the 255-byte file name limit common file systems have.
+pub const MAX_VCI_NAME: usize = 100;
 
 #[derive(Debug, thiserror::Error)]
 pub enum GuardError {
@@ -41,6 +45,8 @@ pub enum GuardError {
     Io(#[from] io::Error),
     #[error("the VIN {0:?} cannot name a vehicle lock")]
     InvalidVin(String),
+    #[error("the VCI name {0:?} cannot name a lock: it must have 1 to {MAX_VCI_NAME} bytes")]
+    InvalidVci(String),
     #[error("the job already holds the lock of vehicle {held:?}, not {asked:?}")]
     OtherVehicle { held: String, asked: String },
 }
@@ -67,6 +73,9 @@ impl JobGuards {
         poll: Duration,
         cancelled: &AtomicBool,
     ) -> Result<Self, GuardError> {
+        if setup.vci.is_empty() || setup.vci.len() > MAX_VCI_NAME {
+            return Err(GuardError::InvalidVci(setup.vci.clone()));
+        }
         fs::create_dir_all(&setup.dir)?;
         let vci = LockFile::wait(&vci_path(&setup.dir, &setup.vci), poll, cancelled)?;
         let slot = LockFile::wait(&setup.dir.join("reprogramming.lock"), poll, cancelled)?;
@@ -311,6 +320,23 @@ mod tests {
         }
         assert_eq!(guards.vehicle().as_deref(), Some(vin));
         drop(guards);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A VCI name too long for a lock file is refused before any file is touched.
+    #[test]
+    fn a_vci_name_must_fit_a_file_name() {
+        let dir = dir("vci-name");
+        let longest = "V".repeat(MAX_VCI_NAME);
+        let guards = JobGuards::take(&setup(&dir, &longest), POLL, &AtomicBool::new(false))
+            .expect("the longest name fits");
+        drop(guards);
+        for name in [String::new(), "V".repeat(MAX_VCI_NAME + 1)] {
+            assert!(matches!(
+                JobGuards::take(&setup(&dir, &name), POLL, &AtomicBool::new(false)),
+                Err(GuardError::InvalidVci(_))
+            ));
+        }
         fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -160,7 +160,8 @@ plan's entry; otherwise, or for a stage the program does not declare, the decisi
 ## Restart entry
 
 `agent::resume_program_journaled` takes the arguments of `run_program_journaled` and the job's
-restart guards (`Arc<JobGuards>`, "Restart guards" below), for a job that ran before (ADR-255).
+restart guards (`JobGuards`, "Restart guards" below), for a job that ran before (ADR-255), and
+returns the guards with its result.
 Once the link is open and the policy allows the program, and before anything is sent to the
 ECU, it opens the job's journal (`Journal::open`) and classifies it.
 
@@ -203,12 +204,13 @@ files are never deleted.
 - Locks are always taken in the order VCI, slot, vehicle, and held until the `JobGuards` is
   dropped.
 
-`resume_program_journaled` requires the guards as an `Arc<JobGuards>`, and the caller owns
-them. A new run after an agent crash or a loss of the device's power takes them with
-`JobGuards::take` before it calls the runner, so a duplicate resume of the same job waits there
-without opening a link. The runner holds its clone until the job ends. A job that survives a
-worker crash, a VCI disconnect or a loss of the vehicle's supply alone still holds the guards
-when the runner returns, and passes them to its next run. The lock directory is one per device,
+`resume_program_journaled` takes the guards by value and returns them with the run's result,
+so two runs can never use one set at once. A new run after an agent crash or a loss of the
+device's power takes them with `JobGuards::take` before it calls the runner, so a duplicate
+resume of the same job waits there without opening a link. A dropped future releases them only
+once the job thread has ended. A job that survives a worker crash, a VCI disconnect or a loss
+of the vehicle's supply alone gets them back, still held, and passes them to its next run. A
+VCI name has 1 to `MAX_VCI_NAME` (100) bytes. The lock directory is one per device,
 shared by every agent process on it whichever user it runs as, and its files must be writable
 by all of them. `run_program` and `run_program_journaled` take no guards.
 

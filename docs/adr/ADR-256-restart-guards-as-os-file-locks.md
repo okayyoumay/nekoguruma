@@ -27,7 +27,9 @@ Several things are not settled by the design:
    lock (`File::try_lock`, the primitive the journal's writer lock already uses, ADR-255
    item 7) on its own file in a lock directory the caller names, one per device and shared
    by every job on it. The files are:
-   - `vci-{hex name}.lock` for each VCI;
+   - `vci-{hex name}.lock` for each VCI, whose name has 1 to 100 bytes so that the file name
+     stays within the 255-byte limit of common file systems (`GuardError::InvalidVci`
+     otherwise);
    - `reprogramming.lock` for the slot;
    - `vehicle-{hex VIN}.lock` for each vehicle.
    - **Why a file lock.** The kernel releases the lock with the handle, also when the process
@@ -35,7 +37,7 @@ Several things are not settled by the design:
      without platform code. A named mutex (`Global\`) would need Windows-only
      code and has no Linux counterpart.
    - **Hex names.** The VCI's name and the VIN are hex-encoded into the file name, so any
-     name gives a valid and distinct file.
+     name within the length limits gives a valid and distinct file.
    - **Never deleted.** A process that locked a recreated file would not exclude one still
      holding the old one.
    - **One directory per device.** Every agent process on the device, whichever user it runs
@@ -56,17 +58,20 @@ Several things are not settled by the design:
 4. **Fixed lock order: VCI, slot, vehicle.** Every job takes them in this order and holds
    them until it ends. A job therefore never waits for a lock that comes before one it holds,
    and two jobs cannot each hold what the other waits for.
-5. **The caller owns the guards; the runner requires them.** `resume_program_journaled` takes
-   an `Arc<JobGuards>`, so a resume cannot run without holding the guards, and they are held
-   before anything goes through the VCI.
+5. **The caller owns the guards; a run borrows them by value.** `resume_program_journaled`
+   takes a `JobGuards` and returns it with the run's result. A resume therefore cannot run
+   without holding the guards, they are held before anything goes through the VCI, and two
+   runs cannot use one set at once: the type is not `Clone`, and a shared handle such as an
+   `Arc` would let two overlapping runs pass the same proof.
    - After an agent crash or a loss of the device's power, the new run takes them with
      `JobGuards::take` before it calls the runner, waiting while another job holds them. A
      duplicate resume of the same job therefore waits there, without opening a link. The
      journal's writer lock (ADR-255 item 7) stays as the second line.
-   - The runner holds its clone until the job ends; the caller keeps its own. A job that
-     survived a worker crash, a VCI disconnect or a loss of the vehicle's supply alone still
-     holds the guards when the runner returns, and passes them to its next run without waiting
-     on itself.
+   - While the job runs, the guards sit in a slot that the job thread also holds. A caller
+     whose future is dropped therefore releases them only after the job thread has ended
+     and closed the link. A job that survived a worker crash, a VCI disconnect or a loss of
+     the vehicle's supply alone gets the guards back, still held, and passes them to its next
+     run without waiting on itself.
    - Taking them inside the runner was rejected: the runner's return would release them, so
      a worker crash would hand the slot to another job while this ECU may still be in its
      programming session.

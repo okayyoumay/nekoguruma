@@ -6,8 +6,8 @@
 //! [`resume_program_journaled`] goes on with a job whose journal exists (`restart`, ADR-255).
 
 use std::panic::AssertUnwindSafe;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use diag_ir::{
@@ -100,8 +100,13 @@ enum JournalMode {
     Create(JournalSetup),
     /// A job that ran before: its journal is opened and classified (`restart`). The job holds
     /// its restart guards for the whole run.
-    Resume(JournalSetup, Arc<JobGuards>),
+    Resume(JournalSetup, GuardSlot),
 }
+
+/// Where a resumed job's guards stay during its run. The job thread keeps a handle, so the
+/// guards outlive the thread even when the caller's future is dropped first; the caller takes
+/// them back once the run ends.
+type GuardSlot = Arc<Mutex<Option<JobGuards>>>;
 
 /// The checks [`run_program`] makes before it touches the worker: the program's schema version and
 /// size must suit this VM (`Vm::check_state`), its restart declaration must hold
@@ -195,30 +200,39 @@ pub async fn run_program_journaled(
 ///
 /// `guards` are the job's restart guards (`guards::JobGuards`, ADR-256): the per-VCI lock and
 /// the reprogramming slot, held before anything goes through the VCI (ADR-229 item 2 step 1).
-/// The caller owns them. After an agent crash or a loss of the device's power, the new run takes
+/// The run takes them by value, so two runs can never use one set at once, and returns them
+/// with its result. After an agent crash or a loss of the device's power, the new run takes
 /// them with `JobGuards::take` before it calls this, waiting while another job holds them, so a
 /// duplicate resume of the same job waits there without opening a link. A job that survives a
-/// worker crash, a VCI disconnect or a loss of the vehicle's supply alone keeps the guards it
-/// holds and passes them again. The journal's writer lock is held while the job runs as well,
-/// so a second writer of the same journal ends in `JobError::Journal(JournalError::InUse)` with
-/// nothing sent (ADR-255). The start deadline and a server reservation are not taken here.
+/// worker crash, a VCI disconnect or a loss of the vehicle's supply alone passes the guards it
+/// got back to its next run. A dropped future releases them only once the job thread has
+/// ended. The journal's writer lock is held while the job runs as well, so a second writer of
+/// the same journal ends in `JobError::Journal(JournalError::InUse)` with nothing sent
+/// (ADR-255). The start deadline and a server reservation are not taken here.
 pub async fn resume_program_journaled(
     client: WorkerClient,
     config: &LinkConfig,
     program: Program,
     limits: JobLimits,
     journal: JournalSetup,
-    guards: Arc<JobGuards>,
-) -> Result<VmState, JobError> {
-    run_program_within(
+    guards: JobGuards,
+) -> (Result<VmState, JobError>, JobGuards) {
+    let slot: GuardSlot = Arc::new(Mutex::new(Some(guards)));
+    let result = run_program_within(
         client,
         config,
         program,
         limits,
         policy::build_ceiling(),
-        Some(JournalMode::Resume(journal, guards)),
+        Some(JournalMode::Resume(journal, Arc::clone(&slot))),
     )
-    .await
+    .await;
+    let guards = slot
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+        .expect("nothing but this call takes the guards out of the slot");
+    (result, guards)
 }
 
 /// [`run_program`] with the build's ceiling given, so tests can run under a lower one.
@@ -1780,7 +1794,8 @@ mod tests {
         interrupted(&program, &dir);
         let before = std::fs::read(journal_file(&dir)).unwrap();
         let guards = take_guards(&dir);
-        let result = resume_on_unreachable(program, &dir, guards, Arc::new(AtomicBool::new(false)));
+        let (result, _guards) =
+            resume_on_unreachable(program, &dir, guards, Arc::new(AtomicBool::new(false)));
         assert!(matches!(result, Err(JobError::Link(_))), "{result:?}");
         assert_eq!(std::fs::read(journal_file(&dir)).unwrap(), before);
         std::fs::remove_dir_all(&dir).unwrap();
@@ -1793,26 +1808,27 @@ mod tests {
         }
     }
 
-    fn take_guards(dir: &std::path::Path) -> Arc<JobGuards> {
-        Arc::new(
-            JobGuards::take(
-                &guard_setup(dir),
-                Duration::from_millis(1),
-                &AtomicBool::new(false),
-            )
-            .unwrap(),
+    fn take_guards(dir: &std::path::Path) -> JobGuards {
+        JobGuards::take(
+            &guard_setup(dir),
+            Duration::from_millis(1),
+            &AtomicBool::new(false),
         )
+        .unwrap()
     }
 
-    /// `run_job` resuming the job of `dir`'s journal on a worker that cannot be reached.
+    /// `run_job` resuming the job of `dir`'s journal on a worker that cannot be reached, with
+    /// the guard slot `resume_program_journaled` builds; gives the guards back with the result.
     fn resume_on_unreachable(
         program: Program,
         dir: &std::path::Path,
-        guards: Arc<JobGuards>,
+        guards: JobGuards,
         cancelled: Arc<AtomicBool>,
-    ) -> Result<VmState, JobError> {
+    ) -> (Result<VmState, JobError>, JobGuards) {
         let setup = file_setup(dir);
-        tokio::runtime::Builder::new_multi_thread()
+        let slot: GuardSlot = Arc::new(Mutex::new(Some(guards)));
+        let job_slot = Arc::clone(&slot);
+        let result = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .unwrap()
@@ -1826,18 +1842,20 @@ mod tests {
                         &program,
                         JobLimits::default(),
                         &cancelled,
-                        Some(JournalMode::Resume(setup, guards)),
+                        Some(JournalMode::Resume(setup, job_slot)),
                     )
                 })
                 .await
                 .unwrap()
-            })
+            });
+        let guards = slot.lock().unwrap().take().unwrap();
+        (result, guards)
     }
 
-    /// The done-when cases (ADR-256): the guards are the caller's, held for the whole run and
-    /// still held after it, so a job that survived a worker crash runs again on the guards it
-    /// holds, while a new run of the same job waits for them in `JobGuards::take` and so never
-    /// reaches a link until the first one lets go.
+    /// The done-when cases (ADR-256): the guards are held for the whole run and come back with
+    /// its result, so a job that survived a worker crash runs again on them, while a new run of
+    /// the same job waits for them in `JobGuards::take` and so never reaches a link until the
+    /// first one lets go.
     #[test]
     fn a_resumed_job_runs_on_guards_it_keeps_across_runs() {
         let program = flash_program();
@@ -1845,15 +1863,14 @@ mod tests {
         interrupted(&program, &dir);
         let guards = take_guards(&dir);
 
-        // A run that fails (here at the link) leaves the guards with the caller.
-        let result = resume_on_unreachable(
+        // A run that fails (here at the link) gives the guards back, still held.
+        let (result, guards) = resume_on_unreachable(
             program.clone(),
             &dir,
-            Arc::clone(&guards),
+            guards,
             Arc::new(AtomicBool::new(false)),
         );
         assert!(matches!(result, Err(JobError::Link(_))), "{result:?}");
-        assert_eq!(Arc::strong_count(&guards), 1);
 
         // A new run of the job, as after an agent crash, waits for them while they are held.
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -1872,17 +1889,17 @@ mod tests {
         ));
 
         // The job that holds them runs again on them.
-        let result = resume_on_unreachable(
+        let (result, guards) = resume_on_unreachable(
             program.clone(),
             &dir,
-            Arc::clone(&guards),
+            guards,
             Arc::new(AtomicBool::new(false)),
         );
         assert!(matches!(result, Err(JobError::Link(_))), "{result:?}");
 
         // Once it lets go, a new run takes them.
         drop(guards);
-        let result = resume_on_unreachable(
+        let (result, _guards) = resume_on_unreachable(
             program,
             &dir,
             take_guards(&dir),

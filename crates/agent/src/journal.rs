@@ -68,6 +68,20 @@ impl Vin {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Whether this VIN is well-formed: 17 characters, each an ASCII digit or upper-case letter
+    /// other than I, O and Q.
+    pub fn is_well_formed(&self) -> bool {
+        Self::is_well_formed_text(&self.0)
+    }
+
+    /// Whether `text` is a well-formed VIN (see [`Vin::is_well_formed`]).
+    pub fn is_well_formed_text(text: &str) -> bool {
+        text.len() == 17
+            && text.bytes().all(|b| {
+                b.is_ascii_digit() || (b.is_ascii_uppercase() && !matches!(b, b'I' | b'O' | b'Q'))
+            })
+    }
 }
 
 impl std::fmt::Debug for Vin {

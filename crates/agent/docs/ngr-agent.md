@@ -240,11 +240,13 @@ process dies, so a crashed run never blocks the next one, and the files are neve
   reads on other VCIs go on while a job reprograms. `JobGuards::holds_slot` tells the two
   apart.
 - `JobGuards::take_vehicle(vin, poll, cancelled)` takes the per-vehicle lock, on guards with or
-  without the slot. The file is one of 4096 buckets, `k` being the first 12 bits of SHA-256 over
-  the VIN, and preparing the lock directory creates all of them, so neither a file's name nor
-  the directory's content reveals a VIN (ADR-262). Two vehicles in one bucket exclude each
-  other, which delays a job about once in 4096 concurrent pairs. Taking the bucket the guards
-  already hold returns at once; another bucket is refused (`GuardError::OtherVehicleHeld`).
+  without the slot, for a well-formed VIN only (`GuardError::InvalidVin`). The file is one of
+  4096 buckets, `k` being the first 12 bits of SHA-256 over the VIN. When its bucket file is
+  missing, the call first creates all 4096 and syncs the directory, so a bucket file never
+  appears alone and neither a file's name nor the directory's content reveals a VIN (ADR-262).
+  Two vehicles in one bucket exclude each other, which delays a job about once in 4096
+  concurrent pairs. Taking the vehicle the guards already hold returns at once; another VIN is
+  refused (`GuardError::OtherVehicleHeld`), as are guards marked `link_unconfirmed`.
   `JobGuards::holds_vehicle` tells whether they hold one.
 - Locks are always taken in the order VCI, then slot, then vehicle, and held until the
   `JobGuards` is dropped.

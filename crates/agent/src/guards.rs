@@ -8,10 +8,11 @@
 //! The per-vehicle lock of design 8.8's two-stage locking ([`JobGuards::take_vehicle`], ADR-262)
 //! is named without keeping the VIN on the device (ADR-256 item 6): the VIN is hashed into one
 //! of 4096 fixed buckets, `vehicle-{k:03x}.lock`, so two VINs may share a bucket and then
-//! exclude each other, which is safe. The lock directory gets all 4096 files, empty, when it is
-//! prepared (the last one doubles as the "done" marker), so the listing is the same on every
-//! device and says nothing about the vehicles seen. A job holds one vehicle: taking the bucket
-//! it already holds succeeds without touching the file, and another one is refused.
+//! exclude each other, which is safe. The first `take_vehicle` that finds its bucket's file
+//! missing creates all 4096, empty, and syncs the directory before it opens any of them, so a
+//! bucket file never exists alone and the listing is the same on every device, saying nothing
+//! about the vehicles seen. A job holds one vehicle (a well-formed VIN): taking that VIN again
+//! succeeds without touching the file, and any other VIN, also one of the same bucket, is refused.
 //!
 //! Each is an exclusive OS lock (`File::try_lock`) on its own file in a lock directory the
 //! caller names. The OS releases a lock with its file handle, also when the process dies, so a
@@ -70,6 +71,10 @@ pub enum GuardError {
     UnsafeDir(PathBuf),
     #[error("the guards already hold the lock of another vehicle: a job serves one vehicle")]
     OtherVehicleHeld,
+    #[error("the VIN is not well-formed, so it cannot name a vehicle lock")]
+    InvalidVin,
+    #[error("the guards' link is unconfirmed closed, so they take no new lock (ADR-258)")]
+    LinkUnconfirmed,
 }
 
 /// How many vehicle lock files a lock directory has (ADR-262).
@@ -85,8 +90,8 @@ pub struct JobGuards {
     _slot: Option<LockFile>,
     /// The lock directory, for the vehicle lock taken later.
     dir: PathBuf,
-    /// The bucket and the lock of the vehicle (ADR-262).
-    _vehicle: Option<(u16, LockFile)>,
+    /// The vehicle, its bucket and its lock (ADR-262). `Vin`'s `Debug` is redacted.
+    _vehicle: Option<(Vin, u16, LockFile)>,
     link_unconfirmed: bool,
 }
 
@@ -134,26 +139,48 @@ impl JobGuards {
     /// Takes the lock of the vehicle `vin` names, last in the lock order (VCI, slot, vehicle),
     /// waiting and cancelling like [`JobGuards::take`]. Allowed with or without the slot. A
     /// cancel returns [`GuardError::Cancelled`] and leaves the locks already held as they were.
-    /// Taking the bucket the guards already hold succeeds at once, without touching the file (a
-    /// second handle in this process would wait for the first for ever); another bucket is
-    /// refused with [`GuardError::OtherVehicleHeld`], since a job serves one vehicle (ADR-262).
+    /// A VIN that is not well-formed gives [`GuardError::InvalidVin`], and guards marked
+    /// unconfirmed (ADR-258) [`GuardError::LinkUnconfirmed`]. Taking the VIN the guards already
+    /// hold succeeds at once, without touching the file (a second handle in this process would
+    /// wait for the first for ever); any other VIN, also one of the same bucket, is refused with
+    /// [`GuardError::OtherVehicleHeld`], since a job serves one vehicle (ADR-262).
     pub fn take_vehicle(
         &mut self,
         vin: &Vin,
         poll: Duration,
         cancelled: &AtomicBool,
     ) -> Result<(), GuardError> {
-        let bucket = vehicle_bucket(vin);
-        if let Some((held, _)) = &self._vehicle {
-            return if *held == bucket {
+        if !vin.is_well_formed() {
+            return Err(GuardError::InvalidVin);
+        }
+        if self.link_unconfirmed {
+            return Err(GuardError::LinkUnconfirmed);
+        }
+        if let Some((held, _, _)) = &self._vehicle {
+            return if held == vin {
                 Ok(())
             } else {
                 Err(GuardError::OtherVehicleHeld)
             };
         }
-        let lock = LockFile::wait(&vehicle_path(&self.dir, bucket), poll, cancelled)?;
-        self._vehicle = Some((bucket, lock));
+        // bucket -> wait -> attach
+        let bucket = vehicle_bucket(vin);
+        let lock = self.wait_vehicle(bucket, poll, cancelled)?;
+        self._vehicle = Some((vin.clone(), bucket, lock));
         Ok(())
+    }
+
+    fn wait_vehicle(
+        &self,
+        bucket: u16,
+        poll: Duration,
+        cancelled: &AtomicBool,
+    ) -> Result<LockFile, GuardError> {
+        let path = vehicle_path(&self.dir, bucket);
+        if !path.try_exists()? {
+            create_vehicle_files(&self.dir)?;
+        }
+        LockFile::wait_existing(&path, poll, cancelled)
     }
 
     /// Whether these guards hold a vehicle's lock.
@@ -209,7 +236,7 @@ impl Drop for JobGuards {
             if let Some(slot) = &mut self._slot {
                 slot.leak();
             }
-            if let Some((_, vehicle)) = &mut self._vehicle {
+            if let Some((_, _, vehicle)) = &mut self._vehicle {
                 vehicle.leak();
             }
         }
@@ -223,8 +250,20 @@ struct LockFile(Option<File>);
 impl LockFile {
     /// Locks `path`, waiting `poll` (at least 1 ms) between tries while another handle holds it.
     fn wait(path: &Path, poll: Duration, cancelled: &AtomicBool) -> Result<Self, GuardError> {
+        Self::lock(Self::open(path)?, poll, cancelled)
+    }
+
+    /// Like [`LockFile::wait`], for a file that must exist: it is never created here.
+    fn wait_existing(
+        path: &Path,
+        poll: Duration,
+        cancelled: &AtomicBool,
+    ) -> Result<Self, GuardError> {
+        Self::lock(OpenOptions::new().read(true).open(path)?, poll, cancelled)
+    }
+
+    fn lock(file: File, poll: Duration, cancelled: &AtomicBool) -> Result<Self, GuardError> {
         let poll = poll.max(Duration::from_millis(1));
-        let file = Self::open(path)?;
         loop {
             if cancelled.load(Ordering::Relaxed) {
                 return Err(GuardError::Cancelled);
@@ -289,23 +328,20 @@ fn prepare_dir(dir: &Path) -> Result<(), GuardError> {
     if shared && !sticky {
         return Err(GuardError::UnsafeDir(dir.to_owned()));
     }
-    create_vehicle_files(dir)
+    Ok(())
 }
 
 /// Creates the lock directory if it is missing. Its ACL is the installation's (ADR-257).
 #[cfg(not(unix))]
 fn prepare_dir(dir: &Path) -> Result<(), GuardError> {
     fs::create_dir_all(dir)?;
-    create_vehicle_files(dir)
+    Ok(())
 }
 
-/// Creates the empty vehicle lock files in bucket order unless the last one exists, which marks
-/// the set complete, so a take costs one stat (ADR-262). A set cut short by a crash is finished
-/// by the next take; a file that exists already is left as it is.
+/// Creates all the empty vehicle lock files in bucket order, then syncs the directory, so a
+/// bucket file is never created alone: the caller found its own missing (ADR-262). A file that
+/// exists already is left as it is.
 fn create_vehicle_files(dir: &Path) -> Result<(), GuardError> {
-    if vehicle_path(dir, (VEHICLE_BUCKETS - 1) as u16).try_exists()? {
-        return Ok(());
-    }
     for bucket in 0..VEHICLE_BUCKETS {
         match OpenOptions::new()
             .write(true)
@@ -317,6 +353,9 @@ fn create_vehicle_files(dir: &Path) -> Result<(), GuardError> {
             Err(error) => return Err(error.into()),
         }
     }
+    // Best effort off Unix: a directory cannot be opened for syncing there.
+    #[cfg(unix)]
+    File::open(dir)?.sync_all()?;
     Ok(())
 }
 
@@ -809,5 +848,146 @@ mod tests {
             vehicle_path(Path::new("locks"), 0x0a5),
             Path::new("locks").join("vehicle-0a5.lock")
         );
+    }
+
+    /// Two VINs of one bucket, found by a small search.
+    fn same_bucket_pair() -> (Vin, Vin) {
+        let make = |n: u32| vin(&format!("1HGCM826{:09}", n));
+        let mut seen = std::collections::HashMap::new();
+        for n in 0.. {
+            let candidate = make(n);
+            if let Some(first) = seen.insert(vehicle_bucket(&candidate), n) {
+                return (make(first), candidate);
+            }
+        }
+        unreachable!()
+    }
+
+    fn vehicle_files(dir: &Path) -> usize {
+        listing(dir)
+            .iter()
+            .filter(|name| name.starts_with("vehicle-"))
+            .count()
+    }
+
+    #[test]
+    fn a_partial_set_is_completed_before_the_bucket_is_locked() {
+        let never = AtomicBool::new(false);
+        let bucket = vehicle_bucket(&vin(VIN_A));
+        for (tag, present) in [("partial-low", 0..0x800u16), ("partial-fff", 0xfff..0x1000)] {
+            let dir = dir(tag);
+            fs::create_dir_all(&dir).unwrap();
+            for k in present {
+                if k != bucket {
+                    fs::write(vehicle_path(&dir, k), b"").unwrap();
+                }
+            }
+            let mut guards = JobGuards::take_vci_only(&setup(&dir, "VCI-1"), POLL, &never).unwrap();
+            assert!(!vehicle_path(&dir, bucket).exists());
+            guards.take_vehicle(&vin(VIN_A), POLL, &never).unwrap();
+            assert_eq!(vehicle_files(&dir), VEHICLE_BUCKETS as usize);
+            drop(guards);
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn take_alone_creates_no_vehicle_files() {
+        let dir = dir("no-vehicle-files");
+        let never = AtomicBool::new(false);
+        drop(JobGuards::take(&setup(&dir, "VCI-1"), POLL, &never).unwrap());
+        drop(JobGuards::take_vci_only(&setup(&dir, "VCI-2"), POLL, &never).unwrap());
+        assert_eq!(vehicle_files(&dir), 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn two_first_takes_on_a_fresh_directory_both_succeed() {
+        let dir = dir("vehicle-race");
+        let threads: Vec<_> = [("VCI-1", VIN_A), ("VCI-2", VIN_B)]
+            .into_iter()
+            .map(|(vci, vehicle)| {
+                let setup = setup(&dir, vci);
+                std::thread::spawn(move || {
+                    let never = AtomicBool::new(false);
+                    let mut guards = JobGuards::take_vci_only(&setup, POLL, &never)?;
+                    guards.take_vehicle(&vin(vehicle), POLL, &never)?;
+                    Ok::<_, GuardError>(guards)
+                })
+            })
+            .collect();
+        let guards: Vec<_> = threads
+            .into_iter()
+            .map(|t| t.join().unwrap().expect("taken"))
+            .collect();
+        assert_eq!(vehicle_files(&dir), VEHICLE_BUCKETS as usize);
+        drop(guards);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn worker_gone_guards_release_the_vehicle_on_drop() {
+        let dir = dir("vehicle-worker-gone");
+        let never = AtomicBool::new(false);
+        let mut first = JobGuards::take_vci_only(&setup(&dir, "VCI-1"), POLL, &never).unwrap();
+        first.take_vehicle(&vin(VIN_A), POLL, &never).unwrap();
+        first.mark_link_unconfirmed();
+        first.worker_gone();
+        drop(first);
+        let mut second = JobGuards::take_vci_only(&setup(&dir, "VCI-2"), POLL, &never).unwrap();
+        second.take_vehicle(&vin(VIN_A), POLL, &never).unwrap();
+        drop(second);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_vin_must_be_well_formed() {
+        let dir = dir("vehicle-invalid-vin");
+        let never = AtomicBool::new(false);
+        let mut guards = JobGuards::take_vci_only(&setup(&dir, "VCI-1"), POLL, &never).unwrap();
+        for bad in ["1hgcm82633a004352", "1HGCM826", "1HGCM82633A00435I", ""] {
+            let result = guards.take_vehicle(&vin(bad), POLL, &never);
+            let Err(error @ GuardError::InvalidVin) = result else {
+                panic!("{bad:?}: {result:?}");
+            };
+            assert!(!error.to_string().contains(bad) || bad.is_empty());
+        }
+        assert!(!guards.holds_vehicle());
+        assert_eq!(vehicle_files(&dir), 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn another_vin_of_the_same_bucket_is_refused() {
+        let (first, second) = same_bucket_pair();
+        assert_ne!(first, second);
+        assert_eq!(vehicle_bucket(&first), vehicle_bucket(&second));
+        let dir = dir("vehicle-same-bucket");
+        let never = AtomicBool::new(false);
+        let mut guards = JobGuards::take_vci_only(&setup(&dir, "VCI-1"), POLL, &never).unwrap();
+        guards.take_vehicle(&first, POLL, &never).unwrap();
+        assert!(matches!(
+            guards.take_vehicle(&second, POLL, &never),
+            Err(GuardError::OtherVehicleHeld)
+        ));
+        assert!(!format!("{guards:?}").contains(first.as_str()));
+        drop(guards);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unconfirmed_guards_take_no_vehicle() {
+        let dir = dir("vehicle-unconfirmed");
+        let never = AtomicBool::new(false);
+        let mut guards = JobGuards::take_vci_only(&setup(&dir, "VCI-1"), POLL, &never).unwrap();
+        guards.mark_link_unconfirmed();
+        assert!(matches!(
+            guards.take_vehicle(&vin(VIN_A), POLL, &never),
+            Err(GuardError::LinkUnconfirmed)
+        ));
+        assert!(!guards.holds_vehicle());
+        guards.worker_gone();
+        drop(guards);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

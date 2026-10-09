@@ -1,12 +1,17 @@
-//! Job guards (design 8.8, 8.8.1; ADR-229 item 2 step 1, ADR-256, ADR-257).
+//! Job guards (design 8.8, 8.8.1; ADR-229 item 2 step 1, ADR-256, ADR-257, ADR-262).
 //!
 //! On one device, every job holds the lock of the VCI it uses (per-VCI lock), and a job that
 //! reprograms also holds:
 //! - the device's single reprogramming slot, since only one ECU is reprogrammed at a time per
 //!   device. A job that only reads ([`JobGuards::take_vci_only`]) does not take it.
 //!
-//! The per-vehicle lock of design 8.8's two-stage locking is not here: its lock would have to
-//! be named after the vehicle without keeping its VIN on the device (ADR-256 item 6).
+//! The per-vehicle lock of design 8.8's two-stage locking ([`JobGuards::take_vehicle`], ADR-262)
+//! is named without keeping the VIN on the device (ADR-256 item 6): the VIN is hashed into one
+//! of 4096 fixed buckets, `vehicle-{k:03x}.lock`, so two VINs may share a bucket and then
+//! exclude each other, which is safe. The lock directory gets all 4096 files, empty, when it is
+//! prepared (the last one doubles as the "done" marker), so the listing is the same on every
+//! device and says nothing about the vehicles seen. A job holds one vehicle: taking the bucket
+//! it already holds succeeds without touching the file, and another one is refused.
 //!
 //! Each is an exclusive OS lock (`File::try_lock`) on its own file in a lock directory the
 //! caller names. The OS releases a lock with its file handle, also when the process dies, so a
@@ -22,8 +27,8 @@
 //! busy device. Marked guards keep their OS locks when dropped, until the process exits or
 //! [`JobGuards::worker_gone`] clears the mark.
 //!
-//! Locks are always taken in the same order (VCI, then slot when wanted), so two jobs that wait on each
-//! other cannot both hold what the other needs. Waiting polls `try_lock` and stops when the job
+//! Locks are always taken in the same order (VCI, then slot when wanted, then vehicle), so two jobs
+//! that wait on each other cannot both hold what the other needs. Waiting polls `try_lock` and stops when the job
 //! is cancelled.
 
 use std::fs::{self, File, OpenOptions};
@@ -31,6 +36,10 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
+use sha2::{Digest, Sha256};
+
+use crate::journal::Vin;
 
 /// Where the guards of a job live and which VCI it uses.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,16 +68,25 @@ pub enum GuardError {
          give it the sticky bit, or make it writable by its owner only"
     )]
     UnsafeDir(PathBuf),
+    #[error("the guards already hold the lock of another vehicle: a job serves one vehicle")]
+    OtherVehicleHeld,
 }
 
-/// The guards one job holds: the per-VCI lock, and for a job that reprograms also the
-/// reprogramming slot. Dropping it releases them, unless the link of the job that used them is
+/// How many vehicle lock files a lock directory has (ADR-262).
+const VEHICLE_BUCKETS: u32 = 0x1000;
+
+/// The guards one job holds: the per-VCI lock, for a job that reprograms also the
+/// reprogramming slot, and once [`JobGuards::take_vehicle`] ran the vehicle's lock. Dropping it releases them, unless the link of the job that used them is
 /// unconfirmed (see [`JobGuards::link_unconfirmed`]). It is not `Clone`, so one set of guards
 /// serves one run at a time.
 #[derive(Debug)]
 pub struct JobGuards {
     _vci: LockFile,
     _slot: Option<LockFile>,
+    /// The lock directory, for the vehicle lock taken later.
+    dir: PathBuf,
+    /// The bucket and the lock of the vehicle (ADR-262).
+    _vehicle: Option<(u16, LockFile)>,
     link_unconfirmed: bool,
 }
 
@@ -86,6 +104,8 @@ impl JobGuards {
         Ok(Self {
             _vci: vci,
             _slot: Some(slot),
+            dir: setup.dir.clone(),
+            _vehicle: None,
             link_unconfirmed: false,
         })
     }
@@ -100,6 +120,8 @@ impl JobGuards {
         Ok(Self {
             _vci: Self::take_vci(setup, poll, cancelled)?,
             _slot: None,
+            dir: setup.dir.clone(),
+            _vehicle: None,
             link_unconfirmed: false,
         })
     }
@@ -107,6 +129,36 @@ impl JobGuards {
     /// Whether these guards hold the device's reprogramming slot.
     pub fn holds_slot(&self) -> bool {
         self._slot.is_some()
+    }
+
+    /// Takes the lock of the vehicle `vin` names, last in the lock order (VCI, slot, vehicle),
+    /// waiting and cancelling like [`JobGuards::take`]. Allowed with or without the slot. A
+    /// cancel returns [`GuardError::Cancelled`] and leaves the locks already held as they were.
+    /// Taking the bucket the guards already hold succeeds at once, without touching the file (a
+    /// second handle in this process would wait for the first for ever); another bucket is
+    /// refused with [`GuardError::OtherVehicleHeld`], since a job serves one vehicle (ADR-262).
+    pub fn take_vehicle(
+        &mut self,
+        vin: &Vin,
+        poll: Duration,
+        cancelled: &AtomicBool,
+    ) -> Result<(), GuardError> {
+        let bucket = vehicle_bucket(vin);
+        if let Some((held, _)) = &self._vehicle {
+            return if *held == bucket {
+                Ok(())
+            } else {
+                Err(GuardError::OtherVehicleHeld)
+            };
+        }
+        let lock = LockFile::wait(&vehicle_path(&self.dir, bucket), poll, cancelled)?;
+        self._vehicle = Some((bucket, lock));
+        Ok(())
+    }
+
+    /// Whether these guards hold a vehicle's lock.
+    pub fn holds_vehicle(&self) -> bool {
+        self._vehicle.is_some()
     }
 
     /// Whether the job that used these guards could not confirm its link closed (ADR-258): the
@@ -150,12 +202,15 @@ impl Drop for JobGuards {
             // Closing the files would release the locks (ADR-258); the OS releases them when
             // this process exits.
             tracing::error!(
-                "dropping job guards whose link was not confirmed closed: the VCI's lock \
-                 stays held until the agent exits"
+                "dropping job guards whose link was not confirmed closed: the job's locks \
+                 stay held until the agent exits"
             );
             self._vci.leak();
             if let Some(slot) = &mut self._slot {
                 slot.leak();
+            }
+            if let Some((_, vehicle)) = &mut self._vehicle {
+                vehicle.leak();
             }
         }
     }
@@ -217,7 +272,6 @@ impl LockFile {
     }
 }
 
-/// Names are hex-encoded, so any VCI name gives a valid, distinct file name.
 /// Creates the lock directory if it is missing, writable by its owner only, and refuses one in
 /// which another user could delete or replace a lock file another job holds: such a file's path
 /// would then name a new file, which a second job could lock at the same time.
@@ -235,16 +289,48 @@ fn prepare_dir(dir: &Path) -> Result<(), GuardError> {
     if shared && !sticky {
         return Err(GuardError::UnsafeDir(dir.to_owned()));
     }
-    Ok(())
+    create_vehicle_files(dir)
 }
 
 /// Creates the lock directory if it is missing. Its ACL is the installation's (ADR-257).
 #[cfg(not(unix))]
 fn prepare_dir(dir: &Path) -> Result<(), GuardError> {
     fs::create_dir_all(dir)?;
+    create_vehicle_files(dir)
+}
+
+/// Creates the empty vehicle lock files in bucket order unless the last one exists, which marks
+/// the set complete, so a take costs one stat (ADR-262). A set cut short by a crash is finished
+/// by the next take; a file that exists already is left as it is.
+fn create_vehicle_files(dir: &Path) -> Result<(), GuardError> {
+    if vehicle_path(dir, (VEHICLE_BUCKETS - 1) as u16).try_exists()? {
+        return Ok(());
+    }
+    for bucket in 0..VEHICLE_BUCKETS {
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(vehicle_path(dir, bucket as u16))
+        {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
     Ok(())
 }
 
+/// The bucket of a VIN: 12 bits of its SHA-256, so the device keeps no VIN (ADR-262).
+fn vehicle_bucket(vin: &Vin) -> u16 {
+    let digest = Sha256::digest(vin.as_str().as_bytes());
+    u16::from_be_bytes([digest[0], digest[1]]) & 0x0fff
+}
+
+fn vehicle_path(dir: &Path, bucket: u16) -> PathBuf {
+    dir.join(format!("vehicle-{bucket:03x}.lock"))
+}
+
+/// Names are hex-encoded, so any VCI name gives a valid, distinct file name.
 fn hex(name: &str) -> String {
     name.bytes().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -278,6 +364,10 @@ mod tests {
             dir: dir.to_owned(),
             vci: vci.to_owned(),
         }
+    }
+
+    fn vin(text: &str) -> Vin {
+        Vin::new(text.to_owned())
     }
 
     /// Takes the guards on another thread and reports how long it waited.
@@ -463,9 +553,16 @@ mod tests {
         let dir = dir("dropped-unconfirmed");
         let never = AtomicBool::new(false);
         let mut guards = JobGuards::take(&setup(&dir, "VCI-1"), POLL, &never).expect("first job");
+        guards
+            .take_vehicle(&vin("1HGCM82633A004352"), POLL, &never)
+            .unwrap();
         guards.mark_link_unconfirmed();
         drop(guards);
-        for path in [vci_path(&dir, "VCI-1"), dir.join("reprogramming.lock")] {
+        for path in [
+            vci_path(&dir, "VCI-1"),
+            dir.join("reprogramming.lock"),
+            vehicle_path(&dir, vehicle_bucket(&vin("1HGCM82633A004352"))),
+        ] {
             let other = File::open(&path).unwrap();
             assert!(
                 matches!(other.try_lock(), Err(fs::TryLockError::WouldBlock)),
@@ -528,5 +625,189 @@ mod tests {
         assert_ne!(vci_path(dir, "a/b"), vci_path(dir, "a_b"));
         assert_eq!(vci_path(dir, "A"), dir.join("vci-41.lock"));
         assert!(!vci_path(dir, "../x").to_string_lossy().contains(".."));
+    }
+
+    const VIN_A: &str = "1HGCM82633A004352";
+    const VIN_B: &str = "WVWZZZ1JZ3W386752";
+
+    /// Names of the files in `dir`, sorted.
+    fn listing(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// The directory looks the same whichever vehicles were seen, and holds no VIN (ADR-262).
+    #[test]
+    fn the_lock_directory_does_not_depend_on_the_vehicles() {
+        let never = AtomicBool::new(false);
+        let mut listings = Vec::new();
+        for (tag, vehicle) in [("listing-a", VIN_A), ("listing-b", VIN_B)] {
+            let dir = dir(tag);
+            let mut guards = JobGuards::take_vci_only(&setup(&dir, "VCI-1"), POLL, &never).unwrap();
+            guards.take_vehicle(&vin(vehicle), POLL, &never).unwrap();
+            drop(guards);
+            let names = listing(&dir);
+            for name in &names {
+                if name.starts_with("vehicle-") {
+                    assert_eq!(fs::metadata(dir.join(name)).unwrap().len(), 0, "{name}");
+                }
+                assert!(!name.contains(vehicle), "{name}");
+                assert!(!name.contains(&hex(vehicle)), "{name}");
+            }
+            assert_eq!(
+                names.iter().filter(|n| n.starts_with("vehicle-")).count(),
+                VEHICLE_BUCKETS as usize
+            );
+            listings.push(names);
+            fs::remove_dir_all(&dir).unwrap();
+        }
+        assert_eq!(listings[0], listings[1]);
+    }
+
+    /// Taking the held vehicle again returns at once; the cancel from another thread turns a
+    /// self-deadlock into a failure instead of a hang.
+    #[test]
+    fn taking_the_same_vehicle_twice_is_idempotent() {
+        let dir = dir("vehicle-twice");
+        let never = AtomicBool::new(false);
+        let mut guards = JobGuards::take(&setup(&dir, "VCI-1"), POLL, &never).unwrap();
+        guards.take_vehicle(&vin(VIN_A), POLL, &never).unwrap();
+        assert!(guards.holds_vehicle());
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let timer = {
+            let cancelled = Arc::clone(&cancelled);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(200));
+                cancelled.store(true, Ordering::Relaxed);
+            })
+        };
+        let again = guards.take_vehicle(&vin(VIN_A), POLL, &cancelled);
+        assert!(again.is_ok(), "{again:?}");
+        timer.join().unwrap();
+        drop(guards);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A job on another VCI waits for the vehicle, and gets it once the first guards drop.
+    #[test]
+    fn a_job_on_another_vci_waits_for_the_vehicle() {
+        let dir = dir("vehicle-wait");
+        let never = AtomicBool::new(false);
+        let mut first = JobGuards::take(&setup(&dir, "VCI-1"), POLL, &never).unwrap();
+        first.take_vehicle(&vin(VIN_A), POLL, &never).unwrap();
+        let other = setup(&dir, "VCI-2");
+        let waiter = std::thread::spawn(move || {
+            let never = AtomicBool::new(false);
+            let mut guards = JobGuards::take_vci_only(&other, POLL, &never)?;
+            guards.take_vehicle(&vin(VIN_A), POLL, &never)?;
+            Ok::<_, GuardError>(guards)
+        });
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(!waiter.is_finished(), "the vehicle is held");
+        drop(first);
+        let second = waiter.join().unwrap().expect("taken once released");
+        assert!(second.holds_vehicle());
+        drop(second);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A cancel while waiting for the vehicle keeps the VCI and the slot, and takes no vehicle.
+    #[test]
+    fn a_cancel_while_waiting_for_the_vehicle_keeps_the_other_guards() {
+        let dir = dir("vehicle-cancel");
+        let never = AtomicBool::new(false);
+        let mut first = JobGuards::take_vci_only(&setup(&dir, "VCI-1"), POLL, &never).unwrap();
+        first.take_vehicle(&vin(VIN_A), POLL, &never).unwrap();
+        let mut second = JobGuards::take(&setup(&dir, "VCI-2"), POLL, &never).unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let timer = {
+            let cancelled = Arc::clone(&cancelled);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(100));
+                cancelled.store(true, Ordering::Relaxed);
+            })
+        };
+        let result = second.take_vehicle(&vin(VIN_A), POLL, &cancelled);
+        assert!(matches!(result, Err(GuardError::Cancelled)), "{result:?}");
+        timer.join().unwrap();
+        assert!(!second.holds_vehicle());
+        assert!(second.holds_slot());
+        for path in [vci_path(&dir, "VCI-2"), dir.join("reprogramming.lock")] {
+            let other = File::open(&path).unwrap();
+            assert!(
+                matches!(other.try_lock(), Err(fs::TryLockError::WouldBlock)),
+                "{} is still held",
+                path.display()
+            );
+        }
+        drop(first);
+        second
+            .take_vehicle(&vin(VIN_A), POLL, &never)
+            .expect("free after the first let go");
+        drop(second);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A read-only job can hold a vehicle, and a writer on another VCI waits for it.
+    #[test]
+    fn a_vci_only_job_can_hold_a_vehicle() {
+        let dir = dir("vehicle-vci-only");
+        let never = AtomicBool::new(false);
+        let mut reader = JobGuards::take_vci_only(&setup(&dir, "VCI-1"), POLL, &never).unwrap();
+        reader.take_vehicle(&vin(VIN_A), POLL, &never).unwrap();
+        assert!(reader.holds_vehicle() && !reader.holds_slot());
+        let mut writer = JobGuards::take(&setup(&dir, "VCI-2"), POLL, &never).unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let timer = {
+            let cancelled = Arc::clone(&cancelled);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(100));
+                cancelled.store(true, Ordering::Relaxed);
+            })
+        };
+        let result = writer.take_vehicle(&vin(VIN_A), POLL, &cancelled);
+        assert!(matches!(result, Err(GuardError::Cancelled)), "{result:?}");
+        timer.join().unwrap();
+        drop(reader);
+        writer.take_vehicle(&vin(VIN_A), POLL, &never).unwrap();
+        drop(writer);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// One vehicle per job: a VIN in another bucket is refused, and the held one stays held.
+    #[test]
+    fn a_job_serves_one_vehicle() {
+        assert_ne!(vehicle_bucket(&vin(VIN_A)), vehicle_bucket(&vin(VIN_B)));
+        let dir = dir("vehicle-other");
+        let never = AtomicBool::new(false);
+        let mut guards = JobGuards::take_vci_only(&setup(&dir, "VCI-1"), POLL, &never).unwrap();
+        guards.take_vehicle(&vin(VIN_A), POLL, &never).unwrap();
+        let refused = guards.take_vehicle(&vin(VIN_B), POLL, &never);
+        let Err(error @ GuardError::OtherVehicleHeld) = refused else {
+            panic!("{refused:?}");
+        };
+        assert!(!error.to_string().contains(VIN_B));
+        assert!(guards.holds_vehicle());
+        guards.take_vehicle(&vin(VIN_A), POLL, &never).unwrap();
+        drop(guards);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The bucket is 12 bits of the VIN's SHA-256; a changed hash or slice fails this.
+    #[test]
+    fn the_vehicle_bucket_is_fixed() {
+        let digest = Sha256::digest(VIN_A.as_bytes());
+        let expected = u16::from_be_bytes([digest[0], digest[1]]) & 0x0fff;
+        assert_eq!(vehicle_bucket(&vin(VIN_A)), expected);
+        assert_eq!(vehicle_bucket(&vin(VIN_A)), 0x4b1);
+        assert!(u32::from(vehicle_bucket(&vin(VIN_B))) < VEHICLE_BUCKETS);
+        assert_eq!(
+            vehicle_path(Path::new("locks"), 0x0a5),
+            Path::new("locks").join("vehicle-0a5.lock")
+        );
     }
 }

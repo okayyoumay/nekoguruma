@@ -44,10 +44,10 @@ pub struct JournalSetup {
     pub key: JobKey,
     /// The table that maps the program's identity sources to requests (`inputs`).
     pub sources: ServiceSources,
-    /// The VIN the job targets, recorded in the journal at the job's first run; a resume must
-    /// name the same one. A restart compares the ECU's against (ADR-229 item 2
-    /// step 2, ADR-261). `None` when the job names none: a restart then never counts the vehicle
-    /// as identified. It is personal data (design 16.2) and is never logged or put in an error.
+    /// The VIN the job targets. A first run records it as the journal's first record, and a
+    /// resume must name the same one (ADR-261); the restart's gates compare the ECU's VIN
+    /// against it. `None` when the job names none: a restart then never counts the vehicle as
+    /// identified. It is personal data (design 16.2) and is never logged or put in an error.
     pub vin: Option<Vin>,
 }
 

@@ -690,6 +690,12 @@ impl<S: Store> Journal<S> {
         if self.poisoned {
             return Err(JournalError::Poisoned);
         }
+        // The target VIN is the journal's first record, by count.
+        if matches!(record, Record::TargetVin(_)) && self.state.records != 0 {
+            return Err(JournalError::Invariant(
+                "the target VIN must be the first record",
+            ));
+        }
         let mut facts = self.state.facts.clone();
         facts.apply(&record).map_err(JournalError::Invariant)?;
         let entry = Entry {
@@ -850,6 +856,9 @@ fn load(bytes: &[u8], key: &JobKey) -> Result<Loaded, JournalError> {
             .map_err(|_| corrupt(offset, "a record does not decode"))?;
         if entry.seq != state.records {
             return Err(corrupt(offset, "a record is out of sequence"));
+        }
+        if matches!(entry.record, Record::TargetVin(_)) && state.records != 0 {
+            return Err(corrupt(offset, "the target VIN must be the first record"));
         }
         state
             .facts
@@ -1041,27 +1050,65 @@ mod tests {
     /// prefixes are what a crash during an append can leave.
     #[test]
     fn every_cut_reads_back_as_the_last_whole_commit() {
-        let dir = TempDir::new();
-        let mut journal = Journal::create(&dir.0, &key(), None).expect("create");
-        let mut boundaries = vec![(journal.store.len as usize, journal.state().clone())];
-        script(&mut journal, |j| {
-            boundaries.push((j.store.len as usize, j.state().clone()));
-        });
-        let bytes = fs::read(path(&dir)).expect("read");
-        assert_eq!(bytes.len(), boundaries.last().expect("some").0);
-        for cut in 0..=bytes.len() {
-            let loaded = load(&bytes[..cut], &key());
-            match boundaries.iter().rev().find(|(len, _)| *len <= cut) {
-                None => assert!(
-                    matches!(loaded, Err(JournalError::Corrupt { .. })),
-                    "cut {cut}"
-                ),
-                Some((len, state)) => {
-                    let loaded = loaded.unwrap_or_else(|error| panic!("cut {cut}: {error}"));
-                    assert_eq!((loaded.len, &loaded.state), (*len, state), "cut {cut}");
+        let vin = Vin::new("WDB12345678901234".to_owned());
+        for target_vin in [None, Some(&vin)] {
+            let dir = TempDir::new();
+            let mut journal = Journal::create(&dir.0, &key(), target_vin).expect("create");
+            let mut boundaries = vec![(journal.store.len as usize, journal.state().clone())];
+            script(&mut journal, |j| {
+                boundaries.push((j.store.len as usize, j.state().clone()));
+            });
+            let bytes = fs::read(path(&dir)).expect("read");
+            assert_eq!(bytes.len(), boundaries.last().expect("some").0);
+            if target_vin.is_some() {
+                // A cut inside the VIN frame leaves the header alone: an empty journal.
+                let FrameRead::Ok { next, .. } = read_frame(&bytes, PREAMBLE) else {
+                    panic!("header");
+                };
+                let empty = JournalState {
+                    facts: RecoveryFacts::new(key()),
+                    last_vm_state: None,
+                    records: 0,
+                };
+                boundaries.insert(0, (next, empty));
+            }
+            for cut in 0..=bytes.len() {
+                let loaded = load(&bytes[..cut], &key());
+                match boundaries.iter().rev().find(|(len, _)| *len <= cut) {
+                    None => assert!(
+                        matches!(loaded, Err(JournalError::Corrupt { .. })),
+                        "cut {cut}"
+                    ),
+                    Some((len, state)) => {
+                        let loaded = loaded.unwrap_or_else(|error| panic!("cut {cut}: {error}"));
+                        assert_eq!((loaded.len, &loaded.state), (*len, state), "cut {cut}");
+                        // Past the VIN frame, the VIN survives every cut.
+                        if target_vin.is_some() && state.records > 0 {
+                            assert_eq!(loaded.state.facts.target_vin.as_ref(), target_vin);
+                        }
+                    }
                 }
             }
         }
+    }
+
+    /// Documented behaviour: a power loss that leaves the VIN frame as the last frame with its
+    /// payload unwritten reads back as an empty journal, with no VIN. No later record was
+    /// durable, so no transfer can have started (ADR-261).
+    #[test]
+    fn a_torn_target_vin_frame_reads_back_as_an_empty_journal() {
+        let dir = TempDir::new();
+        let vin = Vin::new("WDB12345678901234".to_owned());
+        drop(Journal::create(&dir.0, &key(), Some(&vin)).expect("create"));
+        let mut bytes = fs::read(path(&dir)).expect("read");
+        let FrameRead::Ok { next, .. } = read_frame(&bytes, PREAMBLE) else {
+            panic!("header");
+        };
+        bytes[next + FRAME_HEADER..].fill(0);
+        let loaded = load(&bytes, &key()).expect("a torn tail reads back");
+        assert_eq!(loaded.len, next);
+        assert_eq!(loaded.state.facts.target_vin, None);
+        assert_eq!(loaded.state.records, 0);
     }
 
     #[test]
@@ -1806,6 +1853,7 @@ mod tests {
             Record::TransferExitIntent { at: at(0, 0) },
             Record::PostTransferComplete,
             Record::Intent { at: at(0, 0) },
+            Record::TargetVin(Vin::new(String::new())),
         ];
         for (index, record) in records.iter().enumerate() {
             assert_eq!(

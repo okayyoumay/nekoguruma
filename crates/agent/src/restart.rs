@@ -313,7 +313,8 @@ fn cancellable<T>(cancelled: &AtomicBool, read: impl FnOnce() -> T) -> Result<T,
 /// restart's teardown may end the download with an ECUReset. In this order, stopping at the
 /// first that does not pass:
 /// - the VIN: the ECU's, read through the program's source, must equal the VIN the job
-///   targets, which the journal recorded at the job's first run (`RecoveryFacts::target_vin`). A job that names none or a VIN that is not well-formed (`is_vin`), a program that
+///   targets, which the journal recorded at the job's first run (`RecoveryFacts::target_vin`).
+///   A job that names none or a VIN that is not well-formed (`is_vin`), a program that
 ///   declares no source, a source the table does not map, and a read that gives no well-formed
 ///   VIN (no answer, a negative response, an undecodable, padded or lower-case field, a worker
 ///   failure) leave the vehicle unidentified: [`PassiveReason::VinNotEstablished`], and nothing

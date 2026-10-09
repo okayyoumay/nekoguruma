@@ -69,6 +69,10 @@ The maintainer asked which language fits the IR best. Candidates compared:
   `diag.precondition` have no instruction, and `Log` takes only a constant message. The subset
   specification lists how each call lowers; a call whose instruction does not exist yet is
   rejected at ingestion until the variant is appended.
+- The VM's values are `I64`, `F64`, `Bool` and `Bytes`, so lists and dicts exist only at
+  ingestion (constant lists, `params` literals, literal-key access to responses), `None` is not
+  supported, and a string built at run time is UTF-8 bytes. Constructs that need an instruction
+  the IR lacks are rejected at ingestion; the subset specification's value table lists them.
 - Users who already know JavaScript lose that familiarity; Starlark's Python syntax is the
   more common one in tooling and test automation, which is accepted.
 - M2's exit criterion becomes "a CSV + Starlark definition of one ECU". The differential test

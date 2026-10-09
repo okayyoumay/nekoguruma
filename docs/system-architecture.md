@@ -877,7 +877,7 @@ flowchart LR
 | Assignment, arithmetic, logic, comparison | `lambda`, nested `def` (closures), functions as values |
 | `if` / `elif` / `else`, `for` over a finite sequence, `break` / `continue` | `while` and recursion (not in base Starlark) |
 | Top-level `def` and calls to it | `load` (one file per procedure) |
-| List, dict and bytes literals (static); dict access with literal keys | Comprehensions, `*args` / `**kwargs`, keyword and default parameters |
+| Bytes literals; constant lists; dict literals as API parameters and literal-key access to responses | Comprehensions, `None`, `*args` / `**kwargs`, keyword and default parameters |
 | Diagnostic primitive API calls | `fail`, `print` and reflection built-ins (replaced by `diag.fail` and `diag.log`) |
 | Built-in string, number and bytes functions (limited list) | Type annotations (not base Starlark), `set` |
 

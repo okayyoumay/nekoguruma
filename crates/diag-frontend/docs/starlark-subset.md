@@ -47,8 +47,8 @@ A file without `main` is rejected (`STAR_NO_MAIN`).
 | Operators | Arithmetic, comparison, logical (`and` `or` `not`), bitwise, conditional expression (`a if c else b`), `in` / `not in` |
 | Control flow | `if` / `elif` / `else`, `for ... in`, `break`, `continue`, `pass` |
 | Functions | Top-level `def` with positional parameters, calls to them, `return` |
-| Literals | Integers, floats, strings, bytes (`b"..."`), booleans, `None`, lists, dicts (all static) |
-| Indexing | List and bytes index access, slices, dict access with a string-literal key |
+| Literals | Integers, floats, strings, bytes (`b"..."`), booleans, lists, dicts (within the limits of 2.5) |
+| Indexing | Bytes index access and slices, constant-list index access, dict access with a string-literal key (2.5) |
 | Built-ins | The restricted list in 2.4 |
 | API | The diagnostic primitives in section 3 |
 
@@ -75,14 +75,36 @@ General: `len` `range` `int` `float` `str` `bool` `abs` `min` `max` `type`
 
 Strings: `startswith` `endswith` `find` `upper` `lower` `strip` `format` `join`
 
-Lists: `append` `pop` `index`
+Lists: none in version 1 (lists are constants, 2.5)
 
 Bytes (built-in functions, since Starlark's `bytes` type has few methods):
 `to_hex(b)` `from_hex(s)` `read_uint(b, offset, bits)` `write_uint(b, offset, bits, v)`
 (returns new bytes; bytes have value semantics in the IR)
 
+String functions and `int`/`float`/`str` conversions that take a run-time value need the
+instructions listed in 2.5; with constant arguments they are evaluated at ingestion.
+
 `sorted`, `reversed`, `enumerate`, `zip` and other functions that take or build sequences of
 pairs are **not supported** in version 1. Use `for` with an index instead.
+
+### 2.5 Values at Run Time
+
+The VM has four value types: `I64`, `F64`, `Bool` and `Bytes` (ADR-233). Starlark values map
+onto them as follows; anything else exists only at ingestion.
+
+| Starlark | At run time | Limits |
+|---|---|---|
+| `int` | `I64` | 4.4 |
+| `float` | `F64` | |
+| `bool` | `Bool` | |
+| `bytes` | `Bytes` | |
+| `str` | constant only, or UTF-8 `Bytes` when built at run time | A string built at run time (concatenation, `%` formatting, `str(x)`) needs the concatenation and conversion instructions the IR does not have yet |
+| `list` | none | List literals are constants: a `for` over one is unrolled, and an index into one must be a constant. No mutation |
+| `dict` | none | A dict literal appears only as a `params` argument (3.1), which the transpiler encodes into the request bytes. The response (3.5) is accessed only through literal key chains, which the transpiler resolves to the response bytes and the declaration part's decode plan for each field |
+| `None` | none | Not supported in version 1 (`STAR_UNSUPPORTED_SYNTAX`) |
+
+A construct whose lowering needs an instruction the IR does not have yet is rejected at
+ingestion (`STAR_NOT_LOWERABLE`), the same way as a `diag` call with no instruction (3.2).
 
 ---
 
@@ -90,9 +112,10 @@ pairs are **not supported** in version 1. Use `for` with an index instead.
 
 ### 3.1 Overview
 
-Provided as functions of the predeclared `diag` module. Each function lowers to one `diag-ir`
-diagnostic primitive (8.2.4, `Op` in `crates/diag-ir/src/lib.rs`), preceded by the instructions
-that push its run-time operands.
+Provided as functions of the predeclared `diag` module. Each function lowers to the `diag-ir`
+diagnostic primitives listed in 3.2 (8.2.4, `Op` in `crates/diag-ir/src/lib.rs`), with the
+instructions that push their run-time operands. Most functions lower to one primitive;
+`security_access` and `flash_transfer` expand to several.
 
 ```python
 diag.request(service_id, params)        # Execute service -> response
@@ -112,6 +135,12 @@ diag.fail(code, detail)                 # Abnormal end of the procedure
 
 `params` is a dict literal with string keys.
 
+Arguments that the instruction holds as a fixed field (service, DTC mask, routine and its
+sub-function, security level, wait and capture durations, form, template and log level) must be
+constant at ingestion and fit the field's integer width (`u8`, `u16` or `u32` as in `Op`);
+otherwise the call is rejected (`STAR_NON_CONSTANT_ARGUMENT`). A `diag.wait` whose duration is
+only known at run time needs a stack-operand variant of `Wait`.
+
 ### 3.2 Lowering
 
 The instruction set does not cover this whole API yet. Missing instructions are added by
@@ -123,18 +152,18 @@ instruction exists, the transpiler rejects calls to it (`STAR_API_NOT_AVAILABLE`
 | `diag.request` | `ServiceRequest` | request payload (bytes) built from `params` |
 | `diag.read_dtc` | `ReadDtc` | none |
 | `diag.routine` | `RoutineControl` | routine control payload (bytes) built from `params` |
-| `diag.security_access` | `SecurityAccess` | the seed (bytes) read by the preceding seed request; the call expands to that request followed by the instruction |
+| `diag.security_access` | `ServiceRequest`, `SecurityAccess`, `ServiceRequest` | expands to three steps: the seed request (SecurityAccess service, odd sub-function `level`), `SecurityAccess`, which turns the seed (bytes) into the key through the host, and the send-key request (sub-function `level + 1`) carrying that key; a negative response to either request ends the call like a failed `diag.request` |
 | `diag.flash_transfer` | `FlashTransfer` | one block (bytes) per instruction; the call expands to a loop over the flash session's blocks |
 | `diag.wait` | `Wait` | none |
-| `diag.hmi` | `HmiRequest` | none |
-| `diag.record` | `RecordInput` | none |
+| `diag.hmi` | `HmiRequest` | form parameters (bytes) built from `params` |
+| `diag.record` | `RecordInput` | request bytes for the record template |
 | `diag.capture` | `MonitorCapture` | none |
 | `diag.log` | `Log` | none; the message is a constant, so a message built at run time needs a log instruction that takes it from the stack |
 | `diag.ecu_info` | none yet | |
 | `diag.precondition` | none yet | |
 | `diag.fail` | none yet | |
 
-### 3.3 Synchronous Calls
+### 3.4 Synchronous Calls
 
 Internally these involve waiting. Starlark has no `async`, and none is needed: the VM maps the
 calls to instructions that report a waiting outcome, so procedures are written as plain calls.
@@ -145,14 +174,14 @@ def main():
     diag.log(1, res["fields"]["vin"])
 ```
 
-### 3.4 Response Shape
+### 3.5 Response Shape
 
 A dict with fixed keys:
 
 ```python
 {
     "ok": True,          # bool
-    "nrc": None,         # negative response code (NRC) as int when ok is False
+    "nrc": 0,            # negative response code (NRC) when ok is False, else 0
     "fields": {},        # name -> int | float | string | bytes
     "raw": b"",          # response bytes
 }

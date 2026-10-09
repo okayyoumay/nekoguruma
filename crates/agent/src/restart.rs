@@ -332,6 +332,11 @@ fn cancellable<T>(cancelled: &AtomicBool, read: impl FnOnce() -> T) -> Result<T,
 /// exclusions of step 2 (no reset once RequestTransferExit was journaled without the
 /// post-transfer steps complete, none on the completed path).
 ///
+/// `promote` takes the per-vehicle lock (ADR-263, design 8.2.5, 8.8). It is called once, with the
+/// job's target VIN, right after the ECU's VIN read matched it and before the hardware identity
+/// read, so no ECU request lies between the match and the lock. It is not called when the VIN is
+/// not established or differs. Its error is returned as it is, and ends the gates.
+///
 /// A cancel stops it at the start, before and right after every read. Nothing here sends anything but
 /// ReadDataByIdentifier requests through the declared sources, and reads of runtime inputs. No
 /// VIN is put in a log message or a result.
@@ -341,6 +346,7 @@ pub(crate) fn check_gates<H>(
     sources: &ServiceSources,
     host: &mut H,
     cancelled: &AtomicBool,
+    promote: impl FnOnce(&Vin) -> Result<(), JobError>,
 ) -> Result<TeardownGate, JobError>
 where
     H: DiagHost<Error = HostError> + RuntimeInputs,
@@ -351,19 +357,23 @@ where
     }
 
     // The VIN.
-    let (Some(target), Some(source)) = (
+    let (Some(target_vin), Some(source)) = (
         point
             .facts
             .target_vin
             .as_ref()
-            .map(Vin::as_str)
-            .filter(|vin| Vin::is_well_formed_text(vin)),
+            .filter(|vin| Vin::is_well_formed_text(vin.as_str())),
         program.identity.vin,
     ) else {
         return passive(PassiveReason::VinNotEstablished);
     };
+    let target = target_vin.as_str();
     match cancellable(cancelled, || resolve_source(source, sources, host))? {
-        Ok(Reading::Text(text)) if Vin::is_well_formed_text(&text) && text == target => {}
+        Ok(Reading::Text(text)) if Vin::is_well_formed_text(&text) && text == target => {
+            // The vehicle is identified: take its lock before any further ECU request
+            // (design 8.2.5, 8.8; ADR-263).
+            promote(target_vin)?;
+        }
         Ok(Reading::Text(text)) if Vin::is_well_formed_text(&text) => {
             return Err(JobError::IdentityMismatch {
                 identity: IdentityKind::Vin,

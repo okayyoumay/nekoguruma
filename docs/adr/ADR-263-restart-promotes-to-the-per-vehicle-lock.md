@@ -41,7 +41,9 @@ Three points are left open:
    the wait ends the job in `JobError::Cancelled`. Any other lock failure ends it in
    `JobError::VehicleLock`, which names no VIN and no bucket (design 16.2, ADR-262). At that
    point the restart has sent only the VIN read, so nothing that changes the ECU has been sent;
-   the job does not go on to the hardware read without the lock.
+   the job does not go on to the hardware read without the lock. A guard slot found empty, which
+   only a bug in the runner could cause, ends the job in `JobError::GuardsMissing` instead of a
+   panic.
 
 ## Consequences
 

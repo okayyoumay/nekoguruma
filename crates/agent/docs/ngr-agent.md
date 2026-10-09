@@ -178,7 +178,7 @@ ECU, it opens the job's journal (`Journal::open`) and classifies it.
 |---|---|
 | plain start | runs the program from its start on the same journal; its step count starts at `restart::next_steps`, after the journal's last record, and the identity is read again. A program without a plan runs without a journal, when it has none or one that records no transfer |
 | `OnSiteInterventionRequired` | ends in `JobError::OnSiteInterventionRequired` with the classification's reason; nothing is sent |
-| `Restart` | runs `restart::check_before_ecu`, then the gates of `restart::check_gates`, then ends in `JobError::OnSiteInterventionRequired(RestartOrderUnavailable)` carrying the gates' decision, because the rest of the restart order (teardown, ECU state check, replay) does not run in the agent; only the gates' reads reach the ECU |
+| `Restart` | runs `restart::check_before_ecu`, then the gates of `restart::check_gates` (which promote the guards to the per-vehicle lock once the VIN matches, ADR-263), then ends in `JobError::OnSiteInterventionRequired(RestartOrderUnavailable)` carrying the gates' decision, because the rest of the restart order (teardown, ECU state check, replay) does not run in the agent; only the gates' reads reach the ECU |
 
 `check_before_ecu` is the part of ADR-229 item 2 step 1 that an agent without a server makes:
 
@@ -209,6 +209,17 @@ at the first gate that does not hold:
    than I, O and Q) other than the job's ends the job in `JobError::IdentityMismatch`. No
    answer, a negative response, text that is not a well-formed VIN, or a job that names no
    well-formed VIN (which reads nothing) gives `PassiveOnly(VinNotEstablished)`.
+
+   A VIN that matches promotes the job's guards to the per-vehicle lock at once (design 8.2.5,
+   8.8; ADR-263): before the hardware identity read, so no ECU request lies between the match
+   and the lock. The job waits while another job holds that vehicle, retrying at the job's
+   `wait_poll`; the guard slot is not locked during the wait (the guards are taken out of it and
+   put back, also on a panic), and a cancel ends the job in `JobError::Cancelled` with the guards
+   back without the vehicle. Any other failure of the lock (`GuardError` other than a cancel)
+   ends it in `JobError::VehicleLock`, with only ReadDataByIdentifier requests sent so far, and
+   an empty slot in `JobError::GuardsMissing`. A VIN that is not established or differs takes no
+   lock. The lock stays in the guards, which come back with the result
+   (`JobGuards::holds_vehicle`); guards that already hold the job's vehicle go on at once.
 2. The ECU's hardware part number, against the bytes the journal recorded before the erase. A
    different one gives `PassiveOnly(HardwareIdentityDiffers)`, one that cannot be read (or no
    recorded value) `PassiveOnly(HardwareIdentityNotEstablished)`. It aborts only in the later

@@ -16,7 +16,7 @@ use diag_ir::{
 use tokio::runtime::{Handle, RuntimeFlavor};
 use worker_host::client::WorkerClient;
 
-use crate::guards::JobGuards;
+use crate::guards::{GuardError, JobGuards};
 use crate::host::{HostError, Timings, TransferProgress, WorkerHost};
 use crate::inputs::RuntimeInputs;
 use crate::journal::{Journal, JournalError, StepRef, Store};
@@ -104,6 +104,17 @@ pub enum JobError {
     LinkUnconfirmed,
     #[error("the job thread panicked")]
     Panicked,
+    /// A restart could not take the per-vehicle lock right after the ECU's VIN matched
+    /// (ADR-263): the lock file failed, the guards cannot take a vehicle, or they were not in
+    /// the job's slot. Only ReadDataByIdentifier requests were sent by then, so ending the job
+    /// here leaves the ECU unchanged. A cancel during the wait is [`JobError::Cancelled`]. The
+    /// message carries no VIN (design 16.2).
+    #[error("the per-vehicle lock could not be taken: {0}")]
+    VehicleLock(#[source] GuardError),
+    /// The job's guard slot was empty where the restart had to take the vehicle lock, which
+    /// only a bug in this crate causes.
+    #[error("the job's guards were missing when the per-vehicle lock was to be taken")]
+    GuardsMissing,
 }
 
 /// What a job does with its journal.
@@ -222,7 +233,14 @@ pub async fn run_program_journaled(
 ///   supply voltage), commits the incremented resume count and makes the gates of
 ///   `restart::check_gates` (ADR-229 item 2 step 2, ADR-261), which send only
 ///   ReadDataByIdentifier requests through the declared sources and read runtime inputs, nothing
-///   that changes the ECU. The rest of the restart order does not run in this agent, so the job
+///   that changes the ECU. Right after the ECU's VIN matched the job's, and before any further
+///   ECU request, the guards are promoted to the per-vehicle lock (`JobGuards::take_vehicle`,
+///   ADR-263): the job waits while another job holds that vehicle, with the guard slot not
+///   locked, and a cancel then ends it in [`JobError::Cancelled`]. A lock that fails ends it in
+///   [`JobError::VehicleLock`], still with nothing sent that changes the ECU. The lock stays in
+///   the guards, which come back with the result (`JobGuards::holds_vehicle`); guards that
+///   already hold the job's vehicle go on at once. A VIN that is not established or differs
+///   takes no lock. The rest of the restart order does not run in this agent, so the job
 ///   then ends in [`JobError::OnSiteInterventionRequired`] (`RestartOrderUnavailable`, carrying
 ///   the gates' decision), or in [`JobError::IdentityMismatch`] when the ECU's VIN is another
 ///   vehicle's;
@@ -395,7 +413,7 @@ fn run_job(
         module_handle: link.module_handle,
         cll_handle: link.cll_handle,
         deadline: timings.unary,
-        guards,
+        guards: Arc::clone(&guards),
         closed: false,
     };
     let mut host = WorkerHost::new(handle.clone(), client, link, timings);
@@ -421,6 +439,7 @@ fn run_job(
             Journal::open(&setup.dir, &setup.key),
             setup.sources,
             setup.vin.as_ref(),
+            &guards,
         ),
         _ => run_on(
             program,
@@ -504,7 +523,13 @@ impl Drop for CancelOnDrop {
 /// Goes on with a job from its journal as `Journal::open` gave it (ADR-255; see
 /// [`resume_program_journaled`]). Nothing is sent to the ECU before the classification and the
 /// checks of `restart::check_before_ecu` passed; then `restart::check_gates` sends only
-/// ReadDataByIdentifier requests (ADR-229 item 2 step 2). `vin` is the job's target VIN.
+/// ReadDataByIdentifier requests (ADR-229 item 2 step 2). `vin` is the job's target VIN. Once
+/// the ECU's VIN matched it, the gates promote `guards` to the per-vehicle lock (ADR-263; see
+/// [`promote_to_vehicle`]).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the job's whole input, split only by what the caller owns"
+)]
 fn resume_on<H, S>(
     program: &Program,
     host: &mut H,
@@ -513,6 +538,7 @@ fn resume_on<H, S>(
     opened: Result<Journal<S>, JournalError>,
     sources: crate::inputs::ServiceSources,
     vin: Option<&crate::journal::Vin>,
+    guards: &GuardSlot,
 ) -> Result<VmState, JobError>
 where
     H: DiagHost<Error = HostError> + RuntimeInputs + TransferProgress,
@@ -555,13 +581,57 @@ where
             // `classify` restarts only from a journal it read.
             let mut journal = opened?;
             restart::check_before_ecu(program, &point, &mut journal, host, cancelled)?;
-            let teardown = restart::check_gates(program, &point, &sources, host, cancelled)?;
+            let poll = limits.wait_poll.max(Duration::from_millis(1));
+            let teardown =
+                restart::check_gates(program, &point, &sources, host, cancelled, |vin| {
+                    promote_to_vehicle(guards, vin, poll, cancelled)
+                })?;
             Err(JobError::OnSiteInterventionRequired(
                 OnSiteReason::RestartOrderUnavailable {
                     flash_session: point.flash_session,
                     teardown,
                 },
             ))
+        }
+    }
+}
+
+/// Takes the job's guards out of `slot`, takes the per-vehicle lock of `vin` on them, waiting
+/// while another job holds it (`JobGuards::take_vehicle`, ADR-262), and puts them back. The
+/// slot's mutex is held only to take them out and to put them back, never across the wait. A
+/// panic or an early return puts them back as well ([`SlotReturn`]), since the caller expects
+/// them in the slot at the end. A cancel is [`JobError::Cancelled`]; any other failure is
+/// [`JobError::VehicleLock`], and an empty slot [`JobError::GuardsMissing`].
+fn promote_to_vehicle(
+    slot: &GuardSlot,
+    vin: &crate::journal::Vin,
+    poll: Duration,
+    cancelled: &AtomicBool,
+) -> Result<(), JobError> {
+    let taken = slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let mut owned = SlotReturn {
+        slot,
+        guards: Some(taken.ok_or(JobError::GuardsMissing)?),
+    };
+    let guards = owned.guards.as_mut().expect("set just above");
+    guards
+        .take_vehicle(vin, poll, cancelled)
+        .map_err(|error| match error {
+            GuardError::Cancelled => JobError::Cancelled,
+            other => JobError::VehicleLock(other),
+        })
+}
+
+/// Guards taken out of a slot, which go back into it when this is dropped.
+struct SlotReturn<'a> {
+    slot: &'a GuardSlot,
+    guards: Option<JobGuards>,
+}
+
+impl Drop for SlotReturn<'_> {
+    fn drop(&mut self) {
+        if let Some(guards) = self.guards.take() {
+            *self.slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(guards);
         }
     }
 }
@@ -992,6 +1062,9 @@ mod tests {
         /// The readings of the runtime inputs other than the supply voltage, which `voltage`
         /// answers; an input not set is `CannotBeEstablished`.
         inputs: crate::inputs::FixedInputs,
+        /// Every ReadDataByIdentifier request is also pushed here, for a test that looks at the
+        /// host while the job runs on another thread.
+        mirror: Option<Arc<Mutex<Vec<Sent>>>>,
     }
 
     impl FlashHost {
@@ -1011,6 +1084,7 @@ mod tests {
                 vin: Some(TARGET_VIN.as_bytes().to_vec()),
                 hardware: Some(b"HW01".to_vec()),
                 inputs: crate::inputs::FixedInputs::new(),
+                mirror: None,
             }
         }
 
@@ -1059,6 +1133,12 @@ mod tests {
         fn service_request(&mut self, service: u16, payload: &[u8]) -> Result<Vec<u8>, HostError> {
             self.log
                 .push((Sent::Service(service, payload.to_vec()), self.commits.get()));
+            if let Some(mirror) = &self.mirror {
+                mirror
+                    .lock()
+                    .unwrap()
+                    .push(Sent::Service(service, payload.to_vec()));
+            }
             if let Some((did, flag)) = &self.cancel_on_read
                 && service == 0x22
                 && payload == did
@@ -2345,6 +2425,18 @@ mod tests {
         cancelled: bool,
         vin: Option<&str>,
     ) -> Result<VmState, JobError> {
+        resume_in(program, dir, host, cancelled, vin, &vci_only_slot("resume"))
+    }
+
+    /// [`resume_for`] with the job's guard slot given.
+    fn resume_in(
+        program: &Program,
+        dir: &std::path::Path,
+        host: &mut FlashHost,
+        cancelled: bool,
+        vin: Option<&str>,
+        slot: &GuardSlot,
+    ) -> Result<VmState, JobError> {
         resume_on(
             program,
             host,
@@ -2354,6 +2446,7 @@ mod tests {
             identity_sources(),
             vin.map(|vin| crate::journal::Vin::new(vin.to_owned()))
                 .as_ref(),
+            slot,
         )
     }
 
@@ -2551,6 +2644,7 @@ mod tests {
                 Journal::open(&dir, &job_key()),
                 identity_sources(),
                 Some(&target()),
+                &vci_only_slot("resume-cancel"),
             );
             assert!(
                 matches!(result, Err(JobError::Cancelled)),
@@ -3000,6 +3094,7 @@ mod tests {
             Journal::open(&dir, &job_key()),
             identity_sources(),
             Some(&target()),
+            &vci_only_slot("resume"),
         );
         assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
         assert_eq!(host.sent(), [read_of([0xF1, 0x90]), read_of([0xF1, 0x91])]);
@@ -3023,8 +3118,281 @@ mod tests {
             Journal::open(&dir, &job_key()),
             identity_sources(),
             Some(&target()),
+            &vci_only_slot("resume"),
         );
         assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
+        assert_eq!(host.sent(), [read_of([0xF1, 0x90])]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // ------------------------------------ promotion to the vehicle lock (ADR-263)
+
+    const POLL: Duration = Duration::from_millis(1);
+
+    /// Guards of another VCI in the lock directory `guard_setup` uses for `dir`, holding the
+    /// target vehicle.
+    fn other_job_holding_the_vehicle(dir: &std::path::Path) -> JobGuards {
+        let mut other = other_vci_guards(dir);
+        other
+            .take_vehicle(&target(), POLL, &AtomicBool::new(false))
+            .unwrap();
+        other
+    }
+
+    fn other_vci_guards(dir: &std::path::Path) -> JobGuards {
+        let setup = crate::guards::GuardSetup {
+            vci: "VCI-2".to_owned(),
+            ..guard_setup(dir)
+        };
+        JobGuards::take_vci_only(&setup, POLL, &AtomicBool::new(false)).unwrap()
+    }
+
+    /// Whether `take` waits for something another holder has: it is cancelled after a short
+    /// delay and ends in `GuardError::Cancelled`. A take that succeeds first gives `false`.
+    fn waits_for_holder<T>(
+        take: impl FnOnce(&AtomicBool) -> Result<T, crate::guards::GuardError>,
+    ) -> bool {
+        let flag = Arc::new(AtomicBool::new(false));
+        let canceller = {
+            let flag = Arc::clone(&flag);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(100));
+                flag.store(true, Ordering::Relaxed);
+            })
+        };
+        let result = take(&flag);
+        canceller.join().unwrap();
+        matches!(result, Err(crate::guards::GuardError::Cancelled))
+    }
+
+    fn vehicle_is_held(guards: &mut JobGuards) -> bool {
+        waits_for_holder(|cancelled| guards.take_vehicle(&target(), POLL, cancelled))
+    }
+
+    fn wait_until(mut condition: impl FnMut() -> bool) {
+        let start = std::time::Instant::now();
+        while !condition() {
+            assert!(
+                start.elapsed() < Duration::from_secs(20),
+                "the condition did not come true"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// A restart on its own thread, recording its requests in `mirror`.
+    fn spawn_restart(
+        program: &Program,
+        dir: &std::path::Path,
+        slot: &GuardSlot,
+        mirror: &Arc<Mutex<Vec<Sent>>>,
+        cancelled: &Arc<AtomicBool>,
+    ) -> std::thread::JoinHandle<Result<VmState, JobError>> {
+        let (program, dir) = (program.clone(), dir.to_owned());
+        let (slot, mirror, cancelled) =
+            (Arc::clone(slot), Arc::clone(mirror), Arc::clone(cancelled));
+        std::thread::spawn(move || {
+            let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+            host.mirror = Some(mirror);
+            host.voltage = Some(12_600);
+            resume_on(
+                &program,
+                &mut host,
+                JobLimits::default(),
+                &cancelled,
+                Journal::open(&dir, &job_key()),
+                identity_sources(),
+                Some(&target()),
+                &slot,
+            )
+        })
+    }
+
+    /// A restart whose VIN matches leaves the vehicle locked in the guards it returns; another
+    /// job cannot take the vehicle until they are dropped.
+    #[test]
+    fn a_restart_keeps_the_vehicle_lock_in_its_guards() {
+        let program = flash_program();
+        let dir = journal_dir("promote-keeps");
+        interrupted(&program, &dir);
+        let slot: GuardSlot = Arc::new(Mutex::new(Some(take_guards(&dir))));
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        let result = resume_in(&program, &dir, &mut host, false, Some(TARGET_VIN), &slot);
+        assert_eq!(teardown_of(&result), restart::TeardownGate::ResetAllowed);
+        let guards = slot.lock().unwrap().take().unwrap();
+        assert!(guards.holds_vehicle());
+        assert!(guards.holds_slot());
+
+        let mut other = other_vci_guards(&dir);
+        assert!(vehicle_is_held(&mut other));
+        drop(guards);
+        assert!(!vehicle_is_held(&mut other));
+        assert!(other.holds_vehicle());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// While another job holds the vehicle, the promotion waits right after the VIN read: no
+    /// request follows it and the guard slot is not locked. The job goes on once the vehicle is
+    /// free.
+    #[test]
+    fn the_promotion_waits_for_the_vehicle_with_nothing_more_sent() {
+        let program = flash_program();
+        let dir = journal_dir("promote-waits");
+        interrupted(&program, &dir);
+        let other = other_job_holding_the_vehicle(&dir);
+        let slot: GuardSlot = Arc::new(Mutex::new(Some(take_guards(&dir))));
+        let mirror = Arc::new(Mutex::new(Vec::new()));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let job = spawn_restart(&program, &dir, &slot, &mirror, &cancelled);
+
+        // The guards are out of the slot, which can be locked: the job waits for the vehicle.
+        wait_until(|| slot.try_lock().is_ok_and(|slot| slot.is_none()));
+        assert_eq!(*mirror.lock().unwrap(), [read_of([0xF1, 0x90])]);
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!job.is_finished());
+        assert_eq!(*mirror.lock().unwrap(), [read_of([0xF1, 0x90])]);
+
+        drop(other);
+        let result = job.join().unwrap();
+        assert_eq!(teardown_of(&result), restart::TeardownGate::ResetAllowed);
+        assert_eq!(
+            *mirror.lock().unwrap(),
+            [read_of([0xF1, 0x90]), read_of([0xF1, 0x91])]
+        );
+        let guards = slot.lock().unwrap().take().unwrap();
+        assert!(guards.holds_vehicle());
+        assert!(guards.holds_slot());
+        drop(guards);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A cancel during that wait ends the job in `Cancelled`; the guards come back with their
+    /// VCI lock and slot and without the vehicle.
+    #[test]
+    fn a_cancel_during_the_promotion_returns_the_guards_without_the_vehicle() {
+        let program = flash_program();
+        let dir = journal_dir("promote-cancel");
+        interrupted(&program, &dir);
+        let _other = other_job_holding_the_vehicle(&dir);
+        let slot: GuardSlot = Arc::new(Mutex::new(Some(take_guards(&dir))));
+        let mirror = Arc::new(Mutex::new(Vec::new()));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let job = spawn_restart(&program, &dir, &slot, &mirror, &cancelled);
+
+        wait_until(|| slot.try_lock().is_ok_and(|slot| slot.is_none()));
+        cancelled.store(true, Ordering::Relaxed);
+        let result = job.join().unwrap();
+        assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
+        assert_eq!(*mirror.lock().unwrap(), [read_of([0xF1, 0x90])]);
+
+        let guards = slot.lock().unwrap().take().unwrap();
+        assert!(!guards.holds_vehicle());
+        assert!(guards.holds_slot());
+        // Their VCI lock is still held.
+        let setup = guard_setup(&dir);
+        assert!(waits_for_holder(|cancelled| {
+            JobGuards::take_vci_only(&setup, POLL, cancelled)
+        }));
+        drop(guards);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A restart that does not establish the vehicle, or finds another, takes no vehicle lock.
+    #[test]
+    fn a_restart_without_a_matching_vin_takes_no_vehicle_lock() {
+        let cases = [
+            (
+                "mismatch",
+                Some(TARGET_VIN),
+                Some(b"WDB99999999999999".to_vec()),
+                true,
+            ),
+            ("unread", Some(TARGET_VIN), None, true),
+            (
+                "no-target",
+                None,
+                Some(TARGET_VIN.as_bytes().to_vec()),
+                true,
+            ),
+            (
+                "no-source",
+                Some(TARGET_VIN),
+                Some(TARGET_VIN.as_bytes().to_vec()),
+                false,
+            ),
+        ];
+        for (tag, vin, answer, has_source) in cases {
+            let mut program = flash_program();
+            if !has_source {
+                program.identity.vin = None;
+            }
+            let dir = journal_dir("promote-none");
+            interrupted_for(&program, &dir, vin);
+            let slot: GuardSlot = Arc::new(Mutex::new(Some(take_guards(&dir))));
+            let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+            host.vin = answer;
+            let _ = resume_in(&program, &dir, &mut host, false, vin, &slot);
+            let guards = slot.lock().unwrap().take().unwrap();
+            assert!(!guards.holds_vehicle(), "{tag}");
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    /// Guards that hold the job's vehicle already go on without waiting, run after run.
+    #[test]
+    fn guards_that_hold_the_vehicle_resume_without_waiting() {
+        let program = flash_program();
+        let dir = journal_dir("promote-held");
+        interrupted(&program, &dir);
+        let mut guards = take_guards(&dir);
+        guards
+            .take_vehicle(&target(), POLL, &AtomicBool::new(false))
+            .unwrap();
+        let slot: GuardSlot = Arc::new(Mutex::new(Some(guards)));
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        let result = resume_in(&program, &dir, &mut host, false, Some(TARGET_VIN), &slot);
+        assert_eq!(teardown_of(&result), restart::TeardownGate::ResetAllowed);
+        assert!(slot.lock().unwrap().as_ref().unwrap().holds_vehicle());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A vehicle lock file that cannot be used ends the job with nothing sent after the VIN
+    /// read, and no VIN in the error.
+    #[test]
+    fn a_failing_vehicle_lock_ends_the_restart() {
+        let program = flash_program();
+        let dir = journal_dir("promote-fails");
+        interrupted(&program, &dir);
+        let guards = take_guards(&dir);
+        // The bucket's file is a directory.
+        std::fs::create_dir(crate::guards::vehicle_path(
+            &dir.join("locks"),
+            crate::guards::vehicle_bucket(&target()),
+        ))
+        .unwrap();
+        let slot: GuardSlot = Arc::new(Mutex::new(Some(guards)));
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        let result = resume_in(&program, &dir, &mut host, false, Some(TARGET_VIN), &slot);
+        let Err(error @ JobError::VehicleLock(_)) = &result else {
+            panic!("{result:?}");
+        };
+        assert!(!format!("{error} {error:?}").contains("WDB"));
+        assert_eq!(host.sent(), [read_of([0xF1, 0x90])]);
+        let guards = slot.lock().unwrap().take().unwrap();
+        assert!(!guards.holds_vehicle());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An empty slot is an error, not a panic.
+    #[test]
+    fn a_restart_with_an_empty_guard_slot_ends_in_an_error() {
+        let program = flash_program();
+        let dir = journal_dir("promote-empty");
+        interrupted(&program, &dir);
+        let slot: GuardSlot = Arc::new(Mutex::new(None));
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        let result = resume_in(&program, &dir, &mut host, false, Some(TARGET_VIN), &slot);
+        assert!(matches!(result, Err(JobError::GuardsMissing)), "{result:?}");
         assert_eq!(host.sent(), [read_of([0xF1, 0x90])]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -3089,6 +3457,7 @@ mod tests {
             Ok(journal),
             identity_sources(),
             Some(&target()),
+            &vci_only_slot("resume"),
         );
         assert!(matches!(result, Err(JobError::Journal(_))), "{result:?}");
         assert_eq!(host.sent(), []);

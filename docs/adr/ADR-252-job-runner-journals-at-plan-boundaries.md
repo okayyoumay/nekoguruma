@@ -50,7 +50,8 @@ is no step before it.
      plan's end that is the next plan's entry completes the one before entering the next.
 3. **A failure stops before the next instruction.** A commit that fails, or an identity that
    cannot be read, ends the job before the next instruction runs, so a guarded request is never
-   sent without its marker, and nothing is erased without the identity.
+   sent without its marker, and nothing is erased without the identity. A cancelled job (ADR-235: the call in flight finishes, no further instruction runs) stops
+   before each identity read and again before the boundary's instruction.
 4. **The identity is read at the plan's entry, once per job, before the first transfer.** The
    hardware part number and the software version are read through the sources the program
    declares, at the entry rather than at the erase. The entry is where a restart's replay

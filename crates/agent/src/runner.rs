@@ -304,7 +304,12 @@ where
                 pc: vm.state.pc,
                 source,
             })?;
-            journal.arrive(program, &vm.state, host)?;
+            journal.arrive(program, &vm.state, host, cancelled)?;
+            // The identity reads at a boundary take time; a cancel during them stops the job
+            // before the boundary's instruction runs.
+            if cancelled.load(Ordering::Relaxed) {
+                return Err(JobError::Cancelled);
+            }
         }
         let pc = vm.state.pc;
         let at = StepRef {
@@ -648,6 +653,9 @@ mod tests {
         transfer: Option<u64>,
         /// The answer to F195; `None` answers it negatively.
         software_version: Option<Vec<u8>>,
+        /// Set when a ReadDataByIdentifier for this identifier arrives, as a dropped job
+        /// future would.
+        cancel_on_read: Option<([u8; 2], Arc<AtomicBool>)>,
     }
 
     impl FlashHost {
@@ -657,6 +665,7 @@ mod tests {
                 log: Vec::new(),
                 transfer: None,
                 software_version: Some(b"SW01".to_vec()),
+                cancel_on_read: None,
             }
         }
 
@@ -683,6 +692,12 @@ mod tests {
         fn service_request(&mut self, service: u16, payload: &[u8]) -> Result<Vec<u8>, HostError> {
             self.log
                 .push((Sent::Service(service, payload.to_vec()), self.commits.get()));
+            if let Some((did, flag)) = &self.cancel_on_read
+                && service == 0x22
+                && payload == did
+            {
+                flag.store(true, Ordering::Relaxed);
+            }
             match (service, payload) {
                 (0x22, [0xF1, 0x91]) => Ok([&[0x62, 0xF1, 0x91][..], b"HW01"].concat()),
                 (0x22, [0xF1, 0x95]) => Ok(match &self.software_version {
@@ -1074,6 +1089,38 @@ mod tests {
         }
     }
 
+    /// A job cancelled during an identity read sends no further request: neither the next
+    /// identity read nor the boundary's own instruction (the runner's cancel contract).
+    #[test]
+    fn a_cancel_during_the_identity_reads_stops_before_the_next_request() {
+        // With the entry at the erase, the erase is the very next instruction after the reads.
+        let mut at_erase = flash_program();
+        at_erase.flash[0].boundaries.entry_pc = ERASE;
+        for program in [flash_program(), at_erase] {
+            for did in [[0xF1, 0x91], [0xF1, 0x95]] {
+                let flag = Arc::new(AtomicBool::new(false));
+                let commits = Rc::new(Cell::new(0));
+                let mut host = FlashHost::new(Rc::clone(&commits));
+                host.cancel_on_read = Some((did, Arc::clone(&flag)));
+                let mut journal = counting_journal(&commits, None);
+                let result = run_on(
+                    &program,
+                    &mut host,
+                    JobLimits::default(),
+                    &flag,
+                    Some(&mut journal),
+                );
+                assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
+                assert_eq!(
+                    host.sent().last(),
+                    Some(&Sent::Service(0x22, did.to_vec())),
+                    "{did:02X?}"
+                );
+                assert!(!host.sent().iter().any(|s| matches!(s, Sent::Routine(_))));
+            }
+        }
+    }
+
     /// A post-transfer step is recorded, and the completion is committed with the step that
     /// reaches the end, even when the job stops right there (here at its step limit).
     #[test]
@@ -1191,9 +1238,14 @@ mod tests {
         let mut journal = counting_journal(&commits, None);
         let mut vm = Vm::new(&program);
         vm.state.pc = ENTRY;
-        journal.arrive(&program, &vm.state, &mut host).unwrap();
+        let running = AtomicBool::new(false);
+        journal
+            .arrive(&program, &vm.state, &mut host, &running)
+            .unwrap();
         vm.state.steps = 10;
-        journal.arrive(&program, &vm.state, &mut host).unwrap();
+        journal
+            .arrive(&program, &vm.state, &mut host, &running)
+            .unwrap();
         let reads = host
             .sent()
             .iter()
@@ -1376,7 +1428,7 @@ mod tests {
             key: job_key(),
             sources: identity_sources(),
         };
-        // Fails at the link the link opens, after the journal decision: no file appears.
+        // Fails when the link opens, before the journal would be created: no file appears.
         let result = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()

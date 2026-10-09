@@ -23,6 +23,7 @@
 //! instruction runs, so the request a marker guards is never sent without it (ADR-244 item 7).
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use diag_ir::{DiagHost, FlashRecovery, IdentityKind, NoApplication, Op, Program, VmState};
 
@@ -80,12 +81,14 @@ impl<S: Store> JobJournal<S> {
     }
 
     /// Commits the markers and the identity the boundaries at `state.pc` call for. Called once
-    /// each time execution arrives at an instruction, before it runs.
+    /// each time execution arrives at an instruction, before it runs. A cancel stops it before
+    /// each identity read (the runner's contract: no request after the one in flight).
     pub(crate) fn arrive<H>(
         &mut self,
         program: &Program,
         state: &VmState,
         host: &mut H,
+        cancelled: &AtomicBool,
     ) -> Result<(), JobError>
     where
         H: DiagHost<Error = HostError>,
@@ -103,7 +106,7 @@ impl<S: Store> JobJournal<S> {
                 && !self.identity_read
                 && self.journal.state().facts.transfer.is_none()
             {
-                self.record_identity(program, plan, pc, host)?;
+                self.record_identity(program, plan, pc, host, cancelled)?;
                 self.identity_read = true;
             }
             if pc == b.erase_pc {
@@ -180,6 +183,7 @@ impl<S: Store> JobJournal<S> {
         plan: &FlashRecovery,
         pc: u32,
         host: &mut H,
+        cancelled: &AtomicBool,
     ) -> Result<(), JobError>
     where
         H: DiagHost<Error = HostError>,
@@ -196,6 +200,9 @@ impl<S: Store> JobJournal<S> {
         ];
         for (identity, source) in declared {
             let Some(source) = source else { continue };
+            if cancelled.load(Ordering::Relaxed) {
+                return Err(JobError::Cancelled);
+            }
             let read = read_field_bytes(source, &self.sources, host).map_err(|source| {
                 JobError::IdentityRead {
                     pc,

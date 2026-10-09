@@ -217,7 +217,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-224](ADR-224-vci-service-manager-instance-lifecycle-single-flight.md) | `vci-service-manager` Instance Lifecycle Gains a Single-Flight State Machine | Accepted | `vci-service-manager` main |
 | [ADR-226](ADR-226-vci-service-manager-client-authorization.md) | `vci-service-manager` Client Authorization — Peer-Identity Trust Root over Local IPC, Manager-Minted Session Tokens for TCP | Accepted | `vci-service-manager` main, Cargo.toml, docs |
 | [ADR-227](ADR-227-windows-workers-target-gnullvm.md) | Windows Workers Target `*-pc-windows-gnullvm`, Cross-Built on Linux | Accepted | CI, `.cargo/config.toml`, worker target docs |
-| [ADR-228](ADR-228-fixed-library-resolution-locations.md) | Library Resolution from Fixed Locations, Shared by Agent and Worker | Accepted | design 7.1.1 / 7.2 / 7.3, `vci-discovery`, `vci-service-config`, worker services |
+| [ADR-228](ADR-228-fixed-library-resolution-locations.md) | Library Resolution from Fixed Locations, Shared by Agent and Worker | Accepted (the Linux definition format and the shared crate's name settled by ADR-266) | design 7.1.1 / 7.2 / 7.3, `vci-discovery`, `vci-service-config`, worker services |
 | [ADR-229](ADR-229-interrupted-transfer-restarts-from-request-download.md) | Interrupted Transfers Restart from RequestDownload; Write Procedures Are a Reference Implementation | Accepted (item 1's `recovery_required_from_step` replaced by ADR-245; item 2's failed confirmation after an accepted reset gets one passive retry since ADR-265) | design 8.2.5 / 16.1, `agent` journal, `sim-ecu` |
 | [ADR-230](ADR-230-backlog-loop-serialization-and-claims.md) | Backlog Loop Runs One Item at a Time, with PR-Based Claims and Run State | Accepted (Decision items 1-2's claim set extended to `codeql-alerts` PRs by ADR-243; Decision item 5 superseded by ADR-249) | `.claude/skills/backlog-loop`, `next-task`, `scripts/classify-pr-risk.sh` |
 | [ADR-231](ADR-231-agent-mints-worker-tokens-in-process.md) | The Agent Mints Worker Bearer Tokens In-Process | Accepted | `worker-host` client, `vci-service-interface` token |
@@ -255,6 +255,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-263](ADR-263-restart-promotes-to-the-per-vehicle-lock.md) | The Restart Promotes to the Per-Vehicle Lock at Its VIN Match | Accepted | `agent` restart, runner |
 | [ADR-264](ADR-264-restart-teardown.md) | The Restart's Teardown Sends One Hard Reset or Waits Out the Session | Accepted (item 5's ending amended by ADR-265) | `agent` restart, runner; `sim-ecu` |
 | [ADR-265](ADR-265-restart-default-session-confirmation.md) | The Restart Confirms the Default Session, with One Passive Retry | Accepted | `agent` restart, runner; `sim-ecu` |
+| [ADR-266](ADR-266-linux-j2534-registration-definition-format.md) | Linux J2534 Registration Definitions Are TOML Files Keyed Like the Windows Registry | Accepted | `ngr-library-resolver`, design 7.1.1, 7.2 |
 
 ## Status Legend
 
@@ -547,8 +548,9 @@ the predecessor repository these ADRs came from.
 - ADR-220 (Decision item 5's `proxy_to_instance` mechanism removed by ADR-221)
 - ADR-223
 - ADR-224
-- ADR-228
+- ADR-228 (the Linux definition format and the shared crate's name settled by ADR-266)
 - ADR-240
+- ADR-266
 
 ### vci-service-manager Process Startup
 - ADR-073
@@ -559,7 +561,7 @@ the predecessor repository these ADRs came from.
 - ADR-220 (`grpc_endpoint`/`SocketAddr` clients now connect to directly, per this ADR's proxy removal)
 - ADR-221 (Decision item 7's route-preservation for `DELETE /vci-libs/{id}/endpoint` superseded by ADR-225; native-client-enrollment and unauthenticated-admin-route accepted residuals closed by ADR-226; manager-side token minting superseded for the agent by ADR-231)
 - ADR-226
-- ADR-228
+- ADR-228 (the Linux definition format and the shared crate's name settled by ADR-266)
 - ADR-231
 
 ### FFI Bindings & Target ABI

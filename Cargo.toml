@@ -19,6 +19,7 @@ members = [
     "crates/j2534-0404-mock",
     "crates/j2534-0404-registry",
     "crates/j2534-0404-service",
+    "crates/ngr-library-resolver",
     "crates/vci-service-config",
     "crates/vci-service-interface",
     "crates/vci-service-launcher",
@@ -52,6 +53,7 @@ j2534-0404 = { path = "crates/j2534-0404" }
 j2534-0404-sys = { path = "crates/j2534-0404-sys" }
 j2534-0404-mock = { path = "crates/j2534-0404-mock" }
 j2534-0404-registry = { path = "crates/j2534-0404-registry" }
+ngr-library-resolver = { path = "crates/ngr-library-resolver" }
 vci-service-config = { path = "crates/vci-service-config" }
 vci-service-interface = { path = "crates/vci-service-interface" }
 vci-service-launcher = { path = "crates/vci-service-launcher" }

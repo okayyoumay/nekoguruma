@@ -560,17 +560,18 @@ J2534 on Linux **reuses the Windows API definitions as-is**. Function signatures
 
 **Search path**: `/etc/nekoguruma/j2534/` only, written by the administrator, in both operating modes. Per-user locations (such as `$XDG_CONFIG_HOME`) are not supported. The directory is fixed at build time; a runtime override exists only in debug builds, for tests (ADR-228).
 
-**Format**: One file per VCI (TOML or JSON). A single large file would have installers from multiple vendors editing the same file and conflicting, so the granularity matches the registry's one key per VCI.
+**Format**: One TOML file per VCI, with keys named as the Windows registry values (ADR-266). A single large file would have installers from multiple vendors editing the same file and conflicting, so the granularity matches the registry's one key per VCI.
 
 **Fields**: Mapped to the Windows registry values, with field names matching the value names, so that discovery results map onto the same structure.
 
 | Field | Content |
 |---|---|
-| `Name` / `Vendor` | For display |
+| `Name` | The VCI name a caller resolves; it stands for the Windows device's registry key name, which identifies the device there (the Windows `Name` value is for display) |
+| `Vendor` | For display |
 | `FunctionLibrary` | Absolute path of the .so |
 | Supported protocols and capability flags | Correspond to the respective Windows values |
-| `long_size` | Width of `unsigned long` in the vendor implementation (see below) |
-| Additional search paths | For resolving dependent libraries (optional) |
+| `LongSize` | Width of `unsigned long` in the vendor implementation (see below) |
+| `SearchPaths` | Additional search paths for resolving dependent libraries (optional) |
 
 **Creating definition files**: There is no guarantee that vendor installers will write definitions specific to this software, so operation takes one of the following forms.
 
@@ -583,7 +584,7 @@ The agent provides a generation helper, run with administrator rights. It actual
 **OS differences absorbed on the worker side**
 
 - **Calling convention**: Windows uses `WINAPI` (`stdcall` on x86), Linux uses the standard C convention. They are identical on x86_64 but differ on x86 workers
-- **Width of `unsigned long`**: The J2534 API uses `unsigned long` extensively. On Windows it is 32bit even on 64bit; on Linux x86_64 it is 64bit. Since vendor implementations interpret this differently, it must be stated explicitly via `long_size` in the definition file
+- **Width of `unsigned long`**: The J2534 API uses `unsigned long` extensively. On Windows it is 32bit even on 64bit; on Linux x86_64 it is 64bit. Since vendor implementations interpret this differently, a definition file can state it with the optional `LongSize`; without it the ABI default of 7.1.2 applies
 - **Structure alignment**: The packing of `PASSTHRU_MSG` etc. is specified explicitly on the worker side
 - **Dependency resolution**: A .so depends on rpath / `LD_LIBRARY_PATH`. Handled via the additional search paths in the definition file
 
@@ -603,9 +604,9 @@ Basis for the inference: AArch64's AAPCS64 matches x86_64's System V ABI in that
 | Linux armhf | 32bit | Single | **Inferred** (treated as identical to x86) |
 
 - The ABI interpretation is held as data, as a mapping table "architecture x bitness -> `long` width, calling convention, alignment", rather than scattering conditional branches through the code. This keeps the fix confined to one place if an inference turns out wrong. The table lives in `worker-host` (`Abi`: name, default `long_size`, interpretation source); the calling convention and packing are applied by each worker service's sys layer for the target it is built for
-- If `long_size` is not specified in the registration definition, the inferred value from this table is the default. ARM gets no special treatment; the same rule applies
+- If `LongSize` is not specified in the registration definition, the inferred value from this table is the default. ARM gets no special treatment; the same rule applies
 - Structure layouts consist of `unsigned long`, pointers and fixed-length arrays, so they match if the widths are the same. However, armhf aligns 64bit integers to 8 bytes (i686 uses 4 bytes), so explicit packing specification is retained
-- `long_size`, calling convention and alignment can be explicitly overridden in the registration definition and the VCI profile (9.3), so that vendors for which the inference is wrong can be supported by adding an extension alone, without modifying the core
+- `long_size` can be overridden in the registration definition (`LongSize`), and `long_size`, calling convention and alignment in the VCI profile (9.3), so that vendors for which the inference is wrong can be supported by adding an extension alone, without modifying the core
 
 ### 7.2 Pre-load Verification
 
@@ -620,7 +621,7 @@ On Windows, the basis for trust is that HKLM can be modified only by administrat
 
 **One resolver, checked where the library is loaded**
 
-Resolving a VCI name to a library path, and the checks above, live in one shared crate used by both the agent and the worker services. The agent uses it for discovery and to report loadability in `capabilities` (9.5); the worker service resolves the name it was started with through the same code and runs the checks itself immediately before loading, so the file that is checked is the file that is loaded.
+Resolving a VCI name to a library path, and the checks above, live in one shared crate used by both the agent and the worker services. The agent uses it for discovery and to report loadability in `capabilities` (9.5); the worker service resolves the name it was started with through the same code and runs the checks itself immediately before loading, so the file that is checked is the file that is loaded. The crate holds one module per standard and J2534 version (J2534 v04.04; ISO 22900-2 D-PDU API, whose root and module description files are in its installation clause and Annex F: 9.7 in the 2009 edition, 8.7 in the 2022 edition), each keeping the operating-system differences of that standard's discovery chain (7.1) behind one interface; the checks are shared by the standards (ADR-266).
 
 ### 7.3 ABI Detection and Worker Selection
 
@@ -658,7 +659,7 @@ flowchart TD
 - Emulation of a different architecture is out of scope (Linux)
 - The launch test runs through the worker service itself, not through a separate probe binary: the agent launches the service for the detected ABI, connects the module and calls `GetVersion`, which the j2534-0404 service answers with `PassThruReadVersion`. The test therefore exercises the same binary, FFI layer and `long_size` that the job will use, and each ABI ships one worker binary per library kind
 
-**Implementation** (`crates/worker-host`): the agent starts a worker service with the VCI's library name only; the service resolves the path itself (7.2). To choose the build, the agent resolves the name the way each build would (its `config.toml` architecture key and registry view, with both views read explicitly on 64-bit Windows) and takes the first build whose library header matches its own ABI (`agent::launch`, used by `ngr-agent run`). `abi::detect_file` reads the header and returns the ABI name of the 7.1.2 table. Worker binaries are installed as `<workers>/<ABI name>/<service binary>`, and `WorkerLayout::find` reports a missing build as `UNSUPPORTED_ABI`. The J2534 `long_size` (definition file value, else the 7.1.2 default from `Abi::default_long_size`; `agent::launch` reads no definition file and always passes the default) is passed to the j2534-0404 service in the `NGR_J2534_LONG_SIZE` environment variable; its sys layer converts between 32-bit and 64-bit structures at the FFI boundary.
+**Implementation** (`crates/worker-host`): the agent starts a worker service with the VCI's library name only; the service resolves the path itself (7.2). To choose the build, the agent resolves the name the way each build would (its `config.toml` architecture key and registry view, with both views read explicitly on 64-bit Windows) and takes the first build whose library header matches its own ABI (`agent::launch`, used by `ngr-agent run`). `abi::detect_file` reads the header and returns the ABI name of the 7.1.2 table. Worker binaries are installed as `<workers>/<ABI name>/<service binary>`, and `WorkerLayout::find` reports a missing build as `UNSUPPORTED_ABI`. The J2534 `long_size` (the definition file's `LongSize`, else the 7.1.2 default from `Abi::default_long_size`; `agent::launch` reads no definition file and always passes the default) is passed to the j2534-0404 service in the `NGR_J2534_LONG_SIZE` environment variable; its sys layer converts between 32-bit and 64-bit structures at the FFI boundary.
 
 ### 7.4 IPC
 

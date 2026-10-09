@@ -15,7 +15,7 @@ ngr-agent run --vci <name> --program <file> [--workers <dir>] [--locks <dir>] [-
 | `--vci` | J2534 v04.04 library name, as the worker service resolves it (registry key on Windows, `library_path` entry in the service's `config.toml`) |
 | `--program` | IR program file: a `diag_ir::Program` serialized as JSON |
 | `--workers` | Directory of worker builds, laid out as `<dir>/<ABI name>/j2534-0404-service[.exe]` (design 7.3). Default: `workers` next to the `ngr-agent` executable |
-| `--locks` | The device's lock directory for the job's guards ("Job guards" below), as an absolute path. Default: `locks` next to the `ngr-agent` executable. Lock files are opened read-only, so a file another user created still locks. The agent creates a missing directory with the process's default permissions, so a device whose agents run as several users needs it prepared beforehand: writable by all of them, and with the sticky bit (or an equivalent ACL) so that no user can delete another's lock files (ADR-257) |
+| `--locks` | The device's lock directory for the job's guards ("Job guards" below), as an absolute path. Default: `locks` next to the `ngr-agent` executable. Lock files are opened read-only, so a file another user created still locks. The agent creates a missing directory writable by its owner only, so a device whose agents run as several users needs it prepared beforehand: writable by all of them, and with the sticky bit (or an equivalent ACL) so that no user can delete another's lock files (ADR-257). On Unix a directory that group or others may write without the sticky bit is refused |
 | `--tx-id`, `--rx-id` | Physical request and response CAN IDs in hex, with or without `0x`. Default `7E0` / `7E8`. Only 11-bit IDs: the link does not set the CAN ID format |
 
 The link is UDS on ISO 15765 at 500 kbit/s (`LinkConfig::iso15765`), with the CAN IDs from the
@@ -221,7 +221,11 @@ once the job thread has ended. A job that survives a worker crash, a VCI disconn
 of the vehicle's supply alone gets them back, still held, and passes them to its next run. A
 VCI name has 1 to `MAX_VCI_NAME` (100) bytes. The lock directory is one per device,
 shared by every agent process on it whichever user it runs as: each of them must be able to
-create files in it and read the lock files there (lock files are opened read-only). `ngr-agent run` takes the guards from `--locks` and `--vci` before it runs the
+create files in it and read the lock files there (lock files are opened read-only). On Unix
+the guards refuse a directory that group or others may write unless it has the sticky bit
+(`GuardError::UnsafeDir`): another user could otherwise delete a lock file a job holds, and a
+second job would lock the new file at the same path. A directory the guards create is writable
+by its owner only. `ngr-agent run` takes the guards from `--locks` and `--vci` before it runs the
 program, and holds them until the run ends.
 
 ## Restart inputs

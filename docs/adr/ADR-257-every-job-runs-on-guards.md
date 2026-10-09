@@ -60,11 +60,14 @@ runner also needs a way to know which kind of job it runs.
 - The lock directory must let every agent user on the device create files in it, and must
   keep users from deleting or replacing each other's lock files (ADR-256 item 1). On Unix that
   is a directory with the sticky bit, writable by all agent users, like `/tmp`; on Windows an
-  ACL that grants create but not delete on others' files. The agent creates a missing
-  directory with the process's default permissions, which grant neither. On a device whose
-  agents run as several users, the installation therefore prepares the directory and names
-  it with `--locks` or places it next to the executable. A user who cannot create or read a
-  lock file fails at once instead of waiting.
+  ACL that grants create but not delete on others' files. The agent does not set these
+  permissions: it cannot safely change a directory another user owns, so on a device whose
+  agents run as several users the installation prepares the directory and names it with
+  `--locks` or places it next to the executable. The agent checks what it can instead. On
+  Unix it creates a missing directory writable by its owner only (mode 0755 before the
+  umask), and refuses a directory that group or others may write without the sticky bit
+  (`GuardError::UnsafeDir`), before it takes any lock. On Windows it does not check the ACL.
+  A user who cannot create or read a lock file fails at once instead of waiting.
 - A job that only reads can still wait for another VCI's reprogramming, because of the lock
   order of ADR-256 item 4: a writer on VCI-1 takes VCI-1's lock and then waits for the slot,
   which a writer on VCI-2 holds, and a read on VCI-1 then waits for VCI-1's lock. The wait

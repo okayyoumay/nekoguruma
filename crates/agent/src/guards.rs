@@ -13,6 +13,10 @@
 //! crashed agent never blocks the restart that follows it. The files are never deleted: a
 //! process that locked a recreated file would not exclude one still holding the old one.
 //!
+//! On Unix the lock directory must stop users deleting or replacing each other's lock files: a
+//! directory that group or others may write must have the sticky bit, or the guards refuse it
+//! (ADR-257). A directory the guards create is writable by its owner only.
+//!
 //! Locks are always taken in the same order (VCI, then slot when wanted), so two jobs that wait on each
 //! other cannot both hold what the other needs. Waiting polls `try_lock` and stops when the job
 //! is cancelled.
@@ -45,6 +49,11 @@ pub enum GuardError {
     Io(#[from] io::Error),
     #[error("the VCI name {0:?} cannot name a lock: it must have 1 to {MAX_VCI_NAME} bytes")]
     InvalidVci(String),
+    #[error(
+        "the lock directory {0} lets other users delete or replace lock files: \
+         give it the sticky bit, or make it writable by its owner only"
+    )]
+    UnsafeDir(PathBuf),
 }
 
 /// The guards one job holds: the per-VCI lock, and for a job that reprograms also the
@@ -99,7 +108,7 @@ impl JobGuards {
         if setup.vci.is_empty() || setup.vci.len() > MAX_VCI_NAME {
             return Err(GuardError::InvalidVci(setup.vci.clone()));
         }
-        fs::create_dir_all(&setup.dir)?;
+        prepare_dir(&setup.dir)?;
         LockFile::wait(&vci_path(&setup.dir, &setup.vci), poll, cancelled)
     }
 }
@@ -154,6 +163,33 @@ impl LockFile {
 }
 
 /// Names are hex-encoded, so any VCI name gives a valid, distinct file name.
+/// Creates the lock directory if it is missing, writable by its owner only, and refuses one in
+/// which another user could delete or replace a lock file another job holds: such a file's path
+/// would then name a new file, which a second job could lock at the same time.
+#[cfg(unix)]
+fn prepare_dir(dir: &Path) -> Result<(), GuardError> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o755)
+        .create(dir)?;
+    let mode = fs::metadata(dir)?.permissions().mode();
+    let shared = mode & 0o022 != 0;
+    let sticky = mode & 0o1000 != 0;
+    if shared && !sticky {
+        return Err(GuardError::UnsafeDir(dir.to_owned()));
+    }
+    Ok(())
+}
+
+/// Creates the lock directory if it is missing. Its ACL is the installation's (ADR-257).
+#[cfg(not(unix))]
+fn prepare_dir(dir: &Path) -> Result<(), GuardError> {
+    fs::create_dir_all(dir)?;
+    Ok(())
+}
+
 fn hex(name: &str) -> String {
     name.bytes().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -308,6 +344,33 @@ mod tests {
         assert!(matches!(taken, Err(GuardError::Cancelled)), "{taken:?}");
         JobGuards::take(&setup(&dir, "VCI-1"), POLL, &AtomicBool::new(false))
             .expect("nothing is held");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A directory group or others may write needs the sticky bit; one the guards create is the
+    /// owner's alone (ADR-257).
+    #[cfg(unix)]
+    #[test]
+    fn a_shared_lock_directory_needs_the_sticky_bit() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = dir("sticky");
+        let never = AtomicBool::new(false);
+        let take = || JobGuards::take_vci_only(&setup(&dir, "VCI-1"), POLL, &never);
+        drop(take().expect("a directory the guards create is safe"));
+        let created = fs::metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(created & 0o022, 0, "{created:o}");
+        for mode in [0o777, 0o775, 0o757] {
+            fs::set_permissions(&dir, fs::Permissions::from_mode(mode)).unwrap();
+            assert!(
+                matches!(take(), Err(GuardError::UnsafeDir(_))),
+                "{mode:o} is refused"
+            );
+        }
+        for mode in [0o1777, 0o1770, 0o755, 0o700] {
+            fs::set_permissions(&dir, fs::Permissions::from_mode(mode)).unwrap();
+            drop(take().unwrap_or_else(|error| panic!("{mode:o} is safe: {error}")));
+        }
         fs::remove_dir_all(&dir).unwrap();
     }
 

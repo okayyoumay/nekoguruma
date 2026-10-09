@@ -30,8 +30,10 @@ use crate::restart::{self, OnSiteReason, RestartDecision};
 pub struct JobLimits {
     /// Steps after which the job is stopped, against a procedure that never ends.
     pub max_steps: u64,
-    /// Pause between polls of a `Wait` instruction, and between attempts of a restart's wait for
-    /// the per-vehicle lock (ADR-263); at least 1 ms is used.
+    /// Pause between polls of a `Wait` instruction, between attempts of a restart's wait for
+    /// the per-vehicle lock (ADR-263), and between the cancel checks of a restart's passive
+    /// teardown (ADR-264), so it also bounds how late those waits see a cancel; at least 1 ms is
+    /// used.
     pub wait_poll: Duration,
 }
 

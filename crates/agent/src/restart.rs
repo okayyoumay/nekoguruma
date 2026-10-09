@@ -470,7 +470,8 @@ where
 /// sends nothing further meanwhile (after a refused or unknown reset, the reset was the last
 /// request): the agent runs no TesterPresent, so there is none to stop. The wait
 /// sleeps in steps of `poll` and checks `cancelled` at the start of each; a cancel ends it in
-/// [`JobError::Cancelled`]. A cancel before the reset is sent sends none; one that arrives while
+/// [`JobError::Cancelled`]. A cancel set when the teardown starts ends it before anything, on
+/// the completed path too, and sends no reset; one that arrives while
 /// the reset is on its way does not hide an accepted reset.
 pub(crate) fn teardown<H>(
     gate: TeardownGate,
@@ -483,6 +484,10 @@ pub(crate) fn teardown<H>(
 where
     H: DiagHost<Error = HostError>,
 {
+    // Nothing has been sent yet, so a cancel ends the teardown here on every path.
+    if cancelled.load(Ordering::Relaxed) {
+        return Err(JobError::Cancelled);
+    }
     let exit = point
         .facts
         .transfer
@@ -495,9 +500,6 @@ where
     } else if let TeardownGate::PassiveOnly(reason) = gate {
         PassiveCause::Gate(reason)
     } else {
-        if cancelled.load(Ordering::Relaxed) {
-            return Err(JobError::Cancelled);
-        }
         // ECUReset, sub-function hardReset; the suppress bit is not set, so a positive
         // response comes back. Once it is sent, a cancel no longer hides its outcome: an
         // accepted reset is reported as such, and a cancel ends only the wait that follows a
@@ -1161,7 +1163,12 @@ mod tests {
 
     /// A simulated ECU in its extended session, as an interrupted download leaves it.
     fn ecu_in_session() -> SimHost {
-        let mut ecu = sim_ecu::SimEcu::new(sim_ecu::EcuConfig::default());
+        ecu_in_session_with(sim_ecu::EcuConfig::default())
+    }
+
+    /// [`ecu_in_session`] with `config`.
+    fn ecu_in_session_with(config: sim_ecu::EcuConfig) -> SimHost {
+        let mut ecu = sim_ecu::SimEcu::new(config);
         let response = ecu.request(&[0x10, 0x03]);
         assert!(
             matches!(response, sim_ecu::SimResponse::Positive(_)),
@@ -1214,6 +1221,40 @@ mod tests {
         assert_eq!(host.0.power_cycles(), 1);
         assert_eq!(host.0.session, sim_ecu::Session::Default);
         assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
+    }
+
+    /// A cancel set before the teardown ends it on the completed path too, where nothing would be
+    /// sent anyway.
+    #[test]
+    fn a_cancel_before_the_teardown_ends_the_completed_path() {
+        let (_, point) = point_at(EXIT);
+        let mut point = point;
+        point
+            .facts
+            .transfer
+            .as_mut()
+            .and_then(|transfer| transfer.exit.as_mut())
+            .expect("a journal at RequestTransferExit has an exit")
+            .complete = true;
+        let mut host = ecu_in_session();
+        let result = teardown(
+            TeardownGate::ResetAllowed,
+            &point,
+            &TIMING,
+            &mut host,
+            Duration::from_millis(1),
+            &AtomicBool::new(true),
+        );
+        assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
+        let result = teardown(
+            TeardownGate::ResetAllowed,
+            &point,
+            &TIMING,
+            &mut host,
+            Duration::from_millis(1),
+            &AtomicBool::new(false),
+        );
+        assert_eq!(result.unwrap(), Teardown::CompletedPath);
     }
 
     /// A cancel set before the teardown sends no reset.
@@ -1358,14 +1399,21 @@ mod tests {
             ),
         ];
         for (gate, point, cause) in cases {
-            let mut host = ecu_in_session();
+            // The ECU's session timeout is the one the plan declares, so the wait outlasts it.
+            let mut host = ecu_in_session_with(sim_ecu::EcuConfig {
+                s3_server_ms: Some(TIMING.session_timeout_millis),
+                ..sim_ecu::EcuConfig::default()
+            });
             // Armed to show whether any request reaches the ECU: it stays armed if none does.
             host.0.inject(sim_ecu::Fault::BusError);
             let (result, elapsed) = run_teardown(gate, point, &mut host);
             assert_eq!(result.unwrap(), Teardown::Passive(cause));
             assert_eq!(host.0.armed_faults(), &[sim_ecu::Fault::BusError]);
-            assert_eq!(host.0.session, sim_ecu::Session::Extended);
             assert!(elapsed >= Duration::from_millis(20), "{elapsed:?}");
+            // The passive teardown let the session run out: the ECU is back in its default
+            // session without any request.
+            host.0.check_timers();
+            assert_eq!(host.0.session, sim_ecu::Session::Default);
         }
     }
 }

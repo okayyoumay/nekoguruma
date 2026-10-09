@@ -584,7 +584,7 @@ The agent provides a generation helper, run with administrator rights. It actual
 **OS differences absorbed on the worker side**
 
 - **Calling convention**: Windows uses `WINAPI` (`stdcall` on x86), Linux uses the standard C convention. They are identical on x86_64 but differ on x86 workers
-- **Width of `unsigned long`**: The J2534 API uses `unsigned long` extensively. On Windows it is 32bit even on 64bit; on Linux x86_64 it is 64bit. Since vendor implementations interpret this differently, it must be stated explicitly via `LongSize` in the definition file
+- **Width of `unsigned long`**: The J2534 API uses `unsigned long` extensively. On Windows it is 32bit even on 64bit; on Linux x86_64 it is 64bit. Since vendor implementations interpret this differently, a definition file can state it with the optional `LongSize`; without it the ABI default of 7.1.2 applies
 - **Structure alignment**: The packing of `PASSTHRU_MSG` etc. is specified explicitly on the worker side
 - **Dependency resolution**: A .so depends on rpath / `LD_LIBRARY_PATH`. Handled via the additional search paths in the definition file
 
@@ -606,7 +606,7 @@ Basis for the inference: AArch64's AAPCS64 matches x86_64's System V ABI in that
 - The ABI interpretation is held as data, as a mapping table "architecture x bitness -> `long` width, calling convention, alignment", rather than scattering conditional branches through the code. This keeps the fix confined to one place if an inference turns out wrong. The table lives in `worker-host` (`Abi`: name, default `long_size`, interpretation source); the calling convention and packing are applied by each worker service's sys layer for the target it is built for
 - If `LongSize` is not specified in the registration definition, the inferred value from this table is the default. ARM gets no special treatment; the same rule applies
 - Structure layouts consist of `unsigned long`, pointers and fixed-length arrays, so they match if the widths are the same. However, armhf aligns 64bit integers to 8 bytes (i686 uses 4 bytes), so explicit packing specification is retained
-- `long_size` (`LongSize` in a registration definition), calling convention and alignment can be explicitly overridden in the registration definition and the VCI profile (9.3), so that vendors for which the inference is wrong can be supported by adding an extension alone, without modifying the core
+- `long_size` can be overridden in the registration definition (`LongSize`), and `long_size`, calling convention and alignment in the VCI profile (9.3), so that vendors for which the inference is wrong can be supported by adding an extension alone, without modifying the core
 
 ### 7.2 Pre-load Verification
 

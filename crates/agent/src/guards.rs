@@ -1,9 +1,9 @@
-//! Restart guards (design 8.8, 8.8.1; ADR-229 item 2 step 1, ADR-256).
+//! Job guards (design 8.8, 8.8.1; ADR-229 item 2 step 1, ADR-256, ADR-257).
 //!
-//! On one device, a job holds:
-//! - the lock of the VCI it uses (per-VCI lock);
+//! On one device, every job holds the lock of the VCI it uses (per-VCI lock), and a job that
+//! reprograms also holds:
 //! - the device's single reprogramming slot, since only one ECU is reprogrammed at a time per
-//!   device.
+//!   device. A job that only reads ([`JobGuards::take_vci_only`]) does not take it.
 //!
 //! The per-vehicle lock of design 8.8's two-stage locking is not here: its lock would have to
 //! be named after the vehicle without keeping its VIN on the device (ADR-256 item 6).
@@ -13,7 +13,11 @@
 //! crashed agent never blocks the restart that follows it. The files are never deleted: a
 //! process that locked a recreated file would not exclude one still holding the old one.
 //!
-//! Locks are always taken in the same order (VCI, then slot), so two jobs that wait on each
+//! On Unix the lock directory must stop users deleting or replacing each other's lock files: a
+//! directory that group or others may write must have the sticky bit, or the guards refuse it
+//! (ADR-257). A directory the guards create is writable by its owner only.
+//!
+//! Locks are always taken in the same order (VCI, then slot when wanted), so two jobs that wait on each
 //! other cannot both hold what the other needs. Waiting polls `try_lock` and stops when the job
 //! is cancelled.
 
@@ -45,14 +49,20 @@ pub enum GuardError {
     Io(#[from] io::Error),
     #[error("the VCI name {0:?} cannot name a lock: it must have 1 to {MAX_VCI_NAME} bytes")]
     InvalidVci(String),
+    #[error(
+        "the lock directory {0} lets other users delete or replace lock files: \
+         give it the sticky bit, or make it writable by its owner only"
+    )]
+    UnsafeDir(PathBuf),
 }
 
-/// The guards one job holds: the per-VCI lock and the reprogramming slot. Dropping it releases
-/// them. It is not `Clone`, so one set of guards serves one run at a time.
+/// The guards one job holds: the per-VCI lock, and for a job that reprograms also the
+/// reprogramming slot. Dropping it releases them. It is not `Clone`, so one set of guards serves
+/// one run at a time.
 #[derive(Debug)]
 pub struct JobGuards {
     _vci: LockFile,
-    _slot: LockFile,
+    _slot: Option<LockFile>,
 }
 
 impl JobGuards {
@@ -64,16 +74,42 @@ impl JobGuards {
         poll: Duration,
         cancelled: &AtomicBool,
     ) -> Result<Self, GuardError> {
-        if setup.vci.is_empty() || setup.vci.len() > MAX_VCI_NAME {
-            return Err(GuardError::InvalidVci(setup.vci.clone()));
-        }
-        fs::create_dir_all(&setup.dir)?;
-        let vci = LockFile::wait(&vci_path(&setup.dir, &setup.vci), poll, cancelled)?;
+        let vci = Self::take_vci(setup, poll, cancelled)?;
         let slot = LockFile::wait(&setup.dir.join("reprogramming.lock"), poll, cancelled)?;
         Ok(Self {
             _vci: vci,
-            _slot: slot,
+            _slot: Some(slot),
         })
+    }
+
+    /// Takes only the per-VCI lock of `setup.vci`, for a job that does not reprogram. Waits and
+    /// validates like [`JobGuards::take`].
+    pub fn take_vci_only(
+        setup: &GuardSetup,
+        poll: Duration,
+        cancelled: &AtomicBool,
+    ) -> Result<Self, GuardError> {
+        Ok(Self {
+            _vci: Self::take_vci(setup, poll, cancelled)?,
+            _slot: None,
+        })
+    }
+
+    /// Whether these guards hold the device's reprogramming slot.
+    pub fn holds_slot(&self) -> bool {
+        self._slot.is_some()
+    }
+
+    fn take_vci(
+        setup: &GuardSetup,
+        poll: Duration,
+        cancelled: &AtomicBool,
+    ) -> Result<LockFile, GuardError> {
+        if setup.vci.is_empty() || setup.vci.len() > MAX_VCI_NAME {
+            return Err(GuardError::InvalidVci(setup.vci.clone()));
+        }
+        prepare_dir(&setup.dir)?;
+        LockFile::wait(&vci_path(&setup.dir, &setup.vci), poll, cancelled)
     }
 }
 
@@ -85,11 +121,7 @@ impl LockFile {
     /// Locks `path`, waiting `poll` (at least 1 ms) between tries while another handle holds it.
     fn wait(path: &Path, poll: Duration, cancelled: &AtomicBool) -> Result<Self, GuardError> {
         let poll = poll.max(Duration::from_millis(1));
-        let file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)?;
+        let file = Self::open(path)?;
         loop {
             if cancelled.load(Ordering::Relaxed) {
                 return Err(GuardError::Cancelled);
@@ -103,7 +135,61 @@ impl LockFile {
     }
 }
 
+impl LockFile {
+    /// Opens the lock file read-only, so a file another user created (with that user's default
+    /// permissions) can be locked as long as it can be read: an OS lock needs no write access.
+    /// Only a missing file is created, atomically: when another process creates it first, the
+    /// read-only open is tried again rather than opening that file for writing.
+    fn open(path: &Path) -> io::Result<File> {
+        let mut tries = 0;
+        loop {
+            match OpenOptions::new().read(true).open(path) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                opened => return opened,
+            }
+            match OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(path)
+            {
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists && tries < 3 => {
+                    tries += 1;
+                }
+                created => return created,
+            }
+        }
+    }
+}
+
 /// Names are hex-encoded, so any VCI name gives a valid, distinct file name.
+/// Creates the lock directory if it is missing, writable by its owner only, and refuses one in
+/// which another user could delete or replace a lock file another job holds: such a file's path
+/// would then name a new file, which a second job could lock at the same time.
+#[cfg(unix)]
+fn prepare_dir(dir: &Path) -> Result<(), GuardError> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o755)
+        .create(dir)?;
+    let mode = fs::metadata(dir)?.permissions().mode();
+    let shared = mode & 0o022 != 0;
+    let sticky = mode & 0o1000 != 0;
+    if shared && !sticky {
+        return Err(GuardError::UnsafeDir(dir.to_owned()));
+    }
+    Ok(())
+}
+
+/// Creates the lock directory if it is missing. Its ACL is the installation's (ADR-257).
+#[cfg(not(unix))]
+fn prepare_dir(dir: &Path) -> Result<(), GuardError> {
+    fs::create_dir_all(dir)?;
+    Ok(())
+}
+
 fn hex(name: &str) -> String {
     name.bytes().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -189,6 +275,67 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// The VCI-only guards hold the VCI lock: a second job on the VCI waits for them.
+    #[test]
+    fn vci_only_guards_hold_the_vci_lock() {
+        let dir = dir("vci-only-wait");
+        let held = JobGuards::take_vci_only(&setup(&dir, "VCI-1"), POLL, &AtomicBool::new(false))
+            .expect("first job");
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let other = setup(&dir, "VCI-1");
+        let waiter = {
+            let cancelled = Arc::clone(&cancelled);
+            std::thread::spawn(move || JobGuards::take_vci_only(&other, POLL, &cancelled))
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!waiter.is_finished(), "the second job must wait");
+        cancelled.store(true, Ordering::Relaxed);
+        let taken = waiter.join().unwrap();
+        assert!(matches!(taken, Err(GuardError::Cancelled)), "{taken:?}");
+
+        let waiter = {
+            let other = setup(&dir, "VCI-1");
+            std::thread::spawn(move || {
+                JobGuards::take_vci_only(&other, POLL, &AtomicBool::new(false))
+            })
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!waiter.is_finished(), "still waiting");
+        drop(held);
+        waiter.join().unwrap().expect("taken once released");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// VCI-only guards leave the reprogramming slot free for a job on another VCI.
+    #[test]
+    fn vci_only_guards_leave_the_slot_free() {
+        let dir = dir("vci-only-slot");
+        let _held = JobGuards::take_vci_only(&setup(&dir, "VCI-1"), POLL, &AtomicBool::new(false))
+            .expect("read job");
+        let writer = JobGuards::take(&setup(&dir, "VCI-2"), POLL, &AtomicBool::new(false))
+            .expect("the slot is free");
+        assert!(writer.holds_slot());
+        drop((writer, _held));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn only_a_full_take_holds_the_slot() {
+        let dir = dir("holds-slot");
+        let never = AtomicBool::new(false);
+        let full = JobGuards::take(&setup(&dir, "VCI-1"), POLL, &never).unwrap();
+        assert!(full.holds_slot());
+        drop(full);
+        let vci_only = JobGuards::take_vci_only(&setup(&dir, "VCI-1"), POLL, &never).unwrap();
+        assert!(!vci_only.holds_slot());
+        assert!(matches!(
+            JobGuards::take_vci_only(&setup(&dir, ""), POLL, &never),
+            Err(GuardError::InvalidVci(_))
+        ));
+        drop(vci_only);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// A cancelled job takes nothing, and leaves the guards free for the next one.
     #[test]
     fn a_cancelled_job_takes_no_guard() {
@@ -197,6 +344,60 @@ mod tests {
         assert!(matches!(taken, Err(GuardError::Cancelled)), "{taken:?}");
         JobGuards::take(&setup(&dir, "VCI-1"), POLL, &AtomicBool::new(false))
             .expect("nothing is held");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A directory group or others may write needs the sticky bit; one the guards create is the
+    /// owner's alone (ADR-257).
+    #[cfg(unix)]
+    #[test]
+    fn a_shared_lock_directory_needs_the_sticky_bit() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = dir("sticky");
+        let never = AtomicBool::new(false);
+        let take = || JobGuards::take_vci_only(&setup(&dir, "VCI-1"), POLL, &never);
+        drop(take().expect("a directory the guards create is safe"));
+        let created = fs::metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(created & 0o022, 0, "{created:o}");
+        for mode in [0o777, 0o775, 0o757] {
+            fs::set_permissions(&dir, fs::Permissions::from_mode(mode)).unwrap();
+            assert!(
+                matches!(take(), Err(GuardError::UnsafeDir(_))),
+                "{mode:o} is refused"
+            );
+        }
+        for mode in [0o1777, 0o1770, 0o755, 0o700] {
+            fs::set_permissions(&dir, fs::Permissions::from_mode(mode)).unwrap();
+            drop(take().unwrap_or_else(|error| panic!("{mode:o} is safe: {error}")));
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A lock file another user created, which this one may only read, still locks (ADR-257).
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_lock_file_still_locks() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = dir("read-only");
+        fs::create_dir_all(&dir).unwrap();
+        let path = vci_path(&dir, "VCI-1");
+        fs::write(&path, b"").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
+        let held = JobGuards::take_vci_only(&setup(&dir, "VCI-1"), POLL, &AtomicBool::new(false))
+            .expect("a readable lock file locks");
+        let cancelled = AtomicBool::new(true);
+        assert!(matches!(
+            LockFile::wait(&path, POLL, &cancelled),
+            Err(GuardError::Cancelled)
+        ));
+        let other = File::open(&path).unwrap();
+        assert!(matches!(
+            other.try_lock(),
+            Err(fs::TryLockError::WouldBlock)
+        ));
+        drop((held, other));
         fs::remove_dir_all(&dir).unwrap();
     }
 

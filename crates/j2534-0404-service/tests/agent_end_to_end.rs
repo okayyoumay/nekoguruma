@@ -11,8 +11,10 @@
 //! spawned service cannot race with another test.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use agent::guards::{GuardSetup, JobGuards};
 use agent::{JobLimits, LinkConfig, run_program};
 use diag_ir::{IR_SCHEMA_VERSION, Op, Program, Value};
 use worker_host::client::ConnectOptions;
@@ -137,6 +139,32 @@ fn agent_job_reads_the_vin_from_sim_vci() {
     drop(config);
 }
 
+/// Guards for one job, in a lock directory of this call's own: the slot is device-wide, so
+/// jobs of parallel tests must not share a directory. `writes` takes the reprogramming slot.
+fn job_guards(writes: bool) -> JobGuards {
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock should be after unix epoch")
+        .as_nanos();
+    let setup = GuardSetup {
+        dir: std::env::temp_dir().join(format!(
+            "agent-e2e-locks-{}-{nanos}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        )),
+        vci: "agent-e2e-vci".to_owned(),
+    };
+    let never = AtomicBool::new(false);
+    let poll = Duration::from_millis(10);
+    if writes {
+        JobGuards::take(&setup, poll, &never)
+    } else {
+        JobGuards::take_vci_only(&setup, poll, &never)
+    }
+    .expect("guards should be free")
+}
+
 async fn run_the_job() {
     let worker = WorkerProcess::launch(
         std::path::Path::new(env!("CARGO_BIN_EXE_j2534-0404-service")),
@@ -157,14 +185,15 @@ async fn run_the_job() {
         .await
         .expect("client should connect");
 
-    let state = run_program(
+    let (state, _guards) = run_program(
         client,
         &LinkConfig::iso15765(0x7E0, 0x7E8),
         program(),
         JobLimits::default(),
+        job_guards(false),
     )
-    .await
-    .expect("the job should finish");
+    .await;
+    let state = state.expect("the job should finish");
 
     let mut vin = vec![0x62, 0xF1, 0x90];
     vin.extend_from_slice(VIN);
@@ -177,7 +206,7 @@ async fn run_the_job() {
 
     // The link of the first job is closed, so the worker can serve the next one. The agent
     // identified `sim-vci` from the module's version, which lets this job write.
-    let state = run_program(
+    let (state, _guards) = run_program(
         worker
             .connect(&ConnectOptions::default())
             .await
@@ -185,9 +214,10 @@ async fn run_the_job() {
         &LinkConfig::iso15765(0x7E0, 0x7E8),
         write_program(),
         JobLimits::default(),
+        job_guards(true),
     )
-    .await
-    .expect("the write job should finish");
+    .await;
+    let state = state.expect("the write job should finish");
     let [Value::Bytes(session), Value::Bytes(routine)] = state.stack.as_slice() else {
         panic!("{state:?}");
     };

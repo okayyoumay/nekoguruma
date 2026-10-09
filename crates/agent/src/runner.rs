@@ -90,6 +90,8 @@ pub enum JobError {
     /// waits for someone on site.
     #[error("the job needs on-site intervention: {0:?}")]
     OnSiteInterventionRequired(OnSiteReason),
+    #[error("the program writes, but its guards do not hold the device's reprogramming slot")]
+    NoReprogrammingSlot,
     #[error("the job thread panicked")]
     Panicked,
 }
@@ -98,14 +100,13 @@ pub enum JobError {
 enum JournalMode {
     /// A first run: the journal is created, and one that exists is an error.
     Create(JournalSetup),
-    /// A job that ran before: its journal is opened and classified (`restart`). The job holds
-    /// its restart guards for the whole run.
-    Resume(JournalSetup, GuardSlot),
+    /// A job that ran before: its journal is opened and classified (`restart`).
+    Resume(JournalSetup),
 }
 
-/// Where a resumed job's guards stay during its run. The job thread keeps a handle, so the
-/// guards outlive the thread even when the caller's future is dropped first; the caller takes
-/// them back once the run ends.
+/// Where a job's guards stay during its run. The job thread keeps a handle, so the guards
+/// outlive the thread even when the caller's future is dropped first; the caller takes them
+/// back once the run ends.
 type GuardSlot = Arc<Mutex<Option<JobGuards>>>;
 
 /// The checks [`run_program`] makes before it touches the worker: the program's schema version and
@@ -143,19 +144,29 @@ fn refuse_beyond(program: &Program, permission: Permission) -> Result<(), JobErr
 ///
 /// The program is checked against [`policy::build_ceiling`] before anything opens and against
 /// the link's own permission once the VCI is known (ADR-247).
+///
+/// `guards` are the job's guards (`guards::JobGuards`, ADR-256, ADR-257, design 8.8.1). The
+/// caller takes them before it calls: `JobGuards::take` for a program that writes
+/// (`policy::writes`), `JobGuards::take_vci_only` for one that only reads. A writing program on
+/// guards without the reprogramming slot ends in [`JobError::NoReprogrammingSlot`], checked
+/// with the policy before anything opens. The run takes the guards by value, so two runs can
+/// never use one set at once, holds them until the link is closed, and returns them with its
+/// result. A dropped future releases them only once the job thread has ended.
 pub async fn run_program(
     client: WorkerClient,
     config: &LinkConfig,
     program: Program,
     limits: JobLimits,
-) -> Result<VmState, JobError> {
-    run_program_within(
+    guards: JobGuards,
+) -> (Result<VmState, JobError>, JobGuards) {
+    run_guarded(
         client,
         config,
         program,
         limits,
         policy::build_ceiling(),
         None,
+        guards,
     )
     .await
 }
@@ -165,21 +176,24 @@ pub async fn run_program(
 /// link is open and the policy allows the program, before anything is sent to the ECU, and the
 /// runner commits to it at the plan's boundaries (`journaling`). A commit that fails ends the
 /// job before the request it guards is sent. A program without a plan keeps no journal and
-/// creates no file.
+/// creates no file. `guards` are taken and returned as for [`run_program`]; a program with a
+/// plan writes, so they must hold the reprogramming slot (`JobGuards::take`).
 pub async fn run_program_journaled(
     client: WorkerClient,
     config: &LinkConfig,
     program: Program,
     limits: JobLimits,
     journal: JournalSetup,
-) -> Result<VmState, JobError> {
-    run_program_within(
+    guards: JobGuards,
+) -> (Result<VmState, JobError>, JobGuards) {
+    run_guarded(
         client,
         config,
         program,
         limits,
         policy::build_ceiling(),
         Some(JournalMode::Create(journal)),
+        guards,
     )
     .await
 }
@@ -198,17 +212,14 @@ pub async fn run_program_journaled(
 /// - a journal that rules a restart out, or a missing or unreadable one for a program with a
 ///   plan, ends the job the same way, also with nothing sent.
 ///
-/// `guards` are the job's restart guards (`guards::JobGuards`, ADR-256): the per-VCI lock and
-/// the reprogramming slot, held before anything goes through the VCI (ADR-229 item 2 step 1).
-/// The run takes them by value, so two runs can never use one set at once, and returns them
-/// with its result. After an agent crash or a loss of the device's power, the new run takes
-/// them with `JobGuards::take` before it calls this, waiting while another job holds them, so a
-/// duplicate resume of the same job waits there without opening a link. A job that survives a
-/// worker crash, a VCI disconnect or a loss of the vehicle's supply alone passes the guards it
-/// got back to its next run. A dropped future releases them only once the job thread has
-/// ended. The journal's writer lock is held while the job runs as well, so a second writer of
-/// the same journal ends in `JobError::Journal(JournalError::InUse)` with nothing sent
-/// (ADR-255). The start deadline and a server reservation are not taken here.
+/// `guards` are taken and returned as for [`run_program`]. After an agent crash or a loss of the
+/// device's power, the new run takes them with `JobGuards::take` before it calls this, waiting
+/// while another job holds them, so a duplicate resume of the same job waits there without
+/// opening a link. A job that survives a worker crash, a VCI disconnect or a loss of the
+/// vehicle's supply alone passes the guards it got back to its next run. The journal's writer
+/// lock is held while the job runs as well, so a second writer of the same journal ends in
+/// `JobError::Journal(JournalError::InUse)` with nothing sent (ADR-255). The start deadline and
+/// a server reservation are not taken here.
 pub async fn resume_program_journaled(
     client: WorkerClient,
     config: &LinkConfig,
@@ -217,14 +228,38 @@ pub async fn resume_program_journaled(
     journal: JournalSetup,
     guards: JobGuards,
 ) -> (Result<VmState, JobError>, JobGuards) {
+    run_guarded(
+        client,
+        config,
+        program,
+        limits,
+        policy::build_ceiling(),
+        Some(JournalMode::Resume(journal)),
+        guards,
+    )
+    .await
+}
+
+/// Puts `guards` in a slot, runs the job with it and takes the guards back, so every entry
+/// point returns them with its result.
+async fn run_guarded(
+    client: WorkerClient,
+    config: &LinkConfig,
+    program: Program,
+    limits: JobLimits,
+    ceiling: Permission,
+    journal: Option<JournalMode>,
+    guards: JobGuards,
+) -> (Result<VmState, JobError>, JobGuards) {
     let slot: GuardSlot = Arc::new(Mutex::new(Some(guards)));
     let result = run_program_within(
         client,
         config,
         program,
         limits,
-        policy::build_ceiling(),
-        Some(JournalMode::Resume(journal, Arc::clone(&slot))),
+        ceiling,
+        journal,
+        Arc::clone(&slot),
     )
     .await;
     let guards = slot
@@ -243,12 +278,22 @@ async fn run_program_within(
     limits: JobLimits,
     ceiling: Permission,
     journal: Option<JournalMode>,
+    guards: GuardSlot,
 ) -> Result<VmState, JobError> {
     let handle = Handle::current();
     if handle.runtime_flavor() == RuntimeFlavor::CurrentThread {
         return Err(JobError::CurrentThreadRuntime);
     }
     check_program(&program, ceiling)?;
+    // A program that writes needs the device's reprogramming slot (design 8.8.1, ADR-257).
+    let holds_slot = guards
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(JobGuards::holds_slot);
+    if policy::writes(&program) && !holds_slot {
+        return Err(JobError::NoReprogrammingSlot);
+    }
     let config = config.clone();
 
     let cancel = CancelOnDrop(Arc::new(AtomicBool::new(false)));
@@ -256,7 +301,7 @@ async fn run_program_within(
     tokio::task::spawn_blocking(move || {
         std::panic::catch_unwind(AssertUnwindSafe(|| {
             run_job(
-                handle, client, &config, &program, limits, &cancelled, journal,
+                handle, client, &config, &program, limits, &cancelled, journal, guards,
             )
         }))
         .unwrap_or(Err(JobError::Panicked))
@@ -273,6 +318,10 @@ async fn run_program_within(
 }
 
 /// The whole job, on the blocking thread: open, run, close.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the job's whole input, split only by what the caller owns"
+)]
 fn run_job(
     handle: Handle,
     mut client: WorkerClient,
@@ -281,17 +330,15 @@ fn run_job(
     limits: JobLimits,
     cancelled: &AtomicBool,
     journal: Option<JournalMode>,
+    guards: GuardSlot,
 ) -> Result<VmState, JobError> {
+    // The job's guards stay held until the end of this function, after the link is closed:
+    // declared first, this handle is dropped last, so even a caller whose future is gone
+    // cannot hand the VCI to another job while this one still tears its link down.
+    let _guards = guards;
     if cancelled.load(Ordering::Relaxed) {
         return Err(JobError::Cancelled);
     }
-    // A resumed job's guards stay held until the end of this function, after the link is
-    // closed: declared first, this handle is dropped last, so even a caller whose future is gone
-    // cannot hand the VCI to another job while this one still tears its link down.
-    let _guards: Option<GuardSlot> = match &journal {
-        Some(JournalMode::Resume(_, slot)) => Some(Arc::clone(slot)),
-        _ => None,
-    };
     let timings = Timings::for_link(config);
     let link = handle
         .block_on(link::open(&mut client, config, timings.unary))
@@ -310,7 +357,7 @@ fn run_job(
             let mut journal = JobJournal::create(setup)?;
             run_on(program, &mut host, limits, cancelled, Some(&mut journal))
         }
-        Some(JournalMode::Resume(setup, _)) => resume_on(
+        Some(JournalMode::Resume(setup)) => resume_on(
             program,
             &mut host,
             limits,
@@ -1765,6 +1812,7 @@ mod tests {
             key: job_key(),
             sources: identity_sources(),
         };
+        let slot = vci_only_slot("link-fails");
         let result = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -1780,6 +1828,7 @@ mod tests {
                         JobLimits::default(),
                         &AtomicBool::new(false),
                         Some(JournalMode::Create(setup)),
+                        slot,
                     )
                 })
                 .await
@@ -1812,6 +1861,54 @@ mod tests {
             dir: dir.join("locks"),
             vci: "VCI-1".to_owned(),
         }
+    }
+
+    /// A slot holding VCI-only guards in a lock directory of its own, for a test that calls
+    /// `run_job` directly.
+    fn vci_only_slot(tag: &str) -> GuardSlot {
+        Arc::new(Mutex::new(Some(vci_only_guards(tag))))
+    }
+
+    fn vci_only_guards(tag: &str) -> JobGuards {
+        let dir = std::env::temp_dir().join(format!(
+            "ngr-runner-guards-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        JobGuards::take_vci_only(
+            &crate::guards::GuardSetup {
+                dir,
+                vci: "VCI-1".to_owned(),
+            },
+            Duration::from_millis(1),
+            &AtomicBool::new(false),
+        )
+        .unwrap()
+    }
+
+    /// Guards with the reprogramming slot, in a lock directory of their own.
+    #[cfg(debug_assertions)]
+    fn full_guards(tag: &str) -> JobGuards {
+        let dir = std::env::temp_dir().join(format!(
+            "ngr-runner-full-guards-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        JobGuards::take(
+            &crate::guards::GuardSetup {
+                dir,
+                vci: "VCI-1".to_owned(),
+            },
+            Duration::from_millis(1),
+            &AtomicBool::new(false),
+        )
+        .unwrap()
     }
 
     fn take_guards(dir: &std::path::Path) -> JobGuards {
@@ -1848,7 +1945,8 @@ mod tests {
                         &program,
                         JobLimits::default(),
                         &cancelled,
-                        Some(JournalMode::Resume(setup, job_slot)),
+                        Some(JournalMode::Resume(setup)),
+                        job_slot,
                     )
                 })
                 .await
@@ -1959,6 +2057,7 @@ mod tests {
             sources: identity_sources(),
         };
         // Fails when the link opens, before the journal would be created: no file appears.
+        let slot = vci_only_slot("no-journal");
         let result = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -1974,6 +2073,7 @@ mod tests {
                         JobLimits::default(),
                         &AtomicBool::new(false),
                         Some(JournalMode::Create(setup)),
+                        slot,
                     )
                 })
                 .await
@@ -2427,13 +2527,14 @@ mod tests {
             Op::ServiceRequest { service: 0x22 },
             Op::ServiceRequest { service: 0x2E },
         ];
-        let result = run_program_within(
+        let (result, _guards) = run_guarded(
             unreachable_client(),
             &LinkConfig::iso15765(0x7E0, 0x7E8),
             program(code.clone()),
             JobLimits::default(),
             Permission::ReadOnly,
             None,
+            vci_only_guards("refused"),
         )
         .await;
         assert!(
@@ -2447,13 +2548,14 @@ mod tests {
             "{result:?}"
         );
         // Without the check, the same job reaches the worker.
-        let result = run_program_within(
+        let (result, _guards) = run_guarded(
             unreachable_client(),
             &LinkConfig::iso15765(0x7E0, 0x7E8),
             program(two_requests()[..2].to_vec()),
             JobLimits::default(),
             Permission::ReadOnly,
             None,
+            vci_only_guards("reads"),
         )
         .await;
         assert!(matches!(result, Err(JobError::Link(_))), "{result:?}");
@@ -2470,25 +2572,73 @@ mod tests {
                 sub: 1,
             },
         ];
-        let result = run_program_within(
+        let (result, _guards) = run_guarded(
             unreachable_client(),
             &LinkConfig::iso15765(0x7E0, 0x7E8),
             program(code.clone()),
             JobLimits::default(),
             Permission::Simulator,
             None,
+            full_guards("sim-ceiling"),
         )
         .await;
         assert!(matches!(result, Err(JobError::Link(_))), "{result:?}");
         // The public entry point uses the build's ceiling, which a debug build sets to it.
-        let result = run_program(
+        let (result, _guards) = run_program(
             unreachable_client(),
             &LinkConfig::iso15765(0x7E0, 0x7E8),
             program(code),
             JobLimits::default(),
+            full_guards("sim-public"),
         )
         .await;
         assert!(matches!(result, Err(JobError::Link(_))), "{result:?}");
+    }
+
+    /// A program that writes needs the reprogramming slot: on VCI-only guards it ends before
+    /// anything opens, and the guards come back.
+    #[cfg(debug_assertions)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_writing_program_on_vci_only_guards_is_refused() {
+        let (result, guards) = run_program(
+            unreachable_client(),
+            &LinkConfig::iso15765(0x7E0, 0x7E8),
+            flash_program(),
+            JobLimits::default(),
+            vci_only_guards("no-slot"),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(JobError::NoReprogrammingSlot)),
+            "{result:?}"
+        );
+        assert!(!guards.holds_slot());
+        // With the slot, the same program gets past the check and reaches the link.
+        let (result, guards) = run_program(
+            unreachable_client(),
+            &LinkConfig::iso15765(0x7E0, 0x7E8),
+            flash_program(),
+            JobLimits::default(),
+            full_guards("with-slot"),
+        )
+        .await;
+        assert!(matches!(result, Err(JobError::Link(_))), "{result:?}");
+        assert!(guards.holds_slot());
+    }
+
+    /// A program that only reads runs on VCI-only guards.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_read_only_program_runs_on_vci_only_guards() {
+        let (result, guards) = run_program(
+            unreachable_client(),
+            &LinkConfig::iso15765(0x7E0, 0x7E8),
+            program(two_requests()[..2].to_vec()),
+            JobLimits::default(),
+            vci_only_guards("read-only"),
+        )
+        .await;
+        assert!(matches!(result, Err(JobError::Link(_))), "{result:?}");
+        assert!(!guards.holds_slot());
     }
 
     #[test]
@@ -2515,6 +2665,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_job_cancelled_before_it_starts_never_reaches_the_worker() {
         let handle = Handle::current();
+        let slot = vci_only_slot("cancelled");
         let result = tokio::task::spawn_blocking(move || {
             let config = LinkConfig::iso15765(0x7E0, 0x7E8);
             let program = program(two_requests());
@@ -2527,6 +2678,7 @@ mod tests {
                 JobLimits::default(),
                 &AtomicBool::new(true),
                 None,
+                slot,
             )
         })
         .await
@@ -2547,15 +2699,14 @@ mod tests {
     async fn a_current_thread_runtime_is_refused() {
         // Refused before the client is used.
         let client = unreachable_client();
-        assert!(matches!(
-            run_program(
-                client,
-                &LinkConfig::iso15765(0x7E0, 0x7E8),
-                program(Vec::new()),
-                JobLimits::default()
-            )
-            .await,
-            Err(JobError::CurrentThreadRuntime)
-        ));
+        let (result, _guards) = run_program(
+            client,
+            &LinkConfig::iso15765(0x7E0, 0x7E8),
+            program(Vec::new()),
+            JobLimits::default(),
+            vci_only_guards("current-thread"),
+        )
+        .await;
+        assert!(matches!(result, Err(JobError::CurrentThreadRuntime)));
     }
 }

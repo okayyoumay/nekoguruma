@@ -18,8 +18,10 @@
 //! spawned service cannot race with another test.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use agent::guards::{GuardSetup, JobGuards};
 use agent::inputs::{Encoding, ServiceField, ServiceSources};
 use agent::journal::{JobKey, Journal};
 use agent::{JobLimits, JournalSetup, LinkConfig, run_program_journaled};
@@ -248,6 +250,32 @@ fn agent_job_downloads_more_blocks_than_the_counter_holds() {
     assert!(exit.complete);
 }
 
+/// Guards for one job, in a lock directory of this call's own: the slot is device-wide, so
+/// jobs of parallel tests must not share a directory. `writes` takes the reprogramming slot.
+fn job_guards(writes: bool) -> JobGuards {
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock should be after unix epoch")
+        .as_nanos();
+    let setup = GuardSetup {
+        dir: std::env::temp_dir().join(format!(
+            "agent-flash-locks-{}-{nanos}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        )),
+        vci: "agent-flash-vci".to_owned(),
+    };
+    let never = AtomicBool::new(false);
+    let poll = Duration::from_millis(10);
+    if writes {
+        JobGuards::take(&setup, poll, &never)
+    } else {
+        JobGuards::take_vci_only(&setup, poll, &never)
+    }
+    .expect("guards should be free")
+}
+
 async fn run_the_job(journal_dir: PathBuf) {
     let worker = WorkerProcess::launch(
         std::path::Path::new(env!("CARGO_BIN_EXE_j2534-0404-service")),
@@ -263,7 +291,7 @@ async fn run_the_job(journal_dir: PathBuf) {
     .await
     .expect("worker should launch");
 
-    let state = run_program_journaled(
+    let (state, _guards) = run_program_journaled(
         worker
             .connect(&ConnectOptions::default())
             .await
@@ -276,9 +304,10 @@ async fn run_the_job(journal_dir: PathBuf) {
             key: job_key(),
             sources: identity_sources(),
         },
+        job_guards(true),
     )
-    .await
-    .expect("the download job should finish");
+    .await;
+    let state = state.expect("the download job should finish");
     // RequestTransferExit is positive only when every block, in counter order across the wrap
     // from 0xFF to 0x00, arrived.
     assert_eq!(

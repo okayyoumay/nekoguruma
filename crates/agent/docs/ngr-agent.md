@@ -7,7 +7,7 @@ server or take jobs from it.
 ## `ngr-agent run`
 
 ```sh
-ngr-agent run --vci <name> --program <file> [--workers <dir>] [--tx-id <hex>] [--rx-id <hex>]
+ngr-agent run --vci <name> --program <file> [--workers <dir>] [--locks <dir>] [--tx-id <hex>] [--rx-id <hex>]
 ```
 
 | Option | Meaning |
@@ -15,12 +15,13 @@ ngr-agent run --vci <name> --program <file> [--workers <dir>] [--tx-id <hex>] [-
 | `--vci` | J2534 v04.04 library name, as the worker service resolves it (registry key on Windows, `library_path` entry in the service's `config.toml`) |
 | `--program` | IR program file: a `diag_ir::Program` serialized as JSON |
 | `--workers` | Directory of worker builds, laid out as `<dir>/<ABI name>/j2534-0404-service[.exe]` (design 7.3). Default: `workers` next to the `ngr-agent` executable |
+| `--locks` | The device's lock directory for the job's guards ("Job guards" below), as an absolute path. Default: `locks` next to the `ngr-agent` executable. Lock files are opened read-only, so a file another user created still locks. The agent creates a missing directory writable by its owner only, so a device whose agents run as several users needs it prepared beforehand: writable by all of them, and with the sticky bit (or an equivalent ACL) so that no user can delete another's lock files (ADR-257). On Unix a directory that group or others may write without the sticky bit is refused |
 | `--tx-id`, `--rx-id` | Physical request and response CAN IDs in hex, with or without `0x`. Default `7E0` / `7E8`. Only 11-bit IDs: the link does not set the CAN ID format |
 
 The link is UDS on ISO 15765 at 500 kbit/s (`LinkConfig::iso15765`), with the CAN IDs from the
 command line rather than from the program.
 
-Steps (`agent::check_program`, `agent::launch::launch_j2534_worker`, then `agent::run_program`):
+Steps (`agent::check_program`, `agent::guards::JobGuards`, `agent::launch::launch_j2534_worker`, then `agent::run_program`):
 
 1. Read the program and check it (`agent::check_program`): a program whose schema version or
    size this VM does not accept, one whose restart declaration `Program::validate` refuses
@@ -28,7 +29,10 @@ Steps (`agent::check_program`, `agent::launch::launch_j2534_worker`, then `agent
    read-only requests; ADR-235 item 8, ADR-247), fails here,
    before any worker starts. A bad operand, such as a missing constant, fails only when the VM
    reaches it, after the worker has started.
-2. Resolve the VCI name the way each worker build would resolve it on its side
+2. Take the job's guards from the `--locks` directory, named by `--vci` ("Job guards" below):
+   the per-VCI lock, plus the reprogramming slot when the program writes (`policy::writes`).
+   The run waits here while another job on the device holds them.
+3. Resolve the VCI name the way each worker build would resolve it on its side
    (`j2534_0404_registry`): a `library_path` entry in `config.toml` under that build's
    architecture key, else at api level, else the build's registry view. The first build whose
    library header (`worker_host::abi::detect_file`) matches the build's own ABI is chosen, so
@@ -39,13 +43,13 @@ Steps (`agent::check_program`, `agent::launch::launch_j2534_worker`, then `agent
    - Windows x86 agent: the x86 build only, so a 64-bit library is not found.
    - Linux: one lookup without an architecture key; the registry does not apply, so the
      library needs a `library_path` entry, and the build follows the header's ABI.
-3. Pick the service build for that ABI with `WorkerLayout::find`. A missing build fails as
+4. Pick the service build for that ABI with `WorkerLayout::find`. A missing build fails as
    `UNSUPPORTED_ABI`.
-4. Launch the service with the library name and the ABI's default `long_size` (design 7.1.2;
+5. Launch the service with the library name and the ABI's default `long_size` (design 7.1.2;
    always the default, whatever a registration definition declares), provision its
    auth key and connect the gRPC client (design 7.4).
-5. Run the program under the request policy and the default job limits (ADR-235), then stop
-   the worker. The policy is read-only, except that a debug build may send any request once
+6. Run the program under the request policy and the default job limits (ADR-235), then stop
+   the worker and release the guards. The policy is read-only, except that a debug build may send any request once
    the worker's VCI has identified itself as `sim-vci` (ADR-247); a program that needs more
    than the VCI allows is refused after the link opens, before its first instruction runs.
    On that permission the `FlashTransfer` instruction also works (ADR-250); `SecurityAccess`
@@ -105,7 +109,8 @@ changes the file. The journal only records; committing an intent marker before t
 commit fails, are the job runner's duties.
 
 `agent::run_program_journaled` is the runner that keeps it (ADR-252). It takes a
-`JournalSetup` (directory, job key, and the `ServiceSources` table for the ECU's identity) and,
+`JournalSetup` (directory, job key, and the `ServiceSources` table for the ECU's identity) and
+the job's guards ("Job guards" below), which it returns with the result, and,
 for a program with a flash recovery plan, creates the journal once the link is open and the
 policy allows the program, before anything is sent to the ECU; a program without a plan keeps
 none. A journal that already exists ends the job with nothing sent: a job that ran before goes
@@ -159,9 +164,8 @@ plan's entry; otherwise, or for a stage the program does not declare, the decisi
 
 ## Restart entry
 
-`agent::resume_program_journaled` takes the arguments of `run_program_journaled` and the job's
-restart guards (`JobGuards`, "Restart guards" below), for a job that ran before (ADR-255), and
-returns the guards with its result.
+`agent::resume_program_journaled` takes the same arguments as `run_program_journaled`,
+guards included, for a job that ran before (ADR-255), and returns the guards with its result.
 Once the link is open and the policy allows the program, and before anything is sent to the
 ECU, it opens the job's journal (`Journal::open`) and classifies it.
 
@@ -187,10 +191,10 @@ at the limit. A second resume of a job whose journal another run holds ends in
 deadline (a server's job instruction carries it) and a server reservation are not part of this
 entry.
 
-## Restart guards
+## Job guards
 
-The `guards` module holds a job's exclusive locks on the device (design 8.8, 8.8.1; ADR-256):
-the per-VCI lock and the device's single reprogramming slot. Each is an OS lock
+The `guards` module holds a job's exclusive locks on the device (design 8.8, 8.8.1; ADR-256,
+ADR-257): the per-VCI lock and the device's single reprogramming slot. Each is an OS lock
 (`File::try_lock`) on a file in the device's lock directory: `vci-{hex name}.lock` and
 `reprogramming.lock`. The per-vehicle lock is not here: its file must not carry the VIN
 (ADR-256 item 6). The OS
@@ -198,20 +202,31 @@ releases a lock when its process dies, so a crashed run never blocks the next on
 files are never deleted.
 
 - `JobGuards::take(GuardSetup { dir, vci }, poll, cancelled)` takes the per-VCI lock, then the
-  slot. It waits while another job holds either, retrying every `poll`, and stops on a cancel
-  (`GuardError::Cancelled`).
+  slot, for a job that writes (`policy::writes`). It waits while another job holds either,
+  retrying every `poll`, and stops on a cancel (`GuardError::Cancelled`).
+- `JobGuards::take_vci_only(...)` takes the per-VCI lock alone, for a job that only reads, so
+  reads on other VCIs go on while a job reprograms. `JobGuards::holds_slot` tells the two
+  apart.
 - Locks are always taken in the order VCI, then slot, and held until the `JobGuards` is
   dropped.
 
-`resume_program_journaled` takes the guards by value and returns them with the run's result,
-so two runs can never use one set at once. A new run after an agent crash or a loss of the
+Every entry point (`run_program`, `run_program_journaled`, `resume_program_journaled`) takes
+the guards by value and returns them with the run's result, so two runs can never use one set
+at once. A program that writes and that this build allows (a debug build, on the simulator),
+run on guards without the slot, ends in `JobError::NoReprogrammingSlot` before anything opens;
+a release build refuses every writing program first (`JobError::Refused`). A new run after an agent crash or a loss of the
 device's power takes them with `JobGuards::take` before it calls the runner, so a duplicate
 resume of the same job waits there without opening a link. A dropped future releases them only
 once the job thread has ended. A job that survives a worker crash, a VCI disconnect or a loss
 of the vehicle's supply alone gets them back, still held, and passes them to its next run. A
 VCI name has 1 to `MAX_VCI_NAME` (100) bytes. The lock directory is one per device,
-shared by every agent process on it whichever user it runs as, and its files must be writable
-by all of them. `run_program` and `run_program_journaled` take no guards.
+shared by every agent process on it whichever user it runs as: each of them must be able to
+create files in it and read the lock files there (lock files are opened read-only). On Unix
+the guards refuse a directory that group or others may write unless it has the sticky bit
+(`GuardError::UnsafeDir`): another user could otherwise delete a lock file a job holds, and a
+second job would lock the new file at the same path. A directory the guards create is writable
+by its owner only. `ngr-agent run` takes the guards from `--locks` and `--vci` before it runs the
+program, and holds them until the run ends.
 
 ## Restart inputs
 

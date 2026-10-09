@@ -11,8 +11,10 @@
 //! service cannot race with another test.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use agent::guards::{GuardSetup, JobGuards};
 use agent::{HostError, JobError, JobLimits, LinkConfig, run_program};
 use diag_ir::{IR_SCHEMA_VERSION, Op, Program, Value, VmState};
 use worker_host::client::{ConnectOptions, WorkerClient};
@@ -94,8 +96,42 @@ fn read_vin() -> Program {
     }
 }
 
+/// Guards for one job, in a lock directory of this call's own: the slot is device-wide, so
+/// jobs of parallel tests must not share a directory. `writes` takes the reprogramming slot.
+fn job_guards(writes: bool) -> JobGuards {
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock should be after unix epoch")
+        .as_nanos();
+    let setup = GuardSetup {
+        dir: std::env::temp_dir().join(format!(
+            "rc78-locks-{}-{nanos}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        )),
+        vci: "rc78-vci".to_owned(),
+    };
+    let never = AtomicBool::new(false);
+    let poll = Duration::from_millis(10);
+    if writes {
+        JobGuards::take(&setup, poll, &never)
+    } else {
+        JobGuards::take_vci_only(&setup, poll, &never)
+    }
+    .expect("guards should be free")
+}
+
 async fn run(client: &WorkerClient, config: &LinkConfig) -> Result<VmState, JobError> {
-    run_program(client.clone(), config, read_vin(), JobLimits::default()).await
+    let (result, _guards) = run_program(
+        client.clone(),
+        config,
+        read_vin(),
+        JobLimits::default(),
+        job_guards(false),
+    )
+    .await;
+    result
 }
 
 #[test]

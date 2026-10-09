@@ -244,15 +244,16 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-252](ADR-252-job-runner-journals-at-plan-boundaries.md) | The Job Runner Journals at the Flash Recovery Plan's Boundaries | Accepted (item 2's open point decided by ADR-253) | `agent` runner, journaling, inputs |
 | [ADR-253](ADR-253-restart-classification-and-the-recovery-point-intent.md) | Restart Classification and a Write-Ahead Intent at the Recovery-Required Point | Accepted (item 4's wiring into the runner decided by ADR-255) | `agent` restart, journaling, journal |
 | [ADR-254](ADR-254-starlark-for-proprietary-procedures.md) | Starlark Replaces JavaScript as the Proprietary Procedure Language | Accepted | `diag-frontend` subset spec, design 8.4, `ir.fbs` `source_format` |
-| [ADR-255](ADR-255-restart-entry-in-the-job-runner.md) | The Restart Entry in the Job Runner | Accepted (item 5's "locks not taken" and the duplicate-resume consequence superseded by ADR-256; item 5's "nothing sent to the ECU" superseded by ADR-261) | `agent` runner, restart, journaling |
+| [ADR-255](ADR-255-restart-entry-in-the-job-runner.md) | The Restart Entry in the Job Runner | Accepted (item 5's "locks not taken" and the duplicate-resume consequence superseded by ADR-256; item 5's "nothing sent to the ECU" superseded by ADR-261; item 5's teardown that does not run superseded by ADR-264) | `agent` runner, restart, journaling |
 | [ADR-256](ADR-256-restart-guards-as-os-file-locks.md) | Restart Guards as OS Locks on Files in a Device Lock Directory | Accepted (the first-run consequence and item 1's write access to lock files superseded by ADR-257; the failed-close consequence superseded by ADR-258; item 6's per-vehicle lock settled by ADR-262) | `agent` guards, runner |
 | [ADR-257](ADR-257-every-job-runs-on-guards.md) | Every Job Runs on Guards It Holds | Accepted (lock files must be regular files since ADR-262 item 6) | `agent` guards, runner, policy, CLI |
 | [ADR-258](ADR-258-a-failed-link-close-keeps-the-job-guards.md) | A Failed Link Close Keeps the Job Guards | Accepted | `agent` guards, runner, CLI; `worker-host` |
 | [ADR-259](ADR-259-a-standalone-agent-refuses-security-access.md) | A Standalone Agent Refuses the SecurityAccess Instruction | Accepted | `agent` policy, host |
 | [ADR-260](ADR-260-sim-vci-stays-separate-from-the-j2534-mock.md) | `sim-vci` Stays Separate from `j2534-0404-mock` | Accepted | `sim-vci`, `j2534-0404-mock` |
-| [ADR-261](ADR-261-restart-identity-and-safety-gates.md) | The Restart's Identity and Safety Gates | Accepted (the promotion consequence settled by ADR-263) | `agent` restart, runner, journaling |
+| [ADR-261](ADR-261-restart-identity-and-safety-gates.md) | The Restart's Identity and Safety Gates | Accepted (the promotion consequence settled by ADR-263; item 2's ending with the gates' decision superseded by ADR-264) | `agent` restart, runner, journaling |
 | [ADR-262](ADR-262-per-vehicle-lock-in-fixed-buckets.md) | The Per-Vehicle Lock Is One of 4096 Fixed Bucket Files | Accepted | `agent` guards |
 | [ADR-263](ADR-263-restart-promotes-to-the-per-vehicle-lock.md) | The Restart Promotes to the Per-Vehicle Lock at Its VIN Match | Accepted | `agent` restart, runner |
+| [ADR-264](ADR-264-restart-teardown.md) | The Restart's Teardown Sends One Hard Reset or Waits Out the Session | Accepted | `agent` restart, runner; `sim-ecu` |
 
 ## Status Legend
 
@@ -599,14 +600,15 @@ the predecessor repository these ADRs came from.
 - ADR-250
 - ADR-252 (item 2's open point decided by ADR-253)
 - ADR-253 (item 4's wiring into the runner decided by ADR-255)
-- ADR-255 (item 5's "locks not taken" and the duplicate-resume consequence superseded by ADR-256; item 5's "nothing sent to the ECU" superseded by ADR-261)
+- ADR-255 (item 5's "locks not taken" and the duplicate-resume consequence superseded by ADR-256; item 5's "nothing sent to the ECU" superseded by ADR-261; item 5's teardown that does not run superseded by ADR-264)
 - ADR-256 (the first-run consequence and item 1's write access to lock files superseded by ADR-257; the failed-close consequence superseded by ADR-258; item 6's per-vehicle lock settled by ADR-262)
 - ADR-257 (lock files must be regular files since ADR-262 item 6)
 - ADR-258
 - ADR-259
-- ADR-261 (the promotion consequence settled by ADR-263)
+- ADR-261 (the promotion consequence settled by ADR-263; item 2's ending with the gates' decision superseded by ADR-264)
 - ADR-262
 - ADR-263
+- ADR-264
 
 ### Diagnostic IR
 - ADR-233 (item 3's `VmState` fields removed by ADR-245)

@@ -30,8 +30,10 @@ use crate::restart::{self, OnSiteReason, RestartDecision};
 pub struct JobLimits {
     /// Steps after which the job is stopped, against a procedure that never ends.
     pub max_steps: u64,
-    /// Pause between polls of a `Wait` instruction, and between attempts of a restart's wait for
-    /// the per-vehicle lock (ADR-263); at least 1 ms is used.
+    /// Pause between polls of a `Wait` instruction, between attempts of a restart's wait for
+    /// the per-vehicle lock (ADR-263), and between the cancel checks of a restart's passive
+    /// teardown (ADR-264), so it also bounds how late those waits see a cancel; at least 1 ms is
+    /// used.
     pub wait_poll: Duration,
 }
 
@@ -241,9 +243,14 @@ pub async fn run_program_journaled(
 ///   [`JobError::VehicleLock`], still with nothing sent that changes the ECU. The lock stays in
 ///   the guards, which come back with the result (`JobGuards::holds_vehicle`); guards that
 ///   already hold the job's vehicle go on at once. A VIN that is not established or differs
-///   takes no lock. The rest of the restart order does not run in this agent, so the job
-///   then ends in [`JobError::OnSiteInterventionRequired`] (`RestartOrderUnavailable`, carrying
-///   the gates' decision), or in [`JobError::IdentityMismatch`] when the ECU's VIN is another
+///   takes no lock. Then `restart::teardown` ends the interrupted download (step 2b-1,
+///   ADR-264): it sends one ECUReset when the gates allow it and the journal shows no
+///   RequestTransferExit intent, and otherwise waits out the plan's session timeout plus
+///   margin, sending nothing (a cancel during the wait is [`JobError::Cancelled`]); a journal
+///   with the post-transfer steps complete gets neither. The rest of the restart order (the
+///   default-session confirmation and on) does not run in this agent, so the job then ends in
+///   [`JobError::OnSiteInterventionRequired`] (`RestartOrderUnavailable`, carrying the
+///   teardown's outcome), or in [`JobError::IdentityMismatch`] when the ECU's VIN is another
 ///   vehicle's;
 /// - a journal that rules a restart out, or a missing or unreadable one for a program with a
 ///   plan, ends the job in on-site intervention with nothing sent.
@@ -524,7 +531,8 @@ impl Drop for CancelOnDrop {
 /// Goes on with a job from its journal as `Journal::open` gave it (ADR-255; see
 /// [`resume_program_journaled`]). Nothing is sent to the ECU before the classification and the
 /// checks of `restart::check_before_ecu` passed; then `restart::check_gates` sends only
-/// ReadDataByIdentifier requests (ADR-229 item 2 step 2). `vin` is the job's target VIN. Once
+/// ReadDataByIdentifier requests (ADR-229 item 2 step 2), and `restart::teardown` sends at most
+/// one ECUReset (step 2b-1, ADR-264). `vin` is the job's target VIN. Once
 /// the ECU's VIN matched it, the gates promote `guards` to the per-vehicle lock (ADR-263; see
 /// [`promote_to_vehicle`]).
 #[expect(
@@ -583,10 +591,18 @@ where
             let mut journal = opened?;
             restart::check_before_ecu(program, &point, &mut journal, host, cancelled)?;
             let poll = limits.wait_poll.max(Duration::from_millis(1));
-            let teardown =
-                restart::check_gates(program, &point, &sources, host, cancelled, |vin| {
-                    promote_to_vehicle(guards, vin, poll, cancelled)
-                })?;
+            let gate = restart::check_gates(program, &point, &sources, host, cancelled, |vin| {
+                promote_to_vehicle(guards, vin, poll, cancelled)
+            })?;
+            // `classify` took the point from one of the program's plans.
+            let plan = program
+                .flash
+                .iter()
+                .find(|plan| plan.flash_session == point.flash_session)
+                .ok_or(JobError::Journal(JournalError::Invariant(
+                    "the restart point names no plan of the program",
+                )))?;
+            let teardown = restart::teardown(gate, &point, &plan.timing, host, poll, cancelled)?;
             Err(JobError::OnSiteInterventionRequired(
                 OnSiteReason::RestartOrderUnavailable {
                     flash_session: point.flash_session,
@@ -1032,6 +1048,20 @@ mod tests {
         Block,
     }
 
+    /// How a [`FlashHost`] answers an ECUReset.
+    #[derive(Debug, Clone, Copy)]
+    enum ResetAnswer {
+        Positive,
+        /// A negative response with this code.
+        Refuse(u8),
+        /// No answer.
+        NoAnswer,
+        /// A positive-looking answer that does not echo the sub-function.
+        Garbled,
+        /// A positive response with a byte after the sub-function, which a hard reset's has not.
+        Trailing,
+    }
+
     /// An ECU that downloads: it answers ReadDataByIdentifier F191 and F195, accepts every
     /// other request and every block, and counts the blocks since the last RequestDownload as
     /// the worker's host does. It logs each request with the journal commits made before it.
@@ -1066,6 +1096,10 @@ mod tests {
         /// Every ReadDataByIdentifier request is also pushed here, for a test that looks at the
         /// host while the job runs on another thread.
         mirror: Option<Arc<Mutex<Vec<Sent>>>>,
+        /// The answer to ECUReset.
+        reset: ResetAnswer,
+        /// A service whose response is lost.
+        lose_service: Option<u16>,
     }
 
     impl FlashHost {
@@ -1086,6 +1120,8 @@ mod tests {
                 hardware: Some(b"HW01".to_vec()),
                 inputs: crate::inputs::FixedInputs::new(),
                 mirror: None,
+                reset: ResetAnswer::Positive,
+                lose_service: None,
             }
         }
 
@@ -1149,7 +1185,17 @@ mod tests {
             if service == 0x22 && self.fail_reads.iter().any(|did| payload == did) {
                 return Err(HostError::NoResponse);
             }
+            if self.lose_service == Some(service) {
+                return Err(HostError::NoResponse);
+            }
             match (service, payload) {
+                (0x11, _) => match self.reset {
+                    ResetAnswer::Positive => Ok(vec![0x51, payload[0]]),
+                    ResetAnswer::Refuse(nrc) => Ok(vec![0x7F, 0x11, nrc]),
+                    ResetAnswer::NoAnswer => Err(HostError::NoResponse),
+                    ResetAnswer::Garbled => Ok(vec![0x51]),
+                    ResetAnswer::Trailing => Ok(vec![0x51, 0x01, 0x00]),
+                },
                 (0x22, [0xF1, 0x90]) => Ok(match &self.vin {
                     Some(vin) => [&[0x62, 0xF1, 0x90][..], vin].concat(),
                     None => vec![0x7F, 0x22, 0x31],
@@ -1215,6 +1261,8 @@ mod tests {
     const ENTRY: u32 = 3;
     const ERASE: u32 = 4;
     const EXIT: u32 = 16;
+    const SESSION_TIMEOUT_MS: u32 = 20;
+    const TEARDOWN_MARGIN_MS: u32 = 10;
 
     /// A programming session, then a plan: entry at 3, a routine-control erase at 4, a
     /// RequestDownload, three blocks, RequestTransferExit at 16, and the end of the code as the
@@ -1263,9 +1311,10 @@ mod tests {
                 transfer_exit_pc: EXIT,
                 post_transfer_end_pc: program.code.len() as u32,
             },
+            // Short, since the passive teardown of a restart waits them out.
             timing: diag_ir::RecoveryTiming {
-                session_timeout_millis: 5000,
-                teardown_margin_millis: 0,
+                session_timeout_millis: SESSION_TIMEOUT_MS,
+                teardown_margin_millis: TEARDOWN_MARGIN_MS,
                 ecu_startup_millis: 0,
                 confirmation_window_millis: 0,
             },
@@ -2501,14 +2550,17 @@ mod tests {
                 Err(JobError::OnSiteInterventionRequired(
                     OnSiteReason::RestartOrderUnavailable {
                         flash_session: 1,
-                        teardown: restart::TeardownGate::ResetAllowed
+                        teardown: restart::Teardown::Reset
                     }
                 ))
             ),
             "{result:?}"
         );
         // Only the gates' ReadDataByIdentifier requests: the VIN, then the hardware identity.
-        assert_eq!(host.sent(), [read_of([0xF1, 0x90]), read_of([0xF1, 0x91])]);
+        assert_eq!(
+            host.sent(),
+            [read_of([0xF1, 0x90]), read_of([0xF1, 0x91]), reset_sent()]
+        );
         // Read by step 1 and again by the gates.
         assert_eq!(host.voltage_reads, 2);
         assert_eq!(resumes(&dir), 1);
@@ -2698,8 +2750,13 @@ mod tests {
         (result, host)
     }
 
+    /// The teardown of a restart whose gates did not pass for `reason`.
+    fn passive_gate(reason: restart::PassiveReason) -> restart::Teardown {
+        restart::Teardown::Passive(restart::PassiveCause::Gate(reason))
+    }
+
     /// The teardown a restart ended in. Fails the test on any other result.
-    fn teardown_of(result: &Result<VmState, JobError>) -> restart::TeardownGate {
+    fn teardown_of(result: &Result<VmState, JobError>) -> restart::Teardown {
         match result {
             Err(JobError::OnSiteInterventionRequired(OnSiteReason::RestartOrderUnavailable {
                 flash_session: 1,
@@ -2727,6 +2784,23 @@ mod tests {
 
     fn input(input: diag_ir::RuntimeInput) -> diag_ir::Source {
         diag_ir::Source::RuntimeInput(input)
+    }
+
+    fn reset_sent() -> Sent {
+        Sent::Service(0x11, vec![0x01])
+    }
+
+    /// Nothing but ReadDataByIdentifier requests, then at most the teardown's one ECUReset (last),
+    /// was sent: no routine, no block.
+    fn assert_reads_then_reset(host: &FlashHost) {
+        let sent = host.sent();
+        let reads = sent.strip_suffix(&[reset_sent()]).unwrap_or(&sent);
+        assert!(
+            reads
+                .iter()
+                .all(|sent| matches!(sent, Sent::Service(0x22, _))),
+            "{sent:?}"
+        );
     }
 
     /// Nothing but ReadDataByIdentifier requests was sent: no ECUReset, no routine, no block.
@@ -2761,7 +2835,7 @@ mod tests {
 
     #[test]
     fn a_vin_that_cannot_be_read_leaves_the_teardown_passive() {
-        let passive = restart::TeardownGate::PassiveOnly(restart::PassiveReason::VinNotEstablished);
+        let passive = passive_gate(restart::PassiveReason::VinNotEstablished);
         // A negative response.
         let (result, host) = restart_with(&flash_program(), Some(TARGET_VIN), |host| {
             host.vin = None;
@@ -2788,21 +2862,21 @@ mod tests {
         let (result, host) = restart_with(&flash_program(), None, |_| {});
         assert_eq!(
             teardown_of(&result),
-            restart::TeardownGate::PassiveOnly(restart::PassiveReason::VinNotEstablished)
+            passive_gate(restart::PassiveReason::VinNotEstablished)
         );
         assert_eq!(host.sent(), []);
     }
 
     #[test]
     fn a_hardware_identity_that_differs_or_cannot_be_read_leaves_the_teardown_passive() {
-        use restart::{PassiveReason, TeardownGate::PassiveOnly};
+        use restart::PassiveReason;
         // The journal recorded HW01.
         let (result, host) = restart_with(&flash_program(), Some(TARGET_VIN), |host| {
             host.hardware = Some(b"HW02".to_vec());
         });
         assert_eq!(
             teardown_of(&result),
-            PassiveOnly(PassiveReason::HardwareIdentityDiffers)
+            passive_gate(PassiveReason::HardwareIdentityDiffers)
         );
         assert_eq!(host.sent(), [read_of([0xF1, 0x90]), read_of([0xF1, 0x91])]);
 
@@ -2811,7 +2885,7 @@ mod tests {
         });
         assert_eq!(
             teardown_of(&result),
-            PassiveOnly(PassiveReason::HardwareIdentityNotEstablished)
+            passive_gate(PassiveReason::HardwareIdentityNotEstablished)
         );
 
         // No source declared: nothing is compared.
@@ -2820,7 +2894,7 @@ mod tests {
         let (result, host) = restart_with(&no_source, Some(TARGET_VIN), |_| {});
         assert_eq!(
             teardown_of(&result),
-            PassiveOnly(PassiveReason::HardwareIdentityNotEstablished)
+            passive_gate(PassiveReason::HardwareIdentityNotEstablished)
         );
         assert_eq!(host.sent(), [read_of([0xF1, 0x90])]);
     }
@@ -2828,8 +2902,8 @@ mod tests {
     #[test]
     fn a_precondition_that_fails_or_cannot_be_established_leaves_the_teardown_passive() {
         use diag_ir::{PreconditionKind, RuntimeInput};
-        use restart::{PassiveReason, TeardownGate::PassiveOnly};
-        let engine = PassiveOnly(PassiveReason::Precondition(PreconditionKind::Engine));
+        use restart::PassiveReason;
+        let engine = passive_gate(PassiveReason::Precondition(PreconditionKind::Engine));
 
         // The engine runs.
         let program = flash_program_with_engine(
@@ -2897,8 +2971,8 @@ mod tests {
                 crate::inputs::Reading::Value(0),
             );
         });
-        assert_eq!(teardown_of(&result), restart::TeardownGate::ResetAllowed);
-        assert_only_reads(&host);
+        assert_eq!(teardown_of(&result), restart::Teardown::Reset);
+        assert_reads_then_reset(&host);
     }
 
     /// Every gate passes, with all five preconditions declared: the reset is allowed.
@@ -2931,8 +3005,8 @@ mod tests {
         let (result, host) = restart_with(&program, Some(TARGET_VIN), |host| {
             host.inputs = fixed(0);
         });
-        assert_eq!(teardown_of(&result), restart::TeardownGate::ResetAllowed);
-        assert_only_reads(&host);
+        assert_eq!(teardown_of(&result), restart::Teardown::Reset);
+        assert_reads_then_reset(&host);
 
         // The last one in the order fails.
         let (result, _) = restart_with(&program, Some(TARGET_VIN), |host| {
@@ -2940,7 +3014,7 @@ mod tests {
         });
         assert_eq!(
             teardown_of(&result),
-            restart::TeardownGate::PassiveOnly(restart::PassiveReason::Precondition(
+            passive_gate(restart::PassiveReason::Precondition(
                 diag_ir::PreconditionKind::VehicleSpeed
             ))
         );
@@ -2949,20 +3023,20 @@ mod tests {
     #[test]
     fn a_worker_failure_in_a_gate_read_leaves_the_teardown_passive() {
         use diag_ir::{PreconditionKind, RuntimeInput};
-        use restart::{PassiveReason, TeardownGate::PassiveOnly};
+        use restart::PassiveReason;
         let (result, _) = restart_with(&flash_program(), Some(TARGET_VIN), |host| {
             host.fail_reads = vec![[0xF1, 0x90]];
         });
         assert_eq!(
             teardown_of(&result),
-            PassiveOnly(PassiveReason::VinNotEstablished)
+            passive_gate(PassiveReason::VinNotEstablished)
         );
         let (result, _) = restart_with(&flash_program(), Some(TARGET_VIN), |host| {
             host.fail_reads = vec![[0xF1, 0x91]];
         });
         assert_eq!(
             teardown_of(&result),
-            PassiveOnly(PassiveReason::HardwareIdentityNotEstablished)
+            passive_gate(PassiveReason::HardwareIdentityNotEstablished)
         );
         // A precondition read through the ECU, with the programming-session source giving
         // nothing either.
@@ -2976,7 +3050,7 @@ mod tests {
         });
         assert_eq!(
             teardown_of(&result),
-            PassiveOnly(PassiveReason::Precondition(PreconditionKind::Engine))
+            passive_gate(PassiveReason::Precondition(PreconditionKind::Engine))
         );
     }
 
@@ -3001,7 +3075,7 @@ mod tests {
         });
         assert_eq!(
             teardown_of(&result),
-            restart::TeardownGate::PassiveOnly(restart::PassiveReason::Precondition(
+            passive_gate(restart::PassiveReason::Precondition(
                 PreconditionKind::Engine
             ))
         );
@@ -3017,7 +3091,7 @@ mod tests {
         let (result, host) = restart_with(&program, Some(TARGET_VIN), |_| {});
         assert_eq!(
             teardown_of(&result),
-            restart::TeardownGate::PassiveOnly(restart::PassiveReason::VinNotEstablished)
+            passive_gate(restart::PassiveReason::VinNotEstablished)
         );
         assert_eq!(host.sent(), []);
     }
@@ -3025,7 +3099,7 @@ mod tests {
     /// A VIN that is not well-formed never aborts the job, whichever side it is on.
     #[test]
     fn a_malformed_vin_is_not_established_and_never_aborts() {
-        let passive = restart::TeardownGate::PassiveOnly(restart::PassiveReason::VinNotEstablished);
+        let passive = passive_gate(restart::PassiveReason::VinNotEstablished);
         for answer in [
             "wdb12345678901234",
             "WDB1234567890123O",
@@ -3041,6 +3115,217 @@ mod tests {
         let (result, host) = restart_with(&flash_program(), Some("SHORT"), |_| {});
         assert_eq!(teardown_of(&result), passive);
         assert_eq!(host.sent(), []);
+    }
+
+    // ---------------------------------------------- restart teardown (ADR-229 item 2 step 2b-1)
+
+    /// A first run of `program` that `prepare` makes fail with a host error, then a restart on a
+    /// host `prepare_restart` sets up. Gives the result, the host and how long the restart took.
+    fn restart_after(
+        program: &Program,
+        prepare_first: impl FnOnce(&mut FlashHost),
+        prepare_restart: impl FnOnce(&mut FlashHost),
+    ) -> (Result<VmState, JobError>, FlashHost, Duration) {
+        let dir = journal_dir("resume-teardown");
+        let result = first_run(program, &dir, JobLimits::default(), prepare_first);
+        assert!(matches!(result, Err(JobError::Host { .. })), "{result:?}");
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        prepare_restart(&mut host);
+        let started = std::time::Instant::now();
+        let result = resume(program, &dir, &mut host, false);
+        let elapsed = started.elapsed();
+        std::fs::remove_dir_all(&dir).unwrap();
+        (result, host, elapsed)
+    }
+
+    fn passive(cause: restart::PassiveCause) -> restart::Teardown {
+        restart::Teardown::Passive(cause)
+    }
+
+    fn session_wait() -> Duration {
+        Duration::from_millis(u64::from(SESSION_TIMEOUT_MS + TEARDOWN_MARGIN_MS))
+    }
+
+    /// Gates that allow it and a journal that excludes nothing: exactly one ECUReset
+    /// (hardReset, no suppress bit), after the gates' reads, and no wait.
+    #[test]
+    fn the_teardown_sends_one_ecu_reset_when_nothing_rules_it_out() {
+        let mut program = flash_program();
+        program.flash[0].timing.session_timeout_millis = 60_000;
+        let (result, host, elapsed) =
+            restart_after(&program, |host| host.lose_routine = Some(0xFF00), |_| {});
+        assert_eq!(teardown_of(&result), restart::Teardown::Reset);
+        assert_eq!(
+            host.sent(),
+            [read_of([0xF1, 0x90]), read_of([0xF1, 0x91]), reset_sent()]
+        );
+        // An accepted reset waits for nothing, however long the session timeout is.
+        assert!(elapsed < Duration::from_secs(30), "{elapsed:?}");
+    }
+
+    #[test]
+    fn a_gate_that_fails_makes_the_teardown_passive_without_a_reset() {
+        let (result, host, elapsed) = restart_after(
+            &flash_program(),
+            |host| host.lose_routine = Some(0xFF00),
+            |host| host.vin = None,
+        );
+        assert_eq!(
+            teardown_of(&result),
+            passive_gate(restart::PassiveReason::VinNotEstablished)
+        );
+        assert_eq!(host.sent(), [read_of([0xF1, 0x90])]);
+        assert!(elapsed >= session_wait(), "{elapsed:?}");
+    }
+
+    /// The ECU refuses the reset: passive with the code, the wait is at least the session
+    /// timeout plus the margin, and nothing is sent after the refused reset.
+    #[test]
+    fn a_refused_ecu_reset_makes_the_teardown_passive_and_silent() {
+        let (result, host, elapsed) = restart_after(
+            &flash_program(),
+            |host| host.lose_routine = Some(0xFF00),
+            |host| host.reset = ResetAnswer::Refuse(0x22),
+        );
+        assert_eq!(
+            teardown_of(&result),
+            passive(restart::PassiveCause::ResetRefused { nrc: 0x22 })
+        );
+        assert_eq!(
+            host.sent(),
+            [read_of([0xF1, 0x90]), read_of([0xF1, 0x91]), reset_sent()]
+        );
+        assert!(elapsed >= session_wait(), "{elapsed:?}");
+    }
+
+    /// No answer, a final response pending and a positive answer that is not the reset's are
+    /// all an unknown outcome.
+    #[test]
+    fn an_ecu_reset_with_no_usable_answer_has_an_unknown_outcome() {
+        for answer in [
+            ResetAnswer::NoAnswer,
+            ResetAnswer::Garbled,
+            ResetAnswer::Trailing,
+            ResetAnswer::Refuse(0x78),
+        ] {
+            let (result, host, elapsed) = restart_after(
+                &flash_program(),
+                |host| host.lose_routine = Some(0xFF00),
+                |host| host.reset = answer,
+            );
+            assert_eq!(
+                teardown_of(&result),
+                passive(restart::PassiveCause::ResetOutcomeUnknown),
+                "{answer:?}"
+            );
+            assert_eq!(host.sent().last(), Some(&reset_sent()), "{answer:?}");
+            assert!(elapsed >= session_wait(), "{answer:?}: {elapsed:?}");
+        }
+    }
+
+    /// The restart's journal says the RequestTransferExit was written ahead and sent without a
+    /// response, or sent and the post-transfer steps not finished: no ECUReset, whatever the
+    /// gates say, and the passive wait.
+    #[test]
+    fn a_journaled_transfer_exit_rules_the_reset_out() {
+        let (program, _) = program_with_check(diag_ir::RecoveryRequired::Never);
+        type Prepare = fn(&mut FlashHost);
+        let cases: [(&str, Prepare); 2] = [
+            ("the exit has no response", |host| {
+                host.lose_service = Some(0x37)
+            }),
+            ("the post-transfer steps did not finish", |host| {
+                host.lose_routine = Some(0xFF01)
+            }),
+        ];
+        for (name, prepare) in cases {
+            let (result, host, elapsed) = restart_after(&program, prepare, |_| {});
+            assert_eq!(
+                teardown_of(&result),
+                passive(restart::PassiveCause::TransferExitJournaled),
+                "{name}"
+            );
+            assert_eq!(
+                host.sent(),
+                [read_of([0xF1, 0x90]), read_of([0xF1, 0x91])],
+                "{name}"
+            );
+            assert!(elapsed >= session_wait(), "{name}: {elapsed:?}");
+        }
+    }
+
+    /// The post-transfer steps completed before the interruption: the journal reaches the
+    /// restart path (`classify` places the point at the plan's end), where the teardown sends no
+    /// reset and waits for nothing.
+    #[test]
+    fn the_completed_path_gets_no_reset_and_no_wait() {
+        let (mut program, check) = program_with_check(diag_ir::RecoveryRequired::Never);
+        // A routine after the plan's end, whose response is lost.
+        program.code.extend([
+            Op::PushBytes(0),
+            Op::RoutineControl {
+                routine: 0xFF02,
+                sub: 1,
+            },
+            Op::Pop,
+        ]);
+        assert_eq!(program.flash[0].boundaries.post_transfer_end_pc, check + 2);
+        program.validate().unwrap();
+        // A session timeout that would show if the teardown waited.
+        program.flash[0].timing.session_timeout_millis = 60_000;
+        let (result, host, elapsed) =
+            restart_after(&program, |host| host.lose_routine = Some(0xFF02), |_| {});
+        assert_eq!(teardown_of(&result), restart::Teardown::CompletedPath);
+        assert_eq!(host.sent(), [read_of([0xF1, 0x90]), read_of([0xF1, 0x91])]);
+        assert!(elapsed < Duration::from_secs(30), "{elapsed:?}");
+    }
+
+    /// A cancel during the passive wait ends the job in `Cancelled` well before the wait would.
+    #[test]
+    fn a_cancel_during_the_passive_wait_cancels_the_restart() {
+        let mut program = flash_program();
+        program.flash[0].timing.session_timeout_millis = 60_000;
+        let dir = journal_dir("resume-teardown-cancel");
+        interrupted(&program, &dir);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        // The VIN is not established, so the teardown is passive.
+        host.vin = None;
+        let limits = JobLimits {
+            wait_poll: Duration::from_millis(2),
+            ..JobLimits::default()
+        };
+        // The cancel comes once the VIN read was sent, so it lands in the passive wait however
+        // long the journal's commits before it take.
+        let mirror = Arc::new(Mutex::new(Vec::new()));
+        host.mirror = Some(Arc::clone(&mirror));
+        let canceller = {
+            let (cancelled, mirror) = (Arc::clone(&cancelled), Arc::clone(&mirror));
+            std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(20);
+                while mirror.lock().unwrap().is_empty() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                std::thread::sleep(Duration::from_millis(10));
+                cancelled.store(true, Ordering::Relaxed);
+            })
+        };
+        let started = std::time::Instant::now();
+        let result = resume_on(
+            &program,
+            &mut host,
+            limits,
+            &cancelled,
+            Journal::open(&dir, &job_key()),
+            identity_sources(),
+            Some(&target()),
+            &dir_slot(&dir),
+        );
+        canceller.join().unwrap();
+        assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
+        assert!(started.elapsed() < Duration::from_secs(40));
+        assert_eq!(host.sent(), [read_of([0xF1, 0x90])]);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -3090,7 +3375,7 @@ mod tests {
         interrupted(&program, &dir);
         let mut host = FlashHost::new(Rc::new(Cell::new(0)));
         let result = resume(&program, &dir, &mut host, false);
-        assert_eq!(teardown_of(&result), restart::TeardownGate::ResetAllowed);
+        assert_eq!(teardown_of(&result), restart::Teardown::Reset);
         assert_eq!(resumes(&dir), 1);
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -3235,7 +3520,7 @@ mod tests {
         let slot: GuardSlot = Arc::new(Mutex::new(Some(take_guards(&dir))));
         let mut host = FlashHost::new(Rc::new(Cell::new(0)));
         let result = resume_in(&program, &dir, &mut host, false, Some(TARGET_VIN), &slot);
-        assert_eq!(teardown_of(&result), restart::TeardownGate::ResetAllowed);
+        assert_eq!(teardown_of(&result), restart::Teardown::Reset);
         let guards = slot.lock().unwrap().take().unwrap();
         assert!(guards.holds_vehicle());
         assert!(guards.holds_slot());
@@ -3271,10 +3556,10 @@ mod tests {
 
         drop(other);
         let result = job.join().unwrap();
-        assert_eq!(teardown_of(&result), restart::TeardownGate::ResetAllowed);
+        assert_eq!(teardown_of(&result), restart::Teardown::Reset);
         assert_eq!(
             *mirror.lock().unwrap(),
-            [read_of([0xF1, 0x90]), read_of([0xF1, 0x91])]
+            [read_of([0xF1, 0x90]), read_of([0xF1, 0x91]), reset_sent()]
         );
         let guards = slot.lock().unwrap().take().unwrap();
         assert!(guards.holds_vehicle());
@@ -3368,7 +3653,7 @@ mod tests {
         let slot: GuardSlot = Arc::new(Mutex::new(Some(guards)));
         let mut host = FlashHost::new(Rc::new(Cell::new(0)));
         let result = resume_in(&program, &dir, &mut host, false, Some(TARGET_VIN), &slot);
-        assert_eq!(teardown_of(&result), restart::TeardownGate::ResetAllowed);
+        assert_eq!(teardown_of(&result), restart::Teardown::Reset);
         assert!(slot.lock().unwrap().as_ref().unwrap().holds_vehicle());
         std::fs::remove_dir_all(&dir).unwrap();
     }

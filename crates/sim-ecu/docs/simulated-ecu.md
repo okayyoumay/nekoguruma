@@ -162,6 +162,7 @@ numbers contradict each other or exceed the flash window, which the ECU itself n
 | `BusError` | The next request is lost on the bus: neither handled nor answered |
 | `PowerLoss` | Immediate: session, security and a running transfer are lost as in a power cycle (flash progress is kept), and the ECU answers nothing until `reconnect()` |
 | `CorruptBlock { block }` | Writing TransferData block `block` (numbered as for `drop_at_block`) fails: NRC 72 (clause 14.4), nothing is stored and the blockSequenceCounter does not advance, so the client may send the block again |
+| `NegativeResponse { nrc }` | The next request that reaches the ECU is refused with `nrc` and has no effect: it is not dispatched, so no state changes (an ECU reset does not happen, a session does not switch). Sent whatever the addressing and the suppress bit; tS3_Server restarts as for any request that reaches the ECU |
 | `ResponsePending { count, interval_ms }` | The next request the ECU answers gets `count` response pending messages (`7F SID 78`, Annex A.1) before its response: the first when the response was due, the others `interval_ms` apart, and the response `interval_ms` after the last. `exchange()` lists them in `Exchange::pending` with their delays; tS3_Server restarts when the final response goes out. A request without a response leaves the fault armed; with `DropResponse` the messages still go out and only the final response is lost. `count` is capped at `MAX_RESPONSE_PENDING` (1000); zero uses the fault up without sending any |
 
 `ResponsePending` simplifies what a server does around NRC 78 (Annex A.1, clause 7.7.3):
@@ -178,4 +179,5 @@ armed faults stay armed. `armed_faults()` lists the faults that have not fired y
 `power_cycles()` counts power cycles (power loss, ECU reset, `reconnect()`); the VCI side uses it
 to discard responses it was still delaying when the ECU lost power or reset.
 `Fault` serializes in snake case (`"power_loss"`, `{"delay_response": {"ms": 500}}`), the form
-`sim-vci`'s control commands take.
+`sim-vci`'s control commands take. A response code is named the same way, not by its number:
+`{"negative_response": {"nrc": "conditions_not_correct"}}`.

@@ -166,7 +166,7 @@ A control command is a JSON object tagged by `command`:
 
 | Command | Effect |
 |---|---|
-| `{"command": "inject_fault", "fault": F}` | `SimEcu::inject(F)`; `F` is a `sim_ecu::Fault` in snake case: `"power_loss"`, `"drop_response"`, `"bus_error"`, `{"delay_response": {"ms": 500}}`, `{"corrupt_block": {"block": 3}}`, `{"response_pending": {"count": 2, "interval_ms": 300}}` |
+| `{"command": "inject_fault", "fault": F}` | `SimEcu::inject(F)`; `F` is a `sim_ecu::Fault` in snake case: `"power_loss"`, `"drop_response"`, `"bus_error"`, `{"delay_response": {"ms": 500}}`, `{"corrupt_block": {"block": 3}}`, `{"response_pending": {"count": 2, "interval_ms": 300}}`, `{"negative_response": {"nrc": "conditions_not_correct"}}` (the response code by its snake-case name, not its number) |
 | `{"command": "reconnect_ecu"}` | `SimEcu::reconnect`, which ends a power loss |
 | `{"command": "disconnect_vci"}` | unplugs the VCI |
 | `{"command": "connect_vci"}` | plugs it back in |

@@ -9,7 +9,9 @@
 //! `check_gates` then makes the identity and safety gates of ADR-229 item 2 step 2 (ADR-261):
 //! the VIN, the hardware identity and the declared preconditions, which decide whether the
 //! teardown may use an ECUReset or must be passive. It sends only ReadDataByIdentifier requests
-//! through the declared sources.
+//! through the declared sources. `teardown` then ends the interrupted download on the gates'
+//! decision and the journal's exclusions (step 2b-1, ADR-264): an ECUReset, or a passive wait for
+//! the ECU's session to expire.
 //!
 //! The interruption point is the latest of the last completed step and the requests the
 //! journal wrote ahead (the transfer-start and RequestTransferExit markers, and the request
@@ -17,10 +19,11 @@
 //! response was recorded is placed at that request.
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use diag_ir::{
     DiagHost, IdentityKind, Interruptible, Precondition, PreconditionKind, Program,
-    RecoveryRequired, RuntimeInput, Source, Vm, VmError, VmState,
+    RecoveryRequired, RecoveryTiming, RuntimeInput, Source, Vm, VmError, VmState,
 };
 
 use crate::host::HostError;
@@ -98,15 +101,13 @@ pub enum OnSiteReason {
     /// resume is counted (ADR-261).
     TargetVinDiffers,
     /// The restart passed step 1 (the checks that need no ECU service, and its resume was
-    /// counted) and the gates of step 2, which gave `teardown`. The teardown and the rest of
-    /// ADR-229's restart order (the ECU state check, the replay to the erase) do not run in this
-    /// agent, so the job stops before it sends anything that changes the ECU (ADR-255, ADR-261).
-    /// `ResetAllowed` rules out only the gates: the teardown still applies the journal's
-    /// exclusions of step 2 (RequestTransferExit journaled without the post-transfer steps
-    /// complete, the completed path).
+    /// counted), the gates of step 2 and the teardown of step 2b-1, which gave `teardown`. The
+    /// default-session confirmation and the rest of ADR-229's restart order (step 2b-2 onwards:
+    /// the ECU state check, the replay to the erase) do not run in this agent, so the job stops
+    /// before it sends anything further that changes the ECU (ADR-255, ADR-261, ADR-264).
     RestartOrderUnavailable {
         flash_session: u32,
-        teardown: TeardownGate,
+        teardown: Teardown,
     },
 }
 
@@ -119,8 +120,8 @@ pub enum TeardownGate {
     /// post-transfer steps complete, and none on the completed path); those are the
     /// teardown's, not the gates'.
     ResetAllowed,
-    /// A gate did not pass: the teardown is passive (the agent stops TesterPresent and waits
-    /// out the session timeout), with no ECUReset.
+    /// A gate did not pass: the teardown is passive (it waits out the session timeout), with no
+    /// ECUReset.
     PassiveOnly(PassiveReason),
 }
 
@@ -141,6 +142,37 @@ pub enum PassiveReason {
     /// The precondition failed or could not be established, including a source the agent cannot
     /// resolve.
     Precondition(PreconditionKind),
+}
+
+/// How the restart's teardown (ADR-229 item 2 step 2b-1, ADR-264) ended the interrupted download.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Teardown {
+    /// The ECU accepted an ECUReset (hardReset). The ECU's startup time and the confirmation
+    /// that it is back in its default session belong to the next step, so nothing waited.
+    Reset,
+    /// No accepted ECUReset ended the download: the reset was ruled out, refused or got no
+    /// usable answer. The agent then waited out the ECU's session timeout plus the plan's
+    /// margin, sending nothing further, so the ECU's session has expired.
+    Passive(PassiveCause),
+    /// The journal shows the post-transfer steps complete: no reset and no wait, since the
+    /// default-session confirmation of step 2b-2 comes first and only its failure makes the
+    /// teardown passive.
+    CompletedPath,
+}
+
+/// Why a teardown was passive. No VIN is kept in it (design 16.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PassiveCause {
+    /// A gate of step 2 did not pass.
+    Gate(PassiveReason),
+    /// A RequestTransferExit intent is journaled and the post-transfer steps are not complete:
+    /// the request may have reached the ECU, which a reset could disturb.
+    TransferExitJournaled,
+    /// The ECU answered the ECUReset negatively with this response code.
+    ResetRefused { nrc: u8 },
+    /// Whether the ECU reset is not known: the request got no answer or failed, or the answer
+    /// is neither a positive response to the reset nor a final negative one.
+    ResetOutcomeUnknown,
 }
 
 /// Decides how the job of `program` goes on, from its journal as `Journal::read` (or
@@ -422,6 +454,88 @@ where
     Ok(TeardownGate::ResetAllowed)
 }
 
+/// The restart's teardown (ADR-229 item 2 step 2b-1, ADR-264), run on the gates' decision `gate`.
+/// In this order:
+/// - the journal's exclusions, which apply on top of a `ResetAllowed` gate: post-transfer steps
+///   journaled complete (the completed path) send nothing and wait for nothing
+///   ([`Teardown::CompletedPath`]); a RequestTransferExit intent without that completion makes
+///   the teardown passive ([`PassiveCause::TransferExitJournaled`]);
+/// - a `PassiveOnly` gate makes it passive ([`PassiveCause::Gate`]);
+/// - otherwise an ECUReset (hardReset, positive response required) is sent. A positive response
+///   ends in [`Teardown::Reset`] with no wait. A negative response, a failed or unanswered
+///   request, and any other answer make the teardown passive
+///   ([`PassiveCause::ResetRefused`], [`PassiveCause::ResetOutcomeUnknown`]).
+///
+/// A passive teardown waits `timing.session_timeout_millis + timing.teardown_margin_millis` and
+/// sends nothing further meanwhile (after a refused or unknown reset, the reset was the last
+/// request): the agent runs no TesterPresent, so there is none to stop. The wait
+/// sleeps in steps of `poll` and checks `cancelled` at the start of each; a cancel ends it in
+/// [`JobError::Cancelled`]. A cancel set when the teardown starts ends it before anything, on
+/// the completed path too, and sends no reset; one that arrives while
+/// the reset is on its way does not hide an accepted reset.
+pub(crate) fn teardown<H>(
+    gate: TeardownGate,
+    point: &RestartPoint,
+    timing: &RecoveryTiming,
+    host: &mut H,
+    poll: Duration,
+    cancelled: &AtomicBool,
+) -> Result<Teardown, JobError>
+where
+    H: DiagHost<Error = HostError>,
+{
+    // Nothing has been sent yet, so a cancel ends the teardown here on every path.
+    if cancelled.load(Ordering::Relaxed) {
+        return Err(JobError::Cancelled);
+    }
+    let exit = point
+        .facts
+        .transfer
+        .as_ref()
+        .and_then(|transfer| transfer.exit.as_ref());
+    let cause = if exit.is_some_and(|exit| exit.complete) {
+        return Ok(Teardown::CompletedPath);
+    } else if exit.is_some() {
+        PassiveCause::TransferExitJournaled
+    } else if let TeardownGate::PassiveOnly(reason) = gate {
+        PassiveCause::Gate(reason)
+    } else {
+        // ECUReset, sub-function hardReset; the suppress bit is not set, so a positive
+        // response comes back. Once it is sent, a cancel no longer hides its outcome: an
+        // accepted reset is reported as such, and a cancel ends only the wait that follows a
+        // refused or unknown one.
+        match host.service_request(0x11, &[0x01]) {
+            Ok(response) => match response.as_slice() {
+                // The positive response of a hard reset carries nothing after its sub-function.
+                [0x51, 0x01] => return Ok(Teardown::Reset),
+                [0x7F, 0x11, nrc] if *nrc != 0x78 => PassiveCause::ResetRefused { nrc: *nrc },
+                other => {
+                    tracing::warn!(answer = ?other, "the ECUReset got no usable answer");
+                    PassiveCause::ResetOutcomeUnknown
+                }
+            },
+            Err(error) => {
+                tracing::warn!(%error, "the ECUReset got no usable answer");
+                PassiveCause::ResetOutcomeUnknown
+            }
+        }
+    };
+    let total = Duration::from_millis(
+        u64::from(timing.session_timeout_millis) + u64::from(timing.teardown_margin_millis),
+    );
+    let deadline = Instant::now() + total;
+    loop {
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(JobError::Cancelled);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(Teardown::Passive(cause));
+        }
+        std::thread::sleep(remaining.min(poll));
+    }
+}
+
 /// Whether `precondition` holds: the first source that gives a value decides, the
 /// default-session one before the programming-session one (skipped when it is the same source).
 /// Only a reading that is not a value falls back to the other source; a failure to use the
@@ -588,6 +702,8 @@ mod tests {
         FlashRecovery, IR_SCHEMA_VERSION, Idempotency, Op, RecoveryBoundaries, RecoveryTiming,
         Section,
     };
+
+    use std::sync::Arc;
 
     use super::*;
     use crate::journal::{JobKey, Journal, StageId, Store};
@@ -992,5 +1108,312 @@ mod tests {
         assert_eq!(interruption_point(&j.summary()), Some(at(EXIT)));
         let j = journal_until(&program, EXIT - 1);
         assert_eq!(interruption_point(&j.summary()), Some(at(EXIT - 2)));
+    }
+
+    // ------------------------------------------------------------ teardown against sim-ecu
+
+    /// A `DiagHost` over a simulated ECU: a request it does not answer is `NoResponse`. Only
+    /// `service_request` is used by the teardown.
+    struct SimHost(sim_ecu::SimEcu, Option<Arc<AtomicBool>>);
+
+    impl DiagHost for SimHost {
+        type Error = HostError;
+
+        fn service_request(&mut self, service: u16, payload: &[u8]) -> Result<Vec<u8>, HostError> {
+            let mut request = vec![u8::try_from(service).unwrap()];
+            request.extend_from_slice(payload);
+            let response = self.0.request(&request).to_bytes();
+            // A test's cancel that arrives while the request is on its way.
+            if let Some(cancel) = &self.1 {
+                cancel.store(true, Ordering::Relaxed);
+            }
+            response.ok_or(HostError::NoResponse)
+        }
+        fn read_dtc(&mut self, _: u8) -> Result<Vec<u8>, HostError> {
+            Err(HostError::Unsupported("ReadDtc"))
+        }
+        fn routine_control(&mut self, _: u16, _: u8, _: &[u8]) -> Result<Vec<u8>, HostError> {
+            Err(HostError::Unsupported("RoutineControl"))
+        }
+        fn security_access(
+            &mut self,
+            _: u64,
+            _: u8,
+            _: &[u8],
+        ) -> Result<Option<Vec<u8>>, HostError> {
+            Err(HostError::Unsupported("SecurityAccess"))
+        }
+        fn flash_transfer(&mut self, _: u32, _: &[u8]) -> Result<(), HostError> {
+            Err(HostError::Unsupported("FlashTransfer"))
+        }
+        fn wait(&mut self, _: u64, _: u32) -> Result<bool, HostError> {
+            Ok(true)
+        }
+        fn hmi_request(&mut self, _: u64, _: &[u8]) -> Result<Option<Vec<u8>>, HostError> {
+            Ok(None)
+        }
+        fn record_input(&mut self, _: u64, _: &[u8]) -> Result<Option<Vec<u8>>, HostError> {
+            Err(HostError::Unsupported("RecordInput"))
+        }
+        fn monitor_capture(&mut self, _: u32) -> Result<(), HostError> {
+            Err(HostError::Unsupported("MonitorCapture"))
+        }
+        fn log(&mut self, _: u8, _: &str) {}
+    }
+
+    /// A simulated ECU in its extended session, as an interrupted download leaves it.
+    fn ecu_in_session() -> SimHost {
+        ecu_in_session_with(sim_ecu::EcuConfig::default())
+    }
+
+    /// [`ecu_in_session`] with `config`.
+    fn ecu_in_session_with(config: sim_ecu::EcuConfig) -> SimHost {
+        let mut ecu = sim_ecu::SimEcu::new(config);
+        let response = ecu.request(&[0x10, 0x03]);
+        assert!(
+            matches!(response, sim_ecu::SimResponse::Positive(_)),
+            "{response:?}"
+        );
+        assert_eq!(ecu.session, sim_ecu::Session::Extended);
+        SimHost(ecu, None)
+    }
+
+    /// The restart point of a journal interrupted at the erase, or at RequestTransferExit.
+    fn point_at(upto: u32) -> (Program, RestartPoint) {
+        let program = program(RecoveryRequired::Never);
+        let j = journal_until(&program, upto);
+        let RestartDecision::Restart(point) = decide(&program, &j) else {
+            panic!("a restart point");
+        };
+        (program, *point)
+    }
+
+    const TIMING: RecoveryTiming = RecoveryTiming {
+        session_timeout_millis: 15,
+        teardown_margin_millis: 5,
+        ecu_startup_millis: 0,
+        confirmation_window_millis: 0,
+    };
+
+    fn run_teardown(
+        gate: TeardownGate,
+        point: &RestartPoint,
+        host: &mut SimHost,
+    ) -> (Result<Teardown, JobError>, Duration) {
+        let started = Instant::now();
+        let result = teardown(
+            gate,
+            point,
+            &TIMING,
+            host,
+            Duration::from_millis(1),
+            &AtomicBool::new(false),
+        );
+        (result, started.elapsed())
+    }
+
+    #[test]
+    fn an_accepted_ecu_reset_power_cycles_the_simulated_ecu() {
+        let (_, point) = point_at(ERASE);
+        let mut host = ecu_in_session();
+        let (result, elapsed) = run_teardown(TeardownGate::ResetAllowed, &point, &mut host);
+        assert_eq!(result.unwrap(), Teardown::Reset);
+        assert_eq!(host.0.power_cycles(), 1);
+        assert_eq!(host.0.session, sim_ecu::Session::Default);
+        assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
+    }
+
+    /// A cancel set before the teardown ends it on the completed path too, where nothing would be
+    /// sent anyway.
+    #[test]
+    fn a_cancel_before_the_teardown_ends_the_completed_path() {
+        let (_, point) = point_at(EXIT);
+        let mut point = point;
+        point
+            .facts
+            .transfer
+            .as_mut()
+            .and_then(|transfer| transfer.exit.as_mut())
+            .expect("a journal at RequestTransferExit has an exit")
+            .complete = true;
+        let mut host = ecu_in_session();
+        let result = teardown(
+            TeardownGate::ResetAllowed,
+            &point,
+            &TIMING,
+            &mut host,
+            Duration::from_millis(1),
+            &AtomicBool::new(true),
+        );
+        assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
+        let result = teardown(
+            TeardownGate::ResetAllowed,
+            &point,
+            &TIMING,
+            &mut host,
+            Duration::from_millis(1),
+            &AtomicBool::new(false),
+        );
+        assert_eq!(result.unwrap(), Teardown::CompletedPath);
+    }
+
+    /// A cancel set before the teardown sends no reset.
+    #[test]
+    fn a_cancel_before_the_reset_sends_none() {
+        let (_, point) = point_at(ERASE);
+        let mut host = ecu_in_session();
+        let result = teardown(
+            TeardownGate::ResetAllowed,
+            &point,
+            &TIMING,
+            &mut host,
+            Duration::from_millis(1),
+            &AtomicBool::new(true),
+        );
+        assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
+        assert_eq!(host.0.power_cycles(), 0);
+        assert_eq!(host.0.session, sim_ecu::Session::Extended);
+    }
+
+    /// A cancel that arrives while the reset is on its way does not hide that the ECU accepted
+    /// it; after a refused reset it ends the wait.
+    #[test]
+    fn a_cancel_during_the_reset_keeps_its_outcome() {
+        let (_, point) = point_at(ERASE);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut host = ecu_in_session();
+        host.1 = Some(Arc::clone(&cancelled));
+        let result = teardown(
+            TeardownGate::ResetAllowed,
+            &point,
+            &TIMING,
+            &mut host,
+            Duration::from_millis(1),
+            &cancelled,
+        );
+        assert_eq!(result.unwrap(), Teardown::Reset);
+        assert_eq!(host.0.power_cycles(), 1);
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut host = ecu_in_session();
+        host.0.inject(sim_ecu::Fault::NegativeResponse {
+            nrc: sim_ecu::Nrc::ConditionsNotCorrect,
+        });
+        host.1 = Some(Arc::clone(&cancelled));
+        let result = teardown(
+            TeardownGate::ResetAllowed,
+            &point,
+            &TIMING,
+            &mut host,
+            Duration::from_millis(1),
+            &cancelled,
+        );
+        assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
+    }
+
+    /// Timeout and margin are added without wrapping or saturating at 32 bits.
+    #[test]
+    fn the_passive_wait_is_not_cut_short_by_large_timings() {
+        let (_, point) = point_at(ERASE);
+        let timing = RecoveryTiming {
+            session_timeout_millis: u32::MAX,
+            teardown_margin_millis: u32::MAX,
+            ..TIMING
+        };
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let canceller = {
+            let cancelled = Arc::clone(&cancelled);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(20));
+                cancelled.store(true, Ordering::Relaxed);
+            })
+        };
+        let mut host = ecu_in_session();
+        let result = teardown(
+            TeardownGate::PassiveOnly(PassiveReason::VinNotEstablished),
+            &point,
+            &timing,
+            &mut host,
+            Duration::from_millis(1),
+            &cancelled,
+        );
+        canceller.join().unwrap();
+        // Still waiting when cancelled: the wait was not computed as zero or wrapped short.
+        assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
+    }
+
+    #[test]
+    fn a_refused_ecu_reset_leaves_the_simulated_ecu_and_waits() {
+        let (_, point) = point_at(ERASE);
+        let mut host = ecu_in_session();
+        host.0.inject(sim_ecu::Fault::NegativeResponse {
+            nrc: sim_ecu::Nrc::ConditionsNotCorrect,
+        });
+        let (result, elapsed) = run_teardown(TeardownGate::ResetAllowed, &point, &mut host);
+        assert_eq!(
+            result.unwrap(),
+            Teardown::Passive(PassiveCause::ResetRefused { nrc: 0x22 })
+        );
+        assert_eq!(host.0.power_cycles(), 0);
+        assert_eq!(host.0.session, sim_ecu::Session::Extended);
+        assert!(elapsed >= Duration::from_millis(20), "{elapsed:?}");
+    }
+
+    #[test]
+    fn an_unanswered_ecu_reset_is_an_unknown_outcome() {
+        for fault in [sim_ecu::Fault::BusError, sim_ecu::Fault::DropResponse] {
+            let (_, point) = point_at(ERASE);
+            let mut host = ecu_in_session();
+            host.0.inject(fault);
+            let (result, elapsed) = run_teardown(TeardownGate::ResetAllowed, &point, &mut host);
+            assert_eq!(
+                result.unwrap(),
+                Teardown::Passive(PassiveCause::ResetOutcomeUnknown),
+                "{fault:?}"
+            );
+            assert!(
+                elapsed >= Duration::from_millis(20),
+                "{fault:?}: {elapsed:?}"
+            );
+            // A bus error loses the request; a dropped response still carried out the reset.
+            let cycles = u64::from(fault == sim_ecu::Fault::DropResponse);
+            assert_eq!(host.0.power_cycles(), cycles, "{fault:?}");
+        }
+    }
+
+    /// With a RequestTransferExit journaled, or a passive gate, nothing reaches the ECU.
+    #[test]
+    fn no_request_reaches_the_simulated_ecu_when_the_teardown_is_passive() {
+        let (_, exit_point) = point_at(EXIT);
+        let (_, erase_point) = point_at(ERASE);
+        let cases = [
+            (
+                TeardownGate::ResetAllowed,
+                &exit_point,
+                PassiveCause::TransferExitJournaled,
+            ),
+            (
+                TeardownGate::PassiveOnly(PassiveReason::VinNotEstablished),
+                &erase_point,
+                PassiveCause::Gate(PassiveReason::VinNotEstablished),
+            ),
+        ];
+        for (gate, point, cause) in cases {
+            // The ECU's session timeout is the one the plan declares, so the wait outlasts it.
+            let mut host = ecu_in_session_with(sim_ecu::EcuConfig {
+                s3_server_ms: Some(TIMING.session_timeout_millis),
+                ..sim_ecu::EcuConfig::default()
+            });
+            // Armed to show whether any request reaches the ECU: it stays armed if none does.
+            host.0.inject(sim_ecu::Fault::BusError);
+            let (result, elapsed) = run_teardown(gate, point, &mut host);
+            assert_eq!(result.unwrap(), Teardown::Passive(cause));
+            assert_eq!(host.0.armed_faults(), &[sim_ecu::Fault::BusError]);
+            assert!(elapsed >= Duration::from_millis(20), "{elapsed:?}");
+            // The passive teardown let the session run out: the ECU is back in its default
+            // session without any request.
+            host.0.check_timers();
+            assert_eq!(host.0.session, sim_ecu::Session::Default);
+        }
     }
 }

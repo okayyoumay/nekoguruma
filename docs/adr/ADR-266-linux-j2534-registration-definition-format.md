@@ -19,8 +19,10 @@ services. Nothing reads the definitions yet.
 
 ## Decision
 
-1. **TOML, one file per VCI.** Only regular entries ending in `.toml` directly in the
-   definition directory are read; the file name is free. TOML is what the workspace already
+1. **TOML, one file per VCI.** Only regular files directly in the definition directory whose
+   extension is `toml` are read; the file name is free. A symbolic link there is refused, so a
+   definition cannot point outside the root-owned directory, and a file larger than 64 KiB is
+   refused. TOML is what the workspace already
    uses for configuration, and it is easy to write by hand and from the generation helper.
 2. **Keys are the Windows value names.** `Name` (required, not empty), `Vendor`,
    `FunctionLibrary` (required, absolute), `ConfigApplication`, and one key per protocol with
@@ -30,7 +32,10 @@ services. Nothing reads the definitions yet.
    the registry key one to one, so the two platforms share one vocabulary. Unknown keys and
    out-of-range values make the definition invalid, so a typo cannot pass unnoticed.
 3. **The VCI is matched on `Name`, exactly.** A caller names a VCI and gets the definition
-   whose `Name` equals it, case included. Two valid definitions with the same `Name` are an
+   whose `Name` equals it, case included. `Name` is the identifier: it stands for the Windows
+   device's registry key name, which is what a Windows lookup matches, while the Windows
+   `Name` value stays a display string. Names and paths with surrounding whitespace, paths
+   with a NUL or a `..` component are invalid. Two valid definitions with the same `Name` are an
    error: the resolver refuses rather than pick one. An invalid file is skipped and logged;
    when a name is not found, the error says how many invalid files were skipped. A missing
    definition directory is the same as an empty one.

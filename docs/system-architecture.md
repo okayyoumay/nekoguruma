@@ -566,11 +566,12 @@ J2534 on Linux **reuses the Windows API definitions as-is**. Function signatures
 
 | Field | Content |
 |---|---|
-| `Name` / `Vendor` | For display |
+| `Name` | The VCI name a caller resolves; it stands for the Windows device's registry key name, which identifies the device there (the Windows `Name` value is for display) |
+| `Vendor` | For display |
 | `FunctionLibrary` | Absolute path of the .so |
 | Supported protocols and capability flags | Correspond to the respective Windows values |
 | `LongSize` | Width of `unsigned long` in the vendor implementation (see below) |
-| Additional search paths | For resolving dependent libraries (optional) |
+| `SearchPaths` | Additional search paths for resolving dependent libraries (optional) |
 
 **Creating definition files**: There is no guarantee that vendor installers will write definitions specific to this software, so operation takes one of the following forms.
 

@@ -49,7 +49,10 @@ Steps (`agent::check_program`, `agent::guards::JobGuards`, `agent::launch::launc
    always the default, whatever a registration definition declares), provision its
    auth key and connect the gRPC client (design 7.4).
 6. Run the program under the request policy and the default job limits (ADR-235), then stop
-   the worker and release the guards. The policy is read-only, except that a debug build may send any request once
+   the worker and release the guards. A worker that ignores the stop request is killed after
+   5 s and reported on stderr. When the job's link was not confirmed closed and the worker
+   cannot be stopped either, the run fails with "the worker may still hold the VCI", and the
+   locks stay held until the process exits (ADR-258). The policy is read-only, except that a debug build may send any request once
    the worker's VCI has identified itself as `sim-vci` (ADR-247); a program that needs more
    than the VCI allows is refused after the link opens, before its first instruction runs.
    On that permission the `FlashTransfer` instruction also works (ADR-250); `SecurityAccess`
@@ -82,7 +85,7 @@ commits 0 (ADR-252).
 | Exit status | Meaning | Output |
 |---|---|---|
 | 0 | The program ran to its end | The final `diag_ir::VmState` as one line of JSON on stdout. A negative response is a value on the stack, not a failure |
-| 1 | Reading the program, launching the worker or the job failed, or the final state holds a non-finite float (infinity or NaN), which JSON cannot represent | The reason on stderr |
+| 1 | Reading the program, launching the worker or the job failed, the worker may still hold the VCI after a failed link close, or the final state holds a non-finite float (infinity or NaN), which JSON cannot represent | The reason on stderr |
 | 2 | Invalid command line | The error and the usage on stderr |
 
 The worker's own log goes to stderr.
@@ -221,7 +224,17 @@ once the job thread has ended. A job that survives a worker crash, a VCI disconn
 of the vehicle's supply alone gets them back, still held, and passes them to its next run. A
 VCI name has 1 to `MAX_VCI_NAME` (100) bytes. The lock directory is one per device,
 shared by every agent process on it whichever user it runs as: each of them must be able to
-create files in it and read the lock files there (lock files are opened read-only). On Unix
+create files in it and read the lock files there (lock files are opened read-only).
+
+A run whose link close fails, panics or runs during an unwind gives its guards back marked
+(`JobGuards::link_unconfirmed`), whatever the job's own result (ADR-258). Marked guards refuse
+another run (`JobError::LinkUnconfirmed`), and dropping them keeps their locks until the
+process exits. The caller stops the worker that held the link (`WorkerProcess::stop`, which
+returns `Ok` only once the child is reaped) and then calls `JobGuards::worker_gone`, before the
+guards serve another run or are released. The runner closes the link exactly once on every
+path after it opened, a panic included. An agent killed without running its exit path still
+frees its locks while its orphaned worker tears the link down on stdin EOF; the next open of
+a device still held usually fails. On Unix
 the guards refuse a directory that group or others may write unless it has the sticky bit
 (`GuardError::UnsafeDir`): another user could otherwise delete a lock file a job holds, and a
 second job would lock the new file at the same path. A directory the guards create is writable

@@ -245,8 +245,9 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-253](ADR-253-restart-classification-and-the-recovery-point-intent.md) | Restart Classification and a Write-Ahead Intent at the Recovery-Required Point | Accepted (item 4's wiring into the runner decided by ADR-255) | `agent` restart, journaling, journal |
 | [ADR-254](ADR-254-starlark-for-proprietary-procedures.md) | Starlark Replaces JavaScript as the Proprietary Procedure Language | Accepted | `diag-frontend` subset spec, design 8.4, `ir.fbs` `source_format` |
 | [ADR-255](ADR-255-restart-entry-in-the-job-runner.md) | The Restart Entry in the Job Runner | Accepted (item 5's "locks not taken" and the duplicate-resume consequence superseded by ADR-256) | `agent` runner, restart, journaling |
-| [ADR-256](ADR-256-restart-guards-as-os-file-locks.md) | Restart Guards as OS Locks on Files in a Device Lock Directory | Accepted (the first-run consequence and item 1's write access to lock files superseded by ADR-257) | `agent` guards, runner |
+| [ADR-256](ADR-256-restart-guards-as-os-file-locks.md) | Restart Guards as OS Locks on Files in a Device Lock Directory | Accepted (the first-run consequence and item 1's write access to lock files superseded by ADR-257; the failed-close consequence superseded by ADR-258) | `agent` guards, runner |
 | [ADR-257](ADR-257-every-job-runs-on-guards.md) | Every Job Runs on Guards It Holds | Accepted | `agent` guards, runner, policy, CLI |
+| [ADR-258](ADR-258-a-failed-link-close-keeps-the-job-guards.md) | A Failed Link Close Keeps the Job Guards | Accepted | `agent` guards, runner, CLI; `worker-host` |
 
 ## Status Legend
 
@@ -593,8 +594,9 @@ the predecessor repository these ADRs came from.
 - ADR-252 (item 2's open point decided by ADR-253)
 - ADR-253 (item 4's wiring into the runner decided by ADR-255)
 - ADR-255 (item 5's "locks not taken" and the duplicate-resume consequence superseded by ADR-256)
-- ADR-256 (the first-run consequence and item 1's write access to lock files superseded by ADR-257)
+- ADR-256 (the first-run consequence and item 1's write access to lock files superseded by ADR-257; the failed-close consequence superseded by ADR-258)
 - ADR-257
+- ADR-258
 
 ### Diagnostic IR
 - ADR-233 (item 3's `VmState` fields removed by ADR-245)

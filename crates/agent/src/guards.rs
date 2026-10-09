@@ -53,6 +53,9 @@ pub struct JobGuards {
     _vci: LockFile,
     _slot: LockFile,
     vehicle: Mutex<Option<(String, LockFile)>>,
+    /// Held for a whole promotion, so promotions run one at a time: a second one waits for the
+    /// first and then finds its result, rather than waiting on the first one's file lock.
+    promoting: Mutex<()>,
 }
 
 impl JobGuards {
@@ -72,14 +75,15 @@ impl JobGuards {
             _vci: vci,
             _slot: slot,
             vehicle: Mutex::new(None),
+            promoting: Mutex::new(()),
         })
     }
 
     /// Promotes to the per-vehicle lock of `vin` once a VIN read first matched the job's VIN
     /// (design 8.8; ADR-229 item 2 steps 2 and 3), waiting while another job holds it. A second
-    /// call with the same VIN does nothing; one with another VIN is refused. The job's restart
-    /// steps promote from one thread: two calls racing for a VIN not held yet would wait on each
-    /// other's lock until cancelled.
+    /// call with the same VIN does nothing; one with another VIN is refused. Promotions run one
+    /// at a time: a call made while another one waits blocks until that one ends, whatever its
+    /// own `cancelled` says, and then answers from its result.
     pub fn promote(
         &self,
         vin: &str,
@@ -89,24 +93,15 @@ impl JobGuards {
         if vin.is_empty() || vin.len() > 64 {
             return Err(GuardError::InvalidVin(vin.to_owned()));
         }
+        let _promoting = self.promoting.lock().unwrap_or_else(|e| e.into_inner());
         if self.check_vehicle(vin)? {
             return Ok(());
         }
-        // Waited for without the mutex, so `vehicle` stays answerable meanwhile.
+        // Waited for without the `vehicle` mutex, so `vehicle()` stays answerable meanwhile.
+        // Only this call promotes now, so nothing else can set `vehicle` before it does.
         let lock = LockFile::wait(&vehicle_path(&self.dir, vin), poll, cancelled)?;
-        let mut vehicle = self.vehicle.lock().unwrap_or_else(|e| e.into_inner());
-        match &*vehicle {
-            // Another call promoted meanwhile; the lock just taken goes again.
-            Some((held, _)) if held == vin => Ok(()),
-            Some((held, _)) => Err(GuardError::OtherVehicle {
-                held: held.clone(),
-                asked: vin.to_owned(),
-            }),
-            None => {
-                *vehicle = Some((vin.to_owned(), lock));
-                Ok(())
-            }
-        }
+        *self.vehicle.lock().unwrap_or_else(|e| e.into_inner()) = Some((vin.to_owned(), lock));
+        Ok(())
     }
 
     /// Whether the job already holds `vin`'s lock; an error if it holds another vehicle's.
@@ -293,6 +288,29 @@ mod tests {
         assert!(!waiter.is_finished());
         drop(guards);
         waiter.join().unwrap().expect("free once the job ended");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Two promotions of one VIN at once both succeed: the second waits for the first rather
+    /// than for the first one's file lock.
+    #[test]
+    fn concurrent_promotions_of_one_vin_both_succeed() {
+        let dir = dir("promote-race");
+        let guards = Arc::new(
+            JobGuards::take(&setup(&dir, "VCI-1"), POLL, &AtomicBool::new(false)).expect("guards"),
+        );
+        let vin = "WVWZZZ1JZXW000001";
+        let promotions: Vec<_> = (0..4)
+            .map(|_| {
+                let guards = Arc::clone(&guards);
+                std::thread::spawn(move || guards.promote(vin, POLL, &AtomicBool::new(false)))
+            })
+            .collect();
+        for promotion in promotions {
+            promotion.join().unwrap().expect("promoted");
+        }
+        assert_eq!(guards.vehicle().as_deref(), Some(vin));
+        drop(guards);
         fs::remove_dir_all(&dir).unwrap();
     }
 

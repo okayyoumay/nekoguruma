@@ -199,7 +199,7 @@ files are never deleted.
   slot. It waits while another job holds either, retrying every `poll`, and stops on a cancel
   (`GuardError::Cancelled`).
 - `JobGuards::promote(vin, ...)` takes the per-vehicle lock the same way. The same VIN again
-  does nothing; another VIN is refused.
+  does nothing; another VIN is refused. A job's promotions run one at a time.
 - Locks are always taken in the order VCI, slot, vehicle, and held until the `JobGuards` is
   dropped.
 

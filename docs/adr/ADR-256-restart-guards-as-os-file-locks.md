@@ -47,8 +47,10 @@ Several things are not settled by the design:
    example the one `ngr-agent run --vci` takes. Two jobs on one VCI must give the same name.
 3. **Waiting polls, and a cancel stops it.** `JobGuards::take` and `JobGuards::promote` try
    the lock, sleep for the given poll (at least 1 ms, so a zero never spins), and try again
-   while another job holds it. `promote` waits without holding the guards' own mutex. A
-   cancel ends the wait with nothing taken; the runner reports it as `JobError::Cancelled`.
+   while another job holds it. Promotions of one job run one at a time, so two at once never
+   wait on each other's file lock; the guards' VIN can still be read during a promotion's
+   wait. A
+   cancel ends the wait with nothing taken, and the caller gets `GuardError::Cancelled`.
    A blocking lock call could not be cancelled. A standalone agent has no start deadline, so
    the wait has no other end (ADR-255 item 4).
 4. **Fixed lock order: VCI, slot, vehicle.** Every job takes them in this order and holds

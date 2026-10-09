@@ -65,6 +65,14 @@ pub enum ResolveError {
         /// The underlying error.
         source: io::Error,
     },
+    /// The definition directory is a symbolic link (or, on Windows, another reparse point such
+    /// as a junction): it is refused, so the definitions read are those of the fixed directory
+    /// itself (ADR-228 item 2, ADR-266).
+    #[error("the definition directory {} is a link; it is refused", path.display())]
+    LinkedDirectory {
+        /// The directory.
+        path: PathBuf,
+    },
     /// No registration with this name exists.
     #[error("VCI '{name}' not found{}", skipped_note(*skipped_invalid))]
     NotFound {
@@ -99,6 +107,26 @@ pub enum ResolveError {
 /// A missing directory yields no definitions. Any other failure to list it is an error.
 /// Invalid files are returned in [`Definitions::invalid`] and logged at warn level.
 pub fn read_definitions(dir: &Path) -> Result<Definitions, ResolveError> {
+    // The directory itself must not be a link: `read_dir` would follow it, and the definitions
+    // would come from wherever it points. Its parents are left to the 7.2 checks.
+    match fs::symlink_metadata(dir) {
+        Ok(metadata) if is_link(&metadata) => {
+            return Err(ResolveError::LinkedDirectory {
+                path: dir.to_owned(),
+            });
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            debug!(dir = %dir.display(), "definition directory does not exist");
+            return Ok(Definitions::default());
+        }
+        Err(source) => {
+            return Err(ResolveError::Io {
+                path: dir.to_owned(),
+                source,
+            });
+        }
+    }
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -208,6 +236,20 @@ pub fn resolve(name: &str) -> Result<Resolved, ResolveError> {
     }
 }
 
+/// Whether `metadata` (not following links) is a symbolic link or, on Windows, any reparse
+/// point (a junction, for one).
+fn is_link(metadata: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return true;
+        }
+    }
+    metadata.file_type().is_symlink()
+}
+
 /// Resolves `name` in the given registry view (Windows only).
 #[cfg(windows)]
 pub fn resolve_on_registry(
@@ -216,23 +258,30 @@ pub fn resolve_on_registry(
 ) -> Result<Resolved, ResolveError> {
     use j2534_0404_registry::RegistryError;
     match j2534_0404_registry::find_j2534_device_on_registry(name, mode) {
-        Ok(device) => Ok(Resolved {
-            definition: Definition {
-                name: device.device_name,
-                vendor: None,
-                library: device.library_path,
-                config_application: None,
-                protocols: Vec::new(),
-                long_size: None,
-                search_paths: Vec::new(),
-            },
-            source: Source::Registry,
-        }),
+        Ok(device) => Ok(resolved_from_registry(device)),
         Err(RegistryError::NotFound(name)) => Err(ResolveError::NotFound {
             name,
             skipped_invalid: 0,
         }),
         Err(e) => Err(ResolveError::Registry(e)),
+    }
+}
+
+/// The [`Resolved`] of a registry hit: its key name and library; the registry lookup gives no
+/// protocols, `LongSize` or search paths.
+#[cfg(windows)]
+fn resolved_from_registry(device: j2534_0404_registry::J2534DeviceInfo) -> Resolved {
+    Resolved {
+        definition: Definition {
+            name: device.device_name,
+            vendor: None,
+            library: device.library_path,
+            config_application: None,
+            protocols: Vec::new(),
+            long_size: None,
+            search_paths: Vec::new(),
+        },
+        source: Source::Registry,
     }
 }
 

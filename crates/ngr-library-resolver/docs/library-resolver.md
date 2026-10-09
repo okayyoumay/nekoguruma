@@ -19,7 +19,10 @@ files with the extension exactly `toml` (lower case) are read; everything else i
 named just `.toml` has no extension and is ignored; hidden files such as `.x.toml` are read. A
 `.toml` entry that is a symlink or a directory is not followed or read: it is reported as invalid
 (`NotARegularFile`). A file larger than 64 KiB is invalid (`TooLarge`). The file name carries no
-meaning.
+meaning. A definition directory that is itself a symlink (or, on Windows, a junction or another
+reparse point) is refused as a whole (`ResolveError::LinkedDirectory`), so no definition comes
+from outside it; whether its parent folders can be written by regular users is for the 7.2
+checks.
 
 Keys mirror the Windows registry value names. Unknown keys make the definition invalid.
 

@@ -243,6 +243,29 @@ fn symlinked_toml_is_invalid() {
     ));
 }
 
+/// A definition directory that is itself a symlink is refused, even when the files it points to
+/// are valid definitions.
+#[cfg(unix)]
+#[test]
+fn a_linked_definition_directory_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real");
+    fs::create_dir(&real).unwrap();
+    fs::write(real.join("a.toml"), minimal("Linked")).unwrap();
+    let link = dir.path().join("j2534");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    assert!(matches!(
+        read_definitions(&link),
+        Err(ResolveError::LinkedDirectory { .. })
+    ));
+    assert!(matches!(
+        resolve_in_dir(&link, "Linked"),
+        Err(ResolveError::LinkedDirectory { .. })
+    ));
+    // The directory it points to is read as usual.
+    assert!(resolve_in_dir(&real, "Linked").is_ok());
+}
+
 #[test]
 fn results_are_sorted_by_path() {
     let dir = tempfile::tempdir().unwrap();
@@ -369,4 +392,24 @@ fn registry_unknown_name_is_not_found() {
         resolve("__nonexistent_j2534_device__"),
         Err(ResolveError::NotFound { .. })
     ));
+}
+
+/// A registry hit becomes a `Resolved` with its key name and library, from the registry.
+#[cfg(windows)]
+#[test]
+fn a_registry_hit_maps_to_a_resolved() {
+    use j2534_0404_registry::{J2534DeviceInfo, LibraryArch, LibrarySource};
+    let library = std::env::temp_dir().join("vendor").join("j2534.dll");
+    let resolved = resolved_from_registry(J2534DeviceInfo {
+        device_name: "Vendor VCI".to_owned(),
+        library_path: library.clone(),
+        arch: LibraryArch::Native,
+        source: LibrarySource::Registry,
+    });
+    assert_eq!(resolved.source, Source::Registry);
+    assert_eq!(resolved.definition.name, "Vendor VCI");
+    assert_eq!(resolved.definition.library, library);
+    assert!(resolved.definition.protocols.is_empty());
+    assert_eq!(resolved.definition.long_size, None);
+    assert!(resolved.definition.search_paths.is_empty());
 }

@@ -20,8 +20,10 @@ services. Nothing reads the definitions yet.
 ## Decision
 
 1. **TOML, one file per VCI.** Only regular files directly in the definition directory whose
-   extension is `toml` are read; the file name is free. A symbolic link there is refused, so a
-   definition cannot point outside the root-owned directory, and a file larger than 64 KiB is
+   extension is `toml` are read; the file name is free. A symbolic link there is refused, and so is a
+   definition directory that is itself a link (a junction too, on Windows), so a definition
+   cannot come from outside the root-owned directory; its parent folders are left to the 7.2
+   checks, and a file larger than 64 KiB is
    refused. TOML is what the workspace already
    uses for configuration, and it is easy to write by hand and from the generation helper.
 2. **Keys are the Windows value names.** `Name` (required, not empty), `Vendor`,

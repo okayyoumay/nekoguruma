@@ -1568,6 +1568,7 @@ mod tests {
             },
             Record::TransferExitIntent { at: at(0, 0) },
             Record::PostTransferComplete,
+            Record::Intent { at: at(0, 0) },
         ];
         for (index, record) in records.iter().enumerate() {
             assert_eq!(

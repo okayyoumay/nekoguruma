@@ -48,6 +48,9 @@ pub enum OnSiteReason {
     /// The journal cannot be read back: corrupt, of an unknown format version, of another job,
     /// or unreadable (ADR-244 item 5).
     UnreadableJournal(String),
+    /// A program with a flash recovery plan has no journal. The runner creates one before it
+    /// sends anything, so a missing one may have been lost after an erase.
+    MissingJournal,
     /// The interruption point is at or past the plan's recovery-required point and before the
     /// plan's end (ADR-245 item 3).
     RecoveryRequiredPoint { flash_session: u32, at: StepRef },
@@ -66,15 +69,22 @@ pub enum OnSiteReason {
 }
 
 /// Decides how the job of `program` goes on, from its journal as `Journal::read` (or
-/// `Journal::open`) gave it. No journal at all (`JournalError::NotFound`) is a job that never
-/// started its journal: a plain start.
+/// `Journal::open`) gave it. No journal at all (`JournalError::NotFound`) is a plain start only
+/// for a program without a flash recovery plan, which keeps none. For a program with one it is
+/// on-site intervention: the runner creates the journal before it sends anything, so a missing
+/// one cannot be told from one lost after an erase.
 pub fn classify(
     program: &Program,
     journal: Result<&JournalState, &JournalError>,
 ) -> RestartDecision {
     let state = match journal {
         Ok(state) => state,
-        Err(JournalError::NotFound) => return RestartDecision::PlainStart,
+        Err(JournalError::NotFound) if program.flash.is_empty() => {
+            return RestartDecision::PlainStart;
+        }
+        Err(JournalError::NotFound) => {
+            return RestartDecision::OnSiteInterventionRequired(OnSiteReason::MissingJournal);
+        }
         Err(error) => {
             return RestartDecision::OnSiteInterventionRequired(OnSiteReason::UnreadableJournal(
                 error.to_string(),
@@ -416,8 +426,15 @@ mod tests {
             decide(&program, &journal_until(&program, ENTRY)),
             RestartDecision::PlainStart
         );
+        // No journal: a plain start only for a program without a plan, which keeps none.
         assert_eq!(
             classify(&program, Err(&JournalError::NotFound)),
+            RestartDecision::OnSiteInterventionRequired(OnSiteReason::MissingJournal)
+        );
+        let mut no_plan = program.clone();
+        no_plan.flash.clear();
+        assert_eq!(
+            classify(&no_plan, Err(&JournalError::NotFound)),
             RestartDecision::PlainStart
         );
     }

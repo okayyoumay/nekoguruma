@@ -7,7 +7,9 @@
 //! - at a plan's `entry_pc`, once per job and before its first transfer: the ECU hardware part
 //!   number and software version, read through the sources the program declares;
 //! - at `erase_pc`: the transfer-start marker;
-//! - at `transfer_exit_pc`: the RequestTransferExit marker.
+//! - at `transfer_exit_pc`: the RequestTransferExit marker;
+//! - at the first diagnostic primitive at or past a plan's recovery-required point that is
+//!   neither of those, once per pass through the plan: a request intent (ADR-253).
 //!
 //! When an instruction completes ([`JobJournal::completed`]):
 //! - a `FlashTransfer`: the block, by the host's running index;

@@ -58,7 +58,11 @@ Two ways to close this were considered:
    A marker or an intent names a request that may have been sent; a step names one that was.
 3. **`restart::classify`** reads the journal (`Journal::read` or `Journal::open`) together
    with the program, contacts nothing, and decides one of three things.
-   - **No journal** (`NotFound`): a plain start.
+   - **No journal** (`NotFound`): a plain start for a program without a flash recovery plan,
+     which keeps none. For a program with a plan it is on-site intervention: the runner creates
+     the journal before it sends anything, so a missing one cannot be told from one lost after
+     an erase. A crash between the link opening and the journal's creation then errs on the side
+     of on-site intervention, although nothing was sent.
    - **An unreadable journal** (corrupt, of an unknown format version, of another job, or I/O):
      `OnSiteInterventionRequired`.
    - **An interruption point that rules a restart out**: on-site intervention. That is a point

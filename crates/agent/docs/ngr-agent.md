@@ -139,7 +139,8 @@ step count, of the last completed step, the two transfer markers and the last re
 
 | Journal | Decision |
 |---|---|
-| none (`NotFound`) | plain start |
+| none (`NotFound`), program without a plan | plain start |
+| none (`NotFound`), program with a plan | `OnSiteInterventionRequired` (the journal is created before anything is sent) |
 | unreadable (corrupt, unknown format version, another job, I/O) | `OnSiteInterventionRequired` |
 | interruption point at or past a plan's recovery-required point and before its end, or inside a `RecoveryRequired` section the journal can place it in (inside a plan, on the step into a plan's entry, or at a completed plan's end); a point no later than the last post-transfer step of a completed transfer counts as at that plan's end | `OnSiteInterventionRequired` |
 | no transfer-start marker | plain start |

@@ -35,13 +35,20 @@ Three points are not settled by ADR-229 or the design:
    restart takes the passive teardown without reading anything.
 2. **The gates give a decision; the teardown acts on it.** `restart::check_gates` runs after
    `check_before_ecu` and returns a `TeardownGate`: `ResetAllowed`, or `PassiveOnly` with the
-   first gate that did not hold (`PassiveReason`). The gates stop at the first one that does not
+   first gate that did not hold (`PassiveReason`). `ResetAllowed` means the gates do not rule a
+   reset out; the journal's own exclusions (no reset once RequestTransferExit was journaled,
+   none on the completed path) belong to the teardown, which applies them on top. The gates stop at the first one that does not
    hold, since a later one cannot make the decision better. Until the teardown is implemented,
    the restart ends in `OnSiteReason::RestartOrderUnavailable` carrying the decision.
-3. **Only a decoded VIN of another vehicle aborts.** A VIN read that decodes to text other than
-   the job's ends the job in `JobError::IdentityMismatch` (design 5.6 `Interrupted -> Failed`).
-   No answer, a negative response, a value that does not decode, or a VIN source the procedure
-   does not map gives `PassiveOnly(VinNotEstablished)`. At this step a hardware part number that
+3. **Only a decoded VIN of another vehicle aborts.** A VIN read that decodes to a well-formed
+   VIN other than the job's ends the job in `JobError::IdentityMismatch` (design 5.6
+   `Interrupted -> Failed`). Well-formed means 17 characters from the VIN character set of ISO
+   3779 (digits and upper-case letters other than I, O and Q). Text that is not a well-formed
+   VIN (a padded field, lower case, an empty answer) does not count as decoded: an abort is a
+   verdict that the ECU belongs to another vehicle, and malformed text proves nothing of the
+   kind. No answer, a negative response, a value that does not decode, or a VIN source the
+   procedure or the agent's source table does not map gives `PassiveOnly(VinNotEstablished)`. A
+   job VIN that is not well-formed counts as no job VIN. At this step a hardware part number that
    differs from the journal's is not an abort but `PassiveOnly(HardwareIdentityDiffers)`:
    ADR-229 makes it an abort only in step 3, once the ECU is confirmed in its default session.
    The hardware part number is compared as the raw field bytes the journal recorded.
@@ -70,5 +77,13 @@ Three points are not settled by ADR-229 or the design:
   RequestTransferExit remain to be built on this decision.
 - The promotion to the per-vehicle lock at the first matching VIN (ADR-229 item 2, ADR-256
   item 6) is not part of the gates; it needs the per-vehicle lock first.
+- A placeholder that a bootloader may answer after an erase and that happens to be a
+  well-formed VIN (for example seventeen zeros) still aborts the job. Nothing tells it apart
+  from another vehicle's VIN; the job ends without a reset either way.
+- An abort is not journaled as a terminal state: like the on-site endings, a later resume of the
+  same job counts another resume and runs the gates again.
+- When the ECU does not answer its ECU-sourced precondition reads, the gates can take up to two
+  request timeouts per precondition. A start deadline, which a server's job instruction
+  carries, would bound this.
 - A first run does not yet compare the VIN with the job's: that is the VIN match of the
   execution preconditions (design 8.9.1), which come with the job policy.

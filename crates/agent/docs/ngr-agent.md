@@ -199,9 +199,10 @@ entry.
 at the first gate that does not hold:
 
 1. The VIN, through the program's VIN source, against the VIN the job names
-   (`JournalSetup::vin`). A VIN that decodes to another vehicle ends the job in
-   `JobError::IdentityMismatch`. No answer, a negative response, a value that does not decode,
-   or a job that names no VIN (which reads nothing) gives `PassiveOnly(VinNotEstablished)`.
+   (`JournalSetup::vin`). A well-formed VIN (17 characters of the ISO 3779 set) other than the
+   job's ends the job in `JobError::IdentityMismatch`. No answer, a negative response, text
+   that is not a well-formed VIN, or a job that names no well-formed VIN (which reads nothing)
+   gives `PassiveOnly(VinNotEstablished)`.
 2. The ECU's hardware part number, against the bytes the journal recorded before the erase. A
    different one gives `PassiveOnly(HardwareIdentityDiffers)`, one that cannot be read (or no
    recorded value) `PassiveOnly(HardwareIdentityNotEstablished)`. It aborts only in the later
@@ -212,7 +213,9 @@ at the first gate that does not hold:
    declared range, or none (no source, an unmapped one, no answer), gives
    `PassiveOnly(Precondition(kind))`.
 
-When all hold the decision is `ResetAllowed`. A failure to use the worker during a read counts
+When all hold the decision is `ResetAllowed`: the gates do not rule a reset out, and the
+teardown still applies the journal's exclusions (none after RequestTransferExit was journaled,
+none on the completed path). A failure to use the worker during a read counts
 as a read that gave no value. Neither the error nor the log carries a VIN. A cancel stops the
 gates before and after each read.
 

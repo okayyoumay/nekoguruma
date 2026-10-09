@@ -1,7 +1,7 @@
 // Schema for the IR declaration part (design document 8.2.2).
 //
 // Policy:
-//  - Whatever the input format (ODX/OTX, CSV+JS), the frontend normalizes it into this shape (8.2)
+//  - Whatever the input format (ODX/OTX, CSV+Starlark), the frontend normalizes it into this shape (8.2)
 //  - ODX layouts are resolved at import time into flat field arrays. Monitor sets are always
 //    flat, so they are decoded by walking an array. Other requests and responses may also contain
 //    repetitions, keyed selections and structures placed or sized at runtime, which refer to
@@ -414,7 +414,7 @@ table MonitorSet {
 
 table EcuDocument {
   schema_version: uint32;
-  // Provenance of the input format (8.2). "odx" | "csv-js" etc.
+  // Provenance of the input format (8.2). "odx" | "csv-starlark" etc.
   source_format: string;
   source_digest: string;     // hash of the original file
   variant: EcuVariant;

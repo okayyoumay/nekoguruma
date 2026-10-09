@@ -39,3 +39,9 @@ and dropping old partitions (15.1).
 - **Monitoring frames**: display only, not recorded (4.6).
   Only captured windows go into `datasets`
 - **Session tokens**: OIDC access tokens are not stored
+
+## Column values
+
+- `ir_documents.source_format`: `odx` or `csv-starlark` (the proprietary format, ADR-254).
+  The comment in `0001_init.sql` still names the earlier `csv-js`; the column is free text, so
+  no migration is needed.

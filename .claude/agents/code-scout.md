@@ -19,7 +19,7 @@ Workspace map (use it to narrow searches before grepping broadly):
 
 - All crates are under `crates/`. `README.md` has the crate table with the
   design-document section each crate implements.
-- Server side: `server`, `diag-frontend` (ODX/OTX/CSV/JS to IR),
+- Server side: `server`, `diag-frontend` (ODX/OTX/CSV/Starlark to IR),
   `vendor-manifest`. Device side: `agent`, `worker-host`.
   Shared: `shared-proto`, `shared-crypto`, `diag-ir` (IR, bytecode, VM),
   `j2534-defs`, `vci-discovery`.

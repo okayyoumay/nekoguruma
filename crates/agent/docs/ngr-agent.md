@@ -160,10 +160,9 @@ plan's entry; otherwise, or for a stage the program does not declare, the decisi
 ## Restart entry
 
 `agent::resume_program_journaled` takes the arguments of `run_program_journaled` and the job's
-restart guards (`RestartGuards`, "Restart guards" below), for a job that ran before (ADR-255).
-It takes or keeps the guards before the link opens. Once the link is open and the policy
-allows the program, and before anything is sent to the ECU, it opens the job's journal
-(`Journal::open`) and classifies it.
+restart guards (`Arc<JobGuards>`, "Restart guards" below), for a job that ran before (ADR-255).
+Once the link is open and the policy allows the program, and before anything is sent to the
+ECU, it opens the job's journal (`Journal::open`) and classifies it.
 
 | Decision | What the runner does |
 |---|---|
@@ -204,12 +203,14 @@ files are never deleted.
 - Locks are always taken in the order VCI, slot, vehicle, and held until the `JobGuards` is
   dropped.
 
-`resume_program_journaled` takes `RestartGuards::Take(GuardSetup)` for a new run after an agent
-crash or a loss of the device's power. It takes the guards before `link::open`, so a duplicate
-resume of the same job waits there without opening a link. `RestartGuards::Held(Arc<JobGuards>)`
-is for a job that survived a worker crash, a VCI disconnect or a loss of the vehicle's supply
-alone: it keeps the guards it holds rather than waiting on itself. `run_program` and
-`run_program_journaled` take no guards.
+`resume_program_journaled` requires the guards as an `Arc<JobGuards>`, and the caller owns
+them. A new run after an agent crash or a loss of the device's power takes them with
+`JobGuards::take` before it calls the runner, so a duplicate resume of the same job waits there
+without opening a link. The runner holds its clone until the job ends. A job that survives a
+worker crash, a VCI disconnect or a loss of the vehicle's supply alone still holds the guards
+when the runner returns, and passes them to its next run. The lock directory is one per device,
+shared by every agent process on it whichever user it runs as, and its files must be writable
+by all of them. `run_program` and `run_program_journaled` take no guards.
 
 ## Restart inputs
 

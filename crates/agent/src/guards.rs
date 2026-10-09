@@ -77,7 +77,9 @@ impl JobGuards {
 
     /// Promotes to the per-vehicle lock of `vin` once a VIN read first matched the job's VIN
     /// (design 8.8; ADR-229 item 2 steps 2 and 3), waiting while another job holds it. A second
-    /// call with the same VIN does nothing; one with another VIN is refused.
+    /// call with the same VIN does nothing; one with another VIN is refused. The job's restart
+    /// steps promote from one thread: two calls racing for a VIN not held yet would wait on each
+    /// other's lock until cancelled.
     pub fn promote(
         &self,
         vin: &str,
@@ -87,20 +89,37 @@ impl JobGuards {
         if vin.is_empty() || vin.len() > 64 {
             return Err(GuardError::InvalidVin(vin.to_owned()));
         }
+        if self.check_vehicle(vin)? {
+            return Ok(());
+        }
+        // Waited for without the mutex, so `vehicle` stays answerable meanwhile.
+        let lock = LockFile::wait(&vehicle_path(&self.dir, vin), poll, cancelled)?;
         let mut vehicle = self.vehicle.lock().unwrap_or_else(|e| e.into_inner());
         match &*vehicle {
-            Some((held, _)) if held == vin => return Ok(()),
-            Some((held, _)) => {
-                return Err(GuardError::OtherVehicle {
-                    held: held.clone(),
-                    asked: vin.to_owned(),
-                });
+            // Another call promoted meanwhile; the lock just taken goes again.
+            Some((held, _)) if held == vin => Ok(()),
+            Some((held, _)) => Err(GuardError::OtherVehicle {
+                held: held.clone(),
+                asked: vin.to_owned(),
+            }),
+            None => {
+                *vehicle = Some((vin.to_owned(), lock));
+                Ok(())
             }
-            None => {}
         }
-        let lock = LockFile::wait(&vehicle_path(&self.dir, vin), poll, cancelled)?;
-        *vehicle = Some((vin.to_owned(), lock));
-        Ok(())
+    }
+
+    /// Whether the job already holds `vin`'s lock; an error if it holds another vehicle's.
+    fn check_vehicle(&self, vin: &str) -> Result<bool, GuardError> {
+        let vehicle = self.vehicle.lock().unwrap_or_else(|e| e.into_inner());
+        match &*vehicle {
+            Some((held, _)) if held == vin => Ok(true),
+            Some((held, _)) => Err(GuardError::OtherVehicle {
+                held: held.clone(),
+                asked: vin.to_owned(),
+            }),
+            None => Ok(false),
+        }
     }
 
     /// The VIN whose per-vehicle lock the job holds, if it was promoted.
@@ -115,8 +134,9 @@ impl JobGuards {
 struct LockFile(#[expect(dead_code, reason = "held only for its lock")] File);
 
 impl LockFile {
-    /// Locks `path`, waiting `poll` between tries while another handle holds it.
+    /// Locks `path`, waiting `poll` (at least 1 ms) between tries while another handle holds it.
     fn wait(path: &Path, poll: Duration, cancelled: &AtomicBool) -> Result<Self, GuardError> {
+        let poll = poll.max(Duration::from_millis(1));
         let file = OpenOptions::new()
             .write(true)
             .create(true)
@@ -180,8 +200,8 @@ mod tests {
         setup: GuardSetup,
         cancelled: Arc<AtomicBool>,
     ) -> std::thread::JoinHandle<(Result<JobGuards, GuardError>, Duration)> {
+        let start = Instant::now();
         std::thread::spawn(move || {
-            let start = Instant::now();
             let taken = JobGuards::take(&setup, POLL, &cancelled);
             (taken, start.elapsed())
         })
@@ -215,6 +235,13 @@ mod tests {
         cancelled.store(true, Ordering::Relaxed);
         let (taken, _) = waiter.join().unwrap();
         assert!(matches!(taken, Err(GuardError::Cancelled)), "{taken:?}");
+        // The cancelled job let go of VCI-2's lock it had taken.
+        let vci2 = File::options()
+            .write(true)
+            .open(vci_path(&dir, "VCI-2"))
+            .unwrap();
+        vci2.try_lock().expect("VCI-2's lock is free again");
+        drop((vci2, _held));
         fs::remove_dir_all(&dir).unwrap();
     }
 

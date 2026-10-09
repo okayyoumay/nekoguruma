@@ -935,7 +935,7 @@ The targets form 3 tiers: VCI (communication interface) -> vehicle bus -> ECU.
 
 | Layer | Means | Limitation |
 |---|---|---|
-| Same PC | OS-level exclusive lock (`Global\` mutex / `flock`) | Same PC only |
+| Same PC | OS-level exclusive lock (a file lock in a device lock directory, ADR-256) | Same PC only |
 | Server | Per-VIN soft lock (recording running jobs and warning) | Does not work offline |
 | Vehicle | Check session state and bus conditions on connection | Detection, not prevention |
 

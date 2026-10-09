@@ -29,6 +29,6 @@ pub use host::{HostError, Timings, WorkerHost};
 pub use journaling::JournalSetup;
 pub use link::{Link, LinkConfig};
 pub use runner::{
-    JobError, JobLimits, RestartGuards, check_program, resume_program_journaled, run_program,
+    JobError, JobLimits, check_program, resume_program_journaled, run_program,
     run_program_journaled,
 };

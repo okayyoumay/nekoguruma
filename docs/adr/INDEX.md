@@ -244,7 +244,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-252](ADR-252-job-runner-journals-at-plan-boundaries.md) | The Job Runner Journals at the Flash Recovery Plan's Boundaries | Accepted (item 2's open point decided by ADR-253) | `agent` runner, journaling, inputs |
 | [ADR-253](ADR-253-restart-classification-and-the-recovery-point-intent.md) | Restart Classification and a Write-Ahead Intent at the Recovery-Required Point | Accepted (item 4's wiring into the runner decided by ADR-255) | `agent` restart, journaling, journal |
 | [ADR-254](ADR-254-starlark-for-proprietary-procedures.md) | Starlark Replaces JavaScript as the Proprietary Procedure Language | Accepted | `diag-frontend` subset spec, design 8.4, `ir.fbs` `source_format` |
-| [ADR-255](ADR-255-restart-entry-in-the-job-runner.md) | The Restart Entry in the Job Runner | Accepted (item 5's "locks not taken" superseded by ADR-256) | `agent` runner, restart, journaling |
+| [ADR-255](ADR-255-restart-entry-in-the-job-runner.md) | The Restart Entry in the Job Runner | Accepted (item 5's "locks not taken" and the duplicate-resume consequence superseded by ADR-256) | `agent` runner, restart, journaling |
 | [ADR-256](ADR-256-restart-guards-as-os-file-locks.md) | Restart Guards as OS Locks on Files in a Device Lock Directory | Accepted | `agent` guards, runner |
 
 ## Status Legend
@@ -591,7 +591,7 @@ the predecessor repository these ADRs came from.
 - ADR-250
 - ADR-252 (item 2's open point decided by ADR-253)
 - ADR-253 (item 4's wiring into the runner decided by ADR-255)
-- ADR-255 (item 5's "locks not taken" superseded by ADR-256)
+- ADR-255 (item 5's "locks not taken" and the duplicate-resume consequence superseded by ADR-256)
 - ADR-256
 
 ### Diagnostic IR

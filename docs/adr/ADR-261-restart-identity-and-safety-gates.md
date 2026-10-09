@@ -37,21 +37,22 @@ Three points are not settled by ADR-229 or the design:
    `check_before_ecu` and returns a `TeardownGate`: `ResetAllowed`, or `PassiveOnly` with the
    first gate that did not hold (`PassiveReason`). `ResetAllowed` means the gates do not rule a
    reset out; the journal's own exclusions (no reset once RequestTransferExit was journaled,
-   none on the completed path) belong to the teardown, which applies them on top. The gates stop at the first one that does not
-   hold, since a later one cannot make the decision better. Until the teardown is implemented,
-   the restart ends in `OnSiteReason::RestartOrderUnavailable` carrying the decision.
+   none on the completed path) belong to the teardown, which applies them on top. The gates stop
+   at the first one that does not hold, since a later one cannot make the decision better. Until
+   the teardown is implemented, the restart ends in `OnSiteReason::RestartOrderUnavailable`
+   carrying the decision.
 3. **Only a decoded VIN of another vehicle aborts.** A VIN read that decodes to a well-formed
    VIN other than the job's ends the job in `JobError::IdentityMismatch` (design 5.6
-   `Interrupted -> Failed`). Well-formed means 17 characters from the VIN character set of ISO
-   3779 (digits and upper-case letters other than I, O and Q). Text that is not a well-formed
-   VIN (a padded field, lower case, an empty answer) does not count as decoded: an abort is a
-   verdict that the ECU belongs to another vehicle, and malformed text proves nothing of the
-   kind. No answer, a negative response, a value that does not decode, or a VIN source the
-   procedure or the agent's source table does not map gives `PassiveOnly(VinNotEstablished)`. A
-   job VIN that is not well-formed counts as no job VIN. At this step a hardware part number that
-   differs from the journal's is not an abort but `PassiveOnly(HardwareIdentityDiffers)`:
-   ADR-229 makes it an abort only in step 3, once the ECU is confirmed in its default session.
-   The hardware part number is compared as the raw field bytes the journal recorded.
+   `Interrupted -> Failed`). Well-formed means 17 characters, each a digit or an upper-case
+   letter other than I, O and Q. Text that is not a well-formed VIN (a padded field, lower case,
+   an empty answer) does not count as decoded: an abort is a verdict that the ECU belongs to
+   another vehicle, and malformed text proves nothing of the kind. No answer, a negative
+   response, a value that does not decode, or a VIN source the procedure or the agent's source
+   table does not map gives `PassiveOnly(VinNotEstablished)`. A job VIN that is not well-formed
+   counts as no job VIN. At this step a hardware part number that differs from the journal's is
+   not an abort but `PassiveOnly(HardwareIdentityDiffers)`: ADR-229 makes it an abort only in
+   step 3, once the ECU is confirmed in its default session. The hardware part number is
+   compared as the raw field bytes the journal recorded.
 4. **A precondition is read from either session's source.** The default-session source is read
    first. When it gives no value and the procedure declares a different programming-session
    source, that one is read too. A value outside the declared range fails the gate at once.

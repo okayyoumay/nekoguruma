@@ -199,10 +199,10 @@ entry.
 at the first gate that does not hold:
 
 1. The VIN, through the program's VIN source, against the VIN the job names
-   (`JournalSetup::vin`). A well-formed VIN (17 characters of the ISO 3779 set) other than the
-   job's ends the job in `JobError::IdentityMismatch`. No answer, a negative response, text
-   that is not a well-formed VIN, or a job that names no well-formed VIN (which reads nothing)
-   gives `PassiveOnly(VinNotEstablished)`.
+   (`JournalSetup::vin`). A well-formed VIN (17 characters, each a digit or an upper-case letter
+   other than I, O and Q) other than the job's ends the job in `JobError::IdentityMismatch`. No
+   answer, a negative response, text that is not a well-formed VIN, or a job that names no
+   well-formed VIN (which reads nothing) gives `PassiveOnly(VinNotEstablished)`.
 2. The ECU's hardware part number, against the bytes the journal recorded before the erase. A
    different one gives `PassiveOnly(HardwareIdentityDiffers)`, one that cannot be read (or no
    recorded value) `PassiveOnly(HardwareIdentityNotEstablished)`. It aborts only in the later

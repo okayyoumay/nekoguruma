@@ -16,6 +16,7 @@ use diag_ir::{
 use tokio::runtime::{Handle, RuntimeFlavor};
 use worker_host::client::WorkerClient;
 
+use crate::guards::{GuardError, GuardSetup, JobGuards};
 use crate::host::{HostError, Timings, TransferProgress, WorkerHost};
 use crate::inputs::RuntimeInputs;
 use crate::journal::{Journal, JournalError, StepRef, Store};
@@ -89,6 +90,8 @@ pub enum JobError {
     /// waits for someone on site.
     #[error("the job needs on-site intervention: {0:?}")]
     OnSiteInterventionRequired(OnSiteReason),
+    #[error("restart guards: {0}")]
+    Guards(#[source] GuardError),
     #[error("the job thread panicked")]
     Panicked,
 }
@@ -97,8 +100,22 @@ pub enum JobError {
 enum JournalMode {
     /// A first run: the journal is created, and one that exists is an error.
     Create(JournalSetup),
-    /// A job that ran before: its journal is opened and classified (`restart`).
-    Resume(JournalSetup),
+    /// A job that ran before: its journal is opened and classified (`restart`), once the job
+    /// holds its restart guards.
+    Resume(JournalSetup, RestartGuards),
+}
+
+/// How a resumed job comes by its restart guards (design 8.8, 8.8.1; ADR-229 item 2 step 1,
+/// ADR-256).
+#[derive(Debug, Clone)]
+pub enum RestartGuards {
+    /// A new run after an agent crash or a loss of the device's own power: the run that held the
+    /// guards is gone, so this one takes the per-VCI lock and the reprogramming slot, waiting
+    /// while another job holds either, before anything goes through the VCI.
+    Take(GuardSetup),
+    /// A job that survived a worker crash, a VCI disconnect or a loss of the vehicle's or ECU's
+    /// supply alone still holds its guards, and keeps them rather than waiting on itself.
+    Held(Arc<JobGuards>),
 }
 
 /// The checks [`run_program`] makes before it touches the worker: the program's schema version and
@@ -191,16 +208,19 @@ pub async fn run_program_journaled(
 /// - a journal that rules a restart out, or a missing or unreadable one for a program with a
 ///   plan, ends the job the same way, also with nothing sent.
 ///
-/// The journal's writer lock is held while the job runs, so a second resume of the same job
-/// ends in `JobError::Journal(JournalError::InUse)` with nothing sent (ADR-255). The per-VCI
-/// lock, the reprogramming slot, the start deadline and a server reservation are not taken
-/// here.
+/// Before the link opens, the job takes or keeps its restart guards (`guards`, ADR-256): the
+/// per-VCI lock and the reprogramming slot, which it holds until it ends. Waiting for them stops
+/// on a cancel (`JobError::Cancelled`), and a duplicate resume of the same job waits there
+/// without opening a link. The journal's writer lock is held while the job runs as well, so a
+/// second writer of the same journal ends in `JobError::Journal(JournalError::InUse)` with
+/// nothing sent (ADR-255). The start deadline and a server reservation are not taken here.
 pub async fn resume_program_journaled(
     client: WorkerClient,
     config: &LinkConfig,
     program: Program,
     limits: JobLimits,
     journal: JournalSetup,
+    guards: RestartGuards,
 ) -> Result<VmState, JobError> {
     run_program_within(
         client,
@@ -208,7 +228,7 @@ pub async fn resume_program_journaled(
         program,
         limits,
         policy::build_ceiling(),
-        Some(JournalMode::Resume(journal)),
+        Some(JournalMode::Resume(journal, guards)),
     )
     .await
 }
@@ -263,6 +283,31 @@ fn run_job(
     if cancelled.load(Ordering::Relaxed) {
         return Err(JobError::Cancelled);
     }
+    // A resume takes its guards before anything goes through the VCI (ADR-229 item 2 step 1),
+    // and holds them until the job ends.
+    let (journal, _guards) = match journal {
+        Some(JournalMode::Resume(setup, guards)) => {
+            let guards = match guards {
+                RestartGuards::Take(guard_setup) => Arc::new(
+                    JobGuards::take(&guard_setup, limits.wait_poll, cancelled).map_err(
+                        |error| match error {
+                            GuardError::Cancelled => JobError::Cancelled,
+                            error => JobError::Guards(error),
+                        },
+                    )?,
+                ),
+                RestartGuards::Held(guards) => guards,
+            };
+            (
+                Some(JournalMode::Resume(
+                    setup,
+                    RestartGuards::Held(Arc::clone(&guards)),
+                )),
+                Some(guards),
+            )
+        }
+        journal => (journal, None),
+    };
     let timings = Timings::for_link(config);
     let link = handle
         .block_on(link::open(&mut client, config, timings.unary))
@@ -281,7 +326,7 @@ fn run_job(
             let mut journal = JobJournal::create(setup)?;
             run_on(program, &mut host, limits, cancelled, Some(&mut journal))
         }
-        Some(JournalMode::Resume(setup)) => resume_on(
+        Some(JournalMode::Resume(setup, _)) => resume_on(
             program,
             &mut host,
             limits,
@@ -1770,8 +1815,29 @@ mod tests {
         let dir = journal_dir("resume-link-fails");
         interrupted(&program, &dir);
         let before = std::fs::read(journal_file(&dir)).unwrap();
-        let setup = file_setup(&dir);
-        let result = tokio::runtime::Builder::new_multi_thread()
+        let guards = RestartGuards::Take(guard_setup(&dir));
+        let result = resume_on_unreachable(program, &dir, guards, Arc::new(AtomicBool::new(false)));
+        assert!(matches!(result, Err(JobError::Link(_))), "{result:?}");
+        assert_eq!(std::fs::read(journal_file(&dir)).unwrap(), before);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn guard_setup(dir: &std::path::Path) -> GuardSetup {
+        GuardSetup {
+            dir: dir.join("locks"),
+            vci: "VCI-1".to_owned(),
+        }
+    }
+
+    /// `run_job` resuming the job of `dir`'s journal on a worker that cannot be reached.
+    fn resume_on_unreachable(
+        program: Program,
+        dir: &std::path::Path,
+        guards: RestartGuards,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<VmState, JobError> {
+        let setup = file_setup(dir);
+        tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .unwrap()
@@ -1784,15 +1850,71 @@ mod tests {
                         &LinkConfig::iso15765(0x7E0, 0x7E8),
                         &program,
                         JobLimits::default(),
-                        &AtomicBool::new(false),
-                        Some(JournalMode::Resume(setup)),
+                        &cancelled,
+                        Some(JournalMode::Resume(setup, guards)),
                     )
                 })
                 .await
                 .unwrap()
-            });
+            })
+    }
+
+    /// The done-when cases (ADR-256): a resume after an agent crash takes the per-VCI lock and
+    /// the reprogramming slot before anything goes through the VCI, and waits there while
+    /// another job holds them, so a duplicate resume opens no link; a job that still holds its
+    /// guards keeps them and does not wait on itself.
+    #[test]
+    fn a_resume_takes_or_keeps_its_guards_before_the_link() {
+        let program = flash_program();
+        let dir = journal_dir("resume-guards");
+        interrupted(&program, &dir);
+        let held = Arc::new(
+            JobGuards::take(
+                &guard_setup(&dir),
+                Duration::from_millis(1),
+                &AtomicBool::new(false),
+            )
+            .unwrap(),
+        );
+
+        // Another run of the job waits for the guards, never reaching the link, until it is
+        // cancelled.
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let waiter = {
+            let (program, dir, cancelled) = (program.clone(), dir.clone(), Arc::clone(&cancelled));
+            std::thread::spawn(move || {
+                resume_on_unreachable(
+                    program,
+                    &dir,
+                    RestartGuards::Take(guard_setup(&dir)),
+                    cancelled,
+                )
+            })
+        };
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(!waiter.is_finished(), "the duplicate waits for the guards");
+        cancelled.store(true, Ordering::Relaxed);
+        let result = waiter.join().unwrap();
+        assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
+
+        // The job that holds them goes straight on to the link.
+        let result = resume_on_unreachable(
+            program.clone(),
+            &dir,
+            RestartGuards::Held(Arc::clone(&held)),
+            Arc::new(AtomicBool::new(false)),
+        );
         assert!(matches!(result, Err(JobError::Link(_))), "{result:?}");
-        assert_eq!(std::fs::read(journal_file(&dir)).unwrap(), before);
+
+        // Once it lets go, a new run takes them.
+        drop(held);
+        let result = resume_on_unreachable(
+            program,
+            &dir,
+            RestartGuards::Take(guard_setup(&dir)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert!(matches!(result, Err(JobError::Link(_))), "{result:?}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

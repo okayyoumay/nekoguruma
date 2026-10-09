@@ -735,7 +735,7 @@ The supply format of vehicle knowledge is abstracted by an intermediate represen
 | Supply format | Front end | Positioning |
 |---|---|---|
 | ODX / OTX (PDX) | Standard-format parser and validator | Primary target |
-| Proprietary format (CSV tables + JavaScript) | CSV parser + JS->IR transpiler (8.4) | Swap target |
+| Proprietary format (CSV tables + Starlark) | CSV parser + Starlark->IR transpiler (8.4) | Swap target |
 | Future formats | Additional implementation | Room for extension |
 
 Even with the proprietary format, the generated IR and the agent-side runtime are shared. It is a design invariant that format differences must not leak into L2 or below.
@@ -847,14 +847,16 @@ Because ODX / OTX are large specifications, the supported subset is declared in 
 
 OEM-specific extensions and variations in specification interpretation (dialects) are absorbed by adding or updating supply format front ends (9.2). The operating practice is to detect them via ingestion-time validation and provide a corresponding front end.
 
-### 8.4 Conversion from JavaScript to IR
+### 8.4 Conversion from Starlark to IR
 
-The proprietary format (CSV tables + JavaScript) is **converted to IR on the server side**. No script engine is shipped in the agent.
+The proprietary format (CSV tables + Starlark) is **converted to IR on the server side**. No script engine is shipped in the agent.
+
+Procedures are written in Starlark (ADR-254), a deterministic Python dialect whose base language already has no unbounded loops, no recursion, no exceptions, no classes and no access to files, the network or the clock. Those are the constraints the procedure-part VM imposes (8.2.3, 8.2.4), so the subset removes only the constructs the VM cannot represent rather than most of a general-purpose language.
 
 ```mermaid
 flowchart LR
     CSV["CSV tables"] --> DECL["Convert directly to declaration part"]
-    JS["JavaScript"] --> PARSE["Parse (swc / oxc)"]
+    STAR["Starlark"] --> PARSE["Parse (starlark_syntax)"]
     PARSE --> CHECK{"Subset validation"}
     CHECK -->|Violation| ERR["Ingestion error<br/>Report offending line"]
     CHECK -->|Conforms| LOWER["AST → bytecode"]
@@ -866,27 +868,30 @@ flowchart LR
 **Two conversion stages**
 
 1. **CSV tables**: Converted directly to the declaration part. Most vehicle model definitions are covered at this stage
-2. **JavaScript**: Converted to bytecode by a transpiler restricted to a subset
+2. **Starlark**: Converted to bytecode by a transpiler restricted to a subset. One file is one procedure, entered at `def main()`
 
 **Supported subset**
 
 | Supported | Excluded (error at ingestion) |
 |---|---|
-| `let` / `const`, arithmetic, logic, comparison | `var` (hoisting) |
-| `if` / `else`, `for` / `while`, `switch` | Closures, higher-order functions |
-| Function definitions and calls (top level) | `eval`, `new Function`, dynamic import |
-| Array and object literals (static) | Prototype manipulation, `this`, classes |
-| Diagnostic primitive API calls | `async` / `await`, Promise, generators |
-| Built-in string and number functions (limited list) | Regular expressions, throwing exceptions (`throw`) *needs review |
+| Assignment, arithmetic, logic, comparison | `lambda`, nested `def` (closures), functions as values |
+| `if` / `elif` / `else`, `for` over a finite sequence, `break` / `continue` | `while` and recursion (not in base Starlark) |
+| Top-level `def` and calls to it | `load` (one file per procedure) |
+| Bytes literals; constant lists; dict literals as API parameters and literal-key access to responses | Comprehensions, `None`, `*args` / `**kwargs`, keyword and default parameters |
+| Diagnostic primitive API calls | `fail`, `print` and reflection built-ins (replaced by `diag.fail` and `diag.log`) |
+| Built-in string, number and bytes functions (limited list) | Type annotations (not base Starlark), `set` |
 
 **Conversion rules**
 
 - **Static resolution**: Function calls are limited to those that can be resolved statically. Unresolvable calls are errors
-- **Loop limits**: Loops without a statically determined bound get a runtime iteration limit embedded
-- **Determinism**: Dependence on current time, random numbers or external state is prohibited. Where needed, it is limited to going through the diagnostic primitive API so that execution can be reproduced from the audit log
-- **Diagnostic primitive API**: Written as synchronous calls on the JavaScript side and mapped in bytecode to instructions that involve waiting. Designed so that `async` / `await` are unnecessary
-- **Error reporting**: Violations are reported with the line and column in the source file. All violations are enumerated at ingestion rather than stopping at the first
-- **Source maps**: The IR includes a mapping table from bytecode back to the original JavaScript positions. Needed for readability of execution traces and audit logs
+- **Loop limits**: A loop over a range or value whose length is not known at ingestion gets a runtime iteration limit embedded
+- **Determinism**: Dependence on current time, random numbers or external state is impossible in Starlark itself. Where needed, it goes through the diagnostic primitive API so that execution can be reproduced from the audit log
+- **Diagnostic primitive API**: Written as plain synchronous calls and mapped in bytecode to instructions that involve waiting
+- **Numbers**: Starlark integers map to the IR's checked 64-bit integers, so a value outside that range is a run-time error. Floor division and remainder keep Starlark's semantics; the transpiler corrects the IR's truncating division (ADR-233) for operands of different signs
+- **Error reporting**: Violations are reported with the line and column in the source file. Once a file parses, all subset violations are enumerated at ingestion rather than stopping at the first; a syntax error is reported on its own, because the parser stops at the first one
+- **Source maps**: The IR includes a mapping table from bytecode back to the original Starlark positions. Needed for readability of execution traces and audit logs
+
+The detailed subset, the API and the annotations for section attributes are in `crates/diag-frontend/docs/starlark-subset.md`.
 
 **Verification**: Provide a differential test that ingests the same definition via ODX and via the proprietary format and confirms the generated IR matches. This verifies swappability itself.
 
@@ -1210,7 +1215,7 @@ shared-proto     commands, events, capabilities, frame formats
 shared-crypto    provider signature verification, ingestion signing and verification with the distribution key, root key verification, job instruction signing, hash computation
 vendor-manifest  per-vendor manifest parsers
 diag-ir          IR schema, bytecode definition, VM (shared by server and agent)
-diag-frontend    ODX/OTX parser, CSV + JS→IR transpiler (server only)
+diag-frontend    ODX/OTX parser, CSV + Starlark→IR transpiler (server only)
 j2534-defs       ABI-independent J2534 values: status codes, protocol IDs, config/IOCTL IDs, COMPARAM mapping (sim-vci)
 vci-discovery    discovery of J2534 devices and D-PDU API implementations (agent)
 worker-host      ABI detection, worker service launch and control channel (agent)
@@ -1239,7 +1244,7 @@ Signature verification is needed on both server and agent, and is consolidated i
 | IR procedure part | Custom bytecode VM (`diag-ir`) |
 | VM state serialization | `postcard` (written to the journal) |
 | ODX / OTX parsing | `quick-xml` (server only) |
-| JS->IR conversion | Obtain the AST with `swc` or `oxc`, validate the subset, then convert to bytecode |
+| Starlark->IR conversion | Obtain the AST with `starlark_syntax` (the parser of `starlark-rust`), validate the subset, then convert to bytecode |
 
 ### 12.1 Implementation Notes
 
@@ -1476,7 +1481,7 @@ Items listed here are limited to those that **cannot be resolved by extension pa
 |---|---|
 | When ABI interpretation on ARM does not match the assumption | ABI override in the VCI profile (9.3) |
 | ODX dialects / OEM-specific extensions | Supply-format frontend (9.2) |
-| Widening the scope of the JavaScript subset | Supply-format frontend (9.2) |
+| Widening the scope of the Starlark subset | Supply-format frontend (9.2) |
 | Adding new VCIs, vehicle models or ECUs | VCI profile, IR (9.2) |
 
 ### Items to Confirm Early (per Vendor)

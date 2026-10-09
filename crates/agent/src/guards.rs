@@ -112,11 +112,7 @@ impl LockFile {
     /// Locks `path`, waiting `poll` (at least 1 ms) between tries while another handle holds it.
     fn wait(path: &Path, poll: Duration, cancelled: &AtomicBool) -> Result<Self, GuardError> {
         let poll = poll.max(Duration::from_millis(1));
-        let file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)?;
+        let file = Self::open(path)?;
         loop {
             if cancelled.load(Ordering::Relaxed) {
                 return Err(GuardError::Cancelled);
@@ -126,6 +122,23 @@ impl LockFile {
                 Err(fs::TryLockError::WouldBlock) => std::thread::sleep(poll),
                 Err(fs::TryLockError::Error(error)) => return Err(error.into()),
             }
+        }
+    }
+}
+
+impl LockFile {
+    /// Opens the lock file read-only, so a file another user created (with that user's default
+    /// permissions) can be locked as long as it can be read: an OS lock needs no write access.
+    /// Only a missing file is created.
+    fn open(path: &Path) -> io::Result<File> {
+        match OpenOptions::new().read(true).open(path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(path),
+            opened => opened,
         }
     }
 }
@@ -285,6 +298,33 @@ mod tests {
         assert!(matches!(taken, Err(GuardError::Cancelled)), "{taken:?}");
         JobGuards::take(&setup(&dir, "VCI-1"), POLL, &AtomicBool::new(false))
             .expect("nothing is held");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A lock file another user created, which this one may only read, still locks (ADR-257).
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_lock_file_still_locks() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = dir("read-only");
+        fs::create_dir_all(&dir).unwrap();
+        let path = vci_path(&dir, "VCI-1");
+        fs::write(&path, b"").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
+        let held = JobGuards::take_vci_only(&setup(&dir, "VCI-1"), POLL, &AtomicBool::new(false))
+            .expect("a readable lock file locks");
+        let cancelled = AtomicBool::new(true);
+        assert!(matches!(
+            LockFile::wait(&path, POLL, &cancelled),
+            Err(GuardError::Cancelled)
+        ));
+        let other = File::open(&path).unwrap();
+        assert!(matches!(
+            other.try_lock(),
+            Err(fs::TryLockError::WouldBlock)
+        ));
+        drop((held, other));
         fs::remove_dir_all(&dir).unwrap();
     }
 

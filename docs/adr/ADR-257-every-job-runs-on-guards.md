@@ -38,9 +38,9 @@ runner also needs a way to know which kind of job it runs.
      `JobError::NoReprogrammingSlot` before anything opens.
 4. **`ngr-agent run` takes the guards itself.**
    - **Where.** It reads the lock directory from `--locks <dir>`, by default a `locks`
-     directory next to the executable, as `--workers` does. An empty value is refused.
-   - **Absolute.** The path is made absolute, so runs from different working directories
-     share one lock set.
+     directory next to the executable, as `--workers` does.
+   - **Absolute only.** A relative `--locks` is refused. Resolved against each run's working
+     directory, it would name a different lock set from each one.
    - **When.** It takes the guards right after the program check, before it resolves the VCI. It names
    the VCI by its `--vci` argument and takes `take` or `take_vci_only` by `policy::writes`. It
    holds the guards for the run.
@@ -50,11 +50,17 @@ runner also needs a way to know which kind of job it runs.
 - ADR-256's consequence that first runs open the link without the per-VCI lock no longer holds.
 - `run_program` and `run_program_journaled` change their signatures; their callers in the
   repository (the CLI and the `j2534-0404-service` tests) take guards.
-- The lock directory must be writable by every agent user on the device (ADR-256 item 1).
-  The agent creates the directory and its files with the process's default permissions. On a
-  device whose agents run as several users, the installation therefore creates it
-  beforehand, writable by all of them, or every run names one with `--locks`. A user who
-  cannot open a lock file fails at once instead of waiting.
+- Lock files are opened read-only, and created only when missing. An OS lock needs no write
+  access, so a file one user created, with that user's default permissions, still excludes and
+  is excluded by every other user who can read it.
+- The lock directory must let every agent user on the device create files in it, and must
+  keep users from deleting or replacing each other's lock files (ADR-256 item 1). On Unix that
+  is a directory with the sticky bit, writable by all agent users, like `/tmp`; on Windows an
+  ACL that grants create but not delete on others' files. The agent creates a missing
+  directory with the process's default permissions, which grant neither. On a device whose
+  agents run as several users, the installation therefore prepares the directory and names
+  it with `--locks` or places it next to the executable. A user who cannot create or read a
+  lock file fails at once instead of waiting.
 - A job that only reads can still wait for another VCI's reprogramming, because of the lock
   order of ADR-256 item 4: a writer on VCI-1 takes VCI-1's lock and then waits for the slot,
   which a writer on VCI-2 holds, and a read on VCI-1 then waits for VCI-1's lock. The wait

@@ -15,7 +15,7 @@ ngr-agent run --vci <name> --program <file> [--workers <dir>] [--locks <dir>] [-
 | `--vci` | J2534 v04.04 library name, as the worker service resolves it (registry key on Windows, `library_path` entry in the service's `config.toml`) |
 | `--program` | IR program file: a `diag_ir::Program` serialized as JSON |
 | `--workers` | Directory of worker builds, laid out as `<dir>/<ABI name>/j2534-0404-service[.exe]` (design 7.3). Default: `workers` next to the `ngr-agent` executable |
-| `--locks` | The device's lock directory for the job's guards ("Job guards" below), made absolute; an empty value is refused. Default: `locks` next to the `ngr-agent` executable. The agent creates the directory and its files with the process's default permissions, so a device whose agents run as several users needs it created beforehand, writable by all of them |
+| `--locks` | The device's lock directory for the job's guards ("Job guards" below), as an absolute path. Default: `locks` next to the `ngr-agent` executable. Lock files are opened read-only, so a file another user created still locks. The agent creates a missing directory with the process's default permissions, so a device whose agents run as several users needs it prepared beforehand: writable by all of them, and with the sticky bit (or an equivalent ACL) so that no user can delete another's lock files (ADR-257) |
 | `--tx-id`, `--rx-id` | Physical request and response CAN IDs in hex, with or without `0x`. Default `7E0` / `7E8`. Only 11-bit IDs: the link does not set the CAN ID format |
 
 The link is UDS on ISO 15765 at 500 kbit/s (`LinkConfig::iso15765`), with the CAN IDs from the

@@ -3,7 +3,7 @@
 //! VM state as JSON (`crates/agent/docs/ngr-agent.md`).
 
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
@@ -106,8 +106,9 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<RunArgs, Strin
             }
             "--program" => program = Some(PathBuf::from(value)),
             "--workers" => workers = Some(PathBuf::from(value)),
-            "--locks" if value.is_empty() => {
-                return Err("--locks needs a directory".to_owned());
+            // A relative path would name a different lock set from each working directory.
+            "--locks" if !Path::new(&value).is_absolute() => {
+                return Err("--locks needs an absolute directory".to_owned());
             }
             "--locks" => locks = Some(PathBuf::from(value)),
             "--tx-id" => tx_id = parse_can_id(&flag, &value)?,
@@ -170,10 +171,8 @@ async fn run(args: RunArgs) -> Result<String, String> {
     check_program(&program, build_ceiling()).map_err(|error| format!("job failed: {error}"))?;
     // The per-VCI lock, and the reprogramming slot for a program that writes (design 8.8.1). The
     // wait polls a file lock, so it runs off the runtime's threads; nothing cancels it here.
-    // An absolute path, so runs from different working directories share one lock set.
     let dir = match args.locks {
-        Some(dir) => std::path::absolute(&dir)
-            .map_err(|error| format!("--locks {}: {error}", dir.display()))?,
+        Some(dir) => dir,
         None => default_locks()?,
     };
     let setup = GuardSetup {
@@ -266,12 +265,13 @@ mod tests {
 
     #[test]
     fn parses_every_option() {
+        let locks = std::env::temp_dir().join("locks");
         let args = parse(&[
             "run",
             "--workers",
             "w",
             "--locks",
-            "l",
+            locks.to_str().expect("a UTF-8 temp dir"),
             "--tx-id",
             "0x7DF",
             "--rx-id",
@@ -283,7 +283,7 @@ mod tests {
         ])
         .expect("valid arguments");
         assert_eq!(args.workers, Some(PathBuf::from("w")));
-        assert_eq!(args.locks, Some(PathBuf::from("l")));
+        assert_eq!(args.locks, Some(locks));
         assert_eq!((args.link.tx_id, args.link.rx_id), (0x7DF, 0x7E9));
     }
 
@@ -303,6 +303,7 @@ mod tests {
             &["run", "--vci", "x", "--program", "p", "--verbose", "1"],
             &["run", "--vci", "x", "--program", "p", "--locks"],
             &["run", "--vci", "x", "--program", "p", "--locks", ""],
+            &["run", "--vci", "x", "--program", "p", "--locks", "locks"],
         ] {
             assert!(parse(args).is_err(), "{args:?}");
         }

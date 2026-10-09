@@ -1,7 +1,7 @@
 # ADR-256: Restart Guards as OS Locks on Files in a Device Lock Directory
 
 **Date:** 2026-10-09
-**Status:** Accepted (the first-run consequence and item 1's write access to lock files superseded by ADR-257; the failed-close consequence superseded by ADR-258)
+**Status:** Accepted (the first-run consequence and item 1's write access to lock files superseded by ADR-257; the failed-close consequence superseded by ADR-258; item 6's per-vehicle lock settled by ADR-262)
 **Affects:** `agent` (`src/guards.rs`, `src/runner.rs`, `src/lib.rs`, `src/restart.rs`), ADR-255 item 5 and its duplicate-resume consequence
 
 ## Context

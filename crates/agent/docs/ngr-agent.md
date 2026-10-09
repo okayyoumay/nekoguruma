@@ -228,12 +228,10 @@ gates before and after each read.
 ## Job guards
 
 The `guards` module holds a job's exclusive locks on the device (design 8.8, 8.8.1; ADR-256,
-ADR-257): the per-VCI lock and the device's single reprogramming slot. Each is an OS lock
-(`File::try_lock`) on a file in the device's lock directory: `vci-{hex name}.lock` and
-`reprogramming.lock`. The per-vehicle lock is not here: its file must not carry the VIN
-(ADR-256 item 6). The OS
-releases a lock when its process dies, so a crashed run never blocks the next one, and the
-files are never deleted.
+ADR-257, ADR-262): the per-VCI lock, the device's single reprogramming slot and the per-vehicle
+lock. Each is an OS lock (`File::try_lock`) on a file in the device's lock directory: `vci-{hex
+name}.lock`, `reprogramming.lock` and `vehicle-{k:03x}.lock`. The OS releases a lock when its
+process dies, so a crashed run never blocks the next one, and the files are never deleted.
 
 - `JobGuards::take(GuardSetup { dir, vci }, poll, cancelled)` takes the per-VCI lock, then the
   slot, for a job that writes (`policy::writes`). It waits while another job holds either,
@@ -241,8 +239,15 @@ files are never deleted.
 - `JobGuards::take_vci_only(...)` takes the per-VCI lock alone, for a job that only reads, so
   reads on other VCIs go on while a job reprograms. `JobGuards::holds_slot` tells the two
   apart.
-- Locks are always taken in the order VCI, then slot, and held until the `JobGuards` is
-  dropped.
+- `JobGuards::take_vehicle(vin, poll, cancelled)` takes the per-vehicle lock, on guards with or
+  without the slot. The file is one of 4096 buckets, `k` being the first 12 bits of SHA-256 over
+  the VIN, and preparing the lock directory creates all of them, so neither a file's name nor
+  the directory's content reveals a VIN (ADR-262). Two vehicles in one bucket exclude each
+  other, which delays a job about once in 4096 concurrent pairs. Taking the bucket the guards
+  already hold returns at once; another bucket is refused (`GuardError::OtherVehicleHeld`).
+  `JobGuards::holds_vehicle` tells whether they hold one.
+- Locks are always taken in the order VCI, then slot, then vehicle, and held until the
+  `JobGuards` is dropped.
 
 Every entry point (`run_program`, `run_program_journaled`, `resume_program_journaled`) takes
 the guards by value and returns them with the run's result, so two runs can never use one set

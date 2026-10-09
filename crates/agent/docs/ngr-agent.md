@@ -159,9 +159,11 @@ plan's entry; otherwise, or for a stage the program does not declare, the decisi
 
 ## Restart entry
 
-`agent::resume_program_journaled` takes the same arguments as `run_program_journaled`, for a job
-that ran before (ADR-255). Once the link is open and the policy allows the program, and before
-anything is sent to the ECU, it opens the job's journal (`Journal::open`) and classifies it.
+`agent::resume_program_journaled` takes the arguments of `run_program_journaled` and the job's
+restart guards (`JobGuards`, "Restart guards" below), for a job that ran before (ADR-255), and
+returns the guards with its result.
+Once the link is open and the policy allows the program, and before anything is sent to the
+ECU, it opens the job's journal (`Journal::open`) and classifies it.
 
 | Decision | What the runner does |
 |---|---|
@@ -182,8 +184,34 @@ A failed check counts no resume, and a cancel stops it before the voltage read, 
 (whatever the read gave) and before the commit. Each crash during a recovery therefore consumes one attempt, and repeated crashes stop
 at the limit. A second resume of a job whose journal another run holds ends in
 `JobError::Journal(JournalError::InUse)` before the classification, with nothing sent. The start
-deadline (a server's job instruction carries it), the per-VCI lock, the reprogramming slot and a
-server reservation are not part of this entry.
+deadline (a server's job instruction carries it) and a server reservation are not part of this
+entry.
+
+## Restart guards
+
+The `guards` module holds a job's exclusive locks on the device (design 8.8, 8.8.1; ADR-256):
+the per-VCI lock and the device's single reprogramming slot. Each is an OS lock
+(`File::try_lock`) on a file in the device's lock directory: `vci-{hex name}.lock` and
+`reprogramming.lock`. The per-vehicle lock is not here: its file must not carry the VIN
+(ADR-256 item 6). The OS
+releases a lock when its process dies, so a crashed run never blocks the next one, and the
+files are never deleted.
+
+- `JobGuards::take(GuardSetup { dir, vci }, poll, cancelled)` takes the per-VCI lock, then the
+  slot. It waits while another job holds either, retrying every `poll`, and stops on a cancel
+  (`GuardError::Cancelled`).
+- Locks are always taken in the order VCI, then slot, and held until the `JobGuards` is
+  dropped.
+
+`resume_program_journaled` takes the guards by value and returns them with the run's result,
+so two runs can never use one set at once. A new run after an agent crash or a loss of the
+device's power takes them with `JobGuards::take` before it calls the runner, so a duplicate
+resume of the same job waits there without opening a link. A dropped future releases them only
+once the job thread has ended. A job that survives a worker crash, a VCI disconnect or a loss
+of the vehicle's supply alone gets them back, still held, and passes them to its next run. A
+VCI name has 1 to `MAX_VCI_NAME` (100) bytes. The lock directory is one per device,
+shared by every agent process on it whichever user it runs as, and its files must be writable
+by all of them. `run_program` and `run_program_journaled` take no guards.
 
 ## Restart inputs
 

@@ -1,7 +1,7 @@
 # ADR-255: The Restart Entry in the Job Runner
 
 **Date:** 2026-10-09
-**Status:** Accepted
+**Status:** Accepted (item 5's "locks not taken" and the duplicate-resume consequence superseded by ADR-256)
 **Affects:** `agent` (`src/runner.rs`, `src/restart.rs`, `src/journaling.rs`, `src/journal.rs`, `src/lib.rs`), `Cargo.toml` (`rust-version`), ADR-253 item 4, ADR-244 (the no-lock consequence)
 
 ## Context

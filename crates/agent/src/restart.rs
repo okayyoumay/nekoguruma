@@ -4,7 +4,7 @@
 //! [`classify`] reads what a job's write-job journal says about the job's last run, together
 //! with the program, and decides how the job may go on: a plain start, the restart order of
 //! ADR-229 item 2 for an interrupted transfer, or on-site intervention. It contacts nothing; the
-//! restart itself acts on its answer. [`check_before_ecu`] makes the restart's checks that need
+//! restart itself acts on its answer. `check_before_ecu` makes the restart's checks that need
 //! no ECU service (the resume limit and the supply voltage) and counts the resume (ADR-255).
 //!
 //! The interruption point is the latest of the last completed step and the requests the

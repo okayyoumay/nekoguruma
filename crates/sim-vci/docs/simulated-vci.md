@@ -28,6 +28,8 @@ and the two stay separate crates (ADR-260). They differ where it matters:
   when the variable is unset. An unreadable or invalid file makes the open fail with `ERR_FAILED`.
   The ECU's timers run on real time, so a non-default session ends after tS3_Server (5 s unless
   the configuration sets `s3_server_ms`) without a request, as on a vehicle.
+  After an ECUReset it also answers nothing for `startup_ms` when the configuration sets it
+  (`crates/sim-ecu/docs/simulated-ecu.md`); the requests in that time get no response.
 - The ECU lives as long as the process: `PassThruClose` and a new `PassThruOpen` keep its
   flash state, and its session too if the device is opened again within tS3_Server, as a vehicle
   keeps its state while the tester disconnects. A process restart starts a fresh ECU, unless

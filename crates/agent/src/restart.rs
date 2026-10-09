@@ -11,7 +11,9 @@
 //! teardown may use an ECUReset or must be passive. It sends only ReadDataByIdentifier requests
 //! through the declared sources. `teardown` then ends the interrupted download on the gates'
 //! decision and the journal's exclusions (step 2b-1, ADR-264): an ECUReset, or a passive wait for
-//! the ECU's session to expire.
+//! the ECU's session to expire. `confirm_default_session` then waits out the ECU's startup time
+//! and confirms by reading F186 that the ECU is back in its default session (step 2b-2,
+//! ADR-265).
 //!
 //! The interruption point is the latest of the last completed step and the requests the
 //! journal wrote ahead (the transfer-start and RequestTransferExit markers, and the request
@@ -101,11 +103,22 @@ pub enum OnSiteReason {
     /// resume is counted (ADR-261).
     TargetVinDiffers,
     /// The restart passed step 1 (the checks that need no ECU service, and its resume was
-    /// counted), the gates of step 2 and the teardown of step 2b-1, which gave `teardown`. The
-    /// default-session confirmation and the rest of ADR-229's restart order (step 2b-2 onwards:
-    /// the ECU state check, the replay to the erase) do not run in this agent, so the job stops
-    /// before it sends anything further that changes the ECU (ADR-255, ADR-261, ADR-264).
+    /// counted), the gates of step 2, the teardown of step 2b-1 (`teardown`) and the
+    /// default-session confirmation of step 2b-2 (`confirmed`). Step 3 (the service-dependent
+    /// checks) and the rest of ADR-229's restart order (the ECU state check, the replay to the
+    /// erase) do not run in this agent yet, so the job stops before it sends anything further that
+    /// changes the ECU (ADR-255, ADR-261, ADR-264, ADR-265).
     RestartOrderUnavailable {
+        flash_session: u32,
+        teardown: Teardown,
+        confirmed: Confirmation,
+    },
+    /// The ECU could not be confirmed back in its default session (ADR-229 item 2 step 2b-2,
+    /// ADR-265): the confirmation failed, and so did the one after the passive teardown, or the
+    /// teardown was passive already and its confirmation failed. Someone on site must check the
+    /// ECU. `teardown` is how the download was ended first; after `Reset` and `CompletedPath` the
+    /// passive wait ran between the two confirmations, after `Passive` it ran before the only one.
+    DefaultSessionNotConfirmed {
         flash_session: u32,
         teardown: Teardown,
     },
@@ -147,16 +160,18 @@ pub enum PassiveReason {
 /// How the restart's teardown (ADR-229 item 2 step 2b-1, ADR-264) ended the interrupted download.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Teardown {
-    /// The ECU accepted an ECUReset (hardReset). The ECU's startup time and the confirmation
-    /// that it is back in its default session belong to the next step, so nothing waited.
+    /// The ECU accepted an ECUReset (hardReset). The teardown itself did not wait: the ECU's
+    /// startup time and the confirmation that it is back in its default session belong to the
+    /// next step (`confirm_default_session`, ADR-265).
     Reset,
     /// No accepted ECUReset ended the download: the reset was ruled out, refused or got no
     /// usable answer. The agent then waited out the ECU's session timeout plus the plan's
     /// margin, sending nothing further, so the ECU's session has expired.
     Passive(PassiveCause),
     /// The journal shows the post-transfer steps complete: no reset and no wait, since the
-    /// default-session confirmation of step 2b-2 comes first and only its failure makes the
-    /// teardown passive.
+    /// default-session confirmation of step 2b-2 comes first (it still waits the ECU's startup
+    /// time, which may follow a reset of the procedure) and only its failure makes the teardown
+    /// passive (ADR-265).
     CompletedPath,
 }
 
@@ -173,6 +188,14 @@ pub enum PassiveCause {
     /// Whether the ECU reset is not known: the request got no answer or failed, or the answer
     /// is neither a positive response to the reset nor a final negative one.
     ResetOutcomeUnknown,
+}
+
+/// That the ECU was confirmed back in its default session (ADR-229 item 2 step 2b-2, ADR-265).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Confirmation {
+    /// The first confirmation failed, the passive teardown ran after it, and the second one
+    /// confirmed. Always false after a teardown that was passive already.
+    pub after_passive_retry: bool,
 }
 
 /// Decides how the job of `program` goes on, from its journal as `Journal::read` (or
@@ -520,9 +543,29 @@ where
             }
         }
     };
-    let total = Duration::from_millis(
-        u64::from(timing.session_timeout_millis) + u64::from(timing.teardown_margin_millis),
-    );
+    passive_wait(timing, poll, cancelled)?;
+    Ok(Teardown::Passive(cause))
+}
+
+/// The passive teardown's wait: `timing.session_timeout_millis + timing.teardown_margin_millis`,
+/// sending nothing. It sleeps in steps of `poll`, checking `cancelled` at the start of each.
+fn passive_wait(
+    timing: &RecoveryTiming,
+    poll: Duration,
+    cancelled: &AtomicBool,
+) -> Result<(), JobError> {
+    wait_quietly(
+        Duration::from_millis(
+            u64::from(timing.session_timeout_millis) + u64::from(timing.teardown_margin_millis),
+        ),
+        poll,
+        cancelled,
+    )
+}
+
+/// Sleeps for `total` in steps of `poll`, sending nothing. A cancel, checked at the start of
+/// every step and when `total` is zero, ends it in [`JobError::Cancelled`].
+fn wait_quietly(total: Duration, poll: Duration, cancelled: &AtomicBool) -> Result<(), JobError> {
     let deadline = Instant::now() + total;
     loop {
         if cancelled.load(Ordering::Relaxed) {
@@ -530,7 +573,93 @@ where
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Ok(Teardown::Passive(cause));
+            return Ok(());
+        }
+        std::thread::sleep(remaining.min(poll));
+    }
+}
+
+/// The default-session confirmation (ADR-229 item 2 step 2b-2, ADR-265) after `teardown` ended
+/// the interrupted download of plan `flash_session`. One attempt waits
+/// `timing.ecu_startup_millis` sending nothing (the ECU may be restarting, after the teardown's
+/// reset or a reset of the procedure that was journaled), then reads DID F186 until it reports
+/// the default session or `timing.confirmation_window_millis` (counted from the end of the
+/// startup wait) has passed, sleeping `poll` between reads. At least one read is made. Only the
+/// positive response carrying the default session value confirms; a negative response, no answer,
+/// another session and any other answer are failed reads, retried while the window lasts.
+///
+/// The first attempt that fails makes:
+/// - after [`Teardown::Reset`] and [`Teardown::CompletedPath`], where no passive wait has run:
+///   the passive teardown (the wait of `teardown`) and one more attempt, whose result is final;
+/// - after [`Teardown::Passive`], where that wait has run: the failure.
+///
+/// A failure is [`OnSiteReason::DefaultSessionNotConfirmed`]. The waits sleep in steps of `poll`;
+/// `cancelled` is checked before every wait step and every read, and a cancel is
+/// [`JobError::Cancelled`]. No VIN is put in a log message or a result.
+pub(crate) fn confirm_default_session<H>(
+    flash_session: u32,
+    teardown: Teardown,
+    timing: &RecoveryTiming,
+    host: &mut H,
+    poll: Duration,
+    cancelled: &AtomicBool,
+) -> Result<Confirmation, JobError>
+where
+    H: DiagHost<Error = HostError>,
+{
+    if confirmation_attempt(timing, host, poll, cancelled)? {
+        return Ok(Confirmation {
+            after_passive_retry: false,
+        });
+    }
+    if !matches!(teardown, Teardown::Passive(_)) {
+        passive_wait(timing, poll, cancelled)?;
+        if confirmation_attempt(timing, host, poll, cancelled)? {
+            return Ok(Confirmation {
+                after_passive_retry: true,
+            });
+        }
+    }
+    Err(JobError::OnSiteInterventionRequired(
+        OnSiteReason::DefaultSessionNotConfirmed {
+            flash_session,
+            teardown,
+        },
+    ))
+}
+
+/// One confirmation attempt of [`confirm_default_session`]: the startup wait, then the windowed
+/// F186 reads. True when a read reported the default session.
+fn confirmation_attempt<H>(
+    timing: &RecoveryTiming,
+    host: &mut H,
+    poll: Duration,
+    cancelled: &AtomicBool,
+) -> Result<bool, JobError>
+where
+    H: DiagHost<Error = HostError>,
+{
+    wait_quietly(
+        Duration::from_millis(timing.ecu_startup_millis.into()),
+        poll,
+        cancelled,
+    )?;
+    let deadline = Instant::now() + Duration::from_millis(timing.confirmation_window_millis.into());
+    loop {
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(JobError::Cancelled);
+        }
+        // ReadDataByIdentifier F186 (ActiveDiagnosticSession); 0x01 is the default session.
+        match host.service_request(0x22, &[0xF1, 0x86]) {
+            Ok(response) if response == [0x62, 0xF1, 0x86, 0x01] => return Ok(true),
+            Ok(other) => {
+                tracing::warn!(answer = ?other, "the session read did not confirm the default session")
+            }
+            Err(error) => tracing::warn!(%error, "the session read got no usable answer"),
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(false);
         }
         std::thread::sleep(remaining.min(poll));
     }
@@ -1415,5 +1544,280 @@ mod tests {
             host.0.check_timers();
             assert_eq!(host.0.session, sim_ecu::Session::Default);
         }
+    }
+
+    // ------------------------------------------------ confirmation against sim-ecu
+
+    /// Short timings for the confirmation: startup 10 ms, window 2 s, passive wait 20 ms.
+    const CONFIRM_TIMING: RecoveryTiming = RecoveryTiming {
+        ecu_startup_millis: 10,
+        confirmation_window_millis: 2_000,
+        ..TIMING
+    };
+
+    fn confirm(
+        teardown: Teardown,
+        timing: &RecoveryTiming,
+        host: &mut SimHost,
+        cancelled: &AtomicBool,
+    ) -> Result<Confirmation, JobError> {
+        confirm_default_session(
+            1,
+            teardown,
+            timing,
+            host,
+            Duration::from_millis(1),
+            cancelled,
+        )
+    }
+
+    fn not_confirmed(result: Result<Confirmation, JobError>) -> Teardown {
+        match result {
+            Err(JobError::OnSiteInterventionRequired(
+                OnSiteReason::DefaultSessionNotConfirmed {
+                    flash_session: 1,
+                    teardown,
+                },
+            )) => teardown,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    const CONFIRMED: Confirmation = Confirmation {
+        after_passive_retry: false,
+    };
+
+    /// An ECU that refuses the reset leaves its session to expire during the passive teardown,
+    /// and is confirmed afterwards.
+    #[test]
+    fn a_passive_teardown_then_the_default_session_is_confirmed() {
+        let (_, point) = point_at(ERASE);
+        let mut host = ecu_in_session_with(sim_ecu::EcuConfig {
+            s3_server_ms: Some(TIMING.session_timeout_millis),
+            ..sim_ecu::EcuConfig::default()
+        });
+        host.0.inject(sim_ecu::Fault::NegativeResponse {
+            nrc: sim_ecu::Nrc::ConditionsNotCorrect,
+        });
+        let (result, _) = run_teardown(TeardownGate::ResetAllowed, &point, &mut host);
+        let teardown = result.unwrap();
+        assert_eq!(
+            teardown,
+            Teardown::Passive(PassiveCause::ResetRefused { nrc: 0x22 })
+        );
+        let confirmed = confirm(
+            teardown,
+            &CONFIRM_TIMING,
+            &mut host,
+            &AtomicBool::new(false),
+        );
+        assert_eq!(confirmed.unwrap(), CONFIRMED);
+    }
+
+    /// The ECU acknowledges the reset and is silent for longer than the declared startup time,
+    /// within the window: the retried reads still confirm.
+    #[test]
+    fn an_ecu_silent_after_acknowledging_the_reset_is_still_confirmed() {
+        let (_, point) = point_at(ERASE);
+        let mut host = ecu_in_session_with(sim_ecu::EcuConfig {
+            startup_ms: Some(100),
+            ..sim_ecu::EcuConfig::default()
+        });
+        let started = Instant::now();
+        let (result, _) = run_teardown(TeardownGate::ResetAllowed, &point, &mut host);
+        assert_eq!(result.unwrap(), Teardown::Reset);
+        let confirmed = confirm(
+            Teardown::Reset,
+            &CONFIRM_TIMING,
+            &mut host,
+            &AtomicBool::new(false),
+        );
+        assert_eq!(confirmed.unwrap(), CONFIRMED);
+        assert!(started.elapsed() >= Duration::from_millis(100));
+    }
+
+    /// The ECUReset's response is lost while the ECU restarts: the outcome is unknown, the
+    /// teardown passive, and the ECU is confirmed in its default session.
+    #[test]
+    fn a_lost_reset_response_while_the_ecu_restarts_is_confirmed_after_the_passive_teardown() {
+        let (_, point) = point_at(ERASE);
+        let mut host = ecu_in_session_with(sim_ecu::EcuConfig {
+            startup_ms: Some(30),
+            ..sim_ecu::EcuConfig::default()
+        });
+        host.0.inject(sim_ecu::Fault::DropResponse);
+        let (result, _) = run_teardown(TeardownGate::ResetAllowed, &point, &mut host);
+        let teardown = result.unwrap();
+        assert_eq!(
+            teardown,
+            Teardown::Passive(PassiveCause::ResetOutcomeUnknown)
+        );
+        assert_eq!(host.0.power_cycles(), 1);
+        let confirmed = confirm(
+            teardown,
+            &CONFIRM_TIMING,
+            &mut host,
+            &AtomicBool::new(false),
+        );
+        assert_eq!(confirmed.unwrap(), CONFIRMED);
+    }
+
+    /// The completed path after the procedure's own ECUReset and an agent crash: the ECU is
+    /// still starting up when the restart begins, and the startup wait and the retried reads
+    /// confirm it.
+    #[test]
+    fn the_completed_path_after_a_procedure_reset_waits_for_the_startup() {
+        let mut host = ecu_in_session_with(sim_ecu::EcuConfig {
+            startup_ms: Some(120),
+            ..sim_ecu::EcuConfig::default()
+        });
+        let started = Instant::now();
+        // The procedure's reset, whose recording was the last thing the first run did.
+        assert!(matches!(
+            host.0.request(&[0x11, 0x01]),
+            sim_ecu::SimResponse::Positive(_)
+        ));
+        let confirmed = confirm(
+            Teardown::CompletedPath,
+            &CONFIRM_TIMING,
+            &mut host,
+            &AtomicBool::new(false),
+        );
+        assert_eq!(confirmed.unwrap(), CONFIRMED);
+        assert!(started.elapsed() >= Duration::from_millis(120));
+    }
+
+    /// An ECU that stays in a non-default session or never answers cannot be confirmed; the
+    /// failure names the teardown.
+    #[test]
+    fn an_ecu_that_cannot_be_confirmed_needs_on_site_intervention() {
+        let window = RecoveryTiming {
+            confirmation_window_millis: 30,
+            ..CONFIRM_TIMING
+        };
+        // The refused reset left the extended session running (default tS3_Server).
+        let (_, point) = point_at(ERASE);
+        let mut host = ecu_in_session();
+        host.0.inject(sim_ecu::Fault::NegativeResponse {
+            nrc: sim_ecu::Nrc::ConditionsNotCorrect,
+        });
+        let (result, _) = run_teardown(TeardownGate::ResetAllowed, &point, &mut host);
+        let teardown = result.unwrap();
+        let failed = confirm(
+            teardown.clone(),
+            &window,
+            &mut host,
+            &AtomicBool::new(false),
+        );
+        assert_eq!(not_confirmed(failed), teardown);
+
+        // An ECU that answers nothing at all, after the reset path and on the completed path.
+        for teardown in [Teardown::Reset, Teardown::CompletedPath] {
+            let mut host = ecu_in_session();
+            host.0.inject(sim_ecu::Fault::PowerLoss);
+            let failed = confirm(
+                teardown.clone(),
+                &window,
+                &mut host,
+                &AtomicBool::new(false),
+            );
+            assert_eq!(not_confirmed(failed), teardown);
+        }
+    }
+
+    /// A passive teardown that was run already is not repeated when its confirmation fails: the
+    /// failure comes long before a second passive wait of this length would end.
+    #[test]
+    fn a_passive_teardowns_failed_confirmation_ends_at_once() {
+        let timing = RecoveryTiming {
+            session_timeout_millis: 60_000,
+            confirmation_window_millis: 0,
+            ..CONFIRM_TIMING
+        };
+        let teardown = Teardown::Passive(PassiveCause::ResetOutcomeUnknown);
+        let mut host = ecu_in_session();
+        let started = Instant::now();
+        let failed = confirm(
+            teardown.clone(),
+            &timing,
+            &mut host,
+            &AtomicBool::new(false),
+        );
+        assert_eq!(not_confirmed(failed), teardown);
+        assert!(started.elapsed() < Duration::from_secs(30));
+    }
+
+    /// Only the positive response with the default session value confirms; a session the ECU
+    /// reports otherwise is a failed read.
+    #[test]
+    fn a_non_default_session_does_not_confirm() {
+        let window = RecoveryTiming {
+            confirmation_window_millis: 0,
+            ..CONFIRM_TIMING
+        };
+        let mut host = ecu_in_session();
+        // Programming-capable extended session, as the interrupted download left it.
+        let failed = confirm(
+            Teardown::Passive(PassiveCause::ResetOutcomeUnknown),
+            &window,
+            &mut host,
+            &AtomicBool::new(false),
+        );
+        assert!(failed.is_err());
+        assert_eq!(host.0.session, sim_ecu::Session::Extended);
+    }
+
+    /// A cancel during the startup wait, and one during the read retries, end the confirmation.
+    #[test]
+    fn a_cancel_ends_the_startup_wait_and_the_read_retries() {
+        let cases = [
+            (
+                RecoveryTiming {
+                    ecu_startup_millis: 60_000,
+                    ..CONFIRM_TIMING
+                },
+                false,
+            ),
+            (
+                RecoveryTiming {
+                    confirmation_window_millis: 60_000,
+                    ..CONFIRM_TIMING
+                },
+                true,
+            ),
+        ];
+        for (timing, silent) in cases {
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let canceller = {
+                let cancelled = Arc::clone(&cancelled);
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(50));
+                    cancelled.store(true, Ordering::Relaxed);
+                })
+            };
+            let mut host = ecu_in_session();
+            if silent {
+                // No read is answered, so the window keeps retrying.
+                host.0.inject(sim_ecu::Fault::PowerLoss);
+            }
+            let result = confirm(Teardown::Reset, &timing, &mut host, &cancelled);
+            canceller.join().unwrap();
+            assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
+        }
+    }
+
+    /// A cancel set at the start sends no read.
+    #[test]
+    fn a_cancel_before_the_confirmation_sends_no_read() {
+        let mut host = ecu_in_session();
+        host.0.inject(sim_ecu::Fault::BusError);
+        let result = confirm(
+            Teardown::Reset,
+            &CONFIRM_TIMING,
+            &mut host,
+            &AtomicBool::new(true),
+        );
+        assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
+        assert_eq!(host.0.armed_faults(), &[sim_ecu::Fault::BusError]);
     }
 }

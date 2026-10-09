@@ -178,7 +178,7 @@ ECU, it opens the job's journal (`Journal::open`) and classifies it.
 |---|---|
 | plain start | runs the program from its start on the same journal; its step count starts at `restart::next_steps`, after the journal's last record, and the identity is read again. A program without a plan runs without a journal, when it has none or one that records no transfer |
 | `OnSiteInterventionRequired` | ends in `JobError::OnSiteInterventionRequired` with the classification's reason; nothing is sent |
-| `Restart` | runs `restart::check_before_ecu`, then the gates of `restart::check_gates` (which promote the guards to the per-vehicle lock once the VIN matches, ADR-263), then the teardown of `restart::teardown` (ADR-264), then ends in `JobError::OnSiteInterventionRequired(RestartOrderUnavailable)` carrying the teardown's outcome, because the rest of the restart order (default-session confirmation, ECU state check, replay) does not run in the agent; the gates' reads and at most one ECUReset reach the ECU |
+| `Restart` | runs `restart::check_before_ecu`, then the gates of `restart::check_gates` (which promote the guards to the per-vehicle lock once the VIN matches, ADR-263), then the teardown of `restart::teardown` (ADR-264), then the default-session confirmation of `restart::confirm_default_session` (ADR-265). An ECU that cannot be confirmed ends the job in `JobError::OnSiteInterventionRequired(DefaultSessionNotConfirmed)`; otherwise it ends in `OnSiteInterventionRequired(RestartOrderUnavailable)` carrying the teardown's outcome and the confirmation, because step 3 (the service-dependent checks), the ECU state check and the replay do not run in the agent; the gates' reads, at most one ECUReset and the F186 reads reach the ECU |
 
 `check_before_ecu` is the part of ADR-229 item 2 step 1 that an agent without a server makes:
 
@@ -240,12 +240,12 @@ gates before and after each read.
 
 1. The journal's exclusions. Post-transfer steps journaled complete (the completed path) give
    `Teardown::CompletedPath`: no reset and no wait, since the default-session confirmation of
-   step 2b-2 comes first. A RequestTransferExit intent without that completion gives
+   step 2b-2 comes first (ADR-265). A RequestTransferExit intent without that completion gives
    `Teardown::Passive(TransferExitJournaled)`.
 2. A `PassiveOnly` gate gives `Teardown::Passive(Gate(reason))`.
 3. Otherwise one ECUReset (hardReset, positive response required) is sent. A positive response
    gives `Teardown::Reset`, with no wait: the ECU's startup time and the confirmation belong to
-   step 2b-2. A negative response gives `Passive(ResetRefused { nrc })`; a failed or unanswered
+   step 2b-2 (ADR-265). A negative response gives `Passive(ResetRefused { nrc })`; a failed or unanswered
    request, a final response-pending code, or any other answer gives
    `Passive(ResetOutcomeUnknown)`.
 
@@ -254,6 +254,25 @@ reset was the last request; the agent runs no TesterPresent, so there is none to
 waits the flash session's `session_timeout_millis + teardown_margin_millis`, in steps of the
 job's `wait_poll`; a cancel during the wait ends the job in `JobError::Cancelled`.
 `RestartOrderUnavailable` carries the outcome.
+
+`restart::confirm_default_session` is step 2b-2 (ADR-265), run on the teardown's outcome. One
+attempt waits the flash session's `ecu_startup_millis` (sending nothing, in steps of
+`wait_poll`, a cancel ending the job in `Cancelled`), then reads DID F186 every `wait_poll`
+until the ECU confirms its default session or `confirmation_window_millis` (counted from the
+end of the startup wait) has passed; at least one read is made, and a cancel is checked before
+every wait step and every read. Only a positive response with the value `01` confirms; a
+negative response, no answer, another session value or any other answer is a failed read,
+retried while the window lasts. When an attempt fails:
+
+- after `Teardown::Reset` or `Teardown::CompletedPath`, where no passive teardown has run, the
+  agent runs the passive teardown (the same wait as above) and makes one more attempt, startup
+  wait included; if that confirms, the result is `Confirmation { after_passive_retry: true }`;
+- after `Teardown::Passive`, where the wait has run already, the failure is final at once.
+
+A failure is `JobError::OnSiteInterventionRequired(DefaultSessionNotConfirmed { flash_session,
+teardown })`: someone on site must check the ECU. A confirmation ends in
+`RestartOrderUnavailable { flash_session, teardown, confirmed }`. The F186 reads put no VIN in a
+log message or a result.
 
 ## Job guards
 

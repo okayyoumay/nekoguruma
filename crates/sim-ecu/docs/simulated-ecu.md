@@ -174,6 +174,14 @@ numbers contradict each other or exceed the flash window, which the ECU itself n
 - During the chain the ECU answers other requests at once, and the request's own effect (an ECU
   reset, for one) applies at the start of the chain, not at its end.
 
+After an ECUReset the ECU can start up before it answers again (`EcuConfig::startup_ms`, unset
+by default: it answers at once). The reset itself is answered as usual; for `startup_ms` from
+when its response goes out (also when that response is lost) the ECU answers nothing, and a
+request in that time is lost as on a bus error, without firing an armed fault. The time is
+measured on the ECU's clock, like the other timers, and a snapshot keeps the time left.
+`reconnect()` and `Fault::PowerLoss` start no startup (a power loss stays silent until
+`reconnect()`, which also ends a startup in progress).
+
 While the ECU is silent (after `PowerLoss` or `drop_at_block`), requests do not reach it and the
 armed faults stay armed. `armed_faults()` lists the faults that have not fired yet.
 `power_cycles()` counts power cycles (power loss, ECU reset, `reconnect()`); the VCI side uses it

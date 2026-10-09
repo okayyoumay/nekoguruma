@@ -122,6 +122,14 @@ pub struct EcuConfig {
     /// [`Self::sw_version`].
     #[serde(default)]
     pub downloaded_sw_version: Option<String>,
+    /// How long the ECU answers nothing after an ECUReset (ms): it is starting up. Requests that
+    /// arrive in that time are lost as on a bus error (no armed fault fires on them), and the
+    /// time is measured on the ECU's [`Clock`], from when the reset's response goes out (also
+    /// when that response is lost). Only an ECUReset starts it: [`SimEcu::reconnect`] and
+    /// [`Fault::PowerLoss`] do not (a power loss is silent until `reconnect` anyway, which ends a
+    /// startup in progress). `None` answers at once, as the simulator always did.
+    #[serde(default)]
+    pub startup_ms: Option<u32>,
 }
 
 // ---------------------------------------------------------------- Clock
@@ -279,6 +287,9 @@ pub struct SimEcu {
     /// A response delayed past a later request's response still restarts tS3_Server when it
     /// goes out.
     last_response_at: Duration,
+    /// When the startup after an ECUReset ends ([`EcuConfig::startup_ms`]), on [`Self::clock`]'s
+    /// time line: requests before it are lost.
+    startup_until: Option<Duration>,
     clock: Box<dyn Clock>,
     download: Option<Download>,
     image: Vec<u8>,
@@ -310,6 +321,9 @@ pub struct EcuSnapshot {
     s3_left: Option<Duration>,
     /// How long until the last response handed to the VCI side goes out (zero if it has).
     last_response_in: Duration,
+    /// How long until the startup after an ECUReset ends.
+    #[serde(default)]
+    startup_left: Option<Duration>,
     download: Option<Download>,
     image: Vec<u8>,
     silent: bool,
@@ -494,6 +508,7 @@ impl SimEcu {
             security_delay_until: None,
             s3_deadline: None,
             last_response_at: Duration::ZERO,
+            startup_until: None,
             clock: Box::new(clock),
             download: None,
             image: Vec::new(),
@@ -508,6 +523,7 @@ impl SimEcu {
     /// authentication is the gateway's state and is kept.
     pub fn reconnect(&mut self) {
         self.silent = false;
+        self.startup_until = None;
         self.power_cycle();
     }
 
@@ -602,6 +618,7 @@ impl SimEcu {
             security_delay_left: self.security_delay_until.map(left),
             s3_left: self.s3_deadline.map(left),
             last_response_in: left(self.last_response_at),
+            startup_left: self.startup_until.map(left),
             download: self.download,
             image: self.image.clone(),
             silent: self.silent,
@@ -639,6 +656,7 @@ impl SimEcu {
         ecu.security_delay_until = snapshot.security_delay_left.map(at);
         ecu.s3_deadline = snapshot.s3_left.map(at);
         ecu.last_response_at = at(snapshot.last_response_in);
+        ecu.startup_until = snapshot.startup_left.map(at);
         ecu.download = snapshot.download;
         ecu.image = snapshot.image;
         ecu.silent = snapshot.silent;
@@ -672,6 +690,13 @@ impl SimEcu {
         if self.silent {
             return Exchange::none();
         }
+        if self
+            .startup_until
+            .is_some_and(|until| self.clock.now() < until)
+        {
+            // Still starting up after an ECUReset: the request is lost.
+            return Exchange::none();
+        }
         if self.take_armed(|f| matches!(f, Fault::BusError)).is_some() {
             // The request never reaches the ECU.
             return Exchange::none();
@@ -692,6 +717,12 @@ impl SimEcu {
             } else if let Some(until) = &mut self.security_delay_until {
                 *until = until.saturating_add(Duration::from_millis(sent_after_ms.into()));
             }
+            // Only an ECUReset gets here: the ECU then starts up for `startup_ms`, from the
+            // response.
+            self.startup_until = self
+                .config
+                .startup_ms
+                .map(|ms| reset_at.saturating_add(Duration::from_millis(ms.into())));
         }
         // Any request that reaches the ECU restarts tS3_Server, supported or not.
         self.restart_s3(sent_after_ms);

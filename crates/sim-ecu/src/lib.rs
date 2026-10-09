@@ -375,8 +375,9 @@ impl EcuSnapshot {
 
 // ---------------------------------------------------------------- Responses
 
-/// ISO 14229 NRCs (Annex A.1). Used as expected values in tests.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// ISO 14229 NRCs (Annex A.1). Used as expected values in tests, and by [`Fault::NegativeResponse`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 #[repr(u8)]
 pub enum Nrc {
     ServiceNotSupported = 0x11,
@@ -707,7 +708,19 @@ impl SimEcu {
         {
             delay_ms = delay_ms.saturating_add(ms);
         }
-        let response = self.respond(addressing, message);
+        let refused = match message.first() {
+            Some(&sid) => self
+                .take_armed(|f| matches!(f, Fault::NegativeResponse { .. }))
+                .and_then(|fault| match fault {
+                    Fault::NegativeResponse { nrc } => Some(SimResponse::Negative { sid, nrc }),
+                    _ => None,
+                }),
+            None => None,
+        };
+        let response = match refused {
+            Some(response) => response,
+            None => self.respond(addressing, message),
+        };
         let dropped = self
             .take_armed(|f| matches!(f, Fault::DropResponse))
             .is_some();
@@ -856,4 +869,8 @@ pub enum Fault {
     /// not for this ECU to answer) leaves the fault armed. `count` is capped at
     /// [`MAX_RESPONSE_PENDING`]; zero uses the fault up without sending any.
     ResponsePending { count: u32, interval_ms: u32 },
+    /// The next request that reaches the ECU is refused with this NRC and has no effect: the
+    /// ECU does not dispatch it, so no state changes. The refusal is sent whatever the
+    /// addressing and the request's suppress bit.
+    NegativeResponse { nrc: Nrc },
 }

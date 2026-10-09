@@ -2,7 +2,7 @@
 
 **Date:** 2026-10-09
 **Status:** Accepted
-**Affects:** `agent` (`src/restart.rs`, `src/runner.rs`, `docs/ngr-agent.md`), `sim-ecu` (`Fault`), ADR-229 item 2, ADR-261
+**Affects:** `agent` (`src/restart.rs`, `src/runner.rs`, `docs/ngr-agent.md`), `sim-ecu` (`Fault`, `docs/simulated-ecu.md`), ADR-229 item 2, ADR-261 item 2
 
 ## Context
 
@@ -50,8 +50,8 @@ Points the design and ADR-229 leave open:
    (`Teardown::Reset`, `Teardown::Passive(cause)` or `Teardown::CompletedPath`) instead of the
    gates' decision, until the confirmation (the next step) exists.
 6. **A simulator fault for refusals.** `sim-ecu` gains `Fault::NegativeResponse { nrc }`,
-   which refuses the next request it would answer with that response code and changes
-   nothing, so the refusal path is tested against the simulator as the other faults are.
+   which refuses the next request that reaches it with that response code and changes nothing,
+   so the refusal path is tested against the simulator as the other faults are.
 
 ## Consequences
 

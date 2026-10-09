@@ -1445,6 +1445,36 @@ fn drop_response_fault_on_a_block_lets_the_client_repeat_it() {
 }
 
 #[test]
+fn negative_response_fault_refuses_the_next_request_without_effect() {
+    let mut ecu = ecu();
+    ecu.inject(Fault::NegativeResponse {
+        nrc: Nrc::ConditionsNotCorrect,
+    });
+    assert_eq!(
+        ecu.request(&[0x10, 0x03]),
+        neg(0x10, Nrc::ConditionsNotCorrect)
+    );
+    assert_eq!(ecu.session, Session::Default);
+    assert_eq!(ecu.power_cycles(), 0);
+    // Used up: the same request now works, and an ECU reset the fault refused did not happen.
+    assert!(matches!(
+        ecu.request(&[0x10, 0x03]),
+        SimResponse::Positive(_)
+    ));
+    ecu.inject(Fault::NegativeResponse {
+        nrc: Nrc::ConditionsNotCorrect,
+    });
+    assert_eq!(
+        ecu.request(&[0x11, 0x01]),
+        neg(0x11, Nrc::ConditionsNotCorrect)
+    );
+    assert_eq!(ecu.session, Session::Extended);
+    assert_eq!(ecu.power_cycles(), 0);
+    assert_eq!(ecu.request(&[0x11, 0x01]), pos(&[0x51, 0x01]));
+    assert_eq!(ecu.session, Session::Default);
+}
+
+#[test]
 fn bus_error_fault_loses_the_request() {
     let mut ecu = ecu();
     ecu.inject(Fault::BusError);

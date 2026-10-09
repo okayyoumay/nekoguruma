@@ -178,7 +178,7 @@ ECU, it opens the job's journal (`Journal::open`) and classifies it.
 |---|---|
 | plain start | runs the program from its start on the same journal; its step count starts at `restart::next_steps`, after the journal's last record, and the identity is read again. A program without a plan runs without a journal, when it has none or one that records no transfer |
 | `OnSiteInterventionRequired` | ends in `JobError::OnSiteInterventionRequired` with the classification's reason; nothing is sent |
-| `Restart` | runs `restart::check_before_ecu`, then the gates of `restart::check_gates` (which promote the guards to the per-vehicle lock once the VIN matches, ADR-263), then ends in `JobError::OnSiteInterventionRequired(RestartOrderUnavailable)` carrying the gates' decision, because the rest of the restart order (teardown, ECU state check, replay) does not run in the agent; only the gates' reads reach the ECU |
+| `Restart` | runs `restart::check_before_ecu`, then the gates of `restart::check_gates` (which promote the guards to the per-vehicle lock once the VIN matches, ADR-263), then the teardown of `restart::teardown` (ADR-264), then ends in `JobError::OnSiteInterventionRequired(RestartOrderUnavailable)` carrying the teardown's outcome, because the rest of the restart order (default-session confirmation, ECU state check, replay) does not run in the agent; the gates' reads and at most one ECUReset reach the ECU |
 
 `check_before_ecu` is the part of ADR-229 item 2 step 1 that an agent without a server makes:
 
@@ -235,6 +235,24 @@ teardown still applies the journal's exclusions (none after RequestTransferExit 
 none on the completed path). A failure to use the worker during a read counts
 as a read that gave no value. Neither the error nor the log carries a VIN. A cancel stops the
 gates before and after each read.
+
+`restart::teardown` is step 2b-1 (ADR-264), run on the gates' decision. In this order:
+
+1. The journal's exclusions. Post-transfer steps journaled complete (the completed path) give
+   `Teardown::CompletedPath`: no reset and no wait, since the default-session confirmation of
+   step 2b-2 comes first. A RequestTransferExit intent without that completion gives
+   `Teardown::Passive(TransferExitJournaled)`.
+2. A `PassiveOnly` gate gives `Teardown::Passive(Gate(reason))`.
+3. Otherwise one ECUReset (hardReset, positive response required) is sent. A positive response
+   gives `Teardown::Reset`, with no wait: the ECU's startup time and the confirmation belong to
+   step 2b-2. A negative response gives `Passive(ResetRefused { nrc })`; a failed or unanswered
+   request, a final response-pending code, or any other answer gives
+   `Passive(ResetOutcomeUnknown)`.
+
+A passive teardown sends nothing (the agent runs no TesterPresent, so there is none to stop)
+and waits the flash session's `session_timeout_millis + teardown_margin_millis`, in steps of the
+job's `wait_poll`; a cancel during the wait ends the job in `JobError::Cancelled`.
+`RestartOrderUnavailable` carries the outcome.
 
 ## Job guards
 

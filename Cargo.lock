@@ -15,6 +15,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "shared-proto",
+ "sim-ecu",
  "thiserror",
  "tokio",
  "tonic",

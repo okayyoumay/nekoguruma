@@ -1549,6 +1549,14 @@ fn a_damaged_or_foreign_state_file_is_refused() {
     )
     .expect("file should be writable");
     assert!(load_ecu_state(&dir.file()).is_err());
+
+    // A file of the previous version is refused on its version, whatever follows it, before the
+    // rest is decoded in this version's layout.
+    let mut previous =
+        postcard::to_allocvec(&(STATE_FILE_VERSION - 1)).expect("version should encode");
+    previous.extend(postcard::to_allocvec(&other_version.ecu).expect("state should encode"));
+    std::fs::write(dir.file(), previous).expect("file should be writable");
+    assert!(load_ecu_state(&dir.file()).is_err());
 }
 
 #[test]

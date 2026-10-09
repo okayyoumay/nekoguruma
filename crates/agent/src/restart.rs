@@ -647,11 +647,10 @@ where
     let deadline = Instant::now() + Duration::from_millis(timing.confirmation_window_millis.into());
     let mut failed_reads = 0u32;
     loop {
-        if cancelled.load(Ordering::Relaxed) {
-            return Err(JobError::Cancelled);
-        }
         // ReadDataByIdentifier F186 (ActiveDiagnosticSession); 0x01 is the default session.
-        match host.service_request(0x22, &[0xF1, 0x86]) {
+        // The cancel is checked before the read and, so that it wins over the answer, right
+        // after it.
+        match cancellable(cancelled, || host.service_request(0x22, &[0xF1, 0x86]))? {
             Ok(response) if response == [0x62, 0xF1, 0x86, 0x01] => return Ok(true),
             Ok(other) => log_failed_read(failed_reads, format_args!("answer {other:02X?}")),
             Err(error) => log_failed_read(failed_reads, format_args!("{error}")),
@@ -1398,6 +1397,26 @@ mod tests {
             &AtomicBool::new(false),
         );
         assert_eq!(result.unwrap(), Teardown::CompletedPath);
+    }
+
+    /// A cancel that arrives while an F186 read is on its way wins over a read that confirms.
+    #[test]
+    fn a_cancel_during_a_confirming_read_cancels() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        // A fresh simulated ECU is in its default session, so the read would confirm.
+        let mut host = SimHost(
+            sim_ecu::SimEcu::new(sim_ecu::EcuConfig::default()),
+            Some(Arc::clone(&cancelled)),
+        );
+        let result = confirm_default_session(
+            1,
+            Teardown::CompletedPath,
+            &TIMING,
+            &mut host,
+            Duration::from_millis(1),
+            &cancelled,
+        );
+        assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
     }
 
     /// A cancel set before the teardown sends no reset.

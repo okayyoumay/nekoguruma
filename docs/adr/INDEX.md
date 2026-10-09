@@ -236,7 +236,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-244](ADR-244-write-job-journal-format.md) | Write-Job Journal as an Append-Only Record Log | Accepted (record set extended by ADR-253; the no-lock consequence superseded by ADR-255 item 7) | `agent` write-job journal |
 | [ADR-245](ADR-245-ir-restart-declaration-in-the-procedure-part.md) | The IR's Restart Declaration Lives in the Procedure Part | Accepted (items 4 and 6 amended by ADR-250) | `diag-ir` `Program` restart declaration, `ir.fbs` `FlashSession` |
 | [ADR-246](ADR-246-codeql-hand-off-carries-private-alert-details.md) | The CodeQL Hand-Off Carries High and Critical Alert Details Privately | Accepted | `.github/workflows/codeql-alert-handoff.yml`, `.claude/skills/codeql-alerts` |
-| [ADR-247](ADR-247-debug-builds-may-write-to-sim-vci.md) | Debug Builds May Send Write Requests to `sim-vci` | Accepted (Decision item 4's refusal of `FlashTransfer` superseded by ADR-250) | `agent` policy, link, host, runner |
+| [ADR-247](ADR-247-debug-builds-may-write-to-sim-vci.md) | Debug Builds May Send Write Requests to `sim-vci` | Accepted (Decision item 4's refusal of `FlashTransfer` superseded by ADR-250; its reason for refusing `SecurityAccess` replaced by ADR-259) | `agent` policy, link, host, runner |
 | [ADR-248](ADR-248-dependabot-auto-merge-trust-boundary.md) | Dependabot's Cargo Minor/Patch Group Merges Itself | Accepted | `.github/workflows/dependabot-auto-merge.yml`, `.github/dependabot.yml` |
 | [ADR-249](ADR-249-backlog-loop-iterations-start-from-a-fresh-branch.md) | Backlog Loop Iterations Start from a Fresh Branch at `origin/main` | Accepted | `.claude/skills/backlog-loop` (step 1), `codeql-alerts` |
 | [ADR-250](ADR-250-agent-host-flash-transfer.md) | The Agent Host Implements FlashTransfer with Its Own Block Count | Accepted | `agent` host, policy; `diag-ir` plan validation |
@@ -248,6 +248,8 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-256](ADR-256-restart-guards-as-os-file-locks.md) | Restart Guards as OS Locks on Files in a Device Lock Directory | Accepted (the first-run consequence and item 1's write access to lock files superseded by ADR-257; the failed-close consequence superseded by ADR-258) | `agent` guards, runner |
 | [ADR-257](ADR-257-every-job-runs-on-guards.md) | Every Job Runs on Guards It Holds | Accepted | `agent` guards, runner, policy, CLI |
 | [ADR-258](ADR-258-a-failed-link-close-keeps-the-job-guards.md) | A Failed Link Close Keeps the Job Guards | Accepted | `agent` guards, runner, CLI; `worker-host` |
+| [ADR-259](ADR-259-a-standalone-agent-refuses-security-access.md) | A Standalone Agent Refuses the SecurityAccess Instruction | Accepted | `agent` policy, host |
+| [ADR-260](ADR-260-sim-vci-stays-separate-from-the-j2534-mock.md) | `sim-vci` Stays Separate from `j2534-0404-mock` | Accepted | `sim-vci`, `j2534-0404-mock` |
 
 ## Status Legend
 
@@ -575,6 +577,7 @@ the predecessor repository these ADRs came from.
 - ADR-248
 - ADR-249
 - ADR-251
+- ADR-260
 
 ### Timestamps / Clock
 - ADR-057 (amended by ADR-102)
@@ -589,7 +592,7 @@ the predecessor repository these ADRs came from.
 - ADR-241
 - ADR-244 (record set extended by ADR-253; the no-lock consequence superseded by ADR-255 item 7)
 - ADR-245 (items 4 and 6 amended by ADR-250)
-- ADR-247 (Decision item 4's refusal of `FlashTransfer` superseded by ADR-250)
+- ADR-247 (Decision item 4's refusal of `FlashTransfer` superseded by ADR-250; its reason for refusing `SecurityAccess` replaced by ADR-259)
 - ADR-250
 - ADR-252 (item 2's open point decided by ADR-253)
 - ADR-253 (item 4's wiring into the runner decided by ADR-255)
@@ -597,6 +600,7 @@ the predecessor repository these ADRs came from.
 - ADR-256 (the first-run consequence and item 1's write access to lock files superseded by ADR-257; the failed-close consequence superseded by ADR-258)
 - ADR-257
 - ADR-258
+- ADR-259
 
 ### Diagnostic IR
 - ADR-233 (item 3's `VmState` fields removed by ADR-245)

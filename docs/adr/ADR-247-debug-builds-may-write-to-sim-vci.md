@@ -1,7 +1,7 @@
 # ADR-247: Debug Builds May Send Write Requests to `sim-vci`
 
 **Date:** 2026-10-08
-**Status:** Accepted (Decision item 4's refusal of `FlashTransfer` superseded by ADR-250)
+**Status:** Accepted (Decision item 4's refusal of `FlashTransfer` superseded by ADR-250; its reason for refusing `SecurityAccess` replaced by ADR-259)
 **Affects:** `agent` (`src/policy.rs`, `src/link.rs`, `src/host.rs`, `src/runner.rs`), `j2534-0404-service` (`tests/agent_end_to_end.rs`), ADR-235 item 8
 
 ## Context

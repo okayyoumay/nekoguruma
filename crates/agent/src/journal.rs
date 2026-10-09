@@ -56,7 +56,8 @@ pub struct StageId(pub u32);
 
 /// The VIN a job targets. It is personal data (design 16.2): `Debug` hides it, there is no
 /// `Display`, and callers use [`Vin::as_str`] only to compare. The journal keeps it as given;
-/// `restart` decides whether it is well-formed.
+/// [`Vin::is_well_formed`] is the rule for whether it is well-formed, used by the
+/// restart's gates and the job guards (ADR-261, ADR-262).
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Vin(String);
 
@@ -67,6 +68,20 @@ impl Vin {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// Whether this VIN is well-formed: 17 characters, each an ASCII digit or upper-case letter
+    /// other than I, O and Q.
+    pub fn is_well_formed(&self) -> bool {
+        Self::is_well_formed_text(&self.0)
+    }
+
+    /// Whether `text` is a well-formed VIN (see [`Vin::is_well_formed`]).
+    pub fn is_well_formed_text(text: &str) -> bool {
+        text.len() == 17
+            && text.bytes().all(|b| {
+                b.is_ascii_digit() || (b.is_ascii_uppercase() && !matches!(b, b'I' | b'O' | b'Q'))
+            })
     }
 }
 

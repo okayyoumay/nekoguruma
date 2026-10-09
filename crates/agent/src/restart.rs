@@ -314,7 +314,7 @@ fn cancellable<T>(cancelled: &AtomicBool, read: impl FnOnce() -> T) -> Result<T,
 /// first that does not pass:
 /// - the VIN: the ECU's, read through the program's source, must equal the VIN the job
 ///   targets, which the journal recorded at the job's first run (`RecoveryFacts::target_vin`).
-///   A job that names none or a VIN that is not well-formed (`is_vin`), a program that
+///   A job that names none or a VIN that is not well-formed (`Vin::is_well_formed`), a program that
 ///   declares no source, a source the table does not map, and a read that gives no well-formed
 ///   VIN (no answer, a negative response, an undecodable, padded or lower-case field, a worker
 ///   failure) leave the vehicle unidentified: [`PassiveReason::VinNotEstablished`], and nothing
@@ -357,14 +357,14 @@ where
             .target_vin
             .as_ref()
             .map(Vin::as_str)
-            .filter(|vin| is_vin(vin)),
+            .filter(|vin| Vin::is_well_formed_text(vin)),
         program.identity.vin,
     ) else {
         return passive(PassiveReason::VinNotEstablished);
     };
     match cancellable(cancelled, || resolve_source(source, sources, host))? {
-        Ok(Reading::Text(text)) if is_vin(&text) && text == target => {}
-        Ok(Reading::Text(text)) if is_vin(&text) => {
+        Ok(Reading::Text(text)) if Vin::is_well_formed_text(&text) && text == target => {}
+        Ok(Reading::Text(text)) if Vin::is_well_formed_text(&text) => {
             return Err(JobError::IdentityMismatch {
                 identity: IdentityKind::Vin,
             });
@@ -410,15 +410,6 @@ where
         }
     }
     Ok(TeardownGate::ResetAllowed)
-}
-
-/// Whether `text` is a well-formed VIN: 17 characters, each an ASCII digit or upper-case
-/// letter other than I, O and Q.
-fn is_vin(text: &str) -> bool {
-    text.len() == 17
-        && text.bytes().all(|b| {
-            b.is_ascii_digit() || (b.is_ascii_uppercase() && !matches!(b, b'I' | b'O' | b'Q'))
-        })
 }
 
 /// Whether `precondition` holds: the first source that gives a value decides, the

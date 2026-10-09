@@ -15,7 +15,7 @@ ngr-agent run --vci <name> --program <file> [--workers <dir>] [--locks <dir>] [-
 | `--vci` | J2534 v04.04 library name, as the worker service resolves it (registry key on Windows, `library_path` entry in the service's `config.toml`) |
 | `--program` | IR program file: a `diag_ir::Program` serialized as JSON |
 | `--workers` | Directory of worker builds, laid out as `<dir>/<ABI name>/j2534-0404-service[.exe]` (design 7.3). Default: `workers` next to the `ngr-agent` executable |
-| `--locks` | The device's lock directory for the job's guards ("Job guards" below), as an absolute path. Default: `locks` next to the `ngr-agent` executable. Lock files are opened read-only, so a file another user created still locks. The agent creates a missing directory writable by its owner only, so a device whose agents run as several users needs it prepared beforehand: writable by all of them, and with the sticky bit (or an equivalent ACL) so that no user can delete another's lock files (ADR-257). On Unix a directory that group or others may write without the sticky bit is refused |
+| `--locks` | The device's lock directory for the job's guards ("Job guards" below), as an absolute path. Default: `locks` next to the `ngr-agent` executable. Lock files are opened read-only, so a file another user created still locks. The agent creates a missing directory writable by its owner only, so a device whose agents run as several users needs it prepared beforehand: writable by all of them, and with the sticky bit (or an equivalent ACL) so that no user can delete another's lock files (ADR-257). It must also be readable by every agent user, since the per-vehicle lock lists it, and on Unix support hard links, with which it creates its files (ADR-262). On Unix a directory that group or others may write without the sticky bit, or without being readable by them, is refused |
 | `--tx-id`, `--rx-id` | Physical request and response CAN IDs in hex, with or without `0x`. Default `7E0` / `7E8`. Only 11-bit IDs: the link does not set the CAN ID format |
 
 The link is UDS on ISO 15765 at 500 kbit/s (`LinkConfig::iso15765`), with the CAN IDs from the
@@ -228,12 +228,10 @@ gates before and after each read.
 ## Job guards
 
 The `guards` module holds a job's exclusive locks on the device (design 8.8, 8.8.1; ADR-256,
-ADR-257): the per-VCI lock and the device's single reprogramming slot. Each is an OS lock
-(`File::try_lock`) on a file in the device's lock directory: `vci-{hex name}.lock` and
-`reprogramming.lock`. The per-vehicle lock is not here: its file must not carry the VIN
-(ADR-256 item 6). The OS
-releases a lock when its process dies, so a crashed run never blocks the next one, and the
-files are never deleted.
+ADR-257, ADR-262): the per-VCI lock, the device's single reprogramming slot and the per-vehicle
+lock. Each is an OS lock (`File::try_lock`) on a file in the device's lock directory: `vci-{hex
+name}.lock`, `reprogramming.lock` and `vehicle-{k:03x}.lock`. The OS releases a lock when its
+process dies, so a crashed run never blocks the next one, and the files are never deleted.
 
 - `JobGuards::take(GuardSetup { dir, vci }, poll, cancelled)` takes the per-VCI lock, then the
   slot, for a job that writes (`policy::writes`). It waits while another job holds either,
@@ -241,8 +239,26 @@ files are never deleted.
 - `JobGuards::take_vci_only(...)` takes the per-VCI lock alone, for a job that only reads, so
   reads on other VCIs go on while a job reprograms. `JobGuards::holds_slot` tells the two
   apart.
-- Locks are always taken in the order VCI, then slot, and held until the `JobGuards` is
-  dropped.
+- `JobGuards::take_vehicle(vin, poll, cancelled)` takes the per-vehicle lock, on guards with or
+  without the slot, for a well-formed VIN only (`GuardError::InvalidVin`). The file is one of
+  4096 buckets: `k` is the first two bytes of SHA-256 over the VIN, read big-endian, masked to
+  their low 12 bits (a digest starting `84 b1` gives `vehicle-4b1.lock`). Before it opens its
+  bucket, the call lists the lock directory and, when fewer than 4096 bucket files are present,
+  creates every missing one in bucket order (on Unix each made readable by everyone whatever
+  the umask before it is hard-linked to its name, then a best-effort directory sync whose
+  failure is only logged), so whether files
+  are created depends only on the directory's state, never on the VIN, and neither a file's name
+  nor the directory's content reveals a VIN (ADR-262). Two vehicles in one bucket exclude each
+  other, which delays a job about once in 4096 concurrent pairs. Taking the vehicle the guards
+  already hold returns at once; another VIN is refused (`GuardError::OtherVehicleHeld`), as are
+  guards marked `link_unconfirmed`. `JobGuards::holds_vehicle` tells whether they hold one.
+- Every lock file must be a regular file. It is opened without following a symbolic link and
+  without blocking, and a symbolic link, FIFO, device or (on Windows) reparse point at its path
+  fails the take (`GuardError::NotAFile`, or `GuardError::NotAVehicleFile` for a bucket file,
+  which names no path so that no bucket appears in an error, or an I/O error) instead of being
+  followed or hanging (ADR-262 item 6).
+- Locks are always taken in the order VCI, then slot, then vehicle, and held until the
+  `JobGuards` is dropped.
 
 Every entry point (`run_program`, `run_program_journaled`, `resume_program_journaled`) takes
 the guards by value and returns them with the run's result, so two runs can never use one set
@@ -255,23 +271,24 @@ once the job thread has ended. A job that survives a worker crash, a VCI disconn
 of the vehicle's supply alone gets them back, still held, and passes them to its next run. A
 VCI name has 1 to `MAX_VCI_NAME` (100) bytes. The lock directory is one per device,
 shared by every agent process on it whichever user it runs as: each of them must be able to
-create files in it and read the lock files there (lock files are opened read-only).
+create files in it, list it (the per-vehicle lock counts its bucket files, ADR-262) and read the
+lock files there (lock files are opened read-only).
 
-A run whose link close fails or panics, or whose open fails partway and cannot close what it
-had opened, gives its guards back marked (`JobGuards::link_unconfirmed`), whatever the job's
-own result (ADR-258). Marked guards refuse
-another run (`JobError::LinkUnconfirmed`), and dropping them keeps their locks until the
-process exits. The caller stops the worker that held the link (`WorkerProcess::stop`, which
-returns `Ok` only once the child is reaped) and then calls `JobGuards::worker_gone`, before the
-guards serve another run or are released. The runner closes the link exactly once on every
-path after it opened, a panic included. An agent killed without running its exit path still
-frees its locks while its orphaned worker tears the link down on stdin EOF; the next open of
-a device still held usually fails. On Unix
-the guards refuse a directory that group or others may write unless it has the sticky bit
-(`GuardError::UnsafeDir`): another user could otherwise delete a lock file a job holds, and a
-second job would lock the new file at the same path. A directory the guards create is writable
-by its owner only. `ngr-agent run` takes the guards from `--locks` and `--vci` before it runs the
-program, and holds them until the run ends.
+A run whose link close fails or panics, or whose open fails partway and cannot close what it had
+opened, gives its guards back marked (`JobGuards::link_unconfirmed`), whatever the job's own
+result (ADR-258). Marked guards refuse another run (`JobError::LinkUnconfirmed`), and dropping
+them keeps their locks until the process exits. The caller stops the worker that held the link
+(`WorkerProcess::stop`, which returns `Ok` only once the child is reaped) and then calls
+`JobGuards::worker_gone`, before the guards serve another run or are released. The runner closes
+the link exactly once on every path after it opened, a panic included. An agent killed without
+running its exit path still frees its locks while its orphaned worker tears the link down on
+stdin EOF; the next open of a device still held usually fails. On Unix the guards refuse a
+directory that group or others may write unless it has the sticky bit and those users may also
+read it (`GuardError::UnsafeDir`, or `GuardError::UnlistableDir` for a sticky directory they
+cannot read): another user could otherwise delete a lock file a job holds, and a second job
+would lock the new file at the same path. A directory the guards create is writable by its owner
+only. `ngr-agent run` takes the guards from `--locks` and `--vci` before it runs the program,
+and holds them until the run ends.
 
 ## Restart inputs
 

@@ -5,20 +5,21 @@
 //! - the device's single reprogramming slot, since only one ECU is reprogrammed at a time per
 //!   device. A job that only reads ([`JobGuards::take_vci_only`]) does not take it.
 //!
-//! The per-vehicle lock of design 8.8's two-stage locking ([`JobGuards::take_vehicle`], ADR-262)
-//! is named without keeping the VIN on the device (ADR-256 item 6): the VIN is hashed into one
-//! of 4096 fixed buckets (the low 12 bits of the first two bytes of the SHA-256 digest, read
-//! big-endian), `vehicle-{k:03x}.lock`, so two VINs may share a bucket and then
-//! exclude each other, which is safe. A bucket file is never created for one VIN alone: files
-//! are created only by a sweep over all 4096, empty, in a fixed order, whichever VIN triggered it
-//! (a `take_vehicle` that finds its bucket's file or `vehicle-fff.lock` missing). The sweep
-//! creates `vehicle-fff.lock` last, so that file's presence means the other 4095 entries were
-//! committed first: on Unix the directory is synced before `vehicle-fff.lock` is created; on
-//! Windows no sync is made and NTFS's ordering of directory entries is relied on. A set a crash, a failed sync or someone else's file left partial is decided
-//! by the file system's write order, not by a VIN; a complete set is the normal outcome, not an
-//! invariant (ADR-262 item 2). The listing is the same on every device and says nothing about
-//! the vehicles seen. A job holds one vehicle (a well-formed VIN): taking that VIN again
-//! succeeds without touching the file, and any other VIN, also one of the same bucket, is refused.
+//! The per-vehicle lock of design 8.8's two-stage locking ([`JobGuards::take_vehicle`], ADR-262) is
+//! named without keeping the VIN on the device (ADR-256 item 6): the VIN is hashed into one of 4096
+//! fixed buckets (the low 12 bits of the first two bytes of the SHA-256 digest, read big-endian),
+//! `vehicle-{k:03x}.lock`, so two VINs may share a bucket and then exclude each other, which is
+//! safe. A bucket file is never created for one VIN alone: files are created only by a sweep over
+//! all 4096, empty, in a fixed order, whichever VIN triggered it (a `take_vehicle` that finds its
+//! bucket's file or `vehicle-fff.lock` missing). The sweep creates `vehicle-fff.lock` last, so that
+//! file's presence means the other 4095 entries were committed first: on Unix the directory is
+//! synced before `vehicle-fff.lock` is created; on Windows no sync is made and NTFS's ordering of
+//! directory entries is relied on. A set a crash, a failed sync or someone else's file left partial
+//! is decided by the file system's write order, not by a VIN; a complete set is the normal outcome,
+//! not an invariant (ADR-262 item 2). The listing never depends on which VIN triggered a sweep, so
+//! it says nothing about the vehicles seen. A job holds one vehicle (a well-formed VIN): taking
+//! that VIN again succeeds without touching the file, and any other VIN, also one of the same
+//! bucket, is refused.
 //!
 //! Each is an exclusive OS lock (`File::try_lock`) on its own file in a lock directory the
 //! caller names. The OS releases a lock with its file handle, also when the process dies, so a

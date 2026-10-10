@@ -49,6 +49,10 @@ pub struct JournalSetup {
     /// against it. `None` when the job names none: a restart then never counts the vehicle as
     /// identified. It is personal data (design 16.2) and is never logged or put in an error.
     pub vin: Option<Vin>,
+    /// The software version the job intends to write (the procedure's software-version field,
+    /// raw bytes). A first run records it right after the target VIN in the creating write, and
+    /// a resume must name the same one, none included (ADR-268). `None` when the job names none.
+    pub intended_software_version: Option<Vec<u8>>,
 }
 
 /// A job's open journal and what it needs to commit at the plan's boundaries.
@@ -67,7 +71,12 @@ impl JobJournal {
     /// ran before goes on through `resume_program_journaled`, not a first run.
     pub(crate) fn create(setup: JournalSetup) -> Result<Self, JournalError> {
         Ok(Self::new(
-            Journal::create(&setup.dir, &setup.key, setup.vin.as_ref())?,
+            Journal::create(
+                &setup.dir,
+                &setup.key,
+                setup.vin.as_ref(),
+                setup.intended_software_version.as_deref(),
+            )?,
             setup.sources,
         ))
     }

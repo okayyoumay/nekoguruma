@@ -102,6 +102,10 @@ pub enum OnSiteReason {
     /// (none included), so the job's own data changed between runs. Nothing is sent and no
     /// resume is counted (ADR-261).
     TargetVinDiffers,
+    /// The resume names another intended software version than the journal recorded at the
+    /// job's first run (none included), so the job's own data changed between runs. Nothing is
+    /// sent and no resume is counted (ADR-268).
+    IntendedVersionDiffers,
     /// The restart passed step 1 (the checks that need no ECU service, and its resume was
     /// counted), the gates of step 2, the teardown of step 2b-1 (`teardown`), the
     /// default-session confirmation of step 2b-2 (`confirmed`) and the identity checks of step 3a

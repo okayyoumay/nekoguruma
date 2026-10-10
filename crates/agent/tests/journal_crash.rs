@@ -11,6 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use agent::journal::{
     JobKey, Journal, JournalError, RecoveryFacts, StageId, StepRef, TransferAttempt, TransferExit,
+    Vin,
 };
 use shared_proto::JobId;
 
@@ -78,7 +79,8 @@ const SCRIPT: &[(&str, Commit)] = &[
 
 /// Creates the journal in `dir` and makes the first `commits` commits.
 fn run_script(dir: &Path, commits: usize) -> Journal {
-    let mut journal = Journal::create(dir, &key(), None).expect("the journal should be created");
+    let mut journal =
+        Journal::create(dir, &key(), None, None).expect("the journal should be created");
     for (name, commit) in &SCRIPT[..commits] {
         commit(&mut journal).unwrap_or_else(|error| panic!("{name}: {error}"));
     }
@@ -158,6 +160,7 @@ fn check_named_point(commits: usize, facts: &RecoveryFacts) -> Option<&'static s
                 transfer: None,
                 last_intent: None,
                 target_vin: None,
+                intended_software_version: None,
             }
         ),
         "pre-erase version" => {
@@ -280,4 +283,31 @@ fn the_journal_reads_back_after_a_crash_at_each_commit() {
         checked.extend(check_named_point(commits, &facts));
     }
     assert_eq!(checked, NAMED_POINTS, "every named point is reached");
+}
+
+/// A journal created with a target VIN and an intended software version holds both in its
+/// creating write: they read back from the file, and a writer that opens it goes on after them
+/// (ADR-268).
+#[test]
+fn the_creating_write_holds_the_vin_and_the_intended_version() {
+    for (vin, version) in [
+        (Some("WDB12345678901234"), Some(&b"2.0.0"[..])),
+        (None, Some(&b"2.0.0"[..])),
+        (Some("WDB12345678901234"), None),
+    ] {
+        let dir = temp_dir("creation-prefix");
+        let vin = vin.map(|vin| Vin::new(vin.to_owned()));
+        drop(Journal::create(&dir.0, &key(), vin.as_ref(), version).expect("create"));
+        let state = Journal::read(&dir.0, &key()).expect("read");
+        assert_eq!(state.facts.target_vin, vin);
+        assert_eq!(state.facts.intended_software_version.as_deref(), version);
+        assert_eq!(
+            state.records,
+            u64::from(vin.is_some()) + u64::from(version.is_some())
+        );
+        let mut journal = Journal::open(&dir.0, &key()).expect("open");
+        journal
+            .commit_ecu_hardware_part_number(b"NGR-SIM-ECU")
+            .expect("commit after the prefix");
+    }
 }

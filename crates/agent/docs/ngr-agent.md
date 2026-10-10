@@ -120,9 +120,9 @@ below), which it returns with the result, and,
 for a program with a flash recovery plan, creates the journal once the link is open and the
 policy allows the program, before anything is sent to the ECU; a program without a plan keeps
 none. A journal that already exists ends the job with nothing sent: a job that ran before goes
-on through `resume_program_journaled` ("Restart entry" below). Every run, a first run or a plain
-start on an existing journal, commits the VM state it starts from as its first record (the run
-start, ADR-272), at the run's first step count and before anything is sent, so the journal
+on through `resume_program_journaled` ("Restart entry" below). Every run from instruction 0, a first
+run or a plain start on an existing journal, commits the VM state it starts from as its first
+record (the run start, ADR-272); the restart's replay commits none ("Replay to the erase" below), at the run's first step count and before anything is sent, so the journal
 marks where each run began. Each time execution arrives at a plan's boundary, before that
 instruction runs, it commits:
 

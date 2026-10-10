@@ -6469,6 +6469,136 @@ mod tests {
         }
     }
 
+    /// [`completed_path_program`] with `extra` after its routine, `Safe` outside the plan.
+    fn safe_tail_program(extra: impl IntoIterator<Item = Op>) -> Program {
+        let mut program = completed_path_program();
+        program.code.extend(extra);
+        safe_outside_the_plan(program)
+    }
+
+    /// A cancel during the program after the plan ends the job in `Cancelled` before the next
+    /// request (ADR-271 item 3).
+    #[test]
+    fn a_cancel_during_the_continuation_ends_the_job_cancelled() {
+        let program = safe_tail_program([
+            Op::PushBytes(0),
+            Op::ServiceRequest { service: 0x3E },
+            Op::Pop,
+            Op::PushBytes(0),
+            Op::RoutineControl {
+                routine: 0xFF03,
+                sub: 1,
+            },
+            Op::Pop,
+        ]);
+        let dir = journal_dir("continue-cancel");
+        first_run_intending(&program, &dir, lose_after_plan);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        host.software_version = Some(b"SW02".to_vec());
+        host.cancel_on_service = Some((0x3E, Arc::clone(&cancelled)));
+        let result = resume_on(
+            &program,
+            &mut host,
+            JobLimits::default(),
+            &cancelled,
+            Journal::open(&dir, &job_key()),
+            identity_sources(),
+            Some(&target()),
+            Some(b"SW02"),
+            &dir_slot(&dir),
+        );
+        assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
+        let mut expected = verification_reads().to_vec();
+        expected.extend([Sent::Routine(0xFF02), Sent::Service(0x3E, vec![0x01])]);
+        assert_eq!(full_log(&host), expected);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The step limit counts the continuation's steps after the journal's last record: a limit
+    /// reached in the program after the plan ends the job in `StepLimit`, and the request at it
+    /// is not sent.
+    #[test]
+    fn the_step_limit_applies_to_the_continuation() {
+        let program = safe_outside_the_plan(completed_path_program());
+        let dir = journal_dir("continue-step-limit");
+        first_run_intending(&program, &dir, lose_after_plan);
+        let next = restart::next_steps(&Journal::read(&dir, &job_key()).unwrap());
+        // The push at the plan's end runs; the routine after it would be one step too many.
+        let limits = JobLimits {
+            max_steps: next + 1,
+            ..JobLimits::default()
+        };
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        host.software_version = Some(b"SW02".to_vec());
+        let result = resume_on(
+            &program,
+            &mut host,
+            limits,
+            &AtomicBool::new(false),
+            Journal::open(&dir, &job_key()),
+            identity_sources(),
+            Some(&target()),
+            Some(b"SW02"),
+            &dir_slot(&dir),
+        );
+        assert!(
+            matches!(result, Err(JobError::StepLimit(steps)) if steps == next + 1),
+            "{result:?}"
+        );
+        assert_eq!(full_log(&host), verification_reads());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A crash in the program after the plan restarts again from the same plan-end state: the
+    /// continuation journaled nothing, so the next restart reads back and goes on again, and the
+    /// whole program after the plan is sent once more. With one resume allowed, the second
+    /// restart ends at the resume limit instead.
+    #[test]
+    fn a_crash_after_the_plan_continues_again_from_the_same_end_state() {
+        let tail = [
+            Op::PushBytes(0),
+            Op::RoutineControl {
+                routine: 0xFF03,
+                sub: 1,
+            },
+            Op::Pop,
+        ];
+        for max_resumes in [1, 2] {
+            let mut program = completed_path_program();
+            program.flash[0].max_resumes = max_resumes;
+            program.code.extend(tail.clone());
+            let program = safe_outside_the_plan(program);
+            let dir = journal_dir("continue-twice");
+            first_run_intending(&program, &dir, lose_after_plan);
+            let (result, _) = restart_intending(&program, &dir, |host| {
+                host.software_version = Some(b"SW02".to_vec());
+                host.lose_routine = Some(0xFF03);
+            });
+            assert!(matches!(result, Err(JobError::Host { .. })), "{result:?}");
+            let (result, host) = restart_intending(&program, &dir, |host| {
+                host.software_version = Some(b"SW02".to_vec());
+            });
+            if max_resumes == 1 {
+                assert!(
+                    matches!(
+                        result,
+                        Err(JobError::OnSiteInterventionRequired(
+                            OnSiteReason::ResumeLimitReached { .. }
+                        ))
+                    ),
+                    "{result:?}"
+                );
+            } else {
+                assert!(result.is_ok(), "{result:?}");
+                let mut expected = verification_reads().to_vec();
+                expected.extend([Sent::Routine(0xFF02), Sent::Routine(0xFF03)]);
+                assert_eq!(full_log(&host), expected);
+            }
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
     /// `restart::unsafe_outside_plans` looks only at diagnostic primitives outside the plans, and
     /// needs every section that covers one to be `Safe`: an overlapping `CheckState` section makes
     /// a primitive in a `Safe` one unsafe.
@@ -6499,9 +6629,17 @@ mod tests {
         assert_eq!(restart::unsafe_outside_plans(&overlapping), Some(1));
         // A section that leaves the push before the session change out changes nothing either:
         // a push is no primitive.
-        let mut narrower = program;
+        let mut narrower = program.clone();
         narrower.sections[0].start_pc = 1;
         assert_eq!(restart::unsafe_outside_plans(&narrower), None);
+        // A log after the plan, in no section, is a primitive like any other.
+        let mut logged = program;
+        let log_pc = logged.code.len() as u32;
+        logged.code.push(Op::Log {
+            level: 0,
+            message: 0,
+        });
+        assert_eq!(restart::unsafe_outside_plans(&logged), Some(log_pc));
     }
 
     /// A journal whose newest VM state is not at the plan's end gives the continuation nothing to
@@ -7120,11 +7258,11 @@ mod tests {
     }
 
     /// Step 4a runs only when the transfer is redone: a restart that goes to the read-back
-    /// verification does not check the preconditions again there, and stops as before.
+    /// verification does not check the preconditions again there, and goes on after the plan.
     #[test]
     fn step_4a_does_not_run_before_the_read_back_verification() {
         use diag_ir::RuntimeInput as I;
-        let mut program = completed_path_program();
+        let mut program = safe_outside_the_plan(completed_path_program());
         let source = Some(diag_ir::Source::RuntimeInput(I::ExternalSupplyConnected));
         program.preconditions.external_supply = Some(diag_ir::Precondition {
             satisfied: diag_ir::Satisfied { lower: 1, upper: 1 },
@@ -7138,8 +7276,10 @@ mod tests {
             host.inputs = crate::inputs::FixedInputs::new()
                 .with(I::ExternalSupplyConnected, crate::inputs::Reading::Value(0));
         });
-        assert_eq!(state_of(&result), restart::StateCheck::ReadBackVerification);
-        assert_nothing_changed_the_ecu(&host, 0);
+        assert!(result.is_ok(), "{result:?}");
+        let mut expected = verification_reads().to_vec();
+        expected.push(Sent::Routine(0xFF02));
+        assert_eq!(full_log(&host), expected);
     }
 
     // --------------------- restart second precondition check (ADR-229 item 2 step 4b-3)

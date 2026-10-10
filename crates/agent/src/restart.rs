@@ -798,13 +798,12 @@ where
 /// engine, vehicle speed; the VIN and the hardware identity are not preconditions and are not
 /// read) is checked in that order, stopping at the first that does not hold. Each is read through
 /// its programming-session source only, which `Program::validate` requires for every declared
-/// precondition of a restartable plan; a missing one is not established, so not met. By
-/// construction that source is the one for this point: the plan's steps from its entry have run,
-/// which normally enters the programming session, and the source is named for that session. A plan
-/// whose steps from the entry enter no programming session must declare a source usable in the
-/// default session (the default-session source itself or a runtime input; ADR-245 item 2 allows
-/// the same source in both). The agent tracks no session; it reads the source declared for this
-/// point. A value outside the declared range, a
+/// precondition of a restartable plan; a missing one is not established, so not met. That
+/// source must be usable in the programming session (ADR-229 item 2 step 4), which the plan's
+/// steps from its entry normally enter. The agent tracks no session: when those steps re-enter no
+/// programming session, the ECU is still in its default session here, and a source that answers
+/// only in the programming session fails the check, with nothing erased. A value outside the
+/// declared range, a
 /// reading that is not a value, a source the table does not map and a failure to use the worker
 /// all end in [`OnSiteReason::PreconditionNotMetBeforeErase`], which carries the precondition and
 /// `teardown`. Each is read once, with no retry.

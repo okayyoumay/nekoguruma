@@ -374,12 +374,11 @@ failed step, a wait nobody answers, the step limit or a cancel.
 replay stopped at the erase. It checks every declared precondition (supply voltage, external
 supply, ignition, engine, vehicle speed; the VIN and the hardware identity are not preconditions
 and are not read) in the order of step 4a and stops at the first that does not hold, reading each
-through its `programming_session` source only. By construction that source is the one read at
-this point, after the plan's steps from its entry have run; it is named for the session those
-steps normally enter, and a plan whose steps from the entry enter no programming session must
-declare one usable in the default session (the default-session source itself or a runtime input;
-ADR-245 item 2 allows the same source in both). The agent tracks no session; it reads the source
-declared for this point.
+through its `programming_session` source only. That source must be usable in the programming
+session (ADR-229 item 2 step 4), which the plan's replayed steps normally enter. The agent tracks
+no session: when the steps from the entry re-enter no programming session, the ECU is still in its
+default session here, and a source that answers only in the programming session fails the check,
+with nothing erased.
 A missing source (which `Program::validate` refuses for a restartable plan), a value outside the
 declared range, a reading that is not a value, a source the table does not map and a worker
 failure all mean not met. Each read is made once; a cancel stops it at the start and around each

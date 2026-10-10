@@ -683,9 +683,10 @@ where
                     Some(plan.boundaries.erase_pc),
                 )? {
                     RunEnd::Stopped => {
-                        // Step 4b-3 (ADR-229 item 2 step 4, ADR-245 item 6): the ECU is in
-                        // its programming session, so the mutable conditions are read through
-                        // their programming-session sources, right before the erase.
+                        // Step 4b-3 (ADR-229 item 2 step 4, ADR-245 item 6): the replayed steps
+                        // normally put the ECU in its programming session, so the mutable
+                        // conditions are read through their programming-session sources, right
+                        // before the erase.
                         restart::check_before_erase(
                             program, &point, &teardown, &sources, host, cancelled,
                         )?;

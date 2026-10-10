@@ -626,7 +626,7 @@ the predecessor repository these ADRs came from.
 - ADR-269
 - ADR-271
 - ADR-272 (item 2's open point for runs not from instruction 0 settled for the replay of step 4 by ADR-273)
-- ADR-273 (Accepted (item 4's stop at the erase is now preceded by step 4b-3's second precondition check, `restart::check_before_erase`, which ends the job in `PreconditionNotMetBeforeErase` when a condition fails; the `RestartOrderUnavailable` stop remains until step 4c))
+- ADR-273 (item 4's stop at the erase is now preceded by step 4b-3's second precondition check, `restart::check_before_erase`, which ends the job in `PreconditionNotMetBeforeErase` when a condition fails; the `RestartOrderUnavailable` stop remains until step 4c)
 
 ### Diagnostic IR
 - ADR-233 (item 3's `VmState` fields removed by ADR-245)

@@ -1654,6 +1654,22 @@ mod tests {
         assert!(transfer.exit.as_ref().unwrap().complete);
     }
 
+    /// The run start is the first commit of a first run (ADR-272); when it fails, the job ends
+    /// with nothing sent.
+    #[test]
+    fn a_failed_run_start_commit_ends_a_first_run_with_nothing_sent() {
+        let commits = Rc::new(Cell::new(0));
+        let mut host = FlashHost::new(Rc::clone(&commits));
+        let mut journal = counting_journal(&commits, Some(1));
+        let result = run_flash(&mut host, &mut journal);
+        assert!(
+            matches!(result, Err(JobError::Journal(JournalError::Io(_)))),
+            "{result:?}"
+        );
+        assert_eq!(host.sent(), []);
+        assert_eq!(commits.get(), 0);
+    }
+
     #[test]
     fn a_failed_transfer_start_commit_ends_the_job_before_the_erase() {
         let commits = Rc::new(Cell::new(0));
@@ -6459,6 +6475,38 @@ mod tests {
             ))
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The same on a plain start of an existing journal: the run start is the first commit of
+    /// the run, and when it fails nothing is sent (ADR-272).
+    #[test]
+    fn a_failed_run_start_commit_ends_a_plain_start_with_nothing_sent() {
+        let program = flash_program();
+        let commits = Rc::new(Cell::new(0));
+        let store = CountingStore {
+            commits: Rc::clone(&commits),
+            fail_at: Some(1),
+        };
+        let journal = crate::journal::Journal::on_store(store, job_key());
+        let mut host = FlashHost::new(Rc::clone(&commits));
+        let result = resume_on(
+            &program,
+            &mut host,
+            JobLimits::default(),
+            &AtomicBool::new(false),
+            Ok(journal),
+            identity_sources(),
+            None,
+            None,
+            &vci_only_slot("plain-run-start"),
+        );
+        assert!(
+            matches!(result, Err(JobError::Journal(JournalError::Io(_)))),
+            "{result:?}"
+        );
+        assert_eq!(host.sent(), []);
+        assert!(host.session_reads.is_empty());
+        assert_eq!(commits.get(), 0);
     }
 
     /// A program with a plan whose journal is missing or does not read back needs on-site

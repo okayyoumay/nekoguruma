@@ -1572,6 +1572,47 @@ mod tests {
         assert_eq!(point.entry_state, expected);
     }
 
+    /// A journal written before the run-start record holds no VM state at all: for a plan
+    /// entered at pc 0 the entry state is the program's initial one.
+    #[test]
+    fn a_journal_without_any_vm_state_restarts_from_the_initial_state_at_pc_0() {
+        let program = program_entered_at_zero();
+        let mut j = new_journal();
+        j.commit_transfer_start(StageId(7), at(ERASE)).unwrap();
+        assert!(j.state().last_vm_state.is_none());
+        let RestartDecision::Restart(point) = decide(&program, &j) else {
+            panic!("{:?}", decide(&program, &j));
+        };
+        let mut expected = Vm::new(&program).state;
+        expected.steps = next_steps(j.state());
+        assert_eq!(point.entry_state, expected);
+    }
+
+    /// An old-style jump-back state at the entry, then a newer run start: the run start wins.
+    #[test]
+    fn a_run_start_wins_over_an_older_jump_back_state() {
+        let program = program_entered_at_zero();
+        let mut j = new_journal();
+        j.commit_step(
+            StepRef { pc: 2, steps: 1 },
+            Some(&state_bytes(&jump_state(&program, 2))),
+        )
+        .unwrap();
+        let next = next_steps(j.state());
+        let mut initial = Vm::new(&program).state;
+        initial.steps = next;
+        j.commit_run_start(StepRef { pc: 0, steps: next }, &state_bytes(&initial))
+            .unwrap();
+        j.commit_transfer_start(StageId(7), at(ERASE)).unwrap();
+        let RestartDecision::Restart(point) = decide(&program, &j) else {
+            panic!("{:?}", decide(&program, &j));
+        };
+        let mut expected = Vm::new(&program).state;
+        expected.steps = next_steps(j.state());
+        assert_eq!(point.entry_state, expected);
+        assert!(point.entry_state.stack.is_empty());
+    }
+
     #[test]
     fn a_run_start_that_is_unusable_needs_on_site_intervention() {
         let program = program_entered_at_zero();
@@ -1606,7 +1647,8 @@ mod tests {
     #[test]
     fn a_run_start_moves_no_interruption_point_but_counts() {
         let program = program(RecoveryRequired::Never);
-        let mut j = journal_until(&program, ENTRY + 1);
+        // A journal from before the erase: a run start never follows the transfer-start marker.
+        let mut j = journal_until(&program, ENTRY);
         let point = interruption_point(&j.state().facts);
         let next = next_steps(j.state());
         j.commit_run_start(

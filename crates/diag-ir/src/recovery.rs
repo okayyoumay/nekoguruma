@@ -100,7 +100,12 @@ pub struct Precondition {
     pub satisfied: Satisfied,
     /// Where the value is read in the default session.
     pub default_session: Option<Source>,
-    /// Where the value is read in the programming session.
+    /// Where the value is read in the programming session: the source the restart's second check
+    /// reads immediately before the erase, after the plan's steps from its entry have run
+    /// (ADR-229 item 2 step 4). It must be usable in the programming session. The agent tracks
+    /// no session: a plan whose `[entry_pc, erase_pc)` re-enters no programming session leaves
+    /// the ECU in its default session at that point, and a source that answers only in the
+    /// programming session then fails the check, with nothing erased.
     pub programming_session: Option<Source>,
 }
 

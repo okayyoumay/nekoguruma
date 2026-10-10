@@ -267,10 +267,12 @@ pub async fn run_program_journaled(
 ///   [`JobError::OnSiteInterventionRequired`] (`PreconditionNotMet`). Then the program's steps
 ///   from the plan's entry boundary up to, not including, its erase run again from the restart's
 ///   entry state, journaled as in a first run but with no run start and no transfer-start marker
-///   (step 4b-2, ADR-273); a failure there ends the job as in a first run. The rest of the
-///   restart order (the second check of the mutable conditions before the erase, step 4b-3, the
-///   erase, step 4c, and the read-back verification) does not run in this agent, so
-///   a job that passed ends in [`JobError::OnSiteInterventionRequired`] (`RestartOrderUnavailable`,
+///   (step 4b-2, ADR-273); a failure there ends the job as in a first run. Then
+///   `restart::check_before_erase` checks every declared precondition once more through its
+///   programming-session source (step 4b-3): one that does not hold ends the job in
+///   [`JobError::OnSiteInterventionRequired`] (`PreconditionNotMetBeforeErase`) with no erase
+///   sent. The rest of the restart order (the erase, step 4c, and the read-back verification)
+///   does not run in this agent, so a job that passed ends in [`JobError::OnSiteInterventionRequired`] (`RestartOrderUnavailable`,
 ///   carrying the teardown's outcome, the confirmation and the state check), or in
 ///   [`JobError::IdentityMismatch`] when the ECU's VIN is another vehicle's;
 /// - a journal that rules a restart out, or a missing or unreadable one for a program with a
@@ -560,8 +562,10 @@ impl Drop for CancelOnDrop {
 /// (step 3b-2, ADR-268 item 5), and on a redone transfer `restart::check_reentry` reads the
 /// declared preconditions (step 4a, ADR-229 item 2 step 4); then the program's steps from the
 /// plan's entry to its erase run again from the restart's entry state, journaled as in a first
-/// run and stopped before the erase (step 4b-2, ADR-273). `vin` is the job's target VIN and
-/// `intended_software_version` the software version it intends to write. Once the ECU's VIN
+/// run and stopped before the erase (step 4b-2, ADR-273); then `restart::check_before_erase`
+/// reads the declared preconditions through their programming-session sources (step 4b-3).
+/// `vin` is the job's target VIN and `intended_software_version` the software version it
+/// intends to write. Once the ECU's VIN
 /// matched it, the gates promote `guards` to the per-vehicle lock (ADR-263; see
 /// [`promote_to_vehicle`]); step 3a promotes again, which takes the lock when the gates could not
 /// read the VIN and returns at once when the guards hold it already.
@@ -667,7 +671,7 @@ where
                 // Step 4b-2 (ADR-273): the plan's steps from the entry to the erase, without
                 // the erase. The run start is not committed; the entry state is already the
                 // journal's newest.
-                let mut replay = JobJournal::new(journal, sources);
+                let mut replay = JobJournal::new(journal, sources.clone());
                 let vm = Vm::resume(point.entry_state.clone());
                 match run_vm(
                     program,
@@ -678,7 +682,15 @@ where
                     vm,
                     Some(plan.boundaries.erase_pc),
                 )? {
-                    RunEnd::Stopped => {}
+                    RunEnd::Stopped => {
+                        // Step 4b-3 (ADR-229 item 2 step 4, ADR-245 item 6): the replayed steps
+                        // normally put the ECU in its programming session, so the mutable
+                        // conditions are read through their programming-session sources, right
+                        // before the erase.
+                        restart::check_before_erase(
+                            program, &point, &teardown, &sources, host, cancelled,
+                        )?;
+                    }
                     RunEnd::Finished(_) => {
                         return Err(JobError::Journal(JournalError::Invariant(
                             "the replay ended before it reached the erase",
@@ -2944,8 +2956,8 @@ mod tests {
                 read_version(),
             ]
         );
-        // Read by step 1, by the gates and by step 4a.
-        assert_eq!(host.voltage_reads, 3);
+        // Read by step 1, by the gates, by step 4a and by step 4b-3.
+        assert_eq!(host.voltage_reads, 4);
         assert_eq!(resumes(&dir), 1);
         let facts = Journal::read(&dir, &job_key()).unwrap().facts;
         assert_eq!(facts.attempt_key, None);
@@ -6239,8 +6251,15 @@ mod tests {
     /// `flash_program` declaring the external supply (must be connected) and the engine (must be
     /// off), both read from the VCI in either session.
     fn flash_program_with_supply_and_engine() -> Program {
-        use diag_ir::RuntimeInput as I;
         let mut program = flash_program();
+        declare_supply_and_engine(&mut program);
+        program
+    }
+
+    /// Declares the external supply and the engine of [`flash_program_with_supply_and_engine`]
+    /// on `program`.
+    fn declare_supply_and_engine(program: &mut Program) {
+        use diag_ir::RuntimeInput as I;
         let declare = |input: I, value| {
             let source = Some(diag_ir::Source::RuntimeInput(input));
             Some(diag_ir::Precondition {
@@ -6255,7 +6274,6 @@ mod tests {
         program.preconditions.external_supply = declare(I::ExternalSupplyConnected, 1);
         program.preconditions.engine = declare(I::EngineRunning, 0);
         program.validate().expect("the fixture is a valid program");
-        program
     }
 
     /// A host whose engine is off and whose external supply gives `supply` for its first reads,
@@ -6463,6 +6481,345 @@ mod tests {
         });
         assert_eq!(state_of(&result), restart::StateCheck::ReadBackVerification);
         assert_nothing_changed_the_ecu(&host, 0);
+    }
+
+    // --------------------- restart second precondition check (ADR-229 item 2 step 4b-3)
+
+    /// [`replay_program`] declaring the external supply and the engine, both read from the VCI
+    /// in either session.
+    fn replay_program_with_supply_and_engine() -> (Program, u32) {
+        let (mut program, erase) = replay_program();
+        declare_supply_and_engine(&mut program);
+        (program, erase)
+    }
+
+    /// A first run of `program` interrupted at its erase, then a restart on a host `prepare` sets
+    /// up (the VCI reports 12.6 V). Gives the result and the host.
+    fn replay_restart(
+        program: &Program,
+        erase: u32,
+        prepare: impl FnOnce(&mut FlashHost),
+    ) -> (Result<VmState, JobError>, FlashHost) {
+        let dir = journal_dir("before-erase");
+        interrupted_at_erase(program, erase, &dir);
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        host.voltage = Some(12_600);
+        prepare(&mut host);
+        let result = resume(program, &dir, &mut host, false);
+        std::fs::remove_dir_all(&dir).unwrap();
+        (result, host)
+    }
+
+    /// The requests of the replay in [`replay_program`], as `replayed_requests` finds them.
+    fn the_replayed_steps() -> Vec<Sent> {
+        vec![
+            Sent::Service(0x10, vec![0x01]),
+            Sent::Service(0x27, vec![0x01]),
+            Sent::Routine(0xFF02),
+        ]
+    }
+
+    /// Nothing of the erase was sent: no erase routine, RequestDownload or block.
+    fn assert_no_erase_sent(host: &FlashHost) {
+        for (sent, _) in &host.log {
+            assert!(
+                !matches!(
+                    sent,
+                    Sent::Routine(0xFF00) | Sent::Service(0x34, _) | Sent::Block
+                ),
+                "{sent:?} in {:?}",
+                host.log
+            );
+        }
+    }
+
+    /// The teardown of a restart that stopped at step 4b-3 because `kind` did not hold. Fails the
+    /// test on any other result.
+    fn teardown_before_erase(
+        result: &Result<VmState, JobError>,
+        kind: diag_ir::PreconditionKind,
+    ) -> restart::Teardown {
+        match result {
+            Err(JobError::OnSiteInterventionRequired(
+                OnSiteReason::PreconditionNotMetBeforeErase {
+                    flash_session: 1,
+                    precondition,
+                    teardown,
+                },
+            )) if *precondition == kind => teardown.clone(),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The done-when case: the supply voltage holds at step 1, at the gates and at step 4a, and
+    /// has dropped when step 4b-3 reads it after the programming session and the setup steps
+    /// were replayed. The job ends in on-site intervention naming it, with the replayed steps
+    /// the last requests and no erase sent.
+    #[test]
+    fn a_voltage_that_drops_during_the_replay_ends_the_restart_before_the_erase() {
+        let (mut program, erase) = replay_program();
+        let vbatt = Some(diag_ir::Source::RuntimeInput(
+            diag_ir::RuntimeInput::SupplyVoltageMillivolts,
+        ));
+        program.preconditions.voltage_mv = Some(diag_ir::Precondition {
+            satisfied: diag_ir::Satisfied {
+                lower: 11_000,
+                upper: 15_000,
+            },
+            default_session: vbatt,
+            programming_session: vbatt,
+        });
+        program.validate().unwrap();
+        let (result, host) = replay_restart(&program, erase, |host| {
+            host.voltage_script = [12_600, 12_600, 12_600, 10_500].into();
+        });
+        assert_eq!(
+            teardown_before_erase(&result, diag_ir::PreconditionKind::Voltage),
+            restart::Teardown::Reset
+        );
+        assert_eq!(host.voltage_reads, 4);
+        assert_eq!(replayed_requests(&host), the_replayed_steps());
+        assert_no_erase_sent(&host);
+    }
+
+    /// A supply that is disconnected, and an engine that runs, once the replay has run: each is
+    /// reported, and the first failed in the order is the one named.
+    #[test]
+    fn step_4b_3_reports_the_first_failed_precondition_in_the_order() {
+        use diag_ir::RuntimeInput as I;
+        let (program, erase) = replay_program_with_supply_and_engine();
+        let (result, host) = replay_restart(&program, erase, |host| {
+            supply_then_connected(
+                host,
+                vec![
+                    InputAnswer::Value(1),
+                    InputAnswer::Value(1),
+                    InputAnswer::Value(0),
+                ],
+            );
+            host.input_scripts.push((
+                I::EngineRunning,
+                [
+                    InputAnswer::Value(0),
+                    InputAnswer::Value(0),
+                    InputAnswer::Value(1),
+                ]
+                .into(),
+            ));
+        });
+        assert_eq!(
+            teardown_before_erase(&result, diag_ir::PreconditionKind::ExternalSupply),
+            restart::Teardown::Reset
+        );
+        // The supply failed first, so the engine was not read a third time.
+        assert_eq!(host.input_scripts[1].1.len(), 1);
+        assert_eq!(replayed_requests(&host), the_replayed_steps());
+        assert_no_erase_sent(&host);
+
+        // Only the engine fails at step 4b-3.
+        let (result, host) = replay_restart(&program, erase, |host| {
+            supply_then_connected(host, vec![]);
+            host.input_scripts.push((
+                I::EngineRunning,
+                [
+                    InputAnswer::Value(0),
+                    InputAnswer::Value(0),
+                    InputAnswer::Value(1),
+                ]
+                .into(),
+            ));
+        });
+        assert_eq!(
+            teardown_before_erase(&result, diag_ir::PreconditionKind::Engine),
+            restart::Teardown::Reset
+        );
+        assert_eq!(replayed_requests(&host), the_replayed_steps());
+        assert_no_erase_sent(&host);
+    }
+
+    /// Every condition holds at step 4b-3: the restart stops before the erase in the unavailable
+    /// restart order, and each declared precondition was read after the replay (the third read
+    /// of each, after the gates' and step 4a's).
+    #[test]
+    fn a_restart_whose_conditions_hold_before_the_erase_stops_there() {
+        use diag_ir::RuntimeInput as I;
+        let (program, erase) = replay_program_with_supply_and_engine();
+        let (result, host) = replay_restart(&program, erase, |host| {
+            supply_then_connected(
+                host,
+                vec![
+                    InputAnswer::Value(1),
+                    InputAnswer::Value(1),
+                    InputAnswer::Value(1),
+                ],
+            );
+            host.input_scripts.push((
+                I::EngineRunning,
+                [
+                    InputAnswer::Value(0),
+                    InputAnswer::Value(0),
+                    InputAnswer::Value(0),
+                ]
+                .into(),
+            ));
+        });
+        assert_eq!(state_of(&result), restart::StateCheck::RedoTransfer);
+        assert_eq!(teardown_of(&result), restart::Teardown::Reset);
+        assert!(host.input_scripts[0].1.is_empty());
+        assert!(host.input_scripts[1].1.is_empty());
+        assert_eq!(replayed_requests(&host), the_replayed_steps());
+        assert_no_erase_sent(&host);
+    }
+
+    /// Step 4b-3 reads only the programming-session source, after the replayed steps: the
+    /// default-session source gives an in-range value (steps 2 and 4a pass), the
+    /// programming-session one is an ECU field that is text, never a value.
+    /// The VIN request's field (service 1, field 3) is used only as an ECU field that decodes to
+    /// text, never to a value; every field of `identity_sources` is the VIN, the hardware identity or the software version,
+    /// and this test does not compare it with the VIN.
+    #[test]
+    fn step_4b_3_reads_only_the_programming_session_source() {
+        use diag_ir::RuntimeInput;
+        let (mut program, erase) = replay_program();
+        program.preconditions.engine = Some(diag_ir::Precondition {
+            satisfied: diag_ir::Satisfied { lower: 0, upper: 0 },
+            default_session: Some(input(RuntimeInput::EngineRunning)),
+            programming_session: Some(diag_ir::Source::EcuService {
+                service_id: 1,
+                field_id: 3,
+            }),
+        });
+        program.validate().unwrap();
+        let (result, host) = replay_restart(&program, erase, |host| {
+            host.inputs = crate::inputs::FixedInputs::new().with(
+                RuntimeInput::EngineRunning,
+                crate::inputs::Reading::Value(0),
+            );
+        });
+        assert_eq!(
+            teardown_before_erase(&result, diag_ir::PreconditionKind::Engine),
+            restart::Teardown::Reset
+        );
+        // After the version read of step 3b-2 and the replayed steps, the field is read once.
+        let mut expected = log_after_reset(1);
+        expected.extend(the_replayed_steps());
+        expected.push(read_vin());
+        assert_eq!(full_log(&host), expected);
+        assert_no_erase_sent(&host);
+    }
+
+    /// A programming-session source the program lacks is not established, so not met.
+    #[test]
+    fn a_missing_programming_session_source_is_not_met_at_step_4b_3() {
+        let (mut program, erase) = replay_program_with_supply_and_engine();
+        // `Program::validate` refuses this; the check does not rely on it.
+        program
+            .preconditions
+            .engine
+            .as_mut()
+            .unwrap()
+            .programming_session = None;
+        let (result, host) = replay_restart(&program, erase, |host| {
+            supply_then_connected(host, vec![]);
+        });
+        assert_eq!(
+            teardown_before_erase(&result, diag_ir::PreconditionKind::Engine),
+            restart::Teardown::Reset
+        );
+        assert_eq!(replayed_requests(&host), the_replayed_steps());
+        assert_no_erase_sent(&host);
+    }
+
+    /// A worker failure on the step 4b-3 read is a precondition not met, not a host error.
+    #[test]
+    fn a_failed_read_at_step_4b_3_is_a_precondition_not_met() {
+        let (program, erase) = replay_program_with_supply_and_engine();
+        let (result, host) = replay_restart(&program, erase, |host| {
+            supply_then_connected(
+                host,
+                vec![
+                    InputAnswer::Value(1),
+                    InputAnswer::Value(1),
+                    InputAnswer::Fails,
+                ],
+            );
+        });
+        assert_eq!(
+            teardown_before_erase(&result, diag_ir::PreconditionKind::ExternalSupply),
+            restart::Teardown::Reset
+        );
+        assert_eq!(replayed_requests(&host), the_replayed_steps());
+        assert_no_erase_sent(&host);
+    }
+
+    /// A cancel during a step 4b-3 read cancels the restart, whatever the read gave.
+    #[test]
+    fn a_cancel_during_a_step_4b_3_read_cancels_the_restart() {
+        use diag_ir::RuntimeInput as I;
+        let (program, erase) = replay_program_with_supply_and_engine();
+        let dir = journal_dir("before-erase-cancel");
+        interrupted_at_erase(&program, erase, &dir);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        supply_then_connected(&mut host, vec![]);
+        // The engine is the last precondition, so only the check right after its step 4b-3 read
+        // can see the cancel; the read itself gives a value that holds.
+        host.input_scripts.push((
+            I::EngineRunning,
+            [
+                InputAnswer::Value(0),
+                InputAnswer::Value(0),
+                InputAnswer::Cancels(Arc::clone(&cancelled), 0),
+            ]
+            .into(),
+        ));
+        let result = resume_on(
+            &program,
+            &mut host,
+            JobLimits::default(),
+            &cancelled,
+            Journal::open(&dir, &job_key()),
+            identity_sources(),
+            Some(&crate::journal::Vin::new(TARGET_VIN.to_owned())),
+            None,
+            &dir_slot(&dir),
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
+        assert!(host.input_scripts[1].1.is_empty());
+        assert_eq!(replayed_requests(&host), the_replayed_steps());
+        assert_no_erase_sent(&host);
+    }
+
+    /// The teardown reported by step 4b-3 is the one of step 2b-1, whatever it was: a gate that
+    /// fails (the supply voltage read low there) leaves it passive, step 4a passes, and the
+    /// voltage drops again after the replay, so the reason carries the passive teardown.
+    #[test]
+    fn step_4b_3_reports_a_passive_teardown() {
+        let (mut program, erase) = replay_program();
+        let vbatt = Some(diag_ir::Source::RuntimeInput(
+            diag_ir::RuntimeInput::SupplyVoltageMillivolts,
+        ));
+        program.preconditions.voltage_mv = Some(diag_ir::Precondition {
+            satisfied: diag_ir::Satisfied {
+                lower: 11_000,
+                upper: 15_000,
+            },
+            default_session: vbatt,
+            programming_session: vbatt,
+        });
+        program.validate().unwrap();
+        let (result, host) = replay_restart(&program, erase, |host| {
+            host.voltage_script = [12_600, 10_500, 12_600, 10_500].into();
+        });
+        assert_eq!(
+            teardown_before_erase(&result, diag_ir::PreconditionKind::Voltage),
+            restart::Teardown::Passive(restart::PassiveCause::Gate(
+                restart::PassiveReason::Precondition(diag_ir::PreconditionKind::Voltage)
+            ))
+        );
+        assert_eq!(host.voltage_reads, 4);
+        assert_no_erase_sent(&host);
     }
 
     // ------------------------------------ promotion to the vehicle lock (ADR-263)

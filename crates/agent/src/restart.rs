@@ -17,7 +17,8 @@
 //! and `check_state` reads the software version and decides between redoing the transfer and the
 //! read-back verification (step 3b-2, ADR-268 item 5). When it decides to redo the transfer,
 //! `check_reentry` checks every declared precondition again before anything is replayed (step 4a,
-//! ADR-229 item 2 step 4).
+//! ADR-229 item 2 step 4); after the replay reached the erase, `check_before_erase` checks them
+//! once more through the programming-session sources (step 4b-3, ADR-245 item 6).
 //!
 //! The interruption point is the latest of the last completed step and the requests the
 //! journal wrote ahead (the transfer-start and RequestTransferExit markers, and the request
@@ -116,14 +117,14 @@ pub enum OnSiteReason {
     /// default-session confirmation of step 2b-2 (`confirmed`) and the identity checks of step 3a
     /// (`check_identity`) and the ECU state check of step 3b-2 (`state`, `check_state`). Steps 1
     /// to 3 passed, and for [`StateCheck::RedoTransfer`] also the precondition check of step 4a
-    /// (`check_reentry`) and the replay of the plan's steps from the entry up to, not including,
-    /// the erase (step 4b-2, ADR-273). The rest of step 4 (the second check of the
-    /// mutable conditions before the erase, step 4b-3, and the erase, step 4c) and the read-back
-    /// verification do not run in this agent yet, so the job stops before the erase, so before
-    /// anything that writes the ECU's memory (ADR-255, ADR-261, ADR-264, ADR-265, ADR-268
-    /// item 5). After a replay the ECU is in its programming session with the plan's setup
-    /// steps run, and `teardown` and `confirmed` describe the ECU before the replay, not after
-    /// it.
+    /// (`check_reentry`), the replay of the plan's steps from the entry up to, not including,
+    /// the erase (step 4b-2, ADR-273) and the second check of every declared precondition
+    /// through its programming-session source (step 4b-3, `check_before_erase`). The erase
+    /// (step 4c) and the read-back verification do not run in this agent yet, so the job stops
+    /// before the erase, so before anything that writes the ECU's memory (ADR-255, ADR-261,
+    /// ADR-264, ADR-265, ADR-268 item 5). After a replay the plan's steps from its entry have run
+    /// (normally entering the programming session), and `teardown` and `confirmed` describe the ECU before
+    /// the replay, not after it.
     RestartOrderUnavailable {
         flash_session: u32,
         teardown: Teardown,
@@ -152,6 +153,18 @@ pub enum OnSiteReason {
     /// replayed. `precondition` is the first that failed; `teardown` is how the download was
     /// ended first.
     PreconditionNotMet {
+        flash_session: u32,
+        precondition: PreconditionKind,
+        teardown: Teardown,
+    },
+    /// A precondition the program declares did not hold in the second check immediately before
+    /// the erase (step 4b-3, `check_before_erase`; ADR-229 item 2 step 4, ADR-245 item 6): its
+    /// programming-session source gave a value outside the declared range, no value, or could
+    /// not be used, or the program declares none. Unlike [`OnSiteReason::PreconditionNotMet`], the
+    /// plan's steps from its entry were replayed (step 4b-2, which normally puts the ECU in its
+    /// programming session), and no erase was sent. `precondition` is the first that failed; `teardown` is
+    /// how the interrupted download was ended before the replay.
+    PreconditionNotMetBeforeErase {
         flash_session: u32,
         precondition: PreconditionKind,
         teardown: Teardown,
@@ -739,7 +752,7 @@ where
 /// stopping at the first that does not hold. The ECU is in its default session (step 2b-2
 /// confirmed it), so each is read through its default-session source only, which
 /// `Program::validate` requires for every declared precondition; the programming-session source
-/// is for the second check before the erase. A value outside the declared range, a reading that
+/// is for the second check before the erase (`check_before_erase`). A value outside the declared range, a reading that
 /// is not a value, a source the table does not map and a failure to use the worker all end in
 /// [`OnSiteReason::PreconditionNotMet`], which carries the precondition and `teardown`.
 ///
@@ -759,6 +772,93 @@ pub(crate) fn check_reentry<H>(
 where
     H: DiagHost<Error = HostError> + RuntimeInputs,
 {
+    let failed = check_preconditions(
+        program,
+        sources,
+        host,
+        cancelled,
+        |precondition| precondition.default_session,
+        "at re-entry",
+    )?;
+    match failed {
+        None => Ok(()),
+        Some(precondition) => Err(JobError::OnSiteInterventionRequired(
+            OnSiteReason::PreconditionNotMet {
+                flash_session: point.flash_session,
+                precondition,
+                teardown: teardown.clone(),
+            },
+        )),
+    }
+}
+
+/// The second check of the mutable conditions at ADR-229 item 2 step 4 (step 4b-3, ADR-245
+/// item 6), run when the replay of step 4b-2 stopped at the plan's erase and before anything is
+/// erased. Every precondition the program declares (supply voltage, external supply, ignition,
+/// engine, vehicle speed; the VIN and the hardware identity are not preconditions and are not
+/// read) is checked in that order, stopping at the first that does not hold. Each is read through
+/// its programming-session source only, which `Program::validate` requires for every declared
+/// precondition of a restartable plan; a missing one is not established, so not met. That
+/// source must be usable in the programming session (ADR-229 item 2 step 4), which the plan's
+/// steps from its entry normally enter. The agent tracks no session: when those steps re-enter no
+/// programming session, the ECU is still in its default session here, and a source that answers
+/// only in the programming session fails the check, with nothing erased. A value outside the
+/// declared range, a
+/// reading that is not a value, a source the table does not map and a failure to use the worker
+/// all end in [`OnSiteReason::PreconditionNotMetBeforeErase`], which carries the precondition and
+/// `teardown`. Each is read once, with no retry.
+///
+/// A cancel stops it at the start, before and right after every read. Nothing here sends anything
+/// but ReadDataByIdentifier requests through the declared sources, and reads of runtime inputs.
+pub(crate) fn check_before_erase<H>(
+    program: &Program,
+    point: &RestartPoint,
+    teardown: &Teardown,
+    sources: &ServiceSources,
+    host: &mut H,
+    cancelled: &AtomicBool,
+) -> Result<(), JobError>
+where
+    H: DiagHost<Error = HostError> + RuntimeInputs,
+{
+    let failed = check_preconditions(
+        program,
+        sources,
+        host,
+        cancelled,
+        |precondition| precondition.programming_session,
+        "before the erase",
+    )?;
+    match failed {
+        None => Ok(()),
+        Some(precondition) => Err(JobError::OnSiteInterventionRequired(
+            OnSiteReason::PreconditionNotMetBeforeErase {
+                flash_session: point.flash_session,
+                precondition,
+                teardown: teardown.clone(),
+            },
+        )),
+    }
+}
+
+/// The loop shared by `check_reentry` and `check_before_erase`: every declared precondition in
+/// the order voltage, external supply, ignition, engine, vehicle speed, each read once through
+/// the source `pick_source` selects, stopping at the first that does not hold (a missing source,
+/// a value outside the declared range, a reading that is not a value, or a failed read all mean
+/// not met). Returns that precondition, or `None` when all hold. A cancel stops it at the start,
+/// before and right after every read. `log_context` completes the warning logged for a failed
+/// read.
+fn check_preconditions<H>(
+    program: &Program,
+    sources: &ServiceSources,
+    host: &mut H,
+    cancelled: &AtomicBool,
+    pick_source: fn(&Precondition) -> Option<Source>,
+    log_context: &str,
+) -> Result<Option<PreconditionKind>, JobError>
+where
+    H: DiagHost<Error = HostError> + RuntimeInputs,
+{
     if cancelled.load(Ordering::Relaxed) {
         return Err(JobError::Cancelled);
     }
@@ -773,14 +873,14 @@ where
         let Some(precondition) = precondition else {
             continue;
         };
-        let holds = match precondition.default_session {
+        let holds = match pick_source(precondition) {
             Some(source) => {
                 let range = precondition.satisfied.lower..=precondition.satisfied.upper;
                 match cancellable(cancelled, || resolve_source(source, sources, host))? {
                     Ok(Reading::Value(value)) => range.contains(&value),
                     Ok(_) => false,
                     Err(error) => {
-                        tracing::warn!(%error, ?kind, "a precondition could not be read at re-entry");
+                        tracing::warn!(%error, ?kind, "a precondition could not be read {log_context}");
                         false
                     }
                 }
@@ -789,16 +889,10 @@ where
             None => false,
         };
         if !holds {
-            return Err(JobError::OnSiteInterventionRequired(
-                OnSiteReason::PreconditionNotMet {
-                    flash_session: point.flash_session,
-                    precondition: kind,
-                    teardown: teardown.clone(),
-                },
-            ));
+            return Ok(Some(kind));
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 /// Whether the interruption is at the end of a pass whose post-transfer steps are journaled

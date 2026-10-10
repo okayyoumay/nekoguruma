@@ -33,12 +33,18 @@ consists of, where the program goes on afterwards, or which job outcome it leads
    whatever the instruction is, before the post-transfer completion that ADR-252 item 2 commits
    right after it. This is the same record the entry step writes, so the journal format does
    not change. When a plan's end is the next plan's entry, the one record serves both.
+   Reading the journal back keeps the states apart by the boundary they resume at: the newest
+   state at the interrupted plan's entry and the newest at its end. A redo of the transfer uses
+   the entry state and the continuation uses the end state, so a crash after the end state is
+   synced but before the completion still redoes the transfer from the entry, as it does today.
+   An entry state recorded after an end state (a new pass) makes that end state stale.
 3. **The program continues from the plan's end.** On a passed verification the restart sends no
    erase and no further ECUReset for the verified plan. It restores the VM state recorded at the
    interrupted pass's plan end and runs the program's remaining instructions as a first run
    would, with the same journaling; a later flash plan or a final reset among them runs as it
-   would on a first run, and a later plan takes the job back to `Writing` (design 5.6), with the
-   same cancellation rules. The job then ends in `Completed` or `Failed` exactly as that first
+   would on a first run, and a later plan takes the job back to `Writing` (design 5.6). A
+   cancellation during the resumed program follows the first-run rules: it takes effect at the
+   next interruptible point and ends the job in `Cancelled`. The job then ends in `Completed` or `Failed` exactly as that first
    run would.
 4. **The continuation runs only when its instructions are safe to repeat.** The journal records
    no step outside a plan's range (ADR-252 item 2), so a restart cannot tell how far the program

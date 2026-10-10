@@ -363,6 +363,8 @@ stateDiagram-v2
     Interrupted --> ReadBackVerification: intended image installed and post-transfer steps journaled (ADR-229)
     Interrupted --> Failed: VIN or ECU hardware identity mismatch on re-verification (aborted, ADR-229)
     ReadBackVerification --> Writing: resumed program reaches a later flash plan (ADR-271)
+    ReadBackVerification --> OnSiteInterventionRequired: after a restart, plan-end state missing or continuation not safe to repeat (ADR-271)
+    ReadBackVerification --> Cancelled: after a restart, cancellation reaches an interruptible point in the resumed program (ADR-271)
     ReadBackVerification --> Completed
     ReadBackVerification --> Failed
     Completed --> [*]

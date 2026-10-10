@@ -2,6 +2,9 @@
 //!
 //! For a procedure with a flash recovery plan, the runner commits to the journal in two places.
 //!
+//! When a run starts, before anything is sent ([`JobJournal::run_start`]): the VM state it starts
+//! from, so the journal marks where each run began (ADR-272).
+//!
 //! When execution arrives at an instruction, before it runs and once the VM's own checks of it
 //! passed (`Vm::current_op`, ADR-233 item 3) ([`JobJournal::arrive`]):
 //! - at a plan's `entry_pc`, once per job and before its first transfer: the ECU hardware part
@@ -16,8 +19,7 @@
 //! - a diagnostic primitive inside a plan's range: a step record, so the journal's last step
 //!   orders the interruption point (ADR-229 item 1, ADR-245 item 4);
 //! - a step that brings execution to a plan's `entry_pc`: a step record with the VM state
-//!   after it (none when the job starts at the entry: the state is then the program's initial
-//!   one);
+//!   after it (a job that starts at the entry has its run start instead);
 //! - a step that brings execution to a plan's `post_transfer_end_pc` after its exit marker: the
 //!   post-transfer completion.
 //!
@@ -102,6 +104,21 @@ impl<S: Store> JobJournal<S> {
     #[cfg(test)]
     pub(crate) fn into_journal(self) -> Journal<S> {
         self.journal
+    }
+
+    /// Commits the VM state the run starts from, at the step count it starts at, as the run's
+    /// first record (ADR-272). Called before the run's first arrival, so before any request.
+    pub(crate) fn run_start(&mut self, state: &VmState) -> Result<(), JobError> {
+        let encoded = postcard::to_allocvec(state)
+            .map_err(|_| JournalError::Invariant("the VM state does not encode"))?;
+        self.journal.commit_run_start(
+            StepRef {
+                pc: state.pc,
+                steps: state.steps,
+            },
+            &encoded,
+        )?;
+        Ok(())
     }
 
     /// Commits the markers and the identity the boundaries at `state.pc` call for. Called once

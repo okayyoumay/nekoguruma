@@ -1150,9 +1150,12 @@ enum EntryStateError {
     Invalid(String),
 }
 
-/// The VM state at `entry_pc`: the newest state the journal holds, which the runner takes on the
-/// step into a plan's entry (ADR-252), or the program's initial state when the job started at
-/// the entry and so recorded none. Either is checked with `Vm::check_state` before it is used.
+/// The VM state at `entry_pc`: the newest state the journal holds, which is either the state the
+/// runner took on the step into a plan's entry (ADR-252) or the state a run started from, which
+/// every journaled run commits first (ADR-272). A run start sits newer than an earlier run's
+/// states, so a plain start on an existing journal never inherits them. Only a journal that holds
+/// no state, one written before the run-start record, falls back to the program's initial state
+/// for an entry at pc 0. Either is checked with `Vm::check_state` before it is used.
 fn entry_state(
     program: &Program,
     state: &JournalState,
@@ -1484,6 +1487,141 @@ mod tests {
             decide(&other, &j),
             RestartDecision::OnSiteInterventionRequired(OnSiteReason::UnknownStage(7))
         );
+    }
+
+    /// `program` with its plan's entry at pc 0, as a job that starts at the entry has it.
+    fn program_entered_at_zero() -> Program {
+        let mut program = program(RecoveryRequired::Never);
+        program.flash[0].boundaries.entry_pc = 0;
+        program
+    }
+
+    fn new_journal() -> Journal<Memory> {
+        Journal::on_store(
+            Memory,
+            JobKey {
+                job_id: shared_proto::JobId("0190f5a8-7c2e-7d4b-9a6e-3f1c2b4d5e6f".to_owned()),
+                generation: 1,
+            },
+        )
+    }
+
+    fn state_bytes(state: &VmState) -> Vec<u8> {
+        postcard::to_allocvec(state).unwrap()
+    }
+
+    /// A state of the entry-at-zero program that a run left behind on a jump back to pc 0: not
+    /// the initial one (a value on the stack).
+    fn jump_state(program: &Program, steps: u64) -> VmState {
+        let mut state = Vm::new(program).state;
+        state.stack.push(diag_ir::Value::I64(9));
+        state.steps = steps;
+        state
+    }
+
+    /// The done-when case (ADR-272): run 1 jumped back to pc 0 (state S1) and crashed before the
+    /// erase; run 2, a plain start, committed its run start and was interrupted in the transfer.
+    /// The restart's entry state is run 2's initial state, not S1.
+    #[test]
+    fn a_run_start_is_the_entry_state_of_a_run_that_started_at_the_entry() {
+        let program = program_entered_at_zero();
+        let mut j = new_journal();
+        j.commit_run_start(at(0), &state_bytes(&Vm::new(&program).state))
+            .unwrap();
+        j.commit_step(
+            StepRef { pc: 2, steps: 1 },
+            Some(&state_bytes(&jump_state(&program, 2))),
+        )
+        .unwrap();
+        // Run 2: plain start on this journal, with the step count the journal says is next.
+        let next = next_steps(j.state());
+        let mut initial = Vm::new(&program).state;
+        initial.steps = next;
+        j.commit_run_start(StepRef { pc: 0, steps: next }, &state_bytes(&initial))
+            .unwrap();
+        let erase = StepRef {
+            pc: ERASE,
+            steps: next + 1,
+        };
+        j.commit_transfer_start(StageId(7), erase).unwrap();
+        let RestartDecision::Restart(point) = decide(&program, &j) else {
+            panic!("{:?}", decide(&program, &j));
+        };
+        let mut expected = Vm::new(&program).state;
+        expected.steps = next_steps(j.state());
+        assert_eq!(point.entry_state, expected);
+        assert!(point.entry_state.stack.is_empty());
+    }
+
+    /// A jump back to the entry after the run start is newer and wins over it.
+    #[test]
+    fn a_jump_back_to_the_entry_wins_over_the_run_start() {
+        let program = program_entered_at_zero();
+        let mut j = new_journal();
+        j.commit_run_start(at(0), &state_bytes(&Vm::new(&program).state))
+            .unwrap();
+        let jumped = jump_state(&program, 2);
+        j.commit_step(StepRef { pc: 2, steps: 1 }, Some(&state_bytes(&jumped)))
+            .unwrap();
+        j.commit_transfer_start(StageId(7), at(ERASE)).unwrap();
+        let RestartDecision::Restart(point) = decide(&program, &j) else {
+            panic!("{:?}", decide(&program, &j));
+        };
+        let mut expected = jumped;
+        expected.steps = next_steps(j.state());
+        assert_eq!(point.entry_state, expected);
+    }
+
+    #[test]
+    fn a_run_start_that_is_unusable_needs_on_site_intervention() {
+        let program = program_entered_at_zero();
+        let restart_with = |program: &Program, run_start: &[u8]| {
+            let mut j = new_journal();
+            j.commit_run_start(at(0), run_start).unwrap();
+            j.commit_transfer_start(StageId(7), at(ERASE)).unwrap();
+            decide(program, &j)
+        };
+        assert!(matches!(
+            restart_with(&program, b"not a state"),
+            RestartDecision::OnSiteInterventionRequired(OnSiteReason::InvalidEntryState(_))
+        ));
+        let mut wrong_schema = Vm::new(&program).state;
+        wrong_schema.schema_version = 1;
+        assert!(matches!(
+            restart_with(&program, &state_bytes(&wrong_schema)),
+            RestartDecision::OnSiteInterventionRequired(OnSiteReason::InvalidEntryState(_))
+        ));
+        // A plan entered at pc 2: the run start at pc 0 is no state at the entry.
+        let program = self::program(RecoveryRequired::Never);
+        assert_eq!(
+            restart_with(&program, &state_bytes(&Vm::new(&program).state)),
+            RestartDecision::OnSiteInterventionRequired(OnSiteReason::MissingEntryState {
+                flash_session: 1
+            })
+        );
+    }
+
+    /// A run start names no request: it does not move the interruption point, and it counts for
+    /// the next run's step count.
+    #[test]
+    fn a_run_start_moves_no_interruption_point_but_counts() {
+        let program = program(RecoveryRequired::Never);
+        let mut j = journal_until(&program, ENTRY + 1);
+        let point = interruption_point(&j.state().facts);
+        let next = next_steps(j.state());
+        j.commit_run_start(
+            StepRef { pc: 0, steps: next },
+            &state_bytes(&Vm::new(&program).state),
+        )
+        .unwrap();
+        assert_eq!(interruption_point(&j.state().facts), point);
+        assert_eq!(next_steps(j.state()), next + 1);
+        // A run that crashed right after its run start still advances the count on its own.
+        let mut j = new_journal();
+        j.commit_run_start(at(0), &state_bytes(&Vm::new(&program).state))
+            .unwrap();
+        assert_eq!(interruption_point(&j.state().facts), None);
+        assert_eq!(next_steps(j.state()), 1);
     }
 
     /// A resume record after the completion does not undo it: the restart that committed the

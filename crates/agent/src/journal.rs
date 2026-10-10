@@ -173,6 +173,12 @@ impl RecoveryFacts {
                 }
                 self.intended_software_version = Some(version.clone());
             }
+            Record::RunStart { at, .. } => {
+                // It names no request and changes no fact; only its place is checked.
+                if !after_last_step(at, self) {
+                    return Err("a run start must come after the last step");
+                }
+            }
             Record::Step { at, .. } => {
                 if !after_last_step(at, self) {
                     return Err("a step must come after the last step");
@@ -330,8 +336,8 @@ pub struct TransferExit {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JournalState {
     pub facts: RecoveryFacts,
-    /// The newest VM state a step record carried (postcard `VmState`, opaque here), with the
-    /// step it was taken after.
+    /// The newest VM state a step record or a run start carried (postcard `VmState`, opaque
+    /// here), with the step it was taken after (for a run start, the step count it starts at).
     pub last_vm_state: Option<(StepRef, Vec<u8>)>,
     /// Records in the journal.
     pub records: u64,
@@ -371,6 +377,12 @@ enum Record {
     /// The software version the job intends to write (ADR-268); only in the creation prefix,
     /// after the target VIN when there is one.
     IntendedSoftwareVersion(Vec<u8>),
+    /// The VM state a run starts from, committed before the run's first step (ADR-272). Folds
+    /// like a step that carries a state, and changes no fact.
+    RunStart {
+        at: StepRef,
+        vm_state: Vec<u8>,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -673,6 +685,18 @@ impl<S: Store> Journal<S> {
         })
     }
 
+    /// Records the VM state a run starts from, before the run's first step or request is sent
+    /// (ADR-272). `at.steps` is the run's first step count.
+    pub fn commit_run_start(&mut self, at: StepRef, vm_state: &[u8]) -> Result<(), JournalError> {
+        if vm_state.len() > MAX_FRAME as usize {
+            return Err(JournalError::TooLarge);
+        }
+        self.commit(Record::RunStart {
+            at,
+            vm_state: vm_state.to_vec(),
+        })
+    }
+
     /// Records a block the ECU confirmed, counted from the start of the transfer.
     pub fn commit_block(&mut self, block: u32) -> Result<(), JournalError> {
         self.commit(Record::Block { block })
@@ -756,15 +780,21 @@ impl<S: Store> Journal<S> {
             return Err(error.into());
         }
         self.state.facts = facts;
-        if let Record::Step {
-            at,
-            vm_state: Some(vm_state),
-        } = entry.record
-        {
-            self.state.last_vm_state = Some((at, vm_state));
-        }
+        fold_vm_state(&mut self.state.last_vm_state, entry.record);
         self.state.records += 1;
         Ok(())
+    }
+}
+
+/// Takes the VM state `record` carries, a step's or a run start's, as the newest one.
+fn fold_vm_state(last: &mut Option<(StepRef, Vec<u8>)>, record: Record) {
+    match record {
+        Record::Step {
+            at,
+            vm_state: Some(vm_state),
+        }
+        | Record::RunStart { at, vm_state } => *last = Some((at, vm_state)),
+        _ => {}
     }
 }
 
@@ -933,13 +963,7 @@ fn load(bytes: &[u8], key: &JobKey) -> Result<Loaded, JournalError> {
             .facts
             .apply(&entry.record)
             .map_err(|reason| corrupt(offset, reason))?;
-        if let Record::Step {
-            at,
-            vm_state: Some(vm_state),
-        } = entry.record
-        {
-            state.last_vm_state = Some((at, vm_state));
-        }
+        fold_vm_state(&mut state.last_vm_state, entry.record);
         state.records += 1;
         offset = next;
     }
@@ -2063,6 +2087,70 @@ mod tests {
         j.commit_step(at(5, 20), None)
             .expect("step without a state");
         assert_eq!(j.state().last_vm_state, Some((at(2, 10), b"vm-1".to_vec())));
+    }
+
+    /// A run start (ADR-272) is the newest state, survives a reopen, changes no fact, and comes
+    /// right after the creation prefix.
+    #[test]
+    fn a_run_start_reads_back_as_the_newest_state() {
+        let vin = Vin::new("WDB12345678901234".to_owned());
+        for target_vin in [Some(&vin), None] {
+            let dir = TempDir::new();
+            let mut j = Journal::create(&dir.0, &key(), target_vin, Some(VERSION)).expect("create");
+            let facts = j.summary();
+            let prefix = j.state().records;
+            j.commit_run_start(at(0, 0), b"initial").expect("run start");
+            assert_eq!(j.summary(), facts);
+            j.commit_step(at(2, 1), Some(b"vm-1")).expect("step");
+            j.commit_run_start(at(0, 2), b"second").expect("second run");
+            drop(j);
+            let state = Journal::read(&dir.0, &key()).expect("read back");
+            assert_eq!(state.last_vm_state, Some((at(0, 2), b"second".to_vec())));
+            assert_eq!(state.facts.last_step, Some(at(2, 1)));
+            assert_eq!(state.records, prefix + 3);
+            assert_eq!(Journal::open(&dir.0, &key()).expect("open").state(), &state);
+        }
+    }
+
+    #[test]
+    fn a_run_start_must_come_after_the_last_step() {
+        let mut j = memory();
+        j.commit_step(at(2, 5), None).expect("step");
+        for steps in [4, 5] {
+            assert!(matches!(
+                j.commit_run_start(at(0, steps), b"s"),
+                Err(JournalError::Invariant(_))
+            ));
+        }
+        assert_eq!(j.state().last_vm_state, None);
+        j.commit_run_start(at(0, 6), b"s").expect("after the step");
+
+        let dir = TempDir::new();
+        let mut j = Journal::create(&dir.0, &key(), None, None).expect("create");
+        j.commit_step(at(2, 5), None).expect("step");
+        drop(j);
+        append_entry(
+            &dir,
+            1,
+            Record::RunStart {
+                at: at(0, 5),
+                vm_state: b"s".to_vec(),
+            },
+        );
+        assert!(matches!(
+            Journal::read(&dir.0, &key()),
+            Err(JournalError::Corrupt { .. })
+        ));
+    }
+
+    #[test]
+    fn a_run_start_larger_than_a_frame_is_refused() {
+        let mut j = memory();
+        assert!(matches!(
+            j.commit_run_start(at(0, 0), &vec![0; MAX_FRAME as usize + 1]),
+            Err(JournalError::TooLarge)
+        ));
+        assert_eq!(j.state().records, 0);
     }
 
     #[derive(Default)]

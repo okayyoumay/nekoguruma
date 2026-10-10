@@ -13,7 +13,9 @@
 //! decision and the journal's exclusions (step 2b-1, ADR-264): an ECUReset, or a passive wait for
 //! the ECU's session to expire. `confirm_default_session` then waits out the ECU's startup time
 //! and confirms by reading F186 that the ECU is back in its default session (step 2b-2,
-//! ADR-265).
+//! ADR-265). `check_identity` reads the VIN and the hardware identity again (step 3a, ADR-267),
+//! and `check_state` reads the software version and decides between redoing the transfer and the
+//! read-back verification (step 3b-2, ADR-268 item 5).
 //!
 //! The interruption point is the latest of the last completed step and the requests the
 //! journal wrote ahead (the transfer-start and RequestTransferExit markers, and the request
@@ -24,8 +26,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use diag_ir::{
-    DiagHost, IdentityKind, Interruptible, Precondition, PreconditionKind, Program,
-    RecoveryRequired, RecoveryTiming, RuntimeInput, Source, Vm, VmError, VmState,
+    DiagHost, FlashRecovery, IdentityKind, Interruptible, NoApplication, Precondition,
+    PreconditionKind, Program, RecoveryRequired, RecoveryTiming, RuntimeInput, Source, Vm, VmError,
+    VmState,
 };
 
 use crate::host::HostError;
@@ -109,13 +112,31 @@ pub enum OnSiteReason {
     /// The restart passed step 1 (the checks that need no ECU service, and its resume was
     /// counted), the gates of step 2, the teardown of step 2b-1 (`teardown`), the
     /// default-session confirmation of step 2b-2 (`confirmed`) and the identity checks of step 3a
-    /// (`check_identity`). Step 3b (the ECU state check) and the rest of ADR-229's restart order
-    /// (the replay to the erase) do not run in this agent yet, so the job stops before it sends
-    /// anything further that changes the ECU (ADR-255, ADR-261, ADR-264, ADR-265).
+    /// (`check_identity`) and the ECU state check of step 3b-2 (`state`, `check_state`). Steps 1
+    /// to 3 passed. Step 4 (the replay to the erase) and the read-back verification do not run in
+    /// this agent yet, so the job stops before anything that changes the ECU (ADR-255, ADR-261,
+    /// ADR-264, ADR-265, ADR-268 item 5).
     RestartOrderUnavailable {
         flash_session: u32,
         teardown: Teardown,
         confirmed: Confirmation,
+        state: StateCheck,
+    },
+    /// Step 3b-2 could not establish the ECU's software version (ADR-229 item 2 step 3,
+    /// ADR-268 item 5): there is no declared source, or every read (the first and the plan's
+    /// retries) gave no answer, a negative response other than the declared no-application one,
+    /// a value that does not decode, or a worker failure. `teardown` is how the download was
+    /// ended first.
+    SoftwareVersionNotEstablished {
+        flash_session: u32,
+        teardown: Teardown,
+    },
+    /// Step 3b-2 read a software version that is neither the one recorded before the erase nor the
+    /// intended one (ADR-268 item 5): the ECU holds an image the job cannot account for. The read
+    /// is conclusive and not retried. `teardown` is how the download was ended first.
+    UnexpectedSoftwareVersion {
+        flash_session: u32,
+        teardown: Teardown,
     },
     /// Step 3a could not establish an identity in the default session (ADR-229 item 2 step 3):
     /// the ECU gave no answer, a negative response or an undecodable value, or the journal or the
@@ -137,6 +158,19 @@ pub enum OnSiteReason {
         flash_session: u32,
         teardown: Teardown,
     },
+}
+
+/// What the ECU state check of ADR-229 item 2 step 3b-2 found, so what the restart does next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StateCheck {
+    /// The ECU holds no valid application, or the software version it reports is the one read
+    /// before the erase, or the intended one without the journal showing the post-transfer steps
+    /// complete: the transfer is done again.
+    RedoTransfer,
+    /// The journal shows the post-transfer steps complete and the ECU reports the intended
+    /// software version: the transfer is not redone; the read-back verification of ADR-268
+    /// item 5 follows.
+    ReadBackVerification,
 }
 
 /// What the gates of ADR-229 item 2 step 2 allow the restart's teardown.
@@ -580,6 +614,92 @@ where
             not_established(IdentityKind::HardwarePartNumber)
         }
     }
+}
+
+/// The ECU state check of ADR-229 item 2 step 3b-2 (ADR-268 item 5), run in the default session
+/// after `check_identity`. It reads the software version through the program's source with
+/// `read_field_bytes`, at most `1 + plan.version_read_retries` times and with no delay between
+/// reads, and compares the raw bytes with the journal's facts:
+/// - the intended version (`intended_software_version`, if the job names one): with the
+///   post-transfer steps journaled complete, [`StateCheck::ReadBackVerification`]; otherwise
+///   [`StateCheck::RedoTransfer`] (this covers an intended version equal to the pre-erase one:
+///   only the journal's record tells a finished transfer from an unstarted one);
+/// - the pre-erase version (`pre_erase_software_version`): [`StateCheck::RedoTransfer`];
+/// - any other decoded version: [`OnSiteReason::UnexpectedSoftwareVersion`], conclusive and not
+///   retried;
+/// - a negative response with the plan's declared no-application code: `RedoTransfer`,
+///   conclusive;
+/// - anything else (another negative response, a field that does not decode, a worker failure)
+///   is inconclusive and read again; after the last read [`OnSiteReason::SoftwareVersionNotEstablished`].
+///
+/// A program that declares no software-version source is `SoftwareVersionNotEstablished` without
+/// a read. `teardown` is carried by both on-site reasons. A cancel stops it at the start, before
+/// and right after every read. Nothing here sends anything but ReadDataByIdentifier requests
+/// through the declared source.
+pub(crate) fn check_state<H>(
+    program: &Program,
+    point: &RestartPoint,
+    plan: &FlashRecovery,
+    teardown: &Teardown,
+    sources: &ServiceSources,
+    host: &mut H,
+    cancelled: &AtomicBool,
+) -> Result<StateCheck, JobError>
+where
+    H: DiagHost<Error = HostError>,
+{
+    let on_site = |reason| Err(JobError::OnSiteInterventionRequired(reason));
+    let not_established = || {
+        on_site(OnSiteReason::SoftwareVersionNotEstablished {
+            flash_session: point.flash_session,
+            teardown: teardown.clone(),
+        })
+    };
+    if cancelled.load(Ordering::Relaxed) {
+        return Err(JobError::Cancelled);
+    }
+    let Some(source) = program.identity.software_version else {
+        return not_established();
+    };
+    let facts = &point.facts;
+    let post_transfer_complete = facts
+        .transfer
+        .as_ref()
+        .and_then(|transfer| transfer.exit.as_ref())
+        .is_some_and(|exit| exit.complete);
+    for _ in 0..=u32::from(plan.version_read_retries) {
+        match cancellable(cancelled, || read_field_bytes(source, sources, host))? {
+            Ok(FieldBytes::Field(bytes)) => {
+                let version = Some(bytes.as_slice());
+                return if version == facts.intended_software_version.as_deref() {
+                    Ok(if post_transfer_complete {
+                        StateCheck::ReadBackVerification
+                    } else {
+                        StateCheck::RedoTransfer
+                    })
+                } else if version == facts.pre_erase_software_version.as_deref() {
+                    Ok(StateCheck::RedoTransfer)
+                } else {
+                    on_site(OnSiteReason::UnexpectedSoftwareVersion {
+                        flash_session: point.flash_session,
+                        teardown: teardown.clone(),
+                    })
+                };
+            }
+            Ok(FieldBytes::Negative(nrc))
+                if plan.no_application == Some(NoApplication::Nrc(nrc)) =>
+            {
+                return Ok(StateCheck::RedoTransfer);
+            }
+            Ok(other) => {
+                tracing::warn!(?other, "the ECU's software version was not established");
+            }
+            Err(error) => {
+                tracing::warn!(%error, "the ECU's software version could not be read");
+            }
+        }
+    }
+    not_established()
 }
 
 /// The restart's teardown (ADR-229 item 2 step 2b-1, ADR-264), run on the gates' decision `gate`.

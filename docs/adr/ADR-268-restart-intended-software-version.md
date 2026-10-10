@@ -36,7 +36,8 @@ item 7, ADR-245). It therefore cannot come from the program.
    procedure's source reads it, the same representation as the journal's pre-erase version, so
    the state check compares all three with one rule and no decoding rule can make two answers
    equal (ADR-252 item 5). A job that reflashes the version already installed names the same
-   bytes as the pre-erase version.
+   bytes as the pre-erase version. An empty value is refused (on creation, on commit and on
+   read-back), since it would match an ECU that answers with an empty field.
 5. **The state check that uses it** (the rest of ADR-229 item 2 step 3) reads the version with
    the procedure's retry limit; only a field read in full is decoded, the declared
    no-application response is conclusive, and anything else is retried, then ends in on-site
@@ -49,7 +50,9 @@ item 7, ADR-245). It therefore cannot come from the program.
 
 - ADR-244 item 4's list of what the job names loses the version: it is a journal fact now.
 - A journal with the new record is refused as corrupt by an older build, which ends the job in
-  on-site intervention, as ADR-261's record did.
+  on-site intervention, as ADR-261's record did. The other way round, a journal written before
+  this change holds no version, so a resume by a newer build that names one ends in
+  `IntendedVersionDiffers`.
 - A torn creation write that loses the version frame while it is the journal's last frame
   leaves a journal with the VIN and no version. A resume that names a version then ends in
   `IntendedVersionDiffers`; one that names none runs and can never reach read-back

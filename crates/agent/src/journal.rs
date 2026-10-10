@@ -94,7 +94,8 @@ impl std::fmt::Debug for Vin {
 /// What a restart, or a device that takes the job over, needs to know from the journal
 /// (ADR-229). It is the state the journal folds its records into, and the journal's part of the
 /// checkpoint summary sent for handover, carried unchanged; the summary adds what the job itself
-/// names (target VIN and ECU, the version being written, the stage reached; design 8.2.5).
+/// names and the journal does not record (the target ECU and the stage reached; design 8.2.5).
+/// The target VIN and the version being written are journal facts (ADR-261, ADR-268).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecoveryFacts {
     pub key: JobKey,
@@ -153,7 +154,7 @@ impl RecoveryFacts {
             |at: &StepRef, facts: &Self| facts.last_step.is_none_or(|last| at.steps > last.steps);
         match record {
             Record::TargetVin(vin) => {
-                // Where it may appear is `target_vin_allowed`'s rule; a second one is refused
+                // Where it may appear is `creation_prefix_allowed`'s rule; a second one is refused
                 // here as well.
                 if self.target_vin.is_some() {
                     return Err("the target VIN is already set");
@@ -165,6 +166,10 @@ impl RecoveryFacts {
                 // refused here as well.
                 if self.intended_software_version.is_some() {
                     return Err("the intended software version is already set");
+                }
+                // An empty field would match an ECU that answers with an empty one (ADR-268).
+                if version.is_empty() {
+                    return Err("the intended software version is empty");
                 }
                 self.intended_software_version = Some(version.clone());
             }
@@ -1496,6 +1501,23 @@ mod tests {
 
     /// The same rule on read-back: a file that breaks it is corrupt.
     #[test]
+    fn an_empty_intended_version_is_refused_and_creates_nothing() {
+        let dir = TempDir::new();
+        assert!(matches!(
+            Journal::create(&dir.0, &key(), None, Some(&[])),
+            Err(JournalError::Invariant(_))
+        ));
+        assert!(!path(&dir).exists());
+        let dir = TempDir::new();
+        drop(Journal::create(&dir.0, &key(), None, None).expect("create"));
+        append_entry(&dir, 0, Record::IntendedSoftwareVersion(Vec::new()));
+        assert!(matches!(
+            Journal::read(&dir.0, &key()),
+            Err(JournalError::Corrupt { .. })
+        ));
+    }
+
+    #[test]
     fn a_file_that_breaks_the_creation_prefix_order_is_corrupt() {
         let vin = Vin::new("WDB12345678901234".to_owned());
         let version = || Record::IntendedSoftwareVersion(VERSION.to_vec());
@@ -1517,6 +1539,12 @@ mod tests {
                 Some(&vin),
                 Some(VERSION),
                 vec![version()],
+            ),
+            (
+                "version after a hardware part number",
+                None,
+                None,
+                vec![Record::EcuHardwarePartNumber(b"HW01".to_vec()), version()],
             ),
             (
                 "version after VIN and step",

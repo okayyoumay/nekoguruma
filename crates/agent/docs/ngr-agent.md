@@ -208,7 +208,8 @@ first run (none included, on either side) ends in
 `OnSiteInterventionRequired(IntendedVersionDiffers)`, checked right after the VIN and before the
 classification, with nothing sent and no resume counted (ADR-268). Both records belong to the
 journal's creation prefix: the target VIN only first, the intended version only first or right
-after the VIN, each at most once; a file that breaks this is corrupt. Like the VIN record, the
+after the VIN, each at most once; a file that breaks this is corrupt. An empty intended
+version is refused, since it would match an ECU that answers with an empty field. Like the VIN record, the
 version record is appended without a format version change.
 
 `check_gates` is ADR-229 item 2 step 2 before the teardown (ADR-261). It reads only, and stops

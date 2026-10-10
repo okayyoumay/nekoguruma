@@ -118,8 +118,11 @@ pub enum OnSiteReason {
     /// to 3 passed, and for [`StateCheck::RedoTransfer`] also the precondition check of step 4a
     /// (`check_reentry`) and the replay of the plan's steps from the entry up to, not including,
     /// the erase (step 4b-2, ADR-273). The rest of step 4 (the erase) and the read-back
-    /// verification do not run in this agent yet, so the job stops before anything that changes
-    /// the ECU (ADR-255, ADR-261, ADR-264, ADR-265, ADR-268 item 5).
+    /// verification do not run in this agent yet, so the job stops before the erase, so before
+    /// anything that writes the ECU's memory (ADR-255, ADR-261, ADR-264, ADR-265, ADR-268
+    /// item 5). After a replay the ECU is in its programming session with the plan's setup
+    /// steps run, and `teardown` and `confirmed` describe the ECU before the replay, not after
+    /// it.
     RestartOrderUnavailable {
         flash_session: u32,
         teardown: Teardown,

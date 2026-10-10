@@ -2,7 +2,7 @@
 
 **Date:** 2026-10-10
 **Status:** Accepted
-**Affects:** `agent` (`src/runner.rs`, `src/restart.rs`, `src/journaling.rs`, `docs/ngr-agent.md`), ADR-229 item 2 step 4, ADR-245 item 4, ADR-272 item 2
+**Affects:** `agent` (`src/runner.rs`, `src/restart.rs`, `docs/ngr-agent.md`), ADR-229 item 2 step 4, ADR-245 item 4, ADR-272 item 2
 
 ## Context
 

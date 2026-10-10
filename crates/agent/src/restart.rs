@@ -116,7 +116,8 @@ pub enum OnSiteReason {
     /// default-session confirmation of step 2b-2 (`confirmed`) and the identity checks of step 3a
     /// (`check_identity`) and the ECU state check of step 3b-2 (`state`, `check_state`). Steps 1
     /// to 3 passed, and for [`StateCheck::RedoTransfer`] also the precondition check of step 4a
-    /// (`check_reentry`). The rest of step 4 (the replay to the erase) and the read-back
+    /// (`check_reentry`) and the replay of the plan's steps from the entry up to, not including,
+    /// the erase (step 4b-2, ADR-273). The rest of step 4 (the erase) and the read-back
     /// verification do not run in this agent yet, so the job stops before anything that changes
     /// the ECU (ADR-255, ADR-261, ADR-264, ADR-265, ADR-268 item 5).
     RestartOrderUnavailable {

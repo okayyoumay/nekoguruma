@@ -1,7 +1,7 @@
 # ADR-272: Every Journaled Run Records the State It Starts From
 
 **Date:** 2026-10-10
-**Status:** Accepted
+**Status:** Accepted (item 2's runs that do not start at instruction 0: the replay of step 4 commits none, ADR-273)
 **Affects:** `agent` (`src/journal.rs`, `src/journaling.rs`, `src/runner.rs`, `src/restart.rs`, `docs/ngr-agent.md`), ADR-244, ADR-252 item 6, ADR-253 item 3, ADR-255 item 3
 
 ## Context

@@ -224,6 +224,39 @@ mod unix {
     }
 
     #[test]
+    fn link_back_into_a_sticky_library_directory_is_found() {
+        // `dir/sub/l.so -> ../lib.so` loads from `dir`, which must get the library-directory
+        // rule even though the walk first passed it as a container.
+        let t = tree();
+        let sub = t.dir.join("sub");
+        fs::create_dir(&sub).unwrap();
+        chmod(&sub, 0o755);
+        let link = sub.join("l.so");
+        symlink("../lib.so", &link).unwrap();
+        assert!(check_writability_with(&link, &[], &policy()).is_ok());
+        chmod(&t.dir, 0o1777);
+        let e = check_writability_with(&link, &[], &policy()).unwrap_err();
+        assert!(strictly_find(&e, &t.dir, Role::LibraryDirectory), "{e}");
+    }
+
+    #[test]
+    fn dotdot_in_the_given_path_is_found() {
+        let t = tree();
+        let path = t.dir.join("..").join("dir").join("lib.so");
+        let r = check_writability_with(&path, &[], &policy());
+        assert_eq!(found(&r), [(Role::Library, &Reason::ParentComponent)]);
+    }
+
+    #[test]
+    fn link_to_the_root_is_not_a_regular_file() {
+        let t = tree();
+        let link = t.dir.join("root.so");
+        symlink("/", &link).unwrap();
+        let r = check_writability_with(&link, &[], &policy());
+        assert!(found(&r).contains(&(Role::Library, &Reason::NotARegularFile)));
+    }
+
+    #[test]
     fn link_loop_is_too_many_links() {
         let t = tree();
         let link = t.dir.join("loop.so");

@@ -115,10 +115,15 @@ warns.
 
 **What is checked.** The library (it must end at a regular file), its own directory, every further
 ancestor up to the root, each naming file and each of its ancestors. A relative path is a finding
-(`NotAbsolute`) and is not walked. The walk goes component by component from the root without
-following links silently: a symbolic link (on Windows also a junction or other reparse point) is an
-entry of its own (`Role::Link`), then its target is walked the same way; more than 40 links in one
-path is `TooManyLinks`. A directory reached by several walks is reported once, with the stricter
+(`NotAbsolute`) and is not walked, and so is a path with a `..` component (`ParentComponent`). The
+walk goes component by component from the root without following links silently: a symbolic link
+or junction (on Windows, a name-surrogate reparse point; other reparse points such as
+deduplicated files count as the file itself) is an entry of its own (`Role::Link`), then its target
+is walked the same way; more than 40 links in one path is `TooManyLinks`. On Windows a link target
+with a `..` is also `ParentComponent`, since Windows removes `..` by text and the walk could check
+another file than the one loaded. The library-directory rule applies to the directory that holds
+the final file name as reached, so a link target such as `../lib.so` cannot route around it. A walk
+that ends on a root rather than a file name is `NotARegularFile`. A directory reached by several walks is reported once, with the stricter
 role (`LibraryDirectory` over `Directory`). A path that cannot be inspected is an `Io` finding.
 
 **Policy.** `Policy` is the set of owners trusted to hold write access. `Policy::system()` is uid 0
@@ -137,7 +142,8 @@ reparse point). A null DACL is `NullDacl`. For each ACE that is not inherit-only
 (types 0 and 9) whose trustee is outside the policy and whose mask has a write right for the role
 is `WritableByRegularUsers`; deny ACEs are ignored; the OWNER RIGHTS trustee is skipped (the owner
 is checked itself); any other ACE type is treated as a finding. Write rights are data, append,
-delete, change-permissions, take-ownership and the generic write, all and maximum-allowed bits.
+delete, change-permissions, take-ownership and the generic write, all and maximum-allowed bits. On a
+link entry, write-attributes also counts.
 For a container directory the file-data and append rights (which mean add-file and
 add-subdirectory there) do not count, matching the sticky container on Unix; for the library's own
 directory they do.

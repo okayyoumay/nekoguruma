@@ -33,6 +33,8 @@ const FILE_WRITE_DATA: u32 = 0x2;
 /// File: append data. Directory: add a subdirectory.
 const FILE_APPEND_DATA: u32 = 0x4;
 const FILE_DELETE_CHILD: u32 = 0x40;
+/// Write attributes; on a link entry, counted because the link's target is part of its data.
+const FILE_WRITE_ATTRIBUTES: u32 = 0x100;
 const DELETE: u32 = 0x1_0000;
 const WRITE_DAC: u32 = 0x4_0000;
 const WRITE_OWNER: u32 = 0x8_0000;
@@ -62,9 +64,8 @@ fn write_mask(role: Role) -> u32 {
         Role::LibraryDirectory => {
             COMMON_WRITE | FILE_DELETE_CHILD | FILE_WRITE_DATA | FILE_APPEND_DATA
         }
-        Role::Library | Role::NamingFile | Role::Link => {
-            COMMON_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA
-        }
+        Role::Library | Role::NamingFile => COMMON_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA,
+        Role::Link => COMMON_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_ATTRIBUTES,
     }
 }
 
@@ -111,13 +112,15 @@ pub(super) fn reasons(
 }
 
 #[cfg(windows)]
-pub(super) use probe::{WindowsProbe, current_user_sid};
+pub(super) use probe::WindowsProbe;
+#[cfg(all(windows, any(test, debug_assertions)))]
+pub(super) use probe::current_user_sid;
 
 #[cfg(windows)]
 mod probe {
     use std::{
         io,
-        os::windows::{ffi::OsStrExt, fs::MetadataExt},
+        os::windows::ffi::OsStrExt,
         path::Path,
         ptr::{addr_of, null, null_mut},
         slice,
@@ -129,15 +132,13 @@ mod probe {
             Security::{
                 ACCESS_ALLOWED_ACE, ACE_HEADER, ACL,
                 Authorization::{ConvertSidToStringSidW, GetSecurityInfo, SE_FILE_OBJECT},
-                DACL_SECURITY_INFORMATION, GetAce, GetTokenInformation, OWNER_SECURITY_INFORMATION,
-                PSECURITY_DESCRIPTOR, PSID, TOKEN_QUERY, TOKEN_USER, TokenUser,
+                DACL_SECURITY_INFORMATION, GetAce, OWNER_SECURITY_INFORMATION,
+                PSECURITY_DESCRIPTOR, PSID,
             },
             Storage::FileSystem::{
-                CreateFileW, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
-                FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-                OPEN_EXISTING, READ_CONTROL,
+                CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+                FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, READ_CONTROL,
             },
-            System::Threading::{GetCurrentProcess, OpenProcessToken},
         },
         core::PWSTR,
     };
@@ -152,8 +153,9 @@ mod probe {
     impl Probe for WindowsProbe {
         fn inspect(&self, path: &Path, role: Role) -> io::Result<Inspected> {
             let meta = std::fs::symlink_metadata(path)?;
-            // Symbolic links and junctions are both reparse points.
-            let kind = if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            // Symbolic links and junctions (name-surrogate reparse points). Other reparse points,
+            // such as deduplicated or cloud placeholder files, are the files they stand for.
+            let kind = if meta.file_type().is_symlink() {
                 Kind::Link
             } else if meta.is_dir() {
                 Kind::Dir
@@ -318,7 +320,13 @@ mod probe {
     }
 
     /// The user SID text of the current process token.
+    #[cfg(any(test, debug_assertions))]
     pub(in crate::writability) fn current_user_sid() -> io::Result<String> {
+        use windows_sys::Win32::{
+            Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser},
+            System::Threading::{GetCurrentProcess, OpenProcessToken},
+        };
+
         let mut raw: HANDLE = null_mut();
         // SAFETY: the pseudo handle of the current process is valid, and `raw` is a valid out
         // pointer.

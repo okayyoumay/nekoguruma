@@ -65,6 +65,11 @@ pub enum Reason {
     /// The path is relative, so what it names depends on the working directory.
     #[error("the path is not absolute")]
     NotAbsolute,
+    /// The path, or on Windows a link target met while resolving it, contains a `..`
+    /// component. Windows removes those by text before following links, so the walk could check
+    /// a different file than the one loaded.
+    #[error("contains a `..` component")]
+    ParentComponent,
     /// The path does not end at a regular file.
     #[error("not a regular file")]
     NotARegularFile,
@@ -323,17 +328,15 @@ impl Walker<'_> {
             self.report(path, leaf_role, Reason::NotAbsolute);
             return;
         }
+        if path.components().any(|c| c == Component::ParentDir) {
+            self.report(path, leaf_role, Reason::ParentComponent);
+            return;
+        }
+        let container = Role::Directory;
         let mut pending = items(path);
         let mut current = PathBuf::new();
         let mut hops = 0usize;
         while let Some(item) = pending.pop_front() {
-            // The directory whose next entry is the leaf is the leaf's own directory.
-            let next_is_leaf = pending.len() == 1 && matches!(pending[0], Item::Name(_));
-            let container = if next_is_leaf {
-                dir_role
-            } else {
-                Role::Directory
-            };
             match item {
                 Item::Prefix(p) => current = PathBuf::from(p),
                 Item::Root => {
@@ -354,6 +357,11 @@ impl Walker<'_> {
                 Item::Name(name) => {
                     let candidate = current.join(name);
                     let last = pending.is_empty();
+                    // The directory that holds the final name, however the walk reached it
+                    // (through `..` in a link target, say), is the leaf's own directory.
+                    if last && self.inspect(&current, dir_role).is_none() {
+                        return;
+                    }
                     let Some(kind) =
                         self.inspect(&candidate, if last { leaf_role } else { container })
                     else {
@@ -373,6 +381,12 @@ impl Walker<'_> {
                                     return;
                                 }
                             };
+                            if cfg!(windows)
+                                && target.components().any(|c| c == Component::ParentDir)
+                            {
+                                self.report(&candidate, Role::Link, Reason::ParentComponent);
+                                return;
+                            }
                             // A relative target starts in the link's directory (`current`).
                             let mut expanded = items(&target);
                             expanded.append(&mut pending);
@@ -397,6 +411,8 @@ impl Walker<'_> {
                 }
             }
         }
+        // The walk ended on a root or a `..` of a link target, not on a file name.
+        self.report(path, leaf_role, Reason::NotARegularFile);
     }
 }
 

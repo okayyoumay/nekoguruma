@@ -37,7 +37,11 @@ systems:
    rights on Windows. The library's own directory gets no such allowance, since a planted
    sibling library is the sideloading path.
 4. **Links are followed component by component**, with a hop limit: the link entry is checked
-   for its owner, its target for everything. A relative path, a null DACL, an access-control
+   for its owner, its target for everything. The library-directory rule goes to the directory
+   that holds the final file name as the walk reaches it, not to the lexical parent of the given
+   path. A `..` in the given path is a finding, and on Windows also in a link target, because
+   Windows removes `..` by text before following links, so the walk could otherwise check another
+   file than the one loaded. A relative path, a null DACL, an access-control
    entry of a type the check does not know and security information that cannot be read are
    findings; deny entries are ignored, which can only make the check stricter than Windows is.
 5. **The check reports and the caller decides.** It returns every finding (path, role, reason)

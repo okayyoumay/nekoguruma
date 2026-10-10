@@ -413,3 +413,19 @@ fn a_registry_hit_maps_to_a_resolved() {
     assert_eq!(resolved.definition.long_size, None);
     assert!(resolved.definition.search_paths.is_empty());
 }
+
+#[test]
+fn naming_files_of_a_definition_and_of_the_registry() {
+    let definition = Definition::parse(&minimal("x")).unwrap();
+    let file = abs("x.toml");
+    let from_file = Resolved {
+        definition: definition.clone(),
+        source: Source::Definition(file.clone()),
+    };
+    assert_eq!(from_file.naming_files(), [file]);
+    let from_registry = Resolved {
+        definition,
+        source: Source::Registry,
+    };
+    assert!(from_registry.naming_files().is_empty());
+}

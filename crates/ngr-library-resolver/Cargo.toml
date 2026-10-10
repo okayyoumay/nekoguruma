@@ -12,8 +12,20 @@ toml = { workspace = true }
 tracing = { workspace = true }
 vci-service-config = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# windows-sys serves the 7.2 writability check: file security descriptors (owner and DACL), the
+# current process token, and the SID text form.
 [target.'cfg(windows)'.dependencies]
 j2534-0404-registry = { workspace = true }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 tempfile = "3"

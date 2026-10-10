@@ -22,7 +22,8 @@ The rest of this document describes the `j2534_0404` module; the names below are
 
 - In scope: reading Linux J2534 definition files, validating them, matching a VCI name, and on
   Windows looking the name up in the registry (through `j2534-0404-registry`).
-- Not in scope yet: the writability and signer checks of 7.2, and the callers (`j2534-0404-service`,
+- Also in scope: the writability check of 7.2 (below), standard-independent and at the crate root.
+- Not in scope yet: the signer check of 7.2, and the callers (`j2534-0404-service`,
   `agent`, `vci-discovery`) still use their own lookups.
 
 ## Definition files (non-Windows)
@@ -95,3 +96,58 @@ Windows). A caller that needs both views, such as the agent choosing a worker bu
 `resolve_on_registry(name, mode)` per view; mode `All` returns the first hit and does not detect a
 name present in both views. A hit carries the name and library path only (protocols, `LongSize` and search
 paths are empty), with `Source::Registry`. The registry value is not checked for being absolute.
+
+## Writability check (design 7.2)
+
+ADR-270 is the decision record. The check answers one question before a library is loaded: can a
+regular user change the library, or anything that decides which file is loaded?
+
+```rust
+check_writability(library, &resolved.naming_files())?;             // Policy::system()
+check_writability_with(library, &naming_files, &policy)?;           // explicit policy
+```
+
+`Resolved::naming_files()` is the definition file for `Source::Definition` and empty for
+`Source::Registry` (HKLM is trusted by premise, 7.2). The result is `Err(WritabilityError)` with
+every `Finding { path, role, reason }` found, one per line in its `Display`; the check does not stop
+at the first. The caller decides what a finding means: device mode refuses the library, user mode
+warns.
+
+**What is checked.** The library (it must end at a regular file), its own directory, every further
+ancestor up to the root, each naming file and each of its ancestors. A relative path is a finding
+(`NotAbsolute`) and is not walked, and so is a path with a `..` component (`ParentComponent`). The
+walk goes component by component from the root without following links silently: a symbolic link
+or junction (on Windows, a name-surrogate reparse point; other reparse points such as
+deduplicated files count as the file itself) is an entry of its own (`Role::Link`), then its target
+is walked the same way; more than 40 links in one path is `TooManyLinks`. On Windows a link target
+with a `..` is also `ParentComponent`, since Windows removes `..` by text and the walk could check
+another file than the one loaded. The library-directory rule applies to the directory that holds
+the final file name as reached, so a link target such as `../lib.so` cannot route around it. A walk
+that ends on a root rather than a file name is `NotARegularFile`. A directory reached by several walks is reported once, with the stricter
+role (`LibraryDirectory` over `Directory`). A path that cannot be inspected is an `Io` finding.
+
+**Policy.** `Policy` is the set of owners trusted to hold write access. `Policy::system()` is uid 0
+on Unix; on Windows SYSTEM, BUILTIN\Administrators and TrustedInstaller. An entry owned by anyone
+else is `UnprivilegedOwner`. `trusting_current_user()` (tests and debug builds only) adds the
+current user for fixtures.
+
+**Unix rule.** Every entry, links included, must be owned by a policy uid. Other entries must have
+neither the group-write nor the other-write bit. A container directory (`Role::Directory`) with the
+sticky bit passes, since others can add to it but not replace what is in it; the library's own
+directory gets no such exception. A link's own mode is ignored. There is no exemption for group 0:
+a POSIX ACL grant shows in the group and mask bits.
+
+**Windows rule.** Owner and DACL are read from the entry itself (opened without following a
+reparse point). A null DACL is `NullDacl`. For each ACE that is not inherit-only, an allow ACE
+(types 0 and 9) whose trustee is outside the policy and whose mask has a write right for the role
+is `WritableByRegularUsers`; deny ACEs are ignored; the OWNER RIGHTS trustee is skipped (the owner
+is checked itself); any other ACE type is treated as a finding. Write rights are data, append,
+delete, change-permissions, take-ownership and the generic write, all and maximum-allowed bits. On a
+link entry, write-attributes also counts.
+For a container directory the file-data and append rights (which mean add-file and
+add-subdirectory there) do not count, matching the sticky container on Unix; for the library's own
+directory they do.
+
+The per-entry rules are pure functions over plain data (owner, permission bits or ACE list, role,
+policy) and are unit-tested on synthetic input on every platform; only the walker's calls into the
+operating system differ.

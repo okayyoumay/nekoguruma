@@ -43,6 +43,19 @@ pub struct Resolved {
     pub source: Source,
 }
 
+impl Resolved {
+    /// The files that named the library and so take part in the 7.2 writability check besides
+    /// the library itself: the definition file for [`Source::Definition`], none for
+    /// [`Source::Registry`] (HKLM is trusted by premise, 7.2). Pass the result to
+    /// [`check_writability`](crate::check_writability).
+    pub fn naming_files(&self) -> Vec<PathBuf> {
+        match &self.source {
+            Source::Definition(path) => vec![path.clone()],
+            Source::Registry => Vec::new(),
+        }
+    }
+}
+
 /// The result of reading a definition directory.
 #[derive(Debug, Default)]
 pub struct Definitions {

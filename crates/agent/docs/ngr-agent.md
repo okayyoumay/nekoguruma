@@ -428,7 +428,7 @@ sent:
     its erase or its recovery-required point, whichever comes first. A crash with its request in
     flight, before that plan's first journaled step, leaves the same journal as a crash at the
     verified plan's end, so the continuation sends it again; from the recovery-required point
-    on, an intent is journaled before each request. For a plan that allows a restart that is the
+    on, the first request gets an intent before it is sent. For a plan that allows a restart that is the
     replay of ADR-273 item 5, and only an `Unsafe` section refuses (`Program::validate` already
     excludes one). For a plan that does not, the window is checked like the primitives outside
     the plans. A plan reached after that one is not looked at: its predecessor's erase journals

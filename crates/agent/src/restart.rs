@@ -138,8 +138,9 @@ pub enum OnSiteReason {
     /// journal the post-transfer steps complete, ADR-271 item 1), so the image is verified, but
     /// the program cannot go on after the plan (ADR-271 item 4, `unsafe_continuation`): the
     /// diagnostic primitive at `pc` may have reached the ECU before the interruption and must not
-    /// be sent again. It is outside every plan's range, or before the erase of the plan that
-    /// begins at this plan's end, and in no section, in one that is not `Safe`, or in one marked
+    /// be sent again. It is outside every plan's range, or in the plan that begins at this plan's
+    /// end, before its erase or its recovery-required point, whichever comes first, and in no
+    /// section, in one that is not `Safe`, or in one marked
     /// `RecoveryRequired` (for that next plan, when it allows a restart, only under an `Unsafe`
     /// section). Nothing after the verification was sent.
     /// `teardown` and `confirmed` are as for [`OnSiteReason::RestartOrderUnavailable`].
@@ -1284,11 +1285,15 @@ fn recovery_required(program: &Program, at: StepRef) -> Option<OnSiteReason> {
 /// - one in the window of the plan that begins at `verified`'s `post_transfer_end_pc`, from its
 ///   `entry_pc` up to its `erase_pc` or its recovery-required point, whichever comes first. A
 ///   crash with such a request in flight, before that plan's first journaled step, leaves the
-///   same journal as a crash at `verified`'s end, so the continuation runs it again; from the
-///   recovery-required point on, an intent is journaled before each request. For a plan that
-///   allows a restart, that is the replay of ADR-273 item 5, and only an `Unsafe` section
-///   refuses (`Program::validate` already excludes one there). For a plan that does not, no
-///   replay is ever sanctioned, and the window is checked like the primitives outside the plans.
+///   same journal as a crash at `verified`'s end, so the continuation runs it again; the first
+///   request at or after the recovery-required point gets an intent before it is sent, which
+///   places any later interruption past that point. For a plan that allows a restart, that is
+///   the replay of ADR-273 item 5, and only an `Unsafe` section refuses; `Program::validate`
+///   already excludes one there, so for a validated program this branch never refuses. For a
+///   plan that does not, no replay is ever sanctioned, and the window is checked like the
+///   primitives outside the plans. The whole window is checked, although a crash after its first
+///   completed primitive is journaled and no longer reaches the continuation: the check stays
+///   static, and refuses on the safe side.
 ///
 /// A later plan reached through that plan is not looked at: its erase commits a transfer-start
 /// marker first, so an interruption there restarts that plan, not `verified`.

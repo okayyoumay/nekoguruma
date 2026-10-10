@@ -173,8 +173,12 @@ A restart's entry state is the newest state the journal holds if it stands at th
 run start included, so a plain start never inherits an earlier run's state). It is the state before
 the newest only when the newest stands at the plan's post-transfer end (the state of ADR-271 item
 2), is the current attempt's end-state record (the transfer's last post-transfer step is the step
-that carries it) and the interruption point is that same step, so a journal cut after the end
-state, or a crash after the completion, still redoes the transfer (ADR-274). Any other newest
+that carries it) and the interruption point is that same step (no later step or request marker;
+the completion and a resume record may follow). So after a journal cut after the end state, or a
+crash after the completion, the entry state stays available whenever classification allows a
+restart and the state check calls for a redo; when it finds the intended version with the steps
+complete it decides the read-back verification instead (ADR-271), which resumes from the end state
+(ADR-274). Any other newest
 state that does not stand at the entry gives `OnSiteInterventionRequired` (`MissingEntryState`);
 for adjacent plans, a crash after the first plan's completion with a pre-erase primitive of the
 second journaled is refused (ADR-253). The journal keeps those two states only, and

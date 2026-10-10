@@ -33,7 +33,8 @@ Three things complicate that:
    this.** It is the newest state if that stands at the plan's entry. It is the state before the
    newest only when the newest stands at the plan's end, is the current attempt's end-state record
    (the transfer's last post-transfer step is the step that carries it), and the interruption
-   point is that same step, so nothing was journaled after it. Any other newest state that is
+   point is that same step, so no later step or request marker was journaled (the completion and
+   a resume record may follow, since neither moves the interruption point). Any other newest state that is
    not at the entry gives `OnSiteReason::MissingEntryState`. ADR-253's refusal of adjacent plans
    stays: plan 1 complete, a pre-erase primitive of plan 2 journaled, then a crash, is on-site
    intervention. The invariant that two states suffice: at most one end state follows a pass's

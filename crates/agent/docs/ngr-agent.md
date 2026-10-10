@@ -417,19 +417,22 @@ When `restart::check_state` decides `ReadBackVerification`, the match is the ver
 items 3 to 5): no erase and no ECUReset are sent for the verified plan. Before anything else is
 sent:
 
-- `restart::unsafe_outside_plans` looks at two kinds of diagnostic primitive, statically over
-  the whole program; sections may overlap, and every section that covers a primitive counts:
+- `restart::unsafe_continuation` looks at two kinds of diagnostic primitive; sections may
+  overlap, and every section that covers a primitive counts:
   - one outside all of the program's plan ranges (`entry_pc` up to, not including,
-    `post_transfer_end_pc`). The journal records no step there, so it may have reached the ECU
-    before the interruption. It must lie in a section, and every section over it must be `Safe`
-    and none marked `RecoveryRequired`, since the journal cannot rule out that the interruption
-    was there;
-  - one in the pre-erase range (`entry_pc` up to, not including, `erase_pc`) of a plan that
-    begins at another plan's end. A crash with its request in flight, before that plan's first
-    journaled step, leaves the same journal as a crash at the first plan's end, so the
-    continuation sends it again, as a redo's replay would (ADR-273 item 5): only an `Unsafe`
-    section over it refuses. `Program::validate` refuses one only in a plan that allows a
-    restart.
+    `post_transfer_end_pc`), statically over the whole program. The journal records no step
+    there, so it may have reached the ECU before the interruption. It must lie in a section,
+    and every section over it must be `Safe` and none marked `RecoveryRequired`, since the
+    journal cannot rule out that the interruption was there;
+  - one in the window of the plan that begins at the verified plan's end: from its entry up to
+    its erase or its recovery-required point, whichever comes first. A crash with its request in
+    flight, before that plan's first journaled step, leaves the same journal as a crash at the
+    verified plan's end, so the continuation sends it again; from the recovery-required point
+    on, an intent is journaled before each request. For a plan that allows a restart that is the
+    replay of ADR-273 item 5, and only an `Unsafe` section refuses (`Program::validate` already
+    excludes one). For a plan that does not, the window is checked like the primitives outside
+    the plans. A plan reached after that one is not looked at: its predecessor's erase journals
+    a transfer first, so an interruption there restarts that plan.
 
   The first primitive that fails ends the job in
   `OnSiteInterventionRequired(UnsafeContinuation { flash_session, pc, teardown, confirmed })`.

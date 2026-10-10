@@ -278,8 +278,8 @@ pub async fn run_program_journaled(
 ///   check decides the read-back verification instead, the match is the verification
 ///   (ADR-271): the program goes on from the VM state journaled at the plan's end and runs to
 ///   its end as a first run would, with no erase and no ECUReset for the verified plan, and the
-///   job ends as that run does. A program with a diagnostic primitive outside its plans that
-///   is not in a `Safe` section ends in [`JobError::OnSiteInterventionRequired`]
+///   job ends as that run does. A program whose continuation could send a request again
+///   unsafely (`restart::unsafe_continuation`) ends in [`JobError::OnSiteInterventionRequired`]
 ///   (`UnsafeContinuation`), and a journal with no usable end state in the same error
 ///   (`MissingPlanEndState`), both with nothing sent after the verification;
 /// - a journal that rules a restart out, or a missing or unreadable one for a program with a
@@ -730,8 +730,9 @@ where
 /// VM state journaled at `plan`'s end (`restart::plan_end_state`) to the program's end, as a
 /// first run would and with its journaling, so a later plan or a final reset runs as on a first
 /// run. It commits no run start (ADR-274 item 4): a run start that is not at the entry would
-/// leave a later redo of this plan without its entry state. Before anything is sent, a program
-/// with a diagnostic primitive outside its plans that is not in a `Safe` section ends in
+/// leave a later redo of this plan without its entry state. A cancel that arrived before ends
+/// the job in [`JobError::Cancelled`]. Then, before anything is sent, a program whose
+/// continuation could send a request again unsafely (`restart::unsafe_continuation`) ends in
 /// [`OnSiteReason::UnsafeContinuation`], and a journal with no usable state at the plan's end in
 /// [`OnSiteReason::MissingPlanEndState`]; both say the image is verified. The latter also covers
 /// a redo whose replay committed only its run start before a crash: the earlier pass is still
@@ -761,7 +762,7 @@ where
         return Err(JobError::Cancelled);
     }
     let flash_session = plan.flash_session;
-    if let Some(pc) = restart::unsafe_outside_plans(program) {
+    if let Some(pc) = restart::unsafe_continuation(program, plan) {
         return Err(JobError::OnSiteInterventionRequired(
             OnSiteReason::UnsafeContinuation {
                 flash_session,
@@ -6603,18 +6604,70 @@ mod tests {
         }
     }
 
-    /// The pc of the routine in the second plan's pre-erase range in [`adjacent_with_setup`].
+    /// Appends a plan to `program` (`session`, stage `session + 6`) whose pre-erase range holds a
+    /// push, a setup routine `routine` and a pop, so the routine is at its entry plus one and its
+    /// erase at its entry plus three. It begins right after the code so far. With `from`, it
+    /// becomes recovery-required that many instructions after its entry, so it allows no restart
+    /// for `from <= 3`; without, it allows one. Gives the new plan's entry.
+    fn append_plan_with_setup(
+        program: &mut Program,
+        session: u32,
+        routine: u16,
+        from: Option<u32>,
+    ) -> u32 {
+        let source = flash_program_around(
+            Vec::new(),
+            vec![
+                Op::PushBytes(0),
+                Op::RoutineControl { routine, sub: 1 },
+                Op::Pop,
+            ],
+        );
+        let shift = program.code.len() as u32 - ENTRY;
+        program
+            .code
+            .extend(source.code[ENTRY as usize..].iter().cloned());
+        let mut plan = source.flash[0].clone();
+        plan.flash_session = session;
+        plan.stage = session + 6;
+        let b = &mut plan.boundaries;
+        b.entry_pc += shift;
+        b.erase_pc += shift;
+        b.transfer_exit_pc += shift;
+        b.post_transfer_end_pc += shift;
+        let entry = b.entry_pc;
+        if let Some(from) = from {
+            plan.recovery_required = diag_ir::RecoveryRequired::FromPc(entry + from);
+        }
+        program.flash.push(plan);
+        entry
+    }
+
+    fn section_over(
+        start_pc: u32,
+        end_pc: u32,
+        idempotency: diag_ir::Idempotency,
+    ) -> diag_ir::Section {
+        diag_ir::Section {
+            start_pc,
+            end_pc,
+            interruptible: diag_ir::Interruptible::Yes,
+            idempotency,
+            expected_millis: 0,
+        }
+    }
+
+    /// The pc of the setup routine of the second plan in [`adjacent_with_setup`].
     fn adjacent_setup_routine(program: &Program) -> u32 {
         program.flash[1].boundaries.entry_pc + 1
     }
 
-    /// [`flash_program`] with a second plan after it (session 2, stage 8) whose pre-erase range
-    /// holds a setup routine 0xFF05. The second plan begins at the first one's end unless `gap`
-    /// puts a push and a pop between them. It allows a restart when `restartable`, and otherwise
-    /// becomes recovery-required at its erase; `section` covers the setup routine. The code
-    /// before the first plan is `Safe`.
+    /// [`flash_program`] followed by a plan from [`append_plan_with_setup`] (session 2, routine
+    /// 0xFF05, recovery-required at `from`), which begins at the first plan's end unless `gap`
+    /// puts a push and a pop between them; `section` covers its setup routine. The code before
+    /// the first plan, and any gap, is `Safe`.
     fn adjacent_with_setup(
-        restartable: bool,
+        from: Option<u32>,
         gap: bool,
         section: Option<diag_ir::Idempotency>,
     ) -> Program {
@@ -6622,80 +6675,124 @@ mod tests {
         if gap {
             program.code.extend([Op::PushBytes(0), Op::Pop]);
         }
-        let second_source = flash_program_around(
-            Vec::new(),
-            vec![
-                Op::PushBytes(0),
-                Op::RoutineControl {
-                    routine: 0xFF05,
-                    sub: 1,
-                },
-                Op::Pop,
-            ],
-        );
-        let shift = program.code.len() as u32 - ENTRY;
+        let entry = append_plan_with_setup(&mut program, 2, 0xFF05, from);
+        let first_entry = program.flash[0].boundaries.entry_pc;
         program
-            .code
-            .extend(second_source.code[ENTRY as usize..].iter().cloned());
-        let mut second = second_source.flash[0].clone();
-        second.flash_session = 2;
-        second.stage = 8;
-        let b = &mut second.boundaries;
-        b.entry_pc += shift;
-        b.erase_pc += shift;
-        b.transfer_exit_pc += shift;
-        b.post_transfer_end_pc += shift;
-        if !restartable {
-            second.recovery_required = diag_ir::RecoveryRequired::FromPc(b.erase_pc);
-        }
-        program.flash.push(second);
-        let mut program = safe_outside_the_plan(program);
-        // `safe_outside_the_plan` covers from the first plan's end to the end of the code; keep
-        // only what lies between the plans.
-        program.sections[1].end_pc = program.flash[1].boundaries.entry_pc;
-        program.sections.retain(|s| s.start_pc < s.end_pc);
+            .sections
+            .push(section_over(0, first_entry, diag_ir::Idempotency::Safe));
         if let Some(idempotency) = section {
-            let routine = adjacent_setup_routine(&program);
-            program.sections.push(diag_ir::Section {
-                start_pc: routine,
-                end_pc: routine + 1,
-                interruptible: diag_ir::Interruptible::Yes,
-                idempotency,
-                expected_millis: 0,
-            });
+            program
+                .sections
+                .push(section_over(entry + 1, entry + 2, idempotency));
         }
         program.validate().expect("the fixture is a valid program");
         program
     }
 
-    /// The pre-erase range of a plan that begins at another plan's end: only an `Unsafe` section
-    /// over a primitive there refuses the continuation, as it would refuse a redo's replay
-    /// (ADR-273 item 5). With a gap between the plans the later plan's own journaling guards it.
+    /// The window of the plan that begins at the verified plan's end. For a plan that allows no
+    /// restart, it is checked like the code outside the plans: a `CheckState` section, or none,
+    /// refuses as an `Unsafe` one does. For a plan that allows one, only an `Unsafe` section would
+    /// (the replay of ADR-273 item 5), which `Program::validate` already refuses. With a gap
+    /// between the plans the later plan's own journaling guards it.
     #[test]
-    fn an_adjacent_plans_pre_erase_range_refuses_only_an_unsafe_section() {
-        let unsafe_adjacent = adjacent_with_setup(false, false, Some(diag_ir::Idempotency::Unsafe));
-        assert_eq!(
-            restart::unsafe_outside_plans(&unsafe_adjacent),
-            Some(adjacent_setup_routine(&unsafe_adjacent))
-        );
-        for (name, program) in [
+    fn the_next_plans_window_is_checked_by_whether_it_allows_a_restart() {
+        use diag_ir::Idempotency::{CheckState, Safe, Unsafe};
+        for (name, program, refused) in [
             (
-                "CheckState",
-                adjacent_with_setup(false, false, Some(diag_ir::Idempotency::CheckState)),
+                "no restart, Unsafe",
+                adjacent_with_setup(Some(3), false, Some(Unsafe)),
+                true,
             ),
-            ("no section", adjacent_with_setup(true, false, None)),
+            (
+                "no restart, CheckState",
+                adjacent_with_setup(Some(3), false, Some(CheckState)),
+                true,
+            ),
+            (
+                "no restart, no section",
+                adjacent_with_setup(Some(3), false, None),
+                true,
+            ),
+            (
+                "no restart, Safe",
+                adjacent_with_setup(Some(3), false, Some(Safe)),
+                false,
+            ),
+            (
+                "restart, CheckState",
+                adjacent_with_setup(None, false, Some(CheckState)),
+                false,
+            ),
+            (
+                "restart, no section",
+                adjacent_with_setup(None, false, None),
+                false,
+            ),
             (
                 "not adjacent",
-                adjacent_with_setup(false, true, Some(diag_ir::Idempotency::Unsafe)),
+                adjacent_with_setup(Some(3), true, Some(Unsafe)),
+                false,
             ),
         ] {
-            assert_eq!(restart::unsafe_outside_plans(&program), None, "{name}");
+            let expected = refused.then(|| adjacent_setup_routine(&program));
+            assert_eq!(
+                restart::unsafe_continuation(&program, &program.flash[0]),
+                expected,
+                "{name}"
+            );
         }
+    }
+
+    /// The window ends at the next plan's recovery-required point when that comes before its
+    /// erase, since an intent is journaled before each request from there on; and at its erase
+    /// otherwise, so the erase itself, in no section, is not looked at.
+    #[test]
+    fn the_next_plans_window_ends_at_its_recovery_point_or_its_erase() {
+        // Recovery-required at the setup routine: the routine is protected by its intent.
+        let at_routine = adjacent_with_setup(Some(1), false, None);
+        assert_eq!(
+            restart::unsafe_continuation(&at_routine, &at_routine.flash[0]),
+            None
+        );
+        // Recovery-required at the erase, the routine `Safe`: the unsectioned erase is outside
+        // the window.
+        let safe_routine = adjacent_with_setup(Some(3), false, Some(diag_ir::Idempotency::Safe));
+        let erase = safe_routine.flash[1].boundaries.erase_pc;
+        assert!(safe_routine.code[erase as usize].is_diagnostic_primitive());
+        assert_eq!(
+            restart::unsafe_continuation(&safe_routine, &safe_routine.flash[0]),
+            None
+        );
+    }
+
+    /// Only the plan that begins at the verified plan's end is looked at: in a chain of three, a
+    /// third plan allowing no restart with an unsectioned setup routine refuses the second plan's
+    /// continuation, not the first's, since the second plan's erase journals its transfer before
+    /// execution can reach the third.
+    #[test]
+    fn only_the_plan_at_the_verified_plans_end_is_looked_at() {
+        let mut program = flash_program();
+        append_plan_with_setup(&mut program, 2, 0xFF05, None);
+        let third = append_plan_with_setup(&mut program, 3, 0xFF06, Some(3));
+        let first_entry = program.flash[0].boundaries.entry_pc;
+        program
+            .sections
+            .push(section_over(0, first_entry, diag_ir::Idempotency::Safe));
+        program.validate().expect("the fixture is a valid program");
+        assert_eq!(
+            restart::unsafe_continuation(&program, &program.flash[0]),
+            None
+        );
+        assert_eq!(
+            restart::unsafe_continuation(&program, &program.flash[1]),
+            Some(third + 1)
+        );
     }
 
     /// A primitive outside the plans in a `Safe` section marked `RecoveryRequired` refuses the
     /// continuation: the journal cannot rule out that the interruption was there. Another
-    /// interruptibility does not, and a `RecoveryRequired` section inside a plan is not looked at.
+    /// interruptibility does not, and a `RecoveryRequired` section over a plan's post-transfer
+    /// steps (from its recovery-required point) is not looked at.
     #[test]
     fn a_recovery_required_section_outside_the_plans_refuses_the_continuation() {
         let program = safe_outside_the_plan(completed_path_program());
@@ -6703,41 +6800,45 @@ mod tests {
         let with = |interruptible| {
             let mut program = program.clone();
             program.sections.push(diag_ir::Section {
-                start_pc: routine,
-                end_pc: routine + 1,
                 interruptible,
-                idempotency: diag_ir::Idempotency::Safe,
-                expected_millis: 0,
+                ..section_over(routine, routine + 1, diag_ir::Idempotency::Safe)
             });
             program
         };
+        let refused = with(diag_ir::Interruptible::RecoveryRequired);
         assert_eq!(
-            restart::unsafe_outside_plans(&with(diag_ir::Interruptible::RecoveryRequired)),
+            restart::unsafe_continuation(&refused, &refused.flash[0]),
             Some(routine)
         );
+        let allowed = with(diag_ir::Interruptible::No);
         assert_eq!(
-            restart::unsafe_outside_plans(&with(diag_ir::Interruptible::No)),
+            restart::unsafe_continuation(&allowed, &allowed.flash[0]),
             None
         );
-        let mut inside = program.clone();
+        let (mut inside, check) = program_with_check(diag_ir::RecoveryRequired::FromPc(EXIT + 3));
+        let b = inside.flash[0].boundaries;
+        inside
+            .sections
+            .push(section_over(0, b.entry_pc, diag_ir::Idempotency::Safe));
         inside.sections.push(diag_ir::Section {
-            start_pc: program.flash[0].boundaries.entry_pc,
-            end_pc: program.flash[0].boundaries.post_transfer_end_pc,
             interruptible: diag_ir::Interruptible::RecoveryRequired,
-            idempotency: diag_ir::Idempotency::Safe,
-            expected_millis: 0,
+            ..section_over(check, b.post_transfer_end_pc, diag_ir::Idempotency::Safe)
         });
-        assert_eq!(restart::unsafe_outside_plans(&inside), None);
+        inside.validate().expect("a valid program");
+        assert_eq!(
+            restart::unsafe_continuation(&inside, &inside.flash[0]),
+            None
+        );
     }
 
-    /// End to end: a first run that loses the answer to the later plan's setup routine, before
-    /// any step of that plan is journaled, then a restart that reads back the first plan. Under an
-    /// `Unsafe` section the continuation is refused with nothing sent after the verification;
-    /// unsectioned in a plan that allows a restart, the continuation sends the routine again and
-    /// runs the later plan to its end, journaled as a first run.
+    /// End to end: a first run that loses the answer to the next plan's setup routine, before
+    /// any step of that plan is journaled, then a restart that reads back the first plan. When the
+    /// next plan allows no restart, a `CheckState` setup routine (a write whose answer was lost)
+    /// is refused with nothing sent after the verification. When it allows one, the unsectioned
+    /// routine is sent again and the next plan runs to its end, journaled as a first run.
     #[test]
-    fn a_crash_before_an_adjacent_plans_first_step_continues_only_when_safe_to_replay() {
-        let refused = adjacent_with_setup(false, false, Some(diag_ir::Idempotency::Unsafe));
+    fn a_crash_before_the_next_plans_first_step_continues_only_when_safe_to_repeat() {
+        let refused = adjacent_with_setup(Some(3), false, Some(diag_ir::Idempotency::CheckState));
         let dir = journal_dir("continue-adjacent-unsafe");
         first_run_intending(&refused, &dir, |host| host.lose_routine = Some(0xFF05));
         let (result, host) = restart_intending(&refused, &dir, |host| {
@@ -6757,7 +6858,7 @@ mod tests {
         assert_eq!(full_log(&host), verification_reads());
         std::fs::remove_dir_all(&dir).unwrap();
 
-        let replayed = adjacent_with_setup(true, false, None);
+        let replayed = adjacent_with_setup(None, false, None);
         let dir = journal_dir("continue-adjacent-safe");
         first_run_intending(&replayed, &dir, |host| host.lose_routine = Some(0xFF05));
         let (result, host) = restart_intending(&replayed, &dir, |host| {
@@ -6853,13 +6954,16 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// `restart::unsafe_outside_plans` looks only at diagnostic primitives outside the plans, and
+    /// `restart::unsafe_continuation` looks only at diagnostic primitives outside the plans, and
     /// needs every section that covers one to be `Safe`: an overlapping `CheckState` section makes
     /// a primitive in a `Safe` one unsafe.
     #[test]
     fn every_section_over_a_primitive_outside_the_plans_must_be_safe() {
         let program = safe_outside_the_plan(completed_path_program());
-        assert_eq!(restart::unsafe_outside_plans(&program), None);
+        assert_eq!(
+            restart::unsafe_continuation(&program, &program.flash[0]),
+            None
+        );
         // A section over the plan's own primitives changes nothing: they are not looked at.
         let mut inside = program.clone();
         inside.sections.push(diag_ir::Section {
@@ -6869,7 +6973,10 @@ mod tests {
             idempotency: diag_ir::Idempotency::CheckState,
             expected_millis: 0,
         });
-        assert_eq!(restart::unsafe_outside_plans(&inside), None);
+        assert_eq!(
+            restart::unsafe_continuation(&inside, &inside.flash[0]),
+            None
+        );
         // A `CheckState` section over the session change before the plan, overlapping the
         // `Safe` one there.
         let mut overlapping = program.clone();
@@ -6880,12 +6987,18 @@ mod tests {
             idempotency: diag_ir::Idempotency::CheckState,
             expected_millis: 0,
         });
-        assert_eq!(restart::unsafe_outside_plans(&overlapping), Some(1));
+        assert_eq!(
+            restart::unsafe_continuation(&overlapping, &overlapping.flash[0]),
+            Some(1)
+        );
         // A section that leaves the push before the session change out changes nothing either:
         // a push is no primitive.
         let mut narrower = program.clone();
         narrower.sections[0].start_pc = 1;
-        assert_eq!(restart::unsafe_outside_plans(&narrower), None);
+        assert_eq!(
+            restart::unsafe_continuation(&narrower, &narrower.flash[0]),
+            None
+        );
         // A log after the plan, in no section, is a primitive like any other.
         let mut logged = program;
         let log_pc = logged.code.len() as u32;
@@ -6893,7 +7006,10 @@ mod tests {
             level: 0,
             message: 0,
         });
-        assert_eq!(restart::unsafe_outside_plans(&logged), Some(log_pc));
+        assert_eq!(
+            restart::unsafe_continuation(&logged, &logged.flash[0]),
+            Some(log_pc)
+        );
     }
 
     /// A journal whose newest VM state is not at the plan's end gives the continuation nothing to

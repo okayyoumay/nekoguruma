@@ -19,7 +19,7 @@
 //! `check_reentry` checks every declared precondition again before anything is replayed (step 4a,
 //! ADR-229 item 2 step 4); after the replay reached the erase, `check_before_erase` checks them
 //! once more through the programming-session sources (step 4b-3, ADR-245 item 6). When it
-//! decides the read-back verification, `unsafe_outside_plans` and `plan_end_state` decide
+//! decides the read-back verification, `unsafe_continuation` and `plan_end_state` decide
 //! whether the program can go on after the plan (ADR-271 items 4 and 5).
 //!
 //! The interruption point is the latest of the last completed step and the requests the
@@ -136,12 +136,12 @@ pub enum OnSiteReason {
     },
     /// The read-back verification passed (step 3b-2 found the intended software version and the
     /// journal the post-transfer steps complete, ADR-271 item 1), so the image is verified, but
-    /// the program cannot go on after the plan (ADR-271 item 4, `unsafe_outside_plans`): the
+    /// the program cannot go on after the plan (ADR-271 item 4, `unsafe_continuation`): the
     /// diagnostic primitive at `pc` may have reached the ECU before the interruption and must not
-    /// be sent again. It is outside every plan's range and in no section, in one that is not
-    /// `Safe`, or in one marked `RecoveryRequired`; or it is in the pre-erase range of a plan
-    /// that begins at another plan's end, under an `Unsafe` section. Nothing after the
-    /// verification was sent.
+    /// be sent again. It is outside every plan's range, or before the erase of the plan that
+    /// begins at this plan's end, and in no section, in one that is not `Safe`, or in one marked
+    /// `RecoveryRequired` (for that next plan, when it allows a restart, only under an `Unsafe`
+    /// section). Nothing after the verification was sent.
     /// `teardown` and `confirmed` are as for [`OnSiteReason::RestartOrderUnavailable`].
     UnsafeContinuation {
         flash_session: u32,
@@ -1272,28 +1272,56 @@ fn recovery_required(program: &Program, at: StepRef) -> Option<OnSiteReason> {
         .map(|section| OnSiteReason::RecoveryRequiredSection { section, at })
 }
 
-/// The first diagnostic primitive, in pc order, that the continuation after a read-back
-/// verification could send again unsafely (ADR-271 item 4, with its annotations). The check is
-/// static over the whole program, so a jump back to code before a plan is covered too. Sections
-/// may overlap, and every one that covers the primitive counts. `None` when the program can go
-/// on after any of its plans. Two kinds of primitive are looked at:
-/// - one outside every plan's range (`entry_pc` up to, not including, `post_transfer_end_pc`):
-///   the journal records no step there, so it may have reached the ECU before the
-///   interruption. It must be covered, and only by sections that are `Safe` and not marked
-///   `RecoveryRequired`, since the journal cannot rule out that the interruption was there;
-/// - one in the pre-erase range (`entry_pc` up to, not including, `erase_pc`) of a plan that
-///   begins at another plan's `post_transfer_end_pc`: a crash with its request in flight, before
-///   that plan's first journaled step, leaves the same journal as a crash at the first plan's
-///   end, so the continuation runs it again. That is what a redo's replay does to the same
-///   range (ADR-273 item 5), so only an `Unsafe` section over it refuses; `Program::validate`
-///   refuses one only for a plan that allows a restart.
-pub(crate) fn unsafe_outside_plans(program: &Program) -> Option<u32> {
+/// The first diagnostic primitive, in pc order, that the continuation after `verified`'s
+/// read-back verification could send again unsafely (ADR-271 item 4, with its annotations).
+/// Sections may overlap, and every one that covers a primitive counts. `None` when the program
+/// can go on after `verified`. Two kinds of primitive are looked at:
+/// - one outside every plan's range (`entry_pc` up to, not including, `post_transfer_end_pc`),
+///   statically over the whole program, so a jump back to code before a plan is covered too:
+///   the journal records no step there, so it may have reached the ECU before the interruption.
+///   It must be covered, and only by sections that are `Safe` and not marked `RecoveryRequired`,
+///   since the journal cannot rule out that the interruption was there;
+/// - one in the window of the plan that begins at `verified`'s `post_transfer_end_pc`, from its
+///   `entry_pc` up to its `erase_pc` or its recovery-required point, whichever comes first. A
+///   crash with such a request in flight, before that plan's first journaled step, leaves the
+///   same journal as a crash at `verified`'s end, so the continuation runs it again; from the
+///   recovery-required point on, an intent is journaled before each request. For a plan that
+///   allows a restart, that is the replay of ADR-273 item 5, and only an `Unsafe` section
+///   refuses (`Program::validate` already excludes one there). For a plan that does not, no
+///   replay is ever sanctioned, and the window is checked like the primitives outside the plans.
+///
+/// A later plan reached through that plan is not looked at: its erase commits a transfer-start
+/// marker first, so an interruption there restarts that plan, not `verified`.
+pub(crate) fn unsafe_continuation(program: &Program, verified: &FlashRecovery) -> Option<u32> {
     let covering = |pc: u32| {
         program
             .sections
             .iter()
             .filter(move |section| (section.start_pc..section.end_pc).contains(&pc))
     };
+    let not_safe = |pc: u32| {
+        let mut sections = covering(pc).peekable();
+        sections.peek().is_none()
+            || sections.any(|section| {
+                !matches!(section.idempotency, Idempotency::Safe)
+                    || matches!(section.interruptible, Interruptible::RecoveryRequired)
+            })
+    };
+    let end = verified.boundaries.post_transfer_end_pc;
+    let next = program
+        .flash
+        .iter()
+        .find(|plan| plan.boundaries.entry_pc == end)
+        .map(|plan| {
+            let from = match plan.recovery_required {
+                RecoveryRequired::Never => plan.boundaries.post_transfer_end_pc,
+                RecoveryRequired::FromPc(pc) => pc,
+            };
+            (
+                plan,
+                plan.boundaries.entry_pc..from.min(plan.boundaries.erase_pc),
+            )
+        });
     (0..program.code.len() as u32).find(|&pc| {
         if !program.code[pc as usize].is_diagnostic_primitive() {
             return false;
@@ -1302,22 +1330,18 @@ pub(crate) fn unsafe_outside_plans(program: &Program) -> Option<u32> {
             (plan.boundaries.entry_pc..plan.boundaries.post_transfer_end_pc).contains(&pc)
         });
         if !in_plan {
-            let mut sections = covering(pc).peekable();
-            return sections.peek().is_none()
-                || sections.any(|section| {
-                    !matches!(section.idempotency, Idempotency::Safe)
-                        || matches!(section.interruptible, Interruptible::RecoveryRequired)
-                });
+            return not_safe(pc);
         }
-        let adjacent_pre_erase = program.flash.iter().any(|later| {
-            (later.boundaries.entry_pc..later.boundaries.erase_pc).contains(&pc)
-                && program.flash.iter().any(|earlier| {
-                    earlier.flash_session != later.flash_session
-                        && earlier.boundaries.post_transfer_end_pc == later.boundaries.entry_pc
-                })
-        });
-        adjacent_pre_erase
-            && covering(pc).any(|section| matches!(section.idempotency, Idempotency::Unsafe))
+        match &next {
+            Some((plan, window)) if window.contains(&pc) => {
+                if plan.allows_restart() {
+                    covering(pc).any(|section| matches!(section.idempotency, Idempotency::Unsafe))
+                } else {
+                    not_safe(pc)
+                }
+            }
+            _ => false,
+        }
     })
 }
 

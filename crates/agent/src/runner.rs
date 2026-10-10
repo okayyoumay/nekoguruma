@@ -1737,7 +1737,8 @@ mod tests {
         // Commits: 1 the run start, 2 the step into the entry with the VM state, 3 the hardware
         // part number, 4 the software version, 5 the transfer start, 6 the erase's step, 7 the
         // RequestDownload's step, 8-13 each block and its step, 14 the exit marker, 15
-        // RequestTransferExit's step, 16 the completion.
+        // RequestTransferExit's step, 16 the Pop's step after it, which reaches the plan's end and
+        // carries the VM state, 17 the completion.
         assert_eq!(
             host.log,
             [
@@ -1752,7 +1753,7 @@ mod tests {
                 (Sent::Service(0x37, vec![0x01]), 14),
             ]
         );
-        assert_eq!(commits.get(), 16);
+        assert_eq!(commits.get(), 17);
         let facts = &journal.journal().state().facts;
         let transfer = facts.transfer.as_ref().unwrap();
         assert_eq!(transfer.last_block, Some(3));
@@ -1911,23 +1912,20 @@ mod tests {
             }
         );
         assert!(exit.complete);
-        // The last step is RequestTransferExit's, which counts as post-transfer progress.
-        assert_eq!(
-            facts.last_step,
-            Some(StepRef {
-                pc: EXIT,
-                steps: 16
-            })
-        );
-        assert_eq!(
-            exit.last_post_step,
-            Some(StepRef {
-                pc: EXIT,
-                steps: 16
-            })
-        );
-        // The VM state at the entry, on the step before it.
+        // The last step is the Pop after RequestTransferExit, which reaches the plan's end: it
+        // counts as post-transfer progress and carries the VM state there (ADR-271 item 2).
+        let end_step = StepRef {
+            pc: EXIT + 1,
+            steps: 17,
+        };
+        assert_eq!(facts.last_step, Some(end_step));
+        assert_eq!(exit.last_post_step, Some(end_step));
         let (step, bytes) = state.last_vm_state.as_ref().unwrap();
+        assert_eq!(*step, end_step);
+        let end_state: VmState = postcard::from_bytes(bytes).unwrap();
+        assert_eq!((end_state.pc, end_state.steps), (EXIT + 2, 18));
+        // The VM state at the entry, on the step before it, is the previous one.
+        let (step, bytes) = state.previous_vm_state.as_ref().unwrap();
         assert_eq!(
             *step,
             StepRef {
@@ -2172,8 +2170,8 @@ mod tests {
             Some(&mut journal),
         )
         .unwrap();
-        // The adjacent-plans count (17 + 12) plus one intent per plan.
-        assert_eq!(commits.get(), 17 + 12 + 2);
+        // The adjacent-plans count (17 + 12 + 1) plus one intent per plan.
+        assert_eq!(commits.get(), 17 + 12 + 1 + 2);
         assert_eq!(
             journal.journal().state().facts.last_intent.map(|at| at.pc),
             Some(download + shift)
@@ -2219,14 +2217,24 @@ mod tests {
         assert!(matches!(result, Err(JobError::StepLimit(_))), "{result:?}");
         let facts = &journal.journal().state().facts;
         let exit = facts.transfer.as_ref().unwrap().exit.as_ref().unwrap();
-        assert_eq!(
-            exit.last_post_step,
-            Some(StepRef {
-                pc: check_memory,
-                steps: u64::from(check_memory)
-            })
-        );
+        // The step that reaches the end is the Pop after the check: it is recorded as a step
+        // although it is no primitive, with the VM state at the end (ADR-271 item 2).
+        let end_step = StepRef {
+            pc: end - 1,
+            steps: u64::from(end - 1),
+        };
+        assert_eq!(exit.last_post_step, Some(end_step));
         assert!(exit.complete);
+        let (step, bytes) = journal
+            .journal()
+            .state()
+            .last_vm_state
+            .as_ref()
+            .unwrap()
+            .clone();
+        assert_eq!(step, end_step);
+        let end_state: VmState = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(end_state.pc, end);
     }
 
     /// The software version answered with the plan's declared "no valid application" response
@@ -2333,7 +2341,8 @@ mod tests {
         )
         .unwrap();
         let state = journal.journal().state();
-        let (step, _) = state.last_vm_state.as_ref().unwrap();
+        // The newest state is the plan's end (ADR-271 item 2); the entry's is the one before.
+        let (step, _) = state.previous_vm_state.as_ref().unwrap();
         assert_eq!(
             *step,
             StepRef {
@@ -2378,14 +2387,20 @@ mod tests {
         .unwrap();
         let state = journal.journal().state();
         let initial = postcard::to_allocvec(&Vm::new(&program).state).unwrap();
+        // The newest state is the plan's end (ADR-271 item 2); the run start is the one before,
+        // and no step record carries the entry state.
         assert_eq!(
-            state.last_vm_state,
+            state.previous_vm_state,
             Some((StepRef { pc: 0, steps: 0 }, initial))
         );
+        let (end_step, end_bytes) = state.last_vm_state.as_ref().unwrap();
+        assert_eq!(end_step.pc, EXIT - 3 + 1);
+        let end_state: VmState = postcard::from_bytes(end_bytes).unwrap();
+        assert_eq!(end_state.pc, EXIT - 3 + 2);
         assert_eq!(state.facts.transfer.as_ref().unwrap().last_block, Some(3));
         // Run start 1, identity 2, transfer start 1, erase and RequestDownload steps 2, blocks
-        // and their steps 6, exit 1, its step 1, completion 1.
-        assert_eq!(commits.get(), 15);
+        // and their steps 6, exit 1, its step 1, the Pop reaching the end 1, completion 1.
+        assert_eq!(commits.get(), 16);
     }
 
     /// Two plans where the first one's end is the second one's entry: the first completes before
@@ -2421,8 +2436,23 @@ mod tests {
         // The run start, then the first plan: 14 records up to RequestTransferExit's step, then
         // the step into the second plan's entry (with the VM state) and the first plan's
         // completion. The second: transfer start, 2 steps, 6 for the blocks, exit marker, its
-        // step, completion.
-        assert_eq!(commits.get(), 17 + 12);
+        // step, the Pop that reaches the end (with the VM state), completion.
+        assert_eq!(commits.get(), 17 + 12 + 1);
+        // The first plan's end is the second's entry: one record holds that state, and the
+        // second plan's end state comes after it.
+        let state = journal.journal().state();
+        let first_end = program.flash[1].boundaries.entry_pc;
+        assert_eq!(program.flash[0].boundaries.post_transfer_end_pc, first_end);
+        let (_, shared) = state.previous_vm_state.as_ref().unwrap();
+        assert_eq!(
+            postcard::from_bytes::<VmState>(shared).unwrap().pc,
+            first_end
+        );
+        let (_, last) = state.last_vm_state.as_ref().unwrap();
+        assert_eq!(
+            postcard::from_bytes::<VmState>(last).unwrap().pc,
+            program.flash[1].boundaries.post_transfer_end_pc
+        );
         let routines: Vec<u64> = host
             .log
             .iter()

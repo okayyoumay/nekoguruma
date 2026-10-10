@@ -325,7 +325,7 @@ pub fn classify(
             flash_session: plan.flash_session,
         });
     }
-    let entry_state = match entry_state(program, state, plan.boundaries.entry_pc) {
+    let entry_state = match entry_state(program, state, plan) {
         Ok(entry_state) => entry_state,
         Err(reason) => {
             return RestartDecision::OnSiteInterventionRequired(match reason {
@@ -1244,37 +1244,96 @@ fn recovery_required(program: &Program, at: StepRef) -> Option<OnSiteReason> {
         .map(|section| OnSiteReason::RecoveryRequiredSection { section, at })
 }
 
+#[derive(Debug)]
 enum EntryStateError {
     Missing,
     Invalid(String),
 }
 
-/// The VM state at `entry_pc`: the newest state the journal holds, which is either the state the
-/// runner took on the step into a plan's entry (ADR-252) or the state a run started from, which
-/// every journaled run from instruction 0 commits first (ADR-272); the restart's replay commits
-/// none and starts from this same state (ADR-273). A run start sits newer than an earlier run's
-/// states, so a plain start on an existing journal never inherits them. Only a journal that holds
-/// no state, one written before the run-start record, falls back to the program's initial state
-/// for an entry at pc 0. Either is checked with `Vm::check_state` before it is used.
-fn entry_state(
+/// Decodes a journaled VM state, without checking it against the program.
+fn decode_state(bytes: &[u8]) -> Result<VmState, EntryStateError> {
+    postcard::from_bytes::<VmState>(bytes)
+        .map_err(|error| EntryStateError::Invalid(format!("the VM state does not decode: {error}")))
+}
+
+/// Checks `restored` with `Vm::check_state` and that it stands at `pc`.
+fn state_standing_at(
     program: &Program,
-    state: &JournalState,
-    entry_pc: u32,
+    restored: VmState,
+    pc: u32,
 ) -> Result<VmState, EntryStateError> {
-    let restored = match &state.last_vm_state {
-        Some((_, bytes)) => postcard::from_bytes::<VmState>(bytes).map_err(|error| {
-            EntryStateError::Invalid(format!("the VM state does not decode: {error}"))
-        })?,
-        None if entry_pc == 0 => Vm::new(program).state,
-        None => return Err(EntryStateError::Missing),
-    };
     let vm = Vm::resume(restored);
     vm.check_state(program)
         .map_err(|error: VmError| EntryStateError::Invalid(error.to_string()))?;
-    if vm.state.pc != entry_pc {
+    if vm.state.pc != pc {
         return Err(EntryStateError::Missing);
     }
     Ok(vm.state)
+}
+
+/// The VM state a redo of `plan`'s transfer resumes from: the newest state standing at its
+/// `entry_pc`. That is either the state the runner took on the step into the entry (ADR-252) or
+/// the state a run started from, which every journaled run from instruction 0 commits first
+/// (ADR-272); the restart's replay commits none and starts from this same state (ADR-273). A run
+/// start sits newer than an earlier run's states, so a plain start on an existing journal never
+/// inherits them.
+///
+/// The newest state may be the plan's end state (ADR-271 item 2), committed after the entry's
+/// when the pass ran through, and a journal cut between that state and the post-transfer
+/// completion still redoes the transfer: then the state before it is the entry's. Only a newest
+/// state at the plan's end gives way to the previous one; any other newest state is the run's
+/// latest boundary, and an older entry state would belong to a run it has moved past. Only a
+/// journal that holds no state, one written before the run-start record, falls back to the
+/// program's initial state for an entry at pc 0. The state used is checked with
+/// `Vm::check_state` before it is returned.
+fn entry_state(
+    program: &Program,
+    state: &JournalState,
+    plan: &FlashRecovery,
+) -> Result<VmState, EntryStateError> {
+    let entry_pc = plan.boundaries.entry_pc;
+    let Some((_, bytes)) = &state.last_vm_state else {
+        if entry_pc == 0 {
+            return state_standing_at(program, Vm::new(program).state, entry_pc);
+        }
+        return Err(EntryStateError::Missing);
+    };
+    let newest = decode_state(bytes)?;
+    if newest.pc != entry_pc
+        && newest.pc == plan.boundaries.post_transfer_end_pc
+        && let Some((_, previous)) = &state.previous_vm_state
+    {
+        return state_standing_at(program, decode_state(previous)?, entry_pc);
+    }
+    state_standing_at(program, newest, entry_pc)
+}
+
+/// The VM state at `plan`'s `post_transfer_end_pc` that the journal holds for the pass the
+/// interruption is in, if any: what the continuation after a verified restart resumes from
+/// (ADR-271 items 2 and 3). It is the newest state, and only when it stands at the plan's end: a
+/// state recorded at the entry or at a run start since (a new pass) makes an earlier end state
+/// stale, so none is returned. `EntryStateError::Missing` is "no such state".
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the continuation after a restart is not implemented yet"
+    )
+)]
+fn plan_end_state(
+    program: &Program,
+    state: &JournalState,
+    plan: &FlashRecovery,
+) -> Result<VmState, EntryStateError> {
+    let end_pc = plan.boundaries.post_transfer_end_pc;
+    let Some((_, bytes)) = &state.last_vm_state else {
+        return Err(EntryStateError::Missing);
+    };
+    let newest = decode_state(bytes)?;
+    if newest.pc != end_pc {
+        return Err(EntryStateError::Missing);
+    }
+    state_standing_at(program, newest, end_pc)
 }
 
 #[cfg(test)]
@@ -1433,6 +1492,138 @@ mod tests {
         ));
         j.commit_post_transfer_complete().unwrap();
         assert!(matches!(decide(&program, &j), RestartDecision::Restart(_)));
+    }
+
+    /// The VM state at pc `pc` after step count `steps`.
+    fn state_at_pc(program: &Program, pc: u32, steps: u64) -> VmState {
+        let mut state = Vm::new(program).state;
+        state.pc = pc;
+        state.steps = steps;
+        state
+    }
+
+    /// A journal of a pass that ran to the step before the end, then commits the step that
+    /// reaches the end with the VM state there (ADR-271 item 2).
+    fn journal_with_end_state(program: &Program) -> Journal<Memory> {
+        let mut j = journal_until(program, CHECK);
+        j.commit_step(
+            at(CHECK),
+            Some(&state_bytes(&state_at_pc(program, END, u64::from(END)))),
+        )
+        .unwrap();
+        j
+    }
+
+    /// A journal cut after the plan-end state but before the completion still redoes the
+    /// transfer from the entry state; the end state does not replace it.
+    #[test]
+    fn a_journal_cut_after_the_end_state_redoes_the_transfer_from_the_entry_state() {
+        let program = program(RecoveryRequired::Never);
+        let j = journal_with_end_state(&program);
+        let plan = &program.flash[0];
+        assert_eq!(
+            super::plan_end_state(&program, j.state(), plan).unwrap().pc,
+            END
+        );
+        let RestartDecision::Restart(point) = decide(&program, &j) else {
+            panic!("{:?}", decide(&program, &j));
+        };
+        assert_eq!(point.entry_state.pc, ENTRY);
+        assert_eq!(point.interrupted_at, Some(at(CHECK)));
+        // The counter goes on after the end state's record.
+        assert_eq!(point.entry_state.steps, next_steps(j.state()));
+        // The same with the completion committed: the entry state is still the redo's.
+        let mut j = j;
+        j.commit_post_transfer_complete().unwrap();
+        let RestartDecision::Restart(point) = decide(&program, &j) else {
+            panic!("{:?}", decide(&program, &j));
+        };
+        assert_eq!(point.entry_state.pc, ENTRY);
+        assert_eq!(
+            super::plan_end_state(&program, j.state(), plan).unwrap().pc,
+            END
+        );
+    }
+
+    /// An entry state recorded after an end state (a new pass) makes the end state stale: the
+    /// plan-end accessor returns none, and the entry state is the newest one.
+    #[test]
+    fn an_entry_state_after_an_end_state_makes_the_end_state_stale() {
+        let program = program(RecoveryRequired::Never);
+        let mut j = journal_with_end_state(&program);
+        j.commit_post_transfer_complete().unwrap();
+        let next = next_steps(j.state());
+        j.commit_step(
+            StepRef {
+                pc: ENTRY - 1,
+                steps: next,
+            },
+            Some(&state_bytes(&state_at_pc(&program, ENTRY, next + 1))),
+        )
+        .unwrap();
+        let plan = &program.flash[0];
+        assert!(matches!(
+            super::plan_end_state(&program, j.state(), plan),
+            Err(EntryStateError::Missing)
+        ));
+        let entry = super::entry_state(&program, j.state(), plan).unwrap();
+        assert_eq!((entry.pc, entry.steps), (ENTRY, next + 1));
+    }
+
+    /// Only a newest state at the plan's end gives way to the previous one: an older entry state
+    /// behind a run start (a state elsewhere) is not the entry state.
+    #[test]
+    fn an_older_entry_state_behind_another_state_is_not_used() {
+        let program = program(RecoveryRequired::Never);
+        let mut j = journal_with_end_state(&program);
+        let next = next_steps(j.state());
+        j.commit_run_start(
+            StepRef { pc: 0, steps: next },
+            &state_bytes(&state_at_pc(&program, 0, next)),
+        )
+        .unwrap();
+        let plan = &program.flash[0];
+        assert!(matches!(
+            super::entry_state(&program, j.state(), plan),
+            Err(EntryStateError::Missing)
+        ));
+        assert!(matches!(
+            super::plan_end_state(&program, j.state(), plan),
+            Err(EntryStateError::Missing)
+        ));
+    }
+
+    /// Adjacent plans: the first one's end is the second one's entry, and one record serves both.
+    #[test]
+    fn a_shared_end_and_entry_state_serves_both_plans() {
+        let mut program = program(RecoveryRequired::Never);
+        let mut second = program.flash[0].clone();
+        second.stage = 8;
+        second.boundaries = RecoveryBoundaries {
+            entry_pc: END,
+            erase_pc: END,
+            transfer_exit_pc: END,
+            post_transfer_end_pc: END + 1,
+        };
+        program.flash.push(second);
+        let j = journal_with_end_state(&program);
+        let state = j.state();
+        let shared = state_at_pc(&program, END, u64::from(END));
+        assert_eq!(
+            super::plan_end_state(&program, state, &program.flash[0]).unwrap(),
+            shared
+        );
+        assert_eq!(
+            super::entry_state(&program, state, &program.flash[1]).unwrap(),
+            shared
+        );
+        // The first plan's redo still finds its own entry state before the shared one.
+        assert_eq!(
+            super::entry_state(&program, state, &program.flash[0])
+                .unwrap()
+                .pc,
+            ENTRY
+        );
     }
 
     #[test]

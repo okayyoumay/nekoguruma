@@ -22,8 +22,9 @@
 //!   orders the interruption point (ADR-229 item 1, ADR-245 item 4);
 //! - a step that brings execution to a plan's `entry_pc`: a step record with the VM state
 //!   after it (a job that starts at the entry has its run start instead);
-//! - a step that brings execution to a plan's `post_transfer_end_pc` after its exit marker: the
-//!   post-transfer completion.
+//! - a step that brings execution to a plan's `post_transfer_end_pc`, whatever its instruction: a
+//!   step record with the VM state after it (ADR-271 item 2; one record when that pc is also a
+//!   plan's entry), then, after the plan's exit marker, the post-transfer completion.
 //!
 //! A commit that fails, or an identity that cannot be read, ends the job before the next
 //! instruction runs, so the request a marker guards is never sent without it (ADR-244 item 7).
@@ -206,10 +207,11 @@ impl<S: Store> JobJournal<S> {
             let block = block_number(host.transfer_block_index())?;
             self.journal.commit_block(block)?;
         }
-        let enters = program
-            .flash
-            .iter()
-            .any(|plan| plan.boundaries.entry_pc == after.pc);
+        // A state is recorded where a restart resumes: a plan's entry (a redo of the transfer)
+        // and its end (the continuation, ADR-271 item 2). One record serves a pc that is both.
+        let enters = program.flash.iter().any(|plan| {
+            plan.boundaries.entry_pc == after.pc || plan.boundaries.post_transfer_end_pc == after.pc
+        });
         let inside = program.flash.iter().any(|plan| {
             (plan.boundaries.entry_pc..plan.boundaries.post_transfer_end_pc).contains(&at.pc)
         });

@@ -5562,8 +5562,8 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// The pause between inconclusive reads is the poll interval: none before the first read or
-    /// after the last, and the reads are spaced by at least the interval.
+    /// The reads are spaced by at least the poll interval. Only lower bounds are asserted: an upper
+    /// bound would fail whenever the test thread is descheduled, as under parallel CI runs.
     #[test]
     fn the_version_reads_are_spaced_by_the_poll_interval() {
         let mut program = flash_program();
@@ -5571,9 +5571,7 @@ mod tests {
         let poll = Duration::from_millis(100);
         let mut host = FlashHost::new(Rc::new(Cell::new(0)));
         host.software_version = None;
-        let started = std::time::Instant::now();
         let result = state_check_polling(&program, &mut host, poll, &AtomicBool::new(false));
-        let returned = started.elapsed();
         assert!(
             matches!(
                 &result,
@@ -5587,9 +5585,6 @@ mod tests {
         for pair in times.windows(2) {
             assert!(pair[1] - pair[0] >= poll, "{:?}", pair[1] - pair[0]);
         }
-        // Nothing waits before the first read or after the last.
-        assert!(times[0] - started < poll, "{:?}", times[0] - started);
-        assert!(started + returned - times[2] < poll, "{:?}", returned);
     }
 
     /// A cancel that arrives during the pause between reads ends step 3b-2 in `Cancelled`, with

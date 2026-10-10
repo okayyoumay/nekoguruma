@@ -259,6 +259,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-267](ADR-267-restart-identity-recheck.md) | The Restart Re-reads the Identity in the Default Session and Promotes There Too | Accepted | `agent` restart, runner |
 | [ADR-268](ADR-268-restart-intended-software-version.md) | The Job Names Its Intended Software Version, and the Journal Records It | Accepted (item 5's completion counts only for the interrupted pass since ADR-269) | `agent` journal, runner, restart |
 | [ADR-269](ADR-269-restart-completion-of-the-interrupted-pass.md) | Only the Interrupted Pass's Completion Sends a Restart to Read-Back Verification | Accepted | `agent` restart, design 8.2.5 |
+| [ADR-270](ADR-270-library-writability-check.md) | What "Writable by Regular Users" Means for the Pre-Load Check | Accepted | `ngr-library-resolver`, design 7.2 |
 
 ## Status Legend
 
@@ -566,6 +567,7 @@ the predecessor repository these ADRs came from.
 - ADR-226
 - ADR-228 (the Linux definition format and the shared crate's name settled by ADR-266)
 - ADR-231
+- ADR-270
 
 ### FFI Bindings & Target ABI
 - ADR-108

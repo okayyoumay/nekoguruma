@@ -610,7 +610,7 @@ Basis for the inference: AArch64's AAPCS64 matches x86_64's System V ABI in that
 
 ### 7.2 Pre-load Verification
 
-- Verify that configuration files, libraries and their folders are not writable by regular users (blocking privilege-escalation paths)
+- Verify that configuration files, libraries and their folders are not writable by regular users (blocking privilege-escalation paths). Only system principals may own or modify the library, its own folder and the files that named it; further ancestor folders may let regular users add entries but not replace or remove them (ADR-270)
 - In device mode, refuse to load if writable, and report the reason
 - If an Authenticode signature is present, also verify the signer
 - Load by absolute path (`LoadLibraryEx` / `dlopen`)

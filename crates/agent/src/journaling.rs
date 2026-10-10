@@ -4,8 +4,8 @@
 //!
 //! When a run from instruction 0 starts, before anything is sent ([`JobJournal::run_start`]): the
 //! VM state it starts from, so the journal marks where each such run began (ADR-272). The
-//! restart's replay commits none: it starts from the entry state the journal already holds
-//! (ADR-273).
+//! restart's replay to the erase commits one too, carrying the entry state it starts from
+//! (ADR-274); the continuation after it commits none.
 //!
 //! When execution arrives at an instruction, before it runs and once the VM's own checks of it
 //! passed (`Vm::current_op`, ADR-233 item 3) ([`JobJournal::arrive`]):
@@ -22,7 +22,10 @@
 //!   orders the interruption point (ADR-229 item 1, ADR-245 item 4);
 //! - a step that brings execution to a plan's `entry_pc`: a step record with the VM state
 //!   after it (a job that starts at the entry has its run start instead);
-//! - a step that brings execution to a plan's `post_transfer_end_pc` after its exit marker: the
+//! - a step from inside a plan (`entry_pc..post_transfer_end_pc`) that brings execution to its
+//!   `post_transfer_end_pc`, whatever its instruction: a step record with the VM state after it
+//!   (ADR-271 item 2, ADR-274; one record when that pc is also a plan's entry; a jump to the end
+//!   from outside the plan records nothing), then, after the plan's exit marker, the
 //!   post-transfer completion.
 //!
 //! A commit that fails, or an identity that cannot be read, ends the job before the next
@@ -206,10 +209,16 @@ impl<S: Store> JobJournal<S> {
             let block = block_number(host.transfer_block_index())?;
             self.journal.commit_block(block)?;
         }
-        let enters = program
-            .flash
-            .iter()
-            .any(|plan| plan.boundaries.entry_pc == after.pc);
+        // A state is recorded where a restart resumes: a plan's entry (a redo of the transfer),
+        // reached by any step, and its end (the continuation, ADR-271 item 2), reached by a step
+        // from inside the plan only (ADR-274): a jump from outside, such as a polling loop after
+        // the plan, journals nothing. One record serves a pc that is both.
+        let enters = program.flash.iter().any(|plan| {
+            let b = &plan.boundaries;
+            b.entry_pc == after.pc
+                || (b.post_transfer_end_pc == after.pc
+                    && (b.entry_pc..b.post_transfer_end_pc).contains(&at.pc))
+        });
         let inside = program.flash.iter().any(|plan| {
             (plan.boundaries.entry_pc..plan.boundaries.post_transfer_end_pc).contains(&at.pc)
         });

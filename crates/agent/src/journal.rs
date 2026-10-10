@@ -339,6 +339,13 @@ pub struct JournalState {
     /// The newest VM state a step record or a run start carried (postcard `VmState`, opaque
     /// here), with the step it was taken after (for a run start, the step count it starts at).
     pub last_vm_state: Option<(StepRef, Vec<u8>)>,
+    /// The VM state the one in `last_vm_state` replaced, if any. A redo of the transfer finds
+    /// the entry state here when the newest state is the plan's end state (ADR-271 item 2).
+    /// Two states are enough, by this invariant: at most one end state follows a pass's newest
+    /// entry-standing state, because the end state is recorded only by a step from inside the
+    /// plan and every run that starts from a restored entry state commits a run start
+    /// (ADR-274). Memory stays bounded however long a loop runs.
+    pub previous_vm_state: Option<(StepRef, Vec<u8>)>,
     /// Records in the journal.
     pub records: u64,
 }
@@ -559,6 +566,7 @@ impl Journal<FileStore> {
             state: JournalState {
                 facts,
                 last_vm_state: None,
+                previous_vm_state: None,
                 records,
             },
             poisoned: false,
@@ -639,6 +647,7 @@ impl<S: Store> Journal<S> {
             state: JournalState {
                 facts: RecoveryFacts::new(key),
                 last_vm_state: None,
+                previous_vm_state: None,
                 records: 0,
             },
             poisoned: false,
@@ -780,21 +789,26 @@ impl<S: Store> Journal<S> {
             return Err(error.into());
         }
         self.state.facts = facts;
-        fold_vm_state(&mut self.state.last_vm_state, entry.record);
+        self.state.fold_vm_state(entry.record);
         self.state.records += 1;
         Ok(())
     }
 }
 
-/// Takes the VM state `record` carries, a step's or a run start's, as the newest one.
-fn fold_vm_state(last: &mut Option<(StepRef, Vec<u8>)>, record: Record) {
-    match record {
-        Record::Step {
-            at,
-            vm_state: Some(vm_state),
+impl JournalState {
+    /// Takes the VM state `record` carries, a step's or a run start's, as the newest one; the
+    /// one it replaces becomes the previous one.
+    fn fold_vm_state(&mut self, record: Record) {
+        match record {
+            Record::Step {
+                at,
+                vm_state: Some(vm_state),
+            }
+            | Record::RunStart { at, vm_state } => {
+                self.previous_vm_state = self.last_vm_state.replace((at, vm_state));
+            }
+            _ => {}
         }
-        | Record::RunStart { at, vm_state } => *last = Some((at, vm_state)),
-        _ => {}
     }
 }
 
@@ -936,6 +950,7 @@ fn load(bytes: &[u8], key: &JobKey) -> Result<Loaded, JournalError> {
     let mut state = JournalState {
         facts: RecoveryFacts::new(header.key),
         last_vm_state: None,
+        previous_vm_state: None,
         records: 0,
     };
     let mut offset = next;
@@ -963,7 +978,7 @@ fn load(bytes: &[u8], key: &JobKey) -> Result<Loaded, JournalError> {
             .facts
             .apply(&entry.record)
             .map_err(|reason| corrupt(offset, reason))?;
-        fold_vm_state(&mut state.last_vm_state, entry.record);
+        state.fold_vm_state(entry.record);
         state.records += 1;
         offset = next;
     }
@@ -1162,6 +1177,7 @@ mod tests {
                 let empty = JournalState {
                     facts: RecoveryFacts::new(key()),
                     last_vm_state: None,
+                    previous_vm_state: None,
                     records: 0,
                 };
                 boundaries.insert(0, (next, empty));
@@ -1700,6 +1716,7 @@ mod tests {
             state: JournalState {
                 facts,
                 last_vm_state: None,
+                previous_vm_state: None,
                 records: 0,
             },
             poisoned: false,
@@ -2107,6 +2124,8 @@ mod tests {
             let state = Journal::read(&dir.0, &key()).expect("read back");
             assert_eq!(state.last_vm_state, Some((at(0, 2), b"second".to_vec())));
             assert_eq!(state.facts.last_step, Some(at(2, 1)));
+            // The state the newest replaced is kept, and no older one.
+            assert_eq!(state.previous_vm_state, Some((at(2, 1), b"vm-1".to_vec())));
             assert_eq!(state.records, prefix + 3);
             assert_eq!(Journal::open(&dir.0, &key()).expect("open").state(), &state);
         }
@@ -2169,6 +2188,7 @@ mod tests {
             state: JournalState {
                 facts: RecoveryFacts::new(key()),
                 last_vm_state: None,
+                previous_vm_state: None,
                 records: 0,
             },
             poisoned: false,

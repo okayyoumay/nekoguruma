@@ -1,7 +1,7 @@
 # ADR-273: The Restart Replays the Program from the Entry State up to the Erase
 
 **Date:** 2026-10-10
-**Status:** Accepted (item 4's stop at the erase is now preceded by step 4b-3's second precondition check, `restart::check_before_erase`, which ends the job in `PreconditionNotMetBeforeErase` when a condition fails; the `RestartOrderUnavailable` stop remains until step 4c)
+**Status:** Accepted (item 4's stop at the erase is now preceded by step 4b-3's second precondition check, `restart::check_before_erase`, which ends the job in `PreconditionNotMetBeforeErase` when a condition fails; the `RestartOrderUnavailable` stop remains until step 4c; item 2 superseded by ADR-274: the replay commits a run start carrying the entry state)
 **Affects:** `agent` (`src/runner.rs`, `src/restart.rs`, `docs/ngr-agent.md`), ADR-229 item 2 step 4, ADR-245 item 4, ADR-272 item 2
 
 ## Context

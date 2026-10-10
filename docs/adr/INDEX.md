@@ -241,8 +241,8 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-249](ADR-249-backlog-loop-iterations-start-from-a-fresh-branch.md) | Backlog Loop Iterations Start from a Fresh Branch at `origin/main` | Accepted | `.claude/skills/backlog-loop` (step 1), `codeql-alerts` |
 | [ADR-250](ADR-250-agent-host-flash-transfer.md) | The Agent Host Implements FlashTransfer with Its Own Block Count | Accepted | `agent` host, policy; `diag-ir` plan validation |
 | [ADR-251](ADR-251-copilot-re-review-only-after-fixes-that-need-it.md) | Copilot Re-Review Only After Fixes That Need It | Accepted | `.claude/skills/pr-review-loop` (Steps 0, 4-5), `.github/copilot-instructions.md`, `CLAUDE.md` |
-| [ADR-252](ADR-252-job-runner-journals-at-plan-boundaries.md) | The Job Runner Journals at the Flash Recovery Plan's Boundaries | Accepted (item 2's open point decided by ADR-253; the step reaching a plan's end records the VM state since ADR-271; item 6 superseded by ADR-272) | `agent` runner, journaling, inputs |
-| [ADR-253](ADR-253-restart-classification-and-the-recovery-point-intent.md) | Restart Classification and a Write-Ahead Intent at the Recovery-Required Point | Accepted (item 4's wiring into the runner decided by ADR-255; item 3's newest state includes the run start since ADR-272) | `agent` restart, journaling, journal |
+| [ADR-252](ADR-252-job-runner-journals-at-plan-boundaries.md) | The Job Runner Journals at the Flash Recovery Plan's Boundaries | Accepted (item 2's open point decided by ADR-253; the step reaching a plan's end records the VM state since ADR-271, a step from inside the plan only since ADR-274; item 6 superseded by ADR-272) | `agent` runner, journaling, inputs |
+| [ADR-253](ADR-253-restart-classification-and-the-recovery-point-intent.md) | Restart Classification and a Write-Ahead Intent at the Recovery-Required Point | Accepted (item 4's wiring into the runner decided by ADR-255; item 3's newest state includes the run start since ADR-272; item 3's entry-state read-back follows ADR-274 since the end state exists) | `agent` restart, journaling, journal |
 | [ADR-254](ADR-254-starlark-for-proprietary-procedures.md) | Starlark Replaces JavaScript as the Proprietary Procedure Language | Accepted | `diag-frontend` subset spec, design 8.4, `ir.fbs` `source_format` |
 | [ADR-255](ADR-255-restart-entry-in-the-job-runner.md) | The Restart Entry in the Job Runner | Accepted (item 5's "locks not taken" and the duplicate-resume consequence superseded by ADR-256; item 5's "nothing sent to the ECU" superseded by ADR-261; item 5's teardown that does not run superseded by ADR-264; item 3 amended and the stale-entry-state consequence closed by ADR-272) | `agent` runner, restart, journaling |
 | [ADR-256](ADR-256-restart-guards-as-os-file-locks.md) | Restart Guards as OS Locks on Files in a Device Lock Directory | Accepted (the first-run consequence and item 1's write access to lock files superseded by ADR-257; the failed-close consequence superseded by ADR-258; item 6's per-vehicle lock settled by ADR-262) | `agent` guards, runner |
@@ -260,9 +260,10 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-268](ADR-268-restart-intended-software-version.md) | The Job Names Its Intended Software Version, and the Journal Records It | Accepted (item 5's completion counts only for the interrupted pass since ADR-269) | `agent` journal, runner, restart |
 | [ADR-269](ADR-269-restart-completion-of-the-interrupted-pass.md) | Only the Interrupted Pass's Completion Sends a Restart to Read-Back Verification | Accepted | `agent` restart, design 8.2.5 |
 | [ADR-270](ADR-270-library-writability-check.md) | What "Writable by Regular Users" Means for the Pre-Load Check | Accepted | `ngr-library-resolver`, design 7.2 |
-| [ADR-271](ADR-271-restart-read-back-verification.md) | After a Restart, Read-Back Verification Is the State Check's Match, and the Program Continues from the Plan's End | Accepted | `agent` restart, runner, journaling, design 5.6 / 8.2.5 |
-| [ADR-272](ADR-272-journal-run-start-record.md) | Every Journaled Run Records the State It Starts From | Accepted (item 2's open point for runs not from instruction 0 settled for the replay of step 4 by ADR-273) | `agent` journal, runner, restart |
-| [ADR-273](ADR-273-restart-replay-to-the-erase.md) | The Restart Replays the Program from the Entry State up to the Erase | Accepted (item 4's stop at the erase is now preceded by step 4b-3's second precondition check, `restart::check_before_erase`, which ends the job in `PreconditionNotMetBeforeErase` when a condition fails; the `RestartOrderUnavailable` stop remains until step 4c) | `agent` runner, restart, journaling |
+| [ADR-271](ADR-271-restart-read-back-verification.md) | After a Restart, Read-Back Verification Is the State Check's Match, and the Program Continues from the Plan's End | Accepted (item 2's end step is a step from inside the plan, and its read-back follows ADR-274) | `agent` restart, runner, journaling, design 5.6 / 8.2.5 |
+| [ADR-272](ADR-272-journal-run-start-record.md) | Every Journaled Run Records the State It Starts From | Accepted (item 2's open point for runs not from instruction 0 settled for the replay of step 4 by ADR-273; item 3 amended by ADR-274: the entry state is the newest state standing at the entry, which is the newest state or, when the newest is the current attempt's end-state record and the interruption point is that step, the one before it; the replay commits a run start since ADR-274) | `agent` journal, runner, restart |
+| [ADR-273](ADR-273-restart-replay-to-the-erase.md) | The Restart Replays the Program from the Entry State up to the Erase | Accepted (item 4's stop at the erase is now preceded by step 4b-3's second precondition check, `restart::check_before_erase`, which ends the job in `PreconditionNotMetBeforeErase` when a condition fails; the `RestartOrderUnavailable` stop remains until step 4c; item 2 superseded by ADR-274: the replay commits a run start carrying the entry state) | `agent` runner, restart, journaling |
+| [ADR-274](ADR-274-plan-end-state-read-back.md) | A Plan's End State Is Recorded from Inside the Plan, and the Restart Reads the Entry State Back Behind It | Accepted | `agent` journaling, journal, restart, runner |
 
 ## Status Legend
 
@@ -609,8 +610,8 @@ the predecessor repository these ADRs came from.
 - ADR-245 (items 4 and 6 amended by ADR-250)
 - ADR-247 (Decision item 4's refusal of `FlashTransfer` superseded by ADR-250; its reason for refusing `SecurityAccess` replaced by ADR-259)
 - ADR-250
-- ADR-252 (item 2's open point decided by ADR-253; the step reaching a plan's end records the VM state since ADR-271; item 6 superseded by ADR-272)
-- ADR-253 (item 4's wiring into the runner decided by ADR-255; item 3's newest state includes the run start since ADR-272)
+- ADR-252 (item 2's open point decided by ADR-253; the step reaching a plan's end records the VM state since ADR-271, a step from inside the plan only since ADR-274; item 6 superseded by ADR-272)
+- ADR-253 (item 4's wiring into the runner decided by ADR-255; item 3's newest state includes the run start since ADR-272; item 3's entry-state read-back follows ADR-274 since the end state exists)
 - ADR-255 (item 5's "locks not taken" and the duplicate-resume consequence superseded by ADR-256; item 5's "nothing sent to the ECU" superseded by ADR-261; item 5's teardown that does not run superseded by ADR-264; item 3 amended and the stale-entry-state consequence closed by ADR-272)
 - ADR-256 (the first-run consequence and item 1's write access to lock files superseded by ADR-257; the failed-close consequence superseded by ADR-258; item 6's per-vehicle lock settled by ADR-262)
 - ADR-257 (lock files must be regular files since ADR-262 item 6)
@@ -624,9 +625,10 @@ the predecessor repository these ADRs came from.
 - ADR-267
 - ADR-268 (item 5's completion counts only for the interrupted pass since ADR-269)
 - ADR-269
-- ADR-271
-- ADR-272 (item 2's open point for runs not from instruction 0 settled for the replay of step 4 by ADR-273)
-- ADR-273 (item 4's stop at the erase is now preceded by step 4b-3's second precondition check, `restart::check_before_erase`, which ends the job in `PreconditionNotMetBeforeErase` when a condition fails; the `RestartOrderUnavailable` stop remains until step 4c)
+- ADR-271 (item 2's end step is a step from inside the plan, and its read-back follows ADR-274)
+- ADR-272 (item 2's open point for runs not from instruction 0 settled for the replay of step 4 by ADR-273; item 3 amended by ADR-274: the entry state is the newest state standing at the entry, which is the newest state or, when the newest is the current attempt's end-state record and the interruption point is that step, the one before it; the replay commits a run start since ADR-274)
+- ADR-273 (item 4's stop at the erase is now preceded by step 4b-3's second precondition check, `restart::check_before_erase`, which ends the job in `PreconditionNotMetBeforeErase` when a condition fails; the `RestartOrderUnavailable` stop remains until step 4c; item 2 superseded by ADR-274: the replay commits a run start carrying the entry state)
+- ADR-274
 
 ### Diagnostic IR
 - ADR-233 (item 3's `VmState` fields removed by ADR-245)

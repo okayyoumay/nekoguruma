@@ -123,8 +123,9 @@ none. A journal that already exists ends the job with nothing sent: a job that r
 on through `resume_program_journaled` ("Restart entry" below). Every run from instruction 0, a first
 run or a plain start on an existing journal, commits the VM state it starts from as its first
 record (the run start, ADR-272), at the run's first step count and before anything is sent, so
-the journal marks where each such run began. The restart's replay commits none: it starts from
-the entry state the journal already holds as its newest ("Replay to the erase" below). Each time execution arrives at a plan's boundary, before that
+the journal marks where each such run began. The restart's replay commits one too, carrying the
+entry state it starts from (ADR-274; "Replay to the erase" below); the continuation after it
+commits none. Each time execution arrives at a plan's boundary, before that
 instruction runs, it commits:
 
 - at the entry, once per job and before its first transfer: the hardware part number and
@@ -140,8 +141,11 @@ instruction runs, it commits:
 When an instruction completes, it commits the block of a `FlashTransfer`, under the host's
 running index (`TransferProgress`, ADR-250); a step record for every diagnostic primitive inside
 a plan's range; the VM state on the record of a step that brings execution to a plan's entry
-(a job that starts at the entry has its run start instead); and the
-post-transfer completion with the step that reaches the plan's post-transfer end. A commit that
+(a job that starts at the entry has its run start instead); the VM state on the record of a
+step from inside the plan that brings execution to its post-transfer end, whatever its
+instruction (one record when that pc is also the next plan's entry; a jump to the end from
+outside the plan, such as a polling loop after it, records nothing; ADR-271 item 2, ADR-274); and the post-transfer completion
+with that same step, right after the state. A commit that
 fails, or a declared identity source that gives no value (`JobError::IdentityUnreadable`, or
 `JobError::IdentityRead` when the read cannot be sent), ends the job before the next
 instruction runs, so a guarded request is never sent without its marker and nothing is erased
@@ -165,9 +169,23 @@ step count, of the last completed step, the two transfer markers and the last re
 | no transfer-start marker | plain start |
 | transfer-start marker | `Restart`, for the plan of the marker's stage, with the VM state at its entry; `OnSiteInterventionRequired` if that plan never allows a restart |
 
-A restart's entry state is the newest state the journal holds, a run start included, so a plain
-start never inherits an earlier run's state. Only a journal that holds no state (written before
-the run-start record) falls back to the program's initial state, for an entry at instruction 0.
+A restart's entry state is the newest state the journal holds if it stands at the plan's entry (a
+run start included, so a plain start never inherits an earlier run's state). It is the state before
+the newest only when the newest stands at the plan's post-transfer end (the state of ADR-271 item
+2), is the current attempt's end-state record (the transfer's last post-transfer step is the step
+that carries it) and the interruption point is that same step (no later step or request marker;
+the completion and a resume record may follow). So after a journal cut after the end state, or a
+crash after the completion, the entry state stays available whenever classification allows a
+restart and the state check calls for a redo; when it finds the intended version with the steps
+complete it decides the read-back verification instead (ADR-271), which resumes from the end state
+(ADR-274). Any other newest
+state that does not stand at the entry gives `OnSiteInterventionRequired` (`MissingEntryState`);
+for adjacent plans, a crash after the first plan's completion with a pre-erase primitive of the
+second journaled is refused (ADR-253). The journal keeps those two states only, and
+`restart::plan_end_state` gives the end state for the continuation of ADR-271 item 3 only while it
+is the newest (an entry state or run start recorded after it makes it stale). Only a journal that
+holds no state (written before the run-start record) falls back to the program's initial state,
+for an entry at instruction 0.
 The run start names no request, so it does not move the interruption point; the step count
 counts it. It must decode, pass `Vm::check_state` and stand at the
 plan's entry; otherwise, or for a stage the program does not declare, the decision is
@@ -365,8 +383,9 @@ Replay to the erase (step 4b-2, ADR-273): after step 4a passed, the runner runs 
 `erase_pc`, and stops when execution arrives there, before the journal's `arrive` and before the
 instruction. Steps before the entry are not run again; the steps from the entry to the erase
 (programming session, security access, setup routines) are sent in order, and nothing at or after
-the erase, so no transfer-start marker is committed. The replay commits no run start: its starting
-state is already the journal's newest, so a crash during it restarts from the same entry state.
+the erase, so no transfer-start marker is committed. The replay first commits a run start carrying
+the entry state (ADR-274), so a crash during it restarts from the same entry state even when the
+journal's newest state was a completed pass's end state.
 It shares the step loop with a run from instruction 0 (`run_vm`) and ends as a first run does on a
 failed step, a wait nobody answers, the step limit or a cancel.
 

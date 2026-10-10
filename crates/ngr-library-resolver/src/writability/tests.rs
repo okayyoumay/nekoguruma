@@ -374,6 +374,35 @@ mod windows {
     }
 
     #[test]
+    fn junction_is_followed_to_its_target_directory() {
+        // `base\jn` is a junction to `dir`; the library loaded through it lives in `dir`, so
+        // `dir` must get the library-directory rule.
+        let t = tree();
+        let jn = t.base.join("jn");
+        let status = Command::new("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(&jn)
+            .arg(&t.dir)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let via = jn.join("lib.dll");
+        let policy = Policy::system().trusting_current_user();
+        let r = check_writability_with(&via, &[], &policy);
+        assert!(r.is_ok(), "{r:?}");
+        grant(&t.dir, "(WD,AD)");
+        let e = check_writability_with(&via, &[], &policy).unwrap_err();
+        assert!(
+            e.findings
+                .iter()
+                .any(|f| f.role == Role::LibraryDirectory && f.path.ends_with("dir")),
+            "{e}"
+        );
+    }
+
+    #[test]
     fn system_library_passes_under_the_system_policy() {
         let dll = Path::new(r"C:\Windows\System32\kernel32.dll");
         let r = check_writability(dll, &[]);

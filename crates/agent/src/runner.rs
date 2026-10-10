@@ -5377,6 +5377,36 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// A section that asks for a state check, inside the replayed range, does not stop the
+    /// replay: validation accepts it and the restart replays the same requests.
+    #[test]
+    fn a_check_state_section_in_the_replayed_range_is_replayed() {
+        let (mut program, erase) = replay_program();
+        let entry = program.flash[0].boundaries.entry_pc;
+        program.sections.push(diag_ir::Section {
+            start_pc: entry,
+            end_pc: erase,
+            interruptible: diag_ir::Interruptible::No,
+            idempotency: diag_ir::Idempotency::CheckState,
+            expected_millis: 0,
+        });
+        assert_eq!(program.validate(), Ok(()));
+        let dir = journal_dir("replay-check-state");
+        interrupted_at_erase(&program, erase, &dir);
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        let result = resume(&program, &dir, &mut host, false);
+        assert_eq!(state_of(&result), restart::StateCheck::RedoTransfer);
+        assert_eq!(
+            replayed_requests(&host),
+            [
+                Sent::Service(0x10, vec![0x01]),
+                Sent::Service(0x27, vec![0x01]),
+                Sent::Routine(0xFF02),
+            ]
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// The replay journals its steps, commits no transfer-start marker and no run start, and an
     /// interruption after it restarts from the same entry state.
     #[test]

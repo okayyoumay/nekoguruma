@@ -2423,6 +2423,25 @@ fn a_restartable_plan_does_not_replay_an_unsafe_section() {
 }
 
 #[test]
+fn a_restartable_plan_replays_a_check_state_section_but_not_an_unsafe_one() {
+    let mut program = recovery_program();
+    program.sections.push(Section {
+        interruptible: Interruptible::No,
+        idempotency: Idempotency::CheckState,
+        ..recovery_section(0, 1)
+    });
+    assert_eq!(program.validate(), Ok(()));
+    program.sections[0].idempotency = Idempotency::Unsafe;
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::UnsafeSectionInReplay {
+            flash_session: 1,
+            section: 0
+        })
+    );
+}
+
+#[test]
 fn an_empty_restartable_range_contradicts_nothing() {
     let mut program = recovery_program();
     program.flash[0].recovery_required = RecoveryRequired::FromPc(0);

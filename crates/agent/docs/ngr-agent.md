@@ -324,7 +324,7 @@ order:
 "Complete for the interrupted pass" means the completion is journaled and the interruption point
 is no later than the completed pass's last post-transfer step (the test the classifier applies): a
 program that stepped back into the plan's entry after the completion and crashed in the later pass
-is redone, not read back.
+is redone, not read back (ADR-269).
 
 A program that declares no software-version source ends in `SoftwareVersionNotEstablished`
 without a read. When the intended version equals the pre-erase one, only the journal's record of

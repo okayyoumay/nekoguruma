@@ -1,7 +1,7 @@
 # ADR-268: The Job Names Its Intended Software Version, and the Journal Records It
 
 **Date:** 2026-10-10
-**Status:** Accepted
+**Status:** Accepted (item 5's completion counts only for the interrupted pass since ADR-269)
 **Affects:** `agent` (`src/journal.rs`, `src/runner.rs`, `src/restart.rs`, `tests/journal_crash.rs`, `docs/ngr-agent.md`), ADR-229 item 2 step 3, ADR-244 items 4 and 5, ADR-261 item 1
 
 ## Context

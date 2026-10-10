@@ -628,7 +628,7 @@ where
 ///   `interruption_point` places it) is no later than the completed pass's last post-transfer
 ///   step, the same test `effective_point` applies. A program that stepped back into the plan's
 ///   entry after the completion has a later point, so a crash in that later pass does not skip
-///   it (this covers an intended version equal to the pre-erase one:
+///   it (ADR-269; this covers an intended version equal to the pre-erase one:
 ///   only the journal's record tells a finished transfer from an unstarted one);
 /// - the pre-erase version (`pre_erase_software_version`): [`StateCheck::RedoTransfer`];
 /// - any other decoded version: [`OnSiteReason::UnexpectedSoftwareVersion`], conclusive and not

@@ -251,8 +251,13 @@ pub async fn run_program_journaled(
 ///   then waits the ECU's startup time and reads F186 until the ECU reports its default session
 ///   (step 2b-2, ADR-265), with one passive teardown and one more attempt when the first fails
 ///   after a reset or on the completed path; an ECU that cannot be confirmed ends the job in
-///   [`JobError::OnSiteInterventionRequired`] (`DefaultSessionNotConfirmed`). The rest of the
-///   restart order (step 3 on) does not run in this agent, so a confirmed job ends in
+///   [`JobError::OnSiteInterventionRequired`] (`DefaultSessionNotConfirmed`). Then
+///   `restart::check_identity` reads the VIN and the hardware identity again in the default
+///   session (step 3a): a different one ends the job in [`JobError::IdentityMismatch`], one that
+///   cannot be established in [`JobError::OnSiteInterventionRequired`]
+///   (`IdentityNotEstablished`), and a matching VIN promotes the guards again, which is the
+///   lock's fallback when step 2 could not read it. The rest of the restart order (step 3b on)
+///   does not run in this agent, so a job that passed ends in
 ///   [`JobError::OnSiteInterventionRequired`] (`RestartOrderUnavailable`, carrying the
 ///   teardown's outcome and the confirmation), or in [`JobError::IdentityMismatch`] when the
 ///   ECU's VIN is another vehicle's;
@@ -537,9 +542,11 @@ impl Drop for CancelOnDrop {
 /// checks of `restart::check_before_ecu` passed; then `restart::check_gates` sends only
 /// ReadDataByIdentifier requests (ADR-229 item 2 step 2), `restart::teardown` sends at most
 /// one ECUReset (step 2b-1, ADR-264), and `restart::confirm_default_session` reads F186
-/// (step 2b-2, ADR-265). `vin` is the job's target VIN. Once
-/// the ECU's VIN matched it, the gates promote `guards` to the per-vehicle lock (ADR-263; see
-/// [`promote_to_vehicle`]).
+/// (step 2b-2, ADR-265), and `restart::check_identity` reads the VIN and the hardware identity
+/// again (step 3a, ADR-229 item 2 step 3). `vin` is the job's target VIN. Once the ECU's VIN
+/// matched it, the gates promote `guards` to the per-vehicle lock (ADR-263; see
+/// [`promote_to_vehicle`]); step 3a promotes again, which takes the lock when the gates could not
+/// read the VIN and returns at once when the guards hold it already.
 #[expect(
     clippy::too_many_arguments,
     reason = "the job's whole input, split only by what the caller owns"
@@ -615,6 +622,15 @@ where
                 host,
                 poll,
                 cancelled,
+            )?;
+            restart::check_identity(
+                program,
+                &point,
+                &teardown,
+                &sources,
+                host,
+                cancelled,
+                |vin| promote_to_vehicle(guards, vin, poll, cancelled),
             )?;
             Err(JobError::OnSiteInterventionRequired(
                 OnSiteReason::RestartOrderUnavailable {
@@ -1089,6 +1105,25 @@ mod tests {
         NoAnswer,
     }
 
+    /// One scripted answer to a read of F190 or F191, ahead of the host's standing answer.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum IdAnswer {
+        /// A positive response carrying these bytes.
+        Value(Vec<u8>),
+        /// A negative response.
+        Refuse,
+        /// The worker fails, as one that cannot be reached would.
+        Fail,
+        /// No answer is scripted: the standing answer.
+        Standing,
+    }
+
+    impl IdAnswer {
+        fn value(text: &str) -> Self {
+            Self::Value(text.as_bytes().to_vec())
+        }
+    }
+
     /// An ECU that downloads: it answers ReadDataByIdentifier F191 and F195, accepts every
     /// other request and every block, and counts the blocks since the last RequestDownload as
     /// the worker's host does. It logs each request with the journal commits made before it.
@@ -1123,6 +1158,14 @@ mod tests {
         /// Every request is also pushed here, for a test that looks at the host while the job
         /// runs on another thread.
         mirror: Option<Arc<Mutex<Vec<Sent>>>>,
+        /// The answers to the first reads of F190, one per read; later reads get `vin`.
+        vin_script: std::collections::VecDeque<IdAnswer>,
+        /// The answers to the first reads of F191, one per read; later reads get `hardware`.
+        hardware_script: std::collections::VecDeque<IdAnswer>,
+        /// Reads of F190 so far.
+        vin_reads: usize,
+        /// Set when the read of F190 with this index (from 0) arrives.
+        cancel_on_vin_read: Option<(usize, Arc<AtomicBool>)>,
         /// The answer to ECUReset.
         reset: ResetAnswer,
         /// A service whose response is lost.
@@ -1155,6 +1198,10 @@ mod tests {
                 hardware: Some(b"HW01".to_vec()),
                 inputs: crate::inputs::FixedInputs::new(),
                 mirror: None,
+                vin_script: std::collections::VecDeque::new(),
+                hardware_script: std::collections::VecDeque::new(),
+                vin_reads: 0,
+                cancel_on_vin_read: None,
                 reset: ResetAnswer::Positive,
                 lose_service: None,
                 session_script: std::collections::VecDeque::new(),
@@ -1244,14 +1291,24 @@ mod tests {
                         ResetAnswer::Trailing => Ok(vec![0x51, 0x01, 0x00]),
                     }
                 }
-                (0x22, [0xF1, 0x90]) => Ok(match &self.vin {
-                    Some(vin) => [&[0x62, 0xF1, 0x90][..], vin].concat(),
-                    None => vec![0x7F, 0x22, 0x31],
-                }),
-                (0x22, [0xF1, 0x91]) => Ok(match &self.hardware {
-                    Some(hardware) => [&[0x62, 0xF1, 0x91][..], hardware].concat(),
-                    None => vec![0x7F, 0x22, 0x31],
-                }),
+                (0x22, [0xF1, 0x90]) => {
+                    let index = self.vin_reads;
+                    self.vin_reads += 1;
+                    if let Some((at, flag)) = &self.cancel_on_vin_read
+                        && *at == index
+                    {
+                        flag.store(true, Ordering::Relaxed);
+                    }
+                    let scripted = self.vin_script.pop_front().unwrap_or(IdAnswer::Standing);
+                    identity_answer(scripted, &self.vin, 0x90)
+                }
+                (0x22, [0xF1, 0x91]) => {
+                    let scripted = self
+                        .hardware_script
+                        .pop_front()
+                        .unwrap_or(IdAnswer::Standing);
+                    identity_answer(scripted, &self.hardware, 0x91)
+                }
                 (0x22, [0xF1, 0x86]) => {
                     self.session_reads.push(std::time::Instant::now());
                     match self.session_script.pop_front().unwrap_or(self.session) {
@@ -1313,6 +1370,22 @@ mod tests {
             Err(HostError::Unsupported("MonitorCapture"))
         }
         fn log(&mut self, _: u8, _: &str) {}
+    }
+
+    /// The response to a read of F1`low`: the scripted answer, or the standing one (`None` is a
+    /// negative response).
+    fn identity_answer(
+        scripted: IdAnswer,
+        standing: &Option<Vec<u8>>,
+        low: u8,
+    ) -> Result<Vec<u8>, HostError> {
+        let positive = |bytes: &[u8]| Ok([&[0x62, 0xF1, low][..], bytes].concat());
+        match (scripted, standing) {
+            (IdAnswer::Value(bytes), _) => positive(&bytes),
+            (IdAnswer::Refuse, _) | (IdAnswer::Standing, None) => Ok(vec![0x7F, 0x22, 0x31]),
+            (IdAnswer::Fail, _) => Err(HostError::NoResponse),
+            (IdAnswer::Standing, Some(bytes)) => positive(bytes),
+        }
     }
 
     const ENTRY: u32 = 3;
@@ -2617,7 +2690,13 @@ mod tests {
         // Only the gates' ReadDataByIdentifier requests: the VIN, then the hardware identity.
         assert_eq!(
             host.sent(),
-            [read_of([0xF1, 0x90]), read_of([0xF1, 0x91]), reset_sent()]
+            [
+                read_of([0xF1, 0x90]),
+                read_of([0xF1, 0x91]),
+                reset_sent(),
+                read_of([0xF1, 0x90]),
+                read_of([0xF1, 0x91]),
+            ]
         );
         // Read by step 1 and again by the gates.
         assert_eq!(host.voltage_reads, 2);
@@ -2852,11 +2931,21 @@ mod tests {
         Sent::Service(0x11, vec![0x01])
     }
 
-    /// Nothing but ReadDataByIdentifier requests, then at most the teardown's one ECUReset (last),
-    /// was sent: no routine, no block.
+    /// Nothing but ReadDataByIdentifier requests, then at most the teardown's one ECUReset
+    /// followed by step 3a's two reads, was sent: no routine, no block.
     fn assert_reads_then_reset(host: &FlashHost) {
         let sent = host.sent();
-        let reads = sent.strip_suffix(&[reset_sent()]).unwrap_or(&sent);
+        let reads = match sent.iter().position(|sent| *sent == reset_sent()) {
+            Some(at) => {
+                assert_eq!(
+                    sent[at + 1..],
+                    [read_of([0xF1, 0x90]), read_of([0xF1, 0x91])],
+                    "{sent:?}"
+                );
+                &sent[..at]
+            }
+            None => &sent[..],
+        };
         assert!(
             reads
                 .iter()
@@ -2899,32 +2988,59 @@ mod tests {
     #[test]
     fn a_vin_that_cannot_be_read_leaves_the_teardown_passive() {
         let passive = passive_gate(restart::PassiveReason::VinNotEstablished);
+        // Only the gates' read fails (step 3a, which reads again, gets the VIN).
         // A negative response.
         let (result, host) = restart_with(&flash_program(), Some(TARGET_VIN), |host| {
-            host.vin = None;
+            host.vin_script = [IdAnswer::Refuse].into();
         });
         assert_eq!(teardown_of(&result), passive);
-        assert_eq!(host.sent(), [read_of([0xF1, 0x90])]);
+        assert_eq!(
+            host.sent(),
+            [
+                read_of([0xF1, 0x90]),
+                read_of([0xF1, 0x90]),
+                read_of([0xF1, 0x91])
+            ]
+        );
 
         // A VIN field that is blank, so not text.
         let (result, _) = restart_with(&flash_program(), Some(TARGET_VIN), |host| {
-            host.vin = Some(vec![b' '; 17]);
+            host.vin_script = [IdAnswer::Value(vec![b' '; 17])].into();
         });
         assert_eq!(teardown_of(&result), passive);
 
-        // The program declares no VIN source.
+        // The program declares no VIN source: step 3a cannot establish it either.
         let mut no_source = flash_program();
         no_source.identity.vin = None;
         let (result, host) = restart_with(&no_source, Some(TARGET_VIN), |_| {});
-        assert_eq!(teardown_of(&result), passive);
+        assert_eq!(
+            assert_not_established(&result, IdentityKind::Vin),
+            passive_gate(restart::PassiveReason::VinNotEstablished)
+        );
         assert_eq!(host.sent(), []);
     }
 
+    /// The restart ended in on-site intervention because step 3a could not establish `identity`.
+    /// Gives the teardown the reason carries.
+    fn assert_not_established(
+        result: &Result<VmState, JobError>,
+        identity: IdentityKind,
+    ) -> restart::Teardown {
+        match result {
+            Err(JobError::OnSiteInterventionRequired(OnSiteReason::IdentityNotEstablished {
+                flash_session: 1,
+                identity: got,
+                teardown,
+            })) if *got == identity => teardown.clone(),
+            other => panic!("{other:?}"),
+        }
+    }
+
     #[test]
-    fn a_job_without_a_vin_reads_nothing_and_stays_passive() {
+    fn a_job_without_a_vin_reads_nothing_and_establishes_nothing() {
         let (result, host) = restart_with(&flash_program(), None, |_| {});
         assert_eq!(
-            teardown_of(&result),
+            assert_not_established(&result, IdentityKind::Vin),
             passive_gate(restart::PassiveReason::VinNotEstablished)
         );
         assert_eq!(host.sent(), []);
@@ -2934,17 +3050,26 @@ mod tests {
     fn a_hardware_identity_that_differs_or_cannot_be_read_leaves_the_teardown_passive() {
         use restart::PassiveReason;
         // The journal recorded HW01.
+        // Only the gates' read differs (step 3a gets HW01).
         let (result, host) = restart_with(&flash_program(), Some(TARGET_VIN), |host| {
-            host.hardware = Some(b"HW02".to_vec());
+            host.hardware_script = [IdAnswer::value("HW02")].into();
         });
         assert_eq!(
             teardown_of(&result),
             passive_gate(PassiveReason::HardwareIdentityDiffers)
         );
-        assert_eq!(host.sent(), [read_of([0xF1, 0x90]), read_of([0xF1, 0x91])]);
+        assert_eq!(
+            host.sent(),
+            [
+                read_of([0xF1, 0x90]),
+                read_of([0xF1, 0x91]),
+                read_of([0xF1, 0x90]),
+                read_of([0xF1, 0x91])
+            ]
+        );
 
         let (result, _) = restart_with(&flash_program(), Some(TARGET_VIN), |host| {
-            host.hardware = None;
+            host.hardware_script = [IdAnswer::Refuse].into();
         });
         assert_eq!(
             teardown_of(&result),
@@ -2956,10 +3081,10 @@ mod tests {
         no_source.identity.hardware_part_number = None;
         let (result, host) = restart_with(&no_source, Some(TARGET_VIN), |_| {});
         assert_eq!(
-            teardown_of(&result),
-            passive_gate(PassiveReason::HardwareIdentityNotEstablished)
+            assert_not_established(&result, IdentityKind::HardwarePartNumber),
+            passive_gate(restart::PassiveReason::HardwareIdentityNotEstablished)
         );
-        assert_eq!(host.sent(), [read_of([0xF1, 0x90])]);
+        assert_eq!(host.sent(), [read_of([0xF1, 0x90]), read_of([0xF1, 0x90])]);
     }
 
     #[test]
@@ -2987,7 +3112,7 @@ mod tests {
         assert_eq!(teardown_of(&result), engine);
 
         // A value out of range fails at once: the programming-session source, here a field of
-        // the VIN request, is not read (the VIN and the hardware identity were read once).
+        // the VIN request, is not read (the gates and step 3a read each identity once).
         let program = flash_program_with_engine(
             input(RuntimeInput::EngineRunning),
             diag_ir::Source::EcuService {
@@ -3002,7 +3127,15 @@ mod tests {
             );
         });
         assert_eq!(teardown_of(&result), engine);
-        assert_eq!(host.sent(), [read_of([0xF1, 0x90]), read_of([0xF1, 0x91])]);
+        assert_eq!(
+            host.sent(),
+            [
+                read_of([0xF1, 0x90]),
+                read_of([0xF1, 0x91]),
+                read_of([0xF1, 0x90]),
+                read_of([0xF1, 0x91])
+            ]
+        );
 
         // A source the table lacks cannot be established; no request is sent for it.
         let missing = |field_id| diag_ir::Source::EcuService {
@@ -3012,7 +3145,15 @@ mod tests {
         let program = flash_program_with_engine(missing(8), missing(9));
         let (result, host) = restart_with(&program, Some(TARGET_VIN), |_| {});
         assert_eq!(teardown_of(&result), engine);
-        assert_eq!(host.sent(), [read_of([0xF1, 0x90]), read_of([0xF1, 0x91])]);
+        assert_eq!(
+            host.sent(),
+            [
+                read_of([0xF1, 0x90]),
+                read_of([0xF1, 0x91]),
+                read_of([0xF1, 0x90]),
+                read_of([0xF1, 0x91])
+            ]
+        );
     }
 
     /// The ECU may still be in its programming session, so a precondition the default-session
@@ -3088,14 +3229,14 @@ mod tests {
         use diag_ir::{PreconditionKind, RuntimeInput};
         use restart::PassiveReason;
         let (result, _) = restart_with(&flash_program(), Some(TARGET_VIN), |host| {
-            host.fail_reads = vec![[0xF1, 0x90]];
+            host.vin_script = [IdAnswer::Fail].into();
         });
         assert_eq!(
             teardown_of(&result),
             passive_gate(PassiveReason::VinNotEstablished)
         );
         let (result, _) = restart_with(&flash_program(), Some(TARGET_VIN), |host| {
-            host.fail_reads = vec![[0xF1, 0x91]];
+            host.hardware_script = [IdAnswer::Fail].into();
         });
         assert_eq!(
             teardown_of(&result),
@@ -3153,7 +3294,7 @@ mod tests {
         });
         let (result, host) = restart_with(&program, Some(TARGET_VIN), |_| {});
         assert_eq!(
-            teardown_of(&result),
+            assert_not_established(&result, IdentityKind::Vin),
             passive_gate(restart::PassiveReason::VinNotEstablished)
         );
         assert_eq!(host.sent(), []);
@@ -3170,13 +3311,22 @@ mod tests {
         ] {
             assert_eq!(answer.len(), 17);
             let (result, host) = restart_with(&flash_program(), Some(TARGET_VIN), |host| {
-                host.vin = Some(answer.as_bytes().to_vec());
+                host.vin_script = [IdAnswer::value(answer)].into();
             });
             assert_eq!(teardown_of(&result), passive, "{answer}");
-            assert_eq!(host.sent(), [read_of([0xF1, 0x90])]);
+            // The gates' read of the malformed VIN, then step 3a's good one and its hardware read.
+            assert_eq!(
+                host.sent(),
+                [read_vin(), read_vin(), read_hardware()],
+                "{answer}"
+            );
         }
+        // A target VIN that is not well-formed is not read for at all.
         let (result, host) = restart_with(&flash_program(), Some("SHORT"), |_| {});
-        assert_eq!(teardown_of(&result), passive);
+        assert_eq!(
+            assert_not_established(&result, IdentityKind::Vin),
+            passive_gate(restart::PassiveReason::VinNotEstablished)
+        );
         assert_eq!(host.sent(), []);
     }
 
@@ -3220,7 +3370,13 @@ mod tests {
         assert_eq!(teardown_of(&result), restart::Teardown::Reset);
         assert_eq!(
             host.sent(),
-            [read_of([0xF1, 0x90]), read_of([0xF1, 0x91]), reset_sent()]
+            [
+                read_of([0xF1, 0x90]),
+                read_of([0xF1, 0x91]),
+                reset_sent(),
+                read_of([0xF1, 0x90]),
+                read_of([0xF1, 0x91]),
+            ]
         );
         // An accepted reset waits for nothing, however long the session timeout is.
         assert!(elapsed < Duration::from_secs(30), "{elapsed:?}");
@@ -3231,13 +3387,21 @@ mod tests {
         let (result, host, elapsed) = restart_after(
             &flash_program(),
             |host| host.lose_routine = Some(0xFF00),
-            |host| host.vin = None,
+            // Step 2 cannot read the VIN; step 3a can.
+            |host| host.vin_script = [IdAnswer::Refuse].into(),
         );
         assert_eq!(
             teardown_of(&result),
             passive_gate(restart::PassiveReason::VinNotEstablished)
         );
-        assert_eq!(host.sent(), [read_of([0xF1, 0x90])]);
+        assert_eq!(
+            host.sent(),
+            [
+                read_of([0xF1, 0x90]),
+                read_of([0xF1, 0x90]),
+                read_of([0xF1, 0x91])
+            ]
+        );
         assert!(elapsed >= session_wait(), "{elapsed:?}");
     }
 
@@ -3256,7 +3420,13 @@ mod tests {
         );
         assert_eq!(
             host.sent(),
-            [read_of([0xF1, 0x90]), read_of([0xF1, 0x91]), reset_sent()]
+            [
+                read_of([0xF1, 0x90]),
+                read_of([0xF1, 0x91]),
+                reset_sent(),
+                read_of([0xF1, 0x90]),
+                read_of([0xF1, 0x91]),
+            ]
         );
         assert!(elapsed >= session_wait(), "{elapsed:?}");
     }
@@ -3281,7 +3451,18 @@ mod tests {
                 passive(restart::PassiveCause::ResetOutcomeUnknown),
                 "{answer:?}"
             );
-            assert_eq!(host.sent().last(), Some(&reset_sent()), "{answer:?}");
+            // The reset comes after the gates' reads and before step 3a's.
+            assert_eq!(
+                host.sent(),
+                [
+                    read_vin(),
+                    read_hardware(),
+                    reset_sent(),
+                    read_vin(),
+                    read_hardware()
+                ],
+                "{answer:?}"
+            );
             assert!(elapsed >= session_wait(), "{answer:?}: {elapsed:?}");
         }
     }
@@ -3310,7 +3491,12 @@ mod tests {
             );
             assert_eq!(
                 host.sent(),
-                [read_of([0xF1, 0x90]), read_of([0xF1, 0x91])],
+                [
+                    read_of([0xF1, 0x90]),
+                    read_of([0xF1, 0x91]),
+                    read_of([0xF1, 0x90]),
+                    read_of([0xF1, 0x91]),
+                ],
                 "{name}"
             );
             assert!(elapsed >= session_wait(), "{name}: {elapsed:?}");
@@ -3339,7 +3525,15 @@ mod tests {
         let (result, host, elapsed) =
             restart_after(&program, |host| host.lose_routine = Some(0xFF02), |_| {});
         assert_eq!(teardown_of(&result), restart::Teardown::CompletedPath);
-        assert_eq!(host.sent(), [read_of([0xF1, 0x90]), read_of([0xF1, 0x91])]);
+        assert_eq!(
+            host.sent(),
+            [
+                read_of([0xF1, 0x90]),
+                read_of([0xF1, 0x91]),
+                read_of([0xF1, 0x90]),
+                read_of([0xF1, 0x91]),
+            ]
+        );
         assert!(elapsed < Duration::from_secs(30), "{elapsed:?}");
     }
 
@@ -3477,7 +3671,16 @@ mod tests {
             )
         );
         assert_eq!(host.session_reads.len(), 1);
-        assert_eq!(host.sent().last(), Some(&reset_sent()));
+        assert_eq!(
+            host.sent(),
+            [
+                read_vin(),
+                read_hardware(),
+                reset_sent(),
+                read_vin(),
+                read_hardware()
+            ]
+        );
     }
 
     /// A refused ECUReset makes the teardown passive; the ECU is then confirmed, with no
@@ -3960,6 +4163,529 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    // ------------------------------------ restart identity checks (ADR-229 item 2 step 3a)
+
+    fn read_vin() -> Sent {
+        read_of([0xF1, 0x90])
+    }
+
+    fn read_hardware() -> Sent {
+        read_of([0xF1, 0x91])
+    }
+
+    /// Every request a host got, with the reads of F186, in order.
+    fn full_log(host: &FlashHost) -> Vec<Sent> {
+        host.log.iter().map(|(sent, _)| sent.clone()).collect()
+    }
+
+    /// The restart point of the interrupted job in `dir`.
+    fn restart_point(program: &Program, dir: &std::path::Path) -> restart::RestartPoint {
+        let opened = Journal::open(dir, &job_key());
+        let RestartDecision::Restart(point) =
+            restart::classify(program, opened.as_ref().map(Journal::state))
+        else {
+            panic!("the journal does not allow a restart");
+        };
+        *point
+    }
+
+    /// Step 3a on its own, on a host `prepare` sets up; `promote` counts its calls.
+    fn identity_check(
+        program: &Program,
+        vin: Option<&str>,
+        prepare: impl FnOnce(&mut FlashHost),
+    ) -> (Result<(), JobError>, FlashHost, u32) {
+        let dir = journal_dir("identity");
+        interrupted_for(program, &dir, vin);
+        let point = restart_point(program, &dir);
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        prepare(&mut host);
+        let mut promotions = 0;
+        let result = restart::check_identity(
+            program,
+            &point,
+            &restart::Teardown::Reset,
+            &identity_sources(),
+            &mut host,
+            &AtomicBool::new(false),
+            |promoted| {
+                assert_eq!(promoted.as_str(), TARGET_VIN);
+                promotions += 1;
+                Ok(())
+            },
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+        (result, host, promotions)
+    }
+
+    /// Both identities match: the lock is promoted once, with the target VIN, after the VIN
+    /// read and before the hardware read is needed; only the two reads are sent.
+    #[test]
+    fn step_3a_passes_when_both_identities_match() {
+        let (result, host, promotions) = identity_check(&flash_program(), Some(TARGET_VIN), |_| {});
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(promotions, 1);
+        assert_eq!(host.sent(), [read_vin(), read_hardware()]);
+    }
+
+    /// A restart that passes step 3a still stops at `RestartOrderUnavailable`, and step 3a
+    /// reads in the default session: after the confirmation's read of F186.
+    #[test]
+    fn a_passing_step_3a_ends_in_the_unavailable_restart_order_after_the_confirmation() {
+        let (result, host) = restart_with(&flash_program(), Some(TARGET_VIN), |_| {});
+        let (teardown, confirmed) = confirmed_of(&result);
+        assert_eq!(teardown, restart::Teardown::Reset);
+        assert_eq!(
+            confirmed,
+            restart::Confirmation {
+                after_passive_retry: false
+            }
+        );
+        assert_eq!(
+            full_log(&host),
+            [
+                read_vin(),
+                read_hardware(),
+                reset_sent(),
+                read_of([0xF1, 0x86]),
+                read_vin(),
+                read_hardware(),
+            ]
+        );
+    }
+
+    /// A VIN step 3a reads that differs aborts the job; one it cannot establish needs on-site
+    /// intervention. Nothing is sent after the failing read, and the hardware identity is not read.
+    #[test]
+    fn a_step_3a_vin_that_differs_or_is_not_established_ends_the_restart() {
+        let other_vehicle = IdAnswer::value("WDB99999999999999");
+        let cases = [
+            ("different", other_vehicle, true),
+            ("refused", IdAnswer::Refuse, false),
+            ("worker failure", IdAnswer::Fail, false),
+            ("lower case", IdAnswer::value("wdb12345678901234"), false),
+            ("letter O", IdAnswer::value("WDB1234567890123O"), false),
+            ("blank", IdAnswer::Value(vec![b' '; 17]), false),
+            ("short", IdAnswer::value("WDB1234"), false),
+            ("empty", IdAnswer::Value(Vec::new()), false),
+        ];
+        for (name, answer, differs) in cases {
+            // Step 2 reads the target VIN; step 3a reads `answer`.
+            let (result, host) = restart_with(&flash_program(), Some(TARGET_VIN), |host| {
+                host.vin_script = [IdAnswer::Standing, answer].into();
+            });
+            if differs {
+                let Err(error @ JobError::IdentityMismatch { identity }) = &result else {
+                    panic!("{name}: {result:?}");
+                };
+                assert_eq!(*identity, IdentityKind::Vin, "{name}");
+                let text = format!("{error} {error:?}");
+                assert!(!text.contains("WDB"), "{name}: {text}");
+            } else {
+                let teardown = assert_not_established(&result, IdentityKind::Vin);
+                assert_eq!(teardown, restart::Teardown::Reset, "{name}");
+            }
+            assert_eq!(
+                full_log(&host),
+                [
+                    read_vin(),
+                    read_hardware(),
+                    reset_sent(),
+                    read_of([0xF1, 0x86]),
+                    read_vin(),
+                ],
+                "{name}"
+            );
+        }
+    }
+
+    /// Step 3a with nothing to compare reads nothing: no target VIN, a target VIN that is not
+    /// well-formed, or no declared VIN source.
+    #[test]
+    fn step_3a_without_a_usable_vin_source_or_target_establishes_nothing() {
+        let mut no_source = flash_program();
+        no_source.identity.vin = None;
+        for (name, program, vin) in [
+            ("no target", flash_program(), None),
+            ("malformed target", flash_program(), Some("SHORT")),
+            ("no source", no_source, Some(TARGET_VIN)),
+        ] {
+            let (result, host, promotions) = identity_check(&program, vin, |_| {});
+            assert_not_established_check(&result, IdentityKind::Vin);
+            assert_eq!(host.sent(), [], "{name}");
+            assert_eq!(promotions, 0, "{name}");
+        }
+    }
+
+    /// Step 3a's hardware identity that differs aborts the job; one it cannot establish needs
+    /// on-site intervention. Nothing is sent after the failing read.
+    #[test]
+    fn a_step_3a_hardware_identity_that_differs_or_is_not_established_ends_the_restart() {
+        let cases = [
+            ("different", IdAnswer::value("HW02"), true),
+            ("refused", IdAnswer::Refuse, false),
+            ("worker failure", IdAnswer::Fail, false),
+            // Shorter than the 4 bytes the table declares, and bytes that are not ASCII text.
+            ("short", IdAnswer::value("HW0"), false),
+            ("undecodable", IdAnswer::Value(vec![0x00; 4]), false),
+        ];
+        for (name, answer, differs) in cases {
+            let (result, host) = restart_with(&flash_program(), Some(TARGET_VIN), |host| {
+                host.hardware_script = [IdAnswer::Standing, answer].into();
+            });
+            if differs {
+                assert!(
+                    matches!(
+                        result,
+                        Err(JobError::IdentityMismatch {
+                            identity: IdentityKind::HardwarePartNumber
+                        })
+                    ),
+                    "{name}: {result:?}"
+                );
+            } else {
+                let teardown = assert_not_established(&result, IdentityKind::HardwarePartNumber);
+                assert_eq!(teardown, restart::Teardown::Reset, "{name}");
+            }
+            assert_eq!(
+                full_log(&host),
+                [
+                    read_vin(),
+                    read_hardware(),
+                    reset_sent(),
+                    read_of([0xF1, 0x86]),
+                    read_vin(),
+                    read_hardware(),
+                ],
+                "{name}"
+            );
+        }
+
+        // The program declares no hardware source: the VIN is read, nothing else.
+        let mut no_source = flash_program();
+        no_source.identity.hardware_part_number = None;
+        let (result, host, promotions) = identity_check(&no_source, Some(TARGET_VIN), |_| {});
+        assert_not_established_check(&result, IdentityKind::HardwarePartNumber);
+        assert_eq!(host.sent(), [read_vin()]);
+        assert_eq!(promotions, 1);
+    }
+
+    /// [`assert_not_established`] for step 3a on its own, which was given `Teardown::Reset`.
+    fn assert_not_established_check(result: &Result<(), JobError>, identity: IdentityKind) {
+        assert!(
+            matches!(
+                result,
+                Err(JobError::OnSiteInterventionRequired(
+                    OnSiteReason::IdentityNotEstablished {
+                        flash_session: 1,
+                        identity: got,
+                        teardown: restart::Teardown::Reset,
+                    }
+                )) if *got == identity
+            ),
+            "{result:?}"
+        );
+    }
+
+    /// A VIN that differs or is not established takes no lock in step 3a; the hardware identity
+    /// is read only after the VIN matched and the lock was promoted.
+    #[test]
+    fn step_3a_promotes_only_for_a_matching_vin() {
+        let (result, host, promotions) =
+            identity_check(&flash_program(), Some(TARGET_VIN), |host| {
+                host.vin = Some(b"WDB99999999999999".to_vec());
+            });
+        assert!(
+            matches!(
+                result,
+                Err(JobError::IdentityMismatch {
+                    identity: IdentityKind::Vin
+                })
+            ),
+            "{result:?}"
+        );
+        assert_eq!((host.sent(), promotions), (vec![read_vin()], 0));
+
+        let (result, host, promotions) =
+            identity_check(&flash_program(), Some(TARGET_VIN), |host| {
+                host.vin = None;
+            });
+        assert_not_established_check(&result, IdentityKind::Vin);
+        assert_eq!((host.sent(), promotions), (vec![read_vin()], 0));
+
+        // A hardware identity that differs comes after the promotion.
+        let (result, _, promotions) = identity_check(&flash_program(), Some(TARGET_VIN), |host| {
+            host.hardware = Some(b"HW02".to_vec());
+        });
+        assert!(
+            matches!(
+                result,
+                Err(JobError::IdentityMismatch {
+                    identity: IdentityKind::HardwarePartNumber
+                })
+            ),
+            "{result:?}"
+        );
+        assert_eq!(promotions, 1);
+    }
+
+    /// An error of the promotion ends step 3a before the hardware identity is read.
+    #[test]
+    fn a_failed_promotion_ends_step_3a_before_the_hardware_read() {
+        let program = flash_program();
+        let dir = journal_dir("identity-promotion-error");
+        interrupted(&program, &dir);
+        let point = restart_point(&program, &dir);
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        let result = restart::check_identity(
+            &program,
+            &point,
+            &restart::Teardown::Reset,
+            &identity_sources(),
+            &mut host,
+            &AtomicBool::new(false),
+            |_| Err(JobError::Cancelled),
+        );
+        assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
+        assert_eq!(host.sent(), [read_vin()]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A cancel set before step 3a, or during either of its reads, ends it in `Cancelled`
+    /// without a later request or a promotion after the cancelled read.
+    #[test]
+    fn a_cancel_ends_step_3a_at_its_reads() {
+        let program = flash_program();
+        let dir = journal_dir("identity-cancel");
+        interrupted(&program, &dir);
+        let point = restart_point(&program, &dir);
+        let run = |host: &mut FlashHost, cancelled: &AtomicBool| {
+            let mut promotions = 0;
+            let result = restart::check_identity(
+                &program,
+                &point,
+                &restart::Teardown::Reset,
+                &identity_sources(),
+                host,
+                cancelled,
+                |_| {
+                    promotions += 1;
+                    Ok(())
+                },
+            );
+            (result, promotions)
+        };
+
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        let (result, promotions) = run(&mut host, &AtomicBool::new(true));
+        assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
+        assert_eq!((host.sent(), promotions), (vec![], 0));
+
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        host.cancel_on_vin_read = Some((0, Arc::clone(&flag)));
+        let (result, promotions) = run(&mut host, &flag);
+        assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
+        assert_eq!((host.sent(), promotions), (vec![read_vin()], 0));
+
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        host.cancel_on_read = Some(([0xF1, 0x91], Arc::clone(&flag)));
+        let (result, promotions) = run(&mut host, &flag);
+        assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
+        assert_eq!(
+            (host.sent(), promotions),
+            (vec![read_vin(), read_hardware()], 1)
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Step 2 cannot read the VIN, so it takes no lock and the teardown is passive; step 3a
+    /// reads it, and its promotion holds the per-vehicle lock: a job on another VCI cannot take
+    /// the vehicle until the guards are dropped.
+    #[test]
+    fn step_3a_takes_the_vehicle_lock_when_step_2_could_not() {
+        let program = flash_program();
+        let dir = journal_dir("identity-fallback");
+        interrupted(&program, &dir);
+        let slot: GuardSlot = Arc::new(Mutex::new(Some(take_guards(&dir))));
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        host.vin_script = [IdAnswer::Refuse].into();
+        let result = resume_in(&program, &dir, &mut host, false, Some(TARGET_VIN), &slot);
+        assert_eq!(
+            teardown_of(&result),
+            passive_gate(restart::PassiveReason::VinNotEstablished)
+        );
+        let guards = slot.lock().unwrap().take().unwrap();
+        assert!(guards.holds_vehicle());
+        assert!(guards.holds_slot());
+
+        let mut other = other_vci_guards(&dir);
+        assert!(vehicle_is_held(&mut other));
+        drop(guards);
+        assert!(!vehicle_is_held(&mut other));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Step 2 cannot read the VIN and takes no lock; another job holds the vehicle. Step 3a's
+    /// matching VIN read makes the restart wait in the promotion: nothing more is sent (no hardware
+    /// read) and the guard slot is not locked. A cancel then ends it in `Cancelled`, with the
+    /// guards back in the slot and without the vehicle.
+    #[test]
+    fn step_3a_waits_for_the_vehicle_and_a_cancel_ends_the_wait() {
+        let program = flash_program();
+        let dir = journal_dir("identity-wait");
+        interrupted(&program, &dir);
+        let _other = other_job_holding_the_vehicle(&dir);
+        let slot: GuardSlot = Arc::new(Mutex::new(Some(take_guards(&dir))));
+        let mirror = Arc::new(Mutex::new(Vec::new()));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let job = {
+            let (program, dir) = (program.clone(), dir.clone());
+            let (slot, mirror, cancelled) = (
+                Arc::clone(&slot),
+                Arc::clone(&mirror),
+                Arc::clone(&cancelled),
+            );
+            std::thread::spawn(move || {
+                let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+                host.mirror = Some(mirror);
+                host.vin_script = [IdAnswer::Refuse].into();
+                resume_on(
+                    &program,
+                    &mut host,
+                    JobLimits::default(),
+                    &cancelled,
+                    Journal::open(&dir, &job_key()),
+                    identity_sources(),
+                    Some(&target()),
+                    &slot,
+                )
+            })
+        };
+
+        // The guards are out of the slot, which can be locked: the job waits for the vehicle.
+        wait_until(|| slot.try_lock().is_ok_and(|slot| slot.is_none()));
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!job.is_finished());
+        let sent = mirror.lock().unwrap().clone();
+        assert_eq!(
+            sent,
+            [read_vin(), read_of([0xF1, 0x86]), read_vin()],
+            "no hardware read while the job waits"
+        );
+
+        cancelled.store(true, Ordering::Relaxed);
+        let result = job.join().unwrap();
+        assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
+        assert_eq!(*mirror.lock().unwrap(), sent);
+        let guards = slot.lock().unwrap().take().unwrap();
+        assert!(!guards.holds_vehicle());
+        assert!(guards.holds_slot());
+        drop(guards);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Step 2 already promoted: step 3a promotes again, and guards that hold the vehicle go on at
+    /// once (the restart is not blocked by its own lock).
+    #[test]
+    fn step_3a_promotes_again_without_blocking_when_step_2_promoted() {
+        let program = flash_program();
+        let dir = journal_dir("identity-again");
+        interrupted(&program, &dir);
+        let slot: GuardSlot = Arc::new(Mutex::new(Some(take_guards(&dir))));
+        promote_to_vehicle(&slot, &target(), POLL, &AtomicBool::new(false)).unwrap();
+        let point = restart_point(&program, &dir);
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        let mut calls = 0;
+        let result = restart::check_identity(
+            &program,
+            &point,
+            &restart::Teardown::Reset,
+            &identity_sources(),
+            &mut host,
+            &AtomicBool::new(false),
+            |vin| {
+                calls += 1;
+                promote_to_vehicle(&slot, vin, POLL, &AtomicBool::new(false))
+            },
+        );
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(calls, 1);
+        let mut guards = slot.lock().unwrap().take().unwrap();
+        assert!(guards.holds_vehicle());
+        // Taking the held vehicle again does not wait.
+        assert!(!waits_for_holder(|cancelled| {
+            guards.take_vehicle(&target(), POLL, cancelled)
+        }));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A cancel during step 3a's VIN read ends the restart in `Cancelled`. The lock is what step 2
+    /// left: held when step 2 promoted, not held when it could not read the VIN (the cancelled
+    /// read takes no lock).
+    #[test]
+    fn a_cancel_during_the_step_3a_vin_read_keeps_the_lock_outcome_of_step_2() {
+        for (name, step_2_reads_vin) in [("step 2 promoted", true), ("step 2 could not", false)] {
+            let program = flash_program();
+            let dir = journal_dir("identity-cancel-lock");
+            interrupted(&program, &dir);
+            let slot: GuardSlot = Arc::new(Mutex::new(Some(take_guards(&dir))));
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+            if !step_2_reads_vin {
+                host.vin_script = [IdAnswer::Refuse].into();
+            }
+            host.cancel_on_vin_read = Some((1, Arc::clone(&cancelled)));
+            let result = resume_on(
+                &program,
+                &mut host,
+                JobLimits::default(),
+                &cancelled,
+                Journal::open(&dir, &job_key()),
+                identity_sources(),
+                Some(&target()),
+                &slot,
+            );
+            assert!(
+                matches!(result, Err(JobError::Cancelled)),
+                "{name}: {result:?}"
+            );
+            assert_eq!(host.sent().last(), Some(&read_vin()), "{name}");
+            let guards = slot.lock().unwrap().take().unwrap();
+            assert_eq!(guards.holds_vehicle(), step_2_reads_vin, "{name}");
+            assert!(guards.holds_slot(), "{name}");
+            drop(guards);
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    /// A restart whose step 3a VIN differs holds the lock only as step 2 left it, and sends no
+    /// request after the failing read: the job does not go on.
+    #[test]
+    fn a_step_3a_vin_mismatch_keeps_the_lock_outcome_of_step_2() {
+        let program = flash_program();
+        let dir = journal_dir("identity-mismatch-lock");
+        interrupted(&program, &dir);
+        let slot: GuardSlot = Arc::new(Mutex::new(Some(take_guards(&dir))));
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        host.vin_script = [IdAnswer::Refuse, IdAnswer::value("WDB99999999999999")].into();
+        let result = resume_in(&program, &dir, &mut host, false, Some(TARGET_VIN), &slot);
+        assert!(
+            matches!(
+                result,
+                Err(JobError::IdentityMismatch {
+                    identity: IdentityKind::Vin
+                })
+            ),
+            "{result:?}"
+        );
+        let guards = slot.lock().unwrap().take().unwrap();
+        assert!(!guards.holds_vehicle());
+        assert_eq!(host.sent().last(), Some(&read_vin()));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     // ------------------------------------ promotion to the vehicle lock (ADR-263)
 
     const POLL: Duration = Duration::from_millis(1);
@@ -4096,7 +4822,9 @@ mod tests {
                 read_of([0xF1, 0x90]),
                 read_of([0xF1, 0x91]),
                 reset_sent(),
-                read_of([0xF1, 0x86])
+                read_of([0xF1, 0x86]),
+                read_of([0xF1, 0x90]),
+                read_of([0xF1, 0x91]),
             ]
         );
         let guards = slot.lock().unwrap().take().unwrap();

@@ -178,7 +178,7 @@ ECU, it opens the job's journal (`Journal::open`) and classifies it.
 |---|---|
 | plain start | runs the program from its start on the same journal; its step count starts at `restart::next_steps`, after the journal's last record, and the identity is read again. A program without a plan runs without a journal, when it has none or one that records no transfer |
 | `OnSiteInterventionRequired` | ends in `JobError::OnSiteInterventionRequired` with the classification's reason; nothing is sent |
-| `Restart` | runs `restart::check_before_ecu`, then the gates of `restart::check_gates` (which promote the guards to the per-vehicle lock once the VIN matches, ADR-263), then the teardown of `restart::teardown` (ADR-264), then the default-session confirmation of `restart::confirm_default_session` (ADR-265). An ECU that cannot be confirmed ends the job in `JobError::OnSiteInterventionRequired(DefaultSessionNotConfirmed)`; otherwise it ends in `OnSiteInterventionRequired(RestartOrderUnavailable)` carrying the teardown's outcome and the confirmation, because step 3 (the service-dependent checks), the ECU state check and the replay do not run in the agent; the gates' reads, at most one ECUReset and the F186 reads reach the ECU |
+| `Restart` | runs `restart::check_before_ecu`, then the gates of `restart::check_gates` (which promote the guards to the per-vehicle lock once the VIN matches, ADR-263), then the teardown of `restart::teardown` (ADR-264), then the default-session confirmation of `restart::confirm_default_session` (ADR-265). An ECU that cannot be confirmed ends the job in `JobError::OnSiteInterventionRequired(DefaultSessionNotConfirmed)`. Then `restart::check_identity` (step 3a) reads the VIN and the hardware identity again: a different one ends the job in `IdentityMismatch`, one that cannot be established in `OnSiteInterventionRequired(IdentityNotEstablished)`, and a matching VIN promotes the guards again (the lock's fallback when step 2 could not read it). Otherwise it ends in `OnSiteInterventionRequired(RestartOrderUnavailable)` carrying the teardown's outcome and the confirmation, because step 3b (the ECU state check) and the replay do not run in the agent; the gates' reads, at most one ECUReset, the F186 reads and step 3a's two reads reach the ECU |
 
 `check_before_ecu` is the part of ADR-229 item 2 step 1 that an agent without a server makes:
 
@@ -270,9 +270,30 @@ retried while the window lasts. When an attempt fails:
 - after `Teardown::Passive`, where the wait has run already, the failure is final at once.
 
 A failure is `JobError::OnSiteInterventionRequired(DefaultSessionNotConfirmed { flash_session,
-teardown })`: someone on site must check the ECU. A confirmation ends in
-`RestartOrderUnavailable { flash_session, teardown, confirmed }`. The F186 reads put no VIN in a
+teardown })`: someone on site must check the ECU. The F186 reads put no VIN in a
 log message or a result.
+
+`restart::check_identity` is step 3a (ADR-229 item 2 step 3), run after a confirmation. It
+reads in the default session and sends nothing but ReadDataByIdentifier through the declared
+sources, with a cancel check at the start and around each read:
+
+- the VIN, required again even when step 2 matched it. A well-formed VIN equal to the journal's
+  target VIN promotes the guards to the per-vehicle lock again (`JobGuards::take_vehicle`
+  returns at once when they hold that vehicle, so step 2's promotion is not repeated in
+  effect). When step 2 could not read the VIN, this promotion is the fallback that takes the
+  lock, after the passive teardown. A well-formed VIN that differs ends the job in
+  `JobError::IdentityMismatch { identity: Vin }`. Anything else (no target VIN or no declared
+  source, no answer, a negative response, a value that is not a well-formed VIN, a worker
+  failure) ends it in `OnSiteInterventionRequired(IdentityNotEstablished { flash_session,
+  identity: Vin, teardown })`, where `teardown` is step 2b-1's outcome, so the technician
+  knows whether an ECUReset was sent;
+- the hardware identity, only after the VIN matched: the raw field bytes must equal the
+  journal's. Different bytes end the job in `IdentityMismatch { identity: HardwarePartNumber }`,
+  and anything else (no recorded value or source, no answer, a negative response, a worker
+  failure) in `IdentityNotEstablished { identity: HardwarePartNumber, teardown }`.
+
+A job that passes ends in `RestartOrderUnavailable { flash_session, teardown, confirmed }`. The
+reads put no VIN in a log message or a result.
 
 ## Job guards
 

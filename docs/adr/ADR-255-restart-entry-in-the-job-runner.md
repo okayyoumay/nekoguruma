@@ -1,7 +1,7 @@
 # ADR-255: The Restart Entry in the Job Runner
 
 **Date:** 2026-10-09
-**Status:** Accepted (item 5's "locks not taken" and the duplicate-resume consequence superseded by ADR-256; item 5's "nothing sent to the ECU" superseded by ADR-261; item 5's teardown that does not run superseded by ADR-264)
+**Status:** Accepted (item 5's "locks not taken" and the duplicate-resume consequence superseded by ADR-256; item 5's "nothing sent to the ECU" superseded by ADR-261; item 5's teardown that does not run superseded by ADR-264; item 3 amended and the stale-entry-state consequence closed by ADR-272)
 **Affects:** `agent` (`src/runner.rs`, `src/restart.rs`, `src/journaling.rs`, `src/journal.rs`, `src/lib.rs`), `Cargo.toml` (`rust-version`), ADR-253 item 4, ADR-244 (the no-lock consequence)
 
 ## Context

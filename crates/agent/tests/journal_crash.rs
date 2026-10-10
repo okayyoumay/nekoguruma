@@ -10,8 +10,8 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agent::journal::{
-    JobKey, Journal, JournalError, RecoveryFacts, StageId, StepRef, TransferAttempt, TransferExit,
-    Vin,
+    JobKey, Journal, JournalError, JournalState, RecoveryFacts, StageId, StepRef, TransferAttempt,
+    TransferExit, Vin,
 };
 use shared_proto::JobId;
 
@@ -39,9 +39,10 @@ fn at(pc: u32, steps: u64) -> StepRef {
 
 type Commit = fn(&mut Journal) -> Result<(), JournalError>;
 
-/// A write job's commits in order: identity, a resume, a transfer through RequestTransferExit
+/// A write job's commits in order: the run start (ADR-272), identity, a resume, a transfer through RequestTransferExit
 /// and its post-transfer steps, then a second resume whose new transfer start clears them.
 const SCRIPT: &[(&str, Commit)] = &[
+    ("run start", |j| j.commit_run_start(at(0, 0), b"initial")),
     ("hardware part number", |j| {
         j.commit_ecu_hardware_part_number(b"NGR-SIM-ECU")
     }),
@@ -107,8 +108,9 @@ fn temp_dir(name: &str) -> TempDir {
 }
 
 /// The points [`check_named_point`] spells out.
-const NAMED_POINTS: [&str; 13] = [
+const NAMED_POINTS: [&str; 14] = [
     "created",
+    "run start",
     "pre-erase version",
     "resume",
     "programming session",
@@ -125,7 +127,8 @@ const NAMED_POINTS: [&str; 13] = [
 
 /// What the journal must hold after `commits` commits, spelled out for the points the restart
 /// order depends on. Returns the point's name if it is one of them.
-fn check_named_point(commits: usize, facts: &RecoveryFacts) -> Option<&'static str> {
+fn check_named_point(commits: usize, state: &JournalState) -> Option<&'static str> {
+    let facts = &state.facts;
     let first_transfer = |last_block, exit| {
         Some(TransferAttempt {
             stage: STAGE,
@@ -163,7 +166,14 @@ fn check_named_point(commits: usize, facts: &RecoveryFacts) -> Option<&'static s
                 intended_software_version: None,
             }
         ),
+        // The newest VM state is the run start's, and it names no request.
+        "run start" => {
+            assert_eq!(state.last_vm_state, Some((at(0, 0), b"initial".to_vec())));
+            assert_eq!(facts.last_step, None);
+            assert_eq!(facts.transfer, None);
+        }
         "pre-erase version" => {
+            assert_eq!(state.last_vm_state, Some((at(0, 0), b"initial".to_vec())));
             assert_eq!(
                 facts.ecu_hardware_part_number.as_deref(),
                 Some(&b"NGR-SIM-ECU"[..])
@@ -178,6 +188,8 @@ fn check_named_point(commits: usize, facts: &RecoveryFacts) -> Option<&'static s
         "programming session" => {
             assert_eq!(facts.transfer, None);
             assert_eq!(facts.last_step, Some(at(2, 10)));
+            // A later state replaces the run start's.
+            assert_eq!(state.last_vm_state, Some((at(2, 10), b"vm".to_vec())));
         }
         // After it: the marker names the RequestDownload, which has not completed.
         "transfer-start marker" => {
@@ -270,7 +282,6 @@ fn the_journal_reads_back_after_a_crash_at_each_commit() {
 
         let journal = Journal::open(&crashed.0, &key())
             .unwrap_or_else(|error| panic!("after {commits} commits: {error}"));
-        let facts = journal.summary();
         // The same commits in this process, without a crash.
         let reference_dir = temp_dir("reference");
         let reference = run_script(&reference_dir.0, commits);
@@ -280,7 +291,7 @@ fn the_journal_reads_back_after_a_crash_at_each_commit() {
             "after {commits} commits"
         );
         assert_eq!(journal.state().records, commits as u64);
-        checked.extend(check_named_point(commits, &facts));
+        checked.extend(check_named_point(commits, journal.state()));
     }
     assert_eq!(checked, NAMED_POINTS, "every named point is reached");
 }

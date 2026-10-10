@@ -233,7 +233,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-241](ADR-241-sim-ecu-state-file.md) | Simulated ECU State Kept in a File Across Worker Processes | Accepted | `sim-ecu` snapshot, `sim-vci` `NGR_SIM_ECU_STATE` |
 | [ADR-242](ADR-242-ir-variable-length-and-nested-layouts.md) | IR Variable-Length Fields and Nested Layouts | Accepted | `diag-ir` declaration schema (`ir.fbs`) |
 | [ADR-243](ADR-243-codeql-and-backlog-loops-share-one-claim.md) | The CodeQL and Backlog Loops Share One PR-Based Claim | Accepted (Decision item 3's skipping of high and critical alerts and item 4's number-only hand-off of them superseded by ADR-246) | `.claude/skills/codeql-alerts`, `backlog-loop` |
-| [ADR-244](ADR-244-write-job-journal-format.md) | Write-Job Journal as an Append-Only Record Log | Accepted (record set extended by ADR-253, ADR-261 and ADR-268; item 4's target VIN is a journal record since ADR-261, and its version being written since ADR-268; the no-lock consequence superseded by ADR-255 item 7) | `agent` write-job journal |
+| [ADR-244](ADR-244-write-job-journal-format.md) | Write-Job Journal as an Append-Only Record Log | Accepted (record set extended by ADR-253, ADR-261, ADR-268 and ADR-272; item 4's target VIN is a journal record since ADR-261, and its version being written since ADR-268; the no-lock consequence superseded by ADR-255 item 7) | `agent` write-job journal |
 | [ADR-245](ADR-245-ir-restart-declaration-in-the-procedure-part.md) | The IR's Restart Declaration Lives in the Procedure Part | Accepted (items 4 and 6 amended by ADR-250) | `diag-ir` `Program` restart declaration, `ir.fbs` `FlashSession` |
 | [ADR-246](ADR-246-codeql-hand-off-carries-private-alert-details.md) | The CodeQL Hand-Off Carries High and Critical Alert Details Privately | Accepted | `.github/workflows/codeql-alert-handoff.yml`, `.claude/skills/codeql-alerts` |
 | [ADR-247](ADR-247-debug-builds-may-write-to-sim-vci.md) | Debug Builds May Send Write Requests to `sim-vci` | Accepted (Decision item 4's refusal of `FlashTransfer` superseded by ADR-250; its reason for refusing `SecurityAccess` replaced by ADR-259) | `agent` policy, link, host, runner |
@@ -241,10 +241,10 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-249](ADR-249-backlog-loop-iterations-start-from-a-fresh-branch.md) | Backlog Loop Iterations Start from a Fresh Branch at `origin/main` | Accepted | `.claude/skills/backlog-loop` (step 1), `codeql-alerts` |
 | [ADR-250](ADR-250-agent-host-flash-transfer.md) | The Agent Host Implements FlashTransfer with Its Own Block Count | Accepted | `agent` host, policy; `diag-ir` plan validation |
 | [ADR-251](ADR-251-copilot-re-review-only-after-fixes-that-need-it.md) | Copilot Re-Review Only After Fixes That Need It | Accepted | `.claude/skills/pr-review-loop` (Steps 0, 4-5), `.github/copilot-instructions.md`, `CLAUDE.md` |
-| [ADR-252](ADR-252-job-runner-journals-at-plan-boundaries.md) | The Job Runner Journals at the Flash Recovery Plan's Boundaries | Accepted (item 2's open point decided by ADR-253; the step reaching a plan's end records the VM state since ADR-271) | `agent` runner, journaling, inputs |
-| [ADR-253](ADR-253-restart-classification-and-the-recovery-point-intent.md) | Restart Classification and a Write-Ahead Intent at the Recovery-Required Point | Accepted (item 4's wiring into the runner decided by ADR-255) | `agent` restart, journaling, journal |
+| [ADR-252](ADR-252-job-runner-journals-at-plan-boundaries.md) | The Job Runner Journals at the Flash Recovery Plan's Boundaries | Accepted (item 2's open point decided by ADR-253; the step reaching a plan's end records the VM state since ADR-271; item 6 superseded by ADR-272) | `agent` runner, journaling, inputs |
+| [ADR-253](ADR-253-restart-classification-and-the-recovery-point-intent.md) | Restart Classification and a Write-Ahead Intent at the Recovery-Required Point | Accepted (item 4's wiring into the runner decided by ADR-255; item 3's newest state includes the run start since ADR-272) | `agent` restart, journaling, journal |
 | [ADR-254](ADR-254-starlark-for-proprietary-procedures.md) | Starlark Replaces JavaScript as the Proprietary Procedure Language | Accepted | `diag-frontend` subset spec, design 8.4, `ir.fbs` `source_format` |
-| [ADR-255](ADR-255-restart-entry-in-the-job-runner.md) | The Restart Entry in the Job Runner | Accepted (item 5's "locks not taken" and the duplicate-resume consequence superseded by ADR-256; item 5's "nothing sent to the ECU" superseded by ADR-261; item 5's teardown that does not run superseded by ADR-264) | `agent` runner, restart, journaling |
+| [ADR-255](ADR-255-restart-entry-in-the-job-runner.md) | The Restart Entry in the Job Runner | Accepted (item 5's "locks not taken" and the duplicate-resume consequence superseded by ADR-256; item 5's "nothing sent to the ECU" superseded by ADR-261; item 5's teardown that does not run superseded by ADR-264; item 3 amended and the stale-entry-state consequence closed by ADR-272) | `agent` runner, restart, journaling |
 | [ADR-256](ADR-256-restart-guards-as-os-file-locks.md) | Restart Guards as OS Locks on Files in a Device Lock Directory | Accepted (the first-run consequence and item 1's write access to lock files superseded by ADR-257; the failed-close consequence superseded by ADR-258; item 6's per-vehicle lock settled by ADR-262) | `agent` guards, runner |
 | [ADR-257](ADR-257-every-job-runs-on-guards.md) | Every Job Runs on Guards It Holds | Accepted (lock files must be regular files since ADR-262 item 6) | `agent` guards, runner, policy, CLI |
 | [ADR-258](ADR-258-a-failed-link-close-keeps-the-job-guards.md) | A Failed Link Close Keeps the Job Guards | Accepted | `agent` guards, runner, CLI; `worker-host` |
@@ -261,6 +261,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-269](ADR-269-restart-completion-of-the-interrupted-pass.md) | Only the Interrupted Pass's Completion Sends a Restart to Read-Back Verification | Accepted | `agent` restart, design 8.2.5 |
 | [ADR-270](ADR-270-library-writability-check.md) | What "Writable by Regular Users" Means for the Pre-Load Check | Accepted | `ngr-library-resolver`, design 7.2 |
 | [ADR-271](ADR-271-restart-read-back-verification.md) | After a Restart, Read-Back Verification Is the State Check's Match, and the Program Continues from the Plan's End | Accepted | `agent` restart, runner, journaling, design 5.6 / 8.2.5 |
+| [ADR-272](ADR-272-journal-run-start-record.md) | Every Journaled Run Records the State It Starts From | Accepted | `agent` journal, runner, restart |
 
 ## Status Legend
 
@@ -603,13 +604,13 @@ the predecessor repository these ADRs came from.
 - ADR-233 (item 3's `VmState` fields removed by ADR-245)
 - ADR-235 (item 8 relaxed for debug builds against `sim-vci` by ADR-247)
 - ADR-241
-- ADR-244 (record set extended by ADR-253, ADR-261 and ADR-268; item 4's target VIN is a journal record since ADR-261, and its version being written since ADR-268; the no-lock consequence superseded by ADR-255 item 7)
+- ADR-244 (record set extended by ADR-253, ADR-261, ADR-268 and ADR-272; item 4's target VIN is a journal record since ADR-261, and its version being written since ADR-268; the no-lock consequence superseded by ADR-255 item 7)
 - ADR-245 (items 4 and 6 amended by ADR-250)
 - ADR-247 (Decision item 4's refusal of `FlashTransfer` superseded by ADR-250; its reason for refusing `SecurityAccess` replaced by ADR-259)
 - ADR-250
-- ADR-252 (item 2's open point decided by ADR-253; the step reaching a plan's end records the VM state since ADR-271)
-- ADR-253 (item 4's wiring into the runner decided by ADR-255)
-- ADR-255 (item 5's "locks not taken" and the duplicate-resume consequence superseded by ADR-256; item 5's "nothing sent to the ECU" superseded by ADR-261; item 5's teardown that does not run superseded by ADR-264)
+- ADR-252 (item 2's open point decided by ADR-253; the step reaching a plan's end records the VM state since ADR-271; item 6 superseded by ADR-272)
+- ADR-253 (item 4's wiring into the runner decided by ADR-255; item 3's newest state includes the run start since ADR-272)
+- ADR-255 (item 5's "locks not taken" and the duplicate-resume consequence superseded by ADR-256; item 5's "nothing sent to the ECU" superseded by ADR-261; item 5's teardown that does not run superseded by ADR-264; item 3 amended and the stale-entry-state consequence closed by ADR-272)
 - ADR-256 (the first-run consequence and item 1's write access to lock files superseded by ADR-257; the failed-close consequence superseded by ADR-258; item 6's per-vehicle lock settled by ADR-262)
 - ADR-257 (lock files must be regular files since ADR-262 item 6)
 - ADR-258
@@ -623,6 +624,7 @@ the predecessor repository these ADRs came from.
 - ADR-268 (item 5's completion counts only for the interrupted pass since ADR-269)
 - ADR-269
 - ADR-271
+- ADR-272
 
 ### Diagnostic IR
 - ADR-233 (item 3's `VmState` fields removed by ADR-245)

@@ -745,6 +745,11 @@ where
     let wait_poll = limits.wait_poll.max(Duration::from_millis(1));
     let mut vm = Vm::new(program);
     vm.state.steps = first_step;
+    // The state this run starts from is the journal's first record of the run (ADR-272), so a
+    // restart never takes an earlier run's state for it.
+    if let Some(journal) = journal.as_deref_mut() {
+        journal.run_start(&vm.state)?;
+    }
     // Whether the journal has seen this arrival yet (a timer wait polls the same instruction
     // again).
     let mut arrived = true;
@@ -1624,36 +1629,52 @@ mod tests {
         let mut host = FlashHost::new(Rc::clone(&commits));
         let mut journal = counting_journal(&commits, None);
         run_flash(&mut host, &mut journal).unwrap();
-        // Commits: 1 the step into the entry with the VM state, 2 the hardware part number,
-        // 3 the software version, 4 the transfer start, 5 the erase's step, 6 the
-        // RequestDownload's step, 7-12 each block and its step, 13 the exit marker, 14
-        // RequestTransferExit's step, 15 the completion.
+        // Commits: 1 the run start, 2 the step into the entry with the VM state, 3 the hardware
+        // part number, 4 the software version, 5 the transfer start, 6 the erase's step, 7 the
+        // RequestDownload's step, 8-13 each block and its step, 14 the exit marker, 15
+        // RequestTransferExit's step, 16 the completion.
         assert_eq!(
             host.log,
             [
-                (Sent::Service(0x10, vec![0x01]), 0),
-                (Sent::Service(0x22, vec![0xF1, 0x91]), 1),
-                (Sent::Service(0x22, vec![0xF1, 0x95]), 2),
-                (Sent::Routine(0xFF00), 4),
-                (Sent::Service(0x34, vec![0x01]), 5),
-                (Sent::Block, 6),
-                (Sent::Block, 8),
-                (Sent::Block, 10),
-                (Sent::Service(0x37, vec![0x01]), 13),
+                (Sent::Service(0x10, vec![0x01]), 1),
+                (Sent::Service(0x22, vec![0xF1, 0x91]), 2),
+                (Sent::Service(0x22, vec![0xF1, 0x95]), 3),
+                (Sent::Routine(0xFF00), 5),
+                (Sent::Service(0x34, vec![0x01]), 6),
+                (Sent::Block, 7),
+                (Sent::Block, 9),
+                (Sent::Block, 11),
+                (Sent::Service(0x37, vec![0x01]), 14),
             ]
         );
-        assert_eq!(commits.get(), 15);
+        assert_eq!(commits.get(), 16);
         let facts = &journal.journal().state().facts;
         let transfer = facts.transfer.as_ref().unwrap();
         assert_eq!(transfer.last_block, Some(3));
         assert!(transfer.exit.as_ref().unwrap().complete);
     }
 
+    /// The run start is the first commit of a first run (ADR-272); when it fails, the job ends
+    /// with nothing sent.
+    #[test]
+    fn a_failed_run_start_commit_ends_a_first_run_with_nothing_sent() {
+        let commits = Rc::new(Cell::new(0));
+        let mut host = FlashHost::new(Rc::clone(&commits));
+        let mut journal = counting_journal(&commits, Some(1));
+        let result = run_flash(&mut host, &mut journal);
+        assert!(
+            matches!(result, Err(JobError::Journal(JournalError::Io(_)))),
+            "{result:?}"
+        );
+        assert_eq!(host.sent(), []);
+        assert_eq!(commits.get(), 0);
+    }
+
     #[test]
     fn a_failed_transfer_start_commit_ends_the_job_before_the_erase() {
         let commits = Rc::new(Cell::new(0));
         let mut host = FlashHost::new(Rc::clone(&commits));
-        let mut journal = counting_journal(&commits, Some(4));
+        let mut journal = counting_journal(&commits, Some(5));
         let result = run_flash(&mut host, &mut journal);
         assert!(
             matches!(result, Err(JobError::Journal(JournalError::Io(_)))),
@@ -1673,7 +1694,7 @@ mod tests {
     fn a_failed_exit_marker_commit_ends_the_job_before_request_transfer_exit() {
         let commits = Rc::new(Cell::new(0));
         let mut host = FlashHost::new(Rc::clone(&commits));
-        let mut journal = counting_journal(&commits, Some(13));
+        let mut journal = counting_journal(&commits, Some(14));
         let result = run_flash(&mut host, &mut journal);
         assert!(
             matches!(result, Err(JobError::Journal(JournalError::Io(_)))),
@@ -1693,7 +1714,7 @@ mod tests {
         let commits = Rc::new(Cell::new(0));
         let mut host = FlashHost::new(Rc::clone(&commits));
         // The second block's commit.
-        let mut journal = counting_journal(&commits, Some(9));
+        let mut journal = counting_journal(&commits, Some(10));
         assert!(matches!(
             run_flash(&mut host, &mut journal),
             Err(JobError::Journal(JournalError::Io(_)))
@@ -2046,8 +2067,8 @@ mod tests {
             Some(&mut journal),
         )
         .unwrap();
-        // The adjacent-plans count (16 + 12) plus one intent per plan.
-        assert_eq!(commits.get(), 16 + 12 + 2);
+        // The adjacent-plans count (17 + 12) plus one intent per plan.
+        assert_eq!(commits.get(), 17 + 12 + 2);
         assert_eq!(
             journal.journal().state().facts.last_intent.map(|at| at.pc),
             Some(download + shift)
@@ -2226,9 +2247,10 @@ mod tests {
         assert_eq!(transfer.last_block, Some(3));
     }
 
-    /// A job that starts at the plan's entry has its initial state there: no step record.
+    /// A job that starts at the plan's entry has its initial state there: it records it as its
+    /// run start (ADR-272), and no step record carries a state.
     #[test]
-    fn a_job_that_starts_at_the_entry_records_no_state() {
+    fn a_job_that_starts_at_the_entry_records_its_initial_state_as_the_run_start() {
         let mut program = flash_program();
         // Drop the programming session: the plan starts the program.
         program.code.drain(..3);
@@ -2250,11 +2272,15 @@ mod tests {
         )
         .unwrap();
         let state = journal.journal().state();
-        assert_eq!(state.last_vm_state, None);
+        let initial = postcard::to_allocvec(&Vm::new(&program).state).unwrap();
+        assert_eq!(
+            state.last_vm_state,
+            Some((StepRef { pc: 0, steps: 0 }, initial))
+        );
         assert_eq!(state.facts.transfer.as_ref().unwrap().last_block, Some(3));
-        // Identity 2, transfer start 1, erase and RequestDownload steps 2, blocks and their
-        // steps 6, exit 1, its step 1, completion 1.
-        assert_eq!(commits.get(), 14);
+        // Run start 1, identity 2, transfer start 1, erase and RequestDownload steps 2, blocks
+        // and their steps 6, exit 1, its step 1, completion 1.
+        assert_eq!(commits.get(), 15);
     }
 
     /// Two plans where the first one's end is the second one's entry: the first completes before
@@ -2287,17 +2313,18 @@ mod tests {
             Some(&mut journal),
         )
         .unwrap();
-        // The first plan: 14 records up to RequestTransferExit's step, then the step into the
-        // second plan's entry (with the VM state) and the first plan's completion. The second:
-        // transfer start, 2 steps, 6 for the blocks, exit marker, its step, completion.
-        assert_eq!(commits.get(), 16 + 12);
+        // The run start, then the first plan: 14 records up to RequestTransferExit's step, then
+        // the step into the second plan's entry (with the VM state) and the first plan's
+        // completion. The second: transfer start, 2 steps, 6 for the blocks, exit marker, its
+        // step, completion.
+        assert_eq!(commits.get(), 17 + 12);
         let routines: Vec<u64> = host
             .log
             .iter()
             .filter(|(sent, _)| matches!(sent, Sent::Routine(_)))
             .map(|(_, commits)| *commits)
             .collect();
-        assert_eq!(routines, [4, 17]);
+        assert_eq!(routines, [5, 18]);
         let reads = host
             .sent()
             .iter()
@@ -6336,6 +6363,150 @@ mod tests {
         assert!(transfer.exit.as_ref().is_some_and(|exit| exit.complete));
         assert_eq!(after.facts.resume_count(crate::journal::StageId(7)), 0);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The done-when case of ADR-272: a plan entered at pc 0, with a jump back to it before the
+    /// erase. Run 1 jumps back (the journal gets that state) and stops before the erase; run 2,
+    /// a plain start, is interrupted in the transfer. The restart's entry state is run 2's
+    /// initial state, not run 1's.
+    #[test]
+    fn a_plain_start_at_pc_0_after_a_jump_back_restarts_from_its_own_initial_state() {
+        // Reads the VIN (F190) and jumps back to the entry unless the ECU answers it, so a run
+        // whose ECU does not answer it loops, leaving a byte string on the stack.
+        let mut program = flash_program();
+        let mut code = vec![
+            Op::PushBytes(1),
+            Op::ServiceRequest { service: 0x22 },
+            Op::PushI64(0),
+            Op::IndexGet,
+            Op::PushI64(0x62),
+            Op::CmpEq,
+            Op::JumpIfFalse(0),
+            Op::Pop,
+        ];
+        let prefix = code.len() as u32;
+        code.extend_from_slice(&program.code[ENTRY as usize..]);
+        let shift = prefix - ENTRY;
+        let len = code.len() as u32;
+        program.code = code;
+        program.constants.push(vec![0xF1, 0x90]);
+        let b = &mut program.flash[0].boundaries;
+        b.entry_pc = 0;
+        b.erase_pc += shift;
+        b.transfer_exit_pc += shift;
+        b.post_transfer_end_pc = len;
+        program
+            .validate()
+            .expect("a jump back to the entry is valid");
+        let erase = program.flash[0].boundaries.erase_pc;
+
+        let dir = journal_dir("restart-pc0");
+        // Run 1: jumps back once (seven instructions), then stops before the erase.
+        let limits = JobLimits {
+            max_steps: 7,
+            ..JobLimits::default()
+        };
+        let result = first_run(&program, &dir, limits, |host| host.vin = None);
+        assert!(matches!(result, Err(JobError::StepLimit(7))), "{result:?}");
+        let after_run_1 = Journal::read(&dir, &job_key()).unwrap();
+        assert!(after_run_1.facts.transfer.is_none());
+        let (at, jumped) = after_run_1.last_vm_state.as_ref().unwrap();
+        assert_eq!(at.pc, prefix - 2);
+        assert_eq!(
+            postcard::from_bytes::<VmState>(jumped).unwrap().stack.len(),
+            1
+        );
+
+        // Run 2: a plain start on the same journal, interrupted at the erase.
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        host.lose_routine = Some(0xFF00);
+        let result = resume(&program, &dir, &mut host, false);
+        assert!(
+            matches!(result, Err(JobError::Host { pc, .. }) if pc == erase),
+            "{result:?}"
+        );
+        let state = Journal::read(&dir, &job_key()).unwrap();
+        assert_eq!(
+            state.last_vm_state.as_ref().map(|(at, _)| at.steps),
+            Some(restart::next_steps(&after_run_1))
+        );
+        let restart::RestartDecision::Restart(point) = restart::classify(&program, Ok(&state))
+        else {
+            panic!("no restart");
+        };
+        let mut initial = Vm::new(&program).state;
+        initial.steps = restart::next_steps(&state);
+        assert_eq!(point.entry_state, initial);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A first run's records start with the creation prefix and then its run start (ADR-272),
+    /// before anything is sent.
+    #[test]
+    fn a_first_run_commits_its_run_start_right_after_the_creation_prefix() {
+        let program = flash_program();
+        let dir = journal_dir("run-start-order");
+        let limits = JobLimits {
+            max_steps: 0,
+            ..JobLimits::default()
+        };
+        let mut setup = file_setup(&dir);
+        setup.intended_software_version = Some(b"SW02".to_vec());
+        let mut journal = JobJournal::create(setup).unwrap();
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        let result = run_on(
+            &program,
+            &mut host,
+            limits,
+            &AtomicBool::new(false),
+            Some(&mut journal),
+        );
+        assert!(matches!(result, Err(JobError::StepLimit(0))), "{result:?}");
+        assert_eq!(host.sent(), []);
+        drop(journal);
+        let state = Journal::read(&dir, &job_key()).unwrap();
+        // The VIN, the version, the run start.
+        assert_eq!(state.records, 3);
+        assert_eq!(
+            state.last_vm_state,
+            Some((
+                StepRef { pc: 0, steps: 0 },
+                postcard::to_allocvec(&Vm::new(&program).state).unwrap()
+            ))
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The same on a plain start of an existing journal: the run start is the first commit of
+    /// the run, and when it fails nothing is sent (ADR-272).
+    #[test]
+    fn a_failed_run_start_commit_ends_a_plain_start_with_nothing_sent() {
+        let program = flash_program();
+        let commits = Rc::new(Cell::new(0));
+        let store = CountingStore {
+            commits: Rc::clone(&commits),
+            fail_at: Some(1),
+        };
+        let journal = crate::journal::Journal::on_store(store, job_key());
+        let mut host = FlashHost::new(Rc::clone(&commits));
+        let result = resume_on(
+            &program,
+            &mut host,
+            JobLimits::default(),
+            &AtomicBool::new(false),
+            Ok(journal),
+            identity_sources(),
+            None,
+            None,
+            &vci_only_slot("plain-run-start"),
+        );
+        assert!(
+            matches!(result, Err(JobError::Journal(JournalError::Io(_)))),
+            "{result:?}"
+        );
+        assert_eq!(host.sent(), []);
+        assert!(host.session_reads.is_empty());
+        assert_eq!(commits.get(), 0);
     }
 
     /// A program with a plan whose journal is missing or does not read back needs on-site

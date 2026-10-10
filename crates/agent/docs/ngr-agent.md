@@ -179,7 +179,7 @@ ECU, it opens the job's journal (`Journal::open`) and classifies it.
 |---|---|
 | plain start | runs the program from its start on the same journal; its step count starts at `restart::next_steps`, after the journal's last record, and the identity is read again. A program without a plan runs without a journal, when it has none or one that records no transfer |
 | `OnSiteInterventionRequired` | ends in `JobError::OnSiteInterventionRequired` with the classification's reason; nothing is sent |
-| `Restart` | runs `restart::check_before_ecu`, then the gates of `restart::check_gates` (which promote the guards to the per-vehicle lock once the VIN matches, ADR-263), then the teardown of `restart::teardown` (ADR-264), then the default-session confirmation of `restart::confirm_default_session` (ADR-265). An ECU that cannot be confirmed ends the job in `JobError::OnSiteInterventionRequired(DefaultSessionNotConfirmed)`. Then `restart::check_identity` (step 3a) reads the VIN and the hardware identity again: a different one ends the job in `IdentityMismatch`, one that cannot be established in `OnSiteInterventionRequired(IdentityNotEstablished)`, and a matching VIN promotes the guards again (the lock's fallback when step 2 could not read it). Otherwise it ends in `OnSiteInterventionRequired(RestartOrderUnavailable)` carrying the teardown's outcome and the confirmation, because step 3b (the ECU state check) and the replay do not run in the agent; the gates' reads, at most one ECUReset, the F186 reads and step 3a's two reads reach the ECU |
+| `Restart` | runs `restart::check_before_ecu`, then the gates of `restart::check_gates` (which promote the guards to the per-vehicle lock once the VIN matches, ADR-263), then the teardown of `restart::teardown` (ADR-264), then the default-session confirmation of `restart::confirm_default_session` (ADR-265). An ECU that cannot be confirmed ends the job in `JobError::OnSiteInterventionRequired(DefaultSessionNotConfirmed)`. Then `restart::check_identity` (step 3a) reads the VIN and the hardware identity again: a different one ends the job in `IdentityMismatch`, one that cannot be established in `OnSiteInterventionRequired(IdentityNotEstablished)`, and a matching VIN promotes the guards again (the lock's fallback when step 2 could not read it). Then `restart::check_state` (step 3b-2) reads the software version and decides between redoing the transfer and the read-back verification (`restart::check_state` below): a version nobody wrote ends the job in `OnSiteInterventionRequired(UnexpectedSoftwareVersion)`, one that cannot be established in `OnSiteInterventionRequired(SoftwareVersionNotEstablished)`. Otherwise it ends in `OnSiteInterventionRequired(RestartOrderUnavailable)` carrying the teardown's outcome, the confirmation and the state check, because step 4 and the read-back verification do not run in the agent; the gates' reads, at most one ECUReset, the F186 reads, step 3a's two reads and step 3b-2's version reads reach the ECU |
 
 `check_before_ecu` is the part of ADR-229 item 2 step 1 that an agent without a server makes:
 
@@ -303,8 +303,40 @@ sources, with a cancel check at the start and around each read:
   and anything else (no recorded value or source, no answer, a negative response, a worker
   failure) in `IdentityNotEstablished { identity: HardwarePartNumber, teardown }`.
 
-A job that passes ends in `RestartOrderUnavailable { flash_session, teardown, confirmed }`. The
-reads put no VIN in a log message or a result.
+The reads put no VIN in a log message or a result.
+
+`restart::check_state` is step 3b-2 (ADR-229 item 2 step 3, ADR-268 item 5), run after step 3a.
+It reads the software version through `identity.software_version` as raw field bytes, at most
+`1 + version_read_retries` times (the plan's value), pausing for the job's poll interval between an
+inconclusive read and the next (none before the first read or after the last; the pause is
+cancel-checked and sends nothing), and checks for a cancel at the start and around each read. The bytes are compared with the journal's facts, in this
+order:
+
+| Read | Journal | Result |
+|---|---|---|
+| a version equal to the intended one | post-transfer steps complete for the interrupted pass | `StateCheck::ReadBackVerification` |
+| a version equal to the intended one | not complete for the interrupted pass | `StateCheck::RedoTransfer` |
+| a version equal to the pre-erase one (and not the intended one) | any | `StateCheck::RedoTransfer` |
+| any other decoded version | any | `OnSiteInterventionRequired(UnexpectedSoftwareVersion)`, conclusive, not retried |
+| a negative response with the plan's declared `no_application` code | any | `StateCheck::RedoTransfer`, conclusive |
+| no answer, another negative response, a field that does not decode, a worker failure | any | read again; after the last read `OnSiteInterventionRequired(SoftwareVersionNotEstablished)` |
+
+"Complete for the interrupted pass" means the completion is journaled and the interruption point
+is no later than the completed pass's last post-transfer step (the test the classifier applies): a
+program that stepped back into the plan's entry after the completion and crashed in the later pass
+is redone, not read back (ADR-269).
+
+A program that declares no software-version source ends in `SoftwareVersionNotEstablished`
+without a read. When the intended version equals the pre-erase one, only the journal's record of
+the completed post-transfer steps tells a finished job from an unstarted one. A job that names no
+intended version never reaches `ReadBackVerification`: the pre-erase version is redone and any
+other decoded one is unexpected. Both reasons carry the step 2b-1 teardown. The step sends only
+ReadDataByIdentifier requests, so nothing changes the ECU, and a completed path sends no
+ECUReset in the whole restart.
+
+A job that passes ends in `RestartOrderUnavailable { flash_session, teardown, confirmed, state }`
+with `state` the `StateCheck` found: step 4 (the replay to the erase) and the read-back
+verification do not run in the agent yet.
 
 ## Job guards
 

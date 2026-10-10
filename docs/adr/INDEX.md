@@ -261,7 +261,8 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-269](ADR-269-restart-completion-of-the-interrupted-pass.md) | Only the Interrupted Pass's Completion Sends a Restart to Read-Back Verification | Accepted | `agent` restart, design 8.2.5 |
 | [ADR-270](ADR-270-library-writability-check.md) | What "Writable by Regular Users" Means for the Pre-Load Check | Accepted | `ngr-library-resolver`, design 7.2 |
 | [ADR-271](ADR-271-restart-read-back-verification.md) | After a Restart, Read-Back Verification Is the State Check's Match, and the Program Continues from the Plan's End | Accepted | `agent` restart, runner, journaling, design 5.6 / 8.2.5 |
-| [ADR-272](ADR-272-journal-run-start-record.md) | Every Journaled Run Records the State It Starts From | Accepted | `agent` journal, runner, restart |
+| [ADR-272](ADR-272-journal-run-start-record.md) | Every Journaled Run Records the State It Starts From | Accepted (item 2's open point for runs not from instruction 0 settled for the replay of step 4 by ADR-273) | `agent` journal, runner, restart |
+| [ADR-273](ADR-273-restart-replay-to-the-erase.md) | The Restart Replays the Program from the Entry State up to the Erase | Accepted | `agent` runner, restart, journaling |
 
 ## Status Legend
 
@@ -624,7 +625,8 @@ the predecessor repository these ADRs came from.
 - ADR-268 (item 5's completion counts only for the interrupted pass since ADR-269)
 - ADR-269
 - ADR-271
-- ADR-272
+- ADR-272 (item 2's open point for runs not from instruction 0 settled for the replay of step 4 by ADR-273)
+- ADR-273
 
 ### Diagnostic IR
 - ADR-233 (item 3's `VmState` fields removed by ADR-245)

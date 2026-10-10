@@ -264,8 +264,12 @@ pub async fn run_program_journaled(
 ///   established in the same error (`SoftwareVersionNotEstablished`). When it decides to redo
 ///   the transfer, `restart::check_reentry` checks every declared precondition again through its
 ///   default-session source (step 4a): one that does not hold ends the job in
-///   [`JobError::OnSiteInterventionRequired`] (`PreconditionNotMet`). The rest of the restart
-///   order (the replay of step 4 and the read-back verification) does not run in this agent, so
+///   [`JobError::OnSiteInterventionRequired`] (`PreconditionNotMet`). Then the program's steps
+///   from the plan's entry boundary up to, not including, its erase run again from the restart's
+///   entry state, journaled as in a first run but with no run start and no transfer-start marker
+///   (step 4b-2, ADR-273); a failure there ends the job as in a first run. The rest of the
+///   restart order (the second check of the mutable conditions before the erase, step 4b-3, the
+///   erase, step 4c, and the read-back verification) does not run in this agent, so
 ///   a job that passed ends in [`JobError::OnSiteInterventionRequired`] (`RestartOrderUnavailable`,
 ///   carrying the teardown's outcome, the confirmation and the state check), or in
 ///   [`JobError::IdentityMismatch`] when the ECU's VIN is another vehicle's;
@@ -554,7 +558,9 @@ impl Drop for CancelOnDrop {
 /// (step 2b-2, ADR-265), `restart::check_identity` reads the VIN and the hardware identity
 /// again (step 3a, ADR-229 item 2 step 3), `restart::check_state` reads the software version
 /// (step 3b-2, ADR-268 item 5), and on a redone transfer `restart::check_reentry` reads the
-/// declared preconditions (step 4a, ADR-229 item 2 step 4). `vin` is the job's target VIN and
+/// declared preconditions (step 4a, ADR-229 item 2 step 4); then the program's steps from the
+/// plan's entry to its erase run again from the restart's entry state, journaled as in a first
+/// run and stopped before the erase (step 4b-2, ADR-273). `vin` is the job's target VIN and
 /// `intended_software_version` the software version it intends to write. Once the ECU's VIN
 /// matched it, the gates promote `guards` to the per-vehicle lock (ADR-263; see
 /// [`promote_to_vehicle`]); step 3a promotes again, which takes the lock when the gates could not
@@ -658,6 +664,27 @@ where
             )?;
             if state == restart::StateCheck::RedoTransfer {
                 restart::check_reentry(program, &point, &teardown, &sources, host, cancelled)?;
+                // Step 4b-2 (ADR-273): the plan's steps from the entry to the erase, without
+                // the erase. The run start is not committed; the entry state is already the
+                // journal's newest.
+                let mut replay = JobJournal::new(journal, sources);
+                let vm = Vm::resume(point.entry_state.clone());
+                match run_vm(
+                    program,
+                    host,
+                    limits,
+                    cancelled,
+                    Some(&mut replay),
+                    vm,
+                    Some(plan.boundaries.erase_pc),
+                )? {
+                    RunEnd::Stopped => {}
+                    RunEnd::Finished(_) => {
+                        return Err(JobError::Journal(JournalError::Invariant(
+                            "the replay ended before it reached the erase",
+                        )));
+                    }
+                }
             }
             Err(JobError::OnSiteInterventionRequired(
                 OnSiteReason::RestartOrderUnavailable {
@@ -742,7 +769,6 @@ where
     H: DiagHost<Error = HostError> + RuntimeInputs + TransferProgress,
     S: Store,
 {
-    let wait_poll = limits.wait_poll.max(Duration::from_millis(1));
     let mut vm = Vm::new(program);
     vm.state.steps = first_step;
     // The state this run starts from is the journal's first record of the run (ADR-272), so a
@@ -750,12 +776,50 @@ where
     if let Some(journal) = journal.as_deref_mut() {
         journal.run_start(&vm.state)?;
     }
+    match run_vm(program, host, limits, cancelled, journal, vm, None)? {
+        RunEnd::Finished(state) => Ok(state),
+        // No stop point was given.
+        RunEnd::Stopped => Err(JobError::Journal(JournalError::Invariant(
+            "the run stopped without a stop point",
+        ))),
+    }
+}
+
+/// How [`run_vm`] ended without an error.
+enum RunEnd {
+    /// The program ran to its end; the VM's final state.
+    Finished(VmState),
+    /// Execution arrived at the stop point, before its instruction was journaled or run.
+    Stopped,
+}
+
+/// The step loop from `vm`'s state, shared by a run from the program's start and the restart's
+/// replay (ADR-273). The run start is not committed here. With `stop_before`, the loop ends in
+/// [`RunEnd::Stopped`] when execution arrives at that instruction, before the journal's
+/// `arrive` and before the instruction runs, so nothing at the stop point is committed or sent.
+fn run_vm<H, S>(
+    program: &Program,
+    host: &mut H,
+    limits: JobLimits,
+    cancelled: &AtomicBool,
+    mut journal: Option<&mut JobJournal<S>>,
+    mut vm: Vm,
+    stop_before: Option<u32>,
+) -> Result<RunEnd, JobError>
+where
+    H: DiagHost<Error = HostError> + RuntimeInputs + TransferProgress,
+    S: Store,
+{
+    let wait_poll = limits.wait_poll.max(Duration::from_millis(1));
     // Whether the journal has seen this arrival yet (a timer wait polls the same instruction
     // again).
     let mut arrived = true;
     loop {
         if cancelled.load(Ordering::Relaxed) {
             return Err(JobError::Cancelled);
+        }
+        if arrived && stop_before == Some(vm.state.pc) {
+            return Ok(RunEnd::Stopped);
         }
         if vm.state.steps >= limits.max_steps {
             return Err(JobError::StepLimit(vm.state.steps));
@@ -792,7 +856,7 @@ where
         }
         match outcome {
             Ok(StepOutcome::Continue) => {}
-            Ok(StepOutcome::Finished) => return Ok(vm.state),
+            Ok(StepOutcome::Finished) => return Ok(RunEnd::Finished(vm.state)),
             Ok(StepOutcome::Waiting(WaitingOn::Timer)) => std::thread::sleep(wait_poll),
             Ok(StepOutcome::Waiting(on)) => return Err(JobError::Unanswerable(on)),
             Err(StepError::Vm(source)) => return Err(JobError::Vm { pc, source }),
@@ -1216,6 +1280,8 @@ mod tests {
         reset: ResetAnswer,
         /// A service whose response is lost.
         lose_service: Option<u16>,
+        /// Set when a request for this service arrives, as a dropped job future would.
+        cancel_on_service: Option<(u16, Arc<AtomicBool>)>,
         /// The answers to the first reads of F186, one per read; later reads get `session`.
         session_script: std::collections::VecDeque<SessionAnswer>,
         /// The answer to F186 when the script is used up.
@@ -1233,6 +1299,10 @@ mod tests {
         version_read_times: Vec<std::time::Instant>,
         /// The block with this index (from 0 since the last RequestDownload) gets no answer.
         lose_block: Option<u64>,
+        /// The first this many timer waits report that the time is not up yet.
+        waits_pending: u32,
+        /// Timer waits polled so far.
+        wait_polls: u32,
         /// The answers to the first reads of a runtime input other than the supply voltage, one
         /// per read; later reads get `inputs`.
         input_scripts: Vec<(
@@ -1276,6 +1346,7 @@ mod tests {
                 cancel_on_vin_read: None,
                 reset: ResetAnswer::Positive,
                 lose_service: None,
+                cancel_on_service: None,
                 session_script: std::collections::VecDeque::new(),
                 session: SessionAnswer::Default,
                 session_reads: Vec::new(),
@@ -1284,6 +1355,8 @@ mod tests {
                 version_reads: 0,
                 version_read_times: Vec::new(),
                 lose_block: None,
+                waits_pending: 0,
+                wait_polls: 0,
                 input_scripts: Vec::new(),
             }
         }
@@ -1369,6 +1442,11 @@ mod tests {
             if let Some((did, flag)) = &self.cancel_on_read
                 && service == 0x22
                 && payload == did
+            {
+                flag.store(true, Ordering::Relaxed);
+            }
+            if let Some((id, flag)) = &self.cancel_on_service
+                && service == *id
             {
                 flag.store(true, Ordering::Relaxed);
             }
@@ -1470,7 +1548,8 @@ mod tests {
             Ok(())
         }
         fn wait(&mut self, _: u64, _: u32) -> Result<bool, HostError> {
-            Ok(true)
+            self.wait_polls += 1;
+            Ok(self.wait_polls > self.waits_pending)
         }
         fn hmi_request(&mut self, _: u64, _: &[u8]) -> Result<Option<Vec<u8>>, HostError> {
             Ok(None)
@@ -1510,10 +1589,23 @@ mod tests {
     /// RequestDownload, three blocks, RequestTransferExit at 16, and the end of the code as the
     /// post-transfer end.
     fn flash_program() -> Program {
+        flash_program_around(Vec::new(), Vec::new())
+    }
+
+    /// [`flash_program`] with `before` steps between the first session change and the plan's
+    /// entry, and `replayed` steps from the entry to the erase. The entry is at
+    /// `3 + before.len()` and the erase `replayed.len() + 1` later.
+    fn flash_program_around(before: Vec<Op>, replayed: Vec<Op>) -> Program {
+        let entry = 3 + before.len() as u32;
+        let erase = entry + replayed.len() as u32 + 1;
         let mut code = vec![
             Op::PushBytes(0),
             Op::ServiceRequest { service: 0x10 },
             Op::Pop,
+        ];
+        code.extend(before);
+        code.extend(replayed);
+        code.extend([
             Op::PushBytes(0),
             Op::RoutineControl {
                 routine: 0xFF00,
@@ -1523,7 +1615,7 @@ mod tests {
             Op::PushBytes(0),
             Op::ServiceRequest { service: 0x34 },
             Op::Pop,
-        ];
+        ]);
         for _ in 0..3 {
             code.extend([Op::PushBytes(0), Op::FlashTransfer { block: 1 }]);
         }
@@ -1532,6 +1624,7 @@ mod tests {
             Op::ServiceRequest { service: 0x37 },
             Op::Pop,
         ]);
+        let shift = erase - ERASE;
         let mut program = program(code);
         let ecu = |field_id| diag_ir::Source::EcuService {
             service_id: 1,
@@ -1548,9 +1641,9 @@ mod tests {
             max_resumes: 1,
             recovery_required: diag_ir::RecoveryRequired::Never,
             boundaries: diag_ir::RecoveryBoundaries {
-                entry_pc: ENTRY,
-                erase_pc: ERASE,
-                transfer_exit_pc: EXIT,
+                entry_pc: entry,
+                erase_pc: erase,
+                transfer_exit_pc: EXIT + shift,
                 post_transfer_end_pc: program.code.len() as u32,
             },
             // Short, since the passive teardown of a restart waits them out.
@@ -5191,6 +5284,419 @@ mod tests {
         log
     }
 
+    // ------------------------------------ restart replay to the erase (ADR-273)
+
+    /// The routine before the plan's entry in [`replay_program`], which the fake ECU counts.
+    const PRE_ENTRY_ROUTINE: u16 = 0xFF01;
+
+    /// A session change, a routine before the entry, then from the entry a session change, a
+    /// SecurityAccess-like request and a setup routine, then the erase. Gives the program and
+    /// its erase pc.
+    fn replay_program() -> (Program, u32) {
+        let before = vec![
+            Op::PushBytes(0),
+            Op::RoutineControl {
+                routine: PRE_ENTRY_ROUTINE,
+                sub: 1,
+            },
+            Op::Pop,
+        ];
+        let replayed = vec![
+            Op::PushBytes(0),
+            Op::ServiceRequest { service: 0x10 },
+            Op::Pop,
+            Op::PushBytes(0),
+            Op::ServiceRequest { service: 0x27 },
+            Op::Pop,
+            Op::PushBytes(0),
+            Op::RoutineControl {
+                routine: 0xFF02,
+                sub: 1,
+            },
+            Op::Pop,
+        ];
+        let program = flash_program_around(before, replayed);
+        let erase = program.flash[0].boundaries.erase_pc;
+        (program, erase)
+    }
+
+    /// A first run of `program` whose erase response is lost, in `dir`.
+    fn interrupted_at_erase(program: &Program, erase: u32, dir: &std::path::Path) -> FlashHost {
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        host.lose_routine = Some(0xFF00);
+        let mut journal = JobJournal::create(file_setup(dir)).unwrap();
+        let result = run_on(
+            program,
+            &mut host,
+            JobLimits::default(),
+            &AtomicBool::new(false),
+            Some(&mut journal),
+        );
+        assert!(
+            matches!(result, Err(JobError::Host { pc, .. }) if pc == erase),
+            "{result:?}"
+        );
+        host
+    }
+
+    /// The requests of the replay in [`replay_program`]: the entry's session change, then the
+    /// SecurityAccess-like request and the setup routine.
+    fn replayed_requests(host: &FlashHost) -> Vec<Sent> {
+        full_log(host)
+            .into_iter()
+            .skip(log_after_reset(1).len())
+            .collect()
+    }
+
+    /// The done-when case: the restart does not send the step before the entry again, sends the
+    /// steps from the entry to the erase in order, and nothing at or after the erase. The
+    /// fixture's "security access" is a raw `ServiceRequest` 0x27, because `Op::SecurityAccess`
+    /// is not supported by the agent's host yet (ADR-259).
+    #[test]
+    fn the_restart_replays_from_the_entry_up_to_the_erase() {
+        let (program, erase) = replay_program();
+        let dir = journal_dir("replay");
+        let first = interrupted_at_erase(&program, erase, &dir);
+        // The first run did send the routine before the entry, and the erase.
+        assert!(first.sent().contains(&Sent::Routine(PRE_ENTRY_ROUTINE)));
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        let result = resume(&program, &dir, &mut host, false);
+        assert_eq!(state_of(&result), restart::StateCheck::RedoTransfer);
+        let sent = full_log(&host);
+        assert_eq!(sent[..log_after_reset(1).len()], log_after_reset(1));
+        assert_eq!(
+            replayed_requests(&host),
+            [
+                Sent::Service(0x10, vec![0x01]),
+                Sent::Service(0x27, vec![0x01]),
+                Sent::Routine(0xFF02),
+            ]
+        );
+        assert!(!sent.contains(&Sent::Routine(PRE_ENTRY_ROUTINE)));
+        assert!(!sent.contains(&Sent::Routine(0xFF00)));
+        assert!(!sent.contains(&Sent::Block));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A section that asks for a state check, inside the replayed range, does not stop the
+    /// replay: validation accepts it and the restart replays the same requests.
+    #[test]
+    fn a_check_state_section_in_the_replayed_range_is_replayed() {
+        let (mut program, erase) = replay_program();
+        let entry = program.flash[0].boundaries.entry_pc;
+        program.sections.push(diag_ir::Section {
+            start_pc: entry,
+            end_pc: erase,
+            interruptible: diag_ir::Interruptible::No,
+            idempotency: diag_ir::Idempotency::CheckState,
+            expected_millis: 0,
+        });
+        assert_eq!(program.validate(), Ok(()));
+        let dir = journal_dir("replay-check-state");
+        interrupted_at_erase(&program, erase, &dir);
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        let result = resume(&program, &dir, &mut host, false);
+        assert_eq!(state_of(&result), restart::StateCheck::RedoTransfer);
+        assert_eq!(
+            replayed_requests(&host),
+            [
+                Sent::Service(0x10, vec![0x01]),
+                Sent::Service(0x27, vec![0x01]),
+                Sent::Routine(0xFF02),
+            ]
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The replay journals its steps, commits no transfer-start marker and no run start, and an
+    /// interruption after it restarts from the same entry state.
+    #[test]
+    fn the_replay_commits_its_steps_but_no_marker_and_no_run_start() {
+        let (program, erase) = replay_program();
+        let dir = journal_dir("replay-journal");
+        interrupted_at_erase(&program, erase, &dir);
+        let before = Journal::read(&dir, &job_key()).unwrap();
+        let first_point = restart_point(&program, &dir);
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        let result = resume(&program, &dir, &mut host, false);
+        assert_eq!(state_of(&result), restart::StateCheck::RedoTransfer);
+        let after = Journal::read(&dir, &job_key()).unwrap();
+        // The resume of the restart is the only record before the replay's; the replay adds one
+        // step record for each of its three requests, and nothing else.
+        assert_eq!(after.records, before.records + 1 + 3);
+        assert_eq!(after.facts.transfer, {
+            let mut transfer = before.facts.transfer.clone().unwrap();
+            transfer.interrupted = true;
+            Some(transfer)
+        });
+        // No run start and no step into the entry: the newest VM state is the interrupted
+        // pass's.
+        assert_eq!(after.last_vm_state, before.last_vm_state);
+        let second_point = restart_point(&program, &dir);
+        let mut expected = first_point.entry_state.clone();
+        expected.steps = second_point.entry_state.steps;
+        assert_eq!(second_point.entry_state, expected);
+        assert_eq!(second_point.flash_session, first_point.flash_session);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A replayed request whose response is lost ends the job with that error, and nothing after
+    /// it is sent.
+    #[test]
+    fn a_failed_replay_step_ends_the_job_with_nothing_after_it() {
+        let (program, erase) = replay_program();
+        let dir = journal_dir("replay-fails");
+        interrupted_at_erase(&program, erase, &dir);
+        let first_point = restart_point(&program, &dir);
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        host.lose_service = Some(0x27);
+        let result = resume(&program, &dir, &mut host, false);
+        let Err(JobError::Host { pc, .. }) = &result else {
+            panic!("{result:?}");
+        };
+        assert!(*pc < erase);
+        assert_eq!(
+            replayed_requests(&host),
+            [
+                Sent::Service(0x10, vec![0x01]),
+                Sent::Service(0x27, vec![0x01])
+            ]
+        );
+        // An interruption during the replay restarts from the same entry state, and the
+        // interruption point is now a step of the replay, before the erase.
+        drop(host);
+        let second_point = restart_point(&program, &dir);
+        let mut expected = first_point.entry_state.clone();
+        expected.steps = second_point.entry_state.steps;
+        assert_eq!(second_point.entry_state, expected);
+        assert_eq!(second_point.flash_session, first_point.flash_session);
+        let at = second_point.interrupted_at.expect("an interruption point");
+        assert!(at.pc < erase, "{at:?}");
+        assert_ne!(Some(at), first_point.interrupted_at);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A restart of `program` (first run interrupted at its erase) with `limits`, and the host
+    /// it ran on.
+    fn replay_with_limits(
+        program: &Program,
+        dir: &std::path::Path,
+        limits: JobLimits,
+        prepare: impl FnOnce(&mut FlashHost),
+    ) -> (Result<VmState, JobError>, FlashHost) {
+        let erase = program.flash[0].boundaries.erase_pc;
+        interrupted_at_erase(program, erase, dir);
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        prepare(&mut host);
+        let result = resume_on(
+            program,
+            &mut host,
+            limits,
+            &AtomicBool::new(false),
+            Journal::open(dir, &job_key()),
+            identity_sources(),
+            Some(&target()),
+            None,
+            &dir_slot(dir),
+        );
+        (result, host)
+    }
+
+    /// A plan whose entry is the erase has nothing to replay: the restart sends nothing for it
+    /// and journals no step.
+    #[test]
+    fn a_plan_entered_at_the_erase_replays_nothing() {
+        let (mut program, erase) = replay_program();
+        program.flash[0].boundaries.entry_pc = erase;
+        program.validate().expect("an entry at the erase is valid");
+        let dir = journal_dir("replay-entry-is-erase");
+        interrupted_at_erase(&program, erase, &dir);
+        let before = Journal::read(&dir, &job_key()).unwrap();
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        let result = resume(&program, &dir, &mut host, false);
+        assert_eq!(state_of(&result), restart::StateCheck::RedoTransfer);
+        assert!(replayed_requests(&host).is_empty(), "{:?}", full_log(&host));
+        let after = Journal::read(&dir, &job_key()).unwrap();
+        // Only the resume record is new.
+        assert_eq!(after.records, before.records + 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A timer wait right before the erase is waited out, and then the replay stops at the erase.
+    #[test]
+    fn the_replay_waits_out_a_timer_before_the_erase() {
+        let replayed = vec![
+            Op::PushBytes(0),
+            Op::ServiceRequest { service: 0x10 },
+            Op::Pop,
+            Op::Wait { millis: 5 },
+        ];
+        let program = flash_program_around(Vec::new(), replayed);
+        let dir = journal_dir("replay-wait");
+        let limits = JobLimits {
+            wait_poll: Duration::ZERO,
+            ..JobLimits::default()
+        };
+        let (result, host) = replay_with_limits(&program, &dir, limits, |_| {});
+        assert_eq!(state_of(&result), restart::StateCheck::RedoTransfer);
+        assert_eq!(replayed_requests(&host), [Sent::Service(0x10, vec![0x01])]);
+        assert!(!full_log(&host).contains(&Sent::Routine(0xFF00)));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The same plan with the wait polled several times before it ends: the replay keeps
+    /// polling, and only then stops at the erase.
+    #[test]
+    fn the_replay_polls_a_timer_until_it_ends() {
+        let replayed = vec![Op::Wait { millis: 5 }];
+        let program = flash_program_around(Vec::new(), replayed);
+        let dir = journal_dir("replay-wait-polls");
+        let limits = JobLimits {
+            wait_poll: Duration::ZERO,
+            ..JobLimits::default()
+        };
+        let (result, host) = replay_with_limits(&program, &dir, limits, |host| {
+            host.waits_pending = 3;
+        });
+        assert_eq!(state_of(&result), restart::StateCheck::RedoTransfer);
+        // The first run's wait polled once and was pending; the restart's polls follow until one
+        // answers, which is more than one.
+        assert!(host.wait_polls > 3, "{}", host.wait_polls);
+        assert!(replayed_requests(&host).is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A jump from inside the replayed range straight to the erase ends the replay there, with
+    /// the steps it skipped not sent and nothing at or after the erase sent.
+    #[test]
+    fn a_jump_to_the_erase_ends_the_replay_at_the_erase() {
+        // The entry is at 3, the range has eight steps, and the erase follows its own push.
+        let erase_pc = 3 + 8 + 1;
+        let replayed = vec![
+            Op::PushBytes(0),
+            Op::ServiceRequest { service: 0x10 },
+            Op::Pop,
+            Op::PushBytes(0),
+            Op::Jump(erase_pc),
+            Op::PushBytes(0),
+            Op::ServiceRequest { service: 0x27 },
+            Op::Pop,
+        ];
+        let program = flash_program_around(Vec::new(), replayed);
+        assert_eq!(program.flash[0].boundaries.erase_pc, erase_pc);
+        let dir = journal_dir("replay-jump");
+        let (result, host) = replay_with_limits(&program, &dir, JobLimits::default(), |_| {});
+        assert_eq!(state_of(&result), restart::StateCheck::RedoTransfer);
+        assert_eq!(replayed_requests(&host), [Sent::Service(0x10, vec![0x01])]);
+        assert!(!full_log(&host).contains(&Sent::Routine(0xFF00)));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The step limit counts the replay's steps: a limit the replay exceeds ends the restart in
+    /// `StepLimit`, and nothing after the step that reached it is sent.
+    #[test]
+    fn the_step_limit_applies_to_the_replay() {
+        let (program, erase) = replay_program();
+        let dir = journal_dir("replay-step-limit");
+        interrupted_at_erase(&program, erase, &dir);
+        let entry_steps = restart_point(&program, &dir).entry_state.steps;
+        // Four steps into the replay: the session change's three, then the next push.
+        let limits = JobLimits {
+            max_steps: entry_steps + 4,
+            ..JobLimits::default()
+        };
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        let result = resume_on(
+            &program,
+            &mut host,
+            limits,
+            &AtomicBool::new(false),
+            Journal::open(&dir, &job_key()),
+            identity_sources(),
+            Some(&target()),
+            None,
+            &dir_slot(&dir),
+        );
+        assert!(matches!(result, Err(JobError::StepLimit(_))), "{result:?}");
+        assert_eq!(replayed_requests(&host), [Sent::Service(0x10, vec![0x01])]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A cancel during the replay ends the job in `Cancelled` before the next request.
+    #[test]
+    fn a_cancel_during_the_replay_ends_the_job_cancelled() {
+        let (program, erase) = replay_program();
+        let dir = journal_dir("replay-cancel");
+        interrupted_at_erase(&program, erase, &dir);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        host.cancel_on_service = Some((0x10, Arc::clone(&cancelled)));
+        let result = resume_on(
+            &program,
+            &mut host,
+            JobLimits::default(),
+            &cancelled,
+            Journal::open(&dir, &job_key()),
+            identity_sources(),
+            Some(&target()),
+            None,
+            &dir_slot(&dir),
+        );
+        assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
+        // The session change was the last request.
+        assert_eq!(replayed_requests(&host), [Sent::Service(0x10, vec![0x01])]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A restart that reads back the software instead of redoing the transfer replays nothing.
+    #[test]
+    fn a_read_back_verification_restart_does_not_replay() {
+        let (mut program, _) = replay_program();
+        program.code.extend([
+            Op::PushBytes(0),
+            Op::RoutineControl {
+                routine: 0xFF03,
+                sub: 1,
+            },
+            Op::Pop,
+        ]);
+        program.validate().unwrap();
+        let (result, host) = state_restart(
+            &program,
+            Some(b"SW02"),
+            |host| host.lose_routine = Some(0xFF03),
+            |host| host.software_version = Some(b"SW02".to_vec()),
+        );
+        assert_eq!(state_of(&result), restart::StateCheck::ReadBackVerification);
+        assert!(replayed_requests(&host).is_empty(), "{:?}", full_log(&host));
+    }
+
+    /// A restart that fails at step 4a replays nothing.
+    #[test]
+    fn a_restart_that_fails_step_4a_does_not_replay() {
+        let (mut program, erase) = replay_program();
+        let vbatt = Some(diag_ir::Source::RuntimeInput(
+            diag_ir::RuntimeInput::SupplyVoltageMillivolts,
+        ));
+        program.preconditions.voltage_mv = Some(diag_ir::Precondition {
+            satisfied: diag_ir::Satisfied {
+                lower: 11_000,
+                upper: 15_000,
+            },
+            default_session: vbatt,
+            programming_session: vbatt,
+        });
+        program.validate().unwrap();
+        let dir = journal_dir("replay-4a");
+        interrupted_at_erase(&program, erase, &dir);
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        host.voltage_script = [12_600, 12_600, 10_500].into();
+        let result = resume(&program, &dir, &mut host, false);
+        teardown_at_precondition(&result, diag_ir::PreconditionKind::Voltage);
+        assert!(replayed_requests(&host).is_empty(), "{:?}", full_log(&host));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// Nothing that changes the ECU was sent: no ECUReset, routine, block or download.
     fn assert_nothing_changed_the_ecu(host: &FlashHost, resets: usize) {
         for (sent, _) in &host.log {
@@ -5780,10 +6286,10 @@ mod tests {
         assert_nothing_changed_the_ecu(&host, 1);
     }
 
-    /// Every declared precondition holds at step 4a: the restart still stops before anything
-    /// of step 4 is replayed, in the unavailable restart order.
+    /// Every declared precondition holds at step 4a: the restart replays the (here empty) steps
+    /// from the entry to the erase and stops before the erase, in the unavailable restart order.
     #[test]
-    fn a_restart_whose_preconditions_hold_at_step_4a_stops_before_the_replay() {
+    fn a_restart_whose_preconditions_hold_at_step_4a_stops_before_the_erase() {
         let program = flash_program_with_supply_and_engine();
         let (result, host) = restart_with(&program, Some(TARGET_VIN), |host| {
             supply_then_connected(host, vec![InputAnswer::Value(1), InputAnswer::Value(1)]);

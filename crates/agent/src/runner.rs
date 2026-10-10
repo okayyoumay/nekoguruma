@@ -4888,7 +4888,7 @@ mod tests {
         let mut other = other_vci_guards(&dir);
         assert!(vehicle_is_held(&mut other));
         drop(guards);
-        assert!(!vehicle_is_held(&mut other));
+        assert!(vehicle_becomes_free(&mut other));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -5976,6 +5976,26 @@ mod tests {
         waits_for_holder(|cancelled| guards.take_vehicle(&target(), POLL, cancelled))
     }
 
+    /// Whether `guards` take the vehicle once its holder let it go. The take may wait: opening the
+    /// bucket files, and on Windows the release of a closed handle's lock, can take longer than
+    /// [`waits_for_holder`]'s short delay on a loaded runner, so only a take still waiting after
+    /// a generous deadline counts as held.
+    fn vehicle_becomes_free(guards: &mut JobGuards) -> bool {
+        let flag = Arc::new(AtomicBool::new(false));
+        let canceller = {
+            let flag = Arc::clone(&flag);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_secs(20));
+                flag.store(true, Ordering::Relaxed);
+            })
+        };
+        let taken = guards.take_vehicle(&target(), POLL, &flag).is_ok();
+        // Let the canceller end now rather than after its whole delay.
+        flag.store(true, Ordering::Relaxed);
+        drop(canceller);
+        taken
+    }
+
     fn wait_until(mut condition: impl FnMut() -> bool) {
         let start = std::time::Instant::now();
         while !condition() {
@@ -6034,7 +6054,7 @@ mod tests {
         let mut other = other_vci_guards(&dir);
         assert!(vehicle_is_held(&mut other));
         drop(guards);
-        assert!(!vehicle_is_held(&mut other));
+        assert!(vehicle_becomes_free(&mut other));
         assert!(other.holds_vehicle());
         std::fs::remove_dir_all(&dir).unwrap();
     }

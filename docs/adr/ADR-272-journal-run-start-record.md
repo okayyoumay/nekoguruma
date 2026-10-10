@@ -2,7 +2,7 @@
 
 **Date:** 2026-10-10
 **Status:** Accepted
-**Affects:** `agent` (`src/journal.rs`, `src/journaling.rs`, `src/runner.rs`, `src/restart.rs`, `docs/ngr-agent.md`), ADR-244, ADR-252 item 6, ADR-253 item 3, ADR-255 item 3, ADR-271 item 2
+**Affects:** `agent` (`src/journal.rs`, `src/journaling.rs`, `src/runner.rs`, `src/restart.rs`, `docs/ngr-agent.md`), ADR-244, ADR-252 item 6, ADR-253 item 3, ADR-255 item 3
 
 ## Context
 
@@ -26,12 +26,16 @@ and leave it open. The journal needs to say where a run began.
    the last step, by the same ordering check the step and marker records use: a run start that
    does not is refused on commit and makes the journal corrupt on read-back. It is limited to
    the frame size like a step's state (`TooLarge`). `Journal::commit_run_start` writes it.
-2. **Every journaled run commits it first.** `run_on_from` commits, right after it creates the
+2. **Every journaled run of the program from its start commits it first.** `run_on_from` commits, right after it creates the
    VM and sets the run's first step count, the run start `(pc 0, steps = first step)` with the
    encoded state, before the run's first arrival at an instruction and so before anything is
    sent. A first run's records are the creation prefix (ADR-261, ADR-268) and then the run start;
    the prefix rule allows that, since it constrains only the VIN and the version records. A
-   commit that fails ends the job, as other journal failures do (ADR-252 item 3).
+   commit that fails ends the job, as other journal failures do (ADR-252 item 3). This decision
+   covers only runs that start at instruction 0. A run that starts from a restored state
+   elsewhere (the replay of step 4 from a plan's entry, the continuation after a plan's end of
+   ADR-271 item 3) is left to the decision that adds it, which says whether it commits a run
+   start and which boundary such a state counts for.
 3. **The restart's entry state is the newest journaled state.** `restart::entry_state` takes the
    newest state of the journal, run starts included. It must stand at the plan's entry (else
    `MissingEntryState`) and pass `Vm::check_state` (else `InvalidEntryState`, which also covers
@@ -61,6 +65,8 @@ and leave it open. The journal needs to say where a run began.
 - An older build reads a journal with this record as corrupt and ends in on-site intervention,
   with nothing sent. A journal written before the record keeps the old rule (the initial state
   for an entry at instruction 0, when it holds no state) until the next run on a new build adds
-  a run start.
-- ADR-271 item 2's read-back, which keeps states apart by the boundary they resume at, treats a
-  run-start state as a candidate like a step-into-entry state.
+  a run start. A job whose stale state came from a plain start made by an older build that
+  already reached the transfer keeps the old behaviour: nothing in its journal can correct it.
+- A run start stands at instruction 0. For ADR-271 item 2's read-back, which keeps states apart
+  by the boundary they resume at, it is therefore a candidate only for a plan whose entry is
+  instruction 0.

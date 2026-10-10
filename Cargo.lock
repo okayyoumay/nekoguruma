@@ -1049,12 +1049,14 @@ name = "ngr-library-resolver"
 version = "0.1.0"
 dependencies = [
  "j2534-0404-registry",
+ "libc",
  "serde",
  "tempfile",
  "thiserror",
  "toml",
  "tracing",
  "vci-service-config",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

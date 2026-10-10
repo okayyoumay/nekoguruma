@@ -41,6 +41,22 @@ whether a run that starts from a restored state elsewhere does.
    ECUReset and the replayed steps reach the ECU. The resume count, the gates, the teardown,
    the confirmation, the identity check and the state check are unchanged.
 
+5. **Every instruction in the replayed range runs again, whatever its section says.** A `Safe`
+   or `CheckState` section and an instruction in no section are replayed alike; an `Unsafe`
+   section in the range is refused when the program is loaded (ADR-245 item 6), so the replay
+   never meets one. The restart's teardown, default-session confirmation, identity check and
+   state check (steps 2 to 3) are the state query that the idempotency attribute of design 8.2.5
+   asks for, made once for the whole range: they establish that the ECU is in its default
+   session, its security locked and no download open, which is the state the steps before the
+   erase exist to change and the reason ADR-229 item 2 step 4 replays them. Declaring `entry_pc`
+   is the procedure's statement that the steps from there are that setup (ADR-245 item 4); a
+   step that must not run twice goes before the entry or into an `Unsafe` section, and
+   `CheckState` is not a third choice here. ADR-271 item 4 counts `CheckState` and unsectioned
+   primitives as not safe only outside the plans, where the journal cannot tell whether an
+   instruction ran and the teardown does not undo its effect; neither holds inside
+   `[entry_pc, erase_pc)`, which is redone from the entry state however far the interrupted
+   pass got.
+
 ## Alternatives rejected
 
 - **Replaying from instruction 0.** It would run again the steps before the boundary that
@@ -59,3 +75,6 @@ whether a run that starts from a restored state elsewhere does.
   clears them.
 - Step 4b-3 adds the second check of the mutable conditions at the stop point, and step 4c the
   erase and what follows.
+- The agent reads no `Idempotency` at run time: a replayed step that fails ends the job (item 3)
+  and is not repeated. The attribute's per-primitive use, repeating a primitive after a host
+  error, a worker crash or a VCI disconnect (design 8.2.5, ADR-233 item 2), is separate work.

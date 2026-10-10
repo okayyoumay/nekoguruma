@@ -261,9 +261,12 @@ pub async fn run_program_journaled(
 ///   decides between redoing the transfer and the read-back verification: a version that is
 ///   neither the pre-erase nor the intended one ends the job in
 ///   [`JobError::OnSiteInterventionRequired`] (`UnexpectedSoftwareVersion`), one that cannot be
-///   established in the same error (`SoftwareVersionNotEstablished`). The rest of the restart
-///   order (step 4 and the read-back verification) does not run in this agent, so a job that
-///   passed ends in [`JobError::OnSiteInterventionRequired`] (`RestartOrderUnavailable`,
+///   established in the same error (`SoftwareVersionNotEstablished`). When it decides to redo
+///   the transfer, `restart::check_reentry` checks every declared precondition again through its
+///   default-session source (step 4a): one that does not hold ends the job in
+///   [`JobError::OnSiteInterventionRequired`] (`PreconditionNotMet`). The rest of the restart
+///   order (the replay of step 4 and the read-back verification) does not run in this agent, so
+///   a job that passed ends in [`JobError::OnSiteInterventionRequired`] (`RestartOrderUnavailable`,
 ///   carrying the teardown's outcome, the confirmation and the state check), or in
 ///   [`JobError::IdentityMismatch`] when the ECU's VIN is another vehicle's;
 /// - a journal that rules a restart out, or a missing or unreadable one for a program with a
@@ -549,8 +552,9 @@ impl Drop for CancelOnDrop {
 /// ReadDataByIdentifier requests (ADR-229 item 2 step 2), `restart::teardown` sends at most
 /// one ECUReset (step 2b-1, ADR-264), and `restart::confirm_default_session` reads F186
 /// (step 2b-2, ADR-265), `restart::check_identity` reads the VIN and the hardware identity
-/// again (step 3a, ADR-229 item 2 step 3), and `restart::check_state` reads the software version
-/// (step 3b-2, ADR-268 item 5). `vin` is the job's target VIN and
+/// again (step 3a, ADR-229 item 2 step 3), `restart::check_state` reads the software version
+/// (step 3b-2, ADR-268 item 5), and on a redone transfer `restart::check_reentry` reads the
+/// declared preconditions (step 4a, ADR-229 item 2 step 4). `vin` is the job's target VIN and
 /// `intended_software_version` the software version it intends to write. Once the ECU's VIN
 /// matched it, the gates promote `guards` to the per-vehicle lock (ADR-263; see
 /// [`promote_to_vehicle`]); step 3a promotes again, which takes the lock when the gates could not
@@ -1176,6 +1180,8 @@ mod tests {
         /// The supply voltage the VCI reports; `None` reports none.
         voltage: Option<i64>,
         voltage_reads: u32,
+        /// The first voltage readings, one per read; later reads get `voltage`.
+        voltage_script: std::collections::VecDeque<i64>,
         /// Reading the voltage fails, as a worker that cannot be reached would.
         voltage_fails: bool,
         /// Set while the voltage is read, as a dropped job future would.
@@ -1251,6 +1257,7 @@ mod tests {
                 lose_routine: None,
                 voltage: None,
                 voltage_reads: 0,
+                voltage_script: std::collections::VecDeque::new(),
                 voltage_fails: false,
                 cancel_on_voltage: None,
                 fail_reads: Vec::new(),
@@ -1300,6 +1307,12 @@ mod tests {
             if input == diag_ir::RuntimeInput::SupplyVoltageMillivolts && self.voltage_fails {
                 self.voltage_reads += 1;
                 return Err(HostError::NoResponse);
+            }
+            if input == diag_ir::RuntimeInput::SupplyVoltageMillivolts
+                && let Some(millivolts) = self.voltage_script.pop_front()
+            {
+                self.voltage_reads += 1;
+                return Ok(crate::inputs::Reading::Value(millivolts));
             }
             Ok(match (input, self.voltage) {
                 (diag_ir::RuntimeInput::SupplyVoltageMillivolts, Some(millivolts)) => {
@@ -5746,12 +5759,29 @@ mod tests {
     fn a_restart_whose_preconditions_hold_at_step_4a_stops_before_the_replay() {
         let program = flash_program_with_supply_and_engine();
         let (result, host) = restart_with(&program, Some(TARGET_VIN), |host| {
-            supply_then_connected(host, vec![]);
+            supply_then_connected(host, vec![InputAnswer::Value(1), InputAnswer::Value(1)]);
         });
         assert_eq!(state_of(&result), restart::StateCheck::RedoTransfer);
+        // The supply was read by the gates and again by step 4a.
+        assert!(host.input_scripts[0].1.is_empty());
         assert_eq!(teardown_of(&result), restart::Teardown::Reset);
         assert_eq!(full_log(&host), log_after_reset(1));
         assert_nothing_changed_the_ecu(&host, 1);
+    }
+
+    /// The supply voltage holds at step 1 and at the gates, and has dropped by step 4a.
+    #[test]
+    fn a_voltage_that_drops_before_step_4a_ends_the_restart() {
+        let program = flash_program_with_voltage();
+        let (result, host) = restart_with(&program, Some(TARGET_VIN), |host| {
+            host.voltage_script = [12_600, 12_600, 10_500].into();
+        });
+        assert_eq!(
+            teardown_at_precondition(&result, diag_ir::PreconditionKind::Voltage),
+            restart::Teardown::Reset
+        );
+        assert_eq!(host.voltage_reads, 3);
+        assert_eq!(full_log(&host), log_after_reset(1));
     }
 
     /// The first precondition in the order that does not hold is the one reported: here the
@@ -5851,13 +5881,17 @@ mod tests {
         interrupted_for(&program, &dir, Some(TARGET_VIN));
         let cancelled = Arc::new(AtomicBool::new(false));
         let mut host = FlashHost::new(Rc::new(Cell::new(0)));
-        supply_then_connected(
-            &mut host,
-            vec![
-                InputAnswer::Value(1),
-                InputAnswer::Cancels(Arc::clone(&cancelled), 1),
-            ],
-        );
+        supply_then_connected(&mut host, vec![]);
+        // The engine is the last precondition, so only the check right after its step 4a read
+        // can see the cancel; the read itself gives a value that holds.
+        host.input_scripts.push((
+            diag_ir::RuntimeInput::EngineRunning,
+            [
+                InputAnswer::Value(0),
+                InputAnswer::Cancels(Arc::clone(&cancelled), 0),
+            ]
+            .into(),
+        ));
         let result = resume_on(
             &program,
             &mut host,
@@ -5871,7 +5905,7 @@ mod tests {
         );
         std::fs::remove_dir_all(&dir).unwrap();
         assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
-        // Nothing after the step 4a read: the engine is not read.
+        assert!(host.input_scripts[1].1.is_empty());
         assert_eq!(full_log(&host), log_after_reset(1));
     }
 

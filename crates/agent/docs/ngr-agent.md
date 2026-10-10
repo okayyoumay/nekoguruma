@@ -348,7 +348,11 @@ the first failed precondition and the step 2b-1 teardown. The software-version m
 8.9.1 is not checked here, since step 3b-2's rules replace it during a restart, and neither are
 the VIN and the hardware identity, which step 3a established. A cancel stops it at the start and
 around each read. It sends only ReadDataByIdentifier requests through declared sources and reads
-runtime inputs. A restart that goes to the read-back verification does not run it.
+runtime inputs. A restart that goes to the read-back verification does not run it. Each read is
+made once, as in the gates and step 3a; only step 3b-2's version read is retried. `WorkerHost`
+reports every runtime input but the supply voltage as not established (the `inputs` module), so
+with it a program that declares the external supply, ignition, engine or vehicle speed through a
+runtime input ends a redone transfer's restart in `PreconditionNotMet`.
 
 A job that passes ends in `RestartOrderUnavailable { flash_session, teardown, confirmed, state }`
 with `state` the `StateCheck` found: the rest of step 4 (the replay to the erase) and the read-back

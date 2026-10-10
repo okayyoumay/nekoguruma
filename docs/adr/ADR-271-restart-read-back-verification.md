@@ -34,10 +34,24 @@ consists of, where the program goes on afterwards, or which job outcome it leads
    right after it. This is the same record the entry step writes, so the journal format does
    not change. When a plan's end is the next plan's entry, the one record serves both.
 3. **The program continues from the plan's end.** On a passed verification the restart sends no
-   erase and no further ECUReset. It restores the VM state recorded at the interrupted pass's
-   plan end and runs the program's remaining instructions as a first run would, with the same
-   journaling. The job then ends in `Completed` or `Failed` exactly as that first run would.
-4. **A failed match keeps today's endings.** The state check's other outcomes are unchanged:
+   erase and no further ECUReset for the verified plan. It restores the VM state recorded at the
+   interrupted pass's plan end and runs the program's remaining instructions as a first run
+   would, with the same journaling; a later flash plan or a final reset among them runs as it
+   would on a first run, and a later plan takes the job back to `Writing` (design 5.6), with the
+   same cancellation rules. The job then ends in `Completed` or `Failed` exactly as that first
+   run would.
+4. **The continuation runs only when its instructions are safe to repeat.** The journal records
+   no step outside a plan's range (ADR-252 item 2), so a restart cannot tell how far the program
+   got after the plan's end: a primitive there may already have reached the ECU, and the
+   continuation would send it again. The restart therefore continues only when every diagnostic
+   primitive outside all of the program's plan ranges (`entry_pc` up to `post_transfer_end_pc`)
+   lies in a section (`Section`) whose idempotency is `Safe`; `CheckState`, `Unsafe` and a
+   primitive in no section count as not safe.
+   The check is static over the whole program, so a jump back to earlier code is covered.
+   Otherwise the job ends in on-site intervention with the image verified, which the report
+   says. A primitive inside a later plan is guarded by that plan's own journaling: an
+   interruption there puts the interruption point in that plan, and this path is not taken.
+5. **A failed match keeps today's endings.** The state check's other outcomes are unchanged:
    the pre-erase version, the intended version without the completion, or the declared
    no-application response redo the transfer; any other version, or one that cannot be
    established, ends in on-site intervention. A journal whose completion is recorded but which
@@ -51,11 +65,17 @@ consists of, where the program goes on afterwards, or which job outcome it leads
   for the report).
 - Every plan end now costs one more journaled VM state, the same size as the one at the entry.
 - `ReadBackVerification` in design 5.6 has no work of its own after a restart: it passes on
-  entry, and `Completed` or `Failed` comes from the rest of the program. During a first run,
+  entry, and `Completed` or `Failed` comes from the rest of the program, through `Writing` again
+  when the program has a later plan. During a first run,
   the program's own post-transfer steps remain the verification.
 - The resumed program meets the ECU in its default session, which the restart confirmed, while
   a first run reaches the plan's end in whatever session the post-transfer steps left. A step
   after the plan that needs another session is refused by the ECU and ends the job as that
   refusal would end a first run; a procedure that relies on the session after its plan opens it
   again itself.
-- Implementing items 2 and 3 adds an `OnSiteReason` for a missing plan-end state.
+- A program with a primitive outside its plans that is not `Safe` (an unsafe routine, a
+  state-dependent write) never continues after a restart; it ends in on-site intervention even
+  though its image is verified. Journaling the steps after a plan, so the continuation could
+  resume from the last one, would lift this and is left for when a program needs it.
+- Implementing items 2 to 5 adds `OnSiteReason`s for a missing plan-end state and for a
+  continuation that is not safe to repeat.

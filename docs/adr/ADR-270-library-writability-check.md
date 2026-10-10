@@ -56,6 +56,5 @@ systems:
 - A root-owned file that is group-writable is refused even when the group is root's.
 - A pass means no regular user can alter the chain, so the window between the check and the load
   cannot be used by one; only trusted principals could race it.
-- The additional search paths of a Linux definition, which decide dependent libraries, are not
-  covered yet; they are to be checked with the library-directory rule when the service applies
-  them.
+- The check does not cover the additional search paths of a Linux definition, which decide
+  dependent libraries; they need the library-directory rule wherever a service applies them.

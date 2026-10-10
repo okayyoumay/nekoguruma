@@ -4,7 +4,8 @@ use std::{fs, path::Path};
 
 use super::*;
 
-/// The roles and reasons of the findings, for compact assertions.
+/// The roles and reasons of the findings, for compact assertions. Only the Unix tests use it.
+#[cfg(unix)]
 fn found(r: &Result<(), WritabilityError>) -> Vec<(Role, &Reason)> {
     match r {
         Ok(()) => Vec::new(),

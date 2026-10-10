@@ -1245,7 +1245,7 @@ fn recovery_required(program: &Program, at: StepRef) -> Option<OnSiteReason> {
 }
 
 #[derive(Debug)]
-enum EntryStateError {
+pub(crate) enum EntryStateError {
     Missing,
     Invalid(String),
 }
@@ -1335,7 +1335,7 @@ fn entry_state(
         reason = "the continuation after a restart is not implemented yet"
     )
 )]
-fn plan_end_state(
+pub(crate) fn plan_end_state(
     program: &Program,
     state: &JournalState,
     plan: &FlashRecovery,
@@ -1606,6 +1606,85 @@ mod tests {
             super::plan_end_state(&program, j.state(), plan),
             Err(EntryStateError::Missing)
         ));
+    }
+
+    /// The fallback to the state before the newest needs the newest to stand at the plan's end:
+    /// a newest state elsewhere, even as the last step's record, leaves no entry state.
+    #[test]
+    fn a_newest_state_not_at_the_plans_end_is_not_given_way_from() {
+        let program = program(RecoveryRequired::Never);
+        let mut j = journal_until(&program, CHECK);
+        j.commit_step(
+            at(CHECK),
+            Some(&state_bytes(&state_at_pc(
+                &program,
+                CHECK,
+                u64::from(CHECK),
+            ))),
+        )
+        .unwrap();
+        let facts = &j.state().facts;
+        assert_eq!(interruption_point(facts), Some(at(CHECK)));
+        assert_eq!(
+            facts
+                .transfer
+                .as_ref()
+                .unwrap()
+                .exit
+                .as_ref()
+                .unwrap()
+                .last_post_step,
+            Some(at(CHECK))
+        );
+        assert!(matches!(
+            super::entry_state(&program, j.state(), &program.flash[0]),
+            Err(EntryStateError::Missing)
+        ));
+        assert_eq!(
+            decide(&program, &j),
+            RestartDecision::OnSiteInterventionRequired(OnSiteReason::MissingEntryState {
+                flash_session: 1
+            })
+        );
+    }
+
+    /// The fallback needs the newest end state to be the current attempt's end-state record, the
+    /// transfer's last post-transfer step: an end-standing state recorded by a later step, after
+    /// the completion stopped the journal updating that step, is not.
+    #[test]
+    fn an_end_state_not_recorded_by_the_last_post_transfer_step_is_not_given_way_from() {
+        let program = program(RecoveryRequired::Never);
+        let mut j = journal_until(&program, CHECK);
+        j.commit_step(at(CHECK), None).unwrap();
+        j.commit_post_transfer_complete().unwrap();
+        j.commit_step(
+            at(END),
+            Some(&state_bytes(&state_at_pc(&program, END, u64::from(END)))),
+        )
+        .unwrap();
+        let facts = &j.state().facts;
+        assert_eq!(interruption_point(facts), Some(at(END)));
+        assert_eq!(
+            facts
+                .transfer
+                .as_ref()
+                .unwrap()
+                .exit
+                .as_ref()
+                .unwrap()
+                .last_post_step,
+            Some(at(CHECK))
+        );
+        assert!(matches!(
+            super::entry_state(&program, j.state(), &program.flash[0]),
+            Err(EntryStateError::Missing)
+        ));
+        assert_eq!(
+            decide(&program, &j),
+            RestartDecision::OnSiteInterventionRequired(OnSiteReason::MissingEntryState {
+                flash_session: 1
+            })
+        );
     }
 
     /// Adjacent plans: the first one's end is the second one's entry, and one record serves both.

@@ -1,7 +1,7 @@
 # ADR-272: Every Journaled Run Records the State It Starts From
 
 **Date:** 2026-10-10
-**Status:** Accepted (item 2's open point for runs not from instruction 0 settled for the replay of step 4 by ADR-273; item 3 amended by ADR-274: the entry state is the newest state standing at the entry, which is the newest state or, when the newest is the plan's end state and the interruption point is the step that recorded it, the one before it; the replay commits a run start since ADR-274)
+**Status:** Accepted (item 2's open point for runs not from instruction 0 settled for the replay of step 4 by ADR-273; item 3 amended by ADR-274: the entry state is the newest state standing at the entry, which is the newest state or, when the newest is the current attempt's end-state record and the interruption point is that step, the one before it; the replay commits a run start since ADR-274)
 **Affects:** `agent` (`src/journal.rs`, `src/journaling.rs`, `src/runner.rs`, `src/restart.rs`, `docs/ngr-agent.md`), ADR-244, ADR-252 item 6, ADR-253 item 3, ADR-255 item 3
 
 ## Context

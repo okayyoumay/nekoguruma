@@ -5699,6 +5699,55 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// A redo whose replay committed only its run start before a crash: the second restart
+    /// restarts from the entry state in that run start. `completed_pass_interrupted` still reports
+    /// the earlier completed pass (the run start changes no fact) while `plan_end_state` finds
+    /// none, because the run start is newer than the end state. That disagreement is known and
+    /// safe-side until the continuation after a plan's end exists: nothing acts on the completed
+    /// pass, so the job ends in on-site intervention.
+    #[test]
+    fn a_crash_with_only_the_replays_run_start_committed_restarts_from_its_entry_state() {
+        let (program, after_plan) = replay_program_with_end();
+        let dir = journal_dir("replay-run-start-only");
+        let result = first_run(&program, &dir, JobLimits::default(), |host| {
+            host.lose_routine = Some(0xFF04);
+        });
+        assert!(
+            matches!(result, Err(JobError::Host { pc, .. }) if pc == after_plan),
+            "{result:?}"
+        );
+        let first_point = restart_point(&program, &dir);
+        let before = Journal::read(&dir, &job_key()).unwrap();
+        assert!(restart::completed_pass_interrupted(&before.facts));
+        // The redo loses its first replayed request, so no step of the replay is journaled.
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        host.lose_service = Some(0x10);
+        let result = resume(&program, &dir, &mut host, false);
+        assert!(matches!(result, Err(JobError::Host { .. })), "{result:?}");
+        let after = Journal::read(&dir, &job_key()).unwrap();
+        // The resume record and the run start, and no step.
+        assert_eq!(after.records, before.records + 1 + 1);
+        assert_eq!(after.facts.last_step, before.facts.last_step);
+        let plan = &program.flash[0];
+        let (run_start_at, _) = after.last_vm_state.as_ref().unwrap();
+        assert_eq!(run_start_at.pc, plan.boundaries.entry_pc);
+        let second_point = restart_point(&program, &dir);
+        let mut expected = first_point.entry_state.clone();
+        expected.steps = second_point.entry_state.steps;
+        assert_eq!(second_point.entry_state, expected);
+        assert_eq!(second_point.flash_session, first_point.flash_session);
+        let (_, bytes) = after.last_vm_state.as_ref().unwrap();
+        let started: VmState = postcard::from_bytes(bytes).unwrap();
+        assert_eq!(started, first_point.entry_state);
+        // The known disagreement.
+        assert!(restart::completed_pass_interrupted(&after.facts));
+        assert!(matches!(
+            restart::plan_end_state(&program, &after, plan),
+            Err(restart::EntryStateError::Missing)
+        ));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// A replayed request whose response is lost ends the job with that error, and nothing after
     /// it is sent.
     #[test]

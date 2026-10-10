@@ -203,7 +203,7 @@ ECU, it opens the job's journal (`Journal::open`) and classifies it.
 |---|---|
 | plain start | runs the program from its start on the same journal; its step count starts at `restart::next_steps`, after the journal's last record, and the identity is read again. A program without a plan runs without a journal, when it has none or one that records no transfer |
 | `OnSiteInterventionRequired` | ends in `JobError::OnSiteInterventionRequired` with the classification's reason; nothing is sent |
-| `Restart` | runs `restart::check_before_ecu`, then the gates of `restart::check_gates` (which promote the guards to the per-vehicle lock once the VIN matches, ADR-263), then the teardown of `restart::teardown` (ADR-264), then the default-session confirmation of `restart::confirm_default_session` (ADR-265). An ECU that cannot be confirmed ends the job in `JobError::OnSiteInterventionRequired(DefaultSessionNotConfirmed)`. Then `restart::check_identity` (step 3a) reads the VIN and the hardware identity again: a different one ends the job in `IdentityMismatch`, one that cannot be established in `OnSiteInterventionRequired(IdentityNotEstablished)`, and a matching VIN promotes the guards again (the lock's fallback when step 2 could not read it). Then `restart::check_state` (step 3b-2) reads the software version and decides between redoing the transfer and the read-back verification (`restart::check_state` below): a version nobody wrote ends the job in `OnSiteInterventionRequired(UnexpectedSoftwareVersion)`, one that cannot be established in `OnSiteInterventionRequired(SoftwareVersionNotEstablished)`. When the state check decides to redo the transfer, `restart::check_reentry` (step 4a) checks every declared precondition again through its default-session source: one that does not hold ends the job in `OnSiteInterventionRequired(PreconditionNotMet)`. When step 4a passes, the program's steps from the plan's entry boundary up to, not including, its erase run again from `RestartPoint::entry_state` (step 4b-2, ADR-273; `replay to the erase` below), and then `restart::check_before_erase` (step 4b-3) checks every declared precondition once more through its programming-session source: one that does not hold ends the job in `OnSiteInterventionRequired(PreconditionNotMetBeforeErase)` with no erase sent. Otherwise, and after that check, it ends in `OnSiteInterventionRequired(RestartOrderUnavailable)` carrying the teardown's outcome, the confirmation and the state check, because the erase and the read-back verification do not run in the agent; the gates' reads, at most one ECUReset, the F186 reads, step 3a's two reads, step 3b-2's version reads, step 4a's precondition reads, the replayed steps and step 4b-3's precondition reads reach the ECU |
+| `Restart` | runs `restart::check_before_ecu`, then the gates of `restart::check_gates` (which promote the guards to the per-vehicle lock once the VIN matches, ADR-263), then the teardown of `restart::teardown` (ADR-264), then the default-session confirmation of `restart::confirm_default_session` (ADR-265). An ECU that cannot be confirmed ends the job in `JobError::OnSiteInterventionRequired(DefaultSessionNotConfirmed)`. Then `restart::check_identity` (step 3a) reads the VIN and the hardware identity again: a different one ends the job in `IdentityMismatch`, one that cannot be established in `OnSiteInterventionRequired(IdentityNotEstablished)`, and a matching VIN promotes the guards again (the lock's fallback when step 2 could not read it). Then `restart::check_state` (step 3b-2) reads the software version and decides between redoing the transfer and the read-back verification (`restart::check_state` below): a version nobody wrote ends the job in `OnSiteInterventionRequired(UnexpectedSoftwareVersion)`, one that cannot be established in `OnSiteInterventionRequired(SoftwareVersionNotEstablished)`. When the state check decides to redo the transfer, `restart::check_reentry` (step 4a) checks every declared precondition again through its default-session source: one that does not hold ends the job in `OnSiteInterventionRequired(PreconditionNotMet)`. When step 4a passes, the program's steps from the plan's entry boundary up to, not including, its erase run again from `RestartPoint::entry_state` (step 4b-2, ADR-273; `replay to the erase` below), and then `restart::check_before_erase` (step 4b-3) checks every declared precondition once more through its programming-session source: one that does not hold ends the job in `OnSiteInterventionRequired(PreconditionNotMetBeforeErase)` with no erase sent. After that check it ends in `OnSiteInterventionRequired(RestartOrderUnavailable)` carrying the teardown's outcome, the confirmation and the state check, because the erase (step 4c) does not run in the agent. When the state check decides the read-back verification, the program goes on after the plan instead (`continuation after the read-back verification` below), and the job ends as a first run would; the gates' reads, at most one ECUReset, the F186 reads, step 3a's two reads, step 3b-2's version reads, step 4a's precondition reads, the replayed steps and step 4b-3's precondition reads, or after a verification the program's steps after the plan, reach the ECU |
 
 `check_before_ecu` is the part of ADR-229 item 2 step 1 that an agent without a server makes:
 
@@ -408,8 +408,33 @@ ECU in its programming session) and that no erase was sent. `teardown` is the st
 the replay.
 
 A job that passes ends in `RestartOrderUnavailable { flash_session, teardown, confirmed, state }`
-with `state` the `StateCheck` found: the erase (step 4c) and the read-back verification do not run
-in the agent yet.
+with `state` `RedoTransfer`: the erase (step 4c) does not run in the agent yet.
+
+### Continuation after the read-back verification
+
+When `restart::check_state` decides `ReadBackVerification`, the match is the verification
+(ADR-271 item 1) and the program goes on after the plan (`runner::continue_after_plan`, ADR-271
+items 3 to 5): no erase and no ECUReset are sent for the verified plan. Before anything else is
+sent:
+
+- `restart::unsafe_outside_plans` looks at every diagnostic primitive outside all of the
+  program's plan ranges (`entry_pc` up to, not including, `post_transfer_end_pc`). Each must lie
+  in a section, and every section that covers it must have the idempotency `Safe`; sections may
+  overlap. The journal records no step outside a plan, so such a primitive may have reached the
+  ECU before the interruption. The first one that fails ends the job in
+  `OnSiteInterventionRequired(UnsafeContinuation { flash_session, pc, teardown, confirmed })`.
+- `restart::plan_end_state` gives the VM state at the plan's end. None, a stale one (an entry
+  state or a run start recorded after it) or one that fails `Vm::check_state` ends the job in
+  `OnSiteInterventionRequired(MissingPlanEndState { flash_session, teardown, confirmed })`. This
+  covers a redo whose replay committed only its run start before a crash, after an earlier pass
+  had completed: the facts still report the completed pass, but the job is not resumed from a
+  state older than the journal's newest.
+
+Both reasons tell the technician that the image is verified. Otherwise the VM resumes from the end
+state, with its step count after the journal's last record, and runs to the program's end with a
+first run's journaling: a later plan journals as on a first run, and a step that fails, a cancel or
+the step limit end the job as on a first run. The continuation commits no run start (ADR-274 item
+4), since a run start that is not at the entry would leave a later redo without its entry state.
 
 ## Job guards
 

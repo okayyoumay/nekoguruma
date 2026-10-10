@@ -18,7 +18,9 @@
 //! read-back verification (step 3b-2, ADR-268 item 5). When it decides to redo the transfer,
 //! `check_reentry` checks every declared precondition again before anything is replayed (step 4a,
 //! ADR-229 item 2 step 4); after the replay reached the erase, `check_before_erase` checks them
-//! once more through the programming-session sources (step 4b-3, ADR-245 item 6).
+//! once more through the programming-session sources (step 4b-3, ADR-245 item 6). When it
+//! decides the read-back verification, `unsafe_outside_plans` and `plan_end_state` decide
+//! whether the program can go on after the plan (ADR-271 items 4 and 5).
 //!
 //! The interruption point is the latest of the last completed step and the requests the
 //! journal wrote ahead (the transfer-start and RequestTransferExit markers, and the request
@@ -29,7 +31,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use diag_ir::{
-    DiagHost, FlashRecovery, IdentityKind, Interruptible, NoApplication, Precondition,
+    DiagHost, FlashRecovery, Idempotency, IdentityKind, Interruptible, NoApplication, Precondition,
     PreconditionKind, Program, RecoveryRequired, RecoveryTiming, RuntimeInput, Source, Vm, VmError,
     VmState,
 };
@@ -120,16 +122,40 @@ pub enum OnSiteReason {
     /// (`check_reentry`), the replay of the plan's steps from the entry up to, not including,
     /// the erase (step 4b-2, ADR-273) and the second check of every declared precondition
     /// through its programming-session source (step 4b-3, `check_before_erase`). The erase
-    /// (step 4c) and the read-back verification do not run in this agent yet, so the job stops
-    /// before the erase, so before anything that writes the ECU's memory (ADR-255, ADR-261,
-    /// ADR-264, ADR-265, ADR-268 item 5). After a replay the plan's steps from its entry have run
-    /// (normally entering the programming session), and `teardown` and `confirmed` describe the ECU before
-    /// the replay, not after it.
+    /// (step 4c) does not run in this agent yet, so the job stops before the erase, so before
+    /// anything that writes the ECU's memory (ADR-255, ADR-261, ADR-264, ADR-265, ADR-268 item 5).
+    /// After a replay the plan's steps from its entry have run (normally entering the programming
+    /// session), and `teardown` and `confirmed` describe the ECU before the replay, not after it.
+    /// `state` is [`StateCheck::RedoTransfer`]: a read-back verification goes on with the program
+    /// instead (ADR-271 item 3).
     RestartOrderUnavailable {
         flash_session: u32,
         teardown: Teardown,
         confirmed: Confirmation,
         state: StateCheck,
+    },
+    /// The read-back verification passed (step 3b-2 found the intended software version and the
+    /// journal the post-transfer steps complete, ADR-271 item 1), so the image is verified, but
+    /// the program cannot go on after the plan: the diagnostic primitive at `pc`, outside every
+    /// plan's range, is not in a section whose idempotency is `Safe` (ADR-271 item 4). The
+    /// journal records no step outside a plan, so that primitive may have reached the ECU before
+    /// the interruption and must not be sent again. Nothing after the verification was sent.
+    /// `teardown` and `confirmed` are as for [`OnSiteReason::RestartOrderUnavailable`].
+    UnsafeContinuation {
+        flash_session: u32,
+        pc: u32,
+        teardown: Teardown,
+        confirmed: Confirmation,
+    },
+    /// The read-back verification passed, so the image is verified, but the journal holds no
+    /// usable VM state at the plan's end to go on from (ADR-271 item 5, ADR-274 item 3): none
+    /// was recorded, a state recorded since (an entry state or a run start) made it stale, or it
+    /// does not pass `Vm::check_state`. Nothing after the verification was sent. `teardown` and
+    /// `confirmed` are as for [`OnSiteReason::RestartOrderUnavailable`].
+    MissingPlanEndState {
+        flash_session: u32,
+        teardown: Teardown,
+        confirmed: Confirmation,
     },
     /// Step 3b-2 could not establish the ECU's software version (ADR-229 item 2 step 3,
     /// ADR-268 item 5): there is no declared source, or every read (the first and the plan's
@@ -199,8 +225,8 @@ pub enum StateCheck {
     /// complete: the transfer is done again.
     RedoTransfer,
     /// The journal shows the post-transfer steps complete and the ECU reports the intended
-    /// software version: the transfer is not redone; the read-back verification of ADR-268
-    /// item 5 follows.
+    /// software version: the transfer is not redone. The match is the read-back verification
+    /// (ADR-268 item 5, ADR-271 item 1), and the program goes on after the plan (ADR-271 item 3).
     ReadBackVerification,
 }
 
@@ -1244,6 +1270,31 @@ fn recovery_required(program: &Program, at: StepRef) -> Option<OnSiteReason> {
         .map(|section| OnSiteReason::RecoveryRequiredSection { section, at })
 }
 
+/// The first diagnostic primitive outside every plan's range (`entry_pc` up to, not including,
+/// `post_transfer_end_pc`) that the continuation after a read-back verification could send
+/// again unsafely (ADR-271 item 4): one that no section covers, or that a section whose
+/// idempotency is not `Safe` covers. Sections may overlap; every one that covers the primitive
+/// must be `Safe`, as `Program::validate` refuses an `Unsafe` section that only touches a
+/// plan's replayed range. `None` when the program can go on after any of its plans. The check
+/// is static over the whole program, so a jump back to code before a plan is covered too.
+pub(crate) fn unsafe_outside_plans(program: &Program) -> Option<u32> {
+    (0..program.code.len() as u32).find(|&pc| {
+        let in_plan = program.flash.iter().any(|plan| {
+            (plan.boundaries.entry_pc..plan.boundaries.post_transfer_end_pc).contains(&pc)
+        });
+        if in_plan || !program.code[pc as usize].is_diagnostic_primitive() {
+            return false;
+        }
+        let mut covering = program
+            .sections
+            .iter()
+            .filter(|section| (section.start_pc..section.end_pc).contains(&pc))
+            .peekable();
+        covering.peek().is_none()
+            || covering.any(|section| !matches!(section.idempotency, Idempotency::Safe))
+    })
+}
+
 #[derive(Debug)]
 pub(crate) enum EntryStateError {
     Missing,
@@ -1328,13 +1379,6 @@ fn entry_state(
 /// (ADR-271 items 2 and 3). It is the newest state, and only when it stands at the plan's end: a
 /// state recorded at the entry or at a run start since (a new pass) makes an earlier end state
 /// stale, so none is returned. `EntryStateError::Missing` is "no such state".
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the continuation after a restart is not implemented yet"
-    )
-)]
 pub(crate) fn plan_end_state(
     program: &Program,
     state: &JournalState,

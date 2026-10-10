@@ -114,7 +114,8 @@ commit fails, are the job runner's duties.
 `agent::run_program_journaled` is the runner that keeps it (ADR-252). It takes a
 `JournalSetup` (directory, job key, the `ServiceSources` table for the ECU's identity, and
 the VIN the job targets, which a first run records as the journal's first record and a
-restart compares against) and the job's guards ("Job guards"
+restart compares against, and the software version the job intends to write, recorded right
+after it in the same creating write and compared the same way, ADR-268) and the job's guards ("Job guards"
 below), which it returns with the result, and,
 for a program with a flash recovery plan, creates the journal once the link is open and the
 policy allows the program, before anything is sent to the ECU; a program without a plan keeps
@@ -200,6 +201,16 @@ Before the classification, a resume whose `JournalSetup::vin` differs from the t
 journal recorded at the first run (none included) ends in
 `OnSiteInterventionRequired(TargetVinDiffers)`, with nothing sent and no resume counted
 (ADR-261).
+
+The same holds for `JournalSetup::intended_software_version`, the raw bytes of the procedure's
+software-version field: a resume whose value differs from the one the journal recorded at the
+first run (none included, on either side) ends in
+`OnSiteInterventionRequired(IntendedVersionDiffers)`, checked right after the VIN and before the
+classification, with nothing sent and no resume counted (ADR-268). Both records belong to the
+journal's creation prefix: the target VIN only first, the intended version only first or right
+after the VIN, each at most once; a file that breaks this is corrupt. An empty intended
+version is refused, since it would match an ECU that answers with an empty field. Like the VIN record, the
+version record is appended without a format version change.
 
 `check_gates` is ADR-229 item 2 step 2 before the teardown (ADR-261). It reads only, and stops
 at the first gate that does not hold:

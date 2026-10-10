@@ -1,7 +1,7 @@
 # ADR-261: The Restart's Identity and Safety Gates
 
 **Date:** 2026-10-09
-**Status:** Accepted (the promotion consequence settled by ADR-263; item 2's ending with the gates' decision superseded by ADR-264)
+**Status:** Accepted (the promotion consequence settled by ADR-263; item 2's ending with the gates' decision superseded by ADR-264; the creation-prefix rule extended to the intended software version by ADR-268)
 **Affects:** `agent` (`src/restart.rs`, `src/runner.rs`, `src/journaling.rs`, `src/journal.rs`, `docs/ngr-agent.md`), ADR-244, ADR-255 item 5
 
 ## Context

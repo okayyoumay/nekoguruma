@@ -233,7 +233,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-241](ADR-241-sim-ecu-state-file.md) | Simulated ECU State Kept in a File Across Worker Processes | Accepted | `sim-ecu` snapshot, `sim-vci` `NGR_SIM_ECU_STATE` |
 | [ADR-242](ADR-242-ir-variable-length-and-nested-layouts.md) | IR Variable-Length Fields and Nested Layouts | Accepted | `diag-ir` declaration schema (`ir.fbs`) |
 | [ADR-243](ADR-243-codeql-and-backlog-loops-share-one-claim.md) | The CodeQL and Backlog Loops Share One PR-Based Claim | Accepted (Decision item 3's skipping of high and critical alerts and item 4's number-only hand-off of them superseded by ADR-246) | `.claude/skills/codeql-alerts`, `backlog-loop` |
-| [ADR-244](ADR-244-write-job-journal-format.md) | Write-Job Journal as an Append-Only Record Log | Accepted (record set extended by ADR-253 and ADR-261; item 4's target VIN is a journal record since ADR-261; the no-lock consequence superseded by ADR-255 item 7) | `agent` write-job journal |
+| [ADR-244](ADR-244-write-job-journal-format.md) | Write-Job Journal as an Append-Only Record Log | Accepted (record set extended by ADR-253, ADR-261 and ADR-268; item 4's target VIN is a journal record since ADR-261, and its version being written since ADR-268; the no-lock consequence superseded by ADR-255 item 7) | `agent` write-job journal |
 | [ADR-245](ADR-245-ir-restart-declaration-in-the-procedure-part.md) | The IR's Restart Declaration Lives in the Procedure Part | Accepted (items 4 and 6 amended by ADR-250) | `diag-ir` `Program` restart declaration, `ir.fbs` `FlashSession` |
 | [ADR-246](ADR-246-codeql-hand-off-carries-private-alert-details.md) | The CodeQL Hand-Off Carries High and Critical Alert Details Privately | Accepted | `.github/workflows/codeql-alert-handoff.yml`, `.claude/skills/codeql-alerts` |
 | [ADR-247](ADR-247-debug-builds-may-write-to-sim-vci.md) | Debug Builds May Send Write Requests to `sim-vci` | Accepted (Decision item 4's refusal of `FlashTransfer` superseded by ADR-250; its reason for refusing `SecurityAccess` replaced by ADR-259) | `agent` policy, link, host, runner |
@@ -250,13 +250,14 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-258](ADR-258-a-failed-link-close-keeps-the-job-guards.md) | A Failed Link Close Keeps the Job Guards | Accepted | `agent` guards, runner, CLI; `worker-host` |
 | [ADR-259](ADR-259-a-standalone-agent-refuses-security-access.md) | A Standalone Agent Refuses the SecurityAccess Instruction | Accepted | `agent` policy, host |
 | [ADR-260](ADR-260-sim-vci-stays-separate-from-the-j2534-mock.md) | `sim-vci` Stays Separate from `j2534-0404-mock` | Accepted | `sim-vci`, `j2534-0404-mock` |
-| [ADR-261](ADR-261-restart-identity-and-safety-gates.md) | The Restart's Identity and Safety Gates | Accepted (the promotion consequence settled by ADR-263; item 2's ending with the gates' decision superseded by ADR-264) | `agent` restart, runner, journaling |
+| [ADR-261](ADR-261-restart-identity-and-safety-gates.md) | The Restart's Identity and Safety Gates | Accepted (the promotion consequence settled by ADR-263; item 2's ending with the gates' decision superseded by ADR-264; the creation-prefix rule extended to the intended software version by ADR-268) | `agent` restart, runner, journaling |
 | [ADR-262](ADR-262-per-vehicle-lock-in-fixed-buckets.md) | The Per-Vehicle Lock Is One of 4096 Fixed Bucket Files | Accepted | `agent` guards |
 | [ADR-263](ADR-263-restart-promotes-to-the-per-vehicle-lock.md) | The Restart Promotes to the Per-Vehicle Lock at Its VIN Match | Accepted (the step 3 fallback consequence settled by ADR-267) | `agent` restart, runner |
 | [ADR-264](ADR-264-restart-teardown.md) | The Restart's Teardown Sends One Hard Reset or Waits Out the Session | Accepted (item 5's ending amended by ADR-265) | `agent` restart, runner; `sim-ecu` |
 | [ADR-265](ADR-265-restart-default-session-confirmation.md) | The Restart Confirms the Default Session, with One Passive Retry | Accepted | `agent` restart, runner; `sim-ecu` |
 | [ADR-266](ADR-266-linux-j2534-registration-definition-format.md) | Linux J2534 Registration Definitions Are TOML Files Keyed Like the Windows Registry | Accepted | `ngr-library-resolver`, design 7.1.1, 7.2 |
 | [ADR-267](ADR-267-restart-identity-recheck.md) | The Restart Re-reads the Identity in the Default Session and Promotes There Too | Accepted | `agent` restart, runner |
+| [ADR-268](ADR-268-restart-intended-software-version.md) | The Job Names Its Intended Software Version, and the Journal Records It | Accepted | `agent` journal, runner, restart |
 
 ## Status Legend
 
@@ -598,7 +599,7 @@ the predecessor repository these ADRs came from.
 - ADR-233 (item 3's `VmState` fields removed by ADR-245)
 - ADR-235 (item 8 relaxed for debug builds against `sim-vci` by ADR-247)
 - ADR-241
-- ADR-244 (record set extended by ADR-253 and ADR-261; item 4's target VIN is a journal record since ADR-261; the no-lock consequence superseded by ADR-255 item 7)
+- ADR-244 (record set extended by ADR-253, ADR-261 and ADR-268; item 4's target VIN is a journal record since ADR-261, and its version being written since ADR-268; the no-lock consequence superseded by ADR-255 item 7)
 - ADR-245 (items 4 and 6 amended by ADR-250)
 - ADR-247 (Decision item 4's refusal of `FlashTransfer` superseded by ADR-250; its reason for refusing `SecurityAccess` replaced by ADR-259)
 - ADR-250
@@ -609,12 +610,13 @@ the predecessor repository these ADRs came from.
 - ADR-257 (lock files must be regular files since ADR-262 item 6)
 - ADR-258
 - ADR-259
-- ADR-261 (the promotion consequence settled by ADR-263; item 2's ending with the gates' decision superseded by ADR-264)
+- ADR-261 (the promotion consequence settled by ADR-263; item 2's ending with the gates' decision superseded by ADR-264; the creation-prefix rule extended to the intended software version by ADR-268)
 - ADR-262
 - ADR-263 (the step 3 fallback consequence settled by ADR-267)
 - ADR-264 (item 5's ending amended by ADR-265)
 - ADR-265
 - ADR-267
+- ADR-268
 
 ### Diagnostic IR
 - ADR-233 (item 3's `VmState` fields removed by ADR-245)

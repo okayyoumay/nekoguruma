@@ -456,6 +456,7 @@ fn run_job(
             Journal::open(&setup.dir, &setup.key),
             setup.sources,
             setup.vin.as_ref(),
+            setup.intended_software_version.as_deref(),
             &guards,
         ),
         _ => run_on(
@@ -543,7 +544,8 @@ impl Drop for CancelOnDrop {
 /// ReadDataByIdentifier requests (ADR-229 item 2 step 2), `restart::teardown` sends at most
 /// one ECUReset (step 2b-1, ADR-264), and `restart::confirm_default_session` reads F186
 /// (step 2b-2, ADR-265), and `restart::check_identity` reads the VIN and the hardware identity
-/// again (step 3a, ADR-229 item 2 step 3). `vin` is the job's target VIN. Once the ECU's VIN
+/// again (step 3a, ADR-229 item 2 step 3). `vin` is the job's target VIN and
+/// `intended_software_version` the software version it intends to write. Once the ECU's VIN
 /// matched it, the gates promote `guards` to the per-vehicle lock (ADR-263; see
 /// [`promote_to_vehicle`]); step 3a promotes again, which takes the lock when the gates could not
 /// read the VIN and returns at once when the guards hold it already.
@@ -559,6 +561,7 @@ fn resume_on<H, S>(
     opened: Result<Journal<S>, JournalError>,
     sources: crate::inputs::ServiceSources,
     vin: Option<&crate::journal::Vin>,
+    intended_software_version: Option<&[u8]>,
     guards: &GuardSlot,
 ) -> Result<VmState, JobError>
 where
@@ -576,6 +579,14 @@ where
     {
         return Err(JobError::OnSiteInterventionRequired(
             OnSiteReason::TargetVinDiffers,
+        ));
+    }
+    // The same for the software version the job intends to write (ADR-268).
+    if let Ok(journal) = &opened
+        && journal.state().facts.intended_software_version.as_deref() != intended_software_version
+    {
+        return Err(JobError::OnSiteInterventionRequired(
+            OnSiteReason::IntendedVersionDiffers,
         ));
     }
     match restart::classify(program, opened.as_ref().map(Journal::state)) {
@@ -1639,6 +1650,7 @@ mod tests {
             key: job_key(),
             sources: identity_sources(),
             vin: None,
+            intended_software_version: None,
         };
         let mut journal = JobJournal::create(setup).unwrap();
         let mut host = FlashHost::new(Rc::new(Cell::new(0)));
@@ -2218,6 +2230,7 @@ mod tests {
             key: job_key(),
             sources: identity_sources(),
             vin: None,
+            intended_software_version: None,
         };
         let slot = vci_only_slot("link-fails");
         let result = tokio::runtime::Builder::new_multi_thread()
@@ -2475,6 +2488,7 @@ mod tests {
             key: job_key(),
             sources: identity_sources(),
             vin: None,
+            intended_software_version: None,
         };
         // Fails when the link opens, before the journal would be created: no file appears.
         let slot = vci_only_slot("no-journal");
@@ -2551,6 +2565,7 @@ mod tests {
             key: job_key(),
             sources: identity_sources(),
             vin: vin.map(|vin| crate::journal::Vin::new(vin.to_owned())),
+            intended_software_version: None,
         }
     }
 
@@ -2629,6 +2644,19 @@ mod tests {
         vin: Option<&str>,
         slot: &GuardSlot,
     ) -> Result<VmState, JobError> {
+        resume_naming(program, dir, host, cancelled, vin, None, slot)
+    }
+
+    /// [`resume_in`] for a job that also names the software version it intends to write.
+    fn resume_naming(
+        program: &Program,
+        dir: &std::path::Path,
+        host: &mut FlashHost,
+        cancelled: bool,
+        vin: Option<&str>,
+        version: Option<&[u8]>,
+        slot: &GuardSlot,
+    ) -> Result<VmState, JobError> {
         resume_on(
             program,
             host,
@@ -2638,6 +2666,7 @@ mod tests {
             identity_sources(),
             vin.map(|vin| crate::journal::Vin::new(vin.to_owned()))
                 .as_ref(),
+            version,
             slot,
         )
     }
@@ -2849,6 +2878,7 @@ mod tests {
                 Journal::open(&dir, &job_key()),
                 identity_sources(),
                 Some(&target()),
+                None,
                 &dir_slot(&dir),
             );
             assert!(
@@ -3576,6 +3606,7 @@ mod tests {
             Journal::open(&dir, &job_key()),
             identity_sources(),
             Some(&target()),
+            None,
             &dir_slot(&dir),
         );
         canceller.join().unwrap();
@@ -4053,6 +4084,7 @@ mod tests {
             Journal::open(&dir, &job_key()),
             identity_sources(),
             Some(&target()),
+            None,
             &dir_slot(&dir),
         );
         canceller.join().unwrap();
@@ -4114,6 +4146,173 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// An interrupted first run of a job that targets `vin` and intends to write `version`.
+    fn interrupted_naming(
+        program: &Program,
+        dir: &std::path::Path,
+        vin: Option<&str>,
+        version: Option<&[u8]>,
+    ) {
+        let mut setup = file_setup_for(dir, vin);
+        setup.intended_software_version = version.map(<[u8]>::to_vec);
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        host.lose_routine = Some(0xFF00);
+        let mut journal = JobJournal::create(setup).unwrap();
+        let result = run_on(
+            program,
+            &mut host,
+            JobLimits::default(),
+            &AtomicBool::new(false),
+            Some(&mut journal),
+        );
+        assert!(
+            matches!(result, Err(JobError::Host { pc: ERASE, .. })),
+            "{result:?}"
+        );
+    }
+
+    /// A first run journals the intended version, with and without a VIN, in the creating
+    /// write (ADR-268).
+    #[test]
+    fn a_first_run_journals_the_intended_software_version() {
+        let program = flash_program();
+        for vin in [Some(TARGET_VIN), None] {
+            let dir = journal_dir("intended-version-first-run");
+            interrupted_naming(&program, &dir, vin, Some(b"SW-2.0"));
+            let state = Journal::read(&dir, &job_key()).unwrap();
+            assert_eq!(
+                state.facts.intended_software_version.as_deref(),
+                Some(&b"SW-2.0"[..])
+            );
+            assert_eq!(state.facts.target_vin.is_some(), vin.is_some());
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    /// A resume that names another intended version than the journal recorded, or one where
+    /// either side names none, is on-site intervention: nothing is sent and no resume is
+    /// counted. The same version goes on to the gates.
+    #[test]
+    fn a_resume_naming_another_intended_version_sends_nothing_and_counts_nothing() {
+        let program = flash_program();
+        let cases = [
+            (Some(&b"SW-2.0"[..]), Some(&b"SW-3.0"[..])),
+            (Some(&b"SW-2.0"[..]), None),
+            (None, Some(&b"SW-2.0"[..])),
+        ];
+        for (recorded, named) in cases {
+            let dir = journal_dir("resume-version-differs");
+            interrupted_naming(&program, &dir, Some(TARGET_VIN), recorded);
+            let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+            let result = resume_naming(
+                &program,
+                &dir,
+                &mut host,
+                false,
+                Some(TARGET_VIN),
+                named,
+                &dir_slot(&dir),
+            );
+            assert!(
+                matches!(
+                    result,
+                    Err(JobError::OnSiteInterventionRequired(
+                        OnSiteReason::IntendedVersionDiffers
+                    ))
+                ),
+                "{recorded:?} {named:?}: {result:?}"
+            );
+            assert_eq!(host.sent(), []);
+            assert!(host.session_reads.is_empty());
+            assert_eq!(resumes(&dir), 0);
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+        let dir = journal_dir("resume-version-same");
+        interrupted_naming(&program, &dir, Some(TARGET_VIN), Some(b"SW-2.0"));
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        let result = resume_naming(
+            &program,
+            &dir,
+            &mut host,
+            false,
+            Some(TARGET_VIN),
+            Some(b"SW-2.0"),
+            &dir_slot(&dir),
+        );
+        assert_eq!(teardown_of(&result), restart::Teardown::Reset);
+        assert_eq!(resumes(&dir), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A creation write whose version frame is damaged while it is the last frame reads back
+    /// as a journal with the VIN and no version: a resume that names the version ends in a
+    /// difference, with nothing sent (ADR-268).
+    #[test]
+    fn a_torn_version_frame_makes_a_resume_naming_the_version_differ() {
+        let program = flash_program();
+        let dir = journal_dir("resume-torn-version");
+        let mut setup = file_setup(&dir);
+        setup.intended_software_version = Some(b"SW-2.0".to_vec());
+        drop(JobJournal::create(setup).unwrap());
+        let file = journal_file(&dir);
+        let mut bytes = std::fs::read(&file).unwrap();
+        let damaged = bytes.len() - 3;
+        bytes[damaged..].fill(0);
+        std::fs::write(&file, &bytes).unwrap();
+        let state = Journal::read(&dir, &job_key()).unwrap();
+        assert!(state.facts.target_vin.is_some());
+        assert_eq!(state.facts.intended_software_version, None);
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        let result = resume_naming(
+            &program,
+            &dir,
+            &mut host,
+            false,
+            Some(TARGET_VIN),
+            Some(b"SW-2.0"),
+            &dir_slot(&dir),
+        );
+        assert!(
+            matches!(
+                result,
+                Err(JobError::OnSiteInterventionRequired(
+                    OnSiteReason::IntendedVersionDiffers
+                ))
+            ),
+            "{result:?}"
+        );
+        assert_eq!(host.sent(), []);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The VIN comparison comes first: when both differ, the VIN is the reason.
+    #[test]
+    fn a_differing_vin_is_reported_before_a_differing_intended_version() {
+        let program = flash_program();
+        let dir = journal_dir("resume-vin-before-version");
+        interrupted_naming(&program, &dir, Some(TARGET_VIN), Some(b"SW-2.0"));
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        let result = resume_naming(
+            &program,
+            &dir,
+            &mut host,
+            false,
+            None,
+            Some(b"SW-3.0"),
+            &dir_slot(&dir),
+        );
+        assert!(
+            matches!(
+                result,
+                Err(JobError::OnSiteInterventionRequired(
+                    OnSiteReason::TargetVinDiffers
+                ))
+            ),
+            "{result:?}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn a_cancel_during_the_hardware_read_cancels_the_restart() {
         let dir = journal_dir("resume-gates-cancel-hw");
@@ -4130,6 +4329,7 @@ mod tests {
             Journal::open(&dir, &job_key()),
             identity_sources(),
             Some(&target()),
+            None,
             &dir_slot(&dir),
         );
         assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
@@ -4155,6 +4355,7 @@ mod tests {
             Journal::open(&dir, &job_key()),
             identity_sources(),
             Some(&target()),
+            None,
             &dir_slot(&dir),
         );
         assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
@@ -4559,6 +4760,7 @@ mod tests {
                     Journal::open(&dir, &job_key()),
                     identity_sources(),
                     Some(&target()),
+                    None,
                     &slot,
                 )
             })
@@ -4645,6 +4847,7 @@ mod tests {
                 Journal::open(&dir, &job_key()),
                 identity_sources(),
                 Some(&target()),
+                None,
                 &slot,
             );
             assert!(
@@ -4764,6 +4967,7 @@ mod tests {
                 Journal::open(&dir, &job_key()),
                 identity_sources(),
                 Some(&target()),
+                None,
                 &slot,
             )
         })
@@ -5032,6 +5236,7 @@ mod tests {
             Ok(journal),
             identity_sources(),
             Some(&target()),
+            None,
             &vci_only_slot("resume"),
         );
         assert!(matches!(result, Err(JobError::Journal(_))), "{result:?}");
@@ -5089,7 +5294,7 @@ mod tests {
         assert_eq!(host.sent(), []);
         assert!(host.session_reads.is_empty());
 
-        drop(Journal::create(&dir, &job_key(), None).unwrap());
+        drop(Journal::create(&dir, &job_key(), None, None).unwrap());
         std::fs::write(journal_file(&dir), b"not a journal").unwrap();
         let result = resume(&program, &dir, &mut host, false);
         assert!(

@@ -6673,6 +6673,9 @@ mod tests {
     /// Step 4b-3 reads only the programming-session source, after the replayed steps: the
     /// default-session source gives an in-range value (steps 2 and 4a pass), the
     /// programming-session one is an ECU field that is text, never a value.
+    /// The VIN request's field (service 1, field 3) is used only as an ECU field that decodes to
+    /// text, never to a value; every field of `identity_sources` is the VIN, the hardware identity or the software version,
+    /// and this test does not compare it with the VIN.
     #[test]
     fn step_4b_3_reads_only_the_programming_session_source() {
         use diag_ir::RuntimeInput;
@@ -6787,10 +6790,11 @@ mod tests {
         assert_no_erase_sent(&host);
     }
 
-    /// A restart that fails step 4a never reaches step 4b-3 (the voltage is read three times,
-    /// not four), and one that goes to the read-back verification does not run it either.
+    /// The teardown reported by step 4b-3 is the one of step 2b-1, whatever it was: a gate that
+    /// fails (the supply voltage read low there) leaves it passive, step 4a passes, and the
+    /// voltage drops again after the replay, so the reason carries the passive teardown.
     #[test]
-    fn step_4b_3_does_not_run_after_a_failed_step_4a_or_before_the_read_back() {
+    fn step_4b_3_reports_a_passive_teardown() {
         let (mut program, erase) = replay_program();
         let vbatt = Some(diag_ir::Source::RuntimeInput(
             diag_ir::RuntimeInput::SupplyVoltageMillivolts,
@@ -6805,15 +6809,16 @@ mod tests {
         });
         program.validate().unwrap();
         let (result, host) = replay_restart(&program, erase, |host| {
-            host.voltage_script = [12_600, 12_600, 10_500].into();
+            host.voltage_script = [12_600, 10_500, 12_600, 10_500].into();
         });
-        teardown_at_precondition(&result, diag_ir::PreconditionKind::Voltage);
-        assert_eq!(host.voltage_reads, 3);
-        assert!(replayed_requests(&host).is_empty());
-
-        // The read-back case is `step_4a_does_not_run_before_the_read_back_verification`: the
-        // supply reads disconnected throughout and the restart still ends in the state check's
-        // decision, so no precondition is read after it.
+        assert_eq!(
+            teardown_before_erase(&result, diag_ir::PreconditionKind::Voltage),
+            restart::Teardown::Passive(restart::PassiveCause::Gate(
+                restart::PassiveReason::Precondition(diag_ir::PreconditionKind::Voltage)
+            ))
+        );
+        assert_eq!(host.voltage_reads, 4);
+        assert_no_erase_sent(&host);
     }
 
     // ------------------------------------ promotion to the vehicle lock (ADR-263)

@@ -371,17 +371,22 @@ It shares the step loop with a run from instruction 0 (`run_vm`) and ends as a f
 failed step, a wait nobody answers, the step limit or a cancel.
 
 `restart::check_before_erase` is step 4b-3 (ADR-229 item 2 step 4, ADR-245 item 6), run when the
-replay stopped at the erase. The ECU is in its programming session then, so it checks every
-declared precondition (supply voltage, external supply, ignition, engine, vehicle speed; the VIN
-and the hardware identity are not preconditions and are not read) in the order of step 4a and
-stops at the first that does not hold, reading each through its `programming_session` source only.
+replay stopped at the erase. It checks every declared precondition (supply voltage, external
+supply, ignition, engine, vehicle speed; the VIN and the hardware identity are not preconditions
+and are not read) in the order of step 4a and stops at the first that does not hold, reading each
+through its `programming_session` source only. By construction that source is the one read at
+this point, after the plan's steps from its entry have run; it is named for the session those
+steps normally enter, and a plan whose steps from the entry enter no programming session must
+declare one usable in the default session (the default-session source itself or a runtime input;
+ADR-245 item 2 allows the same source in both). The agent tracks no session; it reads the source
+declared for this point.
 A missing source (which `Program::validate` refuses for a restartable plan), a value outside the
 declared range, a reading that is not a value, a source the table does not map and a worker
 failure all mean not met. Each read is made once; a cancel stops it at the start and around each
 read. A failure ends the job in `OnSiteInterventionRequired(PreconditionNotMetBeforeErase {
 flash_session, precondition, teardown })`, a reason apart from step 4a's `PreconditionNotMet`: it
-tells the technician that the ECU went through the replay (it is in its programming session with
-the setup steps run) and that no erase was sent. `teardown` is the step 2b-1 outcome, from before
+tells the technician that the plan's steps from its entry were replayed (which normally puts the
+ECU in its programming session) and that no erase was sent. `teardown` is the step 2b-1 outcome, from before
 the replay.
 
 A job that passes ends in `RestartOrderUnavailable { flash_session, teardown, confirmed, state }`

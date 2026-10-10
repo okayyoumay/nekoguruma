@@ -241,7 +241,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-249](ADR-249-backlog-loop-iterations-start-from-a-fresh-branch.md) | Backlog Loop Iterations Start from a Fresh Branch at `origin/main` | Accepted | `.claude/skills/backlog-loop` (step 1), `codeql-alerts` |
 | [ADR-250](ADR-250-agent-host-flash-transfer.md) | The Agent Host Implements FlashTransfer with Its Own Block Count | Accepted | `agent` host, policy; `diag-ir` plan validation |
 | [ADR-251](ADR-251-copilot-re-review-only-after-fixes-that-need-it.md) | Copilot Re-Review Only After Fixes That Need It | Accepted | `.claude/skills/pr-review-loop` (Steps 0, 4-5), `.github/copilot-instructions.md`, `CLAUDE.md` |
-| [ADR-252](ADR-252-job-runner-journals-at-plan-boundaries.md) | The Job Runner Journals at the Flash Recovery Plan's Boundaries | Accepted (item 2's open point decided by ADR-253) | `agent` runner, journaling, inputs |
+| [ADR-252](ADR-252-job-runner-journals-at-plan-boundaries.md) | The Job Runner Journals at the Flash Recovery Plan's Boundaries | Accepted (item 2's open point decided by ADR-253; the step reaching a plan's end records the VM state since ADR-271) | `agent` runner, journaling, inputs |
 | [ADR-253](ADR-253-restart-classification-and-the-recovery-point-intent.md) | Restart Classification and a Write-Ahead Intent at the Recovery-Required Point | Accepted (item 4's wiring into the runner decided by ADR-255) | `agent` restart, journaling, journal |
 | [ADR-254](ADR-254-starlark-for-proprietary-procedures.md) | Starlark Replaces JavaScript as the Proprietary Procedure Language | Accepted | `diag-frontend` subset spec, design 8.4, `ir.fbs` `source_format` |
 | [ADR-255](ADR-255-restart-entry-in-the-job-runner.md) | The Restart Entry in the Job Runner | Accepted (item 5's "locks not taken" and the duplicate-resume consequence superseded by ADR-256; item 5's "nothing sent to the ECU" superseded by ADR-261; item 5's teardown that does not run superseded by ADR-264) | `agent` runner, restart, journaling |
@@ -260,6 +260,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-268](ADR-268-restart-intended-software-version.md) | The Job Names Its Intended Software Version, and the Journal Records It | Accepted (item 5's completion counts only for the interrupted pass since ADR-269) | `agent` journal, runner, restart |
 | [ADR-269](ADR-269-restart-completion-of-the-interrupted-pass.md) | Only the Interrupted Pass's Completion Sends a Restart to Read-Back Verification | Accepted | `agent` restart, design 8.2.5 |
 | [ADR-270](ADR-270-library-writability-check.md) | What "Writable by Regular Users" Means for the Pre-Load Check | Accepted | `ngr-library-resolver`, design 7.2 |
+| [ADR-271](ADR-271-restart-read-back-verification.md) | After a Restart, Read-Back Verification Is the State Check's Match, and the Program Continues from the Plan's End | Accepted | `agent` restart, runner, journaling, design 5.6 / 8.2.5 |
 
 ## Status Legend
 
@@ -606,7 +607,7 @@ the predecessor repository these ADRs came from.
 - ADR-245 (items 4 and 6 amended by ADR-250)
 - ADR-247 (Decision item 4's refusal of `FlashTransfer` superseded by ADR-250; its reason for refusing `SecurityAccess` replaced by ADR-259)
 - ADR-250
-- ADR-252 (item 2's open point decided by ADR-253)
+- ADR-252 (item 2's open point decided by ADR-253; the step reaching a plan's end records the VM state since ADR-271)
 - ADR-253 (item 4's wiring into the runner decided by ADR-255)
 - ADR-255 (item 5's "locks not taken" and the duplicate-resume consequence superseded by ADR-256; item 5's "nothing sent to the ECU" superseded by ADR-261; item 5's teardown that does not run superseded by ADR-264)
 - ADR-256 (the first-run consequence and item 1's write access to lock files superseded by ADR-257; the failed-close consequence superseded by ADR-258; item 6's per-vehicle lock settled by ADR-262)
@@ -621,6 +622,7 @@ the predecessor repository these ADRs came from.
 - ADR-267
 - ADR-268 (item 5's completion counts only for the interrupted pass since ADR-269)
 - ADR-269
+- ADR-271
 
 ### Diagnostic IR
 - ADR-233 (item 3's `VmState` fields removed by ADR-245)

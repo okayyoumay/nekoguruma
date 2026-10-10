@@ -164,10 +164,10 @@ Past root causes and their fixes: `crates/j2534-0404-service/docs/implementation
   case applies to it. Non-blocking — every shipped J2534-2 phase's own `pname` opt-in reads
   correctly regardless.
   Done when: the decision is recorded in `docs/j2534-2-support-plan.md` or an ADR and `config.rs`
-  follows it, with a test for a `pname` without the prefix. Blocked on: the maintainer's decision on
-  whether `config.rs` validates the `"J2534-2:"` `pname` prefix at load time and how a `pname`
-  without it is treated (`docs/j2534-2-support-plan.md` section 4 design question 1, never decided
-  by ADR-152).
+  follows it, with a test for a `pname` without the prefix. Decided by the maintainer (2026-10-10):
+  `config.rs` does not validate the prefix at load time, and a `pname` without it is accepted and
+  passed to `PassThruOpen` unchanged; the decision is recorded as the answer to
+  `docs/j2534-2-support-plan.md` section 4 design question 1.
 - **P3** (`edge-case-hunter` finding, PR #106 round 2 verification pass, test-coverage gap, not a
   live defect): `ioctl_clear_tx_queue`'s regression test
   (`ioctl_clear_tx_queue_skips_the_native_call_for_a_hard_errored_cll`, `rpc_misc.rs`) builds its
@@ -312,9 +312,10 @@ Past root causes and their fixes: `crates/j2534-0404-service/docs/implementation
   widened in blast radius by it. Needs a `design-advisor` consult if pursued, not a unilateral
   guess.
   Done when: the reading is recorded in an ADR (or an ADR-188 amendment) and
-  `ioctl_start_msg_filter` and the mock follow it for TP2.0, with a test. Blocked on: the maintainer's
-  decision on whether SAE J2534-2 clause 19 forbids all filters on a TP2.0 channel or only the
-  service's automatic pass-all filter (ADR-188 section 1 does not settle it).
+  `ioctl_start_msg_filter` and the mock follow it for TP2.0, with a test. Decided by the
+  maintainer (2026-10-10): a client's own filter request on a TP2.0 CLL is refused with
+  `PduErrIdNotSupported` before any native call, the same blanket rejection Analog Input gets, and
+  the mock's `PassThruStartMsgFilter` refuses it too.
 - **P3** (Codex review fix, PR #97, ADR-188 Fix Z, 23rd round, test-coverage gap, not fixed): no
   `grpc_mock` end-to-end regression test proves `reconcile_established_tp20_loss`'s own round-23
   race fix -- that a concurrent `CoptStopcomm`/`Disconnect`/`Destroy` winning the race against this
@@ -606,9 +607,8 @@ Past root causes and their fixes: `crates/j2534-0404-service/docs/implementation
   candidate's attempt failed, advance and retry -- rather than failing the whole claim loop. Neither
   was chased further here; worth settling explicitly if this mechanism is revisited.
   Done when: an ADR (or an ADR-179 amendment) states which behaviour applies to each of the two
-  cases and a test pins each one. Blocked on: the maintainer's decision on whether a J1939 claim candidate
-  that times out or fails to issue advances to the next candidate or fails the whole claim loop
-  (ADR-179 left both readings open).
+  cases and a test pins each one. Decided by the maintainer (2026-10-10): both cases keep
+  the current behaviour, advancing to the next candidate.
 - **P3** (test-coverage gap, preserved from a completed backlog entry removed during the 2026-08-18
   backlog cleanup; Codex review finding, PR #79): `run_j1939_claim_loop`'s `timed_out_without_indication`
   path (Decision 2's original mechanism, plus its round-20/21 corrections) still has no direct
@@ -1275,8 +1275,10 @@ Past root causes and their fixes: `crates/j2534-0404-service/docs/implementation
   No assigned phase; would need a `design-advisor` consult (or a spec-clarity finding) to decide
   whether a closed allowlist is warranted at all before implementation starts.
   Done when: the decision is recorded in an ADR, and `comparam_support.rs` has the allowlist if
-  one is warranted. Blocked on: the maintainer's decision on whether GM UART needs a closed ComParam
-  allowlist in `comparam_support.rs` (ADR-189 left it unresolved).
+  one is warranted. Decided by the maintainer
+  (2026-10-10): GM UART gets a closed allowlist like its sibling protocols, holding the ComParam
+  that maps to `DATA_RATE` plus any ComParam the service already applies to a GM UART link (list
+  them from the code while doing the work); everything else is refused.
 - **P3** (found by `edge-case-hunter`'s review of the round-1 `BECOME_MASTER` `spawn_blocking` fix,
   PR #98, test-coverage gap, not fixed): no test exercises the actual concurrency property
   `ioctl_become_master`'s `spawn_blocking` dispatch provides -- that a concurrent RPC needing
@@ -1374,8 +1376,12 @@ Past root causes and their fixes: `crates/j2534-0404-service/docs/implementation
   pair as conflicting; no FT-CAN entry was needed in `peer_closed_set_extra_pins`. See
   `resources.rs`'s `peer_closed_set_extra_pins` doc comment for the full investigation.)
   Done when: the rule is recorded in an ADR and `rows_conflict` applies it to UART Echo Byte and
-  J1708, with tests. Blocked on: the maintainer's decision on what a pin conflict means for protocols
-  whose alternate pins cannot be enumerated (UART Echo Byte, J1708).
+  J1708, with tests. Decided by the maintainer
+  (2026-10-10): the conservative reading. `rows_conflict` answers before any connect (it feeds
+  `GetConflictingResources`), so a UART Echo Byte or J1708 row, whose pins a connect may pick
+  freely, is reported as conflicting with every other row that uses a J1962 signal pin; the
+  enumerable alternate sets of the other dynamic-pin protocols (Honda DIAG-H, GM UART, FT-CAN,
+  Ethernet_NDIS) are compared pairwise.
 - **P3** (found while fixing [ADR-202](../docs/adr/ADR-202-j1850-unique-id-comparam-reclassification.md)'s
   J1850 `PDU_PC_UNIQUE_ID` reclassification, deliberately deferred, not fixed there): ISO 22900-2:2022
   Table B.11 scopes `CP_MidRespId` exclusively to SAE J1708 (its own column mark, distinct from every
@@ -1423,27 +1429,27 @@ Past root causes and their fixes: `crates/j2534-0404-service/docs/implementation
   `ps_protocol_id`-fallback check through `resources::is_chx_protocol_id` first (so a `_CHx` id detours
   to `resolve_channel_selection`'s message instead of the generic one), or moving the exact `_CHx`
   detection earlier, for BOTH GM UART's and J1939's arms at once rather than a one-family patch.
-- **P3** (Codex review, ADR-206's PR #117, investigated directly against the ADR-196/198/200 text before
-  recording): `CllCreateFlagRawMode` is not extended to any `_CHx` link, J1939's own new one included --
-  `rpc_link.rs`'s RawMode protocol allowlist checks `hw_protocol_id` against each family's bare
-  `_PS`/base id exactly (e.g. `hw_protocol_id == PROTOCOL_J1939_PS`), so a directly-connected
-  `PROTOCOL_J1939_CH1..128` link (now legal to connect at all, per ADR-206) cannot also request RawMode --
-  it fails with `PDU_ERR_ID_NOT_SUPPORTED`. None of ADR-196/ADR-198/ADR-200 discusses `_CHx`/Additional
-  Channels interaction with RawMode at all -- the exact-id-only allowlist shape is not a considered,
-  documented exclusion of `_CHx` specifically, just an artifact of how each entry happens to be written --
-  so this same gap already exists, identically, for every one of the 8 protocol families `_CHx` already
-  supported before ADR-206 (CAN, ISO15765, ISO9141, ISO14230, J1850VPW, J1850PWM, SCI, GM UART): RawMode
-  has never been exercised against ANY `_CHx` link, for any family, and no test in this codebase does so
-  either. Not fixed here -- deciding whether RawMode's existing TX/RX shim machinery actually behaves
-  correctly end-to-end for a `_CHx` link once allowed (for every family, or only some) is its own
-  cross-cutting design question spanning all 10 families as of ADR-207 (UART Echo Byte's own
-  `PROTOCOL_UART_ECHO_BYTE_PS` allowlist entry has the identical exact-id-only shape, so it carries the
-  same gap, unrecorded as a separate entry per ADR-207's own Consequences), out of scope for a
-  single-family ADR to settle unilaterally. Not investigated or scoped here beyond confirming the gap
-  and its true (repo-wide) extent.
-  Done when: the decision is recorded in an ADR and the RawMode allowlist follows it for every
-  family, with tests. Blocked on: the maintainer's decision on whether RawMode is valid on `_CHx` links,
-  for all protocol families or only some (ADR-196, ADR-198 and ADR-200 do not address it).
+- **P3**: RawMode (`CllCreateFlagRawMode`) is refused on every `_PS` and `_CHx` link (SAE J2534-2
+  clauses 6 and 7). `rpc_link.rs`'s RawMode allowlist (`ConnectComLogicalLink`) compares
+  `hw_protocol_id` with each family's base id exactly, so `CAN_PS`, `ISO9141_PS`, `CAN_CH2`,
+  `J1939_CH5` and the like fail with `PDU_ERR_ID_NOT_SUPPORTED`; ADR-196, ADR-198 and ADR-200 never
+  considered `_CHx`, and scoped the CAN-family and K-line `_PS` ids out only for that phase.
+  Decided by the maintainer (2026-10-10): both `_PS` and `_CHx` links get RawMode. A `_PS` or `_CHx`
+  pin or channel selection changes only where the physical layer is connected, not the protocol, so
+  such a link gets the same RawMode answer as the protocol it stands for: resolve it with
+  `resources::base_protocol_id` (which recurses through `chx_base_protocol_id`) and apply the
+  existing allowlist, including the ChecksumMode rules (K-line ChecksumMode, J1850 requiring
+  ChecksumMode=ON). The SW-CAN, FT-CAN and CAN FD `_PS` families resolve to CAN or ISO15765 and are
+  included; the ADR confirms CAN FD's frame-format flags pass through a raw message unchanged. TP2.0
+  (a permanent exclusion, ADR-200), UART Echo Byte, Honda DIAG-H, GM UART and SAE J1708 keep
+  refusing RawMode in every form. Evidence: the send path (`tx_header.rs`, RawMode branch) keys on
+  the link's protocol family and the receive path (`events.rs`, `CllRxEntry::header_protocol`) on
+  `base_protocol_id(hw_protocol_id)`, so the J1939 DA-byte shim and the generic passthrough already
+  apply to a `J1939_CHx` link; only the allowlist blocks it. No test exercises RawMode on a `_PS` or
+  `_CHx` link today. Done when: an ADR revising ADR-196, ADR-198 and ADR-200 records the rule, the
+  allowlist follows it, and a test per allowed family (CAN, ISO15765, ISO9141, ISO14230, J1850VPW,
+  J1850PWM, SCI, J1939, SW-CAN, FT-CAN, CAN FD) sends and receives a raw frame on both a `_PS` and a
+  `_CHx` link against the mock, plus a test that a refused family still fails on its `_CHx` id.
 - **P3** (Codex review, ADR-206's PR #117, verified pre-existing since Phase 5/ADR-179): the mock's
   `IOCTL_GET_DEVICE_INFO` has no arm for `DEVICE_INFO_J1939_SUPPORTED` at all -- it falls through to
   `Supported = 0` by construction, unlike GM UART's own dedicated arm or the flat `chx_capacity`-packed

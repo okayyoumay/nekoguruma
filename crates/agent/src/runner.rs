@@ -756,6 +756,10 @@ where
     H: DiagHost<Error = HostError> + RuntimeInputs + TransferProgress,
     S: Store,
 {
+    // As at the start of every restart step: a cancel ends the job before the next verdict.
+    if cancelled.load(Ordering::Relaxed) {
+        return Err(JobError::Cancelled);
+    }
     let flash_session = plan.flash_session;
     if let Some(pc) = restart::unsafe_outside_plans(program) {
         return Err(JobError::OnSiteInterventionRequired(
@@ -6597,6 +6601,256 @@ mod tests {
             }
             std::fs::remove_dir_all(&dir).unwrap();
         }
+    }
+
+    /// The pc of the routine in the second plan's pre-erase range in [`adjacent_with_setup`].
+    fn adjacent_setup_routine(program: &Program) -> u32 {
+        program.flash[1].boundaries.entry_pc + 1
+    }
+
+    /// [`flash_program`] with a second plan after it (session 2, stage 8) whose pre-erase range
+    /// holds a setup routine 0xFF05. The second plan begins at the first one's end unless `gap`
+    /// puts a push and a pop between them. It allows a restart when `restartable`, and otherwise
+    /// becomes recovery-required at its erase; `section` covers the setup routine. The code
+    /// before the first plan is `Safe`.
+    fn adjacent_with_setup(
+        restartable: bool,
+        gap: bool,
+        section: Option<diag_ir::Idempotency>,
+    ) -> Program {
+        let mut program = flash_program();
+        if gap {
+            program.code.extend([Op::PushBytes(0), Op::Pop]);
+        }
+        let second_source = flash_program_around(
+            Vec::new(),
+            vec![
+                Op::PushBytes(0),
+                Op::RoutineControl {
+                    routine: 0xFF05,
+                    sub: 1,
+                },
+                Op::Pop,
+            ],
+        );
+        let shift = program.code.len() as u32 - ENTRY;
+        program
+            .code
+            .extend(second_source.code[ENTRY as usize..].iter().cloned());
+        let mut second = second_source.flash[0].clone();
+        second.flash_session = 2;
+        second.stage = 8;
+        let b = &mut second.boundaries;
+        b.entry_pc += shift;
+        b.erase_pc += shift;
+        b.transfer_exit_pc += shift;
+        b.post_transfer_end_pc += shift;
+        if !restartable {
+            second.recovery_required = diag_ir::RecoveryRequired::FromPc(b.erase_pc);
+        }
+        program.flash.push(second);
+        let mut program = safe_outside_the_plan(program);
+        // `safe_outside_the_plan` covers from the first plan's end to the end of the code; keep
+        // only what lies between the plans.
+        program.sections[1].end_pc = program.flash[1].boundaries.entry_pc;
+        program.sections.retain(|s| s.start_pc < s.end_pc);
+        if let Some(idempotency) = section {
+            let routine = adjacent_setup_routine(&program);
+            program.sections.push(diag_ir::Section {
+                start_pc: routine,
+                end_pc: routine + 1,
+                interruptible: diag_ir::Interruptible::Yes,
+                idempotency,
+                expected_millis: 0,
+            });
+        }
+        program.validate().expect("the fixture is a valid program");
+        program
+    }
+
+    /// The pre-erase range of a plan that begins at another plan's end: only an `Unsafe` section
+    /// over a primitive there refuses the continuation, as it would refuse a redo's replay
+    /// (ADR-273 item 5). With a gap between the plans the later plan's own journaling guards it.
+    #[test]
+    fn an_adjacent_plans_pre_erase_range_refuses_only_an_unsafe_section() {
+        let unsafe_adjacent = adjacent_with_setup(false, false, Some(diag_ir::Idempotency::Unsafe));
+        assert_eq!(
+            restart::unsafe_outside_plans(&unsafe_adjacent),
+            Some(adjacent_setup_routine(&unsafe_adjacent))
+        );
+        for (name, program) in [
+            (
+                "CheckState",
+                adjacent_with_setup(false, false, Some(diag_ir::Idempotency::CheckState)),
+            ),
+            ("no section", adjacent_with_setup(true, false, None)),
+            (
+                "not adjacent",
+                adjacent_with_setup(false, true, Some(diag_ir::Idempotency::Unsafe)),
+            ),
+        ] {
+            assert_eq!(restart::unsafe_outside_plans(&program), None, "{name}");
+        }
+    }
+
+    /// A primitive outside the plans in a `Safe` section marked `RecoveryRequired` refuses the
+    /// continuation: the journal cannot rule out that the interruption was there. Another
+    /// interruptibility does not, and a `RecoveryRequired` section inside a plan is not looked at.
+    #[test]
+    fn a_recovery_required_section_outside_the_plans_refuses_the_continuation() {
+        let program = safe_outside_the_plan(completed_path_program());
+        let routine = program.flash[0].boundaries.post_transfer_end_pc + 1;
+        let with = |interruptible| {
+            let mut program = program.clone();
+            program.sections.push(diag_ir::Section {
+                start_pc: routine,
+                end_pc: routine + 1,
+                interruptible,
+                idempotency: diag_ir::Idempotency::Safe,
+                expected_millis: 0,
+            });
+            program
+        };
+        assert_eq!(
+            restart::unsafe_outside_plans(&with(diag_ir::Interruptible::RecoveryRequired)),
+            Some(routine)
+        );
+        assert_eq!(
+            restart::unsafe_outside_plans(&with(diag_ir::Interruptible::No)),
+            None
+        );
+        let mut inside = program.clone();
+        inside.sections.push(diag_ir::Section {
+            start_pc: program.flash[0].boundaries.entry_pc,
+            end_pc: program.flash[0].boundaries.post_transfer_end_pc,
+            interruptible: diag_ir::Interruptible::RecoveryRequired,
+            idempotency: diag_ir::Idempotency::Safe,
+            expected_millis: 0,
+        });
+        assert_eq!(restart::unsafe_outside_plans(&inside), None);
+    }
+
+    /// End to end: a first run that loses the answer to the later plan's setup routine, before
+    /// any step of that plan is journaled, then a restart that reads back the first plan. Under an
+    /// `Unsafe` section the continuation is refused with nothing sent after the verification;
+    /// unsectioned in a plan that allows a restart, the continuation sends the routine again and
+    /// runs the later plan to its end, journaled as a first run.
+    #[test]
+    fn a_crash_before_an_adjacent_plans_first_step_continues_only_when_safe_to_replay() {
+        let refused = adjacent_with_setup(false, false, Some(diag_ir::Idempotency::Unsafe));
+        let dir = journal_dir("continue-adjacent-unsafe");
+        first_run_intending(&refused, &dir, |host| host.lose_routine = Some(0xFF05));
+        let (result, host) = restart_intending(&refused, &dir, |host| {
+            host.software_version = Some(b"SW02".to_vec());
+        });
+        assert_eq!(
+            reason_of(&result),
+            &OnSiteReason::UnsafeContinuation {
+                flash_session: 1,
+                pc: adjacent_setup_routine(&refused),
+                teardown: restart::Teardown::CompletedPath,
+                confirmed: restart::Confirmation {
+                    after_passive_retry: false,
+                },
+            }
+        );
+        assert_eq!(full_log(&host), verification_reads());
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        let replayed = adjacent_with_setup(true, false, None);
+        let dir = journal_dir("continue-adjacent-safe");
+        first_run_intending(&replayed, &dir, |host| host.lose_routine = Some(0xFF05));
+        let (result, host) = restart_intending(&replayed, &dir, |host| {
+            host.software_version = Some(b"SW02".to_vec());
+        });
+        assert!(result.is_ok(), "{result:?}");
+        let log = full_log(&host);
+        assert_eq!(log[..6], verification_reads());
+        assert_eq!(log[6], Sent::Routine(0xFF05));
+        assert!(log.contains(&Sent::Routine(0xFF00)), "{log:?}");
+        let journal = Journal::read(&dir, &job_key()).unwrap();
+        let transfer = journal.facts.transfer.as_ref().unwrap();
+        assert_eq!(transfer.stage, crate::journal::StageId(8));
+        assert!(transfer.exit.as_ref().is_some_and(|exit| exit.complete));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// End to end: a routine after the plan in a `RecoveryRequired` section is refused after the
+    /// verification. A section that starts at the plan's end itself is refused earlier, by the
+    /// classification, with nothing sent at all.
+    #[test]
+    fn a_recovery_required_section_after_the_plan_ends_in_on_site_intervention() {
+        let base = safe_outside_the_plan(completed_path_program());
+        let end = base.flash[0].boundaries.post_transfer_end_pc;
+        let with_section = |start_pc| {
+            let mut program = base.clone();
+            program.sections.push(diag_ir::Section {
+                start_pc,
+                end_pc: end + 3,
+                interruptible: diag_ir::Interruptible::RecoveryRequired,
+                idempotency: diag_ir::Idempotency::Safe,
+                expected_millis: 0,
+            });
+            program.validate().expect("the fixture is a valid program");
+            program
+        };
+        let after_end = with_section(end + 1);
+        let dir = journal_dir("continue-recovery-required");
+        first_run_intending(&after_end, &dir, lose_after_plan);
+        let (result, host) = restart_intending(&after_end, &dir, |host| {
+            host.software_version = Some(b"SW02".to_vec());
+        });
+        assert!(
+            matches!(
+                reason_of(&result),
+                OnSiteReason::UnsafeContinuation { pc, .. } if *pc == end + 1
+            ),
+            "{result:?}"
+        );
+        assert_eq!(full_log(&host), verification_reads());
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        let at_end = with_section(end);
+        let dir = journal_dir("continue-recovery-required-at-end");
+        first_run_intending(&at_end, &dir, lose_after_plan);
+        let (result, host) = restart_intending(&at_end, &dir, |host| {
+            host.software_version = Some(b"SW02".to_vec());
+        });
+        assert!(
+            matches!(
+                reason_of(&result),
+                OnSiteReason::RecoveryRequiredSection { .. }
+            ),
+            "{result:?}"
+        );
+        assert!(full_log(&host).is_empty(), "{:?}", full_log(&host));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A cancel that arrives before the continuation ends the job in `Cancelled`, before the
+    /// static check gives its verdict, as at the start of every restart step.
+    #[test]
+    fn a_cancel_before_the_continuation_wins_over_its_checks() {
+        let program = completed_path_program();
+        let dir = journal_dir("continue-cancel-first");
+        first_run_intending(&program, &dir, lose_after_plan);
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        let result = continue_after_plan(
+            &program,
+            &mut host,
+            JobLimits::default(),
+            &AtomicBool::new(true),
+            Journal::open(&dir, &job_key()).unwrap(),
+            identity_sources(),
+            &program.flash[0],
+            restart::Teardown::CompletedPath,
+            restart::Confirmation {
+                after_passive_retry: false,
+            },
+        );
+        assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
+        assert!(full_log(&host).is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// `restart::unsafe_outside_plans` looks only at diagnostic primitives outside the plans, and

@@ -136,10 +136,12 @@ pub enum OnSiteReason {
     },
     /// The read-back verification passed (step 3b-2 found the intended software version and the
     /// journal the post-transfer steps complete, ADR-271 item 1), so the image is verified, but
-    /// the program cannot go on after the plan: the diagnostic primitive at `pc`, outside every
-    /// plan's range, is not in a section whose idempotency is `Safe` (ADR-271 item 4). The
-    /// journal records no step outside a plan, so that primitive may have reached the ECU before
-    /// the interruption and must not be sent again. Nothing after the verification was sent.
+    /// the program cannot go on after the plan (ADR-271 item 4, `unsafe_outside_plans`): the
+    /// diagnostic primitive at `pc` may have reached the ECU before the interruption and must not
+    /// be sent again. It is outside every plan's range and in no section, in one that is not
+    /// `Safe`, or in one marked `RecoveryRequired`; or it is in the pre-erase range of a plan
+    /// that begins at another plan's end, under an `Unsafe` section. Nothing after the
+    /// verification was sent.
     /// `teardown` and `confirmed` are as for [`OnSiteReason::RestartOrderUnavailable`].
     UnsafeContinuation {
         flash_session: u32,
@@ -1270,28 +1272,52 @@ fn recovery_required(program: &Program, at: StepRef) -> Option<OnSiteReason> {
         .map(|section| OnSiteReason::RecoveryRequiredSection { section, at })
 }
 
-/// The first diagnostic primitive outside every plan's range (`entry_pc` up to, not including,
-/// `post_transfer_end_pc`) that the continuation after a read-back verification could send
-/// again unsafely (ADR-271 item 4): one that no section covers, or that a section whose
-/// idempotency is not `Safe` covers. Sections may overlap; every one that covers the primitive
-/// must be `Safe`, as `Program::validate` refuses an `Unsafe` section that only touches a
-/// plan's replayed range. `None` when the program can go on after any of its plans. The check
-/// is static over the whole program, so a jump back to code before a plan is covered too.
+/// The first diagnostic primitive, in pc order, that the continuation after a read-back
+/// verification could send again unsafely (ADR-271 item 4, with its annotations). The check is
+/// static over the whole program, so a jump back to code before a plan is covered too. Sections
+/// may overlap, and every one that covers the primitive counts. `None` when the program can go
+/// on after any of its plans. Two kinds of primitive are looked at:
+/// - one outside every plan's range (`entry_pc` up to, not including, `post_transfer_end_pc`):
+///   the journal records no step there, so it may have reached the ECU before the
+///   interruption. It must be covered, and only by sections that are `Safe` and not marked
+///   `RecoveryRequired`, since the journal cannot rule out that the interruption was there;
+/// - one in the pre-erase range (`entry_pc` up to, not including, `erase_pc`) of a plan that
+///   begins at another plan's `post_transfer_end_pc`: a crash with its request in flight, before
+///   that plan's first journaled step, leaves the same journal as a crash at the first plan's
+///   end, so the continuation runs it again. That is what a redo's replay does to the same
+///   range (ADR-273 item 5), so only an `Unsafe` section over it refuses; `Program::validate`
+///   refuses one only for a plan that allows a restart.
 pub(crate) fn unsafe_outside_plans(program: &Program) -> Option<u32> {
+    let covering = |pc: u32| {
+        program
+            .sections
+            .iter()
+            .filter(move |section| (section.start_pc..section.end_pc).contains(&pc))
+    };
     (0..program.code.len() as u32).find(|&pc| {
+        if !program.code[pc as usize].is_diagnostic_primitive() {
+            return false;
+        }
         let in_plan = program.flash.iter().any(|plan| {
             (plan.boundaries.entry_pc..plan.boundaries.post_transfer_end_pc).contains(&pc)
         });
-        if in_plan || !program.code[pc as usize].is_diagnostic_primitive() {
-            return false;
+        if !in_plan {
+            let mut sections = covering(pc).peekable();
+            return sections.peek().is_none()
+                || sections.any(|section| {
+                    !matches!(section.idempotency, Idempotency::Safe)
+                        || matches!(section.interruptible, Interruptible::RecoveryRequired)
+                });
         }
-        let mut covering = program
-            .sections
-            .iter()
-            .filter(|section| (section.start_pc..section.end_pc).contains(&pc))
-            .peekable();
-        covering.peek().is_none()
-            || covering.any(|section| !matches!(section.idempotency, Idempotency::Safe))
+        let adjacent_pre_erase = program.flash.iter().any(|later| {
+            (later.boundaries.entry_pc..later.boundaries.erase_pc).contains(&pc)
+                && program.flash.iter().any(|earlier| {
+                    earlier.flash_session != later.flash_session
+                        && earlier.boundaries.post_transfer_end_pc == later.boundaries.entry_pc
+                })
+        });
+        adjacent_pre_erase
+            && covering(pc).any(|section| matches!(section.idempotency, Idempotency::Unsafe))
     })
 }
 

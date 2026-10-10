@@ -618,11 +618,17 @@ where
 
 /// The ECU state check of ADR-229 item 2 step 3b-2 (ADR-268 item 5), run in the default session
 /// after `check_identity`. It reads the software version through the program's source with
-/// `read_field_bytes`, at most `1 + plan.version_read_retries` times and with no delay between
-/// reads, and compares the raw bytes with the journal's facts:
+/// `read_field_bytes`, at most `1 + plan.version_read_retries` times, waiting `poll` (cancel-checked,
+/// sending nothing) between an inconclusive read and the next, and compares the raw bytes with
+/// the journal's facts:
 /// - the intended version (`intended_software_version`, if the job names one): with the
-///   post-transfer steps journaled complete, [`StateCheck::ReadBackVerification`]; otherwise
-///   [`StateCheck::RedoTransfer`] (this covers an intended version equal to the pre-erase one:
+///   post-transfer steps journaled complete for the interrupted pass,
+///   [`StateCheck::ReadBackVerification`]; otherwise [`StateCheck::RedoTransfer`]. "Complete for
+///   the interrupted pass" means the completion is journaled and the interruption point (as
+///   `interruption_point` places it) is no later than the completed pass's last post-transfer
+///   step, the same test `effective_point` applies. A program that stepped back into the plan's
+///   entry after the completion has a later point, so a crash in that later pass does not skip
+///   it (this covers an intended version equal to the pre-erase one:
 ///   only the journal's record tells a finished transfer from an unstarted one);
 /// - the pre-erase version (`pre_erase_software_version`): [`StateCheck::RedoTransfer`];
 /// - any other decoded version: [`OnSiteReason::UnexpectedSoftwareVersion`], conclusive and not
@@ -636,6 +642,10 @@ where
 /// a read. `teardown` is carried by both on-site reasons. A cancel stops it at the start, before
 /// and right after every read. Nothing here sends anything but ReadDataByIdentifier requests
 /// through the declared source.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the restart's whole context, split only by what the caller owns"
+)]
 pub(crate) fn check_state<H>(
     program: &Program,
     point: &RestartPoint,
@@ -643,6 +653,7 @@ pub(crate) fn check_state<H>(
     teardown: &Teardown,
     sources: &ServiceSources,
     host: &mut H,
+    poll: Duration,
     cancelled: &AtomicBool,
 ) -> Result<StateCheck, JobError>
 where
@@ -662,12 +673,13 @@ where
         return not_established();
     };
     let facts = &point.facts;
-    let post_transfer_complete = facts
-        .transfer
-        .as_ref()
-        .and_then(|transfer| transfer.exit.as_ref())
-        .is_some_and(|exit| exit.complete);
-    for _ in 0..=u32::from(plan.version_read_retries) {
+    let post_transfer_complete = completed_pass_interrupted(facts);
+    let reads = u32::from(plan.version_read_retries) + 1;
+    for read in 0..reads {
+        if read > 0 {
+            // Not before the first read, and not after the last: only between reads.
+            wait_quietly(poll, poll, cancelled)?;
+        }
         match cancellable(cancelled, || read_field_bytes(source, sources, host))? {
             Ok(FieldBytes::Field(bytes)) => {
                 let version = Some(bytes.as_slice());
@@ -700,6 +712,23 @@ where
         }
     }
     not_established()
+}
+
+/// Whether the interruption is at the end of a pass whose post-transfer steps are journaled
+/// complete: the completion is recorded and the interruption point is no later than the
+/// completed pass's last post-transfer step (the test of `effective_point`). A step back into the
+/// plan after the completion puts the point later, so this is false for a later pass.
+fn completed_pass_interrupted(facts: &RecoveryFacts) -> bool {
+    let Some(exit) = facts
+        .transfer
+        .as_ref()
+        .and_then(|transfer| transfer.exit.as_ref())
+        .filter(|exit| exit.complete)
+    else {
+        return false;
+    };
+    let last = exit.last_post_step.unwrap_or(exit.intent_at);
+    interruption_point(facts).is_some_and(|at| at.steps <= last.steps)
 }
 
 /// The restart's teardown (ADR-229 item 2 step 2b-1, ADR-264), run on the gates' decision `gate`.

@@ -307,18 +307,24 @@ The reads put no VIN in a log message or a result.
 
 `restart::check_state` is step 3b-2 (ADR-229 item 2 step 3, ADR-268 item 5), run after step 3a.
 It reads the software version through `identity.software_version` as raw field bytes, at most
-`1 + version_read_retries` times (the plan's value) with no delay between reads, and checks for a
-cancel at the start and around each read. The bytes are compared with the journal's facts, in this
+`1 + version_read_retries` times (the plan's value), pausing for the job's poll interval between an
+inconclusive read and the next (none before the first read or after the last; the pause is
+cancel-checked and sends nothing), and checks for a cancel at the start and around each read. The bytes are compared with the journal's facts, in this
 order:
 
 | Read | Journal | Result |
 |---|---|---|
-| a version equal to the intended one | post-transfer steps complete | `StateCheck::ReadBackVerification` |
-| a version equal to the intended one | not complete | `StateCheck::RedoTransfer` |
+| a version equal to the intended one | post-transfer steps complete for the interrupted pass | `StateCheck::ReadBackVerification` |
+| a version equal to the intended one | not complete for the interrupted pass | `StateCheck::RedoTransfer` |
 | a version equal to the pre-erase one (and not the intended one) | any | `StateCheck::RedoTransfer` |
 | any other decoded version | any | `OnSiteInterventionRequired(UnexpectedSoftwareVersion)`, conclusive, not retried |
 | a negative response with the plan's declared `no_application` code | any | `StateCheck::RedoTransfer`, conclusive |
 | no answer, another negative response, a field that does not decode, a worker failure | any | read again; after the last read `OnSiteInterventionRequired(SoftwareVersionNotEstablished)` |
+
+"Complete for the interrupted pass" means the completion is journaled and the interruption point
+is no later than the completed pass's last post-transfer step (the test the classifier applies): a
+program that stepped back into the plan's entry after the completion and crashed in the later pass
+is redone, not read back.
 
 A program that declares no software-version source ends in `SoftwareVersionNotEstablished`
 without a read. When the intended version equals the pre-erase one, only the journal's record of

@@ -649,8 +649,9 @@ where
                 cancelled,
                 |vin| promote_to_vehicle(guards, vin, poll, cancelled),
             )?;
-            let state =
-                restart::check_state(program, &point, plan, &teardown, &sources, host, cancelled)?;
+            let state = restart::check_state(
+                program, &point, plan, &teardown, &sources, host, poll, cancelled,
+            )?;
             Err(JobError::OnSiteInterventionRequired(
                 OnSiteReason::RestartOrderUnavailable {
                     flash_session: point.flash_session,
@@ -1214,6 +1215,8 @@ mod tests {
         version_script: std::collections::VecDeque<VersionAnswer>,
         /// Reads of F195 so far.
         version_reads: usize,
+        /// When each read of F195 arrived.
+        version_read_times: Vec<std::time::Instant>,
         /// The block with this index (from 0 since the last RequestDownload) gets no answer.
         lose_block: Option<u64>,
     }
@@ -1248,6 +1251,7 @@ mod tests {
                 reset_at: None,
                 version_script: std::collections::VecDeque::new(),
                 version_reads: 0,
+                version_read_times: Vec::new(),
                 lose_block: None,
             }
         }
@@ -1361,6 +1365,7 @@ mod tests {
                 }
                 (0x22, [0xF1, 0x95]) => {
                     self.version_reads += 1;
+                    self.version_read_times.push(std::time::Instant::now());
                     match self.version_script.pop_front() {
                         Some(VersionAnswer::Value(version)) => {
                             Ok([&[0x62, 0xF1, 0x95][..], &version].concat())
@@ -2976,10 +2981,17 @@ mod tests {
                 flash_session: 1,
                 teardown,
                 ..
-            }))
-            // Tests that make F195 unreadable on purpose (it is also a precondition source) pass
-            // step 2b and fail at step 3b-2, which carries the same teardown.
-            | Err(JobError::OnSiteInterventionRequired(
+            })) => teardown.clone(),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The teardown of a restart that passed step 2b and stopped at step 3b-2 with the software
+    /// version not established. For the tests that make F195 unreadable on purpose, since it is
+    /// also their precondition source.
+    fn teardown_at_unreadable_version(result: &Result<VmState, JobError>) -> restart::Teardown {
+        match result {
+            Err(JobError::OnSiteInterventionRequired(
                 OnSiteReason::SoftwareVersionNotEstablished {
                     flash_session: 1,
                     teardown,
@@ -3340,7 +3352,7 @@ mod tests {
             host.fail_reads = vec![[0xF1, 0x95]];
         });
         assert_eq!(
-            teardown_of(&result),
+            teardown_at_unreadable_version(&result),
             passive_gate(PassiveReason::Precondition(PreconditionKind::Engine))
         );
     }
@@ -3365,7 +3377,7 @@ mod tests {
             );
         });
         assert_eq!(
-            teardown_of(&result),
+            teardown_at_unreadable_version(&result),
             passive_gate(restart::PassiveReason::Precondition(
                 PreconditionKind::Engine
             ))
@@ -5075,11 +5087,16 @@ mod tests {
         for (sent, _) in &host.log {
             match sent {
                 Sent::Service(0x22, _) => {}
+                // Any ECUReset sub-function is counted below.
                 Sent::Service(0x11, _) => {}
                 other => panic!("{other:?} in {:?}", host.log),
             }
         }
-        let sent_resets = host.log.iter().filter(|(s, _)| *s == reset_sent()).count();
+        let sent_resets = host
+            .log
+            .iter()
+            .filter(|(s, _)| matches!(s, Sent::Service(0x11, _)))
+            .count();
         assert_eq!(sent_resets, resets, "{:?}", host.log);
     }
 
@@ -5130,6 +5147,11 @@ mod tests {
             ("other NRC", VersionAnswer::Nrc(0x22)),
             // Shorter than the 4 bytes the table declares.
             ("undecodable", version("SW0")),
+            // The right length, but bytes the field's ASCII encoding rejects.
+            (
+                "rejected by the encoding",
+                VersionAnswer::Value(vec![0x00; 4]),
+            ),
         ];
         for (name, answer) in answers {
             for retries in [0u8, 2] {
@@ -5299,6 +5321,16 @@ mod tests {
         host: &mut FlashHost,
         cancelled: &AtomicBool,
     ) -> Result<restart::StateCheck, JobError> {
+        state_check_polling(program, host, POLL, cancelled)
+    }
+
+    /// [`state_check_with`] with the pause between reads given.
+    fn state_check_polling(
+        program: &Program,
+        host: &mut FlashHost,
+        poll: Duration,
+        cancelled: &AtomicBool,
+    ) -> Result<restart::StateCheck, JobError> {
         let dir = journal_dir("state");
         interrupted(&flash_program(), &dir);
         let point = restart_point(&flash_program(), &dir);
@@ -5309,6 +5341,7 @@ mod tests {
             &restart::Teardown::Reset,
             &identity_sources(),
             host,
+            poll,
             cancelled,
         );
         std::fs::remove_dir_all(&dir).unwrap();
@@ -5403,6 +5436,192 @@ mod tests {
         assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
         assert_eq!(full_log(&host), log_after_reset(1));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An inconclusive read followed by the declared no-application code within the retries:
+    /// redo, with no further read.
+    #[test]
+    fn an_inconclusive_read_then_the_no_application_code_redoes_the_transfer() {
+        let mut program = flash_program();
+        program.flash[0].no_application = Some(diag_ir::NoApplication::Nrc(0x24));
+        program.flash[0].version_read_retries = 2;
+        let (result, host) = state_restart(&program, None, lose_erase, |host| {
+            host.version_script = [VersionAnswer::NoAnswer, VersionAnswer::Nrc(0x24)].into();
+            host.software_version = None;
+        });
+        assert_eq!(state_of(&result), restart::StateCheck::RedoTransfer);
+        assert_eq!(host.version_reads, 2);
+        assert_eq!(full_log(&host), log_after_reset(2));
+    }
+
+    /// The no-application code means an ECU without an application, so a complete journal with
+    /// an intended version still redoes the transfer.
+    #[test]
+    fn the_no_application_code_redoes_the_transfer_on_a_complete_journal() {
+        let mut program = completed_path_program();
+        program.flash[0].no_application = Some(diag_ir::NoApplication::Nrc(0x24));
+        let (result, host) = state_restart(&program, Some(b"SW02"), lose_after_plan, |host| {
+            host.version_script = [VersionAnswer::Nrc(0x24)].into();
+        });
+        assert_eq!(state_of(&result), restart::StateCheck::RedoTransfer);
+        assert_nothing_changed_the_ecu(&host, 0);
+    }
+
+    /// A program that steps back into the completed plan's entry runs another pass. A crash in
+    /// it before its transfer start leaves the earlier pass's completion in the journal, which
+    /// must not skip the later pass: the intended version on the ECU is redone, not read back.
+    #[test]
+    fn a_later_pass_after_a_completed_one_is_not_read_back() {
+        let program = completed_path_program();
+        let dir = journal_dir("resume-state-loop");
+        {
+            let mut setup = file_setup(&dir);
+            setup.intended_software_version = Some(b"SW02".to_vec());
+            let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+            lose_after_plan(&mut host);
+            let mut journal = JobJournal::create(setup).unwrap();
+            let result = run_on(
+                &program,
+                &mut host,
+                JobLimits::default(),
+                &AtomicBool::new(false),
+                Some(&mut journal),
+            );
+            assert!(matches!(result, Err(JobError::Host { .. })), "{result:?}");
+        }
+        // The plain completed case first: read back.
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        host.software_version = Some(b"SW02".to_vec());
+        let result = resume_naming(
+            &program,
+            &dir,
+            &mut host,
+            false,
+            Some(TARGET_VIN),
+            Some(b"SW02"),
+            &dir_slot(&dir),
+        );
+        assert_eq!(state_of(&result), restart::StateCheck::ReadBackVerification);
+
+        // The restart's resume was counted; the plan allows one, so use a fresh journal for the
+        // later pass: the same first run, then a step back into the entry and its first step.
+        std::fs::remove_dir_all(&dir).unwrap();
+        let dir = journal_dir("resume-state-loop2");
+        {
+            let mut setup = file_setup(&dir);
+            setup.intended_software_version = Some(b"SW02".to_vec());
+            let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+            lose_after_plan(&mut host);
+            let mut journal = JobJournal::create(setup).unwrap();
+            let _ = run_on(
+                &program,
+                &mut host,
+                JobLimits::default(),
+                &AtomicBool::new(false),
+                Some(&mut journal),
+            );
+        }
+        {
+            let mut journal = Journal::open(&dir, &job_key()).unwrap();
+            let next = restart::next_steps(journal.state());
+            let mut state = diag_ir::Vm::new(&program).state;
+            state.pc = ENTRY;
+            state.steps = next + 1;
+            journal
+                .commit_step(
+                    crate::journal::StepRef {
+                        pc: program.code.len() as u32 - 1,
+                        steps: next,
+                    },
+                    Some(&postcard::to_allocvec(&state).unwrap()),
+                )
+                .unwrap();
+            journal
+                .commit_step(
+                    crate::journal::StepRef {
+                        pc: ENTRY,
+                        steps: next + 1,
+                    },
+                    None,
+                )
+                .unwrap();
+        }
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        host.software_version = Some(b"SW02".to_vec());
+        let result = resume_naming(
+            &program,
+            &dir,
+            &mut host,
+            false,
+            Some(TARGET_VIN),
+            Some(b"SW02"),
+            &dir_slot(&dir),
+        );
+        assert_eq!(state_of(&result), restart::StateCheck::RedoTransfer);
+        assert_nothing_changed_the_ecu(&host, 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The pause between inconclusive reads is the poll interval: none before the first read or
+    /// after the last, and the reads are spaced by at least the interval.
+    #[test]
+    fn the_version_reads_are_spaced_by_the_poll_interval() {
+        let mut program = flash_program();
+        program.flash[0].version_read_retries = 2;
+        let poll = Duration::from_millis(100);
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        host.software_version = None;
+        let started = std::time::Instant::now();
+        let result = state_check_polling(&program, &mut host, poll, &AtomicBool::new(false));
+        let returned = started.elapsed();
+        assert!(
+            matches!(
+                &result,
+                Err(JobError::OnSiteInterventionRequired(reason))
+                    if *reason == not_established(restart::Teardown::Reset)
+            ),
+            "{result:?}"
+        );
+        let times = &host.version_read_times;
+        assert_eq!(times.len(), 3);
+        for pair in times.windows(2) {
+            assert!(pair[1] - pair[0] >= poll, "{:?}", pair[1] - pair[0]);
+        }
+        // Nothing waits before the first read or after the last.
+        assert!(times[0] - started < poll, "{:?}", times[0] - started);
+        assert!(started + returned - times[2] < poll, "{:?}", returned);
+    }
+
+    /// A cancel that arrives during the pause between reads ends step 3b-2 in `Cancelled`, with
+    /// no further read.
+    #[test]
+    fn a_cancel_during_the_pause_between_reads_cancels() {
+        let mut program = flash_program();
+        program.flash[0].version_read_retries = 2;
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mirror = Arc::new(Mutex::new(Vec::new()));
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        host.software_version = None;
+        host.mirror = Some(Arc::clone(&mirror));
+        let canceller = {
+            let (cancelled, mirror) = (Arc::clone(&cancelled), Arc::clone(&mirror));
+            std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(20);
+                while mirror.lock().unwrap().is_empty() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                std::thread::sleep(Duration::from_millis(20));
+                cancelled.store(true, Ordering::Relaxed);
+            })
+        };
+        let started = std::time::Instant::now();
+        let result =
+            state_check_polling(&program, &mut host, Duration::from_millis(300), &cancelled);
+        canceller.join().unwrap();
+        assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
+        // The pause ends at its first step, with the second read not made.
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(host.version_reads, 1);
     }
 
     // ------------------------------------ promotion to the vehicle lock (ADR-263)

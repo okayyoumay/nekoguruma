@@ -1,7 +1,7 @@
 # ADR-244: Write-Job Journal as an Append-Only Record Log
 
 **Date:** 2026-10-07
-**Status:** Accepted (record set extended by ADR-253 and ADR-261; item 4's target VIN is a journal record since ADR-261; the no-lock consequence superseded by ADR-255 item 7)
+**Status:** Accepted (record set extended by ADR-253, ADR-261 and ADR-268; item 4's target VIN is a journal record since ADR-261, and its version being written since ADR-268; the no-lock consequence superseded by ADR-255 item 7)
 **Affects:** `crates/agent/src/journal.rs`, `crates/agent/tests/journal_crash.rs`, `docs/system-architecture.md` (5.5)
 
 ## Context

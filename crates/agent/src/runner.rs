@@ -652,6 +652,9 @@ where
             let state = restart::check_state(
                 program, &point, plan, &teardown, &sources, host, poll, cancelled,
             )?;
+            if state == restart::StateCheck::RedoTransfer {
+                restart::check_reentry(program, &point, &teardown, &sources, host, cancelled)?;
+            }
             Err(JobError::OnSiteInterventionRequired(
                 OnSiteReason::RestartOrderUnavailable {
                     flash_session: point.flash_session,
@@ -1219,6 +1222,22 @@ mod tests {
         version_read_times: Vec<std::time::Instant>,
         /// The block with this index (from 0 since the last RequestDownload) gets no answer.
         lose_block: Option<u64>,
+        /// The answers to the first reads of a runtime input other than the supply voltage, one
+        /// per read; later reads get `inputs`.
+        input_scripts: Vec<(
+            diag_ir::RuntimeInput,
+            std::collections::VecDeque<InputAnswer>,
+        )>,
+    }
+
+    /// One scripted answer to a runtime input read.
+    enum InputAnswer {
+        Value(i64),
+        /// The read fails, as a worker that cannot be reached would.
+        Fails,
+        /// The flag is set while the input is read, as a dropped job future would; the read
+        /// still gives this value.
+        Cancels(Arc<AtomicBool>, i64),
     }
 
     impl FlashHost {
@@ -1253,6 +1272,7 @@ mod tests {
                 version_reads: 0,
                 version_read_times: Vec::new(),
                 lose_block: None,
+                input_scripts: Vec::new(),
             }
         }
 
@@ -1290,7 +1310,22 @@ mod tests {
                     self.voltage_reads += 1;
                     crate::inputs::Reading::CannotBeEstablished
                 }
-                _ => return self.inputs.read(input),
+                _ => {
+                    let scripted = self
+                        .input_scripts
+                        .iter_mut()
+                        .find(|(scripted, _)| *scripted == input)
+                        .and_then(|(_, script)| script.pop_front());
+                    match scripted {
+                        Some(InputAnswer::Value(value)) => crate::inputs::Reading::Value(value),
+                        Some(InputAnswer::Fails) => return Err(HostError::NoResponse),
+                        Some(InputAnswer::Cancels(flag, value)) => {
+                            flag.store(true, Ordering::Relaxed);
+                            crate::inputs::Reading::Value(value)
+                        }
+                        None => return self.inputs.read(input),
+                    }
+                }
             })
         }
     }
@@ -2776,8 +2811,8 @@ mod tests {
                 read_version(),
             ]
         );
-        // Read by step 1 and again by the gates.
-        assert_eq!(host.voltage_reads, 2);
+        // Read by step 1, by the gates and by step 4a.
+        assert_eq!(host.voltage_reads, 3);
         assert_eq!(resumes(&dir), 1);
         let facts = Journal::read(&dir, &job_key()).unwrap().facts;
         assert_eq!(facts.attempt_key, None);
@@ -2986,6 +3021,22 @@ mod tests {
         }
     }
 
+    /// The teardown of a restart that stopped at step 4a because `kind` did not hold. Fails the
+    /// test on any other result.
+    fn teardown_at_precondition(
+        result: &Result<VmState, JobError>,
+        kind: diag_ir::PreconditionKind,
+    ) -> restart::Teardown {
+        match result {
+            Err(JobError::OnSiteInterventionRequired(OnSiteReason::PreconditionNotMet {
+                flash_session: 1,
+                precondition,
+                teardown,
+            })) if *precondition == kind => teardown.clone(),
+            other => panic!("{other:?}"),
+        }
+    }
+
     /// The teardown of a restart that passed step 2b and stopped at step 3b-2 with the software
     /// version not established. For the tests that make F195 unreadable on purpose, since it is
     /// also their precondition source.
@@ -3189,6 +3240,8 @@ mod tests {
         use diag_ir::{PreconditionKind, RuntimeInput};
         use restart::PassiveReason;
         let engine = passive_gate(PassiveReason::Precondition(PreconditionKind::Engine));
+        // Each case still fails at step 4a, which reads the default-session source again, so
+        // the restart stops there.
 
         // The engine runs.
         let program = flash_program_with_engine(
@@ -3201,12 +3254,18 @@ mod tests {
                 crate::inputs::Reading::Value(1),
             );
         });
-        assert_eq!(teardown_of(&result), engine);
+        assert_eq!(
+            teardown_at_precondition(&result, PreconditionKind::Engine),
+            engine
+        );
         assert_only_reads(&host);
 
         // The VCI has no source for it.
         let (result, _) = restart_with(&program, Some(TARGET_VIN), |_| {});
-        assert_eq!(teardown_of(&result), engine);
+        assert_eq!(
+            teardown_at_precondition(&result, PreconditionKind::Engine),
+            engine
+        );
 
         // A value out of range fails at once: the programming-session source, here a field of
         // the VIN request, is not read (the gates and step 3a read each identity once).
@@ -3223,7 +3282,10 @@ mod tests {
                 crate::inputs::Reading::Value(1),
             );
         });
-        assert_eq!(teardown_of(&result), engine);
+        assert_eq!(
+            teardown_at_precondition(&result, PreconditionKind::Engine),
+            engine
+        );
         assert_eq!(
             host.sent(),
             [
@@ -3242,7 +3304,10 @@ mod tests {
         };
         let program = flash_program_with_engine(missing(8), missing(9));
         let (result, host) = restart_with(&program, Some(TARGET_VIN), |_| {});
-        assert_eq!(teardown_of(&result), engine);
+        assert_eq!(
+            teardown_at_precondition(&result, PreconditionKind::Engine),
+            engine
+        );
         assert_eq!(
             host.sent(),
             [
@@ -3256,7 +3321,8 @@ mod tests {
     }
 
     /// The ECU may still be in its programming session, so a precondition the default-session
-    /// source cannot give is read through the programming-session one.
+    /// source cannot give is read through the programming-session one. Step 4a, in the confirmed
+    /// default session, reads only the default-session source, so the restart stops there.
     #[test]
     fn a_precondition_falls_back_to_the_programming_session_source() {
         use diag_ir::RuntimeInput;
@@ -3274,7 +3340,10 @@ mod tests {
                 crate::inputs::Reading::Value(0),
             );
         });
-        assert_eq!(teardown_of(&result), restart::Teardown::Reset);
+        assert_eq!(
+            teardown_at_precondition(&result, diag_ir::PreconditionKind::Engine),
+            restart::Teardown::Reset
+        );
         assert_reads_then_reset(&host);
     }
 
@@ -3311,12 +3380,12 @@ mod tests {
         assert_eq!(teardown_of(&result), restart::Teardown::Reset);
         assert_reads_then_reset(&host);
 
-        // The last one in the order fails.
+        // The last one in the order fails, at the gates and again at step 4a.
         let (result, _) = restart_with(&program, Some(TARGET_VIN), |host| {
             host.inputs = fixed(5);
         });
         assert_eq!(
-            teardown_of(&result),
+            teardown_at_precondition(&result, diag_ir::PreconditionKind::VehicleSpeed),
             passive_gate(restart::PassiveReason::Precondition(
                 diag_ir::PreconditionKind::VehicleSpeed
             ))
@@ -5617,6 +5686,216 @@ mod tests {
         // The pause ends at its first step, with the second read not made.
         assert!(started.elapsed() < Duration::from_secs(5));
         assert_eq!(host.version_reads, 1);
+    }
+
+    // ------------------------------- restart precondition check (ADR-229 item 2 step 4a)
+
+    /// `flash_program` declaring the external supply (must be connected) and the engine (must be
+    /// off), both read from the VCI in either session.
+    fn flash_program_with_supply_and_engine() -> Program {
+        use diag_ir::RuntimeInput as I;
+        let mut program = flash_program();
+        let declare = |input: I, value| {
+            let source = Some(diag_ir::Source::RuntimeInput(input));
+            Some(diag_ir::Precondition {
+                satisfied: diag_ir::Satisfied {
+                    lower: value,
+                    upper: value,
+                },
+                default_session: source,
+                programming_session: source,
+            })
+        };
+        program.preconditions.external_supply = declare(I::ExternalSupplyConnected, 1);
+        program.preconditions.engine = declare(I::EngineRunning, 0);
+        program.validate().expect("the fixture is a valid program");
+        program
+    }
+
+    /// A host whose engine is off and whose external supply gives `supply` for its first reads,
+    /// one per read (the gates' first), then stays connected.
+    fn supply_then_connected(host: &mut FlashHost, supply: Vec<InputAnswer>) {
+        use diag_ir::RuntimeInput as I;
+        host.inputs = crate::inputs::FixedInputs::new()
+            .with(I::ExternalSupplyConnected, crate::inputs::Reading::Value(1))
+            .with(I::EngineRunning, crate::inputs::Reading::Value(0));
+        host.input_scripts = vec![(I::ExternalSupplyConnected, supply.into())];
+    }
+
+    /// The done-when case: the power supply is connected when the gates check it, so the
+    /// teardown resets, and disconnected when step 4a checks it again. The job ends in on-site
+    /// intervention right after the state check, with no programming session, no setup step and
+    /// nothing else sent.
+    #[test]
+    fn a_power_supply_disconnected_before_step_4_ends_the_restart() {
+        let program = flash_program_with_supply_and_engine();
+        let (result, host) = restart_with(&program, Some(TARGET_VIN), |host| {
+            supply_then_connected(host, vec![InputAnswer::Value(1), InputAnswer::Value(0)]);
+        });
+        assert_eq!(
+            teardown_at_precondition(&result, diag_ir::PreconditionKind::ExternalSupply),
+            restart::Teardown::Reset
+        );
+        assert_eq!(full_log(&host), log_after_reset(1));
+        assert_nothing_changed_the_ecu(&host, 1);
+    }
+
+    /// Every declared precondition holds at step 4a: the restart still stops before anything
+    /// of step 4 is replayed, in the unavailable restart order.
+    #[test]
+    fn a_restart_whose_preconditions_hold_at_step_4a_stops_before_the_replay() {
+        let program = flash_program_with_supply_and_engine();
+        let (result, host) = restart_with(&program, Some(TARGET_VIN), |host| {
+            supply_then_connected(host, vec![]);
+        });
+        assert_eq!(state_of(&result), restart::StateCheck::RedoTransfer);
+        assert_eq!(teardown_of(&result), restart::Teardown::Reset);
+        assert_eq!(full_log(&host), log_after_reset(1));
+        assert_nothing_changed_the_ecu(&host, 1);
+    }
+
+    /// The first precondition in the order that does not hold is the one reported: here the
+    /// external supply, checked before the engine.
+    #[test]
+    fn step_4a_reports_the_first_failed_precondition_in_the_order() {
+        use diag_ir::RuntimeInput as I;
+        let program = flash_program_with_supply_and_engine();
+        let (result, _) = restart_with(&program, Some(TARGET_VIN), |host| {
+            supply_then_connected(host, vec![InputAnswer::Value(1), InputAnswer::Value(0)]);
+            host.input_scripts.push((
+                I::EngineRunning,
+                [InputAnswer::Value(0), InputAnswer::Value(1)].into(),
+            ));
+        });
+        assert_eq!(
+            teardown_at_precondition(&result, diag_ir::PreconditionKind::ExternalSupply),
+            restart::Teardown::Reset
+        );
+
+        // Only the engine fails at step 4a.
+        let (result, _) = restart_with(&program, Some(TARGET_VIN), |host| {
+            supply_then_connected(host, vec![]);
+            host.input_scripts.push((
+                I::EngineRunning,
+                [InputAnswer::Value(0), InputAnswer::Value(1)].into(),
+            ));
+        });
+        assert_eq!(
+            teardown_at_precondition(&result, diag_ir::PreconditionKind::Engine),
+            restart::Teardown::Reset
+        );
+    }
+
+    /// A worker failure on the step 4a read is a precondition not met, not a host error.
+    #[test]
+    fn a_failed_read_at_step_4a_is_a_precondition_not_met() {
+        let program = flash_program_with_supply_and_engine();
+        let (result, host) = restart_with(&program, Some(TARGET_VIN), |host| {
+            supply_then_connected(host, vec![InputAnswer::Value(1), InputAnswer::Fails]);
+        });
+        assert_eq!(
+            teardown_at_precondition(&result, diag_ir::PreconditionKind::ExternalSupply),
+            restart::Teardown::Reset
+        );
+        assert_nothing_changed_the_ecu(&host, 1);
+    }
+
+    /// Step 4a reads a precondition through its default-session ECU source, after the state
+    /// check, and never through the programming-session one: an answer that is not a value
+    /// fails it.
+    #[test]
+    fn step_4a_reads_only_the_default_session_source() {
+        use diag_ir::RuntimeInput;
+        // The default-session source is a field of the VIN request (text, never a value); the
+        // programming-session one gives an in-range value, which lets the gates pass.
+        let program = flash_program_with_engine(
+            diag_ir::Source::EcuService {
+                service_id: 1,
+                field_id: 3,
+            },
+            input(RuntimeInput::EngineRunning),
+        );
+        let (result, host) = restart_with(&program, Some(TARGET_VIN), |host| {
+            host.inputs = crate::inputs::FixedInputs::new().with(
+                RuntimeInput::EngineRunning,
+                crate::inputs::Reading::Value(0),
+            );
+        });
+        assert_eq!(
+            teardown_at_precondition(&result, diag_ir::PreconditionKind::Engine),
+            restart::Teardown::Reset
+        );
+        // The gates read the field, fall back, and reset; step 4a reads the field once more
+        // after the version.
+        assert_eq!(
+            full_log(&host),
+            [
+                read_vin(),
+                read_hardware(),
+                read_vin(),
+                reset_sent(),
+                read_of([0xF1, 0x86]),
+                read_vin(),
+                read_hardware(),
+                read_version(),
+                read_vin(),
+            ]
+        );
+    }
+
+    /// A cancel during a step 4a read cancels the restart, whatever the read gave.
+    #[test]
+    fn a_cancel_during_a_step_4a_read_cancels_the_restart() {
+        let program = flash_program_with_supply_and_engine();
+        let dir = journal_dir("resume-reentry-cancel");
+        interrupted_for(&program, &dir, Some(TARGET_VIN));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        supply_then_connected(
+            &mut host,
+            vec![
+                InputAnswer::Value(1),
+                InputAnswer::Cancels(Arc::clone(&cancelled), 1),
+            ],
+        );
+        let result = resume_on(
+            &program,
+            &mut host,
+            JobLimits::default(),
+            &cancelled,
+            Journal::open(&dir, &job_key()),
+            identity_sources(),
+            Some(&crate::journal::Vin::new(TARGET_VIN.to_owned())),
+            None,
+            &dir_slot(&dir),
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
+        // Nothing after the step 4a read: the engine is not read.
+        assert_eq!(full_log(&host), log_after_reset(1));
+    }
+
+    /// Step 4a runs only when the transfer is redone: a restart that goes to the read-back
+    /// verification does not check the preconditions again there, and stops as before.
+    #[test]
+    fn step_4a_does_not_run_before_the_read_back_verification() {
+        use diag_ir::RuntimeInput as I;
+        let mut program = completed_path_program();
+        let source = Some(diag_ir::Source::RuntimeInput(I::ExternalSupplyConnected));
+        program.preconditions.external_supply = Some(diag_ir::Precondition {
+            satisfied: diag_ir::Satisfied { lower: 1, upper: 1 },
+            default_session: source,
+            programming_session: source,
+        });
+        program.validate().expect("the fixture is a valid program");
+        // The supply is reported disconnected throughout.
+        let (result, host) = state_restart(&program, Some(b"SW02"), lose_after_plan, |host| {
+            host.software_version = Some(b"SW02".to_vec());
+            host.inputs = crate::inputs::FixedInputs::new()
+                .with(I::ExternalSupplyConnected, crate::inputs::Reading::Value(0));
+        });
+        assert_eq!(state_of(&result), restart::StateCheck::ReadBackVerification);
+        assert_nothing_changed_the_ecu(&host, 0);
     }
 
     // ------------------------------------ promotion to the vehicle lock (ADR-263)

@@ -15,7 +15,9 @@
 //! and confirms by reading F186 that the ECU is back in its default session (step 2b-2,
 //! ADR-265). `check_identity` reads the VIN and the hardware identity again (step 3a, ADR-267),
 //! and `check_state` reads the software version and decides between redoing the transfer and the
-//! read-back verification (step 3b-2, ADR-268 item 5).
+//! read-back verification (step 3b-2, ADR-268 item 5). When it decides to redo the transfer,
+//! `check_reentry` checks every declared precondition again before anything is replayed (step 4a,
+//! ADR-229 item 2 step 4).
 //!
 //! The interruption point is the latest of the last completed step and the requests the
 //! journal wrote ahead (the transfer-start and RequestTransferExit markers, and the request
@@ -113,9 +115,10 @@ pub enum OnSiteReason {
     /// counted), the gates of step 2, the teardown of step 2b-1 (`teardown`), the
     /// default-session confirmation of step 2b-2 (`confirmed`) and the identity checks of step 3a
     /// (`check_identity`) and the ECU state check of step 3b-2 (`state`, `check_state`). Steps 1
-    /// to 3 passed. Step 4 (the replay to the erase) and the read-back verification do not run in
-    /// this agent yet, so the job stops before anything that changes the ECU (ADR-255, ADR-261,
-    /// ADR-264, ADR-265, ADR-268 item 5).
+    /// to 3 passed, and for [`StateCheck::RedoTransfer`] also the precondition check of step 4a
+    /// (`check_reentry`). The rest of step 4 (the replay to the erase) and the read-back
+    /// verification do not run in this agent yet, so the job stops before anything that changes
+    /// the ECU (ADR-255, ADR-261, ADR-264, ADR-265, ADR-268 item 5).
     RestartOrderUnavailable {
         flash_session: u32,
         teardown: Teardown,
@@ -136,6 +139,16 @@ pub enum OnSiteReason {
     /// is conclusive and not retried. `teardown` is how the download was ended first.
     UnexpectedSoftwareVersion {
         flash_session: u32,
+        teardown: Teardown,
+    },
+    /// A precondition the program declares did not hold at the start of step 4 (step 4a,
+    /// `check_reentry`; ADR-229 item 2 step 4, design 8.9): its default-session source gave a
+    /// value outside the declared range, no value, or could not be used. Nothing of step 4 was
+    /// replayed. `precondition` is the first that failed; `teardown` is how the download was
+    /// ended first.
+    PreconditionNotMet {
+        flash_session: u32,
+        precondition: PreconditionKind,
         teardown: Teardown,
     },
     /// Step 3a could not establish an identity in the default session (ADR-229 item 2 step 3):
@@ -712,6 +725,75 @@ where
         }
     }
     not_established()
+}
+
+/// The full precondition check at the start of ADR-229 item 2 step 4 (step 4a), run after
+/// `check_state` decided [`StateCheck::RedoTransfer`] and before anything of step 4 is replayed:
+/// the conditions may have changed while the agent was down. Every precondition the program
+/// declares is checked, in the order voltage, external supply, ignition, engine, vehicle speed,
+/// stopping at the first that does not hold. The ECU is in its default session (step 2b-2
+/// confirmed it), so each is read through its default-session source only, which
+/// `Program::validate` requires for every declared precondition; the programming-session source
+/// is for the second check before the erase. A value outside the declared range, a reading that
+/// is not a value, a source the table does not map and a failure to use the worker all end in
+/// [`OnSiteReason::PreconditionNotMet`], which carries the precondition and `teardown`.
+///
+/// The software-version match of design 8.9.1 is not checked again: during a restart the rules of
+/// step 3b-2 (`check_state`) replace it. Nor are the VIN and the hardware identity, which step 3a
+/// established. A cancel stops it at the start, before and right after every read. Nothing here
+/// sends anything but ReadDataByIdentifier requests through the declared sources, and reads of
+/// runtime inputs.
+pub(crate) fn check_reentry<H>(
+    program: &Program,
+    point: &RestartPoint,
+    teardown: &Teardown,
+    sources: &ServiceSources,
+    host: &mut H,
+    cancelled: &AtomicBool,
+) -> Result<(), JobError>
+where
+    H: DiagHost<Error = HostError> + RuntimeInputs,
+{
+    if cancelled.load(Ordering::Relaxed) {
+        return Err(JobError::Cancelled);
+    }
+    let declared = &program.preconditions;
+    for (kind, precondition) in [
+        (PreconditionKind::Voltage, &declared.voltage_mv),
+        (PreconditionKind::ExternalSupply, &declared.external_supply),
+        (PreconditionKind::Ignition, &declared.ignition),
+        (PreconditionKind::Engine, &declared.engine),
+        (PreconditionKind::VehicleSpeed, &declared.vehicle_speed),
+    ] {
+        let Some(precondition) = precondition else {
+            continue;
+        };
+        let holds = match precondition.default_session {
+            Some(source) => {
+                let range = precondition.satisfied.lower..=precondition.satisfied.upper;
+                match cancellable(cancelled, || resolve_source(source, sources, host))? {
+                    Ok(Reading::Value(value)) => range.contains(&value),
+                    Ok(_) => false,
+                    Err(error) => {
+                        tracing::warn!(%error, ?kind, "a precondition could not be read at re-entry");
+                        false
+                    }
+                }
+            }
+            // `Program::validate` refuses this; not established, so not met.
+            None => false,
+        };
+        if !holds {
+            return Err(JobError::OnSiteInterventionRequired(
+                OnSiteReason::PreconditionNotMet {
+                    flash_session: point.flash_session,
+                    precondition: kind,
+                    teardown: teardown.clone(),
+                },
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Whether the interruption is at the end of a pass whose post-transfer steps are journaled

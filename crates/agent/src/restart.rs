@@ -117,7 +117,8 @@ pub enum OnSiteReason {
     /// (`check_identity`) and the ECU state check of step 3b-2 (`state`, `check_state`). Steps 1
     /// to 3 passed, and for [`StateCheck::RedoTransfer`] also the precondition check of step 4a
     /// (`check_reentry`) and the replay of the plan's steps from the entry up to, not including,
-    /// the erase (step 4b-2, ADR-273). The rest of step 4 (the erase) and the read-back
+    /// the erase (step 4b-2, ADR-273). The rest of step 4 (the second check of the
+    /// mutable conditions before the erase, step 4b-3, and the erase, step 4c) and the read-back
     /// verification do not run in this agent yet, so the job stops before the erase, so before
     /// anything that writes the ECU's memory (ADR-255, ADR-261, ADR-264, ADR-265, ADR-268
     /// item 5). After a replay the ECU is in its programming session with the plan's setup
@@ -1156,7 +1157,8 @@ enum EntryStateError {
 
 /// The VM state at `entry_pc`: the newest state the journal holds, which is either the state the
 /// runner took on the step into a plan's entry (ADR-252) or the state a run started from, which
-/// every journaled run commits first (ADR-272). A run start sits newer than an earlier run's
+/// every journaled run from instruction 0 commits first (ADR-272); the restart's replay commits
+/// none and starts from this same state (ADR-273). A run start sits newer than an earlier run's
 /// states, so a plain start on an existing journal never inherits them. Only a journal that holds
 /// no state, one written before the run-start record, falls back to the program's initial state
 /// for an entry at pc 0. Either is checked with `Vm::check_state` before it is used.

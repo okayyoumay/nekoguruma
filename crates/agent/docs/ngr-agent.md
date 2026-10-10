@@ -122,8 +122,9 @@ policy allows the program, before anything is sent to the ECU; a program without
 none. A journal that already exists ends the job with nothing sent: a job that ran before goes
 on through `resume_program_journaled` ("Restart entry" below). Every run from instruction 0, a first
 run or a plain start on an existing journal, commits the VM state it starts from as its first
-record (the run start, ADR-272); the restart's replay commits none ("Replay to the erase" below), at the run's first step count and before anything is sent, so the journal
-marks where each run began. Each time execution arrives at a plan's boundary, before that
+record (the run start, ADR-272), at the run's first step count and before anything is sent, so
+the journal marks where each such run began. The restart's replay commits none: it starts from
+the entry state the journal already holds as its newest ("Replay to the erase" below). Each time execution arrives at a plan's boundary, before that
 instruction runs, it commits:
 
 - at the entry, once per job and before its first transfer: the hardware part number and

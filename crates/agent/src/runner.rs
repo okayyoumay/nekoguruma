@@ -268,7 +268,8 @@ pub async fn run_program_journaled(
 ///   from the plan's entry boundary up to, not including, its erase run again from the restart's
 ///   entry state, journaled as in a first run but with no run start and no transfer-start marker
 ///   (step 4b-2, ADR-273); a failure there ends the job as in a first run. The rest of the
-///   restart order (the erase and the read-back verification) does not run in this agent, so
+///   restart order (the second check of the mutable conditions before the erase, step 4b-3, the
+///   erase, step 4c, and the read-back verification) does not run in this agent, so
 ///   a job that passed ends in [`JobError::OnSiteInterventionRequired`] (`RestartOrderUnavailable`,
 ///   carrying the teardown's outcome, the confirmation and the state check), or in
 ///   [`JobError::IdentityMismatch`] when the ECU's VIN is another vehicle's;

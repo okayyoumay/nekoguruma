@@ -2,8 +2,10 @@
 //!
 //! For a procedure with a flash recovery plan, the runner commits to the journal in two places.
 //!
-//! When a run starts, before anything is sent ([`JobJournal::run_start`]): the VM state it starts
-//! from, so the journal marks where each run began (ADR-272).
+//! When a run from instruction 0 starts, before anything is sent ([`JobJournal::run_start`]): the
+//! VM state it starts from, so the journal marks where each such run began (ADR-272). The
+//! restart's replay commits none: it starts from the entry state the journal already holds
+//! (ADR-273).
 //!
 //! When execution arrives at an instruction, before it runs and once the VM's own checks of it
 //! passed (`Vm::current_op`, ADR-233 item 3) ([`JobJournal::arrive`]):

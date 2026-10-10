@@ -899,7 +899,7 @@ where
 /// complete: the completion is recorded and the interruption point is no later than the
 /// completed pass's last post-transfer step (the test of `effective_point`). A step back into the
 /// plan after the completion puts the point later, so this is false for a later pass.
-fn completed_pass_interrupted(facts: &RecoveryFacts) -> bool {
+pub(crate) fn completed_pass_interrupted(facts: &RecoveryFacts) -> bool {
     let Some(exit) = facts
         .transfer
         .as_ref()
@@ -1274,18 +1274,20 @@ fn state_standing_at(
 /// The VM state a redo of `plan`'s transfer resumes from: the newest state standing at its
 /// `entry_pc`. That is either the state the runner took on the step into the entry (ADR-252) or
 /// the state a run started from, which every journaled run from instruction 0 commits first
-/// (ADR-272); the restart's replay commits none and starts from this same state (ADR-273). A run
+/// (ADR-272); the restart's replay commits a run start carrying this same state (ADR-274). A run
 /// start sits newer than an earlier run's states, so a plain start on an existing journal never
 /// inherits them.
 ///
 /// The newest state may be the plan's end state (ADR-271 item 2), committed after the entry's
-/// when the pass ran through, and a journal cut between that state and the post-transfer
-/// completion still redoes the transfer: then the state before it is the entry's. Only a newest
-/// state at the plan's end gives way to the previous one; any other newest state is the run's
-/// latest boundary, and an older entry state would belong to a run it has moved past. Only a
-/// journal that holds no state, one written before the run-start record, falls back to the
-/// program's initial state for an entry at pc 0. The state used is checked with
-/// `Vm::check_state` before it is returned.
+/// when the pass ran through, and a crash after that state still redoes the transfer: then the
+/// state before it is the entry's (ADR-274). That fallback applies only when the newest state
+/// stands at the plan's end, it is the current attempt's end-state record (the transfer's last
+/// post-transfer step is the step that recorded it) and the interruption point is that step, so
+/// nothing was journaled after it. Any other newest state not at the entry is
+/// `EntryStateError::Missing`: for adjacent plans, a later plan's pre-erase primitive journaled
+/// after the first plan's completion is refused (ADR-253). Only a journal that holds no state,
+/// one written before the run-start record, falls back to the program's initial state for an
+/// entry at pc 0. The state used is checked with `Vm::check_state` before it is returned.
 fn entry_state(
     program: &Program,
     state: &JournalState,
@@ -1299,13 +1301,26 @@ fn entry_state(
         return Err(EntryStateError::Missing);
     };
     let newest = decode_state(bytes)?;
-    if newest.pc != entry_pc
-        && newest.pc == plan.boundaries.post_transfer_end_pc
-        && let Some((_, previous)) = &state.previous_vm_state
-    {
+    if newest.pc == entry_pc {
+        return state_standing_at(program, newest, entry_pc);
+    }
+    // The fallback is for the current attempt's end-state record only: the step that recorded it
+    // is the plan's last post-transfer step and the interruption point, nothing journaled after.
+    let at = state.last_vm_state.as_ref().map(|(at, _)| *at);
+    let is_end_record = newest.pc == plan.boundaries.post_transfer_end_pc
+        && at.is_some()
+        && state
+            .facts
+            .transfer
+            .as_ref()
+            .and_then(|transfer| transfer.exit.as_ref())
+            .and_then(|exit| exit.last_post_step)
+            == at
+        && interruption_point(&state.facts) == at;
+    if is_end_record && let Some((_, previous)) = &state.previous_vm_state {
         return state_standing_at(program, decode_state(previous)?, entry_pc);
     }
-    state_standing_at(program, newest, entry_pc)
+    Err(EntryStateError::Missing)
 }
 
 /// The VM state at `plan`'s `post_transfer_end_pc` that the journal holds for the pass the
@@ -1623,6 +1638,104 @@ mod tests {
                 .unwrap()
                 .pc,
             ENTRY
+        );
+    }
+
+    /// [`program`] with a second plan that starts where the first ends (stage 8, session 2).
+    fn adjacent_plans() -> Program {
+        let mut program = program(RecoveryRequired::Never);
+        let mut second = program.flash[0].clone();
+        second.flash_session = 2;
+        second.stage = 8;
+        second.boundaries = RecoveryBoundaries {
+            entry_pc: END,
+            erase_pc: END,
+            transfer_exit_pc: END,
+            post_transfer_end_pc: END + 1,
+        };
+        program.flash.push(second);
+        program
+    }
+
+    /// Adjacent plans, the first complete and a pre-erase primitive of the second journaled: the
+    /// shared state is the newest state, but it is no longer the interruption point, so the first
+    /// plan's entry state is not taken from behind it (ADR-253, ADR-274).
+    #[test]
+    fn a_later_plans_pre_erase_primitive_after_a_completion_needs_on_site_intervention() {
+        let program = adjacent_plans();
+        let mut j = journal_with_end_state(&program);
+        j.commit_post_transfer_complete().unwrap();
+        j.commit_step(at(END), None).unwrap();
+        assert!(matches!(
+            super::entry_state(&program, j.state(), &program.flash[0]),
+            Err(EntryStateError::Missing)
+        ));
+        assert_eq!(
+            decide(&program, &j),
+            RestartDecision::OnSiteInterventionRequired(OnSiteReason::MissingEntryState {
+                flash_session: 1
+            })
+        );
+    }
+
+    /// Adjacent plans, a crash right after the first plan's completion: the first plan restarts
+    /// from its own entry state, and the shared state is its end state.
+    #[test]
+    fn a_crash_right_after_the_first_of_two_adjacent_plans_restarts_it_from_its_entry() {
+        let program = adjacent_plans();
+        let mut j = journal_with_end_state(&program);
+        j.commit_post_transfer_complete().unwrap();
+        let RestartDecision::Restart(point) = decide(&program, &j) else {
+            panic!("{:?}", decide(&program, &j));
+        };
+        assert_eq!(point.flash_session, 1);
+        assert_eq!(point.entry_state.pc, ENTRY);
+        assert_eq!(
+            super::plan_end_state(&program, j.state(), &program.flash[0]).unwrap(),
+            state_at_pc(&program, END, u64::from(END))
+        );
+    }
+
+    /// Adjacent plans, the second reached its end state and the crash came before its completion:
+    /// it restarts from the shared state.
+    #[test]
+    fn a_second_adjacent_plan_that_reached_its_end_restarts_from_the_shared_state() {
+        let program = adjacent_plans();
+        let mut j = journal_with_end_state(&program);
+        j.commit_post_transfer_complete().unwrap();
+        let end = u64::from(END);
+        j.commit_transfer_start(
+            StageId(8),
+            StepRef {
+                pc: END,
+                steps: end + 1,
+            },
+        )
+        .unwrap();
+        j.commit_transfer_exit_intent(StepRef {
+            pc: END,
+            steps: end + 2,
+        })
+        .unwrap();
+        j.commit_step(
+            StepRef {
+                pc: END,
+                steps: end + 3,
+            },
+            Some(&state_bytes(&state_at_pc(&program, END + 1, end + 4))),
+        )
+        .unwrap();
+        let RestartDecision::Restart(point) = decide(&program, &j) else {
+            panic!("{:?}", decide(&program, &j));
+        };
+        assert_eq!(point.flash_session, 2);
+        assert_eq!(point.entry_state.pc, END);
+        assert_eq!(point.entry_state.steps, next_steps(j.state()));
+        assert_eq!(
+            super::plan_end_state(&program, j.state(), &program.flash[1])
+                .unwrap()
+                .pc,
+            END + 1
         );
     }
 

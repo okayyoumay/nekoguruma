@@ -339,11 +339,12 @@ pub struct JournalState {
     /// The newest VM state a step record or a run start carried (postcard `VmState`, opaque
     /// here), with the step it was taken after (for a run start, the step count it starts at).
     pub last_vm_state: Option<(StepRef, Vec<u8>)>,
-    /// The VM state the one in `last_vm_state` replaced, if any. A plan's end state sits after
-    /// its entry state, so a redo of the transfer finds the entry state here when the newest
-    /// state is the end one (ADR-271 item 2). Two states are enough: every state is committed at
-    /// a plan's entry or end, or is a run start, and a state older than these two belongs to a
-    /// pass the newest has already moved past. Memory stays bounded however long a loop runs.
+    /// The VM state the one in `last_vm_state` replaced, if any. A redo of the transfer finds
+    /// the entry state here when the newest state is the plan's end state (ADR-271 item 2).
+    /// Two states are enough, by this invariant: at most one end state follows a pass's newest
+    /// entry-standing state, because the end state is recorded only by a step from inside the
+    /// plan and every run that starts from a restored entry state commits a run start
+    /// (ADR-274). Memory stays bounded however long a loop runs.
     pub previous_vm_state: Option<(StepRef, Vec<u8>)>,
     /// Records in the journal.
     pub records: u64,

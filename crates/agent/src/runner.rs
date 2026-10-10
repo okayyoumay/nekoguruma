@@ -266,8 +266,8 @@ pub async fn run_program_journaled(
 ///   default-session source (step 4a): one that does not hold ends the job in
 ///   [`JobError::OnSiteInterventionRequired`] (`PreconditionNotMet`). Then the program's steps
 ///   from the plan's entry boundary up to, not including, its erase run again from the restart's
-///   entry state, journaled as in a first run but with no run start and no transfer-start marker
-///   (step 4b-2, ADR-273); a failure there ends the job as in a first run. Then
+///   entry state, journaled as in a first run: it commits a run start carrying the entry state
+///   first (ADR-274), and no transfer-start marker (step 4b-2, ADR-273); a failure there ends the job as in a first run. Then
 ///   `restart::check_before_erase` checks every declared precondition once more through its
 ///   programming-session source (step 4b-3): one that does not hold ends the job in
 ///   [`JobError::OnSiteInterventionRequired`] (`PreconditionNotMetBeforeErase`) with no erase
@@ -562,7 +562,8 @@ impl Drop for CancelOnDrop {
 /// (step 3b-2, ADR-268 item 5), and on a redone transfer `restart::check_reentry` reads the
 /// declared preconditions (step 4a, ADR-229 item 2 step 4); then the program's steps from the
 /// plan's entry to its erase run again from the restart's entry state, journaled as in a first
-/// run and stopped before the erase (step 4b-2, ADR-273); then `restart::check_before_erase`
+/// run, after a run start that carries the entry state, and stopped before the erase (step 4b-2,
+/// ADR-273, ADR-274); then `restart::check_before_erase`
 /// reads the declared preconditions through their programming-session sources (step 4b-3).
 /// `vin` is the job's target VIN and `intended_software_version` the software version it
 /// intends to write. Once the ECU's VIN
@@ -669,9 +670,10 @@ where
             if state == restart::StateCheck::RedoTransfer {
                 restart::check_reentry(program, &point, &teardown, &sources, host, cancelled)?;
                 // Step 4b-2 (ADR-273): the plan's steps from the entry to the erase, without
-                // the erase. The run start is not committed; the entry state is already the
-                // journal's newest.
+                // the erase. A run start carrying the entry state is committed first (ADR-274),
+                // so the entry state stays the one the journal finds behind a later end state.
                 let mut replay = JobJournal::new(journal, sources.clone());
+                replay.run_start(&point.entry_state)?;
                 let vm = Vm::resume(point.entry_state.clone());
                 match run_vm(
                     program,
@@ -806,7 +808,7 @@ enum RunEnd {
 }
 
 /// The step loop from `vm`'s state, shared by a run from the program's start and the restart's
-/// replay (ADR-273). The run start is not committed here. With `stop_before`, the loop ends in
+/// replay (ADR-273). The caller commits the run start (ADR-272, ADR-274), not this loop. With `stop_before`, the loop ends in
 /// [`RunEnd::Stopped`] when execution arrives at that instruction, before the journal's
 /// `arrive` and before the instruction runs, so nothing at the stop point is committed or sent.
 fn run_vm<H, S>(
@@ -2235,6 +2237,161 @@ mod tests {
         assert_eq!(step, end_step);
         let end_state: VmState = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(end_state.pc, end);
+    }
+
+    /// `flash_program` with a polling loop after the plan, headed at the plan's end: the
+    /// validator allows a jump from outside the plan to that pc. Gives the program and the end.
+    fn program_with_loop_at_end() -> (Program, u32) {
+        let mut program = flash_program();
+        let end = program.flash[0].boundaries.post_transfer_end_pc;
+        program
+            .code
+            .extend([Op::PushI64(1), Op::Pop, Op::Jump(end)]);
+        program
+            .validate()
+            .expect("a jump from outside to the end is valid");
+        (program, end)
+    }
+
+    /// Runs `program` from a fresh counting journal until the step limit, and gives the journal's
+    /// state.
+    fn state_after_steps(program: &Program, max_steps: u64) -> crate::journal::JournalState {
+        let commits = Rc::new(Cell::new(0));
+        let mut host = FlashHost::new(Rc::clone(&commits));
+        let mut journal = counting_journal(&commits, None);
+        let limits = JobLimits {
+            max_steps,
+            ..JobLimits::default()
+        };
+        let result = run_on(
+            program,
+            &mut host,
+            limits,
+            &AtomicBool::new(false),
+            Some(&mut journal),
+        );
+        assert!(matches!(result, Err(JobError::StepLimit(_))), "{result:?}");
+        journal.journal().state().clone()
+    }
+
+    /// A jump from outside the plan to its end journals nothing (ADR-274): the polling loop
+    /// after the plan leaves the journal as the first arrival at the end did, and the restart
+    /// still finds the completed pass and its entry state.
+    #[test]
+    fn a_jump_to_the_end_from_outside_the_plan_journals_nothing() {
+        let (program, end) = program_with_loop_at_end();
+        // Every instruction is one step, so this stops on the first arrival at the end.
+        let first = state_after_steps(&program, u64::from(end));
+        let looped = state_after_steps(&program, u64::from(end) + 10);
+        assert_eq!(looped, first);
+        let exit = looped
+            .facts
+            .transfer
+            .as_ref()
+            .unwrap()
+            .exit
+            .as_ref()
+            .unwrap();
+        assert!(exit.complete);
+        let end_step = StepRef {
+            pc: end - 1,
+            steps: u64::from(end - 1),
+        };
+        assert_eq!(looped.facts.last_step, Some(end_step));
+        assert_eq!(exit.last_post_step, Some(end_step));
+        assert_eq!(looped.last_vm_state.as_ref().unwrap().0, end_step);
+        assert!(restart::completed_pass_interrupted(&looped.facts));
+        let decision = restart::classify(&program, Ok(&looped));
+        let RestartDecision::Restart(point) = decision else {
+            panic!("{decision:?}");
+        };
+        assert_eq!(point.entry_state.pc, ENTRY);
+    }
+
+    /// A jump from inside the post-transfer steps to the end records the state there once.
+    #[test]
+    fn a_jump_to_the_end_from_inside_the_plan_records_the_state_once() {
+        let mut program = flash_program();
+        let jump = program.flash[0].boundaries.post_transfer_end_pc;
+        let end = jump + 1;
+        program
+            .code
+            .extend([Op::Jump(end), Op::PushI64(1), Op::Pop]);
+        program.flash[0].boundaries.post_transfer_end_pc = end;
+        program
+            .validate()
+            .expect("a jump from inside to the end is valid");
+        let commits = Rc::new(Cell::new(0));
+        let mut host = FlashHost::new(Rc::clone(&commits));
+        let mut journal = counting_journal(&commits, None);
+        run_on(
+            &program,
+            &mut host,
+            JobLimits::default(),
+            &AtomicBool::new(false),
+            Some(&mut journal),
+        )
+        .unwrap();
+        let state = journal.journal().state();
+        let (step, bytes) = state.last_vm_state.as_ref().unwrap();
+        assert_eq!(step.pc, jump);
+        assert_eq!(postcard::from_bytes::<VmState>(bytes).unwrap().pc, end);
+        // The state before it is the entry's, so the end was not recorded twice.
+        let (step, bytes) = state.previous_vm_state.as_ref().unwrap();
+        assert_eq!(step.pc, ENTRY - 1);
+        assert_eq!(postcard::from_bytes::<VmState>(bytes).unwrap().pc, ENTRY);
+        assert!(
+            state
+                .facts
+                .transfer
+                .as_ref()
+                .unwrap()
+                .exit
+                .as_ref()
+                .unwrap()
+                .complete
+        );
+    }
+
+    /// A VM state over the journal's frame cannot be recorded: the job ends in
+    /// `JournalError::TooLarge` at the step that reaches the end, with no completion record.
+    #[test]
+    fn a_state_too_large_for_the_journal_ends_the_job_at_the_end_step() {
+        let mut program = flash_program();
+        program.constants.push(vec![0xAA; 4096]);
+        let big = (program.constants.len() - 1) as u32;
+        let end = program.flash[0].boundaries.post_transfer_end_pc;
+        // More than the frame holds, once encoded: 300 values of 4 KiB.
+        for _ in 0..300 {
+            program.code.push(Op::PushBytes(big));
+        }
+        program.flash[0].boundaries.post_transfer_end_pc = end + 300;
+        program.validate().expect("the fixture is a valid program");
+        let commits = Rc::new(Cell::new(0));
+        let mut host = FlashHost::new(Rc::clone(&commits));
+        let mut journal = counting_journal(&commits, None);
+        let result = run_on(
+            &program,
+            &mut host,
+            JobLimits::default(),
+            &AtomicBool::new(false),
+            Some(&mut journal),
+        );
+        assert!(
+            matches!(result, Err(JobError::Journal(JournalError::TooLarge))),
+            "{result:?}"
+        );
+        let exit = journal
+            .journal()
+            .state()
+            .facts
+            .transfer
+            .as_ref()
+            .unwrap()
+            .exit
+            .clone()
+            .unwrap();
+        assert!(!exit.complete);
     }
 
     /// The software version answered with the plan's declared "no valid application" response
@@ -5450,11 +5607,13 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// The replay journals its steps, commits no transfer-start marker and no run start, and an
-    /// interruption after it restarts from the same entry state.
+    /// The replay commits one run start carrying the entry state, then its steps, and no
+    /// transfer-start marker (ADR-274); an interruption after it restarts from the same entry
+    /// state.
     #[test]
-    fn the_replay_commits_its_steps_but_no_marker_and_no_run_start() {
+    fn the_replay_commits_a_run_start_and_its_steps_but_no_marker() {
         let (program, erase) = replay_program();
+        let entry = program.flash[0].boundaries.entry_pc;
         let dir = journal_dir("replay-journal");
         interrupted_at_erase(&program, erase, &dir);
         let before = Journal::read(&dir, &job_key()).unwrap();
@@ -5463,22 +5622,80 @@ mod tests {
         let result = resume(&program, &dir, &mut host, false);
         assert_eq!(state_of(&result), restart::StateCheck::RedoTransfer);
         let after = Journal::read(&dir, &job_key()).unwrap();
-        // The resume of the restart is the only record before the replay's; the replay adds one
-        // step record for each of its three requests, and nothing else.
-        assert_eq!(after.records, before.records + 1 + 3);
+        // The resume of the restart, the run start, and one step record for each of the three
+        // requests of the replay, and nothing else.
+        assert_eq!(after.records, before.records + 1 + 1 + 3);
         assert_eq!(after.facts.transfer, {
             let mut transfer = before.facts.transfer.clone().unwrap();
             transfer.interrupted = true;
             Some(transfer)
         });
-        // No run start and no step into the entry: the newest VM state is the interrupted
-        // pass's.
-        assert_eq!(after.last_vm_state, before.last_vm_state);
+        // The run start is the newest VM state: the entry state, at the step count the restart
+        // continued from.
+        let (at, bytes) = after.last_vm_state.as_ref().unwrap();
+        assert_eq!(
+            *at,
+            StepRef {
+                pc: entry,
+                steps: first_point.entry_state.steps
+            }
+        );
+        let started: VmState = postcard::from_bytes(bytes).unwrap();
+        assert_eq!(started, first_point.entry_state);
         let second_point = restart_point(&program, &dir);
         let mut expected = first_point.entry_state.clone();
         expected.steps = second_point.entry_state.steps;
         assert_eq!(second_point.entry_state, expected);
         assert_eq!(second_point.flash_session, first_point.flash_session);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// [`replay_program`] with a post-transfer check and a routine after the plan (0xFF02 in the
+    /// replay is a setup routine, so the one after the plan is 0xFF04). Gives the program and the
+    /// pc of the routine after the plan.
+    fn replay_program_with_end() -> (Program, u32) {
+        let (mut program, _) = replay_program();
+        let end = program.flash[0].boundaries.post_transfer_end_pc;
+        program.code.extend([
+            Op::PushBytes(0),
+            Op::RoutineControl {
+                routine: 0xFF04,
+                sub: 1,
+            },
+            Op::Pop,
+        ]);
+        program.validate().expect("the fixture is a valid program");
+        (program, end + 1)
+    }
+
+    /// A pass that ran to its end leaves the end state newest; a restart that redoes the transfer
+    /// (the ECU still reports the pre-erase version) and is interrupted in its replay restarts
+    /// from the same entry state, because the replay's run start sits behind it (ADR-274).
+    #[test]
+    fn a_crash_in_the_replay_after_a_completed_pass_restarts_from_the_same_entry_state() {
+        let (program, after_plan) = replay_program_with_end();
+        let dir = journal_dir("replay-after-completed");
+        let result = first_run(&program, &dir, JobLimits::default(), |host| {
+            host.lose_routine = Some(0xFF04);
+        });
+        assert!(
+            matches!(result, Err(JobError::Host { pc, .. }) if pc == after_plan),
+            "{result:?}"
+        );
+        let first_point = restart_point(&program, &dir);
+        assert_eq!(
+            first_point.entry_state.pc,
+            program.flash[0].boundaries.entry_pc
+        );
+        // The restart redoes the transfer and fails in its replay.
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        host.lose_service = Some(0x27);
+        let result = resume(&program, &dir, &mut host, false);
+        assert!(matches!(result, Err(JobError::Host { .. })), "{result:?}");
+        let second_point = restart_point(&program, &dir);
+        let mut expected = first_point.entry_state.clone();
+        expected.steps = second_point.entry_state.steps;
+        assert_eq!(second_point.entry_state, expected);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -5545,7 +5762,7 @@ mod tests {
     }
 
     /// A plan whose entry is the erase has nothing to replay: the restart sends nothing for it
-    /// and journals no step.
+    /// and journals no step, only the run start.
     #[test]
     fn a_plan_entered_at_the_erase_replays_nothing() {
         let (mut program, erase) = replay_program();
@@ -5559,8 +5776,8 @@ mod tests {
         assert_eq!(state_of(&result), restart::StateCheck::RedoTransfer);
         assert!(replayed_requests(&host).is_empty(), "{:?}", full_log(&host));
         let after = Journal::read(&dir, &job_key()).unwrap();
-        // Only the resume record is new.
-        assert_eq!(after.records, before.records + 1);
+        // Only the resume record and the replay's run start are new.
+        assert_eq!(after.records, before.records + 1 + 1);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

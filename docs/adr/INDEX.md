@@ -264,6 +264,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-272](ADR-272-journal-run-start-record.md) | Every Journaled Run Records the State It Starts From | Accepted (item 2's open point for runs not from instruction 0 settled for the replay of step 4 by ADR-273; item 3 amended by ADR-274: the entry state is the newest state standing at the entry, which is the newest state or, when the newest is the current attempt's end-state record and the interruption point is that step, the one before it; the replay commits a run start since ADR-274) | `agent` journal, runner, restart |
 | [ADR-273](ADR-273-restart-replay-to-the-erase.md) | The Restart Replays the Program from the Entry State up to the Erase | Accepted (item 4's stop at the erase is now preceded by step 4b-3's second precondition check, `restart::check_before_erase`, which ends the job in `PreconditionNotMetBeforeErase` when a condition fails; the `RestartOrderUnavailable` stop remains until step 4c; item 2 superseded by ADR-274: the replay commits a run start carrying the entry state) | `agent` runner, restart, journaling |
 | [ADR-274](ADR-274-plan-end-state-read-back.md) | A Plan's End State Is Recorded from Inside the Plan, and the Restart Reads the Entry State Back Behind It | Accepted | `agent` journaling, journal, restart, runner |
+| [ADR-275](ADR-275-optional-real-hardware-checks.md) | Real-Hardware Checks Are Optional, Opt-In Tests Bounded by a Target Class | Accepted | design 13.5, test layout, `sim-ecu` |
 
 ## Status Legend
 
@@ -594,6 +595,7 @@ the predecessor repository these ADRs came from.
 - ADR-249
 - ADR-251
 - ADR-260
+- ADR-275
 
 ### Timestamps / Clock
 - ADR-057 (amended by ADR-102)

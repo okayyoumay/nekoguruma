@@ -2246,6 +2246,10 @@ mod tests {
             Record::Intent { at: at(0, 0) },
             Record::TargetVin(Vin::new(String::new())),
             Record::IntendedSoftwareVersion(Vec::new()),
+            Record::RunStart {
+                at: at(0, 0),
+                vm_state: Vec::new(),
+            },
         ];
         for (index, record) in records.iter().enumerate() {
             assert_eq!(

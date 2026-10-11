@@ -44,8 +44,11 @@ Three facts shape how the loop can do that:
    checks do not cover those builds.
 5. **Run state.** The "Loop run" section gains a Dependabot list (replaced, with the replacement,
    or reported, with the reason), so a resumed run does not handle the same pull request twice.
-   A replacement the run closes itself because it cannot finish it does not stop the run and
-   adds no `Blocked on:` clause, since there is no backlog item.
+   A replacement closed unmerged stops the run as ADR-230 item 6 says, but adds no `Blocked on:`
+   clause, since there is no backlog item. When the run itself finds it cannot finish a
+   replacement, it marks the replacement "final", closes it and ends the run; the final report
+   asks the maintainer to delete its remote branch, which would otherwise reject the next run's
+   push (ADR-249).
 
 ## Alternatives considered
 

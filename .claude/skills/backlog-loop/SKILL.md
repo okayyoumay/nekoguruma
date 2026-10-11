@@ -79,8 +79,8 @@ Then stop the run and go to "Final report" if any of these holds:
 - the latest CI run on `main` failed (a red `main` is P0 work, outside the loop);
 - an open `codeql-alerts` PR exists (the `codeql` label, or the title prefix `[codeql]` with a
   head branch in this repository; ADR-243): tasks run one at a time, across both loops;
-- this run's current PR, other than a Dependabot replacement the run closed itself (step 4),
-  was closed without being merged. Add `Blocked on: the maintainer's
+- this run's current PR was closed without being merged. Unless it is a Dependabot replacement
+  (step 2), add `Blocked on: the maintainer's
   reason for closing PR #<n>` to its item as a backlog edit (see "Backlog edits"), so no later
   run picks it again, and report the close;
 - this run has opened three backlog-only PRs (step 4), so the remaining items need the
@@ -164,10 +164,12 @@ backlog-only PR.
 
 Work the item as any other task, following CLAUDE.md and `.claude/README.md` (task size, agents,
 documentation sync, ADRs). Close the item with the `backlog` skill in the same PR. A Dependabot
-replacement (step 2) has no item to close; if its work shows the loop cannot finish it, close
-the replacement PR unmerged with a comment giving the reason, put the Dependabot PR on the
-run's Dependabot list, and go to step 1 (the close does not stop the run, and adds no
-`Blocked on:` clause).
+replacement (step 2) has no item to close. If its work shows the loop cannot finish it, put the
+Dependabot PR on the run's Dependabot list with the reason, mark the replacement "final" in its
+run state, close it unmerged with a comment giving the reason, and write the final report. Its
+remote branch survives the close, so the next run's push in step 1 would be rejected (ADR-249):
+the report asks the maintainer to delete that branch. No `Blocked on:` clause is added, since
+there is no backlog item.
 
 If the work shows that the item needs something the loop cannot supply, do not guess. Add a
 `Blocked on:` clause to the item with the `backlog` skill, using the forms in `work/README.md`
@@ -247,4 +249,5 @@ One message to the maintainer:
   maintainer can act on now as a question that can be answered in a word, with a
   recommendation; for the rest (another precondition is still open), give only their count;
 - why the run stopped (no items left, nothing eligible within the cap or five `next-task` calls
-  without a pick, `main` red, another loop PR open or a lost claim race, a PR closed without merging, or three backlog-only PRs).
+  without a pick, `main` red, another loop PR open or a lost claim race, a PR closed without merging, a Dependabot replacement the loop could not finish (with the
+  branch the maintainer should delete), or three backlog-only PRs).

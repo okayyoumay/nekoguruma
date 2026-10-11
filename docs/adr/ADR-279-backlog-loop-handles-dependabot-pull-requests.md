@@ -26,7 +26,8 @@ Three facts shape how the loop can do that:
 1. **Dependabot first.** Before picking a backlog item, each iteration looks at the open
    Dependabot pull requests, security updates first, then oldest first.
 2. **Only a failing one becomes an iteration.** A Dependabot pull request with a failed required
-   check that is green on `main` is the iteration's task. The loop applies the same update on its
+   check that is green on `main` is the iteration's task, whatever else holds for it (other
+   checks still pending, auto-merge turned on). The loop applies the same update on its
    own branch, fixes the failure at its root cause, and opens it as an ordinary loop pull request
    (the `[backlog-loop]` prefix and label, so ADR-230's claim covers it) that names the pull
    request it replaces. It counts against the run's items like a backlog item. The maintainer

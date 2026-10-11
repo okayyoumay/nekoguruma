@@ -92,11 +92,13 @@ Then stop the run and go to "Final report" if any of these holds:
 
 Before picking a backlog item, list the open PRs whose author is `dependabot[bot]`, security
 updates first, then oldest first (ADR-279). Sessions cannot push to Dependabot's branches, and
-Claude never merges, so the loop handles each one by its state:
+Claude never merges, so the loop handles each one by its state. A failed required check (the
+last case below) decides first, even while other checks are pending or auto-merge is on;
+otherwise the first case that matches decides:
 
 - **Checks pending:** leave it; look again at the next iteration.
 - **In the `cargo-minor-patch` group, with auto-merge turned on** (the PR's `auto_merge` field
-  is set): leave it. It merges itself once the required checks pass (ADR-248). Green without
+  is set) and no failed check: leave it. It merges itself once the required checks pass (ADR-248). Green without
   auto-merge (the auto-merge workflow failed, or the repository setting is off) is handled like
   the next case.
 - **Green, any other update** (a Cargo update Cargo treats as breaking, a GitHub Actions update,

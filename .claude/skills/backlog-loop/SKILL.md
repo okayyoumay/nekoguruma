@@ -95,8 +95,10 @@ updates first, then oldest first (ADR-279). Sessions cannot push to Dependabot's
 Claude never merges, so the loop handles each one by its state:
 
 - **Checks pending:** leave it; look again at the next iteration.
-- **Green, in the `cargo-minor-patch` group:** leave it. It merges itself once the required
-  checks pass (ADR-248).
+- **In the `cargo-minor-patch` group, with auto-merge turned on** (the PR's `auto_merge` field
+  is set): leave it. It merges itself once the required checks pass (ADR-248). Green without
+  auto-merge (the auto-merge workflow failed, or the repository setting is off) is handled like
+  the next case.
 - **Green, any other update** (a Cargo update Cargo treats as breaking, a GitHub Actions update,
   a security update): it waits for the maintainer. Do not merge it, and do not stop for it. Put
   it on the run's Dependabot list for the final report. If it changes a dependency built for a

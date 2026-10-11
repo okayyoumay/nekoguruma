@@ -217,8 +217,9 @@ A request line is `uds`, the service ID, and what identifies the request, all in
 a 0x22 read (`uds 22 F190 F187`), the DID of a 0x2E write, the sub-function of 0x10, 0x11 and
 0x3E (`uds 11 01`), sub-function and routine ID of 0x31 (`uds 31 01 FF00`), and the block counter
 of 0x36 (`uds 36 03`); other services (0x34, 0x37) give the service ID alone. Each line is
-appended with one write to a file opened for appending, so processes sharing a file do not mix
-lines; the library never truncates or removes it, and a line it cannot write is dropped.
+appended with exactly one write, never retried, to a file opened for appending, so processes
+sharing a file do not mix lines (a short write leaves a truncated line rather than a mixed one);
+the library never truncates or removes it, and a line it cannot write is dropped.
 
 ## Tests
 

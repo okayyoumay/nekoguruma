@@ -553,9 +553,11 @@ impl Bus {
         }
     }
 
-    /// Appends one line to the request trace, if there is one. Each line is written with a single
-    /// append-mode `write`, so lines from processes writing to the same file do not mix. A line
-    /// that cannot be written is dropped: the trace must not change what the simulator does.
+    /// Appends one line to the request trace, if there is one. Each line is written with exactly
+    /// one append-mode `write` call and never retried, so a second writer cannot slip between
+    /// two parts of a line. A short write leaves a truncated line, which a reader sees as
+    /// malformed rather than as a mixed one. A line that cannot be written is dropped: the trace
+    /// must not change what the simulator does.
     fn trace(&self, line: &str) {
         use std::io::Write;
         let Some(path) = &self.trace_path else {
@@ -568,7 +570,8 @@ impl Bus {
         else {
             return;
         };
-        let _ = file.write_all(format!("{line}\n").as_bytes());
+        // `write`, not `write_all`: a retried remainder would be a second append.
+        let _ = file.write(format!("{line}\n").as_bytes());
     }
 
     fn power_cycles(&self) -> u64 {

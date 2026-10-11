@@ -335,7 +335,8 @@ fn security_directory_size_at(h: &[u8]) -> Result<u32, PeError> {
 }
 
 /// The size field of the security data directory of an image held in one slice (the DOS header
-/// and the NT headers it points to both inside `h`).
+/// and the NT headers it points to both inside `h`). Only the tests read whole images this way.
+#[cfg(test)]
 fn security_directory_size(h: &[u8]) -> Result<u32, PeError> {
     let at = pe_offset(h)? as usize;
     security_directory_size_at(h.get(at..).ok_or(PeError::Truncated)?)

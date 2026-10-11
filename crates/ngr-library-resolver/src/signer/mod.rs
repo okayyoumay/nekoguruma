@@ -296,10 +296,10 @@ mod imp {
                 CertGetCertificateContextProperty, CertGetNameStringW,
             },
             WinTrust::{
-                CRYPT_PROVIDER_DATA, CRYPT_PROVIDER_SGNR, WINTRUST_ACTION_GENERIC_VERIFY_V2,
-                WINTRUST_DATA, WINTRUST_DATA_0, WINTRUST_FILE_INFO, WTD_CACHE_ONLY_URL_RETRIEVAL,
-                WTD_CHOICE_FILE, WTD_REVOKE_NONE, WTD_STATEACTION_CLOSE, WTD_STATEACTION_VERIFY,
-                WTD_UI_NONE, WTHelperGetProvCertFromChain, WinVerifyTrust,
+                CRYPT_PROVIDER_SGNR, WINTRUST_ACTION_GENERIC_VERIFY_V2, WINTRUST_DATA,
+                WINTRUST_DATA_0, WINTRUST_FILE_INFO, WTD_CACHE_ONLY_URL_RETRIEVAL, WTD_CHOICE_FILE,
+                WTD_REVOKE_NONE, WTD_STATEACTION_CLOSE, WTD_STATEACTION_VERIFY, WTD_UI_NONE,
+                WTHelperGetProvCertFromChain, WinVerifyTrust,
             },
         },
         Storage::FileSystem::FILE_SHARE_READ,
@@ -326,9 +326,11 @@ mod imp {
         link(name = "wintrust.dll", kind = "raw-dylib", modifiers = "+verbatim")
     )]
     unsafe extern "system" {
-        fn WTHelperProvDataFromStateData(hstatedata: HANDLE) -> *mut CRYPT_PROVIDER_DATA;
+        // The provider data is only passed back to wintrust, so it stays opaque here (its
+        // windows-sys type needs two more feature sets).
+        fn WTHelperProvDataFromStateData(hstatedata: HANDLE) -> *mut c_void;
         fn WTHelperGetProvSignerFromChain(
-            pprovdata: *mut CRYPT_PROVIDER_DATA,
+            pprovdata: *mut c_void,
             idxsigner: u32,
             fcountersigner: windows_sys::core::BOOL,
             idxcountersigner: u32,

@@ -88,6 +88,7 @@ or `reconnect()` of the simulated ECU leaves it as it is.
 | F189 | the running software version (`SimEcu::running_sw_version`): `EcuConfig::sw_version` at power-up, then the version of the last verified download (below) |
 | F190 | `EcuConfig::vin`; writable as 17 ASCII alphanumeric bytes, behind security access |
 | FD00 | flash state: phase code (1 byte), block number (4 bytes), bytes received of the current download (4 bytes), big endian |
+| FD01 | `SimEcu::power_cycles` (ECU resets, power losses, reconnections) as 4 bytes, big endian, saturating |
 
 FD00 phase codes: 00 idle, 01 erased, 02 transferring (next block), 03 transfer complete,
 04 verified, 05 interrupted (last stored block). The received byte count is zero when no

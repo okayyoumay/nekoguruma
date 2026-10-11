@@ -908,6 +908,7 @@ dependencies = [
  "j2534-0404-mock",
  "j2534-0404-registry",
  "j2534-0404-sys",
+ "libc",
  "portable-atomic",
  "serde_json",
  "serial_test",

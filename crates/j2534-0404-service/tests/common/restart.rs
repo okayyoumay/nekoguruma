@@ -16,11 +16,15 @@
 //!    instruction until the kill arrives.
 //! 3. [`AgentChild::kill`] sends SIGKILL to the child's process group, which holds the agent and
 //!    its worker: nothing is closed or flushed, as when the host loses everything at once.
-//! 4. [`Env::probe`] reads the simulated ECU's session and flash state from a separate process
-//!    (the library keeps the ECU of the first use for the life of its process, so a probe in the
-//!    test process would not see later changes), and [`Env::restart`] resumes the job at library
-//!    level in this process, with the journal directory, the guards' lock directory and the ECU
-//!    state file of the first run.
+//! 4. [`Env::probe`] reads the simulated ECU's session, flash state and power-cycle count from a
+//!    separate process (the library keeps the ECU of the first use for the life of its process,
+//!    so a probe in the test process would not see later changes), and [`Env::restart`] resumes
+//!    the job at library level in this process, with the journal directory, the guards' lock
+//!    directory and the ECU state file of the first run.
+//! 5. Every process but the probe appends the requests it sends to the ECU, and its battery
+//!    voltage reads, to the scenario's request trace (`NGR_SIM_VCI_TRACE`, the trace file of
+//!    `sim-vci`). [`Env::restart`] empties the trace before it starts, so [`Env::trace`] returns
+//!    the restart's own requests afterwards.
 //!
 //! The harness is for the unix test hosts, where a process group can be killed.
 
@@ -154,6 +158,10 @@ impl Env {
         self.root.join("ecu.state")
     }
 
+    fn trace_file(&self) -> PathBuf {
+        self.root.join("requests.trace")
+    }
+
     pub fn journal_dir(&self) -> PathBuf {
         self.root.join("journal")
     }
@@ -171,6 +179,7 @@ impl Env {
             .env("VCI_CONFIG_PATH", self.config())
             .env("NGR_SIM_ECU_CONFIG", self.ecu_config())
             .env("NGR_SIM_ECU_STATE", self.ecu_state())
+            .env("NGR_SIM_VCI_TRACE", self.trace_file())
             .env("NGR_J2534_LONG_SIZE", long_size().to_string())
             .env_remove("VCI_SERVICE_INSECURE_NO_AUTH")
             .env_remove("NGR_SIM_VCI_CONTROL_DIR");
@@ -188,6 +197,7 @@ impl Env {
             std::env::set_var("VCI_CONFIG_PATH", self.config());
             std::env::set_var("NGR_SIM_ECU_CONFIG", self.ecu_config());
             std::env::set_var("NGR_SIM_ECU_STATE", self.ecu_state());
+            std::env::set_var("NGR_SIM_VCI_TRACE", self.trace_file());
             std::env::remove_var("VCI_SERVICE_INSECURE_NO_AUTH");
             std::env::remove_var("NGR_SIM_VCI_CONTROL_DIR");
         }
@@ -199,6 +209,10 @@ impl Env {
             .args([self.entry, "--exact", "--nocapture"])
             .env(ROLE_ENV, role);
         self.apply_to(&mut command);
+        if role == "probe" {
+            // The probe's own reads are not part of any scenario's trace.
+            command.env_remove("NGR_SIM_VCI_TRACE");
+        }
         command
     }
 
@@ -269,16 +283,32 @@ impl Env {
             flash_phase: field("phase") as u8,
             flash_block: field("block"),
             received: field("received"),
+            power_cycles: field("cycles"),
         }
+    }
+
+    /// The requests the scenario's processes sent since the last [`Env::restart`] began, or all
+    /// of them before it: one line each, as `sim-vci` writes them (`uds 22 F190`, `vbatt`; see
+    /// `crates/sim-vci/docs/simulated-vci.md`). Call it when no process of the scenario runs.
+    pub fn trace(&self) -> Vec<String> {
+        std::fs::read_to_string(self.trace_file())
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
     }
 
     /// Resumes the job in this process at library level (`resume_program_journaled`): a new
     /// worker, new guards from the scenario's lock directory, and the journal directory and ECU
     /// state of the first run. Returns the job's result. Must not run while a child of this
-    /// scenario is alive.
+    /// scenario is alive. The request trace is emptied first, so [`Env::trace`] afterwards holds
+    /// the restart's requests only.
     pub fn restart(&self, spec: &JobSpec) -> Result<VmState, JobError> {
-        // SAFETY: the test file's tests are serial and no runtime exists yet; the only other
-        // threads are the test harness's own, which do not touch the environment.
+        std::fs::write(self.trace_file(), "").expect("the trace file should be writable");
+        // SAFETY: every test of the test file that reads or writes the environment is
+        // `#[serial]` (the entry test as well, which reads the role variable), so none runs
+        // beside this call, and no runtime exists yet; the only other threads are the test
+        // harness's own, which do not touch the environment after they started.
         unsafe { self.apply_here() };
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -341,12 +371,15 @@ impl AgentChild {
     /// the kill fails the test instead of passing it unnoticed.
     pub fn kill(mut self) -> ExitStatus {
         // The child leads its own process group (`process_group(0)`), which holds its worker.
-        let group = format!("-{}", self.child.id());
-        let status = Command::new("kill")
-            .args(["-KILL", "--", &group])
-            .status()
-            .expect("kill should run");
-        assert!(status.success(), "kill {group} failed: {status}");
+        let group = i32::try_from(self.child.id()).expect("a process ID fits in pid_t");
+        // SAFETY: kill(2) takes a process group and a signal number and touches no memory.
+        let result = unsafe { libc::kill(-group, libc::SIGKILL) };
+        assert_eq!(
+            result,
+            0,
+            "kill of process group {group} failed: {}",
+            std::io::Error::last_os_error()
+        );
         self.child
             .wait()
             .expect("the killed agent should be reaped")
@@ -366,7 +399,7 @@ pub fn died_of_sigkill(status: ExitStatus) -> bool {
     status.signal() == Some(9)
 }
 
-/// What the simulated ECU reports, from DIDs F186 and FD00.
+/// What the simulated ECU reports, from DIDs F186, FD00 and FD01.
 #[derive(Debug, PartialEq, Eq)]
 pub struct EcuProbe {
     /// The active diagnostic session (1 default, 2 programming).
@@ -378,6 +411,8 @@ pub struct EcuProbe {
     pub flash_block: u32,
     /// DID FD00's bytes received of the current download.
     pub received: u32,
+    /// DID FD01's power-cycle count: ECU resets, power losses and reconnections so far.
+    pub power_cycles: u32,
 }
 
 /// The entry point of the child processes. A test file calls it from its entry test; it returns
@@ -469,17 +504,19 @@ fn probe_main() {
     };
     let session = read_did(0xF186);
     let flash = read_did(0xFD00);
+    let cycles = read_did(0xFD01);
     assert_eq!(
-        (session.len(), flash.len()),
-        (1, 9),
-        "{session:?} {flash:?}"
+        (session.len(), flash.len(), cycles.len()),
+        (1, 9, 4),
+        "{session:?} {flash:?} {cycles:?}"
     );
     let be = |bytes: &[u8]| u32::from_be_bytes(bytes.try_into().expect("four bytes"));
     println!(
-        "{PROBE_PREFIX} session={} phase={} block={} received={}",
+        "{PROBE_PREFIX} session={} phase={} block={} received={} cycles={}",
         session[0],
         flash[0],
         be(&flash[1..5]),
-        be(&flash[5..9])
+        be(&flash[5..9]),
+        be(&cycles)
     );
 }

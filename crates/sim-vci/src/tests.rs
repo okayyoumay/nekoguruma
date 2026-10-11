@@ -1587,3 +1587,43 @@ fn time_since_the_write_counts_against_the_session() {
         .expect("the file exists");
     assert_eq!(loaded.session, Session::Default);
 }
+
+// ---------------------------------------------------------------- Request trace
+
+#[test]
+fn the_trace_lists_each_request_and_voltage_read() {
+    let f = fixture();
+    let path = std::env::temp_dir().join(format!("ngr-sim-vci-trace-{}", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    lock_bus().trace_path = Some(path.clone());
+    for payload in [
+        &[0x22, 0xF1, 0x90, 0xF1, 0x87][..],
+        &[0x10, 0x02],
+        &[0x11, 0x01],
+        &[0x31, 0x01, 0xFF, 0x00],
+        &[0x34, 0x00, 0x44],
+        &[0x36, 0x03, 0xAA],
+        &[0x37],
+    ] {
+        write(f.channel, ECU_PHYSICAL_REQUEST_ID, payload);
+    }
+    assert_eq!(read_vbatt(DEVICE_ID).0, STATUS_NOERROR);
+    lock_bus().trace_path = None;
+    // Not traced once the path is gone.
+    write(f.channel, ECU_PHYSICAL_REQUEST_ID, &[0x22, 0xF1, 0x86]);
+    let text = std::fs::read_to_string(&path).expect("trace file");
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(
+        text.lines().collect::<Vec<_>>(),
+        [
+            "uds 22 F190 F187",
+            "uds 10 02",
+            "uds 11 01",
+            "uds 31 01 FF00",
+            "uds 34",
+            "uds 36 03",
+            "uds 37",
+            "vbatt",
+        ]
+    );
+}

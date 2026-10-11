@@ -13,9 +13,11 @@
 //! and matched, the software version checked, the preconditions checked again (8.9), the steps
 //! before the erase replayed, the preconditions checked once more, and then the erase,
 //! RequestDownload, blocks, RequestTransferExit and the post-transfer steps follow as on a first
-//! run (the agent's own tests with a recording host check that order request by request; here
-//! the ECU enforces it, since it refuses the erase while a download runs, refuses a download
-//! without an erase and a RequestTransferExit with blocks missing).
+//! run. The tests observe that order request by request in `sim-vci`'s request trace
+//! ([`EXPECTED_RESTART`]), and the ECU enforces the transfer part of it, since it refuses the
+//! erase while a download runs, refuses a download without an erase and a RequestTransferExit
+//! with blocks missing. Its power-cycle count (DID FD01) shows that the restart reset the ECU
+//! exactly once.
 //!
 //! Two scenarios, with the ECU's session timer (tS3_Server) as the difference: the restart comes
 //! while the ECU is still in its programming session with the transfer running, and after the
@@ -25,8 +27,8 @@
 //! intervention, since the conditions that lead there (an identity or software version that is
 //! not the job's, a precondition that fails) do not hold.
 //!
-//! The tests are serial: the restart sets process-wide environment variables for the worker it
-//! launches.
+//! The tests are serial, the entry test included: the restart sets process-wide environment
+//! variables for the worker it launches, and the entry test reads one.
 
 #[path = "common/restart.rs"]
 mod restart;
@@ -44,6 +46,41 @@ use serial_test::serial;
 
 /// The libtest name of [`restart_child_entry`], which the harness runs in its child processes.
 const ENTRY: &str = "restart_child_entry";
+
+/// The requests of the restart, in order (design 8.2.5, ADR-229 item 2), as `sim-vci` traces
+/// them: the supply voltage read before anything is sent to the ECU, the gates (VIN, hardware
+/// part number, voltage), the ECUReset (hardReset), the default-session confirmation (F186,
+/// repeated until the ECU answers; consecutive repeats are collapsed before the comparison),
+/// the identity again (VIN, hardware part number), the software version, the preconditions of
+/// step 4a (voltage), the programming session of the replay, the preconditions before the
+/// erase (voltage), the erase, RequestDownload, blocks 1 to 8, RequestTransferExit and the
+/// integrity check.
+const EXPECTED_RESTART: &[&str] = &[
+    "vbatt",
+    "uds 22 F190",
+    "uds 22 F187",
+    "vbatt",
+    "uds 11 01",
+    "uds 22 F186",
+    "uds 22 F190",
+    "uds 22 F187",
+    "uds 22 F189",
+    "vbatt",
+    "uds 10 02",
+    "vbatt",
+    "uds 31 01 FF00",
+    "uds 34",
+    "uds 36 01",
+    "uds 36 02",
+    "uds 36 03",
+    "uds 36 04",
+    "uds 36 05",
+    "uds 36 06",
+    "uds 36 07",
+    "uds 36 08",
+    "uds 37",
+    "uds 31 01 FF01",
+];
 
 /// The simulated ECU's erase-memory routine (`sim_ecu::RID_ERASE_MEMORY`) and its integrity
 /// check (`sim_ecu::RID_CHECK_PROGRAMMING_DEPENDENCIES`).
@@ -219,6 +256,7 @@ fn ecu_config(s3_server_ms: u32) -> String {
 /// The entry of the harness's child processes: the agent that is killed, and the ECU probe. A
 /// test run without the harness's environment does nothing.
 #[test]
+#[serial]
 fn restart_child_entry() {
     restart::child_main(spec);
 }
@@ -244,6 +282,25 @@ fn kill_mid_transfer(env: &Env, spec: &JobSpec) -> StepRef {
     transfer.started_at
 }
 
+/// Checks the restart's requests against [`EXPECTED_RESTART`]. TesterPresent requests are left
+/// out and consecutive F186 reads collapsed, since the confirmation reads until the ECU answers;
+/// every other request must be there, once, in order. The ECUReset is checked on its own too.
+fn assert_restart_order(trace: &[String]) {
+    let mut seen: Vec<&str> = Vec::new();
+    for line in trace.iter().map(String::as_str) {
+        if line.starts_with("uds 3E") || (line == "uds 22 F186" && seen.last() == Some(&line)) {
+            continue;
+        }
+        seen.push(line);
+    }
+    assert_eq!(
+        trace.iter().filter(|line| *line == "uds 11 01").count(),
+        1,
+        "exactly one ECUReset: {trace:#?}"
+    );
+    assert_eq!(seen, EXPECTED_RESTART, "the restart's requests: {trace:#?}");
+}
+
 /// What a completed job leaves: the journal records one resume of the stage and a new
 /// transfer attempt from the erase that took all blocks and the post-transfer steps, and the ECU
 /// verified the full image.
@@ -251,6 +308,8 @@ fn assert_completed(
     env: &Env,
     spec: &JobSpec,
     first_attempt: StepRef,
+    power_cycles_before: u32,
+    final_sessions: &[u8],
     result: Result<diag_ir::VmState, agent::JobError>,
 ) {
     let state = result.expect("the restarted job should complete");
@@ -275,16 +334,30 @@ fn assert_completed(
     assert!(!transfer.interrupted);
     assert!(transfer.exit.expect("an exit marker").complete);
 
+    assert_restart_order(&env.trace());
+
     // The ECU holds the whole image, verified by its integrity check, which it passes only
-    // after a RequestTransferExit with every block in order on a freshly erased flash.
+    // after a RequestTransferExit with every block in order on a freshly erased flash. The
+    // restart reset it once. The session is checked apart: the worker's stop can take longer
+    // than a short session timer.
+    let probe = env.probe();
+    assert!(
+        final_sessions.contains(&probe.session),
+        "session {} is not one of {final_sessions:?}",
+        probe.session
+    );
     assert_eq!(
-        env.probe(),
         EcuProbe {
-            session: 2,
+            session: 0,
+            ..probe
+        },
+        EcuProbe {
+            session: 0,
             flash_phase: 4,
             // A verified download is closed: no block is pending and none is counted.
             flash_block: 0,
             received: 0,
+            power_cycles: power_cycles_before + 1,
         }
     );
 }
@@ -298,17 +371,28 @@ fn an_agent_killed_mid_transfer_redoes_it_within_the_session_timer() {
     // A timer far longer than the restart takes, so the ECU is still in its session.
     let env = Env::new("within-s3", ENTRY, &ecu_config(60_000));
     let first_attempt = kill_mid_transfer(&env, &spec);
+    let before = env.probe();
     assert_eq!(
-        env.probe(),
+        before,
         EcuProbe {
             session: 2,
             flash_phase: 2,
             flash_block: KILL_AFTER_BLOCK + 1,
             received: KILL_AFTER_BLOCK * BLOCK_LEN as u32,
+            power_cycles: before.power_cycles,
         },
         "the ECU should still be in its programming session, transferring"
     );
-    assert_completed(&env, &spec, first_attempt, env.restart(&spec));
+    let result = env.restart(&spec);
+    // The 60 s timer outlasts the restart: the ECU ends in its programming session.
+    assert_completed(
+        &env,
+        &spec,
+        first_attempt,
+        before.power_cycles,
+        &[2],
+        result,
+    );
 }
 
 /// The agent is restarted after tS3_Server ran out: the ECU fell back to its default session and
@@ -331,15 +415,26 @@ fn an_agent_killed_mid_transfer_redoes_it_after_the_session_timer_expired() {
         Duration::from_millis(u64::from(S3_MS) + 500).saturating_sub(killed_at.elapsed());
     std::thread::sleep(remaining);
     // The ECU is in its default session, which has no timer, so the probe changes nothing.
+    let before = env.probe();
     assert_eq!(
-        env.probe(),
+        before,
         EcuProbe {
             session: 1,
             flash_phase: 5,
             flash_block: KILL_AFTER_BLOCK,
             received: KILL_AFTER_BLOCK * BLOCK_LEN as u32,
+            power_cycles: before.power_cycles,
         },
         "the ECU should be in its default session with the transfer interrupted"
     );
-    assert_completed(&env, &spec, first_attempt, env.restart(&spec));
+    let result = env.restart(&spec);
+    // The 3 s timer can run out again while the worker stops, so either session is possible.
+    assert_completed(
+        &env,
+        &spec,
+        first_attempt,
+        before.power_cycles,
+        &[1, 2],
+        result,
+    );
 }

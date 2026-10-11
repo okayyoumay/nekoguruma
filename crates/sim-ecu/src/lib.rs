@@ -37,6 +37,9 @@ pub const DID_VIN: u16 = 0xF190;
 /// start with a state check (8.2.5). Record: phase code (1 byte), block number (4 bytes) and
 /// bytes received of the current download (4 bytes), big endian.
 pub const DID_FLASH_STATE: u16 = 0xFD00;
+/// Simulator-specific DID (system supplier range) reporting [`SimEcu::power_cycles`] as a
+/// 4-byte big-endian count (saturating), so that a test can tell a reset from a passive teardown.
+pub const DID_POWER_CYCLES: u16 = 0xFD01;
 
 /// eraseMemory routine (Annex F).
 pub const RID_ERASE_MEMORY: u16 = 0xFF00;

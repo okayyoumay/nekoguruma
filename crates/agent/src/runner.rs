@@ -274,9 +274,10 @@ pub async fn run_program_journaled(
 ///   sent. Then the same VM goes on from the erase as a first run does (step 4c, ADR-276): its
 ///   arrival commits a new transfer-start marker, which starts a new attempt in the journal,
 ///   and the erase, the transfer, the post-transfer steps and the rest of the program follow,
-///   so the job ends as that first run would; an erase the ECU does not accept (for example
-///   from the default session, when the plan's steps before the erase enter no programming
-///   session) ends it as a first-run step failure. A VIN that is another vehicle's ends the job
+///   so the job ends as that first run would. The agent tracks no session: an erase the ECU
+///   refuses in its default session (when the plan's steps before the erase enter no
+///   programming session) is an answer the procedure handles as on a first run, and nothing is
+///   erased. A VIN that is another vehicle's ends the job
 ///   in [`JobError::IdentityMismatch`] before any of this. When the state
 ///   check decides the read-back verification instead, the match is the verification
 ///   (ADR-271): the program goes on from the VM state journaled at the plan's end and runs to
@@ -1487,6 +1488,10 @@ mod tests {
         cancel_on_read: Option<([u8; 2], Arc<AtomicBool>)>,
         /// A routine whose response is lost.
         lose_routine: Option<u16>,
+        /// The ECU stays in its default session and refuses the erase (routine 0xFF00) and
+        /// RequestDownload there with a negative response, as an ECU that accepts them only in
+        /// its programming session would.
+        default_session_only: bool,
         /// The supply voltage the VCI reports; `None` reports none.
         voltage: Option<i64>,
         voltage_reads: u32,
@@ -1571,6 +1576,7 @@ mod tests {
                 software_version: Some(b"SW01".to_vec()),
                 cancel_on_read: None,
                 lose_routine: None,
+                default_session_only: false,
                 voltage: None,
                 voltage_reads: 0,
                 voltage_script: std::collections::VecDeque::new(),
@@ -1750,6 +1756,7 @@ mod tests {
                         }),
                     }
                 }
+                (0x34, _) if self.default_session_only => Ok(vec![0x7F, 0x34, 0x7F]),
                 (0x34, _) => {
                     self.transfer = Some(0);
                     Ok(vec![0x74])
@@ -1768,6 +1775,9 @@ mod tests {
             self.log.push((Sent::Routine(routine), self.commits.get()));
             if self.lose_routine == Some(routine) {
                 return Err(HostError::NoResponse);
+            }
+            if self.default_session_only && routine == 0xFF00 {
+                return Ok(vec![0x7F, 0x31, 0x7F]);
             }
             Ok(vec![0x71])
         }
@@ -6328,14 +6338,17 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// An erase the ECU does not accept ends the redone transfer as a first-run step failure, with
-    /// nothing after the erase sent. Its transfer-start marker was committed before it, so the
-    /// next restart takes the restart order for this new attempt.
+    /// An erase whose answer is lost ends the redone transfer as a first-run step failure at the
+    /// erase, with nothing after it sent. Its transfer-start marker was committed before it, so the
+    /// next restart takes the restart order for this new attempt (an ECUReset is allowed again),
+    /// and the restart after that ends at the plan's resume limit: the new marker does not reset
+    /// the count.
     #[test]
-    fn an_erase_that_fails_ends_the_redo_as_a_first_run_step_failure() {
-        let program = flash_program();
+    fn a_lost_erase_answer_ends_the_redo_and_the_next_restart_takes_the_order() {
+        let mut program = flash_program();
+        program.flash[0].max_resumes = 2;
         let erase = program.flash[0].boundaries.erase_pc;
-        let dir = journal_dir("redo-erase-fails");
+        let dir = journal_dir("redo-erase-lost");
         interrupted(&program, &dir);
         let mut host = FlashHost::new(Rc::new(Cell::new(0)));
         host.lose_routine = Some(0xFF00);
@@ -6359,6 +6372,72 @@ mod tests {
         let transfer = journal.facts.transfer.as_ref().unwrap();
         assert_eq!(transfer.started_at.pc, erase);
         assert!(transfer.exit.is_none());
+
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        let result = resume(&program, &dir, &mut host, false);
+        assert_eq!(teardown_of(&result), restart::Teardown::Reset);
+        assert_eq!(state_of(&result), restart::StateCheck::RedoTransfer);
+
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        let result = resume(&program, &dir, &mut host, false);
+        assert!(
+            matches!(
+                result,
+                Err(JobError::OnSiteInterventionRequired(
+                    OnSiteReason::ResumeLimitReached {
+                        resumes: 2,
+                        max: 2,
+                        ..
+                    }
+                ))
+            ),
+            "{result:?}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A plan whose steps before the erase enter no programming session sends the erase in the
+    /// default session the restart confirmed. An ECU that refuses it there answers negatively,
+    /// which the program receives as an answer: the fixture's program goes on to RequestDownload,
+    /// which is refused as well, and the job ends at the first block with no transfer open. Nothing
+    /// was erased or written.
+    #[test]
+    fn an_erase_refused_in_the_default_session_writes_nothing() {
+        let program = flash_program();
+        let dir = journal_dir("redo-erase-refused");
+        interrupted(&program, &dir);
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        host.default_session_only = true;
+        let result = resume_on(
+            &program,
+            &mut host,
+            JobLimits::default(),
+            &AtomicBool::new(false),
+            Journal::open(&dir, &job_key()),
+            identity_sources(),
+            Some(&target()),
+            None,
+            &dir_slot(&dir),
+        );
+        assert!(
+            matches!(
+                result,
+                Err(JobError::Host {
+                    source: HostError::NoTransferActive,
+                    ..
+                })
+            ),
+            "{result:?}"
+        );
+        assert_eq!(
+            from_the_erase(&host),
+            [
+                Sent::Routine(0xFF00),
+                Sent::Service(0x34, vec![0x01]),
+                Sent::Block
+            ]
+        );
+        assert!(host.transfer.is_none());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

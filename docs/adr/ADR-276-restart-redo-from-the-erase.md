@@ -38,9 +38,13 @@ Two questions are left open by the earlier decisions:
 3. **No session check before the erase.** The runner does not track or check the ECU's
    diagnostic session. A plan whose `[entry_pc, erase_pc)` re-establishes no programming session
    sends the erase in the confirmed default session. If the ECU accepts it there, the restart
-   proceeds; if it does not, the erase's failure ends the job as a first-run step failure, with
-   nothing erased. The transfer-start marker was committed before the erase, so a further
-   restart, within the plan's resume limit, takes the restart order for that new attempt.
+   proceeds. If it refuses it with a negative response, that response is an answer like any
+   other: the job goes on as the procedure handles it, exactly as a first run would, and a
+   procedure that ignores it reaches RequestDownload, which such an ECU refuses as well, and
+   ends at the first block with no transfer open. Either way nothing is erased or written. A
+   lost answer to the erase ends the job at the erase as a host failure. The transfer-start
+   marker was committed before the erase, so a further restart, within the plan's resume
+   limit, takes the restart order for that new attempt.
    Validation does not refuse such plans: whether an ECU accepts the erase outside a programming
    session is the ECU's behaviour, which the program cannot declare.
 4. **The restart's ending before the erase goes.** `OnSiteReason::RestartOrderUnavailable` is no
@@ -63,5 +67,12 @@ Two questions are left open by the earlier decisions:
 - A restart that redoes the transfer now erases and writes the ECU. Everything before the erase
   is unchanged: the resume count, the gates, the teardown, the default-session confirmation, the
   identity and state checks, step 4a, the replay and step 4b-3.
-- A crash during the redo is bounded by the plan's resume limit, as any restart is.
+- A crash during the redo is bounded by the plan's resume limit, as any restart is; the new
+  transfer-start marker does not reset the resume count. An ECU that accepts the erase in its
+  default session but refuses RequestDownload there ends each redo erased, and each further
+  restart repeats that until the limit.
+- The step limit (`JobLimits::max_steps`) counts across runs, since a restart's step count
+  continues after the journal's last record (ADR-253 item 3). Before this decision a restart
+  that reached the limit stopped before the erase; now a redo can reach it after the erase,
+  leaving the ECU erased, and each further restart starts nearer the limit.
 - The restart end-to-end scenarios against `sim-ecu` can now complete a redone transfer.

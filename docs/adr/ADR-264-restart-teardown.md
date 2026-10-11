@@ -1,7 +1,7 @@
 # ADR-264: The Restart's Teardown Sends One Hard Reset or Waits Out the Session
 
 **Date:** 2026-10-09
-**Status:** Accepted (item 5's ending amended by ADR-265)
+**Status:** Accepted (item 5's ending amended by ADR-265; item 5's `RestartOrderUnavailable` carrying the outcome superseded by ADR-276, which goes on with the erase)
 **Affects:** `agent` (`src/restart.rs`, `src/runner.rs`, `docs/ngr-agent.md`), `sim-ecu` (`Fault`, `docs/simulated-ecu.md`), ADR-229 item 2, ADR-255 item 5, ADR-261 item 2
 
 ## Context

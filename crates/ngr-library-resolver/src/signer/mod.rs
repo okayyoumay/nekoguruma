@@ -289,18 +289,17 @@ mod imp {
     };
 
     use windows_sys::Win32::{
-        Foundation::INVALID_HANDLE_VALUE,
+        Foundation::{HANDLE, INVALID_HANDLE_VALUE},
         Security::{
             Cryptography::{
                 CERT_NAME_SIMPLE_DISPLAY_TYPE, CERT_SHA256_HASH_PROP_ID,
                 CertGetCertificateContextProperty, CertGetNameStringW,
             },
             WinTrust::{
-                WINTRUST_ACTION_GENERIC_VERIFY_V2, WINTRUST_DATA, WINTRUST_DATA_0,
-                WINTRUST_FILE_INFO, WTD_CACHE_ONLY_URL_RETRIEVAL, WTD_CHOICE_FILE, WTD_REVOKE_NONE,
-                WTD_STATEACTION_CLOSE, WTD_STATEACTION_VERIFY, WTD_UI_NONE,
-                WTHelperGetProvCertFromChain, WTHelperGetProvSignerFromChain,
-                WTHelperProvDataFromStateData, WinVerifyTrust,
+                CRYPT_PROVIDER_DATA, CRYPT_PROVIDER_SGNR, WINTRUST_ACTION_GENERIC_VERIFY_V2,
+                WINTRUST_DATA, WINTRUST_DATA_0, WINTRUST_FILE_INFO, WTD_CACHE_ONLY_URL_RETRIEVAL,
+                WTD_CHOICE_FILE, WTD_REVOKE_NONE, WTD_STATEACTION_CLOSE, WTD_STATEACTION_VERIFY,
+                WTD_UI_NONE, WTHelperGetProvCertFromChain, WinVerifyTrust,
             },
         },
         Storage::FileSystem::FILE_SHARE_READ,
@@ -310,6 +309,31 @@ mod imp {
         HEADER_WINDOW, Signer, SignerError, TRUST_E_NO_SIGNER_CERT, classify,
         security_directory_size,
     };
+
+    // windows-sys does not bind these two wintrust.dll helpers, so they are declared here the
+    // way it declares the others (raw-dylib, no import library needed).
+    #[cfg_attr(
+        target_arch = "x86",
+        link(
+            name = "wintrust.dll",
+            kind = "raw-dylib",
+            modifiers = "+verbatim",
+            import_name_type = "undecorated"
+        )
+    )]
+    #[cfg_attr(
+        not(target_arch = "x86"),
+        link(name = "wintrust.dll", kind = "raw-dylib", modifiers = "+verbatim")
+    )]
+    unsafe extern "system" {
+        fn WTHelperProvDataFromStateData(hstatedata: HANDLE) -> *mut CRYPT_PROVIDER_DATA;
+        fn WTHelperGetProvSignerFromChain(
+            pprovdata: *mut CRYPT_PROVIDER_DATA,
+            idxsigner: u32,
+            fcountersigner: windows_sys::core::BOOL,
+            idxcountersigner: u32,
+        ) -> *mut CRYPT_PROVIDER_SGNR;
+    }
 
     const S_OK: i32 = 0;
     /// Reported when the provider says yes but hands back no signer certificate.

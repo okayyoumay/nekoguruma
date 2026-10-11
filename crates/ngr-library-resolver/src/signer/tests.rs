@@ -454,8 +454,8 @@ try {
         assert!(e.held.is_some());
     }
 
-    /// `LoadLibraryExW` and `FreeLibrary`, which windows-sys only offers behind a feature this
-    /// crate does not enable; declared the way the wintrust helpers are.
+    // `LoadLibraryExW` and `FreeLibrary`, which windows-sys only offers behind a feature this
+    // crate does not enable; declared the way the wintrust helpers are.
     #[cfg_attr(
         target_arch = "x86",
         link(

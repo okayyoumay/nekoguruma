@@ -100,8 +100,9 @@ Claude never merges, so the loop handles each one by its state:
 - **Green, any other update** (a Cargo update Cargo treats as breaking, a GitHub Actions update,
   a security update): it waits for the maintainer. Do not merge it, and do not stop for it. Put
   it on the run's Dependabot list for the final report. If it changes a dependency built for a
-  Windows target (`cargo tree -i <crate> --target x86_64-pc-windows-gnullvm` finds it), say in
-  the report that the Windows release build and its DLL import check in `ci.yml` run only on
+  Windows target (`cargo tree -i <crate> --target <target>` finds it for either target the
+  `worker-windows` job builds, `x86_64-pc-windows-gnullvm` and `i686-pc-windows-gnullvm`), say
+  in the report that the Windows release build and its DLL import check in `ci.yml` run only on
   `main`, so the PR's green checks do not cover them.
 - **Merge conflict:** comment `@dependabot rebase` once, unless the PR already has such a
   comment that Dependabot has not answered. Dependabot rebases its own branch; this is not an
@@ -112,7 +113,7 @@ Claude never merges, so the loop handles each one by its state:
   Dependabot's title and a "Replaces #<n>" line in the description. In step 4, apply the same
   update on the loop branch (the same versions in `Cargo.toml`, `Cargo.lock` or the workflow
   files), reproduce the failure with the repository's own checks, and fix it at its root cause.
-  If the update changes a dependency built for a Windows target, also check the new version's
+  If the update changes a dependency built for either of those Windows targets, also check the new version's
   DLL imports against the allowlist in `ci.yml`, since that check runs only on `main`.
   The replacement PR has no claimed item, so its shadow risk verdict is HIGH. The maintainer
   merges it like any other loop PR, also when the update came from the `cargo-minor-patch`

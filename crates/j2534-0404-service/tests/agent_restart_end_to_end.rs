@@ -1,10 +1,13 @@
 // Relies on the debug-only runtime VCI_CONFIG_PATH override; see ADR-073. Killing the agent's
 // process group is unix-only.
 #![cfg(all(debug_assertions, unix))]
-//! Restart end to end, an agent killed mid-transfer (design 5.3, 5.6, 8.2.5; ADR-229, ADR-276):
-//! the agent runs a flash job against a real `j2534-0404-service` worker and `sim-vci` as a
-//! child process, is killed with SIGKILL after a block of the transfer was journaled, and the
-//! job is resumed at library level (`resume_program_journaled`) with the same journal directory.
+//! Restart end to end, an agent killed or its worker crashed mid-transfer (design 5.3, 5.6,
+//! 8.2.5; ADR-229, ADR-276): the agent runs a flash job against a real `j2534-0404-service`
+//! worker and `sim-vci` as a child process, is killed with SIGKILL after a block of the transfer
+//! was journaled, and the job is resumed at library level (`resume_program_journaled`) with the
+//! same journal directory. In the worker-crash scenario the agent runs in the test process and
+//! only its worker is killed; the agent's next run resumes on a new worker with the guards the
+//! failed run gave back.
 //!
 //! The harness (`tests/common/restart.rs`) keeps the simulated ECU's state in a state file
 //! (ADR-241), so the ECU outlives the killed agent and its timers go on running. The restarted
@@ -19,7 +22,7 @@
 //! with blocks missing. Its power-cycle count (DID FD01) shows that the restart reset the ECU
 //! exactly once.
 //!
-//! Two scenarios, with the ECU's session timer (tS3_Server) as the difference: the restart comes
+//! The agent-kill scenarios differ in the ECU's session timer (tS3_Server): the restart comes
 //! while the ECU is still in its programming session with the transfer running, and after the
 //! timer ran out, so the ECU fell back to its default session with the transfer interrupted.
 //! Both end with the job complete: the restart sends an ECUReset first in either state, so the
@@ -434,6 +437,54 @@ fn an_agent_killed_mid_transfer_redoes_it_after_the_session_timer_expired() {
         &env,
         &spec,
         first_attempt,
+        before.power_cycles,
+        &[1, 2],
+        result,
+    );
+}
+
+/// The worker alone crashes while the ECU is in its programming session with the transfer
+/// running: the agent survives, its run ends with the worker's loss, and its next run on a new
+/// worker, on the guards it kept, takes the same restart order as after an agent kill and
+/// completes.
+#[test]
+#[serial]
+fn a_worker_crashed_mid_transfer_is_restarted_like_a_killed_agent() {
+    let spec = spec();
+    let env = Env::new("worker-crash", ENTRY, &ecu_config(60_000));
+    let crash = env.crash_worker(&spec, KILL_AFTER_BLOCK, WAIT_FOR_BLOCK);
+    // The run ends with the worker's loss as a failed primitive: neither a result nor an
+    // on-site intervention, which would end the job instead of leaving it to the restart.
+    assert!(
+        matches!(crash.result, Err(agent::JobError::Host { .. })),
+        "the first run should end on the lost worker: {:?}",
+        crash.result
+    );
+    assert!(
+        crash.link_unconfirmed,
+        "a link on a dead worker cannot be confirmed closed"
+    );
+    let transfer = crash.journal.facts.transfer.expect("a transfer attempt");
+    assert_eq!(transfer.started_at.pc, ERASE_PC);
+    assert_eq!(transfer.last_block, Some(KILL_AFTER_BLOCK));
+    assert!(transfer.exit.is_none(), "no RequestTransferExit yet");
+    let before = env.probe();
+    assert_eq!(
+        before,
+        EcuProbe {
+            session: 2,
+            flash_phase: 2,
+            flash_block: KILL_AFTER_BLOCK + 1,
+            received: KILL_AFTER_BLOCK * BLOCK_LEN as u32,
+            power_cycles: before.power_cycles,
+        },
+        "the ECU should still be in its programming session, transferring"
+    );
+    let result = env.restart_on(&spec, crash.guards);
+    assert_completed(
+        &env,
+        &spec,
+        transfer.started_at,
         before.power_cycles,
         &[1, 2],
         result,

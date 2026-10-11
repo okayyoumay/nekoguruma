@@ -214,6 +214,11 @@ impl WorkerProcess {
         &self.endpoints
     }
 
+    /// The worker's process ID, or `None` once the process has been reaped.
+    pub fn id(&self) -> Option<u32> {
+        self.child.id()
+    }
+
     /// Per-instance key for minting bearer tokens for the gRPC listener.
     pub fn auth_key(&self) -> &[u8; 32] {
         &self.auth_key

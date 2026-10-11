@@ -40,7 +40,7 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use agent::guards::{GuardSetup, JobGuards};
+use agent::guards::{GuardError, GuardSetup, JobGuards};
 use agent::inputs::ServiceSources;
 use agent::journal::{JobKey, Journal, JournalState, Vin};
 use agent::{
@@ -416,10 +416,16 @@ impl Env {
                 "kill of worker {pid} failed: {}",
                 std::io::Error::last_os_error()
             );
-            let (result, mut guards) = tokio::time::timeout(RESTART_TIMEOUT, run)
-                .await
-                .expect("the first run should end once its worker is gone")
-                .expect("the first run should not panic");
+            let mut run = run;
+            let (result, mut guards) = match tokio::time::timeout(RESTART_TIMEOUT, &mut run).await {
+                Ok(joined) => joined.expect("the first run should not panic"),
+                Err(_) => {
+                    // Dropping the run cancels the job, so the runtime's drop does not wait for
+                    // it for ever.
+                    run.abort();
+                    panic!("the first run should end once its worker is gone");
+                }
+            };
             // The link could not be closed on a dead worker, so the run marked its guards
             // unconfirmed (ADR-258). Once the worker process is reaped it holds no link, and the
             // agent clears the mark before its next run takes the guards.
@@ -437,6 +443,27 @@ impl Env {
             }
         })
     }
+
+    /// Whether the scenario's guards are held by someone else: a `JobGuards::take` on its lock
+    /// directory is still waiting when it is cancelled a while later. The cancel is set late,
+    /// since the take checks it before its first attempt.
+    pub fn guards_are_held(&self) -> bool {
+        let cancelled = std::sync::Arc::new(AtomicBool::new(false));
+        let canceller = {
+            let cancelled = cancelled.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(200));
+                cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+            })
+        };
+        let taken = JobGuards::take(&self.guard_setup(), Duration::from_millis(10), &cancelled);
+        canceller.join().expect("the canceller should not panic");
+        match taken {
+            Err(GuardError::Cancelled) => true,
+            Ok(_) => false,
+            Err(other) => panic!("taking the guards failed: {other}"),
+        }
+    }
 }
 
 /// How a first run whose worker was killed ended ([`Env::crash_worker`]).
@@ -448,7 +475,7 @@ pub struct WorkerCrash {
     pub guards: JobGuards,
     /// Whether the run had marked the guards' link unconfirmed (ADR-258) before that.
     pub link_unconfirmed: bool,
-    /// The journal as it read when the kill was sent.
+    /// The journal as it read just before the kill was sent.
     pub journal: JournalState,
 }
 

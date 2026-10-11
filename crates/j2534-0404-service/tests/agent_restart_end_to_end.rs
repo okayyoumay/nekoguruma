@@ -97,9 +97,11 @@ const SW_VERSION: &[u8] = b"1.0.0";
 
 const BLOCKS: u32 = 8;
 const BLOCK_LEN: usize = 16;
-/// The agent is killed after this block of the first run.
+/// The agent, or in the worker-crash scenario its worker, is killed after this block of the
+/// first run.
 const KILL_AFTER_BLOCK: u32 = 4;
-/// How long the program waits after that block. The harness kills the agent in this time, and
+/// How long the program waits after that block. The harness kills the agent or the worker in
+/// this time, and
 /// the redone transfer waits it out again, so it must stay far below the ECU's tS3_Server.
 const PARK_MS: u32 = 1_000;
 /// The plan's stage.
@@ -453,21 +455,53 @@ fn a_worker_crashed_mid_transfer_is_restarted_like_a_killed_agent() {
     let spec = spec();
     let env = Env::new("worker-crash", ENTRY, &ecu_config(60_000));
     let crash = env.crash_worker(&spec, KILL_AFTER_BLOCK, WAIT_FOR_BLOCK);
-    // The run ends with the worker's loss as a failed primitive: neither a result nor an
-    // on-site intervention, which would end the job instead of leaving it to the restart.
+    // The `Wait` sends nothing, so the first request to the dead worker is the next block's
+    // transfer: the run ends there with the worker's loss as a failed primitive, neither a
+    // result nor an on-site intervention, which would end the job instead of leaving it to the
+    // restart. A kill that came after the wait would fail here, not later.
+    let next_block_pc = spec
+        .program
+        .code
+        .iter()
+        .position(|op| {
+            *op == Op::FlashTransfer {
+                block: KILL_AFTER_BLOCK + 1,
+            }
+        })
+        .expect("the next block's transfer") as u32;
     assert!(
-        matches!(crash.result, Err(agent::JobError::Host { .. })),
-        "the first run should end on the lost worker: {:?}",
+        matches!(crash.result, Err(agent::JobError::Host { pc, .. }) if pc == next_block_pc),
+        "the first run should end on the lost worker at {next_block_pc}: {:?}",
         crash.result
+    );
+    // The surviving job keeps its guards across the runs (design 8.2.5): nobody else can take
+    // them while it holds them.
+    assert!(
+        env.guards_are_held(),
+        "the failed run should keep its guards"
     );
     assert!(
         crash.link_unconfirmed,
         "a link on a dead worker cannot be confirmed closed"
     );
-    let transfer = crash.journal.facts.transfer.expect("a transfer attempt");
-    assert_eq!(transfer.started_at.pc, ERASE_PC);
-    assert_eq!(transfer.last_block, Some(KILL_AFTER_BLOCK));
-    assert!(transfer.exit.is_none(), "no RequestTransferExit yet");
+    // The journal the restart reads, after the failed run ended, agrees with the one at the
+    // kill: block 4 the last, no RequestTransferExit, no resume yet.
+    for journal in [
+        crash.journal,
+        agent::journal::Journal::read(&env.journal_dir(), &spec.key).expect("journal"),
+    ] {
+        let transfer = journal.facts.transfer.expect("a transfer attempt");
+        assert_eq!(transfer.started_at.pc, ERASE_PC);
+        assert_eq!(transfer.last_block, Some(KILL_AFTER_BLOCK));
+        assert!(transfer.exit.is_none(), "no RequestTransferExit yet");
+        assert!(journal.facts.resume_counts.is_empty());
+    }
+    let first_attempt = agent::journal::Journal::read(&env.journal_dir(), &spec.key)
+        .expect("journal")
+        .facts
+        .transfer
+        .expect("a transfer attempt")
+        .started_at;
     let before = env.probe();
     assert_eq!(
         before,
@@ -481,10 +515,15 @@ fn a_worker_crashed_mid_transfer_is_restarted_like_a_killed_agent() {
         "the ECU should still be in its programming session, transferring"
     );
     let result = env.restart_on(&spec, crash.guards);
+    // The restart released them when it ended, which also shows the check above can fail.
+    assert!(
+        !env.guards_are_held(),
+        "the ended job should release its guards"
+    );
     assert_completed(
         &env,
         &spec,
-        transfer.started_at,
+        first_attempt,
         before.power_cycles,
         &[1, 2],
         result,

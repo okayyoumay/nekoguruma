@@ -292,8 +292,8 @@ hex. Both Windows variants hold the open file, see below.
 directory (entry 4) is not zero. PE32 and PE32+ are read; a directory the header does not declare
 (fewer than five entries, or an optional header too short) counts as empty. The DOS header is read
 first, then the file is positioned at its `e_lfanew` and the NT headers are read there, so headers
-beyond any fixed prefix are found; an `e_lfanew` above 16 MiB or past the end of the file is treated
-as no PE image. A file that is not a PE image, or whose headers are cut off, is `Unsigned` (it has nothing to verify and fails later as a
+beyond any fixed prefix are found, at any 32-bit offset as the loader accepts it; an `e_lfanew` past
+the end of the file is treated as no PE image. A file that is not a PE image, or whose headers are cut off, is `Unsigned` (it has nothing to verify and fails later as a
 library). Catalog signatures are not looked at, so a catalog-signed system file such as
 `kernel32.dll` is `Unsigned`.
 

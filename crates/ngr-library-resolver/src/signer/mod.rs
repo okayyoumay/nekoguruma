@@ -260,8 +260,6 @@ pub fn check_library(
 enum PeError {
     /// No `MZ` or no `PE\0\0` signature.
     NotPe,
-    /// `e_lfanew` points further into the file than a real image puts it.
-    TooFar,
     /// The header is cut off before a field it needs.
     Truncated,
     /// The optional header is neither PE32 nor PE32+.
@@ -293,10 +291,6 @@ fn u32_at(h: &[u8], offset: usize) -> Result<u32, PeError> {
 
 /// Size of the DOS header; `e_lfanew` is its last field (at 0x3C).
 const DOS_HEADER_SIZE: usize = 0x40;
-/// Largest `e_lfanew` accepted. Real images put the PE headers right behind a small DOS stub;
-/// the loader takes any 32-bit value, but a header megabytes into the file is not an image
-/// worth treating as signed, and the bound keeps the second read short.
-const MAX_PE_OFFSET: u32 = 16 * 1024 * 1024;
 /// How much is read at `e_lfanew`: the signature, the COFF header and an optional header with
 /// room for all sixteen data directories (PE32+: 112 + 16 * 8 bytes) with a margin.
 const NT_WINDOW: u64 = 4 + 20 + 512;
@@ -306,11 +300,9 @@ fn pe_offset(h: &[u8]) -> Result<u32, PeError> {
     if bytes(h, 0, 2)? != b"MZ" {
         return Err(PeError::NotPe);
     }
-    let offset = u32_at(h, 0x3C)?;
-    if offset > MAX_PE_OFFSET {
-        return Err(PeError::TooFar);
-    }
-    Ok(offset)
+    // Any 32-bit value is followed, as the loader would: a cap would turn a signed image with
+    // distant headers into an unverified one. Past the end of the file the read comes up short.
+    u32_at(h, 0x3C)
 }
 
 /// The size field of the security data directory, from the NT headers: `h` starts at the PE

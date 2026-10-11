@@ -86,10 +86,7 @@ fn bad_headers_are_errors() {
     assert_eq!(security_directory_size(&bad_magic), Err(PeError::BadMagic));
     let mut far = good.clone();
     far[0x3C..0x40].copy_from_slice(&u32::MAX.to_le_bytes());
-    assert_eq!(security_directory_size(&far), Err(PeError::TooFar));
-    let mut beyond = good.clone();
-    beyond[0x3C..0x40].copy_from_slice(&MAX_PE_OFFSET.to_le_bytes());
-    assert_eq!(security_directory_size(&beyond), Err(PeError::Truncated));
+    assert_eq!(security_directory_size(&far), Err(PeError::Truncated));
     for cut in [
         0x40,
         0x80,
@@ -158,9 +155,9 @@ fn headers_beyond_64_kib_are_read_from_a_reader() {
             embedded_signature_size(&mut Cursor::new(&file[..8])).unwrap(),
             0
         );
-        // A pointer past the bound is not followed.
+        // The largest offset is followed and simply finds nothing there.
         let mut far = file.clone();
-        far[0x3C..0x40].copy_from_slice(&(MAX_PE_OFFSET + 1).to_le_bytes());
+        far[0x3C..0x40].copy_from_slice(&u32::MAX.to_le_bytes());
         assert_eq!(embedded_signature_size(&mut Cursor::new(&far)).unwrap(), 0);
     }
 }

@@ -79,8 +79,8 @@ puts both pre-load checks in the shared resolver crate.
   library that regular users cannot change, and catches a file that was altered, or re-signed with
   an untrusted key, while keeping a signature.
 - The PE headers are located through `e_lfanew` (the DOS header is read first, then the headers at
-  that offset), so their position in the file does not matter; an `e_lfanew` above 16 MiB or past
-  the end of the file counts as no signature.
+  that offset), so their position in the file does not matter (any 32-bit offset is followed, as
+  the loader does); an `e_lfanew` past the end of the file counts as no signature.
 - Roots that a user imported into their own store are honoured in user mode, which crosses no
   boundary.
 - Pinning can follow from an administrator-only source once profiles exist.

@@ -708,16 +708,22 @@ impl SimEcu {
             // Still starting up after an ECUReset: the request is lost.
             return Exchange::none();
         }
+        if self.take_armed(|f| matches!(f, Fault::BusError)).is_some() {
+            // The request never reaches the ECU.
+            return Exchange::none();
+        }
         if let Some(&sid) = message.first() {
+            // Only now has the request reached the ECU: the faults waiting for its service are
+            // armed for it.
             self.arm_for_service(sid);
             if self.silent {
                 // A power loss waiting for this service: the request finds the ECU off.
                 return Exchange::none();
             }
-        }
-        if self.take_armed(|f| matches!(f, Fault::BusError)).is_some() {
-            // The request never reaches the ECU.
-            return Exchange::none();
+            if self.take_armed(|f| matches!(f, Fault::BusError)).is_some() {
+                // A bus error waiting for this service loses the request.
+                return Exchange::none();
+            }
         }
         let power_cycles = self.power_cycles;
         let delay_before = self.security_delay_until;
@@ -823,7 +829,8 @@ impl SimEcu {
 
     /// Arms `fault` (as [`SimEcu::inject`] does) once a request of service `sid` reaches the ECU,
     /// so that it fires on that request: requests of other services pass it by. A request lost
-    /// on the way (the ECU off or still starting up after an ECUReset) does not count, and the
+    /// on the way (the ECU off or still starting up after an ECUReset, or a [`Fault::BusError`]
+    /// armed by [`SimEcu::inject`]) does not count, and the
     /// fault keeps waiting. Faults that wait for the same service are armed together, in
     /// injection order and ahead of the faults [`SimEcu::inject`] armed; from then on they are
     /// armed faults like those, so one that does not fire on that request waits for the next

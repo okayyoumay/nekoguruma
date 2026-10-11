@@ -898,16 +898,18 @@ fn a_lost_ecu_reset_response_makes_the_teardown_passive() {
     );
 }
 
-/// The ECU acknowledges the restart's ECUReset and then answers nothing for 4 s while it starts
-/// up, well past the confirmation's startup wait and window (0.1 s and 2 s) and well before the
-/// second attempt (after the 3.5 s passive wait): the first confirmation fails, the passive wait
-/// runs, the second confirmation succeeds, and the job completes.
+/// The ECU acknowledges the restart's ECUReset and then answers nothing for 6 s while it starts
+/// up. A confirmation attempt waits 0.1 s and then reads for 2 s, and an unanswered read takes
+/// up to the 1 s P2 timeout, so the first attempt ends by about 3.1 s; a second attempt right
+/// after it would read until about 5.2 s and fail too, while the one after the 3.5 s passive
+/// wait reads from about 6.7 s on. So the job completes only if the passive wait runs between
+/// the attempts.
 #[test]
 #[serial]
 fn an_ecu_silent_after_acknowledging_the_reset_is_confirmed_after_the_passive_wait() {
     redo_after_teardown(
         "reset-silent",
-        &ecu_config_with_startup(3_000, Some(4_000)),
+        &ecu_config_with_startup(3_000, Some(6_000)),
         None,
         Teardown {
             first_read_confirms: false,

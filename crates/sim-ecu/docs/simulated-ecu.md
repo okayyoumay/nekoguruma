@@ -190,10 +190,11 @@ of other services by, until a request of service `sid` reaches the ECU, and then
 request as it would have fired on the next one after `inject`. Faults waiting for the same
 service are armed together, in injection order and ahead of the faults `inject` armed; a
 `PowerLoss` takes effect when that request arrives, so it gets no answer. A request lost on the
-way (the ECU silent or starting up) does not count. Once armed, a fault behaves as after
+way (the ECU silent or starting up, or a bus error) does not count. Once armed, a fault behaves as after
 `inject`: one that does not fire on that request (a second fault of the same kind, a
 `ResponsePending` on a request without a response) stays armed for the next request of any
-service, and a `BusError` armed by `inject` that loses the request uses up only itself. This lets
+service. A request a `BusError` armed by `inject` loses never reaches the ECU, so the faults
+waiting for its service wait on; a `BusError` aimed at a service loses that request. This lets
 a test hit a request it cannot time, such as a client's ECUReset that follows a run of other
 requests.
 `faults_for_service()` lists the faults still waiting, with their service.

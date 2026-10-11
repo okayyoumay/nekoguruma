@@ -2515,3 +2515,34 @@ fn a_snapshot_without_faults_for_a_service_still_reads() {
     let restored = SimEcu::restore(old, ManualClock::default(), ms(0)).unwrap();
     assert!(restored.faults_for_service().is_empty());
 }
+
+#[test]
+fn a_request_lost_to_a_bus_error_leaves_the_fault_for_its_service_waiting() {
+    let mut ecu = ecu();
+    ecu.inject(Fault::BusError);
+    ecu.inject_for_service(0x11, Fault::DropResponse);
+    // The bus error loses the reset before it reaches the ECU: no reset, the fault waits on.
+    let cycles = ecu.power_cycles();
+    assert_eq!(ecu.request(&[0x11, 0x01]), SimResponse::NoResponse);
+    assert_eq!(ecu.power_cycles(), cycles);
+    assert_eq!(ecu.faults_for_service(), [(0x11, Fault::DropResponse)]);
+    // A request of another service is answered as usual.
+    assert_eq!(
+        ecu.request(&[0x22, 0xF1, 0x86]),
+        pos(&[0x62, 0xF1, 0x86, 0x01])
+    );
+    // The next reset takes effect and its response is lost.
+    assert_eq!(ecu.request(&[0x11, 0x01]), SimResponse::NoResponse);
+    assert_eq!(ecu.power_cycles(), cycles + 1);
+    assert!(ecu.faults_for_service().is_empty());
+}
+
+#[test]
+fn a_bus_error_for_a_service_loses_that_request() {
+    let mut ecu = ecu();
+    ecu.inject_for_service(0x11, Fault::BusError);
+    let cycles = ecu.power_cycles();
+    assert_eq!(ecu.request(&[0x11, 0x01]), SimResponse::NoResponse);
+    assert_eq!(ecu.power_cycles(), cycles);
+    assert!(ecu.armed_faults().is_empty());
+}

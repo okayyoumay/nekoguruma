@@ -271,10 +271,14 @@ pub async fn run_program_journaled(
 ///   `restart::check_before_erase` checks every declared precondition once more through its
 ///   programming-session source (step 4b-3): one that does not hold ends the job in
 ///   [`JobError::OnSiteInterventionRequired`] (`PreconditionNotMetBeforeErase`) with no erase
-///   sent. The rest of the restart order (the erase, step 4c) does not run in this agent, so a
-///   job that passed ends in [`JobError::OnSiteInterventionRequired`] (`RestartOrderUnavailable`,
-///   carrying the teardown's outcome, the confirmation and the state check), or in
-///   [`JobError::IdentityMismatch`] when the ECU's VIN is another vehicle's. When the state
+///   sent. Then the same VM goes on from the erase as a first run does (step 4c, ADR-276): its
+///   arrival commits a new transfer-start marker, which starts a new attempt in the journal,
+///   and the erase, the transfer, the post-transfer steps and the rest of the program follow,
+///   so the job ends as that first run would. The agent tracks no session and does not judge
+///   the erase's answer (ADR-276 item 3): an erase the ECU refuses in its default session is an
+///   answer the procedure handles as on a first run, and no block is sent without a positive
+///   RequestDownload. A VIN that is another vehicle's ends the job
+///   in [`JobError::IdentityMismatch`] before any of this. When the state
 ///   check decides the read-back verification instead, the match is the verification
 ///   (ADR-271): the program goes on from the VM state journaled at the plan's end and runs to
 ///   its end as a first run would, with no erase and no ECUReset for the verified plan, and the
@@ -571,7 +575,8 @@ impl Drop for CancelOnDrop {
 /// plan's entry to its erase run again from the restart's entry state, journaled as in a first
 /// run, after a run start that carries the entry state, and stopped before the erase (step 4b-2,
 /// ADR-273, ADR-274); then `restart::check_before_erase`
-/// reads the declared preconditions through their programming-session sources (step 4b-3).
+/// reads the declared preconditions through their programming-session sources (step 4b-3);
+/// then the same VM goes on from the erase as a first run does (step 4c, ADR-276).
 /// On a read-back verification the program goes on after the plan instead
 /// ([`continue_after_plan`], ADR-271 items 3 to 5).
 /// `vin` is the job's target VIN and `intended_software_version` the software version it
@@ -594,6 +599,95 @@ fn resume_on<H, S>(
     intended_software_version: Option<&[u8]>,
     guards: &GuardSlot,
 ) -> Result<VmState, JobError>
+where
+    H: DiagHost<Error = HostError> + RuntimeInputs + TransferProgress,
+    S: Store,
+{
+    match restart_order(
+        program,
+        host,
+        limits,
+        cancelled,
+        opened,
+        sources,
+        vin,
+        intended_software_version,
+        guards,
+    )? {
+        Restarted::Finished(state) => Ok(state),
+        Restarted::AtErase(at_erase) => {
+            let AtErase {
+                mut journal,
+                vm,
+                flash_session,
+                teardown,
+                confirmed,
+            } = *at_erase;
+            tracing::info!(
+                flash_session,
+                ?teardown,
+                ?confirmed,
+                "restart: redoing the transfer from the erase"
+            );
+            // Step 4c (ADR-276): the same VM goes on from the erase as a first run does. Its
+            // arrival at the erase commits a new transfer-start marker, which starts a new attempt
+            // in the journal (the earlier exit marker and post-transfer progress go with the old
+            // one), before the erase is sent.
+            match run_vm(
+                program,
+                host,
+                limits,
+                cancelled,
+                Some(&mut journal),
+                vm,
+                None,
+            )? {
+                RunEnd::Finished(state) => Ok(state),
+                // No stop point was given.
+                RunEnd::Stopped(_) => Err(JobError::Journal(JournalError::Invariant(
+                    "the redone transfer stopped without a stop point",
+                ))),
+            }
+        }
+    }
+}
+
+/// Where [`restart_order`] left a job.
+enum Restarted<S: Store> {
+    /// The job ended: a plain start or a continuation after a read-back verification ran to the
+    /// program's end. The VM's final state.
+    Finished(VmState),
+    /// A redone transfer passed every step of the restart order up to the erase (steps 1 to 4b-3);
+    /// the VM stands at the plan's erase, nothing at it journaled or sent.
+    AtErase(Box<AtErase<S>>),
+}
+
+/// A redone transfer stopped at its erase (see [`Restarted::AtErase`]).
+struct AtErase<S: Store> {
+    journal: JobJournal<S>,
+    vm: Vm,
+    flash_session: u32,
+    teardown: restart::Teardown,
+    confirmed: restart::Confirmation,
+}
+
+/// The restart order of [`resume_on`] up to the erase of a redone transfer: everything but
+/// step 4c. A plain start and a continuation after a read-back verification run to the end here.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the job's whole input, split only by what the caller owns"
+)]
+fn restart_order<H, S>(
+    program: &Program,
+    host: &mut H,
+    limits: JobLimits,
+    cancelled: &AtomicBool,
+    opened: Result<Journal<S>, JournalError>,
+    sources: crate::inputs::ServiceSources,
+    vin: Option<&crate::journal::Vin>,
+    intended_software_version: Option<&[u8]>,
+    guards: &GuardSlot,
+) -> Result<Restarted<S>, JobError>
 where
     H: DiagHost<Error = HostError> + RuntimeInputs + TransferProgress,
     S: Store,
@@ -635,9 +729,11 @@ where
                     Some(&mut journal),
                     first_step,
                 )
+                .map(Restarted::Finished)
             }
             // A program without a plan keeps no journal (ADR-252 item 7).
-            _ => run_on(program, host, limits, cancelled, None::<&mut JobJournal<S>>),
+            _ => run_on(program, host, limits, cancelled, None::<&mut JobJournal<S>>)
+                .map(Restarted::Finished),
         },
         RestartDecision::Restart(point) => {
             // `classify` restarts only from a journal it read.
@@ -681,7 +777,8 @@ where
                 // plan, with no erase and no reset for the verified plan.
                 return continue_after_plan(
                     program, host, limits, cancelled, journal, sources, plan, teardown, confirmed,
-                );
+                )
+                .map(Restarted::Finished);
             }
             restart::check_reentry(program, &point, &teardown, &sources, host, cancelled)?;
             // Step 4b-2 (ADR-273): the plan's steps from the entry to the erase, without
@@ -699,7 +796,7 @@ where
                 vm,
                 Some(plan.boundaries.erase_pc),
             )? {
-                RunEnd::Stopped => {
+                RunEnd::Stopped(vm) => {
                     // Step 4b-3 (ADR-229 item 2 step 4, ADR-245 item 6): the replayed steps
                     // normally put the ECU in its programming session, so the mutable
                     // conditions are read through their programming-session sources, right
@@ -707,21 +804,18 @@ where
                     restart::check_before_erase(
                         program, &point, &teardown, &sources, host, cancelled,
                     )?;
+                    Ok(Restarted::AtErase(Box::new(AtErase {
+                        journal: replay,
+                        vm,
+                        flash_session: point.flash_session,
+                        teardown,
+                        confirmed,
+                    })))
                 }
-                RunEnd::Finished(_) => {
-                    return Err(JobError::Journal(JournalError::Invariant(
-                        "the replay ended before it reached the erase",
-                    )));
-                }
+                RunEnd::Finished(_) => Err(JobError::Journal(JournalError::Invariant(
+                    "the replay ended before it reached the erase",
+                ))),
             }
-            Err(JobError::OnSiteInterventionRequired(
-                OnSiteReason::RestartOrderUnavailable {
-                    flash_session: point.flash_session,
-                    teardown,
-                    confirmed,
-                    state,
-                },
-            ))
         }
     }
 }
@@ -794,7 +888,7 @@ where
     match run_vm(program, host, limits, cancelled, Some(&mut tail), vm, None)? {
         RunEnd::Finished(state) => Ok(state),
         // No stop point was given.
-        RunEnd::Stopped => Err(JobError::Journal(JournalError::Invariant(
+        RunEnd::Stopped(_) => Err(JobError::Journal(JournalError::Invariant(
             "the continuation stopped without a stop point",
         ))),
     }
@@ -881,7 +975,7 @@ where
     match run_vm(program, host, limits, cancelled, journal, vm, None)? {
         RunEnd::Finished(state) => Ok(state),
         // No stop point was given.
-        RunEnd::Stopped => Err(JobError::Journal(JournalError::Invariant(
+        RunEnd::Stopped(_) => Err(JobError::Journal(JournalError::Invariant(
             "the run stopped without a stop point",
         ))),
     }
@@ -891,8 +985,9 @@ where
 enum RunEnd {
     /// The program ran to its end; the VM's final state.
     Finished(VmState),
-    /// Execution arrived at the stop point, before its instruction was journaled or run.
-    Stopped,
+    /// Execution arrived at the stop point, before its instruction was journaled or run; the VM
+    /// stands there, so a caller can go on from it.
+    Stopped(Vm),
 }
 
 /// The step loop from `vm`'s state, shared by a run from the program's start and the restart's
@@ -921,7 +1016,7 @@ where
             return Err(JobError::Cancelled);
         }
         if arrived && stop_before == Some(vm.state.pc) {
-            return Ok(RunEnd::Stopped);
+            return Ok(RunEnd::Stopped(vm));
         }
         if vm.state.steps >= limits.max_steps {
             return Err(JobError::StepLimit(vm.state.steps));
@@ -976,6 +1071,51 @@ mod tests {
     use vci_service_interface::{ComLogicalLinkHandle, ModuleHandle};
 
     use super::*;
+
+    /// [`resume_on`] that stops a redone transfer before its erase (step 4c), ending in
+    /// `StoppedBeforeErase` with the restart's outcomes so far; any other job ends as in
+    /// `resume_on`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the job's whole input, as `resume_on` takes it"
+    )]
+    fn resume_to_erase<H, S>(
+        program: &Program,
+        host: &mut H,
+        limits: JobLimits,
+        cancelled: &AtomicBool,
+        opened: Result<Journal<S>, JournalError>,
+        sources: crate::inputs::ServiceSources,
+        vin: Option<&crate::journal::Vin>,
+        intended_software_version: Option<&[u8]>,
+        guards: &GuardSlot,
+    ) -> Result<VmState, JobError>
+    where
+        H: DiagHost<Error = HostError> + RuntimeInputs + TransferProgress,
+        S: Store,
+    {
+        match restart_order(
+            program,
+            host,
+            limits,
+            cancelled,
+            opened,
+            sources,
+            vin,
+            intended_software_version,
+            guards,
+        )? {
+            Restarted::Finished(state) => Ok(state),
+            Restarted::AtErase(at_erase) => Err(JobError::OnSiteInterventionRequired(
+                OnSiteReason::StoppedBeforeErase {
+                    flash_session: at_erase.flash_session,
+                    teardown: at_erase.teardown,
+                    confirmed: at_erase.confirmed,
+                    state: restart::StateCheck::RedoTransfer,
+                },
+            )),
+        }
+    }
 
     /// Answers every service request with its SID plus 0x40, and counts the calls.
     #[derive(Default)]
@@ -1348,6 +1488,14 @@ mod tests {
         cancel_on_read: Option<([u8; 2], Arc<AtomicBool>)>,
         /// A routine whose response is lost.
         lose_routine: Option<u16>,
+        /// The ECU stays in its default session and refuses the erase (routine 0xFF00) and
+        /// RequestDownload there with a negative response, as an ECU that accepts them only in
+        /// its programming session would.
+        default_session_only: bool,
+        /// The ECU refuses the erase (routine 0xFF00) with a negative response but accepts
+        /// RequestDownload, as an ECU that erases on the download or allows a resumed download
+        /// would.
+        refuse_erase_only: bool,
         /// The supply voltage the VCI reports; `None` reports none.
         voltage: Option<i64>,
         voltage_reads: u32,
@@ -1432,6 +1580,8 @@ mod tests {
                 software_version: Some(b"SW01".to_vec()),
                 cancel_on_read: None,
                 lose_routine: None,
+                default_session_only: false,
+                refuse_erase_only: false,
                 voltage: None,
                 voltage_reads: 0,
                 voltage_script: std::collections::VecDeque::new(),
@@ -1611,6 +1761,7 @@ mod tests {
                         }),
                     }
                 }
+                (0x34, _) if self.default_session_only => Ok(vec![0x7F, 0x34, 0x7F]),
                 (0x34, _) => {
                     self.transfer = Some(0);
                     Ok(vec![0x74])
@@ -1629,6 +1780,9 @@ mod tests {
             self.log.push((Sent::Routine(routine), self.commits.get()));
             if self.lose_routine == Some(routine) {
                 return Err(HostError::NoResponse);
+            }
+            if (self.default_session_only || self.refuse_erase_only) && routine == 0xFF00 {
+                return Ok(vec![0x7F, 0x31, 0x7F]);
             }
             Ok(vec![0x71])
         }
@@ -3160,7 +3314,7 @@ mod tests {
         version: Option<&[u8]>,
         slot: &GuardSlot,
     ) -> Result<VmState, JobError> {
-        resume_on(
+        resume_to_erase(
             program,
             host,
             JobLimits::default(),
@@ -3210,7 +3364,7 @@ mod tests {
             matches!(
                 result,
                 Err(JobError::OnSiteInterventionRequired(
-                    OnSiteReason::RestartOrderUnavailable {
+                    OnSiteReason::StoppedBeforeErase {
                         flash_session: 1,
                         teardown: restart::Teardown::Reset,
                         ..
@@ -3298,7 +3452,7 @@ mod tests {
                 matches!(
                     result,
                     Err(JobError::OnSiteInterventionRequired(
-                        OnSiteReason::RestartOrderUnavailable { .. }
+                        OnSiteReason::StoppedBeforeErase { .. }
                     ))
                 ),
                 "{millivolts}: {result:?}"
@@ -3338,7 +3492,7 @@ mod tests {
             matches!(
                 result,
                 Err(JobError::OnSiteInterventionRequired(
-                    OnSiteReason::RestartOrderUnavailable { .. }
+                    OnSiteReason::StoppedBeforeErase { .. }
                 ))
             ),
             "{result:?}"
@@ -3374,7 +3528,7 @@ mod tests {
             host.voltage = Some(12_600);
             host.voltage_fails = fails;
             host.cancel_on_voltage = Some(Arc::clone(&cancelled));
-            let result = resume_on(
+            let result = resume_to_erase(
                 &program,
                 &mut host,
                 JobLimits::default(),
@@ -3434,7 +3588,7 @@ mod tests {
     fn teardown_of(result: &Result<VmState, JobError>) -> restart::Teardown {
         match result {
             Err(JobError::OnSiteInterventionRequired(
-                OnSiteReason::RestartOrderUnavailable {
+                OnSiteReason::StoppedBeforeErase {
                     flash_session: 1,
                     teardown,
                     ..
@@ -4175,7 +4329,7 @@ mod tests {
             })
         };
         let started = std::time::Instant::now();
-        let result = resume_on(
+        let result = resume_to_erase(
             &program,
             &mut host,
             limits,
@@ -4202,7 +4356,7 @@ mod tests {
     ) -> (restart::Teardown, restart::Confirmation) {
         match result {
             Err(JobError::OnSiteInterventionRequired(
-                OnSiteReason::RestartOrderUnavailable {
+                OnSiteReason::StoppedBeforeErase {
                     flash_session: 1,
                     teardown,
                     confirmed,
@@ -4669,7 +4823,7 @@ mod tests {
             wait_poll: Duration::from_millis(2),
             ..JobLimits::default()
         };
-        let result = resume_on(
+        let result = resume_to_erase(
             &program,
             &mut host,
             limits,
@@ -4914,7 +5068,7 @@ mod tests {
         let cancelled = Arc::new(AtomicBool::new(false));
         let mut host = FlashHost::new(Rc::new(Cell::new(0)));
         host.cancel_on_read = Some(([0xF1, 0x91], Arc::clone(&cancelled)));
-        let result = resume_on(
+        let result = resume_to_erase(
             &program,
             &mut host,
             JobLimits::default(),
@@ -4940,7 +5094,7 @@ mod tests {
         let cancelled = Arc::new(AtomicBool::new(false));
         let mut host = FlashHost::new(Rc::new(Cell::new(0)));
         host.cancel_on_read = Some(([0xF1, 0x90], Arc::clone(&cancelled)));
-        let result = resume_on(
+        let result = resume_to_erase(
             &program,
             &mut host,
             JobLimits::default(),
@@ -5026,7 +5180,7 @@ mod tests {
         assert_eq!(host.sent(), [read_vin(), read_hardware()]);
     }
 
-    /// A restart that passes step 3a still stops at `RestartOrderUnavailable`, and step 3a
+    /// A restart that passes step 3a still stops at `StoppedBeforeErase`, and step 3a
     /// reads in the default session: after the confirmation's read of F186.
     #[test]
     fn a_passing_step_3a_ends_in_the_unavailable_restart_order_after_the_confirmation() {
@@ -5350,7 +5504,7 @@ mod tests {
                 let mut host = FlashHost::new(Rc::new(Cell::new(0)));
                 host.mirror = Some(mirror);
                 host.vin_script = [IdAnswer::Refuse].into();
-                resume_on(
+                resume_to_erase(
                     &program,
                     &mut host,
                     JobLimits::default(),
@@ -5437,7 +5591,7 @@ mod tests {
                 host.vin_script = [IdAnswer::Refuse].into();
             }
             host.cancel_on_vin_read = Some((1, Arc::clone(&cancelled)));
-            let result = resume_on(
+            let result = resume_to_erase(
                 &program,
                 &mut host,
                 JobLimits::default(),
@@ -5554,7 +5708,7 @@ mod tests {
     /// other result.
     fn state_of(result: &Result<VmState, JobError>) -> restart::StateCheck {
         match result {
-            Err(JobError::OnSiteInterventionRequired(OnSiteReason::RestartOrderUnavailable {
+            Err(JobError::OnSiteInterventionRequired(OnSiteReason::StoppedBeforeErase {
                 flash_session: 1,
                 state,
                 ..
@@ -5921,7 +6075,7 @@ mod tests {
         interrupted_at_erase(program, erase, dir);
         let mut host = FlashHost::new(Rc::new(Cell::new(0)));
         prepare(&mut host);
-        let result = resume_on(
+        let result = resume_to_erase(
             program,
             &mut host,
             limits,
@@ -6039,7 +6193,7 @@ mod tests {
             ..JobLimits::default()
         };
         let mut host = FlashHost::new(Rc::new(Cell::new(0)));
-        let result = resume_on(
+        let result = resume_to_erase(
             &program,
             &mut host,
             limits,
@@ -6064,7 +6218,7 @@ mod tests {
         let cancelled = Arc::new(AtomicBool::new(false));
         let mut host = FlashHost::new(Rc::new(Cell::new(0)));
         host.cancel_on_service = Some((0x10, Arc::clone(&cancelled)));
-        let result = resume_on(
+        let result = resume_to_erase(
             &program,
             &mut host,
             JobLimits::default(),
@@ -6127,6 +6281,250 @@ mod tests {
         let result = resume(&program, &dir, &mut host, false);
         teardown_at_precondition(&result, diag_ir::PreconditionKind::Voltage);
         assert!(replayed_requests(&host).is_empty(), "{:?}", full_log(&host));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // --------------------- restart step 4c (ADR-276)
+
+    /// The part of a log from the restart's erase on.
+    fn from_the_erase(host: &FlashHost) -> Vec<Sent> {
+        let log = full_log(host);
+        let erase = log
+            .iter()
+            .position(|sent| *sent == Sent::Routine(0xFF00))
+            .unwrap_or_else(|| panic!("no erase in {log:?}"));
+        log[erase..].to_vec()
+    }
+
+    /// The erase, RequestDownload, three blocks and RequestTransferExit of [`flash_program`].
+    fn redone_transfer() -> Vec<Sent> {
+        vec![
+            Sent::Routine(0xFF00),
+            Sent::Service(0x34, vec![0x01]),
+            Sent::Block,
+            Sent::Block,
+            Sent::Block,
+            Sent::Service(0x37, vec![0x01]),
+        ]
+    }
+
+    /// The done-when case: a restart that redoes the transfer goes on from the erase as a first
+    /// run does and completes. The journal holds a new attempt, committed before the erase,
+    /// with every block and the exit, and its post-transfer steps complete.
+    #[test]
+    fn a_redone_transfer_runs_from_the_erase_and_completes() {
+        let program = flash_program();
+        let dir = journal_dir("redo-completes");
+        interrupted(&program, &dir);
+        let before = Journal::read(&dir, &job_key()).unwrap();
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        let result = resume_on(
+            &program,
+            &mut host,
+            JobLimits::default(),
+            &AtomicBool::new(false),
+            Journal::open(&dir, &job_key()),
+            identity_sources(),
+            Some(&target()),
+            None,
+            &dir_slot(&dir),
+        );
+        let state = result.expect("the redone transfer completes the job");
+        assert_eq!(state.pc as usize, program.code.len());
+        assert_eq!(from_the_erase(&host), redone_transfer());
+        let after = Journal::read(&dir, &job_key()).unwrap();
+        let old = before.facts.transfer.as_ref().unwrap();
+        let new = after.facts.transfer.as_ref().unwrap();
+        assert!(new.started_at.steps > old.started_at.steps);
+        assert_eq!(new.started_at.pc, program.flash[0].boundaries.erase_pc);
+        assert_eq!(new.last_block, Some(3));
+        assert!(new.exit.as_ref().is_some_and(|exit| exit.complete));
+        assert!(!new.interrupted);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An erase whose answer is lost ends the redone transfer as a first-run step failure at the
+    /// erase, with nothing after it sent. Its transfer-start marker was committed before it, so the
+    /// next restart takes the restart order for this new attempt (an ECUReset is allowed again),
+    /// and the restart after that ends at the plan's resume limit: the new marker does not reset
+    /// the count.
+    #[test]
+    fn a_lost_erase_answer_ends_the_redo_and_the_next_restart_takes_the_order() {
+        let mut program = flash_program();
+        program.flash[0].max_resumes = 2;
+        let erase = program.flash[0].boundaries.erase_pc;
+        let dir = journal_dir("redo-erase-lost");
+        interrupted(&program, &dir);
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        host.lose_routine = Some(0xFF00);
+        let result = resume_on(
+            &program,
+            &mut host,
+            JobLimits::default(),
+            &AtomicBool::new(false),
+            Journal::open(&dir, &job_key()),
+            identity_sources(),
+            Some(&target()),
+            None,
+            &dir_slot(&dir),
+        );
+        assert_eq!(from_the_erase(&host), [Sent::Routine(0xFF00)]);
+        assert!(
+            matches!(result, Err(JobError::Host { pc, .. }) if pc == erase),
+            "{result:?}"
+        );
+        let journal = Journal::read(&dir, &job_key()).unwrap();
+        let transfer = journal.facts.transfer.as_ref().unwrap();
+        assert_eq!(transfer.started_at.pc, erase);
+        assert!(transfer.exit.is_none());
+
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        let result = resume(&program, &dir, &mut host, false);
+        assert_eq!(teardown_of(&result), restart::Teardown::Reset);
+        assert_eq!(state_of(&result), restart::StateCheck::RedoTransfer);
+
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        let result = resume(&program, &dir, &mut host, false);
+        assert!(
+            matches!(
+                result,
+                Err(JobError::OnSiteInterventionRequired(
+                    OnSiteReason::ResumeLimitReached {
+                        resumes: 2,
+                        max: 2,
+                        ..
+                    }
+                ))
+            ),
+            "{result:?}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A plan whose steps before the erase enter no programming session sends the erase in the
+    /// default session the restart confirmed. An ECU that refuses it there answers negatively,
+    /// which the program receives as an answer: the fixture's program goes on to RequestDownload.
+    /// An ECU that refuses a download without a successful erase, as `sim-ecu` does, refuses it
+    /// too, and the job ends at the first block with no transfer open, nothing written.
+    #[test]
+    fn an_erase_refused_in_the_default_session_writes_nothing() {
+        let program = flash_program();
+        let dir = journal_dir("redo-erase-refused");
+        interrupted(&program, &dir);
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        host.default_session_only = true;
+        let result = resume_on(
+            &program,
+            &mut host,
+            JobLimits::default(),
+            &AtomicBool::new(false),
+            Journal::open(&dir, &job_key()),
+            identity_sources(),
+            Some(&target()),
+            None,
+            &dir_slot(&dir),
+        );
+        assert!(
+            matches!(
+                result,
+                Err(JobError::Host {
+                    source: HostError::NoTransferActive,
+                    ..
+                })
+            ),
+            "{result:?}"
+        );
+        assert_eq!(
+            from_the_erase(&host),
+            [
+                Sent::Routine(0xFF00),
+                Sent::Service(0x34, vec![0x01]),
+                Sent::Block
+            ]
+        );
+        assert!(host.transfer.is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The runner does not judge the erase's answer (ADR-276 item 3): an ECU that refuses the
+    /// erase but accepts RequestDownload is written, as on a first run, and the job completes.
+    /// Whether a refused erase may be written over is the procedure's and the ECU's.
+    #[test]
+    fn an_erase_refused_by_an_ecu_that_accepts_the_download_is_written_as_on_a_first_run() {
+        let program = flash_program();
+        let dir = journal_dir("redo-erase-refused-download-accepted");
+        interrupted(&program, &dir);
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        host.refuse_erase_only = true;
+        let result = resume_on(
+            &program,
+            &mut host,
+            JobLimits::default(),
+            &AtomicBool::new(false),
+            Journal::open(&dir, &job_key()),
+            identity_sources(),
+            Some(&target()),
+            None,
+            &dir_slot(&dir),
+        );
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(from_the_erase(&host), redone_transfer());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The done-when case: an earlier attempt sent RequestTransferExit (its answer was lost), the
+    /// restart redoes the transfer and is interrupted in its blocks. The redo's transfer-start
+    /// marker cleared the earlier exit marker and its post-transfer progress, so the next restart
+    /// takes the ordinary order: its teardown is an ECUReset, not the passive teardown an exit
+    /// marker without the completion calls for.
+    #[test]
+    fn a_redo_clears_the_earlier_exit_marker_for_the_next_restart() {
+        let mut program = flash_program();
+        program.flash[0].max_resumes = 2;
+        let dir = journal_dir("redo-clears-exit");
+        let result = first_run(&program, &dir, JobLimits::default(), |host| {
+            host.lose_service = Some(0x37);
+        });
+        assert!(matches!(result, Err(JobError::Host { .. })), "{result:?}");
+        let first = Journal::read(&dir, &job_key()).unwrap();
+        assert!(first.facts.transfer.as_ref().unwrap().exit.is_some());
+
+        // The first restart: passive because of the exit marker, then the redo loses a block.
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        host.voltage = Some(12_600);
+        host.lose_block = Some(1);
+        let result = resume_on(
+            &program,
+            &mut host,
+            JobLimits::default(),
+            &AtomicBool::new(false),
+            Journal::open(&dir, &job_key()),
+            identity_sources(),
+            Some(&target()),
+            None,
+            &dir_slot(&dir),
+        );
+        assert!(matches!(result, Err(JobError::Host { .. })), "{result:?}");
+        assert!(
+            !full_log(&host)
+                .iter()
+                .any(|sent| matches!(sent, Sent::Service(0x11, _))),
+            "the first restart sends no ECUReset after an exit marker: {:?}",
+            full_log(&host)
+        );
+        let redone = Journal::read(&dir, &job_key()).unwrap();
+        let transfer = redone.facts.transfer.as_ref().unwrap();
+        assert!(transfer.exit.is_none());
+        assert!(
+            transfer.started_at.steps > first.facts.transfer.as_ref().unwrap().started_at.steps
+        );
+
+        // The second restart, stopped before its erase: an ECUReset, so the ordinary order.
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        host.voltage = Some(12_600);
+        let result = resume(&program, &dir, &mut host, false);
+        assert_eq!(teardown_of(&result), restart::Teardown::Reset);
+        assert_eq!(state_of(&result), restart::StateCheck::RedoTransfer);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -6502,7 +6900,7 @@ mod tests {
         let mut host = FlashHost::new(Rc::new(Cell::new(0)));
         host.software_version = Some(b"SW02".to_vec());
         host.cancel_on_service = Some((0x3E, Arc::clone(&cancelled)));
-        let result = resume_on(
+        let result = resume_to_erase(
             &program,
             &mut host,
             JobLimits::default(),
@@ -6536,7 +6934,7 @@ mod tests {
         };
         let mut host = FlashHost::new(Rc::new(Cell::new(0)));
         host.software_version = Some(b"SW02".to_vec());
-        let result = resume_on(
+        let result = resume_to_erase(
             &program,
             &mut host,
             limits,
@@ -7216,7 +7614,7 @@ mod tests {
         let flag = Arc::new(AtomicBool::new(false));
         let mut host = FlashHost::new(Rc::new(Cell::new(0)));
         host.cancel_on_read = Some(([0xF1, 0x95], Arc::clone(&flag)));
-        let result = resume_on(
+        let result = resume_to_erase(
             &program,
             &mut host,
             JobLimits::default(),
@@ -7472,7 +7870,7 @@ mod tests {
     }
 
     /// Every declared precondition holds at step 4a: the restart replays the (here empty) steps
-    /// from the entry to the erase and stops before the erase, in the unavailable restart order.
+    /// from the entry to the erase and stops before the erase (`StoppedBeforeErase`).
     #[test]
     fn a_restart_whose_preconditions_hold_at_step_4a_stops_before_the_erase() {
         let program = flash_program_with_supply_and_engine();
@@ -7610,7 +8008,7 @@ mod tests {
             ]
             .into(),
         ));
-        let result = resume_on(
+        let result = resume_to_erase(
             &program,
             &mut host,
             JobLimits::default(),
@@ -7942,7 +8340,7 @@ mod tests {
             ]
             .into(),
         ));
-        let result = resume_on(
+        let result = resume_to_erase(
             &program,
             &mut host,
             JobLimits::default(),
@@ -8081,7 +8479,7 @@ mod tests {
             let mut host = FlashHost::new(Rc::new(Cell::new(0)));
             host.mirror = Some(mirror);
             host.voltage = Some(12_600);
-            resume_on(
+            resume_to_erase(
                 &program,
                 &mut host,
                 JobLimits::default(),
@@ -8351,7 +8749,7 @@ mod tests {
         let (journal, commits) = interrupted_journal(Some(first_run_commits + 1));
         assert_eq!(commits, first_run_commits);
         let mut host = FlashHost::new(Rc::new(Cell::new(0)));
-        let result = resume_on(
+        let result = resume_to_erase(
             &program,
             &mut host,
             JobLimits::default(),
@@ -8521,7 +8919,7 @@ mod tests {
         };
         let journal = crate::journal::Journal::on_store(store, job_key());
         let mut host = FlashHost::new(Rc::clone(&commits));
-        let result = resume_on(
+        let result = resume_to_erase(
             &program,
             &mut host,
             JobLimits::default(),

@@ -43,7 +43,10 @@ also need a limit that does not depend on each check's author being careful.
    (service and, where it matters, sub-function; T3 uses an allow-list of read-only services),
    raw frames and periodic messages (decoded and held to the same lists; on T2 a
    state-changing request passes only from the authorized job, otherwise T2 is held to the T3
-   list), and hardware controls such as programming voltage, pin
+   list). On T2 the guard also compares a state-changing request with what the authorized job
+   declares: the data identifier for a write, and for a routine its identifier, sub-function and
+   parameters (exact values or bounds), so a matching sub-function alone never lets an
+   undeclared routine run. It also sees hardware controls such as programming voltage, pin
    changes and vendor IOCTLs, which are refused on every class unless a T1 or T2 profile lists
    the control with its complete parameters (pin and voltage, pins, IOCTL identifier and exact
    payload or safe range) and the request matches them; on T2 a listed control also has to be part of an authorized job, so a profile

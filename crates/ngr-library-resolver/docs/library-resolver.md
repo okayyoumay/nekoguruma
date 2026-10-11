@@ -148,8 +148,8 @@ an embedded NUL. A value of another registry type is `ResolveError::Registry`.
 
 **Encoding and size.** The file is read up to `MAX_ROOT_FILE_SIZE` (1 MiB, inclusive; more is
 `TooLarge`). It must be UTF-8 (a byte order mark is tolerated) or UTF-16 little- or big-endian
-with a byte order mark; anything else, including a legacy code page and UTF-32 or UTF-16 with or
-without a mark, is `Encoding`. Unmarked UTF-16 or UTF-32 text is recognised by the NUL bytes it
+with a byte order mark; anything else, including a legacy code page, UTF-32 with or without a
+mark and UTF-16 without one, is `Encoding`. Unmarked UTF-16 or UTF-32 text is recognised by the NUL bytes it
 contains (a NUL character never appears in XML). The XML
 declaration's encoding is not honoured. `parse_root_file` takes text.
 

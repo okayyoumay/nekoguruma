@@ -489,7 +489,10 @@ impl Bus {
     /// Applies one control command.
     fn apply(&mut self, command: Command) -> Result<(), PassThruUlong> {
         match command {
-            Command::InjectFault { fault } => self.change_ecu(|ecu| ecu.inject(fault)),
+            Command::InjectFault { fault, service } => self.change_ecu(|ecu| match service {
+                Some(sid) => ecu.inject_for_service(sid, fault),
+                None => ecu.inject(fault),
+            }),
             Command::ReconnectEcu {} => self.change_ecu(SimEcu::reconnect),
             Command::DisconnectVci {} => {
                 self.vci_present = false;
@@ -745,8 +748,13 @@ const CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(20);
 #[derive(Debug, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 enum Command {
-    /// Arms a `sim_ecu::Fault` on the ECU (`SimEcu::inject`).
-    InjectFault { fault: Fault },
+    /// Arms a `sim_ecu::Fault` on the ECU (`SimEcu::inject`), or, with `service`, once a
+    /// request of that service reaches it (`SimEcu::inject_for_service`).
+    InjectFault {
+        fault: Fault,
+        #[serde(default)]
+        service: Option<u8>,
+    },
     /// `SimEcu::reconnect`: ends a power loss.
     ReconnectEcu {},
     /// Unplugs the VCI: J2534 calls return `ERR_DEVICE_NOT_CONNECTED`.

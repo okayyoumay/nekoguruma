@@ -18,7 +18,7 @@
 //! before the erase replayed, the preconditions checked once more, and then the erase,
 //! RequestDownload, blocks, RequestTransferExit and the post-transfer steps follow as on a first
 //! run. The tests observe that order request by request in `sim-vci`'s request trace
-//! ([`EXPECTED_RESTART`]), and the ECU enforces the transfer part of it, since it refuses the
+//! ([`GATE_REQUESTS`], the teardown, [`REDO_REQUESTS`]), and the ECU enforces the transfer part of it, since it refuses the
 //! erase while a download runs, refuses a download without an erase and a RequestTransferExit
 //! with blocks missing. Its power-cycle count (DID FD01) shows that the restart reset the ECU
 //! exactly once, or not at all after a passive teardown.
@@ -40,6 +40,17 @@
 //! which the ECU's configuration keeps at the plan's declared 3 s. All three redo the transfer,
 //! so RequestTransferExit and the integrity check run again, in order.
 //!
+//! The teardown scenarios kill the agent mid-transfer and hand the restart's worker a fault
+//! through the control directory, aimed at one service (`SimEcu::inject_for_service`): the
+//! ECU refuses the ECUReset, or resets and its response is lost, so the teardown turns passive
+//! (`PassiveCause::ResetRefused`, `ResetOutcomeUnknown`); or it refuses the first VIN read, so
+//! the gate makes the teardown passive before any ECUReset (`PassiveCause::Gate`). A fourth
+//! acknowledges the ECUReset and then answers nothing for longer than the confirmation's window,
+//! so the confirmation succeeds only after the passive retry. All complete the job. The number
+//! of F186 reads tells the paths apart: a passive wait leaves the ECU in its default session for
+//! the first read, while an ECU that is still in its programming session, or not yet answering,
+//! is read again.
+//!
 //! The tests are serial, the entry test included: the restart sets process-wide environment
 //! variables for the worker it launches, and the entry test reads one.
 
@@ -60,20 +71,18 @@ use serial_test::serial;
 /// The libtest name of [`restart_child_entry`], which the harness runs in its child processes.
 const ENTRY: &str = "restart_child_entry";
 
-/// The requests of the restart, in order (design 8.2.5, ADR-229 item 2), as `sim-vci` traces
-/// them: the supply voltage read before anything is sent to the ECU, the gates (VIN, hardware
-/// part number, voltage), the ECUReset (hardReset), the default-session confirmation (F186,
-/// repeated until the ECU answers; consecutive repeats are collapsed before the comparison),
-/// the identity again (VIN, hardware part number), the software version, the preconditions of
-/// step 4a (voltage), the programming session of the replay, the preconditions before the
-/// erase (voltage), the erase, RequestDownload, blocks 1 to 8, RequestTransferExit and the
-/// integrity check.
-const EXPECTED_RESTART: &[&str] = &[
-    "vbatt",
-    "uds 22 F190",
-    "uds 22 F187",
-    "vbatt",
-    "uds 11 01",
+/// The requests of the restart before its teardown, in order (design 8.2.5, ADR-229 item 2),
+/// as `sim-vci` traces them: the supply voltage read before anything is sent to the ECU, and the
+/// gates (VIN, hardware part number, voltage).
+const GATE_REQUESTS: &[&str] = &["vbatt", "uds 22 F190", "uds 22 F187", "vbatt"];
+
+/// The requests of the restart after its teardown, in order: the default-session confirmation
+/// (F186, repeated until the ECU answers; consecutive repeats are collapsed before the
+/// comparison), the identity again (VIN, hardware part number), the software version, the
+/// preconditions of step 4a (voltage), the programming session of the replay, the
+/// preconditions before the erase (voltage), the erase, RequestDownload, blocks 1 to 8,
+/// RequestTransferExit and the integrity check.
+const REDO_REQUESTS: &[&str] = &[
     "uds 22 F186",
     "uds 22 F190",
     "uds 22 F187",
@@ -264,10 +273,17 @@ fn spec() -> JobSpec {
 /// The ECU's configuration, with tS3_Server of `s3_server_ms`. No security access, so the
 /// program needs no seed-key computation.
 fn ecu_config(s3_server_ms: u32) -> String {
+    ecu_config_with_startup(s3_server_ms, None)
+}
+
+/// [`ecu_config`], with the ECU answering nothing for `startup_ms` after an ECUReset.
+fn ecu_config_with_startup(s3_server_ms: u32, startup_ms: Option<u32>) -> String {
+    let startup_ms = startup_ms.map_or("null".to_owned(), |ms| ms.to_string());
     format!(
         r#"{{"vin": "{VIN}", "part_number": "NGR-SIM-ECU", "sw_version": "1.0.0",
             "response_delay_ms": 0, "drop_at_block": null, "require_security_access": false,
-            "require_gateway_auth": false, "fail_checksum": false, "s3_server_ms": {s3_server_ms}}}"#
+            "require_gateway_auth": false, "fail_checksum": false, "s3_server_ms": {s3_server_ms},
+            "startup_ms": {startup_ms}}}"#
     )
 }
 
@@ -301,18 +317,43 @@ fn kill_mid_transfer(env: &Env, spec: &JobSpec) -> StepRef {
 }
 
 /// How the restart tears down the interrupted attempt before it redoes the transfer (ADR-229,
-/// ADR-264): with an ECUReset, or, once the RequestTransferExit marker is in the journal, by
-/// waiting out the ECU's session timer without one.
+/// ADR-264), as the tests observe it: the requests before the teardown, whether it sends the
+/// ECUReset, and whether the ECU reset.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Teardown {
-    Reset,
-    Passive,
+struct Teardown {
+    /// The requests the restart sends before the teardown.
+    gates: &'static [&'static str],
+    /// The teardown sends the ECUReset.
+    reset_sent: bool,
+    /// The ECU reset (one more power cycle).
+    ecu_reset: bool,
+    /// The default-session confirmation's first F186 read confirms: the ECU is back in its
+    /// default session when the confirmation starts (after an accepted reset or a passive wait).
+    /// Otherwise the confirmation reads again until it does.
+    first_read_confirms: bool,
 }
 
-/// Checks the restart's requests against [`EXPECTED_RESTART`], without its ECUReset for a
-/// passive teardown. TesterPresent requests are left out and consecutive F186 reads collapsed,
+impl Teardown {
+    /// The gates pass and the ECU accepts the ECUReset.
+    const RESET: Self = Self {
+        gates: GATE_REQUESTS,
+        reset_sent: true,
+        ecu_reset: true,
+        first_read_confirms: true,
+    };
+    /// The RequestTransferExit marker is in the journal: a passive wait, no ECUReset.
+    const PASSIVE: Self = Self {
+        gates: GATE_REQUESTS,
+        reset_sent: false,
+        ecu_reset: false,
+        first_read_confirms: true,
+    };
+}
+
+/// Checks the restart's requests: `teardown.gates`, the ECUReset if the teardown sends one, then
+/// [`REDO_REQUESTS`]. TesterPresent requests are left out and consecutive F186 reads collapsed,
 /// since the confirmation reads until the ECU answers; every other request must be there, once,
-/// in order. The ECUReset is counted on its own too.
+/// in order. The ECUReset and the F186 reads are counted on their own too.
 fn assert_restart_order(trace: &[String], teardown: Teardown) {
     let mut seen: Vec<&str> = Vec::new();
     for line in trace.iter().map(String::as_str) {
@@ -321,17 +362,23 @@ fn assert_restart_order(trace: &[String], teardown: Teardown) {
         }
         seen.push(line);
     }
-    let resets = usize::from(teardown == Teardown::Reset);
+    let confirmation_reads = trace.iter().filter(|line| *line == "uds 22 F186").count();
+    assert_eq!(
+        confirmation_reads == 1,
+        teardown.first_read_confirms,
+        "{confirmation_reads} F186 reads: {trace:#?}"
+    );
+    let resets = usize::from(teardown.reset_sent);
     assert_eq!(
         trace.iter().filter(|line| *line == "uds 11 01").count(),
         resets,
         "{resets} ECUReset: {trace:#?}"
     );
-    let expected: Vec<&str> = EXPECTED_RESTART
-        .iter()
-        .copied()
-        .filter(|line| teardown == Teardown::Reset || *line != "uds 11 01")
-        .collect();
+    let mut expected: Vec<&str> = teardown.gates.to_vec();
+    if teardown.reset_sent {
+        expected.push("uds 11 01");
+    }
+    expected.extend(REDO_REQUESTS);
     assert_eq!(seen, expected, "the restart's requests: {trace:#?}");
 }
 
@@ -392,7 +439,7 @@ fn assert_completed(
             // A verified download is closed: no block is pending and none is counted.
             flash_block: 0,
             received: 0,
-            power_cycles: power_cycles_before + u32::from(teardown == Teardown::Reset),
+            power_cycles: power_cycles_before + u32::from(teardown.ecu_reset),
         }
     );
 }
@@ -427,7 +474,7 @@ fn an_agent_killed_mid_transfer_redoes_it_within_the_session_timer() {
         first_attempt,
         before.power_cycles,
         &[1, 2],
-        Teardown::Reset,
+        Teardown::RESET,
         result,
     );
 }
@@ -472,7 +519,7 @@ fn an_agent_killed_mid_transfer_redoes_it_after_the_session_timer_expired() {
         first_attempt,
         before.power_cycles,
         &[1, 2],
-        Teardown::Reset,
+        Teardown::RESET,
         result,
     );
 }
@@ -558,7 +605,7 @@ fn a_worker_crashed_mid_transfer_is_restarted_like_a_killed_agent() {
         first_attempt,
         before.power_cycles,
         &[1, 2],
-        Teardown::Reset,
+        Teardown::RESET,
         result,
     );
 }
@@ -717,7 +764,7 @@ fn a_kill_before_the_transfer_exit_response_was_recorded_redoes_the_transfer() {
         first_attempt,
         before.power_cycles,
         &[1, 2],
-        Teardown::Passive,
+        Teardown::PASSIVE,
         result,
     );
 }
@@ -753,7 +800,7 @@ fn a_kill_before_the_post_transfer_steps_completed_redoes_the_transfer() {
         first_attempt,
         before.power_cycles,
         &[1, 2],
-        Teardown::Passive,
+        Teardown::PASSIVE,
         result,
     );
 }
@@ -779,7 +826,114 @@ fn a_kill_before_the_integrity_check_response_was_recorded_redoes_the_transfer()
         first_attempt,
         before.power_cycles,
         &[1, 2],
-        Teardown::Passive,
+        Teardown::PASSIVE,
         result,
+    );
+}
+
+/// Kills the agent mid-transfer, hands `fault` (a `sim-vci` control command) to the restart's
+/// worker, restarts, and checks that the job completed after `teardown`. The plan declares the
+/// ECU's session timeout as 3 s, which the passive teardowns wait out, so `ecu_config` keeps it.
+fn redo_after_teardown(tag: &str, ecu_config: &str, fault: Option<&str>, teardown: Teardown) {
+    let spec = spec();
+    let env = Env::new(tag, ENTRY, ecu_config);
+    let first_attempt = kill_mid_transfer(&env, &spec);
+    let before = env.probe();
+    if let Some(command) = fault {
+        env.inject(command);
+    }
+    let result = env.restart(&spec);
+    assert!(env.commands_applied(), "the fault should have been applied");
+    assert_completed(
+        &env,
+        &spec,
+        first_attempt,
+        before.power_cycles,
+        &[1, 2],
+        teardown,
+        result,
+    );
+}
+
+/// The ECU refuses the restart's ECUReset (NRC 22, without effect): the teardown turns passive
+/// (`PassiveCause::ResetRefused`), waits out the session timer, and the job completes.
+#[test]
+#[serial]
+fn a_refused_ecu_reset_makes_the_teardown_passive() {
+    redo_after_teardown(
+        "reset-refused",
+        &ecu_config(3_000),
+        Some(
+            r#"{"command": "inject_fault", "service": 17,
+                "fault": {"negative_response": {"nrc": "conditions_not_correct"}}}"#,
+        ),
+        Teardown {
+            gates: GATE_REQUESTS,
+            reset_sent: true,
+            ecu_reset: false,
+            // The ECU stays in its programming session until the passive wait has run.
+            first_read_confirms: true,
+        },
+    );
+}
+
+/// The ECU resets but the response to the restart's ECUReset is lost: the teardown cannot tell
+/// whether it reset and turns passive (`PassiveCause::ResetOutcomeUnknown`), and the job
+/// completes.
+#[test]
+#[serial]
+fn a_lost_ecu_reset_response_makes_the_teardown_passive() {
+    redo_after_teardown(
+        "reset-unanswered",
+        &ecu_config(3_000),
+        Some(r#"{"command": "inject_fault", "service": 17, "fault": "drop_response"}"#),
+        Teardown {
+            gates: GATE_REQUESTS,
+            reset_sent: true,
+            ecu_reset: true,
+            first_read_confirms: true,
+        },
+    );
+}
+
+/// The ECU acknowledges the restart's ECUReset and then answers nothing for 3 s while it starts
+/// up, longer than the confirmation's startup wait and window (0.1 s and 2 s): the first
+/// confirmation fails, the passive wait runs, the second confirmation succeeds, and the job
+/// completes.
+#[test]
+#[serial]
+fn an_ecu_silent_after_acknowledging_the_reset_is_confirmed_after_the_passive_wait() {
+    redo_after_teardown(
+        "reset-silent",
+        &ecu_config_with_startup(3_000, Some(3_000)),
+        None,
+        Teardown {
+            first_read_confirms: false,
+            ..Teardown::RESET
+        },
+    );
+}
+
+/// The ECU refuses the restart's first VIN read: the vehicle is not identified, so the gate
+/// makes the teardown passive (`PassiveCause::Gate`, `VinNotEstablished`) without the further
+/// gate reads or an ECUReset, and once the ECU is back in its default session the identity
+/// matches and the job completes.
+#[test]
+#[serial]
+fn an_unreadable_vin_makes_the_teardown_passive() {
+    redo_after_teardown(
+        "gate-vin",
+        &ecu_config(3_000),
+        Some(
+            r#"{"command": "inject_fault", "service": 34,
+                "fault": {"negative_response": {"nrc": "conditions_not_correct"}}}"#,
+        ),
+        Teardown {
+            gates: &["vbatt", "uds 22 F190"],
+            reset_sent: false,
+            ecu_reset: false,
+            // As after the refused reset: only the passive wait brings the default session.
+            first_read_confirms: true,
+        },
     );
 }

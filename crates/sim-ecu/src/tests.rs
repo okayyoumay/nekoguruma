@@ -2243,6 +2243,7 @@ fn restore_brings_back_every_field() {
     ecu.image = vec![7; 0x20];
     ecu.silent = true;
     ecu.armed = vec![Fault::DropResponse, Fault::CorruptBlock { block: 5 }];
+    ecu.armed_for_service = vec![(0x11, Fault::DropResponse)];
     ecu.power_cycles = 3;
     let snapshot = ecu.snapshot();
 
@@ -2400,5 +2401,59 @@ fn response_pending_fault_parses_from_json() {
             count: 2,
             interval_ms: 300
         }
+    );
+}
+
+#[test]
+fn a_fault_for_a_service_passes_other_services_by_and_fires_on_that_one() {
+    let mut ecu = ecu();
+    ecu.inject_for_service(0x11, Fault::DropResponse);
+    assert_eq!(
+        ecu.request(&[0x22, 0xF1, 0x86]),
+        pos(&[0x62, 0xF1, 0x86, 0x01])
+    );
+    assert_eq!(ecu.faults_for_service(), [(0x11, Fault::DropResponse)]);
+    // The reset takes effect although its response is lost.
+    let cycles = ecu.power_cycles();
+    assert_eq!(ecu.request(&[0x11, 0x01]), SimResponse::NoResponse);
+    assert_eq!(ecu.power_cycles(), cycles + 1);
+    assert!(ecu.faults_for_service().is_empty());
+    assert!(ecu.armed_faults().is_empty());
+}
+
+#[test]
+fn faults_for_the_same_service_all_fire_on_its_request() {
+    let mut ecu = ecu();
+    ecu.inject_for_service(
+        0x11,
+        Fault::NegativeResponse {
+            nrc: Nrc::ConditionsNotCorrect,
+        },
+    );
+    ecu.inject_for_service(0x11, Fault::DelayResponse { ms: 7 });
+    ecu.request(&[0x22, 0xF1, 0x86]);
+    // The reset is refused, without effect, and late.
+    let cycles = ecu.power_cycles();
+    let exchange = ecu.exchange(Addressing::Physical, &[0x11, 0x01]);
+    assert_eq!(exchange.response, neg(0x11, Nrc::ConditionsNotCorrect));
+    assert_eq!(exchange.delay_ms, 7);
+    assert_eq!(ecu.power_cycles(), cycles);
+    assert!(ecu.armed_faults().is_empty());
+}
+
+#[test]
+fn a_power_loss_for_a_service_takes_the_ecu_off_when_that_request_arrives() {
+    let mut ecu = ecu();
+    ecu.inject_for_service(0x11, Fault::PowerLoss);
+    assert_eq!(
+        ecu.request(&[0x22, 0xF1, 0x86]),
+        pos(&[0x62, 0xF1, 0x86, 0x01])
+    );
+    assert_eq!(ecu.request(&[0x11, 0x01]), SimResponse::NoResponse);
+    assert_eq!(ecu.request(&[0x22, 0xF1, 0x86]), SimResponse::NoResponse);
+    ecu.reconnect();
+    assert_eq!(
+        ecu.request(&[0x22, 0xF1, 0x86]),
+        pos(&[0x62, 0xF1, 0x86, 0x01])
     );
 }

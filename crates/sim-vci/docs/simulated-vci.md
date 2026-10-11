@@ -212,9 +212,10 @@ A VCI crash, as opposed to a disconnect, is not simulated.
 
 `NGR_SIM_VCI_TRACE` names a file, read once when the library is first called and only in debug
 builds, so a test can check the order of the requests a worker process sent. `sim-vci` appends
-one line per UDS request sent to the simulated ECU, and one `vbatt` line per `READ_VBATT`. A request
-is traced when it is sent, so one the ECU then drops (silent, still starting after a reset, or a
-`Fault::BusError`) is listed too.
+one line per UDS request the worker sends towards the simulated ECU, and one `vbatt` line per
+`READ_VBATT`. A request is traced when it is sent, before the ECU sees it, so a line records a send
+attempt, not receipt: a request lost on the bus (`Fault::BusError`) or ignored by an ECU that is
+silent or still starting after a reset is listed too.
 A request line is `uds`, the service ID, and what identifies the request, all in hex: the DIDs of
 a 0x22 read (`uds 22 F190 F187`), the DID of a 0x2E write, the sub-function of 0x10, 0x11 and
 0x3E (`uds 11 01`), sub-function and routine ID of 0x31 (`uds 31 01 FF00`), and the block counter

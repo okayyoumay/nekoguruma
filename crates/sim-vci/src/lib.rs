@@ -729,9 +729,9 @@ fn reset(config: EcuConfig) {
 pub const CONTROL_DIR_ENV: &str = "NGR_SIM_VCI_CONTROL_DIR";
 
 /// Environment variable naming a file `sim-vci` appends a request trace to, for a test that
-/// checks the order of the requests a worker sent: one line per UDS request sent to the
-/// simulated ECU, including one it then drops (see `trace_line`), and a `vbatt` line per
-/// `READ_VBATT`. Read once, on the first
+/// checks the order of the requests a worker sent: one line per UDS request sent towards the
+/// simulated ECU (a send attempt, traced before the ECU sees it, so a request lost on the bus or
+/// ignored is listed too; see `trace_line`), and a `vbatt` line per `READ_VBATT`. Read once, on the first
 /// call into the library, and only in debug builds. The file is created if missing and never
 /// truncated by the library.
 pub const TRACE_ENV: &str = "NGR_SIM_VCI_TRACE";

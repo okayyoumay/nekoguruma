@@ -271,10 +271,17 @@ pub async fn run_program_journaled(
 ///   `restart::check_before_erase` checks every declared precondition once more through its
 ///   programming-session source (step 4b-3): one that does not hold ends the job in
 ///   [`JobError::OnSiteInterventionRequired`] (`PreconditionNotMetBeforeErase`) with no erase
-///   sent. The rest of the restart order (the erase, step 4c, and the read-back verification)
-///   does not run in this agent, so a job that passed ends in [`JobError::OnSiteInterventionRequired`] (`RestartOrderUnavailable`,
+///   sent. The rest of the restart order (the erase, step 4c) does not run in this agent, so a
+///   job that passed ends in [`JobError::OnSiteInterventionRequired`] (`RestartOrderUnavailable`,
 ///   carrying the teardown's outcome, the confirmation and the state check), or in
-///   [`JobError::IdentityMismatch`] when the ECU's VIN is another vehicle's;
+///   [`JobError::IdentityMismatch`] when the ECU's VIN is another vehicle's. When the state
+///   check decides the read-back verification instead, the match is the verification
+///   (ADR-271): the program goes on from the VM state journaled at the plan's end and runs to
+///   its end as a first run would, with no erase and no ECUReset for the verified plan, and the
+///   job ends as that run does. A program whose continuation could send a request again
+///   unsafely (`restart::unsafe_continuation`) ends in [`JobError::OnSiteInterventionRequired`]
+///   (`UnsafeContinuation`), and a journal with no usable end state in the same error
+///   (`MissingPlanEndState`), both with nothing sent after the verification;
 /// - a journal that rules a restart out, or a missing or unreadable one for a program with a
 ///   plan, ends the job in on-site intervention with nothing sent.
 ///
@@ -565,6 +572,8 @@ impl Drop for CancelOnDrop {
 /// run, after a run start that carries the entry state, and stopped before the erase (step 4b-2,
 /// ADR-273, ADR-274); then `restart::check_before_erase`
 /// reads the declared preconditions through their programming-session sources (step 4b-3).
+/// On a read-back verification the program goes on after the plan instead
+/// ([`continue_after_plan`], ADR-271 items 3 to 5).
 /// `vin` is the job's target VIN and `intended_software_version` the software version it
 /// intends to write. Once the ECU's VIN
 /// matched it, the gates promote `guards` to the per-vehicle lock (ADR-263; see
@@ -667,37 +676,42 @@ where
             let state = restart::check_state(
                 program, &point, plan, &teardown, &sources, host, poll, cancelled,
             )?;
-            if state == restart::StateCheck::RedoTransfer {
-                restart::check_reentry(program, &point, &teardown, &sources, host, cancelled)?;
-                // Step 4b-2 (ADR-273): the plan's steps from the entry to the erase, without
-                // the erase. A run start carrying the entry state is committed first (ADR-274),
-                // so the entry state stays the one the journal finds behind a later end state.
-                let mut replay = JobJournal::new(journal, sources.clone());
-                replay.run_start(&point.entry_state)?;
-                let vm = Vm::resume(point.entry_state.clone());
-                match run_vm(
-                    program,
-                    host,
-                    limits,
-                    cancelled,
-                    Some(&mut replay),
-                    vm,
-                    Some(plan.boundaries.erase_pc),
-                )? {
-                    RunEnd::Stopped => {
-                        // Step 4b-3 (ADR-229 item 2 step 4, ADR-245 item 6): the replayed steps
-                        // normally put the ECU in its programming session, so the mutable
-                        // conditions are read through their programming-session sources, right
-                        // before the erase.
-                        restart::check_before_erase(
-                            program, &point, &teardown, &sources, host, cancelled,
-                        )?;
-                    }
-                    RunEnd::Finished(_) => {
-                        return Err(JobError::Journal(JournalError::Invariant(
-                            "the replay ended before it reached the erase",
-                        )));
-                    }
+            if state == restart::StateCheck::ReadBackVerification {
+                // The match is the verification (ADR-271 item 1): the program goes on after the
+                // plan, with no erase and no reset for the verified plan.
+                return continue_after_plan(
+                    program, host, limits, cancelled, journal, sources, plan, teardown, confirmed,
+                );
+            }
+            restart::check_reentry(program, &point, &teardown, &sources, host, cancelled)?;
+            // Step 4b-2 (ADR-273): the plan's steps from the entry to the erase, without
+            // the erase. A run start carrying the entry state is committed first (ADR-274),
+            // so the entry state stays the one the journal finds behind a later end state.
+            let mut replay = JobJournal::new(journal, sources.clone());
+            replay.run_start(&point.entry_state)?;
+            let vm = Vm::resume(point.entry_state.clone());
+            match run_vm(
+                program,
+                host,
+                limits,
+                cancelled,
+                Some(&mut replay),
+                vm,
+                Some(plan.boundaries.erase_pc),
+            )? {
+                RunEnd::Stopped => {
+                    // Step 4b-3 (ADR-229 item 2 step 4, ADR-245 item 6): the replayed steps
+                    // normally put the ECU in its programming session, so the mutable
+                    // conditions are read through their programming-session sources, right
+                    // before the erase.
+                    restart::check_before_erase(
+                        program, &point, &teardown, &sources, host, cancelled,
+                    )?;
+                }
+                RunEnd::Finished(_) => {
+                    return Err(JobError::Journal(JournalError::Invariant(
+                        "the replay ended before it reached the erase",
+                    )));
                 }
             }
             Err(JobError::OnSiteInterventionRequired(
@@ -709,6 +723,80 @@ where
                 },
             ))
         }
+    }
+}
+
+/// The program after a read-back verification passed (ADR-271 items 3 to 5): it runs from the
+/// VM state journaled at `plan`'s end (`restart::plan_end_state`) to the program's end, as a
+/// first run would and with its journaling, so a later plan or a final reset runs as on a first
+/// run. It commits no run start (ADR-274 item 4): a run start that is not at the entry would
+/// leave a later redo of this plan without its entry state. A cancel that arrived before ends
+/// the job in [`JobError::Cancelled`]. Then, before anything is sent, a program whose
+/// continuation could send a request again unsafely (`restart::unsafe_continuation`) ends in
+/// [`OnSiteReason::UnsafeContinuation`], and a journal with no usable state at the plan's end in
+/// [`OnSiteReason::MissingPlanEndState`]; both say the image is verified. The latter also covers
+/// a redo whose replay committed only its run start before a crash: the earlier pass is still
+/// the completed one, but the run start made its end state stale, and the job is not resumed
+/// from a state older than the journal's newest.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the restart's state so far, split only by what the caller owns"
+)]
+fn continue_after_plan<H, S>(
+    program: &Program,
+    host: &mut H,
+    limits: JobLimits,
+    cancelled: &AtomicBool,
+    journal: Journal<S>,
+    sources: crate::inputs::ServiceSources,
+    plan: &diag_ir::FlashRecovery,
+    teardown: restart::Teardown,
+    confirmed: restart::Confirmation,
+) -> Result<VmState, JobError>
+where
+    H: DiagHost<Error = HostError> + RuntimeInputs + TransferProgress,
+    S: Store,
+{
+    // As at the start of every restart step: a cancel ends the job before the next verdict.
+    if cancelled.load(Ordering::Relaxed) {
+        return Err(JobError::Cancelled);
+    }
+    let flash_session = plan.flash_session;
+    if let Some(pc) = restart::unsafe_continuation(program, plan) {
+        return Err(JobError::OnSiteInterventionRequired(
+            OnSiteReason::UnsafeContinuation {
+                flash_session,
+                pc,
+                teardown,
+                confirmed,
+            },
+        ));
+    }
+    let missing = |why: String, teardown, confirmed| {
+        tracing::warn!(flash_session, %why, "no VM state to go on from at the plan's end");
+        JobError::OnSiteInterventionRequired(OnSiteReason::MissingPlanEndState {
+            flash_session,
+            teardown,
+            confirmed,
+        })
+    };
+    let mut end_state = match restart::plan_end_state(program, journal.state(), plan) {
+        Ok(end_state) => end_state,
+        Err(error) => return Err(missing(format!("{error:?}"), teardown, confirmed)),
+    };
+    // The continuation's records come after the journal's last one, as a restart's do.
+    end_state.steps = restart::next_steps(journal.state());
+    let vm = Vm::resume(end_state);
+    if let Err(error) = vm.check_state(program) {
+        return Err(missing(error.to_string(), teardown, confirmed));
+    }
+    let mut tail = JobJournal::new(journal, sources);
+    match run_vm(program, host, limits, cancelled, Some(&mut tail), vm, None)? {
+        RunEnd::Finished(state) => Ok(state),
+        // No stop point was given.
+        RunEnd::Stopped => Err(JobError::Journal(JournalError::Invariant(
+            "the continuation stopped without a stop point",
+        ))),
     }
 }
 
@@ -3341,14 +3429,27 @@ mod tests {
         restart::Teardown::Passive(restart::PassiveCause::Gate(reason))
     }
 
-    /// The teardown a restart ended in. Fails the test on any other result.
+    /// The teardown a restart ended in, also after a read-back verification that could not go on
+    /// after the plan. Fails the test on any other result.
     fn teardown_of(result: &Result<VmState, JobError>) -> restart::Teardown {
         match result {
-            Err(JobError::OnSiteInterventionRequired(OnSiteReason::RestartOrderUnavailable {
-                flash_session: 1,
-                teardown,
-                ..
-            })) => teardown.clone(),
+            Err(JobError::OnSiteInterventionRequired(
+                OnSiteReason::RestartOrderUnavailable {
+                    flash_session: 1,
+                    teardown,
+                    ..
+                }
+                | OnSiteReason::UnsafeContinuation {
+                    flash_session: 1,
+                    teardown,
+                    ..
+                }
+                | OnSiteReason::MissingPlanEndState {
+                    flash_session: 1,
+                    teardown,
+                    ..
+                },
+            )) => teardown.clone(),
             other => panic!("{other:?}"),
         }
     }
@@ -4100,12 +4201,26 @@ mod tests {
         result: &Result<VmState, JobError>,
     ) -> (restart::Teardown, restart::Confirmation) {
         match result {
-            Err(JobError::OnSiteInterventionRequired(OnSiteReason::RestartOrderUnavailable {
-                flash_session: 1,
-                teardown,
-                confirmed,
-                ..
-            })) => (teardown.clone(), *confirmed),
+            Err(JobError::OnSiteInterventionRequired(
+                OnSiteReason::RestartOrderUnavailable {
+                    flash_session: 1,
+                    teardown,
+                    confirmed,
+                    ..
+                }
+                | OnSiteReason::UnsafeContinuation {
+                    flash_session: 1,
+                    teardown,
+                    confirmed,
+                    ..
+                }
+                | OnSiteReason::MissingPlanEndState {
+                    flash_session: 1,
+                    teardown,
+                    confirmed,
+                    ..
+                },
+            )) => (teardown.clone(), *confirmed),
             other => panic!("{other:?}"),
         }
     }
@@ -5434,7 +5549,9 @@ mod tests {
         host.lose_routine = Some(0xFF02);
     }
 
-    /// The state check a restart ended in. Fails the test on any other result.
+    /// The state check a restart ended in. A restart that passed the read-back verification but
+    /// could not go on after the plan counts as `ReadBackVerification`. Fails the test on any
+    /// other result.
     fn state_of(result: &Result<VmState, JobError>) -> restart::StateCheck {
         match result {
             Err(JobError::OnSiteInterventionRequired(OnSiteReason::RestartOrderUnavailable {
@@ -5442,6 +5559,14 @@ mod tests {
                 state,
                 ..
             })) => *state,
+            Err(JobError::OnSiteInterventionRequired(
+                OnSiteReason::UnsafeContinuation {
+                    flash_session: 1, ..
+                }
+                | OnSiteReason::MissingPlanEndState {
+                    flash_session: 1, ..
+                },
+            )) => restart::StateCheck::ReadBackVerification,
             other => panic!("{other:?}"),
         }
     }
@@ -6181,6 +6306,752 @@ mod tests {
         assert_eq!(state_of(&result), restart::StateCheck::RedoTransfer);
     }
 
+    /// `program` with one `Safe` section before its plan's entry and one from its plan's end to
+    /// the end of the code, so the continuation after a verified restart may run (ADR-271
+    /// item 4).
+    fn safe_outside_the_plan(mut program: Program) -> Program {
+        let boundaries = &program.flash[0].boundaries;
+        let section = |start_pc, end_pc| diag_ir::Section {
+            start_pc,
+            end_pc,
+            interruptible: diag_ir::Interruptible::Yes,
+            idempotency: diag_ir::Idempotency::Safe,
+            expected_millis: 0,
+        };
+        let sections = [
+            section(0, boundaries.entry_pc),
+            section(boundaries.post_transfer_end_pc, program.code.len() as u32),
+        ];
+        program.sections.extend(sections);
+        program.validate().expect("the fixture is a valid program");
+        program
+    }
+
+    /// What a restart on the completed path sends up to and including the read-back
+    /// verification: the gates' reads, the default-session confirmation, step 3a's reads and the
+    /// software version.
+    fn verification_reads() -> [Sent; 6] {
+        [
+            read_vin(),
+            read_hardware(),
+            read_of([0xF1, 0x86]),
+            read_vin(),
+            read_hardware(),
+            read_version(),
+        ]
+    }
+
+    /// A first run of `program` for a job that intends SW02, in `dir`, whose host `prepare` sets
+    /// up. The run must fail with a host error.
+    fn first_run_intending(
+        program: &Program,
+        dir: &std::path::Path,
+        prepare: impl FnOnce(&mut FlashHost),
+    ) {
+        let mut setup = file_setup(dir);
+        setup.intended_software_version = Some(b"SW02".to_vec());
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        prepare(&mut host);
+        let mut journal = JobJournal::create(setup).unwrap();
+        let result = run_on(
+            program,
+            &mut host,
+            JobLimits::default(),
+            &AtomicBool::new(false),
+            Some(&mut journal),
+        );
+        assert!(matches!(result, Err(JobError::Host { .. })), "{result:?}");
+    }
+
+    /// A restart of the job of [`first_run_intending`] in `dir`, on a host `prepare` sets up.
+    fn restart_intending(
+        program: &Program,
+        dir: &std::path::Path,
+        prepare: impl FnOnce(&mut FlashHost),
+    ) -> (Result<VmState, JobError>, FlashHost) {
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        prepare(&mut host);
+        let result = resume_naming(
+            program,
+            dir,
+            &mut host,
+            false,
+            Some(TARGET_VIN),
+            Some(b"SW02"),
+            &dir_slot(dir),
+        );
+        (result, host)
+    }
+
+    /// The done-when case: the post-transfer steps are journaled complete, the ECU reports the
+    /// intended version, and every primitive outside the plan is `Safe`: the restart goes on
+    /// from the plan's end, runs the routine after the plan again and completes, with no erase
+    /// and no ECUReset sent by the restart or the program after the plan. The continuation
+    /// commits no run start (ADR-274 item 4), and with no plan after it, nothing at all.
+    #[test]
+    fn a_verified_restart_goes_on_after_the_plan_and_completes() {
+        let program = safe_outside_the_plan(completed_path_program());
+        let dir = journal_dir("continue-after-plan");
+        first_run_intending(&program, &dir, lose_after_plan);
+        let before = Journal::read(&dir, &job_key()).unwrap();
+        let (result, host) = restart_intending(&program, &dir, |host| {
+            host.software_version = Some(b"SW02".to_vec());
+        });
+        let state = result.expect("the continuation completes the job");
+        assert_eq!(state.pc as usize, program.code.len());
+        let mut expected = verification_reads().to_vec();
+        expected.push(Sent::Routine(0xFF02));
+        assert_eq!(full_log(&host), expected);
+        let after = Journal::read(&dir, &job_key()).unwrap();
+        // The resume record, and no run start or step.
+        assert_eq!(after.records, before.records + 1);
+        assert_eq!(after.last_vm_state, before.last_vm_state);
+        assert_eq!(after.facts.last_step, before.facts.last_step);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A step after the plan that fails ends the continuation as it would end a first run, and
+    /// nothing after it is sent.
+    #[test]
+    fn a_failed_step_after_the_plan_ends_the_continuation_as_on_a_first_run() {
+        let mut program = completed_path_program();
+        let tail_routine = program.code.len() as u32 + 1;
+        program.code.extend([
+            Op::PushBytes(0),
+            Op::RoutineControl {
+                routine: 0xFF03,
+                sub: 1,
+            },
+            Op::Pop,
+        ]);
+        let program = safe_outside_the_plan(program);
+        let dir = journal_dir("continue-fails");
+        first_run_intending(&program, &dir, lose_after_plan);
+        let (result, host) = restart_intending(&program, &dir, |host| {
+            host.software_version = Some(b"SW02".to_vec());
+            host.lose_routine = Some(0xFF03);
+        });
+        assert!(
+            matches!(result, Err(JobError::Host { pc, .. }) if pc == tail_routine),
+            "{result:?}"
+        );
+        let mut expected = verification_reads().to_vec();
+        expected.extend([Sent::Routine(0xFF02), Sent::Routine(0xFF03)]);
+        assert_eq!(full_log(&host), expected);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A primitive outside the plan in no section, or in one that is not `Safe`, ends a verified
+    /// restart in `UnsafeContinuation` naming the first such primitive, with nothing sent after
+    /// the verification. The session change before the plan comes first; with the code before the
+    /// plan `Safe`, the routine after the plan in a `CheckState` section is the one named.
+    #[test]
+    fn a_primitive_outside_the_plan_that_is_not_safe_stops_after_the_verification() {
+        let unsafe_reason = |pc| OnSiteReason::UnsafeContinuation {
+            flash_session: 1,
+            pc,
+            teardown: restart::Teardown::CompletedPath,
+            confirmed: restart::Confirmation {
+                after_passive_retry: false,
+            },
+        };
+        let no_sections = completed_path_program();
+        let mut check_state_tail = safe_outside_the_plan(completed_path_program());
+        check_state_tail.sections[1].idempotency = diag_ir::Idempotency::CheckState;
+        let routine_after_plan = check_state_tail.flash[0].boundaries.post_transfer_end_pc + 1;
+        for (name, program, pc) in [
+            ("no sections", no_sections, 1),
+            ("CheckState tail", check_state_tail, routine_after_plan),
+        ] {
+            let dir = journal_dir("continue-unsafe");
+            first_run_intending(&program, &dir, lose_after_plan);
+            let (result, host) = restart_intending(&program, &dir, |host| {
+                host.software_version = Some(b"SW02".to_vec());
+            });
+            assert_eq!(reason_of(&result), &unsafe_reason(pc), "{name}");
+            assert_eq!(full_log(&host), verification_reads(), "{name}");
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    /// [`completed_path_program`] with `extra` after its routine, `Safe` outside the plan.
+    fn safe_tail_program(extra: impl IntoIterator<Item = Op>) -> Program {
+        let mut program = completed_path_program();
+        program.code.extend(extra);
+        safe_outside_the_plan(program)
+    }
+
+    /// A cancel during the program after the plan ends the job in `Cancelled` before the next
+    /// request (ADR-271 item 3).
+    #[test]
+    fn a_cancel_during_the_continuation_ends_the_job_cancelled() {
+        let program = safe_tail_program([
+            Op::PushBytes(0),
+            Op::ServiceRequest { service: 0x3E },
+            Op::Pop,
+            Op::PushBytes(0),
+            Op::RoutineControl {
+                routine: 0xFF03,
+                sub: 1,
+            },
+            Op::Pop,
+        ]);
+        let dir = journal_dir("continue-cancel");
+        first_run_intending(&program, &dir, lose_after_plan);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        host.software_version = Some(b"SW02".to_vec());
+        host.cancel_on_service = Some((0x3E, Arc::clone(&cancelled)));
+        let result = resume_on(
+            &program,
+            &mut host,
+            JobLimits::default(),
+            &cancelled,
+            Journal::open(&dir, &job_key()),
+            identity_sources(),
+            Some(&target()),
+            Some(b"SW02"),
+            &dir_slot(&dir),
+        );
+        assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
+        let mut expected = verification_reads().to_vec();
+        expected.extend([Sent::Routine(0xFF02), Sent::Service(0x3E, vec![0x01])]);
+        assert_eq!(full_log(&host), expected);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The step limit counts the continuation's steps after the journal's last record: a limit
+    /// reached in the program after the plan ends the job in `StepLimit`, and the request at it
+    /// is not sent.
+    #[test]
+    fn the_step_limit_applies_to_the_continuation() {
+        let program = safe_outside_the_plan(completed_path_program());
+        let dir = journal_dir("continue-step-limit");
+        first_run_intending(&program, &dir, lose_after_plan);
+        let next = restart::next_steps(&Journal::read(&dir, &job_key()).unwrap());
+        // The push at the plan's end runs; the routine after it would be one step too many.
+        let limits = JobLimits {
+            max_steps: next + 1,
+            ..JobLimits::default()
+        };
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        host.software_version = Some(b"SW02".to_vec());
+        let result = resume_on(
+            &program,
+            &mut host,
+            limits,
+            &AtomicBool::new(false),
+            Journal::open(&dir, &job_key()),
+            identity_sources(),
+            Some(&target()),
+            Some(b"SW02"),
+            &dir_slot(&dir),
+        );
+        assert!(
+            matches!(result, Err(JobError::StepLimit(steps)) if steps == next + 1),
+            "{result:?}"
+        );
+        assert_eq!(full_log(&host), verification_reads());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A crash in the program after the plan restarts again from the same plan-end state: the
+    /// continuation journaled nothing, so the next restart reads back and goes on again, and the
+    /// whole program after the plan is sent once more. With one resume allowed, the second
+    /// restart ends at the resume limit instead.
+    #[test]
+    fn a_crash_after_the_plan_continues_again_from_the_same_end_state() {
+        let tail = [
+            Op::PushBytes(0),
+            Op::RoutineControl {
+                routine: 0xFF03,
+                sub: 1,
+            },
+            Op::Pop,
+        ];
+        for max_resumes in [1, 2] {
+            let mut program = completed_path_program();
+            program.flash[0].max_resumes = max_resumes;
+            program.code.extend(tail.clone());
+            let program = safe_outside_the_plan(program);
+            let dir = journal_dir("continue-twice");
+            first_run_intending(&program, &dir, lose_after_plan);
+            let (result, _) = restart_intending(&program, &dir, |host| {
+                host.software_version = Some(b"SW02".to_vec());
+                host.lose_routine = Some(0xFF03);
+            });
+            assert!(matches!(result, Err(JobError::Host { .. })), "{result:?}");
+            let (result, host) = restart_intending(&program, &dir, |host| {
+                host.software_version = Some(b"SW02".to_vec());
+            });
+            if max_resumes == 1 {
+                assert!(
+                    matches!(
+                        result,
+                        Err(JobError::OnSiteInterventionRequired(
+                            OnSiteReason::ResumeLimitReached { .. }
+                        ))
+                    ),
+                    "{result:?}"
+                );
+            } else {
+                assert!(result.is_ok(), "{result:?}");
+                let mut expected = verification_reads().to_vec();
+                expected.extend([Sent::Routine(0xFF02), Sent::Routine(0xFF03)]);
+                assert_eq!(full_log(&host), expected);
+            }
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    /// Appends a plan to `program` (`session`, stage `session + 6`) whose pre-erase range holds a
+    /// push, a setup routine `routine` and a pop, so the routine is at its entry plus one and its
+    /// erase at its entry plus three. It begins right after the code so far. With `from`, it
+    /// becomes recovery-required that many instructions after its entry, so it allows no restart
+    /// for `from <= 3`; without, it allows one. Gives the new plan's entry.
+    fn append_plan_with_setup(
+        program: &mut Program,
+        session: u32,
+        routine: u16,
+        from: Option<u32>,
+    ) -> u32 {
+        let source = flash_program_around(
+            Vec::new(),
+            vec![
+                Op::PushBytes(0),
+                Op::RoutineControl { routine, sub: 1 },
+                Op::Pop,
+            ],
+        );
+        let shift = program.code.len() as u32 - ENTRY;
+        program
+            .code
+            .extend(source.code[ENTRY as usize..].iter().cloned());
+        let mut plan = source.flash[0].clone();
+        plan.flash_session = session;
+        plan.stage = session + 6;
+        let b = &mut plan.boundaries;
+        b.entry_pc += shift;
+        b.erase_pc += shift;
+        b.transfer_exit_pc += shift;
+        b.post_transfer_end_pc += shift;
+        let entry = b.entry_pc;
+        if let Some(from) = from {
+            plan.recovery_required = diag_ir::RecoveryRequired::FromPc(entry + from);
+        }
+        program.flash.push(plan);
+        entry
+    }
+
+    fn section_over(
+        start_pc: u32,
+        end_pc: u32,
+        idempotency: diag_ir::Idempotency,
+    ) -> diag_ir::Section {
+        diag_ir::Section {
+            start_pc,
+            end_pc,
+            interruptible: diag_ir::Interruptible::Yes,
+            idempotency,
+            expected_millis: 0,
+        }
+    }
+
+    /// The pc of the setup routine of the second plan in [`adjacent_with_setup`].
+    fn adjacent_setup_routine(program: &Program) -> u32 {
+        program.flash[1].boundaries.entry_pc + 1
+    }
+
+    /// [`flash_program`] followed by a plan from [`append_plan_with_setup`] (session 2, routine
+    /// 0xFF05, recovery-required at `from`), which begins at the first plan's end unless `gap`
+    /// puts a push and a pop between them; `section` covers its setup routine. The code before
+    /// the first plan, and any gap, is `Safe`.
+    fn adjacent_with_setup(
+        from: Option<u32>,
+        gap: bool,
+        section: Option<diag_ir::Idempotency>,
+    ) -> Program {
+        let mut program = flash_program();
+        if gap {
+            program.code.extend([Op::PushBytes(0), Op::Pop]);
+        }
+        let entry = append_plan_with_setup(&mut program, 2, 0xFF05, from);
+        let first_entry = program.flash[0].boundaries.entry_pc;
+        program
+            .sections
+            .push(section_over(0, first_entry, diag_ir::Idempotency::Safe));
+        if let Some(idempotency) = section {
+            program
+                .sections
+                .push(section_over(entry + 1, entry + 2, idempotency));
+        }
+        program.validate().expect("the fixture is a valid program");
+        program
+    }
+
+    /// The window of the plan that begins at the verified plan's end. For a plan that allows no
+    /// restart, it is checked like the code outside the plans: a `CheckState` section, or none,
+    /// refuses as an `Unsafe` one does. For a plan that allows one, only an `Unsafe` section would
+    /// (the replay of ADR-273 item 5), which `Program::validate` already refuses. With a gap
+    /// between the plans the later plan's own journaling guards it.
+    #[test]
+    fn the_next_plans_window_is_checked_by_whether_it_allows_a_restart() {
+        use diag_ir::Idempotency::{CheckState, Safe, Unsafe};
+        for (name, program, refused) in [
+            (
+                "no restart, Unsafe",
+                adjacent_with_setup(Some(3), false, Some(Unsafe)),
+                true,
+            ),
+            (
+                "no restart, CheckState",
+                adjacent_with_setup(Some(3), false, Some(CheckState)),
+                true,
+            ),
+            (
+                "no restart, no section",
+                adjacent_with_setup(Some(3), false, None),
+                true,
+            ),
+            (
+                "no restart, Safe",
+                adjacent_with_setup(Some(3), false, Some(Safe)),
+                false,
+            ),
+            (
+                "restart, CheckState",
+                adjacent_with_setup(None, false, Some(CheckState)),
+                false,
+            ),
+            (
+                "restart, no section",
+                adjacent_with_setup(None, false, None),
+                false,
+            ),
+            (
+                "not adjacent",
+                adjacent_with_setup(Some(3), true, Some(Unsafe)),
+                false,
+            ),
+        ] {
+            let expected = refused.then(|| adjacent_setup_routine(&program));
+            assert_eq!(
+                restart::unsafe_continuation(&program, &program.flash[0]),
+                expected,
+                "{name}"
+            );
+        }
+    }
+
+    /// The window ends at the next plan's recovery-required point when that comes before its
+    /// erase, since an intent is journaled before each request from there on; and at its erase
+    /// otherwise, so the erase itself, in no section, is not looked at.
+    #[test]
+    fn the_next_plans_window_ends_at_its_recovery_point_or_its_erase() {
+        // Recovery-required at the setup routine: the routine is protected by its intent.
+        let at_routine = adjacent_with_setup(Some(1), false, None);
+        assert_eq!(
+            restart::unsafe_continuation(&at_routine, &at_routine.flash[0]),
+            None
+        );
+        // Recovery-required at the erase, the routine `Safe`: the unsectioned erase is outside
+        // the window.
+        let safe_routine = adjacent_with_setup(Some(3), false, Some(diag_ir::Idempotency::Safe));
+        let erase = safe_routine.flash[1].boundaries.erase_pc;
+        assert!(safe_routine.code[erase as usize].is_diagnostic_primitive());
+        assert_eq!(
+            restart::unsafe_continuation(&safe_routine, &safe_routine.flash[0]),
+            None
+        );
+    }
+
+    /// Only the plan that begins at the verified plan's end is looked at: in a chain of three, a
+    /// third plan allowing no restart with an unsectioned setup routine refuses the second plan's
+    /// continuation, not the first's, since the second plan's erase journals its transfer before
+    /// execution can reach the third.
+    #[test]
+    fn only_the_plan_at_the_verified_plans_end_is_looked_at() {
+        let mut program = flash_program();
+        append_plan_with_setup(&mut program, 2, 0xFF05, None);
+        let third = append_plan_with_setup(&mut program, 3, 0xFF06, Some(3));
+        let first_entry = program.flash[0].boundaries.entry_pc;
+        program
+            .sections
+            .push(section_over(0, first_entry, diag_ir::Idempotency::Safe));
+        program.validate().expect("the fixture is a valid program");
+        assert_eq!(
+            restart::unsafe_continuation(&program, &program.flash[0]),
+            None
+        );
+        assert_eq!(
+            restart::unsafe_continuation(&program, &program.flash[1]),
+            Some(third + 1)
+        );
+    }
+
+    /// A primitive outside the plans in a `Safe` section marked `RecoveryRequired` refuses the
+    /// continuation: the journal cannot rule out that the interruption was there. Another
+    /// interruptibility does not, and a `RecoveryRequired` section over a plan's post-transfer
+    /// steps (from its recovery-required point) is not looked at.
+    #[test]
+    fn a_recovery_required_section_outside_the_plans_refuses_the_continuation() {
+        let program = safe_outside_the_plan(completed_path_program());
+        let routine = program.flash[0].boundaries.post_transfer_end_pc + 1;
+        let with = |interruptible| {
+            let mut program = program.clone();
+            program.sections.push(diag_ir::Section {
+                interruptible,
+                ..section_over(routine, routine + 1, diag_ir::Idempotency::Safe)
+            });
+            program
+        };
+        let refused = with(diag_ir::Interruptible::RecoveryRequired);
+        assert_eq!(
+            restart::unsafe_continuation(&refused, &refused.flash[0]),
+            Some(routine)
+        );
+        let allowed = with(diag_ir::Interruptible::No);
+        assert_eq!(
+            restart::unsafe_continuation(&allowed, &allowed.flash[0]),
+            None
+        );
+        let (mut inside, check) = program_with_check(diag_ir::RecoveryRequired::FromPc(EXIT + 3));
+        let b = inside.flash[0].boundaries;
+        inside
+            .sections
+            .push(section_over(0, b.entry_pc, diag_ir::Idempotency::Safe));
+        inside.sections.push(diag_ir::Section {
+            interruptible: diag_ir::Interruptible::RecoveryRequired,
+            ..section_over(check, b.post_transfer_end_pc, diag_ir::Idempotency::Safe)
+        });
+        inside.validate().expect("a valid program");
+        assert_eq!(
+            restart::unsafe_continuation(&inside, &inside.flash[0]),
+            None
+        );
+    }
+
+    /// End to end: a first run that loses the answer to the next plan's setup routine, before
+    /// any step of that plan is journaled, then a restart that reads back the first plan. When the
+    /// next plan allows no restart, a `CheckState` setup routine (a write whose answer was lost)
+    /// is refused with nothing sent after the verification. When it allows one, the unsectioned
+    /// routine is sent again and the next plan runs to its end, journaled as a first run.
+    #[test]
+    fn a_crash_before_the_next_plans_first_step_continues_only_when_safe_to_repeat() {
+        let refused = adjacent_with_setup(Some(3), false, Some(diag_ir::Idempotency::CheckState));
+        let dir = journal_dir("continue-adjacent-unsafe");
+        first_run_intending(&refused, &dir, |host| host.lose_routine = Some(0xFF05));
+        let (result, host) = restart_intending(&refused, &dir, |host| {
+            host.software_version = Some(b"SW02".to_vec());
+        });
+        assert_eq!(
+            reason_of(&result),
+            &OnSiteReason::UnsafeContinuation {
+                flash_session: 1,
+                pc: adjacent_setup_routine(&refused),
+                teardown: restart::Teardown::CompletedPath,
+                confirmed: restart::Confirmation {
+                    after_passive_retry: false,
+                },
+            }
+        );
+        assert_eq!(full_log(&host), verification_reads());
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        let replayed = adjacent_with_setup(None, false, None);
+        let dir = journal_dir("continue-adjacent-safe");
+        first_run_intending(&replayed, &dir, |host| host.lose_routine = Some(0xFF05));
+        let (result, host) = restart_intending(&replayed, &dir, |host| {
+            host.software_version = Some(b"SW02".to_vec());
+        });
+        assert!(result.is_ok(), "{result:?}");
+        let log = full_log(&host);
+        assert_eq!(log[..6], verification_reads());
+        assert_eq!(log[6], Sent::Routine(0xFF05));
+        assert!(log.contains(&Sent::Routine(0xFF00)), "{log:?}");
+        let journal = Journal::read(&dir, &job_key()).unwrap();
+        let transfer = journal.facts.transfer.as_ref().unwrap();
+        assert_eq!(transfer.stage, crate::journal::StageId(8));
+        assert!(transfer.exit.as_ref().is_some_and(|exit| exit.complete));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// End to end: a routine after the plan in a `RecoveryRequired` section is refused after the
+    /// verification. A section that starts at the plan's end itself is refused earlier, by the
+    /// classification, with nothing sent at all.
+    #[test]
+    fn a_recovery_required_section_after_the_plan_ends_in_on_site_intervention() {
+        let base = safe_outside_the_plan(completed_path_program());
+        let end = base.flash[0].boundaries.post_transfer_end_pc;
+        let with_section = |start_pc| {
+            let mut program = base.clone();
+            program.sections.push(diag_ir::Section {
+                start_pc,
+                end_pc: end + 3,
+                interruptible: diag_ir::Interruptible::RecoveryRequired,
+                idempotency: diag_ir::Idempotency::Safe,
+                expected_millis: 0,
+            });
+            program.validate().expect("the fixture is a valid program");
+            program
+        };
+        let after_end = with_section(end + 1);
+        let dir = journal_dir("continue-recovery-required");
+        first_run_intending(&after_end, &dir, lose_after_plan);
+        let (result, host) = restart_intending(&after_end, &dir, |host| {
+            host.software_version = Some(b"SW02".to_vec());
+        });
+        assert!(
+            matches!(
+                reason_of(&result),
+                OnSiteReason::UnsafeContinuation { pc, .. } if *pc == end + 1
+            ),
+            "{result:?}"
+        );
+        assert_eq!(full_log(&host), verification_reads());
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        let at_end = with_section(end);
+        let dir = journal_dir("continue-recovery-required-at-end");
+        first_run_intending(&at_end, &dir, lose_after_plan);
+        let (result, host) = restart_intending(&at_end, &dir, |host| {
+            host.software_version = Some(b"SW02".to_vec());
+        });
+        assert!(
+            matches!(
+                reason_of(&result),
+                OnSiteReason::RecoveryRequiredSection { .. }
+            ),
+            "{result:?}"
+        );
+        assert!(full_log(&host).is_empty(), "{:?}", full_log(&host));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A cancel that arrives before the continuation ends the job in `Cancelled`, before the
+    /// static check gives its verdict, as at the start of every restart step.
+    #[test]
+    fn a_cancel_before_the_continuation_wins_over_its_checks() {
+        let program = completed_path_program();
+        let dir = journal_dir("continue-cancel-first");
+        first_run_intending(&program, &dir, lose_after_plan);
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        let result = continue_after_plan(
+            &program,
+            &mut host,
+            JobLimits::default(),
+            &AtomicBool::new(true),
+            Journal::open(&dir, &job_key()).unwrap(),
+            identity_sources(),
+            &program.flash[0],
+            restart::Teardown::CompletedPath,
+            restart::Confirmation {
+                after_passive_retry: false,
+            },
+        );
+        assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
+        assert!(full_log(&host).is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `restart::unsafe_continuation` looks only at diagnostic primitives outside the plans, and
+    /// needs every section that covers one to be `Safe`: an overlapping `CheckState` section makes
+    /// a primitive in a `Safe` one unsafe.
+    #[test]
+    fn every_section_over_a_primitive_outside_the_plans_must_be_safe() {
+        let program = safe_outside_the_plan(completed_path_program());
+        assert_eq!(
+            restart::unsafe_continuation(&program, &program.flash[0]),
+            None
+        );
+        // A section over the plan's own primitives changes nothing: they are not looked at.
+        let mut inside = program.clone();
+        inside.sections.push(diag_ir::Section {
+            start_pc: inside.flash[0].boundaries.entry_pc,
+            end_pc: inside.flash[0].boundaries.post_transfer_end_pc,
+            interruptible: diag_ir::Interruptible::Yes,
+            idempotency: diag_ir::Idempotency::CheckState,
+            expected_millis: 0,
+        });
+        assert_eq!(
+            restart::unsafe_continuation(&inside, &inside.flash[0]),
+            None
+        );
+        // A `CheckState` section over the session change before the plan, overlapping the
+        // `Safe` one there.
+        let mut overlapping = program.clone();
+        overlapping.sections.push(diag_ir::Section {
+            start_pc: 1,
+            end_pc: 2,
+            interruptible: diag_ir::Interruptible::Yes,
+            idempotency: diag_ir::Idempotency::CheckState,
+            expected_millis: 0,
+        });
+        assert_eq!(
+            restart::unsafe_continuation(&overlapping, &overlapping.flash[0]),
+            Some(1)
+        );
+        // A section that leaves the push before the session change out changes nothing either:
+        // a push is no primitive.
+        let mut narrower = program.clone();
+        narrower.sections[0].start_pc = 1;
+        assert_eq!(
+            restart::unsafe_continuation(&narrower, &narrower.flash[0]),
+            None
+        );
+        // A log after the plan, in no section, is a primitive like any other.
+        let mut logged = program;
+        let log_pc = logged.code.len() as u32;
+        logged.code.push(Op::Log {
+            level: 0,
+            message: 0,
+        });
+        assert_eq!(
+            restart::unsafe_continuation(&logged, &logged.flash[0]),
+            Some(log_pc)
+        );
+    }
+
+    /// A journal whose newest VM state is not at the plan's end gives the continuation nothing to
+    /// go on from. The case the restart produces: a redo whose replay committed only its run start
+    /// before a crash, after an earlier pass had completed. The completed pass is still the one
+    /// the facts report, so a later restart that finds the intended version reads back, but the
+    /// run start made the plan's end state stale; the job ends in `MissingPlanEndState` with
+    /// nothing sent after the verification, rather than going on from a state older than the
+    /// journal's newest.
+    #[test]
+    fn a_verified_restart_without_the_plan_end_state_stops_after_the_verification() {
+        let (mut program, _) = replay_program_with_end();
+        // Two restarts.
+        program.flash[0].max_resumes = 2;
+        let program = safe_outside_the_plan(program);
+        let dir = journal_dir("continue-no-end-state");
+        first_run_intending(&program, &dir, |host| host.lose_routine = Some(0xFF04));
+        // The ECU still reports the pre-erase version: the transfer is redone, and the redo
+        // loses its first replayed request, so only its run start is journaled.
+        let (result, _) = restart_intending(&program, &dir, |host| {
+            host.lose_service = Some(0x10);
+        });
+        assert!(matches!(result, Err(JobError::Host { .. })), "{result:?}");
+        let journal = Journal::read(&dir, &job_key()).unwrap();
+        assert!(restart::completed_pass_interrupted(&journal.facts));
+        let (result, host) = restart_intending(&program, &dir, |host| {
+            host.software_version = Some(b"SW02".to_vec());
+        });
+        assert_eq!(
+            reason_of(&result),
+            &OnSiteReason::MissingPlanEndState {
+                flash_session: 1,
+                teardown: restart::Teardown::CompletedPath,
+                confirmed: restart::Confirmation {
+                    after_passive_retry: false,
+                },
+            }
+        );
+        assert_eq!(full_log(&host), verification_reads());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// The intended version on the ECU with the post-transfer steps not complete: the transfer is
     /// redone (the image may be partial or the steps after it undone).
     #[test]
@@ -6757,11 +7628,11 @@ mod tests {
     }
 
     /// Step 4a runs only when the transfer is redone: a restart that goes to the read-back
-    /// verification does not check the preconditions again there, and stops as before.
+    /// verification does not check the preconditions again there, and goes on after the plan.
     #[test]
     fn step_4a_does_not_run_before_the_read_back_verification() {
         use diag_ir::RuntimeInput as I;
-        let mut program = completed_path_program();
+        let mut program = safe_outside_the_plan(completed_path_program());
         let source = Some(diag_ir::Source::RuntimeInput(I::ExternalSupplyConnected));
         program.preconditions.external_supply = Some(diag_ir::Precondition {
             satisfied: diag_ir::Satisfied { lower: 1, upper: 1 },
@@ -6775,8 +7646,10 @@ mod tests {
             host.inputs = crate::inputs::FixedInputs::new()
                 .with(I::ExternalSupplyConnected, crate::inputs::Reading::Value(0));
         });
-        assert_eq!(state_of(&result), restart::StateCheck::ReadBackVerification);
-        assert_nothing_changed_the_ecu(&host, 0);
+        assert!(result.is_ok(), "{result:?}");
+        let mut expected = verification_reads().to_vec();
+        expected.push(Sent::Routine(0xFF02));
+        assert_eq!(full_log(&host), expected);
     }
 
     // --------------------- restart second precondition check (ADR-229 item 2 step 4b-3)

@@ -109,8 +109,9 @@ conflict decides next; otherwise the first case that matches decides:
   in the report that the Windows release build and its DLL import check in `ci.yml` run only on
   `main`, so the PR's green checks do not cover them.
 - **Merge conflict:** comment `@dependabot rebase` once, unless the PR already has such a
-  comment that Dependabot has not answered. Dependabot rebases its own branch; this is not an
-  iteration.
+  comment. Dependabot rebases its own branch; this is not an iteration. If the PR is still
+  conflicted after Dependabot has answered (for example, it says it cannot rebase), do not
+  comment again: put it on the run's Dependabot list for the final report.
 - **A required check failed**, and the same check is green on `main`: this PR is the
   iteration's task, ahead of every backlog item. Take the first such PR not already on the run's
   Dependabot list. Claim it as step 3 does, with the title `[backlog-loop] ` followed by

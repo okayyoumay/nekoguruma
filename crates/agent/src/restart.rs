@@ -18,7 +18,8 @@
 //! read-back verification (step 3b-2, ADR-268 item 5). When it decides to redo the transfer,
 //! `check_reentry` checks every declared precondition again before anything is replayed (step 4a,
 //! ADR-229 item 2 step 4); after the replay reached the erase, `check_before_erase` checks them
-//! once more through the programming-session sources (step 4b-3, ADR-245 item 6). When it
+//! once more through the programming-session sources (step 4b-3, ADR-245 item 6), and the
+//! runner then goes on from the erase as a first run does (step 4c, ADR-276). When it
 //! decides the read-back verification, `unsafe_continuation` and `plan_end_state` decide
 //! whether the program can go on after the plan (ADR-271 items 4 and 5).
 //!
@@ -114,21 +115,13 @@ pub enum OnSiteReason {
     /// job's first run (none included), so the job's own data changed between runs. Nothing is
     /// sent and no resume is counted (ADR-268).
     IntendedVersionDiffers,
-    /// The restart passed step 1 (the checks that need no ECU service, and its resume was
-    /// counted), the gates of step 2, the teardown of step 2b-1 (`teardown`), the
-    /// default-session confirmation of step 2b-2 (`confirmed`) and the identity checks of step 3a
-    /// (`check_identity`) and the ECU state check of step 3b-2 (`state`, `check_state`). Steps 1
-    /// to 3 passed, and for [`StateCheck::RedoTransfer`] also the precondition check of step 4a
-    /// (`check_reentry`), the replay of the plan's steps from the entry up to, not including,
-    /// the erase (step 4b-2, ADR-273) and the second check of every declared precondition
-    /// through its programming-session source (step 4b-3, `check_before_erase`). The erase
-    /// (step 4c) does not run in this agent yet, so the job stops before the erase, so before
-    /// anything that writes the ECU's memory (ADR-255, ADR-261, ADR-264, ADR-265, ADR-268 item 5).
-    /// After a replay the plan's steps from its entry have run (normally entering the programming
-    /// session), and `teardown` and `confirmed` describe the ECU before the replay, not after it.
-    /// `state` is [`StateCheck::RedoTransfer`]: a read-back verification goes on with the program
-    /// instead (ADR-271 item 3).
-    RestartOrderUnavailable {
+    /// Test builds only: the restart order of a redone transfer passed steps 1 to 4b-3 and the
+    /// tests' `resume_to_erase` stopped it there, before the erase (step 4c), so the tests can see
+    /// the teardown's outcome (`teardown`), the default-session confirmation (`confirmed`) and the
+    /// state check (`state`, always [`StateCheck::RedoTransfer`]). A job never ends in it: the
+    /// runner goes on with the erase (ADR-276).
+    #[cfg(test)]
+    StoppedBeforeErase {
         flash_session: u32,
         teardown: Teardown,
         confirmed: Confirmation,
@@ -143,7 +136,8 @@ pub enum OnSiteReason {
     /// section, in one that is not `Safe`, or in one marked
     /// `RecoveryRequired` (for that next plan, when it allows a restart, only under an `Unsafe`
     /// section). Nothing after the verification was sent.
-    /// `teardown` and `confirmed` are as for [`OnSiteReason::RestartOrderUnavailable`].
+    /// `teardown` is how the interrupted download was ended (step 2b-1) and `confirmed` how the
+    /// default session was confirmed (step 2b-2).
     UnsafeContinuation {
         flash_session: u32,
         pc: u32,
@@ -154,7 +148,7 @@ pub enum OnSiteReason {
     /// usable VM state at the plan's end to go on from (ADR-271 item 5, ADR-274 item 3): none
     /// was recorded, a state recorded since (an entry state or a run start) made it stale, or it
     /// does not pass `Vm::check_state`. Nothing after the verification was sent. `teardown` and
-    /// `confirmed` are as for [`OnSiteReason::RestartOrderUnavailable`].
+    /// `confirmed` are the outcomes of steps 2b-1 and 2b-2.
     MissingPlanEndState {
         flash_session: u32,
         teardown: Teardown,

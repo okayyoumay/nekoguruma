@@ -274,10 +274,10 @@ pub async fn run_program_journaled(
 ///   sent. Then the same VM goes on from the erase as a first run does (step 4c, ADR-276): its
 ///   arrival commits a new transfer-start marker, which starts a new attempt in the journal,
 ///   and the erase, the transfer, the post-transfer steps and the rest of the program follow,
-///   so the job ends as that first run would. The agent tracks no session: an erase the ECU
-///   refuses in its default session (when the plan's steps before the erase enter no
-///   programming session) is an answer the procedure handles as on a first run, and nothing is
-///   erased. A VIN that is another vehicle's ends the job
+///   so the job ends as that first run would. The agent tracks no session and does not judge
+///   the erase's answer (ADR-276 item 3): an erase the ECU refuses in its default session is an
+///   answer the procedure handles as on a first run, and no block is sent without a positive
+///   RequestDownload. A VIN that is another vehicle's ends the job
 ///   in [`JobError::IdentityMismatch`] before any of this. When the state
 ///   check decides the read-back verification instead, the match is the verification
 ///   (ADR-271): the program goes on from the VM state journaled at the plan's end and runs to
@@ -1492,6 +1492,10 @@ mod tests {
         /// RequestDownload there with a negative response, as an ECU that accepts them only in
         /// its programming session would.
         default_session_only: bool,
+        /// The ECU refuses the erase (routine 0xFF00) with a negative response but accepts
+        /// RequestDownload, as an ECU that erases on the download or allows a resumed download
+        /// would.
+        refuse_erase_only: bool,
         /// The supply voltage the VCI reports; `None` reports none.
         voltage: Option<i64>,
         voltage_reads: u32,
@@ -1577,6 +1581,7 @@ mod tests {
                 cancel_on_read: None,
                 lose_routine: None,
                 default_session_only: false,
+                refuse_erase_only: false,
                 voltage: None,
                 voltage_reads: 0,
                 voltage_script: std::collections::VecDeque::new(),
@@ -1776,7 +1781,7 @@ mod tests {
             if self.lose_routine == Some(routine) {
                 return Err(HostError::NoResponse);
             }
-            if self.default_session_only && routine == 0xFF00 {
+            if (self.default_session_only || self.refuse_erase_only) && routine == 0xFF00 {
                 return Ok(vec![0x7F, 0x31, 0x7F]);
             }
             Ok(vec![0x71])
@@ -6398,9 +6403,9 @@ mod tests {
 
     /// A plan whose steps before the erase enter no programming session sends the erase in the
     /// default session the restart confirmed. An ECU that refuses it there answers negatively,
-    /// which the program receives as an answer: the fixture's program goes on to RequestDownload,
-    /// which is refused as well, and the job ends at the first block with no transfer open. Nothing
-    /// was erased or written.
+    /// which the program receives as an answer: the fixture's program goes on to RequestDownload.
+    /// An ECU that refuses a download without a successful erase, as `sim-ecu` does, refuses it
+    /// too, and the job ends at the first block with no transfer open, nothing written.
     #[test]
     fn an_erase_refused_in_the_default_session_writes_nothing() {
         let program = flash_program();
@@ -6438,6 +6443,32 @@ mod tests {
             ]
         );
         assert!(host.transfer.is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The runner does not judge the erase's answer (ADR-276 item 3): an ECU that refuses the
+    /// erase but accepts RequestDownload is written, as on a first run, and the job completes.
+    /// Whether a refused erase may be written over is the procedure's and the ECU's.
+    #[test]
+    fn an_erase_refused_by_an_ecu_that_accepts_the_download_is_written_as_on_a_first_run() {
+        let program = flash_program();
+        let dir = journal_dir("redo-erase-refused-download-accepted");
+        interrupted(&program, &dir);
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        host.refuse_erase_only = true;
+        let result = resume_on(
+            &program,
+            &mut host,
+            JobLimits::default(),
+            &AtomicBool::new(false),
+            Journal::open(&dir, &job_key()),
+            identity_sources(),
+            Some(&target()),
+            None,
+            &dir_slot(&dir),
+        );
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(from_the_erase(&host), redone_transfer());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

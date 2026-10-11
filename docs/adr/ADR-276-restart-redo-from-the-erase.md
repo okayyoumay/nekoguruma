@@ -35,16 +35,22 @@ Two questions are left open by the earlier decisions:
    An interruption of the redo is therefore classified as an interruption of the new attempt and
    takes the ordinary restart order; in particular the earlier exit marker no longer rules out an
    ECUReset in the next teardown. No new record type is needed.
-3. **No session check before the erase.** The runner does not track or check the ECU's
-   diagnostic session. A plan whose `[entry_pc, erase_pc)` re-establishes no programming session
-   sends the erase in the confirmed default session. If the ECU accepts it there, the restart
-   proceeds. If it refuses it with a negative response, that response is an answer like any
-   other: the job goes on as the procedure handles it, exactly as a first run would, and a
-   procedure that ignores it reaches RequestDownload, which such an ECU refuses as well, and
-   ends at the first block with no transfer open. Either way nothing is erased or written. A
-   lost answer to the erase ends the job at the erase as a host failure. The transfer-start
-   marker was committed before the erase, so a further restart, within the plan's resume
-   limit, takes the restart order for that new attempt.
+3. **No session check before the erase, and no judgement of its answer.** The runner neither
+   tracks the ECU's diagnostic session nor interprets the answer to the instruction at
+   `erase_pc`, on a redo or on a first run: the VM hands that answer to the program as bytes
+   (ADR-233), and what it means is up to the procedure and the ECU (the idempotency of a
+   routine depends on its content, design 8.2.5; a positive routine answer can still carry a
+   failing status, and a long erase may report its outcome only to a later request for the
+   routine's results, ISO 14229-1 clause 13.2). A plan whose `[entry_pc, erase_pc)` enters no
+   programming session sends the erase in the confirmed default session, and the job goes on as
+   the procedure handles the answer. The agent guarantees only two things: the transfer-start
+   marker precedes the erase, so a further restart within the plan's resume limit takes the
+   restart order for the new attempt; and no block is sent without a positive RequestDownload
+   (ADR-250). Whether a refused erase leaves the ECU unwritten is the ECU's behaviour. One that
+   refuses a download without a successful erase, as `sim-ecu` does, ends a procedure that
+   ignores the refusal at the first block, with nothing erased or written; one that accepts the
+   download is written, as on a first run. A lost answer to the erase ends the job at the erase
+   as a host failure.
    Validation does not refuse such plans: whether an ECU accepts the erase outside a programming
    session is the ECU's behaviour, which the program cannot declare.
 4. **The restart's ending before the erase goes.** `OnSiteReason::RestartOrderUnavailable` is no
@@ -54,6 +60,14 @@ Two questions are left open by the earlier decisions:
    exists in test builds only).
 
 ## Alternatives rejected
+
+- **A runtime gate on the erase's answer** (end the job, or refuse the blocks, when the answer to
+  the instruction at `erase_pc` is negative): the agent has no reliable success signal (a
+  positive answer does not mean erased, see item 3); it would refuse legal procedures that retry
+  the erase or fall back to another routine, which the plan's control-flow rules allow
+  (ADR-245 item 4); and it would put a policy on ECU answers into the core, against ADR-233 and
+  design 9.1. The check belongs to the procedure, which needs an instruction to end the job as
+  failed (`diag.fail`, which ADR-254 leaves without an IR instruction).
 
 - **A session check before the erase** (refuse, or end in on-site intervention, when the replayed
   range enters no programming session): the agent would need to track sessions, which it
@@ -67,6 +81,9 @@ Two questions are left open by the earlier decisions:
 - A restart that redoes the transfer now erases and writes the ECU. Everything before the erase
   is unchanged: the resume count, the gates, the teardown, the default-session confirmation, the
   identity and state checks, step 4a, the replay and step 4b-3.
+- Until the IR has an instruction that ends a job as failed, a procedure that detects a refused
+  erase can only loop (into the step limit below) or go on to the download, so the reference
+  procedure relies on the ECU refusing a download without a successful erase.
 - A crash during the redo is bounded by the plan's resume limit, as any restart is; the new
   transfer-start marker does not reset the resume count. An ECU that accepts the erase in its
   default session but refuses RequestDownload there ends each redo erased, and each further

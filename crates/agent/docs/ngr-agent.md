@@ -419,12 +419,14 @@ journaling:
 - the erase, the RequestDownload, the blocks, RequestTransferExit, the post-transfer steps and the
   rest of the program then run and are journaled as on a first run, and the job ends as that run
   would;
-- the agent tracks no session. A plan whose steps from its entry to its erase enter no
-  programming session sends the erase in the default session the restart confirmed. An ECU that
-  refuses it there answers negatively, and the job goes on as the procedure handles that answer,
-  as on a first run; a procedure that ignores it reaches RequestDownload, which such an ECU
-  refuses too, and ends at the first block with no transfer open. Nothing is erased or written.
-  A lost answer to the erase ends the job at the erase. Either way the transfer-start marker is
+- the agent tracks no session and does not judge the erase's answer, on a redo or on a first
+  run (ADR-276 item 3). A plan whose steps from its entry to its erase enter no programming
+  session sends the erase in the default session the restart confirmed, and the job goes on as
+  the procedure handles the answer. No block is sent without a positive RequestDownload: an ECU
+  that refuses the download without a successful erase, as `sim-ecu` does, ends a procedure that
+  ignores a refused erase at the first block with nothing written, while one that accepts the
+  download is written, as on a first run. A lost answer to the erase ends the job at the erase.
+  Either way the transfer-start marker is
   already committed, so a further restart takes the restart order for that new attempt, within
   the resume limit, which the new marker does not reset;
 - the step limit counts across runs (the restart's step count continues after the journal's

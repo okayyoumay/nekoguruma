@@ -695,98 +695,158 @@ fn the_root_file_path_is_the_configured_one_in_either_view() {
     }
 }
 
-fn env_of<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
-    move |name| {
-        vars.iter()
-            .find(|(k, _)| *k == name)
-            .map(|(_, v)| (*v).to_owned())
+/// A lookup that knows the folders of a 64-bit Windows 10 installation.
+fn folders(folder: KnownFolder) -> Option<String> {
+    Some(
+        match folder {
+            KnownFolder::ProgramFiles | KnownFolder::ProgramW6432 => r"C:\Program Files",
+            KnownFolder::CommonProgramFiles | KnownFolder::CommonProgramW6432 => {
+                r"C:\Program Files\Common Files"
+            }
+            KnownFolder::ProgramFilesX86 => r"C:\Program Files (x86)",
+            KnownFolder::CommonProgramFilesX86 => r"C:\Program Files (x86)\Common Files",
+            KnownFolder::SystemRoot => r"C:\Windows",
+        }
+        .to_owned(),
+    )
+}
+
+fn expanded(text: &str) -> Result<String, ResolveError> {
+    expand_root_file_value(text, folders)
+}
+
+fn assert_refused(result: Result<impl std::fmt::Debug, ResolveError>, what: &str) {
+    assert!(
+        matches!(result, Err(ResolveError::RootFileValue { .. })),
+        "{what}: {result:?}"
+    );
+}
+
+#[test]
+fn known_folder_names_are_expanded_in_any_case() {
+    for (text, expected) in [
+        (r"%ProgramFiles%\a", r"C:\Program Files\a"),
+        (r"%PROGRAMFILES%\a", r"C:\Program Files\a"),
+        (
+            r"%CommonProgramFiles%\a",
+            r"C:\Program Files\Common Files\a",
+        ),
+        (
+            r"%commonprogramfiles%\a",
+            r"C:\Program Files\Common Files\a",
+        ),
+        (r"%ProgramFiles(x86)%\a", r"C:\Program Files (x86)\a"),
+        (r"%programfiles(X86)%\a", r"C:\Program Files (x86)\a"),
+        (
+            r"%CommonProgramFiles(x86)%\a",
+            r"C:\Program Files (x86)\Common Files\a",
+        ),
+        (r"%ProgramW6432%\a", r"C:\Program Files\a"),
+        (
+            r"%CommonProgramW6432%\a",
+            r"C:\Program Files\Common Files\a",
+        ),
+        (r"%SystemRoot%\a", r"C:\Windows\a"),
+        (r"%SYSTEMROOT%\a", r"C:\Windows\a"),
+        (r"%windir%\a", r"C:\Windows\a"),
+        (r"%WinDir%\a", r"C:\Windows\a"),
+        (r"%SystemRoot%\%windir%", r"C:\Windows\C:\Windows"),
+        ("no references", "no references"),
+        ("", ""),
+    ] {
+        assert_eq!(expanded(text).as_deref().ok(), Some(expected), "{text}");
     }
 }
 
 #[test]
-fn expand_env_replaces_known_variables() {
-    let env = env_of(&[("ROOT", r"C:\Data"), ("SUB", "pdu")]);
-    assert_eq!(
-        expand_env(r"%ROOT%\%SUB%\r.xml", &env),
-        r"C:\Data\pdu\r.xml"
-    );
-    assert_eq!(expand_env("no variables", &env), "no variables");
-    assert_eq!(expand_env("", &env), "");
+fn each_known_folder_has_its_registry_location() {
+    let cv = r"SOFTWARE\Microsoft\Windows\CurrentVersion";
+    let nt = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion";
+    for (name, key, value) in [
+        ("ProgramFiles", cv, "ProgramFilesDir"),
+        ("CommonProgramFiles", cv, "CommonFilesDir"),
+        ("ProgramFiles(x86)", cv, "ProgramFilesDir (x86)"),
+        ("CommonProgramFiles(x86)", cv, "CommonFilesDir (x86)"),
+        ("ProgramW6432", cv, "ProgramW6432Dir"),
+        ("CommonProgramW6432", cv, "CommonW6432Dir"),
+        ("SystemRoot", nt, "SystemRoot"),
+        ("windir", nt, "SystemRoot"),
+    ] {
+        let folder = KnownFolder::from_name(name).unwrap();
+        assert_eq!(folder.registry_location(), (key, value), "{name}");
+    }
 }
 
 #[test]
-fn expand_env_leaves_unknown_and_unmatched_percents() {
-    let env = env_of(&[("ROOT", "R")]);
-    assert_eq!(expand_env(r"%X%\r.xml", &env), r"%X%\r.xml");
-    assert_eq!(expand_env("100%", &env), "100%");
-    assert_eq!(expand_env("%ROOT", &env), "%ROOT");
-    assert_eq!(expand_env("a%%b", &env), "a%%b");
-    assert_eq!(expand_env("%%", &env), "%%");
-    // An unknown name does not swallow a known one that follows.
-    assert_eq!(expand_env("%X%ROOT%", &env), "%XR");
-    assert_eq!(expand_env("50% of %ROOT%", &env), "50% of R");
+fn other_names_and_stray_percents_are_refused() {
+    for text in [
+        r"%ROOT%\r.xml",
+        r"%USERPROFILE%\r.xml",
+        r"%ProgramData%\r.xml",
+        r"%ProgramFiles (x86)%\r.xml",
+        r"%ProgramFiles%\%X%",
+        "100%",
+        "%ProgramFiles",
+        "50% of x",
+        "50% of %ProgramFiles%",
+        "a%%b",
+        "%%",
+        "%",
+        r"%ProgramFiles%\%",
+    ] {
+        assert_refused(expanded(text), text);
+    }
+}
+
+#[test]
+fn a_known_name_without_a_registry_value_is_refused() {
+    let none = |_: KnownFolder| None;
+    assert_refused(
+        expand_root_file_value(r"%ProgramFiles%\r.xml", none),
+        "missing",
+    );
+    let only_system_root = |f: KnownFolder| (f == KnownFolder::SystemRoot).then(|| "C:".to_owned());
+    assert_refused(
+        expand_root_file_value(r"%windir%\%ProgramFiles%", only_system_root),
+        "one missing",
+    );
+}
+
+#[test]
+fn the_process_environment_is_not_consulted() {
+    // PATH exists on every platform; it is still not a known name.
+    assert_refused(expanded("%PATH%"), "PATH");
+    assert_refused(expanded("%Path%"), "Path");
 }
 
 #[test]
 fn expansion_does_not_rescan_values() {
-    let env = env_of(&[("A", "%B%"), ("B", "b")]);
-    assert_eq!(expand_env("%A%", &env), "%B%");
+    let lookup = |_: KnownFolder| Some(r"C:\%windir%".to_owned());
+    assert_eq!(
+        expand_root_file_value("%ProgramFiles%", lookup).unwrap(),
+        r"C:\%windir%"
+    );
 }
 
 #[test]
-fn the_view_selects_the_program_files_variables() {
-    let env = env_of(&[
-        ("ProgramFiles", r"C:\Program Files"),
-        ("ProgramFiles(x86)", r"C:\Program Files (x86)"),
-        ("ProgramW6432", r"C:\Program Files"),
-        ("CommonProgramFiles", r"C:\Program Files\Common Files"),
-        (
-            "CommonProgramFiles(x86)",
-            r"C:\Program Files (x86)\Common Files",
-        ),
-        ("CommonProgramW6432", r"C:\Program Files\Common Files"),
-        ("Other", "o"),
-    ]);
-    let lookup = |view, name: &str| view_variable(view, name, &env);
-    assert_eq!(
-        lookup(RegistryView::Wow64_32, "ProgramFiles").as_deref(),
-        Some(r"C:\Program Files (x86)")
-    );
-    assert_eq!(
-        lookup(RegistryView::Wow64_64, "ProgramFiles").as_deref(),
-        Some(r"C:\Program Files")
-    );
-    assert_eq!(
-        lookup(RegistryView::Wow64_32, "COMMONPROGRAMFILES").as_deref(),
-        Some(r"C:\Program Files (x86)\Common Files")
-    );
-    assert_eq!(
-        lookup(RegistryView::Wow64_64, "CommonProgramFiles").as_deref(),
-        Some(r"C:\Program Files\Common Files")
-    );
-    assert_eq!(
-        lookup(RegistryView::Wow64_64, "Other").as_deref(),
-        Some("o")
-    );
-    assert_eq!(lookup(RegistryView::Wow64_64, "Absent"), None);
-}
-
-#[test]
-fn the_view_falls_back_to_the_plain_names() {
-    // 32-bit Windows has no `(x86)` or `W6432` variables.
-    let env = env_of(&[
-        ("ProgramFiles", r"C:\Program Files"),
-        ("CommonProgramFiles", r"C:\Program Files\Common Files"),
-    ]);
-    for view in [RegistryView::Wow64_32, RegistryView::Wow64_64] {
-        assert_eq!(
-            view_variable(view, "ProgramFiles", &env).as_deref(),
-            Some(r"C:\Program Files")
-        );
-        assert_eq!(
-            view_variable(view, "CommonProgramFiles", &env).as_deref(),
-            Some(r"C:\Program Files\Common Files")
-        );
+fn drive_letter_paths_are_recognised() {
+    for ok in [r"C:\a", "c:/a", r"Z:\", "d:/"] {
+        assert!(is_drive_letter_path(ok), "{ok}");
+    }
+    for bad in [
+        "a.xml",
+        r"dir\a.xml",
+        r"\a.xml",
+        "/a.xml",
+        r"C:a.xml",
+        "C:",
+        r"\\server\share\a.xml",
+        "//server/share/a.xml",
+        r"\\?\C:\a.xml",
+        r"\\.\C:\a.xml",
+        r"1:\a.xml",
+    ] {
+        assert!(!is_drive_letter_path(bad), "{bad}");
     }
 }
 
@@ -799,44 +859,177 @@ fn registry_string(text: &str) -> Vec<u8> {
 
 #[test]
 fn a_registry_value_expands_only_when_asked() {
-    let env = env_of(&[
-        ("ProgramFiles", r"C:\PF64"),
-        ("ProgramFiles(x86)", r"C:\PF32"),
-    ]);
     let raw = registry_string(r"  %ProgramFiles%\Vendor\root.xml  ");
-    let literal = root_file_from_value(&raw, false, RegistryView::Wow64_64, &env).unwrap();
+    // Literal, so the percent sign makes it a relative path, which is refused.
+    assert_refused(root_file_from_value(&raw, false, &folders), "literal");
+    let expanded = root_file_from_value(&raw, true, &folders).unwrap();
     assert_eq!(
-        literal,
-        Some(PathBuf::from(r"%ProgramFiles%\Vendor\root.xml"))
+        expanded,
+        Some(PathBuf::from(r"C:\Program Files\Vendor\root.xml"))
     );
-    let expanded = root_file_from_value(&raw, true, RegistryView::Wow64_32, &env).unwrap();
-    assert_eq!(expanded, Some(PathBuf::from(r"C:\PF32\Vendor\root.xml")));
+    let literal = registry_string(r"C:\100%\root.xml");
+    assert_eq!(
+        root_file_from_value(&literal, false, &folders).unwrap(),
+        Some(PathBuf::from(r"C:\100%\root.xml"))
+    );
+    assert_refused(root_file_from_value(&literal, true, &folders), "expanded");
+}
+
+#[test]
+fn the_expanded_root_file_must_be_an_absolute_drive_letter_path() {
+    for bad in [
+        "root.xml",
+        r"dir\root.xml",
+        r"\\server\share\root.xml",
+        "//server/share/root.xml",
+        r"\\?\C:\root.xml",
+    ] {
+        for expand in [false, true] {
+            assert_refused(
+                root_file_from_value(&registry_string(bad), expand, &folders),
+                bad,
+            );
+        }
+    }
+    assert_eq!(
+        root_file_from_value(&registry_string("D:/pdu/root.xml"), false, &folders).unwrap(),
+        Some(PathBuf::from("D:/pdu/root.xml"))
+    );
+    // A folder value that is itself relative gives a relative result.
+    let relative = |_: KnownFolder| Some("Program Files".to_owned());
+    assert_refused(
+        root_file_from_value(&registry_string(r"%ProgramFiles%\r.xml"), true, &relative),
+        "relative folder",
+    );
 }
 
 #[test]
 fn a_registry_value_is_decoded_and_checked() {
-    let env = env_of(&[]);
-    let view = RegistryView::Wow64_64;
     // Several terminating NULs are stripped.
-    let mut padded = registry_string("a.xml");
+    let mut padded = registry_string(r"C:\a.xml");
     padded.extend([0, 0, 0, 0]);
     assert_eq!(
-        root_file_from_value(&padded, false, view, &env).unwrap(),
-        Some(PathBuf::from("a.xml"))
+        root_file_from_value(&padded, false, &folders).unwrap(),
+        Some(PathBuf::from(r"C:\a.xml"))
     );
-    assert_eq!(root_file_from_value(&[], true, view, &env).unwrap(), None);
+    assert_eq!(root_file_from_value(&[], true, &folders).unwrap(), None);
     assert_eq!(
-        root_file_from_value(&registry_string("   "), false, view, &env).unwrap(),
+        root_file_from_value(&registry_string("   "), false, &folders).unwrap(),
         None
     );
-    assert!(root_file_from_value(&[0x41], false, view, &env).is_err());
-    assert!(root_file_from_value(&registry_string("a\0b"), false, view, &env).is_err());
+    assert_refused(root_file_from_value(&[0x41], false, &folders), "odd length");
+    assert_refused(
+        root_file_from_value(&registry_string("C:\\a\0b"), false, &folders),
+        "NUL",
+    );
     // An expansion that comes out blank is no path either.
-    let env = env_of(&[("E", "")]);
+    let empty = |_: KnownFolder| Some(String::new());
     assert_eq!(
-        root_file_from_value(&registry_string("%E%"), true, view, &env).unwrap(),
+        root_file_from_value(&registry_string("%windir%"), true, &empty).unwrap(),
         None
     );
+}
+
+#[test]
+fn root_file_value_errors_say_what_is_wrong() {
+    let err = expanded("%ROOT%").unwrap_err();
+    assert!(err.to_string().contains("%ROOT%"), "{err}");
+}
+
+#[test]
+fn percent_decoding_needs_two_hex_digits() {
+    for bad in [
+        "file:///opt/a%+1b/lib.so",
+        "file:///opt/a%-1b/lib.so",
+        "file:///opt/a% 1b/lib.so",
+        "file:///opt/a%1/lib.so",
+        "file:///opt/a%",
+    ] {
+        assert_eq!(uri_to_path(bad), Err(UriFault::Invalid), "{bad}");
+    }
+    let xml = root(&entry_with("file:///opt/a%+1b/lib.so", ""));
+    assert!(matches!(
+        only_invalid(&xml).error,
+        EntryError::InvalidUri {
+            element: "LIBRARY_FILE",
+            ..
+        }
+    ));
+    assert_eq!(
+        uri_to_path(&uri("a%2Fb%4a/lib.so")),
+        Ok(path("a/bJ/lib.so"))
+    );
+}
+
+#[test]
+fn an_empty_path_is_refused() {
+    for bad in ["file:///", "file:/", "file://localhost/"] {
+        assert_eq!(uri_to_path(bad), Err(UriFault::Invalid), "{bad}");
+    }
+    let xml = root(&entry_with("file:///", ""));
+    assert!(matches!(
+        only_invalid(&xml).error,
+        EntryError::InvalidUri {
+            element: "LIBRARY_FILE",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn only_ascii_whitespace_is_trimmed_around_a_uri() {
+    let plain = uri("lib.so");
+    assert_eq!(
+        uri_to_path(&format!(" \t\r\n{plain}\n ")),
+        Ok(path("lib.so"))
+    );
+    // U+00A0 is not ASCII whitespace: it is not trimmed, so it stays in the path (or the URI is
+    // refused), but the path is never the trimmed one.
+    let result = uri_to_path(&format!("{plain}\u{a0}"));
+    assert_ne!(result, Ok(path("lib.so")));
+    let result = uri_to_path(&format!("\u{a0}{plain}"));
+    assert_eq!(result, Err(UriFault::Invalid));
+}
+
+#[test]
+fn utf32_and_unmarked_utf16_are_not_accepted() {
+    let xml = root(&entry("X", "x/lib.so"));
+    let utf32 = |big: bool| -> Vec<u8> {
+        let mut out = if big {
+            vec![0x00, 0x00, 0xFE, 0xFF]
+        } else {
+            vec![0xFF, 0xFE, 0x00, 0x00]
+        };
+        for c in xml.chars() {
+            let u = c as u32;
+            out.extend(if big {
+                u.to_be_bytes()
+            } else {
+                u.to_le_bytes()
+            });
+        }
+        out
+    };
+    for (label, bytes) in [("utf-32le", utf32(false)), ("utf-32be", utf32(true))] {
+        let (_dir, file) = write_bytes(&bytes);
+        let err = resolve_in_root_file(&file, "X").unwrap_err();
+        assert!(
+            matches!(err, ResolveError::Encoding { .. }),
+            "{label}: {err:?}"
+        );
+    }
+    // UTF-16 without a mark: little-endian text contains NULs, which are valid UTF-8 but not
+    // XML; text with an odd byte layout may not be UTF-8 at all.
+    let (_dir, file) = write_bytes(&utf16_bytes(&xml, false, false));
+    assert!(matches!(
+        resolve_in_root_file(&file, "X").unwrap_err(),
+        ResolveError::Xml { .. }
+    ));
+    let (_dir, file) = write_bytes(&utf16_bytes("\u{e9}<a/>", false, false));
+    assert!(matches!(
+        resolve_in_root_file(&file, "X").unwrap_err(),
+        ResolveError::Encoding { .. }
+    ));
 }
 
 #[cfg(windows)]
@@ -878,7 +1071,20 @@ mod registry {
         }
     }
 
-    const VIEW: RegistryView = RegistryView::Wow64_64;
+    /// A folder lookup over two temporary keys standing in for the two HKLM keys.
+    fn lookup_in<'a>(
+        current_version: &'a RegKey,
+        nt_current_version: &'a RegKey,
+    ) -> impl Fn(KnownFolder) -> Option<String> + 'a {
+        move |folder| {
+            let (_, value) = folder.registry_location();
+            let key = match folder {
+                KnownFolder::SystemRoot => nt_current_version,
+                _ => current_version,
+            };
+            registry_folder(key, value)
+        }
+    }
 
     #[test]
     fn root_file_is_read_and_trimmed() {
@@ -887,7 +1093,7 @@ mod registry {
             .set_value("Root File", &r"  C:\ProgramData\pdu_api_root.xml  ")
             .unwrap();
         assert_eq!(
-            root_file_from_key(&temp.0, VIEW).unwrap(),
+            root_file_from_key(&temp.0, &folders).unwrap(),
             Some(PathBuf::from(r"C:\ProgramData\pdu_api_root.xml"))
         );
     }
@@ -895,48 +1101,65 @@ mod registry {
     #[test]
     fn a_missing_or_blank_value_is_no_root_file() {
         let temp = TempKey::new("missing");
-        assert_eq!(root_file_from_key(&temp.0, VIEW).unwrap(), None);
+        assert_eq!(root_file_from_key(&temp.0, &folders).unwrap(), None);
         temp.0.set_value("Root File", &"   ").unwrap();
-        assert_eq!(root_file_from_key(&temp.0, VIEW).unwrap(), None);
+        assert_eq!(root_file_from_key(&temp.0, &folders).unwrap(), None);
     }
 
     #[test]
     fn reg_sz_is_taken_literally() {
         let temp = TempKey::new("sz");
+        temp.set_raw(r"C:\100%\pdu_api_root.xml", false);
+        assert_eq!(
+            root_file_from_key(&temp.0, &folders).unwrap(),
+            Some(PathBuf::from(r"C:\100%\pdu_api_root.xml"))
+        );
         temp.set_raw(r"%SystemRoot%\pdu_api_root.xml", false);
-        assert_eq!(
-            root_file_from_key(&temp.0, VIEW).unwrap(),
-            Some(PathBuf::from(r"%SystemRoot%\pdu_api_root.xml"))
-        );
+        assert_refused(root_file_from_key(&temp.0, &folders), "unexpanded");
     }
 
     #[test]
-    fn reg_expand_sz_is_expanded() {
+    fn reg_expand_sz_is_expanded_from_the_registry_folders() {
         let temp = TempKey::new("expand");
+        let cv = TempKey::new("expand-cv");
+        let nt = TempKey::new("expand-nt");
+        cv.0.set_value("ProgramFilesDir (x86)", &r"D:\PF86")
+            .unwrap();
+        nt.0.set_value("SystemRoot", &r"D:\Win").unwrap();
+        let lookup = lookup_in(&cv.0, &nt.0);
+
         temp.set_raw(r"%SystemRoot%\pdu_api_root.xml", true);
-        let system_root = std::env::var("SystemRoot").unwrap();
         assert_eq!(
-            root_file_from_key(&temp.0, VIEW).unwrap(),
-            Some(PathBuf::from(format!(r"{system_root}\pdu_api_root.xml")))
+            root_file_from_key(&temp.0, &lookup).unwrap(),
+            Some(PathBuf::from(r"D:\Win\pdu_api_root.xml"))
         );
+        temp.set_raw(r"%programfiles(x86)%\Vendor\root.xml", true);
+        assert_eq!(
+            root_file_from_key(&temp.0, &lookup).unwrap(),
+            Some(PathBuf::from(r"D:\PF86\Vendor\root.xml"))
+        );
+        // A known name whose registry value is absent is refused, whatever the environment holds.
+        temp.set_raw(r"%ProgramFiles%\Vendor\root.xml", true);
+        assert_refused(root_file_from_key(&temp.0, &lookup), "missing value");
     }
 
     #[test]
-    fn reg_expand_sz_uses_the_views_program_files() {
-        let temp = TempKey::new("views");
-        temp.set_raw(r"%ProgramFiles%\Vendor\root.xml", true);
-        let var = |name: &str| std::env::var(name).ok();
-        for (view, specific) in [
-            (RegistryView::Wow64_32, "ProgramFiles(x86)"),
-            (RegistryView::Wow64_64, "ProgramW6432"),
-        ] {
-            let base = var(specific).or_else(|| var("ProgramFiles")).unwrap();
-            assert_eq!(
-                root_file_from_key(&temp.0, view).unwrap(),
-                Some(PathBuf::from(format!(r"{base}\Vendor\root.xml"))),
-                "{view:?}"
-            );
-        }
+    fn a_folder_value_must_be_a_plain_string() {
+        let cv = TempKey::new("folder-types");
+        cv.0.set_value("ProgramFilesDir", &1u32).unwrap();
+        assert_eq!(registry_folder(&cv.0, "ProgramFilesDir"), None);
+        let expandable = RegValue {
+            bytes: registry_string(r"%windir%\x"),
+            vtype: REG_EXPAND_SZ,
+        };
+        cv.0.set_raw_value("CommonFilesDir", &expandable).unwrap();
+        assert_eq!(registry_folder(&cv.0, "CommonFilesDir"), None);
+        cv.0.set_value("ProgramW6432Dir", &r"C:\PF").unwrap();
+        assert_eq!(
+            registry_folder(&cv.0, "ProgramW6432Dir").as_deref(),
+            Some(r"C:\PF")
+        );
+        assert_eq!(registry_folder(&cv.0, "Absent"), None);
     }
 
     #[test]
@@ -944,7 +1167,7 @@ mod registry {
         let temp = TempKey::new("dword");
         temp.0.set_value("Root File", &1u32).unwrap();
         assert!(matches!(
-            root_file_from_key(&temp.0, VIEW),
+            root_file_from_key(&temp.0, &folders),
             Err(ResolveError::Registry(_))
         ));
     }

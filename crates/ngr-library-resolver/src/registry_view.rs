@@ -55,4 +55,12 @@ mod tests {
     fn the_views_have_different_flags() {
         assert_ne!(RegistryView::Wow64_32.flag(), RegistryView::Wow64_64.flag());
     }
+
+    #[cfg(windows)]
+    #[test]
+    fn each_view_selects_its_wow64_flag() {
+        use winreg::enums::{KEY_WOW64_32KEY, KEY_WOW64_64KEY};
+        assert_eq!(RegistryView::Wow64_32.flag(), KEY_WOW64_32KEY);
+        assert_eq!(RegistryView::Wow64_64.flag(), KEY_WOW64_64KEY);
+    }
 }

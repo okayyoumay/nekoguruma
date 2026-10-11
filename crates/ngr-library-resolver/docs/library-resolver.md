@@ -123,16 +123,34 @@ locates the root file and calls `resolve_in_root_file(root_file, name)`; `resolv
 and no "all views" mode: a worker reads its own bitness, and the agent calls once per view.
 
 **Registry value.** The value is read raw. `REG_SZ` is taken literally, even if it contains `%`.
-`REG_EXPAND_SZ` has its `%NAME%` references expanded from the process environment, where
-`ProgramFiles` and `CommonProgramFiles` come from the view's own variables (`ProgramFiles(x86)` /
-`CommonProgramFiles(x86)` for `Wow64_32`, `ProgramW6432` / `CommonProgramW6432` for `Wow64_64`),
-falling back to the plain names when those are absent (32-bit Windows). An unknown `%NAME%`, an
-empty `%%` and an unmatched `%` stay as written; expanded text is not scanned again. Other value
-types, invalid UTF-16 and an embedded NUL are `ResolveError::Registry`.
+`REG_EXPAND_SZ` has its `%NAME%` references expanded, but never from the process environment: a
+file that decides which library loads is not located through variables another process could set
+(7.2). Only these names are expanded (case-insensitive), from `REG_SZ` values under `HKLM`, read in
+the same registry view as `Root File`:
+
+| Name | Key | Value |
+|---|---|---|
+| `%ProgramFiles%` | `SOFTWARE\Microsoft\Windows\CurrentVersion` | `ProgramFilesDir` |
+| `%CommonProgramFiles%` | same | `CommonFilesDir` |
+| `%ProgramFiles(x86)%` | same | `ProgramFilesDir (x86)` |
+| `%CommonProgramFiles(x86)%` | same | `CommonFilesDir (x86)` |
+| `%ProgramW6432%` | same | `ProgramW6432Dir` |
+| `%CommonProgramW6432%` | same | `CommonW6432Dir` |
+| `%SystemRoot%`, `%windir%` | `SOFTWARE\Microsoft\Windows NT\CurrentVersion` | `SystemRoot` |
+
+The 32-bit view redirects `CurrentVersion`, so `ProgramFilesDir` there is the x86 folder; that is
+how the view's bitness is honoured. Any other `%NAME%`, an empty `%%`, an unpaired `%`, and a
+listed name whose value is missing or not a `REG_SZ` are refused; expanded text is not scanned
+again. After expansion (and for a literal `REG_SZ` value too) a non-blank `Root File` must be an
+absolute drive-letter path (`X:\...` or `X:/...`); a relative path, a UNC path (`\\` or `//`) and a
+`\\?\` path are refused. All of these are `ResolveError::RootFileValue`, as are invalid UTF-16 and
+an embedded NUL. A value of another registry type is `ResolveError::Registry`.
 
 **Encoding and size.** The file is read up to `MAX_ROOT_FILE_SIZE` (1 MiB, inclusive; more is
 `TooLarge`). It must be UTF-8 (a byte order mark is tolerated) or UTF-16 little- or big-endian
-with a byte order mark; anything else, including a legacy code page, is `Encoding`. The XML
+with a byte order mark; anything else, including a legacy code page and UTF-32 (recognised by its
+mark), is `Encoding`. UTF-16 without a mark is not detected: it fails as `Xml`, or as `Encoding`
+when the bytes are not valid UTF-8 either. The XML
 declaration's encoding is not honoured. `parse_root_file` takes text.
 
 **Structure.** The document element must be `MVCI_PDU_API_ROOT` (`NotARootFile` otherwise; the
@@ -145,12 +163,14 @@ only the un-namespaced `URI` attribute counts. Unknown children are ignored. A r
 cut it) and trimmed; an element inside is `NestedShortName`.
 
 **Paths.** A `file:` URI is converted to an absolute local path, for the library, the MDF and the
-CDF alike, on every platform. Percent-encoding is decoded. A host other than `localhost` (this
-includes `file://c:/dir/x.dll`) and a path starting with `//` in any encoding (`file:////server/..`,
-`file:///%5C%5Cserver/..`) are `RemoteHost`: a share cannot meet the 7.2 premise that regular
-users cannot write the chain. A raw `?` or `#`, a `..` component, a NUL after decoding, another
-scheme and malformed percent-encoding are `InvalidUri`. On Windows only the drive-letter form is
-accepted (a path without one is `RelativePath`); raw backslashes may stay. A URI that gives a
+CDF alike, on every platform. Percent-encoding is decoded. ASCII whitespace around the URI is
+trimmed; any other character (such as U+00A0) is not. A host other than `localhost` (this
+includes `file://c:/dir/x.dll`) and a path starting with `//` or `/\` in any encoding
+(`file:////server/..`, `file:///%5C%5Cserver/..`) are `RemoteHost`: a share cannot meet the 7.2 premise that regular
+users cannot write the chain. A raw `?` or `#`, a `..` component, a NUL after decoding, an empty path
+(`file:///`), another scheme and malformed percent-encoding (each `%` needs two hex digits; a
+sign is not one) are `InvalidUri`; so is a drive-letter path off Windows (`file:///c:/x`). On Windows only the drive-letter form is
+accepted (a path without one is `RelativePath`, not `InvalidUri`); raw backslashes may stay. A URI that gives a
 relative path (`file:dir/x`) is `RelativePath`. A mapped network drive passes these rules.
 
 **Matching.** The name is an entry's `SHORT_NAME`, matched exactly and case-sensitively against

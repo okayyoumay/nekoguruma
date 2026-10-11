@@ -98,8 +98,9 @@ pub enum EntryError {
         element: &'static str,
     },
     /// A file element holds something that is not a usable `file:` URI: another scheme, a
-    /// malformed or unencoded reserved character, a `..` component, a NUL, or (on Windows) a
-    /// path that is not in drive-letter form.
+    /// malformed or unencoded reserved character, a `..` component, a NUL, an empty path
+    /// (`file:///`), or (off Windows) a drive-letter path. On Windows a path that is not in
+    /// drive-letter form is [`RelativePath`](Self::RelativePath).
     #[error("{element} is not a valid file URI: {uri:?}")]
     InvalidUri {
         /// The element name.
@@ -108,7 +109,7 @@ pub enum EntryError {
         uri: String,
     },
     /// A file element names a non-local file: a host other than `localhost`, or a path that
-    /// starts with `//` (a share). The 7.2 writability premise cannot be established for it.
+    /// starts with `//` or `/\` (a share). The 7.2 writability premise cannot be established for it.
     #[error("{element} names a remote file: {uri:?}")]
     RemoteHost {
         /// The element name.
@@ -171,7 +172,8 @@ pub enum ResolveError {
         /// The root file.
         path: PathBuf,
     },
-    /// The root file is neither UTF-8 nor UTF-16 with a byte order mark.
+    /// The root file is neither UTF-8 nor UTF-16 with a byte order mark (UTF-32, with or without
+    /// a mark, and UTF-16 without one are not accepted).
     #[error(
         "D-PDU API root file {} is not UTF-8 or byte-order-marked UTF-16",
         path.display()
@@ -229,6 +231,14 @@ pub enum ResolveError {
         /// The reason.
         #[source]
         source: EntryError,
+    },
+    /// The registry value `Root File` cannot be used: not valid UTF-16, a NUL inside, a `%NAME%`
+    /// reference that is not one of the supported folders (or whose registry value is missing),
+    /// an unpaired `%`, or a result that is not an absolute drive-letter path.
+    #[error("unusable D-PDU API registry value Root File: {reason}")]
+    RootFileValue {
+        /// What is wrong with the value.
+        reason: String,
     },
     /// The registry lookup of the root file failed.
     #[cfg(windows)]
@@ -346,8 +356,14 @@ fn parse_document(xml: &str, path: &Path) -> Result<RootFile, ResolveError> {
 }
 
 /// Decodes the bytes of a root file: UTF-8 (a byte order mark is tolerated) or UTF-16 with a
-/// little- or big-endian byte order mark. `None` for anything else.
+/// little- or big-endian byte order mark. `None` for anything else, including UTF-32 with a mark
+/// and UTF-16 without one (which is not UTF-8, or fails as XML).
 fn decode_root_bytes(bytes: &[u8]) -> Option<String> {
+    // The UTF-32LE mark starts like the UTF-16LE one, so it is tested first.
+    if bytes.starts_with(&[0xFF, 0xFE, 0x00, 0x00]) || bytes.starts_with(&[0x00, 0x00, 0xFE, 0xFF])
+    {
+        return None;
+    }
     let text = if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
         utf16(rest, u16::from_le_bytes)?
     } else if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
@@ -483,8 +499,9 @@ pub fn resolve_in_root_file(root_file: &Path, name: &str) -> Result<Resolved, Re
 
 /// Location of the root description file: the registry value `Root File` under
 /// `HKLM\SOFTWARE\D-PDU API` in registry view `view` on Windows (`None` when the key, the value
-/// or its content is absent; a `REG_EXPAND_SZ` value is expanded with the view's program-files
-/// folders), `vci_service_config::pdu_api_root_file()` elsewhere (always `Some`; the file may not
+/// or its content is absent; a `REG_EXPAND_SZ` value is expanded from the same view's HKLM folder
+/// values, never from the process environment, 7.2; the result must be an absolute drive-letter
+/// path), `vci_service_config::pdu_api_root_file()` elsewhere (always `Some`; the file may not
 /// exist; `view` is ignored).
 pub fn root_file_path(view: RegistryView) -> Result<Option<PathBuf>, ResolveError> {
     #[cfg(windows)]
@@ -503,7 +520,16 @@ pub fn root_file_path(view: RegistryView) -> Result<Option<PathBuf>, ResolveErro
             }
             Err(e) => return Err(ResolveError::Registry(e)),
         };
-        root_file_from_key(&key, view)
+        // The folder values are read in the same view as `Root File`: in the 32-bit view the
+        // `CurrentVersion` key is redirected, so `ProgramFilesDir` there is the x86 folder.
+        let lookup = |folder: KnownFolder| {
+            let (subkey, value) = folder.registry_location();
+            let key = RegKey::predef(HKEY_LOCAL_MACHINE)
+                .open_subkey_with_flags(subkey, KEY_READ | view.flag())
+                .ok()?;
+            registry_folder(&key, value)
+        };
+        root_file_from_key(&key, &lookup)
     }
     #[cfg(not(windows))]
     {
@@ -513,11 +539,12 @@ pub fn root_file_path(view: RegistryView) -> Result<Option<PathBuf>, ResolveErro
 }
 
 /// Reads the `Root File` value of an opened `D-PDU API` registry key. Only a `REG_EXPAND_SZ`
-/// value has its `%NAME%` references expanded; a `REG_SZ` value is taken literally.
+/// value has its `%NAME%` references expanded (from `lookup`); a `REG_SZ` value is taken
+/// literally.
 #[cfg(windows)]
 fn root_file_from_key(
     key: &winreg::RegKey,
-    view: RegistryView,
+    lookup: &dyn Fn(KnownFolder) -> Option<String>,
 ) -> Result<Option<PathBuf>, ResolveError> {
     use winreg::enums::{REG_EXPAND_SZ, REG_SZ};
     let value = match key.get_raw_value("Root File") {
@@ -538,87 +565,162 @@ fn root_file_from_key(
             )));
         }
     };
-    root_file_from_value(&value.bytes, expand, view, &|n| std::env::var(n).ok())
-        .map_err(ResolveError::Registry)
+    root_file_from_value(&value.bytes, expand, lookup)
+}
+
+/// The string value `value` of an opened folder key, if it is a `REG_SZ` (not an expandable
+/// string, so no expansion happens inside an expansion) and not empty.
+#[cfg(windows)]
+fn registry_folder(key: &winreg::RegKey, value: &str) -> Option<String> {
+    use winreg::enums::REG_SZ;
+    let raw = key.get_raw_value(value).ok()?;
+    if !matches!(raw.vtype, REG_SZ) {
+        return None;
+    }
+    let text = utf16(&raw.bytes, u16::from_le_bytes)?;
+    let text = text.trim_end_matches('\0');
+    (!text.is_empty()).then(|| text.to_owned())
+}
+
+/// A bad `Root File` value.
+#[cfg(any(windows, test))]
+fn bad_value(reason: impl Into<String>) -> ResolveError {
+    ResolveError::RootFileValue {
+        reason: reason.into(),
+    }
 }
 
 /// The path held by the raw bytes of a registry string value (UTF-16LE, trailing NULs stripped,
-/// trimmed), expanded when `expand` is set. `None` if blank.
+/// trimmed), expanded when `expand` is set. `None` if blank. A non-blank result must be an
+/// absolute drive-letter path.
 #[cfg(any(windows, test))]
 fn root_file_from_value(
     bytes: &[u8],
     expand: bool,
-    view: RegistryView,
-    env: &dyn Fn(&str) -> Option<String>,
-) -> io::Result<Option<PathBuf>> {
-    let invalid = |what: &str| io::Error::new(io::ErrorKind::InvalidData, what.to_owned());
-    let text =
-        utf16(bytes, u16::from_le_bytes).ok_or_else(|| invalid("Root File is not valid UTF-16"))?;
+    lookup: &dyn Fn(KnownFolder) -> Option<String>,
+) -> Result<Option<PathBuf>, ResolveError> {
+    let text = utf16(bytes, u16::from_le_bytes)
+        .ok_or_else(|| bad_value("Root File is not valid UTF-16"))?;
     let text = text.trim_end_matches('\0');
     if text.contains('\0') {
-        return Err(invalid("Root File contains a NUL character"));
+        return Err(bad_value("Root File contains a NUL character"));
     }
     let text = if expand {
-        expand_env(text, |name| view_variable(view, name, env))
+        expand_root_file_value(text, lookup)?
     } else {
         text.to_owned()
     };
     let text = text.trim();
-    Ok((!text.is_empty()).then(|| PathBuf::from(text)))
+    if text.is_empty() {
+        return Ok(None);
+    }
+    if !is_drive_letter_path(text) {
+        return Err(bad_value(format!(
+            "Root File {text:?} is not an absolute drive-letter path"
+        )));
+    }
+    Ok(Some(PathBuf::from(text)))
 }
 
-/// Expands `%NAME%` references in `text` the way a `REG_EXPAND_SZ` value is meant to be: a name
-/// `lookup` knows is replaced by its value; an unknown name, an empty `%%` and an unmatched `%`
-/// stay as they are.
+/// `X:\...` or `X:/...`. A relative path, a drive-relative path (`X:dir`), a UNC path and a
+/// `\\?\` path all fail.
 #[cfg(any(windows, test))]
-fn expand_env(text: &str, lookup: impl Fn(&str) -> Option<String>) -> String {
+fn is_drive_letter_path(text: &str) -> bool {
+    let b = text.as_bytes();
+    b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/')
+}
+
+/// The folders a `REG_EXPAND_SZ` `Root File` may refer to. Each is read from HKLM in the view of
+/// the `Root File` value, never from the process environment (7.2).
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KnownFolder {
+    /// `%ProgramFiles%`.
+    ProgramFiles,
+    /// `%CommonProgramFiles%`.
+    CommonProgramFiles,
+    /// `%ProgramFiles(x86)%`.
+    ProgramFilesX86,
+    /// `%CommonProgramFiles(x86)%`.
+    CommonProgramFilesX86,
+    /// `%ProgramW6432%`.
+    ProgramW6432,
+    /// `%CommonProgramW6432%`.
+    CommonProgramW6432,
+    /// `%SystemRoot%` and `%windir%`.
+    SystemRoot,
+}
+
+#[cfg(any(windows, test))]
+impl KnownFolder {
+    /// The folder a `%NAME%` stands for (matched case-insensitively), if it is one of the fixed
+    /// names.
+    fn from_name(name: &str) -> Option<Self> {
+        const NAMES: [(&str, KnownFolder); 8] = [
+            ("ProgramFiles", KnownFolder::ProgramFiles),
+            ("CommonProgramFiles", KnownFolder::CommonProgramFiles),
+            ("ProgramFiles(x86)", KnownFolder::ProgramFilesX86),
+            (
+                "CommonProgramFiles(x86)",
+                KnownFolder::CommonProgramFilesX86,
+            ),
+            ("ProgramW6432", KnownFolder::ProgramW6432),
+            ("CommonProgramW6432", KnownFolder::CommonProgramW6432),
+            ("SystemRoot", KnownFolder::SystemRoot),
+            ("windir", KnownFolder::SystemRoot),
+        ];
+        NAMES
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|&(_, folder)| folder)
+    }
+
+    /// The HKLM subkey and value name that hold this folder.
+    fn registry_location(self) -> (&'static str, &'static str) {
+        const CURRENT_VERSION: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion";
+        const NT_CURRENT_VERSION: &str = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion";
+        match self {
+            Self::ProgramFiles => (CURRENT_VERSION, "ProgramFilesDir"),
+            Self::CommonProgramFiles => (CURRENT_VERSION, "CommonFilesDir"),
+            Self::ProgramFilesX86 => (CURRENT_VERSION, "ProgramFilesDir (x86)"),
+            Self::CommonProgramFilesX86 => (CURRENT_VERSION, "CommonFilesDir (x86)"),
+            Self::ProgramW6432 => (CURRENT_VERSION, "ProgramW6432Dir"),
+            Self::CommonProgramW6432 => (CURRENT_VERSION, "CommonW6432Dir"),
+            Self::SystemRoot => (NT_CURRENT_VERSION, "SystemRoot"),
+        }
+    }
+}
+
+/// Expands the `%NAME%` references of a `REG_EXPAND_SZ` `Root File` value. Only the names of
+/// [`KnownFolder`] are expanded, from `lookup`; the process environment is not consulted (7.2).
+/// Any other name, an empty `%%`, an unpaired `%` and a known name `lookup` has no value for are
+/// [`ResolveError::RootFileValue`]. Expanded text is not scanned again.
+#[cfg(any(windows, test))]
+fn expand_root_file_value(
+    text: &str,
+    lookup: impl Fn(KnownFolder) -> Option<String>,
+) -> Result<String, ResolveError> {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(i) = rest.find('%') {
         out.push_str(&rest[..i]);
         let after = &rest[i + 1..];
-        if let Some(j) = after.find('%').filter(|&j| j > 0)
-            && let Some(value) = lookup(&after[..j])
-        {
-            out.push_str(&value);
-            rest = &after[j + 1..];
-            continue;
+        let j = after
+            .find('%')
+            .ok_or_else(|| bad_value("Root File has an unpaired '%'"))?;
+        let name = &after[..j];
+        if name.is_empty() {
+            return Err(bad_value("Root File has an empty '%%'"));
         }
-        out.push('%');
-        rest = after;
+        let folder = KnownFolder::from_name(name)
+            .ok_or_else(|| bad_value(format!("Root File refers to unsupported %{name}%")))?;
+        let value = lookup(folder)
+            .ok_or_else(|| bad_value(format!("no registry value for %{name}% in this view")))?;
+        out.push_str(&value);
+        rest = &after[j + 1..];
     }
     out.push_str(rest);
-    out
-}
-
-/// Looks up an environment variable for expansion in registry view `view`: `ProgramFiles` and
-/// `CommonProgramFiles` come from the variables of that view (`...(x86)` for the 32-bit view,
-/// `...W6432` for the 64-bit one), falling back to the plain name when the view's variable is
-/// absent (32-bit Windows). The names are matched case-insensitively.
-#[cfg(any(windows, test))]
-fn view_variable(
-    view: RegistryView,
-    name: &str,
-    env: &dyn Fn(&str) -> Option<String>,
-) -> Option<String> {
-    const OVERRIDES: [(&str, &str, &str); 2] = [
-        ("ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"),
-        (
-            "CommonProgramFiles",
-            "CommonProgramFiles(x86)",
-            "CommonProgramW6432",
-        ),
-    ];
-    for (plain, wow32, wow64) in OVERRIDES {
-        if name.eq_ignore_ascii_case(plain) {
-            let specific = match view {
-                RegistryView::Wow64_32 => wow32,
-                RegistryView::Wow64_64 => wow64,
-            };
-            return env(specific).or_else(|| env(plain));
-        }
-    }
-    env(name)
+    Ok(out)
 }
 
 /// Resolves `name` in registry view `view`: locates the root file ([`root_file_path`]) and
@@ -649,15 +751,17 @@ enum UriFault {
 
 /// Converts a `file:` URI to an absolute local path (RFC 8089 forms seen in root files):
 /// `file:/dir/x`, `file:///dir/x` and `file://localhost/dir/x`; on Windows the path must be in
-/// drive-letter form (`file:///c:/dir/x.dll`). Percent-encoding is decoded.
+/// drive-letter form (`file:///c:/dir/x.dll`). Percent-encoding is decoded (two hex digits
+/// after each `%`). ASCII whitespace around the URI is trimmed.
 ///
 /// Refused: another scheme; a host other than `localhost` (which includes `file://c:/dir`); a
 /// path starting with `//` or `/\` before or after decoding (a share); a raw `?` or `#` (a query
 /// or fragment, or an unencoded character; `%3F` and `%23` decode normally); a `..` component or
-/// a NUL after decoding; on Windows a path without a drive letter; elsewhere a path that looks
+/// a NUL after decoding; an empty path (`file:///`); on Windows a path without a drive letter; elsewhere a path that looks
 /// like a drive letter.
 fn uri_to_path(uri: &str) -> Result<PathBuf, UriFault> {
-    let uri = uri.trim();
+    // Only ASCII whitespace is trimmed; any other character stays part of the value.
+    let uri = uri.trim_matches(|c: char| c.is_ascii_whitespace());
     let rest = uri
         .get(..5)
         .filter(|scheme| scheme.eq_ignore_ascii_case("file:"))
@@ -680,7 +784,7 @@ fn uri_to_path(uri: &str) -> Result<PathBuf, UriFault> {
         return Err(UriFault::Relative);
     }
     let path = percent_decode(path).ok_or(UriFault::Invalid)?;
-    if path.contains('\0') {
+    if path.contains('\0') || path == "/" {
         return Err(UriFault::Invalid);
     }
     // A second leading separator makes the rest of the path a server name on Windows and is a
@@ -717,6 +821,10 @@ fn percent_decode(s: &str) -> Option<String> {
     while let Some(b) = bytes.next() {
         if b == b'%' {
             let hex = [bytes.next()?, bytes.next()?];
+            // `from_str_radix` would also take a leading sign.
+            if !hex.iter().all(u8::is_ascii_hexdigit) {
+                return None;
+            }
             out.push(u8::from_str_radix(std::str::from_utf8(&hex).ok()?, 16).ok()?);
         } else {
             out.push(b);

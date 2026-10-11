@@ -20,6 +20,8 @@ the J2534 registration-definition directory (`j2534_definition_dir()`,
 ADR-228 — `/etc/nekoguruma/j2534` by default, fixed at build time through
 `NGR_J2534_DEFINITION_DIR` and resolved against the same fixed system
 directory as `system_config_dir()`, never against a `config-root-*` root),
+the D-PDU API root description file (`pdu_api_root_file()`, `NGR_PDU_API_ROOT_FILE`,
+default `pdu_api_root.xml` in the same fixed directory, so `/etc/pdu_api_root.xml`),
 and a fixed, platform-specific system config directory
 (`system_config_dir()`, ADR-226 SS3 amendment — `%ProgramData%\vci-service-launcher`
 on Windows, `/private/etc/vci-service-launcher` on macOS,
@@ -92,7 +94,9 @@ configuration, not a running service.
   (`%ProgramData%\nekoguruma\config.toml` by default), the fixed,
   administrator-only locations of ADR-228. The registration-definition
   directory (`j2534_definition_dir()`, `NGR_J2534_DEFINITION_DIR`, default
-  `nekoguruma/j2534`) is fixed the same way. Each has a runtime override in
+  `nekoguruma/j2534`) is fixed the same way, as is the D-PDU API root description
+  file on Linux (`pdu_api_root_file()`, `NGR_PDU_API_ROOT_FILE`, default
+  `pdu_api_root.xml`, so `/etc/pdu_api_root.xml`). Each has a runtime override in
   debug builds only (ADR-073). Before ADR-228 the default was
   `vci-service-launcher/config.toml`, which the Linux root `/` turned into
   `/vci-service-launcher/config.toml`.

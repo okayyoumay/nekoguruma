@@ -1050,6 +1050,7 @@ version = "0.1.0"
 dependencies = [
  "j2534-0404-registry",
  "libc",
+ "roxmltree",
  "serde",
  "tempfile",
  "thiserror",
@@ -1057,6 +1058,7 @@ dependencies = [
  "tracing",
  "vci-service-config",
  "windows-sys 0.61.2",
+ "winreg",
 ]
 
 [[package]]
@@ -2188,6 +2190,7 @@ version = "0.1.0"
 dependencies = [
  "roxmltree",
  "thiserror",
+ "vci-service-config",
  "winreg",
 ]
 

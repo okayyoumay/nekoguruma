@@ -2,15 +2,12 @@
 //!
 //! Chain: root description file (`pdu_api_root.xml`) -> one `MVCI_PDU_API` entry per
 //! implementation -> API library, module description file (MDF) and cable description file (CDF).
-//! The root file is located via `HKLM\SOFTWARE\D-PDU API` value `Root File` on Windows and is
-//! fixed at `/etc/pdu_api_root.xml` on Linux.
+//! The root file is located via `HKLM\SOFTWARE\D-PDU API` value `Root File` on Windows and by
+//! `vci_service_config::pdu_api_root_file()` elsewhere (`/etc/pdu_api_root.xml` by default).
 
 use std::path::{Path, PathBuf};
 
 use crate::{DiscoveryError, RegistryView};
-
-#[cfg(not(windows))]
-pub const LINUX_ROOT_FILE: &str = "/etc/pdu_api_root.xml";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PduApiLibrary {
@@ -45,7 +42,7 @@ pub fn root_file_path(view: RegistryView) -> Result<Option<PathBuf>, DiscoveryEr
     #[cfg(not(windows))]
     {
         let _ = view;
-        let path = PathBuf::from(LINUX_ROOT_FILE);
+        let path = vci_service_config::pdu_api_root_file();
         Ok(path.exists().then_some(path))
     }
 }

@@ -374,6 +374,28 @@ pub fn j2534_definition_dir() -> PathBuf {
     }
 }
 
+/// The D-PDU API root description file on Linux (design 7.1, ISO 22900-2 clause 8.7): it lists
+/// the installed implementations and is written by the administrator or the vendor's installer.
+/// Fixed at build time (ADR-228 Decision 1): `NGR_PDU_API_ROOT_FILE` at build time, either
+/// absolute or relative to the fixed system directory of [`fixed_system_root`] (default
+/// `pdu_api_root.xml`, so `/etc/pdu_api_root.xml` on Linux). No `config-root-*` feature moves it.
+/// In debug builds only (ADR-073), a non-empty runtime `NGR_PDU_API_ROOT_FILE` takes precedence;
+/// release builds read no environment variable here. On Windows the root file is named by the
+/// registry instead, and this function is not used.
+pub fn pdu_api_root_file() -> PathBuf {
+    const ROOT_FILE: &str = env!("NGR_PDU_API_ROOT_FILE");
+    #[cfg(debug_assertions)]
+    let path = runtime_override(std::env::var_os("NGR_PDU_API_ROOT_FILE"))
+        .unwrap_or_else(|| PathBuf::from(ROOT_FILE));
+    #[cfg(not(debug_assertions))]
+    let path = PathBuf::from(ROOT_FILE);
+    if path.is_absolute() {
+        path
+    } else {
+        fixed_system_root().join(path)
+    }
+}
+
 /// A debug-only runtime override (ADR-073) from an environment variable's value: none when
 /// the variable is unset or empty, so an empty value falls back to the build-time location
 /// instead of resolving to the root itself.
@@ -1345,16 +1367,20 @@ mod tests {
     #[test]
     fn default_locations_are_under_nekoguruma() {
         let defaults = env!("VCI_CONFIG_PATH") == "nekoguruma/config.toml"
-            && env!("NGR_J2534_DEFINITION_DIR") == "nekoguruma/j2534";
+            && env!("NGR_J2534_DEFINITION_DIR") == "nekoguruma/j2534"
+            && env!("NGR_PDU_API_ROOT_FILE") == "pdu_api_root.xml";
         // Cargo puts `rustc-env` values into the test process's environment as well, so a
         // variable holding the embedded value is no override.
         let overridden = |name: &str, embedded: &str| {
             std::env::var_os(name).is_some_and(|value| !value.is_empty() && value != embedded)
         };
         let runtime_overrides = overridden("VCI_CONFIG_PATH", env!("VCI_CONFIG_PATH"))
-            || overridden("NGR_J2534_DEFINITION_DIR", env!("NGR_J2534_DEFINITION_DIR"));
+            || overridden("NGR_J2534_DEFINITION_DIR", env!("NGR_J2534_DEFINITION_DIR"))
+            || overridden("NGR_PDU_API_ROOT_FILE", env!("NGR_PDU_API_ROOT_FILE"));
         if !defaults || runtime_overrides {
-            eprintln!("skipped: VCI_CONFIG_PATH or NGR_J2534_DEFINITION_DIR is set");
+            eprintln!(
+                "skipped: VCI_CONFIG_PATH, NGR_J2534_DEFINITION_DIR or NGR_PDU_API_ROOT_FILE is set"
+            );
             return;
         }
         let root = Path::new("/some/root");
@@ -1364,6 +1390,11 @@ mod tests {
         assert_eq!(
             j2534_definition_dir(),
             fixed_system_root().join("nekoguruma/j2534")
+        );
+        // The D-PDU API root file is a file directly in the fixed system directory.
+        assert_eq!(
+            pdu_api_root_file(),
+            fixed_system_root().join("pdu_api_root.xml")
         );
     }
 

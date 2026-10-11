@@ -25,7 +25,8 @@ profile, which the user can write.
 The J2534 registration definitions on Linux (design 7.1.1) are read from
 `/etc/nekoguruma/j2534/` in every build: no `config-root-*` feature moves them
 (`j2534_definition_dir()`; `NGR_J2534_DEFINITION_DIR` at build time, with a runtime override in
-debug builds only).
+debug builds only). The D-PDU API root description file on Linux is likewise fixed
+(`pdu_api_root_file()`, `NGR_PDU_API_ROOT_FILE`, default `/etc/pdu_api_root.xml`).
 
 If the file does not exist, all logging defaults to `stderr` at the `info` level. Parse errors in the file are printed to `stderr` and defaults are used.
 

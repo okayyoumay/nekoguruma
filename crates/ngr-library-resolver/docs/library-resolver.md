@@ -14,17 +14,21 @@ same call resolves a name on every platform. What does not depend on the standar
 | Module | Standard | Linux | Windows |
 |---|---|---|---|
 | `j2534_0404` | SAE J2534-1 v04.04 (registry: §9.2) | definition files (below) | registry, through `j2534-0404-registry` |
+| `iso22900` | ISO 22900-2 D-PDU API (clause 8.7, Annex F) | root description file (see "ISO 22900") | the same, found through the registry |
 
-The rest of this document describes the `j2534_0404` module; the names below are in it
-(`j2534_0404::resolve`, `j2534_0404::ResolveError`, ...).
+Unless a section says otherwise, this document describes the `j2534_0404` module; the names in
+it are that module's (`j2534_0404::resolve`, `j2534_0404::ResolveError`, ...). The `iso22900`
+module has its own section below and its own `resolve` and `ResolveError`.
 
 ## Scope
 
 - In scope: reading Linux J2534 definition files, validating them, matching a VCI name, and on
   Windows looking the name up in the registry (through `j2534-0404-registry`).
+- Also in scope: resolving a D-PDU API implementation name through the root description file
+  (`iso22900`).
 - Also in scope: the writability check of 7.2 (below), standard-independent and at the crate root.
 - Not in scope yet: the signer check of 7.2, and the callers (`j2534-0404-service`,
-  `agent`, `vci-discovery`) still use their own lookups.
+  `agent`, `iso22900-service`, `vci-discovery`) still use their own lookups.
 
 ## Definition files (non-Windows)
 
@@ -96,6 +100,55 @@ Windows). A caller that needs both views, such as the agent choosing a worker bu
 `resolve_on_registry(name, mode)` per view; mode `All` returns the first hit and does not detect a
 name present in both views. A hit carries the name and library path only (protocols, `LongSize` and search
 paths are empty), with `Source::Registry`. The registry value is not checked for being absolute.
+
+## ISO 22900 (D-PDU API)
+
+The `iso22900` module resolves an implementation name (design 7.1; ISO 22900-2 clause 8.7 and
+Annex F, cited by clause only).
+
+**Chain.** The root description file lists one `MVCI_PDU_API` entry per installed implementation.
+The entry itself names the API library (`LIBRARY_FILE`), the module description file
+(`MODULE_DESCRIPTION_FILE`) and the cable description file (`CABLE_DESCRIPTION_FILE`), each as a
+`URI` attribute holding a `file:` URI. The MDF and CDF are not parsed here; their paths are
+reported in `Implementation`. Percent-encoding is decoded; on Windows a remote host becomes a UNC
+path, elsewhere a remote host or a drive letter is refused.
+
+**Root file location** (`root_file_path()`). On Windows the native registry view of
+`HKLM\SOFTWARE\D-PDU API`, value `Root File` (trimmed; a missing key, value or blank content is
+`None`). Elsewhere `vci_service_config::pdu_api_root_file()` (`/etc/pdu_api_root.xml` in release
+builds, fixed at build time by `NGR_PDU_API_ROOT_FILE`, ADR-228 Decision item 1; debug builds also
+read the variable at run time, ADR-073). `resolve(name)` locates the root file and calls
+`resolve_in_root_file(root_file, name)`.
+
+**Matching.** The name is an entry's `SHORT_NAME` (trimmed), matched exactly and
+case-sensitively against the name as given. The root file is read up to `MAX_ROOT_FILE_SIZE`
+(1 MiB); more is `TooLarge`.
+
+**Errors.**
+
+- `NoRootFile`: no registry value, or the root file does not exist. Distinct from `NotFound`.
+- `NotFound`: no entry has the name; it carries the number of unusable entries skipped, so a
+  typo in an entry is visible. Each skipped entry is logged at warn level.
+- `Ambiguous`: more than one entry has the name (an unusable one counts); none is picked.
+- `InvalidEntry`: the one entry with the name is refused, with an `EntryError`: no
+  `LIBRARY_FILE` (`MissingLibrary`), a URI that is not a valid `file:` URI (`InvalidUri`, for
+  the MDF and CDF as well), or a library path that is not absolute after conversion
+  (`RelativeLibrary`; on Windows a URI without drive letter or host).
+- `Xml`: the root file is not well-formed XML; the error names the file. `Io` is any other read
+  failure.
+
+`parse_root_file` and `read_root_file` return every entry: usable ones in `implementations`,
+unusable ones with their reason in `invalid`, both in document order.
+
+**Naming files.** `Resolved::naming_files()` is the root file, then the MDF and the CDF when the
+entry names them. They decide which library is loaded or how it is configured, so they take part
+in the 7.2 writability check; the library is passed separately:
+
+```rust
+check_writability(&r.implementation.library_file, &r.naming_files())?;
+```
+
+On Windows the registry value is not covered (HKLM is trusted by premise, 7.2).
 
 ## Writability check (design 7.2)
 

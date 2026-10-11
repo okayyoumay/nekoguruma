@@ -167,7 +167,8 @@ CDF alike, on every platform. Percent-encoding is decoded. ASCII whitespace arou
 trimmed; any other character (such as U+00A0) is not. A host other than `localhost` (this
 includes `file://c:/dir/x.dll`) and a path starting with `//` or `/\` in any encoding
 (`file:////server/..`, `file:///%5C%5Cserver/..`) are `RemoteHost`: a share cannot meet the 7.2 premise that regular
-users cannot write the chain. A raw `?` or `#`, a `..` component, a NUL after decoding, an empty path
+users cannot write the chain. A raw `?` or `#`, a `..` component (or any other component made only of dots and spaces except
+`.`, since Windows drops trailing dots and spaces and `.. ` would name the parent there), a NUL after decoding, an empty path
 (`file:///`), another scheme and malformed percent-encoding (each `%` needs two hex digits; a
 sign is not one) are `InvalidUri`; so is a drive-letter path off Windows (`file:///c:/x`). On Windows only the drive-letter form is
 accepted (a path without one is `RelativePath`, not `InvalidUri`); raw backslashes may stay. A URI that gives a

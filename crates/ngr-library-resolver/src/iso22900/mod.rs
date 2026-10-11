@@ -797,7 +797,13 @@ fn uri_to_path(uri: &str) -> Result<PathBuf, UriFault> {
         return Err(UriFault::Remote);
     }
     let separators: &[char] = if cfg!(windows) { &['/', '\\'] } else { &['/'] };
-    if path.split(separators).any(|part| part == "..") {
+    // Windows drops trailing dots and spaces from a path component, so `.. ` or `...` would also
+    // name the parent there. A component made only of dots and spaces is therefore refused on
+    // every platform, except `.` itself.
+    if path
+        .split(separators)
+        .any(|part| !part.is_empty() && part != "." && part.chars().all(|c| c == '.' || c == ' '))
+    {
         return Err(UriFault::Invalid);
     }
 

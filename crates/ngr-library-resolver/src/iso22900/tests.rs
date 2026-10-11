@@ -318,12 +318,17 @@ fn parent_components_and_nul_are_refused_in_any_encoding() {
         uri("a/../b/lib.so"),
         uri("a/%2e%2E/lib.so"),
         uri("a/lib.so/.."),
+        uri("a/..%20/lib.so"),
+        uri("a/.../lib.so"),
+        uri("a/.%20./lib.so"),
+        uri("a/%20/lib.so"),
         uri("a%00/lib.so"),
     ] {
         assert_eq!(uri_to_path(&bad), Err(UriFault::Invalid), "{bad}");
     }
-    // A dotted name is not a parent component.
+    // A dotted name is not a parent component, and `.` is the directory itself.
     assert_eq!(uri_to_path(&uri("a..b/lib.so")), Ok(path("a..b/lib.so")));
+    assert_eq!(uri_to_path(&uri("a/./lib.so")), Ok(path("a/./lib.so")));
 }
 
 #[test]

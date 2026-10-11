@@ -29,7 +29,8 @@ child, any registry value expanded, any declared encoding, UNC paths on Windows)
    ignored. Only the un-namespaced `URI` attribute counts.
 2. **Only local absolute paths.** A `file:` URI is accepted when it names no host other than
    `localhost`, does not start its path with `//` (in any percent-encoding), has no `..`
-   component and no NUL after decoding, and has no raw `?` or `#` (their percent-encoded forms
+   component (nor another component made only of dots and spaces, except `.`, since Windows
+   drops trailing dots and spaces from a component) and no NUL after decoding, and has no raw `?` or `#` (their percent-encoded forms
    decode normally), and no empty path (`file:///`). `/\` is refused like `//`. ASCII whitespace
    around the URI is trimmed, nothing else. On Windows only the drive-letter form is accepted
    (`RelativePath` otherwise); off Windows a drive-letter path (`file:///c:/x`) is `InvalidUri`. This holds for the

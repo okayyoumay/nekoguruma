@@ -1307,6 +1307,63 @@ Such operations are hidden in the UI from the outset and are also stated explici
 - **Clock substitution**: for testing start deadlines and execution time windows, and the vehicle simulator's timers, which run on an injectable clock (ADR-239)
 - **CI matrix**: OS x worker ABI x operating mode
 
+### 13.5 Real-Hardware Checks
+
+The simulators in 13.4 are what CI relies on. Some things they cannot show: how a vendor library actually behaves, timing and electrical behaviour on a real bus, and the per-vendor items in 17 ("Items to Confirm Early"). Real-hardware checks cover these. They are **optional**: no CI job runs them, and a check that cannot run because no hardware is attached never blocks a change. The reasons and the alternatives considered are in ADR-275.
+
+**Target classes.** A hardware profile (below) declares which class the attached setup is. The classes are not ordered: a loopback, a stand-in ECU, a bench ECU and a vehicle differ in topology and in what may be sent to them, so a setup of one class never stands in for another. Each check declares the set of classes it can run on, and it runs only when the profile's class is in that set.
+
+| Class | Setup | Operations allowed |
+|---|---|---|
+| T0 Loopback | A VCI with no ECU: two CAN channels of the same VCI, or the VCI and a second CAN interface, wired to each other with termination | Bus-level traffic only between the profile's two endpoints (open, connect, filters, loopback frames, and the ComParams the profile's links allow). No ECU-addressed request |
+| T1 Stand-in ECU | A VCI talking over a real CAN bus to `sim-ecu`, run on a Linux host through a SocketCAN interface instead of through `sim-vci` | Every UDS service, including writes, reprogramming and fault injection: the ECU is simulated, so no ECU can be damaged. The VCI, the wiring and the link are real, so link setup and hardware controls stay under the guard below |
+| T2 Bench ECU | A real ECU on a bench, powered from a laboratory power supply | Reads; configuration-value writes, routines and reprogramming, with the security access or OEM authentication they need, only inside an authorized job under the conditions below, and reprogramming only when the profile declares the ECU expendable |
+| T3 Vehicle | A real vehicle through its diagnostic connector, ignition on, engine off | Read-only: session control to the default or extended session, reads of DIDs and DTCs, tester present, monitoring. No writes, DTC clearing, routines, resets or security access |
+
+T1 is what makes write and interruption checks safe on real VCIs: the VCI, its library and the bus are real, and the ECU keeps the fault injection and the persistent state of 13.4.
+
+**Writes on a real ECU.** On T2, a check that writes or reprograms runs a job through the agent, the same path a production job takes, so every existing guard applies: the device-side safeguards and write-job state transitions (5.5, 5.6), the execution preconditions (8.9, and 8.9.1 for reprogramming), and the authorization, confirmation and approval levels that section 6 sets for that job type. A T2 write or reprogramming check is written only once all of these exist for its job type; until then, write checks run on T1 and T2 checks stay read-only. The class guard is a ceiling on top of these, never a replacement for any of them.
+
+**Device requirements.**
+
+| Item | Requirement | Needed for |
+|---|---|---|
+| Host PC | Windows 10/11 x86_64; Linux x86_64. Optionally a Linux aarch64 board, to check the inferred ARM ABI (7.1.2) | All classes |
+| J2534 VCI | SAE J2534-1 v04.04 library supporting the CAN and ISO 15765 protocols (J2534-1 6.5.5, 6.5.6) at 500 kbit/s with 11-bit and 29-bit identifiers. Preferably two CAN channels through the additional channels of SAE J2534-2 (clause 7), which gives T0 without a second interface. A Linux library, if the vendor has one, checks the `unsigned long` width (7.1.2) | All classes |
+| D-PDU API VCI | ISO 22900-2 (2022) library with a root description file (Annex F.1) and the ISO 15765-2 (2024) transport and network layer protocols (clauses 9 and 10) on CAN. One device that provides both APIs covers this and the J2534 VCI | All classes |
+| CAN interface | A USB-CAN adapter with a SocketCAN driver in the mainline Linux kernel | T0 without a second VCI channel, T1 |
+| Wiring | A diagnostic-connector (SAE J1962) breakout with the pin assignments listed in SAE J2534-1 6.8: CAN high and low on pins 6 and 14, battery on pin 16, chassis and signal ground on pins 4 and 5; a 120 ohm terminator at each end of the bus (about 60 ohm measured across it) | T0 to T2 |
+| Power supply | Adjustable 12 to 14 V laboratory supply with a current limit, enough for the VCI and the bench ECU. A switch the host can control (for example a USB relay) lets a check cut power during a transfer | T1 power-loss checks, T2 |
+| Bench ECU | An ECU that speaks UDS (the application layer protocol of ISO 14229-1 (2026) clause 7) over ISO 15765-2 (2024) clauses 9 and 10 on CAN, with its pinout known, and either no security access or a seed/key algorithm available to the tester. A spare unit, declared expendable, for reprogramming | T2 |
+| Vehicle | A vehicle with a diagnostic connector the owner allows diagnostic reads on | T3 |
+
+**Hardware profile.** A TOML file outside the repository describes the attached setup; the path is given in the `NGR_HW_PROFILE` environment variable. It names the VCI (its API, `j2534-0404` or `iso22900`, its library name, resolved as in 7.1, and the module: a device name or serial number the library reports for it), the target class, and the complete link: protocol, baud rate, connector pins, the physical, response and functional CAN identifiers and their width, the addressing format and padding, and the transport ComParams the link uses (the same values an IR `Protocol` declaration carries). A T0 profile names both loopback endpoints this way: two channels of one module, or two modules, possibly of different APIs or a SocketCAN interface. A profile can only narrow what its class allows, with three exceptions: on T2 it may allow reprogramming of an ECU it declares expendable, and on T1 and T2 it may name the commands that switch the power supply off and on, and the specific hardware controls (below) the attached wiring is safe for. A T3 profile can add nothing. A check refuses to start when the profile's class is not in its set, when it needs an operation the profile does not allow, or when the library reports no module or more than one module matching the profile, so the class is never applied to the wrong device. A J2534 library reports no serial number, and a configured module is listed whether or not its device is plugged in, so for J2534 the match is not proof of identity on its own: the profile names the device name used when the device is opened and it must be the only module configured for that library; after opening, and before the link is created, the check compares the firmware and library versions the device reports with the ones the profile records; and only that VCI is connected to the host while the check runs (procedure step 1).
+
+**Guarded VCI access.** Checks do not rely on their own care to stay within the class. A check gets the VCI only through a guarded handle the test harness creates; the harness does not hand out the worker client or the vendor library, and a hardware check that opens either directly is rejected in review. When a check runs a job through the agent, the guard sits between the agent and the worker: the harness gives the agent's job runner a worker client that wraps the real one and passes every call through the same guard, so the production job path is mediated exactly like a direct check. The guard sees every operation and fails the check before anything reaches the device when an operation is not allowed:
+
+- Link setup: the harness creates and connects exactly the links the profile describes (one, or a T0 profile's two loopback endpoints). A check cannot create any other link or change the protocol, baud rate, pins or other physical-layer ComParams.
+
+- UDS requests: the service, and the sub-function where it matters, are compared with the class's list. On T3 this list is an allow-list of read-only services. On T2 a state-changing request passes only from the authorized job and only when that job declares the exact request: the data identifier for a write, and for a routine the routine identifier, the sub-function and the parameters (exact values or stated bounds). A routine the job does not declare is refused even when its sub-function matches.
+- Raw frames and periodic messages: the guard decodes the UDS request a frame carries and applies the same lists. On T3, and on T2 outside an authorized job, only frames to the profile's request identifiers carrying a read-only request pass; on T2 a state-changing request passes only from the authorized job. On T0 only traffic between the two loopback endpoints passes.
+- Hardware controls: programming voltage, pin changes (J2534-1 6.7, 6.8) and vendor IOCTLs are refused on every class by default. On T1 and T2, a control passes only when the profile lists that control together with its complete parameters (for programming voltage the pin and the voltage, for a pin change the pins, for a vendor IOCTL its identifier and the exact payload or a stated safe range) and the request matches them; on T2 it must also be part of an authorized job. Reading the battery voltage is always allowed.
+
+**Check requirements.** Each check declares its requirements as static data the harness can read without running it: the classes it can run on and the operations it needs beyond its class's reads (configuration writes, reprogramming, power switching, named hardware controls). The harness collects these declarations from every `hw_` check, so it can list which checks a profile permits and refuse a check before it opens the device, rather than when the guard first refuses a request.
+
+**Running.** Hardware checks are ordinary Rust tests marked `#[ignore]` with a reason naming this section, and their names start with `hw_`, so `cargo test` and the CI profiles skip them. They run with `cargo nextest run --profile hardware --run-ignored=only`. The `hardware` profile selects the `hw_` tests and runs them one at a time (one VCI is one shared resource, 8.8.1) with no retries; `--run-ignored=only` is part of the command because a nextest profile cannot include ignored tests by itself. When `NGR_HW_PROFILE` is not set, a hardware check fails rather than passing silently: running it was an explicit request.
+
+**Cleanup.** The harness registers a teardown step as it acquires each resource (before it switches power on, when it opens a device, when it connects a link) and runs the steps that were registered, in reverse order and each at most once, when the check ends, whether it passes, fails or panics: return an ECU to the default session where one was addressed, close the channel and the device and, when the profile names the power commands, switch the supply off. A check that runs a write or reprogramming job through the agent is the exception: the job runner owns interruption and recovery (5.6, and 8.10.1 for sections that must not be interrupted), so the harness first lets the job reach a state from which 5.6 allows teardown and only then runs this generic cleanup; it never cuts power during such a job except in a deliberate power-loss check on T1. If the process dies or the host loses power so that cleanup cannot run, the ECU falls back to the default session by itself once tester present stops (the S3 session timeout of ISO 14229-2 (2021) 9.5); the operator then switches the power or ignition off and, after an interrupted write on T2, follows the recovery of 5.6 before the next run.
+
+**Reports.** Each run writes a report: the date and time of the run, host and OS, worker ABI, VCI vendor, model, firmware and library version (read through the API where it offers them), target class, and the result of each check. It is written to a directory in the running user's data directory, readable by that user only, and never inside the repository. VINs and serial numbers are masked in the report unless the profile asks for them in full; the owner of the setup decides how long reports are kept.
+
+**Procedure.**
+
+1. Prepare the setup for its class: only the profile's VCIs and CAN interfaces connected to the host, wiring and termination checked (about 60 ohm across CAN high and low with power off), supply voltage set and current limit on, for T3 the ignition on and the engine off.
+2. Write or check the hardware profile, then list the checks that the profile permits without running them (the harness compares each check's declared requirements with the profile).
+3. Run the checks for the milestone or area being looked at with the command under **Running** above.
+4. Read the report.
+5. Turn findings into lasting records: a vendor behaviour the VCI profile can express becomes a profile item (9.3), an answer to an item in 17 ("Items to Confirm Early") is written down there, and a defect is fixed or tracked as an open item.
+6. Check that the target is as it was found: default session, and for T2 and T3 the power or ignition off.
+
 ---
 
 ## 14. Cloud Deployment
@@ -1491,6 +1548,8 @@ Items listed here are limited to those that **cannot be resolved by extension pa
 | Adding new VCIs, vehicle models or ECUs | VCI profile, IR (9.2) |
 
 ### Items to Confirm Early (per Vendor)
+
+These are answered with the real-hardware checks in 13.5, and each answer is written into the VCI profile (9.3) or this list.
 
 - Supported standards (J2534 version / D-PDU API) and provided platforms
 - Width of `unsigned long` and struct packing in Linux J2534 libraries

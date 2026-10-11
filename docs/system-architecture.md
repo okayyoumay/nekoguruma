@@ -551,10 +551,10 @@ Confirmation level (6.3) and two-person approval. The server decides the require
 |---|---|
 | J2534 / Windows | Per-VCI key under `HKLM\SOFTWARE\PassThruSupport.04.04` -> `FunctionLibrary` (absolute path of the DLL). `Name` / `Vendor` are used for display |
 | J2534 / Linux | Registration definition specific to this software (7.1.1) -> `FunctionLibrary` (absolute path of the .so) |
-| ISO 22900 (D-PDU API) | Registry (Windows) / default path (Linux) -> root description file (XML) -> module description file -> API library |
+| ISO 22900 (D-PDU API; ISO 22900-2:2022 clause 8.7 and Annex F, the same chain as 2009 clause 9.7) | Registry value `Root File` under `HKLM\SOFTWARE\D-PDU API` (Windows) / path fixed at build time, `/etc/pdu_api_root.xml` by default (Linux) -> root description file (XML) -> the `MVCI_PDU_API` entry whose `SHORT_NAME` matches -> `LIBRARY_FILE` (`file:` URI, absolute local path of the API library). The entry's module and cable description files (MDF, CDF) are referenced alongside and verified under 7.2, not followed to find the library |
 
 - Specify the registry view explicitly with `KEY_WOW64_32KEY` / `KEY_WOW64_64KEY`
-- Expand environment variables in `REG_EXPAND_SZ` according to the library's bitness
+- Expand a `REG_EXPAND_SZ` value only from a fixed list of system folder names, taking each folder from the HKLM value of the same registry view (so the view's bitness decides it), never from the process environment; any other variable is refused, and the result must be an absolute local path (ADR-277)
 - Also follow and verify the chain of paths referenced by configuration files
 - Redo discovery at every job start; no change-monitoring mechanism is kept
 - A registration definition indicates where the library is. How that VCI is handled (capabilities, quirks, ABI overrides, COMPARAM mapping) is declared in the VCI profile (9.3)
@@ -622,7 +622,7 @@ Basis for the inference: AArch64's AAPCS64 matches x86_64's System V ABI in that
 
 **Trusted locations**
 
-On Windows, the basis for trust is that HKLM can be modified only by administrators. Linux gets the same premise by reading registration definitions only from `/etc/nekoguruma/j2534/` (7.1.1), in both modes. The locations of every file that decides which library is loaded (registration definitions, the worker service's configuration file) are fixed at build time. They are not taken from environment variables or command-line arguments, so another process cannot redirect a worker to a different file; a runtime override is compiled into debug builds only, for tests (ADR-228).
+On Windows, the basis for trust is that HKLM can be modified only by administrators. Linux gets the same premise by reading registration definitions only from `/etc/nekoguruma/j2534/` (7.1.1), in both modes. The locations of every file that decides which library is loaded (registration definitions, the D-PDU API root description file on Linux, the worker service's configuration file) are fixed at build time. They are not taken from environment variables or command-line arguments, so another process cannot redirect a worker to a different file; a runtime override is compiled into debug builds only, for tests (ADR-228).
 
 **One resolver, checked where the library is loaded**
 

@@ -261,7 +261,7 @@ Serialization format used for gRPC messages. Schema lives in `vci-service-interf
 ## R–S
 
 **RDF** — Root Description File  
-An XML file that lists installed D-PDU API libraries with their short names and DLL paths. Read by `iso22900-registry`. Located via the Windows registry (`HKLM\SOFTWARE\D-PDU API\Root File`) or, on non-Windows, the hardcoded path `/etc/pdu_api_root.xml`; there is no environment-variable override. `iso22900-service` consults a `library_path` config override (see **Library Path Override**) before falling back to RDF-based lookup, so a library name can be resolved without an RDF file at all.
+An XML file that lists installed D-PDU API libraries with their short names and DLL paths. Read by `iso22900-registry`, `vci-discovery` and `ngr-library-resolver`. Located via the Windows registry (`HKLM\SOFTWARE\D-PDU API\Root File`) or, on non-Windows, a fixed path: `iso22900-registry` hardcodes `/etc/pdu_api_root.xml`; the other two use `vci_service_config::pdu_api_root_file()` (build-time `NGR_PDU_API_ROOT_FILE`, default `/etc/pdu_api_root.xml`, runtime override in debug builds only). `iso22900-service` consults a `library_path` config override (see **Library Path Override**) before falling back to RDF-based lookup, so a library name can be resolved without an RDF file at all.
 
 **RC-Pending** — Response-Code Pending  
 Informal shorthand for NRC 0x78 (`requestCorrectlyReceived-ResponsePending`). The ECU sends this to indicate it received the request but needs more time to compute the response.

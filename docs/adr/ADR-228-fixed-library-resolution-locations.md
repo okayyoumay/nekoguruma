@@ -2,7 +2,7 @@
 
 **Date:** 2026-10-04
 **Status:** Accepted (the Linux definition format and the shared crate's name settled by ADR-266)
-**Affects:** `docs/system-architecture.md` (4, 4.2, 7.1.1, 7.2, 7.3, 9.2, 9.3, 9.4, 11, 11.1, 16.1), `api/openapi.yaml`, `schemas/extension-manifest.*`, `db/migrations/0002_extensions_without_vci_profile.sql`, `crates/vci-discovery`, `crates/vci-service-config`, `crates/j2534-0404-registry`, `crates/worker-host`, worker services
+**Affects:** `docs/system-architecture.md` (4, 4.2, 7.1.1, 7.2, 7.3, 9.2, 9.3, 9.4, 11, 11.1, 16.1), `api/openapi.yaml`, `schemas/extension-manifest.*`, `db/migrations/0002_extensions_without_vci_profile.sql`, `crates/vci-discovery`, `crates/vci-service-config`, `crates/ngr-library-resolver`, `crates/j2534-0404-registry`, `crates/worker-host`, worker services
 
 ## Context
 
@@ -61,8 +61,9 @@ checked file and the loaded file can differ.
   `%ProgramData%\nekoguruma\config.toml` on Windows by default (`vci-service-config`, build-time
   `VCI_CONFIG_PATH`), replacing a placeholder that resolved to the filesystem root on Linux. The
   registration-definition directory is fixed the same way (`j2534_definition_dir()`, build-time
-  `NGR_J2534_DEFINITION_DIR`, default `/etc/nekoguruma/j2534`), each with a debug-only runtime
-  override.
+  `NGR_J2534_DEFINITION_DIR`, default `/etc/nekoguruma/j2534`), and so is the D-PDU API root
+  description file on Linux (`pdu_api_root_file()`, build-time `NGR_PDU_API_ROOT_FILE`, default
+  `/etc/pdu_api_root.xml`), each with a debug-only runtime override.
 - A VCI profile fix can no longer be pushed to agents from the server; it reaches devices only
   through the operator's package management. The server's extension-package ingestion no longer
   handles VCI profiles.

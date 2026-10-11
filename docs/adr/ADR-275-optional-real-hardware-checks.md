@@ -39,7 +39,8 @@ also need a limit that does not depend on each check's author being careful.
    (service and, where it matters, sub-function; T3 uses an allow-list of read-only services),
    raw frames and periodic messages, and hardware controls such as programming voltage, pin
    changes and vendor IOCTLs, which are refused on every class unless a T1 or T2 profile lists
-   the control; on T2 a listed control also has to be part of an authorized job, so a profile
+   the control with its complete parameters (pin and voltage, pins, IOCTL identifier and exact
+   payload or safe range) and the request matches them; on T2 a listed control also has to be part of an authorized job, so a profile
    entry alone never allows one on a real ECU. The harness creates the profile's one link, and
    checks cannot create others or change its physical layer. The profile names the module, and a
    check refuses zero or several matches; because a J2534 library reports no serial number and
@@ -57,7 +58,10 @@ also need a limit that does not depend on each check's author being careful.
    VCI and library without risking an ECU.
 6. **Cleanup on every exit.** A check registers its cleanup (default session, channel closed,
    power off where the profile can switch it) before its first request to an ECU, and it runs
-   on pass, failure and panic. When the process or host dies, the ECU's own session timeout
+   on pass, failure and panic. During a write or reprogramming job run through the agent, the
+   job runner owns interruption and recovery (design 5.6, 8.10.1); the generic cleanup runs only
+   once the job reaches a state 5.6 allows teardown from, and power is never cut during such a
+   job except in a deliberate T1 power-loss check. When the process or host dies, the ECU's own session timeout
    returns it to the default session, and the operator follows design 5.6 after an interrupted
    write.
 7. **Findings go into permanent records.** Each run writes a report with its date and time to

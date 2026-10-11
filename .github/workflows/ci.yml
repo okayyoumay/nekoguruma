@@ -142,7 +142,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: |
           for target in $TARGETS; do
-            cargo check --locked -p sim-vci -p j2534-0404-service -p iso22900-service --target "$target"
+            cargo check --locked -p sim-vci -p j2534-0404-service -p iso22900-service -p ngr-library-resolver --target "$target"
           done
 
   # The workspace `rust-version` (Cargo.toml) is the oldest Rust the code must build with; every

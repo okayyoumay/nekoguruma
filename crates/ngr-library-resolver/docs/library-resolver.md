@@ -26,9 +26,10 @@ module has its own section below and its own `resolve` and `ResolveError`.
   Windows looking the name up in the registry (through `j2534-0404-registry`).
 - Also in scope: resolving a D-PDU API implementation name through the root description file
   (`iso22900`).
-- Also in scope: the writability check of 7.2 (below), standard-independent and at the crate root.
-- Not in scope yet: the signer check of 7.2, and the callers (`j2534-0404-service`,
-  `agent`, `iso22900-service`, `vci-discovery`) still use their own lookups.
+- Also in scope: the writability check and the signer check of 7.2 (below), standard-independent
+  and at the crate root, and `check_library`, which runs both.
+- Not in scope yet: the callers (`j2534-0404-service`, `agent`, `iso22900-service`,
+  `vci-discovery`) still use their own lookups.
 
 ## Definition files (non-Windows)
 
@@ -260,3 +261,75 @@ directory they do.
 The per-entry rules are pure functions over plain data (owner, permission bits or ACE list, role,
 policy) and are unit-tested on synthetic input on every platform; only the walker's calls into the
 operating system differ.
+
+## Signer check (design 7.2)
+
+ADR-278 is the decision record. The check answers: if the library carries an embedded Authenticode
+signature, does it verify against the system trust store?
+
+```rust
+let signer = check_library(library, &resolved.naming_files(), &Policy::system())?; // both checks
+let signer = check_signer(library)?;                                               // signer only
+```
+
+`check_library` is the single pre-load entry point: it runs `check_writability_with` and
+`check_signer` and returns `Err(PreloadError)` with every `Finding` of both (`findings`, writability
+first). A file that could not be read for the signer check is `PreloadError::io`, not a finding.
+The error also carries what the signer check learned: `PreloadError::signer` is the verdict when
+the check ran without an I/O error and found no invalid signature (so it accompanies writability
+findings), and `PreloadError::held` is the open file when the signature was invalid (there is no
+`Signer` then; `SignerError::Invalid` holds the file too). User mode, which warns and loads, should
+load with that verdict or file kept alive until the library is mapped; device mode drops them.
+The caller decides what a finding means: device mode refuses the library, user mode warns and
+loads. The check takes no mode.
+
+**Verdict.** `Signer::NotApplicable` on every platform but Windows. On Windows:
+`Signer::Unsigned` (no signature to verify) or `Signer::Trusted { subject, thumbprint_sha256, .. }`,
+the signer certificate's simple display name and the SHA-256 of its encoded bytes in upper-case
+hex. Both Windows variants hold the open file, see below.
+
+**Presence.** A signature is present when the size field of the PE optional header's security data
+directory (entry 4) is not zero. PE32 and PE32+ are read; a directory the header does not declare
+(fewer than five entries, or an optional header too short) counts as empty. The DOS header is read
+first, then the file is positioned at its `e_lfanew` and the NT headers are read there, so headers
+beyond any fixed prefix are found, at any 32-bit offset as the loader accepts it; an `e_lfanew` past
+the end of the file is treated as no PE image. A file that is not a PE image, or whose headers are cut off, is `Unsigned` (it has nothing to verify and fails later as a
+library). Catalog signatures are not looked at, so a catalog-signed system file such as
+`kernel32.dll` is `Unsigned`.
+
+**Verification.** Only for a present signature: `WinVerifyTrust` with the generic Authenticode
+action, a file choice, no user interface, no revocation check and cache-only URL retrieval, so it
+makes no network request. Revocation is off both in the revocation-checks field and with the
+no-revocation provider flag, so the machine-wide Software Publishing policy cannot turn it back on;
+`CERT_E_REVOKED` and `CERT_E_REVOCATION_FAILURE`, should one come back anyway, are classed as
+`UntrustedSigner`. The lifetime-signing flag is off: a signature with a trusted time stamp
+passes after its certificate expires, one without a time stamp fails with an expiry. Only the
+primary signature is looked at. The trust source is the system store; nothing is pinned.
+
+**No protection against a writer.** Someone who can write the file can strip the signature and get
+`Unsigned`, which passes. The signer check is therefore no substitute for the writability check,
+which is the gate; it tells who signed a file that regular users cannot change.
+
+**Failures.** A non-success result is `SignerError::Invalid { failure, hresult }`, and in
+`check_library` one finding on the library: `Reason::InvalidSignature { failure, hresult }`,
+`Display` showing the HRESULT in hex. `SignatureFailure` classes:
+
+| Class | Provider results (winerror.h names) |
+|---|---|
+| `Tampered` | `TRUST_E_BAD_DIGEST` |
+| `UntrustedSigner` | `CERT_E_UNTRUSTEDROOT`, `CERT_E_UNTRUSTEDTESTROOT`, `CERT_E_UNTRUSTEDCA`, `CERT_E_CHAINING`, `CERT_E_PURPOSE`, `CERT_E_WRONG_USAGE`, `CERT_E_REVOKED`, `CERT_E_REVOCATION_FAILURE`, `TRUST_E_EXPLICIT_DISTRUST`, `TRUST_E_SUBJECT_NOT_TRUSTED` |
+| `Expired` | `CERT_E_EXPIRED`, `TRUST_E_TIME_STAMP` |
+| `Malformed` | `TRUST_E_NOSIGNATURE`, `TRUST_E_SUBJECT_FORM_UNKNOWN`, `TRUST_E_MALFORMED_SIGNATURE`, `TRUST_E_CERT_SIGNATURE`, `TRUST_E_NO_SIGNER_CERT` |
+| `Other` | anything else, including the case where the provider returns success but the leaf certificate, its name or its SHA-256 property cannot be read (reported as `E_FAIL`; the signature itself is fine) |
+
+**Holding the file.** The library is opened for reading with read sharing only, and the open
+`File` is in the verdict (`Signer::file`). A caller that keeps the verdict alive until the library
+is mapped (`LoadLibraryExW`) stops anyone from overwriting, renaming or deleting the file in
+between. The window before the check is covered by the writability check (ADR-270).
+
+**Tests.** The header parser and the HRESULT mapping are tested on synthetic data on every
+platform. The Windows tests sign a copy of the test executable with a throw-away self-signed
+certificate through PowerShell (removed again afterwards), check an untrusted signer, a changed
+byte, a Microsoft-signed system image, a writability finding together with an invalid signature, and
+a real `LoadLibraryExW` of a copy of `version.dll` while the verdict holds the file. Where PowerShell or such an image is missing they are
+skipped, and fail instead when the `CI` environment variable is set.

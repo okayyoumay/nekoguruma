@@ -267,6 +267,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-275](ADR-275-optional-real-hardware-checks.md) | Real-Hardware Checks Are Optional, Opt-In Tests Bounded by a Target Class | Accepted | design 13.5, test layout, `sim-ecu` |
 | [ADR-276](ADR-276-restart-redo-from-the-erase.md) | A Redone Transfer Goes On from the Erase as a First Run | Accepted | `agent` restart, runner, design 8.2.5 |
 | [ADR-277](ADR-277-dpdu-root-file-interpretation.md) | D-PDU API Root Description File Interpretation | Accepted | `ngr-library-resolver`, design 7.1 / 7.2 |
+| [ADR-278](ADR-278-library-signer-check.md) | Library Signer Check | Accepted | `ngr-library-resolver`, design 7.2 |
 
 ## Status Legend
 
@@ -576,6 +577,7 @@ the predecessor repository these ADRs came from.
 - ADR-231
 - ADR-270 (the D-PDU API root file, MDF and CDF are naming files under item 5, ADR-277)
 - ADR-277
+- ADR-278
 
 ### FFI Bindings & Target ABI
 - ADR-108

@@ -23,13 +23,13 @@
 //! with blocks missing. Its power-cycle count (DID FD01) shows that the restart reset the ECU
 //! exactly once, or not at all after a passive teardown.
 //!
-//! The mid-transfer agent-kill scenarios differ in the ECU's session timer (tS3_Server): the restart comes
-//! while the ECU is still in its programming session with the transfer running, and after the
-//! timer ran out, so the ECU fell back to its default session with the transfer interrupted.
-//! Both end with the job complete: the restart sends an ECUReset first in either state, so the
-//! ECU's state at the reconnection does not change the path. Neither ends in on-site
-//! intervention, since the conditions that lead there (an identity or software version that is
-//! not the job's, a precondition that fails) do not hold.
+//! The mid-transfer agent-kill scenarios differ in the ECU's session timer (tS3_Server): the
+//! restart comes while the ECU is still in its programming session with the transfer running, and
+//! after the timer ran out, so the ECU fell back to its default session with the transfer
+//! interrupted. Both end with the job complete: the restart sends an ECUReset first in either
+//! state, so the ECU's state at the reconnection does not change the path. Neither ends in on-site
+//! intervention, since the conditions that lead there (an identity or software version that is not
+//! the job's, a precondition that fails) do not hold.
 //!
 //! The scenarios after RequestTransferExit kill the agent once the journal holds the
 //! RequestTransferExit marker: before its response was recorded, after it was but before the
@@ -122,11 +122,11 @@ const ERASE_PC: u32 = 4;
 
 const WAIT_FOR_BLOCK: Duration = Duration::from_secs(60);
 
-/// A programming session (the step before the erase), the erase, RequestDownload of the image,
-/// one `FlashTransfer` per block with a `Wait` after block [`KILL_AFTER_BLOCK`] and after the
-/// last block, RequestTransferExit, a `Wait`, and the integrity check as the post-transfer step.
-/// The waits send nothing; they are where the tests kill the agent or inject a fault. The plan starts at
-/// instruction 0, so a restart replays the session change; the supply voltage must stay within
+/// A programming session (the step before the erase), the erase, RequestDownload of the image, one
+/// `FlashTransfer` per block with a `Wait` after block [`KILL_AFTER_BLOCK`] and after the last
+/// block, RequestTransferExit, a `Wait`, and the integrity check as the post-transfer step. The
+/// waits send nothing; they are where the tests kill the agent or inject a fault. The plan starts
+/// at instruction 0, so a restart replays the session change; the supply voltage must stay within
 /// 11 to 15 V, read from the VCI.
 fn program() -> Program {
     let image_len = BLOCKS as usize * BLOCK_LEN;
@@ -581,11 +581,12 @@ const KILL_DELAY: Duration = Duration::from_millis(200);
 /// What the journal and the ECU hold when the agent was killed after RequestTransferExit: the
 /// exit marker, every block, no completed post-transfer steps and no resume yet, with the ECU
 /// in its programming session and the download closed (`flash_phase` 3) or, after the
-/// integrity check, verified (4). Returns where the first attempt's transfer started.
+/// integrity check, verified (4). `last_post_step` is the pc of the last step completed after
+/// the marker. Returns where the first attempt's transfer started.
 fn assert_killed_after_exit(
     env: &Env,
     spec: &JobSpec,
-    response_recorded: bool,
+    last_post_step: Option<u32>,
     flash_phase: u8,
 ) -> StepRef {
     let journal = agent::journal::Journal::read(&env.journal_dir(), &spec.key).expect("journal");
@@ -596,13 +597,12 @@ fn assert_killed_after_exit(
     let exit = transfer.exit.expect("the RequestTransferExit marker");
     assert_eq!(exit.intent_at.pc, exit_pc(spec));
     assert!(!exit.complete, "the post-transfer steps did not complete");
-    // A step after the marker is recorded once the RequestTransferExit's response arrived: that
-    // request's own, or a later one (the wait after it).
+    // The last step completed after the marker: none before the RequestTransferExit's response
+    // arrived, then that request, then the wait after it.
     assert_eq!(
-        exit.last_post_step
-            .is_some_and(|step| step.pc >= exit_pc(spec)),
-        response_recorded,
-        "the RequestTransferExit's response should be recorded: {response_recorded}; {exit:?}"
+        exit.last_post_step.map(|step| step.pc),
+        last_post_step,
+        "the last completed post-transfer step: {exit:?}"
     );
     let probe = env.probe();
     assert_eq!(
@@ -615,8 +615,8 @@ fn assert_killed_after_exit(
 
 /// Kills the agent while the ECU keeps it waiting for the response to `request` (a trace line):
 /// once `parked` holds, while the program waits right before that request, a response-pending
-/// fault is handed to the worker; once the request was sent the agent is killed. Returns when
-/// the ECU's final response would have gone out, after which its session timer runs.
+/// fault is handed to the worker; once the request was sent the agent is killed. Returns at once,
+/// with the instant the ECU's final response goes out, after which its session timer runs.
 fn kill_while_unanswered(
     env: &Env,
     spec: &JobSpec,
@@ -628,15 +628,22 @@ fn kill_while_unanswered(
     // and nothing else is sent in between to take it.
     env.wait_for(spec, "the wait before the request", WAIT_FOR_BLOCK, &parked);
     env.inject(&format!(
-        r#"{{"command": "inject_fault", "fault": {{"response_pending": {{"count": {PENDING_COUNT}, "interval_ms": {PENDING_INTERVAL_MS}}}}}}}"#
+        concat!(
+            r#"{{"command": "inject_fault", "fault": {{"response_pending": "#,
+            r#"{{"count": {}, "interval_ms": {}}}}}}}"#
+        ),
+        PENDING_COUNT, PENDING_INTERVAL_MS
     ));
     env.wait_for(spec, request, WAIT_FOR_BLOCK, |state| {
-        // A fault still waiting when the program has moved on was missed: fail on that.
-        let applied = env.commands_applied();
+        // A fault still waiting when the program has moved on was missed: fail on that. The
+        // trace is read first: `sim-vci` applies and deletes a command before the request it
+        // then sends is traced, so once the request is seen sent, the directory read after it
+        // shows whether the command went first.
         let sent = env.trace().iter().any(|line| line == request);
+        let applied = env.commands_applied();
         assert!(
             applied || !sent,
-            "{request} was sent before the fault was applied"
+            "{request} was sent before the fault was applied (or the command was rejected)"
         );
         parked(state) && sent && applied
     });
@@ -654,7 +661,8 @@ fn kill_while_unanswered(
 
 /// Restarts once the ECU's response-pending sequence is over. The ECU restarts its session
 /// timer when its final response goes out, and the restart's passive teardown waits the plan's
-/// declared timeout from its own first requests: those must come after the sequence ended, as
+/// declared timeout from its last request before the wait: its requests must come after the
+/// sequence ended, as
 /// they would for a restart that takes longer than the sequence (a longer sequence is a backlog
 /// item).
 fn restart_after(
@@ -664,16 +672,6 @@ fn restart_after(
 ) -> Result<diag_ir::VmState, agent::JobError> {
     std::thread::sleep(sequence_end.saturating_duration_since(std::time::Instant::now()));
     env.restart(spec)
-}
-
-/// Whether the journal records the RequestTransferExit marker.
-fn exit_marked(state: &agent::journal::JournalState) -> bool {
-    state
-        .facts
-        .transfer
-        .as_ref()
-        .and_then(|transfer| transfer.exit.as_ref())
-        .is_some()
 }
 
 /// Whether the journal records the RequestTransferExit's response.
@@ -710,7 +708,7 @@ fn a_kill_before_the_transfer_exit_response_was_recorded_redoes_the_transfer() {
         },
         "uds 37",
     );
-    let first_attempt = assert_killed_after_exit(&env, &spec, false, 3);
+    let first_attempt = assert_killed_after_exit(&env, &spec, None, 3);
     let before = env.probe();
     let result = restart_after(&env, &spec, sequence_end);
     assert_completed(
@@ -746,7 +744,7 @@ fn a_kill_before_the_post_transfer_steps_completed_redoes_the_transfer() {
         restart::died_of_sigkill(status),
         "the agent should be killed during the program's wait: {status}"
     );
-    let first_attempt = assert_killed_after_exit(&env, &spec, true, 3);
+    let first_attempt = assert_killed_after_exit(&env, &spec, Some(exit_pc(&spec)), 3);
     let before = env.probe();
     let result = env.restart(&spec);
     assert_completed(
@@ -771,10 +769,8 @@ fn a_kill_before_the_integrity_check_response_was_recorded_redoes_the_transfer()
     let env = Env::new("check-unanswered", ENTRY, &ecu_config(3_000));
     // The program waits after the RequestTransferExit's response.
     let sequence_end = kill_while_unanswered(&env, &spec, exit_answered, "uds 31 01 FF01");
-    assert!(exit_marked(
-        &agent::journal::Journal::read(&env.journal_dir(), &spec.key).expect("journal")
-    ));
-    let first_attempt = assert_killed_after_exit(&env, &spec, true, 4);
+    // The wait after the RequestTransferExit completed; the integrity check did not.
+    let first_attempt = assert_killed_after_exit(&env, &spec, Some(exit_pc(&spec) + 1), 4);
     let before = env.probe();
     let result = restart_after(&env, &spec, sequence_end);
     assert_completed(

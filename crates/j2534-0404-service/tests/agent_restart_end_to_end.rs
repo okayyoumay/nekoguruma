@@ -320,10 +320,12 @@ fn an_agent_killed_mid_transfer_redoes_it_after_the_session_timer_expired() {
     const S3_MS: u32 = 3_000;
     let spec = spec();
     let env = Env::new("after-s3", ENTRY, &ecu_config(S3_MS));
-    let killed_at = std::time::Instant::now();
     let first_attempt = kill_mid_transfer(&env, &spec);
+    // Taken after the kill, not before the spawn: starting the agent can take seconds on a busy
+    // machine, and the timer runs from the last request, which came just before the kill.
+    let killed_at = std::time::Instant::now();
     // The ECU's timer runs on the wall clock while no process has the library loaded (ADR-241),
-    // so the time to wait is the timer's remainder; the last request was before the kill.
+    // so the time to wait is the timer's remainder.
     // Waiting longer than needed is safe: an expired timer stays expired.
     let remaining =
         Duration::from_millis(u64::from(S3_MS) + 500).saturating_sub(killed_at.elapsed());

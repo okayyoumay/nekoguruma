@@ -50,8 +50,8 @@ child, any registry value expanded, any declared encoding, UNC paths on Windows)
    drive-letter path (no relative, UNC or `\\?\` path).
 4. **Encoding.** The file is UTF-8 (a byte order mark tolerated) or UTF-16 with a little- or
    big-endian byte order mark. Anything else, UTF-32 included, is refused as an encoding error; a
-   declared XML encoding is not honoured. UTF-16 without a mark is not detected and fails as XML
-   (or as an encoding error if the bytes are not UTF-8).
+   declared XML encoding is not honoured. Unmarked UTF-16 or UTF-32 is an encoding error too: its
+   NUL bytes, which XML never allows, give it away.
 
 ## Consequences
 

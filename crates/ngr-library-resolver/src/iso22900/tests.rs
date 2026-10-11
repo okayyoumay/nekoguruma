@@ -1018,13 +1018,20 @@ fn utf32_and_unmarked_utf16_are_not_accepted() {
             "{label}: {err:?}"
         );
     }
-    // UTF-16 without a mark: little-endian text contains NULs, which are valid UTF-8 but not
-    // XML; text with an odd byte layout may not be UTF-8 at all.
-    let (_dir, file) = write_bytes(&utf16_bytes(&xml, false, false));
-    assert!(matches!(
-        resolve_in_root_file(&file, "X").unwrap_err(),
-        ResolveError::Xml { .. }
-    ));
+    // UTF-16 and UTF-32 without a mark: ASCII text in them is valid UTF-8, but its NUL bytes
+    // make it an encoding error rather than an XML one.
+    for (label, bytes) in [
+        ("utf-16le", utf16_bytes(&xml, false, false)),
+        ("utf-32le", utf32(false)[4..].to_vec()),
+        ("utf-32be", utf32(true)[4..].to_vec()),
+    ] {
+        let (_dir, file) = write_bytes(&bytes);
+        let err = resolve_in_root_file(&file, "X").unwrap_err();
+        assert!(
+            matches!(err, ResolveError::Encoding { .. }),
+            "unmarked {label}: {err:?}"
+        );
+    }
     let (_dir, file) = write_bytes(&utf16_bytes("\u{e9}<a/>", false, false));
     assert!(matches!(
         resolve_in_root_file(&file, "X").unwrap_err(),

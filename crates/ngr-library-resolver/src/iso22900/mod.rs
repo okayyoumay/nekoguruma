@@ -356,8 +356,9 @@ fn parse_document(xml: &str, path: &Path) -> Result<RootFile, ResolveError> {
 }
 
 /// Decodes the bytes of a root file: UTF-8 (a byte order mark is tolerated) or UTF-16 with a
-/// little- or big-endian byte order mark. `None` for anything else, including UTF-32 with a mark
-/// and UTF-16 without one (which is not UTF-8, or fails as XML).
+/// little- or big-endian byte order mark. `None` for anything else, including UTF-32 and UTF-16
+/// with or without a mark: unmarked ASCII text in those encodings is valid UTF-8, but its NUL
+/// bytes give it away, since a NUL character is never allowed in an XML document.
 fn decode_root_bytes(bytes: &[u8]) -> Option<String> {
     // The UTF-32LE mark starts like the UTF-16LE one, so it is tested first.
     if bytes.starts_with(&[0xFF, 0xFE, 0x00, 0x00]) || bytes.starts_with(&[0x00, 0x00, 0xFE, 0xFF])
@@ -371,6 +372,9 @@ fn decode_root_bytes(bytes: &[u8]) -> Option<String> {
     } else {
         String::from_utf8(bytes.to_vec()).ok()?
     };
+    if text.contains('\0') {
+        return None;
+    }
     Some(match text.strip_prefix('\u{FEFF}') {
         Some(rest) => rest.to_owned(),
         None => text,

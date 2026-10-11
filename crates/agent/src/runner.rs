@@ -7760,7 +7760,7 @@ mod tests {
     }
 
     /// Every declared precondition holds at step 4a: the restart replays the (here empty) steps
-    /// from the entry to the erase and stops before the erase, in the unavailable restart order.
+    /// from the entry to the erase and stops before the erase (`StoppedBeforeErase`).
     #[test]
     fn a_restart_whose_preconditions_hold_at_step_4a_stops_before_the_erase() {
         let program = flash_program_with_supply_and_engine();

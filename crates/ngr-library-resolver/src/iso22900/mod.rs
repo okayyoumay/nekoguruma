@@ -98,8 +98,9 @@ pub enum EntryError {
         element: &'static str,
     },
     /// A file element holds something that is not a usable `file:` URI: another scheme, a
-    /// malformed or unencoded reserved character, a `..` component, a NUL, an empty path
-    /// (`file:///`), or (off Windows) a drive-letter path. On Windows a path that is not in
+    /// malformed or unencoded reserved character, a `..` component or one made only of dots and
+    /// spaces (which Windows reads as the parent), a NUL, a path with no named component
+    /// (`file:///`, `file:///.`), or (off Windows) a drive-letter path. On Windows a path that is not in
     /// drive-letter form is [`RelativePath`](Self::RelativePath).
     #[error("{element} is not a valid file URI: {uri:?}")]
     InvalidUri {
@@ -232,9 +233,11 @@ pub enum ResolveError {
         #[source]
         source: EntryError,
     },
-    /// The registry value `Root File` cannot be used: not valid UTF-16, a NUL inside, a `%NAME%`
-    /// reference that is not one of the supported folders (or whose registry value is missing),
-    /// an unpaired `%`, or a result that is not an absolute drive-letter path.
+    /// The registry value `Root File` cannot be used: not valid UTF-16, a NUL inside (also one
+    /// brought in by an expanded folder), a `%NAME%` reference that is not one of the supported
+    /// folders (or whose registry value is missing, unreadable, not a `REG_SZ` or empty), an
+    /// unpaired `%`, a result that is not an absolute drive-letter path (relative, UNC, `\\?\`),
+    /// or a result with a parent-directory component (`..`, or only dots and spaces).
     #[error("unusable D-PDU API registry value Root File: {reason}")]
     RootFileValue {
         /// What is wrong with the value.
@@ -526,13 +529,7 @@ pub fn root_file_path(view: RegistryView) -> Result<Option<PathBuf>, ResolveErro
         };
         // The folder values are read in the same view as `Root File`: in the 32-bit view the
         // `CurrentVersion` key is redirected, so `ProgramFilesDir` there is the x86 folder.
-        let lookup = |folder: KnownFolder| {
-            let (subkey, value) = folder.registry_location();
-            let key = RegKey::predef(HKEY_LOCAL_MACHINE)
-                .open_subkey_with_flags(subkey, KEY_READ | view.flag())
-                .ok()?;
-            registry_folder(&key, value)
-        };
+        let lookup = |folder: KnownFolder| hklm_folder(view, folder);
         root_file_from_key(&key, &lookup)
     }
     #[cfg(not(windows))]
@@ -572,8 +569,24 @@ fn root_file_from_key(
     root_file_from_value(&value.bytes, expand, lookup)
 }
 
+/// The value of `folder` under HKLM in registry view `view`. `None` fails closed: the key or value
+/// is missing or unreadable, is not a `REG_SZ`, or is empty (see [`registry_folder`]).
+#[cfg(windows)]
+fn hklm_folder(view: RegistryView, folder: KnownFolder) -> Option<String> {
+    use winreg::{
+        RegKey,
+        enums::{HKEY_LOCAL_MACHINE, KEY_READ},
+    };
+    let (subkey, value) = folder.registry_location();
+    let key = RegKey::predef(HKEY_LOCAL_MACHINE)
+        .open_subkey_with_flags(subkey, KEY_READ | view.flag())
+        .ok()?;
+    registry_folder(&key, value)
+}
+
 /// The string value `value` of an opened folder key, if it is a `REG_SZ` (not an expandable
-/// string, so no expansion happens inside an expansion) and not empty.
+/// string, so no expansion happens inside an expansion), not empty and without a NUL inside
+/// (trailing NULs are stripped first).
 #[cfg(windows)]
 fn registry_folder(key: &winreg::RegKey, value: &str) -> Option<String> {
     use winreg::enums::REG_SZ;
@@ -583,7 +596,7 @@ fn registry_folder(key: &winreg::RegKey, value: &str) -> Option<String> {
     }
     let text = utf16(&raw.bytes, u16::from_le_bytes)?;
     let text = text.trim_end_matches('\0');
-    (!text.is_empty()).then(|| text.to_owned())
+    (!text.is_empty() && !text.contains('\0')).then(|| text.to_owned())
 }
 
 /// A bad `Root File` value.
@@ -595,8 +608,9 @@ fn bad_value(reason: impl Into<String>) -> ResolveError {
 }
 
 /// The path held by the raw bytes of a registry string value (UTF-16LE, trailing NULs stripped,
-/// trimmed), expanded when `expand` is set. `None` if blank. A non-blank result must be an
-/// absolute drive-letter path.
+/// ASCII whitespace trimmed), expanded when `expand` is set. `None` if blank. A non-blank result
+/// must be an absolute drive-letter path without a NUL or a parent component (`..`, or a
+/// component of only dots and spaces other than `.`).
 #[cfg(any(windows, test))]
 fn root_file_from_value(
     bytes: &[u8],
@@ -614,7 +628,12 @@ fn root_file_from_value(
     } else {
         text.to_owned()
     };
-    let text = text.trim();
+    // A folder value may bring a NUL in.
+    if text.contains('\0') {
+        return Err(bad_value("Root File contains a NUL character"));
+    }
+    // Only ASCII whitespace is trimmed, as for the URI; any other character stays in the value.
+    let text = text.trim_matches(|c: char| c.is_ascii_whitespace());
     if text.is_empty() {
         return Ok(None);
     }
@@ -623,7 +642,18 @@ fn root_file_from_value(
             "Root File {text:?} is not an absolute drive-letter path"
         )));
     }
+    if text.split(['\\', '/']).any(is_parent_like) {
+        return Err(bad_value(format!(
+            "Root File {text:?} has a parent-directory component"
+        )));
+    }
     Ok(Some(PathBuf::from(text)))
+}
+
+/// A path component that names the parent directory, or does so on Windows, which drops trailing
+/// dots and spaces: one made only of dots and spaces, except `.` itself and the empty component.
+fn is_parent_like(part: &str) -> bool {
+    !part.is_empty() && part != "." && part.chars().all(|c| c == '.' || c == ' ')
 }
 
 /// `X:\...` or `X:/...`. A relative path, a drive-relative path (`X:dir`), a UNC path and a
@@ -719,7 +749,7 @@ fn expand_root_file_value(
         let folder = KnownFolder::from_name(name)
             .ok_or_else(|| bad_value(format!("Root File refers to unsupported %{name}%")))?;
         let value = lookup(folder)
-            .ok_or_else(|| bad_value(format!("no registry value for %{name}% in this view")))?;
+            .ok_or_else(|| bad_value(format!("no usable registry value for %{name}% in this view (missing, unreadable, not REG_SZ or empty)")))?;
         out.push_str(&value);
         rest = &after[j + 1..];
     }
@@ -761,8 +791,10 @@ enum UriFault {
 /// Refused: another scheme; a host other than `localhost` (which includes `file://c:/dir`); a
 /// path starting with `//` or `/\` before or after decoding (a share); a raw `?` or `#` (a query
 /// or fragment, or an unencoded character; `%3F` and `%23` decode normally); a `..` component or
-/// a NUL after decoding; an empty path (`file:///`); on Windows a path without a drive letter; elsewhere a path that looks
-/// like a drive letter.
+/// a NUL after decoding; a component made only of dots and spaces other than `.` (such as `.. `
+/// or `...`, which Windows reads as the parent); a path with no named component (`file:///`,
+/// `file:///.`, `file:///./`); on Windows a path without a drive letter; elsewhere a path that
+/// looks like a drive letter.
 fn uri_to_path(uri: &str) -> Result<PathBuf, UriFault> {
     // Only ASCII whitespace is trimmed; any other character stays part of the value.
     let uri = uri.trim_matches(|c: char| c.is_ascii_whitespace());
@@ -788,7 +820,7 @@ fn uri_to_path(uri: &str) -> Result<PathBuf, UriFault> {
         return Err(UriFault::Relative);
     }
     let path = percent_decode(path).ok_or(UriFault::Invalid)?;
-    if path.contains('\0') || path == "/" {
+    if path.contains('\0') {
         return Err(UriFault::Invalid);
     }
     // A second leading separator makes the rest of the path a server name on Windows and is a
@@ -797,13 +829,17 @@ fn uri_to_path(uri: &str) -> Result<PathBuf, UriFault> {
         return Err(UriFault::Remote);
     }
     let separators: &[char] = if cfg!(windows) { &['/', '\\'] } else { &['/'] };
+    // No component names anything: `/`, `/.`, `/./`.
+    if path
+        .split(separators)
+        .all(|part| part.is_empty() || part == ".")
+    {
+        return Err(UriFault::Invalid);
+    }
     // Windows drops trailing dots and spaces from a path component, so `.. ` or `...` would also
     // name the parent there. A component made only of dots and spaces is therefore refused on
     // every platform, except `.` itself.
-    if path
-        .split(separators)
-        .any(|part| !part.is_empty() && part != "." && part.chars().all(|c| c == '.' || c == ' '))
-    {
+    if path.split(separators).any(is_parent_like) {
         return Err(UriFault::Invalid);
     }
 

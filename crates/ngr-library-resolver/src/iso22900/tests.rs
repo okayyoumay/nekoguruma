@@ -936,6 +936,133 @@ fn a_registry_value_is_decoded_and_checked() {
 }
 
 #[test]
+fn only_ascii_whitespace_is_trimmed_from_a_registry_value() {
+    // U+00A0 stays part of the value, so the path keeps it.
+    let nbsp = registry_string("C:\\pdu\\root.xml\u{A0}");
+    assert_eq!(
+        root_file_from_value(&nbsp, false, &folders).unwrap(),
+        Some(PathBuf::from("C:\\pdu\\root.xml\u{A0}"))
+    );
+    // A value of only U+3000 is not blank; it is not a drive-letter path, so it is refused.
+    assert_refused(
+        root_file_from_value(&registry_string("\u{3000}"), false, &folders),
+        "ideographic space",
+    );
+    // ASCII whitespace of every kind is trimmed.
+    assert_eq!(
+        root_file_from_value(&registry_string("\t C:\\a.xml\r\n"), false, &folders).unwrap(),
+        Some(PathBuf::from("C:\\a.xml"))
+    );
+}
+
+#[test]
+fn a_nul_brought_in_by_a_folder_is_refused() {
+    let nul = |_: KnownFolder| Some("C:\\a\0b".to_owned());
+    assert_refused(
+        root_file_from_value(&registry_string(r"%ProgramFiles%\r.xml"), true, &nul),
+        "NUL from a folder",
+    );
+}
+
+#[test]
+fn parent_like_components_of_the_root_file_are_refused() {
+    for bad in [
+        r"C:\safe\.. \x\root.xml",
+        r"C:\a\..\root.xml",
+        r"C:\a\...\root.xml",
+        "C:/a/../root.xml",
+        r"C:\a\root.xml\..",
+        r"C:\a\. .\root.xml",
+    ] {
+        for expand in [false, true] {
+            assert_refused(
+                root_file_from_value(&registry_string(bad), expand, &folders),
+                bad,
+            );
+        }
+    }
+    // A folder value can bring the component in.
+    let parent = |_: KnownFolder| Some(r"C:\a\..".to_owned());
+    assert_refused(
+        root_file_from_value(&registry_string(r"%ProgramFiles%\r.xml"), true, &parent),
+        "parent from a folder",
+    );
+    // A dotted name and `.` are fine.
+    assert_eq!(
+        root_file_from_value(&registry_string(r"C:\a..b\.\root.xml"), false, &folders).unwrap(),
+        Some(PathBuf::from(r"C:\a..b\.\root.xml"))
+    );
+}
+
+#[test]
+fn a_unc_known_folder_is_refused() {
+    let unc = |_: KnownFolder| Some(r"\\srv\share".to_owned());
+    for text in [r"%ProgramFiles%\root.xml", "%windir%"] {
+        assert_refused(
+            root_file_from_value(&registry_string(text), true, &unc),
+            text,
+        );
+    }
+}
+
+#[test]
+fn a_path_with_no_named_component_is_not_a_usable_uri() {
+    for bad in [
+        "file:///",
+        "file:///.",
+        "file:///./",
+        "file:///././",
+        "file:/.",
+    ] {
+        assert_eq!(uri_to_path(bad), Err(UriFault::Invalid), "{bad}");
+    }
+    // Two leading separators stay a share.
+    assert_eq!(uri_to_path("file:////"), Err(UriFault::Remote));
+}
+
+#[cfg(windows)]
+#[test]
+fn hklm_folders_resolve_in_the_native_view() {
+    let all = [
+        KnownFolder::ProgramFiles,
+        KnownFolder::CommonProgramFiles,
+        KnownFolder::ProgramFilesX86,
+        KnownFolder::CommonProgramFilesX86,
+        KnownFolder::ProgramW6432,
+        KnownFolder::CommonProgramW6432,
+        KnownFolder::SystemRoot,
+    ];
+    let is_64_bit_os = hklm_folder(RegistryView::Wow64_64, KnownFolder::ProgramW6432).is_some();
+    for folder in all {
+        // The x86 and W6432 values exist only on a 64-bit OS.
+        let always = matches!(
+            folder,
+            KnownFolder::ProgramFiles | KnownFolder::CommonProgramFiles | KnownFolder::SystemRoot
+        );
+        if !always && !is_64_bit_os {
+            continue;
+        }
+        let value = hklm_folder(RegistryView::native(), folder)
+            .unwrap_or_else(|| panic!("{folder:?} has no value in the native view"));
+        assert!(is_drive_letter_path(&value), "{folder:?}: {value}");
+    }
+    if is_64_bit_os {
+        for view in [RegistryView::Wow64_32, RegistryView::Wow64_64] {
+            for folder in all {
+                let value = hklm_folder(view, folder)
+                    .unwrap_or_else(|| panic!("{folder:?} has no value in {view:?}"));
+                assert!(is_drive_letter_path(&value), "{view:?} {folder:?}: {value}");
+            }
+        }
+        // The 32-bit view redirects CurrentVersion: its ProgramFilesDir is the x86 folder.
+        assert_eq!(
+            hklm_folder(RegistryView::Wow64_32, KnownFolder::ProgramFiles),
+            hklm_folder(RegistryView::Wow64_64, KnownFolder::ProgramFilesX86)
+        );
+    }
+}
+
+#[test]
 fn root_file_value_errors_say_what_is_wrong() {
     let err = expanded("%ROOT%").unwrap_err();
     assert!(err.to_string().contains("%ROOT%"), "{err}");

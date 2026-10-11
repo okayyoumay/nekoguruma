@@ -48,7 +48,8 @@ child, any registry value expanded, any declared encoding, UNC paths on Windows)
    registry view as `Root File`; the redirected `CurrentVersion` key is what makes the 32-bit view
    yield the x86 folders. Any other name, an empty `%%`, an unpaired `%` and a listed name without a
    value are refused (`RootFileValue`), and the result, expanded or literal, must be an absolute
-   drive-letter path (no relative, UNC or `\\?\` path).
+   drive-letter path (no relative, UNC or `\\?\` path) without a NUL or a parent-directory
+   component, by the same rule as the URI (only ASCII whitespace is trimmed).
 4. **Encoding.** The file is UTF-8 (a byte order mark tolerated) or UTF-16 with a little- or
    big-endian byte order mark. Anything else, UTF-32 included, is refused as an encoding error; a
    declared XML encoding is not honoured. Unmarked UTF-16 or UTF-32 is an encoding error too: its
@@ -62,11 +63,12 @@ child, any registry value expanded, any declared encoding, UNC paths on Windows)
 - A 64-bit agent can see 32-bit installations and name the one it wants; a 32-bit worker reads
   only its own view.
 - A root file saved in a legacy code page must be saved again as UTF-8 or UTF-16.
-- Residuals: a mapped network drive passes the local-path rule; under the 32-bit view the
+- Residuals: a mapped network drive passes the local-path rule (for the registry `Root File` it
+  is the only non-local form left, since UNC, `\\?\` and relative values are refused); under the 32-bit view the
   System32 file-system redirection can make a path name another file than a 64-bit process sees.
-- `check_writability` does not yet refuse non-local paths itself, so a value that never passes
-  through the URI conversion (the registry `Root File`, a J2534 `FunctionLibrary`) still needs
-  that finding.
+- `check_writability` does not yet refuse non-local paths itself, and a J2534 `FunctionLibrary`
+  from the registry is not checked at all (it never passes through the URI conversion or the
+  `Root File` checks), so it still needs that finding.
 
 ## Alternatives considered
 

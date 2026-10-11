@@ -140,11 +140,14 @@ the same registry view as `Root File`:
 
 The 32-bit view redirects `CurrentVersion`, so `ProgramFilesDir` there is the x86 folder; that is
 how the view's bitness is honoured. Any other `%NAME%`, an empty `%%`, an unpaired `%`, and a
-listed name whose value is missing or not a `REG_SZ` are refused; expanded text is not scanned
+listed name whose value is missing, unreadable, not a `REG_SZ`, empty or holding a NUL are refused; expanded text is not scanned
 again. After expansion (and for a literal `REG_SZ` value too) a non-blank `Root File` must be an
 absolute drive-letter path (`X:\...` or `X:/...`); a relative path, a UNC path (`\\` or `//`) and a
-`\\?\` path are refused. All of these are `ResolveError::RootFileValue`, as are invalid UTF-16 and
-an embedded NUL. A value of another registry type is `ResolveError::Registry`.
+`\\?\` path are refused, also when a folder value brings it in (a UNC folder, say). The same
+parent rule as for the URI applies to the result, split on `\` and `/`: a `..` component, or any
+other made only of dots and spaces except `.`, is refused. Only ASCII whitespace is trimmed from the
+value (U+00A0 and U+3000 are not). All of these are `ResolveError::RootFileValue`, as are invalid
+UTF-16 and a NUL, in the value or in an expanded folder. A value of another registry type is `ResolveError::Registry`.
 
 **Encoding and size.** The file is read up to `MAX_ROOT_FILE_SIZE` (1 MiB, inclusive; more is
 `TooLarge`). It must be UTF-8 (a byte order mark is tolerated) or UTF-16 little- or big-endian
@@ -169,7 +172,7 @@ includes `file://c:/dir/x.dll`) and a path starting with `//` or `/\` in any enc
 (`file:////server/..`, `file:///%5C%5Cserver/..`) are `RemoteHost`: a share cannot meet the 7.2 premise that regular
 users cannot write the chain. A raw `?` or `#`, a `..` component (or any other component made only of dots and spaces except
 `.`, since Windows drops trailing dots and spaces and `.. ` would name the parent there), a NUL after decoding, an empty path
-(`file:///`), another scheme and malformed percent-encoding (each `%` needs two hex digits; a
+(`file:///`, `file:///.`, `file:///./`: no named component), another scheme and malformed percent-encoding (each `%` needs two hex digits; a
 sign is not one) are `InvalidUri`; so is a drive-letter path off Windows (`file:///c:/x`). On Windows only the drive-letter form is
 accepted (a path without one is `RelativePath`, not `InvalidUri`); raw backslashes may stay. A URI that gives a
 relative path (`file:dir/x`) is `RelativePath`. A mapped network drive passes these rules.

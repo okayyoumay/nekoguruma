@@ -37,7 +37,9 @@ also need a limit that does not depend on each check's author being careful.
 4. **A guarded handle, not care, enforces the class.** A check reaches the VCI only through a
    handle the harness creates, and the guard behind it sees every operation: UDS requests
    (service and, where it matters, sub-function; T3 uses an allow-list of read-only services),
-   raw frames and periodic messages, and hardware controls such as programming voltage, pin
+   raw frames and periodic messages (decoded and held to the same lists; on T2 a
+   state-changing request passes only from the authorized job, otherwise T2 is held to the T3
+   list), and hardware controls such as programming voltage, pin
    changes and vendor IOCTLs, which are refused on every class unless a T1 or T2 profile lists
    the control with its complete parameters (pin and voltage, pins, IOCTL identifier and exact
    payload or safe range) and the request matches them; on T2 a listed control also has to be part of an authorized job, so a profile
@@ -56,9 +58,10 @@ also need a limit that does not depend on each check's author being careful.
    SocketCAN interface, so writes, reprogramming and fault injection (including physical ones:
    unplugging the VCI, cutting power through a host-controlled switch) can be checked with a real
    VCI and library without risking an ECU.
-6. **Cleanup on every exit.** A check registers its cleanup (default session, channel closed,
-   power off where the profile can switch it) before its first request to an ECU, and it runs
-   on pass, failure and panic. During a write or reprogramming job run through the agent, the
+6. **Cleanup on every exit.** The harness registers a teardown step as it acquires each
+   resource (power, device, link) and runs the registered steps in reverse order, each at most
+   once, on pass, failure and panic (default session where an ECU was addressed, channel and
+   device closed, power off where the profile can switch it). During a write or reprogramming job run through the agent, the
    job runner owns interruption and recovery (design 5.6, 8.10.1); the generic cleanup runs only
    once the job reaches a state 5.6 allows teardown from, and power is never cut during such a
    job except in a deliberate T1 power-loss check. When the process or host dies, the ECU's own session timeout

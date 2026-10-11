@@ -309,25 +309,39 @@ mod windows {
     fn sign_self_signed(target: &Path) -> Result<(), String> {
         const SCRIPT: &str = r"
 $ErrorActionPreference = 'Stop'
-$c = New-SelfSignedCertificate -Type CodeSigningCert -Subject 'CN=ngr-library-resolver test signer' -CertStoreLocation Cert:\CurrentUser\My
 try {
-    # The status is UnknownError (untrusted root); the file is signed all the same.
-    Set-AuthenticodeSignature -FilePath $env:NGR_SIGN_TARGET -Certificate $c -HashAlgorithm SHA256 | Out-Null
-} finally {
-    foreach ($s in 'My', 'CA', 'Root') {
-        Remove-Item -Path ('Cert:\CurrentUser\' + $s + '\' + $c.Thumbprint) -DeleteKey -Force -ErrorAction SilentlyContinue
+    $c = New-SelfSignedCertificate -Type CodeSigningCert -Subject 'CN=ngr-library-resolver test signer' -CertStoreLocation Cert:\CurrentUser\My
+    try {
+        # The status is UnknownError (untrusted root); the file is signed all the same.
+        $r = Set-AuthenticodeSignature -FilePath $env:NGR_SIGN_TARGET -Certificate $c -HashAlgorithm SHA256
+        if ($null -eq $r.SignerCertificate) { throw ('not signed: ' + $r.Status + ' ' + $r.StatusMessage) }
+    } finally {
+        foreach ($s in 'My', 'CA', 'Root') {
+            $p = 'Cert:\CurrentUser\' + $s + '\' + $c.Thumbprint
+            if (Test-Path $p) { Remove-Item -Path $p -DeleteKey -Force }
+        }
     }
+} catch {
+    [Console]::Error.WriteLine(($_ | Out-String))
+    exit 1
 }
 ";
+        // A script file, not -Command: a multi-line argument is easy to mangle on the way.
+        let mut script = tempfile::Builder::new()
+            .suffix(".ps1")
+            .tempfile()
+            .map_err(|e| format!("cannot create the script file: {e}"))?;
+        std::io::Write::write_all(&mut script, SCRIPT.as_bytes())
+            .map_err(|e| format!("cannot write the script file: {e}"))?;
         let output = Command::new("powershell.exe")
             .args([
                 "-NoProfile",
                 "-NonInteractive",
                 "-ExecutionPolicy",
                 "Bypass",
-                "-Command",
-                SCRIPT,
+                "-File",
             ])
+            .arg(script.path())
             .env("NGR_SIGN_TARGET", target)
             .output()
             .map_err(|e| format!("cannot run powershell.exe: {e}"))?;
@@ -335,7 +349,9 @@ try {
             Ok(())
         } else {
             Err(format!(
-                "signing script failed: {}",
+                "signing script failed ({}): {}{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             ))
         }
@@ -544,14 +560,15 @@ try {
     }
 
     #[test]
-    fn catalog_signed_image_is_unsigned() {
+    fn a_system_library_is_never_refused() {
+        // kernel32.dll is catalog-signed on some Windows builds (no embedded signature, so
+        // Unsigned) and carries an embedded Microsoft signature on others (Trusted); either way
+        // the signer check must not refuse it.
         let kernel32 = Path::new(r"C:\Windows\System32\kernel32.dll");
-        if has_signature(kernel32) {
-            return unavailable("kernel32.dll carries an embedded signature on this system");
+        match check_signer(kernel32) {
+            Ok(Signer::Unsigned { .. }) => assert!(!has_signature(kernel32)),
+            Ok(Signer::Trusted { .. }) => assert!(has_signature(kernel32)),
+            other => panic!("kernel32.dll: {other:?}"),
         }
-        assert!(matches!(
-            check_signer(kernel32),
-            Ok(Signer::Unsigned { .. })
-        ));
     }
 }

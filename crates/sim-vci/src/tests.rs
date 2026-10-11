@@ -997,6 +997,20 @@ fn the_control_export_arms_faults_and_reconnects_the_ecu() {
 }
 
 #[test]
+fn the_control_export_arms_a_fault_for_a_service() {
+    let _f = fixture();
+    assert_eq!(
+        control(r#"{"command": "inject_fault", "fault": "drop_response", "service": 17}"#),
+        STATUS_NOERROR
+    );
+    assert_eq!(
+        with_ecu(|ecu| ecu.faults_for_service().to_vec()),
+        [(0x11, Fault::DropResponse)]
+    );
+    assert!(with_ecu(|ecu| ecu.armed_faults().is_empty()));
+}
+
+#[test]
 fn the_control_export_rejects_what_it_cannot_parse() {
     let _f = fixture();
     assert_eq!(unsafe { NgrSimVciControl(ptr::null()) }, ERR_NULL_PARAMETER);
@@ -1006,6 +1020,8 @@ fn the_control_export_rejects_what_it_cannot_parse() {
         r#"{"command": "explode"}"#,
         r#"{"command": "inject_fault", "fault": "melt"}"#,
         r#"{"command": "reconnect_ecu", "extra": 1}"#,
+        r#"{"command": "inject_fault", "fault": "drop_response", "service": 256}"#,
+        r#"{"command": "inject_fault", "fault": "drop_response", "service": -1}"#,
     ] {
         assert_eq!(control(command), ERR_FAILED, "{command}");
     }

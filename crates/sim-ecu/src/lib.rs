@@ -301,6 +301,9 @@ pub struct SimEcu {
     silent: bool,
     /// Faults armed by [`SimEcu::inject`] that have not fired yet, in injection order.
     armed: Vec<Fault>,
+    /// Faults waiting for a request of a given service ([`SimEcu::inject_for_service`]), in
+    /// injection order.
+    armed_for_service: Vec<(u8, Fault)>,
     /// Power cycles so far (power loss, ECU reset, reconnection).
     power_cycles: u64,
 }
@@ -331,6 +334,8 @@ pub struct EcuSnapshot {
     image: Vec<u8>,
     silent: bool,
     armed: Vec<Fault>,
+    #[serde(default)]
+    armed_for_service: Vec<(u8, Fault)>,
     power_cycles: u64,
 }
 
@@ -517,6 +522,7 @@ impl SimEcu {
             image: Vec::new(),
             silent: false,
             armed: Vec::new(),
+            armed_for_service: Vec::new(),
             power_cycles: 0,
         }
     }
@@ -626,6 +632,7 @@ impl SimEcu {
             image: self.image.clone(),
             silent: self.silent,
             armed: self.armed.clone(),
+            armed_for_service: self.armed_for_service.clone(),
             power_cycles: self.power_cycles,
         }
     }
@@ -664,6 +671,7 @@ impl SimEcu {
         ecu.image = snapshot.image;
         ecu.silent = snapshot.silent;
         ecu.armed = snapshot.armed;
+        ecu.armed_for_service = snapshot.armed_for_service;
         ecu.power_cycles = snapshot.power_cycles;
         ecu.check_timers();
         Ok(ecu)
@@ -703,6 +711,19 @@ impl SimEcu {
         if self.take_armed(|f| matches!(f, Fault::BusError)).is_some() {
             // The request never reaches the ECU.
             return Exchange::none();
+        }
+        if let Some(&sid) = message.first() {
+            // Only now has the request reached the ECU: the faults waiting for its service are
+            // armed for it.
+            self.arm_for_service(sid);
+            if self.silent {
+                // A power loss waiting for this service: the request finds the ECU off.
+                return Exchange::none();
+            }
+            if self.take_armed(|f| matches!(f, Fault::BusError)).is_some() {
+                // A bus error waiting for this service loses the request.
+                return Exchange::none();
+            }
         }
         let power_cycles = self.power_cycles;
         let delay_before = self.security_delay_until;
@@ -803,6 +824,41 @@ impl SimEcu {
                 self.silent = true;
             }
             _ => self.armed.push(fault),
+        }
+    }
+
+    /// Arms `fault` (as [`SimEcu::inject`] does) once a request of service `sid` reaches the ECU,
+    /// so that it fires on that request: requests of other services pass it by. A request lost
+    /// on the way (the ECU off or still starting up after an ECUReset, or a [`Fault::BusError`]
+    /// armed by [`SimEcu::inject`]) does not count, and the
+    /// fault keeps waiting. Faults that wait for the same service are armed together, in
+    /// injection order and ahead of the faults [`SimEcu::inject`] armed; from then on they are
+    /// armed faults like those, so one that does not fire on that request waits for the next
+    /// request of any service.
+    /// [`Fault::PowerLoss`] then takes effect at once, so that request gets no answer.
+    pub fn inject_for_service(&mut self, sid: u8, fault: Fault) {
+        self.armed_for_service.push((sid, fault));
+    }
+
+    /// Faults waiting for a request of a given service ([`SimEcu::inject_for_service`]).
+    pub fn faults_for_service(&self) -> &[(u8, Fault)] {
+        &self.armed_for_service
+    }
+
+    /// Arms the faults waiting for service `sid`, ahead of the others, for the request at hand.
+    fn arm_for_service(&mut self, sid: u8) {
+        let (now, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.armed_for_service)
+            .into_iter()
+            .partition(|(waiting_for, _)| *waiting_for == sid);
+        self.armed_for_service = later;
+        let mut position = 0;
+        for (_, fault) in now {
+            if fault == Fault::PowerLoss {
+                self.inject(fault);
+            } else {
+                self.armed.insert(position, fault);
+                position += 1;
+            }
         }
     }
 

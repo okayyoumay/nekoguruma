@@ -185,6 +185,20 @@ measured on the ECU's clock, like the other timers, and a snapshot keeps the tim
 `reconnect()` and `Fault::PowerLoss` start no startup (a power loss stays silent until
 `reconnect()`, which also ends a startup in progress).
 
+`SimEcu::inject_for_service(sid, fault)` arms a fault for one service: it waits, passing requests
+of other services by, until a request of service `sid` reaches the ECU, and then fires on that
+request as it would have fired on the next one after `inject`. Faults waiting for the same
+service are armed together, in injection order and ahead of the faults `inject` armed; a
+`PowerLoss` takes effect when that request arrives, so it gets no answer. A request lost on the
+way (the ECU silent or starting up, or a bus error) does not count. Once armed, a fault behaves as after
+`inject`: one that does not fire on that request (a second fault of the same kind, a
+`ResponsePending` on a request without a response) stays armed for the next request of any
+service. A request a `BusError` armed by `inject` loses never reaches the ECU, so the faults
+waiting for its service wait on; a `BusError` aimed at a service loses that request. This lets
+a test hit a request it cannot time, such as a client's ECUReset that follows a run of other
+requests.
+`faults_for_service()` lists the faults still waiting, with their service.
+
 While the ECU is silent (after `PowerLoss` or `drop_at_block`), requests do not reach it and the
 armed faults stay armed. `armed_faults()` lists the faults that have not fired yet.
 `power_cycles()` counts power cycles (power loss, ECU reset, `reconnect()`); the VCI side uses it

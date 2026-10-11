@@ -26,9 +26,10 @@
 //!    `sim-vci`). [`Env::restart`] empties the trace before it starts, so [`Env::trace`] returns
 //!    the restart's own requests afterwards.
 //!
-//! The first run's worker also takes `sim-vci` control commands from the scenario's control
-//! directory (`NGR_SIM_VCI_CONTROL_DIR`), which [`Env::inject`] writes, so a test can inject a
-//! fault while the program waits; the probe and the restart get no control directory.
+//! The workers of the first run and of the restart also take `sim-vci` control commands from
+//! the scenario's control directory (`NGR_SIM_VCI_CONTROL_DIR`), which [`Env::inject`] writes,
+//! so a test can inject a fault while the program waits, or before the restart; the probe gets
+//! no control directory.
 //!
 //! A worker crash takes another path: [`Env::crash_worker`] runs the first run in this process,
 //! as the agent that survives it, and kills only the worker with SIGKILL once the journal
@@ -220,7 +221,7 @@ impl Env {
             std::env::set_var("NGR_SIM_ECU_STATE", self.ecu_state());
             std::env::set_var("NGR_SIM_VCI_TRACE", self.trace_file());
             std::env::remove_var("VCI_SERVICE_INSECURE_NO_AUTH");
-            std::env::remove_var("NGR_SIM_VCI_CONTROL_DIR");
+            std::env::set_var("NGR_SIM_VCI_CONTROL_DIR", self.control_dir());
         }
     }
 
@@ -235,7 +236,7 @@ impl Env {
             "probe" => {
                 command.env_remove("NGR_SIM_VCI_TRACE");
             }
-            // Only the first run's worker takes control commands ([`Env::inject`]).
+            // The first run's worker takes control commands ([`Env::inject`]).
             "agent" => {
                 command.env("NGR_SIM_VCI_CONTROL_DIR", self.control_dir());
             }
@@ -296,10 +297,11 @@ impl Env {
         }
     }
 
-    /// Hands `command` (a `sim-vci` control command, JSON) to the first run's worker through
+    /// Hands `command` (a `sim-vci` control command, JSON) to the scenario's worker through
     /// the control directory: written under a temporary name and renamed, so `sim-vci` never
     /// reads it half-written, and numbered, so commands apply in the order they were given.
-    /// `sim-vci` applies it at the worker's next J2534 call.
+    /// `sim-vci` applies it at the worker's next J2534 call: the first run's, or, written while no
+    /// process of the scenario runs, the restart's first.
     pub fn inject(&self, command: &str) {
         let number = self.commands.get() + 1;
         self.commands.set(number);

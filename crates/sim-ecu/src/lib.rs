@@ -825,7 +825,9 @@ impl SimEcu {
     /// so that it fires on that request: requests of other services pass it by. A request lost
     /// on the way (the ECU off or still starting up after an ECUReset) does not count, and the
     /// fault keeps waiting. Faults that wait for the same service are armed together, in
-    /// injection order and ahead of the faults [`SimEcu::inject`] armed.
+    /// injection order and ahead of the faults [`SimEcu::inject`] armed; from then on they are
+    /// armed faults like those, so one that does not fire on that request waits for the next
+    /// request of any service.
     /// [`Fault::PowerLoss`] then takes effect at once, so that request gets no answer.
     pub fn inject_for_service(&mut self, sid: u8, fault: Fault) {
         self.armed_for_service.push((sid, fault));

@@ -13,15 +13,15 @@
 //! The harness (`tests/common/restart.rs`) keeps the simulated ECU's state in a state file
 //! (ADR-241), so the ECU outlives the killed agent and its timers go on running. The restarted
 //! agent redoes the transfer, in this order: the VIN and the ECU's hardware identity are read, the
-//! safety preconditions checked, the ECUReset sent, the VIN and hardware identity read again
-//! and matched, the software version checked, the preconditions checked again (8.9), the steps
-//! before the erase replayed, the preconditions checked once more, and then the erase,
-//! RequestDownload, blocks, RequestTransferExit and the post-transfer steps follow as on a first
-//! run. The tests observe that order request by request in `sim-vci`'s request trace
-//! ([`GATE_REQUESTS`], the teardown, [`REDO_REQUESTS`]), and the ECU enforces the transfer part of it, since it refuses the
-//! erase while a download runs, refuses a download without an erase and a RequestTransferExit
-//! with blocks missing. Its power-cycle count (DID FD01) shows that the restart reset the ECU
-//! exactly once, or not at all after a passive teardown.
+//! safety preconditions checked, the ECUReset sent, the VIN and hardware identity read again and
+//! matched, the software version checked, the preconditions checked again (8.9), the steps before
+//! the erase replayed, the preconditions checked once more, and then the erase, RequestDownload,
+//! blocks, RequestTransferExit and the post-transfer steps follow as on a first run. The tests
+//! observe that order request by request in `sim-vci`'s request trace ([`GATE_REQUESTS`], the
+//! teardown, [`REDO_REQUESTS`]), and the ECU enforces the transfer part of it, since it refuses the
+//! erase while a download runs, refuses a download without an erase and a RequestTransferExit with
+//! blocks missing. Its power-cycle count (DID FD01) shows that the restart reset the ECU exactly
+//! once, or not at all after a passive teardown.
 //!
 //! The mid-transfer agent-kill scenarios differ in the ECU's session timer (tS3_Server): the
 //! restart comes while the ECU is still in its programming session with the transfer running, and
@@ -879,13 +879,15 @@ fn a_refused_ecu_reset_makes_the_teardown_passive() {
 
 /// The ECU resets but the response to the restart's ECUReset is lost: the teardown cannot tell
 /// whether it reset and turns passive (`PassiveCause::ResetOutcomeUnknown`), and the job
-/// completes.
+/// completes. The ECU starts up for 1.5 s after the reset, so a confirmation that followed the
+/// reset at once (as after an accepted one) would read during the startup and read again; after
+/// the passive wait the first read confirms.
 #[test]
 #[serial]
 fn a_lost_ecu_reset_response_makes_the_teardown_passive() {
     redo_after_teardown(
         "reset-unanswered",
-        &ecu_config(3_000),
+        &ecu_config_with_startup(3_000, Some(1_500)),
         Some(r#"{"command": "inject_fault", "service": 17, "fault": "drop_response"}"#),
         Teardown {
             gates: GATE_REQUESTS,
@@ -896,16 +898,16 @@ fn a_lost_ecu_reset_response_makes_the_teardown_passive() {
     );
 }
 
-/// The ECU acknowledges the restart's ECUReset and then answers nothing for 3 s while it starts
-/// up, longer than the confirmation's startup wait and window (0.1 s and 2 s): the first
-/// confirmation fails, the passive wait runs, the second confirmation succeeds, and the job
-/// completes.
+/// The ECU acknowledges the restart's ECUReset and then answers nothing for 4 s while it starts
+/// up, well past the confirmation's startup wait and window (0.1 s and 2 s) and well before the
+/// second attempt (after the 3.5 s passive wait): the first confirmation fails, the passive wait
+/// runs, the second confirmation succeeds, and the job completes.
 #[test]
 #[serial]
 fn an_ecu_silent_after_acknowledging_the_reset_is_confirmed_after_the_passive_wait() {
     redo_after_teardown(
         "reset-silent",
-        &ecu_config_with_startup(3_000, Some(3_000)),
+        &ecu_config_with_startup(3_000, Some(4_000)),
         None,
         Teardown {
             first_read_confirms: false,

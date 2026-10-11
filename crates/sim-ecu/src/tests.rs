@@ -2457,3 +2457,61 @@ fn a_power_loss_for_a_service_takes_the_ecu_off_when_that_request_arrives() {
         pos(&[0x62, 0xF1, 0x86, 0x01])
     );
 }
+
+#[test]
+fn a_fault_for_a_service_keeps_waiting_through_a_request_lost_in_the_startup() {
+    let (mut ecu, clock) = ecu_with_clock(EcuConfig {
+        startup_ms: Some(100),
+        ..config()
+    });
+    ecu.request(&[0x11, 0x01]);
+    ecu.inject_for_service(0x11, Fault::DropResponse);
+    // Lost while the ECU starts up: the fault waits on.
+    assert_eq!(ecu.request(&[0x11, 0x01]), SimResponse::NoResponse);
+    assert_eq!(ecu.faults_for_service(), [(0x11, Fault::DropResponse)]);
+    clock.advance(ms(100));
+    let cycles = ecu.power_cycles();
+    assert_eq!(ecu.request(&[0x11, 0x01]), SimResponse::NoResponse);
+    assert_eq!(ecu.power_cycles(), cycles + 1);
+    assert!(ecu.faults_for_service().is_empty());
+}
+
+#[test]
+fn a_fault_for_a_service_fires_ahead_of_one_armed_for_any_request() {
+    let mut ecu = ecu();
+    ecu.inject(Fault::NegativeResponse {
+        nrc: Nrc::RequestOutOfRange,
+    });
+    ecu.inject_for_service(
+        0x22,
+        Fault::NegativeResponse {
+            nrc: Nrc::ConditionsNotCorrect,
+        },
+    );
+    assert_eq!(
+        ecu.request(&[0x22, 0xF1, 0x86]),
+        neg(0x22, Nrc::ConditionsNotCorrect)
+    );
+    // The fault armed for any request fires on the next one.
+    assert_eq!(
+        ecu.request(&[0x22, 0xF1, 0x86]),
+        neg(0x22, Nrc::RequestOutOfRange)
+    );
+}
+
+#[test]
+fn a_snapshot_without_faults_for_a_service_still_reads() {
+    let mut ecu = ecu();
+    let json = serde_json::to_string(&ecu.snapshot()).unwrap();
+    let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert!(
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("armed_for_service")
+            .is_some()
+    );
+    let old: EcuSnapshot = serde_json::from_value(value).unwrap();
+    let restored = SimEcu::restore(old, ManualClock::default(), ms(0)).unwrap();
+    assert!(restored.faults_for_service().is_empty());
+}

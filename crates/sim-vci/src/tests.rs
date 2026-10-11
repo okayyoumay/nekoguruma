@@ -1020,6 +1020,8 @@ fn the_control_export_rejects_what_it_cannot_parse() {
         r#"{"command": "explode"}"#,
         r#"{"command": "inject_fault", "fault": "melt"}"#,
         r#"{"command": "reconnect_ecu", "extra": 1}"#,
+        r#"{"command": "inject_fault", "fault": "drop_response", "service": 256}"#,
+        r#"{"command": "inject_fault", "fault": "drop_response", "service": -1}"#,
     ] {
         assert_eq!(control(command), ERR_FAILED, "{command}");
     }

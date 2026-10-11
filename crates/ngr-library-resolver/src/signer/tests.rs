@@ -145,9 +145,15 @@ fn headers_beyond_64_kib_are_read_from_a_reader() {
             embedded_signature_size(&mut Cursor::new(&file)).unwrap(),
             0x2400
         );
-        // A pointer past the end of the file, and a file shorter than the DOS header, are unsigned.
+        // Headers cut off, a pointer past the end of the file, and a file shorter than the DOS
+        // header, are all unsigned.
         let cut = &file[..at + 10];
         assert_eq!(embedded_signature_size(&mut Cursor::new(cut)).unwrap(), 0);
+        let before_headers = &file[..0x1000];
+        assert_eq!(
+            embedded_signature_size(&mut Cursor::new(before_headers)).unwrap(),
+            0
+        );
         assert_eq!(
             embedded_signature_size(&mut Cursor::new(&file[..8])).unwrap(),
             0
@@ -187,6 +193,8 @@ fn hresults_map_to_failure_classes() {
     for (code, expected) in table {
         assert_eq!(classify(code as i32), expected, "{code:#010X}");
     }
+    // A verified signature whose signer identity cannot be read is not called malformed.
+    assert_eq!(classify(NO_SIGNER_DATA), SignatureFailure::Other);
 }
 
 #[test]

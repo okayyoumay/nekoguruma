@@ -67,6 +67,10 @@ impl fmt::Display for SignatureFailure {
 const fn hr(code: u32) -> i32 {
     code as i32
 }
+/// Reported (E_FAIL, class `Other`) when the provider says yes but the leaf certificate, its
+/// name (an empty subject included) or its SHA-256 property cannot be read. The signature
+/// verified, so it is not a malformed signature; the identity is simply unavailable.
+const NO_SIGNER_DATA: i32 = 0x8000_4005_u32 as i32;
 const TRUST_E_BAD_DIGEST: i32 = hr(0x8009_6010);
 const CERT_E_UNTRUSTEDROOT: i32 = hr(0x800B_0109);
 const CERT_E_UNTRUSTEDTESTROOT: i32 = hr(0x800B_010D);
@@ -391,10 +395,11 @@ mod imp {
         Storage::FileSystem::FILE_SHARE_READ,
     };
 
-    use super::{Signer, SignerError, classify, embedded_signature_size};
+    use super::{NO_SIGNER_DATA, Signer, SignerError, classify, embedded_signature_size};
 
-    // windows-sys does not bind these two wintrust.dll helpers, so they are declared here the
-    // way it declares the others (raw-dylib, no import library needed).
+    // windows-sys binds these two wintrust.dll helpers only behind its Catalog and Sip features,
+    // so they are declared here the way it declares the others (raw-dylib, no import library
+    // needed).
     #[cfg_attr(
         target_arch = "x86",
         link(
@@ -421,10 +426,6 @@ mod imp {
     }
 
     const S_OK: i32 = 0;
-    /// Reported (E_FAIL, class `Other`) when the provider says yes but the leaf certificate, its
-    /// name or its SHA-256 property cannot be read. The signature verified, so it is not a
-    /// malformed signature; the identity is simply unavailable.
-    const NO_SIGNER_DATA: i32 = 0x8000_4005_u32 as i32;
 
     pub(super) fn check_signer(library: &Path) -> Result<Signer, SignerError> {
         // Read sharing only: nobody can open the file for writing, rename or delete it while the
@@ -541,7 +542,8 @@ mod imp {
                 ptr::null_mut(),
                 0,
             );
-            if chars == 0 {
+            // An empty name still counts its terminating NUL, so 1 means no name.
+            if chars <= 1 {
                 return Err(NO_SIGNER_DATA);
             }
             let mut name = vec![0u16; chars as usize];
@@ -553,7 +555,7 @@ mod imp {
                 name.as_mut_ptr(),
                 chars,
             );
-            if written == 0 {
+            if written <= 1 {
                 return Err(NO_SIGNER_DATA);
             }
             // The count includes the terminating NUL.

@@ -1,11 +1,12 @@
 // Relies on the debug-only runtime VCI_CONFIG_PATH override; see ADR-073. Killing the agent's
 // process group is unix-only.
 #![cfg(all(debug_assertions, unix))]
-//! Restart end to end, an agent killed or its worker crashed mid-transfer (design 5.3, 5.6,
-//! 8.2.5; ADR-229, ADR-276): the agent runs a flash job against a real `j2534-0404-service`
-//! worker and `sim-vci` as a child process, is killed with SIGKILL after a block of the transfer
-//! was journaled, and the job is resumed at library level (`resume_program_journaled`) with the
-//! same journal directory. In the worker-crash scenario the agent runs in the test process and
+//! Restart end to end, an agent killed or its worker crashed mid-transfer or after
+//! RequestTransferExit (design 5.3, 5.6, 8.2.5; ADR-229, ADR-276): the agent runs a flash job
+//! against a real `j2534-0404-service` worker and `sim-vci` as a child process, is killed with
+//! SIGKILL after a block of the transfer was journaled, or after RequestTransferExit was sent,
+//! and the job is resumed at library level (`resume_program_journaled`) with the same journal
+//! directory. In the worker-crash scenario the agent runs in the test process and
 //! only its worker is killed; the agent's next run resumes on a new worker with the guards the
 //! failed run gave back.
 //!
@@ -20,7 +21,7 @@
 //! ([`EXPECTED_RESTART`]), and the ECU enforces the transfer part of it, since it refuses the
 //! erase while a download runs, refuses a download without an erase and a RequestTransferExit
 //! with blocks missing. Its power-cycle count (DID FD01) shows that the restart reset the ECU
-//! exactly once.
+//! exactly once, or not at all after a passive teardown.
 //!
 //! The agent-kill scenarios differ in the ECU's session timer (tS3_Server): the restart comes
 //! while the ECU is still in its programming session with the transfer running, and after the
@@ -29,6 +30,14 @@
 //! ECU's state at the reconnection does not change the path. Neither ends in on-site
 //! intervention, since the conditions that lead there (an identity or software version that is
 //! not the job's, a precondition that fails) do not hold.
+//!
+//! The scenarios after RequestTransferExit kill the agent once the journal holds the
+//! RequestTransferExit marker: before the response was recorded (the ECU keeps the agent
+//! waiting with response-pending messages, injected through `sim-vci`'s control directory) and
+//! after it was, before the integrity check ran. The marker makes the restart's teardown
+//! passive: it sends no ECUReset and waits out the ECU's session timer, which the ECU's
+//! configuration keeps at the plan's declared 3 s. Both redo the transfer, so RequestTransferExit
+//! and the integrity check run again, in order.
 //!
 //! The tests are serial, the entry test included: the restart sets process-wide environment
 //! variables for the worker it launches, and the entry test reads one.
@@ -112,8 +121,9 @@ const ERASE_PC: u32 = 4;
 const WAIT_FOR_BLOCK: Duration = Duration::from_secs(60);
 
 /// A programming session (the step before the erase), the erase, RequestDownload of the image,
-/// one `FlashTransfer` per block with a `Wait` after block [`KILL_AFTER_BLOCK`],
-/// RequestTransferExit, and the integrity check as the post-transfer step. The plan starts at
+/// one `FlashTransfer` per block with a `Wait` after block [`KILL_AFTER_BLOCK`] and after the
+/// last block, RequestTransferExit, a `Wait`, and the integrity check as the post-transfer step.
+/// The waits send nothing; they are where the tests kill the agent or inject a fault. The plan starts at
 /// instruction 0, so a restart replays the session change; the supply voltage must stay within
 /// 11 to 15 V, read from the VCI.
 fn program() -> Program {
@@ -151,7 +161,7 @@ fn program() -> Program {
     for i in 0..BLOCKS {
         code.push(Op::PushBytes(first_block + i));
         code.push(Op::FlashTransfer { block: i + 1 });
-        if i + 1 == KILL_AFTER_BLOCK {
+        if i + 1 == KILL_AFTER_BLOCK || i + 1 == BLOCKS {
             code.push(Op::Wait { millis: PARK_MS });
         }
     }
@@ -159,6 +169,7 @@ fn program() -> Program {
     let exit_pc = code.len() as u32;
     code.extend([
         Op::ServiceRequest { service: 0x37 },
+        Op::Wait { millis: PARK_MS },
         Op::PushBytes(4),
         Op::RoutineControl {
             routine: RID_CHECK_PROGRAMMING_DEPENDENCIES,
@@ -287,10 +298,20 @@ fn kill_mid_transfer(env: &Env, spec: &JobSpec) -> StepRef {
     transfer.started_at
 }
 
-/// Checks the restart's requests against [`EXPECTED_RESTART`]. TesterPresent requests are left
-/// out and consecutive F186 reads collapsed, since the confirmation reads until the ECU answers;
-/// every other request must be there, once, in order. The ECUReset is checked on its own too.
-fn assert_restart_order(trace: &[String]) {
+/// How the restart tears down the interrupted attempt before it redoes the transfer (ADR-229,
+/// ADR-264): with an ECUReset, or, once the RequestTransferExit marker is in the journal, by
+/// waiting out the ECU's session timer without one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Teardown {
+    Reset,
+    Passive,
+}
+
+/// Checks the restart's requests against [`EXPECTED_RESTART`], without its ECUReset for a
+/// passive teardown. TesterPresent requests are left out and consecutive F186 reads collapsed,
+/// since the confirmation reads until the ECU answers; every other request must be there, once,
+/// in order. The ECUReset is counted on its own too.
+fn assert_restart_order(trace: &[String], teardown: Teardown) {
     let mut seen: Vec<&str> = Vec::new();
     for line in trace.iter().map(String::as_str) {
         if line.starts_with("uds 3E") || (line == "uds 22 F186" && seen.last() == Some(&line)) {
@@ -298,12 +319,18 @@ fn assert_restart_order(trace: &[String]) {
         }
         seen.push(line);
     }
+    let resets = usize::from(teardown == Teardown::Reset);
     assert_eq!(
         trace.iter().filter(|line| *line == "uds 11 01").count(),
-        1,
-        "exactly one ECUReset: {trace:#?}"
+        resets,
+        "{resets} ECUReset: {trace:#?}"
     );
-    assert_eq!(seen, EXPECTED_RESTART, "the restart's requests: {trace:#?}");
+    let expected: Vec<&str> = EXPECTED_RESTART
+        .iter()
+        .copied()
+        .filter(|line| teardown == Teardown::Reset || *line != "uds 11 01")
+        .collect();
+    assert_eq!(seen, expected, "the restart's requests: {trace:#?}");
 }
 
 /// What a completed job leaves: the journal records one resume of the stage and a new
@@ -315,6 +342,7 @@ fn assert_completed(
     first_attempt: StepRef,
     power_cycles_before: u32,
     final_sessions: &[u8],
+    teardown: Teardown,
     result: Result<diag_ir::VmState, agent::JobError>,
 ) {
     let state = result.expect("the restarted job should complete");
@@ -339,12 +367,12 @@ fn assert_completed(
     assert!(!transfer.interrupted);
     assert!(transfer.exit.expect("an exit marker").complete);
 
-    assert_restart_order(&env.trace());
+    assert_restart_order(&env.trace(), teardown);
 
     // The ECU holds the whole image, verified by its integrity check, which it passes only
     // after a RequestTransferExit with every block in order on a freshly erased flash. The
-    // restart reset it once. The session is checked apart: the worker's stop can take longer
-    // than a short session timer.
+    // restart reset it once, or not at all after a passive teardown. The session is checked
+    // apart: the worker's stop can take longer than a short session timer.
     let probe = env.probe();
     assert!(
         final_sessions.contains(&probe.session),
@@ -362,7 +390,7 @@ fn assert_completed(
             // A verified download is closed: no block is pending and none is counted.
             flash_block: 0,
             received: 0,
-            power_cycles: power_cycles_before + 1,
+            power_cycles: power_cycles_before + u32::from(teardown == Teardown::Reset),
         }
     );
 }
@@ -397,6 +425,7 @@ fn an_agent_killed_mid_transfer_redoes_it_within_the_session_timer() {
         first_attempt,
         before.power_cycles,
         &[1, 2],
+        Teardown::Reset,
         result,
     );
 }
@@ -441,6 +470,7 @@ fn an_agent_killed_mid_transfer_redoes_it_after_the_session_timer_expired() {
         first_attempt,
         before.power_cycles,
         &[1, 2],
+        Teardown::Reset,
         result,
     );
 }
@@ -526,6 +556,141 @@ fn a_worker_crashed_mid_transfer_is_restarted_like_a_killed_agent() {
         first_attempt,
         before.power_cycles,
         &[1, 2],
+        Teardown::Reset,
+        result,
+    );
+}
+
+/// The RequestTransferExit's instruction.
+fn exit_pc(spec: &JobSpec) -> u32 {
+    spec.program
+        .code
+        .iter()
+        .position(|op| *op == Op::ServiceRequest { service: 0x37 })
+        .expect("a RequestTransferExit") as u32
+}
+
+/// What the journal and the ECU hold when the agent was killed after RequestTransferExit: the
+/// exit marker, every block, no completed post-transfer steps and no resume yet, with the ECU
+/// in its programming session and the download closed but not verified. Returns where the
+/// first attempt's transfer started.
+fn assert_killed_after_exit(env: &Env, spec: &JobSpec, response_recorded: bool) -> StepRef {
+    let journal = agent::journal::Journal::read(&env.journal_dir(), &spec.key).expect("journal");
+    assert!(journal.facts.resume_counts.is_empty());
+    let transfer = journal.facts.transfer.expect("a transfer attempt");
+    assert_eq!(transfer.started_at.pc, ERASE_PC);
+    assert_eq!(transfer.last_block, Some(BLOCKS));
+    let exit = transfer.exit.expect("the RequestTransferExit marker");
+    assert_eq!(exit.intent_at.pc, exit_pc(spec));
+    assert!(!exit.complete, "the post-transfer steps did not complete");
+    assert_eq!(
+        exit.last_post_step.map(|step| step.pc),
+        response_recorded.then(|| exit_pc(spec)),
+        "the RequestTransferExit's response should be recorded: {response_recorded}"
+    );
+    let probe = env.probe();
+    assert_eq!(
+        (probe.session, probe.flash_phase),
+        (2, 3),
+        "the ECU should be in its programming session with the download closed, not verified: \
+         {probe:?}"
+    );
+    transfer.started_at
+}
+
+/// The agent is killed after it sent RequestTransferExit and before the response reached the
+/// journal: the ECU answers it with four response-pending messages 200 ms apart, which keeps
+/// the agent waiting while the ECU has already closed the download. The ECU's session timer
+/// restarts when its final response goes out, so the sequence is kept shorter than the
+/// restart's passive wait. The restart cannot tell
+/// whether the download closed. With the RequestTransferExit marker journaled it sends no
+/// ECUReset: it waits out the ECU's session timer (the plan declares the ECU's 3 s), confirms
+/// the default session, and redoes the transfer, so RequestTransferExit and the integrity check
+/// run again, in order.
+#[test]
+#[serial]
+fn a_kill_before_the_transfer_exit_response_was_recorded_redoes_the_transfer() {
+    let spec = spec();
+    let env = Env::new("exit-unanswered", ENTRY, &ecu_config(3_000));
+    let agent = env.spawn_agent();
+    // The program waits after the last block, so the fault is armed before the
+    // RequestTransferExit goes out, and nothing else is sent in between to take it.
+    env.wait_for_block(&spec, BLOCKS, WAIT_FOR_BLOCK);
+    env.inject(
+        r#"{"command": "inject_fault", "fault": {"response_pending": {"count": 4, "interval_ms": 200}}}"#,
+    );
+    env.wait_for(&spec, "RequestTransferExit sent", WAIT_FOR_BLOCK, |state| {
+        state
+            .facts
+            .transfer
+            .as_ref()
+            .and_then(|transfer| transfer.exit.as_ref())
+            .is_some()
+            && env.trace().iter().any(|line| line == "uds 37")
+    });
+    // The trace line is written as the request is sent, just before the ECU handles it; the
+    // kill waits until the ECU has (closed the download and armed its response-pending
+    // sequence), well within that sequence's 800 ms.
+    std::thread::sleep(Duration::from_millis(200));
+    let status = agent.kill();
+    assert!(
+        restart::died_of_sigkill(status),
+        "the agent should be killed while it waits for the response: {status}"
+    );
+    assert!(env.commands_applied(), "the fault should have been applied");
+    let first_attempt = assert_killed_after_exit(&env, &spec, false);
+    let before = env.probe();
+    let result = env.restart(&spec);
+    assert_completed(
+        &env,
+        &spec,
+        first_attempt,
+        before.power_cycles,
+        &[1, 2],
+        Teardown::Passive,
+        result,
+    );
+}
+
+/// The agent is killed after the RequestTransferExit's response was journaled and before the
+/// integrity check ran: the post-transfer steps did not complete, so the restart tears down
+/// passively as above and redoes the transfer, and RequestTransferExit and the integrity check
+/// run again, in order.
+#[test]
+#[serial]
+fn a_kill_before_the_post_transfer_steps_completed_redoes_the_transfer() {
+    let spec = spec();
+    let env = Env::new("post-transfer", ENTRY, &ecu_config(3_000));
+    let agent = env.spawn_agent();
+    // The program waits after the RequestTransferExit, before the integrity check.
+    env.wait_for(
+        &spec,
+        "RequestTransferExit answered",
+        WAIT_FOR_BLOCK,
+        |state| {
+            state
+                .facts
+                .transfer
+                .as_ref()
+                .and_then(|transfer| transfer.exit.as_ref())
+                .is_some_and(|exit| exit.last_post_step.is_some())
+        },
+    );
+    let status = agent.kill();
+    assert!(
+        restart::died_of_sigkill(status),
+        "the agent should be killed during the program's wait: {status}"
+    );
+    let first_attempt = assert_killed_after_exit(&env, &spec, true);
+    let before = env.probe();
+    let result = env.restart(&spec);
+    assert_completed(
+        &env,
+        &spec,
+        first_attempt,
+        before.power_cycles,
+        &[1, 2],
+        Teardown::Passive,
         result,
     );
 }

@@ -26,6 +26,10 @@
 //!    `sim-vci`). [`Env::restart`] empties the trace before it starts, so [`Env::trace`] returns
 //!    the restart's own requests afterwards.
 //!
+//! The first run's worker also takes `sim-vci` control commands from the scenario's control
+//! directory (`NGR_SIM_VCI_CONTROL_DIR`), which [`Env::inject`] writes, so a test can inject a
+//! fault while the program waits; the probe and the restart get no control directory.
+//!
 //! A worker crash takes another path: [`Env::crash_worker`] runs the first run in this process,
 //! as the agent that survives it, and kills only the worker with SIGKILL once the journal
 //! records the given block. The run ends with the lost worker's error and gives its guards back;
@@ -120,6 +124,8 @@ pub struct Env {
     root: PathBuf,
     /// The name of the entry test the child processes run.
     entry: &'static str,
+    /// How many control commands [`Env::inject`] has written.
+    commands: std::cell::Cell<u32>,
 }
 
 impl Drop for Env {
@@ -139,7 +145,12 @@ impl Env {
             .as_nanos();
         let root = std::env::temp_dir().join(format!("ngr-restart-{tag}-{nanos}"));
         std::fs::create_dir_all(root.join("journal")).expect("journal directory");
-        let env = Self { root, entry };
+        std::fs::create_dir_all(root.join("control")).expect("control directory");
+        let env = Self {
+            root,
+            entry,
+            commands: std::cell::Cell::new(0),
+        };
         std::fs::write(
             env.config(),
             format!(
@@ -162,6 +173,10 @@ impl Env {
 
     fn ecu_state(&self) -> PathBuf {
         self.root.join("ecu.state")
+    }
+
+    fn control_dir(&self) -> PathBuf {
+        self.root.join("control")
     }
 
     fn trace_file(&self) -> PathBuf {
@@ -215,9 +230,16 @@ impl Env {
             .args([self.entry, "--exact", "--nocapture"])
             .env(ROLE_ENV, role);
         self.apply_to(&mut command);
-        if role == "probe" {
+        match role {
             // The probe's own reads are not part of any scenario's trace.
-            command.env_remove("NGR_SIM_VCI_TRACE");
+            "probe" => {
+                command.env_remove("NGR_SIM_VCI_TRACE");
+            }
+            // Only the first run's worker takes control commands ([`Env::inject`]).
+            "agent" => {
+                command.env("NGR_SIM_VCI_CONTROL_DIR", self.control_dir());
+            }
+            _ => {}
         }
         command
     }
@@ -235,29 +257,68 @@ impl Env {
     }
 
     /// Waits until the journal records block `block` (counted from 1, as the host's running
-    /// index) and returns what it holds then. Polls the journal without taking its lock, so it
-    /// does not disturb the writer; a journal the child has not created yet is waited for.
+    /// index) and returns what it holds then, as [`Env::wait_for`].
     pub fn wait_for_block(&self, spec: &JobSpec, block: u32, timeout: Duration) -> JournalState {
+        self.wait_for(spec, &format!("block {block}"), timeout, |state| {
+            state
+                .facts
+                .transfer
+                .as_ref()
+                .and_then(|transfer| transfer.last_block)
+                .is_some_and(|reached| reached >= block)
+        })
+    }
+
+    /// Waits until `reached` holds for the journal and returns what the journal held then.
+    /// Polls the journal without taking its lock, so it does not disturb the writer; a journal
+    /// the child has not created yet is waited for. `what` names the condition in the failure.
+    pub fn wait_for(
+        &self,
+        spec: &JobSpec,
+        what: &str,
+        timeout: Duration,
+        reached: impl Fn(&JournalState) -> bool,
+    ) -> JournalState {
         let deadline = Instant::now() + timeout;
         loop {
             let last = Journal::read(&self.journal_dir(), &spec.key);
-            if let Ok(state) = &last {
-                let reached = state
-                    .facts
-                    .transfer
-                    .as_ref()
-                    .and_then(|transfer| transfer.last_block);
-                if reached.is_some_and(|reached| reached >= block) {
-                    return last.expect("matched Ok");
-                }
+            if let Ok(state) = &last
+                && reached(state)
+            {
+                return last.expect("matched Ok");
             }
             assert!(
                 Instant::now() < deadline,
-                "block {block} was not journaled in {timeout:?}; the journal reads {:?}",
+                "{what} was not reached in {timeout:?}; the journal reads {:?}",
                 last.map(|state| state.facts)
             );
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    /// Hands `command` (a `sim-vci` control command, JSON) to the first run's worker through
+    /// the control directory: written under a temporary name and renamed, so `sim-vci` never
+    /// reads it half-written, and numbered, so commands apply in the order they were given.
+    /// `sim-vci` applies it at the worker's next J2534 call.
+    pub fn inject(&self, command: &str) {
+        let number = self.commands.get() + 1;
+        self.commands.set(number);
+        let temporary = self.control_dir().join(format!("{number:03}.tmp"));
+        std::fs::write(&temporary, command).expect("the control file should be writable");
+        std::fs::rename(
+            &temporary,
+            self.control_dir().join(format!("{number:03}.json")),
+        )
+        .expect("the control file should be renamed");
+    }
+
+    /// Whether the control directory is empty: `sim-vci` applied and deleted every command, and
+    /// rejected none.
+    pub fn commands_applied(&self) -> bool {
+        std::fs::read_dir(self.control_dir())
+            .expect("control directory")
+            .next()
+            .is_none()
     }
 
     /// Reads the simulated ECU's session and flash state in a process of its own.

@@ -489,10 +489,18 @@ impl Bus {
     /// Applies one control command.
     fn apply(&mut self, command: Command) -> Result<(), PassThruUlong> {
         match command {
-            Command::InjectFault { fault, service } => self.change_ecu(|ecu| match service {
-                Some(sid) => ecu.inject_for_service(sid, fault),
-                None => ecu.inject(fault),
-            }),
+            Command::InjectFault {
+                fault,
+                service,
+                request,
+            } => match (service, request) {
+                (Some(_), Some(_)) => Err(ERR_FAILED),
+                (Some(sid), None) => self.change_ecu(|ecu| ecu.inject_for_service(sid, fault)),
+                (None, Some(prefix)) => {
+                    self.change_ecu(|ecu| ecu.inject_for_request(&prefix, fault))
+                }
+                (None, None) => self.change_ecu(|ecu| ecu.inject(fault)),
+            },
             Command::ReconnectEcu {} => self.change_ecu(SimEcu::reconnect),
             Command::DisconnectVci {} => {
                 self.vci_present = false;
@@ -749,11 +757,15 @@ const CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(20);
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 enum Command {
     /// Arms a `sim_ecu::Fault` on the ECU (`SimEcu::inject`), or, with `service`, once a
-    /// request of that service reaches it (`SimEcu::inject_for_service`).
+    /// request of that service reaches it (`SimEcu::inject_for_service`), or, with `request`,
+    /// once a request that starts with those bytes does (`SimEcu::inject_for_request`). At most
+    /// one of the two.
     InjectFault {
         fault: Fault,
         #[serde(default)]
         service: Option<u8>,
+        #[serde(default)]
+        request: Option<Vec<u8>>,
     },
     /// `SimEcu::reconnect`: ends a power loss.
     ReconnectEcu {},

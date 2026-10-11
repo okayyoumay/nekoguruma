@@ -451,7 +451,11 @@ the transfer, so RequestTransferExit and the post-transfer steps run again in or
 cover the teardown's other paths, each completing the job: an ECUReset the ECU refuses or whose
 response is lost (passive teardown, `ResetRefused` and `ResetOutcomeUnknown`), a VIN the gate
 cannot read (passive teardown, `Gate`), and an ECU that acknowledges the reset and then stays
-silent past the confirmation window (confirmed after the passive retry). The
+silent past the confirmation window (confirmed after the passive retry). Three more kill the agent
+after the post-transfer steps were journaled complete, so the teardown takes the completed path (no
+reset, no wait), and make the confirmation's first F186 read fail by each of its triggers: the
+programming session still active, a refused read, an unanswered one. Each is confirmed after the
+passive retry and completes the job. The
 tests check the restart's requests in order against `sim-vci`'s request trace (`NGR_SIM_VCI_TRACE`)
 and that the ECU was power-cycled exactly once (not at all after a passive teardown). The
 kill-and-restart harness is `tests/common/restart.rs`.

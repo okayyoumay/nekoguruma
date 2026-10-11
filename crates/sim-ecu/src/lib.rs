@@ -301,9 +301,9 @@ pub struct SimEcu {
     silent: bool,
     /// Faults armed by [`SimEcu::inject`] that have not fired yet, in injection order.
     armed: Vec<Fault>,
-    /// Faults waiting for a request of a given service ([`SimEcu::inject_for_service`]), in
-    /// injection order.
-    armed_for_service: Vec<(u8, Fault)>,
+    /// Faults waiting for a request that starts with given bytes
+    /// ([`SimEcu::inject_for_request`]), in injection order.
+    armed_for_request: Vec<(Vec<u8>, Fault)>,
     /// Power cycles so far (power loss, ECU reset, reconnection).
     power_cycles: u64,
 }
@@ -335,7 +335,7 @@ pub struct EcuSnapshot {
     silent: bool,
     armed: Vec<Fault>,
     #[serde(default)]
-    armed_for_service: Vec<(u8, Fault)>,
+    armed_for_request: Vec<(Vec<u8>, Fault)>,
     power_cycles: u64,
 }
 
@@ -522,7 +522,7 @@ impl SimEcu {
             image: Vec::new(),
             silent: false,
             armed: Vec::new(),
-            armed_for_service: Vec::new(),
+            armed_for_request: Vec::new(),
             power_cycles: 0,
         }
     }
@@ -632,7 +632,7 @@ impl SimEcu {
             image: self.image.clone(),
             silent: self.silent,
             armed: self.armed.clone(),
-            armed_for_service: self.armed_for_service.clone(),
+            armed_for_request: self.armed_for_request.clone(),
             power_cycles: self.power_cycles,
         }
     }
@@ -671,7 +671,7 @@ impl SimEcu {
         ecu.image = snapshot.image;
         ecu.silent = snapshot.silent;
         ecu.armed = snapshot.armed;
-        ecu.armed_for_service = snapshot.armed_for_service;
+        ecu.armed_for_request = snapshot.armed_for_request;
         ecu.power_cycles = snapshot.power_cycles;
         ecu.check_timers();
         Ok(ecu)
@@ -712,16 +712,14 @@ impl SimEcu {
             // The request never reaches the ECU.
             return Exchange::none();
         }
-        if let Some(&sid) = message.first() {
-            // Only now has the request reached the ECU: the faults waiting for its service are
-            // armed for it.
-            self.arm_for_service(sid);
+        // Only now has the request reached the ECU: the faults waiting for it are armed for it.
+        if self.arm_for_request(message) {
             if self.silent {
-                // A power loss waiting for this service: the request finds the ECU off.
+                // A power loss waiting for this request: it finds the ECU off.
                 return Exchange::none();
             }
             if self.take_armed(|f| matches!(f, Fault::BusError)).is_some() {
-                // A bus error waiting for this service loses the request.
+                // A bus error waiting for this request loses it.
                 return Exchange::none();
             }
         }
@@ -827,30 +825,40 @@ impl SimEcu {
         }
     }
 
-    /// Arms `fault` (as [`SimEcu::inject`] does) once a request of service `sid` reaches the ECU,
-    /// so that it fires on that request: requests of other services pass it by. A request lost
-    /// on the way (the ECU off or still starting up after an ECUReset, or a [`Fault::BusError`]
-    /// armed by [`SimEcu::inject`]) does not count, and the
-    /// fault keeps waiting. Faults that wait for the same service are armed together, in
-    /// injection order and ahead of the faults [`SimEcu::inject`] armed; from then on they are
-    /// armed faults like those, so one that does not fire on that request waits for the next
-    /// request of any service.
-    /// [`Fault::PowerLoss`] then takes effect at once, so that request gets no answer.
+    /// Arms `fault` (as [`SimEcu::inject`] does) once a request of service `sid` reaches the ECU:
+    /// [`SimEcu::inject_for_request`] with the one-byte prefix `[sid]`.
     pub fn inject_for_service(&mut self, sid: u8, fault: Fault) {
-        self.armed_for_service.push((sid, fault));
+        self.inject_for_request(&[sid], fault);
     }
 
-    /// Faults waiting for a request of a given service ([`SimEcu::inject_for_service`]).
-    pub fn faults_for_service(&self) -> &[(u8, Fault)] {
-        &self.armed_for_service
+    /// Arms `fault` (as [`SimEcu::inject`] does) once a request that starts with `prefix` (its
+    /// service identifier and the bytes after it, such as `22 F1 86` for a read of DID F186)
+    /// reaches the ECU, so that it fires on that request: other requests pass it by. A request
+    /// lost on the way (the ECU off or still starting up after an ECUReset, or a
+    /// [`Fault::BusError`] armed by [`SimEcu::inject`]) does not count, and the fault keeps
+    /// waiting. Faults that wait for the same request are armed together, in injection order
+    /// and ahead of the faults [`SimEcu::inject`] armed; from then on they are armed faults like
+    /// those, so one that does not fire on that request waits for the next request of any
+    /// kind. [`Fault::PowerLoss`] then takes effect at once, so that request gets no answer. An
+    /// empty prefix matches the next request that reaches the ECU.
+    pub fn inject_for_request(&mut self, prefix: &[u8], fault: Fault) {
+        self.armed_for_request.push((prefix.to_vec(), fault));
     }
 
-    /// Arms the faults waiting for service `sid`, ahead of the others, for the request at hand.
-    fn arm_for_service(&mut self, sid: u8) {
-        let (now, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.armed_for_service)
+    /// Faults waiting for a request ([`SimEcu::inject_for_request`]), with the prefix each waits
+    /// for.
+    pub fn faults_for_request(&self) -> &[(Vec<u8>, Fault)] {
+        &self.armed_for_request
+    }
+
+    /// Arms the faults waiting for `message`, ahead of the others, for the request at hand.
+    /// Whether any was armed.
+    fn arm_for_request(&mut self, message: &[u8]) -> bool {
+        let (now, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.armed_for_request)
             .into_iter()
-            .partition(|(waiting_for, _)| *waiting_for == sid);
-        self.armed_for_service = later;
+            .partition(|(prefix, _)| message.starts_with(prefix));
+        self.armed_for_request = later;
+        let armed = !now.is_empty();
         let mut position = 0;
         for (_, fault) in now {
             if fault == Fault::PowerLoss {
@@ -860,6 +868,7 @@ impl SimEcu {
                 position += 1;
             }
         }
+        armed
     }
 
     /// Number of power cycles (power loss, ECU reset, [`SimEcu::reconnect`]) so far. A response

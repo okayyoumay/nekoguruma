@@ -997,17 +997,31 @@ fn the_control_export_arms_faults_and_reconnects_the_ecu() {
 }
 
 #[test]
-fn the_control_export_arms_a_fault_for_a_service() {
+fn the_control_export_arms_a_fault_for_a_service_or_a_request() {
     let _f = fixture();
     assert_eq!(
         control(r#"{"command": "inject_fault", "fault": "drop_response", "service": 17}"#),
         STATUS_NOERROR
     );
     assert_eq!(
-        with_ecu(|ecu| ecu.faults_for_service().to_vec()),
-        [(0x11, Fault::DropResponse)]
+        control(r#"{"command": "inject_fault", "fault": "bus_error", "request": [34, 241, 134]}"#),
+        STATUS_NOERROR
+    );
+    assert_eq!(
+        with_ecu(|ecu| ecu.faults_for_request().to_vec()),
+        [
+            (vec![0x11], Fault::DropResponse),
+            (vec![0x22, 0xF1, 0x86], Fault::BusError)
+        ]
     );
     assert!(with_ecu(|ecu| ecu.armed_faults().is_empty()));
+    // Both at once is refused.
+    assert_eq!(
+        control(
+            r#"{"command": "inject_fault", "fault": "bus_error", "service": 34, "request": [34]}"#
+        ),
+        ERR_FAILED
+    );
 }
 
 #[test]

@@ -328,7 +328,7 @@ A state the agent or the VCI reports rather than an ECU service: supply voltage,
 ## T–U
 
 **Target class** (hardware check)  
-How real the target of a **hardware check** is: T0 loopback (VCI only), T1 **stand-in ECU**, T2 bench ECU, T3 vehicle. The hardware profile declares the class of the attached setup, and an operation guard limits the UDS services a check may send to the class's list; T3 is read-only (design 13.5, ADR-275).
+The kind of setup a **hardware check** runs against: T0 loopback (VCI only), T1 **stand-in ECU**, T2 bench ECU, T3 vehicle. The classes are not ordered; each check declares the classes it can run on, and the hardware profile declares the class of the attached setup. A guard on the check's VCI handle limits every operation (UDS requests, raw frames, hardware controls) to the class's list; T3 is read-only (design 13.5, ADR-275).
 
 **Tonic**  
 Rust gRPC framework used in all service crates. Built on Hyper and Tokio.

@@ -2,7 +2,7 @@
 
 **Date:** 2026-10-11
 **Status:** Accepted
-**Affects:** design 13.5 (new), design 13.4, design 17 ("Items to Confirm Early"), VCI profile (9.3), test layout and `.config/nextest.toml` when the checks are implemented
+**Affects:** design 13.5 (new), design 13.4, design 17 ("Items to Confirm Early"), VCI profile (9.3), `sim-ecu` (SocketCAN front end), test layout and `.config/nextest.toml` when the checks are implemented
 
 ## Context
 
@@ -27,20 +27,32 @@ also need a limit that does not depend on each check's author being careful.
    (`NGR_HW_PROFILE`) a hardware check fails instead of passing: running it was a request.
    A separate runner binary was considered and rejected: tests reuse the existing harness,
    assertions and per-crate placement, and nextest already selects ignored tests by name.
-3. **Four target classes.** T0 loopback (no ECU), T1 stand-in ECU (`sim-ecu` behind a real CAN
-   interface), T2 bench ECU, T3 vehicle. Each check names the least real class it needs; the
-   hardware profile declares the class of the attached setup and any extra operations its owner
-   allows.
-4. **An operation guard, not care, enforces the class.** Every request passes a guard that
-   checks the UDS service (and sub-function where it matters) against the class's list before
-   anything is sent. T3 uses an allow-list of read-only services. Reprogramming on T2 needs the
-   profile to declare the ECU expendable and the design 8.9.1 checks to pass.
+3. **Four target classes, not ordered.** T0 loopback (no ECU), T1 stand-in ECU (`sim-ecu`
+   behind a real CAN interface), T2 bench ECU, T3 vehicle. They differ in topology and in what may
+   be sent, so none stands in for another: each check declares the set of classes it can run on,
+   and the hardware profile declares the class of the attached setup. A profile can only narrow
+   its class, except that a T2 profile may allow reprogramming of an ECU it declares expendable
+   and T1 and T2 profiles may name power-switch commands. A T3 profile can add nothing.
+4. **A guarded handle, not care, enforces the class.** A check reaches the VCI only through a
+   handle the harness creates, and the guard behind it sees every operation: UDS requests
+   (service and, where it matters, sub-function; T3 uses an allow-list of read-only services),
+   raw frames and periodic messages, and hardware controls such as programming voltage, pin
+   changes and vendor IOCTLs. Anything not on the class's list fails the check before it reaches
+   the device. On T2, writes and reprogramming run as jobs through the agent, so the existing
+   safeguards, preconditions and authorization (design 5.5, 5.6, 8.9, 8.9.1, section 6) all
+   apply and the class guard is a ceiling on top of them.
 5. **A stand-in ECU on a real bus.** `sim-ecu` gets a second front end that talks over a
    SocketCAN interface, so writes, reprogramming and fault injection (including physical ones:
    unplugging the VCI, cutting power through a host-controlled switch) can be checked with a real
    VCI and library without risking an ECU.
-6. **Findings go into permanent records.** Each run writes a report outside the repository (it
-   can contain serial numbers and VINs). A vendor behaviour becomes a VCI profile item (9.3), an
+6. **Cleanup on every exit.** A check registers its cleanup (default session, channel closed,
+   power off where the profile can switch it) before its first request to an ECU, and it runs
+   on pass, failure and panic. When the process or host dies, the ECU's own session timeout
+   returns it to the default session, and the operator follows design 5.6 after an interrupted
+   write.
+7. **Findings go into permanent records.** Each run writes a report with its date and time to
+   a directory readable only by the running user, outside the repository, with VINs and serial
+   numbers masked unless the profile asks for them. A vendor behaviour becomes a VCI profile item (9.3), an
    answer to a design 17 item is written there, and a defect is fixed or tracked.
 
 ## Consequences
@@ -51,5 +63,7 @@ also need a limit that does not depend on each check's author being careful.
   check that has started failing. Reports carry the date and versions so a reader can judge this.
 - T1 needs new code (the SocketCAN front end of `sim-ecu`), and the guard, the profile parser and
   the report writer are new test infrastructure.
+- The guarded handle can only stop what goes through it: Rust cannot keep a test from linking
+  the worker client or library itself, so that rule rests on review of every `hw_` test.
 - The device list in design 13.5 is a purchase the maintainer decides; until hardware exists the
   checks are written and listed but not run.

@@ -48,7 +48,7 @@ M5 and M6 do not depend on each other; M6 comes first (maintainer's decision, 20
 
 **Optional real-hardware checks (design 13.5).**
 
-- T0: a real J2534 library is found through the Windows registry and through a Linux `library_path` entry, opens, connects a CAN channel and passes loopback frames, under each worker ABI the vendor ships a library for (x86_64, i686; Linux ABI and `unsigned long` width per design 7.1.2).
+- T0: for each OS and worker ABI the vendor ships a J2534 library for (Windows x86_64 and i686, Linux x86_64 and i686, and Linux ARM where offered), the library is found the way that OS finds it (the Windows registry; a `library_path` entry or the registration definition on Linux, design 7.1, 7.1.1), opens, connects a CAN channel and passes loopback frames. On Linux this also checks the ABI and `unsigned long` width of design 7.1.2.
 - T1: the M1 exit-criteria read and interrupted write, with a real J2534 VCI against the stand-in ECU, and the VCI-disconnect fault produced by unplugging the VCI instead of by `sim-vci`.
 - T2: one DID read from a bench ECU (read only).
 
@@ -72,7 +72,8 @@ M5 and M6 do not depend on each other; M6 comes first (maintainer's decision, 20
 
 **Optional real-hardware checks (design 13.5).**
 
-- T1/T2: ISO 14229-2 session timing (P2 / P2*) and response-pending chains measured on a real VCI against a bench ECU, compared with the values `sim-ecu` uses.
+- T2: session timing (P2 / P2*) and response-pending chains of ISO 14229-2 (2021) 9.2, 9.5 and clause 10, measured on a real VCI against a bench ECU and compared with the values `sim-ecu` uses.
+- T1: the same timing measured on a real VCI against the stand-in ECU, to separate the VCI's own delays from the ECU's.
 - T2: the exit-criteria CSV + Starlark definition, rewritten for the bench ECU, runs through both a J2534 VCI and a D-PDU API VCI (the first real use of the D-PDU worker).
 - T3: variant identification, DID and DTC reads on a vehicle.
 
@@ -128,8 +129,8 @@ M5 and M6 do not depend on each other; M6 comes first (maintainer's decision, 20
 
 - T1: the clause 16 reprogramming sequence with a real VCI against the stand-in ECU, with power cut through the host-controlled switch during the transfer.
 - T2: reprogramming of an ECU the profile declares expendable, only after the 8.9.1 checks pass.
-- Real seed/key or OEM authentication path on a bench ECU, where an algorithm or account is available (8.10).
-- Whether each VCI's library works when the agent runs as a service (design 17, "Items to Confirm Early").
+- T2: real seed/key or OEM authentication path on a bench ECU, where an algorithm or account is available (8.10).
+- T0: whether each VCI's library opens and passes loopback frames when the agent runs as a service (design 17, "Items to Confirm Early").
 
 ## M5 Real-time monitoring
 

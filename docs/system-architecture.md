@@ -1311,44 +1311,54 @@ Such operations are hidden in the UI from the outset and are also stated explici
 
 The simulators in 13.4 are what CI relies on. Some things they cannot show: how a vendor library actually behaves, timing and electrical behaviour on a real bus, and the per-vendor items in 17 ("Items to Confirm Early"). Real-hardware checks cover these. They are **optional**: no CI job runs them, and a check that cannot run because no hardware is attached never blocks a change. The reasons and the alternatives considered are in ADR-275.
 
-**Target classes.** Each check names the least real target it needs, and a hardware profile (below) declares which class the attached setup is. The class decides which operations a check may send.
+**Target classes.** A hardware profile (below) declares which class the attached setup is. The classes are not ordered: a loopback, a stand-in ECU, a bench ECU and a vehicle differ in topology and in what may be sent to them, so a setup of one class never stands in for another. Each check declares the set of classes it can run on, and it runs only when the profile's class is in that set.
 
 | Class | Setup | Operations allowed |
 |---|---|---|
-| T0 Loopback | A VCI with no ECU: two CAN channels of the same VCI, or the VCI and a second CAN interface, wired to each other with termination | Bus-level traffic only (open, connect, filters, loopback frames, ComParams) |
+| T0 Loopback | A VCI with no ECU: two CAN channels of the same VCI, or the VCI and a second CAN interface, wired to each other with termination | Bus-level traffic only (open, connect, filters, loopback frames, ComParams). No ECU-addressed request, no programming voltage |
 | T1 Stand-in ECU | A VCI talking over a real CAN bus to `sim-ecu`, run on a Linux host through a SocketCAN interface instead of through `sim-vci` | Everything, including writes, reprogramming and fault injection: the ECU is simulated, so nothing can be damaged |
-| T2 Bench ECU | A real ECU on a bench, powered from a laboratory power supply | Reads and configuration-value writes; reprogramming only when the profile declares the ECU expendable, and only after the 8.9.1 checks |
+| T2 Bench ECU | A real ECU on a bench, powered from a laboratory power supply | Reads, and configuration-value writes through the agent's job path (below); reprogramming only when the profile declares the ECU expendable |
 | T3 Vehicle | A real vehicle through its diagnostic connector, ignition on, engine off | Read-only: session control to the default or extended session, reads of DIDs and DTCs, tester present, monitoring. No writes, DTC clearing, routines, resets or security access |
 
 T1 is what makes write and interruption checks safe on real VCIs: the VCI, its library and the bus are real, and the ECU keeps the fault injection and the persistent state of 13.4.
+
+**Writes on a real ECU.** On T2, a check that writes or reprograms runs a job through the agent, the same path a production job takes, so every existing guard applies: the device-side safeguards and write-job state transitions (5.5, 5.6), the execution preconditions (8.9, and 8.9.1 for reprogramming), and the authorization and approval levels of section 6 as far as the milestone has built them. The class guard is a ceiling on top of these, never a replacement for any of them.
 
 **Device requirements.**
 
 | Item | Requirement | Needed for |
 |---|---|---|
 | Host PC | Windows 10/11 x86_64; Linux x86_64. Optionally a Linux aarch64 board, to check the inferred ARM ABI (7.1.2) | All classes |
-| J2534 VCI | SAE J2534-1 v04.04 library with CAN and ISO 15765 at 500 kbit/s, 11-bit and 29-bit identifiers. Preferably two CAN channels (SAE J2534-2 additional channels), which gives T0 without a second interface. A Linux library, if the vendor has one, checks the `unsigned long` width (7.1.2) | All classes |
-| D-PDU API VCI | ISO 22900-2 library with a root description file and the ISO 15765 protocol on CAN. One device that provides both APIs covers this and the J2534 VCI | All classes |
+| J2534 VCI | SAE J2534-1 v04.04 library supporting the CAN and ISO 15765 protocols (J2534-1 6.5.5, 6.5.6) at 500 kbit/s with 11-bit and 29-bit identifiers. Preferably two CAN channels through the additional channels of SAE J2534-2 (clause 7), which gives T0 without a second interface. A Linux library, if the vendor has one, checks the `unsigned long` width (7.1.2) | All classes |
+| D-PDU API VCI | ISO 22900-2 (2022) library with a root description file and ISO 15765-2 (2024) transport on CAN. One device that provides both APIs covers this and the J2534 VCI | All classes |
 | CAN interface | A USB-CAN adapter with a SocketCAN driver in the mainline Linux kernel | T0 without a second VCI channel, T1 |
 | Wiring | A diagnostic-connector (SAE J1962) breakout: CAN high and low on pins 6 and 14, battery and ground on pins 16, 4 and 5; a 120 ohm terminator at each end of the bus (about 60 ohm measured across it) | T0 to T2 |
 | Power supply | Adjustable 12 to 14 V laboratory supply with a current limit, enough for the VCI and the bench ECU. A switch the host can control (for example a USB relay) lets a check cut power during a transfer | T1 power-loss checks, T2 |
 | Bench ECU | An ECU that speaks UDS over ISO 15765 on CAN, with its pinout known, and either no security access or a seed/key algorithm available to the tester. A spare unit, declared expendable, for reprogramming | T2 |
 | Vehicle | A vehicle with a diagnostic connector the owner allows diagnostic reads on | T3 |
 
-**Hardware profile.** A TOML file outside the repository describes the attached setup; the path is given in the `NGR_HW_PROFILE` environment variable. It names the VCI (its API, `j2534-0404` or `iso22900`, and its library name, resolved as in 7.1), the target class, the request and response CAN identifiers and their width, and the operations the owner of the setup allows on top of the class (for example `reprogram = true` for an expendable bench ECU, or the commands that switch the power supply off and on). A check refuses to start when its class is higher than the profile's or when it needs an operation the profile does not allow.
+**Hardware profile.** A TOML file outside the repository describes the attached setup; the path is given in the `NGR_HW_PROFILE` environment variable. It names the VCI (its API, `j2534-0404` or `iso22900`, and its library name, resolved as in 7.1), the target class, and the request and response CAN identifiers and their width. A profile can only narrow what its class allows, with two exceptions: on T2 it may allow reprogramming of an ECU it declares expendable, and on T1 and T2 it may name the commands that switch the power supply off and on. A T3 profile can add nothing. A check refuses to start when the profile's class is not in its set or when it needs an operation the profile does not allow.
 
-**Operation guard.** Checks do not rely on their own care to stay within the class. Every request goes through a guard between the check and the VCI that compares the UDS service, and the sub-function where it matters, with the list for the profile's class, and fails the check before anything is sent when the request is not on it. On T3 this is the only thing that keeps a check read-only, so the T3 list is an allow-list.
+**Guarded VCI access.** Checks do not rely on their own care to stay within the class. A check gets the VCI only through a guarded handle the test harness creates; the harness does not hand out the worker client or the vendor library, and a hardware check that opens either directly is rejected in review. The guard sees every operation the handle offers and fails the check before anything reaches the device when an operation is not on its class's list:
+
+- UDS requests: the service, and the sub-function where it matters, are compared with the class's list. On T3 this list is an allow-list of read-only services.
+- Raw frames and periodic messages: on T3 only frames to the profile's request identifier carrying an allowed UDS request pass; on T0 only traffic between the loopback channels.
+- Hardware controls: programming voltage and pin changes (J2534-1 6.7, 6.8) and vendor IOCTLs are refused on T0 and T3; reading the battery voltage is always allowed.
 
 **Running.** Hardware checks are ordinary Rust tests marked `#[ignore]` with a reason naming this section, and their names start with `hw_`, so `cargo test` and the CI profiles skip them. They run through a dedicated nextest profile, `hardware`, which runs the ignored `hw_` tests one at a time (one VCI is one shared resource, 8.8.1) with no retries. When `NGR_HW_PROFILE` is not set, a hardware check fails rather than passing silently: running it was an explicit request.
+
+**Cleanup.** Before its first request to an ECU, a check registers a cleanup with the harness. It runs when the check ends, whether it passes, fails or panics: return the ECU to the default session, close the channel and, when the profile names the power commands, switch the supply off. If the process dies or the host loses power so that cleanup cannot run, the ECU falls back to the default session by itself once tester present stops (the S3 session timeout of ISO 14229-2 (2021) 9.5); the operator then switches the power or ignition off and, after an interrupted write on T2, follows the recovery of 5.6 before the next run.
+
+**Reports.** Each run writes a report: the date and time of the run, host and OS, worker ABI, VCI vendor, model, firmware and library version (read through the API where it offers them), target class, and the result of each check. It is written to a directory in the running user's data directory, readable by that user only, and never inside the repository. VINs and serial numbers are masked in the report unless the profile asks for them in full; the owner of the setup decides how long reports are kept.
 
 **Procedure.**
 
 1. Prepare the setup for its class: wiring and termination checked (about 60 ohm across CAN high and low with power off), supply voltage set and current limit on, for T3 the ignition on and the engine off.
 2. Write or check the hardware profile, then list the checks that the profile permits without running them.
 3. Run the checks for the milestone or area being looked at with the `hardware` nextest profile.
-4. Each run writes a report: host and OS, worker ABI, VCI vendor, model, firmware and library version (read through the API where it offers them), target class, and the result of each check. The report stays outside the repository; it can hold serial numbers and VINs.
+4. Read the report.
 5. Turn findings into lasting records: a vendor behaviour the VCI profile can express becomes a profile item (9.3), an answer to an item in 17 ("Items to Confirm Early") is written down there, and a defect is fixed or tracked as an open item.
-6. Leave the target as it was found: default session, and for T2 and T3 the power or ignition off.
+6. Check that the target is as it was found: default session, and for T2 and T3 the power or ignition off.
 
 ---
 

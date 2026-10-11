@@ -2,7 +2,7 @@
 
 **Date:** 2026-10-11
 **Status:** Accepted
-**Affects:** design 13.5 (new), design 13.4, design 17 ("Items to Confirm Early"), VCI profile (9.3), `sim-ecu` (SocketCAN front end), test layout and `.config/nextest.toml` when the checks are implemented
+**Affects:** design 13.5 (new), design 13.4, design 17 ("Items to Confirm Early"), VCI profile (9.3), `sim-ecu` (SocketCAN front end), the agent job runner (guarded worker client), test layout and `.config/nextest.toml` when the checks are implemented
 
 ## Context
 
@@ -22,8 +22,10 @@ also need a limit that does not depend on each check's author being careful.
 1. **Optional and outside CI.** Hardware checks never run in CI and are never a required check.
    A milestone's exit criteria do not depend on them unless a milestone names them explicitly.
 2. **Ordinary tests, opted into explicitly.** A hardware check is a Rust test named `hw_...`,
-   marked `#[ignore]` with a reason, and run through a dedicated nextest profile (`hardware`)
-   that runs only those tests, one at a time, without retries. Without a hardware profile
+   marked `#[ignore]` with a reason, and run with
+   `cargo nextest run --profile hardware --run-ignored=only`: the `hardware` profile selects the
+   `hw_` tests and runs them one at a time without retries, and `--run-ignored=only` is needed
+   because a nextest profile cannot include ignored tests by itself. Without a hardware profile
    (`NGR_HW_PROFILE`) a hardware check fails instead of passing: running it was a request.
    A separate runner binary was considered and rejected: tests reuse the existing harness,
    assertions and per-crate placement, and nextest already selects ignored tests by name.

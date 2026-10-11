@@ -1,5 +1,5 @@
 //! ISO 22900 (D-PDU API): resolution of an implementation name to its vendor library (7.1;
-//! ISO 22900-2 clause 8.7 and Annex F; ADR-228 Decision item 4).
+//! ISO 22900-2:2022 clause 8.7 and Annex F; ADR-228 Decision item 4).
 //!
 //! Chain: the root description file lists one `MVCI_PDU_API` entry per installed
 //! implementation; the entry itself names the API library, the module description file (MDF) and

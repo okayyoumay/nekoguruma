@@ -374,8 +374,8 @@ pub fn j2534_definition_dir() -> PathBuf {
     }
 }
 
-/// The D-PDU API root description file on Linux (design 7.1, ISO 22900-2 clause 8.7): it lists
-/// the installed implementations and is written by the administrator or the vendor's installer.
+/// The D-PDU API root description file on Linux (design 7.1, ISO 22900-2:2022 clause 8.7): it
+/// lists the installed implementations and is written by the administrator or the vendor's installer.
 /// Fixed at build time (ADR-228 Decision 1): `NGR_PDU_API_ROOT_FILE` at build time, either
 /// absolute or relative to the fixed system directory of [`fixed_system_root`] (default
 /// `pdu_api_root.xml`, so `/etc/pdu_api_root.xml` on Linux). No `config-root-*` feature moves it.

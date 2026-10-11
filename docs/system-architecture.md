@@ -551,7 +551,7 @@ Confirmation level (6.3) and two-person approval. The server decides the require
 |---|---|
 | J2534 / Windows | Per-VCI key under `HKLM\SOFTWARE\PassThruSupport.04.04` -> `FunctionLibrary` (absolute path of the DLL). `Name` / `Vendor` are used for display |
 | J2534 / Linux | Registration definition specific to this software (7.1.1) -> `FunctionLibrary` (absolute path of the .so) |
-| ISO 22900 (D-PDU API) | Registry (Windows) / default path (Linux) -> root description file (XML) -> module description file -> API library |
+| ISO 22900 (D-PDU API) | Registry (Windows) / path fixed at build time, `/etc/pdu_api_root.xml` by default (Linux) -> root description file (XML) -> module description file -> API library |
 
 - Specify the registry view explicitly with `KEY_WOW64_32KEY` / `KEY_WOW64_64KEY`
 - Expand environment variables in `REG_EXPAND_SZ` according to the library's bitness
@@ -622,7 +622,7 @@ Basis for the inference: AArch64's AAPCS64 matches x86_64's System V ABI in that
 
 **Trusted locations**
 
-On Windows, the basis for trust is that HKLM can be modified only by administrators. Linux gets the same premise by reading registration definitions only from `/etc/nekoguruma/j2534/` (7.1.1), in both modes. The locations of every file that decides which library is loaded (registration definitions, the worker service's configuration file) are fixed at build time. They are not taken from environment variables or command-line arguments, so another process cannot redirect a worker to a different file; a runtime override is compiled into debug builds only, for tests (ADR-228).
+On Windows, the basis for trust is that HKLM can be modified only by administrators. Linux gets the same premise by reading registration definitions only from `/etc/nekoguruma/j2534/` (7.1.1), in both modes. The locations of every file that decides which library is loaded (registration definitions, the D-PDU API root description file on Linux, the worker service's configuration file) are fixed at build time. They are not taken from environment variables or command-line arguments, so another process cannot redirect a worker to a different file; a runtime override is compiled into debug builds only, for tests (ADR-228).
 
 **One resolver, checked where the library is loaded**
 

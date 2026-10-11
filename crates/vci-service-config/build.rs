@@ -18,8 +18,8 @@ fn main() {
         non_empty_var("NGR_J2534_DEFINITION_DIR").unwrap_or_else(|| "nekoguruma/j2534".to_owned());
     println!("cargo:rustc-env=NGR_J2534_DEFINITION_DIR={dir}");
     println!("cargo:rerun-if-env-changed=NGR_J2534_DEFINITION_DIR");
-    // NGR_PDU_API_ROOT_FILE: the D-PDU API root description file on Linux (design 7.1, ISO 22900-2
-    // clause 8.7), relative to the same fixed system directory or absolute.
+    // NGR_PDU_API_ROOT_FILE: the D-PDU API root description file on Linux (design 7.1,
+    // ISO 22900-2:2022 clause 8.7), relative to the same fixed system directory or absolute.
     // Default: "pdu_api_root.xml"
     let root_file =
         non_empty_var("NGR_PDU_API_ROOT_FILE").unwrap_or_else(|| "pdu_api_root.xml".to_owned());

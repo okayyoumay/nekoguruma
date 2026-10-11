@@ -14,7 +14,7 @@ same call resolves a name on every platform. What does not depend on the standar
 | Module | Standard | Linux | Windows |
 |---|---|---|---|
 | `j2534_0404` | SAE J2534-1 v04.04 (registry: §9.2) | definition files (below) | registry, through `j2534-0404-registry` |
-| `iso22900` | ISO 22900-2 D-PDU API (clause 8.7, Annex F) | root description file (see "ISO 22900") | the same, found through the registry |
+| `iso22900` | ISO 22900-2 D-PDU API (2022 edition, clause 8.7, Annex F) | root description file (see "ISO 22900") | the same, found through the registry |
 
 Unless a section says otherwise, this document describes the `j2534_0404` module; the names in
 it are that module's (`j2534_0404::resolve`, `j2534_0404::ResolveError`, ...). The `iso22900`
@@ -103,7 +103,7 @@ paths are empty), with `Source::Registry`. The registry value is not checked for
 
 ## ISO 22900 (D-PDU API)
 
-The `iso22900` module resolves an implementation name (design 7.1; ISO 22900-2 clause 8.7 and
+The `iso22900` module resolves an implementation name (design 7.1; ISO 22900-2:2022 clause 8.7 and
 Annex F, cited by clause only).
 
 **Chain.** The root description file lists one `MVCI_PDU_API` entry per installed implementation.

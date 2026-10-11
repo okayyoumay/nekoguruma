@@ -333,6 +333,9 @@ try {
             .map_err(|e| format!("cannot create the script file: {e}"))?;
         std::io::Write::write_all(&mut script, SCRIPT.as_bytes())
             .map_err(|e| format!("cannot write the script file: {e}"))?;
+        // Close the file (keeping the path): on Windows the open handle denies PowerShell read
+        // access to it.
+        let script = script.into_temp_path();
         let output = Command::new("powershell.exe")
             .args([
                 "-NoProfile",
@@ -341,7 +344,7 @@ try {
                 "Bypass",
                 "-File",
             ])
-            .arg(script.path())
+            .arg(&script)
             .env("NGR_SIGN_TARGET", target)
             .output()
             .map_err(|e| format!("cannot run powershell.exe: {e}"))?;

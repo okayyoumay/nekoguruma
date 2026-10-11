@@ -33,8 +33,9 @@ Three facts shape how the loop can do that:
    merges it, also when the update came from the `cargo-minor-patch` group: ADR-248's auto-merge
    covers only Dependabot's own pull requests. The loop does not close the Dependabot pull
    request; Dependabot closes it once `main` has the update.
-3. **The rest are not iterations.** A pending one is looked at again next iteration; a green one
-   in the `cargo-minor-patch` group is left to merge itself; a conflicted one gets a single
+3. **The rest are not iterations.** A pending one is looked at again next iteration; one in the
+   `cargo-minor-patch` group with auto-merge turned on is left to merge itself (green without
+   auto-merge, it waits for the maintainer like the other updates); a conflicted one gets a single
    `@dependabot rebase` comment; a green one that needs the maintainer is listed in the final
    report as a merge-or-close question, without stopping the run. A failing one whose fix needs
    something the loop cannot supply is listed there too, with the reason.

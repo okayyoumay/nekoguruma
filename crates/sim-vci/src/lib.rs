@@ -328,6 +328,8 @@ struct Bus {
     programming_pin: Option<PassThruUlong>,
     /// Directory control command files are taken from ([`CONTROL_DIR_ENV`]).
     control_dir: Option<PathBuf>,
+    /// File the request trace is appended to ([`TRACE_ENV`]); debug builds only.
+    trace_path: Option<PathBuf>,
     /// Battery voltage `READ_VBATT` reports, in millivolts.
     battery_mv: u32,
     /// File the ECU's state is kept in across processes ([`ECU_STATE_ENV`]).
@@ -350,6 +352,9 @@ fn bus() -> &'static (Mutex<Bus>, Condvar) {
                 epoch: Instant::now(),
                 programming_pin: None,
                 control_dir: std::env::var_os(CONTROL_DIR_ENV).map(PathBuf::from),
+                trace_path: std::env::var_os(TRACE_ENV)
+                    .filter(|_| cfg!(debug_assertions))
+                    .map(PathBuf::from),
                 battery_mv: DEFAULT_BATTERY_MV,
                 state_path: std::env::var_os(ECU_STATE_ENV).map(PathBuf::from),
             }),
@@ -548,6 +553,27 @@ impl Bus {
         }
     }
 
+    /// Appends one line to the request trace, if there is one. Each line is written with exactly
+    /// one append-mode `write` call and never retried, so a second writer cannot slip between
+    /// two parts of a line. A short write leaves a truncated line, which a reader sees as
+    /// malformed rather than as a mixed one. A line that cannot be written is dropped: the trace
+    /// must not change what the simulator does.
+    fn trace(&self, line: &str) {
+        use std::io::Write;
+        let Some(path) = &self.trace_path else {
+            return;
+        };
+        let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        else {
+            return;
+        };
+        // `write`, not `write_all`: a retried remainder would be a second append.
+        let _ = file.write(format!("{line}\n").as_bytes());
+    }
+
     fn power_cycles(&self) -> u64 {
         self.ecu.as_ref().map_or(0, SimEcu::power_cycles)
     }
@@ -565,6 +591,14 @@ impl Bus {
             channel
                 .rx
                 .retain(|p| p.ready_at <= now || p.power_cycle == current);
+        }
+    }
+
+    fn trace_request(&self, payload: &[u8]) {
+        if self.trace_path.is_some()
+            && let Some(line) = trace_line(payload)
+        {
+            self.trace(&line);
         }
     }
 
@@ -588,9 +622,11 @@ impl Bus {
             // No simulated ECU listens on this ID.
             _ => return Ok(()),
         };
-        let Some(ecu) = self.ecu.as_mut() else {
+        if self.ecu.is_none() {
             return Ok(());
-        };
+        }
+        self.trace_request(payload);
+        let ecu = self.ecu.as_mut().expect("checked above");
         let before = ecu.power_cycles();
         let exchange = ecu.exchange(addressing, payload);
         let power_cycle = ecu.power_cycles();
@@ -626,6 +662,34 @@ impl Bus {
     }
 }
 
+/// The trace line for a UDS request, or `None` for an empty one: `uds` and the service ID in
+/// hex, then what identifies the request, in hex: the DIDs of a 0x22 read or the DID of a 0x2E
+/// write, the sub-function (and for 0x31 the routine ID) of 0x10, 0x11, 0x31 and 0x3E, and the
+/// block counter of a 0x36. Other services (0x34, 0x37, ...) give the service ID alone.
+fn trace_line(payload: &[u8]) -> Option<String> {
+    use std::fmt::Write;
+    let (&sid, rest) = payload.split_first()?;
+    let mut line = format!("uds {sid:02X}");
+    let word = |line: &mut String, bytes: &[u8]| {
+        let _ = write!(
+            line,
+            " {}",
+            bytes.iter().map(|b| format!("{b:02X}")).collect::<String>()
+        );
+    };
+    match sid {
+        0x22 => rest.chunks_exact(2).for_each(|did| word(&mut line, did)),
+        0x2E if rest.len() >= 2 => word(&mut line, &rest[..2]),
+        0x31 if rest.len() >= 3 => {
+            word(&mut line, &rest[..1]);
+            word(&mut line, &rest[1..3]);
+        }
+        0x10 | 0x11 | 0x3E | 0x36 if !rest.is_empty() => word(&mut line, &rest[..1]),
+        _ => {}
+    }
+    Some(line)
+}
+
 /// Runs `f` on the simulated ECU, creating it with the built-in configuration if the process has
 /// none yet.
 /// Lets tests inspect the ECU and inject faults (`sim_ecu::Fault`) between J2534 calls.
@@ -653,6 +717,7 @@ fn reset(config: EcuConfig) {
     bus.next_channel = 1;
     bus.programming_pin = None;
     bus.control_dir = None;
+    bus.trace_path = None;
     bus.battery_mv = DEFAULT_BATTERY_MV;
 }
 
@@ -662,6 +727,14 @@ fn reset(config: EcuConfig) {
 /// test can reach the library inside the worker process that loaded it (ADR-238). Read once,
 /// on the first call into the library.
 pub const CONTROL_DIR_ENV: &str = "NGR_SIM_VCI_CONTROL_DIR";
+
+/// Environment variable naming a file `sim-vci` appends a request trace to, for a test that
+/// checks the order of the requests a worker sent: one line per UDS request sent towards the
+/// simulated ECU (a send attempt, traced before the ECU sees it, so a request lost on the bus or
+/// ignored is listed too; see `trace_line`), and a `vbatt` line per `READ_VBATT`. Read once, on the first
+/// call into the library, and only in debug builds. The file is created if missing and never
+/// truncated by the library.
+pub const TRACE_ENV: &str = "NGR_SIM_VCI_TRACE";
 
 /// How often a waiting `PassThruReadMsgs` looks for control files.
 const CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(20);
@@ -1234,6 +1307,7 @@ pub unsafe extern "system" fn PassThruIoctl(
             return ERR_NULL_PARAMETER;
         }
         let millivolts = bus.battery_mv.saturating_add(50) / 100 * 100;
+        bus.trace("vbatt");
         // SAFETY: checked for null above; the caller guarantees it is writable.
         unsafe {
             output

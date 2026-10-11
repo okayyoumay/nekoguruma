@@ -208,6 +208,22 @@ its state throughout.
 
 A VCI crash, as opposed to a disconnect, is not simulated.
 
+## Request trace
+
+`NGR_SIM_VCI_TRACE` names a file, read once when the library is first called and only in debug
+builds, so a test can check the order of the requests a worker process sent. `sim-vci` appends
+one line per UDS request the worker sends towards the simulated ECU, and one `vbatt` line per
+`READ_VBATT`. A request is traced when it is sent, before the ECU sees it, so a line records a send
+attempt, not receipt: a request lost on the bus (`Fault::BusError`) or ignored by an ECU that is
+silent or still starting after a reset is listed too.
+A request line is `uds`, the service ID, and what identifies the request, all in hex: the DIDs of
+a 0x22 read (`uds 22 F190 F187`), the DID of a 0x2E write, the sub-function of 0x10, 0x11 and
+0x3E (`uds 11 01`), sub-function and routine ID of 0x31 (`uds 31 01 FF00`), and the block counter
+of 0x36 (`uds 36 03`); other services (0x34, 0x37) give the service ID alone. Each line is
+appended with exactly one write, never retried, to a file opened for appending, so processes
+sharing a file do not mix lines (a short write leaves a truncated line rather than a mixed one);
+the library never truncates or removes it, and a line it cannot write is dropped.
+
 ## Tests
 
 `sim-vci`'s unit tests call the exports directly. `j2534-0404-service`'s
@@ -226,7 +242,7 @@ lost after the replug, released by the close, and a new device ID on the next op
 runs each step in its own process with a state file: one starts a download and exits without
 closing anything, the next reads the running transfer and the programming session (DIDs FD00
 and F186), and one started after tS3_Server reads the interrupted transfer in the default
-session. `tests/sim_vci_response_pending.rs` runs agent jobs through the worker
+session. `tests/agent_restart_end_to_end.rs` uses the state file with a restart harness (`tests/common/restart.rs`): an agent running a flash job is killed with SIGKILL, with its worker, after a block of the transfer was journaled, and the job is resumed at library level with the same journal directory, once within tS3_Server and once after it ran out (the ECU's timer goes on while no process has it loaded); both end with the job complete and the image verified. `tests/sim_vci_response_pending.rs` runs agent jobs through the worker
 while `sim-ecu` answers with response pending. In a chain whose gaps are longer than P2 and
 shorter than P2*, the job still gets the final response: the worker restarts its timer with P2*
 on each 0x78, and the agent host skips the 0x78s the worker passes on. A chain that outlasts the

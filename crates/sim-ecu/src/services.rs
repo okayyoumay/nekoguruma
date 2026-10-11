@@ -2,10 +2,10 @@
 //! clause in ISO 14229-1 (2026 edition) and returns the first NRC that applies.
 
 use crate::{
-    DID_ACTIVE_DIAGNOSTIC_SESSION, DID_FLASH_STATE, DID_SOFTWARE_VERSION, DID_SPARE_PART_NUMBER,
-    DID_VIN, DTC_STATUS_AFTER_CLEAR, DTC_STATUS_AVAILABILITY_MASK, Download, FLASH_SIZE,
-    FLASH_START, Fault, FlashPhase, MAX_BLOCK_LENGTH, MAX_DIDS_PER_READ, MAX_RESPONSE_LENGTH,
-    MAX_SECURITY_ATTEMPTS, Nrc, P2_SERVER_MAX_MS, P2_STAR_SERVER_MAX_10MS,
+    DID_ACTIVE_DIAGNOSTIC_SESSION, DID_FLASH_STATE, DID_POWER_CYCLES, DID_SOFTWARE_VERSION,
+    DID_SPARE_PART_NUMBER, DID_VIN, DTC_STATUS_AFTER_CLEAR, DTC_STATUS_AVAILABILITY_MASK, Download,
+    FLASH_SIZE, FLASH_START, Fault, FlashPhase, MAX_BLOCK_LENGTH, MAX_DIDS_PER_READ,
+    MAX_RESPONSE_LENGTH, MAX_SECURITY_ATTEMPTS, Nrc, P2_SERVER_MAX_MS, P2_STAR_SERVER_MAX_10MS,
     POSITIVE_RESPONSE_OFFSET, RID_CHECK_PROGRAMMING_DEPENDENCIES, RID_ERASE_MEMORY,
     SUPPRESS_POS_RSP, ServiceResult, Session, SimEcu,
 };
@@ -276,6 +276,10 @@ impl SimEcu {
                 let mut record = self.flash.encode().to_vec();
                 record.extend_from_slice(&received.to_be_bytes());
                 Some(record)
+            }
+            DID_POWER_CYCLES => {
+                let count = u32::try_from(self.power_cycles).unwrap_or(u32::MAX);
+                Some(count.to_be_bytes().to_vec())
             }
             _ => None,
         }

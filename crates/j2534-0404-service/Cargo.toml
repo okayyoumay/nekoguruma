@@ -32,6 +32,8 @@ agent = { path = "../agent" }
 diag-ir = { workspace = true }
 j2534-0404-mock = { workspace = true }
 j2534-0404-sys = { workspace = true }
+# tests/agent_restart_end_to_end.rs kills a process group.
+libc = "0.2"
 serde_json = "1"
 serial_test = "3"
 shared-proto = { workspace = true }

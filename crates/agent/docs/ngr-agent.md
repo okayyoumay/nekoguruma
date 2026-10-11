@@ -437,6 +437,13 @@ stopped. In test builds `OnSiteReason::StoppedBeforeErase` reports a restart tha
 stopped before the erase, with the teardown's outcome, the confirmation and the state check; a
 job never ends in it.
 
+The restart order is tested end to end against `sim-ecu` in `j2534-0404-service`
+(`tests/agent_restart_end_to_end.rs`): the agent runs as a child process that is killed after a
+block of the transfer was journaled, and `resume_program_journaled` resumes the job from the same
+journal directory, both within the ECU's session timer and after it ran out. The tests check the
+restart's requests in order against `sim-vci`'s request trace (`NGR_SIM_VCI_TRACE`) and that the ECU
+was power-cycled exactly once. The kill-and-restart harness is `tests/common/restart.rs`.
+
 ### Continuation after the read-back verification
 
 When `restart::check_state` decides `ReadBackVerification`, the match is the verification

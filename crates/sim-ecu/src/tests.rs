@@ -1555,6 +1555,23 @@ fn power_cycles_count_resets_power_loss_and_reconnect() {
     assert_eq!(ecu.power_cycles(), 3);
 }
 
+#[test]
+fn the_power_cycle_count_is_readable_as_a_did() {
+    let mut ecu = ecu();
+    let read = |ecu: &mut SimEcu| ecu.request(&[0x22, 0xFD, 0x01]);
+    assert_eq!(
+        read(&mut ecu),
+        SimResponse::Positive(vec![0x62, 0xFD, 0x01, 0, 0, 0, 0])
+    );
+    ecu.request(&[0x11, 0x81]);
+    ecu.inject(Fault::PowerLoss);
+    ecu.reconnect();
+    assert_eq!(
+        read(&mut ecu),
+        SimResponse::Positive(vec![0x62, 0xFD, 0x01, 0, 0, 0, 3])
+    );
+}
+
 // ---------------------------------------------------------------- Timers
 
 /// An ECU on a manual clock, and the clock to advance it with.

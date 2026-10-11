@@ -7,16 +7,21 @@
 //!
 //! Registry lookups take an explicit [`RegistryView`] (ADR-277); the `iso22900` module takes one.
 //!
-//! Resolution itself never loads or trusts a library. The writability check of 7.2
-//! ([`check_writability`], ADR-270) is here; the signer check of 7.2 is not performed by this
-//! crate, and the caller decides what to do with a finding (device mode refuses, user mode warns).
+//! Resolution itself never loads or trusts a library. Both pre-load checks of 7.2 are here: the
+//! writability check ([`check_writability`], ADR-270) and the signer check ([`check_signer`],
+//! ADR-278), which [`check_library`] runs together. The caller decides what to do with a finding
+//! (device mode refuses, user mode warns).
 
 pub mod iso22900;
 pub mod j2534_0404;
 mod registry_view;
+mod signer;
 mod writability;
 
 pub use registry_view::RegistryView;
+pub use signer::{
+    PreloadError, SignatureFailure, Signer, SignerError, check_library, check_signer,
+};
 pub use writability::{
     Finding, Policy, Reason, Role, WritabilityError, check_writability, check_writability_with,
 };

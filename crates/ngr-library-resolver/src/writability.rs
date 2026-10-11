@@ -18,6 +18,8 @@ use std::{
 mod unix;
 mod windows;
 
+use crate::signer::SignatureFailure;
+
 /// Maximum number of symbolic links followed while resolving one path.
 const MAX_LINK_HOPS: usize = 40;
 
@@ -79,6 +81,15 @@ pub enum Reason {
     /// The entry could not be inspected.
     #[error("cannot be inspected: {0}")]
     Io(String),
+    /// The library carries an embedded signature that was not accepted (the signer check,
+    /// ADR-278); the HRESULT is the trust provider's raw result.
+    #[error("invalid signature: {failure} (HRESULT {hresult:#010X})")]
+    InvalidSignature {
+        /// The class of the failure.
+        failure: SignatureFailure,
+        /// The raw result of the trust provider.
+        hresult: i32,
+    },
 }
 
 /// One failed path.
@@ -112,7 +123,7 @@ pub struct WritabilityError {
     pub findings: Vec<Finding>,
 }
 
-fn list(findings: &[Finding]) -> String {
+pub(crate) fn list(findings: &[Finding]) -> String {
     findings
         .iter()
         .map(Finding::to_string)

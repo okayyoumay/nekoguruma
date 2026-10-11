@@ -16,8 +16,8 @@ vci-service-config = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
-# windows-sys serves the 7.2 writability check: file security descriptors (owner and DACL), the
-# current process token, and the SID text form.
+# windows-sys serves the 7.2 writability check (file security descriptors, the current process
+# token, the SID text form) and the signer check (WinVerifyTrust and the certificate context).
 [target.'cfg(windows)'.dependencies]
 j2534-0404-registry = { workspace = true }
 winreg = { workspace = true }
@@ -25,6 +25,8 @@ windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",
+    "Win32_Security_Cryptography",
+    "Win32_Security_WinTrust",
     "Win32_Storage_FileSystem",
     "Win32_System_Threading",
 ] }

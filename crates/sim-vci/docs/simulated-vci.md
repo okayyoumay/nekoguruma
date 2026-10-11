@@ -86,7 +86,7 @@ a vehicle outlives a crashed worker (ADR-241):
   not created, and every call that needs it fails until it can be. Only a file that does not
   exist starts a fresh ECU: a path that cannot be read for any other reason, a file of another
   format version (the version is checked before the rest is decoded; any change to the encoded
-  ECU state, such as `startup_ms`, gets a new version, so a file written by an older build is
+  ECU state, such as `startup_ms` or the faults waiting for a request, gets a new version, so a file written by an older build is
   refused rather than misread), or one whose state contradicts itself (`SimEcu::restore` refuses it) makes the
   call that first needs the ECU (`PassThruOpen` or a control command) fail with `ERR_FAILED`.
 - Replacing the file is retried briefly when Windows reports it in use.
@@ -170,7 +170,7 @@ A control command is a JSON object tagged by `command`:
 
 | Command | Effect |
 |---|---|
-| `{"command": "inject_fault", "fault": F}` | `SimEcu::inject(F)`; `F` is a `sim_ecu::Fault` in snake case: `"power_loss"`, `"drop_response"`, `"bus_error"`, `{"delay_response": {"ms": 500}}`, `{"corrupt_block": {"block": 3}}`, `{"response_pending": {"count": 2, "interval_ms": 300}}`, `{"negative_response": {"nrc": "conditions_not_correct"}}` (the response code by its snake-case name, not its number). With `"service": N` (the service identifier, a JSON number from 0 to 255 such as 17 for ECUReset; anything else rejects the command), `SimEcu::inject_for_service(N, F)` instead: the fault waits for the next request of that service. With `"request": [B, ...]` (bytes as JSON numbers, such as `[34, 241, 134]` for a read of DID F186), `SimEcu::inject_for_request` instead: the fault waits for the next request that starts with those bytes. A command with both is rejected |
+| `{"command": "inject_fault", "fault": F}` | `SimEcu::inject(F)`; `F` is a `sim_ecu::Fault` in snake case: `"power_loss"`, `"drop_response"`, `"bus_error"`, `{"delay_response": {"ms": 500}}`, `{"corrupt_block": {"block": 3}}`, `{"response_pending": {"count": 2, "interval_ms": 300}}`, `{"negative_response": {"nrc": "conditions_not_correct"}}` (the response code by its snake-case name, not its number). With `"service": N` (the service identifier, a JSON number from 0 to 255 such as 17 for ECUReset; anything else rejects the command), `SimEcu::inject_for_service(N, F)` instead: the fault waits for the next request of that service. With `"request": [B, ...]` (bytes as JSON numbers, such as `[34, 241, 134]` for a read of DID F186), `SimEcu::inject_for_request` instead: the fault waits for the next request that starts with those bytes (at least one). A command with both is rejected |
 | `{"command": "reconnect_ecu"}` | `SimEcu::reconnect`, which ends a power loss |
 | `{"command": "disconnect_vci"}` | unplugs the VCI |
 | `{"command": "connect_vci"}` | plugs it back in |

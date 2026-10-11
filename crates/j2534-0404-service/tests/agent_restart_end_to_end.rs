@@ -21,7 +21,7 @@
 //! teardown, [`REDO_REQUESTS`]), and the ECU enforces the transfer part of it, since it refuses the
 //! erase while a download runs, refuses a download without an erase and a RequestTransferExit with
 //! blocks missing. Its power-cycle count (DID FD01) shows that the restart reset the ECU exactly
-//! once, or not at all after a passive teardown.
+//! once, or not at all when the restart sends no ECUReset.
 //!
 //! The mid-transfer agent-kill scenarios differ in the ECU's session timer (tS3_Server): the
 //! restart comes while the ECU is still in its programming session with the transfer running, and
@@ -455,7 +455,7 @@ fn assert_completed(
 
     // The ECU holds the whole image, verified by its integrity check, which it passes only
     // after a RequestTransferExit with every block in order on a freshly erased flash. The
-    // restart reset it once, or not at all after a passive teardown. The session is checked
+    // restart reset it once, or not at all when it sent no ECUReset. The session is checked
     // apart: the worker's stop can take longer than a short session timer.
     let probe = env.probe();
     assert!(
@@ -1059,7 +1059,9 @@ fn complete_on_the_completed_path(tag: &str, ecu_in_default_session: bool, fault
 
 /// The ECU is still in its programming session when the restart reads F186: the first read
 /// reports another session. The read restarts the ECU's session timer, which the passive wait
-/// then outlasts.
+/// then outlasts. The restart's gate reads must come within the 3 s timer of the probe's last
+/// read, which a starved runner could miss: the test then fails with one F186 read, never passes
+/// wrongly. The timer cannot be longer, as the passive wait is the plan's declared 3 s.
 #[test]
 #[serial]
 fn a_non_default_session_on_the_completed_path_is_confirmed_after_the_passive_retry() {

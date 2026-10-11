@@ -114,8 +114,9 @@ pub const ECU_STATE_ENV: &str = "NGR_SIM_ECU_STATE";
 
 /// Format of the state file; a file of another version is refused. postcard has no field names,
 /// so any change to the encoded `EcuSnapshot` (version 2: `EcuConfig::startup_ms` and the time
-/// left of the ECU's startup, ADR-265) needs a new version.
-const STATE_FILE_VERSION: u32 = 2;
+/// left of the ECU's startup, ADR-265; version 3: the faults waiting for a request,
+/// `SimEcu::inject_for_request`) needs a new version.
+const STATE_FILE_VERSION: u32 = 3;
 
 /// The contents of the [`ECU_STATE_ENV`] file (postcard).
 #[derive(Serialize, Deserialize)]
@@ -496,6 +497,8 @@ impl Bus {
             } => match (service, request) {
                 (Some(_), Some(_)) => Err(ERR_FAILED),
                 (Some(sid), None) => self.change_ecu(|ecu| ecu.inject_for_service(sid, fault)),
+                // An empty prefix would match any request: `inject` without it says that.
+                (None, Some(prefix)) if prefix.is_empty() => Err(ERR_FAILED),
                 (None, Some(prefix)) => {
                     self.change_ecu(|ecu| ecu.inject_for_request(&prefix, fault))
                 }

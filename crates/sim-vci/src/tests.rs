@@ -1015,13 +1015,14 @@ fn the_control_export_arms_a_fault_for_a_service_or_a_request() {
         ]
     );
     assert!(with_ecu(|ecu| ecu.armed_faults().is_empty()));
-    // Both at once is refused.
-    assert_eq!(
-        control(
-            r#"{"command": "inject_fault", "fault": "bus_error", "service": 34, "request": [34]}"#
-        ),
-        ERR_FAILED
-    );
+    // Both at once, an empty request and a byte out of range are refused.
+    for command in [
+        r#"{"command": "inject_fault", "fault": "bus_error", "service": 34, "request": [34]}"#,
+        r#"{"command": "inject_fault", "fault": "bus_error", "request": []}"#,
+        r#"{"command": "inject_fault", "fault": "bus_error", "request": [34, 256]}"#,
+    ] {
+        assert_eq!(control(command), ERR_FAILED, "{command}");
+    }
 }
 
 #[test]

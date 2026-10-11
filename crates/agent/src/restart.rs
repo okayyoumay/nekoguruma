@@ -18,7 +18,10 @@
 //! read-back verification (step 3b-2, ADR-268 item 5). When it decides to redo the transfer,
 //! `check_reentry` checks every declared precondition again before anything is replayed (step 4a,
 //! ADR-229 item 2 step 4); after the replay reached the erase, `check_before_erase` checks them
-//! once more through the programming-session sources (step 4b-3, ADR-245 item 6).
+//! once more through the programming-session sources (step 4b-3, ADR-245 item 6), and the
+//! runner then goes on from the erase as a first run does (step 4c, ADR-276). When it
+//! decides the read-back verification, `unsafe_continuation` and `plan_end_state` decide
+//! whether the program can go on after the plan (ADR-271 items 4 and 5).
 //!
 //! The interruption point is the latest of the last completed step and the requests the
 //! journal wrote ahead (the transfer-start and RequestTransferExit markers, and the request
@@ -29,7 +32,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use diag_ir::{
-    DiagHost, FlashRecovery, IdentityKind, Interruptible, NoApplication, Precondition,
+    DiagHost, FlashRecovery, Idempotency, IdentityKind, Interruptible, NoApplication, Precondition,
     PreconditionKind, Program, RecoveryRequired, RecoveryTiming, RuntimeInput, Source, Vm, VmError,
     VmState,
 };
@@ -112,24 +115,44 @@ pub enum OnSiteReason {
     /// job's first run (none included), so the job's own data changed between runs. Nothing is
     /// sent and no resume is counted (ADR-268).
     IntendedVersionDiffers,
-    /// The restart passed step 1 (the checks that need no ECU service, and its resume was
-    /// counted), the gates of step 2, the teardown of step 2b-1 (`teardown`), the
-    /// default-session confirmation of step 2b-2 (`confirmed`) and the identity checks of step 3a
-    /// (`check_identity`) and the ECU state check of step 3b-2 (`state`, `check_state`). Steps 1
-    /// to 3 passed, and for [`StateCheck::RedoTransfer`] also the precondition check of step 4a
-    /// (`check_reentry`), the replay of the plan's steps from the entry up to, not including,
-    /// the erase (step 4b-2, ADR-273) and the second check of every declared precondition
-    /// through its programming-session source (step 4b-3, `check_before_erase`). The erase
-    /// (step 4c) and the read-back verification do not run in this agent yet, so the job stops
-    /// before the erase, so before anything that writes the ECU's memory (ADR-255, ADR-261,
-    /// ADR-264, ADR-265, ADR-268 item 5). After a replay the plan's steps from its entry have run
-    /// (normally entering the programming session), and `teardown` and `confirmed` describe the ECU before
-    /// the replay, not after it.
-    RestartOrderUnavailable {
+    /// Test builds only: the restart order of a redone transfer passed steps 1 to 4b-3 and the
+    /// tests' `resume_to_erase` stopped it there, before the erase (step 4c), so the tests can see
+    /// the teardown's outcome (`teardown`), the default-session confirmation (`confirmed`) and the
+    /// state check (`state`, always [`StateCheck::RedoTransfer`]). A job never ends in it: the
+    /// runner goes on with the erase (ADR-276).
+    #[cfg(test)]
+    StoppedBeforeErase {
         flash_session: u32,
         teardown: Teardown,
         confirmed: Confirmation,
         state: StateCheck,
+    },
+    /// The read-back verification passed (step 3b-2 found the intended software version and the
+    /// journal the post-transfer steps complete, ADR-271 item 1), so the image is verified, but
+    /// the program cannot go on after the plan (ADR-271 item 4, `unsafe_continuation`): the
+    /// diagnostic primitive at `pc` may have reached the ECU before the interruption and must not
+    /// be sent again. It is outside every plan's range, or in the plan that begins at this plan's
+    /// end, before its erase or its recovery-required point, whichever comes first, and in no
+    /// section, in one that is not `Safe`, or in one marked
+    /// `RecoveryRequired` (for that next plan, when it allows a restart, only under an `Unsafe`
+    /// section). Nothing after the verification was sent.
+    /// `teardown` is how the interrupted download was ended (step 2b-1) and `confirmed` how the
+    /// default session was confirmed (step 2b-2).
+    UnsafeContinuation {
+        flash_session: u32,
+        pc: u32,
+        teardown: Teardown,
+        confirmed: Confirmation,
+    },
+    /// The read-back verification passed, so the image is verified, but the journal holds no
+    /// usable VM state at the plan's end to go on from (ADR-271 item 5, ADR-274 item 3): none
+    /// was recorded, a state recorded since (an entry state or a run start) made it stale, or it
+    /// does not pass `Vm::check_state`. Nothing after the verification was sent. `teardown` and
+    /// `confirmed` are the outcomes of steps 2b-1 and 2b-2.
+    MissingPlanEndState {
+        flash_session: u32,
+        teardown: Teardown,
+        confirmed: Confirmation,
     },
     /// Step 3b-2 could not establish the ECU's software version (ADR-229 item 2 step 3,
     /// ADR-268 item 5): there is no declared source, or every read (the first and the plan's
@@ -199,8 +222,8 @@ pub enum StateCheck {
     /// complete: the transfer is done again.
     RedoTransfer,
     /// The journal shows the post-transfer steps complete and the ECU reports the intended
-    /// software version: the transfer is not redone; the read-back verification of ADR-268
-    /// item 5 follows.
+    /// software version: the transfer is not redone. The match is the read-back verification
+    /// (ADR-268 item 5, ADR-271 item 1), and the program goes on after the plan (ADR-271 item 3).
     ReadBackVerification,
 }
 
@@ -1244,6 +1267,83 @@ fn recovery_required(program: &Program, at: StepRef) -> Option<OnSiteReason> {
         .map(|section| OnSiteReason::RecoveryRequiredSection { section, at })
 }
 
+/// The first diagnostic primitive, in pc order, that the continuation after `verified`'s
+/// read-back verification could send again unsafely (ADR-271 item 4, with its annotations).
+/// Sections may overlap, and every one that covers a primitive counts. `None` when the program
+/// can go on after `verified`. Two kinds of primitive are looked at:
+/// - one outside every plan's range (`entry_pc` up to, not including, `post_transfer_end_pc`),
+///   statically over the whole program, so a jump back to code before a plan is covered too:
+///   the journal records no step there, so it may have reached the ECU before the interruption.
+///   It must be covered, and only by sections that are `Safe` and not marked `RecoveryRequired`,
+///   since the journal cannot rule out that the interruption was there;
+/// - one in the window of the plan that begins at `verified`'s `post_transfer_end_pc`, from its
+///   `entry_pc` up to its `erase_pc` or its recovery-required point, whichever comes first. A
+///   crash with such a request in flight, before that plan's first journaled step, leaves the
+///   same journal as a crash at `verified`'s end, so the continuation runs it again; the first
+///   request at or after the recovery-required point gets an intent before it is sent, which
+///   places any later interruption past that point. For a plan that allows a restart, that is
+///   the replay of ADR-273 item 5, and only an `Unsafe` section refuses; `Program::validate`
+///   already excludes one there, so for a validated program this branch never refuses. For a
+///   plan that does not, no replay is ever sanctioned, and the window is checked like the
+///   primitives outside the plans. The whole window is checked, although a crash after its first
+///   completed primitive is journaled and no longer reaches the continuation: the check stays
+///   static, and refuses on the safe side.
+///
+/// A later plan reached through that plan is not looked at: its erase commits a transfer-start
+/// marker first, so an interruption there restarts that plan, not `verified`.
+pub(crate) fn unsafe_continuation(program: &Program, verified: &FlashRecovery) -> Option<u32> {
+    let covering = |pc: u32| {
+        program
+            .sections
+            .iter()
+            .filter(move |section| (section.start_pc..section.end_pc).contains(&pc))
+    };
+    let not_safe = |pc: u32| {
+        let mut sections = covering(pc).peekable();
+        sections.peek().is_none()
+            || sections.any(|section| {
+                !matches!(section.idempotency, Idempotency::Safe)
+                    || matches!(section.interruptible, Interruptible::RecoveryRequired)
+            })
+    };
+    let end = verified.boundaries.post_transfer_end_pc;
+    let next = program
+        .flash
+        .iter()
+        .find(|plan| plan.boundaries.entry_pc == end)
+        .map(|plan| {
+            let from = match plan.recovery_required {
+                RecoveryRequired::Never => plan.boundaries.post_transfer_end_pc,
+                RecoveryRequired::FromPc(pc) => pc,
+            };
+            (
+                plan,
+                plan.boundaries.entry_pc..from.min(plan.boundaries.erase_pc),
+            )
+        });
+    (0..program.code.len() as u32).find(|&pc| {
+        if !program.code[pc as usize].is_diagnostic_primitive() {
+            return false;
+        }
+        let in_plan = program.flash.iter().any(|plan| {
+            (plan.boundaries.entry_pc..plan.boundaries.post_transfer_end_pc).contains(&pc)
+        });
+        if !in_plan {
+            return not_safe(pc);
+        }
+        match &next {
+            Some((plan, window)) if window.contains(&pc) => {
+                if plan.allows_restart() {
+                    covering(pc).any(|section| matches!(section.idempotency, Idempotency::Unsafe))
+                } else {
+                    not_safe(pc)
+                }
+            }
+            _ => false,
+        }
+    })
+}
+
 #[derive(Debug)]
 pub(crate) enum EntryStateError {
     Missing,
@@ -1328,13 +1428,6 @@ fn entry_state(
 /// (ADR-271 items 2 and 3). It is the newest state, and only when it stands at the plan's end: a
 /// state recorded at the entry or at a run start since (a new pass) makes an earlier end state
 /// stale, so none is returned. `EntryStateError::Missing` is "no such state".
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the continuation after a restart is not implemented yet"
-    )
-)]
 pub(crate) fn plan_end_state(
     program: &Program,
     state: &JournalState,

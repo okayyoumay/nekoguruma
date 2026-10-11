@@ -1,7 +1,7 @@
 # ADR-271: After a Restart, Read-Back Verification Is the State Check's Match, and the Program Continues from the Plan's End
 
 **Date:** 2026-10-10
-**Status:** Accepted (item 2's end step is a step from inside the plan, and its read-back follows ADR-274)
+**Status:** Accepted (item 2's end step is a step from inside the plan, and its read-back follows ADR-274; item 4 needs every section over a primitive outside the plans to be Safe when sections overlap, and none of them marked RecoveryRequired; it also covers the steps of the plan that begins at the verified plan's end, from that entry up to its erase or its recovery-required point, whichever comes first, which the continuation runs before any record of that plan: for a plan that allows a restart they are the replay of ADR-273 item 5 (an Unsafe section refuses, and Program::validate already excludes one), for a plan that does not, no replay is sanctioned and they are checked like the primitives outside the plans; item 5 also covers a run start that made the end state stale)
 **Affects:** `agent` (`src/restart.rs`, `src/runner.rs`, `src/journaling.rs`), design 5.6 and 8.2.5, ADR-229 item 2 step 3, ADR-252 item 2, ADR-268 item 5
 
 ## Context

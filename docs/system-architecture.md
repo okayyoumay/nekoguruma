@@ -1341,11 +1341,13 @@ T1 is what makes write and interruption checks safe on real VCIs: the VCI, its l
 
 **Guarded VCI access.** Checks do not rely on their own care to stay within the class. A check gets the VCI only through a guarded handle the test harness creates; the harness does not hand out the worker client or the vendor library, and a hardware check that opens either directly is rejected in review. When a check runs a job through the agent, the guard sits between the agent and the worker: the harness gives the agent's job runner a worker client that wraps the real one and passes every call through the same guard, so the production job path is mediated exactly like a direct check. The guard sees every operation and fails the check before anything reaches the device when an operation is not allowed:
 
-- Link setup: the harness creates and connects the one link the profile describes. A check cannot create another link or change the protocol, baud rate, pins or other physical-layer ComParams.
+- Link setup: the harness creates and connects exactly the links the profile describes (one, or a T0 profile's two loopback endpoints). A check cannot create any other link or change the protocol, baud rate, pins or other physical-layer ComParams.
 
 - UDS requests: the service, and the sub-function where it matters, are compared with the class's list. On T3 this list is an allow-list of read-only services.
 - Raw frames and periodic messages: the guard decodes the UDS request a frame carries and applies the same lists. On T3, and on T2 outside an authorized job, only frames to the profile's request identifiers carrying a read-only request pass; on T2 a state-changing request passes only from the authorized job. On T0 only traffic between the two loopback endpoints passes.
 - Hardware controls: programming voltage, pin changes (J2534-1 6.7, 6.8) and vendor IOCTLs are refused on every class by default. On T1 and T2, a control passes only when the profile lists that control together with its complete parameters (for programming voltage the pin and the voltage, for a pin change the pins, for a vendor IOCTL its identifier and the exact payload or a stated safe range) and the request matches them; on T2 it must also be part of an authorized job. Reading the battery voltage is always allowed.
+
+**Check requirements.** Each check declares its requirements as static data the harness can read without running it: the classes it can run on and the operations it needs beyond its class's reads (configuration writes, reprogramming, power switching, named hardware controls). The harness collects these declarations from every `hw_` check, so it can list which checks a profile permits and refuse a check before it opens the device, rather than when the guard first refuses a request.
 
 **Running.** Hardware checks are ordinary Rust tests marked `#[ignore]` with a reason naming this section, and their names start with `hw_`, so `cargo test` and the CI profiles skip them. They run through a dedicated nextest profile, `hardware`, which runs the ignored `hw_` tests one at a time (one VCI is one shared resource, 8.8.1) with no retries. When `NGR_HW_PROFILE` is not set, a hardware check fails rather than passing silently: running it was an explicit request.
 
@@ -1355,8 +1357,8 @@ T1 is what makes write and interruption checks safe on real VCIs: the VCI, its l
 
 **Procedure.**
 
-1. Prepare the setup for its class: only the profile's VCI connected to the host, wiring and termination checked (about 60 ohm across CAN high and low with power off), supply voltage set and current limit on, for T3 the ignition on and the engine off.
-2. Write or check the hardware profile, then list the checks that the profile permits without running them.
+1. Prepare the setup for its class: only the profile's VCIs and CAN interfaces connected to the host, wiring and termination checked (about 60 ohm across CAN high and low with power off), supply voltage set and current limit on, for T3 the ignition on and the engine off.
+2. Write or check the hardware profile, then list the checks that the profile permits without running them (the harness compares each check's declared requirements with the profile).
 3. Run the checks for the milestone or area being looked at with the `hardware` nextest profile.
 4. Read the report.
 5. Turn findings into lasting records: a vendor behaviour the VCI profile can express becomes a profile item (9.3), an answer to an item in 17 ("Items to Confirm Early") is written down there, and a defect is fixed or tracked as an open item.

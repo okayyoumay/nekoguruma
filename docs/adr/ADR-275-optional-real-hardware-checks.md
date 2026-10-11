@@ -30,7 +30,9 @@ also need a limit that does not depend on each check's author being careful.
 3. **Four target classes, not ordered.** T0 loopback (no ECU), T1 stand-in ECU (`sim-ecu`
    behind a real CAN interface), T2 bench ECU, T3 vehicle. They differ in topology and in what may
    be sent, so none stands in for another: each check declares the set of classes it can run on,
-   and the hardware profile declares the class of the attached setup. A profile can only narrow
+   and the hardware profile declares the class of the attached setup. A check declares its
+   classes and the operations it needs as static data the harness reads before running it, so
+   a profile's permitted checks can be listed and a check refused before the device is opened. A profile can only narrow
    its class, except that a T2 profile may allow reprogramming of an ECU it declares expendable
    and T1 and T2 profiles may name power-switch commands and the specific hardware controls
    their wiring is safe for. A T3 profile can add nothing.
@@ -43,7 +45,7 @@ also need a limit that does not depend on each check's author being careful.
    changes and vendor IOCTLs, which are refused on every class unless a T1 or T2 profile lists
    the control with its complete parameters (pin and voltage, pins, IOCTL identifier and exact
    payload or safe range) and the request matches them; on T2 a listed control also has to be part of an authorized job, so a profile
-   entry alone never allows one on a real ECU. The harness creates the profile's one link, and
+   entry alone never allows one on a real ECU. The harness creates exactly the profile's links (one, or T0's two endpoints), and
    checks cannot create others or change its physical layer. The profile names the module, and a
    check refuses zero or several matches; because a J2534 library reports no serial number and
    lists configured modules whether or not they are present, a J2534 module must also be the

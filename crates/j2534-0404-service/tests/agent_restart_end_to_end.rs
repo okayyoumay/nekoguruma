@@ -1,10 +1,13 @@
 // Relies on the debug-only runtime VCI_CONFIG_PATH override; see ADR-073. Killing the agent's
 // process group is unix-only.
 #![cfg(all(debug_assertions, unix))]
-//! Restart end to end, an agent killed mid-transfer (design 5.3, 5.6, 8.2.5; ADR-229, ADR-276):
-//! the agent runs a flash job against a real `j2534-0404-service` worker and `sim-vci` as a
-//! child process, is killed with SIGKILL after a block of the transfer was journaled, and the
-//! job is resumed at library level (`resume_program_journaled`) with the same journal directory.
+//! Restart end to end, an agent killed or its worker crashed mid-transfer (design 5.3, 5.6,
+//! 8.2.5; ADR-229, ADR-276): the agent runs a flash job against a real `j2534-0404-service`
+//! worker and `sim-vci` as a child process, is killed with SIGKILL after a block of the transfer
+//! was journaled, and the job is resumed at library level (`resume_program_journaled`) with the
+//! same journal directory. In the worker-crash scenario the agent runs in the test process and
+//! only its worker is killed; the agent's next run resumes on a new worker with the guards the
+//! failed run gave back.
 //!
 //! The harness (`tests/common/restart.rs`) keeps the simulated ECU's state in a state file
 //! (ADR-241), so the ECU outlives the killed agent and its timers go on running. The restarted
@@ -19,7 +22,7 @@
 //! with blocks missing. Its power-cycle count (DID FD01) shows that the restart reset the ECU
 //! exactly once.
 //!
-//! Two scenarios, with the ECU's session timer (tS3_Server) as the difference: the restart comes
+//! The agent-kill scenarios differ in the ECU's session timer (tS3_Server): the restart comes
 //! while the ECU is still in its programming session with the transfer running, and after the
 //! timer ran out, so the ECU fell back to its default session with the transfer interrupted.
 //! Both end with the job complete: the restart sends an ECUReset first in either state, so the
@@ -94,9 +97,11 @@ const SW_VERSION: &[u8] = b"1.0.0";
 
 const BLOCKS: u32 = 8;
 const BLOCK_LEN: usize = 16;
-/// The agent is killed after this block of the first run.
+/// The agent, or in the worker-crash scenario its worker, is killed after this block of the
+/// first run.
 const KILL_AFTER_BLOCK: u32 = 4;
-/// How long the program waits after that block. The harness kills the agent in this time, and
+/// How long the program waits after that block. The harness kills the agent or the worker in
+/// this time, and
 /// the redone transfer waits it out again, so it must stay far below the ECU's tS3_Server.
 const PARK_MS: u32 = 1_000;
 /// The plan's stage.
@@ -430,6 +435,91 @@ fn an_agent_killed_mid_transfer_redoes_it_after_the_session_timer_expired() {
     );
     let result = env.restart(&spec);
     // The 3 s timer can run out again while the worker stops, so either session is possible.
+    assert_completed(
+        &env,
+        &spec,
+        first_attempt,
+        before.power_cycles,
+        &[1, 2],
+        result,
+    );
+}
+
+/// The worker alone crashes while the ECU is in its programming session with the transfer
+/// running: the agent survives, its run ends with the worker's loss, and its next run on a new
+/// worker, on the guards it kept, takes the same restart order as after an agent kill and
+/// completes.
+#[test]
+#[serial]
+fn a_worker_crashed_mid_transfer_is_restarted_like_a_killed_agent() {
+    let spec = spec();
+    let env = Env::new("worker-crash", ENTRY, &ecu_config(60_000));
+    let crash = env.crash_worker(&spec, KILL_AFTER_BLOCK, WAIT_FOR_BLOCK);
+    // The `Wait` sends nothing, so the first request to the dead worker is the next block's
+    // transfer: the run ends there with the worker's loss as a failed primitive, neither a
+    // result nor an on-site intervention, which would end the job instead of leaving it to the
+    // restart. A kill that came after the wait would fail here, not later.
+    let next_block_pc = spec
+        .program
+        .code
+        .iter()
+        .position(|op| {
+            *op == Op::FlashTransfer {
+                block: KILL_AFTER_BLOCK + 1,
+            }
+        })
+        .expect("the next block's transfer") as u32;
+    assert!(
+        matches!(crash.result, Err(agent::JobError::Host { pc, .. }) if pc == next_block_pc),
+        "the first run should end on the lost worker at {next_block_pc}: {:?}",
+        crash.result
+    );
+    // The surviving job keeps its guards across the runs (design 8.2.5): nobody else can take
+    // them while it holds them.
+    assert!(
+        env.guards_are_held(),
+        "the failed run should keep its guards"
+    );
+    assert!(
+        crash.link_unconfirmed,
+        "a link on a dead worker cannot be confirmed closed"
+    );
+    // The journal the restart reads, after the failed run ended, agrees with the one at the
+    // kill: block 4 the last, no RequestTransferExit, no resume yet.
+    for journal in [
+        crash.journal,
+        agent::journal::Journal::read(&env.journal_dir(), &spec.key).expect("journal"),
+    ] {
+        let transfer = journal.facts.transfer.expect("a transfer attempt");
+        assert_eq!(transfer.started_at.pc, ERASE_PC);
+        assert_eq!(transfer.last_block, Some(KILL_AFTER_BLOCK));
+        assert!(transfer.exit.is_none(), "no RequestTransferExit yet");
+        assert!(journal.facts.resume_counts.is_empty());
+    }
+    let first_attempt = agent::journal::Journal::read(&env.journal_dir(), &spec.key)
+        .expect("journal")
+        .facts
+        .transfer
+        .expect("a transfer attempt")
+        .started_at;
+    let before = env.probe();
+    assert_eq!(
+        before,
+        EcuProbe {
+            session: 2,
+            flash_phase: 2,
+            flash_block: KILL_AFTER_BLOCK + 1,
+            received: KILL_AFTER_BLOCK * BLOCK_LEN as u32,
+            power_cycles: before.power_cycles,
+        },
+        "the ECU should still be in its programming session, transferring"
+    );
+    let result = env.restart_on(&spec, crash.guards);
+    // The restart released them when it ended, which also shows the check above can fail.
+    assert!(
+        !env.guards_are_held(),
+        "the ended job should release its guards"
+    );
     assert_completed(
         &env,
         &spec,

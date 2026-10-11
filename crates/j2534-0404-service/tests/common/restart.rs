@@ -26,6 +26,12 @@
 //!    `sim-vci`). [`Env::restart`] empties the trace before it starts, so [`Env::trace`] returns
 //!    the restart's own requests afterwards.
 //!
+//! A worker crash takes another path: [`Env::crash_worker`] runs the first run in this process,
+//! as the agent that survives it, and kills only the worker with SIGKILL once the journal
+//! records the given block. The run ends with the lost worker's error and gives its guards back;
+//! the harness waits for the killed worker to be reaped and clears the guards' unconfirmed-link
+//! mark (ADR-258), as the agent does, and [`Env::restart_on`] resumes on those guards.
+//!
 //! The harness is for the unix test hosts, where a process group can be killed.
 
 use std::os::unix::process::{CommandExt, ExitStatusExt};
@@ -34,7 +40,7 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use agent::guards::{GuardSetup, JobGuards};
+use agent::guards::{GuardError, GuardSetup, JobGuards};
 use agent::inputs::ServiceSources;
 use agent::journal::{JobKey, Journal, JournalState, Vin};
 use agent::{
@@ -304,33 +310,59 @@ impl Env {
     /// scenario is alive. The request trace is emptied first, so [`Env::trace`] afterwards holds
     /// the restart's requests only.
     pub fn restart(&self, spec: &JobSpec) -> Result<VmState, JobError> {
+        self.resume_in_process(spec, None)
+    }
+
+    /// As [`Env::restart`], on the guards a first run that survived its worker's crash gave
+    /// back ([`WorkerCrash::guards`]): the agent passes them on to its next run instead of
+    /// taking them again (`resume_program_journaled`'s documentation).
+    pub fn restart_on(&self, spec: &JobSpec, guards: JobGuards) -> Result<VmState, JobError> {
+        self.resume_in_process(spec, Some(guards))
+    }
+
+    fn resume_in_process(
+        &self,
+        spec: &JobSpec,
+        guards: Option<JobGuards>,
+    ) -> Result<VmState, JobError> {
         std::fs::write(self.trace_file(), "").expect("the trace file should be writable");
+        let runtime = self.runtime();
+        runtime
+            .block_on(async {
+                tokio::time::timeout(RESTART_TIMEOUT, self.resume(spec, guards)).await
+            })
+            .expect("the restart should finish in time")
+    }
+
+    /// Sets the scenario's environment in this process and builds the runtime its runs use.
+    fn runtime(&self) -> tokio::runtime::Runtime {
         // SAFETY: every test of the test file that reads or writes the environment is
         // `#[serial]` (the entry test as well, which reads the role variable), so none runs
         // beside this call, and no runtime exists yet; the only other threads are the test
         // harness's own, which do not touch the environment after they started.
         unsafe { self.apply_here() };
-        let runtime = tokio::runtime::Builder::new_multi_thread()
+        tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
-            .expect("runtime");
-        runtime
-            .block_on(async { tokio::time::timeout(RESTART_TIMEOUT, self.resume(spec)).await })
-            .expect("the restart should finish in time")
+            .expect("runtime")
     }
 
-    async fn resume(&self, spec: &JobSpec) -> Result<VmState, JobError> {
+    fn take_guards(&self) -> JobGuards {
+        JobGuards::take(
+            &self.guard_setup(),
+            Duration::from_millis(10),
+            &AtomicBool::new(false),
+        )
+        .expect("the guards should be free")
+    }
+
+    async fn resume(&self, spec: &JobSpec, guards: Option<JobGuards>) -> Result<VmState, JobError> {
         let worker = launch_worker().await;
         let client = worker
             .connect(&ConnectOptions::default())
             .await
             .expect("client should connect");
-        let guards = JobGuards::take(
-            &self.guard_setup(),
-            Duration::from_millis(10),
-            &AtomicBool::new(false),
-        )
-        .expect("the killed agent's guards should be free");
+        let guards = guards.unwrap_or_else(|| self.take_guards());
         let (result, guards) = resume_program_journaled(
             client,
             &LinkConfig::iso15765(REQUEST_ID, RESPONSE_ID),
@@ -347,6 +379,104 @@ impl Env {
             .expect("worker should stop");
         result
     }
+
+    /// Runs the job's first run in this process, the agent's, and kills its worker alone with
+    /// SIGKILL once the journal records block `block`: the agent survives and its run ends with
+    /// the error the lost worker gives it. Must not run while a child of this scenario is alive.
+    pub fn crash_worker(&self, spec: &JobSpec, block: u32, timeout: Duration) -> WorkerCrash {
+        let runtime = self.runtime();
+        runtime.block_on(async {
+            let worker = launch_worker().await;
+            let pid = worker.id().expect("the worker runs");
+            let client = worker
+                .connect(&ConnectOptions::default())
+                .await
+                .expect("client should connect");
+            let guards = self.take_guards();
+            let program = spec.program.clone();
+            let journal = spec.journal_setup(&self.journal_dir());
+            let run = tokio::spawn(async move {
+                run_program_journaled(
+                    client,
+                    &LinkConfig::iso15765(REQUEST_ID, RESPONSE_ID),
+                    program,
+                    JobLimits::default(),
+                    journal,
+                    guards,
+                )
+                .await
+            });
+            let journal = tokio::task::block_in_place(|| self.wait_for_block(spec, block, timeout));
+            let pid = i32::try_from(pid).expect("a process ID fits in pid_t");
+            // SAFETY: kill(2) takes a process ID and a signal number and touches no memory.
+            let killed = unsafe { libc::kill(pid, libc::SIGKILL) };
+            assert_eq!(
+                killed,
+                0,
+                "kill of worker {pid} failed: {}",
+                std::io::Error::last_os_error()
+            );
+            let mut run = run;
+            let (result, mut guards) = match tokio::time::timeout(RESTART_TIMEOUT, &mut run).await {
+                Ok(joined) => joined.expect("the first run should not panic"),
+                Err(_) => {
+                    // Dropping the run cancels the job, so the runtime's drop does not wait for
+                    // it for ever.
+                    run.abort();
+                    panic!("the first run should end once its worker is gone");
+                }
+            };
+            // The link could not be closed on a dead worker, so the run marked its guards
+            // unconfirmed (ADR-258). Once the worker process is reaped it holds no link, and the
+            // agent clears the mark before its next run takes the guards.
+            let link_unconfirmed = guards.link_unconfirmed();
+            worker
+                .stop(Duration::from_secs(5))
+                .await
+                .expect("the killed worker should be reaped");
+            guards.worker_gone();
+            WorkerCrash {
+                result,
+                guards,
+                link_unconfirmed,
+                journal,
+            }
+        })
+    }
+
+    /// Whether the scenario's guards are held by someone else: a `JobGuards::take` on its lock
+    /// directory is still waiting when it is cancelled a while later. The cancel is set late,
+    /// since the take checks it before its first attempt.
+    pub fn guards_are_held(&self) -> bool {
+        let cancelled = std::sync::Arc::new(AtomicBool::new(false));
+        let canceller = {
+            let cancelled = cancelled.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(200));
+                cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+            })
+        };
+        let taken = JobGuards::take(&self.guard_setup(), Duration::from_millis(10), &cancelled);
+        canceller.join().expect("the canceller should not panic");
+        match taken {
+            Err(GuardError::Cancelled) => true,
+            Ok(_) => false,
+            Err(other) => panic!("taking the guards failed: {other}"),
+        }
+    }
+}
+
+/// How a first run whose worker was killed ended ([`Env::crash_worker`]).
+pub struct WorkerCrash {
+    /// The first run's result.
+    pub result: Result<VmState, JobError>,
+    /// The guards the run gave back, still held, for the agent's next run. Their
+    /// unconfirmed-link mark is cleared once the killed worker was reaped.
+    pub guards: JobGuards,
+    /// Whether the run had marked the guards' link unconfirmed (ADR-258) before that.
+    pub link_unconfirmed: bool,
+    /// The journal as it read just before the kill was sent.
+    pub journal: JournalState,
 }
 
 async fn launch_worker() -> WorkerProcess {

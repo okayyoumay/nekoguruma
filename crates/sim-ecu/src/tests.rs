@@ -2243,7 +2243,7 @@ fn restore_brings_back_every_field() {
     ecu.image = vec![7; 0x20];
     ecu.silent = true;
     ecu.armed = vec![Fault::DropResponse, Fault::CorruptBlock { block: 5 }];
-    ecu.armed_for_service = vec![(0x11, Fault::DropResponse)];
+    ecu.armed_for_request = vec![(vec![0x11], Fault::DropResponse)];
     ecu.power_cycles = 3;
     let snapshot = ecu.snapshot();
 
@@ -2412,12 +2412,15 @@ fn a_fault_for_a_service_passes_other_services_by_and_fires_on_that_one() {
         ecu.request(&[0x22, 0xF1, 0x86]),
         pos(&[0x62, 0xF1, 0x86, 0x01])
     );
-    assert_eq!(ecu.faults_for_service(), [(0x11, Fault::DropResponse)]);
+    assert_eq!(
+        ecu.faults_for_request(),
+        [(vec![0x11], Fault::DropResponse)]
+    );
     // The reset takes effect although its response is lost.
     let cycles = ecu.power_cycles();
     assert_eq!(ecu.request(&[0x11, 0x01]), SimResponse::NoResponse);
     assert_eq!(ecu.power_cycles(), cycles + 1);
-    assert!(ecu.faults_for_service().is_empty());
+    assert!(ecu.faults_for_request().is_empty());
     assert!(ecu.armed_faults().is_empty());
 }
 
@@ -2468,12 +2471,15 @@ fn a_fault_for_a_service_keeps_waiting_through_a_request_lost_in_the_startup() {
     ecu.inject_for_service(0x11, Fault::DropResponse);
     // Lost while the ECU starts up: the fault waits on.
     assert_eq!(ecu.request(&[0x11, 0x01]), SimResponse::NoResponse);
-    assert_eq!(ecu.faults_for_service(), [(0x11, Fault::DropResponse)]);
+    assert_eq!(
+        ecu.faults_for_request(),
+        [(vec![0x11], Fault::DropResponse)]
+    );
     clock.advance(ms(100));
     let cycles = ecu.power_cycles();
     assert_eq!(ecu.request(&[0x11, 0x01]), SimResponse::NoResponse);
     assert_eq!(ecu.power_cycles(), cycles + 1);
-    assert!(ecu.faults_for_service().is_empty());
+    assert!(ecu.faults_for_request().is_empty());
 }
 
 #[test]
@@ -2500,7 +2506,7 @@ fn a_fault_for_a_service_fires_ahead_of_one_armed_for_any_request() {
 }
 
 #[test]
-fn a_snapshot_without_faults_for_a_service_still_reads() {
+fn a_snapshot_without_faults_for_a_request_still_reads() {
     let mut ecu = ecu();
     let json = serde_json::to_string(&ecu.snapshot()).unwrap();
     let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -2508,12 +2514,12 @@ fn a_snapshot_without_faults_for_a_service_still_reads() {
         value
             .as_object_mut()
             .unwrap()
-            .remove("armed_for_service")
+            .remove("armed_for_request")
             .is_some()
     );
     let old: EcuSnapshot = serde_json::from_value(value).unwrap();
     let restored = SimEcu::restore(old, ManualClock::default(), ms(0)).unwrap();
-    assert!(restored.faults_for_service().is_empty());
+    assert!(restored.faults_for_request().is_empty());
 }
 
 #[test]
@@ -2525,7 +2531,10 @@ fn a_request_lost_to_a_bus_error_leaves_the_fault_for_its_service_waiting() {
     let cycles = ecu.power_cycles();
     assert_eq!(ecu.request(&[0x11, 0x01]), SimResponse::NoResponse);
     assert_eq!(ecu.power_cycles(), cycles);
-    assert_eq!(ecu.faults_for_service(), [(0x11, Fault::DropResponse)]);
+    assert_eq!(
+        ecu.faults_for_request(),
+        [(vec![0x11], Fault::DropResponse)]
+    );
     // A request of another service is answered as usual.
     assert_eq!(
         ecu.request(&[0x22, 0xF1, 0x86]),
@@ -2534,7 +2543,7 @@ fn a_request_lost_to_a_bus_error_leaves_the_fault_for_its_service_waiting() {
     // The next reset takes effect and its response is lost.
     assert_eq!(ecu.request(&[0x11, 0x01]), SimResponse::NoResponse);
     assert_eq!(ecu.power_cycles(), cycles + 1);
-    assert!(ecu.faults_for_service().is_empty());
+    assert!(ecu.faults_for_request().is_empty());
 }
 
 #[test]
@@ -2545,4 +2554,30 @@ fn a_bus_error_for_a_service_loses_that_request() {
     assert_eq!(ecu.request(&[0x11, 0x01]), SimResponse::NoResponse);
     assert_eq!(ecu.power_cycles(), cycles);
     assert!(ecu.armed_faults().is_empty());
+}
+
+#[test]
+fn a_fault_for_a_request_passes_other_requests_of_its_service_by() {
+    let mut ecu = ecu();
+    ecu.inject_for_request(
+        &[0x22, 0xF1, 0x86],
+        Fault::NegativeResponse {
+            nrc: Nrc::ConditionsNotCorrect,
+        },
+    );
+    // A read of another DID passes it by.
+    assert!(matches!(
+        ecu.request(&[0x22, 0xF1, 0x90]),
+        SimResponse::Positive(_)
+    ));
+    assert_eq!(ecu.faults_for_request().len(), 1);
+    assert_eq!(
+        ecu.request(&[0x22, 0xF1, 0x86]),
+        neg(0x22, Nrc::ConditionsNotCorrect)
+    );
+    assert!(ecu.faults_for_request().is_empty());
+    assert_eq!(
+        ecu.request(&[0x22, 0xF1, 0x86]),
+        pos(&[0x62, 0xF1, 0x86, 0x01])
+    );
 }

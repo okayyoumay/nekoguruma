@@ -21,7 +21,7 @@
 //! teardown, [`REDO_REQUESTS`]), and the ECU enforces the transfer part of it, since it refuses the
 //! erase while a download runs, refuses a download without an erase and a RequestTransferExit with
 //! blocks missing. Its power-cycle count (DID FD01) shows that the restart reset the ECU exactly
-//! once, or not at all after a passive teardown.
+//! once, or not at all when the restart sends no ECUReset.
 //!
 //! The mid-transfer agent-kill scenarios differ in the ECU's session timer (tS3_Server): the
 //! restart comes while the ECU is still in its programming session with the transfer running, and
@@ -50,6 +50,14 @@
 //! of F186 reads tells the paths apart: a passive wait leaves the ECU in its default session for
 //! the first read, while an ECU that is still in its programming session, or not yet answering,
 //! is read again.
+//!
+//! The completed-path scenarios run a variant of the job (`COMPLETED_PATH`) that waits after
+//! its plan and confirms the default session with a single read per attempt, and kill the agent
+//! once the post-transfer steps are journaled complete. The teardown then sends nothing and waits
+//! for nothing (`Teardown::CompletedPath`), so the confirmation's first read decides: it reports
+//! the programming session, the ECU refuses it, or it gets no answer (a fault aimed at the F186
+//! read, `SimEcu::inject_for_request`), and the read after the passive retry confirms. Each
+//! completes the job with exactly two F186 reads.
 //!
 //! The tests are serial, the entry test included: the restart sets process-wide environment
 //! variables for the worker it launches, and the entry test reads one.
@@ -258,6 +266,33 @@ fn sources() -> ServiceSources {
     .expect("identity table")
 }
 
+/// The job variant of the completed-path scenarios ([`completed_path_program`]).
+const COMPLETED_PATH: &str = "completed-path";
+
+/// [`program`] with a `Wait` after the plan, where the completed-path scenarios kill the agent
+/// once the post-transfer steps are journaled complete, and a confirmation window of a single
+/// read: the default-session confirmation's first read alone decides whether its first attempt
+/// fails (`restart::confirm_default_session`), as the completed path's triggers need.
+fn completed_path_program() -> Program {
+    let mut program = program();
+    program.code.push(Op::Wait { millis: PARK_MS });
+    program.flash[0].timing.confirmation_window_millis = 0;
+    program.validate().expect("the fixture is a valid program");
+    program
+}
+
+/// The job the harness's agent child runs, by the scenario's variant ([`Env::with_variant`]).
+fn spec_for(variant: &str) -> JobSpec {
+    match variant {
+        "" => spec(),
+        COMPLETED_PATH => JobSpec {
+            program: completed_path_program(),
+            ..spec()
+        },
+        other => panic!("unknown job variant {other:?}"),
+    }
+}
+
 fn spec() -> JobSpec {
     JobSpec {
         program: program(),
@@ -292,7 +327,7 @@ fn ecu_config_with_startup(s3_server_ms: u32, startup_ms: Option<u32>) -> String
 #[test]
 #[serial]
 fn restart_child_entry() {
-    restart::child_main(spec);
+    restart::child_main(spec_for);
 }
 
 /// Runs the first run until `KILL_AFTER_BLOCK` is journaled and kills the agent there; returns
@@ -420,7 +455,7 @@ fn assert_completed(
 
     // The ECU holds the whole image, verified by its integrity check, which it passes only
     // after a RequestTransferExit with every block in order on a freshly erased flash. The
-    // restart reset it once, or not at all after a passive teardown. The session is checked
+    // restart reset it once, or not at all when it sent no ECUReset. The session is checked
     // apart: the worker's stop can take longer than a short session timer.
     let probe = env.probe();
     assert!(
@@ -939,5 +974,122 @@ fn an_unreadable_vin_makes_the_teardown_passive() {
             // As after the refused reset: only the passive wait brings the default session.
             first_read_confirms: true,
         },
+    );
+}
+
+/// Runs the completed-path job until its post-transfer steps are journaled complete and kills
+/// the agent in the `Wait` after the plan. Returns where the transfer started.
+fn kill_after_the_plan(env: &Env, spec: &JobSpec) -> StepRef {
+    let agent = env.spawn_agent();
+    env.wait_for(
+        spec,
+        "the post-transfer steps complete",
+        WAIT_FOR_BLOCK,
+        |state| {
+            state
+                .facts
+                .transfer
+                .as_ref()
+                .and_then(|transfer| transfer.exit.as_ref())
+                .is_some_and(|exit| exit.complete)
+        },
+    );
+    let status = agent.kill();
+    assert!(
+        restart::died_of_sigkill(status),
+        "the agent should be killed during the wait after the plan: {status}"
+    );
+    let journal = agent::journal::Journal::read(&env.journal_dir(), &spec.key).expect("journal");
+    assert!(journal.facts.resume_counts.is_empty());
+    let transfer = journal.facts.transfer.expect("a transfer attempt");
+    assert_eq!(transfer.last_block, Some(BLOCKS));
+    assert!(transfer.exit.expect("the exit marker").complete);
+    transfer.started_at
+}
+
+/// Kills the completed-path job after its plan, waits for the ECU's session timer to run out if
+/// `ecu_in_default_session`, hands `fault` (a `sim-vci` control command) to the restart's
+/// worker, restarts, and checks the job completed after the passive retry.
+///
+/// The teardown takes the completed path (`Teardown::CompletedPath`): no ECUReset and no wait.
+/// The confirmation's first attempt is one F186 read, which fails, so the passive wait runs and
+/// the second attempt's read confirms: exactly two F186 reads, both before the identity is read
+/// again. The restart then finds the ECU's software version unchanged, as the job declares no
+/// version to write, and redoes the transfer, as after the other teardowns.
+fn complete_on_the_completed_path(tag: &str, ecu_in_default_session: bool, fault: Option<&str>) {
+    let spec = spec_for(COMPLETED_PATH);
+    let env = Env::with_variant(tag, ENTRY, COMPLETED_PATH, &ecu_config(3_000));
+    let first_attempt = kill_after_the_plan(&env, &spec);
+    if ecu_in_default_session {
+        // The last request came before the 1 s wait the agent was killed in; the timer is 3 s.
+        std::thread::sleep(Duration::from_millis(3_500));
+    }
+    let before = env.probe();
+    assert_eq!(
+        (before.session, before.flash_phase),
+        (if ecu_in_default_session { 1 } else { 2 }, 4),
+        "the ECU's session and its verified download before the restart"
+    );
+    if let Some(command) = fault {
+        env.inject(command);
+    }
+    let result = env.restart(&spec);
+    assert!(env.commands_applied(), "the fault should have been applied");
+    let trace = env.trace();
+    assert_eq!(
+        trace.iter().filter(|line| *line == "uds 22 F186").count(),
+        2,
+        "the failed read and the one after the passive retry: {trace:#?}"
+    );
+    assert_completed(
+        &env,
+        &spec,
+        first_attempt,
+        before.power_cycles,
+        &[1, 2],
+        Teardown {
+            gates: GATE_REQUESTS,
+            reset_sent: false,
+            ecu_reset: false,
+            first_read_confirms: false,
+        },
+        result,
+    );
+}
+
+/// The ECU is still in its programming session when the restart reads F186: the first read
+/// reports another session. The read restarts the ECU's session timer, which the passive wait
+/// then outlasts. The restart's gate reads must come within the 3 s timer of the probe's last
+/// read, which a starved runner could miss: the test then fails with one F186 read, never passes
+/// wrongly. The timer cannot be longer, as the passive wait is the plan's declared 3 s.
+#[test]
+#[serial]
+fn a_non_default_session_on_the_completed_path_is_confirmed_after_the_passive_retry() {
+    complete_on_the_completed_path("completed-non-default", false, None);
+}
+
+/// The ECU is back in its default session but refuses the restart's first F186 read.
+#[test]
+#[serial]
+fn a_refused_session_read_on_the_completed_path_is_confirmed_after_the_passive_retry() {
+    complete_on_the_completed_path(
+        "completed-refused",
+        true,
+        Some(
+            r#"{"command": "inject_fault", "request": [34, 241, 134],
+                "fault": {"negative_response": {"nrc": "conditions_not_correct"}}}"#,
+        ),
+    );
+}
+
+/// The ECU is back in its default session but the restart's first F186 read is lost on the bus,
+/// so it gets no answer.
+#[test]
+#[serial]
+fn an_unanswered_session_read_on_the_completed_path_is_confirmed_after_the_passive_retry() {
+    complete_on_the_completed_path(
+        "completed-unanswered",
+        true,
+        Some(r#"{"command": "inject_fault", "request": [34, 241, 134], "fault": "bus_error"}"#),
     );
 }

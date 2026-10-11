@@ -1,7 +1,8 @@
 //! A kill-and-restart harness for restart end-to-end tests (design 5.3, 5.6, 8.2.5; ADR-229).
 //!
 //! A test file includes it with `#[path = "common/restart.rs"] mod restart;`, builds the job it
-//! runs as a [`JobSpec`], and has an entry test that calls [`child_main`]. The harness then
+//! runs as a [`JobSpec`] (by variant, when it runs more than one: [`Env::with_variant`]), and
+//! has an entry test that calls [`child_main`]. The harness then
 //! gives the test these steps:
 //!
 //! 1. [`Env::spawn_agent`] starts the agent as a child process (the test executable again, run
@@ -59,6 +60,8 @@ use worker_host::service::{LaunchOptions, ServiceKind, WorkerProcess};
 const LIBRARY_NAME: &str = "sim-vci";
 /// Set in a child process to the role it plays (`agent` or `probe`).
 const ROLE_ENV: &str = "NGR_TEST_RESTART_ROLE";
+/// Set in a child process to the scenario's job variant ([`Env::with_variant`]).
+const VARIANT_ENV: &str = "NGR_TEST_RESTART_VARIANT";
 /// What the probe prints before its findings.
 const PROBE_PREFIX: &str = "ecu-probe";
 /// A wedged service must fail the test, not hang the CI job.
@@ -125,6 +128,8 @@ pub struct Env {
     root: PathBuf,
     /// The name of the entry test the child processes run.
     entry: &'static str,
+    /// The job variant the agent child builds ([`Env::with_variant`]).
+    variant: &'static str,
     /// How many control commands [`Env::inject`] has written.
     commands: std::cell::Cell<u32>,
 }
@@ -140,6 +145,18 @@ impl Env {
     /// configuration (`ecu_config`, the JSON of `sim_ecu::EcuConfig`). `entry` is the libtest
     /// name of the test file's entry test, which calls [`child_main`].
     pub fn new(tag: &str, entry: &'static str, ecu_config: &str) -> Self {
+        Self::with_variant(tag, entry, "", ecu_config)
+    }
+
+    /// As [`Env::new`], for a test file whose entry builds more than one job: the agent child
+    /// gets `variant`, which [`child_main`] hands to the file's job builder, so it runs the
+    /// same job as the test that builds it with that variant. [`Env::new`] uses `""`.
+    pub fn with_variant(
+        tag: &str,
+        entry: &'static str,
+        variant: &'static str,
+        ecu_config: &str,
+    ) -> Self {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock should be after unix epoch")
@@ -150,6 +167,7 @@ impl Env {
         let env = Self {
             root,
             entry,
+            variant,
             commands: std::cell::Cell::new(0),
         };
         std::fs::write(
@@ -229,7 +247,8 @@ impl Env {
         let mut command = Command::new(std::env::current_exe().expect("test executable path"));
         command
             .args([self.entry, "--exact", "--nocapture"])
-            .env(ROLE_ENV, role);
+            .env(ROLE_ENV, role)
+            .env(VARIANT_ENV, self.variant);
         self.apply_to(&mut command);
         match role {
             // The probe's own reads are not part of any scenario's trace.
@@ -608,15 +627,17 @@ pub struct EcuProbe {
     pub power_cycles: u32,
 }
 
-/// The entry point of the child processes. A test file calls it from its entry test; it returns
-/// at once when the process is not a child of the harness, and otherwise never returns normally
-/// for the `agent` role until the job ends (the parent kills it first).
-pub fn child_main(spec: fn() -> JobSpec) {
+/// The entry point of the child processes. A test file calls it from its entry test with its
+/// job builder, which takes the scenario's variant ([`Env::with_variant`]); it returns at once
+/// when the process is not a child of the harness, and otherwise never returns normally for the
+/// `agent` role until the job ends (the parent kills it first).
+pub fn child_main(spec: fn(&str) -> JobSpec) {
     let Ok(role) = std::env::var(ROLE_ENV) else {
         return;
     };
+    let variant = std::env::var(VARIANT_ENV).unwrap_or_default();
     match role.as_str() {
-        "agent" => agent_main(spec()),
+        "agent" => agent_main(spec(&variant)),
         "probe" => probe_main(),
         other => panic!("unknown role {other:?}"),
     }

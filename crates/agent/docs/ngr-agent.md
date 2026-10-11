@@ -443,10 +443,14 @@ block of the transfer was journaled, and `resume_program_journaled` resumes the 
 journal directory, both within the ECU's session timer and after it ran out. A third test kills
 only the worker at the same point: the run fails on the lost worker and marks its guards
 unconfirmed (ADR-258); once the worker is reaped the mark is cleared with `JobGuards::worker_gone`,
-and the next run resumes on those guards with a new worker and takes the same restart order. The
+and the next run resumes on those guards with a new worker and takes the same restart order. Three
+more tests kill the agent after RequestTransferExit was sent: before its response was recorded,
+after it but before the post-transfer step ran, and after the post-transfer step was sent but
+before its response was recorded. The restart's teardown is passive (no ECUReset), and it redoes
+the transfer, so RequestTransferExit and the post-transfer steps run again in order. The
 tests check the restart's requests in order against `sim-vci`'s request trace (`NGR_SIM_VCI_TRACE`)
-and that the ECU was power-cycled exactly once. The kill-and-restart harness is
-`tests/common/restart.rs`.
+and that the ECU was power-cycled exactly once (not at all after a passive teardown). The
+kill-and-restart harness is `tests/common/restart.rs`.
 
 ### Continuation after the read-back verification
 

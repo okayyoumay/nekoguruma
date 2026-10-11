@@ -41,7 +41,11 @@ also need a limit that does not depend on each check's author being careful.
    changes and vendor IOCTLs, which are refused on every class unless a T1 or T2 profile lists
    the control; on T2 a listed control also has to be part of an authorized job, so a profile
    entry alone never allows one on a real ECU. The harness creates the profile's one link, and
-   checks cannot create others or change its physical layer. Jobs run through the agent pass
+   checks cannot create others or change its physical layer. The profile names the module, and a
+   check refuses zero or several matches; because a J2534 library reports no serial number and
+   lists configured modules whether or not they are present, a J2534 module must also be the
+   only one configured, its reported firmware and library versions must match the profile
+   after opening, and only that VCI is connected while checks run. Jobs run through the agent pass
    the same guard: the harness hands the job runner a worker client that wraps the real one. Anything not allowed fails the check before it reaches the device. On T2, writes
    and reprogramming run as jobs through the agent, so the existing safeguards, preconditions
    and authorization (design 5.5, 5.6, 8.9, 8.9.1, section 6) all apply and the class guard is

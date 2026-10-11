@@ -21,7 +21,12 @@ puts both pre-load checks in the shared resolver crate.
    operating-system files) are not looked at, so a catalog-signed file is `Unsigned` too.
 2. **A present signature is verified with `WinVerifyTrust`**, the generic Authenticode policy,
    no user interface, no revocation check, and cache-only URL retrieval so the check never
-   touches the network. The lifetime-signing flag is not set: a signature with a trusted time
+   touches the network. Revocation is switched off explicitly (the no-revocation provider flag, not
+   only the revocation-checks field), because the machine-wide Software Publishing policy can
+   otherwise turn it back on for every caller; a revoked or revocation-failed result that still
+   comes back is classed as an untrusted signer. A signature that verifies but whose leaf
+   certificate, name or SHA-256 property cannot be read is reported as an invalid signature of
+   class `Other` (the signature itself is not malformed). The lifetime-signing flag is not set: a signature with a trusted time
    stamp stays valid after its certificate expires, one without a time stamp does not. Only the
    primary signature is examined. The trust source is the operating system's certificate store.
 3. **No pinning.** Any signer the store trusts is accepted. A successful verdict reports the
@@ -35,7 +40,10 @@ puts both pre-load checks in the shared resolver crate.
 5. **Other platforms report `NotApplicable`**; the call is the same everywhere.
 6. **`check_library` is the single pre-load entry point.** It runs the writability check and the
    signer check and returns every finding together (ADR-228 item 4). A failure to read the file for
-   the signer check is kept apart from the findings, since nothing is known about the signature.
+   the signer check is kept apart from the findings, since nothing is known about the signature. A
+   failure does not discard what the signer check learned: the error carries the signer verdict
+   (with its open file) when the signature was not found invalid, and the open file when it was,
+   so a caller that warns and loads (user mode) loads the file that was checked.
 7. **The file is held from the check to the load.** The check opens the library with read
    sharing only and returns the open file in its verdict. A caller that keeps it open across the
    load blocks overwriting, renaming and deleting the file until it is mapped, which narrows the
@@ -65,6 +73,14 @@ puts both pre-load checks in the shared resolver crate.
   field evidence).
 - A key that has been revoked is not detected. This is deliberate (decision 2); the writability
   check, not the signature, is what keeps regular users from planting a library.
+- The signer check gives no protection against someone who can write the file: they can strip the
+  signature, and a file without an embedded signature is `Unsigned`, which passes. The
+  writability check is the gate (ADR-270). The signer check adds assurance about who signed a
+  library that regular users cannot change, and catches a file that was altered, or re-signed with
+  an untrusted key, while keeping a signature.
+- The PE headers are located through `e_lfanew` (the DOS header is read first, then the headers at
+  that offset), so their position in the file does not matter; an `e_lfanew` above 16 MiB or past
+  the end of the file counts as no signature.
 - Roots that a user imported into their own store are honoured in user mode, which crosses no
   boundary.
 - Pinning can follow from an administrator-only source once profiles exist.

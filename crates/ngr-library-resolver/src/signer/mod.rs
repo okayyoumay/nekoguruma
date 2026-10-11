@@ -3,10 +3,14 @@
 //!
 //! "Carries a signature" means the PE header's security data directory is not empty; catalog
 //! signatures are not looked at. Only then is the file handed to `WinVerifyTrust` (generic
-//! Authenticode policy, no user interface, no revocation check, no network). A failure is one
+//! Authenticode policy, no user interface, revocation checking explicitly off, no network). A failure is one
 //! [`Reason::InvalidSignature`] finding; the check takes no operating mode, and the caller decides
 //! what the finding means (device mode refuses, user mode warns). On other platforms the check
 //! reports [`Signer::NotApplicable`].
+//!
+//! The check gives no protection against someone who can write the file: they can strip the
+//! signature, and the file is then `Unsigned`, which passes. That is why the writability check
+//! (ADR-270), not this one, is the gate against planting a library.
 //!
 //! The mapping from an HRESULT to a [`SignatureFailure`] and the PE header parser are plain
 //! functions over data, compiled and tested on every platform; only [`imp`]'s calls into the
@@ -19,7 +23,12 @@
     )
 )]
 
-use std::{fmt, fs::File, io, path::Path, path::PathBuf};
+use std::{
+    fmt,
+    fs::File,
+    io::{self, Read, Seek, SeekFrom},
+    path::{Path, PathBuf},
+};
 
 use crate::writability::{Finding, Policy, Reason, Role, check_writability_with};
 
@@ -29,7 +38,8 @@ pub enum SignatureFailure {
     /// The file no longer matches the digest in its signature.
     Tampered,
     /// The signer's chain does not end at a root the system trusts, or the certificate may not be
-    /// used for code signing, or the signer is explicitly distrusted.
+    /// used for code signing, or the signer is explicitly distrusted. Also a revoked certificate,
+    /// which the check does not look for itself but a machine policy may still report.
     UntrustedSigner,
     /// A certificate or time stamp is outside its validity (a time-stamped signature outlives the
     /// certificate's expiry; one without a time stamp does not).
@@ -64,6 +74,8 @@ const CERT_E_UNTRUSTEDCA: i32 = hr(0x800B_0112);
 const CERT_E_CHAINING: i32 = hr(0x800B_010A);
 const CERT_E_PURPOSE: i32 = hr(0x800B_0106);
 const CERT_E_WRONG_USAGE: i32 = hr(0x800B_0110);
+const CERT_E_REVOKED: i32 = hr(0x800B_010C);
+const CERT_E_REVOCATION_FAILURE: i32 = hr(0x800B_010E);
 const TRUST_E_EXPLICIT_DISTRUST: i32 = hr(0x800B_0111);
 const TRUST_E_SUBJECT_NOT_TRUSTED: i32 = hr(0x800B_0004);
 const CERT_E_EXPIRED: i32 = hr(0x800B_0101);
@@ -84,6 +96,8 @@ fn classify(hresult: i32) -> SignatureFailure {
         | CERT_E_CHAINING
         | CERT_E_PURPOSE
         | CERT_E_WRONG_USAGE
+        | CERT_E_REVOKED
+        | CERT_E_REVOCATION_FAILURE
         | TRUST_E_EXPLICIT_DISTRUST
         | TRUST_E_SUBJECT_NOT_TRUSTED => SignatureFailure::UntrustedSigner,
         CERT_E_EXPIRED | TRUST_E_TIME_STAMP => SignatureFailure::Expired,
@@ -139,6 +153,9 @@ pub enum SignerError {
         failure: SignatureFailure,
         /// The raw result of the trust provider.
         hresult: i32,
+        /// The open file, held as in [`Signer`]: a caller that decides to load the library anyway
+        /// (user mode) keeps it open until the library is mapped.
+        file: File,
     },
     /// The file could not be opened or read.
     #[error("cannot read the library: {0}")]
@@ -164,6 +181,15 @@ pub struct PreloadError {
     /// The signer check could not read the file. Distinct from a finding: nothing is known
     /// about the signature.
     pub io: Option<io::Error>,
+    /// The signer verdict, when the check ran without an I/O error and found no invalid
+    /// signature (so it is set whenever the findings are writability findings only). It holds the
+    /// open file. User mode, which warns about findings and loads anyway, should load with this
+    /// verdict kept alive until the library is mapped, so the file it reports on is the file it
+    /// loads. Device mode refuses and drops it.
+    pub signer: Option<Signer>,
+    /// The open file when the signature was invalid (an [`Reason::InvalidSignature`] finding):
+    /// there is no [`Signer`] then. The same use as in `signer`.
+    pub held: Option<File>,
 }
 
 fn io_line(io: &Option<io::Error>, first: bool) -> String {
@@ -179,6 +205,10 @@ fn io_line(io: &Option<io::Error>, first: bool) -> String {
 /// The single pre-load entry point of 7.2 (ADR-228 item 4, ADR-278 item 6): runs the writability
 /// check ([`check_writability_with`]) and the signer check and returns every finding together.
 /// On success the verdict holds the open file (see [`Signer`]).
+///
+/// A failure does not discard what the signer check learned: the error carries the verdict
+/// ([`PreloadError::signer`]) or, for an invalid signature, the open file ([`PreloadError::held`]),
+/// so a caller that warns and loads (user mode) loads the file that was checked.
 pub fn check_library(
     library: &Path,
     naming_files: &[PathBuf],
@@ -189,14 +219,20 @@ pub fn check_library(
         Err(e) => e.findings,
     };
     let mut io = None;
+    let mut held = None;
     let signer = match check_signer(library) {
         Ok(s) => Some(s),
-        Err(SignerError::Invalid { failure, hresult }) => {
+        Err(SignerError::Invalid {
+            failure,
+            hresult,
+            file,
+        }) => {
             findings.push(Finding {
                 path: library.to_owned(),
                 role: Role::Library,
                 reason: Reason::InvalidSignature { failure, hresult },
             });
+            held = Some(file);
             None
         }
         Err(SignerError::Io(e)) => {
@@ -206,7 +242,12 @@ pub fn check_library(
     };
     match signer {
         Some(s) if findings.is_empty() => Ok(s),
-        _ => Err(PreloadError { findings, io }),
+        signer => Err(PreloadError {
+            findings,
+            io,
+            signer,
+            held,
+        }),
     }
 }
 
@@ -215,6 +256,8 @@ pub fn check_library(
 enum PeError {
     /// No `MZ` or no `PE\0\0` signature.
     NotPe,
+    /// `e_lfanew` points further into the file than a real image puts it.
+    TooFar,
     /// The header is cut off before a field it needs.
     Truncated,
     /// The optional header is neither PE32 nor PE32+.
@@ -244,20 +287,38 @@ fn u32_at(h: &[u8], offset: usize) -> Result<u32, PeError> {
     ))
 }
 
-/// The size field of the security data directory in the PE headers at the start of `h`. A
-/// directory the optional header does not hold (fewer entries than five, or a header too short
-/// for the entry) counts as empty, as the loader would see it.
-fn security_directory_size(h: &[u8]) -> Result<u32, PeError> {
+/// Size of the DOS header; `e_lfanew` is its last field (at 0x3C).
+const DOS_HEADER_SIZE: usize = 0x40;
+/// Largest `e_lfanew` accepted. Real images put the PE headers right behind a small DOS stub;
+/// the loader takes any 32-bit value, but a header megabytes into the file is not an image
+/// worth treating as signed, and the bound keeps the second read short.
+const MAX_PE_OFFSET: u32 = 16 * 1024 * 1024;
+/// How much is read at `e_lfanew`: the signature, the COFF header and an optional header with
+/// room for all sixteen data directories (PE32+: 112 + 16 * 8 bytes) with a margin.
+const NT_WINDOW: u64 = 4 + 20 + 512;
+
+/// The offset of the PE signature from the DOS header at the start of `h`.
+fn pe_offset(h: &[u8]) -> Result<u32, PeError> {
     if bytes(h, 0, 2)? != b"MZ" {
         return Err(PeError::NotPe);
     }
-    let pe = u32_at(h, 0x3C)? as usize;
-    if bytes(h, pe, 4)? != b"PE\0\0" {
+    let offset = u32_at(h, 0x3C)?;
+    if offset > MAX_PE_OFFSET {
+        return Err(PeError::TooFar);
+    }
+    Ok(offset)
+}
+
+/// The size field of the security data directory, from the NT headers: `h` starts at the PE
+/// signature. A directory the optional header does not hold (fewer entries than five, or a
+/// header too short for the entry) counts as empty, as the loader would see it.
+fn security_directory_size_at(h: &[u8]) -> Result<u32, PeError> {
+    if bytes(h, 0, 4)? != b"PE\0\0" {
         return Err(PeError::NotPe);
     }
     // COFF header (20 bytes) follows the signature; its SizeOfOptionalHeader is at +16.
-    let optional_size = usize::from(u16_at(h, pe + 4 + 16)?);
-    let optional = pe + 4 + 20;
+    let optional_size = usize::from(u16_at(h, 4 + 16)?);
+    let optional = 4 + 20;
     // The data directories start at 96 (PE32) or 112 (PE32+); the entry count precedes them.
     let directories = match u16_at(h, optional)? {
         0x10B => optional + 96,
@@ -273,16 +334,40 @@ fn security_directory_size(h: &[u8]) -> Result<u32, PeError> {
     u32_at(h, entry + 4)
 }
 
-/// How much of the file start is read to find the PE headers.
-#[cfg(windows)]
-const HEADER_WINDOW: u64 = 64 * 1024;
+/// The size field of the security data directory of an image held in one slice (the DOS header
+/// and the NT headers it points to both inside `h`).
+fn security_directory_size(h: &[u8]) -> Result<u32, PeError> {
+    let at = pe_offset(h)? as usize;
+    security_directory_size_at(h.get(at..).ok_or(PeError::Truncated)?)
+}
+
+/// The size of the security data directory of the image in `r`, 0 when there is none to look at.
+///
+/// Reads the DOS header, then seeks to `e_lfanew` and reads the NT headers there, so headers
+/// beyond any fixed prefix of the file are found. A file that is not a PE image, whose
+/// `e_lfanew` is out of bounds or past the end of the file, or whose headers are cut off, has no
+/// signature to verify and gives 0. Only a read failure is an error. The position afterwards is
+/// unspecified.
+fn embedded_signature_size<R: Read + Seek>(r: &mut R) -> io::Result<u32> {
+    let mut dos = Vec::new();
+    r.by_ref()
+        .take(DOS_HEADER_SIZE as u64)
+        .read_to_end(&mut dos)?;
+    let Ok(at) = pe_offset(&dos) else {
+        return Ok(0);
+    };
+    r.seek(SeekFrom::Start(u64::from(at)))?;
+    let mut nt = Vec::new();
+    r.by_ref().take(NT_WINDOW).read_to_end(&mut nt)?;
+    Ok(security_directory_size_at(&nt).unwrap_or(0))
+}
 
 #[cfg(windows)]
 mod imp {
     use std::{
         ffi::c_void,
         fs::{File, OpenOptions},
-        io::{Read, Seek, SeekFrom},
+        io::Seek,
         os::windows::{ffi::OsStrExt, fs::OpenOptionsExt, io::AsRawHandle},
         path::Path,
         ptr,
@@ -298,17 +383,14 @@ mod imp {
             WinTrust::{
                 CRYPT_PROVIDER_SGNR, WINTRUST_ACTION_GENERIC_VERIFY_V2, WINTRUST_DATA,
                 WINTRUST_DATA_0, WINTRUST_FILE_INFO, WTD_CACHE_ONLY_URL_RETRIEVAL, WTD_CHOICE_FILE,
-                WTD_REVOKE_NONE, WTD_STATEACTION_CLOSE, WTD_STATEACTION_VERIFY, WTD_UI_NONE,
-                WTHelperGetProvCertFromChain, WinVerifyTrust,
+                WTD_REVOCATION_CHECK_NONE, WTD_REVOKE_NONE, WTD_STATEACTION_CLOSE,
+                WTD_STATEACTION_VERIFY, WTD_UI_NONE, WTHelperGetProvCertFromChain, WinVerifyTrust,
             },
         },
         Storage::FileSystem::FILE_SHARE_READ,
     };
 
-    use super::{
-        HEADER_WINDOW, Signer, SignerError, TRUST_E_NO_SIGNER_CERT, classify,
-        security_directory_size,
-    };
+    use super::{Signer, SignerError, classify, embedded_signature_size};
 
     // windows-sys does not bind these two wintrust.dll helpers, so they are declared here the
     // way it declares the others (raw-dylib, no import library needed).
@@ -338,8 +420,10 @@ mod imp {
     }
 
     const S_OK: i32 = 0;
-    /// Reported when the provider says yes but hands back no signer certificate.
-    const NO_SIGNER_DATA: i32 = TRUST_E_NO_SIGNER_CERT;
+    /// Reported (E_FAIL, class `Other`) when the provider says yes but the leaf certificate, its
+    /// name or its SHA-256 property cannot be read. The signature verified, so it is not a
+    /// malformed signature; the identity is simply unavailable.
+    const NO_SIGNER_DATA: i32 = 0x8000_4005_u32 as i32;
 
     pub(super) fn check_signer(library: &Path) -> Result<Signer, SignerError> {
         // Read sharing only: nobody can open the file for writing, rename or delete it while the
@@ -348,11 +432,9 @@ mod imp {
             .read(true)
             .share_mode(FILE_SHARE_READ)
             .open(library)?;
-        let mut header = Vec::new();
-        (&mut file).take(HEADER_WINDOW).read_to_end(&mut header)?;
-        file.seek(SeekFrom::Start(0))?;
         // Not a PE image, or one cut off before its directories: no signature to verify.
-        let signed = security_directory_size(&header).is_ok_and(|size| size != 0);
+        let signed = embedded_signature_size(&mut file)? != 0;
+        file.rewind()?;
         if !signed {
             return Ok(Signer::Unsigned { file });
         }
@@ -365,6 +447,7 @@ mod imp {
             Err(hresult) => Err(SignerError::Invalid {
                 failure: classify(hresult),
                 hresult,
+                file,
             }),
         }
     }
@@ -388,7 +471,9 @@ mod imp {
                 pFile: &mut file_info,
             },
             dwStateAction: WTD_STATEACTION_VERIFY,
-            dwProvFlags: WTD_CACHE_ONLY_URL_RETRIEVAL,
+            // The machine-wide Software Publishing policy can switch revocation checking on for
+            // every caller; the explicit no-revocation flag keeps it off.
+            dwProvFlags: WTD_CACHE_ONLY_URL_RETRIEVAL | WTD_REVOCATION_CHECK_NONE,
             ..Default::default()
         };
         let mut action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
@@ -455,6 +540,9 @@ mod imp {
                 ptr::null_mut(),
                 0,
             );
+            if chars == 0 {
+                return Err(NO_SIGNER_DATA);
+            }
             let mut name = vec![0u16; chars as usize];
             let written = CertGetNameStringW(
                 cert,
@@ -464,6 +552,9 @@ mod imp {
                 name.as_mut_ptr(),
                 chars,
             );
+            if written == 0 {
+                return Err(NO_SIGNER_DATA);
+            }
             // The count includes the terminating NUL.
             name.truncate((written as usize).saturating_sub(1));
             let subject = String::from_utf16_lossy(&name);

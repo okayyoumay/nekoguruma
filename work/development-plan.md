@@ -130,7 +130,7 @@ M5 and M6 do not depend on each other; M6 comes first (maintainer's decision, 20
 
 - T1: the clause 16 reprogramming sequence with a real VCI against the stand-in ECU, with power cut through the host-controlled switch during the transfer.
 - T2: a configuration write and reprogramming of an ECU the profile declares expendable, once this milestone's approval levels exist, and only after the 8.9.1 checks pass.
-- T2: real seed/key or OEM authentication path on a bench ECU, where an algorithm or account is available (8.10).
+- T2: the configuration write above unlocks the bench ECU through the real seed/key or OEM authentication path (8.10), where an algorithm or account is available.
 - T0: whether each VCI's library opens and passes loopback frames when the agent runs as a service (design 17, "Items to Confirm Early").
 
 ## M5 Real-time monitoring

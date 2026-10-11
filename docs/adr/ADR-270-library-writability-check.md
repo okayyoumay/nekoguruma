@@ -1,7 +1,7 @@
 # ADR-270: What "Writable by Regular Users" Means for the Pre-Load Check
 
 **Date:** 2026-10-10
-**Status:** Accepted
+**Status:** Accepted (the D-PDU API root file, MDF and CDF are naming files under item 5, ADR-277)
 **Affects:** `ngr-library-resolver` (crate root, `docs/library-resolver.md`), design 7.2, ADR-228 item 4; later the worker services and the agent when they switch over to the shared resolver
 
 ## Context

@@ -14,7 +14,7 @@ same call resolves a name on every platform. What does not depend on the standar
 | Module | Standard | Linux | Windows |
 |---|---|---|---|
 | `j2534_0404` | SAE J2534-1 v04.04 (registry: §9.2) | definition files (below) | registry, through `j2534-0404-registry` |
-| `iso22900` | ISO 22900-2 D-PDU API (2022 edition, clause 8.7, Annex F) | root description file (see "ISO 22900") | the same, found through the registry |
+| `iso22900` | ISO 22900-2 D-PDU API (2022 edition, clause 8.7, Annex F) | root description file (see "ISO 22900") | the same, found through the registry in a named view |
 
 Unless a section says otherwise, this document describes the `j2534_0404` module; the names in
 it are that module's (`j2534_0404::resolve`, `j2534_0404::ResolveError`, ...). The `iso22900`
@@ -109,20 +109,53 @@ Annex F, cited by clause only).
 **Chain.** The root description file lists one `MVCI_PDU_API` entry per installed implementation.
 The entry itself names the API library (`LIBRARY_FILE`), the module description file
 (`MODULE_DESCRIPTION_FILE`) and the cable description file (`CABLE_DESCRIPTION_FILE`), each as a
-`URI` attribute holding a `file:` URI. The MDF and CDF are not parsed here; their paths are
-reported in `Implementation`. Percent-encoding is decoded; on Windows a remote host becomes a UNC
-path, elsewhere a remote host or a drive letter is refused.
+`URI` attribute holding a `file:` URI. The MDF and CDF are not parsed and not followed to find the
+library; their paths are reported in `Implementation` for the 7.2 check. ADR-277 is the decision
+record for the rules below.
 
-**Root file location** (`root_file_path()`). On Windows the native registry view of
-`HKLM\SOFTWARE\D-PDU API`, value `Root File` (trimmed; a missing key, value or blank content is
-`None`). Elsewhere `vci_service_config::pdu_api_root_file()` (`/etc/pdu_api_root.xml` in release
-builds, fixed at build time by `NGR_PDU_API_ROOT_FILE`, ADR-228 Decision item 1; debug builds also
-read the variable at run time, ADR-073). `resolve(name)` locates the root file and calls
-`resolve_in_root_file(root_file, name)`.
+**Root file location** (`root_file_path(view)`). On Windows the registry view `view` of
+`HKLM\SOFTWARE\D-PDU API`, value `Root File` (a missing key, value or blank content is `None`).
+Elsewhere `vci_service_config::pdu_api_root_file()` (`/etc/pdu_api_root.xml` in release builds,
+fixed at build time by `NGR_PDU_API_ROOT_FILE`, ADR-228 Decision item 1; debug builds also read
+the variable at run time, ADR-073); the view is ignored there. `resolve_in_view(name, view)`
+locates the root file and calls `resolve_in_root_file(root_file, name)`; `resolve(name)` uses
+`RegistryView::native()`. `RegistryView` (crate root) has two values, `Wow64_32` and `Wow64_64`,
+and no "all views" mode: a worker reads its own bitness, and the agent calls once per view.
 
-**Matching.** The name is an entry's `SHORT_NAME` (trimmed), matched exactly and
-case-sensitively against the name as given. The root file is read up to `MAX_ROOT_FILE_SIZE`
-(1 MiB); more is `TooLarge`.
+**Registry value.** The value is read raw. `REG_SZ` is taken literally, even if it contains `%`.
+`REG_EXPAND_SZ` has its `%NAME%` references expanded from the process environment, where
+`ProgramFiles` and `CommonProgramFiles` come from the view's own variables (`ProgramFiles(x86)` /
+`CommonProgramFiles(x86)` for `Wow64_32`, `ProgramW6432` / `CommonProgramW6432` for `Wow64_64`),
+falling back to the plain names when those are absent (32-bit Windows). An unknown `%NAME%`, an
+empty `%%` and an unmatched `%` stay as written; expanded text is not scanned again. Other value
+types, invalid UTF-16 and an embedded NUL are `ResolveError::Registry`.
+
+**Encoding and size.** The file is read up to `MAX_ROOT_FILE_SIZE` (1 MiB, inclusive; more is
+`TooLarge`). It must be UTF-8 (a byte order mark is tolerated) or UTF-16 little- or big-endian
+with a byte order mark; anything else, including a legacy code page, is `Encoding`. The XML
+declaration's encoding is not honoured. `parse_root_file` takes text.
+
+**Structure.** The document element must be `MVCI_PDU_API_ROOT` (`NotARootFile` otherwise; the
+version attribute is not checked). Entries are its direct `MVCI_PDU_API` children; one nested
+elsewhere is ignored. Elements are matched by local name, so a default namespace is harmless, and
+only the un-namespaced `URI` attribute counts. Unknown children are ignored. A repeated
+`SHORT_NAME`, `DESCRIPTION`, `SUPPLIER_NAME`, `LIBRARY_FILE`, `MODULE_DESCRIPTION_FILE` or
+`CABLE_DESCRIPTION_FILE` makes the entry unusable (`Duplicate`), reported under its first
+`SHORT_NAME`. `SHORT_NAME` text is the element's text and CDATA joined (a comment inside does not
+cut it) and trimmed; an element inside is `NestedShortName`.
+
+**Paths.** A `file:` URI is converted to an absolute local path, for the library, the MDF and the
+CDF alike, on every platform. Percent-encoding is decoded. A host other than `localhost` (this
+includes `file://c:/dir/x.dll`) and a path starting with `//` in any encoding (`file:////server/..`,
+`file:///%5C%5Cserver/..`) are `RemoteHost`: a share cannot meet the 7.2 premise that regular
+users cannot write the chain. A raw `?` or `#`, a `..` component, a NUL after decoding, another
+scheme and malformed percent-encoding are `InvalidUri`. On Windows only the drive-letter form is
+accepted (a path without one is `RelativePath`); raw backslashes may stay. A URI that gives a
+relative path (`file:dir/x`) is `RelativePath`. A mapped network drive passes these rules.
+
+**Matching.** The name is an entry's `SHORT_NAME`, matched exactly and case-sensitively against
+the name as given. The MDF and CDF are optional, but the schema (Annex F) requires them, so
+resolving an entry that lacks one logs a warning for that entry.
 
 **Errors.**
 
@@ -130,12 +163,11 @@ case-sensitively against the name as given. The root file is read up to `MAX_ROO
 - `NotFound`: no entry has the name; it carries the number of unusable entries skipped, so a
   typo in an entry is visible. Each skipped entry is logged at warn level.
 - `Ambiguous`: more than one entry has the name (an unusable one counts); none is picked.
-- `InvalidEntry`: the one entry with the name is refused, with an `EntryError`: no
-  `LIBRARY_FILE` (`MissingLibrary`), a URI that is not a valid `file:` URI (`InvalidUri`, for
-  the MDF and CDF as well), or a library path that is not absolute after conversion
-  (`RelativeLibrary`; on Windows a URI without drive letter or host).
-- `Xml`: the root file is not well-formed XML; the error names the file. `Io` is any other read
-  failure.
+- `InvalidEntry`: the one entry with the name is refused, with an `EntryError`: `MissingShortName`,
+  `NestedShortName`, `MissingLibrary`, `Duplicate`, `InvalidUri`, `RemoteHost` or `RelativePath`
+  (the last three name the element).
+- `Encoding`, `Xml` and `NotARootFile`: the file is not UTF-8 or marked UTF-16, not well-formed
+  XML, or not a root description file; each names the file. `Io` is any other read failure.
 
 `parse_root_file` and `read_root_file` return every entry: usable ones in `implementations`,
 unusable ones with their reason in `invalid`, both in document order.
@@ -148,7 +180,7 @@ in the 7.2 writability check; the library is passed separately:
 check_writability(&r.implementation.library_file, &r.naming_files())?;
 ```
 
-On Windows the registry value is not covered (HKLM is trusted by premise, 7.2).
+On Windows the registry value is not covered (HKLM is trusted by premise, 7.2), and a path that never passes through the URI conversion is not checked for being local.
 
 ## Writability check (design 7.2)
 

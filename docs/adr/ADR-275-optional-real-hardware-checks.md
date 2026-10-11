@@ -39,7 +39,10 @@ also need a limit that does not depend on each check's author being careful.
    (service and, where it matters, sub-function; T3 uses an allow-list of read-only services),
    raw frames and periodic messages, and hardware controls such as programming voltage, pin
    changes and vendor IOCTLs, which are refused on every class unless a T1 or T2 profile lists
-   the control. Anything not allowed fails the check before it reaches the device. On T2, writes
+   the control; on T2 a listed control also has to be part of an authorized job, so a profile
+   entry alone never allows one on a real ECU. The harness creates the profile's one link, and
+   checks cannot create others or change its physical layer. Jobs run through the agent pass
+   the same guard: the harness hands the job runner a worker client that wraps the real one. Anything not allowed fails the check before it reaches the device. On T2, writes
    and reprogramming run as jobs through the agent, so the existing safeguards, preconditions
    and authorization (design 5.5, 5.6, 8.9, 8.9.1, section 6) all apply and the class guard is
    a ceiling on top of them. A T2 write check exists only once all of section 6's controls for

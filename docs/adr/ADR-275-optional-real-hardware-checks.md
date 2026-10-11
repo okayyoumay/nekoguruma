@@ -32,15 +32,18 @@ also need a limit that does not depend on each check's author being careful.
    be sent, so none stands in for another: each check declares the set of classes it can run on,
    and the hardware profile declares the class of the attached setup. A profile can only narrow
    its class, except that a T2 profile may allow reprogramming of an ECU it declares expendable
-   and T1 and T2 profiles may name power-switch commands. A T3 profile can add nothing.
+   and T1 and T2 profiles may name power-switch commands and the specific hardware controls
+   their wiring is safe for. A T3 profile can add nothing.
 4. **A guarded handle, not care, enforces the class.** A check reaches the VCI only through a
    handle the harness creates, and the guard behind it sees every operation: UDS requests
    (service and, where it matters, sub-function; T3 uses an allow-list of read-only services),
    raw frames and periodic messages, and hardware controls such as programming voltage, pin
-   changes and vendor IOCTLs. Anything not on the class's list fails the check before it reaches
-   the device. On T2, writes and reprogramming run as jobs through the agent, so the existing
-   safeguards, preconditions and authorization (design 5.5, 5.6, 8.9, 8.9.1, section 6) all
-   apply and the class guard is a ceiling on top of them.
+   changes and vendor IOCTLs, which are refused on every class unless a T1 or T2 profile lists
+   the control. Anything not allowed fails the check before it reaches the device. On T2, writes
+   and reprogramming run as jobs through the agent, so the existing safeguards, preconditions
+   and authorization (design 5.5, 5.6, 8.9, 8.9.1, section 6) all apply and the class guard is
+   a ceiling on top of them. A T2 write check exists only once all of section 6's controls for
+   its job type do; before that, writes are checked on T1 only.
 5. **A stand-in ECU on a real bus.** `sim-ecu` gets a second front end that talks over a
    SocketCAN interface, so writes, reprogramming and fault injection (including physical ones:
    unplugging the VCI, cutting power through a host-controlled switch) can be checked with a real

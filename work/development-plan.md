@@ -74,7 +74,7 @@ M5 and M6 do not depend on each other; M6 comes first (maintainer's decision, 20
 
 - T2: session timing (P2 / P2*) and response-pending chains of ISO 14229-2 (2021) 9.2, 9.5 and clause 10, measured on a real VCI against a bench ECU and compared with the values `sim-ecu` uses.
 - T1: the same timing measured on a real VCI against the stand-in ECU, to separate the VCI's own delays from the ECU's.
-- T2: the exit-criteria CSV + Starlark definition, rewritten for the bench ECU, runs through both a J2534 VCI and a D-PDU API VCI (the first real use of the D-PDU worker).
+- T2: the read parts of the exit-criteria CSV + Starlark definition (variant identification, DIDs, DTC read), rewritten for the bench ECU, run through both a J2534 VCI and a D-PDU API VCI (the first real use of the D-PDU worker). The routine waits for M6, when section 6's controls for it exist (design 13.5).
 - T3: variant identification, DID and DTC reads on a vehicle.
 
 ## M3 Server and job control (local deployment profile)
@@ -96,7 +96,8 @@ M5 and M6 do not depend on each other; M6 comes first (maintainer's decision, 20
 
 **Optional real-hardware checks (design 13.5).**
 
-- T1/T2: an acquisition and a configuration write created through the Web API run on a real VCI on the local profile.
+- T1: an acquisition and a configuration write created through the Web API run on a real VCI on the local profile.
+- T2: the same acquisition against a bench ECU (read only; T2 writes wait for M6, design 13.5).
 
 ## M4 Web UI and acquired data
 
@@ -128,7 +129,7 @@ M5 and M6 do not depend on each other; M6 comes first (maintainer's decision, 20
 **Optional real-hardware checks (design 13.5).**
 
 - T1: the clause 16 reprogramming sequence with a real VCI against the stand-in ECU, with power cut through the host-controlled switch during the transfer.
-- T2: reprogramming of an ECU the profile declares expendable, only after the 8.9.1 checks pass.
+- T2: a configuration write and reprogramming of an ECU the profile declares expendable, once this milestone's approval levels exist, and only after the 8.9.1 checks pass.
 - T2: real seed/key or OEM authentication path on a bench ECU, where an algorithm or account is available (8.10).
 - T0: whether each VCI's library opens and passes loopback frames when the agent runs as a service (design 17, "Items to Confirm Early").
 

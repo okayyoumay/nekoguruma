@@ -100,8 +100,8 @@ pub enum JobError {
     OnSiteInterventionRequired(OnSiteReason),
     /// The procedure ended itself as failed (`Op::Fail`, ADR-280): terminal, journaled when the
     /// job has a journal, and not resumed by a restart. `code` and `detail` are the procedure's,
-    /// cut to [`MAX_FAILURE_CODE_BYTES`] and [`MAX_FAILURE_DETAIL_BYTES`]; the detail is decoded
-    /// lossily.
+    /// cut to `journal::MAX_FAILURE_CODE_LEN` and `journal::MAX_FAILURE_DETAIL_LEN` bytes; the
+    /// detail is decoded lossily.
     #[error("the procedure ended as failed at {pc}: {code}: {detail}")]
     ProcedureFailed {
         pc: u32,
@@ -129,11 +129,6 @@ pub enum JobError {
     #[error("the job's guards were missing when the per-vehicle lock was to be taken")]
     GuardsMissing,
 }
-
-/// The longest procedure failure code kept, in bytes (ADR-280).
-const MAX_FAILURE_CODE_BYTES: usize = 128;
-/// The longest procedure failure detail kept, in bytes (ADR-280).
-const MAX_FAILURE_DETAIL_BYTES: usize = 1024;
 
 /// `text` cut to at most `max` bytes, on a character boundary.
 fn truncated(mut text: String, max: usize) -> String {
@@ -723,6 +718,17 @@ where
     if let Err(JournalError::InUse) = opened {
         return Err(JobError::Journal(JournalError::InUse));
     }
+    // A declared failure is final, whatever the job's data say now (ADR-280): it is reported
+    // before the comparisons below, which would otherwise ask for on-site intervention.
+    if let Ok(journal) = &opened
+        && let Some(failure) = &journal.state().facts.procedure_failed
+    {
+        return Err(JobError::ProcedureFailed {
+            pc: failure.at.pc,
+            code: failure.code.clone(),
+            detail: failure.detail.clone(),
+        });
+    }
     // A resume names the VIN the job's first run recorded, or the job's own data changed
     // (ADR-261): nothing is sent and no resume is counted.
     if let Ok(journal) = &opened
@@ -1092,13 +1098,18 @@ where
             Ok(StepOutcome::Failed(failure)) => {
                 // Journaled before the job ends, so a restart does not redo a transfer the
                 // procedure ended (ADR-280). A commit that fails is the job's error instead.
-                let code = truncated(failure.code, MAX_FAILURE_CODE_BYTES);
+                let code = truncated(failure.code, crate::journal::MAX_FAILURE_CODE_LEN);
                 let detail = truncated(
                     String::from_utf8_lossy(&failure.detail).into_owned(),
-                    MAX_FAILURE_DETAIL_BYTES,
+                    crate::journal::MAX_FAILURE_DETAIL_LEN,
                 );
-                if let Some(journal) = journal.as_deref_mut() {
-                    journal.procedure_failed(at, &code, &detail)?;
+                if let Some(journal) = journal.as_deref_mut()
+                    && let Err(error) = journal.procedure_failed(at, &code, &detail)
+                {
+                    // The job ends in the journal error, so the procedure's own reason would
+                    // be lost.
+                    tracing::warn!(pc, %code, %detail, %error, "could not journal the procedure failure");
+                    return Err(error);
                 }
                 return Err(JobError::ProcedureFailed { pc, code, detail });
             }
@@ -1453,15 +1464,14 @@ mod tests {
     }
 
     /// A detail that is not UTF-8 is decoded lossily, and the code and the detail are cut to
-    /// their limits on a character boundary (ADR-280).
+    /// their limits on a character boundary (ADR-280). `Program::validate` keeps a code within
+    /// its limit, so the code is cut by the helper alone.
     #[test]
     fn a_declared_failure_is_decoded_and_bounded() {
         let mut host = FakeHost::default();
-        // 201 bytes; the limit falls inside a two-byte character.
-        let code = format!("a{}", "\u{e9}".repeat(100));
         // Each invalid byte becomes a three-byte replacement character: 1500 bytes.
         let result = run_plain(
-            &failing(&code, &[0xff; 500]),
+            &failing("CODE", &[0xff; 500]),
             &mut host,
             JobLimits::default(),
             &AtomicBool::new(false),
@@ -1469,10 +1479,14 @@ mod tests {
         let Err(JobError::ProcedureFailed { code, detail, .. }) = result else {
             panic!("{result:?}");
         };
-        assert_eq!(code.len(), MAX_FAILURE_CODE_BYTES - 1);
-        assert!(code.starts_with("a\u{e9}"));
-        assert_eq!(detail.len(), MAX_FAILURE_DETAIL_BYTES - 1);
+        assert_eq!(code, "CODE");
+        assert_eq!(detail.len(), crate::journal::MAX_FAILURE_DETAIL_LEN - 1);
         assert!(detail.chars().all(|c| c == char::REPLACEMENT_CHARACTER));
+        // 201 bytes; the limit falls inside a two-byte character.
+        let long = format!("a{}", "\u{e9}".repeat(100));
+        let cut = truncated(long, crate::journal::MAX_FAILURE_CODE_LEN);
+        assert_eq!(cut.len(), crate::journal::MAX_FAILURE_CODE_LEN - 1);
+        assert!(cut.starts_with("a\u{e9}"));
     }
 
     #[test]
@@ -3513,6 +3527,80 @@ mod tests {
         assert_eq!(host.sent(), []);
         assert_eq!(host.voltage_reads, 0);
         assert_eq!(resumes(&dir), 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A failed journal resumed by a job whose data changed (another VIN, or a version it now
+    /// names) still ends in the failure, not in on-site intervention, with nothing sent.
+    #[test]
+    fn a_failed_journal_reports_the_failure_whatever_the_jobs_data() {
+        let program = flash_program_failing_after_the_erase();
+        let dir = journal_dir("procedure-failed-vin");
+        let result = first_run(&program, &dir, JobLimits::default(), |_| {});
+        assert!(
+            matches!(result, Err(JobError::ProcedureFailed { .. })),
+            "{result:?}"
+        );
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        let result = resume_for(&program, &dir, &mut host, false, Some("WDB99999999999999"));
+        assert!(
+            matches!(&result, Err(JobError::ProcedureFailed { code, .. }) if code == "ERASE_REFUSED"),
+            "{result:?}"
+        );
+        let result = resume_naming(
+            &program,
+            &dir,
+            &mut host,
+            false,
+            Some(TARGET_VIN),
+            Some(b"2.0.0"),
+            &dir_slot(&dir),
+        );
+        assert!(
+            matches!(result, Err(JobError::ProcedureFailed { .. })),
+            "{result:?}"
+        );
+        assert_eq!(host.sent(), []);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A `Fail` reached in the redone transfer of a restart (after a resume was counted) is
+    /// journaled as well, and a further restart reports it with nothing sent and no more resume
+    /// counted. The replay path before the erase shares `run_vm`, so it is not tested separately.
+    #[test]
+    fn a_failure_in_a_redone_transfer_is_not_resumed() {
+        let program = flash_program_failing_after_the_erase();
+        let dir = journal_dir("procedure-failed-redo");
+        interrupted(&program, &dir);
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        let result = resume_on(
+            &program,
+            &mut host,
+            JobLimits::default(),
+            &AtomicBool::new(false),
+            Journal::open(&dir, &job_key()),
+            identity_sources(),
+            Some(&target()),
+            None,
+            &dir_slot(&dir),
+        );
+        assert!(
+            matches!(&result, Err(JobError::ProcedureFailed { pc, code, .. })
+                if *pc == ERASE + 1 && code == "ERASE_REFUSED"),
+            "{result:?}"
+        );
+        assert_eq!(resumes(&dir), 1);
+        let facts = Journal::read(&dir, &job_key()).unwrap().facts;
+        assert!(facts.procedure_failed.is_some());
+
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        let result = resume(&program, &dir, &mut host, false);
+        assert!(
+            matches!(&result, Err(JobError::ProcedureFailed { code, .. }) if code == "ERASE_REFUSED"),
+            "{result:?}"
+        );
+        assert_eq!(host.sent(), []);
+        assert_eq!(resumes(&dir), 1);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

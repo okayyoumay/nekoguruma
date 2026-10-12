@@ -12,6 +12,9 @@ use serde::{Deserialize, Serialize};
 /// and `VmState` lost `checkpoint` and `resume_count`, so both postcard encodings changed.
 pub const IR_SCHEMA_VERSION: u32 = 2;
 
+/// The longest code, in bytes, that `Program::validate` accepts for a `Fail` (ADR-280).
+pub const MAX_FAILURE_CODE_LEN: usize = 128;
+
 // ---------------------------------------------------------------- Instructions
 
 /// 8.2.4. No instructions are defined that amount to external access (files, network, process
@@ -78,12 +81,14 @@ pub enum Op {
     HmiRequest {
         form: u32,
     },
+    /// `template` is a 4.3.1 record template.
     RecordInput {
         template: u32,
-    }, // 4.3.1 record template
+    },
+    /// 4.6 capture.
     MonitorCapture {
         back_millis: u32,
-    }, // 4.6 capture
+    },
     Log {
         level: u8,
         message: u32,
@@ -91,8 +96,9 @@ pub enum Op {
 
     // Declared failure (8.2.4, ADR-280). Appended last: the variant order is part of the
     // encoding (ADR-233).
-    /// Ends the procedure as failed. `code` is a constant-pool index (UTF-8, like `Log::message`);
-    /// the detail is the `Bytes` on top of the stack.
+    /// Ends the procedure as failed. `code` is a constant-pool index (UTF-8, like `Log::message`;
+    /// `Program::validate` checks it is 1 to [`MAX_FAILURE_CODE_LEN`] bytes); the detail is the
+    /// `Bytes` on top of the stack.
     Fail {
         code: u32,
     },

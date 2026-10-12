@@ -156,7 +156,7 @@ field that stores them.
 | `millis`, `back_millis` | `int`, 0 to 2^32 - 1 |
 | `form_id`, `template_id` | `str` naming the form or record template |
 | `level` of `diag.log` | `int`, 0 to 255 |
-| `code` of `diag.fail` | non-empty `str` constant, 1 to 64 bytes of UTF-8 |
+| `code` of `diag.fail` | non-empty `str` constant, 1 to 64 bytes of UTF-8 (the IR accepts 1 to 128; `Program::validate` checks the constant, ADR-280) |
 | `detail` of `diag.fail` | `str` expression, which may be built at run time |
 | `params` of `diag.hmi` | dict whose values are all constants (3.2) |
 | `session_id` | `int` naming a flash session declared in the declaration part (`FlashSession` in `ir.fbs`); an unknown session is rejected (`STAR_UNKNOWN_FLASH_SESSION`) |

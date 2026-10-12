@@ -21,7 +21,10 @@ ended: a restart replays to the erase and sends it again.
    stored program valid (ADR-233 item 10), so `IR_SCHEMA_VERSION` stays 2. `code` is a
    constant-pool index holding UTF-8, like `Log::message`, because the server's dry run can then
    check it as it checks a log message (ADR-233 item 7). The detail is a `Bytes` operand popped
-   from the stack, because a detail is built at run time.
+   from the stack, because a detail is built at run time. `Program::validate` also checks the
+   code statically: it must exist, be UTF-8 and be 1 to 128 bytes (`MAX_FAILURE_CODE_LEN`), so
+   the journal's record can always hold it. The Starlark frontend accepts 1 to 64 bytes, a
+   stricter limit it may keep without the IR changing.
 2. **The VM checks the operands before it changes anything:** the constant exists (`BadConstant`)
    and is UTF-8 (`InvalidUtf8`), and the top of the stack exists (`StackUnderflow`) and is
    `Bytes` (`TypeMismatch`). It does not check the detail's encoding or length: a `VmError` at a
@@ -34,7 +37,8 @@ ended: a restart replays to the erase and sends it again.
    nothing reaches the host, so no intent marker precedes it and `check_primitive` has nothing
    to check for it.
 4. **The runner ends the job in `JobError::ProcedureFailed { pc, code, detail }`.** The detail is
-   decoded lossily and cut to 1024 bytes, the code to 128, on character boundaries, so a
+   decoded lossily and cut to 1024 bytes, the code to 128, on character boundaries; the journal
+   refuses a record whose text is beyond those limits, also when it reads the file back, so a
    procedure cannot put an arbitrary amount of text into an error or a journal frame. When the
    job has a journal, the failure is committed first, as a new record
    `Record::ProcedureFailed { at, code, detail }` appended at the end of the record enum (no
@@ -63,9 +67,11 @@ precedent is `IdentityMismatch`, which also ends the job as Failed with a possib
   earlier build does not decode into the new `RecoveryFacts`; the summary is not stored across
   builds yet.
 - A `Fail` is final even where a restart could have succeeded. That is the author's choice.
-- A crash after the last journaled primitive and before the failure record's commit leaves a
-  resumable journal. The window spans pure computation only, since no request is sent between the
-  last primitive and the `Fail`.
+- A crash after the `Fail` step and before the failure record's commit leaves a journal without
+  it. No request is sent in that window, and what the restart then redoes follows the existing
+  rules (the redo of ADR-229, or the continuation of ADR-271), as if the procedure had not yet
+  reached the `Fail`. A primitive outside a plan before the `Fail` leaves no step record (ADR-252),
+  so a restart may send it again.
 - A deterministic `VmError`, or the step limit, after the transfer-start marker is still redone by
   a restart until the resume limit; whether it gets the same terminal record is open.
 - The mapping of `JobError::ProcedureFailed` to the shared protocol's `JobState` and `FailureCode`

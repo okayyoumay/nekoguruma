@@ -24,6 +24,11 @@ use shared_proto::JobId;
 
 /// The journal format this build writes and reads.
 pub const FORMAT_VERSION: u32 = 1;
+/// The longest procedure failure code a journal record holds, in bytes: the longest code
+/// `Program::validate` accepts (ADR-280).
+pub const MAX_FAILURE_CODE_LEN: usize = diag_ir::MAX_FAILURE_CODE_LEN;
+/// The longest procedure failure detail a journal record holds, in bytes (ADR-280).
+pub const MAX_FAILURE_DETAIL_LEN: usize = 1024;
 /// The largest frame payload, in bytes. A record that would exceed it is refused.
 pub const MAX_FRAME: u32 = 1 << 20;
 
@@ -315,6 +320,13 @@ impl RecoveryFacts {
                 exit.complete = true;
             }
             Record::ProcedureFailed { at, code, detail } => {
+                // The runner bounds the text; a record read back is not trusted.
+                if code.is_empty() || code.len() > MAX_FAILURE_CODE_LEN {
+                    return Err("a procedure failure's code must be 1 to 128 bytes");
+                }
+                if detail.len() > MAX_FAILURE_DETAIL_LEN {
+                    return Err("a procedure failure's detail is too long");
+                }
                 if !after_last_step(at, self) {
                     return Err("a procedure failure must come after the last step");
                 }
@@ -1141,10 +1153,11 @@ mod tests {
 
     const STAGE: StageId = StageId(1);
 
-    /// Every kind of commit, in a write job's order, with a second attempt at the end.
+    /// Every kind of commit, in a write job's order, with a second attempt and a procedure failure
+    /// at the end.
     fn script<S: Store>(journal: &mut Journal<S>, mut after_each: impl FnMut(&Journal<S>)) {
         type Commit<S> = fn(&mut Journal<S>) -> Result<(), JournalError>;
-        let commits: [Commit<S>; 14] = [
+        let commits: [Commit<S>; 15] = [
             |j| j.commit_ecu_hardware_part_number(b"HW-1"),
             |j| j.commit_pre_erase_software_version(b"1.0.0"),
             |j| j.commit_step(at(2, 10), Some(b"vm-1")),
@@ -1159,6 +1172,8 @@ mod tests {
             |j| j.commit_transfer_start(STAGE, at(3, 30)),
             |j| j.commit_step(at(3, 30), Some(b"vm-2")),
             |j| j.commit_block(0),
+            // The job's last record (ADR-280).
+            |j| j.commit_procedure_failed(at(6, 40), "ERASE_REFUSED", "detail"),
         ];
         for commit in commits {
             commit(journal).expect("the script commits");
@@ -1202,7 +1217,11 @@ mod tests {
             reopened.state().last_vm_state,
             Some((at(3, 30), b"vm-2".to_vec()))
         );
-        assert_eq!(reopened.state().records, 14);
+        assert_eq!(reopened.state().records, 15);
+        assert_eq!(
+            facts.procedure_failed.map(|f| (f.at, f.code)),
+            Some((at(6, 40), "ERASE_REFUSED".to_owned()))
+        );
     }
 
     /// Every prefix of the file reads back as the state after its last whole frame: the
@@ -1246,6 +1265,23 @@ mod tests {
                     }
                 }
             }
+            // The failure is the last commit: whole, it is the fact; torn, it reads back as the
+            // state before it (ADR-280).
+            let [.., (before_len, before), (_, whole)] = boundaries.as_slice() else {
+                panic!("boundaries");
+            };
+            assert!(whole.facts.procedure_failed.is_some());
+            assert_eq!(before.facts.procedure_failed, None);
+            let torn = load(&bytes[..bytes.len() - 1], &key()).expect("torn tail");
+            assert_eq!((torn.len, &torn.state), (*before_len, before));
+            assert_eq!(
+                load(&bytes, &key())
+                    .expect("whole")
+                    .state
+                    .facts
+                    .procedure_failed,
+                whole.facts.procedure_failed
+            );
         }
     }
 
@@ -2267,6 +2303,44 @@ mod tests {
 
         // A record appended to the file behind it is corrupt, not ignored.
         append_entry(&dir, 2, Record::Block { block: 1 });
+        assert!(matches!(
+            Journal::read(&dir.0, &key()),
+            Err(JournalError::Corrupt { .. })
+        ));
+    }
+
+    /// A failure record's text is bounded on commit and on read-back (ADR-280).
+    #[test]
+    fn a_procedure_failure_with_unbounded_text_is_refused() {
+        let long_code = "c".repeat(MAX_FAILURE_CODE_LEN + 1);
+        let long_detail = "d".repeat(MAX_FAILURE_DETAIL_LEN + 1);
+        let mut j = memory();
+        for (code, detail) in [
+            ("", "d"),
+            (long_code.as_str(), "d"),
+            ("E", long_detail.as_str()),
+        ] {
+            assert!(matches!(
+                j.commit_procedure_failed(at(1, 1), code, detail),
+                Err(JournalError::Invariant(_))
+            ));
+        }
+        assert_eq!(j.state().records, 0);
+        let longest = "d".repeat(MAX_FAILURE_DETAIL_LEN);
+        j.commit_procedure_failed(at(1, 1), &"c".repeat(MAX_FAILURE_CODE_LEN), &longest)
+            .expect("at the limits");
+
+        let dir = TempDir::new();
+        drop(Journal::create(&dir.0, &key(), None, None).expect("create"));
+        append_entry(
+            &dir,
+            0,
+            Record::ProcedureFailed {
+                at: at(1, 1),
+                code: long_code,
+                detail: "d".to_owned(),
+            },
+        );
         assert!(matches!(
             Journal::read(&dir.0, &key()),
             Err(JournalError::Corrupt { .. })

@@ -154,7 +154,8 @@ without the identity.
 When the procedure ends itself as failed (`Op::Fail`, ADR-280), the runner commits a
 procedure-failure record before it returns `JobError::ProcedureFailed { pc, code, detail }`: the
 `Fail` instruction's position and the procedure's code and detail, the detail decoded lossily and
-the code and detail cut to 128 and 1024 bytes. It is the journal's last record: it must come
+the code and detail cut to 128 and 1024 bytes (`Program::validate` already keeps the code within
+128 bytes and non-empty). It is the journal's last record: it must come
 after the last step, and the journal refuses every record after it, in a commit and when it reads
 the file back (`RecoveryFacts::procedure_failed`). A job without a journal (a program without a
 plan, or `ngr-agent run`) ends in the same error with nothing recorded.

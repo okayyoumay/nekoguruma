@@ -2275,6 +2275,7 @@ fn a_subroutine_cannot_reach_a_plan() {
 #[test]
 fn a_plan_may_fail_at_any_stage() {
     let mut program = recovery_program();
+    program.constants = vec![b"E".to_vec()];
     program.code = vec![
         Op::Pop,
         Op::RoutineControl { routine: 1, sub: 1 },
@@ -2293,12 +2294,41 @@ fn a_plan_may_fail_at_any_stage() {
     assert_eq!(program.validate(), Ok(()));
 }
 
+/// The code of a `Fail` is checked statically: it must exist, be UTF-8 and be 1 to the limit
+/// in bytes (ADR-280).
+#[test]
+fn the_code_of_a_declared_failure_is_checked_statically() {
+    let program_with =
+        |constants: Vec<Vec<u8>>| prog(vec![Op::PushBytes(0), Op::Fail { code: 1 }], constants);
+    let long = vec![b'a'; MAX_FAILURE_CODE_LEN + 1];
+    for (constants, ok) in [
+        (vec![b"d".to_vec(), b"E".to_vec()], true),
+        (vec![b"d".to_vec(), vec![b'a'; MAX_FAILURE_CODE_LEN]], true),
+        (vec![b"d".to_vec()], false),
+        (vec![b"d".to_vec(), Vec::new()], false),
+        (vec![b"d".to_vec(), long], false),
+        (vec![b"d".to_vec(), vec![0xc3, 0x28]], false),
+    ] {
+        let expected = if ok {
+            Ok(())
+        } else {
+            Err(ProgramError::BadFailureCode { pc: 1 })
+        };
+        assert_eq!(
+            program_with(constants.clone()).validate(),
+            expected,
+            "{constants:?}"
+        );
+    }
+}
+
 /// A subroutine that ends in a declared failure never falls through into the plan, so it is not
 /// a subroutine that reaches the plan; without the failure it still is.
 #[test]
 fn a_subroutine_ending_in_fail_does_not_reach_the_plan() {
     let build = |first: Op| {
         let mut program = flow_program(|_| {});
+        program.constants = vec![b"E".to_vec()];
         program.code.insert(0, first);
         let b = &mut program.flash[0].boundaries;
         b.entry_pc += 1;

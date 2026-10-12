@@ -14,6 +14,17 @@ pub const IR_SCHEMA_VERSION: u32 = 2;
 
 /// The longest code, in bytes, that `Program::validate` accepts for a `Fail` (ADR-280).
 pub const MAX_FAILURE_CODE_LEN: usize = 128;
+/// The longest detail of a `Fail`, in bytes of text, that a caller keeps (ADR-280).
+pub const MAX_FAILURE_DETAIL_LEN: usize = 1024;
+
+/// The part of a `Fail`'s detail operand that [`Failure::detail`] carries: the operand is an
+/// unbounded stack value, and a caller keeps at most [`MAX_FAILURE_DETAIL_LEN`] bytes of its
+/// text. Lossy UTF-8 decoding never shrinks its input, so every byte of the decoded text up to
+/// that limit comes from this prefix; the three extra bytes let a character that straddles the
+/// limit decode as it would in full, before the caller cuts the text at a character boundary.
+pub fn failure_detail_prefix(detail: &[u8]) -> &[u8] {
+    &detail[..detail.len().min(MAX_FAILURE_DETAIL_LEN + 3)]
+}
 
 // ---------------------------------------------------------------- Instructions
 
@@ -617,7 +628,7 @@ impl Vm {
                 let code = std::str::from_utf8(constant(program, *code)?)
                     .map_err(|_| VmError::InvalidUtf8(*code))?
                     .to_owned();
-                let detail = self.bytes_operand()?.to_vec();
+                let detail = failure_detail_prefix(self.bytes_operand()?).to_vec();
                 return Ok(Executed::Failed(Failure { code, detail }));
             }
         }
@@ -886,7 +897,8 @@ pub enum StepOutcome {
 pub struct Failure {
     /// Chosen by the procedure; valid UTF-8, not otherwise limited by the VM.
     pub code: String,
-    /// Bytes built at run time. Not checked by the VM; may be invalid UTF-8.
+    /// Bytes built at run time, at most [`failure_detail_prefix`] of the operand, so a long
+    /// operand is not copied. Not checked by the VM; may be invalid UTF-8.
     pub detail: Vec<u8>,
 }
 

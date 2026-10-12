@@ -29,8 +29,11 @@ ended: a restart replays to the erase and sends it again.
    and is UTF-8 (`InvalidUtf8`), and the top of the stack exists (`StackUnderflow`) and is
    `Bytes` (`TypeMismatch`). It does not check the detail's encoding or length: a `VmError` at a
    `Fail` would become `JobError::Vm`, which the journal does not record, so a restart would
-   redo the transfer the procedure meant to end. The runner decodes and bounds the detail
-   instead (item 4).
+   redo the transfer the procedure meant to end. It hands over only the operand's first
+   1024 + 3 bytes (`failure_detail_prefix`), so a long run-time value is not copied: the kept text
+   is at most 1024 bytes, lossy decoding never shrinks its input, and the extra bytes let a
+   character straddling the limit decode whole. The runner decodes and bounds the detail
+   (item 4).
 3. **A new `StepOutcome::Failed(Failure { code, detail })` is returned with the state unchanged:**
    `pc` stays on the `Fail`, `steps` is not incremented and the stack is not popped. Stepping again
    gives the same outcome, as for a wait (ADR-233 item 4). `Fail` is not a diagnostic primitive:

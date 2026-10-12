@@ -971,6 +971,29 @@ fn fail_reports_the_code_and_detail_and_leaves_the_state_unchanged() {
 }
 
 #[test]
+fn fail_hands_over_only_a_bounded_prefix_of_a_long_detail() {
+    let long = vec![b'x'; 4 * MAX_FAILURE_DETAIL_LEN];
+    let program = prog(
+        vec![Op::PushBytes(1), Op::Fail { code: 0 }],
+        vec![b"E".to_vec(), long.clone()],
+    );
+    let mut vm = Vm::new(&program);
+    let mut host = MockHost::default();
+    assert!(matches!(
+        vm.step(&program, &mut host),
+        Ok(StepOutcome::Continue)
+    ));
+    match vm.step(&program, &mut host) {
+        Ok(StepOutcome::Failed(failure)) => {
+            assert_eq!(failure.detail, long[..MAX_FAILURE_DETAIL_LEN + 3]);
+        }
+        other => panic!("expected a failure, got {other:?}"),
+    }
+    // The operand itself stays whole on the stack.
+    assert_eq!(vm.state.stack, [Value::Bytes(long)]);
+}
+
+#[test]
 fn fail_inside_a_subroutine_ends_the_procedure_with_the_frame_intact() {
     let program = prog(
         vec![Op::Call(2), Op::Ret, Op::PushBytes(1), Op::Fail { code: 0 }],

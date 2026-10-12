@@ -28,7 +28,7 @@ pub const FORMAT_VERSION: u32 = 1;
 /// `Program::validate` accepts (ADR-280).
 pub const MAX_FAILURE_CODE_LEN: usize = diag_ir::MAX_FAILURE_CODE_LEN;
 /// The longest procedure failure detail a journal record holds, in bytes (ADR-280).
-pub const MAX_FAILURE_DETAIL_LEN: usize = 1024;
+pub const MAX_FAILURE_DETAIL_LEN: usize = diag_ir::MAX_FAILURE_DETAIL_LEN;
 /// The largest frame payload, in bytes. A record that would exceed it is refused.
 pub const MAX_FRAME: u32 = 1 << 20;
 

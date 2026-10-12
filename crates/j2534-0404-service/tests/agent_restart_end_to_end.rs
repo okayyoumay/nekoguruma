@@ -34,8 +34,8 @@
 //! Two more scenarios interrupt the first run the same way, but leave the worker alive: while the
 //! agent waits after block 4, the ECU loses power (`sim_ecu::Fault::PowerLoss`) or the VCI is
 //! unplugged (`disconnect_vci`, ADR-238), each handed to the worker through the control directory
-//! (`Env::fault_mid_run`). The next block's transfer gets no answer or fails on the lost device,
-//! and the run ends there with its guards and journal kept, as after a worker crash. Power comes
+//! (`Env::fault_mid_run`). The next block's transfer gets no answer, or finds the link offline,
+//! since the worker's receive poll met the lost device, and the run ends there with its guards and journal kept, as after a worker crash. Power comes
 //! back (`reconnect_ecu`) at the next run's first J2534 call, and that run's new worker finds the
 //! VCI plugged in again, since an unplugged VCI is the state of the worker process that saw it.
 //! Both complete the job in the same restart order.
@@ -76,6 +76,7 @@ mod restart;
 
 use std::time::Duration;
 
+use agent::host::HostError;
 use agent::inputs::{Encoding, ServiceField, ServiceSources};
 use agent::journal::{JobKey, StageId, StepRef};
 use diag_ir::{
@@ -134,7 +135,7 @@ const SW_VERSION: &[u8] = b"1.0.0";
 const BLOCKS: u32 = 8;
 const BLOCK_LEN: usize = 16;
 /// The agent, or in the worker-crash scenario its worker, is killed after this block of the
-/// first run.
+/// first run; the power-loss and VCI-disconnect scenarios inject their fault there.
 const KILL_AFTER_BLOCK: u32 = 4;
 /// How long each of the program's waits lasts: after block [`KILL_AFTER_BLOCK`], after the last
 /// block and after RequestTransferExit. The harness kills the agent or the worker, or injects a
@@ -579,8 +580,14 @@ fn a_worker_crashed_mid_transfer_is_restarted_like_a_killed_agent() {
     let env = Env::new("worker-crash", ENTRY, &ecu_config(60_000));
     let crash = env.crash_worker(&spec, KILL_AFTER_BLOCK, WAIT_FOR_BLOCK);
     // The `Wait` sends nothing, so the first request to the dead worker is the next block's
-    // transfer: a kill that came after the wait would fail here, not later.
-    let first_attempt = assert_interrupted_at_the_next_block(&env, &spec, &crash);
+    // transfer, which cannot reach it: a kill that came after the wait would fail here, not
+    // later.
+    let first_attempt = assert_interrupted_at_the_next_block(
+        &env,
+        &spec,
+        &crash,
+        |cause| matches!(cause, HostError::Rpc { status, .. } if status.code() == tonic::Code::Unavailable),
+    );
     assert!(
         crash.link_unconfirmed,
         "a link on a dead worker cannot be confirmed closed"
@@ -629,18 +636,21 @@ fn next_block_pc(spec: &JobSpec) -> u32 {
 
 /// Checks how an interrupted first run ended: on the next block's transfer, with a failed
 /// primitive (neither a result nor an on-site intervention, which would end the job instead of
-/// leaving it to the restart), with its guards kept, and with the journal at block
+/// leaving it to the restart) whose cause matches `cause`, with its guards kept, and with the journal at block
 /// [`KILL_AFTER_BLOCK`], no RequestTransferExit and no resume, before and after the run ended.
 /// Returns where the first attempt's transfer started.
 fn assert_interrupted_at_the_next_block(
     env: &Env,
     spec: &JobSpec,
     run: &restart::InterruptedRun,
+    cause: fn(&HostError) -> bool,
 ) -> StepRef {
     let next_block_pc = next_block_pc(spec);
     assert!(
-        matches!(run.result, Err(agent::JobError::Host { pc, .. }) if pc == next_block_pc),
-        "the first run should end on the next block's transfer at {next_block_pc}: {:?}",
+        matches!(&run.result, Err(agent::JobError::Host { pc, source })
+            if *pc == next_block_pc && cause(source)),
+        "the first run should end on the next block's transfer at {next_block_pc}, for the \
+         interruption's cause: {:?}",
         run.result
     );
     // The surviving job keeps its guards across the runs (design 8.2.5): nobody else can take
@@ -691,7 +701,10 @@ fn an_ecu_power_loss_mid_transfer_is_restarted_once_power_returns() {
         !run.link_unconfirmed,
         "the VCI is still there, so the link closes"
     );
-    let first_attempt = assert_interrupted_at_the_next_block(&env, &spec, &run);
+    let first_attempt = assert_interrupted_at_the_next_block(&env, &spec, &run, |cause| {
+        // The silent ECU leaves the transfer unanswered.
+        matches!(cause, HostError::NoResponse)
+    });
     // Power returns: the restart's worker applies it at its first J2534 call, before it sends
     // anything to the ECU.
     env.inject(r#"{"command": "reconnect_ecu"}"#);
@@ -734,7 +747,14 @@ fn a_vci_disconnect_mid_transfer_is_restarted_once_the_vci_is_back() {
         run.link_unconfirmed,
         "a link on a lost device cannot be confirmed closed"
     );
-    let first_attempt = assert_interrupted_at_the_next_block(&env, &spec, &run);
+    let first_attempt = assert_interrupted_at_the_next_block(&env, &spec, &run, |cause| {
+        // The worker's receive poll met the lost device and took the link offline, so the
+        // transfer finds no connected link.
+        matches!(
+            cause,
+            HostError::Rpc { status, .. } if status.code() == tonic::Code::FailedPrecondition
+        )
+    });
     // The probe loads the library in a process of its own, with the VCI present: the
     // disconnect belonged to the stopped worker's process.
     let before = env.probe();

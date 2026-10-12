@@ -474,8 +474,9 @@ impl Env {
 
     /// Runs the job's first run in this process, the agent's, and hands its worker `command`
     /// through the control directory once the journal records block `block`: `sim-vci` applies
-    /// it at the worker's next J2534 call, and the run ends with the error that call gives the
-    /// agent. The worker is stopped after the run ended. Must not run while a child of this
+    /// it at the worker's next J2534 call (its receive poll, while the program waits), and the
+    /// agent's run ends with the error its next request meets. The worker is stopped after the
+    /// run ended. Must not run while a child of this
     /// scenario is alive.
     pub fn fault_mid_run(
         &self,

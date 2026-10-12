@@ -6926,9 +6926,20 @@ fn toml_string(text: &str) -> String {
 pub fn write_definition(dir: &Path, name: &str, library: &Path) -> Result<PathBuf, std::io::Error> {
     let stem: String = name.bytes().map(|b| format!("{b:02x}")).collect();
     let file = dir.join(format!("{stem}.toml"));
-    // A definition names its library by absolute path; a relative one (for example from a
-    // relative `CARGO_TARGET_DIR`) is taken from the current directory.
-    let library = std::path::absolute(library)?;
+    // A definition names its library by an absolute path without `.` or `..` components; a
+    // relative one (for example from a relative `CARGO_TARGET_DIR`) is taken from the current
+    // directory, and `..` is removed by text, since the file need not exist.
+    let mut normalized = PathBuf::new();
+    for component in std::path::absolute(library)?.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other),
+        }
+    }
+    let library = normalized;
     let library = library.to_str().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -7006,17 +7017,25 @@ mod definition_tests {
         }
     }
 
-    /// A relative library path is written as the absolute path it names here.
+    /// A relative library path, also one with `.` and `..` components, is written as the
+    /// absolute path it names here.
     #[test]
     fn write_definition_makes_a_relative_library_absolute() {
         let dir = tempfile::tempdir().unwrap();
-        write_definition(dir.path(), "relative", Path::new("target/x.lib")).unwrap();
-        let resolved =
-            ngr_library_resolver::j2534_0404::resolve_in_dir(dir.path(), "relative").unwrap();
-        assert_eq!(
-            resolved.definition.library,
-            std::env::current_dir().unwrap().join("target/x.lib")
-        );
+        let here = std::env::current_dir().unwrap();
+        let expected = here.parent().unwrap().join("target").join("x.lib");
+        for (name, library) in [
+            ("relative", Path::new("../target/x.lib").to_path_buf()),
+            (
+                "dotted",
+                here.join(".").join("y").join("..").join("../target/x.lib"),
+            ),
+        ] {
+            write_definition(dir.path(), name, &library).unwrap();
+            let resolved = ngr_library_resolver::j2534_0404::resolve_in_dir(dir.path(), name)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(resolved.definition.library, expected, "{name}");
+        }
     }
 
     /// Names that differ only in characters a file name cannot hold, or only in case, get

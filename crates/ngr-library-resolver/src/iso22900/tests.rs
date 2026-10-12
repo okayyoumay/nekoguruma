@@ -1197,7 +1197,7 @@ mod registry {
 
         fn set_raw(&self, text: &str, expand: bool) {
             let value = RegValue {
-                bytes: registry_string(text),
+                bytes: registry_string(text).into(),
                 vtype: if expand { REG_EXPAND_SZ } else { REG_SZ },
             };
             self.0.set_raw_value("Root File", &value).unwrap();
@@ -1288,7 +1288,7 @@ mod registry {
         cv.0.set_value("ProgramFilesDir", &1u32).unwrap();
         assert_eq!(registry_folder(&cv.0, "ProgramFilesDir"), None);
         let expandable = RegValue {
-            bytes: registry_string(r"%windir%\x"),
+            bytes: registry_string(r"%windir%\x").into(),
             vtype: REG_EXPAND_SZ,
         };
         cv.0.set_raw_value("CommonFilesDir", &expandable).unwrap();

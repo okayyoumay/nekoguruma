@@ -888,6 +888,8 @@ version = "0.1.0"
 dependencies = [
  "j2534-0404",
  "j2534-0404-sys",
+ "ngr-library-resolver",
+ "tempfile",
 ]
 
 [[package]]

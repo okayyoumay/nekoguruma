@@ -6902,6 +6902,55 @@ fn search_directory(dir: &Path) -> Option<PathBuf> {
         .max_by_key(|path| std::fs::metadata(path).and_then(|m| m.modified()).ok())
 }
 
+/// A TOML basic string holding `text`, with the characters TOML gives a meaning there escaped.
+fn toml_string(text: &str) -> String {
+    let mut out = String::from("\"");
+    for c in text.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04X}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Writes a J2534 registration definition (design 7.1.1) into `dir` that names `library` as
+/// the VCI `name`, and returns the file's path. Tests point the debug-only
+/// `NGR_J2534_DEFINITION_DIR` override at `dir` (ADR-282) so a service resolves the mock
+/// library or `sim-vci` the way it resolves a vendor library. The file name is derived from
+/// `name`, so one directory can hold the definitions of several VCIs.
+pub fn write_definition(dir: &Path, name: &str, library: &Path) -> Result<PathBuf, std::io::Error> {
+    let stem: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let file = dir.join(format!("{stem}.toml"));
+    let library = library.to_str().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("library path is not UTF-8: {}", library.display()),
+        )
+    })?;
+    std::fs::write(
+        &file,
+        format!(
+            "Name = {}\nFunctionLibrary = {}\n",
+            toml_string(name),
+            toml_string(library)
+        ),
+    )?;
+    Ok(file)
+}
+
 /// Locate the built mock shared library under the Cargo target directory.
 pub fn mock_library_path() -> Result<PathBuf, std::io::Error> {
     if let Some(target_dir) = std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from) {
@@ -6940,6 +6989,28 @@ pub fn mock_library_path() -> Result<PathBuf, std::io::Error> {
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod definition_tests {
+    use super::*;
+
+    /// The definition reads back through the resolver with the name and library it was given,
+    /// also when both hold characters TOML escapes.
+    #[test]
+    fn write_definition_round_trips_through_the_resolver() {
+        let dir = tempfile::tempdir().unwrap();
+        let library = std::env::current_exe()
+            .unwrap()
+            .with_file_name("a \"b\" \\ c.lib");
+        for name in ["mock-lib", "Vendor \"X\" \\ 1"] {
+            write_definition(dir.path(), name, &library).unwrap();
+            let resolved = ngr_library_resolver::j2534_0404::resolve_in_dir(dir.path(), name)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(resolved.definition.name, name);
+            assert_eq!(resolved.definition.library, library);
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

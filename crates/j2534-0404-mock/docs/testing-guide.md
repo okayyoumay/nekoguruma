@@ -19,6 +19,12 @@ let lib_path = env!("CARGO_CDYLIB_FILE_J2534_0404_MOCK");  // set by build scrip
 let api = J2534Api0404::new(lib_path).expect("failed to load mock");
 ```
 
+To have a worker service find the mock (or `sim-vci`) the way it finds a vendor library, write
+a J2534 registration definition (design 7.1.1) with `write_definition(dir, name, library)`. It
+writes `<dir>/<name>.toml` with `Name` and `FunctionLibrary` (escaped as TOML strings) and
+returns the file's path. Then point the debug-only `NGR_J2534_DEFINITION_DIR` override at `dir`
+(ADR-282). `j2534-0404-service`'s tests do this alongside their `library_path` setting.
+
 Before each test, reset all mock state:
 
 ```rust

@@ -1,7 +1,7 @@
 # ADR-035: Consolidate the `find_library_path` Fallback into `resolve_library_path` on Each Registry Crate
 
 **Date:** 2026-07-02
-**Status:** Accepted
+**Status:** Accepted (the `find_library_path` step superseded by ADR-281)
 **Affects:** `iso22900-registry/src/lib.rs`, `j2534-0404-registry/src/lib.rs`, `iso22900-service/src/service/rpc.rs`, `j2534-0404-service/src/service.rs`
 
 ## Context

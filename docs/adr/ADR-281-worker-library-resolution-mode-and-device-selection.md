@@ -1,0 +1,93 @@
+# ADR-281: Worker Library Resolution Has No Config-File Path, the Agent Passes the Mode, and One J2534 Device Is One Worker
+
+**Date:** 2026-10-12
+**Status:** Accepted
+**Affects:** `docs/system-architecture.md` (3.4, 7.1, 7.2, 8.2.6), `docs/j2534-0404-architecture.md`, `crates/vci-service-config` (`find_library_path`, `list_configured_library_paths`, docs), `crates/j2534-0404-registry`, `crates/iso22900-registry`, `crates/j2534-0404-service`, `crates/iso22900-service`, `crates/agent` (`launch.rs`, `link.rs`); ADR-107, ADR-228, ADR-270, ADR-278
+
+## Context
+
+Design 7.1 and 7.2 fix where a library is found: the Linux J2534 definition directory, the
+Windows registry and the D-PDU API root description file, all at locations fixed at build time,
+with a runtime override in debug builds only (ADR-228 item 1). The shared resolver
+`ngr-library-resolver` implements those chains and the two 7.2 checks (ADR-270, ADR-278). Three
+questions were left open before the worker services and the agent could switch over to it.
+
+1. **The `library_path` override.** The worker services' `config.toml` can name a library path
+   per library (`config.apis.<api>.libs."<lib>".library_path`). `resolve_library_path` in both
+   registry crates reads it before the registry or root file, and the agent's `lookup` mirrors
+   that order. The shared resolver does not read it. A path taken from a configuration file
+   bypasses the fixed locations of 7.1 and the checks that 7.2 attaches to the files that name
+   a library.
+2. **Device mode or user mode.** The checks report and the caller decides (ADR-270 item 5,
+   ADR-278 item 4): device mode refuses a failing library, user mode reports and loads. The
+   worker runs the checks itself immediately before loading (ADR-228 item 4), but its startup
+   argument carries only the library name, and nothing tells it which mode applies.
+3. **Several devices behind one J2534 library.** The `modules` entries of ADR-107 select a
+   device by `pname`, but ADR-107 item (b) keeps one open device per worker process and the
+   agent refuses a worker whose `GetModuleIds` returns more than one row. The maintainer wants
+   each entry usable as a separate device, connected at the same time.
+
+## Decision
+
+1. **The `library_path` override is removed as a resolution source.** A worker resolves its
+   library only through the chains of 7.1: the Linux definition directory, the Windows registry
+   and the D-PDU API root description file. The agent's `lookup` resolves through the same
+   shared resolver, with no override of its own. Tests use the resolvers' debug-only overrides
+   (the definition directory of `j2534_definition_dir()`, the root file of `pdu_api_root_file()`,
+   or `resolve_in_dir` / `resolve_in_root_file`) with test definitions that name `sim-vci` or
+   the mock library. The `libs."<lib>"` section of `config.toml` itself stays: it holds
+   `modules`, `can_channel_mode`, `vendor_ioctls`, `vendor_struct_types` and logging, keyed by
+   the same library name the resolver resolves. `find_library_path` and
+   `list_configured_library_paths` and their readers go with the resolver adoption work.
+2. **The agent passes the mode as a startup argument.** The agent knows its device's mode,
+   which is fixed to exactly one of the two (design 3.3, 6.2), and passes it to the worker
+   next to the library name. The worker does not infer it and no configuration file sets it.
+   Device mode refuses a library that fails a 7.2 check; user mode reports the findings and
+   loads (ADR-270 item 5, ADR-278 item 4).
+3. **One J2534 device is one worker process.** For a library with several `modules` entries,
+   the agent starts a separate worker per device and passes the library name plus the entry's
+   `label` as startup arguments. That worker opens only that module, with the entry's `pname`
+   as `PassThruOpen`'s argument (ADR-107 item (a)), and the agent links each worker as its own
+   device. ADR-107 item (b) stays: a worker has one open device and no per-module state
+   partition; simultaneous use comes from several worker processes. When no label is passed the
+   worker behaves as before (the first entry, or the synthesized default entry when `modules` is
+   absent).
+
+## Alternatives considered
+
+- **Keep `library_path` as a resolution source (item 1).** It is convenient for tests and for
+  libraries with no definition. Rejected: it gives a configuration file a say over which file is
+  loaded that the fixed locations were meant to remove, and the device-mode checks of 7.2 do not
+  cover it; the shared resolver would have to grow a second, unchecked path.
+- **Keep it as a debug-only override (item 1).** Rejected as redundant: the resolvers already
+  have debug-only overrides for their naming files (ADR-228 item 1), and a test definition that
+  names `sim-vci` exercises the real resolution chain instead of skipping it.
+- **A setting in `config.toml` for the mode (item 2).** Rejected: the mode is a property of the
+  device that the agent already holds, a second copy can disagree with it, and a file that an
+  administrator edits separately from the agent's installation is the wrong place to decide
+  whether checks are enforced.
+- **The worker infers the mode (item 2)** from its account, its parent or its environment.
+  Rejected: each inference is a heuristic that can fail open, and the worker then enforces a
+  policy it does not own.
+- **One worker opens several devices at once (item 3).** Rejected for now: it revises ADR-107
+  item (b) and needs the worker's state (`device_id`, module state, shared channels, logical
+  links, subscriptions, the poll tasks) partitioned per module, which ADR-107 judged a much
+  larger change than selecting one device.
+
+## Consequences
+
+- Libraries that no definition, registry entry or root file names cannot be loaded by a worker,
+  not even for a test. Tests need a definition or root file; the debug-only overrides provide
+  one without touching the machine's locations.
+- A `library_path` key left in an existing `config.toml` has no effect once the code is
+  changed.
+- The startup argument contract of both workers gains the mode, and the J2534 worker gains an
+  optional module label. The agent starts one J2534 worker per `modules` entry and stops
+  refusing a worker only for having several rows once that is implemented; the worker's
+  `GetModuleIds` still lists every entry, which the agent reads to find the one it asked for.
+- Some vendor DLLs may not support being loaded in two processes at once, for example when
+  they take a process-wide lock on a driver. Such a library stays limited to one device at a
+  time; this is a property of the library and is not detected by the agent.
+- Each running J2534 device costs one worker process, which refines design 3.4's one process per library for J2534. The per-VCI lock (design 8.8) stays per device.
+- Implementation work (the resolver adoption, removing the key and its readers, the startup
+  arguments, the agent's per-device workers) is tracked in the backlog, not here.

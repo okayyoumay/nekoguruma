@@ -155,7 +155,7 @@ Each device's operating mode is fixed to exactly one of "user mode" or "device m
 
 ### 3.4 Worker
 
-- One process per library, a dedicated thread per VCI
+- One process per library, a dedicated thread per VCI. A J2534 library with several configured devices runs one process per device, so each device is its own worker (ADR-281)
 - Absorbs differences in libraries' data-passing methods and always outputs externally as a "timestamped sample sequence"
 - Splits a single data source into a recording path that tolerates no loss and a monitoring path that drops old data when delayed
 - Implemented in coarse-grained operation units (acquire / write / read-back verification)
@@ -558,6 +558,7 @@ Confirmation level (6.3) and two-person approval. The server decides the require
 - Expand a `REG_EXPAND_SZ` value only from a fixed list of system folder names, taking each folder from the HKLM value of the same registry view (so the view's bitness decides it), never from the process environment; any other variable is refused, and the result must be an absolute local path (ADR-277)
 - Also follow and verify the chain of paths referenced by configuration files
 - Redo discovery at every job start; no change-monitoring mechanism is kept
+- No configuration file names a library path: the chains above are the only sources, and the per-library settings in a worker service's `config.toml` (modules, CAN channel mode, vendor IOCTLs, logging) are keyed by the library name that the chain resolves (ADR-281)
 - A registration definition indicates where the library is. How that VCI is handled (capabilities, quirks, ABI overrides, COMPARAM mapping) is declared in the VCI profile (9.3)
 
 #### 7.1.1 J2534 Registration Definition on Linux (Proprietary Specification)
@@ -620,6 +621,7 @@ Basis for the inference: AArch64's AAPCS64 matches x86_64's System V ABI in that
 - In device mode, refuse to load if writable, and report the reason
 - If an Authenticode signature is present, also verify the signer. A signature is present when the PE header's security data directory is not empty (an embedded signature; catalog signatures are not looked at). It is then verified against the operating system's trust store with no user interface, no revocation check (switched off explicitly, so the machine-wide policy cannot enable it) and no network access; a time-stamped signature outlives its certificate's expiry. The PE headers are located through the DOS header's pointer, wherever they are in the file. The check protects nothing against someone who can write the file, since stripping the signature makes it unsigned, which passes; the writability check above is the gate. Any failure, including a verified signature whose signer identity cannot be read, is a finding on the library that device mode refuses and user mode reports (the check's error carries the verdict and the open file, so user mode loads the file it checked); no signer is pinned, and a successful check reports the signer's name and SHA-256 thumbprint. Other platforms have no signer check (ADR-278)
 - Load by absolute path (`LoadLibraryEx` / `dlopen`)
+- The agent starts a worker with the library name, the device's operating mode (6.2) and, for J2534, optionally the label of one `modules` entry. The worker does not infer the mode: in device mode it refuses a library that fails a check above, in user mode it reports the findings and loads (ADR-281). A J2534 worker started with a module label opens only that module, so each configured device of one library is its own worker process and several can be connected at the same time; a vendor library that cannot be loaded in two processes at once limits itself to one device at a time (ADR-281)
 
 **Trusted locations**
 
@@ -842,7 +844,7 @@ For each cause of interruption, the resume origin and whether resumption is poss
 - **Content addressing**: Each file is identified by its hash. Definitions shared across vehicle models are naturally deduplicated, which also provides differential delivery
 - **Lazy fetching**: The agent fetches and caches only the manifest and the target variants
 - **Unit of signing**: The manifest is signed, and the manifest holds the hash of each file (the same structure as artifacts)
-- **Version compatibility**: The IR carries a schema version, and the agent reports supported versions in `capabilities`. The runtime also checks the version, preventing accidents where an old agent executes new IR
+- **Version compatibility**: The IR carries a schema version, and the agent reports supported versions in `capabilities`. The runtime also checks the version, preventing accidents where an old agent executes new IR. Until the first release, breaking changes to the IR schema and to the journal's stored state are allowed with no compatibility path for older schema versions, since nothing is stored outside the repository
 
 ### 8.3 Declaration of the Supported Subset
 

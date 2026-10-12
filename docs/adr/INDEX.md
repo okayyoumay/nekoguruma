@@ -35,9 +35,9 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-029](ADR-029-library-path-config-override.md) | `library_path` Config Override for J2534 v04.04 Library Resolution | Accepted | `vci-service-launcher` config.rs, `j2534-0404-service` service |
 | [ADR-030](ADR-030-iso22900-library-path-config-override.md) | Remove `ISO22900_ROOT_DESCRIPTION_FILE` Env Var; Extend `library_path` Config Override to `iso22900-service` | Accepted | `iso22900-registry` lib.rs, `iso22900-service` rpc.rs |
 | [ADR-033](ADR-033-vci-service-config-package-extraction.md) | Extract Config File Loading into `vci-service-config` | Accepted (kept default config locations superseded by ADR-228) | `vci-service-launcher`, `vci-service-config` (new crate) |
-| [ADR-034](ADR-034-library-path-lookup-wired-into-registries.md) | Wire `library_path` Lookup into `iso22900-registry` / `j2534-0404-registry`; Add `list_configured_libraries` for `vci-service-manager` Discovery | Accepted | `vci-service-config`, `iso22900-registry`, `j2534-0404-registry`, `iso22900-service`, `j2534-0404-service`, `vci-service-manager` |
-| [ADR-035](ADR-035-registry-resolve-library-path-consolidation.md) | Consolidate the `find_library_path` Fallback into `resolve_library_path` on Each Registry Crate | Accepted | `iso22900-registry`, `j2534-0404-registry`, `iso22900-service`, `j2534-0404-service` |
-| [ADR-036](ADR-036-registry-enumerate-libraries-config-merge.md) | `enumerate_libraries` — Merge Config-File Libraries into Registry Enumeration | Accepted | `vci-service-config`, `iso22900-registry`, `j2534-0404-registry`, `vci-service-manager` |
+| [ADR-034](ADR-034-library-path-lookup-wired-into-registries.md) | Wire `library_path` Lookup into `iso22900-registry` / `j2534-0404-registry`; Add `list_configured_libraries` for `vci-service-manager` Discovery | Accepted (the `library_path` lookup superseded by ADR-281) | `vci-service-config`, `iso22900-registry`, `j2534-0404-registry`, `iso22900-service`, `j2534-0404-service`, `vci-service-manager` |
+| [ADR-035](ADR-035-registry-resolve-library-path-consolidation.md) | Consolidate the `find_library_path` Fallback into `resolve_library_path` on Each Registry Crate | Accepted (the `find_library_path` step superseded by ADR-281) | `iso22900-registry`, `j2534-0404-registry`, `iso22900-service`, `j2534-0404-service` |
+| [ADR-036](ADR-036-registry-enumerate-libraries-config-merge.md) | `enumerate_libraries` — Merge Config-File Libraries into Registry Enumeration | Superseded by ADR-281 | `vci-service-config`, `iso22900-registry`, `j2534-0404-registry`, `vci-service-manager` |
 | [ADR-037](ADR-037-stmin-override-unit-conversion.md) | CP_StMinOverride ↔ J2534 STMIN_TX Unit Conversion | Accepted | `j2534-0404-service` comparam_id, rpc_link, events |
 | [ADR-038](ADR-038-msg-filter-type-protocol-restriction.md) | Message Filter Type Restricted by Protocol (ISO15765 vs. Others) | **Superseded by ADR-039** | `j2534-0404-service` rpc_link, rpc_misc |
 | [ADR-039](ADR-039-point-to-point-flow-control-filter.md) | Point-to-Point FLOW_CONTROL_FILTER from UniqueRespIdTable Addressing | Accepted (pass-all fallback amended by ADR-068; removed by ADR-122) | `j2534-0404-service` service, rpc_link, rpc_misc, `j2534-0404-mock` |
@@ -105,7 +105,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-104](ADR-104-p3phys-p3func-p3min-name-resolution-fix.md) | Fix CP_P3Phys/CP_P3Func/CP_P3Min Name Resolution — Not Aliases | Accepted | `j2534-0404-service` names, rpc_link |
 | [ADR-105](ADR-105-rich-error-model-replaces-get-last-error.md) | Rich Error Model via grpc-status-details-bin Replaces GetLastError | Accepted (amended by ADR-112; SET_PROG_VOLTAGE mapping corrected by conformance-audit fix A2-21) | `vci-service-interface`, `iso22900-service`, `j2534-0404-service`, `j2534-0500-service` |
 | [ADR-106](ADR-106-static-conflicting-resources-table-scan.md) | Static Table Scan Replaces Live-Connection Scan for GetConflictingResources | Accepted | `j2534-0404-service` rpc_link, resources, names |
-| [ADR-107](ADR-107-j2534-0404-multi-module-config-selection.md) | Config-Declared Multi-Module Device Selection for J2534 v04.04 | Accepted | `vci-service-config`, `j2534-0404`, `j2534-0404-service` service, config, rpc_module, rpc_link, error |
+| [ADR-107](ADR-107-j2534-0404-multi-module-config-selection.md) | Config-Declared Multi-Module Device Selection for J2534 v04.04 | Accepted (Decision (b) kept; simultaneous devices come from one worker per device, ADR-281) | `vci-service-config`, `j2534-0404`, `j2534-0404-service` service, config, rpc_module, rpc_link, error |
 | [ADR-108](ADR-108-enum-newtype-underlying-type-is-target-abi-dependent.md) | Bindgen Enum-Newtype Underlying Type Is Target-ABI-Dependent — Always Cast, Never Assume `u32` | Accepted | `iso22900-sys` bindings (all targets), `iso22900` safety.rs, lib.rs, item/data/event.rs, item/data/io.rs |
 | [ADR-110](ADR-110-rsc-locked-error-event-replaces-synchronous-lock-rejection.md) | `PDU_ERR_EVT_RSC_LOCKED` Error Event Replaces Synchronous Physical-ComParam-Lock Rejection (Supersedes ADR-044) | Accepted | `j2534-0404-service` rpc_primitive, rpc_link, comparam_support, events |
 | [ADR-111](ADR-111-coptstartcomm-optional-message-transmit.md) | CoptStartcomm's Optional Message Is Transmitted, Not Discarded | Accepted | `j2534-0404-service` service, rpc_primitive, events |
@@ -217,7 +217,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-224](ADR-224-vci-service-manager-instance-lifecycle-single-flight.md) | `vci-service-manager` Instance Lifecycle Gains a Single-Flight State Machine | Accepted | `vci-service-manager` main |
 | [ADR-226](ADR-226-vci-service-manager-client-authorization.md) | `vci-service-manager` Client Authorization — Peer-Identity Trust Root over Local IPC, Manager-Minted Session Tokens for TCP | Accepted | `vci-service-manager` main, Cargo.toml, docs |
 | [ADR-227](ADR-227-windows-workers-target-gnullvm.md) | Windows Workers Target `*-pc-windows-gnullvm`, Cross-Built on Linux | Accepted | CI, `.cargo/config.toml`, worker target docs |
-| [ADR-228](ADR-228-fixed-library-resolution-locations.md) | Library Resolution from Fixed Locations, Shared by Agent and Worker | Accepted (the Linux definition format and the shared crate's name settled by ADR-266) | design 7.1.1 / 7.2 / 7.3, `vci-discovery`, `vci-service-config`, worker services |
+| [ADR-228](ADR-228-fixed-library-resolution-locations.md) | Library Resolution from Fixed Locations, Shared by Agent and Worker | Accepted (the Linux definition format and the shared crate's name settled by ADR-266; item 3 extended by ADR-281 with the mode and a J2534 module label; no library path is read from the worker's configuration file since ADR-281) | design 7.1.1 / 7.2 / 7.3, `vci-discovery`, `vci-service-config`, worker services |
 | [ADR-229](ADR-229-interrupted-transfer-restarts-from-request-download.md) | Interrupted Transfers Restart from RequestDownload; Write Procedures Are a Reference Implementation | Accepted (item 1's `recovery_required_from_step` replaced by ADR-245; item 2's failed confirmation after an accepted reset gets one passive retry since ADR-265; item 2 step 3's post-transfer completion counts only for the interrupted pass since ADR-269) | design 8.2.5 / 16.1, `agent` journal, `sim-ecu` |
 | [ADR-230](ADR-230-backlog-loop-serialization-and-claims.md) | Backlog Loop Runs One Item at a Time, with PR-Based Claims and Run State | Accepted (Decision items 1-2's claim set extended to `codeql-alerts` PRs by ADR-243; Decision item 5 superseded by ADR-249; Decision items 3 and 6 amended by ADR-279 for Dependabot replacements) | `.claude/skills/backlog-loop`, `next-task`, `scripts/classify-pr-risk.sh` |
 | [ADR-231](ADR-231-agent-mints-worker-tokens-in-process.md) | The Agent Mints Worker Bearer Tokens In-Process | Accepted | `worker-host` client, `vci-service-interface` token |
@@ -259,7 +259,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-267](ADR-267-restart-identity-recheck.md) | The Restart Re-reads the Identity in the Default Session and Promotes There Too | Accepted | `agent` restart, runner |
 | [ADR-268](ADR-268-restart-intended-software-version.md) | The Job Names Its Intended Software Version, and the Journal Records It | Accepted (item 5's completion counts only for the interrupted pass since ADR-269) | `agent` journal, runner, restart |
 | [ADR-269](ADR-269-restart-completion-of-the-interrupted-pass.md) | Only the Interrupted Pass's Completion Sends a Restart to Read-Back Verification | Accepted | `agent` restart, design 8.2.5 |
-| [ADR-270](ADR-270-library-writability-check.md) | What "Writable by Regular Users" Means for the Pre-Load Check | Accepted (the D-PDU API root file, MDF and CDF are naming files under item 5, ADR-277) | `ngr-library-resolver`, design 7.2 |
+| [ADR-270](ADR-270-library-writability-check.md) | What "Writable by Regular Users" Means for the Pre-Load Check | Accepted (the D-PDU API root file, MDF and CDF are naming files under item 5, ADR-277; item 5's mode is passed by the agent since ADR-281) | `ngr-library-resolver`, design 7.2 |
 | [ADR-271](ADR-271-restart-read-back-verification.md) | After a Restart, Read-Back Verification Is the State Check's Match, and the Program Continues from the Plan's End | Accepted (item 2's end step is a step from inside the plan, and its read-back follows ADR-274; item 4 needs every section over a primitive outside the plans to be Safe when sections overlap, and none of them marked RecoveryRequired; it also covers the steps of the plan that begins at the verified plan's end, from that entry up to its erase or its recovery-required point, whichever comes first, which the continuation runs before any record of that plan: for a plan that allows a restart they are the replay of ADR-273 item 5 (an Unsafe section refuses, and Program::validate already excludes one), for a plan that does not, no replay is sanctioned and they are checked like the primitives outside the plans; item 5 also covers a run start that made the end state stale) | `agent` restart, runner, journaling, design 5.6 / 8.2.5 |
 | [ADR-272](ADR-272-journal-run-start-record.md) | Every Journaled Run Records the State It Starts From | Accepted (item 2's open point for runs not from instruction 0 settled for the replay of step 4 by ADR-273; item 3 amended by ADR-274: the entry state is the newest state standing at the entry, which is the newest state or, when the newest is the current attempt's end-state record and the interruption point is that step, the one before it; the replay commits a run start since ADR-274) | `agent` journal, runner, restart |
 | [ADR-273](ADR-273-restart-replay-to-the-erase.md) | The Restart Replays the Program from the Entry State up to the Erase | Accepted (item 4's stop at the erase is now preceded by step 4b-3's second precondition check, `restart::check_before_erase`, which ends the job in `PreconditionNotMetBeforeErase` when a condition fails; item 4's `RestartOrderUnavailable` stop superseded by ADR-276, which goes on with the erase; item 2 superseded by ADR-274: the replay commits a run start carrying the entry state; item 5's reading applies to a plan that allows a restart: for the continuation of ADR-271, the steps of a plan that allows none and begins at the verified plan's end are checked like the primitives outside the plans, since no replay is sanctioned for it) | `agent` runner, restart, journaling |
@@ -267,9 +267,10 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-275](ADR-275-optional-real-hardware-checks.md) | Real-Hardware Checks Are Optional, Opt-In Tests Bounded by a Target Class | Accepted | design 13.5, test layout, `sim-ecu` |
 | [ADR-276](ADR-276-restart-redo-from-the-erase.md) | A Redone Transfer Goes On from the Erase as a First Run | Accepted (item 3's gap closed by ADR-280: the procedure can end the job as failed) | `agent` restart, runner, design 8.2.5 |
 | [ADR-277](ADR-277-dpdu-root-file-interpretation.md) | D-PDU API Root Description File Interpretation | Accepted | `ngr-library-resolver`, design 7.1 / 7.2 |
-| [ADR-278](ADR-278-library-signer-check.md) | Library Signer Check | Accepted | `ngr-library-resolver`, design 7.2 |
+| [ADR-278](ADR-278-library-signer-check.md) | Library Signer Check | Accepted (item 4's mode is passed by the agent since ADR-281) | `ngr-library-resolver`, design 7.2 |
 | [ADR-279](ADR-279-backlog-loop-handles-dependabot-pull-requests.md) | The Backlog Loop Handles Open Dependabot Pull Requests First | Accepted | `.claude/skills/backlog-loop` |
 | [ADR-280](ADR-280-diag-fail-instruction.md) | `diag.fail` Is a Terminal `Fail` Instruction, Journaled so a Restart Does Not Resume the Job | Accepted | `diag-ir`, `agent` runner, journal, restart; design 5.6 / 8.2.4 / 8.2.5 |
+| [ADR-281](ADR-281-worker-library-resolution-mode-and-device-selection.md) | Worker Library Resolution Has No Config-File Path, the Agent Passes the Mode, and One J2534 Device Is One Worker | Accepted | design 7.1 / 7.2, `j2534-0404-service`, `iso22900-service`, `agent`, `vci-service-config` |
 
 ## Status Legend
 
@@ -555,16 +556,17 @@ the predecessor repository these ADRs came from.
 - ADR-047
 - ADR-052 (client-side `endpoints` selection contract conformance fixed by ADR-220)
 - ADR-073 (debug-only environment-override pattern reused by ADR-221 and ADR-228)
-- ADR-107 (Decision (d) amended by ADR-131; Accepted Residual #1 closed by ADR-132)
+- ADR-107 (Decision (d) amended by ADR-131; Accepted Residual #1 closed by ADR-132; simultaneous devices come from one worker per device, ADR-281)
 - ADR-132
 - ADR-160 (Consequences' `CAN_MIXED_FORMAT_ALL_FRAMES` deferral fulfilled by ADR-217)
 - ADR-217
 - ADR-220 (Decision item 5's `proxy_to_instance` mechanism removed by ADR-221)
 - ADR-223
 - ADR-224
-- ADR-228 (the Linux definition format and the shared crate's name settled by ADR-266)
+- ADR-228 (the Linux definition format and the shared crate's name settled by ADR-266; item 3 extended and the configuration file no longer names a library, ADR-281)
 - ADR-240
 - ADR-266
+- ADR-281
 
 ### vci-service-manager Process Startup
 - ADR-073
@@ -575,11 +577,12 @@ the predecessor repository these ADRs came from.
 - ADR-220 (`grpc_endpoint`/`SocketAddr` clients now connect to directly, per this ADR's proxy removal)
 - ADR-221 (Decision item 7's route-preservation for `DELETE /vci-libs/{id}/endpoint` superseded by ADR-225; native-client-enrollment and unauthenticated-admin-route accepted residuals closed by ADR-226; manager-side token minting superseded for the agent by ADR-231)
 - ADR-226
-- ADR-228 (the Linux definition format and the shared crate's name settled by ADR-266)
+- ADR-228 (the Linux definition format and the shared crate's name settled by ADR-266; item 3 extended and the configuration file no longer names a library, ADR-281)
 - ADR-231
-- ADR-270 (the D-PDU API root file, MDF and CDF are naming files under item 5, ADR-277)
+- ADR-270 (the D-PDU API root file, MDF and CDF are naming files under item 5, ADR-277; item 5's mode is passed by the agent since ADR-281)
 - ADR-277
-- ADR-278
+- ADR-278 (item 4's mode is passed by the agent since ADR-281)
+- ADR-281
 
 ### FFI Bindings & Target ABI
 - ADR-108

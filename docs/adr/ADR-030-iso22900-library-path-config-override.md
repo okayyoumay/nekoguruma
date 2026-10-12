@@ -1,7 +1,7 @@
 # ADR-030: Remove `ISO22900_ROOT_DESCRIPTION_FILE` Env Var; Extend `library_path` Config Override to `iso22900-service`
 
 **Date:** 2026-07-01
-**Status:** Accepted
+**Status:** Accepted (the `library_path` wiring into `iso22900-service` superseded by ADR-281; the env var removal stands)
 **Affects:** `iso22900-registry/src/lib.rs`, `iso22900-service/src/service/rpc.rs`, `iso22900-service/tests/grpc_mock.rs`, `iso22900-service/tests/stdio_startup.rs`, `iso22900-registry/tests/arch_field.rs` (removed)
 
 ## Context

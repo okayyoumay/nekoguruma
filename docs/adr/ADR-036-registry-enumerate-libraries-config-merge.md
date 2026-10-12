@@ -1,7 +1,7 @@
 # ADR-036: `enumerate_libraries` — Merge Config-File Libraries into Registry Enumeration
 
 **Date:** 2026-07-02
-**Status:** Accepted
+**Status:** Superseded by ADR-281
 **Affects:** `vci-service-config/src/lib.rs`, `iso22900-registry/src/lib.rs`, `j2534-0404-registry/src/lib.rs`, `j2534-0404-registry/Cargo.toml`, `vci-service-manager/src/main.rs`
 
 ## Context

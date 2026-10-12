@@ -1,7 +1,7 @@
 # ADR-034: Wire `library_path` Lookup into `iso22900-registry` / `j2534-0404-registry`; Add `list_configured_libraries` for `vci-service-manager` Discovery
 
 **Date:** 2026-07-02
-**Status:** Accepted
+**Status:** Superseded by ADR-281
 **Affects:** `vci-service-config/src/lib.rs`, `iso22900-registry/src/lib.rs`, `iso22900-registry/Cargo.toml`, `j2534-0404-registry/src/lib.rs`, `j2534-0404-registry/Cargo.toml`, `iso22900-service/src/service/rpc.rs`, `j2534-0404-service/src/service.rs`, `vci-service-manager/src/main.rs`, `vci-service-manager/Cargo.toml`
 
 ## Context

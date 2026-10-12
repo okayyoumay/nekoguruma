@@ -1,7 +1,7 @@
 # ADR-019: CLL/COP Event Ordering on Disconnect and Hard Error
 
 **Date:** 2026-06-29  
-**Status:** Accepted  
+**Status:** Accepted (the module handle in events is the selected one on a worker started with a label, ADR-281)  
 **Supersedes:** ADR-013 (state-transition decision), ADR-015 (state-transition decision), ADR-016 (state-transition decision)  
 **Affects:**
 - `j2534-0404-service/src/service/events.rs` (`poll_rx`, `poll_rx_and_check_match`, `wait_for_expected_response`, new `handle_channel_hard_error`)

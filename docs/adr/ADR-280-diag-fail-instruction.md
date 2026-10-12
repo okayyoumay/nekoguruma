@@ -1,7 +1,7 @@
 # ADR-280: `diag.fail` Is a Terminal `Fail` Instruction, Journaled so a Restart Does Not Resume the Job
 
 **Date:** 2026-10-12
-**Status:** Accepted
+**Status:** Accepted (schema-compatibility consequence relaxed by ADR-281 item 4)
 **Affects:** `diag-ir` (`src/lib.rs`, `src/recovery.rs`), `agent` (`src/runner.rs`, `src/journal.rs`, `src/journaling.rs`, `src/restart.rs`, `src/policy.rs`, `docs/ngr-agent.md`), `diag-frontend` (`docs/starlark-subset.md`), `docs/system-architecture.md` 5.6, 8.2.4, 8.2.5; ADR-233, ADR-244, ADR-254, ADR-276
 
 ## Context
@@ -59,7 +59,10 @@ ended: a restart replays to the erase and sends it again.
    another run holds still ends in `JournalError::InUse` first (ADR-255 item 7). The checks every
    run makes before that (the program's schema and validity, the reprogramming slot, guards
    whose link is not confirmed closed, ADR-258) still come first; they delay the verdict, they
-   do not change it.
+   do not change it. The guard for a link that is not confirmed closed (ADR-258) comes before the
+   recorded failure on purpose: while the worker may still be alive and holding the VCI, the
+   agent reports the unconfirmed link, and once the worker is gone the mark clears and the next
+   resume reports the recorded failure.
 6. **A flash plan may contain `Fail` anywhere, and it ends a path.** The plan validator treats it
    like `Ret` when it follows execution (a subroutine that ends in `Fail` does not reach a plan
    after it), but `Call` and `Ret` stay refused inside a plan.
@@ -83,7 +86,9 @@ precedent is `IdentityMismatch`, which also ends the job as Failed with a possib
   so with version 3 a program stored at version 2 is refused although it encodes the same, and a
   job interrupted under an agent of version 2 cannot be resumed by one of version 3 (its entry
   state is refused, which asks for on-site intervention). No program or journal of version 2 is
-  stored outside this repository yet; accepting a range of versions is left until one is.
+  stored outside this repository yet. Until the first release, breaking changes to the IR schema
+  and to the journal's stored state are accepted with no compatibility path for older schema
+  versions (design 8.2.6, ADR-281 item 4), so accepting a range of versions is not needed before then.
 - A crash after the `Fail` step and before the failure record's commit leaves a journal without
   it. No request is sent in that window, and what the restart then redoes follows the existing
   rules (the redo of ADR-229, or the continuation of ADR-271), as if the procedure had not yet

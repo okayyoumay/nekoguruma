@@ -84,7 +84,7 @@ flowchart TB
 
     subgraph EP["Installed device"]
         AG["Agent (64-bit)<br/>Discovery / Job execution / Journal"]
-        WK["Worker (per ABI, one process per library)"]
+        WK["Worker (per ABI, one process per library; per device for J2534)"]
         LIB["Vendor lib"]
         DEV["Vehicle / ECU"]
     end
@@ -155,7 +155,7 @@ Each device's operating mode is fixed to exactly one of "user mode" or "device m
 
 ### 3.4 Worker
 
-- One process per library, a dedicated thread per VCI
+- One process per library, a dedicated thread per VCI. A J2534 library with several configured devices runs one process per device, so each device is its own worker (ADR-281)
 - Absorbs differences in libraries' data-passing methods and always outputs externally as a "timestamped sample sequence"
 - Splits a single data source into a recording path that tolerates no loss and a monitoring path that drops old data when delayed
 - Implemented in coarse-grained operation units (acquire / write / read-back verification)
@@ -558,6 +558,7 @@ Confirmation level (6.3) and two-person approval. The server decides the require
 - Expand a `REG_EXPAND_SZ` value only from a fixed list of system folder names, taking each folder from the HKLM value of the same registry view (so the view's bitness decides it), never from the process environment; any other variable is refused, and the result must be an absolute local path (ADR-277)
 - Also follow and verify the chain of paths referenced by configuration files
 - Redo discovery at every job start; no change-monitoring mechanism is kept
+- A worker service's `config.toml` does not name a library path: the chains above (registry values, registration definitions and the root description file) are the only sources, and the per-library settings in that `config.toml` (modules, CAN channel mode, vendor IOCTLs, logging) are keyed by the library name that the chain resolves (ADR-281)
 - A registration definition indicates where the library is. How that VCI is handled (capabilities, quirks, ABI overrides, COMPARAM mapping) is declared in the VCI profile (9.3)
 
 #### 7.1.1 J2534 Registration Definition on Linux (Proprietary Specification)
@@ -620,10 +621,11 @@ Basis for the inference: AArch64's AAPCS64 matches x86_64's System V ABI in that
 - In device mode, refuse to load if writable, and report the reason
 - If an Authenticode signature is present, also verify the signer. A signature is present when the PE header's security data directory is not empty (an embedded signature; catalog signatures are not looked at). It is then verified against the operating system's trust store with no user interface, no revocation check (switched off explicitly, so the machine-wide policy cannot enable it) and no network access; a time-stamped signature outlives its certificate's expiry. The PE headers are located through the DOS header's pointer, wherever they are in the file. The check protects nothing against someone who can write the file, since stripping the signature makes it unsigned, which passes; the writability check above is the gate. Any failure, including a verified signature whose signer identity cannot be read, is a finding on the library that device mode refuses and user mode reports (the check's error carries the verdict and the open file, so user mode loads the file it checked); no signer is pinned, and a successful check reports the signer's name and SHA-256 thumbprint. Other platforms have no signer check (ADR-278)
 - Load by absolute path (`LoadLibraryEx` / `dlopen`)
+- The agent starts a worker with the library name, the device's operating mode (6.2) and, for J2534, optionally the label of one `modules` entry together with that entry's `pname`, which the agent read when it took the per-VCI lock; the worker refuses to start when the entry it reads for the label names a different `pname` (8.8.1). The worker does not infer the mode: in device mode it refuses a library that fails a check above, in user mode it reports the findings and loads (ADR-281). A J2534 worker started with a module label opens only that module, so each configured device of one library is its own worker process and several can be connected at the same time; a vendor library that cannot be loaded in two processes at once limits itself to one device at a time (ADR-281)
 
 **Trusted locations**
 
-On Windows, the basis for trust is that HKLM can be modified only by administrators. Linux gets the same premise by reading registration definitions only from `/etc/nekoguruma/j2534/` (7.1.1), in both modes. The locations of every file that decides which library is loaded (registration definitions, the D-PDU API root description file on Linux, the worker service's configuration file) are fixed at build time. They are not taken from environment variables or command-line arguments, so another process cannot redirect a worker to a different file; a runtime override is compiled into debug builds only, for tests (ADR-228).
+On Windows, the basis for trust is that HKLM can be modified only by administrators. Linux gets the same premise by reading registration definitions only from `/etc/nekoguruma/j2534/` (7.1.1), in both modes. The locations of every file that decides which library is loaded (registration definitions, the D-PDU API root description file on Linux), and of the worker service's configuration file, which holds per-library settings but no library path (ADR-281), are fixed at build time. They are not taken from environment variables or command-line arguments, so another process cannot redirect a worker to a different file; a runtime override is compiled into debug builds only, for tests (ADR-228).
 
 **One resolver, checked where the library is loaded**
 
@@ -637,12 +639,14 @@ Determine the ABI from the library header (PE Machine / ELF `EI_CLASS`, `e_machi
 flowchart TD
     S["Job start"] --> OS{OS}
     OS -->|Windows| REG["Read HKLM<br/>WOW64 view specified explicitly"]
-    OS -->|Linux| ENV["Default paths, environment variables"]
-    REG --> CFG["Read configuration files"]
+    OS -->|Linux| ENV["Read registration definitions<br/>or root description file<br/>at fixed paths"]
+    REG --> CFG["Follow the chain of<br/>referenced files"]
     ENV --> CFG
     CFG --> PATH["Resolve absolute library path"]
     PATH --> ACL{"Writable by<br/>regular users?"}
     ACL -->|Yes, device mode| REJ["Refuse load, report"]
+    ACL -->|Yes, user mode| WARN["Report findings"]
+    WARN --> ABI
     ACL -->|No| ABI["Determine ABI from header"]
     ABI --> HAVE{"Matching worker<br/>bundled?"}
     HAVE -->|No| UNSUP["Report UNSUPPORTED_ABI"]
@@ -842,7 +846,7 @@ For each cause of interruption, the resume origin and whether resumption is poss
 - **Content addressing**: Each file is identified by its hash. Definitions shared across vehicle models are naturally deduplicated, which also provides differential delivery
 - **Lazy fetching**: The agent fetches and caches only the manifest and the target variants
 - **Unit of signing**: The manifest is signed, and the manifest holds the hash of each file (the same structure as artifacts)
-- **Version compatibility**: The IR carries a schema version, and the agent reports supported versions in `capabilities`. The runtime also checks the version, preventing accidents where an old agent executes new IR
+- **Version compatibility**: The IR carries a schema version, and the agent reports supported versions in `capabilities`. The runtime also checks the version, preventing accidents where an old agent executes new IR. Until the first release, breaking changes to the IR schema and to the journal's stored state are allowed with no compatibility path for older schema versions, since nothing is stored outside the repository (ADR-281 item 4)
 
 ### 8.3 Declaration of the Supported Subset
 
@@ -954,7 +958,7 @@ The targets form 3 tiers: VCI (communication interface) -> vehicle bus -> ECU.
 
 Operation with multiple VCIs connected to a single device, handling multiple vehicles simultaneously, is assumed.
 
-- **Worker assignment**: One process per library, a dedicated thread per VCI. Multiple VCIs from the same vendor become separate threads in the same worker, so the VCI profile declares whether the library supports opening multiple devices simultaneously. If not, a separate worker is used per VCI
+- **Worker assignment**: One process per library, a dedicated thread per VCI. Multiple VCIs from the same vendor become separate threads in the same worker, so the VCI profile declares whether the library supports opening multiple devices simultaneously. If not, a separate worker is used per VCI. Exception: a J2534 library with several configured devices always runs one worker per device, each selected by its `modules` label (ADR-281), whatever the profile declares; the entries' `pname`s are unique per library and the per-VCI lock is keyed by the library name and `pname`, so two workers never hold locks for the same configured target
 - **Lock units**: Per-VCI and per-vehicle locks are managed independently. A configuration where, on the same device, VCI-A handles vehicle X and VCI-B handles vehicle Y is allowed; only when the two VINs fall into the same per-vehicle lock bucket (about once in 4096 pairs, ADR-262) does one job wait for the other
 - **Concurrent job execution**: The agent can execute multiple jobs in parallel. However, ECU reprogramming is limited to 1 at a time per device (because power, bandwidth and operator attention would be divided)
 - **Resource contention**: The high-resolution timer for monitoring and the CPU consumption of concurrent acquisition jobs can interfere. During monitoring, the measured update interval is re-evaluated, and if it cannot be achieved, the value is lowered and reported
@@ -1339,7 +1343,7 @@ T1 is what makes write and interruption checks safe on real VCIs: the VCI, its l
 | Bench ECU | An ECU that speaks UDS (the application layer protocol of ISO 14229-1 (2026) clause 7) over ISO 15765-2 (2024) clauses 9 and 10 on CAN, with its pinout known, and either no security access or a seed/key algorithm available to the tester. A spare unit, declared expendable, for reprogramming | T2 |
 | Vehicle | A vehicle with a diagnostic connector the owner allows diagnostic reads on | T3 |
 
-**Hardware profile.** A TOML file outside the repository describes the attached setup; the path is given in the `NGR_HW_PROFILE` environment variable. It names the VCI (its API, `j2534-0404` or `iso22900`, its library name, resolved as in 7.1, and the module: a device name or serial number the library reports for it), the target class, and the complete link: protocol, baud rate, connector pins, the physical, response and functional CAN identifiers and their width, the addressing format and padding, and the transport ComParams the link uses (the same values an IR `Protocol` declaration carries). A T0 profile names both loopback endpoints this way: two channels of one module, or two modules, possibly of different APIs or a SocketCAN interface. A profile can only narrow what its class allows, with three exceptions: on T2 it may allow reprogramming of an ECU it declares expendable, and on T1 and T2 it may name the commands that switch the power supply off and on, and the specific hardware controls (below) the attached wiring is safe for. A T3 profile can add nothing. A check refuses to start when the profile's class is not in its set, when it needs an operation the profile does not allow, or when the library reports no module or more than one module matching the profile, so the class is never applied to the wrong device. A J2534 library reports no serial number, and a configured module is listed whether or not its device is plugged in, so for J2534 the match is not proof of identity on its own: the profile names the device name used when the device is opened and it must be the only module configured for that library; after opening, and before the link is created, the check compares the firmware and library versions the device reports with the ones the profile records; and only that VCI is connected to the host while the check runs (procedure step 1).
+**Hardware profile.** A TOML file outside the repository describes the attached setup; the path is given in the `NGR_HW_PROFILE` environment variable. It names the VCI (its API, `j2534-0404` or `iso22900`, its library name, resolved as in 7.1, and the module: a device name or serial number the library reports for it), the target class, and the complete link: protocol, baud rate, connector pins, the physical, response and functional CAN identifiers and their width, the addressing format and padding, and the transport ComParams the link uses (the same values an IR `Protocol` declaration carries). A T0 profile names both loopback endpoints this way: two channels of one module, or two modules, possibly of different APIs or a SocketCAN interface. A profile can only narrow what its class allows, with three exceptions: on T2 it may allow reprogramming of an ECU it declares expendable, and on T1 and T2 it may name the commands that switch the power supply off and on, and the specific hardware controls (below) the attached wiring is safe for. A T3 profile can add nothing. A check refuses to start when the profile's class is not in its set, when it needs an operation the profile does not allow, or when the library reports no module or more than one module matching the profile, so the class is never applied to the wrong device. A J2534 library reports no serial number, and a configured module is listed whether or not its device is plugged in, so for J2534 the match is not proof of identity on its own: the profile names the label and the device name (`pname`) of the configured `modules` entry, the check's worker is started with that label so it lists only that entry (ADR-281), and the entry's `pname` must equal the profile's; after opening, and before the link is created, the check compares the firmware and library versions the device reports with the ones the profile records; and only that VCI is connected to the host while the check runs (procedure step 1).
 
 **Guarded VCI access.** Checks do not rely on their own care to stay within the class. A check gets the VCI only through a guarded handle the test harness creates; the harness does not hand out the worker client or the vendor library, and a hardware check that opens either directly is rejected in review. When a check runs a job through the agent, the guard sits between the agent and the worker: the harness gives the agent's job runner a worker client that wraps the real one and passes every call through the same guard, so the production job path is mediated exactly like a direct check. The guard sees every operation and fails the check before anything reaches the device when an operation is not allowed:
 

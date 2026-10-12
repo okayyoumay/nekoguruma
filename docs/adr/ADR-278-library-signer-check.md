@@ -1,7 +1,7 @@
 # ADR-278: Library Signer Check
 
 **Date:** 2026-10-11
-**Status:** Accepted
+**Status:** Accepted (item 4's mode is passed by the agent since ADR-281)
 **Affects:** `ngr-library-resolver` (`signer` module, `Reason`, crate root, `docs/library-resolver.md`), design 7.2, ADR-228 item 4, ADR-270; later the worker services and the agent when they switch over to the shared resolver
 
 ## Context

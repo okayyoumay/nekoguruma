@@ -1,7 +1,7 @@
 # ADR-029: `library_path` Config Override for J2534 v04.04 Library Resolution
 
 **Date:** 2026-07-01
-**Status:** Accepted
+**Status:** Superseded by ADR-281
 **Affects:** `vci-service-launcher/src/config.rs`, `j2534-0404-service/src/service.rs`
 
 ## Context

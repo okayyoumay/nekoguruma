@@ -26,9 +26,10 @@ use vci_service_launcher::vci_server::VciServer;
 
 use crate::config::StartupConfig;
 use crate::error::{
-    api_not_initialized_status, map_construct_error, map_registry_error, map_runtime_error,
+    api_not_initialized_status, map_construct_error, map_resolve_error, map_runtime_error,
     map_runtime_error_for_link,
 };
+use crate::preload::check_library;
 #[cfg(test)]
 use crate::service::convert::cpst_from_raw;
 use crate::service::convert::cpst_raw;
@@ -58,6 +59,9 @@ pub struct Iso22900Service {
     pub(super) subscriptions: Arc<Mutex<SubscriptionMap>>,
     pub(super) cop_tags: Arc<Mutex<CopTagMap>>,
     pub(super) shutdown: tokio::sync::watch::Receiver<bool>,
+    /// Whether `config.toml` existed at startup and passed through the design 7.2 checks
+    /// (`preload.rs`). When it did not, settings from a file created later are ignored.
+    pub(super) config_checked: bool,
 }
 
 impl Iso22900Service {
@@ -107,8 +111,7 @@ impl Iso22900Service {
     }
 
     // Only exercised by a test that relies on the debug-only runtime
-    // VCI_CONFIG_PATH override (see ADR-073), so this helper itself is
-    // debug-only to avoid a dead-code warning under `cargo test --release`.
+    // overrides (ADR-282, ADR-073), so this helper itself is debug-only to avoid a dead-code warning under `cargo test --release`.
     #[cfg(all(test, debug_assertions))]
     pub(super) async fn terminate_all_subscriptions(&self) {
         let mut subscriptions = self.subscriptions.lock().await;
@@ -178,14 +181,16 @@ impl Iso22900Service {
     ) -> Result<u32, Status> {
         let struct_type_raw = cpst_raw(struct_type);
 
-        if let Some(size) = vci_service_launcher::config::find_vendor_struct_type_size(
-            "iso22900",
-            vci_service_launcher::vci_server::current_arch(),
-            &self.startup_config.library_name,
-            struct_type_raw,
-        )
-        .filter(|&size| size != 0)
-        {
+        // A configuration file that appeared after startup passed no pre-load check.
+        let configured = self.config_checked.then(|| {
+            vci_service_launcher::config::find_vendor_struct_type_size(
+                "iso22900",
+                vci_service_launcher::vci_server::current_arch(),
+                &self.startup_config.library_name,
+                struct_type_raw,
+            )
+        });
+        if let Some(size) = configured.flatten().filter(|&size| size != 0) {
             return Ok(size);
         }
 
@@ -416,22 +421,19 @@ impl VciServer for Iso22900Service {
         startup_config: Self::StartupConfig,
         shutdown: Receiver<bool>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        // The mode decides what a failed 7.2 library check means once the
-        // library is resolved through `ngr-library-resolver`; until then it
-        // is only recorded (ADR-281 Decision item 2).
         tracing::info!(
             library = %startup_config.library_name,
             mode = %startup_config.mode(),
             "starting worker"
         );
-        // A `library_path` configured for this library name takes priority over
-        // RDF-based auto-discovery, letting deployers add libraries manually and
-        // letting the library be resolved without an RDF file present at all.
-        let library_path = iso22900_registry::resolve_library_path(
-            vci_service_launcher::vci_server::current_arch(),
-            &startup_config.library_name,
-        )
-        .map_err(map_registry_error)?;
+        // The root description file entry for the name gives the library
+        // path (design 7.1); the 7.2 checks run here, immediately before the
+        // load, so the file that is checked is the file that is loaded.
+        let resolved = ngr_library_resolver::iso22900::resolve(&startup_config.library_name)
+            .map_err(map_resolve_error)?;
+        let library_path = resolved.implementation.library_file.clone();
+        // Kept alive until `DPduApi::new` has mapped the library (design 7.2).
+        let checked = check_library(&resolved, startup_config.mode())?;
         // Fail fast on a noncanonical `vendor_struct_types` config key
         // (ADR-218): `resolve_vendor_struct_entry_size` only ever looks up
         // one canonical `"0x<8 lowercase hex digits>"` key per call, so an
@@ -449,6 +451,8 @@ impl VciServer for Iso22900Service {
         )
         .map_err(|msg| -> Box<dyn std::error::Error> { msg.into() })?;
         let api = DPduApi::new(&library_path).map_err(map_construct_error)?;
+        let config_checked = checked.config_checked();
+        drop(checked);
         let api = Arc::new(Mutex::new(Some(api)));
         let subscriptions = Arc::new(Mutex::new(HashMap::new()));
         let cop_tags = Arc::new(Mutex::new(HashMap::new()));
@@ -478,6 +482,7 @@ impl VciServer for Iso22900Service {
             subscriptions,
             cop_tags,
             shutdown,
+            config_checked,
         })
     }
 
@@ -486,10 +491,10 @@ impl VciServer for Iso22900Service {
     }
 }
 
-// All tests below rely on the debug-only runtime VCI_CONFIG_PATH override
-// (see ADR-073) to redirect `iso22900-registry`'s library-path resolution at
-// the compiled mock, so the whole module is debug-only and does not exist
-// under `cargo test --release`.
+// All tests below rely on the debug-only runtime overrides of the root
+// description file (ADR-282) and of `config.toml` (ADR-073) to resolve the
+// compiled mock, so the whole module is debug-only and does not exist under
+// `cargo test --release`.
 #[cfg(all(test, debug_assertions))]
 mod tests {
     use super::*;
@@ -497,40 +502,18 @@ mod tests {
     use serial_test::serial;
     use vci_service_interface::ModuleHandle as VciServiceModuleHandle;
 
-    /// Points the shared `config.toml`'s library-path config (resolved by
-    /// `iso22900-registry`) at the compiled `iso22900-mock` cdylib for
-    /// `"TestLib"` (via `VCI_CONFIG_PATH`), so `Iso22900Service::new` loads
-    /// the mock without needing an RDF file.
+    /// Has `Iso22900Service::new` resolve `"TestLib"` to the compiled `iso22900-mock` cdylib
+    /// through a test root description file, with no per-library settings.
     ///
-    /// Callers must be `#[serial]`: this writes a shared config file and
-    /// sets a process-global env var, both of which race under concurrent
-    /// test execution within this process. The config path is also
-    /// per-process-unique (via `std::process::id()`, ADR-195), closing a
-    /// separate cross-process race that `#[serial]` -- itself only ever an
-    /// intra-process convention -- could never address on its own: two
-    /// separate `cargo test` processes would otherwise still race on the
-    /// exact same fixed file path.
-    fn set_mock_library_path_config() {
-        let lib_path = iso22900_mock::mock_library_path()
-            .expect("mock cdylib should be discoverable after build");
-        let config_path = std::env::temp_dir().join(format!(
-            "iso22900-service-rpc-test-config-{}.toml",
-            std::process::id()
-        ));
-        let config_toml = format!(
-            "[config.apis.iso22900.libs.\"TestLib\"]\nlibrary_path = {:?}\n",
-            lib_path.display().to_string()
-        );
-        std::fs::write(&config_path, config_toml).expect("config file should be writable");
-        unsafe {
-            std::env::set_var("VCI_CONFIG_PATH", &config_path);
-        }
+    /// Callers must be `#[serial]` (see `test_support::use_mock_library`).
+    fn set_mock_library_config() {
+        crate::test_support::use_mock_library("rpc-test", "");
     }
 
     #[tokio::test]
     #[serial]
     async fn get_module_ids_uses_mock_library() {
-        set_mock_library_path_config();
+        set_mock_library_config();
         let service = Iso22900Service::new(
             StartupConfig {
                 library_name: "TestLib".into(),
@@ -569,7 +552,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn get_version_uses_mock_library() {
-        set_mock_library_path_config();
+        set_mock_library_config();
         let service = Iso22900Service::new(
             StartupConfig {
                 library_name: "TestLib".into(),
@@ -604,7 +587,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn terminate_all_subscriptions_sends_cancelled_and_clears_map() {
-        set_mock_library_path_config();
+        set_mock_library_config();
         let service = Iso22900Service::new(
             StartupConfig {
                 library_name: "TestLib".into(),
@@ -636,26 +619,16 @@ mod tests {
     // local heap-disclosure via an unverified client-declared entry size;
     // see `resolve_vendor_struct_entry_size`'s doc comment) ─────────────
 
-    /// Like [`set_mock_library_path_config`], but also configures a single
+    /// Like [`set_mock_library_config`], but also configures a single
     /// `vendor_struct_types` entry for `"TestLib"` (ADR-218 Decision item
     /// 4a).
-    fn set_mock_library_path_config_with_vendor_struct_type(struct_type_key: &str, size: u32) {
-        let lib_path = iso22900_mock::mock_library_path()
-            .expect("mock cdylib should be discoverable after build");
-        let config_path = std::env::temp_dir().join(format!(
-            "iso22900-service-rpc-test-config-{}.toml",
-            std::process::id()
-        ));
-        let config_toml = format!(
-            "[config.apis.iso22900.libs.\"TestLib\"]\nlibrary_path = {:?}\n\n[config.apis.iso22900.libs.\"TestLib\".vendor_struct_types]\n{:?} = {}\n",
-            lib_path.display().to_string(),
-            struct_type_key,
-            size,
+    fn set_mock_library_config_with_vendor_struct_type(struct_type_key: &str, size: u32) {
+        crate::test_support::use_mock_library(
+            "rpc-test",
+            &format!(
+                "[config.apis.iso22900.libs.\"TestLib\".vendor_struct_types]\n{struct_type_key:?} = {size}\n"
+            ),
         );
-        std::fs::write(&config_path, config_toml).expect("config file should be writable");
-        unsafe {
-            std::env::set_var("VCI_CONFIG_PATH", &config_path);
-        }
     }
 
     async fn new_test_service() -> Iso22900Service {
@@ -671,35 +644,24 @@ mod tests {
         .expect("service should initialize with mock library")
     }
 
-    /// Like [`set_mock_library_path_config_with_vendor_struct_type`], but
+    /// Like [`set_mock_library_config_with_vendor_struct_type`], but
     /// writes `struct_type_key` verbatim (not necessarily canonical) so
     /// tests can exercise `Iso22900Service::new`'s startup
     /// `validate_vendor_struct_type_keys` check (ADR-218) against a
     /// noncanonical key.
-    fn set_mock_library_path_config_with_raw_vendor_struct_type_key(
-        struct_type_key: &str,
-        size: u32,
-    ) {
-        let lib_path = iso22900_mock::mock_library_path()
-            .expect("mock cdylib should be discoverable after build");
-        let config_path = std::env::temp_dir().join(format!(
-            "iso22900-service-rpc-test-config-{}.toml",
-            std::process::id()
-        ));
-        let config_toml = format!(
-            "[config.apis.iso22900.libs.\"TestLib\"]\nlibrary_path = {:?}\n\n[config.apis.iso22900.libs.\"TestLib\".vendor_struct_types]\n\"{struct_type_key}\" = {size}\n",
-            lib_path.display().to_string(),
+    fn set_mock_library_config_with_raw_vendor_struct_type_key(struct_type_key: &str, size: u32) {
+        crate::test_support::use_mock_library(
+            "rpc-test",
+            &format!(
+                "[config.apis.iso22900.libs.\"TestLib\".vendor_struct_types]\n\"{struct_type_key}\" = {size}\n"
+            ),
         );
-        std::fs::write(&config_path, config_toml).expect("config file should be writable");
-        unsafe {
-            std::env::set_var("VCI_CONFIG_PATH", &config_path);
-        }
     }
 
     #[tokio::test]
     #[serial]
     async fn new_fails_startup_when_vendor_struct_type_key_is_uppercase() {
-        set_mock_library_path_config_with_raw_vendor_struct_type_key("0x8000000A", 12);
+        set_mock_library_config_with_raw_vendor_struct_type_key("0x8000000A", 12);
 
         let result = Iso22900Service::new(
             StartupConfig {
@@ -725,7 +687,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn new_fails_startup_when_vendor_struct_type_key_is_wrong_width() {
-        set_mock_library_path_config_with_raw_vendor_struct_type_key("0x800000a", 12);
+        set_mock_library_config_with_raw_vendor_struct_type_key("0x800000a", 12);
 
         let result = Iso22900Service::new(
             StartupConfig {
@@ -751,7 +713,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn new_succeeds_when_vendor_struct_types_table_is_absent() {
-        set_mock_library_path_config();
+        set_mock_library_config();
         // Regression guard: startup validation must not reject a config
         // with no vendor_struct_types table at all.
         let _service = new_test_service().await;
@@ -762,14 +724,14 @@ mod tests {
     async fn new_succeeds_when_vendor_struct_type_keys_are_canonical() {
         // Regression guard: startup validation must not reject a
         // canonically-keyed vendor_struct_types table.
-        set_mock_library_path_config_with_vendor_struct_type("0x80000001", 12);
+        set_mock_library_config_with_vendor_struct_type("0x80000001", 12);
         let _service = new_test_service().await;
     }
 
     #[tokio::test]
     #[serial]
     async fn resolve_vendor_struct_entry_size_fails_precondition_when_unconfigured() {
-        set_mock_library_path_config();
+        set_mock_library_config();
         let service = new_test_service().await;
 
         let err = service
@@ -781,7 +743,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn resolve_vendor_struct_entry_size_returns_configured_value() {
-        set_mock_library_path_config_with_vendor_struct_type("0x80000001", 12);
+        set_mock_library_config_with_vendor_struct_type("0x80000001", 12);
         let service = new_test_service().await;
 
         let size = service
@@ -790,10 +752,30 @@ mod tests {
         assert_eq!(size, 12);
     }
 
+    /// A configuration file that did not exist at startup passed no pre-load check (design 7.2),
+    /// so settings from one created later are not used.
+    #[tokio::test]
+    #[serial]
+    async fn resolve_vendor_struct_entry_size_ignores_a_config_file_created_after_startup() {
+        set_mock_library_config_with_vendor_struct_type("0x80000001", 12);
+        let config = std::path::PathBuf::from(
+            std::env::var_os("VCI_CONFIG_PATH").expect("the test config path is set"),
+        );
+        let contents = std::fs::read(&config).expect("read the test config");
+        std::fs::remove_file(&config).expect("remove the test config");
+        let service = new_test_service().await;
+        std::fs::write(&config, contents).expect("recreate the test config");
+
+        let err = service
+            .resolve_vendor_struct_entry_size(cpst_from_raw(0x8000_0001))
+            .expect_err("a configuration file created after startup must not be used");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    }
+
     #[tokio::test]
     #[serial]
     async fn resolve_vendor_struct_entry_size_fails_precondition_when_configured_zero() {
-        set_mock_library_path_config_with_vendor_struct_type("0x80000001", 0);
+        set_mock_library_config_with_vendor_struct_type("0x80000001", 0);
         let service = new_test_service().await;
 
         let err = service
@@ -852,7 +834,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn set_com_param_vendor_structfield_write_fails_precondition_when_unconfigured() {
-        set_mock_library_path_config();
+        set_mock_library_config();
         let service = new_test_service().await;
 
         let err = service
@@ -874,7 +856,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn set_com_param_vendor_structfield_write_succeeds_when_size_matches_config() {
-        set_mock_library_path_config_with_vendor_struct_type("0x80000001", 2);
+        set_mock_library_config_with_vendor_struct_type("0x80000001", 2);
         let service = new_test_service().await;
 
         service
@@ -895,7 +877,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn set_com_param_vendor_structfield_write_rejects_mismatched_size_of_entry() {
-        set_mock_library_path_config_with_vendor_struct_type("0x80000001", 4);
+        set_mock_library_config_with_vendor_struct_type("0x80000001", 4);
         let service = new_test_service().await;
 
         let err = service
@@ -922,7 +904,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn set_com_param_empty_vendor_structfield_write_succeeds_without_config() {
-        set_mock_library_path_config();
+        set_mock_library_config();
         let service = new_test_service().await;
 
         service
@@ -952,7 +934,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn set_com_param_empty_write_poison_does_not_satisfy_a_later_reads_config_requirement() {
-        set_mock_library_path_config();
+        set_mock_library_config();
         let service = new_test_service().await;
 
         service

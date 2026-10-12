@@ -941,45 +941,65 @@ fn search_directory(dir: &Path) -> Option<PathBuf> {
         .max_by_key(|path| std::fs::metadata(path).and_then(|m| m.modified()).ok())
 }
 
-pub fn mock_root_definition_file_path() -> Result<PathBuf, std::io::Error> {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let root_file = manifest_dir.join("mock_root_definition.xml");
-    if !root_file.exists() {
-        let lib_path = mock_library_path()?;
-        let rdf_content = format!(
-            r#"
-<MVCI_PDU_APIS>
-    <MVCI_PDU_API>
-        <SHORT_NAME>TestLib</SHORT_NAME>
-        <DESCRIPTION>Test library</DESCRIPTION>
-        <SUPPLIER_NAME>TestSupplier</SUPPLIER_NAME>
-        <LIBRARY_FILE URI="file:///{}"/>
-    </MVCI_PDU_API>
-</MVCI_PDU_APIS>
-"#,
-            lib_path.to_string_lossy()
-        );
-        // Write via a per-thread temp file and rename into place, since this file is
-        // generated lazily and multiple test threads may race to create it concurrently;
-        // a direct write() could leave concurrent readers seeing a truncated file.
-        let temp_file = manifest_dir.join(format!(
-            "mock_root_definition.xml.{:?}.tmp",
-            std::thread::current().id()
-        ));
-        std::fs::write(&temp_file, rdf_content).expect("write test RDF native");
-        std::fs::rename(&temp_file, &root_file).expect("rename test RDF into place");
-    }
-    if root_file.is_file() {
-        Ok(root_file)
+/// The `file:` URI of an absolute `path`, as a root description file's `LIBRARY_FILE` names it:
+/// `file:///opt/x.so` on Unix, `file:///C:/x.dll` on Windows. Bytes outside the unreserved set
+/// (and `/`, `:`) are percent-encoded, so a path with spaces or non-ASCII characters round-trips.
+///
+/// # Panics
+///
+/// If `path` is not absolute.
+pub fn file_uri(path: &Path) -> String {
+    assert!(
+        path.is_absolute(),
+        "not an absolute path: {}",
+        path.display()
+    );
+    let text = path.to_string_lossy();
+    // A verbatim drive path (`\\?\C:\x`) names the same file as `C:\x`.
+    #[cfg(windows)]
+    let text = text
+        .strip_prefix(r"\\?\")
+        .unwrap_or(&text)
+        .replace('\\', "/");
+    let mut uri = String::from(if text.starts_with('/') {
+        "file://"
     } else {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!(
-                "could not find mock_root_definition.xml under {}",
-                manifest_dir.display()
-            ),
-        ))
+        "file:///"
+    });
+    for byte in text.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-._~/:".contains(&byte) {
+            uri.push(byte as char);
+        } else {
+            uri.push_str(&format!("%{byte:02X}"));
+        }
     }
+    uri
+}
+
+/// Writes a D-PDU API root description file `pdu_api_root.xml` into `dir` with one entry,
+/// `short_name`, whose `LIBRARY_FILE` names `library`, and returns its path. Tests point the
+/// debug-only `NGR_PDU_API_ROOT_FILE` override at it (ADR-282), or pass it to
+/// `ngr_library_resolver::iso22900::resolve_in_root_file`, to have a service resolve the mock.
+pub fn write_root_file(
+    dir: &Path,
+    short_name: &str,
+    library: &Path,
+) -> Result<PathBuf, std::io::Error> {
+    let root_file = dir.join("pdu_api_root.xml");
+    // The name is element text: escape the characters XML gives a meaning there. The URI needs
+    // none, since `file_uri` percent-encodes `&`, `<` and `"`.
+    let short_name = short_name
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+    let xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <MVCI_PDU_API_ROOT>\n  <MVCI_PDU_API>\n    <SHORT_NAME>{short_name}</SHORT_NAME>\n    \
+         <LIBRARY_FILE URI=\"{}\"/>\n  </MVCI_PDU_API>\n</MVCI_PDU_API_ROOT>\n",
+        file_uri(library)
+    );
+    std::fs::write(&root_file, xml)?;
+    Ok(root_file)
 }
 
 pub fn mock_library_path() -> Result<PathBuf, std::io::Error> {
@@ -1123,5 +1143,40 @@ mod library_path_tests {
         assert_eq!(search_directory(&root), Some(uplifted));
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn write_root_file_escapes_the_short_name() {
+        let dir = std::env::temp_dir().join(format!(
+            "iso22900-mock-root-file-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let library = std::env::current_exe().unwrap();
+        let root_file = write_root_file(&dir, "A&B <x>", &library).unwrap();
+        let xml = std::fs::read_to_string(&root_file).unwrap();
+        assert!(
+            xml.contains("<SHORT_NAME>A&amp;B &lt;x&gt;</SHORT_NAME>"),
+            "{xml}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn file_uri_percent_encodes_a_unix_path() {
+        assert_eq!(
+            file_uri(Path::new("/opt/a b/日.so")),
+            "file:///opt/a%20b/%E6%97%A5.so"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn file_uri_uses_forward_slashes_on_windows() {
+        assert_eq!(
+            file_uri(Path::new(r"C:\a b\x.dll")),
+            "file:///C:/a%20b/x.dll"
+        );
     }
 }

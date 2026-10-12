@@ -318,42 +318,6 @@ fn enumerate_pdu_libraries_from_rdf(
     Ok(libraries)
 }
 
-pub fn find_pdu_libraries<Name: AsRef<str>>(
-    short_name: &Name,
-) -> Result<PduLibraryInfo, RegistryError> {
-    debug!(short_name = short_name.as_ref(), "looking up D-PDU library");
-    let result = enumerate_pdu_libraries(RegistryViewMode::Native)?
-        .into_iter()
-        .find(|lib| lib.short_name == short_name.as_ref())
-        .ok_or_else(|| {
-            RegistryError::NotFound(format!("PDU library '{}' not found", short_name.as_ref()))
-        });
-    if let Err(RegistryError::NotFound(ref msg)) = result {
-        warn!(msg, "D-PDU library not found");
-    }
-    result
-}
-pub fn find_pdu_libraries_on_registry<Name: AsRef<str>>(
-    short_name: &Name,
-    mode: RegistryViewMode,
-) -> Result<PduLibraryInfo, RegistryError> {
-    debug!(
-        short_name = short_name.as_ref(),
-        ?mode,
-        "looking up D-PDU library"
-    );
-    let result = enumerate_pdu_libraries(mode)?
-        .into_iter()
-        .find(|lib| lib.short_name == short_name.as_ref())
-        .ok_or_else(|| {
-            RegistryError::NotFound(format!("PDU library '{}' not found", short_name.as_ref()))
-        });
-    if let Err(RegistryError::NotFound(ref msg)) = result {
-        warn!(msg, "D-PDU library not found");
-    }
-    result
-}
-
 /// Returns a configured `library_path` override for `library_name` from the
 /// shared `config.toml` (`config.apis.iso22900...`), if present.
 ///
@@ -361,8 +325,7 @@ pub fn find_pdu_libraries_on_registry<Name: AsRef<str>>(
 /// 1. `config.apis.iso22900.arch.<arch>.libs.<lib>.library_path` (Windows only)
 /// 2. `config.apis.iso22900.libs.<lib>.library_path`
 ///
-/// Returns `None` when no override is configured, in which case the caller
-/// should fall back to RDF-based auto-discovery (`find_pdu_libraries`).
+/// Returns `None` when no override is configured.
 pub fn find_library_path(arch: Option<&str>, library_name: &str) -> Option<PathBuf> {
     vci_service_config::find_library_path("iso22900", arch, library_name)
 }
@@ -381,8 +344,7 @@ pub fn list_configured_libraries() -> Vec<String> {
 /// entries).
 ///
 /// A library name present in both sources appears once, with `library_path`
-/// set to the configured override (matching the priority
-/// [`resolve_library_path`] applies at startup) and `source` set to
+/// set to the configured override and `source` set to
 /// [`LibrarySource::Both`]. A name present in only one source keeps that
 /// source's fields, with `source` set to [`LibrarySource::Registry`] or
 /// [`LibrarySource::Config`] accordingly; config-only entries carry no
@@ -425,21 +387,6 @@ pub fn enumerate_libraries(mode: RegistryViewMode) -> Vec<PduLibraryInfo> {
     libraries
 }
 
-/// Resolves the filesystem path of the D-PDU API library named
-/// `library_name`, applying the same priority `Iso22900Service::new()` used
-/// to apply itself: a configured `library_path` override
-/// (`find_library_path`) takes priority when present, falling back to
-/// RDF-based auto-discovery (`find_pdu_libraries`) otherwise.
-pub fn resolve_library_path(
-    arch: Option<&str>,
-    library_name: &str,
-) -> Result<PathBuf, RegistryError> {
-    if let Some(path) = find_library_path(arch, library_name) {
-        return Ok(path);
-    }
-    Ok(find_pdu_libraries(&library_name)?.library_path)
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -469,17 +416,6 @@ mod tests {
         // sole test exercising the real fold/try_fold machinery for it.
         if let Err(RegistryError::NotFound(_)) = enumerate_pdu_libraries(RegistryViewMode::All) {
             panic!("All mode must skip a per-view NotFound, not propagate it")
-        }
-    }
-
-    #[test]
-    fn find_on_registry_all_mode_returns_not_found_for_unknown_device() {
-        match find_pdu_libraries_on_registry(
-            &"__nonexistent_iso22900_device__",
-            RegistryViewMode::All,
-        ) {
-            Err(RegistryError::NotFound(_)) => {}
-            other => panic!("unexpected result: {other:?}"),
         }
     }
 }

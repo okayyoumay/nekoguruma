@@ -44,8 +44,8 @@ pub fn parse_startup_uri(uri: &str) -> Result<StartupUri, Box<dyn std::error::Er
 pub struct StartupConfig {
     pub(crate) library_name: String,
     pub(crate) requested_port: Option<u16>,
-    /// The device's operating mode, passed by the agent (ADR-281 Decision item 2). It decides
-    /// what a failed 7.2 library check means where the library is loaded.
+    /// The device's operating mode, passed by the agent (ADR-281 Decision item 2). Design 7.2
+    /// gives it its meaning for a failed library check; library loading does not consult it.
     pub(crate) mode: OperatingMode,
 }
 

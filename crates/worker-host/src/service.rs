@@ -4,9 +4,9 @@
 //!
 //! - First argument `<scheme>:<library name>?mode=<device|user>[&port=<port>]`. The service
 //!   resolves the library name itself (registry on Windows, its `config.toml` elsewhere), within
-//!   its own registry view. `mode` is the device's operating mode (design 6.2), which decides
-//!   what a failed 7.2 library check means; the service does not infer it (ADR-281 Decision
-//!   item 2).
+//!   its own registry view. `mode` is the device's operating mode (design 6.2; 7.2 gives it its
+//!   meaning for a failed library check); the service does not infer it and records it
+//!   (ADR-281 Decision item 2).
 //! - Control channel: one JSON-RPC 2.0 document per line on stdin / stdout.
 //!   `set_auth_key` installs the per-instance HMAC key that the gRPC listener verifies bearer
 //!   tokens with; `get_status` reports the loopback gRPC endpoints; `stop` shuts down.

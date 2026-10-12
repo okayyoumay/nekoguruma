@@ -3,9 +3,10 @@
 //! A device runs in exactly one of two modes, fixed at installation. The agent passes its
 //! device's mode to every worker it starts, as the `mode` query parameter of the startup
 //! argument (`<scheme>:<library name>?mode=<device|user>&...`). The worker does not infer the
-//! mode and no configuration file sets it: a missing or unknown value is a startup error. The
-//! mode decides what a failed 7.2 library check means: device mode refuses the library, user
-//! mode reports the findings and loads it.
+//! mode and no configuration file sets it: a missing or unknown value is a startup error. Design
+//! 7.2 gives the mode its meaning for a failed library check: device mode refuses the library,
+//! user mode reports the findings and loads it. The workers record the mode; their library
+//! loading does not consult it.
 //!
 //! The agent (`worker-host`) writes the parameter and both worker services parse it, so the
 //! spelling lives here, in the crate both sides already share for the gRPC interface.
@@ -19,9 +20,9 @@ pub const MODE_QUERY_KEY: &str = "mode";
 /// A device's operating mode (design 6.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum OperatingMode {
-    /// Unattended devices: a library that fails a 7.2 check is refused.
+    /// Unattended devices; design 7.2 refuses a library that fails a check in this mode.
     Device,
-    /// Interactive devices: a library that fails a 7.2 check is reported and loaded.
+    /// Interactive devices; design 7.2 reports a failed check in this mode and loads the library.
     User,
 }
 

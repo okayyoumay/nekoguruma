@@ -217,7 +217,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-224](ADR-224-vci-service-manager-instance-lifecycle-single-flight.md) | `vci-service-manager` Instance Lifecycle Gains a Single-Flight State Machine | Accepted | `vci-service-manager` main |
 | [ADR-226](ADR-226-vci-service-manager-client-authorization.md) | `vci-service-manager` Client Authorization — Peer-Identity Trust Root over Local IPC, Manager-Minted Session Tokens for TCP | Accepted | `vci-service-manager` main, Cargo.toml, docs |
 | [ADR-227](ADR-227-windows-workers-target-gnullvm.md) | Windows Workers Target `*-pc-windows-gnullvm`, Cross-Built on Linux | Accepted | CI, `.cargo/config.toml`, worker target docs |
-| [ADR-228](ADR-228-fixed-library-resolution-locations.md) | Library Resolution from Fixed Locations, Shared by Agent and Worker | Accepted (the Linux definition format and the shared crate's name settled by ADR-266; item 3 extended by ADR-281 with the mode and, for J2534, a module label and the `pname` the agent locked, which the worker checks; no library path is read from the worker's configuration file since ADR-281) | design 7.1.1 / 7.2 / 7.3, `vci-discovery`, `vci-service-config`, worker services |
+| [ADR-228](ADR-228-fixed-library-resolution-locations.md) | Library Resolution from Fixed Locations, Shared by Agent and Worker | Accepted (the Linux definition format and the shared crate's name settled by ADR-266; item 3 extended by ADR-281 with the mode and, for J2534, a module label and the `pname` the agent locked, which the worker checks; no library path is read from the worker's configuration file since ADR-281; in debug builds item 1's runtime override also replaces the Windows registry, ADR-282) | design 7.1.1 / 7.2 / 7.3, `vci-discovery`, `vci-service-config`, worker services |
 | [ADR-229](ADR-229-interrupted-transfer-restarts-from-request-download.md) | Interrupted Transfers Restart from RequestDownload; Write Procedures Are a Reference Implementation | Accepted (item 1's `recovery_required_from_step` replaced by ADR-245; item 2's failed confirmation after an accepted reset gets one passive retry since ADR-265; item 2 step 3's post-transfer completion counts only for the interrupted pass since ADR-269) | design 8.2.5 / 16.1, `agent` journal, `sim-ecu` |
 | [ADR-230](ADR-230-backlog-loop-serialization-and-claims.md) | Backlog Loop Runs One Item at a Time, with PR-Based Claims and Run State | Accepted (Decision items 1-2's claim set extended to `codeql-alerts` PRs by ADR-243; Decision item 5 superseded by ADR-249; Decision items 3 and 6 amended by ADR-279 for Dependabot replacements) | `.claude/skills/backlog-loop`, `next-task`, `scripts/classify-pr-risk.sh` |
 | [ADR-231](ADR-231-agent-mints-worker-tokens-in-process.md) | The Agent Mints Worker Bearer Tokens In-Process | Accepted | `worker-host` client, `vci-service-interface` token |
@@ -271,6 +271,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-279](ADR-279-backlog-loop-handles-dependabot-pull-requests.md) | The Backlog Loop Handles Open Dependabot Pull Requests First | Accepted | `.claude/skills/backlog-loop` |
 | [ADR-280](ADR-280-diag-fail-instruction.md) | `diag.fail` Is a Terminal `Fail` Instruction, Journaled so a Restart Does Not Resume the Job | Accepted (schema-compatibility consequence relaxed by ADR-281 item 4) | `diag-ir`, `agent` runner, journal, restart; design 5.6 / 8.2.4 / 8.2.5 |
 | [ADR-281](ADR-281-worker-library-resolution-mode-and-device-selection.md) | Worker Library Resolution Has No Config-File Path, the Agent Passes the Mode, One J2534 Device Is One Worker, and Pre-Release Compatibility May Break | Accepted | design 7.1 / 7.2, `j2534-0404-service`, `iso22900-service`, `agent`, `vci-service-config` |
+| [ADR-282](ADR-282-debug-resolver-overrides-on-windows.md) | In Debug Builds the Resolvers' Runtime Overrides Also Replace the Windows Registry | Accepted | `ngr-library-resolver`, `vci-service-config`, design 7.1.1 / 7.2, worker and agent integration tests |
 
 ## Status Legend
 
@@ -563,10 +564,11 @@ the predecessor repository these ADRs came from.
 - ADR-220 (Decision item 5's `proxy_to_instance` mechanism removed by ADR-221)
 - ADR-223 (ADR-036, which the text calls not superseded, is superseded by ADR-281)
 - ADR-224
-- ADR-228 (the Linux definition format and the shared crate's name settled by ADR-266; item 3 extended and the configuration file no longer names a library, ADR-281)
+- ADR-228 (the Linux definition format and the shared crate's name settled by ADR-266; item 3 extended and the configuration file no longer names a library, ADR-281; item 1's debug override also replaces the Windows registry, ADR-282)
 - ADR-240 (the architecture key of the `config.toml` lookup superseded by ADR-281; the per-build registry view stays)
 - ADR-266
 - ADR-281
+- ADR-282
 
 ### vci-service-manager Process Startup
 - ADR-073
@@ -577,7 +579,7 @@ the predecessor repository these ADRs came from.
 - ADR-220 (`grpc_endpoint`/`SocketAddr` clients now connect to directly, per this ADR's proxy removal)
 - ADR-221 (Decision item 7's route-preservation for `DELETE /vci-libs/{id}/endpoint` superseded by ADR-225; native-client-enrollment and unauthenticated-admin-route accepted residuals closed by ADR-226; manager-side token minting superseded for the agent by ADR-231)
 - ADR-226
-- ADR-228 (the Linux definition format and the shared crate's name settled by ADR-266; item 3 extended and the configuration file no longer names a library, ADR-281)
+- ADR-228 (the Linux definition format and the shared crate's name settled by ADR-266; item 3 extended and the configuration file no longer names a library, ADR-281; item 1's debug override also replaces the Windows registry, ADR-282)
 - ADR-231
 - ADR-270 (the D-PDU API root file, MDF and CDF are naming files under item 5, ADR-277; item 5's mode is passed by the agent since ADR-281)
 - ADR-277

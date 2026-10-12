@@ -59,6 +59,9 @@ pub struct Iso22900Service {
     pub(super) subscriptions: Arc<Mutex<SubscriptionMap>>,
     pub(super) cop_tags: Arc<Mutex<CopTagMap>>,
     pub(super) shutdown: tokio::sync::watch::Receiver<bool>,
+    /// Whether `config.toml` existed at startup and passed through the design 7.2 checks
+    /// (`preload.rs`). When it did not, settings from a file created later are ignored.
+    pub(super) config_checked: bool,
 }
 
 impl Iso22900Service {
@@ -178,14 +181,16 @@ impl Iso22900Service {
     ) -> Result<u32, Status> {
         let struct_type_raw = cpst_raw(struct_type);
 
-        if let Some(size) = vci_service_launcher::config::find_vendor_struct_type_size(
-            "iso22900",
-            vci_service_launcher::vci_server::current_arch(),
-            &self.startup_config.library_name,
-            struct_type_raw,
-        )
-        .filter(|&size| size != 0)
-        {
+        // A configuration file that appeared after startup passed no pre-load check.
+        let configured = self.config_checked.then(|| {
+            vci_service_launcher::config::find_vendor_struct_type_size(
+                "iso22900",
+                vci_service_launcher::vci_server::current_arch(),
+                &self.startup_config.library_name,
+                struct_type_raw,
+            )
+        });
+        if let Some(size) = configured.flatten().filter(|&size| size != 0) {
             return Ok(size);
         }
 
@@ -446,6 +451,7 @@ impl VciServer for Iso22900Service {
         )
         .map_err(|msg| -> Box<dyn std::error::Error> { msg.into() })?;
         let api = DPduApi::new(&library_path).map_err(map_construct_error)?;
+        let config_checked = checked.config_checked();
         drop(checked);
         let api = Arc::new(Mutex::new(Some(api)));
         let subscriptions = Arc::new(Mutex::new(HashMap::new()));
@@ -476,6 +482,7 @@ impl VciServer for Iso22900Service {
             subscriptions,
             cop_tags,
             shutdown,
+            config_checked,
         })
     }
 
@@ -743,6 +750,26 @@ mod tests {
             .resolve_vendor_struct_entry_size(cpst_from_raw(0x8000_0001))
             .expect("a configured vendor_struct_types entry should resolve");
         assert_eq!(size, 12);
+    }
+
+    /// A configuration file that did not exist at startup passed no pre-load check (design 7.2),
+    /// so settings from one created later are not used.
+    #[tokio::test]
+    #[serial]
+    async fn resolve_vendor_struct_entry_size_ignores_a_config_file_created_after_startup() {
+        set_mock_library_config_with_vendor_struct_type("0x80000001", 12);
+        let config = std::path::PathBuf::from(
+            std::env::var_os("VCI_CONFIG_PATH").expect("the test config path is set"),
+        );
+        let contents = std::fs::read(&config).expect("read the test config");
+        std::fs::remove_file(&config).expect("remove the test config");
+        let service = new_test_service().await;
+        std::fs::write(&config, contents).expect("recreate the test config");
+
+        let err = service
+            .resolve_vendor_struct_entry_size(cpst_from_raw(0x8000_0001))
+            .expect_err("a configuration file created after startup must not be used");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
     }
 
     #[tokio::test]

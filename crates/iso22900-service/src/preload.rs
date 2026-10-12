@@ -14,6 +14,15 @@ use vci_service_launcher::mode::OperatingMode;
 pub struct CheckedLibrary {
     _signer: Option<Signer>,
     _held: Option<File>,
+    config_checked: bool,
+}
+
+impl CheckedLibrary {
+    /// Whether the configuration file existed and was among the checked files. When it did not,
+    /// a file created later has passed no check, so the service must not take settings from it.
+    pub fn config_checked(&self) -> bool {
+        self.config_checked
+    }
 }
 
 /// Runs the writability and signer checks on `resolved`'s library, the files that named it and,
@@ -39,6 +48,7 @@ fn check_library_with(
     policy: &Policy,
 ) -> Result<CheckedLibrary, Status> {
     let library = &resolved.implementation.library_file;
+    let config_checked = config.is_some();
     let mut naming_files = resolved.naming_files();
     naming_files.extend(config);
     match ngr_library_resolver::check_library(library, &naming_files, policy) {
@@ -62,6 +72,7 @@ fn check_library_with(
             Ok(CheckedLibrary {
                 _signer: Some(signer),
                 _held: None,
+                config_checked,
             })
         }
         Err(failed) => match mode {
@@ -84,6 +95,7 @@ fn check_library_with(
                 Ok(CheckedLibrary {
                     _signer: failed.signer,
                     _held: failed.held,
+                    config_checked,
                 })
             }
         },
@@ -156,7 +168,8 @@ mod tests {
         let (_tmp, resolved) = fixture();
         for mode in [OperatingMode::Device, OperatingMode::User] {
             let checked = check_library_with(&resolved, None, mode, &policy());
-            assert!(checked.is_ok(), "{mode}: {checked:?}");
+            // No configuration file was there to check.
+            assert!(!checked.expect("clean library").config_checked(), "{mode}");
         }
     }
 
@@ -206,7 +219,7 @@ mod tests {
             OperatingMode::Device,
             &policy(),
         );
-        assert!(clean.is_ok(), "{clean:?}");
+        assert!(clean.expect("clean configuration").config_checked());
         make_writable_by_regular_users(&config);
         let status = check_library_with(&resolved, Some(config), OperatingMode::Device, &policy())
             .expect_err("device mode should refuse with a writable configuration file");

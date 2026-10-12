@@ -2,8 +2,7 @@
 
 This document covers the full `config.toml` schema loaded by
 `vci-service-config`: logging settings and (for services that consult it,
-currently `j2534-0404-service` and `iso22900-service`) `library_path`
-overrides. `vci-service-launcher` re-exports this crate as
+currently `j2534-0404-service` only) `library_path` overrides. `vci-service-launcher` re-exports this crate as
 `vci_service_launcher::config` (see ADR-033), so every service built on the
 launcher template picks this schema up automatically.
 
@@ -348,4 +347,4 @@ output = "null"
 - `stdout` is always reserved for JSON-RPC communication with the parent process (the agent, via `worker-host`). Do not configure log output to `stdout`.
 - When the config file is missing or unparseable, a warning is printed to `stderr` and the default (`info` + `stderr`) is used. The service still starts normally.
 - File output appends; the file is never truncated on startup. Rotate externally (e.g., `logrotate` on Linux).
-- A missing or unparseable config file also means no `library_path` overrides are applied — `j2534-0404-service` falls back to registry auto-discovery for every library name in that case, which fails with `RegistryUnsupported` on non-Windows, and `iso22900-service` falls back to RDF-based lookup, which fails unless `/etc/pdu_api_root.xml` (or, on Windows, the registry-configured RDF) happens to list that name.
+- A missing or unparseable config file also means no `library_path` overrides are applied — `j2534-0404-service` falls back to registry auto-discovery for every library name in that case, which fails with `RegistryUnsupported` on non-Windows. `iso22900-service` never reads `library_path`, so its lookup does not change; a configuration file that is missing at startup also leaves its `vendor_struct_types` unset for the worker's lifetime, even if the file appears later, since only a file that existed at startup passed the design 7.2 checks.

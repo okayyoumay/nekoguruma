@@ -187,7 +187,9 @@ Startup is handled by `vci-service-launcher::start_service::<Iso22900Service>()`
      `ngr_library_resolver::check_library` with the system owners as the
      trusted set) on the library, the files that named it and, when it exists,
      the worker's `config.toml` (`vci_service_config::config_file()`), whose
-     per-library settings the service acts on (ADR-270 Decision item 5). In device mode a
+     per-library settings the service acts on (ADR-270 Decision item 5). When
+     the file is missing at startup, the service uses no settings from a file
+     created later, since that file passed no check. In device mode a
      failure refuses the library with `FAILED_PRECONDITION`; in user mode the
      findings are logged as a warning and the library is loaded. What the check
      opened stays open until the library is mapped (ADR-278).

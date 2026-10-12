@@ -58,8 +58,9 @@ async fn worker_host_client_authenticates_with_minted_tokens() {
         std::path::Path::new(env!("CARGO_BIN_EXE_j2534-0404-service")),
         ServiceKind::J2534V0404,
         TEST_LIBRARY_NAME,
-        // Loading does not depend on the mode yet; device mode must start the worker too.
-        OperatingMode::Device,
+        // User mode: once the worker runs the design 7.2 checks, device mode refuses these
+        // test-owned files. `startup_argument.rs` covers that both modes are accepted.
+        OperatingMode::User,
         // Generous timeouts for a debug binary on a busy CI runner.
         &LaunchOptions {
             startup_timeout: Duration::from_secs(20),

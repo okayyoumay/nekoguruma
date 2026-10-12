@@ -6926,6 +6926,9 @@ fn toml_string(text: &str) -> String {
 pub fn write_definition(dir: &Path, name: &str, library: &Path) -> Result<PathBuf, std::io::Error> {
     let stem: String = name.bytes().map(|b| format!("{b:02x}")).collect();
     let file = dir.join(format!("{stem}.toml"));
+    // A definition names its library by absolute path; a relative one (for example from a
+    // relative `CARGO_TARGET_DIR`) is taken from the current directory.
+    let library = std::path::absolute(library)?;
     let library = library.to_str().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -7001,6 +7004,19 @@ mod definition_tests {
             assert_eq!(resolved.definition.name, name);
             assert_eq!(resolved.definition.library, library);
         }
+    }
+
+    /// A relative library path is written as the absolute path it names here.
+    #[test]
+    fn write_definition_makes_a_relative_library_absolute() {
+        let dir = tempfile::tempdir().unwrap();
+        write_definition(dir.path(), "relative", Path::new("target/x.lib")).unwrap();
+        let resolved =
+            ngr_library_resolver::j2534_0404::resolve_in_dir(dir.path(), "relative").unwrap();
+        assert_eq!(
+            resolved.definition.library,
+            std::env::current_dir().unwrap().join("target/x.lib")
+        );
     }
 
     /// Names that differ only in characters a file name cannot hold, or only in case, get

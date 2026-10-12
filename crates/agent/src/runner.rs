@@ -257,9 +257,13 @@ pub async fn run_program_journaled(
 }
 
 /// Goes on with a job that ran before, from the journal [`run_program_journaled`] wrote under
-/// `journal.key` (ADR-255). Once the link is open and the policy allows the program, and before
-/// anything is sent to the ECU, the journal is opened and classified (`restart::classify`,
-/// ADR-253):
+/// `journal.key` (ADR-255). The journal is opened, with its writer lock, before the worker link:
+/// a journal another run holds ends the job in [`JobError::Journal`] (`InUse`), and one that
+/// records a declared failure in [`JobError::ProcedureFailed`] (ADR-280), neither opening the
+/// link. Once the link is open and the policy allows the program, and before anything is sent to
+/// the ECU, the journal is classified (`restart::classify`, ADR-253):
+/// - a declared failure (`RestartDecision::Failed`) ends the job in
+///   [`JobError::ProcedureFailed`] with nothing sent and no resume counted;
 /// - a plain start runs the program from its start on the same journal, its step count going on
 ///   after the journal's last record (`restart::next_steps`); a program without a flash
 ///   recovery plan and without a journal runs without one;

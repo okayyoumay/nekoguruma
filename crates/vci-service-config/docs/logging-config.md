@@ -170,7 +170,7 @@ directly and the Windows registry (`j2534-0404-registry`,
 unset, `resolve_library_path()` falls back to the registry as before.
 `iso22900-service` does not read `library_path`: it resolves its library
 through `ngr-library-resolver`'s D-PDU API root description file lookup
-(design 7.1, ADR-281 Decision item 1).
+(design 7.1, ADR-281 Decision item 1), then runs the design 7.2 pre-load checks.
 
 The registry crates' `enumerate_libraries()` also reads this table (via
 `list_configured_library_paths()`), so config-only libraries — ones with no

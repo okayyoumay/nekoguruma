@@ -13,7 +13,8 @@ iso22900-service/src/
 ├── main.rs              Entry point: calls vci_service_launcher::start_service::<Iso22900Service>()
 ├── lib.rs               Re-exports Iso22900Service and StartupConfig
 ├── config.rs            Startup argument parser (iso22900:<lib>?mode=<device|user>&port=<u16>)
-├── error.rs             Error mapping: DPduApiError / RegistryError → gRPC Status
+├── error.rs             Error mapping: DPduApiError / ResolveError → gRPC Status
+├── preload.rs           Design 7.2 pre-load checks and the mode's verdict on a failure
 └── service/
     ├── rpc.rs           Iso22900Service struct + VciService trait impl (all 25 RPC methods)
     ├── rpc_module.rs    Module RPCs: GetModuleIds, ModuleConnect, ModuleDisconnect

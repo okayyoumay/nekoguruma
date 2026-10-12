@@ -263,7 +263,8 @@ pub async fn run_program_journaled(
 /// link. Once the link is open and the policy allows the program, and before anything is sent to
 /// the ECU, the journal is classified (`restart::classify`, ADR-253):
 /// - a declared failure (`RestartDecision::Failed`) ends the job in
-///   [`JobError::ProcedureFailed`] with nothing sent and no resume counted;
+///   [`JobError::ProcedureFailed`] with nothing sent and no resume counted (the check before
+///   the link already returns it, so this case is reached only by the classification itself);
 /// - a plain start runs the program from its start on the same journal, its step count going on
 ///   after the journal's last record (`restart::next_steps`); a program without a flash
 ///   recovery plan and without a journal runs without one;
@@ -520,8 +521,10 @@ fn run_job(
         open_link.close();
         return Err(error);
     }
-    // Still before anything is sent: a job that cannot keep its journal sends nothing. A link
-    // that fails to open, or a program the link refuses, leaves no journal behind.
+    // Still before anything is sent: a job that cannot keep its journal sends nothing. For a
+    // first run, a link that fails to open, or a program the link refuses, leaves no journal
+    // behind; a resumed job opened its journal before the link (above), and opening it only cuts
+    // a torn last frame, which any later open would cut as well.
     let result = std::panic::catch_unwind(AssertUnwindSafe(|| match journal {
         Some(JournalMode::Create(setup)) if !program.flash.is_empty() => {
             let mut journal = JobJournal::create(setup)?;
@@ -1136,7 +1139,7 @@ where
                 {
                     // The job ends in the journal error, so the procedure's own reason would
                     // be lost.
-                    tracing::warn!(pc, %code, %detail, %error, "could not journal the procedure failure");
+                    tracing::warn!(pc, ?code, ?detail, %error, "could not journal the procedure failure");
                     return Err(error);
                 }
                 return Err(JobError::ProcedureFailed { pc, code, detail });

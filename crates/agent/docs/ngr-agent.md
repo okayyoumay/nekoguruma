@@ -206,8 +206,10 @@ plan's entry; otherwise, or for a stage the program does not declare, the decisi
 
 `agent::resume_program_journaled` takes the same arguments as `run_program_journaled`,
 guards included, for a job that ran before (ADR-255), and returns the guards with its result.
-Once the link is open and the policy allows the program, and before anything is sent to the
-ECU, it opens the job's journal (`Journal::open`) and classifies it.
+It opens the job's journal (`Journal::open`, with its writer lock) before it opens the worker
+link; a journal another run holds, or one that records a declared failure, ends the job there.
+Once the link is open and the policy allows the program, and before anything is sent to the ECU,
+it classifies the journal.
 
 | Decision | What the runner does |
 |---|---|

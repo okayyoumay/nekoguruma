@@ -56,7 +56,10 @@ ended: a restart replays to the erase and sends it again.
    in the same `JobError::ProcedureFailed` with nothing sent to the ECU and no resume counted. It
    takes the journal's writer lock and reads the record before it opens the worker link, so the
    verdict does not depend on whether the worker or the VCI can be reached, and a journal that
-   another run holds still ends in `JournalError::InUse` first (ADR-255 item 7).
+   another run holds still ends in `JournalError::InUse` first (ADR-255 item 7). The checks every
+   run makes before that (the program's schema and validity, the reprogramming slot, guards
+   whose link is not confirmed closed, ADR-258) still come first; they delay the verdict, they
+   do not change it.
 6. **A flash plan may contain `Fail` anywhere, and it ends a path.** The plan validator treats it
    like `Ret` when it follows execution (a subroutine that ends in `Fail` does not reach a plan
    after it), but `Call` and `Ret` stay refused inside a plan.
@@ -76,6 +79,11 @@ precedent is `IdentityMismatch`, which also ends the job as Failed with a possib
   earlier build does not decode into the new `RecoveryFacts`; the summary is not stored across
   builds yet.
 - A `Fail` is final even where a restart could have succeeded. That is the author's choice.
+- The runtime checks the schema version by equality, for the program and for a journaled state,
+  so with version 3 a program stored at version 2 is refused although it encodes the same, and a
+  job interrupted under an agent of version 2 cannot be resumed by one of version 3 (its entry
+  state is refused, which asks for on-site intervention). No program or journal of version 2 is
+  stored outside this repository yet; accepting a range of versions is left until one is.
 - A crash after the `Fail` step and before the failure record's commit leaves a journal without
   it. No request is sent in that window, and what the restart then redoes follows the existing
   rules (the redo of ADR-229, or the continuation of ADR-271), as if the procedure had not yet

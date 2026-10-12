@@ -322,7 +322,7 @@ impl RecoveryFacts {
             Record::ProcedureFailed { at, code, detail } => {
                 // The runner bounds the text; a record read back is not trusted.
                 if code.is_empty() || code.len() > MAX_FAILURE_CODE_LEN {
-                    return Err("a procedure failure's code must be 1 to 128 bytes");
+                    return Err("a procedure failure's code is empty or too long");
                 }
                 if detail.len() > MAX_FAILURE_DETAIL_LEN {
                     return Err("a procedure failure's detail is too long");

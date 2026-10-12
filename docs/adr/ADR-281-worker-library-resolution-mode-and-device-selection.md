@@ -70,7 +70,11 @@ questions were left open before the worker services and the agent could switch o
    A worker started with a label keeps that entry's handle from ADR-107 Decision (c), which
    numbers modules 1..N in configuration order, so its position in the list is the handle in
    every mode. It lists only that row from `GetModuleIds` with that handle and refuses every
-   other handle (Consequences). The agent takes the handle from the single row it receives and
+   other handle (Consequences). On such a worker `PDU_HANDLE_UNDEF` ("the current module")
+   resolves to the selected handle, and module-level event and subscription attribution uses
+   the selected handle too, where ADR-107 resolved both to handle 1; a worker started with the
+   second entry therefore never reports or accepts handle 1. This closes ADR-107 Accepted
+   Residual 4 for workers started with a label. The agent takes the handle from the single row it receives and
    never computes one, and a log or trace shows the same handle as a worker started without a
    label. ADR-107 item (b) stays: a worker has one open device and no per-module state
    partition; simultaneous use comes from several worker processes. When no label is passed the

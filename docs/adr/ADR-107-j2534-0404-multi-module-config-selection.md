@@ -1,7 +1,7 @@
 # ADR-107: Config-Declared Multi-Module Device Selection for J2534 v04.04
 
 **Date:** 2026-07-21
-**Status:** Accepted (Decision (b) kept; simultaneous devices come from one worker per device, `label` must be non-empty and unique as the device selector, a worker started with a label keeps its entry's Decision (c) handle, and Decision (d)'s `ModuleConnect` on such a worker accepts only that handle, ADR-281)
+**Status:** Accepted (Decision (b) kept; simultaneous devices come from one worker per device, `label` must be non-empty and unique as the device selector, a worker started with a label keeps its entry's Decision (c) handle, Decision (d)'s `ModuleConnect` on such a worker accepts only that handle, and `PDU_HANDLE_UNDEF` and module-level event attribution resolve to it, ADR-281)
 **Affects:** `vci-service-config`, `j2534-0404`, `j2534-0404-service` service, config, rpc_module, rpc_link, error
 
 ## Context

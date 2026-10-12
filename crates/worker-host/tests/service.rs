@@ -84,8 +84,13 @@ async fn times_out_when_never_running() {
 
 #[tokio::test]
 async fn rejects_query_in_library_name() {
-    let result = launch("a?port=1", Duration::from_secs(5)).await;
-    assert!(matches!(result, Err(ServiceError::InvalidLibraryName(_))));
+    for library in ["a?port=1", "a#b"] {
+        let result = launch(library, Duration::from_secs(5)).await;
+        assert!(
+            matches!(result, Err(ServiceError::InvalidLibraryName(_))),
+            "{library:?}"
+        );
+    }
 }
 
 #[tokio::test]

@@ -165,7 +165,9 @@ impl WorkerProcess {
         mode: OperatingMode,
         options: &LaunchOptions,
     ) -> Result<Self, ServiceError> {
-        if library_name.trim().is_empty() || library_name.contains('?') {
+        // `?` or `#` would end the startup argument's path, so the service would read another name
+        // and lose the mode query.
+        if library_name.trim().is_empty() || library_name.contains(['?', '#']) {
             return Err(ServiceError::InvalidLibraryName(library_name.to_owned()));
         }
         let mut command = Command::new(binary);

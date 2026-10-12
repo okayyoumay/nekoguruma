@@ -17,8 +17,11 @@ ended: a restart replays to the erase and sends it again.
 
 ## Decision
 
-1. **`Op::Fail { code: u32 }` is appended as the last variant of `Op`.** Appending keeps every
-   stored program valid (ADR-233 item 10), so `IR_SCHEMA_VERSION` stays 2. `code` is a
+1. **`Op::Fail { code: u32 }` is appended as the last variant of `Op`, and `IR_SCHEMA_VERSION`
+   becomes 3.** Appending keeps the encoding of every existing program (ADR-233 item 10), but a
+   runtime of version 2 cannot decode a program that uses `Fail`. The version is what the agent
+   reports in `capabilities` and a server matches before it sends a program (design 8.2.6 and
+   9.5; `crates/diag-ir/schema/README.md`), so it changes with the instruction set. `code` is a
    constant-pool index holding UTF-8, like `Log::message`, because the server's dry run can then
    check it as it checks a log message (ADR-233 item 7). The detail is a `Bytes` operand popped
    from the stack, because a detail is built at run time. `Program::validate` also checks the

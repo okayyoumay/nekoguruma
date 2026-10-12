@@ -10,7 +10,10 @@ use serde::{Deserialize, Serialize};
 
 /// 2: `Program` gained the restart declaration (`identity`, `preconditions`, `flash`, ADR-245)
 /// and `VmState` lost `checkpoint` and `resume_count`, so both postcard encodings changed.
-pub const IR_SCHEMA_VERSION: u32 = 2;
+/// 3: `Op` gained `Fail` (ADR-280). Programs of version 2 encode the same, but a runtime of
+/// version 2 cannot decode one that uses `Fail`, so the version a server matches against the
+/// agent's `capabilities` (9.5) changes.
+pub const IR_SCHEMA_VERSION: u32 = 3;
 
 /// The longest code, in bytes, that `Program::validate` accepts for a `Fail` (ADR-280).
 pub const MAX_FAILURE_CODE_LEN: usize = 128;

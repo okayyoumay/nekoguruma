@@ -130,7 +130,6 @@ pub enum JobError {
     GuardsMissing,
 }
 
-/// `text` cut to at most `max` bytes, on a character boundary.
 /// The job's error for the declared failure its journal records.
 fn failure_error(failure: &crate::journal::ProcedureFailure) -> JobError {
     JobError::ProcedureFailed {
@@ -140,6 +139,7 @@ fn failure_error(failure: &crate::journal::ProcedureFailure) -> JobError {
     }
 }
 
+/// `text` cut to at most `max` bytes, on a character boundary.
 fn truncated(mut text: String, max: usize) -> String {
     if text.len() > max {
         let mut end = max;

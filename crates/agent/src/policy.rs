@@ -152,7 +152,9 @@ pub fn check_program(program: &Program, permission: Permission) -> Result<(), (u
             | Op::LoadGlobal(_)
             | Op::StoreGlobal(_)
             | Op::IndexGet
-            | Op::IndexSet => None,
+            | Op::IndexSet
+            // Ends the procedure; sends nothing (ADR-280).
+            | Op::Fail { .. } => None,
         };
         if let Some(error) = refused {
             return Err((pc as u32, error));

@@ -122,6 +122,20 @@ pub struct RecoveryFacts {
     /// target VIN, so a resume can tell that the job's own data changed (ADR-268). `None` when
     /// the job named none.
     pub intended_software_version: Option<Vec<u8>>,
+    /// The procedure ended itself as failed (`Op::Fail`, ADR-280). Terminal: no record follows
+    /// it, and a restart does not resume the job.
+    pub procedure_failed: Option<ProcedureFailure>,
+}
+
+/// A declared failure of the procedure, as journaled (ADR-280).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcedureFailure {
+    /// The `Fail` instruction's position and step count.
+    pub at: StepRef,
+    /// The procedure's code, cut to the runner's limit.
+    pub code: String,
+    /// The procedure's detail text (lossily decoded, cut to the runner's limit).
+    pub detail: String,
 }
 
 impl RecoveryFacts {
@@ -137,6 +151,7 @@ impl RecoveryFacts {
             last_intent: None,
             target_vin: None,
             intended_software_version: None,
+            procedure_failed: None,
         }
     }
 
@@ -152,6 +167,10 @@ impl RecoveryFacts {
     fn apply(&mut self, record: &Record) -> Result<(), &'static str> {
         let after_last_step =
             |at: &StepRef, facts: &Self| facts.last_step.is_none_or(|last| at.steps > last.steps);
+        // A declared failure ends the job (ADR-280).
+        if self.procedure_failed.is_some() {
+            return Err("no record follows a procedure failure");
+        }
         match record {
             Record::TargetVin(vin) => {
                 // Where it may appear is `creation_prefix_allowed`'s rule; a second one is refused
@@ -295,6 +314,16 @@ impl RecoveryFacts {
                 }
                 exit.complete = true;
             }
+            Record::ProcedureFailed { at, code, detail } => {
+                if !after_last_step(at, self) {
+                    return Err("a procedure failure must come after the last step");
+                }
+                self.procedure_failed = Some(ProcedureFailure {
+                    at: *at,
+                    code: code.clone(),
+                    detail: detail.clone(),
+                });
+            }
         }
         Ok(())
     }
@@ -389,6 +418,13 @@ enum Record {
     RunStart {
         at: StepRef,
         vm_state: Vec<u8>,
+    },
+    /// The procedure ended itself as failed (ADR-280); the job's last record. Changes no fact
+    /// but `procedure_failed`.
+    ProcedureFailed {
+        at: StepRef,
+        code: String,
+        detail: String,
     },
 }
 
@@ -767,6 +803,21 @@ impl<S: Store> Journal<S> {
     /// is sent, so a crash before its response still places the interruption at it (ADR-253).
     pub fn commit_intent(&mut self, at: StepRef) -> Result<(), JournalError> {
         self.commit(Record::Intent { at })
+    }
+
+    /// Records that the procedure ended itself as failed at `at`, the `Fail` instruction
+    /// (ADR-280). Nothing can be committed after it. The text is bounded by the caller.
+    pub fn commit_procedure_failed(
+        &mut self,
+        at: StepRef,
+        code: &str,
+        detail: &str,
+    ) -> Result<(), JournalError> {
+        self.commit(Record::ProcedureFailed {
+            at,
+            code: code.to_owned(),
+            detail: detail.to_owned(),
+        })
     }
 
     fn commit(&mut self, record: Record) -> Result<(), JournalError> {
@@ -2156,6 +2207,66 @@ mod tests {
                 vm_state: b"s".to_vec(),
             },
         );
+        assert!(matches!(
+            Journal::read(&dir.0, &key()),
+            Err(JournalError::Corrupt { .. })
+        ));
+    }
+
+    /// A procedure failure (ADR-280) comes after the last step, reads back as the fact, and is
+    /// the journal's last record: no commit and no record read from the file may follow it.
+    #[test]
+    fn a_procedure_failure_is_the_last_record() {
+        let mut j = memory();
+        j.commit_transfer_start(STAGE, at(3, 1)).expect("start");
+        j.commit_step(at(3, 1), None).expect("step");
+        for steps in [0, 1] {
+            assert!(matches!(
+                j.commit_procedure_failed(at(4, steps), "E", "d"),
+                Err(JournalError::Invariant(_))
+            ));
+        }
+        assert_eq!(j.summary().procedure_failed, None);
+        j.commit_procedure_failed(at(4, 2), "E", "d")
+            .expect("failure");
+        let failure = j.summary().procedure_failed.expect("the fact");
+        assert_eq!(
+            (failure.at, failure.code.as_str(), failure.detail.as_str()),
+            (at(4, 2), "E", "d")
+        );
+        let records = j.state().records;
+        assert!(matches!(
+            j.commit_step(at(5, 3), None),
+            Err(JournalError::Invariant(
+                "no record follows a procedure failure"
+            ))
+        ));
+        assert!(matches!(
+            j.commit_resume(STAGE, None),
+            Err(JournalError::Invariant(_))
+        ));
+        assert!(matches!(
+            j.commit_procedure_failed(at(4, 4), "E", "d"),
+            Err(JournalError::Invariant(_))
+        ));
+        assert_eq!(j.state().records, records);
+
+        let dir = TempDir::new();
+        let mut j = Journal::create(&dir.0, &key(), None, None).expect("create");
+        j.commit_step(at(3, 1), None).expect("step");
+        j.commit_procedure_failed(at(4, 2), "E", "d")
+            .expect("failure");
+        drop(j);
+        let state = Journal::read(&dir.0, &key()).expect("read back");
+        assert_eq!(
+            state.facts.procedure_failed.as_ref().map(|f| f.at),
+            Some(at(4, 2))
+        );
+        assert_eq!(state.facts.last_step, Some(at(3, 1)));
+        assert_eq!(Journal::open(&dir.0, &key()).expect("open").state(), &state);
+
+        // A record appended to the file behind it is corrupt, not ignored.
+        append_entry(&dir, 2, Record::Block { block: 1 });
         assert!(matches!(
             Journal::read(&dir.0, &key()),
             Err(JournalError::Corrupt { .. })

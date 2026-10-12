@@ -56,16 +56,46 @@ pub enum Op {
     IndexSet,
 
     // Diagnostic primitives (8.2.4)
-    ServiceRequest { service: u16 },
-    ReadDtc { mask: u8 },
-    RoutineControl { routine: u16, sub: u8 },
-    SecurityAccess { level: u8 },
-    FlashTransfer { block: u32 },
-    Wait { millis: u32 },
-    HmiRequest { form: u32 },
-    RecordInput { template: u32 },       // 4.3.1 record template
-    MonitorCapture { back_millis: u32 }, // 4.6 capture
-    Log { level: u8, message: u32 },
+    ServiceRequest {
+        service: u16,
+    },
+    ReadDtc {
+        mask: u8,
+    },
+    RoutineControl {
+        routine: u16,
+        sub: u8,
+    },
+    SecurityAccess {
+        level: u8,
+    },
+    FlashTransfer {
+        block: u32,
+    },
+    Wait {
+        millis: u32,
+    },
+    HmiRequest {
+        form: u32,
+    },
+    RecordInput {
+        template: u32,
+    }, // 4.3.1 record template
+    MonitorCapture {
+        back_millis: u32,
+    }, // 4.6 capture
+    Log {
+        level: u8,
+        message: u32,
+    },
+
+    // Declared failure (8.2.4, ADR-280). Appended last: the variant order is part of the
+    // encoding (ADR-233).
+    /// Ends the procedure as failed. `code` is a constant-pool index (UTF-8, like `Log::message`);
+    /// the detail is the `Bytes` on top of the stack.
+    Fail {
+        code: u32,
+    },
 }
 
 // ---------------------------------------------------------------- Program
@@ -170,7 +200,8 @@ impl Op {
             | Op::LoadGlobal(_)
             | Op::StoreGlobal(_)
             | Op::IndexGet
-            | Op::IndexSet => false,
+            | Op::IndexSet
+            | Op::Fail { .. } => false,
         }
     }
 }
@@ -379,6 +410,7 @@ impl Vm {
                 }
             }
             Executed::Waiting(on) => Ok(StepOutcome::Waiting(on)),
+            Executed::Failed(failure) => Ok(StepOutcome::Failed(failure)),
         }
     }
 
@@ -572,6 +604,16 @@ impl Vm {
                 .monitor_capture(*back_millis)
                 .map_err(StepError::Host)?,
             Op::Log { level, .. } => host.log(*level, input.text()),
+
+            // Terminal and not a primitive: the state stays on the instruction, like a wait, so
+            // stepping again gives the same outcome (ADR-280).
+            Op::Fail { code } => {
+                let code = std::str::from_utf8(constant(program, *code)?)
+                    .map_err(|_| VmError::InvalidUtf8(*code))?
+                    .to_owned();
+                let detail = self.bytes_operand()?.to_vec();
+                return Ok(Executed::Failed(Failure { code, detail }));
+            }
         }
         self.state.pc = next;
         Ok(Executed::Done)
@@ -639,6 +681,8 @@ impl Vm {
             | Op::StoreGlobal(_)
             | Op::IndexGet
             | Op::IndexSet => HostInput::Nothing,
+            // The checks of `Fail` run in `execute`, before it changes anything.
+            Op::Fail { .. } => HostInput::Nothing,
         })
     }
 
@@ -694,6 +738,7 @@ impl Vm {
 enum Executed {
     Done,
     Waiting(WaitingOn),
+    Failed(Failure),
 }
 
 /// What a diagnostic primitive passes to the host, validated by `check_primitive`.
@@ -818,13 +863,25 @@ fn compare(op: &Op, operands: &[Value]) -> Result<bool, VmError> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StepOutcome {
     Continue,
     Finished,
     /// Waiting for an answer from outside; the state is unchanged and the caller steps again
     /// later. Keeps waiting even while disconnected (5.6, 8.2.5).
     Waiting(WaitingOn),
+    /// The procedure ended itself as failed (`Op::Fail`, ADR-280). The state is unchanged, so
+    /// stepping again gives the same outcome; the caller treats it as terminal.
+    Failed(Failure),
+}
+
+/// The declared failure of a procedure (ADR-280).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Failure {
+    /// Chosen by the procedure; valid UTF-8, not otherwise limited by the VM.
+    pub code: String,
+    /// Bytes built at run time. Not checked by the VM; may be invalid UTF-8.
+    pub detail: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

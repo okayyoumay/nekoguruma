@@ -85,7 +85,7 @@ commits 0 (ADR-252).
 | Exit status | Meaning | Output |
 |---|---|---|
 | 0 | The program ran to its end | The final `diag_ir::VmState` as one line of JSON on stdout. A negative response is a value on the stack, not a failure |
-| 1 | Reading the program, launching the worker or the job failed, the worker may still hold the VCI after a failed link close, or the final state holds a non-finite float (infinity or NaN), which JSON cannot represent | The reason on stderr |
+| 1 | Reading the program, launching the worker or the job failed (including a procedure that ended itself as failed, `JobError::ProcedureFailed`), the worker may still hold the VCI after a failed link close, or the final state holds a non-finite float (infinity or NaN), which JSON cannot represent | The reason on stderr |
 | 2 | Invalid command line | The error and the usage on stderr |
 
 The worker's own log goes to stderr.
@@ -151,6 +151,14 @@ fails, or a declared identity source that gives no value (`JobError::IdentityUnr
 instruction runs, so a guarded request is never sent without its marker and nothing is erased
 without the identity.
 
+When the procedure ends itself as failed (`Op::Fail`, ADR-280), the runner commits a
+procedure-failure record before it returns `JobError::ProcedureFailed { pc, code, detail }`: the
+`Fail` instruction's position and the procedure's code and detail, the detail decoded lossily and
+the code and detail cut to 128 and 1024 bytes. It is the journal's last record: it must come
+after the last step, and the journal refuses every record after it, in a commit and when it reads
+the file back (`RecoveryFacts::procedure_failed`). A job without a journal (a program without a
+plan, or `ngr-agent run`) ends in the same error with nothing recorded.
+
 `ngr-agent run` uses `run_program` and keeps no journal; it sends read-only requests, or any
 request to `sim-vci` in a debug build (ADR-247).
 
@@ -165,6 +173,7 @@ step count, of the last completed step, the two transfer markers and the last re
 | none (`NotFound`), program without a plan | plain start |
 | none (`NotFound`), program with a plan | `OnSiteInterventionRequired` (the journal is created before anything is sent) |
 | unreadable (corrupt, unknown format version, another job, I/O) | `OnSiteInterventionRequired` |
+| a procedure-failure record (ADR-280), checked before every row below | `Failed`, with the record's position, code and detail |
 | interruption point at or past a plan's recovery-required point and before its end, or inside a `RecoveryRequired` section the journal can place it in (inside a plan, on the step into a plan's entry, or at a completed plan's end); a point no later than the last post-transfer step of a completed transfer counts as at that plan's end | `OnSiteInterventionRequired` |
 | no transfer-start marker | plain start |
 | transfer-start marker | `Restart`, for the plan of the marker's stage, with the VM state at its entry; `OnSiteInterventionRequired` if that plan never allows a restart |
@@ -202,6 +211,7 @@ ECU, it opens the job's journal (`Journal::open`) and classifies it.
 | Decision | What the runner does |
 |---|---|
 | plain start | runs the program from its start on the same journal; its step count starts at `restart::next_steps`, after the journal's last record, and the identity is read again. A program without a plan runs without a journal, when it has none or one that records no transfer |
+| `Failed` | ends in `JobError::ProcedureFailed` with the record's position, code and detail; nothing is sent to the ECU and no resume is counted (ADR-280) |
 | `OnSiteInterventionRequired` | ends in `JobError::OnSiteInterventionRequired` with the classification's reason; nothing is sent |
 | `Restart` | runs `restart::check_before_ecu`, then the gates of `restart::check_gates` (which promote the guards to the per-vehicle lock once the VIN matches, ADR-263), then the teardown of `restart::teardown` (ADR-264), then the default-session confirmation of `restart::confirm_default_session` (ADR-265). An ECU that cannot be confirmed ends the job in `JobError::OnSiteInterventionRequired(DefaultSessionNotConfirmed)`. Then `restart::check_identity` (step 3a) reads the VIN and the hardware identity again: a different one ends the job in `IdentityMismatch`, one that cannot be established in `OnSiteInterventionRequired(IdentityNotEstablished)`, and a matching VIN promotes the guards again (the lock's fallback when step 2 could not read it). Then `restart::check_state` (step 3b-2) reads the software version and decides between redoing the transfer and the read-back verification (`restart::check_state` below): a version nobody wrote ends the job in `OnSiteInterventionRequired(UnexpectedSoftwareVersion)`, one that cannot be established in `OnSiteInterventionRequired(SoftwareVersionNotEstablished)`. When the state check decides to redo the transfer, `restart::check_reentry` (step 4a) checks every declared precondition again through its default-session source: one that does not hold ends the job in `OnSiteInterventionRequired(PreconditionNotMet)`. When step 4a passes, the program's steps from the plan's entry boundary up to, not including, its erase run again from `RestartPoint::entry_state` (step 4b-2, ADR-273; `replay to the erase` below), and then `restart::check_before_erase` (step 4b-3) checks every declared precondition once more through its programming-session source: one that does not hold ends the job in `OnSiteInterventionRequired(PreconditionNotMetBeforeErase)` with no erase sent. After that check the same VM goes on from the erase as a first run does (step 4c, ADR-276; `redo from the erase` below), and the job ends as that first run would. When the state check decides the read-back verification, the program goes on after the plan instead (`continuation after the read-back verification` below), and the job ends as a first run would; the gates' reads, at most one ECUReset, the F186 reads, step 3a's two reads, step 3b-2's version reads, step 4a's precondition reads, the replayed steps, step 4b-3's precondition reads and then the redone transfer and the rest of the program, or after a verification the program's steps after the plan, reach the ECU |
 

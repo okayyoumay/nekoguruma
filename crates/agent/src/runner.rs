@@ -98,6 +98,16 @@ pub enum JobError {
     /// waits for someone on site.
     #[error("the job needs on-site intervention: {0:?}")]
     OnSiteInterventionRequired(OnSiteReason),
+    /// The procedure ended itself as failed (`Op::Fail`, ADR-280): terminal, journaled when the
+    /// job has a journal, and not resumed by a restart. `code` and `detail` are the procedure's,
+    /// cut to [`MAX_FAILURE_CODE_BYTES`] and [`MAX_FAILURE_DETAIL_BYTES`]; the detail is decoded
+    /// lossily.
+    #[error("the procedure ended as failed at {pc}: {code}: {detail}")]
+    ProcedureFailed {
+        pc: u32,
+        code: String,
+        detail: String,
+    },
     #[error("the program writes, but its guards do not hold the device's reprogramming slot")]
     NoReprogrammingSlot,
     #[error(
@@ -118,6 +128,23 @@ pub enum JobError {
     /// only a bug in this crate causes.
     #[error("the job's guards were missing when the per-vehicle lock was to be taken")]
     GuardsMissing,
+}
+
+/// The longest procedure failure code kept, in bytes (ADR-280).
+const MAX_FAILURE_CODE_BYTES: usize = 128;
+/// The longest procedure failure detail kept, in bytes (ADR-280).
+const MAX_FAILURE_DETAIL_BYTES: usize = 1024;
+
+/// `text` cut to at most `max` bytes, on a character boundary.
+fn truncated(mut text: String, max: usize) -> String {
+    if text.len() > max {
+        let mut end = max;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+    }
+    text
 }
 
 /// What a job does with its journal.
@@ -717,6 +744,12 @@ where
         RestartDecision::OnSiteInterventionRequired(reason) => {
             Err(JobError::OnSiteInterventionRequired(reason))
         }
+        // The procedure ended itself as failed: final, nothing is sent and no resume counted.
+        RestartDecision::Failed { at, code, detail } => Err(JobError::ProcedureFailed {
+            pc: at.pc,
+            code,
+            detail,
+        }),
         RestartDecision::PlainStart => match opened {
             Ok(journal) if !program.flash.is_empty() => {
                 let first_step = restart::next_steps(journal.state());
@@ -1056,6 +1089,19 @@ where
             Ok(StepOutcome::Finished) => return Ok(RunEnd::Finished(vm.state)),
             Ok(StepOutcome::Waiting(WaitingOn::Timer)) => std::thread::sleep(wait_poll),
             Ok(StepOutcome::Waiting(on)) => return Err(JobError::Unanswerable(on)),
+            Ok(StepOutcome::Failed(failure)) => {
+                // Journaled before the job ends, so a restart does not redo a transfer the
+                // procedure ended (ADR-280). A commit that fails is the job's error instead.
+                let code = truncated(failure.code, MAX_FAILURE_CODE_BYTES);
+                let detail = truncated(
+                    String::from_utf8_lossy(&failure.detail).into_owned(),
+                    MAX_FAILURE_DETAIL_BYTES,
+                );
+                if let Some(journal) = journal.as_deref_mut() {
+                    journal.procedure_failed(at, &code, &detail)?;
+                }
+                return Err(JobError::ProcedureFailed { pc, code, detail });
+            }
             Err(StepError::Vm(source)) => return Err(JobError::Vm { pc, source }),
             Err(StepError::Host(source)) => return Err(JobError::Host { pc, source }),
         }
@@ -1369,6 +1415,64 @@ mod tests {
             ),
             Err(JobError::Vm { pc: 1, .. })
         ));
+    }
+
+    fn failing(code: &str, detail: &[u8]) -> Program {
+        let mut program = program(vec![
+            Op::PushI64(1),
+            Op::Pop,
+            Op::PushBytes(1),
+            Op::Fail { code: 0 },
+        ]);
+        program.constants = vec![code.as_bytes().to_vec(), detail.to_vec()];
+        program
+    }
+
+    #[test]
+    fn a_declared_failure_ends_the_job_with_its_code_and_detail() {
+        let mut host = FakeHost::default();
+        let result = run_plain(
+            &failing("NOT_ERASED", b"block 3"),
+            &mut host,
+            JobLimits::default(),
+            &AtomicBool::new(false),
+        );
+        assert!(
+            matches!(
+                &result,
+                Err(JobError::ProcedureFailed { pc: 3, code, detail })
+                    if code == "NOT_ERASED" && detail == "block 3"
+            ),
+            "{result:?}"
+        );
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "the procedure ended as failed at 3: NOT_ERASED: block 3"
+        );
+        assert_eq!(host.requests, 0);
+    }
+
+    /// A detail that is not UTF-8 is decoded lossily, and the code and the detail are cut to
+    /// their limits on a character boundary (ADR-280).
+    #[test]
+    fn a_declared_failure_is_decoded_and_bounded() {
+        let mut host = FakeHost::default();
+        // 201 bytes; the limit falls inside a two-byte character.
+        let code = format!("a{}", "\u{e9}".repeat(100));
+        // Each invalid byte becomes a three-byte replacement character: 1500 bytes.
+        let result = run_plain(
+            &failing(&code, &[0xff; 500]),
+            &mut host,
+            JobLimits::default(),
+            &AtomicBool::new(false),
+        );
+        let Err(JobError::ProcedureFailed { code, detail, .. }) = result else {
+            panic!("{result:?}");
+        };
+        assert_eq!(code.len(), MAX_FAILURE_CODE_BYTES - 1);
+        assert!(code.starts_with("a\u{e9}"));
+        assert_eq!(detail.len(), MAX_FAILURE_DETAIL_BYTES - 1);
+        assert!(detail.chars().all(|c| c == char::REPLACEMENT_CHARACTER));
     }
 
     #[test]
@@ -3346,6 +3450,70 @@ mod tests {
             .unwrap()
             .facts
             .resume_count(crate::journal::StageId(7))
+    }
+
+    /// [`flash_program`] whose procedure ends itself as failed right after the erase, with the
+    /// erase's answer as the detail (ADR-280).
+    fn flash_program_failing_after_the_erase() -> Program {
+        let mut program = flash_program();
+        assert_eq!(program.code[ERASE as usize + 1], Op::Pop);
+        program.code[ERASE as usize + 1] = Op::Fail { code: 1 };
+        program.constants.push(b"ERASE_REFUSED".to_vec());
+        program
+    }
+
+    /// A procedure failure after the erase is journaled, and the restart does not resume the
+    /// job: it ends in the same failure with nothing sent and no resume counted, where a lost
+    /// erase answer would have restarted it.
+    #[test]
+    fn a_failure_after_the_erase_is_journaled_and_not_resumed() {
+        let program = flash_program_failing_after_the_erase();
+        let dir = journal_dir("procedure-failed");
+        let result = first_run(&program, &dir, JobLimits::default(), |_| {});
+        assert!(
+            matches!(
+                &result,
+                Err(JobError::ProcedureFailed { pc, code, detail })
+                    if *pc == ERASE + 1 && code == "ERASE_REFUSED" && detail == "q"
+            ),
+            "{result:?}"
+        );
+        let state = Journal::read(&dir, &job_key()).unwrap();
+        let failure = state
+            .facts
+            .procedure_failed
+            .clone()
+            .expect("a failure record");
+        assert_eq!(failure.at.pc, ERASE + 1);
+        assert_eq!(
+            (failure.code.as_str(), failure.detail.as_str()),
+            ("ERASE_REFUSED", "q")
+        );
+        assert!(state.facts.transfer.is_some(), "the transfer was started");
+        assert_eq!(
+            restart::classify(&program, Ok(&state)),
+            RestartDecision::Failed {
+                at: failure.at,
+                code: "ERASE_REFUSED".to_owned(),
+                detail: "q".to_owned()
+            }
+        );
+
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        host.voltage = Some(12_600);
+        let result = resume(&program, &dir, &mut host, false);
+        assert!(
+            matches!(
+                &result,
+                Err(JobError::ProcedureFailed { pc, code, .. })
+                    if *pc == ERASE + 1 && code == "ERASE_REFUSED"
+            ),
+            "{result:?}"
+        );
+        assert_eq!(host.sent(), []);
+        assert_eq!(host.voltage_reads, 0);
+        assert_eq!(resumes(&dir), 0);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// The done-when cases: a restart commits its resume before anything reaches the ECU, and

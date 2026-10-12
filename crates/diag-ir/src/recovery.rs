@@ -632,7 +632,8 @@ impl Program {
         for (index, op) in self.code.iter().enumerate() {
             let pc = index as u32;
             let successors: &[u32] = match *op {
-                Op::Ret => &[],
+                // A return or a declared failure ends the path (ADR-280).
+                Op::Ret | Op::Fail { .. } => &[],
                 Op::Jump(to) => &[to],
                 Op::JumpIfFalse(to) => &[to, pc + 1],
                 _ => &[pc + 1],

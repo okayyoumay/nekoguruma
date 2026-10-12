@@ -1,7 +1,7 @@
 # ADR-254: Starlark Replaces JavaScript as the Proprietary Procedure Language
 
 **Date:** 2026-10-09
-**Status:** Accepted
+**Status:** Accepted (`diag.fail` has an instruction since ADR-280)
 **Affects:** `docs/system-architecture.md` 8.2, 8.4, 12; `diag-frontend` (`docs/starlark-subset.md`, `examples/sequence.example.star`); `diag-ir` `ir.fbs` `EcuDocument.source_format`
 
 ## Context
@@ -66,8 +66,8 @@ The maintainer asked which language fits the IR best. Candidates compared:
   and attaches each by its line to the following statement.
 - Floor division needs the remainder and negation instructions the IR does not have yet
   (ADR-233 consequences); the transpiler's first procedures need them anyway.
-- The `diag` API is wider than the current instruction set: `diag.fail`, `diag.ecu_info` and
-  `diag.precondition` have no instruction, and `Log` takes only a constant message. The subset
+- The `diag` API is wider than the current instruction set: `diag.ecu_info` and
+  `diag.precondition` have no instruction (`diag.fail` got one in ADR-280), and `Log` takes only a constant message. The subset
   specification lists how each call lowers; a call whose instruction does not exist yet is
   rejected at ingestion until the variant is appended.
 - The VM's values are `I64`, `F64`, `Bool` and `Bytes`, so lists and dicts exist only at

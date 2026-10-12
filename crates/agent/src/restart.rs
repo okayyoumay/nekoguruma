@@ -53,6 +53,13 @@ pub enum RestartDecision {
     Restart(Box<RestartPoint>),
     /// The job must not go on automatically (design 5.6, 8.10.1).
     OnSiteInterventionRequired(OnSiteReason),
+    /// The procedure ended itself as failed (`Op::Fail`, ADR-280): the job is over and is not
+    /// resumed, whatever its transfer state. Nothing is sent and no resume is counted.
+    Failed {
+        at: StepRef,
+        code: String,
+        detail: String,
+    },
 }
 
 /// What a restart starts from.
@@ -305,7 +312,8 @@ pub struct Confirmation {
 /// `Journal::open`) gave it. No journal at all (`JournalError::NotFound`) is a plain start only
 /// for a program without a flash recovery plan, which keeps none. For a program with one it is
 /// on-site intervention: the runner creates the journal before it sends anything, so a missing
-/// one cannot be told from one lost after an erase.
+/// one cannot be told from one lost after an erase. A journal that holds a procedure failure is
+/// decided first, as [`RestartDecision::Failed`], whatever else it holds (ADR-280).
 pub fn classify(
     program: &Program,
     journal: Result<&JournalState, &JournalError>,
@@ -325,6 +333,15 @@ pub fn classify(
         }
     };
     let facts = &state.facts;
+    // A declared failure is final: it is checked before anything that could restart the job
+    // (ADR-280).
+    if let Some(failure) = &facts.procedure_failed {
+        return RestartDecision::Failed {
+            at: failure.at,
+            code: failure.code.clone(),
+            detail: failure.detail.clone(),
+        };
+    }
     let interrupted_at = interruption_point(facts);
     if let Some(at) = interrupted_at
         && let Some(reason) = recovery_required(program, effective_point(program, facts, at))

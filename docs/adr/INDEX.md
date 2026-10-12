@@ -22,10 +22,10 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-016](ADR-016-hard-channel-error-handling.md) | Hard Channel Error: State Transitions and Error Event | **Superseded by ADR-019** | `j2534-0404-service` events |
 | [ADR-017](ADR-017-j2534-1-protocol-scope.md) | J2534-1 Protocol Scope — Unsupported Protocol Features Not Implemented | **Superseded by ADR-152** | `j2534-0404-service` service, comparam_support, names |
 | [ADR-018](ADR-018-rc-pending-auto-handling.md) | Automatic Handling of Response-Pending NRCs (0x78 / 0x21 / 0x23) | Accepted | `j2534-0404-service` service, events |
-| [ADR-019](ADR-019-cll-event-ordering-on-disconnect-and-hard-error.md) | CLL/COP Event Ordering on Disconnect and Hard Error | Accepted | `j2534-0404-service` events, rpc_link |
+| [ADR-019](ADR-019-cll-event-ordering-on-disconnect-and-hard-error.md) | CLL/COP Event Ordering on Disconnect and Hard Error | Accepted (the module handle in events is the selected one on a worker started with a label, ADR-281) | `j2534-0404-service` events, rpc_link |
 | [ADR-020](ADR-020-module-level-state-tracking.md) | Module-Level State Tracking (ModuleState) | Accepted (GetLastError read path amended by ADR-105) | `j2534-0404-service` service, events, rpc_link |
 | [ADR-021](ADR-021-pduckopst-waiting-executing-cop-tracking.md) | PduCopstWaiting via executing_cop Tracking | **Superseded by ADR-117** | `j2534-0404-service` service, events, rpc_link |
-| [ADR-022](ADR-022-received-frame-cop-handle-attribution.md) | ReceivedFrame cop_handle Attribution | Accepted | `j2534-0404-service` service, events, rpc_primitive |
+| [ADR-022](ADR-022-received-frame-cop-handle-attribution.md) | ReceivedFrame cop_handle Attribution | Accepted (the module handle in events is the selected one on a worker started with a label, ADR-281) | `j2534-0404-service` service, events, rpc_primitive |
 | [ADR-023](ADR-023-channel-protocol-abstraction.md) | Service-Level Channel Protocol Abstraction (`ChannelProtocol`) | Accepted (`ChannelKey` shape superseded by ADR-156) | `j2534-0404-service` names, rpc_link, rpc_primitive, comparam_support |
 | [ADR-024](ADR-024-config-path-root-embed.md) | Build-time Configuration of the Config File Root | Accepted (default `VCI_CONFIG_PATH` and the non-Windows root superseded by ADR-228) | `vci-service-launcher` build.rs, config.rs |
 | [ADR-025](ADR-025-config-root-test-override.md) | Thread-Local Test Override for config_root() | Accepted | `vci-service-launcher` config.rs |
@@ -109,7 +109,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-108](ADR-108-enum-newtype-underlying-type-is-target-abi-dependent.md) | Bindgen Enum-Newtype Underlying Type Is Target-ABI-Dependent — Always Cast, Never Assume `u32` | Accepted | `iso22900-sys` bindings (all targets), `iso22900` safety.rs, lib.rs, item/data/event.rs, item/data/io.rs |
 | [ADR-110](ADR-110-rsc-locked-error-event-replaces-synchronous-lock-rejection.md) | `PDU_ERR_EVT_RSC_LOCKED` Error Event Replaces Synchronous Physical-ComParam-Lock Rejection (Supersedes ADR-044) | Accepted | `j2534-0404-service` rpc_primitive, rpc_link, comparam_support, events |
 | [ADR-111](ADR-111-coptstartcomm-optional-message-transmit.md) | CoptStartcomm's Optional Message Is Transmitted, Not Discarded | Accepted | `j2534-0404-service` service, rpc_primitive, events |
-| [ADR-112](ADR-112-cop-handle-attribution-on-error-events.md) | cop_handle Attribution on Async Error Events and the Last-Error Snapshot (Amends ADR-105; Corrects ADR-022) | Accepted | `j2534-0404-service` service, events, rpc_primitive, rpc_misc, error |
+| [ADR-112](ADR-112-cop-handle-attribution-on-error-events.md) | cop_handle Attribution on Async Error Events and the Last-Error Snapshot (Amends ADR-105; Corrects ADR-022) | Accepted (the module handle in events is the selected one on a worker started with a label, ADR-281) | `j2534-0404-service` service, events, rpc_primitive, rpc_misc, error |
 | [ADR-114](ADR-114-stop-clear-msg-filter-fct-failed-on-native-stop-failure.md) | STOP_MSG_FILTER/CLEAR_MSG_FILTER Report PDU_ERR_FCT_FAILED on a Native Stop Failure (Supersedes ADR-079 Items 12-13 Error Reporting) | Accepted | `j2534-0404-service` rpc_misc, `j2534-0404-mock` |
 | [ADR-115](ADR-115-pdu-evt-data-lost-emission.md) | `PDU_EVT_DATA_LOST` Emission on CLL Event-Queue Overflow | Accepted | `j2534-0404-service` events, rpc_primitive, rpc_misc, rpc_link, service |
 | [ADR-116](ADR-116-txflagraw-iso-22900-2-d21-layout.md) | `TxFlagRaw` Is the ISO 22900-2 D.2.1 Byte-Array Layout, Not a Native J2534 `TxFlags` u32 | Accepted | `j2534-0404-service` rpc_primitive, `vci-service-interface` proto, bindings |
@@ -290,7 +290,7 @@ the predecessor repository these ADRs came from.
 - ADR-012
 - ADR-013 (superseded)
 - ADR-015 (superseded)
-- ADR-019
+- ADR-019 (the module handle in events is the selected one on a worker started with a label, ADR-281)
 - ADR-020
 - ADR-045
 - ADR-086
@@ -308,7 +308,7 @@ the predecessor repository these ADRs came from.
 - ADR-086
 - ADR-087
 - ADR-111
-- ADR-112
+- ADR-112 (the module handle in events is the selected one on a worker started with a label, ADR-281)
 - ADR-117 (A2-24 SubscribeEvent gap closed by ADR-118)
 - ADR-118
 - ADR-128
@@ -325,7 +325,7 @@ the predecessor repository these ADRs came from.
 - ADR-009
 - ADR-014
 - ADR-018
-- ADR-022 (ErrorData claim corrected by ADR-112)
+- ADR-022 (ErrorData claim corrected by ADR-112; the module handle in events is the selected one on a worker started with a label, ADR-281)
 - ADR-061 (superseded)
 - ADR-097 (superseded)
 - ADR-098 (residual closed by ADR-143; RxFlag byte-1 scheme extended by ADR-146; amended by ADR-151; ADR-061-inherited RxStatus-CAN-ID premise narrowed by ADR-222)
@@ -524,7 +524,7 @@ the predecessor repository these ADRs came from.
 ### Error Handling
 - ADR-004 (superseded)
 - ADR-016 (superseded)
-- ADR-019
+- ADR-019 (the module handle in events is the selected one on a worker started with a label, ADR-281)
 - ADR-020 (GetLastError read path amended by ADR-105)
 - ADR-026
 - ADR-057 (amended by ADR-102)
@@ -533,7 +533,7 @@ the predecessor repository these ADRs came from.
 - ADR-089
 - ADR-102
 - ADR-105 (amended by ADR-112; SET_PROG_VOLTAGE mapping corrected by A2-21)
-- ADR-112
+- ADR-112 (the module handle in events is the selected one on a worker started with a label, ADR-281)
 - ADR-114
 - ADR-115
 - ADR-126

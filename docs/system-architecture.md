@@ -645,6 +645,8 @@ flowchart TD
     CFG --> PATH["Resolve absolute library path"]
     PATH --> ACL{"Writable by<br/>regular users?"}
     ACL -->|Yes, device mode| REJ["Refuse load, report"]
+    ACL -->|Yes, user mode| WARN["Report findings"]
+    WARN --> ABI
     ACL -->|No| ABI["Determine ABI from header"]
     ABI --> HAVE{"Matching worker<br/>bundled?"}
     HAVE -->|No| UNSUP["Report UNSUPPORTED_ABI"]

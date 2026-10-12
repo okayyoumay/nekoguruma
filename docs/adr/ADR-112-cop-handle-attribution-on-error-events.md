@@ -1,7 +1,7 @@
 # ADR-112: `cop_handle` Attribution on Async Error Events and the Last-Error Snapshot
 
 **Date:** 2026-07-22
-**Status:** Accepted (amends ADR-105; corrects a claim in ADR-022)
+**Status:** Accepted (amends ADR-105; corrects a claim in ADR-022; the module handle in events is the selected one on a worker started with a label, ADR-281)
 **Affects:**
 - `j2534-0404-service/src/service.rs` (`TrackedError`, `CopRef`, `ModuleState::default`)
 - `j2534-0404-service/src/service/events.rs` (`send_error_event`,

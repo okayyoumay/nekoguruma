@@ -2,7 +2,7 @@
 
 **Date:** 2026-10-12
 **Status:** Accepted
-**Affects:** `docs/system-architecture.md` (3.4, 7.1, 7.2, 8.2.6, 8.8.1), `docs/j2534-0404-architecture.md`, `crates/vci-service-config` (`find_library_path`, `list_configured_library_paths`, docs), `crates/j2534-0404-registry`, `crates/iso22900-registry`, `crates/j2534-0404-service`, `crates/iso22900-service`, `crates/agent` (`launch.rs`, `link.rs`); ADR-029, ADR-030, ADR-033, ADR-034, ADR-035, ADR-036, ADR-107, ADR-195, ADR-223, ADR-235, ADR-240, ADR-228, ADR-270, ADR-278, ADR-280 (consequence on schema compatibility)
+**Affects:** `docs/system-architecture.md` (3.4, 7.1, 7.2, 7.3, 8.2.6, 8.8.1, 13.5), `docs/j2534-0404-architecture.md`, `crates/vci-service-config` (`find_library_path`, `list_configured_library_paths`, docs), `crates/j2534-0404-registry`, `crates/iso22900-registry`, `crates/j2534-0404-service`, `crates/iso22900-service`, `crates/agent` (`launch.rs`, `link.rs`); ADR-019, ADR-022, ADR-029, ADR-030, ADR-033, ADR-034, ADR-035, ADR-036, ADR-107, ADR-112, ADR-195, ADR-223, ADR-228, ADR-235, ADR-240, ADR-270, ADR-278, ADR-280 (consequence on schema compatibility)
 
 ## Context
 
@@ -71,7 +71,8 @@ questions were left open before the worker services and the agent could switch o
    numbers modules 1..N in configuration order, so its position in the list is the handle in
    every mode. It lists only that row from `GetModuleIds` with that handle and refuses every
    other handle (Consequences). On such a worker `PDU_HANDLE_UNDEF` ("the current module")
-   resolves to the selected handle, and module-level event and subscription attribution uses
+   resolves to the selected handle, and the module handle in every event (module-level events
+   and subscriptions, and the CLL and ComPrimitive events of ADR-019, ADR-022 and ADR-112) is
    the selected handle too, where ADR-107 resolved both to handle 1; a worker started with the
    second entry therefore never reports or accepts handle 1. This closes ADR-107 Accepted
    Residual 4 for workers started with a label. The agent takes the handle from the single row it receives and

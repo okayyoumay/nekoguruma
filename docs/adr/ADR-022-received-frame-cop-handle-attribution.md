@@ -2,7 +2,7 @@
 
 **Date:** 2026-06-29
 **Status:** Accepted (the `ErrorData`/`send_error_event` claim below is
-corrected by ADR-112 — see note)
+corrected by ADR-112 — see note; the module handle in events is the selected one on a worker started with a label, ADR-281)
 **Affects:**
 - `j2534-0404-service/src/service.rs` (`ReceivedFrame`)
 - `j2534-0404-service/src/service/events.rs` (`make_cll_notification`, `poll_rx`,

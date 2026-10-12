@@ -1,4 +1,5 @@
 use iso22900::{ComLogicalLinkHandle, DPduApi, DPduApiError, LastErrorInfo, ModuleHandle};
+use ngr_library_resolver::iso22900::ResolveError;
 use tonic::{Code, Status};
 use tracing::{error, warn};
 use vci_service_interface::{
@@ -41,26 +42,16 @@ pub(crate) fn api_not_initialized_status(message: impl Into<String>) -> Status {
     status_with_error_detail(Code::FailedPrecondition, message, detail)
 }
 
-pub fn map_registry_error(error: iso22900_registry::RegistryError) -> Status {
+/// Maps a failed library lookup (design 7.1) to a client-facing [`Status`]. Only a name with no
+/// entry is reported as such; every other failure may name a local path, so it is logged and a
+/// fixed message is returned (ADR-089).
+pub fn map_resolve_error(error: ResolveError) -> Status {
     match error {
-        iso22900_registry::RegistryError::Io(e) => {
-            sanitized_internal("I/O error while searching for PDU libraries", e)
-        }
-        iso22900_registry::RegistryError::InvalidUri(e) => sanitized_internal(
-            "invalid URI in registry file while searching for PDU libraries",
-            e,
-        ),
-        iso22900_registry::RegistryError::NotFound(name) => {
+        ResolveError::NotFound { ref name, .. } => {
+            warn!(%error, "D-PDU API library not found");
             Status::not_found(format!("no PDU library found with name '{name}'"))
         }
-        iso22900_registry::RegistryError::Url(e) => sanitized_internal(
-            "failed to parse registry file while searching for PDU libraries",
-            e,
-        ),
-        iso22900_registry::RegistryError::Xml(e) => sanitized_internal(
-            "failed to parse registry file while searching for PDU libraries",
-            e,
-        ),
+        other => sanitized_internal("failed to resolve the D-PDU API library", other),
     }
 }
 
@@ -73,7 +64,7 @@ pub fn map_registry_error(error: iso22900_registry::RegistryError) -> Status {
 /// etc.) do not occur once construction has already succeeded (ADR-089),
 /// but are mapped to `PDU_ERR_FCT_FAILED` as a safe fallback, with the
 /// underlying error sanitized out of the client-facing message exactly like
-/// `map_construct_error`/`map_registry_error`.
+/// `map_construct_error`/`map_resolve_error`.
 fn runtime_error_parts(error: &DPduApiError) -> (Code, String, ErrorDetail) {
     match error {
         DPduApiError::PduError(code) => (

@@ -19,7 +19,7 @@ Hosts gRPC API operations and manages lifecycle through stdio JSON-RPC and local
 - Preserve local-instance ownership semantics for stop behavior.
 - Update lifecycle behavior and docs together when changing shutdown/startup flows.
 - Maintain deterministic subscription termination behavior under local stop and process-exit paths.
-- `get_status`'s `error` field and any construction/registry-error `Status` returned from `error.rs` must stay sanitized: never format a raw `libloading::Error`/`io::Error`/underlying registry error (Display or Debug) into client- or launcher-facing text, since these can contain local filesystem paths. Log the full error server-side via `tracing::error!` instead (ADR-089).
+- `get_status`'s `error` field and any construction/resolve-error `Status` returned from `error.rs` must stay sanitized: never format a raw `libloading::Error`/`io::Error`/underlying registry error (Display or Debug) into client- or launcher-facing text, since these can contain local filesystem paths. Log the full error server-side via `tracing::error!` instead (ADR-089).
 
 ## Change Checklist
 

@@ -298,7 +298,7 @@ impl Iso22900Service {
     }
 }
 
-// Relies on the debug-only runtime VCI_CONFIG_PATH override (see ADR-073),
+// Relies on the debug-only runtime root-file and config overrides (ADR-282, ADR-073),
 // so the whole module is debug-only, matching `rpc.rs`'s own test module.
 #[cfg(all(test, debug_assertions))]
 mod module_disconnect_cop_tag_race_tests {
@@ -311,25 +311,10 @@ mod module_disconnect_cop_tag_race_tests {
     };
     use vci_service_launcher::vci_server::VciServer;
 
-    /// Duplicates `rpc.rs::tests::set_mock_library_path_config` (private to
-    /// that module) rather than sharing it -- matches this repo's own
-    /// established precedent of each test surface owning its copy of this
-    /// setup (see `tests/grpc_mock.rs::TestServer::start`'s doc comment).
-    fn set_mock_library_path_config() {
-        let lib_path = iso22900_mock::mock_library_path()
-            .expect("mock cdylib should be discoverable after build");
-        let config_path = std::env::temp_dir().join(format!(
-            "iso22900-service-rpc-module-disconnect-race-test-config-{}.toml",
-            std::process::id()
-        ));
-        let config_toml = format!(
-            "[config.apis.iso22900.libs.\"TestLib\"]\nlibrary_path = {:?}\n",
-            lib_path.display().to_string()
-        );
-        std::fs::write(&config_path, config_toml).expect("config file should be writable");
-        unsafe {
-            std::env::set_var("VCI_CONFIG_PATH", &config_path);
-        }
+    /// Has `Iso22900Service::new` resolve `"TestLib"` to the compiled `iso22900-mock` cdylib
+    /// (see `test_support::use_mock_library`). Callers must be `#[serial]`.
+    fn set_mock_library_config() {
+        crate::test_support::use_mock_library("rpc-module-test", "");
     }
 
     fn default_resource_data() -> ResourceData {
@@ -385,7 +370,7 @@ mod module_disconnect_cop_tag_race_tests {
     #[tokio::test]
     #[serial]
     async fn module_disconnect_sweep_does_not_erase_a_racing_successors_cop_tag() {
-        set_mock_library_path_config();
+        set_mock_library_config();
         let service = Iso22900Service::new(
             StartupConfig {
                 library_name: "TestLib".into(),

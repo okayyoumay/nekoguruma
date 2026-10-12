@@ -161,21 +161,16 @@ without a specific library name to attach it to.
 **Lookup is exposed through `iso22900-registry::find_library_path()` and
 `j2534-0404-registry::find_library_path()`** (both thin wrappers around this
 crate's `find_library_path()`, scoped to their own API name), not called
-directly from this crate by `iso22900-service` / `j2534-0404-service` — see
-ADR-034. `iso22900-service` and `j2534-0404-service` do not call
-`find_library_path()` directly either: each calls its registry's single
-`resolve_library_path()` function, which applies the priority itself (see
-ADR-035). When set for a library name, it is used directly and the
-platform-specific fallback — the Windows registry (`j2534-0404-registry`,
-`HKLM\SOFTWARE\PassThruSupport.04.04`) for `j2534-0404-service`, or RDF-based
-lookup (`iso22900-registry`) for `iso22900-service` — is not consulted for
-that name. When unset, `resolve_library_path()` falls back to its own
-registry's auto-discovery mechanism as before — so `library_path` is the
-only way to resolve a library on non-Windows platforms, where the J2534
-registry is unavailable and (unlike RDF, which still has a hardcoded
-`/etc/pdu_api_root.xml` path) there is no other way to point
-`iso22900-service` at a library without touching that fixed path or the
-Windows registry.
+directly from this crate by `j2534-0404-service` — see ADR-034.
+`j2534-0404-service` does not call `find_library_path()` directly either: it
+calls its registry's single `resolve_library_path()` function, which applies
+the priority itself (see ADR-035). When set for a library name, it is used
+directly and the Windows registry (`j2534-0404-registry`,
+`HKLM\SOFTWARE\PassThruSupport.04.04`) is not consulted for that name. When
+unset, `resolve_library_path()` falls back to the registry as before.
+`iso22900-service` does not read `library_path`: it resolves its library
+through `ngr-library-resolver`'s D-PDU API root description file lookup
+(design 7.1, ADR-281 Decision item 1).
 
 The registry crates' `enumerate_libraries()` also reads this table (via
 `list_configured_library_paths()`), so config-only libraries — ones with no

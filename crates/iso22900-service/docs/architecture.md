@@ -157,10 +157,11 @@ Conversion is in `service/convert.rs`.
 | `DPduApiError::PduStatus(PDU_ERR_INVALID_PARAMETERS)` | `INVALID_ARGUMENT` |
 | `DPduApiError::PduStatus(PDU_ERR_SHARING_VIOLATION)` | `ALREADY_EXISTS` |
 | Other `PduStatus` | `INTERNAL` |
-| `RegistryError::NotFound` | `NOT_FOUND` |
-| `RegistryError::Io` | `INTERNAL` |
+| `ResolveError::NotFound` (no root description file entry for the name) | `NOT_FOUND` |
+| Other `ResolveError` (no or unreadable root description file, invalid entry) | `INTERNAL` |
+| Failed design 7.2 pre-load check in device mode | `FAILED_PRECONDITION` |
 
-Mapping logic is in `error.rs`. `map_construct_error` and `map_registry_error`
+Mapping logic is in `error.rs` and `preload.rs`. `map_construct_error` and `map_resolve_error`
 log the full underlying error (which may contain a local filesystem path or
 raw OS error text, e.g. from a failed library load) via `tracing::error!` and
 return a sanitized, generic message in the `Status` — see ADR-089.
@@ -174,13 +175,19 @@ Startup is handled by `vci-service-launcher::start_service::<Iso22900Service>()`
 1. Parse startup argument: `iso22900:<library-name>?mode=<device|user>&port=<u16>` (`config.rs`).
 2. Initialize logging from the `config.toml` file (loaded via `vci-service-config`).
 3. Call `Iso22900Service::new(config)`:
-   - Resolve `<library-name>` to a DLL path via a single call to
-     `iso22900_registry::resolve_library_path()`: a configured
-     `config.toml` `library_path` entry
-     (`config.apis.iso22900.libs.<lib>.library_path`), resolved via
-     `iso22900_registry::find_library_path()`, takes priority when present;
-     otherwise it falls back to `iso22900-registry`'s RDF-based lookup
-     (see ADR-030, ADR-034, ADR-035).
+   - Resolve `<library-name>` through `ngr_library_resolver::iso22900::resolve()`
+     (design 7.1, ADR-266): the D-PDU API root description file entry with that
+     short name gives the library path. The root description file is the one
+     the registry names on Windows and the fixed build-time path on Linux; a
+     debug build takes it from `NGR_PDU_API_ROOT_FILE` when that is set
+     (ADR-228, ADR-282), which is how the tests point the service at the mock.
+     No `config.toml` key names the library (ADR-281 Decision item 1).
+   - Run the design 7.2 pre-load checks (`preload.rs`, through
+     `ngr_library_resolver::check_library` with the system owners as the
+     trusted set) on the library and the files that named it. In device mode a
+     failure refuses the library with `FAILED_PRECONDITION`; in user mode the
+     findings are logged as a warning and the library is loaded. What the check
+     opened stays open until the library is mapped (ADR-278).
    - Load the D-PDU DLL from the resolved path.
    - Call `PDUConstruct` to initialize the API.
    - Spawn the event notification routing task.

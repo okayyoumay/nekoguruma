@@ -22,16 +22,14 @@ let lib_path = mock_library_path().expect("build the mock first");
 let api = iso22900::DPduApi::new(&lib_path).expect("failed to load mock");
 ```
 
-`iso22900-service` tests instead point `vci-service-launcher`'s
-`config.toml` `library_path` override at `lib_path` (via `VCI_CONFIG_PATH`)
-so `Iso22900Service::new` resolves the mock without needing an RDF file at
-all — see `iso22900-service/tests/grpc_mock.rs` and `stdio_startup.rs` for
-the pattern. `iso22900-registry`'s RDF-based resolution has no env-var
-override; a test RDF can still be generated with
-`mock_root_definition_file_path()` for scenarios that specifically exercise
-RDF parsing (e.g. `iso22900-registry`'s own tests), but it requires either
-the Windows registry or the hardcoded `/etc/pdu_api_root.xml` path to be
-pointed at it, which `library_path` avoids entirely.
+`iso22900-service` tests instead write a root description file naming
+`lib_path` with `write_root_file()` and point the debug-only
+`NGR_PDU_API_ROOT_FILE` override at it (ADR-282), so `Iso22900Service::new`
+resolves the mock through `ngr-library-resolver` the way it resolves a vendor
+library; `config.toml` (via `VCI_CONFIG_PATH`) then holds only per-library
+settings such as `vendor_struct_types`. See `iso22900-service`'s
+`src/test_support.rs`, `tests/grpc_mock.rs` and `tests/stdio_startup.rs` for
+the pattern.
 
 Before each test, reset all mock state via the back-door export:
 
@@ -118,19 +116,19 @@ The `rlib` portion exports the following Rust functions for use in test setup:
 |----------|-------------|
 | `mock_library_path() -> Result<PathBuf, io::Error>` | Locate the compiled mock DLL in the Cargo target directory. Searches `CARGO_TARGET_DIR` first, then `<workspace>/target/`. |
 | `mock_library_file_name() -> &'static str` | Return the platform-specific file name (`iso22900_mock.dll`, `libiso22900_mock.so`, `libiso22900_mock.dylib`). |
-| `mock_root_definition_file_path() -> Result<PathBuf, io::Error>` | Return or generate a Root Description File (XML) at `<CARGO_MANIFEST_DIR>/mock_root_definition.xml`. The generated RDF points to the located mock DLL. |
+| `write_root_file(dir, short_name, library) -> Result<PathBuf, io::Error>` | Write a D-PDU API root description file `<dir>/pdu_api_root.xml` with one entry, `short_name`, whose `LIBRARY_FILE` names `library`, and return its path. |
+| `file_uri(path) -> String` | The `file:` URI of an absolute path as a `LIBRARY_FILE` names it (`file:///opt/x.so`, `file:///C:/x.dll`), percent-encoding bytes outside the unreserved set. |
 
-### Generated RDF Format
+### Generated root description file
 
 ```xml
-<MVCI_PDU_APIS>
-    <MVCI_PDU_API>
-        <SHORT_NAME>TestLib</SHORT_NAME>
-        <DESCRIPTION>Test library</DESCRIPTION>
-        <SUPPLIER_NAME>TestSupplier</SUPPLIER_NAME>
-        <LIBRARY_FILE URI="file:///<absolute-path-to-mock-dll>"/>
-    </MVCI_PDU_API>
-</MVCI_PDU_APIS>
+<?xml version="1.0" encoding="UTF-8"?>
+<MVCI_PDU_API_ROOT>
+  <MVCI_PDU_API>
+    <SHORT_NAME>TestLib</SHORT_NAME>
+    <LIBRARY_FILE URI="file:///<absolute-path-to-mock-library>"/>
+  </MVCI_PDU_API>
+</MVCI_PDU_API_ROOT>
 ```
 
 ---

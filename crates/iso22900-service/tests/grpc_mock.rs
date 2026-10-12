@@ -1,4 +1,5 @@
-// Relies on the debug-only runtime VCI_CONFIG_PATH override; see ADR-073.
+// Relies on the debug-only runtime overrides of the D-PDU API root description
+// file (ADR-282) and of `config.toml` (ADR-073).
 #![cfg(debug_assertions)]
 
 use std::path::Path;
@@ -54,19 +55,22 @@ impl TestServer {
     async fn start_with_extra_config(extra_config_toml: &str) -> Self {
         let lib_path = iso22900_mock::mock_library_path()
             .expect("mock cdylib should be discoverable after build");
-        // Per-process-unique path (ADR-195): closes a cross-process race where
-        // two separate `cargo test` processes could otherwise write/read the
-        // same fixed config file path concurrently.
-        let config_path = std::env::temp_dir().join(format!(
-            "iso22900-service-grpc-mock-test-config-{}.toml",
+        // Per-process-unique directory (ADR-195): closes a cross-process race
+        // where two separate `cargo test` processes could otherwise write/read
+        // the same fixed files concurrently.
+        let dir = std::env::temp_dir().join(format!(
+            "iso22900-service-grpc-mock-test-{}",
             std::process::id()
         ));
-        let config_toml = format!(
-            "[config.apis.iso22900.libs.\"TestLib\"]\nlibrary_path = {:?}\n{extra_config_toml}",
-            lib_path.display().to_string()
-        );
-        std::fs::write(&config_path, config_toml).expect("config file should be writable");
+        std::fs::create_dir_all(&dir).expect("test directory should be creatable");
+        // The root description file names the mock as "TestLib"; the
+        // `config.toml` holds only per-library settings.
+        let root_file = iso22900_mock::write_root_file(&dir, "TestLib", &lib_path)
+            .expect("root description file should be writable");
+        let config_path = dir.join("config.toml");
+        std::fs::write(&config_path, extra_config_toml).expect("config file should be writable");
         unsafe {
+            std::env::set_var("NGR_PDU_API_ROOT_FILE", &root_file);
             std::env::set_var("VCI_CONFIG_PATH", &config_path);
         }
         let (service_shutdown_tx, service_shutdown_rx) = tokio::sync::watch::channel(false);

@@ -1,8 +1,9 @@
-// Relies on the debug-only runtime VCI_CONFIG_PATH override; see ADR-073.
+// Relies on the debug-only runtime overrides of the D-PDU API root description
+// file (ADR-282) and of `config.toml` (ADR-073).
 #![cfg(debug_assertions)]
 
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -20,29 +21,53 @@ use vci_service_interface::{
 };
 
 const VCI_CONFIG_PATH_ENV: &str = "VCI_CONFIG_PATH";
+const ROOT_FILE_ENV: &str = "NGR_PDU_API_ROOT_FILE";
 const TEST_LIBRARY_NAME: &str = "mock-stdio-library";
 
-fn unique_temp_path(file_name: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock should be after unix epoch")
-        .as_nanos();
-    std::env::temp_dir().join(format!("iso22900-service-{nanos}-{file_name}"))
+/// A per-test directory holding the root description file and `config.toml`
+/// the spawned service reads through the debug-only overrides.
+struct TestFiles {
+    dir: PathBuf,
+    root_file: PathBuf,
+    config: PathBuf,
 }
 
-/// Writes a `config.toml` that points `TEST_LIBRARY_NAME`'s `library_path`
-/// at the compiled mock cdylib, so the spawned service resolves it without
-/// needing an RDF file.
-fn write_test_library_config() -> PathBuf {
+impl TestFiles {
+    /// Writes a root description file naming `library` as `library_name`, and
+    /// an empty `config.toml` (no per-library settings).
+    fn new(library_name: &str, library: &Path) -> Self {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after unix epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "iso22900-service-stdio-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("test directory should be creatable");
+        let root_file = iso22900_mock::write_root_file(&dir, library_name, library)
+            .expect("root description file should be writable");
+        let config = dir.join("config.toml");
+        std::fs::write(&config, "").expect("test config file should be writable");
+        Self {
+            dir,
+            root_file,
+            config,
+        }
+    }
+}
+
+impl Drop for TestFiles {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Test files that name the compiled mock cdylib as `TEST_LIBRARY_NAME`.
+fn write_test_library_config() -> TestFiles {
     let mock_library =
         mock_library_path().expect("mock library should be discoverable after build");
-    let config_path = unique_temp_path("config.toml");
-    let config_toml = format!(
-        "[config.apis.iso22900.libs.{TEST_LIBRARY_NAME:?}]\nlibrary_path = {:?}\n",
-        mock_library.display().to_string()
-    );
-    std::fs::write(&config_path, config_toml).expect("test config file should be writable");
-    config_path
+    TestFiles::new(TEST_LIBRARY_NAME, &mock_library)
 }
 
 fn default_resource_data() -> ResourceData {
@@ -88,12 +113,13 @@ async fn create_default_cll(
 #[tokio::test]
 #[serial]
 async fn startup_argument_auto_starts_grpc_and_stdio_can_stop_process() {
-    let config_path = write_test_library_config();
+    let files = write_test_library_config();
     let exe = env!("CARGO_BIN_EXE_iso22900-service");
 
     let mut child = Command::new(exe)
         .arg(format!("iso22900:{TEST_LIBRARY_NAME}?mode=user"))
-        .env(VCI_CONFIG_PATH_ENV, &config_path)
+        .env(VCI_CONFIG_PATH_ENV, &files.config)
+        .env(ROOT_FILE_ENV, &files.root_file)
         // These tests exercise stdio/gRPC startup mechanics directly (no
         // manager involved to push an auth key via `set_auth_key`), so
         // disable ADR-221's listener auth the same way a manager-less dev
@@ -180,18 +206,19 @@ async fn startup_argument_auto_starts_grpc_and_stdio_can_stop_process() {
         "child exit status should be successful"
     );
 
-    let _ = std::fs::remove_file(&config_path);
+    drop(files);
 }
 
 #[tokio::test]
 #[serial]
 async fn stop_notification_without_id_exits_process_without_response() {
-    let config_path = write_test_library_config();
+    let files = write_test_library_config();
     let exe = env!("CARGO_BIN_EXE_iso22900-service");
 
     let mut child = Command::new(exe)
         .arg(format!("iso22900:{TEST_LIBRARY_NAME}?mode=user"))
-        .env(VCI_CONFIG_PATH_ENV, &config_path)
+        .env(VCI_CONFIG_PATH_ENV, &files.config)
+        .env(ROOT_FILE_ENV, &files.root_file)
         // These tests exercise stdio/gRPC startup mechanics directly (no
         // manager involved to push an auth key via `set_auth_key`), so
         // disable ADR-221's listener auth the same way a manager-less dev
@@ -236,18 +263,19 @@ async fn stop_notification_without_id_exits_process_without_response() {
         "child exit status should be successful"
     );
 
-    let _ = std::fs::remove_file(&config_path);
+    drop(files);
 }
 
 #[tokio::test]
 #[serial]
 async fn process_exits_when_stdin_is_closed() {
-    let config_path = write_test_library_config();
+    let files = write_test_library_config();
     let exe = env!("CARGO_BIN_EXE_iso22900-service");
 
     let mut child = Command::new(exe)
         .arg(format!("iso22900:{TEST_LIBRARY_NAME}?mode=user"))
-        .env(VCI_CONFIG_PATH_ENV, &config_path)
+        .env(VCI_CONFIG_PATH_ENV, &files.config)
+        .env(ROOT_FILE_ENV, &files.root_file)
         // These tests exercise stdio/gRPC startup mechanics directly (no
         // manager involved to push an auth key via `set_auth_key`), so
         // disable ADR-221's listener auth the same way a manager-less dev
@@ -293,18 +321,19 @@ async fn process_exits_when_stdin_is_closed() {
         "child exit status should be successful"
     );
 
-    let _ = std::fs::remove_file(&config_path);
+    drop(files);
 }
 
 #[tokio::test]
 #[serial]
 async fn process_exits_when_stdin_is_closed_with_live_subscribe_event_stream() {
-    let config_path = write_test_library_config();
+    let files = write_test_library_config();
     let exe = env!("CARGO_BIN_EXE_iso22900-service");
 
     let mut child = Command::new(exe)
         .arg(format!("iso22900:{TEST_LIBRARY_NAME}?mode=user"))
-        .env(VCI_CONFIG_PATH_ENV, &config_path)
+        .env(VCI_CONFIG_PATH_ENV, &files.config)
+        .env(ROOT_FILE_ENV, &files.root_file)
         // These tests exercise stdio/gRPC startup mechanics directly (no
         // manager involved to push an auth key via `set_auth_key`), so
         // disable ADR-221's listener auth the same way a manager-less dev
@@ -383,7 +412,7 @@ async fn process_exits_when_stdin_is_closed_with_live_subscribe_event_stream() {
         "child exit status should be successful"
     );
 
-    let _ = std::fs::remove_file(&config_path);
+    drop(files);
 }
 
 #[tokio::test]
@@ -391,19 +420,15 @@ async fn process_exits_when_stdin_is_closed_with_live_subscribe_event_stream() {
 async fn get_status_returns_startup_error_details_when_grpc_start_fails() {
     let exe = env!("CARGO_BIN_EXE_iso22900-service");
     let invalid_library_name = "missing-library-for-startup-error";
-    // Configure a `library_path` that does not exist on disk, so the service
-    // fails to load it deterministically regardless of registry/RDF state.
+    // Name a library file that does not exist on disk, so the service fails
+    // to load it deterministically regardless of registry/RDF state.
     let nonexistent_path = std::env::temp_dir().join(format!("{invalid_library_name}.so"));
-    let config_path = unique_temp_path("config.toml");
-    let config_toml = format!(
-        "[config.apis.iso22900.libs.{invalid_library_name:?}]\nlibrary_path = {:?}\n",
-        nonexistent_path.display().to_string()
-    );
-    std::fs::write(&config_path, config_toml).expect("test config file should be writable");
+    let files = TestFiles::new(invalid_library_name, &nonexistent_path);
 
     let mut child = Command::new(exe)
         .arg(format!("iso22900:{invalid_library_name}?mode=user"))
-        .env(VCI_CONFIG_PATH_ENV, &config_path)
+        .env(VCI_CONFIG_PATH_ENV, &files.config)
+        .env(ROOT_FILE_ENV, &files.root_file)
         // These tests exercise stdio/gRPC startup mechanics directly (no
         // manager involved to push an auth key via `set_auth_key`), so
         // disable ADR-221's listener auth the same way a manager-less dev
@@ -480,5 +505,5 @@ async fn get_status_returns_startup_error_details_when_grpc_start_fails() {
         "child exit status should be successful"
     );
 
-    let _ = std::fs::remove_file(&config_path);
+    drop(files);
 }

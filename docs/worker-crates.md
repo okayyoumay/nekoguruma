@@ -94,7 +94,7 @@ which is kept with the project's working material rather than in the design docu
 | Role | Discovery/parsing of installed D-PDU libraries |
 | Responsibility | XML metadata parsing, Windows registry lookup, architecture selection, `library_path` setting lookup in `config.toml` |
 | Key types | `PduLibraryInfo` (includes `source: LibrarySource`), `LibrarySource`, `LibraryArch`, `RegistryViewMode` |
-| Key functions | `find_library_path(arch, lib)`, `find_pdu_libraries(name)`, `resolve_library_path(arch, lib)`, `list_configured_libraries()`, `enumerate_libraries(mode)` — `find_library_path`/`list_configured_libraries` are thin wrappers that delegate to `vci-service-config` (with the api name fixed to `"iso22900"`). `resolve_library_path` is an integration function for callers (ADR-035) that prefers `find_library_path` and falls back to `find_pdu_libraries`'s RDF-based resolution only when that returns `None`. `enumerate_libraries` is an enumeration function that returns a `Vec<PduLibraryInfo>` merging RDF-based auto-discovery with `config.toml`'s `library_path` settings (both at the api level and the arch level), used for discovery (ADR-036) |
+| Key functions | `find_library_path(arch, lib)`, `list_configured_libraries()`, `enumerate_pdu_libraries(mode)`, `enumerate_libraries(mode)` — `find_library_path`/`list_configured_libraries` are thin wrappers that delegate to `vci-service-config` (with the api name fixed to `"iso22900"`). `enumerate_libraries` is an enumeration function that returns a `Vec<PduLibraryInfo>` merging RDF-based auto-discovery with `config.toml`'s `library_path` settings (both at the api level and the arch level), used for discovery (ADR-036). `iso22900-service` no longer uses this crate to find its library: it resolves the name through `ngr-library-resolver` (design 7.2) |
 | Dependencies | `roxmltree`, `url`, `vci-service-config`, `winreg` (Windows), `tracing` |
 | Notes | The Root Description File path is resolved from the Windows registry (`HKLM\SOFTWARE\D-PDU API\Root File`) or, on non-Windows platforms, the fixed path `/etc/pdu_api_root.xml` (overriding via an environment variable has been removed). The `library_path` setting in `config.toml` is loaded via `vci-service-config` (ADR-034). `enumerate_libraries` falls back to `Vec::new()` on RDF-side auto-discovery errors, so libraries defined only in `config.toml` are always enumerated even if the RDF is broken or missing (ADR-036) |
 
@@ -103,9 +103,9 @@ which is kept with the project's working material rather than in the design docu
 |------|------|
 | Role | Exposes the D-PDU API as a gRPC service |
 | Responsibility | RPC handlers, Proto ↔ Rust type conversion, event streaming, session management |
-| Submodules | `convert`, `events`, `handles`, `ioctl`, `rpc`, `rpc_link`, `rpc_misc`, `rpc_module`, `rpc_primitive` |
-| Dependencies | `iso22900`, `iso22900-registry`, `vci-service-launcher`, `vci-service-interface`, `tonic`, `tokio` |
-| Notes | Library path resolution is consolidated into a single `iso22900_registry::resolve_library_path()`. If a `[config.apis.iso22900.libs.<lib>].library_path` setting exists in `config.toml`, that result takes priority; otherwise it falls back internally to RDF-based resolution (ADR-034, ADR-035) |
+| Submodules | `convert`, `events`, `handles`, `ioctl`, `rpc`, `rpc_link`, `rpc_misc`, `rpc_module`, `rpc_primitive`; `preload` (crate root) |
+| Dependencies | `iso22900`, `iso22900-registry` (architecture of the startup scheme on Windows), `ngr-library-resolver`, `vci-service-launcher`, `vci-service-interface`, `tonic`, `tokio` |
+| Notes | The library name resolves through `ngr_library_resolver::iso22900::resolve()`, the D-PDU API root description file entry with that short name (design 7.1); no `config.toml` key names the library (ADR-281 Decision item 1). The design 7.2 pre-load checks run immediately before the load: device mode refuses a library that fails them, user mode reports the findings and loads it |
 
 ---
 
@@ -180,7 +180,7 @@ which is kept with the project's working material rather than in the design docu
 | Responsibility | Takes a `VciServer` trait implementation and starts the gRPC + JSON-RPC server |
 | Key functions | `start_service::<T: VciServer>()`, `config::find_logging_config()` (re-export of `vci-service-config`) |
 | Dependencies | `vci-service-config`, `vci-service-interface`, `tonic`, `tokio` |
-| Notes | gRPC starts over the network, JSON-RPC over stdio, simultaneously. `config::find_library_path()` is also re-exported, but since ADR-034 `j2534-0404-service` and `iso22900-service` no longer call it directly — instead they call `resolve_library_path()` on `j2534-0404-registry` / `iso22900-registry` (an integration function that folds in config-first-then-auto-discovery-fallback) (ADR-035; see `crates/vci-service-config/docs/logging-config.md` for details) |
+| Notes | gRPC starts over the network, JSON-RPC over stdio, simultaneously. `config::find_library_path()` is also re-exported, but since ADR-034 `j2534-0404-service` no longer calls it directly — instead it calls `resolve_library_path()` on `j2534-0404-registry` (an integration function that folds in config-first-then-auto-discovery-fallback), and `iso22900-service` resolves its library through `ngr-library-resolver` (ADR-035; see `crates/vci-service-config/docs/logging-config.md` for details) |
 
 ---
 

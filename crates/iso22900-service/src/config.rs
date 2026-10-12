@@ -45,7 +45,8 @@ pub struct StartupConfig {
     pub(crate) library_name: String,
     pub(crate) requested_port: Option<u16>,
     /// The device's operating mode, passed by the agent (ADR-281 Decision item 2). Design 7.2
-    /// gives it its meaning for a failed library check; library loading does not consult it.
+    /// gives it its meaning for a failed library check: device mode refuses the library, user
+    /// mode reports the findings and loads it.
     pub(crate) mode: OperatingMode,
 }
 

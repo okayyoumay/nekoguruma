@@ -1,7 +1,7 @@
 # ADR-228: Library Resolution from Fixed Locations, Shared by Agent and Worker
 
 **Date:** 2026-10-04
-**Status:** Accepted (the Linux definition format and the shared crate's name settled by ADR-266; item 3 extended by ADR-281 with the mode and a J2534 module label; no library path is read from the worker's configuration file since ADR-281)
+**Status:** Accepted (the Linux definition format and the shared crate's name settled by ADR-266; item 3 extended by ADR-281 with the mode and, for J2534, a module label and the `pname` the agent locked, which the worker checks; no library path is read from the worker's configuration file since ADR-281)
 **Affects:** `docs/system-architecture.md` (4, 4.2, 7.1.1, 7.2, 7.3, 9.2, 9.3, 9.4, 11, 11.1, 16.1), `api/openapi.yaml`, `schemas/extension-manifest.*`, `db/migrations/0002_extensions_without_vci_profile.sql`, `crates/vci-discovery`, `crates/vci-service-config`, `crates/ngr-library-resolver`, `crates/j2534-0404-registry`, `crates/worker-host`, worker services
 
 ## Context

@@ -185,7 +185,9 @@ Startup is handled by `vci-service-launcher::start_service::<Iso22900Service>()`
      No `config.toml` key names the library (ADR-281 Decision item 1).
    - Run the design 7.2 pre-load checks (`preload.rs`, through
      `ngr_library_resolver::check_library` with the system owners as the
-     trusted set) on the library and the files that named it. In device mode a
+     trusted set) on the library, the files that named it and, when it exists,
+     the worker's `config.toml` (`vci_service_config::config_file()`), whose
+     per-library settings the service acts on (ADR-270 Decision item 5). In device mode a
      failure refuses the library with `FAILED_PRECONDITION`; in user mode the
      findings are logged as a warning and the library is loaded. What the check
      opened stays open until the library is mapped (ADR-278).

@@ -351,6 +351,14 @@ fn config_file_path() -> PathBuf {
     resolve_config_path(&path)
 }
 
+/// The configuration file this process reads: the build-time `VCI_CONFIG_PATH` resolved
+/// against the selected configuration root (or the debug-only runtime override, ADR-073). A
+/// worker adds it to the files its design 7.2 pre-load checks cover, since it holds per-library
+/// settings the worker acts on (ADR-270 Decision item 5). The file need not exist.
+pub fn config_file() -> PathBuf {
+    config_file_path()
+}
+
 /// Directory of the J2534 registration definitions on Linux (design 7.1.1): one file per VCI,
 /// written by the administrator. Fixed at build time (ADR-228): `NGR_J2534_DEFINITION_DIR` at
 /// build time, either absolute or relative to the fixed system directory of

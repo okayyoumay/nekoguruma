@@ -1,7 +1,7 @@
 # ADR-195: Cross-Process Test-Harness Startup Race (Per-Process-Unique Config Paths)
 
 **Date:** 2026-08-27
-**Status:** Accepted
+**Status:** Accepted (the test config files lose `library_path`, ADR-281; the per-process-unique path rule stands)
 **Affects:** `j2534-0404-service/tests/grpc_mock/harness.rs`, `j2534-0404-service/tests/live_grpc_flow.rs`, `iso22900-service/tests/grpc_mock.rs`, `iso22900-service/src/service/rpc.rs`
 
 ## Context

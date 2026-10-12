@@ -1,7 +1,7 @@
 # ADR-223: `RegistryViewMode::All` Falls Back to `Native` When No Architecture-Specific View Exists
 
 **Date:** 2026-09-09
-**Status:** Accepted
+**Status:** Accepted (ADR-036, which the text calls not superseded, is superseded by ADR-281)
 **Affects:** `j2534-0404-registry/src/lib.rs`, `iso22900-registry/src/lib.rs`
 
 ## Context

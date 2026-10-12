@@ -131,6 +131,15 @@ pub enum JobError {
 }
 
 /// `text` cut to at most `max` bytes, on a character boundary.
+/// The job's error for the declared failure its journal records.
+fn failure_error(failure: &crate::journal::ProcedureFailure) -> JobError {
+    JobError::ProcedureFailed {
+        pc: failure.at.pc,
+        code: failure.code.clone(),
+        detail: failure.detail.clone(),
+    }
+}
+
 fn truncated(mut text: String, max: usize) -> String {
     if text.len() > max {
         let mut end = max;
@@ -449,6 +458,16 @@ fn run_job(
     if cancelled.load(Ordering::Relaxed) {
         return Err(JobError::Cancelled);
     }
+    // A declared failure in the journal of a resumed job is final (ADR-280): it is reported
+    // before the link is opened, so the verdict does not depend on the worker or the VCI. The
+    // journal is only read here; its record is the last one, so a run that holds it cannot
+    // change the verdict.
+    if let Some(JournalMode::Resume(setup)) = &journal
+        && let Ok(state) = Journal::read(&setup.dir, &setup.key)
+        && let Some(failure) = &state.facts.procedure_failed
+    {
+        return Err(failure_error(failure));
+    }
     let timings = Timings::for_link(config);
     // An open that fails partway closes what it opened; when even that fails, or the open
     // panics, the worker may still hold the module or the link (ADR-258).
@@ -723,11 +742,7 @@ where
     if let Ok(journal) = &opened
         && let Some(failure) = &journal.state().facts.procedure_failed
     {
-        return Err(JobError::ProcedureFailed {
-            pc: failure.at.pc,
-            code: failure.code.clone(),
-            detail: failure.detail.clone(),
-        });
+        return Err(failure_error(failure));
     }
     // A resume names the VIN the job's first run recorded, or the job's own data changed
     // (ADR-261): nothing is sent and no resume is counted.
@@ -3578,6 +3593,34 @@ mod tests {
             "{result:?}"
         );
         assert_eq!(host.sent(), []);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A recorded failure is reported before the link is opened: a restart on a worker that
+    /// cannot be reached ends in it, not in a link error (ADR-280).
+    #[test]
+    fn a_failed_journal_reports_the_failure_without_a_worker() {
+        let program = flash_program_failing_after_the_erase();
+        let dir = journal_dir("procedure-failed-no-worker");
+        let result = first_run(&program, &dir, JobLimits::default(), |_| {});
+        assert!(
+            matches!(result, Err(JobError::ProcedureFailed { .. })),
+            "{result:?}"
+        );
+        let guards = take_guards(&dir);
+        let (result, _guards) =
+            resume_on_unreachable(program, &dir, guards, Arc::new(AtomicBool::new(false)));
+        assert!(
+            matches!(&result, Err(JobError::ProcedureFailed { code, .. }) if code == "ERASE_REFUSED"),
+            "{result:?}"
+        );
+        assert!(
+            Journal::read(&dir, &job_key())
+                .unwrap()
+                .facts
+                .resume_counts
+                .is_empty()
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -50,7 +50,9 @@ ended: a restart replays to the erase and sends it again.
 5. **The journal folds the record into `RecoveryFacts::procedure_failed`.** It must come after the
    last step, and no record may follow it. The restart reads it first: `classify` returns
    `RestartDecision::Failed` before it looks at the transfer, and `resume_program_journaled` ends
-   in the same `JobError::ProcedureFailed` with nothing sent to the ECU and no resume counted.
+   in the same `JobError::ProcedureFailed` with nothing sent to the ECU and no resume counted. It
+   reads the record before it opens the worker link, so the verdict does not depend on whether
+   the worker or the VCI can be reached.
 6. **A flash plan may contain `Fail` anywhere, and it ends a path.** The plan validator treats it
    like `Ret` when it follows execution (a subroutine that ends in `Fail` does not reach a plan
    after it), but `Call` and `Ret` stay refused inside a plan.

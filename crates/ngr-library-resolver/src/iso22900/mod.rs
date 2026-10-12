@@ -5,7 +5,8 @@
 //! implementation; the entry itself names the API library, the module description file (MDF) and
 //! the cable description file (CDF), each as a `file:` URI. The root file is found through the
 //! registry value `Root File` under `HKLM\SOFTWARE\D-PDU API` on Windows, read in an explicit
-//! [`RegistryView`], and at `vci_service_config::pdu_api_root_file()` elsewhere. The MDF and CDF
+//! [`RegistryView`] (or, in a debug build, at a set `NGR_PDU_API_ROOT_FILE`, ADR-282), and at
+//! `vci_service_config::pdu_api_root_file()` elsewhere. The MDF and CDF
 //! are not parsed here and are not followed to find the library; their paths are reported so the
 //! 7.2 check can cover them. Matching rules and error cases are in `docs/library-resolver.md`.
 //!
@@ -153,7 +154,8 @@ pub enum ResolveError {
     /// exist. Distinct from a name that is not in an existing root file.
     #[error("no D-PDU API root file{}", located(path.as_deref()))]
     NoRootFile {
-        /// The expected location, when known (always on non-Windows).
+        /// The expected location, when known (always on non-Windows, and on Windows when the
+        /// debug override names it).
         path: Option<PathBuf>,
     },
     /// The root file cannot be read.

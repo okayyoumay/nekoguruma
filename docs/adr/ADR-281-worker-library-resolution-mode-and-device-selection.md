@@ -2,7 +2,7 @@
 
 **Date:** 2026-10-12
 **Status:** Accepted
-**Affects:** `docs/system-architecture.md` (3.4, 7.1, 7.2, 8.2.6, 8.8.1), `docs/j2534-0404-architecture.md`, `crates/vci-service-config` (`find_library_path`, `list_configured_library_paths`, docs), `crates/j2534-0404-registry`, `crates/iso22900-registry`, `crates/j2534-0404-service`, `crates/iso22900-service`, `crates/agent` (`launch.rs`, `link.rs`); ADR-029, ADR-030, ADR-034, ADR-035, ADR-036, ADR-107, ADR-228, ADR-270, ADR-278, ADR-280 (consequence on schema compatibility)
+**Affects:** `docs/system-architecture.md` (3.4, 7.1, 7.2, 8.2.6, 8.8.1), `docs/j2534-0404-architecture.md`, `crates/vci-service-config` (`find_library_path`, `list_configured_library_paths`, docs), `crates/j2534-0404-registry`, `crates/iso22900-registry`, `crates/j2534-0404-service`, `crates/iso22900-service`, `crates/agent` (`launch.rs`, `link.rs`); ADR-029, ADR-030, ADR-034, ADR-035, ADR-036, ADR-107, ADR-235, ADR-228, ADR-270, ADR-278, ADR-280 (consequence on schema compatibility)
 
 ## Context
 
@@ -63,10 +63,11 @@ questions were left open before the worker services and the agent could switch o
    entry's `pname`, the target the worker actually opens, not by the label. Two different
    `pname` strings that a vendor library maps to the same device cannot be detected; that stays
    the configuration's responsibility.
-   ADR-107 item (b) stays: a worker has one open device and no per-module state
+   A worker started with a label lists only that entry and refuses every other module handle
+   (Consequences). ADR-107 item (b) stays: a worker has one open device and no per-module state
    partition; simultaneous use comes from several worker processes. When no label is passed the
-   worker behaves as before (the first entry, or the synthesized default entry when `modules` is
-   absent).
+   worker behaves as before (every entry is listed, or the synthesized default entry when
+   `modules` is absent); the agent passes a label whenever the library has `modules` entries.
 4. **Before the first release, compatibility may break.** Changes to the IR schema and to the
    journal's stored state may break compatibility, with no migration and no acceptance of older
    versions, since nothing is stored outside this repository. The runtime keeps refusing a
@@ -107,9 +108,12 @@ questions were left open before the worker services and the agent could switch o
 - A `library_path` key left in an existing `config.toml` has no effect once the code is
   changed.
 - The startup argument contract of both workers gains the mode, and the J2534 worker gains an
-  optional module label. The agent starts one J2534 worker per `modules` entry and stops
-  refusing a worker only for having several rows once that is implemented; the worker's
-  `GetModuleIds` still lists every entry, which the agent reads to find the one it asked for.
+  optional module label. A worker started with a label reports only that entry from
+  `GetModuleIds` and refuses `ModuleConnect`, and every module-scoped request, for any other
+  module handle, so a client cannot open another configured device than the one its per-VCI
+  lock names. The agent's rule that a worker report exactly one module (ADR-235 item 4) stays
+  as it is: the job's VCI is chosen by which worker the agent starts (library name and label),
+  not by picking a row from `GetModuleIds`.
 - Some vendor DLLs may not support being loaded in two processes at once, for example when
   they take a process-wide lock on a driver. Such a library stays limited to one device at a
   time; this is a property of the library and is not detected by the agent.

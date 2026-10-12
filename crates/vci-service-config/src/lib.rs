@@ -398,20 +398,29 @@ fn in_fixed_system_root(path: PathBuf) -> PathBuf {
 /// Fixed at build time (ADR-228 Decision 1): `NGR_PDU_API_ROOT_FILE` at build time, either
 /// absolute or relative to the fixed system directory of [`fixed_system_root`] (default
 /// `pdu_api_root.xml`, so `/etc/pdu_api_root.xml` on Linux). No `config-root-*` feature moves it.
-/// In debug builds only (ADR-073), a non-empty runtime `NGR_PDU_API_ROOT_FILE` takes precedence;
-/// release builds read no environment variable here. On Windows the root file is named by the
-/// registry instead, and this function is not used.
+/// In debug builds only (ADR-073), a non-empty runtime `NGR_PDU_API_ROOT_FILE` takes precedence
+/// ([`pdu_api_root_file_override`]); release builds read no environment variable here. On
+/// Windows the root file is named by the registry instead, and this function is not used.
 pub fn pdu_api_root_file() -> PathBuf {
     const ROOT_FILE: &str = env!("NGR_PDU_API_ROOT_FILE");
+    pdu_api_root_file_override().unwrap_or_else(|| in_fixed_system_root(PathBuf::from(ROOT_FILE)))
+}
+
+/// The debug-only runtime override of [`pdu_api_root_file`] on its own: the file a non-empty
+/// runtime `NGR_PDU_API_ROOT_FILE` names (a relative value resolved against the fixed system
+/// directory, like the build-time value), or `None` when it is unset or empty and always in
+/// release builds. Any set value counts, also one equal to the build-time value, which Cargo
+/// sets in this crate's own test processes. On Windows the D-PDU API resolver uses this file in
+/// place of the registry's `Root File` when it is set (ADR-282), so tests use the same root
+/// description file on every platform.
+pub fn pdu_api_root_file_override() -> Option<PathBuf> {
     #[cfg(debug_assertions)]
-    let path = runtime_override(std::env::var_os("NGR_PDU_API_ROOT_FILE"))
-        .unwrap_or_else(|| PathBuf::from(ROOT_FILE));
+    {
+        runtime_override(std::env::var_os("NGR_PDU_API_ROOT_FILE")).map(in_fixed_system_root)
+    }
     #[cfg(not(debug_assertions))]
-    let path = PathBuf::from(ROOT_FILE);
-    if path.is_absolute() {
-        path
-    } else {
-        fixed_system_root().join(path)
+    {
+        None
     }
 }
 

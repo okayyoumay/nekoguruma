@@ -23,8 +23,8 @@ ended: a restart replays to the erase and sends it again.
    reports in `capabilities` and a server matches before it sends a program (design 8.2.6 and
    9.5; `crates/diag-ir/schema/README.md`), so it changes with the instruction set. `code` is a
    constant-pool index holding UTF-8, like `Log::message`, because the server's dry run can then
-   check it as it checks a log message (ADR-233 item 7). The detail is a `Bytes` operand popped
-   from the stack, because a detail is built at run time. `Program::validate` also checks the
+   check it as it checks a log message (ADR-233 item 7). The detail is the `Bytes` operand on top
+   of the stack, read without popping it (item 3), because a detail is built at run time. `Program::validate` also checks the
    code statically: it must exist, be UTF-8 and be 1 to 128 bytes (`MAX_FAILURE_CODE_LEN`), so
    the journal's record can always hold it. The Starlark frontend accepts 1 to 64 bytes, a
    stricter limit it may keep without the IR changing.

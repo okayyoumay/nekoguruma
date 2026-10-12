@@ -2,8 +2,8 @@
 //!
 //! - [`j2534`]: J2534 v04.04 devices from `HKLM\SOFTWARE\PassThruSupport.04.04` (Windows)
 //!
-//! D-PDU API implementations are resolved through `ngr-library-resolver`'s `iso22900` module
-//! (ADR-228 Decision item 4); this crate has no copy of that lookup.
+//! This crate has no D-PDU API lookup; the agent's is to use `ngr-library-resolver`'s
+//! `iso22900` module (ADR-228 Decision item 4).
 //!
 //! Discovery only reports where libraries are and what they declare about themselves.
 //! Pre-load verification (7.2) and ABI detection (7.3) are separate steps.

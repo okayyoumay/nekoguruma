@@ -37,6 +37,26 @@ fn unique_temp_path(file_name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("j2534-0404-service-{nanos}-{file_name}"))
 }
 
+/// The registration-definition directory that goes with `config_path` (ADR-282): the same
+/// unique name, so tests never share definitions.
+fn definition_dir_for(config_path: &std::path::Path) -> PathBuf {
+    let mut name = config_path
+        .file_name()
+        .expect("config file name")
+        .to_os_string();
+    name.push(".definitions");
+    config_path.with_file_name(name)
+}
+
+/// Writes `library` as the VCI `name` into a fresh definition directory for `config_path`.
+fn write_test_definition(config_path: &std::path::Path, name: &str, library: &std::path::Path) {
+    let dir = definition_dir_for(config_path);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("definition directory");
+    j2534_0404_mock::write_definition(&dir, name, library)
+        .expect("definition file should be writable");
+}
+
 /// Writes a `config.toml` that points `TEST_LIBRARY_NAME`'s `library_path`
 /// at the compiled mock cdylib, so the spawned service resolves it without
 /// needing the Windows registry.
@@ -49,6 +69,9 @@ fn write_test_library_config() -> PathBuf {
         mock_library.display().to_string()
     );
     std::fs::write(&config_path, config_toml).expect("test config file should be writable");
+    // Also names the library through a registration definition (ADR-282), so the switch to
+    // `ngr-library-resolver` needs no test changes.
+    write_test_definition(&config_path, TEST_LIBRARY_NAME, &mock_library);
     config_path
 }
 
@@ -122,6 +145,7 @@ async fn startup_argument_auto_starts_grpc_and_stdio_can_stop_process() {
     let mut child = Command::new(exe)
         .arg(format!("j2534-0404:{TEST_LIBRARY_NAME}?mode=user"))
         .env(VCI_CONFIG_PATH_ENV, &config_path)
+        .env("NGR_J2534_DEFINITION_DIR", definition_dir_for(&config_path))
         // These tests exercise stdio/gRPC startup mechanics directly (no
         // manager involved to push an auth key via `set_auth_key`), so
         // disable ADR-221's listener auth the same way a manager-less dev
@@ -236,6 +260,7 @@ async fn stop_notification_without_id_exits_process_without_response() {
     let mut child = Command::new(exe)
         .arg(format!("j2534-0404:{TEST_LIBRARY_NAME}?mode=user"))
         .env(VCI_CONFIG_PATH_ENV, &config_path)
+        .env("NGR_J2534_DEFINITION_DIR", definition_dir_for(&config_path))
         // These tests exercise stdio/gRPC startup mechanics directly (no
         // manager involved to push an auth key via `set_auth_key`), so
         // disable ADR-221's listener auth the same way a manager-less dev
@@ -292,6 +317,7 @@ async fn process_exits_when_stdin_is_closed() {
     let mut child = Command::new(exe)
         .arg(format!("j2534-0404:{TEST_LIBRARY_NAME}?mode=user"))
         .env(VCI_CONFIG_PATH_ENV, &config_path)
+        .env("NGR_J2534_DEFINITION_DIR", definition_dir_for(&config_path))
         // These tests exercise stdio/gRPC startup mechanics directly (no
         // manager involved to push an auth key via `set_auth_key`), so
         // disable ADR-221's listener auth the same way a manager-less dev
@@ -349,6 +375,7 @@ async fn process_exits_when_stdin_is_closed_with_live_subscribe_event_stream() {
     let mut child = Command::new(exe)
         .arg(format!("j2534-0404:{TEST_LIBRARY_NAME}?mode=user"))
         .env(VCI_CONFIG_PATH_ENV, &config_path)
+        .env("NGR_J2534_DEFINITION_DIR", definition_dir_for(&config_path))
         // These tests exercise stdio/gRPC startup mechanics directly (no
         // manager involved to push an auth key via `set_auth_key`), so
         // disable ADR-221's listener auth the same way a manager-less dev
@@ -446,6 +473,7 @@ async fn stop_terminates_live_subscribe_event_stream() {
     let mut child = Command::new(exe)
         .arg(format!("j2534-0404:{TEST_LIBRARY_NAME}?mode=user"))
         .env(VCI_CONFIG_PATH_ENV, &config_path)
+        .env("NGR_J2534_DEFINITION_DIR", definition_dir_for(&config_path))
         // These tests exercise stdio/gRPC startup mechanics directly (no
         // manager involved to push an auth key via `set_auth_key`), so
         // disable ADR-221's listener auth the same way a manager-less dev
@@ -565,10 +593,12 @@ async fn get_status_returns_startup_error_details_when_grpc_start_fails() {
         nonexistent_path.display().to_string()
     );
     std::fs::write(&config_path, config_toml).expect("test config file should be writable");
+    write_test_definition(&config_path, invalid_library_name, &nonexistent_path);
 
     let mut child = Command::new(exe)
         .arg(format!("j2534-0404:{invalid_library_name}?mode=user"))
         .env(VCI_CONFIG_PATH_ENV, &config_path)
+        .env("NGR_J2534_DEFINITION_DIR", definition_dir_for(&config_path))
         // These tests exercise stdio/gRPC startup mechanics directly (no
         // manager involved to push an auth key via `set_auth_key`), so
         // disable ADR-221's listener auth the same way a manager-less dev

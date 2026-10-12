@@ -117,6 +117,12 @@ fn ngr_agent_runs_a_program_file_on_sim_vci() {
         ),
     )
     .expect("test config file should be writable");
+    // Also names the library through a registration definition (ADR-282), so the switch to
+    // `ngr-library-resolver` needs no test changes.
+    let definition_dir = root.join("definitions");
+    std::fs::create_dir_all(&definition_dir).expect("definition directory");
+    j2534_0404_mock::write_definition(&definition_dir, LIBRARY_NAME, &sim_vci)
+        .expect("definition file should be writable");
     let program_path = root.join("program.json");
     std::fs::write(
         &program_path,
@@ -134,6 +140,7 @@ fn ngr_agent_runs_a_program_file_on_sim_vci() {
         .arg("--locks")
         .arg(root.join("locks"))
         .env("VCI_CONFIG_PATH", &config_path)
+        .env("NGR_J2534_DEFINITION_DIR", &definition_dir)
         .env_remove("VCI_SERVICE_INSECURE_NO_AUTH")
         // The simulated ECU uses its built-in configuration.
         .env_remove("NGR_SIM_ECU_CONFIG")

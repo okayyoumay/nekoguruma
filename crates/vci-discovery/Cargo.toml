@@ -5,9 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-roxmltree.workspace = true
 thiserror.workspace = true
-vci-service-config.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 winreg.workspace = true

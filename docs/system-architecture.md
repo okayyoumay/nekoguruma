@@ -558,7 +558,7 @@ Confirmation level (6.3) and two-person approval. The server decides the require
 - Expand a `REG_EXPAND_SZ` value only from a fixed list of system folder names, taking each folder from the HKLM value of the same registry view (so the view's bitness decides it), never from the process environment; any other variable is refused, and the result must be an absolute local path (ADR-277)
 - Also follow and verify the chain of paths referenced by configuration files
 - Redo discovery at every job start; no change-monitoring mechanism is kept
-- No configuration file names a library path: the chains above are the only sources, and the per-library settings in a worker service's `config.toml` (modules, CAN channel mode, vendor IOCTLs, logging) are keyed by the library name that the chain resolves (ADR-281)
+- A worker service's `config.toml` does not name a library path: the chains above (registry values, registration definitions and the root description file) are the only sources, and the per-library settings in that `config.toml` (modules, CAN channel mode, vendor IOCTLs, logging) are keyed by the library name that the chain resolves (ADR-281)
 - A registration definition indicates where the library is. How that VCI is handled (capabilities, quirks, ABI overrides, COMPARAM mapping) is declared in the VCI profile (9.3)
 
 #### 7.1.1 J2534 Registration Definition on Linux (Proprietary Specification)
@@ -625,7 +625,7 @@ Basis for the inference: AArch64's AAPCS64 matches x86_64's System V ABI in that
 
 **Trusted locations**
 
-On Windows, the basis for trust is that HKLM can be modified only by administrators. Linux gets the same premise by reading registration definitions only from `/etc/nekoguruma/j2534/` (7.1.1), in both modes. The locations of every file that decides which library is loaded (registration definitions, the D-PDU API root description file on Linux, the worker service's configuration file) are fixed at build time. They are not taken from environment variables or command-line arguments, so another process cannot redirect a worker to a different file; a runtime override is compiled into debug builds only, for tests (ADR-228).
+On Windows, the basis for trust is that HKLM can be modified only by administrators. Linux gets the same premise by reading registration definitions only from `/etc/nekoguruma/j2534/` (7.1.1), in both modes. The locations of every file that decides which library is loaded (registration definitions, the D-PDU API root description file on Linux), and of the worker service's configuration file, which holds per-library settings but no library path (ADR-281), are fixed at build time. They are not taken from environment variables or command-line arguments, so another process cannot redirect a worker to a different file; a runtime override is compiled into debug builds only, for tests (ADR-228).
 
 **One resolver, checked where the library is loaded**
 
@@ -639,8 +639,8 @@ Determine the ABI from the library header (PE Machine / ELF `EI_CLASS`, `e_machi
 flowchart TD
     S["Job start"] --> OS{OS}
     OS -->|Windows| REG["Read HKLM<br/>WOW64 view specified explicitly"]
-    OS -->|Linux| ENV["Default paths, environment variables"]
-    REG --> CFG["Read configuration files"]
+    OS -->|Linux| ENV["Read registration definitions<br/>or root description file<br/>at fixed paths"]
+    REG --> CFG["Follow the chain of<br/>referenced files"]
     ENV --> CFG
     CFG --> PATH["Resolve absolute library path"]
     PATH --> ACL{"Writable by<br/>regular users?"}
@@ -956,7 +956,7 @@ The targets form 3 tiers: VCI (communication interface) -> vehicle bus -> ECU.
 
 Operation with multiple VCIs connected to a single device, handling multiple vehicles simultaneously, is assumed.
 
-- **Worker assignment**: One process per library, a dedicated thread per VCI. Multiple VCIs from the same vendor become separate threads in the same worker, so the VCI profile declares whether the library supports opening multiple devices simultaneously. If not, a separate worker is used per VCI. Exception: a J2534 library with several configured devices always runs one worker per device, each selected by its `modules` label (ADR-281), whatever the profile declares
+- **Worker assignment**: One process per library, a dedicated thread per VCI. Multiple VCIs from the same vendor become separate threads in the same worker, so the VCI profile declares whether the library supports opening multiple devices simultaneously. If not, a separate worker is used per VCI. Exception: a J2534 library with several configured devices always runs one worker per device, each selected by its `modules` label (ADR-281), whatever the profile declares; the entries' `pname`s are unique per library and the per-VCI lock is keyed by the library name and `pname`, so two workers never hold locks for the same configured target
 - **Lock units**: Per-VCI and per-vehicle locks are managed independently. A configuration where, on the same device, VCI-A handles vehicle X and VCI-B handles vehicle Y is allowed; only when the two VINs fall into the same per-vehicle lock bucket (about once in 4096 pairs, ADR-262) does one job wait for the other
 - **Concurrent job execution**: The agent can execute multiple jobs in parallel. However, ECU reprogramming is limited to 1 at a time per device (because power, bandwidth and operator attention would be divided)
 - **Resource contention**: The high-resolution timer for monitoring and the CPU consumption of concurrent acquisition jobs can interfere. During monitoring, the measured update interval is re-evaluated, and if it cannot be achieved, the value is lowered and reported

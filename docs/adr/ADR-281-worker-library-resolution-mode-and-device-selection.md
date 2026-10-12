@@ -57,7 +57,13 @@ questions were left open before the worker services and the agent could switch o
    it would silently point at a different device after the configuration is edited, while the
    label is what the operator sees. That worker opens only that module, with the entry's `pname`
    as `PassThruOpen`'s argument (ADR-107 item (a)), and the agent links each worker as its own
-   device. ADR-107 item (b) stays: a worker has one open device and no per-module state
+   device. The `pname` must also be unique within one library's `modules` list, checked at the
+   same time: two entries naming the same target would let two workers, and two per-VCI locks,
+   share one physical VCI. The per-VCI lock of design 8.8 is keyed by the library name and the
+   entry's `pname`, the target the worker actually opens, not by the label. Two different
+   `pname` strings that a vendor library maps to the same device cannot be detected; that stays
+   the configuration's responsibility.
+   ADR-107 item (b) stays: a worker has one open device and no per-module state
    partition; simultaneous use comes from several worker processes. When no label is passed the
    worker behaves as before (the first entry, or the synthesized default entry when `modules` is
    absent).
@@ -107,7 +113,7 @@ questions were left open before the worker services and the agent could switch o
 - Some vendor DLLs may not support being loaded in two processes at once, for example when
   they take a process-wide lock on a driver. Such a library stays limited to one device at a
   time; this is a property of the library and is not detected by the agent.
-- Each running J2534 device costs one worker process, which refines design 3.4's one process per library for J2534. The per-VCI lock (design 8.8) stays per device.
+- Each running J2534 device costs one worker process, which refines design 3.4's one process per library for J2534. The per-VCI lock (design 8.8) stays per device, keyed by the library name and `pname`.
 - ADR-280's consequence that a program or journal of the previous schema version is refused is
   now this decision's rule (item 4), not a limit to be lifted before release. After the first
   release, a schema change needs a compatibility path, or a new decision.

@@ -651,6 +651,7 @@ the predecessor repository these ADRs came from.
 - ADR-245 (items 4 and 6 amended by ADR-250)
 - ADR-254 (`diag.fail` has an instruction since ADR-280)
 - ADR-280 (schema-compatibility consequence relaxed by ADR-281 item 4)
+- ADR-281
 
 ### Acquired Data & Monitoring
 - ADR-236

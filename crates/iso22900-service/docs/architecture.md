@@ -12,7 +12,7 @@
 iso22900-service/src/
 ├── main.rs              Entry point: calls vci_service_launcher::start_service::<Iso22900Service>()
 ├── lib.rs               Re-exports Iso22900Service and StartupConfig
-├── config.rs            Startup argument parser (iso22900:<lib>?port=<u16>)
+├── config.rs            Startup argument parser (iso22900:<lib>?mode=<device|user>&port=<u16>)
 ├── error.rs             Error mapping: DPduApiError / RegistryError → gRPC Status
 └── service/
     ├── rpc.rs           Iso22900Service struct + VciService trait impl (all 25 RPC methods)
@@ -171,7 +171,7 @@ return a sanitized, generic message in the `Status` — see ADR-089.
 
 Startup is handled by `vci-service-launcher::start_service::<Iso22900Service>()`:
 
-1. Parse startup argument: `iso22900:<library-name>?port=<u16>` (`config.rs`).
+1. Parse startup argument: `iso22900:<library-name>?mode=<device|user>&port=<u16>` (`config.rs`).
 2. Initialize logging from the `config.toml` file (loaded via `vci-service-config`).
 3. Call `Iso22900Service::new(config)`:
    - Resolve `<library-name>` to a DLL path via a single call to

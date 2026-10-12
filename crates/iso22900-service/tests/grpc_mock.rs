@@ -71,7 +71,7 @@ impl TestServer {
         }
         let (service_shutdown_tx, service_shutdown_rx) = tokio::sync::watch::channel(false);
         let service = Iso22900Service::new(
-            Iso22900Service::get_startup_config(["iso22900-service", "iso22900:TestLib"])
+            Iso22900Service::get_startup_config(["iso22900-service", "iso22900:TestLib?mode=user"])
                 .expect("startup config"),
             service_shutdown_rx,
         )

@@ -13,16 +13,18 @@ use agent::launch::launch_j2534_worker;
 use agent::policy::{build_ceiling, writes};
 use agent::{JobLimits, LinkConfig, check_program, run_program};
 use diag_ir::{Program, Value, VmState};
-use worker_host::service::{LaunchOptions, Stopped, WorkerLayout};
+use worker_host::service::{LaunchOptions, OperatingMode, Stopped, WorkerLayout};
 
 const USAGE: &str = "\
-usage: ngr-agent run --vci <name> --program <file> [options]
+usage: ngr-agent run --vci <name> --mode <device|user> --program <file> [options]
 
 Runs an IR program (diag-ir Program as JSON) on a J2534 v04.04 VCI and prints the final VM
 state as JSON on stdout.
 
 options:
   --vci <name>         J2534 library name the worker service resolves
+  --mode <device|user> the device's operating mode, passed to the worker: device mode refuses
+                       a library that fails a library check, user mode reports and loads it
   --program <file>     IR program file (JSON)
   --workers <dir>      worker binaries, laid out as <dir>/<ABI name>/<binary>
                        (default: the 'workers' directory next to ngr-agent)
@@ -40,6 +42,7 @@ const STOP_GRACE: Duration = Duration::from_secs(5);
 #[derive(Debug, PartialEq, Eq)]
 struct RunArgs {
     vci: String,
+    mode: OperatingMode,
     program: PathBuf,
     workers: Option<PathBuf>,
     locks: Option<PathBuf>,
@@ -86,6 +89,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<RunArgs, Strin
         None => return Err("missing command".to_owned()),
     }
     let mut vci = None;
+    let mut mode = None;
     let mut program = None;
     let mut workers = None;
     let mut locks = None;
@@ -104,6 +108,15 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<RunArgs, Strin
                         .map_err(|value| format!("--vci {value:?} is not valid UTF-8"))?,
                 )
             }
+            "--mode" => {
+                mode = Some(
+                    value
+                        .to_str()
+                        .ok_or_else(|| format!("--mode {value:?} is not valid UTF-8"))?
+                        .parse::<OperatingMode>()
+                        .map_err(|error| format!("--mode: {error}"))?,
+                )
+            }
             "--program" => program = Some(PathBuf::from(value)),
             "--workers" => workers = Some(PathBuf::from(value)),
             // A relative path would name a different lock set from each working directory.
@@ -120,6 +133,8 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<RunArgs, Strin
     link.validate().map_err(|error| error.to_string())?;
     Ok(RunArgs {
         vci: vci.ok_or("--vci is required")?,
+        // The mode is fixed per device at installation (design 6.2); there is no default.
+        mode: mode.ok_or("--mode is required")?,
         program: program.ok_or("--program is required")?,
         workers,
         locks,
@@ -197,7 +212,7 @@ async fn run(args: RunArgs) -> Result<String, String> {
             None => default_workers()?,
         },
     };
-    let worker = launch_j2534_worker(&args.vci, &workers, &LaunchOptions::default())
+    let worker = launch_j2534_worker(&args.vci, args.mode, &workers, &LaunchOptions::default())
         .await
         .map_err(|error| error.to_string())?;
     let (result, mut guards) = run_program(
@@ -266,9 +281,18 @@ mod tests {
     #[test]
     fn parses_a_run_with_defaults() {
         assert_eq!(
-            parse(&["run", "--vci", "sim-vci", "--program", "p.json"]),
+            parse(&[
+                "run",
+                "--vci",
+                "sim-vci",
+                "--mode",
+                "user",
+                "--program",
+                "p.json"
+            ]),
             Ok(RunArgs {
                 vci: "sim-vci".to_owned(),
+                mode: OperatingMode::User,
                 program: PathBuf::from("p.json"),
                 workers: None,
                 locks: None,
@@ -294,8 +318,11 @@ mod tests {
             "p.json",
             "--vci",
             "x",
+            "--mode",
+            "device",
         ])
         .expect("valid arguments");
+        assert_eq!(args.mode, OperatingMode::Device);
         assert_eq!(args.workers, Some(PathBuf::from("w")));
         assert_eq!(args.locks, Some(locks));
         assert_eq!((args.link.tx_id, args.link.rx_id), (0x7DF, 0x7E9));
@@ -306,20 +333,32 @@ mod tests {
         for args in [
             &[][..],
             &["start"],
-            &["run", "--program", "p.json"],
-            &["run", "--vci", "x"],
+            &["run", "--mode", "user", "--program", "p.json"],
+            &["run", "--vci", "x", "--mode", "user"],
             &["run", "--vci"],
-            &["run", "--vci", "x", "--program", "p", "--tx-id", "7G0"],
-            &["run", "--vci", "x", "--program", "p", "--tx-id", "+7E0"],
-            &["run", "--vci", "x", "--program", "p", "--tx-id", "0x"],
-            // 29-bit IDs need the link to set the ID format.
-            &["run", "--vci", "x", "--program", "p", "--rx-id", "18DAF110"],
-            &["run", "--vci", "x", "--program", "p", "--verbose", "1"],
-            &["run", "--vci", "x", "--program", "p", "--locks"],
-            &["run", "--vci", "x", "--program", "p", "--locks", ""],
-            &["run", "--vci", "x", "--program", "p", "--locks", "locks"],
+            // The mode has no default and only the exact spellings select one.
+            &["run", "--vci", "x", "--program", "p"],
+            &["run", "--vci", "x", "--program", "p", "--mode"],
+            &["run", "--vci", "x", "--program", "p", "--mode", ""],
+            &["run", "--vci", "x", "--program", "p", "--mode", "Device"],
+            &["run", "--vci", "x", "--program", "p", "--mode", "service"],
         ] {
             assert!(parse(args).is_err(), "{args:?}");
+        }
+        let valid = ["run", "--vci", "x", "--mode", "user", "--program", "p"];
+        for extra in [
+            &["--tx-id", "7G0"][..],
+            &["--tx-id", "+7E0"],
+            &["--tx-id", "0x"],
+            // 29-bit IDs need the link to set the ID format.
+            &["--rx-id", "18DAF110"],
+            &["--verbose", "1"],
+            &["--locks"],
+            &["--locks", ""],
+            &["--locks", "locks"],
+        ] {
+            let args: Vec<&str> = valid.iter().chain(extra).copied().collect();
+            assert!(parse(&args).is_err(), "{args:?}");
         }
     }
 

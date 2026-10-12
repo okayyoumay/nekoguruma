@@ -11,9 +11,10 @@ This note defines the startup argument format and the JSON-RPC contract on stand
 ## Startup Argument
 
 - The first program argument must use this format:
-  - `iso22900:<library name>?port=<grpc port number>&...`
-- The query string is optional.
+  - `iso22900:<library name>?mode=<device|user>&port=<grpc port number>&...`
+- The query string is required, since it carries `mode`.
 - `<library name>` is required.
+- Query parameter `mode` is required: the device's operating mode (design 6.2), `device` or `user`, spelled exactly so. The agent passes it; the worker does not infer it and no configuration file sets it (ADR-281 Decision item 2). A missing, repeated or unknown `mode` is rejected as invalid input. The mode decides what a failed library check (design 7.2) means where the library is loaded: device mode refuses the library, user mode reports the findings and loads it. Until the worker resolves its library through `ngr-library-resolver`, it only records the mode and logs it at startup; loading does not depend on it yet.
 - Query parameter `port` is optional.
 - Unknown query parameters are ignored by the current implementation.
 - Repeating `port` is rejected as invalid input.
@@ -21,9 +22,9 @@ This note defines the startup argument format and the JSON-RPC contract on stand
 
 ### Examples
 
-- `iso22900:MyPduLibrary`
-- `iso22900:MyPduLibrary?port=60123`
-- `iso22900:MyPduLibrary?port=60123&profile=test`
+- `iso22900:MyPduLibrary?mode=user`
+- `iso22900:MyPduLibrary?mode=device&port=60123`
+- `iso22900:MyPduLibrary?mode=user&port=60123&profile=test`
 
 ## Process Startup Behavior
 

@@ -58,7 +58,7 @@ use agent::{
 use diag_ir::{Program, VmState};
 use j2534_0404::{FLOW_CONTROL_FILTER, ISO15765, J2534Api0404, PassThruMessage};
 use worker_host::client::ConnectOptions;
-use worker_host::service::{LaunchOptions, ServiceKind, WorkerProcess};
+use worker_host::service::{LaunchOptions, OperatingMode, ServiceKind, WorkerProcess};
 
 const LIBRARY_NAME: &str = "sim-vci";
 /// Set in a child process to the role it plays (`agent` or `probe`).
@@ -609,6 +609,7 @@ async fn launch_worker() -> WorkerProcess {
         Path::new(env!("CARGO_BIN_EXE_j2534-0404-service")),
         ServiceKind::J2534V0404,
         LIBRARY_NAME,
+        OperatingMode::User,
         &launch_options(),
     )
     .await

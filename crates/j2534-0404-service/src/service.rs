@@ -5424,6 +5424,14 @@ impl VciServer for J2534Service {
         // uninitialized-and-then-lazily-started at some arbitrary later
         // first-use moment.
         events::init_module_clock();
+        // The mode decides what a failed 7.2 library check means once the
+        // library is resolved through `ngr-library-resolver`; until then it
+        // is only recorded (ADR-281 Decision item 2).
+        tracing::info!(
+            library = %startup_config.library_name,
+            mode = %startup_config.mode(),
+            "starting worker"
+        );
         // A `library_path` configured for this library name takes priority over
         // platform auto-discovery (the Windows registry), letting deployers add
         // libraries manually and letting non-Windows builds resolve one at all.
@@ -7324,7 +7332,7 @@ mod tests {
         J2534Service {
             api: Arc::new(Mutex::new(api)),
             startup_config: Arc::new(
-                crate::config::parse_startup_arg("j2534-0404:mock-lib").unwrap(),
+                crate::config::parse_startup_arg("j2534-0404:mock-lib?mode=user").unwrap(),
             ),
             can_channel_mode: CanChannelMode::SingleChannel,
             resolved_can_channel_mode: Arc::new(Mutex::new(None)),

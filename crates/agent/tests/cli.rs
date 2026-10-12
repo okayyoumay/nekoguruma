@@ -85,6 +85,8 @@ fn a_29_bit_can_id_is_a_usage_error() {
             "run",
             "--vci",
             "x",
+            "--mode",
+            "user",
             "--program",
             "p.json",
             "--tx-id",
@@ -100,7 +102,7 @@ fn a_29_bit_can_id_is_a_usage_error() {
 fn unreadable_program_exits_with_1() {
     let temp = TempDir::new("missing");
     let output = ngr_agent()
-        .args(["run", "--vci", "none", "--program"])
+        .args(["run", "--vci", "none", "--mode", "user", "--program"])
         .arg(temp.0.join("missing.json"))
         .output()
         .expect("ngr-agent should run");
@@ -116,7 +118,7 @@ fn refused_program_exits_with_1_before_resolving_the_vci() {
         vec![Op::PushBytes(0), Op::SecurityAccess { level: 1 }],
     );
     let output = ngr_agent()
-        .args(["run", "--vci", "none", "--program"])
+        .args(["run", "--vci", "none", "--mode", "user", "--program"])
         .arg(program)
         .output()
         .expect("ngr-agent should run");
@@ -135,7 +137,7 @@ fn a_write_is_refused_before_resolving_the_vci_in_a_release_build() {
         vec![Op::PushBytes(0), Op::ServiceRequest { service: 0x2E }],
     );
     let output = ngr_agent()
-        .args(["run", "--vci", "none", "--program"])
+        .args(["run", "--vci", "none", "--mode", "user", "--program"])
         .arg(program)
         .output()
         .expect("ngr-agent should run");
@@ -165,7 +167,7 @@ fn unknown_vci_exits_with_1() {
     let temp = TempDir::new("unknown-vci");
     let config = write_config(&temp.0, None);
     let output = ngr_agent()
-        .args(["run", "--vci", "test-vci", "--program"])
+        .args(["run", "--vci", "test-vci", "--mode", "user", "--program"])
         .arg(read_vin(&temp.0))
         .arg("--workers")
         .arg(&temp.0)
@@ -184,7 +186,7 @@ fn missing_worker_build_exits_with_1() {
     // Any library header does: the agent's own executable stands in for the VCI library.
     let config = write_config(&temp.0, Some(Path::new(env!("CARGO_BIN_EXE_ngr-agent"))));
     let output = ngr_agent()
-        .args(["run", "--vci", "test-vci", "--program"])
+        .args(["run", "--vci", "test-vci", "--mode", "user", "--program"])
         .arg(read_vin(&temp.0))
         .arg("--workers")
         .arg(temp.0.join("empty"))
@@ -219,7 +221,7 @@ fn a_run_waits_for_the_vci_lock() {
     )
     .expect("the test takes the VCI lock");
     let mut child = ngr_agent()
-        .args(["run", "--vci", "test-vci", "--program"])
+        .args(["run", "--vci", "test-vci", "--mode", "user", "--program"])
         .arg(read_vin(&temp.0))
         .arg("--workers")
         .arg(&temp.0)
@@ -269,7 +271,7 @@ fn a_writing_run_waits_for_the_reprogramming_slot() {
         vec![Op::PushBytes(0), Op::ServiceRequest { service: 0x2E }],
     );
     let mut child = ngr_agent()
-        .args(["run", "--vci", "test-vci", "--program"])
+        .args(["run", "--vci", "test-vci", "--mode", "user", "--program"])
         .arg(program)
         .arg("--workers")
         .arg(&temp.0)

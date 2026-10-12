@@ -588,7 +588,7 @@ An ISO 22900-2 (D-PDU API) compatible gRPC service that exposes J2534 hardware t
 **Start the service:**
 
 ```bash
-j2534-0404-service "j2534-0404:OpenPort2?port=50051"
+j2534-0404-service "j2534-0404:OpenPort2?mode=user&port=50051"
 ```
 
 The startup argument carries a **library name**, not a path (see

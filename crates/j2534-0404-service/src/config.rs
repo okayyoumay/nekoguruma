@@ -3,12 +3,23 @@ use std::ffi::CString;
 use std::io::{self, ErrorKind};
 
 use url::Url;
+use vci_service_launcher::mode::{MODE_QUERY_KEY, OperatingMode};
 
 /// Service startup configuration derived from command-line arguments.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StartupConfig {
     pub(crate) library_name: String,
     pub(crate) requested_port: Option<u16>,
+    /// The device's operating mode, passed by the agent (ADR-281 Decision item 2). It decides
+    /// what a failed 7.2 library check means where the library is loaded.
+    pub(crate) mode: OperatingMode,
+}
+
+impl StartupConfig {
+    /// The operating mode this worker was started in.
+    pub fn mode(&self) -> OperatingMode {
+        self.mode
+    }
 }
 
 /// One configured device-selection entry (ADR-107): a human-readable label
@@ -337,7 +348,7 @@ pub(crate) fn resolve_vendor_ioctls(
         .collect()
 }
 
-/// Parse the second command-line argument as `j2534-0404:<library>?port=<u16>`.
+/// Parse the second command-line argument as `j2534-0404:<library>?mode=<device|user>[&port=<u16>]`.
 pub fn parse_startup_config(
     args: impl IntoIterator<Item = impl Into<String>>,
 ) -> Result<StartupConfig, io::Error> {
@@ -355,7 +366,7 @@ pub(crate) fn parse_startup_arg(startup_arg: &str) -> Result<StartupConfig, io::
 
     if parsed.scheme() != "j2534-0404" {
         return Err(invalid_input(
-            "startup argument must use format 'j2534-0404:<library name>?port=<grpc port number>&...'",
+            "startup argument must use format 'j2534-0404:<library name>?mode=<device|user>&port=<grpc port number>&...'",
         ));
     }
 
@@ -367,7 +378,12 @@ pub(crate) fn parse_startup_arg(startup_arg: &str) -> Result<StartupConfig, io::
     }
 
     let mut requested_port = None;
+    let mut mode = None;
     for (key, value) in parsed.query_pairs() {
+        if key == MODE_QUERY_KEY {
+            mode = Some(parse_mode(mode, &value)?);
+            continue;
+        }
         if key != "port" {
             continue;
         }
@@ -383,10 +399,30 @@ pub(crate) fn parse_startup_arg(startup_arg: &str) -> Result<StartupConfig, io::
         );
     }
 
+    let mode = mode.ok_or_else(|| {
+        invalid_input(
+            "startup argument must include the operating mode ('mode=device' or 'mode=user'); \
+             the worker does not infer it",
+        )
+    })?;
+
     Ok(StartupConfig {
+        mode,
         library_name,
         requested_port,
     })
+}
+
+/// Parses one `mode` query value; a repeated `mode` is refused even when both values agree.
+fn parse_mode(previous: Option<OperatingMode>, value: &str) -> Result<OperatingMode, io::Error> {
+    if previous.is_some() {
+        return Err(invalid_input(
+            "startup argument must not repeat the mode query parameter",
+        ));
+    }
+    value
+        .parse()
+        .map_err(|e| invalid_input(format!("invalid startup argument: {e}")))
 }
 
 fn invalid_input(message: impl Into<String>) -> io::Error {
@@ -400,6 +436,7 @@ mod tests {
         parse_startup_arg, parse_vendor_ioctl_entry,
     };
     use vci_service_launcher::config::{ModuleConfigEntry, VendorIoctlConfigEntry};
+    use vci_service_launcher::mode::OperatingMode;
 
     #[test]
     fn build_module_entries_none_synthesizes_default_single_module() {
@@ -458,14 +495,14 @@ mod tests {
 
     #[test]
     fn parse_startup_config_accepts_library_without_query() {
-        let config = parse_startup_arg("j2534-0404:demo-lib").unwrap();
+        let config = parse_startup_arg("j2534-0404:demo-lib?mode=user").unwrap();
         assert_eq!(config.library_name, "demo-lib");
         assert_eq!(config.requested_port, None);
     }
 
     #[test]
     fn parse_startup_config_accepts_optional_port_query() {
-        let config = parse_startup_arg("j2534-0404:demo-lib?port=60123&foo=bar").unwrap();
+        let config = parse_startup_arg("j2534-0404:demo-lib?port=60123&foo=bar&mode=user").unwrap();
         assert_eq!(config.library_name, "demo-lib");
         assert_eq!(config.requested_port, Some(60123));
     }
@@ -484,9 +521,55 @@ mod tests {
 
     #[test]
     fn parse_startup_config_rejects_duplicate_port() {
-        let err = parse_startup_arg("j2534-0404:demo-lib?port=1234&port=5678")
+        let err = parse_startup_arg("j2534-0404:demo-lib?mode=user&port=1234&port=5678")
             .expect_err("duplicate port should fail");
         assert!(err.to_string().contains("must not repeat"));
+    }
+
+    #[test]
+    fn parse_startup_config_keeps_the_mode() {
+        for (value, mode) in [
+            ("device", OperatingMode::Device),
+            ("user", OperatingMode::User),
+        ] {
+            let config = parse_startup_arg(&format!("j2534-0404:demo-lib?port=1&mode={value}"))
+                .expect("a known mode should parse");
+            assert_eq!(config.mode(), mode);
+            assert_eq!(config.requested_port, Some(1));
+        }
+    }
+
+    #[test]
+    fn parse_startup_config_rejects_a_missing_mode() {
+        let err = parse_startup_arg("j2534-0404:demo-lib?port=1").expect_err("no mode should fail");
+        assert!(
+            err.to_string().contains("must include the operating mode"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn parse_startup_config_rejects_an_unknown_mode() {
+        for query in ["mode=", "mode=Device", "mode=service"] {
+            let err = parse_startup_arg(&format!("j2534-0404:demo-lib?{query}"))
+                .expect_err("an unknown mode should fail");
+            assert!(
+                err.to_string().contains("unknown operating mode"),
+                "{query}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_startup_config_rejects_a_repeated_mode() {
+        for query in ["mode=user&mode=user", "mode=device&mode=user"] {
+            let err = parse_startup_arg(&format!("j2534-0404:demo-lib?{query}"))
+                .expect_err("a repeated mode should fail");
+            assert!(
+                err.to_string().contains("must not repeat the mode"),
+                "{query}: {err}"
+            );
+        }
     }
 
     #[test]

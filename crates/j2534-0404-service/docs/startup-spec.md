@@ -11,9 +11,10 @@ This document defines the startup argument format and the JSON-RPC contract on s
 ## Startup Argument
 
 - The first program argument must use this format:
-  - `j2534-0404:<library name>?port=<grpc port number>&...`
-- The query string is optional.
+  - `j2534-0404:<library name>?mode=<device|user>&port=<grpc port number>&...`
+- The query string is required, since it carries `mode`.
 - `<library name>` is required and must be non-empty.
+- Query parameter `mode` is required: the device's operating mode (design 6.2), `device` or `user`, spelled exactly so. The agent passes it; the worker does not infer it and no configuration file sets it (ADR-281 Decision item 2). A missing, repeated or unknown `mode` is rejected as invalid input. The mode decides what a failed library check (design 7.2) means where the library is loaded: device mode refuses the library, user mode reports the findings and loads it. Until the worker resolves its library through `ngr-library-resolver`, it only records the mode and logs it at startup; loading does not depend on it yet.
 - Query parameter `port` is optional.
 - Unknown query parameters are ignored by the current implementation.
 - Repeating `port` is rejected as invalid input.
@@ -21,9 +22,9 @@ This document defines the startup argument format and the JSON-RPC contract on s
 
 ### Examples
 
-- `j2534-0404:OpenPort2`
-- `j2534-0404:OpenPort2?port=60124`
-- `j2534-0404:OpenPort2?port=60124&profile=test`
+- `j2534-0404:OpenPort2?mode=user`
+- `j2534-0404:OpenPort2?mode=device&port=60124`
+- `j2534-0404:OpenPort2?mode=user&port=60124&profile=test`
 
 ## Process Startup Behavior
 

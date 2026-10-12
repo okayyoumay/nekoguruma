@@ -2,8 +2,11 @@
 //!
 //! Contract of the service binaries (`crates/j2534-0404-service/docs/startup-spec.md`):
 //!
-//! - First argument `<scheme>:<library name>[?port=<port>]`. The service resolves the library
-//!   name itself (registry on Windows, its `config.toml` elsewhere), within its own registry view.
+//! - First argument `<scheme>:<library name>?mode=<device|user>[&port=<port>]`. The service
+//!   resolves the library name itself (registry on Windows, its `config.toml` elsewhere), within
+//!   its own registry view. `mode` is the device's operating mode (design 6.2), which decides
+//!   what a failed 7.2 library check means; the service does not infer it (ADR-281 Decision
+//!   item 2).
 //! - Control channel: one JSON-RPC 2.0 document per line on stdin / stdout.
 //!   `set_auth_key` installs the per-instance HMAC key that the gRPC listener verifies bearer
 //!   tokens with; `get_status` reports the loopback gRPC endpoints; `stop` shuts down.
@@ -26,6 +29,9 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
 use crate::abi::Abi;
 
+use vci_service_interface::mode::MODE_QUERY_KEY;
+pub use vci_service_interface::mode::OperatingMode;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ServiceKind {
     J2534V0404,
@@ -46,6 +52,14 @@ impl ServiceKind {
             ServiceKind::Iso22900 => "iso22900",
         }
     }
+}
+
+/// The service's first argument: `<scheme>:<library name>?mode=<mode>`.
+fn startup_argument(kind: ServiceKind, library_name: &str, mode: OperatingMode) -> String {
+    format!(
+        "{}:{library_name}?{MODE_QUERY_KEY}={mode}",
+        kind.startup_scheme()
+    )
 }
 
 /// Installed workers: `<root>/<abi name>/<binary name>[.exe]`, one directory per ABI (7.3).
@@ -142,12 +156,13 @@ pub struct WorkerProcess {
 }
 
 impl WorkerProcess {
-    /// Launches `binary` for `library_name`, provisions a fresh auth key and waits until the
-    /// gRPC server reports its endpoints.
+    /// Launches `binary` for `library_name` in the device's operating `mode`, provisions a fresh
+    /// auth key and waits until the gRPC server reports its endpoints.
     pub async fn launch(
         binary: &Path,
         kind: ServiceKind,
         library_name: &str,
+        mode: OperatingMode,
         options: &LaunchOptions,
     ) -> Result<Self, ServiceError> {
         if library_name.trim().is_empty() || library_name.contains('?') {
@@ -162,7 +177,7 @@ impl WorkerProcess {
             command.env(LONG_SIZE_ENV, size.to_string());
         }
         let mut child = command
-            .arg(format!("{}:{library_name}", kind.startup_scheme()))
+            .arg(startup_argument(kind, library_name, mode))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())

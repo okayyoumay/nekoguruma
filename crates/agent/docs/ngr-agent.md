@@ -7,12 +7,13 @@ server or take jobs from it.
 ## `ngr-agent run`
 
 ```sh
-ngr-agent run --vci <name> --program <file> [--workers <dir>] [--locks <dir>] [--tx-id <hex>] [--rx-id <hex>]
+ngr-agent run --vci <name> --mode <device|user> --program <file> [--workers <dir>] [--locks <dir>] [--tx-id <hex>] [--rx-id <hex>]
 ```
 
 | Option | Meaning |
 |---|---|
 | `--vci` | J2534 v04.04 library name, as the worker service resolves it (registry key on Windows, `library_path` entry in the service's `config.toml`) |
+| `--mode` | The device's operating mode (design 6.2), `device` or `user`. Required: the mode is fixed per device at installation, and this command, which has no installation of its own, takes it from the command line rather than defaulting to either. It is passed to the worker, which decides with it what a failed library check (design 7.2) means: device mode refuses the library, user mode reports the findings and loads it (ADR-281 Decision item 2). The worker records the mode but does not use it yet, until it resolves its library through `ngr-library-resolver` |
 | `--program` | IR program file: a `diag_ir::Program` serialized as JSON |
 | `--workers` | Directory of worker builds, laid out as `<dir>/<ABI name>/j2534-0404-service[.exe]` (design 7.3). Default: `workers` next to the `ngr-agent` executable |
 | `--locks` | The device's lock directory for the job's guards ("Job guards" below), as an absolute path. Default: `locks` next to the `ngr-agent` executable. Lock files are opened read-only, so a file another user created still locks. The agent creates a missing directory writable by its owner only, so a device whose agents run as several users needs it prepared beforehand: writable by all of them, and with the sticky bit (or an equivalent ACL) so that no user can delete another's lock files (ADR-257). It must also be readable by every agent user, since the per-vehicle lock lists it, and on Unix support hard links, with which it creates its files (ADR-262). On Unix a directory that group or others may write without the sticky bit, or without being readable by them, is refused |
@@ -45,7 +46,7 @@ Steps (`agent::check_program`, `agent::guards::JobGuards`, `agent::launch::launc
      library needs a `library_path` entry, and the build follows the header's ABI.
 4. Pick the service build for that ABI with `WorkerLayout::find`. A missing build fails as
    `UNSUPPORTED_ABI`.
-5. Launch the service with the library name and the ABI's default `long_size` (design 7.1.2;
+5. Launch the service with the library name, the `--mode` value and the ABI's default `long_size` (design 7.1.2;
    always the default, whatever a registration definition declares), provision its
    auth key and connect the gRPC client (design 7.4).
 6. Run the program under the request policy and the default job limits (ADR-235), then stop

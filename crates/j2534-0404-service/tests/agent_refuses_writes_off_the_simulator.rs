@@ -21,7 +21,7 @@ use agent::{HostError, JobError, JobLimits, LinkConfig, run_program};
 use diag_ir::{IR_SCHEMA_VERSION, Op, Program};
 use j2534_0404_mock::mock_library_path;
 use worker_host::client::ConnectOptions;
-use worker_host::service::{LaunchOptions, ServiceKind, WorkerProcess};
+use worker_host::service::{LaunchOptions, OperatingMode, ServiceKind, WorkerProcess};
 
 const LIBRARY_NAME: &str = "mock-agent-refuses-writes";
 
@@ -122,6 +122,7 @@ async fn run_the_job() {
         std::path::Path::new(env!("CARGO_BIN_EXE_j2534-0404-service")),
         ServiceKind::J2534V0404,
         LIBRARY_NAME,
+        OperatingMode::User,
         // Generous timeouts for a debug binary on a busy CI runner.
         &LaunchOptions {
             startup_timeout: Duration::from_secs(20),

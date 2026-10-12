@@ -4,14 +4,18 @@
 //! (`j2534_0404_registry`: a `library_path` entry in `config.toml` under the build's
 //! architecture key or at api level, else the build's registry view), so the file whose header
 //! picks the ABI is the file that build loads. The service is then started with the name only
-//! and resolves it again itself (7.2). ADR-240 records the selection rule.
+//! and resolves it again itself (7.2), together with the device's operating mode, which decides
+//! what a failed 7.2 library check means (ADR-281 Decision item 2). ADR-240 records the
+//! selection rule.
 
 use std::path::{Path, PathBuf};
 
 use j2534_0404_registry::{RegistryError, RegistryViewMode};
 use worker_host::abi::{self, Abi, AbiError};
 use worker_host::client::{ConnectError, ConnectOptions, WorkerClient};
-use worker_host::service::{LaunchOptions, ServiceError, ServiceKind, WorkerLayout, WorkerProcess};
+use worker_host::service::{
+    LaunchOptions, OperatingMode, ServiceError, ServiceKind, WorkerLayout, WorkerProcess,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum LaunchError {
@@ -75,13 +79,14 @@ pub struct LaunchedWorker {
     pub client: WorkerClient,
 }
 
-/// Launches the j2534-0404 worker that matches the ABI of `vci`'s library and connects a client
-/// to it.
+/// Launches the j2534-0404 worker that matches the ABI of `vci`'s library in the device's
+/// operating `mode` and connects a client to it.
 ///
 /// `options.long_size` is filled with the ABI's default (7.1.2) when it is `None`; the Linux
 /// registration definition that could override it (7.1.1) is not read.
 pub async fn launch_j2534_worker(
     vci: &str,
+    mode: OperatingMode,
     workers: &WorkerLayout,
     options: &LaunchOptions,
 ) -> Result<LaunchedWorker, LaunchError> {
@@ -91,7 +96,8 @@ pub async fn launch_j2534_worker(
         long_size: options.long_size.or(Some(abi.default_long_size())),
         ..options.clone()
     };
-    let process = WorkerProcess::launch(&binary, ServiceKind::J2534V0404, vci, &options).await?;
+    let process =
+        WorkerProcess::launch(&binary, ServiceKind::J2534V0404, vci, mode, &options).await?;
     let client = process.connect(&ConnectOptions::default()).await?;
     Ok(LaunchedWorker {
         abi,

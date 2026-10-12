@@ -1,6 +1,8 @@
 //! The startup argument's query rules (`docs/grpc-instance-spec.md`,
 //! "Startup Argument"), checked through the real binary: unknown query
-//! parameters are ignored, while a repeated or malformed `port` is rejected.
+//! parameters are ignored, while a repeated or malformed `port` is rejected,
+//! and the operating mode (`mode=device` or `mode=user`, ADR-281 Decision
+//! item 2) must be given exactly once with a known value.
 //!
 //! A rejected argument does not end the process: `vci-service-launcher` keeps
 //! the stdio JSON-RPC server running so the caller can read the failure, and
@@ -67,7 +69,7 @@ fn error_text(status: &Value) -> &str {
 #[tokio::test]
 async fn unknown_query_parameters_are_ignored() {
     let status = status_for(&format!(
-        "iso22900:{LIBRARY_NAME}?profile=test&port=0&verbose"
+        "iso22900:{LIBRARY_NAME}?profile=test&port=0&verbose&mode=user"
     ))
     .await;
     assert_eq!(status["library_name"], LIBRARY_NAME, "{status}");
@@ -79,7 +81,7 @@ async fn unknown_query_parameters_are_ignored() {
 
 #[tokio::test]
 async fn a_repeated_port_is_rejected() {
-    let status = status_for(&format!("iso22900:{LIBRARY_NAME}?port=0&port=0")).await;
+    let status = status_for(&format!("iso22900:{LIBRARY_NAME}?mode=user&port=0&port=0")).await;
     assert_eq!(status["running"], false, "{status}");
     assert_eq!(status["library_name"], Value::Null, "{status}");
     assert!(
@@ -91,12 +93,54 @@ async fn a_repeated_port_is_rejected() {
 #[tokio::test]
 async fn a_port_that_is_not_a_u16_is_rejected() {
     for port in ["65536", "-1", "abc"] {
-        let status = status_for(&format!("iso22900:{LIBRARY_NAME}?port={port}")).await;
+        let status = status_for(&format!("iso22900:{LIBRARY_NAME}?mode=user&port={port}")).await;
         assert_eq!(status["running"], false, "port={port}: {status}");
         assert_eq!(status["library_name"], Value::Null, "port={port}: {status}");
         assert!(
             error_text(&status).contains("valid u16"),
             "port={port}: {status}"
         );
+    }
+}
+
+#[tokio::test]
+async fn both_modes_are_accepted() {
+    for mode in ["device", "user"] {
+        let status = status_for(&format!("iso22900:{LIBRARY_NAME}?mode={mode}")).await;
+        assert_eq!(
+            status["library_name"], LIBRARY_NAME,
+            "mode={mode}: {status}"
+        );
+        assert!(
+            !error_text(&status).contains("startup argument"),
+            "mode={mode}: the argument should have been accepted: {status}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_missing_mode_is_rejected() {
+    let status = status_for(&format!("iso22900:{LIBRARY_NAME}?port=0")).await;
+    assert_eq!(status["running"], false, "{status}");
+    assert_eq!(status["library_name"], Value::Null, "{status}");
+    assert!(
+        error_text(&status).contains("must include the operating mode"),
+        "{status}"
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_or_repeated_mode_is_rejected() {
+    for (query, expected) in [
+        ("mode=", "unknown operating mode"),
+        ("mode=Device", "unknown operating mode"),
+        ("mode=service", "unknown operating mode"),
+        ("mode=user&mode=user", "must not repeat the mode"),
+        ("mode=user&mode=device", "must not repeat the mode"),
+    ] {
+        let status = status_for(&format!("iso22900:{LIBRARY_NAME}?{query}")).await;
+        assert_eq!(status["running"], false, "{query}: {status}");
+        assert_eq!(status["library_name"], Value::Null, "{query}: {status}");
+        assert!(error_text(&status).contains(expected), "{query}: {status}");
     }
 }

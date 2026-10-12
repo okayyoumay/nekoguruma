@@ -60,7 +60,11 @@ questions were left open before the worker services and the agent could switch o
    device. The `pname` must also be unique within one library's `modules` list, checked at the
    same time: two entries naming the same target would let two workers, and two per-VCI locks,
    share one physical VCI. The per-VCI lock of design 8.8 is keyed by the library name and the
-   entry's `pname`, the target the worker actually opens, not by the label. Two different
+   entry's `pname`, the target the worker actually opens, not by the label. The agent reads the
+   entry once, takes the lock for its `pname`, and passes that `pname` to the worker with the
+   label; the worker refuses to start when the entry it reads for the label has a different
+   `pname`, so an edit of `config.toml` between the two reads cannot make a worker open a target
+   other than the one locked. Two different
    `pname` strings that a vendor library maps to the same device cannot be detected; that stays
    the configuration's responsibility.
    A worker started with a label keeps that entry's handle from ADR-107 Decision (c), which

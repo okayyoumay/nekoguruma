@@ -368,13 +368,18 @@ pub fn j2534_definition_dir() -> PathBuf {
 
 /// The debug-only runtime override of [`j2534_definition_dir`] on its own: the directory a
 /// non-empty runtime `NGR_J2534_DEFINITION_DIR` names (a relative value resolved against the
-/// fixed system directory, like the build-time value), or `None` when it is unset or empty and
-/// always in release builds. On Windows the J2534 resolver reads this directory in place of the
-/// registry when it is set (ADR-282), so tests use the same definition files on every platform.
+/// fixed system directory, like the build-time value), or `None` when it is unset, empty or
+/// equal to the build-time value, and always in release builds. Cargo sets the build-time
+/// value in this crate's own test processes, and naming the fixed directory overrides nothing.
+/// On Windows the J2534 resolver reads this directory in place of the registry when it is set
+/// (ADR-282), so tests use the same definition files on every platform.
 pub fn j2534_definition_dir_override() -> Option<PathBuf> {
     #[cfg(debug_assertions)]
     {
-        runtime_override(std::env::var_os("NGR_J2534_DEFINITION_DIR")).map(in_fixed_system_root)
+        const DEFINITION_DIR: &str = env!("NGR_J2534_DEFINITION_DIR");
+        runtime_override(std::env::var_os("NGR_J2534_DEFINITION_DIR"))
+            .filter(|path| path.as_os_str() != DEFINITION_DIR)
+            .map(in_fixed_system_root)
     }
     #[cfg(not(debug_assertions))]
     {
@@ -1381,6 +1386,20 @@ mod tests {
     /// directory, whatever root a test or a `config-root-*` feature selects. A developer who
     /// exported either variable while building gets a different embedded value; the test then
     /// says so and checks nothing.
+    /// Cargo sets the build-time `NGR_J2534_DEFINITION_DIR` in this test process too; that value
+    /// is the default directory, not an override (ADR-282). Reads only, since the unit tests run
+    /// on several threads; a developer's own differing value skips the check.
+    #[test]
+    fn the_embedded_definition_dir_is_no_override() {
+        let embedded = env!("NGR_J2534_DEFINITION_DIR");
+        match std::env::var_os("NGR_J2534_DEFINITION_DIR") {
+            Some(value) if !value.is_empty() && value != embedded => {
+                eprintln!("skipped: NGR_J2534_DEFINITION_DIR is set to a value of its own");
+            }
+            _ => assert_eq!(j2534_definition_dir_override(), None),
+        }
+    }
+
     #[test]
     fn default_locations_are_under_nekoguruma() {
         let defaults = env!("VCI_CONFIG_PATH") == "nekoguruma/config.toml"

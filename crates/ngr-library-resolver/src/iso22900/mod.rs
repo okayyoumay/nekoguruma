@@ -509,9 +509,32 @@ pub fn resolve_in_root_file(root_file: &Path, name: &str) -> Result<Resolved, Re
 /// or its content is absent; a `REG_EXPAND_SZ` value is expanded from the same view's HKLM folder
 /// values, never from the process environment, 7.2; the result must be an absolute drive-letter
 /// path), `vci_service_config::pdu_api_root_file()` elsewhere (always `Some`; the file may not
-/// exist; `view` is ignored).
+/// exist; `view` is ignored). In a debug build on Windows, a set `NGR_PDU_API_ROOT_FILE`
+/// (`vci_service_config::pdu_api_root_file_override`) replaces the registry for every view
+/// (ADR-282).
 pub fn root_file_path(view: RegistryView) -> Result<Option<PathBuf>, ResolveError> {
     #[cfg(windows)]
+    {
+        root_file_path_or(view, vci_service_config::pdu_api_root_file_override())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = view;
+        Ok(Some(vci_service_config::pdu_api_root_file()))
+    }
+}
+
+/// [`root_file_path`] on Windows with the debug override passed in: a file replaces the
+/// registry's `Root File`.
+#[cfg(windows)]
+fn root_file_path_or(
+    view: RegistryView,
+    override_file: Option<PathBuf>,
+) -> Result<Option<PathBuf>, ResolveError> {
+    if let Some(file) = override_file {
+        tracing::debug!(file = %file.display(), "using the debug root description file, not the registry");
+        return Ok(Some(file));
+    }
     {
         use winreg::{
             RegKey,
@@ -531,11 +554,6 @@ pub fn root_file_path(view: RegistryView) -> Result<Option<PathBuf>, ResolveErro
         // `CurrentVersion` key is redirected, so `ProgramFilesDir` there is the x86 folder.
         let lookup = |folder: KnownFolder| hklm_folder(view, folder);
         root_file_from_key(&key, &lookup)
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = view;
-        Ok(Some(vci_service_config::pdu_api_root_file()))
     }
 }
 

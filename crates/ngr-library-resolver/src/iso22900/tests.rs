@@ -1020,6 +1020,23 @@ fn a_path_with_no_named_component_is_not_a_usable_uri() {
     assert_eq!(uri_to_path("file:////"), Err(UriFault::Remote));
 }
 
+/// With the debug override, every registry view names the override file instead of the
+/// registry's `Root File` (ADR-282).
+#[cfg(windows)]
+#[test]
+fn the_debug_override_replaces_the_root_file_of_every_view() {
+    let file = std::env::temp_dir()
+        .join("ngr-override")
+        .join("pdu_api_root.xml");
+    for view in [RegistryView::Wow64_32, RegistryView::Wow64_64] {
+        assert_eq!(
+            root_file_path_or(view, Some(file.clone())).unwrap(),
+            Some(file.clone()),
+            "{view:?}"
+        );
+    }
+}
+
 #[cfg(windows)]
 #[test]
 fn hklm_folders_resolve_in_the_native_view() {

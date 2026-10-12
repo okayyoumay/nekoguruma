@@ -122,6 +122,10 @@ record for the rules below.
 
 **Root file location** (`root_file_path(view)`). On Windows the registry view `view` of
 `HKLM\SOFTWARE\D-PDU API`, value `Root File` (a missing key, value or blank content is `None`).
+In a debug build on Windows, a non-empty `NGR_PDU_API_ROOT_FILE`
+(`vci_service_config::pdu_api_root_file_override`) replaces the registry for every view, so tests
+name the mock library through the same root description file as on Linux (ADR-282); release
+builds read only the registry.
 Elsewhere `vci_service_config::pdu_api_root_file()` (`/etc/pdu_api_root.xml` in release builds,
 fixed at build time by `NGR_PDU_API_ROOT_FILE`, ADR-228 Decision item 1; debug builds also read
 the variable at run time, ADR-073); the view is ignored there. `resolve_in_view(name, view)`

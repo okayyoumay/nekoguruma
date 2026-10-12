@@ -100,6 +100,8 @@ configuration, not a running service.
   debug builds only (ADR-073). `j2534_definition_dir_override()` returns the
   definition-directory override alone (`None` when it is unset and in release
   builds); the J2534 resolver reads that directory instead of the registry on
-  Windows when it is set (ADR-282). Before ADR-228 the default was
+  Windows when it is set (ADR-282). `pdu_api_root_file_override()` does the same
+  for the D-PDU API root description file, which the D-PDU API resolver then
+  uses instead of the registry's `Root File` on Windows. Before ADR-228 the default was
   `vci-service-launcher/config.toml`, which the Linux root `/` turned into
   `/vci-service-launcher/config.toml`.

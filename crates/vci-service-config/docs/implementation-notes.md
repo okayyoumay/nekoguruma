@@ -98,9 +98,8 @@ configuration, not a running service.
   file on Linux (`pdu_api_root_file()`, `NGR_PDU_API_ROOT_FILE`, default
   `pdu_api_root.xml`, so `/etc/pdu_api_root.xml`). Each has a runtime override in
   debug builds only (ADR-073). `j2534_definition_dir_override()` returns the
-  definition-directory override alone (`None` when it is unset, empty or equal
-  to the build-time value, which Cargo also sets in this crate's test processes,
-  and in release builds); the J2534 resolver reads that directory instead of the registry on
+  definition-directory override alone (`None` when it is unset and in release
+  builds); the J2534 resolver reads that directory instead of the registry on
   Windows when it is set (ADR-282). Before ADR-228 the default was
   `vci-service-launcher/config.toml`, which the Linux root `/` turned into
   `/vci-service-launcher/config.toml`.

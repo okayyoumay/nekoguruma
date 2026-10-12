@@ -1,14 +1,14 @@
 // Relies on the debug-only runtime VCI_CONFIG_PATH override; see ADR-073. Killing the agent's
 // process group is unix-only.
 #![cfg(all(debug_assertions, unix))]
-//! Restart end to end, an agent killed or its worker crashed mid-transfer or after
-//! RequestTransferExit (design 5.3, 5.6, 8.2.5; ADR-229, ADR-276): the agent runs a flash job
-//! against a real `j2534-0404-service` worker and `sim-vci` as a child process, is killed with
-//! SIGKILL after a block of the transfer was journaled, or after RequestTransferExit was sent,
-//! and the job is resumed at library level (`resume_program_journaled`) with the same journal
-//! directory. In the worker-crash scenario the agent runs in the test process and
-//! only its worker is killed; the agent's next run resumes on a new worker with the guards the
-//! failed run gave back.
+//! Restart end to end, an agent killed, its worker crashed, the ECU powered off or the VCI
+//! unplugged mid-transfer, or an agent killed after RequestTransferExit (design 5.3, 5.6, 8.2.5;
+//! ADR-229, ADR-276): the agent runs a flash job against a real `j2534-0404-service` worker and
+//! `sim-vci` as a child process, is killed with SIGKILL after a block of the transfer was
+//! journaled, or after RequestTransferExit was sent, and the job is resumed at library level
+//! (`resume_program_journaled`) with the same journal directory. In the worker-crash, power-loss
+//! and VCI-disconnect scenarios the agent runs in the test process and survives; the agent's
+//! next run resumes on a new worker with the guards the failed run gave back.
 //!
 //! The harness (`tests/common/restart.rs`) keeps the simulated ECU's state in a state file
 //! (ADR-241), so the ECU outlives the killed agent and its timers go on running. The restarted
@@ -30,6 +30,15 @@
 //! state, so the ECU's state at the reconnection does not change the path. Neither ends in on-site
 //! intervention, since the conditions that lead there (an identity or software version that is not
 //! the job's, a precondition that fails) do not hold.
+//!
+//! Two more scenarios interrupt the first run the same way, but leave the worker alive: while the
+//! agent waits after block 4, the ECU loses power (`sim_ecu::Fault::PowerLoss`) or the VCI is
+//! unplugged (`disconnect_vci`, ADR-238), each handed to the worker through the control directory
+//! (`Env::fault_mid_run`). The next block's transfer gets no answer or fails on the lost device,
+//! and the run ends there with its guards and journal kept, as after a worker crash. Power comes
+//! back (`reconnect_ecu`) at the next run's first J2534 call, and that run's new worker finds the
+//! VCI plugged in again, since an unplugged VCI is the state of the worker process that saw it.
+//! Both complete the job in the same restart order.
 //!
 //! The scenarios after RequestTransferExit kill the agent once the journal holds the
 //! RequestTransferExit marker: before its response was recorded, after it was but before the
@@ -570,52 +579,12 @@ fn a_worker_crashed_mid_transfer_is_restarted_like_a_killed_agent() {
     let env = Env::new("worker-crash", ENTRY, &ecu_config(60_000));
     let crash = env.crash_worker(&spec, KILL_AFTER_BLOCK, WAIT_FOR_BLOCK);
     // The `Wait` sends nothing, so the first request to the dead worker is the next block's
-    // transfer: the run ends there with the worker's loss as a failed primitive, neither a
-    // result nor an on-site intervention, which would end the job instead of leaving it to the
-    // restart. A kill that came after the wait would fail here, not later.
-    let next_block_pc = spec
-        .program
-        .code
-        .iter()
-        .position(|op| {
-            *op == Op::FlashTransfer {
-                block: KILL_AFTER_BLOCK + 1,
-            }
-        })
-        .expect("the next block's transfer") as u32;
-    assert!(
-        matches!(crash.result, Err(agent::JobError::Host { pc, .. }) if pc == next_block_pc),
-        "the first run should end on the lost worker at {next_block_pc}: {:?}",
-        crash.result
-    );
-    // The surviving job keeps its guards across the runs (design 8.2.5): nobody else can take
-    // them while it holds them.
-    assert!(
-        env.guards_are_held(),
-        "the failed run should keep its guards"
-    );
+    // transfer: a kill that came after the wait would fail here, not later.
+    let first_attempt = assert_interrupted_at_the_next_block(&env, &spec, &crash);
     assert!(
         crash.link_unconfirmed,
         "a link on a dead worker cannot be confirmed closed"
     );
-    // The journal the restart reads, after the failed run ended, agrees with the one at the
-    // kill: block 4 the last, no RequestTransferExit, no resume yet.
-    for journal in [
-        crash.journal,
-        agent::journal::Journal::read(&env.journal_dir(), &spec.key).expect("journal"),
-    ] {
-        let transfer = journal.facts.transfer.expect("a transfer attempt");
-        assert_eq!(transfer.started_at.pc, ERASE_PC);
-        assert_eq!(transfer.last_block, Some(KILL_AFTER_BLOCK));
-        assert!(transfer.exit.is_none(), "no RequestTransferExit yet");
-        assert!(journal.facts.resume_counts.is_empty());
-    }
-    let first_attempt = agent::journal::Journal::read(&env.journal_dir(), &spec.key)
-        .expect("journal")
-        .facts
-        .transfer
-        .expect("a transfer attempt")
-        .started_at;
     let before = env.probe();
     assert_eq!(
         before,
@@ -630,6 +599,157 @@ fn a_worker_crashed_mid_transfer_is_restarted_like_a_killed_agent() {
     );
     let result = env.restart_on(&spec, crash.guards);
     // The restart released them when it ended, which also shows the check above can fail.
+    assert!(
+        !env.guards_are_held(),
+        "the ended job should release its guards"
+    );
+    assert_completed(
+        &env,
+        &spec,
+        first_attempt,
+        before.power_cycles,
+        &[1, 2],
+        Teardown::RESET,
+        result,
+    );
+}
+
+/// The instruction of the transfer of the block after [`KILL_AFTER_BLOCK`].
+fn next_block_pc(spec: &JobSpec) -> u32 {
+    spec.program
+        .code
+        .iter()
+        .position(|op| {
+            *op == Op::FlashTransfer {
+                block: KILL_AFTER_BLOCK + 1,
+            }
+        })
+        .expect("the next block's transfer") as u32
+}
+
+/// Checks how an interrupted first run ended: on the next block's transfer, with a failed
+/// primitive (neither a result nor an on-site intervention, which would end the job instead of
+/// leaving it to the restart), with its guards kept, and with the journal at block
+/// [`KILL_AFTER_BLOCK`], no RequestTransferExit and no resume, before and after the run ended.
+/// Returns where the first attempt's transfer started.
+fn assert_interrupted_at_the_next_block(
+    env: &Env,
+    spec: &JobSpec,
+    run: &restart::InterruptedRun,
+) -> StepRef {
+    let next_block_pc = next_block_pc(spec);
+    assert!(
+        matches!(run.result, Err(agent::JobError::Host { pc, .. }) if pc == next_block_pc),
+        "the first run should end on the next block's transfer at {next_block_pc}: {:?}",
+        run.result
+    );
+    // The surviving job keeps its guards across the runs (design 8.2.5): nobody else can take
+    // them while it holds them.
+    assert!(
+        env.guards_are_held(),
+        "the failed run should keep its guards"
+    );
+    for journal in [
+        run.journal.clone(),
+        agent::journal::Journal::read(&env.journal_dir(), &spec.key).expect("journal"),
+    ] {
+        let transfer = journal.facts.transfer.expect("a transfer attempt");
+        assert_eq!(transfer.started_at.pc, ERASE_PC);
+        assert_eq!(transfer.last_block, Some(KILL_AFTER_BLOCK));
+        assert!(transfer.exit.is_none(), "no RequestTransferExit yet");
+        assert!(journal.facts.resume_counts.is_empty());
+    }
+    run.journal
+        .facts
+        .transfer
+        .as_ref()
+        .expect("a transfer attempt")
+        .started_at
+}
+
+/// The ECU loses power while the agent waits after block 4 (design 5.6 "power loss", 8.2.5;
+/// ADR-229 item 1): the ECU answers nothing from then on, so the next block's transfer gets no
+/// response and the run ends there, keeping its guards and its journal. Power comes back before
+/// the agent's next run, which takes the same restart order as after an agent kill and
+/// completes. The power loss and the return of power are one power cycle each, and the restart's
+/// ECUReset a third.
+#[test]
+#[serial]
+fn an_ecu_power_loss_mid_transfer_is_restarted_once_power_returns() {
+    let spec = spec();
+    let env = Env::new("power-loss", ENTRY, &ecu_config(60_000));
+    // Probed before the first run: a silent ECU cannot be probed.
+    let initial = env.probe();
+    let run = env.fault_mid_run(
+        &spec,
+        KILL_AFTER_BLOCK,
+        WAIT_FOR_BLOCK,
+        r#"{"command": "inject_fault", "fault": "power_loss"}"#,
+    );
+    assert!(env.commands_applied(), "the power loss should be applied");
+    assert!(
+        !run.link_unconfirmed,
+        "the VCI is still there, so the link closes"
+    );
+    let first_attempt = assert_interrupted_at_the_next_block(&env, &spec, &run);
+    // Power returns: the restart's worker applies it at its first J2534 call, before it sends
+    // anything to the ECU.
+    env.inject(r#"{"command": "reconnect_ecu"}"#);
+    let result = env.restart_on(&spec, run.guards);
+    assert!(env.commands_applied(), "the reconnection should be applied");
+    assert!(
+        !env.guards_are_held(),
+        "the ended job should release its guards"
+    );
+    assert_completed(
+        &env,
+        &spec,
+        first_attempt,
+        initial.power_cycles + 2,
+        &[1, 2],
+        Teardown::RESET,
+        result,
+    );
+}
+
+/// The VCI is unplugged while the agent waits after block 4 (design 5.6, 8.2.5; ADR-229 item 1,
+/// ADR-238): the next block's transfer fails on the lost device and the run ends there, keeping
+/// its guards and its journal; the link cannot be confirmed closed on a lost device (ADR-258).
+/// The ECU, untouched, stays in its programming session with the transfer running. The agent's
+/// next run, on a new worker with the VCI plugged back in, takes the same restart order as after
+/// an agent kill and completes, with the restart's ECUReset the only power cycle.
+#[test]
+#[serial]
+fn a_vci_disconnect_mid_transfer_is_restarted_once_the_vci_is_back() {
+    let spec = spec();
+    let env = Env::new("vci-disconnect", ENTRY, &ecu_config(60_000));
+    let run = env.fault_mid_run(
+        &spec,
+        KILL_AFTER_BLOCK,
+        WAIT_FOR_BLOCK,
+        r#"{"command": "disconnect_vci"}"#,
+    );
+    assert!(env.commands_applied(), "the disconnect should be applied");
+    assert!(
+        run.link_unconfirmed,
+        "a link on a lost device cannot be confirmed closed"
+    );
+    let first_attempt = assert_interrupted_at_the_next_block(&env, &spec, &run);
+    // The probe loads the library in a process of its own, with the VCI present: the
+    // disconnect belonged to the stopped worker's process.
+    let before = env.probe();
+    assert_eq!(
+        before,
+        EcuProbe {
+            session: 2,
+            flash_phase: 2,
+            flash_block: KILL_AFTER_BLOCK + 1,
+            received: KILL_AFTER_BLOCK * BLOCK_LEN as u32,
+            power_cycles: before.power_cycles,
+        },
+        "the ECU should still be in its programming session, transferring"
+    );
+    let result = env.restart_on(&spec, run.guards);
     assert!(
         !env.guards_are_held(),
         "the ended job should release its guards"

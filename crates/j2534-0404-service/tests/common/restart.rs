@@ -37,6 +37,9 @@
 //! records the given block. The run ends with the lost worker's error and gives its guards back;
 //! the harness waits for the killed worker to be reaped and clears the guards' unconfirmed-link
 //! mark (ADR-258), as the agent does, and [`Env::restart_on`] resumes on those guards.
+//! [`Env::fault_mid_run`] runs the first run the same way, but hands the worker a control
+//! command at that block instead of killing it (an ECU power loss, a VCI disconnect), and stops
+//! the worker once the run has ended.
 //!
 //! The harness is for the unix test hosts, where a process group can be killed.
 
@@ -395,8 +398,8 @@ impl Env {
         self.resume_in_process(spec, None)
     }
 
-    /// As [`Env::restart`], on the guards a first run that survived its worker's crash gave
-    /// back ([`WorkerCrash::guards`]): the agent passes them on to its next run instead of
+    /// As [`Env::restart`], on the guards an interrupted first run gave
+    /// back ([`InterruptedRun::guards`]): the agent passes them on to its next run instead of
     /// taking them again (`resume_program_journaled`'s documentation).
     pub fn restart_on(&self, spec: &JobSpec, guards: JobGuards) -> Result<VmState, JobError> {
         self.resume_in_process(spec, Some(guards))
@@ -465,7 +468,32 @@ impl Env {
     /// Runs the job's first run in this process, the agent's, and kills its worker alone with
     /// SIGKILL once the journal records block `block`: the agent survives and its run ends with
     /// the error the lost worker gives it. Must not run while a child of this scenario is alive.
-    pub fn crash_worker(&self, spec: &JobSpec, block: u32, timeout: Duration) -> WorkerCrash {
+    pub fn crash_worker(&self, spec: &JobSpec, block: u32, timeout: Duration) -> InterruptedRun {
+        self.interrupt_run(spec, block, timeout, Interruption::KillWorker)
+    }
+
+    /// Runs the job's first run in this process, the agent's, and hands its worker `command`
+    /// through the control directory once the journal records block `block`: `sim-vci` applies
+    /// it at the worker's next J2534 call, and the run ends with the error that call gives the
+    /// agent. The worker is stopped after the run ended. Must not run while a child of this
+    /// scenario is alive.
+    pub fn fault_mid_run(
+        &self,
+        spec: &JobSpec,
+        block: u32,
+        timeout: Duration,
+        command: &str,
+    ) -> InterruptedRun {
+        self.interrupt_run(spec, block, timeout, Interruption::Inject(command))
+    }
+
+    fn interrupt_run(
+        &self,
+        spec: &JobSpec,
+        block: u32,
+        timeout: Duration,
+        interruption: Interruption<'_>,
+    ) -> InterruptedRun {
         let runtime = self.runtime();
         runtime.block_on(async {
             let worker = launch_worker().await;
@@ -489,15 +517,21 @@ impl Env {
                 .await
             });
             let journal = tokio::task::block_in_place(|| self.wait_for_block(spec, block, timeout));
-            let pid = i32::try_from(pid).expect("a process ID fits in pid_t");
-            // SAFETY: kill(2) takes a process ID and a signal number and touches no memory.
-            let killed = unsafe { libc::kill(pid, libc::SIGKILL) };
-            assert_eq!(
-                killed,
-                0,
-                "kill of worker {pid} failed: {}",
-                std::io::Error::last_os_error()
-            );
+            match interruption {
+                Interruption::KillWorker => {
+                    let pid = i32::try_from(pid).expect("a process ID fits in pid_t");
+                    // SAFETY: kill(2) takes a process ID and a signal number and touches no
+                    // memory.
+                    let killed = unsafe { libc::kill(pid, libc::SIGKILL) };
+                    assert_eq!(
+                        killed,
+                        0,
+                        "kill of worker {pid} failed: {}",
+                        std::io::Error::last_os_error()
+                    );
+                }
+                Interruption::Inject(command) => self.inject(command),
+            }
             let mut run = run;
             let (result, mut guards) = match tokio::time::timeout(RESTART_TIMEOUT, &mut run).await {
                 Ok(joined) => joined.expect("the first run should not panic"),
@@ -505,19 +539,19 @@ impl Env {
                     // Dropping the run cancels the job, so the runtime's drop does not wait for
                     // it for ever.
                     run.abort();
-                    panic!("the first run should end once its worker is gone");
+                    panic!("the first run should end once it is interrupted");
                 }
             };
-            // The link could not be closed on a dead worker, so the run marked its guards
-            // unconfirmed (ADR-258). Once the worker process is reaped it holds no link, and the
-            // agent clears the mark before its next run takes the guards.
+            // A link that could not be closed (on a dead worker, or on a lost device) marks the
+            // guards unconfirmed (ADR-258). Once the worker process has exited it holds no link,
+            // and the agent clears the mark before its next run takes the guards.
             let link_unconfirmed = guards.link_unconfirmed();
             worker
                 .stop(Duration::from_secs(5))
                 .await
-                .expect("the killed worker should be reaped");
+                .expect("the worker should stop or be reaped");
             guards.worker_gone();
-            WorkerCrash {
+            InterruptedRun {
                 result,
                 guards,
                 link_unconfirmed,
@@ -548,16 +582,24 @@ impl Env {
     }
 }
 
-/// How a first run whose worker was killed ended ([`Env::crash_worker`]).
-pub struct WorkerCrash {
+/// How the first run is interrupted ([`Env::interrupt_run`]).
+enum Interruption<'a> {
+    /// The worker alone is killed with SIGKILL.
+    KillWorker,
+    /// The worker is handed this control command.
+    Inject(&'a str),
+}
+
+/// How a first run that was interrupted ended ([`Env::crash_worker`], [`Env::fault_mid_run`]).
+pub struct InterruptedRun {
     /// The first run's result.
     pub result: Result<VmState, JobError>,
     /// The guards the run gave back, still held, for the agent's next run. Their
-    /// unconfirmed-link mark is cleared once the killed worker was reaped.
+    /// unconfirmed-link mark is cleared once the worker was stopped or reaped.
     pub guards: JobGuards,
     /// Whether the run had marked the guards' link unconfirmed (ADR-258) before that.
     pub link_unconfirmed: bool,
-    /// The journal as it read just before the kill was sent.
+    /// The journal as it read just before the interruption.
     pub journal: JournalState,
 }
 

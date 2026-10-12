@@ -52,7 +52,8 @@ The format, the P0-P3 scale and the file list are in `work/README.md` ("Backlog 
 - `next-task`: recommend what to pick up next
 - `backlog-triage` (run on request only): clean up stale, duplicate or mis-prioritized items
 - `backlog-loop` (run on request only): work through the backlog one item and one pull request
-  at a time; the next item starts only after the maintainer merges the previous PR
+  at a time, replacing failing Dependabot pull requests first; the next item starts only after
+  the maintainer merges the previous PR
 
 ### Documentation sync
 

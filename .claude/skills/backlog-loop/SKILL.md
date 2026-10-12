@@ -1,13 +1,14 @@
 ---
 name: backlog-loop
-description: Work through the nekoguruma backlog one item at a time. Pick the next unblocked item, implement it in one pull request, run pr-review-loop, hand the PR to the maintainer, and start the next item only after the maintainer merges it. Run only when the maintainer asks for it.
+description: Work through the nekoguruma backlog one item at a time. Handle open Dependabot pull requests first, then pick the next unblocked item, implement it in one pull request, run pr-review-loop, hand the PR to the maintainer, and start the next item only after the maintainer merges it. Run only when the maintainer asks for it.
 disable-model-invocation: true
 argument-hint: "[max items, default 3] [lowest priority to include: P1 (default) or P2] | pr=<number of the PR to resume>"
 ---
 
 # Backlog loop
 
-One iteration is one backlog item and one pull request. Iterations run strictly one after
+One iteration is one backlog item, or one failing Dependabot pull request (step 2), and one
+pull request. Iterations run strictly one after
 another: the next one starts only after the maintainer has merged the previous PR. Claude never
 merges, and never works on two loop items at once. ADR-230 records why claims, run state and the
 branch reset work the way they do.
@@ -23,8 +24,9 @@ A run starts only when the maintainer asks for one, or from the previous iterati
 ## Run state
 
 The run's state is: a run id (the UTC time the run started), the current PR number, items left,
-the priority cap, and three lists (merged PRs with their shadow risk verdicts, skipped items with
-the reason, and backlog-only PRs, the one that ends the run marked "final"). Keep it in a "Loop
+the priority cap, and four lists (merged PRs with their shadow risk verdicts, skipped items with
+the reason, backlog-only PRs, the one that ends the run marked "final", and Dependabot PRs: each
+one this run replaced, with its replacement, or reported to the maintainer, with the reason). Keep it in a "Loop
 run" section of the current loop PR's description and update it at every step that changes it,
 so it survives a compacted conversation or a fresh session; a merged PR's description can still
 be edited. That section is the only source of the state. A PR belongs to this run only when its
@@ -77,13 +79,59 @@ Then stop the run and go to "Final report" if any of these holds:
 - the latest CI run on `main` failed (a red `main` is P0 work, outside the loop);
 - an open `codeql-alerts` PR exists (the `codeql` label, or the title prefix `[codeql]` with a
   head branch in this repository; ADR-243): tasks run one at a time, across both loops;
-- this run's current PR was closed without being merged. Add `Blocked on: the maintainer's
+- this run's current PR was closed without being merged. Unless it is a Dependabot replacement
+  (step 2), add `Blocked on: the maintainer's
   reason for closing PR #<n>` to its item as a backlog edit (see "Backlog edits"), so no later
   run picks it again, and report the close;
 - this run has opened three backlog-only PRs (step 4), so the remaining items need the
   maintainer more than the loop.
 
 ## 2. Pick
+
+### Dependabot pull requests first
+
+Before picking a backlog item, list the open PRs whose author is `dependabot[bot]`, security
+updates first, then oldest first (ADR-279). Sessions cannot push to Dependabot's branches, and
+Claude never merges, so the loop handles each one by its state. A failed required check (the
+last case below) decides first, even while other checks are pending or auto-merge is on; a merge
+conflict decides next; otherwise the first case that matches decides:
+
+- **Checks pending:** leave it; look again at the next iteration.
+- **In the `cargo-minor-patch` group, with auto-merge turned on** (the PR's `auto_merge` field
+  is set) and no failed check: leave it. It merges itself once the required checks pass (ADR-248). Green without
+  auto-merge (the auto-merge workflow failed, or the repository setting is off) is handled like
+  the next case.
+- **Green, any other update** (a Cargo update Cargo treats as breaking, a GitHub Actions update,
+  a security update): it waits for the maintainer. Do not merge it, and do not stop for it. Put
+  it on the run's Dependabot list for the final report. If it changes a dependency built for a
+  Windows target (`cargo tree -i <crate> --target <target>` finds it for either target the
+  `worker-windows` job builds, `x86_64-pc-windows-gnullvm` and `i686-pc-windows-gnullvm`), say
+  in the report that the Windows release build and its DLL import check in `ci.yml` run only on
+  `main`, so the PR's green checks do not cover them.
+- **Merge conflict:** comment `@dependabot rebase` once, unless the PR already has such a
+  comment. Dependabot rebases its own branch; this is not an iteration. If the PR is still
+  conflicted after Dependabot has answered (for example, it says it cannot rebase), do not
+  comment again: put it on the run's Dependabot list for the final report.
+- **A required check failed**, and the same check is green on `main`: this PR is the
+  iteration's task, ahead of every backlog item. Take the first such PR not already on the run's
+  Dependabot list. Claim it as step 3 does, with the title `[backlog-loop] ` followed by
+  Dependabot's title and a "Replaces #<n>" line in the description. In step 4, apply the same
+  update on the loop branch (the same versions in `Cargo.toml`, `Cargo.lock` or the workflow
+  files), reproduce the failure with the repository's own checks, and fix it at its root cause.
+  If the update changes a dependency built for either of those Windows targets, also check the new version's
+  DLL imports against the allowlist in `ci.yml`, since that check runs only on `main`.
+  The replacement PR has no claimed item, so its shadow risk verdict is HIGH. The maintainer
+  merges it like any other loop PR, also when the update came from the `cargo-minor-patch`
+  group. Do not close the Dependabot PR: Dependabot closes it once `main` has the update. If it
+  is still open after the replacement merges, list it in the final report.
+  When the fix needs something the loop cannot supply (a design choice, an API migration too big
+  for one PR), do not open a replacement: put the PR on the Dependabot list with the reason and
+  go on with the backlog.
+
+A replacement counts against the items left like a backlog item. With no Dependabot PR to
+replace, pick a backlog item as below.
+
+### Backlog item
 
 Run `next-task` with `cap=<cap>` and `skip=` followed by the items on the run's skipped list
 (`next-task` sees nothing but its arguments). Still check its answer: leave out every skipped
@@ -121,7 +169,13 @@ backlog-only PR.
 ## 4. Implement
 
 Work the item as any other task, following CLAUDE.md and `.claude/README.md` (task size, agents,
-documentation sync, ADRs). Close the item with the `backlog` skill in the same PR.
+documentation sync, ADRs). Close the item with the `backlog` skill in the same PR. A Dependabot
+replacement (step 2) has no item to close. If its work shows the loop cannot finish it, put the
+Dependabot PR on the run's Dependabot list with the reason, mark the replacement "final" in its
+run state, close it unmerged with a comment giving the reason, and write the final report. Its
+remote branch survives the close, so the next run's push in step 1 would be rejected (ADR-249):
+the report asks the maintainer to delete that branch. No `Blocked on:` clause is added, since
+there is no backlog item.
 
 If the work shows that the item needs something the loop cannot supply, do not guess. Add a
 `Blocked on:` clause to the item with the `backlog` skill, using the forms in `work/README.md`
@@ -159,7 +213,8 @@ claim="$(git show origin/main:<backlog file> | sed -n '<line number>p')"
 scripts/classify-pr-risk.sh --claimed-item "$claim"
 ```
 
-Without the option, when the claim names no item or several, or when the PR deletes any other
+For a Dependabot replacement, run the classifier without the option. Without the option, when
+the claim names no item or several, or when the PR deletes any other
 item, the verdict is HIGH. The verdict is recorded only to compare it later with the maintainer's
 own judgement; it changes nothing about who merges. If the script exits with status 2, write
 "not classified" and the reason it printed. Then run `pr-review-loop`. Before it hands the PR
@@ -190,6 +245,9 @@ One message to the maintainer:
 
 - the PRs merged in this run, each with its shadow risk verdict, and any backlog-only PRs
   opened (merged or still open);
+- the Dependabot PRs: each one replaced, with its replacement, and each one still open that waits
+  on the maintainer, as a question that can be answered in a word (merge or close) with a
+  recommendation and the reason, including the `main`-only Windows checks where they apply;
 - the items skipped and why;
 - everything that waits on the maintainer: every backlog item whose `Blocked on:` clause
   names the maintainer anywhere, not only at its start (a decision, a purchase, a search, a
@@ -197,4 +255,5 @@ One message to the maintainer:
   maintainer can act on now as a question that can be answered in a word, with a
   recommendation; for the rest (another precondition is still open), give only their count;
 - why the run stopped (no items left, nothing eligible within the cap or five `next-task` calls
-  without a pick, `main` red, another loop PR open or a lost claim race, a PR closed without merging, or three backlog-only PRs).
+  without a pick, `main` red, another loop PR open or a lost claim race, a PR closed without merging, a Dependabot replacement the loop could not finish (with the
+  branch the maintainer should delete), or three backlog-only PRs).

@@ -356,6 +356,7 @@ stateDiagram-v2
     CancelRequested --> Cancelled: interruptible section reached
     CancelRequested --> ReadBackVerification: uninterruptible section continues to completion
     Writing --> ReadBackVerification
+    Writing --> Failed: the procedure ends itself as failed (diag.fail, ADR-280)
     Writing --> Interrupted: power loss, crash, forced termination
     Interrupted --> Writing: resumed from journal after restart
     Interrupted --> OnSiteInterventionRequired: cannot resume
@@ -796,7 +797,7 @@ Approximately 50-80 instructions are expected.
 |---|---|
 | Stack operations | push / pop / dup / swap |
 | Arithmetic, logic, comparison | Integer and floating-point arithmetic, bitwise operations, comparison |
-| Control | Branch, conditional branch, subroutine call and return |
+| Control | Branch, conditional branch, subroutine call and return, declared failure (the procedure ends itself as failed with a code and a detail, ADR-280) |
 | Variables | Local and global read/write, array access |
 | Diagnostic primitives | Service execution, DTC read, routine control, security access request, flash transfer, wait, HMI request, record template input request (4.3.1), monitoring section capture (4.6), log output |
 
@@ -824,6 +825,7 @@ For each cause of interruption, the resume origin and whether resumption is poss
 - The start deadline has passed (terminate as "expired", since another vehicle may be connected)
 - VIN mismatch on re-verification before resuming (abort)
 - The number of resumes at the same stage has reached the limit (avoid infinite loops; escalate to on-site intervention)
+- The procedure ended itself as failed: a declared failure is terminal and journaled, and a restart does not resume the job (ADR-280)
 
 **Key design points**
 

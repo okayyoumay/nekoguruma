@@ -1,7 +1,7 @@
 # ADR-276: A Redone Transfer Goes On from the Erase as a First Run
 
 **Date:** 2026-10-11
-**Status:** Accepted
+**Status:** Accepted (item 3's gap closed by ADR-280: the procedure can end the job as failed)
 **Affects:** `agent` (`src/runner.rs`, `src/restart.rs`, `docs/ngr-agent.md`), ADR-273 item 4
 
 ## Context
@@ -67,7 +67,7 @@ Two questions are left open by the earlier decisions:
   the erase or fall back to another routine, which the plan's control-flow rules allow
   (ADR-245 item 4); and it would put a policy on ECU answers into the core, against ADR-233 and
   design 9.1. The check belongs to the procedure, which needs an instruction to end the job as
-  failed (`diag.fail`, which ADR-254 leaves without an IR instruction).
+  failed (`diag.fail`, which ADR-254 left without an IR instruction until ADR-280).
 
 - **A session check before the erase** (refuse, or end in on-site intervention, when the replayed
   range enters no programming session): the agent would need to track sessions, which it

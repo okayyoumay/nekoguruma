@@ -164,6 +164,7 @@ fn check_named_point(commits: usize, state: &JournalState) -> Option<&'static st
                 last_intent: None,
                 target_vin: None,
                 intended_software_version: None,
+                procedure_failed: None,
             }
         ),
         // The newest VM state is the run start's, and it names no request.

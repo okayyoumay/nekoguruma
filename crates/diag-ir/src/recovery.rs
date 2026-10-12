@@ -8,7 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Idempotency, Interruptible, Op, Program};
+use crate::{Idempotency, Interruptible, MAX_FAILURE_CODE_LEN, Op, Program};
 
 // ---------------------------------------------------------------- Sources
 
@@ -245,6 +245,10 @@ pub enum SourceOwner {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ProgramError {
     #[error(
+        "instruction {pc}: the code of a declared failure must be a constant of 1 to {MAX_FAILURE_CODE_LEN} bytes of UTF-8"
+    )]
+    BadFailureCode { pc: u32 },
+    #[error(
         "flash session {flash_session}: boundaries must satisfy entry <= erase < transfer exit < post-transfer end <= code length"
     )]
     BoundaryOutOfOrder { flash_session: u32 },
@@ -391,6 +395,18 @@ impl Program {
             return Err(ProgramError::TooManyFlashRecoveries {
                 count: self.flash.len(),
             });
+        }
+        // The code of a declared failure is a constant the dry run can check (ADR-280).
+        for (pc, op) in self.code.iter().enumerate() {
+            if let Op::Fail { code } = op
+                && !self
+                    .constants
+                    .get(*code as usize)
+                    .and_then(|bytes| std::str::from_utf8(bytes).ok())
+                    .is_some_and(|text| (1..=MAX_FAILURE_CODE_LEN).contains(&text.len()))
+            {
+                return Err(ProgramError::BadFailureCode { pc: pc as u32 });
+            }
         }
         // The overlap checks below would read a reversed section as empty.
         for (section, s) in self.sections.iter().enumerate() {
@@ -632,7 +648,8 @@ impl Program {
         for (index, op) in self.code.iter().enumerate() {
             let pc = index as u32;
             let successors: &[u32] = match *op {
-                Op::Ret => &[],
+                // A return or a declared failure ends the path (ADR-280).
+                Op::Ret | Op::Fail { .. } => &[],
                 Op::Jump(to) => &[to],
                 Op::JumpIfFalse(to) => &[to, pc + 1],
                 _ => &[pc + 1],

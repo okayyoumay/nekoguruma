@@ -1,7 +1,7 @@
 # ADR-233: diag-ir VM Execution Semantics
 
 **Date:** 2026-10-06
-**Status:** Accepted (item 3's `VmState::checkpoint` and `resume_count` removed by ADR-245)
+**Status:** Accepted (item 3's `VmState::checkpoint` and `resume_count` removed by ADR-245; `Op::Fail` and `StepOutcome::Failed` appended by ADR-280)
 **Affects:** `diag-ir` (`src/lib.rs`: `Vm::step`, `VmState`, `DiagHost`, `StepOutcome`, `VmError`), `docs/system-architecture.md` 8.2.4
 
 ## Context
@@ -87,5 +87,5 @@ No IR programs, transpiler or journals existed when this was decided, so `VmStat
 - The job runner must implement the idempotency and section policy, the intent markers and the journal. The VM gives it a state that is either before or after each instruction, never in between.
 - `DiagHost` is synchronous, while the agent's worker client is asynchronous (tonic). The runner must bridge the two, for example with a per-job blocking thread, or the trait must become async. Changing the trait after more implementations exist costs a migration.
 - Large `Bytes` values on the stack (flash blocks) make every journaled `VmState` large. A transpiler should push block data immediately before `FlashTransfer`; a cap on the total bytes held may be needed later.
-- The instruction set has gaps a transpiler will need, such as length, remainder, negation, integer/float conversion, slicing and concatenation. New variants are appended at the end of `Op`, so existing programs stay valid.
+- The instruction set has gaps a transpiler will need, such as length, remainder, negation, integer/float conversion, slicing and concatenation. New variants are appended at the end of `Op`, so existing programs keep their encoding; the schema version still changes with the instruction set, since an older runtime cannot decode a new variant, and the runtime's equality check then refuses programs of the earlier version (ADR-280).
 - A slot index can be as high as 65535, so a program can make `locals` or `globals` large, and every frame's locals are journaled.

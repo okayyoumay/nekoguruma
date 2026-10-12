@@ -28,6 +28,9 @@
 //!   from outside the plan records nothing), then, after the plan's exit marker, the
 //!   post-transfer completion.
 //!
+//! When the procedure ends itself as failed (`Op::Fail`): a procedure-failure record, the job's
+//! last ([`JobJournal::procedure_failed`], ADR-280).
+//!
 //! A commit that fails, or an identity that cannot be read, ends the job before the next
 //! instruction runs, so the request a marker guards is never sent without it (ADR-244 item 7).
 
@@ -123,6 +126,19 @@ impl<S: Store> JobJournal<S> {
             },
             &encoded,
         )?;
+        Ok(())
+    }
+
+    /// Commits the procedure's declared failure at `at`, the `Fail` instruction, as the job's
+    /// last record (ADR-280). The caller bounds the text. A failed commit is the job's error, so
+    /// the journal never claims a run end it does not hold.
+    pub(crate) fn procedure_failed(
+        &mut self,
+        at: StepRef,
+        code: &str,
+        detail: &str,
+    ) -> Result<(), JobError> {
+        self.journal.commit_procedure_failed(at, code, detail)?;
         Ok(())
     }
 

@@ -133,6 +133,7 @@ fn run(vm: &mut Vm, program: &Program, host: &mut MockHost) {
             StepOutcome::Continue => {}
             StepOutcome::Finished => return,
             StepOutcome::Waiting(on) => panic!("unexpected wait on {on:?}"),
+            StepOutcome::Failed(failure) => panic!("unexpected failure {failure:?}"),
         }
     }
     panic!("program did not finish");
@@ -911,6 +912,7 @@ fn primitive_classification_covers_every_instruction() {
             level: 0,
             message: 0,
         },
+        Op::Fail { code: 0 },
     ];
     for (index, op) in all.iter().enumerate() {
         // The postcard encoding starts with the variant index, so this also pins the variant
@@ -926,6 +928,124 @@ fn primitive_classification_covers_every_instruction() {
                 .any(|p| std::mem::discriminant(p) == std::mem::discriminant(op));
         assert_eq!(op.is_diagnostic_primitive(), expected, "{op:?}");
     }
+}
+
+// ---------------------------------------------------------------- Fail (ADR-280)
+
+fn failing_program(code: u32) -> Program {
+    prog(
+        vec![Op::PushBytes(1), Op::Fail { code }, i(1)],
+        vec![b"FLASH_REFUSED".to_vec(), vec![0xff, 0x00, b'a']],
+    )
+}
+
+#[test]
+fn fail_reports_the_code_and_detail_and_leaves_the_state_unchanged() {
+    let program = failing_program(0);
+    let mut vm = Vm::new(&program);
+    let mut host = MockHost::default();
+    assert!(matches!(
+        vm.step(&program, &mut host),
+        Ok(StepOutcome::Continue)
+    ));
+    let before = postcard::to_allocvec(&vm.state).unwrap();
+    let expected = Failure {
+        code: "FLASH_REFUSED".to_owned(),
+        // Not UTF-8, and not checked by the VM.
+        detail: vec![0xff, 0x00, b'a'],
+    };
+    for _ in 0..2 {
+        match vm.step(&program, &mut host) {
+            Ok(StepOutcome::Failed(failure)) => assert_eq!(failure, expected),
+            other => panic!("expected a failure, got {other:?}"),
+        }
+        assert_eq!(postcard::to_allocvec(&vm.state).unwrap(), before);
+    }
+    assert_eq!(vm.state.pc, 1);
+    assert_eq!(vm.state.steps, 1);
+    assert_eq!(vm.state.stack.len(), 1);
+    assert!(host.calls.is_empty());
+    // `Fail` is not a primitive, so no intent precedes it, and `current_op` still names it.
+    assert_eq!(vm.current_op(&program), Ok(Some(&Op::Fail { code: 0 })));
+    assert!(!Op::Fail { code: 0 }.is_diagnostic_primitive());
+}
+
+#[test]
+fn fail_hands_over_only_a_bounded_prefix_of_a_long_detail() {
+    let long = vec![b'x'; 4 * MAX_FAILURE_DETAIL_LEN];
+    let program = prog(
+        vec![Op::PushBytes(1), Op::Fail { code: 0 }],
+        vec![b"E".to_vec(), long.clone()],
+    );
+    let mut vm = Vm::new(&program);
+    let mut host = MockHost::default();
+    assert!(matches!(
+        vm.step(&program, &mut host),
+        Ok(StepOutcome::Continue)
+    ));
+    match vm.step(&program, &mut host) {
+        Ok(StepOutcome::Failed(failure)) => {
+            assert_eq!(failure.detail, long[..MAX_FAILURE_DETAIL_LEN + 3]);
+        }
+        other => panic!("expected a failure, got {other:?}"),
+    }
+    // The operand itself stays whole on the stack.
+    assert_eq!(vm.state.stack, [Value::Bytes(long)]);
+}
+
+#[test]
+fn fail_inside_a_subroutine_ends_the_procedure_with_the_frame_intact() {
+    let program = prog(
+        vec![Op::Call(2), Op::Ret, Op::PushBytes(1), Op::Fail { code: 0 }],
+        vec![b"E".to_vec(), b"d".to_vec()],
+    );
+    let mut vm = Vm::new(&program);
+    let mut host = MockHost::default();
+    for _ in 0..2 {
+        assert!(matches!(
+            vm.step(&program, &mut host),
+            Ok(StepOutcome::Continue)
+        ));
+    }
+    let before = postcard::to_allocvec(&vm.state).unwrap();
+    assert!(matches!(
+        vm.step(&program, &mut host),
+        Ok(StepOutcome::Failed(Failure { code, detail })) if code == "E" && detail == b"d"
+    ));
+    assert_eq!(postcard::to_allocvec(&vm.state).unwrap(), before);
+    assert_eq!(vm.state.call_stack.len(), 1);
+}
+
+#[test]
+fn fail_checks_its_operands_before_it_changes_anything() {
+    // A missing code constant.
+    assert_eq!(
+        expect_vm_error(
+            vec![Op::PushBytes(0), Op::Fail { code: 7 }],
+            vec![b"d".to_vec()],
+            1
+        ),
+        VmError::BadConstant(7)
+    );
+    // A code that is not UTF-8.
+    assert_eq!(
+        expect_vm_error(
+            vec![Op::PushBytes(0), Op::Fail { code: 1 }],
+            vec![b"d".to_vec(), vec![0xc3, 0x28]],
+            1
+        ),
+        VmError::InvalidUtf8(1)
+    );
+    // No detail on the stack.
+    assert_eq!(
+        expect_vm_error(vec![Op::Fail { code: 0 }], vec![b"c".to_vec()], 0),
+        VmError::StackUnderflow
+    );
+    // A detail that is not bytes.
+    assert_eq!(
+        expect_vm_error(vec![i(1), Op::Fail { code: 0 }], vec![b"c".to_vec()], 1),
+        VmError::TypeMismatch
+    );
 }
 
 #[test]
@@ -1133,6 +1253,7 @@ fn waits_carry_a_stable_inquiry() {
             StepOutcome::Continue => {}
             StepOutcome::Finished => break,
             StepOutcome::Waiting(on) => waits.push(on),
+            StepOutcome::Failed(failure) => panic!("unexpected failure {failure:?}"),
         }
     }
     use WaitingOn::{Hmi, Timer};
@@ -1215,6 +1336,7 @@ fn record_input_waits_for_the_operator() {
                 assert_eq!(postcard::to_allocvec(&vm.state).unwrap(), before);
                 waits += 1;
             }
+            StepOutcome::Failed(failure) => panic!("unexpected failure {failure:?}"),
         }
     }
     assert_eq!(waits, 2);
@@ -2164,6 +2286,84 @@ fn a_subroutine_cannot_reach_a_plan() {
     program.code[10] = Op::Call(0);
     assert_eq!(
         program.validate(),
+        Err(ProgramError::PlanInSubroutine {
+            flash_session: 1,
+            pc: 10
+        })
+    );
+}
+
+/// A declared failure is allowed anywhere in a plan: between the erase and the RequestDownload,
+/// in the transfer, and after it (ADR-280).
+#[test]
+fn a_plan_may_fail_at_any_stage() {
+    let mut program = recovery_program();
+    program.constants = vec![b"E".to_vec()];
+    program.code = vec![
+        Op::Pop,
+        Op::RoutineControl { routine: 1, sub: 1 },
+        Op::Fail { code: 0 },
+        Op::ServiceRequest { service: 0x34 },
+        Op::Fail { code: 0 },
+        Op::ServiceRequest { service: 0x37 },
+        Op::Fail { code: 0 },
+        Op::Pop,
+        Op::Pop,
+        Op::Pop,
+    ];
+    let b = &mut program.flash[0].boundaries;
+    b.transfer_exit_pc = 5;
+    b.post_transfer_end_pc = 7;
+    assert_eq!(program.validate(), Ok(()));
+}
+
+/// The code of a `Fail` is checked statically: it must exist, be UTF-8 and be 1 to the limit
+/// in bytes (ADR-280).
+#[test]
+fn the_code_of_a_declared_failure_is_checked_statically() {
+    let program_with =
+        |constants: Vec<Vec<u8>>| prog(vec![Op::PushBytes(0), Op::Fail { code: 1 }], constants);
+    let long = vec![b'a'; MAX_FAILURE_CODE_LEN + 1];
+    for (constants, ok) in [
+        (vec![b"d".to_vec(), b"E".to_vec()], true),
+        (vec![b"d".to_vec(), vec![b'a'; MAX_FAILURE_CODE_LEN]], true),
+        (vec![b"d".to_vec()], false),
+        (vec![b"d".to_vec(), Vec::new()], false),
+        (vec![b"d".to_vec(), long], false),
+        (vec![b"d".to_vec(), vec![0xc3, 0x28]], false),
+    ] {
+        let expected = if ok {
+            Ok(())
+        } else {
+            Err(ProgramError::BadFailureCode { pc: 1 })
+        };
+        assert_eq!(
+            program_with(constants.clone()).validate(),
+            expected,
+            "{constants:?}"
+        );
+    }
+}
+
+/// A subroutine that ends in a declared failure never falls through into the plan, so it is not
+/// a subroutine that reaches the plan; without the failure it still is.
+#[test]
+fn a_subroutine_ending_in_fail_does_not_reach_the_plan() {
+    let build = |first: Op| {
+        let mut program = flow_program(|_| {});
+        program.constants = vec![b"E".to_vec()];
+        program.code.insert(0, first);
+        let b = &mut program.flash[0].boundaries;
+        b.entry_pc += 1;
+        b.erase_pc += 1;
+        b.transfer_exit_pc += 1;
+        b.post_transfer_end_pc += 1;
+        program.code[10] = Op::Call(0);
+        program
+    };
+    assert_eq!(build(Op::Fail { code: 0 }).validate(), Ok(()));
+    assert_eq!(
+        build(Op::Pop).validate(),
         Err(ProgramError::PlanInSubroutine {
             flash_session: 1,
             pc: 10

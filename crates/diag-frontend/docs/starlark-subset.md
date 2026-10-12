@@ -156,6 +156,8 @@ field that stores them.
 | `millis`, `back_millis` | `int`, 0 to 2^32 - 1 |
 | `form_id`, `template_id` | `str` naming the form or record template |
 | `level` of `diag.log` | `int`, 0 to 255 |
+| `code` of `diag.fail` | non-empty `str` constant, 1 to 64 bytes of UTF-8 (the IR accepts 1 to 128; `Program::validate` checks the constant, ADR-280) |
+| `detail` of `diag.fail` | `str` expression, which may be built at run time |
 | `params` of `diag.hmi` | dict whose values are all constants (3.2) |
 | `session_id` | `int` naming a flash session declared in the declaration part (`FlashSession` in `ir.fbs`); an unknown session is rejected (`STAR_UNKNOWN_FLASH_SESSION`) |
 
@@ -181,7 +183,7 @@ instruction exists, the transpiler rejects calls to it (`STAR_API_NOT_AVAILABLE`
 | `diag.log` | `Log` | none; the message is a constant, so a message built at run time needs a log instruction that takes it from the stack |
 | `diag.ecu_info` | none yet | |
 | `diag.precondition` | none yet | |
-| `diag.fail` | none yet | |
+| `diag.fail` | `Fail` | `code` as a constant-pool entry; `detail` as bytes from the stack, since it can be built at run time. The instruction ends the procedure as failed and is terminal (ADR-280) |
 
 ### 3.3 Synchronous Calls
 
@@ -236,7 +238,7 @@ for i in range(count):
 
 Without the annotation, the default (1000) is applied and reported as a warning.
 The limit is a counter the transpiler emits around the loop; when it is reached, the procedure
-ends as if `diag.fail("LOOP_LIMIT_EXCEEDED", ...)` had been called at that point (3.2).
+ends as if `diag.fail("LOOP_LIMIT_EXCEEDED", ...)` had been called at that point: the counter lowers to a `Fail` with that code (3.2).
 
 A polling loop is written as a bounded `for` with `break`:
 

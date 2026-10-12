@@ -84,7 +84,7 @@ flowchart TB
 
     subgraph EP["Installed device"]
         AG["Agent (64-bit)<br/>Discovery / Job execution / Journal"]
-        WK["Worker (per ABI, one process per library)"]
+        WK["Worker (per ABI, one process per library; per device for J2534)"]
         LIB["Vendor lib"]
         DEV["Vehicle / ECU"]
     end
@@ -844,7 +844,7 @@ For each cause of interruption, the resume origin and whether resumption is poss
 - **Content addressing**: Each file is identified by its hash. Definitions shared across vehicle models are naturally deduplicated, which also provides differential delivery
 - **Lazy fetching**: The agent fetches and caches only the manifest and the target variants
 - **Unit of signing**: The manifest is signed, and the manifest holds the hash of each file (the same structure as artifacts)
-- **Version compatibility**: The IR carries a schema version, and the agent reports supported versions in `capabilities`. The runtime also checks the version, preventing accidents where an old agent executes new IR. Until the first release, breaking changes to the IR schema and to the journal's stored state are allowed with no compatibility path for older schema versions, since nothing is stored outside the repository
+- **Version compatibility**: The IR carries a schema version, and the agent reports supported versions in `capabilities`. The runtime also checks the version, preventing accidents where an old agent executes new IR. Until the first release, breaking changes to the IR schema and to the journal's stored state are allowed with no compatibility path for older schema versions, since nothing is stored outside the repository (ADR-281 item 4)
 
 ### 8.3 Declaration of the Supported Subset
 
@@ -956,7 +956,7 @@ The targets form 3 tiers: VCI (communication interface) -> vehicle bus -> ECU.
 
 Operation with multiple VCIs connected to a single device, handling multiple vehicles simultaneously, is assumed.
 
-- **Worker assignment**: One process per library, a dedicated thread per VCI. Multiple VCIs from the same vendor become separate threads in the same worker, so the VCI profile declares whether the library supports opening multiple devices simultaneously. If not, a separate worker is used per VCI
+- **Worker assignment**: One process per library, a dedicated thread per VCI. Multiple VCIs from the same vendor become separate threads in the same worker, so the VCI profile declares whether the library supports opening multiple devices simultaneously. If not, a separate worker is used per VCI. Exception: a J2534 library with several configured devices always runs one worker per device, each selected by its `modules` label (ADR-281), whatever the profile declares
 - **Lock units**: Per-VCI and per-vehicle locks are managed independently. A configuration where, on the same device, VCI-A handles vehicle X and VCI-B handles vehicle Y is allowed; only when the two VINs fall into the same per-vehicle lock bucket (about once in 4096 pairs, ADR-262) does one job wait for the other
 - **Concurrent job execution**: The agent can execute multiple jobs in parallel. However, ECU reprogramming is limited to 1 at a time per device (because power, bandwidth and operator attention would be divided)
 - **Resource contention**: The high-resolution timer for monitoring and the CPU consumption of concurrent acquisition jobs can interfere. During monitoring, the measured update interval is re-evaluated, and if it cannot be achieved, the value is lowered and reported

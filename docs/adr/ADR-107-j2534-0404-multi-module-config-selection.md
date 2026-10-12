@@ -1,7 +1,7 @@
 # ADR-107: Config-Declared Multi-Module Device Selection for J2534 v04.04
 
 **Date:** 2026-07-21
-**Status:** Accepted (Decision (b) kept; simultaneous devices come from one worker per device, ADR-281)
+**Status:** Accepted (Decision (b) kept; simultaneous devices come from one worker per device, and `label` must be non-empty and unique as the device selector, ADR-281)
 **Affects:** `vci-service-config`, `j2534-0404`, `j2534-0404-service` service, config, rpc_module, rpc_link, error
 
 ## Context

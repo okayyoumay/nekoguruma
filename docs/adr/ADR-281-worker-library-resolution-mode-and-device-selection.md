@@ -1,15 +1,15 @@
-# ADR-281: Worker Library Resolution Has No Config-File Path, the Agent Passes the Mode, and One J2534 Device Is One Worker
+# ADR-281: Worker Library Resolution Has No Config-File Path, the Agent Passes the Mode, One J2534 Device Is One Worker, and Pre-Release Compatibility May Break
 
 **Date:** 2026-10-12
 **Status:** Accepted
-**Affects:** `docs/system-architecture.md` (3.4, 7.1, 7.2, 8.2.6), `docs/j2534-0404-architecture.md`, `crates/vci-service-config` (`find_library_path`, `list_configured_library_paths`, docs), `crates/j2534-0404-registry`, `crates/iso22900-registry`, `crates/j2534-0404-service`, `crates/iso22900-service`, `crates/agent` (`launch.rs`, `link.rs`); ADR-107, ADR-228, ADR-270, ADR-278
+**Affects:** `docs/system-architecture.md` (3.4, 7.1, 7.2, 8.2.6, 8.8.1), `docs/j2534-0404-architecture.md`, `crates/vci-service-config` (`find_library_path`, `list_configured_library_paths`, docs), `crates/j2534-0404-registry`, `crates/iso22900-registry`, `crates/j2534-0404-service`, `crates/iso22900-service`, `crates/agent` (`launch.rs`, `link.rs`); ADR-029, ADR-030, ADR-034, ADR-035, ADR-036, ADR-107, ADR-228, ADR-270, ADR-278, ADR-280 (consequence on schema compatibility)
 
 ## Context
 
 Design 7.1 and 7.2 fix where a library is found: the Linux J2534 definition directory, the
 Windows registry and the D-PDU API root description file, all at locations fixed at build time,
 with a runtime override in debug builds only (ADR-228 item 1). The shared resolver
-`ngr-library-resolver` implements those chains and the two 7.2 checks (ADR-270, ADR-278). Three
+`ngr-library-resolver` implements those chains and the two 7.2 checks (ADR-270, ADR-278). Four
 questions were left open before the worker services and the agent could switch over to it.
 
 1. **The `library_path` override.** The worker services' `config.toml` can name a library path
@@ -26,6 +26,9 @@ questions were left open before the worker services and the agent could switch o
    device by `pname`, but ADR-107 item (b) keeps one open device per worker process and the
    agent refuses a worker whose `GetModuleIds` returns more than one row. The maintainer wants
    each entry usable as a separate device, connected at the same time.
+4. **Compatibility before the first release.** ADR-280 changes the IR schema version, and the
+   runtime refuses any version it does not support. Whether older schema versions or stored
+   journals must stay readable had no authoritative decision.
 
 ## Decision
 
@@ -46,12 +49,23 @@ questions were left open before the worker services and the agent could switch o
    loads (ADR-270 item 5, ADR-278 item 4).
 3. **One J2534 device is one worker process.** For a library with several `modules` entries,
    the agent starts a separate worker per device and passes the library name plus the entry's
-   `label` as startup arguments. That worker opens only that module, with the entry's `pname`
+   `label` as startup arguments. The `label` is the selector: it must be non-empty and unique
+   within one library's `modules` list (today it is only the display text of
+   `ModuleData.vendor_module_name`, and duplicates or empty values are allowed). The J2534
+   worker validates this at startup and refuses to start when the rule is broken, and a label
+   that matches no entry is a startup error. An index or handle is not used as the selector:
+   it would silently point at a different device after the configuration is edited, while the
+   label is what the operator sees. That worker opens only that module, with the entry's `pname`
    as `PassThruOpen`'s argument (ADR-107 item (a)), and the agent links each worker as its own
    device. ADR-107 item (b) stays: a worker has one open device and no per-module state
    partition; simultaneous use comes from several worker processes. When no label is passed the
    worker behaves as before (the first entry, or the synthesized default entry when `modules` is
    absent).
+4. **Before the first release, compatibility may break.** Changes to the IR schema and to the
+   journal's stored state may break compatibility, with no migration and no acceptance of older
+   versions, since nothing is stored outside this repository. The runtime keeps refusing a
+   schema version it does not support. This decision is revisited when the first release is
+   made.
 
 ## Alternatives considered
 
@@ -69,6 +83,11 @@ questions were left open before the worker services and the agent could switch o
 - **The worker infers the mode (item 2)** from its account, its parent or its environment.
   Rejected: each inference is a heuristic that can fail open, and the worker then enforces a
   policy it does not own.
+- **Select the device by config index or module handle (item 3).** Rejected: an index would
+  silently point at a different device after the `modules` list is edited (an entry added,
+  removed or reordered), while the label is the text the operator sees and chose.
+- **Accept older schema versions or migrate journals now (item 4).** Rejected: nothing is stored
+  outside this repository yet, so the code and tests for a range of versions would serve no one.
 - **One worker opens several devices at once (item 3).** Rejected for now: it revises ADR-107
   item (b) and needs the worker's state (`device_id`, module state, shared channels, logical
   links, subscriptions, the poll tasks) partitioned per module, which ADR-107 judged a much
@@ -89,5 +108,10 @@ questions were left open before the worker services and the agent could switch o
   they take a process-wide lock on a driver. Such a library stays limited to one device at a
   time; this is a property of the library and is not detected by the agent.
 - Each running J2534 device costs one worker process, which refines design 3.4's one process per library for J2534. The per-VCI lock (design 8.8) stays per device.
+- ADR-280's consequence that a program or journal of the previous schema version is refused is
+  now this decision's rule (item 4), not a limit to be lifted before release. After the first
+  release, a schema change needs a compatibility path, or a new decision.
+- A `modules` list with an empty or repeated label, which loaded before, makes the J2534 worker
+  refuse to start once item 3 is implemented.
 - Implementation work (the resolver adoption, removing the key and its readers, the startup
   arguments, the agent's per-device workers) is tracked in the backlog, not here.

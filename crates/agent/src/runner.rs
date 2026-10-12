@@ -458,16 +458,25 @@ fn run_job(
     if cancelled.load(Ordering::Relaxed) {
         return Err(JobError::Cancelled);
     }
-    // A declared failure in the journal of a resumed job is final (ADR-280): it is reported
-    // before the link is opened, so the verdict does not depend on the worker or the VCI. The
-    // journal is only read here; its record is the last one, so a run that holds it cannot
-    // change the verdict.
-    if let Some(JournalMode::Resume(setup)) = &journal
-        && let Ok(state) = Journal::read(&setup.dir, &setup.key)
-        && let Some(failure) = &state.facts.procedure_failed
-    {
-        return Err(failure_error(failure));
-    }
+    // A resumed job takes its journal's writer lock before the link is opened (ADR-255 item 7),
+    // so another run that holds it is reported, and a declared failure the journal records is
+    // final (ADR-280), without either depending on the worker or the VCI. The opened journal goes
+    // on to the resume below.
+    let resume_journal = match &journal {
+        Some(JournalMode::Resume(setup)) => {
+            let opened = Journal::open(&setup.dir, &setup.key);
+            if let Err(JournalError::InUse) = opened {
+                return Err(JobError::Journal(JournalError::InUse));
+            }
+            if let Ok(opened) = &opened
+                && let Some(failure) = &opened.state().facts.procedure_failed
+            {
+                return Err(failure_error(failure));
+            }
+            Some(opened)
+        }
+        _ => None,
+    };
     let timings = Timings::for_link(config);
     // An open that fails partway closes what it opened; when even that fails, or the open
     // panics, the worker may still hold the module or the link (ADR-258).
@@ -519,7 +528,7 @@ fn run_job(
             &mut host,
             limits,
             cancelled,
-            Journal::open(&setup.dir, &setup.key),
+            resume_journal.expect("opened above for a resumed job"),
             setup.sources,
             setup.vin.as_ref(),
             setup.intended_software_version.as_deref(),
@@ -3621,6 +3630,30 @@ mod tests {
                 .resume_counts
                 .is_empty()
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The writer lock is taken before the recorded failure is looked at: a failed job whose
+    /// journal another run holds reports that, not the failure, also before the link is opened
+    /// (ADR-255 item 7).
+    #[test]
+    fn a_failed_journal_another_run_holds_reports_it_in_use() {
+        let program = flash_program_failing_after_the_erase();
+        let dir = journal_dir("procedure-failed-in-use");
+        let result = first_run(&program, &dir, JobLimits::default(), |_| {});
+        assert!(
+            matches!(result, Err(JobError::ProcedureFailed { .. })),
+            "{result:?}"
+        );
+        let held = Journal::open(&dir, &job_key()).unwrap();
+        let guards = take_guards(&dir);
+        let (result, _guards) =
+            resume_on_unreachable(program, &dir, guards, Arc::new(AtomicBool::new(false)));
+        assert!(
+            matches!(result, Err(JobError::Journal(JournalError::InUse))),
+            "{result:?}"
+        );
+        drop(held);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

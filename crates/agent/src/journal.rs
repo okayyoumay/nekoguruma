@@ -2455,6 +2455,11 @@ mod tests {
                 at: at(0, 0),
                 vm_state: Vec::new(),
             },
+            Record::ProcedureFailed {
+                at: at(0, 0),
+                code: String::new(),
+                detail: String::new(),
+            },
         ];
         for (index, record) in records.iter().enumerate() {
             assert_eq!(

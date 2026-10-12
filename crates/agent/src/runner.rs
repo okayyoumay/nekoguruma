@@ -131,6 +131,15 @@ pub enum JobError {
 }
 
 /// `text` cut to at most `max` bytes, on a character boundary.
+/// The part of a declared failure's detail that can reach the first
+/// [`crate::journal::MAX_FAILURE_DETAIL_LEN`] bytes once decoded: the detail is an unbounded
+/// stack value, so only this prefix is decoded. Every byte of the decoded text up to the limit
+/// comes from it, since a lossy decoding never shrinks the input; the three extra bytes let a
+/// character that straddles the limit decode as it would in full, before [`truncated`] drops it.
+fn failure_prefix(detail: &[u8]) -> &[u8] {
+    &detail[..detail.len().min(crate::journal::MAX_FAILURE_DETAIL_LEN + 3)]
+}
+
 fn truncated(mut text: String, max: usize) -> String {
     if text.len() > max {
         let mut end = max;
@@ -1100,7 +1109,7 @@ where
                 // procedure ended (ADR-280). A commit that fails is the job's error instead.
                 let code = truncated(failure.code, crate::journal::MAX_FAILURE_CODE_LEN);
                 let detail = truncated(
-                    String::from_utf8_lossy(&failure.detail).into_owned(),
+                    String::from_utf8_lossy(failure_prefix(&failure.detail)).into_owned(),
                     crate::journal::MAX_FAILURE_DETAIL_LEN,
                 );
                 if let Some(journal) = journal.as_deref_mut()
@@ -1487,6 +1496,20 @@ mod tests {
         let cut = truncated(long, crate::journal::MAX_FAILURE_CODE_LEN);
         assert_eq!(cut.len(), crate::journal::MAX_FAILURE_CODE_LEN - 1);
         assert!(cut.starts_with("a\u{e9}"));
+        // Only a bounded prefix of a long detail is decoded, with the same result as decoding
+        // all of it: valid text whose limit falls inside a character, a four-byte character at
+        // the limit, and invalid bytes.
+        let max = crate::journal::MAX_FAILURE_DETAIL_LEN;
+        let four = "\u{1f600}".repeat(max);
+        for detail in [
+            format!("a{}", "\u{e9}".repeat(max)).into_bytes(),
+            format!("ab{four}").into_bytes(),
+            vec![0xff; 4 * max],
+        ] {
+            assert_eq!(failure_prefix(&detail).len(), max + 3);
+            let decode = |bytes: &[u8]| truncated(String::from_utf8_lossy(bytes).into_owned(), max);
+            assert_eq!(decode(failure_prefix(&detail)), decode(&detail));
+        }
     }
 
     #[test]

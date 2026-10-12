@@ -6475,7 +6475,7 @@ mod rollback_stop_comm_pending_tests {
         J2534Service {
             api: Arc::new(Mutex::new(api)),
             startup_config: Arc::new(
-                crate::config::parse_startup_arg("j2534-0404:mock-lib").unwrap(),
+                crate::config::parse_startup_arg("j2534-0404:mock-lib?mode=user").unwrap(),
             ),
             can_channel_mode: CanChannelMode::default(),
             resolved_can_channel_mode: Arc::new(Mutex::new(None)),
@@ -9158,7 +9158,7 @@ mod rpc_cancel_com_primitive_broadcast_periodic_session_gate_tests {
         J2534Service {
             api: Arc::new(Mutex::new(api)),
             startup_config: Arc::new(
-                crate::config::parse_startup_arg("j2534-0404:mock-lib").unwrap(),
+                crate::config::parse_startup_arg("j2534-0404:mock-lib?mode=user").unwrap(),
             ),
             can_channel_mode: CanChannelMode::default(),
             resolved_can_channel_mode: Arc::new(Mutex::new(None)),
@@ -10071,7 +10071,7 @@ mod copt_stopcomm_cancel_all_cancelled_cops_tests {
         J2534Service {
             api: Arc::new(Mutex::new(api)),
             startup_config: Arc::new(
-                crate::config::parse_startup_arg("j2534-0404:mock-lib").unwrap(),
+                crate::config::parse_startup_arg("j2534-0404:mock-lib?mode=user").unwrap(),
             ),
             can_channel_mode: CanChannelMode::default(),
             resolved_can_channel_mode: Arc::new(Mutex::new(None)),

@@ -390,6 +390,7 @@ mod module_disconnect_cop_tag_race_tests {
             StartupConfig {
                 library_name: "TestLib".into(),
                 requested_port: None,
+                mode: vci_service_launcher::mode::OperatingMode::User,
             },
             tokio::sync::watch::channel(false).1,
         )

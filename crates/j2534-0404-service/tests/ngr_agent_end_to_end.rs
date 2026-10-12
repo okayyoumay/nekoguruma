@@ -126,7 +126,7 @@ fn ngr_agent_runs_a_program_file_on_sim_vci() {
 
     // The agent and the worker it launches both read the library path from this config.
     let mut child = Command::new(ngr_agent_path())
-        .args(["run", "--vci", LIBRARY_NAME, "--program"])
+        .args(["run", "--vci", LIBRARY_NAME, "--mode", "user", "--program"])
         .arg(&program_path)
         .arg("--workers")
         .arg(&workers)

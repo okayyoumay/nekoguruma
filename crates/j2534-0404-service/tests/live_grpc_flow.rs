@@ -351,7 +351,7 @@ async fn manual_typical_grpc_flow_against_real_device() {
 
     // ── Start the real service, backed by the resolved target library ──────
     let (service_shutdown_tx, service_shutdown_rx) = tokio::sync::watch::channel(false);
-    let startup_arg = format!("j2534-0404:{library_name}");
+    let startup_arg = format!("j2534-0404:{library_name}?mode=user");
     let service = J2534Service::new(
         J2534Service::get_startup_config(["j2534-0404-service", &startup_arg])
             .expect("startup config should parse"),

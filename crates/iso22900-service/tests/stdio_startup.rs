@@ -92,7 +92,7 @@ async fn startup_argument_auto_starts_grpc_and_stdio_can_stop_process() {
     let exe = env!("CARGO_BIN_EXE_iso22900-service");
 
     let mut child = Command::new(exe)
-        .arg(format!("iso22900:{TEST_LIBRARY_NAME}"))
+        .arg(format!("iso22900:{TEST_LIBRARY_NAME}?mode=user"))
         .env(VCI_CONFIG_PATH_ENV, &config_path)
         // These tests exercise stdio/gRPC startup mechanics directly (no
         // manager involved to push an auth key via `set_auth_key`), so
@@ -190,7 +190,7 @@ async fn stop_notification_without_id_exits_process_without_response() {
     let exe = env!("CARGO_BIN_EXE_iso22900-service");
 
     let mut child = Command::new(exe)
-        .arg(format!("iso22900:{TEST_LIBRARY_NAME}"))
+        .arg(format!("iso22900:{TEST_LIBRARY_NAME}?mode=user"))
         .env(VCI_CONFIG_PATH_ENV, &config_path)
         // These tests exercise stdio/gRPC startup mechanics directly (no
         // manager involved to push an auth key via `set_auth_key`), so
@@ -246,7 +246,7 @@ async fn process_exits_when_stdin_is_closed() {
     let exe = env!("CARGO_BIN_EXE_iso22900-service");
 
     let mut child = Command::new(exe)
-        .arg(format!("iso22900:{TEST_LIBRARY_NAME}"))
+        .arg(format!("iso22900:{TEST_LIBRARY_NAME}?mode=user"))
         .env(VCI_CONFIG_PATH_ENV, &config_path)
         // These tests exercise stdio/gRPC startup mechanics directly (no
         // manager involved to push an auth key via `set_auth_key`), so
@@ -303,7 +303,7 @@ async fn process_exits_when_stdin_is_closed_with_live_subscribe_event_stream() {
     let exe = env!("CARGO_BIN_EXE_iso22900-service");
 
     let mut child = Command::new(exe)
-        .arg(format!("iso22900:{TEST_LIBRARY_NAME}"))
+        .arg(format!("iso22900:{TEST_LIBRARY_NAME}?mode=user"))
         .env(VCI_CONFIG_PATH_ENV, &config_path)
         // These tests exercise stdio/gRPC startup mechanics directly (no
         // manager involved to push an auth key via `set_auth_key`), so
@@ -402,7 +402,7 @@ async fn get_status_returns_startup_error_details_when_grpc_start_fails() {
     std::fs::write(&config_path, config_toml).expect("test config file should be writable");
 
     let mut child = Command::new(exe)
-        .arg(format!("iso22900:{invalid_library_name}"))
+        .arg(format!("iso22900:{invalid_library_name}?mode=user"))
         .env(VCI_CONFIG_PATH_ENV, &config_path)
         // These tests exercise stdio/gRPC startup mechanics directly (no
         // manager involved to push an auth key via `set_auth_key`), so

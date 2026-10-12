@@ -8466,7 +8466,7 @@ mod tests {
         J2534Service {
             api: Arc::new(Mutex::new(api)),
             startup_config: Arc::new(
-                crate::config::parse_startup_arg("j2534-0404:mock-lib").unwrap(),
+                crate::config::parse_startup_arg("j2534-0404:mock-lib?mode=user").unwrap(),
             ),
             can_channel_mode: CanChannelMode::Auto,
             resolved_can_channel_mode: Arc::new(Mutex::new(None)),
@@ -9925,7 +9925,7 @@ mod tests {
         let service = J2534Service {
             api: Arc::new(Mutex::new(api)),
             startup_config: Arc::new(
-                crate::config::parse_startup_arg("j2534-0404:mock-lib").unwrap(),
+                crate::config::parse_startup_arg("j2534-0404:mock-lib?mode=user").unwrap(),
             ),
             can_channel_mode: CanChannelMode::default(),
             resolved_can_channel_mode: Arc::new(Mutex::new(None)),

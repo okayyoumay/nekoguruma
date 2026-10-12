@@ -4,7 +4,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use base64::Engine as _;
-use worker_host::service::{LaunchOptions, ServiceError, ServiceKind, Stopped, WorkerProcess};
+use worker_host::service::{
+    LaunchOptions, OperatingMode, ServiceError, ServiceKind, Stopped, WorkerProcess,
+};
 
 fn fake() -> &'static Path {
     Path::new(env!("CARGO_BIN_EXE_fake-vci-service"))
@@ -15,7 +17,14 @@ async fn launch(library: &str, startup_timeout: Duration) -> Result<WorkerProces
         startup_timeout,
         ..LaunchOptions::default()
     };
-    WorkerProcess::launch(fake(), ServiceKind::J2534V0404, library, &options).await
+    WorkerProcess::launch(
+        fake(),
+        ServiceKind::J2534V0404,
+        library,
+        OperatingMode::User,
+        &options,
+    )
+    .await
 }
 
 #[tokio::test]
@@ -48,9 +57,15 @@ async fn stop_kills_a_worker_that_ignores_the_request() {
         request_timeout: Duration::from_millis(200),
         ..LaunchOptions::default()
     };
-    let worker = WorkerProcess::launch(fake(), ServiceKind::J2534V0404, "ignore-stop", &options)
-        .await
-        .unwrap();
+    let worker = WorkerProcess::launch(
+        fake(),
+        ServiceKind::J2534V0404,
+        "ignore-stop",
+        OperatingMode::User,
+        &options,
+    )
+    .await
+    .unwrap();
     let stopped = worker.stop(Duration::from_millis(300)).await;
     assert!(matches!(stopped, Ok(Stopped::Killed)), "{stopped:?}");
 }
@@ -69,8 +84,13 @@ async fn times_out_when_never_running() {
 
 #[tokio::test]
 async fn rejects_query_in_library_name() {
-    let result = launch("a?port=1", Duration::from_secs(5)).await;
-    assert!(matches!(result, Err(ServiceError::InvalidLibraryName(_))));
+    for library in ["a?port=1", "a#b"] {
+        let result = launch(library, Duration::from_secs(5)).await;
+        assert!(
+            matches!(result, Err(ServiceError::InvalidLibraryName(_))),
+            "{library:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -79,6 +99,7 @@ async fn missing_binary_is_a_spawn_error() {
         Path::new("/nonexistent/worker"),
         ServiceKind::Iso22900,
         "X",
+        OperatingMode::User,
         &LaunchOptions::default(),
     )
     .await;
@@ -92,9 +113,15 @@ async fn passes_long_size_to_the_service() {
             long_size,
             ..LaunchOptions::default()
         };
-        let mut worker = WorkerProcess::launch(fake(), ServiceKind::J2534V0404, "lib", &options)
-            .await
-            .unwrap();
+        let mut worker = WorkerProcess::launch(
+            fake(),
+            ServiceKind::J2534V0404,
+            "lib",
+            OperatingMode::User,
+            &options,
+        )
+        .await
+        .unwrap();
         let echoed = worker.request("echo_long_size", None).await.unwrap();
         assert_eq!(echoed["long_size"], expected);
         worker.stop(Duration::from_secs(2)).await.unwrap();
@@ -104,7 +131,50 @@ async fn passes_long_size_to_the_service() {
         ..LaunchOptions::default()
     };
     assert!(matches!(
-        WorkerProcess::launch(fake(), ServiceKind::J2534V0404, "lib", &options).await,
+        WorkerProcess::launch(
+            fake(),
+            ServiceKind::J2534V0404,
+            "lib",
+            OperatingMode::User,
+            &options
+        )
+        .await,
         Err(ServiceError::InvalidLongSize(2))
     ));
+}
+
+/// The device's mode reaches the service as the startup argument's `mode` query parameter
+/// (ADR-281 Decision item 2), for either service kind.
+#[tokio::test]
+async fn passes_the_mode_in_the_startup_argument() {
+    for (kind, mode, expected) in [
+        (
+            ServiceKind::J2534V0404,
+            OperatingMode::Device,
+            "j2534-0404:Acme - Turtle?mode=device",
+        ),
+        (
+            ServiceKind::J2534V0404,
+            OperatingMode::User,
+            "j2534-0404:Acme - Turtle?mode=user",
+        ),
+        (
+            ServiceKind::Iso22900,
+            OperatingMode::Device,
+            "iso22900:Acme - Turtle?mode=device",
+        ),
+    ] {
+        let mut worker = WorkerProcess::launch(
+            fake(),
+            kind,
+            "Acme - Turtle",
+            mode,
+            &LaunchOptions::default(),
+        )
+        .await
+        .unwrap();
+        let echoed = worker.request("echo_startup_argument", None).await.unwrap();
+        assert_eq!(echoed["argument"], expected);
+        worker.stop(Duration::from_secs(2)).await.unwrap();
+    }
 }

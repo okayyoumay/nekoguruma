@@ -30,7 +30,7 @@ use diag_ir::{
     RecoveryRequired, RecoveryTiming, Source, Value,
 };
 use worker_host::client::ConnectOptions;
-use worker_host::service::{LaunchOptions, ServiceKind, WorkerProcess};
+use worker_host::service::{LaunchOptions, OperatingMode, ServiceKind, WorkerProcess};
 
 const LIBRARY_NAME: &str = "sim-vci";
 /// The simulated ECU's erase-memory routine (`sim_ecu::RID_ERASE_MEMORY`).
@@ -281,6 +281,7 @@ async fn run_the_job(journal_dir: PathBuf) {
         std::path::Path::new(env!("CARGO_BIN_EXE_j2534-0404-service")),
         ServiceKind::J2534V0404,
         LIBRARY_NAME,
+        OperatingMode::User,
         &LaunchOptions {
             startup_timeout: Duration::from_secs(20),
             request_timeout: Duration::from_secs(5),

@@ -1,6 +1,7 @@
 //! Test double for the stdio control channel of the worker service binaries.
 //! Not shipped. The library name selects the behavior: `startup-error`, `never-running`,
 //! `ignore-stop` (a stop request is never answered and the process never exits), anything else starts normally.
+//! The query after the library name is not parsed; `echo_startup_argument` returns the whole argument.
 
 use std::io::{BufRead, Write};
 
@@ -8,7 +9,11 @@ use serde_json::{Value, json};
 
 fn main() {
     let arg = std::env::args().nth(1).unwrap_or_default();
-    let library = arg.split_once(':').map(|(_, rest)| rest.to_owned());
+    let library = arg.split_once(':').map(|(_, rest)| {
+        rest.split_once('?')
+            .map_or(rest, |(library, _query)| library)
+            .to_owned()
+    });
     let mode = library.clone().unwrap_or_default();
     let mut key: Option<String> = None;
     let mut polls = 0;
@@ -52,6 +57,7 @@ fn main() {
                 (status, false)
             }
             "echo_auth_key" => (json!({"key": key, "library": library}), false),
+            "echo_startup_argument" => (json!({"argument": arg}), false),
             "echo_long_size" => (
                 json!({"long_size": std::env::var("NGR_J2534_LONG_SIZE").ok()}),
                 false,

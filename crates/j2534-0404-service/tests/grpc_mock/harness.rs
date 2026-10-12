@@ -1814,8 +1814,11 @@ impl TestServer {
 
         let (service_shutdown_tx, service_shutdown_rx) = tokio::sync::watch::channel(false);
         let service = J2534Service::new(
-            J2534Service::get_startup_config(["j2534-0404-service", "j2534-0404:mock-lib"])
-                .expect("startup config"),
+            J2534Service::get_startup_config([
+                "j2534-0404-service",
+                "j2534-0404:mock-lib?mode=user",
+            ])
+            .expect("startup config"),
             service_shutdown_rx,
         )
         .await?;

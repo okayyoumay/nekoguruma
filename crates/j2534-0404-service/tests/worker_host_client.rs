@@ -15,7 +15,7 @@ use j2534_0404_mock::mock_library_path;
 use vci_service_interface::GetModuleIdsRequest;
 use vci_service_interface::vci_service_client::VciServiceClient;
 use worker_host::client::{ConnectOptions, connect};
-use worker_host::service::{LaunchOptions, ServiceKind, WorkerProcess};
+use worker_host::service::{LaunchOptions, OperatingMode, ServiceKind, WorkerProcess};
 
 const TEST_LIBRARY_NAME: &str = "mock-worker-host-library";
 
@@ -48,6 +48,8 @@ async fn worker_host_client_authenticates_with_minted_tokens() {
         std::path::Path::new(env!("CARGO_BIN_EXE_j2534-0404-service")),
         ServiceKind::J2534V0404,
         TEST_LIBRARY_NAME,
+        // Loading does not depend on the mode yet; device mode must start the worker too.
+        OperatingMode::Device,
         // Generous timeouts for a debug binary on a busy CI runner.
         &LaunchOptions {
             startup_timeout: Duration::from_secs(20),

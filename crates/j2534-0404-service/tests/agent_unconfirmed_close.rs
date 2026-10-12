@@ -19,7 +19,7 @@ use agent::guards::{GuardSetup, JobGuards};
 use agent::{JobError, JobLimits, LinkConfig, run_program};
 use diag_ir::{IR_SCHEMA_VERSION, Op, Program, Value};
 use worker_host::client::ConnectOptions;
-use worker_host::service::{LaunchOptions, ServiceKind, WorkerProcess};
+use worker_host::service::{LaunchOptions, OperatingMode, ServiceKind, WorkerProcess};
 
 const LIBRARY_NAME: &str = "sim-vci";
 /// The simulated ECU's built-in VIN (`crates/sim-vci/docs/simulated-vci.md`).
@@ -127,6 +127,7 @@ async fn launch_worker() -> (WorkerProcess, worker_host::client::WorkerClient) {
         Path::new(env!("CARGO_BIN_EXE_j2534-0404-service")),
         ServiceKind::J2534V0404,
         LIBRARY_NAME,
+        OperatingMode::User,
         &launch_options(),
     )
     .await

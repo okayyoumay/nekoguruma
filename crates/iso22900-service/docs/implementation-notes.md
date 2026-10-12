@@ -6,7 +6,7 @@ Hosts gRPC API operations and manages lifecycle through stdio JSON-RPC and local
 
 ## Assumptions
 
-- Startup argument contract is iso22900:<library name>?port=<u16>&... with required scheme and non-empty library name.
+- Startup argument contract is iso22900:<library name>?mode=<device|user>&port=<u16>&... with required scheme, non-empty library name and operating mode (ADR-281 Decision item 2).
 - Local gRPC server starts before JSON-RPC request loop begins.
 - JSON-RPC stdio framing uses one-line JSON messages.
 - Shutdown paths terminate active subscriptions and avoid indefinite drain.

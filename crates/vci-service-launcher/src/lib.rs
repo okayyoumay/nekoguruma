@@ -3,6 +3,9 @@
 pub use vci_service_config as config;
 pub mod jsonrpc;
 mod logging;
+/// The operating mode in the startup argument (ADR-281 Decision item 2) is spelled in the
+/// gRPC interface crate, which the agent shares.
+pub use vci_service_interface::mode;
 /// The bearer-token format lives with the gRPC interface so that clients can
 /// mint tokens without depending on this crate.
 pub use vci_service_interface::token;

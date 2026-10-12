@@ -10,7 +10,7 @@
 //! Every example here is a **pure gRPC client** connecting to an
 //! already-running `j2534-0404-service` process started separately (see
 //! `docs/startup-spec.md`, e.g. `cargo run -p j2534-0404-service --
-//! j2534-0404:<library-name>?port=<PORT>`) -- this is deliberately
+//! j2534-0404:<library-name>?mode=user&port=<PORT>`) -- this is deliberately
 //! different from `j2534-0404-service/tests/live_grpc_flow.rs`, which
 //! embeds the server in-process as a test harness. Nothing in this module
 //! starts a server.

@@ -416,6 +416,14 @@ impl VciServer for Iso22900Service {
         startup_config: Self::StartupConfig,
         shutdown: Receiver<bool>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        // The mode decides what a failed 7.2 library check means once the
+        // library is resolved through `ngr-library-resolver`; until then it
+        // is only recorded (ADR-281 Decision item 2).
+        tracing::info!(
+            library = %startup_config.library_name,
+            mode = %startup_config.mode(),
+            "starting worker"
+        );
         // A `library_path` configured for this library name takes priority over
         // RDF-based auto-discovery, letting deployers add libraries manually and
         // letting the library be resolved without an RDF file present at all.
@@ -527,6 +535,7 @@ mod tests {
             StartupConfig {
                 library_name: "TestLib".into(),
                 requested_port: None,
+                mode: vci_service_launcher::mode::OperatingMode::User,
             },
             tokio::sync::watch::channel(false).1,
         )
@@ -565,6 +574,7 @@ mod tests {
             StartupConfig {
                 library_name: "TestLib".into(),
                 requested_port: None,
+                mode: vci_service_launcher::mode::OperatingMode::User,
             },
             tokio::sync::watch::channel(false).1,
         )
@@ -599,6 +609,7 @@ mod tests {
             StartupConfig {
                 library_name: "TestLib".into(),
                 requested_port: None,
+                mode: vci_service_launcher::mode::OperatingMode::User,
             },
             tokio::sync::watch::channel(false).1,
         )
@@ -652,6 +663,7 @@ mod tests {
             StartupConfig {
                 library_name: "TestLib".into(),
                 requested_port: None,
+                mode: vci_service_launcher::mode::OperatingMode::User,
             },
             tokio::sync::watch::channel(false).1,
         )
@@ -693,6 +705,7 @@ mod tests {
             StartupConfig {
                 library_name: "TestLib".into(),
                 requested_port: None,
+                mode: vci_service_launcher::mode::OperatingMode::User,
             },
             tokio::sync::watch::channel(false).1,
         )
@@ -718,6 +731,7 @@ mod tests {
             StartupConfig {
                 library_name: "TestLib".into(),
                 requested_port: None,
+                mode: vci_service_launcher::mode::OperatingMode::User,
             },
             tokio::sync::watch::channel(false).1,
         )

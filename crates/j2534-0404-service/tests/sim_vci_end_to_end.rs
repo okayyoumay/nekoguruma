@@ -37,7 +37,7 @@ use vci_service_interface::{
 };
 use worker_host::abi::Abi;
 use worker_host::client::{ConnectOptions, WorkerClient};
-use worker_host::service::{LaunchOptions, ServiceKind, WorkerProcess};
+use worker_host::service::{LaunchOptions, OperatingMode, ServiceKind, WorkerProcess};
 
 const LIBRARY_NAME: &str = "sim-vci";
 /// The simulated ECU's built-in VIN (`crates/sim-vci/docs/simulated-vci.md`).
@@ -231,6 +231,7 @@ async fn read_the_vin() {
         &service,
         ServiceKind::J2534V0404,
         LIBRARY_NAME,
+        OperatingMode::User,
         // Generous timeouts for a debug binary on a busy CI runner.
         &LaunchOptions {
             startup_timeout: Duration::from_secs(20),

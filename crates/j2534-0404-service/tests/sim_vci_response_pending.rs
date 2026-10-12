@@ -18,7 +18,7 @@ use agent::guards::{GuardSetup, JobGuards};
 use agent::{HostError, JobError, JobLimits, LinkConfig, run_program};
 use diag_ir::{IR_SCHEMA_VERSION, Op, Program, Value, VmState};
 use worker_host::client::{ConnectOptions, WorkerClient};
-use worker_host::service::{LaunchOptions, ServiceKind, WorkerProcess};
+use worker_host::service::{LaunchOptions, OperatingMode, ServiceKind, WorkerProcess};
 
 const LIBRARY_NAME: &str = "sim-vci";
 /// The simulated ECU's built-in VIN (`crates/sim-vci/docs/simulated-vci.md`).
@@ -185,6 +185,7 @@ async fn jobs(control_dir: &Path) {
         Path::new(env!("CARGO_BIN_EXE_j2534-0404-service")),
         ServiceKind::J2534V0404,
         LIBRARY_NAME,
+        OperatingMode::User,
         // Generous timeouts for a debug binary on a busy CI runner.
         &LaunchOptions {
             startup_timeout: Duration::from_secs(20),

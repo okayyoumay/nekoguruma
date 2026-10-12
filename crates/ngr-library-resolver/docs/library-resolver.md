@@ -103,6 +103,11 @@ Windows). A caller that needs both views, such as the agent choosing a worker bu
 name present in both views. A hit carries the name and library path only (protocols, `LongSize` and search
 paths are empty), with `Source::Registry`. The registry value is not checked for being absolute.
 
+In a debug build, a non-empty `NGR_J2534_DEFINITION_DIR` (`vci_service_config::j2534_definition_dir_override`)
+replaces the registry in both functions, for every view: the name is resolved in that directory
+exactly as on Linux, and a hit has `Source::Definition` (ADR-282). Tests use this to name the mock
+library or `sim-vci` on Windows. Release builds have no override and read only the registry.
+
 ## ISO 22900 (D-PDU API)
 
 The `iso22900` module resolves an implementation name (design 7.1; ISO 22900-2:2022 clause 8.7 and

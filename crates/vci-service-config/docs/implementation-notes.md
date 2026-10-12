@@ -97,6 +97,9 @@ configuration, not a running service.
   `nekoguruma/j2534`) is fixed the same way, as is the D-PDU API root description
   file on Linux (`pdu_api_root_file()`, `NGR_PDU_API_ROOT_FILE`, default
   `pdu_api_root.xml`, so `/etc/pdu_api_root.xml`). Each has a runtime override in
-  debug builds only (ADR-073). Before ADR-228 the default was
+  debug builds only (ADR-073). `j2534_definition_dir_override()` returns the
+  definition-directory override alone (`None` when it is unset and in release
+  builds); the J2534 resolver reads that directory instead of the registry on
+  Windows when it is set (ADR-282). Before ADR-228 the default was
   `vci-service-launcher/config.toml`, which the Linux root `/` turned into
   `/vci-service-launcher/config.toml`.

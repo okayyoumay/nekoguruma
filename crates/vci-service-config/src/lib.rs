@@ -358,15 +358,32 @@ fn config_file_path() -> PathBuf {
 /// Unlike the configuration file, no `config-root-*` feature moves it: definitions are read
 /// from the administrator's directory in every build and mode (ADR-228 Decision 2). In debug
 /// builds only (ADR-073), a non-empty runtime `NGR_J2534_DEFINITION_DIR` takes precedence, so
-/// tests can point it at a directory of their own; release builds read no environment variable
-/// here.
+/// tests can point it at a directory of their own ([`j2534_definition_dir_override`]); release
+/// builds read no environment variable here.
 pub fn j2534_definition_dir() -> PathBuf {
     const DEFINITION_DIR: &str = env!("NGR_J2534_DEFINITION_DIR");
+    j2534_definition_dir_override()
+        .unwrap_or_else(|| in_fixed_system_root(PathBuf::from(DEFINITION_DIR)))
+}
+
+/// The debug-only runtime override of [`j2534_definition_dir`] on its own: the directory a
+/// non-empty runtime `NGR_J2534_DEFINITION_DIR` names (a relative value resolved against the
+/// fixed system directory, like the build-time value), or `None` when it is unset or empty and
+/// always in release builds. On Windows the J2534 resolver reads this directory in place of the
+/// registry when it is set (ADR-282), so tests use the same definition files on every platform.
+pub fn j2534_definition_dir_override() -> Option<PathBuf> {
     #[cfg(debug_assertions)]
-    let path = runtime_override(std::env::var_os("NGR_J2534_DEFINITION_DIR"))
-        .unwrap_or_else(|| PathBuf::from(DEFINITION_DIR));
+    {
+        runtime_override(std::env::var_os("NGR_J2534_DEFINITION_DIR")).map(in_fixed_system_root)
+    }
     #[cfg(not(debug_assertions))]
-    let path = PathBuf::from(DEFINITION_DIR);
+    {
+        None
+    }
+}
+
+/// `path` itself when absolute, else `path` under the fixed system directory.
+fn in_fixed_system_root(path: PathBuf) -> PathBuf {
     if path.is_absolute() {
         path
     } else {

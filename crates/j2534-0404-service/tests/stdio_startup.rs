@@ -249,6 +249,7 @@ async fn startup_argument_auto_starts_grpc_and_stdio_can_stop_process() {
     );
 
     let _ = std::fs::remove_file(&config_path);
+    let _ = std::fs::remove_dir_all(definition_dir_for(&config_path));
 }
 
 #[tokio::test]
@@ -306,6 +307,7 @@ async fn stop_notification_without_id_exits_process_without_response() {
     );
 
     let _ = std::fs::remove_file(&config_path);
+    let _ = std::fs::remove_dir_all(definition_dir_for(&config_path));
 }
 
 #[tokio::test]
@@ -364,6 +366,7 @@ async fn process_exits_when_stdin_is_closed() {
     );
 
     let _ = std::fs::remove_file(&config_path);
+    let _ = std::fs::remove_dir_all(definition_dir_for(&config_path));
 }
 
 #[tokio::test]
@@ -462,6 +465,7 @@ async fn process_exits_when_stdin_is_closed_with_live_subscribe_event_stream() {
     );
 
     let _ = std::fs::remove_file(&config_path);
+    let _ = std::fs::remove_dir_all(definition_dir_for(&config_path));
 }
 
 #[tokio::test]
@@ -577,6 +581,7 @@ async fn stop_terminates_live_subscribe_event_stream() {
     );
 
     let _ = std::fs::remove_file(&config_path);
+    let _ = std::fs::remove_dir_all(definition_dir_for(&config_path));
 }
 
 #[tokio::test]
@@ -676,4 +681,5 @@ async fn get_status_returns_startup_error_details_when_grpc_start_fails() {
     );
 
     let _ = std::fs::remove_file(&config_path);
+    let _ = std::fs::remove_dir_all(definition_dir_for(&config_path));
 }

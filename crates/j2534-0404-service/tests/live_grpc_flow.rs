@@ -206,12 +206,12 @@ fn resolve_library_name() -> Option<String> {
         ));
         let _ = std::fs::remove_dir_all(&definition_dir);
         std::fs::create_dir_all(&definition_dir).expect("definition directory");
-        j2534_0404_mock::write_definition(
-            &definition_dir,
-            "live-target",
-            std::path::Path::new(&dll_path),
-        )
-        .expect("definition file should be writable");
+        // A definition names its library by absolute path, while `library_path` also takes a
+        // relative one.
+        let definition_library = std::path::absolute(&dll_path)
+            .unwrap_or_else(|err| panic!("{dll_path} should resolve to an absolute path: {err}"));
+        j2534_0404_mock::write_definition(&definition_dir, "live-target", &definition_library)
+            .expect("definition file should be writable");
         // SAFETY: this test runs alone in its own process (a distinct `cargo
         // test` integration-test binary), so no other thread reads env vars
         // concurrently with this write.

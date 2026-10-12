@@ -6920,19 +6920,11 @@ fn toml_string(text: &str) -> String {
 /// Writes a J2534 registration definition (design 7.1.1) into `dir` that names `library` as
 /// the VCI `name`, and returns the file's path. Tests point the debug-only
 /// `NGR_J2534_DEFINITION_DIR` override at `dir` (ADR-282) so a service resolves the mock
-/// library or `sim-vci` the way it resolves a vendor library. The file name is derived from
-/// `name`, so one directory can hold the definitions of several VCIs.
+/// library or `sim-vci` the way it resolves a vendor library. The file name is the hex encoding
+/// of `name`'s bytes, so one directory can hold the definitions of several VCIs, also on a
+/// case-insensitive file system, and writing the same name again replaces its definition.
 pub fn write_definition(dir: &Path, name: &str, library: &Path) -> Result<PathBuf, std::io::Error> {
-    let stem: String = name
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
+    let stem: String = name.bytes().map(|b| format!("{b:02x}")).collect();
     let file = dir.join(format!("{stem}.toml"));
     let library = library.to_str().ok_or_else(|| {
         std::io::Error::new(
@@ -7008,6 +7000,28 @@ mod definition_tests {
                 .unwrap_or_else(|e| panic!("{name}: {e}"));
             assert_eq!(resolved.definition.name, name);
             assert_eq!(resolved.definition.library, library);
+        }
+    }
+
+    /// Names that differ only in characters a file name cannot hold, or only in case, get
+    /// definitions of their own.
+    #[test]
+    fn write_definition_keeps_similar_names_apart() {
+        let dir = tempfile::tempdir().unwrap();
+        let names = ["Vendor/A", "Vendor?A", "vendor/a"];
+        for (i, name) in names.iter().enumerate() {
+            let library = std::env::current_exe()
+                .unwrap()
+                .with_file_name(format!("{i}.lib"));
+            write_definition(dir.path(), name, &library).unwrap();
+        }
+        for (i, name) in names.iter().enumerate() {
+            let resolved = ngr_library_resolver::j2534_0404::resolve_in_dir(dir.path(), name)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert!(
+                resolved.definition.library.ends_with(format!("{i}.lib")),
+                "{name}"
+            );
         }
     }
 }

@@ -177,7 +177,7 @@ Startup is handled by `vci-service-launcher::start_service::<Iso22900Service>()`
 2. Initialize logging from the `config.toml` file (loaded via `vci-service-config`).
 3. Call `Iso22900Service::new(config)`:
    - Resolve `<library-name>` through `ngr_library_resolver::iso22900::resolve()`
-     (design 7.1, ADR-266): the D-PDU API root description file entry with that
+     (design 7.1, ADR-277): the D-PDU API root description file entry with that
      short name gives the library path. The root description file is the one
      the registry names on Windows and the fixed build-time path on Linux; a
      debug build takes it from `NGR_PDU_API_ROOT_FILE` when that is set

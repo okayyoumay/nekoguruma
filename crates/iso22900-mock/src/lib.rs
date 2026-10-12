@@ -986,6 +986,12 @@ pub fn write_root_file(
     library: &Path,
 ) -> Result<PathBuf, std::io::Error> {
     let root_file = dir.join("pdu_api_root.xml");
+    // The name is element text: escape the characters XML gives a meaning there. The URI needs
+    // none, since `file_uri` percent-encodes `&`, `<` and `"`.
+    let short_name = short_name
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
     let xml = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <MVCI_PDU_API_ROOT>\n  <MVCI_PDU_API>\n    <SHORT_NAME>{short_name}</SHORT_NAME>\n    \
@@ -1137,6 +1143,23 @@ mod library_path_tests {
         assert_eq!(search_directory(&root), Some(uplifted));
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn write_root_file_escapes_the_short_name() {
+        let dir = std::env::temp_dir().join(format!(
+            "iso22900-mock-root-file-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let library = std::env::current_exe().unwrap();
+        let root_file = write_root_file(&dir, "A&B <x>", &library).unwrap();
+        let xml = std::fs::read_to_string(&root_file).unwrap();
+        assert!(
+            xml.contains("<SHORT_NAME>A&amp;B &lt;x&gt;</SHORT_NAME>"),
+            "{xml}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

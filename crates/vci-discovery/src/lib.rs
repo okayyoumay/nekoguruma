@@ -1,16 +1,17 @@
-//! Discovery of installed vendor libraries (7.1), used by the agent.
+//! Discovery of installed J2534 v04.04 devices (7.1), used by the agent.
 //!
 //! - [`j2534`]: J2534 v04.04 devices from `HKLM\SOFTWARE\PassThruSupport.04.04` (Windows)
-//! - [`pdu_api`]: D-PDU API implementations from the root description file `pdu_api_root.xml`
+//!
+//! D-PDU API implementations are resolved through `ngr-library-resolver`'s `iso22900` module
+//! (ADR-228 Decision item 4); this crate has no copy of that lookup.
 //!
 //! Discovery only reports where libraries are and what they declare about themselves.
 //! Pre-load verification (7.2) and ABI detection (7.3) are separate steps.
 //! The Linux J2534 registration definition (7.1.1) is not implemented yet.
 //!
-//! Derived from the `j2534-0404-registry` and `iso22900-registry` crates.
+//! Derived from the `j2534-0404-registry` crate.
 
 pub mod j2534;
-pub mod pdu_api;
 
 /// Registry view. Always specified explicitly (`KEY_WOW64_32KEY` / `KEY_WOW64_64KEY`, 7.1),
 /// so that a 64-bit agent also finds 32-bit installations and vice versa.
@@ -38,12 +39,4 @@ pub enum DiscoveryError {
     RegistryUnsupported,
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("invalid XML in {path}: {source}")]
-    Xml {
-        path: String,
-        #[source]
-        source: roxmltree::Error,
-    },
-    #[error("invalid file URI {0:?}")]
-    InvalidUri(String),
 }

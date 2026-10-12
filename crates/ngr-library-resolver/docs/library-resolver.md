@@ -28,8 +28,9 @@ module has its own section below and its own `resolve` and `ResolveError`.
   (`iso22900`).
 - Also in scope: the writability check and the signer check of 7.2 (below), standard-independent
   and at the crate root, and `check_library`, which runs both.
-- Not in scope yet: the callers (`j2534-0404-service`, `agent`, `iso22900-service`,
-  `vci-discovery`) still use their own lookups.
+- Not in scope yet: the callers (`j2534-0404-service`, `agent`, `iso22900-service`, and
+  `vci-discovery` for J2534) still use their own lookups. `vci-discovery` no longer has a D-PDU
+  API lookup of its own.
 
 ## Definition files (non-Windows)
 

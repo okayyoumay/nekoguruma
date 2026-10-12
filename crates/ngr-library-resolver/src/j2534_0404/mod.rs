@@ -9,7 +9,9 @@
 //! registry key name. A leftover copy of a definition with the same `Name` makes resolution
 //! ambiguous. On Windows `resolve` reads only the native registry view; use `resolve_on_registry`
 //! per view when both are needed (mode `All` returns the first hit and does not detect a name
-//! present in both views).
+//! present in both views). In a debug build on Windows, a set `NGR_J2534_DEFINITION_DIR`
+//! (`vci_service_config::j2534_definition_dir_override`) replaces the registry in both functions,
+//! for every view (ADR-282).
 
 use std::{
     fs,
@@ -235,7 +237,8 @@ pub fn resolve_in_dir(dir: &Path, name: &str) -> Result<Resolved, ResolveError> 
 }
 
 /// Resolves `name` on this platform: the definition directory on non-Windows, the registry
-/// (native view) on Windows.
+/// (native view) on Windows, where a debug build with `NGR_J2534_DEFINITION_DIR` set reads that
+/// directory instead (ADR-282).
 pub fn resolve(name: &str) -> Result<Resolved, ResolveError> {
     #[cfg(windows)]
     {
@@ -261,13 +264,33 @@ fn is_link(metadata: &fs::Metadata) -> bool {
     metadata.file_type().is_symlink()
 }
 
-/// Resolves `name` in the given registry view (Windows only).
+/// Resolves `name` in the given registry view (Windows only), or, in a debug build with
+/// `NGR_J2534_DEFINITION_DIR` set, in that definition directory whatever the view (ADR-282).
 #[cfg(windows)]
 pub fn resolve_on_registry(
     name: &str,
     mode: j2534_0404_registry::RegistryViewMode,
 ) -> Result<Resolved, ResolveError> {
+    resolve_on_registry_or_in(
+        name,
+        mode,
+        vci_service_config::j2534_definition_dir_override().as_deref(),
+    )
+}
+
+/// [`resolve_on_registry`] with the debug override passed in: a directory replaces the
+/// registry.
+#[cfg(windows)]
+fn resolve_on_registry_or_in(
+    name: &str,
+    mode: j2534_0404_registry::RegistryViewMode,
+    override_dir: Option<&Path>,
+) -> Result<Resolved, ResolveError> {
     use j2534_0404_registry::RegistryError;
+    if let Some(dir) = override_dir {
+        debug!(dir = %dir.display(), "resolving in the debug definition directory, not the registry");
+        return resolve_in_dir(dir, name);
+    }
     match j2534_0404_registry::find_j2534_device_on_registry(name, mode) {
         Ok(device) => Ok(resolved_from_registry(device)),
         Err(RegistryError::NotFound(name)) => Err(ResolveError::NotFound {

@@ -394,6 +394,44 @@ fn registry_unknown_name_is_not_found() {
     ));
 }
 
+/// With the debug override, every registry view resolves in the definition directory instead
+/// (ADR-282): a name no registry carries is found there, from its definition file.
+#[cfg(windows)]
+#[test]
+fn the_debug_override_replaces_every_registry_view() {
+    use j2534_0404_registry::RegistryViewMode;
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("override.toml");
+    fs::write(&file, minimal("__ngr_override_only__")).unwrap();
+    // The explicit views exist only on x86_64.
+    for mode in [
+        RegistryViewMode::Native,
+        RegistryViewMode::All,
+        #[cfg(target_arch = "x86_64")]
+        RegistryViewMode::W32,
+        #[cfg(target_arch = "x86_64")]
+        RegistryViewMode::W64,
+    ] {
+        let resolved =
+            resolve_on_registry_or_in("__ngr_override_only__", mode, Some(dir.path())).unwrap();
+        assert_eq!(
+            resolved.source,
+            Source::Definition(file.clone()),
+            "{mode:?}"
+        );
+        assert_eq!(resolved.definition.library, abs("libx.so"), "{mode:?}");
+        assert!(matches!(
+            resolve_on_registry_or_in("__ngr_not_defined__", mode, Some(dir.path())),
+            Err(ResolveError::NotFound { .. })
+        ));
+    }
+    // Without it, the registry is read: the name is not registered there.
+    assert!(matches!(
+        resolve_on_registry_or_in("__ngr_override_only__", RegistryViewMode::Native, None),
+        Err(ResolveError::NotFound { .. })
+    ));
+}
+
 /// A registry hit becomes a `Resolved` with its key name and library, from the registry.
 #[cfg(windows)]
 #[test]

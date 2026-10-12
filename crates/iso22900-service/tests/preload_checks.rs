@@ -1,8 +1,10 @@
 //! The design 7.2 pre-load checks at startup, and what the operating mode makes of a failed one
 //! (ADR-281 Decision item 2): `Iso22900Service::new` resolves the library through a test root
 //! description file (the debug-only `NGR_PDU_API_ROOT_FILE` override, ADR-282) and checks it
-//! before loading. A copy of the mock that regular users can write fails the writability check:
-//! device mode refuses it, user mode reports the findings and loads it.
+//! before loading. A copy of the mock that regular users can write fails the writability check
+//! (as does anything a non-system owner holds, which is every test file on CI): device mode
+//! refuses it, user mode reports the findings and loads it. `preload.rs`'s unit tests trust the
+//! test user and show a clean library accepted in device mode.
 
 #![cfg(debug_assertions)]
 

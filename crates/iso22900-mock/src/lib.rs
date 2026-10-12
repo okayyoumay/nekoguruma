@@ -944,8 +944,23 @@ fn search_directory(dir: &Path) -> Option<PathBuf> {
 /// The `file:` URI of an absolute `path`, as a root description file's `LIBRARY_FILE` names it:
 /// `file:///opt/x.so` on Unix, `file:///C:/x.dll` on Windows. Bytes outside the unreserved set
 /// (and `/`, `:`) are percent-encoded, so a path with spaces or non-ASCII characters round-trips.
+///
+/// # Panics
+///
+/// If `path` is not absolute.
 pub fn file_uri(path: &Path) -> String {
-    let text = path.to_string_lossy().replace('\\', "/");
+    assert!(
+        path.is_absolute(),
+        "not an absolute path: {}",
+        path.display()
+    );
+    let text = path.to_string_lossy();
+    // A verbatim drive path (`\\?\C:\x`) names the same file as `C:\x`.
+    #[cfg(windows)]
+    let text = text
+        .strip_prefix(r"\\?\")
+        .unwrap_or(&text)
+        .replace('\\', "/");
     let mut uri = String::from(if text.starts_with('/') {
         "file://"
     } else {

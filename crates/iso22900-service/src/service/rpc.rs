@@ -428,7 +428,7 @@ impl VciServer for Iso22900Service {
             .map_err(map_resolve_error)?;
         let library_path = resolved.implementation.library_file.clone();
         // Kept alive until `DPduApi::new` has mapped the library (design 7.2).
-        let _checked = check_library(&resolved, startup_config.mode())?;
+        let checked = check_library(&resolved, startup_config.mode())?;
         // Fail fast on a noncanonical `vendor_struct_types` config key
         // (ADR-218): `resolve_vendor_struct_entry_size` only ever looks up
         // one canonical `"0x<8 lowercase hex digits>"` key per call, so an
@@ -446,6 +446,7 @@ impl VciServer for Iso22900Service {
         )
         .map_err(|msg| -> Box<dyn std::error::Error> { msg.into() })?;
         let api = DPduApi::new(&library_path).map_err(map_construct_error)?;
+        drop(checked);
         let api = Arc::new(Mutex::new(Some(api)));
         let subscriptions = Arc::new(Mutex::new(HashMap::new()));
         let cop_tags = Arc::new(Mutex::new(HashMap::new()));

@@ -1,8 +1,8 @@
 # ADR-289: A Lost VCI Ends the Pending Primitive at Once, as `HostError::VciLost`
 
-**Date:** 2026-10-14
+**Date:** 2026-10-13
 **Status:** Accepted
-**Affects:** `agent` (`src/host.rs`); ADR-235 item 3, design 5.6 and 8.2.5
+**Affects:** `agent` (`src/host.rs`), `docs/system-architecture.md` 8.2.4; ADR-235 item 3, design 5.6 and 8.2.5
 
 ## Context
 

@@ -132,7 +132,7 @@ Personal, uncommitted instructions go in `CLAUDE.local.md` (gitignored).
 
 ```sh
 cargo check --workspace --locked
-cargo test --workspace --locked --exclude sim-vci
+cargo test --workspace --locked
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked
 scripts/check-work-refs.sh
@@ -141,8 +141,9 @@ scripts/check-backlog.sh
 ```
 
 CI runs the tests with [cargo-nextest](https://nexte.st/) instead. The `core-linux` job runs
-`cargo nextest run --workspace --locked --exclude sim-vci --profile ci`, then
-the doc tests with `cargo test ... --doc`. nextest runs each test in its own process, so the
+`cargo nextest run --workspace --locked --profile ci`, then
+the doc tests with `cargo test ... --doc`, which leaves out `sim-vci`: it is built only as a
+cdylib, and cargo runs no doc tests for one. nextest runs each test in its own process, so the
 `#[serial]` worker-crate integration tests run in parallel there (`.config/nextest.toml`).
 `cargo test` gives the same results, only more slowly; keep `#[serial]` on tests that share
 process-global state, since `cargo test` still needs it. Some of those tests are too

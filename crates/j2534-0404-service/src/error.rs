@@ -270,6 +270,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn map_resolve_error_reports_a_missing_name_as_not_found() {
+        use ngr_library_resolver::j2534_0404::ResolveError;
+        let status = map_resolve_error(ResolveError::NotFound {
+            name: "Some VCI".into(),
+            skipped_invalid: 2,
+        });
+        assert_eq!(status.code(), Code::NotFound);
+        assert_eq!(
+            status.message(),
+            "no J2534 device found with name 'Some VCI'"
+        );
+    }
+
+    /// Every other resolution failure carries local paths in its text; the
+    /// client sees a fixed message instead (ADR-089).
+    #[test]
+    fn map_resolve_error_names_no_path_for_any_other_failure() {
+        use ngr_library_resolver::j2534_0404::ResolveError;
+        let dir = std::path::PathBuf::from("/secret/definitions");
+        let errors = [
+            ResolveError::Io {
+                path: dir.clone(),
+                source: std::io::Error::other("raw OS text"),
+            },
+            ResolveError::LinkedDirectory { path: dir.clone() },
+            ResolveError::Ambiguous {
+                name: "Some VCI".into(),
+                files: vec![dir.join("a.toml"), dir.join("b.toml")],
+            },
+        ];
+        for error in errors {
+            let status = map_resolve_error(error);
+            assert_eq!(status.code(), Code::Internal);
+            assert_eq!(status.message(), "failed to resolve the J2534 library");
+        }
+    }
+
+    #[test]
     fn pdu_error_for_maps_representative_status_codes() {
         assert_eq!(
             pdu_error_for(j2534_0404::StatusCode(j2534_0404::ERR_BUFFER_FULL)),

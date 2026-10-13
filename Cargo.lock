@@ -822,10 +822,8 @@ name = "iso22900-registry"
 version = "0.1.0"
 dependencies = [
  "roxmltree",
- "tempfile",
  "tracing",
  "url",
- "vci-service-config",
  "winreg",
 ]
 

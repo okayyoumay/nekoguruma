@@ -29,8 +29,10 @@ module has its own section below and its own `resolve` and `ResolveError`.
 - Also in scope: the writability check and the signer check of 7.2 (below), standard-independent
   and at the crate root, and `check_library`, which runs both.
 - The callers (`j2534-0404-service`, `iso22900-service` and the agent's ABI detection) resolve
-  through this crate; no other J2534 or D-PDU API lookup is left in the workspace (ADR-228
-  Decision item 4).
+  through this crate, and no other J2534 lookup is left in the workspace (ADR-228 Decision
+  item 4). `iso22900-registry` still offers its own D-PDU API lookups (`find_library_path` and
+  `enumerate_libraries`, which also read the `library_path` key); no worker resolves through
+  them.
 
 ## Definition files (non-Windows)
 

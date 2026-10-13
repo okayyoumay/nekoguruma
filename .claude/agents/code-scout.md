@@ -22,7 +22,7 @@ Workspace map (use it to narrow searches before grepping broadly):
 - Server side: `server`, `diag-frontend` (ODX/OTX/CSV/Starlark to IR),
   `vendor-manifest`. Device side: `agent`, `worker-host`.
   Shared: `shared-proto`, `shared-crypto`, `diag-ir` (IR, bytecode, VM),
-  `j2534-defs`, `vci-discovery`.
+  `j2534-defs`, `ngr-library-resolver` (J2534 and D-PDU API library resolution).
 - Worker crates (`docs/worker-crates.md`) come in layered families:
   `*-sys` (raw FFI, C headers in `src/bindings/`) -> safe wrapper
   (`iso22900`, `j2534-0404`) -> `*-service` (gRPC worker binary), plus

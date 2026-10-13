@@ -2,7 +2,7 @@
 
 This document covers the full `config.toml` schema loaded by
 `vci-service-config`: logging settings, the per-library worker settings, and
-the `library_path` entries that discovery (`enumerate_libraries`) still reads;
+the `library_path` entries that `iso22900-registry`'s discovery (`enumerate_libraries`) still reads;
 no worker service resolves its library through `library_path`. `vci-service-launcher` re-exports this crate as
 `vci_service_launcher::config` (see ADR-033), so every service built on the
 launcher template picks this schema up automatically.
@@ -158,17 +158,18 @@ without a specific library name to attach it to.
 | 1 | `config.apis.<api>.arch.<arch>.libs.<lib>.library_path` | Windows only |
 | 2 | `config.apis.<api>.libs.<lib>.library_path` | All |
 
-**Lookup is exposed through `iso22900-registry::find_library_path()` and
-`j2534-0404-registry::find_library_path()`** (both thin wrappers around this
-crate's `find_library_path()`, scoped to their own API name), not called
-directly from this crate — see ADR-034. Neither worker service reads
+**Lookup is exposed through `iso22900-registry::find_library_path()`** (a thin
+wrapper around this crate's `find_library_path()`, scoped to its API name), not
+called directly from this crate — see ADR-034. `j2534-0404-registry` no longer
+offers a `library_path` lookup: J2534 names resolve only through
+`ngr-library-resolver` (ADR-228 Decision item 4). Neither worker service reads
 `library_path`: `iso22900-service` resolves its library through
 `ngr-library-resolver`'s D-PDU API root description file lookup (design 7.1)
 and `j2534-0404-service` through its J2534 registration definition or registry
 lookup (design 7.1.1), and both then run the design 7.2 pre-load checks
 (ADR-281 Decision item 1).
 
-The registry crates' `enumerate_libraries()` also reads this table (via
+`iso22900-registry`'s `enumerate_libraries()` also reads this table (via
 `list_configured_library_paths()`), so config-only libraries — ones with no
 hardware auto-discovery entry — are included in discovery (ADR-034, ADR-036).
 

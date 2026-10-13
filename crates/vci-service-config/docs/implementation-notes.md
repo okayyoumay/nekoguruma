@@ -64,16 +64,17 @@ configuration, not a running service.
   using `vci_service_launcher::config::*` unchanged for logging.
   `j2534-0404-service` also reads `find_can_channel_mode()` through this
   re-export at startup (ADR-046), and `find_modules()` the same way (ADR-107).
-- `iso22900-registry` and `j2534-0404-registry` depend on this crate
-  directly and each expose a thin wrapper — `find_library_path(arch, lib)`
-  and `list_configured_libraries()` — scoped to their own API name
-  (`"iso22900"` / `"j2534-0404"`). Neither worker service reads
-  `library_path`; both resolve through `ngr-library-resolver`.
-- Each registry crate's `enumerate_libraries(mode)` calls
+- `iso22900-registry` depends on this crate directly and exposes a thin
+  wrapper — `find_library_path(arch, lib)` and `list_configured_libraries()` —
+  scoped to its API name (`"iso22900"`). `j2534-0404-registry` no longer
+  depends on this crate: J2534 names resolve only through
+  `ngr-library-resolver` (ADR-228 Decision item 4). Neither worker service
+  reads `library_path`.
+- `iso22900-registry`'s `enumerate_libraries(mode)` calls
   `list_configured_library_paths()` directly (not just
   `list_configured_libraries()`) so it can merge each config entry's
-  `library_path` into the returned `PduLibraryInfo` / `J2534DeviceInfo`,
-  not just its name (ADR-036).
+  `library_path` into the returned `PduLibraryInfo`, not just its name
+  (ADR-036).
 - `manager_config()` and `system_config_dir()` serve a standalone service
   manager process. nekoguruma has none (the agent launches workers through
   `worker-host`), so nothing in this workspace calls them; they are kept so

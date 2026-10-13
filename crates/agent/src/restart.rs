@@ -2663,6 +2663,40 @@ mod tests {
         assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
     }
 
+    /// A completion an earlier pass left behind, with the interruption in a later pass, is not
+    /// the completed path (ADR-269 item 2): a gate that did not pass makes the teardown passive,
+    /// and it waits.
+    #[test]
+    fn an_earlier_passs_completion_leaves_the_teardown_to_the_gate() {
+        let (_, mut point) = point_at(EXIT);
+        let exit = point
+            .facts
+            .transfer
+            .as_mut()
+            .and_then(|transfer| transfer.exit.as_mut())
+            .expect("the exit intent");
+        exit.complete = true;
+        let completed_at = exit.last_post_step.unwrap_or(exit.intent_at);
+        // A step of the later pass, after the completion.
+        point.facts.last_step = Some(StepRef {
+            pc: 0,
+            steps: completed_at.steps + 1,
+        });
+        assert!(!completed_pass_interrupted(&point.facts));
+        let mut host = ecu_in_session();
+        let (result, elapsed) = run_teardown(
+            TeardownGate::PassiveOnly(PassiveReason::VinNotEstablished),
+            &point,
+            &mut host,
+        );
+        assert_eq!(
+            result.unwrap(),
+            Teardown::Passive(PassiveCause::Gate(PassiveReason::VinNotEstablished))
+        );
+        assert_eq!(host.0.power_cycles(), 0);
+        assert!(elapsed >= Duration::from_millis(20), "{elapsed:?}");
+    }
+
     #[test]
     fn a_refused_ecu_reset_leaves_the_simulated_ecu_and_waits() {
         let (_, point) = point_at(ERASE);

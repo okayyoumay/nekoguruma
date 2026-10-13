@@ -28,9 +28,10 @@ later pass's own steps never completed.
    into the plan) puts the interruption point later; the restart then treats the steps as not
    complete, so the intended version leads to redoing the transfer.
 2. **The same reading applies wherever the restart relies on the completion.** The teardown's
-   completed path (ADR-264, ADR-265) is to use the same rule; until it does, a later pass's
-   restart skips the ECUReset and the passive wait, and the default-session confirmation with
-   its passive retry still runs.
+   completed path (ADR-264, ADR-265) uses the same rule (`restart::teardown` calls
+   `completed_pass_interrupted`). A completion an earlier pass left behind is not a
+   RequestTransferExit with unfinished post-transfer steps either, since that pass's steps
+   finished, so the teardown of a later pass follows the gates' decision.
 
 ## Consequences
 
@@ -39,4 +40,8 @@ later pass's own steps never completed.
   bounds.
 - A single-pass program behaves exactly as before: its interruption point after the completion
   is the completion itself.
-- The teardown still uses the completion alone until it is changed to the same rule.
+- The teardown of a later pass, before its erase, sends the ECUReset the gates allow instead of
+  none. A replay that crashed with only its run start committed changes no fact, so the earlier
+  pass still counts as the interrupted one there, for the teardown and the state check alike;
+  the default-session confirmation and its passive retry cover an ECU the replay left in its
+  programming session.

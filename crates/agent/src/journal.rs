@@ -501,7 +501,18 @@ pub struct FileStore {
 /// never deleted: a process that locked a recreated file would not exclude one still holding
 /// the old one. It is a separate file so that [`Journal::read`] works while a job writes, also
 /// where file locks are mandatory (Windows).
-struct WriterLock(#[expect(dead_code, reason = "held only for its lock")] File);
+struct WriterLock(File);
+
+impl Drop for WriterLock {
+    /// Unlocks before the handle closes. The lock belongs to the open file description, which a
+    /// child process spawned meanwhile shares until it runs its program, so closing this handle
+    /// alone would leave the journal locked for that moment and a writer that opens it then would
+    /// get [`JournalError::InUse`]. Unlocking releases it for every handle to the description.
+    fn drop(&mut self) {
+        // An unlock that fails leaves the release to the close, as before.
+        let _ = self.0.unlock();
+    }
+}
 
 impl WriterLock {
     fn take(journal: &Path) -> Result<Self, JournalError> {
@@ -2182,6 +2193,25 @@ mod tests {
         ));
         drop(reopened);
         Journal::open(&dir.0, &key()).expect("open again");
+    }
+
+    /// A dropped writer releases the lock even while another handle to the lock file's open file
+    /// description is still open, as a child process spawned while the journal was locked holds
+    /// one until it runs its program.
+    #[test]
+    fn a_dropped_writer_releases_the_lock_a_shared_handle_still_holds() {
+        let dir = TempDir::new();
+        let journal = Journal::create(&dir.0, &key(), None, None).expect("create");
+        let shared = journal
+            .store
+            ._writer
+            .0
+            .try_clone()
+            .expect("duplicate the lock handle");
+        drop(journal);
+        let reopened = Journal::open(&dir.0, &key()).expect("open while a shared handle is open");
+        drop(reopened);
+        drop(shared);
     }
 
     #[test]

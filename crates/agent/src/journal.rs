@@ -345,6 +345,11 @@ impl RecoveryFacts {
                 });
             }
             Record::IdentityMismatch { identity } => {
+                // A restart aborts on another vehicle's VIN or hardware part number only; a
+                // software version that differs is an on-site ending (ADR-286 item 1).
+                if *identity == IdentityKind::SoftwareVersion {
+                    return Err("an identity abort names a VIN or a hardware part number");
+                }
                 self.identity_mismatch = Some(*identity);
             }
         }
@@ -2399,6 +2404,15 @@ mod tests {
             j.commit_identity_mismatch(IdentityKind::Vin),
             Err(JournalError::Invariant(
                 "no record follows a procedure failure"
+            ))
+        ));
+        assert_eq!(j.summary().identity_mismatch, None);
+
+        let mut j = memory();
+        assert!(matches!(
+            j.commit_identity_mismatch(IdentityKind::SoftwareVersion),
+            Err(JournalError::Invariant(
+                "an identity abort names a VIN or a hardware part number"
             ))
         ));
         assert_eq!(j.summary().identity_mismatch, None);

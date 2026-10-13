@@ -26,7 +26,8 @@ some from live reads after the resume count.
 
 1. **A new record, `Record::IdentityMismatch { identity }`,** appended at the end of the record enum,
    with no format-version change (the ADR-272 and ADR-280 precedent). `identity` is the
-   `IdentityKind` that differed (VIN or hardware part number). It carries no step, since the abort
+   `IdentityKind` that differed (VIN or hardware part number); the journal refuses a software
+version, in a commit and when it reads the file back. It carries no step, since the abort
    happens at no VM instruction, and no VIN value.
 2. **It folds into `RecoveryFacts::identity_mismatch` and is terminal.** No record may follow it or a
    procedure failure, so neither can follow the other. A journal with a record after it reads back

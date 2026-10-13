@@ -169,10 +169,10 @@ plan, or `ngr-agent run`) ends in the same error with nothing recorded.
 
 A restart that ends in `JobError::IdentityMismatch { identity }` (the gates of step 2 or step 3a)
 commits an identity-abort record first (`Journal::commit_identity_mismatch`, ADR-286): the
-`IdentityKind` only, with no position, VIN or value. It is terminal like the procedure-failure
-record: the journal refuses every record after it and after a procedure failure, in a commit and
-when it reads the file back (`RecoveryFacts::identity_mismatch`; `RecoveryFacts::terminal` is true
-for either). A commit that fails ends the job in `JobError::Journal`, and the mismatch is only
+`IdentityKind` only (a VIN or a hardware part number; the journal refuses a software version), with
+no position, VIN or value. It is terminal like the procedure-failure record: the journal refuses
+every record after it and after a procedure failure, in a commit and when it reads the file back.
+`RecoveryFacts::identity_mismatch` and `RecoveryFacts::procedure_failed` hold the two endings. A commit that fails ends the job in `JobError::Journal`, and the mismatch is only
 logged. No on-site ending is journaled.
 
 `ngr-agent run` uses `run_program` and keeps no journal; it sends read-only requests, or any

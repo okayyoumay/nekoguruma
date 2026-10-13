@@ -10,6 +10,7 @@ Most priorities here were set under the earlier scale these crates were develope
 
 ### Prioritized Backlog
 
+- **P2**: `tester_present_send_type::kline_five_baud_init_force_fires_mode_0_sibling_pre_init_topup` (`crates/j2534-0404-service/tests/grpc_mock/tester_present_send_type.rs`) asserts exactly 2 written frames right after cll_b's PduCopstFinished, inside cll_a's 300 ms tester-present interval measured from the forced send. A runner that takes longer than that between the forced send and the count lets cll_a's next ordinary send land first, so the count reads 3. This is the cause found for the flake in its mode-1 companion (`kline_five_baud_init_does_not_force_fire_mode_1_sibling`), which was fixed by widening its interval to 1500 ms (ADR-149). The mode-0 test has not failed in CI so far. Its later bounds (at least 220 ms and under 2000 ms from the forced send) are tied to the 300 ms interval, so widening it means re-deriving them. Done when: the exact count of 2 has the per-round-trip margin of ADR-149 (`tests/grpc_mock/harness.rs` module doc), with the later bounds re-derived for the new interval and still below the un-overridden default, and no assertion is loosened.
 - **P2**: `iso22900-mock`'s `PDUIoCtl` (`crates/iso22900-mock/src/lib.rs`) takes the IOCTL command ID as `T_PDU_IT`, while the header `crates/iso22900-sys/src/bindings/d_pdu_api_func.h` and the bindings' `DPduApiSys::PDUIoCtl` declare `UNUM32`. Both are 32-bit integers, so calls work, but `crates/iso22900-mock/tests/abi_parity.rs` has to check `PDUIoCtl` by layout instead of by signature. Done when: the mock's parameter is `UNUM32` (converted to `T_PDU_IT` inside where it is compared), `PDUIoCtl` is in that test's signature list and its layout-only test is removed.
 - **P2**: Pull-request CI never compiles `crates/iso22900-mock/tests/abi_parity.rs` for a target where the mock's `exported_fn!` picks `extern "stdcall"` (Windows x86): `core-windows` is x86_64 and `worker-check` in `.github/workflows/ci.yml` runs `cargo check` on `sim-vci`, `j2534-0404-service` and `iso22900-service` without their tests, so a calling-convention drift between the mock and the `iso22900-sys` bindings there (the event callback type `CALLBACKFNC` included) would merge unnoticed. Done when: `worker-check` (or another pull-request job) runs `cargo check -p iso22900-mock --tests --target i686-pc-windows-gnullvm`.
 - **P2**: `crates/iso22900-mock/docs/testing-guide.md` says the mock is a process-global singleton and every test calls `__mock_reset` first, but not how tests that share it may run in parallel. Done when: the guide has a section stating that tests loading the mock in one process need `#[serial]`, that nextest runs each test in its own process (`.config/nextest.toml`) while `cargo test` does not, and when to call `__mock_reset`.
@@ -68,22 +69,7 @@ margin theory — stop widening and instrument instead (see
 in the "Test-suite reliability: past flaky-test root causes" section of
 `crates/j2534-0404-service/docs/implementation-notes.md` for a worked example).
 
-- `j2534-0404-service` `grpc_mock`
-  `tester_present_send_type::kline_five_baud_init_does_not_force_fire_mode_1_sibling`
-  (`crates/j2534-0404-service/tests/grpc_mock/tester_present_send_type.rs`). Symptom: failed once
-  in `core-windows` on main (commit 7c87d51, `ci-windows` profile, one test at a time, 2.2 s): the
-  final `written_count` assertion saw 2 frames where it expects 1. The same run passed it on
-  `core-linux`, and the next main run (23ec12a) passed it on Windows. Suspected cause: the test
-  measures against wall-clock time. cll_a is armed mode 1 with a 300 ms tester-present
-  interval, the test sleeps 75 ms, then runs cll_b's StartComm and 5-baud init and counts frames
-  only after that. If those steps take more than about 225 ms on a slow runner, cll_a's own
-  idle timer fires legitimately before the count, which the assertion reads as a forced fire.
-  Confirm in isolation: run
-  `cargo test -p j2534-0404-service --test grpc_mock -- --exact tester_present_send_type::kline_five_baud_init_does_not_force_fire_mode_1_sibling`
-  in a loop under CPU load, or with a delay added before the final count. Fix by making the check
-  independent of elapsed time (for example a much longer cll_a interval, or a paused or mocked
-  clock as in ADR-149's write-time guideline in `tests/grpc_mock/harness.rs`), not by loosening
-  the count.
+No entries at present.
 
 Past root causes and their fixes: `crates/j2534-0404-service/docs/implementation-notes.md`, section
 "Test-suite reliability: past flaky-test root causes".

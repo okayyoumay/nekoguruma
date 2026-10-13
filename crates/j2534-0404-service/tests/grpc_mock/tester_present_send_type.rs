@@ -4931,14 +4931,20 @@ async fn kline_five_baud_init_does_not_force_fire_mode_1_sibling() {
     let server = TestServer::start().await;
     let mut client = server.client().await;
 
-    // cll_a: mode-1 (idle-triggered), armed first with a 300ms interval --
-    // clearly longer than the mock's (effectively instantaneous) 5-baud init
-    // duration. CP_InitializationSettings = 3 skips its own init sequence.
+    // cll_a: mode-1 (idle-triggered), armed first with a 1500ms interval.
+    // The final count runs after the 75ms sleep and three client round
+    // trips (cll_b's StartComm, its PduCopstFinished, the 5-baud init
+    // count), so the interval must outlast all of them with the per-round-
+    // trip margin of ADR-149: with 300ms a slow runner let cll_a's own idle
+    // send fall due before the count and read as a forced fire. A forced
+    // fire would happen at once, whatever the interval, so the longer
+    // interval does not hide it. CP_InitializationSettings = 3 skips cll_a's
+    // own init sequence.
     let cll_a = create_cll(&mut client, j2534_0404::ISO9141, 1).await;
     set_com_param_unum32(&mut client, cll_a, j2534_0404::DATA_RATE, 9_600).await;
     set_com_param_unum32(&mut client, cll_a, CP_INIT_SETTINGS, 3).await;
     set_com_param_bytes(&mut client, cll_a, CP_TESTER_PRESENT_MESSAGE, vec![0x11]).await;
-    set_com_param_unum32(&mut client, cll_a, CP_TESTER_PRESENT_TIME, 300_000).await;
+    set_com_param_unum32(&mut client, cll_a, CP_TESTER_PRESENT_TIME, 1_500_000).await;
     set_com_param_unum32(&mut client, cll_a, CP_TESTER_PRESENT_SEND_TYPE, 1).await;
     set_com_param_unum32(&mut client, cll_a, CP_TESTER_PRESENT_HANDLING, 1).await;
     client
@@ -4985,7 +4991,7 @@ async fn kline_five_baud_init_does_not_force_fire_mode_1_sibling() {
     wait_for_cop_finished(&mut events_a).await;
     wait_for_written_count(&server, MOCK_CHANNEL_ID, 1).await;
 
-    // Only ~75ms into cll_a's 300ms window, start cll_b's real 5-baud init.
+    // Only ~75ms into cll_a's 1500ms window, start cll_b's real 5-baud init.
     tokio::time::sleep(std::time::Duration::from_millis(75)).await;
     start_comm(&mut client, cll_b).await;
     wait_for_cop_finished(&mut events_b).await;

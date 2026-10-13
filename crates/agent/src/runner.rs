@@ -71,7 +71,9 @@ pub enum JobError {
     },
     #[error("the procedure is waiting on {0:?}, which this agent cannot answer")]
     Unanswerable(WaitingOn),
-    #[error("the procedure ran {0} steps without finishing")]
+    /// The step count is `VmState::steps`, which counts across runs; the limit counts the run's
+    /// own steps (ADR-287).
+    #[error("the run reached its step limit at step {0} without finishing")]
     StepLimit(u64),
     #[error("instruction {pc} is refused: {source}")]
     Refused {
@@ -7063,6 +7065,77 @@ mod tests {
         assert_eq!(state.pc as usize, program.code.len());
         assert_eq!(state.steps, start + run);
         assert_eq!(from_the_erase(&host), redone_transfer());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The restart's replay and its redo from the erase are one run with one budget (ADR-287
+    /// item 1): a limit that covers the redo from the erase alone, but not the replay before it,
+    /// stops the restart.
+    #[test]
+    fn the_replay_and_the_redo_share_one_step_budget() {
+        let program = flash_program();
+        let dir = journal_dir("redo-shared-budget");
+        interrupted(&program, &dir);
+        let entry = program.flash[0].boundaries.entry_pc;
+        let erase = program.flash[0].boundaries.erase_pc;
+        assert!(erase > entry);
+        let limits = JobLimits {
+            max_steps: u64::from(program.code.len() as u32 - erase),
+            ..JobLimits::default()
+        };
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        let result = resume_on(
+            &program,
+            &mut host,
+            limits,
+            &AtomicBool::new(false),
+            Journal::open(&dir, &job_key()),
+            identity_sources(),
+            Some(&target()),
+            None,
+            &dir_slot(&dir),
+        );
+        assert!(matches!(result, Err(JobError::StepLimit(_))), "{result:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A plain start on an existing journal has its own step budget too (ADR-287): after a first
+    /// run the limit stopped before the erase, a plain start with a limit that covers the
+    /// program runs it from the start and completes, although the first run's steps would put
+    /// the cumulative count over the limit.
+    #[test]
+    fn a_plain_start_has_its_own_step_budget() {
+        let program = flash_program();
+        let dir = journal_dir("plain-start-budget");
+        let limits = JobLimits {
+            max_steps: u64::from(ERASE),
+            ..JobLimits::default()
+        };
+        let result = first_run(&program, &dir, limits, |_| {});
+        assert!(matches!(result, Err(JobError::StepLimit(_))), "{result:?}");
+        let before = Journal::read(&dir, &job_key()).unwrap();
+        let start = restart::next_steps(&before);
+        let run = program.code.len() as u64;
+        let limits = JobLimits {
+            max_steps: run,
+            ..JobLimits::default()
+        };
+        assert!(start + run > limits.max_steps, "{start}");
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        let result = resume_on(
+            &program,
+            &mut host,
+            limits,
+            &AtomicBool::new(false),
+            Journal::open(&dir, &job_key()),
+            identity_sources(),
+            Some(&target()),
+            None,
+            &dir_slot(&dir),
+        );
+        let state = result.expect("the plain start completes within its own budget");
+        assert_eq!(state.steps, start + run);
+        assert!(host.sent().contains(&Sent::Routine(0xFF00)));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

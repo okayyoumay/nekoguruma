@@ -349,7 +349,14 @@ jobs:
                 exit 1
               fi
               echo "$exe"
-              for dll in $(llvm-objdump -p "$exe" | sed -n 's/^ *DLL Name: *//p' | tr -d '\r'); do
+              # A separate, checked command: a failure inside the loop's word list would pass
+              # unnoticed. Every binary imports at least kernel32, so no import means a bad read.
+              imports="$(llvm-objdump -p "$exe" | sed -n 's/^ *DLL Name: *//p' | tr -d '\r')"
+              if [ -z "$imports" ]; then
+                echo "::error::no DLL imports read from $exe"
+                exit 1
+              fi
+              for dll in $imports; do
                 case "${dll,,}" in
                   api-ms-*|ext-ms-*) echo "  $dll (API set)" ;;
                   *)

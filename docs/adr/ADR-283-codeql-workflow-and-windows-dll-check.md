@@ -46,8 +46,8 @@ exists to catch a DLL that only the llvm-mingw toolchain ships (such as `libunwi
 
 ## Consequences
 
-- Documentation-only pull requests no longer start CodeQL, which saved about 130 runner minutes
-  a day in the period measured. A commit that changes only Markdown inside a crate is not
+- Documentation-only pull requests no longer start CodeQL, which would have saved about 130
+  runner minutes a day in the period measured. A commit that changes only Markdown inside a crate is not
   analysed either; CodeQL does not analyse Markdown, so nothing is lost.
 - The repository now owns the CodeQL configuration: a new language, query suite or schedule is a
   change to `codeql.yml`, and the action version is kept current by Dependabot's Actions group.

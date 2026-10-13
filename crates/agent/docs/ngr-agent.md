@@ -46,8 +46,10 @@ Steps (`agent::check_program`, `agent::guards::JobGuards`, `agent::launch::launc
    - Linux: one lookup; the build follows the header's ABI.
 4. Pick the service build for that ABI with `WorkerLayout::find`. A missing build fails as
    `UNSUPPORTED_ABI`.
-5. Launch the service with the library name, the `--mode` value and the ABI's default `long_size` (design 7.1.2;
-   always the default, whatever a registration definition declares), provision its
+5. Launch the service with the library name, the `--mode` value and the J2534 `long_size`: the
+   resolved registration definition's `LongSize` (design 7.1.1), else the ABI's default (7.1.2;
+   ADR-284). An 8-byte `LongSize` for an ABI whose `unsigned long` is 32 bits wide fails the
+   run before the service starts. Then provision its
    auth key and connect the gRPC client (design 7.4).
 6. Run the program under the request policy and the default job limits (ADR-235), then stop
    the worker and release the guards. The stop request may take up to 2 s to be answered; a

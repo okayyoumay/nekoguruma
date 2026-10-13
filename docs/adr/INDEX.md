@@ -229,7 +229,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-237](ADR-237-regulatory-scope-access-routes-without-tool-certification.md) | Regulatory Scope: Use the Access Routes Regulations Open, Without Tool Certification | Accepted | design 8.1 / 9.2 / 16.1 / 16.2 / 17, `db/` retention |
 | [ADR-238](ADR-238-sim-vci-control-commands-and-device-loss.md) | sim-vci Control Commands and Device Loss | Accepted | `sim-vci` control export and directory, `ERR_DEVICE_NOT_CONNECTED` |
 | [ADR-239](ADR-239-sim-ecu-session-timer-and-injectable-clock.md) | sim-ecu Session Timer and Injectable Clock | Accepted | `sim-ecu` clock, tS3_Server, security delay |
-| [ADR-240](ADR-240-agent-worker-build-selection.md) | Agent Worker-Build Selection by Per-Build Library Resolution | Accepted (the architecture key of the `config.toml` lookup superseded by ADR-281; the per-build registry view stays) | `agent` launch, `ngr-agent run` |
+| [ADR-240](ADR-240-agent-worker-build-selection.md) | Agent Worker-Build Selection by Per-Build Library Resolution | Accepted (the `config.toml` lookup, with its architecture key, superseded by ADR-281; the per-build registry view stays; Decision item 4 superseded by ADR-284) | `agent` launch, `ngr-agent run` |
 | [ADR-241](ADR-241-sim-ecu-state-file.md) | Simulated ECU State Kept in a File Across Worker Processes | Accepted | `sim-ecu` snapshot, `sim-vci` `NGR_SIM_ECU_STATE` |
 | [ADR-242](ADR-242-ir-variable-length-and-nested-layouts.md) | IR Variable-Length Fields and Nested Layouts | Accepted | `diag-ir` declaration schema (`ir.fbs`) |
 | [ADR-243](ADR-243-codeql-and-backlog-loops-share-one-claim.md) | The CodeQL and Backlog Loops Share One PR-Based Claim | Accepted (Decision item 3's skipping of high and critical alerts and item 4's number-only hand-off of them superseded by ADR-246; item 4's trigger follows the CodeQL workflow instead of default setup, ADR-283) | `.claude/skills/codeql-alerts`, `backlog-loop` |
@@ -273,6 +273,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-281](ADR-281-worker-library-resolution-mode-and-device-selection.md) | Worker Library Resolution Has No Config-File Path, the Agent Passes the Mode, One J2534 Device Is One Worker, and Pre-Release Compatibility May Break | Accepted | design 7.1 / 7.2, `j2534-0404-service`, `iso22900-service`, `agent`, `vci-service-config` |
 | [ADR-282](ADR-282-debug-resolver-overrides-on-windows.md) | In Debug Builds the Resolvers' Runtime Overrides Also Replace the Windows Registry | Accepted | `ngr-library-resolver`, `vci-service-config`, design 7.1.1 / 7.2, worker and agent integration tests |
 | [ADR-283](ADR-283-codeql-workflow-and-windows-dll-check.md) | CodeQL Runs as a Repository Workflow, and the Windows DLL Check Uses the Runner's System Directory | Accepted | `.github/workflows/codeql.yml`, `codeql-alert-handoff.yml`, `ci.yml` (`worker-windows`, `abi-roundtrip-windows`) |
+| [ADR-284](ADR-284-agent-passes-the-definition-long-size.md) | The Agent Passes the Registration Definition's `LongSize` to the J2534 Worker | Accepted | `agent` launch, `ngr-agent run`, design 7.1.1 / 7.1.2 / 7.3 |
 
 ## Status Legend
 
@@ -566,10 +567,11 @@ the predecessor repository these ADRs came from.
 - ADR-223 (ADR-036, which the text calls not superseded, is superseded by ADR-281)
 - ADR-224
 - ADR-228 (the Linux definition format and the shared crate's name settled by ADR-266; item 3 extended and the configuration file no longer names a library, ADR-281; item 1's debug override also replaces the Windows registry, ADR-282)
-- ADR-240 (the architecture key of the `config.toml` lookup superseded by ADR-281; the per-build registry view stays)
+- ADR-240 (the `config.toml` lookup, with its architecture key, superseded by ADR-281; the per-build registry view stays; Decision item 4 superseded by ADR-284)
 - ADR-266
 - ADR-281
 - ADR-282
+- ADR-284
 
 ### vci-service-manager Process Startup
 - ADR-073

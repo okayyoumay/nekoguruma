@@ -202,6 +202,68 @@ fn missing_worker_build_exits_with_1() {
     assert_fails_with(output, "no worker bundled for ABI");
 }
 
+/// Installs, for the agent's own ABI, a stand-in worker that records the `NGR_J2534_LONG_SIZE`
+/// it was started with in `<workers>/long_size` and exits, and runs the agent against a VCI whose
+/// definition carries `extra` (the agent's executable stands in for the library). Returns what
+/// the stand-in recorded.
+#[cfg(all(debug_assertions, unix))]
+fn long_size_passed_to_the_worker(name: &str, extra: &str) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = TempDir::new(name);
+    let agent = Path::new(env!("CARGO_BIN_EXE_ngr-agent"));
+    let definitions = write_definitions(&temp.0, Some(agent));
+    let file = definitions.join("test-vci.toml");
+    let text = std::fs::read_to_string(&file).expect("definition file should be readable");
+    std::fs::write(&file, format!("{text}{extra}")).expect("definition file should be writable");
+    let abi = worker_host::abi::detect_file(agent).expect("the agent's header should be readable");
+    let workers = temp.0.join("workers");
+    let dir = workers.join(abi.name());
+    std::fs::create_dir_all(&dir).expect("workers directory should be writable");
+    let record = workers.join("long_size");
+    let worker = dir.join("j2534-0404-service");
+    std::fs::write(
+        &worker,
+        format!(
+            "#!/bin/sh\nprintf '%s' \"${{NGR_J2534_LONG_SIZE-unset}}\" > '{}'\nexit 1\n",
+            record.display()
+        ),
+    )
+    .expect("stand-in worker should be writable");
+    std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o755))
+        .expect("stand-in worker should be executable");
+    let output = ngr_agent()
+        .args(["run", "--vci", "test-vci", "--mode", "user", "--program"])
+        .arg(read_vin(&temp.0))
+        .arg("--workers")
+        .arg(&workers)
+        .arg("--locks")
+        .arg(temp.0.join("locks"))
+        .env("NGR_J2534_DEFINITION_DIR", &definitions)
+        .output()
+        .expect("ngr-agent should run");
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    std::fs::read_to_string(&record)
+        .unwrap_or_else(|error| panic!("the stand-in worker should have run ({error}): {output:?}"))
+}
+
+/// A definition's `LongSize` reaches the worker even where it differs from the ABI's default
+/// (7.1.1, 7.1.2). The host's default is 8, so 4 is the non-default width.
+#[cfg(all(debug_assertions, unix, target_pointer_width = "64"))]
+#[test]
+fn the_definition_long_size_reaches_the_worker() {
+    assert_eq!(
+        long_size_passed_to_the_worker("long-size-4", "LongSize = 4\n"),
+        "4"
+    );
+}
+
+/// Without a `LongSize`, the worker gets the ABI's default.
+#[cfg(all(debug_assertions, unix, target_pointer_width = "64"))]
+#[test]
+fn without_long_size_the_worker_gets_the_abi_default() {
+    assert_eq!(long_size_passed_to_the_worker("long-size-default", ""), "8");
+}
+
 /// `ngr-agent run` takes the per-VCI lock before it resolves the VCI, and waits while another
 /// job holds it (ADR-257).
 #[cfg(debug_assertions)]

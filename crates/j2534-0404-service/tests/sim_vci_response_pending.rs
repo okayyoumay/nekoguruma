@@ -148,16 +148,9 @@ fn the_worker_absorbs_response_pending_for_the_agent() {
         control_dir: temp.join(format!("sim-vci-rc78-{nanos}")),
         definitions: temp.join(format!("sim-vci-rc78-definitions-{nanos}")),
     };
-    std::fs::write(
-        &paths.config,
-        format!(
-            "[config.apis.j2534-0404.libs.{LIBRARY_NAME:?}]\nlibrary_path = {:?}\n",
-            sim_vci_path().display().to_string()
-        ),
-    )
-    .expect("test config file should be writable");
-    // Also names the library through a registration definition (ADR-282), so the switch to
-    // `ngr-library-resolver` needs no test changes.
+    std::fs::write(&paths.config, "").expect("test config file should be writable");
+    // The registration definition names the library, through the debug-only
+    // `NGR_J2534_DEFINITION_DIR` override (ADR-282).
     std::fs::create_dir_all(&paths.definitions).expect("definition directory");
     j2534_0404_mock::write_definition(&paths.definitions, LIBRARY_NAME, &sim_vci_path())
         .expect("definition file should be writable");

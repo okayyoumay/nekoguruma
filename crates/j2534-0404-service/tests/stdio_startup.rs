@@ -57,20 +57,16 @@ fn write_test_definition(config_path: &std::path::Path, name: &str, library: &st
         .expect("definition file should be writable");
 }
 
-/// Writes a `config.toml` that points `TEST_LIBRARY_NAME`'s `library_path`
-/// at the compiled mock cdylib, so the spawned service resolves it without
-/// needing the Windows registry.
+/// Writes an empty `config.toml` and a registration definition that names the
+/// compiled mock cdylib as `TEST_LIBRARY_NAME`'s library, so the spawned
+/// service resolves it without needing the Windows registry.
 fn write_test_library_config() -> PathBuf {
     let mock_library =
         mock_library_path().expect("mock library should be discoverable after build");
     let config_path = unique_temp_path("config.toml");
-    let config_toml = format!(
-        "[config.apis.j2534-0404.libs.{TEST_LIBRARY_NAME:?}]\nlibrary_path = {:?}\n",
-        mock_library.display().to_string()
-    );
-    std::fs::write(&config_path, config_toml).expect("test config file should be writable");
-    // Also names the library through a registration definition (ADR-282), so the switch to
-    // `ngr-library-resolver` needs no test changes.
+    std::fs::write(&config_path, "").expect("test config file should be writable");
+    // The registration definition names the library, through the debug-only
+    // `NGR_J2534_DEFINITION_DIR` override (ADR-282).
     write_test_definition(&config_path, TEST_LIBRARY_NAME, &mock_library);
     config_path
 }
@@ -589,15 +585,11 @@ async fn stop_terminates_live_subscribe_event_stream() {
 async fn get_status_returns_startup_error_details_when_grpc_start_fails() {
     let exe = env!("CARGO_BIN_EXE_j2534-0404-service");
     let invalid_library_name = "missing-library-for-startup-error";
-    // Configure a `library_path` that does not exist on disk, so the service
+    // Name a library file that does not exist on disk, so the service
     // fails to load it deterministically regardless of registry state.
     let nonexistent_path = std::env::temp_dir().join(format!("{invalid_library_name}.so"));
     let config_path = unique_temp_path("config.toml");
-    let config_toml = format!(
-        "[config.apis.j2534-0404.libs.{invalid_library_name:?}]\nlibrary_path = {:?}\n",
-        nonexistent_path.display().to_string()
-    );
-    std::fs::write(&config_path, config_toml).expect("test config file should be writable");
+    std::fs::write(&config_path, "").expect("test config file should be writable");
     write_test_definition(&config_path, invalid_library_name, &nonexistent_path);
 
     let mut child = Command::new(exe)

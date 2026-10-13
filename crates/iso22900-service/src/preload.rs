@@ -35,8 +35,24 @@ impl CheckedLibrary {
 /// the findings are logged as a warning and the library is loaded.
 pub fn check_library(resolved: &Resolved, mode: OperatingMode) -> Result<CheckedLibrary, Status> {
     let config = vci_service_launcher::config::config_file();
-    let config = std::fs::symlink_metadata(&config).is_ok().then_some(config);
-    check_library_with(resolved, config, mode, &Policy::system())
+    let probe = std::fs::symlink_metadata(&config);
+    check_library_with(
+        resolved,
+        config_to_check(config, probe),
+        mode,
+        &Policy::system(),
+    )
+}
+
+/// The configuration file to check, given what probing it returned: only a file that is not
+/// there is left out. Any other failure to probe it (a parent directory the worker cannot
+/// search, say) keeps it among the checked files, so the check reports it instead of the
+/// service running on defaults that select a device the configuration did not name.
+fn config_to_check<T>(config: PathBuf, probe: std::io::Result<T>) -> Option<PathBuf> {
+    match probe {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        _ => Some(config),
+    }
 }
 
 /// [`check_library`] with the configuration file to check passed in, and the owners `policy`
@@ -161,6 +177,19 @@ mod tests {
 
     fn library(resolved: &Resolved) -> PathBuf {
         resolved.implementation.library_file.clone()
+    }
+
+    #[test]
+    fn only_a_missing_configuration_file_is_left_unchecked() {
+        let config = PathBuf::from("config.toml");
+        let missing = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert_eq!(config_to_check(config.clone(), Err::<(), _>(missing)), None);
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            config_to_check(config.clone(), Err::<(), _>(denied)),
+            Some(config.clone())
+        );
+        assert_eq!(config_to_check(config.clone(), Ok(())), Some(config));
     }
 
     #[test]

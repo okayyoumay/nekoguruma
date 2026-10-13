@@ -18,15 +18,14 @@
 //! requires selecting a connection target at runtime via one of:
 //!
 //! - `J2534_DLL_PATH` — a filesystem path to a real vendor J2534 DLL/`.so`.
-//!   The test writes a temporary `config.toml` `library_path` override
-//!   pointing at it (the same mechanism `grpc_mock.rs` uses to redirect
-//!   resolution at the compiled mock) and starts the service against that.
-//!   Debug builds only: the redirect relies on the runtime
-//!   `VCI_CONFIG_PATH` override, which is compiled out of release builds
-//!   (see ADR-073).
+//!   The test writes a temporary registration definition naming it (the
+//!   same mechanism `grpc_mock.rs` uses to redirect the lookup at the
+//!   compiled mock) and starts the service against that. Debug builds
+//!   only: the redirect relies on the `NGR_J2534_DEFINITION_DIR` override
+//!   (ADR-282), which is compiled out of release builds.
 //! - `J2534_LIVE_LIBRARY_NAME` — a library name already resolvable through
-//!   the platform's normal discovery (the Windows registry, or an existing
-//!   deployed `config.toml`), used as-is with no override. Ignored if
+//!   the platform's normal discovery (the Windows registry, or an installed
+//!   registration definition on Linux), used as-is with no override. Ignored if
 //!   `J2534_DLL_PATH` is also set.
 //!
 //! If neither is set the test is skipped even when the opt-in flag is on.
@@ -180,10 +179,10 @@ async fn comparam_object_id(
 /// for the service startup argument. Returns `None` when nothing is
 /// configured (the caller should skip the test in that case).
 fn resolve_library_name() -> Option<String> {
-    // The J2534_DLL_PATH mode relies on the debug-only runtime
-    // VCI_CONFIG_PATH override (see ADR-073), so it only exists in debug
+    // The J2534_DLL_PATH mode relies on the debug-only
+    // NGR_J2534_DEFINITION_DIR override (ADR-282), so it only exists in debug
     // builds. The J2534_LIVE_LIBRARY_NAME mode below resolves through the
-    // registry or an already deployed config.toml and works in both
+    // registry or an installed registration definition and works in both
     // profiles.
     #[cfg(debug_assertions)]
     if let Ok(dll_path) = std::env::var("J2534_DLL_PATH") {
@@ -194,20 +193,17 @@ fn resolve_library_name() -> Option<String> {
             "j2534-0404-service-live-test-config-{}.toml",
             std::process::id()
         ));
-        let config_toml =
-            format!("[config.apis.j2534-0404.libs.live-target]\nlibrary_path = {dll_path:?}\n",);
-        std::fs::write(&config_path, &config_toml)
+        std::fs::write(&config_path, "")
             .unwrap_or_else(|err| panic!("{} should be writable: {err}", config_path.display()));
-        // Also names the library through a registration definition (ADR-282), so the switch to
-        // `ngr-library-resolver` needs no test changes.
+        // The registration definition names the library, through the debug-only
+        // `NGR_J2534_DEFINITION_DIR` override (ADR-282).
         let definition_dir = std::env::temp_dir().join(format!(
             "j2534-0404-service-live-test-definitions-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&definition_dir);
         std::fs::create_dir_all(&definition_dir).expect("definition directory");
-        // A definition names its library by absolute path, while `library_path` also takes a
-        // relative one.
+        // A definition names its library by absolute path, so make a relative one absolute.
         let definition_library = std::path::absolute(&dll_path)
             .unwrap_or_else(|err| panic!("{dll_path} should resolve to an absolute path: {err}"));
         j2534_0404_mock::write_definition(&definition_dir, "live-target", &definition_library)
@@ -219,7 +215,7 @@ fn resolve_library_name() -> Option<String> {
             std::env::set_var("VCI_CONFIG_PATH", &config_path);
             std::env::set_var("NGR_J2534_DEFINITION_DIR", &definition_dir);
         }
-        println!("target: J2534_DLL_PATH={dll_path:?} (via temporary config.toml override)");
+        println!("target: J2534_DLL_PATH={dll_path:?} (via temporary registration definition)");
         return Some("live-target".to_string());
     }
     // Fail loudly rather than silently falling through to the name mode (or
@@ -227,15 +223,15 @@ fn resolve_library_name() -> Option<String> {
     #[cfg(not(debug_assertions))]
     if std::env::var("J2534_DLL_PATH").is_ok() {
         panic!(
-            "J2534_DLL_PATH requires a debug build: its temporary config.toml \
-             redirect uses the runtime VCI_CONFIG_PATH override, which release \
-             builds compile out (ADR-073); use J2534_LIVE_LIBRARY_NAME against \
-             the registry or a deployed config.toml instead"
+            "J2534_DLL_PATH requires a debug build: its temporary registration \
+             definition uses the NGR_J2534_DEFINITION_DIR override, which release \
+             builds compile out (ADR-282); use J2534_LIVE_LIBRARY_NAME against \
+             the registry or an installed registration definition instead"
         );
     }
     if let Ok(name) = std::env::var("J2534_LIVE_LIBRARY_NAME") {
         println!(
-            "target: J2534_LIVE_LIBRARY_NAME={name:?} (resolved via registry/existing config.toml)"
+            "target: J2534_LIVE_LIBRARY_NAME={name:?} (resolved via registry/installed definition)"
         );
         return Some(name);
     }

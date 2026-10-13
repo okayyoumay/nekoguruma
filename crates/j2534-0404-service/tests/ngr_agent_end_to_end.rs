@@ -109,16 +109,9 @@ fn ngr_agent_runs_a_program_file_on_sim_vci() {
     install_worker(&workers, abi.name());
 
     let config_path = root.join("config.toml");
-    std::fs::write(
-        &config_path,
-        format!(
-            "[config.apis.j2534-0404.libs.{LIBRARY_NAME:?}]\nlibrary_path = {:?}\n",
-            sim_vci.display().to_string()
-        ),
-    )
-    .expect("test config file should be writable");
-    // Also names the library through a registration definition (ADR-282), so the switch to
-    // `ngr-library-resolver` needs no test changes.
+    std::fs::write(&config_path, "").expect("test config file should be writable");
+    // The registration definition names the library, for the agent's ABI detection and the
+    // worker alike, through the debug-only `NGR_J2534_DEFINITION_DIR` override (ADR-282).
     let definition_dir = root.join("definitions");
     std::fs::create_dir_all(&definition_dir).expect("definition directory");
     j2534_0404_mock::write_definition(&definition_dir, LIBRARY_NAME, &sim_vci)
@@ -130,7 +123,7 @@ fn ngr_agent_runs_a_program_file_on_sim_vci() {
     )
     .expect("program file should be writable");
 
-    // The agent and the worker it launches both read the library path from this config.
+    // The agent and the worker it launches both resolve the library through the definition.
     let mut child = Command::new(ngr_agent_path())
         .args(["run", "--vci", LIBRARY_NAME, "--mode", "user", "--program"])
         .arg(&program_path)

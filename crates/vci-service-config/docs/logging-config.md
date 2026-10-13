@@ -1,8 +1,9 @@
 # vci-service-config Configuration
 
 This document covers the full `config.toml` schema loaded by
-`vci-service-config`: logging settings and (for services that consult it,
-currently `j2534-0404-service` only) `library_path` overrides. `vci-service-launcher` re-exports this crate as
+`vci-service-config`: logging settings, the per-library worker settings, and
+the `library_path` entries that discovery (`enumerate_libraries`) still reads;
+no worker service resolves its library through `library_path`. `vci-service-launcher` re-exports this crate as
 `vci_service_launcher::config` (see ADR-033), so every service built on the
 launcher template picks this schema up automatically.
 
@@ -160,16 +161,12 @@ without a specific library name to attach it to.
 **Lookup is exposed through `iso22900-registry::find_library_path()` and
 `j2534-0404-registry::find_library_path()`** (both thin wrappers around this
 crate's `find_library_path()`, scoped to their own API name), not called
-directly from this crate by `j2534-0404-service` — see ADR-034.
-`j2534-0404-service` does not call `find_library_path()` directly either: it
-calls its registry's single `resolve_library_path()` function, which applies
-the priority itself (see ADR-035). When set for a library name, it is used
-directly and the Windows registry (`j2534-0404-registry`,
-`HKLM\SOFTWARE\PassThruSupport.04.04`) is not consulted for that name. When
-unset, `resolve_library_path()` falls back to the registry as before.
-`iso22900-service` does not read `library_path`: it resolves its library
-through `ngr-library-resolver`'s D-PDU API root description file lookup
-(design 7.1, ADR-281 Decision item 1), then runs the design 7.2 pre-load checks.
+directly from this crate — see ADR-034. Neither worker service reads
+`library_path`: `iso22900-service` resolves its library through
+`ngr-library-resolver`'s D-PDU API root description file lookup (design 7.1)
+and `j2534-0404-service` through its J2534 registration definition or registry
+lookup (design 7.1.1), and both then run the design 7.2 pre-load checks
+(ADR-281 Decision item 1).
 
 The registry crates' `enumerate_libraries()` also reads this table (via
 `list_configured_library_paths()`), so config-only libraries — ones with no
@@ -347,4 +344,4 @@ output = "null"
 - `stdout` is always reserved for JSON-RPC communication with the parent process (the agent, via `worker-host`). Do not configure log output to `stdout`.
 - When the config file is missing or unparseable, a warning is printed to `stderr` and the default (`info` + `stderr`) is used. The service still starts normally.
 - File output appends; the file is never truncated on startup. Rotate externally (e.g., `logrotate` on Linux).
-- A missing or unparseable config file also means no `library_path` overrides are applied — `j2534-0404-service` falls back to registry auto-discovery for every library name in that case, which fails with `RegistryUnsupported` on non-Windows. `iso22900-service` never reads `library_path`, so its lookup does not change; a configuration file that is missing at startup also leaves its `vendor_struct_types` unset for the worker's lifetime, even if the file appears later, since only a file that existed at startup passed the design 7.2 checks.
+- Neither worker service reads `library_path`, so a missing or unparseable config file does not change which library either one loads. A configuration file that is missing at startup leaves the worker's per-library settings unset for its lifetime (`vendor_struct_types` in `iso22900-service`; `modules`, `can_channel_mode` and `vendor_ioctls` in `j2534-0404-service`), even if the file appears later, since only a file that existed at startup passed the design 7.2 checks.

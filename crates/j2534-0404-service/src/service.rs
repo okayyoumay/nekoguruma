@@ -16,7 +16,7 @@ use vci_service_launcher::{BoxError, vci_server::VciServer};
 
 use crate::config::StartupConfig;
 use crate::error::{
-    map_construct_error, map_native_error_for_link, map_registry_error, state_guard_status,
+    map_construct_error, map_native_error_for_link, map_resolve_error, state_guard_status,
     unknown_handle_status,
 };
 
@@ -5424,44 +5424,54 @@ impl VciServer for J2534Service {
         // uninitialized-and-then-lazily-started at some arbitrary later
         // first-use moment.
         events::init_module_clock();
-        // The mode decides what a failed 7.2 library check means once the
-        // library is resolved through `ngr-library-resolver`; until then it
-        // is only recorded (ADR-281 Decision item 2).
         tracing::info!(
             library = %startup_config.library_name,
             mode = %startup_config.mode(),
             "starting worker"
         );
-        // A `library_path` configured for this library name takes priority over
-        // platform auto-discovery (the Windows registry), letting deployers add
-        // libraries manually and letting non-Windows builds resolve one at all.
-        let library_path = j2534_0404_registry::resolve_library_path(
-            vci_service_launcher::vci_server::current_arch(),
-            &startup_config.library_name,
-        )
-        .map_err(map_registry_error)?;
-        // Fail fast on an invalid `can_channel_mode` config value so a typo
-        // surfaces at startup rather than as silent single-channel behaviour.
-        let can_channel_mode = CanChannelMode::from_config(
-            vci_service_launcher::vci_server::current_arch(),
-            &startup_config.library_name,
-        )
-        .map_err(|msg| -> BoxError { msg.into() })?;
-        // Fail fast on an invalid `modules` config value (empty array,
-        // non-ASCII/embedded-NUL pname) too (ADR-107).
-        let modules = Arc::new(crate::config::resolve_modules(
-            vci_service_launcher::vci_server::current_arch(),
-            &startup_config.library_name,
-        )?);
-        // Fail fast on an invalid vendor_ioctls config value (bad key
-        // format, unrecognized shape) too (ADR-219, as amended).
-        let vendor_ioctls = Arc::new(crate::config::resolve_vendor_ioctls(
-            vci_service_launcher::vci_server::current_arch(),
-            &startup_config.library_name,
-        )?);
+        // The library name resolves through its registration definition on
+        // Linux, the registry on Windows (design 7.1.1, ADR-228 Decision
+        // item 4); the debug-only `NGR_J2534_DEFINITION_DIR` replaces both
+        // (ADR-282). The 7.2 checks then run on the library, its definition
+        // and the configuration file, and the mode decides what a failed
+        // check means (ADR-281 Decision item 2).
+        let resolved = ngr_library_resolver::j2534_0404::resolve(&startup_config.library_name)
+            .map_err(map_resolve_error)?;
+        let checked = crate::preload::check_library(&resolved, startup_config.mode())?;
+        // The per-library settings come from the configuration file only when
+        // it was among the checked files: one created after the check has
+        // passed none, so it configures nothing (ADR-270 Decision item 5).
+        let arch = vci_service_launcher::vci_server::current_arch();
+        let library_name = &startup_config.library_name;
+        let (can_channel_mode, modules, vendor_ioctls) = if checked.config_checked() {
+            (
+                // Fail fast on an invalid `can_channel_mode` config value so a
+                // typo surfaces at startup rather than as silent single-channel
+                // behaviour.
+                CanChannelMode::from_config(arch, library_name)
+                    .map_err(|msg| -> BoxError { msg.into() })?,
+                // Fail fast on an invalid `modules` config value (empty array,
+                // non-ASCII/embedded-NUL pname) too (ADR-107).
+                crate::config::resolve_modules(arch, library_name)?,
+                // Fail fast on an invalid vendor_ioctls config value (bad key
+                // format, unrecognized shape) too (ADR-219, as amended).
+                crate::config::resolve_vendor_ioctls(arch, library_name)?,
+            )
+        } else {
+            (
+                CanChannelMode::default(),
+                crate::config::default_modules(),
+                HashMap::new(),
+            )
+        };
+        let modules = Arc::new(modules);
+        let vendor_ioctls = Arc::new(vendor_ioctls);
         let api = Arc::new(Mutex::new(
-            J2534Api0404::from_path(&library_path).map_err(map_construct_error)?,
+            J2534Api0404::from_path(&resolved.definition.library).map_err(map_construct_error)?,
         ));
+        // The library is mapped now, so the checked file need not be held
+        // open any longer (ADR-278).
+        drop(checked);
         let logical_links: Arc<Mutex<HashMap<u32, LogicalLinkState>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let drain_watermarks: Arc<Mutex<HashMap<ChannelId, tokio::time::Instant>>> =

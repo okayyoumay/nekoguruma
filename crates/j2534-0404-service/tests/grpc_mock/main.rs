@@ -7,9 +7,10 @@
 //! ADR-014).
 //!
 //! `J2534Service::new` loads its J2534 library by dynamically opening a
-//! shared-library file path resolved from the shared `config.toml` via
-//! `j2534-0404-registry::find_library_path` (see `harness::TestServer`), so
-//! these tests point that resolution at the compiled `j2534-0404-mock` cdylib
+//! shared-library file path named by a registration definition, found through
+//! the debug-only `NGR_J2534_DEFINITION_DIR` override (ADR-282; see
+//! `harness::TestServer`), so these tests point that lookup at the compiled
+//! `j2534-0404-mock` cdylib
 //! and then read back what the service actually sent to it.
 //!
 //! One module per theme; the shared server/backdoor scaffolding lives in

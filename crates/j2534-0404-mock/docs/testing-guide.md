@@ -24,7 +24,7 @@ a J2534 registration definition (design 7.1.1) with `write_definition(dir, name,
 writes one `.toml` file per name into `dir` (named by the hex encoding of the name, so similar
 names never share a file) with `Name` and `FunctionLibrary` escaped as TOML strings, and
 returns the file's path. Then point the debug-only `NGR_J2534_DEFINITION_DIR` override at `dir`
-(ADR-282). `j2534-0404-service`'s tests do this alongside their `library_path` setting.
+(ADR-282). `j2534-0404-service`'s tests name their library this way.
 
 Before each test, reset all mock state:
 

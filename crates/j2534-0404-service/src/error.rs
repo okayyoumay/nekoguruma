@@ -15,22 +15,21 @@ pub fn map_construct_error(error: impl std::fmt::Display) -> Status {
     Status::internal("failed to construct J2534-0404 API")
 }
 
-/// Maps a registry/device-discovery lookup failure to a client-facing
-/// [`Status`], logging the full error (which may contain raw OS/registry
-/// error text) server-side only.
-pub fn map_registry_error(error: j2534_0404_registry::RegistryError) -> Status {
-    use j2534_0404_registry::RegistryError;
+/// Maps a library-resolution failure (design 7.1.1) to a client-facing
+/// [`Status`]. A name that resolves to nothing is reported as not found;
+/// every other failure is logged in full server-side only, since it can
+/// carry definition file paths or raw OS/registry error text (ADR-089).
+pub fn map_resolve_error(error: ngr_library_resolver::j2534_0404::ResolveError) -> Status {
+    use ngr_library_resolver::j2534_0404::ResolveError;
 
     match error {
-        RegistryError::Io(e) => {
-            error!(error = %e, "I/O error while searching for J2534 devices");
-            Status::internal("I/O error while searching for J2534 devices")
-        }
-        RegistryError::RegistryUnsupported => {
-            Status::internal("registry lookup is only supported on Windows")
-        }
-        RegistryError::NotFound(name) => {
+        ResolveError::NotFound { ref name, .. } => {
+            tracing::warn!(%error, "J2534 library not found");
             Status::not_found(format!("no J2534 device found with name '{name}'"))
+        }
+        other => {
+            error!(error = %other, "failed to resolve the J2534 library");
+            Status::internal("failed to resolve the J2534 library")
         }
     }
 }
@@ -269,6 +268,44 @@ mod tests {
     use vci_service_interface::error_detail_from_status;
 
     use super::*;
+
+    #[test]
+    fn map_resolve_error_reports_a_missing_name_as_not_found() {
+        use ngr_library_resolver::j2534_0404::ResolveError;
+        let status = map_resolve_error(ResolveError::NotFound {
+            name: "Some VCI".into(),
+            skipped_invalid: 2,
+        });
+        assert_eq!(status.code(), Code::NotFound);
+        assert_eq!(
+            status.message(),
+            "no J2534 device found with name 'Some VCI'"
+        );
+    }
+
+    /// Every other resolution failure carries local paths in its text; the
+    /// client sees a fixed message instead (ADR-089).
+    #[test]
+    fn map_resolve_error_names_no_path_for_any_other_failure() {
+        use ngr_library_resolver::j2534_0404::ResolveError;
+        let dir = std::path::PathBuf::from("/secret/definitions");
+        let errors = [
+            ResolveError::Io {
+                path: dir.clone(),
+                source: std::io::Error::other("raw OS text"),
+            },
+            ResolveError::LinkedDirectory { path: dir.clone() },
+            ResolveError::Ambiguous {
+                name: "Some VCI".into(),
+                files: vec![dir.join("a.toml"), dir.join("b.toml")],
+            },
+        ];
+        for error in errors {
+            let status = map_resolve_error(error);
+            assert_eq!(status.code(), Code::Internal);
+            assert_eq!(status.message(), "failed to resolve the J2534 library");
+        }
+    }
 
     #[test]
     fn pdu_error_for_maps_representative_status_codes() {

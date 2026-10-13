@@ -1,16 +1,18 @@
 //! Launching the worker for a VCI (design 7.3, 7.4).
 //!
-//! The library behind a VCI name is resolved the way each worker build resolves it on its side
-//! (`j2534_0404_registry`: a `library_path` entry in `config.toml` under the build's
-//! architecture key or at api level, else the build's registry view), so the file whose header
-//! picks the ABI is the file that build loads. The service is then started with the name and
-//! the device's operating mode (ADR-281 Decision item 2; 7.2 gives the mode its meaning for a
-//! failed library check) and resolves the name again itself (7.2). ADR-240 records the
-//! selection rule.
+//! The library behind a VCI name is resolved for each worker build through `ngr-library-resolver`
+//! (7.1.1), as that build resolves it: the build's registry view on Windows, the registration
+//! definition on Linux, and in a debug build the `NGR_J2534_DEFINITION_DIR` definition directory
+//! on both (ADR-282). The file's header picks the ABI, so the file whose header selects the build
+//! is the file that build loads (ADR-281 Decision item 1). The service is then started with the
+//! name and the device's operating mode (ADR-281 Decision item 2; 7.2 gives the mode its meaning
+//! for a failed library check) and resolves the name again itself. ADR-240 records the selection
+//! rule.
 
 use std::path::{Path, PathBuf};
 
-use j2534_0404_registry::{RegistryError, RegistryViewMode};
+use j2534_0404_registry::RegistryViewMode;
+use ngr_library_resolver::j2534_0404::ResolveError;
 use worker_host::abi::{self, Abi, AbiError};
 use worker_host::client::{ConnectError, ConnectOptions, WorkerClient};
 use worker_host::service::{
@@ -21,18 +23,27 @@ use worker_host::service::{
 pub enum LaunchError {
     #[error("cannot resolve the library of VCI {vci:?}: {}", reasons.join("; "))]
     Resolve { vci: String, reasons: Vec<String> },
+    /// The ABI's `unsigned long` is 32 bits wide, so it cannot be 8 bytes (7.1.2).
+    #[error("VCI {vci:?}: LongSize {long_size} is not possible for {}", abi.name())]
+    UnsupportedLongSize {
+        vci: String,
+        abi: Abi,
+        long_size: u8,
+    },
     #[error(transparent)]
     Service(#[from] ServiceError),
     #[error(transparent)]
     Connect(#[from] ConnectError),
 }
 
-/// How one worker build resolves a library name: the `config.toml` architecture key it passes
-/// (`vci_service_launcher::vci_server::current_arch`), the registry view it reads, and the ABI
-/// it is built for (`None`: any, there is one build per host on Linux).
+/// How one worker build resolves a library name: the registry view it reads on Windows, and the
+/// ABI it is built for (`None`: any, there is one build per host on Linux).
 #[derive(Debug, Clone, Copy)]
 struct Resolution {
-    arch: Option<&'static str>,
+    #[cfg_attr(
+        not(windows),
+        expect(dead_code, reason = "only Windows reads a registry view")
+    )]
     view: RegistryViewMode,
     abi: Option<Abi>,
 }
@@ -43,12 +54,10 @@ struct Resolution {
 #[cfg(all(windows, target_arch = "x86_64"))]
 const RESOLUTIONS: &[Resolution] = &[
     Resolution {
-        arch: Some("x86_x64"),
         view: RegistryViewMode::W64,
         abi: Some(Abi::WinX64),
     },
     Resolution {
-        arch: Some("x86"),
         view: RegistryViewMode::W32,
         abi: Some(Abi::WinX86),
     },
@@ -56,21 +65,27 @@ const RESOLUTIONS: &[Resolution] = &[
 
 #[cfg(all(windows, target_arch = "x86"))]
 const RESOLUTIONS: &[Resolution] = &[Resolution {
-    arch: Some("x86"),
     view: RegistryViewMode::Native,
     abi: Some(Abi::WinX86),
 }];
 
-// `vci_service_launcher::vci_server::current_arch` knows no other Windows architecture.
+// No j2534-0404 worker is built for any other Windows architecture.
 #[cfg(all(windows, not(any(target_arch = "x86_64", target_arch = "x86"))))]
 compile_error!("no j2534-0404 worker build is defined for this Windows architecture");
 
 #[cfg(not(windows))]
 const RESOLUTIONS: &[Resolution] = &[Resolution {
-    arch: None,
     view: RegistryViewMode::Native,
     abi: None,
 }];
+
+/// What one worker build would load for a VCI: the library, and the `LongSize` its
+/// registration definition declares (7.1.1; a registry entry declares none).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Library {
+    path: PathBuf,
+    long_size: Option<u8>,
+}
 
 /// A running worker and a client connected to it.
 pub struct LaunchedWorker {
@@ -82,18 +97,20 @@ pub struct LaunchedWorker {
 /// Launches the j2534-0404 worker that matches the ABI of `vci`'s library in the device's
 /// operating `mode` and connects a client to it.
 ///
-/// `options.long_size` is filled with the ABI's default (7.1.2) when it is `None`; the Linux
-/// registration definition that could override it (7.1.1) is not read.
+/// The worker's J2534 `long_size` is `options.long_size`, else the `LongSize` of the
+/// registration definition the lookup resolves (7.1.1), else the ABI's default (7.1.2). An
+/// 8-byte width for an ABI whose `unsigned long` is 32 bits wide fails the launch.
 pub async fn launch_j2534_worker(
     vci: &str,
     mode: OperatingMode,
     workers: &WorkerLayout,
     options: &LaunchOptions,
 ) -> Result<LaunchedWorker, LaunchError> {
-    let (_, abi) = resolve(vci, RESOLUTIONS, lookup, abi::detect_file)?;
+    let (library, abi) = resolve(vci, RESOLUTIONS, lookup, abi::detect_file)?;
+    let long_size = long_size(vci, abi, options.long_size.or(library.long_size))?;
     let binary = workers.find(ServiceKind::J2534V0404, abi)?;
     let options = LaunchOptions {
-        long_size: options.long_size.or(Some(abi.default_long_size())),
+        long_size: Some(long_size),
         ..options.clone()
     };
     let process =
@@ -106,42 +123,64 @@ pub async fn launch_j2534_worker(
     })
 }
 
-/// What one worker build would load for `vci`.
-fn lookup(vci: &str, resolution: &Resolution) -> Result<PathBuf, RegistryError> {
-    if let Some(path) = j2534_0404_registry::find_library_path(resolution.arch, vci) {
-        return Ok(path);
+/// The width to launch `abi`'s worker with: `declared`, else the ABI's default (7.1.2). A
+/// declared 8 is refused where `unsigned long` is 32 bits wide.
+fn long_size(vci: &str, abi: Abi, declared: Option<u8>) -> Result<u8, LaunchError> {
+    match declared {
+        None => Ok(abi.default_long_size()),
+        Some(4) => Ok(4),
+        Some(long_size) if long_size == abi.default_long_size() => Ok(long_size),
+        Some(long_size) => Err(LaunchError::UnsupportedLongSize {
+            vci: vci.to_owned(),
+            abi,
+            long_size,
+        }),
     }
-    Ok(j2534_0404_registry::find_j2534_device_on_registry(vci, resolution.view)?.library_path)
 }
 
-/// The first resolution whose library is built for that resolution's ABI, with the library's
-/// path and ABI.
+/// What one worker build would load for `vci`.
+fn lookup(vci: &str, resolution: &Resolution) -> Result<Library, ResolveError> {
+    #[cfg(windows)]
+    let resolved = ngr_library_resolver::j2534_0404::resolve_on_registry(vci, resolution.view)?;
+    #[cfg(not(windows))]
+    let resolved = {
+        let _ = resolution;
+        ngr_library_resolver::j2534_0404::resolve(vci)?
+    };
+    Ok(Library {
+        path: resolved.definition.library,
+        long_size: resolved.definition.long_size,
+    })
+}
+
+/// The first resolution whose library is built for that resolution's ABI, with the library and
+/// its ABI.
 fn resolve(
     vci: &str,
     resolutions: &[Resolution],
-    lookup: impl Fn(&str, &Resolution) -> Result<PathBuf, RegistryError>,
+    lookup: impl Fn(&str, &Resolution) -> Result<Library, ResolveError>,
     detect: impl Fn(&Path) -> Result<Abi, AbiError>,
-) -> Result<(PathBuf, Abi), LaunchError> {
+) -> Result<(Library, Abi), LaunchError> {
     let mut reasons = Vec::new();
     for resolution in resolutions {
         let build = resolution.abi.map_or("worker", Abi::name);
-        let path = match lookup(vci, resolution) {
-            Ok(path) => path,
+        let library = match lookup(vci, resolution) {
+            Ok(library) => library,
             Err(error) => {
                 reasons.push(format!("{build}: {error}"));
                 continue;
             }
         };
-        match detect(&path) {
+        match detect(&library.path) {
             Ok(abi) if resolution.abi.is_none_or(|expected| expected == abi) => {
-                return Ok((path, abi));
+                return Ok((library, abi));
             }
             Ok(abi) => reasons.push(format!(
                 "{build}: {} is built for {}",
-                path.display(),
+                library.path.display(),
                 abi.name()
             )),
-            Err(error) => reasons.push(format!("{build}: {}: {error}", path.display())),
+            Err(error) => reasons.push(format!("{build}: {}: {error}", library.path.display())),
         }
     }
     Err(LaunchError::Resolve {
@@ -155,12 +194,10 @@ mod tests {
     use super::*;
 
     const X64: Resolution = Resolution {
-        arch: Some("x86_x64"),
         view: RegistryViewMode::Native,
         abi: Some(Abi::WinX64),
     };
     const X86: Resolution = Resolution {
-        arch: Some("x86"),
         view: RegistryViewMode::Native,
         abi: Some(Abi::WinX86),
     };
@@ -174,68 +211,109 @@ mod tests {
         }
     }
 
-    /// Resolves to `paths[arch]`, or not at all.
-    fn lookup_in(
-        paths: &'static [(&'static str, &'static str)],
-    ) -> impl Fn(&str, &Resolution) -> Result<PathBuf, RegistryError> {
-        move |vci, resolution| {
-            paths
-                .iter()
-                .find(|(arch, _)| Some(*arch) == resolution.arch)
-                .map(|(_, path)| PathBuf::from(path))
-                .ok_or_else(|| RegistryError::NotFound(vci.to_owned()))
+    fn library(path: &str) -> Library {
+        Library {
+            path: PathBuf::from(path),
+            long_size: None,
         }
     }
 
-    /// Each build must read what that worker build reads: its `current_arch` key and, for the
-    /// x86 build, the 32-bit view a WOW64 process sees as its own.
+    /// Resolves to the path listed for the build's ABI, or not at all.
+    fn lookup_in(
+        paths: &'static [(Option<Abi>, &'static str)],
+    ) -> impl Fn(&str, &Resolution) -> Result<Library, ResolveError> {
+        move |vci, resolution| {
+            paths
+                .iter()
+                .find(|(abi, _)| *abi == resolution.abi)
+                .map(|(_, path)| library(path))
+                .ok_or_else(|| ResolveError::NotFound {
+                    name: vci.to_owned(),
+                    skipped_invalid: 0,
+                })
+        }
+    }
+
+    /// Each build must read what that worker build reads: for the x86 build, the 32-bit view a
+    /// WOW64 process sees as its own.
     #[cfg(all(windows, target_arch = "x86_64"))]
     #[test]
     fn windows_x64_agent_reads_both_builds_explicitly() {
-        let table: Vec<_> = RESOLUTIONS
-            .iter()
-            .map(|r| (r.arch, r.view, r.abi))
-            .collect();
+        let table: Vec<_> = RESOLUTIONS.iter().map(|r| (r.view, r.abi)).collect();
         assert_eq!(
             table,
             [
-                (Some("x86_x64"), RegistryViewMode::W64, Some(Abi::WinX64)),
-                (Some("x86"), RegistryViewMode::W32, Some(Abi::WinX86)),
+                (RegistryViewMode::W64, Some(Abi::WinX64)),
+                (RegistryViewMode::W32, Some(Abi::WinX86)),
             ]
         );
     }
 
     #[test]
     fn takes_the_build_that_finds_a_library_of_its_own_abi() {
-        let found = resolve("v", &[X64, X86], lookup_in(&[("x86", "x86.dll")]), detect);
-        assert_eq!(found.unwrap(), (PathBuf::from("x86.dll"), Abi::WinX86));
+        let found = resolve(
+            "v",
+            &[X64, X86],
+            lookup_in(&[(Some(Abi::WinX86), "x86.dll")]),
+            detect,
+        );
+        assert_eq!(found.unwrap(), (library("x86.dll"), Abi::WinX86));
     }
 
     #[test]
     fn prefers_the_first_build_when_both_match() {
-        let paths = &[("x86", "x86.dll"), ("x86_x64", "x64.dll")];
+        let paths = &[
+            (Some(Abi::WinX86), "x86.dll"),
+            (Some(Abi::WinX64), "x64.dll"),
+        ];
         let found = resolve("v", &[X64, X86], lookup_in(paths), detect);
-        assert_eq!(found.unwrap(), (PathBuf::from("x64.dll"), Abi::WinX64));
+        assert_eq!(found.unwrap(), (library("x64.dll"), Abi::WinX64));
     }
 
     #[test]
     fn skips_a_build_whose_library_has_another_abi() {
         // Both builds would load the 32-bit library: only the x86 build can.
-        let paths = &[("x86", "x86.dll"), ("x86_x64", "x86.dll")];
+        let paths = &[
+            (Some(Abi::WinX86), "x86.dll"),
+            (Some(Abi::WinX64), "x86.dll"),
+        ];
         let found = resolve("v", &[X64, X86], lookup_in(paths), detect);
-        assert_eq!(found.unwrap(), (PathBuf::from("x86.dll"), Abi::WinX86));
+        assert_eq!(found.unwrap(), (library("x86.dll"), Abi::WinX86));
     }
 
     #[test]
     fn any_abi_matches_a_build_without_one() {
         let any = Resolution { abi: None, ..X86 };
-        let found = resolve("v", &[any], lookup_in(&[("x86", "x64.dll")]), detect);
-        assert_eq!(found.unwrap(), (PathBuf::from("x64.dll"), Abi::WinX64));
+        let found = resolve("v", &[any], lookup_in(&[(None, "x64.dll")]), detect);
+        assert_eq!(found.unwrap(), (library("x64.dll"), Abi::WinX64));
+    }
+
+    #[test]
+    fn a_declared_long_size_overrides_the_abi_default() {
+        assert_eq!(long_size("v", Abi::LinuxX86_64, None).unwrap(), 8);
+        assert_eq!(long_size("v", Abi::LinuxX86_64, Some(4)).unwrap(), 4);
+        assert_eq!(long_size("v", Abi::LinuxX86_64, Some(8)).unwrap(), 8);
+        assert_eq!(long_size("v", Abi::LinuxArmhf, None).unwrap(), 4);
+        assert_eq!(long_size("v", Abi::LinuxArmhf, Some(4)).unwrap(), 4);
+    }
+
+    #[test]
+    fn eight_bytes_is_refused_where_unsigned_long_is_32_bits() {
+        for abi in [Abi::LinuxX86, Abi::LinuxArmhf, Abi::WinX86, Abi::WinX64] {
+            let error = long_size("v", abi, Some(8)).unwrap_err();
+            assert!(
+                matches!(error, LaunchError::UnsupportedLongSize { long_size: 8, .. }),
+                "{abi:?}: {error}"
+            );
+        }
     }
 
     #[test]
     fn reports_every_build_when_none_matches() {
-        let paths = &[("x86", "x64.dll"), ("x86_x64", "bad.dll")];
+        let paths = &[
+            (Some(Abi::WinX86), "x64.dll"),
+            (Some(Abi::WinX64), "bad.dll"),
+        ];
         let error = resolve("v", &[X64, X86], lookup_in(paths), detect)
             .unwrap_err()
             .to_string();

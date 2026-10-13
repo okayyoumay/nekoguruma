@@ -1,4 +1,4 @@
-// Relies on the debug-only runtime VCI_CONFIG_PATH override; see ADR-073.
+// Relies on the debug-only NGR_J2534_DEFINITION_DIR override; see ADR-282.
 #![cfg(debug_assertions)]
 //! End to end without hardware (design 13.4): `worker-host` launches the real
 //! `j2534-0404-service` binary against the `sim-vci` cdylib, with the
@@ -19,8 +19,9 @@
 //! (the ABI name the library must have, so a wrong build fails the test). A service binary
 //! named there must have the library's ABI too.
 //!
-//! This file holds a single test, so the process-wide `VCI_CONFIG_PATH` it
-//! sets for the spawned service cannot race with another test.
+//! This file holds a single test, so the process-wide `VCI_CONFIG_PATH` and
+//! `NGR_J2534_DEFINITION_DIR` it sets for the spawned service cannot race with
+//! another test.
 
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -210,16 +211,9 @@ async fn read_the_vin() {
     );
     let config_path = std::env::temp_dir().join(format!("j2534-0404-service-{nanos}-sim-vci.toml"));
     let config = TempFile(config_path.clone());
-    std::fs::write(
-        &config_path,
-        format!(
-            "[config.apis.j2534-0404.libs.{LIBRARY_NAME:?}]\nlibrary_path = {:?}\n",
-            library.display().to_string()
-        ),
-    )
-    .expect("test config file should be writable");
-    // Also names the library through a registration definition (ADR-282), so the switch to
-    // `ngr-library-resolver` needs no test changes.
+    std::fs::write(&config_path, "").expect("test config file should be writable");
+    // The registration definition names the library, through the debug-only
+    // `NGR_J2534_DEFINITION_DIR` override (ADR-282).
     let definition_dir =
         std::env::temp_dir().join(format!("j2534-0404-service-{nanos}-sim-vci-definitions"));
     let _ = std::fs::remove_dir_all(&definition_dir);

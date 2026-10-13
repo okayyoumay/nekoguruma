@@ -197,16 +197,9 @@ fn agent_job_downloads_more_blocks_than_the_counter_holds() {
     let journal_dir = std::env::temp_dir().join(format!("agent-flash-{nanos}-journal"));
     std::fs::create_dir_all(&journal_dir).expect("journal directory");
     let _journal = TempDir(journal_dir.clone());
-    std::fs::write(
-        &config_path,
-        format!(
-            "[config.apis.j2534-0404.libs.{LIBRARY_NAME:?}]\nlibrary_path = {:?}\n",
-            sim_vci_path().display().to_string()
-        ),
-    )
-    .expect("test config file should be writable");
-    // Also names the library through a registration definition (ADR-282), so the switch to
-    // `ngr-library-resolver` needs no test changes.
+    std::fs::write(&config_path, "").expect("test config file should be writable");
+    // The registration definition names the library, through the debug-only
+    // `NGR_J2534_DEFINITION_DIR` override (ADR-282).
     let definition_dir = std::env::temp_dir().join(format!("agent-flash-{nanos}-definitions"));
     std::fs::create_dir_all(&definition_dir).expect("definition directory");
     let _definitions = TempDir(definition_dir.clone());

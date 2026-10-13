@@ -23,8 +23,9 @@ state as JSON on stdout.
 
 options:
   --vci <name>         J2534 library name the worker service resolves
-  --mode <device|user> the device's operating mode, passed to the worker, which records it;
-                       library loading does not consult it
+  --mode <device|user> the device's operating mode, passed to the worker: device mode
+                       refuses a library that fails the pre-load checks, user mode
+                       reports the findings and loads it
   --program <file>     IR program file (JSON)
   --workers <dir>      worker binaries, laid out as <dir>/<ABI name>/<binary>
                        (default: the 'workers' directory next to ngr-agent)

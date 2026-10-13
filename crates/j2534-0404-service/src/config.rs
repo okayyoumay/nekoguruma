@@ -11,7 +11,7 @@ pub struct StartupConfig {
     pub(crate) library_name: String,
     pub(crate) requested_port: Option<u16>,
     /// The device's operating mode, passed by the agent (ADR-281 Decision item 2). Design 7.2
-    /// gives it its meaning for a failed library check; library loading does not consult it.
+    /// gives it its meaning for a failed library check, which `crate::preload` applies.
     pub(crate) mode: OperatingMode,
 }
 
@@ -66,6 +66,19 @@ pub(crate) fn resolve_modules(
     build_module_entries(configured)
 }
 
+/// The module list when no `modules` are configured: the single synthetic
+/// entry [`resolve_modules`] returns for an absent `modules` key.
+pub(crate) fn default_modules() -> Vec<ModuleEntry> {
+    vec![default_module_entry()]
+}
+
+fn default_module_entry() -> ModuleEntry {
+    ModuleEntry {
+        label: "j2534-0404".to_string(),
+        pname: None,
+    }
+}
+
 /// Pure validation/conversion core of [`resolve_modules`], factored out so
 /// unit tests can exercise it directly against hand-built
 /// `vci_service_config::ModuleConfigEntry` values instead of round-tripping
@@ -74,10 +87,7 @@ fn build_module_entries(
     configured: Option<Vec<vci_service_launcher::config::ModuleConfigEntry>>,
 ) -> Result<Vec<ModuleEntry>, io::Error> {
     match configured {
-        None => Ok(vec![ModuleEntry {
-            label: "j2534-0404".to_string(),
-            pname: None,
-        }]),
+        None => Ok(default_modules()),
         Some(entries) if entries.is_empty() => Err(invalid_input(
             "config.apis.j2534-0404....modules is present but empty; add at least one \
              [[...modules]] entry, or omit the key entirely for the default single-module \

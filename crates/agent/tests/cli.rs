@@ -144,28 +144,32 @@ fn a_write_is_refused_before_resolving_the_vci_in_a_release_build() {
     assert_fails_with(output, "refused");
 }
 
-// The tests below point the agent at a test config through the debug-only VCI_CONFIG_PATH
-// override (ADR-073).
+// The tests below point the agent at a test registration-definition directory through the
+// debug-only NGR_J2534_DEFINITION_DIR override (ADR-282), which replaces the Linux definition
+// directory and the Windows registry alike.
 
+/// A definition directory that names `library` as the VCI `test-vci`, or names nothing.
 #[cfg(debug_assertions)]
-fn write_config(dir: &Path, library_path: Option<&Path>) -> PathBuf {
-    let path = dir.join("config.toml");
-    let text = match library_path {
-        Some(library) => format!(
-            "[config.apis.j2534-0404.libs.\"test-vci\"]\nlibrary_path = {:?}\n",
+fn write_definitions(dir: &Path, library: Option<&Path>) -> PathBuf {
+    let definitions = dir.join("definitions");
+    std::fs::create_dir_all(&definitions).expect("definition directory should be writable");
+    if let Some(library) = library {
+        let library = std::path::absolute(library).expect("library path should be absolute");
+        let text = format!(
+            "Name = \"test-vci\"\nFunctionLibrary = {:?}\n",
             library.display().to_string()
-        ),
-        None => String::new(),
-    };
-    std::fs::write(&path, text).expect("test config file should be writable");
-    path
+        );
+        std::fs::write(definitions.join("test-vci.toml"), text)
+            .expect("definition file should be writable");
+    }
+    definitions
 }
 
 #[cfg(debug_assertions)]
 #[test]
 fn unknown_vci_exits_with_1() {
     let temp = TempDir::new("unknown-vci");
-    let config = write_config(&temp.0, None);
+    let definitions = write_definitions(&temp.0, None);
     let output = ngr_agent()
         .args(["run", "--vci", "test-vci", "--mode", "user", "--program"])
         .arg(read_vin(&temp.0))
@@ -173,7 +177,7 @@ fn unknown_vci_exits_with_1() {
         .arg(&temp.0)
         .arg("--locks")
         .arg(temp.0.join("locks"))
-        .env("VCI_CONFIG_PATH", config)
+        .env("NGR_J2534_DEFINITION_DIR", &definitions)
         .output()
         .expect("ngr-agent should run");
     assert_fails_with(output, "cannot resolve the library of VCI \"test-vci\"");
@@ -184,7 +188,7 @@ fn unknown_vci_exits_with_1() {
 fn missing_worker_build_exits_with_1() {
     let temp = TempDir::new("no-worker");
     // Any library header does: the agent's own executable stands in for the VCI library.
-    let config = write_config(&temp.0, Some(Path::new(env!("CARGO_BIN_EXE_ngr-agent"))));
+    let definitions = write_definitions(&temp.0, Some(Path::new(env!("CARGO_BIN_EXE_ngr-agent"))));
     let output = ngr_agent()
         .args(["run", "--vci", "test-vci", "--mode", "user", "--program"])
         .arg(read_vin(&temp.0))
@@ -192,10 +196,72 @@ fn missing_worker_build_exits_with_1() {
         .arg(temp.0.join("empty"))
         .arg("--locks")
         .arg(temp.0.join("locks"))
-        .env("VCI_CONFIG_PATH", config)
+        .env("NGR_J2534_DEFINITION_DIR", &definitions)
         .output()
         .expect("ngr-agent should run");
     assert_fails_with(output, "no worker bundled for ABI");
+}
+
+/// Installs, for the agent's own ABI, a stand-in worker that records the `NGR_J2534_LONG_SIZE`
+/// it was started with in `<workers>/long_size` and exits, and runs the agent against a VCI whose
+/// definition carries `extra` (the agent's executable stands in for the library). Returns what
+/// the stand-in recorded.
+#[cfg(all(debug_assertions, unix))]
+fn long_size_passed_to_the_worker(name: &str, extra: &str) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = TempDir::new(name);
+    let agent = Path::new(env!("CARGO_BIN_EXE_ngr-agent"));
+    let definitions = write_definitions(&temp.0, Some(agent));
+    let file = definitions.join("test-vci.toml");
+    let text = std::fs::read_to_string(&file).expect("definition file should be readable");
+    std::fs::write(&file, format!("{text}{extra}")).expect("definition file should be writable");
+    let abi = worker_host::abi::detect_file(agent).expect("the agent's header should be readable");
+    let workers = temp.0.join("workers");
+    let dir = workers.join(abi.name());
+    std::fs::create_dir_all(&dir).expect("workers directory should be writable");
+    let record = workers.join("long_size");
+    let worker = dir.join("j2534-0404-service");
+    std::fs::write(
+        &worker,
+        format!(
+            "#!/bin/sh\nprintf '%s' \"${{NGR_J2534_LONG_SIZE-unset}}\" > '{}'\nexit 1\n",
+            record.display()
+        ),
+    )
+    .expect("stand-in worker should be writable");
+    std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o755))
+        .expect("stand-in worker should be executable");
+    let output = ngr_agent()
+        .args(["run", "--vci", "test-vci", "--mode", "user", "--program"])
+        .arg(read_vin(&temp.0))
+        .arg("--workers")
+        .arg(&workers)
+        .arg("--locks")
+        .arg(temp.0.join("locks"))
+        .env("NGR_J2534_DEFINITION_DIR", &definitions)
+        .output()
+        .expect("ngr-agent should run");
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    std::fs::read_to_string(&record)
+        .unwrap_or_else(|error| panic!("the stand-in worker should have run ({error}): {output:?}"))
+}
+
+/// A definition's `LongSize` reaches the worker even where it differs from the ABI's default
+/// (7.1.1, 7.1.2). The host's default is 8, so 4 is the non-default width.
+#[cfg(all(debug_assertions, unix, target_pointer_width = "64"))]
+#[test]
+fn the_definition_long_size_reaches_the_worker() {
+    assert_eq!(
+        long_size_passed_to_the_worker("long-size-4", "LongSize = 4\n"),
+        "4"
+    );
+}
+
+/// Without a `LongSize`, the worker gets the ABI's default.
+#[cfg(all(debug_assertions, unix, target_pointer_width = "64"))]
+#[test]
+fn without_long_size_the_worker_gets_the_abi_default() {
+    assert_eq!(long_size_passed_to_the_worker("long-size-default", ""), "8");
 }
 
 /// `ngr-agent run` takes the per-VCI lock before it resolves the VCI, and waits while another
@@ -209,7 +275,7 @@ fn a_run_waits_for_the_vci_lock() {
     use agent::guards::{GuardSetup, JobGuards};
 
     let temp = TempDir::new("vci-lock");
-    let config = write_config(&temp.0, None);
+    let definitions = write_definitions(&temp.0, None);
     let locks = temp.0.join("locks");
     let held = JobGuards::take_vci_only(
         &GuardSetup {
@@ -227,7 +293,7 @@ fn a_run_waits_for_the_vci_lock() {
         .arg(&temp.0)
         .arg("--locks")
         .arg(&locks)
-        .env("VCI_CONFIG_PATH", config)
+        .env("NGR_J2534_DEFINITION_DIR", &definitions)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -238,7 +304,7 @@ fn a_run_waits_for_the_vci_lock() {
         "the run waits for the VCI lock"
     );
     drop(held);
-    // With the lock free, the run goes on and fails at the VCI, which the config does not name.
+    // With the lock free, the run goes on and fails at the VCI, which no definition names.
     let output = child.wait_with_output().expect("ngr-agent should end");
     assert_fails_with(output, "cannot resolve the library of VCI \"test-vci\"");
 }
@@ -254,7 +320,7 @@ fn a_writing_run_waits_for_the_reprogramming_slot() {
     use agent::guards::{GuardSetup, JobGuards};
 
     let temp = TempDir::new("slot");
-    let config = write_config(&temp.0, None);
+    let definitions = write_definitions(&temp.0, None);
     let locks = temp.0.join("locks");
     let held = JobGuards::take(
         &GuardSetup {
@@ -277,7 +343,7 @@ fn a_writing_run_waits_for_the_reprogramming_slot() {
         .arg(&temp.0)
         .arg("--locks")
         .arg(&locks)
-        .env("VCI_CONFIG_PATH", config)
+        .env("NGR_J2534_DEFINITION_DIR", &definitions)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -288,7 +354,7 @@ fn a_writing_run_waits_for_the_reprogramming_slot() {
         "the run waits for the reprogramming slot"
     );
     drop(held);
-    // With the slot free, the run goes on and fails at the VCI, which the config does not name.
+    // With the slot free, the run goes on and fails at the VCI, which no definition names.
     let output = child.wait_with_output().expect("ngr-agent should end");
     assert_fails_with(output, "cannot resolve the library of VCI \"test-vci\"");
 }

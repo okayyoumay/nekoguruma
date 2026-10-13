@@ -1,7 +1,7 @@
 # ADR-240: Agent Worker-Build Selection by Per-Build Library Resolution
 
 **Date:** 2026-10-07
-**Status:** Accepted (the architecture key of the `config.toml` lookup superseded by ADR-281; the per-build registry view stays)
+**Status:** Accepted (the `config.toml` lookup, with its architecture key, superseded by ADR-281; the per-build registry view stays; Decision item 4 superseded by ADR-284)
 **Affects:** `crates/agent/src/launch.rs`, `crates/agent/src/main.rs` (`ngr-agent run`), `crates/agent/docs/ngr-agent.md`, design 7.3
 
 ## Context

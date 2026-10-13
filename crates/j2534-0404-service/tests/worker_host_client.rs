@@ -29,16 +29,9 @@ async fn worker_host_client_authenticates_with_minted_tokens() {
         .as_nanos();
     let config_path =
         std::env::temp_dir().join(format!("j2534-0404-service-{nanos}-worker-host.toml"));
-    std::fs::write(
-        &config_path,
-        format!(
-            "[config.apis.j2534-0404.libs.{TEST_LIBRARY_NAME:?}]\nlibrary_path = {:?}\n",
-            mock_library.display().to_string()
-        ),
-    )
-    .expect("test config file should be writable");
-    // Also names the library through a registration definition (ADR-282), so the switch to
-    // `ngr-library-resolver` needs no test changes.
+    std::fs::write(&config_path, "").expect("test config file should be writable");
+    // The registration definition names the library, through the debug-only
+    // `NGR_J2534_DEFINITION_DIR` override (ADR-282).
     let definition_dir = std::env::temp_dir().join(format!(
         "j2534-0404-service-{nanos}-worker-host-definitions"
     ));

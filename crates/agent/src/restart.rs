@@ -968,9 +968,14 @@ pub(crate) fn completed_pass_interrupted(facts: &RecoveryFacts) -> bool {
 /// The restart's teardown (ADR-229 item 2 step 2b-1, ADR-264), run on the gates' decision `gate`.
 /// In this order:
 /// - the journal's exclusions, which apply on top of a `ResetAllowed` gate: post-transfer steps
-///   journaled complete (the completed path) send nothing and wait for nothing
-///   ([`Teardown::CompletedPath`]); a RequestTransferExit intent without that completion makes
-///   the teardown passive ([`PassiveCause::TransferExitJournaled`]);
+///   journaled complete for the interrupted pass (the completed path, by the rule of
+///   [`completed_pass_interrupted`] that the state check applies, ADR-269 item 2) send nothing
+///   and wait for nothing ([`Teardown::CompletedPath`]); a RequestTransferExit intent without the
+///   completion makes the teardown passive ([`PassiveCause::TransferExitJournaled`]). A
+///   completion journaled for an earlier pass, which a step back into the plan or the replay of
+///   a redone transfer (ADR-273) has left behind, is neither: that pass's RequestTransferExit
+///   was answered and its post-transfer steps finished, so the gate decides as if no
+///   RequestTransferExit had been journaled;
 /// - a `PassiveOnly` gate makes it passive ([`PassiveCause::Gate`]);
 /// - otherwise an ECUReset (hardReset, positive response required) is sent. A positive response
 ///   ends in [`Teardown::Reset`] with no wait. A negative response, a failed or unanswered
@@ -1004,9 +1009,9 @@ where
         .transfer
         .as_ref()
         .and_then(|transfer| transfer.exit.as_ref());
-    let cause = if exit.is_some_and(|exit| exit.complete) {
+    let cause = if completed_pass_interrupted(&point.facts) {
         return Ok(Teardown::CompletedPath);
-    } else if exit.is_some() {
+    } else if exit.is_some_and(|exit| !exit.complete) {
         PassiveCause::TransferExitJournaled
     } else if let TeardownGate::PassiveOnly(reason) = gate {
         PassiveCause::Gate(reason)
@@ -2656,6 +2661,40 @@ mod tests {
         canceller.join().unwrap();
         // Still waiting when cancelled: the wait was not computed as zero or wrapped short.
         assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
+    }
+
+    /// A completion an earlier pass left behind, with the interruption in a later pass, is not
+    /// the completed path (ADR-269 item 2): a gate that did not pass makes the teardown passive,
+    /// and it waits.
+    #[test]
+    fn an_earlier_passs_completion_leaves_the_teardown_to_the_gate() {
+        let (_, mut point) = point_at(EXIT);
+        let exit = point
+            .facts
+            .transfer
+            .as_mut()
+            .and_then(|transfer| transfer.exit.as_mut())
+            .expect("the exit intent");
+        exit.complete = true;
+        let completed_at = exit.last_post_step.unwrap_or(exit.intent_at);
+        // A step of the later pass, after the completion.
+        point.facts.last_step = Some(StepRef {
+            pc: 0,
+            steps: completed_at.steps + 1,
+        });
+        assert!(!completed_pass_interrupted(&point.facts));
+        let mut host = ecu_in_session();
+        let (result, elapsed) = run_teardown(
+            TeardownGate::PassiveOnly(PassiveReason::VinNotEstablished),
+            &point,
+            &mut host,
+        );
+        assert_eq!(
+            result.unwrap(),
+            Teardown::Passive(PassiveCause::Gate(PassiveReason::VinNotEstablished))
+        );
+        assert_eq!(host.0.power_cycles(), 0);
+        assert!(elapsed >= Duration::from_millis(20), "{elapsed:?}");
     }
 
     #[test]

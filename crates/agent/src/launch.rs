@@ -62,7 +62,7 @@ const RESOLUTIONS: &[Resolution] = &[Resolution {
     abi: Some(Abi::WinX86),
 }];
 
-// `vci_service_launcher::vci_server::current_arch` knows no other Windows architecture.
+// No j2534-0404 worker is built for any other Windows architecture.
 #[cfg(all(windows, not(any(target_arch = "x86_64", target_arch = "x86"))))]
 compile_error!("no j2534-0404 worker build is defined for this Windows architecture");
 
@@ -82,8 +82,8 @@ pub struct LaunchedWorker {
 /// Launches the j2534-0404 worker that matches the ABI of `vci`'s library in the device's
 /// operating `mode` and connects a client to it.
 ///
-/// `options.long_size` is filled with the ABI's default (7.1.2) when it is `None`; the Linux
-/// registration definition that could override it (7.1.1) is not read.
+/// `options.long_size` is filled with the ABI's default (7.1.2) when it is `None`; the `LongSize`
+/// of the registration definition the lookup resolves (7.1.1) is not used.
 pub async fn launch_j2534_worker(
     vci: &str,
     mode: OperatingMode,

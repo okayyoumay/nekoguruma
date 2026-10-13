@@ -93,12 +93,14 @@ The worker's own log goes to stderr.
 
 ## Configuration file
 
-The agent and the worker read the same `config.toml` only if both binaries were built with the
-same configuration root (`vci-service-config`'s `config-root-*` features). The default roots
-agree. With `config-root-exe-dir`, the worker reads the file next to its own build under
-`--workers`; with `config-root-win-program-files`, a 32-bit worker sees `Program Files (x86)`.
-In both cases the agent can resolve a different library than the worker loads; build the
-agent and the workers with the same root.
+The agent and the worker find the library without `config.toml`, from the registry on Windows
+and the registration definition directory on Linux (design 7.1.1), so the configuration root
+(`vci-service-config`'s `config-root-*` features) does not change which library either one
+resolves. The definition directory is fixed at build time (`NGR_J2534_DEFINITION_DIR` when
+building, ADR-228); build the agent and the workers with the same one, or the agent can detect
+the ABI of a different library than the worker loads. The worker's per-library settings still
+come from its own `config.toml`, which with `config-root-exe-dir` is the file next to its build
+under `--workers`.
 
 ## Write-job journal
 

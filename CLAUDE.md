@@ -160,7 +160,12 @@ for a worker target (Linux ARM under qemu-user, Windows on a Windows runner) wit
 four Linux targets, runs the release builds (cargo-zigbuild for Linux, llvm-mingw for the
 `*-pc-windows-gnullvm` Windows targets, all on Linux), and launches the Windows debug builds that
 `worker-windows` cross-compiles (`abi-roundtrip-windows`), where it also checks that the release
-binaries import only DLLs that Windows itself provides (ADR-283). On pull requests that change only documentation, `work/` or `.claude/`, the
+binaries import only DLLs that Windows itself provides (ADR-283). main also runs the agent's
+tests in a release build (`agent-release`, `cargo test -p agent --release`), since ADR-247's
+read-only release agent rests on code that only a release build compiles; pull requests skip it
+to save a release build of the agent's dependencies, so a release-only failure shows on main.
+Check it locally with `RUSTFLAGS="-D warnings" cargo test -p agent --release --locked` when you
+change `cfg(not(debug_assertions))` code. On pull requests that change only documentation, `work/` or `.claude/`, the
 `changes` job in `ci.yml` skips the build jobs, which then count as passed required checks;
 `repo-checks.yml` always runs. CodeQL (`codeql.yml`, ADR-283) skips the same changes. Do not run cross-target builds locally unless asked; CI covers
 them.

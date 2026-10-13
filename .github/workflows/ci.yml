@@ -176,6 +176,22 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo check --workspace --all-targets --locked
 
+  # The agent in release: ADR-247's guarantee (a release agent stays read-only and has no
+  # simulator permission) rests on `cfg(not(debug_assertions))` code that the debug test jobs
+  # never compile. Run on main only, like the other release builds: a release build of the
+  # agent's dependency tree on every pull request costs more than catching a release-only
+  # regression right after it merges.
+  agent-release:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p agent --release --locked
+
   # Linux targets: linked against glibc 2.17 through cargo-zigbuild's target suffix (ADR-232).
   worker-linux:
     if: github.event_name != 'pull_request'

@@ -56,7 +56,7 @@ Execution rules:
   ```sh
   cargo fmt --all -- --check
   cargo clippy --workspace --all-targets --locked
-  cargo test --workspace --locked --exclude sim-vci
+  cargo test --workspace --locked
   scripts/check-work-refs.sh
   scripts/check-adr-index.sh
   scripts/check-backlog.sh

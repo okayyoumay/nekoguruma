@@ -92,7 +92,8 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@nextest
       - run: cargo fmt --all -- --check
-      - run: cargo nextest run --workspace --locked --exclude sim-vci --profile ci
+      - run: cargo nextest run --workspace --locked --profile ci
+      # sim-vci is a cdylib only, which cargo runs no doc tests for.
       - run: cargo test --workspace --locked --exclude sim-vci --doc
 
   # Windows: some timing-sensitive worker-crate tests fail there when run in parallel, so the
@@ -116,9 +117,10 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@nextest
       - shell: bash
-        run: cargo nextest run --workspace --locked --exclude sim-vci $EXCLUDE --profile ci-windows-parallel -E 'package(agent)'
+        run: cargo nextest run --workspace --locked $EXCLUDE --profile ci-windows-parallel -E 'package(agent)'
       - shell: bash
-        run: cargo nextest run --workspace --locked --exclude sim-vci $EXCLUDE --profile ci-windows -E 'not package(agent)'
+        run: cargo nextest run --workspace --locked $EXCLUDE --profile ci-windows -E 'not package(agent)'
+      # sim-vci is a cdylib only, which cargo runs no doc tests for.
       - shell: bash
         run: cargo test --workspace --locked --exclude sim-vci $EXCLUDE --doc
 

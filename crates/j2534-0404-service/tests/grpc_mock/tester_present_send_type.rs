@@ -4932,14 +4932,14 @@ async fn kline_five_baud_init_does_not_force_fire_mode_1_sibling() {
     let mut client = server.client().await;
 
     // cll_a: mode-1 (idle-triggered), armed first with a 1500ms interval.
-    // The final count runs after the 75ms sleep and three client round
-    // trips (cll_b's StartComm, its PduCopstFinished, the 5-baud init
-    // count), so the interval must outlast all of them with the per-round-
-    // trip margin of ADR-149: with 300ms a slow runner let cll_a's own idle
-    // send fall due before the count and read as a forced fire. A forced
-    // fire would happen at once, whatever the interval, so the longer
-    // interval does not hide it. CP_InitializationSettings = 3 skips cll_a's
-    // own init sequence.
+    // The final count runs after the 75ms sleep, cll_b's StartComm request,
+    // the delivery of cll_b's PduCopstFinished on its event stream and a
+    // local read of the mock's 5-baud init count, so the interval must
+    // outlast all of them with the margin of ADR-149: with 300ms a slow
+    // runner let cll_a's own idle send fall due before the count and read
+    // as a forced fire. A forced fire would happen at once, whatever the
+    // interval, so the longer interval does not hide it.
+    // CP_InitializationSettings = 3 skips cll_a's own init sequence.
     let cll_a = create_cll(&mut client, j2534_0404::ISO9141, 1).await;
     set_com_param_unum32(&mut client, cll_a, j2534_0404::DATA_RATE, 9_600).await;
     set_com_param_unum32(&mut client, cll_a, CP_INIT_SETTINGS, 3).await;

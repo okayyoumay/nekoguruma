@@ -78,7 +78,7 @@ Shared-state cause:
 
 Timing-margin cause found later (ADR-149):
 
-7. **A window sized for a fast runner.** `tester_present_send_type.rs::kline_five_baud_init_does_not_force_fire_mode_1_sibling` arms cll_a in mode 1 with a 300 ms interval, sleeps 75 ms, then does three client round trips (cll_b's StartComm, its PduCopstFinished, the 5-baud init count) before asserting exactly one written frame. A slow Windows runner, running one test at a time, took longer than the rest of the window, so cll_a's own idle send fell due and the count read 2. Adding a 400 ms delay before the count reproduces the failure every time. The interval is now 1500 ms, about five times the window: the forced fire the test guards against would happen at once, so the longer interval does not hide it.
+7. **A window sized for a fast runner.** `tester_present_send_type.rs::kline_five_baud_init_does_not_force_fire_mode_1_sibling` arms cll_a in mode 1 with a 300 ms interval, sleeps 75 ms, then sends cll_b's StartComm request, waits for cll_b's PduCopstFinished on its event stream and reads the mock's 5-baud init count before asserting exactly one written frame. A slow Windows runner, running one test at a time, took longer than the rest of the window, so cll_a's own idle send fell due and the count read 2. Adding a 400 ms delay before the count reproduces the failure every time. The interval is now 1500 ms, about five times the window: the forced fire the test guards against would happen at once, so the longer interval does not hide it.
 
 ## SAE J2534-2 Discovery Mechanism (ADR-153, Phase 1)
 

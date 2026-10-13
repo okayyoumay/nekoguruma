@@ -1,8 +1,9 @@
 name: CodeQL
 
 # CodeQL code scanning (ADR-283). This workflow replaces GitHub's default setup, which analyses
-# every pull request commit, so that commits touching only documentation, `work/` or `.claude/`
-# (the paths ci.yml skips) are not analysed. Default setup must stay disabled in the repository's
+# every pull request commit, so that pull requests whose whole diff touches only documentation,
+# `work/` or `.claude/` (the paths ci.yml skips, judged the same way) are not analysed; a later
+# documentation-only commit to a pull request that changes code is still analysed. Default setup must stay disabled in the repository's
 # code security settings: GitHub rejects this workflow's results while it is enabled.
 # The workflow keeps default setup's name, languages, query suite and per-language categories, so
 # existing alerts carry over and codeql-alert-handoff.yml (which follows the "CodeQL" workflow)

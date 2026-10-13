@@ -10,9 +10,9 @@ A review of the Actions run times from 2026-10-08 to 2026-10-13 found two costs 
 layout itself caused.
 
 CodeQL ran as GitHub's default setup, which analyses every commit pushed to a pull request
-whatever it changes. About 30% of those analyses (about six minutes each) were of commits that
-changed only documentation, `work/` or `.claude/`, the paths `ci.yml` already skips. Default
-setup has no path filter.
+whatever it changes. About 30% of those analyses (about six minutes each) were of pull requests
+whose whole diff touched only documentation, `work/` or `.claude/`, the pull requests whose build
+jobs `ci.yml` already skips. Default setup has no path filter.
 
 The release builds of the Windows workers were checked for the DLLs they import by matching
 each name against a fixed list of Windows system DLLs, in `worker-windows`, which runs on `main`
@@ -29,8 +29,10 @@ exists to catch a DLL that only the llvm-mingw toolchain ships (such as `libunwi
    results while default setup is on). The workflow keeps what default setup did: the name
    `CodeQL`, the `actions` and `rust` languages with no build, the default query suite, one
    analysis per language with the category `/language:<language>` (so existing alerts carry
-   over), pushes to `main`, pull requests and a weekly run. It leaves out commits that change
-   only Markdown files, `docs/`, `work/` or `.claude/`, both on pull requests and on `main`.
+   over), pushes to `main`, pull requests and a weekly run. It leaves out pull requests whose
+   whole diff against the base touches only Markdown files, `docs/`, `work/` or `.claude/` (as
+   `ci.yml` judges them), and pushes to `main` that touch only those paths. A documentation-only
+   commit added to a pull request that also changes code is still analysed.
    CodeQL is not a required check, so a pull request may skip the whole workflow.
 2. **The hand-off follows the workflow.** `codeql-alert-handoff.yml` still runs when a workflow
    named `CodeQL` finishes on `main`; ADR-243 Decision item 4's trigger now refers to this
@@ -47,8 +49,8 @@ exists to catch a DLL that only the llvm-mingw toolchain ships (such as `libunwi
 ## Consequences
 
 - Documentation-only pull requests no longer start CodeQL, which would have saved about 130
-  runner minutes a day in the period measured. A commit that changes only Markdown inside a crate is not
-  analysed either; CodeQL does not analyse Markdown, so nothing is lost.
+  runner minutes a day in the period measured. A change to Markdown alone inside a crate is not analysed
+  either; CodeQL does not analyse Markdown, so nothing is lost.
 - The repository now owns the CodeQL configuration: a new language, query suite or schedule is a
   change to `codeql.yml`, and the action version is kept current by Dependabot's Actions group.
 - The runner's Windows is Windows Server, which carries a few DLLs a desktop Windows lacks. A

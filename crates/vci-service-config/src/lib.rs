@@ -856,8 +856,8 @@ pub fn find_vendor_struct_type_size(
 /// or parsed is propagated as `Err` here rather than treated as "nothing to
 /// validate": `find_library_path`'s own lenient load means a broken config
 /// file does NOT reliably fail startup elsewhere on its own, since
-/// `resolve_library_path` can fall back to platform auto-discovery (e.g.
-/// RDF) when it sees `None` for exactly the same reason a broken document
+/// a lookup that sees `None` falls back to platform auto-discovery (e.g.
+/// RDF) for exactly the same reason a broken document
 /// would produce `None` here -- so treating a broken file as "nothing
 /// configured" would let a malformed `vendor_struct_types` table (unreadable
 /// due to the very same broken document) pass validation silently while

@@ -15,7 +15,7 @@
 # (ARM targets under qemu-user, with the target's libraries from the cross
 # sysroot); a Windows target runs on a Windows host under Git Bash (win-x86
 # under WOW64). Both crates must be built for the target in the debug profile,
-# which keeps the VCI_CONFIG_PATH override the test uses (ADR-073). With
+# which keeps the NGR_J2534_DEFINITION_DIR override the test uses (ADR-282). With
 # ABI_TEST set to a prebuilt end-to-end test executable (built with
 # `cargo test --no-run` for any target the host runs), the script runs that
 # instead of building the test with cargo, so the host needs no Rust toolchain.
@@ -72,7 +72,7 @@ if [[ "${LAUNCH:-0}" != 1 ]]; then
   exit 0
 fi
 if [[ "$PROFILE" != debug ]]; then
-  echo "error: LAUNCH=1 needs debug builds (the test's config override is debug-only, ADR-073)" >&2
+  echo "error: LAUNCH=1 needs debug builds (the test's definition-directory override is debug-only, ADR-282)" >&2
   exit 1
 fi
 # The ABI the library must have, and how to run a program built for the target.

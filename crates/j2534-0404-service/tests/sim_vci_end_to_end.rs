@@ -1,4 +1,4 @@
-// Relies on the debug-only runtime VCI_CONFIG_PATH override; see ADR-073.
+// Relies on the debug-only NGR_J2534_DEFINITION_DIR override; see ADR-282.
 #![cfg(debug_assertions)]
 //! End to end without hardware (design 13.4): `worker-host` launches the real
 //! `j2534-0404-service` binary against the `sim-vci` cdylib, with the
@@ -19,8 +19,9 @@
 //! (the ABI name the library must have, so a wrong build fails the test). A service binary
 //! named there must have the library's ABI too.
 //!
-//! This file holds a single test, so the process-wide `VCI_CONFIG_PATH` it
-//! sets for the spawned service cannot race with another test.
+//! This file holds a single test, so the process-wide `VCI_CONFIG_PATH` and
+//! `NGR_J2534_DEFINITION_DIR` it sets for the spawned service cannot race with
+//! another test.
 
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

@@ -288,7 +288,7 @@ impl Env {
             .stdout(Stdio::null())
             .spawn()
             .expect("the agent process should start");
-        AgentChild { child }
+        AgentChild { child: Some(child) }
     }
 
     /// Waits until the journal records block `block` (counted from 1, as the host's running
@@ -688,7 +688,8 @@ fn kill_agent_and_worker(pid: u32) -> std::io::Result<()> {
 
 /// The agent process of a scenario's first run.
 pub struct AgentChild {
-    child: Child,
+    /// `None` once [`AgentChild::kill`] has reaped the agent, so the drop does not kill again.
+    child: Option<Child>,
 }
 
 impl AgentChild {
@@ -696,13 +697,15 @@ impl AgentChild {
     /// test checks that it was killed ([`died_of_kill`]), so a job that finished by itself before
     /// the kill fails the test instead of passing it unnoticed.
     pub fn kill(mut self) -> ExitStatus {
-        let pid = self.child.id();
+        let child = self.child.as_mut().expect("the agent is reaped only here");
+        let pid = child.id();
         if let Err(error) = kill_agent_and_worker(pid) {
             panic!("kill of agent {pid} and its worker failed: {error}");
         }
-        self.child
-            .wait()
-            .expect("the killed agent should be reaped")
+        let status = child.wait().expect("the killed agent should be reaped");
+        // Reaped: its PID and process group may be reused, so the drop must not signal them.
+        self.child = None;
+        status
     }
 }
 
@@ -710,8 +713,10 @@ impl Drop for AgentChild {
     fn drop(&mut self) {
         // A test that failed before the kill must leave neither the agent nor its worker
         // running; the agent may have ended by then, so a failure here is not reported.
-        let _ = kill_agent_and_worker(self.child.id());
-        let _ = self.child.wait();
+        if let Some(child) = self.child.as_mut() {
+            let _ = kill_agent_and_worker(child.id());
+            let _ = child.wait();
+        }
     }
 }
 

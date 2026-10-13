@@ -6581,6 +6581,51 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// A redo after a completed pass that crashes in its replay once a replayed step is journaled
+    /// (ADR-273): the earlier pass's completion is still in the journal, but the interruption is
+    /// in the later pass, so the next restart's teardown does not take the completed path. Its
+    /// gates pass, so it resets the ECU, which the replay may have left in its programming
+    /// session, and the state check redoes the transfer.
+    #[test]
+    fn a_crash_in_the_replay_after_a_completed_pass_is_torn_down_with_a_reset() {
+        let (mut program, after_plan) = replay_program_with_end();
+        // Two restarts.
+        program.flash[0].max_resumes = 2;
+        let dir = journal_dir("replay-after-completed-teardown");
+        let result = first_run(&program, &dir, JobLimits::default(), |host| {
+            host.lose_routine = Some(0xFF04);
+        });
+        assert!(
+            matches!(result, Err(JobError::Host { pc, .. }) if pc == after_plan),
+            "{result:?}"
+        );
+        let completed = Journal::read(&dir, &job_key()).unwrap();
+        assert!(restart::completed_pass_interrupted(&completed.facts));
+        // The first restart takes the completed path, redoes the transfer, and loses the second
+        // replayed request, after the session change was journaled.
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        host.lose_service = Some(0x27);
+        let result = resume(&program, &dir, &mut host, false);
+        assert!(matches!(result, Err(JobError::Host { .. })), "{result:?}");
+        let crashed = Journal::read(&dir, &job_key()).unwrap();
+        assert!(
+            crashed
+                .facts
+                .transfer
+                .as_ref()
+                .and_then(|transfer| transfer.exit.as_ref())
+                .is_some_and(|exit| exit.complete),
+            "the earlier pass's completion stays"
+        );
+        assert!(!restart::completed_pass_interrupted(&crashed.facts));
+        // The second restart resets the ECU and stops before the erase.
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        let result = resume(&program, &dir, &mut host, false);
+        assert_eq!(teardown_of(&result), restart::Teardown::Reset);
+        assert_eq!(state_of(&result), restart::StateCheck::RedoTransfer);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// A redo whose replay committed only its run start before a crash: the second restart
     /// restarts from the entry state in that run start. `completed_pass_interrupted` still reports
     /// the earlier completed pass (the run start changes no fact) while `plan_end_state` finds
@@ -8264,7 +8309,9 @@ mod tests {
 
     /// A program that steps back into the completed plan's entry runs another pass. A crash in
     /// it before its transfer start leaves the earlier pass's completion in the journal, which
-    /// must not skip the later pass: the intended version on the ECU is redone, not read back.
+    /// must not skip the later pass: the intended version on the ECU is redone, not read back,
+    /// and the teardown does not take the completed path but resets the ECU, as the gates allow
+    /// (ADR-269 item 2).
     #[test]
     fn a_later_pass_after_a_completed_one_is_not_read_back() {
         let program = completed_path_program();
@@ -8353,7 +8400,8 @@ mod tests {
             &dir_slot(&dir),
         );
         assert_eq!(state_of(&result), restart::StateCheck::RedoTransfer);
-        assert_nothing_changed_the_ecu(&host, 0);
+        assert_eq!(teardown_of(&result), restart::Teardown::Reset);
+        assert_nothing_changed_the_ecu(&host, 1);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

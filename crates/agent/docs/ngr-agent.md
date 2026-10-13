@@ -307,10 +307,17 @@ gates before and after each read.
 
 `restart::teardown` is step 2b-1 (ADR-264), run on the gates' decision. In this order:
 
-1. The journal's exclusions. Post-transfer steps journaled complete (the completed path) give
-   `Teardown::CompletedPath`: no reset and no wait, since the default-session confirmation of
-   step 2b-2 comes first (ADR-265). A RequestTransferExit intent without that completion gives
-   `Teardown::Passive(TransferExitJournaled)`.
+1. The journal's exclusions. Post-transfer steps journaled complete for the interrupted pass
+   (the completed path, `restart::completed_pass_interrupted`, the rule the state check applies,
+   ADR-269 item 2) give `Teardown::CompletedPath`: no reset and no wait, since the
+   default-session confirmation of step 2b-2 comes first (ADR-265). A RequestTransferExit intent
+   without the completion gives `Teardown::Passive(TransferExitJournaled)`. A completion left
+   by an earlier pass is neither: when the program stepped back into the plan, or a redone
+   transfer's replay (ADR-273) journaled a step before a crash, that pass's RequestTransferExit
+   was answered and its post-transfer steps finished, so the gate decides. A replay that
+   crashed with only its run start committed changes no fact, so the earlier pass still counts
+   as the interrupted one there; the confirmation and its passive retry cover an ECU the replay
+   left in its programming session.
 2. A `PassiveOnly` gate gives `Teardown::Passive(Gate(reason))`.
 3. Otherwise one ECUReset (hardReset, positive response required) is sent. A positive response
    gives `Teardown::Reset`, with no wait: the ECU's startup time and the confirmation belong to

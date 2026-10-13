@@ -968,9 +968,14 @@ pub(crate) fn completed_pass_interrupted(facts: &RecoveryFacts) -> bool {
 /// The restart's teardown (ADR-229 item 2 step 2b-1, ADR-264), run on the gates' decision `gate`.
 /// In this order:
 /// - the journal's exclusions, which apply on top of a `ResetAllowed` gate: post-transfer steps
-///   journaled complete (the completed path) send nothing and wait for nothing
-///   ([`Teardown::CompletedPath`]); a RequestTransferExit intent without that completion makes
-///   the teardown passive ([`PassiveCause::TransferExitJournaled`]);
+///   journaled complete for the interrupted pass (the completed path, by the rule of
+///   [`completed_pass_interrupted`] that the state check applies, ADR-269 item 2) send nothing
+///   and wait for nothing ([`Teardown::CompletedPath`]); a RequestTransferExit intent without the
+///   completion makes the teardown passive ([`PassiveCause::TransferExitJournaled`]). A
+///   completion journaled for an earlier pass, which a step back into the plan or the replay of
+///   a redone transfer (ADR-273) has left behind, is neither: that pass's RequestTransferExit
+///   was answered and its post-transfer steps finished, so the gate decides as if no
+///   RequestTransferExit had been journaled;
 /// - a `PassiveOnly` gate makes it passive ([`PassiveCause::Gate`]);
 /// - otherwise an ECUReset (hardReset, positive response required) is sent. A positive response
 ///   ends in [`Teardown::Reset`] with no wait. A negative response, a failed or unanswered
@@ -1004,9 +1009,9 @@ where
         .transfer
         .as_ref()
         .and_then(|transfer| transfer.exit.as_ref());
-    let cause = if exit.is_some_and(|exit| exit.complete) {
+    let cause = if completed_pass_interrupted(&point.facts) {
         return Ok(Teardown::CompletedPath);
-    } else if exit.is_some() {
+    } else if exit.is_some_and(|exit| !exit.complete) {
         PassiveCause::TransferExitJournaled
     } else if let TeardownGate::PassiveOnly(reason) = gate {
         PassiveCause::Gate(reason)

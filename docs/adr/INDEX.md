@@ -232,7 +232,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-240](ADR-240-agent-worker-build-selection.md) | Agent Worker-Build Selection by Per-Build Library Resolution | Accepted (the architecture key of the `config.toml` lookup superseded by ADR-281; the per-build registry view stays) | `agent` launch, `ngr-agent run` |
 | [ADR-241](ADR-241-sim-ecu-state-file.md) | Simulated ECU State Kept in a File Across Worker Processes | Accepted | `sim-ecu` snapshot, `sim-vci` `NGR_SIM_ECU_STATE` |
 | [ADR-242](ADR-242-ir-variable-length-and-nested-layouts.md) | IR Variable-Length Fields and Nested Layouts | Accepted | `diag-ir` declaration schema (`ir.fbs`) |
-| [ADR-243](ADR-243-codeql-and-backlog-loops-share-one-claim.md) | The CodeQL and Backlog Loops Share One PR-Based Claim | Accepted (Decision item 3's skipping of high and critical alerts and item 4's number-only hand-off of them superseded by ADR-246) | `.claude/skills/codeql-alerts`, `backlog-loop` |
+| [ADR-243](ADR-243-codeql-and-backlog-loops-share-one-claim.md) | The CodeQL and Backlog Loops Share One PR-Based Claim | Accepted (Decision item 3's skipping of high and critical alerts and item 4's number-only hand-off of them superseded by ADR-246; item 4's trigger follows the CodeQL workflow instead of default setup, ADR-283) | `.claude/skills/codeql-alerts`, `backlog-loop` |
 | [ADR-244](ADR-244-write-job-journal-format.md) | Write-Job Journal as an Append-Only Record Log | Accepted (record set extended by ADR-253, ADR-261, ADR-268, ADR-272 and ADR-280; item 4's target VIN is a journal record since ADR-261, and its version being written since ADR-268; the no-lock consequence superseded by ADR-255 item 7) | `agent` write-job journal |
 | [ADR-245](ADR-245-ir-restart-declaration-in-the-procedure-part.md) | The IR's Restart Declaration Lives in the Procedure Part | Accepted (items 4 and 6 amended by ADR-250) | `diag-ir` `Program` restart declaration, `ir.fbs` `FlashSession` |
 | [ADR-246](ADR-246-codeql-hand-off-carries-private-alert-details.md) | The CodeQL Hand-Off Carries High and Critical Alert Details Privately | Accepted | `.github/workflows/codeql-alert-handoff.yml`, `.claude/skills/codeql-alerts` |
@@ -268,10 +268,11 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-276](ADR-276-restart-redo-from-the-erase.md) | A Redone Transfer Goes On from the Erase as a First Run | Accepted (item 3's gap closed by ADR-280: the procedure can end the job as failed) | `agent` restart, runner, design 8.2.5 |
 | [ADR-277](ADR-277-dpdu-root-file-interpretation.md) | D-PDU API Root Description File Interpretation | Accepted | `ngr-library-resolver`, design 7.1 / 7.2 |
 | [ADR-278](ADR-278-library-signer-check.md) | Library Signer Check | Accepted (item 4's mode is passed by the agent since ADR-281) | `ngr-library-resolver`, design 7.2 |
-| [ADR-279](ADR-279-backlog-loop-handles-dependabot-pull-requests.md) | The Backlog Loop Handles Open Dependabot Pull Requests First | Accepted | `.claude/skills/backlog-loop` |
+| [ADR-279](ADR-279-backlog-loop-handles-dependabot-pull-requests.md) | The Backlog Loop Handles Open Dependabot Pull Requests First | Accepted (Decision item 4's allowlist check replaced by the check against the Windows runner's system directory, ADR-283) | `.claude/skills/backlog-loop` |
 | [ADR-280](ADR-280-diag-fail-instruction.md) | `diag.fail` Is a Terminal `Fail` Instruction, Journaled so a Restart Does Not Resume the Job | Accepted (schema-compatibility consequence relaxed by ADR-281 item 4) | `diag-ir`, `agent` runner, journal, restart; design 5.6 / 8.2.4 / 8.2.5 |
 | [ADR-281](ADR-281-worker-library-resolution-mode-and-device-selection.md) | Worker Library Resolution Has No Config-File Path, the Agent Passes the Mode, One J2534 Device Is One Worker, and Pre-Release Compatibility May Break | Accepted | design 7.1 / 7.2, `j2534-0404-service`, `iso22900-service`, `agent`, `vci-service-config` |
 | [ADR-282](ADR-282-debug-resolver-overrides-on-windows.md) | In Debug Builds the Resolvers' Runtime Overrides Also Replace the Windows Registry | Accepted | `ngr-library-resolver`, `vci-service-config`, design 7.1.1 / 7.2, worker and agent integration tests |
+| [ADR-283](ADR-283-codeql-workflow-and-windows-dll-check.md) | CodeQL Runs as a Repository Workflow, and the Windows DLL Check Uses the Runner's System Directory | Accepted | `.github/workflows/codeql.yml`, `codeql-alert-handoff.yml`, `ci.yml` (`worker-windows`, `abi-roundtrip-windows`) |
 
 ## Status Legend
 
@@ -601,14 +602,15 @@ the predecessor repository these ADRs came from.
 - ADR-230 (Decision items 1-2's claim set extended to `codeql-alerts` PRs by ADR-243; Decision item 5 superseded by ADR-249; Decision items 3 and 6 amended by ADR-279 for Dependabot replacements)
 - ADR-238
 - ADR-241
-- ADR-243 (Decision item 3's skipping of high and critical alerts and item 4's number-only hand-off of them superseded by ADR-246)
+- ADR-243 (Decision item 3's skipping of high and critical alerts and item 4's number-only hand-off of them superseded by ADR-246; item 4's trigger follows the CodeQL workflow instead of default setup, ADR-283)
 - ADR-246
 - ADR-248
 - ADR-249
 - ADR-251
 - ADR-260
 - ADR-275
-- ADR-279
+- ADR-279 (Decision item 4's allowlist check replaced by the check against the Windows runner's system directory, ADR-283)
+- ADR-283
 
 ### Timestamps / Clock
 - ADR-057 (amended by ADR-102)

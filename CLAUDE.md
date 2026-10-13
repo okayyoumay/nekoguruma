@@ -147,7 +147,8 @@ the doc tests with `cargo test ... --doc`. nextest runs each test in its own pro
 `cargo test` gives the same results, only more slowly; keep `#[serial]` on tests that share
 process-global state, since `cargo test` still needs it. Some of those tests are too
 timing-sensitive to run in parallel on the Windows runner, so the `core-windows` job uses the
-`ci-windows` profile (one test at a time). On pull requests `core-windows` leaves out
+`ci-windows` profile (one test at a time) for every test except the agent's, which run first in
+a separate nextest run with the `ci-windows-parallel` profile. On pull requests `core-windows` leaves out
 `j2534-0404-service`, which has no Windows-specific code; main runs every test on Windows.
 
 CI (`.github/workflows/ci.yml`) also checks the worker crates for six targets and runs
@@ -157,9 +158,10 @@ for a worker target (Linux ARM under qemu-user, Windows on a Windows runner) wit
 `cargo check --target`) and `abi-roundtrip` launches the i686 and aarch64 builds. main launches all
 four Linux targets, runs the release builds (cargo-zigbuild for Linux, llvm-mingw for the
 `*-pc-windows-gnullvm` Windows targets, all on Linux), and launches the Windows debug builds that
-`worker-windows` cross-compiles (`abi-roundtrip-windows`). On pull requests that change only documentation, `work/` or `.claude/`, the
+`worker-windows` cross-compiles (`abi-roundtrip-windows`), where it also checks that the release
+binaries import only DLLs that Windows itself provides (ADR-283). On pull requests that change only documentation, `work/` or `.claude/`, the
 `changes` job in `ci.yml` skips the build jobs, which then count as passed required checks;
-`repo-checks.yml` always runs. Do not run cross-target builds locally unless asked; CI covers
+`repo-checks.yml` always runs. CodeQL (`codeql.yml`, ADR-283) skips the same changes. Do not run cross-target builds locally unless asked; CI covers
 them.
 
 The `msrv` job checks the workspace with the Rust version in `Cargo.toml`'s `rust-version`

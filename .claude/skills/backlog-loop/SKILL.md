@@ -118,8 +118,9 @@ conflict decides next; otherwise the first case that matches decides:
   Dependabot's title and a "Replaces #<n>" line in the description. In step 4, apply the same
   update on the loop branch (the same versions in `Cargo.toml`, `Cargo.lock` or the workflow
   files), reproduce the failure with the repository's own checks, and fix it at its root cause.
-  If the update changes a dependency built for either of those Windows targets, also check the new version's
-  DLL imports against the allowlist in `ci.yml`, since that check runs only on `main`.
+  If the update changes a dependency built for either of those Windows targets, also check that
+  the new version links no DLL that Windows itself lacks (a toolchain or third-party DLL), since
+  `ci.yml`'s DLL import check runs only on `main` (`abi-roundtrip-windows`, ADR-283).
   The replacement PR has no claimed item, so its shadow risk verdict is HIGH. The maintainer
   merges it like any other loop PR, also when the update came from the `cargo-minor-patch`
   group. Do not close the Dependabot PR: Dependabot closes it once `main` has the update. If it

@@ -402,21 +402,24 @@ impl Env {
     /// scenario is alive. The request trace is emptied first, so [`Env::trace`] afterwards holds
     /// the restart's requests only.
     pub fn restart(&self, spec: &JobSpec) -> Result<VmState, JobError> {
-        self.resume_in_process(spec, None)
+        self.resume_in_process(spec, None).result
     }
 
     /// As [`Env::restart`], on the guards an interrupted first run gave
     /// back ([`InterruptedRun::guards`]): the agent passes them on to its next run instead of
     /// taking them again (`resume_program_journaled`'s documentation).
     pub fn restart_on(&self, spec: &JobSpec, guards: JobGuards) -> Result<VmState, JobError> {
+        self.resume_in_process(spec, Some(guards)).result
+    }
+
+    /// As [`Env::restart_on`], but the guards the run gives back are kept for a further run, as
+    /// [`Env::fault_mid_run`] keeps them: the worker is stopped, and the guards' unconfirmed-link
+    /// mark (ADR-258) is cleared once it has exited.
+    pub fn restart_keeping(&self, spec: &JobSpec, guards: JobGuards) -> InterruptedRun {
         self.resume_in_process(spec, Some(guards))
     }
 
-    fn resume_in_process(
-        &self,
-        spec: &JobSpec,
-        guards: Option<JobGuards>,
-    ) -> Result<VmState, JobError> {
+    fn resume_in_process(&self, spec: &JobSpec, guards: Option<JobGuards>) -> InterruptedRun {
         std::fs::write(self.trace_file(), "").expect("the trace file should be writable");
         let runtime = self.runtime();
         runtime
@@ -448,7 +451,7 @@ impl Env {
         .expect("the guards should be free")
     }
 
-    async fn resume(&self, spec: &JobSpec, guards: Option<JobGuards>) -> Result<VmState, JobError> {
+    async fn resume(&self, spec: &JobSpec, guards: Option<JobGuards>) -> InterruptedRun {
         let worker = launch_worker().await;
         let client = worker
             .connect(&ConnectOptions::default())
@@ -464,12 +467,20 @@ impl Env {
             guards,
         )
         .await;
-        drop(guards);
+        let link_unconfirmed = guards.link_unconfirmed();
         worker
             .stop(Duration::from_secs(5))
             .await
             .expect("worker should stop");
-        result
+        let mut guards = guards;
+        guards.worker_gone();
+        let journal = Journal::read(&self.journal_dir(), &spec.key).expect("journal");
+        InterruptedRun {
+            result,
+            guards,
+            link_unconfirmed,
+            journal,
+        }
     }
 
     /// Runs the job's first run in this process, the agent's, and kills its worker alone with
@@ -607,7 +618,8 @@ pub struct InterruptedRun {
     pub guards: JobGuards,
     /// Whether the run had marked the guards' link unconfirmed (ADR-258) before that.
     pub link_unconfirmed: bool,
-    /// The journal as it read just before the interruption.
+    /// The journal as it read just before the interruption, or after the run for
+    /// [`Env::restart_keeping`].
     pub journal: JournalState,
 }
 

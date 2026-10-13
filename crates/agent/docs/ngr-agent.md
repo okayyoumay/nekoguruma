@@ -111,8 +111,10 @@ append-only file, `{job_id}.g{generation}.journal`, per job and ownership genera
 directory the caller passes. Every commit is synced before it returns. Only the job's writer opens
 the journal for writing: `Journal::create` and `Journal::open` take an exclusive OS lock on the
 sidecar `{job_id}.g{generation}.journal.lock` and hold it while the journal is open, so a second
-writer gets `JournalError::InUse` (ADR-255). The lock goes with the process, so a crashed run
-never blocks the next one. Other readers use `Journal::read`, which takes no lock and never
+writer gets `JournalError::InUse` (ADR-255). Dropping the `Journal` unlocks the sidecar before
+closing it, so a child process spawned meanwhile, which shares the open lock file until it runs its
+program, does not keep the journal locked. The lock goes with the process, so a crashed run never
+blocks the next one. Other readers use `Journal::read`, which takes no lock and never
 changes the file. The journal only records; committing an intent marker before the request it guards, and stopping the job when a
 commit fails, are the job runner's duties.
 

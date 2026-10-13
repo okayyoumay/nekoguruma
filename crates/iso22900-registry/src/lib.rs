@@ -4,7 +4,7 @@ use std::{
     path::PathBuf,
 };
 
-use tracing::{debug, warn};
+use tracing::debug;
 use url::Url;
 
 #[derive(Debug, Clone)]
@@ -16,21 +16,6 @@ pub struct PduLibraryInfo {
     pub module_description_path: Option<PathBuf>,
     pub cable_description_path: Option<PathBuf>,
     pub arch: LibraryArch,
-    pub source: LibrarySource,
-}
-
-/// Where a [`PduLibraryInfo`] returned by [`enumerate_libraries`] came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LibrarySource {
-    /// Found via RDF-based auto-discovery only.
-    Registry,
-    /// Present only as a `library_path` entry in the config file (see
-    /// [`enumerate_libraries`]); no matching RDF entry was found.
-    Config,
-    /// Found via RDF-based auto-discovery, with the config file additionally
-    /// providing a `library_path` override for this library name — the
-    /// `library_path` field reflects the configured override.
-    Both,
 }
 
 #[derive(Debug)]
@@ -306,7 +291,6 @@ fn enumerate_pdu_libraries_from_rdf(
                 module_description_path,
                 cable_description_path,
                 arch: mode.into(),
-                source: LibrarySource::Registry,
             });
         }
     }
@@ -316,75 +300,6 @@ fn enumerate_pdu_libraries_from_rdf(
         "D-PDU library enumeration complete"
     );
     Ok(libraries)
-}
-
-/// Returns a configured `library_path` override for `library_name` from the
-/// shared `config.toml` (`config.apis.iso22900...`), if present.
-///
-/// Applies a 2-level priority (highest first):
-/// 1. `config.apis.iso22900.arch.<arch>.libs.<lib>.library_path` (Windows only)
-/// 2. `config.apis.iso22900.libs.<lib>.library_path`
-///
-/// Returns `None` when no override is configured.
-pub fn find_library_path(arch: Option<&str>, library_name: &str) -> Option<PathBuf> {
-    vci_service_config::find_library_path("iso22900", arch, library_name)
-}
-
-/// Library names configured with a `library_path` under
-/// `config.apis.iso22900` in the shared `config.toml`, across both the
-/// api-level and every arch-level `libs` table. Sorted and deduplicated.
-pub fn list_configured_libraries() -> Vec<String> {
-    vci_service_config::list_configured_libraries("iso22900")
-}
-
-/// Enumerates all D-PDU API libraries visible to this process: RDF-based
-/// auto-discovery ([`enumerate_pdu_libraries`]) merged with `library_path`
-/// entries configured under `config.apis.iso22900` in the shared
-/// `config.toml` ([`list_configured_libraries`], including its `arch`-level
-/// entries).
-///
-/// A library name present in both sources appears once, with `library_path`
-/// set to the configured override and `source` set to
-/// [`LibrarySource::Both`]. A name present in only one source keeps that
-/// source's fields, with `source` set to [`LibrarySource::Registry`] or
-/// [`LibrarySource::Config`] accordingly; config-only entries carry no
-/// `description`/`supplier_name`/`module_description_path`/
-/// `cable_description_path`, since the config file does not declare them.
-///
-/// RDF-based auto-discovery failures (missing RDF, XML parse errors, etc.)
-/// are treated as "no RDF-discovered libraries" rather than propagated, so a
-/// config-only library is always listed even if the RDF is broken or absent.
-///
-/// Sorted by `short_name`.
-pub fn enumerate_libraries(mode: RegistryViewMode) -> Vec<PduLibraryInfo> {
-    let mut libraries = match enumerate_pdu_libraries(mode) {
-        Ok(libs) => libs,
-        Err(e) => {
-            warn!(error = %e, "RDF-based auto-discovery failed while enumerating libraries; falling back to config-only libraries");
-            Vec::new()
-        }
-    };
-
-    for (name, path) in vci_service_config::list_configured_library_paths("iso22900") {
-        if let Some(existing) = libraries.iter_mut().find(|lib| lib.short_name == name) {
-            existing.library_path = path;
-            existing.source = LibrarySource::Both;
-        } else {
-            libraries.push(PduLibraryInfo {
-                short_name: name,
-                description: None,
-                supplier_name: None,
-                library_path: path,
-                module_description_path: None,
-                cable_description_path: None,
-                arch: LibraryArch::get_native(),
-                source: LibrarySource::Config,
-            });
-        }
-    }
-
-    libraries.sort_by(|a, b| a.short_name.cmp(&b.short_name));
-    libraries
 }
 
 // ---------------------------------------------------------------------------

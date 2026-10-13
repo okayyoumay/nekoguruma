@@ -182,9 +182,6 @@ SAE J2534 ("PassThru") standard for vehicle interface adapters. The worker suppo
 **K-Line**  
 Single-wire serial automotive bus (ISO 9141-2, ISO 14230). Older protocol used in pre-CAN vehicles.
 
-**Library Path Override**  
-An explicit `library_path` entry for a given library name in `config.toml` (`config.apis.<api>.libs.<lib>.library_path`, optionally scoped further by `arch`), read by `vci-service-config` via `iso22900-registry::find_library_path()` (ADR-034). Neither worker service nor the agent's ABI detection (`agent::launch`) reads it: they resolve the library through `ngr-library-resolver` (ADR-281 Decision item 1), and J2534 has no `library_path` lookup left (ADR-228 Decision item 4). `iso22900_registry::enumerate_libraries()` merges the `iso22900` entries with the libraries the root description file lists (`source: LibrarySource` marks whether an entry came from the RDF, the config file, or both) (ADR-034, ADR-036). See `vci-service-config/docs/logging-config.md`.
-
 ---
 
 ## M–O
@@ -377,7 +374,7 @@ A per-CLL table that maps `unique_resp_identifier` values to per-ECU ComParam se
 A hardware adapter that connects a PC to vehicle diagnostic buses (CAN, K-Line, Ethernet, etc.). Synonymous with J2534 adapter or MVCI.
 
 **vci-service-config**  
-Shared Rust crate that loads and parses `config.toml`, independent of any gRPC/JSON-RPC bootstrap. Exposes `find_logging_config`, `find_library_path`, `list_configured_libraries`, and `list_configured_library_paths` (name-plus-path variant, ADR-036). `vci-service-launcher` re-exports it as `vci_service_launcher::config` for logging (ADR-033); `iso22900-registry` wraps `find_library_path`/`list_configured_libraries` with its API name fixed and builds `enumerate_libraries()` on top of `list_configured_library_paths` (ADR-034, ADR-036). `j2534-0404-registry` no longer depends on this crate: J2534 names resolve only through `ngr-library-resolver` (ADR-228 Decision item 4).
+Shared Rust crate that loads and parses `config.toml`, independent of any gRPC/JSON-RPC bootstrap. Exposes `find_logging_config` and the per-library lookups for the CAN channel mode, J2534 modules and vendor settings. `vci-service-launcher` re-exports it as `vci_service_launcher::config` for logging (ADR-033); no registry crate depends on it; libraries resolve only through `ngr-library-resolver` (ADR-228 Decision item 4, ADR-281 Decision item 1).
 
 **vci-service-launcher**  
 Shared Rust crate that provides the startup template for all gRPC services. Handles DLL loading, gRPC server lifecycle, JSON-RPC stdio control channel, and logging initialization.

@@ -3,10 +3,7 @@
 ## Scope
 
 Loads and parses the shared `config.toml` file used by all VCI gRPC
-services: logging settings (`find_logging_config`), `library_path`
-overrides (`find_library_path`), library-name discovery
-(`list_configured_libraries`), library-name-plus-path discovery
-(`list_configured_library_paths`, ADR-036), the CAN channel operating
+services: logging settings (`find_logging_config`), the CAN channel operating
 mode (`find_can_channel_mode`, ADR-046/ADR-047 — returned as an opaque string;
 validation of the mode names is the consuming service's responsibility),
 J2534 v04.04 device-selection module entries (`find_modules`, ADR-107 —
@@ -64,17 +61,10 @@ configuration, not a running service.
   using `vci_service_launcher::config::*` unchanged for logging.
   `j2534-0404-service` also reads `find_can_channel_mode()` through this
   re-export at startup (ADR-046), and `find_modules()` the same way (ADR-107).
-- `iso22900-registry` depends on this crate directly and exposes a thin
-  wrapper — `find_library_path(arch, lib)` and `list_configured_libraries()` —
-  scoped to its API name (`"iso22900"`). `j2534-0404-registry` no longer
-  depends on this crate: J2534 names resolve only through
-  `ngr-library-resolver` (ADR-228 Decision item 4). Neither worker service
-  reads `library_path`.
-- `iso22900-registry`'s `enumerate_libraries(mode)` calls
-  `list_configured_library_paths()` directly (not just
-  `list_configured_libraries()`) so it can merge each config entry's
-  `library_path` into the returned `PduLibraryInfo`, not just its name
-  (ADR-036).
+- No registry crate depends on this crate any more: `iso22900-registry` and
+  `j2534-0404-registry` read no `config.toml` setting, and libraries resolve
+  only through `ngr-library-resolver` (ADR-228 Decision item 4, ADR-281
+  Decision item 1). A leftover `library_path` key is ignored.
 - `manager_config()` and `system_config_dir()` serve a standalone service
   manager process. nekoguruma has none (the agent launches workers through
   `worker-host`), so nothing in this workspace calls them; they are kept so

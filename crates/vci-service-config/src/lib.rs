@@ -1,7 +1,7 @@
 //! Config file loading for VCI gRPC services: locates and parses
 //! `config.toml` and exposes priority-based lookups for logging settings
-//! (`find_logging_config`), library path overrides (`find_library_path`),
-//! vendor STRUCTFIELD entry sizes (`find_vendor_struct_type_size`, plus its
+//! (`find_logging_config`), per-library worker settings (`find_modules`,
+//! `find_can_channel_mode`, `find_vendor_ioctls`), vendor STRUCTFIELD entry sizes (`find_vendor_struct_type_size`, plus its
 //! startup key-grammar check `validate_vendor_struct_type_keys`, see
 //! ADR-218), and `vci-service-manager` runtime settings (`manager_config`,
 //! see ADR-073).
@@ -61,12 +61,12 @@ pub(crate) const VENDOR_STRUCT_TYPE_MAX_ENTRY_SIZE_BYTES: u32 = 64 * 1024;
 /// not be read, or it was read but could not be parsed as valid TOML
 /// matching the expected schema.
 ///
-/// Most lookups in this module (e.g. [`find_logging_config`],
-/// [`find_library_path`]) intentionally swallow this error and fall back to
-/// defaults — see [`load_toml_config`]'s doc comment. [`find_modules`] is the
-/// one exception: it surfaces this error to the caller instead, since a
-/// malformed config file makes the real "is there a modules list configured"
-/// answer unknowable (see ADR-107 addendum (j)).
+/// Most lookups in this module (e.g. [`find_logging_config`]) intentionally
+/// swallow this error and fall back to defaults — see [`load_toml_config`]'s
+/// doc comment. [`find_modules`], [`find_vendor_ioctls`] and
+/// [`validate_vendor_struct_type_keys`] are the exceptions: they surface this
+/// error to the caller instead, since a malformed config file makes the real
+/// "is anything configured" answer unknowable (see ADR-107 addendum (j)).
 #[derive(Debug)]
 pub enum ConfigFileError {
     /// The config file exists but could not be read (permissions, I/O
@@ -275,9 +275,6 @@ pub struct ManagerConfig {
 #[derive(Debug, Deserialize, Default)]
 struct InstanceConfig {
     logging: Option<LoggingConfig>,
-    /// Explicit filesystem path to this library, overriding platform
-    /// auto-discovery (e.g. the Windows registry) when present.
-    library_path: Option<String>,
     /// CAN-bus channel operating mode for this library. Consumed by J2534
     /// adapter services (`j2534-0404-service`); the value is an opaque string
     /// here — validation happens in the consuming service.
@@ -643,7 +640,8 @@ fn try_load_toml_config() -> Result<TomlConfig, ConfigFileError> {
 /// Lenient wrapper around [`try_load_toml_config`]: a read or parse failure
 /// is logged to stderr and treated as "nothing configured"
 /// (`TomlConfig::default()`), rather than propagated. Used by every lookup
-/// in this module except [`find_modules`], which cannot safely treat a
+/// in this module except [`find_modules`], [`find_vendor_ioctls`] and
+/// [`validate_vendor_struct_type_keys`], which cannot safely treat a
 /// malformed document as "absent" (see [`ConfigFileError`]'s doc comment).
 fn load_toml_config() -> TomlConfig {
     try_load_toml_config().unwrap_or_else(|e| {
@@ -712,52 +710,10 @@ pub fn find_logging_config(
     root.logging.unwrap_or_default()
 }
 
-/// Return a configured `library_path` override for the given service
-/// instance, if one is present in the config file.
-///
-/// Applies the following priority hierarchy (highest first):
-///
-/// 1. `config.apis.<api>.arch.<arch>.libs.<lib>.library_path` (Windows only)
-/// 2. `config.apis.<api>.libs.<lib>.library_path`
-///
-/// Unlike [`find_logging_config`], there is no api-level or root-level
-/// fallback: a `library_path` only makes sense tied to a specific library
-/// name, so entries without a `libs.<lib>` key are never consulted.
-///
-/// Returns `None` when no override is configured, in which case the caller
-/// should fall back to platform-specific auto-discovery (e.g. the Windows
-/// registry).
-pub fn find_library_path(
-    api_name: &str,
-    arch: Option<&str>,
-    library_name: &str,
-) -> Option<PathBuf> {
-    let toml = load_toml_config();
-    let api_cfg = toml.config?.apis?.remove(api_name)?;
-
-    // Priority 1 — arch + library (Windows only)
-    if let (Some(arch_key), Some(mut arch_map)) = (arch, api_cfg.arch)
-        && let Some(path) = arch_map
-            .remove(arch_key)
-            .and_then(|arch_cfg| arch_cfg.libs)
-            .and_then(|mut libs| libs.remove(library_name))
-            .and_then(|inst| inst.library_path)
-    {
-        return Some(PathBuf::from(path));
-    }
-
-    // Priority 2 — api + library
-    api_cfg
-        .libs?
-        .remove(library_name)?
-        .library_path
-        .map(PathBuf::from)
-}
-
 /// Return a configured vendor STRUCTFIELD entry size (bytes) for the given
 /// `struct_type`, if one is present in the config file (ADR-218).
 ///
-/// Applies the same two-level priority hierarchy as [`find_library_path`]
+/// Applies the same two-level priority hierarchy as [`find_modules`]
 /// (highest first):
 ///
 /// 1. `config.apis.<api>.arch.<arch>.libs.<lib>.vendor_struct_types."<key>"` (Windows only)
@@ -765,7 +721,7 @@ pub fn find_library_path(
 ///
 /// `<key>` is `struct_type` formatted as `"0x<8 lowercase hex digits>"`,
 /// matching the grammar used by the gRPC `ParamVendorSpecificStruct.type_url`
-/// suffix (ADR-218 Decision item 3). Like [`find_library_path`], there is no
+/// suffix (ADR-218 Decision item 3). Like [`find_modules`], there is no
 /// api-level or root-level fallback: a vendor struct-field entry size only
 /// makes sense tied to a specific library.
 ///
@@ -855,11 +811,10 @@ pub fn find_vendor_struct_type_size(
 /// Like [`find_modules`] (not the lenient [`load_toml_config`] every other
 /// lookup in this module uses), a config file that exists but cannot be read
 /// or parsed is propagated as `Err` here rather than treated as "nothing to
-/// validate": `find_library_path`'s own lenient load means a broken config
-/// file does NOT reliably fail startup elsewhere on its own, since
-/// a lookup that sees `None` falls back to platform auto-discovery (e.g.
-/// RDF) for exactly the same reason a broken document
-/// would produce `None` here -- so treating a broken file as "nothing
+/// validate": the lenient load the other lookups use means a broken config
+/// file does NOT reliably fail startup elsewhere on its own, since a lookup
+/// that sees `None` falls back to its default for exactly the same reason a
+/// broken document would produce `None` here -- so treating a broken file as "nothing
 /// configured" would let a malformed `vendor_struct_types` table (unreadable
 /// due to the very same broken document) pass validation silently while
 /// service startup proceeds, defeating this function's purpose the same way
@@ -980,8 +935,7 @@ fn validate_vendor_struct_type_table_keys(
 /// instance, if one is present in the config file (ADR-219, as amended).
 ///
 /// Applies the following priority hierarchy (highest first), the same
-/// two-level shape [`find_library_path`]/[`find_vendor_struct_type_size`]
-/// use and [`find_modules`]'s own whole-collection precedence (the winning
+/// two-level shape [`find_vendor_struct_type_size`] uses and [`find_modules`]'s own whole-collection precedence (the winning
 /// level's table is returned as a whole -- entries are never merged
 /// key-by-key across levels):
 ///
@@ -998,7 +952,7 @@ fn validate_vendor_struct_type_table_keys(
 ///
 /// Each key is `cmd_id` formatted as `"0x<8 lowercase hex digits>"`, the
 /// same grammar [`find_vendor_struct_type_size`] uses for `struct_type`.
-/// Like [`find_library_path`], there is no api-level or root-level fallback:
+/// Like [`find_modules`], there is no api-level or root-level fallback:
 /// a `vendor_ioctls` table only makes sense tied to a specific library.
 ///
 /// Returns `Ok(None)` when the config file loads cleanly but no
@@ -1109,8 +1063,7 @@ pub fn find_can_channel_mode(
 ///
 /// Unlike [`find_logging_config`], there is no api-level or root-level
 /// fallback: a `modules` list only makes sense tied to a specific library
-/// name, so entries without a `libs.<lib>` key are never consulted (same
-/// contract as [`find_library_path`]).
+/// name, so entries without a `libs.<lib>` key are never consulted.
 ///
 /// Returns `Ok(None)` when no `modules` key is configured, in which case the
 /// caller should fall back to today's single-synthetic-module behavior. A
@@ -1153,65 +1106,6 @@ pub fn find_modules(
         .libs
         .and_then(|mut libs| libs.remove(library_name))
         .and_then(|inst| inst.modules))
-}
-
-/// Returns the library names configured with a `library_path` under
-/// `config.apis.<api>` in the config file, across both the api-level `libs`
-/// table and every arch-level `libs` table (Windows only). Sorted and
-/// deduplicated.
-///
-/// Entries without a `library_path` (e.g. logging-only entries) are not
-/// included, since they carry nothing a caller could use to start or list
-/// the library.
-pub fn list_configured_libraries(api_name: &str) -> Vec<String> {
-    list_configured_library_paths(api_name)
-        .into_iter()
-        .map(|(name, _)| name)
-        .collect()
-}
-
-/// Returns every `(library_name, library_path)` pair configured under
-/// `config.apis.<api>` in the config file, across both the api-level `libs`
-/// table and every arch-level `libs` table (Windows only). Sorted by name
-/// and deduplicated.
-///
-/// Entries without a `library_path` (e.g. logging-only entries) are not
-/// included. Unlike [`find_library_path`], this does not apply the
-/// arch-then-api priority for a specific runtime arch — it is meant for
-/// discovery/display of everything the config file declares. If the same
-/// name is configured with different paths at multiple levels (e.g. once
-/// api-level, once under a specific `arch`), the lexicographically-first
-/// path is kept.
-pub fn list_configured_library_paths(api_name: &str) -> Vec<(String, PathBuf)> {
-    let toml = load_toml_config();
-    let Some(api_cfg) = toml
-        .config
-        .and_then(|root| root.apis)
-        .and_then(|mut apis| apis.remove(api_name))
-    else {
-        return Vec::new();
-    };
-
-    let mut entries = Vec::new();
-    if let Some(libs) = api_cfg.libs {
-        entries.extend(
-            libs.into_iter()
-                .filter_map(|(name, inst)| inst.library_path.map(|p| (name, PathBuf::from(p)))),
-        );
-    }
-    if let Some(arch_map) = api_cfg.arch {
-        for arch_cfg in arch_map.into_values() {
-            if let Some(libs) = arch_cfg.libs {
-                entries.extend(libs.into_iter().filter_map(|(name, inst)| {
-                    inst.library_path.map(|p| (name, PathBuf::from(p)))
-                }));
-            }
-        }
-    }
-
-    entries.sort();
-    entries.dedup_by(|a, b| a.0 == b.0);
-    entries
 }
 
 /// Returns the `vci-service-manager` runtime settings from `config.manager`
@@ -1477,68 +1371,6 @@ mod tests {
     }
 
     #[test]
-    fn missing_library_path_returns_none() {
-        let temp = tempfile::tempdir().expect("create temp dir");
-        let _guard = test_support::set(temp.path());
-        assert!(find_library_path("j2534-0404", None, "OpenPort2").is_none());
-    }
-
-    #[test]
-    fn library_path_returns_none_when_lib_has_no_path() {
-        let temp = tempfile::tempdir().expect("create temp dir");
-        let _guard = with_config(
-            temp.path(),
-            r#"
-            [config.apis.j2534-0404.libs."OpenPort2".logging]
-            level = "debug"
-        "#,
-        );
-        assert!(find_library_path("j2534-0404", None, "OpenPort2").is_none());
-    }
-
-    #[test]
-    fn api_plus_lib_library_path_is_found() {
-        let temp = tempfile::tempdir().expect("create temp dir");
-        let _guard = with_config(
-            temp.path(),
-            r#"
-            [config.apis.j2534-0404.libs."OpenPort2"]
-            library_path = "/opt/vci/openport2.so"
-        "#,
-        );
-        let path = find_library_path("j2534-0404", None, "OpenPort2");
-        assert_eq!(path, Some(PathBuf::from("/opt/vci/openport2.so")));
-        // A different library name under the same api is not affected.
-        assert!(find_library_path("j2534-0404", None, "other-lib").is_none());
-    }
-
-    #[test]
-    fn arch_plus_lib_library_path_outranks_api_plus_lib() {
-        let temp = tempfile::tempdir().expect("create temp dir");
-        let _guard = with_config(
-            temp.path(),
-            r#"
-            [config.apis.j2534-0404.libs."OpenPort2"]
-            library_path = "/opt/vci/openport2-generic.so"
-
-            [config.apis.j2534-0404.arch.x86_64.libs."OpenPort2"]
-            library_path = "/opt/vci/openport2-x86_64.so"
-        "#,
-        );
-        let arch_specific = find_library_path("j2534-0404", Some("x86_64"), "OpenPort2");
-        assert_eq!(
-            arch_specific,
-            Some(PathBuf::from("/opt/vci/openport2-x86_64.so"))
-        );
-        // Without an arch match, falls back to the api+lib entry.
-        let no_arch = find_library_path("j2534-0404", None, "OpenPort2");
-        assert_eq!(
-            no_arch,
-            Some(PathBuf::from("/opt/vci/openport2-generic.so"))
-        );
-    }
-
-    #[test]
     fn missing_modules_returns_none() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let _guard = test_support::set(temp.path());
@@ -1715,86 +1547,6 @@ mod tests {
         assert_eq!(
             find_can_channel_mode("j2534-0404", None, "OpenPort2").as_deref(),
             Some("single-channel")
-        );
-    }
-
-    #[test]
-    fn list_configured_libraries_returns_empty_for_missing_config() {
-        let temp = tempfile::tempdir().expect("create temp dir");
-        let _guard = test_support::set(temp.path());
-        assert!(list_configured_libraries("iso22900").is_empty());
-    }
-
-    #[test]
-    fn list_configured_libraries_excludes_entries_without_a_path() {
-        let temp = tempfile::tempdir().expect("create temp dir");
-        let _guard = with_config(
-            temp.path(),
-            r#"
-            [config.apis.iso22900.libs."HasPath"]
-            library_path = "/opt/vci/haspath.so"
-
-            [config.apis.iso22900.libs."LoggingOnly".logging]
-            level = "debug"
-        "#,
-        );
-        assert_eq!(
-            list_configured_libraries("iso22900"),
-            vec!["HasPath".to_string()]
-        );
-    }
-
-    #[test]
-    fn list_configured_libraries_combines_api_and_arch_entries() {
-        let temp = tempfile::tempdir().expect("create temp dir");
-        let _guard = with_config(
-            temp.path(),
-            r#"
-            [config.apis.iso22900.libs."ApiLevelLib"]
-            library_path = "/opt/vci/api-level.so"
-
-            [config.apis.iso22900.arch.x86_64.libs."ArchOnlyLib"]
-            library_path = "/opt/vci/arch-only.so"
-        "#,
-        );
-        assert_eq!(
-            list_configured_libraries("iso22900"),
-            vec!["ApiLevelLib".to_string(), "ArchOnlyLib".to_string()]
-        );
-    }
-
-    #[test]
-    fn list_configured_library_paths_returns_empty_for_missing_config() {
-        let temp = tempfile::tempdir().expect("create temp dir");
-        let _guard = test_support::set(temp.path());
-        assert!(list_configured_library_paths("iso22900").is_empty());
-    }
-
-    #[test]
-    fn list_configured_library_paths_includes_the_path() {
-        let temp = tempfile::tempdir().expect("create temp dir");
-        let _guard = with_config(
-            temp.path(),
-            r#"
-            [config.apis.iso22900.libs."HasPath"]
-            library_path = "/opt/vci/haspath.so"
-
-            [config.apis.iso22900.libs."LoggingOnly".logging]
-            level = "debug"
-
-            [config.apis.iso22900.arch.x86_64.libs."ArchOnlyLib"]
-            library_path = "/opt/vci/arch-only.so"
-        "#,
-        );
-        assert_eq!(
-            list_configured_library_paths("iso22900"),
-            vec![
-                (
-                    "ArchOnlyLib".to_string(),
-                    PathBuf::from("/opt/vci/arch-only.so")
-                ),
-                ("HasPath".to_string(), PathBuf::from("/opt/vci/haspath.so")),
-            ]
         );
     }
 

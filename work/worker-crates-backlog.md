@@ -68,7 +68,22 @@ margin theory — stop widening and instrument instead (see
 in the "Test-suite reliability: past flaky-test root causes" section of
 `crates/j2534-0404-service/docs/implementation-notes.md` for a worked example).
 
-No entries at present.
+- `j2534-0404-service` `grpc_mock`
+  `tester_present_send_type::kline_five_baud_init_does_not_force_fire_mode_1_sibling`
+  (`crates/j2534-0404-service/tests/grpc_mock/tester_present_send_type.rs`). Symptom: failed once
+  in `core-windows` on main (commit 7c87d51, `ci-windows` profile, one test at a time, 2.2 s): the
+  final `written_count` assertion saw 2 frames where it expects 1. The same run passed it on
+  `core-linux`, and the next main run (23ec12a) passed it on Windows. Suspected cause: the test
+  measures against wall-clock time. cll_a is armed mode 1 with a 300 ms tester-present
+  interval, the test sleeps 75 ms, then runs cll_b's StartComm and 5-baud init and counts frames
+  only after that. If those steps take more than about 225 ms on a slow runner, cll_a's own
+  idle timer fires legitimately before the count, which the assertion reads as a forced fire.
+  Confirm in isolation: run
+  `cargo test -p j2534-0404-service --test grpc_mock -- --exact tester_present_send_type::kline_five_baud_init_does_not_force_fire_mode_1_sibling`
+  in a loop under CPU load, or with a delay added before the final count. Fix by making the check
+  independent of elapsed time (for example a much longer cll_a interval, or a paused or mocked
+  clock as in ADR-149's write-time guideline in `tests/grpc_mock/harness.rs`), not by loosening
+  the count.
 
 Past root causes and their fixes: `crates/j2534-0404-service/docs/implementation-notes.md`, section
 "Test-suite reliability: past flaky-test root causes".

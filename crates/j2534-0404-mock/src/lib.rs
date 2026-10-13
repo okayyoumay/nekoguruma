@@ -6902,6 +6902,61 @@ fn search_directory(dir: &Path) -> Option<PathBuf> {
         .max_by_key(|path| std::fs::metadata(path).and_then(|m| m.modified()).ok())
 }
 
+/// A TOML basic string holding `text`, with the characters TOML gives a meaning there escaped.
+fn toml_string(text: &str) -> String {
+    let mut out = String::from("\"");
+    for c in text.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04X}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Writes a J2534 registration definition (design 7.1.1) into `dir` that names `library` as
+/// the VCI `name`, and returns the file's path. Tests point the debug-only
+/// `NGR_J2534_DEFINITION_DIR` override at `dir` (ADR-282) so a service resolves the mock
+/// library or `sim-vci` the way it resolves a vendor library. The file name is the hex encoding
+/// of `name`'s bytes, so one directory can hold the definitions of several VCIs, also on a
+/// case-insensitive file system, and writing the same name again replaces its definition.
+pub fn write_definition(dir: &Path, name: &str, library: &Path) -> Result<PathBuf, std::io::Error> {
+    let stem: String = name.bytes().map(|b| format!("{b:02x}")).collect();
+    let file = dir.join(format!("{stem}.toml"));
+    // A definition names its library by an absolute path without `.` or `..` components; a
+    // relative one (for example from a relative `CARGO_TARGET_DIR`) is taken from the current
+    // directory, and `..` is removed by text, since the file need not exist.
+    let mut normalized = PathBuf::new();
+    for component in std::path::absolute(library)?.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other),
+        }
+    }
+    let library = normalized;
+    let library = library.to_str().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("library path is not UTF-8: {}", library.display()),
+        )
+    })?;
+    std::fs::write(
+        &file,
+        format!(
+            "Name = {}\nFunctionLibrary = {}\n",
+            toml_string(name),
+            toml_string(library)
+        ),
+    )?;
+    Ok(file)
+}
+
 /// Locate the built mock shared library under the Cargo target directory.
 pub fn mock_library_path() -> Result<PathBuf, std::io::Error> {
     if let Some(target_dir) = std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from) {
@@ -6940,6 +6995,71 @@ pub fn mock_library_path() -> Result<PathBuf, std::io::Error> {
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod definition_tests {
+    use super::*;
+
+    /// The definition reads back through the resolver with the name and library it was given,
+    /// also when both hold characters TOML escapes.
+    #[test]
+    fn write_definition_round_trips_through_the_resolver() {
+        let dir = tempfile::tempdir().unwrap();
+        let library = std::env::current_exe()
+            .unwrap()
+            .with_file_name("a \"b\" \\ c.lib");
+        for name in ["mock-lib", "Vendor \"X\" \\ 1"] {
+            write_definition(dir.path(), name, &library).unwrap();
+            let resolved = ngr_library_resolver::j2534_0404::resolve_in_dir(dir.path(), name)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(resolved.definition.name, name);
+            assert_eq!(resolved.definition.library, library);
+        }
+    }
+
+    /// A relative library path, also one with `.` and `..` components, is written as the
+    /// absolute path it names here.
+    #[test]
+    fn write_definition_makes_a_relative_library_absolute() {
+        let dir = tempfile::tempdir().unwrap();
+        let here = std::env::current_dir().unwrap();
+        let expected = here.parent().unwrap().join("target").join("x.lib");
+        for (name, library) in [
+            ("relative", Path::new("../target/x.lib").to_path_buf()),
+            (
+                "dotted",
+                here.join(".").join("y").join("..").join("../target/x.lib"),
+            ),
+        ] {
+            write_definition(dir.path(), name, &library).unwrap();
+            let resolved = ngr_library_resolver::j2534_0404::resolve_in_dir(dir.path(), name)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(resolved.definition.library, expected, "{name}");
+        }
+    }
+
+    /// Names that differ only in characters a file name cannot hold, or only in case, get
+    /// definitions of their own.
+    #[test]
+    fn write_definition_keeps_similar_names_apart() {
+        let dir = tempfile::tempdir().unwrap();
+        let names = ["Vendor/A", "Vendor?A", "vendor/a"];
+        for (i, name) in names.iter().enumerate() {
+            let library = std::env::current_exe()
+                .unwrap()
+                .with_file_name(format!("{i}.lib"));
+            write_definition(dir.path(), name, &library).unwrap();
+        }
+        for (i, name) in names.iter().enumerate() {
+            let resolved = ngr_library_resolver::j2534_0404::resolve_in_dir(dir.path(), name)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert!(
+                resolved.definition.library.ends_with(format!("{i}.lib")),
+                "{name}"
+            );
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

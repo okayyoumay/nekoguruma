@@ -55,6 +55,7 @@ fn long_size() -> u8 {
 struct TempPaths {
     config: PathBuf,
     control_dir: PathBuf,
+    definitions: PathBuf,
     ecu_state: PathBuf,
     locks: PathBuf,
 }
@@ -64,6 +65,7 @@ impl Drop for TempPaths {
         let _ = std::fs::remove_file(&self.config);
         let _ = std::fs::remove_file(&self.ecu_state);
         let _ = std::fs::remove_dir_all(&self.control_dir);
+        let _ = std::fs::remove_dir_all(&self.definitions);
         let _ = std::fs::remove_dir_all(&self.locks);
     }
 }
@@ -154,6 +156,7 @@ fn a_link_that_cannot_be_closed_keeps_the_guards_until_the_worker_is_gone() {
     let paths = TempPaths {
         config: temp.join(format!("sim-vci-unconfirmed-{nanos}.toml")),
         control_dir: temp.join(format!("sim-vci-unconfirmed-{nanos}")),
+        definitions: temp.join(format!("sim-vci-unconfirmed-definitions-{nanos}")),
         ecu_state: temp.join(format!("sim-vci-unconfirmed-{nanos}.ecu")),
         locks: temp.join(format!("sim-vci-unconfirmed-locks-{nanos}")),
     };
@@ -165,11 +168,17 @@ fn a_link_that_cannot_be_closed_keeps_the_guards_until_the_worker_is_gone() {
         ),
     )
     .expect("test config file should be writable");
+    // Also names the library through a registration definition (ADR-282), so the switch to
+    // `ngr-library-resolver` needs no test changes.
+    std::fs::create_dir_all(&paths.definitions).expect("definition directory");
+    j2534_0404_mock::write_definition(&paths.definitions, LIBRARY_NAME, &sim_vci_path())
+        .expect("definition file should be writable");
     std::fs::create_dir(&paths.control_dir).expect("control directory should be created");
     // SAFETY: this test binary runs only this test, and the runtime, the only other source of
     // threads here, is built below, so nothing reads the environment concurrently.
     unsafe {
         std::env::set_var("VCI_CONFIG_PATH", &paths.config);
+        std::env::set_var("NGR_J2534_DEFINITION_DIR", &paths.definitions);
         std::env::set_var("NGR_SIM_VCI_CONTROL_DIR", &paths.control_dir);
         // The ECU's state file appears when the job's open creates the ECU, which tells this
         // test when the job has started.

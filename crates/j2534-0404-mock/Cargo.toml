@@ -14,3 +14,5 @@ j2534-0404-sys = { workspace = true }
 
 [dev-dependencies]
 j2534-0404 = { workspace = true }
+ngr-library-resolver = { workspace = true }
+tempfile = "3"

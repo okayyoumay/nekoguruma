@@ -181,12 +181,21 @@ impl Env {
             ),
         )
         .expect("test config file should be writable");
+        // Also names the library through a registration definition (ADR-282), so the switch to
+        // `ngr-library-resolver` needs no test changes.
+        std::fs::create_dir_all(env.definitions()).expect("definition directory");
+        j2534_0404_mock::write_definition(&env.definitions(), LIBRARY_NAME, &sim_vci_path())
+            .expect("definition file should be writable");
         std::fs::write(env.ecu_config(), ecu_config).expect("ECU config file should be writable");
         env
     }
 
     fn config(&self) -> PathBuf {
         self.root.join("sim-vci.toml")
+    }
+
+    fn definitions(&self) -> PathBuf {
+        self.root.join("definitions")
     }
 
     fn ecu_config(&self) -> PathBuf {
@@ -220,6 +229,7 @@ impl Env {
     fn apply_to(&self, command: &mut Command) {
         command
             .env("VCI_CONFIG_PATH", self.config())
+            .env("NGR_J2534_DEFINITION_DIR", self.definitions())
             .env("NGR_SIM_ECU_CONFIG", self.ecu_config())
             .env("NGR_SIM_ECU_STATE", self.ecu_state())
             .env("NGR_SIM_VCI_TRACE", self.trace_file())
@@ -238,6 +248,7 @@ impl Env {
         // SAFETY: the caller's contract.
         unsafe {
             std::env::set_var("VCI_CONFIG_PATH", self.config());
+            std::env::set_var("NGR_J2534_DEFINITION_DIR", self.definitions());
             std::env::set_var("NGR_SIM_ECU_CONFIG", self.ecu_config());
             std::env::set_var("NGR_SIM_ECU_STATE", self.ecu_state());
             std::env::set_var("NGR_SIM_VCI_TRACE", self.trace_file());

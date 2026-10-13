@@ -218,10 +218,19 @@ async fn read_the_vin() {
         ),
     )
     .expect("test config file should be writable");
+    // Also names the library through a registration definition (ADR-282), so the switch to
+    // `ngr-library-resolver` needs no test changes.
+    let definition_dir =
+        std::env::temp_dir().join(format!("j2534-0404-service-{nanos}-sim-vci-definitions"));
+    let _ = std::fs::remove_dir_all(&definition_dir);
+    std::fs::create_dir_all(&definition_dir).expect("definition directory");
+    j2534_0404_mock::write_definition(&definition_dir, LIBRARY_NAME, &library)
+        .expect("definition file should be writable");
     // SAFETY: this test binary runs only this test, so no other thread reads
     // or writes the environment concurrently.
     unsafe {
         std::env::set_var("VCI_CONFIG_PATH", &config_path);
+        std::env::set_var("NGR_J2534_DEFINITION_DIR", &definition_dir);
         std::env::remove_var("VCI_SERVICE_INSECURE_NO_AUTH");
         // The simulated ECU uses its built-in configuration.
         std::env::remove_var("NGR_SIM_ECU_CONFIG");

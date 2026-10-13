@@ -71,10 +71,18 @@ fn agent_refuses_a_write_on_a_vci_that_is_not_the_simulator() {
         ),
     )
     .expect("test config file should be writable");
+    // Also names the library through a registration definition (ADR-282), so the switch to
+    // `ngr-library-resolver` needs no test changes.
+    let definition_dir = std::env::temp_dir().join(format!("agent-refuses-{nanos}-definitions"));
+    let _ = std::fs::remove_dir_all(&definition_dir);
+    std::fs::create_dir_all(&definition_dir).expect("definition directory");
+    j2534_0404_mock::write_definition(&definition_dir, LIBRARY_NAME, &mock_library)
+        .expect("definition file should be writable");
     // SAFETY: this test binary runs only this test, and the runtime, the only other source of
     // threads here, is built below, so nothing reads the environment concurrently.
     unsafe {
         std::env::set_var("VCI_CONFIG_PATH", &config_path);
+        std::env::set_var("NGR_J2534_DEFINITION_DIR", &definition_dir);
         std::env::remove_var("VCI_SERVICE_INSECURE_NO_AUTH");
     }
 

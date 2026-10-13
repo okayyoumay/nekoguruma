@@ -205,6 +205,13 @@ fn agent_job_downloads_more_blocks_than_the_counter_holds() {
         ),
     )
     .expect("test config file should be writable");
+    // Also names the library through a registration definition (ADR-282), so the switch to
+    // `ngr-library-resolver` needs no test changes.
+    let definition_dir = std::env::temp_dir().join(format!("agent-flash-{nanos}-definitions"));
+    std::fs::create_dir_all(&definition_dir).expect("definition directory");
+    let _definitions = TempDir(definition_dir.clone());
+    j2534_0404_mock::write_definition(&definition_dir, LIBRARY_NAME, &sim_vci_path())
+        .expect("definition file should be writable");
     // No security access, so the program needs no seed-key computation.
     std::fs::write(
         &ecu_path,
@@ -217,6 +224,7 @@ fn agent_job_downloads_more_blocks_than_the_counter_holds() {
     // threads here, is built below, so nothing reads the environment concurrently.
     unsafe {
         std::env::set_var("VCI_CONFIG_PATH", &config_path);
+        std::env::set_var("NGR_J2534_DEFINITION_DIR", &definition_dir);
         std::env::remove_var("VCI_SERVICE_INSECURE_NO_AUTH");
         std::env::set_var("NGR_SIM_ECU_CONFIG", &ecu_path);
         std::env::remove_var("NGR_SIM_ECU_STATE");

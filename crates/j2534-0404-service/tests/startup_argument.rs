@@ -26,6 +26,7 @@ async fn status_for(startup_arg: &str) -> Value {
     let mut child = Command::new(env!("CARGO_BIN_EXE_j2534-0404-service"))
         .arg(startup_arg)
         .env_remove("VCI_CONFIG_PATH")
+        .env_remove("NGR_J2534_DEFINITION_DIR")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

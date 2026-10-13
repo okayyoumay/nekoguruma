@@ -52,12 +52,14 @@ fn long_size() -> u8 {
 struct TempPaths {
     config: PathBuf,
     control_dir: PathBuf,
+    definitions: PathBuf,
 }
 
 impl Drop for TempPaths {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.config);
         let _ = std::fs::remove_dir_all(&self.control_dir);
+        let _ = std::fs::remove_dir_all(&self.definitions);
     }
 }
 
@@ -144,6 +146,7 @@ fn the_worker_absorbs_response_pending_for_the_agent() {
     let paths = TempPaths {
         config: temp.join(format!("sim-vci-rc78-{nanos}.toml")),
         control_dir: temp.join(format!("sim-vci-rc78-{nanos}")),
+        definitions: temp.join(format!("sim-vci-rc78-definitions-{nanos}")),
     };
     std::fs::write(
         &paths.config,
@@ -153,11 +156,17 @@ fn the_worker_absorbs_response_pending_for_the_agent() {
         ),
     )
     .expect("test config file should be writable");
+    // Also names the library through a registration definition (ADR-282), so the switch to
+    // `ngr-library-resolver` needs no test changes.
+    std::fs::create_dir_all(&paths.definitions).expect("definition directory");
+    j2534_0404_mock::write_definition(&paths.definitions, LIBRARY_NAME, &sim_vci_path())
+        .expect("definition file should be writable");
     std::fs::create_dir(&paths.control_dir).expect("control directory should be created");
     // SAFETY: this test binary runs only this test, and the runtime, the only other source of
     // threads here, is built below, so nothing reads the environment concurrently.
     unsafe {
         std::env::set_var("VCI_CONFIG_PATH", &paths.config);
+        std::env::set_var("NGR_J2534_DEFINITION_DIR", &paths.definitions);
         std::env::set_var("NGR_SIM_VCI_CONTROL_DIR", &paths.control_dir);
         std::env::remove_var("VCI_SERVICE_INSECURE_NO_AUTH");
         // The simulated ECU uses its built-in configuration, without a state file.

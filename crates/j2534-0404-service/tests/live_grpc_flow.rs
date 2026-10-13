@@ -198,11 +198,26 @@ fn resolve_library_name() -> Option<String> {
             format!("[config.apis.j2534-0404.libs.live-target]\nlibrary_path = {dll_path:?}\n",);
         std::fs::write(&config_path, &config_toml)
             .unwrap_or_else(|err| panic!("{} should be writable: {err}", config_path.display()));
+        // Also names the library through a registration definition (ADR-282), so the switch to
+        // `ngr-library-resolver` needs no test changes.
+        let definition_dir = std::env::temp_dir().join(format!(
+            "j2534-0404-service-live-test-definitions-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&definition_dir);
+        std::fs::create_dir_all(&definition_dir).expect("definition directory");
+        // A definition names its library by absolute path, while `library_path` also takes a
+        // relative one.
+        let definition_library = std::path::absolute(&dll_path)
+            .unwrap_or_else(|err| panic!("{dll_path} should resolve to an absolute path: {err}"));
+        j2534_0404_mock::write_definition(&definition_dir, "live-target", &definition_library)
+            .expect("definition file should be writable");
         // SAFETY: this test runs alone in its own process (a distinct `cargo
         // test` integration-test binary), so no other thread reads env vars
         // concurrently with this write.
         unsafe {
             std::env::set_var("VCI_CONFIG_PATH", &config_path);
+            std::env::set_var("NGR_J2534_DEFINITION_DIR", &definition_dir);
         }
         println!("target: J2534_DLL_PATH={dll_path:?} (via temporary config.toml override)");
         return Some("live-target".to_string());

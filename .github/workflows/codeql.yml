@@ -1,0 +1,57 @@
+name: CodeQL
+
+# CodeQL code scanning (ADR-283). This workflow replaces GitHub's default setup, which analyses
+# every pull request commit, so that commits touching only documentation, `work/` or `.claude/`
+# (the paths ci.yml skips) are not analysed. Default setup must stay disabled in the repository's
+# code security settings: GitHub rejects this workflow's results while it is enabled.
+# The workflow keeps default setup's name, languages, query suite and per-language categories, so
+# existing alerts carry over and codeql-alert-handoff.yml (which follows the "CodeQL" workflow)
+# keeps working. CodeQL is not a required check, so pull requests may skip it at workflow level.
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'work/**'
+      - '.claude/**'
+  pull_request:
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'work/**'
+      - '.claude/**'
+  schedule:
+    - cron: '17 19 * * 0' # weekly, as under default setup
+  workflow_dispatch:
+
+# A new push to a pull request cancels the analysis of its previous commit.
+concurrency:
+  group: codeql-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # Neither language needs a build (build-mode none), as under default setup.
+        language: [actions, rust]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+      - uses: github/codeql-action/analyze@v4
+        with:
+          category: /language:${{ matrix.language }}

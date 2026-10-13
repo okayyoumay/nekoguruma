@@ -206,8 +206,8 @@ jobs:
 
   # Windows targets are *-pc-windows-gnullvm, cross-built on Linux with the llvm-mingw toolchain
   # (clang, lld and the mingw-w64 import libraries). .cargo/config.toml links libunwind
-  # statically, so the binaries need no DLL beyond those Windows itself provides; the last step
-  # checks that.
+  # statically, so the binaries need no DLL beyond those Windows itself provides;
+  # abi-roundtrip-windows checks that on a Windows runner.
   worker-windows:
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
@@ -252,22 +252,13 @@ jobs:
             target/${{ matrix.target }}/debug/sim_vci.dll
             target/${{ matrix.target }}/debug/j2534-0404-service.exe
             target/${{ matrix.target }}/debug/sim_vci_end_to_end.exe
+            target/${{ matrix.target }}/release/*.exe
           if-no-files-found: error
           # Long enough to re-run abi-roundtrip-windows alone after a failure.
           retention-days: 7
       # sim-vci's exports must carry the plain J2534 names (stdcall on win-x86, 7.1.2).
       - name: Check sim-vci exports
         run: PROFILE=release ./scripts/abi-roundtrip.sh ${{ matrix.target }}
-      - name: Check DLL imports
-        run: |
-          for exe in target/${{ matrix.target }}/release/*.exe; do
-            echo "$exe"
-            llvm-objdump -p "$exe" | grep 'DLL Name' | tee "$RUNNER_TEMP/imports.txt"
-            if grep -Eiv 'DLL Name: (kernel32|ntdll|ucrtbase|advapi32|ws2_32|bcrypt|bcryptprimitives|userenv|user32|ole32|combase|oleaut32|shell32|secur32|crypt32|wintrust|ncrypt|iphlpapi|dbghelp|psapi|synchronization|api-ms-win-[a-z0-9-]+)\.dll' "$RUNNER_TEMP/imports.txt"; then
-              echo "::error::$exe imports a DLL that Windows does not provide"
-              exit 1
-            fi
-          done
 
   # ABI interpretation table (7.1.2) on the Linux worker targets: each target's
   # j2534-0404-service is launched against sim-vci built for the same target (ARM under
@@ -323,11 +314,11 @@ jobs:
       - uses: actions/download-artifact@v7
         with:
           name: abi-launch-x86_64-pc-windows-gnullvm
-          path: target/x86_64-pc-windows-gnullvm/debug
+          path: target/x86_64-pc-windows-gnullvm
       - uses: actions/download-artifact@v7
         with:
           name: abi-launch-i686-pc-windows-gnullvm
-          path: target/i686-pc-windows-gnullvm/debug
+          path: target/i686-pc-windows-gnullvm
       # The export check needs llvm-objdump, which the runner's LLVM provides.
       - shell: bash
         run: |
@@ -336,6 +327,44 @@ jobs:
           for target in x86_64-pc-windows-gnullvm i686-pc-windows-gnullvm; do
             LAUNCH=1 ./scripts/abi-roundtrip.sh "$target"
           done
+      # Every DLL a release binary imports must be one this Windows provides: an API set
+      # (api-ms-*, ext-ms-*, which the loader resolves without a file of that name) or a file in
+      # the system directory for the binary's bitness (System32 for x64, SysWOW64 for x86). It is
+      # checked against the runner's Windows rather than a list of names, so a newly used system
+      # DLL needs no change here (ADR-283), while one that only llvm-mingw ships (libunwind,
+      # libc++) still fails.
+      - name: Check DLL imports
+        shell: bash
+        run: |
+          export PATH="$PATH:/c/Program Files/LLVM/bin"
+          status=0
+          for target in x86_64-pc-windows-gnullvm i686-pc-windows-gnullvm; do
+            case "$target" in
+              x86_64-*) sysdir=/c/Windows/System32 ;;
+              *) sysdir=/c/Windows/SysWOW64 ;;
+            esac
+            for exe in target/"$target"/release/*.exe; do
+              if [ ! -f "$exe" ]; then
+                echo "::error::no release binary for $target"
+                exit 1
+              fi
+              echo "$exe"
+              for dll in $(llvm-objdump -p "$exe" | sed -n 's/^ *DLL Name: *//p' | tr -d '\r'); do
+                case "${dll,,}" in
+                  api-ms-*|ext-ms-*) echo "  $dll (API set)" ;;
+                  *)
+                    if [ -f "$sysdir/$dll" ]; then
+                      echo "  $dll"
+                    else
+                      echo "::error::$exe imports $dll, which $sysdir does not contain"
+                      status=1
+                    fi
+                    ;;
+                esac
+              done
+            done
+          done
+          exit $status
 
   # Integration tests for operation modes (user / device) run in separate environments.
   # TODO: startup tests as a Windows service / systemd user service

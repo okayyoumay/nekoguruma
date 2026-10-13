@@ -158,9 +158,10 @@ for a worker target (Linux ARM under qemu-user, Windows on a Windows runner) wit
 `cargo check --target`) and `abi-roundtrip` launches the i686 and aarch64 builds. main launches all
 four Linux targets, runs the release builds (cargo-zigbuild for Linux, llvm-mingw for the
 `*-pc-windows-gnullvm` Windows targets, all on Linux), and launches the Windows debug builds that
-`worker-windows` cross-compiles (`abi-roundtrip-windows`). On pull requests that change only documentation, `work/` or `.claude/`, the
+`worker-windows` cross-compiles (`abi-roundtrip-windows`), where it also checks that the release
+binaries import only DLLs that Windows itself provides (ADR-283). On pull requests that change only documentation, `work/` or `.claude/`, the
 `changes` job in `ci.yml` skips the build jobs, which then count as passed required checks;
-`repo-checks.yml` always runs. Do not run cross-target builds locally unless asked; CI covers
+`repo-checks.yml` always runs. CodeQL (`codeql.yml`, ADR-283) skips the same changes. Do not run cross-target builds locally unless asked; CI covers
 them.
 
 The `msrv` job checks the workspace with the Rust version in `Cargo.toml`'s `rust-version`

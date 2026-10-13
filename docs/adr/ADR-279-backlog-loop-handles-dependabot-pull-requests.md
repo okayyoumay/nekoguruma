@@ -1,7 +1,7 @@
 # ADR-279: The Backlog Loop Handles Open Dependabot Pull Requests First
 
 **Date:** 2026-10-11
-**Status:** Accepted
+**Status:** Accepted (Decision item 4's allowlist check replaced by the check against the Windows runner's system directory, ADR-283)
 **Affects:** `.claude/skills/backlog-loop/SKILL.md`
 
 ## Context

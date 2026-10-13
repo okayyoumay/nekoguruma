@@ -12,8 +12,8 @@ on:
   schedule:
     - cron: "47 23 * * 2" # Wednesday 08:47 JST
   # A merged fix frees the loop for the next alert. Actions has no code scanning alert event, so
-  # the job runs when CodeQL default setup (workflow name "CodeQL") finishes analysing a push to
-  # main, and continues only when that commit merged a codeql PR.
+  # the job runs when the CodeQL workflow (codeql.yml) finishes analysing main, and continues only
+  # when the analysed commit merged a codeql PR.
   workflow_run:
     workflows: [CodeQL]
     types: [completed]
@@ -31,8 +31,8 @@ concurrency:
 
 jobs:
   handoff:
-    # An analysis that did not succeed leaves the alerts stale: send nothing. (Default setup's
-    # runs report the event `dynamic`, not `push`; the merged-PR check below does the filtering.)
+    # An analysis that did not succeed leaves the alerts stale: send nothing. (Weekly and push
+    # analyses of main both arrive here; the merged-PR check below does the filtering.)
     if: >-
       github.event_name != 'workflow_run'
       || github.event.workflow_run.conclusion == 'success'

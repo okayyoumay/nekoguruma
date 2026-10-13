@@ -279,8 +279,7 @@ pub fn list_configured_libraries() -> Vec<String> {
 /// entries).
 ///
 /// A device name present in both sources appears once, with `library_path`
-/// set to the configured override (matching the priority
-/// [`resolve_library_path`] applies at startup) and `source` set to
+/// set to the configured override and `source` set to
 /// [`LibrarySource::Both`]. A name present in only one source keeps that
 /// source's fields, with `source` set to [`LibrarySource::Registry`] or
 /// [`LibrarySource::Config`] accordingly.
@@ -322,21 +321,6 @@ pub fn enumerate_libraries(mode: RegistryViewMode) -> Vec<J2534DeviceInfo> {
 
     devices.sort_by(|a, b| a.device_name.cmp(&b.device_name));
     devices
-}
-
-/// Resolves the filesystem path of the J2534 v04.04 library named
-/// `library_name`, applying the same priority `J2534Service::new()` used to
-/// apply itself: a configured `library_path` override (`find_library_path`)
-/// takes priority when present, falling back to registry auto-discovery
-/// (`find_j2534_device`) otherwise.
-pub fn resolve_library_path(
-    arch: Option<&str>,
-    library_name: &str,
-) -> Result<PathBuf, RegistryError> {
-    if let Some(path) = find_library_path(arch, library_name) {
-        return Ok(path);
-    }
-    Ok(find_j2534_device(library_name)?.library_path)
 }
 
 // ---------------------------------------------------------------------------

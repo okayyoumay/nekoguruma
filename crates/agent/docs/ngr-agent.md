@@ -12,8 +12,8 @@ ngr-agent run --vci <name> --mode <device|user> --program <file> [--workers <dir
 
 | Option | Meaning |
 |---|---|
-| `--vci` | J2534 v04.04 library name, as the worker service resolves it (registry key on Windows, `library_path` entry in the service's `config.toml`) |
-| `--mode` | The device's operating mode (design 6.2), `device` or `user`. Required: the mode is fixed per device at installation, and this command, which has no installation of its own, takes it from the command line rather than defaulting to either. It is passed to the worker (ADR-281 Decision item 2); design 7.2 gives it its meaning for a failed library check: device mode refuses the library, user mode reports the findings and loads it. `iso22900-service` applies it to the checks it runs before loading; `j2534-0404-service` records it, and its library loading does not consult it yet |
+| `--vci` | J2534 v04.04 library name: the registry key name on Windows, the `Name` of a registration definition on Linux (design 7.1.1), which the worker service resolves. The agent's own lookup (step 3) still reads `library_path` on Linux |
+| `--mode` | The device's operating mode (design 6.2), `device` or `user`. Required: the mode is fixed per device at installation, and this command, which has no installation of its own, takes it from the command line rather than defaulting to either. It is passed to the worker (ADR-281 Decision item 2); design 7.2 gives it its meaning for a failed library check: device mode refuses the library, user mode reports the findings and loads it. both worker services apply it to the checks they run before loading |
 | `--program` | IR program file: a `diag_ir::Program` serialized as JSON |
 | `--workers` | Directory of worker builds, laid out as `<dir>/<ABI name>/j2534-0404-service[.exe]` (design 7.3). Default: `workers` next to the `ngr-agent` executable |
 | `--locks` | The device's lock directory for the job's guards ("Job guards" below), as an absolute path. Default: `locks` next to the `ngr-agent` executable. Lock files are opened read-only, so a file another user created still locks. The agent creates a missing directory writable by its owner only, so a device whose agents run as several users needs it prepared beforehand: writable by all of them, and with the sticky bit (or an equivalent ACL) so that no user can delete another's lock files (ADR-257). It must also be readable by every agent user, since the per-vehicle lock lists it, and on Unix support hard links, with which it creates its files (ADR-262). On Unix a directory that group or others may write without the sticky bit, or without being readable by them, is refused |
@@ -43,7 +43,9 @@ Steps (`agent::check_program`, `agent::guards::JobGuards`, `agent::launch::launc
      the x64 build.
    - Windows x86 agent: the x86 build only, so a 64-bit library is not found.
    - Linux: one lookup without an architecture key; the registry does not apply, so the
-     library needs a `library_path` entry, and the build follows the header's ABI.
+     library needs a `library_path` entry, and the build follows the header's ABI. The
+     worker itself resolves the name through `ngr-library-resolver` (its registration
+     definition), so on Linux the library needs both, naming the same file.
 4. Pick the service build for that ABI with `WorkerLayout::find`. A missing build fails as
    `UNSUPPORTED_ABI`.
 5. Launch the service with the library name, the `--mode` value and the ABI's default `long_size` (design 7.1.2;

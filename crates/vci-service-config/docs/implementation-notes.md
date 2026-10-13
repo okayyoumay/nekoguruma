@@ -67,11 +67,8 @@ configuration, not a running service.
 - `iso22900-registry` and `j2534-0404-registry` depend on this crate
   directly and each expose a thin wrapper — `find_library_path(arch, lib)`
   and `list_configured_libraries()` — scoped to their own API name
-  (`"iso22900"` / `"j2534-0404"`). `j2534-0404-service` calls its
-  registry's `find_library_path` (through `resolve_library_path`, not the
-  launcher re-export) to resolve a library name to a path before falling back
-  to registry auto-discovery (see ADR-034). `iso22900-service` does not read
-  `library_path`; it resolves through `ngr-library-resolver`.
+  (`"iso22900"` / `"j2534-0404"`). Neither worker service reads
+  `library_path`; both resolve through `ngr-library-resolver`.
 - Each registry crate's `enumerate_libraries(mode)` calls
   `list_configured_library_paths()` directly (not just
   `list_configured_libraries()`) so it can merge each config entry's

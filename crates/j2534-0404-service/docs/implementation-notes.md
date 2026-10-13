@@ -7,7 +7,7 @@ Acts as a D-PDU API compliant gRPC service that maps ISO 22900-2 operations onto
 ## Assumptions
 
 - Startup argument contract is `j2534-0404:<library name>?mode=<device|user>&port=<u16>&...` with required scheme, non-empty library name and operating mode (ADR-281 Decision item 2).
-- `<library name>` resolves to a path via `j2534_0404_registry::resolve_library_path()`, which checks a `library_path` entry in the shared `config.toml` first, falling back to the Windows registry (`j2534-0404-registry`) when no such entry exists. See `startup-spec.md`.
+- `<library name>` resolves through `ngr_library_resolver::j2534_0404::resolve()`: a registration definition on Linux, the registry on Windows, and in a debug build the `NGR_J2534_DEFINITION_DIR` definition directory on both (ADR-282). The design 7.2 pre-load checks (`src/preload.rs`) run before loading, and the operating mode decides what a failed one means; the per-library settings are read only when `config.toml` was among the checked files. See `startup-spec.md`.
 - Local gRPC server starts before JSON-RPC request loop begins.
 - JSON-RPC stdio framing uses one-line JSON messages.
 - Physical channels are shared across Logical Links (CLLs) that use the same hardware protocol and baud rate.

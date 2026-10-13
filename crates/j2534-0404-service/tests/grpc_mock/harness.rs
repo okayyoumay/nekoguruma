@@ -1760,9 +1760,8 @@ impl TestServer {
     /// `vci-service-config::load_toml_config` silently treats a resulting
     /// torn/corrupted read as "nothing configured" (`TomlConfig::default()`,
     /// a warning-only `eprintln!`) rather than propagating the parse error,
-    /// so the observable failure is `library_path` silently resolving to
-    /// `None` and falling through to real Windows-registry auto-discovery,
-    /// which immediately errors `RegistryUnsupported` on any other platform.
+    /// so the observable failure is the extra settings silently going missing
+    /// and the test running against the default configuration.
     /// The lock is held from just before the file write through the end of
     /// `J2534Service::new`'s `.await` (confirmed to read `VCI_CONFIG_PATH`
     /// only synchronously, before its first real await point, but the lock
@@ -1803,13 +1802,9 @@ impl TestServer {
         // qualified, so its position relative to `modules_toml`'s
         // `[[...modules]]` array-of-tables entries (also fully qualified)
         // does not matter either way.
-        let config_toml = format!(
-            "[config.apis.j2534-0404.libs.mock-lib]\nlibrary_path = {:?}\n{extra_toml}{VENDOR_IOCTLS_TOML}",
-            lib_path.display().to_string()
-        );
+        let config_toml =
+            format!("[config.apis.j2534-0404.libs.mock-lib]\n{extra_toml}{VENDOR_IOCTLS_TOML}",);
         std::fs::write(&config_path, config_toml).expect("config file should be writable");
-        // Also names the library through a registration definition (ADR-282), so the switch
-        // to `ngr-library-resolver` needs no test changes.
         let definition_dir = std::env::temp_dir().join(format!(
             "j2534-0404-service-grpc-mock-test-definitions-{}",
             std::process::id()

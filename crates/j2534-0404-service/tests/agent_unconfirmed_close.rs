@@ -160,16 +160,9 @@ fn a_link_that_cannot_be_closed_keeps_the_guards_until_the_worker_is_gone() {
         ecu_state: temp.join(format!("sim-vci-unconfirmed-{nanos}.ecu")),
         locks: temp.join(format!("sim-vci-unconfirmed-locks-{nanos}")),
     };
-    std::fs::write(
-        &paths.config,
-        format!(
-            "[config.apis.j2534-0404.libs.{LIBRARY_NAME:?}]\nlibrary_path = {:?}\n",
-            sim_vci_path().display().to_string()
-        ),
-    )
-    .expect("test config file should be writable");
-    // Also names the library through a registration definition (ADR-282), so the switch to
-    // `ngr-library-resolver` needs no test changes.
+    std::fs::write(&paths.config, "").expect("test config file should be writable");
+    // The registration definition names the library, through the debug-only
+    // `NGR_J2534_DEFINITION_DIR` override (ADR-282).
     std::fs::create_dir_all(&paths.definitions).expect("definition directory");
     j2534_0404_mock::write_definition(&paths.definitions, LIBRARY_NAME, &sim_vci_path())
         .expect("definition file should be writable");

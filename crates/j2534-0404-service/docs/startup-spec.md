@@ -14,7 +14,7 @@ This document defines the startup argument format and the JSON-RPC contract on s
   - `j2534-0404:<library name>?mode=<device|user>&port=<grpc port number>&...`
 - The query string is required, since it carries `mode`.
 - `<library name>` is required and must be non-empty.
-- Query parameter `mode` is required: the device's operating mode (design 6.2), `device` or `user` in lowercase (compared after URL percent-decoding, like every query parameter). The agent passes it; the worker does not infer it and no configuration file sets it (ADR-281 Decision item 2). A missing, repeated or unknown `mode` is rejected as invalid input. Design 7.2 gives the mode its meaning for a failed library check: device mode refuses the library, user mode reports the findings and loads it. The worker records the mode and logs it at startup; its library loading ("Library Name Resolution" below) does not consult it.
+- Query parameter `mode` is required: the device's operating mode (design 6.2), `device` or `user` in lowercase (compared after URL percent-decoding, like every query parameter). The agent passes it; the worker does not infer it and no configuration file sets it (ADR-281 Decision item 2). A missing, repeated or unknown `mode` is rejected as invalid input. Design 7.2 gives the mode its meaning for a failed library check: device mode refuses the library, user mode reports the findings and loads it. The worker logs the mode at startup and applies it to the checks it runs before loading ("Library Name Resolution" below).
 - Query parameter `port` is optional.
 - Unknown query parameters are ignored by the current implementation.
 - Repeating `port` is rejected as invalid input.
@@ -36,22 +36,31 @@ This document defines the startup argument format and the JSON-RPC contract on s
 
 ### Library Name Resolution
 
-`<library name>` is resolved to a filesystem path via a single call to
-`j2534_0404_registry::resolve_library_path()`, which checks two sources in
-order:
+`<library name>` resolves through `ngr_library_resolver::j2534_0404::resolve()`
+(design 7.1.1, ADR-228 Decision item 4): the registration definition whose
+`Name` matches on Linux, or the registry key of that name under
+`HKLM\SOFTWARE\PassThruSupport.04.04` (native view) on Windows, gives the
+library path. In a debug build, `NGR_J2534_DEFINITION_DIR` replaces both with a
+definition directory (ADR-282), which is how the tests point the service at the
+mock library or `sim-vci`. No `config.toml` key names the library (ADR-281
+Decision item 1).
 
-1. A `library_path` entry for that name in `config.toml`, resolved via
-   `j2534_0404_registry::find_library_path()` (which wraps
-   `vci-service-config`'s lookup — see `vci-service-config/docs/logging-config.md`,
-   "Library Path Overrides"). When present, it is used as-is and step 2 is
-   skipped.
-2. Otherwise, the Windows registry (`j2534-0404-registry`'s
-   `find_j2534_device()`,
-   `HKLM\SOFTWARE\PassThruSupport.04.04\<library name>\FunctionLibrary`).
+The same name is the `"<lib>"` key of the library's settings in `config.toml`
+(`config.apis.j2534-0404.libs."<lib>"`: `modules`, `can_channel_mode`,
+`vendor_ioctls`), so the settings read are those of the library resolved.
 
-On non-Windows platforms, step 2 always fails
-(`RegistryError::RegistryUnsupported`), so a `library_path` config entry is
-required to resolve any library name.
+Immediately before loading, the service runs the design 7.2 pre-load checks
+(`src/preload.rs`, through `ngr_library_resolver::check_library` with the
+system owners as the trusted set) on the library, the definition that named it
+and, when it exists, `config.toml` (`vci_service_config::config_file()`), whose
+per-library settings it acts on (ADR-270 Decision item 5). A registry hit has
+no naming file to check, since HKLM is trusted by premise (7.2). When
+`config.toml` does not exist at that point, the service reads no settings from
+it and uses the defaults, since a file created later passed no check. In device
+mode a failed check refuses the library with `FAILED_PRECONDITION` and a
+message that names no path; in user mode the findings are logged as a warning
+and the library is loaded. What the check opened stays open until the library
+is mapped (ADR-278).
 
 ## Stdio Framing
 

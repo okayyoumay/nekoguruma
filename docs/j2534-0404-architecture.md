@@ -77,6 +77,7 @@ crates/
 │   │   ├── main.rs
 │   │   ├── config.rs            # Startup configuration parser
 │   │   ├── error.rs
+│   │   ├── preload.rs           # Design 7.2 pre-load checks and the mode's verdict on a failure
 │   │   └── service/
 │   │       ├── rpc_module.rs    # Module RPCs (GetModuleIds, GetVersion, …)
 │   │       ├── rpc_misc.rs      # IoCtl, GetObjectId, UniqueRespIdTable
@@ -592,15 +593,26 @@ j2534-0404-service "j2534-0404:OpenPort2?mode=user&port=50051"
 ```
 
 The startup argument carries a **library name**, not a path (see
-`j2534-0404-service/docs/startup-spec.md`). That name is resolved to an
-actual DLL/`.so` path in one of two ways, checked in order:
+`j2534-0404-service/docs/startup-spec.md`). The service resolves that name
+itself through `ngr-library-resolver` (`ngr_library_resolver::j2534_0404`,
+design 7.1.1, ADR-228 Decision item 4): on Linux the registration definition
+whose `Name` matches, on Windows the registry key of that name (via
+`j2534-0404-registry`, below). In a debug build, `NGR_J2534_DEFINITION_DIR`
+replaces both with a definition directory (ADR-282); the tests use it. No
+`config.toml` key names the library (ADR-281 Decision item 1).
 
-1. A `library_path` entry for that name in `config.toml`, read via
-   `vci-service-config` (see
-   [`vci-service-config/docs/logging-config.md`](../crates/vci-service-config/docs/logging-config.md#library-path-overrides)) — lets deployers add
-   libraries the registry doesn't know about, or override its result, and is
-   the only resolution path on non-Windows.
-2. Otherwise, the Windows registry, via `j2534-0404-registry` (below).
+The name the service is started with is therefore both the name it resolves
+(`Name` in a Linux definition, the registry key name on Windows) and the
+`"<lib>"` key of its per-library settings, `config.apis.j2534-0404.libs."<lib>"`
+in `config.toml`, including the `modules` entries whose `pname` becomes
+`PassThruOpen`'s `pName` (ADR-107). `tests/preload_checks.rs` checks this.
+
+Immediately before loading, the service runs the design 7.2 pre-load checks on
+the library, the definition that named it and, when it exists, `config.toml`
+(ADR-270 Decision item 5). The operating mode from the startup argument decides
+what a failure means (ADR-281 Decision item 2): device mode refuses the library
+with `FAILED_PRECONDITION`, user mode logs the findings and loads it. When
+`config.toml` does not exist at that point, no per-library settings are read.
 
 #### Service Model
 
@@ -950,8 +962,8 @@ An in-process mock J2534 DLL for testing service logic without hardware.
 ### j2534-0404-registry — Registry Lookup
 
 Discovers installed J2534 devices from the Windows registry. `j2534-0404-service`
-only queries this when the requested library name has no `library_path`
-configured in `config.toml` (see "j2534-0404-service" above).
+reaches it through `ngr-library-resolver` on Windows (see "j2534-0404-service"
+above).
 
 **Registry key:** `HKEY_LOCAL_MACHINE\SOFTWARE\PassThruSupport.04.04`
 
@@ -2885,7 +2897,7 @@ The suite's `cop_ctrl_cycles.rs` module pins the `PDU_COP_CTRL_DATA` cycle seman
 
 ### Layer 3 — Manual Live gRPC Integration Test
 
-`j2534-0404-service/tests/live_grpc_flow.rs` drives the full "Typical gRPC Client Flow" (§11 below) against a **real** J2534 device and vehicle, through the actual gRPC surface (`VciServiceClient` → `J2534Service`), rather than against `j2534-0404-mock`. It is opt-in and excluded from normal/CI runs: it no-ops unless `J2534_LIVE_SERVICE_TEST=1` is set, and further requires a connection target via `J2534_DLL_PATH` (writes a temporary `config.toml` `library_path` override, same mechanism as the `grpc_mock` suite; debug builds only, since the runtime `VCI_CONFIG_PATH` override is compiled out of release builds — ADR-073) or `J2534_LIVE_LIBRARY_NAME` (an already-registered library name; works in both profiles).
+`j2534-0404-service/tests/live_grpc_flow.rs` drives the full "Typical gRPC Client Flow" (§11 below) against a **real** J2534 device and vehicle, through the actual gRPC surface (`VciServiceClient` → `J2534Service`), rather than against `j2534-0404-mock`. It is opt-in and excluded from normal/CI runs: it no-ops unless `J2534_LIVE_SERVICE_TEST=1` is set, and further requires a connection target via `J2534_DLL_PATH` (writes a temporary registration definition naming it and points `NGR_J2534_DEFINITION_DIR` at it, the same mechanism as the `grpc_mock` suite; debug builds only, since that override is compiled out of release builds — ADR-282) or `J2534_LIVE_LIBRARY_NAME` (an already-registered library name; works in both profiles).
 
 Primarily targets CAN-family protocols, since its `SetUniqueRespIdTable` addressing uses `CP_CanFuncReqId`/`CP_CanPhysReqId`/`CP_CanRespUSDTId`, which are `PDU_PC_UNIQUE_ID`-class only for the CAN protocol family (ADR-042). K-line (ISO9141/ISO14230) is also driven, with reduced coverage: each `SetComParam` call that uses a CAN-class ComParam falls back to the equivalent KWP-class one (`CP_FuncReqTargetAddr`, `CP_PhysReqTargetAddr` — ADR-050/ADR-054) when the CAN-class call is rejected, so the same flow drives either family given the right `J2534_LIVE_*` overrides below. `SetUniqueRespIdTable`'s `CP_CanRespUSDTId` has no KWP fallback in this harness, so a K-line `SetUniqueRespIdTable` call is rejected and the harness leaves the table empty (no-table "deliver unconditionally" mode) rather than installing a `CP_EcuRespSourceAddress`-only entry. As of [ADR-203](adr/ADR-203-kwp-j1850-source-address-rx-routing.md), `events_rx_routing.rs::route_frame` RX routing DOES have a real matching tier for `CP_EcuRespSourceAddress` on KWP (ISO9141/ISO14230) and J1850 (VPW/PWM), in addition to `CP_CanRespUSDTId`/`CP_CanRespUUDTId`/`CP_J1939SourceAddress` — before that ADR, `build_cll_rx_entries` unconditionally filtered a `CP_EcuRespSourceAddress`-only entry out of `unique_resp_ids` entirely (so RX routing fell back to the same no-table wildcard delivery either way, and such an entry could never cause a drop); now such an entry is retained and routed for real on a KWP/J1850 CLL, restricting delivery to frames whose source address matches. This harness still leaves the table empty on a K-line rejection rather than installing an SA-keyed entry — a simplification (the no-table wildcard already exercises the flow end-to-end without needing to know the target ECU's real K-line source address up front), not a workaround for a routing gap that no longer exists. TX addressing is unaffected, since it falls back to `CP_PhysReqTargetAddr` when no table entry sets `CP_EcuRespSourceAddress`. SCI still uses different addressing ComParams and is not covered.
 

@@ -1,12 +1,13 @@
 //! Launching the worker for a VCI (design 7.3, 7.4).
 //!
-//! The library behind a VCI name is resolved the way each worker build resolves it on its side
-//! (`j2534_0404_registry`: a `library_path` entry in `config.toml` under the build's
-//! architecture key or at api level, else the build's registry view), so the file whose header
-//! picks the ABI is the file that build loads. The service is then started with the name and
-//! the device's operating mode (ADR-281 Decision item 2; 7.2 gives the mode its meaning for a
-//! failed library check) and resolves the name again itself (7.2). ADR-240 records the
-//! selection rule.
+//! The library behind a VCI name is resolved for each worker build (`j2534_0404_registry`: a
+//! `library_path` entry in `config.toml` under the build's architecture key or at api level,
+//! else the build's registry view), and the file's header picks the ABI. The service is then
+//! started with the name and the device's operating mode (ADR-281 Decision item 2; 7.2 gives
+//! the mode its meaning for a failed library check) and resolves the name again itself,
+//! through `ngr-library-resolver` (7.2): on Windows the same registry key, on Linux its
+//! registration definition, which must name the file the `library_path` entry names. ADR-240
+//! records the selection rule.
 
 use std::path::{Path, PathBuf};
 

@@ -15,22 +15,21 @@ pub fn map_construct_error(error: impl std::fmt::Display) -> Status {
     Status::internal("failed to construct J2534-0404 API")
 }
 
-/// Maps a registry/device-discovery lookup failure to a client-facing
-/// [`Status`], logging the full error (which may contain raw OS/registry
-/// error text) server-side only.
-pub fn map_registry_error(error: j2534_0404_registry::RegistryError) -> Status {
-    use j2534_0404_registry::RegistryError;
+/// Maps a library-resolution failure (design 7.1.1) to a client-facing
+/// [`Status`]. A name that resolves to nothing is reported as not found;
+/// every other failure is logged in full server-side only, since it can
+/// carry definition file paths or raw OS/registry error text (ADR-089).
+pub fn map_resolve_error(error: ngr_library_resolver::j2534_0404::ResolveError) -> Status {
+    use ngr_library_resolver::j2534_0404::ResolveError;
 
     match error {
-        RegistryError::Io(e) => {
-            error!(error = %e, "I/O error while searching for J2534 devices");
-            Status::internal("I/O error while searching for J2534 devices")
-        }
-        RegistryError::RegistryUnsupported => {
-            Status::internal("registry lookup is only supported on Windows")
-        }
-        RegistryError::NotFound(name) => {
+        ResolveError::NotFound { ref name, .. } => {
+            tracing::warn!(%error, "J2534 library not found");
             Status::not_found(format!("no J2534 device found with name '{name}'"))
+        }
+        other => {
+            error!(error = %other, "failed to resolve the J2534 library");
+            Status::internal("failed to resolve the J2534 library")
         }
     }
 }

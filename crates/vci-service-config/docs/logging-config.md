@@ -160,16 +160,12 @@ without a specific library name to attach it to.
 **Lookup is exposed through `iso22900-registry::find_library_path()` and
 `j2534-0404-registry::find_library_path()`** (both thin wrappers around this
 crate's `find_library_path()`, scoped to their own API name), not called
-directly from this crate by `j2534-0404-service` — see ADR-034.
-`j2534-0404-service` does not call `find_library_path()` directly either: it
-calls its registry's single `resolve_library_path()` function, which applies
-the priority itself (see ADR-035). When set for a library name, it is used
-directly and the Windows registry (`j2534-0404-registry`,
-`HKLM\SOFTWARE\PassThruSupport.04.04`) is not consulted for that name. When
-unset, `resolve_library_path()` falls back to the registry as before.
-`iso22900-service` does not read `library_path`: it resolves its library
-through `ngr-library-resolver`'s D-PDU API root description file lookup
-(design 7.1, ADR-281 Decision item 1), then runs the design 7.2 pre-load checks.
+directly from this crate — see ADR-034. Neither worker service reads
+`library_path`: `iso22900-service` resolves its library through
+`ngr-library-resolver`'s D-PDU API root description file lookup (design 7.1)
+and `j2534-0404-service` through its J2534 registration definition or registry
+lookup (design 7.1.1), and both then run the design 7.2 pre-load checks
+(ADR-281 Decision item 1).
 
 The registry crates' `enumerate_libraries()` also reads this table (via
 `list_configured_library_paths()`), so config-only libraries — ones with no

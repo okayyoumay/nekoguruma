@@ -38,7 +38,10 @@
 //! since the worker's receive poll met the lost device, and the run ends there with its guards and journal kept, as after a worker crash. Power comes
 //! back (`reconnect_ecu`) at the next run's first J2534 call, and that run's new worker finds the
 //! VCI plugged in again, since an unplugged VCI is the state of the worker process that saw it.
-//! Both complete the job in the same restart order.
+//! Both complete the job in the same restart order. A third scenario leaves the VCI unplugged for
+//! the next run as well: its worker cannot open the device, so the run ends before its link
+//! opens, sending nothing, counting no resume and keeping its guards, and the run after it, with
+//! the VCI back, completes the job.
 //!
 //! The scenarios after RequestTransferExit kill the agent once the journal holds the
 //! RequestTransferExit marker: before its response was recorded, after it was but before the
@@ -1366,4 +1369,72 @@ fn an_agent_killed_after_a_verified_plan_continues_after_the_read_back_verificat
 
     // Nothing reset the ECU or touched its flash.
     assert_eq!(env.probe(), before);
+}
+
+/// The VCI is unplugged mid-transfer, as in
+/// [`a_vci_disconnect_mid_transfer_is_restarted_once_the_vci_is_back`], and is still unplugged
+/// when the agent's next run starts (design 5.6 Interrupted, 8.2.5; ADR-238, ADR-258). That run's
+/// worker fails to open the device (`PassThruOpen` returns `ERR_DEVICE_NOT_CONNECTED`), so the
+/// run ends in `JobError::Link` before its link opens: nothing is sent to the ECU, no resume is
+/// counted, and the journal is unchanged. The run gives its guards back still held, with no
+/// unconfirmed link, since none was opened. A further run, with the VCI plugged back in, takes the
+/// restart order and completes the job, with one resume counted.
+#[test]
+#[serial]
+fn a_next_run_with_the_vci_still_unplugged_keeps_the_job_for_a_later_run() {
+    let spec = spec();
+    let env = Env::new("vci-still-unplugged", ENTRY, &ecu_config(60_000));
+    let run = env.fault_mid_run(
+        &spec,
+        KILL_AFTER_BLOCK,
+        WAIT_FOR_BLOCK,
+        r#"{"command": "disconnect_vci"}"#,
+    );
+    assert!(env.commands_applied(), "the disconnect should be applied");
+    let first_attempt = assert_interrupted_at_the_next_block(&env, &spec, &run, |cause| {
+        matches!(
+            cause,
+            HostError::Rpc { status, .. } if status.code() == tonic::Code::FailedPrecondition
+        )
+    });
+    let before = env.probe();
+    let journal_before =
+        agent::journal::Journal::read(&env.journal_dir(), &spec.key).expect("journal");
+
+    // The next run's worker finds the VCI unplugged at its first J2534 call, the open.
+    env.inject(r#"{"command": "disconnect_vci"}"#);
+    let second = env.restart_keeping(&spec, run.guards);
+    assert!(env.commands_applied(), "the disconnect should be applied");
+    assert!(
+        matches!(
+            &second.result,
+            Err(agent::JobError::Link(error)) if error.to_string().contains("ERR_DEVICE_NOT_CONNECTED")
+        ),
+        "the run should end on the unplugged VCI before its link opens: {:?}",
+        second.result
+    );
+    assert_eq!(env.trace(), Vec::<String>::new(), "nothing reaches the ECU");
+    assert_eq!(
+        second.journal, journal_before,
+        "the journal is unchanged, with no resume counted"
+    );
+    assert!(!second.link_unconfirmed, "no link was opened");
+    assert!(env.guards_are_held(), "the run should keep its guards");
+    assert_eq!(env.probe(), before, "the ECU is untouched");
+
+    // The VCI is back for the run after: the restart order completes the job.
+    let result = env.restart_on(&spec, second.guards);
+    assert!(
+        !env.guards_are_held(),
+        "the ended job should release its guards"
+    );
+    assert_completed(
+        &env,
+        &spec,
+        first_attempt,
+        before.power_cycles,
+        &[1, 2],
+        Teardown::RESET,
+        result,
+    );
 }

@@ -492,7 +492,11 @@ more interrupt the run at the same point without killing anything: the ECU loses
 block's transfer gets no answer, or finds the link offline because the worker met the lost device,
 and the run ends there, keeping its guards and its journal; after the disconnect the guards' link is
 unconfirmed as after a worker crash. The next run, once power is back or on a new worker that finds
-the VCI plugged in again, takes the same restart order and completes. Three more tests kill the
+the VCI plugged in again, takes the same restart order and completes. When the VCI is still
+unplugged at the next run, its worker cannot open the device (`ERR_DEVICE_NOT_CONNECTED`), so the
+run ends in `JobError::Link` before its link opens: nothing is sent, no resume is counted, the
+journal is unchanged and the guards are given back still held; the run after it, with the VCI
+back, completes the job. Three more tests kill the
 agent after RequestTransferExit was sent: before its response was recorded, after it but before the
 post-transfer step ran, and after the post-transfer step was sent but before its response was
 recorded. The restart's teardown is passive (no ECUReset), and it redoes

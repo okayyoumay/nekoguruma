@@ -496,8 +496,8 @@ pub struct FileStore {
 }
 
 /// An exclusive OS lock on the journal's sidecar `.journal.lock` file (ADR-255). It makes the
-/// `Journal` that holds it the journal's only writer. The OS drops the lock with the file handle,
-/// also when the process dies, so a crashed run never blocks the next one. The sidecar is
+/// `Journal` that holds it the journal's only writer. Dropping it unlocks the file; the OS drops
+/// the lock with the file handle when the process dies, so a crashed run never blocks the next one. The sidecar is
 /// never deleted: a process that locked a recreated file would not exclude one still holding
 /// the old one. It is a separate file so that [`Journal::read`] works while a job writes, also
 /// where file locks are mandatory (Windows).

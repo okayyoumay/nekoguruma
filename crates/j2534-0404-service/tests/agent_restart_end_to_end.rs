@@ -1,11 +1,10 @@
-// Relies on the debug-only runtime VCI_CONFIG_PATH override; see ADR-073. The scenarios that
-// kill the agent's process group are unix-only; the worker-crash, power-loss and VCI-disconnect
-// scenarios kill no process group and run on Windows too.
+// Relies on the debug-only runtime VCI_CONFIG_PATH override; see ADR-073.
 #![cfg(debug_assertions)]
 //! Restart end to end, an agent killed, its worker crashed, the ECU powered off or the VCI
 //! unplugged mid-transfer, or an agent killed after RequestTransferExit (design 5.3, 5.6, 8.2.5;
 //! ADR-229, ADR-276): the agent runs a flash job against a real `j2534-0404-service` worker and
-//! `sim-vci` as a child process, is killed with SIGKILL after a block of the transfer was
+//! `sim-vci` as a child process, is killed with its worker (SIGKILL to its process group on unix,
+//! `taskkill /F /T` on Windows) after a block of the transfer was
 //! journaled, or after RequestTransferExit was sent, and the job is resumed at library level
 //! (`resume_program_journaled`) with the same journal directory. In the worker-crash, power-loss
 //! and VCI-disconnect scenarios the agent runs in the test process and survives; the agent's
@@ -388,7 +387,6 @@ fn ecu_config_with_startup(s3_server_ms: u32, startup_ms: Option<u32>) -> String
 
 /// [`ecu_config`], with the ECU installing `version` at the first power cycle after a verified
 /// download.
-#[cfg(unix)]
 fn ecu_config_installing(s3_server_ms: u32, version: &str) -> String {
     ecu_config_full(s3_server_ms, None, Some(version))
 }
@@ -412,7 +410,6 @@ fn restart_child_entry() {
     restart::child_main(spec_for);
 }
 
-#[cfg(unix)]
 /// Runs the first run until `KILL_AFTER_BLOCK` is journaled and kills the agent there; returns
 /// where the first attempt's transfer started. Sends
 /// nothing to the ECU afterwards: a probe's request would restart its session timer.
@@ -421,7 +418,7 @@ fn kill_mid_transfer(env: &Env, spec: &JobSpec) -> StepRef {
     let journal = env.wait_for_block(spec, KILL_AFTER_BLOCK, WAIT_FOR_BLOCK);
     let status = agent.kill();
     assert!(
-        restart::died_of_sigkill(status),
+        restart::died_of_kill(status),
         "the agent should be killed during the program's wait, not end by itself: {status}"
     );
     // The journal and the ECU agree on where the kill came: block 4 was confirmed by the ECU and
@@ -460,7 +457,6 @@ impl Teardown {
         first_read_confirms: true,
     };
     /// The RequestTransferExit marker is in the journal: a passive wait, no ECUReset.
-    #[cfg(unix)]
     const PASSIVE: Self = Self {
         gates: GATE_REQUESTS,
         reset_sent: false,
@@ -563,7 +559,6 @@ fn assert_completed(
     );
 }
 
-#[cfg(unix)]
 /// The agent is restarted while the ECU is in its programming session with the transfer
 /// running: the restart resets the ECU, redoes the transfer and completes.
 #[test]
@@ -599,7 +594,6 @@ fn an_agent_killed_mid_transfer_redoes_it_within_the_session_timer() {
     );
 }
 
-#[cfg(unix)]
 /// The agent is restarted after tS3_Server ran out: the ECU fell back to its default session and
 /// interrupted the transfer while nothing was running. The restart redoes the transfer and
 /// completes as well.
@@ -861,7 +855,6 @@ fn a_vci_disconnect_mid_transfer_is_restarted_once_the_vci_is_back() {
     );
 }
 
-#[cfg(unix)]
 /// The RequestTransferExit's instruction.
 fn exit_pc(spec: &JobSpec) -> u32 {
     spec.program
@@ -871,16 +864,12 @@ fn exit_pc(spec: &JobSpec) -> u32 {
         .expect("a RequestTransferExit") as u32
 }
 
-#[cfg(unix)]
 /// The response-pending sequence the ECU answers the unanswered request with: long enough to
 /// leave time for the kill, which comes [`KILL_DELAY`] after the request was sent.
 const PENDING_COUNT: u32 = 10;
-#[cfg(unix)]
 const PENDING_INTERVAL_MS: u32 = 200;
-#[cfg(unix)]
 const KILL_DELAY: Duration = Duration::from_millis(200);
 
-#[cfg(unix)]
 /// What the journal and the ECU hold when the agent was killed after RequestTransferExit: the
 /// exit marker, every block, no completed post-transfer steps and no resume yet, with the ECU
 /// in its programming session and the download closed (`flash_phase` 3) or, after the
@@ -916,7 +905,6 @@ fn assert_killed_after_exit(
     transfer.started_at
 }
 
-#[cfg(unix)]
 /// Kills the agent while the ECU keeps it waiting for the response to `request` (a trace line):
 /// once `parked` holds, while the program waits right before that request, a response-pending
 /// fault is handed to the worker; once the request was sent the agent is killed. Returns at once,
@@ -957,13 +945,12 @@ fn kill_while_unanswered(
     std::thread::sleep(KILL_DELAY);
     let status = agent.kill();
     assert!(
-        restart::died_of_sigkill(status),
+        restart::died_of_kill(status),
         "the agent should be killed while it waits for the response: {status}"
     );
     sent_at + Duration::from_millis(u64::from(PENDING_COUNT * PENDING_INTERVAL_MS))
 }
 
-#[cfg(unix)]
 /// Restarts once the ECU's response-pending sequence is over. The ECU restarts its session
 /// timer when its final response goes out, and the restart's passive teardown waits the plan's
 /// declared timeout from its last request before the wait: its requests must come after the
@@ -979,7 +966,6 @@ fn restart_after(
     env.restart(spec)
 }
 
-#[cfg(unix)]
 /// Whether the journal records the RequestTransferExit's response.
 fn exit_answered(state: &agent::journal::JournalState) -> bool {
     state
@@ -990,7 +976,6 @@ fn exit_answered(state: &agent::journal::JournalState) -> bool {
         .is_some_and(|exit| exit.last_post_step.is_some())
 }
 
-#[cfg(unix)]
 /// The agent is killed after it sent RequestTransferExit and before the response reached the
 /// journal: the ECU answers it with response-pending messages, which keeps the agent waiting
 /// while the ECU has already closed the download. The restart cannot tell whether the download
@@ -1029,7 +1014,6 @@ fn a_kill_before_the_transfer_exit_response_was_recorded_redoes_the_transfer() {
     );
 }
 
-#[cfg(unix)]
 /// The agent is killed after the RequestTransferExit's response was journaled and before the
 /// integrity check ran: the post-transfer steps did not complete, so the restart tears down
 /// passively as above and redoes the transfer, and RequestTransferExit and the integrity check
@@ -1049,7 +1033,7 @@ fn a_kill_before_the_post_transfer_steps_completed_redoes_the_transfer() {
     );
     let status = agent.kill();
     assert!(
-        restart::died_of_sigkill(status),
+        restart::died_of_kill(status),
         "the agent should be killed during the program's wait: {status}"
     );
     let first_attempt = assert_killed_after_exit(&env, &spec, Some(exit_pc(&spec)), 3);
@@ -1066,7 +1050,6 @@ fn a_kill_before_the_post_transfer_steps_completed_redoes_the_transfer() {
     );
 }
 
-#[cfg(unix)]
 /// The agent is killed after it sent the integrity check (the post-transfer step) and before
 /// its response reached the journal: the ECU has verified the image, but the journal shows the
 /// post-transfer steps incomplete, so the restart tears down passively and redoes the transfer
@@ -1093,7 +1076,6 @@ fn a_kill_before_the_integrity_check_response_was_recorded_redoes_the_transfer()
     );
 }
 
-#[cfg(unix)]
 /// Kills the agent mid-transfer, hands `fault` (a `sim-vci` control command) to the restart's
 /// worker, restarts, and checks that the job completed after `teardown`. The plan declares the
 /// ECU's session timeout as 3 s, which the passive teardowns wait out, so `ecu_config` keeps it.
@@ -1118,7 +1100,6 @@ fn redo_after_teardown(tag: &str, ecu_config: &str, fault: Option<&str>, teardow
     );
 }
 
-#[cfg(unix)]
 /// The ECU refuses the restart's ECUReset (NRC 22, without effect): the teardown turns passive
 /// (`PassiveCause::ResetRefused`), waits out the session timer, and the job completes.
 #[test]
@@ -1141,7 +1122,6 @@ fn a_refused_ecu_reset_makes_the_teardown_passive() {
     );
 }
 
-#[cfg(unix)]
 /// The ECU resets but the response to the restart's ECUReset is lost: the teardown cannot tell
 /// whether it reset and turns passive (`PassiveCause::ResetOutcomeUnknown`), and the job
 /// completes. The ECU starts up for 1.5 s after the reset, so a confirmation that followed the
@@ -1163,7 +1143,6 @@ fn a_lost_ecu_reset_response_makes_the_teardown_passive() {
     );
 }
 
-#[cfg(unix)]
 /// The ECU acknowledges the restart's ECUReset and then answers nothing for 6 s while it starts
 /// up. A confirmation attempt waits 0.1 s and then reads for 2 s, and an unanswered read takes
 /// up to the 1 s P2 timeout, so the first attempt ends by about 3.1 s; a second attempt right
@@ -1184,7 +1163,6 @@ fn an_ecu_silent_after_acknowledging_the_reset_is_confirmed_after_the_passive_wa
     );
 }
 
-#[cfg(unix)]
 /// The ECU refuses the restart's first VIN read: the vehicle is not identified, so the gate
 /// makes the teardown passive (`PassiveCause::Gate`, `VinNotEstablished`) without the further
 /// gate reads or an ECUReset, and once the ECU is back in its default session the identity
@@ -1209,7 +1187,6 @@ fn an_unreadable_vin_makes_the_teardown_passive() {
     );
 }
 
-#[cfg(unix)]
 /// Runs the completed-path or the read-back job until its post-transfer steps are journaled
 /// complete and kills the agent in the `Wait` after the plan. Returns where the transfer started.
 fn kill_after_the_plan(env: &Env, spec: &JobSpec) -> StepRef {
@@ -1229,7 +1206,7 @@ fn kill_after_the_plan(env: &Env, spec: &JobSpec) -> StepRef {
     );
     let status = agent.kill();
     assert!(
-        restart::died_of_sigkill(status),
+        restart::died_of_kill(status),
         "the agent should be killed during the wait after the plan: {status}"
     );
     let journal = agent::journal::Journal::read(&env.journal_dir(), &spec.key).expect("journal");
@@ -1240,7 +1217,6 @@ fn kill_after_the_plan(env: &Env, spec: &JobSpec) -> StepRef {
     transfer.started_at
 }
 
-#[cfg(unix)]
 /// Kills the completed-path job after its plan, waits for the ECU's session timer to run out if
 /// `ecu_in_default_session`, hands `fault` (a `sim-vci` control command) to the restart's
 /// worker, restarts, and checks the job completed after the passive retry.
@@ -1291,7 +1267,6 @@ fn complete_on_the_completed_path(tag: &str, ecu_in_default_session: bool, fault
     );
 }
 
-#[cfg(unix)]
 /// The ECU is still in its programming session when the restart reads F186: the first read
 /// reports another session. The read restarts the ECU's session timer, which the passive wait
 /// then outlasts. The restart's gate reads must come within the 3 s timer of the probe's last
@@ -1303,7 +1278,6 @@ fn a_non_default_session_on_the_completed_path_is_confirmed_after_the_passive_re
     complete_on_the_completed_path("completed-non-default", false, None);
 }
 
-#[cfg(unix)]
 /// The ECU is back in its default session but refuses the restart's first F186 read.
 #[test]
 #[serial]
@@ -1318,7 +1292,6 @@ fn a_refused_session_read_on_the_completed_path_is_confirmed_after_the_passive_r
     );
 }
 
-#[cfg(unix)]
 /// The ECU is back in its default session but the restart's first F186 read is lost on the bus,
 /// so it gets no answer.
 #[test]
@@ -1331,7 +1304,6 @@ fn an_unanswered_session_read_on_the_completed_path_is_confirmed_after_the_passi
     );
 }
 
-#[cfg(unix)]
 /// The read-back job is killed after its plan, with the ECU already running the image it
 /// verified, since the plan's own ECUReset installed it. The restart's teardown takes the completed
 /// path (no ECUReset, no wait), the default-session confirmation's first read confirms, the

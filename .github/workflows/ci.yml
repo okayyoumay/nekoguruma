@@ -121,9 +121,9 @@ jobs:
         run: cargo nextest run --workspace --locked $EXCLUDE --profile ci-windows-parallel -E 'package(agent)'
       - shell: bash
         run: cargo nextest run --workspace --locked $EXCLUDE --profile ci-windows -E 'not package(agent)'
-      # On pull requests the run above leaves j2534-0404-service out, but its restart end to end
-      # (worker crash, ECU power loss, VCI disconnect) is what Windows can break: the worker is
-      # killed with TerminateProcess there. main runs it with the rest of the package.
+      # On pull requests the run above leaves j2534-0404-service out, but its restart end to end is
+      # what Windows can break: the agent and its worker are killed with TerminateProcess there
+      # (taskkill). main runs it with the rest of the package.
       - if: github.event_name == 'pull_request'
         shell: bash
         run: cargo nextest run -p j2534-0404-service --locked --profile ci-windows -E 'binary(agent_restart_end_to_end)'

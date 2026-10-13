@@ -147,7 +147,8 @@ the doc tests with `cargo test ... --doc`. nextest runs each test in its own pro
 `cargo test` gives the same results, only more slowly; keep `#[serial]` on tests that share
 process-global state, since `cargo test` still needs it. Some of those tests are too
 timing-sensitive to run in parallel on the Windows runner, so the `core-windows` job uses the
-`ci-windows` profile (one test at a time). On pull requests `core-windows` leaves out
+`ci-windows` profile (one test at a time) for every test except the agent's, which run first in
+a separate nextest run with the `ci-windows-parallel` profile. On pull requests `core-windows` leaves out
 `j2534-0404-service`, which has no Windows-specific code; main runs every test on Windows.
 
 CI (`.github/workflows/ci.yml`) also checks the worker crates for six targets and runs

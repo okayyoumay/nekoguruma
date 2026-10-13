@@ -96,9 +96,11 @@ jobs:
       - run: cargo test --workspace --locked --exclude sim-vci --doc
 
   # Windows: some timing-sensitive worker-crate tests fail there when run in parallel, so the
-  # `ci-windows` profile runs one test at a time. On pull requests, j2534-0404-service (about 90%
-  # of the tests and of the Windows time) is left out: it has no Windows-specific code, and Linux
-  # runs it on every pull request. main runs everything.
+  # `ci-windows` profile runs one test at a time. The agent's tests are not among them and spend
+  # their time on file I/O, so they run first, on their own and in parallel (`ci-windows-parallel`);
+  # run one at a time they took about half of the Windows time. The second run does not rebuild.
+  # On pull requests, j2534-0404-service (most of the remaining Windows time) is left out: it has no
+  # Windows-specific code, and Linux runs it on every pull request. main runs everything.
   core-windows:
     needs: changes
     if: ${{ always() && (needs.changes.result != 'success' || needs.changes.outputs.code == 'true') }}
@@ -114,7 +116,9 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@nextest
       - shell: bash
-        run: cargo nextest run --workspace --locked --exclude sim-vci $EXCLUDE --profile ci-windows
+        run: cargo nextest run --workspace --locked --exclude sim-vci $EXCLUDE --profile ci-windows-parallel -E 'package(agent)'
+      - shell: bash
+        run: cargo nextest run --workspace --locked --exclude sim-vci $EXCLUDE --profile ci-windows -E 'not package(agent)'
       - shell: bash
         run: cargo test --workspace --locked --exclude sim-vci $EXCLUDE --doc
 

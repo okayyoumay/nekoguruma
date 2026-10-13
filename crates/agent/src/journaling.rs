@@ -44,7 +44,9 @@ use diag_ir::{
 
 use crate::host::{HostError, TransferProgress};
 use crate::inputs::{FieldBytes, ServiceSources, read_field_bytes};
-use crate::journal::{FileStore, JobKey, Journal, JournalError, StageId, StepRef, Store, Vin};
+use crate::journal::{
+    FileStore, JobKey, Journal, JournalError, RunStop, StageId, StepRef, Store, Vin,
+};
 use crate::runner::JobError;
 
 /// Where a job keeps its journal, under which key, and how it reads the ECU's identity.
@@ -140,6 +142,13 @@ impl<S: Store> JobJournal<S> {
         detail: &str,
     ) -> Result<(), JobError> {
         self.journal.commit_procedure_failed(at, code, detail)?;
+        Ok(())
+    }
+
+    /// Commits a run's stop at `at` for `reason` as the job's last record (ADR-288). A failed
+    /// commit is the job's error, as for [`Self::procedure_failed`].
+    pub(crate) fn run_stopped(&mut self, at: StepRef, reason: RunStop) -> Result<(), JobError> {
+        self.journal.commit_run_stopped(at, reason)?;
         Ok(())
     }
 

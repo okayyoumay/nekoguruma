@@ -19,7 +19,7 @@ use worker_host::client::WorkerClient;
 use crate::guards::{GuardError, JobGuards};
 use crate::host::{HostError, Timings, TransferProgress, WorkerHost};
 use crate::inputs::RuntimeInputs;
-use crate::journal::{Journal, JournalError, StepRef, Store};
+use crate::journal::{Journal, JournalError, RunStop, StepRef, StoppedRun, Store};
 use crate::journaling::{JobJournal, JournalSetup};
 use crate::link::{self, LinkConfig};
 use crate::policy::{self, Permission};
@@ -141,6 +141,40 @@ fn failure_error(failure: &crate::journal::ProcedureFailure) -> JobError {
         pc: failure.at.pc,
         code: failure.code.clone(),
         detail: failure.detail.clone(),
+    }
+}
+
+/// The job's error for the run's stop its journal records (ADR-288): the one the stopped run
+/// returned.
+fn stopped_error(stopped: &StoppedRun) -> JobError {
+    match &stopped.reason {
+        RunStop::StepLimit => JobError::StepLimit(stopped.at.steps),
+        RunStop::Vm(source) => JobError::Vm {
+            pc: stopped.at.pc,
+            source: source.clone(),
+        },
+    }
+}
+
+/// `error`, a run's stop at `at` for `reason`, as the run returns it: journaled first, as the
+/// job's last record, when the job has a journal, so a later resume ends in the same error
+/// without sending anything (ADR-288). A commit that fails is the job's error instead; the stop
+/// is then only logged.
+fn stop_run<S: Store>(
+    journal: Option<&mut JobJournal<S>>,
+    at: StepRef,
+    reason: RunStop,
+    error: JobError,
+) -> JobError {
+    let Some(journal) = journal else {
+        return error;
+    };
+    match journal.run_stopped(at, reason) {
+        Ok(()) => error,
+        Err(journal_error) => {
+            tracing::warn!(%error, %journal_error, "could not journal the run's stop");
+            journal_error
+        }
     }
 }
 
@@ -280,9 +314,9 @@ pub async fn run_program_journaled(
 /// Goes on with a job that ran before, from the journal [`run_program_journaled`] wrote under
 /// `journal.key` (ADR-255). The journal is opened, with its writer lock, before the worker link:
 /// a journal another run holds ends the job in [`JobError::Journal`] (`InUse`), and one that
-/// records a declared failure in [`JobError::ProcedureFailed`] (ADR-280), or an identity abort of
-/// an earlier resume in [`JobError::IdentityMismatch`] (ADR-286), neither opening the
-/// link. Once the link is open and the policy allows the program, and before anything is sent to
+/// records a declared failure in [`JobError::ProcedureFailed`] (ADR-280), an identity abort of
+/// an earlier resume in [`JobError::IdentityMismatch`] (ADR-286), or a run's stop in the error
+/// that run returned (ADR-288), none of them opening the link. Once the link is open and the policy allows the program, and before anything is sent to
 /// the ECU, the journal is classified (`restart::classify`, ADR-253):
 /// - a declared failure (`RestartDecision::Failed`) ends the job in
 ///   [`JobError::ProcedureFailed`] with nothing sent and no resume counted (the check before
@@ -292,6 +326,11 @@ pub async fn run_program_journaled(
 ///   is journaled by the resume that met it: a gate (step 2) or step 3a that ends in
 ///   [`JobError::IdentityMismatch`] commits it as the journal's last record first, and a commit
 ///   that fails ends the job in [`JobError::Journal`] instead;
+/// - a run's stop on the step limit or on an instruction the VM refused
+///   (`RestartDecision::Stopped`, ADR-288) ends the job in the error that run returned
+///   ([`JobError::StepLimit`] or [`JobError::Vm`]), nothing sent and no resume counted. Every run
+///   with a journal commits such a stop as the journal's last record before it returns the
+///   error, and a commit that fails ends the job in [`JobError::Journal`] instead;
 /// - a plain start runs the program from its start on the same journal, its step count going on
 ///   after the journal's last record (`restart::next_steps`); a program without a flash
 ///   recovery plan and without a journal runs without one;
@@ -510,6 +549,12 @@ fn run_job(
                 && let Some(identity) = opened.state().facts.identity_mismatch
             {
                 return Err(JobError::IdentityMismatch { identity });
+            }
+            // And so is a run's stop it records (ADR-288).
+            if let Ok(opened) = &opened
+                && let Some(stopped) = &opened.state().facts.run_stopped
+            {
+                return Err(stopped_error(stopped));
             }
             Some(opened)
         }
@@ -803,6 +848,12 @@ where
     {
         return Err(JobError::IdentityMismatch { identity });
     }
+    // And a run's stop (ADR-288).
+    if let Ok(journal) = &opened
+        && let Some(stopped) = &journal.state().facts.run_stopped
+    {
+        return Err(stopped_error(stopped));
+    }
     // A resume names the VIN the job's first run recorded, or the job's own data changed
     // (ADR-261): nothing is sent and no resume is counted.
     if let Ok(journal) = &opened
@@ -833,6 +884,9 @@ where
         // The restart's identity check failed on an earlier resume: final, nothing is sent and
         // no resume counted (ADR-286).
         RestartDecision::Aborted { identity } => Err(JobError::IdentityMismatch { identity }),
+        // A run stopped on the step limit or on an instruction the VM refused, and journaled it:
+        // final, nothing is sent and no resume counted (ADR-288).
+        RestartDecision::Stopped(stopped) => Err(stopped_error(&stopped)),
         RestartDecision::PlainStart => match opened {
             Ok(journal) if !program.flash.is_empty() => {
                 let first_step = restart::next_steps(journal.state());
@@ -1160,7 +1214,13 @@ where
         // The run's own steps (ADR-287): a restart does not inherit the steps of the runs before
         // it, so a redone transfer has the budget a first run has.
         if vm.state.steps.saturating_sub(run_start) >= limits.max_steps {
-            return Err(JobError::StepLimit(vm.state.steps));
+            // Terminal (ADR-288): running the program again would stop at the same place.
+            let at = StepRef {
+                pc: vm.state.pc,
+                steps: vm.state.steps,
+            };
+            let error = JobError::StepLimit(vm.state.steps);
+            return Err(stop_run(journal, at, RunStop::StepLimit, error));
         }
         if std::mem::take(&mut arrived)
             && let Some(journal) = journal.as_deref_mut()
@@ -1168,10 +1228,17 @@ where
             // An intent marker is only journaled for a request the next step sends: the VM's
             // own checks run first (ADR-233 item 3), so an instruction it refuses fails here,
             // with no marker before it.
-            vm.current_op(program).map_err(|source| JobError::Vm {
-                pc: vm.state.pc,
-                source,
-            })?;
+            if let Err(source) = vm.current_op(program) {
+                let at = StepRef {
+                    pc: vm.state.pc,
+                    steps: vm.state.steps,
+                };
+                let error = JobError::Vm {
+                    pc: at.pc,
+                    source: source.clone(),
+                };
+                return Err(stop_run(Some(journal), at, RunStop::Vm(source), error));
+            }
             journal.arrive(program, &vm.state, host, cancelled)?;
             // The identity reads at a boundary take time; a cancel during them stops the job
             // before the boundary's instruction runs.
@@ -1215,7 +1282,19 @@ where
                 }
                 return Err(JobError::ProcedureFailed { pc, code, detail });
             }
-            Err(StepError::Vm(source)) => return Err(JobError::Vm { pc, source }),
+            Err(StepError::Vm(source)) => {
+                // Terminal like the step limit (ADR-288), at the refused instruction: a step is
+                // atomic, so the instruction completed nothing.
+                let at = StepRef {
+                    pc,
+                    steps: vm.state.steps,
+                };
+                let error = JobError::Vm {
+                    pc,
+                    source: source.clone(),
+                };
+                return Err(stop_run(journal, at, RunStop::Vm(source), error));
+            }
             Err(StepError::Host(source)) => return Err(JobError::Host { pc, source }),
         }
     }
@@ -2441,6 +2520,11 @@ mod tests {
                 "{result:?}"
             );
             let facts = &journal.journal().state().facts;
+            // The refusal on arrival is journaled as the run's stop (ADR-288), also behind the
+            // transfer-start marker at RequestTransferExit.
+            let stopped = facts.run_stopped.as_ref().expect("the stop is journaled");
+            assert_eq!(stopped.at.pc, boundary);
+            assert!(matches!(stopped.reason, RunStop::Vm(_)), "{stopped:?}");
             if boundary == ERASE {
                 assert!(facts.transfer.is_none());
                 assert!(!host.sent().iter().any(|s| matches!(s, Sent::Routine(_))));
@@ -2733,7 +2817,8 @@ mod tests {
     }
 
     /// Runs `program` from a fresh counting journal until the step limit, and gives the journal's
-    /// state.
+    /// state as a run interrupted there leaves it: without the stop's record, the last one, which
+    /// a step-limited run commits (ADR-288).
     fn state_after_steps(program: &Program, max_steps: u64) -> crate::journal::JournalState {
         let commits = Rc::new(Cell::new(0));
         let mut host = FlashHost::new(Rc::clone(&commits));
@@ -2750,7 +2835,15 @@ mod tests {
             Some(&mut journal),
         );
         assert!(matches!(result, Err(JobError::StepLimit(_))), "{result:?}");
-        journal.journal().state().clone()
+        let mut state = journal.journal().state().clone();
+        let stopped = state
+            .facts
+            .run_stopped
+            .take()
+            .expect("the stop is journaled");
+        assert_eq!(stopped.reason, RunStop::StepLimit);
+        state.records -= 1;
+        state
     }
 
     /// A jump from outside the plan to its end journals nothing (ADR-274): the polling loop
@@ -3493,6 +3586,23 @@ mod tests {
         )
     }
 
+    /// A first run cancelled once its request for `service` was sent, as a job whose future is
+    /// dropped is: an ending that, unlike the step limit (ADR-288), leaves the job resumable.
+    fn first_run_cancelled_on(
+        program: &Program,
+        dir: &std::path::Path,
+        limits: JobLimits,
+        service: u16,
+        prepare: impl FnOnce(&mut FlashHost),
+    ) -> Result<VmState, JobError> {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        host.cancel_on_service = Some((service, Arc::clone(&cancelled)));
+        prepare(&mut host);
+        let mut journal = JobJournal::create(file_setup_for(dir, Some(TARGET_VIN))).unwrap();
+        run_on(program, &mut host, limits, &cancelled, Some(&mut journal))
+    }
+
     /// A first run whose erase response is lost: an interrupted transfer.
     fn interrupted(program: &Program, dir: &std::path::Path) {
         interrupted_for(program, dir, Some(TARGET_VIN));
@@ -3646,6 +3756,206 @@ mod tests {
         assert_eq!(host.sent(), []);
         assert_eq!(host.voltage_reads, 0);
         assert_eq!(resumes(&dir), 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A first run the step limit stopped before the erase journals the stop (ADR-288), and a
+    /// plain start ends at once in the same `StepLimit`, with nothing sent (the pre-erase
+    /// requests, SecurityAccess among them, are not sent again) and no resume counted.
+    #[test]
+    fn a_step_limit_before_the_erase_ends_a_plain_start_at_once() {
+        let program = flash_program();
+        let dir = journal_dir("step-limit-plain");
+        let limits = JobLimits {
+            max_steps: u64::from(ERASE),
+            ..JobLimits::default()
+        };
+        let result = first_run(&program, &dir, limits, |_| {});
+        let Err(JobError::StepLimit(steps)) = result else {
+            panic!("{result:?}");
+        };
+        let state = Journal::read(&dir, &job_key()).unwrap();
+        assert!(state.facts.transfer.is_none(), "stopped before the erase");
+        let stopped = StoppedRun {
+            at: StepRef { pc: ERASE, steps },
+            reason: RunStop::StepLimit,
+        };
+        assert_eq!(state.facts.run_stopped, Some(stopped.clone()));
+        assert_eq!(
+            restart::classify(&program, Ok(&state)),
+            RestartDecision::Stopped(stopped)
+        );
+
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        let result = resume(&program, &dir, &mut host, false);
+        assert!(
+            matches!(result, Err(JobError::StepLimit(s)) if s == steps),
+            "{result:?}"
+        );
+        assert_eq!(host.sent(), []);
+        assert_eq!(resumes(&dir), 0);
+        assert_eq!(Journal::read(&dir, &job_key()).unwrap(), state);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A first run the step limit stopped after the erase journals the stop, and the restart
+    /// ends at once in the same `StepLimit` instead of redoing the transfer: nothing sent, the
+    /// supply voltage not read and no resume counted (ADR-288).
+    #[test]
+    fn a_step_limit_after_the_erase_ends_the_restart_at_once() {
+        let program = flash_program();
+        let dir = journal_dir("step-limit-restart");
+        // Stops on arriving at RequestDownload, the erase sent.
+        let limits = JobLimits {
+            max_steps: u64::from(ERASE) + 3,
+            ..JobLimits::default()
+        };
+        let result = first_run(&program, &dir, limits, |_| {});
+        let Err(JobError::StepLimit(steps)) = result else {
+            panic!("{result:?}");
+        };
+        let state = Journal::read(&dir, &job_key()).unwrap();
+        assert!(state.facts.transfer.is_some(), "the transfer was started");
+        let stopped = state.facts.run_stopped.clone().expect("the stop record");
+        assert_eq!(stopped.reason, RunStop::StepLimit);
+        assert_eq!(stopped.at.steps, steps);
+        assert_eq!(
+            restart::classify(&program, Ok(&state)),
+            RestartDecision::Stopped(stopped)
+        );
+
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        host.voltage = Some(12_600);
+        let result = resume(&program, &dir, &mut host, false);
+        assert!(
+            matches!(result, Err(JobError::StepLimit(s)) if s == steps),
+            "{result:?}"
+        );
+        assert_eq!(host.sent(), []);
+        assert_eq!(host.voltage_reads, 0);
+        assert_eq!(resumes(&dir), 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An instruction the VM refuses after the erase ends the run in `JobError::Vm`, journaled
+    /// like a step-limited stop (ADR-288): the restart ends at once in the same error, with
+    /// nothing sent and no resume counted.
+    #[test]
+    fn a_vm_error_after_the_erase_is_journaled_and_not_resumed() {
+        let mut program = flash_program();
+        assert_eq!(program.code[ERASE as usize + 1], Op::Pop);
+        // Only the erase's answer is on the stack: an addition underflows it.
+        program.code[ERASE as usize + 1] = Op::Add;
+        let dir = journal_dir("vm-error-restart");
+        let result = first_run(&program, &dir, JobLimits::default(), |_| {});
+        assert!(
+            matches!(
+                &result,
+                Err(JobError::Vm { pc, source: VmError::StackUnderflow }) if *pc == ERASE + 1
+            ),
+            "{result:?}"
+        );
+        let state = Journal::read(&dir, &job_key()).unwrap();
+        assert!(state.facts.transfer.is_some(), "the transfer was started");
+        let stopped = state.facts.run_stopped.clone().expect("the stop record");
+        assert_eq!(stopped.at.pc, ERASE + 1);
+        assert_eq!(stopped.reason, RunStop::Vm(VmError::StackUnderflow));
+
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        host.voltage = Some(12_600);
+        let result = resume(&program, &dir, &mut host, false);
+        assert!(
+            matches!(
+                &result,
+                Err(JobError::Vm { pc, source: VmError::StackUnderflow }) if *pc == ERASE + 1
+            ),
+            "{result:?}"
+        );
+        assert_eq!(host.sent(), []);
+        assert_eq!(host.voltage_reads, 0);
+        assert_eq!(resumes(&dir), 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A stop whose commit fails ends the run in the journal's error instead, so the journal
+    /// never claims an ending it does not hold (ADR-288).
+    #[test]
+    fn a_failed_stop_commit_is_the_jobs_error() {
+        let program = flash_program();
+        let commits = Rc::new(Cell::new(0));
+        // The run start is the first commit, the stop the second.
+        let mut journal = counting_journal(&commits, Some(2));
+        let mut host = FlashHost::new(Rc::clone(&commits));
+        let limits = JobLimits {
+            max_steps: 0,
+            ..JobLimits::default()
+        };
+        let result = run_on(
+            &program,
+            &mut host,
+            limits,
+            &AtomicBool::new(false),
+            Some(&mut journal),
+        );
+        assert!(
+            matches!(result, Err(JobError::Journal(JournalError::Io(_)))),
+            "{result:?}"
+        );
+        assert_eq!(host.sent(), []);
+        assert_eq!(journal.journal().state().facts.run_stopped, None);
+    }
+
+    /// A recorded stop is reported before the link is opened: a resume on a worker that cannot be
+    /// reached ends in it, not in a link error (ADR-288).
+    #[test]
+    fn a_stopped_journal_reports_the_stop_without_a_worker() {
+        let program = flash_program();
+        let dir = journal_dir("step-limit-no-worker");
+        let limits = JobLimits {
+            max_steps: u64::from(ERASE),
+            ..JobLimits::default()
+        };
+        let result = first_run(&program, &dir, limits, |_| {});
+        let Err(JobError::StepLimit(steps)) = result else {
+            panic!("{result:?}");
+        };
+        let guards = take_guards(&dir);
+        let (result, _guards) =
+            resume_on_unreachable(program, &dir, guards, Arc::new(AtomicBool::new(false)));
+        assert!(
+            matches!(result, Err(JobError::StepLimit(s)) if s == steps),
+            "{result:?}"
+        );
+        assert_eq!(resumes(&dir), 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A stopped journal resumed by a job whose data changed (another VIN, or a version it now
+    /// names) still ends in the stop, not in on-site intervention, with nothing sent (ADR-288).
+    #[test]
+    fn a_stopped_journal_reports_the_stop_whatever_the_jobs_data() {
+        let program = flash_program();
+        let dir = journal_dir("step-limit-vin");
+        let limits = JobLimits {
+            max_steps: u64::from(ERASE),
+            ..JobLimits::default()
+        };
+        let result = first_run(&program, &dir, limits, |_| {});
+        assert!(matches!(result, Err(JobError::StepLimit(_))), "{result:?}");
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        let result = resume_for(&program, &dir, &mut host, false, Some("WDB99999999999999"));
+        assert!(matches!(result, Err(JobError::StepLimit(_))), "{result:?}");
+        let result = resume_naming(
+            &program,
+            &dir,
+            &mut host,
+            false,
+            Some(TARGET_VIN),
+            Some(b"2.0.0"),
+            &dir_slot(&dir),
+        );
+        assert!(matches!(result, Err(JobError::StepLimit(_))), "{result:?}");
+        assert_eq!(host.sent(), []);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -7100,19 +7410,15 @@ mod tests {
     }
 
     /// A plain start on an existing journal has its own step budget too (ADR-287): after a first
-    /// run the limit stopped before the erase, a plain start with a limit that covers the
-    /// program runs it from the start and completes, although the first run's steps would put
-    /// the cumulative count over the limit.
+    /// run cancelled before the erase, a plain start with a limit that covers the program runs
+    /// it from the start and completes, although the first run's steps would put the cumulative
+    /// count over the limit.
     #[test]
     fn a_plain_start_has_its_own_step_budget() {
         let program = flash_program();
         let dir = journal_dir("plain-start-budget");
-        let limits = JobLimits {
-            max_steps: u64::from(ERASE),
-            ..JobLimits::default()
-        };
-        let result = first_run(&program, &dir, limits, |_| {});
-        assert!(matches!(result, Err(JobError::StepLimit(_))), "{result:?}");
+        let result = first_run_cancelled_on(&program, &dir, JobLimits::default(), 0x10, |_| {});
+        assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
         let before = Journal::read(&dir, &job_key()).unwrap();
         let start = restart::next_steps(&before);
         let run = program.code.len() as u64;
@@ -9570,13 +9876,9 @@ mod tests {
     fn a_plain_start_goes_on_with_the_existing_journal() {
         let program = flash_program();
         let dir = journal_dir("resume-plain");
-        // Stops on arriving at the erase, after the identity reads and the step into the entry.
-        let limits = JobLimits {
-            max_steps: u64::from(ERASE),
-            ..JobLimits::default()
-        };
-        let result = first_run(&program, &dir, limits, |_| {});
-        assert!(matches!(result, Err(JobError::StepLimit(_))), "{result:?}");
+        // Cancelled after its session change, before the erase.
+        let result = first_run_cancelled_on(&program, &dir, JobLimits::default(), 0x10, |_| {});
+        assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
         let before = Journal::read(&dir, &job_key()).unwrap();
         assert!(before.facts.transfer.is_none());
         let first_step = restart::next_steps(&before);
@@ -9630,13 +9932,23 @@ mod tests {
         let erase = program.flash[0].boundaries.erase_pc;
 
         let dir = journal_dir("restart-pc0");
-        // Run 1: jumps back once (seven instructions), then stops before the erase.
-        let limits = JobLimits {
-            max_steps: 7,
-            ..JobLimits::default()
-        };
-        let result = first_run(&program, &dir, limits, |host| host.vin = None);
-        assert!(matches!(result, Err(JobError::StepLimit(7))), "{result:?}");
+        // Run 1: jumps back once (seven instructions), then stops before the erase. It is
+        // cancelled once its second VIN read, the one after the jump, is sent: a stop on the step
+        // limit would end the job (ADR-288).
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        host.vin = None;
+        host.cancel_on_vin_read = Some((1, Arc::clone(&cancelled)));
+        let mut journal = JobJournal::create(file_setup(&dir)).unwrap();
+        let result = run_on(
+            &program,
+            &mut host,
+            JobLimits::default(),
+            &cancelled,
+            Some(&mut journal),
+        );
+        drop(journal);
+        assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
         let after_run_1 = Journal::read(&dir, &job_key()).unwrap();
         assert!(after_run_1.facts.transfer.is_none());
         let (at, jumped) = after_run_1.last_vm_state.as_ref().unwrap();
@@ -9694,8 +10006,15 @@ mod tests {
         assert_eq!(host.sent(), []);
         drop(journal);
         let state = Journal::read(&dir, &job_key()).unwrap();
-        // The VIN, the version, the run start.
-        assert_eq!(state.records, 3);
+        // The VIN, the version, the run start and the run's stop (ADR-288).
+        assert_eq!(state.records, 4);
+        assert_eq!(
+            state.facts.run_stopped,
+            Some(StoppedRun {
+                at: StepRef { pc: 0, steps: 0 },
+                reason: RunStop::StepLimit,
+            })
+        );
         assert_eq!(
             state.last_vm_state,
             Some((

@@ -233,7 +233,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-241](ADR-241-sim-ecu-state-file.md) | Simulated ECU State Kept in a File Across Worker Processes | Accepted | `sim-ecu` snapshot, `sim-vci` `NGR_SIM_ECU_STATE` |
 | [ADR-242](ADR-242-ir-variable-length-and-nested-layouts.md) | IR Variable-Length Fields and Nested Layouts | Accepted | `diag-ir` declaration schema (`ir.fbs`) |
 | [ADR-243](ADR-243-codeql-and-backlog-loops-share-one-claim.md) | The CodeQL and Backlog Loops Share One PR-Based Claim | Accepted (Decision item 3's skipping of high and critical alerts and item 4's number-only hand-off of them superseded by ADR-246; item 4's trigger follows the CodeQL workflow instead of default setup, ADR-283) | `.claude/skills/codeql-alerts`, `backlog-loop` |
-| [ADR-244](ADR-244-write-job-journal-format.md) | Write-Job Journal as an Append-Only Record Log | Accepted (record set extended by ADR-253, ADR-261, ADR-268, ADR-272, ADR-280 and ADR-286; item 4's target VIN is a journal record since ADR-261, and its version being written since ADR-268; the no-lock consequence superseded by ADR-255 item 7) | `agent` write-job journal |
+| [ADR-244](ADR-244-write-job-journal-format.md) | Write-Job Journal as an Append-Only Record Log | Accepted (record set extended by ADR-253, ADR-261, ADR-268, ADR-272, ADR-280, ADR-286 and ADR-288; item 4's target VIN is a journal record since ADR-261, and its version being written since ADR-268; the no-lock consequence superseded by ADR-255 item 7) | `agent` write-job journal |
 | [ADR-245](ADR-245-ir-restart-declaration-in-the-procedure-part.md) | The IR's Restart Declaration Lives in the Procedure Part | Accepted (items 4 and 6 amended by ADR-250) | `diag-ir` `Program` restart declaration, `ir.fbs` `FlashSession` |
 | [ADR-246](ADR-246-codeql-hand-off-carries-private-alert-details.md) | The CodeQL Hand-Off Carries High and Critical Alert Details Privately | Accepted | `.github/workflows/codeql-alert-handoff.yml`, `.claude/skills/codeql-alerts` |
 | [ADR-247](ADR-247-debug-builds-may-write-to-sim-vci.md) | Debug Builds May Send Write Requests to `sim-vci` | Accepted (Decision item 4's refusal of `FlashTransfer` superseded by ADR-250; its reason for refusing `SecurityAccess` replaced by ADR-259) | `agent` policy, link, host, runner |
@@ -269,14 +269,15 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-277](ADR-277-dpdu-root-file-interpretation.md) | D-PDU API Root Description File Interpretation | Accepted | `ngr-library-resolver`, design 7.1 / 7.2 |
 | [ADR-278](ADR-278-library-signer-check.md) | Library Signer Check | Accepted (item 4's mode is passed by the agent since ADR-281) | `ngr-library-resolver`, design 7.2 |
 | [ADR-279](ADR-279-backlog-loop-handles-dependabot-pull-requests.md) | The Backlog Loop Handles Open Dependabot Pull Requests First | Accepted (Decision item 4's allowlist check replaced by the check against the Windows runner's system directory, ADR-283) | `.claude/skills/backlog-loop` |
-| [ADR-280](ADR-280-diag-fail-instruction.md) | `diag.fail` Is a Terminal `Fail` Instruction, Journaled so a Restart Does Not Resume the Job | Accepted (schema-compatibility consequence relaxed by ADR-281 item 4; the terminal-record rule extended to the restart's identity abort by ADR-286) | `diag-ir`, `agent` runner, journal, restart; design 5.6 / 8.2.4 / 8.2.5 |
+| [ADR-280](ADR-280-diag-fail-instruction.md) | `diag.fail` Is a Terminal `Fail` Instruction, Journaled so a Restart Does Not Resume the Job | Accepted (schema-compatibility consequence relaxed by ADR-281 item 4; the terminal-record rule extended to the restart's identity abort by ADR-286; the open consequence on the step limit and a VM error decided by ADR-288, which journals both as terminal) | `diag-ir`, `agent` runner, journal, restart; design 5.6 / 8.2.4 / 8.2.5 |
 | [ADR-281](ADR-281-worker-library-resolution-mode-and-device-selection.md) | Worker Library Resolution Has No Config-File Path, the Agent Passes the Mode, One J2534 Device Is One Worker, and Pre-Release Compatibility May Break | Accepted | design 7.1 / 7.2, `j2534-0404-service`, `iso22900-service`, `agent`, `vci-service-config` |
 | [ADR-282](ADR-282-debug-resolver-overrides-on-windows.md) | In Debug Builds the Resolvers' Runtime Overrides Also Replace the Windows Registry | Accepted | `ngr-library-resolver`, `vci-service-config`, design 7.1.1 / 7.2, worker and agent integration tests |
 | [ADR-283](ADR-283-codeql-workflow-and-windows-dll-check.md) | CodeQL Runs as a Repository Workflow, and the Windows DLL Check Uses the Runner's System Directory | Accepted | `.github/workflows/codeql.yml`, `codeql-alert-handoff.yml`, `ci.yml` (`worker-windows`, `abi-roundtrip-windows`) |
 | [ADR-284](ADR-284-agent-passes-the-definition-long-size.md) | The Agent Passes the Registration Definition's `LongSize` to the J2534 Worker | Accepted | `agent` launch, `ngr-agent run`, design 7.1.1 / 7.1.2 / 7.3 |
 | [ADR-285](ADR-285-launcher-checks-the-configuration-file.md) | The Launcher Checks the Worker's Configuration File Before Reading It | Accepted | `vci-service-launcher`, `ngr-library-resolver`, `iso22900-service`, `j2534-0404-service`, design 7.2 |
 | [ADR-286](ADR-286-restart-identity-abort-is-journaled.md) | The Restart's Identity Abort Is Journaled as a Terminal Record | Accepted | `agent` journal, restart, runner; design 5.6 / 8.2.5 |
-| [ADR-287](ADR-287-the-step-limit-applies-per-run.md) | The Job's Step Limit Applies to Each Run | Accepted | `agent` runner |
+| [ADR-287](ADR-287-the-step-limit-applies-per-run.md) | The Job's Step Limit Applies to Each Run | Accepted (the open consequence on a plain start after a step-limited run decided by ADR-288: the stop is journaled as terminal) | `agent` runner |
+| [ADR-288](ADR-288-a-stopped-run-is-journaled-as-terminal.md) | A Run Stopped on the Step Limit or a VM Error Is Journaled as a Terminal Record | Accepted | `agent` journal, restart, runner; `diag-ir` `VmError`; design 5.6 |
 
 ## Status Legend
 
@@ -629,7 +630,7 @@ the predecessor repository these ADRs came from.
 - ADR-233 (item 3's `VmState` fields removed by ADR-245; `Op::Fail` and `StepOutcome::Failed` appended by ADR-280)
 - ADR-235 (item 8 relaxed for debug builds against `sim-vci` by ADR-247)
 - ADR-241
-- ADR-244 (record set extended by ADR-253, ADR-261, ADR-268, ADR-272, ADR-280 and ADR-286; item 4's target VIN is a journal record since ADR-261, and its version being written since ADR-268; the no-lock consequence superseded by ADR-255 item 7)
+- ADR-244 (record set extended by ADR-253, ADR-261, ADR-268, ADR-272, ADR-280, ADR-286 and ADR-288; item 4's target VIN is a journal record since ADR-261, and its version being written since ADR-268; the no-lock consequence superseded by ADR-255 item 7)
 - ADR-245 (items 4 and 6 amended by ADR-250)
 - ADR-247 (Decision item 4's refusal of `FlashTransfer` superseded by ADR-250; its reason for refusing `SecurityAccess` replaced by ADR-259)
 - ADR-250
@@ -653,16 +654,17 @@ the predecessor repository these ADRs came from.
 - ADR-273 (item 4's stop at the erase is now preceded by step 4b-3's second precondition check, `restart::check_before_erase`, which ends the job in `PreconditionNotMetBeforeErase` when a condition fails; item 4's `RestartOrderUnavailable` stop superseded by ADR-276, which goes on with the erase; item 2 superseded by ADR-274: the replay commits a run start carrying the entry state; item 5's reading applies to a plan that allows a restart: for the continuation of ADR-271, the steps of a plan that allows none and begins at the verified plan's end are checked like the primitives outside the plans, since no replay is sanctioned for it)
 - ADR-274
 - ADR-276 (item 3's gap closed by ADR-280: the procedure can end the job as failed; the step-limit consequence superseded by ADR-287, which gives each run its own budget)
-- ADR-280 (schema-compatibility consequence relaxed by ADR-281 item 4; the terminal-record rule extended to the restart's identity abort by ADR-286)
+- ADR-280 (schema-compatibility consequence relaxed by ADR-281 item 4; the terminal-record rule extended to the restart's identity abort by ADR-286; the open consequence on the step limit and a VM error decided by ADR-288, which journals both as terminal)
 - ADR-286
-- ADR-287
+- ADR-287 (the open consequence on a plain start after a step-limited run decided by ADR-288: the stop is journaled as terminal)
+- ADR-288
 
 ### Diagnostic IR
 - ADR-233 (item 3's `VmState` fields removed by ADR-245; `Op::Fail` and `StepOutcome::Failed` appended by ADR-280)
 - ADR-242
 - ADR-245 (items 4 and 6 amended by ADR-250)
 - ADR-254 (`diag.fail` has an instruction since ADR-280)
-- ADR-280 (schema-compatibility consequence relaxed by ADR-281 item 4; the terminal-record rule extended to the restart's identity abort by ADR-286)
+- ADR-280 (schema-compatibility consequence relaxed by ADR-281 item 4; the terminal-record rule extended to the restart's identity abort by ADR-286; the open consequence on the step limit and a VM error decided by ADR-288, which journals both as terminal)
 - ADR-281
 
 ### Acquired Data & Monitoring

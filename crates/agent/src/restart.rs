@@ -45,7 +45,9 @@ use crate::host::HostError;
 use crate::inputs::{FieldBytes, Reading, RuntimeInputs, ServiceSources};
 use crate::inputs::{read_field_bytes, resolve_source};
 use crate::journal::Vin;
-use crate::journal::{Journal, JournalError, JournalState, RecoveryFacts, StageId, StepRef, Store};
+use crate::journal::{
+    Journal, JournalError, JournalState, RecoveryFacts, StageId, StepRef, StoppedRun, Store,
+};
 use crate::runner::JobError;
 
 /// How a job whose journal exists goes on.
@@ -68,6 +70,10 @@ pub enum RestartDecision {
     /// is not resumed, whatever its transfer state. `identity` is the one that differed. Nothing
     /// is sent and no resume is counted.
     Aborted { identity: IdentityKind },
+    /// A run stopped on the step limit or on an instruction the VM refused, and journaled it
+    /// (ADR-288): the job is over and is not resumed, whatever its transfer state. Nothing is
+    /// sent and no resume is counted.
+    Stopped(StoppedRun),
 }
 
 /// What a restart starts from.
@@ -322,7 +328,8 @@ pub struct Confirmation {
 /// on-site intervention: the runner creates the journal before it sends anything, so a missing
 /// one cannot be told from one lost after an erase. A journal that holds a procedure failure is
 /// decided first, as [`RestartDecision::Failed`], whatever else it holds (ADR-280); one that holds an
-/// identity abort is decided next, as [`RestartDecision::Aborted`] (ADR-286).
+/// identity abort is decided next, as [`RestartDecision::Aborted`] (ADR-286), and one that holds a
+/// run's stop after that, as [`RestartDecision::Stopped`] (ADR-288).
 pub fn classify(
     program: &Program,
     journal: Result<&JournalState, &JournalError>,
@@ -354,6 +361,10 @@ pub fn classify(
     // So is an identity abort (ADR-286), even with a transfer open at a recovery-required point.
     if let Some(identity) = facts.identity_mismatch {
         return RestartDecision::Aborted { identity };
+    }
+    // So is a run's stop on the step limit or on a refused instruction (ADR-288).
+    if let Some(stopped) = &facts.run_stopped {
+        return RestartDecision::Stopped(stopped.clone());
     }
     let interrupted_at = interruption_point(facts);
     if let Some(at) = interrupted_at
@@ -1995,6 +2006,44 @@ mod tests {
             RestartDecision::Aborted {
                 identity: IdentityKind::Vin
             }
+        );
+    }
+
+    /// A run's stop is final too (ADR-288): decided before the interruption point, so an open
+    /// transfer at a recovery-required point is the stop, not on-site intervention, and an open
+    /// transfer that would restart is the stop too.
+    #[test]
+    fn a_run_stop_is_decided_before_the_interruption() {
+        use crate::journal::{RunStop, StoppedRun};
+        let after_last = |j: &Journal<Memory>| StepRef {
+            pc: 0,
+            steps: j.state().facts.last_step.map_or(0, |last| last.steps + 1),
+        };
+        let program = program(RecoveryRequired::FromPc(EXIT));
+        let mut j = journal_until(&program, EXIT);
+        assert!(matches!(
+            decide(&program, &j),
+            RestartDecision::OnSiteInterventionRequired(OnSiteReason::RecoveryRequiredPoint { .. })
+        ));
+        let at = after_last(&j);
+        j.commit_run_stopped(at, RunStop::StepLimit).unwrap();
+        assert_eq!(
+            decide(&program, &j),
+            RestartDecision::Stopped(StoppedRun {
+                at,
+                reason: RunStop::StepLimit
+            })
+        );
+
+        let program = super::tests::program(RecoveryRequired::Never);
+        let mut j = journal_until(&program, ERASE);
+        assert!(matches!(decide(&program, &j), RestartDecision::Restart(_)));
+        let at = after_last(&j);
+        let reason = RunStop::Vm(diag_ir::VmError::TypeMismatch);
+        j.commit_run_stopped(at, reason.clone()).unwrap();
+        assert_eq!(
+            decide(&program, &j),
+            RestartDecision::Stopped(StoppedRun { at, reason })
         );
     }
 

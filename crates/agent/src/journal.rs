@@ -19,7 +19,7 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use diag_ir::IdentityKind;
+use diag_ir::{IdentityKind, VmError};
 use serde::{Deserialize, Serialize};
 use shared_proto::JobId;
 
@@ -134,6 +134,26 @@ pub struct RecoveryFacts {
     /// The restart ended itself on an identity check that failed (ADR-286). Terminal like
     /// `procedure_failed`: no record follows it, and a restart does not resume the job.
     pub identity_mismatch: Option<IdentityKind>,
+    /// A run stopped on the step limit or on an instruction the VM refused (ADR-288). Terminal
+    /// like `procedure_failed`: no record follows it, and a restart does not resume the job.
+    pub run_stopped: Option<StoppedRun>,
+}
+
+/// Why a run stopped without reaching the program's end or a `Fail` (ADR-288).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RunStop {
+    /// The run reached the job's step limit (`JobLimits::max_steps`, ADR-287).
+    StepLimit,
+    /// The VM refused the instruction at the stop.
+    Vm(VmError),
+}
+
+/// A run's stop, as journaled (ADR-288).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoppedRun {
+    /// The instruction the run stopped at and the step count it had reached.
+    pub at: StepRef,
+    pub reason: RunStop,
 }
 
 /// A declared failure of the procedure, as journaled (ADR-280).
@@ -162,6 +182,7 @@ impl RecoveryFacts {
             intended_software_version: None,
             procedure_failed: None,
             identity_mismatch: None,
+            run_stopped: None,
         }
     }
 
@@ -183,6 +204,9 @@ impl RecoveryFacts {
         }
         if self.identity_mismatch.is_some() {
             return Err("no record follows an identity mismatch");
+        }
+        if self.run_stopped.is_some() {
+            return Err("no record follows a stopped run");
         }
         match record {
             Record::TargetVin(vin) => {
@@ -352,6 +376,15 @@ impl RecoveryFacts {
                 }
                 self.identity_mismatch = Some(*identity);
             }
+            Record::RunStopped { at, reason } => {
+                if !after_last_step(at, self) {
+                    return Err("a run's stop must come after the last step");
+                }
+                self.run_stopped = Some(StoppedRun {
+                    at: *at,
+                    reason: reason.clone(),
+                });
+            }
         }
         Ok(())
     }
@@ -458,6 +491,12 @@ enum Record {
     /// fact but `identity_mismatch`.
     IdentityMismatch {
         identity: IdentityKind,
+    },
+    /// A run stopped on the step limit or on an instruction the VM refused (ADR-288); the job's
+    /// last record. Changes no fact but `run_stopped`.
+    RunStopped {
+        at: StepRef,
+        reason: RunStop,
     },
 }
 
@@ -868,6 +907,12 @@ impl<S: Store> Journal<S> {
     /// committed after it.
     pub fn commit_identity_mismatch(&mut self, identity: IdentityKind) -> Result<(), JournalError> {
         self.commit(Record::IdentityMismatch { identity })
+    }
+
+    /// Records that a run stopped at `at` for `reason` (ADR-288). Nothing can be committed after
+    /// it.
+    pub fn commit_run_stopped(&mut self, at: StepRef, reason: RunStop) -> Result<(), JournalError> {
+        self.commit(Record::RunStopped { at, reason })
     }
 
     fn commit(&mut self, record: Record) -> Result<(), JournalError> {
@@ -2436,6 +2481,117 @@ mod tests {
         ));
     }
 
+    /// A run's stop (ADR-288) reads back as the fact and is terminal: nothing follows it, it
+    /// comes after the last step, and it cannot follow the other terminal records.
+    #[test]
+    fn a_run_stop_is_the_last_record() {
+        let mut j = memory();
+        j.commit_step(at(3, 1), None).expect("step");
+        assert!(matches!(
+            j.commit_run_stopped(at(3, 1), RunStop::StepLimit),
+            Err(JournalError::Invariant(
+                "a run's stop must come after the last step"
+            ))
+        ));
+        assert_eq!(j.summary().run_stopped, None);
+        j.commit_run_stopped(at(4, 2), RunStop::Vm(VmError::StackUnderflow))
+            .expect("stop");
+        assert_eq!(
+            j.summary().run_stopped,
+            Some(StoppedRun {
+                at: at(4, 2),
+                reason: RunStop::Vm(VmError::StackUnderflow),
+            })
+        );
+        let records = j.state().records;
+        assert!(matches!(
+            j.commit_step(at(5, 3), None),
+            Err(JournalError::Invariant("no record follows a stopped run"))
+        ));
+        assert!(matches!(
+            j.commit_procedure_failed(at(6, 4), "E", "d"),
+            Err(JournalError::Invariant(_))
+        ));
+        assert!(matches!(
+            j.commit_identity_mismatch(IdentityKind::Vin),
+            Err(JournalError::Invariant(_))
+        ));
+        assert!(matches!(
+            j.commit_run_stopped(at(6, 4), RunStop::StepLimit),
+            Err(JournalError::Invariant(_))
+        ));
+        assert_eq!(j.state().records, records);
+
+        // The other orders are refused too.
+        let mut j = memory();
+        j.commit_procedure_failed(at(1, 1), "E", "d")
+            .expect("failure");
+        assert!(matches!(
+            j.commit_run_stopped(at(2, 2), RunStop::StepLimit),
+            Err(JournalError::Invariant(
+                "no record follows a procedure failure"
+            ))
+        ));
+        let mut j = memory();
+        j.commit_identity_mismatch(IdentityKind::Vin)
+            .expect("abort");
+        assert!(matches!(
+            j.commit_run_stopped(at(2, 2), RunStop::StepLimit),
+            Err(JournalError::Invariant(
+                "no record follows an identity mismatch"
+            ))
+        ));
+        assert_eq!(j.summary().run_stopped, None);
+
+        let dir = TempDir::new();
+        let mut j = Journal::create(&dir.0, &key(), None, None).expect("create");
+        j.commit_step(at(3, 1), None).expect("step");
+        j.commit_run_stopped(at(4, 2), RunStop::StepLimit)
+            .expect("stop");
+        drop(j);
+        let state = Journal::read(&dir.0, &key()).expect("read back");
+        assert_eq!(
+            state.facts.run_stopped,
+            Some(StoppedRun {
+                at: at(4, 2),
+                reason: RunStop::StepLimit,
+            })
+        );
+        assert_eq!(state.facts.last_step, Some(at(3, 1)));
+        assert_eq!(Journal::open(&dir.0, &key()).expect("open").state(), &state);
+
+        // A record appended behind it is corrupt, not ignored.
+        append_entry(&dir, 2, Record::Block { block: 1 });
+        assert!(matches!(
+            Journal::read(&dir.0, &key()),
+            Err(JournalError::Corrupt { .. })
+        ));
+    }
+
+    /// A torn run-stop record reads back as the state before it, as a crash before its commit
+    /// leaves the journal (ADR-288 Consequences); whole, it is the fact.
+    #[test]
+    fn a_torn_run_stop_reads_back_as_the_state_before_it() {
+        let dir = TempDir::new();
+        let mut j = Journal::create(&dir.0, &key(), None, None).expect("create");
+        j.commit_step(at(3, 1), Some(b"vm")).expect("step");
+        let before = (j.store.len as usize, j.state().clone());
+        j.commit_run_stopped(at(4, 2), RunStop::Vm(VmError::Overflow))
+            .expect("stop");
+        let whole = j.state().clone();
+        drop(j);
+        let bytes = fs::read(path(&dir)).expect("read");
+        for cut in before.0..bytes.len() {
+            let loaded = load(&bytes[..cut], &key()).unwrap_or_else(|e| panic!("cut {cut}: {e}"));
+            assert_eq!(
+                (loaded.len, &loaded.state),
+                (before.0, &before.1),
+                "cut {cut}"
+            );
+        }
+        assert_eq!(load(&bytes, &key()).expect("whole").state, whole);
+    }
+
     /// A failure record's text is bounded on commit and on read-back (ADR-280).
     #[test]
     fn a_procedure_failure_with_unbounded_text_is_refused() {
@@ -2590,6 +2746,10 @@ mod tests {
             Record::IdentityMismatch {
                 identity: IdentityKind::Vin,
             },
+            Record::RunStopped {
+                at: at(0, 0),
+                reason: RunStop::StepLimit,
+            },
         ];
         for (index, record) in records.iter().enumerate() {
             assert_eq!(
@@ -2597,6 +2757,75 @@ mod tests {
                 index,
                 "{record:?}"
             );
+        }
+    }
+
+    /// The run-stop record holds `RunStop` and `diag_ir::VmError`, which postcard encodes by
+    /// variant index, so both orders are part of the journal format (ADR-288): reordering either
+    /// would make an existing journal read back another reason.
+    #[test]
+    fn the_run_stop_record_keeps_its_reason_encoding() {
+        let errors = [
+            VmError::SchemaMismatch {
+                program: 0,
+                runtime: 0,
+            },
+            VmError::StateSchemaMismatch {
+                program: 0,
+                state: 0,
+            },
+            VmError::ProgramTooLarge,
+            VmError::StepLimit,
+            VmError::BadPc(0),
+            VmError::BadReturnPc(0),
+            VmError::StackUnderflow,
+            VmError::StackOverflow,
+            VmError::CallDepthExceeded,
+            VmError::TypeMismatch,
+            VmError::Overflow,
+            VmError::DivisionByZero,
+            VmError::ShiftOutOfRange(0),
+            VmError::BadConstant(0),
+            VmError::InvalidUtf8(0),
+            VmError::UndefinedVariable(0),
+            VmError::IndexOutOfRange(0),
+            VmError::ByteOutOfRange(0),
+        ];
+        // The match fails to compile when a variant is added, so the list above stays complete.
+        for error in &errors {
+            match error {
+                VmError::SchemaMismatch { .. }
+                | VmError::StateSchemaMismatch { .. }
+                | VmError::ProgramTooLarge
+                | VmError::StepLimit
+                | VmError::BadPc(_)
+                | VmError::BadReturnPc(_)
+                | VmError::StackUnderflow
+                | VmError::StackOverflow
+                | VmError::CallDepthExceeded
+                | VmError::TypeMismatch
+                | VmError::Overflow
+                | VmError::DivisionByZero
+                | VmError::ShiftOutOfRange(_)
+                | VmError::BadConstant(_)
+                | VmError::InvalidUtf8(_)
+                | VmError::UndefinedVariable(_)
+                | VmError::IndexOutOfRange(_)
+                | VmError::ByteOutOfRange(_) => {}
+            }
+        }
+        let encoded = |reason: RunStop| {
+            postcard::to_allocvec(&Record::RunStopped {
+                at: at(0, 0),
+                reason,
+            })
+            .expect("encode")
+        };
+        // The record's index, the position's two varints, then the reason.
+        assert_eq!(encoded(RunStop::StepLimit), [14, 0, 0, 0]);
+        for (index, error) in errors.into_iter().enumerate() {
+            let bytes = encoded(RunStop::Vm(error.clone()));
+            assert_eq!(bytes[..5], [14, 0, 0, 1, index as u8], "{error:?}");
         }
     }
 

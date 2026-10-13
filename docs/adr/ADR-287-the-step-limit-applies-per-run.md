@@ -1,7 +1,7 @@
 # ADR-287: The Job's Step Limit Applies to Each Run
 
 **Date:** 2026-10-13
-**Status:** Accepted
+**Status:** Accepted (the open consequence on a plain start after a step-limited run decided by ADR-288: the stop is journaled as terminal)
 **Affects:** `agent` (`src/runner.rs` `JobLimits::max_steps`, `run_vm` and `JobError::StepLimit`,
 `docs/ngr-agent.md`); ADR-253 item 3, ADR-255 and ADR-276 consequences
 

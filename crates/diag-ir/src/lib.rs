@@ -923,7 +923,9 @@ pub enum StepError<E: std::error::Error + 'static> {
     Host(#[source] E),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+/// Serializable because the agent journals the error that stopped a run (ADR-288): the encoding
+/// is part of the journal format, so variants are only ever appended, never reordered or removed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 pub enum VmError {
     #[error("schema version mismatch: program={program}, runtime={runtime}")]
     SchemaMismatch { program: u32, runtime: u32 },

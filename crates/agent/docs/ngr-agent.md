@@ -167,6 +167,14 @@ after the last step, and the journal refuses every record after it, in a commit 
 the file back (`RecoveryFacts::procedure_failed`). A job without a journal (a program without a
 plan, or `ngr-agent run`) ends in the same error with nothing recorded.
 
+A run that stops on the step limit (`JobError::StepLimit`) or on an instruction the VM refuses
+(`JobError::Vm`) commits a run-stop record the same way before it returns its error (ADR-288): the
+instruction it stopped at, the step count it had reached and the reason (`RunStop::StepLimit` or
+`RunStop::Vm` with the VM's error). It is terminal like the procedure-failure record
+(`RecoveryFacts::run_stopped`): it must come after the last step, nothing may follow it, and a
+commit that fails ends the job in `JobError::Journal` instead. A VM error found before the run
+(the program's or the journaled state's schema version) is not a run's stop and is not recorded.
+
 A restart that ends in `JobError::IdentityMismatch { identity }` (the gates of step 2 or step 3a)
 commits an identity-abort record first (`Journal::commit_identity_mismatch`, ADR-286): the
 `IdentityKind` only (a VIN or a hardware part number; the journal refuses a software version), with
@@ -223,8 +231,8 @@ plan's entry; otherwise, or for a stage the program does not declare, the decisi
 `agent::resume_program_journaled` takes the same arguments as `run_program_journaled`,
 guards included, for a job that ran before (ADR-255), and returns the guards with its result.
 It opens the job's journal (`Journal::open`, with its writer lock) before it opens the worker
-link; a journal another run holds, or one that records a declared failure or an identity abort,
-ends the job there.
+link; a journal another run holds, or one that records a declared failure, an identity abort or a
+run's stop, ends the job there.
 Once the link is open and the policy allows the program, and before anything is sent to the ECU,
 it classifies the journal.
 
@@ -233,6 +241,7 @@ it classifies the journal.
 | plain start | runs the program from its start on the same journal; its step count starts at `restart::next_steps`, after the journal's last record, and the identity is read again. A program without a plan runs without a journal, when it has none or one that records no transfer |
 | `Failed` | ends in `JobError::ProcedureFailed` with the record's position, code and detail, read under the journal's lock before the worker link is opened; nothing is sent to the ECU and no resume is counted (ADR-280) |
 | `Aborted` | ends in `JobError::IdentityMismatch` with the journaled `IdentityKind`, read under the journal's lock before the worker link is opened and before the target VIN and intended version are compared; nothing is sent to the ECU and no resume is counted (ADR-286) |
+| `Stopped` | ends in the error the stopped run returned, `JobError::StepLimit` with the recorded step count or `JobError::Vm` with the recorded position and error, read under the journal's lock before the worker link is opened; nothing is sent to the ECU and no resume is counted, so a plain start does not send the pre-erase requests again and a restart does not redo the transfer (ADR-288) |
 | `OnSiteInterventionRequired` | ends in `JobError::OnSiteInterventionRequired` with the classification's reason; nothing is sent |
 | `Restart` | runs `restart::check_before_ecu`, then the gates of `restart::check_gates` (which promote the guards to the per-vehicle lock once the VIN matches, ADR-263), then the teardown of `restart::teardown` (ADR-264), then the default-session confirmation of `restart::confirm_default_session` (ADR-265). An ECU that cannot be confirmed ends the job in `JobError::OnSiteInterventionRequired(DefaultSessionNotConfirmed)`. Then `restart::check_identity` (step 3a) reads the VIN and the hardware identity again: a different one ends the job in `IdentityMismatch` (journaled first, ADR-286), one that cannot be established in `OnSiteInterventionRequired(IdentityNotEstablished)`, and a matching VIN promotes the guards again (the lock's fallback when step 2 could not read it). Then `restart::check_state` (step 3b-2) reads the software version and decides between redoing the transfer and the read-back verification (`restart::check_state` below): a version nobody wrote ends the job in `OnSiteInterventionRequired(UnexpectedSoftwareVersion)`, one that cannot be established in `OnSiteInterventionRequired(SoftwareVersionNotEstablished)`. When the state check decides to redo the transfer, `restart::check_reentry` (step 4a) checks every declared precondition again through its default-session source: one that does not hold ends the job in `OnSiteInterventionRequired(PreconditionNotMet)`. When step 4a passes, the program's steps from the plan's entry boundary up to, not including, its erase run again from `RestartPoint::entry_state` (step 4b-2, ADR-273; `replay to the erase` below), and then `restart::check_before_erase` (step 4b-3) checks every declared precondition once more through its programming-session source: one that does not hold ends the job in `OnSiteInterventionRequired(PreconditionNotMetBeforeErase)` with no erase sent. After that check the same VM goes on from the erase as a first run does (step 4c, ADR-276; `redo from the erase` below), and the job ends as that first run would. When the state check decides the read-back verification, the program goes on after the plan instead (`continuation after the read-back verification` below), and the job ends as a first run would; the gates' reads, at most one ECUReset, the F186 reads, step 3a's two reads, step 3b-2's version reads, step 4a's precondition reads, the replayed steps, step 4b-3's precondition reads and then the redone transfer and the rest of the program, or after a verification the program's steps after the plan, reach the ECU |
 
@@ -473,7 +482,8 @@ journaling:
   the resume limit, which the new marker does not reset;
 - the step limit applies to each run (ADR-287): the restart's step count continues after the
   journal's last record for the journal's ordering, but the limit counts only the restart's own
-  steps, the replay and the redo together, so a redo has the budget a first run has.
+  steps, the replay and the redo together, so a redo has the budget a first run has. A restart
+  the limit stops journals the stop and is not resumed again (ADR-288).
 
 The restart order up to the erase is `runner::restart_order`; `resume_on` continues from where it
 stopped. In test builds `OnSiteReason::StoppedBeforeErase` reports a restart that the tests

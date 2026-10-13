@@ -100,8 +100,9 @@ jobs:
   # `ci-windows` profile runs one test at a time. The agent's tests are not among them and spend
   # their time on file I/O, so they run first, on their own and in parallel (`ci-windows-parallel`);
   # run one at a time they took about half of the Windows time. The second run does not rebuild.
-  # On pull requests, j2534-0404-service (most of the remaining Windows time) is left out: it has no
-  # Windows-specific code, and Linux runs it on every pull request. main runs everything.
+  # On pull requests, j2534-0404-service (most of the remaining Windows time) is left out, but for
+  # its restart end to end, which ends the worker in a Windows-specific way; Linux runs the rest of
+  # it on every pull request. main runs everything.
   core-windows:
     needs: changes
     if: ${{ always() && (needs.changes.result != 'success' || needs.changes.outputs.code == 'true') }}
@@ -120,6 +121,12 @@ jobs:
         run: cargo nextest run --workspace --locked $EXCLUDE --profile ci-windows-parallel -E 'package(agent)'
       - shell: bash
         run: cargo nextest run --workspace --locked $EXCLUDE --profile ci-windows -E 'not package(agent)'
+      # On pull requests the run above leaves j2534-0404-service out, but its restart end to end
+      # (worker crash, ECU power loss, VCI disconnect) is what Windows can break: the worker is
+      # killed with TerminateProcess there. main runs it with the rest of the package.
+      - if: github.event_name == 'pull_request'
+        shell: bash
+        run: cargo nextest run -p j2534-0404-service --locked --profile ci-windows -E 'binary(agent_restart_end_to_end)'
       # sim-vci is a cdylib only, which cargo runs no doc tests for.
       - shell: bash
         run: cargo test --workspace --locked --exclude sim-vci $EXCLUDE --doc

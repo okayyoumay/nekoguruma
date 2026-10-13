@@ -41,11 +41,17 @@
 //! command at that block instead of killing it (an ECU power loss, a VCI disconnect), and stops
 //! the worker once the run has ended.
 //!
-//! The harness is for the unix test hosts, where a process group can be killed.
+//! The agent child ([`Env::spawn_agent`], [`AgentChild`]) is unix-only: it relies on a process
+//! group that SIGKILL ends at once, agent and worker together. The rest runs on Windows too,
+//! where [`Env::crash_worker`] ends the worker with `taskkill /F`, which terminates it at once
+//! as SIGKILL does.
 
+#[cfg(unix)]
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+#[cfg(unix)]
+use std::process::{Child, ExitStatus};
+use std::process::{Command, Stdio};
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -276,6 +282,7 @@ impl Env {
 
     /// Starts the agent as a child process in a process group of its own, running the job's
     /// first run. It runs until the job ends, which a test normally prevents by killing it.
+    #[cfg(unix)]
     pub fn spawn_agent(&self) -> AgentChild {
         let child = self
             .child("agent")
@@ -400,7 +407,8 @@ impl Env {
     /// worker, new guards from the scenario's lock directory, and the journal directory and ECU
     /// state of the first run. Returns the job's result. Must not run while a child of this
     /// scenario is alive. The request trace is emptied first, so [`Env::trace`] afterwards holds
-    /// the restart's requests only.
+    /// the restart's requests only. Its callers kill the agent child, so it is unix-only as well.
+    #[cfg(unix)]
     pub fn restart(&self, spec: &JobSpec) -> Result<VmState, JobError> {
         self.resume_in_process(spec, None).result
     }
@@ -537,18 +545,7 @@ impl Env {
             });
             let journal = tokio::task::block_in_place(|| self.wait_for_block(spec, block, timeout));
             match interruption {
-                Interruption::KillWorker => {
-                    let pid = i32::try_from(pid).expect("a process ID fits in pid_t");
-                    // SAFETY: kill(2) takes a process ID and a signal number and touches no
-                    // memory.
-                    let killed = unsafe { libc::kill(pid, libc::SIGKILL) };
-                    assert_eq!(
-                        killed,
-                        0,
-                        "kill of worker {pid} failed: {}",
-                        std::io::Error::last_os_error()
-                    );
-                }
+                Interruption::KillWorker => kill_worker(pid),
                 Interruption::Inject(command) => self.inject(command),
             }
             let mut run = run;
@@ -635,11 +632,42 @@ async fn launch_worker() -> WorkerProcess {
     .expect("worker should launch")
 }
 
+/// Ends the worker process `pid` at once, as a crash would: nothing in it is closed or flushed.
+#[cfg(unix)]
+fn kill_worker(pid: u32) {
+    let pid = i32::try_from(pid).expect("a process ID fits in pid_t");
+    // SAFETY: kill(2) takes a process ID and a signal number and touches no memory.
+    let killed = unsafe { libc::kill(pid, libc::SIGKILL) };
+    assert_eq!(
+        killed,
+        0,
+        "kill of worker {pid} failed: {}",
+        std::io::Error::last_os_error()
+    );
+}
+
+/// Ends the worker process `pid` at once, as a crash would: `taskkill /F` terminates it
+/// (`TerminateProcess`), so nothing in it is closed or flushed.
+#[cfg(windows)]
+fn kill_worker(pid: u32) {
+    let status = Command::new("taskkill")
+        .args(["/F", "/PID", &pid.to_string()])
+        .stdout(Stdio::null())
+        .status()
+        .expect("taskkill should run");
+    assert!(
+        status.success(),
+        "taskkill of worker {pid} failed: {status}"
+    );
+}
+
 /// The agent process of a scenario's first run.
+#[cfg(unix)]
 pub struct AgentChild {
     child: Child,
 }
 
+#[cfg(unix)]
 impl AgentChild {
     /// Kills the agent and its worker with SIGKILL, waits for the agent and returns how it
     /// ended: the test checks it died of the signal, so a job that finished by itself before
@@ -661,6 +689,7 @@ impl AgentChild {
     }
 }
 
+#[cfg(unix)]
 impl Drop for AgentChild {
     fn drop(&mut self) {
         // A test that failed before the kill must not leave the agent running.
@@ -670,6 +699,7 @@ impl Drop for AgentChild {
 }
 
 /// Whether `status` is the end of a process killed by SIGKILL.
+#[cfg(unix)]
 pub fn died_of_sigkill(status: ExitStatus) -> bool {
     status.signal() == Some(9)
 }

@@ -13,7 +13,9 @@ Flag as P1:
   that change a manifest, the lockfile or `.cargo/`; widening its trigger is still a finding.
   So is `agent-release`, the agent's tests in a release build on main only (ADR-247's read-only
   release agent rests on code only a release build compiles); running it on pull requests is a
-  finding.
+  finding. So is the `core-windows` step that runs `j2534-0404-service`'s `agent_restart_end_to_end`
+  on pull requests (the maintainer's decision: the harness ends the worker in a Windows-specific
+  way); widening it to the whole package is a finding.
 - **Required checks**: a change that lets a required check be skipped and so pass without
   running, or that renames or removes a job the branch ruleset requires (`repo-checks`,
   `core-linux`, `core-windows`, `worker-check`, `abi-roundtrip`, `msrv`). `msrv` is skipped on

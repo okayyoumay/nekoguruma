@@ -2568,6 +2568,30 @@ mod tests {
         ));
     }
 
+    /// A torn run-stop record reads back as the state before it, as a crash before its commit
+    /// leaves the journal (ADR-288 Consequences); whole, it is the fact.
+    #[test]
+    fn a_torn_run_stop_reads_back_as_the_state_before_it() {
+        let dir = TempDir::new();
+        let mut j = Journal::create(&dir.0, &key(), None, None).expect("create");
+        j.commit_step(at(3, 1), Some(b"vm")).expect("step");
+        let before = (j.store.len as usize, j.state().clone());
+        j.commit_run_stopped(at(4, 2), RunStop::Vm(VmError::Overflow))
+            .expect("stop");
+        let whole = j.state().clone();
+        drop(j);
+        let bytes = fs::read(path(&dir)).expect("read");
+        for cut in before.0..bytes.len() {
+            let loaded = load(&bytes[..cut], &key()).unwrap_or_else(|e| panic!("cut {cut}: {e}"));
+            assert_eq!(
+                (loaded.len, &loaded.state),
+                (before.0, &before.1),
+                "cut {cut}"
+            );
+        }
+        assert_eq!(load(&bytes, &key()).expect("whole").state, whole);
+    }
+
     /// A failure record's text is bounded on commit and on read-back (ADR-280).
     #[test]
     fn a_procedure_failure_with_unbounded_text_is_refused() {

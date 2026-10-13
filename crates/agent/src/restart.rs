@@ -2009,6 +2009,44 @@ mod tests {
         );
     }
 
+    /// A run's stop is final too (ADR-288): decided before the interruption point, so an open
+    /// transfer at a recovery-required point is the stop, not on-site intervention, and an open
+    /// transfer that would restart is the stop too.
+    #[test]
+    fn a_run_stop_is_decided_before_the_interruption() {
+        use crate::journal::{RunStop, StoppedRun};
+        let after_last = |j: &Journal<Memory>| StepRef {
+            pc: 0,
+            steps: j.state().facts.last_step.map_or(0, |last| last.steps + 1),
+        };
+        let program = program(RecoveryRequired::FromPc(EXIT));
+        let mut j = journal_until(&program, EXIT);
+        assert!(matches!(
+            decide(&program, &j),
+            RestartDecision::OnSiteInterventionRequired(OnSiteReason::RecoveryRequiredPoint { .. })
+        ));
+        let at = after_last(&j);
+        j.commit_run_stopped(at, RunStop::StepLimit).unwrap();
+        assert_eq!(
+            decide(&program, &j),
+            RestartDecision::Stopped(StoppedRun {
+                at,
+                reason: RunStop::StepLimit
+            })
+        );
+
+        let program = super::tests::program(RecoveryRequired::Never);
+        let mut j = journal_until(&program, ERASE);
+        assert!(matches!(decide(&program, &j), RestartDecision::Restart(_)));
+        let at = after_last(&j);
+        let reason = RunStop::Vm(diag_ir::VmError::TypeMismatch);
+        j.commit_run_stopped(at, reason.clone()).unwrap();
+        assert_eq!(
+            decide(&program, &j),
+            RestartDecision::Stopped(StoppedRun { at, reason })
+        );
+    }
+
     /// The done-when case: a lost response to the request at the recovery-required point ends in
     /// on-site intervention, whether the point is RequestTransferExit (its marker) or another
     /// request (its intent, ADR-253); one step earlier, the restart goes ahead.

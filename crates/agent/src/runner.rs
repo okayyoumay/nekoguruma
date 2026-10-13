@@ -1283,8 +1283,8 @@ where
                 return Err(JobError::ProcedureFailed { pc, code, detail });
             }
             Err(StepError::Vm(source)) => {
-                // Terminal like the step limit (ADR-288). The stop is placed at the refused
-                // instruction, after any step it completed.
+                // Terminal like the step limit (ADR-288), at the refused instruction: a step is
+                // atomic, so the instruction completed nothing.
                 let at = StepRef {
                     pc,
                     steps: vm.state.steps,
@@ -2520,6 +2520,11 @@ mod tests {
                 "{result:?}"
             );
             let facts = &journal.journal().state().facts;
+            // The refusal on arrival is journaled as the run's stop (ADR-288), also behind the
+            // transfer-start marker at RequestTransferExit.
+            let stopped = facts.run_stopped.as_ref().expect("the stop is journaled");
+            assert_eq!(stopped.at.pc, boundary);
+            assert!(matches!(stopped.reason, RunStop::Vm(_)), "{stopped:?}");
             if boundary == ERASE {
                 assert!(facts.transfer.is_none());
                 assert!(!host.sent().iter().any(|s| matches!(s, Sent::Routine(_))));
@@ -3898,6 +3903,60 @@ mod tests {
         );
         assert_eq!(host.sent(), []);
         assert_eq!(journal.journal().state().facts.run_stopped, None);
+    }
+
+    /// A recorded stop is reported before the link is opened: a resume on a worker that cannot be
+    /// reached ends in it, not in a link error (ADR-288).
+    #[test]
+    fn a_stopped_journal_reports_the_stop_without_a_worker() {
+        let program = flash_program();
+        let dir = journal_dir("step-limit-no-worker");
+        let limits = JobLimits {
+            max_steps: u64::from(ERASE),
+            ..JobLimits::default()
+        };
+        let result = first_run(&program, &dir, limits, |_| {});
+        let Err(JobError::StepLimit(steps)) = result else {
+            panic!("{result:?}");
+        };
+        let guards = take_guards(&dir);
+        let (result, _guards) =
+            resume_on_unreachable(program, &dir, guards, Arc::new(AtomicBool::new(false)));
+        assert!(
+            matches!(result, Err(JobError::StepLimit(s)) if s == steps),
+            "{result:?}"
+        );
+        assert_eq!(resumes(&dir), 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A stopped journal resumed by a job whose data changed (another VIN, or a version it now
+    /// names) still ends in the stop, not in on-site intervention, with nothing sent (ADR-288).
+    #[test]
+    fn a_stopped_journal_reports_the_stop_whatever_the_jobs_data() {
+        let program = flash_program();
+        let dir = journal_dir("step-limit-vin");
+        let limits = JobLimits {
+            max_steps: u64::from(ERASE),
+            ..JobLimits::default()
+        };
+        let result = first_run(&program, &dir, limits, |_| {});
+        assert!(matches!(result, Err(JobError::StepLimit(_))), "{result:?}");
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        let result = resume_for(&program, &dir, &mut host, false, Some("WDB99999999999999"));
+        assert!(matches!(result, Err(JobError::StepLimit(_))), "{result:?}");
+        let result = resume_naming(
+            &program,
+            &dir,
+            &mut host,
+            false,
+            Some(TARGET_VIN),
+            Some(b"2.0.0"),
+            &dir_slot(&dir),
+        );
+        assert!(matches!(result, Err(JobError::StepLimit(_))), "{result:?}");
+        assert_eq!(host.sent(), []);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// A failed journal resumed by a job whose data changed (another VIN, or a version it now

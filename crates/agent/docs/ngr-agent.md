@@ -12,7 +12,7 @@ ngr-agent run --vci <name> --mode <device|user> --program <file> [--workers <dir
 
 | Option | Meaning |
 |---|---|
-| `--vci` | J2534 v04.04 library name: the registry key name on Windows, the `Name` of a registration definition on Linux (design 7.1.1), which the worker service resolves. The agent's own lookup (step 3) still reads `library_path` on Linux |
+| `--vci` | J2534 v04.04 library name: the registry key name on Windows, the `Name` of a registration definition on Linux (design 7.1.1), resolved the same way by the agent (step 3) and the worker service |
 | `--mode` | The device's operating mode (design 6.2), `device` or `user`. Required: the mode is fixed per device at installation, and this command, which has no installation of its own, takes it from the command line rather than defaulting to either. It is passed to the worker (ADR-281 Decision item 2); design 7.2 gives it its meaning for a failed library check: device mode refuses the library, user mode reports the findings and loads it. Both worker services apply it to the checks they run before loading |
 | `--program` | IR program file: a `diag_ir::Program` serialized as JSON |
 | `--workers` | Directory of worker builds, laid out as `<dir>/<ABI name>/j2534-0404-service[.exe]` (design 7.3). Default: `workers` next to the `ngr-agent` executable |
@@ -33,19 +33,17 @@ Steps (`agent::check_program`, `agent::guards::JobGuards`, `agent::launch::launc
 2. Take the job's guards from the `--locks` directory, named by `--vci` ("Job guards" below):
    the per-VCI lock, plus the reprogramming slot when the program writes (`policy::writes`).
    The run waits here while another job on the device holds them.
-3. Resolve the VCI name the way each worker build would resolve it on its side
-   (`j2534_0404_registry`): a `library_path` entry in `config.toml` under that build's
-   architecture key, else at api level, else the build's registry view. The first build whose
-   library header (`worker_host::abi::detect_file`) matches the build's own ABI is chosen, so
-   the header that selects the build belongs to the file that build loads (ADR-240).
-   - Windows x64 agent: the x64 build (`x86_x64` key, 64-bit registry view) first, then the x86
-     build (`x86` key, 32-bit view, `KEY_WOW64_32KEY`). A VCI registered in both views runs on
-     the x64 build.
+3. Resolve the VCI name the way each worker build resolves it on its side, through
+   `ngr_library_resolver::j2534_0404` (design 7.1.1): the build's registry view on Windows, the
+   registration definition on Linux; in a debug build the `NGR_J2534_DEFINITION_DIR` definition
+   directory replaces both (ADR-282). No `config.toml` key names the library (ADR-281 Decision
+   item 1). The first build whose library header (`worker_host::abi::detect_file`) matches the
+   build's own ABI is chosen, so the header that selects the build belongs to the file that
+   build loads (ADR-240).
+   - Windows x64 agent: the x64 build (64-bit registry view) first, then the x86 build (32-bit
+     view, `KEY_WOW64_32KEY`). A VCI registered in both views runs on the x64 build.
    - Windows x86 agent: the x86 build only, so a 64-bit library is not found.
-   - Linux: one lookup without an architecture key; the registry does not apply, so the
-     library needs a `library_path` entry, and the build follows the header's ABI. The
-     worker itself resolves the name through `ngr-library-resolver` (its registration
-     definition), so on Linux the library needs both, naming the same file.
+   - Linux: one lookup; the build follows the header's ABI.
 4. Pick the service build for that ABI with `WorkerLayout::find`. A missing build fails as
    `UNSUPPORTED_ABI`.
 5. Launch the service with the library name, the `--mode` value and the ABI's default `long_size` (design 7.1.2;

@@ -2746,6 +2746,10 @@ mod tests {
             Record::IdentityMismatch {
                 identity: IdentityKind::Vin,
             },
+            Record::RunStopped {
+                at: at(0, 0),
+                reason: RunStop::StepLimit,
+            },
         ];
         for (index, record) in records.iter().enumerate() {
             assert_eq!(
@@ -2753,6 +2757,75 @@ mod tests {
                 index,
                 "{record:?}"
             );
+        }
+    }
+
+    /// The run-stop record holds `RunStop` and `diag_ir::VmError`, which postcard encodes by
+    /// variant index, so both orders are part of the journal format (ADR-288): reordering either
+    /// would make an existing journal read back another reason.
+    #[test]
+    fn the_run_stop_record_keeps_its_reason_encoding() {
+        let errors = [
+            VmError::SchemaMismatch {
+                program: 0,
+                runtime: 0,
+            },
+            VmError::StateSchemaMismatch {
+                program: 0,
+                state: 0,
+            },
+            VmError::ProgramTooLarge,
+            VmError::StepLimit,
+            VmError::BadPc(0),
+            VmError::BadReturnPc(0),
+            VmError::StackUnderflow,
+            VmError::StackOverflow,
+            VmError::CallDepthExceeded,
+            VmError::TypeMismatch,
+            VmError::Overflow,
+            VmError::DivisionByZero,
+            VmError::ShiftOutOfRange(0),
+            VmError::BadConstant(0),
+            VmError::InvalidUtf8(0),
+            VmError::UndefinedVariable(0),
+            VmError::IndexOutOfRange(0),
+            VmError::ByteOutOfRange(0),
+        ];
+        // The match fails to compile when a variant is added, so the list above stays complete.
+        for error in &errors {
+            match error {
+                VmError::SchemaMismatch { .. }
+                | VmError::StateSchemaMismatch { .. }
+                | VmError::ProgramTooLarge
+                | VmError::StepLimit
+                | VmError::BadPc(_)
+                | VmError::BadReturnPc(_)
+                | VmError::StackUnderflow
+                | VmError::StackOverflow
+                | VmError::CallDepthExceeded
+                | VmError::TypeMismatch
+                | VmError::Overflow
+                | VmError::DivisionByZero
+                | VmError::ShiftOutOfRange(_)
+                | VmError::BadConstant(_)
+                | VmError::InvalidUtf8(_)
+                | VmError::UndefinedVariable(_)
+                | VmError::IndexOutOfRange(_)
+                | VmError::ByteOutOfRange(_) => {}
+            }
+        }
+        let encoded = |reason: RunStop| {
+            postcard::to_allocvec(&Record::RunStopped {
+                at: at(0, 0),
+                reason,
+            })
+            .expect("encode")
+        };
+        // The record's index, the position's two varints, then the reason.
+        assert_eq!(encoded(RunStop::StepLimit), [14, 0, 0, 0]);
+        for (index, error) in errors.into_iter().enumerate() {
+            let bytes = encoded(RunStop::Vm(error.clone()));
+            assert_eq!(bytes[..5], [14, 0, 0, 1, index as u8], "{error:?}");
         }
     }
 

@@ -29,7 +29,8 @@
 //!   post-transfer completion.
 //!
 //! When the procedure ends itself as failed (`Op::Fail`): a procedure-failure record, the job's
-//! last ([`JobJournal::procedure_failed`], ADR-280).
+//! last ([`JobJournal::procedure_failed`], ADR-280). A restart's identity abort is committed by
+//! the runner on the journal itself (`Journal::commit_identity_mismatch`, ADR-286).
 //!
 //! A commit that fails, or an identity that cannot be read, ends the job before the next
 //! instruction runs, so the request a marker guards is never sent without it (ADR-244 item 7).

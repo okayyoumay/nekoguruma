@@ -167,6 +167,14 @@ after the last step, and the journal refuses every record after it, in a commit 
 the file back (`RecoveryFacts::procedure_failed`). A job without a journal (a program without a
 plan, or `ngr-agent run`) ends in the same error with nothing recorded.
 
+A restart that ends in `JobError::IdentityMismatch { identity }` (the gates of step 2 or step 3a)
+commits an identity-abort record first (`Journal::commit_identity_mismatch`, ADR-286): the
+`IdentityKind` only (a VIN or a hardware part number; the journal refuses a software version), with
+no position, VIN or value. It is terminal like the procedure-failure record: the journal refuses
+every record after it and after a procedure failure, in a commit and when it reads the file back.
+`RecoveryFacts::identity_mismatch` and `RecoveryFacts::procedure_failed` hold the two endings. A commit that fails ends the job in `JobError::Journal`, and the mismatch is only
+logged. No on-site ending is journaled.
+
 `ngr-agent run` uses `run_program` and keeps no journal; it sends read-only requests, or any
 request to `sim-vci` in a debug build (ADR-247).
 
@@ -182,6 +190,7 @@ step count, of the last completed step, the two transfer markers and the last re
 | none (`NotFound`), program with a plan | `OnSiteInterventionRequired` (the journal is created before anything is sent) |
 | unreadable (corrupt, unknown format version, another job, I/O) | `OnSiteInterventionRequired` |
 | a procedure-failure record (ADR-280), checked before every row below | `Failed`, with the record's position, code and detail |
+| an identity-abort record (ADR-286), checked right after the procedure-failure record | `Aborted`, with the `IdentityKind`, whatever the transfer state |
 | interruption point at or past a plan's recovery-required point and before its end, or inside a `RecoveryRequired` section the journal can place it in (inside a plan, on the step into a plan's entry, or at a completed plan's end); a point no later than the last post-transfer step of a completed transfer counts as at that plan's end | `OnSiteInterventionRequired` |
 | no transfer-start marker | plain start |
 | transfer-start marker | `Restart`, for the plan of the marker's stage, with the VM state at its entry; `OnSiteInterventionRequired` if that plan never allows a restart |
@@ -214,7 +223,8 @@ plan's entry; otherwise, or for a stage the program does not declare, the decisi
 `agent::resume_program_journaled` takes the same arguments as `run_program_journaled`,
 guards included, for a job that ran before (ADR-255), and returns the guards with its result.
 It opens the job's journal (`Journal::open`, with its writer lock) before it opens the worker
-link; a journal another run holds, or one that records a declared failure, ends the job there.
+link; a journal another run holds, or one that records a declared failure or an identity abort,
+ends the job there.
 Once the link is open and the policy allows the program, and before anything is sent to the ECU,
 it classifies the journal.
 
@@ -222,8 +232,9 @@ it classifies the journal.
 |---|---|
 | plain start | runs the program from its start on the same journal; its step count starts at `restart::next_steps`, after the journal's last record, and the identity is read again. A program without a plan runs without a journal, when it has none or one that records no transfer |
 | `Failed` | ends in `JobError::ProcedureFailed` with the record's position, code and detail, read under the journal's lock before the worker link is opened; nothing is sent to the ECU and no resume is counted (ADR-280) |
+| `Aborted` | ends in `JobError::IdentityMismatch` with the journaled `IdentityKind`, read under the journal's lock before the worker link is opened and before the target VIN and intended version are compared; nothing is sent to the ECU and no resume is counted (ADR-286) |
 | `OnSiteInterventionRequired` | ends in `JobError::OnSiteInterventionRequired` with the classification's reason; nothing is sent |
-| `Restart` | runs `restart::check_before_ecu`, then the gates of `restart::check_gates` (which promote the guards to the per-vehicle lock once the VIN matches, ADR-263), then the teardown of `restart::teardown` (ADR-264), then the default-session confirmation of `restart::confirm_default_session` (ADR-265). An ECU that cannot be confirmed ends the job in `JobError::OnSiteInterventionRequired(DefaultSessionNotConfirmed)`. Then `restart::check_identity` (step 3a) reads the VIN and the hardware identity again: a different one ends the job in `IdentityMismatch`, one that cannot be established in `OnSiteInterventionRequired(IdentityNotEstablished)`, and a matching VIN promotes the guards again (the lock's fallback when step 2 could not read it). Then `restart::check_state` (step 3b-2) reads the software version and decides between redoing the transfer and the read-back verification (`restart::check_state` below): a version nobody wrote ends the job in `OnSiteInterventionRequired(UnexpectedSoftwareVersion)`, one that cannot be established in `OnSiteInterventionRequired(SoftwareVersionNotEstablished)`. When the state check decides to redo the transfer, `restart::check_reentry` (step 4a) checks every declared precondition again through its default-session source: one that does not hold ends the job in `OnSiteInterventionRequired(PreconditionNotMet)`. When step 4a passes, the program's steps from the plan's entry boundary up to, not including, its erase run again from `RestartPoint::entry_state` (step 4b-2, ADR-273; `replay to the erase` below), and then `restart::check_before_erase` (step 4b-3) checks every declared precondition once more through its programming-session source: one that does not hold ends the job in `OnSiteInterventionRequired(PreconditionNotMetBeforeErase)` with no erase sent. After that check the same VM goes on from the erase as a first run does (step 4c, ADR-276; `redo from the erase` below), and the job ends as that first run would. When the state check decides the read-back verification, the program goes on after the plan instead (`continuation after the read-back verification` below), and the job ends as a first run would; the gates' reads, at most one ECUReset, the F186 reads, step 3a's two reads, step 3b-2's version reads, step 4a's precondition reads, the replayed steps, step 4b-3's precondition reads and then the redone transfer and the rest of the program, or after a verification the program's steps after the plan, reach the ECU |
+| `Restart` | runs `restart::check_before_ecu`, then the gates of `restart::check_gates` (which promote the guards to the per-vehicle lock once the VIN matches, ADR-263), then the teardown of `restart::teardown` (ADR-264), then the default-session confirmation of `restart::confirm_default_session` (ADR-265). An ECU that cannot be confirmed ends the job in `JobError::OnSiteInterventionRequired(DefaultSessionNotConfirmed)`. Then `restart::check_identity` (step 3a) reads the VIN and the hardware identity again: a different one ends the job in `IdentityMismatch` (journaled first, ADR-286), one that cannot be established in `OnSiteInterventionRequired(IdentityNotEstablished)`, and a matching VIN promotes the guards again (the lock's fallback when step 2 could not read it). Then `restart::check_state` (step 3b-2) reads the software version and decides between redoing the transfer and the read-back verification (`restart::check_state` below): a version nobody wrote ends the job in `OnSiteInterventionRequired(UnexpectedSoftwareVersion)`, one that cannot be established in `OnSiteInterventionRequired(SoftwareVersionNotEstablished)`. When the state check decides to redo the transfer, `restart::check_reentry` (step 4a) checks every declared precondition again through its default-session source: one that does not hold ends the job in `OnSiteInterventionRequired(PreconditionNotMet)`. When step 4a passes, the program's steps from the plan's entry boundary up to, not including, its erase run again from `RestartPoint::entry_state` (step 4b-2, ADR-273; `replay to the erase` below), and then `restart::check_before_erase` (step 4b-3) checks every declared precondition once more through its programming-session source: one that does not hold ends the job in `OnSiteInterventionRequired(PreconditionNotMetBeforeErase)` with no erase sent. After that check the same VM goes on from the erase as a first run does (step 4c, ADR-276; `redo from the erase` below), and the job ends as that first run would. When the state check decides the read-back verification, the program goes on after the plan instead (`continuation after the read-back verification` below), and the job ends as a first run would; the gates' reads, at most one ECUReset, the F186 reads, step 3a's two reads, step 3b-2's version reads, step 4a's precondition reads, the replayed steps, step 4b-3's precondition reads and then the redone transfer and the rest of the program, or after a verification the program's steps after the plan, reach the ECU |
 
 `check_before_ecu` is the part of ADR-229 item 2 step 1 that an agent without a server makes:
 
@@ -263,7 +274,8 @@ at the first gate that does not hold:
 
 1. The VIN, through the program's VIN source, against the VIN the job names (the journal's
    target VIN). A well-formed VIN (17 characters, each a digit or an upper-case letter other
-   than I, O and Q) other than the job's ends the job in `JobError::IdentityMismatch`. No
+   than I, O and Q) other than the job's ends the job in `JobError::IdentityMismatch`, journaled
+   first (ADR-286). No
    answer, a negative response, text that is not a well-formed VIN, or a job that names no
    well-formed VIN (which reads nothing) gives `PassiveOnly(VinNotEstablished)`.
 
@@ -338,13 +350,14 @@ sources, with a cancel check at the start and around each read:
   returns at once when they hold that vehicle, so step 2's promotion is not repeated in
   effect). When step 2 could not read the VIN, this promotion is the fallback that takes the
   lock, after the passive teardown. A well-formed VIN that differs ends the job in
-  `JobError::IdentityMismatch { identity: Vin }`. Anything else (no target VIN or no declared
+  `JobError::IdentityMismatch { identity: Vin }`, journaled first (ADR-286). Anything else (no target VIN or no declared
   source, no answer, a negative response, a value that is not a well-formed VIN, a worker
   failure) ends it in `OnSiteInterventionRequired(IdentityNotEstablished { flash_session,
   identity: Vin, teardown })`, where `teardown` is step 2b-1's outcome, so the technician
   knows whether an ECUReset was sent;
 - the hardware identity, only after the VIN matched: the raw field bytes must equal the
-  journal's. Different bytes end the job in `IdentityMismatch { identity: HardwarePartNumber }`,
+  journal's. Different bytes end the job in `IdentityMismatch { identity: HardwarePartNumber }`
+  (journaled first, ADR-286),
   and anything else (no recorded value or source, no answer, a negative response, a worker
   failure) in `IdentityNotEstablished { identity: HardwarePartNumber, teardown }`.
 

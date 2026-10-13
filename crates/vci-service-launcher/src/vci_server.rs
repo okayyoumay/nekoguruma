@@ -129,6 +129,9 @@ pub struct ServiceIdentity {
     /// Process architecture string for config lookup.
     /// `Some("x86_x64")` / `Some("x86")` on Windows; `None` elsewhere.
     pub arch: Option<&'static str>,
+    /// The operating mode from the startup argument, which decides what a failed check on the
+    /// configuration file means (design 7.2, ADR-285).
+    pub mode: crate::mode::OperatingMode,
 }
 
 /// Returns the current process architecture key used in config lookups.
@@ -157,8 +160,12 @@ pub trait VciServer:
     ) -> Result<Self::StartupConfig, BoxError>;
     /// Returns the identity of this service instance for configuration lookup.
     fn service_identity(config: &Self::StartupConfig) -> ServiceIdentity;
+    /// Creates the service. `config_file` is the launcher's verdict on the configuration file
+    /// (ADR-285): the service takes its settings from the file only when
+    /// [`ConfigFile::settings_apply`](crate::ConfigFile::settings_apply) says so.
     fn new(
         args: Self::StartupConfig,
+        config_file: crate::ConfigFile,
         shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> impl Future<Output = Result<Self, BoxError>> + Send + 'static;
     fn get_requested_port(&self) -> Option<u16>;
@@ -229,12 +236,13 @@ async fn bind_loopback_listeners(
 /// Create and start a gRPC server from an already-parsed startup config.
 pub(crate) async fn spawn_vci_context<S>(
     startup_config: S::StartupConfig,
+    config_file: crate::ConfigFile,
 ) -> Result<VciServerContext, BoxError>
 where
     S: VciServer,
 {
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let service = S::new(startup_config, shutdown_rx.clone()).await?;
+    let service = S::new(startup_config, config_file, shutdown_rx.clone()).await?;
     let port_to_use = service.get_requested_port().unwrap_or(0);
 
     let listeners = bind_loopback_listeners(port_to_use).await?;

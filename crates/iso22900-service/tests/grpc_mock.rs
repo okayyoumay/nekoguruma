@@ -77,6 +77,7 @@ impl TestServer {
         let service = Iso22900Service::new(
             Iso22900Service::get_startup_config(["iso22900-service", "iso22900:TestLib?mode=user"])
                 .expect("startup config"),
+            vci_service_launcher::ConfigFile::Checked,
             service_shutdown_rx,
         )
         .await

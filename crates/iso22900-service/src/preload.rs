@@ -1,7 +1,7 @@
 //! The design 7.2 pre-load checks on the resolved library, and what the operating mode makes of
 //! a failed one (ADR-281 Decision item 2).
 
-use std::{fs::File, path::PathBuf};
+use std::fs::File;
 
 use ngr_library_resolver::{Policy, Signer, iso22900::Resolved};
 use tonic::Status;
@@ -14,60 +14,28 @@ use vci_service_launcher::mode::OperatingMode;
 pub struct CheckedLibrary {
     _signer: Option<Signer>,
     _held: Option<File>,
-    config_checked: bool,
 }
 
-impl CheckedLibrary {
-    /// Whether the configuration file existed and was among the checked files. When it did not,
-    /// a file created later has passed no check, so the service must not take settings from it.
-    pub fn config_checked(&self) -> bool {
-        self.config_checked
-    }
-}
-
-/// Runs the writability and signer checks on `resolved`'s library, the files that named it and,
-/// when it exists, the worker's configuration file, whose per-library settings the service acts
-/// on (ADR-270 Decision item 5). A missing configuration file means nothing is configured, so it
-/// is not a finding.
+/// Runs the writability and signer checks on `resolved`'s library and the files that named it.
+/// The launcher has already checked the worker's configuration file, before reading any setting
+/// from it (ADR-285).
 ///
 /// A library that passes is reported with its signer. One that fails is refused in device mode,
 /// with a client message that names no path (ADR-089) and the findings in the log; in user mode
 /// the findings are logged as a warning and the library is loaded.
 pub fn check_library(resolved: &Resolved, mode: OperatingMode) -> Result<CheckedLibrary, Status> {
-    let config = vci_service_launcher::config::config_file();
-    let probe = std::fs::symlink_metadata(&config);
-    check_library_with(
-        resolved,
-        config_to_check(config, probe),
-        mode,
-        &Policy::system(),
-    )
+    check_library_with(resolved, mode, &Policy::system())
 }
 
-/// The configuration file to check, given what probing it returned: only a file that is not
-/// there is left out. Any other failure to probe it (a parent directory the worker cannot
-/// search, say) keeps it among the checked files, so the check reports it instead of the
-/// service running on defaults that select a device the configuration did not name.
-fn config_to_check<T>(config: PathBuf, probe: std::io::Result<T>) -> Option<PathBuf> {
-    match probe {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        _ => Some(config),
-    }
-}
-
-/// [`check_library`] with the configuration file to check passed in, and the owners `policy`
-/// trusts instead of the system owners, so tests can trust the user they run as.
+/// [`check_library`] with the owners `policy` trusts instead of the system owners, so tests can
+/// trust the user they run as.
 fn check_library_with(
     resolved: &Resolved,
-    config: Option<PathBuf>,
     mode: OperatingMode,
     policy: &Policy,
 ) -> Result<CheckedLibrary, Status> {
     let library = &resolved.implementation.library_file;
-    let config_checked = config.is_some();
-    let mut naming_files = resolved.naming_files();
-    naming_files.extend(config);
-    match ngr_library_resolver::check_library(library, &naming_files, policy) {
+    match ngr_library_resolver::check_library(library, &resolved.naming_files(), policy) {
         Ok(signer) => {
             match &signer {
                 Signer::Trusted {
@@ -88,7 +56,6 @@ fn check_library_with(
             Ok(CheckedLibrary {
                 _signer: Some(signer),
                 _held: None,
-                config_checked,
             })
         }
         Err(failed) => match mode {
@@ -111,7 +78,6 @@ fn check_library_with(
                 Ok(CheckedLibrary {
                     _signer: failed.signer,
                     _held: failed.held,
-                    config_checked,
                 })
             }
         },
@@ -120,7 +86,7 @@ fn check_library_with(
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     use ngr_library_resolver::iso22900::Implementation;
     use tonic::Code;
@@ -180,25 +146,11 @@ mod tests {
     }
 
     #[test]
-    fn only_a_missing_configuration_file_is_left_unchecked() {
-        let config = PathBuf::from("config.toml");
-        let missing = std::io::Error::from(std::io::ErrorKind::NotFound);
-        assert_eq!(config_to_check(config.clone(), Err::<(), _>(missing)), None);
-        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
-        assert_eq!(
-            config_to_check(config.clone(), Err::<(), _>(denied)),
-            Some(config.clone())
-        );
-        assert_eq!(config_to_check(config.clone(), Ok(())), Some(config));
-    }
-
-    #[test]
     fn a_clean_library_is_accepted_in_both_modes() {
         let (_tmp, resolved) = fixture();
         for mode in [OperatingMode::Device, OperatingMode::User] {
-            let checked = check_library_with(&resolved, None, mode, &policy());
-            // No configuration file was there to check.
-            assert!(!checked.expect("clean library").config_checked(), "{mode}");
+            let checked = check_library_with(&resolved, mode, &policy());
+            assert!(checked.is_ok(), "{mode}: {checked:?}");
         }
     }
 
@@ -206,7 +158,7 @@ mod tests {
     fn device_mode_refuses_a_writable_library_without_naming_it() {
         let (_tmp, resolved) = fixture();
         make_writable_by_regular_users(&library(&resolved));
-        let status = check_library_with(&resolved, None, OperatingMode::Device, &policy())
+        let status = check_library_with(&resolved, OperatingMode::Device, &policy())
             .expect_err("device mode should refuse the library");
         assert_eq!(status.code(), Code::FailedPrecondition);
         assert!(
@@ -222,7 +174,7 @@ mod tests {
     fn user_mode_accepts_a_writable_library() {
         let (_tmp, resolved) = fixture();
         make_writable_by_regular_users(&library(&resolved));
-        let checked = check_library_with(&resolved, None, OperatingMode::User, &policy());
+        let checked = check_library_with(&resolved, OperatingMode::User, &policy());
         assert!(checked.is_ok(), "{checked:?}");
     }
 
@@ -230,28 +182,8 @@ mod tests {
     fn device_mode_refuses_a_writable_root_file() {
         let (_tmp, resolved) = fixture();
         make_writable_by_regular_users(&resolved.root_file);
-        let status = check_library_with(&resolved, None, OperatingMode::Device, &policy())
+        let status = check_library_with(&resolved, OperatingMode::Device, &policy())
             .expect_err("device mode should refuse a library named by a writable root file");
-        assert_eq!(status.code(), Code::FailedPrecondition);
-    }
-
-    #[test]
-    fn device_mode_refuses_a_writable_configuration_file() {
-        let (tmp, resolved) = fixture();
-        let config = std::fs::canonicalize(tmp.path())
-            .expect("canonicalize temp dir")
-            .join("config.toml");
-        std::fs::write(&config, "").expect("write config file");
-        let clean = check_library_with(
-            &resolved,
-            Some(config.clone()),
-            OperatingMode::Device,
-            &policy(),
-        );
-        assert!(clean.expect("clean configuration").config_checked());
-        make_writable_by_regular_users(&config);
-        let status = check_library_with(&resolved, Some(config), OperatingMode::Device, &policy())
-            .expect_err("device mode should refuse with a writable configuration file");
         assert_eq!(status.code(), Code::FailedPrecondition);
     }
 }

@@ -70,7 +70,12 @@ async fn start(mode: &str) -> Result<Iso22900Service, Box<dyn std::error::Error>
         format!("iso22900:{LIBRARY_NAME}?mode={mode}"),
     ])
     .expect("startup config");
-    Iso22900Service::new(config, tokio::sync::watch::channel(false).1).await
+    Iso22900Service::new(
+        config,
+        vci_service_launcher::ConfigFile::Checked,
+        tokio::sync::watch::channel(false).1,
+    )
+    .await
 }
 
 #[tokio::test]

@@ -607,12 +607,18 @@ The name the service is started with is therefore both the name it resolves
 in `config.toml`, including the `modules` entries whose `pname` becomes
 `PassThruOpen`'s `pName` (ADR-107). `tests/preload_checks.rs` checks this.
 
+Before any setting is read, the launcher checks `config.toml` with the design
+7.2 writability rules (ADR-270 Decision item 5, ADR-285). In device mode a file
+that fails the check is not read and the service does not start; in user mode
+the findings are logged and the file is used. The service reads its
+per-library settings only on that verdict, so when `config.toml` does not exist
+at startup, none are read.
+
 Immediately before loading, the service runs the design 7.2 pre-load checks on
-the library, the definition that named it and, when it exists, `config.toml`
-(ADR-270 Decision item 5). The operating mode from the startup argument decides
-what a failure means (ADR-281 Decision item 2): device mode refuses the library
-with `FAILED_PRECONDITION`, user mode logs the findings and loads it. When
-`config.toml` does not exist at that point, no per-library settings are read.
+the library and the definition that named it. The operating mode from the
+startup argument decides what a failure means (ADR-281 Decision item 2): device
+mode refuses the library with `FAILED_PRECONDITION`, user mode logs the
+findings and loads it.
 
 #### Service Model
 

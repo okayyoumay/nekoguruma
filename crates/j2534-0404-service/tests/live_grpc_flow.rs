@@ -366,6 +366,7 @@ async fn manual_typical_grpc_flow_against_real_device() {
     let service = J2534Service::new(
         J2534Service::get_startup_config(["j2534-0404-service", &startup_arg])
             .expect("startup config should parse"),
+        vci_service_launcher::ConfigFile::Checked,
         service_shutdown_rx,
     )
     .await

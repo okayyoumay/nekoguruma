@@ -205,7 +205,7 @@ The interface-assigned identifier a `PDU_IOCTL_START_REPEAT_MESSAGE` call return
 The physical hardware device that connects a PC to a vehicle bus. Also called VCI or J2534 adapter.
 
 **Naming file** (design 7.2, ADR-270)  
-A file that decides which library a worker loads: a Linux J2534 registration definition, a D-PDU API root or module description file, or the worker service's configuration file. The 7.2 writability check (`ngr_library_resolver::check_writability`) checks each naming file and its folders as it checks the library, since rewriting one redirects the load. A Windows registry hit names no file: HKLM is the trust premise.
+A file that decides which library a worker loads: a Linux J2534 registration definition, a D-PDU API root or module description file, or the worker service's configuration file. The 7.2 writability check (`ngr_library_resolver::check_writability`) checks each naming file and its folders as it checks the library, since rewriting one redirects the load. The worker's configuration file is checked the same way at startup, before any setting is read from it (`ngr_library_resolver::check_files_with`, ADR-285). A Windows registry hit names no file: HKLM is the trust premise.
 
 **NRC** — Negative Response Code  
 A UDS/ISO 14229 status byte returned in a negative response message. Key NRCs handled by this project:

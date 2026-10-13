@@ -23,5 +23,6 @@ pub use signer::{
     PreloadError, SignatureFailure, Signer, SignerError, check_library, check_signer,
 };
 pub use writability::{
-    Finding, Policy, Reason, Role, WritabilityError, check_writability, check_writability_with,
+    Finding, Policy, Reason, Role, WritabilityError, check_files_with, check_writability,
+    check_writability_with,
 };

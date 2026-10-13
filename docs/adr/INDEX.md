@@ -259,7 +259,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-267](ADR-267-restart-identity-recheck.md) | The Restart Re-reads the Identity in the Default Session and Promotes There Too | Accepted | `agent` restart, runner |
 | [ADR-268](ADR-268-restart-intended-software-version.md) | The Job Names Its Intended Software Version, and the Journal Records It | Accepted (item 5's completion counts only for the interrupted pass since ADR-269) | `agent` journal, runner, restart |
 | [ADR-269](ADR-269-restart-completion-of-the-interrupted-pass.md) | Only the Interrupted Pass's Completion Sends a Restart to Read-Back Verification | Accepted | `agent` restart, design 8.2.5 |
-| [ADR-270](ADR-270-library-writability-check.md) | What "Writable by Regular Users" Means for the Pre-Load Check | Accepted (the D-PDU API root file, MDF and CDF are naming files under item 5, ADR-277; item 5's mode is passed by the agent since ADR-281) | `ngr-library-resolver`, design 7.2 |
+| [ADR-270](ADR-270-library-writability-check.md) | What "Writable by Regular Users" Means for the Pre-Load Check | Accepted (the D-PDU API root file, MDF and CDF are naming files under item 5, ADR-277; item 5's mode is passed by the agent since ADR-281; item 5's configuration file is checked by the launcher before any setting is read, ADR-285) | `ngr-library-resolver`, design 7.2 |
 | [ADR-271](ADR-271-restart-read-back-verification.md) | After a Restart, Read-Back Verification Is the State Check's Match, and the Program Continues from the Plan's End | Accepted (item 2's end step is a step from inside the plan, and its read-back follows ADR-274; item 4 needs every section over a primitive outside the plans to be Safe when sections overlap, and none of them marked RecoveryRequired; it also covers the steps of the plan that begins at the verified plan's end, from that entry up to its erase or its recovery-required point, whichever comes first, which the continuation runs before any record of that plan: for a plan that allows a restart they are the replay of ADR-273 item 5 (an Unsafe section refuses, and Program::validate already excludes one), for a plan that does not, no replay is sanctioned and they are checked like the primitives outside the plans; item 5 also covers a run start that made the end state stale) | `agent` restart, runner, journaling, design 5.6 / 8.2.5 |
 | [ADR-272](ADR-272-journal-run-start-record.md) | Every Journaled Run Records the State It Starts From | Accepted (item 2's open point for runs not from instruction 0 settled for the replay of step 4 by ADR-273; item 3 amended by ADR-274: the entry state is the newest state standing at the entry, which is the newest state or, when the newest is the current attempt's end-state record and the interruption point is that step, the one before it; the replay commits a run start since ADR-274) | `agent` journal, runner, restart |
 | [ADR-273](ADR-273-restart-replay-to-the-erase.md) | The Restart Replays the Program from the Entry State up to the Erase | Accepted (item 4's stop at the erase is now preceded by step 4b-3's second precondition check, `restart::check_before_erase`, which ends the job in `PreconditionNotMetBeforeErase` when a condition fails; item 4's `RestartOrderUnavailable` stop superseded by ADR-276, which goes on with the erase; item 2 superseded by ADR-274: the replay commits a run start carrying the entry state; item 5's reading applies to a plan that allows a restart: for the continuation of ADR-271, the steps of a plan that allows none and begins at the verified plan's end are checked like the primitives outside the plans, since no replay is sanctioned for it) | `agent` runner, restart, journaling |
@@ -274,6 +274,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-282](ADR-282-debug-resolver-overrides-on-windows.md) | In Debug Builds the Resolvers' Runtime Overrides Also Replace the Windows Registry | Accepted | `ngr-library-resolver`, `vci-service-config`, design 7.1.1 / 7.2, worker and agent integration tests |
 | [ADR-283](ADR-283-codeql-workflow-and-windows-dll-check.md) | CodeQL Runs as a Repository Workflow, and the Windows DLL Check Uses the Runner's System Directory | Accepted | `.github/workflows/codeql.yml`, `codeql-alert-handoff.yml`, `ci.yml` (`worker-windows`, `abi-roundtrip-windows`) |
 | [ADR-284](ADR-284-agent-passes-the-definition-long-size.md) | The Agent Passes the Registration Definition's `LongSize` to the J2534 Worker | Accepted | `agent` launch, `ngr-agent run`, design 7.1.1 / 7.1.2 / 7.3 |
+| [ADR-285](ADR-285-launcher-checks-the-configuration-file.md) | The Launcher Checks the Worker's Configuration File Before Reading It | Accepted | `vci-service-launcher`, `ngr-library-resolver`, `iso22900-service`, `j2534-0404-service`, design 7.2 |
 
 ## Status Legend
 
@@ -584,10 +585,11 @@ the predecessor repository these ADRs came from.
 - ADR-226
 - ADR-228 (the Linux definition format and the shared crate's name settled by ADR-266; item 3 extended and the configuration file no longer names a library, ADR-281; item 1's debug override also replaces the Windows registry, ADR-282)
 - ADR-231
-- ADR-270 (the D-PDU API root file, MDF and CDF are naming files under item 5, ADR-277; item 5's mode is passed by the agent since ADR-281)
+- ADR-270 (the D-PDU API root file, MDF and CDF are naming files under item 5, ADR-277; item 5's mode is passed by the agent since ADR-281; item 5's configuration file is checked by the launcher before any setting is read, ADR-285)
 - ADR-277
 - ADR-278 (item 4's mode is passed by the agent since ADR-281)
 - ADR-281
+- ADR-285
 
 ### FFI Bindings & Target ABI
 - ADR-108

@@ -303,7 +303,8 @@ const READ_BACK: &str = "read-back";
 
 /// The software version the read-back variant writes. The ECU installs it at the first power
 /// cycle after its integrity check passed (`downloaded_sw_version`), which the variant's own
-/// ECUReset is. As long as [`SW_VERSION`], so the identity table's F189 field reads both.
+/// ECUReset is. It has the same byte length as [`SW_VERSION`], since the identity table's F189
+/// field has a fixed length and must decode both versions.
 const INSTALLED_SW_VERSION: &str = "2.0.0";
 
 /// [`program`] with an ECUReset as the plan's last post-transfer step, which makes the ECU run

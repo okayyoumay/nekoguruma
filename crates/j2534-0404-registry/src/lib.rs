@@ -16,22 +16,6 @@ pub struct J2534DeviceInfo {
     pub library_path: PathBuf,
     /// Architecture of this library entry.
     pub arch: LibraryArch,
-    /// Where this entry came from; see [`enumerate_libraries`].
-    pub source: LibrarySource,
-}
-
-/// Where a [`J2534DeviceInfo`] returned by [`enumerate_libraries`] came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LibrarySource {
-    /// Found via Windows registry auto-discovery only.
-    Registry,
-    /// Present only as a `library_path` entry in the config file (see
-    /// [`enumerate_libraries`]); no matching registry entry was found.
-    Config,
-    /// Found via Windows registry auto-discovery, with the config file
-    /// additionally providing a `library_path` override for this device
-    /// name — the `library_path` field reflects the configured override.
-    Both,
 }
 
 /// Error type for J2534 registry operations.
@@ -252,77 +236,6 @@ pub fn find_j2534_device_on_registry(
     result
 }
 
-/// Returns a configured `library_path` override for `library_name` from the
-/// shared `config.toml` (`config.apis.j2534-0404...`), if present.
-///
-/// Applies a 2-level priority (highest first):
-/// 1. `config.apis.j2534-0404.arch.<arch>.libs.<lib>.library_path` (Windows only)
-/// 2. `config.apis.j2534-0404.libs.<lib>.library_path`
-///
-/// Returns `None` when no override is configured, in which case the caller
-/// should fall back to registry auto-discovery (`find_j2534_device`).
-pub fn find_library_path(arch: Option<&str>, library_name: &str) -> Option<PathBuf> {
-    vci_service_config::find_library_path("j2534-0404", arch, library_name)
-}
-
-/// Device names configured with a `library_path` under
-/// `config.apis.j2534-0404` in the shared `config.toml`, across both the
-/// api-level and every arch-level `libs` table. Sorted and deduplicated.
-pub fn list_configured_libraries() -> Vec<String> {
-    vci_service_config::list_configured_libraries("j2534-0404")
-}
-
-/// Enumerates all J2534 v04.04 devices visible to this process: registry
-/// auto-discovery ([`enumerate_j2534_devices`]) merged with `library_path`
-/// entries configured under `config.apis.j2534-0404` in the shared
-/// `config.toml` ([`list_configured_libraries`], including its `arch`-level
-/// entries).
-///
-/// A device name present in both sources appears once, with `library_path`
-/// set to the configured override and `source` set to
-/// [`LibrarySource::Both`]. A name present in only one source keeps that
-/// source's fields, with `source` set to [`LibrarySource::Registry`] or
-/// [`LibrarySource::Config`] accordingly.
-///
-/// Registry auto-discovery failures (e.g. `RegistryUnsupported` on
-/// non-Windows) are treated as "no registry-discovered devices" rather than
-/// propagated, so a config-only device is always listed regardless of
-/// platform.
-///
-/// Sorted by `device_name`.
-pub fn enumerate_libraries(mode: RegistryViewMode) -> Vec<J2534DeviceInfo> {
-    let mut devices = match enumerate_j2534_devices(mode) {
-        Ok(devices) => devices,
-        Err(RegistryError::RegistryUnsupported) => {
-            debug!(
-                "registry auto-discovery unsupported on this platform; falling back to config-only libraries"
-            );
-            Vec::new()
-        }
-        Err(e) => {
-            warn!(error = %e, "registry auto-discovery failed while enumerating libraries; falling back to config-only libraries");
-            Vec::new()
-        }
-    };
-
-    for (name, path) in vci_service_config::list_configured_library_paths("j2534-0404") {
-        if let Some(existing) = devices.iter_mut().find(|d| d.device_name == name) {
-            existing.library_path = path;
-            existing.source = LibrarySource::Both;
-        } else {
-            devices.push(J2534DeviceInfo {
-                device_name: name,
-                library_path: path,
-                arch: LibraryArch::get_native(),
-                source: LibrarySource::Config,
-            });
-        }
-    }
-
-    devices.sort_by(|a, b| a.device_name.cmp(&b.device_name));
-    devices
-}
-
 // ---------------------------------------------------------------------------
 // Platform implementations
 // ---------------------------------------------------------------------------
@@ -369,7 +282,6 @@ fn enumerate_devices_impl(mode: RegistryViewMode) -> Result<Vec<J2534DeviceInfo>
                 device_name,
                 library_path: PathBuf::from(raw),
                 arch,
-                source: LibrarySource::Registry,
             })
         })
         .collect();

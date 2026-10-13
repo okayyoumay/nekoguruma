@@ -436,13 +436,12 @@ fn the_debug_override_replaces_every_registry_view() {
 #[cfg(windows)]
 #[test]
 fn a_registry_hit_maps_to_a_resolved() {
-    use j2534_0404_registry::{J2534DeviceInfo, LibraryArch, LibrarySource};
+    use j2534_0404_registry::{J2534DeviceInfo, LibraryArch};
     let library = std::env::temp_dir().join("vendor").join("j2534.dll");
     let resolved = resolved_from_registry(J2534DeviceInfo {
         device_name: "Vendor VCI".to_owned(),
         library_path: library.clone(),
         arch: LibraryArch::Native,
-        source: LibrarySource::Registry,
     });
     assert_eq!(resolved.source, Source::Registry);
     assert_eq!(resolved.definition.name, "Vendor VCI");

@@ -18,7 +18,6 @@ Cargo workspace corresponding to the design document `docs/system-architecture.m
 | `diag-frontend` | ODX/OTX parser, CSV + Starlark->IR conversion (server only) | 8.3 / 8.4 |
 | `vendor-manifest` | Manifest parser for ECU distribution packages | 11.2 |
 | `j2534-defs` | ABI-independent J2534 constants, protocol names, COMPARAM mapping | 8.5 |
-| `vci-discovery` | Discovery of J2534 devices | 7.1 |
 | `server` | Web API, jobs, distribution management, GW | 3.2 |
 | `agent` | Discovery, job execution, journal; library plus the `ngr-agent` binary | 3.3 |
 | `worker-host` | ABI detection from the library header, launching worker services, authenticated gRPC client | 7.3 / 7.4 |

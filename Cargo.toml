@@ -7,7 +7,6 @@ members = [
     "crates/diag-frontend",
     "crates/vendor-manifest",
     "crates/j2534-defs",
-    "crates/vci-discovery",
     "crates/worker-host",
     "crates/iso22900",
     "crates/iso22900-sys",
@@ -43,7 +42,6 @@ diag-ir = { path = "crates/diag-ir" }
 vendor-manifest = { path = "crates/vendor-manifest" }
 sim-ecu = { path = "crates/sim-ecu" }
 j2534-defs = { path = "crates/j2534-defs" }
-vci-discovery = { path = "crates/vci-discovery" }
 worker-host = { path = "crates/worker-host" }
 iso22900 = { path = "crates/iso22900" }
 iso22900-sys = { path = "crates/iso22900-sys" }

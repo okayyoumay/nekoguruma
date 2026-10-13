@@ -1230,7 +1230,6 @@ vendor-manifest  per-vendor manifest parsers
 diag-ir          IR schema, bytecode definition, VM (shared by server and agent)
 diag-frontend    ODX/OTX parser, CSV + Starlark→IR transpiler (server only)
 j2534-defs       ABI-independent J2534 values: status codes, protocol IDs, config/IOCTL IDs, COMPARAM mapping (sim-vci)
-vci-discovery    discovery of J2534 devices (agent)
 worker-host      ABI detection, worker service launch and control channel (agent)
 iso22900*        D-PDU API FFI, safe wrapper, discovery, mock, gRPC worker service
 j2534-0404*      J2534 v04.04 FFI (unsigned long width facade), safe wrapper, discovery, mock, gRPC worker service

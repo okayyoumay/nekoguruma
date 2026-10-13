@@ -22,7 +22,7 @@ use vci_service_interface::{
     SubscribeEventRequest, TimestampResponse, UniqueRespIdTableResponse, UnlockResourceRequest,
     VersionResponse, vci_service_server::VciService,
 };
-use vci_service_launcher::vci_server::VciServer;
+use vci_service_launcher::{ConfigFile, vci_server::VciServer};
 
 use crate::config::StartupConfig;
 use crate::error::{
@@ -59,8 +59,9 @@ pub struct Iso22900Service {
     pub(super) subscriptions: Arc<Mutex<SubscriptionMap>>,
     pub(super) cop_tags: Arc<Mutex<CopTagMap>>,
     pub(super) shutdown: tokio::sync::watch::Receiver<bool>,
-    /// Whether `config.toml` existed at startup and passed through the design 7.2 checks
-    /// (`preload.rs`). When it did not, settings from a file created later are ignored.
+    /// Whether the launcher's design 7.2 check on `config.toml` let its settings through
+    /// ([`ConfigFile::settings_apply`], ADR-285). When the file was absent at startup, settings
+    /// from one created later are ignored.
     pub(super) config_checked: bool,
 }
 
@@ -414,11 +415,13 @@ impl VciServer for Iso22900Service {
             api_name: "iso22900",
             library_name: config.library_name.clone(),
             arch: vci_service_launcher::vci_server::current_arch(),
+            mode: config.mode(),
         }
     }
 
     async fn new(
         startup_config: Self::StartupConfig,
+        config_file: ConfigFile,
         shutdown: Receiver<bool>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         tracing::info!(
@@ -444,14 +447,18 @@ impl VciServer for Iso22900Service {
         // `j2534-0404-service`'s identical `resolve_vendor_ioctls` fail-fast
         // validation for its sibling `vendor_ioctls` table (ADR-219, as
         // amended).
-        vci_service_launcher::config::validate_vendor_struct_type_keys(
-            "iso22900",
-            vci_service_launcher::vci_server::current_arch(),
-            &startup_config.library_name,
-        )
-        .map_err(|msg| -> Box<dyn std::error::Error> { msg.into() })?;
+        // The keys are read only from a configuration file the launcher's
+        // check let through (ADR-285).
+        let config_checked = config_file.settings_apply();
+        if config_checked {
+            vci_service_launcher::config::validate_vendor_struct_type_keys(
+                "iso22900",
+                vci_service_launcher::vci_server::current_arch(),
+                &startup_config.library_name,
+            )
+            .map_err(|msg| -> Box<dyn std::error::Error> { msg.into() })?;
+        }
         let api = DPduApi::new(&library_path).map_err(map_construct_error)?;
-        let config_checked = checked.config_checked();
         drop(checked);
         let api = Arc::new(Mutex::new(Some(api)));
         let subscriptions = Arc::new(Mutex::new(HashMap::new()));
@@ -520,6 +527,7 @@ mod tests {
                 requested_port: None,
                 mode: vci_service_launcher::mode::OperatingMode::User,
             },
+            ConfigFile::Checked,
             tokio::sync::watch::channel(false).1,
         )
         .await
@@ -559,6 +567,7 @@ mod tests {
                 requested_port: None,
                 mode: vci_service_launcher::mode::OperatingMode::User,
             },
+            ConfigFile::Checked,
             tokio::sync::watch::channel(false).1,
         )
         .await
@@ -594,6 +603,7 @@ mod tests {
                 requested_port: None,
                 mode: vci_service_launcher::mode::OperatingMode::User,
             },
+            ConfigFile::Checked,
             tokio::sync::watch::channel(false).1,
         )
         .await
@@ -632,12 +642,18 @@ mod tests {
     }
 
     async fn new_test_service() -> Iso22900Service {
+        new_test_service_with(ConfigFile::Checked).await
+    }
+
+    /// [`new_test_service`] with the launcher's verdict on the configuration file passed in.
+    async fn new_test_service_with(config_file: ConfigFile) -> Iso22900Service {
         Iso22900Service::new(
             StartupConfig {
                 library_name: "TestLib".into(),
                 requested_port: None,
                 mode: vci_service_launcher::mode::OperatingMode::User,
             },
+            config_file,
             tokio::sync::watch::channel(false).1,
         )
         .await
@@ -669,6 +685,7 @@ mod tests {
                 requested_port: None,
                 mode: vci_service_launcher::mode::OperatingMode::User,
             },
+            ConfigFile::Checked,
             tokio::sync::watch::channel(false).1,
         )
         .await;
@@ -695,6 +712,7 @@ mod tests {
                 requested_port: None,
                 mode: vci_service_launcher::mode::OperatingMode::User,
             },
+            ConfigFile::Checked,
             tokio::sync::watch::channel(false).1,
         )
         .await;
@@ -752,19 +770,13 @@ mod tests {
         assert_eq!(size, 12);
     }
 
-    /// A configuration file that did not exist at startup passed no pre-load check (design 7.2),
-    /// so settings from one created later are not used.
+    /// A configuration file the launcher found absent passed no pre-load check (design 7.2,
+    /// ADR-285), so settings from one created later are not used.
     #[tokio::test]
     #[serial]
     async fn resolve_vendor_struct_entry_size_ignores_a_config_file_created_after_startup() {
         set_mock_library_config_with_vendor_struct_type("0x80000001", 12);
-        let config = std::path::PathBuf::from(
-            std::env::var_os("VCI_CONFIG_PATH").expect("the test config path is set"),
-        );
-        let contents = std::fs::read(&config).expect("read the test config");
-        std::fs::remove_file(&config).expect("remove the test config");
-        let service = new_test_service().await;
-        std::fs::write(&config, contents).expect("recreate the test config");
+        let service = new_test_service_with(ConfigFile::Absent).await;
 
         let err = service
             .resolve_vendor_struct_entry_size(cpst_from_raw(0x8000_0001))

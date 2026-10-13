@@ -5409,11 +5409,13 @@ impl VciServer for J2534Service {
             api_name: "j2534-0404",
             library_name: config.library_name.clone(),
             arch: vci_service_launcher::vci_server::current_arch(),
+            mode: config.mode(),
         }
     }
 
     async fn new(
         startup_config: Self::StartupConfig,
+        config_file: vci_service_launcher::ConfigFile,
         shutdown: Receiver<bool>,
     ) -> Result<Self, BoxError> {
         // Captures the shared module clock's epoch as close to service
@@ -5432,18 +5434,19 @@ impl VciServer for J2534Service {
         // The library name resolves through its registration definition on
         // Linux, the registry on Windows (design 7.1.1, ADR-228 Decision
         // item 4); the debug-only `NGR_J2534_DEFINITION_DIR` replaces both
-        // (ADR-282). The 7.2 checks then run on the library, its definition
-        // and the configuration file, and the mode decides what a failed
-        // check means (ADR-281 Decision item 2).
+        // (ADR-282). The 7.2 checks then run on the library and its
+        // definition, and the mode decides what a failed check means
+        // (ADR-281 Decision item 2). The launcher checked the configuration
+        // file before this (ADR-285).
         let resolved = ngr_library_resolver::j2534_0404::resolve(&startup_config.library_name)
             .map_err(map_resolve_error)?;
         let checked = crate::preload::check_library(&resolved, startup_config.mode())?;
         // The per-library settings come from the configuration file only when
-        // it was among the checked files: one created after the check has
-        // passed none, so it configures nothing (ADR-270 Decision item 5).
+        // the launcher's check let it through: one created after the check
+        // has passed none, so it configures nothing (ADR-285).
         let arch = vci_service_launcher::vci_server::current_arch();
         let library_name = &startup_config.library_name;
-        let (can_channel_mode, modules, vendor_ioctls) = if checked.config_checked() {
+        let (can_channel_mode, modules, vendor_ioctls) = if config_file.settings_apply() {
             (
                 // Fail fast on an invalid `can_channel_mode` config value so a
                 // typo surfaces at startup rather than as silent single-channel

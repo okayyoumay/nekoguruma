@@ -225,7 +225,12 @@ regular user change the library, or anything that decides which file is loaded?
 ```rust
 check_writability(library, &resolved.naming_files())?;             // Policy::system()
 check_writability_with(library, &naming_files, &policy)?;           // explicit policy
+check_files_with(&[config_file], &policy)?;                        // files alone, no library
 ```
+
+`check_files_with` walks files by the naming-file rule without a library. The worker launcher uses
+it on the worker's configuration file before reading any setting from it, so the per-library
+check no longer includes that file (ADR-285).
 
 `Resolved::naming_files()` is the definition file for `Source::Definition` and empty for
 `Source::Registry` (HKLM is trusted by premise, 7.2). The result is `Err(WritabilityError)` with

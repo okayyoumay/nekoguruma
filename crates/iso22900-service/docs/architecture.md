@@ -174,8 +174,15 @@ return a sanitized, generic message in the `Status` — see ADR-089.
 Startup is handled by `vci-service-launcher::start_service::<Iso22900Service>()`:
 
 1. Parse startup argument: `iso22900:<library-name>?mode=<device|user>&port=<u16>` (`config.rs`).
-2. Initialize logging from the `config.toml` file (loaded via `vci-service-config`).
-3. Call `Iso22900Service::new(config)`:
+2. Check `config.toml` (`vci_service_config::config_file()`) with the design
+   7.2 writability rules before reading any setting from it (the launcher,
+   ADR-270 Decision item 5, ADR-285). In device mode a file that fails the
+   check is not read and the service does not start (step 3 is skipped); in
+   user mode the findings are logged as a warning and the file is used.
+   Initialize logging from the file when it may be read, otherwise with the
+   defaults.
+3. Call `Iso22900Service::new(config, config_file)`, where `config_file` is
+   the launcher's verdict from step 2 (`vci_service_launcher::ConfigFile`):
    - Resolve `<library-name>` through `ngr_library_resolver::iso22900::resolve()`
      (design 7.1, ADR-277): the D-PDU API root description file entry with that
      short name gives the library path. The root description file is the one
@@ -185,11 +192,10 @@ Startup is handled by `vci-service-launcher::start_service::<Iso22900Service>()`
      No `config.toml` key names the library (ADR-281 Decision item 1).
    - Run the design 7.2 pre-load checks (`preload.rs`, through
      `ngr_library_resolver::check_library` with the system owners as the
-     trusted set) on the library, the files that named it and, when it exists,
-     the worker's `config.toml` (`vci_service_config::config_file()`), whose
-     per-library settings the service acts on (ADR-270 Decision item 5). When
-     the file is missing at startup, the service uses no settings from a file
-     created later, since that file passed no check. In device mode a
+     trusted set) on the library and the files that named it. The service
+     reads its `vendor_struct_types` settings only when the verdict allows it
+     (`ConfigFile::settings_apply`): when `config.toml` was missing at startup,
+     a file created later passed no check and is not used. In device mode a
      failure refuses the library with `FAILED_PRECONDITION`; in user mode the
      findings are logged as a warning and the library is loaded. What the check
      opened stays open until the library is mapped (ADR-278).

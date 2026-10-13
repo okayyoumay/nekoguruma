@@ -377,6 +377,7 @@ mod module_disconnect_cop_tag_race_tests {
                 requested_port: None,
                 mode: vci_service_launcher::mode::OperatingMode::User,
             },
+            vci_service_launcher::ConfigFile::Checked,
             tokio::sync::watch::channel(false).1,
         )
         .await

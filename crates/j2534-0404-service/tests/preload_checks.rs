@@ -7,7 +7,8 @@
 //! tests trust the test user and show a clean library accepted in device mode.
 //!
 //! The name the service is started with is also the key of its per-library settings: a test
-//! resolves a definition and reads that library's `modules` under the same name.
+//! resolves a definition and reads that library's `modules` under the same name. The settings
+//! are read only when the launcher's verdict on the configuration file allows it (ADR-285).
 
 #![cfg(debug_assertions)]
 
@@ -17,7 +18,7 @@ use j2534_0404_service::service::J2534Service;
 use serial_test::serial;
 use tonic::{Code, Status};
 use vci_service_interface::{GetModuleIdsRequest, vci_service_server::VciService};
-use vci_service_launcher::vci_server::VciServer;
+use vci_service_launcher::{ConfigFile, vci_server::VciServer};
 
 /// Contains a space and upper-case letters, so a lookup that changed the name would miss it.
 const LIBRARY_NAME: &str = "Preload Test VCI";
@@ -73,12 +74,20 @@ fn make_writable_by_regular_users(path: &Path) {
 }
 
 async fn start(mode: &str) -> Result<J2534Service, Box<dyn std::error::Error>> {
+    start_with(mode, ConfigFile::Checked).await
+}
+
+/// [`start`] with the launcher's verdict on the configuration file passed in.
+async fn start_with(
+    mode: &str,
+    config_file: ConfigFile,
+) -> Result<J2534Service, Box<dyn std::error::Error>> {
     let config = J2534Service::get_startup_config([
         "j2534-0404-service".to_owned(),
         format!("j2534-0404:{LIBRARY_NAME}?mode={mode}"),
     ])
     .expect("startup config");
-    J2534Service::new(config, tokio::sync::watch::channel(false).1).await
+    J2534Service::new(config, config_file, tokio::sync::watch::channel(false).1).await
 }
 
 #[tokio::test]
@@ -128,15 +137,38 @@ async fn the_resolved_name_is_the_key_of_the_library_settings() {
          pname = \"USB:1\"\n"
     ));
     let service = start("user").await.expect("the library should load");
-    let rows = service
+    let rows = module_rows(&service).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].vendor_module_name, "Bench 1");
+    assert_eq!(rows[0].vendor_additional_info, LIBRARY_NAME);
+}
+
+/// Modules listed for the library, read through `GetModuleIds`.
+async fn module_rows(service: &J2534Service) -> Vec<vci_service_interface::ModuleData> {
+    service
         .get_module_ids(tonic::Request::new(GetModuleIdsRequest {}))
         .await
         .expect("get_module_ids should succeed")
         .into_inner()
         .module_id_list
         .expect("module list")
-        .module_data;
+        .module_data
+}
+
+/// A configuration file the launcher found absent passed no check (ADR-285): the settings of a
+/// file that is there by the time the service starts are not used.
+#[tokio::test]
+#[serial]
+async fn settings_are_not_taken_from_a_file_the_launcher_found_absent() {
+    let _test_library = TestLibrary::new(&format!(
+        "[[config.apis.j2534-0404.libs.{LIBRARY_NAME:?}.modules]]\n\
+         label = \"Bench 1\"\n\
+         pname = \"USB:1\"\n"
+    ));
+    let service = start_with("user", ConfigFile::Absent)
+        .await
+        .expect("the library should load");
+    let rows = module_rows(&service).await;
     assert_eq!(rows.len(), 1, "{rows:?}");
-    assert_eq!(rows[0].vendor_module_name, "Bench 1");
-    assert_eq!(rows[0].vendor_additional_info, LIBRARY_NAME);
+    assert_ne!(rows[0].vendor_module_name, "Bench 1");
 }

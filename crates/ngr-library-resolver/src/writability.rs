@@ -191,6 +191,18 @@ pub fn check_writability_with(
     naming_files: &[PathBuf],
     policy: &Policy,
 ) -> Result<(), WritabilityError> {
+    check_with_probe(&*probe(policy), Some(library), naming_files)
+}
+
+/// Checks `files` and their ancestors by the naming-file rule, with no library: for a file whose
+/// settings a worker acts on before it resolves a library, such as its configuration file
+/// (ADR-270 Decision item 5). All findings are collected.
+pub fn check_files_with(files: &[PathBuf], policy: &Policy) -> Result<(), WritabilityError> {
+    check_with_probe(&*probe(policy), None, files)
+}
+
+/// The operating system's probe for `policy`.
+fn probe(policy: &Policy) -> Box<dyn Probe> {
     #[cfg(unix)]
     let probe = unix::UnixProbe {
         uids: policy.uids.clone(),
@@ -204,7 +216,7 @@ pub fn check_writability_with(
         let _ = policy;
         NoProbe
     };
-    check_with_probe(&probe, library, naming_files)
+    Box::new(probe)
 }
 
 /// What an entry is, without following a link.
@@ -242,7 +254,7 @@ impl Probe for NoProbe {
 
 fn check_with_probe(
     probe: &dyn Probe,
-    library: &Path,
+    library: Option<&Path>,
     naming_files: &[PathBuf],
 ) -> Result<(), WritabilityError> {
     let mut walker = Walker {
@@ -250,7 +262,9 @@ fn check_with_probe(
         cache: HashMap::new(),
         findings: Vec::new(),
     };
-    walker.walk(library, Role::Library, Role::LibraryDirectory);
+    if let Some(library) = library {
+        walker.walk(library, Role::Library, Role::LibraryDirectory);
+    }
     for file in naming_files {
         walker.walk(file, Role::NamingFile, Role::Directory);
     }

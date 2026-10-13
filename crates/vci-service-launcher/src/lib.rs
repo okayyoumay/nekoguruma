@@ -1,6 +1,8 @@
 /// Re-exported from the standalone `vci-service-config` crate (see ADR-033)
 /// so existing `vci_service_launcher::config::*` call sites keep working.
 pub use vci_service_config as config;
+mod config_check;
+pub use config_check::ConfigFile;
 pub mod jsonrpc;
 mod logging;
 /// The operating mode in the startup argument (ADR-281 Decision item 2) is spelled in the
@@ -26,17 +28,26 @@ where
     // If parsing fails we still initialize logging with defaults so that any
     // subsequent error messages are captured, then propagate the failure through
     // the JSON-RPC layer so callers can query status even when startup failed.
-    let (startup_config_result, logging_cfg, library_name) =
+    //
+    // The configuration file is checked (design 7.2) before any setting is read
+    // from it, since its logging settings name a file the worker opens: a file
+    // device mode refuses leaves logging at its defaults (ADR-285).
+    let (startup, logging_cfg, library_name) =
         match S::get_startup_config(args.iter().map(String::as_str)) {
             Ok(cfg) => {
                 let identity = S::service_identity(&cfg);
-                let logging = config::find_logging_config(
-                    identity.api_name,
-                    identity.arch,
-                    &identity.library_name,
-                );
+                let outcome = config_check::check();
+                let logging = if outcome.settings_readable(identity.mode) {
+                    config::find_logging_config(
+                        identity.api_name,
+                        identity.arch,
+                        &identity.library_name,
+                    )
+                } else {
+                    config::LoggingConfig::default()
+                };
                 let name = identity.library_name.clone();
-                (Ok(cfg), logging, Some(name))
+                (Ok((cfg, outcome, identity.mode)), logging, Some(name))
             }
             Err(e) => (Err(e), config::LoggingConfig::default(), None),
         };
@@ -45,8 +56,11 @@ where
 
     // Spawn the gRPC service, passing any startup error through to the JSON-RPC
     // context so callers can still query status even if the service failed to start.
-    let vci_context = match startup_config_result {
-        Ok(cfg) => vci_server::spawn_vci_context::<S>(cfg).await,
+    let vci_context = match startup {
+        Ok((cfg, outcome, mode)) => match outcome.verdict(mode) {
+            Ok(config_file) => vci_server::spawn_vci_context::<S>(cfg, config_file).await,
+            Err(e) => Err(e),
+        },
         Err(e) => Err(e),
     };
 

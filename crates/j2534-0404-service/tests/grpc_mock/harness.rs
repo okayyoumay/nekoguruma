@@ -1825,6 +1825,7 @@ impl TestServer {
                 "j2534-0404:mock-lib?mode=user",
             ])
             .expect("startup config"),
+            vci_service_launcher::ConfigFile::Checked,
             service_shutdown_rx,
         )
         .await?;

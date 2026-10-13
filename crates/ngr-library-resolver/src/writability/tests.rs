@@ -131,6 +131,19 @@ mod unix {
     }
 
     #[test]
+    fn files_alone_are_checked_without_a_library() {
+        let t = tree();
+        // The library is world-writable, but only the naming file is checked.
+        chmod(&t.lib, 0o666);
+        let files = std::slice::from_ref(&t.naming);
+        assert!(check_files_with(files, &policy()).is_ok());
+        chmod(&t.naming, 0o664);
+        let e = check_files_with(files, &policy()).unwrap_err();
+        assert_eq!(e.findings.len(), 1);
+        assert!(strictly_find(&e, &t.naming, Role::NamingFile));
+    }
+
+    #[test]
     fn writable_ancestor_is_found_as_a_container_and_once() {
         let t = tree();
         chmod(&t.base, 0o777);

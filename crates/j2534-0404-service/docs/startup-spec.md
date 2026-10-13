@@ -49,18 +49,26 @@ The same name is the `"<lib>"` key of the library's settings in `config.toml`
 (`config.apis.j2534-0404.libs."<lib>"`: `modules`, `can_channel_mode`,
 `vendor_ioctls`), so the settings read are those of the library resolved.
 
+Before it reads any setting, the launcher (`vci_service_launcher::start_service`)
+checks `config.toml` (`vci_service_config::config_file()`) with the design 7.2
+writability rules, against the system owners (ADR-270 Decision item 5,
+ADR-285). In device mode a file that fails the check is not read: logging
+starts with its defaults and the service does not start. In user mode the
+findings are logged as a warning and the file is used. The launcher passes its
+verdict to `J2534Service::new` (`vci_service_launcher::ConfigFile`), which
+reads `modules`, `can_channel_mode` and `vendor_ioctls` only when
+`ConfigFile::settings_apply` says so. When `config.toml` does not exist at
+startup, the service uses the defaults for its lifetime, since a file created
+later passed no check.
+
 Immediately before loading, the service runs the design 7.2 pre-load checks
 (`src/preload.rs`, through `ngr_library_resolver::check_library` with the
-system owners as the trusted set) on the library, the definition that named it
-and, when it exists, `config.toml` (`vci_service_config::config_file()`), whose
-per-library settings it acts on (ADR-270 Decision item 5). A registry hit has
-no naming file to check, since HKLM is trusted by premise (7.2). When
-`config.toml` does not exist at that point, the service reads no settings from
-it and uses the defaults, since a file created later passed no check. In device
-mode a failed check refuses the library with `FAILED_PRECONDITION` and a
-message that names no path; in user mode the findings are logged as a warning
-and the library is loaded. What the check opened stays open until the library
-is mapped (ADR-278).
+system owners as the trusted set) on the library and the definition that named
+it. A registry hit has no naming file to check, since HKLM is trusted by
+premise (7.2). In device mode a failed check refuses the library with
+`FAILED_PRECONDITION` and a message that names no path; in user mode the
+findings are logged as a warning and the library is loaded. What the check
+opened stays open until the library is mapped (ADR-278).
 
 ## Stdio Framing
 

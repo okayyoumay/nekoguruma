@@ -5,9 +5,8 @@
 //! argument (`<scheme>:<library name>?mode=<device|user>&...`). The worker does not infer the
 //! mode and no configuration file sets it: a missing or unknown value is a startup error. Design
 //! 7.2 gives the mode its meaning for a failed library check: device mode refuses the library,
-//! user mode reports the findings and loads it. `iso22900-service` applies it to the checks it
-//! runs before loading; `j2534-0404-service` records it, and its library loading does not
-//! consult it yet.
+//! user mode reports the findings and loads it. Both worker services apply it to the checks they
+//! run before loading, and the launcher to its check on the configuration file (ADR-285).
 //!
 //! The agent (`worker-host`) writes the parameter and both worker services parse it, so the
 //! spelling lives here, in the crate both sides already share for the gRPC interface.

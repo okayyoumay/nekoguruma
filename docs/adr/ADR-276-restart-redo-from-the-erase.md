@@ -1,7 +1,7 @@
 # ADR-276: A Redone Transfer Goes On from the Erase as a First Run
 
 **Date:** 2026-10-11
-**Status:** Accepted (item 3's gap closed by ADR-280: the procedure can end the job as failed)
+**Status:** Accepted (item 3's gap closed by ADR-280: the procedure can end the job as failed; the step-limit consequence superseded by ADR-287, which gives each run its own budget)
 **Affects:** `agent` (`src/runner.rs`, `src/restart.rs`, `docs/ngr-agent.md`), ADR-273 item 4
 
 ## Context

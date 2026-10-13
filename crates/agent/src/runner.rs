@@ -28,7 +28,10 @@ use crate::restart::{self, OnSiteReason, RestartDecision};
 /// Bounds of a job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JobLimits {
-    /// Steps after which the job is stopped, against a procedure that never ends.
+    /// Steps after which a run of the job is stopped, against a procedure that never ends. Each
+    /// run (the first one, a plain start on an existing journal, and every restart) gets the
+    /// whole budget, counted from its own first step, although `VmState::steps` keeps counting
+    /// across runs for the journal's ordering (ADR-287).
     pub max_steps: u64,
     /// Pause between polls of a `Wait` instruction, between attempts of a restart's wait for
     /// the per-vehicle lock (ADR-263), and between the cancel checks of a restart's passive
@@ -704,6 +707,7 @@ where
             let AtErase {
                 mut journal,
                 vm,
+                run_start,
                 flash_session,
                 teardown,
                 confirmed,
@@ -726,6 +730,7 @@ where
                 Some(&mut journal),
                 vm,
                 None,
+                run_start,
             )? {
                 RunEnd::Finished(state) => Ok(state),
                 // No stop point was given.
@@ -751,6 +756,8 @@ enum Restarted<S: Store> {
 struct AtErase<S: Store> {
     journal: JobJournal<S>,
     vm: Vm,
+    /// The step count the restart's run started at, which its step limit counts from (ADR-287).
+    run_start: u64,
     flash_session: u32,
     teardown: restart::Teardown,
     confirmed: restart::Confirmation,
@@ -895,6 +902,7 @@ where
             // so the entry state stays the one the journal finds behind a later end state.
             let mut replay = JobJournal::new(journal, sources.clone());
             replay.run_start(&point.entry_state)?;
+            let run_start = point.entry_state.steps;
             let vm = Vm::resume(point.entry_state.clone());
             match run_vm(
                 program,
@@ -904,6 +912,7 @@ where
                 Some(&mut replay),
                 vm,
                 Some(plan.boundaries.erase_pc),
+                run_start,
             )? {
                 RunEnd::Stopped(vm) => {
                     // Step 4b-3 (ADR-229 item 2 step 4, ADR-245 item 6): the replayed steps
@@ -916,6 +925,7 @@ where
                     Ok(Restarted::AtErase(Box::new(AtErase {
                         journal: replay,
                         vm,
+                        run_start,
                         flash_session: point.flash_session,
                         teardown,
                         confirmed,
@@ -989,12 +999,22 @@ where
     };
     // The continuation's records come after the journal's last one, as a restart's do.
     end_state.steps = restart::next_steps(journal.state());
+    let run_start = end_state.steps;
     let vm = Vm::resume(end_state);
     if let Err(error) = vm.check_state(program) {
         return Err(missing(error.to_string(), teardown, confirmed));
     }
     let mut tail = JobJournal::new(journal, sources);
-    match run_vm(program, host, limits, cancelled, Some(&mut tail), vm, None)? {
+    match run_vm(
+        program,
+        host,
+        limits,
+        cancelled,
+        Some(&mut tail),
+        vm,
+        None,
+        run_start,
+    )? {
         RunEnd::Finished(state) => Ok(state),
         // No stop point was given.
         RunEnd::Stopped(_) => Err(JobError::Journal(JournalError::Invariant(
@@ -1081,7 +1101,9 @@ where
     if let Some(journal) = journal.as_deref_mut() {
         journal.run_start(&vm.state)?;
     }
-    match run_vm(program, host, limits, cancelled, journal, vm, None)? {
+    match run_vm(
+        program, host, limits, cancelled, journal, vm, None, first_step,
+    )? {
         RunEnd::Finished(state) => Ok(state),
         // No stop point was given.
         RunEnd::Stopped(_) => Err(JobError::Journal(JournalError::Invariant(
@@ -1103,6 +1125,11 @@ enum RunEnd {
 /// replay (ADR-273). The caller commits the run start (ADR-272, ADR-274), not this loop. With `stop_before`, the loop ends in
 /// [`RunEnd::Stopped`] when execution arrives at that instruction, before the journal's
 /// `arrive` and before the instruction runs, so nothing at the stop point is committed or sent.
+/// `run_start` is the step count the run started at, which the step limit counts from (ADR-287).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the run's whole context, split only by what the caller owns"
+)]
 fn run_vm<H, S>(
     program: &Program,
     host: &mut H,
@@ -1111,6 +1138,7 @@ fn run_vm<H, S>(
     mut journal: Option<&mut JobJournal<S>>,
     mut vm: Vm,
     stop_before: Option<u32>,
+    run_start: u64,
 ) -> Result<RunEnd, JobError>
 where
     H: DiagHost<Error = HostError> + RuntimeInputs + TransferProgress,
@@ -1127,7 +1155,9 @@ where
         if arrived && stop_before == Some(vm.state.pc) {
             return Ok(RunEnd::Stopped(vm));
         }
-        if vm.state.steps >= limits.max_steps {
+        // The run's own steps (ADR-287): a restart does not inherit the steps of the runs before
+        // it, so a redone transfer has the budget a first run has.
+        if vm.state.steps.saturating_sub(run_start) >= limits.max_steps {
             return Err(JobError::StepLimit(vm.state.steps));
         }
         if std::mem::take(&mut arrived)
@@ -6827,17 +6857,17 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// The step limit counts the replay's steps: a limit the replay exceeds ends the restart in
-    /// `StepLimit`, and nothing after the step that reached it is sent.
+    /// The step limit counts the replay's steps, from the restart's entry state on (ADR-287): a
+    /// limit the replay exceeds ends the restart in `StepLimit`, and nothing after the step that
+    /// reached it is sent.
     #[test]
     fn the_step_limit_applies_to_the_replay() {
         let (program, erase) = replay_program();
         let dir = journal_dir("replay-step-limit");
         interrupted_at_erase(&program, erase, &dir);
-        let entry_steps = restart_point(&program, &dir).entry_state.steps;
         // Four steps into the replay: the session change's three, then the next push.
         let limits = JobLimits {
-            max_steps: entry_steps + 4,
+            max_steps: 4,
             ..JobLimits::default()
         };
         let mut host = FlashHost::new(Rc::new(Cell::new(0)));
@@ -6988,6 +7018,51 @@ mod tests {
         assert_eq!(new.last_block, Some(3));
         assert!(new.exit.as_ref().is_some_and(|exit| exit.complete));
         assert!(!new.interrupted);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The done-when case of ADR-287: a redone transfer gets the step budget a first run has. The
+    /// limit is just enough for the restart's own run, from the entry to the program's end, and
+    /// the first run's steps would put the cumulative count over it after the erase; the redo
+    /// still completes.
+    #[test]
+    fn a_redone_transfer_has_its_own_step_budget() {
+        let program = flash_program();
+        let dir = journal_dir("redo-step-budget");
+        interrupted(&program, &dir);
+        let before = Journal::read(&dir, &job_key()).unwrap();
+        let start = restart::next_steps(&before);
+        let entry = program.flash[0].boundaries.entry_pc;
+        let erase = program.flash[0].boundaries.erase_pc;
+        // The restart's run: its gates and checks send requests but run no instruction, so its
+        // steps are the plan's from the entry to the program's end.
+        let run = u64::from(program.code.len() as u32 - entry);
+        let limits = JobLimits {
+            max_steps: run,
+            ..JobLimits::default()
+        };
+        // Counted across runs, the limit falls after the erase.
+        assert!(
+            start + u64::from(erase - entry) < limits.max_steps,
+            "{start}"
+        );
+        assert!(start + run > limits.max_steps, "{start}");
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        let result = resume_on(
+            &program,
+            &mut host,
+            limits,
+            &AtomicBool::new(false),
+            Journal::open(&dir, &job_key()),
+            identity_sources(),
+            Some(&target()),
+            None,
+            &dir_slot(&dir),
+        );
+        let state = result.expect("the redone transfer completes within its own budget");
+        assert_eq!(state.pc as usize, program.code.len());
+        assert_eq!(state.steps, start + run);
+        assert_eq!(from_the_erase(&host), redone_transfer());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -7566,9 +7641,9 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// The step limit counts the continuation's steps after the journal's last record: a limit
-    /// reached in the program after the plan ends the job in `StepLimit`, and the request at it
-    /// is not sent.
+    /// The step limit counts the continuation's own steps, from the journal's last record on
+    /// (ADR-287): a limit reached in the program after the plan ends the job in `StepLimit`, and
+    /// the request at it is not sent.
     #[test]
     fn the_step_limit_applies_to_the_continuation() {
         let program = safe_outside_the_plan(completed_path_program());
@@ -7577,7 +7652,7 @@ mod tests {
         let next = restart::next_steps(&Journal::read(&dir, &job_key()).unwrap());
         // The push at the plan's end runs; the routine after it would be one step too many.
         let limits = JobLimits {
-            max_steps: next + 1,
+            max_steps: 1,
             ..JobLimits::default()
         };
         let mut host = FlashHost::new(Rc::new(Cell::new(0)));

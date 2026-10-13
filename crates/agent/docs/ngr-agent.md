@@ -471,8 +471,9 @@ journaling:
   Either way the transfer-start marker is
   already committed, so a further restart takes the restart order for that new attempt, within
   the resume limit, which the new marker does not reset;
-- the step limit counts across runs (the restart's step count continues after the journal's
-  last record), so a redo can reach it after the erase.
+- the step limit applies to each run (ADR-287): the restart's step count continues after the
+  journal's last record for the journal's ordering, but the limit counts only the restart's own
+  steps, the replay and the redo together, so a redo has the budget a first run has.
 
 The restart order up to the erase is `runner::restart_order`; `resume_on` continues from where it
 stopped. In test builds `OnSiteReason::StoppedBeforeErase` reports a restart that the tests
@@ -550,7 +551,7 @@ sent:
 Both reasons tell the technician that the image is verified. Otherwise the VM resumes from the end
 state, with its step count after the journal's last record, and runs to the program's end with a
 first run's journaling: a later plan journals as on a first run, and a step that fails, a cancel or
-the step limit end the job as on a first run. The continuation commits no run start (ADR-274 item
+the step limit (counted from the continuation's first step, ADR-287) end the job as on a first run. The continuation commits no run start (ADR-274 item
 4), since a run start that is not at the entry would leave a later redo without its entry state.
 
 ## Job guards

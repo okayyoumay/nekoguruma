@@ -100,7 +100,7 @@ and the registration definition directory on Linux (design 7.1.1), so the config
 (`vci-service-config`'s `config-root-*` features) does not change which library either one
 resolves. The definition directory is fixed at build time (`NGR_J2534_DEFINITION_DIR` when
 building, ADR-228); build the agent and the workers with the same one, or the agent can detect
-the ABI of a different library than the worker loads. The worker's per-library settings still
+the ABI, and pass the `LongSize`, of a different library than the worker loads. The worker's per-library settings still
 come from its own `config.toml`, which with `config-root-exe-dir` is the file next to its build
 under `--workers`.
 

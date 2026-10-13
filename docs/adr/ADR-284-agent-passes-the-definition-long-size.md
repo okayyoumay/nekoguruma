@@ -32,8 +32,11 @@ Alternative not taken:
 - The worker reading `LongSize` from the definition it resolves itself, with the environment
   variable as a fallback: one source for the value, but it changes the contract between
   `worker-host` and the j2534-0404 sys layer, which reads the width from the environment when
-  it loads the library. The agent and the worker resolve the same definition (the definition
-  directory is fixed at build time, ADR-228), so the agent's value is the worker's.
+  it loads the library. The definition directory is fixed at build time (ADR-228), so an agent
+  and workers built with the same one resolve the same definition, and the agent's value is the
+  one that definition declares for the library the worker loads. Builds with different
+  directories can disagree on the library and its width alike; `crates/agent/docs/ngr-agent.md`
+  states that deployment constraint.
 
 ## Consequences
 

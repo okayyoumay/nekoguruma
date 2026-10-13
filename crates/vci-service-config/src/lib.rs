@@ -352,9 +352,10 @@ fn config_file_path() -> PathBuf {
 }
 
 /// The configuration file this process reads: the build-time `VCI_CONFIG_PATH` resolved
-/// against the selected configuration root (or the debug-only runtime override, ADR-073). A
-/// worker adds it to the files its design 7.2 pre-load checks cover, since it holds per-library
-/// settings the worker acts on (ADR-270 Decision item 5). The file need not exist.
+/// against the selected configuration root (or the debug-only runtime override, ADR-073). The
+/// worker launcher checks it with the design 7.2 writability rules before any setting is read
+/// from it and passes its verdict to the service, since it holds settings the worker acts on
+/// (ADR-270 Decision item 5, ADR-285). The file need not exist.
 pub fn config_file() -> PathBuf {
     config_file_path()
 }

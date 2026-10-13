@@ -165,12 +165,6 @@ impl RecoveryFacts {
         }
     }
 
-    /// Whether the job has ended: a declared failure (ADR-280) or an identity abort (ADR-286).
-    /// No record follows either.
-    pub fn terminal(&self) -> bool {
-        self.procedure_failed.is_some() || self.identity_mismatch.is_some()
-    }
-
     /// The resumes made in `stage`.
     pub fn resume_count(&self, stage: StageId) -> u16 {
         self.resume_counts
@@ -2374,14 +2368,12 @@ mod tests {
         let mut j = memory();
         j.commit_step(at(3, 1), None).expect("step");
         assert_eq!(j.summary().identity_mismatch, None);
-        assert!(!j.summary().terminal());
         j.commit_identity_mismatch(IdentityKind::HardwarePartNumber)
             .expect("abort");
         assert_eq!(
             j.summary().identity_mismatch,
             Some(IdentityKind::HardwarePartNumber)
         );
-        assert!(j.summary().terminal());
         let records = j.state().records;
         assert!(matches!(
             j.commit_step(at(5, 3), None),
@@ -2590,6 +2582,23 @@ mod tests {
                 postcard::to_allocvec(record).expect("encode")[0] as usize,
                 index,
                 "{record:?}"
+            );
+        }
+    }
+
+    /// The abort record holds `diag_ir::IdentityKind`, which postcard encodes by variant index, so
+    /// that enum's order is part of the journal format (ADR-286): reordering it would make an
+    /// existing journal read back another identity.
+    #[test]
+    fn the_abort_record_keeps_its_identity_encoding() {
+        for (identity, index) in [
+            (IdentityKind::Vin, 0),
+            (IdentityKind::HardwarePartNumber, 1),
+        ] {
+            assert_eq!(
+                postcard::to_allocvec(&Record::IdentityMismatch { identity }).expect("encode"),
+                [13, index],
+                "{identity:?}"
             );
         }
     }

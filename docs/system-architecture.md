@@ -828,8 +828,7 @@ For each cause of interruption, the resume origin and whether resumption is poss
 **Cases where resumption must not occur**
 
 - The start deadline has passed (terminate as "expired", since another vehicle may be connected)
-- VIN mismatch on re-verification before resuming (abort)
-- A VIN or hardware identity mismatch on re-verification: the abort is journaled as the job's last record, and a later resume ends in the same abort before the link is opened, sending nothing and counting no resume (ADR-286)
+- A VIN or hardware identity mismatch on re-verification before resuming (abort): the abort is journaled as the job's last record, and a later resume ends in the same abort before the link is opened, sending nothing and counting no resume (ADR-286)
 - The number of resumes at the same stage has reached the limit (avoid infinite loops; escalate to on-site intervention)
 - The procedure ended itself as failed: a declared failure is terminal and journaled, and a restart does not resume the job (ADR-280)
 

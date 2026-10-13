@@ -65,6 +65,9 @@ pub enum PreconditionKind {
     VehicleSpeed,
 }
 
+/// An identity of the ECU a restart re-verifies. The agent's write-job journal stores it in its
+/// identity-abort record, encoded by variant index, so the variant order is part of that journal's
+/// format too (ADR-286): append new variants, never reorder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub enum IdentityKind {

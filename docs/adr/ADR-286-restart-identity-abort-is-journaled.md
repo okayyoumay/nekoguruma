@@ -8,8 +8,8 @@
 ## Context
 
 Design 5.6 ends a restart whose re-verification finds another vehicle's ECU in Failed: the VIN read
-in the gates (ADR-261 item 3) or the hardware part number in step 3a (ADR-229 item 2) decodes to an
-identity other than the job's, and the job ends in `JobError::IdentityMismatch`. The journal kept no
+in the gates (ADR-261 item 3), or the VIN or hardware part number read in step 3a (ADR-229 item 2),
+decodes to an identity other than the job's, and the job ends in `JobError::IdentityMismatch`. The journal kept no
 record of that ending. A later `resume_program_journaled` of the same job therefore counted another
 resume and ran the gates again, and once the VCI was on the job's own vehicle the job went on,
 although the design makes it final. ADR-261 recorded this as an open consequence.
@@ -58,6 +58,8 @@ some from live reads after the resume count.
   opens the link or sends anything, whichever vehicle the VCI is on by then.
 - A crash between the gates' verdict and the commit leaves no record. Nothing is sent in that window,
   and the next resume runs the gates again, as before this decision.
+- The record holds `diag_ir::IdentityKind`, which the journal encodes by variant index, so that
+  enum's variant order becomes part of the journal format; a test pins it.
 - `RecoveryFacts` gains a field, so a recovery summary encoded by an earlier build does not decode;
   such summaries are not kept across builds yet (as noted for ADR-280).
 - ADR-261's open consequence is closed for the identity abort and stays open for the on-site endings
@@ -67,7 +69,7 @@ some from live reads after the resume count.
 
 - **One generic `Record::Aborted { cause }`.** Rejected: there is one abort cause today, and a second
   one gets its own record, as `ProcedureFailed` did.
-- **One `RecoveryFacts::terminal` holding either ending.** Rejected: it changes every reader of the
+- **One `RecoveryFacts::terminal` field holding either ending.** Rejected: it changes every reader of the
   recorded procedure failure for no change in behaviour.
 - **Journal every on-site ending now.** Rejected: the input-derived ones would let a wrong caller end
   a valid job, the derived ones gain nothing, and for the live-read ones the design's two rules

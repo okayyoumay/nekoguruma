@@ -23,6 +23,10 @@
 //! decides the read-back verification, `unsafe_continuation` and `plan_end_state` decide
 //! whether the program can go on after the plan (ADR-271 items 4 and 5).
 //!
+//! A journal that ends in a declared failure (ADR-280) or in an identity abort (ADR-286, the
+//! gates' or step 3a's mismatch, journaled by the runner) is final: `classify` decides it first
+//! and the job is not resumed.
+//!
 //! The interruption point is the latest of the last completed step and the requests the
 //! journal wrote ahead (the transfer-start and RequestTransferExit markers, and the request
 //! intent of ADR-253), by step count, so a crash after a guarded request was sent but before its
@@ -60,6 +64,10 @@ pub enum RestartDecision {
         code: String,
         detail: String,
     },
+    /// A resume ended on a failed identity check and journaled it (ADR-286): the job is over and
+    /// is not resumed, whatever its transfer state. `identity` is the one that differed. Nothing
+    /// is sent and no resume is counted.
+    Aborted { identity: IdentityKind },
 }
 
 /// What a restart starts from.
@@ -313,7 +321,8 @@ pub struct Confirmation {
 /// for a program without a flash recovery plan, which keeps none. For a program with one it is
 /// on-site intervention: the runner creates the journal before it sends anything, so a missing
 /// one cannot be told from one lost after an erase. A journal that holds a procedure failure is
-/// decided first, as [`RestartDecision::Failed`], whatever else it holds (ADR-280).
+/// decided first, as [`RestartDecision::Failed`], whatever else it holds (ADR-280); one that holds an
+/// identity abort is decided next, as [`RestartDecision::Aborted`] (ADR-286).
 pub fn classify(
     program: &Program,
     journal: Result<&JournalState, &JournalError>,
@@ -341,6 +350,10 @@ pub fn classify(
             code: failure.code.clone(),
             detail: failure.detail.clone(),
         };
+    }
+    // So is an identity abort (ADR-286), even with a transfer open at a recovery-required point.
+    if let Some(identity) = facts.identity_mismatch {
+        return RestartDecision::Aborted { identity };
     }
     let interrupted_at = interruption_point(facts);
     if let Some(at) = interrupted_at
@@ -1945,6 +1958,38 @@ mod tests {
         assert_eq!(
             classify(&no_plan, Err(&JournalError::NotFound)),
             RestartDecision::PlainStart
+        );
+    }
+
+    /// An identity abort is final (ADR-286): it is decided before the interruption point is
+    /// looked at, so an open transfer at a recovery-required point is the abort, not on-site
+    /// intervention, and an open transfer that would restart is the abort too.
+    #[test]
+    fn an_identity_abort_is_decided_before_the_interruption() {
+        let program = program(RecoveryRequired::FromPc(EXIT));
+        let mut j = journal_until(&program, EXIT);
+        assert!(matches!(
+            decide(&program, &j),
+            RestartDecision::OnSiteInterventionRequired(OnSiteReason::RecoveryRequiredPoint { .. })
+        ));
+        j.commit_identity_mismatch(IdentityKind::HardwarePartNumber)
+            .unwrap();
+        assert_eq!(
+            decide(&program, &j),
+            RestartDecision::Aborted {
+                identity: IdentityKind::HardwarePartNumber
+            }
+        );
+
+        let program = super::tests::program(RecoveryRequired::Never);
+        let mut j = journal_until(&program, ERASE);
+        assert!(matches!(decide(&program, &j), RestartDecision::Restart(_)));
+        j.commit_identity_mismatch(IdentityKind::Vin).unwrap();
+        assert_eq!(
+            decide(&program, &j),
+            RestartDecision::Aborted {
+                identity: IdentityKind::Vin
+            }
         );
     }
 

@@ -19,6 +19,7 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use diag_ir::IdentityKind;
 use serde::{Deserialize, Serialize};
 use shared_proto::JobId;
 
@@ -130,6 +131,9 @@ pub struct RecoveryFacts {
     /// The procedure ended itself as failed (`Op::Fail`, ADR-280). Terminal: no record follows
     /// it, and a restart does not resume the job.
     pub procedure_failed: Option<ProcedureFailure>,
+    /// The restart ended itself on an identity check that failed (ADR-286). Terminal like
+    /// `procedure_failed`: no record follows it, and a restart does not resume the job.
+    pub identity_mismatch: Option<IdentityKind>,
 }
 
 /// A declared failure of the procedure, as journaled (ADR-280).
@@ -157,7 +161,14 @@ impl RecoveryFacts {
             target_vin: None,
             intended_software_version: None,
             procedure_failed: None,
+            identity_mismatch: None,
         }
+    }
+
+    /// Whether the job has ended: a declared failure (ADR-280) or an identity abort (ADR-286).
+    /// No record follows either.
+    pub fn terminal(&self) -> bool {
+        self.procedure_failed.is_some() || self.identity_mismatch.is_some()
     }
 
     /// The resumes made in `stage`.
@@ -172,9 +183,12 @@ impl RecoveryFacts {
     fn apply(&mut self, record: &Record) -> Result<(), &'static str> {
         let after_last_step =
             |at: &StepRef, facts: &Self| facts.last_step.is_none_or(|last| at.steps > last.steps);
-        // A declared failure ends the job (ADR-280).
+        // A declared failure ends the job (ADR-280), and so does an identity abort (ADR-286).
         if self.procedure_failed.is_some() {
             return Err("no record follows a procedure failure");
+        }
+        if self.identity_mismatch.is_some() {
+            return Err("no record follows an identity mismatch");
         }
         match record {
             Record::TargetVin(vin) => {
@@ -336,6 +350,9 @@ impl RecoveryFacts {
                     detail: detail.clone(),
                 });
             }
+            Record::IdentityMismatch { identity } => {
+                self.identity_mismatch = Some(*identity);
+            }
         }
         Ok(())
     }
@@ -437,6 +454,11 @@ enum Record {
         at: StepRef,
         code: String,
         detail: String,
+    },
+    /// The restart ended on a failed identity check (ADR-286); the job's last record. Changes no
+    /// fact but `identity_mismatch`.
+    IdentityMismatch {
+        identity: IdentityKind,
     },
 }
 
@@ -841,6 +863,12 @@ impl<S: Store> Journal<S> {
             code: code.to_owned(),
             detail: detail.to_owned(),
         })
+    }
+
+    /// Records that the restart ended on a failed `identity` check (ADR-286). Nothing can be
+    /// committed after it.
+    pub fn commit_identity_mismatch(&mut self, identity: IdentityKind) -> Result<(), JournalError> {
+        self.commit(Record::IdentityMismatch { identity })
     }
 
     fn commit(&mut self, record: Record) -> Result<(), JournalError> {
@@ -2339,6 +2367,69 @@ mod tests {
         ));
     }
 
+    /// An identity abort (ADR-286) reads back as the fact and is terminal: nothing follows it,
+    /// and it cannot follow a procedure failure either.
+    #[test]
+    fn an_identity_mismatch_is_the_last_record() {
+        let mut j = memory();
+        j.commit_step(at(3, 1), None).expect("step");
+        assert_eq!(j.summary().identity_mismatch, None);
+        assert!(!j.summary().terminal());
+        j.commit_identity_mismatch(IdentityKind::HardwarePartNumber)
+            .expect("abort");
+        assert_eq!(
+            j.summary().identity_mismatch,
+            Some(IdentityKind::HardwarePartNumber)
+        );
+        assert!(j.summary().terminal());
+        let records = j.state().records;
+        assert!(matches!(
+            j.commit_step(at(5, 3), None),
+            Err(JournalError::Invariant(
+                "no record follows an identity mismatch"
+            ))
+        ));
+        assert!(matches!(
+            j.commit_procedure_failed(at(6, 4), "E", "d"),
+            Err(JournalError::Invariant(_))
+        ));
+        assert!(matches!(
+            j.commit_identity_mismatch(IdentityKind::Vin),
+            Err(JournalError::Invariant(_))
+        ));
+        assert_eq!(j.state().records, records);
+
+        // The other order is refused too.
+        let mut j = memory();
+        j.commit_procedure_failed(at(1, 1), "E", "d")
+            .expect("failure");
+        assert!(matches!(
+            j.commit_identity_mismatch(IdentityKind::Vin),
+            Err(JournalError::Invariant(
+                "no record follows a procedure failure"
+            ))
+        ));
+        assert_eq!(j.summary().identity_mismatch, None);
+
+        let dir = TempDir::new();
+        let mut j = Journal::create(&dir.0, &key(), None, None).expect("create");
+        j.commit_step(at(3, 1), None).expect("step");
+        j.commit_identity_mismatch(IdentityKind::Vin)
+            .expect("abort");
+        drop(j);
+        let state = Journal::read(&dir.0, &key()).expect("read back");
+        assert_eq!(state.facts.identity_mismatch, Some(IdentityKind::Vin));
+        assert_eq!(state.facts.last_step, Some(at(3, 1)));
+        assert_eq!(Journal::open(&dir.0, &key()).expect("open").state(), &state);
+
+        // A record appended behind it is corrupt, not ignored.
+        append_entry(&dir, 2, Record::Block { block: 1 });
+        assert!(matches!(
+            Journal::read(&dir.0, &key()),
+            Err(JournalError::Corrupt { .. })
+        ));
+    }
+
     /// A failure record's text is bounded on commit and on read-back (ADR-280).
     #[test]
     fn a_procedure_failure_with_unbounded_text_is_refused() {
@@ -2489,6 +2580,9 @@ mod tests {
                 at: at(0, 0),
                 code: String::new(),
                 detail: String::new(),
+            },
+            Record::IdentityMismatch {
+                identity: IdentityKind::Vin,
             },
         ];
         for (index, record) in records.iter().enumerate() {

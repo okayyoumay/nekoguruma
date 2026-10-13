@@ -139,6 +139,22 @@ fn failure_error(failure: &crate::journal::ProcedureFailure) -> JobError {
     }
 }
 
+/// `error` as the restart returns it: an identity mismatch is journaled first, as the job's last
+/// record, so a later resume ends in the same error without sending anything (ADR-286). A commit
+/// that fails is the job's error instead; the mismatch is then only logged.
+fn journal_identity_abort<S: Store>(journal: &mut Journal<S>, error: JobError) -> JobError {
+    let JobError::IdentityMismatch { identity } = &error else {
+        return error;
+    };
+    match journal.commit_identity_mismatch(*identity) {
+        Ok(()) => error,
+        Err(journal_error) => {
+            tracing::warn!(?identity, %journal_error, "could not journal the identity mismatch");
+            JobError::Journal(journal_error)
+        }
+    }
+}
+
 /// `text` cut to at most `max` bytes, on a character boundary.
 fn truncated(mut text: String, max: usize) -> String {
     if text.len() > max {
@@ -259,12 +275,18 @@ pub async fn run_program_journaled(
 /// Goes on with a job that ran before, from the journal [`run_program_journaled`] wrote under
 /// `journal.key` (ADR-255). The journal is opened, with its writer lock, before the worker link:
 /// a journal another run holds ends the job in [`JobError::Journal`] (`InUse`), and one that
-/// records a declared failure in [`JobError::ProcedureFailed`] (ADR-280), neither opening the
+/// records a declared failure in [`JobError::ProcedureFailed`] (ADR-280), or an identity abort of
+/// an earlier resume in [`JobError::IdentityMismatch`] (ADR-286), neither opening the
 /// link. Once the link is open and the policy allows the program, and before anything is sent to
 /// the ECU, the journal is classified (`restart::classify`, ADR-253):
 /// - a declared failure (`RestartDecision::Failed`) ends the job in
 ///   [`JobError::ProcedureFailed`] with nothing sent and no resume counted (the check before
 ///   the link already returns it, so this case is reached only by the classification itself);
+/// - an identity abort (`RestartDecision::Aborted`, ADR-286) ends the job in
+///   [`JobError::IdentityMismatch`] the same way, nothing sent and no resume counted. The abort
+///   is journaled by the resume that met it: a gate (step 2) or step 3a that ends in
+///   [`JobError::IdentityMismatch`] commits it as the journal's last record first, and a commit
+///   that fails ends the job in [`JobError::Journal`] instead;
 /// - a plain start runs the program from its start on the same journal, its step count going on
 ///   after the journal's last record (`restart::next_steps`); a program without a flash
 ///   recovery plan and without a journal runs without one;
@@ -477,6 +499,12 @@ fn run_job(
                 && let Some(failure) = &opened.state().facts.procedure_failed
             {
                 return Err(failure_error(failure));
+            }
+            // An identity abort the journal records is final too (ADR-286).
+            if let Ok(opened) = &opened
+                && let Some(identity) = opened.state().facts.identity_mismatch
+            {
+                return Err(JobError::IdentityMismatch { identity });
             }
             Some(opened)
         }
@@ -760,6 +788,12 @@ where
     {
         return Err(failure_error(failure));
     }
+    // So is an identity abort (ADR-286), before the comparisons below for the same reason.
+    if let Ok(journal) = &opened
+        && let Some(identity) = journal.state().facts.identity_mismatch
+    {
+        return Err(JobError::IdentityMismatch { identity });
+    }
     // A resume names the VIN the job's first run recorded, or the job's own data changed
     // (ADR-261): nothing is sent and no resume is counted.
     if let Ok(journal) = &opened
@@ -787,6 +821,9 @@ where
             code,
             detail,
         }),
+        // The restart's identity check failed on an earlier resume: final, nothing is sent and
+        // no resume counted (ADR-286).
+        RestartDecision::Aborted { identity } => Err(JobError::IdentityMismatch { identity }),
         RestartDecision::PlainStart => match opened {
             Ok(journal) if !program.flash.is_empty() => {
                 let first_step = restart::next_steps(journal.state());
@@ -812,7 +849,8 @@ where
             let poll = limits.wait_poll.max(Duration::from_millis(1));
             let gate = restart::check_gates(program, &point, &sources, host, cancelled, |vin| {
                 promote_to_vehicle(guards, vin, poll, cancelled)
-            })?;
+            })
+            .map_err(|error| journal_identity_abort(&mut journal, error))?;
             // `classify` took the point from one of the program's plans.
             let plan = program
                 .flash
@@ -838,7 +876,8 @@ where
                 host,
                 cancelled,
                 |vin| promote_to_vehicle(guards, vin, poll, cancelled),
-            )?;
+            )
+            .map_err(|error| journal_identity_abort(&mut journal, error))?;
             let state = restart::check_state(
                 program, &point, plan, &teardown, &sources, host, poll, cancelled,
             )?;
@@ -4072,6 +4111,214 @@ mod tests {
         assert!(!text.contains(&bucket), "{text}");
         assert_eq!(host.sent(), [read_of([0xF1, 0x90])]);
         assert!(host.session_reads.is_empty());
+    }
+
+    /// [`restart_with`] that keeps the journal: also gives the directory, which the caller removes.
+    fn restart_keeping(
+        prepare: impl FnOnce(&mut FlashHost),
+    ) -> (Result<VmState, JobError>, std::path::PathBuf) {
+        let program = flash_program();
+        let dir = journal_dir("resume-identity-abort");
+        interrupted(&program, &dir);
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        host.voltage = Some(12_600);
+        prepare(&mut host);
+        let result = resume(&program, &dir, &mut host, false);
+        (result, dir)
+    }
+
+    /// An identity abort is journaled (ADR-286): a further resume ends in the same error with
+    /// nothing sent and no resume counted, also when the job's data changed meanwhile.
+    fn assert_abort_is_final(dir: &std::path::Path, identity: IdentityKind) {
+        let program = flash_program();
+        let facts = Journal::read(dir, &job_key()).unwrap().facts;
+        assert_eq!(facts.identity_mismatch, Some(identity));
+        assert_eq!(resumes(dir), 1);
+        for vin in [TARGET_VIN, "WDB99999999999999"] {
+            let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+            host.voltage = Some(12_600);
+            let result = resume_for(&program, dir, &mut host, false, Some(vin));
+            assert!(
+                matches!(&result, Err(JobError::IdentityMismatch { identity: i }) if *i == identity),
+                "{result:?}"
+            );
+            assert_eq!(host.sent(), []);
+            assert_eq!(host.voltage_reads, 0);
+            assert_eq!(resumes(dir), 1);
+        }
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        let result = resume_naming(
+            &program,
+            dir,
+            &mut host,
+            false,
+            Some(TARGET_VIN),
+            Some(b"9.9.9"),
+            &dir_slot(dir),
+        );
+        assert!(
+            matches!(result, Err(JobError::IdentityMismatch { .. })),
+            "{result:?}"
+        );
+        assert_eq!(host.sent(), []);
+    }
+
+    /// The gates' VIN mismatch is journaled as the job's last record (ADR-286).
+    #[test]
+    fn a_vin_mismatch_is_journaled_and_not_resumed() {
+        let (result, dir) = restart_keeping(|host| {
+            host.vin = Some(b"WDB99999999999999".to_vec());
+        });
+        assert!(
+            matches!(
+                result,
+                Err(JobError::IdentityMismatch {
+                    identity: IdentityKind::Vin
+                })
+            ),
+            "{result:?}"
+        );
+        assert_abort_is_final(&dir, IdentityKind::Vin);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Step 3a's hardware identity mismatch is journaled too (ADR-286).
+    #[test]
+    fn a_step_3a_hardware_mismatch_is_journaled_and_not_resumed() {
+        let (result, dir) = restart_keeping(|host| {
+            host.hardware_script = [IdAnswer::Standing, IdAnswer::value("HW02")].into();
+        });
+        assert!(
+            matches!(
+                result,
+                Err(JobError::IdentityMismatch {
+                    identity: IdentityKind::HardwarePartNumber
+                })
+            ),
+            "{result:?}"
+        );
+        assert_abort_is_final(&dir, IdentityKind::HardwarePartNumber);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Step 3a's VIN mismatch is journaled too (ADR-286).
+    #[test]
+    fn a_step_3a_vin_mismatch_is_journaled_and_not_resumed() {
+        let (result, dir) = restart_keeping(|host| {
+            host.vin_script = [IdAnswer::Standing, IdAnswer::value("WDB99999999999999")].into();
+        });
+        assert!(
+            matches!(
+                result,
+                Err(JobError::IdentityMismatch {
+                    identity: IdentityKind::Vin
+                })
+            ),
+            "{result:?}"
+        );
+        assert_abort_is_final(&dir, IdentityKind::Vin);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An identity that is only not established is not an abort and journals nothing (ADR-286).
+    #[test]
+    fn an_identity_not_established_is_not_journaled_as_an_abort() {
+        let (result, dir) = restart_keeping(|host| {
+            host.hardware_script = [IdAnswer::Standing, IdAnswer::Refuse].into();
+        });
+        assert!(
+            matches!(result, Err(JobError::OnSiteInterventionRequired(_))),
+            "{result:?}"
+        );
+        let facts = Journal::read(&dir, &job_key()).unwrap().facts;
+        assert_eq!(facts.identity_mismatch, None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A journal with an identity abort is reported before the link is opened: a worker that
+    /// cannot be reached does not matter, and a journal another run holds is still in use
+    /// (ADR-286, ADR-255 item 7).
+    #[test]
+    fn an_aborted_journal_reports_the_abort_without_a_worker() {
+        let (result, dir) = restart_keeping(|host| {
+            host.vin = Some(b"WDB99999999999999".to_vec());
+        });
+        assert!(matches!(result, Err(JobError::IdentityMismatch { .. })));
+        let guards = take_guards(&dir);
+        let (result, guards) = resume_on_unreachable(
+            flash_program(),
+            &dir,
+            guards,
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert!(
+            matches!(
+                result,
+                Err(JobError::IdentityMismatch {
+                    identity: IdentityKind::Vin
+                })
+            ),
+            "{result:?}"
+        );
+        assert_eq!(resumes(&dir), 1);
+
+        let held = Journal::open(&dir, &job_key()).unwrap();
+        let (result, _guards) = resume_on_unreachable(
+            flash_program(),
+            &dir,
+            guards,
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert!(
+            matches!(result, Err(JobError::Journal(JournalError::InUse))),
+            "{result:?}"
+        );
+        drop(held);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A commit of the abort that fails is the job's error; any other error passes unchanged
+    /// (ADR-286).
+    #[test]
+    fn a_failed_abort_commit_is_the_jobs_error() {
+        let mut journal = crate::journal::Journal::on_store(
+            CountingStore {
+                commits: Rc::new(Cell::new(0)),
+                fail_at: Some(1),
+            },
+            job_key(),
+        );
+        let error = journal_identity_abort(
+            &mut journal,
+            JobError::IdentityMismatch {
+                identity: IdentityKind::Vin,
+            },
+        );
+        assert!(matches!(error, JobError::Journal(_)), "{error:?}");
+        let mut journal = crate::journal::Journal::on_store(
+            CountingStore {
+                commits: Rc::new(Cell::new(0)),
+                fail_at: None,
+            },
+            job_key(),
+        );
+        let error = journal_identity_abort(&mut journal, JobError::Cancelled);
+        assert!(matches!(error, JobError::Cancelled), "{error:?}");
+        assert_eq!(journal.state().facts.identity_mismatch, None);
+        let error = journal_identity_abort(
+            &mut journal,
+            JobError::IdentityMismatch {
+                identity: IdentityKind::Vin,
+            },
+        );
+        assert!(
+            matches!(error, JobError::IdentityMismatch { .. }),
+            "{error:?}"
+        );
+        assert_eq!(
+            journal.state().facts.identity_mismatch,
+            Some(IdentityKind::Vin)
+        );
     }
 
     #[test]

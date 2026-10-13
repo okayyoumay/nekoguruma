@@ -1,9 +1,8 @@
 # vci-service-config Configuration
 
 This document covers the full `config.toml` schema loaded by
-`vci-service-config`: logging settings, the per-library worker settings, and
-the `library_path` entries that `iso22900-registry`'s discovery (`enumerate_libraries`) still reads;
-no worker service resolves its library through `library_path`. `vci-service-launcher` re-exports this crate as
+`vci-service-config`: logging settings, the per-library worker settings,
+the J2534 module selection and the vendor settings. `vci-service-launcher` re-exports this crate as
 `vci_service_launcher::config` (see ADR-033), so every service built on the
 launcher template picks this schema up automatically.
 
@@ -72,7 +71,6 @@ output = "stderr"
 
 # Per-API, per-library settings (cross-platform) — highest priority on Linux.
 [config.apis.<api-name>.libs.<library-name>]
-library_path = "/opt/vci/mylib.so"   # optional; see "Library Path Overrides" below
 [config.apis.<api-name>.libs.<library-name>.logging]
 level  = "warn"
 output = { file = "/var/log/vci/mylib.log" }
@@ -85,7 +83,6 @@ output = "eventlog"
 
 # Per-API, per-architecture, per-library settings (Windows only, highest priority).
 [config.apis.<api-name>.arch.<arch-name>.libs.<library-name>]
-library_path = "C:/Program Files/Vendor/mylib-x86_x64.dll"   # optional
 [config.apis.<api-name>.arch.<arch-name>.libs.<library-name>.logging]
 level  = "trace"
 output = { file = "C:/ProgramData/nekoguruma/logs/specific-lib.log" }
@@ -143,55 +140,10 @@ The first level that has a `[logging]` entry wins. Levels do not merge; the enti
 
 ---
 
-## Library Path Overrides
+## Library Resolution
 
-The `libs.<library-name>` and `arch.<arch-name>.libs.<library-name>` tables
-accept an optional `library_path` field: an explicit filesystem path to the
-library, keyed by the same library name passed in the startup argument.
-
-Unlike logging, `library_path` has no api-level or root-level fallback —
-it is only ever read from a `libs.<lib>` entry, since a path is meaningless
-without a specific library name to attach it to.
-
-| Priority | Key path | Platform |
-|----------|----------|----------|
-| 1 | `config.apis.<api>.arch.<arch>.libs.<lib>.library_path` | Windows only |
-| 2 | `config.apis.<api>.libs.<lib>.library_path` | All |
-
-**Lookup is exposed through `iso22900-registry::find_library_path()`** (a thin
-wrapper around this crate's `find_library_path()`, scoped to its API name), not
-called directly from this crate — see ADR-034. `j2534-0404-registry` no longer
-offers a `library_path` lookup: J2534 names resolve only through
-`ngr-library-resolver` (ADR-228 Decision item 4). Neither worker service reads
-`library_path`: `iso22900-service` resolves its library through
-`ngr-library-resolver`'s D-PDU API root description file lookup (design 7.1)
-and `j2534-0404-service` through its J2534 registration definition or registry
-lookup (design 7.1.1), and both then run the design 7.2 pre-load checks
-(ADR-281 Decision item 1).
-
-`iso22900-registry`'s `enumerate_libraries()` also reads this table (via
-`list_configured_library_paths()`), so config-only libraries — ones with no
-hardware auto-discovery entry — are included in discovery (ADR-034, ADR-036).
-
-### Example: add a library manually and point another at a specific build
-
-```toml
-# Not present in the Windows registry (e.g. a Linux .so under test, or a
-# vendor DLL installed without a PassThruSupport.04.04 registry entry).
-[config.apis.j2534-0404.libs."OpenPort2"]
-library_path = "/opt/vci/openport2.so"
-
-# Overrides the registry-resolved path for this specific architecture only;
-# other architectures still fall back to the registry.
-[config.apis.j2534-0404.arch.x86_x64.libs."MongoosePro GM II"]
-library_path = "C:/Program Files/Drew Technologies/MongoosePro GM II/mongoose-x64.dll"
-
-# Not present in the RDF pointed to by the Windows registry (or not present
-# at all on non-Windows, where no RDF-based lookup is reachable without a
-# file at /etc/pdu_api_root.xml).
-[config.apis.iso22900.libs."D_PDU_API_Bosch_6531_Bosch"]
-library_path = "/opt/vci/bosch-dpdu.so"
-```
+`config.toml` names no library. Libraries resolve through `ngr-library-resolver`
+(design 7.1, ADR-281 Decision item 1); an old `library_path` key is ignored.
 
 ---
 
@@ -215,9 +167,8 @@ mode does.
 | 2 | `config.apis.<api>.libs.<lib>.can_channel_mode` | All |
 | 3 | `config.apis.<api>.can_channel_mode` | All |
 
-Unlike `library_path`, an api-level default is supported (priority 3):
-a channel-mapping policy can meaningfully apply to every library of an API,
-whereas a filesystem path cannot.
+Unlike `modules`, an api-level default is supported (priority 3):
+a channel-mapping policy can meaningfully apply to every library of an API.
 
 ### Example: software ISO-TP for one library, dual-channel default
 
@@ -254,8 +205,7 @@ service.
 | 2 | `config.apis.<api>.libs.<lib>.modules` | All |
 
 Unlike `can_channel_mode`, there is no api-level default: a `modules` list
-only makes sense tied to one specific library (same contract as
-`library_path`). When `modules` is omitted entirely, `j2534-0404-service`
+only makes sense tied to one specific library. When `modules` is omitted entirely, `j2534-0404-service`
 falls back to a single default module (`PassThruOpen(NULL, ...)`), matching
 pre-ADR-107 behavior. `module_handle` is the entry's 1-based position in the
 array; deployers should keep the array order stable across restarts so
@@ -264,9 +214,6 @@ persisted client handles keep referring to the same device.
 ### Example: two physical devices behind one vendor DLL
 
 ```toml
-[config.apis.j2534-0404.libs."OpenPort2"]
-library_path = "/opt/vci/openport2.so"
-
 [[config.apis.j2534-0404.libs."OpenPort2".modules]]
 label = "Bench 1"
 pname = "USB:1"
@@ -345,5 +292,5 @@ output = "null"
 - `stdout` is always reserved for JSON-RPC communication with the parent process (the agent, via `worker-host`). Do not configure log output to `stdout`.
 - When the config file is missing or unparseable, a warning is printed to `stderr` and the default (`info` + `stderr`) is used. The service still starts normally.
 - File output appends; the file is never truncated on startup. Rotate externally (e.g., `logrotate` on Linux).
-- Neither worker service reads `library_path`, so a missing or unparseable config file does not change which library either one loads. A configuration file that is missing at startup leaves the worker's per-library settings unset for its lifetime (`vendor_struct_types` in `iso22900-service`; `modules`, `can_channel_mode` and `vendor_ioctls` in `j2534-0404-service`), even if the file appears later, since only a file that existed at startup passed the design 7.2 checks.
+- Library resolution does not read this file, so a missing or unparseable config file does not change which library either one loads. A configuration file that is missing at startup leaves the worker's per-library settings unset for its lifetime (`vendor_struct_types` in `iso22900-service`; `modules`, `can_channel_mode` and `vendor_ioctls` in `j2534-0404-service`), even if the file appears later, since only a file that existed at startup passed the design 7.2 checks.
 - The worker checks the config file with the design 7.2 writability rules before it reads any setting from it, logging included (ADR-285). In device mode a file regular users can change is not read: logging uses the default and the service does not start. In user mode the findings are logged as a warning and the file is used.

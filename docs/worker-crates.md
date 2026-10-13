@@ -92,11 +92,11 @@ which is kept with the project's working material rather than in the design docu
 | Item | Description |
 |------|------|
 | Role | Discovery/parsing of installed D-PDU libraries |
-| Responsibility | XML metadata parsing, Windows registry lookup, architecture selection, `library_path` setting lookup in `config.toml` |
-| Key types | `PduLibraryInfo` (includes `source: LibrarySource`), `LibrarySource`, `LibraryArch`, `RegistryViewMode` |
-| Key functions | `find_library_path(arch, lib)`, `list_configured_libraries()`, `enumerate_pdu_libraries(mode)`, `enumerate_libraries(mode)` — `find_library_path`/`list_configured_libraries` are thin wrappers that delegate to `vci-service-config` (with the api name fixed to `"iso22900"`). `enumerate_libraries` is an enumeration function that returns a `Vec<PduLibraryInfo>` merging RDF-based auto-discovery with `config.toml`'s `library_path` settings (both at the api level and the arch level), used for discovery (ADR-036). `iso22900-service` no longer uses this crate to find its library: it resolves the name through `ngr-library-resolver` (design 7.2) |
-| Dependencies | `roxmltree`, `url`, `vci-service-config`, `winreg` (Windows), `tracing` |
-| Notes | The Root Description File path is resolved from the Windows registry (`HKLM\SOFTWARE\D-PDU API\Root File`) or, on non-Windows platforms, the fixed path `/etc/pdu_api_root.xml` (overriding via an environment variable has been removed). The `library_path` setting in `config.toml` is loaded via `vci-service-config` (ADR-034). `enumerate_libraries` falls back to `Vec::new()` on RDF-side auto-discovery errors, so libraries defined only in `config.toml` are always enumerated even if the RDF is broken or missing (ADR-036) |
+| Responsibility | XML metadata parsing, Windows registry lookup, architecture selection |
+| Key types | `PduLibraryInfo`, `LibraryArch`, `RegistryViewMode` |
+| Key functions | `enumerate_pdu_libraries(mode)` — reads the Root Description File and returns the `Vec<PduLibraryInfo>` it lists, plus the RDF parsing and registry lookup behind it. `iso22900-service` does not use this crate to find its library: it resolves the name through `ngr-library-resolver` (design 7.2, ADR-281 Decision item 1) |
+| Dependencies | `roxmltree`, `url`, `winreg` (Windows), `tracing` |
+| Notes | The Root Description File path is resolved from the Windows registry (`HKLM\SOFTWARE\D-PDU API\Root File`) or, on non-Windows platforms, the fixed path `/etc/pdu_api_root.xml` (overriding via an environment variable has been removed). The crate reads no `config.toml` setting |
 
 #### `iso22900-service`
 | Item | Description |
@@ -141,7 +141,7 @@ which is kept with the project's working material rather than in the design docu
 | Key types | `J2534DeviceInfo`, `LibraryArch`, `RegistryViewMode` |
 | Key functions | `find_j2534_device(name)`, `find_j2534_device_on_registry(name, mode)`, `enumerate_j2534_devices(mode)` |
 | Dependencies | `tracing`, `winreg` (Windows) |
-| Notes | The registry lookup behind `ngr-library-resolver`'s Windows J2534 resolution (design 7.1.1); callers resolve through the resolver, not this crate. It reads no `config.toml` setting: J2534 names have no `library_path` lookup (ADR-228 Decision item 4, ADR-281 Decision item 1) |
+| Notes | The registry lookup behind `ngr-library-resolver`'s Windows J2534 resolution (design 7.1.1); callers resolve through the resolver, not this crate. It reads no `config.toml` setting (ADR-228 Decision item 4, ADR-281 Decision item 1) |
 
 #### `j2534-0404-service`
 | Item | Description |
@@ -168,11 +168,11 @@ which is kept with the project's working material rather than in the design docu
 #### `vci-service-config`
 | Item | Description |
 |------|------|
-| Role | Loading `config.toml` (logging config, `library_path` overrides, `can_channel_mode`, J2534 v04.04 module selection, vendor STRUCTFIELD entry sizes, vendor IOCTL native contracts) |
+| Role | Loading `config.toml` (logging config, `can_channel_mode`, J2534 v04.04 module selection, vendor STRUCTFIELD entry sizes, vendor IOCTL native contracts) |
 | Responsibility | Config file path resolution (`config-root-*` feature, build-time `VCI_CONFIG_PATH` default `nekoguruma/config.toml`, debug-build-only runtime override), the fixed J2534 registration-definition directory (`/etc/nekoguruma/j2534`, ADR-228), the fixed D-PDU API root description file on Linux (build-time `NGR_PDU_API_ROOT_FILE`, default `/etc/pdu_api_root.xml`, ADR-228), TOML parsing, priority-ordered lookup, flat `[config.manager]` lookup |
-| Key functions | `find_logging_config()`, `find_library_path()`, `find_can_channel_mode()`, `find_modules()`, `find_vendor_struct_type_size()`, `find_vendor_ioctls()`, `list_configured_libraries()`, `list_configured_library_paths()`, `manager_config()`, `j2534_definition_dir()`, `pdu_api_root_file()`, `system_config_dir()` |
+| Key functions | `find_logging_config()`, `find_can_channel_mode()`, `find_modules()`, `find_vendor_struct_type_size()`, `find_vendor_ioctls()`, `manager_config()`, `j2534_definition_dir()`, `pdu_api_root_file()`, `system_config_dir()` |
 | Dependencies | `serde`, `toml` (`windows-sys` on Windows only). Does not depend on `tonic`/`tokio`/`vci-service-interface` |
-| Notes | Extracted as an independent crate from config-loading logic that originally lived inside `vci-service-launcher` (ADR-033). `vci-service-launcher` re-exports it via `pub use vci_service_config as config;`, so existing `vci_service_launcher::config::*` calls (logging config) continue to work unchanged. `library_path` lookup is exposed by `iso22900-registry` as a thin wrapper with a fixed API name (ADR-034; see `crates/vci-service-config/docs/logging-config.md` for details); neither worker service uses it to load its library. `manager_config()` reads a flat `[config.manager]` table (`bind`/`root_path`, ADR-073) that the worker services do not use. `find_modules()` resolves the `[[config.apis.j2534-0404.libs."<lib>".modules]]` array-of-tables (`ModuleConfigEntry{label,pname}`) that `j2534-0404-service` uses to pre-declare connectable modules and their `PassThruOpen` `pName` connection-target strings, since J2534 v04.04 has no runtime device-enumeration API (ADR-107). `find_vendor_struct_type_size()` resolves the `[config.apis.iso22900.libs."<lib>".vendor_struct_types]` table (keyed by `"0x<8 lowercase hex digits>"`, matching the gRPC `type_url` grammar) that `iso22900-service` consults as the sole source of its vendor STRUCTFIELD ComParam entry-size resolution, for both `GetComParam`/`GetUniqueRespIdTable` reads and `SetComParam`/`SetUniqueRespIdTable` writes (ADR-218, as amended to remove a process-lifetime write cache found to be a local heap-disclosure vector). `find_vendor_ioctls()` returns the whole `[config.apis.j2534-0404.libs."<lib>".vendor_ioctls]` table (keyed the same way, each entry a `VendorIoctlConfigEntry{shape,input_bytes,output_bytes}`) that `j2534-0404-service` loads and fail-fast validates once at startup as the sole source of each vendor IOCTL command's native buffer shape/sizes — required for any vendor IOCTL carrying a non-NULL buffer, since neither the client-selected raw-vs-`SBYTE_ARRAY` shape nor a fixed capacity cap is safe to trust for that (ADR-219, as amended) |
+| Notes | Extracted as an independent crate from config-loading logic that originally lived inside `vci-service-launcher` (ADR-033). `vci-service-launcher` re-exports it via `pub use vci_service_config as config;`, so existing `vci_service_launcher::config::*` calls (logging config) continue to work unchanged. `config.toml` names no library: libraries resolve through `ngr-library-resolver` (ADR-281 Decision item 1), and no registry crate depends on this crate. `manager_config()` reads a flat `[config.manager]` table (`bind`/`root_path`, ADR-073) that the worker services do not use. `find_modules()` resolves the `[[config.apis.j2534-0404.libs."<lib>".modules]]` array-of-tables (`ModuleConfigEntry{label,pname}`) that `j2534-0404-service` uses to pre-declare connectable modules and their `PassThruOpen` `pName` connection-target strings, since J2534 v04.04 has no runtime device-enumeration API (ADR-107). `find_vendor_struct_type_size()` resolves the `[config.apis.iso22900.libs."<lib>".vendor_struct_types]` table (keyed by `"0x<8 lowercase hex digits>"`, matching the gRPC `type_url` grammar) that `iso22900-service` consults as the sole source of its vendor STRUCTFIELD ComParam entry-size resolution, for both `GetComParam`/`GetUniqueRespIdTable` reads and `SetComParam`/`SetUniqueRespIdTable` writes (ADR-218, as amended to remove a process-lifetime write cache found to be a local heap-disclosure vector). `find_vendor_ioctls()` returns the whole `[config.apis.j2534-0404.libs."<lib>".vendor_ioctls]` table (keyed the same way, each entry a `VendorIoctlConfigEntry{shape,input_bytes,output_bytes}`) that `j2534-0404-service` loads and fail-fast validates once at startup as the sole source of each vendor IOCTL command's native buffer shape/sizes — required for any vendor IOCTL carrying a non-NULL buffer, since neither the client-selected raw-vs-`SBYTE_ARRAY` shape nor a fixed capacity cap is safe to trust for that (ADR-219, as amended) |
 
 #### `vci-service-launcher`
 | Item | Description |
@@ -181,7 +181,7 @@ which is kept with the project's working material rather than in the design docu
 | Responsibility | Takes a `VciServer` trait implementation and starts the gRPC + JSON-RPC server |
 | Key functions | `start_service::<T: VciServer>()`, `config::find_logging_config()` (re-export of `vci-service-config`) |
 | Dependencies | `ngr-library-resolver`, `vci-service-config`, `vci-service-interface`, `tonic`, `tokio` |
-| Notes | gRPC starts over the network, JSON-RPC over stdio, simultaneously. Before reading any setting, `start_service` checks `config.toml` with the design 7.2 writability rules in the mode from the startup argument (`ServiceIdentity::mode`): in device mode a failing file leaves logging at its defaults and the service does not start; in user mode the findings are logged and the file is used. `VciServer::new` receives the verdict as a `ConfigFile` (ADR-285). `config::find_library_path()` is also re-exported, but neither worker service calls it: both resolve their library through `ngr-library-resolver` (ADR-281 Decision item 1; see `crates/vci-service-config/docs/logging-config.md` for details) |
+| Notes | gRPC starts over the network, JSON-RPC over stdio, simultaneously. Before reading any setting, `start_service` checks `config.toml` with the design 7.2 writability rules in the mode from the startup argument (`ServiceIdentity::mode`): in device mode a failing file leaves logging at its defaults and the service does not start; in user mode the findings are logged and the file is used. `VciServer::new` receives the verdict as a `ConfigFile` (ADR-285). |
 
 ---
 
@@ -269,7 +269,6 @@ graph LR
     iface --> svc1
     iface --> svc2
     cfg --> launcher
-    cfg --> reg
     launcher --> svc1
     launcher --> svc2
     svc1 -.->|process| host

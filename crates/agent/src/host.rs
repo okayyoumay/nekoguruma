@@ -35,6 +35,11 @@ pub enum HostError {
     /// request may have been answered.
     #[error("the worker lost events of the link")]
     EventsLost,
+    /// The worker reported the VCI lost (`PDU_ERR_EVT_LOST_COMM_TO_VCI`, ADR-289) while the
+    /// primitive was pending: the request may or may not have reached the ECU, and the link can
+    /// no longer reach it. Not an ECU that stayed silent.
+    #[error("the VCI was lost")]
+    VciLost,
     /// The primitive ended without a response after the worker reported this error event
     /// for it (for example a transmit error), so the request may not have been sent.
     #[error("the primitive failed: {}", error_event_name(*.0))]
@@ -444,6 +449,18 @@ impl Progress {
         item: EventItem,
         cop: ComPrimitiveHandle,
     ) -> Option<Result<Vec<u8>, HostError>> {
+        // A lost VCI ends the pending primitive at once (ADR-289). The worker reports it for the
+        // whole link, with no primitive handle, before it cancels the primitives; one bound to
+        // this primitive counts the same.
+        if item.cop_handle.is_none_or(|handle| handle == cop)
+            && matches!(
+                item.data,
+                Some(event_item::Data::ErrorData(code))
+                    if code == PduErrorEvent::PduErrEvtLostCommToVci as i32
+            )
+        {
+            return Some(Err(HostError::VciLost));
+        }
         // Events of earlier primitives, and of none, are not this request's.
         if item.cop_handle != Some(cop) {
             return None;
@@ -1017,15 +1034,38 @@ mod tests {
         assert_eq!(code, tx_error);
         assert!(error.to_string().contains("TX_ERROR"), "{error}");
         // The worker reports a lost VCI with no primitive handle, then cancels the primitive:
-        // for now that is no response.
+        // the lost VCI ends the primitive at once, before the cancellation (ADR-289).
         let lost = PduErrorEvent::PduErrEvtLostCommToVci as i32;
+        assert!(matches!(
+            outcome(vec![event(None, event_item::Data::ErrorData(lost))]),
+            Some(Err(HostError::VciLost))
+        ));
         assert!(matches!(
             outcome(vec![
                 event(None, event_item::Data::ErrorData(lost)),
                 event(Some(COP), status(PduComPrimitiveStatus::PduCopstCancelled)),
             ]),
-            Some(Err(HostError::NoResponse))
+            Some(Err(HostError::VciLost))
         ));
+        // Bound to the primitive it counts the same, also after a response pending.
+        assert!(matches!(
+            outcome(vec![
+                event(Some(COP), result(&[0x7F, 0x22, 0x78])),
+                event(Some(COP), event_item::Data::ErrorData(lost)),
+            ]),
+            Some(Err(HostError::VciLost))
+        ));
+        // One bound to an earlier primitive is not this request's: the primitive goes on.
+        assert!(
+            outcome(vec![event(
+                Some(ComPrimitiveHandle {
+                    cop_handle: COP.cop_handle + 1,
+                    ..COP
+                }),
+                event_item::Data::ErrorData(lost)
+            )])
+            .is_none()
+        );
         // A receive timeout is no response, not a failed primitive.
         let timeout = PduErrorEvent::PduErrEvtRxTimeout as i32;
         assert!(matches!(

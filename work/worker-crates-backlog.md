@@ -68,7 +68,23 @@ margin theory — stop widening and instrument instead (see
 in the "Test-suite reliability: past flaky-test root causes" section of
 `crates/j2534-0404-service/docs/implementation-notes.md` for a worked example).
 
-No entries at present.
+- `j2534-0404-service` `agent_restart_end_to_end`
+  `a_non_default_session_on_the_completed_path_is_confirmed_after_the_passive_retry`
+  (`crates/j2534-0404-service/tests/agent_restart_end_to_end.rs`). Symptom: failed once in the
+  pull-request `core-windows` step (commit 1f48b76, identical to main 7f54236, `ci-windows`
+  profile, 16.2 s): the trace held one `uds 22 F186` read where the test expects two, the
+  non-default one and the one after the passive retry; the other 17 tests passed. Cause, as the
+  test's own doc says: the restart's gate reads must reach the simulated ECU within its 3 s
+  session timer after the probe's last read, so the first F186 still sees the programming
+  session. On that run the killed worker's start and the restarted worker's were about 5.5 s
+  apart, so the ECU had fallen back to its default session and the first read confirmed. The
+  scenarios have run on Windows since the agent-kill harness came to Windows. Confirm in
+  isolation: `cargo test -p j2534-0404-service --test agent_restart_end_to_end --
+  --exact a_non_default_session_on_the_completed_path_is_confirmed_after_the_passive_retry`
+  under CPU load, or with a delay of more than 3 s added before `env.restart`. Fix by keeping
+  the ECU in its programming session until the restart's first F186 read regardless of the delay
+  (for example a session timer the probe can hold, or a longer timer with a plan whose passive
+  wait matches it), without loosening the read-count assertion.
 
 Past root causes and their fixes: `crates/j2534-0404-service/docs/implementation-notes.md`, section
 "Test-suite reliability: past flaky-test root causes".

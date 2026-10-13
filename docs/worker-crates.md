@@ -105,7 +105,7 @@ which is kept with the project's working material rather than in the design docu
 | Responsibility | RPC handlers, Proto ↔ Rust type conversion, event streaming, session management |
 | Submodules | `convert`, `events`, `handles`, `ioctl`, `rpc`, `rpc_link`, `rpc_misc`, `rpc_module`, `rpc_primitive`; `preload` (crate root) |
 | Dependencies | `iso22900`, `iso22900-registry` (architecture of the startup scheme on Windows), `ngr-library-resolver`, `vci-service-launcher`, `vci-service-interface`, `tonic`, `tokio` |
-| Notes | The library name resolves through `ngr_library_resolver::iso22900::resolve()`, the D-PDU API root description file entry with that short name (design 7.1); no `config.toml` key names the library (ADR-281 Decision item 1). The design 7.2 pre-load checks run immediately before the load: device mode refuses a library that fails them, user mode reports the findings and loads it |
+| Notes | The library name resolves through `ngr_library_resolver::iso22900::resolve()`, the D-PDU API root description file entry with that short name (design 7.1); no `config.toml` key names the library (ADR-281 Decision item 1). The design 7.2 pre-load checks run immediately before the load: device mode refuses a library that fails them, user mode reports the findings and loads it. `config.toml` is checked earlier, by the launcher, and its settings apply only on the launcher's verdict (ADR-285) |
 
 ---
 
@@ -150,7 +150,7 @@ which is kept with the project's working material rather than in the design docu
 | Responsibility | RPC handlers, protocol name/ComParam resolution, physical channel sharing, event polling, CAN channel operating-mode control |
 | Submodules | `rpc_module`, `rpc_link`, `rpc_primitive`, `rpc_misc`, `events`, `names`, `comparam_support`, `can_mode`, `isotp` |
 | Dependencies | `j2534-0404`, `ngr-library-resolver`, `vci-service-launcher`, `vci-service-interface`, `tonic`, `tokio`, `portable-atomic` |
-| Library | The library name resolves through `ngr_library_resolver::j2534_0404::resolve()`: a registration definition on Linux, the registry on Windows (design 7.1.1); no `config.toml` key names the library (ADR-281 Decision item 1). The design 7.2 pre-load checks run immediately before the load: device mode refuses a library that fails them, user mode reports the findings and loads it. The same name is the key of the library's settings in `config.toml` |
+| Library | The library name resolves through `ngr_library_resolver::j2534_0404::resolve()`: a registration definition on Linux, the registry on Windows (design 7.1.1); no `config.toml` key names the library (ADR-281 Decision item 1). The design 7.2 pre-load checks run immediately before the load: device mode refuses a library that fails them, user mode reports the findings and loads it. `config.toml` is checked earlier, by the launcher, and its settings apply only on the launcher's verdict (ADR-285). The same name is the key of the library's settings in `config.toml` |
 | Notes | Channel assignment for CAN-bus-family protocols can be selected via `config.toml`'s `can_channel_mode` (`single-channel` (default) / `dual-channel` / `software-isotp` / `auto`). `auto` attempts to also open a companion CAN channel on the first ISO15765-family CLL connect, falling back to `dual-channel`/`single-channel`-equivalent behavior depending on success (it never auto-transitions to `software-isotp`). Under `software-isotp`, the service-side `isotp` module performs ISO 15765-2 USDT processing (segmented send, flow control, reassembly, supporting both normal and extended addressing) (ADR-046, ADR-047). `device_epoch`'s `AtomicU64` comes from `portable-atomic`, not `std` — `std::sync::atomic::AtomicU64` doesn't exist on `armv5te-unknown-linux-gnueabi` (ADR-107 addendum (h)). `examples/` holds pure-gRPC-client demo binaries (connecting to an already-running service process, unlike `tests/live_grpc_flow.rs`'s embedded-server harness) with shared connect/lifecycle boilerplate in `examples/common/mod.rs`; covers all 14 non-`ANALOG_IN` J2534 protocol families: `grpc_can`/`grpc_iso15765`/`grpc_iso9141`/`grpc_iso14230`/`grpc_j1850vpw`/`grpc_j1850pwm`/`grpc_sci`/`grpc_uart_echo_byte`/`grpc_honda_diagh`/`grpc_j1708`/`grpc_j1939`/`grpc_tp2_0`/`grpc_gm_uart`/`grpc_ethernet_ndis` |
 
 ---
@@ -180,8 +180,8 @@ which is kept with the project's working material rather than in the design docu
 | Role | Common startup template for services |
 | Responsibility | Takes a `VciServer` trait implementation and starts the gRPC + JSON-RPC server |
 | Key functions | `start_service::<T: VciServer>()`, `config::find_logging_config()` (re-export of `vci-service-config`) |
-| Dependencies | `vci-service-config`, `vci-service-interface`, `tonic`, `tokio` |
-| Notes | gRPC starts over the network, JSON-RPC over stdio, simultaneously. `config::find_library_path()` is also re-exported, but neither worker service calls it: both resolve their library through `ngr-library-resolver` (ADR-281 Decision item 1; see `crates/vci-service-config/docs/logging-config.md` for details) |
+| Dependencies | `ngr-library-resolver`, `vci-service-config`, `vci-service-interface`, `tonic`, `tokio` |
+| Notes | gRPC starts over the network, JSON-RPC over stdio, simultaneously. Before reading any setting, `start_service` checks `config.toml` with the design 7.2 writability rules in the mode from the startup argument (`ServiceIdentity::mode`): in device mode a failing file leaves logging at its defaults and the service does not start; in user mode the findings are logged and the file is used. `VciServer::new` receives the verdict as a `ConfigFile` (ADR-285). `config::find_library_path()` is also re-exported, but neither worker service calls it: both resolve their library through `ngr-library-resolver` (ADR-281 Decision item 1; see `crates/vci-service-config/docs/logging-config.md` for details) |
 
 ---
 
@@ -323,7 +323,9 @@ Handles are wrapped in newtypes to achieve type-safe ID management.
 
 ### Service Bootstrap Template
 `vci-service-launcher::start_service::<T: VciServer>()` uniformly starts the gRPC + JSON-RPC server.
-A new protocol's service can be added simply by implementing the `VciServer` trait.
+A new protocol's service can be added simply by implementing the `VciServer` trait. Its `new` receives
+the launcher's verdict on `config.toml` (`ConfigFile`) and takes settings from that file only when
+`ConfigFile::settings_apply` says so (ADR-285).
 
 ### Process Isolation
 Each library runs in its own service process, built for the library's ABI. A crash or an ABI

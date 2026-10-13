@@ -48,9 +48,12 @@ the worker's account, before the check that refuses that file had run.
   immediately before the library loads. A file that passed is owned and writable only by system
   principals, so only they could change it in between, which is the same premise ADR-270's
   Consequences state for the window between the library check and the load.
-- A device-mode worker whose configuration file fails the check now refuses to start even when
-  the library itself would pass. Before, the combined check refused the library for the same
-  finding, so the outcome for the client is unchanged; only the log message differs.
+- A device-mode worker whose configuration file fails the check refuses to start, as before,
+  when the combined check refused the library for the same finding. What changes for the client
+  is the startup error `get_status` reports: the launcher's message instead of the service's
+  `FAILED_PRECONDITION` refusal, and it comes before library resolution, so a failing file is
+  reported even when the library name does not resolve. The agent treats the error as opaque
+  text.
 - `iso22900-service` validates its `vendor_struct_types` keys only when the settings apply, so a
   file absent at startup cannot fail the start through a later read.
 

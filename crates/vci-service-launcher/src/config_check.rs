@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use ngr_library_resolver::{Policy, WritabilityError};
 use tracing::{error, warn};
 
-use crate::{BoxError, mode::OperatingMode};
+use crate::{BoxError, config::LoggingConfig, mode::OperatingMode};
 
 /// What the service may take from its configuration file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +49,20 @@ impl Outcome {
             Outcome::Absent => false,
             Outcome::Passed => true,
             Outcome::Failed(_) => mode == OperatingMode::User,
+        }
+    }
+
+    /// The logging settings to start with: those `read` returns when the file may be read in
+    /// `mode`, otherwise the defaults, without calling `read`.
+    pub(crate) fn logging_config(
+        &self,
+        mode: OperatingMode,
+        read: impl FnOnce() -> LoggingConfig,
+    ) -> LoggingConfig {
+        if self.settings_readable(mode) {
+            read()
+        } else {
+            LoggingConfig::default()
         }
     }
 
@@ -171,8 +185,11 @@ mod tests {
         make_writable_by_regular_users(&config);
         let outcome = check_with(&config, &policy());
         assert!(matches!(outcome, Outcome::Failed(_)), "{outcome:?}");
-        // Logging starts with its defaults instead of the file's settings.
+        // Logging starts with its defaults; the file's settings are never read.
         assert!(!outcome.settings_readable(OperatingMode::Device));
+        outcome.logging_config(OperatingMode::Device, || {
+            panic!("device mode must not read the logging settings of a refused file")
+        });
         let error = outcome
             .verdict(OperatingMode::Device)
             .expect_err("device mode should refuse to start");
@@ -188,7 +205,12 @@ mod tests {
         let (_tmp, config) = config_file();
         make_writable_by_regular_users(&config);
         let outcome = check_with(&config, &policy());
-        assert!(outcome.settings_readable(OperatingMode::User));
+        let mut read = false;
+        outcome.logging_config(OperatingMode::User, || {
+            read = true;
+            LoggingConfig::default()
+        });
+        assert!(read, "user mode reads the logging settings");
         let verdict = outcome
             .verdict(OperatingMode::User)
             .expect("user mode starts");

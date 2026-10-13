@@ -701,6 +701,19 @@ mod tests {
         );
     }
 
+    /// The keys are validated only in a file the launcher's check let through (ADR-285): a file
+    /// absent at startup and present by the time the service starts does not fail it.
+    #[tokio::test]
+    #[serial]
+    async fn new_ignores_a_noncanonical_key_in_a_file_the_launcher_found_absent() {
+        set_mock_library_config_with_raw_vendor_struct_type_key("0x8000000A", 12);
+        let service = new_test_service_with(ConfigFile::Absent).await;
+        let err = service
+            .resolve_vendor_struct_entry_size(cpst_from_raw(0x8000_000A))
+            .expect_err("nothing is configured");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    }
+
     #[tokio::test]
     #[serial]
     async fn new_fails_startup_when_vendor_struct_type_key_is_wrong_width() {

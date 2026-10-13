@@ -37,15 +37,13 @@ where
             Ok(cfg) => {
                 let identity = S::service_identity(&cfg);
                 let outcome = config_check::check();
-                let logging = if outcome.settings_readable(identity.mode) {
+                let logging = outcome.logging_config(identity.mode, || {
                     config::find_logging_config(
                         identity.api_name,
                         identity.arch,
                         &identity.library_name,
                     )
-                } else {
-                    config::LoggingConfig::default()
-                };
+                });
                 let name = identity.library_name.clone();
                 (Ok((cfg, outcome, identity.mode)), logging, Some(name))
             }

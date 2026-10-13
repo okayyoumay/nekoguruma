@@ -82,6 +82,9 @@ pub struct JobSpec {
     pub key: JobKey,
     /// The VIN the job targets (well-formed, ADR-261).
     pub vin: String,
+    /// The software version the job writes, as the ECU reports it (`None` when the job names
+    /// none): with one, a restart after the completed plan takes the read-back path (ADR-271).
+    pub intended_software_version: Option<Vec<u8>>,
 }
 
 impl JobSpec {
@@ -91,7 +94,7 @@ impl JobSpec {
             key: self.key.clone(),
             sources: self.sources.clone(),
             vin: Some(Vin::new(self.vin.clone())),
-            intended_software_version: None,
+            intended_software_version: self.intended_software_version.clone(),
         }
     }
 }

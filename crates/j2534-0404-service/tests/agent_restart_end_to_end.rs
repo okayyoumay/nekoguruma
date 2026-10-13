@@ -68,6 +68,12 @@
 //! read, `SimEcu::inject_for_request`), and the read after the passive retry confirms. Each
 //! completes the job with exactly two F186 reads.
 //!
+//! The read-back scenario runs a variant (`READ_BACK`) that declares the software version it
+//! writes, which the ECU installs at the plan's last post-transfer step, an ECUReset, and kills
+//! the agent after the plan as the completed-path scenarios do. The restart reads that version
+//! with the post-transfer steps journaled complete, which is the read-back verification (ADR-271):
+//! it redoes nothing of the plan and goes on after it from the VM state journaled at its end.
+//!
 //! The tests are serial, the entry test included: the restart sets process-wide environment
 //! variables for the worker it launches, and the entry test reads one.
 
@@ -80,8 +86,9 @@ use agent::host::HostError;
 use agent::inputs::{Encoding, ServiceField, ServiceSources};
 use agent::journal::{JobKey, StageId, StepRef};
 use diag_ir::{
-    FlashRecovery, IR_SCHEMA_VERSION, IdentitySources, Op, Precondition, Program,
-    RecoveryBoundaries, RecoveryRequired, RecoveryTiming, Satisfied, Source, Value,
+    FlashRecovery, IR_SCHEMA_VERSION, Idempotency, IdentitySources, Interruptible, Op,
+    Precondition, Program, RecoveryBoundaries, RecoveryRequired, RecoveryTiming, Satisfied,
+    Section, Source, Value,
 };
 use restart::{EcuProbe, Env, JobSpec};
 use serial_test::serial;
@@ -291,12 +298,60 @@ fn completed_path_program() -> Program {
     program
 }
 
+/// The job variant of the read-back scenario ([`read_back_program`]).
+const READ_BACK: &str = "read-back";
+
+/// The software version the read-back variant writes. The ECU installs it at the first power
+/// cycle after its integrity check passed (`downloaded_sw_version`), which the variant's own
+/// ECUReset is. It has the same byte length as [`SW_VERSION`], since the identity table's F189
+/// field has a fixed length and must decode both versions.
+const INSTALLED_SW_VERSION: &str = "2.0.0";
+
+/// [`program`] with an ECUReset as the plan's last post-transfer step, which makes the ECU run
+/// the image it verified and report [`INSTALLED_SW_VERSION`], and two steps after the plan: a
+/// `Wait`, where the read-back scenario kills the agent once the post-transfer steps are
+/// journaled complete, and a read of the ECU's power-cycle count (DID FD01) in a `Safe` section,
+/// so the continuation after the plan sends a request the trace shows and the result holds.
+fn read_back_program() -> Program {
+    let mut program = program();
+    let reset = program.constants.len() as u32;
+    program.constants.push(vec![0x01]);
+    let power_cycles = program.constants.len() as u32;
+    program.constants.push(0xFD01_u16.to_be_bytes().to_vec());
+    program.code.extend([
+        Op::PushBytes(reset),
+        Op::ServiceRequest { service: 0x11 },
+        Op::Pop,
+    ]);
+    let plan_end = program.code.len() as u32;
+    program.flash[0].boundaries.post_transfer_end_pc = plan_end;
+    program.code.extend([
+        Op::Wait { millis: PARK_MS },
+        Op::PushBytes(power_cycles),
+        Op::ServiceRequest { service: 0x22 },
+    ]);
+    program.sections.push(Section {
+        start_pc: plan_end,
+        end_pc: program.code.len() as u32,
+        interruptible: Interruptible::Yes,
+        idempotency: Idempotency::Safe,
+        expected_millis: PARK_MS + 1_000,
+    });
+    program.validate().expect("the fixture is a valid program");
+    program
+}
+
 /// The job the harness's agent child runs, by the scenario's variant ([`Env::with_variant`]).
 fn spec_for(variant: &str) -> JobSpec {
     match variant {
         "" => spec(),
         COMPLETED_PATH => JobSpec {
             program: completed_path_program(),
+            ..spec()
+        },
+        READ_BACK => JobSpec {
+            program: read_back_program(),
+            intended_software_version: Some(INSTALLED_SW_VERSION.as_bytes().to_vec()),
             ..spec()
         },
         other => panic!("unknown job variant {other:?}"),
@@ -312,6 +367,7 @@ fn spec() -> JobSpec {
             generation: 1,
         },
         vin: VIN.to_owned(),
+        intended_software_version: None,
     }
 }
 
@@ -323,12 +379,23 @@ fn ecu_config(s3_server_ms: u32) -> String {
 
 /// [`ecu_config`], with the ECU answering nothing for `startup_ms` after an ECUReset.
 fn ecu_config_with_startup(s3_server_ms: u32, startup_ms: Option<u32>) -> String {
+    ecu_config_full(s3_server_ms, startup_ms, None)
+}
+
+/// [`ecu_config`], with the ECU installing `version` at the first power cycle after a verified
+/// download.
+fn ecu_config_installing(s3_server_ms: u32, version: &str) -> String {
+    ecu_config_full(s3_server_ms, None, Some(version))
+}
+
+fn ecu_config_full(s3_server_ms: u32, startup_ms: Option<u32>, installs: Option<&str>) -> String {
     let startup_ms = startup_ms.map_or("null".to_owned(), |ms| ms.to_string());
+    let installs = installs.map_or("null".to_owned(), |version| format!("\"{version}\""));
     format!(
         r#"{{"vin": "{VIN}", "part_number": "NGR-SIM-ECU", "sw_version": "1.0.0",
             "response_delay_ms": 0, "drop_at_block": null, "require_security_access": false,
             "require_gateway_auth": false, "fail_checksum": false, "s3_server_ms": {s3_server_ms},
-            "startup_ms": {startup_ms}}}"#
+            "startup_ms": {startup_ms}, "downloaded_sw_version": {installs}}}"#
     )
 }
 
@@ -1117,8 +1184,8 @@ fn an_unreadable_vin_makes_the_teardown_passive() {
     );
 }
 
-/// Runs the completed-path job until its post-transfer steps are journaled complete and kills
-/// the agent in the `Wait` after the plan. Returns where the transfer started.
+/// Runs the completed-path or the read-back job until its post-transfer steps are journaled
+/// complete and kills the agent in the `Wait` after the plan. Returns where the transfer started.
 fn kill_after_the_plan(env: &Env, spec: &JobSpec) -> StepRef {
     let agent = env.spawn_agent();
     env.wait_for(
@@ -1232,4 +1299,71 @@ fn an_unanswered_session_read_on_the_completed_path_is_confirmed_after_the_passi
         true,
         Some(r#"{"command": "inject_fault", "request": [34, 241, 134], "fault": "bus_error"}"#),
     );
+}
+
+/// The read-back job is killed after its plan, with the ECU already running the image it
+/// verified, since the plan's own ECUReset installed it. The restart's teardown takes the completed
+/// path (no ECUReset, no wait), the default-session confirmation's first read confirms, the
+/// identity is read again, and the ECU reports the software version the job writes: with the
+/// post-transfer steps journaled complete, that is the read-back verification (ADR-271 item 1).
+/// The transfer is not redone: no erase, RequestDownload, TransferData or RequestTransferExit,
+/// no integrity check and no ECUReset. The program goes on from the VM state journaled at the
+/// plan's end (ADR-271 item 3), so its one request after the plan is sent and its result sits on
+/// that state's stack, above the first run's integrity-check response.
+#[test]
+#[serial]
+fn an_agent_killed_after_a_verified_plan_continues_after_the_read_back_verification() {
+    let spec = spec_for(READ_BACK);
+    let env = Env::with_variant(
+        "read-back",
+        ENTRY,
+        READ_BACK,
+        &ecu_config_installing(60_000, INSTALLED_SW_VERSION),
+    );
+    let first_attempt = kill_after_the_plan(&env, &spec);
+    let before = env.probe();
+    // The plan's ECUReset put the ECU in its default session with the verified image.
+    assert_eq!(
+        (before.session, before.flash_phase),
+        (1, 4),
+        "the ECU's session and its verified download before the restart"
+    );
+
+    let state = env
+        .restart(&spec)
+        .expect("the restarted job should complete");
+    let power_cycles = [&[0x62, 0xFD, 0x01][..], &before.power_cycles.to_be_bytes()].concat();
+    let integrity_check = vec![0x71, 0x01, 0xFF, 0x01, 0x00];
+    assert_eq!(
+        state.stack[state.stack.len().saturating_sub(2)..],
+        [Value::Bytes(integrity_check), Value::Bytes(power_cycles)],
+        "{state:?}"
+    );
+
+    let mut expected: Vec<&str> = GATE_REQUESTS.to_vec();
+    expected.extend([
+        "uds 22 F186",
+        "uds 22 F190",
+        "uds 22 F187",
+        "uds 22 F189",
+        "uds 22 FD01",
+    ]);
+    let trace = env.trace();
+    let seen: Vec<&str> = trace
+        .iter()
+        .map(String::as_str)
+        .filter(|line| !line.starts_with("uds 3E"))
+        .collect();
+    assert_eq!(seen, expected, "the restart's requests: {trace:#?}");
+
+    let journal = agent::journal::Journal::read(&env.journal_dir(), &spec.key).expect("journal");
+    assert_eq!(journal.facts.resume_counts, [(StageId(STAGE), 1)]);
+    // The first run's transfer attempt, with no new transfer-start marker.
+    let transfer = journal.facts.transfer.expect("a transfer attempt");
+    assert_eq!(transfer.started_at, first_attempt);
+    assert_eq!(transfer.last_block, Some(BLOCKS));
+    assert!(transfer.exit.expect("an exit marker").complete);
+
+    // Nothing reset the ECU or touched its flash.
+    assert_eq!(env.probe(), before);
 }

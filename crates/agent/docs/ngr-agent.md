@@ -497,7 +497,11 @@ after the post-transfer steps were journaled complete, so the teardown takes the
 reset, no wait), and make the confirmation's first F186 read fail by each of its triggers: the
 programming session still active, a refused read, an unanswered one. Each is confirmed after the
 passive retry and completes the job. These restarts redo the transfer: the test job declares no
-software version to write, so the state check cannot tell the download took. The
+software version to write, so the state check cannot tell the download took. One more runs a job
+that declares the version `sim-ecu` installs at the plan's own closing ECUReset and kills the agent
+after the plan: the restart finds that version with the post-transfer steps journaled complete,
+which is the read-back verification, sends no erase, transfer or reset, and goes on after the plan
+from the VM state journaled at its end. The
 tests check the restart's requests in order against `sim-vci`'s request trace (`NGR_SIM_VCI_TRACE`)
 and that the restart power-cycled the ECU exactly once (not at all when it sends no ECUReset). The
 kill-and-restart harness is `tests/common/restart.rs`.

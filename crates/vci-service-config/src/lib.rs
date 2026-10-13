@@ -61,11 +61,12 @@ pub(crate) const VENDOR_STRUCT_TYPE_MAX_ENTRY_SIZE_BYTES: u32 = 64 * 1024;
 /// not be read, or it was read but could not be parsed as valid TOML
 /// matching the expected schema.
 ///
-/// Most lookups in this module (e.g. [`find_logging_config`]) intentionally swallow this error and fall back to
-/// defaults — see [`load_toml_config`]'s doc comment. [`find_modules`] is the
-/// one exception: it surfaces this error to the caller instead, since a
-/// malformed config file makes the real "is there a modules list configured"
-/// answer unknowable (see ADR-107 addendum (j)).
+/// Most lookups in this module (e.g. [`find_logging_config`]) intentionally
+/// swallow this error and fall back to defaults — see [`load_toml_config`]'s
+/// doc comment. [`find_modules`], [`find_vendor_ioctls`] and
+/// [`validate_vendor_struct_type_keys`] are the exceptions: they surface this
+/// error to the caller instead, since a malformed config file makes the real
+/// "is anything configured" answer unknowable (see ADR-107 addendum (j)).
 #[derive(Debug)]
 pub enum ConfigFileError {
     /// The config file exists but could not be read (permissions, I/O
@@ -639,7 +640,8 @@ fn try_load_toml_config() -> Result<TomlConfig, ConfigFileError> {
 /// Lenient wrapper around [`try_load_toml_config`]: a read or parse failure
 /// is logged to stderr and treated as "nothing configured"
 /// (`TomlConfig::default()`), rather than propagated. Used by every lookup
-/// in this module except [`find_modules`], which cannot safely treat a
+/// in this module except [`find_modules`], [`find_vendor_ioctls`] and
+/// [`validate_vendor_struct_type_keys`], which cannot safely treat a
 /// malformed document as "absent" (see [`ConfigFileError`]'s doc comment).
 fn load_toml_config() -> TomlConfig {
     try_load_toml_config().unwrap_or_else(|e| {

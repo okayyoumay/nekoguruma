@@ -374,7 +374,7 @@ A per-CLL table that maps `unique_resp_identifier` values to per-ECU ComParam se
 A hardware adapter that connects a PC to vehicle diagnostic buses (CAN, K-Line, Ethernet, etc.). Synonymous with J2534 adapter or MVCI.
 
 **vci-service-config**  
-Shared Rust crate that loads and parses `config.toml`, independent of any gRPC/JSON-RPC bootstrap. Exposes `find_logging_config` and the per-library lookups for the CAN channel mode, J2534 modules and vendor settings. `vci-service-launcher` re-exports it as `vci_service_launcher::config` for logging (ADR-033); No registry crate depends on it; libraries resolve only through `ngr-library-resolver` (ADR-228 Decision item 4, ADR-281 Decision item 1).
+Shared Rust crate that loads and parses `config.toml`, independent of any gRPC/JSON-RPC bootstrap. Exposes `find_logging_config` and the per-library lookups for the CAN channel mode, J2534 modules and vendor settings. `vci-service-launcher` re-exports it as `vci_service_launcher::config` for logging (ADR-033); no registry crate depends on it; libraries resolve only through `ngr-library-resolver` (ADR-228 Decision item 4, ADR-281 Decision item 1).
 
 **vci-service-launcher**  
 Shared Rust crate that provides the startup template for all gRPC services. Handles DLL loading, gRPC server lifecycle, JSON-RPC stdio control channel, and logging initialization.

@@ -142,8 +142,10 @@ The first level that has a `[logging]` entry wins. Levels do not merge; the enti
 
 ## Library Resolution
 
-`config.toml` names no library. Libraries resolve through `ngr-library-resolver`
-(design 7.1, ADR-281 Decision item 1); an old `library_path` key is ignored.
+`config.toml` names no library path. Its `libs."<lib>"` tables hold per-library
+settings, keyed by the library name the worker resolves through
+`ngr-library-resolver` (design 7.1, ADR-281 Decision item 1); an old
+`library_path` key is ignored.
 
 ---
 

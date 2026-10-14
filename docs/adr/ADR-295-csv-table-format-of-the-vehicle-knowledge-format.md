@@ -58,8 +58,9 @@ declared service from the SID and the parameter names when it lowers the call.
 7. **Leading constants become the IR prefix and identify the service for Starlark.** A field
    with `const` must be one of the first fields of its container, byte-aligned and fixed. The
    converter moves constants into `Request.prefix` and `PositiveResponse.prefix`, which is where
-   the IR and the host's response matching (ADR-235 item 3) expect a sub-function or an echoed
-   identifier. In the frontend the constants keep their names: `diag.request(sid, params)`
+   the IR expects a sub-function or an echoed identifier. The DID and routine services get
+   generated constants named `did`, `sub` and `rid`, which their fields may not reuse. In the
+   frontend the constants keep their names: `diag.request(sid, params)`
    selects the service of that SID whose every constant appears in `params` with its value and
    whose other request fields cover the remaining keys, and exactly one service must match. The
    generated DID services carry a constant named `did`, so `diag.request(0x22, {"did": 0xF190})`
@@ -80,7 +81,8 @@ declared service from the SID and the parameter names when it lowers the call.
     conversion reports all errors at once, with codes `CSV_*`, and checks every rule `ir.fbs`
     states, so nothing reaches the agent that the IR forbids (8.3).
 12. **Left out of this version:** monitor sets (the converter emits none), `CompuBytecode`,
-    constants that are not leading, and a table for a procedure's restart declaration, which
+    constants that are not leading or sit in a nested layout, a `ref` to a field outside the
+    row's own container (a layout reached from several places could not name one field), and a table for a procedure's restart declaration, which
     belongs to the procedure part (ADR-245) and gets its syntax with the Starlark subset.
 
 The tables, their columns and the conversion rules are specified in
@@ -90,15 +92,24 @@ example definition of one ECU that uses every table.
 ## Consequences
 
 - The converter has a complete specification and an example to test against. The example's
-  DIDs, DTC read and routine are those `sim-ecu` answers, apart from two DIDs `sim-ecu` does not
+  DIDs, DTC read and routines are those `sim-ecu` answers, apart from two DIDs `sim-ecu` does not
   answer: a supply voltage with a linear conversion and a last reset reason with a keyed
   selection.
 - A procedure that reads a constant (`res["fields"]["sub"]`) finds nothing: constants are part of
-  the prefix and not IR fields. The response was already checked against them.
+  the prefix and not IR fields. The host checks only the response SID and, for some services, the
+  echoed identifier (ADR-235 item 3), so comparing the rest of a response's prefix falls to the
+  declaration-part decoder.
 - Because names are unique across the definition rather than per variant, a DID whose layout
-  differs between variants appears under two names, and a procedure written for both variants
-  must use the name of each. The alternative, per-variant overrides of one name, would make a
-  field's meaning depend on which variant's document is being read.
+  differs between variants appears under two row names. A procedure is not affected by that: it
+  selects the DID by number and reads fields by their names in the record, which the two rows may
+  share. The alternative, per-variant overrides of one name, would make a table row's meaning
+  depend on which variant's document is being read.
+- A procedure is lowered against one variant's document, so one that reads a DID scoped to some
+  variants only (the example's supply voltage) fails to lower for the others, where the service
+  does not exist.
+- Generating a service per DID assumes the ODX frontend also turns a statically known DID key
+  into a service of its own, so that the differential test (8.4) compares like with like; the
+  ODX frontend has to confirm that.
 - Service lookup by SID and constants is the frontend's rule, not the IR's: the IR still holds
   only the SID in `ServiceRequest` and the bytes in the prefix. An ODX frontend that lowers OTX
   calls needs a rule of its own.

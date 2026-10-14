@@ -1,2 +1,3 @@
-name,rid,start,stop,results,session,p2_star_ms
-checkProgrammingDependencies,0xFF01,yes,no,no,0x02,10000
+name,rid,start,stop,results,session,security,p2_star_ms
+eraseMemory,0xFF00,yes,no,no,0x02,0x01,10000
+checkProgrammingDependencies,0xFF01,yes,no,no,0x02,,10000

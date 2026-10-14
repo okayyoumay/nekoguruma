@@ -59,8 +59,8 @@ in 4.5 is rejected.
 - An optional column may be left out of the header; every row then has it empty. A required
   column must be in the header (`CSV_MISSING_COLUMN`) and non-empty in every row.
 - Every table accepts a `note` column, which the conversion ignores.
-- A row with a different number of cells than the header is rejected. A row whose cells are all
-  empty is skipped.
+- An empty line, and a row whose cells are all empty, are skipped before anything else is
+  checked. Any other row with a different number of cells than the header is rejected.
 - Cells are taken as written: leading and trailing spaces are part of the value, and a value
   that does not parse is rejected (`CSV_BAD_VALUE`).
 
@@ -94,7 +94,8 @@ in every variant's document:
   order;
 - layouts in `layouts.csv` row order;
 - services in `services.csv` row order, then the DID services in `dids.csv` row order (read before
-  write), then the routine services in `routines.csv` row order (start, stop, results).
+  write), then the routine services in `routines.csv` row order (start, stop, results). Only
+  services that are generated take an id: a DID without a write service takes one id, not two.
 
 Ids that something outside the document refers to are written in the tables: variant ids
 (`variants.csv`), text and unit ids (resolved on the server, design 9.2) and flash session ids
@@ -105,7 +106,10 @@ means every variant, otherwise a list of variant names. A variant's document con
 rows that name it or name no variant, together with the layouts, conversions, texts, units and
 fields those rows reach. Two rows of one table that would put two definitions of the same thing
 into one variant's document (the same DID number, routine identifier, DTC code, flash session id
-or protocol name) are rejected.
+or protocol name) are rejected. A row that names a scoped row of another table (a ComParam its
+protocol, an NRC its service, a flash segment its session, a variant pattern its service) must
+belong only to variants that the named row also belongs to; otherwise the name does not exist
+in some variant's document and the row is rejected (`CSV_UNKNOWN_REFERENCE`).
 
 ---
 
@@ -130,7 +134,7 @@ Variant identification (design 8.9.1), one `VariantPattern` per row, in row orde
 |---|---|---|---|
 | `variant` | name | yes | The variant the pattern identifies |
 | `service` | name | yes | A service in that variant's document, including generated ones (`softwareVersion.read`) |
-| `field` | name | yes | A field of that service's positive response (not a constant, 5.2) |
+| `field` | name | yes | A field of that service's positive response (not a constant, 5.3) |
 | `expected` | bytes | yes | `VariantPattern.expected` |
 
 ### 4.3 `protocols.csv` (scoped) and `comparams.csv` (scoped)
@@ -168,7 +172,7 @@ other tables refer to, and a default text the server can seed its message table 
 | `id` | integer, 1 to 2^32 - 1 | yes | Unique; 0 means "no text" in the IR |
 | `text` | text | yes | Default-language text |
 
-`units.csv`: the same with `symbol` (text, may be empty) in place of `text`; 0 means "no unit".
+`units.csv`: the same with an optional `symbol` (text) in place of `text`; 0 means "no unit".
 
 ### 4.5 `conversions.csv` and `conversion_scales.csv`
 
@@ -232,6 +236,9 @@ generates up to two services:
 | `<name>.read` | SID 0x22, constant `did` (2 bytes) | SID 0x62, constant `did`, then the record |
 | `<name>.write` | SID 0x2E, constant `did`, then the record | SID 0x6E, constant `did` |
 
+`did` is a generated constant (5.3), so no field of a `did:` container may be named `did`
+(`CSV_DUPLICATE`).
+
 The record's fields are the same IR fields (same ids) in both services, with positions counted
 from the byte after the DID (5.2).
 
@@ -251,8 +258,9 @@ A row with neither service, or a DID with no fields, is rejected.
 
 A routine identifier with the sub-functions it supports. Each sub-function generates a service
 `<name>.start`, `<name>.stop` or `<name>.results` (RoutineControl sub-functions 0x01, 0x02, 0x03):
-a SID 0x31 request whose constant prefix is the sub-function and the identifier (2 bytes), and a
-SID 0x71 response with the same prefix. Their fields are containers
+a SID 0x31 request whose generated constants are `sub` (the sub-function, 1 byte) and `rid` (the
+identifier, 2 bytes), and a SID 0x71 response with the same constants. No field of a `routine:`
+container may be named `sub` or `rid` (`CSV_DUPLICATE`). Their fields are containers
 `routine:<name>:<start|stop|results>:<request|response>`, with positions counted from the byte
 after the identifier.
 
@@ -288,7 +296,9 @@ fields are container `layout:<name>`.
 | `name` | name | yes | `Layout.short_name` |
 | `byte_size` | integer, 0 to 2^32 - 1 | no | `Layout.byte_size`, default 0 (the extent of the decoded fields) |
 
-A layout is in a variant's document when a field or DTC in that document reaches it.
+A layout is in a variant's `EcuVariant.layouts` when a `group`, `repeat` or `select` field in
+that variant's document refers to it, since `layouts` holds only their targets. A layout that
+only DTCs name is not emitted there; its fields are copied into the DTC definitions (4.11).
 
 ### 4.11 `dtcs.csv` (scoped)
 
@@ -380,30 +390,40 @@ empty for `field` and `terminated`. A `fixed` field of type `ascii`, `bytes`, `b
 in the message (1 for `request:` and `response:`, 3 for `did:`, 4 for `routine:`, 0 for
 `layout:`). A row without `byte` is `AfterPrevious` with `bit_offset` = `bit`.
 
-**References.** `ref` names a field earlier in the same container, or in an enclosing one; inside
-a repeated item it means the same item's occurrence (`ir.fbs`, `Field.length_field_id`). For a DID
-or routine container, the enclosing scope is that container alone.
+**References.** `ref` names a field earlier in the same container; inside a repeated item it
+means the same item's occurrence (`ir.fbs`, `Field.length_field_id`). The IR also allows a field
+of an enclosing layout, but a layout can be reached from several places, so a name in a
+`layout:` row could not be tied to one field; a `ref` to a field outside the row's container is
+therefore not accepted (`CSV_UNSUPPORTED`).
 
 ### 5.3 Constants
 
 A field with `const` is a fixed value the request carries or the response must carry: a
-sub-function, a record identifier echoed in the response. Constants must be the first fields of
+sub-function, a record identifier echoed in the response. Constants are accepted in `request:`,
+`response:`, `did:` and `routine:` containers; a constant in a `layout:` container has no prefix
+to go to and is rejected (`CSV_UNSUPPORTED`). Constants must be the first fields of
 their container, start at byte 0, follow each other without gaps, be `fixed`, byte-aligned
 (`bit` 0, `bits` a multiple of 8) and of type `uint` (`const` an integer that fits `bits`) or
 `bytes` (`const` exactly `bits` / 8 bytes), and have no conversion, unit or shape. A constant
 anywhere else is rejected (`CSV_UNSUPPORTED`).
 
 The converter writes the constants, big-endian, into `Request.prefix` or
-`PositiveResponse.prefix` after any prefix the DID or routine table generates, and does not emit
-them as IR fields. The positions of the other fields are unaffected, since they count from the
-container's position 0 either way.
+`PositiveResponse.prefix`, after the generated constants of a DID or routine, and does not emit
+them as IR fields. Constants of a `did:` record go into the prefix of both the read response and
+the write request. The positions of the other fields are unaffected, since they count from the
+container's position 0 either way. The Starlark lowering builds a request's operand bytes as
+`Request.prefix` followed by the encoded parameters, since `ServiceRequest` sends the SID followed
+by its operand (ADR-235 item 2). Whether a received response's prefix matches is checked by the
+declaration-part decoder, not by the host, which checks only the response SID and, for some
+services, the identifier it echoes (ADR-235 item 3).
 
 Constants also identify the service a Starlark call means (design 8.4, subset spec 3.1). For
 `diag.request(sid, params)` the frontend takes the services of the variant with that SID whose
 every request constant appears in `params` with the same value and whose other request fields
 include every other key of `params`; exactly one service must match. The generated DID services
 have one constant named `did`, so `diag.request(0x22, {"did": 0xF190})` selects `vin.read` in the
-example. `diag.routine(rid, sub, params)` selects the routine service by `rid` and `sub`. Two
+example. `diag.routine(rid, sub, params)` selects the routine service whose `rid` and `sub`
+constants have those values. Two
 services of one variant with the same SID and the same request constants (name and value) can
 never be told apart and are rejected.
 
@@ -428,7 +448,7 @@ for each shape apply, including where it may appear: in a request only `group`, 
 | `items` | integer, 1 to 2^32 - 1 | `fixed` only | `fixed_count` |
 | `item_bytes` | integer, 1 to 2^32 - 1 | `fixed` only | `item_byte_size` |
 | `marker_bits` | integer, 8 to 64, a multiple of 8 | `marker` only | The marker is an unsigned big-endian integer of this width at the item's start |
-| `marker_lower`, `marker_upper` | integer | `marker` only | The marker values that end the repetition; `marker_upper` defaults to `marker_lower` |
+| `marker_lower`, `marker_upper` | integer, 0 to 2^`marker_bits` - 1 | `marker` only | The internal marker values that end the repetition; `marker_upper` defaults to `marker_lower`. A 64-bit value is stored bit for bit in the IR's `int64` |
 | `min_items`, `max_items` | integer, 0 to 2^32 - 1 | no | Request `end` repeats only; defaults 0 |
 
 The converter builds the `Repeat.marker` field (`Absolute`, offset 0, `fixed`, `uint`,
@@ -441,7 +461,7 @@ bytes read as a big-endian integer (`ir.fbs`, `Repeat`), so this one form covers
 |---|---|---|---|
 | `container`, `field` | as in `fields.csv` | yes | The `select` field |
 | `case` | name | yes | `SelectCase.short_name`, unique per field |
-| `lower` | integer | no | Inclusive; empty together with `upper` makes the row the default case |
+| `lower` | integer | no | Inclusive, compared with the key's internal value (ADR-242); empty together with `upper` makes the row the default case |
 | `upper` | integer | no | Default: the same as `lower` |
 | `layout` | layout name | no | Empty: the key is valid but carries no data |
 
@@ -458,10 +478,11 @@ rejected.
   Nothing is left for the agent to discover at run time (design 8.3).
 - **Determinism.** The same directory always converts to the same documents, byte for byte: ids
   follow row order (section 3) and arrays follow row order.
-- **`source_digest`.** The lowercase hexadecimal SHA-256 of the definition's files that the
-  conversion reads (the tables and the procedure files), taken in byte order of their file names;
-  each file contributes its name, a zero byte, its length as a big-endian 64-bit integer and its
-  contents.
+- **`source_digest`.** The lowercase hexadecimal SHA-256 over the table files of section 1 that
+  are present and the `*.star` files, all directly in the definition directory and nothing else,
+  taken in byte order of their file names; each file contributes its name, a zero byte, its
+  length as a big-endian 64-bit integer and its contents. The digest covers the bytes as stored,
+  so a change of line ends alone changes it, and with it the document.
 - **`schema_version`** is the IR schema version the converter writes.
 
 ## 7. Error Reporting
@@ -501,7 +522,7 @@ header name), with a code:
 
 ## 8. Example
 
-The example directory defines a fictional ECU with two variants. Its DIDs, DTC read and routine
+The example directory defines a fictional ECU with two variants. Its DIDs, DTC read and routines
 are those `sim-ecu` answers, except the supply voltage and last reset reason DIDs, which `sim-ecu`
 does not have:
 
@@ -509,16 +530,17 @@ does not have:
   characters of the software version (DID 0xF189).
 - `dids.csv`: the session (a text table), the spare part number and software version
   (`terminated` ASCII to the end of the message), the VIN (writable outside the default session),
-  the flash state (three fields at fixed positions) and, in the second variant only, a supply
+  the flash state (three fields at fixed positions), the power cycle count and, in the second variant only, a supply
   voltage with a linear conversion and a unit; and a last reset reason whose details are a
   `select` on the reason (`select_cases.csv`): no data, the `watchdogReset` layout, or a range of
   reasons without data.
 - `services.csv`: three session controls told apart by their `sub` constant, and
   ReadDTCInformation by status mask, whose response repeats the `dtcRecord` layout to the end of
   the message.
-- `routines.csv`: checkProgrammingDependencies, start only, in the programming session, with its
-  result as a text table.
-- `dtcs.csv`: two DTCs sharing the `dtcStatus` layout.
+- `routines.csv`: eraseMemory, behind security access, and checkProgrammingDependencies, with its
+  result as a text table; both start only, in the programming session.
+- `dtcs.csv`: two DTCs sharing the `dtcStatus` layout, whose eight one-bit fields are the bits
+  of the DTC status byte (ISO 14229-1 (2026) Annex D), named in lower camel case.
 - `flash_sessions.csv` and `flash_segments.csv`: one flash session with one segment.
 
 A row of `fields.csv` from it, the VIN in its data record:

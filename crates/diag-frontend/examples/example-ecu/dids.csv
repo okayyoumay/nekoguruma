@@ -4,5 +4,6 @@ variants,name,did,read,write,write_session,note
 ,softwareVersion,0xF189,yes,no,,
 ,vin,0xF190,yes,yes,0x03,
 ,flashState,0xFD00,yes,no,,
+,powerCycles,0xFD01,yes,no,,
 exampleEcuV2,supplyVoltage,0xFD02,yes,no,,
 ,lastResetReason,0xFD03,yes,no,,

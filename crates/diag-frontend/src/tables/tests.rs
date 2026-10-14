@@ -522,12 +522,15 @@ fn select_case_limits_take_the_widest_key_range() {
                 "did:x,k,c,5,4,",
                 "did:x,k,d,0x10000000000000000,,",
                 "did:x,k,e,,,",
+                "did:x,k,f,,abc,",
             ]
         ),
         vec![
             cell(MissingColumn, 3, "lower"),
             cell(BadValue, 4, "upper"),
             cell(BadValue, 5, "lower"),
+            cell(MissingColumn, 7, "lower"),
+            cell(BadValue, 7, "upper"),
         ]
     );
 }

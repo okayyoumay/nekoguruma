@@ -1389,17 +1389,19 @@ pub(crate) fn select_cases(sheet: &Sheet, errors: &mut Errors) -> Vec<SelectCase
         let lower = row.optional(e, "lower", limit);
         let upper = row.optional(e, "upper", limit);
         let layout = row.optional(e, "layout", values::name);
+        // A limit without the other is checked on the cells, so that a bad `upper` does not hide
+        // a missing `lower`.
+        if row.cell("lower").is_none() && row.cell("upper").is_some() {
+            row.error(
+                e,
+                ErrorCode::MissingColumn,
+                "lower",
+                "upper is set without lower",
+            );
+        }
         let range = match (lower.ok()?, upper.ok()?) {
             (None, None) => None,
-            (None, Some(_)) => {
-                row.error(
-                    e,
-                    ErrorCode::MissingColumn,
-                    "lower",
-                    "upper is set without lower",
-                );
-                None
-            }
+            (None, Some(_)) => None,
             (Some(lower), upper) => {
                 let upper = upper.unwrap_or(lower);
                 if lower > upper {

@@ -360,6 +360,7 @@ stateDiagram-v2
     Writing --> Interrupted: power loss, crash, forced termination
     Interrupted --> Writing: resumed from journal after restart
     Interrupted --> OnSiteInterventionRequired: cannot resume
+    OnSiteInterventionRequired --> Interrupted: a later resume, after an ending a restart reached from a live read after counting its resume, within the resume limit (ADR-290)
     Interrupted --> Expired: start deadline passed before recovery (ADR-229)
     Interrupted --> ReadBackVerification: intended image installed and post-transfer steps journaled (ADR-229)
     Interrupted --> Failed: VIN or ECU hardware identity mismatch on re-verification (aborted and journaled, so a later resume ends Failed without sending, ADR-229, ADR-286)
@@ -379,6 +380,8 @@ stateDiagram-v2
 Procedure execution jobs additionally have an **awaiting HMI response** state. S3 keep-alive continues while waiting, and the wait is maintained during a disconnection. If the HMI timeout is reached, execution proceeds to an interruptible point and then stops (8.10.1). Unmet preconditions (8.9) end the job as ConditionsNotMet at the pre-validation stage.
 
 After a restart, ReadBackVerification is the state check's match itself (the intended software version, and the interrupted pass's post-transfer steps journaled complete); the agent then resumes the program from the VM state journaled at the plan's end, provided every diagnostic primitive outside the program's flash plans is safe to repeat and outside any recovery-required section, and so is every step of the plan beginning at this plan's end up to its erase or its recovery-required point, which the continuation may run before that plan's first record, except that for a plan that allows a restart only a step unsafe to repeat counts, as in its replay (otherwise on-site intervention), and the job ends in Completed or Failed as the rest of the program decides, through Writing again if it reaches a later flash plan (ADR-271).
+
+OnSiteInterventionRequired is final, except for one case. An OnSiteInterventionRequired that a restart reaches after it counted its resume, from a live read (identity or software version not established, an unexpected version, a precondition that does not hold, the default session not confirmed, a continuation not safe to repeat or a missing plan-end state), ends that run but is not journaled: a later resume of the job may try again, counting another resume, within the plan's resume limit (8.2.5), which bounds the repeats (ADR-290). The on-site endings derived from the journal and the program, or from the caller's input, are decided again by every resume before it counts one (ADR-286).
 
 Cancellation by the user does not take effect immediately. In an uninterruptible section (8.10.1), the cancel request is held, and the job transitions to Cancelled once it reaches an interruptible point. For every terminal state, the result is finalized only by the agent's report. The server never treats a disconnection as a failure or automatically reissues a write job.
 

@@ -9037,6 +9037,68 @@ mod tests {
         );
     }
 
+    /// An on-site ending reached after the resume count (here step 4a's precondition) is not
+    /// journaled (ADR-290): the next resume counts another resume within the plan's limit, runs
+    /// the gates again and, with the precondition holding, gets past step 4a. The resume limit
+    /// still bounds the repeats.
+    #[test]
+    fn an_on_site_ending_after_the_resume_count_is_resumed_again() {
+        let mut program = flash_program_with_supply_and_engine();
+        program.flash[0].max_resumes = 2;
+        let dir = journal_dir("on-site-again");
+        interrupted_for(&program, &dir, Some(TARGET_VIN));
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        host.voltage = Some(12_600);
+        supply_then_connected(
+            &mut host,
+            vec![InputAnswer::Value(1), InputAnswer::Value(0)],
+        );
+        let result = resume_for(&program, &dir, &mut host, false, Some(TARGET_VIN));
+        assert_eq!(
+            teardown_at_precondition(&result, diag_ir::PreconditionKind::ExternalSupply),
+            restart::Teardown::Reset
+        );
+        assert_eq!(resumes(&dir), 1);
+        let facts = Journal::read(&dir, &job_key()).unwrap().facts;
+        assert_eq!(
+            (
+                facts.procedure_failed,
+                facts.identity_mismatch,
+                facts.run_stopped
+            ),
+            (None, None, None),
+            "the ending is not journaled"
+        );
+
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        host.voltage = Some(12_600);
+        supply_then_connected(&mut host, Vec::new());
+        let result = resume_for(&program, &dir, &mut host, false, Some(TARGET_VIN));
+        // These tests stop the restart before the erase: it got past step 4a this time.
+        assert_eq!(teardown_of(&result), restart::Teardown::Reset);
+        assert_eq!(resumes(&dir), 2);
+        assert!(
+            host.sent().contains(&read_of([0xF1, 0x90])),
+            "the gates read the VIN again"
+        );
+        // The resume limit bounds the repeats: the third resume stops before the ECU.
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        host.voltage = Some(12_600);
+        let result = resume_for(&program, &dir, &mut host, false, Some(TARGET_VIN));
+        assert!(
+            matches!(
+                result,
+                Err(JobError::OnSiteInterventionRequired(
+                    OnSiteReason::ResumeLimitReached { .. }
+                ))
+            ),
+            "{result:?}"
+        );
+        assert_eq!(host.sent(), []);
+        assert_eq!(resumes(&dir), 2);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// A worker failure on the step 4a read is a precondition not met, not a host error.
     #[test]
     fn a_failed_read_at_step_4a_is_a_precondition_not_met() {

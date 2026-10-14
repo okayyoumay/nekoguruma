@@ -1,7 +1,7 @@
 # ADR-286: The Restart's Identity Abort Is Journaled as a Terminal Record
 
 **Date:** 2026-10-13
-**Status:** Accepted
+**Status:** Accepted (Decision item 5's open point decided by ADR-290: the on-site endings after the resume count stay re-resumable within the resume limit)
 **Affects:** `agent` (`src/journal.rs`, `src/restart.rs`, `src/runner.rs`, `docs/ngr-agent.md`),
 `docs/system-architecture.md` 5.6 and 8.2.5; ADR-229, ADR-244, ADR-261, ADR-280
 

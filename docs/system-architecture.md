@@ -852,7 +852,7 @@ For each cause of interruption, the resume origin and whether resumption is poss
 - **Content addressing**: Each file is identified by its hash. Definitions shared across vehicle models are naturally deduplicated, which also provides differential delivery
 - **Lazy fetching**: The agent fetches and caches only the manifest and the target variants
 - **Unit of signing**: The manifest is signed, and the manifest holds the hash of each file (the same structure as artifacts)
-- **Version compatibility**: The IR carries a schema version, and the agent reports supported versions in `capabilities`. The runtime also checks the version, preventing accidents where an old agent executes new IR: a document is read only after its file identifier, its FlatBuffers structure and its schema version have been verified (`diag_ir::declaration::load_ecu_document`). Until the first release, breaking changes to the IR schema and to the journal's stored state are allowed with no compatibility path for older schema versions, since nothing is stored outside the repository (ADR-281 item 4)
+- **Version compatibility**: The IR carries a schema version, and the agent reports supported versions in `capabilities`. The runtime also checks the version, preventing accidents where an old agent executes new IR: a document is read only after its file identifier, its FlatBuffers structure and its schema version have been verified (`diag_ir::declaration::load_ecu_document`, ADR-296). Until the first release, breaking changes to the IR schema and to the journal's stored state are allowed with no compatibility path for older schema versions, since nothing is stored outside the repository (ADR-281 item 4)
 
 ### 8.3 Declaration of the Supported Subset
 

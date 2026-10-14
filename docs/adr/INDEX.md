@@ -285,6 +285,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-293](ADR-293-a-recovery-required-section-keeps-a-journal-without-a-plan.md) | A `RecoveryRequired` Section Keeps a Journal without a Flash Recovery Plan | Accepted | `agent` runner, restart; design 8.2.5 / 8.10.1 |
 | [ADR-294](ADR-294-a-vci-lost-between-primitives-is-vci-lost.md) | A VCI Lost between Two Primitives Is Reported as `HostError::VciLost` | Accepted | `agent` host, `j2534-0404-service` hard-error handling; design 8.2.4 |
 | [ADR-295](ADR-295-csv-table-format-of-the-vehicle-knowledge-format.md) | The CSV Table Format of the Proprietary Vehicle-Knowledge Format | Accepted | `diag-frontend` CSV table spec and example; design 8.4 |
+| [ADR-296](ADR-296-the-ir-declaration-part-is-loaded-through-a-checking-loader.md) | The IR Declaration Part Is Loaded Through a Checking Loader | Accepted | `diag-ir` declaration loader and generated bindings; design 8.2.6 |
 
 ## Status Legend
 
@@ -680,6 +681,7 @@ the predecessor repository these ADRs came from.
 - ADR-280 (schema-compatibility consequence relaxed by ADR-281 item 4; the terminal-record rule extended to the restart's identity abort by ADR-286; the open consequence on the step limit and a VM error decided by ADR-288, which journals both as terminal)
 - ADR-281
 - ADR-295
+- ADR-296
 
 ### Acquired Data & Monitoring
 - ADR-236

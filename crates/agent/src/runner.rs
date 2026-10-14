@@ -2857,6 +2857,33 @@ mod tests {
             "{result:?}"
         );
         assert!(refused(&journal));
+        // At the plan's entry, after the step into it: the identity read before the erase fails.
+        // No transfer-start marker follows the intent, so a plain start would repeat the
+        // section, and the job is refused although the newest record is outside it.
+        let commits = Rc::new(Cell::new(0));
+        let mut host = FlashHost::new(Rc::clone(&commits));
+        host.fail_reads = vec![[0xF1, 0x91]];
+        let mut journal = counting_journal(&commits, None);
+        let result = run_on(
+            &program,
+            &mut host,
+            JobLimits::default(),
+            &AtomicBool::new(false),
+            Some(&mut journal),
+        );
+        assert!(
+            matches!(result, Err(JobError::IdentityRead { pc: 12, .. })),
+            "{result:?}"
+        );
+        assert!(
+            journal
+                .journal()
+                .state()
+                .facts
+                .last_step
+                .is_some_and(|at| at.pc == 11)
+        );
+        assert!(refused(&journal));
         // The erase's marker comes after the intent, so the interrupted transfer restarts.
         let (result, _, _, journal) = run(Some(0xFF00));
         assert!(matches!(result, Err(JobError::Host { .. })), "{result:?}");

@@ -41,8 +41,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use diag_ir::{
-    DiagHost, FlashRecovery, IdentityKind, Interruptible, NoApplication, Op, Program,
-    RecoveryRequired, VmState,
+    DiagHost, FlashRecovery, IdentityKind, NoApplication, Op, Program, RecoveryRequired, VmState,
 };
 
 use crate::host::{HostError, TransferProgress};
@@ -50,6 +49,7 @@ use crate::inputs::{FieldBytes, ServiceSources, read_field_bytes};
 use crate::journal::{
     FileStore, JobKey, Journal, JournalError, RunStop, StageId, StepRef, Store, Vin,
 };
+use crate::restart::in_section_outside_plans;
 use crate::runner::JobError;
 
 /// Where a job keeps its journal, under which key, and how it reads the ECU's identity.
@@ -360,20 +360,6 @@ fn is_primitive(program: &Program, pc: u32) -> bool {
         .code
         .get(pc as usize)
         .is_some_and(Op::is_diagnostic_primitive)
-}
-
-/// Whether `pc` lies in a section marked `RecoveryRequired` and outside every plan's range
-/// (`entry_pc` up to, not including, `post_transfer_end_pc`).
-fn in_section_outside_plans(program: &Program, pc: u32) -> bool {
-    let in_plan = program
-        .flash
-        .iter()
-        .any(|plan| (plan.boundaries.entry_pc..plan.boundaries.post_transfer_end_pc).contains(&pc));
-    !in_plan
-        && program.sections.iter().any(|section| {
-            matches!(section.interruptible, Interruptible::RecoveryRequired)
-                && (section.start_pc..section.end_pc).contains(&pc)
-        })
 }
 
 /// The journal's block number for the host's running index of a confirmed block (ADR-250): a

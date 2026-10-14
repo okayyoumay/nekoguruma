@@ -33,27 +33,40 @@ program. The plain start had no such check.
      add no intent: the first already places the point in the section.
    - A cancel before the intent sends nothing and leaves no intent, as for the plan's intent.
    - No record variant is added, so the journal format does not change.
-2. **The classification uses the point as it stands.** The intent is a request written ahead, so
-   it takes part in the interruption point (ADR-229 item 1, ADR-253). When it is the newest
-   record by step count, the point lies in the section, and `restart::classify` returns
-   `OnSiteInterventionRequired(RecoveryRequiredSection)`, before it looks at the transfer.
-3. **The intent stays the point until a later record moves it.** Nothing marks the end of a
-   section, so a crash after the section's last response, or a run that ended later outside the
-   plans (a failed or unanswered step, a cancel), still classifies as inside the section. This is
-   deliberate: such a job could only go on with a plain start, and a plain start runs the section
-   again from the program's start, which 8.10.1 rules out. A later record, such as the step into
-   a plan's entry or the erase's transfer-start marker, moves the point past the section, and
-   the restart then replays from the plan's entry only, so it does not repeat the section.
+2. **The classification refuses while no transfer-start marker follows the intent.**
+   `restart::classify` returns `OnSiteInterventionRequired(RecoveryRequiredSection)`, before it
+   looks at the transfer, when the journal's last intent is such a section intent and either
+   the journal holds no transfer, or its transfer-start marker is older than the intent. This
+   holds whether or not the intent is the interruption point:
+   - with no transfer, the job could only go on with a plain start, which runs the program from
+     instruction 0 and so runs the section again;
+   - with an older transfer, the restart redoes that transfer from its plan's entry and goes on
+     past the plan, back through the section, or the continuation after a read-back
+     verification does (which ADR-271 item 4 already refuses).
+
+   So a crash after the section's last response is refused too, as is a run that ended later
+   (a failed or unanswered step, a cancel, an identity read at a plan's entry that failed), up
+   to the next transfer-start marker. 8.10.1 rules out repeating the section, and the journal
+   cannot tell a section that completed from one that did not.
+3. **A transfer-start marker after the intent lifts the refusal.** The restart then replays
+   from that plan's entry only, which lies after the section, so the section is not repeated.
 
 ## Consequences
 
 - A crash in a `RecoveryRequired` section before a plan's entry, or after a plan, now ends the
   job in `OnSiteInterventionRequired` instead of a plain start or, after a completed plan, the
   read-back verification. Nothing is sent and no resume is counted.
-- The same holds for a job whose run ended after such a section and before the next journaled
-  record. The person on site decides whether the section may run again.
-- Each pass through such a section costs one more synced journal write.
+- The same holds for a job whose run ended after such a section and before the next
+  transfer-start marker, also when steps of a plan were journaled in between. The person on site
+  decides whether the section may run again.
+- Each pass through such a section costs one more synced journal write. A loop that leaves the
+  section and comes back writes one per iteration.
+- The section is a range of instructions. A request the section makes through a `Call` to code
+  outside its range is outside the section, as it already was for the classification
+  (ADR-245 item 3), so it gets no intent.
 - A program without a flash recovery plan keeps no journal (ADR-252 item 7), so this does not
   cover it: a resume of such a job is still a plain start, whatever sections it has.
 - ADR-271 item 4's static refusal stays. It still covers a crash between a plan's end and a
   section after it, before the section's intent.
+- A job refused this way has a journal it cannot go on with: every later resume decides the
+  same, before it counts a resume.

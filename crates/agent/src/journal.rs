@@ -117,8 +117,10 @@ pub struct RecoveryFacts {
     pub attempt_key: Option<Vec<u8>>,
     /// The latest transfer attempt.
     pub transfer: Option<TransferAttempt>,
-    /// The newest request intent: a request at or past a plan's recovery-required point that is
-    /// neither the erase nor RequestTransferExit, journaled before it is sent (ADR-253).
+    /// The newest request intent, journaled before its request is sent: a request at or past a
+    /// plan's recovery-required point that is neither the erase nor RequestTransferExit
+    /// (ADR-253), or the first of a pass through a `RecoveryRequired` section outside every plan
+    /// (ADR-291).
     pub last_intent: Option<StepRef>,
     /// The VIN the job targeted at its first run, recorded before any other record, so a resume
     /// can tell that the job's own data changed (ADR-261). `None` when the job named none.
@@ -883,7 +885,9 @@ impl<S: Store> Journal<S> {
     }
 
     /// A request intent, committed before a request at or past a plan's recovery-required point
-    /// is sent, so a crash before its response still places the interruption at it (ADR-253).
+    /// (ADR-253), or before the first request of a pass through a `RecoveryRequired` section
+    /// outside every plan (ADR-291), is sent, so a crash before its response still places the
+    /// interruption at it.
     pub fn commit_intent(&mut self, at: StepRef) -> Result<(), JournalError> {
         self.commit(Record::Intent { at })
     }

@@ -202,7 +202,7 @@ step count, of the last completed step, the two transfer markers and the last re
 | unreadable (corrupt, unknown format version, another job, I/O) | `OnSiteInterventionRequired` |
 | a procedure-failure record (ADR-280), checked before every row below | `Failed`, with the record's position, code and detail |
 | an identity-abort record (ADR-286), checked right after the procedure-failure record | `Aborted`, with the `IdentityKind`, whatever the transfer state |
-| interruption point at or past a plan's recovery-required point and before its end, or inside a `RecoveryRequired` section the journal can place it in (inside a plan, on the step into a plan's entry, at a completed plan's end, or at a section's intent outside the plans, which stays the point until a later record moves it, ADR-291); a point no later than the last post-transfer step of a completed transfer counts as at that plan's end | `OnSiteInterventionRequired` |
+| interruption point at or past a plan's recovery-required point and before its end, or inside a `RecoveryRequired` section the journal can place it in (inside a plan, on the step into a plan's entry, or at a completed plan's end); a point no later than the last post-transfer step of a completed transfer counts as at that plan's end; also, whatever the point, an intent of a `RecoveryRequired` section outside the plans with no transfer-start marker after it (ADR-291) | `OnSiteInterventionRequired` |
 | no transfer-start marker | plain start |
 | transfer-start marker | `Restart`, for the plan of the marker's stage, with the VM state at its entry; `OnSiteInterventionRequired` if that plan never allows a restart |
 

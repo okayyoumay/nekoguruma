@@ -130,6 +130,7 @@ Project skills live in `.claude/skills/`:
 | `backlog` | Adding, updating and closing backlog items in `work/` |
 | `next-task` | Recommending the next item to work on (one pick plus one alternative) |
 | `backlog-triage` | Cleaning up the backlog; manual only (`/backlog-triage`) |
+| `milestone-exit` | The current milestone's open P1 items per exit criterion, the sweep of P2/P3 items it should still take, and closing it (exit evidence, plan and Status update, P1/P2 re-check for the next milestone) |
 | `pr-review-loop` | Driving the Copilot review cycle on a PR Claude opened, up to handing it to the maintainer |
 | `backlog-loop` | Working through the backlog one item and one PR at a time, failing Dependabot PRs first, waiting for the maintainer's merge between items; manual only |
 | `codeql-alerts` | Fixing open CodeQL code scanning alerts one alert and one PR at a time, from the alert list the CodeQL alert hand-off workflow sends to its routine |

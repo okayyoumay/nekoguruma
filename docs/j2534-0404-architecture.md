@@ -1068,7 +1068,7 @@ struct LogicalLinkState {
     active_unique_resp_id_table: Vec<EcuUniqueRespEntry>,  // reflected by installed FLOW_CONTROL_FILTERs / RX routing / TX addressing (ADR-068)
     cancelled_cops: HashSet<u32>,
     held_lock_mask: u32,                           // LOCK_PHYSICAL_TX_QUEUE | LOCK_PHYSICAL_COM_PARAMS
-    last_error: Option<TrackedError>,              // most recent error + when it was recorded + the COP it pertained to, if any; feeds ErrorDetail.error_event_data on the next failing RPC for this CLL (ADR-105, formerly read by the removed GetLastError RPC, ADR-004; COP attribution added by ADR-112)
+    last_error: Option<TrackedError>,              // most recent error + when it was recorded + the COP it pertained to, if any; feeds ErrorDetail.error_event_data on the next failing RPC for this CLL (ADR-105, formerly read by the removed GetLastError RPC, ADR-004; COP attribution added by ADR-112; a hard channel error records PDU_ERR_EVT_LOST_COMM_TO_VCI here in the same critical section that sets connected = false, ADR-294)
     registrants: Vec<CopRegistrant>,               // response-binding registry consulted every poll pass by
                                                     // bind_frame/bind_registrant (ADR-100 Decision §1/§3)
     next_registrant_seq: u64,                      // monotonic per-CLL counter -> CopRegistrant::registration_seq,

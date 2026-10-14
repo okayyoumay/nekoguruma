@@ -35,7 +35,8 @@
 //! agent waits after block 4, the ECU loses power (`sim_ecu::Fault::PowerLoss`) or the VCI is
 //! unplugged (`disconnect_vci`, ADR-238), each handed to the worker through the control directory
 //! (`Env::fault_mid_run`). The next block's transfer gets no answer, or finds the link offline,
-//! since the worker's receive poll met the lost device, and the run ends there with its guards and journal kept, as after a worker crash. Power comes
+//! since the worker's receive poll met the lost device (which the host reports as
+//! `HostError::VciLost`, ADR-294), and the run ends there with its guards and journal kept, as after a worker crash. Power comes
 //! back (`reconnect_ecu`) at the next run's first J2534 call, and that run's new worker finds the
 //! VCI plugged in again, since an unplugged VCI is the state of the worker process that saw it.
 //! A third makes `sim-vci` refuse the next block's write (`fail_writes`), which the worker
@@ -832,11 +833,9 @@ fn a_vci_disconnect_mid_transfer_is_restarted_once_the_vci_is_back() {
     );
     let first_attempt = assert_interrupted_at_the_next_block(&env, &spec, &run, |cause| {
         // The worker's receive poll met the lost device and took the link offline, so the
-        // transfer finds no connected link.
-        matches!(
-            cause,
-            HostError::Rpc { status, .. } if status.code() == tonic::Code::FailedPrecondition
-        )
+        // transfer finds no connected link; the worker's refusal carries the lost VCI, which
+        // the host reports as such (ADR-294).
+        matches!(cause, HostError::VciLost)
     });
     // The probe loads the library in a process of its own, with the VCI present: the
     // disconnect belonged to the stopped worker's process.
@@ -949,11 +948,9 @@ fn a_vci_crash_mid_transfer_is_restarted_once_the_vci_answers_again() {
     );
     let first_attempt = assert_interrupted_at_the_next_block(&env, &spec, &run, |cause| {
         // The worker's receive poll met the failing VCI and took the link offline, as for a lost
-        // device, so the transfer finds no connected link.
-        matches!(
-            cause,
-            HostError::Rpc { status, .. } if status.code() == tonic::Code::FailedPrecondition
-        )
+        // device, so the transfer finds no connected link and the host reports the lost VCI
+        // (ADR-294).
+        matches!(cause, HostError::VciLost)
     });
     let before = env.probe();
     assert_eq!(
@@ -1521,10 +1518,7 @@ fn a_next_run_with_the_vci_still_unplugged_keeps_the_job_for_a_later_run() {
     );
     assert!(env.commands_applied(), "the disconnect should be applied");
     let first_attempt = assert_interrupted_at_the_next_block(&env, &spec, &run, |cause| {
-        matches!(
-            cause,
-            HostError::Rpc { status, .. } if status.code() == tonic::Code::FailedPrecondition
-        )
+        matches!(cause, HostError::VciLost)
     });
     let before = env.probe();
     let journal_before =

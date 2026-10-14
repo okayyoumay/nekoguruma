@@ -285,11 +285,12 @@ pub async fn run_program(
 }
 
 /// [`run_program`] that also writes the write-job journal for a program with a flash recovery
-/// plan (ADR-244, ADR-252): the journal of `journal.key` is created in `journal.dir` once the
-/// link is open and the policy allows the program, before anything is sent to the ECU, and the
-/// runner commits to it at the plan's boundaries (`journaling`). A commit that fails ends the
-/// job before the request it guards is sent. A program without a plan keeps no journal and
-/// creates no file. `guards` are taken and returned as for [`run_program`]; a program with a
+/// plan (ADR-244, ADR-252), or with a section marked `RecoveryRequired` (ADR-293): the journal of
+/// `journal.key` is created in `journal.dir` once the link is open and the policy allows the
+/// program, before anything is sent to the ECU, and the runner commits to it at the plan's
+/// boundaries and ahead of each pass through such a section (`journaling`). A commit that fails
+/// ends the job before the request it guards is sent. A program with neither keeps no journal
+/// and creates no file. `guards` are taken and returned as for [`run_program`]; a program with a
 /// plan writes, so they must hold the reprogramming slot (`JobGuards::take`).
 pub async fn run_program_journaled(
     client: WorkerClient,
@@ -604,7 +605,7 @@ fn run_job(
     // behind; a resumed job opened its journal before the link (above), and opening it only cuts
     // a torn last frame, which any later open would cut as well.
     let result = std::panic::catch_unwind(AssertUnwindSafe(|| match journal {
-        Some(JournalMode::Create(setup)) if !program.flash.is_empty() => {
+        Some(JournalMode::Create(setup)) if restart::keeps_journal(program) => {
             let mut journal = JobJournal::create(setup)?;
             run_on(program, &mut host, limits, cancelled, Some(&mut journal))
         }
@@ -888,7 +889,7 @@ where
         // final, nothing is sent and no resume counted (ADR-288).
         RestartDecision::Stopped(stopped) => Err(stopped_error(&stopped)),
         RestartDecision::PlainStart => match opened {
-            Ok(journal) if !program.flash.is_empty() => {
+            Ok(journal) if restart::keeps_journal(program) => {
                 let first_step = restart::next_steps(journal.state());
                 let mut journal = JobJournal::new(journal, sources);
                 run_on_from(
@@ -901,7 +902,8 @@ where
                 )
                 .map(Restarted::Finished)
             }
-            // A program without a plan keeps no journal (ADR-252 item 7).
+            // A program with neither a plan nor a `RecoveryRequired` section keeps no journal
+            // (ADR-252 item 7, ADR-293).
             _ => run_on(program, host, limits, cancelled, None::<&mut JobJournal<S>>)
                 .map(Restarted::Finished),
         },
@@ -10339,6 +10341,98 @@ mod tests {
             .map(|entry| entry.unwrap().file_name())
             .collect();
         assert_eq!(entries, ["locks"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A program with no flash recovery plan: routine 0xFF01 at 1, then 0xFF02 at 4 in a section
+    /// marked `RecoveryRequired` (pcs 3 to 5), then 0xFF03 at 7.
+    fn recovery_section_without_plan() -> Program {
+        let routine = |routine| {
+            [
+                Op::PushBytes(0),
+                Op::RoutineControl { routine, sub: 1 },
+                Op::Pop,
+            ]
+        };
+        let mut program = program([routine(0xFF01), routine(0xFF02), routine(0xFF03)].concat());
+        program.sections.push(diag_ir::Section {
+            start_pc: 3,
+            end_pc: 6,
+            interruptible: diag_ir::Interruptible::RecoveryRequired,
+            idempotency: diag_ir::Idempotency::Unsafe,
+            expected_millis: 0,
+        });
+        program.validate().unwrap();
+        program
+    }
+
+    /// The done-when case of ADR-293: a program with a `RecoveryRequired` section and no plan
+    /// keeps a journal, so a crash in the section, or after it, is not resumed as a plain start
+    /// that would repeat it. A missing journal needs on-site intervention as for a plan. A crash
+    /// before the section is resumed plainly, and that run journals the section's intent too.
+    #[test]
+    fn a_recovery_required_section_without_a_plan_keeps_a_journal() {
+        let program = recovery_section_without_plan();
+        assert!(crate::restart::keeps_journal(&program));
+        assert!(!crate::restart::keeps_journal(&program_without_plan()));
+        let refused = |result: &Result<VmState, JobError>| {
+            matches!(
+                result,
+                Err(JobError::OnSiteInterventionRequired(
+                    OnSiteReason::RecoveryRequiredSection { section: 0, at }
+                )) if at.pc == 4
+            )
+        };
+
+        // In the section, and after it: refused with nothing sent.
+        for (tag, routine) in [("in", 0xFF02), ("after", 0xFF03)] {
+            let dir = journal_dir(&format!("no-plan-section-{tag}"));
+            let result = first_run(&program, &dir, JobLimits::default(), |host| {
+                host.lose_routine = Some(routine);
+            });
+            assert!(matches!(result, Err(JobError::Host { .. })), "{result:?}");
+            let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+            let result = resume(&program, &dir, &mut host, false);
+            assert!(refused(&result), "{tag}: {result:?}");
+            assert_eq!(host.sent(), []);
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+
+        // No journal: on-site intervention, nothing sent.
+        let dir = journal_dir("no-plan-section-missing");
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        let result = resume(&program, &dir, &mut host, false);
+        assert!(
+            matches!(
+                result,
+                Err(JobError::OnSiteInterventionRequired(
+                    OnSiteReason::MissingJournal
+                ))
+            ),
+            "{result:?}"
+        );
+        assert_eq!(host.sent(), []);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        // Before the section: a plain start that runs the program again and journals the
+        // section's intent, so a crash after it would be refused in turn.
+        let dir = journal_dir("no-plan-section-before");
+        let result = first_run(&program, &dir, JobLimits::default(), |host| {
+            host.lose_routine = Some(0xFF01);
+        });
+        assert!(matches!(result, Err(JobError::Host { .. })), "{result:?}");
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        resume(&program, &dir, &mut host, false).expect("the program runs again");
+        assert_eq!(
+            host.sent(),
+            [
+                Sent::Routine(0xFF01),
+                Sent::Routine(0xFF02),
+                Sent::Routine(0xFF03)
+            ]
+        );
+        let journal = Journal::read(&dir, &job_key()).unwrap();
+        assert_eq!(journal.facts.last_intent.map(|at| at.pc), Some(4));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

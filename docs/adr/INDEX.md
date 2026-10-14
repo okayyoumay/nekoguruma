@@ -241,7 +241,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-249](ADR-249-backlog-loop-iterations-start-from-a-fresh-branch.md) | Backlog Loop Iterations Start from a Fresh Branch at `origin/main` | Accepted | `.claude/skills/backlog-loop` (step 1), `codeql-alerts` |
 | [ADR-250](ADR-250-agent-host-flash-transfer.md) | The Agent Host Implements FlashTransfer with Its Own Block Count | Accepted | `agent` host, policy; `diag-ir` plan validation |
 | [ADR-251](ADR-251-copilot-re-review-only-after-fixes-that-need-it.md) | Copilot Re-Review Only After Fixes That Need It | Accepted | `.claude/skills/pr-review-loop` (Steps 0, 4-5), `.github/copilot-instructions.md`, `CLAUDE.md` |
-| [ADR-252](ADR-252-job-runner-journals-at-plan-boundaries.md) | The Job Runner Journals at the Flash Recovery Plan's Boundaries | Accepted (item 2's open point decided by ADR-253; the step reaching a plan's end records the VM state since ADR-271, a step from inside the plan only since ADR-274; item 6 superseded by ADR-272; item 2 extended by ADR-291: a `RecoveryRequired` section outside the plans gets an intent ahead of its first primitive) | `agent` runner, journaling, inputs |
+| [ADR-252](ADR-252-job-runner-journals-at-plan-boundaries.md) | The Job Runner Journals at the Flash Recovery Plan's Boundaries | Accepted (item 2's open point decided by ADR-253; the step reaching a plan's end records the VM state since ADR-271, a step from inside the plan only since ADR-274; item 6 superseded by ADR-272; item 2 extended by ADR-291: a `RecoveryRequired` section outside the plans gets an intent ahead of its first primitive; item 7 amended by ADR-293: a program with a `RecoveryRequired` section keeps a journal without a plan too) | `agent` runner, journaling, inputs |
 | [ADR-253](ADR-253-restart-classification-and-the-recovery-point-intent.md) | Restart Classification and a Write-Ahead Intent at the Recovery-Required Point | Accepted (item 4's wiring into the runner decided by ADR-255; item 3's newest state includes the run start since ADR-272; item 3's entry-state read-back follows ADR-274 since the end state exists; item 3's step limit applies per run since ADR-287; item 1's intent is also written ahead of a `RecoveryRequired` section outside the plans since ADR-291) | `agent` restart, journaling, journal |
 | [ADR-254](ADR-254-starlark-for-proprietary-procedures.md) | Starlark Replaces JavaScript as the Proprietary Procedure Language | Accepted (`diag.fail` has an instruction since ADR-280) | `diag-frontend` subset spec, design 8.4, `ir.fbs` `source_format` |
 | [ADR-255](ADR-255-restart-entry-in-the-job-runner.md) | The Restart Entry in the Job Runner | Accepted (item 5's "locks not taken" and the duplicate-resume consequence superseded by ADR-256; item 5's "nothing sent to the ECU" superseded by ADR-261; item 5's teardown that does not run superseded by ADR-264; item 3 amended and the stale-entry-state consequence closed by ADR-272; item 5's ending in `RestartOrderUnavailable` superseded by ADR-273 item 4 and then ADR-276, which goes on with the erase; the step-limit consequence superseded by ADR-287, which counts each run's own steps) | `agent` runner, restart, journaling |
@@ -280,7 +280,8 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-288](ADR-288-a-stopped-run-is-journaled-as-terminal.md) | A Run Stopped on the Step Limit or a VM Error Is Journaled as a Terminal Record | Accepted | `agent` journal, restart, runner; `diag-ir` `VmError`; design 5.6 |
 | [ADR-289](ADR-289-a-lost-vci-ends-the-primitive-at-once.md) | A Lost VCI Ends the Pending Primitive at Once, as `HostError::VciLost` | Accepted | `agent` host; design 5.6 / 8.2.5 |
 | [ADR-290](ADR-290-restart-on-site-endings-stay-re-resumable.md) | The Restart's On-Site Endings after the Resume Count Stay Re-Resumable | Accepted | `agent` restart; design 5.6 / 8.2.5 |
-| [ADR-291](ADR-291-recovery-required-sections-outside-the-plans-are-written-ahead.md) | A `RecoveryRequired` Section outside the Flash Recovery Plans Is Written Ahead | Accepted | `agent` journaling, restart; design 8.2.5 / 8.10.1 |
+| [ADR-291](ADR-291-recovery-required-sections-outside-the-plans-are-written-ahead.md) | A `RecoveryRequired` Section outside the Flash Recovery Plans Is Written Ahead | Accepted (the consequence on programs without a flash recovery plan superseded by ADR-293: such a program with a `RecoveryRequired` section keeps a journal) | `agent` journaling, restart; design 8.2.5 / 8.10.1 |
+| [ADR-293](ADR-293-a-recovery-required-section-keeps-a-journal-without-a-plan.md) | A `RecoveryRequired` Section Keeps a Journal without a Flash Recovery Plan | Accepted | `agent` runner, restart; design 8.2.5 / 8.10.1 |
 | [ADR-292](ADR-292-a-crashed-sim-vci-fails-every-call.md) | A Crashed Simulated VCI Fails Every Call with `ERR_FAILED` | Accepted | `sim-vci`, `j2534-0404-service` tests; design 13.4 |
 
 ## Status Legend
@@ -639,7 +640,7 @@ the predecessor repository these ADRs came from.
 - ADR-245 (items 4 and 6 amended by ADR-250)
 - ADR-247 (Decision item 4's refusal of `FlashTransfer` superseded by ADR-250; its reason for refusing `SecurityAccess` replaced by ADR-259)
 - ADR-250
-- ADR-252 (item 2's open point decided by ADR-253; the step reaching a plan's end records the VM state since ADR-271, a step from inside the plan only since ADR-274; item 6 superseded by ADR-272; item 2 extended by ADR-291: a `RecoveryRequired` section outside the plans gets an intent ahead of its first primitive)
+- ADR-252 (item 2's open point decided by ADR-253; the step reaching a plan's end records the VM state since ADR-271, a step from inside the plan only since ADR-274; item 6 superseded by ADR-272; item 2 extended by ADR-291: a `RecoveryRequired` section outside the plans gets an intent ahead of its first primitive; item 7 amended by ADR-293: a program with a `RecoveryRequired` section keeps a journal without a plan too)
 - ADR-253 (item 4's wiring into the runner decided by ADR-255; item 3's newest state includes the run start since ADR-272; item 3's entry-state read-back follows ADR-274 since the end state exists; item 3's step limit applies per run since ADR-287; item 1's intent is also written ahead of a `RecoveryRequired` section outside the plans since ADR-291)
 - ADR-255 (item 5's "locks not taken" and the duplicate-resume consequence superseded by ADR-256; item 5's "nothing sent to the ECU" superseded by ADR-261; item 5's teardown that does not run superseded by ADR-264; item 3 amended and the stale-entry-state consequence closed by ADR-272; item 5's ending in `RestartOrderUnavailable` superseded by ADR-273 item 4 and then ADR-276, which goes on with the erase; the step-limit consequence superseded by ADR-287, which counts each run's own steps)
 - ADR-256 (the first-run consequence and item 1's write access to lock files superseded by ADR-257; the failed-close consequence superseded by ADR-258; item 6's per-vehicle lock settled by ADR-262)
@@ -665,7 +666,8 @@ the predecessor repository these ADRs came from.
 - ADR-288
 - ADR-289
 - ADR-290
-- ADR-291
+- ADR-291 (the consequence on programs without a flash recovery plan superseded by ADR-293: such a program with a `RecoveryRequired` section keeps a journal)
+- ADR-293
 
 ### Diagnostic IR
 - ADR-233 (item 3's `VmState` fields removed by ADR-245; `Op::Fail` and `StepOutcome::Failed` appended by ADR-280)

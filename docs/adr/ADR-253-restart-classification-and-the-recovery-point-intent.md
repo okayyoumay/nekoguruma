@@ -1,7 +1,7 @@
 # ADR-253: Restart Classification and a Write-Ahead Intent at the Recovery-Required Point
 
 **Date:** 2026-10-09
-**Status:** Accepted (item 4's wiring into the runner decided by ADR-255; item 3's newest state includes the run start since ADR-272; item 3's entry-state read-back follows ADR-274 since the end state exists; item 3's step limit applies per run since ADR-287)
+**Status:** Accepted (item 4's wiring into the runner decided by ADR-255; item 3's newest state includes the run start since ADR-272; item 3's entry-state read-back follows ADR-274 since the end state exists; item 3's step limit applies per run since ADR-287; item 1's intent is also written ahead of a `RecoveryRequired` section outside the plans since ADR-291)
 **Affects:** `agent` (`src/restart.rs`, `src/journaling.rs`, `src/journal.rs`), ADR-244 (record set), ADR-252 item 2
 
 ## Context

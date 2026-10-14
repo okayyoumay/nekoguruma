@@ -1291,7 +1291,10 @@ fn effective_point(program: &Program, facts: &RecoveryFacts, at: StepRef) -> Ste
 /// Why an interruption at `at` rules out a restart, if it does: at or past a plan's
 /// recovery-required point and before its end, or inside a section marked `RecoveryRequired`.
 /// Sections are found only where the journal can place a point: inside a plan, on the step into
-/// a plan's entry, or at a completed plan's end.
+/// a plan's entry, at a completed plan's end, or at the intent ahead of the first primitive of a
+/// pass through a `RecoveryRequired` section outside every plan (ADR-291). Such an intent stays
+/// the point until a later record moves it, so a run that left the section and ended before the
+/// next record also refuses: a plain start would repeat the section from the program's start.
 fn recovery_required(program: &Program, at: StepRef) -> Option<OnSiteReason> {
     for plan in &program.flash {
         if let RecoveryRequired::FromPc(from) = plan.recovery_required

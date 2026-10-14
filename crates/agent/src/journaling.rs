@@ -14,7 +14,9 @@
 //! - at `erase_pc`: the transfer-start marker;
 //! - at `transfer_exit_pc`: the RequestTransferExit marker;
 //! - at the first diagnostic primitive at or past a plan's recovery-required point that is
-//!   neither of those, once per pass through the plan: a request intent (ADR-253).
+//!   neither of those, once per pass through the plan: a request intent (ADR-253);
+//! - at the first diagnostic primitive of a pass through a section marked `RecoveryRequired`
+//!   outside every plan: a request intent (ADR-291).
 //!
 //! When an instruction completes ([`JobJournal::completed`]):
 //! - a `FlashTransfer`: the block, by the host's running index;
@@ -39,7 +41,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use diag_ir::{
-    DiagHost, FlashRecovery, IdentityKind, NoApplication, Op, Program, RecoveryRequired, VmState,
+    DiagHost, FlashRecovery, IdentityKind, Interruptible, NoApplication, Op, Program,
+    RecoveryRequired, VmState,
 };
 
 use crate::host::{HostError, TransferProgress};
@@ -77,6 +80,9 @@ pub(crate) struct JobJournal<S = FileStore> {
     /// Stages whose recovery-required point the journal already places the interruption at or
     /// past (an intent, or the erase or RequestTransferExit marker at or past it).
     past_recovery_point: Vec<u32>,
+    /// Execution is in a pass through a `RecoveryRequired` section outside every plan whose
+    /// intent the journal holds (ADR-291).
+    in_recovery_section: bool,
 }
 
 impl JobJournal {
@@ -104,6 +110,7 @@ impl<S: Store> JobJournal<S> {
             sources,
             identity_read: false,
             past_recovery_point: Vec::new(),
+            in_recovery_section: false,
         }
     }
 
@@ -202,23 +209,36 @@ impl<S: Store> JobJournal<S> {
                 && !self.past_recovery_point.contains(&plan.stage)
             {
                 let marked = pc == b.erase_pc || pc == b.transfer_exit_pc;
-                if !marked
-                    && program
-                        .code
-                        .get(pc as usize)
-                        .is_some_and(Op::is_diagnostic_primitive)
-                {
-                    // A cancelled job sends nothing more, so it leaves no intent either.
-                    if cancelled.load(Ordering::Relaxed) {
-                        return Err(JobError::Cancelled);
-                    }
-                    self.journal.commit_intent(at)?;
+                if !marked && is_primitive(program, pc) {
+                    self.intent(at, cancelled)?;
                 }
                 if marked || self.journal.state().facts.last_intent == Some(at) {
                     self.past_recovery_point.push(plan.stage);
                 }
             }
         }
+        // The first primitive of a pass through a `RecoveryRequired` section outside every plan
+        // is written ahead too, so a crash before its response places the interruption in the
+        // section (ADR-291). Inside a plan, the validator allows such a section only from the
+        // plan's recovery-required point (ADR-245 item 3), which the loop above covers.
+        if in_section_outside_plans(program, pc) {
+            if !self.in_recovery_section && is_primitive(program, pc) {
+                self.intent(at, cancelled)?;
+                self.in_recovery_section = true;
+            }
+        } else {
+            self.in_recovery_section = false;
+        }
+        Ok(())
+    }
+
+    /// Commits a request intent at `at`, before the request there is sent (ADR-253).
+    fn intent(&mut self, at: StepRef, cancelled: &AtomicBool) -> Result<(), JobError> {
+        // A cancelled job sends nothing more, so it leaves no intent either.
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(JobError::Cancelled);
+        }
+        self.journal.commit_intent(at)?;
         Ok(())
     }
 
@@ -332,6 +352,28 @@ impl<S: Store> JobJournal<S> {
         }
         Ok(())
     }
+}
+
+/// Whether the instruction at `pc` is a diagnostic primitive.
+fn is_primitive(program: &Program, pc: u32) -> bool {
+    program
+        .code
+        .get(pc as usize)
+        .is_some_and(Op::is_diagnostic_primitive)
+}
+
+/// Whether `pc` lies in a section marked `RecoveryRequired` and outside every plan's range
+/// (`entry_pc` up to, not including, `post_transfer_end_pc`).
+fn in_section_outside_plans(program: &Program, pc: u32) -> bool {
+    let in_plan = program
+        .flash
+        .iter()
+        .any(|plan| (plan.boundaries.entry_pc..plan.boundaries.post_transfer_end_pc).contains(&pc));
+    !in_plan
+        && program.sections.iter().any(|section| {
+            matches!(section.interruptible, Interruptible::RecoveryRequired)
+                && (section.start_pc..section.end_pc).contains(&pc)
+        })
 }
 
 /// The journal's block number for the host's running index of a confirmed block (ADR-250): a

@@ -2743,6 +2743,133 @@ mod tests {
         );
     }
 
+    /// [`flash_program`] with three routines before the plan's entry: 0xFF02 at 4 and 0xFF03 at
+    /// 7 in a section marked `RecoveryRequired` (pcs 3 to 8), and 0xFF04 at 10 after it.
+    fn program_with_recovery_section() -> Program {
+        let routine = |routine| {
+            [
+                Op::PushBytes(0),
+                Op::RoutineControl { routine, sub: 1 },
+                Op::Pop,
+            ]
+        };
+        let mut program = flash_program_around(
+            [routine(0xFF02), routine(0xFF03), routine(0xFF04)].concat(),
+            Vec::new(),
+        );
+        program.sections.push(diag_ir::Section {
+            start_pc: 3,
+            end_pc: 9,
+            interruptible: diag_ir::Interruptible::RecoveryRequired,
+            idempotency: diag_ir::Idempotency::Unsafe,
+            expected_millis: 0,
+        });
+        program.validate().unwrap();
+        program
+    }
+
+    /// The done-when case of ADR-291: a lost response in a `RecoveryRequired` section before the
+    /// plan's entry leaves a journal whose intent places the interruption in the section, so the
+    /// job needs on-site intervention instead of a plain start that would repeat the section.
+    /// The pass through the section writes one intent, before its first primitive; a record
+    /// after it, such as the transfer-start marker, moves the point out again.
+    #[test]
+    fn a_lost_response_in_a_recovery_required_section_needs_on_site_intervention() {
+        use crate::restart::{OnSiteReason, RestartDecision, classify};
+
+        let program = program_with_recovery_section();
+        let run = |lose: Option<u16>| {
+            let commits = Rc::new(Cell::new(0));
+            let mut host = FlashHost::new(Rc::clone(&commits));
+            host.lose_routine = lose;
+            let mut journal = counting_journal(&commits, None);
+            let result = run_on(
+                &program,
+                &mut host,
+                JobLimits::default(),
+                &AtomicBool::new(false),
+                Some(&mut journal),
+            );
+            (result, host, commits.get(), journal)
+        };
+        let intent_at = |journal: &JobJournal<CountingStore>| {
+            journal.journal().state().facts.last_intent.map(|at| at.pc)
+        };
+        let refused = |journal: &JobJournal<CountingStore>| {
+            matches!(
+                classify(&program, Ok(journal.journal().state())),
+                RestartDecision::OnSiteInterventionRequired(
+                    OnSiteReason::RecoveryRequiredSection {
+                        section: 0,
+                        at: StepRef { pc: 4, .. },
+                    }
+                )
+            )
+        };
+
+        // A whole run: one intent, at the section's first primitive, committed right before it.
+        let (result, host, commits, journal) = run(None);
+        result.unwrap();
+        assert_eq!(intent_at(&journal), Some(4));
+        let (_, before) = host
+            .log
+            .iter()
+            .find(|(sent, _)| *sent == Sent::Routine(0xFF02))
+            .unwrap();
+        let (_, after) = host
+            .log
+            .iter()
+            .find(|(sent, _)| *sent == Sent::Routine(0xFF03))
+            .unwrap();
+        assert_eq!(before, after, "no second intent in the same pass");
+        let (_, baseline, _) = {
+            let mut plain = program.clone();
+            plain.sections.clear();
+            let commits = Rc::new(Cell::new(0));
+            let mut host = FlashHost::new(Rc::clone(&commits));
+            let mut journal = counting_journal(&commits, None);
+            run_on(
+                &plain,
+                &mut host,
+                JobLimits::default(),
+                &AtomicBool::new(false),
+                Some(&mut journal),
+            )
+            .unwrap();
+            ((), commits.get(), intent_at(&journal))
+        };
+        assert_eq!(commits, baseline + 1);
+
+        // The first or the second routine of the section loses its response.
+        for (routine, pc) in [(0xFF02, 4), (0xFF03, 7)] {
+            let (result, _, _, journal) = run(Some(routine));
+            assert!(
+                matches!(result, Err(JobError::Host { pc: at, .. }) if at == pc),
+                "{result:?}"
+            );
+            assert!(refused(&journal), "routine {routine:#x}");
+        }
+        // After the section, before the next record: the point is still the section's intent,
+        // and a plain start would repeat the section.
+        let (result, _, _, journal) = run(Some(0xFF04));
+        assert!(
+            matches!(result, Err(JobError::Host { pc: 10, .. })),
+            "{result:?}"
+        );
+        assert!(refused(&journal));
+        // The erase's marker comes after the intent, so the interrupted transfer restarts.
+        let (result, _, _, journal) = run(Some(0xFF00));
+        assert!(matches!(result, Err(JobError::Host { .. })), "{result:?}");
+        assert!(
+            matches!(
+                classify(&program, Ok(journal.journal().state())),
+                RestartDecision::Restart(_)
+            ),
+            "{:?}",
+            classify(&program, Ok(journal.journal().state()))
+        );
+    }
+
     /// A post-transfer step is recorded, and the completion is committed with the step that
     /// reaches the end, even when the job stops right there (here at its step limit).
     #[test]
@@ -8377,8 +8504,10 @@ mod tests {
     }
 
     /// End to end: a routine after the plan in a `RecoveryRequired` section is refused after the
-    /// verification. A section that starts at the plan's end itself is refused earlier, by the
-    /// classification, with nothing sent at all.
+    /// verification when the journal places the interruption at the plan's end, as a crash after
+    /// the plan and before the section's intent leaves it. A crash with the routine in flight
+    /// leaves that intent (ADR-291), and so does a crash in a section that starts at the plan's end
+    /// itself: both are refused earlier, by the classification, with nothing sent at all.
     #[test]
     fn a_recovery_required_section_after_the_plan_ends_in_on_site_intervention() {
         let base = safe_outside_the_plan(completed_path_program());
@@ -8397,7 +8526,9 @@ mod tests {
         };
         let after_end = with_section(end + 1);
         let dir = journal_dir("continue-recovery-required");
-        first_run_intending(&after_end, &dir, lose_after_plan);
+        // The journal of a crash before the section: `base` journals the same records up to the
+        // plan's end and none for the routine after it.
+        first_run_intending(&base, &dir, lose_after_plan);
         let (result, host) = restart_intending(&after_end, &dir, |host| {
             host.software_version = Some(b"SW02".to_vec());
         });
@@ -8409,6 +8540,21 @@ mod tests {
             "{result:?}"
         );
         assert_eq!(full_log(&host), verification_reads());
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        let dir = journal_dir("continue-recovery-required-in-flight");
+        first_run_intending(&after_end, &dir, lose_after_plan);
+        let (result, host) = restart_intending(&after_end, &dir, |host| {
+            host.software_version = Some(b"SW02".to_vec());
+        });
+        assert!(
+            matches!(
+                reason_of(&result),
+                OnSiteReason::RecoveryRequiredSection { at, .. } if at.pc == end + 1
+            ),
+            "{result:?}"
+        );
+        assert!(full_log(&host).is_empty(), "{:?}", full_log(&host));
         std::fs::remove_dir_all(&dir).unwrap();
 
         let at_end = with_section(end);

@@ -143,7 +143,10 @@ instruction runs, it commits:
 - at RequestTransferExit: its marker;
 - at the first diagnostic primitive at or past a plan's recovery-required point that is neither
   of those: a request intent, so a crash before its response still places the interruption
-  there (ADR-253).
+  there (ADR-253);
+- at the first diagnostic primitive of a pass through a section marked `RecoveryRequired`
+  outside every plan's range: a request intent (ADR-291). A pass ends when execution arrives at
+  an instruction outside such a section.
 
 When an instruction completes, it commits the block of a `FlashTransfer`, under the host's
 running index (`TransferProgress`, ADR-250); a step record for every diagnostic primitive inside
@@ -199,7 +202,7 @@ step count, of the last completed step, the two transfer markers and the last re
 | unreadable (corrupt, unknown format version, another job, I/O) | `OnSiteInterventionRequired` |
 | a procedure-failure record (ADR-280), checked before every row below | `Failed`, with the record's position, code and detail |
 | an identity-abort record (ADR-286), checked right after the procedure-failure record | `Aborted`, with the `IdentityKind`, whatever the transfer state |
-| interruption point at or past a plan's recovery-required point and before its end, or inside a `RecoveryRequired` section the journal can place it in (inside a plan, on the step into a plan's entry, or at a completed plan's end); a point no later than the last post-transfer step of a completed transfer counts as at that plan's end | `OnSiteInterventionRequired` |
+| interruption point at or past a plan's recovery-required point and before its end, or inside a `RecoveryRequired` section the journal can place it in (inside a plan, on the step into a plan's entry, at a completed plan's end, or at a section's intent outside the plans, which stays the point until a later record moves it, ADR-291); a point no later than the last post-transfer step of a completed transfer counts as at that plan's end | `OnSiteInterventionRequired` |
 | no transfer-start marker | plain start |
 | transfer-start marker | `Restart`, for the plan of the marker's stage, with the VM state at its entry; `OnSiteInterventionRequired` if that plan never allows a restart |
 

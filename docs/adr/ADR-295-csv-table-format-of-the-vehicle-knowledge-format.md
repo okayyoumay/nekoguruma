@@ -66,7 +66,7 @@ declared service from the SID and the parameter names when it lowers the call.
    parameters are encoded from internal values, and conversions apply only to decoded values. In
    the frontend the constants keep their names: `diag.request(sid, params)`
    selects the service of that SID whose every constant appears in `params` with its value and
-   whose other request fields cover the remaining keys, and exactly one service must match. The
+   whose other request fields are exactly the remaining keys, and exactly one service must match. The
    generated DID services carry a constant named `did`, so `diag.request(0x22, {"did": 0xF190})`
    reads the VIN, as the subset specification's examples already write it. A `params` value for a
    constant's key must be a constant, since the selection happens at ingestion. Two services of one
@@ -86,7 +86,9 @@ declared service from the SID and the parameter names when it lowers the call.
     conversion reports all errors at once, with codes `CSV_*`, and checks every rule `ir.fbs`
     states, so nothing reaches the agent that the IR forbids (8.3).
 12. **Left out of this version:** monitor sets (the converter emits none), `CompuBytecode`,
-    constants that are not leading or sit in a nested layout, a `ref` to a field outside the
+    constants that are not leading or sit in a nested layout, request fields
+    without a single encoding of a procedure's value (shapes, lengths from another field, `zero`
+    and `ff` terminators), a `ref` to a field outside the
     row's own container (a layout reached from several places could not name one field), and a table for a procedure's restart declaration, which
     belongs to the procedure part (ADR-245) and gets its syntax with the Starlark subset.
 

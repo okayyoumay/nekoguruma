@@ -164,8 +164,13 @@ Variant identification (design 8.9.1), one `VariantPattern` per row, in row orde
 
 ### 4.4 `texts.csv` and `units.csv`
 
-Text and unit ids are resolved on the server (design 9.2). The tables give each id a key that
-other tables refer to, and a default text the server can seed its message table with.
+Text and unit ids are resolved on the server (design 9.2), so they are ids of the server's
+message and unit tables, shared by every definition, not numbers local to one directory. The
+tables give each id a key that other tables refer to, and its default text or symbol. Besides the
+documents, the conversion outputs these pairs as a text catalog (id, default text) and a unit
+catalog (id, symbol), sorted by id; an import that finds an id already registered with a
+different text or symbol is a conflict for the server to report, not something the converter can
+see.
 
 `texts.csv`:
 
@@ -332,7 +337,8 @@ their ids (a field id names the definition, not the occurrence; `ir.fbs`, `Field
 The deprecated `FlashSession` fields are left at their schema defaults. The recovery plan and the
 preconditions belong to the procedure part (ADR-245) and have no table here.
 
-`flash_segments.csv`, appended to the named session's `segments` in row order:
+`flash_segments.csv`, appended to the named session's `segments` in row order. It has no
+`variants` column: a segment belongs to exactly the variants of its session.
 
 | Column | Type | Required | Meaning |
 |---|---|---|---|
@@ -428,7 +434,8 @@ services, the identifier it echoes (ADR-235 item 3).
 Constants also identify the service a Starlark call means (design 8.4, subset spec 3.1). For
 `diag.request(sid, params)` the frontend takes the services of the variant with that SID whose
 every request constant appears in `params` with the same value and whose other request fields
-include every other key of `params`; exactly one service must match. The generated DID services
+are exactly the other keys of `params`, no more and no fewer, so every parameter has a value;
+exactly one service must match. The generated DID services
 have one constant named `did`, so `diag.request(0x22, {"did": 0xF190})` selects `vin.read` in the
 example. `diag.routine(rid, sub, params)` selects the routine service whose `rid` and `sub`
 constants have those values. Service selection happens at ingestion, so a `params` value for a
@@ -441,8 +448,9 @@ never be told apart and are rejected.
 
 A field with `shape` is a nested layout (ADR-242). `type`, `bits`, `length` and its columns,
 `conversion` and `unit` must be empty, and the field must start at a byte edge. The `ir.fbs` rules
-for each shape apply, including where it may appear: in a request only `group`, `repeat` with
-`count` `end`, and `select` keyed by a field the procedure supplies.
+for each shape apply. The IR also allows some shapes in a request, but this version defines no
+value a procedure could supply for them, so a shaped field in a request is rejected
+(`CSV_UNSUPPORTED`); see 5.5.
 
 - `group`: one occurrence of `layout`.
 - `repeat`: `layout` repeated; its count is a row of `repeats.csv` for the field.
@@ -471,12 +479,31 @@ bytes read as a big-endian integer (`ir.fbs`, `Repeat`), so this one form covers
 |---|---|---|---|
 | `container`, `field` | as in `fields.csv` | yes | The `select` field |
 | `case` | name | yes | `SelectCase.short_name`, unique per field |
-| `lower` | integer | no | Inclusive, compared with the key's internal value (ADR-242); empty together with `upper` makes the row the default case |
-| `upper` | integer | no | Default: the same as `lower` |
+| `lower` | integer | no | Inclusive, compared with the key's internal value (ADR-242); empty together with `upper` makes the row the default case. For an `int` key, -2^63 to 2^63 - 1; for any other key type, 0 to 2^64 - 1, stored bit for bit in the IR's `int64` (as for byte and string keys, `ir.fbs` `Select`) |
+| `upper` | integer | no | Default: the same as `lower`; same range as `lower` |
 | `layout` | layout name | no | Empty: the key is valid but carries no data |
 
 At most one default row per field (`has_default`, `default_layout_id`). Overlapping cases are
 rejected.
+
+### 5.5 Request Values
+
+A procedure supplies each non-constant request field as one value, which the Starlark lowering
+encodes at the field's position. The fields of a container that is sent (`request:`, a routine's
+`request` and the record of a DID with a write service) are limited to what has one encoding:
+
+| Field | Value | Encoding |
+|---|---|---|
+| `fixed` `uint`, `int`, `bcd` | `int` | `bits` wide, in `byte_order`; BCD as one decimal digit per 4 bits |
+| `fixed` `float` | `float` | IEEE 754, `bits` 32 or 64 |
+| `fixed` `bytes`, `ascii`, `utf8`, `unicode2` | `bytes` or `str` | Exactly `bits` / 8 bytes |
+| `leading` | `bytes` or `str` | The length prefix, then the value |
+| `terminated` with `terminator` `end` | `bytes` or `str` | The value as it is; the field must be the container's last |
+
+`str` values are encoded as UTF-8 (`ascii` accepts only ASCII) or, for `unicode2`, as 2-byte
+characters in `byte_order`. Any other field in such a container (a `field` length, a `zero` or
+`ff` terminator, a shape) is rejected (`CSV_UNSUPPORTED`). A constant value that does not fit
+its field is rejected at ingestion; a run-time value that does not fit is an error at run time.
 
 ---
 
@@ -490,10 +517,10 @@ rejected.
   follow row order (section 3) and arrays follow row order.
 - **`source_digest`.** The lowercase hexadecimal SHA-256 over the table files of section 1 that
   are present and the procedure file the document carries, if any, all directly in the
-  definition directory and nothing else. File names in the definition directory are limited to
-  the ASCII characters `A-Z`, `a-z`, `0-9`, `_`, `-` and `.`, so the name bytes are the same on
-  every platform; a `.csv` or `.star` file with any other name is rejected
-  (`CSV_UNKNOWN_FILE`). The files are taken in byte order of their names; each contributes its
+  definition directory and nothing else. The names of the `.csv` and `.star` files are limited
+  to the ASCII characters `A-Z`, `a-z`, `0-9`, `_`, `-` and `.`, so the name bytes are the same
+  on every platform; a `.csv` or `.star` file with any other name is rejected
+  (`CSV_UNKNOWN_FILE`). Other files are not read and their names are not checked. The files are taken in byte order of their names; each contributes its
   name, a zero byte, its length as a big-endian 64-bit integer and its contents. The digest covers
   the bytes as stored, so a change of line ends alone changes it, and with it the document.
 - **`schema_version`** is the IR schema version the converter writes.
@@ -556,7 +583,7 @@ does not have:
 - `routines.csv`: eraseMemory, behind security access, and checkProgrammingDependencies, with its
   result as a text table; both start only, in the programming session.
 - `dtcs.csv`: two DTCs sharing the `dtcStatus` layout, whose eight one-bit fields are the bits
-  of the DTC status byte (ISO 14229-1 (2026) Annex D), named in lower camel case.
+  of the DTC status byte (ISO 14229-1 (2026) Annex D), under names of the example's own.
 - `flash_sessions.csv` and `flash_segments.csv`: one flash session with one segment.
 
 A row of `fields.csv` from it, the VIN in its data record:

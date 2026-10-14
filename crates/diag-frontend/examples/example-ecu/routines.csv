@@ -1,0 +1,2 @@
+name,rid,start,stop,results,session,p2_star_ms
+checkProgrammingDependencies,0xFF01,yes,no,no,0x02,10000

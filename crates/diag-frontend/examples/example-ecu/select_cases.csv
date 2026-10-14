@@ -1,0 +1,4 @@
+container,field,case,lower,upper,layout
+did:lastResetReason,details,powerOn,0x01,,
+did:lastResetReason,details,watchdog,0x02,,watchdogReset
+did:lastResetReason,details,software,0x03,0x0F,

@@ -1,0 +1,5 @@
+name,sid
+defaultSession,0x10
+extendedSession,0x10
+programmingSession,0x10
+readDtcByStatusMask,0x19

@@ -1,0 +1,14 @@
+key,id,text
+session.default,1,Default session
+session.programming,2,Programming session
+session.extended,3,Extended session
+check.correct,4,Image correct
+check.incorrect,5,Image incorrect
+value.unknown,6,Unknown value
+nrc.subFunctionNotSupported,10,Sub-function not supported
+nrc.conditionsNotCorrect,11,Conditions not correct
+nrc.requestOutOfRange,12,Request out of range
+nrc.securityAccessDenied,13,Security access denied
+nrc.requestSequenceError,14,Request sequence error
+dtc.supplyVoltageLow,20,Supply voltage low
+dtc.lostCommunication,21,Lost communication with the engine controller

@@ -1,0 +1,6 @@
+service,nrc,text,retryable
+,0x12,nrc.subFunctionNotSupported,no
+,0x22,nrc.conditionsNotCorrect,no
+,0x31,nrc.requestOutOfRange,no
+,0x33,nrc.securityAccessDenied,no
+checkProgrammingDependencies.start,0x24,nrc.requestSequenceError,no

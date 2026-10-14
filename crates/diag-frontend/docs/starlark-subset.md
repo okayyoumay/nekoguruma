@@ -211,6 +211,9 @@ A dict with fixed keys:
 
 The keys of `fields` are `Field.short_name` from the IR declaration part. They are defined on
 the CSV table side, so a `fields` key is checked against the declaration part at import time.
+Which declared service a `diag.request` or `diag.routine` call means is found from its SID or
+routine identifier and the constant fields of the request (`csv-tables.md` 5.3); constants are
+part of the message prefix, so they are not keys of `fields`.
 
 ---
 

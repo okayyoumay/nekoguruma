@@ -1,0 +1,532 @@
+# CSV Table Format (CSV -> IR Declaration Part)
+
+Corresponds to design document 8.4. Defines the CSV tables of the proprietary vehicle-knowledge
+format (CSV tables + Starlark) and how `diag-frontend` converts them into the IR declaration part
+(`crates/diag-ir/schema/ir.fbs`). ADR-295 records the decisions behind the format. The procedure
+part is written in Starlark (`starlark-subset.md`).
+
+An example definition of one ECU is in `crates/diag-frontend/examples/example-ecu/`. Every table
+below has rows there, and the examples in this document are taken from it.
+
+---
+
+## 1. Definition Directory
+
+One ECU is defined by one directory. Its tables are the CSV files below, each with a fixed name.
+A table that is absent is empty. A `.csv` file with any other name is rejected
+(`CSV_UNKNOWN_FILE`). Files that are not `.csv`, such as the Starlark procedure files and a
+`README`, are not tables and are ignored by the table conversion.
+
+| File | Required | Section | IR target |
+|---|---|---|---|
+| `variants.csv` | yes | 4.1 | `EcuVariant` (one `EcuDocument` per row) |
+| `variant_patterns.csv` | no | 4.2 | `EcuVariant.patterns` |
+| `protocols.csv` | yes | 4.3 | `EcuVariant.protocols` |
+| `comparams.csv` | no | 4.3 | `Protocol.params` |
+| `texts.csv` | no | 4.4 | text ids (`text_id`, `message_id`) |
+| `units.csv` | no | 4.4 | `unit_id` |
+| `conversions.csv` | no | 4.5 | `Compu` |
+| `conversion_scales.csv` | no | 4.5 | `Compu` arrays |
+| `services.csv` | no | 4.6 | `Service` |
+| `dids.csv` | no | 4.7 | generated `Service`s (ReadDataByIdentifier, WriteDataByIdentifier) |
+| `routines.csv` | no | 4.8 | generated `Service`s (RoutineControl) |
+| `nrcs.csv` | no | 4.9 | `Service.negatives` |
+| `layouts.csv` | no | 4.10 | `Layout` |
+| `fields.csv` | no | 5 | `Field`, `Request.prefix`, `PositiveResponse.prefix` |
+| `repeats.csv` | no | 5.4 | `Repeat` |
+| `select_cases.csv` | no | 5.4 | `Select`, `SelectCase` |
+| `dtcs.csv` | no | 4.11 | `DtcDefinition` |
+| `flash_sessions.csv` | no | 4.12 | `FlashSession` |
+| `flash_segments.csv` | no | 4.12 | `FlashSegment` |
+
+The conversion produces one `EcuDocument` per variant (design 8.2.6), with `source_format` set to
+`csv-starlark` (ADR-254). Monitor sets (`EcuVariant.monitor_sets`) and `CompuBytecode` have no
+table in this version: the converter emits no monitor set, and a conversion kind other than those
+in 4.5 is rejected.
+
+---
+
+## 2. CSV Dialect
+
+- RFC 4180: comma-separated, fields that contain a comma, a double quote or a line break are
+  enclosed in double quotes, and a double quote inside them is doubled. Line ends may be CRLF or
+  LF.
+- UTF-8. A byte order mark at the start of a file is skipped, so files saved by spreadsheet
+  programs are accepted. Any other invalid UTF-8 is rejected.
+- The first record is the header. Columns are identified by their header name, not their
+  position, so their order is free. A header name that the table does not define is rejected
+  (`CSV_UNKNOWN_COLUMN`), as is a header name that appears twice.
+- An optional column may be left out of the header; every row then has it empty. A required
+  column must be in the header (`CSV_MISSING_COLUMN`) and non-empty in every row.
+- Every table accepts a `note` column, which the conversion ignores.
+- A row with a different number of cells than the header is rejected. A row whose cells are all
+  empty is skipped.
+- Cells are taken as written: leading and trailing spaces are part of the value, and a value
+  that does not parse is rejected (`CSV_BAD_VALUE`).
+
+## 3. Values
+
+| Type | Syntax | Example |
+|---|---|---|
+| integer | Decimal (`-` allowed where the column is signed), or hexadecimal with a `0x` prefix. Each column states its range | `500000`, `0x7E0` |
+| float | Decimal, with an optional fraction and exponent; integers are accepted | `0.1`, `1e-3` |
+| bytes | Hexadecimal digit pairs, upper or lower case, with optional single spaces between pairs; no `0x` prefix | `F190`, `31 2E` |
+| boolean | `yes` or `no` | `yes` |
+| name | `[A-Za-z_][A-Za-z0-9_]*` | `softwareVersion` |
+| key | A name, or names joined by `.` | `session.default` |
+| list | Values joined by `;`, without spaces | `1.0.0;1.0.1` |
+| text | Any string | `Default session` |
+
+An empty optional cell takes the column's default.
+
+**Names and references.** Rows refer to each other by name, never by IR id. A name is unique
+within its table (variants, services, DIDs, routines, layouts, conversions, flash sessions) or its
+container (fields, 5.1), across the whole definition, whichever variants a row belongs to: a
+variant that needs a different layout for the same DID defines a second DID row with another
+name. A reference to a name that does not exist is rejected (`CSV_UNKNOWN_REFERENCE`); a
+duplicate name is rejected (`CSV_DUPLICATE`).
+
+**IR ids.** Ids that only connect parts of one document (`Field.id`, `Layout.id`, `Service.id`)
+are assigned by the converter from 1, over the whole definition, so the same row has the same id
+in every variant's document:
+
+- fields in `fields.csv` row order, then the marker fields of `repeats.csv` (5.4) in its row
+  order;
+- layouts in `layouts.csv` row order;
+- services in `services.csv` row order, then the DID services in `dids.csv` row order (read before
+  write), then the routine services in `routines.csv` row order (start, stop, results).
+
+Ids that something outside the document refers to are written in the tables: variant ids
+(`variants.csv`), text and unit ids (resolved on the server, design 9.2) and flash session ids
+(`diag.flash_transfer(session_id)` in Starlark).
+
+**Variant scope.** Tables marked "scoped" in section 4 have an optional `variants` column: empty
+means every variant, otherwise a list of variant names. A variant's document contains the scoped
+rows that name it or name no variant, together with the layouts, conversions, texts, units and
+fields those rows reach. Two rows of one table that would put two definitions of the same thing
+into one variant's document (the same DID number, routine identifier, DTC code, flash session id
+or protocol name) are rejected.
+
+---
+
+## 4. Tables
+
+### 4.1 `variants.csv`
+
+| Column | Type | Required | Meaning |
+|---|---|---|---|
+| `id` | integer, 1 to 2^32 - 1 | yes | `EcuVariant.id`, unique |
+| `name` | name | yes | `EcuVariant.short_name` |
+| `part_numbers` | list of text | no | `EcuVariant.part_numbers` |
+| `sw_versions` | list of text | no | `EcuVariant.sw_versions` |
+
+At least one row is required.
+
+### 4.2 `variant_patterns.csv`
+
+Variant identification (design 8.9.1), one `VariantPattern` per row, in row order.
+
+| Column | Type | Required | Meaning |
+|---|---|---|---|
+| `variant` | name | yes | The variant the pattern identifies |
+| `service` | name | yes | A service in that variant's document, including generated ones (`softwareVersion.read`) |
+| `field` | name | yes | A field of that service's positive response (not a constant, 5.2) |
+| `expected` | bytes | yes | `VariantPattern.expected` |
+
+### 4.3 `protocols.csv` (scoped) and `comparams.csv` (scoped)
+
+`protocols.csv`, one `Protocol` per row. Every variant needs at least one.
+
+| Column | Type | Required | Meaning |
+|---|---|---|---|
+| `name` | text | yes | `Protocol.short_name`, such as `ISO15765` |
+| `baud_rate` | integer, 1 to 2^32 - 1 | yes | |
+| `tx_id` | integer, 0 to 2^32 - 1 | yes | Physical request identifier |
+| `rx_id` | integer, 0 to 2^32 - 1 | yes | Physical response identifier |
+| `functional_id` | integer, 0 to 2^32 - 1 | no | Default 0 (none) |
+| `extended_addressing` | boolean | no | Default `no` |
+
+`comparams.csv`, one `ComParam` per row, appended to the named protocol's `params` in row order.
+
+| Column | Type | Required | Meaning |
+|---|---|---|---|
+| `protocol` | text | yes | A protocol in the same variant's document |
+| `name` | text | yes | The COMPARAM short name, held standard-neutral (design 8.5); unique per protocol and variant |
+| `value` | signed integer, 64 bits | yes | |
+| `unit` | key | no | A `units.csv` key |
+
+### 4.4 `texts.csv` and `units.csv`
+
+Text and unit ids are resolved on the server (design 9.2). The tables give each id a key that
+other tables refer to, and a default text the server can seed its message table with.
+
+`texts.csv`:
+
+| Column | Type | Required | Meaning |
+|---|---|---|---|
+| `key` | key | yes | Unique |
+| `id` | integer, 1 to 2^32 - 1 | yes | Unique; 0 means "no text" in the IR |
+| `text` | text | yes | Default-language text |
+
+`units.csv`: the same with `symbol` (text, may be empty) in place of `text`; 0 means "no unit".
+
+### 4.5 `conversions.csv` and `conversion_scales.csv`
+
+A conversion is named in `conversions.csv` and referenced from a field's `conversion` column. A
+field without one uses `CompuIdentity`. The kinds that need arrays take one `conversion_scales.csv`
+row per array entry, in row order, which is the IR array order. That order matters for
+`text-table`, where the first matching entry wins.
+
+`conversions.csv`:
+
+| Column | Type | Used by | Meaning |
+|---|---|---|---|
+| `name` | name | all | Required, unique |
+| `kind` | `identity`, `linear`, `scale-linear`, `text-table`, `interpolation`, `rational` | all | Required |
+| `numerator` | float | `linear` | `CompuLinear.numerator`, default 1 |
+| `denominator` | float, not 0 | `linear` | Default 1 |
+| `offset` | float | `linear` | Default 0 |
+| `numerator_coeffs` | list of float | `rational` | Required for `rational`, at least one |
+| `denominator_coeffs` | list of float | `rational` | Required for `rational`, at least one |
+| `default_text` | key | `text-table` | `CompuTextTable.default_text_id`; empty is 0 |
+
+`conversion_scales.csv`:
+
+| Column | Type | Used by | Meaning |
+|---|---|---|---|
+| `conversion` | name | all | Required |
+| `lower` | integer (`text-table`) or float (`scale-linear`) | `scale-linear`, `text-table` | Required there |
+| `upper` | as `lower` | `scale-linear`, `text-table` | Default: the same as `lower`; `lower` <= `upper` |
+| `numerator`, `denominator`, `offset` | float | `scale-linear` | Defaults 1, 1, 0; `denominator` not 0 |
+| `text` | key | `text-table` | Required there |
+| `internal`, `physical` | float | `interpolation` | Required there; `internal` strictly ascending |
+
+A cell that the conversion's kind does not use must be empty, and a kind without arrays takes no
+`conversion_scales.csv` rows. `scale-linear` and `interpolation` need at least one row (two for
+`interpolation`). `text-table` limits are signed 64-bit integers, compared with the internal
+value; a `text-table` on a `float` field is rejected (`ir.fbs`, `TextEntry`).
+
+### 4.6 `services.csv` (scoped)
+
+One `Service` per row, for any service the DID and routine tables do not generate.
+
+| Column | Type | Required | Meaning |
+|---|---|---|---|
+| `name` | name | yes | `Service.short_name`; must not contain `.` (reserved for generated services) |
+| `sid` | integer, 0x00 to 0xBF, not 0x3F | yes | Request SID; the positive response SID is `sid` + 0x40 |
+| `session` | integer, 0x00 to 0xFF | no | `required_session`, default 0 (none) |
+| `security` | integer, 0x00 to 0xFF | no | `required_security_level`, default 0 (none) |
+| `p2_ms` | integer, 1 to 2^32 - 1 | no | Default 50 |
+| `p2_star_ms` | integer, 1 to 2^32 - 1 | no | Default 5000 |
+
+The request is the fields of container `request:<name>` and the positive response those of
+`response:<name>` (section 5). Either may have no fields.
+
+### 4.7 `dids.csv` (scoped)
+
+A data identifier and its data record. The record's fields are container `did:<name>`. Each row
+generates up to two services:
+
+| Service | Request | Positive response |
+|---|---|---|
+| `<name>.read` | SID 0x22, constant `did` (2 bytes) | SID 0x62, constant `did`, then the record |
+| `<name>.write` | SID 0x2E, constant `did`, then the record | SID 0x6E, constant `did` |
+
+The record's fields are the same IR fields (same ids) in both services, with positions counted
+from the byte after the DID (5.2).
+
+| Column | Type | Required | Meaning |
+|---|---|---|---|
+| `name` | name | yes | |
+| `did` | integer, 0x0000 to 0xFFFF | yes | |
+| `read` | boolean | no | Generate `<name>.read`, default `yes` |
+| `write` | boolean | no | Generate `<name>.write`, default `no` |
+| `read_session`, `read_security` | integer, 0x00 to 0xFF | no | The read service's requirements, default 0 |
+| `write_session`, `write_security` | integer, 0x00 to 0xFF | no | The write service's requirements, default 0 |
+| `p2_ms`, `p2_star_ms` | as in 4.6 | no | Both services' timings |
+
+A row with neither service, or a DID with no fields, is rejected.
+
+### 4.8 `routines.csv` (scoped)
+
+A routine identifier with the sub-functions it supports. Each sub-function generates a service
+`<name>.start`, `<name>.stop` or `<name>.results` (RoutineControl sub-functions 0x01, 0x02, 0x03):
+a SID 0x31 request whose constant prefix is the sub-function and the identifier (2 bytes), and a
+SID 0x71 response with the same prefix. Their fields are containers
+`routine:<name>:<start|stop|results>:<request|response>`, with positions counted from the byte
+after the identifier.
+
+| Column | Type | Required | Meaning |
+|---|---|---|---|
+| `name` | name | yes | |
+| `rid` | integer, 0x0000 to 0xFFFF | yes | |
+| `start`, `stop`, `results` | boolean | no | Defaults `yes`, `no`, `no`; at least one `yes` |
+| `session`, `security` | integer, 0x00 to 0xFF | no | All of the routine's services, default 0 |
+| `p2_ms`, `p2_star_ms` | as in 4.6 | no | |
+
+### 4.9 `nrcs.csv` (scoped)
+
+Negative responses a service can return, one `NegativeResponse` per row.
+
+| Column | Type | Required | Meaning |
+|---|---|---|---|
+| `service` | name of a service, generated ones included | no | Empty: every service in the variant's document |
+| `nrc` | integer, 0x01 to 0xFF | yes | |
+| `text` | key | no | `message_id`, default 0 |
+| `retryable` | boolean | no | Default `no` |
+
+A row for one service replaces an empty-`service` row with the same NRC for that service. Each
+service's negatives are in row order: its own rows first, then the remaining variant-wide rows.
+
+### 4.10 `layouts.csv`
+
+A nested layout (ADR-242) that a `repeat`, `select` or `group` field, or a DTC, refers to. Its
+fields are container `layout:<name>`.
+
+| Column | Type | Required | Meaning |
+|---|---|---|---|
+| `name` | name | yes | `Layout.short_name` |
+| `byte_size` | integer, 0 to 2^32 - 1 | no | `Layout.byte_size`, default 0 (the extent of the decoded fields) |
+
+A layout is in a variant's document when a field or DTC in that document reaches it.
+
+### 4.11 `dtcs.csv` (scoped)
+
+One `DtcDefinition` per row.
+
+| Column | Type | Required | Meaning |
+|---|---|---|---|
+| `code` | integer, 0x000000 to 0xFFFFFF | yes | The 3-byte DTC |
+| `display` | text | yes | `display_code` |
+| `text` | key | no | `message_id`, default 0 |
+| `status` | layout name | yes | Its fields become `status_fields` |
+| `snapshot` | layout name | no | Its fields become `snapshot_fields` |
+| `extended` | layout name | no | Its fields become `extended_fields` |
+
+Many DTCs share one status layout. The layouts' fields are copied into the definition with
+their ids (a field id names the definition, not the occurrence; `ir.fbs`, `Field.id`).
+
+### 4.12 `flash_sessions.csv` (scoped) and `flash_segments.csv`
+
+`flash_sessions.csv`:
+
+| Column | Type | Required | Meaning |
+|---|---|---|---|
+| `id` | integer, 1 to 2^32 - 1 | yes | `FlashSession.id`, the number Starlark's `diag.flash_transfer` takes |
+| `name` | name | yes | |
+| `steps` | list of `enter-programming-session`, `security-access`, `erase-memory`, `request-download`, `transfer-data`, `transfer-exit`, `check-memory`, `ecu-reset` | yes | `FlashSession.steps`, in order |
+
+The deprecated `FlashSession` fields are left at their schema defaults. The recovery plan and the
+preconditions belong to the procedure part (ADR-245) and have no table here.
+
+`flash_segments.csv`, appended to the named session's `segments` in row order:
+
+| Column | Type | Required | Meaning |
+|---|---|---|---|
+| `session` | name | yes | A flash session |
+| `name` | name | yes | Unique per session |
+| `start_address`, `length`, `artifact_offset` | integer, 0 to 2^64 - 1 | yes | |
+| `block_size` | integer, 1 to 2^32 - 1 | yes | |
+| `checksum` | bytes | no | Default empty |
+
+---
+
+## 5. Fields
+
+### 5.1 Containers
+
+Every field row in `fields.csv` belongs to one container, named in its `container` column:
+
+| Container | Fields of | Position 0 is |
+|---|---|---|
+| `request:<service>` | a `services.csv` request | the byte after the SID |
+| `response:<service>` | a `services.csv` positive response | the byte after the SID |
+| `did:<did>` | a DID's data record | the byte after the DID |
+| `routine:<routine>:<sub>:request` | a routine sub-function's request (`<sub>` is `start`, `stop` or `results`) | the byte after the routine identifier |
+| `routine:<routine>:<sub>:response` | its positive response | the byte after the routine identifier |
+| `layout:<layout>` | a nested layout | the layout's first byte |
+
+Row order within a container is decode order (`ir.fbs`, `Field`). Rows of different containers
+may be interleaved. A container whose owner is not defined is rejected, as is a routine container
+for a sub-function the routine does not have.
+
+### 5.2 Columns
+
+| Column | Type | Required | Meaning |
+|---|---|---|---|
+| `container` | as in 5.1 | yes | |
+| `name` | name | yes | `Field.short_name`, unique in the container; the key of the field in a Starlark response's `fields` (subset spec 3.4) |
+| `byte` | integer, 0 to 2^29 - 1 | no | Byte position from the container's position 0. Empty: `AfterPrevious` |
+| `bit` | integer, 0 to 7 | no | Bit position within that byte, counted from the least significant bit; default 0 |
+| `type` | `uint`, `int`, `float`, `ascii`, `bytes`, `bcd`, `utf8`, `unicode2` | yes, unless `shape` is set | `Field.kind` |
+| `bits` | integer, 1 to 2^32 - 1 | see `length` | |
+| `length` | `fixed`, `field`, `leading`, `terminated` | no | `Field.length_kind`, default `fixed` |
+| `min_bytes`, `max_bytes` | integer, 0 to 2^32 - 1 | no | `terminated` only; defaults 0; `max_bytes` 0 means no maximum |
+| `terminator` | `end`, `zero`, `ff` | no | `terminated` only: `EndOfPdu` (default), `Zero`, `HexFF` |
+| `byte_order` | `big`, `little` | no | Default `big` |
+| `conversion` | name | no | A `conversions.csv` name; empty: `CompuIdentity` |
+| `unit` | key | no | A `units.csv` key |
+| `const` | integer or bytes | no | A constant (5.3) |
+| `shape` | `group`, `repeat`, `select` | no | A nested layout (5.4) |
+| `layout` | layout name | for `group` and `repeat` | `Group.layout_id`, `Repeat.layout_id` |
+| `ref` | field name | for `length` `field`, a `repeat` counted by a field, and `select` | The field holding the length, the count or the key: `length_field_id`, `count_field_id` or `key_field_id` |
+
+`bits` is the value's width for `fixed` and the length prefix's width for `leading`, and must be
+empty for `field` and `terminated`. A `fixed` field of type `ascii`, `bytes`, `bcd`, `utf8` or
+`unicode2` gives its width in bits too (a 17-character VIN is 136).
+
+**Positions.** A row with `byte` set is `Absolute`: its IR `bit_offset` is
+`(base + byte) * 8 + bit`, where `base` is the number of bytes before the container's position 0
+in the message (1 for `request:` and `response:`, 3 for `did:`, 4 for `routine:`, 0 for
+`layout:`). A row without `byte` is `AfterPrevious` with `bit_offset` = `bit`.
+
+**References.** `ref` names a field earlier in the same container, or in an enclosing one; inside
+a repeated item it means the same item's occurrence (`ir.fbs`, `Field.length_field_id`). For a DID
+or routine container, the enclosing scope is that container alone.
+
+### 5.3 Constants
+
+A field with `const` is a fixed value the request carries or the response must carry: a
+sub-function, a record identifier echoed in the response. Constants must be the first fields of
+their container, start at byte 0, follow each other without gaps, be `fixed`, byte-aligned
+(`bit` 0, `bits` a multiple of 8) and of type `uint` (`const` an integer that fits `bits`) or
+`bytes` (`const` exactly `bits` / 8 bytes), and have no conversion, unit or shape. A constant
+anywhere else is rejected (`CSV_UNSUPPORTED`).
+
+The converter writes the constants, big-endian, into `Request.prefix` or
+`PositiveResponse.prefix` after any prefix the DID or routine table generates, and does not emit
+them as IR fields. The positions of the other fields are unaffected, since they count from the
+container's position 0 either way.
+
+Constants also identify the service a Starlark call means (design 8.4, subset spec 3.1). For
+`diag.request(sid, params)` the frontend takes the services of the variant with that SID whose
+every request constant appears in `params` with the same value and whose other request fields
+include every other key of `params`; exactly one service must match. The generated DID services
+have one constant named `did`, so `diag.request(0x22, {"did": 0xF190})` selects `vin.read` in the
+example. `diag.routine(rid, sub, params)` selects the routine service by `rid` and `sub`. Two
+services of one variant with the same SID and the same request constants (name and value) can
+never be told apart and are rejected.
+
+### 5.4 Nested Layouts
+
+A field with `shape` is a nested layout (ADR-242). `type`, `bits`, `length` and its columns,
+`conversion` and `unit` must be empty, and the field must start at a byte edge. The `ir.fbs` rules
+for each shape apply, including where it may appear: in a request only `group`, `repeat` with
+`count` `end`, and `select` keyed by a field the procedure supplies.
+
+- `group`: one occurrence of `layout`.
+- `repeat`: `layout` repeated; its count is a row of `repeats.csv` for the field.
+- `select`: one layout chosen by the key in `ref`; its cases are rows of `select_cases.csv` for
+  the field.
+
+`repeats.csv`, exactly one row per `repeat` field:
+
+| Column | Type | Required | Meaning |
+|---|---|---|---|
+| `container`, `field` | as in `fields.csv` | yes | The `repeat` field |
+| `count` | `fixed`, `field`, `marker`, `end` | yes | `RepeatCount`: `Fixed`, `FromField` (the field in `ref`), `UntilMarker`, `UntilEndOfPdu` |
+| `items` | integer, 1 to 2^32 - 1 | `fixed` only | `fixed_count` |
+| `item_bytes` | integer, 1 to 2^32 - 1 | `fixed` only | `item_byte_size` |
+| `marker_bits` | integer, 8 to 64, a multiple of 8 | `marker` only | The marker is an unsigned big-endian integer of this width at the item's start |
+| `marker_lower`, `marker_upper` | integer | `marker` only | The marker values that end the repetition; `marker_upper` defaults to `marker_lower` |
+| `min_items`, `max_items` | integer, 0 to 2^32 - 1 | no | Request `end` repeats only; defaults 0 |
+
+The converter builds the `Repeat.marker` field (`Absolute`, offset 0, `fixed`, `uint`,
+`marker_bits` wide) and names it `<field>.marker`. A byte or string marker is compared as its
+bytes read as a big-endian integer (`ir.fbs`, `Repeat`), so this one form covers both.
+
+`select_cases.csv`, one row per case, in row order:
+
+| Column | Type | Required | Meaning |
+|---|---|---|---|
+| `container`, `field` | as in `fields.csv` | yes | The `select` field |
+| `case` | name | yes | `SelectCase.short_name`, unique per field |
+| `lower` | integer | no | Inclusive; empty together with `upper` makes the row the default case |
+| `upper` | integer | no | Default: the same as `lower` |
+| `layout` | layout name | no | Empty: the key is valid but carries no data |
+
+At most one default row per field (`has_default`, `default_layout_id`). Overlapping cases are
+rejected.
+
+---
+
+## 6. Conversion Rules
+
+- **Every IR rule is checked.** The constraints `ir.fbs` states (field order, which shapes may
+  appear where, length kinds per type, marker and key types, `min_bytes` <= `max_bytes`, layout
+  bounds) are checked at conversion and reported like any other table error (`CSV_IR_RULE`).
+  Nothing is left for the agent to discover at run time (design 8.3).
+- **Determinism.** The same directory always converts to the same documents, byte for byte: ids
+  follow row order (section 3) and arrays follow row order.
+- **`source_digest`.** The lowercase hexadecimal SHA-256 of the definition's files that the
+  conversion reads (the tables and the procedure files), taken in byte order of their file names;
+  each file contributes its name, a zero byte, its length as a big-endian 64-bit integer and its
+  contents.
+- **`schema_version`** is the IR schema version the converter writes.
+
+## 7. Error Reporting
+
+As for Starlark (subset spec 5), all errors are listed, not only the first. Each names the file,
+the row (the line on which the record starts, counting the header as line 1) and the column (its
+header name), with a code:
+
+| Code | Meaning |
+|---|---|
+| `CSV_SYNTAX` | The file is not valid RFC 4180 CSV or not UTF-8, or a row has the wrong number of cells |
+| `CSV_UNKNOWN_FILE` | A `.csv` file that is not a table of section 1 |
+| `CSV_UNKNOWN_COLUMN` | A header name the table does not define, or a duplicate header name |
+| `CSV_MISSING_COLUMN` | A required column is missing from the header, or a required cell is empty |
+| `CSV_BAD_VALUE` | A value does not parse, is out of range, or is set in a column its row's kind does not use |
+| `CSV_UNKNOWN_REFERENCE` | A name, key or container that is not defined |
+| `CSV_DUPLICATE` | A name, id or key defined twice, or two definitions of one thing in one variant (section 3) |
+| `CSV_UNSUPPORTED` | A construct this version does not accept, such as a constant that is not leading |
+| `CSV_IR_RULE` | A rule of `ir.fbs` is violated (section 6) |
+
+```json
+{
+  "status": "rejected",
+  "errors": [
+    {
+      "code": "CSV_UNKNOWN_REFERENCE",
+      "file": "fields.csv",
+      "line": 29,
+      "column": "conversion",
+      "hint": "No conversion named sessionNames in conversions.csv"
+    }
+  ]
+}
+```
+
+---
+
+## 8. Example
+
+The example directory defines a fictional ECU with two variants. Its DIDs, DTC read and routine
+are those `sim-ecu` answers, except the supply voltage and last reset reason DIDs, which `sim-ecu`
+does not have:
+
+- `variants.csv` and `variant_patterns.csv`: the variants are told apart by the first two
+  characters of the software version (DID 0xF189).
+- `dids.csv`: the session (a text table), the spare part number and software version
+  (`terminated` ASCII to the end of the message), the VIN (writable outside the default session),
+  the flash state (three fields at fixed positions) and, in the second variant only, a supply
+  voltage with a linear conversion and a unit; and a last reset reason whose details are a
+  `select` on the reason (`select_cases.csv`): no data, the `watchdogReset` layout, or a range of
+  reasons without data.
+- `services.csv`: three session controls told apart by their `sub` constant, and
+  ReadDTCInformation by status mask, whose response repeats the `dtcRecord` layout to the end of
+  the message.
+- `routines.csv`: checkProgrammingDependencies, start only, in the programming session, with its
+  result as a text table.
+- `dtcs.csv`: two DTCs sharing the `dtcStatus` layout.
+- `flash_sessions.csv` and `flash_segments.csv`: one flash session with one segment.
+
+A row of `fields.csv` from it, the VIN in its data record:
+
+```csv
+container,name,byte,bit,type,bits,length,min_bytes,terminator,conversion,unit,const,shape,layout,ref
+did:vin,vin,0,,ascii,136,,,,,,,,,
+```
+
+`vin.read` therefore sends `22 F1 90` and decodes `vin` from byte 3 of the response
+(`bit_offset` 24), after the SID and the echoed DID, which form the positive response's prefix.

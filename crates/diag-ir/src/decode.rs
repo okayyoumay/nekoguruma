@@ -143,7 +143,8 @@ fn decode_fields(
     message: &[u8],
     start: usize,
 ) -> Result<Vec<DecodedField>, DecodeError> {
-    let mut decoded: Vec<DecodedField> = Vec::with_capacity(fields.len());
+    // Not reserved from fields.len(): the first field may fail at once.
+    let mut decoded: Vec<DecodedField> = Vec::new();
     // The byte edge after the previous field.
     let mut edge = start;
     for field in fields {
@@ -474,7 +475,7 @@ fn convert(
         }
     };
     let result = if let Some(c) = field.compu_as_compu_linear() {
-        ratio(field, x * c.numerator() + c.offset(), c.denominator())?
+        linear(field, x * c.numerator() + c.offset(), c.denominator())?
     } else if let Some(c) = field.compu_as_compu_scale_linear() {
         // Both limits are inclusive, like ODX's default CLOSED interval (ADR-297); the first
         // matching scale wins.
@@ -484,7 +485,7 @@ fn convert(
             .flatten()
             .find(|s| s.lower() <= x && x <= s.upper())
             .ok_or_else(|| conversion(field, "no scale contains the value"))?;
-        ratio(
+        linear(
             field,
             x * scale.numerator() + scale.offset(),
             scale.denominator(),
@@ -503,6 +504,15 @@ fn convert(
         return Err(plan(field, "an unknown conversion"));
     };
     Ok((PhysicalValue::Float(result), 0))
+}
+
+/// A linear conversion's `numerator / denominator`. Its denominator is a constant, so zero is
+/// a broken plan rather than a property of the value.
+fn linear(field: &Field<'_>, numerator: f64, denominator: f64) -> Result<f64, DecodeError> {
+    if denominator == 0.0 {
+        return Err(plan(field, "a linear conversion with a zero denominator"));
+    }
+    ratio(field, numerator, denominator)
 }
 
 /// `numerator / denominator`, failing on a zero denominator or a result that is not finite.
@@ -536,30 +546,38 @@ fn interpolate(
             "an interpolation table with fewer than two points",
         ));
     };
-    let mut previous = points.get(0);
-    for point in points.iter().skip(1) {
-        let (x0, y0, x1, y1) = (
-            previous.internal(),
-            previous.physical(),
-            point.internal(),
-            point.physical(),
-        );
-        // NaN, which is unordered, fails this as well.
-        if x0.partial_cmp(&x1) != Some(core::cmp::Ordering::Less) {
-            return Err(plan(
-                field,
-                "interpolation points that do not ascend strictly",
-            ));
+    // The whole table is checked first, so a broken table fails whatever value arrives.
+    // NaN, which is unordered, fails this as well.
+    let ascending = points
+        .iter()
+        .zip(points.iter().skip(1))
+        .all(|(a, b)| a.internal().partial_cmp(&b.internal()) == Some(core::cmp::Ordering::Less));
+    if !ascending {
+        return Err(plan(
+            field,
+            "interpolation points that do not ascend strictly",
+        ));
+    }
+    for (a, b) in points.iter().zip(points.iter().skip(1)) {
+        let (x0, y0, x1, y1) = (a.internal(), a.physical(), b.internal(), b.physical());
+        // A value on a point gives that point's physical value exactly.
+        if x == x0 {
+            return Ok(y0);
         }
-        if x0 <= x && x <= x1 {
-            let result = y0 + (x - x0) * (y1 - y0) / (x1 - x0);
+        if x == x1 {
+            return Ok(y1);
+        }
+        if x0 < x && x < x1 {
+            // The fraction first, then a weighted sum: neither step can overflow for finite
+            // points, as (x - x0) * (y1 - y0) can.
+            let t = (x - x0) / (x1 - x0);
+            let result = y0 * (1.0 - t) + y1 * t;
             return if result.is_finite() {
                 Ok(result)
             } else {
                 Err(conversion(field, "the result is not finite"))
             };
         }
-        previous = point;
     }
     Err(conversion(
         field,

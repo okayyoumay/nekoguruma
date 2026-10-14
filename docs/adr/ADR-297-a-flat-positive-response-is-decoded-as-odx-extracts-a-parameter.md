@@ -51,17 +51,20 @@ response, and what the decoder does with a plan that breaks a schema rule only a
    states (ADR-295); unlike ODX, the calculation type does not depend on the internal and
    physical types. A `LinearScale` range includes both limits, ODX's default closed interval,
    and the first matching scale applies. An interpolation table needs points whose internal
-   values ascend strictly, and a value outside it has no result. A text table keeps the internal
+   values ascend strictly, checked over the whole table; a value on a point gives that point's
+   physical value exactly, and a value outside the table has no result. A text table keeps the internal
    value and reports the text id of the first entry whose range holds it, else the default text;
-   with no default text (0) the value has no result, as in ODX (7.3.6.6.1). A zero denominator
-   or a result that is not finite (an overflow) fails.
+   with no default text (0) the value has no result, as in ODX (7.3.6.6.1). A rational function
+   whose denominator is zero for the value, or any result that is not finite (an overflow),
+   fails; a linear or scale-linear denominator is a constant, so zero there is a broken plan.
 5. **A field that fails fails the response.** The decoder returns every field or an error naming
    the failing field, never a partial result. Errors are classed by who has to act:
    - `InvalidValue` and `Conversion`: the message holds something the plan cannot decode (the
      ECU's side);
    - `Truncated`: the message ends inside a field;
    - `InvalidPlan`: the plan breaks a schema rule that a frontend must enforce, such as a
-     16-bit float, a terminated integer or a numeric conversion on a string. The loader
+     16-bit float, a terminated integer, a numeric conversion on a string or a constant zero
+     denominator. The loader
      (ADR-296) checks only what the schema states as types and tags, so the decoder rejects such
      a plan where it meets it rather than guessing;
    - `Unsupported`: a field with a shape (a nested layout, ADR-242) or a `CompuBytecode`
@@ -78,6 +81,12 @@ response, and what the decoder does with a plan that breaks a schema rule only a
   response fail. That is ODX's behaviour; a caller that wants the other fields has no partial
   result to fall back on.
 - A `Float` field whose bytes are NaN or an infinity passes through an identity conversion
-  unchanged; a numeric conversion of it fails as not finite.
+  unchanged; a numeric conversion of it has no result (`Conversion`), and a text table on it is
+  a broken plan.
+- The flat decoder sets no limit of its own on the number of fields or the bytes it copies: a
+  field array is bounded by the verifier's limits on the document (ADR-296) and a value by the
+  message, so a document with many fields that each read the rest of a long message copies it
+  once per field. The document is signed (8.2.6); the decoded-value limit of ADR-242 applies
+  when nested layouts are decoded.
 - `ir.fbs` now states the scale-linear rule in comments; the generated bindings do not change,
   since `flatc` does not carry plain comments into them.

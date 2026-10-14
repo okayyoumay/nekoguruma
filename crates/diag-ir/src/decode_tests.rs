@@ -658,9 +658,10 @@ fn linear_scales_and_offsets() {
     );
     let signed = vec![with_compu(next(1, DataKind::Int, 8), linear(0.5, 1.0, 0.0))];
     assert_eq!(values(decode(&[], signed, &[SID, 0xFC])), vec![Float(-2.0)]);
+    // A constant zero denominator is a broken plan, whatever the value.
     assert!(matches!(
         decode(&[], uint8(linear(1.0, 0.0, 0.0)), &[SID, 1]),
-        Err(DecodeError::Conversion { field: 1, .. })
+        Err(DecodeError::InvalidPlan { field: 1, .. })
     ));
     assert!(matches!(
         decode(&[], uint8(linear(f64::MAX, 1.0, 0.0)), &[SID, 2]),
@@ -693,6 +694,14 @@ fn scale_linear_ranges_include_both_limits() {
         decode(&[], uint8(compu()), &[SID, 15]),
         Err(DecodeError::Conversion { field: 1, .. })
     ));
+    // Should scales overlap (the CSV format rejects that), the first one applies.
+    let overlapping = CompuT::CompuScaleLinear(Box::new(CompuScaleLinearT {
+        scales: Some(vec![scale(0.0, 10.0, 1.0), scale(5.0, 10.0, 2.0)]),
+    }));
+    assert_eq!(
+        values(decode(&[], uint8(overlapping), &[SID, 7])),
+        vec![Float(7.0)]
+    );
 }
 
 #[test]
@@ -766,6 +775,28 @@ fn interpolation_is_linear_between_points() {
         decode(&[], uint8(table()), &[SID, 21]),
         Err(DecodeError::Conversion { field: 1, .. })
     ));
+    // A point exactly on the table gives its physical value, not a rounded interpolation.
+    let tenth = compu(Some(vec![point(0.0, 0.0), point(3.0, 0.1)]));
+    assert_eq!(
+        values(decode(&[], uint8(tenth), &[SID, 3])),
+        vec![Float(0.1)]
+    );
+    // A wide table does not overflow on the way to a small result.
+    let wide = vec![with_compu(
+        next(1, DataKind::Int, 8),
+        compu(Some(vec![point(-1e300, -1e300), point(1e300, 1e300)])),
+    )];
+    assert_eq!(values(decode(&[], wide, &[SID, 0])), vec![Float(0.0)]);
+    // The whole table is checked, not only the points before the matching segment.
+    let late = compu(Some(vec![
+        point(0.0, 0.0),
+        point(10.0, 10.0),
+        point(5.0, 5.0),
+    ]));
+    assert!(matches!(
+        decode(&[], uint8(late), &[SID, 3]),
+        Err(DecodeError::InvalidPlan { field: 1, .. })
+    ));
     let descending = compu(Some(vec![point(10.0, 0.0), point(0.0, 1.0)]));
     assert!(matches!(
         decode(&[], uint8(descending), &[SID, 5]),
@@ -798,6 +829,15 @@ fn a_rational_function_divides_two_polynomials() {
     // x - 3 is zero at x = 3.
     assert!(matches!(
         decode(&[], uint8(compu(vec![1.0], vec![-3.0, 1.0])), &[SID, 3]),
+        Err(DecodeError::Conversion { field: 1, .. })
+    ));
+    // An overflow is no result.
+    assert!(matches!(
+        decode(
+            &[],
+            uint8(compu(vec![0.0, 0.0, f64::MAX], vec![1.0])),
+            &[SID, 200]
+        ),
         Err(DecodeError::Conversion { field: 1, .. })
     ));
     assert!(matches!(
@@ -835,4 +875,93 @@ fn the_unit_is_carried() {
     };
     let decoded = decode(&[], vec![field], &[SID, 1]).expect("decodes");
     assert_eq!((decoded[0].unit_id, decoded[0].text_id), (4, 0));
+}
+
+// ---------------------------------------------------------------- Further corners
+
+#[test]
+fn a_64_bit_value_at_bit_position_7_spans_nine_bytes() {
+    // Bytes 1..=9; the value is bits 7..71 of the normalized 72-bit number.
+    let message = [SID, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0x80];
+    let big = (0x0001_2345_6789_ABCD_EF80_u128 >> 7) as u64;
+    let little_value = (u128::from_le_bytes({
+        let mut b = [0u8; 16];
+        b[..9].copy_from_slice(&message[1..10]);
+        b
+    }) >> 7) as u64;
+    assert_eq!(
+        values(decode(
+            &[],
+            vec![
+                at(1, DataKind::Uint, 8 + 7, 64),
+                little(at(2, DataKind::Uint, 8 + 7, 64))
+            ],
+            &message
+        )),
+        vec![Unsigned(big), Unsigned(little_value)]
+    );
+}
+
+#[test]
+fn a_little_endian_int_and_a_16_digit_bcd() {
+    let mut message = vec![SID, 0xFE, 0xFF];
+    message.extend_from_slice(&[0x12, 0x34, 0x56, 0x78, 0x90, 0x12, 0x34, 0x56]);
+    let fields = vec![
+        little(next(1, DataKind::Int, 16)),
+        next(2, DataKind::Bcd, 64),
+    ];
+    assert_eq!(
+        values(decode(&[], fields, &message)),
+        vec![Signed(-2), Unsigned(1_234_567_890_123_456)]
+    );
+}
+
+#[test]
+fn a_unicode2_value_ends_at_an_ffff_character() {
+    let fields = vec![
+        terminated(1, DataKind::Unicode2, Termination::HexFF, 0, 0),
+        next(2, DataKind::Uint, 8),
+    ];
+    let message = [SID, 0x00, 0xFF, 0xFF, 0x00, 0xFF, 0xFF, 0x05];
+    assert_eq!(
+        values(decode(&[], fields, &message)),
+        vec![Text("\u{FF}\u{FF00}".into()), Unsigned(5)]
+    );
+}
+
+#[test]
+fn utf8_cut_by_max_bytes_is_invalid() {
+    let fields = vec![terminated(1, DataKind::Utf8, Termination::Zero, 0, 2)];
+    assert!(matches!(
+        decode(&[], fields, &[SID, b'a', 0xC3, 0xA9]),
+        Err(DecodeError::InvalidValue { field: 1, .. })
+    ));
+}
+
+#[test]
+fn a_cut_off_leading_length_prefix_is_truncated() {
+    let fields = vec![FieldT {
+        length_kind: LengthKind::LeadingLength,
+        ..next(1, DataKind::Bytes, 16)
+    }];
+    assert_eq!(
+        decode(&[], fields, &[SID, 0x00]),
+        Err(DecodeError::Truncated { field: 1 })
+    );
+}
+
+#[test]
+fn a_nan_float_passes_through_identity() {
+    let mut message = vec![SID];
+    message.extend_from_slice(&f64::NAN.to_be_bytes());
+    let decoded = values(decode(&[], vec![next(1, DataKind::Float, 64)], &message));
+    assert!(matches!(decoded[..], [Float(f)] if f.is_nan()));
+    let converted = vec![with_compu(
+        next(1, DataKind::Float, 64),
+        linear(1.0, 1.0, 0.0),
+    )];
+    assert!(matches!(
+        decode(&[], converted, &message),
+        Err(DecodeError::Conversion { field: 1, .. })
+    ));
 }

@@ -68,31 +68,7 @@ margin theory — stop widening and instrument instead (see
 in the "Test-suite reliability: past flaky-test root causes" section of
 `crates/j2534-0404-service/docs/implementation-notes.md` for a worked example).
 
-- `j2534-0404-service` `agent_restart_end_to_end`
-  (`crates/j2534-0404-service/tests/agent_restart_end_to_end.rs`): scenarios whose simulated ECU
-  has a 3 s session timer (tS3_Server, `ecu_config(3_000)`) fail on the Windows runner when a
-  step of the test takes longer than the timer. They have run on Windows since the agent-kill
-  harness came to Windows, in the pull-request `core-windows` step. Seen on commits whose tree is
-  main's (1f48b76 and c45e3f9, `ci-windows` profile, one test at a time):
-  - `a_non_default_session_on_the_completed_path_is_confirmed_after_the_passive_retry` (twice,
-    about 16 s): one `uds 22 F186` read where the test expects two. The restart's first F186
-    read must reach the ECU within the timer after the probe's last read, as the test's doc
-    says; the killed and restarted workers' starts were about 5.5 s apart, so the ECU was
-    already back in its default session and the first read confirmed.
-  - `a_kill_before_the_integrity_check_response_was_recorded_redoes_the_transfer` (once, 60 s
-    timeout): the first run's job ended with `TransferRefused { block: 5, response: 7F 36 7F }`
-    (service not supported in the active session) before the kill point, with the journal at
-    block 4. The gap between two TransferData blocks outlasted the timer, so the ECU left its
-    programming session.
-
-  Confirm in isolation: run either test with `cargo test -p j2534-0404-service --test
-  agent_restart_end_to_end -- --exact <name>` under CPU load, or with a delay of more than 3 s
-  added at the step named above. Fix by making these scenarios independent of the runner's
-  speed without loosening their assertions: for example a control command that holds the ECU's
-  timer while the test controls the timing, or a longer timer together with a plan whose
-  declared passive wait matches it. The scenario whose point is the timer running out
-  (`an_agent_killed_mid_transfer_redoes_it_after_the_session_timer_expired`) keeps a timer the
-  test controls.
+No entries at present.
 
 Past root causes and their fixes: `crates/j2534-0404-service/docs/implementation-notes.md`, section
 "Test-suite reliability: past flaky-test root causes".

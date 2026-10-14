@@ -49,7 +49,7 @@
 //! recorded. Where a response is pending at the kill, the ECU keeps the agent waiting with
 //! response-pending messages, injected through `sim-vci`'s control directory. The marker makes
 //! the restart's teardown passive: it sends no ECUReset and waits out the ECU's session timer,
-//! which the ECU's configuration keeps at the plan's declared 3 s. All three redo the transfer,
+//! which the ECU's configuration keeps at the plan's declared timeout ([`S3_MS`]). All three redo the transfer,
 //! so RequestTransferExit and the integrity check run again, in order.
 //!
 //! The teardown scenarios kill the agent mid-transfer and hand the restart's worker a fault
@@ -159,6 +159,15 @@ const ERASE_PC: u32 = 4;
 
 const WAIT_FOR_BLOCK: Duration = Duration::from_secs(60);
 
+/// The plan's declared session timeout, and the ECU's tS3_Server in the scenarios that wait it
+/// out: the passive teardown waits out the declared value, so the ECU's timer must not be longer.
+/// It must outlast every step of those scenarios on a slow runner, or the ECU leaves its
+/// programming session where the scenario needs it there: the gap between two blocks of the
+/// first run, which includes a [`PARK_MS`] wait, and the time from the probe to the restart's
+/// first request, which includes starting a worker. Both took longer than 3 s on the Windows
+/// runner.
+const S3_MS: u32 = 10_000;
+
 /// A programming session (the step before the erase), the erase, RequestDownload of the image, one
 /// `FlashTransfer` per block with a `Wait` after block [`KILL_AFTER_BLOCK`] and after the last
 /// block, RequestTransferExit, a `Wait`, and the integrity check as the post-transfer step. The
@@ -256,7 +265,7 @@ fn program() -> Program {
             post_transfer_end_pc: program.code.len() as u32,
         },
         timing: RecoveryTiming {
-            session_timeout_millis: 3_000,
+            session_timeout_millis: S3_MS,
             teardown_margin_millis: 500,
             ecu_startup_millis: 100,
             confirmation_window_millis: 2_000,
@@ -600,7 +609,6 @@ fn an_agent_killed_mid_transfer_redoes_it_within_the_session_timer() {
 #[test]
 #[serial]
 fn an_agent_killed_mid_transfer_redoes_it_after_the_session_timer_expired() {
-    const S3_MS: u32 = 3_000;
     let spec = spec();
     let env = Env::new("after-s3", ENTRY, &ecu_config(S3_MS));
     let first_attempt = kill_mid_transfer(&env, &spec);
@@ -627,7 +635,7 @@ fn an_agent_killed_mid_transfer_redoes_it_after_the_session_timer_expired() {
         "the ECU should be in its default session with the transfer interrupted"
     );
     let result = env.restart(&spec);
-    // The 3 s timer can run out again while the worker stops, so either session is possible.
+    // The timer can run out again while the worker stops, so either session is possible.
     assert_completed(
         &env,
         &spec,
@@ -980,13 +988,13 @@ fn exit_answered(state: &agent::journal::JournalState) -> bool {
 /// journal: the ECU answers it with response-pending messages, which keeps the agent waiting
 /// while the ECU has already closed the download. The restart cannot tell whether the download
 /// closed. With the RequestTransferExit marker journaled it sends no ECUReset: it waits out the
-/// ECU's session timer (the plan declares the ECU's 3 s), confirms the default session, and
+/// ECU's session timer (the plan declares the ECU's [`S3_MS`]), confirms the default session, and
 /// redoes the transfer, so RequestTransferExit and the integrity check run again, in order.
 #[test]
 #[serial]
 fn a_kill_before_the_transfer_exit_response_was_recorded_redoes_the_transfer() {
     let spec = spec();
-    let env = Env::new("exit-unanswered", ENTRY, &ecu_config(3_000));
+    let env = Env::new("exit-unanswered", ENTRY, &ecu_config(S3_MS));
     // The program waits after the last block.
     let sequence_end = kill_while_unanswered(
         &env,
@@ -1022,7 +1030,7 @@ fn a_kill_before_the_transfer_exit_response_was_recorded_redoes_the_transfer() {
 #[serial]
 fn a_kill_before_the_post_transfer_steps_completed_redoes_the_transfer() {
     let spec = spec();
-    let env = Env::new("post-transfer", ENTRY, &ecu_config(3_000));
+    let env = Env::new("post-transfer", ENTRY, &ecu_config(S3_MS));
     let agent = env.spawn_agent();
     // The program waits after the RequestTransferExit, before the integrity check.
     env.wait_for(
@@ -1058,7 +1066,7 @@ fn a_kill_before_the_post_transfer_steps_completed_redoes_the_transfer() {
 #[serial]
 fn a_kill_before_the_integrity_check_response_was_recorded_redoes_the_transfer() {
     let spec = spec();
-    let env = Env::new("check-unanswered", ENTRY, &ecu_config(3_000));
+    let env = Env::new("check-unanswered", ENTRY, &ecu_config(S3_MS));
     // The program waits after the RequestTransferExit's response.
     let sequence_end = kill_while_unanswered(&env, &spec, exit_answered, "uds 31 01 FF01");
     // The wait after the RequestTransferExit completed; the integrity check did not.
@@ -1078,7 +1086,7 @@ fn a_kill_before_the_integrity_check_response_was_recorded_redoes_the_transfer()
 
 /// Kills the agent mid-transfer, hands `fault` (a `sim-vci` control command) to the restart's
 /// worker, restarts, and checks that the job completed after `teardown`. The plan declares the
-/// ECU's session timeout as 3 s, which the passive teardowns wait out, so `ecu_config` keeps it.
+/// ECU's session timeout as [`S3_MS`], which the passive teardowns wait out, so `ecu_config` keeps it.
 fn redo_after_teardown(tag: &str, ecu_config: &str, fault: Option<&str>, teardown: Teardown) {
     let spec = spec();
     let env = Env::new(tag, ENTRY, ecu_config);
@@ -1107,7 +1115,7 @@ fn redo_after_teardown(tag: &str, ecu_config: &str, fault: Option<&str>, teardow
 fn a_refused_ecu_reset_makes_the_teardown_passive() {
     redo_after_teardown(
         "reset-refused",
-        &ecu_config(3_000),
+        &ecu_config(S3_MS),
         Some(
             r#"{"command": "inject_fault", "service": 17,
                 "fault": {"negative_response": {"nrc": "conditions_not_correct"}}}"#,
@@ -1132,7 +1140,7 @@ fn a_refused_ecu_reset_makes_the_teardown_passive() {
 fn a_lost_ecu_reset_response_makes_the_teardown_passive() {
     redo_after_teardown(
         "reset-unanswered",
-        &ecu_config_with_startup(3_000, Some(1_500)),
+        &ecu_config_with_startup(S3_MS, Some(1_500)),
         Some(r#"{"command": "inject_fault", "service": 17, "fault": "drop_response"}"#),
         Teardown {
             gates: GATE_REQUESTS,
@@ -1146,15 +1154,15 @@ fn a_lost_ecu_reset_response_makes_the_teardown_passive() {
 /// The ECU acknowledges the restart's ECUReset and then answers nothing for 6 s while it starts
 /// up. A confirmation attempt waits 0.1 s and then reads for 2 s, and an unanswered read takes
 /// up to the 1 s P2 timeout, so the first attempt ends by about 3.1 s; a second attempt right
-/// after it would read until about 5.2 s and fail too, while the one after the 3.5 s passive
-/// wait reads from about 6.7 s on. So the job completes only if the passive wait runs between
+/// after it would read until about 5.2 s and fail too, while the one after the passive wait
+/// ([`S3_MS`] and the 0.5 s margin) reads from about 13.7 s on. So the job completes only if the passive wait runs between
 /// the attempts.
 #[test]
 #[serial]
 fn an_ecu_silent_after_acknowledging_the_reset_is_confirmed_after_the_passive_wait() {
     redo_after_teardown(
         "reset-silent",
-        &ecu_config_with_startup(3_000, Some(6_000)),
+        &ecu_config_with_startup(S3_MS, Some(6_000)),
         None,
         Teardown {
             first_read_confirms: false,
@@ -1172,7 +1180,7 @@ fn an_ecu_silent_after_acknowledging_the_reset_is_confirmed_after_the_passive_wa
 fn an_unreadable_vin_makes_the_teardown_passive() {
     redo_after_teardown(
         "gate-vin",
-        &ecu_config(3_000),
+        &ecu_config(S3_MS),
         Some(
             r#"{"command": "inject_fault", "service": 34,
                 "fault": {"negative_response": {"nrc": "conditions_not_correct"}}}"#,
@@ -1228,11 +1236,11 @@ fn kill_after_the_plan(env: &Env, spec: &JobSpec) -> StepRef {
 /// version to write, and redoes the transfer, as after the other teardowns.
 fn complete_on_the_completed_path(tag: &str, ecu_in_default_session: bool, fault: Option<&str>) {
     let spec = spec_for(COMPLETED_PATH);
-    let env = Env::with_variant(tag, ENTRY, COMPLETED_PATH, &ecu_config(3_000));
+    let env = Env::with_variant(tag, ENTRY, COMPLETED_PATH, &ecu_config(S3_MS));
     let first_attempt = kill_after_the_plan(&env, &spec);
     if ecu_in_default_session {
-        // The last request came before the 1 s wait the agent was killed in; the timer is 3 s.
-        std::thread::sleep(Duration::from_millis(3_500));
+        // The last request came before the 1 s wait the agent was killed in.
+        std::thread::sleep(Duration::from_millis(u64::from(S3_MS) + 500));
     }
     let before = env.probe();
     assert_eq!(
@@ -1269,9 +1277,10 @@ fn complete_on_the_completed_path(tag: &str, ecu_in_default_session: bool, fault
 
 /// The ECU is still in its programming session when the restart reads F186: the first read
 /// reports another session. The read restarts the ECU's session timer, which the passive wait
-/// then outlasts. The restart's gate reads must come within the 3 s timer of the probe's last
-/// read, which a starved runner could miss: the test then fails with one F186 read, never passes
-/// wrongly. The timer cannot be longer, as the passive wait is the plan's declared 3 s.
+/// then outlasts. The restart's gate reads must come within the timer ([`S3_MS`]) of the probe's
+/// last read; a runner that missed it would fail the test with one F186 read, never pass it
+/// wrongly. The timer cannot be longer than the plan's declared timeout, which the passive wait
+/// waits out, so both are [`S3_MS`].
 #[test]
 #[serial]
 fn a_non_default_session_on_the_completed_path_is_confirmed_after_the_passive_retry() {

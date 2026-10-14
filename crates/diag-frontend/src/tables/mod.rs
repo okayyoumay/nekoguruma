@@ -133,10 +133,23 @@ fn read_entries(
     let mut sheets: HashMap<&'static str, Sheet> = HashMap::new();
     // Tables that broke the record format: their other errors are not reported (section 7).
     let mut broken: Vec<&'static str> = Vec::new();
+    // A directory cannot hold two entries of one name, but a caller of `read_files` can pass
+    // them; the first is read and the repeat reported, so that nothing is replaced unseen.
+    let mut seen = std::collections::HashSet::new();
     for (name, contents) in entries {
         let lower = name.to_ascii_lowercase();
         let csv = lower.ends_with(".csv");
         if !csv && !lower.ends_with(".star") {
+            continue;
+        }
+        if !seen.insert(name.clone()) {
+            errors.push(
+                ErrorCode::Duplicate,
+                &name,
+                None,
+                None,
+                format!("{name} is given twice"),
+            );
             continue;
         }
         if !name

@@ -755,3 +755,16 @@ fn entries_that_are_not_definition_files_are_never_looked_at() {
         (UnknownFile, "loop.csv")
     );
 }
+
+#[test]
+fn a_file_given_twice_is_reported_and_its_first_copy_read() {
+    let mut files = with("variants.csv", "id,name\n1,bad-name\n");
+    files.push(("variants.csv".into(), b"id,name\n2,valid\n".to_vec()));
+    assert_eq!(
+        errors(files),
+        vec![
+            at(Duplicate, "variants.csv", None, None),
+            at(BadValue, "variants.csv", Some(2), Some("name")),
+        ]
+    );
+}

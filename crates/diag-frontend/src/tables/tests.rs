@@ -816,6 +816,9 @@ fn the_example_definition_resolves_into_two_variants() {
     assert_eq!(names(&definition.variants[1]).len(), 8);
     for variant in &definition.variants {
         assert_eq!(variant.protocols, vec![0]);
+        assert_eq!(variant.comparams, vec![0, 1]);
+        assert_eq!(variant.routines, vec![0, 1]);
+        assert_eq!(variant.dtcs, vec![0, 1]);
         assert_eq!(variant.services.len(), 4);
         assert_eq!(variant.nrcs.len(), 5);
         assert_eq!(variant.flash_sessions, vec![0]);
@@ -863,9 +866,10 @@ fn every_variant_needs_a_protocol_and_comparams_follow_their_protocol() {
 
 #[test]
 fn variant_patterns_name_a_value_of_a_response_in_their_variant() {
+    const P: &str = "variant_patterns.csv";
     assert_eq!(
         resolved_with(
-            "variant_patterns.csv",
+            P,
             "variant,service,field,expected",
             &[
                 "exampleEcuV1,softwareVersion.read,softwareVersion,31",
@@ -876,45 +880,19 @@ fn variant_patterns_name_a_value_of_a_response_in_their_variant() {
                 "exampleEcuV1,readDtcByStatusMask,records,01",
                 "exampleEcuV1,defaultSession,missing,01",
                 "exampleEcuV1,checkProgrammingDependencies.start,result,00",
+                "exampleEcuV1,vin.write,vin,31",
             ],
         ),
         vec![
-            at(
-                UnknownReference,
-                "variant_patterns.csv",
-                Some(3),
-                Some("variant")
-            ),
-            at(
-                UnknownReference,
-                "variant_patterns.csv",
-                Some(4),
-                Some("service")
-            ),
-            at(
-                UnknownReference,
-                "variant_patterns.csv",
-                Some(5),
-                Some("service")
-            ),
-            at(
-                UnknownReference,
-                "variant_patterns.csv",
-                Some(6),
-                Some("field")
-            ),
-            at(
-                UnknownReference,
-                "variant_patterns.csv",
-                Some(7),
-                Some("field")
-            ),
-            at(
-                UnknownReference,
-                "variant_patterns.csv",
-                Some(8),
-                Some("field")
-            ),
+            at(UnknownReference, P, Some(3), Some("variant")),
+            at(UnknownReference, P, Some(4), Some("service")),
+            at(UnknownReference, P, Some(5), Some("service")),
+            // A constant has no IR field; a shaped field is not a scalar value.
+            at(UnknownReference, P, Some(6), Some("field")),
+            at(BadValue, P, Some(7), Some("field")),
+            at(UnknownReference, P, Some(8), Some("field")),
+            // A write's positive response carries only the identifier.
+            at(UnknownReference, P, Some(10), Some("field")),
         ]
     );
 }
@@ -1072,7 +1050,8 @@ fn fields_name_existing_owners_and_references() {
          layout:dtcRecord,nested,5,,,,,,,,,,repeat,noLayout,\n\
          layout:dtcRecord,later,6,,uint,8,,,,,,,,,afterwards\n\
          layout:dtcRecord,afterwards,7,,uint,8,,,,,,,,,\n\
-         layout:dtcStatus,elsewhere,1,,uint,8,,,,,,,,,dtc\n",
+         layout:dtcStatus,elsewhere,1,,uint,8,,,,,,,,,dtc\n\
+         layout:dtcStatus,nowhere,1,,uint,8,,,,,,,,,missing\n",
     );
     // Every field of powerCycles goes, so the DID has none.
     let contents: String = contents
@@ -1088,68 +1067,21 @@ fn fields_name_existing_owners_and_references() {
         u32::try_from(index).unwrap() + 1
     };
     const F: &str = "fields.csv";
+    let e = |code, prefix: &str, column: &str| at(code, F, Some(lines(prefix)), Some(column));
     let expected = vec![
         at(MissingColumn, "dids.csv", Some(7), Some("name")),
-        at(
-            UnknownReference,
-            F,
-            Some(lines("response:unknownService")),
-            Some("container"),
-        ),
-        at(
-            UnknownReference,
-            F,
-            Some(lines("did:unknownDid")),
-            Some("container"),
-        ),
-        at(
-            UnknownReference,
-            F,
-            Some(lines("routine:unknownRoutine")),
-            Some("container"),
-        ),
-        at(
-            UnknownReference,
-            F,
-            Some(lines("routine:eraseMemory:stop")),
-            Some("container"),
-        ),
-        at(
-            UnknownReference,
-            F,
-            Some(lines("layout:unknownLayout")),
-            Some("container"),
-        ),
-        at(
-            UnknownReference,
-            F,
-            Some(lines("layout:dtcRecord,converted")),
-            Some("conversion"),
-        ),
-        at(
-            UnknownReference,
-            F,
-            Some(lines("layout:dtcRecord,converted")),
-            Some("unit"),
-        ),
-        at(
-            UnknownReference,
-            F,
-            Some(lines("layout:dtcRecord,nested")),
-            Some("layout"),
-        ),
-        at(
-            UnknownReference,
-            F,
-            Some(lines("layout:dtcRecord,later")),
-            Some("ref"),
-        ),
-        at(
-            UnknownReference,
-            F,
-            Some(lines("layout:dtcStatus,elsewhere")),
-            Some("ref"),
-        ),
+        e(UnknownReference, "response:unknownService", "container"),
+        e(UnknownReference, "did:unknownDid", "container"),
+        e(UnknownReference, "routine:unknownRoutine", "container"),
+        e(UnknownReference, "routine:eraseMemory:stop", "container"),
+        e(UnknownReference, "layout:unknownLayout", "container"),
+        e(UnknownReference, "layout:dtcRecord,converted", "conversion"),
+        e(UnknownReference, "layout:dtcRecord,converted", "unit"),
+        e(UnknownReference, "layout:dtcRecord,nested", "layout"),
+        // A later field of the same container, a field of another one, and no field at all.
+        e(BadValue, "layout:dtcRecord,later", "ref"),
+        e(Unsupported, "layout:dtcStatus,elsewhere", "ref"),
+        e(UnknownReference, "layout:dtcStatus,nowhere", "ref"),
     ];
     assert_eq!(resolved(with(F, &contents)), expected);
 }
@@ -1253,4 +1185,163 @@ fn a_service_row_replaces_the_variant_wide_row_of_its_nrc() {
     assert_eq!(nrcs(0, "defaultSession"), vec![0x7F, 0x22, 0x31]);
     assert_eq!(nrcs(1, "defaultSession"), vec![0x31, 0x7F, 0x22]);
     assert_eq!(nrcs(1, "extendedSession"), vec![0x22, 0x31]);
+}
+
+/// The example's `file`, as text.
+fn example_text(file: &str) -> String {
+    let (_, bytes) = example()
+        .into_iter()
+        .find(|(n, _)| n == file)
+        .expect("in the example");
+    String::from_utf8(bytes).expect("UTF-8")
+}
+
+#[test]
+fn an_unknown_variant_is_reported_only_where_it_is_written() {
+    // A typo in a protocol's scope does not also fail its ComParams or the variant it missed.
+    assert_eq!(
+        resolved_with(
+            "protocols.csv",
+            "variants,name,baud_rate,tx_id,rx_id",
+            &["exampleEcuV11;exampleEcuV2,ISO15765,500000,0x7E0,0x7E8"],
+        ),
+        vec![at(
+            UnknownReference,
+            "protocols.csv",
+            Some(2),
+            Some("variants")
+        )]
+    );
+    // Nor does a typo in a DID's scope fail the NRCs and variant patterns that name it.
+    let dids = example_text("dids.csv").replace(
+        "\n,softwareVersion,",
+        "\nexampleEcuV11;exampleEcuV2,softwareVersion,",
+    );
+    let mut files = with("dids.csv", &dids);
+    files.retain(|(n, _)| n != "nrcs.csv");
+    files.push((
+        "nrcs.csv".into(),
+        b"service,nrc\nsoftwareVersion.read,0x31\n".to_vec(),
+    ));
+    assert_eq!(
+        resolved(files),
+        vec![at(UnknownReference, "dids.csv", Some(4), Some("variants"))]
+    );
+}
+
+#[test]
+fn a_missing_lower_limit_is_reported_beside_a_bad_upper_one() {
+    assert_eq!(
+        resolved_with(
+            "conversion_scales.csv",
+            "conversion,lower,upper,text",
+            &[
+                "sessionName,0x01,,session.default",
+                "checkResult,,abc,check.correct",
+            ],
+        ),
+        vec![
+            at(
+                MissingColumn,
+                "conversion_scales.csv",
+                Some(3),
+                Some("lower")
+            ),
+            at(BadValue, "conversion_scales.csv", Some(3), Some("upper")),
+        ]
+    );
+}
+
+#[test]
+fn a_layout_a_dtc_names_holds_no_shaped_field() {
+    let fields = example_text("fields.csv");
+    let line = u32::try_from(fields.lines().count()).unwrap() + 1;
+    let fields = format!("{fields}layout:dtcStatus,nested,1,,,,,,,,,,repeat,dtcRecord,\n");
+    let mut files = with("fields.csv", &fields);
+    files.retain(|(n, _)| n != "repeats.csv");
+    files.push((
+        "repeats.csv".into(),
+        b"container,field,count\n\
+          response:readDtcByStatusMask,records,end\n\
+          layout:dtcStatus,nested,end\n"
+            .to_vec(),
+    ));
+    // Both DTCs name the layout; the field is reported once.
+    assert_eq!(
+        resolved(files),
+        vec![at(BadValue, "fields.csv", Some(line), Some("shape"))]
+    );
+}
+
+#[test]
+fn every_scoped_key_is_unique_within_a_variant() {
+    let rejected = |file: &str, header: &str, rows: &[&str], column: &str| {
+        let line = u32::try_from(rows.len()).unwrap() + 1;
+        assert_eq!(
+            resolved_with(file, header, rows),
+            vec![at(Duplicate, file, Some(line), Some(column))],
+            "{file}"
+        );
+    };
+    // In each, the first two rows are in different variants; the last clashes with both.
+    rejected(
+        "protocols.csv",
+        "variants,name,baud_rate,tx_id,rx_id",
+        &[
+            "exampleEcuV1,ISO15765,500000,0x7E0,0x7E8",
+            "exampleEcuV2,ISO15765,500000,0x7E0,0x7E8",
+            ",ISO15765,250000,0x7E0,0x7E8",
+        ],
+        "name",
+    );
+    rejected(
+        "comparams.csv",
+        "variants,protocol,name,value",
+        &[
+            "exampleEcuV1,ISO15765,CP_StMin,0",
+            "exampleEcuV2,ISO15765,CP_StMin,1",
+            ",ISO15765,CP_StMin,2",
+        ],
+        "name",
+    );
+    rejected(
+        "routines.csv",
+        "variants,name,rid,start",
+        &[
+            "exampleEcuV1,eraseMemory,0xFF00,yes",
+            "exampleEcuV2,eraseAgain,0xFF00,yes",
+            ",checkProgrammingDependencies,0xFF00,yes",
+        ],
+        "rid",
+    );
+    rejected(
+        "dtcs.csv",
+        "variants,code,display,status",
+        &[
+            "exampleEcuV1,0x910116,B1101-16,dtcStatus",
+            "exampleEcuV2,0x910116,B1101-16,dtcStatus",
+            ",0x910116,B1101-16,dtcStatus",
+        ],
+        "code",
+    );
+    let mut files = with(
+        "flash_sessions.csv",
+        "variants,id,name,steps\n\
+         exampleEcuV1,1,application,ecu-reset\n\
+         exampleEcuV2,1,calibration,ecu-reset\n\
+         ,1,boot,ecu-reset\n",
+    );
+    files.retain(|(n, _)| n != "flash_segments.csv");
+    files.push((
+        "flash_segments.csv".into(),
+        b"session,name,start_address,length,artifact_offset,block_size\n\
+          application,app,0x0,0x10,0,0x10\n\
+          calibration,cal,0x0,0x10,0,0x10\n\
+          boot,boot,0x0,0x10,0,0x10\n"
+            .to_vec(),
+    ));
+    assert_eq!(
+        resolved(files),
+        vec![at(Duplicate, "flash_sessions.csv", Some(4), Some("id"))]
+    );
 }

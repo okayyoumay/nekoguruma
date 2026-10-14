@@ -69,7 +69,10 @@ type Variants = BTreeSet<usize>;
 #[derive(Clone)]
 struct ServiceInfo {
     variants: Variants,
-    response: Container,
+    /// The positive response's container; `None` when it holds only generated constants.
+    response: Option<Container>,
+    /// The row's `variants` list named an unknown variant, so `variants` may lack some.
+    partial: bool,
 }
 
 struct Resolver<'a> {
@@ -77,6 +80,10 @@ struct Resolver<'a> {
     e: &'a mut Errors,
     variant_index: HashMap<&'a str, usize>,
     all: Variants,
+    /// The rows, as (file, line), whose `variants` list named an unknown variant. A check that
+    /// would fail only because such a row lacks a variant is skipped, since the row's own error
+    /// already explains it (section 7).
+    partial: HashSet<(&'static str, Line)>,
 }
 
 impl<'a> Resolver<'a> {
@@ -93,6 +100,7 @@ impl<'a> Resolver<'a> {
             e,
             variant_index,
             all,
+            partial: HashSet::new(),
         }
     }
 
@@ -106,7 +114,7 @@ impl<'a> Resolver<'a> {
 
     /// The variants of a scoped row: its `variants` list, or every variant when empty. Unknown
     /// names are reported and left out.
-    fn scope(&mut self, file: &str, line: Line, scope: &Scope) -> Variants {
+    fn scope(&mut self, file: &'static str, line: Line, scope: &Scope) -> Variants {
         if scope.is_empty() {
             return self.all.clone();
         }
@@ -116,12 +124,15 @@ impl<'a> Resolver<'a> {
                 Some(&i) => {
                     variants.insert(i);
                 }
-                None => self.unknown(
-                    file,
-                    line,
-                    "variants",
-                    format!("no variant named {name} in variants.csv"),
-                ),
+                None => {
+                    self.partial.insert((file, line));
+                    self.unknown(
+                        file,
+                        line,
+                        "variants",
+                        format!("no variant named {name} in variants.csv"),
+                    );
+                }
             }
         }
         variants
@@ -238,7 +249,8 @@ impl<'a> Resolver<'a> {
                 },
                 ServiceInfo {
                     variants: variants.clone(),
-                    response: Container::Response(row.name.clone()),
+                    response: Some(Container::Response(row.name.clone())),
+                    partial: self.partial.contains(&("services.csv", row.line)),
                 },
             );
         }
@@ -252,7 +264,10 @@ impl<'a> Resolver<'a> {
                         },
                         ServiceInfo {
                             variants: variants.clone(),
-                            response: Container::Did(row.name.clone()),
+                            // A write's positive response echoes only the identifier (4.7).
+                            response: (generated == Generated::Read)
+                                .then(|| Container::Did(row.name.clone())),
+                            partial: self.partial.contains(&("dids.csv", row.line)),
                         },
                     );
                 }
@@ -272,11 +287,12 @@ impl<'a> Resolver<'a> {
                         },
                         ServiceInfo {
                             variants: variants.clone(),
-                            response: Container::Routine {
+                            response: Some(Container::Routine {
                                 routine: row.name.clone(),
                                 part,
                                 response: true,
-                            },
+                            }),
+                            partial: self.partial.contains(&("routines.csv", row.line)),
                         },
                     );
                 }
@@ -287,6 +303,15 @@ impl<'a> Resolver<'a> {
 
     /// Every variant needs a protocol (4.3).
     fn protocols_per_variant(&mut self, protocols: &[Variants]) {
+        // A protocol whose scope names an unknown variant may have been meant for any of them.
+        if self
+            .t
+            .protocols
+            .iter()
+            .any(|p| self.partial.contains(&("protocols.csv", p.line)))
+        {
+            return;
+        }
         for (i, variant) in self.t.variants.iter().enumerate() {
             if !protocols.iter().any(|p| p.contains(&i)) {
                 self.error(
@@ -319,7 +344,10 @@ impl<'a> Resolver<'a> {
                 })
                 .map(|&v| t.variants[v].name.as_str())
                 .collect();
-            if !missing.is_empty() {
+            let partial = t.protocols.iter().any(|p| {
+                p.name == row.protocol && self.partial.contains(&("protocols.csv", p.line))
+            });
+            if !missing.is_empty() && !partial {
                 self.unknown(
                     "comparams.csv",
                     row.line,
@@ -368,6 +396,9 @@ impl<'a> Resolver<'a> {
                 continue;
             };
             if !service.variants.contains(&variant) {
+                if service.partial {
+                    continue;
+                }
                 self.unknown(
                     "variant_patterns.csv",
                     row.line,
@@ -383,17 +414,22 @@ impl<'a> Resolver<'a> {
             let field = t
                 .fields
                 .iter()
-                .find(|f| f.container == service.response && f.name == row.field);
+                .find(|f| service.response.as_ref() == Some(&f.container) && f.name == row.field);
             match field {
                 Some(f) if f.constant.is_none() && f.shape.is_none() => {}
-                Some(_) => self.unknown(
+                // A constant has no IR field to compare (5.3).
+                Some(f) if f.constant.is_some() => self.unknown(
                     "variant_patterns.csv",
                     row.line,
                     "field",
-                    format!(
-                        "{} is a constant or a shaped field, not a value of the response",
-                        row.field
-                    ),
+                    format!("{} is a constant, not a field of the response", row.field),
+                ),
+                Some(_) => self.error(
+                    ErrorCode::BadValue,
+                    "variant_patterns.csv",
+                    row.line,
+                    "field",
+                    format!("{} is a shaped field, not a scalar value", row.field),
                 ),
                 None => self.unknown(
                     "variant_patterns.csv",
@@ -431,7 +467,7 @@ impl<'a> Resolver<'a> {
                             .difference(&service.variants)
                             .map(|&v| t.variants[v].name.as_str())
                             .collect();
-                        if !missing.is_empty() {
+                        if !missing.is_empty() && !service.partial {
                             self.unknown(
                                 "nrcs.csv",
                                 row.line,
@@ -651,6 +687,15 @@ impl<'a> Resolver<'a> {
         in_order: impl Fn(T, T) -> bool,
     ) -> Option<(T, T)> {
         const FILE: &str = "conversion_scales.csv";
+        if row.lower.is_none() {
+            self.error(
+                ErrorCode::MissingColumn,
+                FILE,
+                row.line,
+                "lower",
+                "the row needs a lower limit".into(),
+            );
+        }
         let mut cell = |column: &str, text: Option<&String>| -> Result<Option<T>, ()> {
             match text {
                 None => Ok(None),
@@ -661,17 +706,7 @@ impl<'a> Resolver<'a> {
         };
         let lower = cell("lower", row.lower.as_ref());
         let upper = cell("upper", row.upper.as_ref());
-        let (lower, upper) = (lower.ok()?, upper.ok()?);
-        let Some(lower) = lower else {
-            self.error(
-                ErrorCode::MissingColumn,
-                FILE,
-                row.line,
-                "lower",
-                "the row needs a lower limit".into(),
-            );
-            return None;
-        };
+        let (lower, upper) = (lower.ok()??, upper.ok()?);
         let upper = upper.unwrap_or(lower);
         if !in_order(lower, upper) {
             self.error(
@@ -686,9 +721,33 @@ impl<'a> Resolver<'a> {
         Some((lower, upper))
     }
 
-    /// A DTC's text and layouts exist (4.11).
+    /// A DTC's text and layouts exist, and those layouts hold no shaped field (4.11).
     fn dtcs(&mut self, _dtcs: &[Variants], layouts: &HashSet<&str>, texts: &HashSet<String>) {
-        for row in &self.t.dtcs {
+        let t = self.t;
+        // A layout a DTC names has no shaped field, since a DTC definition holds no layouts; the
+        // field is reported once, however many DTCs name its layout.
+        let named: HashSet<&str> = t
+            .dtcs
+            .iter()
+            .flat_map(|r| [Some(&r.status), r.snapshot.as_ref(), r.extended.as_ref()])
+            .flatten()
+            .map(String::as_str)
+            .collect();
+        for field in &t.fields {
+            if let Container::Layout(layout) = &field.container
+                && named.contains(layout.as_str())
+                && field.shape.is_some()
+            {
+                self.error(
+                    ErrorCode::BadValue,
+                    "fields.csv",
+                    field.line,
+                    "shape",
+                    format!("layout {layout} is named by a DTC and cannot hold a shaped field"),
+                );
+            }
+        }
+        for row in &t.dtcs {
             self.text("dtcs.csv", row.line, "text", row.text.as_deref(), texts);
             for (column, layout) in [
                 ("status", Some(&row.status)),
@@ -837,12 +896,31 @@ impl<'a> Resolver<'a> {
             if let Some(reference) = &row.reference
                 && !earlier.contains(reference.as_str())
             {
-                self.unknown(
-                    FILE,
-                    row.line,
-                    "ref",
-                    format!("no field {reference} earlier in the same container"),
-                );
+                let named = |f: &&FieldRow| f.name == *reference;
+                if t.fields
+                    .iter()
+                    .filter(named)
+                    .any(|f| f.container == row.container)
+                {
+                    self.error(
+                        ErrorCode::BadValue,
+                        FILE,
+                        row.line,
+                        "ref",
+                        format!("{reference} comes after this field in the container"),
+                    );
+                } else if t.fields.iter().any(|f| named(&f)) {
+                    // A field of another container cannot be tied to one occurrence (5.2).
+                    self.error(
+                        ErrorCode::Unsupported,
+                        FILE,
+                        row.line,
+                        "ref",
+                        format!("{reference} is a field of another container"),
+                    );
+                } else {
+                    self.unknown(FILE, row.line, "ref", format!("no field {reference}"));
+                }
             }
             earlier.insert(row.name.as_str());
         }

@@ -82,9 +82,10 @@ declared service from the SID and the parameter names when it lowers the call.
 10. **DTC status, snapshot and extended data are layouts.** A DTC row names the layouts whose
     fields the converter copies into its definition. The status byte's bits are therefore data
     in the definition, not a list built into the converter.
-11. **Every error is listed, with file, line and column.** As for Starlark (subset spec 5), the
-    conversion reports all errors at once, with codes `CSV_*`, and checks every rule `ir.fbs`
-    states, so nothing reaches the agent that the IR forbids (8.3).
+11. **Every error is listed, with its file and, where they exist, its line and column.** As for
+    Starlark (subset spec 5), the conversion reports all errors at once, with codes `CSV_*`; an
+    error about a whole file or its header leaves out the location it does not have. It checks
+    every rule `ir.fbs` states, so nothing reaches the agent that the IR forbids (8.3).
 12. **Left out of this version:** monitor sets (the converter emits none), `CompuBytecode`,
     constants that are not leading or sit in a nested layout, request fields
     without a single encoding of a procedure's value (shapes, lengths from another field, `zero`

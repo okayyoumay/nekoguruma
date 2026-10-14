@@ -480,10 +480,11 @@ fn convert(
     } else if let Some(c) = field.compu_as_compu_scale_linear() {
         // Both limits are inclusive, like ODX's default CLOSED interval (ADR-297); the first
         // matching scale wins.
-        let scale = c
-            .scales()
-            .into_iter()
-            .flatten()
+        let Some(scales) = c.scales().filter(|s| !s.is_empty()) else {
+            return Err(plan(field, "a scale-linear conversion without scales"));
+        };
+        let scale = scales
+            .iter()
             .find(|s| s.lower() <= x && x <= s.upper())
             .ok_or_else(|| conversion(field, "no scale contains the value"))?;
         linear(
@@ -577,8 +578,14 @@ fn interpolate(
         }
         if x0 < x && x < x1 {
             // The fraction first, then a weighted sum, as (x - x0) * (y1 - y0) can overflow.
-            // Halving the operands keeps the differences of finite points finite too.
-            let t = (x / 2.0 - x0 / 2.0) / (x1 / 2.0 - x0 / 2.0);
+            // Only a span across most of the float range overflows itself; its halves do not,
+            // and halving any other span could underflow it to zero.
+            let span = x1 - x0;
+            let t = if span.is_finite() {
+                (x - x0) / span
+            } else {
+                (x / 2.0 - x0 / 2.0) / (x1 / 2.0 - x0 / 2.0)
+            };
             return finite(y0 * (1.0 - t) + y1 * t);
         }
     }

@@ -66,8 +66,8 @@ response, and what the decoder does with a plan that breaks a schema rule only a
      ECU's side);
    - `Truncated`: the message ends inside a field;
    - `InvalidPlan`: the plan breaks a schema rule that a frontend must enforce, such as a
-     16-bit float, a terminated integer, a numeric conversion on a string or a constant zero
-     denominator. The loader
+     16-bit float, a terminated integer, a numeric conversion on a string, a constant zero
+     denominator or a scale-linear conversion without scales. The loader
      (ADR-296) checks only what the schema states as types and tags, so the decoder rejects such
      a plan where it meets it rather than guessing;
    - `Unsupported`: a field with a shape (a nested layout, ADR-242) or a `CompuBytecode`

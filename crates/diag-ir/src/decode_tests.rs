@@ -694,6 +694,14 @@ fn scale_linear_ranges_include_both_limits() {
         decode(&[], uint8(compu()), &[SID, 15]),
         Err(DecodeError::Conversion { field: 1, .. })
     ));
+    // A scale-linear conversion without scales is a broken plan, not the value's fault.
+    for scales in [None, Some(vec![])] {
+        let empty = CompuT::CompuScaleLinear(Box::new(CompuScaleLinearT { scales }));
+        assert!(matches!(
+            decode(&[], uint8(empty), &[SID, 1]),
+            Err(DecodeError::InvalidPlan { field: 1, .. })
+        ));
+    }
     // Should scales overlap (the CSV format rejects that), the first one applies.
     let overlapping = CompuT::CompuScaleLinear(Box::new(CompuScaleLinearT {
         scales: Some(vec![scale(0.0, 10.0, 1.0), scale(5.0, 10.0, 2.0)]),
@@ -793,6 +801,15 @@ fn interpolation_is_linear_between_points() {
         compu(Some(vec![point(-f64::MAX, -1.0), point(f64::MAX, 1.0)])),
     )];
     assert_eq!(values(decode(&[], widest, &[SID, 0])), vec![Float(0.0)]);
+    // A span of subnormal points does not underflow to zero.
+    let tiny = vec![with_compu(
+        next(1, DataKind::Int, 8),
+        compu(Some(vec![
+            point(-f64::from_bits(1), -1.0),
+            point(f64::from_bits(1), 1.0),
+        ])),
+    )];
+    assert_eq!(values(decode(&[], tiny, &[SID, 0])), vec![Float(0.0)]);
     // A point's physical value that is not finite is no result, even when hit exactly.
     let infinite = compu(Some(vec![point(0.0, f64::INFINITY), point(10.0, 0.0)]));
     assert!(matches!(

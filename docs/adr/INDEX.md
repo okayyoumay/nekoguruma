@@ -250,7 +250,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-258](ADR-258-a-failed-link-close-keeps-the-job-guards.md) | A Failed Link Close Keeps the Job Guards | Accepted | `agent` guards, runner, CLI; `worker-host` |
 | [ADR-259](ADR-259-a-standalone-agent-refuses-security-access.md) | A Standalone Agent Refuses the SecurityAccess Instruction | Accepted | `agent` policy, host |
 | [ADR-260](ADR-260-sim-vci-stays-separate-from-the-j2534-mock.md) | `sim-vci` Stays Separate from `j2534-0404-mock` | Accepted | `sim-vci`, `j2534-0404-mock` |
-| [ADR-261](ADR-261-restart-identity-and-safety-gates.md) | The Restart's Identity and Safety Gates | Accepted (the promotion consequence settled by ADR-263; item 2's ending with the gates' decision superseded by ADR-264; the creation-prefix rule extended to the intended software version by ADR-268; the unjournaled-abort consequence closed for the identity abort by ADR-286) | `agent` restart, runner, journaling |
+| [ADR-261](ADR-261-restart-identity-and-safety-gates.md) | The Restart's Identity and Safety Gates | Accepted (the promotion consequence settled by ADR-263; item 2's ending with the gates' decision superseded by ADR-264; the creation-prefix rule extended to the intended software version by ADR-268; the unjournaled-abort consequence closed for the identity abort by ADR-286 and for the on-site endings by ADR-290) | `agent` restart, runner, journaling |
 | [ADR-262](ADR-262-per-vehicle-lock-in-fixed-buckets.md) | The Per-Vehicle Lock Is One of 4096 Fixed Bucket Files | Accepted | `agent` guards |
 | [ADR-263](ADR-263-restart-promotes-to-the-per-vehicle-lock.md) | The Restart Promotes to the Per-Vehicle Lock at Its VIN Match | Accepted (the step 3 fallback consequence settled by ADR-267) | `agent` restart, runner |
 | [ADR-264](ADR-264-restart-teardown.md) | The Restart's Teardown Sends One Hard Reset or Waits Out the Session | Accepted (item 5's ending amended by ADR-265; item 5's `RestartOrderUnavailable` carrying the outcome superseded by ADR-276, which goes on with the erase; item 1's completed path counts only for the interrupted pass since ADR-269 item 2) | `agent` restart, runner; `sim-ecu` |
@@ -275,10 +275,11 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-283](ADR-283-codeql-workflow-and-windows-dll-check.md) | CodeQL Runs as a Repository Workflow, and the Windows DLL Check Uses the Runner's System Directory | Accepted | `.github/workflows/codeql.yml`, `codeql-alert-handoff.yml`, `ci.yml` (`worker-windows`, `abi-roundtrip-windows`) |
 | [ADR-284](ADR-284-agent-passes-the-definition-long-size.md) | The Agent Passes the Registration Definition's `LongSize` to the J2534 Worker | Accepted | `agent` launch, `ngr-agent run`, design 7.1.1 / 7.1.2 / 7.3 |
 | [ADR-285](ADR-285-launcher-checks-the-configuration-file.md) | The Launcher Checks the Worker's Configuration File Before Reading It | Accepted | `vci-service-launcher`, `ngr-library-resolver`, `iso22900-service`, `j2534-0404-service`, design 7.2 |
-| [ADR-286](ADR-286-restart-identity-abort-is-journaled.md) | The Restart's Identity Abort Is Journaled as a Terminal Record | Accepted | `agent` journal, restart, runner; design 5.6 / 8.2.5 |
+| [ADR-286](ADR-286-restart-identity-abort-is-journaled.md) | The Restart's Identity Abort Is Journaled as a Terminal Record | Accepted (Decision item 5's open point decided by ADR-290: the on-site endings after the resume count stay re-resumable within the resume limit) | `agent` journal, restart, runner; design 5.6 / 8.2.5 |
 | [ADR-287](ADR-287-the-step-limit-applies-per-run.md) | The Job's Step Limit Applies to Each Run | Accepted (the open consequence on a plain start after a step-limited run decided by ADR-288: the stop is journaled as terminal) | `agent` runner |
 | [ADR-288](ADR-288-a-stopped-run-is-journaled-as-terminal.md) | A Run Stopped on the Step Limit or a VM Error Is Journaled as a Terminal Record | Accepted | `agent` journal, restart, runner; `diag-ir` `VmError`; design 5.6 |
 | [ADR-289](ADR-289-a-lost-vci-ends-the-primitive-at-once.md) | A Lost VCI Ends the Pending Primitive at Once, as `HostError::VciLost` | Accepted | `agent` host; design 5.6 / 8.2.5 |
+| [ADR-290](ADR-290-restart-on-site-endings-stay-re-resumable.md) | The Restart's On-Site Endings after the Resume Count Stay Re-Resumable | Accepted | `agent` restart; design 5.6 / 8.2.5 |
 
 ## Status Legend
 
@@ -642,7 +643,7 @@ the predecessor repository these ADRs came from.
 - ADR-257 (lock files must be regular files since ADR-262 item 6)
 - ADR-258
 - ADR-259
-- ADR-261 (the promotion consequence settled by ADR-263; item 2's ending with the gates' decision superseded by ADR-264; the creation-prefix rule extended to the intended software version by ADR-268; the unjournaled-abort consequence closed for the identity abort by ADR-286)
+- ADR-261 (the promotion consequence settled by ADR-263; item 2's ending with the gates' decision superseded by ADR-264; the creation-prefix rule extended to the intended software version by ADR-268; the unjournaled-abort consequence closed for the identity abort by ADR-286 and for the on-site endings by ADR-290)
 - ADR-262
 - ADR-263 (the step 3 fallback consequence settled by ADR-267)
 - ADR-264 (item 5's ending amended by ADR-265; item 5's `RestartOrderUnavailable` carrying the outcome superseded by ADR-276, which goes on with the erase; item 1's completed path counts only for the interrupted pass since ADR-269 item 2)
@@ -656,10 +657,11 @@ the predecessor repository these ADRs came from.
 - ADR-274
 - ADR-276 (item 3's gap closed by ADR-280: the procedure can end the job as failed; the step-limit consequence superseded by ADR-287, which gives each run its own budget)
 - ADR-280 (schema-compatibility consequence relaxed by ADR-281 item 4; the terminal-record rule extended to the restart's identity abort by ADR-286; the open consequence on the step limit and a VM error decided by ADR-288, which journals both as terminal)
-- ADR-286
+- ADR-286 (Decision item 5's open point decided by ADR-290: the on-site endings after the resume count stay re-resumable within the resume limit)
 - ADR-287 (the open consequence on a plain start after a step-limited run decided by ADR-288: the stop is journaled as terminal)
 - ADR-288
 - ADR-289
+- ADR-290
 
 ### Diagnostic IR
 - ADR-233 (item 3's `VmState` fields removed by ADR-245; `Op::Fail` and `StepOutcome::Failed` appended by ADR-280)

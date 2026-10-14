@@ -2,13 +2,14 @@
 //!
 //! [`read_directory`] (or [`read_files`] for files already in memory) checks the file set, the
 //! dialect, the value syntax, and each table's columns and cells, and returns the typed rows of
-//! every table. Every error is collected and reported at once, sorted as section 7 of the format
-//! describes. The rules that compare rows with each other or with other tables (references,
-//! variant scoping, the field rules of section 5) are not checked yet, apart from names defined
-//! twice in one table.
+//! every table. [`resolve`] then checks the rules that compare rows with each other or with other
+//! tables: references, variant scoping, and keys defined twice in one variant's document. Each
+//! stage reports every error it finds, sorted as section 7 of the format describes. The field
+//! rules of section 5 and the `ir.fbs` rules of section 6 are not checked yet.
 
 mod error;
 mod records;
+mod resolve;
 pub mod rows;
 mod sheet;
 mod values;
@@ -18,6 +19,7 @@ use std::path::Path;
 
 use error::Errors;
 pub use error::{ErrorCode, Rejected, TableError};
+pub use resolve::{Definition, VariantRows, resolve};
 use rows::*;
 use sheet::{Sheet, Spec};
 pub use values::{Generated, ServiceName};

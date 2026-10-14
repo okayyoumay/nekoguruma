@@ -390,7 +390,7 @@ preconditions belong to the procedure part (ADR-245) and have no table here.
 | `checksum` | bytes | no | Default empty |
 
 Every flash session needs at least one segment, and the address ranges of one session's segments
-must not overlap.
+must not overlap (`CSV_DUPLICATE`).
 
 ---
 

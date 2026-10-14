@@ -1014,7 +1014,7 @@ fn flash_segments_belong_to_a_session_and_do_not_overlap() {
         resolved(files),
         vec![
             at(
-                BadValue,
+                Duplicate,
                 "flash_segments.csv",
                 Some(3),
                 Some("start_address")
@@ -1343,5 +1343,77 @@ fn every_scoped_key_is_unique_within_a_variant() {
     assert_eq!(
         resolved(files),
         vec![at(Duplicate, "flash_sessions.csv", Some(4), Some("id"))]
+    );
+}
+
+#[test]
+fn an_unknown_variant_hides_no_other_error_of_its_row() {
+    assert_eq!(
+        resolved_with(
+            "comparams.csv",
+            "variants,protocol,name,value",
+            &["exampleEcuV3,CAN,CP_StMin,0"],
+        ),
+        vec![
+            at(UnknownReference, "comparams.csv", Some(2), Some("protocol")),
+            at(UnknownReference, "comparams.csv", Some(2), Some("variants")),
+        ]
+    );
+    assert_eq!(
+        resolved_with(
+            "variant_patterns.csv",
+            "variant,service,field,expected",
+            &[
+                "exampleEcuV3,missing.read,softwareVersion,31",
+                "exampleEcuV3,softwareVersion.read,missing,31",
+            ],
+        ),
+        vec![
+            at(
+                UnknownReference,
+                "variant_patterns.csv",
+                Some(2),
+                Some("service")
+            ),
+            at(
+                UnknownReference,
+                "variant_patterns.csv",
+                Some(2),
+                Some("variant")
+            ),
+            at(
+                UnknownReference,
+                "variant_patterns.csv",
+                Some(3),
+                Some("field")
+            ),
+            at(
+                UnknownReference,
+                "variant_patterns.csv",
+                Some(3),
+                Some("variant")
+            ),
+        ]
+    );
+    // A service whose own scope has a typo still has its response fields checked.
+    let dids =
+        example_text("dids.csv").replace("\n,softwareVersion,", "\nexampleEcuV11,softwareVersion,");
+    let mut files = with("dids.csv", &dids);
+    files.retain(|(n, _)| n != "variant_patterns.csv");
+    files.push((
+        "variant_patterns.csv".into(),
+        b"variant,service,field,expected\nexampleEcuV1,softwareVersion.read,missing,31\n".to_vec(),
+    ));
+    assert_eq!(
+        resolved(files),
+        vec![
+            at(UnknownReference, "dids.csv", Some(4), Some("variants")),
+            at(
+                UnknownReference,
+                "variant_patterns.csv",
+                Some(2),
+                Some("field")
+            ),
+        ]
     );
 }

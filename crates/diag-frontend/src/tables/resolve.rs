@@ -347,7 +347,15 @@ impl<'a> Resolver<'a> {
             let partial = t.protocols.iter().any(|p| {
                 p.name == row.protocol && self.partial.contains(&("protocols.csv", p.line))
             });
-            if !missing.is_empty() && !partial {
+            if !t.protocols.iter().any(|p| p.name == row.protocol) {
+                // Reported whatever the row's own scope resolved to.
+                self.unknown(
+                    "comparams.csv",
+                    row.line,
+                    "protocol",
+                    format!("no protocol {} in protocols.csv", row.protocol),
+                );
+            } else if !missing.is_empty() && !partial {
                 self.unknown(
                     "comparams.csv",
                     row.line,
@@ -377,15 +385,16 @@ impl<'a> Resolver<'a> {
     fn variant_patterns(&mut self, services: &HashMap<ServiceName, ServiceInfo>) {
         let t = self.t;
         for row in &t.variant_patterns {
-            let Some(&variant) = self.variant_index.get(row.variant.as_str()) else {
+            // Each column is checked on its own, so an unknown variant hides no other error.
+            let variant = self.variant_index.get(row.variant.as_str()).copied();
+            if variant.is_none() {
                 self.unknown(
                     "variant_patterns.csv",
                     row.line,
                     "variant",
                     format!("no variant named {} in variants.csv", row.variant),
                 );
-                continue;
-            };
+            }
             let Some(service) = services.get(&row.service) else {
                 self.unknown(
                     "variant_patterns.csv",
@@ -395,10 +404,10 @@ impl<'a> Resolver<'a> {
                 );
                 continue;
             };
-            if !service.variants.contains(&variant) {
-                if service.partial {
-                    continue;
-                }
+            if let Some(variant) = variant
+                && !service.variants.contains(&variant)
+                && !service.partial
+            {
                 self.unknown(
                     "variant_patterns.csv",
                     row.line,
@@ -409,7 +418,6 @@ impl<'a> Resolver<'a> {
                         row.variant
                     ),
                 );
-                continue;
             }
             let field = t
                 .fields
@@ -788,7 +796,7 @@ impl<'a> Resolver<'a> {
             let earlier = by_session.entry(row.session.as_str()).or_default();
             if let Some(&(_, _, line)) = earlier.iter().find(|(s, e, _)| start < *e && *s < end) {
                 self.error(
-                    ErrorCode::BadValue,
+                    ErrorCode::Duplicate,
                     "flash_segments.csv",
                     row.line,
                     "start_address",

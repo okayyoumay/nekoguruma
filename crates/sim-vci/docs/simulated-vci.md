@@ -161,8 +161,13 @@ Simplifications:
 The faults of `sim_ecu::Fault` act on the ECU behind the VCI as described in `sim-ecu`'s document;
 `sim-vci` applies the resulting delay or missing response on the read side. The response pending
 messages of `ResponsePending` are queued on the channel like responses, each at its own delay,
-ahead of the final response. Tests arm them, and
-unplug the VCI, with control commands (ADR-238).
+ahead of the final response. Tests arm them, unplug the VCI and make its writes fail with control
+commands (ADR-238).
+
+A write failure acts on the VCI, not on the ECU: a `PassThruWriteMsgs` call it fails checks its
+arguments and channel as usual, then takes none of the messages, reports zero sent and returns
+`ERR_FAILED`. The ECU sees nothing of it. Like an unplugged VCI, it belongs to the process that
+applied the command, so a worker started afterwards writes normally.
 
 ## Control
 
@@ -175,6 +180,8 @@ A control command is a JSON object tagged by `command`:
 | `{"command": "disconnect_vci"}` | unplugs the VCI |
 | `{"command": "connect_vci"}` | plugs it back in |
 | `{"command": "set_battery_voltage", "millivolts": N}` | sets the battery voltage `READ_VBATT` reports (default 12000) |
+| `{"command": "fail_writes", "times": N}` | the next `N` calls of `PassThruWriteMsgs` (at least 1) fail with `ERR_FAILED`, sending nothing; without `"times"`, every call fails until `clear_write_failures` |
+| `{"command": "clear_write_failures"}` | ends `fail_writes` |
 
 Unknown commands and unknown fields, in the command or in the fault, are rejected. A command that needs the ECU creates it first,
 as the first `PassThruOpen` does. There are two ways to send one:
@@ -242,7 +249,7 @@ lost after the replug, released by the close, and a new device ID on the next op
 runs each step in its own process with a state file: one starts a download and exits without
 closing anything, the next reads the running transfer and the programming session (DIDs FD00
 and F186), and one started after tS3_Server reads the interrupted transfer in the default
-session. `tests/agent_restart_end_to_end.rs` uses the state file with a restart harness (`tests/common/restart.rs`): an agent running a flash job is killed with SIGKILL, with its worker, after a block of the transfer was journaled, and the job is resumed at library level with the same journal directory, once within tS3_Server and once after it ran out (the ECU's timer goes on while no process has it loaded); both end with the job complete and the image verified. `tests/sim_vci_response_pending.rs` runs agent jobs through the worker
+session. `tests/agent_restart_end_to_end.rs` uses the state file with a restart harness (`tests/common/restart.rs`): an agent running a flash job is killed with SIGKILL, with its worker, after a block of the transfer was journaled, and the job is resumed at library level with the same journal directory, once within tS3_Server and once after it ran out (the ECU's timer goes on while no process has it loaded); both end with the job complete and the image verified. The same file interrupts a running agent's transfer with `fail_writes`: the worker reports the refused block as a transmit error, and the next run restarts the transfer and completes the job. `tests/sim_vci_response_pending.rs` runs agent jobs through the worker
 while `sim-ecu` answers with response pending. In a chain whose gaps are longer than P2 and
 shorter than P2*, the job still gets the final response: the worker restarts its timer with P2*
 on each 0x78, and the agent host skips the 0x78s the worker passes on. A chain that outlasts the

@@ -51,7 +51,14 @@ program is loaded (8.9, 8.10.1; ADR-245). A plan refers to its `FlashSession` by
 flatc --rust --gen-object-api -o src/generated schema/ir.fbs
 ```
 
-Generated code is placed in `src/generated` and committed to the repository (so the build environment
-does not require flatc). When the schema changes, bump `IR_SCHEMA_VERSION` and
-have the agent report its supported version via `capabilities` (9.5). Until the declaration part
-is first generated, nothing encodes it, so the schema changes without a version bump.
+Run it in `crates/diag-ir`. The output, `src/generated/ir_generated.rs`, is committed to the
+repository (so the build environment does not require flatc) and is never edited by hand: change
+`ir.fbs` and regenerate in the same commit. Use the `flatc` release whose version equals the
+`flatbuffers` crate's version in the workspace `Cargo.toml` (25.12.19), since the generated code
+calls that runtime. `rustfmt` skips the file (`#[rustfmt::skip]` on its module in
+`src/declaration.rs`).
+
+`declaration::load_ecu_document` is the only way a buffer is read: it checks the `DIR1` file
+identifier, runs the FlatBuffers verifier with bounded limits, and accepts only
+`EcuDocument.schema_version == IR_SCHEMA_VERSION`. When the schema changes, bump
+`IR_SCHEMA_VERSION` and have the agent report its supported version via `capabilities` (9.5).

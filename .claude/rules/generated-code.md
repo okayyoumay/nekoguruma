@@ -3,6 +3,8 @@ paths:
   - "crates/iso22900-sys/**"
   - "crates/j2534-0404-sys/**"
   - "crates/vci-service-interface/**"
+  - "crates/diag-ir/schema/**"
+  - "crates/diag-ir/src/generated/**"
 ---
 
 # Generated code
@@ -12,6 +14,11 @@ paths:
   `cargo build -p vci-service-interface --features vendored-protoc` and commit
   the result with the proto change. Update `docs/rpc-api-guide.md` in the same
   PR.
+- **IR FlatBuffers bindings** (`crates/diag-ir`): `schema/ir.fbs` is the
+  source of truth; `src/generated/ir_generated.rs` is regenerated with `flatc`
+  (command and version in `schema/README.md`) in the same commit as every
+  schema change, never edited by hand. A schema change also bumps
+  `IR_SCHEMA_VERSION`.
 - **FFI bindings** (`crates/iso22900-sys`, `crates/j2534-0404-sys`): the C
   headers in `src/bindings/*.h` are the source of truth;
   `src/bindings/{target}.rs` is committed for every target listed in

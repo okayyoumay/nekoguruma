@@ -117,9 +117,9 @@ the clause or section number and paraphrase in your own words.
 
 ### Generated code
 
-Proto bindings (`crates/vci-service-interface`) and FFI bindings (`crates/*-sys/src/bindings/`)
-are generated and committed. Never hand-edit them, and never regenerate FFI bindings without
-asking first (slow cross builds). The details are in `.claude/rules/generated-code.md`, which
+Proto bindings (`crates/vci-service-interface`), FFI bindings (`crates/*-sys/src/bindings/`) and
+the IR's FlatBuffers bindings (`crates/diag-ir/src/generated/`) are generated and committed. Never
+hand-edit them, and never regenerate FFI bindings without asking first (slow cross builds). The details are in `.claude/rules/generated-code.md`, which
 loads when you open files in those crates.
 
 ### Path-scoped rules

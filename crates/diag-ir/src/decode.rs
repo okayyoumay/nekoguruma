@@ -23,7 +23,7 @@ pub enum PhysicalValue {
     Signed(i64),
     /// A `Float` field, or the result of a numeric conversion.
     Float(f64),
-    /// An `Ascii` (ISO 8859-1), `Utf8` or `Unicode2` field.
+    /// An `Ascii`, `Utf8` or `Unicode2` field.
     Text(String),
     /// A `Bytes` field.
     Bytes(Vec<u8>),
@@ -409,7 +409,8 @@ fn extract_terminated(
 fn string_value(field: &Field<'_>, bytes: &[u8]) -> Result<PhysicalValue, DecodeError> {
     match field.kind() {
         DataKind::Bytes => Ok(PhysicalValue::Bytes(bytes.to_vec())),
-        // ODX codes A_ASCIISTRING as ISO 8859-1, whose bytes are the first 256 code points.
+        // Each byte is the code point of the same value: the 8-bit character set ISO 22901-1
+        // (2008) 7.3.6.2 gives A_ASCIISTRING.
         DataKind::Ascii => Ok(PhysicalValue::Text(
             bytes.iter().map(|&b| char::from(b)).collect(),
         )),
@@ -560,23 +561,25 @@ fn interpolate(
     }
     for (a, b) in points.iter().zip(points.iter().skip(1)) {
         let (x0, y0, x1, y1) = (a.internal(), a.physical(), b.internal(), b.physical());
-        // A value on a point gives that point's physical value exactly.
-        if x == x0 {
-            return Ok(y0);
-        }
-        if x == x1 {
-            return Ok(y1);
-        }
-        if x0 < x && x < x1 {
-            // The fraction first, then a weighted sum: neither step can overflow for finite
-            // points, as (x - x0) * (y1 - y0) can.
-            let t = (x - x0) / (x1 - x0);
-            let result = y0 * (1.0 - t) + y1 * t;
-            return if result.is_finite() {
+        let finite = |result: f64| {
+            if result.is_finite() {
                 Ok(result)
             } else {
                 Err(conversion(field, "the result is not finite"))
-            };
+            }
+        };
+        // A value on a point gives that point's physical value exactly.
+        if x == x0 {
+            return finite(y0);
+        }
+        if x == x1 {
+            return finite(y1);
+        }
+        if x0 < x && x < x1 {
+            // The fraction first, then a weighted sum, as (x - x0) * (y1 - y0) can overflow.
+            // Halving the operands keeps the differences of finite points finite too.
+            let t = (x / 2.0 - x0 / 2.0) / (x1 / 2.0 - x0 / 2.0);
+            return finite(y0 * (1.0 - t) + y1 * t);
         }
     }
     Err(conversion(

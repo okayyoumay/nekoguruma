@@ -204,7 +204,7 @@ fn integers_of_every_width_are_read() {
 }
 
 #[test]
-fn floats_are_ieee_754_in_either_byte_order() {
+fn floats_are_read_from_their_bit_patterns_in_either_byte_order() {
     let mut message = vec![SID];
     message.extend_from_slice(&1.5f32.to_be_bytes());
     message.extend_from_slice(&(-0.25f64).to_le_bytes());
@@ -513,7 +513,7 @@ fn a_unicode2_terminator_is_a_whole_character() {
 
 #[test]
 fn strings_are_checked_against_their_encoding() {
-    // ISO 8859-1: every byte is a character.
+    // Every byte is the code point of the same value.
     assert_eq!(
         values(decode(
             &[],
@@ -787,6 +787,18 @@ fn interpolation_is_linear_between_points() {
         compu(Some(vec![point(-1e300, -1e300), point(1e300, 1e300)])),
     )];
     assert_eq!(values(decode(&[], wide, &[SID, 0])), vec![Float(0.0)]);
+    // Nor on the way to the fraction, when the points span the whole float range.
+    let widest = vec![with_compu(
+        next(1, DataKind::Int, 8),
+        compu(Some(vec![point(-f64::MAX, -1.0), point(f64::MAX, 1.0)])),
+    )];
+    assert_eq!(values(decode(&[], widest, &[SID, 0])), vec![Float(0.0)]);
+    // A point's physical value that is not finite is no result, even when hit exactly.
+    let infinite = compu(Some(vec![point(0.0, f64::INFINITY), point(10.0, 0.0)]));
+    assert!(matches!(
+        decode(&[], uint8(infinite), &[SID, 0]),
+        Err(DecodeError::Conversion { field: 1, .. })
+    ));
     // The whole table is checked, not only the points before the matching segment.
     let late = compu(Some(vec![
         point(0.0, 0.0),

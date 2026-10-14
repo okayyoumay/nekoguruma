@@ -638,7 +638,7 @@ is `CSV_BAD_VALUE`:
 
 | Code | Meaning |
 |---|---|
-| `CSV_SYNTAX` | The file is not valid RFC 4180 CSV or not UTF-8, or a row has the wrong number of cells |
+| `CSV_SYNTAX` | The file does not follow the record format of section 2 (RFC 4180 section 2, with LF line ends allowed) or is not UTF-8, or a row has the wrong number of cells |
 | `CSV_UNKNOWN_FILE` | A `.csv` file that is not a table of section 1, a file name outside the allowed characters (section 6), or a required table that is missing |
 | `CSV_UNKNOWN_COLUMN` | A header name the table does not define, or a duplicate header name |
 | `CSV_MISSING_COLUMN` | A required column is missing from the header, a required cell is empty, or a row that a rule requires is missing |

@@ -73,6 +73,9 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<Vec<Record>, SyntaxError> {
                             cell.push('"');
                         }
                         Some('"') => break,
+                        Some(c) if is_forbidden_control(c) && c != '\n' && c != '\r' => {
+                            return Err(control(line));
+                        }
                         Some(c) => {
                             if c == '\n' {
                                 line = line.saturating_add(1);
@@ -100,6 +103,7 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<Vec<Record>, SyntaxError> {
                                 hint: "a quote inside a cell that is not quoted",
                             });
                         }
+                        c if is_forbidden_control(c) => return Err(control(line)),
                         _ => {
                             cell.push(c);
                             chars.next();
@@ -143,6 +147,19 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<Vec<Record>, SyntaxError> {
     match invalid {
         Some(error) => Err(error),
         None => Ok(records),
+    }
+}
+
+/// An ASCII control character, which the record format of RFC 4180 section 2 allows in no cell;
+/// line breaks are allowed inside a quoted cell and are checked there.
+fn is_forbidden_control(c: char) -> bool {
+    c.is_ascii_control()
+}
+
+fn control(line: u32) -> SyntaxError {
+    SyntaxError {
+        line,
+        hint: "a cell holds an ASCII control character",
     }
 }
 
@@ -222,6 +239,16 @@ mod tests {
             error(b"id\n\"open \xFF").hint,
             "the file is not valid UTF-8"
         );
+        // ASCII controls, quoted or not, other than the line breaks a quoted cell may hold.
+        for bad in [
+            &b"a\nb\tc\n"[..],
+            b"a\n\"b\x00\"\n",
+            b"a\nb\x7F\n",
+            b"a\n\"b\x1B\"\n",
+        ] {
+            assert_eq!(error(bad).line, 2, "{bad:?}");
+        }
+        assert!(parse(b"a\n\"b\rc\r\nd\"\n").is_ok());
         assert_eq!(error(b"a\nb\"c\n").line, 2);
         assert_eq!(error(b"\"a\"b\n").line, 1);
         assert_eq!(error(b"a\rb\n").line, 1);

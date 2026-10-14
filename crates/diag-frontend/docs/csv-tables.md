@@ -56,7 +56,8 @@ in 4.5 is rejected.
 - The record format of RFC 4180 section 2: comma-separated, fields that contain a comma, a
   double quote or a line break are enclosed in double quotes, and a double quote inside them is
   doubled. As an extension to that section, which ends records with CRLF, a record may also end
-  with LF alone.
+  with LF alone. As that section's grammar has it, no cell holds an ASCII control character
+  (a tab, NUL or DEL among them), except line breaks inside a quoted cell (`CSV_SYNTAX`).
 - UTF-8. A byte order mark at the start of a file is skipped, so files saved by spreadsheet
   programs are accepted. Any other invalid UTF-8 is rejected.
 - The first record is the header. Columns are identified by their header name, not their

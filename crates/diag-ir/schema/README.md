@@ -59,6 +59,9 @@ calls that runtime. `rustfmt` skips the file (`#[rustfmt::skip]` on its module i
 `src/declaration.rs`).
 
 `declaration::load_ecu_document` is the only way a buffer is read: it checks the `DIR1` file
-identifier, runs the FlatBuffers verifier with bounded limits, and accepts only
-`EcuDocument.schema_version == IR_SCHEMA_VERSION`. When the schema changes, bump
+identifier, runs the FlatBuffers verifier with limits that grow with the buffer (so a small
+buffer whose offsets share data cannot unpack into a huge tree), accepts only
+`EcuDocument.schema_version == IR_SCHEMA_VERSION`, and then rejects what the verifier lets
+through: enum values and union tags the schema does not define, a document without its variant,
+source format or source digest, and layouts whose ids do not strictly increase. When the schema changes, bump
 `IR_SCHEMA_VERSION` and have the agent report its supported version via `capabilities` (9.5).

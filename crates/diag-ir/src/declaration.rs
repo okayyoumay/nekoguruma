@@ -2,7 +2,9 @@
 //! bindings, and the loader that checks a document before anything reads it.
 //!
 //! The bindings in `generated/ir_generated.rs` are produced by `flatc` (the command is in
-//! `schema/README.md`) and committed; they are never edited by hand.
+//! `schema/README.md`) and committed; they are never edited by hand. Their object-API structs
+//! (`EcuDocumentT` and the like) are `#[non_exhaustive]`, so another crate builds one from
+//! `Default::default()` and assigns its fields.
 
 use thiserror::Error;
 
@@ -21,16 +23,27 @@ pub use generated::diag::ir::*;
 
 use crate::IR_SCHEMA_VERSION;
 
-/// Limits the verifier applies to a document before it is read. A document reaches the agent
-/// from a signed manifest (8.2.6), but the verifier is the only defence against a malformed one
-/// past that point, so the limits bound the work and the recursion it may cause: nested layouts
-/// are themselves limited to 16 levels by the decoder (ADR-242), well within `max_depth`.
-pub const VERIFIER_OPTIONS: flatbuffers::VerifierOptions = flatbuffers::VerifierOptions {
-    max_depth: 64,
-    max_tables: 1_000_000,
-    max_apparent_size: 1 << 31,
-    ignore_missing_null_terminator: false,
-};
+/// How many times its own size a document may appear to be once every offset is followed.
+/// FlatBuffers lets many offsets share one vector, so a small buffer can unpack into a very
+/// large object tree; an honest document stays well below this, since only vtables are shared.
+pub const MAX_APPARENT_SIZE_FACTOR: usize = 8;
+
+/// The verifier limits for a buffer. A document reaches the agent from a signed manifest
+/// (8.2.6), but past that point the verifier and the checks after it are the only defence
+/// against a malformed one, so the limits grow with the buffer rather than being fixed:
+/// - `max_apparent_size` bounds what following every offset may read, which bounds what
+///   `unpack` allocates;
+/// - `max_tables` cannot exceed one table per four bytes of an honest buffer;
+/// - `max_depth` bounds the only recursion the schema allows, a `Repeat` marker that is a
+///   `Field` with a shape of its own (layouts refer to each other by id, not by nesting).
+pub fn verifier_options(buf_len: usize) -> flatbuffers::VerifierOptions {
+    flatbuffers::VerifierOptions {
+        max_depth: 64,
+        max_tables: (buf_len / 4).max(1),
+        max_apparent_size: buf_len.saturating_mul(MAX_APPARENT_SIZE_FACTOR),
+        ignore_missing_null_terminator: false,
+    }
+}
 
 /// Why [`load_ecu_document`] rejected a buffer.
 #[derive(Debug, Error, PartialEq)]
@@ -44,6 +57,10 @@ pub enum LoadError {
     /// The FlatBuffers verifier rejected the buffer.
     #[error("malformed IR document: {0}")]
     Malformed(#[from] flatbuffers::InvalidFlatbuffer),
+    /// A value the verifier cannot judge is not one the schema defines: an enum value or union
+    /// tag outside its type, a missing part every document has, or layouts out of id order.
+    #[error("invalid IR document: {0}")]
+    Invalid(String),
     /// The document was written for another IR schema version (8.2.6). Until the first release
     /// no other version is read (ADR-281 item 4).
     #[error("IR schema version {found} is not supported (expected {expected})")]
@@ -61,8 +78,11 @@ const HEADER_LEN: usize = 4 + flatbuffers::FILE_IDENTIFIER_LENGTH;
 /// Checks a buffer and returns its `EcuDocument`.
 ///
 /// The buffer must carry the `DIR1` file identifier, pass the FlatBuffers verifier with
-/// [`VERIFIER_OPTIONS`], and declare [`IR_SCHEMA_VERSION`]. Only then are its fields read; the
-/// returned document borrows `buf` and its accessors do not fail.
+/// [`verifier_options`], and declare [`IR_SCHEMA_VERSION`]. Then [`check_values`] rejects what
+/// the verifier lets through: enum values and union tags the schema does not define, a document
+/// without its variant, source format or source digest, and layouts whose ids do not strictly
+/// increase (ADR-242 keeps them sorted for lookup by id). The returned document borrows `buf`;
+/// optional parts below the variant may still be absent, which their accessors report as `None`.
 pub fn load_ecu_document(buf: &[u8]) -> Result<EcuDocument<'_>, LoadError> {
     // `buffer_has_identifier` slices the identifier out without checking the length.
     if buf.len() < HEADER_LEN {
@@ -71,14 +91,113 @@ pub fn load_ecu_document(buf: &[u8]) -> Result<EcuDocument<'_>, LoadError> {
     if !ecu_document_buffer_has_identifier(buf) {
         return Err(LoadError::WrongIdentifier);
     }
-    let document = root_as_ecu_document_with_opts(&VERIFIER_OPTIONS, buf)?;
+    let document = root_as_ecu_document_with_opts(&verifier_options(buf.len()), buf)?;
     if document.schema_version() != IR_SCHEMA_VERSION {
         return Err(LoadError::SchemaVersion {
             found: document.schema_version(),
             expected: IR_SCHEMA_VERSION,
         });
     }
+    check_values(&document)?;
     Ok(document)
+}
+
+fn invalid(what: impl Into<String>) -> LoadError {
+    LoadError::Invalid(what.into())
+}
+
+/// Checks the values of a verified document that the FlatBuffers verifier does not: it checks
+/// only the size of an enum field, and it skips the value of a union whose tag it does not know.
+fn check_values(document: &EcuDocument<'_>) -> Result<(), LoadError> {
+    if document.source_format().is_none() {
+        return Err(invalid("missing source_format"));
+    }
+    if document.source_digest().is_none() {
+        return Err(invalid("missing source_digest"));
+    }
+    let variant = document
+        .variant()
+        .ok_or_else(|| invalid("missing variant"))?;
+    for service in variant.services().iter().flatten() {
+        if let Some(request) = service.request() {
+            check_fields(request.params(), "request params")?;
+        }
+        if let Some(positive) = service.positive() {
+            check_fields(positive.fields(), "positive response fields")?;
+        }
+    }
+    for dtc in variant.dtcs().iter().flatten() {
+        check_fields(dtc.status_fields(), "DTC status fields")?;
+        check_fields(dtc.snapshot_fields(), "DTC snapshot fields")?;
+        check_fields(dtc.extended_fields(), "DTC extended fields")?;
+    }
+    for session in variant.flash_sessions().iter().flatten() {
+        for step in session.steps().iter().flatten() {
+            if !(FlashStep::ENUM_MIN..=FlashStep::ENUM_MAX).contains(&step.0) {
+                return Err(invalid(format!("flash step {}", step.0)));
+            }
+        }
+    }
+    let mut previous_layout = 0;
+    for layout in variant.layouts().iter().flatten() {
+        if layout.id() <= previous_layout {
+            return Err(invalid(format!(
+                "layout id {} does not follow {previous_layout}",
+                layout.id()
+            )));
+        }
+        previous_layout = layout.id();
+        check_fields(layout.fields(), "layout fields")?;
+    }
+    for set in variant.monitor_sets().iter().flatten() {
+        check_fields(set.fields(), "monitor set fields")?;
+    }
+    Ok(())
+}
+
+fn check_fields(
+    fields: Option<flatbuffers::Vector<'_, flatbuffers::ForwardsUOffset<Field<'_>>>>,
+    place: &str,
+) -> Result<(), LoadError> {
+    for field in fields.iter().flatten() {
+        check_field(&field, place)?;
+    }
+    Ok(())
+}
+
+fn check_field(field: &Field<'_>, place: &str) -> Result<(), LoadError> {
+    let bad =
+        |what: &str, value: i64| invalid(format!("{place}: field {}: {what} {value}", field.id()));
+    if !(Placement::ENUM_MIN..=Placement::ENUM_MAX).contains(&field.placement().0) {
+        return Err(bad("placement", field.placement().0.into()));
+    }
+    if !(LengthKind::ENUM_MIN..=LengthKind::ENUM_MAX).contains(&field.length_kind().0) {
+        return Err(bad("length kind", field.length_kind().0.into()));
+    }
+    if !(DataKind::ENUM_MIN..=DataKind::ENUM_MAX).contains(&field.kind().0) {
+        return Err(bad("data kind", field.kind().0.into()));
+    }
+    if !(ByteOrder::ENUM_MIN..=ByteOrder::ENUM_MAX).contains(&field.byte_order().0) {
+        return Err(bad("byte order", field.byte_order().0.into()));
+    }
+    if !(Termination::ENUM_MIN..=Termination::ENUM_MAX).contains(&field.termination().0) {
+        return Err(bad("termination", field.termination().0.into()));
+    }
+    if !(Compu::ENUM_MIN..=Compu::ENUM_MAX).contains(&field.compu_type().0) {
+        return Err(bad("conversion tag", field.compu_type().0.into()));
+    }
+    if !(Shape::ENUM_MIN..=Shape::ENUM_MAX).contains(&field.shape_type().0) {
+        return Err(bad("shape tag", field.shape_type().0.into()));
+    }
+    if let Some(repeat) = field.shape_as_repeat() {
+        if !(RepeatCount::ENUM_MIN..=RepeatCount::ENUM_MAX).contains(&repeat.count().0) {
+            return Err(bad("repeat count", repeat.count().0.into()));
+        }
+        if let Some(marker) = repeat.marker() {
+            check_field(&marker, place)?;
+        }
+    }
+    Ok(())
 }
 
 /// Encodes a document with the `DIR1` file identifier, as the frontends write it.
@@ -131,6 +250,139 @@ mod tests {
             variant: Some(Box::new(variant)),
             procedure: Some(vec![1, 2, 3]),
         }
+    }
+
+    /// A document that uses every union variant, a struct vector, a scalar vector and an enum
+    /// vector, so that corrupting it reaches every kind of accessor.
+    fn rich_document() -> EcuDocumentT {
+        let scalar = |id: u32, compu: CompuT| FieldT {
+            id,
+            short_name: Some(format!("f{id}")),
+            bit_length: 8,
+            compu,
+            ..Default::default()
+        };
+        let compus = vec![
+            CompuT::CompuIdentity(Box::default()),
+            CompuT::CompuLinear(Box::new(CompuLinearT {
+                numerator: 1.0,
+                denominator: 10.0,
+                offset: 0.0,
+            })),
+            CompuT::CompuScaleLinear(Box::new(CompuScaleLinearT {
+                scales: Some(vec![LinearScaleT {
+                    lower: 0.0,
+                    upper: 9.0,
+                    numerator: 1.0,
+                    denominator: 1.0,
+                    offset: 0.0,
+                }]),
+            })),
+            CompuT::CompuTextTable(Box::new(CompuTextTableT {
+                entries: Some(vec![TextEntryT {
+                    lower: 1,
+                    upper: 1,
+                    text_id: 3,
+                }]),
+                default_text_id: 6,
+            })),
+            CompuT::CompuTableInterp(Box::new(CompuTableInterpT {
+                points: Some(vec![
+                    InterpPointT {
+                        internal: 0.0,
+                        physical: 0.0,
+                    },
+                    InterpPointT {
+                        internal: 1.0,
+                        physical: 2.0,
+                    },
+                ]),
+            })),
+            CompuT::CompuRational(Box::new(CompuRationalT {
+                numerator_coeffs: Some(vec![1.0, 1.0]),
+                denominator_coeffs: Some(vec![1.0]),
+            })),
+            CompuT::CompuBytecode(Box::new(CompuBytecodeT { code_offset: 4 })),
+        ];
+        let mut fields: Vec<FieldT> = compus
+            .into_iter()
+            .zip(1..)
+            .map(|(compu, id)| scalar(id, compu))
+            .collect();
+        fields.push(FieldT {
+            id: 20,
+            shape: ShapeT::Repeat(Box::new(RepeatT {
+                layout_id: 1,
+                count: RepeatCount::UntilMarker,
+                marker: Some(Box::new(scalar(21, CompuT::NONE))),
+                marker_lower: 0,
+                marker_upper: 0,
+                ..Default::default()
+            })),
+            ..Default::default()
+        });
+        fields.push(FieldT {
+            id: 22,
+            shape: ShapeT::Select(Box::new(SelectT {
+                key_field_id: 1,
+                cases: Some(vec![SelectCaseT {
+                    short_name: Some("one".into()),
+                    lower: 1,
+                    upper: 1,
+                    layout_id: 2,
+                }]),
+                has_default: true,
+                default_layout_id: 0,
+            })),
+            ..Default::default()
+        });
+        fields.push(FieldT {
+            id: 23,
+            shape: ShapeT::Group(Box::new(GroupT { layout_id: 2 })),
+            ..Default::default()
+        });
+        let mut doc = document();
+        let variant = doc.variant.as_mut().unwrap();
+        variant.services.as_mut().unwrap()[0]
+            .positive
+            .as_mut()
+            .unwrap()
+            .fields = Some(fields);
+        variant.layouts = Some(vec![
+            LayoutT {
+                id: 1,
+                fields: Some(vec![scalar(30, CompuT::NONE)]),
+                ..Default::default()
+            },
+            LayoutT {
+                id: 2,
+                byte_size: 1,
+                ..Default::default()
+            },
+        ]);
+        variant.dtcs = Some(vec![DtcDefinitionT {
+            code: 0x910116,
+            status_fields: Some(vec![scalar(40, CompuT::NONE)]),
+            ..Default::default()
+        }]);
+        variant.flash_sessions = Some(vec![FlashSessionT {
+            id: 1,
+            steps: Some(vec![
+                FlashStep::EnterProgrammingSession,
+                FlashStep::EcuReset,
+            ]),
+            segments: Some(vec![FlashSegmentT {
+                checksum: Some(vec![0xAA; 4]),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }]);
+        variant.monitor_sets = Some(vec![MonitorSetT {
+            id: 1,
+            fields: Some(vec![scalar(50, CompuT::NONE)]),
+            ..Default::default()
+        }]);
+        doc
     }
 
     #[test]
@@ -214,9 +466,9 @@ mod tests {
     fn a_corrupted_document_is_rejected_or_read_without_panicking() {
         // Every single-byte change is either rejected or yields a document whose accessors are
         // safe to call: the verifier is what makes reading an untrusted buffer sound.
-        let buf = encode_ecu_document(&document());
+        let buf = encode_ecu_document(&rich_document());
         for at in HEADER_LEN..buf.len() {
-            for value in [0x00, 0x7F, 0x80, 0xFF] {
+            for value in [0x00, 0x01, 0x07, 0x09, 0x7F, 0x80, 0xFF] {
                 let mut corrupted = buf.clone();
                 corrupted[at] = value;
                 if let Ok(doc) = load_ecu_document(&corrupted) {
@@ -224,5 +476,236 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_document_with_every_union_variant_loads_and_reads_back() {
+        let buf = encode_ecu_document(&rich_document());
+        let loaded = load_ecu_document(&buf).expect("loads");
+        assert_eq!(loaded.unpack(), rich_document());
+    }
+
+    #[test]
+    fn a_shared_vector_that_unpacks_far_beyond_the_buffer_is_rejected() {
+        // 64 segments share one 4 KiB checksum: about 4 KiB of buffer that would unpack into
+        // 256 KiB, past the apparent-size limit.
+        let mut fbb = flatbuffers::FlatBufferBuilder::new();
+        let checksum = fbb.create_vector(&[0u8; 4096]);
+        let segments: Vec<_> = (0..64)
+            .map(|_| {
+                FlashSegment::create(
+                    &mut fbb,
+                    &FlashSegmentArgs {
+                        checksum: Some(checksum),
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect();
+        let segments = fbb.create_vector(&segments);
+        let session = FlashSession::create(
+            &mut fbb,
+            &FlashSessionArgs {
+                segments: Some(segments),
+                ..Default::default()
+            },
+        );
+        let sessions = fbb.create_vector(&[session]);
+        let variant = EcuVariant::create(
+            &mut fbb,
+            &EcuVariantArgs {
+                flash_sessions: Some(sessions),
+                ..Default::default()
+            },
+        );
+        let format = fbb.create_string("csv-starlark");
+        let digest = fbb.create_string("00");
+        let root = EcuDocument::create(
+            &mut fbb,
+            &EcuDocumentArgs {
+                schema_version: IR_SCHEMA_VERSION,
+                source_format: Some(format),
+                source_digest: Some(digest),
+                variant: Some(variant),
+                procedure: None,
+            },
+        );
+        finish_ecu_document_buffer(&mut fbb, root);
+        let buf = fbb.finished_data();
+        assert!(matches!(
+            load_ecu_document(buf),
+            Err(LoadError::Malformed(
+                flatbuffers::InvalidFlatbuffer::ApparentSizeTooLarge
+            ))
+        ));
+    }
+
+    #[test]
+    fn an_enum_value_outside_its_type_is_rejected() {
+        let mut doc = document();
+        doc.variant.as_mut().unwrap().services.as_mut().unwrap()[0]
+            .positive
+            .as_mut()
+            .unwrap()
+            .fields
+            .as_mut()
+            .unwrap()[0]
+            .placement = Placement(2);
+        let buf = encode_ecu_document(&doc);
+        assert!(matches!(
+            load_ecu_document(&buf),
+            Err(LoadError::Invalid(_))
+        ));
+
+        let mut doc = rich_document();
+        doc.variant
+            .as_mut()
+            .unwrap()
+            .flash_sessions
+            .as_mut()
+            .unwrap()[0]
+            .steps = Some(vec![FlashStep(8)]);
+        let buf = encode_ecu_document(&doc);
+        assert!(matches!(
+            load_ecu_document(&buf),
+            Err(LoadError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn an_unknown_union_tag_is_rejected() {
+        // The verifier skips the value of a union whose tag it does not know.
+        let mut fbb = flatbuffers::FlatBufferBuilder::new();
+        let linear = CompuLinear::create(&mut fbb, &CompuLinearArgs::default());
+        let field = Field::create(
+            &mut fbb,
+            &FieldArgs {
+                id: 1,
+                compu_type: Compu(9),
+                compu: Some(linear.as_union_value()),
+                ..Default::default()
+            },
+        );
+        let fields = fbb.create_vector(&[field]);
+        let layout = Layout::create(
+            &mut fbb,
+            &LayoutArgs {
+                id: 1,
+                fields: Some(fields),
+                ..Default::default()
+            },
+        );
+        let layouts = fbb.create_vector(&[layout]);
+        let variant = EcuVariant::create(
+            &mut fbb,
+            &EcuVariantArgs {
+                layouts: Some(layouts),
+                ..Default::default()
+            },
+        );
+        let format = fbb.create_string("csv-starlark");
+        let digest = fbb.create_string("00");
+        let root = EcuDocument::create(
+            &mut fbb,
+            &EcuDocumentArgs {
+                schema_version: IR_SCHEMA_VERSION,
+                source_format: Some(format),
+                source_digest: Some(digest),
+                variant: Some(variant),
+                procedure: None,
+            },
+        );
+        finish_ecu_document_buffer(&mut fbb, root);
+        assert!(matches!(
+            load_ecu_document(fbb.finished_data()),
+            Err(LoadError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn a_document_without_its_variant_or_provenance_is_rejected() {
+        let mut doc = document();
+        doc.variant = None;
+        assert!(matches!(
+            load_ecu_document(&encode_ecu_document(&doc)),
+            Err(LoadError::Invalid(_))
+        ));
+        let mut doc = document();
+        doc.source_digest = None;
+        assert!(matches!(
+            load_ecu_document(&encode_ecu_document(&doc)),
+            Err(LoadError::Invalid(_))
+        ));
+        let mut doc = document();
+        doc.source_format = None;
+        assert!(matches!(
+            load_ecu_document(&encode_ecu_document(&doc)),
+            Err(LoadError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn layouts_out_of_id_order_are_rejected() {
+        for ids in [[2, 1], [1, 1], [0, 1]] {
+            let mut doc = document();
+            doc.variant.as_mut().unwrap().layouts = Some(
+                ids.iter()
+                    .map(|&id| LayoutT {
+                        id,
+                        ..Default::default()
+                    })
+                    .collect(),
+            );
+            assert!(
+                matches!(
+                    load_ecu_document(&encode_ecu_document(&doc)),
+                    Err(LoadError::Invalid(_))
+                ),
+                "{ids:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_string_that_is_not_utf8_is_rejected() {
+        let mut buf = encode_ecu_document(&document());
+        let at = buf
+            .windows(8)
+            .position(|w| w == b"vin.read")
+            .expect("service name in buffer");
+        buf[at] = 0xFF;
+        assert!(matches!(
+            load_ecu_document(&buf),
+            Err(LoadError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn markers_nested_past_the_depth_limit_are_rejected() {
+        // A `Repeat` marker is a `Field` that may have a shape of its own: the one recursion
+        // the schema allows, which the verifier's depth limit bounds.
+        let mut field = FieldT::default();
+        for id in 0..70 {
+            field = FieldT {
+                id,
+                shape: ShapeT::Repeat(Box::new(RepeatT {
+                    marker: Some(Box::new(field)),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            };
+        }
+        let mut doc = document();
+        doc.variant.as_mut().unwrap().layouts = Some(vec![LayoutT {
+            id: 1,
+            fields: Some(vec![field]),
+            ..Default::default()
+        }]);
+        assert!(matches!(
+            load_ecu_document(&encode_ecu_document(&doc)),
+            Err(LoadError::Malformed(
+                flatbuffers::InvalidFlatbuffer::DepthLimitReached
+            ))
+        ));
     }
 }

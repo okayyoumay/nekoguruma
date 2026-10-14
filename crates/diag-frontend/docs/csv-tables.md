@@ -148,10 +148,15 @@ Variant identification (design 8.9.1), one `VariantPattern` per row, in row orde
 |---|---|---|---|
 | `name` | text | yes | `Protocol.short_name`, such as `ISO15765` |
 | `baud_rate` | integer, 1 to 2^32 - 1 | yes | |
-| `tx_id` | integer, 0 to 2^32 - 1 | yes | Physical request identifier |
-| `rx_id` | integer, 0 to 2^32 - 1 | yes | Physical response identifier |
-| `functional_id` | integer, 0 to 2^32 - 1 | no | Default 0 (none) |
+| `tx_id` | integer, 0x000 to 0x7FF | yes | Physical request identifier |
+| `rx_id` | integer, 0x000 to 0x7FF | yes | Physical response identifier |
+| `functional_id` | integer, 0x000 to 0x7FF | no | Default 0 (none) |
 | `extended_addressing` | boolean | no | Default `no` |
+
+The identifiers are 11-bit CAN identifiers. A 29-bit identifier also needs the ComParams that
+select the identifier format, which this version does not define, so a value above 0x7FF is
+rejected (`CSV_BAD_VALUE`); the agent's link accepts only 11-bit identifiers for the same reason
+(ADR-235 item 4).
 
 `comparams.csv`, one `ComParam` per row, appended to the named protocol's `params` in row order.
 
@@ -198,8 +203,8 @@ row per array entry, in row order, which is the IR array order. That order matte
 | `numerator` | float | `linear` | `CompuLinear.numerator`, default 1 |
 | `denominator` | float, not 0 | `linear` | Default 1 |
 | `offset` | float | `linear` | Default 0 |
-| `numerator_coeffs` | list of float | `rational` | Required for `rational`, at least one |
-| `denominator_coeffs` | list of float | `rational` | Required for `rational`, at least one |
+| `numerator_coeffs` | list of float | `rational` | Required for `rational`, at least one; ordered by ascending power, the first being the constant term |
+| `denominator_coeffs` | list of float | `rational` | Required for `rational`, at least one, in the same order, and not all zero |
 | `default_text` | key | `text-table` | `CompuTextTable.default_text_id`; empty is 0 |
 
 `conversion_scales.csv`:
@@ -220,6 +225,16 @@ value; a `text-table` on a `float` field is rejected (`ir.fbs`, `TextEntry`). Th
 `scale-linear` conversion must not overlap, so every internal value has at most one result;
 overlapping rows are rejected (`CSV_BAD_VALUE`). (A `text-table` may overlap, since its first
 matching row wins.)
+
+A `rational` conversion gives physical = (n0 + n1·x + n2·x² + …) / (d0 + d1·x + d2·x² + …) for
+the internal value x, with the coefficients in the order of the two lists. A denominator that
+evaluates to zero for a decoded value makes that field's decoding fail, like any other value the
+decoder cannot convert.
+
+What a decoded field yields: `identity` gives the internal value; `linear`, `scale-linear`,
+`interpolation` and `rational` give the physical value as a float. A `text-table` gives the
+internal value as an integer; its texts are resolved on the server by `text_id` (design 9.2), so
+the agent and a Starlark procedure never see the text, only the value it stands for.
 
 A conversion applies to a numeric value, so the field types it may be used with are:
 

@@ -87,6 +87,7 @@ declared service from the SID and the parameter names when it lowers the call.
     error about a whole file or its header leaves out the location it does not have. It checks
     every rule `ir.fbs` states, so nothing reaches the agent that the IR forbids (8.3).
 12. **Left out of this version:** monitor sets (the converter emits none), `CompuBytecode`,
+    29-bit CAN identifiers (as in the agent's link, ADR-235 item 4),
     constants that are not leading or sit in a nested layout, request fields
     without a single encoding of a procedure's value (shapes, lengths from another field, `zero`
     and `ff` terminators), a `ref` to a field outside the

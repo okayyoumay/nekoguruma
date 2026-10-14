@@ -30,7 +30,7 @@ M5 and M6 do not depend on each other; M6 comes first (maintainer's decision, 20
 
 **Scope.**
 
-- Worker L1: ISO-TP (ISO 15765-2) and UDS client behaviour on both the J2534 and D-PDU workers (design 8.1): session-layer timing and response pending from ISO 14229-2 (existing worker ADRs already cite its timing clause), request/response handling per ISO 14229-1 clause 7. `sim-ecu` still uses the fixed, configurable timing values of M1; they are checked against ISO 14229-2 here.
+- Worker L1: ISO-TP (ISO 15765-2) and UDS client behaviour on both the J2534 and D-PDU workers (design 8.1): session-layer timing and response pending from ISO 14229-2 (ADR-018 and ADR-102 still cite the wrong clause for it), request/response handling per ISO 14229-1 clause 7. `sim-ecu`'s P2 and P2* are still fixed constants from M1; here they become configurable and are checked against ISO 14229-2.
 - Agent L2 primitives (design 8.1) built on ISO 14229-1: read/write DID (10.2, 10.7) with the DID ranges in Annex C.1, read DTC with the status-mask bits and DTC formats in Annex D.2 / D.4, routine control (13.2, Annex F), security access (9.4). The 2026 edition also defines the Authentication service (9.6, certificate exchange and challenge-response) as an alternative to seed/key; L2 keeps the security step replaceable so it can be added in M6.
 - `diag-ir`: declaration part in FlatBuffers with pre-expanded decode plans and COMPU-METHOD conversions (8.2.2); the full procedure-part instruction set (8.2.4); resume model (8.2.5); interruptibility attributes (8.10.1).
 - `diag-frontend`: the proprietary format first, CSV tables + Starlark subset -> IR (8.4), because it needs no purchased standard. Dry-run validation with vehicle access mocked (12.1).

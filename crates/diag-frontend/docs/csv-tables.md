@@ -625,8 +625,11 @@ the header as line 1) and the column (`column`: its header name). An error about
 (`CSV_UNKNOWN_FILE`, a missing required file) has neither; one about the header has no `line`
 beyond 1; invalid UTF-8 or a CSV syntax error gives the line where it occurs and no column. A
 location that does not exist is left out of the report. Errors are listed sorted by file name,
-line and column. Every row is checked, whether or not anything refers to it; an error is
-reported once, at the row that has it, and not again where another row refers to that row.
+line and column: a missing line or column sorts before any, and columns sort by their header
+names. A file that breaks the record format or is not UTF-8 is not read past the error, since
+its records cannot be told apart from there on; its other errors are not reported. Every row is
+checked, whether or not anything refers to it; an error is reported once, at the row that has
+it, and not again where another row refers to that row.
 
 A rule in this document that names no code uses the closest one below: a missing row that a rule
 requires (an empty `variants.csv`, a variant without a protocol, a DID with no service or no

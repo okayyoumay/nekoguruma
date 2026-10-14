@@ -2,8 +2,9 @@
 
 **Date:** 2026-10-14
 **Status:** Accepted
-**Affects:** `agent` (`src/host.rs`), `j2534-0404-service` (`tests/agent_restart_end_to_end.rs`),
-`docs/system-architecture.md` 8.2.4; ADR-289, ADR-292
+**Affects:** `agent` (`src/host.rs`), `j2534-0404-service` (`src/service/events.rs`,
+`tests/agent_restart_end_to_end.rs`), `docs/system-architecture.md` 8.2.4; ADR-105, ADR-289,
+ADR-292
 
 ## Context
 
@@ -28,7 +29,12 @@ worker took offline after a lost VCI is refused as `FailedPrecondition` with
 2. **Every other failure is reported as before.** A refusal with another error event or none,
    another status code, and a failure of any other call stay `HostError::Rpc` (or what they
    were).
-3. **The worker does not change.** It reports the loss in the status it already returns.
+3. **The worker records the loss with the offline transition.** It already reported the loss in
+   the status it returns, but recorded the link's error event only after it had taken the link
+   offline and released the link table, so a primitive started in between was refused without
+   it. The hard-error handler now records `PDU_ERR_EVT_LOST_COMM_TO_VCI` as the link's last
+   error in the same critical section that takes the link offline. Every refusal on the offline
+   link carries the loss.
 4. **The job's handling does not change.** A host error ends the run as an interrupted step, as
    ADR-289 item 4 says.
 
@@ -42,3 +48,5 @@ worker took offline after a lost VCI is refused as `FailedPrecondition` with
 - The mapping depends on the worker attaching the link's last error event. A worker that did not
   would leave the error as `HostError::Rpc`, as before; the job's handling is the same either
   way.
+- A worker unit test parks the hard-error handler after it took the link offline and before it
+  sends the event, and checks that the link already carries the loss.

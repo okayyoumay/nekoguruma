@@ -425,3 +425,45 @@ async fn hard_channel_error_leaks_a_live_broadcast_periodic_onto_the_dead_shared
     );
     assert!(!link.connected, "a hard-errored CLL must be taken offline");
 }
+
+/// ADR-294: the lost-VCI error is recorded in the same critical section that
+/// takes the CLL offline, so a primitive refused on the link while the sweep
+/// is still running (here parked on the `ctx.api` fence, before
+/// `send_error_event` records the event it sends) already carries the loss.
+#[tokio::test]
+async fn hard_channel_error_records_the_loss_with_the_offline_transition() {
+    let ctx = ctx_with_an_in_flight_broadcast_periodic_reservation().await;
+    let api = ctx.api.lock().await;
+
+    let spawned_ctx = clone_ctx(&ctx);
+    let sweep = tokio::spawn(async move {
+        handle_channel_hard_error(HEBP_CHANNEL_ID, &spawned_ctx).await;
+    });
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
+    }
+    assert!(!sweep.is_finished(), "the sweep must be parked on ctx.api");
+    {
+        let links = ctx.logical_links.lock().await;
+        let link = links.get(&HEBP_TEST_CLL).unwrap();
+        assert!(!link.connected, "the CLL is offline before the fence");
+        assert_eq!(
+            link.last_error.as_ref().map(|error| error.event),
+            Some(PduErrorEvent::PduErrEvtLostCommToVci),
+            "the offline CLL must already carry the loss"
+        );
+    }
+
+    drop(api);
+    sweep.await.expect("the sweep must not panic");
+    let links = ctx.logical_links.lock().await;
+    assert_eq!(
+        links
+            .get(&HEBP_TEST_CLL)
+            .unwrap()
+            .last_error
+            .as_ref()
+            .map(|error| error.event),
+        Some(PduErrorEvent::PduErrEvtLostCommToVci)
+    );
+}

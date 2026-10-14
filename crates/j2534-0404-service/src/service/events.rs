@@ -429,6 +429,17 @@ async fn handle_channel_hard_error(channel_id: ChannelId, ctx: &ChannelPollCtx) 
                 // fact away.
                 let was_primary = l.channel_id == Some(channel_id);
                 l.connected = false;
+                // The loss is recorded with the offline transition, in this
+                // same critical section, so a primitive refused on this link
+                // from now on carries it (ADR-105, ADR-294);
+                // `send_error_event` below records it again with the event
+                // it sends.
+                l.last_error = Some(TrackedError {
+                    event: PduErrorEvent::PduErrEvtLostCommToVci,
+                    timestamp: module_timestamp_us(),
+                    cop: None,
+                    cop_tag: None,
+                });
                 l.comm_started = false;
                 l.stop_comm_pending = false;
                 if l.channel_id == Some(channel_id) {

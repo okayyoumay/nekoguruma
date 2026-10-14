@@ -35,9 +35,12 @@ pub enum HostError {
     /// request may have been answered.
     #[error("the worker lost events of the link")]
     EventsLost,
-    /// The worker reported the VCI lost (`PDU_ERR_EVT_LOST_COMM_TO_VCI`, ADR-289) while the
-    /// primitive was pending: the request may or may not have reached the ECU, and the link can
-    /// no longer reach it. Not an ECU that stayed silent.
+    /// The VCI was lost (`PDU_ERR_EVT_LOST_COMM_TO_VCI`), and the link can no longer reach the
+    /// ECU. Not an ECU that stayed silent. Two cases:
+    /// - the worker reported the loss while the primitive was pending (ADR-289): the request may
+    ///   or may not have reached the ECU;
+    /// - the loss came before the primitive, and the worker refused to start it on the link it
+    ///   had taken offline (ADR-294): the request was not sent.
     #[error("the VCI was lost")]
     VciLost,
     /// The primitive ended without a response after the worker reported this error event

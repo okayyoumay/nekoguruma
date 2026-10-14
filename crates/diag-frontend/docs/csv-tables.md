@@ -440,8 +440,8 @@ have one constant named `did`, so `diag.request(0x22, {"did": 0xF190})` selects 
 example. `diag.routine(rid, sub, params)` selects the routine service whose `rid` and `sub`
 constants have those values. `diag.read_dtc(mask)` sends ReadDTCInformation with sub-function
 0x02 and the mask (ADR-235 item 2), so its response is decoded through the variant's service that
-describes that request: SID 0x19, one 1-byte constant 0x02 and one other request field, 8 bits
-wide. A procedure that reads `fields` from a `read_dtc` result in a variant without exactly one
+describes that request: SID 0x19, one 1-byte constant 0x02 and one other request field, a
+`fixed` 8-bit `uint`, so that every mask from 0x00 to 0xFF is a value of it. A procedure that reads `fields` from a `read_dtc` result in a variant without exactly one
 such service is rejected at ingestion, like any `fields` key the declaration part does not
 define (subset spec 3.4); `raw`, `ok` and `nrc` need no service. Service selection happens at ingestion, so a `params` value for a
 key that names a constant must be a constant expression; a value known only at run time is

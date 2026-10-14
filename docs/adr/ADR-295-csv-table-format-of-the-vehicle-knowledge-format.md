@@ -30,7 +30,7 @@ declared service from the SID and the parameter names when it lowers the call.
    declaration part; only `variants.csv` and `protocols.csv` are required. Unknown `.csv` files
    are rejected, other files (the Starlark procedures) are not tables. Each variant becomes its
    own `EcuDocument` (8.2.6).
-2. **Plain RFC 4180 CSV, columns by header name.** UTF-8 with a tolerated byte order mark, so
+2. **Plain CSV (the record format of RFC 4180 section 2), columns by header name.** UTF-8 with a tolerated byte order mark, so
    spreadsheet exports work; columns in any order; optional columns may be left out of the
    header; every table accepts a `note` column. Unknown columns are rejected, so a misspelled
    column cannot silently fall back to a default. Integers may be hexadecimal (`0x`), bytes are

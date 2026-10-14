@@ -70,8 +70,8 @@ declared service from the SID and the parameter names when it lowers the call.
    generated DID services carry a constant named `did`, so `diag.request(0x22, {"did": 0xF190})`
    reads the VIN, as the subset specification's examples already write it. A `params` value for a
    constant's key must be a constant, since the selection happens at ingestion. Two services of one
-   variant with the same SID and the same constants are rejected, since no call could select
-   either.
+   variant with the same SID are rejected when one call could match both: when their request
+   fields have the same names and no name is a constant in both with different values.
 8. **Conversions are named and shared.** `conversions.csv` names a conversion and its kind;
    kinds with arrays (scale-linear, text table, interpolation) take one `conversion_scales.csv`
    row per entry, in IR array order, which keeps a text table's first-match order visible.

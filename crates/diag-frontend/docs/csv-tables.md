@@ -440,9 +440,12 @@ have one constant named `did`, so `diag.request(0x22, {"did": 0xF190})` selects 
 example. `diag.routine(rid, sub, params)` selects the routine service whose `rid` and `sub`
 constants have those values. Service selection happens at ingestion, so a `params` value for a
 key that names a constant must be a constant expression; a value known only at run time is
-rejected (`STAR_NON_CONSTANT_ARGUMENT`). Two
-services of one variant with the same SID and the same request constants (name and value) can
-never be told apart and are rejected.
+rejected (`STAR_NON_CONSTANT_ARGUMENT`). Since a call names
+every request field of the service it means, two services of one variant with the same SID could
+both match one call only when their request fields have the same names and no name is a constant
+in both with different values; such a pair can never be told apart and is rejected. Services
+whose request field names differ, or that hold one name as constants of different values, are
+always distinguishable.
 
 ### 5.4 Nested Layouts
 
@@ -572,7 +575,7 @@ does not have:
 - `variants.csv` and `variant_patterns.csv`: the variants are told apart by the first two
   characters of the software version (DID 0xF189).
 - `dids.csv`: the session (a text table), the spare part number and software version
-  (`terminated` ASCII to the end of the message), the VIN (writable outside the default session),
+  (`terminated` ASCII to the end of the message), the VIN (writable outside the default session, behind security access),
   the flash state (three fields at fixed positions), the power cycle count and, in the second variant only, a supply
   voltage with a linear conversion and a unit; and a last reset reason whose details are a
   `select` on the reason (`select_cases.csv`): no data, the `watchdogReset` layout, or a range of
@@ -594,4 +597,5 @@ did:vin,vin,0,,ascii,136,,,,,,,,,
 ```
 
 `vin.read` therefore sends `22 F1 90` and decodes `vin` from byte 3 of the response
-(`bit_offset` 24), after the SID and the echoed DID, which form the positive response's prefix.
+(`bit_offset` 24), after the SID and the echoed DID. The positive response's `prefix` is the
+echoed DID alone (`F1 90`); the SID is held separately in `PositiveResponse.sid`.

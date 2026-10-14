@@ -21,9 +21,10 @@ Flag as P1:
     regenerated bindings in the same PR. Proto regeneration is never deferred.
   - FFI hand edit: a change to `crates/*-sys/src/bindings/*.rs` without a header change. No
     exception.
-  - IR FlatBuffers: a change to `crates/diag-ir/src/generated/ir_generated.rs` without the
-    matching `crates/diag-ir/schema/ir.fbs` change (hand edit), or an `ir.fbs` change without the
-    regenerated bindings and an `IR_SCHEMA_VERSION` bump in the same PR.
+  - IR FlatBuffers: content in `crates/diag-ir/src/generated/ir_generated.rs` that `flatc` (the
+    version `crates/diag-ir/schema/README.md` names) would not produce from
+    `crates/diag-ir/schema/ir.fbs` (a hand edit), or an `ir.fbs` change without the regenerated
+    bindings and an `IR_SCHEMA_VERSION` bump in the same PR.
   - FFI missing target: a target added to the target-ABI list in `docs/worker-crates.md` (or a
     CI target list) without its committed `src/bindings/{target}.rs` in every `*-sys` crate.
   - FFI stale bindings: a header change without regenerated bindings. Accepted only when the

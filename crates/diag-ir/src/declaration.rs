@@ -19,7 +19,42 @@ use thiserror::Error;
 #[path = "generated/ir_generated.rs"]
 mod generated;
 
-pub use generated::diag::ir::*;
+// The types, enums and builders are public; the generated parse entry points
+// (`root_as_ecu_document` and its variants) are not, so that `load_ecu_document` is the only
+// public way into a buffer (ADR-296).
+pub use generated::diag::ir::{
+    ByteOrder, ComParam, ComParamArgs, ComParamBuilder, ComParamOffset, ComParamT, Compu,
+    CompuBytecode, CompuBytecodeArgs, CompuBytecodeBuilder, CompuBytecodeOffset, CompuBytecodeT,
+    CompuIdentity, CompuIdentityArgs, CompuIdentityBuilder, CompuIdentityOffset, CompuIdentityT,
+    CompuLinear, CompuLinearArgs, CompuLinearBuilder, CompuLinearOffset, CompuLinearT,
+    CompuRational, CompuRationalArgs, CompuRationalBuilder, CompuRationalOffset, CompuRationalT,
+    CompuScaleLinear, CompuScaleLinearArgs, CompuScaleLinearBuilder, CompuScaleLinearOffset,
+    CompuScaleLinearT, CompuT, CompuTableInterp, CompuTableInterpArgs, CompuTableInterpBuilder,
+    CompuTableInterpOffset, CompuTableInterpT, CompuTextTable, CompuTextTableArgs,
+    CompuTextTableBuilder, CompuTextTableOffset, CompuTextTableT, CompuUnionTableOffset, DataKind,
+    DtcDefinition, DtcDefinitionArgs, DtcDefinitionBuilder, DtcDefinitionOffset, DtcDefinitionT,
+    ECU_DOCUMENT_EXTENSION, ECU_DOCUMENT_IDENTIFIER, EcuDocument, EcuDocumentArgs,
+    EcuDocumentBuilder, EcuDocumentOffset, EcuDocumentT, EcuVariant, EcuVariantArgs,
+    EcuVariantBuilder, EcuVariantOffset, EcuVariantT, Field, FieldArgs, FieldBuilder, FieldOffset,
+    FieldT, FlashSegment, FlashSegmentArgs, FlashSegmentBuilder, FlashSegmentOffset, FlashSegmentT,
+    FlashSession, FlashSessionArgs, FlashSessionBuilder, FlashSessionOffset, FlashSessionT,
+    FlashStep, Group, GroupArgs, GroupBuilder, GroupOffset, GroupT, InterpPoint, InterpPointT,
+    Layout, LayoutArgs, LayoutBuilder, LayoutOffset, LayoutT, LengthKind, LinearScale,
+    LinearScaleT, MonitorSet, MonitorSetArgs, MonitorSetBuilder, MonitorSetOffset, MonitorSetT,
+    NegativeResponse, NegativeResponseArgs, NegativeResponseBuilder, NegativeResponseOffset,
+    NegativeResponseT, Placement, PositiveResponse, PositiveResponseArgs, PositiveResponseBuilder,
+    PositiveResponseOffset, PositiveResponseT, Protocol, ProtocolArgs, ProtocolBuilder,
+    ProtocolOffset, ProtocolT, Repeat, RepeatArgs, RepeatBuilder, RepeatCount, RepeatOffset,
+    RepeatT, Request, RequestArgs, RequestBuilder, RequestOffset, RequestT, Select, SelectArgs,
+    SelectBuilder, SelectCase, SelectCaseArgs, SelectCaseBuilder, SelectCaseOffset, SelectCaseT,
+    SelectOffset, SelectT, Service, ServiceArgs, ServiceBuilder, ServiceOffset, ServiceT, Shape,
+    ShapeT, ShapeUnionTableOffset, Termination, TextEntry, TextEntryArgs, TextEntryBuilder,
+    TextEntryOffset, TextEntryT, VariantPattern, VariantPatternArgs, VariantPatternBuilder,
+    VariantPatternOffset, VariantPatternT,
+};
+use generated::diag::ir::{
+    ecu_document_buffer_has_identifier, finish_ecu_document_buffer, root_as_ecu_document_with_opts,
+};
 
 use crate::IR_SCHEMA_VERSION;
 

@@ -36,7 +36,12 @@ safe to read, but it does not make it sensible:
 2. **One loader.** `diag_ir::declaration::load_ecu_document` is the only way a buffer is read. In
    order, it rejects a buffer shorter than the root offset and file identifier, a file identifier
    other than `DIR1`, a buffer the verifier rejects, a schema version other than
-   `IR_SCHEMA_VERSION`, and finally what the value checks (item 4) find.
+   `IR_SCHEMA_VERSION`, and finally what the value checks (item 4) find. The generated parse entry
+   points (`root_as_ecu_document` and its variants, among them the unchecked one) are not
+   re-exported, so no other public `diag-ir` function turns bytes into a document. The generated
+   types stay public for reading, so a caller could still call the `flatbuffers` crate's own
+   `root` on them; that is a deliberate bypass the review instructions would flag, not an
+   accident of the API.
 3. **Verifier limits grow with the buffer.** The apparent size, everything following every offset
    may read, is at most eight times the buffer's length, and the number of tables at most one per
    four bytes. An honest document shares only vtables, and one with thousands of fields measured

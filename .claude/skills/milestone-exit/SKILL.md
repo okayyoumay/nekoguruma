@@ -69,7 +69,8 @@ optional, or none. Change nothing before the answer. Raise the chosen items with
 skill (new items for promises with no item) in one backlog-only PR (no Copilot review, ADR-251).
 
 After the raised items are done, the next sweep only needs rule 2 for items added since this
-one, plus rules 1 and 3 for code merged since. The milestone is ready to close when a sweep
+one, plus rules 1, 3 and 4 for code and CI changes merged since (a fix can add a platform or
+release-only path that CI does not run). The milestone is ready to close when a sweep
 finds nothing.
 
 ## close
@@ -79,9 +80,13 @@ last sweep found nothing; if a sweep has not run since the last raised items mer
 first and stop if it finds something.
 
 1. **Evidence for each exit criterion**, not only closed items: the test or CI job that shows
-   it, in the latest successful CI run on `main` (job, run, the log line that says it passed).
-   Note jobs that run only on `main` and not on pull requests. A criterion without evidence
-   becomes a P1 item and the close stops.
+   it, in a successful CI run on `main` for the commit the report names (job, run, the log line
+   that says it passed). If that run is still going, use an earlier green run only after
+   checking that the commits between it and the reported one cannot affect the criterion, and
+   never past a newer failure of the same job. Note jobs that run only on `main` and not on
+   pull requests. A criterion that the plan says needs real hardware (design 13.5, ADR-275)
+   is shown by the recorded hardware run instead (what ran, on which equipment, the result). A
+   criterion without evidence becomes a P1 item and the close stops.
 2. **Plan.** Delete the milestone's section. Carry over to the next milestone's section
    anything that still applies (optional hardware checks, notes on values still to be checked).
    Update the overview table and the order-of-work paragraph (the finish date). Move any lasting

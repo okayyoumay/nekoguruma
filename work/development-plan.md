@@ -4,7 +4,7 @@
 
 Milestones from the current skeleton to a deployable product. Each milestone has a goal, its scope (by design-document section) and exit criteria a reviewer can check. The individual work items live in `backlog.md` and `worker-crates-backlog.md`; this file only says which milestone they belong to. When a milestone finishes, delete its section, move any lasting decision into `docs/system-architecture.md` or an ADR, and name the next milestone in `backlog.md`'s Status section (that is what P1 means).
 
-Order of work: the device side first (M1, M2), because interruption safety (R5) and the IR runtime are the riskiest parts and can be verified without a server. The server and UI follow on the local deployment profile (M3, M4), which needs no cloud. Trust, approval and reprogramming (M6) come before real-time monitoring (M5), so the highest-risk job type continues directly from the M1/M2 interrupted-write work and signing is in place before M7 ingests extension packages. The ODX converter and the SOVD endpoints of M7 can be developed alongside M5/M6, since those standards are held, but the server does not ingest ODX-derived IR as extension packages (9.4) until M6's package signing (11.1) exists; the OTX and ExVe parts come last, once ISO 13209 and ISO 20077/20078 are obtained.
+Order of work: the device side first (M1, finished 2026-10-14, then M2), because interruption safety (R5) and the IR runtime are the riskiest parts and can be verified without a server. The server and UI follow on the local deployment profile (M3, M4), which needs no cloud. Trust, approval and reprogramming (M6) come before real-time monitoring (M5), so the highest-risk job type continues directly from the M1/M2 interrupted-write work and signing is in place before M7 ingests extension packages. The ODX converter and the SOVD endpoints of M7 can be developed alongside M5/M6, since those standards are held, but the server does not ingest ODX-derived IR as extension packages (9.4) until M6's package signing (11.1) exists; the OTX and ExVe parts come last, once ISO 13209 and ISO 20077/20078 are obtained.
 
 Standards: `vehicle-comm-specs` holds SAE J2534-1 (v04.04), SAE J2534-2 (DEC2020), ISO 22900-2 (2009 and 2022), ISO 14229-1 (2026 edition), ISO 14229-2 (2021 edition), ISO 15765-2 (2024 edition), ISO 22901-1 (2008 edition) and ISO 17978-1/-2/-3 (2026 edition). Clause numbers below for ISO 14229-1 refer to the 2026 edition. Standards marked "not held" still have to be obtained.
 
@@ -12,7 +12,6 @@ Standards: `vehicle-comm-specs` holds SAE J2534-1 (v04.04), SAE J2534-2 (DEC2020
 
 | Milestone | Goal | Main crates | Standards needed |
 |---|---|---|---|
-| M1 Local E2E | agent -> worker -> `sim-vci` -> `sim-ecu` works on the worker targets, including an interrupted-write resume | `agent`, `worker-host`, `sim-vci`, `sim-ecu`, `diag-ir`, worker crates | J2534-1, J2534-2, ISO 22900-2, ISO 14229-1 (all held) |
 | M2 Diagnostic runtime | Diagnostic procedures defined as data (proprietary CSV + Starlark format) run end to end | `diag-ir`, `diag-frontend`, worker L1 (ISO-TP, UDS), `agent` L2 | ISO 14229-1, ISO 14229-2, ISO 15765-2 (all held) |
 | M3 Server and job control (local profile) | A job created through the Web API is executed by the agent over the control channel and its result is stored | `server`, `agent`, `shared-proto`, `shared-crypto`, `db/` | none (RFC/IT specs only) |
 | M4 Web UI and acquired data | Operators run jobs and view/edit acquired data in the browser; offline start works | UI framework, reference UI, `server` | none |
@@ -25,40 +24,13 @@ Each milestone also lists optional real-hardware checks (design 13.5, ADR-275) b
 
 M5 and M6 do not depend on each other; M6 comes first (maintainer's decision, 2026-10-06). M7's ODX converter and SOVD endpoints can be developed in parallel with M5/M6; ingesting ODX-derived IR as extension packages waits on M6's package signing, and the OTX and ExVe parts wait on those standards.
 
-## M1 Local E2E (current milestone)
-
-**Goal.** The local end-to-end path works and is verified on the worker targets: agent -> worker service -> `sim-vci` -> `sim-ecu`, with the ABI interpretation table (design 7.1.2) checked on the six worker targets and the interrupted-write resume scenario (design 5.3 / 5.6) passing against the simulators.
-
-**Scope.**
-
-- `sim-ecu` as a UDS server per ISO 14229-1: the services an M1 write job and its resume exercise are DiagnosticSessionControl (9.2), ECUReset (9.3), SecurityAccess (9.4, with the security access state chart in Annex I), TesterPresent (9.7), ReadDataByIdentifier (10.2), WriteDataByIdentifier (10.7, the configuration-value write), ClearDiagnosticInformation and ReadDTCInformation (11.2, 11.3), RoutineControl (13.2) and RequestDownload / TransferData / RequestTransferExit (14.2, 14.4, 14.5). Server response rules (7.7: negative responses, suppressing positive responses, physical vs. functional addressing) and the negative response codes in Annex A.1 apply to all of them. The TransferData block sequence counter (14.4) lets `sim-ecu` accept a block repeated after a lost response without writing it twice; a transfer interrupted by a reset or a lost session restarts from RequestDownload (ADR-229).
-- Simulators: session/flash state in `sim-ecu`; `sim-vci` delegating to `sim-ecu` with fault injection (delay, disconnect, crash, write failure; design 13.4); all functions the j2534-0404 service needs, with stdcall exports on Windows x86 and `long_size = 8` on Linux.
-- Agent: worker launch through `worker-host`, bearer-token minting and the tonic client (design 7.4); Linux library resolution (design 7.1.1).
-- Core logic: `diag-ir` instruction dispatch for the instructions a configuration-value write needs, VM state serialized with postcard (design 8.2.5); a minimal agent journal recording each write step (design 5.5 / 5.6). Journal encryption is M6.
-- CI: the launch test (design 7.3, through `j2534-0404-service`) and ABI table check on the six targets; the resume scenario in the core test job.
-
-**Exit criteria.**
-
-1. A test in CI starts the agent, which launches the j2534-0404 worker against `sim-vci`, opens a channel, and reads a DID from `sim-ecu` (Linux x86_64 at least; the cross-built targets run the launch test).
-2. The ABI table check passes on all six worker targets in CI (`scripts/abi-roundtrip.sh` or its successor).
-3. A write job interrupted at each injected fault (power loss during transfer, worker crash, VCI disconnect) resumes from the journal or ends in a defined failure state, never in an undefined one (design 5.6 state diagram), with a test per fault.
-4. No P1 item for M1 remains open in `backlog.md` or `worker-crates-backlog.md`.
-
-**Risk.** ISO 14229-1 defines the services but not the session-layer timing (P2 / P2* and response-pending handling), which is in ISO 14229-2 (held, 2021 edition). `sim-ecu` uses fixed, configurable timing values in M1; they are checked against ISO 14229-2 in M2.
-
-**Optional real-hardware checks (design 13.5).**
-
-- T0: for each OS and worker ABI the vendor ships a J2534 library for (Windows x86_64 and i686, Linux x86_64 and i686, and Linux ARM where offered), the library is found the way that OS finds it (the Windows registry; the registration definition in `/etc/nekoguruma/j2534/` on Linux, design 7.1, 7.1.1), opens, connects a CAN channel and passes loopback frames. On Linux this also checks the ABI and `unsigned long` width of design 7.1.2.
-- T1: the M1 exit-criteria read and interrupted write, with a real J2534 VCI against the stand-in ECU, and the VCI-disconnect fault produced by unplugging the VCI instead of by `sim-vci`.
-- T2: one DID read from a bench ECU (read only).
-
-## M2 Diagnostic runtime
+## M2 Diagnostic runtime (current milestone)
 
 **Goal.** Vehicle knowledge supplied as data is turned into IR on the server side and executed by the agent, with format differences not leaking below L3 (design 8.1, 8.2).
 
 **Scope.**
 
-- Worker L1: ISO-TP (ISO 15765-2) and UDS client behaviour on both the J2534 and D-PDU workers (design 8.1): session-layer timing and response pending from ISO 14229-2 (existing worker ADRs already cite its timing clause), request/response handling per ISO 14229-1 clause 7.
+- Worker L1: ISO-TP (ISO 15765-2) and UDS client behaviour on both the J2534 and D-PDU workers (design 8.1): session-layer timing and response pending from ISO 14229-2 (ADR-018 and ADR-102 still cite the wrong clause for it), request/response handling per ISO 14229-1 clause 7. `sim-ecu`'s P2 and P2* are still fixed constants from M1; here they become configurable and are checked against ISO 14229-2.
 - Agent L2 primitives (design 8.1) built on ISO 14229-1: read/write DID (10.2, 10.7) with the DID ranges in Annex C.1, read DTC with the status-mask bits and DTC formats in Annex D.2 / D.4, routine control (13.2, Annex F), security access (9.4). The 2026 edition also defines the Authentication service (9.6, certificate exchange and challenge-response) as an alternative to seed/key; L2 keeps the security step replaceable so it can be added in M6.
 - `diag-ir`: declaration part in FlatBuffers with pre-expanded decode plans and COMPU-METHOD conversions (8.2.2); the full procedure-part instruction set (8.2.4); resume model (8.2.5); interruptibility attributes (8.10.1).
 - `diag-frontend`: the proprietary format first, CSV tables + Starlark subset -> IR (8.4), because it needs no purchased standard. Dry-run validation with vehicle access mocked (12.1).
@@ -72,6 +44,8 @@ M5 and M6 do not depend on each other; M6 comes first (maintainer's decision, 20
 
 **Optional real-hardware checks (design 13.5).**
 
+- T0 (carried over from M1): for each OS and worker ABI the vendor ships a J2534 library for (Windows x86_64 and i686, Linux x86_64 and i686, and Linux ARM where offered), the library is found the way that OS finds it (the Windows registry; the registration definition in `/etc/nekoguruma/j2534/` on Linux, design 7.1, 7.1.1), opens, connects a CAN channel and passes loopback frames. On Linux this also checks the ABI and `unsigned long` width of design 7.1.2.
+- T1 (carried over from M1): the local end-to-end read and interrupted write of M1, with a real J2534 VCI against the stand-in ECU, and the VCI-disconnect fault produced by unplugging the VCI instead of by `sim-vci`.
 - T2: session timing (P2 / P2*) and response-pending chains of ISO 14229-2 (2021) 9.2, 9.5 and clause 10, measured on a real VCI against a bench ECU and compared with the values `sim-ecu` uses.
 - T1: the same timing measured on a real VCI against the stand-in ECU, to separate the VCI's own delays from the ECU's.
 - T2: the read parts of the exit-criteria CSV + Starlark definition (variant identification, DIDs, DTC read), rewritten for the bench ECU, run through both a J2534 VCI and a D-PDU API VCI (the first real use of the D-PDU worker). The routine waits for M6, when section 6's controls for it exist (design 13.5).
@@ -178,6 +152,6 @@ This is the one milestone whose exit criteria require real hardware. It reuses t
 
 These change the plan's scope or order; each is a design-17 item or a purchase.
 
-- Standards purchase: SAE J3138 before M6; ISO 13209 (OTX) and ISO 20077/20078 (ExVe) before M7's OTX and ExVe parts start; SAE J1979, J1979-2, ISO 15031-5, ISO 15765-4 and ISO 27145 before M7's generic OBD package. The M1 and M2 standards, ISO 22901-1 (ODX) and ISO 17978 (SOVD) are held.
+- Standards purchase: SAE J3138 before M6; ISO 13209 (OTX) and ISO 20077/20078 (ExVe) before M7's OTX and ExVe parts start; SAE J1979, J1979-2, ISO 15031-5, ISO 15765-4 and ISO 27145 before M7's generic OBD package. The M2 standards, ISO 22901-1 (ODX) and ISO 17978 (SOVD) are held.
 - Design 17 P5 (non-functional targets) before M8.
 - Hardware purchase for the optional real-hardware checks (design 13.5): the minimum set is one VCI meeting both the J2534 and the D-PDU API requirements of design 13.5's device table, a SocketCAN USB-CAN adapter, a diagnostic-connector breakout with terminators, and a laboratory power supply (T0 and T1). A bench ECU (T2) and access to a vehicle (T3) add the later checks. Until hardware exists the checks are written but not run.

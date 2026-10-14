@@ -39,8 +39,10 @@ A table that is absent is empty. A `.csv` file with any other name is rejected
 | `flash_sessions.csv` | no | 4.12 | `FlashSession` |
 | `flash_segments.csv` | no | 4.12 | `FlashSegment` |
 
-The conversion produces one `EcuDocument` per variant (design 8.2.6), with `source_format` set to
-`csv-starlark` (ADR-254). Monitor sets (`EcuVariant.monitor_sets`) and `CompuBytecode` have no
+The table conversion produces the declaration part of one `EcuDocument` per variant (design
+8.2.6), with `source_format` set to `csv-starlark` (ADR-254). Which procedure a document carries
+in `EcuDocument.procedure`, and how a directory with several procedure files is packaged, belong
+to the Starlark lowering, not to this format. Monitor sets (`EcuVariant.monitor_sets`) and `CompuBytecode` have no
 table in this version: the converter emits no monitor set, and a conversion kind other than those
 in 4.5 is rejected.
 
@@ -48,9 +50,10 @@ in 4.5 is rejected.
 
 ## 2. CSV Dialect
 
-- RFC 4180: comma-separated, fields that contain a comma, a double quote or a line break are
-  enclosed in double quotes, and a double quote inside them is doubled. Line ends may be CRLF or
-  LF.
+- The record format of RFC 4180 section 2: comma-separated, fields that contain a comma, a
+  double quote or a line break are enclosed in double quotes, and a double quote inside them is
+  doubled. As an extension to that section, which ends records with CRLF, a record may also end
+  with LF alone.
 - UTF-8. A byte order mark at the start of a file is skipped, so files saved by spreadsheet
   programs are accepted. Any other invalid UTF-8 is rejected.
 - The first record is the header. Columns are identified by their header name, not their
@@ -74,7 +77,7 @@ in 4.5 is rejected.
 | boolean | `yes` or `no` | `yes` |
 | name | `[A-Za-z_][A-Za-z0-9_]*` | `softwareVersion` |
 | key | A name, or names joined by `.` | `session.default` |
-| list | Values joined by `;`, without spaces | `1.0.0;1.0.1` |
+| list | Values joined by `;`, without spaces. `;` is reserved: no element may contain it, and there is no escape | `1.0.0;1.0.1` |
 | text | Any string | `Default session` |
 
 An empty optional cell takes the column's default.
@@ -366,7 +369,7 @@ for a sub-function the routine does not have.
 |---|---|---|---|
 | `container` | as in 5.1 | yes | |
 | `name` | name | yes | `Field.short_name`, unique in the container; the key of the field in a Starlark response's `fields` (subset spec 3.4) |
-| `byte` | integer, 0 to 2^29 - 1 | no | Byte position from the container's position 0. Empty: `AfterPrevious` |
+| `byte` | integer, 0 to 2^29 - 1 | no | Byte position from the container's position 0. Empty: `AfterPrevious`. The resulting IR `bit_offset` (below) must also fit in 32 bits, so the largest `byte` depends on the container |
 | `bit` | integer, 0 to 7 | no | Bit position within that byte, counted from the least significant bit; default 0 |
 | `type` | `uint`, `int`, `float`, `ascii`, `bytes`, `bcd`, `utf8`, `unicode2` | yes, unless `shape` is set | `Field.kind` |
 | `bits` | integer, 1 to 2^32 - 1 | see `length` | |
@@ -374,7 +377,7 @@ for a sub-function the routine does not have.
 | `min_bytes`, `max_bytes` | integer, 0 to 2^32 - 1 | no | `terminated` only; defaults 0; `max_bytes` 0 means no maximum |
 | `terminator` | `end`, `zero`, `ff` | no | `terminated` only: `EndOfPdu` (default), `Zero`, `HexFF` |
 | `byte_order` | `big`, `little` | no | Default `big` |
-| `conversion` | name | no | A `conversions.csv` name; empty: `CompuIdentity` |
+| `conversion` | name | no | A `conversions.csv` name; empty: `CompuIdentity`. It converts decoded values; a procedure supplies request parameters as internal values (5.3) |
 | `unit` | key | no | A `units.csv` key |
 | `const` | integer or bytes | no | A constant (5.3) |
 | `shape` | `group`, `repeat`, `select` | no | A nested layout (5.4) |
@@ -388,7 +391,7 @@ empty for `field` and `terminated`. A `fixed` field of type `ascii`, `bytes`, `b
 **Positions.** A row with `byte` set is `Absolute`: its IR `bit_offset` is
 `(base + byte) * 8 + bit`, where `base` is the number of bytes before the container's position 0
 in the message (1 for `request:` and `response:`, 3 for `did:`, 4 for `routine:`, 0 for
-`layout:`). A row without `byte` is `AfterPrevious` with `bit_offset` = `bit`.
+`layout:`). A value above 2^32 - 1 is rejected (`CSV_BAD_VALUE`). A row without `byte` is `AfterPrevious` with `bit_offset` = `bit`.
 
 **References.** `ref` names a field earlier in the same container; inside a repeated item it
 means the same item's occurrence (`ir.fbs`, `Field.length_field_id`). The IR also allows a field
@@ -413,7 +416,12 @@ them as IR fields. Constants of a `did:` record go into the prefix of both the r
 the write request. The positions of the other fields are unaffected, since they count from the
 container's position 0 either way. The Starlark lowering builds a request's operand bytes as
 `Request.prefix` followed by the encoded parameters, since `ServiceRequest` sends the SID followed
-by its operand (ADR-235 item 2). Whether a received response's prefix matches is checked by the
+by its operand (ADR-235 item 2). `RoutineControl` already sends the sub-function and the routine
+identifier before its operand, so for a routine service the lowering leaves out the three
+generated prefix bytes and starts the operand with any declared constants that follow them.
+Request parameters are encoded from internal values: a field's conversion applies only when a
+response is decoded, so a procedure never needs the inverse of a text table or another
+conversion that has none. Whether a received response's prefix matches is checked by the
 declaration-part decoder, not by the host, which checks only the response SID and, for some
 services, the identifier it echoes (ADR-235 item 3).
 
@@ -423,7 +431,9 @@ every request constant appears in `params` with the same value and whose other r
 include every other key of `params`; exactly one service must match. The generated DID services
 have one constant named `did`, so `diag.request(0x22, {"did": 0xF190})` selects `vin.read` in the
 example. `diag.routine(rid, sub, params)` selects the routine service whose `rid` and `sub`
-constants have those values. Two
+constants have those values. Service selection happens at ingestion, so a `params` value for a
+key that names a constant must be a constant expression; a value known only at run time is
+rejected (`STAR_NON_CONSTANT_ARGUMENT`). Two
 services of one variant with the same SID and the same request constants (name and value) can
 never be told apart and are rejected.
 
@@ -479,22 +489,28 @@ rejected.
 - **Determinism.** The same directory always converts to the same documents, byte for byte: ids
   follow row order (section 3) and arrays follow row order.
 - **`source_digest`.** The lowercase hexadecimal SHA-256 over the table files of section 1 that
-  are present and the `*.star` files, all directly in the definition directory and nothing else,
-  taken in byte order of their file names; each file contributes its name, a zero byte, its
-  length as a big-endian 64-bit integer and its contents. The digest covers the bytes as stored,
-  so a change of line ends alone changes it, and with it the document.
+  are present and the procedure file the document carries, if any, all directly in the
+  definition directory and nothing else. File names in the definition directory are limited to
+  the ASCII characters `A-Z`, `a-z`, `0-9`, `_`, `-` and `.`, so the name bytes are the same on
+  every platform; a `.csv` or `.star` file with any other name is rejected
+  (`CSV_UNKNOWN_FILE`). The files are taken in byte order of their names; each contributes its
+  name, a zero byte, its length as a big-endian 64-bit integer and its contents. The digest covers
+  the bytes as stored, so a change of line ends alone changes it, and with it the document.
 - **`schema_version`** is the IR schema version the converter writes.
 
 ## 7. Error Reporting
 
-As for Starlark (subset spec 5), all errors are listed, not only the first. Each names the file,
-the row (the line on which the record starts, counting the header as line 1) and the column (its
-header name), with a code:
+As for Starlark (subset spec 5), all errors are listed, not only the first. Each names the file
+and a code, and where they exist the row (`line`: the line on which the record starts, counting
+the header as line 1) and the column (`column`: its header name). An error about a whole file
+(`CSV_UNKNOWN_FILE`, a missing required file) has neither; one about the header has no `line`
+beyond 1; invalid UTF-8 or a CSV syntax error gives the line where it occurs and no column. A
+location that does not exist is left out of the report:
 
 | Code | Meaning |
 |---|---|
 | `CSV_SYNTAX` | The file is not valid RFC 4180 CSV or not UTF-8, or a row has the wrong number of cells |
-| `CSV_UNKNOWN_FILE` | A `.csv` file that is not a table of section 1 |
+| `CSV_UNKNOWN_FILE` | A `.csv` file that is not a table of section 1, a file name outside the allowed characters (section 6), or a required table that is missing |
 | `CSV_UNKNOWN_COLUMN` | A header name the table does not define, or a duplicate header name |
 | `CSV_MISSING_COLUMN` | A required column is missing from the header, or a required cell is empty |
 | `CSV_BAD_VALUE` | A value does not parse, is out of range, or is set in a column its row's kind does not use |

@@ -11,9 +11,10 @@ declaration part, with Starlark procedures (design 8.4, ADR-254). The Starlark s
 specification; the CSV side was only named. Its converter, the IR golden tests and the M2
 end-to-end test all need the tables defined first.
 
-The declaration part (`crates/diag-ir/schema/ir.fbs`) is shaped by ODX: services with request and
-response layouts, fields with bit positions, length kinds and nested layouts (ADR-242),
-COMPU-METHOD-like conversions, DTCs, protocols and ComParams, flash sessions and variant patterns.
+The declaration part (`crates/diag-ir/schema/ir.fbs`) is shaped by ODX (ISO 22901-1 (2008)):
+services with request and response layouts (7.3.5.3 to 7.3.5.6), fields with bit positions,
+length kinds and nested layouts (7.3.6, ADR-242), conversions like its computational methods
+(7.3.6.6), DTCs, protocols and ComParams, flash sessions and variant patterns.
 The format has to reach all of it, be writable by hand or in a spreadsheet, convert
 deterministically (the IR is content-addressed and signed, 8.2.6), and leave the differential test
 against ODX (8.4) possible.
@@ -42,7 +43,8 @@ declared service from the SID and the parameter names when it lowers the call.
 4. **Variants by an optional `variants` column.** A scoped row with the column empty belongs to
    every variant; otherwise to the listed ones. Names are unique across the definition, so a
    variant that needs a different layout for the same DID uses a second row with another name.
-   This replaces ODX's layer inheritance with one flat rule.
+   This replaces ODX's value inheritance between diagnostic layers (ISO 22901-1 (2008) 7.3.2.4)
+   with one flat rule.
 5. **One field table for every layout.** `fields.csv` holds the fields of every request,
    response, DID record, routine record and nested layout, each row naming its container. Row
    order is decode order. Positions count from the container's own data (the byte after the SID,
@@ -51,20 +53,23 @@ declared service from the SID and the parameter names when it lowers the call.
    in `repeats.csv` and `select_cases.csv`.
 6. **DIDs and routines generate their services.** A `dids.csv` row generates a read service
    (`<name>.read`) and optionally a write service with one record definition; a `routines.csv`
-   row generates one service per supported sub-function. This mirrors ODX, where each DID or
-   routine sub-function is its own DIAG-SERVICE with the identifier as a constant parameter, so
+   row generates one service per supported sub-function. This mirrors the usual ODX modelling,
+   where each DID or routine sub-function is its own diagnostic service (ISO 22901-1 (2008)
+   7.3.5.3) whose request carries the identifier as a coded constant parameter (7.3.5.4), so
    the differential test against ODX compares like with like. Other services are written in
    `services.csv`.
 7. **Leading constants become the IR prefix and identify the service for Starlark.** A field
    with `const` must be one of the first fields of its container, byte-aligned and fixed. The
    converter moves constants into `Request.prefix` and `PositiveResponse.prefix`, which is where
    the IR expects a sub-function or an echoed identifier. The DID and routine services get
-   generated constants named `did`, `sub` and `rid`, which their fields may not reuse. In the
-   frontend the constants keep their names: `diag.request(sid, params)`
+   generated constants named `did`, `sub` and `rid`, which their fields may not reuse. Request
+   parameters are encoded from internal values, and conversions apply only to decoded values. In
+   the frontend the constants keep their names: `diag.request(sid, params)`
    selects the service of that SID whose every constant appears in `params` with its value and
    whose other request fields cover the remaining keys, and exactly one service must match. The
    generated DID services carry a constant named `did`, so `diag.request(0x22, {"did": 0xF190})`
-   reads the VIN, as the subset specification's examples already write it. Two services of one
+   reads the VIN, as the subset specification's examples already write it. A `params` value for a
+   constant's key must be a constant, since the selection happens at ingestion. Two services of one
    variant with the same SID and the same constants are rejected, since no call could select
    either.
 8. **Conversions are named and shared.** `conversions.csv` names a conversion and its kind;

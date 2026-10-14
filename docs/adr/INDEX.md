@@ -224,7 +224,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-232](ADR-232-linux-support-scope-and-minimum-glibc.md) | Linux Support Scope and Minimum glibc 2.17 | Accepted | design 2 / 7.1.2 / 12.1 / 17, `worker-linux` CI job |
 | [ADR-233](ADR-233-diag-ir-vm-execution-semantics.md) | diag-ir VM Execution Semantics | Accepted (item 3's `VmState` fields removed by ADR-245; `Op::Fail` and `StepOutcome::Failed` appended by ADR-280) | `diag-ir` VM |
 | [ADR-234](ADR-234-sim-vci-flow-control-filter-model.md) | sim-vci Flow-Control Filter Model | Accepted | `sim-vci` filters, writes, reads, IOCTLs |
-| [ADR-235](ADR-235-agent-job-runner-and-worker-diag-host.md) | Agent Job Runner and the Worker-Backed DiagHost | Accepted (item 8 relaxed for debug builds against `sim-vci` by ADR-247) | `agent` runner, host, link |
+| [ADR-235](ADR-235-agent-job-runner-and-worker-diag-host.md) | Agent Job Runner and the Worker-Backed DiagHost | Accepted (item 8 relaxed for debug builds against `sim-vci` by ADR-247; item 3's lost VCI told apart by ADR-289) | `agent` runner, host, link |
 | [ADR-236](ADR-236-time-series-scale-and-raw-response-storage.md) | Time-Series Scale and Raw-Response Storage | Accepted | design 4.3 / 4.6 / 10.3 / 17, `dataset_chunks.chunk_format` |
 | [ADR-237](ADR-237-regulatory-scope-access-routes-without-tool-certification.md) | Regulatory Scope: Use the Access Routes Regulations Open, Without Tool Certification | Accepted | design 8.1 / 9.2 / 16.1 / 16.2 / 17, `db/` retention |
 | [ADR-238](ADR-238-sim-vci-control-commands-and-device-loss.md) | sim-vci Control Commands and Device Loss | Accepted | `sim-vci` control export and directory, `ERR_DEVICE_NOT_CONNECTED` |
@@ -278,6 +278,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-286](ADR-286-restart-identity-abort-is-journaled.md) | The Restart's Identity Abort Is Journaled as a Terminal Record | Accepted | `agent` journal, restart, runner; design 5.6 / 8.2.5 |
 | [ADR-287](ADR-287-the-step-limit-applies-per-run.md) | The Job's Step Limit Applies to Each Run | Accepted (the open consequence on a plain start after a step-limited run decided by ADR-288: the stop is journaled as terminal) | `agent` runner |
 | [ADR-288](ADR-288-a-stopped-run-is-journaled-as-terminal.md) | A Run Stopped on the Step Limit or a VM Error Is Journaled as a Terminal Record | Accepted | `agent` journal, restart, runner; `diag-ir` `VmError`; design 5.6 |
+| [ADR-289](ADR-289-a-lost-vci-ends-the-primitive-at-once.md) | A Lost VCI Ends the Pending Primitive at Once, as `HostError::VciLost` | Accepted | `agent` host; design 5.6 / 8.2.5 |
 
 ## Status Legend
 
@@ -628,7 +629,7 @@ the predecessor repository these ADRs came from.
 ### Write Jobs & Resume
 - ADR-229 (item 1's `recovery_required_from_step` replaced by ADR-245; item 2's failed confirmation after an accepted reset gets one passive retry since ADR-265; item 2 step 3's post-transfer completion counts only for the interrupted pass since ADR-269; item 2's identity abort is journaled as a terminal state since ADR-286)
 - ADR-233 (item 3's `VmState` fields removed by ADR-245; `Op::Fail` and `StepOutcome::Failed` appended by ADR-280)
-- ADR-235 (item 8 relaxed for debug builds against `sim-vci` by ADR-247)
+- ADR-235 (item 8 relaxed for debug builds against `sim-vci` by ADR-247; item 3's lost VCI told apart by ADR-289)
 - ADR-241
 - ADR-244 (record set extended by ADR-253, ADR-261, ADR-268, ADR-272, ADR-280, ADR-286 and ADR-288; item 4's target VIN is a journal record since ADR-261, and its version being written since ADR-268; the no-lock consequence superseded by ADR-255 item 7)
 - ADR-245 (items 4 and 6 amended by ADR-250)
@@ -658,6 +659,7 @@ the predecessor repository these ADRs came from.
 - ADR-286
 - ADR-287 (the open consequence on a plain start after a step-limited run decided by ADR-288: the stop is journaled as terminal)
 - ADR-288
+- ADR-289
 
 ### Diagnostic IR
 - ADR-233 (item 3's `VmState` fields removed by ADR-245; `Op::Fail` and `StepOutcome::Failed` appended by ADR-280)

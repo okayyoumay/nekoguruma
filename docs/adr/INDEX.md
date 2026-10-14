@@ -286,6 +286,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-294](ADR-294-a-vci-lost-between-primitives-is-vci-lost.md) | A VCI Lost between Two Primitives Is Reported as `HostError::VciLost` | Accepted | `agent` host, `j2534-0404-service` hard-error handling; design 8.2.4 |
 | [ADR-295](ADR-295-csv-table-format-of-the-vehicle-knowledge-format.md) | The CSV Table Format of the Proprietary Vehicle-Knowledge Format | Accepted | `diag-frontend` CSV table spec and example; design 8.4 |
 | [ADR-296](ADR-296-the-ir-declaration-part-is-loaded-through-a-checking-loader.md) | The IR Declaration Part Is Loaded Through a Checking Loader | Accepted | `diag-ir` declaration loader and generated bindings; design 8.2.6 |
+| [ADR-297](ADR-297-a-flat-positive-response-is-decoded-as-odx-extracts-a-parameter.md) | A Flat Positive Response Is Decoded as ODX Extracts a Parameter | Accepted | `diag-ir` response decoder; design 8.2.2 |
 
 ## Status Legend
 
@@ -682,6 +683,7 @@ the predecessor repository these ADRs came from.
 - ADR-281
 - ADR-295
 - ADR-296
+- ADR-297
 
 ### Acquired Data & Monitoring
 - ADR-236

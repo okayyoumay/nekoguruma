@@ -182,6 +182,8 @@ A control command is a JSON object tagged by `command`:
 | `{"command": "set_battery_voltage", "millivolts": N}` | sets the battery voltage `READ_VBATT` reports (default 12000) |
 | `{"command": "fail_writes", "times": N}` | the next `N` calls of `PassThruWriteMsgs` (at least 1) fail with `ERR_FAILED`, sending nothing; without `"times"`, every call fails until `clear_write_failures` |
 | `{"command": "clear_write_failures"}` | ends `fail_writes` |
+| `{"command": "crash_vci"}` | crashes the VCI: it stays plugged in, but every J2534 call except `PassThruGetLastError` fails with `ERR_FAILED` (ADR-292) |
+| `{"command": "restart_vci"}` | restarts a crashed VCI |
 
 Unknown commands and unknown fields, in the command or in the fault, are rejected. A command that needs the ECU creates it first,
 as the first `PassThruOpen` does. There are two ways to send one:
@@ -213,7 +215,14 @@ answer as they do with no device open (a device or channel ID gets `ERR_INVALID_
 succeed), and the open succeeds once the VCI is back. The ECU keeps
 its state throughout.
 
-A VCI crash, as opposed to a disconnect, is not simulated.
+A crashed VCI (ADR-292) is plugged in but answers nothing: every function except
+`PassThruGetLastError` returns `ERR_FAILED`, before checking its arguments, and a waiting
+`PassThruReadMsgs` returns with it at once. `PassThruOpen` fails the same way while the VCI is
+crashed. `PassThruClose` on the open device still releases it (with its channels and unread
+responses) and reports `ERR_FAILED`; the next open, once the VCI answers again, returns a new
+device ID. After `restart_vci`, a device that was still open is lost, as after a disconnect, until
+`PassThruClose` releases it. Like a disconnect, a crash is the state of the process that applied
+it, and the ECU keeps its state throughout.
 
 ## Request trace
 
@@ -249,7 +258,7 @@ lost after the replug, released by the close, and a new device ID on the next op
 runs each step in its own process with a state file: one starts a download and exits without
 closing anything, the next reads the running transfer and the programming session (DIDs FD00
 and F186), and one started after tS3_Server reads the interrupted transfer in the default
-session. `tests/agent_restart_end_to_end.rs` uses the state file with a restart harness (`tests/common/restart.rs`): an agent running a flash job is killed with SIGKILL, with its worker, after a block of the transfer was journaled, and the job is resumed at library level with the same journal directory, once within tS3_Server and once after it ran out (the ECU's timer goes on while no process has it loaded); both end with the job complete and the image verified. The same file interrupts a running agent's transfer with `fail_writes`: the worker reports the refused block as a transmit error, and the next run restarts the transfer and completes the job. `tests/sim_vci_response_pending.rs` runs agent jobs through the worker
+session. `tests/agent_restart_end_to_end.rs` uses the state file with a restart harness (`tests/common/restart.rs`): an agent running a flash job is killed with SIGKILL, with its worker, after a block of the transfer was journaled, and the job is resumed at library level with the same journal directory, once within tS3_Server and once after it ran out (the ECU's timer goes on while no process has it loaded); both end with the job complete and the image verified. The same file interrupts a running agent's transfer with `fail_writes`: the worker reports the refused block as a transmit error, and the next run restarts the transfer and completes the job. It also crashes the VCI mid-transfer (`crash_vci`): the worker's receive poll takes the link offline, as for a lost device, and the next run, on a new worker, completes the job. `tests/sim_vci_response_pending.rs` runs agent jobs through the worker
 while `sim-ecu` answers with response pending. In a chain whose gaps are longer than P2 and
 shorter than P2*, the job still gets the final response: the worker restarts its timer with P2*
 on each 0x78, and the agent host skips the 0x78s the worker passes on. A chain that outlasts the

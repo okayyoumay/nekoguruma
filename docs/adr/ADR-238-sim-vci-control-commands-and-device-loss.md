@@ -1,7 +1,7 @@
 # ADR-238: sim-vci Control Commands and Device Loss
 
 **Date:** 2026-10-07
-**Status:** Accepted
+**Status:** Accepted (the VCI crash consequence settled by ADR-292: a crashed VCI fails every call with `ERR_FAILED`)
 **Affects:** `crates/sim-vci` (control export, control directory, `ERR_DEVICE_NOT_CONNECTED`), `crates/sim-ecu` (`Fault` serialization), `crates/j2534-0404-service/tests/sim_vci_control.rs`
 
 ## Context

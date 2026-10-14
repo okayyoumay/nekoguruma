@@ -743,4 +743,100 @@ mod tests {
             ))
         ));
     }
+
+    /// The document with its one field changed by `edit`.
+    fn with_field(edit: impl FnOnce(&mut FieldT)) -> Vec<u8> {
+        let mut doc = document();
+        let field = &mut doc.variant.as_mut().unwrap().services.as_mut().unwrap()[0]
+            .positive
+            .as_mut()
+            .unwrap()
+            .fields
+            .as_mut()
+            .unwrap()[0];
+        edit(field);
+        encode_ecu_document(&doc)
+    }
+
+    #[test]
+    fn every_field_enum_outside_its_type_is_rejected() {
+        type Case = (&'static str, fn(&mut FieldT));
+        let cases: [Case; 6] = [
+            ("placement", |f| {
+                f.placement = Placement(Placement::ENUM_MAX + 1)
+            }),
+            ("length kind", |f| {
+                f.length_kind = LengthKind(LengthKind::ENUM_MAX + 1)
+            }),
+            ("data kind", |f| f.kind = DataKind(DataKind::ENUM_MAX + 1)),
+            ("byte order", |f| f.byte_order = ByteOrder(-1)),
+            ("termination", |f| {
+                f.termination = Termination(Termination::ENUM_MAX + 1)
+            }),
+            ("repeat count", |f| {
+                f.shape = ShapeT::Repeat(Box::new(RepeatT {
+                    count: RepeatCount(RepeatCount::ENUM_MAX + 1),
+                    ..Default::default()
+                }));
+            }),
+        ];
+        for (what, edit) in cases {
+            assert!(
+                matches!(
+                    load_ecu_document(&with_field(edit)),
+                    Err(LoadError::Invalid(_))
+                ),
+                "{what}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_shape_tag_is_rejected() {
+        let mut fbb = flatbuffers::FlatBufferBuilder::new();
+        let group = Group::create(&mut fbb, &GroupArgs { layout_id: 1 });
+        let field = Field::create(
+            &mut fbb,
+            &FieldArgs {
+                id: 1,
+                shape_type: Shape(Shape::ENUM_MAX + 1),
+                shape: Some(group.as_union_value()),
+                ..Default::default()
+            },
+        );
+        let fields = fbb.create_vector(&[field]);
+        let layout = Layout::create(
+            &mut fbb,
+            &LayoutArgs {
+                id: 1,
+                fields: Some(fields),
+                ..Default::default()
+            },
+        );
+        let layouts = fbb.create_vector(&[layout]);
+        let variant = EcuVariant::create(
+            &mut fbb,
+            &EcuVariantArgs {
+                layouts: Some(layouts),
+                ..Default::default()
+            },
+        );
+        let format = fbb.create_string("csv-starlark");
+        let digest = fbb.create_string("00");
+        let root = EcuDocument::create(
+            &mut fbb,
+            &EcuDocumentArgs {
+                schema_version: IR_SCHEMA_VERSION,
+                source_format: Some(format),
+                source_digest: Some(digest),
+                variant: Some(variant),
+                procedure: None,
+            },
+        );
+        finish_ecu_document_buffer(&mut fbb, root);
+        assert!(matches!(
+            load_ecu_document(fbb.finished_data()),
+            Err(LoadError::Invalid(_))
+        ));
+    }
 }

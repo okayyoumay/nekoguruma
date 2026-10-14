@@ -155,6 +155,9 @@ pub(crate) fn list<T>(
             if item.is_empty() {
                 return Err(format!("{cell:?} has an empty element"));
             }
+            if item.starts_with(char::is_whitespace) || item.ends_with(char::is_whitespace) {
+                return Err(format!("{cell:?}: list elements are joined without spaces"));
+            }
             if unique && !seen.insert(item) {
                 return Err(format!("{item:?} is given twice"));
             }
@@ -326,6 +329,14 @@ mod tests {
             assert!(list(bad, false, text).is_err(), "{bad:?}");
         }
         assert!(list("a;a", true, text).is_err());
+        for bad in ["1.0.0; 1.0.1", "1.0.0 ;1.0.1", " a"] {
+            assert!(list(bad, false, text).is_err(), "{bad:?}");
+        }
+        // A space inside an element is part of it.
+        assert_eq!(
+            list("NGR EX;b", false, text),
+            Ok(vec!["NGR EX".into(), "b".into()])
+        );
         assert_eq!(list("1;1", false, float), Ok(vec![1.0, 1.0]));
         assert!(boolean("Yes").is_err());
     }

@@ -86,18 +86,21 @@ const REQUIRED_FILES: [&str; 2] = ["variants.csv", "protocols.csv"];
 
 /// Reads the tables of the definition directory `dir`. Only the entries directly in it are
 /// considered, following symbolic links; entries whose names end neither in `.csv` nor in
-/// `.star` are not read, and one with such a name that is not a regular file is rejected.
+/// `.star` are skipped without being looked at, and one with such a name that is not a regular
+/// file is rejected.
 pub fn read_directory(dir: &Path) -> Result<Tables, ReadError> {
     let mut entries = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        // `metadata` follows a link; a link to nothing is not a regular file.
-        let is_file = match std::fs::metadata(entry.path()) {
-            Ok(metadata) => metadata.is_file(),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-            Err(e) => return Err(e.into()),
-        };
+        // Entries that are neither tables nor procedures are not looked at at all.
+        let lower = name.to_ascii_lowercase();
+        if !lower.ends_with(".csv") && !lower.ends_with(".star") {
+            continue;
+        }
+        // `metadata` follows a link; one that leads nowhere (missing, a loop) is not a regular
+        // file.
+        let is_file = std::fs::metadata(entry.path()).is_ok_and(|m| m.is_file());
         // Only a table is read; any other name is judged by its name alone.
         let contents = if !is_file {
             None

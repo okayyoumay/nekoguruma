@@ -1054,7 +1054,9 @@ pub struct FieldRow {
     pub bit: u8,
     pub field_type: Option<FieldType>,
     pub bits: Option<u32>,
-    pub length: Length,
+    /// `None`: the cell is empty, which means `fixed` except where a field takes no length
+    /// at all (a shape, 5.4).
+    pub length: Option<Length>,
     pub min_bytes: Option<u32>,
     pub max_bytes: Option<u32>,
     pub terminator: Option<Terminator>,
@@ -1133,7 +1135,7 @@ pub(crate) fn fields(sheet: &Sheet, errors: &mut Errors) -> Vec<FieldRow> {
             );
         }
         let bits = row.optional(e, "bits", as_u32(1));
-        let length = row.or(e, "length", Length::Fixed, |c| {
+        let length = row.optional(e, "length", |c| {
             values::keyword(
                 c,
                 &[
@@ -1182,7 +1184,7 @@ pub(crate) fn fields(sheet: &Sheet, errors: &mut Errors) -> Vec<FieldRow> {
             bit: bit?,
             field_type: field_type.ok()?,
             bits: bits.ok()?,
-            length: length?,
+            length: length.ok()?,
             min_bytes: min_bytes.ok()?,
             max_bytes: max_bytes.ok()?,
             terminator: terminator.ok()?,
@@ -1303,7 +1305,8 @@ pub(crate) fn repeats(sheet: &Sheet, errors: &mut Errors) -> Vec<RepeatRow> {
                 let limit = |c: &str| values::integer(c, false, 0, max.into()).map(|v| v as u64);
                 let lower = row.required(e, "marker_lower", limit);
                 let upper = row.optional(e, "marker_upper", limit);
-                let (bits, lower) = (bits?, lower?);
+                // The limits are compared even when the width is wrong.
+                let lower = lower?;
                 let upper = upper.ok()?.unwrap_or(lower);
                 if lower > upper {
                     row.error(
@@ -1320,7 +1323,11 @@ pub(crate) fn repeats(sheet: &Sheet, errors: &mut Errors) -> Vec<RepeatRow> {
                         "the marker range crosses 2^63, so its limits would not be in order as int64",
                     );
                 }
-                RepeatCount::Marker { bits, lower, upper }
+                RepeatCount::Marker {
+                    bits: bits?,
+                    lower,
+                    upper,
+                }
             }
             kind @ (Count::Field | Count::End) => {
                 let label = if matches!(kind, Count::Field) {

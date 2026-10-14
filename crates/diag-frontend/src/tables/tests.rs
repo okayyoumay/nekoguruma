@@ -632,6 +632,14 @@ fn one_bad_cell_does_not_hide_the_others_of_its_row() {
             cell(BadValue, 2, "marker_upper"),
         ]
     );
+    // A wrong width does not hide limits in the wrong order.
+    assert_eq!(
+        table_errors("repeats.csv", header, &["layout:a,f,marker,12,5,4"]),
+        vec![
+            cell(BadValue, 2, "marker_bits"),
+            cell(BadValue, 2, "marker_upper"),
+        ]
+    );
     assert_eq!(
         table_errors("repeats.csv", header, &["layout:a,f,forever,8,zz,"]),
         vec![
@@ -696,5 +704,51 @@ fn a_directory_follows_links_and_rejects_entries_that_are_not_files() {
             .map(|e| (e.code, e.file.as_str()))
             .collect::<Vec<_>>(),
         vec![(UnknownFile, "broken.star"), (UnknownFile, "odd.csv")]
+    );
+}
+
+#[test]
+fn an_empty_length_is_kept_apart_from_an_explicit_one() {
+    let tables = read_files(with(
+        "fields.csv",
+        "container,name,shape,layout,length\nlayout:x,a,group,y,\nlayout:x,b,group,y,fixed\n",
+    ))
+    .expect("cell syntax is valid; the field rules come later");
+    assert_eq!(
+        tables.fields.iter().map(|f| f.length).collect::<Vec<_>>(),
+        vec![None, Some(Length::Fixed)]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn entries_that_are_not_definition_files_are_never_looked_at() {
+    let dir = std::env::temp_dir().join(format!(
+        "ngr-csv-loop-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    std::fs::create_dir(&dir).expect("temporary directory");
+    for (name, contents) in example() {
+        std::fs::write(dir.join(&name), contents).expect("write");
+    }
+    // A link to itself cannot be followed; as a README it is simply not read.
+    std::os::unix::fs::symlink(dir.join("README"), dir.join("README")).expect("link");
+    let ignored = read_directory(&dir).map(|t| t.variants.len());
+    // Named like a table, the same loop is rejected rather than failing the read.
+    std::os::unix::fs::symlink(dir.join("loop.csv"), dir.join("loop.csv")).expect("link");
+    let rejected = read_directory(&dir);
+    std::fs::remove_dir_all(&dir).expect("clean up");
+    assert_eq!(ignored.expect("valid"), 2);
+    let Err(ReadError::Rejected(rejected)) = rejected else {
+        panic!("rejected: {rejected:?}");
+    };
+    assert_eq!(rejected.errors.len(), 1);
+    assert_eq!(
+        (rejected.errors[0].code, rejected.errors[0].file.as_str()),
+        (UnknownFile, "loop.csv")
     );
 }

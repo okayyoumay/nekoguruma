@@ -324,9 +324,10 @@ pub struct Confirmation {
 
 /// Decides how the job of `program` goes on, from its journal as `Journal::read` (or
 /// `Journal::open`) gave it. No journal at all (`JournalError::NotFound`) is a plain start only
-/// for a program without a flash recovery plan, which keeps none. For a program with one it is
-/// on-site intervention: the runner creates the journal before it sends anything, so a missing
-/// one cannot be told from one lost after an erase. A journal that holds a procedure failure is
+/// for a program that keeps none ([`keeps_journal`]). For one with a flash recovery plan or a
+/// `RecoveryRequired` section it is on-site intervention: the runner creates the journal before
+/// it sends anything, so a missing one cannot be told from one lost after an erase or inside the
+/// section (ADR-293). A journal that holds a procedure failure is
 /// decided first, as [`RestartDecision::Failed`], whatever else it holds (ADR-280); one that holds an
 /// identity abort is decided next, as [`RestartDecision::Aborted`] (ADR-286), and one that holds a
 /// run's stop after that, as [`RestartDecision::Stopped`] (ADR-288).
@@ -336,7 +337,7 @@ pub fn classify(
 ) -> RestartDecision {
     let state = match journal {
         Ok(state) => state,
-        Err(JournalError::NotFound) if program.flash.is_empty() => {
+        Err(JournalError::NotFound) if !keeps_journal(program) => {
             return RestartDecision::PlainStart;
         }
         Err(JournalError::NotFound) => {
@@ -1328,6 +1329,17 @@ fn recovery_required(program: &Program, at: StepRef) -> Option<OnSiteReason> {
         .map(|section| OnSiteReason::RecoveryRequiredSection { section, at })
 }
 
+/// Whether a job of `program` keeps a write-job journal: a program with a flash recovery plan
+/// (ADR-252 item 7), or with a section marked `RecoveryRequired`, whose passes the journal
+/// records (ADR-291, ADR-293). Any other program keeps none.
+pub(crate) fn keeps_journal(program: &Program) -> bool {
+    !program.flash.is_empty()
+        || program
+            .sections
+            .iter()
+            .any(|section| matches!(section.interruptible, Interruptible::RecoveryRequired))
+}
+
 /// Whether `pc` lies in a section marked `RecoveryRequired` and outside every plan's range
 /// (`entry_pc` up to, not including, `post_transfer_end_pc`): where the runner writes an intent
 /// ahead of a pass's first primitive (ADR-291).
@@ -1994,7 +2006,7 @@ mod tests {
             decide(&program, &journal_until(&program, ENTRY)),
             RestartDecision::PlainStart
         );
-        // No journal: a plain start only for a program without a plan, which keeps none.
+        // No journal: a plain start only for a program that keeps none.
         assert_eq!(
             classify(&program, Err(&JournalError::NotFound)),
             RestartDecision::OnSiteInterventionRequired(OnSiteReason::MissingJournal)
@@ -2004,6 +2016,18 @@ mod tests {
         assert_eq!(
             classify(&no_plan, Err(&JournalError::NotFound)),
             RestartDecision::PlainStart
+        );
+        // A `RecoveryRequired` section keeps a journal without a plan too (ADR-293).
+        no_plan.sections.push(Section {
+            start_pc: 0,
+            end_pc: 2,
+            interruptible: Interruptible::RecoveryRequired,
+            idempotency: Idempotency::Safe,
+            expected_millis: 0,
+        });
+        assert_eq!(
+            classify(&no_plan, Err(&JournalError::NotFound)),
+            RestartDecision::OnSiteInterventionRequired(OnSiteReason::MissingJournal)
         );
     }
 

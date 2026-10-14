@@ -1,7 +1,7 @@
 # ADR-291: A `RecoveryRequired` Section outside the Flash Recovery Plans Is Written Ahead
 
 **Date:** 2026-10-14
-**Status:** Accepted
+**Status:** Accepted (the consequence on programs without a flash recovery plan superseded by ADR-293: such a program with a `RecoveryRequired` section keeps a journal)
 **Affects:** `agent` (`src/journaling.rs`, `src/restart.rs`, `src/runner.rs` tests,
 `docs/ngr-agent.md`), `docs/system-architecture.md` 8.2.5; ADR-245 item 3, ADR-252, ADR-253
 

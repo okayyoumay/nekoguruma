@@ -124,9 +124,9 @@ the VIN the job targets, which a first run records as the journal's first record
 restart compares against, and the software version the job intends to write, recorded right
 after it in the same creating write and compared the same way, ADR-268) and the job's guards ("Job guards"
 below), which it returns with the result, and,
-for a program with a flash recovery plan, creates the journal once the link is open and the
-policy allows the program, before anything is sent to the ECU; a program without a plan keeps
-none. A journal that already exists ends the job with nothing sent: a job that ran before goes
+for a program with a flash recovery plan or a section marked `RecoveryRequired` (ADR-293),
+creates the journal once the link is open and the policy allows the program, before anything is
+sent to the ECU; a program with neither keeps none. A journal that already exists ends the job with nothing sent: a job that ran before goes
 on through `resume_program_journaled` ("Restart entry" below). Every run from instruction 0, a first
 run or a plain start on an existing journal, commits the VM state it starts from as its first
 record (the run start, ADR-272), at the run's first step count and before anything is sent, so
@@ -197,8 +197,8 @@ step count, of the last completed step, the two transfer markers and the last re
 
 | Journal | Decision |
 |---|---|
-| none (`NotFound`), program without a plan | plain start |
-| none (`NotFound`), program with a plan | `OnSiteInterventionRequired` (the journal is created before anything is sent) |
+| none (`NotFound`), program with neither a plan nor a `RecoveryRequired` section | plain start |
+| none (`NotFound`), program with a plan or a `RecoveryRequired` section (ADR-293) | `OnSiteInterventionRequired` (the journal is created before anything is sent) |
 | unreadable (corrupt, unknown format version, another job, I/O) | `OnSiteInterventionRequired` |
 | a procedure-failure record (ADR-280), checked before every row below | `Failed`, with the record's position, code and detail |
 | an identity-abort record (ADR-286), checked right after the procedure-failure record | `Aborted`, with the `IdentityKind`, whatever the transfer state |
@@ -241,7 +241,7 @@ it classifies the journal.
 
 | Decision | What the runner does |
 |---|---|
-| plain start | runs the program from its start on the same journal; its step count starts at `restart::next_steps`, after the journal's last record, and the identity is read again. A program without a plan runs without a journal, when it has none or one that records no transfer |
+| plain start | runs the program from its start on the same journal; its step count starts at `restart::next_steps`, after the journal's last record, and the identity is read again. A program with neither a plan nor a `RecoveryRequired` section runs without a journal, when it has none or one that records no transfer |
 | `Failed` | ends in `JobError::ProcedureFailed` with the record's position, code and detail, read under the journal's lock before the worker link is opened; nothing is sent to the ECU and no resume is counted (ADR-280) |
 | `Aborted` | ends in `JobError::IdentityMismatch` with the journaled `IdentityKind`, read under the journal's lock before the worker link is opened and before the target VIN and intended version are compared; nothing is sent to the ECU and no resume is counted (ADR-286) |
 | `Stopped` | ends in the error the stopped run returned, `JobError::StepLimit` with the recorded step count or `JobError::Vm` with the recorded position and error, read under the journal's lock before the worker link is opened; nothing is sent to the ECU and no resume is counted, so a plain start does not send the pre-erase requests again and a restart does not redo the transfer (ADR-288) |

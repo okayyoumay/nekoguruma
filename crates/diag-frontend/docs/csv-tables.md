@@ -462,8 +462,15 @@ value a procedure could supply for them, so a shaped field in a request is rejec
 
 - `group`: one occurrence of `layout`.
 - `repeat`: `layout` repeated; its count is a row of `repeats.csv` for the field.
-- `select`: one layout chosen by the key in `ref`; its cases are rows of `select_cases.csv` for
-  the field.
+- `select`: one layout chosen by the key in `ref`, which must not be a `float` field; its cases
+  are rows of `select_cases.csv` for the field.
+
+A Starlark response's `fields` (subset spec 3.4) holds one value per name, so in this version its
+keys are the scalar fields at the top of the response: those of the `response:` container, the
+DID record or the routine response, not fields inside a `group`, `repeat` or `select`, which may
+occur several times or not at all. Reading a nested field, or a shaped field itself, from
+`fields` is rejected at ingestion; a procedure reaches that data through `raw`. The nested
+layouts still serve the declaration-part decoder and DTC decoding.
 
 `repeats.csv`, exactly one row per `repeat` field:
 
@@ -487,7 +494,7 @@ bytes read as a big-endian integer (`ir.fbs`, `Repeat`), so this one form covers
 |---|---|---|---|
 | `container`, `field` | as in `fields.csv` | yes | The `select` field |
 | `case` | name | yes | `SelectCase.short_name`, unique per field |
-| `lower` | integer | no | Inclusive, compared with the key's internal value (ADR-242); empty together with `upper` makes the row the default case. For an `int` key, -2^63 to 2^63 - 1; for any other key type, 0 to 2^64 - 1, stored bit for bit in the IR's `int64` (as for byte and string keys, `ir.fbs` `Select`) |
+| `lower` | integer | no | Inclusive, compared with the key's internal value (ADR-242); empty together with `upper` makes the row the default case. For an `int` key, -2^63 to 2^63 - 1; for a `uint`, `bcd`, `bytes`, `ascii`, `utf8` or `unicode2` key, 0 to 2^64 - 1, stored bit for bit in the IR's `int64` (as for byte and string keys, `ir.fbs` `Select`). A `select` keyed by a `float` field is rejected (`CSV_IR_RULE`; `ir.fbs` `Select`, ADR-242) |
 | `upper` | integer | no | Default: the same as `lower`; same range as `lower` |
 | `layout` | layout name | no | Empty: the key is valid but carries no data |
 
@@ -510,7 +517,14 @@ encodes at the field's position. The fields of a container that is sent (`reques
 
 `str` values are encoded as UTF-8 (`ascii` accepts only ASCII) or, for `unicode2`, as 2-byte
 characters in `byte_order`. Any other field in such a container (a `field` length, a `zero` or
-`ff` terminator, a shape) is rejected (`CSV_UNSUPPORTED`). A constant value that does not fit
+`ff` terminator, a shape) is rejected (`CSV_UNSUPPORTED`).
+
+The encoded request is the concatenation of its fields in row order, so every byte of it comes
+from exactly one field. In a container that is sent, every field is byte-aligned (`bit` 0) and
+whole bytes wide (`bits` a multiple of 8), the constants come first (5.3), and every other field
+starts exactly where the previous one ends: either without `byte`, or with the `byte` at which
+the previous field ends. A field that would leave a gap or overlap the previous one is rejected
+(`CSV_UNSUPPORTED`). A constant value that does not fit
 its field is rejected at ingestion; a run-time value that does not fit is an error at run time.
 
 ---
@@ -519,7 +533,10 @@ its field is rejected at ingestion; a run-time value that does not fit is an err
 
 - **Every IR rule is checked.** The constraints `ir.fbs` states (field order, which shapes may
   appear where, length kinds per type, marker and key types, `min_bytes` <= `max_bytes`, layout
-  bounds) are checked at conversion and reported like any other table error (`CSV_IR_RULE`).
+  bounds) are checked at conversion and reported like any other table error (`CSV_IR_RULE`), and
+  so are the limits ADR-242 places on nested layouts: a layout that reaches itself through
+  `group`, `repeat` or `select` fields (a cycle) is rejected, as is nesting deeper than the
+  decoder accepts.
   Nothing is left for the agent to discover at run time (design 8.3).
 - **Determinism.** The same directory always converts to the same documents, byte for byte: ids
   follow row order (section 3) and arrays follow row order.

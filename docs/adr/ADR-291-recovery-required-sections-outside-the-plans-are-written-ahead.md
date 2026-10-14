@@ -48,8 +48,14 @@ program. The plain start had no such check.
    (a failed or unanswered step, a cancel, an identity read at a plan's entry that failed), up
    to the next transfer-start marker. 8.10.1 rules out repeating the section, and the journal
    cannot tell a section that completed from one that did not.
-3. **A transfer-start marker after the intent lifts the refusal.** The restart then replays
-   from that plan's entry only, which lies after the section, so the section is not repeated.
+3. **A transfer-start marker after the intent lifts the refusal.** Execution left the section
+   and reached that plan's erase, so the section's pass ended, and the restart replays from the
+   plan's entry, not from the program's start. If the program's own flow goes from the plan
+   into the section again, for example a section after the plan that a loop back to the entry
+   passed before, the restart's pass through it is the next pass the program makes after the
+   plan, which the uninterrupted run makes too. It gets its own intent. What 8.10.1 rules out is
+   repeating a pass whose end is not known, and a later transfer-start marker shows the earlier
+   pass ended.
 
 ## Consequences
 

@@ -637,7 +637,7 @@ file on its own (the file set, the record format, the header, each cell, and nam
 in one table), then the rules that compare rows with each other or with other tables
 (references, variant scoping, a key defined twice in one variant's document). The second stage
 runs only when the first finds no error, since a reference to a row with an error can be checked
-neither way; a definition with errors of the first stage therefore lists only those.
+neither way; a definition with errors of the first stage therefore lists only those (ADR-298).
 
 A rule in this document that names no code uses the closest one below: a missing row that a rule
 requires (an empty `variants.csv`, a variant without a protocol, a DID with no service or no

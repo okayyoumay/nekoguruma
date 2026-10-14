@@ -1,0 +1,6 @@
+conversion,lower,upper,text
+sessionName,0x01,,session.default
+sessionName,0x02,,session.programming
+sessionName,0x03,,session.extended
+checkResult,0x00,,check.correct
+checkResult,0x01,0xFF,check.incorrect

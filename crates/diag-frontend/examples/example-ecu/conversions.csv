@@ -1,0 +1,5 @@
+name,kind,numerator,denominator,offset,default_text
+sessionName,text-table,,,,value.unknown
+checkResult,text-table,,,,value.unknown
+supplyVoltage,linear,1,10,0,
+tenMilliseconds,linear,10,1,0,

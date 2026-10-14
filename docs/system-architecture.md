@@ -911,6 +911,8 @@ flowchart LR
 
 The detailed subset, the API and the annotations for section attributes are in `crates/diag-frontend/docs/starlark-subset.md`.
 
+The CSV tables (one directory per ECU, one fixed file per table, rows that refer to each other by name, and the DID and routine services they generate) are specified in `crates/diag-frontend/docs/csv-tables.md` (ADR-295). Each variant converts to its own `EcuDocument` (8.2.6). Leading constant fields of a request or response, such as a sub-function or an echoed DID, become the IR prefix; in the frontend the request's constants also select the declared service a Starlark `diag.request` call means, since the IR's `ServiceRequest` holds only the SID.
+
 **Verification**: Provide a differential test that ingests the same definition via ODX and via the proprietary format and confirms the generated IR matches. This verifies swappability itself.
 
 The scope of the subset can be broadened by updating the supply format front end (9.2). As long as the agent-side runtime and the IR schema do not change, no redistribution of the core is needed.

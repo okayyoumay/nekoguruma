@@ -1,0 +1,3 @@
+variant,service,field,expected,note
+exampleEcuV1,softwareVersion.read,softwareVersion,312E,"ASCII ""1."""
+exampleEcuV2,softwareVersion.read,softwareVersion,322E,"ASCII ""2."""

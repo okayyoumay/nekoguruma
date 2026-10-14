@@ -78,7 +78,7 @@ in 4.5 is rejected.
 | boolean | `yes` or `no` | `yes` |
 | name | `[A-Za-z_][A-Za-z0-9_]*` | `softwareVersion` |
 | key | A name, or names joined by `.` | `session.default` |
-| list | Values joined by `;`, without spaces. `;` is reserved: no element may contain it, and there is no escape. An empty element (`a;;b`, a leading or trailing `;`) or an element given twice is rejected | `1.0.0;1.0.1` |
+| list | Values joined by `;`, without spaces. `;` is reserved: no element may contain it, and there is no escape. An empty element (`a;;b`, a leading or trailing `;`) is rejected. In a list of names or keywords (`variants`, `part_numbers`, `sw_versions`, `steps`) an element given twice is rejected too; a list of numbers (`numerator_coeffs`, `denominator_coeffs`) may repeat values | `1.0.0;1.0.1` |
 | text | Any string | `Default session` |
 | service name | A `name`, or a DID or routine name followed by `.read`, `.write`, `.start`, `.stop` or `.results`, naming a generated service (4.7, 4.8) | `vin.read` |
 

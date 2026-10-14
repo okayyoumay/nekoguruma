@@ -104,8 +104,8 @@ example definition of one ECU that uses every table.
   DIDs, DTC read and routines are those `sim-ecu` answers, apart from two DIDs `sim-ecu` does not
   answer: a supply voltage with a linear conversion and a last reset reason with a keyed
   selection.
-- A procedure that reads a constant (`res["fields"]["sub"]`) finds nothing: constants are part of
-  the prefix and not IR fields. The host checks only the response SID and, for some services, the
+- A procedure cannot read a constant (`res["fields"]["sub"]` is rejected at ingestion):
+  constants are part of the prefix and not IR fields. The host checks only the response SID and, for some services, the
   echoed identifier (ADR-235 item 3), so comparing the rest of a response's prefix falls to the
   declaration-part decoder.
 - Because names are unique across the definition rather than per variant, a DID whose layout

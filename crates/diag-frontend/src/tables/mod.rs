@@ -14,7 +14,6 @@ mod sheet;
 mod values;
 
 use std::collections::HashMap;
-use std::hash::Hash;
 use std::path::Path;
 
 use error::Errors;
@@ -85,33 +84,53 @@ const SPECS: [&Spec; 19] = [
 /// The tables a definition must have.
 const REQUIRED_FILES: [&str; 2] = ["variants.csv", "protocols.csv"];
 
-/// Reads the tables of the definition directory `dir`. Only the files directly in it are
-/// considered; files whose names end neither in `.csv` nor in `.star` are not read.
+/// Reads the tables of the definition directory `dir`. Only the entries directly in it are
+/// considered, following symbolic links; entries whose names end neither in `.csv` nor in
+/// `.star` are not read, and one with such a name that is not a regular file is rejected.
 pub fn read_directory(dir: &Path) -> Result<Tables, ReadError> {
-    let mut files = Vec::new();
+    let mut entries = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
-        if !entry.file_type()?.is_file() {
-            continue;
-        }
         let name = entry.file_name().to_string_lossy().into_owned();
-        // Only a table is read; any other name is judged by its name alone.
-        let contents = if SPECS.iter().any(|spec| spec.file == name) {
-            std::fs::read(entry.path())?
-        } else {
-            Vec::new()
+        // `metadata` follows a link; a link to nothing is not a regular file.
+        let is_file = match std::fs::metadata(entry.path()) {
+            Ok(metadata) => metadata.is_file(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => return Err(e.into()),
         };
-        files.push((name, contents));
+        // Only a table is read; any other name is judged by its name alone.
+        let contents = if !is_file {
+            None
+        } else if SPECS.iter().any(|spec| spec.file == name) {
+            Some(std::fs::read(entry.path())?)
+        } else {
+            Some(Vec::new())
+        };
+        entries.push((name, contents));
     }
-    Ok(read_files(files)?)
+    Ok(read_entries(entries)?)
 }
 
 /// Reads the tables from `files`, the names and contents of the files directly in a definition
 /// directory.
 pub fn read_files(files: impl IntoIterator<Item = (String, Vec<u8>)>) -> Result<Tables, Rejected> {
+    read_entries(
+        files
+            .into_iter()
+            .map(|(name, contents)| (name, Some(contents))),
+    )
+}
+
+/// Reads the tables from a directory's entries; `None` contents mark an entry that is not a
+/// regular file.
+fn read_entries(
+    entries: impl IntoIterator<Item = (String, Option<Vec<u8>>)>,
+) -> Result<Tables, Rejected> {
     let mut errors = Errors::default();
     let mut sheets: HashMap<&'static str, Sheet> = HashMap::new();
-    for (name, contents) in files {
+    // Tables that broke the record format: their other errors are not reported (section 7).
+    let mut broken: Vec<&'static str> = Vec::new();
+    for (name, contents) in entries {
         let lower = name.to_ascii_lowercase();
         let csv = lower.ends_with(".csv");
         if !csv && !lower.ends_with(".star") {
@@ -130,6 +149,16 @@ pub fn read_files(files: impl IntoIterator<Item = (String, Vec<u8>)>) -> Result<
             );
             continue;
         }
+        let Some(contents) = contents else {
+            errors.push(
+                ErrorCode::UnknownFile,
+                &name,
+                None,
+                None,
+                format!("{name} is not a regular file"),
+            );
+            continue;
+        };
         if !csv {
             continue;
         }
@@ -143,10 +172,8 @@ pub fn read_files(files: impl IntoIterator<Item = (String, Vec<u8>)>) -> Result<
             );
             continue;
         };
-        match records::parse(&contents) {
-            Ok(records) => {
-                sheets.insert(spec.file, Sheet::new(spec, records, &mut errors));
-            }
+        let sheet = match records::parse(&contents) {
+            Ok(records) => Sheet::new(spec, records, &mut errors),
             Err(syntax) => {
                 errors.push(
                     ErrorCode::Syntax,
@@ -156,9 +183,14 @@ pub fn read_files(files: impl IntoIterator<Item = (String, Vec<u8>)>) -> Result<
                     syntax.hint,
                 );
                 // The rest of the file cannot be trusted; it is read as empty.
-                sheets.insert(spec.file, Sheet::new(spec, Vec::new(), &mut errors));
+                broken.push(spec.file);
+                Sheet::new(spec, Vec::new(), &mut errors)
             }
+        };
+        if sheet.had_syntax_error {
+            broken.push(spec.file);
         }
+        sheets.insert(spec.file, sheet);
     }
     for file in REQUIRED_FILES {
         if !sheets.contains_key(file) {
@@ -171,7 +203,8 @@ pub fn read_files(files: impl IntoIterator<Item = (String, Vec<u8>)>) -> Result<
             );
         }
     }
-    if sheets.get("variants.csv").is_some_and(Sheet::is_empty) {
+    if sheets.get("variants.csv").is_some_and(Sheet::is_empty) && !broken.contains(&"variants.csv")
+    {
         errors.push(
             ErrorCode::MissingColumn,
             "variants.csv",
@@ -180,31 +213,35 @@ pub fn read_files(files: impl IntoIterator<Item = (String, Vec<u8>)>) -> Result<
             "a definition needs at least one variant",
         );
     }
-    let empty = |spec: &Spec| Sheet::new(spec, Vec::new(), &mut Errors::default());
-    let mut sheet = |spec: &Spec| sheets.remove(spec.file).unwrap_or_else(|| empty(spec));
+    for spec in SPECS {
+        sheets
+            .entry(spec.file)
+            .or_insert_with(|| Sheet::new(spec, Vec::new(), &mut Errors::default()));
+    }
+    let sheet = |spec: &Spec| &sheets[spec.file];
     let e = &mut errors;
     let tables = Tables {
-        variants: variants(&sheet(&VARIANTS), e),
-        variant_patterns: variant_patterns(&sheet(&VARIANT_PATTERNS), e),
-        protocols: protocols(&sheet(&PROTOCOLS), e),
-        comparams: comparams(&sheet(&COMPARAMS), e),
-        texts: catalog(&sheet(&TEXTS), e, "text"),
-        units: catalog(&sheet(&UNITS), e, "symbol"),
-        conversions: conversions(&sheet(&CONVERSIONS), e),
-        conversion_scales: conversion_scales(&sheet(&CONVERSION_SCALES), e),
-        services: services(&sheet(&SERVICES), e),
-        dids: dids(&sheet(&DIDS), e),
-        routines: routines(&sheet(&ROUTINES), e),
-        nrcs: nrcs(&sheet(&NRCS), e),
-        layouts: layouts(&sheet(&LAYOUTS), e),
-        fields: fields(&sheet(&FIELDS), e),
-        repeats: repeats(&sheet(&REPEATS), e),
-        select_cases: select_cases(&sheet(&SELECT_CASES), e),
-        dtcs: dtcs(&sheet(&DTCS), e),
-        flash_sessions: flash_sessions(&sheet(&FLASH_SESSIONS), e),
-        flash_segments: flash_segments(&sheet(&FLASH_SEGMENTS), e),
+        variants: variants(sheet(&VARIANTS), e),
+        variant_patterns: variant_patterns(sheet(&VARIANT_PATTERNS), e),
+        protocols: protocols(sheet(&PROTOCOLS), e),
+        comparams: comparams(sheet(&COMPARAMS), e),
+        texts: catalog(sheet(&TEXTS), e, "text"),
+        units: catalog(sheet(&UNITS), e, "symbol"),
+        conversions: conversions(sheet(&CONVERSIONS), e),
+        conversion_scales: conversion_scales(sheet(&CONVERSION_SCALES), e),
+        services: services(sheet(&SERVICES), e),
+        dids: dids(sheet(&DIDS), e),
+        routines: routines(sheet(&ROUTINES), e),
+        nrcs: nrcs(sheet(&NRCS), e),
+        layouts: layouts(sheet(&LAYOUTS), e),
+        fields: fields(sheet(&FIELDS), e),
+        repeats: repeats(sheet(&REPEATS), e),
+        select_cases: select_cases(sheet(&SELECT_CASES), e),
+        dtcs: dtcs(sheet(&DTCS), e),
+        flash_sessions: flash_sessions(sheet(&FLASH_SESSIONS), e),
+        flash_segments: flash_segments(sheet(&FLASH_SEGMENTS), e),
     };
-    check_duplicates(&tables, e);
+    check_duplicates(&sheets, e);
     if errors.0.is_empty() {
         Ok(tables)
     } else {
@@ -212,139 +249,137 @@ pub fn read_files(files: impl IntoIterator<Item = (String, Vec<u8>)>) -> Result<
     }
 }
 
+/// A key that no two rows of a table may share (section 3; a field's name per container, 5.1;
+/// a case per `select` field and a count per `repeat` field, 5.4; a segment per session, 4.12).
+struct UniqueKey {
+    file: &'static str,
+    /// The cells that make up the key; the last is the one reported.
+    columns: &'static [&'static str],
+    /// Whether the key is a number, compared by value rather than as written.
+    numeric: bool,
+}
+
+const UNIQUE_KEYS: [UniqueKey; 16] = [
+    UniqueKey {
+        file: "variants.csv",
+        columns: &["id"],
+        numeric: true,
+    },
+    UniqueKey {
+        file: "variants.csv",
+        columns: &["name"],
+        numeric: false,
+    },
+    UniqueKey {
+        file: "texts.csv",
+        columns: &["key"],
+        numeric: false,
+    },
+    UniqueKey {
+        file: "texts.csv",
+        columns: &["id"],
+        numeric: true,
+    },
+    UniqueKey {
+        file: "units.csv",
+        columns: &["key"],
+        numeric: false,
+    },
+    UniqueKey {
+        file: "units.csv",
+        columns: &["id"],
+        numeric: true,
+    },
+    UniqueKey {
+        file: "conversions.csv",
+        columns: &["name"],
+        numeric: false,
+    },
+    UniqueKey {
+        file: "services.csv",
+        columns: &["name"],
+        numeric: false,
+    },
+    UniqueKey {
+        file: "dids.csv",
+        columns: &["name"],
+        numeric: false,
+    },
+    UniqueKey {
+        file: "routines.csv",
+        columns: &["name"],
+        numeric: false,
+    },
+    UniqueKey {
+        file: "layouts.csv",
+        columns: &["name"],
+        numeric: false,
+    },
+    UniqueKey {
+        file: "flash_sessions.csv",
+        columns: &["name"],
+        numeric: false,
+    },
+    UniqueKey {
+        file: "fields.csv",
+        columns: &["container", "name"],
+        numeric: false,
+    },
+    UniqueKey {
+        file: "repeats.csv",
+        columns: &["container", "field"],
+        numeric: false,
+    },
+    UniqueKey {
+        file: "select_cases.csv",
+        columns: &["container", "field", "case"],
+        numeric: false,
+    },
+    UniqueKey {
+        file: "flash_segments.csv",
+        columns: &["session", "name"],
+        numeric: false,
+    },
+];
+
 /// Reports every row that defines again a name, id or key an earlier row of the same table
-/// defines (section 3; `name` and its container for fields, 5.1).
-fn check_duplicates(tables: &Tables, errors: &mut Errors) {
-    fn once<K: Eq + Hash>(
-        errors: &mut Errors,
-        file: &str,
-        column: &str,
-        rows: impl IntoIterator<Item = (Line, K, String)>,
-    ) {
-        let mut first: HashMap<K, Line> = HashMap::new();
-        for (line, key, shown) in rows {
-            match first.get(&key) {
+/// defines. The keys are compared as written (numbers by value), so a row whose other cells
+/// are wrong is still checked; a key with an empty or unparsable cell is left to the cell's own
+/// error.
+fn check_duplicates(sheets: &HashMap<&'static str, Sheet>, errors: &mut Errors) {
+    for key in &UNIQUE_KEYS {
+        let column = key.columns[key.columns.len() - 1];
+        let mut first: HashMap<Vec<String>, u32> = HashMap::new();
+        for (line, cells) in sheets[key.file].cells(key.columns) {
+            let Some(cells) = cells.into_iter().collect::<Option<Vec<&str>>>() else {
+                continue;
+            };
+            let value: Vec<String> = if key.numeric {
+                match values::integer(cells[0], false, 0, u64::MAX.into()) {
+                    Ok(n) => vec![n.to_string()],
+                    Err(_) => continue,
+                }
+            } else {
+                cells.iter().map(|c| (*c).to_owned()).collect()
+            };
+            match first.get(&value) {
                 Some(&earlier) => errors.push(
                     ErrorCode::Duplicate,
-                    file,
+                    key.file,
                     Some(line),
                     Some(column),
-                    format!("{shown} is already defined on line {earlier}"),
+                    format!(
+                        "{} {} is already defined on line {earlier}",
+                        column,
+                        cells.join(" / ")
+                    ),
                 ),
                 None => {
-                    first.insert(key, line);
+                    first.insert(value, line);
                 }
             }
         }
     }
-    let t = tables;
-    let by_name = |line, name: &String| (line, name.clone(), name.clone());
-    let by_id = |line, id: u32| (line, id, id.to_string());
-    once(
-        errors,
-        "variants.csv",
-        "id",
-        t.variants.iter().map(|r| by_id(r.line, r.id)),
-    );
-    once(
-        errors,
-        "variants.csv",
-        "name",
-        t.variants.iter().map(|r| by_name(r.line, &r.name)),
-    );
-    for (file, rows) in [("texts.csv", &t.texts), ("units.csv", &t.units)] {
-        once(
-            errors,
-            file,
-            "key",
-            rows.iter().map(|r| by_name(r.line, &r.key)),
-        );
-        once(errors, file, "id", rows.iter().map(|r| by_id(r.line, r.id)));
-    }
-    once(
-        errors,
-        "conversions.csv",
-        "name",
-        t.conversions.iter().map(|r| by_name(r.line, &r.name)),
-    );
-    once(
-        errors,
-        "services.csv",
-        "name",
-        t.services.iter().map(|r| by_name(r.line, &r.name)),
-    );
-    once(
-        errors,
-        "dids.csv",
-        "name",
-        t.dids.iter().map(|r| by_name(r.line, &r.name)),
-    );
-    once(
-        errors,
-        "routines.csv",
-        "name",
-        t.routines.iter().map(|r| by_name(r.line, &r.name)),
-    );
-    once(
-        errors,
-        "layouts.csv",
-        "name",
-        t.layouts.iter().map(|r| by_name(r.line, &r.name)),
-    );
-    once(
-        errors,
-        "flash_sessions.csv",
-        "name",
-        t.flash_sessions.iter().map(|r| by_name(r.line, &r.name)),
-    );
-    once(
-        errors,
-        "fields.csv",
-        "name",
-        t.fields.iter().map(|r| {
-            (
-                r.line,
-                (r.container.clone(), r.name.clone()),
-                format!("field {}", r.name),
-            )
-        }),
-    );
-    once(
-        errors,
-        "repeats.csv",
-        "field",
-        t.repeats.iter().map(|r| {
-            (
-                r.line,
-                (r.container.clone(), r.field.clone()),
-                format!("the count of {}", r.field),
-            )
-        }),
-    );
-    once(
-        errors,
-        "select_cases.csv",
-        "case",
-        t.select_cases.iter().map(|r| {
-            (
-                r.line,
-                (r.container.clone(), r.field.clone(), r.case.clone()),
-                format!("case {} of {}", r.case, r.field),
-            )
-        }),
-    );
-    once(
-        errors,
-        "flash_segments.csv",
-        "name",
-        t.flash_segments.iter().map(|r| {
-            (
-                r.line,
-                (r.session.clone(), r.name.clone()),
-                format!("segment {} of {}", r.name, r.session),
-            )
-        }),
-    );
 }
 
 #[cfg(test)]

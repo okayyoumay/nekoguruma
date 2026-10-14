@@ -16,7 +16,9 @@ One ECU is defined by one directory. Its tables are the CSV files below, each wi
 A table that is absent is empty; so is a file of zero bytes, and a file with only a header row.
 File names match exactly, case included; any other file whose name ends in `.csv`, in any case,
 is rejected (`CSV_UNKNOWN_FILE`). Files that are not `.csv`, such as the Starlark procedure files and a
-`README`, are not tables and are ignored by the table conversion.
+`README`, are not tables and are ignored by the table conversion. A symbolic link is read as the
+file it points to; an entry named like a `.csv` or `.star` file that is not a regular file (a
+directory, a link to nothing) is rejected (`CSV_UNKNOWN_FILE`).
 
 | File | Required | Section | IR target |
 |---|---|---|---|

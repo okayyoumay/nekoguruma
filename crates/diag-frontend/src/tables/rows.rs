@@ -344,7 +344,19 @@ pub(crate) fn conversions(sheet: &Sheet, errors: &mut Errors) -> Vec<ConversionR
                 ],
             )
         });
-        let kind = match kind? {
+        let Some(kind) = kind else {
+            // With no valid kind, each cell is still checked for its own syntax.
+            for column in ["numerator", "offset"] {
+                row.optional(e, column, values::float).ok();
+            }
+            row.optional(e, "denominator", nonzero_float).ok();
+            for column in ["numerator_coeffs", "denominator_coeffs"] {
+                row.optional(e, column, floats).ok();
+            }
+            row.optional(e, "default_text", values::key).ok();
+            return None;
+        };
+        let kind = match kind {
             Kind::Linear => {
                 let numerator = row.or(e, "numerator", 1.0, values::float);
                 let denominator = row.or(e, "denominator", 1.0, nonzero_float);
@@ -1230,6 +1242,14 @@ enum Count {
     End,
 }
 
+fn marker_bits(cell: &str) -> Parsed<u8> {
+    let bits = as_u8(8, 64)(cell)?;
+    if bits % 8 != 0 {
+        return Err(format!("{bits} is not a multiple of 8"));
+    }
+    Ok(bits)
+}
+
 const FIXED_COLUMNS: [&str; 2] = ["items", "item_bytes"];
 const MARKER_COLUMNS: [&str; 3] = ["marker_bits", "marker_lower", "marker_upper"];
 
@@ -1248,7 +1268,17 @@ pub(crate) fn repeats(sheet: &Sheet, errors: &mut Errors) -> Vec<RepeatRow> {
                 ],
             )
         });
-        let count = match count? {
+        let Some(count) = count else {
+            // With no valid count, each cell is still checked for its own syntax.
+            row.optional(e, "items", as_u32(1)).ok();
+            row.optional(e, "item_bytes", as_u32(1)).ok();
+            row.optional(e, "marker_bits", marker_bits).ok();
+            for column in ["marker_lower", "marker_upper"] {
+                row.optional(e, column, as_u64(0)).ok();
+            }
+            return None;
+        };
+        let count = match count {
             Count::Fixed => {
                 let items = row.required(e, "items", as_u32(1));
                 let item_bytes = row.required(e, "item_bytes", as_u32(1));
@@ -1264,23 +1294,17 @@ pub(crate) fn repeats(sheet: &Sheet, errors: &mut Errors) -> Vec<RepeatRow> {
                 for column in FIXED_COLUMNS {
                     row.unused(e, column, "a marker count");
                 }
-                let bits = row.required(e, "marker_bits", |c| {
-                    let bits = as_u8(8, 64)(c)?;
-                    if bits % 8 != 0 {
-                        return Err(format!("{bits} is not a multiple of 8"));
-                    }
-                    Ok(bits)
-                })?;
-                let max = if bits == 64 {
-                    u64::MAX
-                } else {
-                    (1u64 << bits) - 1
+                let bits = row.required(e, "marker_bits", marker_bits);
+                // Without a valid width the limits are still checked against the widest one.
+                let max = match bits {
+                    Some(bits) if bits < 64 => (1u64 << bits) - 1,
+                    _ => u64::MAX,
                 };
-                let limit = |c: &str| {
-                    values::integer(c, false, 0, max.into()).map(|v| v as u64)
-                };
-                let lower = row.required(e, "marker_lower", limit)?;
-                let upper = row.or(e, "marker_upper", lower, limit)?;
+                let limit = |c: &str| values::integer(c, false, 0, max.into()).map(|v| v as u64);
+                let lower = row.required(e, "marker_lower", limit);
+                let upper = row.optional(e, "marker_upper", limit);
+                let (bits, lower) = (bits?, lower?);
+                let upper = upper.ok()?.unwrap_or(lower);
                 if lower > upper {
                     row.error(
                         e,

@@ -19,7 +19,11 @@ pub(crate) struct Spec {
 pub(crate) struct Sheet {
     file: &'static str,
     header: HashMap<&'static str, usize>,
+    /// The columns the header must have: their empty cells are reported by the header check.
+    header_required: &'static [(&'static str, bool)],
     records: Vec<Record>,
+    /// Whether a row had the wrong number of cells.
+    pub(crate) had_syntax_error: bool,
 }
 
 impl Sheet {
@@ -32,7 +36,9 @@ impl Sheet {
             return Self {
                 file: spec.file,
                 header,
+                header_required: spec.columns,
                 records: Vec::new(),
+                had_syntax_error: false,
             };
         };
         let known = |name: &str| -> Option<&'static str> {
@@ -45,14 +51,17 @@ impl Sheet {
         };
         for (index, name) in first.cells.iter().enumerate() {
             match known(name) {
-                Some(column) if header.insert(column, index).is_some() => errors.push(
+                // The first occurrence is the column; the repeat is only reported.
+                Some(column) if header.contains_key(column) => errors.push(
                     ErrorCode::UnknownColumn,
                     spec.file,
                     Some(first.line),
                     Some(name),
                     format!("column {name} appears twice in the header"),
                 ),
-                Some(_) => {}
+                Some(column) => {
+                    header.insert(column, index);
+                }
                 None => errors.push(
                     ErrorCode::UnknownColumn,
                     spec.file,
@@ -74,10 +83,12 @@ impl Sheet {
             }
         }
         let width = first.cells.len();
+        let mut had_syntax_error = false;
         let records = records
             .filter(|record| {
                 let fits = record.cells.len() == width;
                 if !fits {
+                    had_syntax_error = true;
                     errors.push(
                         ErrorCode::Syntax,
                         spec.file,
@@ -95,7 +106,9 @@ impl Sheet {
         Self {
             file: spec.file,
             header,
+            header_required: spec.columns,
             records,
+            had_syntax_error,
         }
     }
 
@@ -113,10 +126,31 @@ impl Sheet {
                     line: record.line,
                     cells: &record.cells,
                     header: &self.header,
+                    header_required: self.header_required,
                     ok: true,
                 };
                 let value = read(&mut row, errors);
                 if row.ok { value } else { None }
+            })
+            .collect()
+    }
+
+    /// Each row's line and the cells of `columns`, as written; `None` for an empty cell or a
+    /// column the header leaves out.
+    pub(crate) fn cells(&self, columns: &[&str]) -> Vec<(u32, Vec<Option<&str>>)> {
+        self.records
+            .iter()
+            .map(|record| {
+                let cells = columns
+                    .iter()
+                    .map(|column| {
+                        self.header
+                            .get(column)
+                            .map(|&i| record.cells[i].as_str())
+                            .filter(|cell| !cell.is_empty())
+                    })
+                    .collect();
+                (record.line, cells)
             })
             .collect()
     }
@@ -134,6 +168,7 @@ pub(crate) struct Row<'a> {
     pub(crate) line: u32,
     cells: &'a [String],
     header: &'a HashMap<&'static str, usize>,
+    header_required: &'static [(&'static str, bool)],
     ok: bool,
 }
 
@@ -158,8 +193,10 @@ impl Row<'_> {
         errors.push(code, self.file, Some(self.line), Some(column), hint);
     }
 
-    /// A required cell. An empty one is reported, unless the column is missing from the header,
-    /// which the header check reported already.
+    /// A required cell. An empty one is reported, also when its column is missing from the
+    /// header, unless the header check reported that already: a column the table always
+    /// requires is reported once there, while one that only some kinds of row require (such as
+    /// the coefficients of a rational conversion) is reported at each row that needs it.
     pub(crate) fn required<T>(
         &mut self,
         errors: &mut Errors,
@@ -169,15 +206,17 @@ impl Row<'_> {
         match self.cell(column) {
             Some(cell) => self.parse(errors, column, cell.to_owned(), parse),
             None => {
-                if self.header.contains_key(column) {
+                let reported = !self.header.contains_key(column)
+                    && self.header_required.contains(&(column, true));
+                if reported {
+                    self.ok = false;
+                } else {
                     self.error(
                         errors,
                         ErrorCode::MissingColumn,
                         column,
                         format!("{column} is required"),
                     );
-                } else {
-                    self.ok = false;
                 }
                 None
             }

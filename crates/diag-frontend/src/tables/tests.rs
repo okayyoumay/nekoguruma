@@ -574,3 +574,127 @@ fn every_error_is_listed_sorted_by_file_line_and_column() {
         ]
     );
 }
+
+// ---------------------------------------------------------------- Edge cases
+
+#[test]
+fn a_column_one_kind_of_row_requires_is_reported_when_the_header_leaves_it_out() {
+    assert_eq!(
+        table_errors(
+            "conversions.csv",
+            "name,kind",
+            &["r,rational", "i,identity"]
+        ),
+        vec![
+            cell(MissingColumn, 2, "denominator_coeffs"),
+            cell(MissingColumn, 2, "numerator_coeffs"),
+        ]
+    );
+    assert_eq!(
+        table_errors(
+            "repeats.csv",
+            "container,field,count",
+            &["layout:a,f,fixed", "layout:a,g,marker", "layout:a,h,end"]
+        ),
+        vec![
+            cell(MissingColumn, 2, "item_bytes"),
+            cell(MissingColumn, 2, "items"),
+            cell(MissingColumn, 3, "marker_bits"),
+            cell(MissingColumn, 3, "marker_lower"),
+        ]
+    );
+}
+
+#[test]
+fn a_file_that_breaks_the_record_format_reports_nothing_else() {
+    assert_eq!(
+        errors(with("variants.csv", "id,name\n1,exampleEcuV1\n2,\"x\"y\n")),
+        vec![at(Syntax, "variants.csv", Some(3), None)]
+    );
+    // Rows with the wrong number of cells are syntax errors too, not an empty table.
+    assert_eq!(
+        errors(with("variants.csv", "id,name\n1\n2,b,c\n")),
+        vec![
+            at(Syntax, "variants.csv", Some(2), None),
+            at(Syntax, "variants.csv", Some(3), None),
+        ]
+    );
+}
+
+#[test]
+fn one_bad_cell_does_not_hide_the_others_of_its_row() {
+    let header = "container,field,count,marker_bits,marker_lower,marker_upper";
+    assert_eq!(
+        table_errors("repeats.csv", header, &["layout:a,f,marker,12,zz,qq"]),
+        vec![
+            cell(BadValue, 2, "marker_bits"),
+            cell(BadValue, 2, "marker_lower"),
+            cell(BadValue, 2, "marker_upper"),
+        ]
+    );
+    assert_eq!(
+        table_errors("repeats.csv", header, &["layout:a,f,forever,8,zz,"]),
+        vec![
+            cell(BadValue, 2, "count"),
+            cell(BadValue, 2, "marker_lower")
+        ]
+    );
+    assert_eq!(
+        table_errors("conversions.csv", "name,kind,numerator", &["r,cubic,abc"]),
+        vec![cell(BadValue, 2, "kind"), cell(BadValue, 2, "numerator")]
+    );
+    // A row with another error is still checked for a duplicate key, compared by value.
+    assert_eq!(
+        table_errors(
+            "variants.csv",
+            "id,name",
+            &["1,exampleEcuV1", "0x01,bad-name"]
+        ),
+        vec![cell(Duplicate, 3, "id"), cell(BadValue, 3, "name")]
+    );
+}
+
+#[test]
+fn a_repeated_header_column_keeps_its_first_occurrence() {
+    assert_eq!(
+        table_errors("variants.csv", "id,name,id", &["1,exampleEcuV1,zz"]),
+        vec![cell(UnknownColumn, 1, "id")]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_directory_follows_links_and_rejects_entries_that_are_not_files() {
+    let dir = std::env::temp_dir().join(format!(
+        "ngr-csv-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    std::fs::create_dir(&dir).expect("temporary directory");
+    for (name, contents) in example() {
+        if name != "dids.csv" {
+            std::fs::write(dir.join(&name), contents).expect("write");
+        }
+    }
+    std::os::unix::fs::symlink(example_dir().join("dids.csv"), dir.join("dids.csv")).expect("link");
+    let tables = read_directory(&dir).expect("valid through the link");
+    assert_eq!(tables.dids.len(), 8);
+    std::fs::create_dir(dir.join("odd.csv")).expect("directory");
+    std::os::unix::fs::symlink(dir.join("missing"), dir.join("broken.star")).expect("link");
+    let result = read_directory(&dir);
+    std::fs::remove_dir_all(&dir).expect("clean up");
+    let Err(ReadError::Rejected(rejected)) = result else {
+        panic!("rejected: {result:?}");
+    };
+    assert_eq!(
+        rejected
+            .errors
+            .iter()
+            .map(|e| (e.code, e.file.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(UnknownFile, "broken.star"), (UnknownFile, "odd.csv")]
+    );
+}

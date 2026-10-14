@@ -26,13 +26,28 @@ const BOM: &[u8] = b"\xEF\xBB\xBF";
 
 /// Splits a file into records. A byte order mark at the start is skipped; any other invalid
 /// UTF-8, a quote inside an unquoted cell, text after a closing quote, a carriage return that
-/// does not end a line, and an unterminated quoted cell are syntax errors.
+/// does not end a line, and an unterminated quoted cell are syntax errors. The first error in the
+/// file is reported, whichever kind it is.
 pub(crate) fn parse(bytes: &[u8]) -> Result<Vec<Record>, SyntaxError> {
     let bytes = bytes.strip_prefix(BOM).unwrap_or(bytes);
-    let text = std::str::from_utf8(bytes).map_err(|e| SyntaxError {
-        line: line_of(&bytes[..e.valid_up_to()]),
-        hint: "the file is not valid UTF-8",
-    })?;
+    // The records are parsed up to the first invalid byte, so that a syntax error before it is
+    // the one reported; reaching that byte is the encoding error.
+    let (text, invalid) = match std::str::from_utf8(bytes) {
+        Ok(text) => (text, None),
+        Err(e) => {
+            let valid = &bytes[..e.valid_up_to()];
+            let text = std::str::from_utf8(valid).expect("valid up to here");
+            (
+                text,
+                Some(SyntaxError {
+                    line: line_of(valid),
+                    hint: "the file is not valid UTF-8",
+                }),
+            )
+        }
+    };
+    // What the end of the valid text means: the end of the file, or the invalid byte.
+    let end = |otherwise: SyntaxError| Err(invalid.clone().unwrap_or(otherwise));
     let mut records = Vec::new();
     let mut chars = text.chars().peekable();
     let mut line: u32 = 1;
@@ -44,11 +59,12 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<Vec<Record>, SyntaxError> {
             // At the start of a cell.
             if chars.peek() == Some(&'"') {
                 chars.next();
+                let opened = line;
                 loop {
                     match chars.next() {
                         None => {
-                            return Err(SyntaxError {
-                                line: start,
+                            return end(SyntaxError {
+                                line: opened,
                                 hint: "a quoted cell is not closed",
                             });
                         }
@@ -59,7 +75,7 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<Vec<Record>, SyntaxError> {
                         Some('"') => break,
                         Some(c) => {
                             if c == '\n' {
-                                line += 1;
+                                line = line.saturating_add(1);
                             }
                             cell.push(c);
                         }
@@ -95,17 +111,26 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<Vec<Record>, SyntaxError> {
             match chars.next() {
                 Some(',') => continue,
                 Some('\r') => {
-                    if chars.next() != Some('\n') {
-                        return Err(SyntaxError {
-                            line,
-                            hint: "a carriage return that does not end a line",
-                        });
+                    match chars.next() {
+                        Some('\n') => {}
+                        None => {
+                            return end(SyntaxError {
+                                line,
+                                hint: "a carriage return that does not end a line",
+                            });
+                        }
+                        Some(_) => {
+                            return Err(SyntaxError {
+                                line,
+                                hint: "a carriage return that does not end a line",
+                            });
+                        }
                     }
-                    line += 1;
+                    line = line.saturating_add(1);
                     break;
                 }
                 Some('\n') => {
-                    line += 1;
+                    line = line.saturating_add(1);
                     break;
                 }
                 // The last record need not end with a line break.
@@ -115,7 +140,10 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<Vec<Record>, SyntaxError> {
         }
         records.push(Record { line: start, cells });
     }
-    Ok(records)
+    match invalid {
+        Some(error) => Err(error),
+        None => Ok(records),
+    }
 }
 
 /// The line on which the byte after `prefix` lies.
@@ -185,6 +213,15 @@ mod tests {
     fn syntax_errors_name_their_line() {
         let error = |bytes: &[u8]| parse(bytes).expect_err("rejected");
         assert_eq!(error(b"a\n\"open\nstill").line, 2);
+        // An unclosed quote is reported where it opens, not where its record starts.
+        assert_eq!(error(b"id,name\n1,\"a\nb\",\"open\nmore").line, 3);
+        // The first error wins: a syntax error before an encoding error, and the reverse.
+        assert_eq!(error(b"id\n\"a\"b\nc\xFF\n").line, 2);
+        assert_eq!(error(b"id\nc\xFF\n\"a\"b\n").line, 2);
+        assert_eq!(
+            error(b"id\n\"open \xFF").hint,
+            "the file is not valid UTF-8"
+        );
         assert_eq!(error(b"a\nb\"c\n").line, 2);
         assert_eq!(error(b"\"a\"b\n").line, 1);
         assert_eq!(error(b"a\rb\n").line, 1);

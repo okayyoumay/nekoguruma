@@ -82,6 +82,26 @@ fn error_event_name(code: i32) -> String {
         .unwrap_or_else(|_| format!("error event {code:#x}"))
 }
 
+/// A primitive refused on a link the worker took offline after a lost VCI is the lost VCI
+/// (ADR-294): the worker refuses it as `FailedPrecondition` and attaches the link's last error
+/// event, `PDU_ERR_EVT_LOST_COMM_TO_VCI`, to the status (ADR-105). The loss came between two
+/// primitives, so no pending primitive saw its event. Any other error is returned as it is.
+fn lost_vci_between_primitives(error: HostError) -> HostError {
+    match &error {
+        HostError::Rpc { status, .. }
+            if status.code() == tonic::Code::FailedPrecondition
+                && vci_service_interface::error_detail_from_status(status)
+                    .and_then(|detail| detail.error_event_data)
+                    .is_some_and(|data| {
+                        data.error_event == PduErrorEvent::PduErrEvtLostCommToVci as i32
+                    }) =>
+        {
+            HostError::VciLost
+        }
+        _ => error,
+    }
+}
+
 /// Calls a unary RPC with a deadline (ADR-235 item 6).
 pub(crate) async fn unary<T>(
     deadline: Duration,
@@ -339,7 +359,8 @@ impl WorkerHost {
             "StartComPrimitive",
             self.client.start_com_primitive(start),
         )
-        .await?
+        .await
+        .map_err(lost_vci_between_primitives)?
         .cop_handle
         // Without a handle, events of no primitive would match.
         .ok_or(HostError::Setup(
@@ -1077,5 +1098,56 @@ mod tests {
         ));
         // Nothing ends the primitive yet.
         assert!(outcome(vec![event(Some(COP), result(&[0x62]))]).is_none());
+    }
+
+    /// A primitive refused on an offline link whose last error is the lost VCI is `VciLost`
+    /// (ADR-294); the same refusal with another event, or none, and any other status stay as
+    /// they are.
+    #[test]
+    fn an_offline_link_after_a_lost_vci_is_vci_lost() {
+        use vci_service_interface::{ErrorDetail, ErrorEventData, PduError};
+        let refused = |code, event: Option<PduErrorEvent>| HostError::Rpc {
+            rpc: "StartComPrimitive",
+            status: Box::new(vci_service_interface::status_with_error_detail(
+                code,
+                "logical link must be connected before starting a primitive",
+                ErrorDetail {
+                    pdu_error: PduError::PduErrCllNotConnected as i32,
+                    error_event_data: event.map(|event| ErrorEventData {
+                        error_event: event as i32,
+                        cop_handle: None,
+                        timestamp: 1,
+                        extra_error_info: 0,
+                    }),
+                    detail_text: None,
+                },
+            )),
+        };
+        assert!(matches!(
+            lost_vci_between_primitives(refused(
+                tonic::Code::FailedPrecondition,
+                Some(PduErrorEvent::PduErrEvtLostCommToVci)
+            )),
+            HostError::VciLost
+        ));
+        for error in [
+            refused(tonic::Code::FailedPrecondition, None),
+            refused(
+                tonic::Code::FailedPrecondition,
+                Some(PduErrorEvent::PduErrEvtTxError),
+            ),
+            refused(
+                tonic::Code::Internal,
+                Some(PduErrorEvent::PduErrEvtLostCommToVci),
+            ),
+            HostError::Rpc {
+                rpc: "StartComPrimitive",
+                status: Box::new(tonic::Status::failed_precondition("no detail")),
+            },
+            HostError::NoResponse,
+        ] {
+            let kept = format!("{error:?}");
+            assert_eq!(format!("{:?}", lost_vci_between_primitives(error)), kept);
+        }
     }
 }

@@ -1,7 +1,7 @@
 # ADR-289: A Lost VCI Ends the Pending Primitive at Once, as `HostError::VciLost`
 
 **Date:** 2026-10-13
-**Status:** Accepted
+**Status:** Accepted (the consequence on a VCI lost between two primitives closed by ADR-294: the next request ends in `VciLost` too)
 **Affects:** `agent` (`src/host.rs`), `docs/system-architecture.md` 8.2.4; ADR-235 item 3, design 5.6 and 8.2.5
 
 ## Context

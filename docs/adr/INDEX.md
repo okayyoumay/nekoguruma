@@ -278,11 +278,12 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-286](ADR-286-restart-identity-abort-is-journaled.md) | The Restart's Identity Abort Is Journaled as a Terminal Record | Accepted (Decision item 5's open point decided by ADR-290: the on-site endings after the resume count stay re-resumable within the resume limit) | `agent` journal, restart, runner; design 5.6 / 8.2.5 |
 | [ADR-287](ADR-287-the-step-limit-applies-per-run.md) | The Job's Step Limit Applies to Each Run | Accepted (the open consequence on a plain start after a step-limited run decided by ADR-288: the stop is journaled as terminal) | `agent` runner |
 | [ADR-288](ADR-288-a-stopped-run-is-journaled-as-terminal.md) | A Run Stopped on the Step Limit or a VM Error Is Journaled as a Terminal Record | Accepted | `agent` journal, restart, runner; `diag-ir` `VmError`; design 5.6 |
-| [ADR-289](ADR-289-a-lost-vci-ends-the-primitive-at-once.md) | A Lost VCI Ends the Pending Primitive at Once, as `HostError::VciLost` | Accepted | `agent` host; design 5.6 / 8.2.5 |
+| [ADR-289](ADR-289-a-lost-vci-ends-the-primitive-at-once.md) | A Lost VCI Ends the Pending Primitive at Once, as `HostError::VciLost` | Accepted (the consequence on a VCI lost between two primitives closed by ADR-294: the next request ends in `VciLost` too) | `agent` host; design 5.6 / 8.2.5 |
 | [ADR-290](ADR-290-restart-on-site-endings-stay-re-resumable.md) | The Restart's On-Site Endings after the Resume Count Stay Re-Resumable | Accepted | `agent` restart; design 5.6 / 8.2.5 |
 | [ADR-291](ADR-291-recovery-required-sections-outside-the-plans-are-written-ahead.md) | A `RecoveryRequired` Section outside the Flash Recovery Plans Is Written Ahead | Accepted (the consequence on programs without a flash recovery plan superseded by ADR-293: such a program with a `RecoveryRequired` section keeps a journal) | `agent` journaling, restart; design 8.2.5 / 8.10.1 |
 | [ADR-293](ADR-293-a-recovery-required-section-keeps-a-journal-without-a-plan.md) | A `RecoveryRequired` Section Keeps a Journal without a Flash Recovery Plan | Accepted | `agent` runner, restart; design 8.2.5 / 8.10.1 |
-| [ADR-292](ADR-292-a-crashed-sim-vci-fails-every-call.md) | A Crashed Simulated VCI Fails Every Call with `ERR_FAILED` | Accepted | `sim-vci`, `j2534-0404-service` tests; design 13.4 |
+| [ADR-294](ADR-294-a-vci-lost-between-primitives-is-vci-lost.md) | A VCI Lost between Two Primitives Is Reported as `HostError::VciLost` | Accepted | `agent` host; design 8.2.4 |
+| [ADR-292](ADR-292-a-crashed-sim-vci-fails-every-call.md) | A Crashed Simulated VCI Fails Every Call with `ERR_FAILED` | Accepted (the consequence that a crash shows as `HostError::Rpc` superseded by ADR-294: the agent reports `HostError::VciLost`) | `sim-vci`, `j2534-0404-service` tests; design 13.4 |
 
 ## Status Legend
 
@@ -623,7 +624,7 @@ the predecessor repository these ADRs came from.
 - ADR-275
 - ADR-279 (Decision item 4's allowlist check replaced by the check against the Windows runner's system directory, ADR-283)
 - ADR-283
-- ADR-292
+- ADR-292 (the consequence that a crash shows as `HostError::Rpc` superseded by ADR-294: the agent reports `HostError::VciLost`)
 
 ### Timestamps / Clock
 - ADR-057 (amended by ADR-102)
@@ -664,10 +665,11 @@ the predecessor repository these ADRs came from.
 - ADR-286 (Decision item 5's open point decided by ADR-290: the on-site endings after the resume count stay re-resumable within the resume limit)
 - ADR-287 (the open consequence on a plain start after a step-limited run decided by ADR-288: the stop is journaled as terminal)
 - ADR-288
-- ADR-289
+- ADR-289 (the consequence on a VCI lost between two primitives closed by ADR-294: the next request ends in `VciLost` too)
 - ADR-290
 - ADR-291 (the consequence on programs without a flash recovery plan superseded by ADR-293: such a program with a `RecoveryRequired` section keeps a journal)
 - ADR-293
+- ADR-294
 
 ### Diagnostic IR
 - ADR-233 (item 3's `VmState` fields removed by ADR-245; `Op::Fail` and `StepOutcome::Failed` appended by ADR-280)

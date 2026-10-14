@@ -1,7 +1,7 @@
 # ADR-292: A Crashed Simulated VCI Fails Every Call with `ERR_FAILED`
 
 **Date:** 2026-10-14
-**Status:** Accepted
+**Status:** Accepted (the consequence that a crash shows as `HostError::Rpc` superseded by ADR-294: the agent reports `HostError::VciLost`)
 **Affects:** `crates/sim-vci` (`crash_vci`, `restart_vci`), `crates/j2534-0404-service/tests/agent_restart_end_to_end.rs`;
 ADR-238
 

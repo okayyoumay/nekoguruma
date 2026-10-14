@@ -31,14 +31,16 @@
 //! intervention, since the conditions that lead there (an identity or software version that is not
 //! the job's, a precondition that fails) do not hold.
 //!
-//! Two more scenarios interrupt the first run the same way, but leave the worker alive: while the
+//! Three more scenarios interrupt the first run the same way, but leave the worker alive: while the
 //! agent waits after block 4, the ECU loses power (`sim_ecu::Fault::PowerLoss`) or the VCI is
 //! unplugged (`disconnect_vci`, ADR-238), each handed to the worker through the control directory
 //! (`Env::fault_mid_run`). The next block's transfer gets no answer, or finds the link offline,
 //! since the worker's receive poll met the lost device, and the run ends there with its guards and journal kept, as after a worker crash. Power comes
 //! back (`reconnect_ecu`) at the next run's first J2534 call, and that run's new worker finds the
 //! VCI plugged in again, since an unplugged VCI is the state of the worker process that saw it.
-//! Both complete the job in the same restart order. A third scenario leaves the VCI unplugged for
+//! A third makes `sim-vci` refuse the next block's write (`fail_writes`), which the worker
+//! reports as a transmit error on the primitive.
+//! All three complete the job in the same restart order. A fourth scenario leaves the VCI unplugged for
 //! the next run as well: its worker cannot open the device, so the run ends before its link
 //! opens, sending nothing, counting no resume and keeping its guards, and the run after it, with
 //! the VCI back, completes the job.
@@ -95,6 +97,7 @@ use diag_ir::{
 };
 use restart::{EcuProbe, Env, JobSpec};
 use serial_test::serial;
+use vci_service_interface::PduErrorEvent;
 
 /// The libtest name of [`restart_child_entry`], which the harness runs in its child processes.
 const ENTRY: &str = "restart_child_entry";
@@ -835,6 +838,63 @@ fn a_vci_disconnect_mid_transfer_is_restarted_once_the_vci_is_back() {
     });
     // The probe loads the library in a process of its own, with the VCI present: the
     // disconnect belonged to the stopped worker's process.
+    let before = env.probe();
+    assert_eq!(
+        before,
+        EcuProbe {
+            session: 2,
+            flash_phase: 2,
+            flash_block: KILL_AFTER_BLOCK + 1,
+            received: KILL_AFTER_BLOCK * BLOCK_LEN as u32,
+            power_cycles: before.power_cycles,
+        },
+        "the ECU should still be in its programming session, transferring"
+    );
+    let result = env.restart_on(&spec, run.guards);
+    assert!(
+        !env.guards_are_held(),
+        "the ended job should release its guards"
+    );
+    assert_completed(
+        &env,
+        &spec,
+        first_attempt,
+        before.power_cycles,
+        &[1, 2],
+        Teardown::RESET,
+        result,
+    );
+}
+
+/// The VCI fails to send while the agent waits after block 4 (design 5.6, 13.4; ADR-229 item 1):
+/// `sim-vci` refuses the next block's write, so that transfer fails and the run ends there,
+/// keeping its guards and its journal. The VCI stays plugged in and the link closes. The ECU,
+/// which never saw the block, stays in its programming session with the transfer running. The
+/// agent's next run, on a new worker whose writes succeed, takes the same restart order as after
+/// an agent kill and completes, with the restart's ECUReset the only power cycle.
+#[test]
+#[serial]
+fn a_write_failure_mid_transfer_is_restarted() {
+    let spec = spec();
+    let env = Env::new("write-failure", ENTRY, &ecu_config(60_000));
+    let run = env.fault_mid_run(
+        &spec,
+        KILL_AFTER_BLOCK,
+        WAIT_FOR_BLOCK,
+        r#"{"command": "fail_writes", "times": 1}"#,
+    );
+    assert!(
+        env.commands_applied(),
+        "the write failure should be applied"
+    );
+    assert!(
+        !run.link_unconfirmed,
+        "the VCI is still there, so the link closes"
+    );
+    let first_attempt = assert_interrupted_at_the_next_block(&env, &spec, &run, |cause| {
+        // The worker reports the refused write as a transmit error on the primitive.
+        matches!(cause, HostError::PrimitiveFailed(code) if *code == PduErrorEvent::PduErrEvtTxError as i32)
+    });
     let before = env.probe();
     assert_eq!(
         before,

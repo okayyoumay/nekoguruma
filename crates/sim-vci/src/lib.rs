@@ -335,6 +335,32 @@ struct Bus {
     battery_mv: u32,
     /// File the ECU's state is kept in across processes ([`ECU_STATE_ENV`]).
     state_path: Option<PathBuf>,
+    /// `PassThruWriteMsgs` calls to fail (`Command::FailWrites`).
+    write_failures: WriteFailures,
+}
+
+/// Which `PassThruWriteMsgs` calls fail with `ERR_FAILED`, sending nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteFailures {
+    None,
+    /// The next this many calls.
+    Next(u32),
+    /// Every call until `Command::ClearWriteFailures`.
+    UntilCleared,
+}
+
+impl WriteFailures {
+    /// Whether this call fails, counting it.
+    fn take(&mut self) -> bool {
+        match *self {
+            Self::None => false,
+            Self::Next(n) => {
+                *self = if n > 1 { Self::Next(n - 1) } else { Self::None };
+                true
+            }
+            Self::UntilCleared => true,
+        }
+    }
 }
 
 static BUS: OnceLock<(Mutex<Bus>, Condvar)> = OnceLock::new();
@@ -358,6 +384,7 @@ fn bus() -> &'static (Mutex<Bus>, Condvar) {
                     .map(PathBuf::from),
                 battery_mv: DEFAULT_BATTERY_MV,
                 state_path: std::env::var_os(ECU_STATE_ENV).map(PathBuf::from),
+                write_failures: WriteFailures::None,
             }),
             Condvar::new(),
         )
@@ -518,6 +545,16 @@ impl Bus {
             }
             Command::SetBatteryVoltage { millivolts } => {
                 self.battery_mv = millivolts;
+                Ok(())
+            }
+            Command::FailWrites { times: Some(0) } => Err(ERR_FAILED),
+            Command::FailWrites { times } => {
+                self.write_failures =
+                    times.map_or(WriteFailures::UntilCleared, WriteFailures::Next);
+                Ok(())
+            }
+            Command::ClearWriteFailures {} => {
+                self.write_failures = WriteFailures::None;
                 Ok(())
             }
         }
@@ -733,6 +770,7 @@ fn reset(config: EcuConfig) {
     bus.control_dir = None;
     bus.trace_path = None;
     bus.battery_mv = DEFAULT_BATTERY_MV;
+    bus.write_failures = WriteFailures::None;
 }
 
 // ---------------------------------------------------------------- Control
@@ -755,7 +793,8 @@ const CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 /// A control command, as JSON: `{"command": "inject_fault", "fault": "power_loss"}`,
 /// `{"command": "reconnect_ecu"}`, `{"command": "disconnect_vci"}`, `{"command": "connect_vci"}`,
-/// `{"command": "set_battery_voltage", "millivolts": 11500}`.
+/// `{"command": "set_battery_voltage", "millivolts": 11500}`, `{"command": "fail_writes",
+/// "times": 1}`, `{"command": "clear_write_failures"}`.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 enum Command {
@@ -779,6 +818,14 @@ enum Command {
     ConnectVci {},
     /// Sets the battery voltage `READ_VBATT` reports, in millivolts.
     SetBatteryVoltage { millivolts: u32 },
+    /// Makes `PassThruWriteMsgs` fail with `ERR_FAILED`, sending nothing: the next `times` calls
+    /// (at least one), or, without `times`, every call until `ClearWriteFailures`.
+    FailWrites {
+        #[serde(default)]
+        times: Option<u32>,
+    },
+    /// Ends `FailWrites`.
+    ClearWriteFailures {},
 }
 
 /// Applies one control command, given as the JSON a control file holds. For a test that loads
@@ -1045,7 +1092,8 @@ pub unsafe extern "system" fn PassThruReadMsgs(
 
 /// Sends each message to the simulated ECU. The ECU handles the request at once; its response
 /// becomes readable after the delay it reports. No TxDone indications or loopback messages
-/// are generated.
+/// are generated. A call that `Command::FailWrites` fails returns `ERR_FAILED` with no message
+/// sent.
 ///
 /// # Safety
 /// `num_msgs` must be null or valid for reads and writes, and `msgs` null or valid for reads of
@@ -1077,6 +1125,10 @@ pub unsafe extern "system" fn PassThruWriteMsgs(
     let Some(protocol_id) = bus.channels.get(&channel_id).map(|c| c.protocol_id) else {
         return fail(ERR_INVALID_CHANNEL_ID);
     };
+    // A write failure the test armed: the device takes none of the messages.
+    if bus.write_failures.take() {
+        return fail(ERR_FAILED);
+    }
     let mut sent = 0;
     let status = loop {
         if sent == wanted {

@@ -1037,6 +1037,9 @@ fn the_control_export_rejects_what_it_cannot_parse() {
         r#"{"command": "reconnect_ecu", "extra": 1}"#,
         r#"{"command": "inject_fault", "fault": "drop_response", "service": 256}"#,
         r#"{"command": "inject_fault", "fault": "drop_response", "service": -1}"#,
+        r#"{"command": "fail_writes", "times": 0}"#,
+        r#"{"command": "fail_writes", "times": -1}"#,
+        r#"{"command": "clear_write_failures", "times": 1}"#,
     ] {
         assert_eq!(control(command), ERR_FAILED, "{command}");
     }
@@ -1657,4 +1660,39 @@ fn the_trace_lists_each_request_and_voltage_read() {
             "vbatt",
         ]
     );
+}
+
+/// A failed write sends nothing and reports `ERR_FAILED` with no message taken; `times` fails
+/// that many calls, and no `times` fails every call until cleared. The ECU sees none of them.
+#[test]
+fn armed_write_failures_send_nothing() {
+    let f = fixture();
+    let m = msg(ECU_PHYSICAL_REQUEST_ID, &[0x3E, 0x00]);
+    let failed = || {
+        let mut n = 1;
+        let status = unsafe { PassThruWriteMsgs(f.channel, &m, &mut n, 100) };
+        assert_eq!(n, 0, "no message taken");
+        status == ERR_FAILED
+    };
+    assert_eq!(
+        control(r#"{"command": "fail_writes", "times": 2}"#),
+        STATUS_NOERROR
+    );
+    assert!(failed());
+    assert!(failed());
+    // The third call goes through and is answered.
+    write(f.channel, ECU_PHYSICAL_REQUEST_ID, &[0x3E, 0x00]);
+    assert_eq!(read(f.channel, 1, 1000).1, vec![response(&[0x7E, 0x00])]);
+
+    assert_eq!(control(r#"{"command": "fail_writes"}"#), STATUS_NOERROR);
+    for _ in 0..3 {
+        assert!(failed());
+    }
+    assert_eq!(read(f.channel, 1, 50).1, Vec::<Vec<u8>>::new());
+    assert_eq!(
+        control(r#"{"command": "clear_write_failures"}"#),
+        STATUS_NOERROR
+    );
+    write(f.channel, ECU_PHYSICAL_REQUEST_ID, &[0x3E, 0x00]);
+    assert_eq!(read(f.channel, 1, 1000).1, vec![response(&[0x7E, 0x00])]);
 }

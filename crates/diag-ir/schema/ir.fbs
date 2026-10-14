@@ -55,10 +55,12 @@ table CompuLinear {
   offset: double;
 }
 
+// The first scale whose range holds the internal value applies; none is an error.
 table CompuScaleLinear {
   scales: [LinearScale];
 }
 
+// lower..upper includes both limits, as ODX's default CLOSED interval does (ADR-297).
 struct LinearScale {
   lower: double;
   upper: double;

@@ -65,3 +65,10 @@ buffer whose offsets share data cannot unpack into a huge tree), accepts only
 through: enum values and union tags the schema does not define, a document without its variant,
 source format or source digest, and layouts whose ids do not strictly increase. When the schema changes, bump
 `IR_SCHEMA_VERSION` and have the agent report its supported version via `capabilities` (9.5).
+
+## Decoding
+
+`decode::decode_positive_response` decodes a response through its `PositiveResponse`: it checks
+the SID and the prefix, extracts each flat field as ISO 22901-1 (2008) 7.3.6.3 describes, and
+applies its conversion (ADR-297). A field with a shape or a `CompuBytecode` conversion is
+rejected as unsupported for now.

@@ -223,10 +223,10 @@ row per array entry, in row order, which is the IR array order. That order matte
 A cell that the conversion's kind does not use must be empty, and a kind without arrays takes no
 `conversion_scales.csv` rows. `scale-linear` and `interpolation` need at least one row (two for
 `interpolation`). `text-table` limits are signed 64-bit integers, compared with the internal
-value; a `text-table` on a `float` field is rejected (`ir.fbs`, `TextEntry`). The ranges of a
-`scale-linear` conversion must not overlap, so every internal value has at most one result;
-overlapping rows are rejected (`CSV_BAD_VALUE`). (A `text-table` may overlap, since its first
-matching row wins.)
+value; a `text-table` on a `float` field is rejected (`ir.fbs`, `TextEntry`). A range of either
+kind includes both its limits (ADR-297). The ranges of a `scale-linear` conversion must not
+overlap, so every internal value has at most one result; overlapping rows are rejected
+(`CSV_BAD_VALUE`). (A `text-table` may overlap, since its first matching row wins.)
 
 A `rational` conversion gives physical = (n0 + n1·x + n2·x² + …) / (d0 + d1·x + d2·x² + …) for
 the internal value x, with the coefficients in the order of the two lists. A denominator that

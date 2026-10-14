@@ -188,7 +188,8 @@ fn save_ecu_state(path: &Path, ecu: &mut SimEcu) -> std::io::Result<()> {
 }
 
 /// The device ID the first `PassThruOpen` returns. The simulator has one device; it gets a new
-/// ID only when it is opened again after it was lost (`ERR_DEVICE_NOT_CONNECTED`).
+/// ID only when it is opened again after it was lost (`ERR_DEVICE_NOT_CONNECTED`) or closed while
+/// the VCI was crashed (`ERR_FAILED`, ADR-292).
 pub const DEVICE_ID: PassThruUlong = 1;
 
 /// 11-bit CAN IDs of the simulated ECU (ISO 15765-4 legacy OBD identifiers of the first ECU).

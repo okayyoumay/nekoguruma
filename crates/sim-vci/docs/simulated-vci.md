@@ -182,7 +182,7 @@ A control command is a JSON object tagged by `command`:
 | `{"command": "set_battery_voltage", "millivolts": N}` | sets the battery voltage `READ_VBATT` reports (default 12000) |
 | `{"command": "fail_writes", "times": N}` | the next `N` calls of `PassThruWriteMsgs` (at least 1) fail with `ERR_FAILED`, sending nothing; without `"times"`, every call fails until `clear_write_failures` |
 | `{"command": "clear_write_failures"}` | ends `fail_writes` |
-| `{"command": "crash_vci"}` | crashes the VCI: it stays plugged in, but every J2534 call fails (ADR-292) |
+| `{"command": "crash_vci"}` | crashes the VCI: it stays plugged in, but every J2534 call except `PassThruGetLastError` fails with `ERR_FAILED` (ADR-292) |
 | `{"command": "restart_vci"}` | restarts a crashed VCI |
 
 Unknown commands and unknown fields, in the command or in the fault, are rejected. A command that needs the ECU creates it first,

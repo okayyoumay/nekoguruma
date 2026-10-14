@@ -72,7 +72,7 @@ in 4.5 is rejected.
 | Type | Syntax | Example |
 |---|---|---|
 | integer | Decimal (`-` allowed where the column is signed), or hexadecimal with a `0x` prefix. Each column states its range | `500000`, `0x7E0` |
-| float | Decimal, with an optional fraction and exponent; integers are accepted | `0.1`, `1e-3` |
+| float | Decimal, with an optional fraction and exponent; integers are accepted. The value must be finite in IEEE 754 double precision: one that overflows to infinity, and `inf` or `nan`, is rejected (`CSV_BAD_VALUE`) | `0.1`, `1e-3` |
 | bytes | Hexadecimal digit pairs, upper or lower case, with optional single spaces between pairs; no `0x` prefix | `F190`, `31 2E` |
 | boolean | `yes` or `no` | `yes` |
 | name | `[A-Za-z_][A-Za-z0-9_]*` | `softwareVersion` |
@@ -93,8 +93,8 @@ duplicate name is rejected (`CSV_DUPLICATE`).
 are assigned by the converter from 1, over the whole definition, so the same row has the same id
 in every variant's document:
 
-- fields in `fields.csv` row order, then the marker fields of `repeats.csv` (5.4) in its row
-  order;
+- fields in `fields.csv` row order, counting only rows that become IR fields (a constant, 5.3,
+  takes no id), then the marker fields of `repeats.csv` (5.4) in its row order;
 - layouts in `layouts.csv` row order;
 - services in `services.csv` row order, then the DID services in `dids.csv` row order (read before
   write), then the routine services in `routines.csv` row order (start, stop, results). Only
@@ -216,7 +216,21 @@ row per array entry, in row order, which is the IR array order. That order matte
 A cell that the conversion's kind does not use must be empty, and a kind without arrays takes no
 `conversion_scales.csv` rows. `scale-linear` and `interpolation` need at least one row (two for
 `interpolation`). `text-table` limits are signed 64-bit integers, compared with the internal
-value; a `text-table` on a `float` field is rejected (`ir.fbs`, `TextEntry`).
+value; a `text-table` on a `float` field is rejected (`ir.fbs`, `TextEntry`). The ranges of a
+`scale-linear` conversion must not overlap, so every internal value has at most one result;
+overlapping rows are rejected (`CSV_BAD_VALUE`). (A `text-table` may overlap, since its first
+matching row wins.)
+
+A conversion applies to a numeric value, so the field types it may be used with are:
+
+| Kind | Field types |
+|---|---|
+| `identity` | all |
+| `linear`, `scale-linear`, `interpolation`, `rational` | `uint`, `int`, `float`, `bcd` |
+| `text-table` | `uint`, `int`, `bcd` |
+
+Any other combination, such as a `linear` conversion on an `ascii` field, is rejected
+(`CSV_BAD_VALUE`).
 
 ### 4.6 `services.csv` (scoped)
 
@@ -413,8 +427,10 @@ sub-function, a record identifier echoed in the response. Constants are accepted
 to go to and is rejected (`CSV_UNSUPPORTED`). Constants must be the first fields of
 their container, start at byte 0, follow each other without gaps, be `fixed`, byte-aligned
 (`bit` 0, `bits` a multiple of 8) and of type `uint` (`const` an integer that fits `bits`) or
-`bytes` (`const` exactly `bits` / 8 bytes), and have no conversion, unit or shape. A constant
-anywhere else is rejected (`CSV_UNSUPPORTED`).
+`bytes` (`const` exactly `bits` / 8 bytes), have no conversion, unit or shape, and keep the
+default `byte_order` `big`, since constants are written big-endian; a constant with `byte_order`
+`little` is rejected (`CSV_BAD_VALUE`). A constant anywhere else is rejected
+(`CSV_UNSUPPORTED`).
 
 The converter writes the constants, big-endian, into `Request.prefix` or
 `PositiveResponse.prefix`, after the generated constants of a DID or routine, and does not emit

@@ -1696,3 +1696,101 @@ fn armed_write_failures_send_nothing() {
     write(f.channel, ECU_PHYSICAL_REQUEST_ID, &[0x3E, 0x00]);
     assert_eq!(read(f.channel, 1, 1000).1, vec![response(&[0x7E, 0x00])]);
 }
+
+/// A crashed VCI fails every call but `PassThruGetLastError` with `ERR_FAILED`, a close included,
+/// which still releases the device. The open fails until the VCI restarts; the next one gets a
+/// new device ID, and the ECU kept its state (ADR-292).
+#[test]
+fn a_crashed_vci_fails_every_call_until_it_restarts() {
+    let f = fixture();
+    write(f.channel, ECU_PHYSICAL_REQUEST_ID, &[0x10, 0x03]);
+    let (status, answers) = read(f.channel, 1, 1000);
+    assert_eq!(status, STATUS_NOERROR);
+    assert!(
+        answers[0].starts_with(&response(&[0x50, 0x03])),
+        "{answers:?}"
+    );
+    assert_eq!(control(r#"{"command": "crash_vci"}"#), STATUS_NOERROR);
+    let m = msg(ECU_PHYSICAL_REQUEST_ID, &[0x3E, 0x00]);
+    let mut n = 1;
+    assert_eq!(
+        unsafe { PassThruWriteMsgs(f.channel, &m, &mut n, 100) },
+        ERR_FAILED
+    );
+    assert_eq!(n, 0);
+    assert_eq!(read(f.channel, 1, 0), (ERR_FAILED, vec![]));
+    assert_eq!(
+        unsafe { PassThruIoctl(f.channel, 0, ptr::null_mut(), ptr::null_mut()) },
+        ERR_FAILED
+    );
+    let mut description = [0 as c_char; 80];
+    assert_eq!(
+        unsafe { PassThruGetLastError(description.as_mut_ptr()) },
+        STATUS_NOERROR
+    );
+    assert_eq!(PassThruClose(DEVICE_ID), ERR_FAILED);
+    let mut device = 0;
+    assert_eq!(
+        unsafe { PassThruOpen(ptr::null(), &mut device) },
+        ERR_FAILED
+    );
+    assert_eq!(control(r#"{"command": "restart_vci"}"#), STATUS_NOERROR);
+    assert_eq!(
+        unsafe { PassThruOpen(ptr::null(), &mut device) },
+        STATUS_NOERROR
+    );
+    assert_eq!(device, DEVICE_ID + 1);
+    let mut channel = 0;
+    assert_eq!(
+        unsafe { PassThruConnect(device, ISO15765, 0, 500_000, &mut channel) },
+        STATUS_NOERROR
+    );
+    assert_eq!(
+        start_filter(channel, ECU_RESPONSE_ID, ECU_PHYSICAL_REQUEST_ID).0,
+        STATUS_NOERROR
+    );
+    // The ECU is still in the extended session the request before the crash put it in.
+    write(channel, ECU_PHYSICAL_REQUEST_ID, &[0x22, 0xF1, 0x86]);
+    assert_eq!(
+        read(channel, 1, 1000).1,
+        vec![response(&[0x62, 0xF1, 0x86, 0x03])]
+    );
+    assert_eq!(PassThruClose(device), STATUS_NOERROR);
+}
+
+/// A VCI that restarts while the application still holds the device open has forgotten it: the
+/// device is lost, as after a disconnect, until it is closed (J2534-1 6.10.1).
+#[test]
+fn a_device_left_open_across_a_crash_is_lost_until_closed() {
+    let f = fixture();
+    assert_eq!(control(r#"{"command": "crash_vci"}"#), STATUS_NOERROR);
+    assert_eq!(control(r#"{"command": "restart_vci"}"#), STATUS_NOERROR);
+    assert_eq!(read(f.channel, 1, 0), (ERR_DEVICE_NOT_CONNECTED, vec![]));
+    assert_eq!(PassThruClose(DEVICE_ID), ERR_DEVICE_NOT_CONNECTED);
+    let mut device = 0;
+    assert_eq!(
+        unsafe { PassThruOpen(ptr::null(), &mut device) },
+        STATUS_NOERROR
+    );
+    assert_eq!(device, DEVICE_ID + 1);
+    // A restart of a VCI that did not crash changes nothing.
+    assert_eq!(control(r#"{"command": "restart_vci"}"#), STATUS_NOERROR);
+    assert_eq!(PassThruClose(device), STATUS_NOERROR);
+}
+
+/// A crash ends a read that waits for a response.
+#[test]
+fn a_crash_ends_a_waiting_read() {
+    let f = fixture();
+    let start = Instant::now();
+    let crash = std::thread::spawn(|| {
+        std::thread::sleep(Duration::from_millis(50));
+        control(r#"{"command": "crash_vci"}"#)
+    });
+    let result = read(f.channel, 1, 5000);
+    let elapsed = start.elapsed();
+    // Joined before asserting, so a failure cannot crash the VCI under the next test.
+    assert_eq!(crash.join().expect("no panic"), STATUS_NOERROR);
+    assert_eq!(result, (ERR_FAILED, vec![]));
+    assert!(elapsed < Duration::from_millis(4000));
+}

@@ -227,7 +227,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-235](ADR-235-agent-job-runner-and-worker-diag-host.md) | Agent Job Runner and the Worker-Backed DiagHost | Accepted (item 8 relaxed for debug builds against `sim-vci` by ADR-247; item 3's lost VCI told apart by ADR-289) | `agent` runner, host, link |
 | [ADR-236](ADR-236-time-series-scale-and-raw-response-storage.md) | Time-Series Scale and Raw-Response Storage | Accepted | design 4.3 / 4.6 / 10.3 / 17, `dataset_chunks.chunk_format` |
 | [ADR-237](ADR-237-regulatory-scope-access-routes-without-tool-certification.md) | Regulatory Scope: Use the Access Routes Regulations Open, Without Tool Certification | Accepted | design 8.1 / 9.2 / 16.1 / 16.2 / 17, `db/` retention |
-| [ADR-238](ADR-238-sim-vci-control-commands-and-device-loss.md) | sim-vci Control Commands and Device Loss | Accepted | `sim-vci` control export and directory, `ERR_DEVICE_NOT_CONNECTED` |
+| [ADR-238](ADR-238-sim-vci-control-commands-and-device-loss.md) | sim-vci Control Commands and Device Loss | Accepted (the VCI crash consequence settled by ADR-292: a crashed VCI fails every call with `ERR_FAILED`) | `sim-vci` control export and directory, `ERR_DEVICE_NOT_CONNECTED` |
 | [ADR-239](ADR-239-sim-ecu-session-timer-and-injectable-clock.md) | sim-ecu Session Timer and Injectable Clock | Accepted | `sim-ecu` clock, tS3_Server, security delay |
 | [ADR-240](ADR-240-agent-worker-build-selection.md) | Agent Worker-Build Selection by Per-Build Library Resolution | Accepted (the `config.toml` lookup, with its architecture key, superseded by ADR-281; the per-build registry view stays; Decision item 4 superseded by ADR-284) | `agent` launch, `ngr-agent run` |
 | [ADR-241](ADR-241-sim-ecu-state-file.md) | Simulated ECU State Kept in a File Across Worker Processes | Accepted | `sim-ecu` snapshot, `sim-vci` `NGR_SIM_ECU_STATE` |
@@ -281,6 +281,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-289](ADR-289-a-lost-vci-ends-the-primitive-at-once.md) | A Lost VCI Ends the Pending Primitive at Once, as `HostError::VciLost` | Accepted | `agent` host; design 5.6 / 8.2.5 |
 | [ADR-290](ADR-290-restart-on-site-endings-stay-re-resumable.md) | The Restart's On-Site Endings after the Resume Count Stay Re-Resumable | Accepted | `agent` restart; design 5.6 / 8.2.5 |
 | [ADR-291](ADR-291-recovery-required-sections-outside-the-plans-are-written-ahead.md) | A `RecoveryRequired` Section outside the Flash Recovery Plans Is Written Ahead | Accepted | `agent` journaling, restart; design 8.2.5 / 8.10.1 |
+| [ADR-292](ADR-292-a-crashed-sim-vci-fails-every-call.md) | A Crashed Simulated VCI Fails Every Call with `ERR_FAILED` | Accepted | `sim-vci`, `j2534-0404-service` tests; design 13.4 |
 
 ## Status Legend
 
@@ -610,7 +611,7 @@ the predecessor repository these ADRs came from.
 - ADR-195 (the test config files lose `library_path`, ADR-281; the per-process-unique path rule stands)
 - ADR-227
 - ADR-230 (Decision items 1-2's claim set extended to `codeql-alerts` PRs by ADR-243; Decision item 5 superseded by ADR-249; Decision items 3 and 6 amended by ADR-279 for Dependabot replacements)
-- ADR-238
+- ADR-238 (the VCI crash consequence settled by ADR-292: a crashed VCI fails every call with `ERR_FAILED`)
 - ADR-241
 - ADR-243 (Decision item 3's skipping of high and critical alerts and item 4's number-only hand-off of them superseded by ADR-246; item 4's trigger follows the CodeQL workflow instead of default setup, ADR-283)
 - ADR-246
@@ -621,6 +622,7 @@ the predecessor repository these ADRs came from.
 - ADR-275
 - ADR-279 (Decision item 4's allowlist check replaced by the check against the Windows runner's system directory, ADR-283)
 - ADR-283
+- ADR-292
 
 ### Timestamps / Clock
 - ADR-057 (amended by ADR-102)

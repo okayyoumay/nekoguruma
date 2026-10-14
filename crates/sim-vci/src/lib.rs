@@ -322,6 +322,8 @@ struct Bus {
     /// `ERR_DEVICE_NOT_CONNECTED`, even once the VCI is back, until `PassThruClose` releases
     /// the device (J2534-1 6.10.1).
     device_lost: bool,
+    /// The VCI has crashed: plugged in, but it answers nothing (`Command::CrashVci`, ADR-292).
+    vci_crashed: bool,
     channels: HashMap<PassThruUlong, Channel>,
     next_channel: PassThruUlong,
     epoch: Instant,
@@ -374,6 +376,7 @@ fn bus() -> &'static (Mutex<Bus>, Condvar) {
                 device_id: DEVICE_ID,
                 vci_present: true,
                 device_lost: false,
+                vci_crashed: false,
                 channels: HashMap::new(),
                 next_channel: 1,
                 epoch: Instant::now(),
@@ -405,11 +408,11 @@ fn lock_bus() -> MutexGuard<'static, Bus> {
 }
 
 /// [`lock`] for a J2534 call: fails with `ERR_DEVICE_NOT_CONNECTED` while the device is lost
-/// (J2534-1 6.10.1).
+/// (J2534-1 6.10.1), and with `ERR_FAILED` while the VCI is crashed (ADR-292).
 fn lock_connected() -> Result<MutexGuard<'static, Bus>, PassThruUlong> {
     let bus = lock();
-    if bus.unreachable() {
-        return Err(ERR_DEVICE_NOT_CONNECTED);
+    if let Some(status) = bus.unreachable() {
+        return Err(status);
     }
     Ok(bus)
 }
@@ -467,8 +470,17 @@ impl Bus {
     /// Whether the open device is lost: every call but `PassThruGetLastError` then fails with
     /// `ERR_DEVICE_NOT_CONNECTED`, and `PassThruClose` on the lost device also releases it. With
     /// no device open, an unplugged VCI fails only `PassThruOpen`, which checks it itself.
-    fn unreachable(&self) -> bool {
-        self.device_lost
+    /// The status every J2534 call except `PassThruGetLastError` returns before it checks its
+    /// arguments, if any: `ERR_FAILED` while the VCI is crashed (`Command::CrashVci`, ADR-292),
+    /// `ERR_DEVICE_NOT_CONNECTED` while the device is lost (J2534-1 6.10.1).
+    fn unreachable(&self) -> Option<PassThruUlong> {
+        if self.vci_crashed {
+            Some(ERR_FAILED)
+        } else if self.device_lost {
+            Some(ERR_DEVICE_NOT_CONNECTED)
+        } else {
+            None
+        }
     }
 
     /// Closes the device: its channels go with their filters and unread responses, and every
@@ -541,6 +553,19 @@ impl Bus {
             }
             Command::ConnectVci {} => {
                 self.vci_present = true;
+                Ok(())
+            }
+            Command::CrashVci {} => {
+                self.vci_crashed = true;
+                // Reads waiting for a response return at once.
+                notify();
+                Ok(())
+            }
+            Command::RestartVci {} => {
+                // The restarted VCI has forgotten a device the application still holds open.
+                if std::mem::take(&mut self.vci_crashed) {
+                    self.device_lost |= self.device_open;
+                }
                 Ok(())
             }
             Command::SetBatteryVoltage { millivolts } => {
@@ -764,6 +789,7 @@ fn reset(config: EcuConfig) {
     bus.device_id = DEVICE_ID;
     bus.vci_present = true;
     bus.device_lost = false;
+    bus.vci_crashed = false;
     bus.channels.clear();
     bus.next_channel = 1;
     bus.programming_pin = None;
@@ -794,7 +820,8 @@ const CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// A control command, as JSON: `{"command": "inject_fault", "fault": "power_loss"}`,
 /// `{"command": "reconnect_ecu"}`, `{"command": "disconnect_vci"}`, `{"command": "connect_vci"}`,
 /// `{"command": "set_battery_voltage", "millivolts": 11500}`, `{"command": "fail_writes",
-/// "times": 1}`, `{"command": "clear_write_failures"}`.
+/// "times": 1}`, `{"command": "clear_write_failures"}`, `{"command": "crash_vci"}`,
+/// `{"command": "restart_vci"}`.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 enum Command {
@@ -818,6 +845,12 @@ enum Command {
     ConnectVci {},
     /// Sets the battery voltage `READ_VBATT` reports, in millivolts.
     SetBatteryVoltage { millivolts: u32 },
+    /// Crashes the VCI: it stays plugged in, but every J2534 call except `PassThruGetLastError`
+    /// returns `ERR_FAILED` until `RestartVci` (ADR-292).
+    CrashVci {},
+    /// Restarts a crashed VCI. A device that was open when it crashed is lost, as after a
+    /// disconnect, until it is closed (J2534-1 6.10.1).
+    RestartVci {},
     /// Makes `PassThruWriteMsgs` fail with `ERR_FAILED`, sending nothing: the next `times` calls
     /// (at least one), or, without `times`, every call until `ClearWriteFailures`.
     FailWrites {
@@ -938,6 +971,14 @@ pub unsafe extern "system" fn PassThruOpen(
 #[unsafe(no_mangle)]
 pub extern "system" fn PassThruClose(device_id: PassThruUlong) -> PassThruUlong {
     let mut bus = lock();
+    if bus.vci_crashed && bus.device_open && bus.device_ok(device_id) {
+        // The VCI does not answer, but the application gives the device up: it is released as
+        // after a loss, and the call reports the failure (ADR-292).
+        bus.close_device();
+        bus.device_lost = false;
+        bus.device_id = bus.device_id.wrapping_add(1).max(1);
+        return ERR_FAILED;
+    }
     if bus.device_lost && bus.device_ok(device_id) {
         // Closing is how the application recovers from a lost device; the call still reports
         // the loss, and the next open gets a new device ID (J2534-1 6.10.1).
@@ -946,8 +987,8 @@ pub extern "system" fn PassThruClose(device_id: PassThruUlong) -> PassThruUlong 
         bus.device_id = bus.device_id.wrapping_add(1).max(1);
         return ERR_DEVICE_NOT_CONNECTED;
     }
-    if bus.unreachable() {
-        return ERR_DEVICE_NOT_CONNECTED;
+    if let Some(status) = bus.unreachable() {
+        return status;
     }
     if !bus.device_ok(device_id) {
         return ERR_INVALID_DEVICE_ID;
@@ -1018,12 +1059,12 @@ pub unsafe extern "system" fn PassThruReadMsgs(
     timeout: PassThruUlong,
 ) -> PassThruUlong {
     let mut bus = lock();
-    if bus.unreachable() {
+    if let Some(status) = bus.unreachable() {
         if !num_msgs.is_null() {
             // SAFETY: checked for null; the caller guarantees it is valid.
             unsafe { num_msgs.write(0) };
         }
-        return ERR_DEVICE_NOT_CONNECTED;
+        return status;
     }
     if msgs.is_null() || num_msgs.is_null() {
         return ERR_NULL_PARAMETER;
@@ -1038,8 +1079,8 @@ pub unsafe extern "system" fn PassThruReadMsgs(
         .unwrap_or(now + Duration::from_secs(365 * 24 * 3600));
     let mut read = 0;
     let status = loop {
-        if bus.unreachable() {
-            break ERR_DEVICE_NOT_CONNECTED;
+        if let Some(status) = bus.unreachable() {
+            break status;
         }
         let epoch = bus.epoch;
         let Some(channel) = bus.channels.get_mut(&channel_id) else {
@@ -1114,8 +1155,8 @@ pub unsafe extern "system" fn PassThruWriteMsgs(
         }
         status
     };
-    if bus.unreachable() {
-        return fail(ERR_DEVICE_NOT_CONNECTED);
+    if let Some(status) = bus.unreachable() {
+        return fail(status);
     }
     if msgs.is_null() || num_msgs.is_null() {
         return ERR_NULL_PARAMETER;

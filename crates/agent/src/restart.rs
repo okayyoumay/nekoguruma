@@ -372,6 +372,19 @@ pub fn classify(
     {
         return RestartDecision::OnSiteInterventionRequired(reason);
     }
+    // A pass through a `RecoveryRequired` section outside the plans that no transfer-start
+    // marker followed would run again: a plain start runs the program from its start, and a
+    // restart of an older transfer goes on past its plan (ADR-291).
+    if let Some(intent) = facts.last_intent
+        && in_section_outside_plans(program, intent.pc)
+        && facts
+            .transfer
+            .as_ref()
+            .is_none_or(|transfer| transfer.started_at.steps < intent.steps)
+        && let Some(reason) = recovery_required(program, intent)
+    {
+        return RestartDecision::OnSiteInterventionRequired(reason);
+    }
     let Some(transfer) = &facts.transfer else {
         return RestartDecision::PlainStart;
     };
@@ -1291,7 +1304,9 @@ fn effective_point(program: &Program, facts: &RecoveryFacts, at: StepRef) -> Ste
 /// Why an interruption at `at` rules out a restart, if it does: at or past a plan's
 /// recovery-required point and before its end, or inside a section marked `RecoveryRequired`.
 /// Sections are found only where the journal can place a point: inside a plan, on the step into
-/// a plan's entry, or at a completed plan's end.
+/// a plan's entry, at a completed plan's end, or at the intent ahead of the first primitive of a
+/// pass through a `RecoveryRequired` section outside every plan (ADR-291). `classify` also
+/// refuses on such an intent that is not the point, when no transfer-start marker followed it.
 fn recovery_required(program: &Program, at: StepRef) -> Option<OnSiteReason> {
     for plan in &program.flash {
         if let RecoveryRequired::FromPc(from) = plan.recovery_required
@@ -1311,6 +1326,21 @@ fn recovery_required(program: &Program, at: StepRef) -> Option<OnSiteReason> {
                 && (section.start_pc..section.end_pc).contains(&at.pc)
         })
         .map(|section| OnSiteReason::RecoveryRequiredSection { section, at })
+}
+
+/// Whether `pc` lies in a section marked `RecoveryRequired` and outside every plan's range
+/// (`entry_pc` up to, not including, `post_transfer_end_pc`): where the runner writes an intent
+/// ahead of a pass's first primitive (ADR-291).
+pub(crate) fn in_section_outside_plans(program: &Program, pc: u32) -> bool {
+    let in_plan = program
+        .flash
+        .iter()
+        .any(|plan| (plan.boundaries.entry_pc..plan.boundaries.post_transfer_end_pc).contains(&pc));
+    !in_plan
+        && program.sections.iter().any(|section| {
+            matches!(section.interruptible, Interruptible::RecoveryRequired)
+                && (section.start_pc..section.end_pc).contains(&pc)
+        })
 }
 
 /// The first diagnostic primitive, in pc order, that the continuation after `verified`'s
@@ -2095,6 +2125,69 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// A section intent outside the plans refuses while no transfer-start marker follows it,
+    /// even when a later record is the interruption point, since a plain start, or a restart of
+    /// an older transfer that goes on past its plan, would run the section again (ADR-291).
+    #[test]
+    fn a_section_intent_without_a_later_transfer_needs_on_site_intervention() {
+        let section = |start_pc, end_pc| Section {
+            start_pc,
+            end_pc,
+            interruptible: Interruptible::RecoveryRequired,
+            idempotency: Idempotency::Safe,
+            expected_millis: 0,
+        };
+        let refused_at = |decision: RestartDecision, pc| {
+            matches!(
+                decision,
+                RestartDecision::OnSiteInterventionRequired(OnSiteReason::RecoveryRequiredSection {
+                    section: 0,
+                    at,
+                }) if at.pc == pc
+            )
+        };
+        let entry = |j: &mut Journal<Memory>, program: &Program, steps: u64| {
+            let mut state = Vm::new(program).state;
+            state.pc = ENTRY;
+            state.steps = steps;
+            j.commit_step(
+                StepRef {
+                    pc: ENTRY - 1,
+                    steps,
+                },
+                Some(&state_bytes(&state)),
+            )
+            .unwrap();
+        };
+
+        // Before the plan, pc 0: the step into the entry and a step in the plan come later.
+        let mut program = program(RecoveryRequired::Never);
+        program.sections.push(section(0, 1));
+        let mut j = new_journal();
+        j.commit_intent(at(0)).unwrap();
+        entry(&mut j, &program, 1);
+        j.commit_step(at(ENTRY), None).unwrap();
+        let decision = decide(&program, &j);
+        assert!(refused_at(decision.clone(), 0), "{decision:?}");
+        // The erase's marker follows it: the restart replays from the entry only.
+        j.commit_transfer_start(StageId(7), at(ERASE)).unwrap();
+        let decision = decide(&program, &j);
+        assert!(
+            matches!(decision, RestartDecision::Restart(_)),
+            "{decision:?}"
+        );
+
+        // After the plan, pc 8: the transfer before it is older, and a step back into the
+        // entry comes later.
+        let mut program = super::tests::program(RecoveryRequired::Never);
+        program.sections.push(section(END, END + 1));
+        let mut j = journal_until(&program, END);
+        j.commit_intent(at(END)).unwrap();
+        entry(&mut j, &program, u64::from(END) + 1);
+        let decision = decide(&program, &j);
+        assert!(refused_at(decision.clone(), END), "{decision:?}");
     }
 
     /// The done-when case: an unreadable journal ends in on-site intervention.

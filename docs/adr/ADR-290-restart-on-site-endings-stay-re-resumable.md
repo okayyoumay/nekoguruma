@@ -45,8 +45,9 @@ before it changes anything on the ECU.
 
 ## Consequences
 
-- Design 5.6's `OnSiteInterventionRequired` is final for the run that reached it. For these
-  endings, a later resume of the job may try again within the resume limit.
+- Design 5.6's state diagram gains an edge from `OnSiteInterventionRequired` back to
+  `Interrupted` for these endings: a later resume of the job may try again within the resume
+  limit. Every other `OnSiteInterventionRequired` stays final.
 - Each such ending uses up one resume. A job whose cause does not go away ends in
   `ResumeLimitReached` after `max_resumes` tries.
 - ADR-286 Decision item 5's open point is decided, and ADR-261's open consequence on the unjournaled

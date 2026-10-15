@@ -26,7 +26,9 @@ A run starts only when the maintainer asks for one, or from the previous iterati
 The run's state is: a run id (the UTC time the run started), the current PR number, items left,
 the priority cap, and four lists (merged PRs with their shadow risk verdicts, skipped items with
 the reason, backlog-only PRs, the one that ends the run marked "final", and Dependabot PRs: each
-one this run replaced, with its replacement, or reported to the maintainer, with the reason). Keep it in a "Loop
+one this run replaced, with its replacement, or reported to the maintainer, with the reason),
+and the milestone count at the start: the number of milestone P1 items, counted on `origin/main`
+when the run starts by the counting rules of the `milestone-exit` skill. Keep it in a "Loop
 run" section of the current loop PR's description and update it at every step that changes it,
 so it survives a compacted conversation or a fresh session; a merged PR's description can still
 be edited. That section is the only source of the state. A PR belongs to this run only when its
@@ -255,6 +257,11 @@ One message to the maintainer:
   setting), plus the items blocked on hardware the maintainer could supply. Write each one the
   maintainer can act on now as a question that can be answered in a word, with a
   recommendation; for the rest (another precondition is still open), give only their count;
+- one line on the current milestone: its P1 count now, counted the same way on the latest
+  `origin/main`, and the change from the count at the start. Give no per-item list; the
+  `milestone-exit` skill's `status` mode gives the full report. When the count is zero, say so
+  and recommend that the maintainer run its `sweep` mode. Never run `sweep` or `close` from the
+  loop: both need the maintainer;
 - why the run stopped (no items left, nothing eligible within the cap or five `next-task` calls
   without a pick, `main` red, another loop PR open or a lost claim race, a PR closed without merging, a Dependabot replacement the loop could not finish (with the
   branch the maintainer should delete), or three backlog-only PRs).

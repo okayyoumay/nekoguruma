@@ -632,12 +632,14 @@ line and column: a missing line or column sorts before any, and columns sort by 
 names. A file that breaks the record format or is not UTF-8 is not read past the error, since
 its records cannot be told apart from there on; its other errors are not reported. Every row is
 checked, whether or not anything refers to it; an error is reported once, at the row that has
-it, and not again where another row refers to that row. The checks run in two stages: first each
-file on its own (the file set, the record format, the header, each cell, and names defined twice
-in one table), then the rules that compare rows with each other or with other tables
-(references, variant scoping, a key defined twice in one variant's document). The second stage
-runs only when the first finds no error, since a reference to a row with an error can be checked
-neither way; a definition with errors of the first stage therefore lists only those (ADR-298).
+it, and not again where another row refers to that row. The checks run in stages: first each file
+on its own (the file set, the record format, the header, each cell, and names defined twice in
+one table); then the rules that compare rows with each other or with other tables (references,
+variant scoping, a key defined twice in one variant's document); then the rules of single fields
+(5.2, 5.3, 5.5, the conversion and type pairs of 4.5, the services of 4.6 and the status layouts
+of 4.11), which follow the references the stage before resolved. A stage runs only when the
+earlier ones find no error, since a rule that follows a row with an error can be checked neither
+way; a definition with errors of an earlier stage therefore lists only those (ADR-298).
 
 A rule in this document that names no code uses the closest one below: a missing row that a rule
 requires (an empty `variants.csv`, a variant without a protocol, a DID with no service or no

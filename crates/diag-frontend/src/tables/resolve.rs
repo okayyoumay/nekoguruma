@@ -51,12 +51,19 @@ impl Definition {
     }
 }
 
-/// Resolves `tables`; every error found is reported.
+/// Resolves `tables`, then checks the rules of single fields (ADR-298); every error of the
+/// stage that fails is reported.
 pub fn resolve(tables: Tables) -> Result<Definition, Rejected> {
     let mut errors = Errors::default();
     let variants = Resolver::new(&tables, &mut errors).run();
+    if !errors.0.is_empty() {
+        return Err(Rejected::new(errors.0));
+    }
+    // The rules of single fields need resolved references, so they form the next stage.
+    let definition = Definition { tables, variants };
+    super::fields::check(&definition, &mut errors);
     if errors.0.is_empty() {
-        Ok(Definition { tables, variants })
+        Ok(definition)
     } else {
         Err(Rejected::new(errors.0))
     }

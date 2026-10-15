@@ -155,7 +155,9 @@ except the agent's, which run first in a separate nextest run with the `ci-windo
 profile. On pull requests `core-windows` leaves out
 `j2534-0404-service`, which has no Windows-specific code, except for its restart end to end
 (`agent_restart_end_to_end`), which a step of its own runs, since its harness ends the agent and
-its worker with `taskkill` there; main runs every test on Windows.
+its worker with `taskkill` there. Pull requests also leave out the agent's `runner::` tests on
+Windows: they are most of the job's time, the runner has no Windows-specific code, and
+`core-linux` runs them. main runs every test on Windows.
 
 CI (`.github/workflows/ci.yml`) also checks the worker crates for six targets and runs
 `scripts/abi-roundtrip.sh`, which launches `j2534-0404-service` against `sim-vci` built in debug

@@ -156,6 +156,110 @@ fn integer_floor_division_and_remainder_follow_starlark() {
 }
 
 #[test]
+fn a_remainder_by_minus_one_is_zero_even_for_the_smallest_integer() {
+    let min = "-9223372036854775807 - 1";
+    assert!(holds("x, y", &format!("{min}, -1"), "x % y == 0"));
+    assert!(holds("x, y", "7, -1", "x % y == 0"));
+    // The quotient is out of range, at run time and folded.
+    let result = run(&format!(
+        "def f(x, y):\n    return x // y\n\ndef main():\n    f({min}, -1)\n"
+    ));
+    assert!(
+        result.as_ref().is_err_and(|e| e.contains("Overflow")),
+        "{result:?}"
+    );
+    assert_eq!(
+        fold(BinOp::Percent, &Const::Int(i64::MIN), &Const::Int(-1)),
+        Ok(Const::Int(0))
+    );
+    assert!(fold(BinOp::FloorDivide, &Const::Int(i64::MIN), &Const::Int(-1)).is_err());
+}
+
+#[test]
+fn a_folded_float_remainder_is_exact_and_takes_the_divisors_sign() {
+    let rem = |x: f64, y: f64| match fold(BinOp::Percent, &Const::Float(x), &Const::Float(y)) {
+        Ok(Const::Float(r)) => r,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(rem(0.5, 0.1), 0.5 % 0.1);
+    let r = rem(1e308, 1e-10);
+    assert!((0.0..1e-10).contains(&r), "{r}");
+    assert_eq!(rem(-7.0, 2.0), 1.0);
+    assert_eq!(rem(7.0, -2.0), -1.0);
+    assert_eq!(rem(-4.0, 2.0), 0.0);
+}
+
+#[test]
+fn a_folded_shift_count_outside_0_to_63_is_an_error() {
+    for (op, n) in [
+        (BinOp::RightShift, 64),
+        (BinOp::RightShift, -1),
+        (BinOp::LeftShift, 64),
+    ] {
+        assert!(fold(op, &Const::Int(1), &Const::Int(n)).is_err(), "{n}");
+    }
+    assert_eq!(
+        fold(BinOp::RightShift, &Const::Int(-8), &Const::Int(63)),
+        Ok(Const::Int(-1))
+    );
+}
+
+#[test]
+fn min_and_max_keep_the_first_of_equal_values() {
+    let args = [Const::Int(1), Const::Float(1.0)];
+    assert_eq!(fold_builtin("max", &args), Ok(Const::Int(1)));
+    assert_eq!(fold_builtin("min", &args), Ok(Const::Int(1)));
+    assert_eq!(
+        fold_builtin("max", &[Const::Int(1), Const::Int(3), Const::Int(2)]),
+        Ok(Const::Int(3))
+    );
+    // The kept int can index a list.
+    assert_eq!(
+        failed_with("def main():\n    diag.fail([\"A\", \"B\"][max(1, 1.0)], \"\")\n"),
+        "B"
+    );
+}
+
+#[test]
+fn constants_that_double_are_stopped_at_the_size_limit() {
+    // Each line doubles the one before. Without a limit on the folded size the last lines
+    // would need gigabytes; with it, lowering stops building on the first constant too large.
+    // A string of 2^20 bytes is on line 21; a list of 2^19 lists of one int, line 20.
+    for (first, double, line) in [("\"x\"", "A{p} + A{p}", 21), ("[1]", "[A{p}, A{p}]", 20)] {
+        let mut source = format!("A0 = {first}\n");
+        for i in 1..40 {
+            let line = double.replace("{p}", &(i - 1).to_string());
+            source.push_str(&format!("A{i} = {line}\n"));
+        }
+        source.push_str("\ndef main():\n    pass\n");
+        let started = std::time::Instant::now();
+        let found = codes(&source);
+        assert!(!found.is_empty(), "{first}");
+        assert!(
+            found
+                .iter()
+                .all(|(code, _)| *code == StarCode::NotLowerable)
+        );
+        // The first constant past the limit, over 2^20 values and bytes, is reported.
+        assert_eq!(found[0].1, line, "{first}: {found:?}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(60));
+    }
+}
+
+#[test]
+fn a_global_named_often_is_pooled_once() {
+    let mut source = format!(
+        "T = \"{}\"\n\ndef same(x, y):\n    return x == y\n\ndef main():\n",
+        "x".repeat(1000)
+    );
+    for _ in 0..50 {
+        source.push_str("    if same(T, T):\n        pass\n");
+    }
+    let program = lowered(&source).unwrap();
+    assert_eq!(program.constants.len(), 1);
+}
+
+#[test]
 fn a_right_shift_is_arithmetic() {
     assert!(holds("x", "-8", "x >> 1 == -4"));
     assert!(holds("x", "-1", "x >> 63 == -1"));
@@ -183,12 +287,55 @@ fn comparisons_cover_both_numeric_types() {
         "2.5, 2.5",
         "a <= b and a >= b and not (a < b)"
     ));
-    // NaN is not ordered, so <= is false too.
+}
+
+/// `n` is NaN at run time: infinity minus infinity.
+const NAN: &str = "1e308 * 10.0 - 1e308 * 10.0";
+
+#[test]
+fn floats_are_totally_ordered_with_nan_greatest() {
+    // NaN equals NaN and is greater than every other float, at run time and when folded.
+    for (params, args) in [
+        ("n, x", format!("{NAN}, 1.0")),
+        ("n, x", format!("{NAN}, 1e308 * 10.0")),
+    ] {
+        assert!(holds(
+            params,
+            &args,
+            "n == n and not (n != n) and n <= n and n >= n"
+        ));
+        assert!(holds(
+            params,
+            &args,
+            "n > x and n >= x and not (n < x) and not (n <= x)"
+        ));
+        assert!(holds(
+            params,
+            &args,
+            "x < n and x <= n and not (x > n) and x != n"
+        ));
+    }
     assert!(holds(
-        "a",
-        "0.0",
-        "not (a / a <= 1.0) and not (a / a >= 1.0)"
+        "x, y",
+        "1.0, 2.0",
+        "x != y and not (x == y) and x < y"
     ));
+    let folded = format!(
+        "N = {NAN}\n\ndef main():\n    if N == N and N > 1.0 and max(1.0, N) == N and min(N, 1.0) == 1.0:\n        diag.fail(\"YES\", \"\")\n"
+    );
+    assert_eq!(failed_with(&folded), "YES");
+}
+
+#[test]
+fn a_float_division_by_zero_is_an_error() {
+    let result = run(
+        "def r(a, b):\n    return a / b\n\ndef main():\n    if r(1.0, -0.0) > 1.0:\n        diag.fail(\"YES\", \"\")\n",
+    );
+    assert!(
+        result.as_ref().is_err_and(|e| e.contains("DivisionByZero")),
+        "{result:?}"
+    );
+    assert!(holds("a, b", "1.0, 4.0", "a / b == 0.25"));
 }
 
 #[test]
@@ -236,13 +383,18 @@ def main():
 fn bytes_are_indexed_at_run_time() {
     assert!(holds("b, i", "b\"\\x01\\x02\\x03\", 2", "b[i] == 3"));
     // An index past the end is an error at run time.
-    let result = run("def f(b, i):\n    return b[i]\n\ndef main():\n    f(b\"\\x01\", 5)\n");
-    assert!(
-        result
-            .as_ref()
-            .is_err_and(|e| e.contains("IndexOutOfRange")),
-        "{result:?}"
-    );
+    // So is a negative index known only at run time (subset 4.8).
+    for index in ["5", "-1"] {
+        let result = run(&format!(
+            "def f(b, i):\n    return b[i]\n\ndef main():\n    f(b\"\\x01\", {index})\n"
+        ));
+        assert!(
+            result
+                .as_ref()
+                .is_err_and(|e| e.contains("IndexOutOfRange")),
+            "{index}: {result:?}"
+        );
+    }
 }
 
 #[test]

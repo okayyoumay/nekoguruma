@@ -36,9 +36,12 @@ instructions, what happens to `None`, and how the source map is laid out.
    ECU's data, where a value rarely changes type.
 4. **Starlark semantics with the existing instructions.** `//` and `%` on `int`s use the
    truncating `Div` and correct the result when the remainder is non-zero and its sign differs
-   from the divisor's; `>>` is lowered as `~((~x) >> n)` for negative `x`; `<=` and `>=` on
-   floats are `(a < b) or (a == b)`, so NaN compares false; `-x` on a float is `x * -1.0`, which
-   keeps the sign of zero; `and` and `or` give the deciding operand's value. Values of different
+   from the divisor's; `>>` is lowered as `~((~x) >> n)` for negative `x`; a remainder by -1 is 0
+   without a division; float comparisons test their operands for NaN (a float that does not
+   equal itself) before the IEEE 754 comparison, giving Starlark's total order, where NaN equals
+   NaN and is the greatest float, and `<=` is then `not (a > b)`; a float `/` tests the divisor
+   and sends zero to the integer `Div` by zero, so it stops the program as Starlark would;
+   `-x` on a float is `x * -1.0`, which keeps the sign of zero; `and` and `or` give the deciding operand's value. Values of different
    types are unequal without a comparison. What needs a missing instruction (conversion between
    `int` and `float`, concatenation, a length, a slice, `<<` at run time, a float floor or
    remainder, built-ins and string methods on values known only at run time) is

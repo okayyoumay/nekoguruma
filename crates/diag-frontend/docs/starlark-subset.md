@@ -367,19 +367,26 @@ def main():
 - `//` and `%` on two `int` operands follow Starlark: floor division and a remainder with the
   sign of the divisor. The IR's integer division truncates toward zero (ADR-233), so the
   transpiler corrects the result only when the remainder is non-zero and the operands have
-  different signs (`-7 // 2` is `-4`, while `-4 // 2` stays `-2`)
+  different signs (`-7 // 2` is `-4`, while `-4 // 2` stays `-2`). A remainder by -1 is 0
+  without a division, so it holds for the smallest integer too, whose quotient by -1 is out of
+  range
 - `//` and `%` with a `float` operand need floor and remainder instructions for `F64` that the
   IR does not have; they are rejected (`STAR_NOT_LOWERABLE`) unless both operands are constants,
   which are folded at ingestion
-- `/` is float division and always yields `F64`
+- `/` is float division and always yields `F64`. A division by zero is an error, as in
+  Starlark, although the IR's float `Div` would give an infinity or NaN: the transpiler tests the
+  divisor first
+- Floats are totally ordered, as in Starlark: NaN equals NaN and is greater than every other
+  float. The IR's comparisons follow IEEE 754, where NaN equals nothing, so a float comparison
+  tests its operands for NaN first
 - `>>` is arithmetic in Starlark, while the IR's `Shr` is logical (ADR-233). The transpiler
   lowers `x >> n` as `x >> n` for `x >= 0` and as `~((~x) >> n)` for negative `x` (the complement
   is `BitXor` with -1), which gives the arithmetic result with the existing instructions
 - `<<` must not lose bits, since a Starlark integer would grow instead, but the IR's `Shl` drops
   shifted-out bits. A `<<` with a run-time operand needs an overflow-checked shift and is
   rejected (`STAR_NOT_LOWERABLE`) until one exists; constant operands are folded at ingestion
-- A shift count outside 0 to 63 is an error at run time. Starlark accepts larger right shifts;
-  this subset does not
+- A shift count outside 0 to 63 is an error, at run time and when constants are folded.
+  Starlark accepts larger right shifts; this subset does not
 - No implicit conversion between `int` and `float` beyond what Starlark itself does for
   mixed arithmetic; the transpiler inserts the conversion instructions explicitly
 
@@ -485,7 +492,13 @@ type, so the transpiler infers at ingestion which types each value can have (ADR
   every path, and a function that returns none cannot be used as a value
   (`STAR_UNSUPPORTED_SYNTAX`).
 - Expressions whose operands are all constants are folded at ingestion with Starlark's
-  semantics, so they need no instruction; a folded constant may be at most 1 MiB.
+  semantics, so they need no instruction. A constant may hold at most 2^20 values and bytes,
+  counting each value, each byte of its strings, bytes and dict keys, and a value a list holds
+  twice twice; a larger one is `STAR_NOT_LOWERABLE`.
+- An index into bytes known only at run time must not be negative: without a length
+  instruction the transpiler cannot count it from the end, so a negative index stops the
+  procedure with an index error where Starlark would count from the end. A constant negative
+  index is `STAR_NOT_LOWERABLE`.
 
 ---
 

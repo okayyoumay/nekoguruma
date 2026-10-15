@@ -13,6 +13,7 @@
 //! `diag` function without an instruction), so nothing is lowered silently wrong.
 
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use diag_ir::{IR_SCHEMA_VERSION, Op, Program, SourceSpan};
 use starlark_syntax::codemap::Span;
@@ -27,9 +28,9 @@ use super::{
     is_string_expression, resolve, to_u32,
 };
 
-/// The longest constant string, bytes or list a fold may build, so a constant expression cannot
-/// make ingestion allocate without bound.
-const MAX_CONSTANT_LEN: usize = 1 << 20;
+/// The largest constant a fold or literal may build ([`Const::size`]), so a constant expression
+/// cannot make ingestion allocate or work without bound.
+const MAX_CONSTANT_SIZE: usize = 1 << 20;
 
 /// How many passes type inference may take before it gives up (ADR-304). Each pass can only
 /// widen a type, so real procedures settle in a few; a file that needs more is rejected rather
@@ -141,20 +142,55 @@ impl Tys {
     }
 }
 
-/// A value known at ingestion.
+/// A value known at ingestion. Strings, bytes, lists and dicts are shared, so naming a constant
+/// does not copy it; a list or dict carries its [`Const::size`].
 #[derive(Debug, Clone, PartialEq)]
 enum Const {
     Int(i64),
     Float(f64),
     Bool(bool),
-    Str(String),
-    Bytes(Vec<u8>),
-    List(Vec<Const>),
+    Str(Rc<str>),
+    Bytes(Rc<[u8]>),
+    List(Rc<[Const]>, usize),
     /// String keys in source order.
-    Dict(Vec<(String, Const)>),
+    Dict(Rc<[(Rc<str>, Const)]>, usize),
 }
 
 impl Const {
+    fn str(s: impl Into<Rc<str>>) -> Const {
+        Const::Str(s.into())
+    }
+
+    fn bytes(b: impl Into<Rc<[u8]>>) -> Const {
+        Const::Bytes(b.into())
+    }
+
+    fn list(items: Vec<Const>) -> Const {
+        let size = items
+            .iter()
+            .fold(1usize, |size, item| size.saturating_add(item.size()));
+        Const::List(items.into(), size)
+    }
+
+    fn dict(entries: Vec<(Rc<str>, Const)>) -> Const {
+        let size = entries.iter().fold(1usize, |size, (key, value)| {
+            size.saturating_add(key.len()).saturating_add(value.size())
+        });
+        Const::Dict(entries.into(), size)
+    }
+
+    /// The size the constant limit counts: one for each value, plus the bytes of each string,
+    /// bytes value and dict key. A list that holds the same value twice counts it twice, since
+    /// folding walks it twice.
+    fn size(&self) -> usize {
+        match self {
+            Const::Int(_) | Const::Float(_) | Const::Bool(_) => 1,
+            Const::Str(s) => 1 + s.len(),
+            Const::Bytes(b) => 1 + b.len(),
+            Const::List(_, size) | Const::Dict(_, size) => *size,
+        }
+    }
+
     fn ty(&self) -> Option<Ty> {
         match self {
             Const::Int(_) => Some(Ty::Int),
@@ -162,14 +198,14 @@ impl Const {
             Const::Bool(_) => Some(Ty::Bool),
             Const::Str(_) => Some(Ty::Str),
             Const::Bytes(_) => Some(Ty::Bytes),
-            Const::List(_) | Const::Dict(_) => None,
+            Const::List(..) | Const::Dict(..) => None,
         }
     }
 
     fn type_name(&self) -> &'static str {
         match self {
-            Const::List(_) => "list",
-            Const::Dict(_) => "dict",
+            Const::List(..) => "list",
+            Const::Dict(..) => "dict",
             other => other.ty().map_or("value", Ty::name),
         }
     }
@@ -182,8 +218,8 @@ impl Const {
             Const::Bool(b) => *b,
             Const::Str(s) => !s.is_empty(),
             Const::Bytes(b) => !b.is_empty(),
-            Const::List(l) => !l.is_empty(),
-            Const::Dict(d) => !d.is_empty(),
+            Const::List(l, _) => !l.is_empty(),
+            Const::Dict(d, _) => !d.is_empty(),
         }
     }
 
@@ -191,8 +227,8 @@ impl Const {
         match self {
             Const::Str(s) => s.len(),
             Const::Bytes(b) => b.len(),
-            Const::List(l) => l.len(),
-            Const::Dict(d) => d.len(),
+            Const::List(l, _) => l.len(),
+            Const::Dict(d, _) => d.len(),
             _ => 0,
         }
     }
@@ -265,6 +301,8 @@ struct Lowerer<'a> {
     /// The constant pool, and each entry's index.
     pool: Vec<Vec<u8>>,
     pooled: HashMap<Vec<u8>, u32>,
+    /// Pool indexes by the address and length of a shared constant's bytes, with the constant.
+    shared: HashMap<(usize, usize), (Const, u32)>,
 }
 
 impl<'a> Lowerer<'a> {
@@ -281,6 +319,7 @@ impl<'a> Lowerer<'a> {
             called: Vec::new(),
             pool: Vec::new(),
             pooled: HashMap::new(),
+            shared: HashMap::new(),
         }
     }
 
@@ -642,8 +681,8 @@ impl<'a> Lowerer<'a> {
                     },
                 },
                 AstLiteral::Float(f) => Val::Const(Const::Float(f.node)),
-                AstLiteral::String(s) => Val::Const(Const::Str(s.node.clone())),
-                AstLiteral::Bytes(b) => Val::Const(Const::Bytes(b.node.clone())),
+                AstLiteral::String(s) => Val::Const(Const::str(s.node.as_str())),
+                AstLiteral::Bytes(b) => Val::Const(Const::bytes(b.node.as_slice())),
                 AstLiteral::Ellipsis => {
                     self.not_lowerable(span, "`...` cannot be lowered (2.3)");
                     Val::Const(Const::Int(0))
@@ -719,11 +758,11 @@ impl<'a> Lowerer<'a> {
                                 item.span,
                                 "a list exists only at ingestion, so its items must be constants (2.5)",
                             );
-                            return Val::Const(Const::List(Vec::new()));
+                            return Val::Const(Const::list(Vec::new()));
                         }
                     }
                 }
-                Val::Const(Const::List(values))
+                self.bounded(Const::list(values), span)
             }
             ExprP::Dict(pairs) => {
                 let mut entries = Vec::new();
@@ -746,7 +785,7 @@ impl<'a> Lowerer<'a> {
                         ),
                     }
                 }
-                Val::Const(Const::Dict(entries))
+                self.bounded(Const::dict(entries), span)
             }
             ExprP::Index(parts) => {
                 let (object, index) = &**parts;
@@ -863,11 +902,28 @@ impl<'a> Lowerer<'a> {
                 Op::PushI64(if *b { 0 } else { 1 }),
                 Op::CmpEq,
             ],
-            Const::Str(s) => vec![Op::PushBytes(self.pool(s.as_bytes()))],
-            Const::Bytes(b) => vec![Op::PushBytes(self.pool(b))],
-            Const::List(_) | Const::Dict(_) => Vec::new(),
+            Const::Str(_) | Const::Bytes(_) => vec![Op::PushBytes(self.pool_shared(value))],
+            Const::List(..) | Const::Dict(..) => Vec::new(),
         };
         ops.into_iter().map(|op| (Ins::Op(op), span)).collect()
+    }
+
+    /// The pool index of a string or bytes constant. A constant pushed again (a global named in
+    /// many places, in every inference pass) is found by its shared allocation, without hashing
+    /// its bytes again; the map keeps the allocation alive, so its address is not reused.
+    fn pool_shared(&mut self, value: &Const) -> u32 {
+        let bytes: &[u8] = match value {
+            Const::Str(s) => s.as_bytes(),
+            Const::Bytes(b) => b,
+            _ => return 0,
+        };
+        let key = (bytes.as_ptr() as usize, bytes.len());
+        if let Some((_, index)) = self.shared.get(&key) {
+            return *index;
+        }
+        let index = self.pool(bytes);
+        self.shared.insert(key, (value.clone(), index));
+        index
     }
 
     fn pool(&mut self, bytes: &[u8]) -> u32 {
@@ -1036,6 +1092,19 @@ impl<'a> Lowerer<'a> {
         Val::Run(Tys::of(ty), code)
     }
 
+    /// `value`, or a placeholder after an error when it is larger than the constant limit, so a
+    /// later fold does not build on it.
+    fn bounded(&mut self, value: Const, span: Span) -> Val {
+        if value.size() > MAX_CONSTANT_SIZE {
+            self.not_lowerable(
+                span,
+                "the constant is too large: more than 1 Mi values and bytes (4.4)",
+            );
+            return Val::Const(Const::Int(0));
+        }
+        Val::Const(value)
+    }
+
     fn out_of_range(&mut self, span: Span) -> Val {
         self.not_lowerable(span, "the result is outside the 64-bit integer range (4.4)");
         Val::Const(Const::Int(0))
@@ -1044,12 +1113,7 @@ impl<'a> Lowerer<'a> {
     fn binary(&mut self, id: Option<usize>, op: BinOp, a: Val, b: Val, span: Span) -> Val {
         if let (Val::Const(x), Val::Const(y)) = (&a, &b) {
             return match fold(op, x, y) {
-                Ok(value) => {
-                    if value.len() > MAX_CONSTANT_LEN {
-                        self.not_lowerable(span, "the constant is larger than 1 MiB");
-                    }
-                    Val::Const(value)
-                }
+                Ok(value) => self.bounded(value, span),
                 Err(reason) => {
                     self.not_lowerable(span, reason);
                     Val::Const(Const::Int(0))
@@ -1067,17 +1131,36 @@ impl<'a> Lowerer<'a> {
         code.extend(cb);
         let at = |op: Op| (Ins::Op(op), span);
         let result = match (op, ta, tb) {
+            (BinOp::Divide, Ty::Float, Ty::Float) => {
+                // Starlark rejects a division by zero, while the IR's float `Div` gives an
+                // infinity or NaN: a zero divisor is sent to the integer `Div` by zero, which
+                // stops the program with the same error.
+                let (zero, end) = (self.label(), self.label());
+                code.extend(
+                    [
+                        Ins::Op(Op::Dup),
+                        Ins::Op(Op::PushF64(0.0)),
+                        Ins::Op(Op::CmpEq),
+                        Ins::Op(Op::Not),
+                        Ins::JumpIfFalse(zero),
+                        Ins::Op(Op::Div),
+                        Ins::Jump(end),
+                        Ins::Mark(zero),
+                        Ins::Op(Op::PushI64(0)),
+                        Ins::Op(Op::PushI64(0)),
+                        Ins::Op(Op::Div),
+                        Ins::Mark(end),
+                    ]
+                    .map(|ins| (ins, span)),
+                );
+                Ty::Float
+            }
             (BinOp::Add | BinOp::Subtract | BinOp::Multiply, Ty::Int, Ty::Int)
-            | (
-                BinOp::Add | BinOp::Subtract | BinOp::Multiply | BinOp::Divide,
-                Ty::Float,
-                Ty::Float,
-            ) => {
+            | (BinOp::Add | BinOp::Subtract | BinOp::Multiply, Ty::Float, Ty::Float) => {
                 code.push(at(match op {
                     BinOp::Add => Op::Add,
                     BinOp::Subtract => Op::Sub,
-                    BinOp::Multiply => Op::Mul,
-                    _ => Op::Div,
+                    _ => Op::Mul,
                 }));
                 ta
             }
@@ -1103,6 +1186,16 @@ impl<'a> Lowerer<'a> {
                 code.extend(self.shift_right(id, span));
                 Ty::Int
             }
+            (BinOp::Equal | BinOp::NotEqual, Ty::Float, Ty::Float) => {
+                let Some(id) = id else {
+                    return Val::Run(Tys::default(), Vec::new());
+                };
+                code.extend(self.float_compare(id, BinOp::Equal, span));
+                if op == BinOp::NotEqual {
+                    code.push(at(Op::Not));
+                }
+                Ty::Bool
+            }
             (BinOp::Equal | BinOp::NotEqual, x, y) if x == y => {
                 code.push(at(Op::CmpEq));
                 if op == BinOp::NotEqual {
@@ -1125,8 +1218,7 @@ impl<'a> Lowerer<'a> {
                 code.extend(self.push_const(&Const::Bool(op == BinOp::NotEqual), span));
                 Ty::Bool
             }
-            (BinOp::Less | BinOp::Greater, Ty::Int, Ty::Int)
-            | (BinOp::Less | BinOp::Greater, Ty::Float, Ty::Float) => {
+            (BinOp::Less | BinOp::Greater, Ty::Int, Ty::Int) => {
                 code.push(at(if op == BinOp::Less {
                     Op::CmpLt
                 } else {
@@ -1144,12 +1236,26 @@ impl<'a> Lowerer<'a> {
                 code.push(at(Op::Not));
                 Ty::Bool
             }
-            (BinOp::LessOrEqual | BinOp::GreaterOrEqual, Ty::Float, Ty::Float) => {
+            (
+                BinOp::Less | BinOp::Greater | BinOp::LessOrEqual | BinOp::GreaterOrEqual,
+                Ty::Float,
+                Ty::Float,
+            ) => {
                 let Some(id) = id else {
                     return Val::Run(Tys::default(), Vec::new());
                 };
-                // NaN is neither less, greater nor equal, so a <= b is (a < b) or (a == b).
-                code.extend(self.float_or_equal(id, op == BinOp::LessOrEqual, span));
+                // Floats are totally ordered in Starlark (NaN is the greatest), so a <= b is
+                // not (a > b), as for integers.
+                let (strict, negate) = match op {
+                    BinOp::Less => (BinOp::Less, false),
+                    BinOp::Greater => (BinOp::Greater, false),
+                    BinOp::LessOrEqual => (BinOp::Greater, true),
+                    _ => (BinOp::Less, true),
+                };
+                code.extend(self.float_compare(id, strict, span));
+                if negate {
+                    code.push(at(Op::Not));
+                }
                 Ty::Bool
             }
             _ => {
@@ -1186,10 +1292,19 @@ impl<'a> Lowerer<'a> {
             self.temp(id, span),
             self.temp(id, span),
         );
-        let done = self.label();
-        let mut ops = vec![
-            Ins::Op(Op::StoreLocal(b)),
-            Ins::Op(Op::StoreLocal(a)),
+        let (done, minus_one) = (self.label(), self.label());
+        let mut ops = vec![Ins::Op(Op::StoreLocal(b)), Ins::Op(Op::StoreLocal(a))];
+        if percent {
+            // x % -1 is 0 for every x, while the division overflows for the smallest integer.
+            ops.extend([
+                Ins::Op(Op::LoadLocal(b)),
+                Ins::Op(Op::PushI64(-1)),
+                Ins::Op(Op::CmpEq),
+                Ins::Op(Op::Not),
+                Ins::JumpIfFalse(minus_one),
+            ]);
+        }
+        ops.extend([
             // q = a / b, truncated; r = a - q * b.
             Ins::Op(Op::LoadLocal(a)),
             Ins::Op(Op::LoadLocal(b)),
@@ -1217,12 +1332,16 @@ impl<'a> Lowerer<'a> {
             Ins::Op(Op::CmpEq),
             Ins::Op(Op::Not),
             Ins::JumpIfFalse(done),
-        ];
+        ]);
         if percent {
             ops.extend([
                 Ins::Op(Op::LoadLocal(r)),
                 Ins::Op(Op::LoadLocal(b)),
                 Ins::Op(Op::Add),
+                Ins::Op(Op::StoreLocal(r)),
+                Ins::Jump(done),
+                Ins::Mark(minus_one),
+                Ins::Op(Op::PushI64(0)),
                 Ins::Op(Op::StoreLocal(r)),
             ]);
         } else {
@@ -1268,8 +1387,10 @@ impl<'a> Lowerer<'a> {
         ops.into_iter().map(|ins| (ins, span)).collect()
     }
 
-    /// `a <= b` (`less` true) or `a >= b` on floats: `(a < b) or (a == b)`.
-    fn float_or_equal(&mut self, id: usize, less: bool, span: Span) -> Code {
+    /// `a == b`, `a < b` or `a > b` (`op`) on the floats on the stack, in Starlark's total order:
+    /// NaN equals NaN and is greater than every other float, where the IR's comparisons follow
+    /// IEEE 754 and are false for NaN. A float is NaN when it does not equal itself.
+    fn float_compare(&mut self, id: usize, op: BinOp, span: Span) -> Code {
         // The temporaries hold floats.
         let (a, b) = (self.temp(id, span), self.temp(id, span));
         for slot in [a, b] {
@@ -1277,23 +1398,54 @@ impl<'a> Lowerer<'a> {
                 *tys = Tys::of(Ty::Float);
             }
         }
-        let end = self.label();
-        let ops = vec![
+        let (a_nan, b_nan, end) = (self.label(), self.label(), self.label());
+        let ieee = match op {
+            BinOp::Less => Op::CmpLt,
+            BinOp::Greater => Op::CmpGt,
+            _ => Op::CmpEq,
+        };
+        let mut ops = vec![
             Ins::Op(Op::StoreLocal(b)),
             Ins::Op(Op::StoreLocal(a)),
             Ins::Op(Op::LoadLocal(a)),
-            Ins::Op(Op::LoadLocal(b)),
-            Ins::Op(if less { Op::CmpLt } else { Op::CmpGt }),
-            Ins::Op(Op::Dup),
-            Ins::Op(Op::Not),
-            // When the strict comparison holds, it stays as the result.
-            Ins::JumpIfFalse(end),
-            Ins::Op(Op::Pop),
             Ins::Op(Op::LoadLocal(a)),
+            Ins::Op(Op::CmpEq),
+            Ins::JumpIfFalse(a_nan),
+            Ins::Op(Op::LoadLocal(b)),
             Ins::Op(Op::LoadLocal(b)),
             Ins::Op(Op::CmpEq),
-            Ins::Mark(end),
+            Ins::JumpIfFalse(b_nan),
+            // Neither is NaN.
+            Ins::Op(Op::LoadLocal(a)),
+            Ins::Op(Op::LoadLocal(b)),
+            Ins::Op(ieee),
+            Ins::Jump(end),
+            // Only b is NaN: a is less.
+            Ins::Mark(b_nan),
         ];
+        let boolean = |this: &mut Self, b: bool| {
+            this.push_const(&Const::Bool(b), span)
+                .into_iter()
+                .map(|(ins, _)| ins)
+                .collect::<Vec<_>>()
+        };
+        ops.extend(boolean(self, op == BinOp::Less));
+        ops.extend([Ins::Jump(end), Ins::Mark(a_nan)]);
+        // Only a, or both, are NaN: a equals b when b is NaN too, and is greater otherwise.
+        match op {
+            BinOp::Less => ops.extend(boolean(self, false)),
+            _ => {
+                ops.extend([
+                    Ins::Op(Op::LoadLocal(b)),
+                    Ins::Op(Op::LoadLocal(b)),
+                    Ins::Op(Op::CmpEq),
+                ]);
+                if op == BinOp::Equal {
+                    ops.push(Ins::Op(Op::Not));
+                }
+            }
+        }
+        ops.push(Ins::Mark(end));
         ops.into_iter().map(|ins| (ins, span)).collect()
     }
 
@@ -1350,10 +1502,10 @@ impl<'a> Lowerer<'a> {
         let (from, to) = (clamp(start, 0), clamp(stop, len));
         let to = to.max(from);
         match object {
-            Const::Bytes(b) => Val::Const(Const::Bytes(b[from..to].to_vec())),
-            Const::List(l) => Val::Const(Const::List(l[from..to].to_vec())),
+            Const::Bytes(b) => Val::Const(Const::bytes(&b[from..to])),
+            Const::List(l, _) => Val::Const(Const::list(l[from..to].to_vec())),
             // Indexes count bytes here, which are characters only in ASCII.
-            Const::Str(s) if s.is_ascii() => Val::Const(Const::Str(s[from..to].to_owned())),
+            Const::Str(s) if s.is_ascii() => Val::Const(Const::str(&s[from..to])),
             other => {
                 self.not_lowerable(
                     span,
@@ -1399,7 +1551,7 @@ impl<'a> Lowerer<'a> {
                         })
                         .collect();
                     return match consts.map(|args| fold_builtin(name, &args)) {
-                        Some(Ok(value)) => Val::Const(value),
+                        Some(Ok(value)) => self.bounded(value, span),
                         Some(Err(reason)) => {
                             self.not_lowerable(span, reason);
                             Val::Run(Tys::default(), Vec::new())
@@ -1438,7 +1590,7 @@ impl<'a> Lowerer<'a> {
                         if STRING_METHODS.contains(&method.node.as_str()) =>
                     {
                         match fold_method(&s, &method.node, &args) {
-                            Ok(value) => Val::Const(value),
+                            Ok(value) => self.bounded(value, span),
                             Err(reason) => {
                                 self.not_lowerable(span, reason);
                                 Val::Run(Tys::default(), Vec::new())
@@ -1804,10 +1956,14 @@ fn number(value: &Const) -> Option<f64> {
     }
 }
 
-/// Starlark's floor division and remainder on integers.
-fn floor_div_mod(a: i64, b: i64) -> Result<(i64, i64), String> {
+/// Starlark's floor division and remainder on integers. `x % -1` is 0 for every `x`, so only
+/// the quotient of the smallest integer by -1 is out of range.
+fn floor_div_mod(a: i64, b: i64, percent: bool) -> Result<(i64, i64), String> {
     if b == 0 {
         return Err("division by zero".to_owned());
+    }
+    if b == -1 && percent {
+        return Ok((0, 0));
     }
     let q = a
         .checked_div(b)
@@ -1839,35 +1995,31 @@ fn fold(op: BinOp, a: &Const, b: &Const) -> Result<Const, String> {
         BinOp::NotEqual => Ok(Bool(!equal(a, b))),
         BinOp::Less | BinOp::Greater | BinOp::LessOrEqual | BinOp::GreaterOrEqual => {
             let ordering = match (a, b) {
-                (Str(x), Str(y)) => Some(x.cmp(y)),
-                (Bytes(x), Bytes(y)) => Some(x.cmp(y)),
+                (Str(x), Str(y)) => x.cmp(y),
+                (Bytes(x), Bytes(y)) => x.cmp(y),
                 _ => match (a, b) {
-                    (Int(x), Int(y)) => Some(x.cmp(y)),
+                    (Int(x), Int(y)) => x.cmp(y),
                     _ => match (number(a), number(b)) {
-                        (Some(x), Some(y)) => x.partial_cmp(&y),
+                        (Some(x), Some(y)) => float_order(x, y),
                         _ => return Err(mismatch()),
                     },
                 },
             };
             use std::cmp::Ordering::*;
-            Ok(Bool(match (op, ordering) {
-                (_, None) => false,
-                (BinOp::Less, Some(o)) => o == Less,
-                (BinOp::Greater, Some(o)) => o == Greater,
-                (BinOp::LessOrEqual, Some(o)) => o != Greater,
-                (_, Some(o)) => o != Less,
+            Ok(Bool(match op {
+                BinOp::Less => ordering == Less,
+                BinOp::Greater => ordering == Greater,
+                BinOp::LessOrEqual => ordering != Greater,
+                _ => ordering != Less,
             }))
         }
         BinOp::In | BinOp::NotIn => {
             let found = match (a, b) {
-                (_, List(items)) => items.iter().any(|item| equal(a, item)),
-                (Str(key), Dict(entries)) => entries.iter().any(|(k, _)| k == key),
-                (Str(needle), Str(haystack)) => haystack.contains(needle.as_str()),
+                (_, List(items, _)) => items.iter().any(|item| equal(a, item)),
+                (Str(key), Dict(entries, _)) => entries.iter().any(|(k, _)| k == key),
+                (Str(needle), Str(haystack)) => haystack.contains(&**needle),
                 (Bytes(needle), Bytes(haystack)) => {
-                    needle.is_empty()
-                        || haystack
-                            .windows(needle.len())
-                            .any(|w| w == needle.as_slice())
+                    needle.is_empty() || haystack.windows(needle.len()).any(|w| w == &**needle)
                 }
                 (Int(byte), Bytes(haystack)) => {
                     u8::try_from(*byte).is_ok_and(|byte| haystack.contains(&byte))
@@ -1884,9 +2036,9 @@ fn fold(op: BinOp, a: &Const, b: &Const) -> Result<Const, String> {
             }
             .map(Int)
             .ok_or_else(range),
-            (Str(x), Str(y)) if op == BinOp::Add => Ok(Str(format!("{x}{y}"))),
-            (Bytes(x), Bytes(y)) if op == BinOp::Add => Ok(Bytes([x.as_slice(), y].concat())),
-            (List(x), List(y)) if op == BinOp::Add => Ok(List([x.as_slice(), y].concat())),
+            (Str(x), Str(y)) if op == BinOp::Add => Ok(Const::str(format!("{x}{y}"))),
+            (Bytes(x), Bytes(y)) if op == BinOp::Add => Ok(Const::bytes([&**x, &**y].concat())),
+            (List(x, _), List(y, _)) if op == BinOp::Add => Ok(Const::list([&**x, &**y].concat())),
             _ => match (number(a), number(b)) {
                 (Some(x), Some(y)) => Ok(Float(match op {
                     BinOp::Add => x + y,
@@ -1903,17 +2055,20 @@ fn fold(op: BinOp, a: &Const, b: &Const) -> Result<Const, String> {
         },
         BinOp::FloorDivide | BinOp::Percent => match (a, b) {
             (Int(x), Int(y)) => {
-                let (q, r) = floor_div_mod(*x, *y)?;
+                let (q, r) = floor_div_mod(*x, *y, op == BinOp::Percent)?;
                 Ok(Int(if op == BinOp::FloorDivide { q } else { r }))
             }
             _ => match (number(a), number(b)) {
                 (Some(_), Some(0.0)) => Err("division by zero".to_owned()),
+                (Some(x), Some(y)) if op == BinOp::FloorDivide => Ok(Float((x / y).floor())),
+                // The remainder takes the divisor's sign; `x - floor(x / y) * y` would lose
+                // precision, or overflow, where the remainder itself is exact.
                 (Some(x), Some(y)) => {
-                    let q = (x / y).floor();
-                    Ok(Float(if op == BinOp::FloorDivide {
-                        q
+                    let r = x % y;
+                    Ok(Float(if r != 0.0 && (r < 0.0) != (y < 0.0) {
+                        r + y
                     } else {
-                        x - q * y
+                        r
                     }))
                 }
                 _ => Err(mismatch()),
@@ -1928,12 +2083,11 @@ fn fold(op: BinOp, a: &Const, b: &Const) -> Result<Const, String> {
             _ => Err(mismatch()),
         },
         BinOp::LeftShift | BinOp::RightShift => match (a, b) {
-            (Int(_), Int(n)) if *n < 0 => Err("a negative shift count".to_owned()),
-            (Int(x), Int(n)) if op == BinOp::RightShift => Ok(Int(if *n >= 64 {
-                if *x < 0 { -1 } else { 0 }
-            } else {
-                x >> n
-            })),
+            // As at run time (4.4), and unlike Starlark, a count outside 0 to 63 is an error.
+            (Int(_), Int(n)) if !(0..64).contains(n) => {
+                Err(format!("the shift count {n} is outside 0 to 63 (4.4)"))
+            }
+            (Int(x), Int(n)) if op == BinOp::RightShift => Ok(Int(x >> n)),
             (Int(x), Int(n)) => {
                 // A Starlark integer grows rather than losing bits; the result must fit.
                 let shifted = u32::try_from(*n)
@@ -1947,18 +2101,30 @@ fn fold(op: BinOp, a: &Const, b: &Const) -> Result<Const, String> {
     }
 }
 
+/// Starlark's total order on floats: NaN equals NaN and is greater than every other float.
+fn float_order(x: f64, y: f64) -> std::cmp::Ordering {
+    use std::cmp::Ordering::*;
+    match (x.is_nan(), y.is_nan()) {
+        (true, true) => Equal,
+        (true, false) => Greater,
+        (false, true) => Less,
+        (false, false) => x.partial_cmp(&y).unwrap_or(Equal),
+    }
+}
+
 /// Starlark equality: numbers compare by value across `int` and `float`; other values of
 /// different types are never equal.
 fn equal(a: &Const, b: &Const) -> bool {
     match (a, b) {
         (Const::Int(_) | Const::Float(_), Const::Int(_) | Const::Float(_)) => match (a, b) {
             (Const::Int(x), Const::Int(y)) => x == y,
+            (Const::Float(x), Const::Float(y)) => float_order(*x, *y).is_eq(),
             _ => number(a) == number(b),
         },
-        (Const::List(x), Const::List(y)) => {
-            x.len() == y.len() && x.iter().zip(y).all(|(p, q)| equal(p, q))
+        (Const::List(x, _), Const::List(y, _)) => {
+            x.len() == y.len() && x.iter().zip(y.iter()).all(|(p, q)| equal(p, q))
         }
-        (Const::Dict(x), Const::Dict(y)) => {
+        (Const::Dict(x, _), Const::Dict(y, _)) => {
             x.len() == y.len()
                 && x.iter()
                     .all(|(k, v)| y.iter().any(|(k2, v2)| k == k2 && equal(v, v2)))
@@ -1976,11 +2142,11 @@ fn fold_index(object: &Const, index: &Const) -> Result<Const, String> {
             .ok_or_else(|| format!("index {n} is out of range"))
     };
     match (object, index) {
-        (Const::List(items), Const::Int(n)) => Ok(items[position(*n, items.len())?].clone()),
+        (Const::List(items, _), Const::Int(n)) => Ok(items[position(*n, items.len())?].clone()),
         (Const::Bytes(bytes), Const::Int(n)) => {
             Ok(Const::Int(i64::from(bytes[position(*n, bytes.len())?])))
         }
-        (Const::Dict(entries), Const::Str(key)) => entries
+        (Const::Dict(entries, _), Const::Str(key)) => entries
             .iter()
             .find(|(k, _)| k == key)
             .map(|(_, v)| v.clone())
@@ -1997,7 +2163,7 @@ fn fold_index(object: &Const, index: &Const) -> Result<Const, String> {
 /// are folded; the rest wait for their own lowering.
 fn fold_builtin(name: &str, args: &[Const]) -> Result<Const, String> {
     match (name, args) {
-        ("len", [Const::Bytes(_) | Const::List(_) | Const::Dict(_)]) => {
+        ("len", [Const::Bytes(_) | Const::List(..) | Const::Dict(..)]) => {
             Ok(Const::Int(args[0].len() as i64))
         }
         ("abs", [Const::Int(n)]) => n
@@ -2015,12 +2181,14 @@ fn fold_builtin(name: &str, args: &[Const]) -> Result<Const, String> {
         ("float", [Const::Float(f)]) => Ok(Const::Float(*f)),
         ("min" | "max", [_, _, ..]) => {
             let mut best = args[0].clone();
+            // The first of equal values is kept, as in Starlark.
+            let better = if name == "min" {
+                BinOp::Less
+            } else {
+                BinOp::Greater
+            };
             for arg in &args[1..] {
-                let less = match fold(BinOp::Less, arg, &best)? {
-                    Const::Bool(b) => b,
-                    _ => false,
-                };
-                if (name == "min") == less {
+                if fold(better, arg, &best)? == Const::Bool(true) {
                     best = arg.clone();
                 }
             }
@@ -2034,11 +2202,11 @@ fn fold_builtin(name: &str, args: &[Const]) -> Result<Const, String> {
 
 fn fold_method(s: &str, method: &str, args: &[Const]) -> Result<Const, String> {
     match (method, args) {
-        ("upper", []) => Ok(Const::Str(s.to_uppercase())),
-        ("lower", []) => Ok(Const::Str(s.to_lowercase())),
-        ("strip", []) => Ok(Const::Str(s.trim().to_owned())),
-        ("startswith", [Const::Str(p)]) => Ok(Const::Bool(s.starts_with(p.as_str()))),
-        ("endswith", [Const::Str(p)]) => Ok(Const::Bool(s.ends_with(p.as_str()))),
+        ("upper", []) => Ok(Const::str(s.to_uppercase())),
+        ("lower", []) => Ok(Const::str(s.to_lowercase())),
+        ("strip", []) => Ok(Const::str(s.trim())),
+        ("startswith", [Const::Str(p)]) => Ok(Const::Bool(s.starts_with(&**p))),
+        ("endswith", [Const::Str(p)]) => Ok(Const::Bool(s.ends_with(&**p))),
         _ => Err(format!(
             "`.{method}` with these arguments is not lowered yet (2.4)"
         )),

@@ -1,6 +1,6 @@
 //! Resolving the typed rows of a definition into a [`Definition`]: references between tables,
 //! variant scoping, and the rules of `docs/csv-tables.md` sections 3 and 4 that compare rows.
-//! The field rules of section 5 and the `ir.fbs` rules of section 6 are not checked here.
+//! [`resolve`] then runs the rules of single fields (`fields.rs`) as the next stage (ADR-298).
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 

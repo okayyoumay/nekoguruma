@@ -13,7 +13,7 @@ ngr-agent run --vci <name> --mode <device|user> --program <file> [--api <j2534|d
 | Option | Meaning |
 |---|---|
 | `--vci` | The library name, resolved the same way by the agent (step 3) and the worker service (design 7.1.1). For J2534 v04.04: the registry key name on Windows, the `Name` of a registration definition on Linux. For the D-PDU API: the `SHORT_NAME` of an implementation in the root description file |
-| `--api` | The API the VCI's library implements: `j2534` (J2534 v04.04, `j2534-0404-service`; the default) or `dpdu` (the ISO 22900-2 D-PDU API, `iso22900-service`). The names are those of a VCI profile's `standard.kind` (`schemas/vci-profile.schema.json`) |
+| `--api` | The API the VCI's library implements: `j2534` (J2534 v04.04, `j2534-0404-service`; the default) or `dpdu` (the D-PDU API, `iso22900-service`). The names are those of a VCI profile's `standard.kind` (`schemas/vci-profile.schema.json`) |
 | `--mode` | The device's operating mode (design 6.2), `device` or `user`. Required: the mode is fixed per device at installation, and this command, which has no installation of its own, takes it from the command line rather than defaulting to either. It is passed to the worker (ADR-281 Decision item 2); design 7.2 gives it its meaning for a failed library check: device mode refuses the library, user mode reports the findings and loads it. Both worker services apply it to the checks they run before loading |
 | `--program` | IR program file: a `diag_ir::Program` serialized as JSON |
 | `--workers` | Directory of worker builds, laid out as `<dir>/<ABI name>/j2534-0404-service[.exe]` and `<dir>/<ABI name>/iso22900-service[.exe]` (design 7.3). Default: `workers` next to the `ngr-agent` executable |

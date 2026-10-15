@@ -28,9 +28,9 @@ use worker_host::service::{
 /// names are those of a VCI profile's `standard.kind` (`schemas/vci-profile.schema.json`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Api {
-    /// SAE J2534 v04.04, loaded by `j2534-0404-service`.
+    /// J2534 v04.04, loaded by `j2534-0404-service`.
     J2534,
-    /// The ISO 22900-2 D-PDU API, loaded by `iso22900-service`.
+    /// The D-PDU API, loaded by `iso22900-service`.
     Dpdu,
 }
 
@@ -331,6 +331,9 @@ mod tests {
                 (RegistryViewMode::W32, Some(Abi::WinX86)),
             ]
         );
+        // The D-PDU API lookup reads the same view for each build.
+        let views: Vec<_> = RESOLUTIONS.iter().map(registry_view).collect();
+        assert_eq!(views, [RegistryView::Wow64_64, RegistryView::Wow64_32]);
     }
 
     #[test]

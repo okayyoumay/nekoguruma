@@ -43,7 +43,9 @@ directory, a link to nothing) is rejected (`CSV_UNKNOWN_FILE`).
 | `flash_segments.csv` | no | 4.12 | `FlashSegment` |
 
 The table conversion produces the declaration part of one `EcuDocument` per variant (design
-8.2.6), with `source_format` set to `csv-starlark` (ADR-254). Which procedure a document carries
+8.2.6), with `source_format` set to `csv-starlark` (ADR-254). In `diag-frontend`,
+`convert::to_ir` converts a definition that `tables::resolve` accepted (section 7) and returns
+the documents with the catalogs of 4.4. Which procedure a document carries
 in `EcuDocument.procedure`, and how a directory with several procedure files is packaged, belong
 to the Starlark lowering, not to this format. Monitor sets (`EcuVariant.monitor_sets`) and `CompuBytecode` have no
 table in this version: the converter emits no monitor set, and a conversion kind other than those

@@ -291,6 +291,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-299](ADR-299-iso22900-mock-answers-from-sim-ecu.md) | iso22900-mock Answers ComPrimitives from sim-ecu | Accepted | `iso22900-mock` ComPrimitive events, `__mock_sim_ecu_control`, `NGR_SIM_ECU_CONFIG` |
 | [ADR-300](ADR-300-statically-resolved-function-features-in-starlark.md) | Statically Resolved Lambdas, Nested Functions and Keyword Arguments in Starlark | Accepted (the Consequences' rule for sections in a nested `def` superseded by ADR-301) | `diag-frontend` Starlark subset spec, design 8.4 |
 | [ADR-301](ADR-301-starlark-sections-are-whole-functions.md) | Starlark Sections Are Whole Functions | Accepted | `diag-frontend` Starlark subset spec and checker, design 8.4 |
+| [ADR-302](ADR-302-decoded-shape-of-nested-layouts.md) | Decoded Shape of Nested Layouts | Accepted | `diag-ir` decoder, design 8.2.2 |
 | [ADR-303](ADR-303-starlark-nesting-bounds-before-parsing.md) | Starlark Nesting Bounds Checked Before Parsing | Accepted | `diag-frontend` Starlark subset spec and checker, design 8.4 |
 
 ## Status Legend
@@ -693,6 +694,7 @@ the predecessor repository these ADRs came from.
 - ADR-298
 - ADR-300 (the Consequences' rule for sections in a nested `def` superseded by ADR-301)
 - ADR-301
+- ADR-302
 - ADR-303
 
 ### Acquired Data & Monitoring

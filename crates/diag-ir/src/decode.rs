@@ -2,21 +2,46 @@
 //!
 //! [`decode_positive_response`] checks a response's SID and prefix, extracts each field of
 //! `PositiveResponse.fields` as ISO 22901-1 (2008) 7.3.6.3 describes, and applies the field's
-//! conversion (`Compu`). [`decode_dtc_fields`] decodes one of a DTC's flat field lists the same
-//! way, from a byte the caller states. Fields with a shape (nested layouts, ADR-242) and
-//! `CompuBytecode` are not decoded here yet; they fail with [`DecodeError::Unsupported`].
+//! conversion (`Compu`). [`decode_dtc_fields`] decodes one of a DTC's field lists the same way,
+//! from a byte the caller states. A field with a shape follows its nested layout (ADR-242) and
+//! decodes to a [`PhysicalValue::Group`], [`PhysicalValue::Repeat`] or
+//! [`PhysicalValue::Select`] (ADR-302). `CompuBytecode` is not evaluated here yet; it fails with
+//! [`DecodeError::Unsupported`].
+
+use std::collections::HashMap;
 
 use flatbuffers::{ForwardsUOffset, Vector};
 use thiserror::Error;
 
 use crate::declaration::{
-    ByteOrder, Compu, DataKind, DtcDefinition, Field, LengthKind, Placement, PositiveResponse,
-    Shape, Termination,
+    ByteOrder, Compu, DataKind, DtcDefinition, Field, Layout, LengthKind, Placement,
+    PositiveResponse, RepeatCount, Shape, Termination,
 };
+
+/// The nested layouts a document's fields refer to by id: `EcuVariant.layouts`, in id order
+/// (the loader checks the order).
+pub type Layouts<'a> = Option<Vector<'a, ForwardsUOffset<Layout<'a>>>>;
+
+/// The most nested layouts one message may go through (ADR-242 item 7).
+pub const MAX_NESTED_LAYOUTS: usize = 16;
+
+/// The most decoded fields and repeated items one message may give, nested ones included
+/// (ADR-242 item 7, ADR-302).
+pub const MAX_DECODED_VALUES: usize = 65_536;
+
+/// The most bytes of names, byte strings and text one message may decode to (ADR-302).
+/// Absolute placement lets nested fields read the same bytes many times over, so the message's
+/// length does not bound this.
+pub const MAX_DECODED_BYTES: usize = 16 << 20;
+
+/// The most case, scale, text-table and interpolation entries one message's decoding may look
+/// at (ADR-302), so a long table shared by many decoded occurrences cannot take unbounded time.
+pub const MAX_TABLE_ENTRIES: usize = 16 << 20;
 
 /// A decoded value. Before a conversion it is the field's internal value; after one, the
 /// physical value: a float for every conversion except a text table, which keeps the internal
-/// value and reports its text by id ([`DecodedField::text_id`]).
+/// value and reports its text by id ([`DecodedField::text_id`]). A field with a shape decodes
+/// to the fields of its nested layout instead (ADR-302).
 #[derive(Debug, Clone, PartialEq)]
 pub enum PhysicalValue {
     /// A `Uint` or `Bcd` field (BCD as the number its digits spell).
@@ -29,6 +54,17 @@ pub enum PhysicalValue {
     Text(String),
     /// A `Bytes` field.
     Bytes(Vec<u8>),
+    /// A `Group`: the fields of its one layout occurrence.
+    Group(Vec<DecodedField>),
+    /// A `Repeat`: the fields of each item, in message order.
+    Repeat(Vec<Vec<DecodedField>>),
+    /// A `Select`: the case the key chose and the fields of its layout.
+    Select {
+        /// The index of the chosen case in `Select.cases`; `None` for the default case.
+        case: Option<usize>,
+        /// The fields of the chosen layout; empty for a case without one.
+        fields: Vec<DecodedField>,
+    },
 }
 
 /// One decoded field of a response.
@@ -73,8 +109,9 @@ pub enum DecodeError {
         /// The message's length.
         len: usize,
     },
-    /// The field reaches past the end of the message.
-    #[error("field {field} reaches past the end of the response")]
+    /// The field reaches past the end of the message, or of the nested layout or fixed-size
+    /// item that holds it.
+    #[error("field {field} reaches past the end of the response or of its layout")]
     Truncated {
         /// The field.
         field: u32,
@@ -107,8 +144,20 @@ pub enum DecodeError {
         /// What is wrong.
         reason: &'static str,
     },
-    /// The field needs what this decoder does not do yet: a shape (nested layout) or a
-    /// `CompuBytecode` conversion.
+    /// The field goes through more than [`MAX_NESTED_LAYOUTS`] nested layouts.
+    #[error("field {field} goes through more than {MAX_NESTED_LAYOUTS} nested layouts")]
+    TooDeep {
+        /// The field whose layout is one too many.
+        field: u32,
+    },
+    /// The message decodes to more than [`MAX_DECODED_VALUES`] fields and items.
+    #[error("the response decodes to more than {MAX_DECODED_VALUES} values")]
+    TooManyValues,
+    /// Decoding the message needs more than [`MAX_DECODED_BYTES`] bytes of names and values, or
+    /// looks at more than [`MAX_TABLE_ENTRIES`] table entries.
+    #[error("the response is too large to decode")]
+    TooLarge,
+    /// The field needs what this decoder does not do yet: a `CompuBytecode` conversion.
     #[error("field {field}: {what} is not supported")]
     Unsupported {
         /// The field.
@@ -119,7 +168,7 @@ pub enum DecodeError {
 }
 
 /// Decodes `message`, a whole positive response starting with its SID, through `response`'s
-/// flat fields, in array order.
+/// fields, in array order; `layouts` are the document's nested layouts.
 ///
 /// The SID must equal `PositiveResponse.sid` and the bytes after it must start with
 /// `PositiveResponse.prefix`. Field positions count from the SID (`ir.fbs`, `Placement`); an
@@ -127,6 +176,7 @@ pub enum DecodeError {
 /// read and are not an error.
 pub fn decode_positive_response(
     response: &PositiveResponse<'_>,
+    layouts: Layouts<'_>,
     message: &[u8],
 ) -> Result<Vec<DecodedField>, DecodeError> {
     let (&sid, rest) = message.split_first().ok_or(DecodeError::Empty)?;
@@ -141,7 +191,7 @@ pub fn decode_positive_response(
         return Err(DecodeError::PrefixMismatch);
     }
     match response.fields() {
-        Some(fields) => decode_fields(fields, message, 1 + prefix.len()),
+        Some(fields) => Decoder::new(layouts, message).top(fields, 1 + prefix.len()),
         None => Ok(Vec::new()),
     }
 }
@@ -158,7 +208,7 @@ pub enum DtcFields {
 }
 
 /// Decodes one of `dtc`'s field lists from `message`, with the list's layout starting at byte
-/// `start` of it.
+/// `start` of it; `layouts` are the document's nested layouts.
 ///
 /// The fields are decoded as [`decode_positive_response`] decodes a response's, in array order,
 /// but their positions count from `start`: an `Absolute` field at bit offset 0 begins at byte
@@ -170,6 +220,7 @@ pub enum DtcFields {
 /// does not have decodes to no fields.
 pub fn decode_dtc_fields(
     dtc: &DtcDefinition<'_>,
+    layouts: Layouts<'_>,
     which: DtcFields,
     message: &[u8],
     start: usize,
@@ -186,48 +237,459 @@ pub fn decode_dtc_fields(
         start,
         len: message.len(),
     })?;
-    decode_fields(fields, rest, 0)
+    Decoder::new(layouts, rest).top(fields, 0)
 }
 
-/// Decodes a flat field array over `message`; `start` is the byte where an `AfterPrevious`
-/// first field starts.
-fn decode_fields(
-    fields: Vector<'_, ForwardsUOffset<Field<'_>>>,
-    message: &[u8],
-    start: usize,
-) -> Result<Vec<DecodedField>, DecodeError> {
-    // Not reserved from fields.len(): the first field may fail at once.
-    let mut decoded: Vec<DecodedField> = Vec::new();
-    // The byte edge after the previous field.
-    let mut edge = start;
-    for field in fields {
-        let id = field.id();
-        if field.shape_type() != Shape::NONE {
-            return Err(DecodeError::Unsupported {
-                field: id,
-                what: "a nested layout (shape)",
+type Fields<'a> = Vector<'a, ForwardsUOffset<Field<'a>>>;
+
+/// What a later field may need of a decoded one: a length or count (its physical value, when
+/// numeric) and a key or marker (its internal value as an integer, ADR-242 item 5).
+#[derive(Clone, Copy)]
+struct Seen {
+    /// The physical value, when it is a number.
+    number: Option<Number>,
+    /// The internal value as a key: an integer, or bytes or a string of up to 8 bytes read as
+    /// a big-endian integer and stored bit for bit in an `i64`.
+    key: Option<Key>,
+}
+
+#[derive(Clone, Copy)]
+enum Number {
+    Unsigned(u64),
+    Signed(i64),
+    Float(f64),
+}
+
+/// The state of decoding one message: its bytes, the layouts, the fields decoded so far that
+/// later ones may refer to, and the limits.
+struct Decoder<'a, 'm> {
+    layouts: Layouts<'a>,
+    message: &'m [u8],
+    /// The fields of each layout occurrence being decoded, by id, innermost last; a later
+    /// occurrence of an id replaces an earlier one, so a reference finds the latest.
+    scopes: Vec<HashMap<u32, Seen>>,
+    /// Decoded fields and items so far, nested ones included.
+    values: usize,
+    /// Bytes of names and values decoded so far.
+    bytes: usize,
+    /// Table entries looked at so far.
+    entries: usize,
+}
+
+impl<'a, 'm> Decoder<'a, 'm> {
+    fn new(layouts: Layouts<'a>, message: &'m [u8]) -> Self {
+        Decoder {
+            layouts,
+            message,
+            scopes: Vec::new(),
+            values: 0,
+            bytes: 0,
+            entries: 0,
+        }
+    }
+
+    /// Decodes a top-level field array, whose positions count from byte 0 and whose first
+    /// `AfterPrevious` field starts at `first`.
+    fn top(mut self, fields: Fields<'_>, first: usize) -> Result<Vec<DecodedField>, DecodeError> {
+        let end = self.message.len();
+        self.layout(fields, 0, first, end)
+            .map(|(decoded, _)| decoded)
+    }
+
+    /// Decodes one layout occurrence whose fields' positions count from byte `base`, whose first
+    /// `AfterPrevious` field starts at `first`, and whose fields must end by byte `end`. Returns
+    /// the fields and the byte edge after the one that ends last.
+    fn layout(
+        &mut self,
+        fields: Fields<'_>,
+        base: usize,
+        first: usize,
+        end: usize,
+    ) -> Result<(Vec<DecodedField>, usize), DecodeError> {
+        self.scopes.push(HashMap::new());
+        let result = self.fields(fields, base, first, end);
+        self.scopes.pop();
+        result
+    }
+
+    fn fields(
+        &mut self,
+        fields: Fields<'_>,
+        base: usize,
+        first: usize,
+        end: usize,
+    ) -> Result<(Vec<DecodedField>, usize), DecodeError> {
+        let window = &self.message[..end];
+        // Not reserved from fields.len(): the first field may fail at once.
+        let mut decoded: Vec<DecodedField> = Vec::new();
+        // The byte edge after the previous field, and after the field that ends last.
+        let mut edge = first;
+        let mut extent = first;
+        for field in fields {
+            let id = field.id();
+            let (byte, bit) = position(&field, base, edge)?;
+            let (value, text_id, after) = if field.shape_type() == Shape::NONE {
+                let (internal, after) = extract(self, &field, window, byte, bit)?;
+                let key = key_of(&field, &internal);
+                let mut visited = 0;
+                let converted = convert(&field, internal, &mut visited);
+                self.scan(visited)?;
+                let (value, text_id) = converted?;
+                self.remember(
+                    id,
+                    Seen {
+                        number: number_of(&value),
+                        key,
+                    },
+                );
+                (value, text_id, after)
+            } else {
+                if bit != 0 {
+                    return Err(plan(
+                        &field,
+                        "a nested layout that does not start at a byte edge",
+                    ));
+                }
+                // Even a shaped field that consumes nothing must start within its layout.
+                if byte > end {
+                    return Err(truncated(&field));
+                }
+                let (value, after) = self.shaped(&field, byte, end)?;
+                (value, 0, after)
+            };
+            edge = after;
+            extent = extent.max(after);
+            let name = field.short_name().unwrap_or_default();
+            let value_bytes = match &value {
+                PhysicalValue::Bytes(b) => b.len(),
+                PhysicalValue::Text(t) => t.len(),
+                _ => 0,
+            };
+            self.count_value(name.len().saturating_add(value_bytes))?;
+            decoded.push(DecodedField {
+                id,
+                short_name: name.to_owned(),
+                value,
+                text_id,
+                unit_id: field.unit_id(),
             });
         }
-        let (byte, bit) = position(&field, edge)?;
-        let (internal, end) = extract(&field, message, byte, bit, &decoded)?;
-        edge = end;
-        let (value, text_id) = convert(&field, internal)?;
-        decoded.push(DecodedField {
-            id,
-            short_name: field.short_name().unwrap_or_default().to_owned(),
-            value,
-            text_id,
-            unit_id: field.unit_id(),
-        });
+        Ok((decoded, extent))
     }
-    Ok(decoded)
+
+    /// Counts one decoded field or item of `bytes` bytes against the limits.
+    fn count_value(&mut self, bytes: usize) -> Result<(), DecodeError> {
+        self.values += 1;
+        if self.values > MAX_DECODED_VALUES {
+            return Err(DecodeError::TooManyValues);
+        }
+        self.bytes = self.bytes.saturating_add(bytes);
+        if self.bytes > MAX_DECODED_BYTES {
+            return Err(DecodeError::TooLarge);
+        }
+        Ok(())
+    }
+
+    /// Counts `entries` table entries looked at against the limit.
+    fn scan(&mut self, entries: usize) -> Result<(), DecodeError> {
+        self.entries = self.entries.saturating_add(entries);
+        if self.entries > MAX_TABLE_ENTRIES {
+            return Err(DecodeError::TooLarge);
+        }
+        Ok(())
+    }
+
+    fn remember(&mut self, id: u32, seen: Seen) {
+        if let Some(scope) = self.scopes.last_mut() {
+            scope.insert(id, seen);
+        }
+    }
+
+    /// The latest decoded field `id` in this layout occurrence or an enclosing one.
+    fn seen(&self, id: u32) -> Option<Seen> {
+        self.scopes
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(&id).copied())
+    }
+
+    /// Decodes a field with a shape starting at byte `start`, with the enclosing layout ending
+    /// at byte `end`. Returns the value and the byte edge after the field.
+    fn shaped(
+        &mut self,
+        field: &Field<'_>,
+        start: usize,
+        end: usize,
+    ) -> Result<(PhysicalValue, usize), DecodeError> {
+        if let Some(group) = field.shape_as_group() {
+            let layout = self.find(field, group.layout_id())?;
+            let (fields, after) = self.nested(field, &layout, start, end)?;
+            Ok((PhysicalValue::Group(fields), after))
+        } else if let Some(repeat) = field.shape_as_repeat() {
+            let layout = self.find(field, repeat.layout_id())?;
+            let mut items = Vec::new();
+            let mut at = start;
+            match repeat.count() {
+                RepeatCount::Fixed => {
+                    let size = as_usize(repeat.item_byte_size());
+                    if size == 0 {
+                        return Err(plan(field, "a fixed repetition with an item size of 0"));
+                    }
+                    for _ in 0..repeat.fixed_count() {
+                        let item_end = add(field, at, size)?;
+                        if item_end > end {
+                            return Err(truncated(field));
+                        }
+                        let (fields, _) = self.nested(field, &layout, at, item_end)?;
+                        self.count_value(0)?;
+                        items.push(fields);
+                        at = item_end;
+                    }
+                }
+                RepeatCount::FromField => {
+                    let count = self.count(field, repeat.count_field_id())?;
+                    for _ in 0..count {
+                        let (fields, after) = self.nested(field, &layout, at, end)?;
+                        if after == at {
+                            break;
+                        }
+                        self.count_value(0)?;
+                        items.push(fields);
+                        at = after;
+                    }
+                }
+                RepeatCount::UntilMarker => {
+                    let Some(marker) = repeat.marker() else {
+                        return Err(plan(field, "an end-marker repetition without a marker"));
+                    };
+                    if marker.shape_type() != Shape::NONE
+                        || marker.length_kind() != LengthKind::Fixed
+                        || marker.placement() != Placement::Absolute
+                        || marker.bit_offset() != 0
+                    {
+                        return Err(plan(
+                            field,
+                            "a marker that is not a fixed-length field at offset 0",
+                        ));
+                    }
+                    // A key is at most 64 bits (ADR-242 item 5); checked before any marker is
+                    // read, so a wide marker cannot be copied at every item.
+                    if marker.bit_length() > 64 {
+                        return Err(plan(field, "a marker wider than 64 bits"));
+                    }
+                    let (lower, upper) = (repeat.marker_lower(), repeat.marker_upper());
+                    while at < end {
+                        let window = &self.message[..end];
+                        match extract(self, &marker, window, at, 0) {
+                            Ok((internal, _)) => {
+                                let Some(key) = key_of(&marker, &internal) else {
+                                    return Err(plan(field, "a marker that is not an integer"));
+                                };
+                                if key.within(lower, upper) {
+                                    break;
+                                }
+                            }
+                            // Too few bytes left for a marker, or bytes that are no value of the
+                            // marker's type: no marker, so an item follows.
+                            Err(
+                                DecodeError::Truncated { .. } | DecodeError::InvalidValue { .. },
+                            ) => {}
+                            Err(error) => return Err(error),
+                        }
+                        let (fields, after) = self.nested(field, &layout, at, end)?;
+                        if after == at {
+                            break;
+                        }
+                        self.count_value(0)?;
+                        items.push(fields);
+                        at = after;
+                    }
+                }
+                RepeatCount::UntilEndOfPdu => {
+                    while at < end {
+                        let (fields, after) = self.nested(field, &layout, at, end)?;
+                        if after == at {
+                            break;
+                        }
+                        self.count_value(0)?;
+                        items.push(fields);
+                        at = after;
+                    }
+                }
+                _ => return Err(plan(field, "an unknown repetition count")),
+            }
+            Ok((PhysicalValue::Repeat(items), at))
+        } else if let Some(select) = field.shape_as_select() {
+            let key = self
+                .seen(select.key_field_id())
+                .ok_or_else(|| plan(field, "a key field that is not decoded before it"))?
+                .key
+                .ok_or_else(|| plan(field, "a key that is not an integer or up to 8 bytes"))?;
+            let found = select.cases().map(|cases| {
+                let at = cases.iter().position(|c| key.within(c.lower(), c.upper()));
+                // The cases looked at: up to the match, or all of them.
+                (
+                    at.map_or(cases.len(), |at| at + 1),
+                    at.map(|at| (Some(at), cases.get(at).layout_id())),
+                )
+            });
+            self.scan(found.map_or(0, |(looked, _)| looked))?;
+            let chosen = found.and_then(|(_, chosen)| chosen);
+            let (case, layout_id) = match chosen {
+                Some(chosen) => chosen,
+                None if select.has_default() => (None, select.default_layout_id()),
+                None => return Err(invalid(field, "a key that no case matches")),
+            };
+            if layout_id == 0 {
+                return Ok((
+                    PhysicalValue::Select {
+                        case,
+                        fields: Vec::new(),
+                    },
+                    start,
+                ));
+            }
+            let layout = self.find(field, layout_id)?;
+            let (fields, after) = self.nested(field, &layout, start, end)?;
+            Ok((PhysicalValue::Select { case, fields }, after))
+        } else {
+            Err(plan(field, "an unknown shape"))
+        }
+    }
+
+    /// The layout `id` refers to.
+    fn find(&self, field: &Field<'_>, id: u32) -> Result<Layout<'a>, DecodeError> {
+        self.layouts
+            .and_then(|layouts| {
+                layouts.lookup_by_key(id, |layout, id| layout.key_compare_with_value(*id))
+            })
+            .ok_or_else(|| plan(field, "a layout id that names no layout"))
+    }
+
+    /// Decodes one occurrence of `layout` starting at byte `start`, inside an enclosing layout
+    /// or item that ends at byte `end`. A layout with a `byte_size` ends there and its fields
+    /// must end within it; otherwise it ends after the field that ends last.
+    fn nested(
+        &mut self,
+        field: &Field<'_>,
+        layout: &Layout<'_>,
+        start: usize,
+        end: usize,
+    ) -> Result<(Vec<DecodedField>, usize), DecodeError> {
+        // The top level is one scope; each nested layout adds one.
+        if self.scopes.len() > MAX_NESTED_LAYOUTS {
+            return Err(DecodeError::TooDeep { field: field.id() });
+        }
+        let size = as_usize(layout.byte_size());
+        let bound = if size == 0 {
+            end
+        } else {
+            let bound = add(field, start, size)?;
+            if bound > end {
+                return Err(truncated(field));
+            }
+            bound
+        };
+        let Some(fields) = layout.fields() else {
+            return Ok((Vec::new(), if size == 0 { start } else { bound }));
+        };
+        let (decoded, extent) = self.layout(fields, start, start, bound)?;
+        Ok((decoded, if size == 0 { extent } else { bound }))
+    }
+
+    /// A `FromField` repetition's item count: the physical value of `count_field_id`.
+    fn count(&self, field: &Field<'_>, id: u32) -> Result<u64, DecodeError> {
+        let seen = self
+            .seen(id)
+            .ok_or_else(|| plan(field, "a count field that is not decoded before it"))?;
+        whole(field, seen, "a count that is negative or not whole")
+    }
 }
 
-/// The byte and the bit position (0 to 7, from the least significant bit) where a field starts.
-fn position(field: &Field<'_>, edge: usize) -> Result<(usize, u32), DecodeError> {
+/// The physical value of a referenced field as a whole, non-negative number.
+fn whole(field: &Field<'_>, seen: Seen, reason: &'static str) -> Result<u64, DecodeError> {
+    match seen.number {
+        Some(Number::Unsigned(n)) => Ok(n),
+        Some(Number::Signed(n)) => u64::try_from(n).map_err(|_| invalid(field, reason)),
+        Some(Number::Float(f)) if f >= 0.0 && f.fract() == 0.0 && f < u64::MAX as f64 => {
+            Ok(f as u64)
+        }
+        Some(Number::Float(_)) => Err(invalid(field, reason)),
+        None => Err(plan(field, "a referenced field that is not numeric")),
+    }
+}
+
+fn number_of(value: &PhysicalValue) -> Option<Number> {
+    match *value {
+        PhysicalValue::Unsigned(n) => Some(Number::Unsigned(n)),
+        PhysicalValue::Signed(n) => Some(Number::Signed(n)),
+        PhysicalValue::Float(f) => Some(Number::Float(f)),
+        _ => None,
+    }
+}
+
+/// A field's internal value as a key (ADR-242 item 5). A signed integer is compared as signed;
+/// an unsigned integer, and bytes or a string of up to 8 bytes read as a big-endian integer,
+/// are compared as unsigned, with the case or marker limits (stored bit for bit in `int64`) read
+/// as unsigned too. A float, or a longer byte string, is no key.
+fn key_of(field: &Field<'_>, internal: &PhysicalValue) -> Option<Key> {
+    // At most 9 bytes are rebuilt: enough to tell that a value is too long to be a key.
+    let bytes: Vec<u8> = match internal {
+        PhysicalValue::Unsigned(n) => return Some(Key::Unsigned(*n)),
+        PhysicalValue::Signed(n) => return Some(Key::Signed(*n)),
+        PhysicalValue::Bytes(b) => b.iter().copied().take(9).collect(),
+        // Each character is one byte of the message (`string_value`).
+        PhysicalValue::Text(t) if field.kind() == DataKind::Ascii => {
+            t.chars().take(9).map(|c| c as u8).collect()
+        }
+        PhysicalValue::Text(t) if field.kind() == DataKind::Utf8 => {
+            t.as_bytes().iter().copied().take(9).collect()
+        }
+        PhysicalValue::Text(t) if field.kind() == DataKind::Unicode2 => {
+            let little = field.byte_order() == ByteOrder::Little;
+            t.encode_utf16()
+                .take(5)
+                .flat_map(|u| {
+                    if little {
+                        u.to_le_bytes()
+                    } else {
+                        u.to_be_bytes()
+                    }
+                })
+                .collect()
+        }
+        _ => return None,
+    };
+    if bytes.len() > 8 {
+        return None;
+    }
+    Some(Key::Unsigned(
+        bytes.iter().fold(0u64, |acc, &b| (acc << 8) | u64::from(b)),
+    ))
+}
+
+/// A key or marker value, compared with the inclusive limits `lower..=upper` of `ir.fbs`.
+#[derive(Clone, Copy)]
+enum Key {
+    Signed(i64),
+    Unsigned(u64),
+}
+
+impl Key {
+    fn within(self, lower: i64, upper: i64) -> bool {
+        match self {
+            Key::Signed(k) => lower <= k && k <= upper,
+            Key::Unsigned(k) => (lower as u64) <= k && k <= (upper as u64),
+        }
+    }
+}
+
+/// The byte and the bit position (0 to 7, from the least significant bit) where a field starts,
+/// in a layout that starts at byte `base`.
+fn position(field: &Field<'_>, base: usize, edge: usize) -> Result<(usize, u32), DecodeError> {
     let offset = field.bit_offset();
     match field.placement() {
-        Placement::Absolute => Ok((as_usize(offset / 8), offset % 8)),
+        Placement::Absolute => Ok((add(field, base, as_usize(offset / 8))?, offset % 8)),
         Placement::AfterPrevious if offset <= 7 => Ok((edge, offset)),
         Placement::AfterPrevious => Err(plan(field, "an AfterPrevious bit position above 7")),
         _ => Err(plan(field, "an unknown placement")),
@@ -236,18 +698,18 @@ fn position(field: &Field<'_>, edge: usize) -> Result<(usize, u32), DecodeError>
 
 /// Extracts a field's internal value; returns it with the byte edge after the field.
 fn extract(
+    decoder: &Decoder<'_, '_>,
     field: &Field<'_>,
     message: &[u8],
     byte: usize,
     bit: u32,
-    decoded: &[DecodedField],
 ) -> Result<(PhysicalValue, usize), DecodeError> {
     let kind = field.kind();
     let string_like = is_string_like(kind);
     match field.length_kind() {
         LengthKind::Fixed => extract_with_width(field, message, byte, bit, field.bit_length()),
         LengthKind::FromField => {
-            let width = width_from_field(field, decoded)?;
+            let width = width_from_field(field, decoder)?;
             extract_with_width(field, message, byte, bit, width)
         }
         LengthKind::LeadingLength if string_like => {
@@ -384,30 +846,19 @@ fn byte_count(bit: u32, width: u32) -> usize {
 }
 
 /// A `FromField` length: the physical value of the field `length_field_id`, in bits, decoded
-/// earlier in the same array.
-fn width_from_field(field: &Field<'_>, decoded: &[DecodedField]) -> Result<u32, DecodeError> {
-    let source = decoded
-        .iter()
-        .rev()
-        .find(|d| d.id == field.length_field_id())
+/// earlier in the same layout occurrence or an enclosing one.
+fn width_from_field(field: &Field<'_>, decoder: &Decoder<'_, '_>) -> Result<u32, DecodeError> {
+    let seen = decoder
+        .seen(field.length_field_id())
         .ok_or_else(|| plan(field, "a length field that is not decoded before it"))?;
-    let bits = match source.value {
-        PhysicalValue::Unsigned(n) => Some(n),
-        PhysicalValue::Signed(n) => u64::try_from(n).ok(),
-        PhysicalValue::Float(f) if f >= 0.0 && f.fract() == 0.0 && f <= u32::MAX as f64 => {
-            Some(f as u64)
-        }
-        PhysicalValue::Float(_) => None,
-        PhysicalValue::Text(_) | PhysicalValue::Bytes(_) => {
-            return Err(plan(field, "a length field that is not numeric"));
-        }
-    };
-    bits.and_then(|b| u32::try_from(b).ok()).ok_or_else(|| {
-        invalid(
-            field,
-            "a length that is negative, not whole or above 2^32 - 1",
-        )
-    })
+    if seen.number.is_none() {
+        return Err(plan(field, "a length field that is not numeric"));
+    }
+    let reason = "a length that is negative, not whole or above 2^32 - 1";
+    whole(field, seen, reason)
+        .ok()
+        .and_then(|bits| u32::try_from(bits).ok())
+        .ok_or_else(|| invalid(field, reason))
 }
 
 /// Extracts a `Terminated` field at a byte edge (ISO 22901-1 (2008) 7.3.6.2, MIN-MAX-LENGTH-TYPE).
@@ -501,10 +952,13 @@ fn is_string_like(kind: DataKind) -> bool {
     )
 }
 
-/// Applies the field's conversion; returns the physical value and the text id.
+/// Applies the field's conversion; returns the physical value and the text id, and adds the
+/// table entries it looked at (scales and text entries up to the first match, all points and
+/// coefficients) to `visited`.
 fn convert(
     field: &Field<'_>,
     internal: PhysicalValue,
+    visited: &mut usize,
 ) -> Result<(PhysicalValue, u32), DecodeError> {
     let tag = field.compu_type();
     if tag == Compu::NONE || tag == Compu::CompuIdentity {
@@ -517,16 +971,14 @@ fn convert(
         });
     }
     if tag == Compu::CompuTextTable {
-        let text_id = text_table(field, &internal)?;
+        let text_id = text_table(field, &internal, visited)?;
         return Ok((internal, text_id));
     }
     let x = match internal {
         PhysicalValue::Unsigned(n) => n as f64,
         PhysicalValue::Signed(n) => n as f64,
         PhysicalValue::Float(f) => f,
-        PhysicalValue::Text(_) | PhysicalValue::Bytes(_) => {
-            return Err(plan(field, "a numeric conversion on bytes or a string"));
-        }
+        _ => return Err(plan(field, "a numeric conversion on bytes or a string")),
     };
     let result = if let Some(c) = field.compu_as_compu_linear() {
         linear(field, x * c.numerator() + c.offset(), c.denominator())?
@@ -536,16 +988,16 @@ fn convert(
         let Some(scales) = c.scales().filter(|s| !s.is_empty()) else {
             return Err(plan(field, "a scale-linear conversion without scales"));
         };
-        let scale = scales
-            .iter()
-            .find(|s| s.lower() <= x && x <= s.upper())
-            .ok_or_else(|| conversion(field, "no scale contains the value"))?;
+        let at = scales.iter().position(|s| s.lower() <= x && x <= s.upper());
+        *visited += at.map_or(scales.len(), |at| at + 1);
+        let scale = scales.get(at.ok_or_else(|| conversion(field, "no scale contains the value"))?);
         linear(
             field,
             x * scale.numerator() + scale.offset(),
             scale.denominator(),
         )?
     } else if let Some(c) = field.compu_as_compu_table_interp() {
+        *visited += c.points().map_or(0, |p| p.len());
         interpolate(field, c.points(), x)?
     } else if let Some(c) = field.compu_as_compu_rational() {
         let (Some(num), Some(den)) = (c.numerator_coeffs(), c.denominator_coeffs()) else {
@@ -554,6 +1006,7 @@ fn convert(
         if num.is_empty() || den.is_empty() {
             return Err(plan(field, "a rational conversion without coefficients"));
         }
+        *visited += num.len() + den.len();
         ratio(field, polynomial(num, x), polynomial(den, x))?
     } else {
         return Err(plan(field, "an unknown conversion"));
@@ -651,7 +1104,11 @@ fn interpolate(
 /// The text id a text table gives an integer internal value: the first entry whose closed
 /// range holds it, else the default text; with no default (0) the value has no result
 /// (ISO 22901-1 (2008) 7.3.6.6.1).
-fn text_table(field: &Field<'_>, internal: &PhysicalValue) -> Result<u32, DecodeError> {
+fn text_table(
+    field: &Field<'_>,
+    internal: &PhysicalValue,
+    visited: &mut usize,
+) -> Result<u32, DecodeError> {
     let x = match *internal {
         PhysicalValue::Unsigned(n) => i128::from(n),
         PhysicalValue::Signed(n) => i128::from(n),
@@ -665,11 +1122,13 @@ fn text_table(field: &Field<'_>, internal: &PhysicalValue) -> Result<u32, Decode
     let Some(table) = field.compu_as_compu_text_table() else {
         return Err(plan(field, "an unknown conversion"));
     };
-    let entry = table
-        .entries()
+    let entries = table.entries();
+    let at = entries
         .into_iter()
         .flatten()
-        .find(|e| i128::from(e.lower()) <= x && x <= i128::from(e.upper()));
+        .position(|e| i128::from(e.lower()) <= x && x <= i128::from(e.upper()));
+    *visited += at.map_or(entries.map_or(0, |e| e.len()), |at| at + 1);
+    let entry = at.zip(entries).map(|(at, entries)| entries.get(at));
     match (entry, table.default_text_id()) {
         (Some(entry), _) => Ok(entry.text_id()),
         (None, 0) => Err(conversion(

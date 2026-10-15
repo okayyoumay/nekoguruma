@@ -35,6 +35,11 @@ def helper(x, y):
     """Doc."""
     return x + y
 
+# @section uninterruptible expected=120000
+def write():
+    # @idempotency checkState
+    diag.flash_transfer(1)
+
 def main():
     total = helper(1, 2)
     res = diag.request(0x22, {"did": 0xF190})
@@ -48,30 +53,27 @@ def main():
     for i in range(count):
         if i > LIMIT:
             break
-    # @section uninterruptible expected=120000
-    # @idempotency checkState
-    diag.flash_transfer(1)
-    # @endsection
+    write()
     v = KEYS["a"] if total else -1
 "#,
     );
     assert_eq!(
         checked.annotations,
         [
-            Annotation::MaxIterations {
-                line: 18,
-                limit: 10
-            },
             Annotation::Section {
-                line: 22,
+                line: 9,
+                def: 10,
                 kind: SectionKind::Uninterruptible,
                 expected_millis: Some(120_000)
             },
             Annotation::Idempotency {
-                line: 23,
+                line: 11,
                 value: Idempotency::CheckState
             },
-            Annotation::EndSection { line: 25 },
+            Annotation::MaxIterations {
+                line: 23,
+                limit: 10
+            },
         ]
     );
 }
@@ -277,12 +279,15 @@ def main():
         pass
     # @maxIterations 5
     diag.log(1, \"not a loop\")
-    # @section uninteruptible
-    # @section interruptible expected=5 extra=1
     # @idempotency maybe
     # @frobnicate
     # @endsection
     x = \"# @not an annotation\"
+
+# @section uninteruptible
+# @section interruptible expected=5 extra=1
+def other():
+    pass
 ";
     let found = codes(source);
     assert!(
@@ -292,11 +297,13 @@ def main():
         "{found:?}"
     );
     let lines: Vec<u32> = found.iter().map(|(_, line)| *line).collect();
-    assert_eq!(lines, [2, 5, 7, 8, 9, 10, 11]);
+    assert_eq!(lines, [2, 5, 7, 8, 9, 12, 13]);
 }
 
+/// A section is a whole top-level `def`: the annotation must come directly before one, outside
+/// every function body (4.5, ADR-301).
 #[test]
-fn sections_pair_within_one_function_at_one_indentation() {
+fn a_section_marks_a_top_level_def() {
     let source = "\
 def helper():
     # @section uninterruptible
@@ -306,18 +313,151 @@ def main():
     if True:
         # @section interruptible
         pass
-    # @endsection
-    # @endsection
+    x = 1
+# @section interruptible
+    helper()
+
+# @section interruptible
+X = 1
 ";
-    let found = codes(source);
     assert_eq!(
-        found,
+        codes(source),
         [
             (StarCode::BadAnnotation, 2),
             (StarCode::BadAnnotation, 7),
-            (StarCode::BadAnnotation, 9),
             (StarCode::BadAnnotation, 10),
+            (StarCode::BadAnnotation, 13),
         ]
+    );
+}
+
+/// A comment after the last statement of a body belongs to that body, even when a top-level
+/// `def` follows it.
+#[test]
+fn a_section_comment_inside_the_previous_body_is_rejected() {
+    let source = "\
+def helper():
+    pass
+    # @section interruptible
+def main():
+    helper()
+";
+    assert_eq!(codes(source), [(StarCode::BadAnnotation, 3)]);
+}
+
+/// A comment inside a multi-line constant is not directly before the `def` after it.
+#[test]
+fn a_section_comment_inside_a_constant_is_rejected() {
+    let source = "\
+X = {
+    # @section interruptible
+    \"a\": 1,
+}
+def main():
+    pass
+";
+    assert_eq!(codes(source), [(StarCode::BadAnnotation, 2)]);
+}
+
+/// A `@section` written after a one-line `def` or inside the last call of the previous body is
+/// not directly before the next `def`.
+#[test]
+fn a_section_comment_in_the_previous_def_is_rejected() {
+    assert_eq!(
+        codes("def helper(): pass  # @section uninterruptible\ndef main():\n    helper()\n"),
+        [(StarCode::BadAnnotation, 1)]
+    );
+    let source = "\
+def helper():
+    diag.log(1,
+# @section uninterruptible
+        \"x\")
+def main():
+    helper()
+";
+    assert_eq!(codes(source), [(StarCode::BadAnnotation, 3)]);
+    // Comments and blank lines between functions are fine.
+    passes(
+        "def helper():\n    pass\n\n# Writes.\n# @section uninterruptible\n\n# More.\ndef main():\n    helper()\n",
+    );
+}
+
+#[test]
+fn a_def_takes_one_section() {
+    let source = "\
+# @section interruptible
+# @section uninterruptible
+def main():
+    pass
+";
+    assert_eq!(codes(source), [(StarCode::BadAnnotation, 2)]);
+}
+
+#[test]
+fn the_end_of_a_section_is_the_end_of_its_def() {
+    let source = "\
+# @section interruptible
+def main():
+    diag.wait(1)
+    # @endsection
+";
+    assert_eq!(codes(source), [(StarCode::BadAnnotation, 4)]);
+}
+
+/// A section function called from inside another section, directly or through a helper, is
+/// rejected at the call; calling one from outside every section is not (ADR-301).
+#[test]
+fn sections_do_not_nest() {
+    let source = "\
+# @section interruptible
+def inner():
+    diag.wait(1)
+
+def helper():
+    inner()
+
+# @section uninterruptible expected=10
+def outer():
+    inner()
+    helper()
+
+# @section recoveryRequired
+def last():
+    diag.wait(2)
+
+def main():
+    inner()
+    outer()
+    helper()
+    last()
+";
+    assert_eq!(
+        codes(source),
+        [(StarCode::BadAnnotation, 6), (StarCode::BadAnnotation, 10)]
+    );
+}
+
+/// A section function in a recursive cycle is reported as recursion only.
+#[test]
+fn recursion_through_a_section_is_reported_once() {
+    let source = "\
+# @section interruptible
+def a():
+    b()
+
+# @section interruptible
+def b():
+    a()
+
+def main():
+    a()
+";
+    let found = codes(source);
+    assert!(
+        found
+            .iter()
+            .all(|(code, _)| *code == StarCode::UnboundedNotAllowed),
+        "{found:?}"
     );
 }
 
@@ -512,14 +652,16 @@ fn an_annotation_belongs_to_the_function_its_comment_is_in() {
         ),
         [(StarCode::BadAnnotation, 3)]
     );
-    // A comment at the indentation of `def` is outside the body.
+    // A comment at the indentation of `def` is outside the body: it precedes the next top-level
+    // statement, here a constant rather than a `def`.
     assert_eq!(
-        codes("def main():\n    pass\n# @section interruptible\n    # @endsection\n\nX = 1\n"),
-        [(StarCode::BadAnnotation, 3), (StarCode::BadAnnotation, 4)]
+        codes("def main():\n    pass\n# @section interruptible\n\nX = 1\n"),
+        [(StarCode::BadAnnotation, 3)]
     );
     // A comment after the last statement of the body still belongs to it.
-    passes(
-        "def main():\n    # @section interruptible\n    diag.wait(1)\n    # @endsection\n\nX = 1\n",
+    assert_eq!(
+        codes("def main():\n    diag.wait(1)\n    # @idempotency safe\n\nX = 1\n"),
+        [(StarCode::BadAnnotation, 3)]
     );
 }
 
@@ -528,13 +670,11 @@ fn a_negative_annotation_value_is_out_of_range() {
     assert_eq!(
         codes(
             "def main():\n    # @maxIterations -1\n    for i in range(3):\n        pass\n    \
-             # @section uninterruptible expected=-1\n    pass\n    # @endsection\n"
+             pass\n\n# @section uninterruptible expected=-1\ndef write():\n    pass\n"
         ),
-        // The rejected `@section` leaves its `@endsection` unpaired.
         [
             (StarCode::ArgumentOutOfRange, 2),
-            (StarCode::ArgumentOutOfRange, 5),
-            (StarCode::BadAnnotation, 7),
+            (StarCode::ArgumentOutOfRange, 7),
         ]
     );
     assert_eq!(
@@ -917,18 +1057,17 @@ fn a_long_chain_of_functions_is_checked_in_linear_time() {
     );
 }
 
+/// A `@section` written after a statement is on that statement's line, so it is not directly
+/// before a `def`.
 #[test]
-fn a_section_pairs_by_the_indentation_of_its_lines() {
-    // The `#` columns line up, but the lines are at different indentation.
+fn an_inline_section_comment_is_judged_by_its_line() {
     assert_eq!(
-        codes(
-            "def main():\n    x = 1        # @section interruptible\n    if x:\n        y = 2    # @endsection\n"
-        ),
-        [(StarCode::BadAnnotation, 2), (StarCode::BadAnnotation, 4)]
+        codes("X = 1  # @section interruptible\ndef main():\n    pass\n"),
+        [(StarCode::BadAnnotation, 1)]
     );
-    // An inline opener and a standalone closer on lines of one indentation pair.
-    passes(
-        "def main():\n    x = 1  # @section interruptible\n    diag.wait(1)\n    # @endsection\n",
+    assert_eq!(
+        codes("def main():\n    x = 1  # @section interruptible\n    diag.wait(1)\n"),
+        [(StarCode::BadAnnotation, 2)]
     );
 }
 
@@ -1131,4 +1270,27 @@ fn nested_defs_in_a_loop_are_walked_once() {
             .iter()
             .any(|e| e.code == StarCode::DynamicKeyNotAllowed)
     );
+}
+
+/// The nesting check is one pass over the call graph, however many sections and calls there are.
+#[test]
+fn many_sections_are_checked_in_linear_time() {
+    let mut source = String::new();
+    for at in 0..2_000 {
+        source.push_str(&format!(
+            "def h{at}():\n    diag.wait(1)\n\n# @section interruptible\ndef s{at}():\n"
+        ));
+        for callee in 0..at.min(20) {
+            source.push_str(&format!("    h{callee}()\n"));
+        }
+        source.push_str("    pass\n\n");
+    }
+    source.push_str("def main():\n");
+    for at in 0..2_000 {
+        source.push_str(&format!("    s{at}()\n"));
+    }
+    let started = std::time::Instant::now();
+    let checked = passes(&source);
+    assert_eq!(checked.annotations.len(), 2_000);
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
 }

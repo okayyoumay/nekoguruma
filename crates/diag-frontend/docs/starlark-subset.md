@@ -27,7 +27,7 @@ language and are rejected, as are some base-language features this subset leaves
 Starlark already provides most of this: it has no `while`, no recursion, no exceptions, no
 classes and no access to files, the network or the clock. The subset below removes the
 remaining constructs the VM cannot represent (closures, function values other than the
-capture-free lambdas and function arguments of 2.6, comprehensions, `load`).
+capture-free functions and function arguments of 2.6, comprehensions, `load`).
 
 ---
 
@@ -46,8 +46,8 @@ A file without `main` is rejected (`STAR_NO_MAIN`).
 | Assignments | Plain assignment, augmented assignment (`+=` etc.) inside functions; top-level constants |
 | Operators | Arithmetic, comparison, logical (`and` `or` `not`), bitwise, conditional expression (`a if c else b`), `in` / `not in` |
 | Control flow | `if` / `elif` / `else`, `for ... in`, `break`, `continue`, `pass` |
-| Functions | Top-level `def` with positional parameters, calls to them, `return` |
-| Lambdas | Capture-free `lambda`, bound to a name or passed to a top-level `def` (2.6) |
+| Functions | Top-level `def` with positional and default parameters, calls to them with positional and keyword arguments (2.7), `return` |
+| Lambdas, nested `def` | Capture-free, bound to a name or passed as an argument (2.6) |
 | Literals | Integers, floats, strings, bytes (`b"..."`), booleans, lists, dicts (within the limits of 2.5) |
 | Indexing | Bytes index access and slices, constant-list index access, dict access with a string-literal key (2.5) |
 | Built-ins | The restricted list in 2.4 |
@@ -57,13 +57,14 @@ A file without `main` is rejected (`STAR_NO_MAIN`).
 
 | Syntax | Rationale | Error code |
 |---|---|---|
-| Nested `def`, a `lambda` that names a local, parameter or loop variable of the enclosing function, a `lambda` inside a `lambda` | The VM has no environment capture | `STAR_CLOSURE_NOT_ALLOWED` |
-| Functions as values outside 2.6 (returning a function, assigning it to another name, storing it in a list or dict, comparing it, passing it to a built-in or a `diag` function) | Callee cannot be resolved statically | `STAR_FUNCTION_VALUE_NOT_ALLOWED` |
+| A `lambda` or nested `def` that names a local, parameter, loop variable or bound function of the enclosing function; a `lambda` or `def` inside a `lambda` or nested `def`; a nested `def` inside `if` or `for` | The VM has no environment capture | `STAR_CLOSURE_NOT_ALLOWED` |
+| Functions as values outside 2.6 (returning a function, assigning it to another name, storing it in a list or dict, comparing it, passing it to a built-in or a `diag` function, using it as a default value) | Callee cannot be resolved statically | `STAR_FUNCTION_VALUE_NOT_ALLOWED` |
 | List and dict comprehensions | Not supported in version 1 (may be added later as a lowering to `for`) | `STAR_UNSUPPORTED_SYNTAX` |
 | `load` | One file = one procedure | `STAR_LOAD_NOT_ALLOWED` |
 | `while`, recursion | Not base Starlark; execution must stay finite | `STAR_UNBOUNDED_NOT_ALLOWED` |
 | Top-level statements other than constant assignments and `def` | The procedure runs from `main` only | `STAR_TOPLEVEL_STATEMENT_NOT_ALLOWED` |
-| `*args`, `**kwargs`, default and keyword-only parameters, keyword arguments to user functions | Not supported in version 1 | `STAR_UNSUPPORTED_SYNTAX` |
+| `*args`, `**kwargs`, keyword-only parameters, keyword arguments to built-ins and `diag` functions | Not supported in version 1 | `STAR_UNSUPPORTED_SYNTAX` |
+| A missing, repeated or unknown argument, or too many positional arguments, in a call to a user function (2.7) | The call cannot be bound to the parameters | `STAR_ARGUMENT_MISMATCH` |
 | Type annotations | Not base Starlark | `STAR_UNSUPPORTED_SYNTAX` |
 | `set` | No IR value type for it; not supported in version 1 | `STAR_UNSUPPORTED_SYNTAX` |
 | Dict access with a computed key `d[expr]` | Key cannot be resolved statically (list and bytes indexing are allowed) | `STAR_DYNAMIC_KEY_NOT_ALLOWED` |
@@ -113,27 +114,28 @@ onto them as follows; anything else exists only at ingestion.
 A construct whose lowering needs an instruction the IR does not have yet is rejected at
 ingestion (`STAR_NOT_LOWERABLE`), the same way as a `diag` call with no instruction (3.2).
 
-### 2.6 Lambdas and Function Arguments
+### 2.6 Lambdas, Nested Functions and Function Arguments
 
 ADR-300 allows functions in two places, both resolved at ingestion.
 
-A **capture-free lambda** names only its own parameters, top-level constants, top-level `def`s,
-the built-ins of 2.4 and `diag`. Its parameters follow the rules for `def` parameters
-(positional only). A lambda that names anything from the enclosing function is a closure and is
-rejected (2.3).
+A **capture-free function** is a `lambda`, or a `def` written directly in the body of a
+top-level `def` (a nested `def`), whose body names only its own parameters and locals, top-level
+constants, top-level `def`s, the built-ins of 2.4 and `diag`. Its parameters follow the rules
+for top-level `def` parameters (2.7). One that names anything else from the enclosing function,
+including another lambda or nested `def` bound there, is a closure and is rejected (2.3).
 
-A function (a capture-free lambda or a top-level `def`) may appear only:
+A function (a capture-free function or a top-level `def`) may appear only:
 
 - **bound to a name**: a lambda assigned to a plain name, as a top-level constant or as a
-  statement directly in a function body (not inside `if` or `for`), with no other assignment to
-  that name in the same scope and no use before the assignment. The name may then be called or
-  passed as an argument;
-- **as an argument**: a lambda, a name bound to one, a top-level `def` name or a function
-  parameter, passed as a positional argument to a top-level `def`.
+  statement directly in a function body (not inside `if` or `for`), or a nested `def` (also not
+  inside `if` or `for`), with no other binding of that name in the same scope and no use before
+  the binding. The name may then be called or passed as an argument;
+- **as an argument**: a lambda, a name bound to a function, a top-level `def` name or a function
+  parameter, passed as an argument to a top-level `def` or to a bound function.
 
-A `def` parameter that receives a function is a **function parameter**: in the callee's body it
+A parameter that receives a function is a **function parameter**: in its function's body it
 may only be called or passed on as an argument. A parameter is a function parameter when its
-body calls it or passes it to a function parameter of another top-level `def`, so a helper that
+body calls it or passes it to a function parameter of another function, so a helper that
 only forwards a function (`def relay(f): return poll(f)`) is accepted. The transpiler finds the
 function parameters from the bodies, following such forwarding chains, and checks every call
 site against them; a function passed to any other parameter, or a value passed to a function
@@ -154,11 +156,37 @@ def main():
         diag.fail("ROUTINE_TIMEOUT", "routine did not finish")
 ```
 
-**Lowering.** A bound or passed lambda becomes an unnamed top-level function. A call that passes
-functions to a `def` is specialized: the transpiler emits one copy of the callee per distinct
+A nested `def` keeps a helper next to the one function that uses it:
+
+```python
+def main():
+    def ready():
+        return diag.request(0x22, {"did": 0xF186})["ok"]
+
+    if not poll(ready):
+        diag.fail("NOT_READY", "ECU did not answer")
+```
+
+**Lowering.** A bound or passed lambda and a nested `def` become unnamed top-level functions. A
+call that passes functions is specialized: the transpiler emits one copy of the callee per distinct
 combination of functions it receives, in which each call through a function parameter is a
 `Call` to the received function; call sites passing the same functions share a copy. Recursion
 (4.1) is checked on the call graph after specialization. No IR instruction is involved.
+
+### 2.7 Default Values and Keyword Arguments
+
+A parameter of a user function (a top-level `def` or a capture-free function of 2.6) may have a
+default value. The default must fold to a constant at ingestion (literals, top-level constants
+and operators over them) and must not be a function; parameters with defaults follow those
+without. A call to a user function passes its positional arguments first and may then name
+parameters (`check(res, strict=True)`). `*args`, `**kwargs` and keyword-only parameters (after a
+bare `*`) are not supported, nor are keyword arguments to built-ins and `diag` functions (2.3).
+
+The transpiler binds every argument to its parameter at the call site and fills in the defaults,
+so the IR call is positional. Arguments are still evaluated in source order, since an argument
+can be a `diag` call: the transpiler evaluates them in that order into locals before the call. A
+missing, repeated or unknown argument, or too many positional ones, is `STAR_ARGUMENT_MISMATCH`;
+for a call through a function parameter (2.6) it is checked in each specialized copy.
 
 ---
 
@@ -371,7 +399,8 @@ range interruptible.
 `expected=<millis>` is the expected duration, an integer from 0 to 2^32 - 1; a value outside that
 range is rejected (`STAR_ARGUMENT_OUT_OF_RANGE`). It is compared with the remaining OEM
 authentication time (8.10.1). A section starts and ends in the same function body, at the same
-indentation.
+indentation. A nested `def` (2.6) is a function body of its own: a section inside it starts
+and ends inside it.
 
 ### 4.6 Specifying Idempotency
 
@@ -395,8 +424,8 @@ used:
 
 The source file line and column are recorded for each instruction and stored in
 `Program.source_map`. This allows execution traces and audit logs to refer back to the original
-source. A lifted lambda's instructions are recorded at the lambda's position, and a specialized
-copy's (2.6) at the callee's.
+source. A lifted lambda's or nested `def`'s instructions are recorded at its own position, and a
+specialized copy's (2.6) at the callee's.
 
 ---
 

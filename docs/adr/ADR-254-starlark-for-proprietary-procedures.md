@@ -1,7 +1,7 @@
 # ADR-254: Starlark Replaces JavaScript as the Proprietary Procedure Language
 
 **Date:** 2026-10-09
-**Status:** Accepted (`diag.fail` has an instruction since ADR-280; Decision item 4's ban on `lambda` and functions as values narrowed by ADR-300)
+**Status:** Accepted (`diag.fail` has an instruction since ADR-280; Decision item 4's bans on `lambda`, nested `def`, functions as values and default and keyword arguments narrowed by ADR-300)
 **Affects:** `docs/system-architecture.md` 8.2, 8.4, 12; `diag-frontend` (`docs/starlark-subset.md`, `examples/sequence.example.star`); `diag-ir` `ir.fbs` `EcuDocument.source_format`
 
 ## Context

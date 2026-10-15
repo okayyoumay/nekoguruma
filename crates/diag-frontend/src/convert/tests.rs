@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use diag_ir::declaration::{EcuDocumentT, load_ecu_document};
 
 use super::*;
-use crate::tables::{read_files, resolve};
+use crate::tables::{read_directory, read_files, resolve};
 
 /// The example definition's files, by name.
 fn example() -> Vec<(String, Vec<u8>)> {
@@ -221,6 +221,37 @@ fn each_variant_gets_its_own_protocols_and_comparams() {
 }
 
 #[test]
+fn comparams_follow_the_protocol_of_their_own_variant() {
+    // One protocol name with a different row in each variant.
+    let files = with(
+        example(),
+        "protocols.csv",
+        "name,baud_rate,tx_id,rx_id,variants\n\
+         ISO15765,500000,0x7E0,0x7E8,exampleEcuV1\n\
+         ISO15765,250000,0x7E1,0x7E9,exampleEcuV2\n",
+    );
+    let files = with(
+        files,
+        "comparams.csv",
+        "protocol,name,value\nISO15765,CP_StMin,5\n",
+    );
+    let documents = documents(&convert(files));
+    let protocol = |baud, tx, rx| {
+        (
+            "ISO15765".to_owned(),
+            baud,
+            tx,
+            rx,
+            0,
+            false,
+            vec![("CP_StMin".to_owned(), 5, 0)],
+        )
+    };
+    assert_eq!(protocols(&documents[0]), [protocol(500_000, 0x7E0, 0x7E8)]);
+    assert_eq!(protocols(&documents[1]), [protocol(250_000, 0x7E1, 0x7E9)]);
+}
+
+#[test]
 fn the_source_digest_follows_section_6() {
     // SHA-256 of nothing.
     assert_eq!(
@@ -236,6 +267,11 @@ fn the_source_digest_follows_section_6() {
     assert_eq!(
         source_digest([("a.csv", &b""[..]), ("b.csv", &b"x\n"[..])]),
         expected
+    );
+    // A repeated name does not make the digest depend on the order of the files.
+    assert_eq!(
+        source_digest([("a.csv", &b"1"[..]), ("a.csv", &b"2"[..])]),
+        source_digest([("a.csv", &b"2"[..]), ("a.csv", &b"1"[..])])
     );
 }
 
@@ -253,6 +289,14 @@ fn the_source_digest_covers_the_table_files_as_stored() {
     let mut with_readme = example();
     with_readme.push(("README".to_owned(), b"notes".to_vec()));
     assert_eq!(digest(with_readme), plain);
+    // Nor is a procedure file the document does not carry, and no document carries one yet.
+    let mut with_procedure = example();
+    with_procedure.push(("main.star".to_owned(), b"def main():\n    pass\n".to_vec()));
+    assert_eq!(digest(with_procedure), plain);
+    // Reading the directory covers the same bytes.
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/example-ecu");
+    let from_dir = to_ir(&resolve(read_directory(&dir).expect("reads")).expect("resolves"));
+    assert_eq!(from_dir, convert(example()));
     // Line ends are part of the bytes.
     let crlf: Vec<_> = example()
         .into_iter()

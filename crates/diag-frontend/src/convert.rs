@@ -1,15 +1,15 @@
 //! Converting a resolved CSV definition into the IR declaration part (`docs/csv-tables.md`,
 //! ADR-295).
 //!
-//! [`to_ir`] turns a [`Definition`] that passed every check into one `EcuDocument` per variant
-//! (design 8.2.6) and the text and unit catalogs of 4.4. The definition was checked against
-//! every rule the conversion relies on, so the conversion itself cannot fail. The documents are
-//! the same, byte for byte, for the same input (section 6).
+//! [`to_ir`] turns the [`Definition`] that [`resolve`](crate::tables::resolve) returns into one
+//! `EcuDocument` per variant (design 8.2.6) and the text and unit catalogs of 4.4. `resolve` has
+//! checked every rule the conversion relies on, so the conversion itself cannot fail. The
+//! documents are the same, byte for byte, for the same input (section 6).
 //!
 //! Each document carries its header (`schema_version`, `source_format`, `source_digest`), the
-//! variant's own data (4.1) and its protocols with their ComParams (4.3). Services, layouts,
-//! variant patterns, DTCs and flash sessions are not converted yet, so those arrays are empty;
-//! no procedure is attached, which is the Starlark lowering's part.
+//! variant's own data (4.1) and its protocols with their ComParams (4.3). Its services, layouts,
+//! variant patterns, DTCs and flash sessions are left empty, and it carries no procedure: that
+//! is attached by the Starlark lowering.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -55,7 +55,8 @@ pub struct CatalogEntry {
     pub text: String,
 }
 
-/// Converts `definition` into one document per variant and the text and unit catalogs.
+/// Converts `definition`, as [`resolve`](crate::tables::resolve) returned it, into one document
+/// per variant and the text and unit catalogs.
 pub fn to_ir(definition: &Definition) -> Converted {
     let tables = &definition.tables;
     let digest = source_digest(
@@ -136,10 +137,12 @@ pub fn to_ir(definition: &Definition) -> Converted {
 
 /// The lowercase hexadecimal SHA-256 of `files`, given by name and contents (section 6). The
 /// files are taken in byte order of their names; each contributes its name, a zero byte, its
-/// length as a big-endian 64-bit integer and its contents.
+/// length as a big-endian 64-bit integer and its contents. The names of a definition's files
+/// are unique; should a name repeat, its files are taken in byte order of their contents, so
+/// the digest still does not depend on the order `files` gives them in.
 pub fn source_digest<'a>(files: impl IntoIterator<Item = (&'a str, &'a [u8])>) -> String {
     let mut files: Vec<(&str, &[u8])> = files.into_iter().collect();
-    files.sort_unstable_by_key(|&(name, _)| name);
+    files.sort_unstable();
     let mut hasher = Sha256::new();
     for (name, contents) in files {
         hasher.update(name.as_bytes());

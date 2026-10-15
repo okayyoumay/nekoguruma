@@ -32,6 +32,10 @@ use super::{
 /// cannot make ingestion allocate or work without bound.
 const MAX_CONSTANT_SIZE: usize = 1 << 20;
 
+/// The total [`Const::size`] of the constants one procedure may build: each is bounded by
+/// [`MAX_CONSTANT_SIZE`], and this bounds how much many of them hold together.
+const MAX_CONSTANTS_TOTAL: usize = 16 << 20;
+
 /// How deeply constant lists and dicts may nest ([`Const::depth`]). Each literal is shallow,
 /// but globals can nest one in the next, and folding recurses through every level.
 const MAX_CONSTANT_DEPTH: usize = 64;
@@ -334,6 +338,8 @@ struct Lowerer<'a> {
     pooled: HashMap<Vec<u8>, u32>,
     /// Pool indexes by the address and length of a shared constant's bytes, with the constant.
     shared: HashMap<(usize, usize), (Const, u32)>,
+    /// The total size of the constants built outside inference, against [`MAX_CONSTANTS_TOTAL`].
+    built: usize,
 }
 
 impl<'a> Lowerer<'a> {
@@ -351,6 +357,7 @@ impl<'a> Lowerer<'a> {
             pool: Vec::new(),
             pooled: HashMap::new(),
             shared: HashMap::new(),
+            built: 0,
         }
     }
 
@@ -748,6 +755,8 @@ impl<'a> Lowerer<'a> {
                 let value = self.expr(id, inner);
                 self.not(value, span)
             }
+            // -2^63 is in range though its magnitude is not: negate the literal as a whole.
+            ExprP::Minus(inner) if is_two_to_the_63(inner) => Val::Const(Const::Int(i64::MIN)),
             ExprP::Minus(inner) => {
                 let value = self.expr(id, inner);
                 self.unary(Unary::Minus, value, span)
@@ -1179,6 +1188,23 @@ impl<'a> Lowerer<'a> {
             );
             return Val::Const(Const::Int(0));
         }
+        // A pass of type inference keeps none of its constants, so only the constants built
+        // once, outside inference, count toward the total.
+        if self.quiet == 0
+            && matches!(
+                value,
+                Const::Str(_) | Const::Bytes(_) | Const::List(..) | Const::Dict(..)
+            )
+        {
+            self.built = self.built.saturating_add(value.size());
+            if self.built > MAX_CONSTANTS_TOTAL {
+                self.not_lowerable(
+                    span,
+                    "the procedure's constants together hold more than 16 Mi values and bytes (4.4)",
+                );
+                return Val::Const(Const::Int(0));
+            }
+        }
         Val::Const(value)
     }
 
@@ -1579,10 +1605,10 @@ impl<'a> Lowerer<'a> {
         let (from, to) = (clamp(start, 0), clamp(stop, len));
         let to = to.max(from);
         match object {
-            Const::Bytes(b) => Val::Const(Const::bytes(&b[from..to])),
-            Const::List(l, _) => Val::Const(Const::list(l[from..to].to_vec())),
+            Const::Bytes(b) => self.bounded(Const::bytes(&b[from..to]), span),
+            Const::List(l, _) => self.bounded(Const::list(l[from..to].to_vec()), span),
             // Indexes count bytes here, which are characters only in ASCII.
-            Const::Str(s) if s.is_ascii() => Val::Const(Const::str(&s[from..to])),
+            Const::Str(s) if s.is_ascii() => self.bounded(Const::str(&s[from..to]), span),
             other => {
                 self.not_lowerable(
                     span,
@@ -1772,7 +1798,7 @@ impl<'a> Lowerer<'a> {
                     detail.span,
                     "a `diag.fail` detail",
                 ) {
-                    Some((Ty::Str | Ty::Bytes, code)) => Some(code),
+                    Some((Ty::Str, code)) => Some(code),
                     Some((ty, _)) => {
                         self.not_lowerable(
                             detail.span,
@@ -2019,8 +2045,28 @@ fn always_returns(stmt: &AstStmt) -> bool {
         StmtP::Return(_) => true,
         StmtP::Statements(list) => list.iter().any(always_returns),
         StmtP::IfElse(_, branches) => always_returns(&branches.0) && always_returns(&branches.1),
+        // `diag.fail` ends the procedure, so no path through it returns (3.2).
+        StmtP::Expression(expr) => is_diag_fail(expr),
         _ => false,
     }
+}
+
+fn is_diag_fail(expr: &AstExpr) -> bool {
+    let ExprP::Call(function, _) = &expr.node else {
+        return false;
+    };
+    let ExprP::Dot(object, method) = &function.node else {
+        return false;
+    };
+    method.node == "fail" && matches!(&object.node, ExprP::Identifier(m) if m.node.ident == "diag")
+}
+
+/// Whether `expr` is the integer literal 2^63, whatever its spelling.
+fn is_two_to_the_63(expr: &AstExpr) -> bool {
+    let ExprP::Literal(AstLiteral::Int(int)) = &expr.node else {
+        return false;
+    };
+    matches!(&int.node, TokenInt::BigInt(big) if big.to_string() == "9223372036854775808")
 }
 
 // ---------------------------------------------------------------- Folding
@@ -2095,12 +2141,11 @@ fn fold(op: BinOp, a: &Const, b: &Const) -> Result<Const, String> {
                 (_, List(items, _)) => items.iter().any(|item| equal(a, item)),
                 (Str(key), Dict(entries, _)) => entries.iter().any(|(k, _)| k == key),
                 (Str(needle), Str(haystack)) => haystack.contains(&**needle),
-                (Bytes(needle), Bytes(haystack)) => {
-                    needle.is_empty() || haystack.windows(needle.len()).any(|w| w == &**needle)
-                }
-                (Int(byte), Bytes(haystack)) => {
-                    u8::try_from(*byte).is_ok_and(|byte| haystack.contains(&byte))
-                }
+                (Bytes(needle), Bytes(haystack)) => contains_bytes(haystack, needle),
+                (Int(byte), Bytes(haystack)) => match u8::try_from(*byte) {
+                    Ok(byte) => haystack.contains(&byte),
+                    Err(_) => return Err(format!("{byte} is not a byte value (0 to 255)")),
+                },
                 _ => return Err(mismatch()),
             };
             Ok(Bool(found == (op == BinOp::In)))
@@ -2176,6 +2221,40 @@ fn fold(op: BinOp, a: &Const, b: &Const) -> Result<Const, String> {
             _ => Err(mismatch()),
         },
     }
+}
+
+/// Whether `needle` occurs in `haystack`, in time linear in both (Knuth-Morris-Pratt), so a
+/// repetitive constant cannot make the search quadratic.
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    // fallback[i]: the length of the longest proper prefix of needle[..=i] that is also its
+    // suffix.
+    let mut fallback = vec![0usize; needle.len()];
+    let mut k = 0;
+    for i in 1..needle.len() {
+        while k > 0 && needle[i] != needle[k] {
+            k = fallback[k - 1];
+        }
+        if needle[i] == needle[k] {
+            k += 1;
+        }
+        fallback[i] = k;
+    }
+    let mut matched = 0;
+    for &byte in haystack {
+        while matched > 0 && byte != needle[matched] {
+            matched = fallback[matched - 1];
+        }
+        if byte == needle[matched] {
+            matched += 1;
+            if matched == needle.len() {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Starlark's total order on floats: NaN equals NaN and is greater than every other float.

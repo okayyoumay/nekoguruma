@@ -384,6 +384,90 @@ fn constants_nest_at_most_64_deep() {
 }
 
 #[test]
+fn the_smallest_integer_can_be_written_as_a_literal() {
+    for literal in ["-9223372036854775808", "-0x8000000000000000"] {
+        let source = format!(
+            "MIN = {literal}\n\ndef main():\n    if MIN == -9223372036854775807 - 1:\n        diag.fail(\"YES\", \"\")\n"
+        );
+        assert_eq!(failed_with(&source), "YES", "{literal}");
+    }
+    // One less is still out of range.
+    assert_eq!(
+        codes("X = -9223372036854775809\n\ndef main():\n    pass\n"),
+        vec![(StarCode::NotLowerable, 1)]
+    );
+}
+
+#[test]
+fn a_fail_detail_must_be_a_string() {
+    let found = codes("def main():\n    diag.fail(\"E\", b\"\\xff\")\n");
+    assert_eq!(found, vec![(StarCode::NotLowerable, 2)]);
+}
+
+#[test]
+fn a_path_that_fails_needs_no_return_value() {
+    let source = "\
+def f(x):
+    if x > 0:
+        return x
+    else:
+        diag.fail(\"NEG\", \"\")
+
+def main():
+    if f(2) == 2:
+        f(-1)
+";
+    assert_eq!(failed_with(source), "NEG");
+}
+
+#[test]
+fn an_int_in_bytes_must_be_a_byte_value() {
+    for (needle, ok) in [("-1", false), ("256", false), ("0", true), ("255", true)] {
+        for op in ["in", "not in"] {
+            let source = format!("X = {needle} {op} b\"abc\"\n\ndef main():\n    pass\n");
+            assert_eq!(codes(&source).is_empty(), ok, "{needle} {op}");
+        }
+    }
+}
+
+#[test]
+fn a_bytes_search_is_linear_and_correct() {
+    let found = |h: &[u8], n: &[u8]| contains_bytes(h, n);
+    assert!(found(b"abc", b""));
+    assert!(found(b"aabaabaaab", b"aaab"));
+    assert!(found(b"abcabd", b"abd"));
+    assert!(!found(b"abcab", b"abd"));
+    assert!(!found(b"ab", b"abc"));
+    // An all-`A` haystack and a needle of `A`s with a `B` in the middle: a naive search
+    // compares a long prefix at every position.
+    let haystack = vec![b'A'; 1 << 19];
+    let mut needle = vec![b'A'; (1 << 18) + 1];
+    needle[1 << 17] = b'B';
+    let started = std::time::Instant::now();
+    assert!(!found(&haystack, &needle));
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+}
+
+#[test]
+fn the_constants_of_a_procedure_are_bounded_together() {
+    // One constant of 2^19 bytes, then many concatenations, each within the limit for one
+    // constant but together past the total.
+    let mut source = String::from("B0 = b\"x\"\n");
+    for i in 1..=19 {
+        source.push_str(&format!("B{i} = B{p} + B{p}\n", p = i - 1));
+    }
+    for i in 0..64 {
+        source.push_str(&format!("C{i} = B19 + b\"y\"\n"));
+    }
+    source.push_str("\ndef main():\n    pass\n");
+    let found = codes(&source);
+    assert!(!found.is_empty() && found.iter().all(|(c, _)| *c == StarCode::NotLowerable));
+    // B0 to B19 hold just over 2^20, and each C line just over 2^19 (its literal counts too),
+    // so the 30th C (line 50) passes 2^24.
+    assert_eq!(found[0].1, 50, "{found:?}");
+}
+
+#[test]
 fn a_right_shift_is_arithmetic() {
     assert!(holds("x", "-8", "x >> 1 == -4"));
     assert!(holds("x", "-1", "x >> 63 == -1"));

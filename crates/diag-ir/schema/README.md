@@ -79,4 +79,5 @@ nested layout there (ADR-242): it decodes to a `Group` of the layout's fields, a
 item's fields or a `Select` naming the chosen case and its fields (ADR-302). A nested layout's
 positions count from its first byte; a length, count or key refers to the nearest earlier
 occurrence of its field, in the same item when it is repeated; and decoding fails past 16 nested
-layouts or 65,536 decoded values. A `CompuBytecode` conversion is rejected as unsupported for now.
+layouts, 65,536 decoded values and items, 16 MiB of names and values, or 16 Mi table entries looked
+at, since nested fields can read the same bytes many times. A `CompuBytecode` conversion is rejected as unsupported for now.

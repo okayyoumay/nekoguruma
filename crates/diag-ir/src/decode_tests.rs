@@ -1136,7 +1136,8 @@ fn layouts_nest_at_most_sixteen_deep() {
 
 #[test]
 fn a_message_decodes_to_at_most_65536_values() {
-    // Fixed items of one byte with one field each: n items give n + 1 values with the repeat.
+    // Fixed items of one byte with one field each: n items give 2n + 1 values, each item and
+    // its field counting, with the repeat.
     let fixed = |fixed_count| {
         vec![repeat(
             1,
@@ -1152,16 +1153,147 @@ fn a_message_decodes_to_at_most_65536_values() {
     let layouts = || vec![layout(1, 0, vec![next(10, DataKind::Uint, 8)])];
     let mut message = vec![SID];
     message.resize(1 + MAX_DECODED_VALUES, 0);
-    assert!(decode_nested(&[], fixed(65_535), layouts(), &message).is_ok());
+    assert!(decode_nested(&[], fixed(32_767), layouts(), &message).is_ok());
     assert_eq!(
-        decode_nested(&[], fixed(65_536), layouts(), &message),
+        decode_nested(&[], fixed(32_768), layouts(), &message),
         Err(DecodeError::TooManyValues)
     );
     // A count larger than the message ends at the message rather than looping.
+    let short = &message[..100];
     assert_eq!(
-        decode_nested(&[], fixed(u32::MAX), layouts(), &message),
+        decode_nested(&[], fixed(u32::MAX), layouts(), short),
         Err(DecodeError::Truncated { field: 1 })
     );
+}
+
+/// Layout n (from 1) holds two copies of `inner(n)`, both at offset 0, so `depth` layouts
+/// decode the innermost one 2^depth times over the same bytes.
+fn doubling(depth: u32, innermost: Vec<FieldT>) -> Vec<LayoutT> {
+    (1..=depth)
+        .map(|n| {
+            let fields = if n == depth {
+                innermost.clone()
+            } else {
+                let copy = |id| FieldT {
+                    placement: Placement::Absolute,
+                    ..group(id, n + 1)
+                };
+                vec![copy(100 + 2 * n), copy(101 + 2 * n)]
+            };
+            layout(n, 0, fields)
+        })
+        .collect()
+}
+
+#[test]
+fn items_read_over_the_same_bytes_count_toward_the_limit() {
+    // Repeats of empty items, decoded 2^14 times over the same bytes: the items count even
+    // though their fields are none.
+    let empty_items = |id| FieldT {
+        placement: Placement::Absolute,
+        ..repeat(
+            id,
+            RepeatT {
+                layout_id: 99,
+                count: RepeatCount::Fixed,
+                fixed_count: 1000,
+                item_byte_size: 1,
+                ..Default::default()
+            },
+        )
+    };
+    let mut layouts = doubling(14, vec![empty_items(1), empty_items(2)]);
+    layouts.push(layout(99, 0, vec![]));
+    let mut message = vec![SID];
+    message.resize(1001, 0);
+    let started = std::time::Instant::now();
+    assert_eq!(
+        decode_nested(&[], vec![group(1, 1)], layouts, &message),
+        Err(DecodeError::TooManyValues)
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+}
+
+#[test]
+fn names_and_values_read_over_the_same_bytes_are_bounded() {
+    // A field with a 64 KiB name, decoded 2^10 times: 64 MiB of names.
+    let named = FieldT {
+        short_name: Some("n".repeat(64 << 10)),
+        ..at(1, DataKind::Uint, 0, 8)
+    };
+    assert_eq!(
+        decode_nested(&[], vec![group(1, 1)], doubling(11, vec![named]), &[SID, 0]),
+        Err(DecodeError::TooLarge)
+    );
+}
+
+#[test]
+fn table_entries_looked_at_are_bounded() {
+    // A select with 4,096 unmatched cases and a default, decoded 2^13 times: 32 Mi entries.
+    let cases = (0..4096).map(|n| (n + 10, n + 10, 0)).collect();
+    let innermost = vec![at(5, DataKind::Uint, 0, 8), select(6, 5, cases, Some(0))];
+    let started = std::time::Instant::now();
+    assert_eq!(
+        decode_nested(&[], vec![group(1, 1)], doubling(14, innermost), &[SID, 0]),
+        Err(DecodeError::TooLarge)
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+}
+
+#[test]
+fn a_shaped_field_past_the_end_of_its_layout_is_truncated() {
+    // An empty group, and a case without a layout, take no bytes but must still start within
+    // the message.
+    let past = FieldT {
+        placement: Placement::Absolute,
+        bit_offset: 800,
+        ..group(1, 1)
+    };
+    assert_eq!(
+        decode_nested(&[], vec![past], vec![layout(1, 0, vec![])], &[SID]),
+        Err(DecodeError::Truncated { field: 1 })
+    );
+    let past_case = FieldT {
+        placement: Placement::Absolute,
+        bit_offset: 800,
+        ..select(2, 1, vec![(0, 0, 0)], None)
+    };
+    assert_eq!(
+        decode_nested(
+            &[],
+            vec![next(1, DataKind::Uint, 8), past_case],
+            vec![],
+            &[SID, 0]
+        ),
+        Err(DecodeError::Truncated { field: 2 })
+    );
+}
+
+#[test]
+fn bytes_that_are_no_value_of_the_marker_type_are_no_marker() {
+    // A UTF-8 marker: 0xFF 0x01 is not UTF-8, so it is item data, not an error.
+    let fields = vec![
+        repeat(
+            1,
+            RepeatT {
+                layout_id: 1,
+                count: RepeatCount::UntilMarker,
+                marker: Some(Box::new(at(9, DataKind::Utf8, 0, 16))),
+                marker_lower: 0,
+                marker_upper: 0,
+                ..Default::default()
+            },
+        ),
+        next(2, DataKind::Uint, 16),
+    ];
+    let layouts = vec![layout(1, 0, vec![next(10, DataKind::Uint, 16)])];
+    let decoded = decode_nested(&[], fields, layouts, &[SID, 0xFF, 0x01, 0, 0]).unwrap();
+    let PhysicalValue::Repeat(items) = value_of(&decoded, 1) else {
+        panic!("not a repeat: {decoded:?}");
+    };
+    let items: Vec<_> = items.iter().map(|item| plain(item)).collect();
+    assert_eq!(items, [[Unsigned(0xFF01)]]);
+    assert_eq!(value_of(&decoded, 2), &Unsigned(0));
 }
 
 #[test]

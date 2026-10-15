@@ -25,8 +25,18 @@ pub type Layouts<'a> = Option<Vector<'a, ForwardsUOffset<Layout<'a>>>>;
 /// The most nested layouts one message may go through (ADR-242 item 7).
 pub const MAX_NESTED_LAYOUTS: usize = 16;
 
-/// The most decoded fields one message may give, nested ones included (ADR-242 item 7).
+/// The most decoded fields and repeated items one message may give, nested ones included
+/// (ADR-242 item 7, ADR-302).
 pub const MAX_DECODED_VALUES: usize = 65_536;
+
+/// The most bytes of names, byte strings and text one message may decode to (ADR-302).
+/// Absolute placement lets nested fields read the same bytes many times over, so the message's
+/// length does not bound this.
+pub const MAX_DECODED_BYTES: usize = 16 << 20;
+
+/// The most case, scale, text-table and interpolation entries one message's decoding may look
+/// at (ADR-302), so a long table shared by many decoded occurrences cannot take unbounded time.
+pub const MAX_TABLE_ENTRIES: usize = 16 << 20;
 
 /// A decoded value. Before a conversion it is the field's internal value; after one, the
 /// physical value: a float for every conversion except a text table, which keeps the internal
@@ -140,9 +150,13 @@ pub enum DecodeError {
         /// The field whose layout is one too many.
         field: u32,
     },
-    /// The message decodes to more than [`MAX_DECODED_VALUES`] fields.
+    /// The message decodes to more than [`MAX_DECODED_VALUES`] fields and items.
     #[error("the response decodes to more than {MAX_DECODED_VALUES} values")]
     TooManyValues,
+    /// Decoding the message needs more than [`MAX_DECODED_BYTES`] bytes of names and values, or
+    /// looks at more than [`MAX_TABLE_ENTRIES`] table entries.
+    #[error("the response is too large to decode")]
+    TooLarge,
     /// The field needs what this decoder does not do yet: a `CompuBytecode` conversion.
     #[error("field {field}: {what} is not supported")]
     Unsupported {
@@ -254,8 +268,12 @@ struct Decoder<'a, 'm> {
     /// The fields of each layout occurrence being decoded, by id, innermost last; a later
     /// occurrence of an id replaces an earlier one, so a reference finds the latest.
     scopes: Vec<HashMap<u32, Seen>>,
-    /// Decoded fields so far, nested ones included.
+    /// Decoded fields and items so far, nested ones included.
     values: usize,
+    /// Bytes of names and values decoded so far.
+    bytes: usize,
+    /// Table entries looked at so far.
+    entries: usize,
 }
 
 impl<'a, 'm> Decoder<'a, 'm> {
@@ -265,6 +283,8 @@ impl<'a, 'm> Decoder<'a, 'm> {
             message,
             scopes: Vec::new(),
             values: 0,
+            bytes: 0,
+            entries: 0,
         }
     }
 
@@ -311,6 +331,7 @@ impl<'a, 'm> Decoder<'a, 'm> {
             let (value, text_id, after) = if field.shape_type() == Shape::NONE {
                 let (internal, after) = extract(self, &field, window, byte, bit)?;
                 let key = key_of(&field, &internal);
+                self.scan(table_len(&field))?;
                 let (value, text_id) = convert(&field, internal)?;
                 self.remember(
                     id,
@@ -327,24 +348,53 @@ impl<'a, 'm> Decoder<'a, 'm> {
                         "a nested layout that does not start at a byte edge",
                     ));
                 }
+                // Even a shaped field that consumes nothing must start within its layout.
+                if byte > end {
+                    return Err(truncated(&field));
+                }
                 let (value, after) = self.shaped(&field, byte, end)?;
                 (value, 0, after)
             };
             edge = after;
             extent = extent.max(after);
-            self.values += 1;
-            if self.values > MAX_DECODED_VALUES {
-                return Err(DecodeError::TooManyValues);
-            }
+            let name = field.short_name().unwrap_or_default();
+            let value_bytes = match &value {
+                PhysicalValue::Bytes(b) => b.len(),
+                PhysicalValue::Text(t) => t.len(),
+                _ => 0,
+            };
+            self.count_value(name.len().saturating_add(value_bytes))?;
             decoded.push(DecodedField {
                 id,
-                short_name: field.short_name().unwrap_or_default().to_owned(),
+                short_name: name.to_owned(),
                 value,
                 text_id,
                 unit_id: field.unit_id(),
             });
         }
         Ok((decoded, extent))
+    }
+
+    /// Counts one decoded field or item of `bytes` bytes against the limits.
+    fn count_value(&mut self, bytes: usize) -> Result<(), DecodeError> {
+        self.values += 1;
+        if self.values > MAX_DECODED_VALUES {
+            return Err(DecodeError::TooManyValues);
+        }
+        self.bytes = self.bytes.saturating_add(bytes);
+        if self.bytes > MAX_DECODED_BYTES {
+            return Err(DecodeError::TooLarge);
+        }
+        Ok(())
+    }
+
+    /// Counts `entries` table entries looked at against the limit.
+    fn scan(&mut self, entries: usize) -> Result<(), DecodeError> {
+        self.entries = self.entries.saturating_add(entries);
+        if self.entries > MAX_TABLE_ENTRIES {
+            return Err(DecodeError::TooLarge);
+        }
+        Ok(())
     }
 
     fn remember(&mut self, id: u32, seen: Seen) {
@@ -389,6 +439,7 @@ impl<'a, 'm> Decoder<'a, 'm> {
                             return Err(truncated(field));
                         }
                         let (fields, _) = self.nested(field, &layout, at, item_end)?;
+                        self.count_value(0)?;
                         items.push(fields);
                         at = item_end;
                     }
@@ -400,6 +451,7 @@ impl<'a, 'm> Decoder<'a, 'm> {
                         if after == at {
                             break;
                         }
+                        self.count_value(0)?;
                         items.push(fields);
                         at = after;
                     }
@@ -430,14 +482,18 @@ impl<'a, 'm> Decoder<'a, 'm> {
                                     break;
                                 }
                             }
-                            // Too few bytes left for a marker: no marker, so an item follows.
-                            Err(DecodeError::Truncated { .. }) => {}
+                            // Too few bytes left for a marker, or bytes that are no value of the
+                            // marker's type: no marker, so an item follows.
+                            Err(
+                                DecodeError::Truncated { .. } | DecodeError::InvalidValue { .. },
+                            ) => {}
                             Err(error) => return Err(error),
                         }
                         let (fields, after) = self.nested(field, &layout, at, end)?;
                         if after == at {
                             break;
                         }
+                        self.count_value(0)?;
                         items.push(fields);
                         at = after;
                     }
@@ -448,6 +504,7 @@ impl<'a, 'm> Decoder<'a, 'm> {
                         if after == at {
                             break;
                         }
+                        self.count_value(0)?;
                         items.push(fields);
                         at = after;
                     }
@@ -461,6 +518,7 @@ impl<'a, 'm> Decoder<'a, 'm> {
                 .ok_or_else(|| plan(field, "a key field that is not decoded before it"))?
                 .key
                 .ok_or_else(|| plan(field, "a key that is not an integer or up to 8 bytes"))?;
+            self.scan(select.cases().map_or(0, |cases| cases.len()))?;
             let chosen = select.cases().and_then(|cases| {
                 cases
                     .iter()
@@ -535,6 +593,22 @@ impl<'a, 'm> Decoder<'a, 'm> {
             .seen(id)
             .ok_or_else(|| plan(field, "a count field that is not decoded before it"))?;
         whole(field, seen, "a count that is negative or not whole")
+    }
+}
+
+/// The number of entries a field's conversion may look at: its scales, text entries,
+/// interpolation points or rational coefficients.
+fn table_len(field: &Field<'_>) -> usize {
+    if let Some(c) = field.compu_as_compu_scale_linear() {
+        c.scales().map_or(0, |v| v.len())
+    } else if let Some(c) = field.compu_as_compu_text_table() {
+        c.entries().map_or(0, |v| v.len())
+    } else if let Some(c) = field.compu_as_compu_table_interp() {
+        c.points().map_or(0, |v| v.len())
+    } else if let Some(c) = field.compu_as_compu_rational() {
+        c.numerator_coeffs().map_or(0, |v| v.len()) + c.denominator_coeffs().map_or(0, |v| v.len())
+    } else {
+        0
     }
 }
 

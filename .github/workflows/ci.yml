@@ -117,6 +117,12 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@nextest
+      # Experiment: show whether Defender real-time scanning is on for the runner.
+      - shell: pwsh
+        run: |
+          Get-MpComputerStatus | Select-Object AMRunningMode, RealTimeProtectionEnabled, OnAccessProtectionEnabled | Format-List
+          Get-MpPreference | Select-Object -ExpandProperty ExclusionPath
+          Get-PSDrive -PSProvider FileSystem | Format-Table Name, Root
       - shell: bash
         run: cargo nextest run --workspace --locked $EXCLUDE --profile ci-windows-parallel -E 'package(agent)'
       - shell: bash
@@ -126,7 +132,7 @@ jobs:
       # (taskkill). main runs it with the rest of the package.
       - if: github.event_name == 'pull_request'
         shell: bash
-        run: cargo nextest run -p j2534-0404-service --locked --profile ci-windows -E 'binary(agent_restart_end_to_end)'
+        run: cargo nextest run -p j2534-0404-service --locked --profile ci-windows --test agent_restart_end_to_end
       # sim-vci is a cdylib only, which cargo runs no doc tests for.
       - shell: bash
         run: cargo test --workspace --locked --exclude sim-vci $EXCLUDE --doc

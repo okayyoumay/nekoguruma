@@ -35,9 +35,11 @@ remaining constructs the VM cannot represent (function values, closures, compreh
 
 ### 2.1 File Structure
 
-One file is one procedure. The top level holds only constant assignments and `def` statements.
-The procedure's entry point is `def main():`, which takes no parameters; the VM starts there.
-A file without `main` is rejected (`STAR_NO_MAIN`).
+One file is one procedure. The top level holds only constant assignments and `def` statements,
+and a docstring may open the file and each function. A top-level constant cannot call `diag` or
+a function of the file, which run only from `main`. The procedure's entry point is
+`def main():`, which takes no parameters; the VM starts there. A file without `main`, or whose
+`main` takes parameters, is rejected (`STAR_NO_MAIN`).
 
 ### 2.2 Accepted
 
@@ -355,8 +357,10 @@ source.
 **All subset violations are listed**. Do not stop at the first one.
 
 A syntax error is different: the parser (6) stops at the first one and returns no AST, so a file
-that does not parse reports that single error. Subset validation runs on a file that parses and
-lists every violation it finds.
+that does not parse reports that single error (`STAR_SYNTAX_ERROR`, or
+`STAR_UNBOUNDED_NOT_ALLOWED` when the parser stops at `while`, which it reads as a reserved word).
+Subset validation runs on a file that parses and lists every violation it finds, sorted by
+position. Lines and columns count from 1; the column counts characters.
 
 ```json
 {
@@ -392,7 +396,18 @@ lists every violation it finds.
   `STAR_UNSUPPORTED_SYNTAX` so that nothing slips through by oversight
 - Comment annotations (4.2, 4.5, 4.6) are taken from the comment tokens the parser's lexer
   reports, never from raw source lines, so `# @` inside a string literal is not an annotation.
-  Each annotation is attached by its line to the following statement
+  Each annotation is attached by its line to the following statement. `@maxIterations` takes an
+  integer from 1 to 2^32 - 1 and must precede a `for`; `@idempotency` takes `safe`, `checkState`
+  or `unsafe` and must precede a statement in a function; a `@section` may not open while another
+  is open. An integer outside its range is `STAR_ARGUMENT_OUT_OF_RANGE`, any other fault
+  `STAR_BAD_ANNOTATION`
+- The check of 2.3 sees the syntax only. A computed key is found on the expressions known to be
+  dicts without type inference: dict literals, the responses of `diag.request`, `diag.routine`
+  and `diag.read_dtc` (3.4), a response's `"fields"`, and names assigned from those. A call
+  must name a top-level `def`, a built-in of 2.4, a string method of 2.4 or a `diag` function of
+  3.1; anything else is `STAR_BUILTIN_NOT_ALLOWED`. What needs the declaration part or the
+  instruction set (a `fields` key, a flash session, an argument's range, an instruction the IR
+  lacks) is checked by the lowering
 - Constant folding is done during bytecode generation
 - After generation, verify with a dry run on the `diag-ir` VM (vehicle access mocked) (12.1)
 

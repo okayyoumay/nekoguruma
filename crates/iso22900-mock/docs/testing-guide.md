@@ -177,4 +177,4 @@ The `rlib` portion exports the following Rust functions for use in test setup:
 - ComParams are not stored or returned (`PDUGetComParam` returns `PDU_ERR_ID_NOT_SUPPORTED`).
 - The UniqueRespIdTable is accepted but not applied to event routing.
 - The mock uses a process-global singleton. Tests in the same process share state; always call `__mock_reset()` between tests.
-- No actual bus communication or timing is simulated.
+- No bus communication is simulated. With a `sim-ecu` attached, the ECU's response delays are applied, but there is no P2 timing, no functional addressing and no `PDUCancelComPrimitive` (ADR-299).

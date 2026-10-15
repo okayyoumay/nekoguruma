@@ -1853,3 +1853,25 @@ fn a_rejected_position_starts_nothing_and_a_status_byte_may_be_terminated() {
         ]
     );
 }
+
+#[test]
+fn every_position_after_a_variable_value_is_reported() {
+    assert_eq!(
+        field_errors(
+            &[
+                "request:r11,a,,,ascii,8,leading",
+                "request:r11,b,5,,uint,8",
+                "request:r11,c,6,,uint,8",
+                // A rejected length kind gives no extent to judge the next field by.
+                "request:r12,a,0,,uint,8,leading",
+                "request:r12,b,1,,uint,8",
+            ],
+            &[",r11,0x5B", ",r12,0x5C"],
+        ),
+        vec![
+            row(Unsupported, 1, "byte"),
+            row(Unsupported, 2, "byte"),
+            row(IrRule, 3, "length"),
+        ]
+    );
+}

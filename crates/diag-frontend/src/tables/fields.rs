@@ -566,8 +566,11 @@ impl<'a> Checker<'a> {
                     "byte",
                     "a request value starts where the previous field ends",
                 );
-                // A rejected position gives no known end for the fields after it.
-                end = End::Unknown;
+                // A rejected position gives no known end for the fields after it; after a value
+                // of variable length, the end stays unknowable whatever this field's position.
+                if !matches!(end, End::Variable) {
+                    end = End::Unknown;
+                }
                 continue;
             }
             let start = match (f.byte, &end) {
@@ -580,7 +583,12 @@ impl<'a> Checker<'a> {
                 (Length::Fixed, Some(bits), Some(start)) if whole_width(f, bits) => {
                     End::At(start + u64::from(bits / 8))
                 }
-                (Length::Leading | Length::Terminated, _, _) => End::Variable,
+                // A length kind its type cannot take is rejected, and gives no extent.
+                (Length::Leading | Length::Terminated, _, _)
+                    if f.field_type.is_some_and(string_like) =>
+                {
+                    End::Variable
+                }
                 (Length::Fixed, Some(bits), None) if after_variable && whole_width(f, bits) => {
                     End::Variable
                 }

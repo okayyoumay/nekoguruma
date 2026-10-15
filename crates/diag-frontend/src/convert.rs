@@ -9,9 +9,10 @@
 //! Each document carries its header (`schema_version`, `source_format`, `source_digest`), the
 //! variant's own data (4.1), its variant patterns (4.2), its protocols with their ComParams
 //! (4.3), and its services with their fields and NRCs and the nested layouts those fields reach
-//! (4.5 to 4.10, section 5; [`services`]). Its DTCs and flash sessions are left empty, and it
-//! carries no procedure: that is attached by the Starlark lowering.
+//! (4.5 to 4.10, section 5; [`services`]), and its DTCs and flash sessions (4.11, 4.12;
+//! [`dtcs_and_flash`]). It carries no procedure: that is attached by the Starlark lowering.
 
+mod dtcs_and_flash;
 mod services;
 
 use std::collections::HashMap;
@@ -74,6 +75,7 @@ pub fn to_ir(definition: &Definition) -> Converted {
         .map(|row| (row.key.as_str(), row.id))
         .collect();
     let index = services::Index::new(definition);
+    let dtcs_and_flash = dtcs_and_flash::DtcsAndFlash::new(definition, &index);
     let documents = tables
         .variants
         .iter()
@@ -125,6 +127,9 @@ pub fn to_ir(definition: &Definition) -> Converted {
             ecu.patterns = Some(part.patterns);
             ecu.services = Some(part.services);
             ecu.layouts = Some(part.layouts);
+            let part = dtcs_and_flash.variant(at);
+            ecu.dtcs = Some(part.dtcs);
+            ecu.flash_sessions = Some(part.flash_sessions);
             let mut document = EcuDocumentT::default();
             document.schema_version = IR_SCHEMA_VERSION;
             document.source_format = Some(SOURCE_FORMAT.to_owned());

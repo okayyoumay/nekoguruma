@@ -560,16 +560,20 @@ impl<'a> Index<'a> {
                 layout.id = id;
                 layout.short_name = Some(name.to_owned());
                 layout.byte_size = row.byte_size;
-                layout.fields = Some(
-                    self.fields_by_container
-                        .get(&container)
-                        .into_iter()
-                        .flatten()
-                        .map(|&i| self.field(i))
-                        .collect(),
-                );
+                layout.fields = Some(self.layout_fields(&container));
                 layout
             })
+            .collect()
+    }
+
+    /// The IR fields of the layout container `container`, in row order, with their own ids. A
+    /// layout holds no constant (5.3).
+    pub(super) fn layout_fields(&self, container: &rows::Container) -> Vec<FieldT> {
+        self.fields_by_container
+            .get(container)
+            .into_iter()
+            .flatten()
+            .map(|&i| self.field(i))
             .collect()
     }
 
@@ -583,7 +587,7 @@ impl<'a> Index<'a> {
         self.field_ids[self.fields_by_name[&(container, name)]].expect("refers to an IR field")
     }
 
-    fn text_id(&self, key: Option<&str>) -> u32 {
+    pub(super) fn text_id(&self, key: Option<&str>) -> u32 {
         key.map_or(0, |key| self.text_ids[key])
     }
 }

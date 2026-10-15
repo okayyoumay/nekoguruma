@@ -881,7 +881,10 @@ impl Checker<'_> {
                 let kinds = self.kinds(&assign.rhs, scope);
                 if let Some(name) = self.target(&assign.lhs, scope) {
                     if kinds.is_dict() {
-                        Rc::make_mut(&mut scope.kinds).insert(name, kinds);
+                        // A binding that is already this leaves the shared state as it is.
+                        if scope.kinds.get(&name) != Some(&kinds) {
+                            Rc::make_mut(&mut scope.kinds).insert(name, kinds);
+                        }
                     } else {
                         unbind(&mut scope.kinds, &name);
                     }

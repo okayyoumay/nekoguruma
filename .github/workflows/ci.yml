@@ -109,6 +109,9 @@ jobs:
     runs-on: windows-latest
     env:
       EXCLUDE: ${{ github.event_name == 'pull_request' && '--exclude j2534-0404-service' || '' }}
+      # On pull requests the agent's runner tests, most of this job's time and with no
+      # Windows-specific code, run on Linux only (core-linux); main runs them here too.
+      AGENT_TESTS: ${{ github.event_name == 'pull_request' && 'package(agent) & not test(/^runner::/)' || 'package(agent)' }}
       RUSTFLAGS: -D warnings
     steps:
       - uses: actions/checkout@v7
@@ -118,7 +121,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@nextest
       - shell: bash
-        run: cargo nextest run --workspace --locked $EXCLUDE --profile ci-windows-parallel -E 'package(agent)'
+        run: cargo nextest run --workspace --locked $EXCLUDE --profile ci-windows-parallel -E "$AGENT_TESTS"
       - shell: bash
         run: cargo nextest run --workspace --locked $EXCLUDE --profile ci-windows -E 'not package(agent)'
       # On pull requests the run above leaves j2534-0404-service out, but its restart end to end is

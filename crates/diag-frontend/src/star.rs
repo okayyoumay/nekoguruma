@@ -1403,19 +1403,19 @@ impl Checker<'_> {
                 ((to_u32(begin.line + 1), end), to_u32(begin.column))
             })
             .collect();
-        let enclosing = |line: u32, column: u32| {
-            defs.iter()
-                .find(|((begin, end), def_column)| {
-                    *begin < line && line <= *end && column > *def_column
-                })
-                .map(|(range, _)| *range)
+        // Both lists are in source order, so a lookup is a binary search.
+        let enclosing = |line: u32, indent: u32| {
+            let at = defs.partition_point(|((begin, _), _)| *begin < line);
+            at.checked_sub(1)
+                .map(|at| defs[at])
+                .filter(|((_, end), def_indent)| line <= *end && indent > *def_indent)
+                .map(|(range, _)| range)
         };
         // The statement after `line`, if it is in the function `def`.
         let next_statement = |def: (u32, u32), line: u32| {
+            let at = statement_lines.partition_point(|(begin, _)| *begin <= line);
             statement_lines
-                .iter()
-                .filter(|(at, _)| *at > line)
-                .min_by_key(|(at, _)| *at)
+                .get(at)
                 .copied()
                 .filter(|(at, _)| def.0 < *at && *at <= def.1)
         };
@@ -1440,7 +1440,15 @@ impl Checker<'_> {
             }
             let resolved = file_span.resolve_span();
             let line = to_u32(resolved.begin.line + 1);
-            let column = to_u32(resolved.begin.column);
+            // The indentation of the comment's line: for a comment after a statement, that
+            // statement's.
+            let source_line = file_span.file.source_line(resolved.begin.line);
+            let column = to_u32(
+                source_line
+                    .chars()
+                    .take_while(|c| *c == ' ' || *c == '\t')
+                    .count(),
+            );
             let mut words = annotation.split_whitespace();
             let keyword = words.next().unwrap_or_default();
             let args: Vec<&str> = words.collect();

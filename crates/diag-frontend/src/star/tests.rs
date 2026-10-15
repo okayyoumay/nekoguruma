@@ -916,3 +916,33 @@ fn a_long_chain_of_functions_is_checked_in_linear_time() {
             .all(|e| e.code == StarCode::UnboundedNotAllowed)
     );
 }
+
+#[test]
+fn a_section_pairs_by_the_indentation_of_its_lines() {
+    // The `#` columns line up, but the lines are at different indentation.
+    assert_eq!(
+        codes(
+            "def main():\n    x = 1        # @section interruptible\n    if x:\n        y = 2    # @endsection\n"
+        ),
+        [(StarCode::BadAnnotation, 2), (StarCode::BadAnnotation, 4)]
+    );
+    // An inline opener and a standalone closer on lines of one indentation pair.
+    passes(
+        "def main():\n    x = 1  # @section interruptible\n    diag.wait(1)\n    # @endsection\n",
+    );
+}
+
+#[test]
+fn many_annotations_are_looked_up_in_logarithmic_time() {
+    let mut source = String::new();
+    for at in 0..2_000 {
+        source.push_str(&format!("def f{at}():\n"));
+        source.push_str(&"    # @idempotency safe\n    diag.wait(1)\n".repeat(10));
+        source.push('\n');
+    }
+    source.push_str("def main():\n    f0()\n");
+    let started = std::time::Instant::now();
+    let checked = passes(&source);
+    assert_eq!(checked.annotations.len(), 20_000);
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+}

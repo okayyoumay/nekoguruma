@@ -398,11 +398,13 @@ position. Lines and columns count from 1; the column counts characters.
   reports, never from raw source lines, so `# @` inside a string literal is not an annotation.
   The text after the one comment marker must start with `@`, so `## @...` is an ordinary comment.
   Each annotation is attached by its line to the following statement. An annotation belongs to
-  a top-level `def` when its comment is indented further than `def` and comes before the next
+  a top-level `def` when the line of its comment is indented further than `def` and comes before the next
   top-level statement, so a comment after the last statement of a body still belongs to it.
   `@maxIterations` takes an integer from 1 to 2^32 - 1 and must precede a `for` in the same
   function; `@idempotency` takes `safe`, `checkState` or `unsafe` and must precede a statement in
-  the same function; a `@section` may not open while another is open. An integer, negative ones
+  the same function; a `@section` may not open while another is open, and it pairs with an
+  `@endsection` on a line of the same indentation (the line's leading whitespace, so a comment
+  after a statement takes that statement's indentation). An integer, negative ones
   included, outside its range is `STAR_ARGUMENT_OUT_OF_RANGE`, any other fault
   `STAR_BAD_ANNOTATION`
 - The check of 2.3 sees the syntax only. A computed key, or a slice, is found on the expressions known to be

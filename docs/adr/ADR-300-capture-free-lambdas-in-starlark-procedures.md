@@ -35,14 +35,15 @@ known callee.
    - **Argument**: a lambda, a name bound to one, a top-level `def` name or a function
      parameter (below), passed as a positional argument to a top-level `def`.
 3. A parameter of a top-level `def` that receives a function is a **function parameter**. In the
-   callee's body it may only be called or passed on as an argument (item 2). The transpiler
-   derives which parameters are function parameters from the callee's body and checks every
-   call site against that: passing a function to a parameter that is used as a value, or a
-   value to a function parameter, is rejected.
+   callee's body it may only be called or passed on as an argument (item 2). A parameter is a
+   function parameter when its body calls it or passes it to a function parameter of another
+   top-level `def`; the transpiler derives this from the bodies, following such forwarding
+   chains, and checks every call site against it: passing a function to any other parameter,
+   or a value to a function parameter, is rejected.
 4. Every other use of a function stays rejected with `STAR_FUNCTION_VALUE_NOT_ALLOWED`:
    assigning it to another name, returning it, storing it in a list or dict, comparing it,
-   passing it to a built-in or a `diag` function, or a function parameter that is never
-   called. `main` still takes no parameters.
+   passing it to a built-in or a `diag` function, or passing it to a parameter that is neither
+   called nor forwarded to a function parameter. `main` still takes no parameters.
 5. **Lowering without new instructions.** A bound or passed lambda is lifted to an unnamed
    top-level function. A call to a top-level `def` that passes functions is resolved by
    specialization: the transpiler emits one copy of the callee per distinct combination of the

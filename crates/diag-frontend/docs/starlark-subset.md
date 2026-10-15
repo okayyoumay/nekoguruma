@@ -132,10 +132,12 @@ A function (a capture-free lambda or a top-level `def`) may appear only:
   parameter, passed as a positional argument to a top-level `def`.
 
 A `def` parameter that receives a function is a **function parameter**: in the callee's body it
-may only be called or passed on as an argument. The transpiler finds the function parameters
-from each body and checks every call site against them; a function passed to a parameter used
-as a value, or a value passed to a function parameter, is rejected
-(`STAR_FUNCTION_VALUE_NOT_ALLOWED`).
+may only be called or passed on as an argument. A parameter is a function parameter when its
+body calls it or passes it to a function parameter of another top-level `def`, so a helper that
+only forwards a function (`def relay(f): return poll(f)`) is accepted. The transpiler finds the
+function parameters from the bodies, following such forwarding chains, and checks every call
+site against them; a function passed to any other parameter, or a value passed to a function
+parameter, is rejected (`STAR_FUNCTION_VALUE_NOT_ALLOWED`).
 
 ```python
 POLL_LIMIT = 50

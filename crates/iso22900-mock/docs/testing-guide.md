@@ -115,7 +115,7 @@ All back-door functions are exported with C ABI using the `__mock_` prefix.
 
 | Function | Description |
 |----------|-------------|
-| `__mock_sim_ecu_control(command)` | Applies a NUL-terminated JSON command; returns 0 when it applied, 1 otherwise. `{"attach":{}}` attaches an ECU with `sim-vci`'s default configuration, `{"attach":{"config":{...}}}` one with the `sim_ecu::EcuConfig` fields given set over that default (for example `{"response_delay_ms":500}`); `{"detach":{}}` detaches it; `{"inject_fault":{"fault":...}}` arms a `sim_ecu::Fault`, with an optional `"service"` (SID) or `"request"` (byte prefix) to wait for, not both. A fault with no ECU attached returns 1. |
+| `__mock_sim_ecu_control(command)` | Applies a NUL-terminated JSON command; returns 0 when it applied, 1 otherwise. `{"attach":{}}` attaches an ECU with `sim-vci`'s default configuration, `{"attach":{"config":{...}}}` one with the `sim_ecu::EcuConfig` fields given set over that default (for example `{"response_delay_ms":500}`; a field `EcuConfig` does not have returns 1); `{"detach":{}}` detaches it; `{"inject_fault":{"fault":...}}` arms a `sim_ecu::Fault`, with an optional `"service"` (SID) or `"request"` (byte prefix) to wait for, not both. A fault with no ECU attached returns 1. |
 
 ### Call Counters
 

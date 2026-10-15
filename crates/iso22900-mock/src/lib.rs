@@ -369,7 +369,8 @@ unsafe fn queue_event(event: PendingEvent) {
     unsafe { notify_data_available(callback, &notified, api_tag) };
 }
 
-/// Wakes the delivery thread when `MockState::scheduled` or `MockState::stop_delivery` changes.
+/// Wakes the delivery thread when `MockState::waiting`, `MockState::scheduled` or
+/// `MockState::stop_delivery` changes.
 fn delivery_signal() -> &'static Condvar {
     static SIGNAL: Condvar = Condvar::new();
     &SIGNAL
@@ -427,9 +428,18 @@ fn stop_delivery_thread(mut guard: MutexGuard<'_, MockState>) {
         .lock()
         .expect("delivery thread poisoned")
         .take();
-    if let Some(thread) = thread {
-        let _ = thread.join();
+    let Some(thread) = thread else {
+        state().lock().expect("mock state poisoned").stop_delivery = false;
+        return;
+    };
+    if thread.thread().id() == std::thread::current().id() {
+        // `PDUDestruct` from inside the callback, which ISO 22900-2 (2022) does not allow: the
+        // thread cannot wait for itself, so it keeps the stop flag and ends once the callback
+        // returns.
+        *delivery_thread().lock().expect("delivery thread poisoned") = Some(thread);
+        return;
     }
+    let _ = thread.join();
     state().lock().expect("mock state poisoned").stop_delivery = false;
 }
 
@@ -598,7 +608,12 @@ fn apply_sim_ecu_command(state: &mut MockState, command: SimEcuCommand) -> Resul
         SimEcuCommand::Attach { config } => {
             let mut merged = serde_json::to_value(default_ecu_config()).map_err(|_| ())?;
             let fields = merged.as_object_mut().ok_or(())?;
-            fields.extend(config.unwrap_or_default());
+            let config = config.unwrap_or_default();
+            // A misspelled field would otherwise leave the default in place unnoticed.
+            if config.keys().any(|key| !fields.contains_key(key)) {
+                return Err(());
+            }
+            fields.extend(config);
             let config: EcuConfig = serde_json::from_value(merged).map_err(|_| ())?;
             state.ecu = Some(SimEcu::new(config));
         }
@@ -663,6 +678,14 @@ exported_fn!(PDUConstruct(_option_str: *mut CHAR8, p_api_tag: *mut c_void) -> T_
             Err(()) => return E_PDU_ERROR::PDU_ERR_FCT_FAILED,
         }
     }
+    // A delivery thread that a `PDUDestruct` from its own callback left to end keeps the stop
+    // flag set until here.
+    let mut thread = delivery_thread().lock().expect("delivery thread poisoned");
+    if thread.as_ref().is_some_and(JoinHandle::is_finished) {
+        let _ = thread.take().map(JoinHandle::join);
+        guard.stop_delivery = false;
+    }
+    drop(thread);
     guard.constructed = true;
     guard.api_tag = p_api_tag as usize;
     guard.next_com_primitive_handle = MOCK_COM_PRIMITIVE_HANDLE;
@@ -920,6 +943,10 @@ exported_fn!(PDUStartComPrimitive(_h_mod: UNUM32, _h_cll: UNUM32, cop_type: T_PD
             let request = (cop_type == E_PDU_COPT::PDU_COPT_SENDRECV && !request.is_empty())
                 .then(|| (request.to_vec(), cycles(control)));
             guard.waiting.push_back(WaitingCop { event, request });
+            // On an idle link it begins at once, as it would without the delivery thread.
+            if !busy {
+                begin_next(&mut guard, Instant::now());
+            }
             delivery_signal().notify_all();
             // Started under the state lock, so a `PDUDestruct` that follows finds the thread
             // to stop; none is started once the API is destructed.
@@ -1649,6 +1676,12 @@ mod sim_ecu_tests {
         apply_sim_ecu_command(&mut state, command(r#"{"detach":{}}"#)).unwrap();
         assert!(state.ecu.is_none());
         assert!(serde_json::from_str::<SimEcuCommand>(r#"{"reboot":{}}"#).is_err());
+        let misspelled = r#"{"attach":{"config":{"s3_ms":300}}}"#;
+        assert!(apply_sim_ecu_command(&mut state, command(misspelled)).is_err());
+        assert!(state.ecu.is_none());
+        let known = r#"{"attach":{"config":{"s3_server_ms":300}}}"#;
+        apply_sim_ecu_command(&mut state, command(known)).unwrap();
+        assert!(state.ecu.is_some());
     }
 
     #[test]
@@ -1740,7 +1773,7 @@ mod delivery_tests {
             let mut guard = state().lock().unwrap();
             let command = serde_json::from_str(r#"{"attach":{}}"#).unwrap();
             apply_sim_ecu_command(&mut guard, command).unwrap();
-            let delay = r#"{"inject_fault":{"fault":{"delay_response":{"ms":200}}}}"#;
+            let delay = r#"{"inject_fault":{"fault":{"delay_response":{"ms":2000}}}}"#;
             apply_sim_ecu_command(&mut guard, serde_json::from_str(delay).unwrap()).unwrap();
         }
         let mut request = [0x22u8, 0xF1, 0x90];
@@ -1757,7 +1790,7 @@ mod delivery_tests {
                 &mut handle,
             );
         }
-        // The EXECUTING item's callback is now blocked; the response is due in 200 ms.
+        // The EXECUTING item's callback is now blocked; the response is due in 2 s.
         let started = Instant::now();
         while !ENTERED.load(Ordering::SeqCst) {
             assert!(started.elapsed() < Duration::from_secs(5), "no callback");
@@ -1771,7 +1804,15 @@ mod delivery_tests {
                 destructed.store(true, Ordering::SeqCst);
             })
         };
-        std::thread::sleep(Duration::from_millis(100));
+        // Released only once `PDUDestruct` has asked the thread to stop.
+        let started = Instant::now();
+        while !state().lock().unwrap().stop_delivery {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "PDUDestruct did not run"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
         assert!(
             !destructed.load(Ordering::SeqCst),
             "PDUDestruct returned while a callback ran"
@@ -1780,11 +1821,8 @@ mod delivery_tests {
         RELEASED.notify_all();
         destruct.join().unwrap();
         assert!(destructed.load(Ordering::SeqCst));
-        // The response and FINISHED items were due later; none reaches the callback.
-        let calls = CALLS.load(Ordering::SeqCst);
-        std::thread::sleep(Duration::from_millis(400));
-        assert_eq!(CALLS.load(Ordering::SeqCst), calls);
-        assert_eq!(calls, 1);
+        // The thread has ended, so the response and FINISHED items never reach the callback.
+        assert_eq!(CALLS.load(Ordering::SeqCst), 1);
         mock_reset();
     }
 }

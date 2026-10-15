@@ -63,5 +63,7 @@ API's own response-pending handling.
 - A receive timeout comes without the delay a real VCI would take, so a test cannot observe P2
   timing through the mock.
 - `PDUCancelComPrimitive` still does nothing: a ComPrimitive cancelled while its delayed events
-  are pending still delivers them and finishes. No test needs cancellation against the ECU yet.
+  are pending still delivers them and finishes, and one cancelled while it waits its turn still
+  reaches the ECU when it begins and changes the ECU's state. No test needs cancellation against
+  the ECU yet.
 - Functional addressing and the ECU state file of ADR-241 are not supported by the mock.

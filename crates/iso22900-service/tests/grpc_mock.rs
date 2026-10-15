@@ -1278,6 +1278,7 @@ enum Seen {
     Error(i32),
 }
 
+const IDLE: i32 = 0x8010;
 const EXECUTING: i32 = 0x8011;
 const FINISHED: i32 = 0x8012;
 
@@ -1466,26 +1467,37 @@ async fn com_primitives_are_answered_by_the_simulated_ecu() {
     let started = std::time::Instant::now();
     let first = start_send_and_receive(&mut client, cll_handle, &read_vin, 1).await;
     let second = start_send_and_receive(&mut client, cll_handle, &read_vin, 1).await;
-    // A ComPrimitive with events still to come is executing.
-    let status = client
-        .get_status(GetStatusRequest {
-            handle: Some(get_status_request::Handle::CopHandle(ComPrimitiveHandle {
-                module_handle: MOCK_MODULE_HANDLE,
-                cll_handle: MOCK_CLL_HANDLE,
-                cop_handle: first,
-            })),
-        })
-        .await
-        .expect("get_status should succeed")
-        .into_inner();
+    // A ComPrimitive with events still to come is executing; one waiting its turn is idle.
+    let mut cop_status = async |cop_handle| {
+        client
+            .get_status(GetStatusRequest {
+                handle: Some(get_status_request::Handle::CopHandle(ComPrimitiveHandle {
+                    module_handle: MOCK_MODULE_HANDLE,
+                    cll_handle: MOCK_CLL_HANDLE,
+                    cop_handle,
+                })),
+            })
+            .await
+            .expect("get_status should succeed")
+            .into_inner()
+            .status
+    };
+    let status = cop_status(first).await;
+    let waiting = cop_status(second).await;
     assert!(
         started.elapsed() < Duration::from_millis(1000),
         "the test ran too slowly to overlap the two ComPrimitives"
     );
     assert_eq!(
-        status.status,
+        status,
         Some(vci_service_interface::status_response::Status::CopStatus(
             EXECUTING
+        ))
+    );
+    assert_eq!(
+        waiting,
+        Some(vci_service_interface::status_response::Status::CopStatus(
+            IDLE
         ))
     );
     let events = events_until_finished(&mut stream, 2).await;
@@ -1578,8 +1590,8 @@ async fn com_primitives_are_answered_by_the_simulated_ecu() {
 }
 
 /// A ComPrimitive that waits behind another reaches the ECU only when it begins, so the ECU's
-/// timers run from then (ADR-299). The session request below waits 500 ms behind the VIN read;
-/// had it reached the ECU at once, its 300 ms session timeout would have run out before its own
+/// timers run from then (ADR-299). The session request below waits 1 s behind the VIN read;
+/// had it reached the ECU at once, its 600 ms session timeout would have run out before its own
 /// response arrived, and the read after it would find the default session.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
@@ -1589,7 +1601,7 @@ async fn a_waiting_com_primitive_reaches_the_ecu_when_it_begins() {
     let backdoor = MockBackdoor::open(&lib_path);
     sim_ecu_control(
         &backdoor,
-        r#"{"attach":{"config":{"response_delay_ms":500,"s3_server_ms":300}}}"#,
+        r#"{"attach":{"config":{"response_delay_ms":1000,"s3_server_ms":600}}}"#,
     );
     let _attached = AttachedEcu(&backdoor);
 

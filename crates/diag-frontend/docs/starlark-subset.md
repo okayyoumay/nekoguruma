@@ -173,7 +173,9 @@ def main():
 call that passes functions is specialized: the transpiler emits one copy of the callee per distinct
 combination of functions it receives, in which each call through a function parameter is a
 `Call` to the received function; call sites passing the same functions share a copy. Recursion
-(4.1) is checked on the call graph after specialization. No IR instruction is involved.
+(4.1) is judged by source function along the specialized call paths, so `invoke(reenter)`, where
+`invoke(f)` calls `f()` and `reenter()` calls `invoke(done)`, is rejected although it reaches two
+different copies of `invoke`. No IR instruction is involved.
 
 ### 2.7 Default Values and Keyword Arguments
 
@@ -305,10 +307,13 @@ response values.
 ### 4.1 Static Resolution
 
 - Function calls must resolve to a top-level `def` in the same file, a built-in in 2.4 or a
-  `diag` function. A call through a name bound to a lambda or through a function parameter
-  resolves to the lambda or to the function each specialized copy receives (2.6)
+  `diag` function. A call through a name bound to a lambda or nested `def`, or through a
+  function parameter, resolves to that function or to the function each specialized copy
+  receives (2.6)
 - Recursion, direct or indirect, is detected by building a call graph
-  (`STAR_UNBOUNDED_NOT_ALLOWED`)
+  (`STAR_UNBOUNDED_NOT_ALLOWED`). Calls through function parameters are followed along each
+  specialized call path, and a path that enters a function while the same source function is
+  already on it is recursion (2.6)
 - Dict keys are string literals only. `d["a"]` is allowed; `d[k]` is not
 
 ### 4.2 Loop Limits

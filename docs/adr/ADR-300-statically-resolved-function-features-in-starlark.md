@@ -56,8 +56,12 @@ site and never reach the VM.
    the transpiler emits one copy of the callee per distinct combination of the functions it
    receives, with each call through a function parameter replaced by a `Call` to the received
    function. Copies are shared between call sites that pass the same functions. Recursion
-   detection (`STAR_UNBOUNDED_NOT_ALLOWED`) runs on the call graph after specialization, so a
-   cycle formed through a function argument is caught.
+   (`STAR_UNBOUNDED_NOT_ALLOWED`) is judged by source function, as Starlark itself does: along
+   every call path the specialization follows, entering a function while the same source
+   function is already on the path is recursion, even when the two calls reach different copies.
+   For example, `invoke(reenter)`, where `invoke(f)` calls `f()` and `reenter()` calls
+   `invoke(done)`, re-enters `invoke` and is rejected. The check runs while specializing, so it
+   also keeps the number of copies finite.
 6. **Default values and keyword arguments.** A parameter of a user function (a top-level `def`
    or a capture-free function) may have a default value, which must fold to a constant at
    ingestion and must not be a function; parameters with defaults follow those without, as

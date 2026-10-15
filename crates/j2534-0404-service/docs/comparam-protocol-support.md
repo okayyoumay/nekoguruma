@@ -634,7 +634,7 @@ to `SET_CONFIG` on any protocol (`comparam_id.rs`). The Active `CP_P2Max` is the
 
 `CP_P2Star` (us, like `CP_P2Min`/`CP_P2Max`) is the RC78 (response-pending)
 auto-handler's per-occurrence reload window: each 0x78 reloads the response
-deadline to `now + CP_P2Star` (ISO 14229-2 §7.3 P2*client semantics,
+deadline to `now + CP_P2Star` (ISO 14229-2 (2021) 9.2 P2*client semantics,
 ADR-102 — supersedes ADR-057's anchor-once treatment of this value).
 `CP_RC78CompletionTimeout` below is a separate, independent total-duration
 ceiling. `CP_P2Star_Ecu`/`CP_P2Max_Ecu` remain stored-only; no per-ECU

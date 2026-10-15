@@ -16576,7 +16576,7 @@ async fn wait_for_expected_response_inner(
                 match rc_code {
                     0x78 => {
                         // NRC 0x78 — ResponsePending: reload the deadline on EVERY
-                        // occurrence to now + CP_P2Star (ISO 14229-2 §7.3's P2*client
+                        // occurrence to now + CP_P2Star (ISO 14229-2 (2021) 9.2's P2*client
                         // reload-per-occurrence semantics, ADR-102 — supersedes ADR-057's
                         // anchor-once treatment of this deadline, which was correct for
                         // CP_RC78CompletionTimeout's ceiling role but not for CP_P2Star's

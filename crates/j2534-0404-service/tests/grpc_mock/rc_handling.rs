@@ -1,7 +1,7 @@
 //! Response-pending / re-request NRC (0x21/0x23/0x78) auto-handling
 //! (ADR-018). NRC 0x78 (ResponsePending) is the exception: `CP_P2Star`
 //! reloads the response deadline to `now + CP_P2Star` on *every* occurrence
-//! (ISO 14229-2 §7.3 P2*client semantics, ADR-102), and `CP_RC78CompletionTimeout`
+//! (ISO 14229-2 (2021) 9.2 P2*client semantics, ADR-102), and `CP_RC78CompletionTimeout`
 //! is an independent, optional total-duration ceiling anchored once at the
 //! first 0x78. NRC 0x21/0x23 have no analogous reload mechanism: each
 //! response code's `CP_RC*CompletionTimeout` remains a fixed ceiling
@@ -91,7 +91,7 @@ fn negative_response(nrc: u8) -> Vec<u8> {
 
 /// ADR-102: `CP_P2Star` is a per-occurrence reload window, not a ceiling --
 /// each 0x78 must reload the response deadline to `now + CP_P2Star`
-/// (ISO 14229-2 §7.3 P2*client semantics), so a *second* 0x78 sent partway
+/// (ISO 14229-2 (2021) 9.2 P2*client semantics), so a *second* 0x78 sent partway
 /// through the first window must push the deadline further out. This
 /// supersedes ADR-057's anchor-once treatment of this same value, which is
 /// now exclusive to `CP_RC78CompletionTimeout` (see the ceiling test below).

@@ -1943,7 +1943,7 @@ Stored at the CLL level; not forwarded to hardware.
 
 `CP_P2Star` (0x8011) is the RC78 (response-pending) auto-handler's
 per-occurrence reload window: each 0x78 reloads the response deadline to
-`now + CP_P2Star` (ISO 14229-2 §7.3 P2*client semantics, ADR-102).
+`now + CP_P2Star` (ISO 14229-2 (2021) 9.2 P2*client semantics, ADR-102).
 `CP_RC78CompletionTimeout` (0x8026, ADR-018) is reinstated (ADR-102) as a
 separate, independent total-duration ceiling for the whole RC78 sequence,
 anchored once at the first 0x78 — no longer inert (ADR-056).

@@ -58,7 +58,9 @@ When NRC 0x78 is received and `CP_RC78Handling = 1`, the COP deadline is reset t
 If no final response arrives before the completion timeout expires, the COP ends
 with `PduErrEvtRxTimeout` (same as a normal timeout).
 
-Default for `CP_RC78CompletionTimeout`: **5000 ms** (absent an explicit `SetComParam`).
+Default for `CP_RC78CompletionTimeout`: **5000 ms** (absent an explicit `SetComParam`), the
+value ISO 14229-2 (2021) 9.2 (Table 4) recommends for a server's P2*server maximum; the
+standard leaves the maximum itself server-specific.
 
 **Amended by ADR-056:** the actual deadline-extension value now comes from
 `CP_P2Star` (the D-PDU-standard ComParam for exactly this purpose), not
@@ -66,7 +68,7 @@ Default for `CP_RC78CompletionTimeout`: **5000 ms** (absent an explicit `SetComP
 but no longer has any effect. The 5000 ms default is unchanged.
 
 **Amended by ADR-102:** `CP_P2Star` now reloads the deadline on every 0x78
-occurrence (ISO 14229-2 §7.3), not once; `CP_RC78CompletionTimeout` is
+occurrence (ISO 14229-2 (2021) 9.2), not once; `CP_RC78CompletionTimeout` is
 reinstated as an independent total-duration ceiling — it is no longer
 inert as the paragraph above (still accurate as of ADR-056) describes.
 

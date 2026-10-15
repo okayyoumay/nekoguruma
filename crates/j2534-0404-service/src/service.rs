@@ -445,7 +445,7 @@ pub(super) struct RcHandlingConfig {
 
     /// If true, NRC 0x78 (ResponsePending) triggers an extended wait instead of
     /// finishing the COP immediately. Each 0x78 reloads the response deadline
-    /// to `now + rc78_p2_star_ms` (ISO 14229-2 §7.3's P2*client reload-per
+    /// to `now + rc78_p2_star_ms` (ISO 14229-2 (2021) 9.2's P2*client reload-per
     /// -occurrence semantics, ADR-102), clamped to `rc78_total_ceiling_ms` when
     /// set (an independent anti-stall ceiling, anchored once at the first
     /// 0x78). `rc78_p2_star_ms` is sourced from `CP_P2Star` (D-PDU's standard

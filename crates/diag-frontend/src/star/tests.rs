@@ -735,3 +735,31 @@ fn a_top_level_name_is_bound_once() {
         [(StarCode::UnsupportedSyntax, 4)]
     );
 }
+
+#[test]
+fn a_known_dict_is_not_sliced() {
+    assert_eq!(
+        codes(
+            "def main():\n    res = diag.request(0x22, {})\n    x = res[:1]\n    raw = res[\"raw\"]\n    \
+             y = raw[1:2]\n"
+        ),
+        [(StarCode::DynamicKeyNotAllowed, 3)]
+    );
+}
+
+#[test]
+fn an_excluded_builtin_is_not_a_value() {
+    assert_eq!(
+        codes(
+            "def helper(x):\n    return x\n\ndef main():\n    a = sorted\n    helper(zip)\n    \
+             return set\n"
+        ),
+        [
+            (StarCode::FunctionValueNotAllowed, 5),
+            (StarCode::FunctionValueNotAllowed, 6),
+            (StarCode::FunctionValueNotAllowed, 7),
+        ]
+    );
+    // A local of that spelling is a value.
+    passes("def helper(sorted):\n    return sorted\n\ndef main():\n    helper(1)\n");
+}

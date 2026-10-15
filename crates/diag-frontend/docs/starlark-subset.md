@@ -405,7 +405,7 @@ position. Lines and columns count from 1; the column counts characters.
   the same function; a `@section` may not open while another is open. An integer, negative ones
   included, outside its range is `STAR_ARGUMENT_OUT_OF_RANGE`, any other fault
   `STAR_BAD_ANNOTATION`
-- The check of 2.3 sees the syntax only. A computed key is found on the expressions known to be
+- The check of 2.3 sees the syntax only. A computed key, or a slice, is found on the expressions known to be
   dicts without type inference: dict literals, the responses of `diag.request`, `diag.routine`
   and `diag.read_dtc` (3.4), a response's `"fields"` (not the values in it, nor another dict's
   `"fields"`), and names assigned from those, top-level constants included. A name assigned on

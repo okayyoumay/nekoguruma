@@ -206,6 +206,23 @@ const DIAG_RESPONSES: &[&str] = &["request", "routine", "read_dtc"];
 /// Built-ins 2.3 names as not allowed.
 const FORBIDDEN_BUILTINS: &[&str] = &["print", "getattr", "hasattr", "dir"];
 
+/// The other Starlark built-in functions, which 2.4 leaves out: calling one is rejected as not a
+/// built-in of 2.4, and naming one as a value as a function value (2.3).
+const EXCLUDED_BUILTINS: &[&str] = &[
+    "all",
+    "any",
+    "dict",
+    "enumerate",
+    "hash",
+    "list",
+    "repr",
+    "reversed",
+    "set",
+    "sorted",
+    "tuple",
+    "zip",
+];
+
 /// The dialect the file is parsed with: everything the subset rejects with its own code is
 /// parsed, so that the checker can report it with that code rather than as a syntax error.
 fn dialect() -> Dialect {
@@ -1056,6 +1073,13 @@ impl Checker<'_> {
                 }
             }
             ExprP::Slice(object, start, stop, step) => {
+                if self.kinds(object, scope).is_dict() {
+                    self.error(
+                        StarCode::DynamicKeyNotAllowed,
+                        expr.span,
+                        "a dict is indexed with a string literal only, never sliced (2.3, 4.1)",
+                    );
+                }
                 self.expr(object, scope, false);
                 for bound in [start, stop, step].into_iter().flatten() {
                     self.expr(bound, scope, false);
@@ -1141,6 +1165,7 @@ impl Checker<'_> {
             || (!self.globals.contains(name)
                 && (BUILTINS.contains(&name)
                     || FORBIDDEN_BUILTINS.contains(&name)
+                    || EXCLUDED_BUILTINS.contains(&name)
                     || name == "fail"
                     || name == "diag"));
         if function {

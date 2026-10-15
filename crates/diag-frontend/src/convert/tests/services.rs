@@ -740,3 +740,61 @@ fn marker_ids_follow_the_repeats_rows() {
     };
     assert_eq!(marker("second") + 1, marker("first"));
 }
+
+#[test]
+fn many_conversions_and_service_nrcs_convert() {
+    // DIDs, each with its own text-table conversion of one scale row and its own NRC, which
+    // replaces the variant-wide row of the same NRC (4.9). The count is kept small for the
+    // test's run time.
+    const N: u32 = 2_000;
+    let field_rows: Vec<String> = (0..N)
+        .map(|i| format!("did:d{i},v,0,,uint,8,,,,c{i},,,,,,,"))
+        .collect();
+    let field_rows: Vec<&str> = field_rows.iter().map(String::as_str).collect();
+    let files = with_fields(&field_rows);
+    let dids: Vec<String> = (0..N)
+        .map(|i| format!(",d{i},{:#06x},yes,no,,,", 0x1000 + i))
+        .collect();
+    let files = appended(
+        files,
+        "dids.csv",
+        &dids.iter().map(String::as_str).collect::<Vec<_>>(),
+    );
+    let conversions: Vec<String> = (0..N).map(|i| format!("c{i},text-table,,,,")).collect();
+    let files = appended(
+        files,
+        "conversions.csv",
+        &conversions.iter().map(String::as_str).collect::<Vec<_>>(),
+    );
+    let scales: Vec<String> = (0..N).map(|i| format!("c{i},{i},,check.correct")).collect();
+    let files = appended(
+        files,
+        "conversion_scales.csv",
+        &scales.iter().map(String::as_str).collect::<Vec<_>>(),
+    );
+    let nrcs: Vec<String> = (0..N)
+        .map(|i| format!("d{i}.read,0x22,nrc.requestSequenceError,yes"))
+        .collect();
+    let files = appended(
+        files,
+        "nrcs.csv",
+        &nrcs.iter().map(String::as_str).collect::<Vec<_>>(),
+    );
+    let documents = documents(&convert(files));
+    let last = service(&documents[0], &format!("d{}.read", N - 1));
+    assert_eq!(
+        negatives(last),
+        [(0x22, 14), (0x12, 10), (0x31, 12), (0x33, 13)]
+    );
+    let CompuT::CompuTextTable(table) = &response(last).2[0].compu else {
+        panic!("a text table")
+    };
+    let entries: Vec<(i64, i64, u32)> = table
+        .entries
+        .iter()
+        .flatten()
+        .map(|e| (e.lower, e.upper, e.text_id))
+        .collect();
+    assert_eq!(entries, [(i64::from(N - 1), i64::from(N - 1), 4)]);
+}
+

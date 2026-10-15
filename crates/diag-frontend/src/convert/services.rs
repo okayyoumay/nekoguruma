@@ -5,7 +5,7 @@
 //! id in every variant's document, and converts each conversion once; [`Index::variant`] then
 //! builds one variant's part.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use diag_ir::declaration::{
     ByteOrder, CompuLinearT, CompuRationalT, CompuScaleLinearT, CompuT, CompuTableInterpT,
@@ -47,6 +47,13 @@ pub(super) struct Index<'a> {
     unit_ids: HashMap<&'a str, u32>,
     text_ids: HashMap<&'a str, u32>,
     service_ids: HashMap<ServiceName, u32>,
+}
+
+/// A variant's `nrcs.csv` rows: those naming a service, by service, and the variant-wide ones.
+#[derive(Default)]
+struct Nrcs<'a> {
+    own: HashMap<&'a ServiceName, Vec<usize>>,
+    wide: Vec<usize>,
 }
 
 /// One service of a document, as the tables define or generate it.
@@ -116,10 +123,18 @@ impl<'a> Index<'a> {
             .iter()
             .map(|t| (t.key.as_str(), t.id))
             .collect();
+        // Each conversion's scale rows, in row order, gathered in one pass.
+        let mut scales: HashMap<&str, Vec<&rows::ConversionScaleRow>> = HashMap::new();
+        for s in &tables.conversion_scales {
+            scales.entry(s.conversion.as_str()).or_default().push(s);
+        }
         let compus = tables
             .conversions
             .iter()
-            .map(|c| (c.name.as_str(), compu(definition, c, &text_ids)))
+            .map(|c| {
+                let rows = scales.get(c.name.as_str()).map_or(&[][..], Vec::as_slice);
+                (c.name.as_str(), compu(c, rows, &text_ids))
+            })
             .collect();
         // Services, then DID services (read before write), then routine services (start, stop,
         // results); only generated services take an id (section 3).
@@ -259,10 +274,15 @@ impl<'a> Index<'a> {
                 });
             }
         }
-        let services = specs
-            .iter()
-            .map(|spec| self.service(variant, spec))
-            .collect();
+        // The variant's NRC rows, by the service they name and variant-wide, in row order.
+        let mut nrcs = Nrcs::default();
+        for &i in &rows.nrcs {
+            match &tables.nrcs[i].service {
+                Some(service) => nrcs.own.entry(service).or_default().push(i),
+                None => nrcs.wide.push(i),
+            }
+        }
+        let services = specs.iter().map(|spec| self.service(spec, &nrcs)).collect();
         let layouts = self.layouts(
             specs
                 .iter()
@@ -291,7 +311,7 @@ impl<'a> Index<'a> {
         }
     }
 
-    fn service(&self, variant: usize, spec: &ServiceSpec) -> ServiceT {
+    fn service(&self, spec: &ServiceSpec, nrcs: &Nrcs) -> ServiceT {
         let part = |container: Option<&rows::Container>| {
             let mut prefix = spec.generated_prefix.clone();
             let mut fields = Vec::new();
@@ -308,6 +328,7 @@ impl<'a> Index<'a> {
             }
             (prefix, fields)
         };
+        let tables = &self.definition.tables;
         let (request_prefix, params) = part(spec.request.as_ref());
         let (response_prefix, fields) = part(spec.response.as_ref());
         let mut request = RequestT::default();
@@ -318,12 +339,19 @@ impl<'a> Index<'a> {
         positive.sid = spec.sid + 0x40;
         positive.prefix = Some(response_prefix);
         positive.fields = Some(fields);
-        let negatives = self
-            .definition
-            .negative_responses(variant, &spec.name)
-            .into_iter()
-            .map(|i| {
-                let row = &self.definition.tables.nrcs[i];
+        // The service's own rows, then the variant-wide rows whose NRC none of them replaces
+        // (4.9). A variant holds each NRC once variant-wide, so the second list is short.
+        let own = nrcs.own.get(&spec.name).map_or(&[][..], Vec::as_slice);
+        let replaced: HashSet<u8> = own.iter().map(|&i| tables.nrcs[i].nrc).collect();
+        let wide = nrcs
+            .wide
+            .iter()
+            .filter(|&&i| !replaced.contains(&tables.nrcs[i].nrc));
+        let negatives = own
+            .iter()
+            .chain(wide)
+            .map(|&i| {
+                let row = &tables.nrcs[i];
                 let mut negative = NegativeResponseT::default();
                 negative.nrc = row.nrc;
                 negative.message_id = self.text_id(row.text.as_deref());
@@ -606,14 +634,12 @@ fn identity() -> CompuT {
 }
 
 /// The `Compu` of a conversion, with its `conversion_scales.csv` rows in row order (4.5).
-fn compu(definition: &Definition, row: &ConversionRow, text_ids: &HashMap<&str, u32>) -> CompuT {
-    let scales = || {
-        definition
-            .tables
-            .conversion_scales
-            .iter()
-            .filter(move |s| s.conversion == row.name)
-    };
+fn compu(
+    row: &ConversionRow,
+    scale_rows: &[&rows::ConversionScaleRow],
+    text_ids: &HashMap<&str, u32>,
+) -> CompuT {
+    let scales = || scale_rows.iter().copied();
     let limits = |s: &rows::ConversionScaleRow, parse: &dyn Fn(&str) -> f64| {
         let lower = parse(s.lower.as_deref().expect("a scale row has a lower limit"));
         let upper = s.upper.as_deref().map_or(lower, parse);

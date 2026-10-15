@@ -8,6 +8,7 @@ rust-version.workspace = true
 diag-ir.workspace = true
 serde.workspace = true
 sha2.workspace = true
+starlark_syntax.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

@@ -35,9 +35,11 @@ capture-free functions and function arguments of 2.6, comprehensions, `load`).
 
 ### 2.1 File Structure
 
-One file is one procedure. The top level holds only constant assignments and `def` statements.
-The procedure's entry point is `def main():`, which takes no parameters; the VM starts there.
-A file without `main` is rejected (`STAR_NO_MAIN`).
+One file is one procedure. The top level holds only constant assignments and `def` statements,
+and a docstring may open the file and each function. A top-level constant cannot call `diag` or
+a function of the file, which run only from `main`. The procedure's entry point is
+`def main():`, which takes no parameters; the VM starts there. A file without `main`, or whose
+`main` takes parameters, is rejected (`STAR_NO_MAIN`).
 
 ### 2.2 Accepted
 
@@ -434,8 +436,12 @@ specialized copy's (2.6) at the callee's.
 **All subset violations are listed**. Do not stop at the first one.
 
 A syntax error is different: the parser (6) stops at the first one and returns no AST, so a file
-that does not parse reports that single error. Subset validation runs on a file that parses and
-lists every violation it finds.
+that does not parse reports that single error (`STAR_SYNTAX_ERROR`, or
+`STAR_UNBOUNDED_NOT_ALLOWED` when the parser stops at `while`, which it reads as a reserved word).
+Subset validation runs on a file that parses and lists every violation it finds, sorted by
+position. Lines and columns count from 1; the column counts characters. The snippet is the
+source line; of a line longer than 160 characters it is the 160 characters around the column, so
+that many violations on one long line stay small.
 
 ```json
 {
@@ -471,7 +477,38 @@ lists every violation it finds.
   `STAR_UNSUPPORTED_SYNTAX` so that nothing slips through by oversight
 - Comment annotations (4.2, 4.5, 4.6) are taken from the comment tokens the parser's lexer
   reports, never from raw source lines, so `# @` inside a string literal is not an annotation.
-  Each annotation is attached by its line to the following statement
+  The text after the one comment marker must start with `@`, so `## @...` is an ordinary comment.
+  Each annotation is attached by its line to the following statement. An annotation belongs to
+  a top-level `def` when the line of its comment is indented further than `def` and comes before the next
+  top-level statement, so a comment after the last statement of a body still belongs to it.
+  Within it, an annotation belongs to a nested `def` (2.6) whose body holds the line in the same
+  way.
+  `@maxIterations` takes an integer from 1 to 2^32 - 1 and must precede a `for` in the same
+  function; `@idempotency` takes `safe`, `checkState` or `unsafe` and must precede a statement in
+  the same function; a `@section` may not open while another is open, and it pairs with an
+  `@endsection` on a line of the same indentation (the line's leading whitespace, so a comment
+  after a statement takes that statement's indentation). An integer, negative ones
+  included, outside its range is `STAR_ARGUMENT_OUT_OF_RANGE`, any other fault
+  `STAR_BAD_ANNOTATION`
+- The check of 2.3 sees the syntax only. A computed key, or a slice, is found on the expressions known to be
+  dicts without type inference: dict literals, the responses of `diag.request`, `diag.routine`
+  and `diag.read_dtc` (3.4), a response's `"fields"` (not the values in it, nor another dict's
+  `"fields"`), and names assigned from those, top-level constants included. A name assigned on
+  only some paths (one branch of an `if`, the body of a `for`, which may run no pass or several,
+  either operand of `and`, `or` or a conditional expression) counts as a dict after it when it is
+  one on any path. A `break` carries its bindings to the loop's exit and a `continue` to the next
+  pass; what follows a jump or a `return` is still checked but its bindings reach nothing. A
+  parameter or a name a function assigns hides a top-level name or built-in of the same spelling,
+  and is a value that cannot be called (`STAR_FUNCTION_VALUE_NOT_ALLOWED`, like a top-level
+  constant), unless it is a function parameter or a name bound to a function (2.6); a top-level `def` or constant named `diag` hides the module as well. A top-level
+  name is bound once, by one `def` or one constant assignment, so each has one meaning in the
+  whole file; a second binding is `STAR_UNSUPPORTED_SYNTAX`. A call must name a top-level
+  `def`, a name bound to a function or a function parameter (2.6), a built-in of 2.4, a string
+  method of 2.4 or a `diag` function of 3.1; anything else is `STAR_BUILTIN_NOT_ALLOWED`. A
+  rejected construct (a capturing `lambda` or nested `def`, a comprehension, an f-string, a
+  top-level statement) is checked inside as well, so that every violation is listed. What needs the declaration part or the
+  instruction set (a `fields` key, a flash session, an argument's range, an instruction the IR
+  lacks) is checked by the lowering
 - Constant folding is done during bytecode generation
 - After generation, verify with a dry run on the `diag-ir` VM (vehicle access mocked) (12.1)
 

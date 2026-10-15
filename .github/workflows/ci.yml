@@ -199,6 +199,40 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p agent --release --locked
 
+  # Fuzzing malformed IR (design 12.1): each target in fuzz/ runs for 60 seconds, starting from
+  # the seeds that fuzz/seeds writes (fuzz/README.md). cargo-fuzz needs a nightly toolchain. Run
+  # on main only, like agent-release: fuzzing on every pull request costs more than finding a
+  # crash right after a merge. It is not a required check. A crash keeps its input as an artifact.
+  fuzz:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+          key: fuzz
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo run --locked --manifest-path fuzz/Cargo.toml -p ngr-fuzz-seeds -- fuzz/corpus
+      # The installed cargo-fuzz is a musl build, which would otherwise build the targets for its
+      # own triple; the sanitizer needs the glibc target.
+      - working-directory: fuzz
+        run: |
+          for target in ngr-fuzz-ecu-document ngr-fuzz-vm; do
+            cargo fuzz run --target x86_64-unknown-linux-gnu "$target" "corpus/$target" \
+              -- -max_total_time=60 -rss_limit_mb=2048
+          done
+      - if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
+
   # Linux targets: linked against glibc 2.17 through cargo-zigbuild's target suffix (ADR-232).
   worker-linux:
     if: github.event_name != 'pull_request'

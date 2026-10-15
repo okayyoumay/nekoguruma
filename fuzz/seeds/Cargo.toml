@@ -1,0 +1,11 @@
+# Writes the fuzz targets' seed corpora (`fuzz/README.md`).
+[package]
+name = "ngr-fuzz-seeds"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[dependencies]
+diag-frontend = { path = "../../crates/diag-frontend" }
+diag-ir = { path = "../../crates/diag-ir" }
+postcard = { version = "1", default-features = false, features = ["alloc"] }

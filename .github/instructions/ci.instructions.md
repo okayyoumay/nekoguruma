@@ -15,7 +15,9 @@ Flag as P1:
   release agent rests on code only a release build compiles); running it on pull requests is a
   finding. So is the `core-windows` step that runs `j2534-0404-service`'s `agent_restart_end_to_end`
   on pull requests (the maintainer's decision: the harness ends the worker in a Windows-specific
-  way); widening it to the whole package is a finding.
+  way); widening it to the whole package is a finding. So is `fuzz`, the cargo-fuzz targets of
+  `fuzz/` for 60 seconds each on main only (design 12.1 asks for fuzzing against malformed IR in
+  CI); running it on pull requests is a finding.
 - **Required checks**: a change that lets a required check be skipped and so pass without
   running, or that renames or removes a job the branch ruleset requires (`repo-checks`,
   `core-linux`, `core-windows`, `worker-check`, `abi-roundtrip`, `msrv`). `msrv` is skipped on

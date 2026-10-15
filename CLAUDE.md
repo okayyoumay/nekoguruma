@@ -170,13 +170,15 @@ tests in a release build (`agent-release`, `cargo test -p agent --release`), sin
 read-only release agent rests on code that only a release build compiles; pull requests skip it
 to save a release build of the agent's dependencies, so a release-only failure shows on main.
 Check it locally with `RUSTFLAGS="-D warnings" cargo test -p agent --release --locked` when you
-change `cfg(not(debug_assertions))` code. On pull requests that change only documentation, `work/` or `.claude/`, the
+change `cfg(not(debug_assertions))` code. The `fuzz` job runs the cargo-fuzz targets in `fuzz/` (its
+own workspace, on nightly; `fuzz/README.md`) for 60 seconds each against malformed IR, on main
+only; check a change to the IR or to `fuzz/` locally with the commands there. On pull requests that change only documentation, `work/` or `.claude/`, the
 `changes` job in `ci.yml` skips the build jobs, which then count as passed required checks;
 `repo-checks.yml` always runs. CodeQL (`codeql.yml`, ADR-283) skips the same changes. Do not run cross-target builds locally unless asked; CI covers
 them.
 
 The `msrv` job checks the workspace with the Rust version in `Cargo.toml`'s `rust-version`
-(`cargo check --workspace --all-targets`); every other job uses stable. On pull requests it runs
+(`cargo check --workspace --all-targets`); every other job uses stable, except `fuzz` (nightly). On pull requests it runs
 only when a `Cargo.toml`, `Cargo.lock` or `.cargo/` changes, which covers Dependabot's update pull
 requests (`.github/dependabot.yml`); main runs it on every push that is not documentation-only
 (the workflow's `paths-ignore`). Code that needs a newer compiler therefore shows up on main;

@@ -442,18 +442,18 @@ struct Checker<'a> {
 /// The bindings a loop's `break`s and `continue`s carry; `None` while none is reachable.
 #[derive(Default)]
 struct Jumps {
-    breaks: Option<HashMap<String, Kinds>>,
-    continues: Option<HashMap<String, Kinds>>,
+    breaks: Option<Bindings>,
+    continues: Option<Bindings>,
 }
 
 /// What a loop's fixpoint found: the bindings before the loop it covers, at the start of a pass,
 /// at its `break`s and after the loop.
 #[derive(Clone, Default)]
 struct LoopState {
-    entry: HashMap<String, Kinds>,
-    head: HashMap<String, Kinds>,
-    breaks: Option<HashMap<String, Kinds>>,
-    exit: HashMap<String, Kinds>,
+    entry: Bindings,
+    head: Bindings,
+    breaks: Option<Bindings>,
+    exit: Bindings,
 }
 
 /// Whether every binding of `part` is in `whole`.
@@ -465,7 +465,7 @@ fn covers(whole: &HashMap<String, Kinds>, part: &HashMap<String, Kinds>) -> bool
 }
 
 /// Adds `kinds` to the bindings of a jump, which are unset while no jump is reachable.
-fn join_jump(into: &mut Option<HashMap<String, Kinds>>, kinds: HashMap<String, Kinds>) {
+fn join_jump(into: &mut Option<Bindings>, kinds: Bindings) {
     match into {
         Some(into) => merge(into, kinds),
         None => *into = Some(kinds),
@@ -504,11 +504,34 @@ impl Kinds {
     }
 }
 
-/// Adds the bindings of `other`, a state reached along another path, to `into`.
-fn merge(into: &mut HashMap<String, Kinds>, other: HashMap<String, Kinds>) {
-    for (name, kinds) in other {
-        let entry = into.entry(name).or_default();
-        *entry = entry.union(kinds);
+/// What the locals are bound to at one point. Shared until changed, so that the copies a branch
+/// or a loop takes of the bindings before it cost nothing while nothing in it rebinds a name.
+type Bindings = Rc<HashMap<String, Kinds>>;
+
+/// Adds the bindings of `other`, a state reached along another path, to `into`. Nothing is
+/// copied when `other` adds nothing.
+fn merge(into: &mut Bindings, other: Bindings) {
+    if Rc::ptr_eq(into, &other) || other.is_empty() {
+        return;
+    }
+    if into.is_empty() {
+        *into = other;
+        return;
+    }
+    if covers(into, &other) {
+        return;
+    }
+    let into = Rc::make_mut(into);
+    for (name, kinds) in other.iter() {
+        let entry = into.entry(name.clone()).or_default();
+        *entry = entry.union(*kinds);
+    }
+}
+
+/// Removes `name` from the bindings, copying them only when it is there.
+fn unbind(bindings: &mut Bindings, name: &str) {
+    if bindings.contains_key(name) {
+        Rc::make_mut(bindings).remove(name);
     }
 }
 
@@ -524,7 +547,7 @@ struct Scope {
     closures: HashMap<String, Rc<str>>,
     /// What the locals are known to be at the point being checked; a local missing here is not a
     /// dict.
-    kinds: HashMap<String, Kinds>,
+    kinds: Bindings,
     /// The point being checked follows a `return`, `break` or `continue` on every path, so its
     /// bindings reach nothing. Its syntax is still checked.
     dead: bool,
@@ -532,7 +555,7 @@ struct Scope {
 
 impl Scope {
     /// Joins the state `(kinds, dead)` reached along another path into this one.
-    fn join(&mut self, kinds: HashMap<String, Kinds>, dead: bool) {
+    fn join(&mut self, kinds: Bindings, dead: bool) {
         if dead {
             return;
         }
@@ -574,7 +597,9 @@ impl Scope {
         }
         closures.retain(|name, _| !own.contains(name));
         let mut kinds = outer.kinds.clone();
-        kinds.retain(|name, _| !own.contains(name));
+        if own.iter().any(|name| kinds.contains_key(name)) {
+            Rc::make_mut(&mut kinds).retain(|name, _| !own.contains(name));
+        }
         let mut locals = outer.locals.clone();
         locals.extend(own);
         Scope {
@@ -856,9 +881,9 @@ impl Checker<'_> {
                 let kinds = self.kinds(&assign.rhs, scope);
                 if let Some(name) = self.target(&assign.lhs, scope) {
                     if kinds.is_dict() {
-                        scope.kinds.insert(name, kinds);
+                        Rc::make_mut(&mut scope.kinds).insert(name, kinds);
                     } else {
-                        scope.kinds.remove(&name);
+                        unbind(&mut scope.kinds, &name);
                     }
                 }
             }
@@ -916,6 +941,12 @@ impl Checker<'_> {
                     self.loops.push(Jumps::default());
                     self.loop_body(&for_.var, &for_.body, scope);
                     self.loops.pop();
+                    // After an outermost loop no fixpoint can come back to it or to the loops
+                    // in it, so their states are dropped rather than kept to the end of the
+                    // file.
+                    if self.loops.is_empty() {
+                        self.loop_states.clear();
+                    }
                 }
                 scope.kinds = state.exit;
                 scope.dead = false;
@@ -953,7 +984,7 @@ impl Checker<'_> {
         scope: &mut Scope,
     ) -> LoopState {
         let mut state = self.loop_states.get(&at).cloned().unwrap_or_default();
-        if covers(&state.entry, &scope.kinds) && self.loop_states.contains_key(&at) {
+        if self.loop_states.contains_key(&at) && covers(&state.entry, &scope.kinds) {
             return state;
         }
         merge(&mut state.entry, scope.kinds.clone());
@@ -978,7 +1009,7 @@ impl Checker<'_> {
             if let Some(found) = jumps.breaks {
                 join_jump(&mut breaks, found);
             }
-            if next == head {
+            if Rc::ptr_eq(&next, &head) || next == head {
                 break;
             }
             head = next;
@@ -1002,7 +1033,7 @@ impl Checker<'_> {
     /// dict.
     fn loop_body(&mut self, var: &AstAssignTarget, body: &AstStmt, scope: &mut Scope) {
         if let Some(name) = self.target(var, scope) {
-            scope.kinds.remove(&name);
+            unbind(&mut scope.kinds, &name);
         }
         self.stmt(body, scope);
     }
@@ -1019,7 +1050,7 @@ impl Checker<'_> {
                 );
                 for item in items {
                     if let Some(name) = self.target(item, scope) {
-                        scope.kinds.remove(&name);
+                        unbind(&mut scope.kinds, &name);
                     }
                 }
                 None
@@ -1147,7 +1178,7 @@ impl Checker<'_> {
         let mut names = HashSet::new();
         target_names(target, &mut names);
         for name in &names {
-            scope.kinds.remove(name);
+            unbind(&mut scope.kinds, name);
             scope.closures.remove(name);
         }
         scope.locals.extend(names);

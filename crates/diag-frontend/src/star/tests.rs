@@ -1033,3 +1033,18 @@ fn a_chain_of_literal_keys_is_checked_in_linear_time() {
     passes(&source);
     assert!(started.elapsed() < std::time::Duration::from_secs(10));
 }
+
+#[test]
+fn many_dict_locals_and_many_loops_stay_cheap() {
+    let count = 2_000;
+    let mut source = String::from("def main():\n");
+    for at in 0..count {
+        source.push_str(&format!("    d{at} = {{\"a\": {at}}}\n"));
+    }
+    for _ in 0..count {
+        source.push_str("    # @maxIterations 1\n    for i in range(1):\n        pass\n");
+    }
+    let started = std::time::Instant::now();
+    passes(&source);
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+}

@@ -19,15 +19,15 @@ postcard = { version = "1", default-features = false, features = ["alloc"] }
 members = ["seeds"]
 
 [[bin]]
-name = "ecu_document"
-path = "fuzz_targets/ecu_document.rs"
+name = "ngr-fuzz-ecu-document"
+path = "fuzz_targets/ngr-fuzz-ecu-document.rs"
 test = false
 doc = false
 bench = false
 
 [[bin]]
-name = "vm"
-path = "fuzz_targets/vm.rs"
+name = "ngr-fuzz-vm"
+path = "fuzz_targets/ngr-fuzz-vm.rs"
 test = false
 doc = false
 bench = false

@@ -171,8 +171,8 @@ read-only release agent rests on code that only a release build compiles; pull r
 to save a release build of the agent's dependencies, so a release-only failure shows on main.
 Check it locally with `RUSTFLAGS="-D warnings" cargo test -p agent --release --locked` when you
 change `cfg(not(debug_assertions))` code. The `fuzz` job runs the cargo-fuzz targets in `fuzz/` (its
-own workspace, on nightly; `fuzz/README.md`) for 60 seconds each against malformed IR; pull
-requests run it only when `crates/diag-ir`, `crates/diag-frontend` or `fuzz/` change. On pull requests that change only documentation, `work/` or `.claude/`, the
+own workspace, on nightly; `fuzz/README.md`) for 60 seconds each against malformed IR, on main
+only; check a change to the IR or to `fuzz/` locally with the commands there. On pull requests that change only documentation, `work/` or `.claude/`, the
 `changes` job in `ci.yml` skips the build jobs, which then count as passed required checks;
 `repo-checks.yml` always runs. CodeQL (`codeql.yml`, ADR-283) skips the same changes. Do not run cross-target builds locally unless asked; CI covers
 them.

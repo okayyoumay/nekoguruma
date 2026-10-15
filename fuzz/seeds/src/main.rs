@@ -1,6 +1,7 @@
-//! Writes seed inputs for the fuzz targets into `<dir>/ecu_document` and `<dir>/vm`: the
+//! Writes seed inputs for the fuzz targets into `<dir>/ngr-fuzz-ecu-document` and
+//! `<dir>/ngr-fuzz-vm`: the
 //! documents of `diag-frontend`'s example definition, and a few small programs with their
-//! starting states, encoded as the `vm` target reads them. Seeds are generated rather than
+//! starting states, encoded as `ngr-fuzz-vm` reads them. Seeds are generated rather than
 //! committed, so they always follow the current schema.
 
 use std::path::{Path, PathBuf};
@@ -19,7 +20,7 @@ fn main() {
         .join("../../crates/diag-frontend/examples/example-ecu");
     let tables = read_directory(&example).expect("the example definition reads");
     let definition = resolve(tables).expect("the example definition resolves");
-    let documents = dir.join("ecu_document");
+    let documents = dir.join("ngr-fuzz-ecu-document");
     std::fs::create_dir_all(&documents).expect("corpus directory");
     for document in to_ir(&definition).documents {
         std::fs::write(
@@ -29,7 +30,7 @@ fn main() {
         .expect("seed file");
     }
 
-    let programs = dir.join("vm");
+    let programs = dir.join("ngr-fuzz-vm");
     std::fs::create_dir_all(&programs).expect("corpus directory");
     for (name, code, constants) in [
         (
@@ -48,10 +49,13 @@ fn main() {
         ),
         (
             "loop",
+            // Counts 3 down to 0, then pops the counter.
             vec![
                 Op::PushI64(3),
                 Op::Dup,
-                Op::JumpIfFalse(6),
+                Op::PushI64(0),
+                Op::CmpGt,
+                Op::JumpIfFalse(8),
                 Op::PushI64(1),
                 Op::Sub,
                 Op::Jump(1),

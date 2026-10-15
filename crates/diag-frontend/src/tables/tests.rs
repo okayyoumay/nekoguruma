@@ -2340,3 +2340,57 @@ fn a_key_missing_its_width_and_large_selects_and_shared_items_are_checked_once()
     );
     assert!(started.elapsed() < std::time::Duration::from_secs(20));
 }
+
+#[test]
+fn a_case_overlapping_only_a_rejected_case_is_reported_too() {
+    const L: &str = "layout:watchdogReset";
+    let (files, _) = with_layouts(
+        &[
+            &format!("{L},k8,40,,uint,8"),
+            &format!("{L},s8,41,,,,,,,,,,select,,k8"),
+        ],
+        &[],
+        &[(
+            "select_cases.csv",
+            &[
+                "layout:watchdogReset,s8,a,0,10,",
+                "layout:watchdogReset,s8,b,5,20,",
+                "layout:watchdogReset,s8,c,15,16,",
+                "layout:watchdogReset,s8,d,21,30,",
+            ],
+        )],
+    );
+    const S: &str = "select_cases.csv";
+    assert_eq!(
+        resolved(files),
+        vec![
+            at(Duplicate, S, Some(added_line(S, 1)), Some("lower")),
+            at(Duplicate, S, Some(added_line(S, 2)), Some("lower")),
+        ]
+    );
+}
+
+#[test]
+fn many_selects_find_their_keys_in_linear_time() {
+    const N: usize = 5_000;
+    let mut rows = Vec::new();
+    let mut layouts = Vec::new();
+    let mut cases = Vec::new();
+    for i in 0..N {
+        layouts.push(format!("q{i},0"));
+        rows.push(format!("layout:q{i},k,0,,uint,8"));
+        rows.push(format!("layout:q{i},s,1,,,,,,,,,,select,,k"));
+        cases.push(format!("layout:q{i},s,one,0x01,,"));
+    }
+    let rows: Vec<&str> = rows.iter().map(String::as_str).collect();
+    let layouts: Vec<&str> = layouts.iter().map(String::as_str).collect();
+    let cases: Vec<&str> = cases.iter().map(String::as_str).collect();
+    let (files, _) = with_layouts(
+        &rows,
+        &[],
+        &[("layouts.csv", &layouts), ("select_cases.csv", &cases)],
+    );
+    let started = std::time::Instant::now();
+    assert_eq!(resolved(files), vec![]);
+    assert!(started.elapsed() < std::time::Duration::from_secs(20));
+}

@@ -209,14 +209,19 @@ impl<'a> Checker<'a> {
             );
         }
         if shape == Shape::Select {
-            self.select_key(f);
+            self.select_key(index, f);
         }
     }
 
     /// A select key is not a float (`ir.fbs` `Select`, ADR-242), and a key of bytes or a
     /// string is at most 8 bytes, the width compared as an integer.
-    fn select_key(&mut self, f: &FieldRow) {
-        let Some(key) = f.reference.as_ref().and_then(|name| self.referred(f, name)) else {
+    fn select_key(&mut self, index: &Index<'a>, f: &'a FieldRow) {
+        // The reference rules have checked that the key is an earlier field of the container.
+        let Some(key) = f
+            .reference
+            .as_ref()
+            .and_then(|name| index.owner(&f.container, name))
+        else {
             return;
         };
         if key.constant.is_some() || key.shape.is_some() || !self.key_cells_sound(key) {
@@ -302,17 +307,18 @@ impl<'a> Checker<'a> {
             let key = f
                 .reference
                 .as_ref()
-                .and_then(|name| self.referred(f, name))
+                .and_then(|name| index.owner(&f.container, name))
                 .filter(|k| self.sound_key(k));
             let (min, max, signed) = key.map_or((i128::MIN, i128::MAX, true), key_range);
             let compared_whole = key
                 .and_then(|k| k.field_type)
                 .is_some_and(super::string_like);
             let mut default: Option<Line> = None;
-            // The cases accepted so far, disjoint, by their lower limit: a new case overlaps one
-            // of them exactly when it overlaps the one with the greatest lower limit not above
-            // its own upper limit.
-            let mut earlier: BTreeMap<i128, (i128, Line)> = BTreeMap::new();
+            // The union of the earlier cases, as disjoint ranges by their lower limit: a new case
+            // overlaps an earlier one exactly when it overlaps the range with the greatest lower
+            // limit not above its own upper limit. Every case joins the union, also one that
+            // overlaps, so a later case overlapping only that one is reported too.
+            let mut earlier: BTreeMap<i128, i128> = BTreeMap::new();
             for c in cases {
                 let Some((lower, upper)) = c.range else {
                     if let Some(first) = default {
@@ -370,18 +376,28 @@ impl<'a> Checker<'a> {
                             .into(),
                     );
                 }
-                match earlier.range(..=upper).next_back() {
-                    Some((_, &(u, first))) if u >= lower => self.error(
+                let touching: Vec<i128> = earlier
+                    .range(..=upper)
+                    .rev()
+                    .take_while(|&(_, &u)| u >= lower)
+                    .map(|(&l, _)| l)
+                    .collect();
+                if !touching.is_empty() {
+                    self.error(
                         ErrorCode::Duplicate,
                         "select_cases.csv",
                         c.line,
                         "lower",
-                        format!("the range overlaps the case on line {first}"),
-                    ),
-                    _ => {
-                        earlier.insert(lower, (upper, c.line));
-                    }
+                        "the range overlaps an earlier case of the select".into(),
+                    );
                 }
+                let (mut merged_lower, mut merged_upper) = (lower, upper);
+                for l in touching {
+                    let u = earlier.remove(&l).expect("listed above");
+                    merged_lower = merged_lower.min(l);
+                    merged_upper = merged_upper.max(u);
+                }
+                earlier.insert(merged_lower, merged_upper);
             }
         }
     }

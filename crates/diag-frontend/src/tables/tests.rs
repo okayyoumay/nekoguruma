@@ -1417,3 +1417,461 @@ fn an_unknown_variant_hides_no_other_error_of_its_row() {
         ]
     );
 }
+
+// ---------------------------------------------------------------- Rules of single fields
+
+/// The columns of the example's `fields.csv` followed by `max_bytes` and `byte_order`.
+const FIELD_COLUMNS: &str = "container,name,byte,bit,type,bits,length,min_bytes,terminator,\
+                             conversion,unit,const,shape,layout,ref,max_bytes,byte_order";
+
+/// The example with `rows` (in [`FIELD_COLUMNS`] order, trailing cells optional) after its
+/// fields, and `services` after its services (`variants,name,sid`); the line of the first added
+/// field row.
+fn with_fields(rows: &[&str], services: &[&str]) -> (Vec<(String, Vec<u8>)>, u32) {
+    let example = example_text("fields.csv");
+    let mut lines = example.lines();
+    let header = lines.next().expect("header");
+    let width = FIELD_COLUMNS.split(',').count();
+    let pad = |row: &str| {
+        let cells = row.split(',').count();
+        assert!(cells <= width, "{row}");
+        format!("{row}{}\n", ",".repeat(width - cells))
+    };
+    let mut fields = format!("{header},max_bytes,byte_order\n");
+    for line in lines {
+        fields.push_str(&format!("{line},,\n"));
+    }
+    let first = u32::try_from(fields.lines().count()).unwrap() + 1;
+    for row in rows {
+        fields.push_str(&pad(row));
+    }
+    let mut services_csv = String::from("variants,name,sid\n");
+    for line in example_text("services.csv").lines().skip(1) {
+        services_csv.push_str(&format!(",{line}\n"));
+    }
+    for row in services {
+        services_csv.push_str(row);
+        services_csv.push('\n');
+    }
+    let mut files = with("fields.csv", &fields);
+    files.retain(|(n, _)| n != "services.csv");
+    files.push(("services.csv".into(), services_csv.into_bytes()));
+    (files, first)
+}
+
+/// The errors of [`with_fields`] in `fields.csv`, as (code, index of the added row, column).
+fn field_errors(rows: &[&str], services: &[&str]) -> Vec<(ErrorCode, u32, String)> {
+    let (files, first) = with_fields(rows, services);
+    resolved(files)
+        .into_iter()
+        .map(|(code, file, line, column)| {
+            assert_eq!(file, "fields.csv", "{code:?} at {line:?}");
+            (code, line.unwrap() - first, column.unwrap())
+        })
+        .collect()
+}
+
+fn row(code: ErrorCode, index: u32, column: &str) -> (ErrorCode, u32, String) {
+    (code, index, column.to_owned())
+}
+
+#[test]
+fn a_field_has_the_width_and_columns_of_its_type_and_length() {
+    const L: &str = "layout:watchdogReset";
+    let rows = [
+        format!("{L},a,5,,uint,65"),
+        format!("{L},b,6,3,float,32"),
+        format!("{L},c,,,bcd,6"),
+        format!("{L},d,,,unicode2,24"),
+        format!("{L},e,,,uint"),
+        format!("{L},f,,,uint,8,leading"),
+        format!("{L},g,,,ascii,40,leading"),
+        format!("{L},h,,,ascii,8,terminated"),
+        format!("{L},i,,,ascii,,terminated,4,,,,,,,,2"),
+        format!("{L},j,,,uint,8,,1"),
+        format!("{L},k,,,ascii,,field"),
+        format!("{L},l,,,bytes,,field,,,,,,,,g"),
+        format!("{L},m,,,uint,8,,,,,,,,,taskId"),
+        format!("{L},n,,,ascii,8,,,,supplyVoltage"),
+        format!("{L},o,,,float,32,,,,sessionName"),
+        format!("{L},p,,2,ascii,8"),
+        "did:powerCycles,q,536870911,,uint,8".to_owned(),
+        // Valid: a length from a fixed uint, a terminated string within its limits.
+        format!("{L},r,,,ascii,,field,,,,,,,,taskId"),
+        format!("{L},s,,,utf8,,terminated,2,zero,,,,,,,8"),
+    ];
+    let rows: Vec<&str> = rows.iter().map(String::as_str).collect();
+    assert_eq!(
+        field_errors(&rows, &[]),
+        vec![
+            row(BadValue, 0, "bits"),
+            row(BadValue, 1, "bit"),
+            row(BadValue, 2, "bits"),
+            row(BadValue, 3, "bits"),
+            row(MissingColumn, 4, "bits"),
+            row(IrRule, 5, "length"),
+            row(BadValue, 6, "bits"),
+            row(BadValue, 7, "bits"),
+            row(IrRule, 8, "min_bytes"),
+            row(BadValue, 9, "min_bytes"),
+            row(MissingColumn, 10, "ref"),
+            row(BadValue, 11, "ref"),
+            row(BadValue, 12, "ref"),
+            row(BadValue, 13, "conversion"),
+            row(IrRule, 14, "conversion"),
+            row(BadValue, 15, "bit"),
+            row(BadValue, 16, "byte"),
+        ]
+    );
+}
+
+#[test]
+fn a_ref_names_neither_a_constant_nor_a_shaped_field() {
+    assert_eq!(
+        field_errors(
+            &[
+                "response:defaultSession,n,,,ascii,,field,,,,,,,,sub",
+                "response:readDtcByStatusMask,n,,,ascii,,field,,,,,,,,records",
+            ],
+            &[],
+        ),
+        vec![row(UnknownReference, 0, "ref"), row(BadValue, 1, "ref")]
+    );
+}
+
+#[test]
+fn constants_lead_their_container_and_fit_their_field() {
+    let services: Vec<String> = (1..=7).map(|i| format!(",t{i},0x8{i}")).collect();
+    let services: Vec<&str> = services.iter().map(String::as_str).collect();
+    assert_eq!(
+        field_errors(
+            &[
+                "layout:watchdogReset,k,,,uint,8,,,,,,0x01",
+                "response:extendedSession,late,5,,uint,8,,,,,,0x01",
+                "response:t1,k,1,,uint,8,,,,,,0x01",
+                "response:t2,k,,,uint,12,,,,,,0x01",
+                "response:t3,k,,,uint,8,,,,,,0x100",
+                "response:t4,k,,,bytes,16,,,,,,F1",
+                "response:t5,k,,,ascii,8,,,,,,31",
+                "response:t6,k,,,uint,8,,,,,millisecond,0x01,,,,,little",
+                "response:t7,a,,,uint,8,,,,,,0x01",
+                "response:t7,b,2,,uint,8,,,,,,0x02",
+                // Valid: a 2-byte identifier then a 1-byte sub-function.
+                "response:t7,c,3,,bytes,16,,,,,,F1 90",
+            ],
+            &services,
+        ),
+        vec![
+            row(Unsupported, 0, "const"),
+            row(Unsupported, 1, "const"),
+            row(BadValue, 2, "byte"),
+            row(BadValue, 3, "bits"),
+            row(BadValue, 4, "const"),
+            row(BadValue, 5, "const"),
+            row(BadValue, 6, "type"),
+            row(BadValue, 7, "byte_order"),
+            row(BadValue, 7, "unit"),
+            row(BadValue, 9, "byte"),
+        ]
+    );
+}
+
+#[test]
+fn a_request_value_has_one_encoding_and_follows_the_previous_field() {
+    let services: Vec<String> = (1..=8).map(|i| format!(",r{i},0x9{i}")).collect();
+    let services: Vec<&str> = services.iter().map(String::as_str).collect();
+    assert_eq!(
+        field_errors(
+            &[
+                "request:r1,n,,,uint,8",
+                "request:r1,a,,,ascii,,field,,,,,,,,n",
+                "request:r2,a,,,ascii,,terminated,,zero",
+                "request:r3,a,,,ascii,,terminated",
+                "request:r3,b,,,uint,8",
+                "request:r4,a,,,uint,4",
+                "request:r5,a,,2,uint,8",
+                "request:r6,a,,,uint,8",
+                "request:r6,b,2,,uint,8",
+                "request:r7,a,,,ascii,8,leading",
+                "request:r7,b,3,,uint,8",
+                // Valid: one field after another, then a value up to the end.
+                "request:r8,a,0,,uint,8",
+                "request:r8,b,1,,uint,16",
+                "request:r8,c,,,ascii,,terminated",
+            ],
+            &services,
+        ),
+        vec![
+            row(Unsupported, 1, "length"),
+            row(Unsupported, 2, "terminator"),
+            row(Unsupported, 3, "length"),
+            row(Unsupported, 5, "bits"),
+            row(Unsupported, 6, "bit"),
+            row(Unsupported, 8, "byte"),
+            row(Unsupported, 10, "byte"),
+        ]
+    );
+}
+
+#[test]
+fn a_status_layout_lies_within_byte_0() {
+    assert_eq!(
+        field_errors(
+            &[
+                "layout:dtcStatus,extra,1,,uint,1",
+                "layout:dtcStatus,wide,0,4,uint,8",
+                "layout:dtcStatus,after,,,uint,1",
+            ],
+            &[],
+        ),
+        vec![
+            row(BadValue, 0, "byte"),
+            row(BadValue, 1, "bits"),
+            row(BadValue, 2, "byte"),
+        ]
+    );
+}
+
+#[test]
+fn services_one_call_cannot_tell_apart_are_rejected() {
+    let (files, first_field) = with_fields(
+        &[
+            "request:dup3,sub,,,uint,8,,,,,,0x04",
+            "request:dup1,sub,,,uint,8,,,,,,0x01",
+            "request:dup2,sub,,,uint,8",
+            "request:readVin,did,,,uint,16,,,,,,0xF190",
+            "request:readOther,did,,,uint,16,,,,,,0x1234",
+        ],
+        &[
+            ",dup3,0x10",
+            ",dup1,0x10",
+            ",dup2,0x10",
+            ",readVin,0x22",
+            ",readOther,0x22",
+            "exampleEcuV1,v1only,0x30",
+            "exampleEcuV2,v2only,0x30",
+        ],
+    );
+    assert!(first_field > 1);
+    // services.csv: the header, the example's four services, then the added ones from line 6.
+    assert_eq!(
+        resolved(files),
+        vec![
+            at(Duplicate, "services.csv", Some(7), Some("name")),
+            at(Duplicate, "services.csv", Some(8), Some("name")),
+            at(Duplicate, "services.csv", Some(9), Some("name")),
+        ]
+    );
+}
+
+#[test]
+fn field_rules_report_each_cell_once_and_follow_the_ir() {
+    const L: &str = "layout:watchdogReset";
+    let rows = [
+        // A width that would overflow the status-layout sum is a bad width, no panic.
+        "layout:dtcStatus,x,0,1,uint,4294967295".to_owned(),
+        // A leading length prefix may start at any bit.
+        format!("{L},s,,3,ascii,8,leading"),
+        format!("{L},u,,,unicode2,,terminated,3,,,,,,,,5"),
+        format!("{L},v,,,uint,8,terminated"),
+        format!("{L},w,,,uint,8,,,,,,,,,,4"),
+        format!("{L},w2,,,uint,8,,,end"),
+        format!("{L},y,,,ascii,,leading"),
+    ];
+    let rows: Vec<&str> = rows.iter().map(String::as_str).collect();
+    assert_eq!(
+        field_errors(&rows, &[]),
+        vec![
+            row(BadValue, 0, "bits"),
+            row(IrRule, 2, "max_bytes"),
+            row(IrRule, 2, "min_bytes"),
+            row(BadValue, 3, "bits"),
+            row(IrRule, 3, "length"),
+            row(BadValue, 4, "max_bytes"),
+            row(BadValue, 5, "terminator"),
+            row(MissingColumn, 6, "bits"),
+        ]
+    );
+}
+
+#[test]
+fn every_container_that_is_sent_is_checked_once_per_cause() {
+    assert_eq!(
+        field_errors(
+            &[
+                // A missing width is reported; the next field's position is not.
+                "request:d1,a,0,,uint",
+                "request:d1,v,1,,uint,8",
+                "request:d2,sub,0,,uint,8,,,,,,0x01",
+                "request:d2,v,2,,uint,8",
+                // After a value of variable length, no field has a known position.
+                "request:d3,a,,,ascii,8,leading",
+                "request:d3,b,,,uint,8",
+                "request:d3,c,5,,uint,8",
+                // A routine request and the record of a DID with a write service are sent.
+                "routine:eraseMemory:start:request,a,,4,uint,8",
+                "did:vin,extra,20,,uint,8",
+                // The record of a DID without one is not.
+                "did:powerCycles,gap,10,,uint,8",
+            ],
+            &[",d1,0xA1", ",d2,0xA2", ",d3,0xA3"],
+        ),
+        vec![
+            row(MissingColumn, 0, "bits"),
+            row(Unsupported, 3, "byte"),
+            row(Unsupported, 6, "byte"),
+            row(Unsupported, 7, "bit"),
+            row(Unsupported, 8, "byte"),
+        ]
+    );
+}
+
+#[test]
+fn constants_are_compared_by_value_across_services() {
+    let rows = [
+        "request:a16,sub,,,uint,16,,,,,,0x0001",
+        "request:b8,sub,,,uint,8,,,,,,0x101",
+        "request:bytesSub,sub,,,bytes,8,,,,,,01",
+        "request:writeVin,did,,,uint,16,,,,,,0xF190",
+        "request:writeVin,vin,,,ascii,136",
+        "request:routineLike,sub,,,uint,8,,,,,,0x01",
+        "request:routineLike,rid,,,uint,16,,,,,,0xFF00",
+    ];
+    let (files, first) = with_fields(
+        &rows,
+        &[
+            ",a16,0x10",
+            ",b8,0x10",
+            ",bytesSub,0x10",
+            ",writeVin,0x2E",
+            ",routineLike,0x31",
+        ],
+    );
+    assert_eq!(
+        resolved(files),
+        vec![
+            // A broken constant is reported once, with no clash made up from it.
+            at(BadValue, "fields.csv", Some(first + 1), Some("const")),
+            // 0x0001 in 16 bits is the value 1, as is defaultSession's 0x01.
+            at(Duplicate, "services.csv", Some(6), Some("name")),
+            // The same request fields as the generated vin.write.
+            at(Duplicate, "services.csv", Some(9), Some("name")),
+        ]
+    );
+}
+
+#[test]
+fn a_counted_repeat_counts_with_a_fixed_number() {
+    let (mut files, first) = with_fields(
+        &[
+            "response:rr,cnt,,,ascii,8",
+            "response:rr,items,,,,,,,,,,,repeat,dtcRecord,cnt",
+        ],
+        &[",rr,0xB1"],
+    );
+    files.retain(|(n, _)| n != "repeats.csv");
+    files.push((
+        "repeats.csv".into(),
+        b"container,field,count\n\
+          response:readDtcByStatusMask,records,end\n\
+          response:rr,items,field\n"
+            .to_vec(),
+    ));
+    assert_eq!(
+        resolved(files),
+        vec![at(BadValue, "fields.csv", Some(first + 1), Some("ref"))]
+    );
+}
+
+#[test]
+fn an_error_neither_hides_another_nor_makes_one_up() {
+    assert_eq!(
+        field_errors(
+            &[
+                // A bad width gives no known end, so the next position is not judged.
+                "request:e1,a,0,,uint,72",
+                "request:e1,b,1,,uint,8",
+                "request:e2,sub,0,,uint,72,,,,,,0x01",
+                "request:e2,v,1,,uint,8",
+                // A length source with its own error is not judged again through the ref.
+                "layout:watchdogReset,src,,,uint,8,leading",
+                "layout:watchdogReset,ln,,,ascii,,field,,,,,,,,src",
+                // Every column of a constant is checked, wherever it stands.
+                "response:t8,k,,,uint,8,,,,,millisecond,0x01,group,dtcRecord,,,little",
+                "layout:watchdogReset,kc,,,uint,8,,,,,millisecond,0x01",
+                // A constant's syntax is checked whatever its width.
+                "response:t9,k,,,uint,12,,,,,,bogus",
+                "response:t10,k,,,bytes,12,,,,,,ZZ",
+                // A float's alignment is checked without a width.
+                "layout:watchdogReset,fl,,3,float",
+            ],
+            &[",e1,0x41", ",e2,0x42", ",t8,0x48", ",t9,0x49", ",t10,0x4A"],
+        ),
+        vec![
+            row(BadValue, 0, "bits"),
+            row(BadValue, 2, "bits"),
+            row(IrRule, 4, "length"),
+            row(BadValue, 6, "byte_order"),
+            row(BadValue, 6, "shape"),
+            row(BadValue, 6, "unit"),
+            row(Unsupported, 7, "const"),
+            row(BadValue, 7, "unit"),
+            row(BadValue, 8, "bits"),
+            row(BadValue, 8, "const"),
+            row(BadValue, 9, "bits"),
+            row(BadValue, 9, "const"),
+            row(BadValue, 10, "bit"),
+            row(MissingColumn, 10, "bits"),
+        ]
+    );
+}
+
+#[test]
+fn a_rejected_position_starts_nothing_and_a_status_byte_may_be_terminated() {
+    assert_eq!(
+        field_errors(
+            &[
+                "response:t11,k,,,uint,72,,,,,,0x01,group,dtcRecord",
+                // Only the second field is out of place; the third follows it as written.
+                "request:r9,a,0,,uint,8",
+                "request:r9,b,2,,uint,8",
+                "request:r9,c,2,,uint,8",
+                "request:r10,sub,1,,uint,8,,,,,,0x01",
+                "request:r10,v,1,,uint,8",
+                // At most one byte, so within byte 0; a leading length is not.
+                "layout:dtcStatus,tb,0,,bytes,,terminated,1,end,,,,,,,1",
+                "layout:dtcStatus,lb,0,,bytes,8,leading",
+            ],
+            &[",t11,0x4B", ",r9,0x59", ",r10,0x5A"],
+        ),
+        vec![
+            row(BadValue, 0, "bits"),
+            row(BadValue, 0, "shape"),
+            row(Unsupported, 2, "byte"),
+            row(BadValue, 4, "byte"),
+            row(BadValue, 7, "length"),
+        ]
+    );
+}
+
+#[test]
+fn every_position_after_a_variable_value_is_reported() {
+    assert_eq!(
+        field_errors(
+            &[
+                "request:r11,a,,,ascii,8,leading",
+                "request:r11,b,5,,uint,8",
+                "request:r11,c,6,,uint,8",
+                // A rejected length kind gives no extent to judge the next field by.
+                "request:r12,a,0,,uint,8,leading",
+                "request:r12,b,1,,uint,8",
+            ],
+            &[",r11,0x5B", ",r12,0x5C"],
+        ),
+        vec![
+            row(Unsupported, 1, "byte"),
+            row(Unsupported, 2, "byte"),
+            row(IrRule, 3, "length"),
+        ]
+    );
+}

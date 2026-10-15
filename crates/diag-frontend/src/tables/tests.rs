@@ -1825,3 +1825,31 @@ fn an_error_neither_hides_another_nor_makes_one_up() {
         ]
     );
 }
+
+#[test]
+fn a_rejected_position_starts_nothing_and_a_status_byte_may_be_terminated() {
+    assert_eq!(
+        field_errors(
+            &[
+                "response:t11,k,,,uint,72,,,,,,0x01,group,dtcRecord",
+                // Only the second field is out of place; the third follows it as written.
+                "request:r9,a,0,,uint,8",
+                "request:r9,b,2,,uint,8",
+                "request:r9,c,2,,uint,8",
+                "request:r10,sub,1,,uint,8,,,,,,0x01",
+                "request:r10,v,1,,uint,8",
+                // At most one byte, so within byte 0; a leading length is not.
+                "layout:dtcStatus,tb,0,,bytes,,terminated,1,end,,,,,,,1",
+                "layout:dtcStatus,lb,0,,bytes,8,leading",
+            ],
+            &[",t11,0x4B", ",r9,0x59", ",r10,0x5A"],
+        ),
+        vec![
+            row(BadValue, 0, "bits"),
+            row(BadValue, 0, "shape"),
+            row(Unsupported, 2, "byte"),
+            row(BadValue, 4, "byte"),
+            row(BadValue, 7, "length"),
+        ]
+    );
+}

@@ -412,9 +412,9 @@ impl<'a> Checker<'a> {
             // The constant's own columns are checked wherever it stands.
             let width = self.constant(f, value);
             if placed {
-                if let (Some(byte), Some(start)) = (f.byte, end)
-                    && u64::from(byte) != start
-                {
+                let misplaced =
+                    matches!((f.byte, end), (Some(byte), Some(start)) if u64::from(byte) != start);
+                if misplaced {
                     self.field_error(
                         ErrorCode::BadValue,
                         f,
@@ -422,7 +422,8 @@ impl<'a> Checker<'a> {
                         "constants start at byte 0 and follow each other without gaps".into(),
                     );
                 }
-                let start = f.byte.map(u64::from).or(end);
+                // A rejected position gives no known end for the fields after it.
+                let start = f.byte.map(u64::from).or(end).filter(|_| !misplaced);
                 end = start.zip(width).map(|(s, w)| s + u64::from(w / 8));
             }
         }
@@ -462,6 +463,9 @@ impl<'a> Checker<'a> {
         // The value's syntax is checked whatever the width; its size only against a valid one.
         let width = match f.field_type {
             Some(FieldType::Uint) => {
+                if whole.is_some_and(|b| b > 64) {
+                    bad(self, "bits", "a uint constant is at most 64 bits wide");
+                }
                 let width = whole.filter(|b| (8..=64).contains(b));
                 let max = match width {
                     Some(64) | None => i128::from(u64::MAX),
@@ -562,6 +566,9 @@ impl<'a> Checker<'a> {
                     "byte",
                     "a request value starts where the previous field ends",
                 );
+                // A rejected position gives no known end for the fields after it.
+                end = End::Unknown;
+                continue;
             }
             let start = match (f.byte, &end) {
                 (Some(byte), _) => Some(u64::from(byte)),
@@ -604,13 +611,20 @@ impl<'a> Checker<'a> {
                         format!("the fields of status layout {name} lie in byte 0"),
                     );
                 }
-                let fits = matches!(f.length, None | Some(Length::Fixed))
-                    && f.bits.is_some_and(|b| u64::from(f.bit) + u64::from(b) <= 8);
+                // A fixed field within the byte, or a terminated one of at most one byte.
+                let (fits, column) = match f.length.unwrap_or(Length::Fixed) {
+                    Length::Fixed => (
+                        f.bits.is_some_and(|b| u64::from(f.bit) + u64::from(b) <= 8),
+                        "bits",
+                    ),
+                    Length::Terminated => (f.max_bytes == Some(1), "max_bytes"),
+                    Length::Field | Length::Leading => (false, "length"),
+                };
                 if !fits {
                     self.field_error(
                         ErrorCode::BadValue,
                         f,
-                        "bits",
+                        column,
                         format!("the fields of status layout {name} lie within bits 0 to 7"),
                     );
                 }

@@ -2210,3 +2210,79 @@ fn a_long_chain_of_layouts_is_checked_without_recursion() {
         vec![at(IrRule, "fields.csv", Some(first), Some("shape"))]
     );
 }
+
+#[test]
+fn a_terminated_key_and_a_shaped_item_field_have_their_bounds() {
+    const L: &str = "layout:watchdogReset";
+    let rows = [
+        format!("{L},tk1,50,,bytes,,terminated,1,,,,,,,,1"),
+        format!("{L},s11,60,,,,,,,,,,select,,tk1"),
+        // An item of one byte whose layout places a group at byte 2.
+        "response:fy,items,1,,,,,,,,,,repeat,itemL".to_owned(),
+        "layout:itemL,g,2,,,,,,,,,,group,dtcStatus".to_owned(),
+    ];
+    let rows: Vec<&str> = rows.iter().map(String::as_str).collect();
+    let (mut files, _) = with_layouts(
+        &rows,
+        &[",fy,0x64"],
+        &[
+            ("layouts.csv", &["itemL,0"]),
+            (
+                "select_cases.csv",
+                &[
+                    "layout:watchdogReset,s11,one,0xFF,,",
+                    "layout:watchdogReset,s11,two,0x100,,",
+                ],
+            ),
+        ],
+    );
+    files.retain(|(n, _)| n != "repeats.csv");
+    files.push((
+        "repeats.csv".into(),
+        b"container,field,count,items,item_bytes\n\
+          response:readDtcByStatusMask,records,end,,\n\
+          response:fy,items,fixed,3,1\n"
+            .to_vec(),
+    ));
+    const S: &str = "select_cases.csv";
+    assert_eq!(
+        resolved(files),
+        vec![
+            at(IrRule, "repeats.csv", Some(3), Some("item_bytes")),
+            at(BadValue, S, Some(added_line(S, 1)), Some("lower")),
+        ]
+    );
+}
+
+#[test]
+fn many_selects_cycles_and_sized_layouts_are_checked_in_linear_time() {
+    const N: usize = 3000;
+    let mut rows = Vec::new();
+    let mut layouts = Vec::new();
+    let mut cases = Vec::new();
+    for i in 0..N {
+        // A select per layout leading to the next, a self cycle, and a sized layout.
+        layouts.push(format!("m{i},2"));
+        rows.push(format!("layout:m{i},k,0,,uint,8"));
+        rows.push(format!("layout:m{i},s,1,,,,,,,,,,select,,k"));
+        if i + 1 < N {
+            cases.push(format!("layout:m{i},s,next,0x01,,m{}", i + 1));
+        }
+        layouts.push(format!("self{i},0"));
+        rows.push(format!("layout:self{i},me,0,,,,,,,,,,group,self{i}"));
+    }
+    let rows: Vec<&str> = rows.iter().map(String::as_str).collect();
+    let layouts: Vec<&str> = layouts.iter().map(String::as_str).collect();
+    let cases: Vec<&str> = cases.iter().map(String::as_str).collect();
+    let (files, _) = with_layouts(
+        &rows,
+        &[],
+        &[("layouts.csv", &layouts), ("select_cases.csv", &cases)],
+    );
+    let started = std::time::Instant::now();
+    let errors = resolved(files);
+    // One cycle error per self-referring layout, and nothing else.
+    assert_eq!(errors.len(), N);
+    assert!(errors.iter().all(|e| e.0 == IrRule && e.1 == "layouts.csv"));
+    assert!(started.elapsed() < std::time::Duration::from_secs(20));
+}

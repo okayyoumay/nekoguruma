@@ -35,6 +35,15 @@ binary(grpc_mock) & (
 """
 threads-required = "num-test-threads"
 
+# The Windows signer tests of `ngr-library-resolver` create and remove a self-signed certificate
+# in the user's certificate store, which fails with access denied when two processes do so at once.
+[[profile.ci-windows.overrides]]
+filter = 'package(ngr-library-resolver) & test(/^signer::tests::windows::/)'
+test-group = "windows-cert-store"
+
+[test-groups]
+windows-cert-store = { max-threads = 1 }
+
 # Windows CI, for the tests that do not depend on timing and so need not run alone: the agent's
 # tests, which spend their time creating and syncing lock and journal files rather than on the CPU.
 # CI runs them in a separate nextest run before the `ci-windows` one, so they never run beside the

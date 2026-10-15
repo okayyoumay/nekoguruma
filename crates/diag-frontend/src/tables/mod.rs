@@ -13,13 +13,14 @@ mod records;
 mod resolve;
 pub mod rows;
 mod sheet;
-mod values;
+pub(crate) mod values;
 
 use std::collections::HashMap;
 use std::path::Path;
 
 use error::Errors;
 pub use error::{ErrorCode, Rejected, TableError};
+pub(crate) use fields::{Constant, constant_value};
 pub use resolve::{Definition, VariantRows, resolve};
 use rows::*;
 use sheet::{Sheet, Spec};

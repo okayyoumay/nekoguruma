@@ -736,14 +736,14 @@ impl<'a> Checker<'a> {
 /// for a `uint` constant, bytes for a `bytes` one. Values of the two kinds never match the same
 /// parameter, so they always differ.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Constant {
+pub(crate) enum Constant {
     Integer(u64),
     Bytes(Vec<u8>),
 }
 
 /// A constant's value, or `None` if it breaks a constant rule (reported by those rules), so that
 /// no clash follows from a broken value.
-fn constant_value(f: &FieldRow, value: &str) -> Option<Constant> {
+pub(crate) fn constant_value(f: &FieldRow, value: &str) -> Option<Constant> {
     let bits = f.bits.filter(|b| b.is_multiple_of(8))?;
     match f.field_type? {
         FieldType::Uint if (8..=64).contains(&bits) => {

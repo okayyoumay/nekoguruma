@@ -2286,3 +2286,57 @@ fn many_selects_cycles_and_sized_layouts_are_checked_in_linear_time() {
     assert!(errors.iter().all(|e| e.0 == IrRule && e.1 == "layouts.csv"));
     assert!(started.elapsed() < std::time::Duration::from_secs(20));
 }
+
+#[test]
+fn a_key_missing_its_width_and_large_selects_and_shared_items_are_checked_once() {
+    const L: &str = "layout:watchdogReset";
+    const CASES: u32 = 20_000;
+    const REPEATS: usize = 2_000;
+    let mut rows = vec![
+        // A bytes key without a width: its own error, nothing on the select.
+        format!("{L},nk,40,,bytes"),
+        format!("{L},sn,48,,,,,,,,,,select,,nk"),
+        // A 16-bit key with many disjoint cases, one overlapping at the end.
+        format!("{L},wk,50,,uint,16"),
+        format!("{L},sw,52,,,,,,,,,,select,,wk"),
+    ];
+    // Many fixed repeats sharing one large layout whose last field ends at byte 2,000.
+    let mut layouts = vec!["shared,0".to_owned()];
+    for i in 0..REPEATS {
+        rows.push(format!("layout:shared,f{i},{i},,uint,8"));
+    }
+    let mut repeats = String::from(
+        "container,field,count,items,item_bytes\nresponse:readDtcByStatusMask,records,end,,\n",
+    );
+    for i in 0..REPEATS {
+        rows.push(format!("response:many,r{i},1,,,,,,,,,,repeat,shared"));
+        let item_bytes = if i == 0 { 1_999 } else { 2_000 };
+        repeats.push_str(&format!("response:many,r{i},fixed,1,{item_bytes}\n"));
+    }
+    layouts.push("unused,0".to_owned());
+    let mut cases: Vec<String> = (0..CASES)
+        .map(|i| format!("{L},sw,c{i},{},,", i * 3))
+        .collect();
+    cases.push(format!("{L},sw,clash,{},{},", 3, 4));
+    let rows: Vec<&str> = rows.iter().map(String::as_str).collect();
+    let layouts: Vec<&str> = layouts.iter().map(String::as_str).collect();
+    let cases: Vec<&str> = cases.iter().map(String::as_str).collect();
+    let (mut files, first) = with_layouts(
+        &rows,
+        &[",many,0x65"],
+        &[("layouts.csv", &layouts), ("select_cases.csv", &cases)],
+    );
+    files.retain(|(n, _)| n != "repeats.csv");
+    files.push(("repeats.csv".into(), repeats.into_bytes()));
+    let started = std::time::Instant::now();
+    const S: &str = "select_cases.csv";
+    assert_eq!(
+        resolved(files),
+        vec![
+            at(MissingColumn, "fields.csv", Some(first), Some("bits")),
+            at(IrRule, "repeats.csv", Some(3), Some("item_bytes")),
+            at(Duplicate, S, Some(added_line(S, CASES)), Some("lower")),
+        ]
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(20));
+}

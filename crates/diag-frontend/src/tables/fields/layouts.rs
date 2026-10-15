@@ -219,8 +219,8 @@ impl<'a> Checker<'a> {
         let Some(key) = f.reference.as_ref().and_then(|name| self.referred(f, name)) else {
             return;
         };
-        if key.constant.is_some() || key.shape.is_some() {
-            // Reported by the reference rules.
+        if key.constant.is_some() || key.shape.is_some() || !self.key_cells_sound(key) {
+            // Reported by the reference rules, or by the key's own cells.
             return;
         }
         match key.field_type {
@@ -266,9 +266,14 @@ impl<'a> Checker<'a> {
             && key.shape.is_none()
             && key.field_type.is_some_and(|ty| ty != FieldType::Float)
             && (!key.field_type.is_some_and(super::string_like) || short_key(key))
-            && ["type", "bits", "length", "max_bytes"]
-                .iter()
-                .all(|column| !self.reported.contains(&(FILE, key.line, column)))
+            && self.key_cells_sound(key)
+    }
+
+    /// Whether the cells that set a key's type and width have no error of their own.
+    fn key_cells_sound(&self, key: &FieldRow) -> bool {
+        ["type", "bits", "length", "max_bytes"]
+            .iter()
+            .all(|column| !self.reported.contains(&(FILE, key.line, column)))
     }
 
     /// `select_cases.csv`: rows of `select` fields, at most one default per field, no overlaps,
@@ -304,7 +309,10 @@ impl<'a> Checker<'a> {
                 .and_then(|k| k.field_type)
                 .is_some_and(super::string_like);
             let mut default: Option<Line> = None;
-            let mut earlier: Vec<(i128, i128, Line)> = Vec::new();
+            // The cases accepted so far, disjoint, by their lower limit: a new case overlaps one
+            // of them exactly when it overlaps the one with the greatest lower limit not above
+            // its own upper limit.
+            let mut earlier: BTreeMap<i128, (i128, Line)> = BTreeMap::new();
             for c in cases {
                 let Some((lower, upper)) = c.range else {
                     if let Some(first) = default {
@@ -362,18 +370,18 @@ impl<'a> Checker<'a> {
                             .into(),
                     );
                 }
-                if let Some(&(_, _, first)) =
-                    earlier.iter().find(|(l, u, _)| lower <= *u && *l <= upper)
-                {
-                    self.error(
+                match earlier.range(..=upper).next_back() {
+                    Some((_, &(u, first))) if u >= lower => self.error(
                         ErrorCode::Duplicate,
                         "select_cases.csv",
                         c.line,
                         "lower",
                         format!("the range overlaps the case on line {first}"),
-                    );
+                    ),
+                    _ => {
+                        earlier.insert(lower, (upper, c.line));
+                    }
                 }
-                earlier.push((lower, upper, c.line));
             }
         }
     }
@@ -437,6 +445,7 @@ impl<'a> Checker<'a> {
     /// (`ir.fbs` `Repeat`).
     fn fixed_items(&mut self, index: &Index<'a>) {
         let t = self.t;
+        let mut extents: HashMap<&str, Option<(u64, &FieldRow)>> = HashMap::new();
         for r in &t.repeats {
             let RepeatCount::Fixed { item_bytes, .. } = r.count else {
                 continue;
@@ -448,15 +457,23 @@ impl<'a> Checker<'a> {
                 continue;
             };
             let limit = u64::from(item_bytes) * 8;
-            let past = index.layout_fields(layout).iter().find(|f| {
-                self.placed(f)
-                    && match (f.shape, f.byte) {
-                        (Some(_), Some(byte)) => u64::from(byte) > u64::from(item_bytes),
-                        (Some(_), None) => false,
-                        (None, _) => fixed_end(f).is_some_and(|end| end > limit),
-                    }
+            // Each layout's extent is found once, however many repeats share it.
+            let extent = *extents.entry(layout.as_str()).or_insert_with(|| {
+                index
+                    .layout_fields(layout)
+                    .iter()
+                    .filter(|f| self.placed(f))
+                    .filter_map(|&f| {
+                        let bits = match f.shape {
+                            // A shaped field consumes its layouts from where it starts.
+                            Some(_) => u64::from(f.byte?) * 8,
+                            None => fixed_end(f)?,
+                        };
+                        Some((bits, f))
+                    })
+                    .max_by_key(|&(bits, f)| (bits, std::cmp::Reverse(f.line)))
             });
-            if let Some(f) = past {
+            if let Some((_, f)) = extent.filter(|&(bits, _)| bits > limit) {
                 self.error(
                     ErrorCode::IrRule,
                     "repeats.csv",

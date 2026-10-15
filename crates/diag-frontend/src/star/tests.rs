@@ -763,3 +763,41 @@ fn an_excluded_builtin_is_not_a_value() {
     // A local of that spelling is a value.
     passes("def helper(sorted):\n    return sorted\n\ndef main():\n    helper(1)\n");
 }
+
+#[test]
+fn bytes_is_not_a_value() {
+    assert_eq!(
+        codes("def main():\n    a = bytes\n    return bytes\n"),
+        [
+            (StarCode::FunctionValueNotAllowed, 2),
+            (StarCode::FunctionValueNotAllowed, 3),
+        ]
+    );
+    passes("def helper(bytes):\n    return bytes\n\ndef main():\n    helper(1)\n");
+}
+
+#[test]
+fn constants_on_one_line_are_constants() {
+    passes("A = 1; B = 2\n\ndef main():\n    x = A + B\n");
+}
+
+#[test]
+fn a_rejected_top_level_target_is_checked_inside() {
+    assert_eq!(
+        codes("D = {}\nD[fail(\"x\")] = 1\nD.x = print(1)\n\ndef main():\n    pass\n"),
+        [
+            (StarCode::UnsupportedSyntax, 2),
+            (StarCode::FailNotAllowed, 2),
+            (StarCode::UnsupportedSyntax, 3),
+            (StarCode::BuiltinNotAllowed, 3),
+        ]
+    );
+}
+
+#[test]
+fn a_dict_literal_key_is_a_string_literal() {
+    assert_eq!(
+        codes("def main():\n    k = \"did\"\n    diag.request(0x22, {k: 0xF190, \"a\": 1})\n"),
+        [(StarCode::DynamicKeyNotAllowed, 3)]
+    );
+}

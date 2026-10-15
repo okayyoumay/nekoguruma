@@ -211,6 +211,7 @@ const FORBIDDEN_BUILTINS: &[&str] = &["print", "getattr", "hasattr", "dir"];
 const EXCLUDED_BUILTINS: &[&str] = &[
     "all",
     "any",
+    "bytes",
     "dict",
     "enumerate",
     "hash",
@@ -496,9 +497,10 @@ impl Checker<'_> {
         });
     }
 
+    /// The statements of a block, with the groupings (`a = 1; b = 2` on one line) flattened.
     fn statements(stmt: &AstStmt) -> Vec<&AstStmt> {
         match &stmt.node {
-            StmtP::Statements(list) => list.iter().collect(),
+            StmtP::Statements(list) => list.iter().flat_map(Self::statements).collect(),
             _ => vec![stmt],
         }
     }
@@ -574,6 +576,7 @@ impl Checker<'_> {
                             assign.lhs.span,
                             "a top-level constant is assigned to a single name (2.1)",
                         );
+                        self.target_parts(&assign.lhs, &mut Scope::default());
                     }
                     if let Some(ty) = &assign.ty {
                         self.error(
@@ -919,6 +922,23 @@ impl Checker<'_> {
         }
     }
 
+    /// The expressions inside an assignment target, which is reported already.
+    fn target_parts(&mut self, target: &AstAssignTarget, scope: &mut Scope) {
+        match &target.node {
+            AssignTargetP::Identifier(_) => {}
+            AssignTargetP::Tuple(items) => {
+                for item in items {
+                    self.target_parts(item, scope);
+                }
+            }
+            AssignTargetP::Index(pair) => {
+                self.expr(&pair.0, scope, false);
+                self.expr(&pair.1, scope, false);
+            }
+            AssignTargetP::Dot(object, _) => self.expr(object, scope, false),
+        }
+    }
+
     /// Whether `expr` is the `diag` module, not a name that hides it.
     fn is_diag(&self, expr: &AstExpr, scope: &Scope) -> bool {
         is_name(expr, "diag")
@@ -1114,6 +1134,13 @@ impl Checker<'_> {
             }
             ExprP::Dict(entries) => {
                 for (key, value) in entries {
+                    if !matches!(&key.node, ExprP::Literal(AstLiteral::String(_))) {
+                        self.error(
+                            StarCode::DynamicKeyNotAllowed,
+                            key.span,
+                            "a dict literal's keys are string literals only (4.1)",
+                        );
+                    }
                     self.expr(key, scope, false);
                     self.expr(value, scope, false);
                 }

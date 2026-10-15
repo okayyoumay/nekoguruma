@@ -70,7 +70,7 @@ pub(super) const PARAM_CYCLIC_RESP_TIMEOUT: ComParamId = ComParamId(0x8010);
 /// The per-occurrence reload window after receiving a ResponsePending
 /// indication (e.g. RC 0x78): `RcHandlingConfig::from_params` reads this
 /// as `rc78_p2_star_ms`, reloading the deadline on every 0x78 (ISO 14229-2
-/// §7.3 P2*client semantics, ADR-102 -- supersedes ADR-056/057's
+/// (2021) 9.2 P2*client semantics, ADR-102 -- supersedes ADR-056/057's
 /// anchor-once treatment of this value). See `PARAM_RC78_COMPLETION_TIMEOUT`
 /// for the independent total-duration ceiling.
 pub(super) const PARAM_P2_STAR: ComParamId = ComParamId(0x8011);

@@ -9,7 +9,7 @@
 
 ## Context
 
-ISO 14229-2 §7.3 specifies that a UDS client receiving NRC 0x78
+ISO 14229-2 (2021) 9.2 specifies that a UDS client receiving NRC 0x78
 (RequestCorrectlyReceived-ResponsePending) reloads its P2*client timer on
 *each* occurrence — the extended wait window resets every time the ECU
 sends another 0x78, with no standards-defined ceiling on the total number
@@ -23,7 +23,7 @@ that ComParam is *for*. However, ADR-057's anchor-once-at-first-occurrence
 fix — written to bound `CP_RC78CompletionTimeout`, whose name and doc
 comment describe a total-duration ceiling — stayed attached to the same
 deadline after ADR-056 repointed it at `CP_P2Star`. The result: a client
-that sets `CP_P2Star` to ISO 14229-2's typical `P2*server_max` default (5 s)
+that sets `CP_P2Star` to the `P2*server_max` value ISO 14229-2 (2021) 9.2 recommends (5 s)
 gets a **5 s total cap** on the entire 0x78 sequence, not a 5 s
 *per-occurrence* reload — a spec-legal ECU that emits periodic 0x78 during a
 long operation (e.g. flash erase, emitting 0x78 roughly every 4 s) times out

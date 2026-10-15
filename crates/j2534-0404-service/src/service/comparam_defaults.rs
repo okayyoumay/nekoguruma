@@ -701,7 +701,7 @@ pub(super) fn protocol_default_params(name: &str) -> Option<ComParamSet> {
     }?;
     // ADR-102 removes the ADR-056 CP_P2Star/CP_RC78CompletionTimeout preset
     // sync: CP_P2Star is now a reload-per-occurrence window (ISO 14229-2
-    // §7.3 P2*client semantics), not a ceiling-scale value, so seeding it
+    // (2021) 9.2 P2*client semantics), not a ceiling-scale value, so seeding it
     // from each preset's CP_RC78CompletionTimeout no longer makes sense.
     // Presets keep their existing CP_RC78CompletionTimeout values, which
     // ADR-102 reinstates as the (now-consulted again) total-duration

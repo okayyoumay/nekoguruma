@@ -74,5 +74,9 @@ applies its conversion (ADR-297). A `LinearScale` range includes both its limits
 scale whose range holds the value applies. `decode::decode_dtc_fields` decodes one of a
 `DtcDefinition`'s field lists (status, snapshot or extended) the same way, with the list's
 positions counted from a byte its caller states, since where a list starts depends on the service
-that returned the DTC. A field with a shape or a `CompuBytecode` conversion is rejected as
-unsupported for now.
+that returned the DTC. Both take the variant's `layouts`, since a field with a shape follows its
+nested layout there (ADR-242): it decodes to a `Group` of the layout's fields, a `Repeat` of each
+item's fields or a `Select` naming the chosen case and its fields (ADR-302). A nested layout's
+positions count from its first byte; a length, count or key refers to the nearest earlier
+occurrence of its field, in the same item when it is repeated; and decoding fails past 16 nested
+layouts or 65,536 decoded values. A `CompuBytecode` conversion is rejected as unsupported for now.

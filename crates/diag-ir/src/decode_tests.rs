@@ -3,8 +3,8 @@ use crate::IR_SCHEMA_VERSION;
 use crate::declaration::{
     CompuBytecodeT, CompuLinearT, CompuRationalT, CompuScaleLinearT, CompuT, CompuTableInterpT,
     CompuTextTableT, DtcDefinitionT, EcuDocumentT, EcuVariantT, FieldT, GroupT, InterpPointT,
-    LinearScaleT, PositiveResponseT, ServiceT, ShapeT, TextEntryT, encode_ecu_document,
-    load_ecu_document,
+    LayoutT, LinearScaleT, PositiveResponseT, RepeatT, SelectCaseT, SelectT, ServiceT, ShapeT,
+    TextEntryT, encode_ecu_document, load_ecu_document,
 };
 
 const SID: u8 = 0x62;
@@ -14,6 +14,16 @@ const SID: u8 = 0x62;
 fn decode(
     prefix: &[u8],
     fields: Vec<FieldT>,
+    message: &[u8],
+) -> Result<Vec<DecodedField>, DecodeError> {
+    decode_nested(prefix, fields, vec![], message)
+}
+
+/// As [`decode`], with `layouts` as the variant's nested layouts.
+fn decode_nested(
+    prefix: &[u8],
+    fields: Vec<FieldT>,
+    layouts: Vec<LayoutT>,
     message: &[u8],
 ) -> Result<Vec<DecodedField>, DecodeError> {
     let service = ServiceT {
@@ -33,19 +43,20 @@ fn decode(
         variant: Some(Box::new(EcuVariantT {
             id: 1,
             services: Some(vec![service]),
+            layouts: Some(layouts),
             ..Default::default()
         })),
         procedure: None,
     };
     let buf = encode_ecu_document(&document);
     let document = load_ecu_document(&buf).expect("test document loads");
-    let positive = document
-        .variant()
-        .and_then(|v| v.services())
+    let variant = document.variant().expect("test document has a variant");
+    let positive = variant
+        .services()
         .map(|s| s.get(0))
         .and_then(|s| s.positive())
         .expect("test document has a positive response");
-    decode_positive_response(&positive, message)
+    decode_positive_response(&positive, variant.layouts(), message)
 }
 
 fn values(result: Result<Vec<DecodedField>, DecodeError>) -> Vec<PhysicalValue> {
@@ -607,16 +618,598 @@ fn plans_that_break_the_schema_rules_are_rejected() {
     }
 }
 
+// ---------------------------------------------------------------- Nested layouts (ADR-242, ADR-302)
+
+fn layout(id: u32, byte_size: u32, fields: Vec<FieldT>) -> LayoutT {
+    LayoutT {
+        id,
+        short_name: Some(format!("l{id}")),
+        byte_size,
+        fields: Some(fields),
+    }
+}
+
+fn shaped(id: u32, shape: ShapeT) -> FieldT {
+    FieldT {
+        shape,
+        ..next(id, DataKind::Bytes, 0)
+    }
+}
+
+fn group(id: u32, layout_id: u32) -> FieldT {
+    shaped(id, ShapeT::Group(Box::new(GroupT { layout_id })))
+}
+
+fn repeat(id: u32, repeat: RepeatT) -> FieldT {
+    shaped(id, ShapeT::Repeat(Box::new(repeat)))
+}
+
+fn select(id: u32, key_field_id: u32, cases: Vec<(i64, i64, u32)>, default: Option<u32>) -> FieldT {
+    let cases = cases
+        .into_iter()
+        .enumerate()
+        .map(|(at, (lower, upper, layout_id))| SelectCaseT {
+            short_name: Some(format!("c{at}")),
+            lower,
+            upper,
+            layout_id,
+        })
+        .collect();
+    shaped(
+        id,
+        ShapeT::Select(Box::new(SelectT {
+            key_field_id,
+            cases: Some(cases),
+            has_default: default.is_some(),
+            default_layout_id: default.unwrap_or(0),
+        })),
+    )
+}
+
+/// The decoded value of the one field with `id` at the top level.
+fn value_of(decoded: &[DecodedField], id: u32) -> &PhysicalValue {
+    &decoded
+        .iter()
+        .find(|d| d.id == id)
+        .expect("the field is decoded")
+        .value
+}
+
+/// The values of a list of decoded fields.
+fn plain(fields: &[DecodedField]) -> Vec<PhysicalValue> {
+    fields.iter().map(|d| d.value.clone()).collect()
+}
+
 #[test]
-fn a_shaped_field_is_not_decoded_yet() {
-    let field = FieldT {
-        shape: ShapeT::Group(Box::new(GroupT { layout_id: 1 })),
-        ..next(1, DataKind::Uint, 0)
+fn a_group_decodes_its_layout_where_it_starts() {
+    // A one-byte length, a string of that many bytes, then a group that follows it: its
+    // fields count their positions from the group's first byte.
+    let fields = vec![
+        next(1, DataKind::Uint, 8),
+        FieldT {
+            length_kind: LengthKind::FromField,
+            length_field_id: 1,
+            ..next(2, DataKind::Ascii, 0)
+        },
+        group(3, 1),
+        next(4, DataKind::Uint, 8),
+    ];
+    let layouts = vec![layout(
+        1,
+        0,
+        vec![at(10, DataKind::Uint, 8, 8), at(11, DataKind::Uint, 0, 8)],
+    )];
+    let decoded = decode_nested(
+        &[],
+        fields,
+        layouts,
+        &[SID, 16, b'A', b'B', 0x0A, 0x0B, 0x0C],
+    )
+    .unwrap();
+    let PhysicalValue::Group(inner) = value_of(&decoded, 3) else {
+        panic!("not a group: {decoded:?}");
     };
+    assert_eq!(plain(inner), [Unsigned(0x0B), Unsigned(0x0A)]);
+    // The group ends after its field that ends last, so the next field reads the third byte.
+    assert_eq!(value_of(&decoded, 4), &Unsigned(0x0C));
+}
+
+#[test]
+fn a_layout_with_a_byte_size_ends_there_and_holds_its_fields() {
+    let fields = vec![group(1, 1), next(2, DataKind::Uint, 8)];
+    let sized = |inner: Vec<FieldT>| vec![layout(1, 3, inner)];
+    let decoded = decode_nested(
+        &[],
+        fields.clone(),
+        sized(vec![next(10, DataKind::Uint, 8)]),
+        &[SID, 1, 2, 3, 4],
+    )
+    .unwrap();
+    // The next field starts after the group's three bytes, not after its one field.
+    assert_eq!(value_of(&decoded, 2), &Unsigned(4));
+    // A field reaching past the layout's size is truncated, even with bytes in the message.
+    assert_eq!(
+        decode_nested(
+            &[],
+            fields.clone(),
+            sized(vec![at(10, DataKind::Uint, 16, 16)]),
+            &[SID, 1, 2, 3, 4, 5]
+        ),
+        Err(DecodeError::Truncated { field: 10 })
+    );
+    // A layout larger than what is left of the message is truncated.
+    assert_eq!(
+        decode_nested(&[], fields, sized(vec![]), &[SID, 1, 2]),
+        Err(DecodeError::Truncated { field: 1 })
+    );
+}
+
+#[test]
+fn a_fixed_repeat_has_items_a_fixed_size_apart() {
+    let fields = vec![
+        repeat(
+            1,
+            RepeatT {
+                layout_id: 1,
+                count: RepeatCount::Fixed,
+                fixed_count: 3,
+                item_byte_size: 2,
+                ..Default::default()
+            },
+        ),
+        next(2, DataKind::Uint, 8),
+    ];
+    // Each item uses one of its two bytes.
+    let layouts = || vec![layout(1, 0, vec![at(10, DataKind::Uint, 8, 8)])];
+    let decoded =
+        decode_nested(&[], fields.clone(), layouts(), &[SID, 0, 1, 0, 2, 0, 3, 9]).unwrap();
+    let PhysicalValue::Repeat(items) = value_of(&decoded, 1) else {
+        panic!("not a repeat: {decoded:?}");
+    };
+    let items: Vec<_> = items.iter().map(|item| plain(item)).collect();
+    assert_eq!(items, [[Unsigned(1)], [Unsigned(2)], [Unsigned(3)]]);
+    assert_eq!(value_of(&decoded, 2), &Unsigned(9));
+    // The last item does not fit.
+    assert_eq!(
+        decode_nested(&[], fields, layouts(), &[SID, 0, 1, 0, 2, 0]),
+        Err(DecodeError::Truncated { field: 1 })
+    );
+}
+
+#[test]
+fn a_fixed_item_cannot_reach_past_its_size() {
+    let fields = vec![repeat(
+        1,
+        RepeatT {
+            layout_id: 1,
+            count: RepeatCount::Fixed,
+            fixed_count: 1,
+            item_byte_size: 1,
+            ..Default::default()
+        },
+    )];
+    let layouts = vec![layout(1, 0, vec![next(10, DataKind::Uint, 16)])];
+    assert_eq!(
+        decode_nested(&[], fields, layouts, &[SID, 1, 2, 3]),
+        Err(DecodeError::Truncated { field: 10 })
+    );
+}
+
+#[test]
+fn a_repeat_count_comes_from_an_earlier_field() {
+    let fields = vec![
+        next(1, DataKind::Uint, 8),
+        repeat(
+            2,
+            RepeatT {
+                layout_id: 1,
+                count: RepeatCount::FromField,
+                count_field_id: 1,
+                ..Default::default()
+            },
+        ),
+        next(3, DataKind::Uint, 8),
+    ];
+    // Items of one length byte and that many data bytes; the length is the item's own.
+    let layouts = vec![layout(
+        1,
+        0,
+        vec![
+            next(10, DataKind::Uint, 8),
+            FieldT {
+                length_kind: LengthKind::FromField,
+                length_field_id: 10,
+                ..next(11, DataKind::Bytes, 0)
+            },
+        ],
+    )];
+    let decoded =
+        decode_nested(&[], fields, layouts, &[SID, 2, 8, 0xAA, 16, 0xBB, 0xCC, 7]).unwrap();
+    let PhysicalValue::Repeat(items) = value_of(&decoded, 2) else {
+        panic!("not a repeat: {decoded:?}");
+    };
+    let items: Vec<_> = items.iter().map(|item| plain(item)).collect();
+    assert_eq!(
+        items,
+        [
+            vec![Unsigned(8), Bytes(vec![0xAA])],
+            vec![Unsigned(16), Bytes(vec![0xBB, 0xCC])]
+        ]
+    );
+    assert_eq!(value_of(&decoded, 3), &Unsigned(7));
+}
+
+#[test]
+fn a_repeat_count_must_be_a_whole_number_decoded_first() {
+    let repeat_from = |count_field_id| {
+        repeat(
+            2,
+            RepeatT {
+                layout_id: 1,
+                count: RepeatCount::FromField,
+                count_field_id,
+                ..Default::default()
+            },
+        )
+    };
+    let layouts = || vec![layout(1, 0, vec![next(10, DataKind::Uint, 8)])];
     assert!(matches!(
-        decode(&[], vec![field], &[SID, 0]),
-        Err(DecodeError::Unsupported { field: 1, .. })
+        decode_nested(&[], vec![repeat_from(1)], layouts(), &[SID, 1]),
+        Err(DecodeError::InvalidPlan { field: 2, .. })
     ));
+    let negative = next(1, DataKind::Int, 8);
+    assert!(matches!(
+        decode_nested(
+            &[],
+            vec![negative, repeat_from(1)],
+            layouts(),
+            &[SID, 0xFF, 1]
+        ),
+        Err(DecodeError::InvalidValue { field: 2, .. })
+    ));
+    let text = next(1, DataKind::Ascii, 8);
+    assert!(matches!(
+        decode_nested(&[], vec![text, repeat_from(1)], layouts(), &[SID, b'1', 1]),
+        Err(DecodeError::InvalidPlan { field: 2, .. })
+    ));
+}
+
+#[test]
+fn an_end_marker_repeat_stops_at_the_marker_and_leaves_it() {
+    let fields = vec![
+        repeat(
+            1,
+            RepeatT {
+                layout_id: 1,
+                count: RepeatCount::UntilMarker,
+                marker: Some(Box::new(at(9, DataKind::Uint, 0, 8))),
+                marker_lower: 0xFF,
+                marker_upper: 0xFF,
+                ..Default::default()
+            },
+        ),
+        next(2, DataKind::Uint, 8),
+    ];
+    let layouts = || vec![layout(1, 0, vec![next(10, DataKind::Uint, 16)])];
+    let decoded = decode_nested(&[], fields.clone(), layouts(), &[SID, 0, 1, 0, 2, 0xFF]).unwrap();
+    let PhysicalValue::Repeat(items) = value_of(&decoded, 1) else {
+        panic!("not a repeat: {decoded:?}");
+    };
+    assert_eq!(items.len(), 2);
+    // The marker's byte is left for the next field.
+    assert_eq!(value_of(&decoded, 2), &Unsigned(0xFF));
+    // Without a marker the items run to the end of the message.
+    assert_eq!(
+        decode_nested(&[], fields, layouts(), &[SID, 0, 1, 0, 2]),
+        Err(DecodeError::Truncated { field: 2 })
+    );
+}
+
+#[test]
+fn a_byte_string_marker_is_compared_as_a_big_endian_integer() {
+    let fields = vec![repeat(
+        1,
+        RepeatT {
+            layout_id: 1,
+            count: RepeatCount::UntilMarker,
+            marker: Some(Box::new(at(9, DataKind::Bytes, 0, 16))),
+            marker_lower: 0xFFFE,
+            marker_upper: 0xFFFE,
+            ..Default::default()
+        },
+    )];
+    let layouts = vec![layout(1, 0, vec![next(10, DataKind::Uint, 8)])];
+    let decoded = decode_nested(&[], fields, layouts, &[SID, 1, 0xFF, 0xFF, 0xFE]).unwrap();
+    let PhysicalValue::Repeat(items) = value_of(&decoded, 1) else {
+        panic!("not a repeat: {decoded:?}");
+    };
+    let items: Vec<_> = items.iter().map(|item| plain(item)).collect();
+    // 0xFF 0xFF is no marker, so 0xFF is an item; the marker is 0xFF 0xFE.
+    assert_eq!(items, [[Unsigned(1)], [Unsigned(0xFF)]]);
+}
+
+#[test]
+fn an_end_of_pdu_repeat_runs_to_the_end_of_the_message() {
+    let fields = vec![
+        next(1, DataKind::Uint, 8),
+        repeat(
+            2,
+            RepeatT {
+                layout_id: 1,
+                count: RepeatCount::UntilEndOfPdu,
+                ..Default::default()
+            },
+        ),
+    ];
+    let layouts = vec![layout(1, 0, vec![next(10, DataKind::Uint, 16)])];
+    let decoded = decode_nested(&[], fields, layouts, &[SID, 7, 0, 1, 0, 2, 0, 3]).unwrap();
+    let PhysicalValue::Repeat(items) = value_of(&decoded, 2) else {
+        panic!("not a repeat: {decoded:?}");
+    };
+    let items: Vec<_> = items.iter().map(|item| plain(item)).collect();
+    assert_eq!(items, [[Unsigned(1)], [Unsigned(2)], [Unsigned(3)]]);
+}
+
+#[test]
+fn an_item_that_consumes_no_bytes_ends_the_repeat() {
+    for count in [RepeatCount::FromField, RepeatCount::UntilEndOfPdu] {
+        let fields = vec![
+            next(1, DataKind::Uint, 8),
+            repeat(
+                2,
+                RepeatT {
+                    layout_id: 1,
+                    count,
+                    count_field_id: 1,
+                    ..Default::default()
+                },
+            ),
+        ];
+        let layouts = vec![layout(1, 0, vec![])];
+        let decoded = decode_nested(&[], fields, layouts, &[SID, 200, 1, 2]).unwrap();
+        assert_eq!(
+            value_of(&decoded, 2),
+            &PhysicalValue::Repeat(vec![]),
+            "{count:?}"
+        );
+    }
+}
+
+#[test]
+fn a_select_decodes_the_case_its_key_chooses() {
+    let fields = |default| {
+        vec![
+            next(1, DataKind::Uint, 8),
+            select(2, 1, vec![(0, 0, 0), (3, 4, 1), (5, 5, 2)], default),
+            next(3, DataKind::Uint, 8),
+        ]
+    };
+    let layouts = || {
+        vec![
+            layout(1, 0, vec![next(10, DataKind::Uint, 16)]),
+            layout(2, 0, vec![next(20, DataKind::Uint, 8)]),
+        ]
+    };
+    let decoded = decode_nested(&[], fields(None), layouts(), &[SID, 4, 0x12, 0x34, 9]).unwrap();
+    assert_eq!(
+        value_of(&decoded, 2),
+        &PhysicalValue::Select {
+            case: Some(1),
+            fields: vec![DecodedField {
+                id: 10,
+                short_name: "f10".into(),
+                value: Unsigned(0x1234),
+                text_id: 0,
+                unit_id: 0,
+            }],
+        }
+    );
+    assert_eq!(value_of(&decoded, 3), &Unsigned(9));
+    // A case without a layout carries no data.
+    let decoded = decode_nested(&[], fields(None), layouts(), &[SID, 0, 9]).unwrap();
+    assert_eq!(
+        value_of(&decoded, 2),
+        &PhysicalValue::Select {
+            case: Some(0),
+            fields: vec![]
+        }
+    );
+    assert_eq!(value_of(&decoded, 3), &Unsigned(9));
+    // An unmatched key takes the default, or is rejected without one.
+    let decoded = decode_nested(&[], fields(Some(2)), layouts(), &[SID, 7, 8, 9]).unwrap();
+    let PhysicalValue::Select {
+        case: None,
+        fields: chosen,
+    } = value_of(&decoded, 2)
+    else {
+        panic!("not the default case: {decoded:?}");
+    };
+    assert_eq!(plain(chosen), [Unsigned(8)]);
+    assert!(matches!(
+        decode_nested(&[], fields(None), layouts(), &[SID, 7, 8, 9]),
+        Err(DecodeError::InvalidValue { field: 2, .. })
+    ));
+}
+
+#[test]
+fn a_select_key_is_the_internal_value() {
+    // The key field's conversion doubles its value; the cases name internal values.
+    let fields = vec![
+        with_compu(next(1, DataKind::Uint, 8), linear(2.0, 1.0, 0.0)),
+        select(2, 1, vec![(3, 3, 1)], None),
+    ];
+    let layouts = vec![layout(1, 0, vec![next(10, DataKind::Uint, 8)])];
+    let decoded = decode_nested(&[], fields, layouts, &[SID, 3, 5]).unwrap();
+    assert!(matches!(
+        value_of(&decoded, 2),
+        PhysicalValue::Select { case: Some(0), .. }
+    ));
+}
+
+#[test]
+fn a_nested_select_reads_a_key_from_its_own_layout() {
+    // A group holding a key and a select: the cascaded selection of ADR-242 item 3.
+    let fields = vec![group(1, 1)];
+    let layouts = vec![
+        layout(
+            1,
+            0,
+            vec![
+                next(10, DataKind::Uint, 8),
+                select(11, 10, vec![(1, 1, 2)], None),
+            ],
+        ),
+        layout(2, 0, vec![next(20, DataKind::Ascii, 16)]),
+    ];
+    let decoded = decode_nested(&[], fields, layouts, &[SID, 1, b'O', b'K']).unwrap();
+    let PhysicalValue::Group(inner) = value_of(&decoded, 1) else {
+        panic!("not a group: {decoded:?}");
+    };
+    let PhysicalValue::Select { fields: chosen, .. } = value_of(inner, 11) else {
+        panic!("not a select: {inner:?}");
+    };
+    assert_eq!(plain(chosen), [Text("OK".into())]);
+}
+
+#[test]
+fn shaped_fields_that_break_the_plan_are_rejected() {
+    let unknown_layout = vec![group(1, 9)];
+    let off_edge = vec![FieldT {
+        bit_offset: 3,
+        ..group(1, 1)
+    }];
+    let zero_size = vec![repeat(
+        1,
+        RepeatT {
+            layout_id: 1,
+            count: RepeatCount::Fixed,
+            fixed_count: 1,
+            ..Default::default()
+        },
+    )];
+    let no_marker = vec![repeat(
+        1,
+        RepeatT {
+            layout_id: 1,
+            count: RepeatCount::UntilMarker,
+            ..Default::default()
+        },
+    )];
+    let key_missing = vec![select(1, 5, vec![(0, 0, 1)], None)];
+    for (case, fields) in [
+        ("unknown layout", unknown_layout),
+        ("off a byte edge", off_edge),
+        ("zero item size", zero_size),
+        ("no marker", no_marker),
+        ("key not decoded", key_missing),
+    ] {
+        let layouts = vec![layout(1, 0, vec![next(10, DataKind::Uint, 8)])];
+        let result = decode_nested(&[], fields, layouts, &[SID, 1, 2]);
+        assert!(
+            matches!(result, Err(DecodeError::InvalidPlan { field: 1, .. })),
+            "{case}: {result:?}"
+        );
+    }
+}
+
+#[test]
+fn layouts_nest_at_most_sixteen_deep() {
+    // Layout n holds a group of layout n + 1; the last holds one byte.
+    let chain = |depth: u32| {
+        (1..=depth)
+            .map(|n| {
+                let inner = if n == depth {
+                    next(100 + n, DataKind::Uint, 8)
+                } else {
+                    group(100 + n, n + 1)
+                };
+                layout(n, 0, vec![inner])
+            })
+            .collect::<Vec<_>>()
+    };
+    assert!(decode_nested(&[], vec![group(1, 1)], chain(16), &[SID, 1]).is_ok());
+    assert_eq!(
+        decode_nested(&[], vec![group(1, 1)], chain(17), &[SID, 1]),
+        Err(DecodeError::TooDeep { field: 116 })
+    );
+}
+
+#[test]
+fn a_message_decodes_to_at_most_65536_values() {
+    // Fixed items of one byte with one field each: n items give n + 1 values with the repeat.
+    let fixed = |fixed_count| {
+        vec![repeat(
+            1,
+            RepeatT {
+                layout_id: 1,
+                count: RepeatCount::Fixed,
+                fixed_count,
+                item_byte_size: 1,
+                ..Default::default()
+            },
+        )]
+    };
+    let layouts = || vec![layout(1, 0, vec![next(10, DataKind::Uint, 8)])];
+    let mut message = vec![SID];
+    message.resize(1 + MAX_DECODED_VALUES, 0);
+    assert!(decode_nested(&[], fixed(65_535), layouts(), &message).is_ok());
+    assert_eq!(
+        decode_nested(&[], fixed(65_536), layouts(), &message),
+        Err(DecodeError::TooManyValues)
+    );
+    // A count larger than the message ends at the message rather than looping.
+    assert_eq!(
+        decode_nested(&[], fixed(u32::MAX), layouts(), &message),
+        Err(DecodeError::Truncated { field: 1 })
+    );
+}
+
+#[test]
+fn a_dtc_list_follows_nested_layouts_too() {
+    let snapshot = vec![
+        next(1, DataKind::Uint, 8),
+        repeat(
+            2,
+            RepeatT {
+                layout_id: 1,
+                count: RepeatCount::FromField,
+                count_field_id: 1,
+                ..Default::default()
+            },
+        ),
+    ];
+    let document = EcuDocumentT {
+        schema_version: IR_SCHEMA_VERSION,
+        source_format: Some("csv-starlark".into()),
+        source_digest: Some("00".into()),
+        variant: Some(Box::new(EcuVariantT {
+            id: 1,
+            dtcs: Some(vec![DtcDefinitionT {
+                code: 1,
+                snapshot_fields: Some(snapshot),
+                ..Default::default()
+            }]),
+            layouts: Some(vec![layout(1, 0, vec![next(10, DataKind::Uint, 8)])]),
+            ..Default::default()
+        })),
+        procedure: None,
+    };
+    let buf = encode_ecu_document(&document);
+    let document = load_ecu_document(&buf).expect("test document loads");
+    let variant = document.variant().unwrap();
+    let dtc = variant.dtcs().unwrap().get(0);
+    let decoded = decode_dtc_fields(
+        &dtc,
+        variant.layouts(),
+        DtcFields::Snapshot,
+        &[0x59, 2, 5, 6],
+        1,
+    )
+    .unwrap();
+    let PhysicalValue::Repeat(items) = value_of(&decoded, 2) else {
+        panic!("not a repeat: {decoded:?}");
+    };
+    assert_eq!(items.len(), 2);
 }
 
 // ---------------------------------------------------------------- Conversions
@@ -1028,12 +1621,12 @@ fn decode_dtc(
     };
     let buf = encode_ecu_document(&document);
     let document = load_ecu_document(&buf).expect("test document loads");
-    let dtc = document
-        .variant()
-        .and_then(|v| v.dtcs())
+    let variant = document.variant().expect("test document has a variant");
+    let dtc = variant
+        .dtcs()
         .map(|d| d.get(0))
         .expect("test document has a DTC");
-    decode_dtc_fields(&dtc, which, message, start)
+    decode_dtc_fields(&dtc, variant.layouts(), which, message, start)
 }
 
 /// Three status bits: bit 0, bit 3 and bit 7 of the status byte.

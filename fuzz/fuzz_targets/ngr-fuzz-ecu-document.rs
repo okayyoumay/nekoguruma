@@ -18,7 +18,7 @@ fuzz_target!(|data: &[u8]| {
     for service in variant.services().iter().flatten() {
         if let Some(positive) = service.positive() {
             // The input itself serves as the response, so the fields see arbitrary bytes too.
-            let _ = decode_positive_response(&positive, data);
+            let _ = decode_positive_response(&positive, variant.layouts(), data);
         }
     }
 });

@@ -297,17 +297,23 @@ fn the_source_digest_covers_the_table_files_as_stored() {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/example-ecu");
     let from_dir = to_ir(&resolve(read_directory(&dir).expect("reads")).expect("resolves"));
     assert_eq!(from_dir, convert(example()));
-    // Line ends are part of the bytes.
-    let crlf: Vec<_> = example()
+    // Line ends are part of the bytes. The checkout may already use CRLF (Git on Windows), so
+    // the line ends of one table are switched to the other kind.
+    let switched: Vec<_> = example()
         .into_iter()
         .map(|(name, contents)| {
             if name == "variants.csv" {
                 let text = String::from_utf8(contents).expect("UTF-8");
-                (name, text.replace('\n', "\r\n").into_bytes())
+                let text = if text.contains("\r\n") {
+                    text.replace("\r\n", "\n")
+                } else {
+                    text.replace('\n', "\r\n")
+                };
+                (name, text.into_bytes())
             } else {
                 (name, contents)
             }
         })
         .collect();
-    assert_ne!(digest(crlf), plain);
+    assert_ne!(digest(switched), plain);
 }

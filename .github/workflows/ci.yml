@@ -96,10 +96,10 @@ jobs:
       # sim-vci is a cdylib only, which cargo runs no doc tests for.
       - run: cargo test --workspace --locked --exclude sim-vci --doc
 
-  # Windows: some timing-sensitive worker-crate tests fail there when run in parallel, so the
-  # `ci-windows` profile runs one test at a time. The agent's tests are not among them and spend
-  # their time on file I/O, so they run first, on their own and in parallel (`ci-windows-parallel`);
-  # run one at a time they took about half of the Windows time. The second run does not rebuild.
+  # Windows: some timing-sensitive worker-crate tests fail there when other tests run beside them,
+  # so the `ci-windows` profile runs those alone and the rest four at a time. The agent's tests
+  # spend their time on file I/O, so they run first, on their own and in parallel
+  # (`ci-windows-parallel`), never beside the worker-crate tests. The second run does not rebuild.
   # On pull requests, j2534-0404-service (most of the remaining Windows time) is left out, but for
   # its restart end to end, which ends the worker in a Windows-specific way; Linux runs the rest of
   # it on every pull request. main runs everything.

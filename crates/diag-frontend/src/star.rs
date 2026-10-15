@@ -1459,15 +1459,29 @@ impl Checker<'_> {
     /// Recursion, direct or through other functions, is reported at each call that closes a
     /// cycle in the call graph (4.1).
     fn recursion(&mut self) {
-        let component = components(self.calls.iter().map(|c| (&*c.caller, &*c.callee)));
+        // Each name gets a number once: by its shared allocation, and only a name not seen in
+        // that allocation before is hashed as text, so a long name called many times is not
+        // hashed per call.
+        let mut by_pointer: HashMap<*const str, usize> = HashMap::new();
+        let mut by_text: HashMap<Rc<str>, usize> = HashMap::new();
+        let mut number = |name: &Rc<str>| -> usize {
+            *by_pointer.entry(Rc::as_ptr(name)).or_insert_with(|| {
+                let next = by_text.len();
+                *by_text.entry(name.clone()).or_insert(next)
+            })
+        };
+        let edges: Vec<(usize, usize)> = self
+            .calls
+            .iter()
+            .map(|call| (number(&call.caller), number(&call.callee)))
+            .collect();
+        let component = components(by_text.len(), &edges);
         let recursive: Vec<(Span, Rc<str>)> = self
             .calls
             .iter()
-            .filter(|call| {
-                call.caller == call.callee
-                    || component.get(&*call.caller) == component.get(&*call.callee)
-            })
-            .map(|call| (call.span, call.callee.clone()))
+            .zip(&edges)
+            .filter(|(_, (from, to))| component[*from] == component[*to])
+            .map(|(call, _)| (call.span, call.callee.clone()))
             .collect();
         for (span, callee) in recursive {
             // The name as the call writes it, not `outer.inner`, so the hint is no longer than
@@ -1739,24 +1753,15 @@ fn parse_limit(checker: &mut Checker<'_>, span: Span, value: &str, min: i128) ->
     }
 }
 
-/// The strongly connected component of each function in the call graph `edges` (Tarjan's
+/// The strongly connected component of each of the `count` functions in the call graph `edges`
+/// (Tarjan's
 /// algorithm, iterative so that a long call chain cannot exhaust the stack). Two functions share
 /// a component exactly when each reaches the other; time and memory are linear in the graph.
-fn components<'a>(edges: impl Iterator<Item = (&'a str, &'a str)>) -> HashMap<&'a str, usize> {
-    let mut ids: HashMap<&str, usize> = HashMap::new();
-    let mut successors: Vec<Vec<usize>> = Vec::new();
-    for (from, to) in edges {
-        let mut id = |name: &'a str| {
-            let next = ids.len();
-            *ids.entry(name).or_insert_with(|| {
-                successors.push(Vec::new());
-                next
-            })
-        };
-        let (from, to) = (id(from), id(to));
+fn components(count: usize, edges: &[(usize, usize)]) -> Vec<usize> {
+    let mut successors: Vec<Vec<usize>> = vec![Vec::new(); count];
+    for &(from, to) in edges {
         successors[from].push(to);
     }
-    let count = successors.len();
     let mut index = vec![usize::MAX; count];
     let mut low = vec![0; count];
     let mut on_stack = vec![false; count];
@@ -1806,9 +1811,7 @@ fn components<'a>(edges: impl Iterator<Item = (&'a str, &'a str)>) -> HashMap<&'
             }
         }
     }
-    ids.into_iter()
-        .map(|(name, id)| (name, component[id]))
-        .collect()
+    component
 }
 
 /// Every statement but the `Statements` groupings, in source order.

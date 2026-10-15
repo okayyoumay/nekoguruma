@@ -15,7 +15,7 @@
 //! A name assigned on only some paths (one branch of an `if`, the body of a `for`) counts as a
 //! dict after it when it is one on any path.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use serde::Serialize;
 use starlark_syntax::codemap::Span;
@@ -212,10 +212,12 @@ const EXCLUDED_BUILTINS: &[&str] = &[
     "all",
     "any",
     "bytes",
+    "chr",
     "dict",
     "enumerate",
     "hash",
     "list",
+    "ord",
     "repr",
     "reversed",
     "set",
@@ -423,8 +425,9 @@ struct Scope {
     /// The parameters and the names the function assigns, which hide the top-level names and the
     /// built-ins (2.2), with those of the functions it is nested in.
     locals: HashSet<String>,
-    /// The nested `def`s, already reported where they are defined (2.3).
-    closures: HashSet<String>,
+    /// The nested `def`s, already reported where they are defined (2.3), with the name each has
+    /// in the call graph: `outer.inner`.
+    closures: HashMap<String, String>,
     /// What the locals are known to be at the point being checked; a local missing here is not a
     /// dict.
     kinds: HashMap<String, Kinds>,
@@ -461,11 +464,16 @@ impl Scope {
                 own.insert(ident.node.ident.clone());
             }
         }
-        let mut closures = outer.closures.clone();
+        let mut nested = HashSet::new();
         if let Some(body) = body {
-            collect_locals(body, &mut own, &mut closures);
+            collect_locals(body, &mut own, &mut nested);
         }
-        closures.retain(|name| !own.contains(name));
+        let mut closures = outer.closures.clone();
+        for inner in nested {
+            let qualified = format!("{name}.{inner}");
+            closures.insert(inner, qualified);
+        }
+        closures.retain(|name, _| !own.contains(name));
         let mut kinds = outer.kinds.clone();
         kinds.retain(|name, _| !own.contains(name));
         let mut locals = outer.locals.clone();
@@ -689,11 +697,20 @@ impl Checker<'_> {
                         self.expr(default, defining, false);
                     }
                 }
-                ParameterP::Args(..) | ParameterP::KwArgs(..) => self.error(
-                    StarCode::UnsupportedSyntax,
-                    param.span,
-                    "`*args` and `**kwargs` are not supported (2.3)",
-                ),
+                ParameterP::Args(_, ty) | ParameterP::KwArgs(_, ty) => {
+                    self.error(
+                        StarCode::UnsupportedSyntax,
+                        param.span,
+                        "`*args` and `**kwargs` are not supported (2.3)",
+                    );
+                    if let Some(ty) = ty {
+                        self.error(
+                            StarCode::UnsupportedSyntax,
+                            ty.span,
+                            "type annotations are not supported (2.3)",
+                        );
+                    }
+                }
                 ParameterP::NoArgs | ParameterP::Slash => self.error(
                     StarCode::UnsupportedSyntax,
                     param.span,
@@ -810,7 +827,8 @@ impl Checker<'_> {
                     def.name.span,
                     "a nested `def` is not allowed; write it as a top-level `def` (2.3)",
                 );
-                self.function(scope, scope.name.clone(), def);
+                let qualified = format!("{}.{}", scope.name, def.name.node.ident);
+                self.function(scope, qualified, def);
             }
             StmtP::Load(_) => self.error(
                 StarCode::LoadNotAllowed,
@@ -909,14 +927,7 @@ impl Checker<'_> {
                     "assigning to an element or attribute is not supported: values are not \
                      mutated (2.5)",
                 );
-                match &target.node {
-                    AssignTargetP::Index(pair) => {
-                        self.expr(&pair.0, scope, false);
-                        self.expr(&pair.1, scope, false);
-                    }
-                    AssignTargetP::Dot(object, _) => self.expr(object, scope, false),
-                    _ => {}
-                }
+                self.target_parts(target, scope);
                 None
             }
         }
@@ -932,10 +943,24 @@ impl Checker<'_> {
                 }
             }
             AssignTargetP::Index(pair) => {
+                self.dict_key(&pair.0, &pair.1, scope);
                 self.expr(&pair.0, scope, false);
                 self.expr(&pair.1, scope, false);
             }
             AssignTargetP::Dot(object, _) => self.expr(object, scope, false),
+        }
+    }
+
+    /// A dict known as one is indexed with a string literal only (2.3, 4.1).
+    fn dict_key(&mut self, object: &AstExpr, key: &AstExpr, scope: &Scope) {
+        if self.kinds(object, scope).is_dict()
+            && !matches!(&key.node, ExprP::Literal(AstLiteral::String(_)))
+        {
+            self.error(
+                StarCode::DynamicKeyNotAllowed,
+                key.span,
+                "a dict is indexed with a string literal only (2.3, 4.1)",
+            );
         }
     }
 
@@ -1083,6 +1108,13 @@ impl Checker<'_> {
                 self.expr(&pair.1, scope, false);
             }
             ExprP::Index2(triple) => {
+                if self.kinds(&triple.0, scope).is_dict() {
+                    self.error(
+                        StarCode::DynamicKeyNotAllowed,
+                        expr.span,
+                        "a dict is indexed with a string literal only (2.3, 4.1)",
+                    );
+                }
                 self.error(
                     StarCode::UnsupportedSyntax,
                     expr.span,
@@ -1189,6 +1221,7 @@ impl Checker<'_> {
             return;
         }
         let function = self.defs.contains(name)
+            || scope.closures.contains_key(name)
             || (!self.globals.contains(name)
                 && (BUILTINS.contains(&name)
                     || FORBIDDEN_BUILTINS.contains(&name)
@@ -1210,8 +1243,16 @@ impl Checker<'_> {
             ExprP::Identifier(name) => {
                 let name = name.node.ident.as_str();
                 let local = scope.locals.contains(name);
-                if scope.closures.contains(name) && !local {
-                    // The nested `def` is reported where it is defined.
+                if let Some(qualified) = scope.closures.get(name).filter(|_| !local) {
+                    // The nested `def` is reported where it is defined; its calls still count
+                    // for recursion.
+                    if self.quiet == 0 {
+                        self.calls.push(Call {
+                            caller: scope.name.clone(),
+                            callee: qualified.clone(),
+                            span: function.span,
+                        });
+                    }
                 } else if local || (self.globals.contains(name) && !self.defs.contains(name)) {
                     self.error(
                         StarCode::FunctionValueNotAllowed,
@@ -1312,30 +1353,32 @@ impl Checker<'_> {
     /// Recursion, direct or through other functions, is reported at each call that closes a
     /// cycle in the call graph (4.1).
     fn recursion(&mut self) {
-        let mut edges: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        let mut edges: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
         for call in &self.calls {
             edges
                 .entry(call.caller.as_str())
                 .or_default()
-                .push(call.callee.as_str());
+                .insert(call.callee.as_str());
         }
-        let reaches = |from: &str, to: &str| -> bool {
-            let mut seen = HashSet::new();
-            let mut pending = vec![from];
-            while let Some(name) = pending.pop() {
-                if name == to {
-                    return true;
-                }
-                if seen.insert(name) {
-                    pending.extend(edges.get(name).into_iter().flatten().copied());
-                }
-            }
-            false
-        };
+        // What each function reaches, found once per function rather than once per call.
+        let mut reach: HashMap<&str, HashSet<&str>> = HashMap::new();
         let recursive: Vec<(Span, String)> = self
             .calls
             .iter()
-            .filter(|call| reaches(&call.callee, &call.caller))
+            .filter(|call| {
+                let from = call.callee.as_str();
+                let reached = reach.entry(from).or_insert_with(|| {
+                    let mut seen = HashSet::new();
+                    let mut pending = vec![from];
+                    while let Some(name) = pending.pop() {
+                        if seen.insert(name) {
+                            pending.extend(edges.get(name).into_iter().flatten().copied());
+                        }
+                    }
+                    seen
+                });
+                reached.contains(call.caller.as_str())
+            })
             .map(|call| (call.span, call.callee.clone()))
             .collect();
         for (span, callee) in recursive {
@@ -1401,6 +1444,14 @@ impl Checker<'_> {
             let Some(annotation) = text.strip_prefix('@') else {
                 continue;
             };
+            if annotation.starts_with(char::is_whitespace) || annotation.is_empty() {
+                self.error(
+                    StarCode::BadAnnotation,
+                    span,
+                    "an annotation keyword follows `@` directly, as in `@section` (4.2, 4.5, 4.6)",
+                );
+                continue;
+            }
             let resolved = file_span.resolve_span();
             let line = to_u32(resolved.begin.line + 1);
             let column = to_u32(resolved.begin.column);

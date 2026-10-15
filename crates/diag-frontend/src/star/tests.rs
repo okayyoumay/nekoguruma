@@ -787,6 +787,7 @@ fn a_rejected_top_level_target_is_checked_inside() {
         codes("D = {}\nD[fail(\"x\")] = 1\nD.x = print(1)\n\ndef main():\n    pass\n"),
         [
             (StarCode::UnsupportedSyntax, 2),
+            (StarCode::DynamicKeyNotAllowed, 2),
             (StarCode::FailNotAllowed, 2),
             (StarCode::UnsupportedSyntax, 3),
             (StarCode::BuiltinNotAllowed, 3),
@@ -799,5 +800,91 @@ fn a_dict_literal_key_is_a_string_literal() {
     assert_eq!(
         codes("def main():\n    k = \"did\"\n    diag.request(0x22, {k: 0xF190, \"a\": 1})\n"),
         [(StarCode::DynamicKeyNotAllowed, 3)]
+    );
+}
+
+#[test]
+fn chr_and_ord_are_not_values() {
+    assert_eq!(
+        codes("def main():\n    x = chr\n    y = ord\n"),
+        [
+            (StarCode::FunctionValueNotAllowed, 2),
+            (StarCode::FunctionValueNotAllowed, 3),
+        ]
+    );
+}
+
+#[test]
+fn an_annotation_keyword_follows_the_at_sign() {
+    assert_eq!(
+        codes(
+            "def main():\n    # @ section uninterruptible\n    diag.wait(1)\n    # @ endsection\n    \
+             # @\n    pass\n"
+        ),
+        [
+            (StarCode::BadAnnotation, 2),
+            (StarCode::BadAnnotation, 4),
+            (StarCode::BadAnnotation, 5),
+        ]
+    );
+}
+
+#[test]
+fn many_calls_are_checked_for_recursion_once_per_function() {
+    let calls = 20_000;
+    let mut source = String::from("def c():\n    pass\n\ndef b():\n");
+    source.push_str(&"    c()\n".repeat(calls));
+    source.push_str("\ndef main():\n");
+    source.push_str(&"    b()\n".repeat(calls));
+    let started = std::time::Instant::now();
+    passes(&source);
+    // Quadratic in the calls this took seconds; linear it takes a fraction of one.
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+}
+
+#[test]
+fn an_assigned_element_of_a_dict_has_a_literal_key() {
+    assert_eq!(
+        codes("def main():\n    d = {\"a\": 1}\n    k = \"a\"\n    d[k] = 2\n    d[k] += 2\n"),
+        [
+            (StarCode::UnsupportedSyntax, 4),
+            (StarCode::DynamicKeyNotAllowed, 4),
+            (StarCode::UnsupportedSyntax, 5),
+            (StarCode::DynamicKeyNotAllowed, 5),
+        ]
+    );
+}
+
+#[test]
+fn a_dict_indexed_with_two_keys_is_a_computed_key() {
+    assert_eq!(
+        codes("def main():\n    d = {\"a\": 1}\n    x = d[1, 2]\n"),
+        [
+            (StarCode::DynamicKeyNotAllowed, 3),
+            (StarCode::UnsupportedSyntax, 3),
+        ]
+    );
+}
+
+#[test]
+fn a_nested_def_is_a_function_value_and_can_recurse() {
+    assert_eq!(
+        codes("def main():\n    def g():\n        g()\n    x = g\n"),
+        [
+            (StarCode::ClosureNotAllowed, 2),
+            (StarCode::UnboundedNotAllowed, 3),
+            (StarCode::FunctionValueNotAllowed, 4),
+        ]
+    );
+}
+
+#[test]
+fn a_typed_star_parameter_reports_the_type_too() {
+    assert_eq!(
+        codes("def f(*args: int):\n    pass\n\ndef main():\n    pass\n"),
+        [
+            (StarCode::UnsupportedSyntax, 1),
+            (StarCode::UnsupportedSyntax, 1),
+        ]
     );
 }

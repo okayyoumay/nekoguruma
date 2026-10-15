@@ -364,7 +364,8 @@ their ids (a field id names the definition, not the occurrence; `ir.fbs`, `Field
 that a DTC names must have no shaped field, since `DtcDefinition` has no layouts of its own; its
 fields are checked against its `byte_size` and the size itself is not emitted. The fields of a
 status layout must lie within one byte (bits 0 to 7 of byte 0). Where snapshot and extended
-fields start in a message is the declaration-part decoder's rule, not this format's.
+fields start in a message is the declaration-part decoder's rule, not this format's: it decodes
+each list from a starting byte its caller states (`diag_ir::decode::decode_dtc_fields`).
 
 ### 4.12 `flash_sessions.csv` (scoped) and `flash_segments.csv`
 

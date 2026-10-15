@@ -71,5 +71,8 @@ source format or source digest, and layouts whose ids do not strictly increase. 
 `decode::decode_positive_response` decodes a response through its `PositiveResponse`: it checks
 the SID and the prefix, extracts each flat field as ISO 22901-1 (2008) 7.3.6.3 describes, and
 applies its conversion (ADR-297). A `LinearScale` range includes both its limits, and the first
-scale whose range holds the value applies. A field with a shape or a `CompuBytecode` conversion is
-rejected as unsupported for now.
+scale whose range holds the value applies. `decode::decode_dtc_fields` decodes one of a
+`DtcDefinition`'s field lists (status, snapshot or extended) the same way, with the list's
+positions counted from a byte its caller states, since where a list starts depends on the service
+that returned the DTC. A field with a shape or a `CompuBytecode` conversion is rejected as
+unsupported for now.

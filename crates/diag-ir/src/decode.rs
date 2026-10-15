@@ -2,14 +2,16 @@
 //!
 //! [`decode_positive_response`] checks a response's SID and prefix, extracts each field of
 //! `PositiveResponse.fields` as ISO 22901-1 (2008) 7.3.6.3 describes, and applies the field's
-//! conversion (`Compu`). Fields with a shape (nested layouts, ADR-242) and `CompuBytecode` are
-//! not decoded here yet; they fail with [`DecodeError::Unsupported`].
+//! conversion (`Compu`). [`decode_dtc_fields`] decodes one of a DTC's flat field lists the same
+//! way, from a byte the caller states. Fields with a shape (nested layouts, ADR-242) and
+//! `CompuBytecode` are not decoded here yet; they fail with [`DecodeError::Unsupported`].
 
 use flatbuffers::{ForwardsUOffset, Vector};
 use thiserror::Error;
 
 use crate::declaration::{
-    ByteOrder, Compu, DataKind, Field, LengthKind, Placement, PositiveResponse, Shape, Termination,
+    ByteOrder, Compu, DataKind, DtcDefinition, Field, LengthKind, Placement, PositiveResponse,
+    Shape, Termination,
 };
 
 /// A decoded value. Before a conversion it is the field's internal value; after one, the
@@ -63,6 +65,14 @@ pub enum DecodeError {
     /// an echoed identifier, ADR-295).
     #[error("the response does not start with its declared prefix")]
     PrefixMismatch,
+    /// The byte a DTC's field list is to start at is past the end of the message.
+    #[error("the DTC fields start at byte {start}, past the end of the {len}-byte message")]
+    StartPastEnd {
+        /// The stated starting byte.
+        start: usize,
+        /// The message's length.
+        len: usize,
+    },
     /// The field reaches past the end of the message.
     #[error("field {field} reaches past the end of the response")]
     Truncated {
@@ -134,6 +144,49 @@ pub fn decode_positive_response(
         Some(fields) => decode_fields(fields, message, 1 + prefix.len()),
         None => Ok(Vec::new()),
     }
+}
+
+/// One of a DTC's field lists (`DtcDefinition`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DtcFields {
+    /// `status_fields`: the bits of the DTC's status byte.
+    Status,
+    /// `snapshot_fields`: the data of a snapshot (freeze frame) record.
+    Snapshot,
+    /// `extended_fields`: the data of an extended data record.
+    Extended,
+}
+
+/// Decodes one of `dtc`'s field lists from `message`, with the list's layout starting at byte
+/// `start` of it.
+///
+/// The fields are decoded as [`decode_positive_response`] decodes a response's, in array order,
+/// but their positions count from `start`: an `Absolute` field at bit offset 0 begins at byte
+/// `start`, and an `AfterPrevious` first field starts there. A field that reaches past the end
+/// of `message` is truncated, and a terminated field ends at the end of `message` at the
+/// latest; bytes after the last field are not read. Where a list starts depends on the service
+/// that returned the DTC (its status byte in a status record, the data after a record's
+/// header in a snapshot or extended record), so the caller states it. A list the definition
+/// does not have decodes to no fields.
+pub fn decode_dtc_fields(
+    dtc: &DtcDefinition<'_>,
+    which: DtcFields,
+    message: &[u8],
+    start: usize,
+) -> Result<Vec<DecodedField>, DecodeError> {
+    let fields = match which {
+        DtcFields::Status => dtc.status_fields(),
+        DtcFields::Snapshot => dtc.snapshot_fields(),
+        DtcFields::Extended => dtc.extended_fields(),
+    };
+    let Some(fields) = fields.filter(|f| !f.is_empty()) else {
+        return Ok(Vec::new());
+    };
+    let rest = message.get(start..).ok_or(DecodeError::StartPastEnd {
+        start,
+        len: message.len(),
+    })?;
+    decode_fields(fields, rest, 0)
 }
 
 /// Decodes a flat field array over `message`; `start` is the byte where an `AfterPrevious`

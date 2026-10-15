@@ -2,8 +2,9 @@ use super::*;
 use crate::IR_SCHEMA_VERSION;
 use crate::declaration::{
     CompuBytecodeT, CompuLinearT, CompuRationalT, CompuScaleLinearT, CompuT, CompuTableInterpT,
-    CompuTextTableT, EcuDocumentT, EcuVariantT, FieldT, GroupT, InterpPointT, LinearScaleT,
-    PositiveResponseT, ServiceT, ShapeT, TextEntryT, encode_ecu_document, load_ecu_document,
+    CompuTextTableT, DtcDefinitionT, EcuDocumentT, EcuVariantT, FieldT, GroupT, InterpPointT,
+    LinearScaleT, PositiveResponseT, ServiceT, ShapeT, TextEntryT, encode_ecu_document,
+    load_ecu_document,
 };
 
 const SID: u8 = 0x62;
@@ -993,4 +994,160 @@ fn a_nan_float_passes_through_identity() {
         decode(&[], converted, &message),
         Err(DecodeError::Conversion { field: 1, .. })
     ));
+}
+
+// ---------------------------------------------------------------- DTCs
+
+/// Decodes `which` of a DTC with `status`, `snapshot` and `extended` field lists from `message`
+/// at `start`, after encoding it in a document and loading that through the checking loader.
+fn decode_dtc(
+    status: Option<Vec<FieldT>>,
+    snapshot: Option<Vec<FieldT>>,
+    extended: Option<Vec<FieldT>>,
+    which: DtcFields,
+    message: &[u8],
+    start: usize,
+) -> Result<Vec<DecodedField>, DecodeError> {
+    let document = EcuDocumentT {
+        schema_version: IR_SCHEMA_VERSION,
+        source_format: Some("csv-starlark".into()),
+        source_digest: Some("00".into()),
+        variant: Some(Box::new(EcuVariantT {
+            id: 1,
+            dtcs: Some(vec![DtcDefinitionT {
+                code: 0x01_23_45,
+                display_code: Some("P0123".into()),
+                status_fields: status,
+                snapshot_fields: snapshot,
+                extended_fields: extended,
+                ..Default::default()
+            }]),
+            ..Default::default()
+        })),
+        procedure: None,
+    };
+    let buf = encode_ecu_document(&document);
+    let document = load_ecu_document(&buf).expect("test document loads");
+    let dtc = document
+        .variant()
+        .and_then(|v| v.dtcs())
+        .map(|d| d.get(0))
+        .expect("test document has a DTC");
+    decode_dtc_fields(&dtc, which, message, start)
+}
+
+/// Three status bits: bit 0, bit 3 and bit 7 of the status byte.
+fn status_bits() -> Vec<FieldT> {
+    vec![
+        at(1, DataKind::Uint, 0, 1),
+        at(2, DataKind::Uint, 3, 1),
+        at(3, DataKind::Uint, 7, 1),
+    ]
+}
+
+#[test]
+fn the_status_bits_are_read_from_the_stated_byte() {
+    // A status record after the service's echo and mask: DTC 0x012345, status 0x29.
+    let message = [0x59, 0x02, 0xFF, 0x01, 0x23, 0x45, 0x29];
+    let decoded = decode_dtc(
+        Some(status_bits()),
+        None,
+        None,
+        DtcFields::Status,
+        &message,
+        6,
+    )
+    .expect("decodes");
+    assert_eq!(
+        decoded
+            .iter()
+            .map(|d| (d.id, d.value.clone()))
+            .collect::<Vec<_>>(),
+        [(1, Unsigned(1)), (2, Unsigned(1)), (3, Unsigned(0))]
+    );
+    assert_eq!(decoded[0].short_name, "f1");
+}
+
+#[test]
+fn snapshot_fields_count_their_positions_from_the_start() {
+    // After the stated start: a 16-bit value, then a byte scaled by 0.5 that follows it, then
+    // a byte at an absolute position 4 bytes in.
+    let snapshot = vec![
+        at(10, DataKind::Uint, 0, 16),
+        with_compu(next(11, DataKind::Uint, 8), linear(1.0, 2.0, 0.0)),
+        at(12, DataKind::Uint, 32, 8),
+    ];
+    let message = [0x59, 0x04, 0xAA, 0xBB, 0x01, 0xF4, 0x64, 0xEE, 0x07];
+    assert_eq!(
+        values(decode_dtc(
+            None,
+            Some(snapshot),
+            None,
+            DtcFields::Snapshot,
+            &message,
+            4,
+        )),
+        [Unsigned(500), Float(50.0), Unsigned(7)]
+    );
+}
+
+#[test]
+fn extended_fields_are_their_own_list() {
+    let extended = vec![at(20, DataKind::Uint, 0, 8), next(21, DataKind::Uint, 8)];
+    let message = [0x59, 0x06, 0x01, 0x23, 0x45, 0x29, 0x01, 0x05, 0x02];
+    // The extended list is decoded; the status list, though present, is not.
+    let decoded = decode_dtc(
+        Some(status_bits()),
+        None,
+        Some(extended),
+        DtcFields::Extended,
+        &message,
+        7,
+    );
+    assert_eq!(values(decoded), [Unsigned(5), Unsigned(2)]);
+}
+
+#[test]
+fn a_list_the_dtc_does_not_have_decodes_to_nothing() {
+    for which in [DtcFields::Snapshot, DtcFields::Extended] {
+        assert_eq!(
+            decode_dtc(Some(status_bits()), None, Some(vec![]), which, &[0x59], 9),
+            Ok(Vec::new())
+        );
+    }
+}
+
+#[test]
+fn a_dtc_list_past_the_end_of_the_message_is_rejected() {
+    let message = [0x59, 0x02, 0xFF, 0x01, 0x23, 0x45];
+    // Starting past the end.
+    assert_eq!(
+        decode_dtc(
+            Some(status_bits()),
+            None,
+            None,
+            DtcFields::Status,
+            &message,
+            7
+        ),
+        Err(DecodeError::StartPastEnd { start: 7, len: 6 })
+    );
+    // Starting at the end, with nothing left for the first field.
+    assert_eq!(
+        decode_dtc(
+            Some(status_bits()),
+            None,
+            None,
+            DtcFields::Status,
+            &message,
+            6
+        ),
+        Err(DecodeError::Truncated { field: 1 })
+    );
+    // A field that reaches past the end from a start inside the message.
+    let snapshot = vec![at(10, DataKind::Uint, 0, 16)];
+    assert_eq!(
+        decode_dtc(None, Some(snapshot), None, DtcFields::Snapshot, &message, 5),
+        Err(DecodeError::Truncated { field: 10 })
+    );
 }

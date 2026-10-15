@@ -36,7 +36,8 @@ format" section first. Permanent files never name a backlog file or item.
    vehicle damage, lost write or journal state, a broken trust boundary) or
    work that stops everything else. A development-process item (backlog
    and priority rules, documentation and ADR conventions, `CLAUDE.md`,
-   `.claude/` agents, skills and rules, review guidelines; defined in
+   `.claude/` agents, skills and rules, review guidelines, shortening the
+   pull-request CI run; defined in
    `work/README.md`) is P1 whatever the milestone, unless it meets P0, and
    goes in the project-wide backlog's "Development process" section. When unsure between two levels, pick the
    higher one and say so in your report.

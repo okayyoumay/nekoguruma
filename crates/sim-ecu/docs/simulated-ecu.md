@@ -15,7 +15,8 @@ message)` takes the addressing mode. `message` is the A_Data starting with the S
 `SimResponse`: a positive response (response SID included), a negative response (`7F SID NRC`
 via `to_bytes()`), or no response. `exchange(addressing, message)` returns the same response
 together with the delay before it is sent (`EcuConfig::response_delay_ms` plus any injected
-delay); the VCI side (`sim-vci`) applies it.
+delay); the VCI side (`sim-vci` for the J2534 worker, `iso22900-mock` for the D-PDU worker,
+ADR-299) applies it.
 
 The ECU's own timers (the session timeout and the security delay, below) run on a `Clock`.
 `SimEcu::new` uses real time (`SystemClock`); `SimEcu::with_clock(config, clock)` takes another,

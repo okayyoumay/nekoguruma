@@ -829,6 +829,9 @@ name = "iso22900-mock"
 version = "0.1.0"
 dependencies = [
  "iso22900-sys",
+ "serde",
+ "serde_json",
+ "sim-ecu",
 ]
 
 [[package]]

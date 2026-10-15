@@ -12,14 +12,16 @@
 //! argument) is left to the lowering. Computed dict keys (2.3) are found on the expressions known
 //! to be dicts without type inference: dict literals, the responses of `diag.request`,
 //! `diag.routine` and `diag.read_dtc`, a response's `"fields"`, and names assigned from those.
+//! A name assigned on only some paths (one branch of an `if`, the body of a `for`) counts as a
+//! dict after it when it is one on any path.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde::Serialize;
 use starlark_syntax::codemap::Span;
 use starlark_syntax::syntax::ast::{
-    ArgumentP, AssignTargetP, AstArgument, AstAssignTarget, AstExpr, AstLiteral, AstParameter,
-    AstStmt, ExprP, ParameterP, StmtP,
+    ArgumentP, AssignTargetP, AstArgument, AstAssignTarget, AstExpr, AstLiteral, AstNoPayload,
+    AstParameter, AstStmt, ClauseP, DefP, ExprP, ForClauseP, ParameterP, StmtP,
 };
 use starlark_syntax::syntax::{AstModule, Dialect, DialectTypes};
 
@@ -216,7 +218,7 @@ fn dialect() -> Dialect {
         enable_types: DialectTypes::ParseOnly,
         enable_load_reexport: false,
         enable_top_level_stmt: true,
-        enable_f_strings: false,
+        enable_f_strings: true,
         ..Dialect::Standard
     }
 }
@@ -231,10 +233,11 @@ pub fn check(file: &str, source: &str) -> Result<Checked, Vec<StarError>> {
         file,
         module: &module,
         errors: Vec::new(),
-        defs: HashMap::new(),
+        defs: HashSet::new(),
         globals: HashSet::new(),
-        global_dicts: HashSet::new(),
+        global_kinds: HashMap::new(),
         calls: Vec::new(),
+        quiet: 0,
     };
     checker.top_level();
     checker.recursion();
@@ -290,11 +293,6 @@ fn to_u32(n: usize) -> u32 {
     u32::try_from(n).unwrap_or(u32::MAX)
 }
 
-/// A top-level `def`: its line range, for the annotations, and whether it takes parameters.
-struct Def {
-    span: Span,
-}
-
 /// A call from one top-level `def` to another, for the recursion check (4.1).
 struct Call {
     caller: String,
@@ -306,23 +304,108 @@ struct Checker<'a> {
     file: &'a str,
     module: &'a AstModule,
     errors: Vec<StarError>,
-    /// The top-level `def`s by name.
-    defs: HashMap<String, Def>,
+    /// The names of the top-level `def`s.
+    defs: HashSet<String>,
     /// The top-level constants.
     globals: HashSet<String>,
-    /// The top-level constants bound to a dict.
-    global_dicts: HashSet<String>,
+    /// What the top-level constants are known to be.
+    global_kinds: HashMap<String, Kinds>,
     calls: Vec<Call>,
+    /// Above 0 while a loop body is walked only to find what its names are bound to: nothing is
+    /// reported then.
+    quiet: u32,
 }
 
-/// The names of the function being checked: its locals bound to a dict.
+/// What an expression is known to be, for the computed-key check (2.3). A name can be bound to
+/// different things on different paths, so both are kept.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Kinds {
+    /// A response of `diag.request`, `diag.routine` or `diag.read_dtc` (3.4).
+    response: bool,
+    /// Any other dict: a literal or a response's `"fields"`.
+    dict: bool,
+}
+
+impl Kinds {
+    const RESPONSE: Self = Self {
+        response: true,
+        dict: false,
+    };
+    const DICT: Self = Self {
+        response: false,
+        dict: true,
+    };
+
+    fn is_dict(self) -> bool {
+        self.response || self.dict
+    }
+
+    fn union(self, other: Self) -> Self {
+        Self {
+            response: self.response || other.response,
+            dict: self.dict || other.dict,
+        }
+    }
+}
+
+/// Adds the bindings of `other`, a state reached along another path, to `into`.
+fn merge(into: &mut HashMap<String, Kinds>, other: HashMap<String, Kinds>) {
+    for (name, kinds) in other {
+        let entry = into.entry(name).or_default();
+        *entry = entry.union(kinds);
+    }
+}
+
+/// The names of the function being checked.
+#[derive(Default, Clone)]
 struct Scope {
     name: String,
-    dicts: HashSet<String>,
+    /// The parameters and the names the function assigns, which hide the top-level names and the
+    /// built-ins (2.2), with those of the functions it is nested in.
+    locals: HashSet<String>,
+    /// The nested `def`s, already reported where they are defined (2.3).
+    closures: HashSet<String>,
+    /// What the locals are known to be at the point being checked; a local missing here is not a
+    /// dict.
+    kinds: HashMap<String, Kinds>,
+}
+
+impl Scope {
+    /// The scope of a function named `name` (the top-level one it belongs to, for the call graph)
+    /// nested in `outer`, with its parameters and, for a `def`, its body.
+    fn enter(outer: &Scope, name: String, params: &[AstParameter], body: Option<&AstStmt>) -> Self {
+        let mut own = HashSet::new();
+        for param in params {
+            if let ParameterP::Normal(ident, ..)
+            | ParameterP::Args(ident, _)
+            | ParameterP::KwArgs(ident, _) = &param.node
+            {
+                own.insert(ident.node.ident.clone());
+            }
+        }
+        let mut closures = outer.closures.clone();
+        if let Some(body) = body {
+            collect_locals(body, &mut own, &mut closures);
+        }
+        closures.retain(|name| !own.contains(name));
+        let mut kinds = outer.kinds.clone();
+        kinds.retain(|name, _| !own.contains(name));
+        let mut locals = outer.locals.clone();
+        locals.extend(own);
+        Scope {
+            name,
+            locals,
+            closures,
+            kinds,
+        }
+    }
 }
 
 impl Checker<'_> {
     fn error(&mut self, code: StarCode, span: Span, hint: impl Into<String>) {
+        if self.quiet > 0 {
+            return;
+        }
         let file_span = self.module.file_span(span);
         let resolved = file_span.resolve_span();
         self.errors.push(StarError {
@@ -350,18 +433,27 @@ impl Checker<'_> {
         for stmt in &top {
             match &stmt.node {
                 StmtP::Def(def) => {
-                    self.defs
-                        .insert(def.name.node.ident.clone(), Def { span: stmt.span });
+                    self.defs.insert(def.name.node.ident.clone());
                 }
                 StmtP::Assign(assign) => {
                     if let AssignTargetP::Identifier(name) = &assign.lhs.node {
                         self.globals.insert(name.node.ident.clone());
-                        if is_dict_literal(&assign.rhs) {
-                            self.global_dicts.insert(name.node.ident.clone());
-                        }
                     }
                 }
                 _ => {}
+            }
+        }
+        // In order, so that a constant assigned from another takes what that one is known to be.
+        for stmt in &top {
+            if let StmtP::Assign(assign) = &stmt.node
+                && let AssignTargetP::Identifier(name) = &assign.lhs.node
+            {
+                let kinds = self.kinds(&assign.rhs, &Scope::default());
+                if kinds.is_dict() {
+                    self.global_kinds.insert(name.node.ident.clone(), kinds);
+                } else {
+                    self.global_kinds.remove(&name.node.ident);
+                }
             }
         }
         let mut has_main = false;
@@ -379,35 +471,16 @@ impl Checker<'_> {
                             "`main` takes no parameters (2.1)",
                         );
                     }
-                    self.params(&def.params);
-                    if let Some(ty) = &def.return_type {
-                        self.error(
-                            StarCode::UnsupportedSyntax,
-                            ty.span,
-                            "type annotations are not supported (2.3)",
-                        );
-                    }
-                    let mut scope = Scope {
-                        name,
-                        dicts: HashSet::new(),
-                    };
-                    for (index, inner) in Self::statements(&def.body).into_iter().enumerate() {
-                        // A docstring opens the body.
-                        if index == 0 && is_string_expression(inner) {
-                            continue;
-                        }
-                        self.stmt(inner, &mut scope);
-                    }
+                    self.function(&Scope::default(), name, def);
                 }
                 StmtP::Assign(assign) => {
-                    let AssignTargetP::Identifier(_) = &assign.lhs.node else {
+                    if !matches!(&assign.lhs.node, AssignTargetP::Identifier(_)) {
                         self.error(
                             StarCode::UnsupportedSyntax,
                             assign.lhs.span,
                             "a top-level constant is assigned to a single name (2.1)",
                         );
-                        continue;
-                    };
+                    }
                     if let Some(ty) = &assign.ty {
                         self.error(
                             StarCode::UnsupportedSyntax,
@@ -424,11 +497,16 @@ impl Checker<'_> {
                 ),
                 // A module docstring.
                 StmtP::Expression(_) if at == 0 && is_string_expression(stmt) => {}
-                _ => self.error(
-                    StarCode::ToplevelStatementNotAllowed,
-                    stmt.span,
-                    "the top level holds only constant assignments and `def`s (2.1)",
-                ),
+                _ => {
+                    self.error(
+                        StarCode::ToplevelStatementNotAllowed,
+                        stmt.span,
+                        "the top level holds only constant assignments and `def`s (2.1)",
+                    );
+                    // What it holds is checked too, so that every violation is listed (5).
+                    let mut scope = Scope::enter(&Scope::default(), String::new(), &[], Some(stmt));
+                    self.stmt(stmt, &mut scope);
+                }
             }
         }
         if !has_main {
@@ -453,11 +531,27 @@ impl Checker<'_> {
                 "a top-level constant cannot call `diag` or a function of this file (2.1)",
             );
         }
-        let mut scope = Scope {
-            name: String::new(),
-            dicts: HashSet::new(),
-        };
-        self.expr(expr, &mut scope, false);
+        self.expr(expr, &mut Scope::default(), false);
+    }
+
+    /// A `def`'s parameters and body. `name` is the top-level function it belongs to.
+    fn function(&mut self, outer: &Scope, name: String, def: &DefP<AstNoPayload>) {
+        self.params(&def.params);
+        if let Some(ty) = &def.return_type {
+            self.error(
+                StarCode::UnsupportedSyntax,
+                ty.span,
+                "type annotations are not supported (2.3)",
+            );
+        }
+        let mut scope = Scope::enter(outer, name, &def.params, Some(&def.body));
+        for (index, inner) in Self::statements(&def.body).into_iter().enumerate() {
+            // A docstring opens the body.
+            if index == 0 && is_string_expression(inner) {
+                continue;
+            }
+            self.stmt(inner, &mut scope);
+        }
     }
 
     /// Positional parameters only, without defaults or types (2.3).
@@ -512,17 +606,17 @@ impl Checker<'_> {
                     );
                 }
                 self.expr(&assign.rhs, scope, false);
-                let dict = self.is_dict(&assign.rhs, scope);
-                if let Some(name) = self.target(&assign.lhs) {
-                    if dict {
-                        scope.dicts.insert(name);
+                let kinds = self.kinds(&assign.rhs, scope);
+                if let Some(name) = self.target(&assign.lhs, scope) {
+                    if kinds.is_dict() {
+                        scope.kinds.insert(name, kinds);
                     } else {
-                        scope.dicts.remove(&name);
+                        scope.kinds.remove(&name);
                     }
                 }
             }
             StmtP::AssignModify(target, _, value) => {
-                self.target(target);
+                self.target(target, scope);
                 self.expr(value, scope, false);
             }
             StmtP::Statements(list) => {
@@ -530,27 +624,62 @@ impl Checker<'_> {
                     self.stmt(inner, scope);
                 }
             }
+            // Each branch starts from the bindings before the `if`, and what follows sees the
+            // bindings of every path, the skipped one included.
             StmtP::If(condition, then) => {
                 self.expr(condition, scope, false);
+                let entry = scope.kinds.clone();
                 self.stmt(then, scope);
+                merge(&mut scope.kinds, entry);
             }
             StmtP::IfElse(condition, branches) => {
                 self.expr(condition, scope, false);
+                let entry = scope.kinds.clone();
                 self.stmt(&branches.0, scope);
+                let then = std::mem::replace(&mut scope.kinds, entry);
                 self.stmt(&branches.1, scope);
+                merge(&mut scope.kinds, then);
             }
             StmtP::For(for_) => {
-                if let Some(name) = self.target(&for_.var) {
-                    scope.dicts.remove(&name);
-                }
+                // The iterable is evaluated once, with the bindings before the loop.
                 self.expr(&for_.over, scope, false);
-                self.stmt(&for_.body, scope);
+                let entry = scope.kinds.clone();
+                if self.quiet > 0 {
+                    // A loop inside a body walked quietly takes one pass: the loop around it
+                    // repeats that walk until nothing changes, which repeats this pass as well.
+                    // A fixpoint per level would cost passes exponential in the nesting depth.
+                    self.loop_body(&for_.var, &for_.body, scope);
+                    merge(&mut scope.kinds, entry);
+                    return;
+                }
+                // A pass sees the bindings before the loop and those a previous pass leaves, so
+                // these are found first without reporting; the body is then checked once.
+                let mut state = entry;
+                loop {
+                    scope.kinds = state.clone();
+                    self.quiet += 1;
+                    self.loop_body(&for_.var, &for_.body, scope);
+                    self.quiet -= 1;
+                    let mut next = state.clone();
+                    merge(&mut next, std::mem::take(&mut scope.kinds));
+                    if next == state {
+                        break;
+                    }
+                    state = next;
+                }
+                scope.kinds = state.clone();
+                self.loop_body(&for_.var, &for_.body, scope);
+                // The loop may run no pass at all.
+                merge(&mut scope.kinds, state);
             }
-            StmtP::Def(def) => self.error(
-                StarCode::ClosureNotAllowed,
-                def.name.span,
-                "a nested `def` is not allowed; write it as a top-level `def` (2.3)",
-            ),
+            StmtP::Def(def) => {
+                self.error(
+                    StarCode::ClosureNotAllowed,
+                    def.name.span,
+                    "a nested `def` is not allowed; write it as a top-level `def` (2.3)",
+                );
+                self.function(scope, scope.name.clone(), def);
+            }
             StmtP::Load(_) => self.error(
                 StarCode::LoadNotAllowed,
                 stmt.span,
@@ -559,16 +688,30 @@ impl Checker<'_> {
         }
     }
 
+    /// One pass of a `for` body: the target is bound to an element, which is not known to be a
+    /// dict.
+    fn loop_body(&mut self, var: &AstAssignTarget, body: &AstStmt, scope: &mut Scope) {
+        if let Some(name) = self.target(var, scope) {
+            scope.kinds.remove(&name);
+        }
+        self.stmt(body, scope);
+    }
+
     /// An assignment target: a single name. Returns the name.
-    fn target(&mut self, target: &AstAssignTarget) -> Option<String> {
+    fn target(&mut self, target: &AstAssignTarget, scope: &mut Scope) -> Option<String> {
         match &target.node {
             AssignTargetP::Identifier(name) => Some(name.node.ident.clone()),
-            AssignTargetP::Tuple(_) => {
+            AssignTargetP::Tuple(items) => {
                 self.error(
                     StarCode::UnsupportedSyntax,
                     target.span,
                     "unpacking assignment is not supported; assign each name (2.2)",
                 );
+                for item in items {
+                    if let Some(name) = self.target(item, scope) {
+                        scope.kinds.remove(&name);
+                    }
+                }
                 None
             }
             AssignTargetP::Index(_) | AssignTargetP::Dot(..) => {
@@ -578,31 +721,96 @@ impl Checker<'_> {
                     "assigning to an element or attribute is not supported: values are not \
                      mutated (2.5)",
                 );
+                match &target.node {
+                    AssignTargetP::Index(pair) => {
+                        self.expr(&pair.0, scope, false);
+                        self.expr(&pair.1, scope, false);
+                    }
+                    AssignTargetP::Dot(object, _) => self.expr(object, scope, false),
+                    _ => {}
+                }
                 None
             }
         }
     }
 
-    /// Whether `expr` is known to be a dict (see the module documentation).
-    fn is_dict(&self, expr: &AstExpr, scope: &Scope) -> bool {
+    /// Whether `expr` is the `diag` module, not a name that hides it.
+    fn is_diag(&self, expr: &AstExpr, scope: &Scope) -> bool {
+        is_name(expr, "diag") && !scope.locals.contains("diag") && !self.globals.contains("diag")
+    }
+
+    /// What `expr` is known to be (see the module documentation).
+    fn kinds(&self, expr: &AstExpr, scope: &Scope) -> Kinds {
         match &expr.node {
-            ExprP::Dict(_) => true,
+            ExprP::Dict(_) => Kinds::DICT,
             ExprP::Identifier(name) => {
-                scope.dicts.contains(&name.node.ident)
-                    || self.global_dicts.contains(&name.node.ident)
+                let name = &name.node.ident;
+                let known = if scope.locals.contains(name) {
+                    scope.kinds.get(name)
+                } else {
+                    self.global_kinds.get(name)
+                };
+                known.copied().unwrap_or_default()
             }
             ExprP::Call(callee, _) => match &callee.node {
-                ExprP::Dot(module, function) => {
-                    is_name(module, "diag") && DIAG_RESPONSES.contains(&function.node.as_str())
+                ExprP::Dot(module, function)
+                    if self.is_diag(module, scope)
+                        && DIAG_RESPONSES.contains(&function.node.as_str()) =>
+                {
+                    Kinds::RESPONSE
                 }
-                _ => false,
+                _ => Kinds::default(),
             },
-            ExprP::Index(pair) => {
-                matches!(&pair.1.node, ExprP::Literal(AstLiteral::String(key)) if key.node == "fields")
-                    && self.is_dict(&pair.0, scope)
+            // Only a response's `"fields"` is a dict; the values it holds are not (3.4).
+            ExprP::Index(pair)
+                if matches!(&pair.1.node, ExprP::Literal(AstLiteral::String(key)) if key.node == "fields")
+                    && self.kinds(&pair.0, scope).response =>
+            {
+                Kinds::DICT
             }
-            _ => false,
+            ExprP::If(triple) => self
+                .kinds(&triple.1, scope)
+                .union(self.kinds(&triple.2, scope)),
+            _ => Kinds::default(),
         }
+    }
+
+    /// A comprehension, after it has been reported: its parts, with its loop variables bound.
+    fn comprehension(
+        &mut self,
+        first: &ForClauseP<AstNoPayload>,
+        clauses: &[ClauseP<AstNoPayload>],
+        elements: &[&AstExpr],
+        scope: &mut Scope,
+    ) {
+        // The first iterable is evaluated outside the comprehension.
+        self.expr(&first.over, scope, false);
+        let mut inner = scope.clone();
+        self.bind(&first.var, &mut inner);
+        for clause in clauses {
+            match clause {
+                ClauseP::For(for_) => {
+                    self.expr(&for_.over, &mut inner, false);
+                    self.bind(&for_.var, &mut inner);
+                }
+                ClauseP::If(condition) => self.expr(condition, &mut inner, false),
+            }
+        }
+        for element in elements {
+            self.expr(element, &mut inner, false);
+        }
+    }
+
+    /// Binds the names of a comprehension's loop target in `scope`.
+    fn bind(&mut self, target: &AstAssignTarget, scope: &mut Scope) {
+        let mut names = HashSet::new();
+        target_names(target, &mut names);
+        for name in &names {
+            scope.kinds.remove(name);
+            scope.closures.remove(name);
+        }
+        scope.locals.extend(names);
+        self.target(target, scope);
     }
 
     /// Checks an expression; `callee` is true when it is the function a call names.
@@ -614,7 +822,7 @@ impl Checker<'_> {
                 "`...` is not supported (2.2)",
             ),
             ExprP::Literal(_) => {}
-            ExprP::Identifier(name) => self.identifier(&name.node.ident, expr.span, callee),
+            ExprP::Identifier(name) => self.identifier(&name.node.ident, expr.span, callee, scope),
             ExprP::Tuple(items) => {
                 self.error(
                     StarCode::UnsupportedSyntax,
@@ -626,7 +834,7 @@ impl Checker<'_> {
                 }
             }
             ExprP::Dot(object, attribute) => {
-                if is_name(object, "diag") {
+                if self.is_diag(object, scope) {
                     if !callee {
                         self.error(
                             StarCode::FunctionValueNotAllowed,
@@ -650,7 +858,7 @@ impl Checker<'_> {
             }
             ExprP::Call(function, args) => self.call(function, &args.args, scope),
             ExprP::Index(pair) => {
-                if self.is_dict(&pair.0, scope)
+                if self.kinds(&pair.0, scope).is_dict()
                     && !matches!(&pair.1.node, ExprP::Literal(AstLiteral::String(_)))
                 {
                     self.error(
@@ -678,11 +886,16 @@ impl Checker<'_> {
                     self.expr(bound, scope, false);
                 }
             }
-            ExprP::Lambda(_) => self.error(
-                StarCode::ClosureNotAllowed,
-                expr.span,
-                "`lambda` is not allowed; write a top-level `def` (2.3)",
-            ),
+            ExprP::Lambda(lambda) => {
+                self.error(
+                    StarCode::ClosureNotAllowed,
+                    expr.span,
+                    "`lambda` is not allowed; write a top-level `def` (2.3)",
+                );
+                self.params(&lambda.params);
+                let mut inner = Scope::enter(scope, scope.name.clone(), &lambda.params, None);
+                self.expr(&lambda.body, &mut inner, false);
+            }
             ExprP::Not(inner) | ExprP::Minus(inner) | ExprP::Plus(inner) | ExprP::BitNot(inner) => {
                 self.expr(inner, scope, false)
             }
@@ -706,22 +919,38 @@ impl Checker<'_> {
                     self.expr(value, scope, false);
                 }
             }
-            ExprP::ListComprehension(..) | ExprP::DictComprehension(..) => self.error(
-                StarCode::UnsupportedSyntax,
-                expr.span,
-                "comprehensions are not supported; use a `for` loop (2.3)",
-            ),
-            ExprP::FString(_) => self.error(
-                StarCode::UnsupportedSyntax,
-                expr.span,
-                "f-strings are not supported (2.2)",
-            ),
+            ExprP::ListComprehension(element, first, clauses) => {
+                self.error(
+                    StarCode::UnsupportedSyntax,
+                    expr.span,
+                    "comprehensions are not supported; use a `for` loop (2.3)",
+                );
+                self.comprehension(first, clauses, &[element], scope);
+            }
+            ExprP::DictComprehension(entry, first, clauses) => {
+                self.error(
+                    StarCode::UnsupportedSyntax,
+                    expr.span,
+                    "comprehensions are not supported; use a `for` loop (2.3)",
+                );
+                self.comprehension(first, clauses, &[&entry.0, &entry.1], scope);
+            }
+            ExprP::FString(fstring) => {
+                self.error(
+                    StarCode::UnsupportedSyntax,
+                    expr.span,
+                    "f-strings are not supported (2.2)",
+                );
+                for inner in &fstring.node.expressions {
+                    self.expr(inner, scope, false);
+                }
+            }
         }
     }
 
     /// A name: a function is only called, never used as a value (2.3), and `None` has no value
-    /// at run time (2.5).
-    fn identifier(&mut self, name: &str, span: Span, callee: bool) {
+    /// at run time (2.5). A local hides the functions and built-ins of the same name.
+    fn identifier(&mut self, name: &str, span: Span, callee: bool, scope: &Scope) {
         if name == "None" {
             self.error(
                 StarCode::UnsupportedSyntax,
@@ -730,10 +959,10 @@ impl Checker<'_> {
             );
             return;
         }
-        if callee {
+        if callee || scope.locals.contains(name) {
             return;
         }
-        let function = self.defs.contains_key(name)
+        let function = self.defs.contains(name)
             || (!self.globals.contains(name)
                 && (BUILTINS.contains(&name)
                     || FORBIDDEN_BUILTINS.contains(&name)
@@ -753,13 +982,24 @@ impl Checker<'_> {
         match &function.node {
             ExprP::Identifier(name) => {
                 let name = name.node.ident.as_str();
-                if self.defs.contains_key(name) {
+                let local = scope.locals.contains(name);
+                if scope.closures.contains(name) && !local {
+                    // The nested `def` is reported where it is defined.
+                } else if local || (self.globals.contains(name) && !self.defs.contains(name)) {
+                    self.error(
+                        StarCode::FunctionValueNotAllowed,
+                        function.span,
+                        format!("`{name}` is a value, not a function: it cannot be called (2.3)"),
+                    );
+                } else if self.defs.contains(name) {
                     user_function = true;
-                    self.calls.push(Call {
-                        caller: scope.name.clone(),
-                        callee: name.to_owned(),
-                        span: function.span,
-                    });
+                    if self.quiet == 0 {
+                        self.calls.push(Call {
+                            caller: scope.name.clone(),
+                            callee: name.to_owned(),
+                            span: function.span,
+                        });
+                    }
                 } else if name == "fail" {
                     self.error(
                         StarCode::FailNotAllowed,
@@ -787,11 +1027,11 @@ impl Checker<'_> {
                         ),
                     );
                 }
-                self.identifier(name, function.span, true);
+                self.identifier(name, function.span, true, scope);
             }
             ExprP::Dot(object, method) => {
                 let method = method.node.as_str();
-                if is_name(object, "diag") {
+                if self.is_diag(object, scope) {
                     if !DIAG_FUNCTIONS.contains(&method) {
                         self.error(
                             StarCode::BuiltinNotAllowed,
@@ -881,37 +1121,47 @@ impl Checker<'_> {
     }
 
     /// Reads and checks the comment annotations (4.2, 4.5, 4.6). An annotation is attached by
-    /// its line to the statement that follows it.
+    /// its line to the statement that follows it, which must be in the same function.
     fn annotations(&mut self) -> Vec<Annotation> {
         let module = self.module;
+        let line_of = |span: Span| to_u32(module.file_span(span).resolve_span().begin.line + 1);
         let mut statements = Vec::new();
         collect_statements(module.statement(), &mut statements);
         let statement_lines: Vec<(u32, bool)> = statements
             .iter()
-            .map(|stmt| {
-                let line = to_u32(module.file_span(stmt.span).resolve_span().begin.line + 1);
-                (line, matches!(stmt.node, StmtP::For(_)))
+            .map(|stmt| (line_of(stmt.span), matches!(stmt.node, StmtP::For(_))))
+            .collect();
+        // A top-level `def` holds the lines after its own up to the next top-level statement, and
+        // of those the comments indented further than `def`: a comment after the last statement
+        // of the body still belongs to it.
+        let top = Self::statements(module.statement());
+        let defs: Vec<((u32, u32), u32)> = top
+            .iter()
+            .enumerate()
+            .filter(|(_, stmt)| matches!(stmt.node, StmtP::Def(_)))
+            .map(|(at, stmt)| {
+                let begin = module.file_span(stmt.span).resolve_span().begin;
+                let end = top
+                    .get(at + 1)
+                    .map_or(u32::MAX, |next| line_of(next.span) - 1);
+                ((to_u32(begin.line + 1), end), to_u32(begin.column))
             })
             .collect();
-        let defs: Vec<(u32, u32)> = self
-            .defs
-            .values()
-            .map(|def| {
-                let span = module.file_span(def.span).resolve_span();
-                (to_u32(span.begin.line + 1), to_u32(span.end.line + 1))
-            })
-            .collect();
-        let enclosing = |line: u32| {
+        let enclosing = |line: u32, column: u32| {
             defs.iter()
-                .copied()
-                .find(|(begin, end)| *begin < line && line <= *end)
+                .find(|((begin, end), def_column)| {
+                    *begin < line && line <= *end && column > *def_column
+                })
+                .map(|(range, _)| *range)
         };
-        let next_statement = |line: u32| {
+        // The statement after `line`, if it is in the function `def`.
+        let next_statement = |def: (u32, u32), line: u32| {
             statement_lines
                 .iter()
                 .filter(|(at, _)| *at > line)
                 .min_by_key(|(at, _)| *at)
                 .copied()
+                .filter(|(at, _)| def.0 < *at && *at <= def.1)
         };
         let mut annotations = Vec::new();
         // The open `@section` of the function being read: its def, column and comment.
@@ -940,10 +1190,13 @@ impl Checker<'_> {
                     let Some(limit) = parse_limit(self, span, value, 1) else {
                         continue;
                     };
-                    if !matches!(next_statement(line), Some((_, true))) {
+                    let target = enclosing(line, column).and_then(|def| next_statement(def, line));
+                    if !matches!(target, Some((_, true))) {
                         bad(
                             self,
-                            "`@maxIterations` must precede a `for` statement (4.2)".to_owned(),
+                            "`@maxIterations` must precede a `for` statement in the same function \
+                             (4.2)"
+                                .to_owned(),
                         );
                         continue;
                     }
@@ -963,10 +1216,11 @@ impl Checker<'_> {
                             continue;
                         }
                     };
-                    if enclosing(line).is_none() || next_statement(line).is_none() {
+                    let target = enclosing(line, column).and_then(|def| next_statement(def, line));
+                    if target.is_none() {
                         bad(
                             self,
-                            "`@idempotency` must precede a statement in a function (4.6)"
+                            "`@idempotency` must precede a statement in the same function (4.6)"
                                 .to_owned(),
                         );
                         continue;
@@ -1011,7 +1265,7 @@ impl Checker<'_> {
                             continue;
                         }
                     };
-                    let Some(def) = enclosing(line) else {
+                    let Some(def) = enclosing(line, column) else {
                         bad(
                             self,
                             "`@section` must be inside a function (4.5)".to_owned(),
@@ -1039,7 +1293,7 @@ impl Checker<'_> {
                     }
                     match open.take() {
                         Some((def, open_column, _))
-                            if enclosing(line) == Some(def) && open_column == column =>
+                            if enclosing(line, column) == Some(def) && open_column == column =>
                         {
                             annotations.push(Annotation::EndSection { line });
                         }
@@ -1076,10 +1330,11 @@ impl Checker<'_> {
     }
 }
 
-/// An annotation's integer, from `min` to 2^32 - 1. A value that is not an integer is a bad
-/// annotation; one outside the range is out of range.
-fn parse_limit(checker: &mut Checker<'_>, span: Span, value: &str, min: u64) -> Option<u32> {
-    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+/// An annotation's integer, from `min` to 2^32 - 1. A value that is not a decimal integer, signed
+/// or not, is a bad annotation; one outside the range is out of range.
+fn parse_limit(checker: &mut Checker<'_>, span: Span, value: &str, min: i128) -> Option<u32> {
+    let digits = value.strip_prefix(['-', '+']).unwrap_or(value);
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
         checker.error(
             StarCode::BadAnnotation,
             span,
@@ -1087,8 +1342,9 @@ fn parse_limit(checker: &mut Checker<'_>, span: Span, value: &str, min: u64) -> 
         );
         return None;
     }
-    match value.parse::<u64>() {
-        Ok(n) if n >= min && n <= u64::from(u32::MAX) => Some(n as u32),
+    // Too many digits for an i128 is out of range as well.
+    match value.parse::<i128>() {
+        Ok(n) if n >= min && n <= i128::from(u32::MAX) => u32::try_from(n).ok(),
         _ => {
             checker.error(
                 StarCode::ArgumentOutOfRange,
@@ -1127,10 +1383,10 @@ fn collect_statements<'a>(stmt: &'a AstStmt, out: &mut Vec<&'a AstStmt>) {
 
 /// The calls in a top-level constant that can only run from `main`: to `diag` and to the
 /// file's functions.
-fn collect_runtime_calls(expr: &AstExpr, defs: &HashMap<String, Def>, found: &mut Vec<Span>) {
+fn collect_runtime_calls(expr: &AstExpr, defs: &HashSet<String>, found: &mut Vec<Span>) {
     if let ExprP::Call(function, _) = &expr.node {
         let runtime = match &function.node {
-            ExprP::Identifier(name) => defs.contains_key(&name.node.ident),
+            ExprP::Identifier(name) => defs.contains(&name.node.ident),
             ExprP::Dot(object, _) => is_name(object, "diag"),
             _ => false,
         };
@@ -1145,8 +1401,40 @@ fn is_name(expr: &AstExpr, name: &str) -> bool {
     matches!(&expr.node, ExprP::Identifier(ident) if ident.node.ident == name)
 }
 
-fn is_dict_literal(expr: &AstExpr) -> bool {
-    matches!(expr.node, ExprP::Dict(_))
+/// The names a function body binds, without descending into nested `def`s: the assigned names
+/// into `locals`, the nested `def`s into `closures`.
+fn collect_locals(stmt: &AstStmt, locals: &mut HashSet<String>, closures: &mut HashSet<String>) {
+    match &stmt.node {
+        StmtP::Statements(list) => list
+            .iter()
+            .for_each(|inner| collect_locals(inner, locals, closures)),
+        StmtP::Assign(assign) => target_names(&assign.lhs, locals),
+        StmtP::AssignModify(target, ..) => target_names(target, locals),
+        StmtP::If(_, then) => collect_locals(then, locals, closures),
+        StmtP::IfElse(_, branches) => {
+            collect_locals(&branches.0, locals, closures);
+            collect_locals(&branches.1, locals, closures);
+        }
+        StmtP::For(for_) => {
+            target_names(&for_.var, locals);
+            collect_locals(&for_.body, locals, closures);
+        }
+        StmtP::Def(def) => {
+            closures.insert(def.name.node.ident.clone());
+        }
+        _ => {}
+    }
+}
+
+/// The names an assignment target binds.
+fn target_names(target: &AstAssignTarget, out: &mut HashSet<String>) {
+    match &target.node {
+        AssignTargetP::Identifier(name) => {
+            out.insert(name.node.ident.clone());
+        }
+        AssignTargetP::Tuple(items) => items.iter().for_each(|item| target_names(item, out)),
+        AssignTargetP::Index(_) | AssignTargetP::Dot(..) => {}
+    }
 }
 
 fn is_string_expression(stmt: &AstStmt) -> bool {

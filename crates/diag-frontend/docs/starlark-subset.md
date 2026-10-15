@@ -396,16 +396,26 @@ position. Lines and columns count from 1; the column counts characters.
   `STAR_UNSUPPORTED_SYNTAX` so that nothing slips through by oversight
 - Comment annotations (4.2, 4.5, 4.6) are taken from the comment tokens the parser's lexer
   reports, never from raw source lines, so `# @` inside a string literal is not an annotation.
-  Each annotation is attached by its line to the following statement. `@maxIterations` takes an
-  integer from 1 to 2^32 - 1 and must precede a `for`; `@idempotency` takes `safe`, `checkState`
-  or `unsafe` and must precede a statement in a function; a `@section` may not open while another
-  is open. An integer outside its range is `STAR_ARGUMENT_OUT_OF_RANGE`, any other fault
+  Each annotation is attached by its line to the following statement. An annotation belongs to
+  a top-level `def` when its comment is indented further than `def` and comes before the next
+  top-level statement, so a comment after the last statement of a body still belongs to it.
+  `@maxIterations` takes an integer from 1 to 2^32 - 1 and must precede a `for` in the same
+  function; `@idempotency` takes `safe`, `checkState` or `unsafe` and must precede a statement in
+  the same function; a `@section` may not open while another is open. An integer, negative ones
+  included, outside its range is `STAR_ARGUMENT_OUT_OF_RANGE`, any other fault
   `STAR_BAD_ANNOTATION`
 - The check of 2.3 sees the syntax only. A computed key is found on the expressions known to be
   dicts without type inference: dict literals, the responses of `diag.request`, `diag.routine`
-  and `diag.read_dtc` (3.4), a response's `"fields"`, and names assigned from those. A call
-  must name a top-level `def`, a built-in of 2.4, a string method of 2.4 or a `diag` function of
-  3.1; anything else is `STAR_BUILTIN_NOT_ALLOWED`. What needs the declaration part or the
+  and `diag.read_dtc` (3.4), a response's `"fields"` (not the values in it, nor another dict's
+  `"fields"`), and names assigned from those, top-level constants included. A name assigned on
+  only some paths (one branch of an `if`, the body of a `for`, which may run no pass or several)
+  counts as a dict after it when it is one on any path. A parameter or a name a function assigns
+  hides a top-level name or built-in of the same spelling, and is a value that cannot be called
+  (`STAR_FUNCTION_VALUE_NOT_ALLOWED`, like a top-level constant). A call must name a top-level
+  `def`, a built-in of 2.4, a string method of 2.4 or a `diag` function of 3.1; anything else is
+  `STAR_BUILTIN_NOT_ALLOWED`. A rejected construct (a `lambda`, a nested `def`, a comprehension,
+  an f-string, a top-level statement) is checked inside as well, so that every violation is
+  listed. What needs the declaration part or the
   instruction set (a `fields` key, a flash session, an argument's range, an instruction the IR
   lacks) is checked by the lowering
 - Constant folding is done during bytecode generation

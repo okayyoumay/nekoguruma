@@ -62,6 +62,12 @@ site and never reach the VM.
    For example, `invoke(reenter)`, where `invoke(f)` calls `f()` and `reenter()` calls
    `invoke(done)`, re-enters `invoke` and is rejected. The check runs while specializing, so it
    also keeps the number of copies finite.
+   Finite is not small: helpers that each pass on several functions in different combinations
+   can multiply copies exponentially, and procedures are untrusted input on the server (design
+   8.4). Specialization therefore has a budget of 1,000 specialized copies per procedure file,
+   counted before a copy is allocated; a file that needs more is rejected with
+   `STAR_SPECIALIZATION_LIMIT` at the call that would exceed it, before any further copy is
+   built or any instruction emitted.
 6. **Default values and keyword arguments.** A parameter of a user function (a top-level `def`
    or a capture-free function) may have a default value, which must fold to a constant at
    ingestion and must not be a function; parameters with defaults follow those without, as
@@ -80,9 +86,10 @@ site and never reach the VM.
   a helper repeats as an argument (for example a polling helper that takes the request to poll),
   and give helpers optional arguments.
 - Specialization grows the program by one copy of a callee per distinct set of functions passed
-  to it. Recursion is forbidden, so the number of copies is finite, but deep chains of helpers
-  that each receive functions multiply. The VM's existing program limits still apply to the
-  result.
+  to it. The copy budget (item 5) bounds the work and memory ingestion spends on it; the VM's
+  existing program limits still apply to the result. A legitimate procedure that hits the budget
+  can move a helper's function arguments into fewer combinations; the budget is a constant of
+  the transpiler and can be raised by a later change if real procedures need it.
 - Source maps (subset 4.7) record a lifted function's instructions at its own position, and a
   specialized copy's instructions at the callee's position, so traces still point at the source
   the author wrote. Loop limits (subset 4.2) inside a callee apply to every copy. A nested `def`

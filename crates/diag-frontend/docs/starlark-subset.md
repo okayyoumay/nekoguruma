@@ -67,6 +67,7 @@ a function of the file, which run only from `main`. The procedure's entry point 
 | Top-level statements other than constant assignments and `def` | The procedure runs from `main` only | `STAR_TOPLEVEL_STATEMENT_NOT_ALLOWED` |
 | `*args`, `**kwargs`, keyword-only parameters, keyword arguments to built-ins and `diag` functions | Not supported in version 1 | `STAR_UNSUPPORTED_SYNTAX` |
 | A missing, repeated or unknown argument, or too many positional arguments, in a call to a user function (2.7) | The call cannot be bound to the parameters | `STAR_ARGUMENT_MISMATCH` |
+| Calls that pass functions needing more than 1,000 specialized copies (2.6) | Bounds ingestion work on untrusted input | `STAR_SPECIALIZATION_LIMIT` |
 | Type annotations | Not base Starlark | `STAR_UNSUPPORTED_SYNTAX` |
 | `set` | No IR value type for it; not supported in version 1 | `STAR_UNSUPPORTED_SYNTAX` |
 | Dict access with a computed key `d[expr]` | Key cannot be resolved statically (list and bytes indexing are allowed) | `STAR_DYNAMIC_KEY_NOT_ALLOWED` |
@@ -175,7 +176,9 @@ combination of functions it receives, in which each call through a function para
 `Call` to the received function; call sites passing the same functions share a copy. Recursion
 (4.1) is judged by source function along the specialized call paths, so `invoke(reenter)`, where
 `invoke(f)` calls `f()` and `reenter()` calls `invoke(done)`, is rejected although it reaches two
-different copies of `invoke`. No IR instruction is involved.
+different copies of `invoke`. Specialization has a budget of 1,000 copies per file, counted before
+each copy is built, so a file whose helpers multiply copies cannot exhaust the server; the call
+that would exceed it is `STAR_SPECIALIZATION_LIMIT`. No IR instruction is involved.
 
 ### 2.7 Default Values and Keyword Arguments
 

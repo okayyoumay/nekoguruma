@@ -16,6 +16,7 @@
 //! dict after it when it is one on any path.
 
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use serde::Serialize;
 use starlark_syntax::codemap::Span;
@@ -254,6 +255,7 @@ pub fn check(file: &str, source: &str) -> Result<Checked, Vec<StarError>> {
         module: &module,
         errors: Vec::new(),
         defs: HashSet::new(),
+        def_names: HashMap::new(),
         globals: HashSet::new(),
         global_kinds: HashMap::new(),
         calls: Vec::new(),
@@ -407,8 +409,8 @@ fn to_u32(n: usize) -> u32 {
 
 /// A call from one top-level `def` to another, for the recursion check (4.1).
 struct Call {
-    caller: String,
-    callee: String,
+    caller: Rc<str>,
+    callee: Rc<str>,
     span: Span,
 }
 
@@ -417,6 +419,9 @@ struct Checker<'a> {
     errors: Vec<Pending>,
     /// The names of the top-level `def`s.
     defs: HashSet<String>,
+    /// The name of each top-level `def` in the call graph, shared by every call to it, so that
+    /// a long name called many times is stored once.
+    def_names: HashMap<String, Rc<str>>,
     /// The top-level constants.
     globals: HashSet<String>,
     /// What the top-level constants are known to be.
@@ -510,13 +515,13 @@ fn merge(into: &mut HashMap<String, Kinds>, other: HashMap<String, Kinds>) {
 /// The names of the function being checked.
 #[derive(Default, Clone)]
 struct Scope {
-    name: String,
+    name: Rc<str>,
     /// The parameters and the names the function assigns, which hide the top-level names and the
     /// built-ins (2.2), with those of the functions it is nested in.
     locals: HashSet<String>,
     /// The nested `def`s, already reported where they are defined (2.3), with the name each has
     /// in the call graph: `outer.inner`.
-    closures: HashMap<String, String>,
+    closures: HashMap<String, Rc<str>>,
     /// What the locals are known to be at the point being checked; a local missing here is not a
     /// dict.
     kinds: HashMap<String, Kinds>,
@@ -543,7 +548,12 @@ impl Scope {
 impl Scope {
     /// The scope of a function named `name` (the top-level one it belongs to, for the call graph)
     /// nested in `outer`, with its parameters and, for a `def`, its body.
-    fn enter(outer: &Scope, name: String, params: &[AstParameter], body: Option<&AstStmt>) -> Self {
+    fn enter(
+        outer: &Scope,
+        name: Rc<str>,
+        params: &[AstParameter],
+        body: Option<&AstStmt>,
+    ) -> Self {
         let mut own = HashSet::new();
         for param in params {
             if let ParameterP::Normal(ident, ..)
@@ -559,7 +569,7 @@ impl Scope {
         }
         let mut closures = outer.closures.clone();
         for inner in nested {
-            let qualified = format!("{name}.{inner}");
+            let qualified: Rc<str> = Rc::from(format!("{name}.{inner}"));
             closures.insert(inner, qualified);
         }
         closures.retain(|name, _| !own.contains(name));
@@ -608,6 +618,10 @@ impl Checker<'_> {
             let name = match &stmt.node {
                 StmtP::Def(def) => {
                     self.defs.insert(def.name.node.ident.clone());
+                    self.def_names.insert(
+                        def.name.node.ident.clone(),
+                        Rc::from(def.name.node.ident.as_str()),
+                    );
                     &def.name
                 }
                 StmtP::Assign(assign) => match &assign.lhs.node {
@@ -659,7 +673,8 @@ impl Checker<'_> {
                             "`main` takes no parameters (2.1)",
                         );
                     }
-                    self.function(&Scope::default(), name, def);
+                    let id = self.def_names[&name].clone();
+                    self.function(&Scope::default(), id, def);
                 }
                 StmtP::Assign(assign) => {
                     if !matches!(&assign.lhs.node, AssignTargetP::Identifier(_)) {
@@ -693,7 +708,7 @@ impl Checker<'_> {
                         "the top level holds only constant assignments and `def`s (2.1)",
                     );
                     // What it holds is checked too, so that every violation is listed (5).
-                    let mut scope = Scope::enter(&Scope::default(), String::new(), &[], Some(stmt));
+                    let mut scope = Scope::enter(&Scope::default(), Rc::from(""), &[], Some(stmt));
                     self.stmt(stmt, &mut scope);
                 }
             }
@@ -740,7 +755,7 @@ impl Checker<'_> {
     }
 
     /// A `def`'s parameters and body. `name` is the top-level function it belongs to.
-    fn function(&mut self, outer: &Scope, name: String, def: &DefP<AstNoPayload>) {
+    fn function(&mut self, outer: &Scope, name: Rc<str>, def: &DefP<AstNoPayload>) {
         self.params(&def.params, &mut outer.clone());
         if let Some(ty) = &def.return_type {
             self.error(
@@ -911,7 +926,12 @@ impl Checker<'_> {
                     def.name.span,
                     "a nested `def` is not allowed; write it as a top-level `def` (2.3)",
                 );
-                let qualified = format!("{}.{}", scope.name, def.name.node.ident);
+                // The same name `Scope::enter` gave it in `closures`, shared with its calls.
+                let qualified = scope
+                    .closures
+                    .get(&def.name.node.ident)
+                    .cloned()
+                    .unwrap_or_else(|| Rc::from(format!("{}.{}", scope.name, def.name.node.ident)));
                 self.function(scope, qualified, def);
             }
             StmtP::Load(_) => self.error(
@@ -1037,8 +1057,8 @@ impl Checker<'_> {
 
     /// A dict known as one is indexed with a string literal only (2.3, 4.1).
     fn dict_key(&mut self, object: &AstExpr, key: &AstExpr, scope: &Scope) {
-        if self.kinds(object, scope).is_dict()
-            && !matches!(&key.node, ExprP::Literal(AstLiteral::String(_)))
+        if !matches!(&key.node, ExprP::Literal(AstLiteral::String(_)))
+            && self.kinds(object, scope).is_dict()
         {
             self.error(
                 StarCode::DynamicKeyNotAllowed,
@@ -1179,8 +1199,10 @@ impl Checker<'_> {
             }
             ExprP::Call(function, args) => self.call(function, &args.args, scope),
             ExprP::Index(pair) => {
-                if self.kinds(&pair.0, scope).is_dict()
-                    && !matches!(&pair.1.node, ExprP::Literal(AstLiteral::String(_)))
+                // The key first: a literal key needs no classification of the receiver, which
+                // would walk a chain of indices again at every level.
+                if !matches!(&pair.1.node, ExprP::Literal(AstLiteral::String(_)))
+                    && self.kinds(&pair.0, scope).is_dict()
                 {
                     self.error(
                         StarCode::DynamicKeyNotAllowed,
@@ -1348,7 +1370,7 @@ impl Checker<'_> {
                     if self.quiet == 0 {
                         self.calls.push(Call {
                             caller: scope.name.clone(),
-                            callee: name.to_owned(),
+                            callee: self.def_names[name].clone(),
                             span: function.span,
                         });
                     }
@@ -1437,25 +1459,24 @@ impl Checker<'_> {
     /// Recursion, direct or through other functions, is reported at each call that closes a
     /// cycle in the call graph (4.1).
     fn recursion(&mut self) {
-        let component = components(
-            self.calls
-                .iter()
-                .map(|c| (c.caller.as_str(), c.callee.as_str())),
-        );
-        let recursive: Vec<(Span, String)> = self
+        let component = components(self.calls.iter().map(|c| (&*c.caller, &*c.callee)));
+        let recursive: Vec<(Span, Rc<str>)> = self
             .calls
             .iter()
             .filter(|call| {
                 call.caller == call.callee
-                    || component.get(call.caller.as_str()) == component.get(call.callee.as_str())
+                    || component.get(&*call.caller) == component.get(&*call.callee)
             })
             .map(|call| (call.span, call.callee.clone()))
             .collect();
         for (span, callee) in recursive {
+            // The name as the call writes it, not `outer.inner`, so the hint is no longer than
+            // the call itself.
+            let written = callee.rsplit('.').next().unwrap_or(&callee);
             self.error(
                 StarCode::UnboundedNotAllowed,
                 span,
-                format!("the call to `{callee}` is recursive; execution must stay finite (4.1)"),
+                format!("the call to `{written}` is recursive; execution must stay finite (4.1)"),
             );
         }
     }

@@ -999,3 +999,37 @@ fn a_long_line_is_resolved_in_linear_time() {
     let columns: Vec<u32> = errors.iter().map(|e| e.column).collect();
     assert_eq!(columns, expected);
 }
+
+#[test]
+fn a_long_function_name_is_stored_once() {
+    // A long caller and many calls from it: the call graph shares the name rather than copying
+    // it per call.
+    let name = "f".repeat(20_000);
+    let source = format!(
+        "def helper():\n    pass\n\ndef {name}():\n{}\ndef main():\n    {name}()\n",
+        "    helper()\n".repeat(20_000)
+    );
+    let started = std::time::Instant::now();
+    passes(&source);
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    // A recursive nested def names only itself in the hint.
+    let nested = format!("def {name}():\n    def g():\n        g()\n\ndef main():\n    pass\n");
+    let errors = check("test.star", &nested).unwrap_err();
+    let recursion = errors
+        .iter()
+        .find(|e| e.code == StarCode::UnboundedNotAllowed)
+        .unwrap();
+    assert!(recursion.hint.contains("`g`"));
+    assert!(recursion.hint.len() < 100);
+}
+
+#[test]
+fn a_chain_of_literal_keys_is_checked_in_linear_time() {
+    let source = format!(
+        "def main():\n    res = diag.request(0x22, {{}})\n    x = res{}\n",
+        "[\"fields\"]".repeat(1_000)
+    );
+    let started = std::time::Instant::now();
+    passes(&source);
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+}

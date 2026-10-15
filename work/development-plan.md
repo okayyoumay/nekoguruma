@@ -20,7 +20,7 @@ Standards: `vehicle-comm-specs` holds SAE J2534-1 (v04.04), SAE J2534-2 (DEC2020
 | M7 Standard formats and external API | ODX/PDX and OTX ingestion; SOVD / ExVe compatible endpoints; generic OBD package | `diag-frontend`, `server`; for generic OBD also `agent` (L2), worker L1 (functional requests), `diag-ir` and `sim-ecu` | ISO 22901-1 (ODX), ISO 17978 (SOVD) (held); ISO 13209 (OTX), ISO 20077/20078, SAE J1979 / J1979-2, ISO 15031-5, ISO 15765-4, ISO 27145 (not held) |
 | M8 Cloud deployment and field validation | Standard (cloud) deployment, scale measures for size S, validation with real VCIs | `server`, deployment, CI | UNECE R155/R156 as needed (free to obtain) |
 
-Each milestone also lists optional real-hardware checks (design 13.5, ADR-275) by target class (T0 loopback, T1 stand-in ECU, T2 bench ECU, T3 vehicle). They are never exit criteria, except M8's.
+Each milestone also implements real-hardware checks (design 13.5, ADR-275) by target class (T0 loopback, T1 stand-in ECU, T2 bench ECU, T3 vehicle) for what it adds (maintainer's decision, 2026-10-15). Implementing them is part of the milestone's scope and exit criteria: each check is written, the harness lists it for a profile of its class, and the parts that need no hardware (profile parsing, the guard, reports, listing) are tested in CI. Running them on real hardware is optional and never an exit criterion, except in M8. A milestone takes only the checks it can implement with the infrastructure it already builds; a check that needs more waits for the milestone that builds it.
 
 M5 and M6 do not depend on each other; M6 comes first (maintainer's decision, 2026-10-06). M7's ODX converter and SOVD endpoints can be developed in parallel with M5/M6; ingesting ODX-derived IR as extension packages waits on M6's package signing, and the OTX and ExVe parts wait on those standards.
 
@@ -41,15 +41,14 @@ M5 and M6 do not depend on each other; M6 comes first (maintainer's decision, 20
 1. A CSV + Starlark definition of one ECU (variant identification, a few DIDs with conversions, DTC read, one routine) is converted to IR and runs against `sim-ecu` through both worker kinds (J2534 and D-PDU mock).
 2. IR golden tests (definition -> IR -> request bytes and decoded values) and a fuzz target for malformed IR run in CI (12.1).
 3. A procedure interrupted mid-run resumes at the IR level according to its section attributes (8.2.5, 8.10.1).
+4. The hardware checks listed below are implemented: the harness lists each one for a profile of its class, a check run without `NGR_HW_PROFILE` fails, and their parts that need no hardware are tested in CI (design 13.5). Running them on hardware is optional.
 
-**Optional real-hardware checks (design 13.5).**
+**Hardware checks to implement (design 13.5; running them on hardware is optional).**
 
-- T0 (carried over from M1): for each OS and worker ABI the vendor ships a J2534 library for (Windows x86_64 and i686, Linux x86_64 and i686, and Linux ARM where offered), the library is found the way that OS finds it (the Windows registry; the registration definition in `/etc/nekoguruma/j2534/` on Linux, design 7.1, 7.1.1), opens, connects a CAN channel and passes loopback frames. On Linux this also checks the ABI and `unsigned long` width of design 7.1.2.
-- T1 (carried over from M1): the local end-to-end read and interrupted write of M1, with a real J2534 VCI against the stand-in ECU, and the VCI-disconnect fault produced by unplugging the VCI instead of by `sim-vci`.
-- T2: session timing (P2 / P2*) and response-pending chains of ISO 14229-2 (2021) 9.2, 9.5 and clause 10, measured on a real VCI against a bench ECU and compared with the values `sim-ecu` uses.
-- T1: the same timing measured on a real VCI against the stand-in ECU, to separate the VCI's own delays from the ECU's.
-- T2: the read parts of the exit-criteria CSV + Starlark definition (variant identification, DIDs, DTC read), rewritten for the bench ECU, run through both a J2534 VCI and a D-PDU API VCI (the first real use of the D-PDU worker). The routine waits for M6, when section 6's controls for it exist (design 13.5).
-- T3: variant identification, DID and DTC reads on a vehicle.
+- The harness the checks run in: the hardware profile named by `NGR_HW_PROFILE` and its parser, the static check declarations and the listing of the checks a profile permits, the `hardware` nextest profile, the guarded VCI handle with its cleanup (including the seam in the agent's job runner that hands it a guarded worker client) for read-only checks, refusing state-changing requests on T2 and T3 and every hardware control, and the report writer.
+- T0: for each OS and worker ABI the vendor ships a J2534 library for (Windows x86_64 and i686, Linux x86_64 and i686, and Linux ARM where offered), the library is found the way that OS finds it (the Windows registry; the registration definition in `/etc/nekoguruma/j2534/` on Linux, design 7.1, 7.1.1), opens, connects two CAN endpoints and passes loopback frames. On Linux this also checks the ABI and `unsigned long` width of design 7.1.2.
+- T2/T3: the read parts of exit criterion 1's CSV + Starlark definition (variant identification, DIDs, DTC read), with the definition for the bench ECU or vehicle named by the profile, run through a J2534 VCI and through a D-PDU API VCI (the first real use of the D-PDU worker). The routine waits for M6, when section 6's controls for it exist (design 13.5).
+- T2: the session timing (P2 / P2*) the bench ECU reports and the response times measured through a real VCI, compared with the values `sim-ecu` uses (ISO 14229-2 (2021) 9.2).
 
 ## M3 Server and job control (local deployment profile)
 
@@ -67,10 +66,14 @@ M5 and M6 do not depend on each other; M6 comes first (maintainer's decision, 20
 1. In CI, a local-profile server and an agent with the simulators run an acquisition job and a configuration write job end to end, created through the Web API.
 2. A network fault test (disconnect, slow link; design 13.4) shows no duplicate execution, no automatic reissue of a write job, and complete event delivery after reconnection (5.3).
 3. An agent rejects a job instruction with a bad signature.
+4. The hardware checks listed below are implemented: the harness lists each one for a profile of its class, a check run without `NGR_HW_PROFILE` fails, and their parts that need no hardware are tested in CI (design 13.5). Running them on hardware is optional.
 
-**Optional real-hardware checks (design 13.5).**
+**Hardware checks to implement (design 13.5; running them on hardware is optional).**
 
-- T1: an acquisition and a configuration write created through the Web API run on a real VCI on the local profile.
+- The stand-in ECU for T1: `sim-ecu` served over a Linux SocketCAN interface, testable without hardware on a virtual CAN interface (`vcan`).
+- T1 (carried over from M1 and M2): the local end-to-end read of M1 with a real J2534 VCI against the stand-in ECU, and M2's session timing measured the same way, to separate the VCI's own delays from the ECU's.
+- T1: an acquisition created through the Web API runs on a real VCI on the local profile.
+- Writes through a real VCI wait for M6: the agent lets only `sim-vci` receive state-changing requests until the authorization layer replaces that rule (ADR-247).
 - T2: the same acquisition against a bench ECU (read only; T2 writes wait for M6, design 13.5).
 
 ## M4 Web UI and acquired data
@@ -84,9 +87,9 @@ M5 and M6 do not depend on each other; M6 comes first (maintainer's decision, 20
 1. A browser end-to-end test (Playwright) runs an acquisition against the simulators, edits a record-template field, and sees the change from a second session.
 2. With the server unreachable, a pre-fetched acquisition job starts from the cached UI over the local connection and syncs once the server is back.
 
-**Optional real-hardware checks (design 13.5).**
+**Hardware checks to implement (design 13.5; running them on hardware is optional).**
 
-- T2/T3: an acquisition run from the browser, and a pre-fetched job started offline over the local connection, on a real VCI.
+- None new. The browser and the offline local connection change nothing between the agent and the VCI, so M3's acquisition checks cover the hardware side of this milestone.
 
 ## M6 Trust, approval and reprogramming
 
@@ -99,13 +102,15 @@ M5 and M6 do not depend on each other; M6 comes first (maintainer's decision, 20
 1. Unsigned or wrongly signed packages, artifacts and job instructions are each rejected, with a test per layer.
 2. An ECU reprogramming job runs the ISO 14229-1 clause 16 sequence against `sim-ecu`'s flash state machine, recovers from each of the four fault classes in clause 16.4 per design 5.6, and is refused when a precondition (8.9.1) is not met.
 3. A two-person approval flow blocks reprogramming on an unattended device until the second approval.
+4. The hardware checks listed below are implemented: the harness lists each one for a profile of its class, a check run without `NGR_HW_PROFILE` fails, and their parts that need no hardware are tested in CI (design 13.5). Running them on hardware is optional.
 
-**Optional real-hardware checks (design 13.5).**
+**Hardware checks to implement (design 13.5; running them on hardware is optional).**
 
 - T1: the clause 16 reprogramming sequence with a real VCI against the stand-in ECU, with power cut through the host-controlled switch during the transfer.
+- T1 (carried over from M1 and M3): the interrupted write of M1 and a configuration write created through the Web API, with a real J2534 VCI against the stand-in ECU, and the VCI-disconnect fault produced by unplugging the VCI when the check asks for it, instead of by `sim-vci`.
+- The rest of the guard (design 13.5): on T1, a hardware control passes when the profile lists it with its complete parameters and the request matches them; on T2, state-changing requests and listed hardware controls pass only from an authorized job, checked against what the job declares.
 - T2: a configuration write and reprogramming of an ECU the profile declares expendable, once this milestone's approval levels exist, and only after the 8.9.1 checks pass.
 - T2: the configuration write above unlocks the bench ECU through the real seed/key or OEM authentication path (8.10), where an algorithm or account is available.
-- T0: whether each VCI's library opens and passes loopback frames when the agent runs as a service (design 17, "Items to Confirm Early").
 
 ## M5 Real-time monitoring
 
@@ -116,8 +121,9 @@ M5 and M6 do not depend on each other; M6 comes first (maintainer's decision, 20
 1. A monitoring session against the simulators reports the measured achievable interval and the p99 arrival interval (10.3).
 2. A captured interval is stored as acquired data with its metadata (4.6).
 3. A second browser subscribes through the server path while the first uses the direct path (10.4).
+4. The hardware checks listed below are implemented: the harness lists each one for a profile of its class, a check run without `NGR_HW_PROFILE` fails, and their parts that need no hardware are tested in CI (design 13.5). Running them on hardware is optional.
 
-**Optional real-hardware checks (design 13.5).**
+**Hardware checks to implement (design 13.5; running them on hardware is optional).**
 
 - T0/T2: the achievable monitoring interval and p99 arrival interval of each VCI at hand, recorded as the VCI profile's minimum monitoring period (9.3).
 - T3: a monitoring session on a vehicle.
@@ -131,8 +137,9 @@ M5 and M6 do not depend on each other; M6 comes first (maintainer's decision, 20
 1. A sample PDX converts to the same IR shape as the M2 proprietary-format definition for the same ECU, and runs against `sim-ecu`.
 2. The SOVD resource mapping (L4) serves data reads for that ECU.
 3. The generic OBD package reads the supported data identifiers (PIDs for classic SAE J1979, DIDs for J1979-2 and ISO 27145), current data and stored DTCs against `sim-ecu`, for each generic OBD family whose standard is held.
+4. The hardware checks listed below are implemented: the harness lists each one for a profile of its class, a check run without `NGR_HW_PROFILE` fails, and their parts that need no hardware are tested in CI (design 13.5). Running them on hardware is optional.
 
-**Optional real-hardware checks (design 13.5).**
+**Hardware checks to implement (design 13.5; running them on hardware is optional).**
 
 - T3: the generic OBD package reads supported identifiers, current data and stored DTCs on a vehicle, for each family whose standard is held.
 - T2: a PDX for the bench ECU, where one is available, converts and runs.
@@ -146,7 +153,11 @@ M5 and M6 do not depend on each other; M6 comes first (maintainer's decision, 20
 1. The server runs as a container with OIDC and S3-compatible storage, and an agent over the internet completes a job (14.4).
 2. At least one real J2534 VCI and one D-PDU API VCI complete acquisition and a configuration write on a real ECU or bench.
 
-This is the one milestone whose exit criteria require real hardware. It reuses the hardware checks written in earlier milestones (design 13.5) at T2, and answers the design 17 per-vendor items for each VCI.
+This is the one milestone whose exit criteria require real hardware. It runs the hardware checks implemented in earlier milestones (design 13.5) at T2, and answers the design 17 per-vendor items for each VCI.
+
+**Hardware checks to implement (design 13.5; running them on hardware is optional).**
+
+- T0: whether each VCI's library opens and passes loopback frames when the agent runs as a service (design 6.2, 6.5; design 17, "Items to Confirm Early"). It needs the agent's service modes, which this milestone's deployment uses.
 
 ## Decisions needed
 

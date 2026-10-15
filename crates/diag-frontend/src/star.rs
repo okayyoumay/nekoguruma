@@ -251,7 +251,6 @@ pub fn check(file: &str, source: &str) -> Result<Checked, Vec<StarError>> {
         Err(error) => return Err(vec![syntax_error(file, source, &error)]),
     };
     let mut checker = Checker {
-        file,
         module: &module,
         errors: Vec::new(),
         defs: HashSet::new(),
@@ -265,15 +264,57 @@ pub fn check(file: &str, source: &str) -> Result<Checked, Vec<StarError>> {
     checker.top_level();
     checker.recursion();
     let annotations = checker.annotations();
-    let mut errors = checker.errors;
-    if errors.is_empty() {
+    let pending = checker.errors;
+    if pending.is_empty() {
         return Ok(Checked {
             module,
             annotations,
         });
     }
-    errors.sort_by_key(|e| (e.line, e.column));
-    Err(errors)
+    Err(resolve(file, &module, pending))
+}
+
+/// A violation found by the walk, located by its span until all are resolved together.
+struct Pending {
+    code: StarCode,
+    span: Span,
+    hint: String,
+}
+
+/// Turns the violations into errors in source order. The character column is counted in one
+/// sweep over the sorted positions, from the previous error on the same line, so many errors on
+/// one long line cost time linear in the line rather than one count from its start each.
+fn resolve(file: &str, module: &AstModule, mut pending: Vec<Pending>) -> Vec<StarError> {
+    // Stable, so errors at one position keep the order they were found in.
+    pending.sort_by_key(|p| p.span.begin());
+    let codemap = module.file_span(module.statement().span).file;
+    let source = codemap.source();
+    let mut current = usize::MAX;
+    let (mut byte, mut column) = (0, 0);
+    pending
+        .into_iter()
+        .map(|p| {
+            let line = codemap.find_line(p.span.begin());
+            if line != current {
+                current = line;
+                byte = codemap.line_span(line).begin().get() as usize;
+                column = 0;
+            }
+            let at = p.span.begin().get() as usize;
+            column += source[byte..at].chars().count();
+            byte = at;
+            let text = codemap.source_line(line);
+            let line_start = codemap.line_span(line).begin().get() as usize;
+            StarError {
+                code: p.code,
+                file: file.to_owned(),
+                line: to_u32(line + 1),
+                column: to_u32(column + 1),
+                snippet: snippet(text, at - line_start),
+                hint: p.hint,
+            }
+        })
+        .collect()
 }
 
 /// The one error of a file that does not parse. `while` is a reserved word that the parser
@@ -372,9 +413,8 @@ struct Call {
 }
 
 struct Checker<'a> {
-    file: &'a str,
     module: &'a AstModule,
-    errors: Vec<StarError>,
+    errors: Vec<Pending>,
     /// The names of the top-level `def`s.
     defs: HashSet<String>,
     /// The top-level constants.
@@ -542,17 +582,9 @@ impl Checker<'_> {
         if self.quiet > 0 {
             return;
         }
-        let file_span = self.module.file_span(span);
-        let resolved = file_span.resolve_span();
-        self.errors.push(StarError {
+        self.errors.push(Pending {
             code,
-            file: self.file.to_owned(),
-            line: to_u32(resolved.begin.line + 1),
-            column: to_u32(resolved.begin.column + 1),
-            snippet: snippet(
-                file_span.file.source_line(resolved.begin.line),
-                line_offset(&file_span.file, span),
-            ),
+            span,
             hint: hint.into(),
         });
     }
@@ -1432,7 +1464,18 @@ impl Checker<'_> {
     /// its line to the statement that follows it, which must be in the same function.
     fn annotations(&mut self) -> Vec<Annotation> {
         let module = self.module;
-        let line_of = |span: Span| to_u32(module.file_span(span).resolve_span().begin.line + 1);
+        let codemap = module.file_span(module.statement().span).file;
+        // Only lines are needed here, which a binary search over the line starts gives.
+        let line_of = |span: Span| to_u32(codemap.find_line(span.begin()) + 1);
+        let indent_of = |line: u32| {
+            to_u32(
+                codemap
+                    .source_line(line as usize - 1)
+                    .chars()
+                    .take_while(|c| *c == ' ' || *c == '\t')
+                    .count(),
+            )
+        };
         let mut statements = Vec::new();
         collect_statements(module.statement(), &mut statements);
         let statement_lines: Vec<(u32, bool)> = statements
@@ -1448,11 +1491,11 @@ impl Checker<'_> {
             .enumerate()
             .filter(|(_, stmt)| matches!(stmt.node, StmtP::Def(_)))
             .map(|(at, stmt)| {
-                let begin = module.file_span(stmt.span).resolve_span().begin;
+                let begin = line_of(stmt.span);
                 let end = top
                     .get(at + 1)
                     .map_or(u32::MAX, |next| line_of(next.span) - 1);
-                ((to_u32(begin.line + 1), end), to_u32(begin.column))
+                ((begin, end), indent_of(begin))
             })
             .collect();
         // Both lists are in source order, so a lookup is a binary search.
@@ -1490,17 +1533,10 @@ impl Checker<'_> {
                 );
                 continue;
             }
-            let resolved = file_span.resolve_span();
-            let line = to_u32(resolved.begin.line + 1);
+            let line = line_of(span);
             // The indentation of the comment's line: for a comment after a statement, that
             // statement's.
-            let source_line = file_span.file.source_line(resolved.begin.line);
-            let column = to_u32(
-                source_line
-                    .chars()
-                    .take_while(|c| *c == ' ' || *c == '\t')
-                    .count(),
-            );
+            let column = indent_of(line);
             let mut words = annotation.split_whitespace();
             let keyword = words.next().unwrap_or_default();
             let args: Vec<&str> = words.collect();

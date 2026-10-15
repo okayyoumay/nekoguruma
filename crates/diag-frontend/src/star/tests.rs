@@ -979,3 +979,23 @@ fn a_snippet_window_keeps_whole_characters() {
     assert_eq!(snippet.chars().count(), SNIPPET_CHARS);
     assert!(snippet.ends_with("+ None"));
 }
+
+#[test]
+fn a_long_line_is_resolved_in_linear_time() {
+    // Many valid statements on one line.
+    let statements: Vec<String> = (0..20_000).map(|at| format!("v{at} = {at}")).collect();
+    let valid = format!("def main():\n    {}\n", statements.join("; "));
+    let started = std::time::Instant::now();
+    passes(&valid);
+    // Many violations on one line, each at its own column.
+    let line = format!("    x = [{}]", vec!["None"; 20_000].join(", "));
+    let invalid = format!("def main():\n{line}\n");
+    let errors = check("test.star", &invalid).unwrap_err();
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    let expected: Vec<u32> = line
+        .match_indices("None")
+        .map(|(at, _)| u32::try_from(at + 1).unwrap())
+        .collect();
+    let columns: Vec<u32> = errors.iter().map(|e| e.column).collect();
+    assert_eq!(columns, expected);
+}

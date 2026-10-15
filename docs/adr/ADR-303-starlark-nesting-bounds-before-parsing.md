@@ -37,20 +37,25 @@ abort but cannot tell the author what is wrong).
    - the bracket depth (`(`, `[`, `{`, an f-string's `{`), at most 64;
    - the block depth (indented blocks), at most 32;
    - the `elif` clauses of the `if` statements enclosing a point, at most 256 together;
-   - the chain of operators, keywords and postfix accesses (`.`, an index, a call) of the
-     expressions enclosing a point, counted from the last comma at each bracket level, at most
-     512 together.
+   - the expression depth, at most 512: the operators, keywords, postfix accesses (`.`, an
+     index, a call) and brackets on the deepest path from a statement down to an operand.
 
    Every inner node of an expression has a token of its own, so these counts are never less than
-   the depth they stand for; where a token nests nothing (a statement keyword), the bound is only
-   stricter. A file past a bound is refused with `STAR_NESTING_TOO_DEEP` at the token that passes
+   the depth they stand for; where a token nests nothing (a statement keyword, a parenthesis),
+   the bound is only stricter. The expression depth is computed per bracket level from the
+   elements that commas separate: an element nests at most its links plus its deepest bracketed
+   operand, since any link may wrap any operand, and a closed bracket nests one more than its
+   deepest element. Commas between a `lambda`'s parameters do not separate elements, since its
+   body nests under all of them; a `;` ends an expression but not the `if` statement whose
+   inline body holds it. A file past a bound is refused with `STAR_NESTING_TOO_DEEP` at the token that passes
    it, and is never parsed. A file larger than 1 MiB is refused with `STAR_SOURCE_TOO_LARGE`
    before it is lexed, which also bounds the time and memory of the later passes.
 2. **The bounds are kept separate**, not folded into one weighted budget, so the specification
    can state each in terms an author recognizes.
 3. **A file within the bounds is parsed and checked on a thread with a fixed 16 MiB stack**
    (`on_parser_stack`). A file at every bound at once, in the costliest shapes (nested
-   comprehensions inside nested blocks inside an `elif` chain, around a `not` chain), needs
+   comprehensions inside nested blocks inside an `elif` chain, around a `not` chain that fills
+   the rest of the expression depth), needs
    about 5 MiB in a debug build and under 1 MiB in release. The stack is reserved address
    space; only the pages a parse touches are committed. Any later recursive walk over the AST
    (the lowering) runs on the same kind of thread. Dropping the AST needs far less and may happen
@@ -58,8 +63,14 @@ abort but cannot tell the author what is wrong).
 4. **Tests at the bounds are the guard against a change in `starlark_syntax`.** For each shape a
    file at the bound checks and one past it is refused; a file at every bound at once checks in a
    debug build on the fixed stack and its AST drops on a test thread's default stack; 100,000
-   levels are refused. Dependabot's patch updates merge on green checks (ADR-248), so an update
-   that makes a level cost more stack fails these tests instead of reaching main.
+   levels are refused. Dependabot's grouped minor and patch Cargo updates merge themselves once
+   the required checks pass (ADR-248), so an update that makes a level cost more stack fails
+   these tests instead of reaching main.
+5. **`starlark_syntax` is built with optimisation in the dev profile too.** Its lexer, which
+   logos generates, recurses once per character of a long run of digits, spaces or line
+   continuations when built without optimisation, so a debug build of a test or a tool would
+   overflow on a large but valid file; with `opt-level = 1` it does not, as in release. The
+   pre-scan, which lexes the whole file, also runs on the fixed stack.
 
 ## Consequences
 

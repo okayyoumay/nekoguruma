@@ -1167,8 +1167,9 @@ fn a_long_function_name_is_stored_once() {
 fn a_chain_of_literal_keys_is_checked_in_linear_time() {
     let source = format!(
         "def main():\n    res = diag.request(0x22, {{}})\n    x = res{}\n",
-        // As long as the chain bound allows (2.8): the `=` is one link.
-        "[\"fields\"]".repeat(MAX_EXPRESSION_CHAIN - 1)
+        // As deep as the expression bound allows (2.8): the `=` and the index's bracket are one
+        // level each.
+        "[\"fields\"]".repeat(MAX_EXPRESSION_DEPTH - 2)
     );
     let started = std::time::Instant::now();
     passes(&source);
@@ -1314,7 +1315,13 @@ fn too_deep(source: &str) -> bool {
 
 #[test]
 fn brackets_nest_to_the_bound() {
-    for (open, close) in [("(", ")"), ("[", "]"), ("{0: ", "}"), ("f(", ")")] {
+    for (open, close) in [
+        ("(", ")"),
+        ("[", "]"),
+        ("{0: ", "}"),
+        ("f(", ")"),
+        ("f\"{", "}\""),
+    ] {
         let at = |n: usize| in_main(&format!("x = {}1{}", open.repeat(n), close.repeat(n)));
         assert!(!too_deep(&at(MAX_BRACKET_DEPTH)), "{open}");
         assert!(too_deep(&at(MAX_BRACKET_DEPTH + 1)), "{open}");
@@ -1323,29 +1330,56 @@ fn brackets_nest_to_the_bound() {
 
 #[test]
 fn expression_chains_reach_the_bound() {
-    // Each `link` adds one to the chain; the assignment's `=` is the first.
-    let shapes: [(&str, &str, &str, usize); 7] = [
-        ("res", "[\"f\"]", "", 1),
-        ("res", ".f", "", 1),
-        ("1", " + 1", "", 1),
-        ("", "not ", "True", 1),
-        ("", "-", "1", 1),
-        ("", "1 if a else ", "1", 2),
-        ("", "lambda: ", "1", 1),
+    // Each `link` nests `per` levels; `overhead` counts the assignment's `=` and, for an index,
+    // the level of its own bracket.
+    let shapes: [(&str, &str, &str, usize, usize); 8] = [
+        ("res", "[\"f\"]", "", 1, 2),
+        ("res", ".f", "", 1, 1),
+        ("1", " + 1", "", 1, 1),
+        ("", "not ", "True", 1, 1),
+        ("", "-", "1", 1, 1),
+        ("", "1 if a else ", "1", 2, 1),
+        ("", "lambda: ", "1", 1, 1),
+        ("", "lambda a, b: ", "1", 1, 1),
     ];
-    for (head, link, tail, per) in shapes {
+    for (head, link, tail, per, overhead) in shapes {
         let at = |n: usize| in_main(&format!("x = {head}{}{tail}", link.repeat(n)));
-        let most = (MAX_EXPRESSION_CHAIN - 1) / per;
+        let most = (MAX_EXPRESSION_DEPTH - overhead) / per;
         assert!(!too_deep(&at(most)), "{link}");
         assert!(too_deep(&at(most + 1)), "{link}");
     }
 }
 
 #[test]
-fn a_comma_starts_a_new_chain() {
-    let item = format!("1{}", " + 1".repeat(MAX_EXPRESSION_CHAIN / 2));
+fn commas_separate_siblings() {
+    let item = format!("1{}", " + 1".repeat(MAX_EXPRESSION_DEPTH / 2));
     let list = vec![item; 4].join(", ");
     assert!(!too_deep(&in_main(&format!("x = [{list}]"))));
+    assert!(!too_deep(&in_main(&format!("x = f({list})"))));
+}
+
+#[test]
+fn what_wraps_a_bracket_adds_to_the_depth_inside_it() {
+    // Each closing bracket is wrapped by the links that follow it. One bracket level is left for
+    // an index.
+    let parens = MAX_BRACKET_DEPTH - 1;
+    let wrapped = |operand: &str, link: &str, links: usize| {
+        in_main(&format!(
+            "x = {}{operand}{}",
+            "(".repeat(parens),
+            format!("{})", link.repeat(links)).repeat(parens)
+        ))
+    };
+    // 1 for the `=`, then each parenthesis and its links.
+    let fits = (MAX_EXPRESSION_DEPTH - 1) / parens - 1;
+    for (operand, link) in [("1", " + 1"), ("res", "[\"f\"]"), ("res", ".f")] {
+        assert!(!too_deep(&wrapped(operand, link, fits)), "{link}");
+        assert!(too_deep(&wrapped(operand, link, fits + 1)), "{link}");
+        assert!(
+            too_deep(&wrapped(operand, link, MAX_EXPRESSION_DEPTH - 1)),
+            "{link}"
+        );
+    }
 }
 
 /// `main` whose body nests `depth` blocks in all, the innermost holding `body`.
@@ -1378,6 +1412,10 @@ fn elif_chains_reach_the_bound() {
     assert!(!too_deep(&elif_chain(MAX_ELIF_CHAIN, "        pass\n")));
     let past = elif_chain(MAX_ELIF_CHAIN + 1, "        pass\n");
     assert!(too_deep(&past));
+    // Inline bodies with `;` stay inside the chain.
+    let mut inline = "def main():\n    if a: pass; pass\n".to_owned();
+    inline += &"    elif a: pass; pass\n".repeat(MAX_ELIF_CHAIN + 1);
+    assert!(too_deep(&inline));
     // Separate `if` statements do not add up.
     let two = elif_chain(MAX_ELIF_CHAIN, "        pass\n").replacen("def main():\n", "", 1);
     assert!(!too_deep(&format!("def main():\n{two}{two}")));
@@ -1385,12 +1423,12 @@ fn elif_chains_reach_the_bound() {
 
 /// A file at every bound at once, in the costliest shapes: an `elif` chain whose last branch
 /// nests blocks, the innermost holding nested brackets (`opening` each, which also adds
-/// `links` links to the chain) around a `not` chain that fills the rest of the chain bound.
+/// `links` links) around a `not` chain that fills the rest of the expression bound.
 fn at_every_bound(opening: &str, links: usize) -> String {
     let expression = format!(
         "x = {}{}True{}",
         opening.repeat(MAX_BRACKET_DEPTH),
-        "not ".repeat(MAX_EXPRESSION_CHAIN - 1 - links * MAX_BRACKET_DEPTH),
+        "not ".repeat(MAX_EXPRESSION_DEPTH - 1 - (links + 1) * MAX_BRACKET_DEPTH),
         "]".repeat(MAX_BRACKET_DEPTH)
     );
     // The `elif` body is at depth 2; it nests the remaining blocks.
@@ -1443,4 +1481,16 @@ fn a_source_past_the_size_bound_is_refused() {
     assert_eq!(errors.len(), 1);
     assert_eq!(errors[0].code, StarCode::SourceTooLarge);
     assert_eq!(errors[0].line, 3);
+}
+
+#[test]
+fn long_runs_of_one_character_lex_without_overflow() {
+    // The lexer of an unoptimised `starlark_syntax` recursed per character of such runs.
+    let spaces = format!(
+        "def main():\n    x = 1{}\n",
+        " ".repeat(MAX_SOURCE_BYTES - 30)
+    );
+    assert!(check("test.star", &spaces).is_ok());
+    let continuations = format!("def main():\n    x = 1{}\n", " \\\n".repeat(300_000));
+    assert!(check("test.star", &continuations).is_ok());
 }

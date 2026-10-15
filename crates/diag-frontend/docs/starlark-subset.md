@@ -206,14 +206,17 @@ nested, can exhaust the converter's stack:
 | Bracket depth: `(`, `[`, `{` and an f-string's `{` nested inside each other | 64 | `STAR_NESTING_TOO_DEEP` |
 | Block depth: indented blocks nested inside each other, the function body included | 32 | `STAR_NESTING_TOO_DEEP` |
 | `elif` clauses of the `if` statements enclosing a point, together | 256 | `STAR_NESTING_TOO_DEEP` |
-| Expression chain: operators, keywords and accesses (`.`, an index, a call) of the expressions enclosing a point, together | 512 | `STAR_NESTING_TOO_DEEP` |
+| Expression depth: operators, keywords, accesses (`.`, an index, a call) and brackets on one path from a statement down to an operand | 512 | `STAR_NESTING_TOO_DEEP` |
 
-The expression chain is counted per bracket level from the last comma at that level, so the
-items of a list, a dict or an argument list each start a chain of their own, and what a bracket
-holds adds to the chain around it. Every operator and keyword token counts, a unary one too, and
-so does an assignment's `=`; `x = a + b` is a chain of 2 and `res["fields"]["rpm"]` of 2.
-Separate statements do not add up, and an `if` statement's `elif` clauses stop counting where the
-statement ends.
+The expression depth counts every operator and keyword token, a unary one too, an assignment's
+`=`, each `.`, index and call, and each bracket, along the deepest path: `x = a + b` is 2 deep,
+`res["fields"]["rpm"]` 3 (two indexes and their bracket), `(a + b) * c` 3. Everything an element
+of an expression holds may nest under every link of that element, so a chain counts in full
+around the deepest bracket in it, and a bracket's depth adds to the links around it. The items of
+a list, a dict, a tuple or an argument list, which commas separate, are siblings and do not add
+up; the parameters of a `lambda` are not, since its body nests under all of them. Separate
+statements do not add up either, `;` included, and an `if` statement's `elif` clauses stop
+counting where the statement ends; an inline body after `:` is still inside the statement.
 
 A file past a limit is refused with one error at the token that passes it, as a syntax error is
 (5). Split a deep expression with intermediate names, a long `elif` chain or a deep block with
@@ -537,9 +540,11 @@ that many violations on one long line stay small.
 - The limits of 2.8 are checked by one pass over the tokens of `starlark_syntax`'s own lexer,
   before the parser runs: its parser, the validation it runs after parsing, the checker's walk
   and the AST's drop all recurse once per level of the AST, and every inner node of an
-  expression has a token of its own, so the counts bound that depth. A file within them is parsed
-  and checked, and the lowering walks its AST, on a thread with a fixed 16 MiB stack, about three
-  times what a file at every limit at once needs in a debug build (ADR-303)
+  expression has a token of its own, so the counts bound that depth. The pass, the parse and the
+  check run, and the lowering walks the AST, on a thread with a fixed 16 MiB stack, about three
+  times what a file at every limit at once needs in a debug build; `starlark_syntax` is built
+  with optimisation in the dev profile too, since its unoptimised lexer recurses per character of
+  a long run of digits or spaces (ADR-303)
 - Detection uses an "allowlist approach". Unknown node kinds are rejected as
   `STAR_UNSUPPORTED_SYNTAX` so that nothing slips through by oversight
 - Comment annotations (4.2, 4.5, 4.6) are taken from the comment tokens the parser's lexer

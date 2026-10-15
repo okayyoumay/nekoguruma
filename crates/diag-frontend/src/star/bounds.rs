@@ -26,10 +26,11 @@ pub const MAX_BLOCK_DEPTH: usize = 32;
 /// nests the rest of its statement one level deeper in the AST.
 pub const MAX_ELIF_CHAIN: usize = 256;
 
-/// The longest chain of operators, keywords and postfix accesses (`.`, an index, a call) the
-/// expressions enclosing a point have together, counted from the last comma at each bracket
-/// level. A chain such as `a + b + c` or `x["a"]["b"]` nests one level deeper per link.
-pub const MAX_EXPRESSION_CHAIN: usize = 512;
+/// The deepest an expression may nest: the most operators, keywords, postfix accesses (`.`, an
+/// index, a call) and brackets on one path from the statement down to an operand. A chain such as
+/// `a + b + c` or `x["a"]["b"]` nests one level deeper per link, and whatever wraps a bracketed
+/// operand adds to the depth inside it.
+pub const MAX_EXPRESSION_DEPTH: usize = 512;
 
 /// The stack of the thread that parses and checks a file. A file at every bound at once, in the
 /// costliest shapes, needs about 5 MiB in a debug build and under 1 MiB in a release build
@@ -57,18 +58,41 @@ pub(super) fn prescan(source: &str, dialect: &Dialect) -> Result<(), Exceeded> {
     Ok(())
 }
 
+/// One open bracket level, or the statement's own level, in the scan.
+///
+/// An expression at this level is a sequence of elements separated by commas, which are siblings
+/// in the AST. Within the current element every link (an operator, a keyword, a postfix access)
+/// may wrap every operand, the bracketed ones included, so the element nests at most `links`
+/// plus the deepest bracketed operand in it.
+#[derive(Default)]
+struct Level {
+    /// The links of the current element.
+    links: usize,
+    /// The depth of the deepest closed bracket in the current element.
+    bracketed: usize,
+    /// The depth of the deepest element already ended by a comma.
+    ended: usize,
+    /// The `lambda`s whose parameters are still being read: until its `:`, a comma separates
+    /// parameters of one `lambda`, whose body nests under everything before it.
+    lambdas: usize,
+}
+
+impl Level {
+    fn element(&self) -> usize {
+        self.links + self.bracketed
+    }
+}
+
 /// The scan's state at one token.
 struct Scan {
-    /// The chain length of each open bracket level; the first is the statement's own level.
-    chains: Vec<usize>,
-    /// The sum of `chains`.
-    chain: usize,
+    /// The open bracket levels; the first is the statement's own level.
+    levels: Vec<Level>,
     /// The `elif` count of the `if` statement in progress at each open block; the first is the
     /// top level.
     elifs: Vec<usize>,
     /// The sum of `elifs`.
     elif: usize,
-    /// Whether the token is the first of a statement.
+    /// Whether the token is the first of a statement on its own line.
     statement_start: bool,
     /// Whether the previous token ended an operand, so that a `(` or `[` is a call or an index.
     after_operand: bool,
@@ -77,8 +101,7 @@ struct Scan {
 impl Default for Scan {
     fn default() -> Self {
         Self {
-            chains: vec![0],
-            chain: 0,
+            levels: vec![Level::default()],
             elifs: vec![0],
             elif: 0,
             statement_start: true,
@@ -97,12 +120,13 @@ impl Scan {
                 self.after_operand = after_operand;
                 return Ok(());
             }
+            // A `;` ends a small statement on the same line, inside the same block: it ends the
+            // expression but not an `if` statement whose inline body it is in.
             Token::Newline | Token::Semicolon => {
-                if self.chains.len() == 1 {
-                    self.chain -= self.chains[0];
-                    self.chains[0] = 0;
+                if self.levels.len() == 1 {
+                    self.levels[0] = Level::default();
                 }
-                self.statement_start = true;
+                self.statement_start = matches!(token, Token::Newline);
                 return Ok(());
             }
             Token::Indent => {
@@ -150,67 +174,87 @@ impl Scan {
             | Token::OpeningCurly
             | Token::FStringExprStart => {
                 if after_operand && matches!(token, Token::OpeningRound | Token::OpeningSquare) {
-                    self.link(at)?;
+                    self.level().links += 1;
                 }
-                self.chains.push(0);
-                if self.chains.len() - 1 > MAX_BRACKET_DEPTH {
+                self.levels.push(Level::default());
+                if self.levels.len() - 1 > MAX_BRACKET_DEPTH {
                     return Err(exceeded(
                         at,
                         format!("brackets nest deeper than {MAX_BRACKET_DEPTH} levels"),
                     ));
                 }
+                return self.check_depth(at);
             }
             Token::ClosingRound
             | Token::ClosingSquare
             | Token::ClosingCurly
             | Token::FStringExprEnd => {
                 // An unbalanced bracket is the parser's syntax error.
-                if self.chains.len() > 1 {
-                    self.chain -= self.chains.pop().unwrap_or_default();
+                if self.levels.len() > 1 {
+                    let closed = self.levels.pop().expect("more than one level is open");
+                    let depth = 1 + closed.ended.max(closed.element());
+                    let level = self.level();
+                    level.bracketed = level.bracketed.max(depth);
                 }
                 self.after_operand = true;
+                return Ok(());
             }
             Token::Comma => {
-                let current = self
-                    .chains
-                    .last_mut()
-                    .expect("the statement level is never popped");
-                self.chain -= std::mem::take(current);
+                let level = self.level();
+                if level.lambdas == 0 {
+                    level.ended = level.ended.max(level.element());
+                    level.links = 0;
+                    level.bracketed = 0;
+                }
+                return Ok(());
+            }
+            Token::Colon => {
+                let level = self.level();
+                level.lambdas = level.lambdas.saturating_sub(1);
+                return Ok(());
             }
             Token::Identifier(_)
             | Token::Int(_)
             | Token::Float(_)
             | Token::String(_)
             | Token::Bytes(_)
-            | Token::FStringEnd => self.after_operand = true,
+            | Token::FStringEnd => {
+                self.after_operand = true;
+                return Ok(());
+            }
             Token::FStringStart(_)
             | Token::FStringText(_)
             | Token::FStringBang
-            | Token::Colon
             | Token::Pass
             | Token::Break
-            | Token::Continue => {}
-            // Every other token (operators, keywords, `.`) is a link; a statement keyword counts
-            // one more than it nests, which only makes the bound stricter.
-            _ => self.link(at)?,
+            | Token::Continue => return Ok(()),
+            Token::Lambda => self.level().lambdas += 1,
+            _ => {}
         }
-        Ok(())
+        // Every other token (operators, keywords, `.`) is a link; a statement keyword counts one
+        // more than it nests, which only makes the bound stricter.
+        self.level().links += 1;
+        self.check_depth(at)
     }
 
-    /// Adds one link to the chain at the innermost bracket level.
-    fn link(&mut self, at: usize) -> Result<(), Exceeded> {
-        *self
-            .chains
+    fn level(&mut self) -> &mut Level {
+        self.levels
             .last_mut()
-            .expect("the statement level is never popped") += 1;
-        self.chain += 1;
-        if self.chain > MAX_EXPRESSION_CHAIN {
+            .expect("the statement level is never popped")
+    }
+
+    /// Fails when the statement nests deeper than [`MAX_EXPRESSION_DEPTH`] along the path to this
+    /// token: each open bracket counts as closed here, wrapped by its level's links.
+    fn check_depth(&self, at: usize) -> Result<(), Exceeded> {
+        let mut levels = self.levels.iter().rev();
+        let innermost = levels.next().expect("the statement level is never popped");
+        let depth = levels.fold(innermost.element(), |inner, level| {
+            level.links + level.bracketed.max(1 + inner)
+        });
+        if depth > MAX_EXPRESSION_DEPTH {
             return Err(exceeded(
                 at,
-                format!(
-                    "the expressions here chain more than {MAX_EXPRESSION_CHAIN} operators, \
-                     keywords and accesses"
-                ),
+                format!("the expression here nests deeper than {MAX_EXPRESSION_DEPTH} levels"),
             ));
         }
         Ok(())

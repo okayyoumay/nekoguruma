@@ -29,7 +29,7 @@ use starlark_syntax::syntax::{AstModule, Dialect, DialectTypes};
 mod bounds;
 
 pub use bounds::{
-    MAX_BLOCK_DEPTH, MAX_BRACKET_DEPTH, MAX_ELIF_CHAIN, MAX_EXPRESSION_CHAIN, MAX_SOURCE_BYTES,
+    MAX_BLOCK_DEPTH, MAX_BRACKET_DEPTH, MAX_ELIF_CHAIN, MAX_EXPRESSION_DEPTH, MAX_SOURCE_BYTES,
     PARSER_STACK_BYTES, on_parser_stack,
 };
 
@@ -276,6 +276,11 @@ pub fn check(file: &str, source: &str) -> Result<Checked, Vec<StarError>> {
             format!("the file is larger than {MAX_SOURCE_BYTES} bytes (2.8)"),
         )]);
     }
+    on_parser_stack(|| check_bounded(file, source))
+}
+
+/// [`check`] on a file within the size bound.
+fn check_bounded(file: &str, source: &str) -> Result<Checked, Vec<StarError>> {
     let dialect = dialect();
     if let Err(exceeded) = bounds::prescan(source, &dialect) {
         return Err(vec![located(
@@ -286,12 +291,7 @@ pub fn check(file: &str, source: &str) -> Result<Checked, Vec<StarError>> {
             exceeded.hint,
         )]);
     }
-    on_parser_stack(|| check_bounded(file, source, &dialect))
-}
-
-/// [`check`] on a file within the bounds.
-fn check_bounded(file: &str, source: &str, dialect: &Dialect) -> Result<Checked, Vec<StarError>> {
-    let module = match AstModule::parse(file, source.to_owned(), dialect) {
+    let module = match AstModule::parse(file, source.to_owned(), &dialect) {
         Ok(module) => module,
         Err(error) => return Err(vec![syntax_error(file, source, &error)]),
     };

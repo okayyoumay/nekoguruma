@@ -108,7 +108,7 @@ jobs:
     if: ${{ always() && (needs.changes.result != 'success' || needs.changes.outputs.code == 'true') }}
     runs-on: windows-latest
     env:
-      EXCLUDE: ''
+      EXCLUDE: ${{ github.event_name == 'pull_request' && '--exclude j2534-0404-service' || '' }}
       RUSTFLAGS: -D warnings
     steps:
       - uses: actions/checkout@v7

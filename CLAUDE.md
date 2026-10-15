@@ -180,7 +180,7 @@ only; check a change to the IR or to `fuzz/` locally with the commands there. On
 them.
 
 The `msrv` job checks the workspace with the Rust version in `Cargo.toml`'s `rust-version`
-(`cargo check --workspace --all-targets`); every other job uses stable, except `fuzz` (nightly). On pull requests it runs
+(`cargo check --workspace --all-targets`); every other job uses stable, except `fuzz` (nightly for cargo-fuzz; its seeds build with stable). On pull requests it runs
 only when a `Cargo.toml`, `Cargo.lock` or `.cargo/` changes, which covers Dependabot's update pull
 requests (`.github/dependabot.yml`); main runs it on every push that is not documentation-only
 (the workflow's `paths-ignore`). Code that needs a newer compiler therefore shows up on main;

@@ -1273,7 +1273,7 @@ Signature verification is needed on both server and agent, and is consolidated i
 - 32-bit workers statically link libstdc++ / libgcc and dynamically link only glibc (fully static linking is impossible because of `dlopen`)
 - Do not declare dependencies on i386 / armhf packages
 - The `diag-ir` VM also runs on the server side, validating procedure definitions at ingestion with a dry run (execution with vehicle access mocked)
-- IR golden tests (known definition -> generated IR -> expected request bytes and decode results) are kept as regression tests. Fuzzing against malformed IR is also performed
+- IR golden tests (known definition -> generated IR -> expected request bytes and decode results) are kept as regression tests. Fuzzing against malformed IR is also performed (the cargo-fuzz targets in `fuzz/`, run by CI)
 
 ---
 

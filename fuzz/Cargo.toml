@@ -1,0 +1,33 @@
+# Fuzz targets for malformed IR (design 12.1), run with cargo-fuzz on a nightly toolchain
+# (`fuzz/README.md`). The package is its own workspace, so the main workspace's builds and
+# checks leave it out.
+[package]
+name = "ngr-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+diag-ir = { path = "../crates/diag-ir" }
+libfuzzer-sys = "0.4"
+postcard = { version = "1", default-features = false, features = ["alloc"] }
+
+[workspace]
+members = ["seeds"]
+
+[[bin]]
+name = "ecu_document"
+path = "fuzz_targets/ecu_document.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vm"
+path = "fuzz_targets/vm.rs"
+test = false
+doc = false
+bench = false

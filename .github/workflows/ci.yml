@@ -41,6 +41,7 @@ jobs:
     outputs:
       code: ${{ steps.filter.outputs.code }}
       deps: ${{ steps.filter.outputs.deps }}
+      fuzz: ${{ steps.filter.outputs.fuzz }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -55,6 +56,7 @@ jobs:
           if [ "$EVENT" != pull_request ]; then
             echo code=true >> "$GITHUB_OUTPUT"
             echo deps=true >> "$GITHUB_OUTPUT"
+            echo fuzz=true >> "$GITHUB_OUTPUT"
             exit 0
           fi
           files="$(git diff --name-only "$BASE" HEAD)"
@@ -67,6 +69,11 @@ jobs:
             echo deps=true >> "$GITHUB_OUTPUT"
           else
             echo deps=false >> "$GITHUB_OUTPUT"
+          fi
+          if grep -qE '^(crates/diag-ir/|crates/diag-frontend/|fuzz/)' <<< "$files"; then
+            echo fuzz=true >> "$GITHUB_OUTPUT"
+          else
+            echo fuzz=false >> "$GITHUB_OUTPUT"
           fi
 
   # Server and agent are 64-bit only.
@@ -198,6 +205,39 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p agent --release --locked
+
+  # Fuzzing malformed IR (design 12.1): each target in fuzz/ runs for 60 seconds, starting from
+  # the seeds that fuzz/seeds writes (fuzz/README.md). cargo-fuzz needs a nightly toolchain. On
+  # pull requests it runs only when the IR, the frontend that writes the seeds, or fuzz/ change;
+  # main runs it on every push that starts this workflow. It is not a required check. A crash
+  # keeps its input as an artifact.
+  fuzz:
+    needs: changes
+    if: ${{ always() && (needs.changes.result != 'success' || needs.changes.outputs.fuzz == 'true') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+          key: fuzz
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo run --locked --manifest-path fuzz/Cargo.toml -p ngr-fuzz-seeds -- fuzz/corpus
+      - working-directory: fuzz
+        run: |
+          for target in ecu_document vm; do
+            cargo fuzz run "$target" "corpus/$target" -- -max_total_time=60 -rss_limit_mb=2048
+          done
+      - if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
 
   # Linux targets: linked against glibc 2.17 through cargo-zigbuild's target suffix (ADR-232).
   worker-linux:

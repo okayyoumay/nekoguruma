@@ -610,3 +610,133 @@ fn unsigned_select_limits_are_stored_bit_for_bit() {
     let case = &select.cases.as_deref().expect("cases")[0];
     assert_eq!((case.lower, case.upper), (-1, -1));
 }
+
+#[test]
+fn every_routine_part_and_did_record_constants_convert() {
+    // container,name,byte,bit,type,bits,length,min_bytes,terminator,conversion,unit,const,shape,
+    // layout,ref,byte_order,max_bytes
+    let files = with_fields(&[
+        "routine:cycle:start:response,s,0,,uint,8,,,,,,,,,,,",
+        "routine:cycle:stop:response,t,0,,uint,8,,,,,,,,,,,",
+        "routine:cycle:results:response,u,0,,uint,8,,,,,,,,,,,",
+        "did:rec,k16,0,,uint,16,,,,,,0x0102,,,,,",
+        "did:rec,k24,2,,uint,24,,,,,,0x030405,,,,,",
+        "did:rec,kb,5,,bytes,16,,,,,,AA bb,,,,,",
+        "did:rec,k64,7,,uint,64,,,,,,0xFFFFFFFFFFFFFFFE,,,,,",
+        "did:rec,v,15,,uint,8,,,,,,,,,,,",
+    ]);
+    let files = appended(files, "routines.csv", &["cycle,0xAB01,yes,yes,yes,,,"]);
+    let files = appended(files, "dids.csv", &[",rec,0x1234,yes,yes,,,"]);
+    let documents = documents(&convert(files));
+    let document = &documents[0];
+    // After the example's 15 services and rec's read and write.
+    let parts = [
+        ("start", 0x01, "s"),
+        ("stop", 0x02, "t"),
+        ("results", 0x03, "u"),
+    ];
+    for (n, (part, sub, field_name)) in (18..).zip(parts) {
+        let s = service(document, &format!("cycle.{part}"));
+        assert_eq!(s.id, n);
+        assert_eq!(request(s), (0x31, &[sub, 0xAB, 0x01][..], &[][..]));
+        let (sid, prefix, fields) = response(s);
+        assert_eq!((sid, prefix), (0x71, &[sub, 0xAB, 0x01][..]));
+        let names: Vec<&str> = fields
+            .iter()
+            .filter_map(|f| f.short_name.as_deref())
+            .collect();
+        assert_eq!(names, [field_name]);
+    }
+    // Record constants, big-endian, in both the read response and the write request.
+    let record: &[u8] = &[
+        0x12, 0x34, 0x01, 0x02, 0x03, 0x04, 0x05, 0xAA, 0xBB, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFF, 0xFE,
+    ];
+    let read = service(document, "rec.read");
+    let write = service(document, "rec.write");
+    assert_eq!(request(read).1, &[0x12, 0x34]);
+    assert_eq!(response(read).1, record);
+    assert_eq!(request(write).1, record);
+    assert_eq!(response(write).1, &[0x12, 0x34]);
+    let v = &response(read).2[0];
+    assert_eq!(
+        (v.short_name.as_deref(), v.bit_offset),
+        (Some("v"), (3 + 15) * 8)
+    );
+    assert_eq!(request(write).2, response(read).2);
+}
+
+#[test]
+fn layouts_are_those_the_variant_reaches_also_through_other_layouts() {
+    let files = with_fields(&[
+        "response:scoped,g,0,,,,,,,,,,group,outer,,,",
+        "layout:outer,key,0,,uint,8,,,,,,,,,,,",
+        "layout:outer,sel,1,,,,,,,,,,select,,key,,",
+        "layout:inner1,a,0,,uint,8,,,,,,,,,,,",
+        "layout:inner2,b,0,,uint,8,,,,,,,,,,,",
+    ]);
+    let services = example()
+        .into_iter()
+        .find(|(name, _)| name == "services.csv")
+        .map(|(_, contents)| String::from_utf8(contents).expect("UTF-8"))
+        .expect("services.csv");
+    let mut lines: Vec<String> = services
+        .lines()
+        .enumerate()
+        .map(|(i, line)| format!("{line},{}", if i == 0 { "variants" } else { "" }))
+        .collect();
+    lines.push("scoped,0x23,exampleEcuV2".to_owned());
+    let files = with(files, "services.csv", &(lines.join("\n") + "\n"));
+    // Ids 4, 5 and 6 after the example's three layouts.
+    let files = appended(files, "layouts.csv", &["inner1,0", "inner2,0", "outer,0"]);
+    let files = appended(
+        files,
+        "select_cases.csv",
+        &[
+            "layout:outer,sel,one,0x01,,inner2",
+            "layout:outer,sel,rest,,,inner1",
+        ],
+    );
+    let documents = documents(&convert(files));
+    let ids = |document| -> Vec<u32> { layouts(document).iter().map(|l| l.id).collect() };
+    assert_eq!(ids(&documents[0]), [1, 3]);
+    assert_eq!(ids(&documents[1]), [1, 3, 4, 5, 6]);
+    let outer = &layouts(&documents[1])[4];
+    let ShapeT::Select(select) = &outer.fields.as_deref().expect("fields")[1].shape else {
+        panic!("a select")
+    };
+    assert_eq!(
+        (
+            select.has_default,
+            select.default_layout_id,
+            select.cases.as_deref().expect("cases")[0].layout_id
+        ),
+        (true, 4, 5)
+    );
+}
+
+#[test]
+fn marker_ids_follow_the_repeats_rows() {
+    let files = with_fields(&[
+        "response:markers,first,0,,,,,,,,,,repeat,pair,,,",
+        "response:markers,second,,,,,,,,,,,repeat,pair,,,",
+        "layout:pair,a,0,,uint,8,,,,,,,,,,,",
+    ]);
+    let files = appended(files, "services.csv", &["markers,0x23"]);
+    let files = appended(files, "layouts.csv", &["pair,1"]);
+    let files = with(
+        files,
+        "repeats.csv",
+        "container,field,count,marker_bits,marker_lower\n\
+         response:readDtcByStatusMask,records,end,,\n\
+         response:markers,second,marker,8,0x00\n\
+         response:markers,first,marker,8,0xFF\n",
+    );
+    let documents = documents(&convert(files));
+    let fields = response(service(&documents[0], "markers")).2;
+    let marker = |name| match &field(fields, name).shape {
+        ShapeT::Repeat(r) => r.marker.as_deref().expect("a marker").id,
+        _ => panic!("a repeat"),
+    };
+    assert_eq!(marker("second") + 1, marker("first"));
+}

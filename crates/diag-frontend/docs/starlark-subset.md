@@ -385,19 +385,25 @@ def main():
 
 ### 4.5 Specifying Section Attributes
 
-Interruptibility (8.10.1) is specified with comment annotations. Ranges without a specification
-are `interruptible: yes`.
+Interruptibility (8.10.1) is specified with comment annotations. Code outside every section is
+`interruptible: yes`.
 
 Every comment whose text starts with `@` is an annotation. An annotation that is not one of the
-forms in 4.2, 4.5 and 4.6, has an unknown or misspelled keyword or attribute, or leaves a
-`@section` without its `@endsection` (or the reverse) is rejected at ingestion
-(`STAR_BAD_ANNOTATION`), so a typo such as `# @section uninteruptible` cannot silently leave a
-range interruptible.
+forms in 4.2, 4.5 and 4.6, has an unknown or misspelled keyword or attribute, or stands where its
+form does not allow it is rejected at ingestion (`STAR_BAD_ANNOTATION`), so a typo such as
+`# @section uninteruptible` cannot silently leave a range interruptible.
+
+A section is a whole function (ADR-301). A `@section` comment directly before a top-level `def`
+makes that function a **section function**:
 
 ```python
-    # @section uninterruptible expected=120000
+# @section uninterruptible expected=120000
+def write_image():
+    diag.security_access(0x11)
     diag.flash_transfer(1)
-    # @endsection
+
+def main():
+    write_image()
 ```
 
 | Annotation | `Interruptible` |
@@ -408,9 +414,26 @@ range interruptible.
 
 `expected=<millis>` is the expected duration, an integer from 0 to 2^32 - 1; a value outside that
 range is rejected (`STAR_ARGUMENT_OUT_OF_RANGE`). It is compared with the remaining OEM
-authentication time (8.10.1). A section starts and ends in the same function body, at the same
-indentation. A nested `def` (2.6) is a function body of its own: a section inside it starts
-and ends inside it.
+authentication time (8.10.1) each time the function is called.
+
+- **Placement.** The comment is outside every function body, and the next statement after it is
+  a top-level `def`; only comments and blank lines may come between. A `def` takes one
+  `@section`. A nested `def` or a lambda (2.6) cannot be a section function: write the step as a
+  top-level `def`, which is equivalent since neither can capture anything. There is no
+  `@endsection`; the section ends where the function returns, by `return`, by the end of its
+  body or by `diag.fail`.
+- **Extent.** Everything that runs during a call of a section function is in the section: its
+  own body, every function it calls, directly or not, and every function it receives as an
+  argument and calls (2.6). The lowering gives each such function a copy that only the section
+  reaches and covers that copy with the same attributes; a function also called outside the
+  section keeps its own copy there. These copies count toward the specialization budget of 2.6.
+- **No nesting.** A call to a section function from anything that runs inside a section,
+  directly or through other functions or function arguments, is rejected at that call
+  (`STAR_BAD_ANNOTATION`). A call to a section function from outside every section, as many
+  times as the procedure needs, enters the section once per call.
+- **Values.** A section function takes what it needs as arguments and returns what the caller
+  needs; several values are returned in a dict or a list, since the subset has no tuples (2.3).
+  A loop around a section that must stop early tests the value the section returns.
 
 ### 4.6 Specifying Idempotency
 
@@ -490,14 +513,16 @@ that many violations on one long line stay small.
   a top-level `def` when the line of its comment is indented further than `def` and comes before the next
   top-level statement, so a comment after the last statement of a body still belongs to it.
   Within it, an annotation belongs to a nested `def` (2.6) whose body holds the line in the same
-  way.
+  way. A comment after a statement takes that statement's line and indentation.
   `@maxIterations` takes an integer from 1 to 2^32 - 1 and must precede a `for` in the same
   function; `@idempotency` takes `safe`, `checkState` or `unsafe` and must precede a statement in
-  the same function; a `@section` may not open while another is open, and it pairs with an
-  `@endsection` on a line of the same indentation (the line's leading whitespace, so a comment
-  after a statement takes that statement's indentation). An integer, negative ones
-  included, outside its range is `STAR_ARGUMENT_OUT_OF_RANGE`, any other fault
-  `STAR_BAD_ANNOTATION`
+  the same function; `@section` belongs to no function and must precede a top-level `def` (4.5).
+  An integer, negative ones included, outside its range is `STAR_ARGUMENT_OUT_OF_RANGE`, any
+  other fault `STAR_BAD_ANNOTATION`
+- Section nesting (4.5) is found on the call graph the recursion check builds, in one pass: the
+  functions reachable from any section function are marked, and a call from a marked function
+  to a section function is reported, unless it closes a cycle, which is reported as recursion
+  only. Calls through function parameters (2.6) are followed along the specialized call paths
 - The check of 2.3 sees the syntax only. A computed key, or a slice, is found on the expressions known to be
   dicts without type inference: dict literals, the responses of `diag.request`, `diag.routine`
   and `diag.read_dtc` (3.4), a response's `"fields"` (not the values in it, nor another dict's

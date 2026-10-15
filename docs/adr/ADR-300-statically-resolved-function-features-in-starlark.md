@@ -1,7 +1,7 @@
 # ADR-300: Statically Resolved Lambdas, Nested Functions and Keyword Arguments in Starlark
 
 **Date:** 2026-10-15
-**Status:** Accepted
+**Status:** Accepted (the Consequences' rule for sections in a nested `def` superseded by ADR-301)
 **Affects:** `diag-frontend` (`docs/starlark-subset.md` 2.2, 2.3, 2.6, 2.7, 4.1, 4.5, 4.7, 5); `docs/system-architecture.md` 8.4; ADR-254 Decision item 4
 
 ## Context

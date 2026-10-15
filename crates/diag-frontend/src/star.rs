@@ -15,7 +15,7 @@
 //! A name assigned on only some paths (one branch of an `if`, the body of a `for`) counts as a
 //! dict after it when it is one on any path.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 
 use serde::Serialize;
@@ -135,14 +135,15 @@ pub enum Idempotency {
 pub enum Annotation {
     /// `@maxIterations n`, attached to the `for` statement that follows (4.2).
     MaxIterations { line: u32, limit: u32 },
-    /// `@section kind [expected=millis]` (4.5).
+    /// `@section kind [expected=millis]`, which makes the whole top-level `def` that follows it a
+    /// section, together with every function that `def` calls (4.5, ADR-301).
     Section {
         line: u32,
+        /// The line of the `def`.
+        def: u32,
         kind: SectionKind,
         expected_millis: Option<u32>,
     },
-    /// `@endsection` (4.5).
-    EndSection { line: u32 },
     /// `@idempotency value`, attached to the statement that follows (4.6).
     Idempotency { line: u32, value: Idempotency },
 }
@@ -260,6 +261,7 @@ pub fn check(file: &str, source: &str) -> Result<Checked, Vec<StarError>> {
         globals: HashSet::new(),
         global_kinds: HashMap::new(),
         calls: Vec::new(),
+        components: Vec::new(),
         quiet: 0,
         loops: Vec::new(),
         loop_states: HashMap::new(),
@@ -431,6 +433,9 @@ struct Checker<'a> {
     /// What the top-level constants are known to be.
     global_kinds: HashMap<String, Kinds>,
     calls: Vec<Call>,
+    /// The strongly connected component of each function in the call graph, once
+    /// [`Checker::recursion`] has run.
+    components: Vec<usize>,
     /// Above 0 while a loop body is walked only to find what its names are bound to: nothing is
     /// reported then.
     quiet: u32,
@@ -1585,6 +1590,7 @@ impl Checker<'_> {
             .filter(|call| component[call.caller] == component[call.callee])
             .map(|call| (call.span, call.written.clone()))
             .collect();
+        self.components = component;
         for (span, written) in recursive {
             self.error(
                 StarCode::UnboundedNotAllowed,
@@ -1648,9 +1654,27 @@ impl Checker<'_> {
                 .copied()
                 .filter(|(at, _)| def.0 < *at && *at <= def.1)
         };
+        // The top-level `def`s by line, with their names and the last line of the top-level
+        // statement before each, when that is not a `def` (0 otherwise): a `def`'s span runs on
+        // over the comments after its body, which `enclosing` judges instead.
+        let top_defs: Vec<(u32, String, u32)> = top
+            .iter()
+            .enumerate()
+            .filter_map(|(at, stmt)| match &stmt.node {
+                StmtP::Def(def) => Some((
+                    line_of(stmt.span),
+                    def.name.node.ident.clone(),
+                    at.checked_sub(1)
+                        .map(|before| top[before])
+                        .filter(|before| !matches!(before.node, StmtP::Def(_)))
+                        .map_or(0, |before| line_of(before.span.end_span())),
+                )),
+                _ => None,
+            })
+            .collect();
         let mut annotations = Vec::new();
-        // The open `@section` of the function being read: its def, column and comment.
-        let mut open: Option<((u32, u32), u32, Span)> = None;
+        // The section functions, by the line of their `def`.
+        let mut sectioned: BTreeMap<u32, String> = BTreeMap::new();
         for &span in module.comments() {
             let file_span = module.file_span(span);
             // One comment marker: after `##` the text starts with `#`, an ordinary comment.
@@ -1761,68 +1785,102 @@ impl Checker<'_> {
                             continue;
                         }
                     };
-                    let Some(def) = enclosing(line, column) else {
+                    // The statement after the comment must be a top-level `def`, and the comment
+                    // must be outside every function body and every other top-level statement.
+                    let at = statement_lines.partition_point(|(begin, _)| *begin <= line);
+                    let target = statement_lines
+                        .get(at)
+                        .and_then(|(next, _)| {
+                            top_defs
+                                .binary_search_by_key(next, |(def_line, _, _)| *def_line)
+                                .ok()
+                        })
+                        .map(|at| &top_defs[at])
+                        .filter(|(_, _, before)| *before < line)
+                        .filter(|_| enclosing(line, column).is_none());
+                    let Some((def, name, _)) = target.cloned() else {
                         bad(
                             self,
-                            "`@section` must be inside a function (4.5)".to_owned(),
+                            "`@section` must directly precede a top-level `def`, which it makes a \
+                             section; a nested `def` or a lambda cannot be one (4.5)"
+                                .to_owned(),
                         );
                         continue;
                     };
-                    if let Some((_, _, open_span)) = open {
-                        self.error(
-                            StarCode::BadAnnotation,
-                            open_span,
-                            "this `@section` has no `@endsection` before the next one (4.5)",
+                    if sectioned.contains_key(&def) {
+                        bad(
+                            self,
+                            format!("`{name}` already has a `@section`; a `def` takes one (4.5)"),
                         );
+                        continue;
                     }
-                    open = Some((def, column, span));
+                    sectioned.insert(def, name);
                     annotations.push(Annotation::Section {
                         line,
+                        def,
                         kind,
                         expected_millis,
                     });
                 }
-                "endsection" => {
-                    if !args.is_empty() {
-                        bad(self, "`@endsection` takes no arguments (4.5)".to_owned());
-                        continue;
-                    }
-                    match open.take() {
-                        Some((def, open_column, _))
-                            if enclosing(line, column) == Some(def) && open_column == column =>
-                        {
-                            annotations.push(Annotation::EndSection { line });
-                        }
-                        Some((_, _, open_span)) => {
-                            bad(
-                                self,
-                                "`@endsection` must be in the same function and at the same \
-                                 indentation as its `@section` (4.5)"
-                                    .to_owned(),
-                            );
-                            self.error(
-                                StarCode::BadAnnotation,
-                                open_span,
-                                "this `@section` has no matching `@endsection` (4.5)",
-                            );
-                        }
-                        None => bad(self, "`@endsection` without a `@section` (4.5)".to_owned()),
-                    }
-                }
+                "endsection" => bad(
+                    self,
+                    "`@endsection` does not exist: a section is a whole top-level `def`, marked \
+                     by a `@section` directly before it (4.5)"
+                        .to_owned(),
+                ),
                 other => bad(
                     self,
                     format!("unknown annotation `@{other}`; see 4.2, 4.5 and 4.6"),
                 ),
             }
         }
-        if let Some((_, _, open_span)) = open {
+        self.section_nesting(sectioned.values());
+        annotations
+    }
+
+    /// Sections do not nest: no function that runs inside a section, the section function itself
+    /// or anything it calls, directly or not, may call another section function (4.5,
+    /// ADR-301). A call that closes a cycle is reported as recursion only.
+    fn section_nesting<'n>(&mut self, sections: impl Iterator<Item = &'n String>) {
+        let ids: HashSet<usize> = sections.map(|name| self.def_ids[name]).collect();
+        let mut successors: Vec<Vec<usize>> = vec![Vec::new(); self.next_function];
+        for call in &self.calls {
+            successors[call.caller].push(call.callee);
+        }
+        // Every function reachable from a section function, by one pass over the graph.
+        let mut inside = vec![false; self.next_function];
+        let mut stack: Vec<usize> = ids.iter().copied().collect();
+        for &id in &stack {
+            inside[id] = true;
+        }
+        while let Some(function) = stack.pop() {
+            for &next in &successors[function] {
+                if !inside[next] {
+                    inside[next] = true;
+                    stack.push(next);
+                }
+            }
+        }
+        let nested: Vec<(Span, String)> = self
+            .calls
+            .iter()
+            .filter(|call| {
+                inside[call.caller]
+                    && ids.contains(&call.callee)
+                    && self.components[call.caller] != self.components[call.callee]
+            })
+            .map(|call| (call.span, call.written.clone()))
+            .collect();
+        for (span, written) in nested {
             self.error(
                 StarCode::BadAnnotation,
-                open_span,
-                "this `@section` has no `@endsection` (4.5)",
+                span,
+                format!(
+                    "`{written}` is a section and this call runs inside another section; \
+                     sections do not nest (4.5)"
+                ),
             );
         }
-        annotations
     }
 }
 

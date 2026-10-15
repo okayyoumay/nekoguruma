@@ -377,22 +377,24 @@ fn delivery_thread() -> &'static Mutex<Option<JoinHandle<()>>> {
     &THREAD
 }
 
-/// Appends `events` to the schedule, each `delay_ms` after `start` and none before the last
-/// event already scheduled, so a ComPrimitive's events follow those of the one before it
-/// (ISO 22900-2 (2022) 8.2.6.5: a link executes its non-cyclic ComPrimitives one after another).
+/// Appends `events` to the schedule, each `delay_ms` after the ComPrimitive begins: at `start`,
+/// or when the last event already scheduled is due if that is later. So a ComPrimitive's events
+/// follow those of the one before it (ISO 22900-2 (2022) 8.2.6.5: a link executes its
+/// non-cyclic ComPrimitives one after another) and keep their own spacing.
 fn schedule(state: &mut MockState, start: Instant, events: Vec<(u32, PendingEvent)>) {
-    let earliest = state
+    let begins = state
         .scheduled
         .back()
         .map_or(start, |(due, _)| (*due).max(start));
     for (delay_ms, event) in events {
-        let due = (start + Duration::from_millis(delay_ms.into())).max(earliest);
+        let due = begins + Duration::from_millis(delay_ms.into());
         state.scheduled.push_back((due, event));
     }
     delivery_signal().notify_all();
 }
 
-/// Starts the delivery thread unless one runs.
+/// Starts the delivery thread unless one runs. Called with the state locked; neither the
+/// delivery thread nor `stop_delivery_thread` takes the state lock while holding this one.
 fn ensure_delivery_thread() {
     let mut thread = delivery_thread().lock().expect("delivery thread poisoned");
     if thread.as_ref().is_none_or(JoinHandle::is_finished) {
@@ -889,15 +891,25 @@ exported_fn!(PDUStartComPrimitive(_h_mod: UNUM32, _h_cll: UNUM32, cop_type: T_PD
         // and while one is attached every ComPrimitive's events go through the schedule, so
         // they follow those of the ComPrimitives before it. Without one, the synthetic
         // completion event is queued at once.
-        let immediate = match guard.ecu.as_mut() {
+        // Events still scheduled (the ECU detached meanwhile) keep this one behind them too.
+        let behind = !guard.scheduled.is_empty();
+        let events = match guard.ecu.as_mut() {
+            Some(ecu) if cop_type == E_PDU_COPT::PDU_COPT_SENDRECV && !request.is_empty() => {
+                Some(ecu_events(ecu, request, cycles(control), &event))
+            }
+            Some(_) => Some(vec![(0, event.clone())]),
+            None if behind => Some(vec![(0, event.clone())]),
+            None => None,
+        };
+        let immediate = match events {
             None => Some(event),
-            Some(ecu) => {
-                let events = if cop_type == E_PDU_COPT::PDU_COPT_SENDRECV && !request.is_empty() {
-                    ecu_events(ecu, request, cycles(control), &event)
-                } else {
-                    vec![(0, event)]
-                };
+            Some(events) => {
                 schedule(&mut guard, start, events);
+                // Started under the state lock, so a `PDUDestruct` that follows finds the
+                // thread to stop; none is started once the API is destructed.
+                if guard.constructed {
+                    ensure_delivery_thread();
+                }
                 None
             }
         };
@@ -908,9 +920,8 @@ exported_fn!(PDUStartComPrimitive(_h_mod: UNUM32, _h_cll: UNUM32, cop_type: T_PD
         *ph_cop = handle;
     }
 
-    match immediate {
-        Some(event) => unsafe { queue_event(event) },
-        None => ensure_delivery_thread(),
+    if let Some(event) = immediate {
+        unsafe { queue_event(event) };
     }
     no_error()
 });
@@ -1165,7 +1176,10 @@ exported_fn!(PDUGetTimestamp(_h_mod: UNUM32, p_timestamp: *mut UNUM32) -> T_PDU_
 // Call this from tests to reset the DLL's internal state between test runs.
 exported_fn!(__mock_reset() -> T_PDU_ERROR {
     let mut guard = state().lock().expect("mock state poisoned");
+    // A `PDUDestruct` in progress still needs the delivery thread to see its stop.
+    let stop_delivery = guard.stop_delivery;
     *guard = MockState::default();
+    guard.stop_delivery = stop_delivery;
     no_error()
 });
 
@@ -1426,7 +1440,9 @@ pub fn mock_library_path() -> Result<PathBuf, std::io::Error> {
 /// Back-door API: Reset all mock state and counters for clean test isolation.
 pub fn mock_reset() {
     let mut guard = state().lock().expect("mock state poisoned");
+    let stop_delivery = guard.stop_delivery;
     *guard = MockState::default();
+    guard.stop_delivery = stop_delivery;
 }
 
 /// Back-door API: Get the call count for PDUConstruct.

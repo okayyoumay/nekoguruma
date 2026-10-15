@@ -42,10 +42,12 @@ API's own response-pending handling.
    items, as they do when the D-PDU API's handling of NRC 0x78 is switched off. The mock keeps
    no ComParams, so it cannot follow the client's setting; passing the messages on lets the
    worker and its callers see them, as `sim-vci` does.
-5. **Timing and order.** While an ECU is attached, every ComPrimitive's events go into one
-   schedule, each at the delay `sim-ecu` gives it counted from the request, and none before
-   the last event already scheduled: a link runs its non-cyclic ComPrimitives one after another
-   (8.2.6.5), so one ComPrimitive's events never come between another's. One delivery thread
+5. **Timing and order.** While an ECU is attached, and while events of an earlier
+   ComPrimitive are still scheduled after it is detached, every ComPrimitive's events go into
+   one schedule. Each is due at the delay `sim-ecu` gives it, counted from when the
+   ComPrimitive begins: at its request, or when the last event already scheduled is due if
+   that is later. A link runs its non-cyclic ComPrimitives one after another (8.2.6.5), so one
+   ComPrimitive's events never come between another's, and each keeps its own spacing. One delivery thread
    queues them when due and notifies the callback with the mock's state unlocked. The receive
    timeout is reported right after the last message the ECU sent, since there is no P2 to wait
    for. `PDUConstruct` and a reset discard the schedule; `PDUDestruct` discards it and waits

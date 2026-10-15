@@ -1317,6 +1317,54 @@ fn table_entries_looked_at_are_bounded() {
 }
 
 #[test]
+fn only_the_entries_looked_at_count_toward_the_table_budget() {
+    // The same select as above, but its key matches the first case: 2^13 searches look at one
+    // entry each, far below the budget.
+    let cases = (0..4096).map(|n| (n, n, 0)).collect();
+    let innermost = vec![at(5, DataKind::Uint, 0, 8), select(6, 5, cases, None)];
+    assert!(decode_nested(&[], vec![group(1, 1)], doubling(14, innermost), &[SID, 0]).is_ok());
+    // A text table and a scale-linear conversion matched by their first entry, likewise.
+    let entries = (0..4096)
+        .map(|n| TextEntryT {
+            lower: n,
+            upper: n,
+            text_id: 1,
+        })
+        .collect();
+    let text = with_compu(
+        at(5, DataKind::Uint, 0, 8),
+        CompuT::CompuTextTable(Box::new(CompuTextTableT {
+            entries: Some(entries),
+            default_text_id: 0,
+        })),
+    );
+    let scales = (0..4096)
+        .map(|n| LinearScaleT {
+            lower: f64::from(n),
+            upper: f64::from(n),
+            numerator: 1.0,
+            denominator: 1.0,
+            offset: 0.0,
+        })
+        .collect();
+    let scaled = with_compu(
+        at(6, DataKind::Uint, 0, 8),
+        CompuT::CompuScaleLinear(Box::new(CompuScaleLinearT {
+            scales: Some(scales),
+        })),
+    );
+    assert!(
+        decode_nested(
+            &[],
+            vec![group(1, 1)],
+            doubling(14, vec![text, scaled]),
+            &[SID, 0]
+        )
+        .is_ok()
+    );
+}
+
+#[test]
 fn a_shaped_field_past_the_end_of_its_layout_is_truncated() {
     // An empty group, and a case without a layout, take no bytes but must still start within
     // the message.

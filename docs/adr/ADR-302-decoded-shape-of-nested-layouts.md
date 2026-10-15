@@ -59,7 +59,8 @@ decoded more than once; and how the limits of ADR-242 item 7 are counted.
    `Absolute` placement lets several shaped fields, and the layouts they nest, read the same
    bytes again, so a small document can multiply its decoded occurrences. Two more budgets
    therefore fail with `TooLarge`: more than 16 MiB of names and byte or text values, and more
-   than 16 Mi entries looked at in `Select` cases and conversion tables.
+   than 16 Mi entries looked at in `Select` cases and conversion tables (cases, scales and text
+   entries up to the first match, interpolation points and rational coefficients all).
 7. A key that matches no case of a `Select` without a default is an invalid value of the
    message (`InvalidValue`), not a broken plan.
 

@@ -331,8 +331,10 @@ impl<'a, 'm> Decoder<'a, 'm> {
             let (value, text_id, after) = if field.shape_type() == Shape::NONE {
                 let (internal, after) = extract(self, &field, window, byte, bit)?;
                 let key = key_of(&field, &internal);
-                self.scan(table_len(&field))?;
-                let (value, text_id) = convert(&field, internal)?;
+                let mut visited = 0;
+                let converted = convert(&field, internal, &mut visited);
+                self.scan(visited)?;
+                let (value, text_id) = converted?;
                 self.remember(
                     id,
                     Seen {
@@ -523,13 +525,16 @@ impl<'a, 'm> Decoder<'a, 'm> {
                 .ok_or_else(|| plan(field, "a key field that is not decoded before it"))?
                 .key
                 .ok_or_else(|| plan(field, "a key that is not an integer or up to 8 bytes"))?;
-            self.scan(select.cases().map_or(0, |cases| cases.len()))?;
-            let chosen = select.cases().and_then(|cases| {
-                cases
-                    .iter()
-                    .position(|c| key.within(c.lower(), c.upper()))
-                    .map(|at| (Some(at), cases.get(at).layout_id()))
+            let found = select.cases().map(|cases| {
+                let at = cases.iter().position(|c| key.within(c.lower(), c.upper()));
+                // The cases looked at: up to the match, or all of them.
+                (
+                    at.map_or(cases.len(), |at| at + 1),
+                    at.map(|at| (Some(at), cases.get(at).layout_id())),
+                )
             });
+            self.scan(found.map_or(0, |(looked, _)| looked))?;
+            let chosen = found.and_then(|(_, chosen)| chosen);
             let (case, layout_id) = match chosen {
                 Some(chosen) => chosen,
                 None if select.has_default() => (None, select.default_layout_id()),
@@ -598,22 +603,6 @@ impl<'a, 'm> Decoder<'a, 'm> {
             .seen(id)
             .ok_or_else(|| plan(field, "a count field that is not decoded before it"))?;
         whole(field, seen, "a count that is negative or not whole")
-    }
-}
-
-/// The number of entries a field's conversion may look at: its scales, text entries,
-/// interpolation points or rational coefficients.
-fn table_len(field: &Field<'_>) -> usize {
-    if let Some(c) = field.compu_as_compu_scale_linear() {
-        c.scales().map_or(0, |v| v.len())
-    } else if let Some(c) = field.compu_as_compu_text_table() {
-        c.entries().map_or(0, |v| v.len())
-    } else if let Some(c) = field.compu_as_compu_table_interp() {
-        c.points().map_or(0, |v| v.len())
-    } else if let Some(c) = field.compu_as_compu_rational() {
-        c.numerator_coeffs().map_or(0, |v| v.len()) + c.denominator_coeffs().map_or(0, |v| v.len())
-    } else {
-        0
     }
 }
 
@@ -963,10 +952,13 @@ fn is_string_like(kind: DataKind) -> bool {
     )
 }
 
-/// Applies the field's conversion; returns the physical value and the text id.
+/// Applies the field's conversion; returns the physical value and the text id, and adds the
+/// table entries it looked at (scales and text entries up to the first match, all points and
+/// coefficients) to `visited`.
 fn convert(
     field: &Field<'_>,
     internal: PhysicalValue,
+    visited: &mut usize,
 ) -> Result<(PhysicalValue, u32), DecodeError> {
     let tag = field.compu_type();
     if tag == Compu::NONE || tag == Compu::CompuIdentity {
@@ -979,7 +971,7 @@ fn convert(
         });
     }
     if tag == Compu::CompuTextTable {
-        let text_id = text_table(field, &internal)?;
+        let text_id = text_table(field, &internal, visited)?;
         return Ok((internal, text_id));
     }
     let x = match internal {
@@ -996,16 +988,16 @@ fn convert(
         let Some(scales) = c.scales().filter(|s| !s.is_empty()) else {
             return Err(plan(field, "a scale-linear conversion without scales"));
         };
-        let scale = scales
-            .iter()
-            .find(|s| s.lower() <= x && x <= s.upper())
-            .ok_or_else(|| conversion(field, "no scale contains the value"))?;
+        let at = scales.iter().position(|s| s.lower() <= x && x <= s.upper());
+        *visited += at.map_or(scales.len(), |at| at + 1);
+        let scale = scales.get(at.ok_or_else(|| conversion(field, "no scale contains the value"))?);
         linear(
             field,
             x * scale.numerator() + scale.offset(),
             scale.denominator(),
         )?
     } else if let Some(c) = field.compu_as_compu_table_interp() {
+        *visited += c.points().map_or(0, |p| p.len());
         interpolate(field, c.points(), x)?
     } else if let Some(c) = field.compu_as_compu_rational() {
         let (Some(num), Some(den)) = (c.numerator_coeffs(), c.denominator_coeffs()) else {
@@ -1014,6 +1006,7 @@ fn convert(
         if num.is_empty() || den.is_empty() {
             return Err(plan(field, "a rational conversion without coefficients"));
         }
+        *visited += num.len() + den.len();
         ratio(field, polynomial(num, x), polynomial(den, x))?
     } else {
         return Err(plan(field, "an unknown conversion"));
@@ -1111,7 +1104,11 @@ fn interpolate(
 /// The text id a text table gives an integer internal value: the first entry whose closed
 /// range holds it, else the default text; with no default (0) the value has no result
 /// (ISO 22901-1 (2008) 7.3.6.6.1).
-fn text_table(field: &Field<'_>, internal: &PhysicalValue) -> Result<u32, DecodeError> {
+fn text_table(
+    field: &Field<'_>,
+    internal: &PhysicalValue,
+    visited: &mut usize,
+) -> Result<u32, DecodeError> {
     let x = match *internal {
         PhysicalValue::Unsigned(n) => i128::from(n),
         PhysicalValue::Signed(n) => i128::from(n),
@@ -1125,11 +1122,13 @@ fn text_table(field: &Field<'_>, internal: &PhysicalValue) -> Result<u32, Decode
     let Some(table) = field.compu_as_compu_text_table() else {
         return Err(plan(field, "an unknown conversion"));
     };
-    let entry = table
-        .entries()
+    let entries = table.entries();
+    let at = entries
         .into_iter()
         .flatten()
-        .find(|e| i128::from(e.lower()) <= x && x <= i128::from(e.upper()));
+        .position(|e| i128::from(e.lower()) <= x && x <= i128::from(e.upper()));
+    *visited += at.map_or(entries.map_or(0, |e| e.len()), |at| at + 1);
+    let entry = at.zip(entries).map(|(at, entries)| entries.get(at));
     match (entry, table.default_text_id()) {
         (Some(entry), _) => Ok(entry.text_id()),
         (None, 0) => Err(conversion(

@@ -51,7 +51,7 @@ unsafe { libloading::Library::new(&lib_path).unwrap().get::<fn()>(b"__mock_reset
 | `PDUModuleConnect` | Always succeeds. |
 | `PDUModuleDisconnect` | Always succeeds. |
 | `PDUGetVersion` | Returns canned version data (`"iso22900-mock"` strings). |
-| `PDUGetStatus` | Returns `PDU_CLLST_ONLINE` for CLL handles; `PDU_MODST_READY` for module handles. |
+| `PDUGetStatus` | Returns `PDU_CLLST_ONLINE` for CLL handles; `PDU_MODST_READY` for module handles. For a ComPrimitive handle it reports the status code `PDU_COPST_FINISHED`, or `PDU_COPST_EXECUTING` while the ComPrimitive's events are still scheduled (ADR-299). |
 | `PDUGetLastError` | Returns `PDU_ERR_EVT_NOERROR` (0). |
 | `PDUGetModuleIds` | Returns a single module entry (`MOCK_MODULE_HANDLE` = 1001). |
 | `PDUGetResourceIds` | Returns a single resource ID (`MOCK_RESOURCE_ID` = 2001). |
@@ -83,11 +83,14 @@ When `PDUStartComPrimitive` is called, the mock immediately enqueues a synthetic
 
 With a `sim-ecu` attached (ADR-299), a `PDU_COPT_SENDRECV` ComPrimitive with request bytes is answered by the ECU instead, through `SimEcu::exchange` with physical addressing. Its events are, in order:
 
-1. a result item for each response-pending message (`7F <SID> 78`): the mock does no negative-response handling of its own;
-2. a result item with the response, or, when the ECU sends none, an error item `PDU_ERR_EVT_RX_TIMEOUT`;
-3. a `PDU_COPST_FINISHED` status item.
+1. a `PDU_COPST_EXECUTING` status item;
+2. a result item for each response-pending message (`7F <SID> 78`): the mock does no negative-response handling of its own;
+3. a result item with the response, or, when the ECU sends none, an error item `PDU_ERR_EVT_RX_TIMEOUT`;
+4. a `PDU_COPST_FINISHED` status item.
 
-Each is queued at the delay the ECU gives it, counted from the request; a delayed event is queued from a thread, and one still waiting when `PDUConstruct`, `PDUDestruct` or a reset discards the queue is dropped. The receive timeout comes right after the last message the ECU sent, since the mock keeps no ComParams and so has no P2 to wait for. Other ComPrimitive types, and a send-and-receive ComPrimitive without request bytes, still get the synthetic completion event; so does every ComPrimitive while no ECU is attached.
+The control data's cycles decide what is sent and received: with no send cycles nothing reaches the ECU and only the two status items follow; with no receive cycles the request reaches the ECU and only the two status items follow. Any other combination runs as one send and one response, and so does a ComPrimitive without control data.
+
+While an ECU is attached, every ComPrimitive's events (the synthetic completion event of the other ComPrimitive types too) go into one schedule, each at the delay the ECU gives it counted from the request and none before the events already scheduled, so ComPrimitives run one after another. A delivery thread queues each event when it is due and fires the callback. `PDUConstruct` and a reset discard the schedule; `PDUDestruct` discards it and waits for the delivery thread to end. The receive timeout comes right after the last message the ECU sent, since the mock keeps no ComParams and so has no P2 to wait for. `PDUGetStatus` reports `PDU_COPST_EXECUTING` for a ComPrimitive with events still scheduled. Without an ECU every ComPrimitive gets the synthetic completion event at once.
 
 An ECU is attached in one of two ways:
 

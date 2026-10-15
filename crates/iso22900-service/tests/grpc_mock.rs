@@ -1278,6 +1278,37 @@ enum Seen {
     Error(i32),
 }
 
+const EXECUTING: i32 = 0x8011;
+const FINISHED: i32 = 0x8012;
+
+/// Starts a send-and-receive ComPrimitive with `request`, sent once and expecting
+/// `receive_cycles` responses, and returns its handle.
+async fn start_send_and_receive(
+    client: &mut VciServiceClient<Channel>,
+    cll_handle: ComLogicalLinkHandle,
+    request: &[u8],
+    receive_cycles: i32,
+) -> u32 {
+    client
+        .start_com_primitive(StartComPrimitiveRequest {
+            cll_handle: Some(cll_handle),
+            cop_type: vci_service_interface::ComOperationType::CoptSendrecv as i32,
+            cop_data: request.to_vec(),
+            cop_ctrl_data: Some(vci_service_interface::ComPrimitiveCtrlData {
+                num_send_cycles: 1,
+                num_receive_cycles: receive_cycles,
+                ..Default::default()
+            }),
+            cop_tag: None,
+        })
+        .await
+        .expect("start_com_primitive should succeed")
+        .into_inner()
+        .cop_handle
+        .expect("a ComPrimitive handle")
+        .cop_handle
+}
+
 /// Starts a send-and-receive ComPrimitive with `request` and returns its events up to and
 /// including its `PDU_COPST_FINISHED` status.
 async fn send_and_receive(
@@ -1286,17 +1317,22 @@ async fn send_and_receive(
     cll_handle: ComLogicalLinkHandle,
     request: &[u8],
 ) -> Vec<Seen> {
-    client
-        .start_com_primitive(StartComPrimitiveRequest {
-            cll_handle: Some(cll_handle),
-            cop_type: vci_service_interface::ComOperationType::CoptSendrecv as i32,
-            cop_data: request.to_vec(),
-            cop_ctrl_data: None,
-            cop_tag: None,
-        })
+    start_send_and_receive(client, cll_handle, request, 1).await;
+    events_until_finished(stream, 1)
         .await
-        .expect("start_com_primitive should succeed");
+        .into_iter()
+        .map(|(_, seen)| seen)
+        .collect()
+}
+
+/// The events on `stream`, with the ComPrimitive handle of each, until `count` ComPrimitives
+/// have reached `PDU_COPST_FINISHED`.
+async fn events_until_finished(
+    stream: &mut tonic::Streaming<EventNotification>,
+    count: usize,
+) -> Vec<(u32, Seen)> {
     let mut seen = Vec::new();
+    let mut finished = 0;
     loop {
         let notification = timeout(Duration::from_secs(5), stream.message())
             .await
@@ -1308,15 +1344,18 @@ async fn send_and_receive(
         else {
             panic!("expected an event item");
         };
+        let cop = item.cop_handle.expect("a ComPrimitive handle").cop_handle;
         let event = match item.data.expect("event data") {
             event_item::Data::ResultData(result) => Seen::Result(result.data_bytes),
             event_item::Data::CopStatus(status) => Seen::Status(status),
             event_item::Data::ErrorData(error) => Seen::Error(error),
             other => panic!("unexpected event {other:?}"),
         };
-        let finished = event == Seen::Status(0x8012);
-        seen.push(event);
-        if finished {
+        if event == Seen::Status(FINISHED) {
+            finished += 1;
+        }
+        seen.push((cop, event));
+        if finished == count {
             return seen;
         }
     }
@@ -1349,10 +1388,13 @@ async fn com_primitives_are_answered_by_the_simulated_ecu() {
     let read_vin = [0x22, 0xF1, 0x90];
     let mut vin_response = vec![0x62, 0xF1, 0x90];
     vin_response.extend_from_slice(b"NGRSIMECU00000001");
-    const FINISHED: i32 = 0x8012;
     assert_eq!(
         send_and_receive(&mut client, &mut stream, cll_handle, &read_vin).await,
-        [Seen::Result(vin_response.clone()), Seen::Status(FINISHED)]
+        [
+            Seen::Status(EXECUTING),
+            Seen::Result(vin_response.clone()),
+            Seen::Status(FINISHED)
+        ]
     );
 
     // Response pending messages come first, each as a result item.
@@ -1364,6 +1406,7 @@ async fn com_primitives_are_answered_by_the_simulated_ecu() {
     assert_eq!(
         send_and_receive(&mut client, &mut stream, cll_handle, &read_vin).await,
         [
+            Seen::Status(EXECUTING),
             pending,
             Seen::Result(vec![0x7F, 0x22, 0x78]),
             Seen::Result(vin_response.clone()),
@@ -1378,14 +1421,61 @@ async fn com_primitives_are_answered_by_the_simulated_ecu() {
     );
     assert_eq!(
         send_and_receive(&mut client, &mut stream, cll_handle, &read_vin).await,
-        [Seen::Error(0x103), Seen::Status(FINISHED)]
+        [
+            Seen::Status(EXECUTING),
+            Seen::Error(0x103),
+            Seen::Status(FINISHED)
+        ]
     );
 
     // A negative response is an ordinary result.
     assert_eq!(
         send_and_receive(&mut client, &mut stream, cll_handle, &[0x22, 0x12, 0x34]).await,
-        [Seen::Result(vec![0x7F, 0x22, 0x31]), Seen::Status(FINISHED)]
+        [
+            Seen::Status(EXECUTING),
+            Seen::Result(vec![0x7F, 0x22, 0x31]),
+            Seen::Status(FINISHED)
+        ]
     );
+
+    // A send-only ComPrimitive reaches the ECU but receives nothing.
+    start_send_and_receive(&mut client, cll_handle, &[0x10, 0x03], 0).await;
+    let events: Vec<Seen> = events_until_finished(&mut stream, 1)
+        .await
+        .into_iter()
+        .map(|(_, seen)| seen)
+        .collect();
+    assert_eq!(events, [Seen::Status(EXECUTING), Seen::Status(FINISHED)]);
+    // The extended session it requested is active.
+    assert_eq!(
+        send_and_receive(&mut client, &mut stream, cll_handle, &[0x22, 0xF1, 0x86]).await,
+        [
+            Seen::Status(EXECUTING),
+            Seen::Result(vec![0x62, 0xF1, 0x86, 0x03]),
+            Seen::Status(FINISHED)
+        ]
+    );
+
+    // A ComPrimitive started while the one before it still waits for its response runs after
+    // it: its events never come between the earlier one's.
+    sim_ecu_control(
+        &backdoor,
+        r#"{"inject_fault":{"fault":{"response_pending":{"count":2,"interval_ms":50}}}}"#,
+    );
+    let first = start_send_and_receive(&mut client, cll_handle, &read_vin, 1).await;
+    let second = start_send_and_receive(&mut client, cll_handle, &read_vin, 1).await;
+    let events = events_until_finished(&mut stream, 2).await;
+    let order: Vec<u32> = events.iter().map(|(cop, _)| *cop).collect();
+    let split = order
+        .iter()
+        .position(|cop| *cop == second)
+        .expect("the second's events");
+    assert!(order[..split].iter().all(|cop| *cop == first), "{events:?}");
+    assert!(
+        order[split..].iter().all(|cop| *cop == second),
+        "{events:?}"
+    );
+    assert_eq!(split, 5, "{events:?}");
 
     drop(stream);
     drop(stream_client);

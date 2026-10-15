@@ -2,11 +2,12 @@
 #![allow(unsafe_code)]
 #![allow(non_snake_case)]
 
+use std::collections::VecDeque;
 use std::ffi::{CStr, c_char, c_void};
 use std::path::{Path, PathBuf};
 use std::ptr;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use iso22900_sys::bindings::*;
@@ -49,10 +50,6 @@ enum EventKind {
     /// An error item.
     Error(T_PDU_ERR_EVT),
 }
-
-/// Bumped whenever queued events are discarded (`PDUConstruct`, `PDUDestruct`, a reset), so an
-/// event a delayed ComPrimitive schedules after that is dropped rather than queued.
-static GENERATION: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Default, Clone, Copy)]
 struct CallCounters {
@@ -114,6 +111,12 @@ struct MockState {
     /// The simulated ECU that answers `PDU_COPT_SENDRECV` ComPrimitives, if one is attached
     /// (`__mock_sim_ecu_control`, or `NGR_SIM_ECU_CONFIG` at `PDUConstruct`; ADR-299).
     ecu: Option<SimEcu>,
+    /// Events of ComPrimitives answered while an ECU is attached, with the time each is due, in
+    /// due order. The delivery thread ([`deliver`]) moves each to `pending_events` when it is
+    /// due. Discarded with the event queue (`PDUConstruct`, `PDUDestruct`, a reset).
+    scheduled: VecDeque<(Instant, PendingEvent)>,
+    /// Set by `PDUDestruct` to end the delivery thread.
+    stop_delivery: bool,
 }
 
 impl MockState {
@@ -362,46 +365,145 @@ unsafe fn queue_event(event: PendingEvent) {
     unsafe { notify_data_available(callback, &notified, api_tag) };
 }
 
-/// Queues `events`, each `delay_ms` after `start`, in order: at once when none is delayed,
-/// otherwise from a thread. A thread drops what is left once the queue was discarded since
-/// `generation` ([`GENERATION`]).
-fn schedule_events(start: Instant, events: Vec<(u32, PendingEvent)>) {
-    if events.iter().all(|(delay_ms, _)| *delay_ms == 0) {
-        for (_, event) in events {
-            unsafe { queue_event(event) };
-        }
-        return;
+/// Wakes the delivery thread when `MockState::scheduled` or `MockState::stop_delivery` changes.
+fn delivery_signal() -> &'static Condvar {
+    static SIGNAL: Condvar = Condvar::new();
+    &SIGNAL
+}
+
+/// The delivery thread, while one runs.
+fn delivery_thread() -> &'static Mutex<Option<JoinHandle<()>>> {
+    static THREAD: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
+    &THREAD
+}
+
+/// Appends `events` to the schedule, each `delay_ms` after `start` and none before the last
+/// event already scheduled, so a ComPrimitive's events follow those of the one before it
+/// (ISO 22900-2 (2022) 8.2.6.5: a link executes its non-cyclic ComPrimitives one after another).
+fn schedule(state: &mut MockState, start: Instant, events: Vec<(u32, PendingEvent)>) {
+    let earliest = state
+        .scheduled
+        .back()
+        .map_or(start, |(due, _)| (*due).max(start));
+    for (delay_ms, event) in events {
+        let due = (start + Duration::from_millis(delay_ms.into())).max(earliest);
+        state.scheduled.push_back((due, event));
     }
-    let generation = GENERATION.load(Ordering::SeqCst);
-    std::thread::spawn(move || {
-        for (delay_ms, event) in events {
-            let due = start + Duration::from_millis(delay_ms.into());
-            if let Some(wait) = due.checked_duration_since(Instant::now()) {
-                std::thread::sleep(wait);
-            }
-            if GENERATION.load(Ordering::SeqCst) != generation {
-                return;
-            }
-            unsafe { queue_event(event) };
+    delivery_signal().notify_all();
+}
+
+/// Starts the delivery thread unless one runs.
+fn ensure_delivery_thread() {
+    let mut thread = delivery_thread().lock().expect("delivery thread poisoned");
+    if thread.as_ref().is_none_or(JoinHandle::is_finished) {
+        *thread = Some(std::thread::spawn(deliver));
+    }
+}
+
+/// Ends the delivery thread and waits for it, so no callback runs once `PDUDestruct` returns.
+fn stop_delivery_thread(mut guard: MutexGuard<'_, MockState>) {
+    guard.stop_delivery = true;
+    guard.scheduled.clear();
+    delivery_signal().notify_all();
+    drop(guard);
+    let thread = delivery_thread()
+        .lock()
+        .expect("delivery thread poisoned")
+        .take();
+    if let Some(thread) = thread {
+        let _ = thread.join();
+    }
+    state().lock().expect("mock state poisoned").stop_delivery = false;
+}
+
+/// The delivery thread: queues each scheduled event when it is due and notifies the callback,
+/// with the state unlocked, as `queue_event` does.
+fn deliver() {
+    let mut guard = state().lock().expect("mock state poisoned");
+    loop {
+        if guard.stop_delivery {
+            return;
         }
-    });
+        let now = Instant::now();
+        match guard.scheduled.front().map(|(due, _)| *due) {
+            None => {
+                guard = delivery_signal().wait(guard).expect("mock state poisoned");
+            }
+            Some(due) if due > now => {
+                guard = delivery_signal()
+                    .wait_timeout(guard, due - now)
+                    .expect("mock state poisoned")
+                    .0;
+            }
+            Some(_) => {
+                let (_, event) = guard.scheduled.pop_front().expect("an event is due");
+                guard.pending_events.push(event.clone());
+                let (callback, api_tag) = (guard.callback, guard.api_tag);
+                drop(guard);
+                unsafe { notify_data_available(callback, &event, api_tag) };
+                guard = state().lock().expect("mock state poisoned");
+            }
+        }
+    }
+}
+
+/// How a send-and-receive ComPrimitive's control data says to run it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Cycles {
+    /// Nothing to send: no request reaches the ECU.
+    NoSend,
+    /// Send without waiting for a response (`NumReceiveCycles` 0).
+    SendOnly,
+    /// Send and receive one response. Periodic sends and several or cyclic receives are run as
+    /// one send and one response.
+    SendReceive,
+}
+
+/// `PDU_COP_CTRL_DATA`'s send and receive cycles (ISO 22900-2 (2022) 8.2.6.2). Without control
+/// data the mock sends once and receives once.
+fn cycles(control: Option<&PDU_COP_CTRL_DATA>) -> Cycles {
+    match control {
+        None => Cycles::SendReceive,
+        Some(control) if control.NumSendCycles == 0 => Cycles::NoSend,
+        Some(control) if control.NumReceiveCycles == 0 => Cycles::SendOnly,
+        Some(_) => Cycles::SendReceive,
+    }
 }
 
 /// The events a `PDU_COPT_SENDRECV` ComPrimitive gets from the attached ECU, each with its delay
-/// from the request in milliseconds (ADR-299): a result item for each response pending message
-/// and for the response, or a receive timeout error item when the ECU sends no response, then the
-/// `PDU_COPST_FINISHED` status item.
-fn ecu_events(ecu: &mut SimEcu, request: &[u8], event: &PendingEvent) -> Vec<(u32, PendingEvent)> {
-    let exchange = ecu.exchange(Addressing::Physical, request);
+/// from the request in milliseconds (ADR-299): the `PDU_COPST_EXECUTING` status item; when it
+/// receives, a result item for each response pending message and for the response, or a receive
+/// timeout error item when the ECU sends no response; then the `PDU_COPST_FINISHED` status item.
+fn ecu_events(
+    ecu: &mut SimEcu,
+    request: &[u8],
+    cycles: Cycles,
+    event: &PendingEvent,
+) -> Vec<(u32, PendingEvent)> {
     let with = |kind| PendingEvent {
         kind,
         ..event.clone()
     };
-    let mut events: Vec<(u32, PendingEvent)> = exchange
-        .pending
-        .into_iter()
-        .map(|(delay_ms, bytes)| (delay_ms, with(EventKind::Result(bytes))))
-        .collect();
+    let mut events = vec![(
+        0,
+        with(EventKind::Status(E_PDU_STATUS::PDU_COPST_EXECUTING)),
+    )];
+    if cycles == Cycles::NoSend {
+        events.push((0, with(EventKind::Status(E_PDU_STATUS::PDU_COPST_FINISHED))));
+        return events;
+    }
+    let exchange = ecu.exchange(Addressing::Physical, request);
+    if cycles == Cycles::SendOnly {
+        // The request reached the ECU; whatever it answers is not received.
+        events.push((0, with(EventKind::Status(E_PDU_STATUS::PDU_COPST_FINISHED))));
+        return events;
+    }
+    events.extend(
+        exchange
+            .pending
+            .into_iter()
+            .map(|(delay_ms, bytes)| (delay_ms, with(EventKind::Result(bytes)))),
+    );
     let last = match exchange.response.to_bytes() {
         Some(bytes) => {
             events.push((exchange.delay_ms, with(EventKind::Result(bytes))));
@@ -425,10 +527,10 @@ fn ecu_events(ecu: &mut SimEcu, request: &[u8], event: &PendingEvent) -> Vec<(u3
     events
 }
 
-/// The `EcuConfig` named by `NGR_SIM_ECU_CONFIG`, if it is set; `Err` when the file cannot be
-/// read or parsed.
-fn env_ecu_config() -> Result<Option<EcuConfig>, ()> {
-    match std::env::var_os(ECU_CONFIG_ENV) {
+/// The `EcuConfig` in the file `path` names, if it names one (`NGR_SIM_ECU_CONFIG`); `Err` when
+/// the file cannot be read or parsed.
+fn ecu_config_from(path: Option<std::ffi::OsString>) -> Result<Option<EcuConfig>, ()> {
+    match path {
         None => Ok(None),
         Some(path) => {
             let text = std::fs::read_to_string(path).map_err(|_| ())?;
@@ -531,29 +633,31 @@ macro_rules! exported_fn {
 exported_fn!(PDUConstruct(_option_str: *mut CHAR8, p_api_tag: *mut c_void) -> T_PDU_ERROR {
     let mut guard = state().lock().expect("mock state poisoned");
     if guard.ecu.is_none() {
-        match env_ecu_config() {
+        match ecu_config_from(std::env::var_os(ECU_CONFIG_ENV)) {
             Ok(Some(config)) => guard.ecu = Some(SimEcu::new(config)),
             Ok(None) => {}
             Err(()) => return E_PDU_ERROR::PDU_ERR_FCT_FAILED,
         }
     }
-    GENERATION.fetch_add(1, Ordering::SeqCst);
     guard.constructed = true;
     guard.api_tag = p_api_tag as usize;
     guard.next_com_primitive_handle = MOCK_COM_PRIMITIVE_HANDLE;
     guard.pending_events.clear();
+    guard.scheduled.clear();
     guard.counters.construct += 1;
     no_error()
 });
 
 exported_fn!(PDUDestruct() -> T_PDU_ERROR {
     let mut guard = state().lock().expect("mock state poisoned");
-    GENERATION.fetch_add(1, Ordering::SeqCst);
     guard.constructed = false;
     guard.api_tag = 0;
     guard.callback = None;
     guard.pending_events.clear();
     guard.counters.destruct += 1;
+    // The caller frees the API tag and may unload the library once this returns, so no
+    // delivery may still be running.
+    stop_delivery_thread(guard);
     no_error()
 });
 
@@ -635,18 +739,24 @@ exported_fn!(PDUGetVersion(_h_mod: UNUM32, p_version_data: *mut PDU_VERSION_DATA
     unsafe { set_out(p_version_data, fixed_version()) }
 });
 
-exported_fn!(PDUGetStatus(_h_mod: UNUM32, _h_cll: UNUM32, _h_cop: UNUM32, p_status_code: *mut T_PDU_STATUS, p_timestamp: *mut UNUM32, p_extra_info: *mut UNUM32) -> T_PDU_ERROR {
+exported_fn!(PDUGetStatus(_h_mod: UNUM32, _h_cll: UNUM32, h_cop: UNUM32, p_status_code: *mut T_PDU_STATUS, p_timestamp: *mut UNUM32, p_extra_info: *mut UNUM32) -> T_PDU_ERROR {
     if p_status_code.is_null() || p_timestamp.is_null() || p_extra_info.is_null() {
         return invalid_parameters();
     }
 
-    {
+    let status = {
         let mut guard = state().lock().expect("mock state poisoned");
         guard.counters.get_status += 1;
-    }
+        // A ComPrimitive with scheduled events (ADR-299) is still running.
+        if h_cop != 0 && guard.scheduled.iter().any(|(_, event)| event.h_cop == h_cop) {
+            E_PDU_STATUS::PDU_COPST_EXECUTING
+        } else {
+            E_PDU_STATUS::PDU_COPST_FINISHED
+        }
+    };
 
     unsafe {
-        *p_status_code = E_PDU_STATUS::PDU_COPST_FINISHED;
+        *p_status_code = status;
         *p_timestamp = MOCK_TIMESTAMP;
         *p_extra_info = 0;
     }
@@ -750,7 +860,7 @@ exported_fn!(PDUSetComParam(_h_mod: UNUM32, _h_cll: UNUM32, _p_param_item: *mut 
     no_error()
 });
 
-exported_fn!(PDUStartComPrimitive(_h_mod: UNUM32, _h_cll: UNUM32, cop_type: T_PDU_COPT, cop_data_size: UNUM32, p_cop_data: *mut UNUM8, _p_cop_ctrl_data: *mut PDU_COP_CTRL_DATA, p_cop_tag: *mut c_void, ph_cop: *mut UNUM32) -> T_PDU_ERROR {
+exported_fn!(PDUStartComPrimitive(_h_mod: UNUM32, _h_cll: UNUM32, cop_type: T_PDU_COPT, cop_data_size: UNUM32, p_cop_data: *mut UNUM8, p_cop_ctrl_data: *mut PDU_COP_CTRL_DATA, p_cop_tag: *mut c_void, ph_cop: *mut UNUM32) -> T_PDU_ERROR {
     if ph_cop.is_null() {
         return invalid_parameters();
     }
@@ -761,7 +871,9 @@ exported_fn!(PDUStartComPrimitive(_h_mod: UNUM32, _h_cll: UNUM32, cop_type: T_PD
         unsafe { std::slice::from_raw_parts(p_cop_data, cop_data_size as usize) }
     };
 
-    let (handle, events) = {
+    let control = unsafe { p_cop_ctrl_data.as_ref() };
+
+    let (handle, immediate) = {
         let mut guard = state().lock().expect("mock state poisoned");
         guard.counters.start_com_primitive += 1;
         let handle = guard.next_primitive_handle();
@@ -773,22 +885,33 @@ exported_fn!(PDUStartComPrimitive(_h_mod: UNUM32, _h_cll: UNUM32, cop_type: T_PD
             timestamp: MOCK_TIMESTAMP,
             kind: EventKind::Result(Vec::new()),
         };
-        // An attached ECU answers a send-and-receive ComPrimitive with a request (ADR-299);
-        // anything else gets the synthetic completion event.
-        let events = match guard.ecu.as_mut() {
-            Some(ecu) if cop_type == E_PDU_COPT::PDU_COPT_SENDRECV && !request.is_empty() => {
-                ecu_events(ecu, request, &event)
+        // An attached ECU answers a send-and-receive ComPrimitive with a request (ADR-299),
+        // and while one is attached every ComPrimitive's events go through the schedule, so
+        // they follow those of the ComPrimitives before it. Without one, the synthetic
+        // completion event is queued at once.
+        let immediate = match guard.ecu.as_mut() {
+            None => Some(event),
+            Some(ecu) => {
+                let events = if cop_type == E_PDU_COPT::PDU_COPT_SENDRECV && !request.is_empty() {
+                    ecu_events(ecu, request, cycles(control), &event)
+                } else {
+                    vec![(0, event)]
+                };
+                schedule(&mut guard, start, events);
+                None
             }
-            _ => vec![(0, event)],
         };
-        (handle, events)
+        (handle, immediate)
     };
 
     unsafe {
         *ph_cop = handle;
     }
 
-    schedule_events(start, events);
+    match immediate {
+        Some(event) => unsafe { queue_event(event) },
+        None => ensure_delivery_thread(),
+    }
     no_error()
 });
 
@@ -1042,7 +1165,6 @@ exported_fn!(PDUGetTimestamp(_h_mod: UNUM32, p_timestamp: *mut UNUM32) -> T_PDU_
 // Call this from tests to reset the DLL's internal state between test runs.
 exported_fn!(__mock_reset() -> T_PDU_ERROR {
     let mut guard = state().lock().expect("mock state poisoned");
-    GENERATION.fetch_add(1, Ordering::SeqCst);
     *guard = MockState::default();
     no_error()
 });
@@ -1304,7 +1426,6 @@ pub fn mock_library_path() -> Result<PathBuf, std::io::Error> {
 /// Back-door API: Reset all mock state and counters for clean test isolation.
 pub fn mock_reset() {
     let mut guard = state().lock().expect("mock state poisoned");
-    GENERATION.fetch_add(1, Ordering::SeqCst);
     *guard = MockState::default();
 }
 
@@ -1442,5 +1563,80 @@ mod library_path_tests {
             file_uri(Path::new(r"C:\a b\x.dll")),
             "file:///C:/a%20b/x.dll"
         );
+    }
+}
+
+#[cfg(test)]
+mod sim_ecu_tests {
+    use super::*;
+
+    fn temp_file(name: &str, contents: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "iso22900-mock-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    #[test]
+    fn the_config_file_is_read_when_named() {
+        assert!(matches!(ecu_config_from(None), Ok(None)));
+        let config = EcuConfig {
+            vin: "WVWZZZ1KZAW000001".into(),
+            ..default_ecu_config()
+        };
+        let valid = temp_file("valid", &serde_json::to_string(&config).unwrap());
+        let config = ecu_config_from(Some(valid.clone().into_os_string()))
+            .expect("parses")
+            .expect("a configuration");
+        assert_eq!(config.vin, "WVWZZZ1KZAW000001");
+        let invalid = temp_file("invalid", "not json");
+        assert!(ecu_config_from(Some(invalid.clone().into_os_string())).is_err());
+        let missing = std::env::temp_dir().join("iso22900-mock-no-such-config.json");
+        assert!(ecu_config_from(Some(missing.into_os_string())).is_err());
+        std::fs::remove_file(valid).unwrap();
+        std::fs::remove_file(invalid).unwrap();
+    }
+
+    #[test]
+    fn faults_need_an_ecu_and_at_most_one_trigger() {
+        let mut state = MockState::default();
+        let command = |text: &str| serde_json::from_str::<SimEcuCommand>(text).unwrap();
+        let fault = r#"{"inject_fault":{"fault":"drop_response"}}"#;
+        assert!(apply_sim_ecu_command(&mut state, command(fault)).is_err());
+        apply_sim_ecu_command(&mut state, command(r#"{"attach":{}}"#)).unwrap();
+        apply_sim_ecu_command(&mut state, command(fault)).unwrap();
+        let both = r#"{"inject_fault":{"fault":"drop_response","service":34,"request":[34]}}"#;
+        assert!(apply_sim_ecu_command(&mut state, command(both)).is_err());
+        apply_sim_ecu_command(&mut state, command(r#"{"detach":{}}"#)).unwrap();
+        assert!(state.ecu.is_none());
+        assert!(serde_json::from_str::<SimEcuCommand>(r#"{"reboot":{}}"#).is_err());
+    }
+
+    #[test]
+    fn control_data_selects_the_cycles() {
+        let control = |send, receive| PDU_COP_CTRL_DATA {
+            Time: 0,
+            NumSendCycles: send,
+            NumReceiveCycles: receive,
+            TempParamUpdate: 0,
+            TxFlag: PDU_FLAG_DATA {
+                NumFlagBytes: 0,
+                pFlagData: ptr::null_mut(),
+            },
+            NumPossibleExpectedResponses: 0,
+            pExpectedResponseArray: ptr::null_mut(),
+        };
+        assert_eq!(cycles(None), Cycles::SendReceive);
+        assert_eq!(cycles(Some(&control(0, 0))), Cycles::NoSend);
+        assert_eq!(cycles(Some(&control(0, 1))), Cycles::NoSend);
+        assert_eq!(cycles(Some(&control(1, 0))), Cycles::SendOnly);
+        assert_eq!(cycles(Some(&control(1, 1))), Cycles::SendReceive);
+        assert_eq!(cycles(Some(&control(1, -2))), Cycles::SendReceive);
     }
 }

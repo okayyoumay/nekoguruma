@@ -5,6 +5,8 @@ use diag_ir::declaration::{EcuDocumentT, load_ecu_document};
 use super::*;
 use crate::tables::{read_directory, read_files, resolve};
 
+mod services;
+
 /// The example definition's files, by name.
 fn example() -> Vec<(String, Vec<u8>)> {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/example-ecu");
@@ -28,7 +30,8 @@ fn with(mut files: Vec<(String, Vec<u8>)>, file: &str, contents: &str) -> Vec<(S
 }
 
 fn convert(files: Vec<(String, Vec<u8>)>) -> Converted {
-    to_ir(&resolve(read_files(files).expect("reads")).expect("resolves"))
+    let tables = read_files(files).unwrap_or_else(|e| panic!("does not read: {e:?}"));
+    to_ir(&resolve(tables).unwrap_or_else(|e| panic!("does not resolve: {e:?}")))
 }
 
 /// The documents, read back through the loader the agent uses.
@@ -124,7 +127,7 @@ fn the_example_converts_into_one_document_per_variant() {
             )]
         );
         // Not converted yet.
-        assert!(variant.services.is_none() && variant.layouts.is_none());
+        assert!(variant.dtcs.is_none() && variant.flash_sessions.is_none());
     }
 }
 

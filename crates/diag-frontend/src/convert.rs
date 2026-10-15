@@ -7,9 +7,12 @@
 //! documents are the same, byte for byte, for the same input (section 6).
 //!
 //! Each document carries its header (`schema_version`, `source_format`, `source_digest`), the
-//! variant's own data (4.1) and its protocols with their ComParams (4.3). Its services, layouts,
-//! variant patterns, DTCs and flash sessions are left empty, and it carries no procedure: that
-//! is attached by the Starlark lowering.
+//! variant's own data (4.1), its variant patterns (4.2), its protocols with their ComParams
+//! (4.3), and its services with their fields and NRCs and the nested layouts those fields reach
+//! (4.5 to 4.10, section 5; [`services`]). Its DTCs and flash sessions are left empty, and it
+//! carries no procedure: that is attached by the Starlark lowering.
+
+mod services;
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -70,11 +73,13 @@ pub fn to_ir(definition: &Definition) -> Converted {
         .iter()
         .map(|row| (row.key.as_str(), row.id))
         .collect();
+    let index = services::Index::new(definition);
     let documents = tables
         .variants
         .iter()
         .zip(&definition.variants)
-        .map(|(variant, rows)| {
+        .enumerate()
+        .map(|(at, (variant, rows))| {
             let mut protocols: Vec<ProtocolT> = rows
                 .protocols
                 .iter()
@@ -116,6 +121,10 @@ pub fn to_ir(definition: &Definition) -> Converted {
             ecu.part_numbers = Some(variant.part_numbers.clone());
             ecu.sw_versions = Some(variant.sw_versions.clone());
             ecu.protocols = Some(protocols);
+            let part = index.variant(at);
+            ecu.patterns = Some(part.patterns);
+            ecu.services = Some(part.services);
+            ecu.layouts = Some(part.layouts);
             let mut document = EcuDocumentT::default();
             document.schema_version = IR_SCHEMA_VERSION;
             document.source_format = Some(SOURCE_FORMAT.to_owned());

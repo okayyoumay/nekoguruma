@@ -334,7 +334,7 @@ fn variant_patterns_name_the_service_and_field() {
 /// The example with `fields.csv` given a `byte_order` and `max_bytes` column and `rows`
 /// appended (in the header order plus those two columns), and the other tables replaced or
 /// extended as `with` gives them.
-fn with_fields(rows: &[&str]) -> Vec<(String, Vec<u8>)> {
+pub(super) fn with_fields(rows: &[&str]) -> Vec<(String, Vec<u8>)> {
     let fields = example()
         .into_iter()
         .find(|(name, _)| name == "fields.csv")
@@ -356,7 +356,11 @@ fn with_fields(rows: &[&str]) -> Vec<(String, Vec<u8>)> {
 }
 
 /// Appends `rows` to the example's `file`.
-fn appended(files: Vec<(String, Vec<u8>)>, file: &str, rows: &[&str]) -> Vec<(String, Vec<u8>)> {
+pub(super) fn appended(
+    files: Vec<(String, Vec<u8>)>,
+    file: &str,
+    rows: &[&str],
+) -> Vec<(String, Vec<u8>)> {
     let text = files
         .iter()
         .find(|(name, _)| name == file)

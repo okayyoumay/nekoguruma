@@ -5,6 +5,7 @@ use diag_ir::declaration::{EcuDocumentT, load_ecu_document};
 use super::*;
 use crate::tables::{read_directory, read_files, resolve};
 
+mod dtcs_and_flash;
 mod services;
 
 /// The example definition's files, by name.
@@ -126,8 +127,6 @@ fn the_example_converts_into_one_document_per_variant() {
                 ],
             )]
         );
-        // Not converted yet.
-        assert!(variant.dtcs.is_none() && variant.flash_sessions.is_none());
     }
 }
 

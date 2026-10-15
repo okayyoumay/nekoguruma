@@ -462,7 +462,30 @@ used:
 The source file line and column are recorded for each instruction and stored in
 `Program.source_map`. This allows execution traces and audit logs to refer back to the original
 source. A lifted lambda's or nested `def`'s instructions are recorded at its own position, and a
-specialized copy's (2.6) at the callee's.
+specialized copy's (2.6) at the callee's. An entry is written where the position changes and
+covers the instructions after it up to the next entry (ADR-304).
+
+### 4.8 Types at Run Time
+
+The IR's instructions take operands of one type, and the VM has no instruction that asks a value's
+type, so the transpiler infers at ingestion which types each value can have (ADR-304):
+
+- A local has the types of every value assigned to it anywhere in its function; a parameter
+  has the types of the arguments its callers pass; a call has the types its function returns.
+  Only `main` and the functions it calls, directly or not, are lowered; a function nothing
+  reaches never runs and is left out.
+- An operator whose instruction depends on its operands' types (arithmetic, comparisons,
+  shifts, indexing, truth values) needs each operand to have one type. A value that can have two
+  (an `int` on one path and a `float` on another, or a parameter its callers pass both) is
+  `STAR_NOT_LOWERABLE` there; write the function for one type.
+- Values of different types are never equal, as in Starlark: `1 == "1"` is `False` without
+  an instruction comparing them. An `int` and a `float` compare by value in Starlark, which needs
+  a conversion instruction at run time.
+- `None` does not exist at run time (2.5). A function that returns a value must return one on
+  every path, and a function that returns none cannot be used as a value
+  (`STAR_UNSUPPORTED_SYNTAX`).
+- Expressions whose operands are all constants are folded at ingestion with Starlark's
+  semantics, so they need no instruction; a folded constant may be at most 1 MiB.
 
 ---
 

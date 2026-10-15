@@ -26,7 +26,11 @@ use starlark_syntax::syntax::ast::{
 };
 use starlark_syntax::syntax::{AstModule, Dialect, DialectTypes};
 
-/// The error codes of `docs/starlark-subset.md` that the checker reports.
+mod lower;
+
+pub use lower::lower;
+
+/// The error codes of `docs/starlark-subset.md` that the checker and the lowering report.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub enum StarCode {
     /// The file does not parse (section 5).
@@ -68,6 +72,16 @@ pub enum StarCode {
     /// An annotation value outside its range (4.2, 4.5).
     #[serde(rename = "STAR_ARGUMENT_OUT_OF_RANGE")]
     ArgumentOutOfRange,
+    /// An argument that must be known at ingestion is not (3.1).
+    #[serde(rename = "STAR_NON_CONSTANT_ARGUMENT")]
+    NonConstantArgument,
+    /// A construct whose lowering needs an instruction the IR does not have, or that the
+    /// lowering does not cover yet (2.5, 4.4).
+    #[serde(rename = "STAR_NOT_LOWERABLE")]
+    NotLowerable,
+    /// A `diag` function with no IR instruction yet (3.2).
+    #[serde(rename = "STAR_API_NOT_AVAILABLE")]
+    ApiNotAvailable,
 }
 
 impl StarCode {
@@ -87,6 +101,9 @@ impl StarCode {
             Self::BuiltinNotAllowed => "STAR_BUILTIN_NOT_ALLOWED",
             Self::BadAnnotation => "STAR_BAD_ANNOTATION",
             Self::ArgumentOutOfRange => "STAR_ARGUMENT_OUT_OF_RANGE",
+            Self::NonConstantArgument => "STAR_NON_CONSTANT_ARGUMENT",
+            Self::NotLowerable => "STAR_NOT_LOWERABLE",
+            Self::ApiNotAvailable => "STAR_API_NOT_AVAILABLE",
         }
     }
 }

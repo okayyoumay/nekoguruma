@@ -1323,7 +1323,7 @@ Such operations are hidden in the UI from the outset and are also stated explici
 
 ### 13.5 Real-Hardware Checks
 
-The simulators in 13.4 are what CI relies on. Some things they cannot show: how a vendor library actually behaves, timing and electrical behaviour on a real bus, and the per-vendor items in 17 ("Items to Confirm Early"). Real-hardware checks cover these. They are **optional**: no CI job runs them, and a check that cannot run because no hardware is attached never blocks a change. The reasons and the alternatives considered are in ADR-275.
+The simulators in 13.4 are what CI relies on. Some things they cannot show: how a vendor library actually behaves, timing and electrical behaviour on a real bus, and the per-vendor items in 17 ("Items to Confirm Early"). Real-hardware checks cover these. Running them is **optional**: no CI job runs them, and a check that cannot run because no hardware is attached never blocks a change. Writing them is not: each check is written as part of the work that adds the behaviour it covers, and its parts that need no hardware (the profile parser, the guard, the report writer, the listing of permitted checks) are tested in CI. The reasons and the alternatives considered are in ADR-275.
 
 **Target classes.** A hardware profile (below) declares which class the attached setup is. The classes are not ordered: a loopback, a stand-in ECU, a bench ECU and a vehicle differ in topology and in what may be sent to them, so a setup of one class never stands in for another. Each check declares the set of classes it can run on, and it runs only when the profile's class is in that set.
 

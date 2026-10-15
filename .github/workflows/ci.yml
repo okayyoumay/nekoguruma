@@ -212,6 +212,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      # The seeds are built with stable: diag-frontend's parser pulls in allocative, whose build
+      # script turns on code that no longer compiles on a nightly compiler. Only cargo-fuzz needs
+      # nightly, and the targets do not depend on diag-frontend.
+      - uses: dtolnay/rust-toolchain@stable
       - uses: dtolnay/rust-toolchain@nightly
       - uses: taiki-e/install-action@v2
         with:
@@ -221,7 +225,7 @@ jobs:
           workspaces: fuzz
           key: fuzz
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo run --locked --manifest-path fuzz/Cargo.toml -p ngr-fuzz-seeds -- fuzz/corpus
+      - run: cargo +stable run --locked --manifest-path fuzz/Cargo.toml -p ngr-fuzz-seeds -- fuzz/corpus
       # The installed cargo-fuzz is a musl build, which would otherwise build the targets for its
       # own triple; the sanitizer needs the glibc target.
       - working-directory: fuzz

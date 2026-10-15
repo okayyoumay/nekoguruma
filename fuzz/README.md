@@ -11,10 +11,12 @@ workspace's builds, tests and checks leave it out.
 
 `seeds` writes the starting corpora: the documents of `diag-frontend`'s example definition, and
 a few small programs with their initial states. They are generated, not committed, so they
-follow the current schema.
+follow the current schema. Build them with stable: `diag-frontend`'s parser depends on
+`allocative`, whose build script turns on code that a current nightly compiler rejects. Only
+`cargo fuzz` needs nightly, and the targets do not depend on `diag-frontend`.
 
 ```sh
-cargo run --locked --manifest-path fuzz/Cargo.toml -p ngr-fuzz-seeds -- fuzz/corpus
+cargo +stable run --locked --manifest-path fuzz/Cargo.toml -p ngr-fuzz-seeds -- fuzz/corpus
 cd fuzz
 cargo +nightly fuzz run ngr-fuzz-ecu-document corpus/ngr-fuzz-ecu-document -- -max_total_time=60
 cargo +nightly fuzz run ngr-fuzz-vm corpus/ngr-fuzz-vm -- -max_total_time=60 -rss_limit_mb=2048

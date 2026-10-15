@@ -4,9 +4,8 @@
 //! dialect, the value syntax, and each table's columns and cells, and returns the typed rows of
 //! every table. [`resolve`] then checks the rules that compare rows with each other or with other
 //! tables (references, variant scoping, keys defined twice in one variant's document) and, once
-//! those hold, the rules of single fields. Each stage reports every error it finds, sorted as
-//! section 7 of the format describes. The rules of nested layouts (section 5.4 and the limits of
-//! section 6) are not checked yet.
+//! those hold, the rules of fields and nested layouts (sections 5 and 6). Each stage reports
+//! every error it finds, sorted as section 7 of the format describes.
 
 mod error;
 mod fields;

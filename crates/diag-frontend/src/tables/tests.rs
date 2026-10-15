@@ -1811,8 +1811,11 @@ fn an_error_neither_hides_another_nor_makes_one_up() {
             row(BadValue, 0, "bits"),
             row(BadValue, 2, "bits"),
             row(IrRule, 4, "length"),
+            // A shaped field has neither a type nor a width (5.4).
+            row(BadValue, 6, "bits"),
             row(BadValue, 6, "byte_order"),
             row(BadValue, 6, "shape"),
+            row(BadValue, 6, "type"),
             row(BadValue, 6, "unit"),
             row(Unsupported, 7, "const"),
             row(BadValue, 7, "unit"),
@@ -1847,6 +1850,8 @@ fn a_rejected_position_starts_nothing_and_a_status_byte_may_be_terminated() {
         vec![
             row(BadValue, 0, "bits"),
             row(BadValue, 0, "shape"),
+            // A shaped field has no type (5.4).
+            row(BadValue, 0, "type"),
             row(Unsupported, 2, "byte"),
             row(BadValue, 4, "byte"),
             row(BadValue, 7, "length"),
@@ -1872,6 +1877,175 @@ fn every_position_after_a_variable_value_is_reported() {
             row(Unsupported, 1, "byte"),
             row(Unsupported, 2, "byte"),
             row(IrRule, 3, "length"),
+        ]
+    );
+}
+
+// ---------------------------------------------------------------- Nested layouts
+
+/// [`with_fields`], with `extra` rows appended to other tables of the example.
+fn with_layouts(
+    rows: &[&str],
+    services: &[&str],
+    extra: &[(&str, &[&str])],
+) -> (Vec<(String, Vec<u8>)>, u32) {
+    let (mut files, first) = with_fields(rows, services);
+    for (file, lines) in extra {
+        let entry = files
+            .iter_mut()
+            .find(|(n, _)| n == file)
+            .expect("an example table");
+        for line in *lines {
+            entry.1.extend_from_slice(line.as_bytes());
+            entry.1.push(b'\n');
+        }
+    }
+    (files, first)
+}
+
+/// The line of the `index`th row of an example table after its header and existing rows.
+fn added_line(file: &str, index: u32) -> u32 {
+    u32::try_from(example_text(file).lines().count()).unwrap() + 1 + index
+}
+
+#[test]
+fn a_shaped_field_has_only_the_columns_of_its_shape() {
+    const L: &str = "layout:watchdogReset";
+    let rows = [
+        format!("{L},g1,2,,uint,8,,,,,,,group,dtcRecord"),
+        format!("{L},g2,3,4,,,,,,,,,group,dtcRecord"),
+        format!("{L},g3,4,,,,,,,,,,group"),
+        format!("{L},g4,5,,,,,,,,,,group,dtcRecord,taskId"),
+        "request:s1,g,0,,,,,,,,,,group,dtcRecord".to_owned(),
+        format!("{L},r1,6,,,,,,,,,,repeat,dtcRecord"),
+        format!("{L},s1,7,,,,,,,,,,select,dtcRecord,taskId"),
+        format!("{L},s2,8,,,,,,,,,,select"),
+        format!("{L},fk,9,,float,32"),
+        format!("{L},s3,13,,,,,,,,,,select,,fk"),
+        format!("{L},bk,13,,bytes,72"),
+        format!("{L},s4,22,,,,,,,,,,select,,bk"),
+    ];
+    let rows: Vec<&str> = rows.iter().map(String::as_str).collect();
+    assert_eq!(
+        field_errors(&rows, &[",s1,0x5D"]),
+        vec![
+            row(BadValue, 0, "bits"),
+            row(BadValue, 0, "type"),
+            row(BadValue, 1, "bit"),
+            row(MissingColumn, 2, "layout"),
+            row(BadValue, 3, "ref"),
+            row(Unsupported, 4, "shape"),
+            row(MissingColumn, 5, "shape"),
+            row(BadValue, 6, "layout"),
+            row(MissingColumn, 7, "ref"),
+            row(IrRule, 9, "ref"),
+            row(IrRule, 11, "ref"),
+        ]
+    );
+}
+
+#[test]
+fn repeats_and_cases_belong_to_their_shape_and_cases_fit_their_key() {
+    const L: &str = "layout:watchdogReset";
+    let rows = [
+        format!("{L},k64,30,,uint,64"),
+        format!("{L},sel64,38,,,,,,,,,,select,,k64"),
+        format!("{L},ki,46,,int,8"),
+        format!("{L},seli,47,,,,,,,,,,select,,ki"),
+    ];
+    let rows: Vec<&str> = rows.iter().map(String::as_str).collect();
+    let (files, _) = with_layouts(
+        &rows,
+        &[],
+        &[
+            ("repeats.csv", &["layout:watchdogReset,taskId,end"]),
+            (
+                "select_cases.csv",
+                &[
+                    "did:lastResetReason,details,overlap,0x05,0x06,",
+                    "did:lastResetReason,details,big,0x100,,",
+                    "did:lastResetReason,details,neg,-1,,",
+                    "did:lastResetReason,details,dflt,,,",
+                    "did:lastResetReason,details,dflt2,,,",
+                    "did:lastResetReason,reason,notSel,0x01,,",
+                    "layout:watchdogReset,sel64,cross,0x7FFFFFFFFFFFFFFF,0x8000000000000000,",
+                    "layout:watchdogReset,sel64,top,0xFFFFFFFFFFFFFFFF,,",
+                    "layout:watchdogReset,seli,hi,0x80,,",
+                    "layout:watchdogReset,seli,lo,-128,-1,",
+                ],
+            ),
+        ],
+    );
+    const S: &str = "select_cases.csv";
+    let s = |i| Some(added_line(S, i));
+    assert_eq!(
+        resolved(files),
+        vec![
+            at(
+                BadValue,
+                "repeats.csv",
+                Some(added_line("repeats.csv", 0)),
+                Some("field")
+            ),
+            at(Duplicate, S, s(0), Some("lower")),
+            at(BadValue, S, s(1), Some("lower")),
+            at(BadValue, S, s(2), Some("lower")),
+            at(Duplicate, S, s(4), Some("case")),
+            at(BadValue, S, s(5), Some("field")),
+            at(BadValue, S, s(6), Some("upper")),
+            at(BadValue, S, s(8), Some("lower")),
+        ]
+    );
+}
+
+#[test]
+fn layouts_hold_their_fields_reach_no_cycle_and_nest_at_most_16_deep() {
+    let mut rows = vec![
+        "layout:dtcRecord,over,3,,uint,16".to_owned(),
+        "layout:loopA,b,0,,,,,,,,,,group,loopB".to_owned(),
+        "layout:loopB,a,0,,,,,,,,,,group,loopA".to_owned(),
+        "layout:selfL,me,0,,,,,,,,,,group,selfL".to_owned(),
+        // A response reaching 17 layouts, and one reaching 16.
+        "response:deep,top,1,,,,,,,,,,group,d1".to_owned(),
+        "response:shallow,top,1,,,,,,,,,,group,d2".to_owned(),
+    ];
+    let mut layouts = vec![
+        "loopA,0".to_owned(),
+        "loopB,0".to_owned(),
+        "selfL,0".to_owned(),
+    ];
+    for i in 1..=17 {
+        layouts.push(format!("d{i},0"));
+        rows.push(if i < 17 {
+            format!("layout:d{i},n,0,,,,,,,,,,group,d{}", i + 1)
+        } else {
+            format!("layout:d{i},v,0,,uint,8")
+        });
+    }
+    let rows: Vec<&str> = rows.iter().map(String::as_str).collect();
+    let layouts: Vec<&str> = layouts.iter().map(String::as_str).collect();
+    let (files, first) = with_layouts(
+        &rows,
+        &[",deep,0x5E", ",shallow,0x5F"],
+        &[("layouts.csv", &layouts)],
+    );
+    assert_eq!(
+        resolved(files),
+        vec![
+            at(IrRule, "fields.csv", Some(first), Some("byte")),
+            at(IrRule, "fields.csv", Some(first + 4), Some("shape")),
+            at(
+                IrRule,
+                "layouts.csv",
+                Some(added_line("layouts.csv", 0)),
+                Some("name")
+            ),
+            at(
+                IrRule,
+                "layouts.csv",
+                Some(added_line("layouts.csv", 2)),
+                Some("name")
+            ),
         ]
     );
 }

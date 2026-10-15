@@ -1,6 +1,8 @@
-//! The rules of single fields (`docs/csv-tables.md` 4.5, 4.6, 4.11, 5.2, 5.3, 5.5 and 6): the
-//! third stage of reading a definition, which runs only on a definition whose references
-//! resolve (ADR-298). The rules of nested layouts (5.4) are not checked here.
+//! The rules of fields (`docs/csv-tables.md` 4.5, 4.6, 4.11, 5.2 to 5.5 and 6): the third
+//! stage of reading a definition, which runs only on a definition whose references resolve
+//! (ADR-298). The rules of nested layouts are in [`layouts`].
+
+mod layouts;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -22,6 +24,7 @@ pub(super) fn check(definition: &Definition, errors: &mut Errors) {
     checker.containers();
     checker.status_layouts();
     checker.services(definition);
+    checker.layouts();
 }
 
 struct Checker<'a> {

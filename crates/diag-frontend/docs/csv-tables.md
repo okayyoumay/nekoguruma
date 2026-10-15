@@ -533,8 +533,11 @@ value a procedure could supply for them, so a shaped field in a request is rejec
 
 - `group`: one occurrence of `layout`.
 - `repeat`: `layout` repeated; its count is a row of `repeats.csv` for the field.
-- `select`: one layout chosen by the key in `ref`, which must not be a `float` field; its cases
-  are rows of `select_cases.csv` for the field.
+- `select`: one layout chosen by the key in `ref`, which must not be a `float` field. A key of
+  bytes or a string is compared for equality as a big-endian integer, so it is at most 8 bytes
+  (fixed at most 64 bits wide, or `terminated` with a `max_bytes` of 1 to 8; ADR-242,
+  `CSV_IR_RULE`) and each of its cases is one value. Its cases are rows of `select_cases.csv`
+  for the field, and `layout` stays empty.
 
 A Starlark response's `fields` (subset spec 3.4) holds one value per name, so in this version its
 keys are the scalar fields at the top of the response: those of the `response:` container, the
@@ -610,8 +613,11 @@ its field is rejected at ingestion; a run-time value that does not fit is an err
   appear where, length kinds per type, marker and key types, `min_bytes` <= `max_bytes`, layout
   bounds) are checked at conversion and reported like any other table error (`CSV_IR_RULE`), and
   so are the limits ADR-242 places on nested layouts: a layout that reaches itself through
-  `group`, `repeat` or `select` fields (a cycle) is rejected, as is nesting more than 16 layouts
-  deep.
+  `group`, `repeat` or `select` fields (a cycle) is rejected, once per cycle at its first layout
+  in `layouts.csv`, as is a field of a request or response that nests more than 16 layouts
+  deep. A field of a layout with a `byte_size`, at a set `byte` and of a fixed width, must end
+  within it, and a shaped field there must not start past it; such a field of the layout of a
+  `fixed` repeat must end within `item_bytes`.
   Nothing is left for the agent to discover at run time (design 8.3).
 - **Determinism.** The same directory always converts to the same documents, byte for byte: ids
   follow row order (section 3) and arrays follow row order.
@@ -640,9 +646,9 @@ checked, whether or not anything refers to it; an error is reported once, at the
 it, and not again where another row refers to that row. The checks run in stages: first each file
 on its own (the file set, the record format, the header, each cell, and names defined twice in
 one table); then the rules that compare rows with each other or with other tables (references,
-variant scoping, a key defined twice in one variant's document); then the rules of single fields
-(5.2, 5.3, 5.5, the conversion and type pairs of 4.5, the services of 4.6 and the status layouts
-of 4.11), which follow the references the stage before resolved. A stage runs only when the
+variant scoping, a key defined twice in one variant's document); then the rules of fields (5.2
+to 5.5, the conversion and type pairs of 4.5, the services of 4.6, the status layouts of 4.11
+and the layout rules of section 6), which follow the references the stage before resolved. A stage runs only when the
 earlier ones find no error, since a rule that follows a row with an error can be checked neither
 way; a definition with errors of an earlier stage therefore lists only those (ADR-298).
 

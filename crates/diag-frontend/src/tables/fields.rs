@@ -1,6 +1,8 @@
-//! The rules of single fields (`docs/csv-tables.md` 4.5, 4.6, 4.11, 5.2, 5.3, 5.5 and 6): the
-//! third stage of reading a definition, which runs only on a definition whose references
-//! resolve (ADR-298). The rules of nested layouts (5.4) are not checked here.
+//! The rules of fields (`docs/csv-tables.md` 4.5, 4.6, 4.11, 5.2 to 5.5 and 6): the third
+//! stage of reading a definition, which runs only on a definition whose references resolve
+//! (ADR-298). The rules of nested layouts are in [`layouts`].
+
+mod layouts;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -13,15 +15,22 @@ const FILE: &str = "fields.csv";
 
 /// Checks the fields of `definition`, adding every error found to `errors`.
 pub(super) fn check(definition: &Definition, errors: &mut Errors) {
+    let t = &definition.tables;
+    let mut by_name = HashMap::new();
+    for f in &t.fields {
+        by_name.entry((&f.container, f.name.as_str())).or_insert(f);
+    }
     let mut checker = Checker {
-        t: &definition.tables,
+        t,
         e: errors,
         reported: HashSet::new(),
+        by_name,
     };
     checker.fields();
     checker.containers();
     checker.status_layouts();
     checker.services(definition);
+    checker.layouts();
 }
 
 struct Checker<'a> {
@@ -30,6 +39,8 @@ struct Checker<'a> {
     /// The cells already reported, as (file, line, column): one error per cell, the first rule
     /// that fails it.
     reported: HashSet<(&'static str, Line, &'static str)>,
+    /// Each field by its container and name, which the table keeps unique.
+    by_name: HashMap<(&'a Container, &'a str), &'a FieldRow>,
 }
 
 /// Whether a type is bytes or a string, whose value may have a variable length.
@@ -78,13 +89,11 @@ impl<'a> Checker<'a> {
 
     /// The field `name` refers to: the earlier field of the same container (resolved by the
     /// second stage).
-    fn referred(&self, f: &FieldRow, name: &str) -> Option<&'a FieldRow> {
-        self.t
-            .fields
-            .iter()
-            .take_while(|g| g.line != f.line)
-            .filter(|g| g.container == f.container && g.name == name)
-            .last()
+    fn referred(&self, f: &'a FieldRow, name: &'a str) -> Option<&'a FieldRow> {
+        self.by_name
+            .get(&(&f.container, name))
+            .copied()
+            .filter(|g| g.line < f.line)
     }
 
     /// The rules each field obeys on its own (4.5, 5.2, 6).

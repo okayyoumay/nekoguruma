@@ -535,16 +535,32 @@ fn unbind(bindings: &mut Bindings, name: &str) {
     }
 }
 
+/// The names one function, lambda or comprehension binds, linked to those of the one it is
+/// nested in. Each holds only its own names, so entering a nested scope copies nothing.
+#[derive(Default, Clone)]
+struct Frame {
+    /// The parameters and the names it assigns, which hide the names of the scopes around it,
+    /// the top-level names and the built-ins (2.2).
+    locals: HashSet<String>,
+    /// Its nested `def`s, already reported where they are defined (2.3), with the name each has
+    /// in the call graph: `outer.inner`.
+    closures: HashMap<String, Rc<str>>,
+    parent: Option<Rc<Frame>>,
+}
+
+/// What a name means in a scope, found from the innermost frame out.
+enum Lookup<'a> {
+    Local,
+    Closure(&'a Rc<str>),
+    /// Not bound in any enclosing function: a top-level name, a built-in or nothing.
+    Outside,
+}
+
 /// The names of the function being checked.
 #[derive(Default, Clone)]
 struct Scope {
     name: Rc<str>,
-    /// The parameters and the names the function assigns, which hide the top-level names and the
-    /// built-ins (2.2), with those of the functions it is nested in.
-    locals: HashSet<String>,
-    /// The nested `def`s, already reported where they are defined (2.3), with the name each has
-    /// in the call graph: `outer.inner`.
-    closures: HashMap<String, Rc<str>>,
+    frame: Rc<Frame>,
     /// What the locals are known to be at the point being checked; a local missing here is not a
     /// dict.
     kinds: Bindings,
@@ -554,6 +570,24 @@ struct Scope {
 }
 
 impl Scope {
+    fn resolve(&self, name: &str) -> Lookup<'_> {
+        let mut frame = Some(&self.frame);
+        while let Some(current) = frame {
+            if current.locals.contains(name) {
+                return Lookup::Local;
+            }
+            if let Some(qualified) = current.closures.get(name) {
+                return Lookup::Closure(qualified);
+            }
+            frame = current.parent.as_ref();
+        }
+        Lookup::Outside
+    }
+
+    fn is_local(&self, name: &str) -> bool {
+        matches!(self.resolve(name), Lookup::Local)
+    }
+
     /// Joins the state `(kinds, dead)` reached along another path into this one.
     fn join(&mut self, kinds: Bindings, dead: bool) {
         if dead {
@@ -590,22 +624,26 @@ impl Scope {
         if let Some(body) = body {
             collect_locals(body, &mut own, &mut nested);
         }
-        let mut closures = outer.closures.clone();
-        for inner in nested {
-            let qualified: Rc<str> = Rc::from(format!("{name}.{inner}"));
-            closures.insert(inner, qualified);
-        }
-        closures.retain(|name, _| !own.contains(name));
+        // A name both assigned and defined by a nested `def` is a local.
+        let closures = nested
+            .into_iter()
+            .filter(|inner| !own.contains(inner))
+            .map(|inner| {
+                let qualified: Rc<str> = Rc::from(format!("{name}.{inner}"));
+                (inner, qualified)
+            })
+            .collect();
         let mut kinds = outer.kinds.clone();
-        if own.iter().any(|name| kinds.contains_key(name)) {
-            Rc::make_mut(&mut kinds).retain(|name, _| !own.contains(name));
+        for local in &own {
+            unbind(&mut kinds, local);
         }
-        let mut locals = outer.locals.clone();
-        locals.extend(own);
         Scope {
             name,
-            locals,
-            closures,
+            frame: Rc::new(Frame {
+                locals: own,
+                closures,
+                parent: Some(outer.frame.clone()),
+            }),
             kinds,
             dead: false,
         }
@@ -961,11 +999,10 @@ impl Checker<'_> {
                     "a nested `def` is not allowed; write it as a top-level `def` (2.3)",
                 );
                 // The same name `Scope::enter` gave it in `closures`, shared with its calls.
-                let qualified = scope
-                    .closures
-                    .get(&def.name.node.ident)
-                    .cloned()
-                    .unwrap_or_else(|| Rc::from(format!("{}.{}", scope.name, def.name.node.ident)));
+                let qualified = match scope.resolve(&def.name.node.ident) {
+                    Lookup::Closure(qualified) => qualified.clone(),
+                    _ => Rc::from(format!("{}.{}", scope.name, def.name.node.ident)),
+                };
                 self.function(scope, qualified, def);
             }
             StmtP::Load(_) => self.error(
@@ -1105,7 +1142,7 @@ impl Checker<'_> {
     /// Whether `expr` is the `diag` module, not a name that hides it.
     fn is_diag(&self, expr: &AstExpr, scope: &Scope) -> bool {
         is_name(expr, "diag")
-            && !scope.locals.contains("diag")
+            && matches!(scope.resolve("diag"), Lookup::Outside)
             && !self.globals.contains("diag")
             && !self.defs.contains("diag")
     }
@@ -1116,7 +1153,7 @@ impl Checker<'_> {
             ExprP::Dict(_) => Kinds::DICT,
             ExprP::Identifier(name) => {
                 let name = &name.node.ident;
-                let known = if scope.locals.contains(name) {
+                let known = if scope.is_local(name) {
                     scope.kinds.get(name)
                 } else {
                     self.global_kinds.get(name)
@@ -1160,7 +1197,13 @@ impl Checker<'_> {
     ) {
         // The first iterable is evaluated outside the comprehension.
         self.expr(&first.over, scope, false);
-        let mut inner = scope.clone();
+        let mut inner = Scope {
+            frame: Rc::new(Frame {
+                parent: Some(scope.frame.clone()),
+                ..Frame::default()
+            }),
+            ..scope.clone()
+        };
         self.bind(&first.var, &mut inner);
         for clause in clauses {
             match clause {
@@ -1182,9 +1225,9 @@ impl Checker<'_> {
         target_names(target, &mut names);
         for name in &names {
             unbind(&mut scope.kinds, name);
-            scope.closures.remove(name);
         }
-        scope.locals.extend(names);
+        // The comprehension's own frame, which nothing else holds, so this copies nothing.
+        Rc::make_mut(&mut scope.frame).locals.extend(names);
         self.target(target, scope);
     }
 
@@ -1357,11 +1400,12 @@ impl Checker<'_> {
             );
             return;
         }
-        if callee || scope.locals.contains(name) {
+        let lookup = scope.resolve(name);
+        if callee || matches!(lookup, Lookup::Local) {
             return;
         }
         let function = self.defs.contains(name)
-            || scope.closures.contains_key(name)
+            || matches!(lookup, Lookup::Closure(_))
             || (!self.globals.contains(name)
                 && (BUILTINS.contains(&name)
                     || FORBIDDEN_BUILTINS.contains(&name)
@@ -1382,8 +1426,9 @@ impl Checker<'_> {
         match &function.node {
             ExprP::Identifier(name) => {
                 let name = name.node.ident.as_str();
-                let local = scope.locals.contains(name);
-                if let Some(qualified) = scope.closures.get(name).filter(|_| !local) {
+                let lookup = scope.resolve(name);
+                let local = matches!(lookup, Lookup::Local);
+                if let Lookup::Closure(qualified) = lookup {
                     // The nested `def` is reported where it is defined; its calls still count
                     // for recursion.
                     if self.quiet == 0 {

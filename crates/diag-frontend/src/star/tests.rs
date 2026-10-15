@@ -1063,3 +1063,22 @@ fn many_loops_rebinding_a_dict_to_a_dict_stay_cheap() {
     passes(&source);
     assert!(started.elapsed() < std::time::Duration::from_secs(10));
 }
+
+#[test]
+fn many_nested_scopes_beside_many_locals_stay_cheap() {
+    // Each nested def, lambda and comprehension is a scope; none copies the names around it.
+    let count = 2_000;
+    let mut source = String::from("def main():\n");
+    for at in 0..count {
+        source.push_str(&format!("    v{at} = {at}\n"));
+    }
+    for at in 0..count {
+        source.push_str(&format!(
+            "    def g{at}(x):\n        return x\n    f{at} = lambda y: y\n    c{at} = [z for z in range(1)]\n"
+        ));
+    }
+    let started = std::time::Instant::now();
+    let errors = check("test.star", &source).unwrap_err();
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    assert_eq!(errors.len(), 3 * count);
+}

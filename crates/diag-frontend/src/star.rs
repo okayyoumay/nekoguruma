@@ -255,7 +255,8 @@ pub fn check(file: &str, source: &str) -> Result<Checked, Vec<StarError>> {
         module: &module,
         errors: Vec::new(),
         defs: HashSet::new(),
-        def_names: HashMap::new(),
+        def_ids: HashMap::new(),
+        next_function: 1,
         globals: HashSet::new(),
         global_kinds: HashMap::new(),
         calls: Vec::new(),
@@ -407,10 +408,12 @@ fn to_u32(n: usize) -> u32 {
     u32::try_from(n).unwrap_or(u32::MAX)
 }
 
-/// A call from one top-level `def` to another, for the recursion check (4.1).
+/// A call from one function to another, for the recursion check (4.1). Functions are numbered,
+/// so a call holds no name but the callee's as the call writes it, for the hint.
 struct Call {
-    caller: Rc<str>,
-    callee: Rc<str>,
+    caller: usize,
+    callee: usize,
+    written: String,
     span: Span,
 }
 
@@ -419,9 +422,10 @@ struct Checker<'a> {
     errors: Vec<Pending>,
     /// The names of the top-level `def`s.
     defs: HashSet<String>,
-    /// The name of each top-level `def` in the call graph, shared by every call to it, so that
-    /// a long name called many times is stored once.
-    def_names: HashMap<String, Rc<str>>,
+    /// The number of each top-level `def` in the call graph.
+    def_ids: HashMap<String, usize>,
+    /// The number the next function gets in the call graph; 0 is the top level.
+    next_function: usize,
     /// The top-level constants.
     globals: HashSet<String>,
     /// What the top-level constants are known to be.
@@ -542,16 +546,16 @@ struct Frame {
     /// The parameters and the names it assigns, which hide the names of the scopes around it,
     /// the top-level names and the built-ins (2.2).
     locals: HashSet<String>,
-    /// Its nested `def`s, already reported where they are defined (2.3), with the name each has
-    /// in the call graph: `outer.inner`.
-    closures: HashMap<String, Rc<str>>,
+    /// Its nested `def`s, already reported where they are defined (2.3), with the number each
+    /// has in the call graph.
+    closures: HashMap<String, usize>,
     parent: Option<Rc<Frame>>,
 }
 
 /// What a name means in a scope, found from the innermost frame out.
-enum Lookup<'a> {
+enum Lookup {
     Local,
-    Closure(&'a Rc<str>),
+    Closure(usize),
     /// Not bound in any enclosing function: a top-level name, a built-in or nothing.
     Outside,
 }
@@ -559,7 +563,9 @@ enum Lookup<'a> {
 /// The names of the function being checked.
 #[derive(Default, Clone)]
 struct Scope {
-    name: Rc<str>,
+    /// The number of the function in the call graph (for a lambda or comprehension, of the one
+    /// it is in).
+    function: usize,
     frame: Rc<Frame>,
     /// What the locals are known to be at the point being checked; a local missing here is not a
     /// dict.
@@ -570,14 +576,14 @@ struct Scope {
 }
 
 impl Scope {
-    fn resolve(&self, name: &str) -> Lookup<'_> {
+    fn resolve(&self, name: &str) -> Lookup {
         let mut frame = Some(&self.frame);
         while let Some(current) = frame {
             if current.locals.contains(name) {
                 return Lookup::Local;
             }
-            if let Some(qualified) = current.closures.get(name) {
-                return Lookup::Closure(qualified);
+            if let Some(&id) = current.closures.get(name) {
+                return Lookup::Closure(id);
             }
             frame = current.parent.as_ref();
         }
@@ -603,13 +609,14 @@ impl Scope {
 }
 
 impl Scope {
-    /// The scope of a function named `name` (the top-level one it belongs to, for the call graph)
-    /// nested in `outer`, with its parameters and, for a `def`, its body.
+    /// The scope of the function numbered `function` nested in `outer`, with its parameters and,
+    /// for a `def`, its body; its nested `def`s are numbered from `next_function`.
     fn enter(
         outer: &Scope,
-        name: Rc<str>,
+        function: usize,
         params: &[AstParameter],
         body: Option<&AstStmt>,
+        next_function: &mut usize,
     ) -> Self {
         let mut own = HashSet::new();
         for param in params {
@@ -629,8 +636,9 @@ impl Scope {
             .into_iter()
             .filter(|inner| !own.contains(inner))
             .map(|inner| {
-                let qualified: Rc<str> = Rc::from(format!("{name}.{inner}"));
-                (inner, qualified)
+                let id = *next_function;
+                *next_function += 1;
+                (inner, id)
             })
             .collect();
         let mut kinds = outer.kinds.clone();
@@ -638,7 +646,7 @@ impl Scope {
             unbind(&mut kinds, local);
         }
         Scope {
-            name,
+            function,
             frame: Rc::new(Frame {
                 locals: own,
                 closures,
@@ -681,10 +689,9 @@ impl Checker<'_> {
             let name = match &stmt.node {
                 StmtP::Def(def) => {
                     self.defs.insert(def.name.node.ident.clone());
-                    self.def_names.insert(
-                        def.name.node.ident.clone(),
-                        Rc::from(def.name.node.ident.as_str()),
-                    );
+                    let id = self.next_function;
+                    self.next_function += 1;
+                    self.def_ids.insert(def.name.node.ident.clone(), id);
                     &def.name
                 }
                 StmtP::Assign(assign) => match &assign.lhs.node {
@@ -736,7 +743,7 @@ impl Checker<'_> {
                             "`main` takes no parameters (2.1)",
                         );
                     }
-                    let id = self.def_names[&name].clone();
+                    let id = self.def_ids[&name];
                     self.function(&Scope::default(), id, def);
                 }
                 StmtP::Assign(assign) => {
@@ -771,7 +778,13 @@ impl Checker<'_> {
                         "the top level holds only constant assignments and `def`s (2.1)",
                     );
                     // What it holds is checked too, so that every violation is listed (5).
-                    let mut scope = Scope::enter(&Scope::default(), Rc::from(""), &[], Some(stmt));
+                    let mut scope = Scope::enter(
+                        &Scope::default(),
+                        0,
+                        &[],
+                        Some(stmt),
+                        &mut self.next_function,
+                    );
                     self.stmt(stmt, &mut scope);
                 }
             }
@@ -818,7 +831,7 @@ impl Checker<'_> {
     }
 
     /// A `def`'s parameters and body. `name` is the top-level function it belongs to.
-    fn function(&mut self, outer: &Scope, name: Rc<str>, def: &DefP<AstNoPayload>) {
+    fn function(&mut self, outer: &Scope, function: usize, def: &DefP<AstNoPayload>) {
         self.params(&def.params, &mut outer.clone());
         if let Some(ty) = &def.return_type {
             self.error(
@@ -827,7 +840,13 @@ impl Checker<'_> {
                 "type annotations are not supported (2.3)",
             );
         }
-        let mut scope = Scope::enter(outer, name, &def.params, Some(&def.body));
+        let mut scope = Scope::enter(
+            outer,
+            function,
+            &def.params,
+            Some(&def.body),
+            &mut self.next_function,
+        );
         for (index, inner) in Self::statements(&def.body).into_iter().enumerate() {
             // A docstring opens the body.
             if index == 0 && is_string_expression(inner) {
@@ -998,12 +1017,15 @@ impl Checker<'_> {
                     def.name.span,
                     "a nested `def` is not allowed; write it as a top-level `def` (2.3)",
                 );
-                // The same name `Scope::enter` gave it in `closures`, shared with its calls.
-                let qualified = match scope.resolve(&def.name.node.ident) {
-                    Lookup::Closure(qualified) => qualified.clone(),
-                    _ => Rc::from(format!("{}.{}", scope.name, def.name.node.ident)),
+                // The number `Scope::enter` gave it, which its calls use too.
+                let id = match scope.resolve(&def.name.node.ident) {
+                    Lookup::Closure(id) => id,
+                    _ => {
+                        self.next_function += 1;
+                        self.next_function - 1
+                    }
                 };
-                self.function(scope, qualified, def);
+                self.function(scope, id, def);
             }
             StmtP::Load(_) => self.error(
                 StarCode::LoadNotAllowed,
@@ -1327,7 +1349,13 @@ impl Checker<'_> {
                     "`lambda` is not allowed; write a top-level `def` (2.3)",
                 );
                 self.params(&lambda.params, scope);
-                let mut inner = Scope::enter(scope, scope.name.clone(), &lambda.params, None);
+                let mut inner = Scope::enter(
+                    scope,
+                    scope.function,
+                    &lambda.params,
+                    None,
+                    &mut self.next_function,
+                );
                 self.expr(&lambda.body, &mut inner, false);
             }
             ExprP::Not(inner) | ExprP::Minus(inner) | ExprP::Plus(inner) | ExprP::BitNot(inner) => {
@@ -1428,13 +1456,14 @@ impl Checker<'_> {
                 let name = name.node.ident.as_str();
                 let lookup = scope.resolve(name);
                 let local = matches!(lookup, Lookup::Local);
-                if let Lookup::Closure(qualified) = lookup {
+                if let Lookup::Closure(id) = lookup {
                     // The nested `def` is reported where it is defined; its calls still count
                     // for recursion.
                     if self.quiet == 0 {
                         self.calls.push(Call {
-                            caller: scope.name.clone(),
-                            callee: qualified.clone(),
+                            caller: scope.function,
+                            callee: id,
+                            written: name.to_owned(),
                             span: function.span,
                         });
                     }
@@ -1448,8 +1477,9 @@ impl Checker<'_> {
                     user_function = true;
                     if self.quiet == 0 {
                         self.calls.push(Call {
-                            caller: scope.name.clone(),
-                            callee: self.def_names[name].clone(),
+                            caller: scope.function,
+                            callee: self.def_ids[name],
+                            written: name.to_owned(),
                             span: function.span,
                         });
                     }
@@ -1538,34 +1568,19 @@ impl Checker<'_> {
     /// Recursion, direct or through other functions, is reported at each call that closes a
     /// cycle in the call graph (4.1).
     fn recursion(&mut self) {
-        // Each name gets a number once: by its shared allocation, and only a name not seen in
-        // that allocation before is hashed as text, so a long name called many times is not
-        // hashed per call.
-        let mut by_pointer: HashMap<*const str, usize> = HashMap::new();
-        let mut by_text: HashMap<Rc<str>, usize> = HashMap::new();
-        let mut number = |name: &Rc<str>| -> usize {
-            *by_pointer.entry(Rc::as_ptr(name)).or_insert_with(|| {
-                let next = by_text.len();
-                *by_text.entry(name.clone()).or_insert(next)
-            })
-        };
         let edges: Vec<(usize, usize)> = self
             .calls
             .iter()
-            .map(|call| (number(&call.caller), number(&call.callee)))
+            .map(|call| (call.caller, call.callee))
             .collect();
-        let component = components(by_text.len(), &edges);
-        let recursive: Vec<(Span, Rc<str>)> = self
+        let component = components(self.next_function, &edges);
+        let recursive: Vec<(Span, String)> = self
             .calls
             .iter()
-            .zip(&edges)
-            .filter(|(_, (from, to))| component[*from] == component[*to])
-            .map(|(call, _)| (call.span, call.callee.clone()))
+            .filter(|call| component[call.caller] == component[call.callee])
+            .map(|call| (call.span, call.written.clone()))
             .collect();
-        for (span, callee) in recursive {
-            // The name as the call writes it, not `outer.inner`, so the hint is no longer than
-            // the call itself.
-            let written = callee.rsplit('.').next().unwrap_or(&callee);
+        for (span, written) in recursive {
             self.error(
                 StarCode::UnboundedNotAllowed,
                 span,

@@ -1082,3 +1082,18 @@ fn many_nested_scopes_beside_many_locals_stay_cheap() {
     assert!(started.elapsed() < std::time::Duration::from_secs(10));
     assert_eq!(errors.len(), 3 * count);
 }
+
+#[test]
+fn nested_defs_under_a_long_name_do_not_repeat_it() {
+    // Nested defs are numbered, not named after the function they are in.
+    let name = "f".repeat(20_000);
+    let mut source = format!("def {name}():\n");
+    for at in 0..20_000 {
+        source.push_str(&format!("    def g{at}():\n        pass\n"));
+    }
+    source.push_str("\ndef main():\n    pass\n");
+    let started = std::time::Instant::now();
+    let errors = check("test.star", &source).unwrap_err();
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    assert_eq!(errors.len(), 20_000);
+}

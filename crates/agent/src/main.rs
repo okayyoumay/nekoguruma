@@ -9,7 +9,7 @@ use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use agent::guards::{GuardSetup, JobGuards};
-use agent::launch::launch_j2534_worker;
+use agent::launch::{Api, launch_worker};
 use agent::policy::{build_ceiling, writes};
 use agent::{JobLimits, LinkConfig, check_program, run_program};
 use diag_ir::{Program, Value, VmState};
@@ -18,11 +18,13 @@ use worker_host::service::{LaunchOptions, OperatingMode, Stopped, WorkerLayout};
 const USAGE: &str = "\
 usage: ngr-agent run --vci <name> --mode <device|user> --program <file> [options]
 
-Runs an IR program (diag-ir Program as JSON) on a J2534 v04.04 VCI and prints the final VM
-state as JSON on stdout.
+Runs an IR program (diag-ir Program as JSON) on a J2534 v04.04 or D-PDU API VCI and prints
+the final VM state as JSON on stdout.
 
 options:
-  --vci <name>         J2534 library name the worker service resolves
+  --vci <name>         library name the worker service resolves: a J2534 library, or the
+                       SHORT_NAME of a D-PDU API implementation
+  --api <j2534|dpdu>   the API the VCI's library implements (default j2534)
   --mode <device|user> the device's operating mode, passed to the worker: device mode
                        refuses a library that fails the pre-load checks, user mode
                        reports the findings and loads it
@@ -42,6 +44,7 @@ const STOP_GRACE: Duration = Duration::from_secs(5);
 
 #[derive(Debug, PartialEq, Eq)]
 struct RunArgs {
+    api: Api,
     vci: String,
     mode: OperatingMode,
     program: PathBuf,
@@ -89,6 +92,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<RunArgs, Strin
         Some(command) => return Err(format!("unknown command {command:?}")),
         None => return Err("missing command".to_owned()),
     }
+    let mut api = Api::J2534;
     let mut vci = None;
     let mut mode = None;
     let mut program = None;
@@ -118,6 +122,13 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<RunArgs, Strin
                         .map_err(|error| format!("--mode: {error}"))?,
                 )
             }
+            "--api" => {
+                api = value
+                    .to_str()
+                    .ok_or_else(|| format!("--api {value:?} is not valid UTF-8"))?
+                    .parse()
+                    .map_err(|error| format!("--api: {error}"))?
+            }
             "--program" => program = Some(PathBuf::from(value)),
             "--workers" => workers = Some(PathBuf::from(value)),
             // A relative path would name a different lock set from each working directory.
@@ -133,6 +144,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<RunArgs, Strin
     let link = LinkConfig::iso15765(tx_id, rx_id);
     link.validate().map_err(|error| error.to_string())?;
     Ok(RunArgs {
+        api,
         vci: vci.ok_or("--vci is required")?,
         // The mode is fixed per device at installation (design 6.2); there is no default.
         mode: mode.ok_or("--mode is required")?,
@@ -213,9 +225,15 @@ async fn run(args: RunArgs) -> Result<String, String> {
             None => default_workers()?,
         },
     };
-    let worker = launch_j2534_worker(&args.vci, args.mode, &workers, &LaunchOptions::default())
-        .await
-        .map_err(|error| error.to_string())?;
+    let worker = launch_worker(
+        args.api,
+        &args.vci,
+        args.mode,
+        &workers,
+        &LaunchOptions::default(),
+    )
+    .await
+    .map_err(|error| error.to_string())?;
     let (result, mut guards) = run_program(
         worker.client,
         &args.link,
@@ -292,6 +310,7 @@ mod tests {
                 "p.json"
             ]),
             Ok(RunArgs {
+                api: Api::J2534,
                 vci: "sim-vci".to_owned(),
                 mode: OperatingMode::User,
                 program: PathBuf::from("p.json"),
@@ -321,8 +340,11 @@ mod tests {
             "x",
             "--mode",
             "device",
+            "--api",
+            "dpdu",
         ])
         .expect("valid arguments");
+        assert_eq!(args.api, Api::Dpdu);
         assert_eq!(args.mode, OperatingMode::Device);
         assert_eq!(args.workers, Some(PathBuf::from("w")));
         assert_eq!(args.locks, Some(locks));
@@ -357,6 +379,11 @@ mod tests {
             &["--locks"],
             &["--locks", ""],
             &["--locks", "locks"],
+            // Only the exact spellings select an API.
+            &["--api"],
+            &["--api", ""],
+            &["--api", "J2534"],
+            &["--api", "d-pdu"],
         ] {
             let args: Vec<&str> = valid.iter().chain(extra).copied().collect();
             assert!(parse(&args).is_err(), "{args:?}");

@@ -848,6 +848,7 @@ dependencies = [
 name = "iso22900-service"
 version = "0.1.0"
 dependencies = [
+ "agent",
  "iso22900",
  "iso22900-mock",
  "iso22900-registry",
@@ -863,6 +864,7 @@ dependencies = [
  "url",
  "vci-service-interface",
  "vci-service-launcher",
+ "worker-host",
 ]
 
 [[package]]

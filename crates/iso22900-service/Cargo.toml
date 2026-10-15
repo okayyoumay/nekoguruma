@@ -28,7 +28,10 @@ vci-service-interface = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+# tests/agent_launch.rs launches this service through the agent's launch path.
+agent = { path = "../agent" }
 iso22900-mock = { workspace = true }
+worker-host = { workspace = true }
 serial_test = "3"
 tempfile = "3"
 serde_json = "1"

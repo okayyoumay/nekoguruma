@@ -7,22 +7,23 @@ server or take jobs from it.
 ## `ngr-agent run`
 
 ```sh
-ngr-agent run --vci <name> --mode <device|user> --program <file> [--workers <dir>] [--locks <dir>] [--tx-id <hex>] [--rx-id <hex>]
+ngr-agent run --vci <name> --mode <device|user> --program <file> [--api <j2534|dpdu>] [--workers <dir>] [--locks <dir>] [--tx-id <hex>] [--rx-id <hex>]
 ```
 
 | Option | Meaning |
 |---|---|
-| `--vci` | J2534 v04.04 library name: the registry key name on Windows, the `Name` of a registration definition on Linux (design 7.1.1), resolved the same way by the agent (step 3) and the worker service |
+| `--vci` | The library name, resolved the same way by the agent (step 3) and the worker service (design 7.1.1). For J2534 v04.04: the registry key name on Windows, the `Name` of a registration definition on Linux. For the D-PDU API: the `SHORT_NAME` of an implementation in the root description file |
+| `--api` | The API the VCI's library implements: `j2534` (J2534 v04.04, `j2534-0404-service`; the default) or `dpdu` (the D-PDU API, `iso22900-service`). The names are those of a VCI profile's `standard.kind` (`schemas/vci-profile.schema.json`) |
 | `--mode` | The device's operating mode (design 6.2), `device` or `user`. Required: the mode is fixed per device at installation, and this command, which has no installation of its own, takes it from the command line rather than defaulting to either. It is passed to the worker (ADR-281 Decision item 2); design 7.2 gives it its meaning for a failed library check: device mode refuses the library, user mode reports the findings and loads it. Both worker services apply it to the checks they run before loading |
 | `--program` | IR program file: a `diag_ir::Program` serialized as JSON |
-| `--workers` | Directory of worker builds, laid out as `<dir>/<ABI name>/j2534-0404-service[.exe]` (design 7.3). Default: `workers` next to the `ngr-agent` executable |
+| `--workers` | Directory of worker builds, laid out as `<dir>/<ABI name>/j2534-0404-service[.exe]` and `<dir>/<ABI name>/iso22900-service[.exe]` (design 7.3). Default: `workers` next to the `ngr-agent` executable |
 | `--locks` | The device's lock directory for the job's guards ("Job guards" below), as an absolute path. Default: `locks` next to the `ngr-agent` executable. Lock files are opened read-only, so a file another user created still locks. The agent creates a missing directory writable by its owner only, so a device whose agents run as several users needs it prepared beforehand: writable by all of them, and with the sticky bit (or an equivalent ACL) so that no user can delete another's lock files (ADR-257). It must also be readable by every agent user, since the per-vehicle lock lists it, and on Unix support hard links, with which it creates its files (ADR-262). On Unix a directory that group or others may write without the sticky bit, or without being readable by them, is refused |
 | `--tx-id`, `--rx-id` | Physical request and response CAN IDs in hex, with or without `0x`. Default `7E0` / `7E8`. Only 11-bit IDs: the link does not set the CAN ID format |
 
 The link is UDS on ISO 15765 at 500 kbit/s (`LinkConfig::iso15765`), with the CAN IDs from the
 command line rather than from the program.
 
-Steps (`agent::check_program`, `agent::guards::JobGuards`, `agent::launch::launch_j2534_worker`, then `agent::run_program`):
+Steps (`agent::check_program`, `agent::guards::JobGuards`, `agent::launch::launch_worker`, then `agent::run_program`):
 
 1. Read the program and check it (`agent::check_program`): a program whose schema version or
    size this VM does not accept, one whose restart declaration `Program::validate` refuses
@@ -33,24 +34,29 @@ Steps (`agent::check_program`, `agent::guards::JobGuards`, `agent::launch::launc
 2. Take the job's guards from the `--locks` directory, named by `--vci` ("Job guards" below):
    the per-VCI lock, plus the reprogramming slot when the program writes (`policy::writes`).
    The run waits here while another job on the device holds them.
-3. Resolve the VCI name the way each worker build resolves it on its side, through
-   `ngr_library_resolver::j2534_0404` (design 7.1.1): the build's registry view on Windows, the
+3. Resolve the VCI name the way each worker build resolves it on its side (design 7.1.1). For
+   J2534, through `ngr_library_resolver::j2534_0404`: the build's registry view on Windows, the
    registration definition on Linux; in a debug build the `NGR_J2534_DEFINITION_DIR` definition
-   directory replaces both (ADR-282). No `config.toml` key names the library (ADR-281 Decision
-   item 1). The first build whose library header (`worker_host::abi::detect_file`) matches the
+   directory replaces both. For the D-PDU API, through `ngr_library_resolver::iso22900`: the
+   root description file that the build's registry view names on Windows, the fixed root file on
+   Linux; in a debug build the `NGR_PDU_API_ROOT_FILE` file replaces both (ADR-282). No
+   `config.toml` key names the library (ADR-281 Decision item 1). The first build whose library header (`worker_host::abi::detect_file`) matches the
    build's own ABI is chosen, so the header that selects the build belongs to the file that
    build loads (ADR-240).
+   The same builds are tried in the same order for both APIs:
    - Windows x64 agent: the x64 build (64-bit registry view) first, then the x86 build (32-bit
      view, `KEY_WOW64_32KEY`). A VCI registered in both views runs on the x64 build.
    - Windows x86 agent: the x86 build only, so a 64-bit library is not found.
    - Linux: one lookup; the build follows the header's ABI.
-4. Pick the service build for that ABI with `WorkerLayout::find`. A missing build fails as
-   `UNSUPPORTED_ABI`.
-5. Launch the service with the library name, the `--mode` value and the J2534 `long_size`: the
-   resolved registration definition's `LongSize` (design 7.1.1), else the ABI's default (7.1.2;
-   ADR-284). An 8-byte `LongSize` for an ABI whose `unsigned long` is 32 bits wide fails the
-   run before the service starts. Then provision its
-   auth key and connect the gRPC client (design 7.4).
+4. Pick the API's service build for that ABI with `WorkerLayout::find`. A missing build fails
+   as `UNSUPPORTED_ABI`.
+5. Launch the service with the library name and the `--mode` value, and a J2534 service also
+   with its `long_size`: the resolved registration definition's `LongSize` (design 7.1.1), else
+   the ABI's default (7.1.2; ADR-284). An 8-byte `LongSize` for an ABI whose `unsigned long` is
+   32 bits wide fails the run before the service starts. Then provision its auth key and connect
+   the gRPC client (design 7.4). The job's link set-up (step 6) names only the protocol in its
+   resource data, which a J2534 worker maps itself; a D-PDU API worker also needs the bus type,
+   so a run with `--api dpdu` stops at the link set-up with an error from the worker.
 6. Run the program under the request policy and the default job limits (ADR-235), then stop
    the worker and release the guards. The stop request may take up to 2 s to be answered; a
    worker that has not exited 5 s after that is killed and reported on stderr. When the job's link was not confirmed closed and the worker

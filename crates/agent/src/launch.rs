@@ -1,23 +1,68 @@
 //! Launching the worker for a VCI (design 7.3, 7.4).
 //!
-//! The library behind a VCI name is resolved for each worker build through `ngr-library-resolver`
-//! (7.1.1), as that build resolves it: the build's registry view on Windows, the registration
-//! definition on Linux, and in a debug build the `NGR_J2534_DEFINITION_DIR` definition directory
-//! on both (ADR-282). The file's header picks the ABI, so the file whose header selects the build
-//! is the file that build loads (ADR-281 Decision item 1). The service is then started with the
-//! name and the device's operating mode (ADR-281 Decision item 2; 7.2 gives the mode its meaning
-//! for a failed library check) and resolves the name again itself. ADR-240 records the selection
-//! rule.
+//! A VCI is a J2534 v04.04 library or a D-PDU API implementation ([`Api`]). The library behind
+//! its name is resolved for each worker build through `ngr-library-resolver` (7.1.1), as that
+//! build resolves it: for J2534 the build's registry view on Windows, the registration definition
+//! on Linux, and in a debug build the `NGR_J2534_DEFINITION_DIR` definition directory on both;
+//! for the D-PDU API the root description file the build's registry view names on Windows, the
+//! fixed root file on Linux, and in a debug build the `NGR_PDU_API_ROOT_FILE` file on both
+//! (ADR-282). The file's header picks the ABI, so the file whose header selects the build is the
+//! file that build loads (ADR-281 Decision item 1). The service (`j2534-0404-service` or
+//! `iso22900-service`) is then started with the name and the device's operating mode (ADR-281
+//! Decision item 2; 7.2 gives the mode its meaning for a failed library check) and resolves the
+//! name again itself. ADR-240 records the selection rule; it applies to both APIs alike.
 
+use std::fmt;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use j2534_0404_registry::RegistryViewMode;
-use ngr_library_resolver::j2534_0404::ResolveError;
+use ngr_library_resolver::{RegistryView, iso22900, j2534_0404};
 use worker_host::abi::{self, Abi, AbiError};
 use worker_host::client::{ConnectError, ConnectOptions, WorkerClient};
 use worker_host::service::{
     LaunchOptions, OperatingMode, ServiceError, ServiceKind, WorkerLayout, WorkerProcess,
 };
+
+/// The API a VCI's library implements, which decides the worker service that loads it. The
+/// names are those of a VCI profile's `standard.kind` (`schemas/vci-profile.schema.json`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Api {
+    /// J2534 v04.04, loaded by `j2534-0404-service`.
+    J2534,
+    /// The D-PDU API, loaded by `iso22900-service`.
+    Dpdu,
+}
+
+impl Api {
+    fn service(self) -> ServiceKind {
+        match self {
+            Api::J2534 => ServiceKind::J2534V0404,
+            Api::Dpdu => ServiceKind::Iso22900,
+        }
+    }
+}
+
+impl fmt::Display for Api {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Api::J2534 => "j2534",
+            Api::Dpdu => "dpdu",
+        })
+    }
+}
+
+impl FromStr for Api {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        match text {
+            "j2534" => Ok(Api::J2534),
+            "dpdu" => Ok(Api::Dpdu),
+            _ => Err(format!("unknown API {text:?} (expected j2534 or dpdu)")),
+        }
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum LaunchError {
@@ -37,7 +82,8 @@ pub enum LaunchError {
 }
 
 /// How one worker build resolves a library name: the registry view it reads on Windows, and the
-/// ABI it is built for (`None`: any, there is one build per host on Linux).
+/// ABI it is built for (`None`: any, there is one build per host on Linux). The same builds and
+/// order serve both APIs.
 #[derive(Debug, Clone, Copy)]
 struct Resolution {
     #[cfg_attr(
@@ -69,9 +115,9 @@ const RESOLUTIONS: &[Resolution] = &[Resolution {
     abi: Some(Abi::WinX86),
 }];
 
-// No j2534-0404 worker is built for any other Windows architecture.
+// No worker is built for any other Windows architecture.
 #[cfg(all(windows, not(any(target_arch = "x86_64", target_arch = "x86"))))]
-compile_error!("no j2534-0404 worker build is defined for this Windows architecture");
+compile_error!("no worker build is defined for this Windows architecture");
 
 #[cfg(not(windows))]
 const RESOLUTIONS: &[Resolution] = &[Resolution {
@@ -79,8 +125,9 @@ const RESOLUTIONS: &[Resolution] = &[Resolution {
     abi: None,
 }];
 
-/// What one worker build would load for a VCI: the library, and the `LongSize` its
-/// registration definition declares (7.1.1; a registry entry declares none).
+/// What one worker build would load for a VCI: the library, and the `LongSize` its J2534
+/// registration definition declares (7.1.1; a registry entry and a D-PDU API implementation
+/// declare none).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Library {
     path: PathBuf,
@@ -94,27 +141,41 @@ pub struct LaunchedWorker {
     pub client: WorkerClient,
 }
 
-/// Launches the j2534-0404 worker that matches the ABI of `vci`'s library in the device's
+/// Launches the worker of `api` that matches the ABI of `vci`'s library in the device's
 /// operating `mode` and connects a client to it.
 ///
-/// The worker's J2534 `long_size` is `options.long_size`, else the `LongSize` of the
-/// registration definition the lookup resolves (7.1.1), else the ABI's default (7.1.2). An
-/// 8-byte width for an ABI whose `unsigned long` is 32 bits wide fails the launch.
-pub async fn launch_j2534_worker(
+/// A J2534 worker's `long_size` is `options.long_size`, else the `LongSize` of the registration
+/// definition the lookup resolves (7.1.1), else the ABI's default (7.1.2). An 8-byte width for an
+/// ABI whose `unsigned long` is 32 bits wide fails the launch. A D-PDU API worker takes no
+/// `long_size`.
+pub async fn launch_worker(
+    api: Api,
     vci: &str,
     mode: OperatingMode,
     workers: &WorkerLayout,
     options: &LaunchOptions,
 ) -> Result<LaunchedWorker, LaunchError> {
-    let (library, abi) = resolve(vci, RESOLUTIONS, lookup, abi::detect_file)?;
-    let long_size = long_size(vci, abi, options.long_size.or(library.long_size))?;
-    let binary = workers.find(ServiceKind::J2534V0404, abi)?;
-    let options = LaunchOptions {
-        long_size: Some(long_size),
-        ..options.clone()
+    let (abi, options) = match api {
+        Api::J2534 => {
+            let (library, abi) = resolve(vci, RESOLUTIONS, lookup_j2534, abi::detect_file)?;
+            let long_size = long_size(vci, abi, options.long_size.or(library.long_size))?;
+            let options = LaunchOptions {
+                long_size: Some(long_size),
+                ..options.clone()
+            };
+            (abi, options)
+        }
+        Api::Dpdu => {
+            let (_, abi) = resolve(vci, RESOLUTIONS, lookup_dpdu, abi::detect_file)?;
+            let options = LaunchOptions {
+                long_size: None,
+                ..options.clone()
+            };
+            (abi, options)
+        }
     };
-    let process =
-        WorkerProcess::launch(&binary, ServiceKind::J2534V0404, vci, mode, &options).await?;
+    let binary = workers.find(api.service(), abi)?;
+    let process = WorkerProcess::launch(&binary, api.service(), vci, mode, &options).await?;
     let client = process.connect(&ConnectOptions::default()).await?;
     Ok(LaunchedWorker {
         abi,
@@ -138,14 +199,14 @@ fn long_size(vci: &str, abi: Abi, declared: Option<u8>) -> Result<u8, LaunchErro
     }
 }
 
-/// What one worker build would load for `vci`.
-fn lookup(vci: &str, resolution: &Resolution) -> Result<Library, ResolveError> {
+/// What one J2534 worker build would load for `vci`.
+fn lookup_j2534(vci: &str, resolution: &Resolution) -> Result<Library, j2534_0404::ResolveError> {
     #[cfg(windows)]
-    let resolved = ngr_library_resolver::j2534_0404::resolve_on_registry(vci, resolution.view)?;
+    let resolved = j2534_0404::resolve_on_registry(vci, resolution.view)?;
     #[cfg(not(windows))]
     let resolved = {
         let _ = resolution;
-        ngr_library_resolver::j2534_0404::resolve(vci)?
+        j2534_0404::resolve(vci)?
     };
     Ok(Library {
         path: resolved.definition.library,
@@ -153,12 +214,35 @@ fn lookup(vci: &str, resolution: &Resolution) -> Result<Library, ResolveError> {
     })
 }
 
+/// What one D-PDU API worker build would load for `vci`: the library of the root description
+/// file's entry named `vci`, the root file being the one the build's registry view names.
+fn lookup_dpdu(vci: &str, resolution: &Resolution) -> Result<Library, iso22900::ResolveError> {
+    let resolved = iso22900::resolve_in_view(vci, registry_view(resolution))?;
+    Ok(Library {
+        path: resolved.implementation.library_file,
+        long_size: None,
+    })
+}
+
+/// The D-PDU API resolver's name for the registry view `resolution` reads. Outside Windows the
+/// view is ignored.
+fn registry_view(resolution: &Resolution) -> RegistryView {
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    match resolution.view {
+        RegistryViewMode::W64 => return RegistryView::Wow64_64,
+        RegistryViewMode::W32 => return RegistryView::Wow64_32,
+        _ => {}
+    }
+    let _ = resolution;
+    RegistryView::native()
+}
+
 /// The first resolution whose library is built for that resolution's ABI, with the library and
 /// its ABI.
-fn resolve(
+fn resolve<E: fmt::Display>(
     vci: &str,
     resolutions: &[Resolution],
-    lookup: impl Fn(&str, &Resolution) -> Result<Library, ResolveError>,
+    lookup: impl Fn(&str, &Resolution) -> Result<Library, E>,
     detect: impl Fn(&Path) -> Result<Abi, AbiError>,
 ) -> Result<(Library, Abi), LaunchError> {
     let mut reasons = Vec::new();
@@ -221,13 +305,13 @@ mod tests {
     /// Resolves to the path listed for the build's ABI, or not at all.
     fn lookup_in(
         paths: &'static [(Option<Abi>, &'static str)],
-    ) -> impl Fn(&str, &Resolution) -> Result<Library, ResolveError> {
+    ) -> impl Fn(&str, &Resolution) -> Result<Library, j2534_0404::ResolveError> {
         move |vci, resolution| {
             paths
                 .iter()
                 .find(|(abi, _)| *abi == resolution.abi)
                 .map(|(_, path)| library(path))
-                .ok_or_else(|| ResolveError::NotFound {
+                .ok_or_else(|| j2534_0404::ResolveError::NotFound {
                     name: vci.to_owned(),
                     skipped_invalid: 0,
                 })
@@ -247,6 +331,9 @@ mod tests {
                 (RegistryViewMode::W32, Some(Abi::WinX86)),
             ]
         );
+        // The D-PDU API lookup reads the same view for each build.
+        let views: Vec<_> = RESOLUTIONS.iter().map(registry_view).collect();
+        assert_eq!(views, [RegistryView::Wow64_64, RegistryView::Wow64_32]);
     }
 
     #[test]

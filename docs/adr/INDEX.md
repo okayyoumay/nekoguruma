@@ -284,9 +284,10 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-292](ADR-292-a-crashed-sim-vci-fails-every-call.md) | A Crashed Simulated VCI Fails Every Call with `ERR_FAILED` | Accepted (the consequence that a crash shows as `HostError::Rpc` superseded by ADR-294: the agent reports `HostError::VciLost`) | `sim-vci`, `j2534-0404-service` tests; design 13.4 |
 | [ADR-293](ADR-293-a-recovery-required-section-keeps-a-journal-without-a-plan.md) | A `RecoveryRequired` Section Keeps a Journal without a Flash Recovery Plan | Accepted | `agent` runner, restart; design 8.2.5 / 8.10.1 |
 | [ADR-294](ADR-294-a-vci-lost-between-primitives-is-vci-lost.md) | A VCI Lost between Two Primitives Is Reported as `HostError::VciLost` | Accepted | `agent` host, `j2534-0404-service` hard-error handling; design 8.2.4 |
-| [ADR-295](ADR-295-csv-table-format-of-the-vehicle-knowledge-format.md) | The CSV Table Format of the Proprietary Vehicle-Knowledge Format | Accepted | `diag-frontend` CSV table spec and example; design 8.4 |
+| [ADR-295](ADR-295-csv-table-format-of-the-vehicle-knowledge-format.md) | The CSV Table Format of the Proprietary Vehicle-Knowledge Format | Accepted (item 11 amended by ADR-298) | `diag-frontend` CSV table spec and example; design 8.4 |
 | [ADR-296](ADR-296-the-ir-declaration-part-is-loaded-through-a-checking-loader.md) | The IR Declaration Part Is Loaded Through a Checking Loader | Accepted | `diag-ir` declaration loader and generated bindings; design 8.2.6 |
 | [ADR-297](ADR-297-a-flat-positive-response-is-decoded-as-odx-extracts-a-parameter.md) | A Flat Positive Response Is Decoded as ODX Extracts a Parameter | Accepted | `diag-ir` response decoder; design 8.2.2 |
+| [ADR-298](ADR-298-csv-definition-errors-are-reported-in-two-stages.md) | CSV Definition Errors Are Reported in Two Stages | Accepted | `diag-frontend` CSV table reader error reporting |
 
 ## Status Legend
 
@@ -681,9 +682,10 @@ the predecessor repository these ADRs came from.
 - ADR-254 (`diag.fail` has an instruction since ADR-280)
 - ADR-280 (schema-compatibility consequence relaxed by ADR-281 item 4; the terminal-record rule extended to the restart's identity abort by ADR-286; the open consequence on the step limit and a VM error decided by ADR-288, which journals both as terminal)
 - ADR-281
-- ADR-295
+- ADR-295 (item 11 amended by ADR-298)
 - ADR-296
 - ADR-297
+- ADR-298
 
 ### Acquired Data & Monitoring
 - ADR-236

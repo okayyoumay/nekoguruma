@@ -1,7 +1,7 @@
 # ADR-295: The CSV Table Format of the Proprietary Vehicle-Knowledge Format
 
 **Date:** 2026-10-14
-**Status:** Accepted
+**Status:** Accepted (Decision item 11 amended by ADR-298)
 **Affects:** `diag-frontend` (`docs/csv-tables.md`, `examples/example-ecu/`), design 8.4
 
 ## Context

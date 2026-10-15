@@ -572,3 +572,90 @@ fn a_binding_carried_by_an_inner_loop_reaches_the_outer_one() {
         [(StarCode::DynamicKeyNotAllowed, 11)]
     );
 }
+
+#[test]
+fn a_default_value_is_checked_inside() {
+    assert_eq!(
+        codes(
+            "def helper(x = fail(\"bad\"), y = print(None)):\n    pass\n\ndef main():\n    \
+             f = lambda z = dir(1): z\n"
+        ),
+        [
+            (StarCode::UnsupportedSyntax, 1),
+            (StarCode::FailNotAllowed, 1),
+            (StarCode::UnsupportedSyntax, 1),
+            (StarCode::BuiltinNotAllowed, 1),
+            (StarCode::UnsupportedSyntax, 1),
+            (StarCode::ClosureNotAllowed, 5),
+            (StarCode::UnsupportedSyntax, 5),
+            (StarCode::BuiltinNotAllowed, 5),
+        ]
+    );
+}
+
+#[test]
+fn break_and_continue_carry_their_bindings() {
+    // What follows a `break` is not reached, and the loop ends with the binding at the `break`.
+    assert_eq!(
+        codes(
+            "def main():\n    d = 0\n    k = \"a\"\n    # @maxIterations 3\n    for i in \
+             range(3):\n        d = {\"a\": 1}\n        break\n        d = 0\n    x = d[k]\n"
+        ),
+        [(StarCode::DynamicKeyNotAllowed, 9)]
+    );
+    // A `continue` carries its binding to the next pass.
+    assert_eq!(
+        codes(
+            "def main():\n    d = 0\n    k = \"a\"\n    # @maxIterations 3\n    for i in \
+             range(3):\n        x = d[k]\n        d = {\"a\": 1}\n        if i:\n            \
+             continue\n        d = 0\n"
+        ),
+        [(StarCode::DynamicKeyNotAllowed, 6)]
+    );
+    // A path that returns does not reach what follows.
+    passes(
+        "def helper(k):\n    d = {\"a\": 1}\n    if k:\n        return 1\n    else:\n        \
+         d = [1]\n    return d[k]\n\ndef main():\n    helper(0)\n",
+    );
+}
+
+#[test]
+fn an_inner_loop_reaches_its_own_fixpoint_inside_an_outer_one() {
+    // `a` becomes a dict on the inner loop's second pass; `b` is reset after the inner loop.
+    let after = "def main():\n    a = [1]\n    b = [1]\n    k = 0\n    # @maxIterations 2\n    \
+                 for i in range(2):\n        x = a[k]\n        # @maxIterations 2\n        for j in \
+                 range(2):\n            a = b\n            b = {\"x\": 1}\n        b = [1]\n";
+    assert_eq!(codes(after), [(StarCode::DynamicKeyNotAllowed, 7)]);
+    // The same with `b` reset before the inner loop.
+    let before = "def main():\n    a = [1]\n    b = [1]\n    k = 0\n    # @maxIterations 2\n    \
+                  for i in range(2):\n        x = a[k]\n        b = [1]\n        # @maxIterations 2\n        \
+                  for j in range(2):\n            a = b\n            b = {\"x\": 1}\n";
+    assert_eq!(codes(before), [(StarCode::DynamicKeyNotAllowed, 7)]);
+}
+
+#[test]
+fn a_function_or_constant_named_diag_hides_the_module() {
+    assert_eq!(
+        codes("def diag():\n    return 1\n\ndef main():\n    diag.request(0x22, {})\n"),
+        [
+            (StarCode::BuiltinNotAllowed, 5),
+            (StarCode::FunctionValueNotAllowed, 5),
+        ]
+    );
+    passes("diag = \"abc\"\nLABEL = diag.upper()\n\ndef main():\n    pass\n");
+}
+
+#[test]
+fn and_and_or_give_one_of_their_operands() {
+    assert_eq!(
+        codes(
+            "def main():\n    k = \"a\"\n    res = diag.request(0x22, {}) or {}\n    x = res[k]\n    \
+             y = res[\"fields\"][k]\n    z = (k and {\"a\": 1})[k]\n"
+        ),
+        [
+            (StarCode::DynamicKeyNotAllowed, 4),
+            (StarCode::DynamicKeyNotAllowed, 5),
+            (StarCode::DynamicKeyNotAllowed, 6),
+        ]
+    );
+}

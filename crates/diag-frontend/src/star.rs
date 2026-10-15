@@ -21,7 +21,7 @@ use serde::Serialize;
 use starlark_syntax::codemap::Span;
 use starlark_syntax::syntax::ast::{
     ArgumentP, AssignTargetP, AstArgument, AstAssignTarget, AstExpr, AstLiteral, AstNoPayload,
-    AstParameter, AstStmt, ClauseP, DefP, ExprP, ForClauseP, ParameterP, StmtP,
+    AstParameter, AstStmt, BinOp, ClauseP, DefP, ExprP, ForClauseP, ParameterP, StmtP,
 };
 use starlark_syntax::syntax::{AstModule, Dialect, DialectTypes};
 
@@ -238,6 +238,8 @@ pub fn check(file: &str, source: &str) -> Result<Checked, Vec<StarError>> {
         global_kinds: HashMap::new(),
         calls: Vec::new(),
         quiet: 0,
+        loops: Vec::new(),
+        loop_states: HashMap::new(),
     };
     checker.top_level();
     checker.recursion();
@@ -314,11 +316,39 @@ struct Checker<'a> {
     /// Above 0 while a loop body is walked only to find what its names are bound to: nothing is
     /// reported then.
     quiet: u32,
+    /// The bindings `break` and `continue` carry, for each loop being walked, innermost last.
+    loops: Vec<Jumps>,
+    /// The bindings at the head and after each loop, by the loop's position and the bindings
+    /// before it. A loop nested in another is walked again on each pass of the outer one, mostly
+    /// with bindings seen before, so this keeps the passes from multiplying with the depth.
+    loop_states: HashMap<(u32, Vec<(String, Kinds)>), LoopState>,
+}
+
+/// The bindings a loop's `break`s and `continue`s carry; `None` while none is reachable.
+#[derive(Default)]
+struct Jumps {
+    breaks: Option<HashMap<String, Kinds>>,
+    continues: Option<HashMap<String, Kinds>>,
+}
+
+/// What a loop's fixpoint found: the bindings at the start of a pass and after the loop.
+#[derive(Clone)]
+struct LoopState {
+    head: HashMap<String, Kinds>,
+    exit: HashMap<String, Kinds>,
+}
+
+/// Adds `kinds` to the bindings of a jump, which are unset while no jump is reachable.
+fn join_jump(into: &mut Option<HashMap<String, Kinds>>, kinds: HashMap<String, Kinds>) {
+    match into {
+        Some(into) => merge(into, kinds),
+        None => *into = Some(kinds),
+    }
 }
 
 /// What an expression is known to be, for the computed-key check (2.3). A name can be bound to
 /// different things on different paths, so both are kept.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct Kinds {
     /// A response of `diag.request`, `diag.routine` or `diag.read_dtc` (3.4).
     response: bool,
@@ -368,6 +398,24 @@ struct Scope {
     /// What the locals are known to be at the point being checked; a local missing here is not a
     /// dict.
     kinds: HashMap<String, Kinds>,
+    /// The point being checked follows a `return`, `break` or `continue` on every path, so its
+    /// bindings reach nothing. Its syntax is still checked.
+    dead: bool,
+}
+
+impl Scope {
+    /// Joins the state `(kinds, dead)` reached along another path into this one.
+    fn join(&mut self, kinds: HashMap<String, Kinds>, dead: bool) {
+        if dead {
+            return;
+        }
+        if self.dead {
+            self.kinds = kinds;
+            self.dead = false;
+        } else {
+            merge(&mut self.kinds, kinds);
+        }
+    }
 }
 
 impl Scope {
@@ -397,6 +445,7 @@ impl Scope {
             locals,
             closures,
             kinds,
+            dead: false,
         }
     }
 }
@@ -523,7 +572,7 @@ impl Checker<'_> {
     /// functions, which run only from `main` (2.1).
     fn constant(&mut self, expr: &AstExpr) {
         let mut found = Vec::new();
-        collect_runtime_calls(expr, &self.defs, &mut found);
+        self.collect_runtime_calls(expr, &mut found);
         for span in found {
             self.error(
                 StarCode::ToplevelStatementNotAllowed,
@@ -534,9 +583,25 @@ impl Checker<'_> {
         self.expr(expr, &mut Scope::default(), false);
     }
 
+    /// The calls in a top-level constant that can only run from `main`: to `diag` and to the
+    /// file's functions.
+    fn collect_runtime_calls(&self, expr: &AstExpr, found: &mut Vec<Span>) {
+        if let ExprP::Call(function, _) = &expr.node {
+            let runtime = match &function.node {
+                ExprP::Identifier(name) => self.defs.contains(&name.node.ident),
+                ExprP::Dot(object, _) => self.is_diag(object, &Scope::default()),
+                _ => false,
+            };
+            if runtime {
+                found.push(function.span);
+            }
+        }
+        expr.visit_expr(|inner| self.collect_runtime_calls(inner, found));
+    }
+
     /// A `def`'s parameters and body. `name` is the top-level function it belongs to.
     fn function(&mut self, outer: &Scope, name: String, def: &DefP<AstNoPayload>) {
-        self.params(&def.params);
+        self.params(&def.params, &mut outer.clone());
         if let Some(ty) = &def.return_type {
             self.error(
                 StarCode::UnsupportedSyntax,
@@ -555,7 +620,8 @@ impl Checker<'_> {
     }
 
     /// Positional parameters only, without defaults or types (2.3).
-    fn params(&mut self, params: &[AstParameter]) {
+    /// A default value is checked too, in `defining`, the scope the function is defined in.
+    fn params(&mut self, params: &[AstParameter], defining: &mut Scope) {
         for param in params {
             match &param.node {
                 ParameterP::Normal(_, ty, default) => {
@@ -566,12 +632,13 @@ impl Checker<'_> {
                             "type annotations are not supported (2.3)",
                         );
                     }
-                    if default.is_some() {
+                    if let Some(default) = default {
                         self.error(
                             StarCode::UnsupportedSyntax,
                             param.span,
                             "default parameter values are not supported (2.3)",
                         );
+                        self.expr(default, defining, false);
                     }
                 }
                 ParameterP::Args(..) | ParameterP::KwArgs(..) => self.error(
@@ -590,11 +657,27 @@ impl Checker<'_> {
 
     fn stmt(&mut self, stmt: &AstStmt, scope: &mut Scope) {
         match &stmt.node {
-            StmtP::Break | StmtP::Continue | StmtP::Pass => {}
+            StmtP::Pass => {}
+            // A jump carries the bindings to the loop's exit or head; what follows it in the
+            // block is not reached.
+            StmtP::Break | StmtP::Continue => {
+                if !scope.dead
+                    && let Some(jumps) = self.loops.last_mut()
+                {
+                    let kinds = scope.kinds.clone();
+                    if matches!(stmt.node, StmtP::Break) {
+                        join_jump(&mut jumps.breaks, kinds);
+                    } else {
+                        join_jump(&mut jumps.continues, kinds);
+                    }
+                }
+                scope.dead = true;
+            }
             StmtP::Return(value) => {
                 if let Some(value) = value {
                     self.expr(value, scope, false);
                 }
+                scope.dead = true;
             }
             StmtP::Expression(expr) => self.expr(expr, scope, false),
             StmtP::Assign(assign) => {
@@ -628,49 +711,49 @@ impl Checker<'_> {
             // bindings of every path, the skipped one included.
             StmtP::If(condition, then) => {
                 self.expr(condition, scope, false);
-                let entry = scope.kinds.clone();
+                let (entry, dead) = (scope.kinds.clone(), scope.dead);
                 self.stmt(then, scope);
-                merge(&mut scope.kinds, entry);
+                scope.join(entry, dead);
             }
             StmtP::IfElse(condition, branches) => {
                 self.expr(condition, scope, false);
-                let entry = scope.kinds.clone();
+                let (entry, dead) = (scope.kinds.clone(), scope.dead);
                 self.stmt(&branches.0, scope);
                 let then = std::mem::replace(&mut scope.kinds, entry);
+                let then_dead = std::mem::replace(&mut scope.dead, dead);
                 self.stmt(&branches.1, scope);
-                merge(&mut scope.kinds, then);
+                if scope.dead {
+                    scope.kinds = then;
+                    scope.dead = then_dead;
+                } else {
+                    scope.join(then, then_dead);
+                }
             }
             StmtP::For(for_) => {
                 // The iterable is evaluated once, with the bindings before the loop.
                 self.expr(&for_.over, scope, false);
-                let entry = scope.kinds.clone();
-                if self.quiet > 0 {
-                    // A loop inside a body walked quietly takes one pass: the loop around it
-                    // repeats that walk until nothing changes, which repeats this pass as well.
-                    // A fixpoint per level would cost passes exponential in the nesting depth.
-                    self.loop_body(&for_.var, &for_.body, scope);
-                    merge(&mut scope.kinds, entry);
+                if scope.dead {
+                    // A loop that is never reached is checked for its syntax only.
+                    if self.quiet == 0 {
+                        let entry = scope.kinds.clone();
+                        self.loops.push(Jumps::default());
+                        self.loop_body(&for_.var, &for_.body, scope);
+                        self.loops.pop();
+                        scope.kinds = entry;
+                        scope.dead = true;
+                    }
                     return;
                 }
-                // A pass sees the bindings before the loop and those a previous pass leaves, so
-                // these are found first without reporting; the body is then checked once.
-                let mut state = entry;
-                loop {
-                    scope.kinds = state.clone();
-                    self.quiet += 1;
+                let state = self.loop_state(stmt.span.begin().get(), &for_.var, &for_.body, scope);
+                if self.quiet == 0 {
+                    // The body is checked once, with every binding a pass can start from.
+                    scope.kinds = state.head;
+                    self.loops.push(Jumps::default());
                     self.loop_body(&for_.var, &for_.body, scope);
-                    self.quiet -= 1;
-                    let mut next = state.clone();
-                    merge(&mut next, std::mem::take(&mut scope.kinds));
-                    if next == state {
-                        break;
-                    }
-                    state = next;
+                    self.loops.pop();
                 }
-                scope.kinds = state.clone();
-                self.loop_body(&for_.var, &for_.body, scope);
-                // The loop may run no pass at all.
-                merge(&mut scope.kinds, state);
+                scope.kinds = state.exit;
+                scope.dead = false;
             }
             StmtP::Def(def) => {
                 self.error(
@@ -686,6 +769,58 @@ impl Checker<'_> {
                 "`load` is not allowed (2.3)",
             ),
         }
+    }
+
+    /// Walks a loop's body quietly until the bindings at the start of a pass stop changing. A
+    /// pass starts from the bindings before the loop, at the end of a pass or at a `continue`;
+    /// the loop ends with those or at a `break`.
+    fn loop_state(
+        &mut self,
+        at: u32,
+        var: &AstAssignTarget,
+        body: &AstStmt,
+        scope: &mut Scope,
+    ) -> LoopState {
+        let mut entry: Vec<(String, Kinds)> =
+            scope.kinds.iter().map(|(n, k)| (n.clone(), *k)).collect();
+        entry.sort();
+        let key = (at, entry);
+        if let Some(state) = self.loop_states.get(&key) {
+            return state.clone();
+        }
+        let mut head = scope.kinds.clone();
+        let mut breaks = None;
+        loop {
+            scope.kinds = head.clone();
+            scope.dead = false;
+            self.quiet += 1;
+            self.loops.push(Jumps::default());
+            self.loop_body(var, body, scope);
+            let jumps = self.loops.pop().unwrap_or_default();
+            self.quiet -= 1;
+            let mut next = head.clone();
+            if !scope.dead {
+                merge(&mut next, std::mem::take(&mut scope.kinds));
+            }
+            if let Some(continues) = jumps.continues {
+                merge(&mut next, continues);
+            }
+            if let Some(found) = jumps.breaks {
+                join_jump(&mut breaks, found);
+            }
+            if next == head {
+                break;
+            }
+            head = next;
+        }
+        // The loop ends when its iterable runs out, at the head, or at a `break`.
+        let mut exit = head.clone();
+        if let Some(breaks) = breaks {
+            merge(&mut exit, breaks);
+        }
+        let state = LoopState { head, exit };
+        self.loop_states.insert(key, state.clone());
+        state
     }
 
     /// One pass of a `for` body: the target is bound to an element, which is not known to be a
@@ -736,7 +871,10 @@ impl Checker<'_> {
 
     /// Whether `expr` is the `diag` module, not a name that hides it.
     fn is_diag(&self, expr: &AstExpr, scope: &Scope) -> bool {
-        is_name(expr, "diag") && !scope.locals.contains("diag") && !self.globals.contains("diag")
+        is_name(expr, "diag")
+            && !scope.locals.contains("diag")
+            && !self.globals.contains("diag")
+            && !self.defs.contains("diag")
     }
 
     /// What `expr` is known to be (see the module documentation).
@@ -771,6 +909,10 @@ impl Checker<'_> {
             ExprP::If(triple) => self
                 .kinds(&triple.1, scope)
                 .union(self.kinds(&triple.2, scope)),
+            // `and` and `or` give one of their operands.
+            ExprP::Op(left, BinOp::And | BinOp::Or, right) => {
+                self.kinds(left, scope).union(self.kinds(right, scope))
+            }
             _ => Kinds::default(),
         }
     }
@@ -892,7 +1034,7 @@ impl Checker<'_> {
                     expr.span,
                     "`lambda` is not allowed; write a top-level `def` (2.3)",
                 );
-                self.params(&lambda.params);
+                self.params(&lambda.params, scope);
                 let mut inner = Scope::enter(scope, scope.name.clone(), &lambda.params, None);
                 self.expr(&lambda.body, &mut inner, false);
             }
@@ -1379,22 +1521,6 @@ fn collect_statements<'a>(stmt: &'a AstStmt, out: &mut Vec<&'a AstStmt>) {
         }
         _ => out.push(stmt),
     }
-}
-
-/// The calls in a top-level constant that can only run from `main`: to `diag` and to the
-/// file's functions.
-fn collect_runtime_calls(expr: &AstExpr, defs: &HashSet<String>, found: &mut Vec<Span>) {
-    if let ExprP::Call(function, _) = &expr.node {
-        let runtime = match &function.node {
-            ExprP::Identifier(name) => defs.contains(&name.node.ident),
-            ExprP::Dot(object, _) => is_name(object, "diag"),
-            _ => false,
-        };
-        if runtime {
-            found.push(function.span);
-        }
-    }
-    expr.visit_expr(|inner| collect_runtime_calls(inner, defs, found));
 }
 
 fn is_name(expr: &AstExpr, name: &str) -> bool {

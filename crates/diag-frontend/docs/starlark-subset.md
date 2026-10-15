@@ -408,13 +408,16 @@ position. Lines and columns count from 1; the column counts characters.
   dicts without type inference: dict literals, the responses of `diag.request`, `diag.routine`
   and `diag.read_dtc` (3.4), a response's `"fields"` (not the values in it, nor another dict's
   `"fields"`), and names assigned from those, top-level constants included. A name assigned on
-  only some paths (one branch of an `if`, the body of a `for`, which may run no pass or several)
-  counts as a dict after it when it is one on any path. A parameter or a name a function assigns
-  hides a top-level name or built-in of the same spelling, and is a value that cannot be called
-  (`STAR_FUNCTION_VALUE_NOT_ALLOWED`, like a top-level constant). A call must name a top-level
+  only some paths (one branch of an `if`, the body of a `for`, which may run no pass or several,
+  either operand of `and`, `or` or a conditional expression) counts as a dict after it when it is
+  one on any path. A `break` carries its bindings to the loop's exit and a `continue` to the next
+  pass; what follows a jump or a `return` is still checked but its bindings reach nothing. A
+  parameter or a name a function assigns hides a top-level name or built-in of the same spelling,
+  and is a value that cannot be called (`STAR_FUNCTION_VALUE_NOT_ALLOWED`, like a top-level
+  constant); a top-level `def` or constant named `diag` hides the module as well. A call must name a top-level
   `def`, a built-in of 2.4, a string method of 2.4 or a `diag` function of 3.1; anything else is
   `STAR_BUILTIN_NOT_ALLOWED`. A rejected construct (a `lambda`, a nested `def`, a comprehension,
-  an f-string, a top-level statement) is checked inside as well, so that every violation is
+  an f-string, a top-level statement, a default parameter value) is checked inside as well, so that every violation is
   listed. What needs the declaration part or the
   instruction set (a `fields` key, a flash session, an argument's range, an instruction the IR
   lacks) is checked by the lowering

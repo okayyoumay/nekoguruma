@@ -1097,3 +1097,38 @@ fn nested_defs_under_a_long_name_do_not_repeat_it() {
     assert!(started.elapsed() < std::time::Duration::from_secs(10));
     assert_eq!(errors.len(), 20_000);
 }
+
+#[test]
+fn nested_defs_in_a_loop_are_walked_once() {
+    // A chain of aliases makes the loop's fixpoint take many passes; the nested defs in it,
+    // each holding another, are checked once and numbered once.
+    let count = 512;
+    let mut source = String::from("def main():\n    k = \"a\"\n");
+    for at in 0..=count {
+        source.push_str(&format!("    a{at} = 0\n"));
+    }
+    source.push_str("    # @maxIterations 2\n    for i in range(2):\n");
+    for at in (0..count).rev() {
+        source.push_str(&format!("        a{at} = a{}\n", at + 1));
+    }
+    source.push_str(&format!("        a{count} = {{\"a\": 1}}\n"));
+    for at in 0..count {
+        source.push_str(&format!(
+            "        def g{at}():\n            def h():\n                pass\n"
+        ));
+    }
+    source.push_str("        x = a0[k]\n");
+    let started = std::time::Instant::now();
+    let errors = check("test.star", &source).unwrap_err();
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    let closures = errors
+        .iter()
+        .filter(|e| e.code == StarCode::ClosureNotAllowed)
+        .count();
+    assert_eq!(closures, 2 * count);
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.code == StarCode::DynamicKeyNotAllowed)
+    );
+}

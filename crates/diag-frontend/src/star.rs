@@ -1012,6 +1012,11 @@ impl Checker<'_> {
                 scope.dead = false;
             }
             StmtP::Def(def) => {
+                // A nested `def` is a scope of its own and changes no binding around it, so a
+                // quiet pass skips it; the reporting pass checks it once.
+                if self.quiet > 0 {
+                    return;
+                }
                 self.error(
                     StarCode::ClosureNotAllowed,
                     def.name.span,

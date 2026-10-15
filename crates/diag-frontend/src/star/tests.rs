@@ -946,3 +946,36 @@ fn many_annotations_are_looked_up_in_logarithmic_time() {
     assert_eq!(checked.annotations.len(), 20_000);
     assert!(started.elapsed() < std::time::Duration::from_secs(10));
 }
+
+#[test]
+fn a_snippet_of_a_long_line_is_bounded() {
+    let entries = 20_000;
+    let source = format!(
+        "def main():\n    x = [{}]\n",
+        vec!["None"; entries].join(", ")
+    );
+    let errors = check("test.star", &source).unwrap_err();
+    assert_eq!(errors.len(), entries);
+    assert!(
+        errors
+            .iter()
+            .all(|e| e.snippet.chars().count() == SNIPPET_CHARS)
+    );
+    // Each snippet shows its own violation.
+    for error in [&errors[0], &errors[entries / 2], &errors[entries - 1]] {
+        assert!(error.snippet.contains("None"));
+    }
+    // A short line is kept whole.
+    let short = check("test.star", "def main():\n    x = None\n").unwrap_err();
+    assert_eq!(short[0].snippet, "    x = None");
+}
+
+#[test]
+fn a_snippet_window_keeps_whole_characters() {
+    // A long line of multi-byte characters, with the violation at its end.
+    let source = format!("def main():\n    x = \"{}\" + None\n", "é".repeat(400));
+    let errors = check("test.star", &source).unwrap_err();
+    let snippet = &errors[0].snippet;
+    assert_eq!(snippet.chars().count(), SNIPPET_CHARS);
+    assert!(snippet.ends_with("+ None"));
+}

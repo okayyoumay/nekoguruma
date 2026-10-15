@@ -106,7 +106,8 @@ pub struct StarError {
     pub line: u32,
     /// 1-based column, in characters.
     pub column: u32,
-    /// The source line, without its line end.
+    /// The source line, without its line end; of a line longer than [`SNIPPET_CHARS`]
+    /// characters, only that many around the column.
     pub snippet: String,
     /// What is wrong, for a person.
     pub hint: String,
@@ -284,7 +285,7 @@ fn syntax_error(file: &str, source: &str, error: &starlark_syntax::Error) -> Sta
             file: file.to_owned(),
             line: 1,
             column: 1,
-            snippet: source.lines().next().unwrap_or_default().to_owned(),
+            snippet: snippet(source.lines().next().unwrap_or_default(), 0),
             hint: error.without_diagnostic().to_string(),
         };
     };
@@ -306,9 +307,57 @@ fn syntax_error(file: &str, source: &str, error: &starlark_syntax::Error) -> Sta
         file: file.to_owned(),
         line: to_u32(resolved.begin.line + 1),
         column: to_u32(resolved.begin.column + 1),
-        snippet: span.file.source_line(resolved.begin.line).to_owned(),
+        snippet: snippet(
+            span.file.source_line(resolved.begin.line),
+            line_offset(&span.file, span.span),
+        ),
         hint,
     }
+}
+
+/// The longest snippet an error carries, in characters, so that many violations on one long line
+/// do not each copy the whole line.
+pub const SNIPPET_CHARS: usize = 160;
+
+/// The part of `line` an error at the byte `offset` in it shows: all of it when it is short,
+/// otherwise [`SNIPPET_CHARS`] characters around the offset. Only those characters are visited,
+/// so many errors on one long line cost what their snippets do.
+fn snippet(line: &str, offset: usize) -> String {
+    if line.len() <= SNIPPET_CHARS {
+        return line.to_owned();
+    }
+    let mut offset = offset.min(line.len());
+    while !line.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    let before: Vec<usize> = line[..offset]
+        .char_indices()
+        .rev()
+        .take(SNIPPET_CHARS)
+        .map(|(at, _)| at)
+        .collect();
+    let after: Vec<usize> = line[offset..]
+        .char_indices()
+        .take(SNIPPET_CHARS + 1)
+        .map(|(at, _)| offset + at)
+        .collect();
+    let after_chars = after.len().min(SNIPPET_CHARS);
+    // Half the window before the offset, more when the line ends sooner after it.
+    let back = before
+        .len()
+        .min((SNIPPET_CHARS / 2).max(SNIPPET_CHARS - after_chars));
+    let start = if back == 0 { offset } else { before[back - 1] };
+    let end = after
+        .get(SNIPPET_CHARS - back)
+        .copied()
+        .unwrap_or(line.len());
+    line[start..end].to_owned()
+}
+
+/// The byte offset of `span`'s start within its line.
+fn line_offset(file: &starlark_syntax::codemap::CodeMap, span: Span) -> usize {
+    let line = file.find_line(span.begin());
+    (span.begin().get() - file.line_span(line).begin().get()) as usize
 }
 
 fn to_u32(n: usize) -> u32 {
@@ -500,7 +549,10 @@ impl Checker<'_> {
             file: self.file.to_owned(),
             line: to_u32(resolved.begin.line + 1),
             column: to_u32(resolved.begin.column + 1),
-            snippet: file_span.file.source_line(resolved.begin.line).to_owned(),
+            snippet: snippet(
+                file_span.file.source_line(resolved.begin.line),
+                line_offset(&file_span.file, span),
+            ),
             hint: hint.into(),
         });
     }

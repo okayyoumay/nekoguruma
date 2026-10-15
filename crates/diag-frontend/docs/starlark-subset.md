@@ -360,7 +360,9 @@ A syntax error is different: the parser (6) stops at the first one and returns n
 that does not parse reports that single error (`STAR_SYNTAX_ERROR`, or
 `STAR_UNBOUNDED_NOT_ALLOWED` when the parser stops at `while`, which it reads as a reserved word).
 Subset validation runs on a file that parses and lists every violation it finds, sorted by
-position. Lines and columns count from 1; the column counts characters.
+position. Lines and columns count from 1; the column counts characters. The snippet is the
+source line; of a line longer than 160 characters it is the 160 characters around the column, so
+that many violations on one long line stay small.
 
 ```json
 {

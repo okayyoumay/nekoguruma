@@ -1663,3 +1663,122 @@ fn services_one_call_cannot_tell_apart_are_rejected() {
         ]
     );
 }
+
+#[test]
+fn field_rules_report_each_cell_once_and_follow_the_ir() {
+    const L: &str = "layout:watchdogReset";
+    let rows = [
+        // A width that would overflow the status-layout sum is a bad width, no panic.
+        "layout:dtcStatus,x,0,1,uint,4294967295".to_owned(),
+        // A leading length prefix may start at any bit.
+        format!("{L},s,,3,ascii,8,leading"),
+        format!("{L},u,,,unicode2,,terminated,3,,,,,,,,5"),
+        format!("{L},v,,,uint,8,terminated"),
+        format!("{L},w,,,uint,8,,,,,,,,,,4"),
+        format!("{L},w2,,,uint,8,,,end"),
+        format!("{L},y,,,ascii,,leading"),
+    ];
+    let rows: Vec<&str> = rows.iter().map(String::as_str).collect();
+    assert_eq!(
+        field_errors(&rows, &[]),
+        vec![
+            row(BadValue, 0, "bits"),
+            row(IrRule, 2, "max_bytes"),
+            row(IrRule, 2, "min_bytes"),
+            row(BadValue, 3, "bits"),
+            row(IrRule, 3, "length"),
+            row(BadValue, 4, "max_bytes"),
+            row(BadValue, 5, "terminator"),
+            row(MissingColumn, 6, "bits"),
+        ]
+    );
+}
+
+#[test]
+fn every_container_that_is_sent_is_checked_once_per_cause() {
+    assert_eq!(
+        field_errors(
+            &[
+                // A missing width is reported; the next field's position is not.
+                "request:d1,a,0,,uint",
+                "request:d1,v,1,,uint,8",
+                "request:d2,sub,0,,uint,8,,,,,,0x01",
+                "request:d2,v,2,,uint,8",
+                // After a value of variable length, no field has a known position.
+                "request:d3,a,,,ascii,8,leading",
+                "request:d3,b,,,uint,8",
+                "request:d3,c,5,,uint,8",
+                // A routine request and the record of a DID with a write service are sent.
+                "routine:eraseMemory:start:request,a,,4,uint,8",
+                "did:vin,extra,20,,uint,8",
+                // The record of a DID without one is not.
+                "did:powerCycles,gap,10,,uint,8",
+            ],
+            &[",d1,0xA1", ",d2,0xA2", ",d3,0xA3"],
+        ),
+        vec![
+            row(MissingColumn, 0, "bits"),
+            row(Unsupported, 3, "byte"),
+            row(Unsupported, 6, "byte"),
+            row(Unsupported, 7, "bit"),
+            row(Unsupported, 8, "byte"),
+        ]
+    );
+}
+
+#[test]
+fn constants_are_compared_by_value_across_services() {
+    let rows = [
+        "request:a16,sub,,,uint,16,,,,,,0x0001",
+        "request:b8,sub,,,uint,8,,,,,,0x101",
+        "request:bytesSub,sub,,,bytes,8,,,,,,01",
+        "request:writeVin,did,,,uint,16,,,,,,0xF190",
+        "request:writeVin,vin,,,ascii,136",
+        "request:routineLike,sub,,,uint,8,,,,,,0x01",
+        "request:routineLike,rid,,,uint,16,,,,,,0xFF00",
+    ];
+    let (files, first) = with_fields(
+        &rows,
+        &[
+            ",a16,0x10",
+            ",b8,0x10",
+            ",bytesSub,0x10",
+            ",writeVin,0x2E",
+            ",routineLike,0x31",
+        ],
+    );
+    assert_eq!(
+        resolved(files),
+        vec![
+            // A broken constant is reported once, with no clash made up from it.
+            at(BadValue, "fields.csv", Some(first + 1), Some("const")),
+            // 0x0001 in 16 bits is the value 1, as is defaultSession's 0x01.
+            at(Duplicate, "services.csv", Some(6), Some("name")),
+            // The same request fields as the generated vin.write.
+            at(Duplicate, "services.csv", Some(9), Some("name")),
+        ]
+    );
+}
+
+#[test]
+fn a_counted_repeat_counts_with_a_fixed_number() {
+    let (mut files, first) = with_fields(
+        &[
+            "response:rr,cnt,,,ascii,8",
+            "response:rr,items,,,,,,,,,,,repeat,dtcRecord,cnt",
+        ],
+        &[",rr,0xB1"],
+    );
+    files.retain(|(n, _)| n != "repeats.csv");
+    files.push((
+        "repeats.csv".into(),
+        b"container,field,count\n\
+          response:readDtcByStatusMask,records,end\n\
+          response:rr,items,field\n"
+            .to_vec(),
+    ));
+    assert_eq!(
+        resolved(files),
+        vec![at(BadValue, "fields.csv", Some(first + 1), Some("ref"))]
+    );
+}

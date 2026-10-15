@@ -115,7 +115,7 @@ impl<'a> Checker<'a> {
     }
 
     /// What a `ref` may name (5.2): never a constant, which has no IR field, nor a shaped field;
-    /// for a `field` length, a fixed `uint`, `int` or `bcd` with an identity or linear
+    /// for a `field` length or a counted repeat, a fixed `uint`, `int` or `bcd` with an identity or linear
     /// conversion.
     fn reference(&mut self, f: &FieldRow) {
         let Some(name) = &f.reference else {
@@ -138,7 +138,7 @@ impl<'a> Checker<'a> {
                 "ref",
                 format!("{name} is a shaped field, not a value"),
             );
-        } else if f.shape.is_none() && f.length == Some(Length::Field) {
+        } else if self.counts(f) {
             let numeric = matches!(
                 target.field_type,
                 Some(FieldType::Uint | FieldType::Int | FieldType::Bcd)
@@ -157,11 +157,23 @@ impl<'a> Checker<'a> {
                     f,
                     "ref",
                     format!(
-                        "the length field {name} must be a fixed uint, int or bcd with an \
-                         identity or linear conversion"
+                        "the length or count field {name} must be a fixed uint, int or bcd with \
+                         an identity or linear conversion"
                     ),
                 );
             }
+        }
+    }
+
+    /// Whether `f`'s `ref` holds a length (a `field` length) or a count (a `repeat` counted by
+    /// a field).
+    fn counts(&self, f: &FieldRow) -> bool {
+        match f.shape {
+            None => f.length == Some(Length::Field),
+            Some(Shape::Repeat) => self.t.repeats.iter().any(|r| {
+                r.container == f.container && r.field == f.name && r.count == RepeatCount::Field
+            }),
+            Some(_) => false,
         }
     }
 
@@ -172,6 +184,14 @@ impl<'a> Checker<'a> {
         };
         let length = f.length.unwrap_or(Length::Fixed);
         let strings = string_like(ty);
+        if matches!(length, Length::Leading | Length::Terminated) && !strings {
+            self.field_error(
+                ErrorCode::IrRule,
+                f,
+                "length",
+                "only bytes and strings take a leading length or a terminator".into(),
+            );
+        }
         match length {
             Length::Fixed => match f.bits {
                 None => self.field_error(
@@ -182,12 +202,6 @@ impl<'a> Checker<'a> {
                 ),
                 Some(bits) => self.width(f, ty, bits),
             },
-            Length::Leading | Length::Terminated if !strings => self.field_error(
-                ErrorCode::IrRule,
-                f,
-                "length",
-                "only bytes and strings take a leading length or a terminator".into(),
-            ),
             Length::Leading => match f.bits {
                 None => self.field_error(
                     ErrorCode::MissingColumn,
@@ -214,8 +228,9 @@ impl<'a> Checker<'a> {
                 }
             }
         }
-        // Bytes and strings, and a terminated value in particular, start at a byte edge.
-        if strings && f.bit != 0 {
+        // Bytes and strings start at a byte edge; only a leading length prefix may start at any
+        // bit, the value itself starting at the next byte edge (`ir.fbs`, `LengthKind`).
+        if strings && length != Length::Leading && f.bit != 0 {
             self.field_error(
                 ErrorCode::BadValue,
                 f,
@@ -224,6 +239,18 @@ impl<'a> Checker<'a> {
             );
         }
         if length == Length::Terminated {
+            if ty == FieldType::Unicode2 {
+                for (column, value) in [("min_bytes", f.min_bytes), ("max_bytes", f.max_bytes)] {
+                    if value.is_some_and(|v| v % 2 != 0) {
+                        self.field_error(
+                            ErrorCode::IrRule,
+                            f,
+                            column,
+                            "a unicode2 value is a whole number of 2-byte characters".into(),
+                        );
+                    }
+                }
+            }
             if let (Some(min), Some(max)) = (f.min_bytes, f.max_bytes)
                 && max != 0
                 && min > max
@@ -454,7 +481,15 @@ impl<'a> Checker<'a> {
 
     /// The fields after the constants of a container that is sent: one encoding each, whole
     /// bytes, one after the other (5.5). `end` is where the constants end, when known.
-    fn request(&mut self, fields: &[&FieldRow], mut end: Option<u64>) {
+    fn request(&mut self, fields: &[&FieldRow], end: Option<u64>) {
+        // Where the previous field ends: a known byte, after a value of variable length, or
+        // unknown because of an error reported elsewhere (which reports nothing more here).
+        enum End {
+            At(u64),
+            Variable,
+            Unknown,
+        }
+        let mut end = end.map_or(End::Unknown, End::At);
         let rest: Vec<&FieldRow> = fields
             .iter()
             .copied()
@@ -466,7 +501,7 @@ impl<'a> Checker<'a> {
             };
             if f.constant.is_some() || f.shape.is_some() {
                 // Reported as a constant out of place, or left to the nested-layout rules.
-                end = None;
+                end = End::Unknown;
                 continue;
             }
             let length = f.length.unwrap_or(Length::Fixed);
@@ -502,21 +537,33 @@ impl<'a> Checker<'a> {
             {
                 unsupported(self, "bits", "a request value is whole bytes wide");
             }
-            if let Some(byte) = f.byte
-                && end != Some(u64::from(byte))
-            {
+            let gap = match (&end, f.byte) {
+                (End::At(at), Some(byte)) => *at != u64::from(byte),
+                (End::Variable, Some(_)) => true,
+                _ => false,
+            };
+            if gap {
                 unsupported(
                     self,
                     "byte",
                     "a request value starts where the previous field ends",
                 );
             }
-            let start = f.byte.map(u64::from).or(end);
-            end = match (length, f.bits) {
-                (Length::Fixed, Some(bits)) if bits.is_multiple_of(8) => {
-                    start.map(|s| s + u64::from(bits / 8))
+            let start = match (f.byte, &end) {
+                (Some(byte), _) => Some(u64::from(byte)),
+                (None, End::At(at)) => Some(*at),
+                (None, _) => None,
+            };
+            let after_variable = matches!(end, End::Variable) && f.byte.is_none();
+            end = match (length, f.bits, start) {
+                (Length::Fixed, Some(bits), Some(start)) if bits.is_multiple_of(8) => {
+                    End::At(start + u64::from(bits / 8))
                 }
-                _ => None,
+                (Length::Leading | Length::Terminated, _, _) => End::Variable,
+                (Length::Fixed, Some(bits), None) if after_variable && bits.is_multiple_of(8) => {
+                    End::Variable
+                }
+                _ => End::Unknown,
             };
         }
     }
@@ -544,7 +591,7 @@ impl<'a> Checker<'a> {
                     );
                 }
                 let fits = matches!(f.length, None | Some(Length::Fixed))
-                    && f.bits.is_some_and(|b| u32::from(f.bit) + b <= 8);
+                    && f.bits.is_some_and(|b| u64::from(f.bit) + u64::from(b) <= 8);
                 if !fits {
                     self.field_error(
                         ErrorCode::BadValue,
@@ -566,19 +613,19 @@ impl<'a> Checker<'a> {
         for f in &t.fields {
             requests.entry(&f.container).or_default().push(f);
         }
-        let names = |container: &Container| -> Option<BTreeMap<String, Option<Vec<u8>>>> {
+        let names = |container: &Container| -> Option<BTreeMap<String, Option<Constant>>> {
             let mut out = BTreeMap::new();
             for f in requests.get(container).into_iter().flatten() {
                 let value = match &f.constant {
                     None => None,
-                    Some(c) => Some(constant_bytes(f, c)?),
+                    Some(c) => Some(constant_value(f, c)?),
                 };
                 out.insert(f.name.clone(), value);
             }
             Some(out)
         };
         // (sid, request fields, the services.csv line of a declared service).
-        type Candidate = (u8, BTreeMap<String, Option<Vec<u8>>>, Option<Line>);
+        type Candidate = (u8, BTreeMap<String, Option<Constant>>, Option<Line>);
         let mut reported = HashSet::new();
         for variant in &definition.variants {
             let mut candidates: Vec<Candidate> = Vec::new();
@@ -590,7 +637,7 @@ impl<'a> Checker<'a> {
             }
             for &i in &variant.dids {
                 let d = &t.dids[i];
-                let did = Some(d.did.to_be_bytes().to_vec());
+                let did = Some(Constant::Integer(u64::from(d.did)));
                 if d.read {
                     let fields = BTreeMap::from([("did".to_owned(), did.clone())]);
                     candidates.push((0x22, fields, None));
@@ -640,16 +687,33 @@ impl<'a> Checker<'a> {
     }
 }
 
-/// A constant's value as the bytes it is written as, or `None` if it does not parse (reported
-/// by the constant rules).
-fn constant_bytes(f: &FieldRow, value: &str) -> Option<Vec<u8>> {
-    let width = usize::try_from(f.bits? / 8).ok()?;
+/// The value a constant holds, as a procedure's parameter would give it (5.3): an integer
+/// for a `uint` constant, bytes for a `bytes` one. Values of the two kinds never match the same
+/// parameter, so they always differ.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Constant {
+    Integer(u64),
+    Bytes(Vec<u8>),
+}
+
+/// A constant's value, or `None` if it breaks a constant rule (reported by those rules), so that
+/// no clash follows from a broken value.
+fn constant_value(f: &FieldRow, value: &str) -> Option<Constant> {
+    let bits = f.bits.filter(|b| b.is_multiple_of(8))?;
     match f.field_type? {
-        FieldType::Uint if (1..=8).contains(&width) => {
-            let v = values::integer(value, false, 0, i128::from(u64::MAX)).ok()? as u64;
-            Some(v.to_be_bytes()[8 - width..].to_vec())
+        FieldType::Uint if (8..=64).contains(&bits) => {
+            let max = if bits == 64 {
+                i128::from(u64::MAX)
+            } else {
+                (1i128 << bits) - 1
+            };
+            let v = values::integer(value, false, 0, max).ok()?;
+            Some(Constant::Integer(u64::try_from(v).ok()?))
         }
-        FieldType::Bytes => values::bytes(value).ok(),
+        FieldType::Bytes => {
+            let bytes = values::bytes(value).ok()?;
+            (bytes.len() as u64 * 8 == u64::from(bits)).then_some(Constant::Bytes(bytes))
+        }
         _ => None,
     }
 }

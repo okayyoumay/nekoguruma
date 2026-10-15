@@ -447,7 +447,10 @@ are (any other is rejected, `CSV_BAD_VALUE`):
 | `bytes`, `ascii`, `utf8` | a multiple of 8, byte-aligned |
 | `unicode2` | a multiple of 16, byte-aligned |
 
-A `leading` length prefix is 1 to 32 bits wide.
+A `leading` length prefix is 1 to 32 bits wide and may start at any bit; the value after it starts
+at the next byte edge. Only `bytes`, `ascii`, `utf8` and `unicode2` take a `leading` or
+`terminated` length, and a `unicode2` field's `min_bytes` and `max_bytes` are even (`ir.fbs`,
+`LengthKind`; `CSV_IR_RULE`).
 
 `ref` never names a constant (it has no IR field) or a shaped field. The field a `length` `field`
 or a `repeat` counted by a field refers to is a `fixed` `uint`, `int` or `bcd` with an `identity`
@@ -514,7 +517,9 @@ key that names a constant must be a constant expression; a value known only at r
 rejected (`STAR_NON_CONSTANT_ARGUMENT`). Since a call names
 every request field of the service it means, two services of one variant with the same SID could
 both match one call only when their request fields have the same names and no name is a constant
-in both with different values; such a pair can never be told apart and is rejected. Services
+in both with different values; such a pair can never be told apart and is rejected. Constants
+are compared by value: a `uint` constant by its integer, whatever its width, and a `bytes`
+constant by its bytes; an integer never equals bytes, since a parameter is one or the other. Services
 whose request field names differ, or that hold one name as constants of different values, are
 always distinguishable.
 

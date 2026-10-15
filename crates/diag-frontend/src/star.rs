@@ -15,7 +15,7 @@
 //! A name assigned on only some paths (one branch of an `if`, the body of a `for`) counts as a
 //! dict after it when it is one on any path.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
 use serde::Serialize;
 use starlark_syntax::codemap::Span;
@@ -1353,31 +1353,17 @@ impl Checker<'_> {
     /// Recursion, direct or through other functions, is reported at each call that closes a
     /// cycle in the call graph (4.1).
     fn recursion(&mut self) {
-        let mut edges: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
-        for call in &self.calls {
-            edges
-                .entry(call.caller.as_str())
-                .or_default()
-                .insert(call.callee.as_str());
-        }
-        // What each function reaches, found once per function rather than once per call.
-        let mut reach: HashMap<&str, HashSet<&str>> = HashMap::new();
+        let component = components(
+            self.calls
+                .iter()
+                .map(|c| (c.caller.as_str(), c.callee.as_str())),
+        );
         let recursive: Vec<(Span, String)> = self
             .calls
             .iter()
             .filter(|call| {
-                let from = call.callee.as_str();
-                let reached = reach.entry(from).or_insert_with(|| {
-                    let mut seen = HashSet::new();
-                    let mut pending = vec![from];
-                    while let Some(name) = pending.pop() {
-                        if seen.insert(name) {
-                            pending.extend(edges.get(name).into_iter().flatten().copied());
-                        }
-                    }
-                    seen
-                });
-                reached.contains(call.caller.as_str())
+                call.caller == call.callee
+                    || component.get(call.caller.as_str()) == component.get(call.callee.as_str())
             })
             .map(|call| (call.span, call.callee.clone()))
             .collect();
@@ -1634,6 +1620,78 @@ fn parse_limit(checker: &mut Checker<'_>, span: Span, value: &str, min: i128) ->
             None
         }
     }
+}
+
+/// The strongly connected component of each function in the call graph `edges` (Tarjan's
+/// algorithm, iterative so that a long call chain cannot exhaust the stack). Two functions share
+/// a component exactly when each reaches the other; time and memory are linear in the graph.
+fn components<'a>(edges: impl Iterator<Item = (&'a str, &'a str)>) -> HashMap<&'a str, usize> {
+    let mut ids: HashMap<&str, usize> = HashMap::new();
+    let mut successors: Vec<Vec<usize>> = Vec::new();
+    for (from, to) in edges {
+        let mut id = |name: &'a str| {
+            let next = ids.len();
+            *ids.entry(name).or_insert_with(|| {
+                successors.push(Vec::new());
+                next
+            })
+        };
+        let (from, to) = (id(from), id(to));
+        successors[from].push(to);
+    }
+    let count = successors.len();
+    let mut index = vec![usize::MAX; count];
+    let mut low = vec![0; count];
+    let mut on_stack = vec![false; count];
+    let mut stack = Vec::new();
+    let mut component = vec![usize::MAX; count];
+    let mut next_index = 0;
+    let mut next_component = 0;
+    for root in 0..count {
+        if index[root] != usize::MAX {
+            continue;
+        }
+        // Each frame is a node and the position of the next successor to visit.
+        let mut frames = vec![(root, 0)];
+        index[root] = next_index;
+        low[root] = next_index;
+        next_index += 1;
+        stack.push(root);
+        on_stack[root] = true;
+        while let Some(&mut (node, ref mut at)) = frames.last_mut() {
+            if let Some(&next) = successors[node].get(*at) {
+                *at += 1;
+                if index[next] == usize::MAX {
+                    index[next] = next_index;
+                    low[next] = next_index;
+                    next_index += 1;
+                    stack.push(next);
+                    on_stack[next] = true;
+                    frames.push((next, 0));
+                } else if on_stack[next] {
+                    low[node] = low[node].min(index[next]);
+                }
+                continue;
+            }
+            frames.pop();
+            if let Some(&(parent, _)) = frames.last() {
+                low[parent] = low[parent].min(low[node]);
+            }
+            if low[node] == index[node] {
+                while let Some(member) = stack.pop() {
+                    on_stack[member] = false;
+                    component[member] = next_component;
+                    if member == node {
+                        break;
+                    }
+                }
+                next_component += 1;
+            }
+        }
+    }
+    ids.into_iter()
+        .map(|(name, id)| (name, component[id]))
+        .collect()
 }
 
 /// Every statement but the `Statements` groupings, in source order.

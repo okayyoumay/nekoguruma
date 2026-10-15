@@ -888,3 +888,31 @@ fn a_typed_star_parameter_reports_the_type_too() {
         ]
     );
 }
+
+#[test]
+fn a_long_chain_of_functions_is_checked_in_linear_time() {
+    // Each function calls the next; what each reaches, kept per function, would be quadratic.
+    let functions = 20_000;
+    let mut source = String::new();
+    for at in 0..functions {
+        source.push_str(&format!("def f{at}():\n    f{}()\n\n", at + 1));
+    }
+    source.push_str(&format!(
+        "def f{functions}():\n    pass\n\ndef main():\n    f0()\n"
+    ));
+    let started = std::time::Instant::now();
+    passes(&source);
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    // Closing the chain into a cycle makes every call in it recursive.
+    let cycle = source.replace(
+        &format!("def f{functions}():\n    pass"),
+        &format!("def f{functions}():\n    f0()"),
+    );
+    let errors = check("test.star", &cycle).unwrap_err();
+    assert_eq!(errors.len(), functions + 1);
+    assert!(
+        errors
+            .iter()
+            .all(|e| e.code == StarCode::UnboundedNotAllowed)
+    );
+}

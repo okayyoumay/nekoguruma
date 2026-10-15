@@ -92,6 +92,10 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@nextest
       - run: cargo fmt --all -- --check
+      # fuzz/ is a workspace of its own whose seeds depend on this workspace's crates, so a
+      # dependency added here can leave fuzz/Cargo.lock stale. The fuzz job runs on main only, so
+      # this resolves the fuzz workspace against its lock on every pull request; nothing is built.
+      - run: cargo metadata --locked --format-version 1 --manifest-path fuzz/Cargo.toml > /dev/null
       - run: cargo nextest run --workspace --locked --profile ci
       # sim-vci is a cdylib only, which cargo runs no doc tests for.
       - run: cargo test --workspace --locked --exclude sim-vci --doc

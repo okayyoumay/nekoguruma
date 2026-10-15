@@ -174,7 +174,9 @@ to save a release build of the agent's dependencies, so a release-only failure s
 Check it locally with `RUSTFLAGS="-D warnings" cargo test -p agent --release --locked` when you
 change `cfg(not(debug_assertions))` code. The `fuzz` job runs the cargo-fuzz targets in `fuzz/` (its
 own workspace, on nightly; `fuzz/README.md`) for 60 seconds each against malformed IR, on main
-only; check a change to the IR or to `fuzz/` locally with the commands there. On pull requests that change only documentation, `work/` or `.claude/`, the
+only; check a change to the IR or to `fuzz/` locally with the commands there. `core-linux` checks on
+every pull request that `fuzz/Cargo.lock` is current (`cargo metadata --locked`), since the fuzz
+seeds depend on this workspace's crates. On pull requests that change only documentation, `work/` or `.claude/`, the
 `changes` job in `ci.yml` skips the build jobs, which then count as passed required checks;
 `repo-checks.yml` always runs. CodeQL (`codeql.yml`, ADR-283) skips the same changes. Do not run cross-target builds locally unless asked; CI covers
 them.

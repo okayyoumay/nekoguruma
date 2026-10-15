@@ -2,7 +2,13 @@
 
 Fuzzing against malformed IR (design 12.1) with [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz),
 which needs a nightly toolchain. This directory is its own Cargo workspace, so the main
-workspace's builds, tests and checks leave it out.
+workspace's builds, tests and checks leave it out. Its lock, `fuzz/Cargo.lock`, also holds the
+dependencies of the main workspace's crates that `seeds` uses, so a change that adds a dependency
+to one of them updates it with `cargo metadata --manifest-path fuzz/Cargo.toml > /dev/null`,
+which adds the missing entries without upgrading the others. New entries take the newest
+compatible versions; `cargo update --manifest-path fuzz/Cargo.toml -p <crate> --precise <version>`
+sets one to the version the main `Cargo.lock` uses. `core-linux` checks the lock on every pull
+request.
 
 | Target | Input | What must hold |
 |---|---|---|

@@ -1782,3 +1782,46 @@ fn a_counted_repeat_counts_with_a_fixed_number() {
         vec![at(BadValue, "fields.csv", Some(first + 1), Some("ref"))]
     );
 }
+
+#[test]
+fn an_error_neither_hides_another_nor_makes_one_up() {
+    assert_eq!(
+        field_errors(
+            &[
+                // A bad width gives no known end, so the next position is not judged.
+                "request:e1,a,0,,uint,72",
+                "request:e1,b,1,,uint,8",
+                "request:e2,sub,0,,uint,72,,,,,,0x01",
+                "request:e2,v,1,,uint,8",
+                // A length source with its own error is not judged again through the ref.
+                "layout:watchdogReset,src,,,uint,8,leading",
+                "layout:watchdogReset,ln,,,ascii,,field,,,,,,,,src",
+                // Every column of a constant is checked, wherever it stands.
+                "response:t8,k,,,uint,8,,,,,millisecond,0x01,group,dtcRecord,,,little",
+                "layout:watchdogReset,kc,,,uint,8,,,,,millisecond,0x01",
+                // A constant's syntax is checked whatever its width.
+                "response:t9,k,,,uint,12,,,,,,bogus",
+                "response:t10,k,,,bytes,12,,,,,,ZZ",
+                // A float's alignment is checked without a width.
+                "layout:watchdogReset,fl,,3,float",
+            ],
+            &[",e1,0x41", ",e2,0x42", ",t8,0x48", ",t9,0x49", ",t10,0x4A"],
+        ),
+        vec![
+            row(BadValue, 0, "bits"),
+            row(BadValue, 2, "bits"),
+            row(IrRule, 4, "length"),
+            row(BadValue, 6, "byte_order"),
+            row(BadValue, 6, "shape"),
+            row(BadValue, 6, "unit"),
+            row(Unsupported, 7, "const"),
+            row(BadValue, 7, "unit"),
+            row(BadValue, 8, "bits"),
+            row(BadValue, 8, "const"),
+            row(BadValue, 9, "bits"),
+            row(BadValue, 9, "const"),
+            row(BadValue, 10, "bit"),
+            row(MissingColumn, 10, "bits"),
+        ]
+    );
+}

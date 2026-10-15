@@ -138,7 +138,8 @@ impl<'a> Checker<'a> {
                 "ref",
                 format!("{name} is a shaped field, not a value"),
             );
-        } else if self.counts(f) {
+        } else if self.counts(f) && !self.source_error(target) {
+            // A source with an error of its own is not judged again through the reference.
             let numeric = matches!(
                 target.field_type,
                 Some(FieldType::Uint | FieldType::Int | FieldType::Bcd)
@@ -163,6 +164,15 @@ impl<'a> Checker<'a> {
                 );
             }
         }
+    }
+
+    /// Whether a field already has an error of this stage in its type, length kind or
+    /// conversion, the cells a length or count source is judged by. The fields are checked in
+    /// row order, so a field a `ref` names, which comes earlier, has been checked.
+    fn source_error(&self, f: &FieldRow) -> bool {
+        ["type", "length", "conversion"]
+            .iter()
+            .any(|column| self.reported.contains(&(FILE, f.line, column)))
     }
 
     /// Whether `f`'s `ref` holds a length (a `field` length) or a count (a `repeat` counted by
@@ -227,6 +237,14 @@ impl<'a> Checker<'a> {
                     );
                 }
             }
+        }
+        if ty == FieldType::Float && f.bit != 0 {
+            self.field_error(
+                ErrorCode::BadValue,
+                f,
+                "bit",
+                "a float starts at a byte edge (bit 0)".into(),
+            );
         }
         // Bytes and strings start at a byte edge; only a leading length prefix may start at any
         // bit, the value itself starting at the next byte edge (`ir.fbs`, `LengthKind`).
@@ -317,32 +335,13 @@ impl<'a> Checker<'a> {
 
     /// The widths a fixed field of each type accepts (5.2).
     fn width(&mut self, f: &FieldRow, ty: FieldType, bits: u32) {
-        let (ok, rule) = match ty {
-            FieldType::Uint | FieldType::Int => ((1..=64).contains(&bits), "1 to 64 bits"),
-            FieldType::Float => (bits == 32 || bits == 64, "32 or 64 bits"),
-            FieldType::Bcd => (
-                bits.is_multiple_of(4) && bits <= 64,
-                "a multiple of 4 bits, up to 64",
-            ),
-            FieldType::Bytes | FieldType::Ascii | FieldType::Utf8 => {
-                (bits.is_multiple_of(8), "a multiple of 8 bits")
-            }
-            FieldType::Unicode2 => (bits.is_multiple_of(16), "a multiple of 16 bits"),
-        };
+        let (ok, rule) = width_rule(ty, bits);
         if !ok {
             self.field_error(
                 ErrorCode::BadValue,
                 f,
                 "bits",
                 format!("a fixed field of this type is {rule} wide"),
-            );
-        }
-        if ty == FieldType::Float && f.bit != 0 {
-            self.field_error(
-                ErrorCode::BadValue,
-                f,
-                "bit",
-                "a float starts at a byte edge (bit 0)".into(),
             );
         }
     }
@@ -391,45 +390,53 @@ impl<'a> Checker<'a> {
             let Some(value) = &f.constant else {
                 continue;
             };
-            if matches!(container, Container::Layout(_)) {
+            let placed = if matches!(container, Container::Layout(_)) {
                 self.field_error(
                     ErrorCode::Unsupported,
                     f,
                     "const",
                     "a layout has no prefix for a constant".into(),
                 );
-                continue;
-            }
-            if i >= leading {
+                false
+            } else if i >= leading {
                 self.field_error(
                     ErrorCode::Unsupported,
                     f,
                     "const",
                     "constants must be the first fields of their container".into(),
                 );
-                continue;
+                false
+            } else {
+                true
+            };
+            // The constant's own columns are checked wherever it stands.
+            let width = self.constant(f, value);
+            if placed {
+                if let (Some(byte), Some(start)) = (f.byte, end)
+                    && u64::from(byte) != start
+                {
+                    self.field_error(
+                        ErrorCode::BadValue,
+                        f,
+                        "byte",
+                        "constants start at byte 0 and follow each other without gaps".into(),
+                    );
+                }
+                let start = f.byte.map(u64::from).or(end);
+                end = start.zip(width).map(|(s, w)| s + u64::from(w / 8));
             }
-            end = self.constant(f, value, end);
         }
         if leading == 0 { Some(0) } else { end }
     }
 
-    /// One leading constant starting at `start` (when known); returns where it ends.
-    fn constant(&mut self, f: &FieldRow, value: &str, start: Option<u64>) -> Option<u64> {
+    /// The columns of one constant (5.3); returns its width when it is a valid one, so that the
+    /// next field's position can be checked.
+    fn constant(&mut self, f: &FieldRow, value: &str) -> Option<u32> {
         let bad = |checker: &mut Self, column: &'static str, hint: &str| {
             checker.field_error(ErrorCode::BadValue, f, column, hint.into());
         };
-        match (f.byte, start) {
-            (Some(byte), Some(start)) if u64::from(byte) != start => bad(
-                self,
-                "byte",
-                "constants start at byte 0 and follow each other without gaps",
-            ),
-            _ => {}
-        }
         if f.shape.is_some() {
             bad(self, "shape", "a constant has no shape");
-            return None;
         }
         if !matches!(f.length, None | Some(Length::Fixed)) {
             bad(self, "length", "a constant has a fixed length");
@@ -448,35 +455,42 @@ impl<'a> Checker<'a> {
         if !f.big_endian {
             bad(self, "byte_order", "constants are written big-endian");
         }
-        let bits = f.bits.filter(|b| b.is_multiple_of(8));
-        if bits.is_none() {
+        let whole = f.bits.filter(|b| b.is_multiple_of(8));
+        if whole.is_none() {
             bad(self, "bits", "a constant is a whole number of bytes wide");
         }
-        match (f.field_type, bits) {
-            (Some(FieldType::Uint), Some(bits)) if bits <= 64 => {
-                let max = if bits == 64 {
-                    i128::from(u64::MAX)
-                } else {
-                    (1i128 << bits) - 1
+        // The value's syntax is checked whatever the width; its size only against a valid one.
+        let width = match f.field_type {
+            Some(FieldType::Uint) => {
+                let width = whole.filter(|b| (8..=64).contains(b));
+                let max = match width {
+                    Some(64) | None => i128::from(u64::MAX),
+                    Some(bits) => (1i128 << bits) - 1,
                 };
                 if let Err(hint) = values::integer(value, false, 0, max) {
                     bad(self, "const", &hint);
                 }
+                width
             }
-            (Some(FieldType::Bytes), Some(bits)) => match values::bytes(value) {
-                Ok(bytes) if bytes.len() as u64 * 8 == u64::from(bits) => {}
-                Ok(bytes) => bad(
-                    self,
-                    "const",
-                    &format!("{} bytes for a field of {} bytes", bytes.len(), bits / 8),
-                ),
-                Err(hint) => bad(self, "const", &hint),
-            },
-            (Some(FieldType::Uint | FieldType::Bytes), _) => {}
-            _ => bad(self, "type", "a constant is a uint or bytes"),
-        }
-        let start = f.byte.map(u64::from).or(start)?;
-        bits.map(|b| start + u64::from(b / 8))
+            Some(FieldType::Bytes) => {
+                match (values::bytes(value), whole) {
+                    (Err(hint), _) => bad(self, "const", &hint),
+                    (Ok(bytes), Some(bits)) if bytes.len() as u64 * 8 != u64::from(bits) => bad(
+                        self,
+                        "const",
+                        &format!("{} bytes for a field of {} bytes", bytes.len(), bits / 8),
+                    ),
+                    _ => {}
+                }
+                whole
+            }
+            _ => {
+                bad(self, "type", "a constant is a uint or bytes");
+                None
+            }
+        };
+        let fixed = f.shape.is_none() && matches!(f.length, None | Some(Length::Fixed));
+        width.filter(|_| fixed)
     }
 
     /// The fields after the constants of a container that is sent: one encoding each, whole
@@ -556,11 +570,11 @@ impl<'a> Checker<'a> {
             };
             let after_variable = matches!(end, End::Variable) && f.byte.is_none();
             end = match (length, f.bits, start) {
-                (Length::Fixed, Some(bits), Some(start)) if bits.is_multiple_of(8) => {
+                (Length::Fixed, Some(bits), Some(start)) if whole_width(f, bits) => {
                     End::At(start + u64::from(bits / 8))
                 }
                 (Length::Leading | Length::Terminated, _, _) => End::Variable,
-                (Length::Fixed, Some(bits), None) if after_variable && bits.is_multiple_of(8) => {
+                (Length::Fixed, Some(bits), None) if after_variable && whole_width(f, bits) => {
                     End::Variable
                 }
                 _ => End::Unknown,
@@ -716,4 +730,26 @@ fn constant_value(f: &FieldRow, value: &str) -> Option<Constant> {
         }
         _ => None,
     }
+}
+
+/// Whether a fixed width suits a type, and the rule if not (5.2).
+fn width_rule(ty: FieldType, bits: u32) -> (bool, &'static str) {
+    match ty {
+        FieldType::Uint | FieldType::Int => ((1..=64).contains(&bits), "1 to 64 bits"),
+        FieldType::Float => (bits == 32 || bits == 64, "32 or 64 bits"),
+        FieldType::Bcd => (
+            bits.is_multiple_of(4) && bits <= 64,
+            "a multiple of 4 bits, up to 64",
+        ),
+        FieldType::Bytes | FieldType::Ascii | FieldType::Utf8 => {
+            (bits.is_multiple_of(8), "a multiple of 8 bits")
+        }
+        FieldType::Unicode2 => (bits.is_multiple_of(16), "a multiple of 16 bits"),
+    }
+}
+
+/// Whether a fixed field `bits` wide is valid for its type and whole bytes, so that it has a
+/// known end.
+fn whole_width(f: &FieldRow, bits: u32) -> bool {
+    bits.is_multiple_of(8) && f.field_type.is_some_and(|ty| width_rule(ty, bits).0)
 }

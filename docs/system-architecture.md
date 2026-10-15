@@ -893,9 +893,9 @@ flowchart LR
 
 | Supported | Excluded (error at ingestion) |
 |---|---|
-| Assignment, arithmetic, logic, comparison | `lambda`, nested `def` (closures), functions as values |
+| Assignment, arithmetic, logic, comparison | Nested `def` and a `lambda` that captures a local (closures); functions as values other than those allowed on the left |
 | `if` / `elif` / `else`, `for` over a finite sequence, `break` / `continue` | `while` and recursion (not in base Starlark) |
-| Top-level `def` and calls to it | `load` (one file per procedure) |
+| Top-level `def` and calls to it; a capture-free `lambda` bound to a name or passed to a top-level `def`, resolved at ingestion by specialization (ADR-300) | `load` (one file per procedure) |
 | Bytes literals; constant lists; dict literals as API parameters and literal-key access to responses | Comprehensions, `None`, `*args` / `**kwargs`, keyword and default parameters |
 | Diagnostic primitive API calls | `fail`, `print` and reflection built-ins (replaced by `diag.fail` and `diag.log`) |
 | Built-in string, number and bytes functions (limited list) | Type annotations (not base Starlark), `set` |

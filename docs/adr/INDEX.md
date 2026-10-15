@@ -243,7 +243,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-251](ADR-251-copilot-re-review-only-after-fixes-that-need-it.md) | Copilot Re-Review Only After Fixes That Need It | Accepted | `.claude/skills/pr-review-loop` (Steps 0, 4-5), `.github/copilot-instructions.md`, `CLAUDE.md` |
 | [ADR-252](ADR-252-job-runner-journals-at-plan-boundaries.md) | The Job Runner Journals at the Flash Recovery Plan's Boundaries | Accepted (item 2's open point decided by ADR-253; the step reaching a plan's end records the VM state since ADR-271, a step from inside the plan only since ADR-274; item 6 superseded by ADR-272; item 2 extended by ADR-291: a `RecoveryRequired` section outside the plans gets an intent ahead of its first primitive; item 7 amended by ADR-293: a program with a `RecoveryRequired` section keeps a journal without a plan too) | `agent` runner, journaling, inputs |
 | [ADR-253](ADR-253-restart-classification-and-the-recovery-point-intent.md) | Restart Classification and a Write-Ahead Intent at the Recovery-Required Point | Accepted (item 4's wiring into the runner decided by ADR-255; item 3's newest state includes the run start since ADR-272; item 3's entry-state read-back follows ADR-274 since the end state exists; item 3's step limit applies per run since ADR-287; item 1's intent is also written ahead of a `RecoveryRequired` section outside the plans since ADR-291) | `agent` restart, journaling, journal |
-| [ADR-254](ADR-254-starlark-for-proprietary-procedures.md) | Starlark Replaces JavaScript as the Proprietary Procedure Language | Accepted (`diag.fail` has an instruction since ADR-280) | `diag-frontend` subset spec, design 8.4, `ir.fbs` `source_format` |
+| [ADR-254](ADR-254-starlark-for-proprietary-procedures.md) | Starlark Replaces JavaScript as the Proprietary Procedure Language | Accepted (`diag.fail` has an instruction since ADR-280; Decision item 4's ban on `lambda` and functions as values narrowed by ADR-300) | `diag-frontend` subset spec, design 8.4, `ir.fbs` `source_format` |
 | [ADR-255](ADR-255-restart-entry-in-the-job-runner.md) | The Restart Entry in the Job Runner | Accepted (item 5's "locks not taken" and the duplicate-resume consequence superseded by ADR-256; item 5's "nothing sent to the ECU" superseded by ADR-261; item 5's teardown that does not run superseded by ADR-264; item 3 amended and the stale-entry-state consequence closed by ADR-272; item 5's ending in `RestartOrderUnavailable` superseded by ADR-273 item 4 and then ADR-276, which goes on with the erase; the step-limit consequence superseded by ADR-287, which counts each run's own steps) | `agent` runner, restart, journaling |
 | [ADR-256](ADR-256-restart-guards-as-os-file-locks.md) | Restart Guards as OS Locks on Files in a Device Lock Directory | Accepted (the first-run consequence and item 1's write access to lock files superseded by ADR-257; the failed-close consequence superseded by ADR-258; item 6's per-vehicle lock settled by ADR-262) | `agent` guards, runner |
 | [ADR-257](ADR-257-every-job-runs-on-guards.md) | Every Job Runs on Guards It Holds | Accepted (lock files must be regular files since ADR-262 item 6) | `agent` guards, runner, policy, CLI |
@@ -289,6 +289,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-297](ADR-297-a-flat-positive-response-is-decoded-as-odx-extracts-a-parameter.md) | A Flat Positive Response Is Decoded as ODX Extracts a Parameter | Accepted | `diag-ir` response decoder; design 8.2.2 |
 | [ADR-298](ADR-298-csv-definition-errors-are-reported-in-two-stages.md) | CSV Definition Errors Are Reported in Two Stages | Accepted | `diag-frontend` CSV table reader error reporting |
 | [ADR-299](ADR-299-iso22900-mock-answers-from-sim-ecu.md) | iso22900-mock Answers ComPrimitives from sim-ecu | Accepted | `iso22900-mock` ComPrimitive events, `__mock_sim_ecu_control`, `NGR_SIM_ECU_CONFIG` |
+| [ADR-300](ADR-300-capture-free-lambdas-in-starlark-procedures.md) | Capture-Free Lambdas in Starlark Procedures | Accepted | `diag-frontend` Starlark subset spec, design 8.4 |
 
 ## Status Legend
 
@@ -681,13 +682,14 @@ the predecessor repository these ADRs came from.
 - ADR-233 (item 3's `VmState` fields removed by ADR-245; `Op::Fail` and `StepOutcome::Failed` appended by ADR-280)
 - ADR-242
 - ADR-245 (items 4 and 6 amended by ADR-250)
-- ADR-254 (`diag.fail` has an instruction since ADR-280)
+- ADR-254 (`diag.fail` has an instruction since ADR-280; Decision item 4's ban on `lambda` and functions as values narrowed by ADR-300)
 - ADR-280 (schema-compatibility consequence relaxed by ADR-281 item 4; the terminal-record rule extended to the restart's identity abort by ADR-286; the open consequence on the step limit and a VM error decided by ADR-288, which journals both as terminal)
 - ADR-281
 - ADR-295 (item 11 amended by ADR-298)
 - ADR-296
 - ADR-297
 - ADR-298
+- ADR-300
 
 ### Acquired Data & Monitoring
 - ADR-236

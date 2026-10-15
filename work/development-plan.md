@@ -45,7 +45,7 @@ M5 and M6 do not depend on each other; M6 comes first (maintainer's decision, 20
 
 **Hardware checks to implement (design 13.5; running them on hardware is optional).**
 
-- The harness the checks run in: the hardware profile named by `NGR_HW_PROFILE` and its parser, the static check declarations and the listing of the checks a profile permits, the `hardware` nextest profile, the guarded VCI handle with its cleanup (including the seam in the agent's job runner that hands it a guarded worker client) for read-only checks, refusing every state-changing request and hardware control, and the report writer.
+- The harness the checks run in: the hardware profile named by `NGR_HW_PROFILE` and its parser, the static check declarations and the listing of the checks a profile permits, the `hardware` nextest profile, the guarded VCI handle with its cleanup (including the seam in the agent's job runner that hands it a guarded worker client) for read-only checks, refusing state-changing requests on T2 and T3 and every hardware control, and the report writer.
 - T0: for each OS and worker ABI the vendor ships a J2534 library for (Windows x86_64 and i686, Linux x86_64 and i686, and Linux ARM where offered), the library is found the way that OS finds it (the Windows registry; the registration definition in `/etc/nekoguruma/j2534/` on Linux, design 7.1, 7.1.1), opens, connects two CAN endpoints and passes loopback frames. On Linux this also checks the ABI and `unsigned long` width of design 7.1.2.
 - T2/T3: the read parts of exit criterion 1's CSV + Starlark definition (variant identification, DIDs, DTC read), with the definition for the bench ECU or vehicle named by the profile, run through a J2534 VCI and through a D-PDU API VCI (the first real use of the D-PDU worker). The routine waits for M6, when section 6's controls for it exist (design 13.5).
 - T2: the session timing (P2 / P2*) the bench ECU reports and the response times measured through a real VCI, compared with the values `sim-ecu` uses (ISO 14229-2 (2021) 9.2).
@@ -108,7 +108,7 @@ M5 and M6 do not depend on each other; M6 comes first (maintainer's decision, 20
 
 - T1: the clause 16 reprogramming sequence with a real VCI against the stand-in ECU, with power cut through the host-controlled switch during the transfer.
 - T1 (carried over from M1 and M3): the interrupted write of M1 and a configuration write created through the Web API, with a real J2534 VCI against the stand-in ECU, and the VCI-disconnect fault produced by unplugging the VCI when the check asks for it, instead of by `sim-vci`.
-- The guard's authorized-job path: on T1 and T2, state-changing requests and listed hardware controls pass only from an authorized job, checked against what the job declares (design 13.5).
+- The rest of the guard (design 13.5): on T1, a hardware control passes when the profile lists it with its complete parameters and the request matches them; on T2, state-changing requests and listed hardware controls pass only from an authorized job, checked against what the job declares.
 - T2: a configuration write and reprogramming of an ECU the profile declares expendable, once this milestone's approval levels exist, and only after the 8.9.1 checks pass.
 - T2: the configuration write above unlocks the bench ECU through the real seed/key or OEM authentication path (8.10), where an algorithm or account is available.
 

@@ -433,9 +433,9 @@ fn stop_delivery_thread(mut guard: MutexGuard<'_, MockState>) {
         return;
     };
     if thread.thread().id() == std::thread::current().id() {
-        // `PDUDestruct` from inside the callback, which ISO 22900-2 (2022) does not allow: the
-        // thread cannot wait for itself, so it keeps the stop flag and ends once the callback
-        // returns.
+        // `PDUDestruct` from inside the callback, where ISO 22900-2 (2022) permits only
+        // `PDUGetEventItem` (8.2.4.2, 8.4.22.1): the thread cannot wait for itself, so it keeps
+        // the stop flag and ends once the callback returns.
         *delivery_thread().lock().expect("delivery thread poisoned") = Some(thread);
         return;
     }

@@ -1576,3 +1576,60 @@ async fn com_primitives_are_answered_by_the_simulated_ecu() {
         .await
         .expect("the worker shuts down while a response is due");
 }
+
+/// A ComPrimitive that waits behind another reaches the ECU only when it begins, so the ECU's
+/// timers run from then (ADR-299). The session request below waits 500 ms behind the VIN read;
+/// had it reached the ECU at once, its 300 ms session timeout would have run out before its own
+/// response arrived, and the read after it would find the default session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_waiting_com_primitive_reaches_the_ecu_when_it_begins() {
+    let server = TestServer::start().await;
+    let lib_path = iso22900_mock::mock_library_path().expect("mock cdylib should be discoverable");
+    let backdoor = MockBackdoor::open(&lib_path);
+    sim_ecu_control(
+        &backdoor,
+        r#"{"attach":{"config":{"response_delay_ms":500,"s3_server_ms":300}}}"#,
+    );
+    let _attached = AttachedEcu(&backdoor);
+
+    let mut setup_client = server.client().await;
+    let cll_handle = create_default_cll(&mut setup_client).await;
+    let mut stream_client = server.client().await;
+    let mut stream = stream_client
+        .subscribe_event(SubscribeEventRequest {
+            handle: Some(
+                vci_service_interface::subscribe_event_request::Handle::CllHandle(cll_handle),
+            ),
+        })
+        .await
+        .expect("subscribe_event should succeed")
+        .into_inner();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut client = server.client().await;
+
+    start_send_and_receive(&mut client, cll_handle, &[0x22, 0xF1, 0x90], 1).await;
+    start_send_and_receive(&mut client, cll_handle, &[0x10, 0x03], 1).await;
+    let events = events_until_finished(&mut stream, 2).await;
+    assert!(
+        events.iter().any(
+            |(_, seen)| matches!(seen, Seen::Result(bytes) if bytes.starts_with(&[0x50, 0x03]))
+        ),
+        "{events:?}"
+    );
+    let session = send_and_receive(&mut client, &mut stream, cll_handle, &[0x22, 0xF1, 0x86]).await;
+    assert_eq!(
+        session,
+        [
+            Seen::Status(EXECUTING),
+            Seen::Result(vec![0x62, 0xF1, 0x86, 0x03]),
+            Seen::Status(FINISHED)
+        ]
+    );
+
+    drop(stream);
+    drop(stream_client);
+    drop(client);
+    drop(setup_client);
+    server.shutdown().await;
+}

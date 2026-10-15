@@ -51,7 +51,7 @@ unsafe { libloading::Library::new(&lib_path).unwrap().get::<fn()>(b"__mock_reset
 | `PDUModuleConnect` | Always succeeds. |
 | `PDUModuleDisconnect` | Always succeeds. |
 | `PDUGetVersion` | Returns canned version data (`"iso22900-mock"` strings). |
-| `PDUGetStatus` | Returns `PDU_CLLST_ONLINE` for CLL handles; `PDU_MODST_READY` for module handles. For a ComPrimitive handle it reports the status code `PDU_COPST_FINISHED`, or `PDU_COPST_EXECUTING` while the ComPrimitive's events are still scheduled (ADR-299). |
+| `PDUGetStatus` | Returns `PDU_CLLST_ONLINE` for CLL handles; `PDU_MODST_READY` for module handles. For a ComPrimitive handle it reports the status code `PDU_COPST_FINISHED`, `PDU_COPST_IDLE` while the ComPrimitive waits its turn, or `PDU_COPST_EXECUTING` while its events are still to come (ADR-299). |
 | `PDUGetLastError` | Returns `PDU_ERR_EVT_NOERROR` (0). |
 | `PDUGetModuleIds` | Returns a single module entry (`MOCK_MODULE_HANDLE` = 1001). |
 | `PDUGetResourceIds` | Returns a single resource ID (`MOCK_RESOURCE_ID` = 2001). |
@@ -90,7 +90,7 @@ With a `sim-ecu` attached (ADR-299), a `PDU_COPT_SENDRECV` ComPrimitive with req
 
 The control data's cycles decide what is sent and received: with no send cycles nothing reaches the ECU and only the two status items follow; with no receive cycles the request reaches the ECU and only the two status items follow. Any other combination runs as one send and one response, and so does a ComPrimitive without control data.
 
-While an ECU is attached, and while events of an earlier ComPrimitive are still scheduled after it is detached, every ComPrimitive's events (the synthetic completion event of the other ComPrimitive types too) go into one schedule. Each is due at the delay the ECU gives it, counted from when the ComPrimitive begins: at its request, or when the last event already scheduled is due if that is later. So ComPrimitives run one after another and each keeps its own spacing. A delivery thread queues each event when it is due and fires the callback. `PDUConstruct` and a reset discard the schedule; `PDUDestruct` discards it and waits for the delivery thread to end. The receive timeout comes right after the last message the ECU sent, since the mock keeps no ComParams and so has no P2 to wait for. `PDUGetStatus` reports `PDU_COPST_EXECUTING` for a ComPrimitive with events still scheduled. Without an ECU every ComPrimitive gets the synthetic completion event at once.
+While an ECU is attached, and while other ComPrimitives still wait or run after it is detached, a ComPrimitive waits its turn (the synthetic completion event of the other ComPrimitive types too): it begins when the one before it has finished, and only then does its request reach the ECU, so the ECU's timers run from then. Its events are due at the delays the ECU gives them, counted from when it begins. A delivery thread begins each ComPrimitive in turn, queues each event when it is due and fires the callback. `PDUConstruct` and a reset discard waiting ComPrimitives and scheduled events; `PDUDestruct` discards them and waits for the delivery thread to end, so no callback runs after it returns. The receive timeout comes right after the last message the ECU sent, since the mock keeps no ComParams and so has no P2 to wait for. Without an ECU every ComPrimitive gets the synthetic completion event at once.
 
 An ECU is attached in one of two ways:
 
@@ -115,7 +115,7 @@ All back-door functions are exported with C ABI using the `__mock_` prefix.
 
 | Function | Description |
 |----------|-------------|
-| `__mock_sim_ecu_control(command)` | Applies a NUL-terminated JSON command; returns 0 when it applied, 1 otherwise. `{"attach":{}}` attaches an ECU with `sim-vci`'s default configuration, `{"attach":{"config":{...}}}` one with that `sim_ecu::EcuConfig`; `{"detach":{}}` detaches it; `{"inject_fault":{"fault":...}}` arms a `sim_ecu::Fault`, with an optional `"service"` (SID) or `"request"` (byte prefix) to wait for, not both. A fault with no ECU attached returns 1. |
+| `__mock_sim_ecu_control(command)` | Applies a NUL-terminated JSON command; returns 0 when it applied, 1 otherwise. `{"attach":{}}` attaches an ECU with `sim-vci`'s default configuration, `{"attach":{"config":{...}}}` one with the `sim_ecu::EcuConfig` fields given set over that default (for example `{"response_delay_ms":500}`); `{"detach":{}}` detaches it; `{"inject_fault":{"fault":...}}` arms a `sim_ecu::Fault`, with an optional `"service"` (SID) or `"request"` (byte prefix) to wait for, not both. A fault with no ECU attached returns 1. |
 
 ### Call Counters
 

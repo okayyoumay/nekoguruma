@@ -20,8 +20,8 @@ API's own response-pending handling.
 ## Decision
 
 1. **Opt-in ECU.** The mock answers from `sim-ecu` only when an ECU is attached. Tests attach
-   one through the back door `__mock_sim_ecu_control`, a JSON command (`attach` with an optional
-   `sim_ecu::EcuConfig`, `detach`, `inject_fault` with an optional `service` or request prefix,
+   one through the back door `__mock_sim_ecu_control`, a JSON command (`attach` with optional
+   `sim_ecu::EcuConfig` fields set over `sim-vci`'s default configuration, `detach`, `inject_fault` with an optional `service` or request prefix,
    as `sim-vci`'s control commands take them). A process that loads the mock as a vendor
    library attaches one at `PDUConstruct` when `NGR_SIM_ECU_CONFIG` names a configuration file,
    the variable `sim-vci` reads; a file that cannot be read or parsed fails `PDUConstruct`.
@@ -42,18 +42,19 @@ API's own response-pending handling.
    items, as they do when the D-PDU API's handling of NRC 0x78 is switched off. The mock keeps
    no ComParams, so it cannot follow the client's setting; passing the messages on lets the
    worker and its callers see them, as `sim-vci` does.
-5. **Timing and order.** While an ECU is attached, and while events of an earlier
-   ComPrimitive are still scheduled after it is detached, every ComPrimitive's events go into
-   one schedule. Each is due at the delay `sim-ecu` gives it, counted from when the
-   ComPrimitive begins: at its request, or when the last event already scheduled is due if
-   that is later. A link runs its non-cyclic ComPrimitives one after another (8.2.6.5), so one
-   ComPrimitive's events never come between another's, and each keeps its own spacing. One delivery thread
-   queues them when due and notifies the callback with the mock's state unlocked. The receive
-   timeout is reported right after the last message the ECU sent, since there is no P2 to wait
-   for. `PDUConstruct` and a reset discard the schedule; `PDUDestruct` discards it and waits
-   for the delivery thread to end, so no callback runs after it returns and the caller may free
-   the API tag and unload the library. `PDUGetStatus` reports a ComPrimitive with scheduled
-   events as executing.
+5. **Timing and order.** A link runs its non-cyclic ComPrimitives one after another
+   (8.2.6.5). While an ECU is attached, and while other ComPrimitives still wait or run after
+   it is detached, a ComPrimitive therefore waits its turn: it begins when the one before it
+   has finished, and only then does its request reach the ECU, so the ECU's state and timers
+   (a session timeout, a reset's start-up time) run from when it begins. Its events are due at
+   the delays `sim-ecu` gives them, counted from when it begins. One delivery thread begins
+   each ComPrimitive in turn, queues each event when due and notifies the callback with the
+   mock's state unlocked. The receive timeout is reported right after the last message the ECU
+   sent, since there is no P2 to wait for. `PDUConstruct` and a reset discard waiting
+   ComPrimitives and scheduled events; `PDUDestruct` discards them and waits for the delivery
+   thread to end, so no callback runs after it returns and the caller may free the API tag and
+   unload the library. `PDUGetStatus` reports a waiting ComPrimitive as idle and one with
+   events still to come as executing.
 
 ## Consequences
 

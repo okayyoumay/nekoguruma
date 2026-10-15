@@ -1305,15 +1305,17 @@ fn names_and_values_read_over_the_same_bytes_are_bounded() {
 
 #[test]
 fn table_entries_looked_at_are_bounded() {
-    // A select with 4,096 unmatched cases and a default, decoded 2^13 times: 32 Mi entries.
-    let cases = (0..4096).map(|n| (n + 10, n + 10, 0)).collect();
-    let innermost = vec![at(5, DataKind::Uint, 0, 8), select(6, 5, cases, Some(0))];
-    let started = std::time::Instant::now();
-    assert_eq!(
-        decode_nested(&[], vec![group(1, 1)], doubling(14, innermost), &[SID, 0]),
-        Err(DecodeError::TooLarge)
-    );
-    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    // A select with unmatched cases and a default, decoded 2^13 times: 2,048 cases each make
+    // exactly the budget, one case more goes past it. Only the case count differs, so the
+    // error comes from the table budget and not from the value or byte limits.
+    let decode = |count: i64| {
+        let cases = (0..count).map(|n| (n + 10, n + 10, 0)).collect();
+        let innermost = vec![at(5, DataKind::Uint, 0, 8), select(6, 5, cases, Some(0))];
+        decode_nested(&[], vec![group(1, 1)], doubling(14, innermost), &[SID, 0])
+    };
+    assert_eq!(MAX_TABLE_ENTRIES, (1 << 13) * 2048);
+    assert!(decode(2048).is_ok());
+    assert_eq!(decode(2049), Err(DecodeError::TooLarge));
 }
 
 #[test]

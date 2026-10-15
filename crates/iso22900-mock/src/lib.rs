@@ -432,7 +432,7 @@ fn stop_delivery_thread(mut guard: MutexGuard<'_, MockState>) {
         state().lock().expect("mock state poisoned").stop_delivery = false;
         return;
     };
-    if thread.thread().id() == std::thread::current().id() {
+    if is_current_thread(&thread) {
         // `PDUDestruct` from inside the callback, where ISO 22900-2 (2022) permits only
         // `PDUGetEventItem` (8.2.4.2, 8.4.22.1): the thread cannot wait for itself, so it keeps
         // the stop flag and ends once the callback returns.
@@ -441,6 +441,32 @@ fn stop_delivery_thread(mut guard: MutexGuard<'_, MockState>) {
     }
     let _ = thread.join();
     state().lock().expect("mock state poisoned").stop_delivery = false;
+}
+
+/// Whether the calling thread is `thread`, compared by the operating system's thread identity.
+/// `std::thread::current` would leave a thread-local destructor of this library's own copy of
+/// `std` on the caller's thread, which runs when that thread exits, after the caller may have
+/// unloaded the library.
+fn is_current_thread(thread: &JoinHandle<()>) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::thread::{JoinHandleExt, RawPthread};
+        unsafe extern "C" {
+            fn pthread_self() -> RawPthread;
+            fn pthread_equal(a: RawPthread, b: RawPthread) -> std::ffi::c_int;
+        }
+        unsafe { pthread_equal(pthread_self(), thread.as_pthread_t()) != 0 }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::{AsRawHandle, RawHandle};
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetThreadId(thread: RawHandle) -> u32;
+            fn GetCurrentThreadId() -> u32;
+        }
+        unsafe { GetThreadId(thread.as_raw_handle()) == GetCurrentThreadId() }
+    }
 }
 
 /// The delivery thread: begins each waiting ComPrimitive once the one before it has finished,
@@ -1752,6 +1778,22 @@ mod delivery_tests {
 
     /// `PDUDestruct` returns only after a running callback has returned, and no callback runs
     /// after it (ADR-299): the caller frees the API tag and may unload the library then.
+    #[test]
+    fn the_delivery_thread_is_told_apart_from_its_callers() {
+        static HANDLE: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
+        let (sent, seen) = std::sync::mpsc::channel();
+        let mut handle = HANDLE.lock().unwrap();
+        *handle = Some(std::thread::spawn(move || {
+            let handle = HANDLE.lock().unwrap();
+            sent.send(is_current_thread(handle.as_ref().unwrap()))
+                .unwrap();
+        }));
+        assert!(!is_current_thread(handle.as_ref().unwrap()));
+        drop(handle);
+        assert!(seen.recv().unwrap(), "the thread itself");
+        HANDLE.lock().unwrap().take().unwrap().join().unwrap();
+    }
+
     #[test]
     fn destruct_waits_for_a_running_callback_and_stops_the_rest() {
         mock_reset();

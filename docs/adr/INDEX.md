@@ -288,6 +288,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-296](ADR-296-the-ir-declaration-part-is-loaded-through-a-checking-loader.md) | The IR Declaration Part Is Loaded Through a Checking Loader | Accepted | `diag-ir` declaration loader and generated bindings; design 8.2.6 |
 | [ADR-297](ADR-297-a-flat-positive-response-is-decoded-as-odx-extracts-a-parameter.md) | A Flat Positive Response Is Decoded as ODX Extracts a Parameter | Accepted | `diag-ir` response decoder; design 8.2.2 |
 | [ADR-298](ADR-298-csv-definition-errors-are-reported-in-two-stages.md) | CSV Definition Errors Are Reported in Two Stages | Accepted | `diag-frontend` CSV table reader error reporting |
+| [ADR-299](ADR-299-iso22900-mock-answers-from-sim-ecu.md) | iso22900-mock Answers ComPrimitives from sim-ecu | Accepted | `iso22900-mock` ComPrimitive events, `__mock_sim_ecu_control`, `NGR_SIM_ECU_CONFIG` |
 
 ## Status Legend
 
@@ -629,6 +630,7 @@ the predecessor repository these ADRs came from.
 - ADR-279 (Decision item 4's allowlist check replaced by the check against the Windows runner's system directory, ADR-283)
 - ADR-283
 - ADR-292 (the consequence that a crash shows as `HostError::Rpc` superseded by ADR-294: the agent reports `HostError::VciLost`)
+- ADR-299
 
 ### Timestamps / Clock
 - ADR-057 (amended by ADR-102)

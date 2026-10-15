@@ -85,7 +85,7 @@ which is kept with the project's working material rather than in the design docu
 | Item | Description |
 |------|------|
 | Role | D-PDU mock implementation for testing/CI |
-| Responsibility | Fake implementation of C-ABI-compatible PDU functions, call-count counters, event queue |
+| Responsibility | Fake implementation of C-ABI-compatible PDU functions, call-count counters, event queue; with a `sim-ecu` attached, answers send-and-receive ComPrimitives from it (ADR-299) |
 | Build artifacts | `cdylib` (native DLL) + `rlib` |
 
 #### `iso22900-registry`

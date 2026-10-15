@@ -64,7 +64,7 @@ unsafe { libloading::Library::new(&lib_path).unwrap().get::<fn()>(b"__mock_reset
 | `PDULockResource` / `PDUUnlockResource` | Always succeed. |
 | `PDUGetComParam` | Returns `PDU_ERR_ID_NOT_SUPPORTED` (params not stored). |
 | `PDUSetComParam` | Always succeeds (params not stored). |
-| `PDUStartComPrimitive` | Allocates a new COP handle. Immediately queues a completion event via the registered callback. |
+| `PDUStartComPrimitive` | Allocates a new COP handle. Immediately queues a completion event via the registered callback, or, with a simulated ECU attached, the ECU's answer to a send-and-receive request (see "Simulated ECU"). |
 | `PDUCancelComPrimitive` | Always succeeds. |
 | `PDUGetEventItem` | Dequeues one pending event. Returns `PDU_ERR_EVENT_QUEUE_EMPTY` when empty. |
 | `PDURegisterEventCallback` | Stores the callback function for the given CLL handle. |
@@ -73,11 +73,28 @@ unsafe { libloading::Library::new(&lib_path).unwrap().get::<fn()>(b"__mock_reset
 | `PDUSetUniqueRespIdTable` | Always succeeds. |
 | `PDUGetTimestamp` | Returns `MOCK_TIMESTAMP` = 4242. |
 | `PDUIoCtl` | Returns `PDU_STATUS_NOERROR` for most commands; `PDU_ERR_VALUE_NOT_SUPPORTED` for unsupported. For `MOCK_IOCTL_NULL_OUTPUT` it returns `PDU_STATUS_NOERROR` and leaves the output item null. |
-| `PDUDestroyItem` | Frees heap-allocated PDU items. |
+| `PDUDestroyItem` | Frees heap-allocated PDU items, including a result item's data bytes and a status or error item's payload. |
 
 ### Event Delivery
 
 When `PDUStartComPrimitive` is called, the mock immediately enqueues a synthetic completion event and fires the registered callback. `PDUGetEventItem` then returns the event. This allows tests to exercise the event subscription path without real hardware timing.
+
+### Simulated ECU
+
+With a `sim-ecu` attached (ADR-299), a `PDU_COPT_SENDRECV` ComPrimitive with request bytes is answered by the ECU instead, through `SimEcu::exchange` with physical addressing. Its events are, in order:
+
+1. a result item for each response-pending message (`7F <SID> 78`): the mock does no negative-response handling of its own;
+2. a result item with the response, or, when the ECU sends none, an error item `PDU_ERR_EVT_RX_TIMEOUT`;
+3. a `PDU_COPST_FINISHED` status item.
+
+Each is queued at the delay the ECU gives it, counted from the request; a delayed event is queued from a thread, and one still waiting when `PDUConstruct`, `PDUDestruct` or a reset discards the queue is dropped. The receive timeout comes right after the last message the ECU sent, since the mock keeps no ComParams and so has no P2 to wait for. Other ComPrimitive types, and a send-and-receive ComPrimitive without request bytes, still get the synthetic completion event; so does every ComPrimitive while no ECU is attached.
+
+An ECU is attached in one of two ways:
+
+- `__mock_sim_ecu_control` (below), for tests that load the mock in their own process;
+- `NGR_SIM_ECU_CONFIG`, the variable `sim-vci` reads: when it names a `sim_ecu::EcuConfig` JSON file at `PDUConstruct` and no ECU is attached, the mock attaches one with that configuration. A file that cannot be read or parsed makes `PDUConstruct` fail with `PDU_ERR_FCT_FAILED`.
+
+`__mock_reset` detaches the ECU.
 
 ---
 
@@ -89,7 +106,13 @@ All back-door functions are exported with C ABI using the `__mock_` prefix.
 
 | Function | Description |
 |----------|-------------|
-| `__mock_reset()` | Reset all mock state: counters, events, callback. Call between tests. |
+| `__mock_reset()` | Reset all mock state: counters, events, callback, the simulated ECU. Call between tests. |
+
+### Simulated ECU Control
+
+| Function | Description |
+|----------|-------------|
+| `__mock_sim_ecu_control(command)` | Applies a NUL-terminated JSON command; returns 0 when it applied, 1 otherwise. `{"attach":{}}` attaches an ECU with `sim-vci`'s default configuration, `{"attach":{"config":{...}}}` one with that `sim_ecu::EcuConfig`; `{"detach":{}}` detaches it; `{"inject_fault":{"fault":...}}` arms a `sim_ecu::Fault`, with an optional `"service"` (SID) or `"request"` (byte prefix) to wait for, not both. A fault with no ECU attached returns 1. |
 
 ### Call Counters
 

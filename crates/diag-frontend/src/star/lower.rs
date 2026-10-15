@@ -32,6 +32,10 @@ use super::{
 /// cannot make ingestion allocate or work without bound.
 const MAX_CONSTANT_SIZE: usize = 1 << 20;
 
+/// How deeply constant lists and dicts may nest ([`Const::depth`]). Each literal is shallow,
+/// but globals can nest one in the next, and folding recurses through every level.
+const MAX_CONSTANT_DEPTH: usize = 64;
+
 /// How many passes type inference may take before it gives up (ADR-304). Each pass can only
 /// widen a type, so real procedures settle in a few; a file that needs more is rejected rather
 /// than analysed without bound.
@@ -152,9 +156,17 @@ enum Const {
     Bool(bool),
     Str(Rc<str>),
     Bytes(Rc<[u8]>),
-    List(Rc<[Const]>, usize),
+    List(Rc<[Const]>, Shape),
     /// String keys in source order.
-    Dict(Rc<[(Rc<str>, Const)]>, usize),
+    Dict(Rc<[(Rc<str>, Const)]>, Shape),
+}
+
+/// A list's or dict's [`Const::size`] and [`Const::depth`], kept with it so neither is
+/// recomputed by walking it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Shape {
+    size: usize,
+    depth: usize,
 }
 
 impl Const {
@@ -167,17 +179,26 @@ impl Const {
     }
 
     fn list(items: Vec<Const>) -> Const {
-        let size = items
+        let shape = items
             .iter()
-            .fold(1usize, |size, item| size.saturating_add(item.size()));
-        Const::List(items.into(), size)
+            .fold(Shape { size: 1, depth: 1 }, |shape, item| Shape {
+                size: shape.size.saturating_add(item.size()),
+                depth: shape.depth.max(item.depth() + 1),
+            });
+        Const::List(items.into(), shape)
     }
 
     fn dict(entries: Vec<(Rc<str>, Const)>) -> Const {
-        let size = entries.iter().fold(1usize, |size, (key, value)| {
-            size.saturating_add(key.len()).saturating_add(value.size())
-        });
-        Const::Dict(entries.into(), size)
+        let shape = entries
+            .iter()
+            .fold(Shape { size: 1, depth: 1 }, |shape, (key, value)| Shape {
+                size: shape
+                    .size
+                    .saturating_add(key.len())
+                    .saturating_add(value.size()),
+                depth: shape.depth.max(value.depth() + 1),
+            });
+        Const::Dict(entries.into(), shape)
     }
 
     /// The size the constant limit counts: one for each value, plus the bytes of each string,
@@ -188,7 +209,16 @@ impl Const {
             Const::Int(_) | Const::Float(_) | Const::Bool(_) => 1,
             Const::Str(s) => 1 + s.len(),
             Const::Bytes(b) => 1 + b.len(),
-            Const::List(_, size) | Const::Dict(_, size) => *size,
+            Const::List(_, shape) | Const::Dict(_, shape) => shape.size,
+        }
+    }
+
+    /// How deeply lists and dicts nest: 0 for other values, 1 for a list of them. Comparing,
+    /// searching and dropping a constant recurse this deep, so it is bounded too.
+    fn depth(&self) -> usize {
+        match self {
+            Const::List(_, shape) | Const::Dict(_, shape) => shape.depth,
+            _ => 0,
         }
     }
 
@@ -1139,6 +1169,13 @@ impl<'a> Lowerer<'a> {
             self.not_lowerable(
                 span,
                 "the constant is too large: more than 1 Mi values and bytes (4.4)",
+            );
+            return Val::Const(Const::Int(0));
+        }
+        if value.depth() > MAX_CONSTANT_DEPTH {
+            self.not_lowerable(
+                span,
+                "lists and dicts nest more than 64 deep in this constant (4.4)",
             );
             return Val::Const(Const::Int(0));
         }

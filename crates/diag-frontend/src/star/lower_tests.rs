@@ -356,6 +356,34 @@ fn string_and_bytes_literals_are_bounded_too() {
 }
 
 #[test]
+fn constants_nest_at_most_64_deep() {
+    // Each line is shallow, but the globals nest one in the next: folding and dropping them
+    // would recurse 100,000 deep.
+    let chain = |lines: usize, wrap: &str| {
+        let mut source = String::from("A0 = 0\n");
+        for i in 1..=lines {
+            let inner = format!("A{}", i - 1);
+            source.push_str(&format!("A{i} = {}\n", wrap.replace("{}", &inner)));
+        }
+        source.push_str(&format!(
+            "X = A{lines} == A{lines}\n\ndef main():\n    pass\n"
+        ));
+        source
+    };
+    for wrap in ["[{}]", "{\"k\": {}}"] {
+        assert!(codes(&chain(64, wrap)).is_empty(), "{wrap}");
+        // A65 is the first too deep; it is on line 66.
+        assert_eq!(
+            codes(&chain(65, wrap)),
+            vec![(StarCode::NotLowerable, 66)],
+            "{wrap}"
+        );
+        let found = codes(&chain(100_000, wrap));
+        assert!(!found.is_empty() && found.iter().all(|(c, _)| *c == StarCode::NotLowerable));
+    }
+}
+
+#[test]
 fn a_right_shift_is_arithmetic() {
     assert!(holds("x", "-8", "x >> 1 == -4"));
     assert!(holds("x", "-1", "x >> 63 == -1"));

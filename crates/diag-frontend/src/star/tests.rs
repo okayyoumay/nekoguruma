@@ -659,3 +659,79 @@ fn and_and_or_give_one_of_their_operands() {
         ]
     );
 }
+
+#[test]
+fn loops_that_reset_each_others_bindings_stay_cheap() {
+    // Each level resets the next level's name before that loop and binds its own after it, so
+    // every level sees different bindings; a cache by whole entry state grows exponentially.
+    let depth = 20;
+    let mut source = String::from("def main():\n    k = \"a\"\n");
+    for level in 0..=depth {
+        source.push_str(&format!("    v{level} = 0\n"));
+    }
+    let mut lines = 2 + depth as u32 + 1;
+    for level in 0..depth {
+        let indent = "    ".repeat(level + 1);
+        source.push_str(&format!(
+            "{indent}v{next} = 0\n{indent}# @maxIterations 2\n{indent}for i{level} in range(2):\n",
+            next = level + 1
+        ));
+        lines += 3;
+    }
+    let indent = "    ".repeat(depth + 1);
+    source.push_str(&format!("{indent}x = v0[k]\n"));
+    let read = lines + 1;
+    for level in (0..depth).rev() {
+        let indent = "    ".repeat(level + 2);
+        source.push_str(&format!("{indent}v{level} = {{\"a\": 1}}\n"));
+    }
+    assert_eq!(codes(&source), [(StarCode::DynamicKeyNotAllowed, read)]);
+}
+
+#[test]
+fn a_loop_after_a_jump_in_its_outer_body_is_still_reached() {
+    // The outer body ends with `continue`, which leaves the quiet walk unreached; the inner loop
+    // must still be checked with every binding a pass can start from.
+    assert_eq!(
+        codes(
+            "def main():\n    k = \"a\"\n    # @maxIterations 2\n    for i in range(2):\n        \
+             d = 0\n        # @maxIterations 2\n        for j in range(2):\n            x = d[k]\n            \
+             d = {\"a\": 1}\n        continue\n"
+        ),
+        [(StarCode::DynamicKeyNotAllowed, 8)]
+    );
+}
+
+#[test]
+fn only_one_comment_marker_starts_an_annotation() {
+    let checked = passes(
+        "def main():\n    ## @idempotency safe\n    ## @unknown\n    # @idempotency checkState\n    \
+         diag.wait(1)\n",
+    );
+    assert_eq!(
+        checked.annotations,
+        [Annotation::Idempotency {
+            line: 4,
+            value: Idempotency::CheckState
+        }]
+    );
+}
+
+#[test]
+fn a_top_level_name_is_bound_once() {
+    assert_eq!(
+        codes(
+            "K = \"a\"\nTABLE = {\"a\": 1}\nITEM = TABLE[K]\nTABLE = [1]\n\ndef helper():\n    \
+             return 1\n\nhelper = 3\n\ndef main():\n    helper()\n\nmain = 3\n"
+        ),
+        [
+            (StarCode::UnsupportedSyntax, 4),
+            (StarCode::UnsupportedSyntax, 9),
+            (StarCode::UnsupportedSyntax, 14),
+        ]
+    );
+    assert_eq!(
+        codes("def f():\n    pass\n\ndef f():\n    pass\n\ndef main():\n    f()\n"),
+        [(StarCode::UnsupportedSyntax, 4)]
+    );
+}

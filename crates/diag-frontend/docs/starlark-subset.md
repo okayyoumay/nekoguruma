@@ -396,6 +396,7 @@ position. Lines and columns count from 1; the column counts characters.
   `STAR_UNSUPPORTED_SYNTAX` so that nothing slips through by oversight
 - Comment annotations (4.2, 4.5, 4.6) are taken from the comment tokens the parser's lexer
   reports, never from raw source lines, so `# @` inside a string literal is not an annotation.
+  The text after the one comment marker must start with `@`, so `## @...` is an ordinary comment.
   Each annotation is attached by its line to the following statement. An annotation belongs to
   a top-level `def` when its comment is indented further than `def` and comes before the next
   top-level statement, so a comment after the last statement of a body still belongs to it.
@@ -414,7 +415,9 @@ position. Lines and columns count from 1; the column counts characters.
   pass; what follows a jump or a `return` is still checked but its bindings reach nothing. A
   parameter or a name a function assigns hides a top-level name or built-in of the same spelling,
   and is a value that cannot be called (`STAR_FUNCTION_VALUE_NOT_ALLOWED`, like a top-level
-  constant); a top-level `def` or constant named `diag` hides the module as well. A call must name a top-level
+  constant); a top-level `def` or constant named `diag` hides the module as well. A top-level
+  name is bound once, by one `def` or one constant assignment, so each has one meaning in the
+  whole file; a second binding is `STAR_UNSUPPORTED_SYNTAX`. A call must name a top-level
   `def`, a built-in of 2.4, a string method of 2.4 or a `diag` function of 3.1; anything else is
   `STAR_BUILTIN_NOT_ALLOWED`. A rejected construct (a `lambda`, a nested `def`, a comprehension,
   an f-string, a top-level statement, a default parameter value) is checked inside as well, so that every violation is

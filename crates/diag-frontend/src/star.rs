@@ -318,10 +318,11 @@ struct Checker<'a> {
     quiet: u32,
     /// The bindings `break` and `continue` carry, for each loop being walked, innermost last.
     loops: Vec<Jumps>,
-    /// The bindings at the head and after each loop, by the loop's position and the bindings
-    /// before it. A loop nested in another is walked again on each pass of the outer one, mostly
-    /// with bindings seen before, so this keeps the passes from multiplying with the depth.
-    loop_states: HashMap<(u32, Vec<(String, Kinds)>), LoopState>,
+    /// What each loop's fixpoint has found so far, by the loop's position. A loop nested in
+    /// another is walked again on each pass of the outer one; its state there only grows, so it
+    /// is kept and extended rather than computed afresh, which bounds the passes of every loop
+    /// by the number of bindings that can change, whatever the nesting depth.
+    loop_states: HashMap<u32, LoopState>,
 }
 
 /// The bindings a loop's `break`s and `continue`s carry; `None` while none is reachable.
@@ -331,11 +332,22 @@ struct Jumps {
     continues: Option<HashMap<String, Kinds>>,
 }
 
-/// What a loop's fixpoint found: the bindings at the start of a pass and after the loop.
-#[derive(Clone)]
+/// What a loop's fixpoint found: the bindings before the loop it covers, at the start of a pass,
+/// at its `break`s and after the loop.
+#[derive(Clone, Default)]
 struct LoopState {
+    entry: HashMap<String, Kinds>,
     head: HashMap<String, Kinds>,
+    breaks: Option<HashMap<String, Kinds>>,
     exit: HashMap<String, Kinds>,
+}
+
+/// Whether every binding of `part` is in `whole`.
+fn covers(whole: &HashMap<String, Kinds>, part: &HashMap<String, Kinds>) -> bool {
+    part.iter().all(|(name, kinds)| {
+        let have = whole.get(name).copied().unwrap_or_default();
+        have.union(*kinds) == have
+    })
 }
 
 /// Adds `kinds` to the bindings of a jump, which are unset while no jump is reachable.
@@ -478,18 +490,34 @@ impl Checker<'_> {
     fn top_level(&mut self) {
         let module = self.module;
         let top = Self::statements(module.statement());
-        // The names first, so that a call to a function defined further down resolves.
+        // The names first, so that a call to a function defined further down resolves. A
+        // top-level name is bound once, so each has one meaning throughout the file.
+        let mut bound = HashSet::new();
         for stmt in &top {
-            match &stmt.node {
+            let name = match &stmt.node {
                 StmtP::Def(def) => {
                     self.defs.insert(def.name.node.ident.clone());
+                    &def.name
                 }
-                StmtP::Assign(assign) => {
-                    if let AssignTargetP::Identifier(name) = &assign.lhs.node {
+                StmtP::Assign(assign) => match &assign.lhs.node {
+                    AssignTargetP::Identifier(name) => {
                         self.globals.insert(name.node.ident.clone());
+                        name
                     }
-                }
-                _ => {}
+                    _ => continue,
+                },
+                _ => continue,
+            };
+            if !bound.insert(name.node.ident.clone()) {
+                self.error(
+                    StarCode::UnsupportedSyntax,
+                    name.span,
+                    format!(
+                        "`{}` is already bound at the top level; a top-level name is bound once \
+                         (2.1)",
+                        name.node.ident
+                    ),
+                );
             }
         }
         // In order, so that a constant assigned from another takes what that one is known to be.
@@ -748,6 +776,7 @@ impl Checker<'_> {
                 if self.quiet == 0 {
                     // The body is checked once, with every binding a pass can start from.
                     scope.kinds = state.head;
+                    scope.dead = false;
                     self.loops.push(Jumps::default());
                     self.loop_body(&for_.var, &for_.body, scope);
                     self.loops.pop();
@@ -781,15 +810,14 @@ impl Checker<'_> {
         body: &AstStmt,
         scope: &mut Scope,
     ) -> LoopState {
-        let mut entry: Vec<(String, Kinds)> =
-            scope.kinds.iter().map(|(n, k)| (n.clone(), *k)).collect();
-        entry.sort();
-        let key = (at, entry);
-        if let Some(state) = self.loop_states.get(&key) {
-            return state.clone();
+        let mut state = self.loop_states.get(&at).cloned().unwrap_or_default();
+        if covers(&state.entry, &scope.kinds) && self.loop_states.contains_key(&at) {
+            return state;
         }
-        let mut head = scope.kinds.clone();
-        let mut breaks = None;
+        merge(&mut state.entry, scope.kinds.clone());
+        let mut head = state.head;
+        merge(&mut head, scope.kinds.clone());
+        let mut breaks = state.breaks;
         loop {
             scope.kinds = head.clone();
             scope.dead = false;
@@ -815,11 +843,16 @@ impl Checker<'_> {
         }
         // The loop ends when its iterable runs out, at the head, or at a `break`.
         let mut exit = head.clone();
-        if let Some(breaks) = breaks {
-            merge(&mut exit, breaks);
+        if let Some(breaks) = &breaks {
+            merge(&mut exit, breaks.clone());
         }
-        let state = LoopState { head, exit };
-        self.loop_states.insert(key, state.clone());
+        let state = LoopState {
+            entry: state.entry,
+            head,
+            breaks,
+            exit,
+        };
+        self.loop_states.insert(at, state.clone());
         state
     }
 
@@ -1310,7 +1343,9 @@ impl Checker<'_> {
         let mut open: Option<((u32, u32), u32, Span)> = None;
         for &span in module.comments() {
             let file_span = module.file_span(span);
-            let text = file_span.source_span().trim_start_matches('#').trim();
+            // One comment marker: after `##` the text starts with `#`, an ordinary comment.
+            let source = file_span.source_span();
+            let text = source.strip_prefix('#').unwrap_or(source).trim();
             let Some(annotation) = text.strip_prefix('@') else {
                 continue;
             };

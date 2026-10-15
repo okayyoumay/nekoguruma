@@ -250,7 +250,7 @@ struct Seen {
     number: Option<Number>,
     /// The internal value as a key: an integer, or bytes or a string of up to 8 bytes read as
     /// a big-endian integer and stored bit for bit in an `i64`.
-    key: Option<i128>,
+    key: Option<Key>,
 }
 
 #[derive(Clone, Copy)]
@@ -470,6 +470,11 @@ impl<'a, 'm> Decoder<'a, 'm> {
                             "a marker that is not a fixed-length field at offset 0",
                         ));
                     }
+                    // A key is at most 64 bits (ADR-242 item 5); checked before any marker is
+                    // read, so a wide marker cannot be copied at every item.
+                    if marker.bit_length() > 64 {
+                        return Err(plan(field, "a marker wider than 64 bits"));
+                    }
                     let (lower, upper) = (repeat.marker_lower(), repeat.marker_upper());
                     while at < end {
                         let window = &self.message[..end];
@@ -478,7 +483,7 @@ impl<'a, 'm> Decoder<'a, 'm> {
                                 let Some(key) = key_of(&marker, &internal) else {
                                     return Err(plan(field, "a marker that is not an integer"));
                                 };
-                                if i128::from(lower) <= key && key <= i128::from(upper) {
+                                if key.within(lower, upper) {
                                     break;
                                 }
                             }
@@ -522,7 +527,7 @@ impl<'a, 'm> Decoder<'a, 'm> {
             let chosen = select.cases().and_then(|cases| {
                 cases
                     .iter()
-                    .position(|c| i128::from(c.lower()) <= key && key <= i128::from(c.upper()))
+                    .position(|c| key.within(c.lower(), c.upper()))
                     .map(|at| (Some(at), cases.get(at).layout_id()))
             });
             let (case, layout_id) = match chosen {
@@ -634,22 +639,27 @@ fn number_of(value: &PhysicalValue) -> Option<Number> {
     }
 }
 
-/// A field's internal value as a key (ADR-242 item 5): an integer as it is, and bytes or a
-/// string of up to 8 bytes as those bytes read as a big-endian integer, stored bit for bit in
-/// an `i64`. A float, or a longer byte string, is no key.
-fn key_of(field: &Field<'_>, internal: &PhysicalValue) -> Option<i128> {
+/// A field's internal value as a key (ADR-242 item 5). A signed integer is compared as signed;
+/// an unsigned integer, and bytes or a string of up to 8 bytes read as a big-endian integer,
+/// are compared as unsigned, with the case or marker limits (stored bit for bit in `int64`) read
+/// as unsigned too. A float, or a longer byte string, is no key.
+fn key_of(field: &Field<'_>, internal: &PhysicalValue) -> Option<Key> {
+    // At most 9 bytes are rebuilt: enough to tell that a value is too long to be a key.
     let bytes: Vec<u8> = match internal {
-        PhysicalValue::Unsigned(n) => return Some(i128::from(*n)),
-        PhysicalValue::Signed(n) => return Some(i128::from(*n)),
-        PhysicalValue::Bytes(b) => b.clone(),
+        PhysicalValue::Unsigned(n) => return Some(Key::Unsigned(*n)),
+        PhysicalValue::Signed(n) => return Some(Key::Signed(*n)),
+        PhysicalValue::Bytes(b) => b.iter().copied().take(9).collect(),
         // Each character is one byte of the message (`string_value`).
         PhysicalValue::Text(t) if field.kind() == DataKind::Ascii => {
-            t.chars().map(|c| c as u8).collect()
+            t.chars().take(9).map(|c| c as u8).collect()
         }
-        PhysicalValue::Text(t) if field.kind() == DataKind::Utf8 => t.as_bytes().to_vec(),
+        PhysicalValue::Text(t) if field.kind() == DataKind::Utf8 => {
+            t.as_bytes().iter().copied().take(9).collect()
+        }
         PhysicalValue::Text(t) if field.kind() == DataKind::Unicode2 => {
             let little = field.byte_order() == ByteOrder::Little;
             t.encode_utf16()
+                .take(5)
                 .flat_map(|u| {
                     if little {
                         u.to_le_bytes()
@@ -664,8 +674,25 @@ fn key_of(field: &Field<'_>, internal: &PhysicalValue) -> Option<i128> {
     if bytes.len() > 8 {
         return None;
     }
-    let raw = bytes.iter().fold(0u64, |acc, &b| (acc << 8) | u64::from(b));
-    Some(i128::from(raw as i64))
+    Some(Key::Unsigned(
+        bytes.iter().fold(0u64, |acc, &b| (acc << 8) | u64::from(b)),
+    ))
+}
+
+/// A key or marker value, compared with the inclusive limits `lower..=upper` of `ir.fbs`.
+#[derive(Clone, Copy)]
+enum Key {
+    Signed(i64),
+    Unsigned(u64),
+}
+
+impl Key {
+    fn within(self, lower: i64, upper: i64) -> bool {
+        match self {
+            Key::Signed(k) => lower <= k && k <= upper,
+            Key::Unsigned(k) => (lower as u64) <= k && k <= (upper as u64),
+        }
+    }
 }
 
 /// The byte and the bit position (0 to 7, from the least significant bit) where a field starts,

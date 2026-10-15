@@ -1047,6 +1047,82 @@ fn a_select_key_is_the_internal_value() {
 }
 
 #[test]
+fn unsigned_keys_compare_with_limits_stored_bit_for_bit() {
+    // A 64-bit unsigned key: the frontend stores 2^64 - 1 as -1 and a range across 2^63 as a
+    // positive lower and a negative upper limit (csv-tables 5.4).
+    let fields = |cases| vec![next(1, DataKind::Uint, 64), select(2, 1, cases, None)];
+    let layouts = || vec![layout(1, 0, vec![])];
+    let all_ones = [SID, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
+    let decoded = decode_nested(&[], fields(vec![(-1, -1, 1)]), layouts(), &all_ones).unwrap();
+    assert!(matches!(
+        value_of(&decoded, 2),
+        PhysicalValue::Select { case: Some(0), .. }
+    ));
+    let across = vec![(i64::MAX - 1, i64::MIN + 1, 1)];
+    let high_bit = [SID, 0x80, 0, 0, 0, 0, 0, 0, 0];
+    let decoded = decode_nested(&[], fields(across), layouts(), &high_bit).unwrap();
+    assert!(matches!(
+        value_of(&decoded, 2),
+        PhysicalValue::Select { case: Some(0), .. }
+    ));
+    // A signed key compares as signed.
+    let signed = vec![
+        next(1, DataKind::Int, 8),
+        select(2, 1, vec![(-2, -1, 1)], None),
+    ];
+    let decoded = decode_nested(&[], signed, layouts(), &[SID, 0xFF]).unwrap();
+    assert!(matches!(
+        value_of(&decoded, 2),
+        PhysicalValue::Select { case: Some(0), .. }
+    ));
+}
+
+#[test]
+fn a_64_bit_marker_of_all_ones_matches_its_stored_limit() {
+    let fields = vec![
+        repeat(
+            1,
+            RepeatT {
+                layout_id: 1,
+                count: RepeatCount::UntilMarker,
+                marker: Some(Box::new(at(9, DataKind::Uint, 0, 64))),
+                marker_lower: -1,
+                marker_upper: -1,
+                ..Default::default()
+            },
+        ),
+        next(2, DataKind::Uint, 8),
+    ];
+    let layouts = vec![layout(1, 0, vec![next(10, DataKind::Uint, 8)])];
+    let mut message = vec![SID, 7];
+    message.extend([0xFF; 8]);
+    let decoded = decode_nested(&[], fields, layouts, &message).unwrap();
+    let PhysicalValue::Repeat(items) = value_of(&decoded, 1) else {
+        panic!("not a repeat: {decoded:?}");
+    };
+    assert_eq!(items.len(), 1);
+    assert_eq!(value_of(&decoded, 2), &Unsigned(0xFF));
+}
+
+#[test]
+fn a_marker_wider_than_64_bits_is_a_broken_plan() {
+    let fields = vec![repeat(
+        1,
+        RepeatT {
+            layout_id: 1,
+            count: RepeatCount::UntilMarker,
+            marker: Some(Box::new(at(9, DataKind::Utf8, 0, 4096 * 8))),
+            ..Default::default()
+        },
+    )];
+    let layouts = vec![layout(1, 0, vec![next(10, DataKind::Uint, 8)])];
+    assert!(matches!(
+        decode_nested(&[], fields, layouts, &[SID, 0xFF, 0xFF]),
+        Err(DecodeError::InvalidPlan { field: 1, .. })
+    ));
+}
+
+#[test]
 fn a_nested_select_reads_a_key_from_its_own_layout() {
     // A group holding a key and a select: the cascaded selection of ADR-242 item 3.
     let fields = vec![group(1, 1)];

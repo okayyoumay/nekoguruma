@@ -41,8 +41,10 @@ decoded more than once; and how the limits of ADR-242 item 7 are counted.
    the innermost occurrence wins, and within one occurrence the latest. Inside a repeated item
    this is the same item's field, as `ir.fbs` says. A length or count is the field's physical
    value; a key or marker is its internal value as an integer, with a byte or string value of up
-   to 8 bytes read as a big-endian integer stored bit for bit in an `i64` (ADR-242 item 5). A
-   float, or a longer byte string, cannot be a key.
+   to 8 bytes read as a big-endian integer (ADR-242 item 5). A signed integer key is compared
+   with the limits as signed; an unsigned or byte-string key is compared with the limits read as
+   unsigned, since the frontend stores limits of 2^63 or more bit for bit in `int64`. A float, or
+   a longer byte string, cannot be a key, and a marker wider than 64 bits is a broken plan.
 5. **Repetitions.** A `Fixed` repetition places item n at n times `item_byte_size`; an item past
    the enclosing layout is `Truncated`. The other kinds start each item at the byte edge after
    the previous one. `UntilMarker` reads the marker before each item and stops when its value is

@@ -260,6 +260,102 @@ fn a_global_named_often_is_pooled_once() {
 }
 
 #[test]
+fn a_dict_literal_must_not_repeat_a_key() {
+    let found = codes("D = {\"k\": 1, \"k\": 2}\n\ndef main():\n    pass\n");
+    assert_eq!(found, vec![(StarCode::NotLowerable, 1)]);
+}
+
+#[test]
+fn large_dicts_compare_in_linear_time() {
+    let entries: Vec<String> = (0..100_000).map(|n| format!("\"k{n}\": {n}")).collect();
+    let source = format!(
+        "D = {{{}}}\nE = D == D\n\ndef main():\n    if E:\n        diag.fail(\"YES\", \"\")\n",
+        entries.join(", ")
+    );
+    let started = std::time::Instant::now();
+    assert_eq!(failed_with(&source), "YES");
+    assert!(started.elapsed() < std::time::Duration::from_secs(60));
+}
+
+#[test]
+fn section_and_idempotency_annotations_are_not_dropped() {
+    for (source, line) in [
+        ("# @section uninterruptible\ndef main():\n    pass\n", 1),
+        ("def main():\n    # @idempotency unsafe\n    x = 1\n", 2),
+    ] {
+        assert_eq!(
+            codes(source),
+            vec![(StarCode::NotLowerable, line)],
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn ints_and_floats_compare_by_exact_value() {
+    use std::cmp::Ordering::*;
+    let order = |a: Const, b: Const| number_order(&a, &b).unwrap();
+    // 2^53 + 1 is not a float; the float nearest it is 2^53.
+    let (above, float) = (
+        Const::Int((1 << 53) + 1),
+        Const::Float(9_007_199_254_740_992.0),
+    );
+    assert_eq!(order(above.clone(), float.clone()), Greater);
+    assert_eq!(order(float.clone(), above.clone()), Less);
+    assert!(!equal(&above, &float));
+    assert_eq!(
+        fold_builtin("max", &[float.clone(), above.clone()]),
+        Ok(above)
+    );
+    assert_eq!(
+        order(Const::Int(i64::MAX), Const::Float(2f64.powi(63))),
+        Less
+    );
+    assert_eq!(
+        order(Const::Int(i64::MIN), Const::Float(-2f64.powi(63))),
+        Equal
+    );
+    assert_eq!(order(Const::Int(i64::MIN), Const::Float(-1e19)), Greater);
+    assert_eq!(order(Const::Int(1), Const::Float(1.5)), Less);
+    assert_eq!(order(Const::Int(-1), Const::Float(-1.5)), Greater);
+    assert_eq!(order(Const::Int(2), Const::Float(f64::NAN)), Less);
+    assert!(equal(&Const::Int(3), &Const::Float(3.0)));
+}
+
+#[test]
+fn int_of_a_float_accepts_every_value_in_range() {
+    assert_eq!(
+        fold_builtin("int", &[Const::Float(-2f64.powi(63))]),
+        Ok(Const::Int(i64::MIN))
+    );
+    assert_eq!(
+        fold_builtin("int", &[Const::Float(9.21e18)]),
+        Ok(Const::Int(9_210_000_000_000_000_000))
+    );
+    assert_eq!(
+        fold_builtin("int", &[Const::Float(-2.7)]),
+        Ok(Const::Int(-2))
+    );
+    for f in [2f64.powi(63), -9.3e18, f64::NAN, f64::INFINITY] {
+        assert!(fold_builtin("int", &[Const::Float(f)]).is_err(), "{f}");
+    }
+}
+
+#[test]
+fn string_and_bytes_literals_are_bounded_too() {
+    // A literal of 2^20 bytes counts 2^20 + 1, one past the limit; one byte less fits.
+    for (quote, prefix) in [("\"", ""), ("\"", "b")] {
+        for (len, over) in [((1 << 20) - 1, false), (1 << 20, true)] {
+            let source = format!(
+                "T = {prefix}{quote}{}{quote}\n\ndef main():\n    pass\n",
+                "x".repeat(len)
+            );
+            assert_eq!(!codes(&source).is_empty(), over, "{prefix} {len}");
+        }
+    }
+}
+
+#[test]
 fn a_right_shift_is_arithmetic() {
     assert!(holds("x", "-8", "x >> 1 == -4"));
     assert!(holds("x", "-1", "x >> 63 == -1"));

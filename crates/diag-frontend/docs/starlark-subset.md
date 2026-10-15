@@ -494,7 +494,9 @@ type, so the transpiler infers at ingestion which types each value can have (ADR
 - Expressions whose operands are all constants are folded at ingestion with Starlark's
   semantics, so they need no instruction. A constant may hold at most 2^20 values and bytes,
   counting each value, each byte of its strings, bytes and dict keys, and a value a list holds
-  twice twice; a larger one is `STAR_NOT_LOWERABLE`.
+  twice twice; a larger one is `STAR_NOT_LOWERABLE`. A dict literal that repeats a key is
+  rejected, as Starlark rejects it, and an `int` and a `float` constant compare by their exact
+  values, without rounding the `int` to a `float`.
 - An index into bytes known only at run time must not be negative: without a length
   instruction the transpiler cannot count it from the end, so a negative index stops the
   procedure with an index error where Starlark would count from the end. A constant negative

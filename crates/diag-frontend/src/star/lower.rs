@@ -24,7 +24,7 @@ use starlark_syntax::syntax::ast::{
 };
 
 use super::{
-    BUILTINS, Checked, Pending, STRING_METHODS, StarCode, StarError, collect_locals,
+    Annotation, BUILTINS, Checked, Pending, STRING_METHODS, StarCode, StarError, collect_locals,
     is_string_expression, resolve, to_u32,
 };
 
@@ -44,6 +44,7 @@ const MAX_FAIL_CODE_LEN: usize = 64;
 /// be lowered is reported, in source order.
 pub fn lower(file: &str, checked: &Checked) -> Result<Program, Vec<StarError>> {
     let mut lowerer = Lowerer::new(checked);
+    lowerer.annotations();
     lowerer.constants();
     lowerer.functions();
     if lowerer.errors.is_empty() {
@@ -344,6 +345,30 @@ impl<'a> Lowerer<'a> {
 
     fn top_level(&self) -> Vec<&'a AstStmt> {
         super::Checker::statements(self.checked.module.statement())
+    }
+
+    /// Rejects the annotations whose ranges are not lowered yet, so their attributes are not
+    /// dropped silently (ADR-304). `@maxIterations` belongs to a `for`, which is rejected itself.
+    fn annotations(&mut self) {
+        let codemap = self
+            .checked
+            .module
+            .file_span(self.checked.module.statement().span)
+            .file;
+        for annotation in &self.checked.annotations {
+            let (line, what) = match annotation {
+                Annotation::Section { line, .. } => (*line, "a `@section` annotation (4.5)"),
+                Annotation::Idempotency { line, .. } => {
+                    (*line, "an `@idempotency` annotation (4.6)")
+                }
+                Annotation::MaxIterations { .. } => continue,
+            };
+            let begin = codemap.line_span(line.saturating_sub(1) as usize).begin();
+            self.not_lowerable(
+                Span::new(begin, begin),
+                format!("{what} is not lowered yet"),
+            );
+        }
     }
 
     /// Folds the top-level constants in order; each may name the ones before it.
@@ -681,8 +706,8 @@ impl<'a> Lowerer<'a> {
                     },
                 },
                 AstLiteral::Float(f) => Val::Const(Const::Float(f.node)),
-                AstLiteral::String(s) => Val::Const(Const::str(s.node.as_str())),
-                AstLiteral::Bytes(b) => Val::Const(Const::bytes(b.node.as_slice())),
+                AstLiteral::String(s) => self.bounded(Const::str(s.node.as_str()), span),
+                AstLiteral::Bytes(b) => self.bounded(Const::bytes(b.node.as_slice()), span),
                 AstLiteral::Ellipsis => {
                     self.not_lowerable(span, "`...` cannot be lowered (2.3)");
                     Val::Const(Const::Int(0))
@@ -766,6 +791,7 @@ impl<'a> Lowerer<'a> {
             }
             ExprP::Dict(pairs) => {
                 let mut entries = Vec::new();
+                let mut keys = HashSet::new();
                 for (key, value) in pairs {
                     let key = match self.expr(id, key) {
                         Val::Const(Const::Str(key)) => key,
@@ -777,6 +803,13 @@ impl<'a> Lowerer<'a> {
                             continue;
                         }
                     };
+                    if !keys.insert(key.clone()) {
+                        self.not_lowerable(
+                            span,
+                            format!("the dict repeats the key {key:?}, which Starlark rejects"),
+                        );
+                        continue;
+                    }
                     match self.expr(id, value) {
                         Val::Const(value) => entries.push((key, value)),
                         _ => self.not_lowerable(
@@ -912,6 +945,9 @@ impl<'a> Lowerer<'a> {
     /// many places, in every inference pass) is found by its shared allocation, without hashing
     /// its bytes again; the map keeps the allocation alive, so its address is not reused.
     fn pool_shared(&mut self, value: &Const) -> u32 {
+        if self.quiet > 0 {
+            return 0;
+        }
         let bytes: &[u8] = match value {
             Const::Str(s) => s.as_bytes(),
             Const::Bytes(b) => b,
@@ -927,6 +963,10 @@ impl<'a> Lowerer<'a> {
     }
 
     fn pool(&mut self, bytes: &[u8]) -> u32 {
+        // Code made while types are inferred is thrown away, so it needs no pool entry.
+        if self.quiet > 0 {
+            return 0;
+        }
         if let Some(&index) = self.pooled.get(bytes) {
             return index;
         }
@@ -1999,9 +2039,9 @@ fn fold(op: BinOp, a: &Const, b: &Const) -> Result<Const, String> {
                 (Bytes(x), Bytes(y)) => x.cmp(y),
                 _ => match (a, b) {
                     (Int(x), Int(y)) => x.cmp(y),
-                    _ => match (number(a), number(b)) {
-                        (Some(x), Some(y)) => float_order(x, y),
-                        _ => return Err(mismatch()),
+                    _ => match number_order(a, b) {
+                        Some(ordering) => ordering,
+                        None => return Err(mismatch()),
                     },
                 },
             };
@@ -2112,22 +2152,55 @@ fn float_order(x: f64, y: f64) -> std::cmp::Ordering {
     }
 }
 
+/// The order of two numbers by their exact values, `None` for other values: an `int` and a
+/// `float` are compared without rounding the `int` to the nearest `float`.
+fn number_order(a: &Const, b: &Const) -> Option<std::cmp::Ordering> {
+    match (a, b) {
+        (Const::Int(x), Const::Int(y)) => Some(x.cmp(y)),
+        (Const::Float(x), Const::Float(y)) => Some(float_order(*x, *y)),
+        (Const::Int(x), Const::Float(y)) => Some(int_float_order(*x, *y)),
+        (Const::Float(x), Const::Int(y)) => Some(int_float_order(*y, *x).reverse()),
+        _ => None,
+    }
+}
+
+/// The exact order of an `int` and a `float`, NaN the greatest.
+fn int_float_order(x: i64, y: f64) -> std::cmp::Ordering {
+    use std::cmp::Ordering::*;
+    // 2^63, exact as a float.
+    const LIMIT: f64 = 9_223_372_036_854_775_808.0;
+    if y.is_nan() || y >= LIMIT {
+        return Less;
+    }
+    if y < -LIMIT {
+        return Greater;
+    }
+    // Here y's integer part fits an i64 exactly.
+    let whole = y.trunc();
+    match x.cmp(&(whole as i64)) {
+        Equal => 0.0.partial_cmp(&(y - whole)).unwrap_or(Equal),
+        other => other,
+    }
+}
+
 /// Starlark equality: numbers compare by value across `int` and `float`; other values of
 /// different types are never equal.
 fn equal(a: &Const, b: &Const) -> bool {
     match (a, b) {
         (Const::Int(_) | Const::Float(_), Const::Int(_) | Const::Float(_)) => match (a, b) {
             (Const::Int(x), Const::Int(y)) => x == y,
-            (Const::Float(x), Const::Float(y)) => float_order(*x, *y).is_eq(),
-            _ => number(a) == number(b),
+            _ => number_order(a, b).is_some_and(|o| o.is_eq()),
         },
         (Const::List(x, _), Const::List(y, _)) => {
             x.len() == y.len() && x.iter().zip(y.iter()).all(|(p, q)| equal(p, q))
         }
+        // Keys are unique (a literal that repeats one is rejected), so equal lengths and every
+        // entry of one found in the other make the dicts equal.
         (Const::Dict(x, _), Const::Dict(y, _)) => {
+            let other: HashMap<&str, &Const> = y.iter().map(|(k, v)| (&**k, v)).collect();
             x.len() == y.len()
                 && x.iter()
-                    .all(|(k, v)| y.iter().any(|(k2, v2)| k == k2 && equal(v, v2)))
+                    .all(|(k, v)| other.get(&**k).is_some_and(|w| equal(v, w)))
         }
         _ => a == b,
     }
@@ -2174,7 +2247,10 @@ fn fold_builtin(name: &str, args: &[Const]) -> Result<Const, String> {
         ("bool", [value]) => Ok(Const::Bool(value.truth())),
         ("int", [Const::Int(n)]) => Ok(Const::Int(*n)),
         ("int", [Const::Bool(b)]) => Ok(Const::Int(i64::from(*b))),
-        ("int", [Const::Float(f)]) if f.is_finite() && f.trunc().abs() < 9.2e18 => {
+        // The truncated value must lie in [-2^63, 2^63), where the conversion is exact.
+        ("int", [Const::Float(f)])
+            if (-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&f.trunc()) =>
+        {
             Ok(Const::Int(f.trunc() as i64))
         }
         ("float", [Const::Int(n)]) => Ok(Const::Float(*n as f64)),

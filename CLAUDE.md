@@ -149,9 +149,10 @@ cdylib, and cargo runs no doc tests for one. nextest runs each test in its own p
 `#[serial]` worker-crate integration tests run in parallel there (`.config/nextest.toml`).
 `cargo test` gives the same results, only more slowly; keep `#[serial]` on tests that share
 process-global state, since `cargo test` still needs it. Some of those tests are too
-timing-sensitive to run in parallel on the Windows runner, so the `core-windows` job uses the
-`ci-windows` profile (one test at a time) for every test except the agent's, which run first in
-a separate nextest run with the `ci-windows-parallel` profile. On pull requests `core-windows` leaves out
+timing-sensitive to run beside other tests on the Windows runner, so the `core-windows` job uses
+the `ci-windows` profile, which runs them alone and the rest four at a time, for every test
+except the agent's, which run first in a separate nextest run with the `ci-windows-parallel`
+profile. On pull requests `core-windows` leaves out
 `j2534-0404-service`, which has no Windows-specific code, except for its restart end to end
 (`agent_restart_end_to_end`), which a step of its own runs, since its harness ends the agent and
 its worker with `taskkill` there; main runs every test on Windows.

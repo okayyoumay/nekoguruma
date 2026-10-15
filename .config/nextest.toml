@@ -15,18 +15,39 @@ fail-fast = false
 # Never retry: a test that passes only on retry is a flaky test to fix, not to hide.
 retries = 0
 
-# Windows CI. Some timing-sensitive worker-crate tests fail on the Windows runner when other tests
-# run at the same time, so this profile runs one test at a time, which matches what `cargo test`
-# does for the `#[serial]` tests.
+# Windows CI, for everything but the agent's tests. The runner has four cores, so four tests run
+# at once. Six modules of `j2534-0404-service`'s `grpc_mock` tests fail on the Windows runner when
+# other tests run beside them, because they measure timer windows; the override gives each of
+# their tests every thread, so it runs alone. They are the modules whose timing dependence is still
+# to be removed. `agent_restart_end_to_end` is `#[serial]` only because it sets environment
+# variables, which nextest's process per test makes harmless, so it runs in parallel here.
 [profile.ci-windows]
-test-threads = 1
+test-threads = 4
 fail-fast = false
 retries = 0
+
+[[profile.ci-windows.overrides]]
+filter = """
+binary(grpc_mock) & (
+    test(/^cop_ctrl_cycles::/) | test(/^j1939::/) | test(/^p3_gap::/) | test(/^rc_handling::/)
+    | test(/^stopcomm_data_tx::/) | test(/^tester_present_send_type::/)
+)
+"""
+threads-required = "num-test-threads"
+
+# The Windows signer tests of `ngr-library-resolver` create and remove a self-signed certificate
+# in the user's certificate store, which fails with access denied when two processes do so at once.
+[[profile.ci-windows.overrides]]
+filter = 'package(ngr-library-resolver) & test(/^signer::tests::windows::/)'
+test-group = "windows-cert-store"
+
+[test-groups]
+windows-cert-store = { max-threads = 1 }
 
 # Windows CI, for the tests that do not depend on timing and so need not run alone: the agent's
 # tests, which spend their time creating and syncing lock and journal files rather than on the CPU.
 # CI runs them in a separate nextest run before the `ci-windows` one, so they never run beside the
-# timing-sensitive worker-crate tests.
+# worker-crate tests.
 [profile.ci-windows-parallel]
 test-threads = 4
 fail-fast = false

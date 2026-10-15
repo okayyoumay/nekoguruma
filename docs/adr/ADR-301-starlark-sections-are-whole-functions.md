@@ -28,8 +28,9 @@ annotations.
 ## Decision
 
 1. **A section is a whole function.** A `@section kind [expected=millis]` comment directly before
-   a top-level `def` makes that function a section function. The comment is outside every
-   function body, and only comments and blank lines may stand between it and the `def`. A `def`
+   a top-level `def` makes that function a section function. The comment starts its line, and
+   only comments and blank lines may stand between it and the `def`, so it is outside every
+   function body and every statement. A `def`
    takes one `@section`. `@endsection` is removed; a section ends where its function returns.
 2. **Only top-level `def`s.** A nested `def` or a lambda (ADR-300) cannot be a section function.
    Neither may capture anything, so the same step written as a top-level `def` is equivalent.
@@ -50,9 +51,10 @@ annotations.
 - A section can no longer be bounded wrongly, and an `uninterruptible` or `recoveryRequired`
   section can call helpers without leaving its range. The job runner's and the restart
   validation's program-counter checks stay correct as they are.
-- Authors write each section as a function: values go in as arguments and come back as the
-  return value, in a dict or list when there are several, since the subset has no tuples; a loop
-  around a section that must stop early tests what the section returns.
+- Authors write each section as a function: values go in as arguments and one comes back as the
+  return value, since the VM has no run-time lists, dicts or tuples (subset 2.5). Work that needs
+  several results of a section stays inside it, or the step is split into several section
+  functions; a loop around a section that must stop early tests what the section returns.
 - `expected=` is fixed per section function rather than per place in the code.
 - A helper called both inside and outside sections appears twice in the program, and once per
   section that reaches it. The specialization budget bounds this.

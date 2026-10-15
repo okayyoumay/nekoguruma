@@ -359,6 +359,29 @@ def main():
     assert_eq!(codes(source), [(StarCode::BadAnnotation, 2)]);
 }
 
+/// A `@section` written after a one-line `def` or inside the last call of the previous body is
+/// not directly before the next `def`.
+#[test]
+fn a_section_comment_in_the_previous_def_is_rejected() {
+    assert_eq!(
+        codes("def helper(): pass  # @section uninterruptible\ndef main():\n    helper()\n"),
+        [(StarCode::BadAnnotation, 1)]
+    );
+    let source = "\
+def helper():
+    diag.log(1,
+# @section uninterruptible
+        \"x\")
+def main():
+    helper()
+";
+    assert_eq!(codes(source), [(StarCode::BadAnnotation, 3)]);
+    // Comments and blank lines between functions are fine.
+    passes(
+        "def helper():\n    pass\n\n# Writes.\n# @section uninterruptible\n\n# More.\ndef main():\n    helper()\n",
+    );
+}
+
 #[test]
 fn a_def_takes_one_section() {
     let source = "\

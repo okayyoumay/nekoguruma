@@ -416,8 +416,10 @@ def main():
 range is rejected (`STAR_ARGUMENT_OUT_OF_RANGE`). It is compared with the remaining OEM
 authentication time (8.10.1) each time the function is called.
 
-- **Placement.** The comment is outside every function body, and the next statement after it is
-  a top-level `def`; only comments and blank lines may come between. A `def` takes one
+- **Placement.** The comment stands alone at the start of its line (column 1), and the next line
+  of code after it is a top-level `def`; only comments and blank lines may come between. A
+  `@section` after code on the same line, or inside a body or a statement that spans lines, is
+  rejected. A `def` takes one
   `@section`. A nested `def` or a lambda (2.6) cannot be a section function: write the step as a
   top-level `def`, which is equivalent since neither can capture anything. There is no
   `@endsection`; the section ends where the function returns, by `return`, by the end of its
@@ -432,8 +434,10 @@ authentication time (8.10.1) each time the function is called.
   (`STAR_BAD_ANNOTATION`). A call to a section function from outside every section, as many
   times as the procedure needs, enters the section once per call.
 - **Values.** A section function takes what it needs as arguments and returns what the caller
-  needs; several values are returned in a dict or a list, since the subset has no tuples (2.3).
-  A loop around a section that must stop early tests the value the section returns.
+  needs, like any function: one run-time value, since the VM has no run-time lists, dicts or
+  tuples (2.5). Work that needs several results of a section is done inside the section, or the
+  step is split into several section functions. A loop around a section that must stop early
+  tests the value the section returns.
 
 ### 4.6 Specifying Idempotency
 
@@ -516,7 +520,8 @@ that many violations on one long line stay small.
   way. A comment after a statement takes that statement's line and indentation.
   `@maxIterations` takes an integer from 1 to 2^32 - 1 and must precede a `for` in the same
   function; `@idempotency` takes `safe`, `checkState` or `unsafe` and must precede a statement in
-  the same function; `@section` belongs to no function and must precede a top-level `def` (4.5).
+  the same function; `@section` belongs to no function, starts its line, and must have a
+  top-level `def` as the next line of code (4.5).
   An integer, negative ones included, outside its range is `STAR_ARGUMENT_OUT_OF_RANGE`, any
   other fault `STAR_BAD_ANNOTATION`
 - Section nesting (4.5) is found on the call graph the recursion check builds, in one pass: the

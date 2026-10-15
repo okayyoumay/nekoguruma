@@ -1654,24 +1654,28 @@ impl Checker<'_> {
                 .copied()
                 .filter(|(at, _)| def.0 < *at && *at <= def.1)
         };
-        // The top-level `def`s by line, with their names and the last line of the top-level
-        // statement before each, when that is not a `def` (0 otherwise): a `def`'s span runs on
-        // over the comments after its body, which `enclosing` judges instead.
-        let top_defs: Vec<(u32, String, u32)> = top
+        // The top-level `def`s by line, with their names.
+        let top_defs: Vec<(u32, String)> = top
             .iter()
-            .enumerate()
-            .filter_map(|(at, stmt)| match &stmt.node {
-                StmtP::Def(def) => Some((
-                    line_of(stmt.span),
-                    def.name.node.ident.clone(),
-                    at.checked_sub(1)
-                        .map(|before| top[before])
-                        .filter(|before| !matches!(before.node, StmtP::Def(_)))
-                        .map_or(0, |before| line_of(before.span.end_span())),
-                )),
+            .filter_map(|stmt| match &stmt.node {
+                StmtP::Def(def) => Some((line_of(stmt.span), def.name.node.ident.clone())),
                 _ => None,
             })
             .collect();
+        // For each 1-based line, the first line from it on that holds code: neither blank nor a
+        // comment alone. A line inside a string that starts with `#` counts as a comment here,
+        // but such a string began on an earlier line of code, so it never stands between a
+        // comment and the `def` after it without code doing so too.
+        let source_lines: Vec<&str> = codemap.source().lines().collect();
+        let mut next_code = vec![u32::MAX; source_lines.len() + 2];
+        for (at, text) in source_lines.iter().enumerate().rev() {
+            let trimmed = text.trim_start();
+            next_code[at + 1] = if trimmed.is_empty() || trimmed.starts_with('#') {
+                next_code[at + 2]
+            } else {
+                to_u32(at + 1)
+            };
+        }
         let mut annotations = Vec::new();
         // The section functions, by the line of their `def`.
         let mut sectioned: BTreeMap<u32, String> = BTreeMap::new();
@@ -1785,20 +1789,22 @@ impl Checker<'_> {
                             continue;
                         }
                     };
-                    // The statement after the comment must be a top-level `def`, and the comment
-                    // must be outside every function body and every other top-level statement.
-                    let at = statement_lines.partition_point(|(begin, _)| *begin <= line);
-                    let target = statement_lines
-                        .get(at)
-                        .and_then(|(next, _)| {
+                    // The comment stands alone at the start of its line, and the next line of
+                    // code after it is a top-level `def`: only blank lines and other comments
+                    // come between, so it is outside every function body and every statement.
+                    let standalone = source_lines
+                        .get(line as usize - 1)
+                        .is_some_and(|text| text.starts_with('#'));
+                    let target = next_code
+                        .get(line as usize + 1)
+                        .filter(|_| standalone)
+                        .and_then(|next| {
                             top_defs
-                                .binary_search_by_key(next, |(def_line, _, _)| *def_line)
+                                .binary_search_by_key(next, |(def_line, _)| *def_line)
                                 .ok()
                         })
-                        .map(|at| &top_defs[at])
-                        .filter(|(_, _, before)| *before < line)
-                        .filter(|_| enclosing(line, column).is_none());
-                    let Some((def, name, _)) = target.cloned() else {
+                        .map(|at| &top_defs[at]);
+                    let Some((def, name)) = target.cloned() else {
                         bad(
                             self,
                             "`@section` must directly precede a top-level `def`, which it makes a \

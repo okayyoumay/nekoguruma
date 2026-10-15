@@ -533,10 +533,11 @@ value a procedure could supply for them, so a shaped field in a request is rejec
 
 - `group`: one occurrence of `layout`.
 - `repeat`: `layout` repeated; its count is a row of `repeats.csv` for the field.
-- `select`: one layout chosen by the key in `ref`, which must not be a `float` field, nor bytes
-  or a string fixed wider than 8 bytes, since such a key is compared as a big-endian integer
-  (ADR-242; `CSV_IR_RULE`); its cases are rows of `select_cases.csv` for the field, and `layout`
-  stays empty.
+- `select`: one layout chosen by the key in `ref`, which must not be a `float` field. A key of
+  bytes or a string is compared for equality as a big-endian integer, so it is at most 8 bytes
+  (fixed at most 64 bits wide, or `terminated` with a `max_bytes` of 1 to 8; ADR-242,
+  `CSV_IR_RULE`) and each of its cases is one value. Its cases are rows of `select_cases.csv`
+  for the field, and `layout` stays empty.
 
 A Starlark response's `fields` (subset spec 3.4) holds one value per name, so in this version its
 keys are the scalar fields at the top of the response: those of the `response:` container, the
@@ -615,7 +616,8 @@ its field is rejected at ingestion; a run-time value that does not fit is an err
   `group`, `repeat` or `select` fields (a cycle) is rejected, once per cycle at its first layout
   in `layouts.csv`, as is a field of a request or response that nests more than 16 layouts
   deep. A field of a layout with a `byte_size`, at a set `byte` and of a fixed width, must end
-  within it.
+  within it, and a shaped field there must not start past it; such a field of the layout of a
+  `fixed` repeat must end within `item_bytes`.
   Nothing is left for the agent to discover at run time (design 8.3).
 - **Determinism.** The same directory always converts to the same documents, byte for byte: ids
   follow row order (section 3) and arrays follow row order.

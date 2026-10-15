@@ -1459,14 +1459,15 @@ fn with_fields(rows: &[&str], services: &[&str]) -> (Vec<(String, Vec<u8>)>, u32
     (files, first)
 }
 
-/// The errors of [`with_fields`] in `fields.csv`, as (code, index of the added row, column).
+/// The errors of [`with_fields`] in `fields.csv`, as (code, index of the added row, column);
+/// an error of the row as a whole has the column "".
 fn field_errors(rows: &[&str], services: &[&str]) -> Vec<(ErrorCode, u32, String)> {
     let (files, first) = with_fields(rows, services);
     resolved(files)
         .into_iter()
         .map(|(code, file, line, column)| {
             assert_eq!(file, "fields.csv", "{code:?} at {line:?}");
-            (code, line.unwrap() - first, column.unwrap())
+            (code, line.unwrap() - first, column.unwrap_or_default())
         })
         .collect()
 }
@@ -1935,7 +1936,8 @@ fn a_shaped_field_has_only_the_columns_of_its_shape() {
             row(MissingColumn, 2, "layout"),
             row(BadValue, 3, "ref"),
             row(Unsupported, 4, "shape"),
-            row(MissingColumn, 5, "shape"),
+            // A missing repeats.csv row is an error of the row, not of a cell.
+            row(MissingColumn, 5, ""),
             row(BadValue, 6, "layout"),
             row(MissingColumn, 7, "ref"),
             row(IrRule, 9, "ref"),
@@ -2047,5 +2049,164 @@ fn layouts_hold_their_fields_reach_no_cycle_and_nest_at_most_16_deep() {
                 Some("name")
             ),
         ]
+    );
+}
+
+#[test]
+fn a_select_key_with_an_error_of_its_own_judges_no_case() {
+    const L: &str = "layout:watchdogReset";
+    let rows = [
+        format!("{L},fk,9,,float,32"),
+        format!("{L},s3,13,,,,,,,,,,select,,fk"),
+        format!("{L},sk,14,,,,,,,,,,group,dtcRecord"),
+        format!("{L},s5,15,,,,,,,,,,select,,sk"),
+        format!("{L},bk2,20,,bytes,12"),
+        format!("{L},s6,22,,,,,,,,,,select,,bk2"),
+        // Bytes keys are compared for equality, and at most 8 bytes long.
+        format!("{L},bk3,24,,bytes,16"),
+        format!("{L},s7,26,,,,,,,,,,select,,bk3"),
+        format!("{L},tk,28,,ascii,,terminated"),
+        format!("{L},s8,40,,,,,,,,,,select,,tk"),
+        format!("{L},tk2,50,,ascii,,terminated,1,,,,,,,,4"),
+        format!("{L},s9,60,,,,,,,,,,select,,tk2"),
+        // A BCD key holds decimal values.
+        format!("{L},bcdk,70,,bcd,8"),
+        format!("{L},s10,71,,,,,,,,,,select,,bcdk"),
+        format!("{L},ul,72,,uint,8,,,,,,,,dtcRecord"),
+        "did:vin,g,17,,,,,,,,,,group,dtcRecord".to_owned(),
+    ];
+    let rows: Vec<&str> = rows.iter().map(String::as_str).collect();
+    let (files, first) = with_layouts(
+        &rows,
+        &[],
+        &[(
+            "select_cases.csv",
+            &[
+                "layout:watchdogReset,s3,neg,-1,,",
+                "layout:watchdogReset,s5,neg,-1,,",
+                "layout:watchdogReset,s6,c,0x1000,,",
+                "layout:watchdogReset,s7,r,0x03,0x0F,",
+                "layout:watchdogReset,s7,one,0x10,,",
+                "layout:watchdogReset,s9,one,0x41,,",
+                "layout:watchdogReset,s10,ok,99,,",
+                "layout:watchdogReset,s10,hi,100,,",
+            ],
+        )],
+    );
+    const S: &str = "select_cases.csv";
+    let f = |i: u32, code, column| at(code, "fields.csv", Some(first + i), Some(column));
+    assert_eq!(
+        resolved(files),
+        vec![
+            f(1, IrRule, "ref"),
+            f(3, BadValue, "ref"),
+            f(4, BadValue, "bits"),
+            f(9, IrRule, "ref"),
+            f(14, BadValue, "layout"),
+            f(15, Unsupported, "shape"),
+            at(BadValue, S, Some(added_line(S, 3)), Some("upper")),
+            at(BadValue, S, Some(added_line(S, 7)), Some("lower")),
+        ]
+    );
+}
+
+#[test]
+fn cycles_and_depth_follow_every_shape_and_items_hold_their_layout() {
+    let mut rows = vec![
+        "layout:cs,k,0,,uint,8".to_owned(),
+        "layout:cs,sw,1,,,,,,,,,,select,,k".to_owned(),
+        "layout:cr,items,0,,,,,,,,,,repeat,cr".to_owned(),
+        // A cycle below hides no chain that is too deep.
+        "layout:top,c,0,,,,,,,,,,group,cs".to_owned(),
+        "layout:top,d,1,,,,,,,,,,group,e1".to_owned(),
+        "response:deep2,f,1,,,,,,,,,,group,top".to_owned(),
+        // A select case leads to its layout as a group does.
+        "response:viaSel,k,1,,uint,8".to_owned(),
+        "response:viaSel,s,2,,,,,,,,,,select,,k".to_owned(),
+        // dtcRecord's fields reach byte 4.
+        "response:fx,items,1,,,,,,,,,,repeat,dtcRecord".to_owned(),
+        "response:fx,ok,9,,,,,,,,,,repeat,dtcRecord".to_owned(),
+        "layout:dtcRecord,late,5,,,,,,,,,,group,watchdogReset".to_owned(),
+    ];
+    let mut layouts = vec!["cs,0".to_owned(), "cr,0".to_owned(), "top,0".to_owned()];
+    for i in 1..=17 {
+        layouts.push(format!("e{i},0"));
+        rows.push(if i < 17 {
+            format!("layout:e{i},n,0,,,,,,,,,,group,e{}", i + 1)
+        } else {
+            format!("layout:e{i},v,0,,uint,8")
+        });
+    }
+    let rows: Vec<&str> = rows.iter().map(String::as_str).collect();
+    let layouts: Vec<&str> = layouts.iter().map(String::as_str).collect();
+    let (mut files, first) = with_layouts(
+        &rows,
+        &[",deep2,0x60", ",viaSel,0x61", ",fx,0x62"],
+        &[
+            ("layouts.csv", &layouts),
+            (
+                "select_cases.csv",
+                &["layout:cs,sw,me,0x01,,cs", "response:viaSel,s,x,0x01,,e1"],
+            ),
+        ],
+    );
+    files.retain(|(n, _)| n != "repeats.csv");
+    files.push((
+        "repeats.csv".into(),
+        b"container,field,count,items,item_bytes\n\
+          response:readDtcByStatusMask,records,end,,\n\
+          layout:cr,items,end,,\n\
+          response:fx,items,fixed,2,2\n\
+          response:fx,ok,fixed,1,4\n"
+            .to_vec(),
+    ));
+    let f = |i: u32, column| at(IrRule, "fields.csv", Some(first + i), Some(column));
+    assert_eq!(
+        resolved(files),
+        vec![
+            f(5, "shape"),
+            f(7, "shape"),
+            f(10, "byte"),
+            at(
+                IrRule,
+                "layouts.csv",
+                Some(added_line("layouts.csv", 0)),
+                Some("name")
+            ),
+            at(
+                IrRule,
+                "layouts.csv",
+                Some(added_line("layouts.csv", 1)),
+                Some("name")
+            ),
+            at(
+                IrRule,
+                "repeats.csv",
+                Some(added_line("repeats.csv", 1)),
+                Some("item_bytes")
+            ),
+        ]
+    );
+}
+
+#[test]
+fn a_long_chain_of_layouts_is_checked_without_recursion() {
+    let mut rows = vec!["response:chain,f,1,,,,,,,,,,group,c1".to_owned()];
+    let mut layouts = Vec::new();
+    const N: usize = 5000;
+    for i in 1..=N {
+        layouts.push(format!("c{i},0"));
+        rows.push(if i < N {
+            format!("layout:c{i},n,0,,,,,,,,,,group,c{}", i + 1)
+        } else {
+            format!("layout:c{i},v,0,,uint,8")
+        });
+    }
+    let rows: Vec<&str> = rows.iter().map(String::as_str).collect();
+    let layouts: Vec<&str> = layouts.iter().map(String::as_str).collect();
+    let (files, first) = with_layouts(&rows, &[",chain,0x63"], &[("layouts.csv", &layouts)]);
+    assert_eq!(
+        resolved(files),
+        vec![at(IrRule, "fields.csv", Some(first), Some("shape"))]
     );
 }

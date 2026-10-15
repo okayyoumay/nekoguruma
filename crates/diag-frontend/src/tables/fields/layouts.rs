@@ -14,13 +14,21 @@ impl<'a> Checker<'a> {
     pub(super) fn layouts(&mut self) {
         let t = self.t;
         for f in &t.fields {
-            if let Some(shape) = f.shape {
-                self.shaped(f, shape);
+            match f.shape {
+                Some(shape) => self.shaped(f, shape),
+                None if f.layout.is_some() => self.field_error(
+                    ErrorCode::BadValue,
+                    f,
+                    "layout",
+                    "layout is used only by a group or a repeat".into(),
+                ),
+                None => {}
             }
         }
         self.repeats();
         self.select_cases();
         self.bounds();
+        self.fixed_items();
         self.nesting();
     }
 
@@ -116,11 +124,14 @@ impl<'a> Checker<'a> {
             _ => {}
         }
         if shape == Shape::Repeat && self.repeat_row(f).is_none() {
-            self.field_error(
+            // A row of another table is missing, so no cell of this one is named, and no
+            // error of a cell hides it.
+            self.e.push(
                 ErrorCode::MissingColumn,
-                f,
-                "shape",
-                "a repeat needs its row in repeats.csv".into(),
+                FILE,
+                Some(f.line),
+                None,
+                "a repeat needs its row in repeats.csv",
             );
         }
         if shape == Shape::Select {
@@ -145,18 +156,12 @@ impl<'a> Checker<'a> {
                 "ref",
                 format!("the key {} is a float; case limits are integers", key.name),
             ),
-            Some(ty)
-                if super::string_like(ty)
-                    && matches!(key.length, None | Some(Length::Fixed))
-                    && key.bits.is_some_and(|b| b > 64) =>
-            {
-                self.field_error(
-                    ErrorCode::IrRule,
-                    f,
-                    "ref",
-                    format!("the key {} is longer than 8 bytes", key.name),
-                )
-            }
+            Some(ty) if super::string_like(ty) && !short_key(key) => self.field_error(
+                ErrorCode::IrRule,
+                f,
+                "ref",
+                format!("the key {} can be longer than 8 bytes", key.name),
+            ),
             _ => {}
         }
     }
@@ -178,6 +183,18 @@ impl<'a> Checker<'a> {
                 );
             }
         }
+    }
+
+    /// Whether a select key gives a range to judge its cases by: a scalar of a type a key may
+    /// have, with no error of its own in the cells that set its range.
+    fn sound_key(&self, key: &FieldRow) -> bool {
+        key.constant.is_none()
+            && key.shape.is_none()
+            && key.field_type.is_some_and(|ty| ty != FieldType::Float)
+            && (!key.field_type.is_some_and(super::string_like) || short_key(key))
+            && ["type", "bits", "length", "max_bytes"]
+                .iter()
+                .all(|column| !self.reported.contains(&(FILE, key.line, column)))
     }
 
     /// `select_cases.csv`: rows of `select` fields, at most one default per field, no overlaps,
@@ -206,8 +223,16 @@ impl<'a> Checker<'a> {
         }
         for ((line, _), cases) in by_field {
             let f = t.fields.iter().find(|f| f.line == line).expect("the owner");
-            let key = f.reference.as_ref().and_then(|name| self.referred(f, name));
+            // A key with an error of its own gives no range to judge the cases by.
+            let key = f
+                .reference
+                .as_ref()
+                .and_then(|name| self.referred(f, name))
+                .filter(|k| self.sound_key(k));
             let (min, max, signed) = key.map_or((i128::MIN, i128::MAX, true), key_range);
+            let compared_whole = key
+                .and_then(|k| k.field_type)
+                .is_some_and(super::string_like);
             let mut default: Option<Line> = None;
             let mut earlier: Vec<(i128, i128, Line)> = Vec::new();
             for c in cases {
@@ -257,6 +282,16 @@ impl<'a> Checker<'a> {
                     // Reported when the row was read.
                     continue;
                 }
+                if compared_whole && lower != upper {
+                    self.error(
+                        ErrorCode::BadValue,
+                        "select_cases.csv",
+                        c.line,
+                        "upper",
+                        "a bytes or string key is compared for equality, so a case is one value"
+                            .into(),
+                    );
+                }
                 if let Some(&(_, _, first)) =
                     earlier.iter().find(|(l, u, _)| lower <= *u && *l <= upper)
                 {
@@ -283,7 +318,24 @@ impl<'a> Checker<'a> {
             }
             let limit = u64::from(layout.byte_size) * 8;
             for f in &t.fields {
-                if f.container != Container::Layout(layout.name.clone()) || f.shape.is_some() {
+                if f.container != Container::Layout(layout.name.clone()) {
+                    continue;
+                }
+                if f.shape.is_some() {
+                    // A shaped field consumes its layouts from where it starts.
+                    if let Some(byte) = f.byte
+                        && byte > layout.byte_size
+                    {
+                        self.field_error(
+                            ErrorCode::IrRule,
+                            f,
+                            "byte",
+                            format!(
+                                "the field starts past the {} bytes of layout {}",
+                                layout.byte_size, layout.name
+                            ),
+                        );
+                    }
                     continue;
                 }
                 let (Some(byte), Some(bits), None | Some(Length::Fixed)) =
@@ -310,6 +362,50 @@ impl<'a> Checker<'a> {
                         ),
                     );
                 }
+            }
+        }
+    }
+
+    /// A fixed repeat's items hold the fields of its layout: a field at a known position with a
+    /// fixed width does not reach past `item_bytes` (`ir.fbs` `Repeat`).
+    fn fixed_items(&mut self) {
+        let t = self.t;
+        for r in &t.repeats {
+            let RepeatCount::Fixed { item_bytes, .. } = r.count else {
+                continue;
+            };
+            let Some(layout) = self
+                .owner(&r.container, &r.field)
+                .and_then(|f| f.layout.as_ref())
+            else {
+                continue;
+            };
+            let limit = u64::from(item_bytes) * 8;
+            let past = t.fields.iter().find(|f| {
+                f.container == Container::Layout(layout.clone())
+                    && f.shape.is_none()
+                    && matches!(f.length, None | Some(Length::Fixed))
+                    && !["bits", "byte"]
+                        .iter()
+                        .any(|column| self.reported.contains(&(FILE, f.line, column)))
+                    && match (f.byte, f.bits) {
+                        (Some(byte), Some(bits)) => {
+                            u64::from(byte) * 8 + u64::from(f.bit) + u64::from(bits) > limit
+                        }
+                        _ => false,
+                    }
+            });
+            if let Some(f) = past {
+                self.error(
+                    ErrorCode::IrRule,
+                    "repeats.csv",
+                    r.line,
+                    "item_bytes",
+                    format!(
+                        "field {} of layout {layout} reaches past the {item_bytes} bytes of an item",
+                        f.name
+                    ),
+                );
             }
         }
     }
@@ -348,71 +444,65 @@ impl<'a> Checker<'a> {
     }
 
     /// No layout reaches itself, and no field nests more than 16 layouts (ADR-242 item 7).
+    /// The layouts are walked without recursion, in time linear in their fields.
     fn nesting(&mut self) {
         let t = self.t;
         let children = self.children();
-        let reach = |from: &str| -> HashSet<&str> {
-            let mut seen = HashSet::new();
-            let mut stack: Vec<&str> = children.get(from).cloned().unwrap_or_default();
-            while let Some(l) = stack.pop() {
-                if seen.insert(l) {
-                    stack.extend(children.get(l).into_iter().flatten().copied());
-                }
-            }
-            seen
-        };
-        let reaches: HashMap<&str, HashSet<&str>> = t
-            .layouts
+        let names: Vec<&str> = t.layouts.iter().map(|l| l.name.as_str()).collect();
+        let index: HashMap<&str, usize> = names.iter().enumerate().map(|(i, n)| (*n, i)).collect();
+        let adj: Vec<Vec<usize>> = names
             .iter()
-            .map(|l| (l.name.as_str(), reach(&l.name)))
+            .map(|n| {
+                children[n]
+                    .iter()
+                    .filter_map(|c| index.get(c).copied())
+                    .collect()
+            })
             .collect();
-        let on_cycle = |l: &str| reaches.get(l).is_some_and(|r| r.contains(l));
+        let (order, component) = components(&adj);
+        let mut size = vec![0usize; names.len()];
+        for &c in &component {
+            size[c] += 1;
+        }
+        let on_cycle: Vec<bool> = (0..names.len())
+            .map(|v| size[component[v]] > 1 || adj[v].contains(&v))
+            .collect();
         // Each cycle is reported once, at its first layout in row order.
-        let mut reported: HashSet<&str> = HashSet::new();
-        for l in &t.layouts {
-            let name = l.name.as_str();
-            if !on_cycle(name) || reported.contains(name) {
+        let mut reported = HashSet::new();
+        for v in 0..names.len() {
+            if on_cycle[v] && reported.insert(component[v]) {
+                let members: Vec<&str> = (0..names.len())
+                    .filter(|&m| component[m] == component[v])
+                    .map(|m| names[m])
+                    .collect();
+                self.error(
+                    ErrorCode::IrRule,
+                    "layouts.csv",
+                    t.layouts[v].line,
+                    "name",
+                    format!(
+                        "layout {} reaches itself through {}",
+                        names[v],
+                        members.join(", ")
+                    ),
+                );
+            }
+        }
+        // The depth of each layout off a cycle: itself plus its deepest child off a cycle, so a
+        // cycle below hides no chain that is too deep. Children finish before their parents in
+        // `order`, except along a cycle.
+        let mut depth = vec![0usize; names.len()];
+        for &v in &order {
+            if on_cycle[v] {
                 continue;
             }
-            let members: Vec<&str> = t
-                .layouts
+            depth[v] = 1 + adj[v]
                 .iter()
-                .map(|m| m.name.as_str())
-                .filter(|m| reaches[name].contains(m) && reaches[*m].contains(name))
-                .collect();
-            reported.extend(&members);
-            self.error(
-                ErrorCode::IrRule,
-                "layouts.csv",
-                l.line,
-                "name",
-                format!(
-                    "layout {name} reaches itself through {}",
-                    members.join(", ")
-                ),
-            );
-        }
-        // The depth of each layout that reaches no cycle: itself plus its deepest child.
-        let mut depth: HashMap<&str, usize> = HashMap::new();
-        fn depth_of<'n>(
-            l: &'n str,
-            children: &HashMap<&'n str, Vec<&'n str>>,
-            depth: &mut HashMap<&'n str, usize>,
-        ) -> usize {
-            if let Some(&d) = depth.get(l) {
-                return d;
-            }
-            let d = 1 + children
-                .get(l)
-                .into_iter()
-                .flatten()
-                .map(|c| depth_of(c, children, depth))
+                .filter(|&&c| !on_cycle[c])
+                .map(|&c| depth[c])
                 .max()
                 .unwrap_or(0);
-            depth.insert(l, d);
-            d
         }
-        let cyclic = |l: &str| on_cycle(l) || reaches[l].iter().any(|m| on_cycle(m));
         for f in &t.fields {
             if matches!(f.container, Container::Layout(_)) {
                 continue;
@@ -420,8 +510,9 @@ impl<'a> Checker<'a> {
             let deepest = self
                 .targets(f)
                 .into_iter()
-                .filter(|l| reaches.contains_key(l) && !cyclic(l))
-                .map(|l| depth_of(l, &children, &mut depth))
+                .filter_map(|l| index.get(l).copied())
+                .filter(|&v| !on_cycle[v])
+                .map(|v| depth[v])
                 .max();
             if let Some(d) = deepest
                 && d > MAX_DEPTH
@@ -434,6 +525,68 @@ impl<'a> Checker<'a> {
                 );
             }
         }
+    }
+}
+
+/// The strongly connected components of a graph (Kosaraju's algorithm, without recursion):
+/// the vertices in the order the first search finishes them, and each vertex's component.
+fn components(adj: &[Vec<usize>]) -> (Vec<usize>, Vec<usize>) {
+    let n = adj.len();
+    let mut order = Vec::with_capacity(n);
+    let mut visited = vec![false; n];
+    for start in 0..n {
+        if visited[start] {
+            continue;
+        }
+        visited[start] = true;
+        let mut stack = vec![(start, 0usize)];
+        while let Some((v, next)) = stack.last_mut() {
+            if let Some(&c) = adj[*v].get(*next) {
+                *next += 1;
+                if !visited[c] {
+                    visited[c] = true;
+                    stack.push((c, 0));
+                }
+            } else {
+                order.push(*v);
+                stack.pop();
+            }
+        }
+    }
+    let mut reverse = vec![Vec::new(); n];
+    for (v, cs) in adj.iter().enumerate() {
+        for &c in cs {
+            reverse[c].push(v);
+        }
+    }
+    let mut component = vec![usize::MAX; n];
+    let mut count = 0;
+    for &start in order.iter().rev() {
+        if component[start] != usize::MAX {
+            continue;
+        }
+        component[start] = count;
+        let mut stack = vec![start];
+        while let Some(v) = stack.pop() {
+            for &c in &reverse[v] {
+                if component[c] == usize::MAX {
+                    component[c] = count;
+                    stack.push(c);
+                }
+            }
+        }
+        count += 1;
+    }
+    (order, component)
+}
+
+/// Whether a bytes or string key is at most 8 bytes, as a key compared as an integer must be
+/// (ADR-242): fixed at most 64 bits wide, or terminated with `max_bytes` 1 to 8.
+fn short_key(key: &FieldRow) -> bool {
+    match key.length.unwrap_or(Length::Fixed) {
+        Length::Fixed => key.bits.is_some_and(|b| b <= 64),
+        Length::Terminated => key.max_bytes.is_some_and(|m| (1..=8).contains(&m)),
+        Length::Field | Length::Leading => false,
     }
 }
 

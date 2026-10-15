@@ -48,6 +48,9 @@ pub struct Tables {
     pub dtcs: Vec<DtcRow>,
     pub flash_sessions: Vec<FlashSessionRow>,
     pub flash_segments: Vec<FlashSegmentRow>,
+    /// The names and contents, as stored, of the table files present, sorted by name in byte
+    /// order: what `source_digest` covers besides a procedure file (section 6).
+    pub sources: Vec<(String, Vec<u8>)>,
 }
 
 /// Why [`read_directory`] failed.
@@ -136,6 +139,7 @@ fn read_entries(
     let mut sheets: HashMap<&'static str, Sheet> = HashMap::new();
     // Tables that broke the record format: their other errors are not reported (section 7).
     let mut broken: Vec<&'static str> = Vec::new();
+    let mut sources = Vec::new();
     // A directory cannot hold two entries of one name, but a caller of `read_files` can pass
     // them; the first is read and the repeat reported, so that nothing is replaced unseen.
     let mut seen = std::collections::HashSet::new();
@@ -210,6 +214,7 @@ fn read_entries(
             broken.push(spec.file);
         }
         sheets.insert(spec.file, sheet);
+        sources.push((name, contents));
     }
     for file in REQUIRED_FILES {
         if !sheets.contains_key(file) {
@@ -259,6 +264,10 @@ fn read_entries(
         dtcs: dtcs(sheet(&DTCS), e),
         flash_sessions: flash_sessions(sheet(&FLASH_SESSIONS), e),
         flash_segments: flash_segments(sheet(&FLASH_SEGMENTS), e),
+        sources: {
+            sources.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+            sources
+        },
     };
     check_duplicates(&sheets, e);
     if errors.0.is_empty() {

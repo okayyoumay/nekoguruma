@@ -685,8 +685,9 @@ fn a_negative_annotation_value_is_out_of_range() {
 
 #[test]
 fn deeply_nested_loops_are_checked_in_linear_passes() {
-    // Each loop body binds `d` after using it, so every level needs a second pass to see it.
-    let depth = 40;
+    // Each loop body binds `d` after using it, so every level needs a second pass to see it. The
+    // loops nest as deep as the block bound allows (2.8).
+    let depth = MAX_BLOCK_DEPTH - 1;
     let mut source = String::from("def main():\n    d = 0\n    k = \"a\"\n");
     for level in 0..depth {
         let indent = "    ".repeat(level + 1);
@@ -1166,7 +1167,8 @@ fn a_long_function_name_is_stored_once() {
 fn a_chain_of_literal_keys_is_checked_in_linear_time() {
     let source = format!(
         "def main():\n    res = diag.request(0x22, {{}})\n    x = res{}\n",
-        "[\"fields\"]".repeat(1_000)
+        // As long as the chain bound allows (2.8): the `=` is one link.
+        "[\"fields\"]".repeat(MAX_EXPRESSION_CHAIN - 1)
     );
     let started = std::time::Instant::now();
     passes(&source);
@@ -1293,4 +1295,152 @@ fn many_sections_are_checked_in_linear_time() {
     let checked = passes(&source);
     assert_eq!(checked.annotations.len(), 2_000);
     assert!(started.elapsed() < std::time::Duration::from_secs(10));
+}
+
+/// `main` with `line` as its body, which holds one link (the `=` of an assignment) besides its
+/// expression.
+fn in_main(line: &str) -> String {
+    format!("def main():\n    {line}\n")
+}
+
+/// The codes of `source`, with no line.
+fn bare_codes(source: &str) -> Vec<StarCode> {
+    codes(source).into_iter().map(|(code, _)| code).collect()
+}
+
+fn too_deep(source: &str) -> bool {
+    bare_codes(source) == [StarCode::NestingTooDeep]
+}
+
+#[test]
+fn brackets_nest_to_the_bound() {
+    for (open, close) in [("(", ")"), ("[", "]"), ("{0: ", "}"), ("f(", ")")] {
+        let at = |n: usize| in_main(&format!("x = {}1{}", open.repeat(n), close.repeat(n)));
+        assert!(!too_deep(&at(MAX_BRACKET_DEPTH)), "{open}");
+        assert!(too_deep(&at(MAX_BRACKET_DEPTH + 1)), "{open}");
+    }
+}
+
+#[test]
+fn expression_chains_reach_the_bound() {
+    // Each `link` adds one to the chain; the assignment's `=` is the first.
+    let shapes: [(&str, &str, &str, usize); 7] = [
+        ("res", "[\"f\"]", "", 1),
+        ("res", ".f", "", 1),
+        ("1", " + 1", "", 1),
+        ("", "not ", "True", 1),
+        ("", "-", "1", 1),
+        ("", "1 if a else ", "1", 2),
+        ("", "lambda: ", "1", 1),
+    ];
+    for (head, link, tail, per) in shapes {
+        let at = |n: usize| in_main(&format!("x = {head}{}{tail}", link.repeat(n)));
+        let most = (MAX_EXPRESSION_CHAIN - 1) / per;
+        assert!(!too_deep(&at(most)), "{link}");
+        assert!(too_deep(&at(most + 1)), "{link}");
+    }
+}
+
+#[test]
+fn a_comma_starts_a_new_chain() {
+    let item = format!("1{}", " + 1".repeat(MAX_EXPRESSION_CHAIN / 2));
+    let list = vec![item; 4].join(", ");
+    assert!(!too_deep(&in_main(&format!("x = [{list}]"))));
+}
+
+/// `main` whose body nests `depth` blocks in all, the innermost holding `body`.
+fn nested_blocks(depth: usize, body: &str) -> String {
+    let mut source = "def main():\n".to_owned();
+    for level in 1..depth {
+        source += &format!("{}if a:\n", "    ".repeat(level));
+    }
+    source + &format!("{}{body}\n", "    ".repeat(depth))
+}
+
+#[test]
+fn blocks_nest_to_the_bound() {
+    assert!(!too_deep(&nested_blocks(MAX_BLOCK_DEPTH, "pass")));
+    assert!(too_deep(&nested_blocks(MAX_BLOCK_DEPTH + 1, "pass")));
+}
+
+/// An `if` statement with `elifs` `elif` clauses in `main`, the last one's body holding `body`
+/// (already indented).
+fn elif_chain(elifs: usize, body: &str) -> String {
+    let mut source = "def main():\n    if a:\n        pass\n".to_owned();
+    for _ in 1..elifs {
+        source += "    elif a:\n        pass\n";
+    }
+    source + &format!("    elif a:\n{body}    else:\n        pass\n")
+}
+
+#[test]
+fn elif_chains_reach_the_bound() {
+    assert!(!too_deep(&elif_chain(MAX_ELIF_CHAIN, "        pass\n")));
+    let past = elif_chain(MAX_ELIF_CHAIN + 1, "        pass\n");
+    assert!(too_deep(&past));
+    // Separate `if` statements do not add up.
+    let two = elif_chain(MAX_ELIF_CHAIN, "        pass\n").replacen("def main():\n", "", 1);
+    assert!(!too_deep(&format!("def main():\n{two}{two}")));
+}
+
+/// A file at every bound at once, in the costliest shapes: an `elif` chain whose last branch
+/// nests blocks, the innermost holding nested brackets (`opening` each, which also adds
+/// `links` links to the chain) around a `not` chain that fills the rest of the chain bound.
+fn at_every_bound(opening: &str, links: usize) -> String {
+    let expression = format!(
+        "x = {}{}True{}",
+        opening.repeat(MAX_BRACKET_DEPTH),
+        "not ".repeat(MAX_EXPRESSION_CHAIN - 1 - links * MAX_BRACKET_DEPTH),
+        "]".repeat(MAX_BRACKET_DEPTH)
+    );
+    // The `elif` body is at depth 2; it nests the remaining blocks.
+    let mut body = String::new();
+    for level in 2..MAX_BLOCK_DEPTH {
+        body += &format!("{}if a:\n", "    ".repeat(level));
+    }
+    body += &format!("{}{expression}\n", "    ".repeat(MAX_BLOCK_DEPTH));
+    format!("a = 1\n{}", elif_chain(MAX_ELIF_CHAIN, &body))
+}
+
+/// Within the bounds, a file checks without overflow in a debug build, and its AST is dropped on
+/// this test thread's default stack.
+#[test]
+fn a_file_at_every_bound_checks() {
+    let checked = passes(&at_every_bound("[", 0));
+    drop(checked);
+    // Nested comprehensions cost the most stack per bracket; the subset rejects them, after
+    // parsing.
+    let comprehensions = bare_codes(&at_every_bound("[1 for a in ", 2));
+    assert!(!comprehensions.is_empty());
+    assert!(!comprehensions.contains(&StarCode::NestingTooDeep));
+}
+
+#[test]
+fn a_hundred_thousand_levels_are_refused() {
+    let chain = in_main(&format!("x = res{}", "[\"f\"]".repeat(100_000)));
+    assert_eq!(bare_codes(&chain), [StarCode::NestingTooDeep]);
+    let brackets = in_main(&format!(
+        "x = {}1{}",
+        "(".repeat(100_000),
+        ")".repeat(100_000)
+    ));
+    let errors = check("test.star", &brackets).unwrap_err();
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].code, StarCode::NestingTooDeep);
+    assert_eq!(
+        (errors[0].line, errors[0].column),
+        (2, 9 + MAX_BRACKET_DEPTH as u32)
+    );
+    assert!(errors[0].hint.contains("brackets"), "{}", errors[0].hint);
+}
+
+#[test]
+fn a_source_past_the_size_bound_is_refused() {
+    let at = |n: usize| format!("def main():\n    pass\n#{}", "a".repeat(n - 22));
+    assert_eq!(at(MAX_SOURCE_BYTES).len(), MAX_SOURCE_BYTES);
+    assert!(check("test.star", &at(MAX_SOURCE_BYTES)).is_ok());
+    let errors = check("test.star", &at(MAX_SOURCE_BYTES + 1)).unwrap_err();
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].code, StarCode::SourceTooLarge);
+    assert_eq!(errors[0].line, 3);
 }

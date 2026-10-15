@@ -195,6 +195,30 @@ can be a `diag` call: the transpiler evaluates them in that order into locals be
 missing, repeated or unknown argument, or too many positional ones, is `STAR_ARGUMENT_MISMATCH`;
 for a call through a function parameter (2.6) it is checked in each specialized copy.
 
+### 2.8 Size and Nesting Limits
+
+A file is held to these limits before it is parsed (ADR-303), so that no file, however it is
+nested, can exhaust the converter's stack:
+
+| Limit | Bound | Error code |
+|---|---|---|
+| Source size | 1 MiB (1,048,576 bytes) | `STAR_SOURCE_TOO_LARGE` |
+| Bracket depth: `(`, `[`, `{` and an f-string's `{` nested inside each other | 64 | `STAR_NESTING_TOO_DEEP` |
+| Block depth: indented blocks nested inside each other, the function body included | 32 | `STAR_NESTING_TOO_DEEP` |
+| `elif` clauses of the `if` statements enclosing a point, together | 256 | `STAR_NESTING_TOO_DEEP` |
+| Expression chain: operators, keywords and accesses (`.`, an index, a call) of the expressions enclosing a point, together | 512 | `STAR_NESTING_TOO_DEEP` |
+
+The expression chain is counted per bracket level from the last comma at that level, so the
+items of a list, a dict or an argument list each start a chain of their own, and what a bracket
+holds adds to the chain around it. Every operator and keyword token counts, a unary one too, and
+so does an assignment's `=`; `x = a + b` is a chain of 2 and `res["fields"]["rpm"]` of 2.
+Separate statements do not add up, and an `if` statement's `elif` clauses stop counting where the
+statement ends.
+
+A file past a limit is refused with one error at the token that passes it, as a syntax error is
+(5). Split a deep expression with intermediate names, a long `elif` chain or a deep block with
+helper functions.
+
 ---
 
 ## 3. Diagnostic Primitive API
@@ -473,6 +497,8 @@ specialized copy's (2.6) at the callee's.
 A syntax error is different: the parser (6) stops at the first one and returns no AST, so a file
 that does not parse reports that single error (`STAR_SYNTAX_ERROR`, or
 `STAR_UNBOUNDED_NOT_ALLOWED` when the parser stops at `while`, which it reads as a reserved word).
+A file past a limit of 2.8 is not parsed at all and reports that single error
+(`STAR_SOURCE_TOO_LARGE` or `STAR_NESTING_TOO_DEEP`).
 Subset validation runs on a file that parses and lists every violation it finds, sorted by
 position. Lines and columns count from 1; the column counts characters. The snippet is the
 source line; of a line longer than 160 characters it is the 160 characters around the column, so
@@ -508,6 +534,12 @@ that many violations on one long line stay small.
 
 - Parse with the syntax crate of `starlark-rust` (`starlark_syntax`), using only its parser and
   AST, not its evaluator. Walk the AST to detect 2.3
+- The limits of 2.8 are checked by one pass over the tokens of `starlark_syntax`'s own lexer,
+  before the parser runs: its parser, the validation it runs after parsing, the checker's walk
+  and the AST's drop all recurse once per level of the AST, and every inner node of an
+  expression has a token of its own, so the counts bound that depth. A file within them is parsed
+  and checked, and the lowering walks its AST, on a thread with a fixed 16 MiB stack, about three
+  times what a file at every limit at once needs in a debug build (ADR-303)
 - Detection uses an "allowlist approach". Unknown node kinds are rejected as
   `STAR_UNSUPPORTED_SYNTAX` so that nothing slips through by oversight
 - Comment annotations (4.2, 4.5, 4.6) are taken from the comment tokens the parser's lexer

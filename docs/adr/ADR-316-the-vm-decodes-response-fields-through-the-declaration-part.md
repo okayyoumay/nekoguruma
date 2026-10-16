@@ -40,8 +40,9 @@ The maintainer chose the first.
    - `Vm::step_with_declarations(program, declarations, host)` takes the variant's `EcuVariant`.
      `Vm::step` is that call without declarations, so existing callers are unchanged until they
      need decoding.
-   - The declarations are not part of the VM state. The journaled state stays the same, and the
-     job runner passes the document it already holds for the job.
+   - The declarations are not part of the VM state, so the journaled state stays the same. The
+     caller passes the variant's document for the job. The agent's job runner does not hold one
+     yet and still calls `Vm::step` (Consequences).
 3. **Values map onto the VM's value types.**
 
    | Decoded value | VM value |

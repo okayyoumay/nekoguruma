@@ -425,6 +425,33 @@ fn remainder_truncates_like_division() {
 }
 
 #[test]
+fn negation_of_integers_and_floats() {
+    assert_eq!(
+        eval(vec![i(5), Op::Neg, i(-7), Op::Neg, i(0), Op::Neg]),
+        [Value::I64(-5), Value::I64(7), Value::I64(0)]
+    );
+    assert_eq!(eval(vec![i(i64::MAX), Op::Neg]), [Value::I64(-i64::MAX)]);
+    assert_eq!(eval(vec![Op::PushF64(1.5), Op::Neg]), [Value::F64(-1.5)]);
+    let [Value::F64(zero)] = eval(vec![Op::PushF64(0.0), Op::Neg])[..] else {
+        panic!("not a float");
+    };
+    assert!(zero == 0.0 && zero.is_sign_negative());
+    // Each error leaves the state as it was (checked by `expect_vm_error`).
+    assert_eq!(
+        expect_vm_error(vec![i(i64::MIN), Op::Neg], vec![], 1),
+        VmError::Overflow
+    );
+    assert_eq!(
+        expect_vm_error(vec![Op::PushBytes(0), Op::Neg], vec![vec![1]], 1),
+        VmError::TypeMismatch
+    );
+    assert_eq!(
+        expect_vm_error(vec![Op::Neg], vec![], 0),
+        VmError::StackUnderflow
+    );
+}
+
+#[test]
 fn length_pushes_the_length_above_the_bytes() {
     let program = prog(
         vec![Op::PushBytes(0), Op::Length, Op::PushBytes(1), Op::Length],
@@ -989,6 +1016,7 @@ fn primitive_classification_covers_every_instruction() {
         Op::Fail { code: 0 },
         Op::Length,
         Op::Rem,
+        Op::Neg,
     ];
     for (index, op) in all.iter().enumerate() {
         // The postcard encoding starts with the variant index, so this also pins the variant

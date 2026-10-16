@@ -22,7 +22,8 @@ use serde::{Deserialize, Serialize};
 /// agent's `capabilities` (9.5) changes.
 /// 4: `Op` gained `Length`, for the same reason (ADR-233).
 /// 5: `Op` gained `Rem`, for the same reason.
-pub const IR_SCHEMA_VERSION: u32 = 5;
+/// 6: `Op` gained `Neg`, for the same reason.
+pub const IR_SCHEMA_VERSION: u32 = 6;
 
 /// The longest code, in bytes, that `Program::validate` accepts for a `Fail` (ADR-280).
 pub const MAX_FAILURE_CODE_LEN: usize = 128;
@@ -138,6 +139,9 @@ pub enum Op {
     /// out of range (`i64::MIN` by -1 gives 0); dividing an integer by 0 is
     /// `VmError::DivisionByZero`, a float by 0 gives NaN.
     Rem,
+    /// Negates the `I64` or `F64` on top of the stack. Negating `i64::MIN` is
+    /// `VmError::Overflow`; a float only changes its sign, NaN and zeros included.
+    Neg,
 }
 
 // ---------------------------------------------------------------- Program
@@ -245,6 +249,7 @@ impl Op {
             | Op::IndexSet
             | Op::Length
             | Op::Rem
+            | Op::Neg
             | Op::Fail { .. } => false,
         }
     }
@@ -503,6 +508,14 @@ impl Vm {
                 let result = compare(op, self.top(2)?)?;
                 self.replace(2, Value::Bool(result));
             }
+            Op::Neg => {
+                let result = match self.top(1)?[0] {
+                    Value::I64(a) => Value::I64(a.checked_neg().ok_or(VmError::Overflow)?),
+                    Value::F64(a) => Value::F64(-a),
+                    _ => return Err(VmError::TypeMismatch.into()),
+                };
+                self.replace(1, result);
+            }
             Op::Not => {
                 let Value::Bool(b) = self.top(1)?[0] else {
                     return Err(VmError::TypeMismatch.into());
@@ -734,7 +747,8 @@ impl Vm {
             | Op::IndexGet
             | Op::IndexSet
             | Op::Length
-            | Op::Rem => HostInput::Nothing,
+            | Op::Rem
+            | Op::Neg => HostInput::Nothing,
             // The checks of `Fail` run in `execute`, before it changes anything.
             Op::Fail { .. } => HostInput::Nothing,
         })

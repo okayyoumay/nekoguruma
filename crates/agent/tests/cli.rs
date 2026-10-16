@@ -125,6 +125,92 @@ fn refused_program_exits_with_1_before_resolving_the_vci() {
     assert_fails_with(output, "refused");
 }
 
+#[test]
+fn a_program_that_decodes_without_a_document_exits_with_1_before_resolving_the_vci() {
+    let temp = TempDir::new("no-document");
+    let program = write_program(
+        &temp.0,
+        vec![
+            Op::PushBytes(0),
+            Op::DecodeField {
+                service: 1,
+                field: 1,
+            },
+        ],
+    );
+    let output = ngr_agent()
+        .args(["run", "--vci", "none", "--mode", "user", "--program"])
+        .arg(program)
+        .output()
+        .expect("ngr-agent should run");
+    assert_fails_with(output, "no document");
+}
+
+/// A variant's document with no services, carrying `procedure`.
+fn write_document(dir: &Path, procedure: Option<Vec<u8>>) -> PathBuf {
+    use diag_ir::declaration::{EcuDocumentT, EcuVariantT, encode_ecu_document};
+    let mut variant = EcuVariantT::default();
+    variant.id = 1;
+    variant.short_name = Some("v".into());
+    let mut document = EcuDocumentT::default();
+    document.schema_version = IR_SCHEMA_VERSION;
+    document.source_format = Some("csv-starlark".into());
+    document.source_digest = Some("00".into());
+    document.variant = Some(Box::new(variant));
+    document.procedure = procedure;
+    let path = dir.join("variant.dir");
+    std::fs::write(&path, encode_ecu_document(&document)).expect("document should be writable");
+    path
+}
+
+#[test]
+fn a_document_that_cannot_run_exits_with_1_before_resolving_the_vci() {
+    let temp = TempDir::new("document");
+    let not_a_document = temp.0.join("not.dir");
+    std::fs::write(&not_a_document, b"not a document").expect("file should be writable");
+    // A field the document does not declare.
+    let decodes = Program {
+        schema_version: IR_SCHEMA_VERSION,
+        code: vec![
+            Op::PushBytes(0),
+            Op::DecodeField {
+                service: 1,
+                field: 1,
+            },
+        ],
+        constants: vec![vec![0x62]],
+        sections: Vec::new(),
+        source_map: Vec::new(),
+        identity: Default::default(),
+        preconditions: Default::default(),
+        flash: Vec::new(),
+    };
+    let undeclared = write_document(
+        &temp.0,
+        Some(postcard::to_allocvec(&decodes).expect("program should serialize")),
+    );
+    let cases = [
+        (temp.0.join("missing.dir"), "cannot read"),
+        (not_a_document, "not a variant document"),
+        (undeclared, "does not declare"),
+    ];
+    for (path, message) in cases {
+        let output = ngr_agent()
+            .args(["run", "--vci", "none", "--mode", "user", "--document"])
+            .arg(&path)
+            .output()
+            .expect("ngr-agent should run");
+        assert_fails_with(output, message);
+    }
+    let without_procedure = TempDir::new("no-procedure");
+    let output = ngr_agent()
+        .args(["run", "--vci", "none", "--mode", "user", "--document"])
+        .arg(write_document(&without_procedure.0, None))
+        .output()
+        .expect("ngr-agent should run");
+    assert_fails_with(output, "carries no procedure");
+}
+
 /// A release build refuses every write before a worker starts (ADR-235 item 8, ADR-247); a
 /// debug build allows them on the simulator, so it cannot refuse them up front.
 #[cfg(not(debug_assertions))]

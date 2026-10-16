@@ -1,6 +1,7 @@
 //! `ngr-agent`: the device-side agent (design 3.3). The job runner lives in the `agent` library.
-//! The binary's one command, `ngr-agent run`, runs one IR program on a VCI and prints the final
-//! VM state as JSON (`crates/agent/docs/ngr-agent.md`).
+//! The binary's one command, `ngr-agent run`, runs one IR program, or the procedure of a
+//! variant's document, on a VCI and prints the final VM state as JSON
+//! (`crates/agent/docs/ngr-agent.md`).
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -11,15 +12,16 @@ use std::time::Duration;
 use agent::guards::{GuardSetup, JobGuards};
 use agent::launch::{Api, launch_worker};
 use agent::policy::{build_ceiling, writes};
-use agent::{JobLimits, LinkConfig, check_program, run_program};
+use agent::{Job, JobDocument, JobLimits, LinkConfig, check_job, run_program};
 use diag_ir::{Program, Value, VmState};
 use worker_host::service::{LaunchOptions, OperatingMode, Stopped, WorkerLayout};
 
 const USAGE: &str = "\
-usage: ngr-agent run --vci <name> --mode <device|user> --program <file> [options]
+usage: ngr-agent run --vci <name> --mode <device|user> (--program <file> | --document <file>)
+                     [options]
 
-Runs an IR program (diag-ir Program as JSON) on a J2534 v04.04 or D-PDU API VCI and prints
-the final VM state as JSON on stdout.
+Runs an IR program (diag-ir Program as JSON), or the procedure of a variant's document, on a
+J2534 v04.04 or D-PDU API VCI and prints the final VM state as JSON on stdout.
 
 options:
   --vci <name>         library name the worker service resolves: a J2534 library, or the
@@ -28,7 +30,9 @@ options:
   --mode <device|user> the device's operating mode, passed to the worker: device mode
                        refuses a library that fails the pre-load checks, user mode
                        reports the findings and loads it
-  --program <file>     IR program file (JSON)
+  --program <file>     IR program file (JSON); it decodes no response fields
+  --document <file>    a variant's document (.dir): runs its procedure, which decodes
+                       response fields through the variant's declarations
   --workers <dir>      worker binaries, laid out as <dir>/<ABI name>/<binary>
                        (default: the 'workers' directory next to ngr-agent)
   --locks <dir>        the device's lock directory for the VCI lock and the reprogramming
@@ -42,12 +46,21 @@ const GUARD_POLL: Duration = Duration::from_millis(10);
 /// How long a stopping worker may take to close its link before it is killed.
 const STOP_GRACE: Duration = Duration::from_secs(5);
 
+/// The file a run's job comes from.
+#[derive(Debug, PartialEq, Eq)]
+enum JobFile {
+    /// A `diag_ir::Program` as JSON.
+    Program(PathBuf),
+    /// A variant's document, whose procedure is the program (design 8.2.6).
+    Document(PathBuf),
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct RunArgs {
     api: Api,
     vci: String,
     mode: OperatingMode,
-    program: PathBuf,
+    job: JobFile,
     workers: Option<PathBuf>,
     locks: Option<PathBuf>,
     link: LinkConfig,
@@ -95,7 +108,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<RunArgs, Strin
     let mut api = Api::J2534;
     let mut vci = None;
     let mut mode = None;
-    let mut program = None;
+    let mut job = None;
     let mut workers = None;
     let mut locks = None;
     let mut tx_id = 0x7E0;
@@ -129,7 +142,11 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<RunArgs, Strin
                     .parse()
                     .map_err(|error| format!("--api: {error}"))?
             }
-            "--program" => program = Some(PathBuf::from(value)),
+            "--program" | "--document" if job.is_some() => {
+                return Err("give --program or --document, once".to_owned());
+            }
+            "--program" => job = Some(JobFile::Program(PathBuf::from(value))),
+            "--document" => job = Some(JobFile::Document(PathBuf::from(value))),
             "--workers" => workers = Some(PathBuf::from(value)),
             // A relative path would name a different lock set from each working directory.
             "--locks" if !Path::new(&value).is_absolute() => {
@@ -148,7 +165,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<RunArgs, Strin
         vci: vci.ok_or("--vci is required")?,
         // The mode is fixed per device at installation (design 6.2); there is no default.
         mode: mode.ok_or("--mode is required")?,
-        program: program.ok_or("--program is required")?,
+        job: job.ok_or("--program or --document is required")?,
         workers,
         locks,
         link,
@@ -189,14 +206,32 @@ fn next_to_exe(name: &str, flag: &str) -> Result<PathBuf, String> {
     Ok(dir.join(name))
 }
 
+/// Reads the job a run's file gives.
+fn read_job(file: &JobFile) -> Result<Job, String> {
+    match file {
+        JobFile::Program(path) => {
+            let text = std::fs::read_to_string(path)
+                .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+            let program: Program = serde_json::from_str(&text)
+                .map_err(|error| format!("{} is not an IR program: {error}", path.display()))?;
+            Ok(program.into())
+        }
+        JobFile::Document(path) => {
+            let bytes = std::fs::read(path)
+                .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+            JobDocument::new(bytes)
+                .and_then(Job::from_document)
+                .map_err(|error| format!("{}: {error}", path.display()))
+        }
+    }
+}
+
 /// Runs the job and returns the final VM state as JSON.
 async fn run(args: RunArgs) -> Result<String, String> {
-    let text = std::fs::read_to_string(&args.program)
-        .map_err(|error| format!("cannot read {}: {error}", args.program.display()))?;
-    let program: Program = serde_json::from_str(&text)
-        .map_err(|error| format!("{} is not an IR program: {error}", args.program.display()))?;
+    let job = read_job(&args.job)?;
+    let program = job.program();
     // A program the job would refuse does not need a worker.
-    check_program(&program, build_ceiling()).map_err(|error| format!("job failed: {error}"))?;
+    check_job(&job, build_ceiling()).map_err(|error| format!("job failed: {error}"))?;
     // The per-VCI lock, and the reprogramming slot for a program that writes (design 8.8.1). The
     // wait polls a file lock, so it runs off the runtime's threads; nothing cancels it here.
     let dir = match args.locks {
@@ -207,7 +242,7 @@ async fn run(args: RunArgs) -> Result<String, String> {
         dir,
         vci: args.vci.clone(),
     };
-    let writes = writes(&program);
+    let writes = writes(program);
     let guards = tokio::task::spawn_blocking(move || {
         let never = AtomicBool::new(false);
         if writes {
@@ -234,14 +269,8 @@ async fn run(args: RunArgs) -> Result<String, String> {
     )
     .await
     .map_err(|error| error.to_string())?;
-    let (result, mut guards) = run_program(
-        worker.client,
-        &args.link,
-        program,
-        JobLimits::default(),
-        guards,
-    )
-    .await;
+    let (result, mut guards) =
+        run_program(worker.client, &args.link, job, JobLimits::default(), guards).await;
     // The job has closed its link whatever the result, unless its guards say otherwise
     // (ADR-258). A stop that reaped the worker means the worker no longer holds the link; a
     // vendor device server may still hold the device a while, which the next open detects.
@@ -313,7 +342,7 @@ mod tests {
                 api: Api::J2534,
                 vci: "sim-vci".to_owned(),
                 mode: OperatingMode::User,
-                program: PathBuf::from("p.json"),
+                job: JobFile::Program(PathBuf::from("p.json")),
                 workers: None,
                 locks: None,
                 link: LinkConfig::iso15765(0x7E0, 0x7E8),
@@ -349,6 +378,9 @@ mod tests {
         assert_eq!(args.workers, Some(PathBuf::from("w")));
         assert_eq!(args.locks, Some(locks));
         assert_eq!((args.link.tx_id, args.link.rx_id), (0x7DF, 0x7E9));
+        let args = parse(&["run", "--vci", "x", "--mode", "user", "--document", "v.dir"])
+            .expect("valid arguments");
+        assert_eq!(args.job, JobFile::Document(PathBuf::from("v.dir")));
     }
 
     #[test]
@@ -357,6 +389,40 @@ mod tests {
             &[][..],
             &["start"],
             &["run", "--mode", "user", "--program", "p.json"],
+            // One job file.
+            &[
+                "run",
+                "--vci",
+                "x",
+                "--mode",
+                "user",
+                "--program",
+                "p",
+                "--document",
+                "d",
+            ],
+            &[
+                "run",
+                "--vci",
+                "x",
+                "--mode",
+                "user",
+                "--document",
+                "d",
+                "--document",
+                "d",
+            ],
+            &[
+                "run",
+                "--vci",
+                "x",
+                "--mode",
+                "user",
+                "--program",
+                "p",
+                "--program",
+                "p",
+            ],
             &["run", "--vci", "x", "--mode", "user"],
             &["run", "--vci"],
             // The mode has no default and only the exact spellings select one.

@@ -5,7 +5,8 @@
 //! diag-ir procedure on a CAN link to the simulated ECU behind it.
 //!
 //! A second job switches the ECU to its programming session and runs a routine, which only a
-//! debug build allows and only on the simulator (ADR-247).
+//! debug build allows and only on the simulator (ADR-247). A third reads the VIN again and
+//! decodes it through the job's document (ADR-316).
 //!
 //! This file holds a single test, so the process-wide `VCI_CONFIG_PATH` it sets for the
 //! spawned service cannot race with another test.
@@ -15,7 +16,11 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agent::guards::{GuardSetup, JobGuards};
-use agent::{JobLimits, LinkConfig, run_program};
+use agent::{Job, JobDocument, JobLimits, LinkConfig, run_program};
+use diag_ir::declaration::{
+    DataKind, EcuDocumentT, EcuVariantT, FieldT, Placement, PositiveResponseT, ServiceT,
+    encode_ecu_document,
+};
 use diag_ir::{IR_SCHEMA_VERSION, Op, Program, Value};
 use worker_host::client::ConnectOptions;
 use worker_host::service::{LaunchOptions, OperatingMode, ServiceKind, WorkerProcess};
@@ -99,6 +104,54 @@ fn write_program() -> Program {
         preconditions: Default::default(),
         flash: Vec::new(),
     }
+}
+
+/// A variant's document with one service, 1: ReadDataByIdentifier of the VIN, whose positive
+/// response is `62 F1 90` and the 17 ASCII bytes of field 1. Its procedure is `procedure`.
+fn vin_document(procedure: &Program) -> Vec<u8> {
+    let mut vin = FieldT::default();
+    vin.id = 1;
+    vin.short_name = Some("vin".into());
+    vin.placement = Placement::AfterPrevious;
+    vin.bit_length = 17 * 8;
+    vin.kind = DataKind::Ascii;
+    let mut positive = PositiveResponseT::default();
+    positive.sid = 0x62;
+    positive.prefix = Some(vec![0xF1, 0x90]);
+    positive.fields = Some(vec![vin]);
+    let mut service = ServiceT::default();
+    service.id = 1;
+    service.short_name = Some("readVin".into());
+    service.positive = Some(Box::new(positive));
+    let mut variant = EcuVariantT::default();
+    variant.id = 1;
+    variant.short_name = Some("sim".into());
+    variant.services = Some(vec![service]);
+    let mut document = EcuDocumentT::default();
+    document.schema_version = IR_SCHEMA_VERSION;
+    document.source_format = Some("csv-starlark".into());
+    document.source_digest = Some("00".into());
+    document.variant = Some(Box::new(variant));
+    document.procedure = Some(postcard::to_allocvec(procedure).expect("program should serialize"));
+    encode_ecu_document(&document)
+}
+
+/// A document whose procedure reads the VIN and decodes its field through the document.
+fn decoding_job() -> Job {
+    let procedure = Program {
+        code: vec![
+            Op::PushBytes(0),
+            Op::ServiceRequest { service: 0x22 },
+            Op::DecodeField {
+                service: 1,
+                field: 1,
+            },
+        ],
+        constants: vec![vec![0xF1, 0x90]],
+        ..program()
+    };
+    let document = JobDocument::new(vin_document(&procedure)).expect("the document loads");
+    Job::from_document(document).expect("the document carries its procedure")
 }
 
 #[test]
@@ -229,6 +282,21 @@ async fn run_the_job() {
     // checks; without an image transferred it ends in a request sequence error (0x24) instead
     // of the request out of range (0x31) it answers in the default session.
     assert_eq!(routine, &[0x7F, 0x31, 0x24], "{state:?}");
+
+    // The VIN as the procedure reads it: decoded through the job's document.
+    let (state, _guards) = run_program(
+        worker
+            .connect(&ConnectOptions::default())
+            .await
+            .expect("client should connect"),
+        &LinkConfig::iso15765(0x7E0, 0x7E8),
+        decoding_job(),
+        JobLimits::default(),
+        job_guards(false),
+    )
+    .await;
+    let state = state.expect("the decoding job should finish");
+    assert_eq!(state.stack, [Value::Bytes(VIN.to_vec())], "{state:?}");
 
     worker
         .stop(Duration::from_secs(5))

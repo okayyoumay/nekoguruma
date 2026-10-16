@@ -1,13 +1,13 @@
 # `ngr-agent`
 
 `ngr-agent` is the binary of the `agent` crate (design 3.3). It has one command, which runs a
-single IR program on a VCI for local end-to-end runs and tests; it does not connect to the
-server or take jobs from it.
+single IR program, or the procedure of a variant's document, on a VCI for local end-to-end runs
+and tests; it does not connect to the server or take jobs from it.
 
 ## `ngr-agent run`
 
 ```sh
-ngr-agent run --vci <name> --mode <device|user> --program <file> [--api <j2534|dpdu>] [--workers <dir>] [--locks <dir>] [--tx-id <hex>] [--rx-id <hex>]
+ngr-agent run --vci <name> --mode <device|user> (--program <file> | --document <file>) [--api <j2534|dpdu>] [--workers <dir>] [--locks <dir>] [--tx-id <hex>] [--rx-id <hex>]
 ```
 
 | Option | Meaning |
@@ -15,7 +15,8 @@ ngr-agent run --vci <name> --mode <device|user> --program <file> [--api <j2534|d
 | `--vci` | The library name, resolved the same way by the agent (step 3) and the worker service (design 7.1.1). For J2534 v04.04: the registry key name on Windows, the `Name` of a registration definition on Linux. For the D-PDU API: the `SHORT_NAME` of an implementation in the root description file |
 | `--api` | The API the VCI's library implements: `j2534` (J2534 v04.04, `j2534-0404-service`; the default) or `dpdu` (the D-PDU API, `iso22900-service`). The names are those of a VCI profile's `standard.kind` (`schemas/vci-profile.schema.json`) |
 | `--mode` | The device's operating mode (design 6.2), `device` or `user`. Required: the mode is fixed per device at installation, and this command, which has no installation of its own, takes it from the command line rather than defaulting to either. It is passed to the worker (ADR-281 Decision item 2); design 7.2 gives it its meaning for a failed library check: device mode refuses the library, user mode reports the findings and loads it. Both worker services apply it to the checks they run before loading |
-| `--program` | IR program file: a `diag_ir::Program` serialized as JSON |
+| `--program` | IR program file: a `diag_ir::Program` serialized as JSON. A program alone has no declarations to decode response fields with, so one that decodes (`Op::DecodeField`, ADR-316) is refused in step 1 |
+| `--document` | A variant's document (design 8.2.6, `.dir`): its procedure is the program, and the job decodes response fields through its variant's declarations (`agent::JobDocument`). The document is checked as `diag_ir::declaration::load_ecu_document` checks it (ADR-296), and one without a procedure, or whose procedure is not exactly one program, is refused (ADR-318). Give exactly one of `--program` and `--document` |
 | `--workers` | Directory of worker builds, laid out as `<dir>/<ABI name>/j2534-0404-service[.exe]` and `<dir>/<ABI name>/iso22900-service[.exe]` (design 7.3). Default: `workers` next to the `ngr-agent` executable |
 | `--locks` | The device's lock directory for the job's guards ("Job guards" below), as an absolute path. Default: `locks` next to the `ngr-agent` executable. Lock files are opened read-only, so a file another user created still locks. The agent creates a missing directory writable by its owner only, so a device whose agents run as several users needs it prepared beforehand: writable by all of them, and with the sticky bit (or an equivalent ACL) so that no user can delete another's lock files (ADR-257). It must also be readable by every agent user, since the per-vehicle lock lists it, and on Unix support hard links, with which it creates its files (ADR-262). On Unix a directory that group or others may write without the sticky bit, or without being readable by them, is refused |
 | `--tx-id`, `--rx-id` | Physical request and response CAN IDs in hex, with or without `0x`. Default `7E0` / `7E8`. Only 11-bit IDs: the link does not set the CAN ID format |
@@ -23,9 +24,11 @@ ngr-agent run --vci <name> --mode <device|user> --program <file> [--api <j2534|d
 The link is UDS on ISO 15765 at 500 kbit/s (`LinkConfig::iso15765`), with the CAN IDs from the
 command line rather than from the program.
 
-Steps (`agent::check_program`, `agent::guards::JobGuards`, `agent::launch::launch_worker`, then `agent::run_program`):
+Steps (`agent::check_job`, `agent::guards::JobGuards`, `agent::launch::launch_worker`, then `agent::run_program`):
 
-1. Read the program and check it (`agent::check_program`): a program whose schema version or
+1. Read the program, or the document and its procedure, and check the job (`agent::check_job`):
+   a program that decodes response fields without a document, or decodes a field the document
+   does not declare (ADR-318), a program whose schema version or
    size this VM does not accept, one whose restart declaration `Program::validate` refuses
    (ADR-245), or one with a request this build may never send (a release build sends only
    read-only requests; ADR-235 item 8, ADR-247), fails here,

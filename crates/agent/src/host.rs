@@ -291,6 +291,8 @@ pub struct WorkerHost {
     vbatt_id: crate::inputs::VbattId,
     /// The blocks of the transfer in progress (ADR-250).
     transfer: TransferCounter,
+    /// The job's document, which the VM decodes response fields with (ADR-316).
+    document: Option<crate::document::JobDocument>,
 }
 
 impl WorkerHost {
@@ -303,7 +305,13 @@ impl WorkerHost {
             waits: HashMap::new(),
             vbatt_id: crate::inputs::VbattId::Unknown,
             transfer: TransferCounter::default(),
+            document: None,
         }
+    }
+
+    /// Gives the host the job's document (`crate::document`).
+    pub fn set_document(&mut self, document: Option<crate::document::JobDocument>) {
+        self.document = document;
     }
 
     /// The number of TransferData blocks the ECU confirmed since the last RequestDownload sent
@@ -529,6 +537,12 @@ fn is_response_pending(response: &[u8]) -> bool {
 pub trait TransferProgress {
     /// See [`WorkerHost::transfer_block_index`].
     fn transfer_block_index(&self) -> Option<u64>;
+}
+
+impl crate::document::Declarations for WorkerHost {
+    fn declarations(&self) -> Option<crate::document::JobDocument> {
+        self.document.clone()
+    }
 }
 
 impl TransferProgress for WorkerHost {

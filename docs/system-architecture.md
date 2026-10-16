@@ -809,7 +809,7 @@ Approximately 50-80 instructions are expected.
 | Arithmetic, logic, comparison | Integer and floating-point arithmetic (including the remainder, negation and conversion between the two), bitwise operations, comparison |
 | Control | Branch, conditional branch, subroutine call and return, declared failure (the procedure ends itself as failed with a code and a detail, ADR-280) |
 | Variables | Local and global read/write, array access, byte-string length, concatenation and slices |
-| Declarations | Decoding a response field through the declaration part the VM is stepped with (ADR-316) |
+| Declarations | Decoding a response field through the declaration part the VM is stepped with (ADR-316). An agent job with a document is made from the variant's document, whose procedure is the program, and the VM is stepped with its declarations on every run, a restart's included; the caller passes the same document again, since the journal does not record it. A program that decodes without a document, or decodes a field the document does not declare, is refused before its link opens (ADR-318) |
 | Diagnostic primitives | Service execution, DTC read, routine control, security access request, flash transfer, wait, HMI request, record template input request (4.3.1), monitoring section capture (4.6), log output |
 
 No instructions are defined that correspond to external access (files, network, process launch, dynamic code generation).

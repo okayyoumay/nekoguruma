@@ -981,20 +981,37 @@ fn store(slots: &mut Vec<Option<Value>>, slot: u16, value: Value) {
 
 /// The value of field `field` of service `service`'s positive response in `message`, decoded
 /// through `variant` ([`Op::DecodeField`], ADR-316).
-fn decode_field(
+/// Checks every `Op::DecodeField` of `program` against `variant`, as the instruction checks it
+/// before decoding: the error of the first one that names a field the variant does not declare
+/// as a top-level field of the service's positive response, or one with a nested layout, with
+/// its instruction's index. These errors depend only on the declarations, so a caller can refuse
+/// such a program before it runs (ADR-316).
+pub fn check_decode_fields(
+    program: &Program,
     variant: &EcuVariant<'_>,
+) -> Result<(), (u32, VmError)> {
+    for (pc, op) in program.code.iter().enumerate() {
+        if let Op::DecodeField { service, field } = op {
+            declared_positive(variant, *service, *field)
+                .map_err(|error| (u32::try_from(pc).unwrap_or(u32::MAX), error))?;
+        }
+    }
+    Ok(())
+}
+
+/// The positive response of `service` whose top-level field `field` is declared without a
+/// nested layout.
+fn declared_positive<'a>(
+    variant: &EcuVariant<'a>,
     service: u32,
     field: u32,
-    message: &[u8],
-) -> Result<Value, VmError> {
+) -> Result<crate::declaration::PositiveResponse<'a>, VmError> {
     let unknown = || VmError::UnknownField { service, field };
     let positive = variant
         .services()
         .and_then(|services| services.iter().find(|s| s.id() == service))
         .and_then(|s| s.positive())
         .ok_or_else(unknown)?;
-    // Checked before decoding: an unknown or shaped field is an error of the program whatever
-    // the response holds, so it is not reported as an undecodable response.
     let declared = positive
         .fields()
         .and_then(|fields| fields.iter().find(|f| f.id() == field))
@@ -1002,6 +1019,19 @@ fn decode_field(
     if declared.shape_type() != Shape::NONE {
         return Err(VmError::ShapedField { service, field });
     }
+    Ok(positive)
+}
+
+fn decode_field(
+    variant: &EcuVariant<'_>,
+    service: u32,
+    field: u32,
+    message: &[u8],
+) -> Result<Value, VmError> {
+    let unknown = || VmError::UnknownField { service, field };
+    // Checked before decoding: an unknown or shaped field is an error of the program whatever
+    // the response holds, so it is not reported as an undecodable response.
+    let positive = declared_positive(variant, service, field)?;
     let fields = decode::decode_positive_response(&positive, variant.layouts(), message)
         .map_err(|_| VmError::Undecodable { service })?;
     let decoded = fields

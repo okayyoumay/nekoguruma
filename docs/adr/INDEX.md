@@ -240,7 +240,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-248](ADR-248-dependabot-auto-merge-trust-boundary.md) | Dependabot's Cargo Minor/Patch Group Merges Itself | Accepted | `.github/workflows/dependabot-auto-merge.yml`, `.github/dependabot.yml` |
 | [ADR-249](ADR-249-backlog-loop-iterations-start-from-a-fresh-branch.md) | Backlog Loop Iterations Start from a Fresh Branch at `origin/main` | Accepted | `.claude/skills/backlog-loop` (step 1), `codeql-alerts` |
 | [ADR-250](ADR-250-agent-host-flash-transfer.md) | The Agent Host Implements FlashTransfer with Its Own Block Count | Accepted | `agent` host, policy; `diag-ir` plan validation |
-| [ADR-251](ADR-251-copilot-re-review-only-after-fixes-that-need-it.md) | Copilot Re-Review Only After Fixes That Need It | Accepted | `.claude/skills/pr-review-loop` (Steps 0, 4-5), `.github/copilot-instructions.md`, `CLAUDE.md` |
+| [ADR-251](ADR-251-copilot-re-review-only-after-fixes-that-need-it.md) | Copilot Re-Review Only After Fixes That Need It | Accepted (applies to Codex and Copilot alike, ADR-312) | `.claude/skills/pr-review-loop` (Steps 0, 4-5), `.github/copilot-instructions.md`, `CLAUDE.md` |
 | [ADR-252](ADR-252-job-runner-journals-at-plan-boundaries.md) | The Job Runner Journals at the Flash Recovery Plan's Boundaries | Accepted (item 2's open point decided by ADR-253; the step reaching a plan's end records the VM state since ADR-271, a step from inside the plan only since ADR-274; item 6 superseded by ADR-272; item 2 extended by ADR-291: a `RecoveryRequired` section outside the plans gets an intent ahead of its first primitive; item 7 amended by ADR-293: a program with a `RecoveryRequired` section keeps a journal without a plan too) | `agent` runner, journaling, inputs |
 | [ADR-253](ADR-253-restart-classification-and-the-recovery-point-intent.md) | Restart Classification and a Write-Ahead Intent at the Recovery-Required Point | Accepted (item 4's wiring into the runner decided by ADR-255; item 3's newest state includes the run start since ADR-272; item 3's entry-state read-back follows ADR-274 since the end state exists; item 3's step limit applies per run since ADR-287; item 1's intent is also written ahead of a `RecoveryRequired` section outside the plans since ADR-291) | `agent` restart, journaling, journal |
 | [ADR-254](ADR-254-starlark-for-proprietary-procedures.md) | Starlark Replaces JavaScript as the Proprietary Procedure Language | Accepted (`diag.fail` has an instruction since ADR-280; Decision item 4's bans on `lambda`, nested `def`, functions as values and default and keyword arguments narrowed by ADR-300) | `diag-frontend` subset spec, design 8.4, `ir.fbs` `source_format` |
@@ -301,6 +301,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-309](ADR-309-application-layer-profiles.md) | Application-Layer Profiles for Protocol-Neutral Diagnostic Calls | Accepted | `diag-frontend` lowering and CSV tables, `diag-ir` primitives, `agent` host and read-only policy; ADR-235 items 2, 3 and 8; design 8.2.4, 8.4 |
 | [ADR-310](ADR-310-one-line-message-notation.md) | A One-Line Message Notation for the Vehicle-Knowledge Format | Accepted | `diag-frontend` message shapes (`messages.txt` replacing the CSV field tables), CSV format sections 1 and 5; design 8.4 |
 | [ADR-311](ADR-311-lowering-each-procedure-once-per-variant.md) | Lowering Each Procedure Once per Variant | Accepted | `diag-frontend` conversion and Starlark lowering, CSV format section 1, Starlark subset section 5 |
+| [ADR-312](ADR-312-codex-as-pr-reviewer-with-copilot-fallback.md) | Codex as the Pull Request Reviewer, with Copilot as Fallback | Accepted | `.claude/skills/pr-review-loop` (Steps 0, 1, 4-5), `AGENTS.md`, `CLAUDE.md`; ADR-251 |
 
 ## Status Legend
 
@@ -636,13 +637,14 @@ the predecessor repository these ADRs came from.
 - ADR-246
 - ADR-248
 - ADR-249
-- ADR-251
+- ADR-251 (applies to Codex and Copilot alike, ADR-312)
 - ADR-260
 - ADR-275
 - ADR-279 (Decision item 4's allowlist check replaced by the check against the Windows runner's system directory, ADR-283)
 - ADR-283
 - ADR-292 (the consequence that a crash shows as `HostError::Rpc` superseded by ADR-294: the agent reports `HostError::VciLost`)
 - ADR-299
+- ADR-312
 
 ### Timestamps / Clock
 - ADR-057 (amended by ADR-102)

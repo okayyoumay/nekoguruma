@@ -66,7 +66,7 @@ or hardware work, blocked on a later milestone). Report two lists, **recommended
 **optional**, each item with its file, line, current priority and the reason above, then ask the
 maintainer which to raise, offering: recommended only (the recommendation), recommended and
 optional, or none. Change nothing before the answer. Raise the chosen items with the `backlog`
-skill (new items for promises with no item) in one backlog-only PR (no Copilot review, ADR-251).
+skill (new items for promises with no item) in one backlog-only PR (no automated review, ADR-251).
 
 After the raised items are done, the next sweep only needs rule 2 for items added since this
 one, plus rules 1, 3 and 4 for code and CI changes merged since (a fix can add a platform or
@@ -101,5 +101,5 @@ first and stop if it finds something.
    are.
 5. Run `scripts/check-backlog.sh` and `scripts/check-work-refs.sh`, open one draft PR with the
    plan and backlog changes, and run `pr-review-loop` (the plan is not a backlog file, so
-   Copilot reviews it). The PR description names the raised, lowered and added items by their
+   it gets the automated review). The PR description names the raised, lowered and added items by their
    wording, and the next milestone's P1 count per file. The maintainer merges.

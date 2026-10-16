@@ -206,12 +206,14 @@ the attribute fails the build once the code is used and gets removed.
    `.github/pull_request_template.md`.
 2. Drive CI to green. A failure is fixed at its root cause; never skip, disable or loosen a test
    to get green.
-3. Run the automated review loop with the `pr-review-loop` skill: request a review from GitHub
-   Copilot, fix or answer every finding, and re-request until a round is clean or its fixes need
-   no re-review under the skill's re-request rule (ADR-251). A PR that changes only the backlog
-   files gets no Copilot review (same ADR). If Copilot code review is not
-   available, or the owner's Copilot budget is used up, the skill falls back to an
-   `edge-case-hunter` pass over the whole diff and tells the maintainer.
+3. Run the automated review loop with the `pr-review-loop` skill: request a review from Codex,
+   fix or answer every finding, and re-request until a round is clean or its fixes need no
+   re-review under the skill's re-request rule (ADR-251). A PR that changes only the backlog
+   files gets no automated review (same ADR). If Codex cannot review (not set up, usage limit
+   reached, or a stalled review), the skill switches that PR to GitHub Copilot code review for
+   the rest of the PR (ADR-312); if Copilot is not available either, or the owner's Copilot
+   budget is used up, it falls back to an `edge-case-hunter` pass over the whole diff and tells
+   the maintainer.
 4. Before marking the PR ready, check that nothing deferred during the work exists only in the
    conversation: every follow-up is either done in the PR or added to the backlog (`backlog`
    skill). Items the PR finishes are closed in the same PR.
@@ -221,9 +223,10 @@ the attribute fails the build once the code is used and gets removed.
 
 Commit messages and PR descriptions follow the same copyright rule as the code.
 
-Copilot reviews against [.github/copilot-instructions.md](.github/copilot-instructions.md) and
-the path-specific files in `.github/instructions/`, which restate the rules above as review
-priorities; a path-specific file applies only to the files its `applyTo` globs match. When a
+Both reviewers review against [.github/copilot-instructions.md](.github/copilot-instructions.md)
+and the path-specific files in `.github/instructions/`, which restate the rules above as review
+priorities (Codex reaches them through [AGENTS.md](AGENTS.md), which points there instead of
+repeating them); a path-specific file applies only to the files its `applyTo` globs match. When a
 rule in this file changes, update those files in the same pull request; the "Documentation sync"
 table is copied into `.github/copilot-instructions.md`. Copilot code review also reads the skills
 in `.claude/skills/` when it judges them relevant, so the repository-wide file tells it that those

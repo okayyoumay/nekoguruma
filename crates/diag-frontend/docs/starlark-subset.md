@@ -313,7 +313,8 @@ calls to instructions that report a waiting outcome, so procedures are written a
 ```python
 def main():
     res = diag.request(0x22, {"did": 0xF190})  # Read VIN
-    diag.log(1, res["fields"]["vin"])
+    if res["ok"] and res["fields"]["vin"] == "WVWZZZ1JZXW000001":
+        diag.log(1, "known vehicle")
 ```
 
 ### 3.4 Response Shape
@@ -333,9 +334,9 @@ The keys of `fields` are `Field.short_name` from the IR declaration part. Under 
 the CSV table side, so a `fields` key is checked against the declaration part at import time.
 Which declared service a `diag.request`, `diag.routine` or `diag.read_dtc` call means is found
 from its SID or routine identifier and the constant fields of the request (`csv-tables.md` 5.3).
-Constants are part of the message prefix, so they are not keys of `fields`; neither are fields
-inside a nested layout, so only the scalar fields at the top of the response are keys
-(`csv-tables.md` 5.4). Selection happens at ingestion, so a `params` value for a constant's key
+Constants are part of the message prefix, so they are not keys of `fields`; only the fields
+at the top of the response are keys (`csv-tables.md` 5.4), and of those the fields that hold a
+nested layout cannot be read yet. Selection happens at ingestion, so a `params` value for a constant's key
 (such as `did`) must itself be a constant (`STAR_NON_CONSTANT_ARGUMENT`). Request parameters are
 given as internal (coded) values; the declaration part's conversions apply only to decoded
 response values.
@@ -355,8 +356,12 @@ response whose short name is `name` (`Op::DecodeField`, ADR-316). Its type comes
 field's declaration: `int` for a number, also under a text table; `float` for a float or a
 numeric conversion; `str` for text; `bytes` for bytes. A name the response does not declare is
 `STAR_UNSUPPORTED_SYNTAX`. These are `STAR_NOT_LOWERABLE`:
-- a field the procedure cannot read (a nested layout, a bytecode conversion);
-- a response that can come from requests to different services on different paths.
+- a field the procedure cannot read (a nested layout, a bytecode conversion, a text table on a
+  value that is not an integer, a numeric conversion of text or bytes);
+- a value that can hold responses to different services: a variable assigned from requests to
+  different services anywhere in its function, also one after the other, or a parameter whose
+  callers pass them. Types are inferred per variable, not per statement (4.8), so each
+  response whose fields are read is kept in a variable of its own.
 
 Reading a field of a negative response stops the run, so a procedure tests `res["ok"]` first.
 

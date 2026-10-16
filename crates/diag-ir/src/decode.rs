@@ -1054,7 +1054,8 @@ pub enum ScalarKind {
 }
 
 /// What `field` decodes to, or why it does not decode to a scalar: a nested layout, a
-/// conversion the decoder does not run, or a numeric conversion of a string. Decided from the
+/// conversion the decoder does not run, a text table on a value that is not an integer, or a
+/// numeric conversion of a string. Decided from the
 /// declaration alone, as [`convert`] decides it, so a caller can type a field before any
 /// response arrives.
 pub fn scalar_kind(field: &Field<'_>) -> Result<ScalarKind, &'static str> {
@@ -1072,8 +1073,15 @@ pub fn scalar_kind(field: &Field<'_>) -> Result<ScalarKind, &'static str> {
         DataKind::Bytes => ScalarKind::Bytes,
         _ => return Err("an unknown data kind"),
     };
-    if tag == Compu::NONE || tag == Compu::CompuIdentity || tag == Compu::CompuTextTable {
+    if tag == Compu::NONE || tag == Compu::CompuIdentity {
         return Ok(by_kind);
+    }
+    if tag == Compu::CompuTextTable {
+        // `text_table` looks up integers only.
+        return match by_kind {
+            ScalarKind::Integer => Ok(by_kind),
+            _ => Err("a text table on a value that is not an integer"),
+        };
     }
     if is_string_like(field.kind()) {
         return Err("a numeric conversion on bytes or a string");

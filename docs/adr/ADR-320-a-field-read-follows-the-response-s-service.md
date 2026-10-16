@@ -21,7 +21,10 @@ type at ingestion, as for every run-time value (subset 2.5, ADR-304).
 1. **The response type carries its service.** The lowering's inferred types carry, beside
    the type bits, the `Service.id` of the request a response comes from:
    - one known service;
-   - several, when paths that join carry responses of different services;
+   - several, when the value can hold responses of different services: a variable assigned
+     from requests to different services anywhere in its function, or a parameter whose
+     callers pass them. Types are inferred per variable for the whole function, not per
+     statement (subset 4.8), so this holds also when the assignments follow one another;
    - unknown, when the call was already reported as an error.
 
    A value assigned, passed or returned keeps it, as it keeps its type. A union of two
@@ -48,15 +51,20 @@ type at ingestion, as for every run-time value (subset 2.5, ADR-304).
    The lowering types the value that way. A field it cannot type is `STAR_NOT_LOWERABLE`:
    - a nested layout;
    - a bytecode conversion, which the decoder does not run;
-   - a numeric conversion of bytes or text.
+   - a text table on a value that is not an integer, or a numeric conversion of bytes or
+     text, which the decoder rejects.
 
 ## Consequences
 
 - The type mapping lives beside the decoder, so a change to what the decoder gives also has
-  to change `scalar_kind`. The decode tests check that the two agree.
+  to change `scalar_kind`. The decode tests decode a field of each kind and check that the
+  value has the type `scalar_kind` gives.
 - Reading a field of a negative response stops the run with `VmError::Undecodable`
   (ADR-316). A procedure tests `res["ok"]` first. The lowering does not force that.
-- A procedure that reads the same response through two services' paths has to read the
-  fields inside each path.
+- A procedure that reads fields of responses to different services keeps each response in a
+  variable of its own, and a helper that reads a field is called with one service's responses
+  only. Reusing one variable for both is `STAR_NOT_LOWERABLE`, although Starlark would run it.
+- A bytecode conversion on another field of the same response is not checked at ingestion:
+  the decoder rejects the whole response (ADR-316), so the read stops the run.
 - Fields inside nested layouts, and a text table's text rather than its number, cannot be
   read yet.

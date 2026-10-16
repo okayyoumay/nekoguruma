@@ -224,7 +224,8 @@ enum Service {
     Unknown,
     /// The `Service.id` of the one request the response can come from.
     One(u32),
-    /// Requests to more than one service, on different paths.
+    /// Requests to more than one service: a variable assigned from both anywhere in its
+    /// function (types are per variable, subset 4.8), or a parameter whose callers pass both.
     Several,
 }
 
@@ -2459,8 +2460,8 @@ impl<'a> Lowerer<'a> {
             Service::Several => {
                 self.not_lowerable(
                     span,
-                    "this response can come from requests to different services, so its fields \
-                     are not known at ingestion (3.4)",
+                    "this value can hold responses to different services, so its fields are not \
+                     known at ingestion; keep each response in a variable of its own (3.4, 4.8)",
                 );
                 return Val::Run(Tys::default(), Vec::new());
             }

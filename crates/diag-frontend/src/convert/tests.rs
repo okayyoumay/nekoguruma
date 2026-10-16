@@ -682,7 +682,16 @@ impl diag_ir::DiagHost for Answering {
 /// Runs the first variant's program for `main.star` against `responses`, stepped with that
 /// variant's declarations (ADR-316): the messages it logged, or the VM error it stopped with.
 fn answered(source: &str, responses: &[&[u8]]) -> Result<Vec<String>, String> {
-    let converted = convert(with(example(), "main.star", source));
+    answered_in(example(), source, responses)
+}
+
+/// [`answered`] for the definition `files`.
+fn answered_in(
+    files: Vec<(String, Vec<u8>)>,
+    source: &str,
+    responses: &[&[u8]],
+) -> Result<Vec<String>, String> {
+    let converted = convert(with(files, "main.star", source));
     let document = load_ecu_document(&converted.documents[0].bytes).expect("the document loads");
     let bytes = document.procedure().expect("a program");
     let program: diag_ir::Program = postcard::from_bytes(bytes.bytes()).expect("a program");
@@ -856,6 +865,35 @@ def main():
 }
 
 #[test]
+fn a_float_field_reads_as_a_float() {
+    // The supply voltage, declared here for every variant, is linear: 0x89 / 10 = 13.7.
+    let files: Vec<_> = example()
+        .into_iter()
+        .map(|(name, bytes)| {
+            let bytes = if name == "dids.csv" {
+                String::from_utf8(bytes)
+                    .unwrap()
+                    .replace("exampleEcuV2,supplyVoltage", ",supplyVoltage")
+                    .into_bytes()
+            } else {
+                bytes
+            };
+            (name, bytes)
+        })
+        .collect();
+    let source = "\
+def main():
+    v = diag.request(0x22, {\"did\": 0xFD02})[\"fields\"][\"supplyVoltage\"]
+    if v > 13.5 and v < 13.75:
+        diag.log(1, \"in range\")
+";
+    assert_eq!(
+        answered_in(files, source, &[&[0x62, 0xFD, 0x02, 0x00, 0x89]]).unwrap(),
+        ["in range"]
+    );
+}
+
+#[test]
 fn a_field_of_a_negative_response_stops_the_run() {
     let source = "\
 def main():
@@ -890,6 +928,23 @@ fn a_field_read_is_checked_against_the_declarations() {
             "def main():\n    res = diag.request(0x22, {\"did\": 0xFD03})\n    \
              if res[\"ok\"]:\n        res = diag.request(0x22, {\"did\": 0xFD01})\n    \
              x = res[\"fields\"][\"reason\"]\n"
+                .to_owned(),
+            NotLowerable,
+        ),
+        // Types are per variable (4.8), so a variable reused for another service's response
+        // cannot be read, even one assignment after the other.
+        (
+            "def main():\n    res = diag.request(0x22, {\"did\": 0xFD03})\n    \
+             res = diag.request(0x22, {\"did\": 0xFD01})\n    \
+             x = res[\"fields\"][\"reason\"]\n"
+                .to_owned(),
+            NotLowerable,
+        ),
+        // Nor a parameter whose callers pass responses of different services.
+        (
+            "def get(r):\n    return r[\"fields\"][\"reason\"]\n\n\
+             def main():\n    x = get(diag.request(0x22, {\"did\": 0xFD03}))\n    \
+             y = get(diag.request(0x22, {\"did\": 0xFD01}))\n"
                 .to_owned(),
             NotLowerable,
         ),

@@ -15,7 +15,7 @@ mod recovery;
 pub use recovery::*;
 use serde::{Deserialize, Serialize};
 
-use crate::declaration::EcuVariant;
+use crate::declaration::{EcuVariant, Shape};
 
 /// 2: `Program` gained the restart declaration (`identity`, `preconditions`, `flash`, ADR-245)
 /// and `VmState` lost `checkpoint` and `resume_count`, so both postcard encodings changed.
@@ -993,12 +993,14 @@ fn decode_field(
         .and_then(|services| services.iter().find(|s| s.id() == service))
         .and_then(|s| s.positive())
         .ok_or_else(unknown)?;
-    // Checked before decoding, so an unknown field is not reported as an undecodable response.
-    if !positive
+    // Checked before decoding: an unknown or shaped field is an error of the program whatever
+    // the response holds, so it is not reported as an undecodable response.
+    let declared = positive
         .fields()
-        .is_some_and(|fields| fields.iter().any(|f| f.id() == field))
-    {
-        return Err(unknown());
+        .and_then(|fields| fields.iter().find(|f| f.id() == field))
+        .ok_or_else(unknown)?;
+    if declared.shape_type() != Shape::NONE {
+        return Err(VmError::ShapedField { service, field });
     }
     let fields = decode::decode_positive_response(&positive, variant.layouts(), message)
         .map_err(|_| VmError::Undecodable { service })?;

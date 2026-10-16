@@ -3042,8 +3042,9 @@ fn a_version_one_state_still_decodes_and_is_refused() {
 mod decode_field {
     use super::*;
     use crate::declaration::{
-        DataKind, EcuDocumentT, EcuVariantT, FieldT, GroupT, LayoutT, Placement, PositiveResponseT,
-        ServiceT, ShapeT, encode_ecu_document, load_ecu_document,
+        CompuLinearT, CompuT, CompuTextTableT, DataKind, EcuDocumentT, EcuVariantT, FieldT, GroupT,
+        LayoutT, Placement, PositiveResponseT, ServiceT, ShapeT, TextEntryT, encode_ecu_document,
+        load_ecu_document,
     };
 
     /// A field that follows the previous one.
@@ -3093,13 +3094,52 @@ mod decode_field {
             })),
             ..Default::default()
         };
+        // Service 8: a linear conversion (1), a text table (2), BCD (3) and a u64 (4).
+        let converted = ServiceT {
+            id: 8,
+            short_name: Some("c".into()),
+            positive: Some(Box::new(PositiveResponseT {
+                sid: 0x62,
+                prefix: None,
+                fields: Some(vec![
+                    FieldT {
+                        compu: CompuT::CompuLinear(Box::new(CompuLinearT {
+                            numerator: 1.0,
+                            denominator: 2.0,
+                            offset: 0.0,
+                        })),
+                        ..next(1, DataKind::Uint, 8)
+                    },
+                    FieldT {
+                        compu: CompuT::CompuTextTable(Box::new(CompuTextTableT {
+                            entries: Some(vec![TextEntryT {
+                                lower: 3,
+                                upper: 3,
+                                text_id: 9,
+                            }]),
+                            default_text_id: 0,
+                        })),
+                        ..next(2, DataKind::Uint, 8)
+                    },
+                    next(3, DataKind::Bcd, 16),
+                    next(4, DataKind::Uint, 64),
+                ]),
+            })),
+            ..Default::default()
+        };
+        // Service 9 declares no positive response.
+        let bare = ServiceT {
+            id: 9,
+            short_name: Some("b".into()),
+            ..Default::default()
+        };
         encode_ecu_document(&EcuDocumentT {
             schema_version: IR_SCHEMA_VERSION,
             source_format: Some("csv-starlark".into()),
             source_digest: Some("00".into()),
             variant: Some(Box::new(EcuVariantT {
                 id: 1,
-                services: Some(vec![service]),
+                services: Some(vec![service, converted, bare]),
                 layouts: Some(vec![layout]),
                 ..Default::default()
             })),
@@ -3168,6 +3208,17 @@ mod decode_field {
     }
 
     #[test]
+    fn conversions_bcd_and_the_largest_integer_map_as_the_adr_says() {
+        let mut message = vec![0x62, 0x0B, 0x03, 0x12, 0x34];
+        message.extend(i64::MAX.to_be_bytes());
+        assert_eq!(decode(true, 8, 1, &message), Ok(Value::F64(5.5)));
+        // A text table keeps its internal value.
+        assert_eq!(decode(true, 8, 2, &message), Ok(Value::I64(3)));
+        assert_eq!(decode(true, 8, 3, &message), Ok(Value::I64(1234)));
+        assert_eq!(decode(true, 8, 4, &message), Ok(Value::I64(i64::MAX)));
+    }
+
+    #[test]
     fn a_field_the_vm_cannot_hold_is_an_error() {
         let message = response();
         assert_eq!(
@@ -3187,11 +3238,19 @@ mod decode_field {
                 field: 7
             })
         );
+        // An undeclared service, and one without a positive response.
+        for service in [10, 9] {
+            assert_eq!(
+                decode(true, service, 1, &message),
+                Err(VmError::UnknownField { service, field: 1 })
+            );
+        }
+        // A shaped field is reported as such even when the response would not decode.
         assert_eq!(
-            decode(true, 9, 1, &message),
-            Err(VmError::UnknownField {
-                service: 9,
-                field: 1
+            decode(true, 7, 6, &[0x7F, 0x22, 0x31]),
+            Err(VmError::ShapedField {
+                service: 7,
+                field: 6
             })
         );
     }

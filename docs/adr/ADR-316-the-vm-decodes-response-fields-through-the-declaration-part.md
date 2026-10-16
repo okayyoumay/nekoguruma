@@ -30,7 +30,10 @@ The maintainer chose the first.
      The bytes must be a whole positive response starting with its SID. The field must be one
      of the top-level fields of service `service`'s (`Service.id`) declared positive response.
    - Decoding goes through `decode_positive_response`, so the response SID, the prefix and every
-     field's length and conversion are checked as ADR-297 checks them.
+     field's length and conversion are checked as ADR-297 checks them. The response is decoded
+     as a whole: a field reads only from a response that decodes, so a truncated or malformed
+     response, or a field with a conversion the decoder does not run, makes every field of it
+     unreadable rather than letting a procedure act on part of a response that is wrong.
    - It is not a diagnostic primitive: it sends nothing, goes through no host, and is pure like
      the arithmetic instructions.
 2. **The VM is stepped with the declarations.**
@@ -51,9 +54,10 @@ The maintainer chose the first.
 4. **Errors are VM errors**, appended to `VmError`. As for every VM error, the state is left
    unchanged.
    - `NoDeclarations`: the VM was stepped without declarations.
-   - `UnknownField`: the service or the top-level field is not declared. This is checked before
-     decoding.
-   - `ShapedField`: the field is a nested layout, whose value has no VM type.
+   - `UnknownField`: the service or the top-level field is not declared.
+   - `ShapedField`: the field is a nested layout, whose value has no VM type. This and
+     `UnknownField` depend only on the declarations, so they are checked before decoding and
+     reported whatever the response holds.
    - `Undecodable`: the bytes do not decode as that positive response. A negative response is
      one such case.
    - An unsigned value above `i64::MAX` is `Overflow`.
@@ -68,5 +72,7 @@ The maintainer chose the first.
   fails the run as `Undecodable`. The lowering of `res["fields"]` has to account for this.
 - Nested layouts (`group`, `repeat`, `select`) cannot be read from a procedure until the VM has a
   value type for them.
+- `Undecodable` does not say why the response failed to decode. ADR-297's errors are not kept,
+  so the journal cannot tell a truncated response from an unsupported conversion.
 - Old agents cannot read journals that record one of the new errors. Earlier `VmError` additions
   had the same limit.

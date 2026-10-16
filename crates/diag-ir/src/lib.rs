@@ -21,7 +21,8 @@ use serde::{Deserialize, Serialize};
 /// version 2 cannot decode one that uses `Fail`, so the version a server matches against the
 /// agent's `capabilities` (9.5) changes.
 /// 4: `Op` gained `Length`, for the same reason (ADR-233).
-pub const IR_SCHEMA_VERSION: u32 = 4;
+/// 5: `Op` gained `Rem`, for the same reason.
+pub const IR_SCHEMA_VERSION: u32 = 5;
 
 /// The longest code, in bytes, that `Program::validate` accepts for a `Fail` (ADR-280).
 pub const MAX_FAILURE_CODE_LEN: usize = 128;
@@ -130,6 +131,13 @@ pub enum Op {
     /// place below it, as `IndexGet` does, so a length and an index into the same bytes need
     /// no copy.
     Length,
+
+    // Arithmetic. Appended after `Length` (ADR-233).
+    /// The remainder of the division below it by the value on top, both `I64` or both `F64`.
+    /// It truncates like `Div`, so an integer remainder takes the dividend's sign and is never
+    /// out of range (`i64::MIN` by -1 gives 0); dividing an integer by 0 is
+    /// `VmError::DivisionByZero`, a float by 0 gives NaN.
+    Rem,
 }
 
 // ---------------------------------------------------------------- Program
@@ -236,6 +244,7 @@ impl Op {
             | Op::IndexGet
             | Op::IndexSet
             | Op::Length
+            | Op::Rem
             | Op::Fail { .. } => false,
         }
     }
@@ -482,7 +491,7 @@ impl Vm {
                 self.state.stack.swap(len - 1, len - 2);
             }
 
-            Op::Add | Op::Sub | Op::Mul | Op::Div => {
+            Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Rem => {
                 let result = arithmetic(op, self.top(2)?)?;
                 self.replace(2, result);
             }
@@ -724,7 +733,8 @@ impl Vm {
             | Op::StoreGlobal(_)
             | Op::IndexGet
             | Op::IndexSet
-            | Op::Length => HostInput::Nothing,
+            | Op::Length
+            | Op::Rem => HostInput::Nothing,
             // The checks of `Fail` run in `execute`, before it changes anything.
             Op::Fail { .. } => HostInput::Nothing,
         })
@@ -857,6 +867,9 @@ fn arithmetic(op: &Op, operands: &[Value]) -> Result<Value, VmError> {
                 Op::Mul => a.checked_mul(*b),
                 Op::Div if *b == 0 => return Err(VmError::DivisionByZero),
                 Op::Div => a.checked_div(*b),
+                Op::Rem if *b == 0 => return Err(VmError::DivisionByZero),
+                // Only `i64::MIN % -1` wraps, and its exact remainder, 0, is what it wraps to.
+                Op::Rem => Some(a.wrapping_rem(*b)),
                 _ => unreachable!("not an arithmetic op"),
             };
             result.map(Value::I64).ok_or(VmError::Overflow)
@@ -866,6 +879,7 @@ fn arithmetic(op: &Op, operands: &[Value]) -> Result<Value, VmError> {
             Op::Sub => a - b,
             Op::Mul => a * b,
             Op::Div => a / b,
+            Op::Rem => a % b,
             _ => unreachable!("not an arithmetic op"),
         })),
         _ => Err(VmError::TypeMismatch),

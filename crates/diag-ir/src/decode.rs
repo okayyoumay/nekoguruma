@@ -1039,6 +1039,48 @@ fn string_value(field: &Field<'_>, bytes: &[u8]) -> Result<PhysicalValue, Decode
     }
 }
 
+/// What a scalar field decodes to, by [`decode_positive_response`]'s rules: the value
+/// `Op::DecodeField` gives a procedure (ADR-316).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScalarKind {
+    /// An unsigned, signed or BCD number, also under a text table, which keeps the number.
+    Integer,
+    /// A float, or the result of a numeric conversion.
+    Float,
+    /// A string.
+    Text,
+    /// Bytes.
+    Bytes,
+}
+
+/// What `field` decodes to, or why it does not decode to a scalar: a nested layout, a
+/// conversion the decoder does not run, or a numeric conversion of a string. Decided from the
+/// declaration alone, as [`convert`] decides it, so a caller can type a field before any
+/// response arrives.
+pub fn scalar_kind(field: &Field<'_>) -> Result<ScalarKind, &'static str> {
+    if field.shape_type() != Shape::NONE {
+        return Err("a field with a nested layout");
+    }
+    let tag = field.compu_type();
+    if tag == Compu::CompuBytecode {
+        return Err("a CompuBytecode conversion");
+    }
+    let by_kind = match field.kind() {
+        DataKind::Uint | DataKind::Int | DataKind::Bcd => ScalarKind::Integer,
+        DataKind::Float => ScalarKind::Float,
+        DataKind::Ascii | DataKind::Utf8 | DataKind::Unicode2 => ScalarKind::Text,
+        DataKind::Bytes => ScalarKind::Bytes,
+        _ => return Err("an unknown data kind"),
+    };
+    if tag == Compu::NONE || tag == Compu::CompuIdentity || tag == Compu::CompuTextTable {
+        return Ok(by_kind);
+    }
+    if is_string_like(field.kind()) {
+        return Err("a numeric conversion on bytes or a string");
+    }
+    Ok(ScalarKind::Float)
+}
+
 fn is_string_like(kind: DataKind) -> bool {
     matches!(
         kind,

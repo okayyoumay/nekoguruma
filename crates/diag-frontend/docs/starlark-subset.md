@@ -346,8 +346,19 @@ and `nrc` is the third byte of a negative response and 0 otherwise. A negative r
 short to hold its code stops the run when `nrc` is read. Until the declaration part carries the
 application layer's negative-response shape (ADR-309 item 4), that shape is UDS's. Another
 string key is `STAR_UNSUPPORTED_SYNTAX`. A response used other than through its keys (its
-truth value, an operator such as `==`, a built-in) is `STAR_NOT_LOWERABLE`, and so is `fields`, whose
-lowering is not built yet.
+truth value, an operator such as `==`, a built-in) is `STAR_NOT_LOWERABLE`.
+
+**Field reads (ADR-320).** A response keeps the declared service of the request it came from,
+and `res["fields"]` is a value of its own with the same service, read only by a string
+literal. `res["fields"]["name"]` decodes the top-level field of that service's positive
+response whose short name is `name` (`Op::DecodeField`, ADR-316). Its type comes from the
+field's declaration: `int` for a number, also under a text table; `float` for a float or a
+numeric conversion; `str` for text; `bytes` for bytes. A name the response does not declare is
+`STAR_UNSUPPORTED_SYNTAX`. These are `STAR_NOT_LOWERABLE`:
+- a field the procedure cannot read (a nested layout, a bytecode conversion);
+- a response that can come from requests to different services on different paths.
+
+Reading a field of a negative response stops the run, so a procedure tests `res["ok"]` first.
 
 ---
 

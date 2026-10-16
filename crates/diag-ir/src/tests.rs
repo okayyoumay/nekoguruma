@@ -3152,6 +3152,52 @@ mod decode_field {
     }
 
     #[test]
+    fn a_field_is_typed_from_its_declaration_as_it_decodes() {
+        use crate::decode::{ScalarKind, scalar_kind};
+        let bytes = document();
+        let variant = load_ecu_document(&bytes).unwrap().variant().unwrap();
+        let kinds = |service: u32| -> Vec<_> {
+            let service = variant
+                .services()
+                .unwrap()
+                .iter()
+                .find(|s| s.id() == service)
+                .unwrap();
+            service
+                .positive()
+                .unwrap()
+                .fields()
+                .unwrap()
+                .iter()
+                .map(|f| (f.id(), scalar_kind(&f).ok()))
+                .collect()
+        };
+        use ScalarKind::*;
+        assert_eq!(
+            kinds(7),
+            [
+                (1, Some(Integer)),
+                (2, Some(Integer)),
+                (3, Some(Float)),
+                (4, Some(Text)),
+                (5, Some(Bytes)),
+                (6, None),
+                (8, Some(Integer)),
+            ]
+        );
+        // A linear conversion gives a float; a text table keeps the number; BCD is a number.
+        assert_eq!(
+            kinds(8),
+            [
+                (1, Some(Float)),
+                (2, Some(Integer)),
+                (3, Some(Integer)),
+                (4, Some(Integer)),
+            ]
+        );
+    }
+
+    #[test]
     fn the_fields_a_program_decodes_are_checked_against_the_declarations() {
         let bytes = document();
         let variant = load_ecu_document(&bytes).unwrap().variant().unwrap();

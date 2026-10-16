@@ -47,7 +47,7 @@ that the subset is widened by updating the frontend (design 8.4).
    layer.
 
 2. **Application-layer profiles.** The frontend holds one profile per supported application layer,
-   starting with UDS (ISO 14229-1). A profile is data, not code in the agent. For each call it gives:
+   starting with UDS. A profile is data, not code in the agent. For each call it gives:
    - the service or sequence of services the call expands to, with their constants (service
      identifier, sub-function) and the request fields the call's arguments fill, including their
      widths;

@@ -17,7 +17,7 @@ positions are numbers the reader must add up, and a `repeat` or `select` is spli
 three files.
 
 There is no widely used compact text notation for diagnostic requests and responses. The industry
-describes them in ODX (ISO 22901-1), usually edited in GUI tools or converted from spreadsheet
+describes them in ODX, usually edited in GUI tools or converted from spreadsheet
 specifications; open-source UDS libraries use short type codes per data identifier (Python
 `struct` strings in udsoncan) or code objects; CAN signal databases (DBC) write one signal per
 line with a scale, an offset and a unit; and generic binary description languages such as Kaitai

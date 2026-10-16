@@ -2132,7 +2132,13 @@ fn signed_and_empty_expected_values_at_their_edges() {
 
 /// A variant whose patterns are `(pattern, service_id, field_id, expected)` entries.
 fn variant(entries: &[(u16, u32, u32, &[u8])]) -> Vec<u8> {
+    named("", entries)
+}
+
+/// [`variant`] with a short name.
+fn named(name: &str, entries: &[(u16, u32, u32, &[u8])]) -> Vec<u8> {
     let variant = EcuVariantT {
+        short_name: Some(name.to_owned()),
         patterns: Some(
             entries
                 .iter()
@@ -2192,6 +2198,20 @@ fn a_pattern_matches_when_all_its_entries_do_and_a_variant_when_any_pattern_does
 }
 
 #[test]
+fn entries_of_a_pattern_need_not_be_adjacent() {
+    // Pattern 1's entries are split by pattern 2's: version "1." and hardware 3, or "1.9".
+    let bytes = variant(&[(1, 1, 10, b"1."), (2, 1, 10, b"1.9"), (1, 2, 20, &[3])]);
+    let v = root(&bytes);
+    let matches = |version: &str, hardware| {
+        let fields = identification(version, hardware);
+        variant_matches(&v, |service| fields.get(&service).map(Vec::as_slice))
+    };
+    assert!(!matches("1.2", 4));
+    assert!(matches("1.2", 3));
+    assert!(matches("1.9", 4));
+}
+
+#[test]
 fn a_variant_without_patterns_is_never_identified() {
     let bytes = variant(&[]);
     let fields = identification("1.0", 1);
@@ -2201,11 +2221,12 @@ fn a_variant_without_patterns_is_never_identified() {
 }
 
 #[test]
-fn the_first_matching_variant_is_selected() {
-    let v1 = variant(&[(1, 1, 10, b"1.")]);
-    let v2 = variant(&[(1, 1, 10, b"2.")]);
-    // Matches every version starting with a digit 1 or 2, like both of the others.
-    let any = variant(&[(1, 1, 10, b"1."), (2, 1, 10, b"2.")]);
+fn the_first_matching_variant_by_short_name_is_selected() {
+    let v1 = named("b1", &[(1, 1, 10, b"1.")]);
+    let v2 = named("b2", &[(1, 1, 10, b"2.")]);
+    // Matches every version starting with a digit 1 or 2, like both of the others, and comes
+    // first by name.
+    let any = named("a", &[(1, 1, 10, b"1."), (2, 1, 10, b"2.")]);
     let select = |variants: &[&[u8]], version: &str| {
         let fields = identification(version, 0);
         select_variant(variants.iter().map(|b| root(b)), |_, service| {
@@ -2214,7 +2235,8 @@ fn the_first_matching_variant_is_selected() {
     };
     assert_eq!(select(&[&v1, &v2], "2.1"), Some(1));
     assert_eq!(select(&[&v1, &v2], "3.0"), None);
-    // Two variants match: the earlier one wins.
+    // Two variants match: the one first by short name wins, wherever it is given.
     assert_eq!(select(&[&v1, &any, &v2], "2.1"), Some(1));
-    assert_eq!(select(&[&any, &v1], "1.0"), Some(0));
+    assert_eq!(select(&[&v2, &v1, &any], "1.0"), Some(2));
+    assert_eq!(select(&[&v2, &v1], "1.0"), Some(1));
 }

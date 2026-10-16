@@ -164,8 +164,8 @@ Variant identification (design 8.9.1), one `VariantPattern` per row, in row orde
 A variant's rows are grouped into patterns by `pattern` (ADR-315, after ISO 22901-1 (2008)
 7.4.3). A pattern matches when every one of its rows matches, a variant is identified when any of
 its patterns matches, and a variant without rows is never identified. The variants are tried in
-`variants.csv` row order and the first that matches is selected, so patterns of different variants
-should not overlap. A row whose service gave no positive response does not match. Without the
+rising order of their names, and the first that matches is selected, so patterns of different
+variants should not overlap; prefix matching makes `31 2E 32` (text `1.2`) also match `1.20`. A row whose service gave no positive response does not match. Without the
 column, all of a variant's rows form one pattern.
 
 Each row compares `expected` with the value the field decodes to, not with the bytes on the wire

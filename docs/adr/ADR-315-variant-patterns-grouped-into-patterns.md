@@ -33,13 +33,14 @@ frontend of M7 has to carry ODX's grouping into the IR.
    - An entry whose identification service gave no decoded positive response does not match.
 
    `diag_ir::decode::variant_matches` implements this.
-3. **The first matching variant is selected.**
-   - `diag_ir::decode::select_variant` tries the variants in the order given and returns the
-     first that matches, or none. For a definition directory that order is `variants.csv`'s row
-     order.
+3. **The first matching variant by name is selected.**
+   - `diag_ir::decode::select_variant` tries the variants in rising order of their
+     `short_name`, compared byte by byte, and returns the first that matches, or none. This is
+     the order 7.4.3 lays down so that every implementation picks the same variant. It does not
+     depend on the order the caller gives, which the per-variant documents (8.2.6) do not record
+     anyway.
    - The standard makes patterns disjoint, so two matching variants mean an authoring error. The
-     earlier variant still wins, as the standard's first-match rule says, and the function does
-     not try to detect the overlap.
+     variant first by name still wins, and the function does not try to detect the overlap.
    - Each variant's document numbers its own services, so the function asks for a response by
      variant and service.
 4. **The CSV format writes the number as an optional column.** `variant_patterns.csv` gains an
@@ -55,4 +56,12 @@ frontend of M7 has to carry ODX's grouping into the IR.
   responses as given.
 - A definition with overlapping patterns gets a deterministic but possibly unintended variant.
   Checking patterns for overlap at ingestion would need their value ranges compared and is left
-  out.
+  out. Prefix matching (ADR-306) makes overlaps easier to write than ODX's equality: a pattern
+  expecting the text "1.2" also matches "1.20". The variant first by name then wins, so a
+  definition that has to tell such values apart reads them from a fixed-length field padded
+  after its value, whose padding the pattern then includes (ADR-306).
+- Two parts of 7.4.3 are not supported:
+  - A matching parameter inside a repeated structure, which ODX matches when any element does.
+    `pattern_matches` never matches a shaped value, and the CSV format rejects such fields.
+  - A matching parameter resolved in a negative response. The IR's negative responses have no
+    fields, so an entry matches only a decoded positive response.

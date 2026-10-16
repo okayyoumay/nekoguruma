@@ -340,8 +340,8 @@ fn variant_patterns_carry_their_pattern_numbers() {
         "variant_patterns.csv",
         "variant,service,field,expected,pattern\n\
          exampleEcuV1,softwareVersion.read,softwareVersion,31 2E,\n\
-         exampleEcuV1,powerCycles.read,powerCycles,05,1\n\
          exampleEcuV1,vin.read,vin,57,2\n\
+         exampleEcuV1,powerCycles.read,powerCycles,05,1\n\
          exampleEcuV2,softwareVersion.read,softwareVersion,32 2E,7\n",
     );
     let documents = documents(&convert(files));
@@ -353,7 +353,8 @@ fn variant_patterns_carry_their_pattern_numbers() {
             .map(|p| p.pattern)
             .collect()
     };
-    assert_eq!(numbers(&documents[0]), [1, 1, 2]);
+    // In row order: a pattern's rows need not be adjacent.
+    assert_eq!(numbers(&documents[0]), [1, 2, 1]);
     assert_eq!(numbers(&documents[1]), [7]);
 }
 

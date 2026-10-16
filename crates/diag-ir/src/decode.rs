@@ -258,19 +258,20 @@ pub fn variant_matches<'f>(
         })
 }
 
-/// The index of the first of `variants` that [`variant_matches`], or `None` when none does.
-/// `fields(index, service_id)` gives the decoded positive response of the variant at `index`'s
-/// identification service, since each variant's document numbers its own services. Variants are
-/// tried in the order given, the order of `variants.csv` for a definition directory, and the
-/// first that matches is selected (ISO 22901-1 (2008) 7.4.3): a definition whose patterns are not
-/// disjoint gets the earlier variant.
+/// The index in `variants` of the variant selected by its identification responses, or `None`
+/// when none matches. As ISO 22901-1 (2008) 7.4.3 lays down, the variants are tried in rising
+/// order of their `short_name` (compared byte by byte, whatever order they are given in) and
+/// the first that [`variant_matches`] is selected, so every implementation picks the same one.
+/// `fields(index, service_id)` gives the decoded positive response of the identification service
+/// of the variant at `index`, since each variant's document numbers its own services.
 pub fn select_variant<'v, 'f>(
     variants: impl IntoIterator<Item = EcuVariant<'v>>,
     mut fields: impl FnMut(usize, u32) -> Option<&'f [DecodedField]>,
 ) -> Option<usize> {
+    let mut variants: Vec<(usize, EcuVariant<'v>)> = variants.into_iter().enumerate().collect();
+    variants.sort_by(|(_, a), (_, b)| a.short_name().cmp(&b.short_name()));
     variants
         .into_iter()
-        .enumerate()
         .find(|(index, variant)| variant_matches(variant, |service| fields(*index, service)))
         .map(|(index, _)| index)
 }

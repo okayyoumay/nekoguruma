@@ -288,6 +288,25 @@ fn dialect() -> Dialect {
     }
 }
 
+/// [`check`] on a procedure file's bytes as stored. A file that is not UTF-8 is not parsed: it
+/// reports `STAR_SYNTAX_ERROR` where its first byte that is not UTF-8 is (section 5).
+pub fn check_file(file: &str, bytes: &[u8]) -> Result<Checked, Vec<StarError>> {
+    match std::str::from_utf8(bytes) {
+        Ok(source) => check(file, source),
+        Err(error) => {
+            // The bytes before the error are valid UTF-8, so the error is placed at their end.
+            let valid = std::str::from_utf8(&bytes[..error.valid_up_to()]).unwrap_or_default();
+            Err(vec![located(
+                StarCode::SyntaxError,
+                file,
+                valid,
+                valid.len(),
+                "the file is not UTF-8 (5)".to_owned(),
+            )])
+        }
+    }
+}
+
 /// Parses `source`, the contents of the procedure file `file`, and checks it against the subset.
 /// A file past the size or nesting bounds of 2.8 is refused before it is parsed; any other is
 /// parsed and checked on a thread of its own ([`on_parser_stack`]).

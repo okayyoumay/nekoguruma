@@ -370,6 +370,7 @@ name = "diag-frontend"
 version = "0.1.0"
 dependencies = [
  "diag-ir",
+ "postcard",
  "serde",
  "sha2",
  "starlark_syntax",

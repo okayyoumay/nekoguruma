@@ -52,6 +52,10 @@ pub struct Tables {
     /// The names and contents, as stored, of the table files present, sorted by name in byte
     /// order: what `source_digest` covers besides a procedure file (section 6).
     pub sources: Vec<(String, Vec<u8>)>,
+    /// The names and contents, as stored, of the procedure files (`.star`) present, sorted by
+    /// name in byte order. The tables do not read them; the packaging of section 1 does
+    /// (ADR-307).
+    pub procedures: Vec<(String, Vec<u8>)>,
 }
 
 /// Why [`read_directory`] failed.
@@ -91,10 +95,10 @@ const SPECS: [&Spec; 19] = [
 /// The tables a definition must have.
 const REQUIRED_FILES: [&str; 2] = ["variants.csv", "protocols.csv"];
 
-/// Reads the tables of the definition directory `dir`. Only the entries directly in it are
-/// considered, following symbolic links; entries whose names end neither in `.csv` nor in
-/// `.star` are skipped without being looked at, and one with such a name that is not a regular
-/// file is rejected.
+/// Reads the tables and procedure files of the definition directory `dir`. Only the entries
+/// directly in it are considered, following symbolic links; entries whose names end neither in
+/// `.csv` nor in `.star` are skipped without being looked at, and one with such a name that is
+/// not a regular file is rejected.
 pub fn read_directory(dir: &Path) -> Result<Tables, ReadError> {
     let mut entries = Vec::new();
     for entry in std::fs::read_dir(dir)? {
@@ -108,10 +112,10 @@ pub fn read_directory(dir: &Path) -> Result<Tables, ReadError> {
         // `metadata` follows a link; one that leads nowhere (missing, a loop) is not a regular
         // file.
         let is_file = std::fs::metadata(entry.path()).is_ok_and(|m| m.is_file());
-        // Only a table is read; any other name is judged by its name alone.
+        // Only a table or a procedure is read; any other name is judged by its name alone.
         let contents = if !is_file {
             None
-        } else if SPECS.iter().any(|spec| spec.file == name) {
+        } else if SPECS.iter().any(|spec| spec.file == name) || lower.ends_with(".star") {
             Some(std::fs::read(entry.path())?)
         } else {
             Some(Vec::new())
@@ -121,8 +125,8 @@ pub fn read_directory(dir: &Path) -> Result<Tables, ReadError> {
     Ok(read_entries(entries)?)
 }
 
-/// Reads the tables from `files`, the names and contents of the files directly in a definition
-/// directory.
+/// Reads the tables and procedure files from `files`, the names and contents of the files
+/// directly in a definition directory.
 pub fn read_files(files: impl IntoIterator<Item = (String, Vec<u8>)>) -> Result<Tables, Rejected> {
     read_entries(
         files
@@ -141,6 +145,7 @@ fn read_entries(
     // Tables that broke the record format: their other errors are not reported (section 7).
     let mut broken: Vec<&'static str> = Vec::new();
     let mut sources = Vec::new();
+    let mut procedures = Vec::new();
     // A directory cannot hold two entries of one name, but a caller of `read_files` can pass
     // them; the first is read and the repeat reported, so that nothing is replaced unseen.
     let mut seen = std::collections::HashSet::new();
@@ -184,6 +189,7 @@ fn read_entries(
             continue;
         };
         if !csv {
+            procedures.push((name, contents));
             continue;
         }
         let Some(spec) = SPECS.iter().find(|spec| spec.file == name) else {
@@ -268,6 +274,10 @@ fn read_entries(
         sources: {
             sources.sort_unstable_by(|a, b| a.0.cmp(&b.0));
             sources
+        },
+        procedures: {
+            procedures.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+            procedures
         },
     };
     check_duplicates(&sheets, e);

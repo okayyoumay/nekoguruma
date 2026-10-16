@@ -42,12 +42,21 @@ directory, a link to nothing) is rejected (`CSV_UNKNOWN_FILE`).
 | `flash_sessions.csv` | no | 4.12 | `FlashSession` |
 | `flash_segments.csv` | no | 4.12 | `FlashSegment` |
 
-The table conversion produces the declaration part of one `EcuDocument` per variant (design
-8.2.6), with `source_format` set to `csv-starlark` (ADR-254). In `diag-frontend`,
-`convert::to_ir` converts a definition that `tables::resolve` accepted (section 7) and returns
-the documents with the catalogs of 4.4. Which procedure a document carries
-in `EcuDocument.procedure`, and how a directory with several procedure files is packaged, belong
-to the Starlark lowering, not to this format. Monitor sets (`EcuVariant.monitor_sets`) and `CompuBytecode` have no
+The table conversion produces the declaration part of each variant's documents (design 8.2.6),
+with `source_format` set to `csv-starlark` (ADR-254). Each `.star` file directly in the
+directory is one procedure (`starlark-subset.md` 2.1), and the documents are packaged by ADR-307:
+
+- With procedure files, there is one document per variant and procedure: the variant's whole
+  declaration part and, in `EcuDocument.procedure`, the procedure's lowered program as postcard
+  bytes. Every procedure goes with every variant. The documents come in `variants.csv` row order,
+  and within a variant in byte order of the procedure file names.
+- Without procedure files, there is one document per variant, with no procedure.
+
+In `diag-frontend`, `convert::lower_procedures` checks and lowers the procedure files, listing
+every file's errors together (a file that is not UTF-8 is `STAR_SYNTAX_ERROR`), and
+`convert::to_ir` converts a definition that `tables::resolve` accepted (section 7) with those
+procedures. It returns the documents, each named by its variant and its procedure's file name,
+with the catalogs of 4.4. Monitor sets (`EcuVariant.monitor_sets`) and `CompuBytecode` have no
 table in this version: the converter emits no monitor set, and a conversion kind other than those
 in 4.5 is rejected.
 

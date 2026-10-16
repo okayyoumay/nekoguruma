@@ -33,7 +33,7 @@ pub use bounds::{
     MAX_BLOCK_DEPTH, MAX_BRACKET_DEPTH, MAX_ELIF_CHAIN, MAX_EXPRESSION_DEPTH, MAX_SOURCE_BYTES,
     PARSER_STACK_BYTES, on_parser_stack,
 };
-pub use lower::lower;
+pub use lower::{Lowered, lower};
 
 /// The error codes of `docs/starlark-subset.md` that the checker and the lowering report.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
@@ -93,6 +93,10 @@ pub enum StarCode {
     /// A `diag` function with no IR instruction yet (3.2).
     #[serde(rename = "STAR_API_NOT_AVAILABLE")]
     ApiNotAvailable,
+    /// A warning: a `range` loop with a bound known only at run time has no `@maxIterations`, so
+    /// the default limit applies (4.2).
+    #[serde(rename = "STAR_LOOP_LIMIT_DEFAULTED")]
+    LoopLimitDefaulted,
 }
 
 impl StarCode {
@@ -117,6 +121,7 @@ impl StarCode {
             Self::NonConstantArgument => "STAR_NON_CONSTANT_ARGUMENT",
             Self::NotLowerable => "STAR_NOT_LOWERABLE",
             Self::ApiNotAvailable => "STAR_API_NOT_AVAILABLE",
+            Self::LoopLimitDefaulted => "STAR_LOOP_LIMIT_DEFAULTED",
         }
     }
 }
@@ -164,7 +169,12 @@ pub enum Idempotency {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Annotation {
     /// `@maxIterations n`, attached to the `for` statement that follows (4.2).
-    MaxIterations { line: u32, limit: u32 },
+    MaxIterations {
+        line: u32,
+        /// The line of the `for`.
+        for_line: u32,
+        limit: u32,
+    },
     /// `@section kind [expected=millis]`, which makes the whole top-level `def` that follows it a
     /// section, together with every function that `def` calls (4.5, ADR-301).
     Section {
@@ -1792,7 +1802,7 @@ impl Checker<'_> {
                         continue;
                     };
                     let target = enclosing(line, column).and_then(|def| next_statement(def, line));
-                    if !matches!(target, Some((_, true))) {
+                    let Some((for_line, true)) = target else {
                         bad(
                             self,
                             "`@maxIterations` must precede a `for` statement in the same function \
@@ -1800,8 +1810,12 @@ impl Checker<'_> {
                                 .to_owned(),
                         );
                         continue;
-                    }
-                    annotations.push(Annotation::MaxIterations { line, limit });
+                    };
+                    annotations.push(Annotation::MaxIterations {
+                        line,
+                        for_line,
+                        limit,
+                    });
                 }
                 "idempotency" => {
                     let value = match args.as_slice() {

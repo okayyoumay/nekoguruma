@@ -294,6 +294,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-302](ADR-302-decoded-shape-of-nested-layouts.md) | Decoded Shape of Nested Layouts | Accepted | `diag-ir` decoder, design 8.2.2 |
 | [ADR-303](ADR-303-starlark-nesting-bounds-before-parsing.md) | Starlark Nesting Bounds Checked Before Parsing | Accepted | `diag-frontend` Starlark subset spec and checker, design 8.4 |
 | [ADR-304](ADR-304-lowering-starlark-procedures.md) | Lowering Starlark Procedures to the IR | Accepted | `diag-frontend` Starlark lowering, subset spec 4.7 and 4.8, design 8.4 |
+| [ADR-305](ADR-305-lowering-starlark-loops.md) | Lowering Starlark Loops | Accepted | `diag-frontend` Starlark lowering, subset spec 4.2 |
 
 ## Status Legend
 
@@ -698,6 +699,7 @@ the predecessor repository these ADRs came from.
 - ADR-302
 - ADR-303
 - ADR-304
+- ADR-305
 
 ### Acquired Data & Monitoring
 - ADR-236

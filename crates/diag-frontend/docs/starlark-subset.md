@@ -358,9 +358,33 @@ for i in range(count):
     ...
 ```
 
-Without the annotation, the default (1000) is applied and reported as a warning.
-The limit is a counter the transpiler emits around the loop; when it is reached, the procedure
-ends as if `diag.fail("LOOP_LIMIT_EXCEEDED", ...)` had been called at that point: the counter lowers to a `Fail` with that code (3.2).
+Without the annotation, the default (1000) is applied and reported as a warning
+(`STAR_LOOP_LIMIT_DEFAULTED`).
+The limit is a counter the transpiler emits around the loop. It allows exactly that many
+iterations; at the next one the procedure ends as if `diag.fail("LOOP_LIMIT_EXCEEDED", ...)` had
+been called at that point: the counter lowers to a `Fail` with that code (3.2), whose detail
+names the loop's line and limit.
+
+How loops are lowered (ADR-305):
+
+- A loop over a constant list, or over a constant dict (its keys), is unrolled. Each iteration
+  binds the loop variable to its item at ingestion, so the body folds with it; for example, a
+  constant `did` from a table can be passed where a constant is required. Items that can exist at
+  run time are also stored in the variable, which holds the last item after the loop. When the
+  items are lists or dicts, the variable has a value only inside the body: assigning it there,
+  or using it anywhere in the function outside the loop, is `STAR_NOT_LOWERABLE`.
+- Unrolling is bounded: a procedure may unroll at most 2^20 iterations, statements,
+  expressions and call arguments in all, nested loops multiplying and a body counting once per copy, and each 64
+  bytes of a name an unrolled copy handles counting as one more; past that it is
+  `STAR_NOT_LOWERABLE`.
+- A loop over `range(stop)`, `range(start, stop)` or `range(start, stop, step)` runs without
+  unrolling. Its step must be an `int` constant other than 0; its start and stop are `int`s,
+  evaluated once before the loop. The counter applies when the start or stop is known only at
+  run time, or when `@maxIterations` precedes the loop; a loop with constant bounds and no
+  annotation has none. `@maxIterations` before an unrolled loop has no effect.
+- A `range` that would step past the end of the 64-bit range ends there, since the next value
+  would be past its stop anyway.
+- `break` leaves the innermost loop; `continue` starts its next iteration.
 
 A polling loop is written as a bounded `for` with `break`:
 

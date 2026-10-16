@@ -526,6 +526,51 @@ fn slice_follows_starlark() {
 }
 
 #[test]
+fn conversions_between_integers_and_floats() {
+    assert_eq!(
+        eval(vec![i(-3), Op::IntToFloat, i(i64::MAX), Op::IntToFloat]),
+        [Value::F64(-3.0), Value::F64(9_223_372_036_854_775_808.0)]
+    );
+    let int = |f: f64| eval(vec![Op::PushF64(f), Op::FloatToInt]);
+    // Toward zero.
+    assert_eq!(int(2.9), [Value::I64(2)]);
+    assert_eq!(int(-2.9), [Value::I64(-2)]);
+    assert_eq!(int(-0.0), [Value::I64(0)]);
+    // The ends of the range.
+    assert_eq!(int(-9_223_372_036_854_775_808.0), [Value::I64(i64::MIN)]);
+    assert_eq!(
+        int(9_223_372_036_854_774_784.0),
+        [Value::I64(9_223_372_036_854_774_784)]
+    );
+    // Each error leaves the state as it was (checked by `expect_vm_error`).
+    for f in [
+        f64::NAN,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        9_223_372_036_854_775_808.0,
+        -9_223_372_036_854_777_856.0,
+    ] {
+        assert_eq!(
+            expect_vm_error(vec![Op::PushF64(f), Op::FloatToInt], vec![], 1),
+            VmError::FloatNotConvertible,
+            "{f}"
+        );
+    }
+    assert_eq!(
+        expect_vm_error(vec![Op::PushF64(1.0), Op::IntToFloat], vec![], 1),
+        VmError::TypeMismatch
+    );
+    assert_eq!(
+        expect_vm_error(vec![i(1), Op::FloatToInt], vec![], 1),
+        VmError::TypeMismatch
+    );
+    assert_eq!(
+        expect_vm_error(vec![Op::IntToFloat], vec![], 0),
+        VmError::StackUnderflow
+    );
+}
+
+#[test]
 fn concatenation_is_bounded() {
     let half = MAX_BYTES_LEN / 2;
     // Exactly the bound is allowed.
@@ -1118,6 +1163,8 @@ fn primitive_classification_covers_every_instruction() {
         Op::Neg,
         Op::Concat,
         Op::Slice,
+        Op::IntToFloat,
+        Op::FloatToInt,
     ];
     for (index, op) in all.iter().enumerate() {
         // The postcard encoding starts with the variant index, so this also pins the variant

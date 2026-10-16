@@ -2795,6 +2795,7 @@ mod tests {
             VmError::IndexOutOfRange(0),
             VmError::ByteOutOfRange(0),
             VmError::BytesTooLong(0),
+            VmError::FloatNotConvertible,
         ];
         // The match fails to compile when a variant is added, so the list above stays complete.
         for error in &errors {
@@ -2817,7 +2818,8 @@ mod tests {
                 | VmError::UndefinedVariable(_)
                 | VmError::IndexOutOfRange(_)
                 | VmError::ByteOutOfRange(_)
-                | VmError::BytesTooLong(_) => {}
+                | VmError::BytesTooLong(_)
+                | VmError::FloatNotConvertible => {}
             }
         }
         let encoded = |reason: RunStop| {

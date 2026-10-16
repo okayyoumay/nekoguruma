@@ -1890,28 +1890,27 @@ impl<'a> Lowerer<'a> {
         code.extend(cb);
         let at = |op: Op| (Ins::Op(op), span);
         let result = match (op, ta, tb) {
-            (BinOp::Divide, Ty::Float, Ty::Float) => {
-                // Starlark rejects a division by zero, while the IR's float `Div` gives an
-                // infinity or NaN: a zero divisor is sent to the integer `Div` by zero, which
-                // stops the program with the same error.
-                let (zero, end) = (self.label(), self.label());
-                code.extend(
-                    [
-                        Ins::Op(Op::Dup),
-                        Ins::Op(Op::PushF64(0.0)),
-                        Ins::Op(Op::CmpEq),
-                        Ins::Op(Op::Not),
-                        Ins::JumpIfFalse(zero),
-                        Ins::Op(Op::Div),
-                        Ins::Jump(end),
-                        Ins::Mark(zero),
-                        Ins::Op(Op::PushI64(0)),
-                        Ins::Op(Op::PushI64(0)),
-                        Ins::Op(Op::Div),
-                        Ins::Mark(end),
-                    ]
-                    .map(|ins| (ins, span)),
-                );
+            // Starlark computes an int with a float, and `/` of two ints, in floats (4.4).
+            (
+                BinOp::Add | BinOp::Subtract | BinOp::Multiply | BinOp::Divide,
+                Ty::Int | Ty::Float,
+                Ty::Int | Ty::Float,
+            ) if ta != tb || op == BinOp::Divide => {
+                if ta == Ty::Int {
+                    code.extend([Op::Swap, Op::IntToFloat, Op::Swap].map(at));
+                }
+                if tb == Ty::Int {
+                    code.push(at(Op::IntToFloat));
+                }
+                if op == BinOp::Divide {
+                    code.extend(self.float_divide(span));
+                } else {
+                    code.push(at(match op {
+                        BinOp::Add => Op::Add,
+                        BinOp::Subtract => Op::Sub,
+                        _ => Op::Mul,
+                    }));
+                }
                 Ty::Float
             }
             // A run-time string is UTF-8 `Bytes` (2.5), and joining two keeps it UTF-8.
@@ -1971,7 +1970,8 @@ impl<'a> Lowerer<'a> {
             | (BinOp::Equal | BinOp::NotEqual, Ty::Float, Ty::Int) => {
                 self.not_lowerable(
                     span,
-                    "comparing an int with a float known at run time needs a conversion instruction (4.4)",
+                    "comparing an int with a float known at run time is not lowered: converting \
+                     the int to a float could round it and change the answer (4.4)",
                 );
                 return Val::Run(Tys::of(Ty::Bool), Vec::new());
             }
@@ -2299,6 +2299,68 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    /// A built-in of 2.4 on values known only at run time: `int` of a number and `float` of a
+    /// number, through the IR's conversions. The others are not lowered yet.
+    fn run_builtin(&mut self, name: &str, values: Vec<Val>, span: Span) -> Val {
+        let failed = || Val::Run(Tys::default(), Vec::new());
+        if let ("int" | "float", [_]) = (name, values.as_slice()) {
+            let value = values.into_iter().next().expect("one argument");
+            let Some((ty, mut code)) = self.single(value, span, &format!("`{name}`")) else {
+                return failed();
+            };
+            let result = match (name, ty) {
+                ("int", Ty::Int) | ("float", Ty::Float) => ty,
+                ("int", Ty::Float) => {
+                    code.push((Ins::Op(Op::FloatToInt), span));
+                    Ty::Int
+                }
+                ("float", Ty::Int) => {
+                    code.push((Ins::Op(Op::IntToFloat), span));
+                    Ty::Float
+                }
+                _ => {
+                    self.not_lowerable(
+                        span,
+                        format!(
+                            "`{name}` of a {} known only at run time is not lowered yet (2.4)",
+                            ty.name()
+                        ),
+                    );
+                    return failed();
+                }
+            };
+            return Val::Run(Tys::of(result), code);
+        }
+        self.not_lowerable(
+            span,
+            format!("`{name}` on a value known only at run time is not lowered yet (2.4)"),
+        );
+        failed()
+    }
+
+    /// Divides the two floats on top of the stack. Starlark rejects a division by zero, while
+    /// the IR's float `Div` gives an infinity or NaN: a zero divisor is sent to the integer
+    /// `Div` by zero, which stops the program with the same error.
+    fn float_divide(&mut self, span: Span) -> Code {
+        let (zero, end) = (self.label(), self.label());
+        [
+            Ins::Op(Op::Dup),
+            Ins::Op(Op::PushF64(0.0)),
+            Ins::Op(Op::CmpEq),
+            Ins::Op(Op::Not),
+            Ins::JumpIfFalse(zero),
+            Ins::Op(Op::Div),
+            Ins::Jump(end),
+            Ins::Mark(zero),
+            Ins::Op(Op::PushI64(0)),
+            Ins::Op(Op::PushI64(0)),
+            Ins::Op(Op::Div),
+            Ins::Mark(end),
+        ]
+        .map(|ins| (ins, span))
+        .into()
+    }
+
     /// A slice of bytes known only at run time, or with bounds known only at run time: the
     /// bytes, the start (0 when omitted) and the stop (`i64::MAX` when omitted, which `Op::Slice`
     /// clamps to the end), then `Op::Slice`. A string is not sliced at run time, since its
@@ -2373,13 +2435,19 @@ impl<'a> Lowerer<'a> {
                 }
                 let values: Vec<Val> = positional.iter().map(|arg| self.expr(id, arg)).collect();
                 if BUILTINS.contains(&name) {
-                    let consts: Option<Vec<Const>> = values
-                        .into_iter()
-                        .map(|v| match v {
-                            Val::Const(c) => Some(c),
-                            _ => None,
-                        })
-                        .collect();
+                    let all_const = values.iter().all(|v| matches!(v, Val::Const(_)));
+                    let (consts, values_copy): (Option<Vec<Const>>, Vec<Val>) = if all_const {
+                        let consts = values
+                            .into_iter()
+                            .map(|v| match v {
+                                Val::Const(c) => c,
+                                _ => unreachable!("all constant"),
+                            })
+                            .collect();
+                        (Some(consts), Vec::new())
+                    } else {
+                        (None, values)
+                    };
                     if let Some(args) = &consts {
                         // `min` and `max` compare their best so far with every argument, so
                         // the largest argument may be read once per argument.
@@ -2398,13 +2466,7 @@ impl<'a> Lowerer<'a> {
                             self.not_lowerable(span, reason);
                             Val::Run(Tys::default(), Vec::new())
                         }
-                        None => {
-                            self.not_lowerable(
-                                span,
-                                format!("`{name}` on a value known only at run time is not lowered yet (2.4)"),
-                            );
-                            Val::Run(Tys::default(), Vec::new())
-                        }
+                        None => self.run_builtin(name, values_copy, span),
                     };
                 }
                 self.not_lowerable(span, format!("`{name}` cannot be called here"));
@@ -2873,13 +2935,10 @@ fn binary_hint(op: BinOp, a: Ty, b: Ty) -> String {
         BinOp::LeftShift => "an overflow-checked shift instruction (4.4)",
         BinOp::In | BinOp::NotIn => "a search instruction",
         BinOp::Percent if a == Ty::Str => "string formatting instructions (2.5)",
-        BinOp::Divide | BinOp::FloorDivide | BinOp::Percent
+        BinOp::FloorDivide | BinOp::Percent
             if matches!(a, Ty::Int | Ty::Float) && matches!(b, Ty::Int | Ty::Float) =>
         {
-            "float conversion, floor or remainder instructions (4.4)"
-        }
-        _ if a != b && matches!(a, Ty::Int | Ty::Float) && matches!(b, Ty::Int | Ty::Float) => {
-            "a conversion between int and float (4.4)"
+            "a float floor, which is not lowered yet (4.4)"
         }
         _ => {
             return format!(

@@ -91,8 +91,10 @@ starts with Codex again.
 
 **Codex requested but never finished.** If a check-in finds no result for the latest request,
 schedule one more check-in 15 minutes later. While the summary's state shows `status: running` for
-the current head, keep scheduling check-ins instead of counting the round as stalled. If the
-second check-in finds no result and no running state, or Codex errored twice
+the current head, keep scheduling check-ins instead of counting the round as stalled, but only up
+to 45 minutes after the request (a Codex review usually takes under ten); a state still running
+after that counts as stalled too. If the second check-in finds no result and no running state, or
+the 45 minutes have passed, or Codex errored twice
 on the head, the round has stalled: tell the maintainer once in the thread and switch the PR to
 Copilot for this head.
 

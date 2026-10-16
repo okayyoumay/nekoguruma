@@ -224,7 +224,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-232](ADR-232-linux-support-scope-and-minimum-glibc.md) | Linux Support Scope and Minimum glibc 2.17 | Accepted | design 2 / 7.1.2 / 12.1 / 17, `worker-linux` CI job |
 | [ADR-233](ADR-233-diag-ir-vm-execution-semantics.md) | diag-ir VM Execution Semantics | Accepted (item 3's `VmState` fields removed by ADR-245; `Op::Fail` and `StepOutcome::Failed` appended by ADR-280) | `diag-ir` VM |
 | [ADR-234](ADR-234-sim-vci-flow-control-filter-model.md) | sim-vci Flow-Control Filter Model | Accepted | `sim-vci` filters, writes, reads, IOCTLs |
-| [ADR-235](ADR-235-agent-job-runner-and-worker-diag-host.md) | Agent Job Runner and the Worker-Backed DiagHost | Accepted (item 8 relaxed for debug builds against `sim-vci` by ADR-247; item 3's lost VCI told apart by ADR-289) | `agent` runner, host, link |
+| [ADR-235](ADR-235-agent-job-runner-and-worker-diag-host.md) | Agent Job Runner and the Worker-Backed DiagHost | Accepted (item 8 relaxed for debug builds against `sim-vci` by ADR-247; item 3's lost VCI told apart by ADR-289; item 2's `ReadDtc` request building, item 3's UDS response patterns and item 8's single UDS allowlist superseded by ADR-309) | `agent` runner, host, link |
 | [ADR-236](ADR-236-time-series-scale-and-raw-response-storage.md) | Time-Series Scale and Raw-Response Storage | Accepted | design 4.3 / 4.6 / 10.3 / 17, `dataset_chunks.chunk_format` |
 | [ADR-237](ADR-237-regulatory-scope-access-routes-without-tool-certification.md) | Regulatory Scope: Use the Access Routes Regulations Open, Without Tool Certification | Accepted | design 8.1 / 9.2 / 16.1 / 16.2 / 17, `db/` retention |
 | [ADR-238](ADR-238-sim-vci-control-commands-and-device-loss.md) | sim-vci Control Commands and Device Loss | Accepted (the VCI crash consequence settled by ADR-292: a crashed VCI fails every call with `ERR_FAILED`) | `sim-vci` control export and directory, `ERR_DEVICE_NOT_CONNECTED` |
@@ -284,7 +284,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-292](ADR-292-a-crashed-sim-vci-fails-every-call.md) | A Crashed Simulated VCI Fails Every Call with `ERR_FAILED` | Accepted (the consequence that a crash shows as `HostError::Rpc` superseded by ADR-294: the agent reports `HostError::VciLost`) | `sim-vci`, `j2534-0404-service` tests; design 13.4 |
 | [ADR-293](ADR-293-a-recovery-required-section-keeps-a-journal-without-a-plan.md) | A `RecoveryRequired` Section Keeps a Journal without a Flash Recovery Plan | Accepted | `agent` runner, restart; design 8.2.5 / 8.10.1 |
 | [ADR-294](ADR-294-a-vci-lost-between-primitives-is-vci-lost.md) | A VCI Lost between Two Primitives Is Reported as `HostError::VciLost` | Accepted | `agent` host, `j2534-0404-service` hard-error handling; design 8.2.4 |
-| [ADR-295](ADR-295-csv-table-format-of-the-vehicle-knowledge-format.md) | The CSV Table Format of the Proprietary Vehicle-Knowledge Format | Accepted (item 11 amended by ADR-298; item 1 amended by ADR-307) | `diag-frontend` CSV table spec and example; design 8.4 |
+| [ADR-295](ADR-295-csv-table-format-of-the-vehicle-knowledge-format.md) | The CSV Table Format of the Proprietary Vehicle-Knowledge Format | Accepted (item 11 amended by ADR-298; item 1 amended by ADR-307; item 5 and item 1's field tables superseded by ADR-310) | `diag-frontend` CSV table spec and example; design 8.4 |
 | [ADR-296](ADR-296-the-ir-declaration-part-is-loaded-through-a-checking-loader.md) | The IR Declaration Part Is Loaded Through a Checking Loader | Accepted | `diag-ir` declaration loader and generated bindings; design 8.2.6 |
 | [ADR-297](ADR-297-a-flat-positive-response-is-decoded-as-odx-extracts-a-parameter.md) | A Flat Positive Response Is Decoded as ODX Extracts a Parameter | Accepted | `diag-ir` response decoder; design 8.2.2 |
 | [ADR-298](ADR-298-csv-definition-errors-are-reported-in-two-stages.md) | CSV Definition Errors Are Reported in Two Stages | Accepted | `diag-frontend` CSV table reader error reporting |
@@ -298,6 +298,8 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-306](ADR-306-comparing-a-variant-pattern-with-a-decoded-field.md) | Comparing a Variant Pattern with a Decoded Field | Accepted | `diag-ir` decoder, `diag-frontend` CSV variant patterns, design 8.9.1 |
 | [ADR-307](ADR-307-packaging-starlark-procedures-into-documents.md) | Packaging Starlark Procedures into Documents | Accepted | `diag-frontend` conversion, CSV format sections 1 and 6, design 8.2.6 |
 | [ADR-308](ADR-308-encoding-a-request-operand.md) | Encoding a Request Operand | Accepted | `diag-ir` request encoder, CSV format 5.3, design 8.2.2 |
+| [ADR-309](ADR-309-application-layer-profiles.md) | Application-Layer Profiles for Protocol-Neutral Diagnostic Calls | Accepted | `diag-frontend` lowering and CSV tables, `diag-ir` primitives, `agent` host and read-only policy; ADR-235 items 2, 3 and 8; design 8.2.4, 8.4 |
+| [ADR-310](ADR-310-one-line-message-notation.md) | A One-Line Message Notation for the Vehicle-Knowledge Format | Accepted | `diag-frontend` message shapes (`messages.txt` replacing the CSV field tables), CSV format sections 1 and 5; design 8.4 |
 
 ## Status Legend
 
@@ -650,7 +652,7 @@ the predecessor repository these ADRs came from.
 ### Write Jobs & Resume
 - ADR-229 (item 1's `recovery_required_from_step` replaced by ADR-245; item 2's failed confirmation after an accepted reset gets one passive retry since ADR-265; item 2 step 3's post-transfer completion counts only for the interrupted pass since ADR-269; item 2's identity abort is journaled as a terminal state since ADR-286)
 - ADR-233 (item 3's `VmState` fields removed by ADR-245; `Op::Fail` and `StepOutcome::Failed` appended by ADR-280)
-- ADR-235 (item 8 relaxed for debug builds against `sim-vci` by ADR-247; item 3's lost VCI told apart by ADR-289)
+- ADR-235 (item 8 relaxed for debug builds against `sim-vci` by ADR-247; item 3's lost VCI told apart by ADR-289; item 2's `ReadDtc` request building, item 3's UDS response patterns and item 8's single UDS allowlist superseded by ADR-309)
 - ADR-241
 - ADR-244 (record set extended by ADR-253, ADR-261, ADR-268, ADR-272, ADR-280, ADR-286 and ADR-288; item 4's target VIN is a journal record since ADR-261, and its version being written since ADR-268; the no-lock consequence superseded by ADR-255 item 7)
 - ADR-245 (items 4 and 6 amended by ADR-250)
@@ -693,7 +695,7 @@ the predecessor repository these ADRs came from.
 - ADR-254 (`diag.fail` has an instruction since ADR-280; Decision item 4's bans on `lambda`, nested `def`, functions as values and default and keyword arguments narrowed by ADR-300)
 - ADR-280 (schema-compatibility consequence relaxed by ADR-281 item 4; the terminal-record rule extended to the restart's identity abort by ADR-286; the open consequence on the step limit and a VM error decided by ADR-288, which journals both as terminal)
 - ADR-281
-- ADR-295 (item 11 amended by ADR-298; item 1's one document per variant amended by ADR-307)
+- ADR-295 (item 11 amended by ADR-298; item 1's one document per variant amended by ADR-307; item 5 and item 1's four field tables superseded by ADR-310)
 - ADR-296
 - ADR-297
 - ADR-298
@@ -706,6 +708,8 @@ the predecessor repository these ADRs came from.
 - ADR-306
 - ADR-307
 - ADR-308
+- ADR-309
+- ADR-310
 
 ### Acquired Data & Monitoring
 - ADR-236

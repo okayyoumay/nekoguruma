@@ -459,11 +459,13 @@ impl<'a> Lowerer<'a> {
                 .collect();
             let mut assigned = HashSet::new();
             collect_locals(&def.body, &mut assigned, &mut HashSet::new());
+            // Removing the parameters from the set, rather than searching the parameters for
+            // each name, keeps this linear in the number of names.
+            for param in &params {
+                assigned.remove(param);
+            }
             let mut names: Vec<String> = params.clone();
-            let mut others: Vec<String> = assigned
-                .into_iter()
-                .filter(|name| !params.contains(name))
-                .collect();
+            let mut others: Vec<String> = assigned.into_iter().collect();
             // Sorted, so the slots do not depend on hashing.
             others.sort();
             names.extend(others);

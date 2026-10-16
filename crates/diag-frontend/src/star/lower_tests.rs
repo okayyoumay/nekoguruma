@@ -507,6 +507,22 @@ fn running_out_of_constants_where_nothing_reports_it_still_rejects() {
 }
 
 #[test]
+fn many_parameters_and_locals_are_numbered_in_linear_time() {
+    let n = 32_767;
+    let params: Vec<String> = (0..n).map(|i| format!("p{i}")).collect();
+    let mut source = format!("def unused({}):\n", params.join(", "));
+    for i in 0..n {
+        source.push_str(&format!("    l{i} = 0\n"));
+    }
+    // A parameter assigned to is still one slot.
+    source.push_str("    p0 = 1\n\ndef main():\n    pass\n");
+    let checked = check("t.star", &source).unwrap_or_else(|errors| panic!("{errors:#?}"));
+    let started = std::time::Instant::now();
+    assert!(lower("t.star", &checked).is_ok());
+    assert!(started.elapsed() < std::time::Duration::from_secs(30));
+}
+
+#[test]
 fn a_right_shift_is_arithmetic() {
     assert!(holds("x", "-8", "x >> 1 == -4"));
     assert!(holds("x", "-1", "x >> 63 == -1"));

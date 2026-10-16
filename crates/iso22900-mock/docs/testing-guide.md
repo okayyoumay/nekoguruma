@@ -165,6 +165,9 @@ The `rlib` portion exports the following Rust functions for use in test setup:
 |----------|-------|-------------|
 | `MOCK_MODULE_HANDLE` | 1001 | Handle returned by `PDUGetModuleIds` |
 | `MOCK_RESOURCE_ID` | 2001 | Resource ID returned by `PDUGetResourceIds` |
+| `STANDARD_BUS_TYPE_DWCAN` | 3111 | `PDUGetObjectId` of the bus type `ISO_11898_2_DWCAN` (ADR-319) |
+| `STANDARD_PROTOCOL_UDS_ON_CAN` | 3112 | `PDUGetObjectId` of the protocol `ISO_14229_3_on_ISO_15765_2` (ADR-319) |
+| `STANDARD_PIN_TYPE_HI`, `STANDARD_PIN_TYPE_LOW` | 3311, 3312 | `PDUGetObjectId` of the pin types `HI` and `LOW` (ADR-319) |
 | `MOCK_LOGICAL_LINK_HANDLE` | 3001 | Base CLL handle (first `PDUCreateComLogicalLink`) |
 | `MOCK_COM_PRIMITIVE_HANDLE` | 4001 | Base COP handle (first `PDUStartComPrimitive`) |
 | `MOCK_TIMESTAMP` | 4242 | Timestamp returned by `PDUGetTimestamp` |

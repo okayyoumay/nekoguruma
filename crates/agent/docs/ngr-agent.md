@@ -22,7 +22,9 @@ ngr-agent run --vci <name> --mode <device|user> (--program <file> | --document <
 | `--tx-id`, `--rx-id` | Physical request and response CAN IDs in hex, with or without `0x`. Default `7E0` / `7E8`. Only 11-bit IDs: the link does not set the CAN ID format |
 
 The link is UDS on ISO 15765 at 500 kbit/s (`LinkConfig::iso15765`), with the CAN IDs from the
-command line rather than from the program.
+command line rather than from the program. Its resource is named by the ISO 22900-2 short names
+of UDS on dual-wire CAN, which both worker kinds resolve (`agent::link::resource_data`,
+ADR-319).
 
 Steps (`agent::check_job`, `agent::guards::JobGuards`, `agent::launch::launch_worker`, then `agent::run_program`):
 

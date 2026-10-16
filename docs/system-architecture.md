@@ -910,6 +910,7 @@ flowchart LR
 - **Error reporting**: Violations are reported with the line and column in the source file. Once a file parses, all subset violations are enumerated at ingestion rather than stopping at the first; a syntax error is reported on its own, because the parser stops at the first one
 - **Source maps**: The IR includes a mapping table from bytecode back to the original Starlark positions. Needed for readability of execution traces and audit logs
 - **Sections**: An interruptibility section (8.10.1) is a whole function marked by an annotation, and it covers everything that runs while that function is called, including the functions it calls; sections do not nest (ADR-301)
+- **Size and nesting limits**: A file larger than 1 MiB, or nested past fixed bounds on brackets, blocks, `elif` chains and expression depth, is refused from its tokens before it is parsed, and a file within them is parsed on a thread with a fixed stack, so that no untrusted file can exhaust the converter's stack and abort the server (ADR-303)
 
 The detailed subset, the API and the annotations for section attributes are in `crates/diag-frontend/docs/starlark-subset.md`.
 

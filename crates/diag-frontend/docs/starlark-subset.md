@@ -299,7 +299,7 @@ instruction exists, the transpiler rejects calls to it (`STAR_API_NOT_AVAILABLE`
 | `diag.precondition` | none yet | |
 | `diag.fail` | `Fail` | `code` as a constant-pool entry; `detail` as bytes from the stack, since it can be built at run time. The instruction ends the procedure as failed and is terminal (ADR-280) |
 
-`diag.read_dtc`, `diag.routine`, `diag.security_access` and `diag.flash_transfer` name an intent, not a UDS request. They are lowered through the application-layer profile of the variant's protocol into that variant's declared services, and the IR keeps one generic send-receive in place of `ReadDtc` and `RoutineControl` (ADR-309). UDS is the first profile.
+**Target contract (ADR-309).** The table describes the UDS-only lowering as built. ADR-309 changes it: `diag.read_dtc`, `diag.routine` and `diag.security_access` name an intent and are lowered through the application-layer profile of the variant's protocol into that variant's declared services; `diag.read_dtc` lowers to a generic send-receive instead of `ReadDtc`; `diag.routine` keeps `RoutineControl` on UDS and uses the generic send-receive on other application layers; `diag.flash_transfer` stays UDS-only. UDS is the first profile.
 
 ### 3.3 Synchronous Calls
 
@@ -325,7 +325,7 @@ A dict with fixed keys:
 }
 ```
 
-The keys of `fields` are `Field.short_name` from the IR declaration part. They are defined on
+The keys of `fields` are `Field.short_name` from the IR declaration part. Under ADR-309 the result of `diag.read_dtc`, `diag.routine` and `diag.security_access` instead uses the field names the application-layer profile maps the response to, shared by every profile; a `diag.request` result keeps the declared names. They are defined on
 the CSV table side, so a `fields` key is checked against the declaration part at import time.
 Which declared service a `diag.request`, `diag.routine` or `diag.read_dtc` call means is found
 from its SID or routine identifier and the constant fields of the request (`csv-tables.md` 5.3).

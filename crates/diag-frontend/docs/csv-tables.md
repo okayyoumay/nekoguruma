@@ -200,6 +200,8 @@ select the identifier format, which this version does not define, so a value abo
 rejected (`CSV_BAD_VALUE`); the agent's link accepts only 11-bit identifiers for the same reason
 (ADR-235 item 4).
 
+ADR-309 adds a column naming the application layer the protocol carries (UDS first), which selects the profile the variant's procedures are lowered through; this version has no such column and every protocol is UDS.
+
 `comparams.csv`, one `ComParam` per row, appended to the named protocol's `params` in row order.
 
 | Column | Type | Required | Meaning |
@@ -545,7 +547,7 @@ example. `diag.routine(rid, sub, params)` considers only the services `routines.
 and selects the one whose `rid` and `sub` constants have those values, with the same rule for the
 other keys of `params`; `diag.request` never selects a generated routine service.
 `diag.security_access` needs no declared service: the host builds its requests and reads the
-seed from the response itself (subset spec 3.2). `diag.read_dtc(mask)` sends ReadDTCInformation with sub-function
+seed from the response itself (subset spec 3.2). Under ADR-309 the seed and key requests come from the application-layer profile instead, and `diag.read_dtc` is lowered through the profile into a declared service rather than sent by the host. `diag.read_dtc(mask)` sends ReadDTCInformation with sub-function
 0x02 and the mask (ADR-235 item 2), so its response is decoded through the variant's service that
 describes that request: SID 0x19, one 1-byte constant 0x02 and one other request field, a
 `fixed` 8-bit `uint`, so that every mask from 0x00 to 0xFF is a value of it. A procedure that reads `fields` from a `read_dtc` result in a variant without exactly one

@@ -4,7 +4,7 @@ use crate::declaration::{
     CompuBytecodeT, CompuLinearT, CompuRationalT, CompuScaleLinearT, CompuT, CompuTableInterpT,
     CompuTextTableT, DtcDefinitionT, EcuDocumentT, EcuVariantT, FieldT, GroupT, InterpPointT,
     LayoutT, LinearScaleT, PositiveResponseT, RepeatT, SelectCaseT, SelectT, ServiceT, ShapeT,
-    TextEntryT, encode_ecu_document, load_ecu_document,
+    TextEntryT, VariantPatternT, encode_ecu_document, load_ecu_document,
 };
 
 const SID: u8 = 0x62;
@@ -2001,4 +2001,100 @@ fn a_dtc_list_past_the_end_of_the_message_is_rejected() {
         decode_dtc(None, Some(snapshot), None, DtcFields::Snapshot, &message, 5),
         Err(DecodeError::Truncated { field: 10 })
     );
+}
+
+// ---------------------------------------------------------------- Variant patterns (ADR-306)
+
+/// Whether a pattern expecting `expected` of field `field_id` matches `fields`.
+fn matches(field_id: u32, expected: &[u8], fields: &[DecodedField]) -> bool {
+    let mut builder = flatbuffers::FlatBufferBuilder::new();
+    let pattern = VariantPatternT {
+        service_id: 1,
+        field_id,
+        expected: Some(expected.to_vec()),
+    }
+    .pack(&mut builder);
+    builder.finish_minimal(pattern);
+    let pattern = flatbuffers::root::<VariantPattern>(builder.finished_data()).expect("pattern");
+    pattern_matches(&pattern, fields)
+}
+
+#[test]
+fn a_bytes_field_matches_a_prefix_of_its_bytes() {
+    let fields = decode(
+        &[],
+        vec![next(1, DataKind::Bytes, 32)],
+        &[SID, 0x12, 0x34, 0x56, 0x78],
+    )
+    .expect("decodes");
+    assert!(matches(1, &[0x12, 0x34], &fields));
+    assert!(matches(1, &[0x12, 0x34, 0x56, 0x78], &fields));
+    assert!(!matches(1, &[0x34, 0x56], &fields));
+    assert!(!matches(1, &[0x12, 0x34, 0x56, 0x78, 0x9A], &fields));
+}
+
+#[test]
+fn a_text_field_matches_a_prefix_of_its_text_whatever_its_encoding() {
+    // "AB12" in ASCII and "AB" in big-endian UTF-16: both compare as UTF-8 text.
+    let fields = decode(
+        &[],
+        vec![
+            next(1, DataKind::Ascii, 32),
+            next(2, DataKind::Unicode2, 32),
+        ],
+        &[SID, b'A', b'B', b'1', b'2', 0x00, b'A', 0x00, b'B'],
+    )
+    .expect("decodes");
+    assert!(matches(1, b"AB", &fields));
+    assert!(matches(1, b"AB12", &fields));
+    assert!(!matches(1, b"B1", &fields));
+    assert!(matches(2, b"AB", &fields));
+    assert!(!matches(2, &[0x00, b'A'], &fields));
+}
+
+#[test]
+fn an_integer_field_matches_the_big_endian_number_expected() {
+    // 0x1234 big-endian, 0x1234 little-endian, -2 in 16 bits, and BCD 1234.
+    let fields = decode(
+        &[],
+        vec![
+            next(1, DataKind::Uint, 16),
+            little(next(2, DataKind::Uint, 16)),
+            next(3, DataKind::Int, 16),
+            next(4, DataKind::Bcd, 16),
+        ],
+        &[SID, 0x12, 0x34, 0x34, 0x12, 0xFF, 0xFE, 0x12, 0x34],
+    )
+    .expect("decodes");
+    assert!(matches(1, &[0x12, 0x34], &fields));
+    assert!(matches(1, &[0x00, 0x00, 0x12, 0x34], &fields));
+    assert!(
+        !matches(1, &[0x12], &fields),
+        "an integer is equal, not a prefix"
+    );
+    // The little-endian field's value is written big-endian, as a number.
+    assert!(matches(2, &[0x12, 0x34], &fields));
+    assert!(!matches(2, &[0x34, 0x12], &fields));
+    // A signed value is sign-extended from the width it is written in.
+    assert!(matches(3, &[0xFE], &fields));
+    assert!(matches(3, &[0xFF, 0xFF, 0xFE], &fields));
+    assert!(!matches(3, &[0x00, 0xFE], &fields));
+    // BCD digits spell 1234, which is 0x04D2.
+    assert!(matches(4, &[0x04, 0xD2], &fields));
+    assert!(!matches(4, &[0x12, 0x34], &fields));
+    // Empty, or longer than eight bytes, never matches an integer.
+    assert!(!matches(1, &[], &fields));
+    assert!(!matches(1, &[0, 0, 0, 0, 0, 0, 0, 0x12, 0x34], &fields));
+}
+
+#[test]
+fn a_missing_or_float_field_never_matches() {
+    let fields = decode(
+        &[],
+        vec![next(1, DataKind::Float, 32)],
+        &[SID, 0x3F, 0xC0, 0x00, 0x00],
+    )
+    .expect("decodes");
+    assert!(!matches(1, &[0x3F, 0xC0, 0x00, 0x00], &fields));
+    assert!(!matches(2, &[0x3F], &fields));
 }

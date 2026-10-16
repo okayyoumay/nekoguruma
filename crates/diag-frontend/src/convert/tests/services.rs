@@ -331,6 +331,39 @@ fn variant_patterns_name_the_service_and_field() {
     }
 }
 
+#[test]
+fn a_bcd_pattern_expects_the_number_its_digits_spell() {
+    // `powerCycles` is made a BCD field: the digits 12 34 are written as 1234 (ADR-306).
+    let files: Vec<(String, Vec<u8>)> = example()
+        .into_iter()
+        .map(|(name, bytes)| {
+            let bytes = match name.as_str() {
+                "fields.csv" => String::from_utf8(bytes)
+                    .expect("UTF-8")
+                    .replace(
+                        "did:powerCycles,powerCycles,0,,uint,32,",
+                        "did:powerCycles,powerCycles,0,,bcd,32,",
+                    )
+                    .into_bytes(),
+                "variant_patterns.csv" => {
+                    b"variant,service,field,expected\nexampleEcuV1,powerCycles.read,powerCycles,12 34\n"
+                        .to_vec()
+                }
+                _ => bytes,
+            };
+            (name, bytes)
+        })
+        .collect();
+    let documents = documents(&convert(files));
+    let expected: Vec<Vec<u8>> = variant(&documents[0])
+        .patterns
+        .iter()
+        .flatten()
+        .map(|p| p.expected.clone().expect("bytes"))
+        .collect();
+    assert_eq!(expected, [1234u64.to_be_bytes().to_vec()]);
+}
+
 /// The example with `fields.csv` given a `byte_order` and `max_bytes` column and `rows`
 /// appended (in the header order plus those two columns), and the other tables replaced or
 /// extended as `with` gives them.

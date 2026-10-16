@@ -201,7 +201,7 @@ impl<'a> Resolver<'a> {
 
         self.protocols_per_variant(&protocols);
         self.comparams(&comparams, &protocols, &units);
-        self.variant_patterns(&service_map);
+        self.variant_patterns(&service_map, &conversions);
         self.nrcs(&nrcs, &service_map, &texts);
         self.conversions(&texts);
         self.conversion_scales(&conversions, &texts);
@@ -389,8 +389,13 @@ impl<'a> Resolver<'a> {
     }
 
     /// A variant pattern names its variant, a service in that variant's document, and a field of
-    /// that service's positive response that is neither a constant nor shaped (4.2).
-    fn variant_patterns(&mut self, services: &HashMap<ServiceName, ServiceInfo>) {
+    /// that service's positive response that is neither a constant nor shaped, and whose value
+    /// the pattern can compare (4.2, ADR-306).
+    fn variant_patterns(
+        &mut self,
+        services: &HashMap<ServiceName, ServiceInfo>,
+        conversions: &HashMap<&str, &ConversionRow>,
+    ) {
         let t = self.t;
         for row in &t.variant_patterns {
             // Each column is checked on its own, so an unknown variant hides no other error.
@@ -432,7 +437,9 @@ impl<'a> Resolver<'a> {
                 .iter()
                 .find(|f| service.response.as_ref() == Some(&f.container) && f.name == row.field);
             match field {
-                Some(f) if f.constant.is_none() && f.shape.is_none() => {}
+                Some(f) if f.constant.is_none() && f.shape.is_none() => {
+                    self.pattern_value(row, f, conversions);
+                }
                 // A constant has no IR field to compare (5.3).
                 Some(f) if f.constant.is_some() => self.unknown(
                     "variant_patterns.csv",
@@ -458,6 +465,87 @@ impl<'a> Resolver<'a> {
                     ),
                 ),
             }
+        }
+    }
+
+    /// The pattern's field decodes to a value it can compare, and `expected` is written as that
+    /// value's type takes it (4.2, ADR-306): a float, from a `float` field or a numeric
+    /// conversion, is never compared; an integer takes one to eight bytes, a `bcd` field's as
+    /// its digits.
+    fn pattern_value(
+        &mut self,
+        row: &VariantPatternRow,
+        field: &FieldRow,
+        conversions: &HashMap<&str, &ConversionRow>,
+    ) {
+        let bad = |this: &mut Self, column: &str, hint: String| {
+            this.error(
+                ErrorCode::BadValue,
+                "variant_patterns.csv",
+                row.line,
+                column,
+                hint,
+            );
+        };
+        if field.field_type == Some(FieldType::Float) {
+            bad(
+                self,
+                "field",
+                format!(
+                    "{} is a float field, which a pattern cannot compare exactly",
+                    row.field
+                ),
+            );
+            return;
+        }
+        let numeric = field
+            .conversion
+            .as_deref()
+            .and_then(|name| conversions.get(name))
+            .is_some_and(|c| {
+                !matches!(
+                    c.kind,
+                    ConversionKind::Identity | ConversionKind::TextTable { .. }
+                )
+            });
+        if numeric {
+            bad(
+                self,
+                "field",
+                format!(
+                    "{} has a numeric conversion, whose float value a pattern cannot compare \
+                     exactly; compare a field with no conversion or a text table",
+                    row.field
+                ),
+            );
+            return;
+        }
+        if matches!(
+            field.field_type,
+            Some(FieldType::Uint | FieldType::Int | FieldType::Bcd)
+        ) && row.expected.len() > 8
+        {
+            bad(
+                self,
+                "expected",
+                format!(
+                    "{} is an integer, so the expected value takes one to eight bytes",
+                    row.field
+                ),
+            );
+            return;
+        }
+        if field.field_type == Some(FieldType::Bcd)
+            && row.expected.iter().any(|b| b >> 4 > 9 || b & 0x0F > 9)
+        {
+            bad(
+                self,
+                "expected",
+                format!(
+                    "{} is a bcd field, so the expected value is written as its digits, 0 to 9",
+                    row.field
+                ),
+            );
         }
     }
 

@@ -290,13 +290,16 @@ fn int(field: &Field<'_>, value: ParamValue<'_>) -> Result<i64, EncodeError> {
 
 /// The bytes a `Bytes`, `Ascii`, `Utf8` or `Unicode2` field sends for `value`.
 fn string_bytes(field: &Field<'_>, value: ParamValue<'_>) -> Result<Vec<u8>, EncodeError> {
-    // A value past the message limit is refused before it is copied or converted.
-    let given = match value {
-        ParamValue::Bytes(b) => b.len(),
-        ParamValue::Text(t) => t.len(),
+    // A value whose encoding is past the message limit is refused before it is copied or
+    // converted. A character the field cannot take is refused while converting.
+    let encoded = match (field.kind(), value) {
+        (DataKind::Ascii, ParamValue::Text(t)) => t.chars().count(),
+        (DataKind::Unicode2, ParamValue::Text(t)) => t.chars().count().saturating_mul(2),
+        (_, ParamValue::Bytes(b)) => b.len(),
+        (_, ParamValue::Text(t)) => t.len(),
         _ => 0,
     };
-    if given > MAX_ENCODED_BYTES {
+    if encoded > MAX_ENCODED_BYTES {
         return Err(EncodeError::TooLarge);
     }
     match (field.kind(), value) {
@@ -311,7 +314,7 @@ fn string_bytes(field: &Field<'_>, value: ParamValue<'_>) -> Result<Vec<u8>, Enc
         (DataKind::Utf8, ParamValue::Text(t)) => Ok(t.as_bytes().to_vec()),
         (DataKind::Unicode2, ParamValue::Text(t)) => {
             let little = field.byte_order() == ByteOrder::Little;
-            let mut out = Vec::with_capacity(t.len() * 2);
+            let mut out = Vec::with_capacity(encoded);
             for c in t.chars() {
                 // The decoder reads one UTF-16 unit per character and refuses surrogates.
                 let unit = u16::try_from(u32::from(c))

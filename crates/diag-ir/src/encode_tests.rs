@@ -537,3 +537,20 @@ fn a_float_takes_large_integers_it_holds_exactly() {
         Err(EncodeError::OutOfRange { .. })
     ));
 }
+
+#[test]
+fn the_size_limit_counts_the_encoded_bytes() {
+    let rest = |kind| FieldT {
+        length_kind: LengthKind::Terminated,
+        termination: Termination::EndOfPdu,
+        ..next("t", kind, 0)
+    };
+    // Two UTF-8 bytes each but one ASCII byte: past the limit as UTF-8, within it as ASCII.
+    let latin = "\u{e9}".repeat(MAX_ENCODED_BYTES / 2 + 1);
+    let operand = encode(&[], vec![rest(DataKind::Ascii)], &[("t", Text(&latin))]).expect("fits");
+    assert_eq!(operand.len(), MAX_ENCODED_BYTES / 2 + 1);
+    // Three UTF-8 bytes each but two UTF-16 bytes.
+    let kana = "\u{3042}".repeat(MAX_ENCODED_BYTES / 3 + 1);
+    let operand = encode(&[], vec![rest(DataKind::Unicode2)], &[("t", Text(&kana))]).expect("fits");
+    assert_eq!(operand.len(), 2 * (MAX_ENCODED_BYTES / 3 + 1));
+}

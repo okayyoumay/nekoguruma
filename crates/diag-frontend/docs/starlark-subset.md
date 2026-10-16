@@ -299,6 +299,8 @@ instruction exists, the transpiler rejects calls to it (`STAR_API_NOT_AVAILABLE`
 | `diag.precondition` | none yet | |
 | `diag.fail` | `Fail` | `code` as a constant-pool entry; `detail` as bytes from the stack, since it can be built at run time. The instruction ends the procedure as failed and is terminal (ADR-280) |
 
+`diag.read_dtc`, `diag.routine`, `diag.security_access` and `diag.flash_transfer` name an intent, not a UDS request. They are lowered through the application-layer profile of the variant's protocol into that variant's declared services, and the IR keeps one generic send-receive in place of `ReadDtc` and `RoutineControl` (ADR-309). UDS is the first profile.
+
 ### 3.3 Synchronous Calls
 
 Internally these involve waiting. Starlark has no `async`, and none is needed: the VM maps the

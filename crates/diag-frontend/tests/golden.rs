@@ -43,6 +43,9 @@ fn inputs() -> Vec<(String, Vec<u8>)> {
     files
 }
 
+/// The inputs in `golden/`, which are not expected outputs.
+const INPUTS: [&str; 2] = ["procedure.star", "responses.txt"];
+
 /// Compares `actual` with the expected file `name`, or rewrites it under `NGR_UPDATE_GOLDEN`.
 fn check(name: &str, actual: &str) {
     let path = crate_dir().join("tests/golden").join(name);
@@ -159,11 +162,18 @@ fn the_example_ecu_converts_runs_and_decodes_as_recorded() {
     for entry in &converted.units {
         writeln!(catalogs, "unit {} {:?}", entry.id, entry.text).expect("a String");
     }
+    let mut produced = vec!["catalogs.txt".to_owned()];
     check("catalogs.txt", &catalogs);
 
     let responses = read_text(&crate_dir().join("tests/golden/responses.txt"));
     for document in &converted.documents {
-        let name = &document.name;
+        let variant_name = &document.name;
+        // One document per variant and procedure file, so both name the expected files.
+        let procedure = document.procedure.as_deref().expect("a procedure");
+        let name = format!(
+            "{variant_name}.{}",
+            procedure.strip_suffix(".star").unwrap_or(procedure)
+        );
         let loaded = load_ecu_document(&document.bytes).expect("the document loads");
         let program: Program =
             postcard::from_bytes(loaded.procedure().expect("a procedure").bytes())
@@ -172,11 +182,13 @@ fn the_example_ecu_converts_runs_and_decodes_as_recorded() {
         // The declaration part and the program, the procedure's bytes shown as the program.
         let mut unpacked = loaded.unpack();
         unpacked.procedure = None;
+        produced.push(format!("{name}.ir.txt"));
         check(
             &format!("{name}.ir.txt"),
             &format!("{unpacked:#?}\n{program:#?}\n"),
         );
 
+        produced.push(format!("{name}.run.txt"));
         check(&format!("{name}.run.txt"), &run(&program));
 
         let variant = loaded.variant().expect("a variant");
@@ -191,7 +203,7 @@ fn the_example_ecu_converts_runs_and_decodes_as_recorded() {
             let (Some(scope), Some(service)) = (words.next(), words.next()) else {
                 panic!("responses.txt: {line}");
             };
-            if scope != "*" && scope != name {
+            if scope != "*" && scope != variant_name {
                 continue;
             }
             let bytes: Vec<u8> = words
@@ -205,6 +217,33 @@ fn the_example_ecu_converts_runs_and_decodes_as_recorded() {
             let result = decode_positive_response(&positive, variant.layouts(), &bytes);
             writeln!(decoded, "{service} [{}]\n{result:#?}", hex(&bytes)).expect("a String");
         }
+        produced.push(format!("{name}.decoded.txt"));
         check(&format!("{name}.decoded.txt"), &decoded);
+    }
+
+    // Every expected file belongs to an output, so a variant or procedure that stops being
+    // converted fails here instead of leaving its files unread.
+    let dir = crate_dir().join("tests/golden");
+    let mut stale: Vec<String> = std::fs::read_dir(&dir)
+        .expect("the golden directory")
+        .map(|entry| {
+            entry
+                .expect("entry")
+                .file_name()
+                .into_string()
+                .expect("UTF-8")
+        })
+        .filter(|file| !INPUTS.contains(&file.as_str()) && !produced.contains(file))
+        .collect();
+    stale.sort();
+    if std::env::var_os("NGR_UPDATE_GOLDEN").is_some() {
+        for file in &stale {
+            std::fs::remove_file(dir.join(file)).expect("a stale golden file removed");
+        }
+    } else {
+        assert!(
+            stale.is_empty(),
+            "golden files no output produces: {stale:?}; run with NGR_UPDATE_GOLDEN=1 to remove them"
+        );
     }
 }

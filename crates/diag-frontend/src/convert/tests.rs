@@ -32,7 +32,11 @@ fn with(mut files: Vec<(String, Vec<u8>)>, file: &str, contents: &str) -> Vec<(S
 
 fn convert(files: Vec<(String, Vec<u8>)>) -> Converted {
     let tables = read_files(files).unwrap_or_else(|e| panic!("does not read: {e:?}"));
-    to_ir(&resolve(tables).unwrap_or_else(|e| panic!("does not resolve: {e:?}")))
+    let procedures = lower_procedures(&tables).unwrap_or_else(|e| panic!("does not lower: {e:?}"));
+    to_ir(
+        &resolve(tables).unwrap_or_else(|e| panic!("does not resolve: {e:?}")),
+        &procedures,
+    )
 }
 
 /// The documents, read back through the loader the agent uses.
@@ -92,6 +96,7 @@ fn the_example_converts_into_one_document_per_variant() {
         .map(|d| (d.id, d.name.as_str()))
         .collect();
     assert_eq!(ids, [(1, "exampleEcuV1"), (2, "exampleEcuV2")]);
+    assert!(converted.documents.iter().all(|d| d.procedure.is_none()));
     let documents = documents(&converted);
     let expected_versions: [&[&str]; 2] = [&["1.0.0", "1.0.1"], &["2.0.0"]];
     for ((document, converted), versions) in documents
@@ -136,6 +141,11 @@ fn the_conversion_is_deterministic() {
     let mut reversed = example();
     reversed.reverse();
     assert_eq!(first, convert(reversed));
+    // With procedures, given in either order.
+    let procedures = with(with(example(), "a.star", LOG), "b.star", FAIL);
+    let mut reversed = procedures.clone();
+    reversed.reverse();
+    assert_eq!(convert(procedures), convert(reversed));
 }
 
 #[test]
@@ -291,13 +301,21 @@ fn the_source_digest_covers_the_table_files_as_stored() {
     let mut with_readme = example();
     with_readme.push(("README".to_owned(), b"notes".to_vec()));
     assert_eq!(digest(with_readme), plain);
-    // Nor is a procedure file the document does not carry, and no document carries one yet.
+    // A procedure file is covered by the documents that carry it (ADR-307).
     let mut with_procedure = example();
     with_procedure.push(("main.star".to_owned(), b"def main():\n    pass\n".to_vec()));
-    assert_eq!(digest(with_procedure), plain);
+    let tables_and_procedure = source_digest(
+        with_procedure
+            .iter()
+            .map(|(n, c)| (n.as_str(), c.as_slice())),
+    );
+    assert_eq!(digest(with_procedure), tables_and_procedure);
+    assert_ne!(tables_and_procedure, plain);
     // Reading the directory covers the same bytes.
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/example-ecu");
-    let from_dir = to_ir(&resolve(read_directory(&dir).expect("reads")).expect("resolves"));
+    let tables = read_directory(&dir).expect("reads");
+    let procedures = lower_procedures(&tables).expect("lowers");
+    let from_dir = to_ir(&resolve(tables).expect("resolves"), &procedures);
     assert_eq!(from_dir, convert(example()));
     // Line ends are part of the bytes. The checkout may already use CRLF (Git on Windows), so
     // the line ends of one table are switched to the other kind.
@@ -318,4 +336,139 @@ fn the_source_digest_covers_the_table_files_as_stored() {
         })
         .collect();
     assert_ne!(digest(switched), plain);
+}
+
+// ---------------------------------------------------------------- Procedures (ADR-307)
+
+const LOG: &str = "def main():\n    diag.log(1, \"a\")\n";
+const FAIL: &str = "def main():\n    diag.fail(\"STOP\", \"\")\n";
+
+#[test]
+fn every_procedure_goes_with_every_variant() {
+    let files = with(with(example(), "b.star", FAIL), "a.star", LOG);
+    let converted = convert(files.clone());
+    let keys: Vec<(&str, Option<&str>)> = converted
+        .documents
+        .iter()
+        .map(|d| (d.name.as_str(), d.procedure.as_deref()))
+        .collect();
+    assert_eq!(
+        keys,
+        [
+            ("exampleEcuV1", Some("a.star")),
+            ("exampleEcuV1", Some("b.star")),
+            ("exampleEcuV2", Some("a.star")),
+            ("exampleEcuV2", Some("b.star")),
+        ]
+    );
+    let tables: Vec<(&str, &[u8])> = files
+        .iter()
+        .filter(|(n, _)| n.ends_with(".csv"))
+        .map(|(n, c)| (n.as_str(), c.as_slice()))
+        .collect();
+    for (document, converted) in documents(&converted).iter().zip(&converted.documents) {
+        let file = converted.procedure.as_deref().expect("a procedure");
+        let source = if file == "a.star" { LOG } else { FAIL };
+        // Each document's digest covers the tables and its own procedure file only.
+        let expected = source_digest(tables.iter().copied().chain([(file, source.as_bytes())]));
+        assert_eq!(document.source_digest.as_deref(), Some(expected.as_str()));
+        // The procedure is the lowered program, as postcard bytes.
+        let bytes = document.procedure.as_deref().expect("a program");
+        let program: diag_ir::Program = postcard::from_bytes(bytes).expect("a program");
+        let lowered = crate::star::lower(file, &crate::star::check(file, source).expect("checks"))
+            .expect("lowers")
+            .program;
+        assert_eq!(
+            postcard::to_allocvec(&program).expect("encodes"),
+            postcard::to_allocvec(&lowered).expect("encodes")
+        );
+    }
+}
+
+#[test]
+fn every_procedure_file_reports_its_errors() {
+    // Two files fail, one to check and one because it is not UTF-8; both are reported, and a
+    // file that lowers does not hide them.
+    let mut files = with(
+        with(example(), "ok.star", LOG),
+        "bad.star",
+        "def f():\n    pass\n",
+    );
+    files.push((
+        "latin1.star".to_owned(),
+        b"def main():\n    pass # \xe9\n".to_vec(),
+    ));
+    let tables = read_files(files).expect("reads");
+    let errors = lower_procedures(&tables).expect_err("two files fail");
+    let found: Vec<(&str, crate::star::StarCode, u32)> = errors
+        .errors
+        .iter()
+        .map(|e| (e.file.as_str(), e.code, e.line))
+        .collect();
+    assert_eq!(
+        found,
+        [
+            ("bad.star", crate::star::StarCode::NoMain, 1),
+            ("latin1.star", crate::star::StarCode::SyntaxError, 2),
+        ]
+    );
+}
+
+#[test]
+fn a_rejected_procedure_keeps_the_warnings_of_the_others() {
+    // `a.star` lowers with the default-limit warning; `b.star` has no `main`.
+    let a = "def f(n):\n    for i in range(n):\n        pass\n\ndef main():\n    f(1)\n";
+    let files = with(
+        with(example(), "a.star", a),
+        "b.star",
+        "def f():\n    pass\n",
+    );
+    let tables = read_files(files).expect("reads");
+    let rejected = lower_procedures(&tables).expect_err("b.star fails");
+    assert_eq!(rejected.errors.len(), 1);
+    let warnings: Vec<(&str, crate::star::StarCode)> = rejected
+        .warnings
+        .iter()
+        .map(|w| (w.file.as_str(), w.code))
+        .collect();
+    assert_eq!(
+        warnings,
+        [("a.star", crate::star::StarCode::LoopLimitDefaulted)]
+    );
+}
+
+#[test]
+fn a_file_too_large_is_reported_before_its_encoding() {
+    let mut files = example();
+    let mut big = vec![b'#'; crate::star::MAX_SOURCE_BYTES + 1];
+    big[0] = 0xFF;
+    files.push(("big.star".to_owned(), big));
+    let tables = read_files(files).expect("reads");
+    let rejected = lower_procedures(&tables).expect_err("too large");
+    let codes: Vec<_> = rejected.errors.iter().map(|e| e.code).collect();
+    assert_eq!(codes, [crate::star::StarCode::SourceTooLarge]);
+}
+
+#[test]
+fn reading_the_directory_reads_its_procedure_files() {
+    // A copy of the example with a procedure file, read from disk.
+    let dir =
+        std::env::temp_dir().join(format!("ngr-procedures-{}-{}", std::process::id(), line!()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("temporary directory");
+    let files = with(example(), "main.star", LOG);
+    for (name, contents) in &files {
+        std::fs::write(dir.join(name), contents).expect("written");
+    }
+    let tables = read_directory(&dir).expect("reads");
+    let procedures = lower_procedures(&tables).expect("lowers");
+    let from_dir = to_ir(&resolve(tables).expect("resolves"), &procedures);
+    std::fs::remove_dir_all(&dir).expect("removed");
+    assert_eq!(from_dir, convert(files));
+    assert!(
+        from_dir
+            .documents
+            .iter()
+            .all(|d| d.procedure.as_deref() == Some("main.star"))
+    );
 }

@@ -849,7 +849,7 @@ For each cause of interruption, the resume origin and whether resumption is poss
 
 #### 8.2.6 Packaging and Distribution
 
-- **Unit of splitting**: One file per ECU variant
+- **Unit of splitting**: One file per ECU variant, and per procedure when a definition has procedures: each file carries the variant's declaration part and one procedure (ADR-307)
 - **Content addressing**: Each file is identified by its hash. Definitions shared across vehicle models are naturally deduplicated, which also provides differential delivery
 - **Lazy fetching**: The agent fetches and caches only the manifest and the target variants
 - **Unit of signing**: The manifest is signed, and the manifest holds the hash of each file (the same structure as artifacts)

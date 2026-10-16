@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-use diag_frontend::convert::to_ir;
+use diag_frontend::convert::{lower_procedures, to_ir};
 use diag_frontend::tables::{read_directory, resolve};
 use diag_ir::{IR_SCHEMA_VERSION, Op, Program, Vm};
 
@@ -19,15 +19,17 @@ fn main() {
     let example = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../crates/diag-frontend/examples/example-ecu");
     let tables = read_directory(&example).expect("the example definition reads");
+    let procedures = lower_procedures(&tables).expect("the example's procedures lower");
     let definition = resolve(tables).expect("the example definition resolves");
     let documents = dir.join("ngr-fuzz-ecu-document");
     std::fs::create_dir_all(&documents).expect("corpus directory");
-    for document in to_ir(&definition).documents {
-        std::fs::write(
-            documents.join(format!("{}.bin", document.name)),
-            &document.bytes,
-        )
-        .expect("seed file");
+    for document in to_ir(&definition, &procedures).documents {
+        // A variant has one document per procedure (ADR-307), so both name the seed.
+        let name = match &document.procedure {
+            Some(procedure) => format!("{}-{procedure}.bin", document.name),
+            None => format!("{}.bin", document.name),
+        };
+        std::fs::write(documents.join(name), &document.bytes).expect("seed file");
     }
 
     let programs = dir.join("ngr-fuzz-vm");

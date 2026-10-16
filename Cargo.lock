@@ -537,6 +537,7 @@ name = "diag-frontend"
 version = "0.1.0"
 dependencies = [
  "diag-ir",
+ "postcard",
  "serde",
  "serde_json",
  "sha2",

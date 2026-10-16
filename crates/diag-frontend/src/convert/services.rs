@@ -354,6 +354,7 @@ impl<'a> Index<'a> {
                 let mut pattern = VariantPatternT::default();
                 pattern.service_id = self.service_ids[&p.service];
                 pattern.field_id = self.field_id(&response, &p.field);
+                pattern.pattern = p.pattern;
                 let field = &tables.fields[self.fields_by_name[&(&response, p.field.as_str())]];
                 pattern.expected = Some(if field.field_type == Some(FieldType::Bcd) {
                     bcd_number(&p.expected)

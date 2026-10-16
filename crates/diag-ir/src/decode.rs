@@ -14,7 +14,7 @@ use flatbuffers::{ForwardsUOffset, Vector};
 use thiserror::Error;
 
 use crate::declaration::{
-    ByteOrder, Compu, DataKind, DtcDefinition, Field, Layout, LengthKind, Placement,
+    ByteOrder, Compu, DataKind, DtcDefinition, EcuVariant, Field, Layout, LengthKind, Placement,
     PositiveResponse, RepeatCount, Shape, Termination, VariantPattern,
 };
 
@@ -230,6 +230,48 @@ pub fn pattern_matches(pattern: &VariantPattern<'_>, fields: &[DecodedField]) ->
             .iter()
             .find(|field| field.id == pattern.field_id())
             .is_some_and(|field| value_matches(expected, &field.value))
+}
+
+/// Whether `variant` is identified (ADR-315, as ISO 22901-1 (2008) 7.4.3 describes for ECU
+/// variant patterns): its `patterns` entries with the same `pattern` number form one pattern,
+/// which matches when every entry matches ([`pattern_matches`]), and the variant matches when
+/// any of its patterns does. `fields` gives the decoded positive response of an identification
+/// service by `Service.id`, or `None` when the service gave none (a negative response, no
+/// answer, or a response that did not decode), which no entry of that service matches. A
+/// variant without patterns cannot be identified.
+pub fn variant_matches<'f>(
+    variant: &EcuVariant<'_>,
+    mut fields: impl FnMut(u32) -> Option<&'f [DecodedField]>,
+) -> bool {
+    let Some(entries) = variant.patterns() else {
+        return false;
+    };
+    let mut groups: Vec<u16> = entries.iter().map(|entry| entry.pattern()).collect();
+    groups.sort_unstable();
+    groups.dedup();
+    groups.into_iter().any(|group| {
+        entries
+            .iter()
+            .filter(|entry| entry.pattern() == group)
+            .all(|entry| fields(entry.service_id()).is_some_and(|f| pattern_matches(&entry, f)))
+    })
+}
+
+/// The index of the first of `variants` that [`variant_matches`], or `None` when none does.
+/// `fields(index, service_id)` gives the decoded positive response of the variant at `index`'s
+/// identification service, since each variant's document numbers its own services. Variants are
+/// tried in the order given, the order of `variants.csv` for a definition directory, and the
+/// first that matches is selected (ISO 22901-1 (2008) 7.4.3): a definition whose patterns are not
+/// disjoint gets the earlier variant.
+pub fn select_variant<'v, 'f>(
+    variants: impl IntoIterator<Item = EcuVariant<'v>>,
+    mut fields: impl FnMut(usize, u32) -> Option<&'f [DecodedField]>,
+) -> Option<usize> {
+    variants
+        .into_iter()
+        .enumerate()
+        .find(|(index, variant)| variant_matches(variant, |service| fields(*index, service)))
+        .map(|(index, _)| index)
 }
 
 fn value_matches(expected: &[u8], value: &PhysicalValue) -> bool {

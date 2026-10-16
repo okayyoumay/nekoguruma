@@ -295,7 +295,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-303](ADR-303-starlark-nesting-bounds-before-parsing.md) | Starlark Nesting Bounds Checked Before Parsing | Accepted | `diag-frontend` Starlark subset spec and checker, design 8.4 |
 | [ADR-304](ADR-304-lowering-starlark-procedures.md) | Lowering Starlark Procedures to the IR | Accepted | `diag-frontend` Starlark lowering, subset spec 4.7 and 4.8, design 8.4 |
 | [ADR-305](ADR-305-lowering-starlark-loops.md) | Lowering Starlark Loops | Accepted | `diag-frontend` Starlark lowering, subset spec 4.2 |
-| [ADR-306](ADR-306-comparing-a-variant-pattern-with-a-decoded-field.md) | Comparing a Variant Pattern with a Decoded Field | Accepted | `diag-ir` decoder, `diag-frontend` CSV variant patterns, design 8.9.1 |
+| [ADR-306](ADR-306-comparing-a-variant-pattern-with-a-decoded-field.md) | Comparing a Variant Pattern with a Decoded Field | Accepted (how entries combine and which variant wins decided by ADR-315) | `diag-ir` decoder, `diag-frontend` CSV variant patterns, design 8.9.1 |
 | [ADR-307](ADR-307-packaging-starlark-procedures-into-documents.md) | Packaging Starlark Procedures into Documents | Accepted (item 2's single lowering amended by ADR-311) | `diag-frontend` conversion, CSV format sections 1 and 6, design 8.2.6 |
 | [ADR-308](ADR-308-encoding-a-request-operand.md) | Encoding a Request Operand | Accepted | `diag-ir` request encoder, CSV format 5.3, design 8.2.2 |
 | [ADR-309](ADR-309-application-layer-profiles.md) | Application-Layer Profiles for Protocol-Neutral Diagnostic Calls | Accepted (items 2 and 5 given their form by ADR-314) | `diag-frontend` lowering and CSV tables, `diag-ir` primitives, `agent` host and read-only policy; ADR-235 items 2, 3 and 8; design 8.2.4, 8.4 |
@@ -304,6 +304,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-312](ADR-312-codex-as-pr-reviewer-with-copilot-fallback.md) | Codex as the Pull Request Reviewer, with Copilot as Fallback | Accepted | `.claude/skills/pr-review-loop` (Steps 0, 1, 4-5), `AGENTS.md`, `CLAUDE.md`; ADR-251 |
 | [ADR-313](ADR-313-selecting-a-request-service-from-a-table-index.md) | Selecting a Request's Service from an Index of the Tables | Accepted | `diag-frontend` conversion and Starlark lowering, CSV format 5.3, Starlark subset 3.1, 3.2 and 3.4; ADR-311 item 4 |
 | [ADR-314](ADR-314-application-layer-profiles-as-typed-frontend-data.md) | Application-Layer Profiles as Typed Frontend Data | Accepted | `diag-frontend` profiles, Starlark subset 3.2 and 3.4, CSV format 5.3; ADR-309 items 2 and 5 |
+| [ADR-315](ADR-315-variant-patterns-grouped-into-patterns.md) | Variant Pattern Entries Grouped into Patterns | Accepted | `diag-ir` schema and decoder (`IR_SCHEMA_VERSION` 10), `diag-frontend` CSV variant patterns, CSV format 4.2, design 8.9.1; ADR-306 |
 
 ## Status Legend
 
@@ -710,7 +711,7 @@ the predecessor repository these ADRs came from.
 - ADR-303
 - ADR-304
 - ADR-305
-- ADR-306
+- ADR-306 (how entries combine and which variant wins decided by ADR-315)
 - ADR-307 (item 2's single lowering amended by ADR-311)
 - ADR-308
 - ADR-309 (items 2 and 5 given their form by ADR-314)
@@ -718,6 +719,7 @@ the predecessor repository these ADRs came from.
 - ADR-311 (item 4 amended by ADR-313)
 - ADR-313
 - ADR-314
+- ADR-315
 
 ### Acquired Data & Monitoring
 - ADR-236

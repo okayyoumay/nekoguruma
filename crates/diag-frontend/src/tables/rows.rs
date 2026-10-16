@@ -88,6 +88,9 @@ pub struct VariantPatternRow {
     pub service: ServiceName,
     pub field: String,
     pub expected: Vec<u8>,
+    /// The pattern the row belongs to (ADR-315); rows of one variant with the same number form
+    /// one pattern.
+    pub pattern: u16,
 }
 
 pub(crate) const VARIANT_PATTERNS: Spec = Spec {
@@ -98,6 +101,7 @@ pub(crate) const VARIANT_PATTERNS: Spec = Spec {
         ("service", true),
         ("field", true),
         ("expected", true),
+        ("pattern", false),
     ],
 };
 
@@ -107,12 +111,16 @@ pub(crate) fn variant_patterns(sheet: &Sheet, errors: &mut Errors) -> Vec<Varian
         let service = row.required(e, "service", values::service_name);
         let field = row.required(e, "field", values::name);
         let expected = row.required(e, "expected", values::bytes);
+        let pattern = row.or(e, "pattern", 1, |cell| {
+            values::integer(cell, false, 1, u16::MAX.into()).map(|v| v as u16)
+        });
         Some(VariantPatternRow {
             line: row.line,
             variant: variant?,
             service: service?,
             field: field?,
             expected: expected?,
+            pattern: pattern?,
         })
     })
 }

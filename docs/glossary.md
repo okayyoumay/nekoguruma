@@ -189,6 +189,9 @@ Single-wire serial automotive bus (ISO 9141-2, ISO 14230). Older protocol used i
 
 ## M–O
 
+**Message notation** (`messages.txt`, ADR-310)  
+The one-line notation of the proprietary vehicle-knowledge format for message shapes: each request, response, DID record, routine message or nested layout is one line listing its fields in wire order, as `name:type` with an optional position (`@byte.bit`), length, conversion (`*name`), unit (`"key"`) and constant (`=value`). It replaces the CSV field tables and converts to the same IR; its model is ODX's.
+
 **Module** (D-PDU API)  
 A logical representation of one VCI hardware device. Maps to a J2534 `Device`. Identified by a `ModuleHandle`.
 

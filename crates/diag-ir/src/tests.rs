@@ -1165,6 +1165,10 @@ fn primitive_classification_covers_every_instruction() {
         Op::Slice,
         Op::IntToFloat,
         Op::FloatToInt,
+        Op::DecodeField {
+            service: 0,
+            field: 0,
+        },
     ];
     for (index, op) in all.iter().enumerate() {
         // The postcard encoding starts with the variant index, so this also pins the variant

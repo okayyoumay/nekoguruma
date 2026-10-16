@@ -452,6 +452,61 @@ fn negation_of_integers_and_floats() {
 }
 
 #[test]
+fn concatenation_joins_the_lower_bytes_first() {
+    let program = prog(
+        vec![
+            Op::PushBytes(0),
+            Op::PushBytes(1),
+            Op::Concat,
+            Op::PushBytes(2),
+            Op::Concat,
+        ],
+        vec![vec![1, 2], vec![3], vec![]],
+    );
+    let mut vm = Vm::new(&program);
+    run(&mut vm, &program, &mut MockHost::default());
+    assert_eq!(vm.state.stack, [Value::Bytes(vec![1, 2, 3])]);
+    // Each error leaves the state as it was (checked by `expect_vm_error`).
+    assert_eq!(
+        expect_vm_error(vec![Op::PushBytes(0), i(1), Op::Concat], vec![vec![1]], 2),
+        VmError::TypeMismatch
+    );
+    assert_eq!(
+        expect_vm_error(vec![i(1), Op::PushBytes(0), Op::Concat], vec![vec![1]], 2),
+        VmError::TypeMismatch
+    );
+    assert_eq!(
+        expect_vm_error(vec![Op::PushBytes(0), Op::Concat], vec![vec![1]], 1),
+        VmError::StackUnderflow
+    );
+}
+
+#[test]
+fn concatenation_is_bounded() {
+    let half = MAX_BYTES_LEN / 2;
+    // Exactly the bound is allowed.
+    let program = prog(
+        vec![Op::PushBytes(0), Op::Dup, Op::Concat],
+        vec![vec![0; half]],
+    );
+    let mut vm = Vm::new(&program);
+    run(&mut vm, &program, &mut MockHost::default());
+    let [Value::Bytes(joined)] = &vm.state.stack[..] else {
+        panic!("one byte string");
+    };
+    assert_eq!(joined.len(), MAX_BYTES_LEN);
+    // One byte more is not.
+    assert_eq!(
+        expect_vm_error(
+            vec![Op::PushBytes(0), Op::PushBytes(1), Op::Concat],
+            vec![vec![0; half], vec![0; half + 1]],
+            2
+        ),
+        VmError::BytesTooLong(MAX_BYTES_LEN as u64 + 1)
+    );
+}
+
+#[test]
 fn length_pushes_the_length_above_the_bytes() {
     let program = prog(
         vec![Op::PushBytes(0), Op::Length, Op::PushBytes(1), Op::Length],
@@ -1017,6 +1072,7 @@ fn primitive_classification_covers_every_instruction() {
         Op::Length,
         Op::Rem,
         Op::Neg,
+        Op::Concat,
     ];
     for (index, op) in all.iter().enumerate() {
         // The postcard encoding starts with the variant index, so this also pins the variant

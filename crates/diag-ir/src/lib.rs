@@ -23,12 +23,16 @@ use serde::{Deserialize, Serialize};
 /// 4: `Op` gained `Length`, for the same reason (ADR-233).
 /// 5: `Op` gained `Rem`, for the same reason.
 /// 6: `Op` gained `Neg`, for the same reason.
-pub const IR_SCHEMA_VERSION: u32 = 6;
+/// 7: `Op` gained `Concat`, for the same reason; `VmError` gained `BytesTooLong`.
+pub const IR_SCHEMA_VERSION: u32 = 7;
 
 /// The longest code, in bytes, that `Program::validate` accepts for a `Fail` (ADR-280).
 pub const MAX_FAILURE_CODE_LEN: usize = 128;
 /// The longest detail of a `Fail`, in bytes of text, that a caller keeps (ADR-280).
 pub const MAX_FAILURE_DETAIL_LEN: usize = 1024;
+/// The longest byte string `Concat` builds: the bound of an encoded request
+/// ([`encode::MAX_ENCODED_BYTES`]), since building request payloads is what it is for.
+pub const MAX_BYTES_LEN: usize = encode::MAX_ENCODED_BYTES;
 
 /// The part of a `Fail`'s detail operand that [`Failure::detail`] carries: the operand is an
 /// unbounded stack value, and a caller keeps at most [`MAX_FAILURE_DETAIL_LEN`] bytes of its
@@ -142,6 +146,12 @@ pub enum Op {
     /// Negates the `I64` or `F64` on top of the stack. Negating `i64::MIN` is
     /// `VmError::Overflow`; a float only changes its sign, NaN and zeros included.
     Neg,
+
+    // Byte strings. Appended after `Neg` (ADR-233).
+    /// Replaces the `Bytes` below the top of the stack and the `Bytes` on top with their
+    /// concatenation, the lower one first. A result longer than [`MAX_BYTES_LEN`] is
+    /// `VmError::BytesTooLong`, so a loop that keeps doubling a value cannot exhaust memory.
+    Concat,
 }
 
 // ---------------------------------------------------------------- Program
@@ -250,6 +260,7 @@ impl Op {
             | Op::Length
             | Op::Rem
             | Op::Neg
+            | Op::Concat
             | Op::Fail { .. } => false,
         }
     }
@@ -516,6 +527,19 @@ impl Vm {
                 };
                 self.replace(1, result);
             }
+            Op::Concat => {
+                let [Value::Bytes(a), Value::Bytes(b)] = self.top(2)? else {
+                    return Err(VmError::TypeMismatch.into());
+                };
+                let len = a.len() + b.len();
+                if len > MAX_BYTES_LEN {
+                    return Err(VmError::BytesTooLong(len as u64).into());
+                }
+                let mut joined = Vec::with_capacity(len);
+                joined.extend_from_slice(a);
+                joined.extend_from_slice(b);
+                self.replace(2, Value::Bytes(joined));
+            }
             Op::Not => {
                 let Value::Bool(b) = self.top(1)?[0] else {
                     return Err(VmError::TypeMismatch.into());
@@ -748,7 +772,8 @@ impl Vm {
             | Op::IndexSet
             | Op::Length
             | Op::Rem
-            | Op::Neg => HostInput::Nothing,
+            | Op::Neg
+            | Op::Concat => HostInput::Nothing,
             // The checks of `Fail` run in `execute`, before it changes anything.
             Op::Fail { .. } => HostInput::Nothing,
         })
@@ -1015,6 +1040,8 @@ pub enum VmError {
     IndexOutOfRange(i64),
     #[error("byte value out of range: {0}")]
     ByteOutOfRange(i64),
+    #[error("byte string of {0} bytes is longer than {MAX_BYTES_LEN}")]
+    BytesTooLong(u64),
 }
 
 #[cfg(test)]

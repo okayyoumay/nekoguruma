@@ -785,6 +785,19 @@ fn a_source_map_entry_starts_each_run_of_one_position() {
 }
 
 #[test]
+fn bytes_and_strings_join_at_run_time() {
+    assert!(holds(
+        "a, b",
+        "b\"\\x01\", b\"\\x02\\x03\"",
+        "a + b == b\"\\x01\\x02\\x03\""
+    ));
+    assert!(holds("a, b", "\"x\", \"yz\"", "a + b == \"xyz\""));
+    assert!(holds("a", "b\"\"", "a + a == b\"\""));
+    // A constant joins a run-time value as well.
+    assert!(holds("a", "\"y\"", "\"x\" + a == \"xy\""));
+}
+
+#[test]
 fn what_the_ir_cannot_express_is_not_lowerable() {
     let cases = [
         // Mixed int and float at run time.
@@ -793,8 +806,8 @@ fn what_the_ir_cannot_express_is_not_lowerable() {
         "def f(x):\n    return x // 2.0\n\ndef main():\n    f(1.0)\n",
         // A run-time `<<`.
         "def f(x):\n    return x << 1\n\ndef main():\n    f(1)\n",
-        // String concatenation at run time.
-        "def f(x):\n    return x + \"a\"\n\ndef main():\n    f(\"b\")\n",
+        // Bytes and a string joined at run time.
+        "def f(x):\n    return x + \"a\"\n\ndef main():\n    f(b\"b\")\n",
         // A local of two types.
         "def f(x):\n    y = 1\n    if x:\n        y = 1.0\n    return y + y\n\ndef main():\n    f(True)\n",
         // The truth of bytes at run time.

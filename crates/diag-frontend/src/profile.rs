@@ -204,6 +204,10 @@ pub enum ProfileError {
     SourceCount(Intent, Source, usize),
     #[error("{}: `params` is used {} times, not once", .0.name(), .1)]
     ParamsCount(Intent, usize),
+    #[error("{}: an argument that runs to the end of the request is not last", .0.name())]
+    RestNotLast(Intent),
+    #[error("{}: {:?} is in the wrong kind of part (only the routine's identifier and sub-function select)", .0.name(), .1)]
+    PartForSource(Intent, Source),
     #[error("{}: the key is used before the step that makes it", .0.name())]
     KeyBeforeKeyStep(Intent),
     #[error("{}: a step's kind does not fit the call", .0.name())]
@@ -245,13 +249,14 @@ impl Profile {
 impl Call {
     fn validate(&self) -> Result<(), ProfileError> {
         let intent = self.intent;
-        if self.steps.is_empty() {
+        let Some(last) = self.steps.last() else {
             return Err(ProfileError::NoStep(intent));
-        }
-        let mut key_made = false;
+        };
+        let mut key_step = None;
         let mut params = 0;
         let mut used: Vec<Source> = Vec::new();
-        for step in self.steps {
+        let mut dtc_maps = 0;
+        for (at, step) in self.steps.iter().enumerate() {
             let kind_fits = match step.kind {
                 StepKind::SendReceive => true,
                 StepKind::RoutineControl => {
@@ -271,11 +276,16 @@ impl Call {
                             ]
                         )
                 }
+                // The step sends nothing, and it follows the seed request.
                 StepKind::SecurityKey => {
                     intent == Intent::SecurityAccess
-                        && !key_made
+                        && key_step.is_none()
+                        && step.request.sid == 0
                         && step.request.parts.is_empty()
                         && !step.declared
+                        && step.result == ResultMap::None
+                        && at > 0
+                        && matches!(self.steps[at - 1].result, ResultMap::Seed { .. })
                 }
             };
             if !kind_fits {
@@ -283,19 +293,32 @@ impl Call {
             }
             let map_fits = match step.result {
                 ResultMap::ReadDtc {
+                    mask,
+                    dtcs,
                     code_bits,
                     status_bits,
-                    ..
                 } => {
+                    dtc_maps += 1;
+                    let whole = |bits: u8| bits > 0 && bits <= 64 && bits % 8 == 0;
                     intent == Intent::ReadDtc
                         && step.declared
-                        && code_bits > 0
-                        && code_bits % 8 == 0
-                        && status_bits > 0
-                        && status_bits % 8 == 0
+                        && mask != dtcs
+                        && whole(code_bits)
+                        && whole(status_bits)
                 }
-                ResultMap::Declared => step.declared,
-                ResultMap::Seed { .. } => intent == Intent::SecurityAccess,
+                // Only a routine's last step gives its declared names (ADR-314 item 4).
+                ResultMap::Declared => {
+                    intent == Intent::Routine && step.declared && std::ptr::eq(step, last)
+                }
+                // The seed is read by the profile's own rule, just before the key step.
+                ResultMap::Seed { .. } => {
+                    intent == Intent::SecurityAccess
+                        && !step.declared
+                        && self
+                            .steps
+                            .get(at + 1)
+                            .is_some_and(|next| next.kind == StepKind::SecurityKey)
+                }
                 ResultMap::None => true,
             };
             if !map_fits {
@@ -305,19 +328,32 @@ impl Call {
             for (i, part) in parts.iter().enumerate() {
                 match *part {
                     Part::Const { bits, value } => {
-                        if bits == 0 || bits % 8 != 0 || (bits < 64 && value >> bits != 0) {
+                        if bits == 0
+                            || bits > 64
+                            || bits % 8 != 0
+                            || (bits < 64 && value >> bits != 0)
+                        {
                             return Err(ProfileError::BadConstant(intent));
                         }
                     }
                     Part::Select { bits, arg } | Part::Arg { bits, arg } => {
-                        let rest = matches!(part, Part::Arg { bits: 0, .. });
-                        if bits % 8 != 0 || (bits == 0 && !rest) || bits > 64 {
+                        let select = matches!(part, Part::Select { .. });
+                        let rest = !select && bits == 0;
+                        if bits % 8 != 0 || bits > 64 || (bits == 0 && !rest) {
                             return Err(ProfileError::BadWidth(intent));
+                        }
+                        if rest && i + 1 != parts.len() {
+                            return Err(ProfileError::RestNotLast(intent));
                         }
                         if arg.intent() != intent {
                             return Err(ProfileError::ForeignSource(intent, arg));
                         }
-                        if arg == Source::Key && !key_made {
+                        // Only the routine's identifier and sub-function select a service; the
+                        // other arguments are values sent in a field.
+                        if select != matches!(arg, Source::Sub | Source::Rid) {
+                            return Err(ProfileError::PartForSource(intent, arg));
+                        }
+                        if arg == Source::Key && key_step.is_none() {
                             return Err(ProfileError::KeyBeforeKeyStep(intent));
                         }
                         used.push(arg);
@@ -331,7 +367,7 @@ impl Call {
                 }
             }
             if step.kind == StepKind::SecurityKey {
-                key_made = true;
+                key_step = Some(at);
             }
         }
         let (required, needs_params): (&[Source], usize) = match intent {
@@ -348,8 +384,13 @@ impl Call {
         if params != needs_params {
             return Err(ProfileError::ParamsCount(intent, params));
         }
-        if intent == Intent::SecurityAccess && !key_made {
-            return Err(ProfileError::StepKind(intent));
+        let result_fits = match intent {
+            Intent::ReadDtc => dtc_maps == 1,
+            Intent::Routine => last.result == ResultMap::Declared,
+            Intent::SecurityAccess => key_step.is_some(),
+        };
+        if !result_fits {
+            return Err(ProfileError::ResultMap(intent));
         }
         Ok(())
     }

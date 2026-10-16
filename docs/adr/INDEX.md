@@ -297,6 +297,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-305](ADR-305-lowering-starlark-loops.md) | Lowering Starlark Loops | Accepted | `diag-frontend` Starlark lowering, subset spec 4.2 |
 | [ADR-306](ADR-306-comparing-a-variant-pattern-with-a-decoded-field.md) | Comparing a Variant Pattern with a Decoded Field | Accepted | `diag-ir` decoder, `diag-frontend` CSV variant patterns, design 8.9.1 |
 | [ADR-307](ADR-307-packaging-starlark-procedures-into-documents.md) | Packaging Starlark Procedures into Documents | Accepted | `diag-frontend` conversion, CSV format sections 1 and 6, design 8.2.6 |
+| [ADR-308](ADR-308-encoding-a-request-operand.md) | Encoding a Request Operand | Accepted | `diag-ir` request encoder, CSV format 5.3, design 8.2.2 |
 
 ## Status Legend
 
@@ -704,6 +705,7 @@ the predecessor repository these ADRs came from.
 - ADR-305
 - ADR-306
 - ADR-307
+- ADR-308
 
 ### Acquired Data & Monitoring
 - ADR-236

@@ -646,7 +646,9 @@ impl<'a> Lowerer<'a> {
                     }
                 }
             }
-            if !self.changed {
+            // Once a budget is spent the procedure is rejected, so further passes would only
+            // repeat work.
+            if !self.changed || self.exhausted.is_some() {
                 self.quiet -= 1;
                 return;
             }
@@ -988,7 +990,12 @@ impl<'a> Lowerer<'a> {
     }
 
     /// Charges `units` of unrolling work; false, after an error, once the budget is spent.
+    /// False as well once any budget is spent, since the procedure is rejected then: the rest
+    /// of the copies would only repeat work, such as building a literal again and again.
     fn unroll_step(&mut self, span: Span, units: usize) -> bool {
+        if self.exhausted.is_some() {
+            return false;
+        }
         self.unrolled = self.unrolled.saturating_add(units);
         if self.unrolled > MAX_UNROLLED {
             self.exhausted.get_or_insert((span, TOO_MUCH_UNROLLING));
@@ -1315,7 +1322,7 @@ impl<'a> Lowerer<'a> {
             ExprP::Literal(literal) => match literal {
                 AstLiteral::Int(int) => match &int.node {
                     TokenInt::I32(n) => Val::Const(Const::Int(i64::from(*n))),
-                    TokenInt::BigInt(big) => match big.to_string().parse::<i64>() {
+                    TokenInt::BigInt(big) => match i64::try_from(big) {
                         Ok(n) => Val::Const(Const::Int(n)),
                         Err(_) => {
                             self.not_lowerable(span, "an integer outside the 64-bit range (4.4)");
@@ -2909,7 +2916,7 @@ fn is_two_to_the_63(expr: &AstExpr) -> bool {
     let ExprP::Literal(AstLiteral::Int(int)) = &expr.node else {
         return false;
     };
-    matches!(&int.node, TokenInt::BigInt(big) if big.to_string() == "9223372036854775808")
+    matches!(&int.node, TokenInt::BigInt(big) if u64::try_from(big) == Ok(1 << 63))
 }
 
 // ---------------------------------------------------------------- Folding

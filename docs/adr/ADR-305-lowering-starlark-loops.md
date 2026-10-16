@@ -63,6 +63,9 @@ Lowering loops needs choices the subset leaves open:
      would let a large body grow without bound.
    - Running past the bound rejects the procedure (`STAR_NOT_LOWERABLE`), even where errors are
      muted, like the constant budgets of subset 4.8.
+   - Once any of these budgets is spent, unrolling and type inference stop where they are,
+     since the procedure is rejected anyway. Otherwise the remaining copies would repeat work
+     the budget has already refused, such as building the same large literal again.
 7. **Warnings come back with the program.** `lower` returns `Lowered { program, warnings }`.
    Warnings are resolved like errors (file, line, column, snippet, hint), matching the
    `warnings` list of subset 5. An unrolled body meets the same problem once per copy, so

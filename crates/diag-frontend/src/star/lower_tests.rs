@@ -1346,6 +1346,52 @@ fn unrolling_counts_the_bytes_of_the_names_it_handles() {
 }
 
 #[test]
+fn unrolling_stops_once_a_budget_is_spent() {
+    // Each copy builds a 256 KiB literal, so the constant budget runs out after 64 copies;
+    // the remaining copies are not lowered, even while inference mutes the error.
+    let items = vec!["0"; 2000].join(", ");
+    let text = "s".repeat(1 << 18);
+    let source =
+        format!("L = [{items}]\n\ndef main():\n    for n in L:\n        diag.log(1, \"{text}\")\n");
+    let checked = check("t.star", &source).unwrap_or_else(|errors| panic!("{errors:#?}"));
+    let mut lowerer = Lowerer::new(&checked);
+    lowerer.annotations();
+    lowerer.constants();
+    lowerer.globals_built = lowerer.built;
+    lowerer.functions();
+    lowerer.infer();
+    assert!(lowerer.exhausted.is_some());
+    assert!(lowerer.unrolled < 1000, "{}", lowerer.unrolled);
+    let found = codes(&source);
+    assert!(
+        !found.is_empty() && found.iter().all(|(c, _)| *c == StarCode::NotLowerable),
+        "{found:?}"
+    );
+}
+
+#[test]
+fn a_huge_integer_literal_is_rejected_without_formatting_it() {
+    // A 16,384-bit literal in 10,000 copies: rejecting it must not convert it to decimal in
+    // each copy.
+    let items = vec!["0"; 10_000].join(", ");
+    let huge = format!("0x{}", "f".repeat(4096));
+    let source =
+        format!("L = [{items}]\n\ndef main():\n    for n in L:\n        diag.wait({huge})\n");
+    let found = codes(&source);
+    assert!(
+        !found.is_empty() && found.iter().all(|(c, _)| *c == StarCode::NotLowerable),
+        "{found:?}"
+    );
+    // 2^63 is still recognized under its minus sign, in any spelling.
+    assert_eq!(
+        failed_with(
+            "def main():\n    if -0x8000000000000000 < 0:\n        diag.fail(\"MIN\", \"\")\n"
+        ),
+        "MIN"
+    );
+}
+
+#[test]
 fn an_unrolled_body_reports_each_problem_once() {
     let source = "\
 def spin(n):

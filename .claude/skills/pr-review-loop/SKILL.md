@@ -55,16 +55,23 @@ its own comment, after every thread of the round has its reply (Step 4), never i
 This works on draft PRs. Codex may also review on its own when a PR is marked ready for review
 (an owner setting in Codex); such a review is handled like any other result for its commit.
 
-**Result.** Codex reports in one of three shapes, all by `chatgpt-codex-connector[bot]` (in
-`get_review_comments`, `chatgpt-codex-connector`):
+**Result.** Codex keeps one "Codex Review Summary" PR comment (`get_comments`) and edits it in
+place as reviews start and finish; each edit wakes the session as a comment event. Its body
+carries a hidden state line, `<!-- codex-review-state:v1 {...} -->` (braces HTML-escaped as
+`&#123;` and `&#125;`), whose `code_review` object gives `commit_sha` (the full SHA reviewed),
+`status` (`running`, `completed`) and `has_any_findings`. That state is the authoritative signal:
+read it first, and accept it only when `commit_sha` is the current head. Codex also reacts to the
+PR with 👀 and 👍, but the GitHub tools here cannot list reactions, so a reaction is never a
+signal. All of Codex's output is by `chatgpt-codex-connector[bot]` (in `get_review_comments`,
+`chatgpt-codex-connector`), in these shapes:
 
-- **Findings**: a "Commented" review whose body is headed "Codex Review" and names the commit as
+- **Findings** (`has_any_findings: true`): a "Commented" review whose body is headed "Codex Review" and names the commit as
   "Reviewed commit: `<short SHA>`", with the findings as inline comments in the same review. Each
   inline comment starts with a severity badge whose image alt text is "P0 Badge" to "P3 Badge".
   Their closing "Useful? React with 👍 / 👎" line is not a question for you.
-- **Clean**: a PR comment (`get_comments`, not a review) starting "Codex Review: Didn't find any
-  major issues", naming the reviewed commit the same way; or a 👍 reaction from the app on the PR
-  or on the request comment with no review of the head.
+- **Clean** (`status: completed`, `has_any_findings: false`): no review on the head. Older Codex
+  versions posted a separate PR comment starting "Codex Review: Didn't find any major issues"
+  naming the reviewed commit; treat that the same way if it appears.
 - **Error**: a PR comment starting "Codex Review: Something went wrong", usually with the cause in
   a code block. Request again once on the same head; a second error on that head counts as a stall
   (below).
@@ -72,8 +79,8 @@ This works on draft PRs. Codex may also review on its own when a PR is marked re
 Only a result posted after the latest request whose reviewed commit is a prefix of the current
 head counts as that request's result.
 
-**Codex not set up.** If the request gets no reaction and no result by the second check-in and the
-app has never answered on this repository, or Codex answers that it is not set up for the
+**Codex not set up.** If the request gets no summary comment and no result by the second check-in
+and the app has never answered on this repository, or Codex answers that it is not set up for the
 repository or account, Codex cannot review here (installing the ChatGPT Codex GitHub app and
 turning on code review for the repository in the Codex settings are steps only the owner can take).
 Say so once in the thread, naming those steps, and switch the PR to Copilot.
@@ -83,7 +90,9 @@ right away; do not wait for the allowance to come back. Say so once in the threa
 starts with Codex again.
 
 **Codex requested but never finished.** If a check-in finds no result for the latest request,
-schedule one more check-in 15 minutes later. If that one still finds none, or Codex errored twice
+schedule one more check-in 15 minutes later. While the summary's state shows `status: running` for
+the current head, keep scheduling check-ins instead of counting the round as stalled. If the
+second check-in finds no result and no running state, or Codex errored twice
 on the head, the round has stalled: tell the maintainer once in the thread and switch the PR to
 Copilot for this head.
 
@@ -182,8 +191,9 @@ pull_request_read(method="get_comments", owner, repo, pullNumber, perPage=100)
   already fixed, accepted or declined gets a reply pointing at the earlier answer, not a new
   investigation.
 - **Clean round** means: the reviewer's latest result came after the latest request and is for
-  the current head, and it raises nothing new. For Codex, that is the "Didn't find any major
-  issues" comment or the 👍 reaction (Step 0) with no new inline thread on the head. For Copilot,
+  the current head, and it raises nothing new. For Codex, the summary's state shows `status:
+  completed` and `has_any_findings: false` for the current head (Step 0), and there is no new
+  inline thread on the head. For Copilot,
   the review's `commit_id` is the current head, it has no new inline comments, and its summary
   lists no open or previously missed finding ("Findings: None" with nothing under "Previously
   missed"). An older head's result never counts, even while the new one has not arrived yet. A

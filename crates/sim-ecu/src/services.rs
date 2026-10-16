@@ -2,11 +2,11 @@
 //! clause in ISO 14229-1 (2026 edition) and returns the first NRC that applies.
 
 use crate::{
-    DID_ACTIVE_DIAGNOSTIC_SESSION, DID_FLASH_STATE, DID_POWER_CYCLES, DID_SOFTWARE_VERSION,
-    DID_SPARE_PART_NUMBER, DID_VIN, DTC_STATUS_AFTER_CLEAR, DTC_STATUS_AVAILABILITY_MASK, Download,
-    FLASH_SIZE, FLASH_START, Fault, FlashPhase, MAX_BLOCK_LENGTH, MAX_DIDS_PER_READ,
-    MAX_RESPONSE_LENGTH, MAX_SECURITY_ATTEMPTS, Nrc, P2_SERVER_MAX_MS, P2_STAR_SERVER_MAX_10MS,
-    POSITIVE_RESPONSE_OFFSET, RID_CHECK_PROGRAMMING_DEPENDENCIES, RID_ERASE_MEMORY,
+    DEFAULT_P2_SERVER_MAX_MS, DEFAULT_P2_STAR_SERVER_MAX_MS, DID_ACTIVE_DIAGNOSTIC_SESSION,
+    DID_FLASH_STATE, DID_POWER_CYCLES, DID_SOFTWARE_VERSION, DID_SPARE_PART_NUMBER, DID_VIN,
+    DTC_STATUS_AFTER_CLEAR, DTC_STATUS_AVAILABILITY_MASK, Download, FLASH_SIZE, FLASH_START, Fault,
+    FlashPhase, MAX_BLOCK_LENGTH, MAX_DIDS_PER_READ, MAX_RESPONSE_LENGTH, MAX_SECURITY_ATTEMPTS,
+    Nrc, POSITIVE_RESPONSE_OFFSET, RID_CHECK_PROGRAMMING_DEPENDENCIES, RID_ERASE_MEMORY,
     SUPPRESS_POS_RSP, ServiceResult, Session, SimEcu,
 };
 
@@ -139,8 +139,19 @@ impl SimEcu {
             self.interrupt_transfer();
         }
         self.session = target;
-        let p2 = P2_SERVER_MAX_MS.to_be_bytes();
-        let p2_star = P2_STAR_SERVER_MAX_10MS.to_be_bytes();
+        // The response reports P2 in 1 ms and P2* in 10 ms units (clause 9.2).
+        let p2 = self
+            .config
+            .p2_server_max_ms
+            .unwrap_or(DEFAULT_P2_SERVER_MAX_MS)
+            .to_be_bytes();
+        let p2_star_ms = self
+            .config
+            .p2_star_server_max_ms
+            .unwrap_or(DEFAULT_P2_STAR_SERVER_MAX_MS);
+        let p2_star = u16::try_from(p2_star_ms / 10)
+            .unwrap_or(u16::MAX)
+            .to_be_bytes();
         reply(
             &sf,
             positive(

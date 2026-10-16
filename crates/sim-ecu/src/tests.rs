@@ -169,6 +169,33 @@ fn session_control_switches_session_and_reports_timing() {
 }
 
 #[test]
+fn session_control_reports_the_configured_timing() {
+    let report = |p2, p2_star| {
+        let mut ecu = SimEcu::new(EcuConfig {
+            p2_server_max_ms: p2,
+            p2_star_server_max_ms: p2_star,
+            ..config()
+        });
+        ecu.request(&[0x10, 0x01])
+    };
+    // The defaults are the values clause 9.2 recommends: 50 ms and 5000 ms (500 x 10 ms).
+    assert_eq!(
+        report(None, None),
+        pos(&[0x50, 0x01, 0x00, 0x32, 0x01, 0xF4])
+    );
+    // P2 in 1 ms units; P2* in 10 ms units, rounded down.
+    assert_eq!(
+        report(Some(0x1234), Some(2_009)),
+        pos(&[0x50, 0x01, 0x12, 0x34, 0x00, 0xC8])
+    );
+    // A P2* past what 16 bits of 10 ms hold is reported as the largest value.
+    assert_eq!(
+        report(Some(0), Some(700_000)),
+        pos(&[0x50, 0x01, 0x00, 0x00, 0xFF, 0xFF])
+    );
+}
+
+#[test]
 fn session_control_rejects_unknown_session_and_bad_length() {
     let mut ecu = ecu();
     assert_eq!(

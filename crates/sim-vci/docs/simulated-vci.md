@@ -86,7 +86,7 @@ a vehicle outlives a crashed worker (ADR-241):
   not created, and every call that needs it fails until it can be. Only a file that does not
   exist starts a fresh ECU: a path that cannot be read for any other reason, a file of another
   format version (the version is checked before the rest is decoded; any change to the encoded
-  ECU state, such as `startup_ms` or the faults waiting for a request, gets a new version, so a file written by an older build is
+  ECU state, such as `startup_ms`, the faults waiting for a request or the reported P2 and P2*, gets a new version, so a file written by an older build is
   refused rather than misread), or one whose state contradicts itself (`SimEcu::restore` refuses it) makes the
   call that first needs the ECU (`PassThruOpen` or a control command) fail with `ERR_FAILED`.
 - Replacing the file is retried briefly when Windows reports it in use.

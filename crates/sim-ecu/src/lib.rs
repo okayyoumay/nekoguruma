@@ -86,10 +86,13 @@ pub const DTC_STATUS_AVAILABILITY_MASK: u8 = 0xFF;
 /// "test not completed" bits (4 and 6) are set (Annex D.2).
 pub const DTC_STATUS_AFTER_CLEAR: u8 = 0x50;
 
-/// tL7_P2_Server_Max reported in the DiagnosticSessionControl response (1 ms resolution).
-pub const P2_SERVER_MAX_MS: u16 = 50;
-/// tL7_P2*_Server_Max reported in the DiagnosticSessionControl response (10 ms resolution).
-pub const P2_STAR_SERVER_MAX_10MS: u16 = 500;
+/// tP2_Server_Max when `EcuConfig::p2_server_max_ms` is unset: the value ISO 14229-2 (2021)
+/// clause 9.2 (Table 4) recommends for the time to start a response.
+pub const DEFAULT_P2_SERVER_MAX_MS: u16 = 50;
+/// tP2*_Server_Max when `EcuConfig::p2_star_server_max_ms` is unset: the value ISO 14229-2
+/// (2021) clause 9.2 (Table 4) recommends for the time to start a response after a response
+/// pending message.
+pub const DEFAULT_P2_STAR_SERVER_MAX_MS: u32 = 5_000;
 
 // ---------------------------------------------------------------- Configuration
 
@@ -117,6 +120,16 @@ pub struct EcuConfig {
     /// [`DEFAULT_S3_SERVER_MS`] when unset.
     #[serde(default)]
     pub s3_server_ms: Option<u32>,
+    /// tP2_Server_Max in ms, which the DiagnosticSessionControl response reports (1 ms
+    /// resolution). [`DEFAULT_P2_SERVER_MAX_MS`] when unset. It is reported only: response
+    /// timing is set by `response_delay_ms` and [`Fault::ResponsePending`].
+    #[serde(default)]
+    pub p2_server_max_ms: Option<u16>,
+    /// tP2*_Server_Max in ms, which the DiagnosticSessionControl response reports in 10 ms units
+    /// (rounded down, and 0xFFFF past 655 350 ms). [`DEFAULT_P2_STAR_SERVER_MAX_MS`] when unset.
+    /// Reported only, as `p2_server_max_ms` is.
+    #[serde(default)]
+    pub p2_star_server_max_ms: Option<u32>,
     /// How long the security delay timer runs, in ms. [`DEFAULT_SECURITY_DELAY_MS`] when unset.
     #[serde(default)]
     pub security_delay_ms: Option<u32>,

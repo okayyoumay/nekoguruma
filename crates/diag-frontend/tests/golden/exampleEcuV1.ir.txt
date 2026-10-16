@@ -1,0 +1,2175 @@
+EcuDocumentT {
+    schema_version: 9,
+    source_format: Some(
+        "csv-starlark",
+    ),
+    source_digest: Some(
+        "57ad91a52c23c917cb0564d008b281a7d3f4c222a2d403c1e8e57523aa3f2cfe",
+    ),
+    variant: Some(
+        EcuVariantT {
+            id: 1,
+            short_name: Some(
+                "exampleEcuV1",
+            ),
+            part_numbers: Some(
+                [
+                    "NGR-EX-0001",
+                ],
+            ),
+            sw_versions: Some(
+                [
+                    "1.0.0",
+                    "1.0.1",
+                ],
+            ),
+            patterns: Some(
+                [
+                    VariantPatternT {
+                        service_id: 7,
+                        field_id: 22,
+                        expected: Some(
+                            [
+                                49,
+                                46,
+                            ],
+                        ),
+                    },
+                ],
+            ),
+            protocols: Some(
+                [
+                    ProtocolT {
+                        short_name: Some(
+                            "ISO15765",
+                        ),
+                        baud_rate: 500000,
+                        tx_id: 2016,
+                        rx_id: 2024,
+                        functional_id: 2015,
+                        extended_addressing: false,
+                        params: Some(
+                            [
+                                ComParamT {
+                                    short_name: Some(
+                                        "CP_BlockSize",
+                                    ),
+                                    value: 0,
+                                    unit_id: 0,
+                                },
+                                ComParamT {
+                                    short_name: Some(
+                                        "CP_StMin",
+                                    ),
+                                    value: 0,
+                                    unit_id: 0,
+                                },
+                            ],
+                        ),
+                    },
+                ],
+            ),
+            services: Some(
+                [
+                    ServiceT {
+                        id: 1,
+                        short_name: Some(
+                            "defaultSession",
+                        ),
+                        request: Some(
+                            RequestT {
+                                sid: 16,
+                                prefix: Some(
+                                    [
+                                        1,
+                                    ],
+                                ),
+                                params: Some(
+                                    [],
+                                ),
+                            },
+                        ),
+                        positive: Some(
+                            PositiveResponseT {
+                                sid: 80,
+                                prefix: Some(
+                                    [
+                                        1,
+                                    ],
+                                ),
+                                fields: Some(
+                                    [
+                                        FieldT {
+                                            id: 1,
+                                            short_name: Some(
+                                                "p2ServerMax",
+                                            ),
+                                            placement: Absolute,
+                                            bit_offset: 16,
+                                            length_kind: Fixed,
+                                            bit_length: 16,
+                                            kind: Uint,
+                                            byte_order: Big,
+                                            compu: CompuIdentity(
+                                                CompuIdentityT,
+                                            ),
+                                            unit_id: 2,
+                                            length_field_id: 0,
+                                            min_bytes: 0,
+                                            max_bytes: 0,
+                                            termination: EndOfPdu,
+                                            shape: NONE,
+                                        },
+                                        FieldT {
+                                            id: 2,
+                                            short_name: Some(
+                                                "p2StarServerMax",
+                                            ),
+                                            placement: Absolute,
+                                            bit_offset: 32,
+                                            length_kind: Fixed,
+                                            bit_length: 16,
+                                            kind: Uint,
+                                            byte_order: Big,
+                                            compu: CompuLinear(
+                                                CompuLinearT {
+                                                    numerator: 10.0,
+                                                    denominator: 1.0,
+                                                    offset: 0.0,
+                                                },
+                                            ),
+                                            unit_id: 2,
+                                            length_field_id: 0,
+                                            min_bytes: 0,
+                                            max_bytes: 0,
+                                            termination: EndOfPdu,
+                                            shape: NONE,
+                                        },
+                                    ],
+                                ),
+                            },
+                        ),
+                        negatives: Some(
+                            [
+                                NegativeResponseT {
+                                    nrc: 18,
+                                    message_id: 10,
+                                    retryable: false,
+                                },
+                                NegativeResponseT {
+                                    nrc: 34,
+                                    message_id: 11,
+                                    retryable: false,
+                                },
+                                NegativeResponseT {
+                                    nrc: 49,
+                                    message_id: 12,
+                                    retryable: false,
+                                },
+                                NegativeResponseT {
+                                    nrc: 51,
+                                    message_id: 13,
+                                    retryable: false,
+                                },
+                            ],
+                        ),
+                        required_session: 0,
+                        required_security_level: 0,
+                        p2_millis: 50,
+                        p2_star_millis: 5000,
+                    },
+                    ServiceT {
+                        id: 2,
+                        short_name: Some(
+                            "extendedSession",
+                        ),
+                        request: Some(
+                            RequestT {
+                                sid: 16,
+                                prefix: Some(
+                                    [
+                                        3,
+                                    ],
+                                ),
+                                params: Some(
+                                    [],
+                                ),
+                            },
+                        ),
+                        positive: Some(
+                            PositiveResponseT {
+                                sid: 80,
+                                prefix: Some(
+                                    [
+                                        3,
+                                    ],
+                                ),
+                                fields: Some(
+                                    [
+                                        FieldT {
+                                            id: 3,
+                                            short_name: Some(
+                                                "p2ServerMax",
+                                            ),
+                                            placement: Absolute,
+                                            bit_offset: 16,
+                                            length_kind: Fixed,
+                                            bit_length: 16,
+                                            kind: Uint,
+                                            byte_order: Big,
+                                            compu: CompuIdentity(
+                                                CompuIdentityT,
+                                            ),
+                                            unit_id: 2,
+                                            length_field_id: 0,
+                                            min_bytes: 0,
+                                            max_bytes: 0,
+                                            termination: EndOfPdu,
+                                            shape: NONE,
+                                        },
+                                        FieldT {
+                                            id: 4,
+                                            short_name: Some(
+                                                "p2StarServerMax",
+                                            ),
+                                            placement: Absolute,
+                                            bit_offset: 32,
+                                            length_kind: Fixed,
+                                            bit_length: 16,
+                                            kind: Uint,
+                                            byte_order: Big,
+                                            compu: CompuLinear(
+                                                CompuLinearT {
+                                                    numerator: 10.0,
+                                                    denominator: 1.0,
+                                                    offset: 0.0,
+                                                },
+                                            ),
+                                            unit_id: 2,
+                                            length_field_id: 0,
+                                            min_bytes: 0,
+                                            max_bytes: 0,
+                                            termination: EndOfPdu,
+                                            shape: NONE,
+                                        },
+                                    ],
+                                ),
+                            },
+                        ),
+                        negatives: Some(
+                            [
+                                NegativeResponseT {
+                                    nrc: 18,
+                                    message_id: 10,
+                                    retryable: false,
+                                },
+                                NegativeResponseT {
+                                    nrc: 34,
+                                    message_id: 11,
+                                    retryable: false,
+                                },
+                                NegativeResponseT {
+                                    nrc: 49,
+                                    message_id: 12,
+                                    retryable: false,
+                                },
+                                NegativeResponseT {
+                                    nrc: 51,
+                                    message_id: 13,
+                                    retryable: false,
+                                },
+                            ],
+                        ),
+                        required_session: 0,
+                        required_security_level: 0,
+                        p2_millis: 50,
+                        p2_star_millis: 5000,
+                    },
+                    ServiceT {
+                        id: 3,
+                        short_name: Some(
+                            "programmingSession",
+                        ),
+                        request: Some(
+                            RequestT {
+                                sid: 16,
+                                prefix: Some(
+                                    [
+                                        2,
+                                    ],
+                                ),
+                                params: Some(
+                                    [],
+                                ),
+                            },
+                        ),
+                        positive: Some(
+                            PositiveResponseT {
+                                sid: 80,
+                                prefix: Some(
+                                    [
+                                        2,
+                                    ],
+                                ),
+                                fields: Some(
+                                    [
+                                        FieldT {
+                                            id: 5,
+                                            short_name: Some(
+                                                "p2ServerMax",
+                                            ),
+                                            placement: Absolute,
+                                            bit_offset: 16,
+                                            length_kind: Fixed,
+                                            bit_length: 16,
+                                            kind: Uint,
+                                            byte_order: Big,
+                                            compu: CompuIdentity(
+                                                CompuIdentityT,
+                                            ),
+                                            unit_id: 2,
+                                            length_field_id: 0,
+                                            min_bytes: 0,
+                                            max_bytes: 0,
+                                            termination: EndOfPdu,
+                                            shape: NONE,
+                                        },
+                                        FieldT {
+                                            id: 6,
+                                            short_name: Some(
+                                                "p2StarServerMax",
+                                            ),
+                                            placement: Absolute,
+                                            bit_offset: 32,
+                                            length_kind: Fixed,
+                                            bit_length: 16,
+                                            kind: Uint,
+                                            byte_order: Big,
+                                            compu: CompuLinear(
+                                                CompuLinearT {
+                                                    numerator: 10.0,
+                                                    denominator: 1.0,
+                                                    offset: 0.0,
+                                                },
+                                            ),
+                                            unit_id: 2,
+                                            length_field_id: 0,
+                                            min_bytes: 0,
+                                            max_bytes: 0,
+                                            termination: EndOfPdu,
+                                            shape: NONE,
+                                        },
+                                    ],
+                                ),
+                            },
+                        ),
+                        negatives: Some(
+                            [
+                                NegativeResponseT {
+                                    nrc: 18,
+                                    message_id: 10,
+                                    retryable: false,
+                                },
+                                NegativeResponseT {
+                                    nrc: 34,
+                                    message_id: 11,
+                                    retryable: false,
+                                },
+                                NegativeResponseT {
+                                    nrc: 49,
+                                    message_id: 12,
+                                    retryable: false,
+                                },
+                                NegativeResponseT {
+                                    nrc: 51,
+                                    message_id: 13,
+                                    retryable: false,
+                                },
+                            ],
+                        ),
+                        required_session: 0,
+                        required_security_level: 0,
+                        p2_millis: 50,
+                        p2_star_millis: 5000,
+                    },
+                    ServiceT {
+                        id: 4,
+                        short_name: Some(
+                            "readDtcByStatusMask",
+                        ),
+                        request: Some(
+                            RequestT {
+                                sid: 25,
+                                prefix: Some(
+                                    [
+                                        2,
+                                    ],
+                                ),
+                                params: Some(
+                                    [
+                                        FieldT {
+                                            id: 7,
+                                            short_name: Some(
+                                                "statusMask",
+                                            ),
+                                            placement: Absolute,
+                                            bit_offset: 16,
+                                            length_kind: Fixed,
+                                            bit_length: 8,
+                                            kind: Uint,
+                                            byte_order: Big,
+                                            compu: CompuIdentity(
+                                                CompuIdentityT,
+                                            ),
+                                            unit_id: 0,
+                                            length_field_id: 0,
+                                            min_bytes: 0,
+                                            max_bytes: 0,
+                                            termination: EndOfPdu,
+                                            shape: NONE,
+                                        },
+                                    ],
+                                ),
+                            },
+                        ),
+                        positive: Some(
+                            PositiveResponseT {
+                                sid: 89,
+                                prefix: Some(
+                                    [
+                                        2,
+                                    ],
+                                ),
+                                fields: Some(
+                                    [
+                                        FieldT {
+                                            id: 8,
+                                            short_name: Some(
+                                                "availabilityMask",
+                                            ),
+                                            placement: Absolute,
+                                            bit_offset: 16,
+                                            length_kind: Fixed,
+                                            bit_length: 8,
+                                            kind: Uint,
+                                            byte_order: Big,
+                                            compu: CompuIdentity(
+                                                CompuIdentityT,
+                                            ),
+                                            unit_id: 0,
+                                            length_field_id: 0,
+                                            min_bytes: 0,
+                                            max_bytes: 0,
+                                            termination: EndOfPdu,
+                                            shape: NONE,
+                                        },
+                                        FieldT {
+                                            id: 9,
+                                            short_name: Some(
+                                                "records",
+                                            ),
+                                            placement: Absolute,
+                                            bit_offset: 24,
+                                            length_kind: Fixed,
+                                            bit_length: 0,
+                                            kind: Uint,
+                                            byte_order: Big,
+                                            compu: NONE,
+                                            unit_id: 0,
+                                            length_field_id: 0,
+                                            min_bytes: 0,
+                                            max_bytes: 0,
+                                            termination: EndOfPdu,
+                                            shape: Repeat(
+                                                RepeatT {
+                                                    layout_id: 1,
+                                                    count: UntilEndOfPdu,
+                                                    fixed_count: 0,
+                                                    item_byte_size: 0,
+                                                    count_field_id: 0,
+                                                    marker: None,
+                                                    marker_lower: 0,
+                                                    marker_upper: 0,
+                                                    min_items: 0,
+                                                    max_items: 0,
+                                                },
+                                            ),
+                                        },
+                                    ],
+                                ),
+                            },
+                        ),
+                        negatives: Some(
+                            [
+                                NegativeResponseT {
+                                    nrc: 18,
+                                    message_id: 10,
+                                    retryable: false,
+                                },
+                                NegativeResponseT {
+                                    nrc: 34,
+                                    message_id: 11,
+                                    retryable: false,
+                                },
+                                NegativeResponseT {
+                                    nrc: 49,
+                                    message_id: 12,
+                                    retryable: false,
+                                },
+                                NegativeResponseT {
+                                    nrc: 51,
+                                    message_id: 13,
+                                    retryable: false,
+                                },
+                            ],
+                        ),
+                        required_session: 0,
+                        required_security_level: 0,
+                        p2_millis: 50,
+                        p2_star_millis: 5000,
+                    },
+                    ServiceT {
+                        id: 5,
+                        short_name: Some(
+                            "activeSession.read",
+                        ),
+                        request: Some(
+                            RequestT {
+                                sid: 34,
+                                prefix: Some(
+                                    [
+                                        241,
+                                        134,
+                                    ],
+                                ),
+                                params: Some(
+                                    [],
+                                ),
+                            },
+                        ),
+                        positive: Some(
+                            PositiveResponseT {
+                                sid: 98,
+                                prefix: Some(
+                                    [
+                                        241,
+                                        134,
+                                    ],
+                                ),
+                                fields: Some(
+                                    [
+                                        FieldT {
+                                            id: 20,
+                                            short_name: Some(
+                                                "session",
+                                            ),
+                                            placement: Absolute,
+                                            bit_offset: 24,
+                                            length_kind: Fixed,
+                                            bit_length: 8,
+                                            kind: Uint,
+                                            byte_order: Big,
+                                            compu: CompuTextTable(
+                                                CompuTextTableT {
+                                                    entries: Some(
+                                                        [
+                                                            TextEntryT {
+                                                                lower: 1,
+                                                                upper: 1,
+                                                                text_id: 1,
+                                                            },
+                                                            TextEntryT {
+                                                                lower: 2,
+                                                                upper: 2,
+                                                                text_id: 2,
+                                                            },
+                                                            TextEntryT {
+                                                                lower: 3,
+                                                                upper: 3,
+                                                                text_id: 3,
+                                                            },
+                                                        ],
+                                                    ),
+                                                    default_text_id: 6,
+                                                },
+                                            ),
+                                            unit_id: 0,
+                                            length_field_id: 0,
+                                            min_bytes: 0,
+                                            max_bytes: 0,
+                                            termination: EndOfPdu,
+                                            shape: NONE,
+                                        },
+                                    ],
+                                ),
+                            },
+                        ),
+                        negatives: Some(
+                            [
+                                NegativeResponseT {
+                                    nrc: 18,
+                                    message_id: 10,
+                                    retryable: false,
+                                },
+                                NegativeResponseT {
+                                    nrc: 34,
+                                    message_id: 11,
+                                    retryable: false,
+                                },
+                                NegativeResponseT {
+                                    nrc: 49,
+                                    message_id: 12,
+                                    retryable: false,
+                                },
+                                NegativeResponseT {
+                                    nrc: 51,
+                                    message_id: 13,
+                                    retryable: false,
+                                },
+                            ],
+                        ),
+                        required_session: 0,
+                        required_security_level: 0,
+                        p2_millis: 50,
+                        p2_star_millis: 5000,
+                    },
+                    ServiceT {
+                        id: 6,
+                        short_name: Some(
+                            "sparePartNumber.read",
+                        ),
+                        request: Some(
+                            RequestT {
+                                sid: 34,
+                                prefix: Some(
+                                    [
+                                        241,
+                                        135,
+                                    ],
+                                ),
+                                params: Some(
+                                    [],
+                                ),
+                            },
+                        ),
+                        positive: Some(
+                            PositiveResponseT {
+                                sid: 98,
+                                prefix: Some(
+                                    [
+                                        241,
+                                        135,
+                                    ],
+                                ),
+                                fields: Some(
+                                    [
+                                        FieldT {
+                                            id: 21,
+                                            short_name: Some(
+                                                "sparePartNumber",
+                                            ),
+                                            placement: Absolute,
+                                            bit_offset: 24,
+                                            length_kind: Terminated,
+                                            bit_length: 0,
+                                            kind: Ascii,
+                                            byte_order: Big,
+                                            compu: CompuIdentity(
+                                                CompuIdentityT,
+                                            ),
+                                            unit_id: 0,
+                                            length_field_id: 0,
+                                            min_bytes: 1,
+                                            max_bytes: 0,
+                                            termination: EndOfPdu,
+                                            shape: NONE,
+                                        },
+                                    ],
+                                ),
+                            },
+                        ),
+                        negatives: Some(
+                            [
+                                NegativeResponseT {
+                                    nrc: 18,
+                                    message_id: 10,
+                                    retryable: false,
+                                },
+                                NegativeResponseT {
+                                    nrc: 34,
+                                    message_id: 11,
+                                    retryable: false,
+                                },
+                                NegativeResponseT {
+                                    nrc: 49,
+                                    message_id: 12,
+                                    retryable: false,
+                                },
+                                NegativeResponseT {
+                                    nrc: 51,
+                                    message_id: 13,
+                                    retryable: false,
+                                },
+                            ],
+                        ),
+                        required_session: 0,
+                        required_security_level: 0,
+                        p2_millis: 50,
+                        p2_star_millis: 5000,
+                    },
+                    ServiceT {
+                        id: 7,
+                        short_name: Some(
+                            "softwareVersion.read",
+                        ),
+                        request: Some(
+                            RequestT {
+                                sid: 34,
+                                prefix: Some(
+                                    [
+                                        241,
+                                        137,
+                                    ],
+                                ),
+                                params: Some(
+                                    [],
+                                ),
+                            },
+                        ),
+                        positive: Some(
+                            PositiveResponseT {
+                                sid: 98,
+                                prefix: Some(
+                                    [
+                                        241,
+                                        137,
+                                    ],
+                                ),
+                                fields: Some(
+                                    [
+                                        FieldT {
+                                            id: 22,
+                                            short_name: Some(
+                                                "softwareVersion",
+                                            ),
+                                            placement: Absolute,
+                                            bit_offset: 24,
+                                            length_kind: Terminated,
+                                            bit_length: 0,
+                                            kind: Ascii,
+                                            byte_order: Big,
+                                            compu: CompuIdentity(
+                                                CompuIdentityT,
+                                            ),
+                                            unit_id: 0,
+                                            length_field_id: 0,
+                                            min_bytes: 1,
+                                            max_bytes: 0,
+                                            termination: EndOfPdu,
+                                            shape: NONE,
+                                        },
+                                    ],
+                                ),
+                            },
+                        ),
+                        negatives: Some(
+                            [
+                                NegativeResponseT {
+                                    nrc: 18,
+                                    message_id: 10,
+                                    retryable: false,
+                                },
+                                NegativeResponseT {
+                                    nrc: 34,
+                                    message_id: 11,
+                                    retryable: false,
+                                },
+                                NegativeResponseT {
+                                    nrc: 49,
+                                    message_id: 12,
+                                    retryable: false,
+                                },
+                                NegativeResponseT {
+                                    nrc: 51,
+                                    message_id: 13,
+                                    retryable: false,
+                                },
+                            ],
+                        ),
+                        required_session: 0,
+                        required_security_level: 0,
+                        p2_millis: 50,
+                        p2_star_millis: 5000,
+                    },
+                    ServiceT {
+                        id: 8,
+                        short_name: Some(
+                            "vin.read",
+                        ),
+                        request: Some(
+                            RequestT {
+                                sid: 34,
+                                prefix: Some(
+                                    [
+                                        241,
+                                        144,
+                                    ],
+                                ),
+                                params: Some(
+                                    [],
+                                ),
+                            },
+                        ),
+                        positive: Some(
+                            PositiveResponseT {
+                                sid: 98,
+                                prefix: Some(
+                                    [
+                                        241,
+                                        144,
+                                    ],
+                                ),
+                                fields: Some(
+                                    [
+                                        FieldT {
+                                            id: 23,
+                                            short_name: Some(
+                                                "vin",
+                                            ),
+                                            placement: Absolute,
+                                            bit_offset: 24,
+                                            length_kind: Fixed,
+                                            bit_length: 136,
+                                            kind: Ascii,
+                                            byte_order: Big,
+                                            compu: CompuIdentity(
+                                                CompuIdentityT,
+                                            ),
+                                            unit_id: 0,
+                                            length_field_id: 0,
+                                            min_bytes: 0,
+                                            max_bytes: 0,
+                                            termination: EndOfPdu,
+                                            shape: NONE,
+                                        },
+                                    ],
+                                ),
+                            },
+                        ),
+                        negatives: Some(
+                            [
+                                NegativeResponseT {
+                                    nrc: 18,
+                                    message_id: 10,
+                                    retryable: false,
+                                },
+                                NegativeResponseT {
+                                    nrc: 34,
+                                    message_id: 11,
+                                    retryable: false,
+                                },
+                                NegativeResponseT {
+                                    nrc: 49,
+                                    message_id: 12,
+                                    retryable: false,
+                                },
+                                NegativeResponseT {
+                                    nrc: 51,
+                                    message_id: 13,
+                                    retryable: false,
+                                },
+                            ],
+                        ),
+                        required_session: 0,
+                        required_security_level: 0,
+                        p2_millis: 50,
+                        p2_star_millis: 5000,
+                    },
+                    ServiceT {
+                        id: 9,
+                        short_name: Some(
+                            "vin.write",
+                        ),
+                        request: Some(
+                            RequestT {
+                                sid: 46,
+                                prefix: Some(
+                                    [
+                                        241,
+                                        144,
+                                    ],
+                                ),
+                                params: Some(
+                                    [
+                                        FieldT {
+                                            id: 23,
+                                            short_name: Some(
+                                                "vin",
+                                            ),
+                                            placement: Absolute,
+                                            bit_offset: 24,
+                                            length_kind: Fixed,
+                                            bit_length: 136,
+                                            kind: Ascii,
+                                            byte_order: Big,
+                                            compu: CompuIdentity(
+                                                CompuIdentityT,
+                                            ),
+                                            unit_id: 0,
+                                            length_field_id: 0,
+                                            min_bytes: 0,
+                                            max_bytes: 0,
+                                            termination: EndOfPdu,
+                                            shape: NONE,
+                                        },
+                                    ],
+                                ),
+                            },
+                        ),
+                        positive: Some(
+                            PositiveResponseT {
+                                sid: 110,
+                                prefix: Some(
+                                    [
+                                        241,
+                                        144,
+                                    ],
+                                ),
+                                fields: Some(
+                                    [],
+                                ),
+                            },
+                        ),
+                        negatives: Some(
+                            [
+                                NegativeResponseT {
+                                    nrc: 18,
+                                    message_id: 10,
+                                    retryable: false,
+                                },
+                                NegativeResponseT {
+                                    nrc: 34,
+                                    message_id: 11,
+                                    retryable: false,
+                                },
+                                NegativeResponseT {
+                                    nrc: 49,
+                                    message_id: 12,
+                                    retryable: false,
+                                },
+                                NegativeResponseT {
+                                    nrc: 51,
+                                    message_id: 13,
+                                    retryable: false,
+                                },
+                            ],
+                        ),
+                        required_session: 3,
+                        required_security_level: 1,
+                        p2_millis: 50,
+                        p2_star_millis: 5000,
+                    },
+                    ServiceT {
+                        id: 10,
+                        short_name: Some(
+                            "flashState.read",
+                        ),
+                        request: Some(
+                            RequestT {
+                                sid: 34,
+                                prefix: Some(
+                                    [
+                                        253,
+                                        0,
+                                    ],
+                                ),
+                                params: Some(
+                                    [],
+                                ),
+                            },
+                        ),
+                        positive: Some(
+                            PositiveResponseT {
+                                sid: 98,
+                                prefix: Some(
+                                    [
+                                        253,
+                                        0,
+                                    ],
+                                ),
+                                fields: Some(
+                                    [
+                                        FieldT {
+                                            id: 24,
+                                            short_name: Some(
+                                                "phase",
+                                            ),
+                                            placement: Absolute,
+                                            bit_offset: 24,
+                                            length_kind: Fixed,
+                                            bit_length: 8,
+                                            kind: Uint,
+                                            byte_order: Big,
+                                            compu: CompuIdentity(
+                                                CompuIdentityT,
+                                            ),
+                                            unit_id: 0,
+                                            length_field_id: 0,
+                                            min_bytes: 0,
+                                            max_bytes: 0,
+                                            termination: EndOfPdu,
+                                            shape: NONE,
+                                        },
+                                        FieldT {
+                                            id: 25,
+                                            short_name: Some(
+                                                "blockNumber",
+                                            ),
+                                            placement: Absolute,
+                                            bit_offset: 32,
+                                            length_kind: Fixed,
+                                            bit_length: 32,
+                                            kind: Uint,
+                                            byte_order: Big,
+                                            compu: CompuIdentity(
+                                                CompuIdentityT,
+                                            ),
+                                            unit_id: 0,
+                                            length_field_id: 0,
+                                            min_bytes: 0,
+                                            max_bytes: 0,
+                                            termination: EndOfPdu,
+                                            shape: NONE,
+                                        },
+                                        FieldT {
+                                            id: 26,
+                                            short_name: Some(
+                                                "bytesReceived",
+                                            ),
+                                            placement: Absolute,
+                                            bit_offset: 64,
+                                            length_kind: Fixed,
+                                            bit_length: 32,
+                                            kind: Uint,
+                                            byte_order: Big,
+                                            compu: CompuIdentity(
+                                                CompuIdentityT,
+                                            ),
+                                            unit_id: 0,
+                                            length_field_id: 0,
+                                            min_bytes: 0,
+                                            max_bytes: 0,
+                                            termination: EndOfPdu,
+                                            shape: NONE,
+                                        },
+                                    ],
+                                ),
+                            },
+                        ),
+                        negatives: Some(
+                            [
+                                NegativeResponseT {
+                                    nrc: 18,
+                                    message_id: 10,
+                                    retryable: false,
+                                },
+                                NegativeResponseT {
+                                    nrc: 34,
+                                    message_id: 11,
+                                    retryable: false,
+                                },
+                                NegativeResponseT {
+                                    nrc: 49,
+                                    message_id: 12,
+                                    retryable: false,
+                                },
+                                NegativeResponseT {
+                                    nrc: 51,
+                                    message_id: 13,
+                                    retryable: false,
+                                },
+                            ],
+                        ),
+                        required_session: 0,
+                        required_security_level: 0,
+                        p2_millis: 50,
+                        p2_star_millis: 5000,
+                    },
+                    ServiceT {
+                        id: 11,
+                        short_name: Some(
+                            "powerCycles.read",
+                        ),
+                        request: Some(
+                            RequestT {
+                                sid: 34,
+                                prefix: Some(
+                                    [
+                                        253,
+                                        1,
+                                    ],
+                                ),
+                                params: Some(
+                                    [],
+                                ),
+                            },
+                        ),
+                        positive: Some(
+                            PositiveResponseT {
+                                sid: 98,
+                                prefix: Some(
+                                    [
+                                        253,
+                                        1,
+                                    ],
+                                ),
+                                fields: Some(
+                                    [
+                                        FieldT {
+                                            id: 27,
+                                            short_name: Some(
+                                                "powerCycles",
+                                            ),
+                                            placement: Absolute,
+                                            bit_offset: 24,
+                                            length_kind: Fixed,
+                                            bit_length: 32,
+                                            kind: Uint,
+                                            byte_order: Big,
+                                            compu: CompuIdentity(
+                                                CompuIdentityT,
+                                            ),
+                                            unit_id: 0,
+                                            length_field_id: 0,
+                                            min_bytes: 0,
+                                            max_bytes: 0,
+                                            termination: EndOfPdu,
+                                            shape: NONE,
+                                        },
+                                    ],
+                                ),
+                            },
+                        ),
+                        negatives: Some(
+                            [
+                                NegativeResponseT {
+                                    nrc: 18,
+                                    message_id: 10,
+                                    retryable: false,
+                                },
+                                NegativeResponseT {
+                                    nrc: 34,
+                                    message_id: 11,
+                                    retryable: false,
+                                },
+                                NegativeResponseT {
+                                    nrc: 49,
+                                    message_id: 12,
+                                    retryable: false,
+                                },
+                                NegativeResponseT {
+                                    nrc: 51,
+                                    message_id: 13,
+                                    retryable: false,
+                                },
+                            ],
+                        ),
+                        required_session: 0,
+                        required_security_level: 0,
+                        p2_millis: 50,
+                        p2_star_millis: 5000,
+                    },
+                    ServiceT {
+                        id: 13,
+                        short_name: Some(
+                            "lastResetReason.read",
+                        ),
+                        request: Some(
+                            RequestT {
+                                sid: 34,
+                                prefix: Some(
+                                    [
+                                        253,
+                                        3,
+                                    ],
+                                ),
+                                params: Some(
+                                    [],
+                                ),
+                            },
+                        ),
+                        positive: Some(
+                            PositiveResponseT {
+                                sid: 98,
+                                prefix: Some(
+                                    [
+                                        253,
+                                        3,
+                                    ],
+                                ),
+                                fields: Some(
+                                    [
+                                        FieldT {
+                                            id: 30,
+                                            short_name: Some(
+                                                "reason",
+                                            ),
+                                            placement: Absolute,
+                                            bit_offset: 24,
+                                            length_kind: Fixed,
+                                            bit_length: 8,
+                                            kind: Uint,
+                                            byte_order: Big,
+                                            compu: CompuIdentity(
+                                                CompuIdentityT,
+                                            ),
+                                            unit_id: 0,
+                                            length_field_id: 0,
+                                            min_bytes: 0,
+                                            max_bytes: 0,
+                                            termination: EndOfPdu,
+                                            shape: NONE,
+                                        },
+                                        FieldT {
+                                            id: 31,
+                                            short_name: Some(
+                                                "details",
+                                            ),
+                                            placement: Absolute,
+                                            bit_offset: 32,
+                                            length_kind: Fixed,
+                                            bit_length: 0,
+                                            kind: Uint,
+                                            byte_order: Big,
+                                            compu: NONE,
+                                            unit_id: 0,
+                                            length_field_id: 0,
+                                            min_bytes: 0,
+                                            max_bytes: 0,
+                                            termination: EndOfPdu,
+                                            shape: Select(
+                                                SelectT {
+                                                    key_field_id: 30,
+                                                    cases: Some(
+                                                        [
+                                                            SelectCaseT {
+                                                                short_name: Some(
+                                                                    "powerOn",
+                                                                ),
+                                                                lower: 1,
+                                                                upper: 1,
+                                                                layout_id: 0,
+                                                            },
+                                                            SelectCaseT {
+                                                                short_name: Some(
+                                                                    "watchdog",
+                                                                ),
+                                                                lower: 2,
+                                                                upper: 2,
+                                                                layout_id: 3,
+                                                            },
+                                                            SelectCaseT {
+                                                                short_name: Some(
+                                                                    "software",
+                                                                ),
+                                                                lower: 3,
+                                                                upper: 15,
+                                                                layout_id: 0,
+                                                            },
+                                                        ],
+                                                    ),
+                                                    has_default: false,
+                                                    default_layout_id: 0,
+                                                },
+                                            ),
+                                        },
+                                    ],
+                                ),
+                            },
+                        ),
+                        negatives: Some(
+                            [
+                                NegativeResponseT {
+                                    nrc: 18,
+                                    message_id: 10,
+                                    retryable: false,
+                                },
+                                NegativeResponseT {
+                                    nrc: 34,
+                                    message_id: 11,
+                                    retryable: false,
+                                },
+                                NegativeResponseT {
+                                    nrc: 49,
+                                    message_id: 12,
+                                    retryable: false,
+                                },
+                                NegativeResponseT {
+                                    nrc: 51,
+                                    message_id: 13,
+                                    retryable: false,
+                                },
+                            ],
+                        ),
+                        required_session: 0,
+                        required_security_level: 0,
+                        p2_millis: 50,
+                        p2_star_millis: 5000,
+                    },
+                    ServiceT {
+                        id: 14,
+                        short_name: Some(
+                            "eraseMemory.start",
+                        ),
+                        request: Some(
+                            RequestT {
+                                sid: 49,
+                                prefix: Some(
+                                    [
+                                        1,
+                                        255,
+                                        0,
+                                    ],
+                                ),
+                                params: Some(
+                                    [],
+                                ),
+                            },
+                        ),
+                        positive: Some(
+                            PositiveResponseT {
+                                sid: 113,
+                                prefix: Some(
+                                    [
+                                        1,
+                                        255,
+                                        0,
+                                    ],
+                                ),
+                                fields: Some(
+                                    [],
+                                ),
+                            },
+                        ),
+                        negatives: Some(
+                            [
+                                NegativeResponseT {
+                                    nrc: 18,
+                                    message_id: 10,
+                                    retryable: false,
+                                },
+                                NegativeResponseT {
+                                    nrc: 34,
+                                    message_id: 11,
+                                    retryable: false,
+                                },
+                                NegativeResponseT {
+                                    nrc: 49,
+                                    message_id: 12,
+                                    retryable: false,
+                                },
+                                NegativeResponseT {
+                                    nrc: 51,
+                                    message_id: 13,
+                                    retryable: false,
+                                },
+                            ],
+                        ),
+                        required_session: 2,
+                        required_security_level: 1,
+                        p2_millis: 50,
+                        p2_star_millis: 10000,
+                    },
+                    ServiceT {
+                        id: 15,
+                        short_name: Some(
+                            "checkProgrammingDependencies.start",
+                        ),
+                        request: Some(
+                            RequestT {
+                                sid: 49,
+                                prefix: Some(
+                                    [
+                                        1,
+                                        255,
+                                        1,
+                                    ],
+                                ),
+                                params: Some(
+                                    [],
+                                ),
+                            },
+                        ),
+                        positive: Some(
+                            PositiveResponseT {
+                                sid: 113,
+                                prefix: Some(
+                                    [
+                                        1,
+                                        255,
+                                        1,
+                                    ],
+                                ),
+                                fields: Some(
+                                    [
+                                        FieldT {
+                                            id: 29,
+                                            short_name: Some(
+                                                "result",
+                                            ),
+                                            placement: Absolute,
+                                            bit_offset: 32,
+                                            length_kind: Fixed,
+                                            bit_length: 8,
+                                            kind: Uint,
+                                            byte_order: Big,
+                                            compu: CompuTextTable(
+                                                CompuTextTableT {
+                                                    entries: Some(
+                                                        [
+                                                            TextEntryT {
+                                                                lower: 0,
+                                                                upper: 0,
+                                                                text_id: 4,
+                                                            },
+                                                            TextEntryT {
+                                                                lower: 1,
+                                                                upper: 255,
+                                                                text_id: 5,
+                                                            },
+                                                        ],
+                                                    ),
+                                                    default_text_id: 6,
+                                                },
+                                            ),
+                                            unit_id: 0,
+                                            length_field_id: 0,
+                                            min_bytes: 0,
+                                            max_bytes: 0,
+                                            termination: EndOfPdu,
+                                            shape: NONE,
+                                        },
+                                    ],
+                                ),
+                            },
+                        ),
+                        negatives: Some(
+                            [
+                                NegativeResponseT {
+                                    nrc: 36,
+                                    message_id: 14,
+                                    retryable: false,
+                                },
+                                NegativeResponseT {
+                                    nrc: 18,
+                                    message_id: 10,
+                                    retryable: false,
+                                },
+                                NegativeResponseT {
+                                    nrc: 34,
+                                    message_id: 11,
+                                    retryable: false,
+                                },
+                                NegativeResponseT {
+                                    nrc: 49,
+                                    message_id: 12,
+                                    retryable: false,
+                                },
+                                NegativeResponseT {
+                                    nrc: 51,
+                                    message_id: 13,
+                                    retryable: false,
+                                },
+                            ],
+                        ),
+                        required_session: 2,
+                        required_security_level: 0,
+                        p2_millis: 50,
+                        p2_star_millis: 10000,
+                    },
+                ],
+            ),
+            dtcs: Some(
+                [
+                    DtcDefinitionT {
+                        code: 9502998,
+                        display_code: Some(
+                            "B1101-16",
+                        ),
+                        message_id: 20,
+                        status_fields: Some(
+                            [
+                                FieldT {
+                                    id: 12,
+                                    short_name: Some(
+                                        "failedNow",
+                                    ),
+                                    placement: Absolute,
+                                    bit_offset: 0,
+                                    length_kind: Fixed,
+                                    bit_length: 1,
+                                    kind: Uint,
+                                    byte_order: Big,
+                                    compu: CompuIdentity(
+                                        CompuIdentityT,
+                                    ),
+                                    unit_id: 0,
+                                    length_field_id: 0,
+                                    min_bytes: 0,
+                                    max_bytes: 0,
+                                    termination: EndOfPdu,
+                                    shape: NONE,
+                                },
+                                FieldT {
+                                    id: 13,
+                                    short_name: Some(
+                                        "failedThisCycle",
+                                    ),
+                                    placement: Absolute,
+                                    bit_offset: 1,
+                                    length_kind: Fixed,
+                                    bit_length: 1,
+                                    kind: Uint,
+                                    byte_order: Big,
+                                    compu: CompuIdentity(
+                                        CompuIdentityT,
+                                    ),
+                                    unit_id: 0,
+                                    length_field_id: 0,
+                                    min_bytes: 0,
+                                    max_bytes: 0,
+                                    termination: EndOfPdu,
+                                    shape: NONE,
+                                },
+                                FieldT {
+                                    id: 14,
+                                    short_name: Some(
+                                        "pending",
+                                    ),
+                                    placement: Absolute,
+                                    bit_offset: 2,
+                                    length_kind: Fixed,
+                                    bit_length: 1,
+                                    kind: Uint,
+                                    byte_order: Big,
+                                    compu: CompuIdentity(
+                                        CompuIdentityT,
+                                    ),
+                                    unit_id: 0,
+                                    length_field_id: 0,
+                                    min_bytes: 0,
+                                    max_bytes: 0,
+                                    termination: EndOfPdu,
+                                    shape: NONE,
+                                },
+                                FieldT {
+                                    id: 15,
+                                    short_name: Some(
+                                        "confirmed",
+                                    ),
+                                    placement: Absolute,
+                                    bit_offset: 3,
+                                    length_kind: Fixed,
+                                    bit_length: 1,
+                                    kind: Uint,
+                                    byte_order: Big,
+                                    compu: CompuIdentity(
+                                        CompuIdentityT,
+                                    ),
+                                    unit_id: 0,
+                                    length_field_id: 0,
+                                    min_bytes: 0,
+                                    max_bytes: 0,
+                                    termination: EndOfPdu,
+                                    shape: NONE,
+                                },
+                                FieldT {
+                                    id: 16,
+                                    short_name: Some(
+                                        "untestedSinceClear",
+                                    ),
+                                    placement: Absolute,
+                                    bit_offset: 4,
+                                    length_kind: Fixed,
+                                    bit_length: 1,
+                                    kind: Uint,
+                                    byte_order: Big,
+                                    compu: CompuIdentity(
+                                        CompuIdentityT,
+                                    ),
+                                    unit_id: 0,
+                                    length_field_id: 0,
+                                    min_bytes: 0,
+                                    max_bytes: 0,
+                                    termination: EndOfPdu,
+                                    shape: NONE,
+                                },
+                                FieldT {
+                                    id: 17,
+                                    short_name: Some(
+                                        "failedSinceClear",
+                                    ),
+                                    placement: Absolute,
+                                    bit_offset: 5,
+                                    length_kind: Fixed,
+                                    bit_length: 1,
+                                    kind: Uint,
+                                    byte_order: Big,
+                                    compu: CompuIdentity(
+                                        CompuIdentityT,
+                                    ),
+                                    unit_id: 0,
+                                    length_field_id: 0,
+                                    min_bytes: 0,
+                                    max_bytes: 0,
+                                    termination: EndOfPdu,
+                                    shape: NONE,
+                                },
+                                FieldT {
+                                    id: 18,
+                                    short_name: Some(
+                                        "untestedThisCycle",
+                                    ),
+                                    placement: Absolute,
+                                    bit_offset: 6,
+                                    length_kind: Fixed,
+                                    bit_length: 1,
+                                    kind: Uint,
+                                    byte_order: Big,
+                                    compu: CompuIdentity(
+                                        CompuIdentityT,
+                                    ),
+                                    unit_id: 0,
+                                    length_field_id: 0,
+                                    min_bytes: 0,
+                                    max_bytes: 0,
+                                    termination: EndOfPdu,
+                                    shape: NONE,
+                                },
+                                FieldT {
+                                    id: 19,
+                                    short_name: Some(
+                                        "warningLamp",
+                                    ),
+                                    placement: Absolute,
+                                    bit_offset: 7,
+                                    length_kind: Fixed,
+                                    bit_length: 1,
+                                    kind: Uint,
+                                    byte_order: Big,
+                                    compu: CompuIdentity(
+                                        CompuIdentityT,
+                                    ),
+                                    unit_id: 0,
+                                    length_field_id: 0,
+                                    min_bytes: 0,
+                                    max_bytes: 0,
+                                    termination: EndOfPdu,
+                                    shape: NONE,
+                                },
+                            ],
+                        ),
+                        snapshot_fields: Some(
+                            [],
+                        ),
+                        extended_fields: Some(
+                            [],
+                        ),
+                    },
+                    DtcDefinitionT {
+                        code: 12648448,
+                        display_code: Some(
+                            "U0100-00",
+                        ),
+                        message_id: 21,
+                        status_fields: Some(
+                            [
+                                FieldT {
+                                    id: 12,
+                                    short_name: Some(
+                                        "failedNow",
+                                    ),
+                                    placement: Absolute,
+                                    bit_offset: 0,
+                                    length_kind: Fixed,
+                                    bit_length: 1,
+                                    kind: Uint,
+                                    byte_order: Big,
+                                    compu: CompuIdentity(
+                                        CompuIdentityT,
+                                    ),
+                                    unit_id: 0,
+                                    length_field_id: 0,
+                                    min_bytes: 0,
+                                    max_bytes: 0,
+                                    termination: EndOfPdu,
+                                    shape: NONE,
+                                },
+                                FieldT {
+                                    id: 13,
+                                    short_name: Some(
+                                        "failedThisCycle",
+                                    ),
+                                    placement: Absolute,
+                                    bit_offset: 1,
+                                    length_kind: Fixed,
+                                    bit_length: 1,
+                                    kind: Uint,
+                                    byte_order: Big,
+                                    compu: CompuIdentity(
+                                        CompuIdentityT,
+                                    ),
+                                    unit_id: 0,
+                                    length_field_id: 0,
+                                    min_bytes: 0,
+                                    max_bytes: 0,
+                                    termination: EndOfPdu,
+                                    shape: NONE,
+                                },
+                                FieldT {
+                                    id: 14,
+                                    short_name: Some(
+                                        "pending",
+                                    ),
+                                    placement: Absolute,
+                                    bit_offset: 2,
+                                    length_kind: Fixed,
+                                    bit_length: 1,
+                                    kind: Uint,
+                                    byte_order: Big,
+                                    compu: CompuIdentity(
+                                        CompuIdentityT,
+                                    ),
+                                    unit_id: 0,
+                                    length_field_id: 0,
+                                    min_bytes: 0,
+                                    max_bytes: 0,
+                                    termination: EndOfPdu,
+                                    shape: NONE,
+                                },
+                                FieldT {
+                                    id: 15,
+                                    short_name: Some(
+                                        "confirmed",
+                                    ),
+                                    placement: Absolute,
+                                    bit_offset: 3,
+                                    length_kind: Fixed,
+                                    bit_length: 1,
+                                    kind: Uint,
+                                    byte_order: Big,
+                                    compu: CompuIdentity(
+                                        CompuIdentityT,
+                                    ),
+                                    unit_id: 0,
+                                    length_field_id: 0,
+                                    min_bytes: 0,
+                                    max_bytes: 0,
+                                    termination: EndOfPdu,
+                                    shape: NONE,
+                                },
+                                FieldT {
+                                    id: 16,
+                                    short_name: Some(
+                                        "untestedSinceClear",
+                                    ),
+                                    placement: Absolute,
+                                    bit_offset: 4,
+                                    length_kind: Fixed,
+                                    bit_length: 1,
+                                    kind: Uint,
+                                    byte_order: Big,
+                                    compu: CompuIdentity(
+                                        CompuIdentityT,
+                                    ),
+                                    unit_id: 0,
+                                    length_field_id: 0,
+                                    min_bytes: 0,
+                                    max_bytes: 0,
+                                    termination: EndOfPdu,
+                                    shape: NONE,
+                                },
+                                FieldT {
+                                    id: 17,
+                                    short_name: Some(
+                                        "failedSinceClear",
+                                    ),
+                                    placement: Absolute,
+                                    bit_offset: 5,
+                                    length_kind: Fixed,
+                                    bit_length: 1,
+                                    kind: Uint,
+                                    byte_order: Big,
+                                    compu: CompuIdentity(
+                                        CompuIdentityT,
+                                    ),
+                                    unit_id: 0,
+                                    length_field_id: 0,
+                                    min_bytes: 0,
+                                    max_bytes: 0,
+                                    termination: EndOfPdu,
+                                    shape: NONE,
+                                },
+                                FieldT {
+                                    id: 18,
+                                    short_name: Some(
+                                        "untestedThisCycle",
+                                    ),
+                                    placement: Absolute,
+                                    bit_offset: 6,
+                                    length_kind: Fixed,
+                                    bit_length: 1,
+                                    kind: Uint,
+                                    byte_order: Big,
+                                    compu: CompuIdentity(
+                                        CompuIdentityT,
+                                    ),
+                                    unit_id: 0,
+                                    length_field_id: 0,
+                                    min_bytes: 0,
+                                    max_bytes: 0,
+                                    termination: EndOfPdu,
+                                    shape: NONE,
+                                },
+                                FieldT {
+                                    id: 19,
+                                    short_name: Some(
+                                        "warningLamp",
+                                    ),
+                                    placement: Absolute,
+                                    bit_offset: 7,
+                                    length_kind: Fixed,
+                                    bit_length: 1,
+                                    kind: Uint,
+                                    byte_order: Big,
+                                    compu: CompuIdentity(
+                                        CompuIdentityT,
+                                    ),
+                                    unit_id: 0,
+                                    length_field_id: 0,
+                                    min_bytes: 0,
+                                    max_bytes: 0,
+                                    termination: EndOfPdu,
+                                    shape: NONE,
+                                },
+                            ],
+                        ),
+                        snapshot_fields: Some(
+                            [],
+                        ),
+                        extended_fields: Some(
+                            [],
+                        ),
+                    },
+                ],
+            ),
+            flash_sessions: Some(
+                [
+                    FlashSessionT {
+                        id: 1,
+                        short_name: Some(
+                            "application",
+                        ),
+                        steps: Some(
+                            [
+                                EnterProgrammingSession,
+                                SecurityAccess,
+                                EraseMemory,
+                                RequestDownload,
+                                TransferData,
+                                TransferExit,
+                                CheckMemory,
+                                EcuReset,
+                            ],
+                        ),
+                        segments: Some(
+                            [
+                                FlashSegmentT {
+                                    short_name: Some(
+                                        "app",
+                                    ),
+                                    start_address: 0,
+                                    length: 65536,
+                                    artifact_offset: 0,
+                                    block_size: 256,
+                                    checksum: Some(
+                                        [],
+                                    ),
+                                },
+                            ],
+                        ),
+                    },
+                ],
+            ),
+            layouts: Some(
+                [
+                    LayoutT {
+                        id: 1,
+                        short_name: Some(
+                            "dtcRecord",
+                        ),
+                        byte_size: 4,
+                        fields: Some(
+                            [
+                                FieldT {
+                                    id: 10,
+                                    short_name: Some(
+                                        "dtc",
+                                    ),
+                                    placement: Absolute,
+                                    bit_offset: 0,
+                                    length_kind: Fixed,
+                                    bit_length: 24,
+                                    kind: Uint,
+                                    byte_order: Big,
+                                    compu: CompuIdentity(
+                                        CompuIdentityT,
+                                    ),
+                                    unit_id: 0,
+                                    length_field_id: 0,
+                                    min_bytes: 0,
+                                    max_bytes: 0,
+                                    termination: EndOfPdu,
+                                    shape: NONE,
+                                },
+                                FieldT {
+                                    id: 11,
+                                    short_name: Some(
+                                        "status",
+                                    ),
+                                    placement: Absolute,
+                                    bit_offset: 24,
+                                    length_kind: Fixed,
+                                    bit_length: 8,
+                                    kind: Uint,
+                                    byte_order: Big,
+                                    compu: CompuIdentity(
+                                        CompuIdentityT,
+                                    ),
+                                    unit_id: 0,
+                                    length_field_id: 0,
+                                    min_bytes: 0,
+                                    max_bytes: 0,
+                                    termination: EndOfPdu,
+                                    shape: NONE,
+                                },
+                            ],
+                        ),
+                    },
+                    LayoutT {
+                        id: 3,
+                        short_name: Some(
+                            "watchdogReset",
+                        ),
+                        byte_size: 0,
+                        fields: Some(
+                            [
+                                FieldT {
+                                    id: 32,
+                                    short_name: Some(
+                                        "taskId",
+                                    ),
+                                    placement: Absolute,
+                                    bit_offset: 0,
+                                    length_kind: Fixed,
+                                    bit_length: 8,
+                                    kind: Uint,
+                                    byte_order: Big,
+                                    compu: CompuIdentity(
+                                        CompuIdentityT,
+                                    ),
+                                    unit_id: 0,
+                                    length_field_id: 0,
+                                    min_bytes: 0,
+                                    max_bytes: 0,
+                                    termination: EndOfPdu,
+                                    shape: NONE,
+                                },
+                                FieldT {
+                                    id: 33,
+                                    short_name: Some(
+                                        "programCounter",
+                                    ),
+                                    placement: Absolute,
+                                    bit_offset: 8,
+                                    length_kind: Fixed,
+                                    bit_length: 32,
+                                    kind: Uint,
+                                    byte_order: Big,
+                                    compu: CompuIdentity(
+                                        CompuIdentityT,
+                                    ),
+                                    unit_id: 0,
+                                    length_field_id: 0,
+                                    min_bytes: 0,
+                                    max_bytes: 0,
+                                    termination: EndOfPdu,
+                                    shape: NONE,
+                                },
+                            ],
+                        ),
+                    },
+                ],
+            ),
+            monitor_sets: None,
+        },
+    ),
+    procedure: None,
+}
+Program {
+    schema_version: 9,
+    code: [
+        Call(
+            2,
+        ),
+        Ret,
+        PushBytes(
+            0,
+        ),
+        ServiceRequest {
+            service: 16,
+        },
+        Pop,
+        PushBytes(
+            1,
+        ),
+        ServiceRequest {
+            service: 34,
+        },
+        Pop,
+        PushBytes(
+            2,
+        ),
+        ServiceRequest {
+            service: 34,
+        },
+        Pop,
+        PushBytes(
+            3,
+        ),
+        ServiceRequest {
+            service: 25,
+        },
+        Pop,
+        PushBytes(
+            4,
+        ),
+        ServiceRequest {
+            service: 46,
+        },
+        Pop,
+        Log {
+            level: 1,
+            message: 5,
+        },
+        Ret,
+    ],
+    constants: [
+        [
+            3,
+        ],
+        [
+            241,
+            144,
+        ],
+        [
+            241,
+            134,
+        ],
+        [
+            2,
+            9,
+        ],
+        [
+            241,
+            144,
+            87,
+            86,
+            87,
+            90,
+            90,
+            90,
+            49,
+            74,
+            90,
+            88,
+            87,
+            48,
+            48,
+            48,
+            48,
+            48,
+            49,
+        ],
+        [
+            100,
+            111,
+            110,
+            101,
+        ],
+    ],
+    sections: [],
+    source_map: [
+        SourceSpan {
+            pc: 0,
+            file: 0,
+            line: 4,
+            column: 5,
+        },
+        SourceSpan {
+            pc: 2,
+            file: 0,
+            line: 5,
+            column: 5,
+        },
+        SourceSpan {
+            pc: 5,
+            file: 0,
+            line: 6,
+            column: 5,
+        },
+        SourceSpan {
+            pc: 8,
+            file: 0,
+            line: 7,
+            column: 5,
+        },
+        SourceSpan {
+            pc: 11,
+            file: 0,
+            line: 8,
+            column: 5,
+        },
+        SourceSpan {
+            pc: 14,
+            file: 0,
+            line: 9,
+            column: 5,
+        },
+        SourceSpan {
+            pc: 17,
+            file: 0,
+            line: 10,
+            column: 5,
+        },
+        SourceSpan {
+            pc: 18,
+            file: 0,
+            line: 4,
+            column: 5,
+        },
+    ],
+    identity: IdentitySources {
+        vin: None,
+        hardware_part_number: None,
+        software_version: None,
+    },
+    preconditions: Preconditions {
+        voltage_mv: None,
+        external_supply: None,
+        ignition: None,
+        engine: None,
+        vehicle_speed: None,
+    },
+    flash: [],
+}

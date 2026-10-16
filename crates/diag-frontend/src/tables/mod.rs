@@ -61,7 +61,7 @@ pub struct Tables {
 /// Why [`read_directory`] failed.
 #[derive(Debug, thiserror::Error)]
 pub enum ReadError {
-    /// The directory or one of its table files could not be read.
+    /// The directory or one of its table or procedure files could not be read.
     #[error("cannot read the definition directory: {0}")]
     Io(#[from] std::io::Error),
     /// The tables break the format.

@@ -79,9 +79,17 @@ pub struct Procedure {
     pub warnings: Vec<StarError>,
 }
 
+/// Why [`lower_procedures`] failed: the errors of every file that failed, and the warnings of
+/// every file that lowered, which a rejected report carries too (`starlark-subset.md` section 5).
+#[derive(Debug, Clone)]
+pub struct ProceduresRejected {
+    pub errors: Vec<StarError>,
+    pub warnings: Vec<StarError>,
+}
+
 /// Checks and lowers each procedure file of `tables`, in byte order of their names. Every file is
 /// checked and lowered, so the errors of all of them are listed together.
-pub fn lower_procedures(tables: &Tables) -> Result<Vec<Procedure>, Vec<StarError>> {
+pub fn lower_procedures(tables: &Tables) -> Result<Vec<Procedure>, ProceduresRejected> {
     let mut procedures = Vec::new();
     let mut errors = Vec::new();
     for (file, source) in &tables.procedures {
@@ -101,7 +109,10 @@ pub fn lower_procedures(tables: &Tables) -> Result<Vec<Procedure>, Vec<StarError
     if errors.is_empty() {
         Ok(procedures)
     } else {
-        Err(errors)
+        Err(ProceduresRejected {
+            errors,
+            warnings: procedures.into_iter().flat_map(|p| p.warnings).collect(),
+        })
     }
 }
 
@@ -110,12 +121,26 @@ pub fn lower_procedures(tables: &Tables) -> Result<Vec<Procedure>, Vec<StarError
 /// unit catalogs. Every procedure goes with every variant (ADR-307).
 pub fn to_ir(definition: &Definition, procedures: &[Procedure]) -> Converted {
     let tables = &definition.tables;
-    let tables_only = || {
-        tables
-            .sources
-            .iter()
-            .map(|(name, contents)| (name.as_str(), contents.as_slice()))
+    let carried: Vec<Option<&Procedure>> = if procedures.is_empty() {
+        vec![None]
+    } else {
+        procedures.iter().map(Some).collect()
     };
+    // Each document's digest covers the tables and the one procedure file it carries (section
+    // 6), so it depends on the procedure alone and is taken once per procedure.
+    let digests: Vec<String> = carried
+        .iter()
+        .map(|procedure| {
+            let file = procedure.map(|p| (p.file.as_str(), p.source.as_slice()));
+            source_digest(
+                tables
+                    .sources
+                    .iter()
+                    .map(|(name, contents)| (name.as_str(), contents.as_slice()))
+                    .chain(file),
+            )
+        })
+        .collect();
     let unit_ids: HashMap<&str, u32> = tables
         .units
         .iter()
@@ -177,16 +202,8 @@ pub fn to_ir(definition: &Definition, procedures: &[Procedure]) -> Converted {
         document.schema_version = IR_SCHEMA_VERSION;
         document.source_format = Some(SOURCE_FORMAT.to_owned());
         document.variant = Some(Box::new(ecu));
-        let carried: Vec<Option<&Procedure>> = if procedures.is_empty() {
-            vec![None]
-        } else {
-            procedures.iter().map(Some).collect()
-        };
-        for procedure in carried {
-            // The digest covers the tables and the one procedure file the document carries
-            // (section 6).
-            let file = procedure.map(|p| (p.file.as_str(), p.source.as_slice()));
-            document.source_digest = Some(source_digest(tables_only().chain(file)));
+        for (procedure, digest) in carried.iter().zip(&digests) {
+            document.source_digest = Some(digest.clone());
             document.procedure = procedure.map(|p| p.program.clone());
             documents.push(VariantDocument {
                 id: variant.id,

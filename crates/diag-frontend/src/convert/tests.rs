@@ -141,6 +141,11 @@ fn the_conversion_is_deterministic() {
     let mut reversed = example();
     reversed.reverse();
     assert_eq!(first, convert(reversed));
+    // With procedures, given in either order.
+    let procedures = with(with(example(), "a.star", LOG), "b.star", FAIL);
+    let mut reversed = procedures.clone();
+    reversed.reverse();
+    assert_eq!(convert(procedures), convert(reversed));
 }
 
 #[test]
@@ -396,6 +401,7 @@ fn every_procedure_file_reports_its_errors() {
     let tables = read_files(files).expect("reads");
     let errors = lower_procedures(&tables).expect_err("two files fail");
     let found: Vec<(&str, crate::star::StarCode, u32)> = errors
+        .errors
         .iter()
         .map(|e| (e.file.as_str(), e.code, e.line))
         .collect();
@@ -405,5 +411,64 @@ fn every_procedure_file_reports_its_errors() {
             ("bad.star", crate::star::StarCode::NoMain, 1),
             ("latin1.star", crate::star::StarCode::SyntaxError, 2),
         ]
+    );
+}
+
+#[test]
+fn a_rejected_procedure_keeps_the_warnings_of_the_others() {
+    // `a.star` lowers with the default-limit warning; `b.star` has no `main`.
+    let a = "def f(n):\n    for i in range(n):\n        pass\n\ndef main():\n    f(1)\n";
+    let files = with(
+        with(example(), "a.star", a),
+        "b.star",
+        "def f():\n    pass\n",
+    );
+    let tables = read_files(files).expect("reads");
+    let rejected = lower_procedures(&tables).expect_err("b.star fails");
+    assert_eq!(rejected.errors.len(), 1);
+    let warnings: Vec<(&str, crate::star::StarCode)> = rejected
+        .warnings
+        .iter()
+        .map(|w| (w.file.as_str(), w.code))
+        .collect();
+    assert_eq!(
+        warnings,
+        [("a.star", crate::star::StarCode::LoopLimitDefaulted)]
+    );
+}
+
+#[test]
+fn a_file_too_large_is_reported_before_its_encoding() {
+    let mut files = example();
+    let mut big = vec![b'#'; crate::star::MAX_SOURCE_BYTES + 1];
+    big[0] = 0xFF;
+    files.push(("big.star".to_owned(), big));
+    let tables = read_files(files).expect("reads");
+    let rejected = lower_procedures(&tables).expect_err("too large");
+    let codes: Vec<_> = rejected.errors.iter().map(|e| e.code).collect();
+    assert_eq!(codes, [crate::star::StarCode::SourceTooLarge]);
+}
+
+#[test]
+fn reading_the_directory_reads_its_procedure_files() {
+    // A copy of the example with a procedure file, read from disk.
+    let dir =
+        std::env::temp_dir().join(format!("ngr-procedures-{}-{}", std::process::id(), line!()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("temporary directory");
+    let files = with(example(), "main.star", LOG);
+    for (name, contents) in &files {
+        std::fs::write(dir.join(name), contents).expect("written");
+    }
+    let tables = read_directory(&dir).expect("reads");
+    let procedures = lower_procedures(&tables).expect("lowers");
+    let from_dir = to_ir(&resolve(tables).expect("resolves"), &procedures);
+    std::fs::remove_dir_all(&dir).expect("removed");
+    assert_eq!(from_dir, convert(files));
+    assert!(
+        from_dir
+            .documents
+            .iter()
+            .all(|d| d.procedure.as_deref() == Some("main.star"))
     );
 }

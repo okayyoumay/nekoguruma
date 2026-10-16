@@ -288,9 +288,25 @@ fn dialect() -> Dialect {
     }
 }
 
-/// [`check`] on a procedure file's bytes as stored. A file that is not UTF-8 is not parsed: it
-/// reports `STAR_SYNTAX_ERROR` where its first byte that is not UTF-8 is (section 5).
+/// [`check`] on a procedure file's bytes as stored. A file past the size bound of 2.8 reports
+/// that first, as [`check`] does; a file within it that is not UTF-8 is not parsed and reports
+/// `STAR_SYNTAX_ERROR` where its first byte that is not UTF-8 is (2.1).
 pub fn check_file(file: &str, bytes: &[u8]) -> Result<Checked, Vec<StarError>> {
+    if bytes.len() > MAX_SOURCE_BYTES {
+        // Placed at the bound, within the bytes before it that are UTF-8.
+        let head = &bytes[..MAX_SOURCE_BYTES];
+        let valid = match std::str::from_utf8(head) {
+            Ok(valid) => valid,
+            Err(error) => std::str::from_utf8(&head[..error.valid_up_to()]).unwrap_or_default(),
+        };
+        return Err(vec![located(
+            StarCode::SourceTooLarge,
+            file,
+            valid,
+            valid.len(),
+            format!("the file is larger than {MAX_SOURCE_BYTES} bytes (2.8)"),
+        )]);
+    }
     match std::str::from_utf8(bytes) {
         Ok(source) => check(file, source),
         Err(error) => {
@@ -301,7 +317,7 @@ pub fn check_file(file: &str, bytes: &[u8]) -> Result<Checked, Vec<StarError>> {
                 file,
                 valid,
                 valid.len(),
-                "the file is not UTF-8 (5)".to_owned(),
+                "the file is not UTF-8 (2.1)".to_owned(),
             )])
         }
     }

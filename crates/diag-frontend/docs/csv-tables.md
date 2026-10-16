@@ -52,8 +52,10 @@ directory is one procedure (`starlark-subset.md` 2.1), and the documents are pac
   and within a variant in byte order of the procedure file names.
 - Without procedure files, there is one document per variant, with no procedure.
 
-In `diag-frontend`, `convert::lower_procedures` checks and lowers the procedure files, listing
-every file's errors together (a file that is not UTF-8 is `STAR_SYNTAX_ERROR`), and
+A procedure file is any file whose name ends in `.star`, in any case. In `diag-frontend`,
+`convert::lower_procedures` checks and lowers the procedure files, listing every file's errors
+together with the warnings of the files that lowered (a file that is not UTF-8 is
+`STAR_SYNTAX_ERROR`, `starlark-subset.md` 2.1), and
 `convert::to_ir` converts a definition that `tables::resolve` accepted (section 7) with those
 procedures. It returns the documents, each named by its variant and its procedure's file name,
 with the catalogs of 4.4. Monitor sets (`EcuVariant.monitor_sets`) and `CompuBytecode` have no

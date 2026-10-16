@@ -34,8 +34,10 @@ identified at run time (design 8.9.1, ADR-306).
    is left to a later change.
 3. **The procedure is named by its file name.** The converter reports which procedure a document
    carries by the file name, `.star` included (`VariantDocument.procedure`). The files are read
-   as stored; a file that is not UTF-8 is rejected with `STAR_SYNTAX_ERROR` at its first invalid
-   byte, and every file's errors are listed together (subset section 5).
+   as stored; a file past the size bound reports that first, and one within it that is not UTF-8
+   is rejected with `STAR_SYNTAX_ERROR` at its first invalid byte (subset 2.1, 2.8). Every
+   file's errors are listed together, with the warnings of the files that lowered (subset
+   section 5).
 4. **The program is stored as postcard bytes.** `EcuDocument.procedure` holds the postcard
    encoding of the lowered `diag_ir::Program`, the encoding `ir.fbs` names for that field.
 5. **Each document's digest covers its own procedure only.** `source_digest` covers the table
@@ -49,5 +51,9 @@ identified at run time (design 8.9.1, ADR-306).
   stores and distributes its declarations many times; storing procedures apart from the
   declaration part would need a schema change.
 - A job names a variant and a procedure, which together pick one document.
+- Nothing caps the number of variants or procedure files, so a directory produces as many
+  documents as the product of the two, each with the whole declaration part. The digest is taken
+  once per procedure, but the documents are all held in memory. A cap on what one directory may
+  produce is a backlog item.
 - Scoping a procedure to some variants, and sharing code between procedures (`load`, which the
   subset rejects), are open; both are backlog items.

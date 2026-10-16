@@ -35,8 +35,10 @@ capture-free functions and function arguments of 2.6, comprehensions, `load`).
 
 ### 2.1 File Structure
 
-One file is one procedure, named by its file name (`*.star`, directly in the definition
-directory; `csv-tables.md` section 1 packages it with every variant, ADR-307). The top level
+One file is one procedure, named by its file name (any file directly in the definition directory
+whose name ends in `.star`, in any case; `csv-tables.md` section 1 packages it with every
+variant, ADR-307). A file within the size bound of 2.8 that is not UTF-8 is not parsed and
+reports `STAR_SYNTAX_ERROR` at its first byte that is not. The top level
 holds only constant assignments and `def` statements, and a docstring may open the file and each
 function. A top-level constant cannot call `diag` or a function of the file, which run only
 from `main`. The procedure's entry point is `def main():`, which takes no parameters; the VM

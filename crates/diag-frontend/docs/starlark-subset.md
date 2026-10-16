@@ -303,7 +303,7 @@ instruction exists, the transpiler rejects calls to it (`STAR_API_NOT_AVAILABLE`
 | `diag.precondition` | none yet | |
 | `diag.fail` | `Fail` | `code` as a constant-pool entry; `detail` as bytes from the stack, since it can be built at run time. The instruction ends the procedure as failed and is terminal (ADR-280) |
 
-**Target contract (ADR-309).** The table describes the UDS-only lowering as built. ADR-309 changes it: `diag.read_dtc`, `diag.routine` and `diag.security_access` name an intent and are lowered through the application-layer profile of the variant's protocol into that variant's declared services; `diag.read_dtc` lowers to a generic send-receive instead of `ReadDtc`; `diag.routine` keeps `RoutineControl` on UDS and uses the generic send-receive on other application layers; `diag.flash_transfer` stays UDS-only. UDS is the first profile.
+**Target contract (ADR-309).** The table describes the UDS-only lowering as built. ADR-309 changes it: `diag.read_dtc`, `diag.routine` and `diag.security_access` name an intent and are lowered through the application-layer profile of the variant's protocol into that variant's declared services; `diag.read_dtc` lowers to a generic send-receive instead of `ReadDtc`; `diag.routine` keeps `RoutineControl` on UDS and uses the generic send-receive on other application layers; `diag.flash_transfer` stays UDS-only. UDS is the first profile. A profile is typed data shipped with the frontend (`diag_frontend::profile`, ADR-314): per call, the steps it expands to, each with a request template that selects the declared service by value and position and a map from the response to the result.
 
 ### 3.3 Synchronous Calls
 
@@ -329,7 +329,7 @@ A dict with fixed keys:
 }
 ```
 
-The keys of `fields` are `Field.short_name` from the IR declaration part. Under ADR-309 the result of `diag.read_dtc`, `diag.routine` and `diag.security_access` instead uses the field names the application-layer profile maps the response to, shared by every profile; a `diag.request` result keeps the declared names. They are defined on
+The keys of `fields` are `Field.short_name` from the IR declaration part. Under ADR-309 the result of `diag.read_dtc`, `diag.routine` and `diag.security_access` instead uses the names the application-layer profile maps the response to (ADR-314): `diag.read_dtc` gives `mask` (the availability status mask, an `int`) and `dtcs` (a list of dicts with `code` and `status`, both `int`), whatever the layer; `diag.routine` gives the declared names of its last step's response, since routine results are routine-specific; `diag.security_access` gives no `fields`, and its `raw` is the key response. The profile maps a shared name to a position among the declared response's top-level fields, so a definition keeps its own names; reading `dtcs` waits on decoding lists of records. A `diag.request` result keeps the declared names. They are defined on
 the CSV table side, so a `fields` key is checked against the declaration part at import time.
 Which declared service a `diag.request`, `diag.routine` or `diag.read_dtc` call means is found
 from its SID or routine identifier and the constant fields of the request (`csv-tables.md` 5.3).

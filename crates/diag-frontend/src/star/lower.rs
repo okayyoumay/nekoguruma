@@ -1268,7 +1268,15 @@ impl<'a> Lowerer<'a> {
 
     fn binary(&mut self, id: Option<usize>, op: BinOp, a: Val, b: Val, span: Span) -> Val {
         if let (Val::Const(x), Val::Const(y)) = (&a, &b) {
-            if !self.charge(x.size().saturating_add(y.size()), span) {
+            // A list search compares the needle with every item, so it reads the needle once
+            // per item.
+            let cost = match (op, y) {
+                (BinOp::In | BinOp::NotIn, Const::List(items, _)) => {
+                    x.size().saturating_mul(items.len())
+                }
+                _ => x.size(),
+            };
+            if !self.charge(cost.saturating_add(y.size()), span) {
                 return Val::Const(Const::Int(0));
             }
             return match fold(op, x, y) {
@@ -1668,6 +1676,10 @@ impl<'a> Lowerer<'a> {
     }
 
     fn slice(&mut self, object: Const, start: Option<i64>, stop: Option<i64>, span: Span) -> Val {
+        // Charged before copying, so slicing a shared constant again and again is bounded too.
+        if !self.charge(object.size(), span) {
+            return Val::Const(Const::Int(0));
+        }
         let len = object.len() as i64;
         let clamp = |n: Option<i64>, default: i64| -> usize {
             let n = n.unwrap_or(default);
@@ -1726,9 +1738,13 @@ impl<'a> Lowerer<'a> {
                         })
                         .collect();
                     if let Some(args) = &consts {
+                        // `min` and `max` compare their best so far with every argument, so
+                        // the largest argument may be read once per argument.
+                        let largest = args.iter().map(Const::size).max().unwrap_or(0);
                         let cost = args
                             .iter()
-                            .fold(1usize, |cost, arg| cost.saturating_add(arg.size()));
+                            .fold(1usize, |cost, arg| cost.saturating_add(arg.size()))
+                            .saturating_add(largest.saturating_mul(args.len()));
                         if !self.charge(cost, span) {
                             return Val::Const(Const::Int(0));
                         }

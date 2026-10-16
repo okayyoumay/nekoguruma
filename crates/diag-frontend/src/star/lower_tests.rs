@@ -543,6 +543,33 @@ fn repeated_folds_over_a_shared_constant_are_bounded_together() {
 }
 
 #[test]
+fn list_searches_and_slices_are_charged_for_what_they_read() {
+    let mut doubling = String::from("B0 = b\"A\"\n");
+    for i in 1..=19 {
+        doubling.push_str(&format!("B{i} = B{p} + B{p}\n", p = i - 1));
+    }
+    // A list search reads its needle once per item: 2^19 + 1 bytes times 4,096 items is past
+    // 2^30 at once, though both constants are within their limits.
+    let items = vec!["0"; 4_096].join(", ");
+    let search = format!("{doubling}L = [{items}]\nX = B19 in L\n\ndef main():\n    pass\n");
+    assert_eq!(codes(&search), vec![(StarCode::NotLowerable, 22)]);
+    // Each slice reads the whole constant before it copies, even once the constant budget is
+    // spent: 2,100 slices of 2^19 bytes pass 2^30.
+    let mut slices = doubling.clone();
+    for i in 0..2_100 {
+        slices.push_str(&format!("S{i} = B19[1:-1]\n"));
+    }
+    slices.push_str("\ndef main():\n    pass\n");
+    let errors = lowered(&slices).unwrap_err();
+    let folding = errors
+        .iter()
+        .find(|e| e.hint.contains("folding"))
+        .expect("the folding budget is reported");
+    // B0 to B19 read just over 2^20; each slice line from 21 on reads just over 2^19.
+    assert!((2_060..=2_070).contains(&folding.line), "{}", folding.line);
+}
+
+#[test]
 fn a_right_shift_is_arithmetic() {
     assert!(holds("x", "-8", "x >> 1 == -4"));
     assert!(holds("x", "-1", "x >> 63 == -1"));

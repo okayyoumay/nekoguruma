@@ -523,6 +523,26 @@ fn many_parameters_and_locals_are_numbered_in_linear_time() {
 }
 
 #[test]
+fn repeated_folds_over_a_shared_constant_are_bounded_together() {
+    // B19 is 2^19 bytes of `A`; each `N in B19` reads it all but builds nothing, so only the
+    // folding budget (2^30) stops the searches: past about 2,048 of them.
+    let mut source = String::from("B0 = b\"A\"\n");
+    for i in 1..=19 {
+        source.push_str(&format!("B{i} = B{p} + B{p}\n", p = i - 1));
+    }
+    source.push_str("N = b\"B\"\n");
+    for i in 0..2_100 {
+        source.push_str(&format!("R{i} = N in B19\n"));
+    }
+    source.push_str("\ndef main():\n    pass\n");
+    let found = codes(&source);
+    assert!(!found.is_empty() && found.iter().all(|(c, _)| *c == StarCode::NotLowerable));
+    // Lines 1 to 21 build B0 to B19 and N, whose folds read just over 2^20; each search on
+    // line 22 onward reads just over 2^19, so the 2,046th (line 2,067) passes 2^30.
+    assert_eq!(found[0].1, 2_067, "{:?}", &found[..1]);
+}
+
+#[test]
 fn a_right_shift_is_arithmetic() {
     assert!(holds("x", "-8", "x >> 1 == -4"));
     assert!(holds("x", "-1", "x >> 63 == -1"));

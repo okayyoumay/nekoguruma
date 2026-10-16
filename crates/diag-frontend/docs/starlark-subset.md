@@ -497,7 +497,8 @@ type, so the transpiler infers at ingestion which types each value can have (ADR
   twice twice, and its lists and dicts may nest at most 64 deep, counting nesting through other
   constants; a larger or deeper one is `STAR_NOT_LOWERABLE`. All the strings, bytes, lists and
   dicts a procedure builds together may hold at most 2^24 values and bytes. Searches in
-  constants take time linear in their sizes. A dict literal that repeats a key is
+  constants take time linear in their sizes, and all the folds of a procedure together may read
+  at most 2^30 values and bytes (each fold counts the sizes of the constants it reads). A dict literal that repeats a key is
   rejected, as Starlark rejects it, and an `int` and a `float` constant compare by their exact
   values, without rounding the `int` to a `float`.
 - An index into bytes known only at run time must not be negative: without a length

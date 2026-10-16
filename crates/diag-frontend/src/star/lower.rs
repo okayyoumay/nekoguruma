@@ -36,6 +36,17 @@ const MAX_CONSTANT_SIZE: usize = 1 << 20;
 /// [`MAX_CONSTANT_SIZE`], and this bounds how much many of them hold together.
 const MAX_CONSTANTS_TOTAL: usize = 16 << 20;
 
+/// How much work folding may do over the whole lowering, every pass included: each fold is
+/// charged the sizes ([`Const::size`]) of the constants it reads, which bounds what it walks.
+/// Naming a constant shares it, so this, not the constant budget, bounds repeated searches and
+/// comparisons over one large constant.
+const MAX_FOLD_WORK: usize = 1 << 30;
+
+const TOO_MANY_CONSTANTS: &str =
+    "the procedure's constants together hold more than 16 Mi values and bytes (4.4)";
+const TOO_MUCH_FOLDING: &str =
+    "folding the procedure's constants reads more than 2^30 values and bytes in all (4.4)";
+
 /// How deeply constant lists and dicts may nest ([`Const::depth`]). Each literal is shallow,
 /// but globals can nest one in the next, and folding recurses through every level.
 const MAX_CONSTANT_DEPTH: usize = 64;
@@ -351,7 +362,9 @@ struct Lowerer<'a> {
     /// built in place of a constant could give a value the wrong type, and which pass runs
     /// out depends on the order functions are visited in, so running out anywhere, reported
     /// or not, rejects the procedure.
-    exhausted: Option<Span>,
+    exhausted: Option<(Span, &'static str)>,
+    /// The work folding has done so far, against [`MAX_FOLD_WORK`]; never reset.
+    work: usize,
 }
 
 impl<'a> Lowerer<'a> {
@@ -372,6 +385,7 @@ impl<'a> Lowerer<'a> {
             built: 0,
             globals_built: 0,
             exhausted: None,
+            work: 0,
         }
     }
 
@@ -1212,32 +1226,39 @@ impl<'a> Lowerer<'a> {
         ) {
             self.built = self.built.saturating_add(value.size());
             if self.built > MAX_CONSTANTS_TOTAL {
-                self.exhausted.get_or_insert(span);
-                self.not_lowerable(
-                    span,
-                    "the procedure's constants together hold more than 16 Mi values and bytes (4.4)",
-                );
+                self.exhausted.get_or_insert((span, TOO_MANY_CONSTANTS));
+                self.not_lowerable(span, TOO_MANY_CONSTANTS);
                 return Val::Const(Const::Int(0));
             }
         }
         Val::Const(value)
     }
 
-    /// Reports running out of the constant budget when nothing reported it, because it
-    /// happened only where reports are muted (in inference, or in an operand that is never
-    /// evaluated).
+    /// Reports running out of the constant or folding budget when nothing reported it,
+    /// because it happened only where reports are muted (in inference, or in an operand that is
+    /// never evaluated).
     fn reject_if_exhausted(&mut self) {
-        if let Some(span) = self.exhausted
+        if let Some((span, hint)) = self.exhausted
             && self.errors.is_empty()
         {
             self.errors.push(Pending {
                 code: StarCode::NotLowerable,
                 span,
-                hint:
-                    "the procedure's constants together hold more than 16 Mi values and bytes (4.4)"
-                        .to_owned(),
+                hint: hint.to_owned(),
             });
         }
+    }
+
+    /// Charges a fold that reads `cost` values and bytes; false, after an error, once the
+    /// folding budget is spent, and the fold is then not done.
+    fn charge(&mut self, cost: usize, span: Span) -> bool {
+        self.work = self.work.saturating_add(cost);
+        if self.work > MAX_FOLD_WORK {
+            self.exhausted.get_or_insert((span, TOO_MUCH_FOLDING));
+            self.not_lowerable(span, TOO_MUCH_FOLDING);
+            return false;
+        }
+        true
     }
 
     fn out_of_range(&mut self, span: Span) -> Val {
@@ -1247,6 +1268,9 @@ impl<'a> Lowerer<'a> {
 
     fn binary(&mut self, id: Option<usize>, op: BinOp, a: Val, b: Val, span: Span) -> Val {
         if let (Val::Const(x), Val::Const(y)) = (&a, &b) {
+            if !self.charge(x.size().saturating_add(y.size()), span) {
+                return Val::Const(Const::Int(0));
+            }
             return match fold(op, x, y) {
                 Ok(value) => self.bounded(value, span),
                 Err(reason) => {
@@ -1586,13 +1610,17 @@ impl<'a> Lowerer<'a> {
 
     fn index(&mut self, object: Val, index: Val, span: Span) -> Val {
         match (object, index) {
-            (Val::Const(object), Val::Const(index)) => match fold_index(&object, &index) {
-                Ok(value) => Val::Const(value),
-                Err(reason) => {
-                    self.not_lowerable(span, reason);
-                    Val::Const(Const::Int(0))
+            (Val::Const(object), Val::Const(index)) => {
+                // A dict is searched; a list or bytes is indexed directly.
+                let cost = match &object {
+                    Const::Dict(..) => object.size(),
+                    _ => 1,
+                };
+                if !self.charge(cost.saturating_add(index.size()), span) {
+                    return Val::Const(Const::Int(0));
                 }
-            },
+                self.fold_index_checked(object, index, span)
+            }
             (_, Val::Const(Const::Int(n))) if n < 0 => {
                 self.not_lowerable(
                     span,
@@ -1600,31 +1628,43 @@ impl<'a> Lowerer<'a> {
                 );
                 Val::Run(Tys::of(Ty::Int), Vec::new())
             }
-            (object, index) => {
-                let (Some((to, co)), Some((ti, ci))) = (
-                    self.single(object, span, "an index"),
-                    self.single(index, span, "an index"),
-                ) else {
-                    return Val::Run(Tys::default(), Vec::new());
-                };
-                if (to, ti) != (Ty::Bytes, Ty::Int) {
-                    self.not_lowerable(
-                        span,
-                        format!(
-                            "only bytes known at run time can be indexed, by an int; this is a {} indexed by a {} (2.5)",
-                            to.name(),
-                            ti.name()
-                        ),
-                    );
-                    return Val::Run(Tys::default(), Vec::new());
-                }
-                let mut code = co;
-                code.extend(ci);
-                // `IndexGet` leaves the bytes below the byte read.
-                code.extend([Op::IndexGet, Op::Swap, Op::Pop].map(|op| (Ins::Op(op), span)));
-                Val::Run(Tys::of(Ty::Int), code)
+            (object, index) => self.index_at_run_time(object, index, span),
+        }
+    }
+
+    fn fold_index_checked(&mut self, object: Const, index: Const, span: Span) -> Val {
+        match fold_index(&object, &index) {
+            Ok(value) => Val::Const(value),
+            Err(reason) => {
+                self.not_lowerable(span, reason);
+                Val::Const(Const::Int(0))
             }
         }
+    }
+
+    fn index_at_run_time(&mut self, object: Val, index: Val, span: Span) -> Val {
+        let (Some((to, co)), Some((ti, ci))) = (
+            self.single(object, span, "an index"),
+            self.single(index, span, "an index"),
+        ) else {
+            return Val::Run(Tys::default(), Vec::new());
+        };
+        if (to, ti) != (Ty::Bytes, Ty::Int) {
+            self.not_lowerable(
+                span,
+                format!(
+                    "only bytes known at run time can be indexed, by an int; this is a {} indexed by a {} (2.5)",
+                    to.name(),
+                    ti.name()
+                ),
+            );
+            return Val::Run(Tys::default(), Vec::new());
+        }
+        let mut code = co;
+        code.extend(ci);
+        // `IndexGet` leaves the bytes below the byte read.
+        code.extend([Op::IndexGet, Op::Swap, Op::Pop].map(|op| (Ins::Op(op), span)));
+        Val::Run(Tys::of(Ty::Int), code)
     }
 
     fn slice(&mut self, object: Const, start: Option<i64>, stop: Option<i64>, span: Span) -> Val {
@@ -1685,6 +1725,14 @@ impl<'a> Lowerer<'a> {
                             _ => None,
                         })
                         .collect();
+                    if let Some(args) = &consts {
+                        let cost = args
+                            .iter()
+                            .fold(1usize, |cost, arg| cost.saturating_add(arg.size()));
+                        if !self.charge(cost, span) {
+                            return Val::Const(Const::Int(0));
+                        }
+                    }
                     return match consts.map(|args| fold_builtin(name, &args)) {
                         Some(Ok(value)) => self.bounded(value, span),
                         Some(Err(reason)) => {
@@ -1724,6 +1772,12 @@ impl<'a> Lowerer<'a> {
                     (Val::Const(Const::Str(s)), Some(args))
                         if STRING_METHODS.contains(&method.node.as_str()) =>
                     {
+                        let cost = args
+                            .iter()
+                            .fold(1 + s.len(), |cost, arg| cost.saturating_add(arg.size()));
+                        if !self.charge(cost, span) {
+                            return Val::Const(Const::Int(0));
+                        }
                         match fold_method(&s, &method.node, &args) {
                             Ok(value) => self.bounded(value, span),
                             Err(reason) => {

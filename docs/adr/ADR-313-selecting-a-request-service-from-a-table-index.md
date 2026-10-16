@@ -36,13 +36,17 @@ the IR, or have the lowering read the CSV rows directly.
    does not rely on that. A call some variants cannot serve is reported once, naming those
    variants (ADR-311 item 3).
 4. **Arguments at ingestion.** The SID must be a constant from 0x00 to 0xFF and `params` a
-   dict known at ingestion. A value known only at run time under a key some service with that
-   SID holds as a constant is `STAR_NON_CONSTANT_ARGUMENT`; one under any other key is not
-   lowered yet (`STAR_NOT_LOWERABLE`), since the request is encoded at ingestion. A value the
-   field cannot hold is `STAR_ARGUMENT_OUT_OF_RANGE`.
+   dict known at ingestion. The SIDs of RequestDownload, TransferData and RequestTransferExit
+   (0x34, 0x36, 0x37) are refused (`STAR_ARGUMENT_OUT_OF_RANGE`): they bound a flash plan's
+   transfer, which `Program::validate` accepts only from `diag.flash_transfer`. A value known
+   only at run time under a key some service with that SID holds as a constant is
+   `STAR_NON_CONSTANT_ARGUMENT`; one under any other key is not lowered yet
+   (`STAR_NOT_LOWERABLE`), since the request is encoded at ingestion. A value the field cannot
+   hold is `STAR_ARGUMENT_OUT_OF_RANGE`.
 5. **A statement until the response has a shape.** The call lowers to the operand pushed from
    the constant pool, `ServiceRequest` with the SID, and a `Pop` of the response; using the
-   call's value is not lowered until the response has a run-time shape (subset 3.4).
+   call's value is not lowered until the response has a run-time shape (subset 3.4), and using
+   it is reported as such (`STAR_NOT_LOWERABLE`).
 
 ADR-311 item 4 is amended: the lowering reads the variant's declarations as the IR, and in
 addition the index the tables give for that variant, which carries only what the IR does not.

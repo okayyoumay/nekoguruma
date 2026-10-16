@@ -368,6 +368,9 @@ enum Val {
     Run(Tys, Code),
     /// Code that pushes nothing: a call to a function that returns no value.
     Void(Code),
+    /// Code that pushes nothing: a `diag.request` call, whose response has no run-time shape
+    /// yet (subset 3.4), so its value is not lowered.
+    Unread(Code),
 }
 
 // ---------------------------------------------------------------- Functions
@@ -397,6 +400,8 @@ struct Lowerer<'a> {
     variant: EcuVariant<'a>,
     /// The variant's services as `diag.request` selects among them (ADR-313).
     requests: &'a RequestIndex,
+    /// The position of each of the variant's services by `Service.id`.
+    service_at: HashMap<u32, usize>,
     /// Folded top-level constants.
     globals: HashMap<String, Const>,
     funcs: Vec<Func<'a>>,
@@ -472,6 +477,13 @@ impl<'a> Lowerer<'a> {
             checked,
             variant,
             requests,
+            service_at: variant
+                .services()
+                .into_iter()
+                .flatten()
+                .enumerate()
+                .map(|(at, service)| (service.id(), at))
+                .collect(),
             globals: HashMap::new(),
             funcs: Vec::new(),
             by_name: HashMap::new(),
@@ -760,7 +772,7 @@ impl<'a> Lowerer<'a> {
             }
             StmtP::Expression(expr) => match self.expr(Some(id), expr) {
                 Val::Const(_) => {}
-                Val::Void(more) => code.extend(more),
+                Val::Void(more) | Val::Unread(more) => code.extend(more),
                 Val::Run(_, more) => {
                     code.extend(more);
                     code.push((Ins::Op(Op::Pop), expr.span));
@@ -1573,6 +1585,14 @@ impl<'a> Lowerer<'a> {
                     StarCode::UnsupportedSyntax,
                     span,
                     "this call returns no value, and None is not supported (2.5)",
+                );
+                None
+            }
+            Val::Unread(_) => {
+                self.not_lowerable(
+                    span,
+                    "the response of `diag.request` is not lowered yet: the call is a statement \
+                     for now (3.4)",
                 );
                 None
             }
@@ -2736,9 +2756,26 @@ impl<'a> Lowerer<'a> {
                 span,
                 "`diag.request` takes a service identifier and params (3.1)",
             );
-            return Val::Void(Vec::new());
+            return Val::Unread(Vec::new());
         };
-        let sid = self.constant_int(id, sid_arg, "request", "service_id", 0..=0xFF);
+        let sid = self
+            .constant_int(id, sid_arg, "request", "service_id", 0..=0xFF)
+            .filter(|&sid| {
+                // RequestDownload, TransferData and RequestTransferExit bound a flash plan's
+                // transfer, which only `diag.flash_transfer` lowers (`Program::validate`).
+                let transfer = matches!(sid, 0x34 | 0x36 | 0x37);
+                if transfer {
+                    self.error(
+                        StarCode::ArgumentOutOfRange,
+                        sid_arg.span,
+                        format!(
+                            "`diag.request` cannot send service 0x{sid:02X}: a data transfer is \
+                             sent by `diag.flash_transfer` (3.2)"
+                        ),
+                    );
+                }
+                !transfer
+            });
         let params = match self.request_params(id, sid, params_arg) {
             None => None,
             Some(Val::Const(Const::Dict(entries, _))) => Some(entries),
@@ -2764,7 +2801,7 @@ impl<'a> Lowerer<'a> {
             }
         };
         let (Some(sid), Some(params)) = (sid, params) else {
-            return Val::Void(Vec::new());
+            return Val::Unread(Vec::new());
         };
         // In range by the check above.
         let sid = sid as u8;
@@ -2784,7 +2821,7 @@ impl<'a> Lowerer<'a> {
                     }
                 ),
             );
-            return Val::Void(Vec::new());
+            return Val::Unread(Vec::new());
         };
         let mut values = HashMap::new();
         for (key, value) in params.iter() {
@@ -2806,7 +2843,7 @@ impl<'a> Lowerer<'a> {
                             other.type_name()
                         ),
                     );
-                    return Val::Void(Vec::new());
+                    return Val::Unread(Vec::new());
                 }
             };
             values.insert(&**key, value);
@@ -2814,7 +2851,7 @@ impl<'a> Lowerer<'a> {
         match encode_request(&request, &values) {
             Ok(operand) => {
                 let operand = self.pool(&operand);
-                Val::Void(vec![
+                Val::Unread(vec![
                     (Ins::Op(Op::PushBytes(operand)), span),
                     (
                         Ins::Op(Op::ServiceRequest {
@@ -2831,7 +2868,7 @@ impl<'a> Lowerer<'a> {
                     params_arg.span,
                     format!("the request of `diag.request` cannot be encoded: {e} (3.1)"),
                 );
-                Val::Void(Vec::new())
+                Val::Unread(Vec::new())
             }
         }
     }
@@ -2900,7 +2937,14 @@ impl<'a> Lowerer<'a> {
                 }
             }
         }
-        complete.then(|| self.bounded(Const::dict(entries), arg.span))
+        if !complete {
+            return None;
+        }
+        // Anything but a dict means `bounded` refused it and reported why.
+        match self.bounded(Const::dict(entries), arg.span) {
+            value @ Val::Const(Const::Dict(..)) => Some(value),
+            _ => None,
+        }
     }
 
     /// The one service of this variant that `diag.request(sid, params)` names, with the names of
@@ -2916,12 +2960,6 @@ impl<'a> Lowerer<'a> {
             if indexed.sid != sid || indexed.routine {
                 continue;
             }
-            let Some(service) = services.iter().find(|s| s.id() == indexed.service_id) else {
-                continue;
-            };
-            let Some(request) = service.request() else {
-                continue;
-            };
             let constants_match = indexed.constants.iter().all(|(name, constant)| {
                 params
                     .iter()
@@ -2937,6 +2975,13 @@ impl<'a> Lowerer<'a> {
             if !constants_match {
                 continue;
             }
+            let Some(request) = self
+                .service_at
+                .get(&indexed.service_id)
+                .and_then(|&at| services.get(at).request())
+            else {
+                continue;
+            };
             let constants: HashSet<&'a str> = indexed
                 .constants
                 .iter()

@@ -445,7 +445,12 @@ type Sent = Vec<(u16, Vec<u8>)>;
 
 /// The requests each variant's program for `main.star` sends, by variant.
 fn requests_sent(source: &str) -> Vec<(String, Sent)> {
-    let converted = convert(with(example(), "main.star", source));
+    requests_sent_by(example(), source)
+}
+
+/// The requests each variant's program for `main.star` beside `files` sends, by variant.
+fn requests_sent_by(files: Vec<(String, Vec<u8>)>, source: &str) -> Vec<(String, Sent)> {
+    let converted = convert(with(files, "main.star", source));
     converted
         .documents
         .iter()
@@ -499,6 +504,43 @@ fn a_request_is_selected_by_its_constants_and_encoded_from_its_fields() {
             ("exampleEcuV2".to_owned(), sent),
         ]
     );
+}
+
+#[test]
+fn a_request_is_selected_by_a_bytes_constant_and_may_have_no_fields() {
+    let files = services::appended(
+        example(),
+        "fields.csv",
+        &[
+            "request:ecuReset,sub,0,,uint,8,,,,,,0x01,,,",
+            "request:customRead,tag,0,,bytes,16,,,,,,A1B2,,,",
+            "request:customRead,mode,2,,uint,8,,,,,,,,,",
+        ],
+    );
+    let files = services::appended(files, "services.csv", &["ecuReset,0x11", "customRead,0xBA"]);
+    // `params` may also be a global constant.
+    let source = "P = {\"mode\": 7, \"tag\": b\"\\xa1\\xb2\"}\n\n\
+                  def main():\n    diag.request(0x11, {\"sub\": 1})\n    diag.request(0xBA, P)\n";
+    let sent = vec![(0x11, vec![0x01]), (0xBA, vec![0xA1, 0xB2, 0x07])];
+    assert_eq!(
+        requests_sent_by(files.clone(), source),
+        [
+            ("exampleEcuV1".to_owned(), sent.clone()),
+            ("exampleEcuV2".to_owned(), sent),
+        ]
+    );
+    // The bytes constant is not matched by an integer of the same value.
+    let errors: Vec<_> = procedures(with(
+        files,
+        "main.star",
+        "def main():\n    diag.request(0xBA, {\"mode\": 7, \"tag\": 0xA1B2})\n",
+    ))
+    .expect_err("rejected")
+    .errors
+    .into_iter()
+    .map(|e| e.code)
+    .collect();
+    assert_eq!(errors, [crate::star::StarCode::UnknownService]);
 }
 
 #[test]
@@ -561,6 +603,30 @@ fn a_request_needs_its_arguments_at_ingestion() {
         (
             "def main():\n    diag.request(0x122, {})\n",
             ArgumentOutOfRange,
+        ),
+        // A data transfer is sent by `diag.flash_transfer`.
+        (
+            "def main():\n    diag.request(0x34, {})\n",
+            ArgumentOutOfRange,
+        ),
+        (
+            "def main():\n    diag.request(0x36, {})\n",
+            ArgumentOutOfRange,
+        ),
+        (
+            "def main():\n    diag.request(0x37, {})\n",
+            ArgumentOutOfRange,
+        ),
+        // The response cannot be read yet.
+        (
+            "def main():\n    r = diag.request(0x22, {\"did\": 0xF190})\n",
+            NotLowerable,
+        ),
+        // A dict past the constant size bound is reported once.
+        (
+            "A = b\"x\" * 600000\n\ndef main():\n    \
+             diag.request(0x2E, {\"did\": 0xF190, \"vin\": A, \"x\": A})\n",
+            NotLowerable,
         ),
         (
             // The VIN field is 17 bytes.

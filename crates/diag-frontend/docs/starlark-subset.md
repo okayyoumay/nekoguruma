@@ -265,7 +265,7 @@ field that stores them.
 
 | Argument | Type and range |
 |---|---|
-| `service_id` | `int`, 0x00 to 0xFF (a UDS service identifier; ADR-235 item 2) |
+| `service_id` | `int`, 0x00 to 0xFF (a UDS service identifier; ADR-235 item 2), except RequestDownload (0x34), TransferData (0x36) and RequestTransferExit (0x37), which only `diag.flash_transfer` sends |
 | `mask` | `int`, 0x00 to 0xFF |
 | `routine_id` | `int`, 0x0000 to 0xFFFF |
 | `sub` | `int`, 0x00 to 0xFF |

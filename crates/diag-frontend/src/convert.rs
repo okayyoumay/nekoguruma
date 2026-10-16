@@ -27,7 +27,7 @@ use diag_ir::declaration::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::star::{self, StarError};
+use crate::star::{self, RequestIndex, StarError};
 use crate::tables::Definition;
 use crate::tables::rows::CatalogRow;
 
@@ -101,17 +101,19 @@ pub fn lower_procedures(definition: &Definition) -> Result<Vec<Procedure>, Proce
         .iter()
         .map(encode_ecu_document)
         .collect();
-    let variants: Vec<(&str, EcuVariant<'_>)> = definition
+    let index = services::Index::new(definition);
+    let variants: Vec<(&str, EcuVariant<'_>, RequestIndex)> = definition
         .tables
         .variants
         .iter()
         .zip(&declarations)
-        .map(|(row, bytes)| {
+        .enumerate()
+        .map(|(at, (row, bytes))| {
             let variant = load_ecu_document(bytes)
                 .expect("a converted declaration part loads")
                 .variant()
                 .expect("a converted document has its variant");
-            (row.name.as_str(), variant)
+            (row.name.as_str(), variant, index.request_index(at))
         })
         .collect();
     let mut procedures = Vec::new();
@@ -127,8 +129,9 @@ pub fn lower_procedures(definition: &Definition) -> Result<Vec<Procedure>, Proce
         let mut programs = Vec::with_capacity(variants.len());
         let mut file_errors = Vec::new();
         let mut file_warnings = Vec::new();
-        for &(name, variant) in &variants {
-            match star::lower(file, &checked, variant) {
+        for (name, variant, requests) in &variants {
+            let name = *name;
+            match star::lower(file, &checked, *variant, requests) {
                 Ok(lowered) => {
                     programs.push(
                         postcard::to_allocvec(&lowered.program)

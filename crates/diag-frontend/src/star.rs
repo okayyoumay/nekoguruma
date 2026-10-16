@@ -35,6 +35,34 @@ pub use bounds::{
 };
 pub use lower::{Lowered, lower};
 
+/// The services of one variant as `diag.request` selects among them (`csv-tables.md` 5.3,
+/// ADR-313): what the IR does not keep, the names of each request's constants, beside the id of
+/// the IR service the call then encodes and sends. The frontend builds it from the tables.
+#[derive(Debug, Clone, Default)]
+pub struct RequestIndex {
+    pub services: Vec<IndexedService>,
+}
+
+/// One service of a [`RequestIndex`].
+#[derive(Debug, Clone)]
+pub struct IndexedService {
+    /// `Service.id` in the variant's declaration part.
+    pub service_id: u32,
+    pub sid: u8,
+    /// A service `routines.csv` generates, which `diag.request` never selects.
+    pub routine: bool,
+    /// The request's constants by name, in order: the generated ones (`did` of a DID service)
+    /// first, then those of the request's fields.
+    pub constants: Vec<(String, RequestConstant)>,
+}
+
+/// The value of a request constant (`csv-tables.md` 5.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RequestConstant {
+    Uint(u64),
+    Bytes(Vec<u8>),
+}
+
 /// The error codes of `docs/starlark-subset.md` that the checker and the lowering report.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub enum StarCode {
@@ -93,6 +121,10 @@ pub enum StarCode {
     /// A `diag` function with no IR instruction yet (3.2).
     #[serde(rename = "STAR_API_NOT_AVAILABLE")]
     ApiNotAvailable,
+    /// A `diag.request` call that no declared service of the variant matches, or that several
+    /// match (3.4; `csv-tables.md` 5.3).
+    #[serde(rename = "STAR_UNKNOWN_SERVICE")]
+    UnknownService,
     /// A warning: a `range` loop with a bound known only at run time has no `@maxIterations`, so
     /// the default limit applies (4.2).
     #[serde(rename = "STAR_LOOP_LIMIT_DEFAULTED")]
@@ -121,6 +153,7 @@ impl StarCode {
             Self::NonConstantArgument => "STAR_NON_CONSTANT_ARGUMENT",
             Self::NotLowerable => "STAR_NOT_LOWERABLE",
             Self::ApiNotAvailable => "STAR_API_NOT_AVAILABLE",
+            Self::UnknownService => "STAR_UNKNOWN_SERVICE",
             Self::LoopLimitDefaulted => "STAR_LOOP_LIMIT_DEFAULTED",
         }
     }

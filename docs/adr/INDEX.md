@@ -300,8 +300,9 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-308](ADR-308-encoding-a-request-operand.md) | Encoding a Request Operand | Accepted | `diag-ir` request encoder, CSV format 5.3, design 8.2.2 |
 | [ADR-309](ADR-309-application-layer-profiles.md) | Application-Layer Profiles for Protocol-Neutral Diagnostic Calls | Accepted | `diag-frontend` lowering and CSV tables, `diag-ir` primitives, `agent` host and read-only policy; ADR-235 items 2, 3 and 8; design 8.2.4, 8.4 |
 | [ADR-310](ADR-310-one-line-message-notation.md) | A One-Line Message Notation for the Vehicle-Knowledge Format | Accepted | `diag-frontend` message shapes (`messages.txt` replacing the CSV field tables), CSV format sections 1 and 5; design 8.4 |
-| [ADR-311](ADR-311-lowering-each-procedure-once-per-variant.md) | Lowering Each Procedure Once per Variant | Accepted | `diag-frontend` conversion and Starlark lowering, CSV format section 1, Starlark subset section 5 |
+| [ADR-311](ADR-311-lowering-each-procedure-once-per-variant.md) | Lowering Each Procedure Once per Variant | Accepted (item 4 amended by ADR-313) | `diag-frontend` conversion and Starlark lowering, CSV format section 1, Starlark subset section 5 |
 | [ADR-312](ADR-312-codex-as-pr-reviewer-with-copilot-fallback.md) | Codex as the Pull Request Reviewer, with Copilot as Fallback | Accepted | `.claude/skills/pr-review-loop` (Steps 0, 1, 4-5), `AGENTS.md`, `CLAUDE.md`; ADR-251 |
+| [ADR-313](ADR-313-selecting-a-request-service-from-a-table-index.md) | Selecting a Request's Service from an Index of the Tables | Accepted | `diag-frontend` conversion and Starlark lowering, CSV format 5.3, Starlark subset 3.1, 3.2 and 3.4; ADR-311 item 4 |
 
 ## Status Legend
 
@@ -713,7 +714,8 @@ the predecessor repository these ADRs came from.
 - ADR-308
 - ADR-309
 - ADR-310
-- ADR-311
+- ADR-311 (item 4 amended by ADR-313)
+- ADR-313
 
 ### Acquired Data & Monitoring
 - ADR-236

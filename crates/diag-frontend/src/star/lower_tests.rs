@@ -53,19 +53,24 @@ fn lowered_with_warnings(source: &str) -> Result<Lowered, Vec<StarError>> {
     lower_for_a_variant(&checked)
 }
 
-/// Lowers `checked` for a variant that declares nothing.
-fn lower_for_a_variant(checked: &Checked) -> Result<Lowered, Vec<StarError>> {
+/// A document whose variant declares nothing.
+fn empty_document() -> Vec<u8> {
     let mut document = EcuDocumentT::default();
     document.schema_version = IR_SCHEMA_VERSION;
     document.source_format = Some("test".to_owned());
     document.source_digest = Some(String::new());
     document.variant = Some(Box::new(EcuVariantT::default()));
-    let bytes = encode_ecu_document(&document);
+    encode_ecu_document(&document)
+}
+
+/// Lowers `checked` for a variant that declares nothing.
+fn lower_for_a_variant(checked: &Checked) -> Result<Lowered, Vec<StarError>> {
+    let bytes = empty_document();
     let variant = load_ecu_document(&bytes)
         .expect("the document loads")
         .variant()
         .expect("a variant");
-    lower("t.star", checked, variant)
+    lower("t.star", checked, variant, &RequestIndex::default())
 }
 
 /// Runs `source` to its end: `Ok(None)` when it finishes, `Ok(Some((code, detail)))` when it
@@ -1428,7 +1433,10 @@ fn unrolling_stops_once_a_budget_is_spent() {
     let source =
         format!("L = [{items}]\n\ndef main():\n    for n in L:\n        diag.log(1, \"{text}\")\n");
     let checked = check("t.star", &source).unwrap_or_else(|errors| panic!("{errors:#?}"));
-    let mut lowerer = Lowerer::new(&checked);
+    let bytes = empty_document();
+    let document = load_ecu_document(&bytes).expect("the document loads");
+    let requests = RequestIndex::default();
+    let mut lowerer = Lowerer::new(&checked, document.variant().expect("a variant"), &requests);
     lowerer.annotations();
     lowerer.constants();
     lowerer.globals_built = lowerer.built;
@@ -1476,10 +1484,13 @@ fn unrolling_counts_the_arguments_of_a_call() {
         format!("    for n in L:\n        for b in range({args}, stop=1):\n            pass\n"),
         format!("    for n in L:\n        diag.wait(min({args}, x=1))\n"),
     ];
+    let bytes = empty_document();
+    let requests = RequestIndex::default();
     for body in calls {
         let source = format!("L = [{items}]\n\ndef main():\n{body}");
         let checked = check("t.star", &source).unwrap_or_else(|errors| panic!("{errors:#?}"));
-        let mut lowerer = Lowerer::new(&checked);
+        let document = load_ecu_document(&bytes).expect("the document loads");
+        let mut lowerer = Lowerer::new(&checked, document.variant().expect("a variant"), &requests);
         lowerer.annotations();
         lowerer.constants();
         lowerer.globals_built = lowerer.built;

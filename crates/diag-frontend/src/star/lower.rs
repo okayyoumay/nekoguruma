@@ -17,7 +17,8 @@
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
-use diag_ir::declaration::EcuVariant;
+use diag_ir::declaration::{EcuVariant, Request};
+use diag_ir::encode::{ParamValue, encode_request};
 use diag_ir::{IR_SCHEMA_VERSION, Op, Program, SourceSpan};
 use starlark_syntax::codemap::Span;
 use starlark_syntax::lexer::TokenInt;
@@ -28,8 +29,8 @@ use starlark_syntax::syntax::ast::{
 use starlark_syntax::syntax::uniplate::Visit;
 
 use super::{
-    Annotation, BUILTINS, Checked, Pending, STRING_METHODS, StarCode, StarError, collect_locals,
-    is_string_expression, resolve, to_u32,
+    Annotation, BUILTINS, Checked, Pending, RequestConstant, RequestIndex, STRING_METHODS,
+    StarCode, StarError, collect_locals, is_string_expression, resolve, to_u32,
 };
 
 /// The largest constant a fold or literal may build ([`Const::size`]), so a constant expression
@@ -96,8 +97,9 @@ pub fn lower(
     file: &str,
     checked: &Checked,
     variant: EcuVariant<'_>,
+    requests: &RequestIndex,
 ) -> Result<Lowered, Vec<StarError>> {
-    super::on_parser_stack(|| lower_here(file, checked, variant))
+    super::on_parser_stack(|| lower_here(file, checked, variant, requests))
 }
 
 /// A lowered procedure and the warnings its lowering reported (such as
@@ -108,16 +110,13 @@ pub struct Lowered {
     pub warnings: Vec<StarError>,
 }
 
-#[expect(
-    unused_variables,
-    reason = "nothing lowered yet depends on the variant; `diag.request` will select its services"
-)]
-fn lower_here(
+fn lower_here<'a>(
     file: &str,
-    checked: &Checked,
-    variant: EcuVariant<'_>,
+    checked: &'a Checked,
+    variant: EcuVariant<'a>,
+    requests: &'a RequestIndex,
 ) -> Result<Lowered, Vec<StarError>> {
-    let mut lowerer = Lowerer::new(checked);
+    let mut lowerer = Lowerer::new(checked, variant, requests);
     lowerer.annotations();
     lowerer.constants();
     lowerer.globals_built = lowerer.built;
@@ -394,6 +393,10 @@ struct Func<'a> {
 
 struct Lowerer<'a> {
     checked: &'a Checked,
+    /// The variant's declaration part, whose services `diag.request` encodes (ADR-311).
+    variant: EcuVariant<'a>,
+    /// The variant's services as `diag.request` selects among them (ADR-313).
+    requests: &'a RequestIndex,
     /// Folded top-level constants.
     globals: HashMap<String, Const>,
     funcs: Vec<Func<'a>>,
@@ -464,9 +467,11 @@ struct LoopLabels {
 }
 
 impl<'a> Lowerer<'a> {
-    fn new(checked: &'a Checked) -> Self {
+    fn new(checked: &'a Checked, variant: EcuVariant<'a>, requests: &'a RequestIndex) -> Self {
         Lowerer {
             checked,
+            variant,
+            requests,
             globals: HashMap::new(),
             funcs: Vec::new(),
             by_name: HashMap::new(),
@@ -2704,6 +2709,7 @@ impl<'a> Lowerer<'a> {
                     _ => Val::Void(Vec::new()),
                 }
             }
+            "request" => self.diag_request(id, args, span),
             "ecu_info" | "precondition" => {
                 self.error(
                     StarCode::ApiNotAvailable,
@@ -2717,6 +2723,245 @@ impl<'a> Lowerer<'a> {
                 Val::Run(Tys::default(), Vec::new())
             }
         }
+    }
+
+    /// `diag.request(service_id, params)`: selects the variant's service the SID and the
+    /// params' keys name, by the rule of `docs/csv-tables.md` 5.3 (ADR-313), and sends the
+    /// request [`encode_request`] writes from the remaining params. The call is a statement
+    /// until its response has a run-time shape: the response is dropped.
+    fn diag_request(&mut self, id: Option<usize>, args: &[&AstExpr], span: Span) -> Val {
+        let [sid_arg, params_arg] = args else {
+            self.error(
+                StarCode::UnsupportedSyntax,
+                span,
+                "`diag.request` takes a service identifier and params (3.1)",
+            );
+            return Val::Void(Vec::new());
+        };
+        let sid = self.constant_int(id, sid_arg, "request", "service_id", 0..=0xFF);
+        let params = match self.request_params(id, sid, params_arg) {
+            None => None,
+            Some(Val::Const(Const::Dict(entries, _))) => Some(entries),
+            Some(Val::Const(other)) => {
+                self.error(
+                    StarCode::UnsupportedSyntax,
+                    params_arg.span,
+                    format!(
+                        "`params` of `diag.request` is a dict, not a {} (3.1)",
+                        other.type_name()
+                    ),
+                );
+                None
+            }
+            Some(_) => {
+                self.error(
+                    StarCode::NonConstantArgument,
+                    params_arg.span,
+                    "`params` of `diag.request` must be a dict known at ingestion: they select \
+                     the service (3.1)",
+                );
+                None
+            }
+        };
+        let (Some(sid), Some(params)) = (sid, params) else {
+            return Val::Void(Vec::new());
+        };
+        // In range by the check above.
+        let sid = sid as u8;
+        let Some((request, constants)) = self.select_request(sid, &params) else {
+            let mut keys: Vec<&str> = params.iter().map(|(key, _)| &**key).collect();
+            keys.sort_unstable();
+            self.error(
+                StarCode::UnknownService,
+                span,
+                format!(
+                    "no single service of this variant has SID 0x{sid:02X}, takes the params {} \
+                     and has the constants they give (csv-tables 5.3)",
+                    if keys.is_empty() {
+                        "{}".to_owned()
+                    } else {
+                        keys.join(", ")
+                    }
+                ),
+            );
+            return Val::Void(Vec::new());
+        };
+        let mut values = HashMap::new();
+        for (key, value) in params.iter() {
+            if constants.contains(&**key) {
+                continue;
+            }
+            let value = match value {
+                Const::Int(n) => ParamValue::Int(*n),
+                Const::Float(x) => ParamValue::Float(*x),
+                Const::Bytes(bytes) => ParamValue::Bytes(bytes),
+                Const::Str(text) => ParamValue::Text(text),
+                other => {
+                    self.error(
+                        StarCode::UnsupportedSyntax,
+                        params_arg.span,
+                        format!(
+                            "the `{key}` param of `diag.request` is an int, float, bytes or str, \
+                             not a {} (3.1)",
+                            other.type_name()
+                        ),
+                    );
+                    return Val::Void(Vec::new());
+                }
+            };
+            values.insert(&**key, value);
+        }
+        match encode_request(&request, &values) {
+            Ok(operand) => {
+                let operand = self.pool(&operand);
+                Val::Void(vec![
+                    (Ins::Op(Op::PushBytes(operand)), span),
+                    (
+                        Ins::Op(Op::ServiceRequest {
+                            service: u16::from(sid),
+                        }),
+                        span,
+                    ),
+                    (Ins::Op(Op::Pop), span),
+                ])
+            }
+            Err(e) => {
+                self.error(
+                    StarCode::ArgumentOutOfRange,
+                    params_arg.span,
+                    format!("the request of `diag.request` cannot be encoded: {e} (3.1)"),
+                );
+                Val::Void(Vec::new())
+            }
+        }
+    }
+
+    /// The `params` of `diag.request(sid, ...)` as a value. A dict literal is built here, so
+    /// that a value known only at run time is reported for what it is: under a key some service
+    /// with the SID holds as a constant it is needed to select the service (csv-tables 5.3);
+    /// under another key it is a field's value, which only a run-time encoding could send.
+    /// `None` once the dict literal's errors are reported.
+    fn request_params(
+        &mut self,
+        id: Option<usize>,
+        sid: Option<i64>,
+        arg: &AstExpr,
+    ) -> Option<Val> {
+        let ExprP::Dict(pairs) = &arg.node else {
+            return Some(self.expr(id, arg));
+        };
+        let mut entries = Vec::new();
+        let mut keys = HashSet::new();
+        let mut complete = true;
+        for (key, value) in pairs {
+            let key = match self.expr(id, key) {
+                Val::Const(Const::Str(key)) => key,
+                _ => {
+                    self.not_lowerable(key.span, "a dict key must be a string literal (4.1)");
+                    complete = false;
+                    continue;
+                }
+            };
+            if !keys.insert(key.clone()) {
+                self.not_lowerable(
+                    arg.span,
+                    format!("the dict repeats the key {key:?}, which Starlark rejects"),
+                );
+                complete = false;
+                continue;
+            }
+            match self.expr(id, value) {
+                Val::Const(value) => entries.push((key, value)),
+                _ => {
+                    complete = false;
+                    let constant = self.requests.services.iter().any(|service| {
+                        Some(i64::from(service.sid)) == sid
+                            && !service.routine
+                            && service.constants.iter().any(|(name, _)| **name == *key)
+                    });
+                    if constant {
+                        self.error(
+                            StarCode::NonConstantArgument,
+                            value.span,
+                            format!(
+                                "the `{key}` param of `diag.request` selects the service, so \
+                                 it must be known at ingestion (3.4)"
+                            ),
+                        );
+                    } else {
+                        self.not_lowerable(
+                            value.span,
+                            format!(
+                                "the `{key}` param of `diag.request` is known only at run time; \
+                                 a request is encoded at ingestion for now (3.2)"
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+        complete.then(|| self.bounded(Const::dict(entries), arg.span))
+    }
+
+    /// The one service of this variant that `diag.request(sid, params)` names, with the names of
+    /// its request constants, or `None` when none or several match (csv-tables 5.3).
+    fn select_request(
+        &self,
+        sid: u8,
+        params: &[(Rc<str>, Const)],
+    ) -> Option<(Request<'a>, HashSet<&'a str>)> {
+        let services = self.variant.services()?;
+        let mut found = None;
+        for indexed in &self.requests.services {
+            if indexed.sid != sid || indexed.routine {
+                continue;
+            }
+            let Some(service) = services.iter().find(|s| s.id() == indexed.service_id) else {
+                continue;
+            };
+            let Some(request) = service.request() else {
+                continue;
+            };
+            let constants_match = indexed.constants.iter().all(|(name, constant)| {
+                params
+                    .iter()
+                    .find(|(key, _)| **key == **name)
+                    .is_some_and(|(_, value)| match (constant, value) {
+                        (RequestConstant::Uint(c), Const::Int(n)) => {
+                            u64::try_from(*n).is_ok_and(|n| n == *c)
+                        }
+                        (RequestConstant::Bytes(c), Const::Bytes(b)) => **c == **b,
+                        _ => false,
+                    })
+            });
+            if !constants_match {
+                continue;
+            }
+            let constants: HashSet<&'a str> = indexed
+                .constants
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect();
+            let fields: HashSet<&str> = request
+                .params()
+                .into_iter()
+                .flatten()
+                .map(|field| field.short_name().unwrap_or_default())
+                .collect();
+            let rest: HashSet<&str> = params
+                .iter()
+                .map(|(key, _)| &**key)
+                .filter(|key| !constants.contains(key))
+                .collect();
+            if rest != fields {
+                continue;
+            }
+            if found.is_some() {
+                return None;
+            }
+            found = Some((request, constants));
+        }
+        found
     }
 
     /// The value of `arg`, an argument of `diag.{function}` that its instruction holds as a

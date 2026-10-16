@@ -381,13 +381,196 @@ fn every_procedure_goes_with_every_variant() {
         let bytes = document.procedure().expect("a program");
         let program: diag_ir::Program = postcard::from_bytes(bytes.bytes()).expect("a program");
         let checked = crate::star::check(file, source).expect("checks");
-        let lowered = crate::star::lower(file, &checked, document.variant().expect("a variant"))
-            .expect("lowers")
-            .program;
+        let lowered = crate::star::lower(
+            file,
+            &checked,
+            document.variant().expect("a variant"),
+            &crate::star::RequestIndex::default(),
+        )
+        .expect("lowers")
+        .program;
         assert_eq!(
             postcard::to_allocvec(&program).expect("encodes"),
             postcard::to_allocvec(&lowered).expect("encodes")
         );
+    }
+}
+
+// ---------------------------------------------------------------- `diag.request` (ADR-313)
+
+/// A host that records each request it is sent and answers with the positive response SID.
+#[derive(Default)]
+struct Recording(Sent);
+
+#[derive(Debug, thiserror::Error)]
+#[error("not sent by these tests")]
+struct NotSent;
+
+impl diag_ir::DiagHost for Recording {
+    type Error = NotSent;
+
+    fn service_request(&mut self, service: u16, payload: &[u8]) -> Result<Vec<u8>, NotSent> {
+        self.0.push((service, payload.to_vec()));
+        Ok(vec![service as u8 + 0x40])
+    }
+    fn read_dtc(&mut self, _: u8) -> Result<Vec<u8>, NotSent> {
+        Err(NotSent)
+    }
+    fn routine_control(&mut self, _: u16, _: u8, _: &[u8]) -> Result<Vec<u8>, NotSent> {
+        Err(NotSent)
+    }
+    fn security_access(&mut self, _: u64, _: u8, _: &[u8]) -> Result<Option<Vec<u8>>, NotSent> {
+        Err(NotSent)
+    }
+    fn flash_transfer(&mut self, _: u32, _: &[u8]) -> Result<(), NotSent> {
+        Err(NotSent)
+    }
+    fn wait(&mut self, _: u64, _: u32) -> Result<bool, NotSent> {
+        Err(NotSent)
+    }
+    fn hmi_request(&mut self, _: u64, _: &[u8]) -> Result<Option<Vec<u8>>, NotSent> {
+        Err(NotSent)
+    }
+    fn record_input(&mut self, _: u64, _: &[u8]) -> Result<Option<Vec<u8>>, NotSent> {
+        Err(NotSent)
+    }
+    fn monitor_capture(&mut self, _: u32) -> Result<(), NotSent> {
+        Err(NotSent)
+    }
+    fn log(&mut self, _: u8, _: &str) {}
+}
+
+/// The SID and operand of each request sent.
+type Sent = Vec<(u16, Vec<u8>)>;
+
+/// The requests each variant's program for `main.star` sends, by variant.
+fn requests_sent(source: &str) -> Vec<(String, Sent)> {
+    let converted = convert(with(example(), "main.star", source));
+    converted
+        .documents
+        .iter()
+        .map(|converted| {
+            let document = load_ecu_document(&converted.bytes).expect("the document loads");
+            let bytes = document.procedure().expect("a program");
+            let program: diag_ir::Program = postcard::from_bytes(bytes.bytes()).expect("a program");
+            let mut vm = diag_ir::Vm::new(&program);
+            let mut host = Recording::default();
+            loop {
+                match vm.step(&program, &mut host).expect("runs") {
+                    diag_ir::StepOutcome::Continue => {}
+                    diag_ir::StepOutcome::Finished => break,
+                    other => panic!("{other:?}"),
+                }
+            }
+            (converted.name.clone(), host.0)
+        })
+        .collect()
+}
+
+/// The errors `main.star` gives, as (code, hint).
+fn request_errors(source: &str) -> Vec<(crate::star::StarCode, String)> {
+    procedures(with(example(), "main.star", source))
+        .expect_err("rejected")
+        .errors
+        .into_iter()
+        .map(|e| (e.code, e.hint))
+        .collect()
+}
+
+#[test]
+fn a_request_is_selected_by_its_constants_and_encoded_from_its_fields() {
+    let source = "def main():\n    \
+                  diag.request(0x22, {\"did\": 0xF190})\n    \
+                  diag.request(0x10, {\"sub\": 3})\n    \
+                  diag.request(0x19, {\"statusMask\": 0xFF, \"sub\": 2})\n    \
+                  diag.request(0x2E, {\"did\": 0xF190, \"vin\": \"WVWZZZ1JZXW000001\"})\n";
+    let mut vin = vec![0xF1, 0x90];
+    vin.extend_from_slice(b"WVWZZZ1JZXW000001");
+    let sent = vec![
+        (0x22, vec![0xF1, 0x90]),
+        (0x10, vec![0x03]),
+        (0x19, vec![0x02, 0xFF]),
+        (0x2E, vin),
+    ];
+    assert_eq!(
+        requests_sent(source),
+        [
+            ("exampleEcuV1".to_owned(), sent.clone()),
+            ("exampleEcuV2".to_owned(), sent),
+        ]
+    );
+}
+
+#[test]
+fn a_request_no_service_matches_is_refused() {
+    use crate::star::StarCode::UnknownService;
+    for call in [
+        // The routine service with no request fields is left to `diag.routine`.
+        "diag.request(0x31, {})",
+        // No service has the SID.
+        "diag.request(0x85, {})",
+        // No session has sub-function 4.
+        "diag.request(0x10, {\"sub\": 4})",
+        // A constant is missing, so it is not known which session is meant.
+        "diag.request(0x10, {})",
+        // A key no field of the request has.
+        "diag.request(0x10, {\"sub\": 3, \"extra\": 1})",
+        // A field of the request is missing.
+        "diag.request(0x19, {\"sub\": 2})",
+        // A constant given as the wrong type.
+        "diag.request(0x22, {\"did\": b\"\\xf1\\x90\"})",
+    ] {
+        let errors = request_errors(&format!("def main():\n    {call}\n"));
+        assert_eq!(errors.len(), 1, "{call}: {errors:?}");
+        assert_eq!(errors[0].0, UnknownService, "{call}: {errors:?}");
+        assert!(!errors[0].1.contains("(in variant"), "{call}: {errors:?}");
+    }
+}
+
+#[test]
+fn a_request_one_variant_lacks_names_the_variant() {
+    // Only exampleEcuV2 declares 0xFD02.
+    let errors = request_errors("def main():\n    diag.request(0x22, {\"did\": 0xFD02})\n");
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(errors[0].0, crate::star::StarCode::UnknownService);
+    assert!(
+        errors[0].1.ends_with("(in variant exampleEcuV1)"),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn a_request_needs_its_arguments_at_ingestion() {
+    use crate::star::StarCode::{ArgumentOutOfRange, NonConstantArgument, NotLowerable};
+    let cases = [
+        (
+            "def f(n):\n    diag.request(n, {\"did\": 0xF190})\n\ndef main():\n    f(0x22)\n",
+            NonConstantArgument,
+        ),
+        // A constant's value selects the service.
+        (
+            "def f(n):\n    diag.request(0x22, {\"did\": n})\n\ndef main():\n    f(0xF190)\n",
+            NonConstantArgument,
+        ),
+        // A field's value would need encoding at run time.
+        (
+            "def f(n):\n    diag.request(0x19, {\"sub\": 2, \"statusMask\": n})\n\n\
+             def main():\n    f(0xFF)\n",
+            NotLowerable,
+        ),
+        (
+            "def main():\n    diag.request(0x122, {})\n",
+            ArgumentOutOfRange,
+        ),
+        (
+            // The VIN field is 17 bytes.
+            "def main():\n    diag.request(0x2E, {\"did\": 0xF190, \"vin\": \"short\"})\n",
+            ArgumentOutOfRange,
+        ),
+    ];
+    for (source, code) in cases {
+        let codes: Vec<_> = request_errors(source).into_iter().map(|e| e.0).collect();
+        assert_eq!(codes, [code], "{source}");
     }
 }
 

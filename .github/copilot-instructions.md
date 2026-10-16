@@ -84,5 +84,5 @@ reviewing.
   Medium or higher. Only the remaining new findings, those you rate Low on code that has not
   changed since your previous review and that are not P0 or P1, are not raised; if you notice
   any, give only their number in the summary. Each re-review
-  is requested on purpose and spends the owner's AI credits, so it should converge.
+  is requested on purpose and spends the owner's review allowance, so it should converge.
 - Write in English.

@@ -1,7 +1,7 @@
 # ADR-251: Copilot Re-Review Only After Fixes That Need It
 
 **Date:** 2026-10-08
-**Status:** Accepted
+**Status:** Accepted (applies to whichever reviewer the pull request has, Codex or Copilot, ADR-312)
 **Affects:** `.claude/skills/pr-review-loop/SKILL.md` (Steps 0, 4 and 5), `.github/copilot-instructions.md` ("Writing findings"), `CLAUDE.md` ("Pull requests")
 
 ## Context

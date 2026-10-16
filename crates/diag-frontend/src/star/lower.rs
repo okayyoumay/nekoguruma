@@ -2349,6 +2349,10 @@ impl<'a> Lowerer<'a> {
                         Ins::Mark(positive),
                         Ins::Op(Op::PushI64(0)),
                         Ins::Mark(end),
+                        // The slot would otherwise keep a copy of the response in the VM state,
+                        // and its journaled checkpoints, until the function returns.
+                        Ins::Op(Op::PushI64(0)),
+                        Ins::Op(Op::StoreLocal(response)),
                     ]
                     .map(|ins| (ins, span)),
                 );

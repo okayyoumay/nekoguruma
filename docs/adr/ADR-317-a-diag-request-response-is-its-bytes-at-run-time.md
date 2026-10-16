@@ -45,8 +45,9 @@ send-receive work, but the declaration part does not carry it yet.
 
 ## Consequences
 
-- Each read of `nrc` keeps the response in a temporary slot so that it can be read twice. The
-  lowering already does this for floor division.
+- Each read of `nrc` keeps the response in a temporary slot so that it can be read twice, as the
+  lowering already does for floor division. The slot is overwritten once the code is read, so the
+  copy does not stay in the VM state or its checkpoints.
 - A procedure that reads `nrc` from a malformed negative response fails instead of reading a
   made-up code.
 - Reading the same key twice repeats its few instructions. The response is read from the slot

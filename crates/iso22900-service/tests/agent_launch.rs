@@ -4,14 +4,20 @@
 //! The agent's launch path for a D-PDU API VCI: `agent::launch::launch_worker` with
 //! `Api::Dpdu` resolves the `iso22900-mock` library through a root description file, picks the
 //! `iso22900-service` build for the library's ABI from a workers directory, starts it with the
-//! name and the device's mode, and connects a client that reaches the mock's module.
+//! name and the device's mode, and connects a client that reaches the mock's module. Through
+//! that client, the resource the agent names a link by (ISO 22900-2 (2022) Annex B.1 and
+//! B.2 short names, ADR-319) resolves and a logical link is created on it.
 
 use std::path::Path;
 use std::time::Duration;
 
+use agent::LinkConfig;
 use agent::launch::{Api, launch_worker};
 use serial_test::serial;
-use vci_service_interface::GetModuleIdsRequest;
+use vci_service_interface::{
+    CreateComLogicalLinkRequest, GetModuleIdsRequest, GetResourceIdsRequest, ModuleConnectRequest,
+    create_com_logical_link_request,
+};
 use worker_host::service::{LaunchOptions, OperatingMode, Stopped, WorkerLayout};
 
 const LIBRARY_NAME: &str = "NGR Mock D-PDU API";
@@ -70,6 +76,43 @@ async fn the_agent_launches_iso22900_service_for_a_d_pdu_api_vci() {
         .map(|list| list.module_data)
         .unwrap_or_default();
     assert_eq!(modules.len(), 1, "{modules:?}");
+
+    // The agent's resource data: the standard names resolve, and a link is created on the
+    // resource they select.
+    let module_handle = modules[0].module_handle;
+    worker
+        .client
+        .module_connect(ModuleConnectRequest { module_handle })
+        .await
+        .expect("the module should connect");
+    let resource_id = worker
+        .client
+        .get_resource_ids(GetResourceIdsRequest {
+            module_handle,
+            resource_data: Some(agent::link::resource_data(&LinkConfig::iso15765(
+                0x7E0, 0x7E8,
+            ))),
+        })
+        .await
+        .expect("the standard names should resolve")
+        .into_inner()
+        .resource_id_list
+        .and_then(|list| list.resource_id_data_array.into_iter().next())
+        .and_then(|data| data.resource_id_array.into_iter().next())
+        .expect("a resource for UDS on CAN");
+    let link = worker
+        .client
+        .create_com_logical_link(CreateComLogicalLinkRequest {
+            module_handle,
+            resource: Some(create_com_logical_link_request::Resource::ResourceId(
+                resource_id,
+            )),
+            cll_create_flag: None,
+        })
+        .await
+        .expect("a link should be created on the resource")
+        .into_inner();
+    assert!(link.cll_handle.is_some(), "{link:?}");
     assert_eq!(
         worker.process.stop(Duration::from_secs(5)).await.ok(),
         Some(Stopped::Exited)

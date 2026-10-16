@@ -16,6 +16,11 @@ use sim_ecu::{Addressing, EcuConfig, Fault, SimEcu};
 
 const MOCK_MODULE_HANDLE: UNUM32 = 1001;
 const MOCK_RESOURCE_ID: UNUM32 = 2001;
+/// Object ids the mock gives the ISO 22900-2 (2022) short names it resolves (Annex B.1, B.2).
+pub const STANDARD_BUS_TYPE_DWCAN: UNUM32 = 3111;
+pub const STANDARD_PROTOCOL_UDS_ON_CAN: UNUM32 = 3112;
+pub const STANDARD_PIN_TYPE_HI: UNUM32 = 3311;
+pub const STANDARD_PIN_TYPE_LOW: UNUM32 = 3312;
 const MOCK_LOGICAL_LINK_HANDLE: UNUM32 = 3001;
 const MOCK_COM_PRIMITIVE_HANDLE: UNUM32 = 4001;
 const MOCK_TIMESTAMP: UNUM32 = 4242;
@@ -1197,6 +1202,14 @@ exported_fn!(PDUGetObjectId(pdu_object_type: T_PDU_OBJT, p_shortname: *mut CHAR8
         (E_PDU_OBJT::PDU_OBJT_RESOURCE, "mock-resource") => MOCK_RESOURCE_ID,
         (E_PDU_OBJT::PDU_OBJT_COMPARAM, "mock-com-param") => 3201,
         (E_PDU_OBJT::PDU_OBJT_PINTYPE, "mock-pin-type") => 3301,
+        // The ISO 22900-2 (2022) short names of UDS on CAN (Annex B.1, B.2), which the agent
+        // names a link's resource by (ADR-319).
+        (E_PDU_OBJT::PDU_OBJT_BUSTYPE, "ISO_11898_2_DWCAN") => STANDARD_BUS_TYPE_DWCAN,
+        (E_PDU_OBJT::PDU_OBJT_PROTOCOL, "ISO_14229_3_on_ISO_15765_2") => {
+            STANDARD_PROTOCOL_UDS_ON_CAN
+        }
+        (E_PDU_OBJT::PDU_OBJT_PINTYPE, "HI") => STANDARD_PIN_TYPE_HI,
+        (E_PDU_OBJT::PDU_OBJT_PINTYPE, "LOW") => STANDARD_PIN_TYPE_LOW,
         // An unrecognized (object type, shortname) pair is a client error,
         // matching how a real D-PDU DLL's PDUGetObjectId rejects an unknown
         // shortname (PDU_ERR_INVALID_PARAMETERS) rather than silently

@@ -224,7 +224,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-232](ADR-232-linux-support-scope-and-minimum-glibc.md) | Linux Support Scope and Minimum glibc 2.17 | Accepted | design 2 / 7.1.2 / 12.1 / 17, `worker-linux` CI job |
 | [ADR-233](ADR-233-diag-ir-vm-execution-semantics.md) | diag-ir VM Execution Semantics | Accepted (item 3's `VmState` fields removed by ADR-245; `Op::Fail` and `StepOutcome::Failed` appended by ADR-280) | `diag-ir` VM |
 | [ADR-234](ADR-234-sim-vci-flow-control-filter-model.md) | sim-vci Flow-Control Filter Model | Accepted | `sim-vci` filters, writes, reads, IOCTLs |
-| [ADR-235](ADR-235-agent-job-runner-and-worker-diag-host.md) | Agent Job Runner and the Worker-Backed DiagHost | Accepted (item 8 relaxed for debug builds against `sim-vci` by ADR-247; item 3's lost VCI told apart by ADR-289; item 2's `ReadDtc` request building, item 3's UDS response patterns and item 8's single UDS allowlist superseded by ADR-309) | `agent` runner, host, link |
+| [ADR-235](ADR-235-agent-job-runner-and-worker-diag-host.md) | Agent Job Runner and the Worker-Backed DiagHost | Accepted (item 8 relaxed for debug builds against `sim-vci` by ADR-247; item 3's lost VCI told apart by ADR-289; item 2's `ReadDtc` request building, item 3's UDS response patterns and item 8's single UDS allowlist superseded by ADR-309; item 4's protocol name superseded by ADR-319) | `agent` runner, host, link |
 | [ADR-236](ADR-236-time-series-scale-and-raw-response-storage.md) | Time-Series Scale and Raw-Response Storage | Accepted | design 4.3 / 4.6 / 10.3 / 17, `dataset_chunks.chunk_format` |
 | [ADR-237](ADR-237-regulatory-scope-access-routes-without-tool-certification.md) | Regulatory Scope: Use the Access Routes Regulations Open, Without Tool Certification | Accepted | design 8.1 / 9.2 / 16.1 / 16.2 / 17, `db/` retention |
 | [ADR-238](ADR-238-sim-vci-control-commands-and-device-loss.md) | sim-vci Control Commands and Device Loss | Accepted (the VCI crash consequence settled by ADR-292: a crashed VCI fails every call with `ERR_FAILED`) | `sim-vci` control export and directory, `ERR_DEVICE_NOT_CONNECTED` |
@@ -308,6 +308,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-316](ADR-316-the-vm-decodes-response-fields-through-the-declaration-part.md) | The VM Decodes Response Fields Through the Declaration Part | Accepted (the runner's stepping without declarations superseded by ADR-318) | `diag-ir` VM (`Op::DecodeField`, `Vm::step_with_declarations`, `IR_SCHEMA_VERSION` 11), `agent` policy and journal, design 8.2.4; ADR-233, ADR-297 |
 | [ADR-317](ADR-317-a-diag-request-response-is-its-bytes-at-run-time.md) | A `diag.request` Response Is Its Bytes at Run Time | Accepted | `diag-frontend` Starlark lowering, Starlark subset 3.2 and 3.4, design 8.4; ADR-313 item 5, ADR-309 item 4 |
 | [ADR-318](ADR-318-a-job-carries-its-variants-document.md) | A Job Carries Its Variant's Document | Accepted | `agent` job runner (`Job`, `check_job`, `ngr-agent run --document`), `diag_ir::check_decode_fields`, design 8.2.4; ADR-316, ADR-307 |
+| [ADR-319](ADR-319-the-agent-names-a-links-resource-by-iso-22900-2-short-names.md) | The Agent Names a Link's Resource by ISO 22900-2 (2022) Short Names | Accepted | `agent` link (`resource_data`), `iso22900-mock` short names, design 8.2.4; ADR-235 item 4, ADR-069 |
 
 ## Status Legend
 
@@ -661,7 +662,7 @@ the predecessor repository these ADRs came from.
 ### Write Jobs & Resume
 - ADR-229 (item 1's `recovery_required_from_step` replaced by ADR-245; item 2's failed confirmation after an accepted reset gets one passive retry since ADR-265; item 2 step 3's post-transfer completion counts only for the interrupted pass since ADR-269; item 2's identity abort is journaled as a terminal state since ADR-286)
 - ADR-233 (item 3's `VmState` fields removed by ADR-245; `Op::Fail` and `StepOutcome::Failed` appended by ADR-280)
-- ADR-235 (item 8 relaxed for debug builds against `sim-vci` by ADR-247; item 3's lost VCI told apart by ADR-289; item 2's `ReadDtc` request building, item 3's UDS response patterns and item 8's single UDS allowlist superseded by ADR-309)
+- ADR-235 (item 8 relaxed for debug builds against `sim-vci` by ADR-247; item 3's lost VCI told apart by ADR-289; item 2's `ReadDtc` request building, item 3's UDS response patterns and item 8's single UDS allowlist superseded by ADR-309; item 4's protocol name superseded by ADR-319)
 - ADR-241
 - ADR-244 (record set extended by ADR-253, ADR-261, ADR-268, ADR-272, ADR-280, ADR-286 and ADR-288; item 4's target VIN is a journal record since ADR-261, and its version being written since ADR-268; the no-lock consequence superseded by ADR-255 item 7)
 - ADR-245 (items 4 and 6 amended by ADR-250)
@@ -726,6 +727,7 @@ the predecessor repository these ADRs came from.
 - ADR-316 (the runner's stepping without declarations superseded by ADR-318)
 - ADR-317
 - ADR-318
+- ADR-319
 
 ### Acquired Data & Monitoring
 - ADR-236

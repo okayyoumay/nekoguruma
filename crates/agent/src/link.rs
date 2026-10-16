@@ -8,9 +8,9 @@ use vci_service_interface::{
     DestroyComLogicalLinkRequest, DisconnectComLogicalLinkRequest, EcuUniqueRespData,
     EventNotification, GetModuleIdsRequest, GetObjectIdRequest, GetResourceIdsRequest,
     ModuleConnectRequest, ModuleDisconnectRequest, ModuleHandle, ObjectType, ParamItem,
-    PduParamClass, ResourceData, SetComParamRequest, SetUniqueRespIdTableRequest,
+    PduParamClass, PinData, ResourceData, SetComParamRequest, SetUniqueRespIdTableRequest,
     SubscribeEventRequest, UniqueRespIdTableItem, create_com_logical_link_request, param_item,
-    resource_data, subscribe_event_request,
+    pin_data, resource_data, subscribe_event_request,
 };
 use worker_host::client::WorkerClient;
 
@@ -20,7 +20,7 @@ use crate::policy::Permission;
 /// What a job's link needs. Until procedures declare their timings, the caller fills it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinkConfig {
-    /// D-PDU protocol name, e.g. `ISO15765`.
+    /// ISO 22900-2 (2022) protocol short name (Annex B.1), e.g. [`PROTOCOL_UDS_ON_CAN`].
     pub protocol_short_name: String,
     pub baud_rate: u32,
     /// Physical request CAN ID (tester to ECU).
@@ -40,7 +40,7 @@ impl LinkConfig {
     /// common 7E0 / 7E8 pair).
     pub fn iso15765(tx_id: u32, rx_id: u32) -> Self {
         Self {
-            protocol_short_name: PROTOCOL_ISO15765.to_owned(),
+            protocol_short_name: PROTOCOL_UDS_ON_CAN.to_owned(),
             baud_rate: 500_000,
             tx_id,
             rx_id,
@@ -56,11 +56,11 @@ impl LinkConfig {
     /// [`MAX_TIMING_MS`] does not fit the worker's microsecond ComParams.
     pub fn validate(&self) -> Result<(), HostError> {
         // The read-only policy judges UDS service IDs, and the link set-up (flow-control table,
-        // response pending handling) is for UDS on the `ISO15765` protocol. On any other, raw
-        // CAN for example, the same bytes would not be UDS requests.
-        if self.protocol_short_name != PROTOCOL_ISO15765 {
+        // response pending handling) is for UDS on CAN. On any other protocol, raw CAN for
+        // example, the same bytes would not be UDS requests.
+        if self.protocol_short_name != PROTOCOL_UDS_ON_CAN {
             return Err(HostError::Setup(
-                "only the ISO15765 protocol (UDS on CAN) is supported",
+                "only the ISO_14229_3_on_ISO_15765_2 protocol (UDS on CAN) is supported",
             ));
         }
         for timing in [self.p2_max_ms, self.p2_star_ms, self.rc78_completion_ms] {
@@ -90,8 +90,14 @@ impl LinkConfig {
     }
 }
 
-/// The one protocol the runner supports.
-pub const PROTOCOL_ISO15765: &str = "ISO15765";
+/// The one protocol the runner supports: UDS on CAN, by its ISO 22900-2 (2022) short name
+/// (Annex B.1). Both worker kinds resolve the link's resource from the standard names (ADR-319).
+pub const PROTOCOL_UDS_ON_CAN: &str = "ISO_14229_3_on_ISO_15765_2";
+/// The bus type of UDS on CAN: dual-wire high-speed CAN (ISO 22900-2 (2022) Annex B.1).
+pub const BUS_TYPE_DWCAN: &str = "ISO_11898_2_DWCAN";
+/// The DLC pins of dual-wire CAN and their pin types (ISO 22900-2 (2022) Annex B.2): CAN high
+/// on pin 6, CAN low on pin 14.
+pub const DWCAN_PINS: [(u32, &str); 2] = [(6, "HI"), (14, "LOW")];
 
 /// Longest timing the worker's microsecond ComParams can hold.
 pub const MAX_TIMING_MS: u32 = u32::MAX / 1_000;
@@ -302,6 +308,26 @@ async fn vci_permission(
     Permission::ReadOnly
 }
 
+/// The resource a link is created on, by the ISO 22900-2 (2022) short names of its protocol,
+/// bus type and DLC pins (10.1.4.8), which both worker kinds resolve (ADR-319).
+pub fn resource_data(config: &LinkConfig) -> ResourceData {
+    ResourceData {
+        bus_type: Some(resource_data::BusType::BusTypeName(
+            BUS_TYPE_DWCAN.to_owned(),
+        )),
+        protocol: Some(resource_data::Protocol::ProtocolName(
+            config.protocol_short_name.clone(),
+        )),
+        dlc_pin_data: DWCAN_PINS
+            .iter()
+            .map(|&(dlc_pin_number, pin_type)| PinData {
+                dlc_pin_number,
+                dlc_pin_type: Some(pin_data::DlcPinType::DlcPinTypeName(pin_type.to_owned())),
+            })
+            .collect(),
+    }
+}
+
 async fn create_link(
     client: &mut WorkerClient,
     config: &LinkConfig,
@@ -313,13 +339,7 @@ async fn create_link(
         "GetResourceIds",
         client.get_resource_ids(GetResourceIdsRequest {
             module_handle: Some(module_handle),
-            resource_data: Some(ResourceData {
-                dlc_pin_data: vec![],
-                bus_type: None,
-                protocol: Some(resource_data::Protocol::ProtocolName(
-                    config.protocol_short_name.clone(),
-                )),
-            }),
+            resource_data: Some(resource_data(config)),
         }),
     )
     .await?

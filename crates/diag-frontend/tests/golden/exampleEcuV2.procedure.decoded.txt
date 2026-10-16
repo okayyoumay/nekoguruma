@@ -1,0 +1,278 @@
+extendedSession [50 03 00 32 01 F4]
+Ok(
+    [
+        DecodedField {
+            id: 3,
+            short_name: "p2ServerMax",
+            value: Unsigned(
+                50,
+            ),
+            text_id: 0,
+            unit_id: 2,
+        },
+        DecodedField {
+            id: 4,
+            short_name: "p2StarServerMax",
+            value: Float(
+                5000.0,
+            ),
+            text_id: 0,
+            unit_id: 2,
+        },
+    ],
+)
+vin.read [62 F1 90 57 56 57 5A 5A 5A 31 4A 5A 58 57 30 30 30 30 30 31]
+Ok(
+    [
+        DecodedField {
+            id: 23,
+            short_name: "vin",
+            value: Text(
+                "WVWZZZ1JZXW000001",
+            ),
+            text_id: 0,
+            unit_id: 0,
+        },
+    ],
+)
+activeSession.read [62 F1 86 03]
+Ok(
+    [
+        DecodedField {
+            id: 20,
+            short_name: "session",
+            value: Unsigned(
+                3,
+            ),
+            text_id: 3,
+            unit_id: 0,
+        },
+    ],
+)
+activeSession.read [62 F1 86 7F]
+Ok(
+    [
+        DecodedField {
+            id: 20,
+            short_name: "session",
+            value: Unsigned(
+                127,
+            ),
+            text_id: 6,
+            unit_id: 0,
+        },
+    ],
+)
+softwareVersion.read [62 F1 89 31 2E 30 2E 31]
+Ok(
+    [
+        DecodedField {
+            id: 22,
+            short_name: "softwareVersion",
+            value: Text(
+                "1.0.1",
+            ),
+            text_id: 0,
+            unit_id: 0,
+        },
+    ],
+)
+flashState.read [62 FD 00 02 00 00 00 05 00 01 00 00]
+Ok(
+    [
+        DecodedField {
+            id: 24,
+            short_name: "phase",
+            value: Unsigned(
+                2,
+            ),
+            text_id: 0,
+            unit_id: 0,
+        },
+        DecodedField {
+            id: 25,
+            short_name: "blockNumber",
+            value: Unsigned(
+                5,
+            ),
+            text_id: 0,
+            unit_id: 0,
+        },
+        DecodedField {
+            id: 26,
+            short_name: "bytesReceived",
+            value: Unsigned(
+                65536,
+            ),
+            text_id: 0,
+            unit_id: 0,
+        },
+    ],
+)
+powerCycles.read [62 FD 01 00 00 04 D2]
+Ok(
+    [
+        DecodedField {
+            id: 27,
+            short_name: "powerCycles",
+            value: Unsigned(
+                1234,
+            ),
+            text_id: 0,
+            unit_id: 0,
+        },
+    ],
+)
+lastResetReason.read [62 FD 03 01]
+Ok(
+    [
+        DecodedField {
+            id: 30,
+            short_name: "reason",
+            value: Unsigned(
+                1,
+            ),
+            text_id: 0,
+            unit_id: 0,
+        },
+        DecodedField {
+            id: 31,
+            short_name: "details",
+            value: Select {
+                case: Some(
+                    0,
+                ),
+                fields: [],
+            },
+            text_id: 0,
+            unit_id: 0,
+        },
+    ],
+)
+lastResetReason.read [62 FD 03 02 07 00 01 23 45]
+Ok(
+    [
+        DecodedField {
+            id: 30,
+            short_name: "reason",
+            value: Unsigned(
+                2,
+            ),
+            text_id: 0,
+            unit_id: 0,
+        },
+        DecodedField {
+            id: 31,
+            short_name: "details",
+            value: Select {
+                case: Some(
+                    1,
+                ),
+                fields: [
+                    DecodedField {
+                        id: 32,
+                        short_name: "taskId",
+                        value: Unsigned(
+                            7,
+                        ),
+                        text_id: 0,
+                        unit_id: 0,
+                    },
+                    DecodedField {
+                        id: 33,
+                        short_name: "programCounter",
+                        value: Unsigned(
+                            74565,
+                        ),
+                        text_id: 0,
+                        unit_id: 0,
+                    },
+                ],
+            },
+            text_id: 0,
+            unit_id: 0,
+        },
+    ],
+)
+readDtcByStatusMask [59 02 FF 01 23 45 09 C0 FF EE 28]
+Ok(
+    [
+        DecodedField {
+            id: 8,
+            short_name: "availabilityMask",
+            value: Unsigned(
+                255,
+            ),
+            text_id: 0,
+            unit_id: 0,
+        },
+        DecodedField {
+            id: 9,
+            short_name: "records",
+            value: Repeat(
+                [
+                    [
+                        DecodedField {
+                            id: 10,
+                            short_name: "dtc",
+                            value: Unsigned(
+                                74565,
+                            ),
+                            text_id: 0,
+                            unit_id: 0,
+                        },
+                        DecodedField {
+                            id: 11,
+                            short_name: "status",
+                            value: Unsigned(
+                                9,
+                            ),
+                            text_id: 0,
+                            unit_id: 0,
+                        },
+                    ],
+                    [
+                        DecodedField {
+                            id: 10,
+                            short_name: "dtc",
+                            value: Unsigned(
+                                12648430,
+                            ),
+                            text_id: 0,
+                            unit_id: 0,
+                        },
+                        DecodedField {
+                            id: 11,
+                            short_name: "status",
+                            value: Unsigned(
+                                40,
+                            ),
+                            text_id: 0,
+                            unit_id: 0,
+                        },
+                    ],
+                ],
+            ),
+            text_id: 0,
+            unit_id: 0,
+        },
+    ],
+)
+vin.write [6E F1 90]
+Ok(
+    [],
+)
+supplyVoltage.read [62 FD 02 00 89]
+Ok(
+    [
+        DecodedField {
+            id: 28,
+            short_name: "supplyVoltage",
+            value: Float(
+                13.7,
+            ),
+            text_id: 0,
+            unit_id: 1,
+        },
+    ],
+)

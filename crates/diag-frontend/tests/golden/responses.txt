@@ -1,0 +1,14 @@
+# Positive responses the IR golden test decodes, one per line: the variant (or * for every
+# variant), the service's short name, and the response bytes in hex, SID first.
+* extendedSession 50 03 00 32 01 F4
+* vin.read 62 F1 90 57 56 57 5A 5A 5A 31 4A 5A 58 57 30 30 30 30 30 31
+* activeSession.read 62 F1 86 03
+* activeSession.read 62 F1 86 7F
+* softwareVersion.read 62 F1 89 31 2E 30 2E 31
+* flashState.read 62 FD 00 02 00 00 00 05 00 01 00 00
+* powerCycles.read 62 FD 01 00 00 04 D2
+* lastResetReason.read 62 FD 03 01
+* lastResetReason.read 62 FD 03 02 07 00 01 23 45
+* readDtcByStatusMask 59 02 FF 01 23 45 09 C0 FF EE 28
+* vin.write 6E F1 90
+exampleEcuV2 supplyVoltage.read 62 FD 02 00 89

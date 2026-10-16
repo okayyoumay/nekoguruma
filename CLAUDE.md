@@ -159,6 +159,10 @@ its worker with `taskkill` there. Pull requests also leave out the agent's `runn
 Windows: they are most of the job's time, the runner has no Windows-specific code, and
 `core-linux` runs them. main runs every test on Windows.
 
+A change to the IR, to `diag-frontend`'s conversion or lowering, or to the example ECU changes
+the IR golden files (`crates/diag-frontend/tests/golden/`, design 12.1): record an intended change
+with `NGR_UPDATE_GOLDEN=1 cargo test -p diag-frontend --test golden` and review the diff.
+
 CI (`.github/workflows/ci.yml`) also checks the worker crates for six targets and runs
 `scripts/abi-roundtrip.sh`, which launches `j2534-0404-service` against `sim-vci` built in debug
 for a worker target (Linux ARM under qemu-user, Windows on a Windows runner) with the ABI table's

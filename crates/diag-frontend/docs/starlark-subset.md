@@ -675,4 +675,4 @@ names them at the end of its hint (`(in variant V1)`, `(in variants V1, V2)`).
 confirm that the generated IR instruction sequences match. This directly verifies
 replaceability (8.2).
 
-**Golden tests**: Keep pairs of Starlark source and expected bytecode to detect regressions.
+**Golden tests**: Keep pairs of Starlark source and expected bytecode to detect regressions. `tests/golden.rs` lowers `tests/golden/procedure.star` for each variant of the example ECU and compares the program, as part of the IR, and the requests it sends with the expected files in `tests/golden/`; run it with `NGR_UPDATE_GOLDEN=1` to record an intended change, and review the diff.

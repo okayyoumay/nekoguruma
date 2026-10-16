@@ -553,10 +553,13 @@ the constants only as prefix bytes, so the conversion hands the lowering an inde
 variant's services with their request constants by name and value; a call that selects no
 service, or more than one, is rejected (`STAR_UNKNOWN_SERVICE`, ADR-313).
 `diag.security_access` needs no declared service: the host builds its requests and reads the
-seed from the response itself (subset spec 3.2). Under ADR-309 the seed and key requests come from the application-layer profile instead, and `diag.read_dtc` is lowered through the profile into a declared service rather than sent by the host. `diag.read_dtc(mask)` sends ReadDTCInformation with sub-function
-0x02 and the mask (ADR-235 item 2), so its response is decoded through the variant's service that
-describes that request: SID 0x19, one 1-byte constant 0x02 and one other request field, a
-`fixed` 8-bit `uint`, so that every mask from 0x00 to 0xFF is a value of it. A procedure that reads `fields` from a `read_dtc` result in a variant without exactly one
+seed from the response itself (subset spec 3.2). Under ADR-309 the seed and key requests come from the application-layer profile instead, and `diag.read_dtc` is lowered through the profile into a declared service rather than sent by the host. Until then
+`diag.read_dtc(mask)` sends ReadDTCInformation with sub-function 0x02 and the mask (ADR-235 item
+2), so its response is decoded through the variant's service that describes that request: SID
+0x19, one 1-byte constant 0x02 and one other request field, a `fixed` 8-bit `uint`, so that every
+mask from 0x00 to 0xFF is a value of it. A profile states this rule as a request template whose
+parts select the declared service by value and position, the same matching as this section's,
+without relying on the names a definition gives its constants (ADR-314). A procedure that reads `fields` from a `read_dtc` result in a variant without exactly one
 such service is rejected at ingestion, like any `fields` key the declaration part does not
 define (subset spec 3.4); `raw`, `ok` and `nrc` need no service. Service selection happens at ingestion, so a `params` value for a
 key that names a constant must be a constant expression; a value known only at run time is

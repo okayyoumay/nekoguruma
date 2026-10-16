@@ -48,18 +48,19 @@ shared names.
    other than `7F`, the service identifier and the code, and a pending code outside 0x78, 0x21 and
    0x23 (ADR-309 item 5), and it checks that every call can be lowered: each intent at most once;
    constants and arguments of whole bytes, at most 64 bits, constants fitting their width, and an
-   argument that runs to the end of the request last; each call argument used exactly once and
-   only by its own call, with only a routine's identifier and sub-function selecting a service;
-   `params` once and last for `diag.routine`; `RoutineControl` only for `diag.routine` with the
-   sub-function and the 16-bit routine identifier first (the instruction sends them itself); for
-   `diag.security_access`, one key step that sends nothing and directly follows the step whose
-   undeclared response gives the seed, and a key used only after it; and the results of item 4:
-   one DTC map with two different positions for `diag.read_dtc`, declared names on the last,
-   declared step of `diag.routine` only.
-   Profiles ship with the frontend, so a profile that fails is a programming error caught by a
-   test over every shipped profile, not an ingestion error; ingestion errors concern only a
-   variant (an intent its profile lacks, no single declared service, a declared response that
-   does not fit the map).
+   argument that runs to the end of the request last; each call argument used exactly once and only
+   by its own call, with only a routine's identifier and sub-function selecting a service; `params`
+   once and last for `diag.routine`; `RoutineControl` only for `diag.routine` of the UDS profile,
+   with SID 0x31 and the sub-function and the 16-bit routine identifier first (the instruction
+   sends UDS's request itself, ADR-309 item 4); for `diag.security_access`, one key step that sends
+   nothing and directly follows the step whose undeclared response gives the seed, the level on
+   that seed request, and the level plus one and the key only after the key step; and the results
+   of item 4: one DTC map with two different positions for `diag.read_dtc`, declared names on the
+   last, declared step of `diag.routine` only. A test also checks that no two shipped profiles name
+   the same layer. Profiles ship with the frontend, so a profile that fails is a programming error
+   caught by a test over every shipped profile, not an ingestion error; ingestion errors concern
+   only a variant (an intent its profile lacks, no single declared service, a declared response
+   that does not fit the map).
 
 ## Consequences
 

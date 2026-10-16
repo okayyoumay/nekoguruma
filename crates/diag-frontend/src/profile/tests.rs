@@ -96,7 +96,7 @@ const SECURITY_ACCESS: Call = Call {
 };
 
 const UDS_LIKE: Profile = Profile {
-    layer: "UDS",
+    layer: UDS,
     calls: &[READ_DTC, ROUTINE, SECURITY_ACCESS],
     negative: NEGATIVE_7F,
     pending: &[0x78],
@@ -108,7 +108,9 @@ fn every_shipped_profile_is_valid() {
         profile
             .validate()
             .unwrap_or_else(|e| panic!("{}: {e}", profile.layer));
-        assert_eq!(get(profile.layer).map(|p| p.layer), Some(profile.layer));
+        // One profile per layer: a second of the same name would be unreachable.
+        let found = get(profile.layer).expect("found by its layer");
+        assert!(std::ptr::eq(found, *profile), "{} twice", profile.layer);
     }
     assert!(get("no such layer").is_none());
 }
@@ -641,5 +643,59 @@ fn the_key_step_follows_the_seed_and_sends_nothing() {
             )],
         ),
         Err(ProfileError::StepKind(Intent::ReadDtc))
+    );
+}
+
+#[test]
+fn the_levels_go_with_the_seed_and_the_key_requests() {
+    let i = Intent::SecurityAccess;
+    // `level + 1` on the seed request and `level` on the key request.
+    let mut seed = seed_step();
+    seed.request.parts = leak(vec![Part::Arg {
+        bits: 8,
+        arg: Source::LevelPlusOne,
+    }]);
+    let mut send_key = send_key_step();
+    send_key.request.parts = leak(vec![
+        Part::Arg {
+            bits: 8,
+            arg: Source::Level,
+        },
+        Part::Arg {
+            bits: 0,
+            arg: Source::Key,
+        },
+    ]);
+    assert_eq!(
+        security(vec![seed, key_step(0), send_key]),
+        Err(ProfileError::SourceOutOfPlace(i, Source::LevelPlusOne))
+    );
+}
+
+#[test]
+fn routine_control_serves_only_uds_routine_control() {
+    let routine = |sid| Call {
+        intent: Intent::Routine,
+        steps: leak(vec![step(
+            StepKind::RoutineControl,
+            sid,
+            ROUTINE_REQUEST.parts.to_vec(),
+            true,
+            ResultMap::Declared,
+        )]),
+    };
+    let profile = |layer, sid| Profile {
+        layer,
+        calls: leak(vec![routine(sid)]),
+        ..UDS_LIKE
+    };
+    assert_eq!(profile(UDS, 0x31).validate(), Ok(()));
+    assert_eq!(
+        profile(UDS, 0x32).validate(),
+        Err(ProfileError::StepKind(Intent::Routine))
+    );
+    assert_eq!(
+        profile("KWP2000", 0x31).validate(),
+        Err(ProfileError::StepKind(Intent::Routine))
     );
 }

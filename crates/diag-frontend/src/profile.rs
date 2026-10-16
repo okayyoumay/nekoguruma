@@ -17,6 +17,9 @@ pub fn get(layer: &str) -> Option<&'static Profile> {
     ALL.iter().copied().find(|profile| profile.layer == layer)
 }
 
+/// The name of the UDS application layer, the only one `RoutineControl` serves (ADR-309 item 4).
+pub const UDS: &str = "UDS";
+
 /// The response-pending codes a profile may use: those the workers absorb (ADR-309 item 5).
 pub const PENDING_CODES: [u8; 3] = [0x78, 0x21, 0x23];
 
@@ -208,6 +211,8 @@ pub enum ProfileError {
     RestNotLast(Intent),
     #[error("{}: {:?} is in the wrong kind of part (only the routine's identifier and sub-function select)", .0.name(), .1)]
     PartForSource(Intent, Source),
+    #[error("{}: {:?} is not in the step that sends it (the seed request, or the key request)", .0.name(), .1)]
+    SourceOutOfPlace(Intent, Source),
     #[error("{}: the key is used before the step that makes it", .0.name())]
     KeyBeforeKeyStep(Intent),
     #[error("{}: a step's kind does not fit the call", .0.name())]
@@ -240,14 +245,14 @@ impl Profile {
             if self.calls[..i].iter().any(|c| c.intent == call.intent) {
                 return Err(ProfileError::IntentTwice(call.intent));
             }
-            call.validate()?;
+            call.validate(self.layer)?;
         }
         Ok(())
     }
 }
 
 impl Call {
-    fn validate(&self) -> Result<(), ProfileError> {
+    fn validate(&self, layer: &str) -> Result<(), ProfileError> {
         let intent = self.intent;
         let Some(last) = self.steps.last() else {
             return Err(ProfileError::NoStep(intent));
@@ -259,8 +264,11 @@ impl Call {
         for (at, step) in self.steps.iter().enumerate() {
             let kind_fits = match step.kind {
                 StepKind::SendReceive => true,
+                // The instruction sends UDS's RoutineControl request itself.
                 StepKind::RoutineControl => {
                     intent == Intent::Routine
+                        && layer == UDS
+                        && step.request.sid == 0x31
                         && matches!(
                             step.request.parts,
                             [
@@ -355,6 +363,15 @@ impl Call {
                         }
                         if arg == Source::Key && key_step.is_none() {
                             return Err(ProfileError::KeyBeforeKeyStep(intent));
+                        }
+                        // The seed is requested with `level`, the key sent with `level + 1`.
+                        let in_place = match arg {
+                            Source::Level => matches!(step.result, ResultMap::Seed { .. }),
+                            Source::LevelPlusOne => key_step.is_some(),
+                            _ => true,
+                        };
+                        if !in_place {
+                            return Err(ProfileError::SourceOutOfPlace(intent, arg));
                         }
                         used.push(arg);
                     }

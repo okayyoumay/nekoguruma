@@ -1,7 +1,7 @@
 //! IR schema, bytecode definitions and VM. Shared by the server and the agent (8.2).
 //!
 //! - Declaration part: FlatBuffers (`schema/ir.fbs`), read through [`declaration`]; responses
-//!   are decoded with it by [`decode`]. This file handles the procedure part.
+//!   are decoded with it by [`decode`], and request operands encoded by [`encode`]. This file handles the procedure part.
 //! - Procedure part: custom bytecode VM. The entire execution state must be serializable (8.2.3).
 
 // The FlatBuffers bindings of the declaration part name `alloc::` paths (`declaration`).
@@ -9,6 +9,7 @@ extern crate alloc;
 
 pub mod declaration;
 pub mod decode;
+pub mod encode;
 mod recovery;
 
 pub use recovery::*;

@@ -374,11 +374,16 @@ table FlashSession {
 // ---------------------------------------------------------------- ECU variants
 
 // Variant identification (equivalent to ECU-VARIANT-PATTERN).
-// Runs identification services and selects the variant whose responses match (integrated into the pre-check in 8.9.1).
+// Runs identification services and selects the variant whose responses match (integrated into the pre-check in 8.9.1;
+// `decode::select_variant`, ADR-315).
 table VariantPattern {
   service_id: uint32;       // identification service to run
   field_id: uint32;         // field to compare
   expected: [uint8];        // expected value, compared with the decoded field (ADR-306)
+  // The pattern this matching parameter belongs to (ADR-315): the entries of one variant with
+  // the same number form one pattern, which matches when all of them match; the variant
+  // matches when any of its patterns does.
+  pattern: uint16;
 }
 
 table EcuVariant {

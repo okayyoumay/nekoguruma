@@ -332,6 +332,52 @@ fn variant_patterns_name_the_service_and_field() {
 }
 
 #[test]
+fn variant_patterns_carry_their_pattern_numbers() {
+    // Two patterns for V1: the version and the power cycles together, or the VIN alone. A row
+    // without a number belongs to pattern 1.
+    let files = with(
+        example(),
+        "variant_patterns.csv",
+        "variant,service,field,expected,pattern\n\
+         exampleEcuV1,softwareVersion.read,softwareVersion,31 2E,\n\
+         exampleEcuV1,vin.read,vin,57,2\n\
+         exampleEcuV1,powerCycles.read,powerCycles,05,1\n\
+         exampleEcuV2,softwareVersion.read,softwareVersion,32 2E,7\n",
+    );
+    let documents = documents(&convert(files));
+    let numbers = |document: &EcuDocumentT| -> Vec<u16> {
+        variant(document)
+            .patterns
+            .iter()
+            .flatten()
+            .map(|p| p.pattern)
+            .collect()
+    };
+    // In row order: a pattern's rows need not be adjacent.
+    assert_eq!(numbers(&documents[0]), [1, 2, 1]);
+    assert_eq!(numbers(&documents[1]), [7]);
+}
+
+#[test]
+fn a_pattern_number_is_from_1_to_65535() {
+    for number in ["0", "65536", "x"] {
+        let files = with(
+            example(),
+            "variant_patterns.csv",
+            &format!(
+                "variant,service,field,expected,pattern\n\
+                 exampleEcuV1,softwareVersion.read,softwareVersion,31,{number}\n"
+            ),
+        );
+        let rejected = crate::tables::read_files(files).expect_err(number);
+        assert!(
+            format!("{rejected:?}").contains("pattern"),
+            "{number}: {rejected:?}"
+        );
+    }
+}
+
+#[test]
 fn a_bcd_pattern_expects_the_number_its_digits_spell() {
     // `powerCycles` is made a 64-bit BCD field: the digits 12 34 are written as 1234, and the
     // sixteen digits it holds at most still fit (ADR-306).

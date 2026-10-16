@@ -6578,6 +6578,7 @@ impl<'a> VariantPattern<'a> {
   pub const VT_SERVICE_ID: ::flatbuffers::VOffsetT = 4;
   pub const VT_FIELD_ID: ::flatbuffers::VOffsetT = 6;
   pub const VT_EXPECTED: ::flatbuffers::VOffsetT = 8;
+  pub const VT_PATTERN: ::flatbuffers::VOffsetT = 10;
 
   #[inline]
   pub unsafe fn init_from_table(table: ::flatbuffers::Table<'a>) -> Self {
@@ -6592,6 +6593,7 @@ impl<'a> VariantPattern<'a> {
     if let Some(x) = args.expected { builder.add_expected(x); }
     builder.add_field_id(args.field_id);
     builder.add_service_id(args.service_id);
+    builder.add_pattern(args.pattern);
     builder.finish()
   }
 
@@ -6601,10 +6603,12 @@ impl<'a> VariantPattern<'a> {
     let expected = self.expected().map(|x| {
       x.into_iter().collect()
     });
+    let pattern = self.pattern();
     VariantPatternT {
       service_id,
       field_id,
       expected,
+      pattern,
     }
   }
 
@@ -6629,6 +6633,13 @@ impl<'a> VariantPattern<'a> {
     // which contains a valid value in this slot
     unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'a, u8>>>(VariantPattern::VT_EXPECTED, None)}
   }
+  #[inline]
+  pub fn pattern(&self) -> u16 {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<u16>(VariantPattern::VT_PATTERN, Some(0)).unwrap()}
+  }
 }
 
 impl ::flatbuffers::Verifiable for VariantPattern<'_> {
@@ -6640,6 +6651,7 @@ impl ::flatbuffers::Verifiable for VariantPattern<'_> {
      .visit_field::<u32>("service_id", Self::VT_SERVICE_ID, false)?
      .visit_field::<u32>("field_id", Self::VT_FIELD_ID, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, u8>>>("expected", Self::VT_EXPECTED, false)?
+     .visit_field::<u16>("pattern", Self::VT_PATTERN, false)?
      .finish();
     Ok(())
   }
@@ -6648,6 +6660,7 @@ pub struct VariantPatternArgs<'a> {
     pub service_id: u32,
     pub field_id: u32,
     pub expected: Option<::flatbuffers::WIPOffset<::flatbuffers::Vector<'a, u8>>>,
+    pub pattern: u16,
 }
 impl<'a> Default for VariantPatternArgs<'a> {
   #[inline]
@@ -6656,6 +6669,7 @@ impl<'a> Default for VariantPatternArgs<'a> {
       service_id: 0,
       field_id: 0,
       expected: None,
+      pattern: 0,
     }
   }
 }
@@ -6678,6 +6692,10 @@ impl<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> VariantPatternBuilder<'a, 'b,
     self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(VariantPattern::VT_EXPECTED, expected);
   }
   #[inline]
+  pub fn add_pattern(&mut self, pattern: u16) {
+    self.fbb_.push_slot::<u16>(VariantPattern::VT_PATTERN, pattern, 0);
+  }
+  #[inline]
   pub fn new(_fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>) -> VariantPatternBuilder<'a, 'b, A> {
     let start = _fbb.start_table();
     VariantPatternBuilder {
@@ -6698,6 +6716,7 @@ impl ::core::fmt::Debug for VariantPattern<'_> {
       ds.field("service_id", &self.service_id());
       ds.field("field_id", &self.field_id());
       ds.field("expected", &self.expected());
+      ds.field("pattern", &self.pattern());
       ds.finish()
   }
 }
@@ -6707,6 +6726,7 @@ pub struct VariantPatternT {
   pub service_id: u32,
   pub field_id: u32,
   pub expected: Option<alloc::vec::Vec<u8>>,
+  pub pattern: u16,
 }
 impl Default for VariantPatternT {
   fn default() -> Self {
@@ -6714,6 +6734,7 @@ impl Default for VariantPatternT {
       service_id: 0,
       field_id: 0,
       expected: None,
+      pattern: 0,
     }
   }
 }
@@ -6727,10 +6748,12 @@ impl VariantPatternT {
     let expected = self.expected.as_ref().map(|x|{
       _fbb.create_vector(x)
     });
+    let pattern = self.pattern;
     VariantPattern::create(_fbb, &VariantPatternArgs{
       service_id,
       field_id,
       expected,
+      pattern,
     })
   }
 }

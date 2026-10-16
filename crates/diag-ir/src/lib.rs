@@ -27,7 +27,9 @@ use serde::{Deserialize, Serialize};
 /// 8: `Op` gained `Slice`, for the same reason.
 /// 9: `Op` gained `IntToFloat` and `FloatToInt`, for the same reason; `VmError` gained
 /// `FloatNotConvertible`.
-pub const IR_SCHEMA_VERSION: u32 = 9;
+/// 10: `VariantPattern` gained `pattern`, which groups a variant's matching parameters into
+/// patterns (ADR-315); a document of version 9 would read every entry as one pattern.
+pub const IR_SCHEMA_VERSION: u32 = 10;
 
 /// The longest code, in bytes, that `Program::validate` accepts for a `Fail` (ADR-280).
 pub const MAX_FAILURE_CODE_LEN: usize = 128;

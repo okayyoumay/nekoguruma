@@ -159,8 +159,16 @@ Variant identification (design 8.9.1), one `VariantPattern` per row, in row orde
 | `service` | service name | yes | A service in that variant's document, including generated ones (`softwareVersion.read`) |
 | `field` | name | yes | A scalar field at the top of that service's positive response: not a constant (5.3), not shaped and not inside a nested layout (5.4), not a `float` and without a numeric conversion |
 | `expected` | bytes | yes | `VariantPattern.expected`, compared with the field's decoded value as below |
+| `pattern` | integer, 1 to 65535 | no | `VariantPattern.pattern`, default 1: the rows of one variant with the same number form one pattern |
 
-A pattern compares `expected` with the value the field decodes to, not with the bytes on the wire
+A variant's rows are grouped into patterns by `pattern` (ADR-315, after ISO 22901-1 (2008)
+7.4.3). A pattern matches when every one of its rows matches, a variant is identified when any of
+its patterns matches, and a variant without rows is never identified. The variants are tried in
+rising order of their names, and the first that matches is selected, so patterns of different
+variants should not overlap; prefix matching makes `31 2E 32` (text `1.2`) also match `1.20`. A row whose service gave no positive response does not match. Without the
+column, all of a variant's rows form one pattern.
+
+Each row compares `expected` with the value the field decodes to, not with the bytes on the wire
 (ADR-306):
 
 - A `bytes` field matches when `expected` is a prefix of its bytes. An `ascii`, `utf8` or

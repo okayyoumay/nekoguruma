@@ -15,7 +15,7 @@ use thiserror::Error;
 
 use crate::declaration::{
     ByteOrder, Compu, DataKind, DtcDefinition, Field, Layout, LengthKind, Placement,
-    PositiveResponse, RepeatCount, Shape, Termination,
+    PositiveResponse, RepeatCount, Shape, Termination, VariantPattern,
 };
 
 /// The nested layouts a document's fields refer to by id: `EcuVariant.layouts`, in id order
@@ -205,6 +205,56 @@ pub enum DtcFields {
     Snapshot,
     /// `extended_fields`: the data of an extended data record.
     Extended,
+}
+
+/// Whether `pattern` matches `fields`, the decoded positive response of its service
+/// (`VariantPattern.service_id`), as ADR-306 defines it. The field `pattern.field_id` among the
+/// response's top-level fields is compared with `pattern.expected` by its decoded value:
+///
+/// - bytes: `expected` is a prefix of them;
+/// - text: `expected` is a prefix of the text's UTF-8 encoding, whatever the field's encoding;
+/// - an unsigned integer (a `Uint`, or a `Bcd` as the number its digits spell): `expected`, one
+///   to eight bytes read as a big-endian unsigned number, equals it;
+/// - a signed integer: `expected`, one to eight bytes read as a big-endian two's complement
+///   number, equals it.
+///
+/// Integers are compared after decoding, so a little-endian field's `expected` is written
+/// big-endian like any other. A text table's value is its internal value, not its text. The
+/// pattern does not match when `expected` is absent or empty, when the field is missing, when
+/// its value is a float or shaped, or when an integer's `expected` is longer than eight bytes.
+pub fn pattern_matches(pattern: &VariantPattern<'_>, fields: &[DecodedField]) -> bool {
+    let expected = pattern.expected().map_or(&[][..], |e| e.bytes());
+    // An empty prefix would match every value, which identifies nothing.
+    !expected.is_empty()
+        && fields
+            .iter()
+            .find(|field| field.id == pattern.field_id())
+            .is_some_and(|field| value_matches(expected, &field.value))
+}
+
+fn value_matches(expected: &[u8], value: &PhysicalValue) -> bool {
+    match value {
+        PhysicalValue::Bytes(bytes) => bytes.starts_with(expected),
+        PhysicalValue::Text(text) => text.as_bytes().starts_with(expected),
+        PhysicalValue::Unsigned(n) => big_endian(expected) == Some(*n),
+        PhysicalValue::Signed(n) => big_endian(expected).is_some_and(|raw| {
+            // Sign-extend from the width `expected` was written in.
+            let shift = 64 - 8 * expected.len() as u32;
+            ((raw << shift) as i64) >> shift == *n
+        }),
+        PhysicalValue::Float(_)
+        | PhysicalValue::Group(_)
+        | PhysicalValue::Repeat(_)
+        | PhysicalValue::Select { .. } => false,
+    }
+}
+
+/// `bytes` as a big-endian number; `None` unless it has one to eight bytes.
+fn big_endian(bytes: &[u8]) -> Option<u64> {
+    if bytes.is_empty() || bytes.len() > 8 {
+        return None;
+    }
+    Some(bytes.iter().fold(0, |n, &b| (n << 8) | u64::from(b)))
 }
 
 /// Decodes one of `dtc`'s field lists from `message`, with the list's layout starting at byte

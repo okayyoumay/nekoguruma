@@ -988,7 +988,7 @@ Procedure definitions in the IR declaratively carry **execution preconditions**,
 Because a failure can render an ECU unable to boot, precondition checks are strengthened.
 
 - Battery voltage, connection of a power supply unit, ignition state
-- Matching of VIN, part number and current software version via ECU variant identification (equivalent to ODX ECU-VARIANT-PATTERN)
+- Matching of VIN, part number and current software version via ECU variant identification (equivalent to ODX ECU-VARIANT-PATTERN; a pattern compares its expected bytes with the decoded value of a response field: bytes and text by prefix, integers by number, never a float, ADR-306)
 - Firmware version of the VCI itself (updates are left to the vendor's genuine tools; this system only checks it and gives guidance when incompatible)
 - Correspondence between the session configuration indicated by the flash description (equivalent to ODX-F) and the OEM-signed binary. The premise that the binary itself is "ingested exactly as provided" is maintained
 - The signature of OEM-provided flash data is normally verified by the ECU itself (falls under "verifiable only by the ECU" in 11.3). Since the agent cannot pre-verify it, this is supplemented by hash matching, and it is confirmed that the ECU does not apply partially transferred data

@@ -300,7 +300,12 @@ impl<'a> Index<'a> {
                 let mut pattern = VariantPatternT::default();
                 pattern.service_id = self.service_ids[&p.service];
                 pattern.field_id = self.field_id(&response, &p.field);
-                pattern.expected = Some(p.expected.clone());
+                let field = &tables.fields[self.fields_by_name[&(&response, p.field.as_str())]];
+                pattern.expected = Some(if field.field_type == Some(FieldType::Bcd) {
+                    bcd_number(&p.expected)
+                } else {
+                    p.expected.clone()
+                });
                 pattern
             })
             .collect();
@@ -590,6 +595,17 @@ impl<'a> Index<'a> {
     pub(super) fn text_id(&self, key: Option<&str>) -> u32 {
         key.map_or(0, |key| self.text_ids[key])
     }
+}
+
+/// The number that BCD digits spell, as the big-endian bytes a pattern compares it with
+/// (ADR-306), in eight bytes: the digits `12 34` become 1234, `00 00 00 00 00 00 04 D2`. The
+/// table check has kept the digits to at most eight bytes, which spell less than 2^64, and each
+/// digit to 0 to 9.
+fn bcd_number(digits: &[u8]) -> Vec<u8> {
+    let number = digits.iter().fold(0u64, |n, &b| {
+        n * 100 + u64::from(b >> 4) * 10 + u64::from(b & 0x0F)
+    });
+    number.to_be_bytes().to_vec()
 }
 
 /// The container of the fields of a service's positive response, if it can have any.

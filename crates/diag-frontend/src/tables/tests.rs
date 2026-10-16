@@ -886,6 +886,8 @@ fn variant_patterns_name_a_value_of_a_response_in_their_variant() {
         vec![
             at(UnknownReference, P, Some(3), Some("variant")),
             at(UnknownReference, P, Some(4), Some("service")),
+            // The supply voltage's linear conversion makes it a float.
+            at(BadValue, P, Some(5), Some("field")),
             at(UnknownReference, P, Some(5), Some("service")),
             // A constant has no IR field; a shaped field is not a scalar value.
             at(UnknownReference, P, Some(6), Some("field")),
@@ -893,6 +895,68 @@ fn variant_patterns_name_a_value_of_a_response_in_their_variant() {
             at(UnknownReference, P, Some(8), Some("field")),
             // A write's positive response carries only the identifier.
             at(UnknownReference, P, Some(10), Some("field")),
+        ]
+    );
+}
+
+#[test]
+fn variant_patterns_compare_only_values_they_can_match_exactly() {
+    // `powerCycles` is made a BCD field and `blockNumber` a float, for the test.
+    const P: &str = "variant_patterns.csv";
+    let fields = example_text("fields.csv")
+        .replace(
+            "did:powerCycles,powerCycles,0,,uint,32,",
+            "did:powerCycles,powerCycles,0,,bcd,32,",
+        )
+        .replace(
+            "did:flashState,blockNumber,1,,uint,32,",
+            "did:flashState,blockNumber,1,,float,32,",
+        )
+        .replace("did:vin,vin,0,,ascii,136,", "did:vin,vin,0,,bytes,136,")
+        .replace(
+            "did:flashState,phase,0,,uint,8,",
+            "did:flashState,phase,0,,int,8,",
+        );
+    let mut files = with("fields.csv", &fields);
+    files.retain(|(n, _)| n != P);
+    files.push((
+        P.into(),
+        b"variant,service,field,expected
+exampleEcuV2,supplyVoltage.read,supplyVoltage,0078
+exampleEcuV1,flashState.read,blockNumber,00
+exampleEcuV1,flashState.read,bytesReceived,00 00 00 00 00 00 00 00 01
+exampleEcuV1,powerCycles.read,powerCycles,1A
+exampleEcuV1,powerCycles.read,powerCycles,12345678
+exampleEcuV1,activeSession.read,session,01
+exampleEcuV1,flashState.read,phase,00 00 00 00 00 00 00 01
+exampleEcuV1,powerCycles.read,powerCycles,00 12 34 56 78
+exampleEcuV1,powerCycles.read,powerCycles,01 23 45 67 89
+exampleEcuV1,flashState.read,bytesReceived,00 00 00 01 00 00 00 00
+exampleEcuV1,flashState.read,phase,FF 80
+exampleEcuV1,flashState.read,phase,00 FE
+exampleEcuV1,vin.read,vin,31 32 33 34 35 36 37 38 39 30 31 32 33 34 35 36 37
+exampleEcuV1,vin.read,vin,31 32 33 34 35 36 37 38 39 30 31 32 33 34 35 36 37 38
+exampleEcuV1,softwareVersion.read,softwareVersion,FF
+"
+        .to_vec(),
+    ));
+    assert_eq!(
+        resolved(files),
+        vec![
+            // A numeric conversion, and a float field, give floats.
+            at(BadValue, P, Some(2), Some("field")),
+            at(BadValue, P, Some(3), Some("field")),
+            // An integer takes at most eight bytes; BCD digits are 0 to 9.
+            at(BadValue, P, Some(4), Some("expected")),
+            at(BadValue, P, Some(5), Some("expected")),
+            // Leading zeros are fine, but not a value the fixed width cannot hold: nine BCD
+            // digits in 32 bits, 2^32 in 32 bits, 254 in a signed byte, 18 bytes in 17.
+            at(BadValue, P, Some(10), Some("expected")),
+            at(BadValue, P, Some(11), Some("expected")),
+            at(BadValue, P, Some(13), Some("expected")),
+            at(BadValue, P, Some(15), Some("expected")),
+            // Text is compared in UTF-8.
+            at(BadValue, P, Some(16), Some("expected")),
         ]
     );
 }

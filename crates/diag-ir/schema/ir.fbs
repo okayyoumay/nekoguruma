@@ -378,7 +378,7 @@ table FlashSession {
 table VariantPattern {
   service_id: uint32;       // identification service to run
   field_id: uint32;         // field to compare
-  expected: [uint8];        // expected value (prefix match)
+  expected: [uint8];        // expected value, compared with the decoded field (ADR-306)
 }
 
 table EcuVariant {

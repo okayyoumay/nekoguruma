@@ -1,8 +1,8 @@
 use super::*;
 use crate::IR_SCHEMA_VERSION;
 use crate::declaration::{
-    EcuDocumentT, EcuVariantT, FieldT, LayoutT, PositiveResponseT, RequestT, ServiceT,
-    encode_ecu_document, load_ecu_document,
+    EcuDocumentT, EcuVariantT, FieldT, GroupT, LayoutT, PositiveResponseT, RequestT, ServiceT,
+    ShapeT, encode_ecu_document, load_ecu_document,
 };
 use crate::decode::{PhysicalValue, decode_positive_response};
 
@@ -347,5 +347,141 @@ fn a_field_placed_too_far_out_is_refused() {
     assert_eq!(
         encode(&[], vec![far], &[("far", Int(1))]),
         Err(EncodeError::TooLarge)
+    );
+}
+
+fn plan_error(result: Result<Vec<u8>, EncodeError>) -> bool {
+    matches!(result, Err(EncodeError::InvalidPlan { .. }))
+}
+
+#[test]
+fn a_field_may_not_overlap_another_the_sid_or_the_prefix() {
+    // Over the SID, over the prefix, over another field, and over a terminator.
+    assert!(plan_error(encode(
+        &[],
+        vec![at("a", DataKind::Uint, 0, 8)],
+        &[("a", Int(0x22))]
+    )));
+    assert!(plan_error(encode(
+        &[0xF1, 0x90],
+        vec![at("a", DataKind::Uint, 8, 8)],
+        &[("a", Int(0x22))]
+    )));
+    assert!(plan_error(encode(
+        &[],
+        vec![
+            at("a", DataKind::Uint, 8, 16),
+            at("b", DataKind::Uint, 16, 8)
+        ],
+        &[("a", Int(0x1234)), ("b", Int(0x99))]
+    )));
+    let zero = FieldT {
+        length_kind: LengthKind::Terminated,
+        termination: Termination::Zero,
+        ..at("a", DataKind::Bytes, 8, 0)
+    };
+    assert!(plan_error(encode(
+        &[],
+        vec![zero, at("b", DataKind::Uint, 16, 8)],
+        &[("a", Bytes(&[1])), ("b", Int(7))]
+    )));
+    // Bit fields that share bytes without sharing bits are fine.
+    assert!(
+        encode(
+            &[],
+            vec![
+                at("a", DataKind::Uint, 8, 4),
+                at("b", DataKind::Uint, 12, 4)
+            ],
+            &[("a", Int(1)), ("b", Int(2))]
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn every_value_that_runs_to_the_end_must_be_last() {
+    let rest = |name: &str, bit_offset| FieldT {
+        length_kind: LengthKind::Terminated,
+        termination: Termination::EndOfPdu,
+        ..at(name, DataKind::Bytes, bit_offset, 0)
+    };
+    assert!(plan_error(encode(
+        &[],
+        vec![rest("a", 8), rest("b", 16)],
+        &[("a", Bytes(&[1])), ("b", Bytes(&[5, 6]))]
+    )));
+}
+
+#[test]
+fn fields_need_names_of_their_own() {
+    let unnamed = FieldT {
+        short_name: None,
+        ..next("a", DataKind::Uint, 8)
+    };
+    assert!(plan_error(encode(&[], vec![unnamed], &[])));
+    assert!(plan_error(encode(
+        &[],
+        vec![next("a", DataKind::Uint, 8), next("a", DataKind::Uint, 8)],
+        &[("a", Int(1))]
+    )));
+}
+
+#[test]
+fn a_nested_layout_is_unsupported_even_with_a_value() {
+    let group = FieldT {
+        shape: ShapeT::Group(Box::new(GroupT { layout_id: 1 })),
+        ..next("g", DataKind::Bytes, 0)
+    };
+    assert!(matches!(
+        encode(&[], vec![group], &[("g", Bytes(&[1]))]),
+        Err(EncodeError::Unsupported { .. })
+    ));
+}
+
+#[test]
+fn an_odd_unicode2_terminated_bound_is_refused() {
+    let field = FieldT {
+        length_kind: LengthKind::Terminated,
+        termination: Termination::Zero,
+        min_bytes: 1,
+        ..next("w", DataKind::Unicode2, 0)
+    };
+    assert!(plan_error(encode(&[], vec![field], &[("w", Text("A"))])));
+}
+
+#[test]
+fn more_positions_and_kinds_round_trip() {
+    // A little-endian 64-bit value from bit 7, spanning nine bytes; a field after an absolute
+    // one; and a zero-terminated UTF-16 value.
+    let wide = FieldT {
+        byte_order: ByteOrder::Little,
+        ..at("w", DataKind::Int, 8 + 7, 64)
+    };
+    let after = next("n", DataKind::Uint, 8);
+    let text = FieldT {
+        length_kind: LengthKind::Terminated,
+        termination: Termination::Zero,
+        ..next("t", DataKind::Unicode2, 0)
+    };
+    let fields = vec![wide, after, text];
+    let values = [("w", Int(-5)), ("n", Int(9)), ("t", Text("Ab"))];
+    let operand = encode(&[], fields.clone(), &values).expect("encodes");
+    assert_eq!(
+        decode(&[], fields, &operand),
+        [
+            PhysicalValue::Signed(-5),
+            PhysicalValue::Unsigned(9),
+            PhysicalValue::Text("Ab".into()),
+        ]
+    );
+    // A float field takes an integer it holds exactly, however large.
+    assert!(
+        encode(
+            &[],
+            vec![next("f", DataKind::Float, 64)],
+            &[("f", Int(1 << 60))]
+        )
+        .is_ok()
     );
 }

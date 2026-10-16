@@ -87,6 +87,6 @@ at, since nested fields can read the same bytes many times. A `CompuBytecode` co
 `encode::encode_request` is the inverse for a request (ADR-308): from an internal value per field
 `short_name`, it writes the SID, the `prefix` and each field where and how the decoder would read
 it, and returns the operand, the bytes after the SID. Every scalar field needs a value and every
-value a field; a value must fit the field as given, with nothing padded or cut; a terminated
+value a field, and no field may overlap another, the SID or the prefix; a value must fit the field as given, with nothing padded or cut; a terminated
 value gets its terminator unless it fills `max_bytes`; and a field with a nested layout or a
 length from another field is refused as unsupported.

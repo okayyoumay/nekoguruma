@@ -23,11 +23,13 @@ terminator, or a field whose length comes from another field.
    written and read back through the same fields gives the same value; the tests check that round
    trip for every data and length kind.
 2. **Every scalar field needs a value, and every value a field.** A missing value or a name that
-   is no scalar field of the request is an error. This is the rule `csv-tables.md` 5.3 applies when
+   is no field of the request is an error, and so is a field without a name or with another
+   field's name, since values are given by name. This is the rule `csv-tables.md` 5.3 applies when
    it selects a service, so a selected service always encodes.
 3. **A value must fit as given; nothing is padded or cut.**
    - An integer must be within the field's width (unsigned, two's complement, or the number of
-     BCD digits).
+     BCD digits). Values are given as 64-bit signed integers, so a 64-bit unsigned field cannot
+     be given a value of 2^63 or more.
    - A float field takes a float, or an integer the float holds exactly; a 32-bit field only a
      value a 32-bit float holds exactly.
    - A fixed-length bytes or string value must have exactly the field's length; a leading-length
@@ -38,12 +40,14 @@ terminator, or a field whose length comes from another field.
    `min_bytes` and `max_bytes`. The terminator follows it unless the value fills `max_bytes`,
    where the decoder stops without one. A value that holds its terminator at or after `min_bytes`
    is refused, since the decoder would end it there. A value that runs to the end of the message
-   (`EndOfPdu`) must be the last thing in the message.
+   (`EndOfPdu`) must be the last thing in the message, even when it fills its `max_bytes`.
 5. **What the encoder does not cover is refused, not guessed.** A field with a nested layout, or
    with a length taken from another field, is `Unsupported`. A field that breaks a rule of
    `ir.fbs` (a width its type cannot have, an unknown kind) is `InvalidPlan`. A message longer than
    16 MiB is `TooLarge`, so a field placed far out cannot make the encoder allocate without bound.
-6. **Bytes no field covers are 0**, and bit fields that share a byte keep each other's bits.
+6. **Fields do not overlap.** A field may not write a bit another field, the SID or the prefix
+   has written (`InvalidPlan`); bit fields that share a byte without sharing bits are fine. Bytes
+   no field covers are 0.
 
 ## Consequences
 

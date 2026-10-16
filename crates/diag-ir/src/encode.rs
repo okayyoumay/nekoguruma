@@ -67,21 +67,28 @@ pub fn encode_request(
     values: &HashMap<&str, ParamValue<'_>>,
 ) -> Result<Vec<u8>, EncodeError> {
     let prefix = request.prefix().map_or(&[][..], |p| p.bytes());
-    let mut message = Vec::with_capacity(1 + prefix.len());
-    message.push(request.sid());
-    message.extend_from_slice(prefix);
+    let mut message = Message::default();
+    // The SID and the prefix are written first and belong to no field.
+    message.bytes.push(request.sid());
+    message.bytes.extend_from_slice(prefix);
+    message.written = vec![0xFF; message.bytes.len()];
+    // Values are given by name, so every field needs a name of its own.
+    let mut names = std::collections::HashSet::new();
+    for field in request.params().into_iter().flatten() {
+        match field.short_name() {
+            None | Some("") => return Err(plan(&field, "a field without a name")),
+            Some(name) if !names.insert(name) => {
+                return Err(plan(&field, "a name another field of the request has"));
+            }
+            Some(_) => {}
+        }
+    }
     // A value for no field is reported first, by name in byte order, so the error does not
     // depend on the map's order.
     let mut unknown: Vec<&str> = values
         .keys()
         .copied()
-        .filter(|key| {
-            !request
-                .params()
-                .into_iter()
-                .flatten()
-                .any(|f| f.shape_type() == Shape::NONE && f.short_name() == Some(*key))
-        })
+        .filter(|key| !names.contains(key))
         .collect();
     unknown.sort_unstable();
     if let Some(field) = unknown.first() {
@@ -89,9 +96,9 @@ pub fn encode_request(
             field: (*field).to_owned(),
         });
     }
-    let mut edge = message.len();
-    // The end of a field that runs to the end of the message, which nothing may follow.
-    let mut open_end: Option<(String, usize)> = None;
+    let mut edge = message.bytes.len();
+    // The ends of the fields that run to the end of the message, which nothing may follow.
+    let mut open_ends: Vec<(String, usize)> = Vec::new();
     for field in request.params().into_iter().flatten() {
         let name = field.short_name().unwrap_or_default();
         if field.shape_type() != Shape::NONE {
@@ -105,21 +112,30 @@ pub fn encode_request(
         if field.length_kind() == LengthKind::Terminated
             && field.termination() == Termination::EndOfPdu
         {
-            open_end = Some((name.to_owned(), end));
+            open_ends.push((name.to_owned(), end));
         }
         edge = end;
     }
     // A value that runs to the end of the message is read to its end, so nothing may follow it.
-    if let Some((field, end)) = open_end
-        && end != message.len()
+    if let Some((field, _)) = open_ends
+        .into_iter()
+        .find(|(_, end)| *end != message.bytes.len())
     {
         return Err(EncodeError::InvalidPlan {
             field,
             reason: "a value that runs to the end of the message is not last",
         });
     }
-    message.remove(0);
-    Ok(message)
+    message.bytes.remove(0);
+    Ok(message.bytes)
+}
+
+/// A request message being written, with the bits each byte has had written, so a field that
+/// overlaps another, the SID or the prefix is refused rather than overwriting it.
+#[derive(Default)]
+struct Message {
+    bytes: Vec<u8>,
+    written: Vec<u8>,
 }
 
 /// The byte and bit position (0 to 7, from the least significant bit) where a field starts.
@@ -135,7 +151,7 @@ fn position(field: &Field<'_>, edge: usize) -> Result<(usize, u32), EncodeError>
 
 /// Writes `value` into `message` at the field's position; returns the byte edge after it.
 fn write(
-    message: &mut Vec<u8>,
+    message: &mut Message,
     field: &Field<'_>,
     value: ParamValue<'_>,
     byte: usize,
@@ -160,7 +176,7 @@ fn write(
                         "a value whose length is not the field's fixed length",
                     ));
                 }
-                put_bytes(message, byte, &bytes)
+                put_bytes(message, field, byte, &bytes)
             }
             LengthKind::LeadingLength => {
                 let prefix_bits = field.bit_length();
@@ -172,7 +188,7 @@ fn write(
                     return Err(range(field, "a value too long for its length prefix"));
                 }
                 let start = put_bits(message, field, byte, bit, prefix_bits, len)?;
-                put_bytes(message, start, &bytes)
+                put_bytes(message, field, start, &bytes)
             }
             LengthKind::Terminated => {
                 if bit != 0 {
@@ -235,9 +251,9 @@ fn write(
             let x = match value {
                 ParamValue::Float(x) => x,
                 // An integer is taken when the float holds it exactly.
-                ParamValue::Int(n) if (n as f64) as i64 == n && n.unsigned_abs() <= 1 << 53 => {
-                    n as f64
-                }
+                // Compared in i128, since `i64::MAX as f64` rounds up to 2^63, which an i64 cast
+                // would saturate back to i64::MAX.
+                ParamValue::Int(n) if (n as f64) as i128 == i128::from(n) => n as f64,
                 ParamValue::Int(_) => {
                     return Err(range(
                         field,
@@ -304,7 +320,7 @@ fn string_bytes(field: &Field<'_>, value: ParamValue<'_>) -> Result<Vec<u8>, Enc
 /// Writes a terminated value at a byte edge: the bytes and, unless the value fills `max_bytes`
 /// or runs to the end of the message, the terminator (ISO 22901-1 (2008) 7.3.6.2).
 fn terminated(
-    message: &mut Vec<u8>,
+    message: &mut Message,
     field: &Field<'_>,
     byte: usize,
     bytes: &[u8],
@@ -314,6 +330,12 @@ fn terminated(
     let max = as_usize(field.max_bytes());
     if max != 0 && min > max {
         return Err(plan(field, "min_bytes above max_bytes"));
+    }
+    if !min.is_multiple_of(unit) || !max.is_multiple_of(unit) {
+        return Err(plan(
+            field,
+            "an odd min_bytes or max_bytes on a Unicode2 field",
+        ));
     }
     if bytes.len() < min {
         return Err(range(field, "a value shorter than min_bytes"));
@@ -327,7 +349,7 @@ fn terminated(
         Termination::HexFF => Some(0xFF),
         _ => return Err(plan(field, "an unknown termination")),
     };
-    let mut end = put_bytes(message, byte, bytes)?;
+    let mut end = put_bytes(message, field, byte, bytes)?;
     if let Some(t) = terminator {
         // A terminator inside the value from min_bytes on would end it early when decoded.
         let early = (min..)
@@ -338,25 +360,52 @@ fn terminated(
             return Err(range(field, "a value that holds its terminator"));
         }
         if max == 0 || bytes.len() + unit <= max {
-            end = put_bytes(message, end, &vec![t; unit])?;
+            end = put_bytes(message, field, end, &vec![t; unit])?;
         }
     }
     Ok(end)
 }
 
 /// Copies `bytes` into `message` from byte `at`; returns the byte after them.
-fn put_bytes(message: &mut Vec<u8>, at: usize, bytes: &[u8]) -> Result<usize, EncodeError> {
+fn put_bytes(
+    message: &mut Message,
+    field: &Field<'_>,
+    at: usize,
+    bytes: &[u8],
+) -> Result<usize, EncodeError> {
     let end = at.checked_add(bytes.len()).ok_or(EncodeError::TooLarge)?;
     grow(message, end)?;
-    message[at..end].copy_from_slice(bytes);
+    claim(message, field, at, &vec![0xFF; bytes.len()])?;
+    message.bytes[at..end].copy_from_slice(bytes);
     Ok(end)
+}
+
+/// Marks the bits `masks` gives for the bytes from `at` on as written; refuses bits written
+/// already.
+fn claim(
+    message: &mut Message,
+    field: &Field<'_>,
+    at: usize,
+    masks: &[u8],
+) -> Result<(), EncodeError> {
+    let written = &mut message.written[at..at + masks.len()];
+    if written.iter().zip(masks).any(|(w, m)| w & m != 0) {
+        return Err(plan(
+            field,
+            "a field that overlaps another field, the SID or the prefix",
+        ));
+    }
+    for (w, m) in written.iter_mut().zip(masks) {
+        *w |= m;
+    }
+    Ok(())
 }
 
 /// Writes the low `width` (1 to 64) bits of `raw` starting `bit` bits above the least
 /// significant bit of the bytes from `byte` on, normalized as the decoder reads them (reversed
 /// for a little-endian field), keeping the other bits of those bytes. Returns the byte after.
 fn put_bits(
-    message: &mut Vec<u8>,
+    message: &mut Message,
     field: &Field<'_>,
     byte: usize,
     bit: u32,
@@ -367,7 +416,18 @@ fn put_bits(
     let end = byte.checked_add(count).ok_or(EncodeError::TooLarge)?;
     grow(message, end)?;
     let little = field.byte_order() == ByteOrder::Little;
-    let window = &mut message[byte..end];
+    let mask = if width == 64 {
+        u128::from(u64::MAX)
+    } else {
+        (1u128 << width) - 1
+    };
+    // The byte at index i of the window holds bits 8 * from_low(i) up of the normalized value.
+    let from_low = |i: usize| if little { i } else { count - 1 - i };
+    let masks: Vec<u8> = (0..count)
+        .map(|i| ((mask << bit) >> (8 * from_low(i))) as u8)
+        .collect();
+    claim(message, field, byte, &masks)?;
+    let window = &mut message.bytes[byte..end];
     // bit <= 7 and width <= 64 touch at most 9 bytes, which fit in a u128.
     let fold = |acc: u128, &b: &u8| (acc << 8) | u128::from(b);
     let mut normalized = if little {
@@ -375,25 +435,20 @@ fn put_bits(
     } else {
         window.iter().fold(0, fold)
     };
-    let mask = if width == 64 {
-        u128::from(u64::MAX)
-    } else {
-        (1u128 << width) - 1
-    };
     normalized = (normalized & !(mask << bit)) | ((u128::from(raw) & mask) << bit);
     for (i, slot) in window.iter_mut().enumerate() {
-        let from_low = if little { i } else { count - 1 - i };
-        *slot = (normalized >> (8 * from_low)) as u8;
+        *slot = (normalized >> (8 * from_low(i))) as u8;
     }
     Ok(end)
 }
 
-fn grow(message: &mut Vec<u8>, end: usize) -> Result<(), EncodeError> {
+fn grow(message: &mut Message, end: usize) -> Result<(), EncodeError> {
     if end > MAX_ENCODED_BYTES {
         return Err(EncodeError::TooLarge);
     }
-    if message.len() < end {
-        message.resize(end, 0);
+    if message.bytes.len() < end {
+        message.bytes.resize(end, 0);
+        message.written.resize(end, 0);
     }
     Ok(())
 }

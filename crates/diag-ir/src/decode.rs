@@ -220,14 +220,16 @@ pub enum DtcFields {
 ///
 /// Integers are compared after decoding, so a little-endian field's `expected` is written
 /// big-endian like any other. A text table's value is its internal value, not its text. The
-/// pattern does not match when the field is missing, when its value is a float or shaped, or
-/// when an integer's `expected` is empty or longer than eight bytes.
+/// pattern does not match when `expected` is absent or empty, when the field is missing, when
+/// its value is a float or shaped, or when an integer's `expected` is longer than eight bytes.
 pub fn pattern_matches(pattern: &VariantPattern<'_>, fields: &[DecodedField]) -> bool {
     let expected = pattern.expected().map_or(&[][..], |e| e.bytes());
-    fields
-        .iter()
-        .find(|field| field.id == pattern.field_id())
-        .is_some_and(|field| value_matches(expected, &field.value))
+    // An empty prefix would match every value, which identifies nothing.
+    !expected.is_empty()
+        && fields
+            .iter()
+            .find(|field| field.id == pattern.field_id())
+            .is_some_and(|field| value_matches(expected, &field.value))
 }
 
 fn value_matches(expected: &[u8], value: &PhysicalValue) -> bool {

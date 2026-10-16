@@ -498,16 +498,23 @@ impl<'a> Resolver<'a> {
             );
             return;
         }
-        let numeric = field
-            .conversion
-            .as_deref()
-            .and_then(|name| conversions.get(name))
-            .is_some_and(|c| {
-                !matches!(
-                    c.kind,
-                    ConversionKind::Identity | ConversionKind::TextTable { .. }
-                )
-            });
+        let integer = matches!(
+            field.field_type,
+            Some(FieldType::Uint | FieldType::Int | FieldType::Bcd)
+        );
+        // Only an integer may carry a numeric conversion (4.5), so another type with one is
+        // reported by the field check, not here.
+        let numeric = integer
+            && field
+                .conversion
+                .as_deref()
+                .and_then(|name| conversions.get(name))
+                .is_some_and(|c| {
+                    !matches!(
+                        c.kind,
+                        ConversionKind::Identity | ConversionKind::TextTable { .. }
+                    )
+                });
         if numeric {
             bad(
                 self,
@@ -520,11 +527,8 @@ impl<'a> Resolver<'a> {
             );
             return;
         }
-        if matches!(
-            field.field_type,
-            Some(FieldType::Uint | FieldType::Int | FieldType::Bcd)
-        ) && row.expected.len() > 8
-        {
+        let expected = &row.expected;
+        if integer && expected.len() > 8 {
             bad(
                 self,
                 "expected",
@@ -535,14 +539,65 @@ impl<'a> Resolver<'a> {
             );
             return;
         }
-        if field.field_type == Some(FieldType::Bcd)
-            && row.expected.iter().any(|b| b >> 4 > 9 || b & 0x0F > 9)
-        {
+        // A fixed width bounds the values the field can decode to, and a pattern outside them
+        // could never match.
+        let fixed_bits = match field.length {
+            None | Some(Length::Fixed) => field.bits.filter(|&bits| (1..=64).contains(&bits)),
+            _ => None,
+        };
+        let number = expected.iter().fold(0u64, |n, &b| (n << 8) | u64::from(b));
+        let outside = match (field.field_type, fixed_bits) {
+            (Some(FieldType::Bcd), _) if expected.iter().any(|b| b >> 4 > 9 || b & 0x0F > 9) => {
+                bad(
+                    self,
+                    "expected",
+                    format!(
+                        "{} is a bcd field, so the expected value is written as its digits, \
+                         0 to 9",
+                        row.field
+                    ),
+                );
+                return;
+            }
+            (Some(FieldType::Bcd), Some(bits)) => {
+                // Leading zero digits are allowed; the digits past the field's are not.
+                let digits = expected.len() * 2 - leading_zero_digits(expected);
+                digits > (bits / 4) as usize
+            }
+            (Some(FieldType::Uint), Some(bits)) => bits < 64 && number >> bits != 0,
+            (Some(FieldType::Int), Some(bits)) if !expected.is_empty() => {
+                // Sign-extend from the width the value is written in, then check the range.
+                let shift = 64 - 8 * expected.len() as u32;
+                let value = ((number << shift) as i64) >> shift;
+                bits < 64 && (value < -(1i64 << (bits - 1)) || value >= 1i64 << (bits - 1))
+            }
+            (Some(FieldType::Bytes), Some(bits)) => expected.len() > (bits / 8) as usize,
+            _ => false,
+        };
+        if outside {
             bad(
                 self,
                 "expected",
                 format!(
-                    "{} is a bcd field, so the expected value is written as its digits, 0 to 9",
+                    "{} cannot hold the expected value in its {} bits, so the pattern could \
+                     never match",
+                    row.field,
+                    fixed_bits.unwrap_or(0)
+                ),
+            );
+            return;
+        }
+        let text = matches!(
+            field.field_type,
+            Some(FieldType::Ascii | FieldType::Utf8 | FieldType::Unicode2)
+        );
+        if text && std::str::from_utf8(expected).is_err() {
+            bad(
+                self,
+                "expected",
+                format!(
+                    "{} is text, which is compared in UTF-8, so the expected value must be \
+                     UTF-8",
                     row.field
                 ),
             );
@@ -1217,4 +1272,13 @@ fn show(service: &ServiceName) -> String {
             format!("{}.{suffix}", service.name)
         }
     }
+}
+
+/// How many of the leading BCD digits in `digits` are 0.
+fn leading_zero_digits(digits: &[u8]) -> usize {
+    digits
+        .iter()
+        .flat_map(|b| [b >> 4, b & 0x0F])
+        .take_while(|&d| d == 0)
+        .count()
 }

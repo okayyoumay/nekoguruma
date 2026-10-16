@@ -152,17 +152,24 @@ A pattern compares `expected` with the value the field decodes to, not with the 
 
 - A `bytes` field matches when `expected` is a prefix of its bytes. An `ascii`, `utf8` or
   `unicode2` field matches when `expected` is a prefix of its text in UTF-8, so `31 2E` matches a
-  version `1.` followed by anything, whatever the field's encoding.
+  version `1.` followed by anything, whatever the field's encoding. An `ascii` byte of 0x80 or
+  above counts as that code point, so `FF` on the wire is written `C3 BF`. A terminated field's
+  terminator is not part of its text, so a prefix cannot tell `1.2` from `1.20`; a fixed-length
+  field padded after its value can, with the padding written into `expected`.
 - A `uint` or `int` field matches when `expected`, one to eight bytes read as a big-endian number,
   equals its value; an `int`'s `expected` is two's complement of its own width (`FE` is -2). A
   little-endian field's `expected` is written big-endian too: `12 34` matches a field sent as
   `34 12`.
 - A `bcd` field's `expected` is written as its digits, two per byte, most significant first, each
-  0 to 9 (`12 34` for 1234), at most eight bytes. The conversion stores the number they spell.
+  0 to 9 (`12 34` for 1234), at most eight bytes. The converter writes the number they spell into
+  the IR.
 - A field with a text table compares its internal value, not the text.
 - A `float` field, or a field whose conversion is not `identity` or `text-table`, decodes to a
-  float that no byte string matches exactly, and is rejected (`CSV_BAD_VALUE`), as is an integer's
-  `expected` longer than eight bytes.
+  float that no byte string matches exactly, and is rejected (`CSV_BAD_VALUE`).
+- A pattern that could never match is rejected too (`CSV_BAD_VALUE`): an integer's `expected`
+  longer than eight bytes, a value a fixed-width `uint`, `int` or `bcd` field cannot hold (leading
+  zero bytes or digits are fine), an `expected` longer than a fixed-length `bytes` field, and a
+  text field's `expected` that is not UTF-8.
 
 ### 4.3 `protocols.csv` (scoped) and `comparams.csv` (scoped)
 

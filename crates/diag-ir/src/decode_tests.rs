@@ -2098,3 +2098,31 @@ fn a_missing_or_float_field_never_matches() {
     assert!(!matches(1, &[0x3F, 0xC0, 0x00, 0x00], &fields));
     assert!(!matches(2, &[0x3F], &fields));
 }
+
+#[test]
+fn signed_and_empty_expected_values_at_their_edges() {
+    // -2 in 64 bits, 0x7F in 8 bits, and a bytes field.
+    let fields = decode(
+        &[],
+        vec![
+            next(1, DataKind::Int, 64),
+            next(2, DataKind::Int, 8),
+            next(3, DataKind::Bytes, 8),
+        ],
+        &[
+            SID, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE, 0x7F, 0x00,
+        ],
+    )
+    .expect("decodes");
+    // Eight bytes are read with no sign extension; one byte with its top bit clear is positive.
+    assert!(matches(
+        1,
+        &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE],
+        &fields
+    ));
+    assert!(matches(1, &[0xFE], &fields));
+    assert!(matches(2, &[0x7F], &fields));
+    assert!(!matches(2, &[0xFF], &fields));
+    // An empty expected value identifies nothing, whatever the field.
+    assert!(!matches(3, &[], &fields));
+}

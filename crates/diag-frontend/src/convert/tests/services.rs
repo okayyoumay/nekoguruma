@@ -333,7 +333,8 @@ fn variant_patterns_name_the_service_and_field() {
 
 #[test]
 fn a_bcd_pattern_expects_the_number_its_digits_spell() {
-    // `powerCycles` is made a BCD field: the digits 12 34 are written as 1234 (ADR-306).
+    // `powerCycles` is made a 64-bit BCD field: the digits 12 34 are written as 1234, and the
+    // sixteen digits it holds at most still fit (ADR-306).
     let files: Vec<(String, Vec<u8>)> = example()
         .into_iter()
         .map(|(name, bytes)| {
@@ -342,11 +343,11 @@ fn a_bcd_pattern_expects_the_number_its_digits_spell() {
                     .expect("UTF-8")
                     .replace(
                         "did:powerCycles,powerCycles,0,,uint,32,",
-                        "did:powerCycles,powerCycles,0,,bcd,32,",
+                        "did:powerCycles,powerCycles,0,,bcd,64,",
                     )
                     .into_bytes(),
                 "variant_patterns.csv" => {
-                    b"variant,service,field,expected\nexampleEcuV1,powerCycles.read,powerCycles,12 34\n"
+                    b"variant,service,field,expected\nexampleEcuV1,powerCycles.read,powerCycles,12 34\nexampleEcuV1,powerCycles.read,powerCycles,99 99 99 99 99 99 99 99\n"
                         .to_vec()
                 }
                 _ => bytes,
@@ -361,7 +362,13 @@ fn a_bcd_pattern_expects_the_number_its_digits_spell() {
         .flatten()
         .map(|p| p.expected.clone().expect("bytes"))
         .collect();
-    assert_eq!(expected, [1234u64.to_be_bytes().to_vec()]);
+    assert_eq!(
+        expected,
+        [
+            1234u64.to_be_bytes().to_vec(),
+            9_999_999_999_999_999u64.to_be_bytes().to_vec()
+        ]
+    );
 }
 
 /// The example with `fields.csv` given a `byte_order` and `max_bytes` column and `rows`

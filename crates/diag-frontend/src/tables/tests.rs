@@ -911,6 +911,11 @@ fn variant_patterns_compare_only_values_they_can_match_exactly() {
         .replace(
             "did:flashState,blockNumber,1,,uint,32,",
             "did:flashState,blockNumber,1,,float,32,",
+        )
+        .replace("did:vin,vin,0,,ascii,136,", "did:vin,vin,0,,bytes,16,")
+        .replace(
+            "did:flashState,phase,0,,uint,8,",
+            "did:flashState,phase,0,,int,8,",
         );
     let mut files = with("fields.csv", &fields);
     files.retain(|(n, _)| n != P);
@@ -924,6 +929,14 @@ exampleEcuV1,powerCycles.read,powerCycles,1A
 exampleEcuV1,powerCycles.read,powerCycles,12345678
 exampleEcuV1,activeSession.read,session,01
 exampleEcuV1,flashState.read,phase,00 00 00 00 00 00 00 01
+exampleEcuV1,powerCycles.read,powerCycles,00 12 34 56 78
+exampleEcuV1,powerCycles.read,powerCycles,01 23 45 67 89
+exampleEcuV1,flashState.read,bytesReceived,00 00 00 01 00 00 00 00
+exampleEcuV1,flashState.read,phase,FF 80
+exampleEcuV1,flashState.read,phase,00 FE
+exampleEcuV1,vin.read,vin,31 32
+exampleEcuV1,vin.read,vin,31 32 33
+exampleEcuV1,softwareVersion.read,softwareVersion,FF
 "
         .to_vec(),
     ));
@@ -936,6 +949,14 @@ exampleEcuV1,flashState.read,phase,00 00 00 00 00 00 00 01
             // An integer takes at most eight bytes; BCD digits are 0 to 9.
             at(BadValue, P, Some(4), Some("expected")),
             at(BadValue, P, Some(5), Some("expected")),
+            // Leading zeros are fine, but not a value the fixed width cannot hold: nine BCD
+            // digits in 32 bits, 2^32 in 32 bits, 254 in a signed byte, three bytes in two.
+            at(BadValue, P, Some(10), Some("expected")),
+            at(BadValue, P, Some(11), Some("expected")),
+            at(BadValue, P, Some(13), Some("expected")),
+            at(BadValue, P, Some(15), Some("expected")),
+            // Text is compared in UTF-8.
+            at(BadValue, P, Some(16), Some("expected")),
         ]
     );
 }

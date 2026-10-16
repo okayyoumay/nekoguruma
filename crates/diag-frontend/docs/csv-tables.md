@@ -531,7 +531,8 @@ container's position 0 either way. The Starlark lowering builds a request's oper
 by its operand (ADR-235 item 2). `RoutineControl` already sends the sub-function and the routine
 identifier before its operand, so for a routine service the lowering leaves out the three
 generated prefix bytes and starts the operand with any declared constants that follow them.
-Request parameters are encoded from internal values: a field's conversion applies only when a
+Request parameters are encoded from internal values (`diag_ir::encode::encode_request`, ADR-308:
+every field needs a value that fits it as given): a field's conversion applies only when a
 response is decoded, so a procedure never needs the inverse of a text table or another
 conversion that has none. Whether a received response's prefix matches is checked by the
 declaration-part decoder, not by the host, which checks only the response SID and, for some

@@ -123,6 +123,12 @@ pub enum Op {
     Fail {
         code: u32,
     },
+
+    // Byte strings. Appended after `Fail`: the variant order is part of the encoding (ADR-233).
+    /// Pushes the length of the `Bytes` on top of the stack as an `I64`, leaving the bytes in
+    /// place below it, as `IndexGet` does, so a length and an index into the same bytes need
+    /// no copy.
+    Length,
 }
 
 // ---------------------------------------------------------------- Program
@@ -228,6 +234,7 @@ impl Op {
             | Op::StoreGlobal(_)
             | Op::IndexGet
             | Op::IndexSet
+            | Op::Length
             | Op::Fail { .. } => false,
         }
     }
@@ -573,6 +580,14 @@ impl Vm {
                 };
                 bytes[index] = value;
             }
+            Op::Length => {
+                let [Value::Bytes(bytes)] = self.top(1)? else {
+                    return Err(VmError::TypeMismatch.into());
+                };
+                // A Vec's length is at most isize::MAX, so it fits an i64.
+                let len = i64::try_from(bytes.len()).expect("a length fits an i64");
+                self.push(Value::I64(len))?;
+            }
 
             Op::ServiceRequest { service } => {
                 let response = host
@@ -707,7 +722,8 @@ impl Vm {
             | Op::LoadGlobal(_)
             | Op::StoreGlobal(_)
             | Op::IndexGet
-            | Op::IndexSet => HostInput::Nothing,
+            | Op::IndexSet
+            | Op::Length => HostInput::Nothing,
             // The checks of `Fail` run in `execute`, before it changes anything.
             Op::Fail { .. } => HostInput::Nothing,
         })

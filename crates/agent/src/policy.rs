@@ -155,6 +155,7 @@ pub fn check_program(program: &Program, permission: Permission) -> Result<(), (u
             | Op::IndexSet
             | Op::Length
             | Op::Rem
+            | Op::Neg
             // Ends the procedure; sends nothing (ADR-280).
             | Op::Fail { .. } => None,
         };

@@ -1165,6 +1165,10 @@ fn primitive_classification_covers_every_instruction() {
         Op::Slice,
         Op::IntToFloat,
         Op::FloatToInt,
+        Op::DecodeField {
+            service: 0,
+            field: 0,
+        },
     ];
     for (index, op) in all.iter().enumerate() {
         // The postcard encoding starts with the variant index, so this also pins the variant
@@ -3035,4 +3039,268 @@ fn a_version_one_state_still_decodes_and_is_refused() {
         Vm::resume(state).check_state(&current),
         Err(VmError::StateSchemaMismatch { state: 1, .. })
     ));
+}
+
+// ---------------------------------------------------------------- DecodeField (ADR-316)
+
+mod decode_field {
+    use super::*;
+    use crate::declaration::{
+        CompuLinearT, CompuT, CompuTextTableT, DataKind, EcuDocumentT, EcuVariantT, FieldT, GroupT,
+        LayoutT, Placement, PositiveResponseT, ServiceT, ShapeT, TextEntryT, encode_ecu_document,
+        load_ecu_document,
+    };
+
+    /// A field that follows the previous one.
+    fn next(id: u32, kind: DataKind, bit_length: u32) -> FieldT {
+        FieldT {
+            id,
+            short_name: Some(format!("f{id}")),
+            placement: Placement::AfterPrevious,
+            bit_length,
+            kind,
+            ..Default::default()
+        }
+    }
+
+    /// A document whose service 7 answers with SID 0x62, prefix F1 90 and one field of each
+    /// kind: a u16 (1), an i8 (2), an f32 (3), two ASCII bytes (4), two bytes (5), a group
+    /// (6) and a u64 (8).
+    fn document() -> Vec<u8> {
+        let fields = vec![
+            next(1, DataKind::Uint, 16),
+            next(2, DataKind::Int, 8),
+            next(3, DataKind::Float, 32),
+            next(4, DataKind::Ascii, 16),
+            next(5, DataKind::Bytes, 16),
+            FieldT {
+                shape: ShapeT::Group(Box::new(GroupT { layout_id: 1 })),
+                ..next(6, DataKind::Bytes, 0)
+            },
+            next(8, DataKind::Uint, 64),
+        ];
+        let layout = LayoutT {
+            id: 1,
+            short_name: Some("l1".into()),
+            byte_size: 1,
+            fields: Some(vec![FieldT {
+                placement: Placement::Absolute,
+                ..next(7, DataKind::Uint, 8)
+            }]),
+        };
+        let service = ServiceT {
+            id: 7,
+            short_name: Some("s".into()),
+            positive: Some(Box::new(PositiveResponseT {
+                sid: 0x62,
+                prefix: Some(vec![0xF1, 0x90]),
+                fields: Some(fields),
+            })),
+            ..Default::default()
+        };
+        // Service 8: a linear conversion (1), a text table (2), BCD (3) and a u64 (4).
+        let converted = ServiceT {
+            id: 8,
+            short_name: Some("c".into()),
+            positive: Some(Box::new(PositiveResponseT {
+                sid: 0x62,
+                prefix: None,
+                fields: Some(vec![
+                    FieldT {
+                        compu: CompuT::CompuLinear(Box::new(CompuLinearT {
+                            numerator: 1.0,
+                            denominator: 2.0,
+                            offset: 0.0,
+                        })),
+                        ..next(1, DataKind::Uint, 8)
+                    },
+                    FieldT {
+                        compu: CompuT::CompuTextTable(Box::new(CompuTextTableT {
+                            entries: Some(vec![TextEntryT {
+                                lower: 3,
+                                upper: 3,
+                                text_id: 9,
+                            }]),
+                            default_text_id: 0,
+                        })),
+                        ..next(2, DataKind::Uint, 8)
+                    },
+                    next(3, DataKind::Bcd, 16),
+                    next(4, DataKind::Uint, 64),
+                ]),
+            })),
+            ..Default::default()
+        };
+        // Service 9 declares no positive response.
+        let bare = ServiceT {
+            id: 9,
+            short_name: Some("b".into()),
+            ..Default::default()
+        };
+        encode_ecu_document(&EcuDocumentT {
+            schema_version: IR_SCHEMA_VERSION,
+            source_format: Some("csv-starlark".into()),
+            source_digest: Some("00".into()),
+            variant: Some(Box::new(EcuVariantT {
+                id: 1,
+                services: Some(vec![service, converted, bare]),
+                layouts: Some(vec![layout]),
+                ..Default::default()
+            })),
+            procedure: None,
+        })
+    }
+
+    /// A positive response: 0x1234, -2, 1.5, "ok", 0xBEEF, a group byte, u64::MAX.
+    fn response() -> Vec<u8> {
+        let mut message = vec![0x62, 0xF1, 0x90, 0x12, 0x34, 0xFE];
+        message.extend(1.5f32.to_be_bytes());
+        message.extend(b"ok");
+        message.extend([0xBE, 0xEF, 0x05]);
+        message.extend(u64::MAX.to_be_bytes());
+        message
+    }
+
+    /// Runs `PushBytes(message)` then `DecodeField` of `field` of `service`.
+    fn decode(
+        declarations: bool,
+        service: u32,
+        field: u32,
+        message: &[u8],
+    ) -> Result<Value, VmError> {
+        let program = prog(
+            vec![Op::PushBytes(0), Op::DecodeField { service, field }],
+            vec![message.to_vec()],
+        );
+        let bytes = document();
+        let document = load_ecu_document(&bytes).expect("the document loads");
+        let variant = document.variant().expect("a variant");
+        let declarations = declarations.then_some(&variant);
+        let mut vm = Vm::new(&program);
+        let mut host = MockHost::default();
+        vm.step_with_declarations(&program, declarations, &mut host)
+            .expect("pushes");
+        let before = postcard::to_allocvec(&vm.state).expect("encodes");
+        match vm.step_with_declarations(&program, declarations, &mut host) {
+            Ok(StepOutcome::Finished) => Ok(vm.state.stack.pop().expect("a value")),
+            Err(StepError::Vm(error)) => {
+                assert_eq!(
+                    postcard::to_allocvec(&vm.state).expect("encodes"),
+                    before,
+                    "state changed on error"
+                );
+                Err(error)
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn each_value_kind_becomes_a_vm_value() {
+        let message = response();
+        assert_eq!(decode(true, 7, 1, &message), Ok(Value::I64(0x1234)));
+        assert_eq!(decode(true, 7, 2, &message), Ok(Value::I64(-2)));
+        assert_eq!(decode(true, 7, 3, &message), Ok(Value::F64(1.5)));
+        assert_eq!(
+            decode(true, 7, 4, &message),
+            Ok(Value::Bytes(b"ok".to_vec()))
+        );
+        assert_eq!(
+            decode(true, 7, 5, &message),
+            Ok(Value::Bytes(vec![0xBE, 0xEF]))
+        );
+    }
+
+    #[test]
+    fn conversions_bcd_and_the_largest_integer_map_as_the_adr_says() {
+        let mut message = vec![0x62, 0x0B, 0x03, 0x12, 0x34];
+        message.extend(i64::MAX.to_be_bytes());
+        assert_eq!(decode(true, 8, 1, &message), Ok(Value::F64(5.5)));
+        // A text table keeps its internal value.
+        assert_eq!(decode(true, 8, 2, &message), Ok(Value::I64(3)));
+        assert_eq!(decode(true, 8, 3, &message), Ok(Value::I64(1234)));
+        assert_eq!(decode(true, 8, 4, &message), Ok(Value::I64(i64::MAX)));
+    }
+
+    #[test]
+    fn a_field_the_vm_cannot_hold_is_an_error() {
+        let message = response();
+        assert_eq!(
+            decode(true, 7, 6, &message),
+            Err(VmError::ShapedField {
+                service: 7,
+                field: 6
+            })
+        );
+        // u64::MAX does not fit an I64.
+        assert_eq!(decode(true, 7, 8, &message), Err(VmError::Overflow));
+        // A field of the nested layout is not a top-level field.
+        assert_eq!(
+            decode(true, 7, 7, &message),
+            Err(VmError::UnknownField {
+                service: 7,
+                field: 7
+            })
+        );
+        // An undeclared service, and one without a positive response.
+        for service in [10, 9] {
+            assert_eq!(
+                decode(true, service, 1, &message),
+                Err(VmError::UnknownField { service, field: 1 })
+            );
+        }
+        // A shaped field is reported as such even when the response would not decode.
+        assert_eq!(
+            decode(true, 7, 6, &[0x7F, 0x22, 0x31]),
+            Err(VmError::ShapedField {
+                service: 7,
+                field: 6
+            })
+        );
+    }
+
+    #[test]
+    fn a_response_that_does_not_decode_is_an_error() {
+        // A negative response, another prefix, and a truncated response.
+        for message in [
+            vec![0x7F, 0x22, 0x31],
+            vec![0x62, 0xF1, 0x91, 0x12, 0x34],
+            vec![0x62, 0xF1, 0x90, 0x12],
+        ] {
+            assert_eq!(
+                decode(true, 7, 1, &message),
+                Err(VmError::Undecodable { service: 7 }),
+                "{message:02X?}"
+            );
+        }
+    }
+
+    #[test]
+    fn decoding_needs_the_declarations_and_bytes() {
+        assert_eq!(
+            decode(false, 7, 1, &response()),
+            Err(VmError::NoDeclarations)
+        );
+        let program = prog(
+            vec![
+                Op::PushI64(1),
+                Op::DecodeField {
+                    service: 7,
+                    field: 1,
+                },
+            ],
+            vec![],
+        );
+        let bytes = document();
+        let document = load_ecu_document(&bytes).expect("the document loads");
+        let variant = document.variant().expect("a variant");
+        let mut vm = Vm::new(&program);
+        let mut host = MockHost::default();
+        vm.step_with_declarations(&program, Some(&variant), &mut host)
+            .expect("pushes");
+        assert!(matches!(
+            vm.step_with_declarations(&program, Some(&variant), &mut host),
+            Err(StepError::Vm(VmError::TypeMismatch))
+        ));
+    }
 }

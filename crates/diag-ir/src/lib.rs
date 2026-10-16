@@ -15,6 +15,8 @@ mod recovery;
 pub use recovery::*;
 use serde::{Deserialize, Serialize};
 
+use crate::declaration::{EcuVariant, Shape};
+
 /// 2: `Program` gained the restart declaration (`identity`, `preconditions`, `flash`, ADR-245)
 /// and `VmState` lost `checkpoint` and `resume_count`, so both postcard encodings changed.
 /// 3: `Op` gained `Fail` (ADR-280). Programs of version 2 encode the same, but a runtime of
@@ -29,7 +31,9 @@ use serde::{Deserialize, Serialize};
 /// `FloatNotConvertible`.
 /// 10: `VariantPattern` gained `pattern`, which groups a variant's matching parameters into
 /// patterns (ADR-315); a document of version 9 would read every entry as one pattern.
-pub const IR_SCHEMA_VERSION: u32 = 10;
+/// 11: `Op` gained `DecodeField`, and `VmError` gained `NoDeclarations`, `UnknownField`,
+/// `ShapedField` and `Undecodable` (ADR-316).
+pub const IR_SCHEMA_VERSION: u32 = 11;
 
 /// The longest code, in bytes, that `Program::validate` accepts for a `Fail` (ADR-280).
 pub const MAX_FAILURE_CODE_LEN: usize = 128;
@@ -171,6 +175,21 @@ pub enum Op {
     /// Starlark's `int` does. NaN, an infinity, or a value whose integer part is outside the
     /// `I64` range is `VmError::FloatNotConvertible`.
     FloatToInt,
+
+    // Declarations. Appended after `FloatToInt` (ADR-233, ADR-316).
+    /// Replaces the `Bytes` on top of the stack, a whole positive response starting with its
+    /// SID, with the value of field `field` (`Field.id`) among the top-level fields of service
+    /// `service`'s (`Service.id`) declared positive response, decoded through the declaration
+    /// part the VM is stepped with ([`Vm::step_with_declarations`]) by
+    /// [`decode::decode_positive_response`]. An unsigned or signed integer becomes an `I64`, a
+    /// float an `F64`, text its UTF-8 `Bytes`, and bytes `Bytes`; a text table gives its
+    /// internal value. A shaped field, an unknown service or field, a response that does not
+    /// decode, an unsigned value past `i64::MAX` and stepping without declarations are
+    /// `VmError`s.
+    DecodeField {
+        service: u32,
+        field: u32,
+    },
 }
 
 // ---------------------------------------------------------------- Program
@@ -283,6 +302,7 @@ impl Op {
             | Op::Slice
             | Op::IntToFloat
             | Op::FloatToInt
+            | Op::DecodeField { .. }
             | Op::Fail { .. } => false,
         }
     }
@@ -479,10 +499,22 @@ impl Vm {
         program: &Program,
         host: &mut H,
     ) -> Result<StepOutcome, StepError<H::Error>> {
+        self.step_with_declarations(program, None, host)
+    }
+
+    /// [`Vm::step`] with the declaration part of the variant the program runs on, which
+    /// [`Op::DecodeField`] decodes through (ADR-316). Without it, `DecodeField` is
+    /// [`VmError::NoDeclarations`].
+    pub fn step_with_declarations<H: DiagHost>(
+        &mut self,
+        program: &Program,
+        declarations: Option<&EcuVariant<'_>>,
+        host: &mut H,
+    ) -> Result<StepOutcome, StepError<H::Error>> {
         let Some(op) = self.current_op(program)? else {
             return Ok(StepOutcome::Finished);
         };
-        match self.execute(op, program, host)? {
+        match self.execute(op, program, declarations, host)? {
             Executed::Done => {
                 self.state.steps += 1;
                 if self.state.pc as usize == program.code.len() {
@@ -500,6 +532,7 @@ impl Vm {
         &mut self,
         op: &Op,
         program: &Program,
+        declarations: Option<&EcuVariant<'_>>,
         host: &mut H,
     ) -> Result<Executed, StepError<H::Error>> {
         let next = self.state.pc + 1;
@@ -584,6 +617,14 @@ impl Vm {
                 };
                 let converted = float_to_int(*f).ok_or(VmError::FloatNotConvertible)?;
                 self.replace(1, Value::I64(converted));
+            }
+            Op::DecodeField { service, field } => {
+                let [Value::Bytes(message)] = self.top(1)? else {
+                    return Err(VmError::TypeMismatch.into());
+                };
+                let declarations = declarations.ok_or(VmError::NoDeclarations)?;
+                let value = decode_field(declarations, *service, *field, message)?;
+                self.replace(1, value);
             }
             Op::Not => {
                 let Value::Bool(b) = self.top(1)?[0] else {
@@ -821,7 +862,8 @@ impl Vm {
             | Op::Concat
             | Op::Slice
             | Op::IntToFloat
-            | Op::FloatToInt => HostInput::Nothing,
+            | Op::FloatToInt
+            | Op::DecodeField { .. } => HostInput::Nothing,
             // The checks of `Fail` run in `execute`, before it changes anything.
             Op::Fail { .. } => HostInput::Nothing,
         })
@@ -935,6 +977,51 @@ fn store(slots: &mut Vec<Option<Value>>, slot: u16, value: Value) {
         slots.resize(slot + 1, None);
     }
     slots[slot] = Some(value);
+}
+
+/// The value of field `field` of service `service`'s positive response in `message`, decoded
+/// through `variant` ([`Op::DecodeField`], ADR-316).
+fn decode_field(
+    variant: &EcuVariant<'_>,
+    service: u32,
+    field: u32,
+    message: &[u8],
+) -> Result<Value, VmError> {
+    let unknown = || VmError::UnknownField { service, field };
+    let positive = variant
+        .services()
+        .and_then(|services| services.iter().find(|s| s.id() == service))
+        .and_then(|s| s.positive())
+        .ok_or_else(unknown)?;
+    // Checked before decoding: an unknown or shaped field is an error of the program whatever
+    // the response holds, so it is not reported as an undecodable response.
+    let declared = positive
+        .fields()
+        .and_then(|fields| fields.iter().find(|f| f.id() == field))
+        .ok_or_else(unknown)?;
+    if declared.shape_type() != Shape::NONE {
+        return Err(VmError::ShapedField { service, field });
+    }
+    let fields = decode::decode_positive_response(&positive, variant.layouts(), message)
+        .map_err(|_| VmError::Undecodable { service })?;
+    let decoded = fields
+        .into_iter()
+        .find(|f| f.id == field)
+        .ok_or_else(unknown)?;
+    Ok(match decoded.value {
+        decode::PhysicalValue::Unsigned(n) => {
+            Value::I64(i64::try_from(n).map_err(|_| VmError::Overflow)?)
+        }
+        decode::PhysicalValue::Signed(n) => Value::I64(n),
+        decode::PhysicalValue::Float(x) => Value::F64(x),
+        decode::PhysicalValue::Text(text) => Value::Bytes(text.into_bytes()),
+        decode::PhysicalValue::Bytes(bytes) => Value::Bytes(bytes),
+        decode::PhysicalValue::Group(_)
+        | decode::PhysicalValue::Repeat(_)
+        | decode::PhysicalValue::Select { .. } => {
+            return Err(VmError::ShapedField { service, field });
+        }
+    })
 }
 
 /// `f` rounded toward zero, or `None` when it is NaN, infinite, or its integer part is outside
@@ -1119,6 +1206,14 @@ pub enum VmError {
     BytesTooLong(u64),
     #[error("float is NaN, infinite or outside the integer range")]
     FloatNotConvertible,
+    #[error("the VM was stepped without a declaration part to decode with")]
+    NoDeclarations,
+    #[error("service {service} has no declared positive response field {field}")]
+    UnknownField { service: u32, field: u32 },
+    #[error("field {field} of service {service} is a nested layout, not a value")]
+    ShapedField { service: u32, field: u32 },
+    #[error("the response does not decode as service {service}'s positive response")]
+    Undecodable { service: u32 },
 }
 
 #[cfg(test)]

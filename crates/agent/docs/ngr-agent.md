@@ -22,9 +22,9 @@ ngr-agent run --vci <name> --mode <device|user> (--program <file> | --document <
 | `--tx-id`, `--rx-id` | Physical request and response CAN IDs in hex, with or without `0x`. Default `7E0` / `7E8`. Only 11-bit IDs: the link does not set the CAN ID format |
 
 The link is UDS on ISO 15765 at 500 kbit/s (`LinkConfig::iso15765`), with the CAN IDs from the
-command line rather than from the program. Its resource is named by the ISO 22900-2 short names
-of UDS on dual-wire CAN, which both worker kinds resolve (`agent::link::resource_data`,
-ADR-319).
+command line rather than from the program. Its resource is named by the ISO 22900-2 (2022)
+short names of UDS on dual-wire CAN (Annex B.1, B.2), which both worker kinds resolve
+(`agent::link::resource_data`, ADR-319).
 
 Steps (`agent::check_job`, `agent::guards::JobGuards`, `agent::launch::launch_worker`, then `agent::run_program`):
 
@@ -59,9 +59,11 @@ Steps (`agent::check_job`, `agent::guards::JobGuards`, `agent::launch::launch_wo
    with its `long_size`: the resolved registration definition's `LongSize` (design 7.1.1), else
    the ABI's default (7.1.2; ADR-284). An 8-byte `LongSize` for an ABI whose `unsigned long` is
    32 bits wide fails the run before the service starts. Then provision its auth key and connect
-   the gRPC client (design 7.4). The job's link set-up (step 6) names only the protocol in its
-   resource data, which a J2534 worker maps itself; a D-PDU API worker also needs the bus type,
-   so a run with `--api dpdu` stops at the link set-up with an error from the worker.
+   the gRPC client (design 7.4). The job's link set-up (step 6) names its resource by protocol,
+   bus type and DLC pins, which both worker kinds resolve (ADR-319). The rest of that set-up
+   (ComParams, the unique response id table, the event subscription) has not been run against a
+   D-PDU API worker yet, so a run with `--api dpdu` may still stop there with an error from the
+   worker.
 6. Run the program under the request policy and the default job limits (ADR-235), then stop
    the worker and release the guards. The stop request may take up to 2 s to be answered; a
    worker that has not exited 5 s after that is killed and reported on stderr. When the job's link was not confirmed closed and the worker

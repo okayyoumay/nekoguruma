@@ -4,7 +4,7 @@
 **Status:** Accepted
 **Affects:** `agent` (`src/link.rs`: `PROTOCOL_UDS_ON_CAN`, `BUS_TYPE_DWCAN`, `DWCAN_PINS`,
 `resource_data`), `iso22900-mock` (`PDUGetObjectId`), `iso22900-service/tests/agent_launch.rs`,
-`crates/agent/docs/ngr-agent.md`; ADR-235 item 4, ADR-069
+`crates/agent/docs/ngr-agent.md`, design 8.2.4; ADR-235 item 4, ADR-069
 
 ## Context
 

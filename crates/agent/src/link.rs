@@ -20,7 +20,7 @@ use crate::policy::Permission;
 /// What a job's link needs. Until procedures declare their timings, the caller fills it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinkConfig {
-    /// ISO 22900-2 protocol short name, e.g. [`PROTOCOL_UDS_ON_CAN`].
+    /// ISO 22900-2 (2022) protocol short name (Annex B.1), e.g. [`PROTOCOL_UDS_ON_CAN`].
     pub protocol_short_name: String,
     pub baud_rate: u32,
     /// Physical request CAN ID (tester to ECU).

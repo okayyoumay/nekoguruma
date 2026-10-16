@@ -27,13 +27,15 @@ use starlark_syntax::syntax::ast::{
 use starlark_syntax::syntax::{AstModule, Dialect, DialectTypes};
 
 mod bounds;
+mod lower;
 
 pub use bounds::{
     MAX_BLOCK_DEPTH, MAX_BRACKET_DEPTH, MAX_ELIF_CHAIN, MAX_EXPRESSION_DEPTH, MAX_SOURCE_BYTES,
     PARSER_STACK_BYTES, on_parser_stack,
 };
+pub use lower::lower;
 
-/// The error codes of `docs/starlark-subset.md` that the checker reports.
+/// The error codes of `docs/starlark-subset.md` that the checker and the lowering report.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub enum StarCode {
     /// The file does not parse (section 5).
@@ -81,6 +83,16 @@ pub enum StarCode {
     /// A file nested past one of the bounds of 2.8.
     #[serde(rename = "STAR_NESTING_TOO_DEEP")]
     NestingTooDeep,
+    /// An argument that must be known at ingestion is not (3.1).
+    #[serde(rename = "STAR_NON_CONSTANT_ARGUMENT")]
+    NonConstantArgument,
+    /// A construct whose lowering needs an instruction the IR does not have, or that the
+    /// lowering does not cover yet (2.5, 4.4).
+    #[serde(rename = "STAR_NOT_LOWERABLE")]
+    NotLowerable,
+    /// A `diag` function with no IR instruction yet (3.2).
+    #[serde(rename = "STAR_API_NOT_AVAILABLE")]
+    ApiNotAvailable,
 }
 
 impl StarCode {
@@ -102,6 +114,9 @@ impl StarCode {
             Self::ArgumentOutOfRange => "STAR_ARGUMENT_OUT_OF_RANGE",
             Self::SourceTooLarge => "STAR_SOURCE_TOO_LARGE",
             Self::NestingTooDeep => "STAR_NESTING_TOO_DEEP",
+            Self::NonConstantArgument => "STAR_NON_CONSTANT_ARGUMENT",
+            Self::NotLowerable => "STAR_NOT_LOWERABLE",
+            Self::ApiNotAvailable => "STAR_API_NOT_AVAILABLE",
         }
     }
 }

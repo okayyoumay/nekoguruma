@@ -74,9 +74,9 @@ signal. All of Codex's output is by `chatgpt-codex-connector[bot]` (in `get_revi
   "Reviewed commit: `<short SHA>`", with the findings as inline comments in the same review. Each
   inline comment starts with a severity badge whose image alt text is "P0 Badge" to "P3 Badge".
   Their closing "Useful? React with 👍 / 👎" line is not a question for you.
-- **Clean** (`status: completed`, `has_any_findings: false`): no review on the head. Older Codex
-  versions posted a separate PR comment starting "Codex Review: Didn't find any major issues"
-  naming the reviewed commit; treat that the same way if it appears.
+- **Clean** (`status: completed`, `has_any_findings: false`): no review on the head. Codex also
+  posts a separate PR comment starting "Codex Review: Didn't find any major issues" that names the
+  reviewed commit; it confirms the same result.
 - **Error**: a PR comment starting "Codex Review: Something went wrong", usually with the cause in
   a code block. Request again once on the same head; a second error on that head counts as a stall
   (below).

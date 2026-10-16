@@ -1,4 +1,4 @@
-use diag_ir::{DiagHost, StepOutcome, Vm};
+use diag_ir::{DiagHost, StepOutcome, Vm, WaitingOn};
 
 use super::*;
 use crate::star::check;
@@ -786,7 +786,7 @@ fn what_the_ir_cannot_express_is_not_lowerable() {
         // A loop.
         "def main():\n    for i in range(3):\n        pass\n",
         // A primitive not lowered yet.
-        "def main():\n    diag.wait(10)\n",
+        "def main():\n    diag.record(\"t\")\n",
     ];
     for source in cases {
         let found = codes(source);
@@ -837,7 +837,7 @@ fn none_cannot_reach_run_time() {
 
 #[test]
 fn every_problem_is_reported() {
-    let found = codes("def main():\n    diag.wait(1)\n    diag.ecu_info()\n    x = [1]\n");
+    let found = codes("def main():\n    diag.record(\"t\")\n    diag.ecu_info()\n    x = [1]\n");
     assert_eq!(
         found,
         [
@@ -872,4 +872,172 @@ def main():
         diag.fail(\"OK\", \"\")
 ";
     assert_eq!(failed_with(source), "OK");
+}
+
+/// A host that records the calls procedures make, and reports a wait as done only from its
+/// `waits_pending`-th inquiry on.
+#[derive(Default)]
+struct ScriptedHost {
+    calls: Vec<String>,
+    waits_pending: u32,
+}
+
+impl DiagHost for ScriptedHost {
+    type Error = NoHostError;
+
+    fn service_request(&mut self, _: u16, _: &[u8]) -> Result<Vec<u8>, NoHostError> {
+        unreachable!("not lowered yet")
+    }
+    fn read_dtc(&mut self, _: u8) -> Result<Vec<u8>, NoHostError> {
+        unreachable!("not lowered yet")
+    }
+    fn routine_control(&mut self, _: u16, _: u8, _: &[u8]) -> Result<Vec<u8>, NoHostError> {
+        unreachable!("not lowered yet")
+    }
+    fn security_access(&mut self, _: u64, _: u8, _: &[u8]) -> Result<Option<Vec<u8>>, NoHostError> {
+        unreachable!("not lowered yet")
+    }
+    fn flash_transfer(&mut self, _: u32, _: &[u8]) -> Result<(), NoHostError> {
+        unreachable!("not lowered yet")
+    }
+    fn wait(&mut self, _: u64, millis: u32) -> Result<bool, NoHostError> {
+        if self.waits_pending > 0 {
+            self.waits_pending -= 1;
+            return Ok(false);
+        }
+        self.calls.push(format!("wait {millis}"));
+        Ok(true)
+    }
+    fn hmi_request(&mut self, _: u64, _: &[u8]) -> Result<Option<Vec<u8>>, NoHostError> {
+        unreachable!("not lowered yet")
+    }
+    fn record_input(&mut self, _: u64, _: &[u8]) -> Result<Option<Vec<u8>>, NoHostError> {
+        unreachable!("not lowered yet")
+    }
+    fn monitor_capture(&mut self, back_millis: u32) -> Result<(), NoHostError> {
+        self.calls.push(format!("capture {back_millis}"));
+        Ok(())
+    }
+    fn log(&mut self, level: u8, message: &str) {
+        self.calls.push(format!("log {level} {message}"));
+    }
+}
+
+/// Runs `source` against `host` to its end, counting the steps that waited.
+fn run_on(source: &str, host: &mut ScriptedHost) -> u32 {
+    let program = lowered(source).unwrap_or_else(|errors| panic!("{errors:#?}"));
+    let mut vm = Vm::new(&program);
+    let mut waited = 0;
+    for _ in 0..10_000 {
+        match vm.step(&program, host) {
+            Ok(StepOutcome::Continue) => {}
+            Ok(StepOutcome::Finished) => return waited,
+            Ok(StepOutcome::Waiting(WaitingOn::Timer)) => waited += 1,
+            other => panic!("{other:?}"),
+        }
+    }
+    panic!("the procedure did not end")
+}
+
+#[test]
+fn wait_log_and_capture_reach_the_host_in_order() {
+    let source = "\
+STEP = 250
+
+def main():
+    diag.log(2, \"start\")
+    diag.wait(STEP * 6)
+    diag.capture(STEP)
+    diag.wait(0)
+    diag.log(0, \"end \" + \"of run\")
+";
+    let mut host = ScriptedHost::default();
+    assert_eq!(run_on(source, &mut host), 0);
+    assert_eq!(
+        host.calls,
+        [
+            "log 2 start",
+            "wait 1500",
+            "capture 250",
+            "wait 0",
+            "log 0 end of run"
+        ]
+    );
+    // The full ranges of 3.1 are accepted.
+    let edges = "def main():\n    diag.wait(4294967295)\n    diag.capture(4294967295)\n    diag.log(255, \"x\")\n";
+    let mut host = ScriptedHost::default();
+    run_on(edges, &mut host);
+    assert_eq!(
+        host.calls,
+        ["wait 4294967295", "capture 4294967295", "log 255 x"]
+    );
+}
+
+#[test]
+fn a_wait_not_yet_over_is_stepped_again() {
+    let mut host = ScriptedHost {
+        waits_pending: 2,
+        ..ScriptedHost::default()
+    };
+    let waited = run_on(
+        "def main():\n    diag.wait(10)\n    diag.log(1, \"after\")\n",
+        &mut host,
+    );
+    assert_eq!(waited, 2);
+    assert_eq!(host.calls, ["wait 10", "log 1 after"]);
+}
+
+#[test]
+fn wait_log_and_capture_arguments_are_checked() {
+    use StarCode::*;
+    let cases = [
+        // Known only at run time.
+        (
+            "def f(n):\n    diag.wait(n)\n\ndef main():\n    f(1)\n",
+            NonConstantArgument,
+            2,
+        ),
+        (
+            "def f(n):\n    diag.capture(n)\n\ndef main():\n    f(1)\n",
+            NonConstantArgument,
+            2,
+        ),
+        (
+            "def f(n):\n    diag.log(n, \"x\")\n\ndef main():\n    f(1)\n",
+            NonConstantArgument,
+            2,
+        ),
+        (
+            "def f(s):\n    diag.log(1, s)\n\ndef main():\n    f(\"x\")\n",
+            NonConstantArgument,
+            2,
+        ),
+        // Outside the ranges of 3.1.
+        ("def main():\n    diag.wait(-1)\n", ArgumentOutOfRange, 2),
+        (
+            "def main():\n    diag.wait(4294967296)\n",
+            ArgumentOutOfRange,
+            2,
+        ),
+        ("def main():\n    diag.capture(-5)\n", ArgumentOutOfRange, 2),
+        (
+            "def main():\n    diag.log(256, \"x\")\n",
+            ArgumentOutOfRange,
+            2,
+        ),
+        // The wrong type or number of arguments.
+        ("def main():\n    diag.wait(1.5)\n", UnsupportedSyntax, 2),
+        (
+            "def main():\n    diag.log(1, b\"x\")\n",
+            UnsupportedSyntax,
+            2,
+        ),
+        ("def main():\n    diag.wait()\n", UnsupportedSyntax, 2),
+        ("def main():\n    diag.log(1)\n", UnsupportedSyntax, 2),
+        // They return nothing.
+        ("def main():\n    x = diag.wait(1)\n", UnsupportedSyntax, 2),
+    ];
+    for (source, code, line) in cases {
+        assert_eq!(codes(source), vec![(code, line)], "{source}");
+    }
 }

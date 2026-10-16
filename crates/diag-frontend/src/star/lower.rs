@@ -3,11 +3,13 @@
 //!
 //! The core of the lowering: top-level constants (folded at ingestion), top-level `def`s with
 //! positional parameters, calls between them, locals, the operators the IR's instructions
-//! cover, `and`, `or`, `not`, conditional expressions, `if`/`elif`/`else` and `diag.fail`.
-//! Every value that reaches run time has one type, inferred at ingestion (ADR-304); an
-//! operation the IR cannot express for its operands is `STAR_NOT_LOWERABLE`.
+//! cover, `and`, `or`, `not`, conditional expressions, `if`/`elif`/`else`, and `diag.fail`,
+//! `diag.wait`, `diag.log` and `diag.capture`. Every value that reaches run time has one type,
+//! inferred at ingestion (ADR-304); an operation the IR cannot express for its operands is
+//! `STAR_NOT_LOWERABLE`.
 //!
-//! Not lowered yet, each its own backlog item: `for` loops, the other `diag` functions,
+//! Not lowered yet, each its own backlog item: `for` loops, the other `diag` functions (`hmi`
+//! and `record`; `request`, `routine`, `read_dtc` and `security_access`; `flash_transfer`),
 //! built-ins and string methods on values known only at run time, and section and idempotency
 //! annotations. Each is rejected with `STAR_NOT_LOWERABLE` (or `STAR_API_NOT_AVAILABLE` for a
 //! `diag` function without an instruction), so nothing is lowered silently wrong.
@@ -1929,6 +1931,82 @@ impl<'a> Lowerer<'a> {
                     _ => Val::Void(Vec::new()),
                 }
             }
+            "wait" | "capture" => {
+                let what = if name == "wait" {
+                    "millis"
+                } else {
+                    "back_millis"
+                };
+                let [millis] = args else {
+                    self.error(
+                        StarCode::UnsupportedSyntax,
+                        span,
+                        format!("`diag.{name}` takes one argument, `{what}` (3.1)"),
+                    );
+                    return Val::Void(Vec::new());
+                };
+                let Some(millis) =
+                    self.constant_int(id, millis, name, what, 0..=i64::from(u32::MAX))
+                else {
+                    return Val::Void(Vec::new());
+                };
+                // In range by the check above.
+                let millis = millis as u32;
+                let op = if name == "wait" {
+                    Op::Wait { millis }
+                } else {
+                    Op::MonitorCapture {
+                        back_millis: millis,
+                    }
+                };
+                Val::Void(vec![(Ins::Op(op), span)])
+            }
+            "log" => {
+                let [level, message] = args else {
+                    self.error(
+                        StarCode::UnsupportedSyntax,
+                        span,
+                        "`diag.log` takes a level and a message (3.1)",
+                    );
+                    return Val::Void(Vec::new());
+                };
+                let level = self.constant_int(id, level, name, "level", 0..=255);
+                let message = match self.expr(id, message) {
+                    Val::Const(Const::Str(text)) => Some(text),
+                    Val::Const(other) => {
+                        self.error(
+                            StarCode::UnsupportedSyntax,
+                            message.span,
+                            format!("a `diag.log` message is a str, not a {}", other.type_name()),
+                        );
+                        None
+                    }
+                    _ => {
+                        self.error(
+                            StarCode::NonConstantArgument,
+                            message.span,
+                            "a `diag.log` message must be a string constant: `Log` takes it from \
+                             the constant pool, and a message built at run time needs a log \
+                             instruction that takes it from the stack (3.2)",
+                        );
+                        None
+                    }
+                };
+                match (level, message) {
+                    (Some(level), Some(text)) => {
+                        let message = self.pool(text.as_bytes());
+                        Val::Void(vec![(
+                            Ins::Op(Op::Log {
+                                // In range by the check above.
+                                level: level as u8,
+                                message,
+                            }),
+                            span,
+                        )])
+                    }
+                    _ => Val::Void(Vec::new()),
+                }
+            }
             "ecu_info" | "precondition" => {
                 self.error(
                     StarCode::ApiNotAvailable,
@@ -1940,6 +2018,55 @@ impl<'a> Lowerer<'a> {
             _ => {
                 self.not_lowerable(span, format!("`diag.{name}` is not lowered yet (3.2)"));
                 Val::Run(Tys::default(), Vec::new())
+            }
+        }
+    }
+
+    /// The value of `arg`, an argument of `diag.{function}` that its instruction holds as a
+    /// fixed field: an `int` constant in `range` (subset 3.1), or `None` after an error.
+    fn constant_int(
+        &mut self,
+        id: Option<usize>,
+        arg: &AstExpr,
+        function: &str,
+        what: &str,
+        range: std::ops::RangeInclusive<i64>,
+    ) -> Option<i64> {
+        match self.expr(id, arg) {
+            Val::Const(Const::Int(n)) if range.contains(&n) => Some(n),
+            Val::Const(Const::Int(n)) => {
+                self.error(
+                    StarCode::ArgumentOutOfRange,
+                    arg.span,
+                    format!(
+                        "`{what}` of `diag.{function}` is {n}, outside {} to {} (3.1)",
+                        range.start(),
+                        range.end()
+                    ),
+                );
+                None
+            }
+            Val::Const(other) => {
+                self.error(
+                    StarCode::UnsupportedSyntax,
+                    arg.span,
+                    format!(
+                        "`{what}` of `diag.{function}` is an int, not a {} (3.1)",
+                        other.type_name()
+                    ),
+                );
+                None
+            }
+            _ => {
+                self.error(
+                    StarCode::NonConstantArgument,
+                    arg.span,
+                    format!(
+                        "`{what}` of `diag.{function}` must be known at ingestion: the \
+                         instruction holds it as a fixed field (3.1)"
+                    ),
+                );
+                None
             }
         }
     }

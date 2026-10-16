@@ -68,7 +68,7 @@ unsafe { libloading::Library::new(&lib_path).unwrap().get::<fn()>(b"__mock_reset
 | `PDUCancelComPrimitive` | Always succeeds. |
 | `PDUGetEventItem` | Dequeues one pending event. Returns `PDU_ERR_EVENT_QUEUE_EMPTY` when empty. |
 | `PDURegisterEventCallback` | Stores the callback function for the given CLL handle. |
-| `PDUGetObjectId` | Returns `PDU_ERR_ID_NOT_SUPPORTED` for unknown names. |
+| `PDUGetObjectId` | Resolves the mock's own test names (`mock-bus`, `mock-protocol`, `mock-resource`, `mock-com-param`, `mock-pin-type`) and the ISO 22900-2 (2022) short names in the constants below; returns `PDU_ERR_INVALID_PARAMETERS` for any other name. |
 | `PDUGetUniqueRespIdTable` | Returns empty table. |
 | `PDUSetUniqueRespIdTable` | Always succeeds. |
 | `PDUGetTimestamp` | Returns `MOCK_TIMESTAMP` = 4242. |
@@ -168,6 +168,7 @@ The `rlib` portion exports the following Rust functions for use in test setup:
 | `STANDARD_BUS_TYPE_DWCAN` | 3111 | `PDUGetObjectId` of the bus type `ISO_11898_2_DWCAN` (ADR-319) |
 | `STANDARD_PROTOCOL_UDS_ON_CAN` | 3112 | `PDUGetObjectId` of the protocol `ISO_14229_3_on_ISO_15765_2` (ADR-319) |
 | `STANDARD_PIN_TYPE_HI`, `STANDARD_PIN_TYPE_LOW` | 3311, 3312 | `PDUGetObjectId` of the pin types `HI` and `LOW` (ADR-319) |
+| `STANDARD_COMPARAMS` | 3210 to 3217 | `PDUGetObjectId` of the ISO 22900-2 (2022) ComParams (Annex B.3) the agent sets on a UDS on CAN link: `CP_Baudrate`, `CP_P2Max`, `CP_P2Star`, `CP_RC78Handling`, `CP_RCByteOffset`, `CP_RC78CompletionTimeout`, `CP_CanPhysReqId`, `CP_CanRespUSDTId`. The mock keeps no ComParam values |
 | `MOCK_LOGICAL_LINK_HANDLE` | 3001 | Base CLL handle (first `PDUCreateComLogicalLink`) |
 | `MOCK_COM_PRIMITIVE_HANDLE` | 4001 | Base COP handle (first `PDUStartComPrimitive`) |
 | `MOCK_TIMESTAMP` | 4242 | Timestamp returned by `PDUGetTimestamp` |

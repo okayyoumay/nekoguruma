@@ -30,6 +30,8 @@ tracing = { workspace = true }
 [dev-dependencies]
 # tests/agent_launch.rs launches this service through the agent's launch path.
 agent = { path = "../agent" }
+# tests/ngr_agent_dpdu_end_to_end.rs writes and reads diag-ir programs and states.
+diag-ir = { workspace = true }
 iso22900-mock = { workspace = true }
 worker-host = { workspace = true }
 serial_test = "3"

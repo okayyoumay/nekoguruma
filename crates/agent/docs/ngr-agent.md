@@ -60,10 +60,10 @@ Steps (`agent::check_job`, `agent::guards::JobGuards`, `agent::launch::launch_wo
    the ABI's default (7.1.2; ADR-284). An 8-byte `LongSize` for an ABI whose `unsigned long` is
    32 bits wide fails the run before the service starts. Then provision its auth key and connect
    the gRPC client (design 7.4). The job's link set-up (step 6) names its resource by protocol,
-   bus type and DLC pins, which both worker kinds resolve (ADR-319). The rest of that set-up
-   (ComParams, the unique response id table, the event subscription) has not been run against a
-   D-PDU API worker yet, so a run with `--api dpdu` may still stop there with an error from the
-   worker.
+   bus type and DLC pins, which both worker kinds resolve (ADR-319), and sets the link's
+   ComParams by their ISO 22900-2 (2022) short names (Annex B.3). A run with `--api dpdu` is
+   tested end to end on `iso22900-mock` with a simulated ECU attached (ADR-299,
+   `crates/iso22900-service/tests/ngr_agent_dpdu_end_to_end.rs`).
 6. Run the program under the request policy and the default job limits (ADR-235), then stop
    the worker and release the guards. The stop request may take up to 2 s to be answered; a
    worker that has not exited 5 s after that is killed and reported on stderr. When the job's link was not confirmed closed and the worker

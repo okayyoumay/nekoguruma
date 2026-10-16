@@ -16,6 +16,26 @@ use sim_ecu::{Addressing, EcuConfig, Fault, SimEcu};
 
 const MOCK_MODULE_HANDLE: UNUM32 = 1001;
 const MOCK_RESOURCE_ID: UNUM32 = 2001;
+/// The ISO 22900-2 (2022) ComParams (Annex B.3) the mock resolves, with the object ids it gives
+/// them: those the agent sets up a UDS on CAN link with. The mock keeps no ComParam values.
+pub const STANDARD_COMPARAMS: [(&str, UNUM32); 8] = [
+    ("CP_Baudrate", 3210),
+    ("CP_P2Max", 3211),
+    ("CP_P2Star", 3212),
+    ("CP_RC78Handling", 3213),
+    ("CP_RCByteOffset", 3214),
+    ("CP_RC78CompletionTimeout", 3215),
+    ("CP_CanPhysReqId", 3216),
+    ("CP_CanRespUSDTId", 3217),
+];
+
+fn standard_comparam_id(name: &str) -> Option<UNUM32> {
+    STANDARD_COMPARAMS
+        .iter()
+        .find(|(short_name, _)| *short_name == name)
+        .map(|&(_, id)| id)
+}
+
 /// Object ids the mock gives the ISO 22900-2 (2022) short names it resolves (Annex B.1, B.2).
 pub const STANDARD_BUS_TYPE_DWCAN: UNUM32 = 3111;
 pub const STANDARD_PROTOCOL_UDS_ON_CAN: UNUM32 = 3112;
@@ -1210,6 +1230,10 @@ exported_fn!(PDUGetObjectId(pdu_object_type: T_PDU_OBJT, p_shortname: *mut CHAR8
         }
         (E_PDU_OBJT::PDU_OBJT_PINTYPE, "HI") => STANDARD_PIN_TYPE_HI,
         (E_PDU_OBJT::PDU_OBJT_PINTYPE, "LOW") => STANDARD_PIN_TYPE_LOW,
+        (E_PDU_OBJT::PDU_OBJT_COMPARAM, name) => match standard_comparam_id(name) {
+            Some(id) => id,
+            None => return invalid_parameters(),
+        },
         // An unrecognized (object type, shortname) pair is a client error,
         // matching how a real D-PDU DLL's PDUGetObjectId rejects an unknown
         // shortname (PDU_ERR_INVALID_PARAMETERS) rather than silently

@@ -1341,3 +1341,18 @@ def main():
     let lowered = lowered_with_warnings(warnings).unwrap();
     assert_eq!(lowered.warnings.len(), 1);
 }
+
+#[test]
+fn a_range_loop_body_does_not_fold_a_name_it_assigns() {
+    // `x` is bound to 1 by the unrolled loop, but the range body assigns it and runs again,
+    // so every read in the body must see the run-time value: 1 + 3 = 4.
+    let source = "\
+def main():
+    for x in [1]:
+        for j in range(3):
+            x = x + 1
+        if x == 4:
+            diag.log(1, \"ok\")
+";
+    assert_eq!(run_logged(source).0, ["log 1 ok"]);
+}

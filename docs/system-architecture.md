@@ -903,7 +903,7 @@ flowchart LR
 **Conversion rules**
 
 - **Static resolution**: Function calls are limited to those that can be resolved statically. Unresolvable calls are errors
-- **Loop limits**: A loop over a range or value whose length is not known at ingestion gets a runtime iteration limit embedded
+- **Loop limits**: A loop over a constant list is unrolled at ingestion, within a fixed bound on the unrolling work, nested loops multiplying. A loop over a `range` runs; when a bound is not known at ingestion, or the loop has a `@maxIterations` annotation, it gets a runtime iteration limit (default 1000, reported as a warning), and running past it ends the procedure as failed. A range that would step past the 64-bit integer range ends there (ADR-305)
 - **Determinism**: Dependence on current time, random numbers or external state is impossible in Starlark itself. Where needed, it goes through the diagnostic primitive API so that execution can be reproduced from the audit log
 - **Diagnostic primitive API**: Written as plain synchronous calls and mapped in bytecode to instructions that involve waiting
 - **Numbers**: Starlark integers map to the IR's checked 64-bit integers, so a value outside that range is a run-time error. Floor division and remainder keep Starlark's semantics; the transpiler corrects the IR's truncating division (ADR-233) for operands of different signs

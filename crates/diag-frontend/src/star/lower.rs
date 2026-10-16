@@ -433,6 +433,10 @@ struct Lowerer<'a> {
     /// Whether the variable of a loop over items that exist only at ingestion is used outside
     /// the loop, by statement, so the function is searched once per loop.
     variable_escapes: HashMap<*const AstStmt, bool>,
+    /// How often each name is read or updated in each function, by function, taken once.
+    mention_counts: HashMap<usize, HashMap<String, usize>>,
+    /// The names each loop body assigns, by body, taken once.
+    assigned: HashMap<*const AstStmt, Rc<HashSet<String>>>,
 }
 
 /// Where `break` and `continue` jump in the loop being lowered.
@@ -477,6 +481,8 @@ impl<'a> Lowerer<'a> {
             unrolled: 0,
             unrolling: 0,
             variable_escapes: HashMap::new(),
+            mention_counts: HashMap::new(),
+            assigned: HashMap::new(),
         }
     }
 
@@ -868,12 +874,10 @@ impl<'a> Lowerer<'a> {
             self.range_loop(id, stmt, &var, &positional, &for_.body, code);
             return;
         }
+        // Shared, not copied: an iteration takes its item when it comes to it.
         let items = match self.expr(Some(id), &for_.over) {
-            Val::Const(Const::List(items, _)) => items.to_vec(),
-            Val::Const(Const::Dict(entries, _)) => entries
-                .iter()
-                .map(|(key, _)| Const::Str(key.clone()))
-                .collect(),
+            Val::Const(Const::List(items, _)) => Items::List(items),
+            Val::Const(Const::Dict(entries, _)) => Items::Keys(entries),
             Val::Const(other) => {
                 self.not_lowerable(
                     for_.over.span,
@@ -905,23 +909,22 @@ impl<'a> Lowerer<'a> {
         id: usize,
         stmt: &AstStmt,
         var: &str,
-        items: Vec<Const>,
+        items: Items,
         body: &AstStmt,
         code: &mut Code,
     ) {
-        let mut assigned = HashSet::new();
-        collect_locals(body, &mut assigned, &mut HashSet::new());
         let end = self.label();
         self.loops.push(LoopLabels { end, next: end });
         self.unrolling += 1;
-        for item in items {
+        for at in 0..items.len() {
             if !self.unroll_step(stmt.span) {
                 break;
             }
+            let item = items.get(at);
             if item.ty().is_none() {
                 // No slot can hold the item, so the variable has a value only inside the body.
-                let escapes = self.variable_escapes(id, stmt, var);
-                if escapes || assigned.contains(var) {
+                let escapes = self.variable_escapes(id, stmt, body, var);
+                if escapes || self.assigned_in(body).contains(var) {
                     let place = if escapes {
                         "is used outside the loop"
                     } else {
@@ -978,15 +981,42 @@ impl<'a> Lowerer<'a> {
     }
 
     /// Whether function `id` reads `var`, or updates it with an augmented assignment, anywhere
-    /// outside the loop `stmt` (its body counts as inside).
-    fn variable_escapes(&mut self, id: usize, stmt: &AstStmt, var: &str) -> bool {
+    /// outside the body of the loop `stmt`: whether it is mentioned more often in the function
+    /// than in the body. The function's counts are taken once, and a loop's once, so sibling
+    /// loops do not each search the whole function.
+    fn variable_escapes(&mut self, id: usize, stmt: &AstStmt, body: &AstStmt, var: &str) -> bool {
         let key: *const AstStmt = stmt;
         if let Some(&escapes) = self.variable_escapes.get(&key) {
             return escapes;
         }
-        let escapes = mentions_outside(&self.funcs[id].def.body, var, stmt);
+        let total = match self.mention_counts.get(&id) {
+            Some(counts) => counts.get(var).copied().unwrap_or(0),
+            None => {
+                let mut counts = HashMap::new();
+                count_mentions(&self.funcs[id].def.body, &mut counts);
+                let total = counts.get(var).copied().unwrap_or(0);
+                self.mention_counts.insert(id, counts);
+                total
+            }
+        };
+        let mut inside = HashMap::new();
+        count_mentions(body, &mut inside);
+        let escapes = total > inside.get(var).copied().unwrap_or(0);
         self.variable_escapes.insert(key, escapes);
         escapes
+    }
+
+    /// The names `body` assigns, nested statements included, taken once per body.
+    fn assigned_in(&mut self, body: &AstStmt) -> Rc<HashSet<String>> {
+        let key: *const AstStmt = body;
+        self.assigned
+            .entry(key)
+            .or_insert_with(|| {
+                let mut assigned = HashSet::new();
+                collect_locals(body, &mut assigned, &mut HashSet::new());
+                Rc::new(assigned)
+            })
+            .clone()
     }
 
     /// A loop over `range(start, stop, step)`: the step must be a constant other than 0. When
@@ -1129,6 +1159,11 @@ impl<'a> Lowerer<'a> {
             );
         }
         code.extend([Ins::Op(Op::LoadLocal(i)), Ins::Op(Op::StoreLocal(slot))].map(at));
+        // The body runs again after it assigns a name, so a name it assigns must not fold to an
+        // enclosing unrolled loop's constant anywhere in it, even before the assignment.
+        for name in self.assigned_in(body).iter() {
+            self.unbind(name);
+        }
         self.loops.push(LoopLabels { end, next });
         self.stmt(id, body, code);
         self.loops.pop();
@@ -2750,35 +2785,48 @@ fn returns_value(stmt: &AstStmt) -> bool {
 }
 
 /// Whether every path through the body ends in a `return`.
-/// Whether `stmt`, outside `skip`, reads `name` or updates it with an augmented assignment.
-fn mentions_outside(stmt: &AstStmt, name: &str, skip: &AstStmt) -> bool {
-    if std::ptr::eq(stmt, skip) {
-        return false;
-    }
+/// Counts, for each name, how often `stmt` reads it or updates it with an augmented
+/// assignment.
+fn count_mentions(stmt: &AstStmt, counts: &mut HashMap<String, usize>) {
     if let StmtP::AssignModify(target, ..) = &stmt.node
-        && matches!(&target.node, AssignTargetP::Identifier(n) if n.node.ident == name)
+        && let AssignTargetP::Identifier(name) = &target.node
     {
-        return true;
+        *counts.entry(name.node.ident.clone()).or_default() += 1;
     }
-    let mut found = false;
-    stmt.visit_children(|child| {
-        found = found
-            || match child {
-                Visit::Stmt(inner) => mentions_outside(inner, name, skip),
-                Visit::Expr(expr) => mentions(expr, name),
-            }
+    stmt.visit_children(|child| match child {
+        Visit::Stmt(inner) => count_mentions(inner, counts),
+        Visit::Expr(expr) => count_expr_mentions(expr, counts),
     });
-    found
 }
 
-/// Whether `expr` reads `name`.
-fn mentions(expr: &AstExpr, name: &str) -> bool {
-    if matches!(&expr.node, ExprP::Identifier(ident) if ident.node.ident == name) {
-        return true;
+fn count_expr_mentions(expr: &AstExpr, counts: &mut HashMap<String, usize>) {
+    if let ExprP::Identifier(ident) = &expr.node {
+        *counts.entry(ident.node.ident.clone()).or_default() += 1;
     }
-    let mut found = false;
-    expr.visit_expr(|inner| found = found || mentions(inner, name));
-    found
+    expr.visit_expr(|inner| count_expr_mentions(inner, counts));
+}
+
+/// The items of a constant loop, shared with the constant they come from.
+enum Items {
+    List(Rc<[Const]>),
+    /// A dict's keys.
+    Keys(Rc<[(Rc<str>, Const)]>),
+}
+
+impl Items {
+    fn len(&self) -> usize {
+        match self {
+            Items::List(items) => items.len(),
+            Items::Keys(entries) => entries.len(),
+        }
+    }
+
+    fn get(&self, at: usize) -> Const {
+        match self {
+            Items::List(items) => items[at].clone(),
+            Items::Keys(entries) => Const::Str(entries[at].0.clone()),
+        }
+    }
 }
 
 fn always_returns(stmt: &AstStmt) -> bool {

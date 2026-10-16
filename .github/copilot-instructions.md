@@ -60,6 +60,10 @@ reviewing.
   (the folder itself and `work/README.md` are fine). Open items belong in `work/`.
 - **Tests weakened**: a test skipped, ignored, deleted or loosened to pass CI, or `#[serial]`
   removed from a test sharing process-global state.
+- **IR golden files**: a change to the IR, to `diag-frontend`'s conversion or lowering, or to
+  the example ECU whose effect on the IR, the requests or the decoded values is not recorded in
+  `crates/diag-frontend/tests/golden/` (regenerated with `NGR_UPDATE_GOLDEN=1`), or a golden-file
+  diff that does not match the change described.
 
 ## Do not flag
 

@@ -21,12 +21,15 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 
 use diag_ir::IR_SCHEMA_VERSION;
-use diag_ir::declaration::{ComParamT, EcuDocumentT, EcuVariantT, ProtocolT, encode_ecu_document};
+use diag_ir::declaration::{
+    ComParamT, EcuDocumentT, EcuVariant, EcuVariantT, ProtocolT, encode_ecu_document,
+    load_ecu_document,
+};
 use sha2::{Digest, Sha256};
 
 use crate::star::{self, StarError};
+use crate::tables::Definition;
 use crate::tables::rows::CatalogRow;
-use crate::tables::{Definition, Tables};
 
 /// The `source_format` of a document converted from CSV tables and Starlark (ADR-254).
 pub const SOURCE_FORMAT: &str = "csv-starlark";
@@ -66,16 +69,18 @@ pub struct CatalogEntry {
     pub text: String,
 }
 
-/// A procedure file of a definition directory, checked and lowered (ADR-307).
+/// A procedure file of a definition directory, checked once and lowered for each variant
+/// (ADR-307, ADR-311).
 #[derive(Debug, Clone)]
 pub struct Procedure {
     /// The file name, `.star` included.
     pub file: String,
     /// The file's contents as stored, which the document's `source_digest` covers.
     pub source: Vec<u8>,
-    /// The postcard encoding of the lowered `diag_ir::Program`: `EcuDocument.procedure`.
-    pub program: Vec<u8>,
-    /// The file's warnings (`starlark-subset.md` section 5).
+    /// The postcard encoding of the `diag_ir::Program` lowered for each variant, by row of
+    /// `variants.csv` in its order: `EcuDocument.procedure` of that variant's document.
+    pub programs: Vec<Vec<u8>>,
+    /// The file's warnings (`starlark-subset.md` section 5), each given once (ADR-311).
     pub warnings: Vec<StarError>,
 }
 
@@ -87,23 +92,63 @@ pub struct ProceduresRejected {
     pub warnings: Vec<StarError>,
 }
 
-/// Checks and lowers each procedure file of `tables`, in byte order of their names. Every file is
-/// checked and lowered, so the errors of all of them are listed together.
-pub fn lower_procedures(tables: &Tables) -> Result<Vec<Procedure>, ProceduresRejected> {
+/// Checks each procedure file of `definition`, in byte order of their names, and lowers it for
+/// each variant against that variant's declarations (ADR-311). Every file is checked and
+/// lowered, so the errors of all of them are listed together; a file is lowered only when its
+/// check passed, and an error that only some variants give names them.
+pub fn lower_procedures(definition: &Definition) -> Result<Vec<Procedure>, ProceduresRejected> {
+    let declarations: Vec<Vec<u8>> = declarations(definition)
+        .iter()
+        .map(encode_ecu_document)
+        .collect();
+    let variants: Vec<(&str, EcuVariant<'_>)> = definition
+        .tables
+        .variants
+        .iter()
+        .zip(&declarations)
+        .map(|(row, bytes)| {
+            let variant = load_ecu_document(bytes)
+                .expect("a converted declaration part loads")
+                .variant()
+                .expect("a converted document has its variant");
+            (row.name.as_str(), variant)
+        })
+        .collect();
     let mut procedures = Vec::new();
     let mut errors = Vec::new();
-    for (file, source) in &tables.procedures {
-        let lowered =
-            star::check_file(file, source).and_then(|checked| star::lower(file, &checked));
-        match lowered {
-            Ok(lowered) => procedures.push(Procedure {
+    for (file, source) in &definition.tables.procedures {
+        let checked = match star::check_file(file, source) {
+            Ok(checked) => checked,
+            Err(more) => {
+                errors.extend(more);
+                continue;
+            }
+        };
+        let mut programs = Vec::with_capacity(variants.len());
+        let mut file_errors = Vec::new();
+        let mut file_warnings = Vec::new();
+        for &(name, variant) in &variants {
+            match star::lower(file, &checked, variant) {
+                Ok(lowered) => {
+                    programs.push(
+                        postcard::to_allocvec(&lowered.program)
+                            .expect("a program serializes into memory"),
+                    );
+                    file_warnings.push((name, lowered.warnings));
+                }
+                Err(more) => file_errors.push((name, more)),
+            }
+        }
+        let warnings = merge(file_warnings, variants.len());
+        if file_errors.is_empty() {
+            procedures.push(Procedure {
                 file: file.clone(),
                 source: source.clone(),
-                program: postcard::to_allocvec(&lowered.program)
-                    .expect("a program serializes into memory"),
-                warnings: lowered.warnings,
-            }),
-            Err(more) => errors.extend(more),
+                programs,
+                warnings,
+            });
+        } else {
+            errors.extend(merge(file_errors, variants.len()));
         }
     }
     if errors.is_empty() {
@@ -116,31 +161,43 @@ pub fn lower_procedures(tables: &Tables) -> Result<Vec<Procedure>, ProceduresRej
     }
 }
 
-/// Converts `definition`, as [`resolve`](crate::tables::resolve) returned it, with the
-/// `procedures` [`lower_procedures`] returned for its tables, into documents and the text and
-/// unit catalogs. Every procedure goes with every variant (ADR-307).
-pub fn to_ir(definition: &Definition, procedures: &[Procedure]) -> Converted {
-    let tables = &definition.tables;
-    let carried: Vec<Option<&Procedure>> = if procedures.is_empty() {
-        vec![None]
-    } else {
-        procedures.iter().map(Some).collect()
-    };
-    // Each document's digest covers the tables and the one procedure file it carries (section
-    // 6), so it depends on the procedure alone and is taken once per procedure.
-    let digests: Vec<String> = carried
-        .iter()
-        .map(|procedure| {
-            let file = procedure.map(|p| (p.file.as_str(), p.source.as_slice()));
-            source_digest(
-                tables
-                    .sources
-                    .iter()
-                    .map(|(name, contents)| (name.as_str(), contents.as_slice()))
-                    .chain(file),
-            )
+/// The errors or warnings that lowering one file for each of `variants` variants gave, by the
+/// name of the variant: each distinct one once, in source order (ADR-311). One that not every
+/// variant gave names the variants that did at the end of its hint.
+fn merge(per_variant: Vec<(&str, Vec<StarError>)>, variants: usize) -> Vec<StarError> {
+    let mut merged: Vec<(StarError, Vec<&str>)> = Vec::new();
+    for (name, found) in per_variant {
+        for error in found {
+            match merged.iter_mut().find(|(seen, _)| *seen == error) {
+                Some((_, names)) => names.push(name),
+                None => merged.push((error, vec![name])),
+            }
+        }
+    }
+    // Stable, so errors at one position keep the order the lowering gave them.
+    merged.sort_by_key(|(error, _)| (error.line, error.column));
+    merged
+        .into_iter()
+        .map(|(mut error, names)| {
+            if names.len() < variants {
+                let noun = if names.len() == 1 {
+                    "variant"
+                } else {
+                    "variants"
+                };
+                error.hint = format!("{} (in {noun} {})", error.hint, names.join(", "));
+            }
+            error
         })
-        .collect();
+        .collect()
+}
+
+/// Each variant's document without a procedure, by row of `variants.csv` in its order: the
+/// header, with an empty `source_digest` that [`to_ir`] fills in, and the variant's whole
+/// declaration part. [`lower_procedures`] lowers against these, and [`to_ir`] adds a procedure
+/// and its digest to each.
+fn declarations(definition: &Definition) -> Vec<EcuDocumentT> {
+    let tables = &definition.tables;
     let unit_ids: HashMap<&str, u32> = tables
         .units
         .iter()
@@ -201,10 +258,49 @@ pub fn to_ir(definition: &Definition, procedures: &[Procedure]) -> Converted {
         let mut document = EcuDocumentT::default();
         document.schema_version = IR_SCHEMA_VERSION;
         document.source_format = Some(SOURCE_FORMAT.to_owned());
+        document.source_digest = Some(String::new());
         document.variant = Some(Box::new(ecu));
+        documents.push(document);
+    }
+    documents
+}
+
+/// Converts `definition`, which [`resolve`](crate::tables::resolve) returned, with the
+/// `procedures` [`lower_procedures`] returned for it, into documents and the text and unit
+/// catalogs. Every procedure goes with every variant, with the program lowered for that variant
+/// (ADR-307, ADR-311).
+pub fn to_ir(definition: &Definition, procedures: &[Procedure]) -> Converted {
+    let tables = &definition.tables;
+    let carried: Vec<Option<&Procedure>> = if procedures.is_empty() {
+        vec![None]
+    } else {
+        procedures.iter().map(Some).collect()
+    };
+    // Each document's digest covers the tables and the one procedure file it carries (section
+    // 6), so it depends on the procedure alone and is taken once per procedure.
+    let digests: Vec<String> = carried
+        .iter()
+        .map(|procedure| {
+            let file = procedure.map(|p| (p.file.as_str(), p.source.as_slice()));
+            source_digest(
+                tables
+                    .sources
+                    .iter()
+                    .map(|(name, contents)| (name.as_str(), contents.as_slice()))
+                    .chain(file),
+            )
+        })
+        .collect();
+    let mut documents = Vec::new();
+    for (at, (variant, mut document)) in tables
+        .variants
+        .iter()
+        .zip(declarations(definition))
+        .enumerate()
+    {
         for (procedure, digest) in carried.iter().zip(&digests) {
             document.source_digest = Some(digest.clone());
-            document.procedure = procedure.map(|p| p.program.clone());
+            document.procedure = procedure.map(|p| p.programs[at].clone());
             documents.push(VariantDocument {
                 id: variant.id,
                 name: variant.name.clone(),

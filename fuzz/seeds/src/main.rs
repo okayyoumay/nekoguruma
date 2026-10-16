@@ -19,8 +19,8 @@ fn main() {
     let example = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../crates/diag-frontend/examples/example-ecu");
     let tables = read_directory(&example).expect("the example definition reads");
-    let procedures = lower_procedures(&tables).expect("the example's procedures lower");
     let definition = resolve(tables).expect("the example definition resolves");
+    let procedures = lower_procedures(&definition).expect("the example's procedures lower");
     let documents = dir.join("ngr-fuzz-ecu-document");
     std::fs::create_dir_all(&documents).expect("corpus directory");
     for document in to_ir(&definition, &procedures).documents {

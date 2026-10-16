@@ -1483,27 +1483,22 @@ impl<'a> Lowerer<'a> {
             }
             ExprP::Slice(object, start, stop, step) => {
                 let object = self.expr(id, object);
-                let bound = |this: &mut Self, part: &Option<Box<AstExpr>>| match part {
+                let start = start.as_ref().map(|expr| self.expr(id, expr));
+                let stop = stop.as_ref().map(|expr| self.expr(id, expr));
+                let known = |bound: &Option<Val>| match bound {
                     None => Some(None),
-                    Some(expr) => match this.expr(id, expr) {
-                        Val::Const(Const::Int(n)) => Some(Some(n)),
-                        _ => None,
-                    },
+                    Some(Val::Const(Const::Int(n))) => Some(Some(*n)),
+                    Some(_) => None,
                 };
-                let (start, stop) = (bound(self, start), bound(self, stop));
-                let step_given = step.is_some();
-                match (object, start, stop) {
-                    (Val::Const(object), Some(start), Some(stop)) if !step_given => {
-                        self.slice(object, start, stop, span)
+                if step.is_some() {
+                    self.not_lowerable(span, "a slice with a step is not lowered (2.5)");
+                    return Val::Run(Tys::default(), Vec::new());
+                }
+                match (object, known(&start), known(&stop)) {
+                    (Val::Const(object), Some(from), Some(to)) => {
+                        self.slice(object, from, to, span)
                     }
-                    _ => {
-                        self.not_lowerable(
-                            span,
-                            "a slice is lowered only when it is a constant without a step; a slice of \
-                             a value known at run time needs a slice instruction (2.5)",
-                        );
-                        Val::Run(Tys::default(), Vec::new())
-                    }
+                    (object, ..) => self.run_slice(object, start, stop, span),
                 }
             }
             ExprP::Call(function, args) => self.call(id, function, &args.args, span),
@@ -2286,14 +2281,9 @@ impl<'a> Lowerer<'a> {
         if !self.charge(object.size(), span) {
             return Val::Const(Const::Int(0));
         }
-        let len = object.len() as i64;
-        let clamp = |n: Option<i64>, default: i64| -> usize {
-            let n = n.unwrap_or(default);
-            let n = if n < 0 { (n + len).max(0) } else { n.min(len) };
-            n as usize
-        };
-        let (from, to) = (clamp(start, 0), clamp(stop, len));
-        let to = to.max(from);
+        // The same bounds `Op::Slice` takes at run time.
+        let (from, to) =
+            diag_ir::slice_bounds(start.unwrap_or(0), stop.unwrap_or(i64::MAX), object.len());
         match object {
             Const::Bytes(b) => self.bounded(Const::bytes(&b[from..to]), span),
             Const::List(l, _) => self.bounded(Const::list(l[from..to].to_vec()), span),
@@ -2307,6 +2297,45 @@ impl<'a> Lowerer<'a> {
                 Val::Const(Const::Int(0))
             }
         }
+    }
+
+    /// A slice of bytes known only at run time, or with bounds known only at run time: the
+    /// bytes, the start (0 when omitted) and the stop (`i64::MAX` when omitted, which `Op::Slice`
+    /// clamps to the end), then `Op::Slice`. A string is not sliced at run time, since its
+    /// indexes count characters and the VM holds it as UTF-8 bytes.
+    fn run_slice(&mut self, object: Val, start: Option<Val>, stop: Option<Val>, span: Span) -> Val {
+        let failed = || Val::Run(Tys::default(), Vec::new());
+        let Some((ty, mut code)) = self.single(object, span, "a slice") else {
+            return failed();
+        };
+        if ty != Ty::Bytes {
+            self.not_lowerable(
+                span,
+                format!(
+                    "only bytes are sliced at run time; this value is {} (2.5)",
+                    ty.name()
+                ),
+            );
+            return failed();
+        }
+        for (bound, omitted) in [(start, 0), (stop, i64::MAX)] {
+            match bound {
+                None => code.push((Ins::Op(Op::PushI64(omitted)), span)),
+                Some(bound) => match self.single(bound, span, "a slice index") {
+                    Some((Ty::Int, bound)) => code.extend(bound),
+                    Some((other, _)) => {
+                        self.not_lowerable(
+                            span,
+                            format!("a slice index must be an int, not {}", other.name()),
+                        );
+                        return failed();
+                    }
+                    None => return failed(),
+                },
+            }
+        }
+        code.push((Ins::Op(Op::Slice), span));
+        Val::Run(Tys::of(Ty::Bytes), code)
     }
 
     // ------------------------------------------------------------ Calls

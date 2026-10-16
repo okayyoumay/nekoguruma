@@ -24,7 +24,8 @@ use serde::{Deserialize, Serialize};
 /// 5: `Op` gained `Rem`, for the same reason.
 /// 6: `Op` gained `Neg`, for the same reason.
 /// 7: `Op` gained `Concat`, for the same reason; `VmError` gained `BytesTooLong`.
-pub const IR_SCHEMA_VERSION: u32 = 7;
+/// 8: `Op` gained `Slice`, for the same reason.
+pub const IR_SCHEMA_VERSION: u32 = 8;
 
 /// The longest code, in bytes, that `Program::validate` accepts for a `Fail` (ADR-280).
 pub const MAX_FAILURE_CODE_LEN: usize = 128;
@@ -152,6 +153,11 @@ pub enum Op {
     /// concatenation, the lower one first. A result longer than [`MAX_BYTES_LEN`] is
     /// `VmError::BytesTooLong`, so a loop that keeps doubling a value cannot exhaust memory.
     Concat,
+    /// Replaces a `Bytes`, a start and a stop (two `I64`s, the stop on top) with the bytes from
+    /// start up to stop, as Starlark slices bytes: a negative index counts from the end, both
+    /// are then clamped to the length, and a stop before the start gives empty bytes. A stop of
+    /// `i64::MAX` therefore slices to the end. No index is out of range.
+    Slice,
 }
 
 // ---------------------------------------------------------------- Program
@@ -261,6 +267,7 @@ impl Op {
             | Op::Rem
             | Op::Neg
             | Op::Concat
+            | Op::Slice
             | Op::Fail { .. } => false,
         }
     }
@@ -540,6 +547,15 @@ impl Vm {
                 joined.extend_from_slice(b);
                 self.replace(2, Value::Bytes(joined));
             }
+            Op::Slice => {
+                let [Value::Bytes(bytes), Value::I64(start), Value::I64(stop)] = self.top(3)?
+                else {
+                    return Err(VmError::TypeMismatch.into());
+                };
+                let (from, to) = slice_bounds(*start, *stop, bytes.len());
+                let sliced = bytes[from..to].to_vec();
+                self.replace(3, Value::Bytes(sliced));
+            }
             Op::Not => {
                 let Value::Bool(b) = self.top(1)?[0] else {
                     return Err(VmError::TypeMismatch.into());
@@ -773,7 +789,8 @@ impl Vm {
             | Op::Length
             | Op::Rem
             | Op::Neg
-            | Op::Concat => HostInput::Nothing,
+            | Op::Concat
+            | Op::Slice => HostInput::Nothing,
             // The checks of `Fail` run in `execute`, before it changes anything.
             Op::Fail { .. } => HostInput::Nothing,
         })
@@ -887,6 +904,25 @@ fn store(slots: &mut Vec<Option<Value>>, slot: u16, value: Value) {
         slots.resize(slot + 1, None);
     }
     slots[slot] = Some(value);
+}
+
+/// The byte range of a slice from `start` to `stop` of `len` bytes, as Starlark computes it: a
+/// negative index counts from the end, both are clamped to `0..=len`, and the range is empty
+/// when the stop comes before the start. `Op::Slice` uses it, and so can a frontend that slices
+/// constants at ingestion, so both agree.
+pub fn slice_bounds(start: i64, stop: i64, len: usize) -> (usize, usize) {
+    // A Vec's length is at most isize::MAX, so it fits an i64.
+    let len = i64::try_from(len).expect("a length fits an i64");
+    let clamp = |n: i64| {
+        let n = if n < 0 {
+            n.saturating_add(len).max(0)
+        } else {
+            n.min(len)
+        };
+        usize::try_from(n).expect("clamped to 0..=len")
+    };
+    let (from, to) = (clamp(start), clamp(stop));
+    (from, to.max(from))
 }
 
 fn byte_index(index: i64, len: usize) -> Result<usize, VmError> {

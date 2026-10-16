@@ -482,6 +482,50 @@ fn concatenation_joins_the_lower_bytes_first() {
 }
 
 #[test]
+fn slice_follows_starlark() {
+    let slice = |start: i64, stop: i64| {
+        let program = prog(
+            vec![Op::PushBytes(0), i(start), i(stop), Op::Slice],
+            vec![vec![10, 11, 12, 13, 14]],
+        );
+        let mut vm = Vm::new(&program);
+        run(&mut vm, &program, &mut MockHost::default());
+        let [Value::Bytes(bytes)] = &vm.state.stack[..] else {
+            panic!("one byte string");
+        };
+        bytes.clone()
+    };
+    assert_eq!(slice(1, 3), [11, 12]);
+    assert_eq!(slice(0, i64::MAX), [10, 11, 12, 13, 14]);
+    // Negative indexes count from the end.
+    assert_eq!(slice(-2, i64::MAX), [13, 14]);
+    assert_eq!(slice(1, -1), [11, 12, 13]);
+    // Indexes are clamped, and a stop before the start gives nothing.
+    assert_eq!(slice(-100, 2), [10, 11]);
+    assert_eq!(slice(3, 100), [13, 14]);
+    assert_eq!(slice(i64::MIN, i64::MIN), Vec::<u8>::new());
+    assert_eq!(slice(4, 2), Vec::<u8>::new());
+    assert_eq!(slice(5, 5), Vec::<u8>::new());
+    // Each error leaves the state as it was (checked by `expect_vm_error`).
+    assert_eq!(
+        expect_vm_error(vec![i(1), i(0), i(1), Op::Slice], vec![], 3),
+        VmError::TypeMismatch
+    );
+    assert_eq!(
+        expect_vm_error(
+            vec![Op::PushBytes(0), Op::PushF64(0.0), i(1), Op::Slice],
+            vec![vec![1]],
+            3
+        ),
+        VmError::TypeMismatch
+    );
+    assert_eq!(
+        expect_vm_error(vec![Op::PushBytes(0), i(1), Op::Slice], vec![vec![1]], 2),
+        VmError::StackUnderflow
+    );
+}
+
+#[test]
 fn concatenation_is_bounded() {
     let half = MAX_BYTES_LEN / 2;
     // Exactly the bound is allowed.
@@ -1073,6 +1117,7 @@ fn primitive_classification_covers_every_instruction() {
         Op::Rem,
         Op::Neg,
         Op::Concat,
+        Op::Slice,
     ];
     for (index, op) in all.iter().enumerate() {
         // The postcard encoding starts with the variant index, so this also pins the variant

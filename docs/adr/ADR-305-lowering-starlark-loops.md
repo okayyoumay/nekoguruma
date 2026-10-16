@@ -63,8 +63,9 @@ Lowering loops needs choices the subset leaves open:
      muted, like the constant budgets of subset 4.8.
 7. **Warnings come back with the program.** `lower` returns `Lowered { program, warnings }`.
    Warnings are resolved like errors (file, line, column, snippet, hint), matching the
-   `warnings` list of subset 5. An unrolled body reports the same problem once per copy, so
-   errors and warnings are reported once per place and hint. The checker records the line of the `for` each `@maxIterations`
+   `warnings` list of subset 5. An unrolled body meets the same problem once per copy, so
+   errors and warnings are recorded once per code and place, as they are reported, and an
+   expensive hint is not built again for a place already reported. The checker records the line of the `for` each `@maxIterations`
    belongs to, so the lowering finds a loop's limit by the loop's line.
 
 ## Consequences

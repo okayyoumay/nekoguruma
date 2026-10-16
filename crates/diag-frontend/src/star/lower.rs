@@ -111,7 +111,7 @@ fn lower_here(file: &str, checked: &Checked) -> Result<Lowered, Vec<StarError>> 
         lowerer.reject_if_exhausted();
     }
     if !lowerer.errors.is_empty() {
-        let errors = distinct(std::mem::take(&mut lowerer.errors));
+        let errors = std::mem::take(&mut lowerer.errors);
         return Err(resolve(file, &checked.module, errors));
     }
     let program = lowerer.assemble();
@@ -128,21 +128,11 @@ fn lower_here(file: &str, checked: &Checked) -> Result<Lowered, Vec<StarError>> 
             }],
         ));
     }
-    let warnings = distinct(std::mem::take(&mut lowerer.warnings));
+    let warnings = std::mem::take(&mut lowerer.warnings);
     Ok(Lowered {
         program,
         warnings: resolve(file, &checked.module, warnings),
     })
-}
-
-/// `pending` without repeats: an unrolled body is lowered once per item, and reports the same
-/// problem at the same place each time.
-fn distinct(pending: Vec<Pending>) -> Vec<Pending> {
-    let mut seen = HashSet::new();
-    pending
-        .into_iter()
-        .filter(|p| seen.insert((p.code, p.span.begin(), p.span.end(), p.hint.clone())))
-        .collect()
 }
 
 // ---------------------------------------------------------------- Types and constants
@@ -416,6 +406,12 @@ struct Lowerer<'a> {
     work: usize,
     /// Warnings, reported like errors but not rejecting the procedure.
     warnings: Vec<Pending>,
+    /// The code and place of every error and warning recorded, so each is recorded once.
+    reported: HashSet<(
+        StarCode,
+        starlark_syntax::codemap::Pos,
+        starlark_syntax::codemap::Pos,
+    )>,
     /// `@maxIterations` limits by the line of their `for` (4.2).
     loop_limits: HashMap<u32, u32>,
     /// The loops being lowered, innermost last: where `break` and `continue` jump.
@@ -466,6 +462,7 @@ impl<'a> Lowerer<'a> {
             exhausted: None,
             work: 0,
             warnings: Vec::new(),
+            reported: HashSet::new(),
             loop_limits: checked
                 .annotations
                 .iter()
@@ -486,14 +483,22 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    /// Records an error once per code and place: an unrolled body is lowered once per item and
+    /// reports the same problem at the same place each time.
     fn error(&mut self, code: StarCode, span: Span, hint: impl Into<String>) {
-        if self.quiet == 0 {
+        if self.quiet == 0 && self.reported.insert((code, span.begin(), span.end())) {
             self.errors.push(Pending {
                 code,
                 span,
                 hint: hint.into(),
             });
         }
+    }
+
+    /// Whether `error(code, span, ...)` would record nothing, so a caller can skip building an
+    /// expensive hint.
+    fn is_muted(&self, code: StarCode, span: Span) -> bool {
+        self.quiet > 0 || self.reported.contains(&(code, span.begin(), span.end()))
     }
 
     fn not_lowerable(&mut self, span: Span, hint: impl Into<String>) {
@@ -925,6 +930,9 @@ impl<'a> Lowerer<'a> {
                 // No slot can hold the item, so the variable has a value only inside the body.
                 let escapes = self.variable_escapes(id, stmt, body, var);
                 if escapes || self.assigned_in(body).contains(var) {
+                    if self.is_muted(StarCode::NotLowerable, stmt.span) {
+                        break;
+                    }
                     let place = if escapes {
                         "is used outside the loop"
                     } else {
@@ -1161,8 +1169,13 @@ impl<'a> Lowerer<'a> {
         code.extend([Ins::Op(Op::LoadLocal(i)), Ins::Op(Op::StoreLocal(slot))].map(at));
         // The body runs again after it assigns a name, so a name it assigns must not fold to an
         // enclosing unrolled loop's constant anywhere in it, even before the assignment.
-        for name in self.assigned_in(body).iter() {
-            self.unbind(name);
+        // The enclosing bindings are few (one per enclosing unrolled loop), so they are checked
+        // against the assigned names, not the other way round.
+        let assigned = self.assigned_in(body);
+        for (name, value) in &mut self.bound {
+            if assigned.contains(name) {
+                *value = None;
+            }
         }
         self.loops.push(LoopLabels { end, next });
         self.stmt(id, body, code);
@@ -1219,7 +1232,7 @@ impl<'a> Lowerer<'a> {
     }
 
     fn warn(&mut self, code: StarCode, span: Span, hint: impl Into<String>) {
-        if self.quiet == 0 {
+        if self.quiet == 0 && self.reported.insert((code, span.begin(), span.end())) {
             self.warnings.push(Pending {
                 code,
                 span,

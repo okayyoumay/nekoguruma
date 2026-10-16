@@ -1244,8 +1244,8 @@ fn loops_that_cannot_be_lowered_are_reported() {
         let found = codes(source);
         assert!(found.contains(&(code, line)), "{source}: {found:?}");
     }
-    // Nested constant loops multiply: 300 x 300 iterations pass the unrolling bound.
-    let items = (0..300)
+    // Nested constant loops multiply: 1,100 x 1,100 iterations pass the unrolling bound.
+    let items = (0..1100)
         .map(|n| n.to_string())
         .collect::<Vec<_>>()
         .join(", ");
@@ -1257,4 +1257,87 @@ fn loops_that_cannot_be_lowered_are_reported() {
         !found.is_empty() && found.iter().all(|(c, _)| *c == NotLowerable),
         "{found:?}"
     );
+}
+
+#[test]
+fn a_variable_over_lists_or_dicts_cannot_be_used_outside_its_loop() {
+    // No slot holds a list, so after the loop the variable would read a stale value.
+    let after = "\
+def main():
+    x = 1
+    for x in [[5], [6]]:
+        pass
+    if x == 1:
+        diag.log(1, \"stale\")
+";
+    assert_eq!(codes(after), vec![(StarCode::NotLowerable, 3)]);
+    // Used only inside the loop, it is fine.
+    let inside = "\
+def main():
+    for row in [[5], [6]]:
+        diag.log(row[0], \"in\")
+";
+    assert_eq!(run_logged(inside).0, ["log 5 in", "log 6 in"]);
+}
+
+#[test]
+fn reassigning_an_outer_loop_variable_does_not_leave_a_binding_behind() {
+    // The inner loop over T[x] assigns `y` only when `x` is 1; with a run-time break after
+    // the first iteration, `x` must read 0 after the loop.
+    let source = "\
+T = [[], [0]]
+
+def f(c):
+    for y in [7]:
+        for x in [0, 1]:
+            for y in T[x]:
+                pass
+            if c:
+                break
+        if x == 0:
+            diag.log(1, \"x is 0\")
+        if x == 1:
+            diag.log(1, \"x is 1\")
+
+def main():
+    f(True)
+";
+    assert_eq!(run_logged(source).0, ["log 1 x is 0"]);
+}
+
+#[test]
+fn unrolling_counts_the_body_as_well_as_the_iterations() {
+    // 4,096 iterations of a body of 300 calls: far fewer iterations than the bound, but past
+    // it in statements and expressions lowered.
+    let items = (0..4096)
+        .map(|n| n.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let body = "        diag.wait(1)\n".repeat(300);
+    let source = format!("L = [{items}]\n\ndef main():\n    for n in L:\n{body}");
+    let found = codes(&source);
+    assert!(
+        !found.is_empty() && found.iter().all(|(c, _)| *c == StarCode::NotLowerable),
+        "{found:?}"
+    );
+}
+
+#[test]
+fn an_unrolled_body_reports_each_problem_once() {
+    let source = "\
+def spin(n):
+    for k in [1, 2, 3]:
+        for i in range(n):
+            pass
+    for k in [1, 2, 3, 4, 5]:
+        diag.record(\"t\")
+
+def main():
+    spin(1)
+";
+    let found = codes(source);
+    assert_eq!(found, vec![(StarCode::NotLowerable, 6)]);
+    let warnings = "def spin(n):\n    for k in [1, 2, 3]:\n        for i in range(n):\n            pass\n\ndef main():\n    spin(1)\n";
+    let lowered = lowered_with_warnings(warnings).unwrap();
+    assert_eq!(lowered.warnings.len(), 1);
 }

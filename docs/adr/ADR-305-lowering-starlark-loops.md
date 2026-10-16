@@ -28,9 +28,11 @@ Lowering loops needs choices the subset leaves open:
    a constant argument. When the item can exist at run time, the iteration also stores it in
    the variable's slot, so the variable holds the last item after the loop, as in Starlark.
 
-   An assignment to the variable in the body ends the binding for the rest of the iteration.
-   When the items cannot exist at run time (lists, dicts), such an assignment is rejected, since
-   no slot holds the item.
+   An assignment to the variable ends the binding for the rest of the iteration. The binding is
+   cleared in place, not removed, so the bindings of the loops around keep their places.
+   When the items cannot exist at run time (lists, dicts), no slot holds them, so the variable
+   has a value only inside the body. Assigning it in the body, or using it anywhere in the
+   function outside the loop, is rejected.
 2. **`break` and `continue` jump.** The lowering keeps a stack of the enclosing loops' labels:
    `break` jumps past the loop, and `continue` to the next iteration (in an unrolled loop, the
    next copy of the body). No loop keeps a value on the stack, so the jumps need no clean-up.
@@ -51,15 +53,18 @@ Lowering loops needs choices the subset leaves open:
 5. **No overflow at the end of the range.** Before stepping, the loop checks whether the next
    value would leave the 64-bit range. Such a value would be past every stop anyway, so the
    loop ends there instead of failing with the VM's overflow error.
-6. **Unrolling is bounded.** One pass over the function bodies may unroll at most 65,536
-   iterations in all, nested loops multiplying.
+6. **Unrolling is bounded.** One pass over the function bodies may do at most 2^20 units of
+   unrolling work. A unit is an iteration, or a statement or expression lowered in an unrolled
+   body, so nested loops multiply and a large body counts in full.
    - This bounds the size of the program and the work of lowering it, since each unrolled
-     iteration lowers the body again, in every inference pass.
+     iteration lowers the body again, in every inference pass. A count of iterations alone
+     would let a large body grow without bound.
    - Running past the bound rejects the procedure (`STAR_NOT_LOWERABLE`), even where errors are
      muted, like the constant budgets of subset 4.8.
 7. **Warnings come back with the program.** `lower` returns `Lowered { program, warnings }`.
    Warnings are resolved like errors (file, line, column, snippet, hint), matching the
-   `warnings` list of subset 5. The checker records the line of the `for` each `@maxIterations`
+   `warnings` list of subset 5. An unrolled body reports the same problem once per copy, so
+   errors and warnings are reported once per place and hint. The checker records the line of the `for` each `@maxIterations`
    belongs to, so the lowering finds a loop's limit by the loop's line.
 
 ## Consequences

@@ -374,8 +374,9 @@ How loops are lowered (ADR-305):
   items are lists or dicts, the variable has a value only inside the body: assigning it there,
   or using it anywhere in the function outside the loop, is `STAR_NOT_LOWERABLE`.
 - Unrolling is bounded: a procedure may unroll at most 2^20 iterations, statements and
-  expressions in all, nested loops multiplying and a body counting once per copy; past that it
-  is `STAR_NOT_LOWERABLE`.
+  expressions in all, nested loops multiplying and a body counting once per copy, and each 64
+  bytes of a name an unrolled copy handles counting as one more; past that it is
+  `STAR_NOT_LOWERABLE`.
 - A loop over `range(stop)`, `range(start, stop)` or `range(start, stop, step)` runs without
   unrolling. Its step must be an `int` constant other than 0; its start and stop are `int`s,
   evaluated once before the loop. The counter applies when the start or stop is known only at

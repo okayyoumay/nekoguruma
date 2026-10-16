@@ -1323,6 +1323,29 @@ fn unrolling_counts_the_body_as_well_as_the_iterations() {
 }
 
 #[test]
+fn unrolling_counts_the_bytes_of_the_names_it_handles() {
+    // 100,000 iterations are well within the bound, but each copies, hashes or compares a
+    // 64 KiB name, so the names' bytes take them past it: a long loop variable, and a long
+    // local read in the body.
+    let items = vec!["0"; 100_000].join(", ");
+    let long = "v".repeat(1 << 16);
+    let variable = format!("L = [{items}]\n\ndef main():\n    for {long} in L:\n        pass\n");
+    let local = format!(
+        "L = [{items}]\n\ndef main():\n    {long} = 1\n    for n in L:\n        diag.wait({long})\n"
+    );
+    for source in [variable, local] {
+        let found = codes(&source);
+        assert!(
+            !found.is_empty() && found.iter().all(|(c, _)| *c == StarCode::NotLowerable),
+            "{found:?}"
+        );
+    }
+    // Names shorter than a unit's bytes cost nothing extra.
+    let short = format!("L = [{items}]\n\ndef main():\n    for n in L:\n        pass\n");
+    assert!(codes(&short).is_empty());
+}
+
+#[test]
 fn an_unrolled_body_reports_each_problem_once() {
     let source = "\
 def spin(n):

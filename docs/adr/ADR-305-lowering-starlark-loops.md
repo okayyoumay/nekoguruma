@@ -55,7 +55,9 @@ Lowering loops needs choices the subset leaves open:
    loop ends there instead of failing with the VM's overflow error.
 6. **Unrolling is bounded.** One pass over the function bodies may do at most 2^20 units of
    unrolling work. A unit is an iteration, or a statement or expression lowered in an unrolled
-   body, so nested loops multiply and a large body counts in full.
+   body, so nested loops multiply and a large body counts in full. A name an unrolled copy
+   copies, hashes or compares also costs a unit per 64 bytes, so a long name repeated in many
+   iterations counts by its length; names shorter than that cost nothing extra.
    - This bounds the size of the program and the work of lowering it, since each unrolled
      iteration lowers the body again, in every inference pass. A count of iterations alone
      would let a large body grow without bound.

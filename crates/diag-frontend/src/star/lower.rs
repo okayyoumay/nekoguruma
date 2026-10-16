@@ -56,6 +56,11 @@ const TOO_MUCH_FOLDING: &str =
 /// (subset 4.2).
 const MAX_UNROLLED: usize = 1 << 20;
 
+/// The bytes of a name that unrolling may copy, hash or compare for one unit of
+/// [`MAX_UNROLLED`]. Each unrolled copy handles its names again, so a long name repeated in many
+/// iterations costs in proportion to its length; a name shorter than this costs nothing extra.
+const NAME_BYTES_PER_UNIT: usize = 64;
+
 /// The limit of a `range` loop whose bound is known only at run time and that has no
 /// `@maxIterations` (subset 4.2).
 const DEFAULT_MAX_ITERATIONS: u32 = 1000;
@@ -418,11 +423,12 @@ struct Lowerer<'a> {
     loops: Vec<LoopLabels>,
     /// Loop variables bound to the constant item of an unrolled iteration, innermost last. An
     /// assignment to the variable clears its entries (`None`) rather than removing them, so the
-    /// entries of the loops around keep their places.
-    bound: Vec<(String, Option<Const>)>,
+    /// entries of the loops around keep their places. The name is shared by the iterations.
+    bound: Vec<(Rc<str>, Option<Const>)>,
     /// The work of unrolling in the current pass over the function bodies, against
     /// [`MAX_UNROLLED`]: one for each iteration and each statement and expression lowered in an
-    /// unrolled body, so nested loops multiply and a large body counts in full.
+    /// unrolled body, so nested loops multiply and a large body counts in full, and one for each
+    /// [`NAME_BYTES_PER_UNIT`] bytes of a name an unrolled copy copies, hashes or compares.
     unrolled: usize,
     /// How many unrolled loops enclose what is being lowered.
     unrolling: u32,
@@ -720,7 +726,7 @@ impl<'a> Lowerer<'a> {
     // ------------------------------------------------------------ Statements
 
     fn stmt(&mut self, id: usize, stmt: &AstStmt, code: &mut Code) {
-        if self.unrolling > 0 && !self.unroll_step(stmt.span) {
+        if self.unrolling > 0 && !self.unroll_step(stmt.span, 1) {
             return;
         }
         match &stmt.node {
@@ -751,11 +757,11 @@ impl<'a> Lowerer<'a> {
                     self.not_lowerable(target.span, "only a name can be assigned (2.3)");
                     return;
                 };
-                let name = name.node.ident.clone();
-                let current = self.load(id, &name, target.span);
+                let name = name.node.ident.as_str();
+                let current = self.load(id, name, target.span);
                 let rhs_value = self.expr(Some(id), rhs);
                 let value = self.binary(Some(id), assign_op(*op), current, rhs_value, stmt.span);
-                self.store(id, &name, value, stmt.span, code);
+                self.store(id, name, value, stmt.span, code);
             }
             StmtP::Return(value) => {
                 match value {
@@ -855,7 +861,10 @@ impl<'a> Lowerer<'a> {
             );
             return;
         };
-        let var = var.node.ident.clone();
+        if !self.charge_name(&var.node.ident, 1, for_.var.span) {
+            return;
+        }
+        let var: Rc<str> = Rc::from(var.node.ident.as_str());
         if let ExprP::Call(function, args) = &for_.over.node
             && matches!(&function.node, ExprP::Identifier(f) if f.node.ident == "range")
             && !self.funcs[id].slots.contains_key("range")
@@ -913,7 +922,7 @@ impl<'a> Lowerer<'a> {
         &mut self,
         id: usize,
         stmt: &AstStmt,
-        var: &str,
+        var: &Rc<str>,
         items: Items,
         body: &AstStmt,
         code: &mut Code,
@@ -922,14 +931,15 @@ impl<'a> Lowerer<'a> {
         self.loops.push(LoopLabels { end, next: end });
         self.unrolling += 1;
         for at in 0..items.len() {
-            if !self.unroll_step(stmt.span) {
+            // The iteration may look the variable up in the body's assigned names.
+            if !self.unroll_step(stmt.span, 1) || !self.charge_name(var, 1, stmt.span) {
                 break;
             }
             let item = items.get(at);
             if item.ty().is_none() {
                 // No slot can hold the item, so the variable has a value only inside the body.
                 let escapes = self.variable_escapes(id, stmt, body, var);
-                if escapes || self.assigned_in(body).contains(var) {
+                if escapes || self.assigned_in(body).contains(&**var) {
                     if self.is_muted(StarCode::NotLowerable, stmt.span) {
                         break;
                     }
@@ -958,7 +968,7 @@ impl<'a> Lowerer<'a> {
                 self.store(id, var, Val::Const(item.clone()), stmt.span, code);
             }
             let depth = self.bound.len();
-            self.bound.push((var.to_owned(), Some(item)));
+            self.bound.push((Rc::clone(var), Some(item)));
             self.stmt(id, body, code);
             self.bound.truncate(depth);
             code.push((Ins::Mark(next), stmt.span));
@@ -971,21 +981,29 @@ impl<'a> Lowerer<'a> {
     /// Ends the constant bindings of `name`, in place.
     fn unbind(&mut self, name: &str) {
         for (bound, value) in &mut self.bound {
-            if bound == name {
+            if **bound == *name {
                 *value = None;
             }
         }
     }
 
-    /// Charges one unit of unrolling work; false, after an error, once the budget is spent.
-    fn unroll_step(&mut self, span: Span) -> bool {
-        self.unrolled += 1;
+    /// Charges `units` of unrolling work; false, after an error, once the budget is spent.
+    fn unroll_step(&mut self, span: Span, units: usize) -> bool {
+        self.unrolled = self.unrolled.saturating_add(units);
         if self.unrolled > MAX_UNROLLED {
             self.exhausted.get_or_insert((span, TOO_MUCH_UNROLLING));
             self.not_lowerable(span, TOO_MUCH_UNROLLING);
             return false;
         }
         true
+    }
+
+    /// Charges the unrolling work of handling `name` `times` over in an unrolled copy (copying,
+    /// hashing or comparing it); true outside unrolled loops. False, after an error, once the
+    /// budget is spent.
+    fn charge_name(&mut self, name: &str, times: usize, span: Span) -> bool {
+        let units = (name.len() / NAME_BYTES_PER_UNIT).saturating_mul(times);
+        self.unrolling == 0 || units == 0 || self.unroll_step(span, units)
     }
 
     /// Whether function `id` reads `var`, or updates it with an augmented assignment, anywhere
@@ -1172,8 +1190,15 @@ impl<'a> Lowerer<'a> {
         // The enclosing bindings are few (one per enclosing unrolled loop), so they are checked
         // against the assigned names, not the other way round.
         let assigned = self.assigned_in(body);
+        let names: usize = self.bound.iter().map(|(name, _)| name.len()).sum();
+        if names >= NAME_BYTES_PER_UNIT && self.unrolling > 0 {
+            let units = names / NAME_BYTES_PER_UNIT;
+            if !self.unroll_step(span, units) {
+                return;
+            }
+        }
         for (name, value) in &mut self.bound {
-            if assigned.contains(name) {
+            if assigned.contains(&**name) {
                 *value = None;
             }
         }
@@ -1245,6 +1270,10 @@ impl<'a> Lowerer<'a> {
     fn store(&mut self, id: usize, name: &str, value: Val, span: Span, code: &mut Code) {
         // An assignment to a loop variable bound to a constant ends the binding; the slot
         // holds the new value (an unrolled iteration stores its item in the slot as well).
+        // Clearing the bindings compares the name with each; the slot lookup hashes it.
+        if !self.charge_name(name, self.bound.len() + 1, span) {
+            return;
+        }
         self.unbind(name);
         let Some(&slot) = self.funcs[id].slots.get(name) else {
             self.not_lowerable(span, format!("`{name}` is not a local of this function"));
@@ -1279,7 +1308,7 @@ impl<'a> Lowerer<'a> {
     /// Lowers an expression in function `id`, or at the top level for `None`.
     fn expr(&mut self, id: Option<usize>, expr: &AstExpr) -> Val {
         let span = expr.span;
-        if self.unrolling > 0 && !self.unroll_step(span) {
+        if self.unrolling > 0 && !self.unroll_step(span, 1) {
             return Val::Run(Tys::default(), Vec::new());
         }
         match &expr.node {
@@ -1455,8 +1484,13 @@ impl<'a> Lowerer<'a> {
     }
 
     fn name(&mut self, id: Option<usize>, name: &str, span: Span) -> Val {
+        // The bindings are compared with the name, then a slot and a global looked up by it.
+        if !self.charge_name(name, self.bound.len() + 2, span) {
+            return Val::Run(Tys::default(), Vec::new());
+        }
         if id.is_some()
-            && let Some((_, Some(value))) = self.bound.iter().rev().find(|(bound, _)| bound == name)
+            && let Some((_, Some(value))) =
+                self.bound.iter().rev().find(|(bound, _)| **bound == *name)
         {
             return Val::Const(value.clone());
         }
@@ -1479,6 +1513,9 @@ impl<'a> Lowerer<'a> {
     }
 
     fn load(&mut self, id: usize, name: &str, span: Span) -> Val {
+        if !self.charge_name(name, 1, span) {
+            return Val::Run(Tys::default(), Vec::new());
+        }
         match self.funcs[id].slots.get(name) {
             Some(&slot) => Val::Run(
                 self.funcs[id].slot_tys[usize::from(slot)],
@@ -2254,6 +2291,10 @@ impl<'a> Lowerer<'a> {
         match &function.node {
             ExprP::Identifier(ident) => {
                 let name = ident.node.ident.as_str();
+                // The name is looked up among the functions, then the builtins.
+                if !self.charge_name(name, 2, function.span) {
+                    return Val::Run(Tys::default(), Vec::new());
+                }
                 if let Some(&callee) = self.by_name.get(name) {
                     return self.call_function(id, callee, &positional, span);
                 }

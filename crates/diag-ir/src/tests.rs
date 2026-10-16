@@ -386,6 +386,41 @@ fn call_depth_is_limited() {
 }
 
 #[test]
+fn length_pushes_the_length_above_the_bytes() {
+    let program = prog(
+        vec![Op::PushBytes(0), Op::Length, Op::PushBytes(1), Op::Length],
+        vec![vec![1, 2, 3], vec![]],
+    );
+    let mut vm = Vm::new(&program);
+    run(&mut vm, &program, &mut MockHost::default());
+    assert_eq!(
+        vm.state.stack,
+        [
+            Value::Bytes(vec![1, 2, 3]),
+            Value::I64(3),
+            Value::Bytes(vec![]),
+            Value::I64(0)
+        ]
+    );
+    // Not bytes, nothing on the stack, and no room for the length; each leaves the state as it
+    // was (checked by `expect_vm_error`).
+    assert_eq!(
+        expect_vm_error(vec![i(1), Op::Length], vec![], 1),
+        VmError::TypeMismatch
+    );
+    assert_eq!(
+        expect_vm_error(vec![Op::Length], vec![], 0),
+        VmError::StackUnderflow
+    );
+    let mut code = vec![i(0); MAX_STACK - 1];
+    code.extend([Op::PushBytes(0), Op::Length]);
+    assert_eq!(
+        expect_vm_error(code, vec![vec![1]], MAX_STACK),
+        VmError::StackOverflow
+    );
+}
+
+#[test]
 fn byte_indexing() {
     let program = prog(
         vec![
@@ -913,6 +948,7 @@ fn primitive_classification_covers_every_instruction() {
             message: 0,
         },
         Op::Fail { code: 0 },
+        Op::Length,
     ];
     for (index, op) in all.iter().enumerate() {
         // The postcard encoding starts with the variant index, so this also pins the variant

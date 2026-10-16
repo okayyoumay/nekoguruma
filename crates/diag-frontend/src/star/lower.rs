@@ -1673,7 +1673,7 @@ impl<'a> Lowerer<'a> {
             Ty::Bytes | Ty::Str => {
                 self.not_lowerable(
                     span,
-                    "the truth of bytes or a string known at run time needs a length instruction (2.5)",
+                    "the truth of bytes or a string known at run time is not lowered yet (2.5)",
                 );
                 return None;
             }
@@ -2218,7 +2218,7 @@ impl<'a> Lowerer<'a> {
             (_, Val::Const(Const::Int(n))) if n < 0 => {
                 self.not_lowerable(
                     span,
-                    "a negative index into bytes known at run time needs a length instruction (2.5)",
+                    "a negative index into bytes known at run time is not lowered yet (2.5)",
                 );
                 Val::Run(Tys::of(Ty::Int), Vec::new())
             }

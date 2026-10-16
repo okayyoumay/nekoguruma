@@ -58,9 +58,11 @@ pub fn lower(file: &str, checked: &Checked) -> Result<Program, Vec<StarError>> {
     lowerer.functions();
     if lowerer.errors.is_empty() {
         lowerer.infer();
+        lowerer.reject_if_exhausted();
     }
     if lowerer.errors.is_empty() {
         lowerer.emit_all();
+        lowerer.reject_if_exhausted();
     }
     if !lowerer.errors.is_empty() {
         let errors = std::mem::take(&mut lowerer.errors);
@@ -345,6 +347,11 @@ struct Lowerer<'a> {
     /// the globals' total, and each is bounded, reported or not.
     built: usize,
     globals_built: usize,
+    /// Where the total first passed the budget, in any pass. A placeholder that inference
+    /// built in place of a constant could give a value the wrong type, and which pass runs
+    /// out depends on the order functions are visited in, so running out anywhere, reported
+    /// or not, rejects the procedure.
+    exhausted: Option<Span>,
 }
 
 impl<'a> Lowerer<'a> {
@@ -364,6 +371,7 @@ impl<'a> Lowerer<'a> {
             shared: HashMap::new(),
             built: 0,
             globals_built: 0,
+            exhausted: None,
         }
     }
 
@@ -1202,6 +1210,7 @@ impl<'a> Lowerer<'a> {
         ) {
             self.built = self.built.saturating_add(value.size());
             if self.built > MAX_CONSTANTS_TOTAL {
+                self.exhausted.get_or_insert(span);
                 self.not_lowerable(
                     span,
                     "the procedure's constants together hold more than 16 Mi values and bytes (4.4)",
@@ -1210,6 +1219,23 @@ impl<'a> Lowerer<'a> {
             }
         }
         Val::Const(value)
+    }
+
+    /// Reports running out of the constant budget when nothing reported it, because it
+    /// happened only where reports are muted (in inference, or in an operand that is never
+    /// evaluated).
+    fn reject_if_exhausted(&mut self) {
+        if let Some(span) = self.exhausted
+            && self.errors.is_empty()
+        {
+            self.errors.push(Pending {
+                code: StarCode::NotLowerable,
+                span,
+                hint:
+                    "the procedure's constants together hold more than 16 Mi values and bytes (4.4)"
+                        .to_owned(),
+            });
+        }
     }
 
     fn out_of_range(&mut self, span: Span) -> Val {

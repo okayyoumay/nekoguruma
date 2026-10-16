@@ -490,6 +490,23 @@ fn constants_built_in_function_bodies_are_bounded_together() {
 }
 
 #[test]
+fn running_out_of_constants_where_nothing_reports_it_still_rejects() {
+    // `h` runs out of the constant budget only inside an operand that is never evaluated, so
+    // nothing reports it there. Inference visits `h` before `f` and emission `f` before `h`,
+    // so the placeholder could reach `f`'s inferred type; the procedure must be rejected.
+    let mut source = String::from("B0 = b\"x\"\n");
+    for i in 1..=19 {
+        source.push_str(&format!("B{i} = B{p} + B{p}\n", p = i - 1));
+    }
+    let items = vec!["B19 + b\"y\""; 64].join(", ");
+    source.push_str(&format!(
+        "\ndef main():\n    h()\n    if f() == \"s\":\n        diag.fail(\"YES\", \"\")\n\ndef h():\n    x = True or [{items}]\n\ndef f():\n    return \"s\"\n"
+    ));
+    let found = codes(&source);
+    assert_eq!(found, vec![(StarCode::NotLowerable, 28)], "{found:?}");
+}
+
+#[test]
 fn a_right_shift_is_arithmetic() {
     assert!(holds("x", "-8", "x >> 1 == -4"));
     assert!(holds("x", "-1", "x >> 63 == -1"));

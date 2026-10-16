@@ -28,6 +28,8 @@ pub enum DocumentError {
     NoProcedure,
     #[error("the document's procedure is not an IR program: {0}")]
     Procedure(#[from] postcard::Error),
+    #[error("the document's procedure has {0} bytes after its program")]
+    TrailingBytes(usize),
 }
 
 impl JobDocument {
@@ -45,7 +47,11 @@ impl JobDocument {
             .document()
             .procedure()
             .ok_or(DocumentError::NoProcedure)?;
-        Ok(postcard::from_bytes(procedure.bytes())?)
+        let (program, rest) = postcard::take_from_bytes(procedure.bytes())?;
+        if !rest.is_empty() {
+            return Err(DocumentError::TrailingBytes(rest.len()));
+        }
+        Ok(program)
     }
 
     /// The variant's declarations.
@@ -84,7 +90,7 @@ pub(crate) mod tests {
         vin_document_with(procedure.map(|p| postcard::to_allocvec(p).unwrap()))
     }
 
-    fn vin_document_with(procedure: Option<Vec<u8>>) -> Vec<u8> {
+    pub(crate) fn vin_document_with(procedure: Option<Vec<u8>>) -> Vec<u8> {
         let mut vin = FieldT::default();
         vin.id = 1;
         vin.short_name = Some("vin".into());
@@ -149,6 +155,13 @@ pub(crate) mod tests {
         assert!(matches!(
             document.program(),
             Err(DocumentError::Procedure(_))
+        ));
+        let mut procedure = postcard::to_allocvec(&program()).unwrap();
+        procedure.push(0);
+        let document = JobDocument::new(vin_document_with(Some(procedure))).unwrap();
+        assert!(matches!(
+            document.program(),
+            Err(DocumentError::TrailingBytes(1))
         ));
     }
 }

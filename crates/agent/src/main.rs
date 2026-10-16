@@ -143,7 +143,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<RunArgs, Strin
                     .map_err(|error| format!("--api: {error}"))?
             }
             "--program" | "--document" if job.is_some() => {
-                return Err("give one of --program and --document".to_owned());
+                return Err("give --program or --document, once".to_owned());
             }
             "--program" => job = Some(JobFile::Program(PathBuf::from(value))),
             "--document" => job = Some(JobFile::Document(PathBuf::from(value))),
@@ -229,7 +229,7 @@ fn read_job(file: &JobFile) -> Result<Job, String> {
 /// Runs the job and returns the final VM state as JSON.
 async fn run(args: RunArgs) -> Result<String, String> {
     let job = read_job(&args.job)?;
-    let program = &job.program;
+    let program = job.program();
     // A program the job would refuse does not need a worker.
     check_job(&job, build_ceiling()).map_err(|error| format!("job failed: {error}"))?;
     // The per-VCI lock, and the reprogramming slot for a program that writes (design 8.8.1). The
@@ -411,6 +411,17 @@ mod tests {
                 "d",
                 "--document",
                 "d",
+            ],
+            &[
+                "run",
+                "--vci",
+                "x",
+                "--mode",
+                "user",
+                "--program",
+                "p",
+                "--program",
+                "p",
             ],
             &["run", "--vci", "x", "--mode", "user"],
             &["run", "--vci"],

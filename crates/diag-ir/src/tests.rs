@@ -3151,6 +3151,45 @@ mod decode_field {
         })
     }
 
+    #[test]
+    fn the_fields_a_program_decodes_are_checked_against_the_declarations() {
+        let bytes = document();
+        let variant = load_ecu_document(&bytes).unwrap().variant().unwrap();
+        let decode = |service, field| Op::DecodeField { service, field };
+        let check = |code| crate::check_decode_fields(&prog(code, Vec::new()), &variant);
+        assert_eq!(check(vec![decode(7, 1), decode(8, 4)]), Ok(()));
+        assert_eq!(
+            check(vec![decode(7, 1), i(0), decode(7, 6)]),
+            Err((
+                2,
+                VmError::ShapedField {
+                    service: 7,
+                    field: 6
+                }
+            ))
+        );
+        assert_eq!(
+            check(vec![decode(9, 1)]),
+            Err((
+                0,
+                VmError::UnknownField {
+                    service: 9,
+                    field: 1
+                }
+            ))
+        );
+        assert_eq!(
+            check(vec![decode(7, 99)]),
+            Err((
+                0,
+                VmError::UnknownField {
+                    service: 7,
+                    field: 99
+                }
+            ))
+        );
+    }
+
     /// A positive response: 0x1234, -2, 1.5, "ok", 0xBEEF, a group byte, u64::MAX.
     fn response() -> Vec<u8> {
         let mut message = vec![0x62, 0xF1, 0x90, 0x12, 0x34, 0xFE];

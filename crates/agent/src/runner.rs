@@ -52,12 +52,15 @@ impl Default for JobLimits {
     }
 }
 
-/// What a job runs: a program, and the document its program decodes responses with, if any
-/// (`document`). A restart is given the same job again.
+/// What a job runs: a program, and the document its program decodes responses with, if any.
+/// A program and a document come together only from the document itself, whose procedure is
+/// the program (design 8.2.6), so a job never decodes one variant's responses with another's
+/// declarations. The caller of a restart passes the same job again: the journal records neither
+/// the program nor the document (ADR-318).
 #[derive(Debug, Clone)]
 pub struct Job {
-    pub program: Program,
-    pub document: Option<JobDocument>,
+    program: Program,
+    document: Option<JobDocument>,
 }
 
 impl Job {
@@ -67,6 +70,14 @@ impl Job {
             program: document.program()?,
             document: Some(document),
         })
+    }
+
+    pub fn program(&self) -> &Program {
+        &self.program
+    }
+
+    pub fn document(&self) -> Option<&JobDocument> {
+        self.document.as_ref()
     }
 }
 
@@ -157,6 +168,14 @@ pub enum JobError {
     /// document to decode them with.
     #[error("the program decodes response fields, but the job has no document")]
     NoDeclarations,
+    /// Instruction `pc` decodes a field the job's document does not declare as a top-level
+    /// field of the service's positive response, or one with a nested layout.
+    #[error("instruction {pc} decodes a field the job's document does not declare: {source}")]
+    Undeclared {
+        pc: u32,
+        #[source]
+        source: VmError,
+    },
     /// A restart could not take the per-vehicle lock right after the ECU's VIN matched
     /// (ADR-263): the lock file failed or the guards cannot take a vehicle (an empty guard slot
     /// is [`JobError::GuardsMissing`]). Only ReadDataByIdentifier requests were sent by then, so ending the job
@@ -269,23 +288,28 @@ pub fn check_program(program: &Program, permission: Permission) -> Result<(), Jo
     refuse_beyond(program, permission)
 }
 
-/// The policy part of [`check_program`].
-/// [`check_program`] for a job, which also refuses a program that decodes response fields
-/// (`Op::DecodeField`, ADR-316) without a document to decode them with, rather than failing at
-/// the instruction.
+/// [`check_program`] for a job, which also checks the response fields its program decodes
+/// (`Op::DecodeField`, ADR-316, ADR-318): a job without a document to decode them with, or one
+/// whose document does not declare a field the program decodes, is refused here rather than
+/// failing at the instruction, which could be after a write.
 pub fn check_job(job: &Job, permission: Permission) -> Result<(), JobError> {
     check_program(&job.program, permission)?;
-    let decodes = job
-        .program
-        .code
-        .iter()
-        .any(|op| matches!(op, diag_ir::Op::DecodeField { .. }));
-    if decodes && job.document.is_none() {
-        return Err(JobError::NoDeclarations);
+    match &job.document {
+        Some(document) => diag_ir::check_decode_fields(&job.program, &document.variant())
+            .map_err(|(pc, source)| JobError::Undeclared { pc, source }),
+        None if job
+            .program
+            .code
+            .iter()
+            .any(|op| matches!(op, diag_ir::Op::DecodeField { .. })) =>
+        {
+            Err(JobError::NoDeclarations)
+        }
+        None => Ok(()),
     }
-    Ok(())
 }
 
+/// The policy part of [`check_program`].
 fn refuse_beyond(program: &Program, permission: Permission) -> Result<(), JobError> {
     policy::check_program(program, permission)
         .map_err(|(pc, source)| JobError::Refused { pc, source })
@@ -306,8 +330,10 @@ fn refuse_beyond(program: &Program, permission: Permission) -> Result<(), JobErr
 /// closed. That happens after the future is gone, so a caller that dropped it must not hand
 /// the worker to another job yet (ADR-235 consequences).
 ///
-/// The program is checked against [`policy::build_ceiling`] before anything opens and against
-/// the link's own permission once the VCI is known (ADR-247).
+/// The job is checked by [`check_job`] against [`policy::build_ceiling`] before anything opens,
+/// which also refuses a program that decodes response fields its job cannot decode
+/// ([`JobError::NoDeclarations`], [`JobError::Undeclared`], ADR-318), and against the link's
+/// own permission once the VCI is known (ADR-247). `program` is a [`Program`] or a [`Job`].
 ///
 /// `guards` are the job's guards (`guards::JobGuards`, ADR-256, ADR-257, design 8.8.1). The
 /// caller takes them before it calls: `JobGuards::take` for a program that writes
@@ -1257,11 +1283,11 @@ where
     S: Store,
 {
     let wait_poll = limits.wait_poll.max(Duration::from_millis(1));
-    // Whether the journal has seen this arrival yet (a timer wait polls the same instruction
-    // again).
     // Loaded once per run; the document was checked when the job was made.
     let document = host.declarations();
     let variant = document.as_ref().map(JobDocument::variant);
+    // Whether the journal has seen this arrival yet (a timer wait polls the same instruction
+    // again).
     let mut arrived = true;
     loop {
         if cancelled.load(Ordering::Relaxed) {
@@ -7563,6 +7589,31 @@ mod tests {
             document: Some(vin_job_document()),
         };
         assert!(check_job(&job, Permission::ReadOnly).is_ok());
+        // A field the document does not declare is refused before anything is sent, also
+        // when the decode comes after a write.
+        let mut undeclared = program.clone();
+        undeclared.code[1] = Op::DecodeField {
+            service: 2,
+            field: 1,
+        };
+        let job = Job {
+            program: undeclared,
+            document: Some(vin_job_document()),
+        };
+        assert!(
+            matches!(
+                check_job(&job, Permission::ReadOnly),
+                Err(JobError::Undeclared {
+                    pc: 1,
+                    source: VmError::UnknownField {
+                        service: 2,
+                        field: 1
+                    }
+                })
+            ),
+            "{:?}",
+            check_job(&job, Permission::ReadOnly)
+        );
         // A host without one fails at the instruction, leaving the state there.
         let error = run_plain(
             &program,

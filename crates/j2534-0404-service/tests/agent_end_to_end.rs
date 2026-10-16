@@ -106,9 +106,9 @@ fn write_program() -> Program {
     }
 }
 
-/// A variant's declarations with one service, 1: ReadDataByIdentifier of the VIN, whose
-/// positive response is `62 F1 90` and the 17 ASCII bytes of field 1.
-fn vin_document() -> Vec<u8> {
+/// A variant's document with one service, 1: ReadDataByIdentifier of the VIN, whose positive
+/// response is `62 F1 90` and the 17 ASCII bytes of field 1. Its procedure is `procedure`.
+fn vin_document(procedure: &Program) -> Vec<u8> {
     let mut vin = FieldT::default();
     vin.id = 1;
     vin.short_name = Some("vin".into());
@@ -132,26 +132,26 @@ fn vin_document() -> Vec<u8> {
     document.source_format = Some("csv-starlark".into());
     document.source_digest = Some("00".into());
     document.variant = Some(Box::new(variant));
+    document.procedure = Some(postcard::to_allocvec(procedure).expect("program should serialize"));
     encode_ecu_document(&document)
 }
 
-/// Reads the VIN and decodes its field through the job's document.
+/// A document whose procedure reads the VIN and decodes its field through the document.
 fn decoding_job() -> Job {
-    Job {
-        program: Program {
-            code: vec![
-                Op::PushBytes(0),
-                Op::ServiceRequest { service: 0x22 },
-                Op::DecodeField {
-                    service: 1,
-                    field: 1,
-                },
-            ],
-            constants: vec![vec![0xF1, 0x90]],
-            ..program()
-        },
-        document: Some(JobDocument::new(vin_document()).expect("the document loads")),
-    }
+    let procedure = Program {
+        code: vec![
+            Op::PushBytes(0),
+            Op::ServiceRequest { service: 0x22 },
+            Op::DecodeField {
+                service: 1,
+                field: 1,
+            },
+        ],
+        constants: vec![vec![0xF1, 0x90]],
+        ..program()
+    };
+    let document = JobDocument::new(vin_document(&procedure)).expect("the document loads");
+    Job::from_document(document).expect("the document carries its procedure")
 }
 
 #[test]

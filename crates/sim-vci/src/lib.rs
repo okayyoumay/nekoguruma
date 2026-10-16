@@ -115,8 +115,9 @@ pub const ECU_STATE_ENV: &str = "NGR_SIM_ECU_STATE";
 /// Format of the state file; a file of another version is refused. postcard has no field names,
 /// so any change to the encoded `EcuSnapshot` (version 2: `EcuConfig::startup_ms` and the time
 /// left of the ECU's startup, ADR-265; version 3: the faults waiting for a request,
-/// `SimEcu::inject_for_request`) needs a new version.
-const STATE_FILE_VERSION: u32 = 3;
+/// `SimEcu::inject_for_request`; version 4: `EcuConfig::p2_server_max_ms` and
+/// `p2_star_server_max_ms`) needs a new version.
+const STATE_FILE_VERSION: u32 = 4;
 
 /// The contents of the [`ECU_STATE_ENV`] file (postcard).
 #[derive(Serialize, Deserialize)]

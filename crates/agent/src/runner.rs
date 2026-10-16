@@ -4,6 +4,8 @@
 //! at the failed primitive (ADR-233 item 1). [`run_program_journaled`] also writes the
 //! write-job journal at a flash recovery plan's boundaries (`journaling`, ADR-252), and
 //! [`resume_program_journaled`] goes on with a job whose journal exists (`restart`, ADR-255).
+//! A [`Job`] is a program and, when its program decodes response fields, the variant's
+//! document the VM is stepped with (ADR-316).
 
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,6 +18,7 @@ use diag_ir::{
 use tokio::runtime::{Handle, RuntimeFlavor};
 use worker_host::client::WorkerClient;
 
+use crate::document::{Declarations, JobDocument};
 use crate::guards::{GuardError, JobGuards};
 use crate::host::{HostError, Timings, TransferProgress, WorkerHost};
 use crate::inputs::RuntimeInputs;
@@ -45,6 +48,34 @@ impl Default for JobLimits {
         Self {
             max_steps: 1_000_000,
             wait_poll: Duration::from_millis(10),
+        }
+    }
+}
+
+/// What a job runs: a program, and the document its program decodes responses with, if any
+/// (`document`). A restart is given the same job again.
+#[derive(Debug, Clone)]
+pub struct Job {
+    pub program: Program,
+    pub document: Option<JobDocument>,
+}
+
+impl Job {
+    /// The job a variant's document describes: its procedure, decoding through its variant.
+    pub fn from_document(document: JobDocument) -> Result<Self, crate::document::DocumentError> {
+        Ok(Self {
+            program: document.program()?,
+            document: Some(document),
+        })
+    }
+}
+
+/// A program alone decodes nothing.
+impl From<Program> for Job {
+    fn from(program: Program) -> Self {
+        Self {
+            program,
+            document: None,
         }
     }
 }
@@ -122,6 +153,10 @@ pub enum JobError {
     LinkUnconfirmed,
     #[error("the job thread panicked")]
     Panicked,
+    /// The program decodes response fields (`Op::DecodeField`, ADR-316) but the job has no
+    /// document to decode them with.
+    #[error("the program decodes response fields, but the job has no document")]
+    NoDeclarations,
     /// A restart could not take the per-vehicle lock right after the ECU's VIN matched
     /// (ADR-263): the lock file failed or the guards cannot take a vehicle (an empty guard slot
     /// is [`JobError::GuardsMissing`]). Only ReadDataByIdentifier requests were sent by then, so ending the job
@@ -235,6 +270,22 @@ pub fn check_program(program: &Program, permission: Permission) -> Result<(), Jo
 }
 
 /// The policy part of [`check_program`].
+/// [`check_program`] for a job, which also refuses a program that decodes response fields
+/// (`Op::DecodeField`, ADR-316) without a document to decode them with, rather than failing at
+/// the instruction.
+pub fn check_job(job: &Job, permission: Permission) -> Result<(), JobError> {
+    check_program(&job.program, permission)?;
+    let decodes = job
+        .program
+        .code
+        .iter()
+        .any(|op| matches!(op, diag_ir::Op::DecodeField { .. }));
+    if decodes && job.document.is_none() {
+        return Err(JobError::NoDeclarations);
+    }
+    Ok(())
+}
+
 fn refuse_beyond(program: &Program, permission: Permission) -> Result<(), JobError> {
     policy::check_program(program, permission)
         .map_err(|(pc, source)| JobError::Refused { pc, source })
@@ -268,7 +319,7 @@ fn refuse_beyond(program: &Program, permission: Permission) -> Result<(), JobErr
 pub async fn run_program(
     client: WorkerClient,
     config: &LinkConfig,
-    program: Program,
+    program: impl Into<Job>,
     limits: JobLimits,
     guards: JobGuards,
 ) -> (Result<VmState, JobError>, JobGuards) {
@@ -295,7 +346,7 @@ pub async fn run_program(
 pub async fn run_program_journaled(
     client: WorkerClient,
     config: &LinkConfig,
-    program: Program,
+    program: impl Into<Job>,
     limits: JobLimits,
     journal: JournalSetup,
     guards: JobGuards,
@@ -403,7 +454,7 @@ pub async fn run_program_journaled(
 pub async fn resume_program_journaled(
     client: WorkerClient,
     config: &LinkConfig,
-    program: Program,
+    program: impl Into<Job>,
     limits: JobLimits,
     journal: JournalSetup,
     guards: JobGuards,
@@ -425,7 +476,7 @@ pub async fn resume_program_journaled(
 async fn run_guarded(
     client: WorkerClient,
     config: &LinkConfig,
-    program: Program,
+    job: impl Into<Job>,
     limits: JobLimits,
     ceiling: Permission,
     journal: Option<JournalMode>,
@@ -435,7 +486,7 @@ async fn run_guarded(
     let result = run_program_within(
         client,
         config,
-        program,
+        job.into(),
         limits,
         ceiling,
         journal,
@@ -454,7 +505,7 @@ async fn run_guarded(
 async fn run_program_within(
     client: WorkerClient,
     config: &LinkConfig,
-    program: Program,
+    job: Job,
     limits: JobLimits,
     ceiling: Permission,
     journal: Option<JournalMode>,
@@ -474,7 +525,8 @@ async fn run_program_within(
     {
         return Err(JobError::LinkUnconfirmed);
     }
-    check_program(&program, ceiling)?;
+    check_job(&job, ceiling)?;
+    let Job { program, document } = job;
     // A program that writes needs the device's reprogramming slot (design 8.8.1, ADR-257).
     let holds_slot = guards
         .lock()
@@ -491,7 +543,7 @@ async fn run_program_within(
     tokio::task::spawn_blocking(move || {
         std::panic::catch_unwind(AssertUnwindSafe(|| {
             run_job(
-                handle, client, &config, &program, limits, &cancelled, journal, guards,
+                handle, client, &config, &program, document, limits, &cancelled, journal, guards,
             )
         }))
         .unwrap_or(Err(JobError::Panicked))
@@ -517,6 +569,7 @@ fn run_job(
     mut client: WorkerClient,
     config: &LinkConfig,
     program: &Program,
+    document: Option<JobDocument>,
     limits: JobLimits,
     cancelled: &AtomicBool,
     journal: Option<JournalMode>,
@@ -593,6 +646,7 @@ fn run_job(
         closed: false,
     };
     let mut host = WorkerHost::new(handle.clone(), client, link, timings);
+    host.set_document(document);
     // The VCI is known now. Nothing has been sent to the ECU yet, so a program that needs more
     // than this link allows is refused with no effect on it.
     if let Err(error) = refuse_beyond(program, permission) {
@@ -736,7 +790,7 @@ fn resume_on<H, S>(
     guards: &GuardSlot,
 ) -> Result<VmState, JobError>
 where
-    H: DiagHost<Error = HostError> + RuntimeInputs + TransferProgress,
+    H: DiagHost<Error = HostError> + RuntimeInputs + TransferProgress + Declarations,
     S: Store,
 {
     match restart_order(
@@ -829,7 +883,7 @@ fn restart_order<H, S>(
     guards: &GuardSlot,
 ) -> Result<Restarted<S>, JobError>
 where
-    H: DiagHost<Error = HostError> + RuntimeInputs + TransferProgress,
+    H: DiagHost<Error = HostError> + RuntimeInputs + TransferProgress + Declarations,
     S: Store,
 {
     // Another run of this job holds the journal: it, not this one, goes on with the job.
@@ -1025,7 +1079,7 @@ fn continue_after_plan<H, S>(
     confirmed: restart::Confirmation,
 ) -> Result<VmState, JobError>
 where
-    H: DiagHost<Error = HostError> + RuntimeInputs + TransferProgress,
+    H: DiagHost<Error = HostError> + RuntimeInputs + TransferProgress + Declarations,
     S: Store,
 {
     // As at the start of every restart step: a cancel ends the job before the next verdict.
@@ -1132,7 +1186,7 @@ fn run_on<H, S>(
     journal: Option<&mut JobJournal<S>>,
 ) -> Result<VmState, JobError>
 where
-    H: DiagHost<Error = HostError> + RuntimeInputs + TransferProgress,
+    H: DiagHost<Error = HostError> + RuntimeInputs + TransferProgress + Declarations,
     S: Store,
 {
     run_on_from(program, host, limits, cancelled, journal, 0)
@@ -1149,7 +1203,7 @@ fn run_on_from<H, S>(
     first_step: u64,
 ) -> Result<VmState, JobError>
 where
-    H: DiagHost<Error = HostError> + RuntimeInputs + TransferProgress,
+    H: DiagHost<Error = HostError> + RuntimeInputs + TransferProgress + Declarations,
     S: Store,
 {
     let mut vm = Vm::new(program);
@@ -1199,12 +1253,15 @@ fn run_vm<H, S>(
     run_start: u64,
 ) -> Result<RunEnd, JobError>
 where
-    H: DiagHost<Error = HostError> + RuntimeInputs + TransferProgress,
+    H: DiagHost<Error = HostError> + RuntimeInputs + TransferProgress + Declarations,
     S: Store,
 {
     let wait_poll = limits.wait_poll.max(Duration::from_millis(1));
     // Whether the journal has seen this arrival yet (a timer wait polls the same instruction
     // again).
+    // Loaded once per run; the document was checked when the job was made.
+    let document = host.declarations();
+    let variant = document.as_ref().map(JobDocument::variant);
     let mut arrived = true;
     loop {
         if cancelled.load(Ordering::Relaxed) {
@@ -1253,7 +1310,7 @@ where
             pc,
             steps: vm.state.steps,
         };
-        let outcome = vm.step(program, host);
+        let outcome = vm.step_with_declarations(program, variant.as_ref(), host);
         if vm.state.steps > at.steps {
             // The instruction completed.
             if let Some(journal) = journal.as_deref_mut() {
@@ -1331,7 +1388,7 @@ mod tests {
         guards: &GuardSlot,
     ) -> Result<VmState, JobError>
     where
-        H: DiagHost<Error = HostError> + RuntimeInputs + TransferProgress,
+        H: DiagHost<Error = HostError> + RuntimeInputs + TransferProgress + Declarations,
         S: Store,
     {
         match restart_order(
@@ -1364,6 +1421,8 @@ mod tests {
         waits: u32,
         /// Set after this many requests, as a dropped job future would.
         cancel_after: Option<(u32, Arc<AtomicBool>)>,
+        /// The job's document (`Declarations`).
+        document: Option<JobDocument>,
     }
 
     impl DiagHost for FakeHost {
@@ -1420,6 +1479,12 @@ mod tests {
     impl TransferProgress for FakeHost {
         fn transfer_block_index(&self) -> Option<u64> {
             None
+        }
+    }
+
+    impl Declarations for FakeHost {
+        fn declarations(&self) -> Option<JobDocument> {
+            self.document.clone()
         }
     }
 
@@ -1877,6 +1942,8 @@ mod tests {
             diag_ir::RuntimeInput,
             std::collections::VecDeque<InputAnswer>,
         )>,
+        /// The job's document (`Declarations`).
+        document: Option<JobDocument>,
     }
 
     /// One scripted answer to a runtime input read.
@@ -1928,6 +1995,7 @@ mod tests {
                 waits_pending: 0,
                 wait_polls: 0,
                 input_scripts: Vec::new(),
+                document: None,
             }
         }
 
@@ -1939,6 +2007,12 @@ mod tests {
                 .map(|(sent, _)| sent.clone())
                 .filter(|sent| *sent != read_of([0xF1, 0x86]))
                 .collect()
+        }
+    }
+
+    impl Declarations for FlashHost {
+        fn declarations(&self) -> Option<JobDocument> {
+            self.document.clone()
         }
     }
 
@@ -3388,6 +3462,7 @@ mod tests {
                         unreachable_client(),
                         &LinkConfig::iso15765(0x7E0, 0x7E8),
                         &flash_program(),
+                        None,
                         JobLimits::default(),
                         &AtomicBool::new(false),
                         Some(JournalMode::Create(setup)),
@@ -3518,6 +3593,7 @@ mod tests {
                         unreachable_client(),
                         &LinkConfig::iso15765(0x7E0, 0x7E8),
                         &program,
+                        None,
                         JobLimits::default(),
                         &cancelled,
                         Some(JournalMode::Resume(setup)),
@@ -3647,6 +3723,7 @@ mod tests {
                         unreachable_client(),
                         &LinkConfig::iso15765(0x7E0, 0x7E8),
                         &program(two_requests()),
+                        None,
                         JobLimits::default(),
                         &AtomicBool::new(false),
                         Some(JournalMode::Create(setup)),
@@ -7430,6 +7507,138 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    // --------------------- declarations (ADR-316)
+
+    /// The VIN the declarations' service 1 answers with, and its positive response.
+    const DECODED_VIN: &[u8; 17] = b"WVWZZZ1JZXW000001";
+
+    fn vin_response() -> Vec<u8> {
+        let mut response = vec![0x62, 0xF1, 0x90];
+        response.extend_from_slice(DECODED_VIN);
+        response
+    }
+
+    fn vin_job_document() -> JobDocument {
+        JobDocument::new(crate::document::tests::vin_document(None)).unwrap()
+    }
+
+    /// Decodes the VIN field of a constant response through the job's document.
+    fn decoding_program() -> Program {
+        let mut program = program(vec![
+            Op::PushBytes(0),
+            Op::DecodeField {
+                service: 1,
+                field: 1,
+            },
+        ]);
+        program.constants = vec![vin_response()];
+        program
+    }
+
+    #[test]
+    fn a_run_decodes_through_the_jobs_document() {
+        let mut host = FakeHost {
+            document: Some(vin_job_document()),
+            ..FakeHost::default()
+        };
+        let state = run_plain(
+            &decoding_program(),
+            &mut host,
+            JobLimits::default(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(state.stack, [Value::Bytes(DECODED_VIN.to_vec())]);
+    }
+
+    #[test]
+    fn a_program_that_decodes_needs_a_document() {
+        let program = decoding_program();
+        assert!(matches!(
+            check_job(&program.clone().into(), Permission::ReadOnly),
+            Err(JobError::NoDeclarations)
+        ));
+        let job = Job {
+            program: program.clone(),
+            document: Some(vin_job_document()),
+        };
+        assert!(check_job(&job, Permission::ReadOnly).is_ok());
+        // A host without one fails at the instruction, leaving the state there.
+        let error = run_plain(
+            &program,
+            &mut FakeHost::default(),
+            JobLimits::default(),
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                JobError::Vm {
+                    pc: 1,
+                    source: VmError::NoDeclarations
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_job_that_decodes_without_a_document_is_refused_before_the_link() {
+        let (result, _guards) = run_guarded(
+            unreachable_client(),
+            &LinkConfig::iso15765(0x7E0, 0x7E8),
+            decoding_program(),
+            JobLimits::default(),
+            Permission::ReadOnly,
+            None,
+            vci_only_guards("no-declarations"),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(JobError::NoDeclarations)),
+            "{result:?}"
+        );
+    }
+
+    /// A restart gets the job's document again: after the redone transfer, the program decodes
+    /// the VIN it reads.
+    #[test]
+    fn a_restarted_job_decodes_with_its_document() {
+        let mut program = flash_program();
+        let constant = program.constants.len() as u32;
+        program.constants.push(vin_response());
+        program.code.extend([
+            Op::PushBytes(constant),
+            Op::DecodeField {
+                service: 1,
+                field: 1,
+            },
+        ]);
+        let dir = journal_dir("restart-decodes");
+        interrupted(&program, &dir);
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        host.document = Some(vin_job_document());
+        let state = resume_on(
+            &program,
+            &mut host,
+            JobLimits::default(),
+            &AtomicBool::new(false),
+            Journal::open(&dir, &job_key()),
+            identity_sources(),
+            Some(&target()),
+            None,
+            &dir_slot(&dir),
+        )
+        .expect("the restarted job completes");
+        assert_eq!(state.pc as usize, program.code.len());
+        assert_eq!(
+            state.stack.last(),
+            Some(&Value::Bytes(DECODED_VIN.to_vec()))
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     // --------------------- restart step 4c (ADR-276)
 
     /// The part of a log from the restart's erase on.
@@ -10605,6 +10814,7 @@ mod tests {
                 unreachable_client(),
                 &config,
                 &program,
+                None,
                 JobLimits::default(),
                 &AtomicBool::new(true),
                 None,

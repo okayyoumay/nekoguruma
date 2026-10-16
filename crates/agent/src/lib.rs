@@ -11,10 +11,12 @@
 //!   ADR-262)
 //! - [`policy`]: which requests the runner may send (read-only, except on the simulator in a debug build)
 //! - [`runner`]: runs a [`diag_ir::Program`] to its end on a link
+//! - [`document`]: the variant's document a job's program decodes responses with (ADR-316)
 //!
 //! The contract between the VM and the worker (what `ServiceRequest` sends, what comes back,
 //! deadlines, the sync/async bridge) is ADR-235.
 
+pub mod document;
 pub mod guards;
 pub mod host;
 pub mod inputs;
@@ -26,11 +28,12 @@ pub mod policy;
 pub mod restart;
 pub mod runner;
 
+pub use document::JobDocument;
 pub use host::{HostError, Timings, WorkerHost};
 pub use journal::Vin;
 pub use journaling::JournalSetup;
 pub use link::{Link, LinkConfig};
 pub use runner::{
-    JobError, JobLimits, check_program, resume_program_journaled, run_program,
+    Job, JobError, JobLimits, check_job, check_program, resume_program_journaled, run_program,
     run_program_journaled,
 };

@@ -51,9 +51,11 @@ from `AGENTS.md` rather than from the files Copilot reads.
   reviews run outside GitHub Actions.
 - If Codex's usage limit is reached often, many pull requests end up reviewed by Copilot anyway,
   which also shows in the recorded data.
-- Codex may review on its own when a pull request is marked ready for review, depending on the
-  owner's Codex settings. Such a review arrives after the loop has handed the pull request over;
-  the loop handles it like any other result while it is still subscribed.
+- The loop decides when Codex reviews, so Codex's automatic reviews (on opening a pull request
+  for review and on marking a draft ready) stay off in the owner's Codex settings. With them on,
+  handing a pull request over would start a review that ADR-251 exempts, or put both reviewers on
+  a pull request that fell back to Copilot. If an automatic review arrives anyway, the loop tells
+  the maintainer and handles its findings like any other result.
 - Whether Codex follows the pointer in `AGENTS.md` as faithfully as it would follow rules written
   there is unverified; the first Codex reviews show it. If it does not, the fallback is to copy
   the rules into `AGENTS.md` and keep both copies in step.

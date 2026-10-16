@@ -52,8 +52,13 @@ other `@codex` text asks Codex to carry out a task; either may push commits to t
 **Request.** Post a top-level PR comment (`add_issue_comment`, `issue_number` = the PR number)
 whose first line is exactly `@codex review`, followed only by the attribution footer. Post it as
 its own comment, after every thread of the round has its reply (Step 4), never inside a reply.
-This works on draft PRs. Codex may also review on its own when a PR is marked ready for review
-(an owner setting in Codex); such a review is handled like any other result for its commit.
+This works on draft PRs. The loop asks for every Codex review itself, so Codex's automatic reviews
+(on opening a PR for review and on marking a draft ready) must stay off in the Codex settings
+(ADR-312); otherwise Step 5's ready transition would start a review that ADR-251's exemptions
+skip, or a second reviewer on a PR that fell back to Copilot. A Codex review the loop did not ask
+for shows "Automatic" rather than "Manual request" as its trigger in the summary comment's table.
+If one arrives, tell the maintainer once that automatic reviews are on and how to turn them off,
+and route its findings like any other result while the PR is still open.
 
 **Result.** Codex keeps one "Codex Review Summary" PR comment (`get_comments`) and edits it in
 place as reviews start and finish; each edit wakes the session as a comment event. Its body

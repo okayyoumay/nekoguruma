@@ -542,7 +542,8 @@ impl<'a> Resolver<'a> {
         // A fixed width bounds the values the field can decode to, and a pattern outside them
         // could never match.
         let fixed_bits = match field.length {
-            None | Some(Length::Fixed) => field.bits.filter(|&bits| (1..=64).contains(&bits)),
+            // Any width for bytes; the integer arms below check theirs against 64.
+            None | Some(Length::Fixed) => field.bits.filter(|&bits| bits >= 1),
             _ => None,
         };
         let number = expected.iter().fold(0u64, |n, &b| (n << 8) | u64::from(b));
@@ -559,13 +560,13 @@ impl<'a> Resolver<'a> {
                 );
                 return;
             }
-            (Some(FieldType::Bcd), Some(bits)) => {
+            (Some(FieldType::Bcd), Some(bits)) if bits <= 64 => {
                 // Leading zero digits are allowed; the digits past the field's are not.
                 let digits = expected.len() * 2 - leading_zero_digits(expected);
                 digits > (bits / 4) as usize
             }
-            (Some(FieldType::Uint), Some(bits)) => bits < 64 && number >> bits != 0,
-            (Some(FieldType::Int), Some(bits)) if !expected.is_empty() => {
+            (Some(FieldType::Uint), Some(bits)) if bits <= 64 => bits < 64 && number >> bits != 0,
+            (Some(FieldType::Int), Some(bits)) if bits <= 64 && !expected.is_empty() => {
                 // Sign-extend from the width the value is written in, then check the range.
                 let shift = 64 - 8 * expected.len() as u32;
                 let value = ((number << shift) as i64) >> shift;

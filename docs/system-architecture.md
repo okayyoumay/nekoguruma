@@ -911,6 +911,7 @@ flowchart LR
 - **Source maps**: The IR includes a mapping table from bytecode back to the original Starlark positions. Needed for readability of execution traces and audit logs
 - **Types**: The VM's instructions are typed and it cannot ask a value's type, so the transpiler infers at ingestion which types each value can have; an operation whose operands can have more than one type, or that needs an instruction the IR lacks, is rejected at ingestion (ADR-304)
 - **Sections**: An interruptibility section (8.10.1) is a whole function marked by an annotation, and it covers everything that runs while that function is called, including the functions it calls; sections do not nest (ADR-301)
+- **Size and nesting limits**: A file larger than 1 MiB, or nested past fixed bounds on brackets, blocks, `elif` chains and expression depth, is refused from its tokens before it is parsed, and a file within them is parsed on a thread with a fixed stack, so that no untrusted file can exhaust the converter's stack and abort the server (ADR-303)
 
 The detailed subset, the API and the annotations for section attributes are in `crates/diag-frontend/docs/starlark-subset.md`.
 

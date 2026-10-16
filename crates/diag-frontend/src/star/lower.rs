@@ -61,7 +61,15 @@ const MAX_FAIL_CODE_LEN: usize = 64;
 
 /// Lowers `checked`, the procedure in `file`, to a program. Every reason the procedure cannot
 /// be lowered is reported, in source order.
+///
+/// The lowering walks the AST recursively, so it runs on the parser's thread
+/// ([`super::on_parser_stack`]): only that stack is large enough for every file within the
+/// nesting bounds (subset 2.8, ADR-303).
 pub fn lower(file: &str, checked: &Checked) -> Result<Program, Vec<StarError>> {
+    super::on_parser_stack(|| lower_here(file, checked))
+}
+
+fn lower_here(file: &str, checked: &Checked) -> Result<Program, Vec<StarError>> {
     let mut lowerer = Lowerer::new(checked);
     lowerer.annotations();
     lowerer.constants();

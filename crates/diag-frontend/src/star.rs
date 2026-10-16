@@ -26,8 +26,13 @@ use starlark_syntax::syntax::ast::{
 };
 use starlark_syntax::syntax::{AstModule, Dialect, DialectTypes};
 
+mod bounds;
 mod lower;
 
+pub use bounds::{
+    MAX_BLOCK_DEPTH, MAX_BRACKET_DEPTH, MAX_ELIF_CHAIN, MAX_EXPRESSION_DEPTH, MAX_SOURCE_BYTES,
+    PARSER_STACK_BYTES, on_parser_stack,
+};
 pub use lower::lower;
 
 /// The error codes of `docs/starlark-subset.md` that the checker and the lowering report.
@@ -72,6 +77,12 @@ pub enum StarCode {
     /// An annotation value outside its range (4.2, 4.5).
     #[serde(rename = "STAR_ARGUMENT_OUT_OF_RANGE")]
     ArgumentOutOfRange,
+    /// A file larger than [`MAX_SOURCE_BYTES`] (2.8).
+    #[serde(rename = "STAR_SOURCE_TOO_LARGE")]
+    SourceTooLarge,
+    /// A file nested past one of the bounds of 2.8.
+    #[serde(rename = "STAR_NESTING_TOO_DEEP")]
+    NestingTooDeep,
     /// An argument that must be known at ingestion is not (3.1).
     #[serde(rename = "STAR_NON_CONSTANT_ARGUMENT")]
     NonConstantArgument,
@@ -101,6 +112,8 @@ impl StarCode {
             Self::BuiltinNotAllowed => "STAR_BUILTIN_NOT_ALLOWED",
             Self::BadAnnotation => "STAR_BAD_ANNOTATION",
             Self::ArgumentOutOfRange => "STAR_ARGUMENT_OUT_OF_RANGE",
+            Self::SourceTooLarge => "STAR_SOURCE_TOO_LARGE",
+            Self::NestingTooDeep => "STAR_NESTING_TOO_DEEP",
             Self::NonConstantArgument => "STAR_NON_CONSTANT_ARGUMENT",
             Self::NotLowerable => "STAR_NOT_LOWERABLE",
             Self::ApiNotAvailable => "STAR_API_NOT_AVAILABLE",
@@ -165,7 +178,9 @@ pub enum Annotation {
     Idempotency { line: u32, value: Idempotency },
 }
 
-/// A procedure that passed the checks: its AST and annotations, for the lowering.
+/// A procedure that passed the checks: its AST and annotations, for the lowering. The AST nests
+/// no deeper than the bounds of 2.8 allow, which a recursive walk over it can rely on only on a
+/// thread with a [`PARSER_STACK_BYTES`] stack ([`on_parser_stack`]); dropping it needs much less.
 #[derive(Debug)]
 pub struct Checked {
     pub module: AstModule,
@@ -264,8 +279,34 @@ fn dialect() -> Dialect {
 }
 
 /// Parses `source`, the contents of the procedure file `file`, and checks it against the subset.
+/// A file past the size or nesting bounds of 2.8 is refused before it is parsed; any other is
+/// parsed and checked on a thread of its own ([`on_parser_stack`]).
 pub fn check(file: &str, source: &str) -> Result<Checked, Vec<StarError>> {
-    let module = match AstModule::parse(file, source.to_owned(), &dialect()) {
+    if source.len() > MAX_SOURCE_BYTES {
+        return Err(vec![located(
+            StarCode::SourceTooLarge,
+            file,
+            source,
+            MAX_SOURCE_BYTES,
+            format!("the file is larger than {MAX_SOURCE_BYTES} bytes (2.8)"),
+        )]);
+    }
+    on_parser_stack(|| check_bounded(file, source))
+}
+
+/// [`check`] on a file within the size bound.
+fn check_bounded(file: &str, source: &str) -> Result<Checked, Vec<StarError>> {
+    let dialect = dialect();
+    if let Err(exceeded) = bounds::prescan(source, &dialect) {
+        return Err(vec![located(
+            StarCode::NestingTooDeep,
+            file,
+            source,
+            exceeded.at,
+            exceeded.hint,
+        )]);
+    }
+    let module = match AstModule::parse(file, source.to_owned(), &dialect) {
         Ok(module) => module,
         Err(error) => return Err(vec![syntax_error(file, source, &error)]),
     };
@@ -337,6 +378,25 @@ fn resolve(file: &str, module: &AstModule, mut pending: Vec<Pending>) -> Vec<Sta
             }
         })
         .collect()
+}
+
+/// An error at the byte `at` of `source`, located without a parse.
+fn located(code: StarCode, file: &str, source: &str, at: usize, hint: String) -> StarError {
+    let mut at = at.min(source.len());
+    while !source.is_char_boundary(at) {
+        at -= 1;
+    }
+    let line_start = source[..at].rfind('\n').map_or(0, |n| n + 1);
+    let line_end = source[at..].find('\n').map_or(source.len(), |n| at + n);
+    let text = source[line_start..line_end].trim_end_matches('\r');
+    StarError {
+        code,
+        file: file.to_owned(),
+        line: to_u32(source[..line_start].matches('\n').count() + 1),
+        column: to_u32(source[line_start..at].chars().count() + 1),
+        snippet: snippet(text, at - line_start),
+        hint,
+    }
 }
 
 /// The one error of a file that does not parse. `while` is a reserved word that the parser

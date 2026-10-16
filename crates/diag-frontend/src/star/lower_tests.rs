@@ -267,7 +267,7 @@ fn a_dict_literal_must_not_repeat_a_key() {
 
 #[test]
 fn large_dicts_compare_in_linear_time() {
-    let entries: Vec<String> = (0..100_000).map(|n| format!("\"k{n}\": {n}")).collect();
+    let entries: Vec<String> = (0..50_000).map(|n| format!("\"k{n}\": {n}")).collect();
     let source = format!(
         "D = {{{}}}\nE = D == D\n\ndef main():\n    if E:\n        diag.fail(\"YES\", \"\")\n",
         entries.join(", ")
@@ -342,23 +342,28 @@ fn int_of_a_float_accepts_every_value_in_range() {
 }
 
 #[test]
-fn string_and_bytes_literals_are_bounded_too() {
-    // A literal of 2^20 bytes counts 2^20 + 1, one past the limit; one byte less fits.
-    for (quote, prefix) in [("\"", ""), ("\"", "b")] {
-        for (len, over) in [((1 << 20) - 1, false), (1 << 20, true)] {
-            let source = format!(
-                "T = {prefix}{quote}{}{quote}\n\ndef main():\n    pass\n",
-                "x".repeat(len)
-            );
-            assert_eq!(!codes(&source).is_empty(), over, "{prefix} {len}");
-        }
+fn string_and_bytes_literals_stay_within_the_constant_limit() {
+    // A literal of 2^20 bytes would count 2^20 + 1, one past the constant limit, but no file
+    // within the source limit (2.8) holds one; the lowering bounds literals all the same.
+    for prefix in ["", "b"] {
+        let fits = format!(
+            "T = {prefix}\"{}\"\n\ndef main():\n    pass\n",
+            "x".repeat((1 << 20) - 64)
+        );
+        assert!(codes(&fits).is_empty(), "{prefix}");
+        let over = format!(
+            "T = {prefix}\"{}\"\n\ndef main():\n    pass\n",
+            "x".repeat(1 << 20)
+        );
+        let errors = check("t.star", &over).unwrap_err();
+        assert_eq!(errors[0].code, StarCode::SourceTooLarge, "{prefix}");
     }
 }
 
 #[test]
 fn constants_nest_at_most_64_deep() {
     // Each line is shallow, but the globals nest one in the next: folding and dropping them
-    // would recurse 100,000 deep.
+    // would recurse 40,000 deep.
     let chain = |lines: usize, wrap: &str| {
         let mut source = String::from("A0 = 0\n");
         for i in 1..=lines {
@@ -378,7 +383,7 @@ fn constants_nest_at_most_64_deep() {
             vec![(StarCode::NotLowerable, 66)],
             "{wrap}"
         );
-        let found = codes(&chain(100_000, wrap));
+        let found = codes(&chain(40_000, wrap));
         assert!(!found.is_empty() && found.iter().all(|(c, _)| *c == StarCode::NotLowerable));
     }
 }
@@ -567,6 +572,27 @@ fn list_searches_and_slices_are_charged_for_what_they_read() {
         .expect("the folding budget is reported");
     // B0 to B19 read just over 2^20; each slice line from 21 on reads just over 2^19.
     assert!((2_060..=2_070).contains(&folding.line), "{}", folding.line);
+}
+
+#[test]
+fn a_deeply_nested_procedure_lowers_on_the_parser_stack() {
+    // A chain of 400 `+`, which nests one level per link, near the expression bound (subset
+    // 2.8): walking it recursively needs more than a test thread's stack, so the lowering runs
+    // on the parser's.
+    let depth = 400;
+    let expr = format!("x{}", " + x".repeat(depth));
+    let source = format!(
+        "def f(x):\n    return {expr}\n\ndef main():\n    if f(1) == {}:\n        diag.fail(\"YES\", \"\")\n",
+        depth + 1
+    );
+    // Called from a thread with a small stack: only the parser's thread can take the walk.
+    let lowered = std::thread::Builder::new()
+        .stack_size(128 << 10)
+        .spawn(move || lowered(&source).is_ok())
+        .unwrap()
+        .join()
+        .unwrap();
+    assert!(lowered);
 }
 
 #[test]

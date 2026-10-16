@@ -1919,6 +1919,11 @@ impl<'a> Lowerer<'a> {
                 );
                 Ty::Float
             }
+            // A run-time string is UTF-8 `Bytes` (2.5), and joining two keeps it UTF-8.
+            (BinOp::Add, Ty::Bytes, Ty::Bytes) | (BinOp::Add, Ty::Str, Ty::Str) => {
+                code.push(at(Op::Concat));
+                ta
+            }
             (BinOp::Add | BinOp::Subtract | BinOp::Multiply, Ty::Int, Ty::Int)
             | (BinOp::Add | BinOp::Subtract | BinOp::Multiply, Ty::Float, Ty::Float) => {
                 code.push(at(match op {
@@ -2838,9 +2843,6 @@ fn binary_hint(op: BinOp, a: Ty, b: Ty) -> String {
     let reason = match op {
         BinOp::LeftShift => "an overflow-checked shift instruction (4.4)",
         BinOp::In | BinOp::NotIn => "a search instruction",
-        BinOp::Add if a == b && matches!(a, Ty::Str | Ty::Bytes) => {
-            "a concatenation instruction (2.5)"
-        }
         BinOp::Percent if a == Ty::Str => "string formatting instructions (2.5)",
         BinOp::Divide | BinOp::FloorDivide | BinOp::Percent
             if matches!(a, Ty::Int | Ty::Float) && matches!(b, Ty::Int | Ty::Float) =>

@@ -2794,6 +2794,7 @@ mod tests {
             VmError::UndefinedVariable(0),
             VmError::IndexOutOfRange(0),
             VmError::ByteOutOfRange(0),
+            VmError::BytesTooLong(0),
         ];
         // The match fails to compile when a variant is added, so the list above stays complete.
         for error in &errors {
@@ -2815,7 +2816,8 @@ mod tests {
                 | VmError::InvalidUtf8(_)
                 | VmError::UndefinedVariable(_)
                 | VmError::IndexOutOfRange(_)
-                | VmError::ByteOutOfRange(_) => {}
+                | VmError::ByteOutOfRange(_)
+                | VmError::BytesTooLong(_) => {}
             }
         }
         let encoded = |reason: RunStop| {

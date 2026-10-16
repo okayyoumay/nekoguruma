@@ -806,7 +806,7 @@ Approximately 50-80 instructions are expected.
 | Category | Instructions |
 |---|---|
 | Stack operations | push / pop / dup / swap |
-| Arithmetic, logic, comparison | Integer and floating-point arithmetic (including the remainder and negation), bitwise operations, comparison |
+| Arithmetic, logic, comparison | Integer and floating-point arithmetic (including the remainder, negation and conversion between the two), bitwise operations, comparison |
 | Control | Branch, conditional branch, subroutine call and return, declared failure (the procedure ends itself as failed with a code and a detail, ADR-280) |
 | Variables | Local and global read/write, array access, byte-string length, concatenation and slices |
 | Diagnostic primitives | Service execution, DTC read, routine control, security access request, flash transfer, wait, HMI request, record template input request (4.3.1), monitoring section capture (4.6), log output |

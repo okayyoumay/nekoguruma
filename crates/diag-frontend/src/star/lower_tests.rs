@@ -816,12 +816,36 @@ fn bytes_slice_at_run_time_as_at_ingestion() {
 }
 
 #[test]
+fn ints_and_floats_mix_at_run_time() {
+    // An int with a float is computed in floats, either side.
+    assert!(holds("a, b", "1, 0.5", "a + b == 1.5"));
+    assert!(holds("a, b", "1, 0.5", "b - a == -0.5"));
+    assert!(holds("a, b", "3, 0.5", "a * b == 1.5"));
+    // `/` divides in floats, also for two ints.
+    assert!(holds("a, b", "7, 2", "a / b == 3.5"));
+    assert!(holds("a, b", "1, 0.5", "a / b == 2.0"));
+    assert!(holds("a, b", "1.0, 4", "a / b == 0.25"));
+    let divide_by_zero = "def f(a, b):\n    return a / b\n\ndef main():\n    f(1, 0)\n";
+    assert!(run(divide_by_zero).is_err_and(|e| e.contains("DivisionByZero")));
+    // `int` and `float` of numbers known only at run time.
+    assert!(holds("x", "2.9", "int(x) == 2"));
+    assert!(holds("x", "-2.9", "int(x) == -2"));
+    assert!(holds("x", "3", "float(x) == 3.0"));
+    assert!(holds("x", "3", "int(x) == 3"));
+    assert!(holds("x", "0.5", "float(x) == 0.5"));
+    let infinite = "def f(x):\n    return int(x * x)\n\ndef main():\n    f(1e200)\n";
+    assert!(run(infinite).is_err_and(|e| e.contains("FloatNotConvertible")));
+}
+
+#[test]
 fn what_the_ir_cannot_express_is_not_lowerable() {
     let cases = [
-        // Mixed int and float at run time.
-        "def f(x):\n    return x + 1.0\n\ndef main():\n    f(1)\n",
+        // An int compared with a float at run time.
+        "def f(x):\n    return x == 1.0\n\ndef main():\n    f(1)\n",
         // Float floor division at run time.
         "def f(x):\n    return x // 2.0\n\ndef main():\n    f(1.0)\n",
+        // `int` of a string at run time.
+        "def f(x):\n    return int(x)\n\ndef main():\n    f(\"1\")\n",
         // A run-time `<<`.
         "def f(x):\n    return x << 1\n\ndef main():\n    f(1)\n",
         // Bytes and a string joined at run time.

@@ -96,8 +96,11 @@ through the declaration part's decode plan instead. An `offset` that runs past t
 a `v` outside 0 to 2^`bits` - 1, is an error at run time. Both are built from `IndexGet`,
 `IndexSet`, shifts and `BitOr`.
 
-String functions and `int`/`float`/`str` conversions that take a run-time value need the
-instructions listed in 2.5; with constant arguments they are evaluated at ingestion.
+`int` and `float` of a number known only at run time lower to the IR's conversions between
+integers and floats (`int` rounds toward zero, and a NaN, an infinity or a value out of the
+64-bit range is an error at run time, as in Starlark). String functions and the other
+conversions that take a run-time value need the instructions listed in 2.5; with constant
+arguments they are evaluated at ingestion.
 
 `sorted`, `reversed`, `enumerate`, `zip` and other functions that take or build sequences of
 pairs are **not supported** in version 1. Use `for` with an index instead.
@@ -445,7 +448,9 @@ def main():
 - A shift count outside 0 to 63 is an error, at run time and when constants are folded.
   Starlark accepts larger right shifts; this subset does not
 - No implicit conversion between `int` and `float` beyond what Starlark itself does for
-  mixed arithmetic; the transpiler inserts the conversion instructions explicitly
+  mixed arithmetic: `+`, `-`, `*` and `/` with an `int` and a `float` operand, and `/` of two
+  `int`s, compute in floats, and the transpiler inserts the conversion of each `int` operand.
+  An `int` past 2^53 rounds to the nearest float, as it does in Starlark
 
 ### 4.5 Specifying Section Attributes
 
@@ -543,8 +548,9 @@ type, so the transpiler infers at ingestion which types each value can have (ADR
   (an `int` on one path and a `float` on another, or a parameter its callers pass both) is
   `STAR_NOT_LOWERABLE` there; write the function for one type.
 - Values of different types are never equal, as in Starlark: `1 == "1"` is `False` without
-  an instruction comparing them. An `int` and a `float` compare by value in Starlark, which needs
-  a conversion instruction at run time.
+  an instruction comparing them. An `int` and a `float` compare by value in Starlark; known only
+  at run time, they are not compared, since converting the `int` to a `float` could round it and
+  change the answer.
 - `None` does not exist at run time (2.5). A function that returns a value must return one on
   every path, and a function that returns none cannot be used as a value
   (`STAR_UNSUPPORTED_SYNTAX`).

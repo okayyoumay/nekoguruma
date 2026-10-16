@@ -25,7 +25,9 @@ use serde::{Deserialize, Serialize};
 /// 6: `Op` gained `Neg`, for the same reason.
 /// 7: `Op` gained `Concat`, for the same reason; `VmError` gained `BytesTooLong`.
 /// 8: `Op` gained `Slice`, for the same reason.
-pub const IR_SCHEMA_VERSION: u32 = 8;
+/// 9: `Op` gained `IntToFloat` and `FloatToInt`, for the same reason; `VmError` gained
+/// `FloatNotConvertible`.
+pub const IR_SCHEMA_VERSION: u32 = 9;
 
 /// The longest code, in bytes, that `Program::validate` accepts for a `Fail` (ADR-280).
 pub const MAX_FAILURE_CODE_LEN: usize = 128;
@@ -158,6 +160,15 @@ pub enum Op {
     /// are then clamped to the length, and a stop before the start gives empty bytes. A stop of
     /// `i64::MAX` therefore slices to the end. No index is out of range.
     Slice,
+
+    // Conversions. Appended after `Slice` (ADR-233).
+    /// Replaces the `I64` on top of the stack with the nearest `F64`, as Starlark's `float`
+    /// does; integers past 2^53 may round.
+    IntToFloat,
+    /// Replaces the `F64` on top of the stack with its integer part, rounding toward zero, as
+    /// Starlark's `int` does. NaN, an infinity, or a value whose integer part is outside the
+    /// `I64` range is `VmError::FloatNotConvertible`.
+    FloatToInt,
 }
 
 // ---------------------------------------------------------------- Program
@@ -268,6 +279,8 @@ impl Op {
             | Op::Neg
             | Op::Concat
             | Op::Slice
+            | Op::IntToFloat
+            | Op::FloatToInt
             | Op::Fail { .. } => false,
         }
     }
@@ -556,6 +569,20 @@ impl Vm {
                 let sliced = bytes[from..to].to_vec();
                 self.replace(3, Value::Bytes(sliced));
             }
+            Op::IntToFloat => {
+                let [Value::I64(n)] = self.top(1)? else {
+                    return Err(VmError::TypeMismatch.into());
+                };
+                let converted = *n as f64;
+                self.replace(1, Value::F64(converted));
+            }
+            Op::FloatToInt => {
+                let [Value::F64(f)] = self.top(1)? else {
+                    return Err(VmError::TypeMismatch.into());
+                };
+                let converted = float_to_int(*f).ok_or(VmError::FloatNotConvertible)?;
+                self.replace(1, Value::I64(converted));
+            }
             Op::Not => {
                 let Value::Bool(b) = self.top(1)?[0] else {
                     return Err(VmError::TypeMismatch.into());
@@ -790,7 +817,9 @@ impl Vm {
             | Op::Rem
             | Op::Neg
             | Op::Concat
-            | Op::Slice => HostInput::Nothing,
+            | Op::Slice
+            | Op::IntToFloat
+            | Op::FloatToInt => HostInput::Nothing,
             // The checks of `Fail` run in `execute`, before it changes anything.
             Op::Fail { .. } => HostInput::Nothing,
         })
@@ -904,6 +933,14 @@ fn store(slots: &mut Vec<Option<Value>>, slot: u16, value: Value) {
         slots.resize(slot + 1, None);
     }
     slots[slot] = Some(value);
+}
+
+/// `f` rounded toward zero, or `None` when it is NaN, infinite, or its integer part is outside
+/// the `i64` range (whose bounds are -2^63, exactly representable, and 2^63, excluded).
+fn float_to_int(f: f64) -> Option<i64> {
+    const LIMIT: f64 = 9_223_372_036_854_775_808.0; // 2^63
+    let t = f.trunc();
+    (-LIMIT..LIMIT).contains(&t).then_some(t as i64)
 }
 
 /// The byte range of a slice from `start` to `stop` of `len` bytes, as Starlark computes it: a
@@ -1078,6 +1115,8 @@ pub enum VmError {
     ByteOutOfRange(i64),
     #[error("byte string of {0} bytes is longer than {MAX_BYTES_LEN}")]
     BytesTooLong(u64),
+    #[error("float is NaN, infinite or outside the integer range")]
+    FloatNotConvertible,
 }
 
 #[cfg(test)]

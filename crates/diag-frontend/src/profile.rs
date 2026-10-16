@@ -299,7 +299,7 @@ impl Call {
                     status_bits,
                 } => {
                     dtc_maps += 1;
-                    let whole = |bits: u8| bits > 0 && bits <= 64 && bits % 8 == 0;
+                    let whole = |bits: u8| bits > 0 && bits <= 64 && bits.is_multiple_of(8);
                     intent == Intent::ReadDtc
                         && step.declared
                         && mask != dtcs
@@ -330,7 +330,7 @@ impl Call {
                     Part::Const { bits, value } => {
                         if bits == 0
                             || bits > 64
-                            || bits % 8 != 0
+                            || !bits.is_multiple_of(8)
                             || (bits < 64 && value >> bits != 0)
                         {
                             return Err(ProfileError::BadConstant(intent));
@@ -339,7 +339,7 @@ impl Call {
                     Part::Select { bits, arg } | Part::Arg { bits, arg } => {
                         let select = matches!(part, Part::Select { .. });
                         let rest = !select && bits == 0;
-                        if bits % 8 != 0 || bits > 64 || (bits == 0 && !rest) {
+                        if !bits.is_multiple_of(8) || bits > 64 || (bits == 0 && !rest) {
                             return Err(ProfileError::BadWidth(intent));
                         }
                         if rest && i + 1 != parts.len() {

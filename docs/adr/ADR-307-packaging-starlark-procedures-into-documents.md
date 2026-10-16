@@ -3,7 +3,7 @@
 **Date:** 2026-10-16
 **Status:** Accepted
 **Affects:** `diag-frontend` (`src/convert.rs`, `src/tables/mod.rs`, `src/star.rs`),
-`crates/diag-frontend/docs/csv-tables.md` sections 1 and 6, `starlark-subset.md` 2.1, design
+`crates/diag-frontend/docs/csv-tables.md` sections 1 and 6, `starlark-subset.md` 2.1, ADR-295 item 1, design
 8.2.6
 
 ## Context

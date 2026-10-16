@@ -544,13 +544,19 @@ fn each_call_has_the_results_adr_314_gives_it() {
         bits: 8,
         value: 0x02,
     };
-    // `diag.read_dtc` maps `mask` and `dtcs`, to different fields.
-    for map in [ResultMap::None, ResultMap::Declared] {
-        assert_eq!(
-            read_dtc(vec![sub, mask(8)], map),
-            Err(ProfileError::ResultMap(Intent::ReadDtc))
-        );
-    }
+    // `diag.read_dtc` maps `mask` and `dtcs`, to different fields; without the map the mask has
+    // no request of its own either.
+    assert_eq!(
+        read_dtc(vec![sub, mask(8)], ResultMap::Declared),
+        Err(ProfileError::ResultMap(Intent::ReadDtc))
+    );
+    assert_eq!(
+        read_dtc(vec![sub, mask(8)], ResultMap::None),
+        Err(ProfileError::SourceOutOfPlace(
+            Intent::ReadDtc,
+            Source::Mask
+        ))
+    );
     let same = ResultMap::ReadDtc {
         mask: Pos(1),
         dtcs: Pos(1),
@@ -669,6 +675,69 @@ fn the_levels_go_with_the_seed_and_the_key_requests() {
     assert_eq!(
         security(vec![seed, key_step(0), send_key]),
         Err(ProfileError::SourceOutOfPlace(i, Source::LevelPlusOne))
+    );
+}
+
+#[test]
+fn the_mask_goes_in_the_request_whose_response_gives_the_dtcs() {
+    let mask_first = step(
+        StepKind::SendReceive,
+        0x19,
+        vec![mask(8)],
+        true,
+        ResultMap::None,
+    );
+    let dtcs = step(
+        StepKind::SendReceive,
+        0x19,
+        vec![Part::Const {
+            bits: 8,
+            value: 0x02,
+        }],
+        true,
+        DTC_MAP,
+    );
+    assert_eq!(
+        check(Intent::ReadDtc, vec![mask_first, dtcs]),
+        Err(ProfileError::SourceOutOfPlace(
+            Intent::ReadDtc,
+            Source::Mask
+        ))
+    );
+}
+
+#[test]
+fn the_level_and_the_key_go_in_one_request_that_ends_the_call() {
+    let i = Intent::SecurityAccess;
+    let level_plus_one = step(
+        StepKind::SendReceive,
+        0x27,
+        vec![Part::Arg {
+            bits: 8,
+            arg: Source::LevelPlusOne,
+        }],
+        false,
+        ResultMap::None,
+    );
+    let key_alone = step(
+        StepKind::SendReceive,
+        0x27,
+        vec![Part::Arg {
+            bits: 0,
+            arg: Source::Key,
+        }],
+        false,
+        ResultMap::None,
+    );
+    assert_eq!(
+        security(vec![seed_step(), key_step(0), level_plus_one, key_alone]),
+        Err(ProfileError::SourceOutOfPlace(i, Source::Key))
+    );
+    // A request after the send-key request.
+    let after = step(StepKind::SendReceive, 0x3E, vec![], false, ResultMap::None);
+    assert_eq!(
+        security(vec![seed_step(), key_step(0), send_key_step(), after]),
+        Err(ProfileError::ResultMap(i))
     );
 }
 

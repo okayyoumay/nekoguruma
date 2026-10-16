@@ -211,7 +211,7 @@ pub enum ProfileError {
     RestNotLast(Intent),
     #[error("{}: {:?} is in the wrong kind of part (only the routine's identifier and sub-function select)", .0.name(), .1)]
     PartForSource(Intent, Source),
-    #[error("{}: {:?} is not in the step that sends it (the seed request, or the key request)", .0.name(), .1)]
+    #[error("{}: {:?} is not in the request it belongs to", .0.name(), .1)]
     SourceOutOfPlace(Intent, Source),
     #[error("{}: the key is used before the step that makes it", .0.name())]
     KeyBeforeKeyStep(Intent),
@@ -365,9 +365,14 @@ impl Call {
                             return Err(ProfileError::KeyBeforeKeyStep(intent));
                         }
                         // The seed is requested with `level`, the key sent with `level + 1`.
+                        // Both go in the one send-key request right after the key step.
                         let in_place = match arg {
                             Source::Level => matches!(step.result, ResultMap::Seed { .. }),
-                            Source::LevelPlusOne => key_step.is_some(),
+                            // The mask goes in the request whose response gives the DTCs.
+                            Source::Mask => matches!(step.result, ResultMap::ReadDtc { .. }),
+                            Source::LevelPlusOne | Source::Key => {
+                                key_step.is_some_and(|k| k + 1 == at)
+                            }
                             _ => true,
                         };
                         if !in_place {
@@ -418,7 +423,8 @@ impl Call {
         let result_fits = match intent {
             Intent::ReadDtc => dtc_maps == 1,
             Intent::Routine => last.result == ResultMap::Declared,
-            Intent::SecurityAccess => key_step.is_some(),
+            // The send-key request ends the call.
+            Intent::SecurityAccess => key_step.is_some_and(|k| k + 2 == self.steps.len()),
         };
         if !result_fits {
             return Err(ProfileError::ResultMap(intent));

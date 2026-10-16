@@ -510,7 +510,10 @@ fn an_error_only_some_variants_give_names_them() {
     let merged = merge(
         vec![
             ("v1", vec![error(2, "both"), error(3, "v1 only")]),
-            ("v2", vec![error(1, "v2 and v3"), error(2, "both")]),
+            (
+                "v2",
+                vec![error(1, "v2 and v3"), error(2, "both"), error(2, "both")],
+            ),
             ("v3", vec![error(1, "v2 and v3"), error(2, "both")]),
         ],
         3,

@@ -165,12 +165,20 @@ pub fn lower_procedures(definition: &Definition) -> Result<Vec<Procedure>, Proce
 /// name of the variant: each distinct one once, in source order (ADR-311). One that not every
 /// variant gave names the variants that did at the end of its hint.
 fn merge(per_variant: Vec<(&str, Vec<StarError>)>, variants: usize) -> Vec<StarError> {
+    // A file can give many errors (one per annotation, up to the bounds of subset 2.8), so each
+    // is found by hash rather than by comparing it with every earlier one.
     let mut merged: Vec<(StarError, Vec<&str>)> = Vec::new();
+    let mut at: HashMap<StarError, usize> = HashMap::new();
     for (name, found) in per_variant {
         for error in found {
-            match merged.iter_mut().find(|(seen, _)| *seen == error) {
-                Some((_, names)) => names.push(name),
-                None => merged.push((error, vec![name])),
+            match at.get(&error) {
+                // One variant giving the same error twice still counts once.
+                Some(&i) if merged[i].1.last() == Some(&name) => {}
+                Some(&i) => merged[i].1.push(name),
+                None => {
+                    at.insert(error.clone(), merged.len());
+                    merged.push((error, vec![name]));
+                }
             }
         }
     }

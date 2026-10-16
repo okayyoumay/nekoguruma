@@ -59,12 +59,15 @@ adopted as is.
 4. **Fields.** Fields are separated by spaces; a field contains no space outside brackets. Each is
    `[@position] name:type[length][*conversion]["unit"][=constant]`:
    - position: `@3` is byte 3 and `@0.5` byte 0, bit 5 (`Absolute`); without it the field
-     follows the previous one (`AfterPrevious`). The byte counts from the container's position 0,
-     as the `byte` column does;
+     starts at the byte edge after the previous one (`AfterPrevious`), and `@+.5` starts it at
+     bit 5 of that byte (`AfterPrevious` with a bit position, a row without `byte` but with
+     `bit`). The byte counts from the container's position 0, as the `byte` column does;
    - type: `u<bits>`, `i<bits>`, `f32`, `f64`, `bcd<bits>`, `bytes`, `ascii`, `utf8`, `ucs2`, with
      a `le` suffix for little-endian (big-endian is the default);
-   - length, for the byte and string types: `[17]` a fixed size in bytes; `[len]` the length held
-     by the earlier field `len` (`FromField`, its value in bits as `csv-tables.md` 5.2 defines);
+   - length: a numeric type with a field-held width is written without its width, as `u[len]`,
+     `i[len]` or `bcd[len]`, where `len` is the earlier field holding the width (`FromField`, its
+     value in bits as `csv-tables.md` 5.2 defines). For the byte and string types: `[17]` a fixed
+     size in bytes; `[len]` the length held by the earlier field `len` (`FromField`, as above);
      `[lead8]` a leading length prefix of that many bits; `[..end]`, `[..zero]` or `[..ff]` a
      terminated value, optionally with its byte limits as `[1..16 zero]` (a maximum left out, as in `[1.. end]`, means none);
    - `*name` a conversion of `conversions.csv`, `"key"` a unit of `units.csv` (quoted, as DBC writes units, so it never reads as a length);

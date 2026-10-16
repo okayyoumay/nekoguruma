@@ -67,6 +67,9 @@ pub fn encode_request(
     values: &HashMap<&str, ParamValue<'_>>,
 ) -> Result<Vec<u8>, EncodeError> {
     let prefix = request.prefix().map_or(&[][..], |p| p.bytes());
+    if prefix.len() >= MAX_ENCODED_BYTES {
+        return Err(EncodeError::TooLarge);
+    }
     let mut message = Message::default();
     // The SID and the prefix are written first and belong to no field.
     message.bytes.push(request.sid());
@@ -287,6 +290,15 @@ fn int(field: &Field<'_>, value: ParamValue<'_>) -> Result<i64, EncodeError> {
 
 /// The bytes a `Bytes`, `Ascii`, `Utf8` or `Unicode2` field sends for `value`.
 fn string_bytes(field: &Field<'_>, value: ParamValue<'_>) -> Result<Vec<u8>, EncodeError> {
+    // A value past the message limit is refused before it is copied or converted.
+    let given = match value {
+        ParamValue::Bytes(b) => b.len(),
+        ParamValue::Text(t) => t.len(),
+        _ => 0,
+    };
+    if given > MAX_ENCODED_BYTES {
+        return Err(EncodeError::TooLarge);
+    }
     match (field.kind(), value) {
         (DataKind::Bytes, ParamValue::Bytes(b)) => Ok(b.to_vec()),
         // The decoder reads each byte as the code point of the same value (ADR-297).

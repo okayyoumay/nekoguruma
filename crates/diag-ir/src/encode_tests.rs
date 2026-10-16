@@ -485,3 +485,55 @@ fn more_positions_and_kinds_round_trip() {
         .is_ok()
     );
 }
+
+#[test]
+fn the_size_limit_holds_for_a_long_prefix_and_long_values() {
+    let prefix = vec![0; MAX_ENCODED_BYTES];
+    assert_eq!(encode(&prefix, vec![], &[]), Err(EncodeError::TooLarge));
+    let long = vec![0; MAX_ENCODED_BYTES + 1];
+    let text = "a".repeat(MAX_ENCODED_BYTES + 1);
+    let rest = |name: &str, kind| FieldT {
+        length_kind: LengthKind::Terminated,
+        termination: Termination::EndOfPdu,
+        ..next(name, kind, 0)
+    };
+    assert_eq!(
+        encode(
+            &[],
+            vec![rest("b", DataKind::Bytes)],
+            &[("b", Bytes(&long))]
+        ),
+        Err(EncodeError::TooLarge)
+    );
+    for kind in [DataKind::Ascii, DataKind::Utf8, DataKind::Unicode2] {
+        assert_eq!(
+            encode(&[], vec![rest("t", kind)], &[("t", Text(&text))]),
+            Err(EncodeError::TooLarge)
+        );
+    }
+}
+
+#[test]
+fn a_float_takes_large_integers_it_holds_exactly() {
+    for width in [32, 64] {
+        for n in [1i64 << 54, i64::MIN] {
+            assert!(
+                encode(
+                    &[],
+                    vec![next("f", DataKind::Float, width)],
+                    &[("f", Int(n))]
+                )
+                .is_ok(),
+                "{width} {n}"
+            );
+        }
+    }
+    assert!(matches!(
+        encode(
+            &[],
+            vec![next("f", DataKind::Float, 64)],
+            &[("f", Int(i64::MAX))]
+        ),
+        Err(EncodeError::OutOfRange { .. })
+    ));
+}

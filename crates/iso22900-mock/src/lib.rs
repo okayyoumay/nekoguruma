@@ -16,7 +16,7 @@ use sim_ecu::{Addressing, EcuConfig, Fault, SimEcu};
 
 const MOCK_MODULE_HANDLE: UNUM32 = 1001;
 const MOCK_RESOURCE_ID: UNUM32 = 2001;
-/// Object ids the mock gives the ISO 22900-2 (2022) short names it resolves.
+/// Object ids the mock gives the ISO 22900-2 (2022) short names it resolves (Annex B.1, B.2).
 pub const STANDARD_BUS_TYPE_DWCAN: UNUM32 = 3111;
 pub const STANDARD_PROTOCOL_UDS_ON_CAN: UNUM32 = 3112;
 pub const STANDARD_PIN_TYPE_HI: UNUM32 = 3311;

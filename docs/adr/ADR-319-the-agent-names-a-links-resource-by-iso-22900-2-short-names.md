@@ -1,4 +1,4 @@
-# ADR-319: The Agent Names a Link's Resource by ISO 22900-2 Short Names
+# ADR-319: The Agent Names a Link's Resource by ISO 22900-2 (2022) Short Names
 
 **Date:** 2026-10-16
 **Status:** Accepted

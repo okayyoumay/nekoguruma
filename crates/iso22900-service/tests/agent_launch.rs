@@ -5,8 +5,8 @@
 //! `Api::Dpdu` resolves the `iso22900-mock` library through a root description file, picks the
 //! `iso22900-service` build for the library's ABI from a workers directory, starts it with the
 //! name and the device's mode, and connects a client that reaches the mock's module. Through
-//! that client, the resource the agent names a link by (ISO 22900-2 (2022) Annex B short
-//! names, ADR-319) resolves and a logical link is created on it.
+//! that client, the resource the agent names a link by (ISO 22900-2 (2022) Annex B.1 and
+//! B.2 short names, ADR-319) resolves and a logical link is created on it.
 
 use std::path::Path;
 use std::time::Duration;

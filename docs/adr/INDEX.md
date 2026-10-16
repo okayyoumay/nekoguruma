@@ -308,7 +308,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-316](ADR-316-the-vm-decodes-response-fields-through-the-declaration-part.md) | The VM Decodes Response Fields Through the Declaration Part | Accepted (the runner's stepping without declarations superseded by ADR-318) | `diag-ir` VM (`Op::DecodeField`, `Vm::step_with_declarations`, `IR_SCHEMA_VERSION` 11), `agent` policy and journal, design 8.2.4; ADR-233, ADR-297 |
 | [ADR-317](ADR-317-a-diag-request-response-is-its-bytes-at-run-time.md) | A `diag.request` Response Is Its Bytes at Run Time | Accepted | `diag-frontend` Starlark lowering, Starlark subset 3.2 and 3.4, design 8.4; ADR-313 item 5, ADR-309 item 4 |
 | [ADR-318](ADR-318-a-job-carries-its-variants-document.md) | A Job Carries Its Variant's Document | Accepted | `agent` job runner (`Job`, `check_job`, `ngr-agent run --document`), `diag_ir::check_decode_fields`, design 8.2.4; ADR-316, ADR-307 |
-| [ADR-319](ADR-319-the-agent-names-a-links-resource-by-iso-22900-2-short-names.md) | The Agent Names a Link's Resource by ISO 22900-2 Short Names | Accepted | `agent` link (`resource_data`), `iso22900-mock` short names, design 8.2.4; ADR-235 item 4, ADR-069 |
+| [ADR-319](ADR-319-the-agent-names-a-links-resource-by-iso-22900-2-short-names.md) | The Agent Names a Link's Resource by ISO 22900-2 (2022) Short Names | Accepted | `agent` link (`resource_data`), `iso22900-mock` short names, design 8.2.4; ADR-235 item 4, ADR-069 |
 
 ## Status Legend
 

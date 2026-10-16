@@ -617,11 +617,6 @@ fn a_request_needs_its_arguments_at_ingestion() {
             "def main():\n    diag.request(0x37, {})\n",
             ArgumentOutOfRange,
         ),
-        // The response cannot be read yet.
-        (
-            "def main():\n    r = diag.request(0x22, {\"did\": 0xF190})\n",
-            NotLowerable,
-        ),
         // A dict past the constant size bound is reported once.
         (
             "A = b\"x\" * 600000\n\ndef main():\n    \
@@ -636,6 +631,182 @@ fn a_request_needs_its_arguments_at_ingestion() {
     ];
     for (source, code) in cases {
         let codes: Vec<_> = request_errors(source).into_iter().map(|e| e.0).collect();
+        assert_eq!(codes, [code], "{source}");
+    }
+}
+
+// ---------------------------------------------------------------- `diag.request` responses (ADR-317)
+
+/// A host that answers every request with the next of its responses and records the messages
+/// logged.
+struct Answering {
+    responses: std::collections::VecDeque<Vec<u8>>,
+    logged: Vec<String>,
+}
+
+impl diag_ir::DiagHost for Answering {
+    type Error = NotSent;
+
+    fn service_request(&mut self, _: u16, _: &[u8]) -> Result<Vec<u8>, NotSent> {
+        self.responses.pop_front().ok_or(NotSent)
+    }
+    fn read_dtc(&mut self, _: u8) -> Result<Vec<u8>, NotSent> {
+        Err(NotSent)
+    }
+    fn routine_control(&mut self, _: u16, _: u8, _: &[u8]) -> Result<Vec<u8>, NotSent> {
+        Err(NotSent)
+    }
+    fn security_access(&mut self, _: u64, _: u8, _: &[u8]) -> Result<Option<Vec<u8>>, NotSent> {
+        Err(NotSent)
+    }
+    fn flash_transfer(&mut self, _: u32, _: &[u8]) -> Result<(), NotSent> {
+        Err(NotSent)
+    }
+    fn wait(&mut self, _: u64, _: u32) -> Result<bool, NotSent> {
+        Err(NotSent)
+    }
+    fn hmi_request(&mut self, _: u64, _: &[u8]) -> Result<Option<Vec<u8>>, NotSent> {
+        Err(NotSent)
+    }
+    fn record_input(&mut self, _: u64, _: &[u8]) -> Result<Option<Vec<u8>>, NotSent> {
+        Err(NotSent)
+    }
+    fn monitor_capture(&mut self, _: u32) -> Result<(), NotSent> {
+        Err(NotSent)
+    }
+    fn log(&mut self, _: u8, message: &str) {
+        self.logged.push(message.to_owned());
+    }
+}
+
+/// Runs the first variant's program for `main.star` against `responses`: the messages it
+/// logged, or the VM error it stopped with.
+fn answered(source: &str, responses: &[&[u8]]) -> Result<Vec<String>, String> {
+    let converted = convert(with(example(), "main.star", source));
+    let document = load_ecu_document(&converted.documents[0].bytes).expect("the document loads");
+    let bytes = document.procedure().expect("a program");
+    let program: diag_ir::Program = postcard::from_bytes(bytes.bytes()).expect("a program");
+    let mut vm = diag_ir::Vm::new(&program);
+    let mut host = Answering {
+        responses: responses.iter().map(|r| r.to_vec()).collect(),
+        logged: Vec::new(),
+    };
+    loop {
+        match vm.step(&program, &mut host) {
+            Ok(diag_ir::StepOutcome::Continue) => {}
+            Ok(diag_ir::StepOutcome::Finished) => return Ok(host.logged),
+            Ok(other) => panic!("{other:?}"),
+            Err(e) => return Err(format!("{e:?}")),
+        }
+    }
+}
+
+const READ_VIN: &str = "\
+def main():
+    res = diag.request(0x22, {\"did\": 0xF190})
+    if res[\"ok\"]:
+        diag.log(1, \"positive\")
+    else:
+        diag.log(1, \"negative\")
+    if res[\"nrc\"] == 0:
+        diag.log(1, \"no nrc\")
+    if res[\"nrc\"] == 0x31:
+        diag.log(1, \"out of range\")
+    if res[\"raw\"] == b\"\\x62\\xf1\\x90\":
+        diag.log(1, \"answer\")
+    if res[\"raw\"][0] == 0x7F:
+        diag.log(1, \"7F\")
+";
+
+#[test]
+fn a_positive_response_reads_as_ok_without_an_nrc() {
+    assert_eq!(
+        answered(READ_VIN, &[&[0x62, 0xF1, 0x90]]).unwrap(),
+        ["positive", "no nrc", "answer"]
+    );
+}
+
+#[test]
+fn a_negative_response_reads_as_not_ok_with_its_nrc() {
+    assert_eq!(
+        answered(READ_VIN, &[&[0x7F, 0x22, 0x31]]).unwrap(),
+        ["negative", "out of range", "7F"]
+    );
+    // Another NRC is read as itself.
+    assert_eq!(
+        answered(READ_VIN, &[&[0x7F, 0x22, 0x22]]).unwrap(),
+        ["negative", "7F"]
+    );
+}
+
+#[test]
+fn an_empty_response_is_ok_and_a_short_negative_one_has_no_nrc() {
+    // An empty answer has no `7F`, so it reads as positive.
+    let ok = "def main():\n    if diag.request(0x22, {\"did\": 0xF190})[\"ok\"]:\n        \
+              diag.log(1, \"positive\")\n";
+    assert_eq!(answered(ok, &[&[]]).unwrap(), ["positive"]);
+    // A negative response without its NRC byte stops the run when the NRC is read.
+    let error = answered(READ_VIN, &[&[0x7F, 0x22]]).unwrap_err();
+    assert!(error.contains("IndexOutOfRange"), "{error}");
+}
+
+#[test]
+fn a_response_is_read_where_it_is_passed_and_each_call_sends_once() {
+    let source = "\
+def nrc_of(res):
+    return res[\"nrc\"]
+
+def read():
+    return diag.request(0x22, {\"did\": 0xF190})
+
+def main():
+    first = read()
+    second = read()
+    if nrc_of(first) == 0x31 and second[\"ok\"]:
+        diag.log(1, \"both\")
+    diag.request(0x10, {\"sub\": 3})
+";
+    assert_eq!(
+        answered(
+            source,
+            &[&[0x7F, 0x22, 0x31], &[0x62, 0xF1, 0x90], &[0x50, 0x03]]
+        )
+        .unwrap(),
+        ["both"]
+    );
+    // The call used as a statement still sends: without a third answer the run fails.
+    assert!(answered(source, &[&[0x7F, 0x22, 0x31], &[0x62]]).is_err());
+}
+
+#[test]
+fn a_response_assigned_in_a_loop_is_read_after_it() {
+    let source = "\
+def main():
+    res = diag.request(0x22, {\"did\": 0xF190})
+    for i in range(3):
+        if not res[\"ok\"]:
+            res = diag.request(0x22, {\"did\": 0xF190})
+    if res[\"ok\"]:
+        diag.log(1, \"read\")
+";
+    let answers: [&[u8]; 2] = [&[0x7F, 0x22, 0x78], &[0x62, 0xF1, 0x90]];
+    assert_eq!(answered(source, &answers).unwrap(), ["read"]);
+}
+
+#[test]
+fn a_response_is_read_only_through_its_keys() {
+    use crate::star::StarCode::{NotLowerable, UnsupportedSyntax};
+    let read = |expr: &str| {
+        format!("def main():\n    res = diag.request(0x22, {{\"did\": 0xF190}})\n    x = {expr}\n")
+    };
+    let cases = [
+        (read("res[\"okay\"]"), UnsupportedSyntax),
+        (read("res[\"fields\"]"), NotLowerable),
+        (read("res + b\"x\""), NotLowerable),
+        (read("1 if res else 2"), NotLowerable),
+    ];
+    for (source, code) in cases {
+        let codes: Vec<_> = request_errors(&source).into_iter().map(|e| e.0).collect();
         assert_eq!(codes, [code], "{source}");
     }
 }

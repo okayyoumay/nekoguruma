@@ -1,7 +1,7 @@
 # ADR-313: Selecting a Request's Service from an Index of the Tables
 
 **Date:** 2026-10-16
-**Status:** Accepted
+**Status:** Accepted (Decision item 5 superseded by ADR-317)
 **Affects:** `diag-frontend` (`src/convert.rs`, `src/convert/services.rs`, `src/star.rs`,
 `src/star/lower.rs`), `crates/diag-frontend/docs/csv-tables.md` 5.3,
 `crates/diag-frontend/docs/starlark-subset.md` 3.1, 3.2 and 3.4; ADR-311 item 4

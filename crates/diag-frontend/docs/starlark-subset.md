@@ -289,7 +289,7 @@ instruction exists, the transpiler rejects calls to it (`STAR_API_NOT_AVAILABLE`
 
 | Function | Instruction | Run-time operands |
 |---|---|---|
-| `diag.request` | `ServiceRequest` | request payload (bytes): encoded at ingestion from `params` into a constant-pool entry and pushed before the instruction (ADR-313). Until the response has a run-time shape (3.4) the call is a statement and its response is dropped; a `params` value known only at run time under a field's key is not lowered yet (`STAR_NOT_LOWERABLE`) |
+| `diag.request` | `ServiceRequest` | request payload (bytes): encoded at ingestion from `params` into a constant-pool entry and pushed before the instruction (ADR-313). The call's value is the response (3.4), kept as its bytes (ADR-317); a call used as a statement drops it; a `params` value known only at run time under a field's key is not lowered yet (`STAR_NOT_LOWERABLE`) |
 | `diag.read_dtc` | `ReadDtc` | none |
 | `diag.routine` | `RoutineControl` | routine control payload (bytes) built from `params` |
 | `diag.security_access` | `ServiceRequest`, `SecurityAccess`, `ServiceRequest` | expands to three steps: the seed request (SecurityAccess service, odd sub-function `level`), `SecurityAccess`, which turns the seed (bytes) into the key through the host, and the send-key request (sub-function `level + 1`) carrying that key; a negative response to either request ends the call like a failed `diag.request` |
@@ -339,6 +339,15 @@ inside a nested layout, so only the scalar fields at the top of the response are
 (such as `did`) must itself be a constant (`STAR_NON_CONSTANT_ARGUMENT`). Request parameters are
 given as internal (coded) values; the declaration part's conversions apply only to decoded
 response values.
+
+**Lowering (ADR-317).** At run time a response is the bytes the host returned, and each key is
+lowered where it is read: `raw` is those bytes, `ok` is false only when the first byte is `7F`,
+and `nrc` is the third byte of a negative response and 0 otherwise. A negative response too
+short to hold its code stops the run when `nrc` is read. Until the declaration part carries the
+application layer's negative-response shape (ADR-309 item 4), that shape is UDS's. Another
+literal key is `STAR_UNSUPPORTED_SYNTAX`. A response used other than through its keys (its
+truth value, an operator, a built-in) is `STAR_NOT_LOWERABLE`, and so is `fields`, whose
+lowering is not built yet.
 
 ---
 

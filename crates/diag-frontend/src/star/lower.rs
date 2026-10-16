@@ -156,7 +156,8 @@ fn lower_here<'a>(
 
 // ---------------------------------------------------------------- Types and constants
 
-/// A run-time type (subset 2.5): `str` exists at run time as UTF-8 bytes.
+/// A run-time type (subset 2.5): `str` exists at run time as UTF-8 bytes, and the response of
+/// `diag.request` (3.4) as the response bytes, read only through its literal keys (ADR-317).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Ty {
     Int,
@@ -164,7 +165,17 @@ enum Ty {
     Bool,
     Bytes,
     Str,
+    Response,
 }
+
+const TYS: [Ty; 6] = [
+    Ty::Int,
+    Ty::Float,
+    Ty::Bool,
+    Ty::Bytes,
+    Ty::Str,
+    Ty::Response,
+];
 
 impl Ty {
     fn bit(self) -> u8 {
@@ -174,6 +185,7 @@ impl Ty {
             Ty::Bool => 4,
             Ty::Bytes => 8,
             Ty::Str => 16,
+            Ty::Response => 32,
         }
     }
 
@@ -184,6 +196,7 @@ impl Ty {
             Ty::Bool => "bool",
             Ty::Bytes => "bytes",
             Ty::Str => "str",
+            Ty::Response => "response",
         }
     }
 }
@@ -204,13 +217,11 @@ impl Tys {
 
     /// The one type, when there is exactly one.
     fn one(self) -> Option<Ty> {
-        [Ty::Int, Ty::Float, Ty::Bool, Ty::Bytes, Ty::Str]
-            .into_iter()
-            .find(|ty| self.0 == ty.bit())
+        TYS.into_iter().find(|ty| self.0 == ty.bit())
     }
 
     fn describe(self) -> String {
-        let names: Vec<_> = [Ty::Int, Ty::Float, Ty::Bool, Ty::Bytes, Ty::Str]
+        let names: Vec<_> = TYS
             .into_iter()
             .filter(|ty| self.0 & ty.bit() != 0)
             .map(Ty::name)
@@ -368,9 +379,6 @@ enum Val {
     Run(Tys, Code),
     /// Code that pushes nothing: a call to a function that returns no value.
     Void(Code),
-    /// Code that pushes nothing: a `diag.request` call, whose response has no run-time shape
-    /// yet (subset 3.4), so its value is not lowered.
-    Unread(Code),
 }
 
 // ---------------------------------------------------------------- Functions
@@ -772,7 +780,7 @@ impl<'a> Lowerer<'a> {
             }
             StmtP::Expression(expr) => match self.expr(Some(id), expr) {
                 Val::Const(_) => {}
-                Val::Void(more) | Val::Unread(more) => code.extend(more),
+                Val::Void(more) => code.extend(more),
                 Val::Run(_, more) => {
                     code.extend(more);
                     code.push((Ins::Op(Op::Pop), expr.span));
@@ -1496,7 +1504,12 @@ impl<'a> Lowerer<'a> {
                 let (object, index) = &**parts;
                 let a = self.expr(id, object);
                 let b = self.expr(id, index);
-                self.index(a, b, span)
+                match a {
+                    Val::Run(tys, code) if tys == Tys::of(Ty::Response) => {
+                        self.response_key(id, code, b, span)
+                    }
+                    a => self.index(a, b, span),
+                }
             }
             ExprP::Slice(object, start, stop, step) => {
                 let object = self.expr(id, object);
@@ -1585,14 +1598,6 @@ impl<'a> Lowerer<'a> {
                     StarCode::UnsupportedSyntax,
                     span,
                     "this call returns no value, and None is not supported (2.5)",
-                );
-                None
-            }
-            Val::Unread(_) => {
-                self.not_lowerable(
-                    span,
-                    "the response of `diag.request` is not lowered yet: the call is a statement \
-                     for now (3.4)",
                 );
                 None
             }
@@ -1709,6 +1714,13 @@ impl<'a> Lowerer<'a> {
                 self.not_lowerable(
                     span,
                     "the truth of bytes or a string known at run time is not lowered yet (2.5)",
+                );
+                return None;
+            }
+            Ty::Response => {
+                self.not_lowerable(
+                    span,
+                    "a response is always true; test `res[\"ok\"]` instead (3.4)",
                 );
                 return None;
             }
@@ -2266,6 +2278,94 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    /// `res["ok"]`, `res["nrc"]` or `res["raw"]` of a `diag.request` response (subset 3.4,
+    /// ADR-317): `code` pushes the response bytes. Until the declaration part carries the
+    /// application layer's negative-response shape (ADR-309 item 4), a response is negative when
+    /// its first byte is UDS's `7F`, and its NRC is then its third byte.
+    fn response_key(&mut self, id: Option<usize>, code: Code, key: Val, span: Span) -> Val {
+        let Val::Const(Const::Str(key)) = key else {
+            self.error(
+                StarCode::DynamicKeyNotAllowed,
+                span,
+                "a response is read with a string literal key (3.4, 4.1)",
+            );
+            return Val::Run(Tys::default(), Vec::new());
+        };
+        let mut code = code;
+        match &*key {
+            "raw" => Val::Run(Tys::of(Ty::Bytes), code),
+            "ok" => {
+                code.extend(self.response_ok(span));
+                Val::Run(Tys::of(Ty::Bool), code)
+            }
+            "nrc" => {
+                let Some(id) = id else {
+                    return Val::Run(Tys::default(), Vec::new());
+                };
+                let response = self.temp(id, span);
+                let (positive, end) = (self.label(), self.label());
+                code.extend([
+                    (Ins::Op(Op::StoreLocal(response)), span),
+                    (Ins::Op(Op::LoadLocal(response)), span),
+                ]);
+                code.extend(self.response_ok(span));
+                code.extend(
+                    [
+                        Ins::Op(Op::Not),
+                        Ins::JumpIfFalse(positive),
+                        // A negative response is `7F`, the SID and the NRC; a shorter one fails
+                        // the run as an index out of range.
+                        Ins::Op(Op::LoadLocal(response)),
+                        Ins::Op(Op::PushI64(2)),
+                        Ins::Op(Op::IndexGet),
+                        Ins::Op(Op::Swap),
+                        Ins::Op(Op::Pop),
+                        Ins::Jump(end),
+                        Ins::Mark(positive),
+                        Ins::Op(Op::PushI64(0)),
+                        Ins::Mark(end),
+                    ]
+                    .map(|ins| (ins, span)),
+                );
+                Val::Run(Tys::of(Ty::Int), code)
+            }
+            "fields" => {
+                self.not_lowerable(
+                    span,
+                    "reading `fields` of a response is not lowered yet (3.4)",
+                );
+                Val::Run(Tys::default(), Vec::new())
+            }
+            other => {
+                self.error(
+                    StarCode::UnsupportedSyntax,
+                    span,
+                    format!(
+                        "a response has the keys `ok`, `nrc`, `fields` and `raw`, not `{other}` \
+                         (3.4)"
+                    ),
+                );
+                Val::Run(Tys::default(), Vec::new())
+            }
+        }
+    }
+
+    /// Code that turns the response bytes on top of the stack into whether the response is
+    /// positive: its first byte, if any, is not `7F`.
+    fn response_ok(&mut self, span: Span) -> Code {
+        let negative = self.pool(&[0x7F]);
+        [
+            Op::PushI64(0),
+            Op::PushI64(1),
+            Op::Slice,
+            Op::PushBytes(negative),
+            Op::CmpEq,
+            Op::Not,
+        ]
+        .map(|op| (Ins::Op(op), span))
+        .to_vec()
+    }
+
     fn fold_index_checked(&mut self, object: Const, index: Const, span: Span) -> Val {
         match fold_index(&object, &index) {
             Ok(value) => Val::Const(value),
@@ -2747,8 +2847,8 @@ impl<'a> Lowerer<'a> {
 
     /// `diag.request(service_id, params)`: selects the variant's service the SID and the
     /// params' keys name, by the rule of `docs/csv-tables.md` 5.3 (ADR-313), and sends the
-    /// request [`encode_request`] writes from the remaining params. The call is a statement
-    /// until its response has a run-time shape: the response is dropped.
+    /// request [`encode_request`] writes from the remaining params. Its value is the response
+    /// (ADR-317), read through [`Self::response_key`].
     fn diag_request(&mut self, id: Option<usize>, args: &[&AstExpr], span: Span) -> Val {
         let [sid_arg, params_arg] = args else {
             self.error(
@@ -2756,7 +2856,7 @@ impl<'a> Lowerer<'a> {
                 span,
                 "`diag.request` takes a service identifier and params (3.1)",
             );
-            return Val::Unread(Vec::new());
+            return Val::Run(Tys::of(Ty::Response), Vec::new());
         };
         let sid = self
             .constant_int(id, sid_arg, "request", "service_id", 0..=0xFF)
@@ -2801,7 +2901,7 @@ impl<'a> Lowerer<'a> {
             }
         };
         let (Some(sid), Some(params)) = (sid, params) else {
-            return Val::Unread(Vec::new());
+            return Val::Run(Tys::of(Ty::Response), Vec::new());
         };
         // In range by the check above.
         let sid = sid as u8;
@@ -2821,7 +2921,7 @@ impl<'a> Lowerer<'a> {
                     }
                 ),
             );
-            return Val::Unread(Vec::new());
+            return Val::Run(Tys::of(Ty::Response), Vec::new());
         };
         let mut values = HashMap::new();
         for (key, value) in params.iter() {
@@ -2843,7 +2943,7 @@ impl<'a> Lowerer<'a> {
                             other.type_name()
                         ),
                     );
-                    return Val::Unread(Vec::new());
+                    return Val::Run(Tys::of(Ty::Response), Vec::new());
                 }
             };
             values.insert(&**key, value);
@@ -2851,16 +2951,18 @@ impl<'a> Lowerer<'a> {
         match encode_request(&request, &values) {
             Ok(operand) => {
                 let operand = self.pool(&operand);
-                Val::Unread(vec![
-                    (Ins::Op(Op::PushBytes(operand)), span),
-                    (
-                        Ins::Op(Op::ServiceRequest {
-                            service: u16::from(sid),
-                        }),
-                        span,
-                    ),
-                    (Ins::Op(Op::Pop), span),
-                ])
+                Val::Run(
+                    Tys::of(Ty::Response),
+                    vec![
+                        (Ins::Op(Op::PushBytes(operand)), span),
+                        (
+                            Ins::Op(Op::ServiceRequest {
+                                service: u16::from(sid),
+                            }),
+                            span,
+                        ),
+                    ],
+                )
             }
             Err(e) => {
                 self.error(
@@ -2868,7 +2970,7 @@ impl<'a> Lowerer<'a> {
                     params_arg.span,
                     format!("the request of `diag.request` cannot be encoded: {e} (3.1)"),
                 );
-                Val::Unread(Vec::new())
+                Val::Run(Tys::of(Ty::Response), Vec::new())
             }
         }
     }

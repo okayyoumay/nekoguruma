@@ -200,7 +200,7 @@ select the identifier format, which this version does not define, so a value abo
 rejected (`CSV_BAD_VALUE`); the agent's link accepts only 11-bit identifiers for the same reason
 (ADR-235 item 4).
 
-ADR-309 adds a column naming the application layer the protocol carries (UDS first), which selects the profile the variant's procedures are lowered through; this version has no such column and every protocol is UDS.
+ADR-309 adds a column naming the application layer the protocol carries (UDS first), which selects the profile the variant's procedures are lowered through and must be the same for every protocol of a variant; this version has no such column and every protocol is UDS.
 
 `comparams.csv`, one `ComParam` per row, appended to the named protocol's `params` in row order.
 

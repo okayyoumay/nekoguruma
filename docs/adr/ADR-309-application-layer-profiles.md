@@ -63,8 +63,12 @@ that the subset is widened by updating the frontend (design 8.4).
    9.2), apart from the agent-side items 4 and 6 name.
 
 3. **The variant names its application layer.** Each protocol a variant declares names the
-   application layer used over it, and the frontend lowers every call of that variant's procedures
-   through that layer's profile into the variant's declared services. A call whose intent the
+   application layer used over it, and every protocol of one variant must name the same application
+   layer, or the definition is rejected at ingestion. A variant's procedures are packaged as one
+   program per variant (ADR-307), and their lowered request bytes belong to one application layer,
+   so a variant whose protocols mixed layers would have no single program for both; an ECU reachable
+   over two application layers is declared as two variants. The frontend lowers every call of the
+   variant's procedures through that layer's profile into the variant's declared services. A call whose intent the
    profile does not define, or a result field the profile does not map, is an ingestion error; a
    procedure never reaches the agent with a call its ECU cannot serve.
 

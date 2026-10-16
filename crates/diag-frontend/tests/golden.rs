@@ -1,6 +1,6 @@
 //! IR golden tests (design 12.1): the example ECU definition with `golden/procedure.star`,
-//! converted to IR, the requests its programs send, and the values its declarations decode from
-//! `golden/responses.txt`, compared with the expected files in `golden/`.
+//! converted to IR, the requests its programs send answered from `golden/responses.txt`, and the
+//! values its declarations decode from that file, compared with the expected files in `golden/`.
 //!
 //! An intended change to any of them is recorded by running the test with
 //! `NGR_UPDATE_GOLDEN=1`, which rewrites the expected files; review their diff before committing
@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use diag_frontend::convert::{lower_procedures, to_ir};
 use diag_frontend::tables::{read_files, resolve};
-use diag_ir::declaration::load_ecu_document;
+use diag_ir::declaration::{EcuVariant, load_ecu_document};
 use diag_ir::decode::decode_positive_response;
 use diag_ir::{DiagHost, Program, StepOutcome, Vm};
 
@@ -70,10 +70,13 @@ fn check(name: &str, actual: &str) {
     }
 }
 
-/// A host that records each request and answers with the positive response SID and the
-/// request's first two bytes, enough for the program to go on.
-#[derive(Default)]
-struct Recording(String);
+/// A host that records each request and answers with the first response in `responses.txt`
+/// that starts with the positive response SID and the request's first two bytes, or with just
+/// those bytes, enough for the program to go on.
+struct Recording {
+    out: String,
+    answers: Vec<Vec<u8>>,
+}
 
 #[derive(Debug)]
 struct NotSent;
@@ -96,10 +99,15 @@ impl DiagHost for Recording {
 
     fn service_request(&mut self, service: u16, payload: &[u8]) -> Result<Vec<u8>, NotSent> {
         let sid = u8::try_from(service).expect("a one-byte SID");
-        writeln!(self.0, "request {sid:02X} {}", hex(payload)).expect("a String");
+        writeln!(self.out, "request {sid:02X} {}", hex(payload)).expect("a String");
         let mut response = vec![sid + 0x40];
         response.extend(payload.iter().take(2));
-        Ok(response)
+        Ok(self
+            .answers
+            .iter()
+            .find(|answer| answer.starts_with(&response))
+            .cloned()
+            .unwrap_or(response))
     }
     fn read_dtc(&mut self, _: u8) -> Result<Vec<u8>, NotSent> {
         Err(NotSent)
@@ -126,20 +134,24 @@ impl DiagHost for Recording {
         Err(NotSent)
     }
     fn log(&mut self, level: u8, message: &str) {
-        writeln!(self.0, "log {level} {message}").expect("a String");
+        writeln!(self.out, "log {level} {message}").expect("a String");
     }
 }
 
-/// The requests and logs `program` produces, then how it ends.
-fn run(program: &Program) -> String {
+/// The requests and logs `program` produces with the declarations of `variant`, answered from
+/// `answers`, then how it ends.
+fn run(program: &Program, variant: &EcuVariant<'_>, answers: Vec<Vec<u8>>) -> String {
     let mut vm = Vm::new(program);
-    let mut host = Recording::default();
+    let mut host = Recording {
+        out: String::new(),
+        answers,
+    };
     for _ in 0..100_000 {
-        match vm.step(program, &mut host) {
+        match vm.step_with_declarations(program, Some(variant), &mut host) {
             Ok(StepOutcome::Continue) => {}
             Ok(StepOutcome::Finished) => {
-                host.0.push_str("finished\n");
-                return host.0;
+                host.out.push_str("finished\n");
+                return host.out;
             }
             other => panic!("the golden procedure stopped: {other:?}"),
         }
@@ -188,11 +200,9 @@ fn the_example_ecu_converts_runs_and_decodes_as_recorded() {
             &format!("{unpacked:#?}\n{program:#?}\n"),
         );
 
-        produced.push(format!("{name}.run.txt"));
-        check(&format!("{name}.run.txt"), &run(&program));
-
         let variant = loaded.variant().expect("a variant");
         let services = variant.services().expect("services");
+        let mut answers = Vec::new();
         let mut decoded = String::new();
         for line in responses.lines() {
             let line = line.trim();
@@ -216,9 +226,16 @@ fn the_example_ecu_converts_runs_and_decodes_as_recorded() {
                 .unwrap_or_else(|| panic!("{name} has no positive response for {service}"));
             let result = decode_positive_response(&positive, variant.layouts(), &bytes);
             writeln!(decoded, "{service} [{}]\n{result:#?}", hex(&bytes)).expect("a String");
+            answers.push(bytes);
         }
         produced.push(format!("{name}.decoded.txt"));
         check(&format!("{name}.decoded.txt"), &decoded);
+
+        produced.push(format!("{name}.run.txt"));
+        check(
+            &format!("{name}.run.txt"),
+            &run(&program, &variant, answers),
+        );
     }
 
     // Every expected file belongs to an output, so a variant or procedure that stops being

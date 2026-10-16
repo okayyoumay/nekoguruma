@@ -5,7 +5,8 @@
 //! chain with the link settings the agent sets (`CP_RC78Handling`, `CP_RCByteOffset`,
 //! `CP_P2Star`, `CP_RC78CompletionTimeout`), and the agent host skips the 0x78s the worker
 //! passes on, so the procedure sees only the final response (ADR-235). A chain that outlasts
-//! the completion timeout ends the job with `NoResponse`.
+//! the completion timeout, or a gap after a 0x78 longer than P2*, ends the job with
+//! `NoResponse`.
 //!
 //! This file holds a single test, so the process-wide environment it sets for the spawned
 //! service cannot race with another test.
@@ -245,6 +246,33 @@ async fn jobs(control_dir: &Path) {
     // It ended at the completion timeout, long before the chain would have.
     assert!(
         start.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        start.elapsed()
+    );
+
+    // A gap longer than P2*: the final response comes 3 s after the only 0x78, while the link
+    // allows 1 s, so the worker stops waiting and the request ends without a response, before
+    // the ECU would have answered. The ECU reporting a longer P2* does not change what the
+    // link enforces.
+    let short_p2_star = LinkConfig {
+        p2_star_ms: 1_000,
+        ..LinkConfig::iso15765(0x7E0, 0x7E8)
+    };
+    arm_response_pending(control_dir, "003", 1, 3_000);
+    let start = Instant::now();
+    let timed_out = run(&client, &short_p2_star).await;
+    assert!(
+        matches!(
+            timed_out,
+            Err(JobError::Host {
+                pc: 1,
+                source: HostError::NoResponse
+            })
+        ),
+        "{timed_out:?}"
+    );
+    assert!(
+        start.elapsed() < Duration::from_millis(3_000),
         "{:?}",
         start.elapsed()
     );

@@ -54,6 +54,13 @@ General behaviour (clause 7.7):
 
 Any other SID gets NRC 11.
 
+The DiagnosticSessionControl response reports tP2_Server_Max and tP2*_Server_Max
+(`EcuConfig::p2_server_max_ms` and `p2_star_server_max_ms`; 50 ms and 5000 ms by default, the
+values ISO 14229-2 (2021) clause 9.2, Table 4, recommends), P2 in 1 ms units and P2* in 10 ms
+units, rounded down and capped at 0xFFFF. They are reported only: when the ECU responds is set by
+`response_delay_ms` and `Fault::ResponsePending`, so a test can also make it break the timing it
+reports.
+
 A non-default session times out after tS3_Server without a request (`EcuConfig::s3_server_ms`,
 5000 ms by default, the value ISO 14229-2 (2021) clause 9.5, Table 5, gives). Following Table 6
 of that clause (ADR-239), the timer restarts with every request

@@ -72,6 +72,7 @@ def main():
             },
             Annotation::MaxIterations {
                 line: 23,
+                for_line: 24,
                 limit: 10
             },
         ]

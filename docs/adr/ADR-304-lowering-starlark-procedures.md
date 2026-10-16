@@ -53,8 +53,8 @@ instructions, what happens to `None`, and how the source map is laid out.
 7. **Source map.** An entry is written for the first instruction and wherever the source
    position changes; it covers the instructions after it up to the next entry. Columns count
    characters from 1.
-8. **What is not lowered yet is rejected.** Loops, the `diag` functions not lowered yet (at
-   first all but `diag.fail`), and section and idempotency annotations each have their own work; until then the lowering
+8. **What is not lowered yet is rejected.** Loops (at first; ADR-305 lowers them), the `diag`
+   functions not lowered yet (at first all but `diag.fail`), and section and idempotency annotations each have their own work; until then the lowering
    rejects them (`STAR_NOT_LOWERABLE`, or `STAR_API_NOT_AVAILABLE` for a `diag` function without
    an instruction), so nothing is lowered silently wrong.
 

@@ -3,16 +3,16 @@
 //!
 //! The core of the lowering: top-level constants (folded at ingestion), top-level `def`s with
 //! positional parameters, calls between them, locals, the operators the IR's instructions
-//! cover, `and`, `or`, `not`, conditional expressions, `if`/`elif`/`else`, and `diag.fail`,
-//! `diag.wait`, `diag.log` and `diag.capture`. Every value that reaches run time has one type,
-//! inferred at ingestion (ADR-304); an operation the IR cannot express for its operands is
-//! `STAR_NOT_LOWERABLE`.
+//! cover, `and`, `or`, `not`, conditional expressions, `if`/`elif`/`else`, `for` loops
+//! (ADR-305), and `diag.fail`, `diag.wait`, `diag.log` and `diag.capture`. Every value that
+//! reaches run time has one type, inferred at ingestion (ADR-304); an operation the IR cannot
+//! express for its operands is `STAR_NOT_LOWERABLE`.
 //!
-//! Not lowered yet, each its own backlog item: `for` loops, the other `diag` functions (`hmi`
-//! and `record`; `request`, `routine`, `read_dtc` and `security_access`; `flash_transfer`),
-//! built-ins and string methods on values known only at run time, and section and idempotency
-//! annotations. Each is rejected with `STAR_NOT_LOWERABLE` (or `STAR_API_NOT_AVAILABLE` for a
-//! `diag` function without an instruction), so nothing is lowered silently wrong.
+//! Not lowered yet, each its own backlog item: the other `diag` functions (`hmi` and `record`;
+//! `request`, `routine`, `read_dtc` and `security_access`; `flash_transfer`), built-ins and
+//! string methods on values known only at run time, and section and idempotency annotations.
+//! Each is rejected with `STAR_NOT_LOWERABLE` (or `STAR_API_NOT_AVAILABLE` for a `diag`
+//! function without an instruction), so nothing is lowered silently wrong.
 
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -22,7 +22,7 @@ use starlark_syntax::codemap::Span;
 use starlark_syntax::lexer::TokenInt;
 use starlark_syntax::syntax::ast::{
     ArgumentP, AssignOp, AssignTargetP, AstArgument, AstExpr, AstLiteral, AstNoPayload, AstStmt,
-    BinOp, DefP, ExprP, ParameterP, StmtP,
+    BinOp, DefP, ExprP, ForP, ParameterP, StmtP,
 };
 
 use super::{
@@ -49,6 +49,21 @@ const TOO_MANY_CONSTANTS: &str =
 const TOO_MUCH_FOLDING: &str =
     "folding the procedure's constants reads more than 2^30 values and bytes in all (4.4)";
 
+/// The most loop iterations one pass over the function bodies may unroll, nested loops
+/// multiplying, so a long constant list cannot make the program, or the work of lowering it,
+/// grow without bound (subset 4.2).
+const MAX_UNROLLED: usize = 1 << 16;
+
+/// The limit of a `range` loop whose bound is known only at run time and that has no
+/// `@maxIterations` (subset 4.2).
+const DEFAULT_MAX_ITERATIONS: u32 = 1000;
+
+/// The `Fail` code of a loop that runs past its limit (subset 4.2, ADR-280).
+const LOOP_LIMIT_EXCEEDED: &str = "LOOP_LIMIT_EXCEEDED";
+
+const TOO_MUCH_UNROLLING: &str =
+    "the procedure's constant loops unroll to more than 65,536 iterations in all (4.2)";
+
 /// How deeply constant lists and dicts may nest ([`Const::depth`]). Each literal is shallow,
 /// but globals can nest one in the next, and folding recurses through every level.
 const MAX_CONSTANT_DEPTH: usize = 64;
@@ -67,11 +82,19 @@ const MAX_FAIL_CODE_LEN: usize = 64;
 /// The lowering walks the AST recursively, so it runs on the parser's thread
 /// ([`super::on_parser_stack`]): only that stack is large enough for every file within the
 /// nesting bounds (subset 2.8, ADR-303).
-pub fn lower(file: &str, checked: &Checked) -> Result<Program, Vec<StarError>> {
+pub fn lower(file: &str, checked: &Checked) -> Result<Lowered, Vec<StarError>> {
     super::on_parser_stack(|| lower_here(file, checked))
 }
 
-fn lower_here(file: &str, checked: &Checked) -> Result<Program, Vec<StarError>> {
+/// A lowered procedure and the warnings its lowering reported (such as
+/// `STAR_LOOP_LIMIT_DEFAULTED`, subset 4.2), which do not reject it.
+#[derive(Debug)]
+pub struct Lowered {
+    pub program: Program,
+    pub warnings: Vec<StarError>,
+}
+
+fn lower_here(file: &str, checked: &Checked) -> Result<Lowered, Vec<StarError>> {
     let mut lowerer = Lowerer::new(checked);
     lowerer.annotations();
     lowerer.constants();
@@ -103,7 +126,11 @@ fn lower_here(file: &str, checked: &Checked) -> Result<Program, Vec<StarError>> 
             }],
         ));
     }
-    Ok(program)
+    let warnings = std::mem::take(&mut lowerer.warnings);
+    Ok(Lowered {
+        program,
+        warnings: resolve(file, &checked.module, warnings),
+    })
 }
 
 // ---------------------------------------------------------------- Types and constants
@@ -375,6 +402,24 @@ struct Lowerer<'a> {
     exhausted: Option<(Span, &'static str)>,
     /// The work folding has done so far, against [`MAX_FOLD_WORK`]; never reset.
     work: usize,
+    /// Warnings, reported like errors but not rejecting the procedure.
+    warnings: Vec<Pending>,
+    /// `@maxIterations` limits by the line of their `for` (4.2).
+    loop_limits: HashMap<u32, u32>,
+    /// The loops being lowered, innermost last: where `break` and `continue` jump.
+    loops: Vec<LoopLabels>,
+    /// Loop variables bound to the constant item of an unrolled iteration, innermost last.
+    bound: Vec<(String, Const)>,
+    /// The iterations unrolled in the current pass over the function bodies, against
+    /// [`MAX_UNROLLED`].
+    unrolled: usize,
+}
+
+/// Where `break` and `continue` jump in the loop being lowered.
+#[derive(Clone, Copy)]
+struct LoopLabels {
+    end: Label,
+    next: Label,
 }
 
 impl<'a> Lowerer<'a> {
@@ -396,6 +441,20 @@ impl<'a> Lowerer<'a> {
             globals_built: 0,
             exhausted: None,
             work: 0,
+            warnings: Vec::new(),
+            loop_limits: checked
+                .annotations
+                .iter()
+                .filter_map(|annotation| match annotation {
+                    Annotation::MaxIterations {
+                        for_line, limit, ..
+                    } => Some((*for_line, *limit)),
+                    _ => None,
+                })
+                .collect(),
+            loops: Vec::new(),
+            bound: Vec::new(),
+            unrolled: 0,
         }
     }
 
@@ -534,6 +593,7 @@ impl<'a> Lowerer<'a> {
         for _ in 0..MAX_TYPE_PASSES {
             self.changed = false;
             self.built = self.globals_built;
+            self.unrolled = 0;
             for id in 0..self.funcs.len() {
                 if !reached[id] {
                     continue;
@@ -569,6 +629,7 @@ impl<'a> Lowerer<'a> {
             return;
         };
         self.built = self.globals_built;
+        self.unrolled = 0;
         let mut pending = vec![main];
         let mut emitted = vec![false; self.funcs.len()];
         emitted[main] = true;
@@ -727,9 +788,18 @@ impl<'a> Lowerer<'a> {
                     }
                 }
             }
-            StmtP::For(_) | StmtP::Break | StmtP::Continue => {
-                self.not_lowerable(stmt.span, "`for` loops are not lowered yet (4.2)")
-            }
+            StmtP::For(for_) => self.for_loop(id, stmt, for_, code),
+            StmtP::Break | StmtP::Continue => match self.loops.last() {
+                Some(labels) => {
+                    let target = if matches!(stmt.node, StmtP::Break) {
+                        labels.end
+                    } else {
+                        labels.next
+                    };
+                    code.push((Ins::Jump(target), stmt.span));
+                }
+                None => self.not_lowerable(stmt.span, "`break` and `continue` belong in a loop"),
+            },
             StmtP::Def(_) | StmtP::Load(_) => self.not_lowerable(
                 stmt.span,
                 "a nested `def` or `load` cannot be lowered (2.3)",
@@ -737,8 +807,332 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    // ------------------------------------------------------------ Loops
+
+    /// A `for` loop (subset 4.2): over a constant list or dict it is unrolled, over `range(...)`
+    /// it runs, limited by `@maxIterations` when a bound is known only at run time.
+    fn for_loop(&mut self, id: usize, stmt: &AstStmt, for_: &ForP<AstNoPayload>, code: &mut Code) {
+        let AssignTargetP::Identifier(var) = &for_.var.node else {
+            self.not_lowerable(
+                for_.var.span,
+                "a loop variable must be a name; unpacking is not lowered (2.3)",
+            );
+            return;
+        };
+        let var = var.node.ident.clone();
+        if let ExprP::Call(function, args) = &for_.over.node
+            && matches!(&function.node, ExprP::Identifier(f) if f.node.ident == "range")
+            && !self.funcs[id].slots.contains_key("range")
+            && !self.globals.contains_key("range")
+            && !self.by_name.contains_key("range")
+        {
+            let mut positional = Vec::new();
+            for arg in &args.args {
+                match &arg.node {
+                    ArgumentP::Positional(expr) => positional.push(expr),
+                    _ => {
+                        self.error(
+                            StarCode::UnsupportedSyntax,
+                            arg.span,
+                            "`range` takes positional arguments (2.3)",
+                        );
+                        return;
+                    }
+                }
+            }
+            self.range_loop(id, stmt, &var, &positional, &for_.body, code);
+            return;
+        }
+        let items = match self.expr(Some(id), &for_.over) {
+            Val::Const(Const::List(items, _)) => items.to_vec(),
+            Val::Const(Const::Dict(entries, _)) => entries
+                .iter()
+                .map(|(key, _)| Const::Str(key.clone()))
+                .collect(),
+            Val::Const(other) => {
+                self.not_lowerable(
+                    for_.over.span,
+                    format!(
+                        "a {} is not iterable; a loop runs over a constant list or dict, or over \
+                         `range(...)` (4.2)",
+                        other.type_name()
+                    ),
+                );
+                return;
+            }
+            _ => {
+                self.not_lowerable(
+                    for_.over.span,
+                    "a loop over a value known only at run time is not lowered: lists exist only \
+                     at ingestion, and bytes are not iterable, so loop over `range(...)` (4.2)",
+                );
+                return;
+            }
+        };
+        self.unroll(id, stmt, &var, items, &for_.body, code);
+    }
+
+    /// Unrolls a loop over constant items: each iteration binds the variable to its item, so
+    /// the body folds with it, and stores the item in the variable's slot when the item can
+    /// exist at run time, so the variable holds the last item after the loop, as in Starlark.
+    fn unroll(
+        &mut self,
+        id: usize,
+        stmt: &AstStmt,
+        var: &str,
+        items: Vec<Const>,
+        body: &AstStmt,
+        code: &mut Code,
+    ) {
+        let mut assigned = HashSet::new();
+        collect_locals(body, &mut assigned, &mut HashSet::new());
+        let end = self.label();
+        self.loops.push(LoopLabels { end, next: end });
+        for item in items {
+            self.unrolled += 1;
+            if self.unrolled > MAX_UNROLLED {
+                self.exhausted
+                    .get_or_insert((stmt.span, TOO_MUCH_UNROLLING));
+                self.not_lowerable(stmt.span, TOO_MUCH_UNROLLING);
+                break;
+            }
+            if item.ty().is_none() && assigned.contains(var) {
+                self.not_lowerable(
+                    stmt.span,
+                    format!(
+                        "the body assigns `{var}`, whose items are {}s, which exist only at \
+                         ingestion (2.5)",
+                        item.type_name()
+                    ),
+                );
+                break;
+            }
+            let next = self.label();
+            if let Some(labels) = self.loops.last_mut() {
+                labels.next = next;
+            }
+            if item.ty().is_some() {
+                self.store(id, var, Val::Const(item.clone()), stmt.span, code);
+            }
+            let depth = self.bound.len();
+            self.bound.push((var.to_owned(), item));
+            self.stmt(id, body, code);
+            self.bound.truncate(depth);
+            code.push((Ins::Mark(next), stmt.span));
+        }
+        self.loops.pop();
+        code.push((Ins::Mark(end), stmt.span));
+    }
+
+    /// A loop over `range(start, stop, step)`: the step must be a constant other than 0. When
+    /// a bound is known only at run time, or the loop has `@maxIterations`, a counter limits
+    /// it, and an iteration past the limit ends the procedure with `Fail`
+    /// `LOOP_LIMIT_EXCEEDED`.
+    fn range_loop(
+        &mut self,
+        id: usize,
+        stmt: &AstStmt,
+        var: &str,
+        args: &[&AstExpr],
+        body: &AstStmt,
+        code: &mut Code,
+    ) {
+        let span = stmt.span;
+        let values: Vec<Val> = args.iter().map(|arg| self.expr(Some(id), arg)).collect();
+        let (start, stop, step) = match <[Val; 3]>::try_from(match values.len() {
+            1 => {
+                let mut v = values;
+                v.insert(0, Val::Const(Const::Int(0)));
+                v.push(Val::Const(Const::Int(1)));
+                v
+            }
+            2 => {
+                let mut v = values;
+                v.push(Val::Const(Const::Int(1)));
+                v
+            }
+            _ => values,
+        }) {
+            Ok([start, stop, step]) => (start, stop, step),
+            Err(_) => {
+                self.error(
+                    StarCode::UnsupportedSyntax,
+                    span,
+                    "`range` takes one to three arguments (2.4)",
+                );
+                return;
+            }
+        };
+        let step = match step {
+            Val::Const(Const::Int(0)) => {
+                self.error(
+                    StarCode::ArgumentOutOfRange,
+                    span,
+                    "the step of `range` must not be 0 (2.4)",
+                );
+                return;
+            }
+            Val::Const(Const::Int(step)) => step,
+            Val::Const(other) => {
+                self.not_lowerable(
+                    span,
+                    format!("the step of `range` is an int, not a {}", other.type_name()),
+                );
+                return;
+            }
+            _ => {
+                self.not_lowerable(
+                    span,
+                    "a `range` step known only at run time is not lowered: the loop's \
+                     comparison depends on its sign (4.2)",
+                );
+                return;
+            }
+        };
+        let constant_bounds = matches!(
+            (&start, &stop),
+            (Val::Const(Const::Int(_)), Val::Const(Const::Int(_)))
+        );
+        let line = self.line_of(span);
+        let annotated = self.loop_limits.get(&line).copied();
+        let limit = match annotated {
+            Some(limit) => Some(limit),
+            None if constant_bounds => None,
+            None => {
+                self.warn(
+                    StarCode::LoopLimitDefaulted,
+                    span,
+                    format!(
+                        "a bound of this `range` is known only at run time; specify \
+                         @maxIterations (default {DEFAULT_MAX_ITERATIONS} applied) (4.2)"
+                    ),
+                );
+                Some(DEFAULT_MAX_ITERATIONS)
+            }
+        };
+        let (Some((ts, start_code)), Some((tt, stop_code))) = (
+            self.single(start, span, "`range`"),
+            self.single(stop, span, "`range`"),
+        ) else {
+            return;
+        };
+        if (ts, tt) != (Ty::Int, Ty::Int) {
+            self.not_lowerable(span, "the bounds of `range` are ints (2.4)");
+            return;
+        }
+        let Some(&slot) = self.funcs[id].slots.get(var) else {
+            self.not_lowerable(span, format!("`{var}` is not a local of this function"));
+            return;
+        };
+        // The variable now holds a run-time value, not an enclosing unrolled loop's constant.
+        self.bound.retain(|(bound, _)| bound != var);
+        self.widen_slot(id, slot, Tys::of(Ty::Int));
+        let (i, stop_slot) = (self.temp(id, span), self.temp(id, span));
+        let counter = limit.map(|_| self.temp(id, span));
+        let (head, next, end, over) = (self.label(), self.label(), self.label(), self.label());
+        let at = |ins: Ins| (ins, span);
+        code.extend(start_code);
+        code.push(at(Ins::Op(Op::StoreLocal(i))));
+        code.extend(stop_code);
+        code.push(at(Ins::Op(Op::StoreLocal(stop_slot))));
+        if let Some(c) = counter {
+            code.extend([Ins::Op(Op::PushI64(0)), Ins::Op(Op::StoreLocal(c))].map(at));
+        }
+        code.extend(
+            [
+                Ins::Mark(head),
+                Ins::Op(Op::LoadLocal(i)),
+                Ins::Op(Op::LoadLocal(stop_slot)),
+                Ins::Op(if step > 0 { Op::CmpLt } else { Op::CmpGt }),
+                Ins::JumpIfFalse(end),
+            ]
+            .map(at),
+        );
+        if let (Some(c), Some(limit)) = (counter, limit) {
+            code.extend(
+                [
+                    Ins::Op(Op::LoadLocal(c)),
+                    Ins::Op(Op::PushI64(i64::from(limit))),
+                    Ins::Op(Op::CmpLt),
+                    Ins::JumpIfFalse(over),
+                    Ins::Op(Op::LoadLocal(c)),
+                    Ins::Op(Op::PushI64(1)),
+                    Ins::Op(Op::Add),
+                    Ins::Op(Op::StoreLocal(c)),
+                ]
+                .map(at),
+            );
+        }
+        code.extend([Ins::Op(Op::LoadLocal(i)), Ins::Op(Op::StoreLocal(slot))].map(at));
+        self.loops.push(LoopLabels { end, next });
+        self.stmt(id, body, code);
+        self.loops.pop();
+        // A value one step on would leave the int range only when it is past every stop
+        // anyway, so the loop ends there instead of overflowing.
+        let (edge, past) = if step > 0 {
+            (i64::MAX - step, Op::CmpGt)
+        } else {
+            (i64::MIN - step, Op::CmpLt)
+        };
+        code.extend(
+            [
+                Ins::Mark(next),
+                Ins::Op(Op::LoadLocal(i)),
+                Ins::Op(Op::PushI64(edge)),
+                Ins::Op(past),
+                Ins::Op(Op::Not),
+                Ins::JumpIfFalse(end),
+                Ins::Op(Op::LoadLocal(i)),
+                Ins::Op(Op::PushI64(step)),
+                Ins::Op(Op::Add),
+                Ins::Op(Op::StoreLocal(i)),
+                Ins::Jump(head),
+            ]
+            .map(at),
+        );
+        if let Some(limit) = limit {
+            let code_index = self.pool(LOOP_LIMIT_EXCEEDED.as_bytes());
+            let detail = self.pool(
+                format!("the loop on line {line} ran past its limit of {limit} iterations")
+                    .as_bytes(),
+            );
+            code.extend(
+                [
+                    Ins::Mark(over),
+                    Ins::Op(Op::PushBytes(detail)),
+                    Ins::Op(Op::Fail { code: code_index }),
+                ]
+                .map(at),
+            );
+        }
+        code.push(at(Ins::Mark(end)));
+    }
+
+    /// The 1-based line `span` starts on.
+    fn line_of(&self, span: Span) -> u32 {
+        let codemap = self
+            .checked
+            .module
+            .file_span(self.checked.module.statement().span)
+            .file;
+        to_u32(codemap.find_line(span.begin()) + 1)
+    }
+
+    fn warn(&mut self, code: StarCode, span: Span, hint: impl Into<String>) {
+        if self.quiet == 0 {
+            self.warnings.push(Pending {
+                code,
+                span,
+                hint: hint.into(),
+            });
+        }
+    }
+
     /// Stores `value` in the local `name`.
     fn store(&mut self, id: usize, name: &str, value: Val, span: Span, code: &mut Code) {
+        // An assignment to a loop variable bound to a constant ends the binding; the slot
+        // holds the new value (an unrolled iteration stores its item in the slot as well).
+        self.bound.retain(|(bound, _)| bound != name);
         let Some(&slot) = self.funcs[id].slots.get(name) else {
             self.not_lowerable(span, format!("`{name}` is not a local of this function"));
             return;
@@ -945,6 +1339,11 @@ impl<'a> Lowerer<'a> {
     }
 
     fn name(&mut self, id: Option<usize>, name: &str, span: Span) -> Val {
+        if id.is_some()
+            && let Some((_, value)) = self.bound.iter().rev().find(|(bound, _)| bound == name)
+        {
+            return Val::Const(value.clone());
+        }
         if let Some(id) = id
             && self.funcs[id].slots.contains_key(name)
         {

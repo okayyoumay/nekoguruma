@@ -44,6 +44,10 @@ impl DiagHost for NoHost {
 }
 
 fn lowered(source: &str) -> Result<Program, Vec<StarError>> {
+    lowered_with_warnings(source).map(|lowered| lowered.program)
+}
+
+fn lowered_with_warnings(source: &str) -> Result<Lowered, Vec<StarError>> {
     let checked = check("t.star", source).unwrap_or_else(|errors| panic!("{errors:#?}"));
     lower("t.star", &checked)
 }
@@ -783,8 +787,8 @@ fn what_the_ir_cannot_express_is_not_lowerable() {
         "def main():\n    x = [1, 2]\n",
         // A built-in on a run-time value.
         "def f(x):\n    return abs(x)\n\ndef main():\n    f(1)\n",
-        // A loop.
-        "def main():\n    for i in range(3):\n        pass\n",
+        // A loop over bytes known only at run time.
+        "def f(b):\n    for x in b:\n        pass\n\ndef main():\n    f(b\"\")\n",
         // A primitive not lowered yet.
         "def main():\n    diag.record(\"t\")\n",
     ];
@@ -1053,4 +1057,204 @@ fn a_message_logged_many_times_is_pooled_once() {
     let mut host = ScriptedHost::default();
     run_on(&source, &mut host);
     assert_eq!(host.calls.len(), 50);
+}
+
+/// Runs `source` against a scripted host to its end: the calls it made, and the failure it
+/// ended with, if any.
+fn run_logged(source: &str) -> (Vec<String>, Option<(String, String)>) {
+    let program = lowered(source).unwrap_or_else(|errors| panic!("{errors:#?}"));
+    let mut host = ScriptedHost::default();
+    let mut vm = Vm::new(&program);
+    for _ in 0..1_000_000 {
+        match vm.step(&program, &mut host) {
+            Ok(StepOutcome::Continue) => {}
+            Ok(StepOutcome::Finished) => return (host.calls, None),
+            Ok(StepOutcome::Failed(failure)) => {
+                let detail = String::from_utf8_lossy(&failure.detail).into_owned();
+                return (host.calls, Some((failure.code, detail)));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    panic!("the procedure did not end")
+}
+
+#[test]
+fn a_loop_over_a_constant_list_or_dict_is_unrolled_with_its_items_folded() {
+    // `diag.log`'s level must be a constant, so each iteration's item must fold.
+    let source = "\
+LEVELS = [1, 2, 3]
+NAMES = {\"a\": 1, \"b\": 2}
+TABLE = [[1, \"one\"], [2, \"two\"]]
+
+def main():
+    for level in LEVELS:
+        diag.log(level, \"level\")
+    for name in NAMES:
+        diag.log(0, name)
+    for row in TABLE:
+        diag.log(row[0], row[1])
+    for level in []:
+        diag.log(9, \"never\")
+";
+    let (calls, failed) = run_logged(source);
+    assert_eq!(failed, None);
+    assert_eq!(
+        calls,
+        [
+            "log 1 level",
+            "log 2 level",
+            "log 3 level",
+            "log 0 a",
+            "log 0 b",
+            "log 1 one",
+            "log 2 two"
+        ]
+    );
+}
+
+#[test]
+fn break_and_continue_work_in_both_kinds_of_loop() {
+    let source = "\
+def count(n):
+    total = 0
+    # @maxIterations 100
+    for i in range(n):
+        if i == 2:
+            continue
+        if i == 5:
+            break
+        total += 1
+    return total
+
+def main():
+    for level in [1, 2, 3, 4]:
+        if level == 2:
+            continue
+        if level == 4:
+            break
+        diag.log(level, \"unrolled\")
+    if count(50) == 4:
+        diag.log(9, \"ranged\")
+";
+    let (calls, failed) = run_logged(source);
+    assert_eq!(failed, None);
+    assert_eq!(calls, ["log 1 unrolled", "log 3 unrolled", "log 9 ranged"]);
+}
+
+#[test]
+fn a_loop_past_its_limit_fails_with_loop_limit_exceeded() {
+    let program = |n: u32| {
+        format!(
+            "def spin(n):\n    # @maxIterations 5\n    for i in range(n):\n        diag.wait(1)\n\ndef main():\n    spin({n})\n"
+        )
+    };
+    let (calls, failed) = run_logged(&program(5));
+    assert_eq!((calls.len(), failed), (5, None));
+    let (calls, failed) = run_logged(&program(6));
+    assert_eq!(calls.len(), 5);
+    let (code, detail) = failed.expect("the sixth iteration fails");
+    assert_eq!(code, "LOOP_LIMIT_EXCEEDED");
+    assert!(
+        detail.contains("line 3") && detail.contains("5 iterations"),
+        "{detail}"
+    );
+}
+
+#[test]
+fn the_default_limit_is_a_warning_and_constant_ranges_have_none() {
+    let source =
+        "def spin(n):\n    for i in range(n):\n        pass\n\ndef main():\n    spin(2000)\n";
+    let lowered = lowered_with_warnings(source).unwrap();
+    let warnings: Vec<_> = lowered.warnings.iter().map(|w| (w.code, w.line)).collect();
+    assert_eq!(warnings, [(StarCode::LoopLimitDefaulted, 2)]);
+    let (_, failed) = run_logged(source);
+    assert_eq!(
+        failed.map(|(code, _)| code).as_deref(),
+        Some("LOOP_LIMIT_EXCEEDED")
+    );
+    // Constant bounds need no limit, and run past the default.
+    let constant = "def main():\n    n = 0\n    for i in range(2000):\n        n += 1\n    if n == 2000:\n        diag.log(1, \"done\")\n";
+    assert!(lowered_with_warnings(constant).unwrap().warnings.is_empty());
+    assert_eq!(run_logged(constant), (vec!["log 1 done".to_owned()], None));
+}
+
+#[test]
+fn ranges_follow_their_start_stop_and_step() {
+    let holds_sum = |range: &str, sum: i64| {
+        let source = format!(
+            "def main():\n    total = 0\n    last = -1\n    for i in {range}:\n        total += i\n        last = i\n    if total == {sum}:\n        diag.log(1, \"ok\")\n"
+        );
+        run_logged(&source).0 == ["log 1 ok"]
+    };
+    assert!(holds_sum("range(4)", 6));
+    assert!(holds_sum("range(2, 5)", 9));
+    assert!(holds_sum("range(10, 0, -3)", 22));
+    assert!(holds_sum("range(5, 2)", 0));
+    assert!(holds_sum("range(0, 10, 4)", 12));
+    // Near the end of the int range the loop stops instead of stepping past it.
+    let max = i64::MAX;
+    let source = format!(
+        "def main():\n    n = 0\n    for i in range({}, {max}, 4):\n        n += 1\n    if n == 2:\n        diag.log(1, \"ok\")\n",
+        max - 5
+    );
+    assert_eq!(run_logged(&source).0, ["log 1 ok"]);
+    // The variable keeps its last value after the loop, as in Starlark.
+    let after = "def main():\n    for i in range(3):\n        pass\n    if i == 2:\n        diag.log(1, \"ok\")\n";
+    assert_eq!(run_logged(after).0, ["log 1 ok"]);
+}
+
+#[test]
+fn loops_that_cannot_be_lowered_are_reported() {
+    use StarCode::*;
+    let cases = [
+        (
+            "def main():\n    for i in range(1, 2, 0):\n        pass\n",
+            ArgumentOutOfRange,
+            2,
+        ),
+        (
+            "def f(s):\n    for i in range(0, 9, s):\n        pass\n\ndef main():\n    f(1)\n",
+            NotLowerable,
+            2,
+        ),
+        (
+            "def main():\n    for i in range(1, 2, 3, 4):\n        pass\n",
+            UnsupportedSyntax,
+            2,
+        ),
+        (
+            "def main():\n    for i in range(1.5):\n        pass\n",
+            NotLowerable,
+            2,
+        ),
+        (
+            "def main():\n    for i in \"abc\":\n        pass\n",
+            NotLowerable,
+            2,
+        ),
+        // A list item cannot be assigned at run time.
+        (
+            "def main():\n    for row in [[1]]:\n        row = 2\n",
+            NotLowerable,
+            2,
+        ),
+    ];
+    for (source, code, line) in cases {
+        let found = codes(source);
+        assert!(found.contains(&(code, line)), "{source}: {found:?}");
+    }
+    // Nested constant loops multiply: 300 x 300 iterations pass the unrolling bound.
+    let items = (0..300)
+        .map(|n| n.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let source = format!(
+        "L = [{items}]\n\ndef main():\n    for a in L:\n        for b in L:\n            pass\n"
+    );
+    let found = codes(&source);
+    assert!(
+        !found.is_empty() && found.iter().all(|(c, _)| *c == NotLowerable),
+        "{found:?}"
+    );
 }

@@ -879,8 +879,9 @@ flowchart LR
     STAR["Starlark"] --> PARSE["Parse (starlark_syntax)"]
     PARSE --> CHECK{"Subset validation"}
     CHECK -->|Violation| ERR["Ingestion error<br/>Report offending line"]
-    CHECK -->|Conforms| LOWER["AST → bytecode"]
-    LOWER --> PROC["Procedure part"]
+    CHECK -->|Conforms| LOWER["AST → bytecode<br/>once per variant"]
+    DECL -->|"each variant's declarations"| LOWER
+    LOWER --> PROC["Procedure part<br/>per variant"]
     DECL --> IR[("IR (signed)")]
     PROC --> IR
 ```
@@ -916,7 +917,7 @@ flowchart LR
 
 The detailed subset, the API and the annotations for section attributes are in `crates/diag-frontend/docs/starlark-subset.md`.
 
-The CSV tables (one directory per ECU, one fixed file per table, rows that refer to each other by name, and the DID and routine services they generate) are specified in `crates/diag-frontend/docs/csv-tables.md` (ADR-295). The frontend checks them in stages: each file on its own, then the references and rules that span rows and tables; a later stage runs only when the earlier ones found no error, and each stage lists all of its errors (ADR-298). Each variant converts to its own `EcuDocument` (8.2.6). Leading constant fields of a request or response, such as a sub-function or an echoed DID, become the IR prefix; in the frontend the request's constants also select the declared service a Starlark `diag.request` call means, since the IR's `ServiceRequest` holds only the SID. Message shapes (the fields of each request, response, DID record, routine message and nested layout) are written one message per line in wire order, in a notation of the format's own whose model is ODX's (ADR-310); it replaces the CSV field tables and converts to the same IR.
+The CSV tables (one directory per ECU, one fixed file per table, rows that refer to each other by name, and the DID and routine services they generate) are specified in `crates/diag-frontend/docs/csv-tables.md` (ADR-295). The frontend checks them in stages: each file on its own, then the references and rules that span rows and tables; a later stage runs only when the earlier ones found no error, and each stage lists all of its errors (ADR-298). Each variant converts to its own `EcuDocument` (8.2.6). A procedure file is checked once and lowered once per variant, against that variant's declaration part, so the program in each variant's document is the one lowered for it; an error only some variants give names them, and a procedure is lowered only once the tables are accepted, since it needs their declarations (ADR-311). Leading constant fields of a request or response, such as a sub-function or an echoed DID, become the IR prefix; in the frontend the request's constants also select the declared service a Starlark `diag.request` call means, since the IR's `ServiceRequest` holds only the SID. Message shapes (the fields of each request, response, DID record, routine message and nested layout) are written one message per line in wire order, in a notation of the format's own whose model is ODX's (ADR-310); it replaces the CSV field tables and converts to the same IR.
 
 **Verification**: Provide a differential test that ingests the same definition via ODX and via the proprietary format and confirms the generated IR matches. This verifies swappability itself.
 

@@ -47,13 +47,15 @@ with `source_format` set to `csv-starlark` (ADR-254). Each `.star` file directly
 directory is one procedure (`starlark-subset.md` 2.1), and the documents are packaged by ADR-307:
 
 - With procedure files, there is one document per variant and procedure: the variant's whole
-  declaration part and, in `EcuDocument.procedure`, the procedure's lowered program as postcard
-  bytes. Every procedure goes with every variant. The documents come in `variants.csv` row order,
+  declaration part and, in `EcuDocument.procedure`, the procedure's program lowered for that
+  variant, as postcard bytes. Every procedure goes with every variant, and is lowered once per
+  variant against its declarations (ADR-311). The documents come in `variants.csv` row order,
   and within a variant in byte order of the procedure file names.
 - Without procedure files, there is one document per variant, with no procedure.
 
 A procedure file is any file whose name ends in `.star`, in any case. In `diag-frontend`,
-`convert::lower_procedures` checks and lowers the procedure files, listing every file's errors
+`convert::lower_procedures` checks the procedure files of a definition that `tables::resolve`
+accepted and lowers each for every variant, listing every file's errors
 together with the warnings of the files that lowered (a file that is not UTF-8 is
 `STAR_SYNTAX_ERROR`, `starlark-subset.md` 2.1), and
 `convert::to_ir` converts a definition that `tables::resolve` accepted (section 7) with those

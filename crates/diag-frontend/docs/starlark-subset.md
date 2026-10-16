@@ -578,6 +578,9 @@ Subset validation runs on a file that parses and lists every violation it finds,
 position. Lines and columns count from 1; the column counts characters. The snippet is the
 source line; of a line longer than 160 characters it is the 160 characters around the column, so
 that many violations on one long line stay small.
+A file that passes is lowered once for each variant of its definition directory (ADR-311). Each
+distinct error or warning of those lowerings is listed once; one that only some variants give
+names them at the end of its hint (`(in variant V1)`, `(in variants V1, V2)`).
 
 ```json
 {

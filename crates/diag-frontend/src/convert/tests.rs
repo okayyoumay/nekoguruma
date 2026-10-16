@@ -32,11 +32,15 @@ fn with(mut files: Vec<(String, Vec<u8>)>, file: &str, contents: &str) -> Vec<(S
 
 fn convert(files: Vec<(String, Vec<u8>)>) -> Converted {
     let tables = read_files(files).unwrap_or_else(|e| panic!("does not read: {e:?}"));
-    let procedures = lower_procedures(&tables).unwrap_or_else(|e| panic!("does not lower: {e:?}"));
-    to_ir(
-        &resolve(tables).unwrap_or_else(|e| panic!("does not resolve: {e:?}")),
-        &procedures,
-    )
+    let definition = resolve(tables).unwrap_or_else(|e| panic!("does not resolve: {e:?}"));
+    let procedures =
+        lower_procedures(&definition).unwrap_or_else(|e| panic!("does not lower: {e:?}"));
+    to_ir(&definition, &procedures)
+}
+
+/// The procedures of `files`, or why they were rejected.
+fn procedures(files: Vec<(String, Vec<u8>)>) -> Result<Vec<Procedure>, ProceduresRejected> {
+    lower_procedures(&resolve(read_files(files).expect("reads")).expect("resolves"))
 }
 
 /// The documents, read back through the loader the agent uses.
@@ -313,9 +317,9 @@ fn the_source_digest_covers_the_table_files_as_stored() {
     assert_ne!(tables_and_procedure, plain);
     // Reading the directory covers the same bytes.
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/example-ecu");
-    let tables = read_directory(&dir).expect("reads");
-    let procedures = lower_procedures(&tables).expect("lowers");
-    let from_dir = to_ir(&resolve(tables).expect("resolves"), &procedures);
+    let definition = resolve(read_directory(&dir).expect("reads")).expect("resolves");
+    let procedures = lower_procedures(&definition).expect("lowers");
+    let from_dir = to_ir(&definition, &procedures);
     assert_eq!(from_dir, convert(example()));
     // Line ends are part of the bytes. The checkout may already use CRLF (Git on Windows), so
     // the line ends of one table are switched to the other kind.
@@ -366,16 +370,18 @@ fn every_procedure_goes_with_every_variant() {
         .filter(|(n, _)| n.ends_with(".csv"))
         .map(|(n, c)| (n.as_str(), c.as_slice()))
         .collect();
-    for (document, converted) in documents(&converted).iter().zip(&converted.documents) {
+    for converted in &converted.documents {
+        let document = load_ecu_document(&converted.bytes).expect("the document loads");
         let file = converted.procedure.as_deref().expect("a procedure");
         let source = if file == "a.star" { LOG } else { FAIL };
         // Each document's digest covers the tables and its own procedure file only.
         let expected = source_digest(tables.iter().copied().chain([(file, source.as_bytes())]));
-        assert_eq!(document.source_digest.as_deref(), Some(expected.as_str()));
-        // The procedure is the lowered program, as postcard bytes.
-        let bytes = document.procedure.as_deref().expect("a program");
-        let program: diag_ir::Program = postcard::from_bytes(bytes).expect("a program");
-        let lowered = crate::star::lower(file, &crate::star::check(file, source).expect("checks"))
+        assert_eq!(document.source_digest(), Some(expected.as_str()));
+        // The procedure is the program lowered for the document's variant, as postcard bytes.
+        let bytes = document.procedure().expect("a program");
+        let program: diag_ir::Program = postcard::from_bytes(bytes.bytes()).expect("a program");
+        let checked = crate::star::check(file, source).expect("checks");
+        let lowered = crate::star::lower(file, &checked, document.variant().expect("a variant"))
             .expect("lowers")
             .program;
         assert_eq!(
@@ -398,8 +404,7 @@ fn every_procedure_file_reports_its_errors() {
         "latin1.star".to_owned(),
         b"def main():\n    pass # \xe9\n".to_vec(),
     ));
-    let tables = read_files(files).expect("reads");
-    let errors = lower_procedures(&tables).expect_err("two files fail");
+    let errors = procedures(files).expect_err("two files fail");
     let found: Vec<(&str, crate::star::StarCode, u32)> = errors
         .errors
         .iter()
@@ -423,8 +428,7 @@ fn a_rejected_procedure_keeps_the_warnings_of_the_others() {
         "b.star",
         "def f():\n    pass\n",
     );
-    let tables = read_files(files).expect("reads");
-    let rejected = lower_procedures(&tables).expect_err("b.star fails");
+    let rejected = procedures(files).expect_err("b.star fails");
     assert_eq!(rejected.errors.len(), 1);
     let warnings: Vec<(&str, crate::star::StarCode)> = rejected
         .warnings
@@ -443,8 +447,7 @@ fn a_file_too_large_is_reported_before_its_encoding() {
     let mut big = vec![b'#'; crate::star::MAX_SOURCE_BYTES + 1];
     big[0] = 0xFF;
     files.push(("big.star".to_owned(), big));
-    let tables = read_files(files).expect("reads");
-    let rejected = lower_procedures(&tables).expect_err("too large");
+    let rejected = procedures(files).expect_err("too large");
     let codes: Vec<_> = rejected.errors.iter().map(|e| e.code).collect();
     assert_eq!(codes, [crate::star::StarCode::SourceTooLarge]);
 }
@@ -460,9 +463,9 @@ fn reading_the_directory_reads_its_procedure_files() {
     for (name, contents) in &files {
         std::fs::write(dir.join(name), contents).expect("written");
     }
-    let tables = read_directory(&dir).expect("reads");
-    let procedures = lower_procedures(&tables).expect("lowers");
-    let from_dir = to_ir(&resolve(tables).expect("resolves"), &procedures);
+    let definition = resolve(read_directory(&dir).expect("reads")).expect("resolves");
+    let procedures = lower_procedures(&definition).expect("lowers");
+    let from_dir = to_ir(&definition, &procedures);
     std::fs::remove_dir_all(&dir).expect("removed");
     assert_eq!(from_dir, convert(files));
     assert!(
@@ -470,5 +473,58 @@ fn reading_the_directory_reads_its_procedure_files() {
             .documents
             .iter()
             .all(|d| d.procedure.as_deref() == Some("main.star"))
+    );
+}
+
+#[test]
+fn each_procedure_is_lowered_for_each_variant() {
+    let procedures = procedures(with(example(), "a.star", LOG)).expect("lowers");
+    let [procedure] = &procedures[..] else {
+        panic!("one procedure");
+    };
+    // The example has two variants, each with its own program (ADR-311).
+    assert_eq!(procedure.programs.len(), 2);
+}
+
+#[test]
+fn an_error_every_variant_gives_is_reported_once() {
+    let section = "# @section uninterruptible\ndef main():\n    pass\n";
+    let rejected = procedures(with(example(), "a.star", section)).expect_err("not lowerable");
+    let found: Vec<(crate::star::StarCode, u32)> =
+        rejected.errors.iter().map(|e| (e.code, e.line)).collect();
+    assert_eq!(found, [(crate::star::StarCode::NotLowerable, 1)]);
+    assert!(!rejected.errors[0].hint.contains("(in variant"));
+    assert!(!rejected.errors[0].hint.contains("(in variants"));
+}
+
+#[test]
+fn an_error_only_some_variants_give_names_them() {
+    let error = |line, hint: &str| StarError {
+        code: crate::star::StarCode::NotLowerable,
+        file: "a.star".to_owned(),
+        line,
+        column: 1,
+        snippet: String::new(),
+        hint: hint.to_owned(),
+    };
+    let merged = merge(
+        vec![
+            ("v1", vec![error(2, "both"), error(3, "v1 only")]),
+            (
+                "v2",
+                vec![error(1, "v2 and v3"), error(2, "both"), error(2, "both")],
+            ),
+            ("v3", vec![error(1, "v2 and v3"), error(2, "both")]),
+        ],
+        3,
+    );
+    let hints: Vec<(u32, &str)> = merged.iter().map(|e| (e.line, e.hint.as_str())).collect();
+    assert_eq!(
+        hints,
+        [
+            (1, "v2 and v3 (in variants v2, v3)"),
+            (2, "both"),
+            (3, "v1 only (in variant v1)"),
+        ]
     );
 }

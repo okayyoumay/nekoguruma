@@ -17,6 +17,7 @@
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
+use diag_ir::declaration::EcuVariant;
 use diag_ir::{IR_SCHEMA_VERSION, Op, Program, SourceSpan};
 use starlark_syntax::codemap::Span;
 use starlark_syntax::lexer::TokenInt;
@@ -83,14 +84,20 @@ const MAX_TYPE_PASSES: usize = 256;
 /// The longest `diag.fail` code (subset 3.1).
 const MAX_FAIL_CODE_LEN: usize = 64;
 
-/// Lowers `checked`, the procedure in `file`, to a program. Every reason the procedure cannot
-/// be lowered is reported, in source order.
+/// Lowers `checked`, the procedure in `file`, to a program for `variant`, against whose
+/// declarations it is lowered: every procedure goes with every variant, and is lowered once per
+/// variant (ADR-307, ADR-311). Every reason the procedure cannot be lowered is reported, in
+/// source order.
 ///
 /// The lowering walks the AST recursively, so it runs on the parser's thread
 /// ([`super::on_parser_stack`]): only that stack is large enough for every file within the
 /// nesting bounds (subset 2.8, ADR-303).
-pub fn lower(file: &str, checked: &Checked) -> Result<Lowered, Vec<StarError>> {
-    super::on_parser_stack(|| lower_here(file, checked))
+pub fn lower(
+    file: &str,
+    checked: &Checked,
+    variant: EcuVariant<'_>,
+) -> Result<Lowered, Vec<StarError>> {
+    super::on_parser_stack(|| lower_here(file, checked, variant))
 }
 
 /// A lowered procedure and the warnings its lowering reported (such as
@@ -101,7 +108,15 @@ pub struct Lowered {
     pub warnings: Vec<StarError>,
 }
 
-fn lower_here(file: &str, checked: &Checked) -> Result<Lowered, Vec<StarError>> {
+#[expect(
+    unused_variables,
+    reason = "nothing lowered yet depends on the variant; `diag.request` will select its services"
+)]
+fn lower_here(
+    file: &str,
+    checked: &Checked,
+    variant: EcuVariant<'_>,
+) -> Result<Lowered, Vec<StarError>> {
     let mut lowerer = Lowerer::new(checked);
     lowerer.annotations();
     lowerer.constants();

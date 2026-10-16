@@ -1,3 +1,4 @@
+use diag_ir::declaration::{EcuDocumentT, EcuVariantT, encode_ecu_document, load_ecu_document};
 use diag_ir::{DiagHost, StepOutcome, Vm, WaitingOn};
 
 use super::*;
@@ -49,7 +50,22 @@ fn lowered(source: &str) -> Result<Program, Vec<StarError>> {
 
 fn lowered_with_warnings(source: &str) -> Result<Lowered, Vec<StarError>> {
     let checked = check("t.star", source).unwrap_or_else(|errors| panic!("{errors:#?}"));
-    lower("t.star", &checked)
+    lower_for_a_variant(&checked)
+}
+
+/// Lowers `checked` for a variant that declares nothing.
+fn lower_for_a_variant(checked: &Checked) -> Result<Lowered, Vec<StarError>> {
+    let mut document = EcuDocumentT::default();
+    document.schema_version = IR_SCHEMA_VERSION;
+    document.source_format = Some("test".to_owned());
+    document.source_digest = Some(String::new());
+    document.variant = Some(Box::new(EcuVariantT::default()));
+    let bytes = encode_ecu_document(&document);
+    let variant = load_ecu_document(&bytes)
+        .expect("the document loads")
+        .variant()
+        .expect("a variant");
+    lower("t.star", checked, variant)
 }
 
 /// Runs `source` to its end: `Ok(None)` when it finishes, `Ok(Some((code, detail)))` when it
@@ -527,7 +543,7 @@ fn many_parameters_and_locals_are_numbered_in_linear_time() {
     source.push_str("    p0 = 1\n\ndef main():\n    pass\n");
     let checked = check("t.star", &source).unwrap_or_else(|errors| panic!("{errors:#?}"));
     let started = std::time::Instant::now();
-    assert!(lower("t.star", &checked).is_ok());
+    assert!(lower_for_a_variant(&checked).is_ok());
     assert!(started.elapsed() < std::time::Duration::from_secs(30));
 }
 

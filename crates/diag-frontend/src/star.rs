@@ -133,7 +133,7 @@ impl std::fmt::Display for StarCode {
 }
 
 /// One violation, in the form of section 5.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct StarError {
     pub code: StarCode,
     /// The file's name.

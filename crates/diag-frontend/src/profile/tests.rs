@@ -698,4 +698,25 @@ fn routine_control_serves_only_uds_routine_control() {
         profile("KWP2000", 0x31).validate(),
         Err(ProfileError::StepKind(Intent::Routine))
     );
+    // On UDS a routine keeps `RoutineControl`.
+    let send_receive = Call {
+        intent: Intent::Routine,
+        steps: leak(vec![step(
+            StepKind::SendReceive,
+            0x31,
+            ROUTINE_REQUEST.parts.to_vec(),
+            true,
+            ResultMap::Declared,
+        )]),
+    };
+    let uds = Profile {
+        calls: leak(vec![send_receive]),
+        ..UDS_LIKE
+    };
+    assert_eq!(uds.validate(), Err(ProfileError::StepKind(Intent::Routine)));
+    let other = Profile {
+        layer: "KWP2000",
+        ..uds
+    };
+    assert_eq!(other.validate(), Ok(()));
 }

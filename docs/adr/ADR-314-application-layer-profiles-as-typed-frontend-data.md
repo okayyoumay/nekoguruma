@@ -52,15 +52,16 @@ shared names.
    by its own call, with only a routine's identifier and sub-function selecting a service; `params`
    once and last for `diag.routine`; `RoutineControl` only for `diag.routine` of the UDS profile,
    with SID 0x31 and the sub-function and the 16-bit routine identifier first (the instruction
-   sends UDS's request itself, ADR-309 item 4); for `diag.security_access`, one key step that sends
-   nothing and directly follows the step whose undeclared response gives the seed, the level on
-   that seed request, and the level plus one and the key only after the key step; and the results
-   of item 4: one DTC map with two different positions for `diag.read_dtc`, declared names on the
-   last, declared step of `diag.routine` only. A test also checks that no two shipped profiles name
-   the same layer. Profiles ship with the frontend, so a profile that fails is a programming error
-   caught by a test over every shipped profile, not an ingestion error; ingestion errors concern
-   only a variant (an intent its profile lacks, no single declared service, a declared response
-   that does not fit the map).
+   sends UDS's request itself, ADR-309 item 4), and on UDS `diag.routine` as that one step, which
+   recovery relies on; for `diag.security_access`, one key step that sends nothing and directly
+   follows the step whose undeclared response gives the seed, the level on that seed request, and
+   the level plus one and the key only after the key step; and the results of item 4: one DTC map
+   with two different positions for `diag.read_dtc`, declared names on the last, declared step of
+   `diag.routine` only. A test also checks that no two shipped profiles name the same layer.
+   Profiles ship with the frontend, so a profile that fails is a programming error caught by a test
+   over every shipped profile, not an ingestion error; ingestion errors concern only a variant (an
+   intent its profile lacks, no single declared service, a declared response that does not fit the
+   map).
 
 ## Consequences
 

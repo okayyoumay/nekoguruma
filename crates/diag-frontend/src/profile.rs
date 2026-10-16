@@ -401,6 +401,20 @@ impl Call {
         if params != needs_params {
             return Err(ProfileError::ParamsCount(intent, params));
         }
+        // On UDS a routine is the one `RoutineControl` step, which recovery relies on (ADR-309
+        // items 4 and 6).
+        if layer == UDS
+            && intent == Intent::Routine
+            && !matches!(
+                self.steps,
+                [Step {
+                    kind: StepKind::RoutineControl,
+                    ..
+                }]
+            )
+        {
+            return Err(ProfileError::StepKind(intent));
+        }
         let result_fits = match intent {
             Intent::ReadDtc => dtc_maps == 1,
             Intent::Routine => last.result == ResultMap::Declared,

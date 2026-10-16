@@ -386,6 +386,45 @@ fn call_depth_is_limited() {
 }
 
 #[test]
+fn remainder_truncates_like_division() {
+    // The integer remainder takes the dividend's sign.
+    assert_eq!(eval(vec![i(7), i(3), Op::Rem]), [Value::I64(1)]);
+    assert_eq!(eval(vec![i(-7), i(2), Op::Rem]), [Value::I64(-1)]);
+    assert_eq!(eval(vec![i(7), i(-2), Op::Rem]), [Value::I64(1)]);
+    // The one quotient out of range has a remainder in range.
+    assert_eq!(eval(vec![i(i64::MIN), i(-1), Op::Rem]), [Value::I64(0)]);
+    assert_eq!(
+        eval(vec![i(i64::MIN), i(i64::MAX), Op::Rem]),
+        [Value::I64(-1)]
+    );
+    assert_eq!(
+        eval(vec![Op::PushF64(-5.5), Op::PushF64(2.0), Op::Rem]),
+        [Value::F64(-1.5)]
+    );
+    let [Value::F64(nan)] = eval(vec![Op::PushF64(1.0), Op::PushF64(0.0), Op::Rem])[..] else {
+        panic!("not a float");
+    };
+    assert!(nan.is_nan());
+    // Each error leaves the state as it was (checked by `expect_vm_error`).
+    assert_eq!(
+        expect_vm_error(vec![i(1), i(0), Op::Rem], vec![], 2),
+        VmError::DivisionByZero
+    );
+    assert_eq!(
+        expect_vm_error(vec![i(1), Op::PushF64(1.0), Op::Rem], vec![], 2),
+        VmError::TypeMismatch
+    );
+    assert_eq!(
+        expect_vm_error(vec![Op::PushBytes(0), i(1), Op::Rem], vec![vec![1]], 2),
+        VmError::TypeMismatch
+    );
+    assert_eq!(
+        expect_vm_error(vec![i(1), Op::Rem], vec![], 1),
+        VmError::StackUnderflow
+    );
+}
+
+#[test]
 fn length_pushes_the_length_above_the_bytes() {
     let program = prog(
         vec![Op::PushBytes(0), Op::Length, Op::PushBytes(1), Op::Length],
@@ -949,6 +988,7 @@ fn primitive_classification_covers_every_instruction() {
         },
         Op::Fail { code: 0 },
         Op::Length,
+        Op::Rem,
     ];
     for (index, op) in all.iter().enumerate() {
         // The postcard encoding starts with the variant index, so this also pins the variant

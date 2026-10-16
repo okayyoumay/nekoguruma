@@ -2796,6 +2796,16 @@ mod tests {
             VmError::ByteOutOfRange(0),
             VmError::BytesTooLong(0),
             VmError::FloatNotConvertible,
+            VmError::NoDeclarations,
+            VmError::UnknownField {
+                service: 0,
+                field: 0,
+            },
+            VmError::ShapedField {
+                service: 0,
+                field: 0,
+            },
+            VmError::Undecodable { service: 0 },
         ];
         // The match fails to compile when a variant is added, so the list above stays complete.
         for error in &errors {
@@ -2819,7 +2829,11 @@ mod tests {
                 | VmError::IndexOutOfRange(_)
                 | VmError::ByteOutOfRange(_)
                 | VmError::BytesTooLong(_)
-                | VmError::FloatNotConvertible => {}
+                | VmError::FloatNotConvertible
+                | VmError::NoDeclarations
+                | VmError::UnknownField { .. }
+                | VmError::ShapedField { .. }
+                | VmError::Undecodable { .. } => {}
             }
         }
         let encoded = |reason: RunStop| {

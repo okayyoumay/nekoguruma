@@ -1,5 +1,5 @@
 EcuDocumentT {
-    schema_version: 10,
+    schema_version: 11,
     source_format: Some(
         "csv-starlark",
     ),
@@ -2018,7 +2018,7 @@ EcuDocumentT {
     procedure: None,
 }
 Program {
-    schema_version: 10,
+    schema_version: 11,
     code: [
         Call(
             2,

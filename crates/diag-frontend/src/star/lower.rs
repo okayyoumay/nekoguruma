@@ -873,6 +873,19 @@ impl<'a> Lowerer<'a> {
             && !self.globals.contains_key("range")
             && !self.by_name.contains_key("range")
         {
+            // Each argument is looked at in every unrolled copy, and more than three are
+            // refused before any is.
+            if self.unrolling > 0 && !self.unroll_step(for_.over.span, args.args.len()) {
+                return;
+            }
+            if !(1..=3).contains(&args.args.len()) {
+                self.error(
+                    StarCode::UnsupportedSyntax,
+                    for_.over.span,
+                    "`range` takes one to three arguments (2.4)",
+                );
+                return;
+            }
             let mut positional = Vec::new();
             for arg in &args.args {
                 match &arg.node {
@@ -2285,6 +2298,10 @@ impl<'a> Lowerer<'a> {
         args: &[AstArgument],
         span: Span,
     ) -> Val {
+        // Each argument is looked at in every unrolled copy, even when one is refused.
+        if self.unrolling > 0 && !self.unroll_step(span, args.len()) {
+            return Val::Run(Tys::default(), Vec::new());
+        }
         let mut positional = Vec::new();
         for arg in args {
             match &arg.node {

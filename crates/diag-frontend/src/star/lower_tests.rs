@@ -1392,6 +1392,31 @@ fn a_huge_integer_literal_is_rejected_without_formatting_it() {
 }
 
 #[test]
+fn unrolling_counts_the_arguments_of_a_call() {
+    // 2,000 copies of a call with 3,001 arguments, the last of them named and refused: each
+    // copy looks at every argument, so the arguments count against the unrolling bound even
+    // though none is lowered.
+    let items = vec!["0"; 2000].join(", ");
+    let args = vec!["0"; 3000].join(", ");
+    let calls = [
+        format!("    for n in L:\n        for b in range({args}, stop=1):\n            pass\n"),
+        format!("    for n in L:\n        diag.wait(min({args}, x=1))\n"),
+    ];
+    for body in calls {
+        let source = format!("L = [{items}]\n\ndef main():\n{body}");
+        let checked = check("t.star", &source).unwrap_or_else(|errors| panic!("{errors:#?}"));
+        let mut lowerer = Lowerer::new(&checked);
+        lowerer.annotations();
+        lowerer.constants();
+        lowerer.globals_built = lowerer.built;
+        lowerer.functions();
+        lowerer.infer();
+        assert!(lowerer.exhausted.is_some(), "{body}");
+        assert!(!codes(&source).is_empty(), "{body}");
+    }
+}
+
+#[test]
 fn an_unrolled_body_reports_each_problem_once() {
     let source = "\
 def spin(n):

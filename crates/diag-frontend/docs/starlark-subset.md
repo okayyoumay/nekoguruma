@@ -265,7 +265,7 @@ field that stores them.
 
 | Argument | Type and range |
 |---|---|
-| `service_id` | `int`, 0x00 to 0xFF (a UDS service identifier; ADR-235 item 2) |
+| `service_id` | `int`, 0x00 to 0xFF (a UDS service identifier; ADR-235 item 2), except RequestDownload (0x34), TransferData (0x36) and RequestTransferExit (0x37), which only `diag.flash_transfer` sends |
 | `mask` | `int`, 0x00 to 0xFF |
 | `routine_id` | `int`, 0x0000 to 0xFFFF |
 | `sub` | `int`, 0x00 to 0xFF |
@@ -276,6 +276,7 @@ field that stores them.
 | `code` of `diag.fail` | non-empty `str` constant, 1 to 64 bytes of UTF-8 (the IR accepts 1 to 128; `Program::validate` checks the constant, ADR-280) |
 | `detail` of `diag.fail` | `str` expression, which may be built at run time |
 | `params` of `diag.hmi` | dict whose values are all constants (3.2) |
+| `params` of `diag.request` | dict known at ingestion whose keys and values select one declared service of the variant and give its other request fields (3.4); a call that selects none, or more than one, is rejected (`STAR_UNKNOWN_SERVICE`) |
 | `session_id` | `int` naming a flash session declared in the declaration part (`FlashSession` in `ir.fbs`); an unknown session is rejected (`STAR_UNKNOWN_FLASH_SESSION`) |
 
 A `diag.wait` whose duration is only known at run time needs a stack-operand variant of `Wait`.
@@ -288,7 +289,7 @@ instruction exists, the transpiler rejects calls to it (`STAR_API_NOT_AVAILABLE`
 
 | Function | Instruction | Run-time operands |
 |---|---|---|
-| `diag.request` | `ServiceRequest` | request payload (bytes) built from `params` |
+| `diag.request` | `ServiceRequest` | request payload (bytes): encoded at ingestion from `params` into a constant-pool entry and pushed before the instruction (ADR-313). Until the response has a run-time shape (3.4) the call is a statement and its response is dropped; a `params` value known only at run time under a field's key is not lowered yet (`STAR_NOT_LOWERABLE`) |
 | `diag.read_dtc` | `ReadDtc` | none |
 | `diag.routine` | `RoutineControl` | routine control payload (bytes) built from `params` |
 | `diag.security_access` | `ServiceRequest`, `SecurityAccess`, `ServiceRequest` | expands to three steps: the seed request (SecurityAccess service, odd sub-function `level`), `SecurityAccess`, which turns the seed (bytes) into the key through the host, and the send-key request (sub-function `level + 1`) carrying that key; a negative response to either request ends the call like a failed `diag.request` |

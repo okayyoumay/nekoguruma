@@ -548,7 +548,10 @@ exactly one service must match. The generated DID services
 have one constant named `did`, so `diag.request(0x22, {"did": 0xF190})` selects `vin.read` in the
 example. `diag.routine(rid, sub, params)` considers only the services `routines.csv` generates,
 and selects the one whose `rid` and `sub` constants have those values, with the same rule for the
-other keys of `params`; `diag.request` never selects a generated routine service.
+other keys of `params`; `diag.request` never selects a generated routine service. The IR keeps
+the constants only as prefix bytes, so the conversion hands the lowering an index of each
+variant's services with their request constants by name and value; a call that selects no
+service, or more than one, is rejected (`STAR_UNKNOWN_SERVICE`, ADR-313).
 `diag.security_access` needs no declared service: the host builds its requests and reads the
 seed from the response itself (subset spec 3.2). Under ADR-309 the seed and key requests come from the application-layer profile instead, and `diag.read_dtc` is lowered through the profile into a declared service rather than sent by the host. `diag.read_dtc(mask)` sends ReadDTCInformation with sub-function
 0x02 and the mask (ADR-235 item 2), so its response is decoded through the variant's service that

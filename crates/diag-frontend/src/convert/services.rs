@@ -14,6 +14,7 @@ use diag_ir::declaration::{
     SelectT, ServiceT, ShapeT, Termination, TextEntryT, VariantPatternT,
 };
 
+use crate::star::{IndexedService, RequestConstant, RequestIndex};
 use crate::tables::rows::{
     self, ConversionKind, ConversionRow, FieldRow, FieldType, Length, RoutinePart, Terminator,
     Timing,
@@ -188,7 +189,53 @@ impl<'a> Index<'a> {
 
     /// The services, layouts and variant patterns of the document of `variant`, an index into
     /// `variants.csv`.
-    pub(super) fn variant(&self, variant: usize) -> VariantPart {
+    /// The services of `variant` as `diag.request` selects among them (5.3, ADR-313): each one's
+    /// IR id and SID, whether `routines.csv` generated it, and its request constants by name.
+    pub(super) fn request_index(&self, variant: usize) -> RequestIndex {
+        let tables = &self.definition.tables;
+        let services = self
+            .specs(variant)
+            .iter()
+            .map(|spec| {
+                let mut constants = Vec::new();
+                if let Some(Generated::Read | Generated::Write) = spec.name.generated {
+                    let did = &spec.generated_prefix;
+                    let did = u64::from(u16::from_be_bytes([did[0], did[1]]));
+                    constants.push(("did".to_owned(), RequestConstant::Uint(did)));
+                }
+                for &i in spec
+                    .request
+                    .as_ref()
+                    .and_then(|c| self.fields_by_container.get(c))
+                    .into_iter()
+                    .flatten()
+                {
+                    let f = &tables.fields[i];
+                    if let Some(value) = f.constant.as_deref() {
+                        let value = match constant_value(f, value).expect("a valid constant") {
+                            Constant::Integer(v) => RequestConstant::Uint(v),
+                            Constant::Bytes(bytes) => RequestConstant::Bytes(bytes),
+                        };
+                        constants.push((f.name.clone(), value));
+                    }
+                }
+                IndexedService {
+                    service_id: self.service_ids[&spec.name],
+                    sid: spec.sid,
+                    routine: matches!(
+                        spec.name.generated,
+                        Some(Generated::Start | Generated::Stop | Generated::Results)
+                    ),
+                    constants,
+                }
+            })
+            .collect();
+        RequestIndex { services }
+    }
+
+    /// The services of `variant`, as the tables define or generate them: its `services.csv`
+    /// rows, then the DID and the routine services, in row order.
+    fn specs(&self, variant: usize) -> Vec<ServiceSpec<'a>> {
         let tables = &self.definition.tables;
         let rows = &self.definition.variants[variant];
         let mut specs = Vec::new();
@@ -274,6 +321,13 @@ impl<'a> Index<'a> {
                 });
             }
         }
+        specs
+    }
+
+    pub(super) fn variant(&self, variant: usize) -> VariantPart {
+        let tables = &self.definition.tables;
+        let rows = &self.definition.variants[variant];
+        let specs = self.specs(variant);
         // The variant's NRC rows, by the service they name and variant-wide, in row order.
         let mut nrcs = Nrcs::default();
         for &i in &rows.nrcs {

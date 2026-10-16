@@ -1994,7 +1994,9 @@ impl<'a> Lowerer<'a> {
                 };
                 match (level, message) {
                     (Some(level), Some(text)) => {
-                        let message = self.pool(text.as_bytes());
+                        // Found by its shared allocation, so a large global logged many times
+                        // is not hashed again for each call.
+                        let message = self.pool_shared(&Const::Str(text));
                         Val::Void(vec![(
                             Ins::Op(Op::Log {
                                 // In range by the check above.

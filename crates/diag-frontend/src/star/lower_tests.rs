@@ -1041,3 +1041,16 @@ fn wait_log_and_capture_arguments_are_checked() {
         assert_eq!(codes(source), vec![(code, line)], "{source}");
     }
 }
+
+#[test]
+fn a_message_logged_many_times_is_pooled_once() {
+    let mut source = format!("M = \"{}\"\n\ndef main():\n", "x".repeat(1000));
+    for _ in 0..50 {
+        source.push_str("    diag.log(1, M)\n");
+    }
+    let program = lowered(&source).unwrap();
+    assert_eq!(program.constants.len(), 1);
+    let mut host = ScriptedHost::default();
+    run_on(&source, &mut host);
+    assert_eq!(host.calls.len(), 50);
+}

@@ -468,6 +468,28 @@ fn the_constants_of_a_procedure_are_bounded_together() {
 }
 
 #[test]
+fn constants_built_in_function_bodies_are_bounded_together() {
+    // A global of 2^19 bytes, then a body that builds 64 concatenations at once: as the
+    // arguments of one call, and as the items of one list. Every inference pass and the
+    // emission stop building them once the total passes 2^24.
+    let mut doubling = String::from("B0 = b\"x\"\n");
+    for i in 1..=19 {
+        doubling.push_str(&format!("B{i} = B{p} + B{p}\n", p = i - 1));
+    }
+    let items = vec!["B19 + b\"y\""; 64].join(", ");
+    for body in [format!("max({items})"), format!("[{items}]")] {
+        let source = format!("{doubling}\ndef main():\n    x = {body}\n");
+        let found = codes(&source);
+        assert!(
+            found
+                .iter()
+                .any(|(c, line)| *c == StarCode::NotLowerable && *line == 23),
+            "{found:?}"
+        );
+    }
+}
+
+#[test]
 fn a_right_shift_is_arithmetic() {
     assert!(holds("x", "-8", "x >> 1 == -4"));
     assert!(holds("x", "-1", "x >> 63 == -1"));

@@ -54,6 +54,7 @@ pub fn lower(file: &str, checked: &Checked) -> Result<Program, Vec<StarError>> {
     let mut lowerer = Lowerer::new(checked);
     lowerer.annotations();
     lowerer.constants();
+    lowerer.globals_built = lowerer.built;
     lowerer.functions();
     if lowerer.errors.is_empty() {
         lowerer.infer();
@@ -338,8 +339,12 @@ struct Lowerer<'a> {
     pooled: HashMap<Vec<u8>, u32>,
     /// Pool indexes by the address and length of a shared constant's bytes, with the constant.
     shared: HashMap<(usize, usize), (Const, u32)>,
-    /// The total size of the constants built outside inference, against [`MAX_CONSTANTS_TOTAL`].
+    /// The total size of the constants built so far, against [`MAX_CONSTANTS_TOTAL`]: the
+    /// globals' (`globals_built`) and those of the current pass over the function bodies, an
+    /// inference pass or the emission. A pass drops its constants, so each starts again from
+    /// the globals' total, and each is bounded, reported or not.
     built: usize,
+    globals_built: usize,
 }
 
 impl<'a> Lowerer<'a> {
@@ -358,6 +363,7 @@ impl<'a> Lowerer<'a> {
             pooled: HashMap::new(),
             shared: HashMap::new(),
             built: 0,
+            globals_built: 0,
         }
     }
 
@@ -493,6 +499,7 @@ impl<'a> Lowerer<'a> {
         self.quiet += 1;
         for _ in 0..MAX_TYPE_PASSES {
             self.changed = false;
+            self.built = self.globals_built;
             for id in 0..self.funcs.len() {
                 if !reached[id] {
                     continue;
@@ -527,6 +534,7 @@ impl<'a> Lowerer<'a> {
         let Some(&main) = self.by_name.get("main") else {
             return;
         };
+        self.built = self.globals_built;
         let mut pending = vec![main];
         let mut emitted = vec![false; self.funcs.len()];
         emitted[main] = true;
@@ -1188,14 +1196,10 @@ impl<'a> Lowerer<'a> {
             );
             return Val::Const(Const::Int(0));
         }
-        // A pass of type inference keeps none of its constants, so only the constants built
-        // once, outside inference, count toward the total.
-        if self.quiet == 0
-            && matches!(
-                value,
-                Const::Str(_) | Const::Bytes(_) | Const::List(..) | Const::Dict(..)
-            )
-        {
+        if matches!(
+            value,
+            Const::Str(_) | Const::Bytes(_) | Const::List(..) | Const::Dict(..)
+        ) {
             self.built = self.built.saturating_add(value.size());
             if self.built > MAX_CONSTANTS_TOTAL {
                 self.not_lowerable(

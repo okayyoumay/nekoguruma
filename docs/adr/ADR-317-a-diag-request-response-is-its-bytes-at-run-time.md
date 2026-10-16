@@ -3,7 +3,7 @@
 **Date:** 2026-10-16
 **Status:** Accepted
 **Affects:** `diag-frontend` (`src/star/lower.rs`, `src/convert/tests.rs`),
-`crates/diag-frontend/docs/starlark-subset.md` 2.5, 3.2 and 3.4, design 8.4; ADR-313 item 5,
+`crates/diag-frontend/docs/starlark-subset.md` 3.2 and 3.4, design 8.4; ADR-313 item 5,
 ADR-309 item 4
 
 ## Context
@@ -34,10 +34,12 @@ send-receive work, but the declaration part does not carry it yet.
 2. **UDS's negative-response shape for now.** The `7F` test and the NRC's position are UDS's
    (ISO 14229-1 (2026) 7.6: a negative response carries `7F`, then the SID of the request and
    then the response code). They give way to the shape the declaration part will carry under ADR-309 item 4.
-3. **Only the four keys.** Any other literal key is `STAR_UNSUPPORTED_SYNTAX`, and a computed
-   key stays `STAR_DYNAMIC_KEY_NOT_ALLOWED` (subset 4.1). Using a response as anything else is
+3. **Only the four keys.** Any other string key is `STAR_UNSUPPORTED_SYNTAX`. A key that is not a
+   string literal is `STAR_DYNAMIC_KEY_NOT_ALLOWED` (subset 4.1), also when the response comes
+   from a function's return value or parameter, which the checker does not follow. Using a response as anything else is
    `STAR_NOT_LOWERABLE`: its truth value, which is always true in Starlark, an operator, or a
-   built-in. `res["ok"]` says what a truth test would mean.
+   built-in. Equality is rejected too, although Starlark defines it: a response compared with
+   bytes would be silently false where `res["raw"]` was meant. `res["ok"]` says what a truth test would mean.
 4. **ADR-313 item 5 is superseded.** The call's value is the response, and a call used as a
    statement drops it with the `Pop` every expression statement gets.
 

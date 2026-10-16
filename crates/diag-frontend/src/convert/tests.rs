@@ -795,7 +795,7 @@ def main():
 
 #[test]
 fn a_response_is_read_only_through_its_keys() {
-    use crate::star::StarCode::{NotLowerable, UnsupportedSyntax};
+    use crate::star::StarCode::{DynamicKeyNotAllowed, NotLowerable, UnsupportedSyntax};
     let read = |expr: &str| {
         format!("def main():\n    res = diag.request(0x22, {{\"did\": 0xF190}})\n    x = {expr}\n")
     };
@@ -804,6 +804,18 @@ fn a_response_is_read_only_through_its_keys() {
         (read("res[\"fields\"]"), NotLowerable),
         (read("res + b\"x\""), NotLowerable),
         (read("1 if res else 2"), NotLowerable),
+        // Starlark would compare the dict: never equal to bytes, so a left-out `["raw"]`
+        // would go unnoticed.
+        (read("res == b\"\\x62\""), NotLowerable),
+        (read("res != 0"), NotLowerable),
+        (read("res == res"), NotLowerable),
+        // A key must be a string literal also where the checker does not see a response.
+        (
+            "K = \"ok\"\n\ndef get():\n    return diag.request(0x22, {\"did\": 0xF190})\n\n\
+             def main():\n    x = get()[K]\n"
+                .to_owned(),
+            DynamicKeyNotAllowed,
+        ),
     ];
     for (source, code) in cases {
         let codes: Vec<_> = request_errors(&source).into_iter().map(|e| e.0).collect();

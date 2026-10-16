@@ -306,7 +306,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-314](ADR-314-application-layer-profiles-as-typed-frontend-data.md) | Application-Layer Profiles as Typed Frontend Data | Accepted | `diag-frontend` profiles, Starlark subset 3.2 and 3.4, CSV format 5.3; ADR-309 items 2 and 5 |
 | [ADR-315](ADR-315-variant-patterns-grouped-into-patterns.md) | Variant Pattern Entries Grouped into Patterns | Accepted | `diag-ir` schema and decoder (`IR_SCHEMA_VERSION` 10), `diag-frontend` CSV variant patterns, CSV format 4.2, design 8.9.1; ADR-306 |
 | [ADR-316](ADR-316-the-vm-decodes-response-fields-through-the-declaration-part.md) | The VM Decodes Response Fields Through the Declaration Part | Accepted | `diag-ir` VM (`Op::DecodeField`, `Vm::step_with_declarations`, `IR_SCHEMA_VERSION` 11), `agent` policy and journal, design 8.2.4; ADR-233, ADR-297 |
-| [ADR-317](ADR-317-a-diag-request-response-is-its-bytes-at-run-time.md) | A `diag.request` Response Is Its Bytes at Run Time | Accepted | `diag-frontend` Starlark lowering, Starlark subset 2.5, 3.2 and 3.4, design 8.4; ADR-313 item 5, ADR-309 item 4 |
+| [ADR-317](ADR-317-a-diag-request-response-is-its-bytes-at-run-time.md) | A `diag.request` Response Is Its Bytes at Run Time | Accepted | `diag-frontend` Starlark lowering, Starlark subset 3.2 and 3.4, design 8.4; ADR-313 item 5, ADR-309 item 4 |
 
 ## Status Legend
 

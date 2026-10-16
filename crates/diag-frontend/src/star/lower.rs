@@ -1506,7 +1506,15 @@ impl<'a> Lowerer<'a> {
                 let b = self.expr(id, index);
                 match a {
                     Val::Run(tys, code) if tys == Tys::of(Ty::Response) => {
-                        self.response_key(id, code, b, span)
+                        // Subset 4.1 holds for a response however it reached here, also through
+                        // a function the checker does not follow.
+                        let literal = matches!(&index.node, ExprP::Literal(AstLiteral::String(_)));
+                        let key = if literal {
+                            b
+                        } else {
+                            Val::Run(Tys::default(), Vec::new())
+                        };
+                        self.response_key(id, code, key, span)
                     }
                     a => self.index(a, b, span),
                 }
@@ -1915,6 +1923,23 @@ impl<'a> Lowerer<'a> {
                     Val::Const(Const::Int(0))
                 }
             };
+        }
+        let response = Ty::Response.bit();
+        if [&a, &b]
+            .iter()
+            .any(|v| matches!(v, Val::Run(tys, _) if tys.0 & response != 0))
+        {
+            // Starlark would compare the dict, which a procedure that left out `["raw"]` gets
+            // wrong silently (ADR-317 item 3).
+            self.not_lowerable(
+                span,
+                format!(
+                    "`{}` does not take a response: read it through its keys, such as \
+                     `res[\"raw\"]` (3.4)",
+                    binop_symbol(op)
+                ),
+            );
+            return Val::Run(Tys::default(), Vec::new());
         }
         let _ = id;
         let what = binop_symbol(op);

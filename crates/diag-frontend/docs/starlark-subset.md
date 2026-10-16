@@ -345,8 +345,8 @@ lowered where it is read: `raw` is those bytes, `ok` is false only when the firs
 and `nrc` is the third byte of a negative response and 0 otherwise. A negative response too
 short to hold its code stops the run when `nrc` is read. Until the declaration part carries the
 application layer's negative-response shape (ADR-309 item 4), that shape is UDS's. Another
-literal key is `STAR_UNSUPPORTED_SYNTAX`. A response used other than through its keys (its
-truth value, an operator, a built-in) is `STAR_NOT_LOWERABLE`, and so is `fields`, whose
+string key is `STAR_UNSUPPORTED_SYNTAX`. A response used other than through its keys (its
+truth value, an operator such as `==`, a built-in) is `STAR_NOT_LOWERABLE`, and so is `fields`, whose
 lowering is not built yet.
 
 ---

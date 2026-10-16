@@ -112,7 +112,7 @@ onto them as follows; anything else exists only at ingestion.
 | `int` | `I64` | 4.4 |
 | `float` | `F64` | |
 | `bool` | `Bool` | |
-| `bytes` | `Bytes` | |
+| `bytes` | `Bytes` | A slice without a step lowers at run time to the IR's slice instruction, with Starlark's clamping of negative and out-of-range indexes; a string is sliced only when it is a constant, since its indexes count characters |
 | `str` | constant only, or UTF-8 `Bytes` when built at run time | Two strings, or two bytes values, known only at run time are joined with `+` through the IR's concatenation instruction, which ends the procedure with a VM error past 16 MiB; a string built by `%` formatting or `str(x)` needs the conversion instructions the IR does not have yet |
 | `list` | none | List literals are constants: a `for` over one is unrolled, and an index into one must be a constant. No mutation |
 | `dict` | none | A dict literal appears only as a `params` argument (3.1), which the transpiler encodes into the request bytes. The response (3.4) is accessed only through literal key chains, which the transpiler resolves to the response bytes and the declaration part's decode plan for each field |

@@ -798,6 +798,24 @@ fn bytes_and_strings_join_at_run_time() {
 }
 
 #[test]
+fn bytes_slice_at_run_time_as_at_ingestion() {
+    // Each slice of a run-time value gives what the same slice of the constant gives.
+    let b = "b\"\\x0a\\x0b\\x0c\\x0d\\x0e\"";
+    for slice in [
+        "[1:3]", "[:2]", "[3:]", "[:]", "[-2:]", "[1:-1]", "[-100:2]", "[3:100]", "[4:2]",
+    ] {
+        assert!(holds("x", b, &format!("x{slice} == {b}{slice}")), "{slice}");
+    }
+    // Bounds known only at run time.
+    assert!(holds(
+        "x, i, j",
+        &format!("{b}, 1, -1"),
+        &format!("x[i:j] == {b}[1:-1]")
+    ));
+    assert!(holds("i", "2", &format!("{b}[i:] == {b}[2:]")));
+}
+
+#[test]
 fn what_the_ir_cannot_express_is_not_lowerable() {
     let cases = [
         // Mixed int and float at run time.
@@ -816,6 +834,9 @@ fn what_the_ir_cannot_express_is_not_lowerable() {
         "def main():\n    x = [1, 2]\n",
         // A built-in on a run-time value.
         "def f(x):\n    return abs(x)\n\ndef main():\n    f(1)\n",
+        // A string sliced at run time, and a slice with a step.
+        "def f(x):\n    return x[1:]\n\ndef main():\n    f(\"ab\")\n",
+        "def f(x):\n    return x[::2]\n\ndef main():\n    f(b\"ab\")\n",
         // A loop over bytes known only at run time.
         "def f(b):\n    for x in b:\n        pass\n\ndef main():\n    f(b\"\")\n",
         // A primitive not lowered yet.

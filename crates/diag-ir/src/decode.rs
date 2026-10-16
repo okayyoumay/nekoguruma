@@ -246,15 +246,16 @@ pub fn variant_matches<'f>(
     let Some(entries) = variant.patterns() else {
         return false;
     };
-    let mut groups: Vec<u16> = entries.iter().map(|entry| entry.pattern()).collect();
-    groups.sort_unstable();
-    groups.dedup();
-    groups.into_iter().any(|group| {
-        entries
-            .iter()
-            .filter(|entry| entry.pattern() == group)
-            .all(|entry| fields(entry.service_id()).is_some_and(|f| pattern_matches(&entry, f)))
-    })
+    // Sorted once by pattern, so each pattern is one run of entries.
+    let mut entries: Vec<VariantPattern<'_>> = entries.iter().collect();
+    entries.sort_by_key(VariantPattern::pattern);
+    entries
+        .chunk_by(|a, b| a.pattern() == b.pattern())
+        .any(|pattern| {
+            pattern
+                .iter()
+                .all(|entry| fields(entry.service_id()).is_some_and(|f| pattern_matches(entry, f)))
+        })
 }
 
 /// The index of the first of `variants` that [`variant_matches`], or `None` when none does.

@@ -9,7 +9,7 @@
 //! express for its operands is `STAR_NOT_LOWERABLE`.
 //!
 //! Not lowered yet, each its own backlog item: the other `diag` functions (`hmi` and `record`;
-//! `request`, `routine`, `read_dtc` and `security_access`; `flash_transfer`), built-ins and
+//! `routine` and `security_access`; `flash_transfer`), reading `dtcs` of `diag.read_dtc`, built-ins and
 //! string methods on values known only at run time, and section and idempotency annotations.
 //! Each is rejected with `STAR_NOT_LOWERABLE` (or `STAR_API_NOT_AVAILABLE` for a `diag`
 //! function without an instruction), so nothing is lowered silently wrong.
@@ -17,7 +17,7 @@
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
-use diag_ir::declaration::{EcuVariant, Request};
+use diag_ir::declaration::{EcuVariant, LengthKind, Request};
 use diag_ir::encode::{ParamValue, encode_request};
 use diag_ir::{IR_SCHEMA_VERSION, Op, Program, SourceSpan};
 use starlark_syntax::codemap::Span;
@@ -28,7 +28,7 @@ use starlark_syntax::syntax::ast::{
 };
 use starlark_syntax::syntax::uniplate::Visit;
 
-use crate::profile::Intent;
+use crate::profile::{Intent, Part, ResultMap, Source};
 
 use super::{
     Annotation, BUILTINS, Checked, Pending, RequestConstant, RequestIndex, STRING_METHODS,
@@ -226,6 +226,9 @@ enum Service {
     Unknown,
     /// The `Service.id` of the one request the response can come from.
     One(u32),
+    /// A `diag.read_dtc` result from the service of that `Service.id`: its `fields` are the
+    /// names the profile maps the response to, not the declared ones (ADR-314 item 4).
+    Dtcs(u32),
     /// Requests to more than one service: a variable assigned from both anywhere in its
     /// function (types are per variable, subset 4.8), or a parameter whose callers pass both.
     Several,
@@ -236,6 +239,7 @@ impl Service {
         match (self, other) {
             (Service::Unknown, s) | (s, Service::Unknown) => s,
             (Service::One(a), Service::One(b)) if a == b => Service::One(a),
+            (Service::Dtcs(a), Service::Dtcs(b)) if a == b => Service::Dtcs(a),
             _ => Service::Several,
         }
     }
@@ -254,6 +258,14 @@ impl Tys {
         Tys {
             bits: ty.bit(),
             service: Service::One(service),
+        }
+    }
+
+    /// A `diag.read_dtc` result from `service`.
+    fn from_dtc_service(service: u32) -> Self {
+        Tys {
+            bits: Ty::Response.bit(),
+            service: Service::Dtcs(service),
         }
     }
 
@@ -2456,8 +2468,9 @@ impl<'a> Lowerer<'a> {
             );
             return Val::Run(Tys::default(), Vec::new());
         };
-        let service = match service {
-            Service::One(service) => service,
+        let (service, profiled) = match service {
+            Service::One(service) => (service, false),
+            Service::Dtcs(service) => (service, true),
             // The request's own error is already reported.
             Service::Unknown => return Val::Run(Tys::default(), Vec::new()),
             Service::Several => {
@@ -2474,13 +2487,22 @@ impl<'a> Lowerer<'a> {
             .services()
             .and_then(|services| services.iter().find(|s| s.id() == service))
             .and_then(|s| s.positive());
-        let field = declared
-            .and_then(|positive| positive.fields())
-            .and_then(|fields| {
-                fields
-                    .iter()
-                    .find(|f| f.short_name().is_some_and(|name| name == &*key))
-            });
+        let field = if profiled {
+            let Some(position) = self.dtc_result_position(&key, span) else {
+                return Val::Run(Tys::default(), Vec::new());
+            };
+            declared
+                .and_then(|positive| positive.fields())
+                .and_then(|fields| fields.iter().nth(position))
+        } else {
+            declared
+                .and_then(|positive| positive.fields())
+                .and_then(|fields| {
+                    fields
+                        .iter()
+                        .find(|f| f.short_name().is_some_and(|name| name == &*key))
+                })
+        };
         let Some(field) = field else {
             self.error(
                 StarCode::UnsupportedSyntax,
@@ -3015,6 +3037,9 @@ impl<'a> Lowerer<'a> {
                 }
             }
             "request" => self.diag_request(id, args, span),
+            "read_dtc" if self.requests.profile.call(Intent::ReadDtc).is_some() => {
+                self.diag_read_dtc(id, args, span)
+            }
             "read_dtc" | "routine" | "security_access" => {
                 let intent = match name {
                     "read_dtc" => Intent::ReadDtc,
@@ -3256,6 +3281,340 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    /// `diag.read_dtc(mask)` through the variant's profile (ADR-309 items 2 to 4, ADR-314):
+    /// the request the profile's template builds, sent as it is by the generic send-receive to
+    /// the declared service the template selects. The result is read under the profile's names
+    /// ([`Self::dtc_result_position`]).
+    fn diag_read_dtc(&mut self, id: Option<usize>, args: &[&AstExpr], span: Span) -> Val {
+        let [mask_arg] = args else {
+            self.error(
+                StarCode::UnsupportedSyntax,
+                span,
+                "`diag.read_dtc` takes a status mask (3.1)",
+            );
+            return Val::Run(Tys::of(Ty::Response), Vec::new());
+        };
+        let mask = self.constant_int(id, mask_arg, "read_dtc", "mask", 0..=0xFF);
+        let profile = self.requests.profile;
+        let call = profile.call(Intent::ReadDtc).expect("the caller checked");
+        let [step] = call.steps else {
+            self.not_lowerable(
+                span,
+                format!(
+                    "the {} profile's `diag.read_dtc` takes several steps, which are not lowered \
+                     yet (3.2)",
+                    profile.layer
+                ),
+            );
+            return Val::Run(Tys::of(Ty::Response), Vec::new());
+        };
+        let Some(mask) = mask else {
+            return Val::Run(Tys::of(Ty::Response), Vec::new());
+        };
+        // In range by the check above.
+        let args = [(Source::Mask, mask as u64)];
+        let Some((service, bytes)) = self.select_template(&step.request, &args, span) else {
+            return Val::Run(Tys::of(Ty::Response), Vec::new());
+        };
+        if !self.dtc_response_fits(service, step.result, span) {
+            return Val::Run(Tys::of(Ty::Response), Vec::new());
+        }
+        let operand = self.pool(&bytes);
+        Val::Run(
+            Tys::from_dtc_service(service),
+            vec![
+                (Ins::Op(Op::PushBytes(operand)), span),
+                (Ins::Op(Op::SendReceive { service }), span),
+            ],
+        )
+    }
+
+    /// The one declared service of this variant that a profile's request template selects
+    /// (ADR-314 item 2), with the complete request bytes, its SID first: the template's
+    /// constants and selecting arguments, encoded at their widths, must be the declared
+    /// request's prefix byte for byte, its other arguments fill the declared request's fields in
+    /// order, each a fixed `uint` of the template's width with no conversion, and the request
+    /// must encode to exactly the bytes the template stands for. `args` gives the call's
+    /// argument values. `None` after an error.
+    fn select_template(
+        &mut self,
+        template: &crate::profile::Request,
+        args: &[(Source, u64)],
+        span: Span,
+    ) -> Option<(u32, Vec<u8>)> {
+        let value = |source: Source| {
+            args.iter()
+                .find(|(s, _)| *s == source)
+                .map(|&(_, v)| v)
+                .expect("the call gives each source its template uses")
+        };
+        let services = self.variant.services();
+        let mut found = Vec::new();
+        for indexed in &self.requests.services {
+            if indexed.sid != template.sid || indexed.routine {
+                continue;
+            }
+            let Some(request) = services.and_then(|services| {
+                self.service_at
+                    .get(&indexed.service_id)
+                    .and_then(|&at| services.get(at).request())
+            }) else {
+                continue;
+            };
+            let fields: Vec<_> = request.params().into_iter().flatten().collect();
+            let mut fields_at = fields.iter();
+            // The constants lead the request (csv-tables 5.3), so they are its prefix.
+            let mut prefix = Vec::new();
+            // The operand the template stands for: the prefix, then each argument at its width.
+            let mut expected = Vec::new();
+            let mut values = HashMap::new();
+            let fits = template.parts.iter().all(|part| {
+                let (bits, constant) = match *part {
+                    Part::Const { bits, value } => (bits, value),
+                    Part::Select { bits, arg } => (bits, value(arg)),
+                    _ => (0, 0),
+                };
+                match *part {
+                    // A constant after a field cannot be part of the prefix.
+                    Part::Const { .. } | Part::Select { .. } if values.is_empty() => {
+                        let width = usize::from(bits / 8);
+                        prefix.extend_from_slice(&constant.to_be_bytes()[8 - width..]);
+                        expected.extend_from_slice(&constant.to_be_bytes()[8 - width..]);
+                        true
+                    }
+                    Part::Const { .. } | Part::Select { .. } => false,
+                    // A profile's argument is a raw value such as a bit mask, so its field is
+                    // an unsigned integer that sends it as it is, not BCD or a signed number.
+                    Part::Arg { bits, arg } => fields_at.next().is_some_and(|field| {
+                        let fits = is_fixed_uint(field, bits)
+                            && field.compu_type() == diag_ir::declaration::Compu::CompuIdentity;
+                        // A value an `i64` cannot hold selects nothing; the profiles' arguments
+                        // are 8 or 16 bits wide.
+                        let value = i64::try_from(value(arg));
+                        if let (true, Ok(value)) = (fits, value) {
+                            let name = field.short_name().unwrap_or_default();
+                            values.insert(name, ParamValue::Int(value));
+                            let width = usize::from(bits / 8);
+                            expected.extend_from_slice(&value.to_be_bytes()[8 - width..]);
+                        }
+                        fits && value.is_ok()
+                    }),
+                    // No call that is lowered through a template yet takes `params`.
+                    Part::Params => false,
+                }
+            });
+            let declared_prefix = request.prefix().map(|p| p.bytes()).unwrap_or_default();
+            if !fits || declared_prefix != &prefix[..] || fields_at.next().is_some() {
+                continue;
+            }
+            // The declared fields must also sit where the template puts the arguments, in its
+            // byte order: the request encodes to exactly the template's bytes.
+            if encode_request(&request, &values).is_ok_and(|operand| operand == expected) {
+                found.push((indexed.service_id, expected));
+            }
+        }
+        let layer = self.requests.profile.layer;
+        let [(service, operand)] = &found[..] else {
+            self.error(
+                StarCode::UnknownService,
+                span,
+                format!(
+                    "{} services of this variant have SID 0x{:02X} and the constants and \
+                     fields the {layer} profile's request needs, not one (csv-tables 5.3, \
+                     ADR-314)",
+                    found.len(),
+                    template.sid
+                ),
+            );
+            return None;
+        };
+        Some((*service, [&[template.sid][..], operand].concat()))
+    }
+
+    /// Whether the declared positive response of `service` fits the profile's `diag.read_dtc`
+    /// map (ADR-314 item 3): an integer field as wide as a DTC's status at the mask's position,
+    /// and a field at the records' position. Reports the field that does not.
+    fn dtc_response_fits(&mut self, service: u32, map: ResultMap, span: Span) -> bool {
+        let ResultMap::ReadDtc {
+            mask,
+            dtcs,
+            code_bits,
+            status_bits,
+        } = map
+        else {
+            unreachable!("`Profile::validate` gives `diag.read_dtc` its DTC map")
+        };
+        let positive = self
+            .variant
+            .services()
+            .and_then(|services| services.iter().find(|s| s.id() == service))
+            .and_then(|s| s.positive());
+        let fields: Vec<_> = positive
+            .and_then(|positive| positive.fields())
+            .into_iter()
+            .flatten()
+            .collect();
+        let prefix = positive.and_then(|p| p.prefix()).map_or(0, |p| p.len());
+        let layer = self.requests.profile.layer;
+        let mask_field = fields.get(usize::from(mask.0));
+        let problem = match mask_field {
+            None => Some(format!("has no field at the mask's position {}", mask.0)),
+            // The availability mask is a status mask, as wide as each DTC's status, and its bits
+            // are read as they are.
+            Some(field)
+                if !is_fixed_uint(field, status_bits)
+                    || field.compu_type() != diag_ir::declaration::Compu::CompuIdentity =>
+            {
+                Some(format!(
+                    "has `{}`, which is not a {status_bits}-bit `uint` without a conversion, at \
+                     the mask's position",
+                    field.short_name().unwrap_or_default()
+                ))
+            }
+            Some(_) => match fields.get(usize::from(dtcs.0)) {
+                None => Some(format!(
+                    "has no field at the DTC records' position {}",
+                    dtcs.0
+                )),
+                Some(records) if !self.is_dtc_records(records, code_bits, status_bits) => {
+                    Some(format!(
+                        "has `{}` at the DTC records' position, which is not a repeat until the \
+                         end of the message of a {code_bits}-bit code then a {status_bits}-bit \
+                         status, both `uint` without a conversion",
+                        records.short_name().unwrap_or_default()
+                    ))
+                }
+                // The records run to the end of the message, so nothing can follow them.
+                Some(records) if fields.len() > usize::from(dtcs.0) + 1 => Some(format!(
+                    "declares fields after `{}`, which runs to the end of the message",
+                    records.short_name().unwrap_or_default()
+                )),
+                // The profile's fields are on the wire one after the other from the end of the
+                // prefix, as the profile's response has them.
+                Some(_) => fields[..=usize::from(dtcs.0)]
+                    .iter()
+                    .scan(Some((1 + prefix as u32) * 8), |next, field| {
+                        let start = (*next)?;
+                        let placed = match field.placement() {
+                            diag_ir::declaration::Placement::Absolute => {
+                                field.bit_offset() == start
+                            }
+                            diag_ir::declaration::Placement::AfterPrevious => {
+                                field.bit_offset() == 0 && start % 8 == 0
+                            }
+                            _ => false,
+                        };
+                        *next = (field.length_kind() == LengthKind::Fixed
+                            && field.shape_type() == diag_ir::declaration::Shape::NONE)
+                            .then(|| start + field.bit_length());
+                        Some((field, placed))
+                    })
+                    .find(|(_, placed)| !placed)
+                    .map(|(field, _)| {
+                        format!(
+                            "has `{}` apart from the field before it, so the response is not \
+                             the profile's fields one after the other",
+                            field.short_name().unwrap_or_default()
+                        )
+                    }),
+            },
+        };
+        if let Some(problem) = problem {
+            self.error(
+                StarCode::NotInProfile,
+                span,
+                format!(
+                    "the positive response of the selected service {problem}, so it does not fit \
+                     the {layer} profile's `diag.read_dtc` (ADR-314)"
+                ),
+            );
+            return false;
+        }
+        true
+    }
+
+    /// Whether `records` repeats, until the end of the message, an unpadded layout of exactly a
+    /// `code_bits`-bit code and then a `status_bits`-bit status, each a `uint` without a
+    /// conversion: the records the profile's `dtcs` reads (ADR-314 item 4).
+    fn is_dtc_records(
+        &self,
+        records: &diag_ir::declaration::Field<'_>,
+        code_bits: u8,
+        status_bits: u8,
+    ) -> bool {
+        let Some(repeat) = records.shape_as_repeat() else {
+            return false;
+        };
+        if repeat.count() != diag_ir::declaration::RepeatCount::UntilEndOfPdu {
+            return false;
+        }
+        let layout = self
+            .variant
+            .layouts()
+            .and_then(|layouts| layouts.iter().find(|l| l.id() == repeat.layout_id()));
+        let fields: Vec<_> = layout
+            .and_then(|l| l.fields())
+            .into_iter()
+            .flatten()
+            .collect();
+        // A field starts at `offset` bits into the record: placed there, or right after the
+        // previous field (whole bytes here, so the bit position is 0).
+        let at = |field: &diag_ir::declaration::Field<'_>, bits: u8, offset: u32| {
+            use diag_ir::declaration::Placement;
+            is_fixed_uint(field, bits)
+                && field.compu_type() == diag_ir::declaration::Compu::CompuIdentity
+                && match field.placement() {
+                    Placement::Absolute => field.bit_offset() == offset,
+                    Placement::AfterPrevious => field.bit_offset() == 0,
+                    _ => false,
+                }
+        };
+        // Each record is the layout's size apart, so it may not be padded (0 is its extent).
+        let size = u32::from(code_bits) / 8 + u32::from(status_bits) / 8;
+        let unpadded = layout.is_some_and(|l| l.byte_size() == 0 || l.byte_size() == size);
+        unpadded
+            && matches!(&fields[..], [code, status]
+                if at(code, code_bits, 0) && at(status, status_bits, u32::from(code_bits)))
+    }
+
+    /// The position among the declared response's top-level fields of `key`, a name the
+    /// profile's `diag.read_dtc` map defines (ADR-314 item 4), or `None` after an error.
+    fn dtc_result_position(&mut self, key: &str, span: Span) -> Option<usize> {
+        let profile = self.requests.profile;
+        let map = profile.call(Intent::ReadDtc).and_then(|call| {
+            call.steps.iter().find_map(|step| match step.result {
+                ResultMap::ReadDtc { mask, dtcs, .. } => Some((mask, dtcs)),
+                _ => None,
+            })
+        });
+        let Some((mask, _)) = map else {
+            unreachable!("only a `diag.read_dtc` the profile defines is lowered")
+        };
+        match key {
+            "mask" => Some(usize::from(mask.0)),
+            "dtcs" => {
+                self.not_lowerable(
+                    span,
+                    "`dtcs` is a list of records, which a procedure cannot read yet; read `raw` \
+                     instead (3.4)",
+                );
+                None
+            }
+            _ => {
+                self.error(
+                    StarCode::NotInProfile,
+                    span,
+                    format!(
+                        "the result of `diag.read_dtc` has `mask` and `dtcs`, the names the {} \
+                         profile maps it to, not `{key}` (3.4, ADR-314)",
+                        profile.layer
+                    ),
+                );
+                None
+            }
+        }
+    }
+
     /// The one service of this variant that `diag.request(sid, params)` names, with the names of
     /// its request constants, or `None` when none or several match (csv-tables 5.3).
     fn select_request(
@@ -3318,8 +3677,9 @@ impl<'a> Lowerer<'a> {
         found
     }
 
-    /// The value of `arg`, an argument of `diag.{function}` that its instruction holds as a
-    /// fixed field: an `int` constant in `range` (subset 3.1), or `None` after an error.
+    /// The value of `arg`, an argument of `diag.{function}` that is fixed at ingestion, in its
+    /// instruction or in the request bytes built then: an `int` constant in `range` (subset
+    /// 3.1), or `None` after an error.
     fn constant_int(
         &mut self,
         id: Option<usize>,
@@ -3358,8 +3718,8 @@ impl<'a> Lowerer<'a> {
                     StarCode::NonConstantArgument,
                     arg.span,
                     format!(
-                        "`{what}` of `diag.{function}` must be known at ingestion: the \
-                         instruction holds it as a fixed field (3.1)"
+                        "`{what}` of `diag.{function}` must be known at ingestion: it is a \
+                         fixed field of the instruction or of the request built then (3.1)"
                     ),
                 );
                 None
@@ -3979,3 +4339,13 @@ fn fold_method(s: &str, method: &str, args: &[Const]) -> Result<Const, String> {
 #[cfg(test)]
 #[path = "lower_tests.rs"]
 mod tests;
+
+/// Whether `field` is a fixed-width `uint` of `bits` bits, a value sent or read as its own bits:
+/// most significant byte first, as the profiles' values are (ADR-314 item 2).
+fn is_fixed_uint(field: &diag_ir::declaration::Field<'_>, bits: u8) -> bool {
+    field.kind() == diag_ir::declaration::DataKind::Uint
+        && (bits <= 8 || field.byte_order() == diag_ir::declaration::ByteOrder::Big)
+        && field.length_kind() == LengthKind::Fixed
+        && field.bit_length() == u32::from(bits)
+        && field.shape_type() == diag_ir::declaration::Shape::NONE
+}

@@ -7,6 +7,8 @@ def main():
     session = diag.request(0x22, {"did": 0xF186})
     if session["fields"]["session"] == 3:
         diag.log(1, "extended session")
-    diag.request(0x19, {"sub": 0x02, "statusMask": 0x09})
+    dtcs = diag.read_dtc(0x09)
+    if dtcs["ok"] and dtcs["fields"]["mask"] == 0xFF:
+        diag.log(1, "all DTC status bits supported")
     diag.request(0x2E, {"did": 0xF190, "vin": "WVWZZZ1JZXW000001"})
     diag.log(1, "done")

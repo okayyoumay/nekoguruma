@@ -4,7 +4,7 @@ EcuDocumentT {
         "csv-starlark",
     ),
     source_digest: Some(
-        "fe237a596d7e4dce08ba2d2e8c6c5937d304e55ee42f7ddf3cb345956701be5a",
+        "fadc6b3ae863d3d9803d29085fa7a7b246ca82e7c9829b59490359dcf28ff7aa",
     ),
     variant: Some(
         EcuVariantT {
@@ -2147,10 +2147,10 @@ Program {
             service: 34,
         },
         StoreLocal(
-            0,
+            1,
         ),
         LoadLocal(
-            0,
+            1,
         ),
         DecodeField {
             service: 5,
@@ -2170,12 +2170,52 @@ Program {
         PushBytes(
             4,
         ),
-        ServiceRequest {
-            service: 25,
+        SendReceive {
+            service: 4,
         },
-        Pop,
+        StoreLocal(
+            0,
+        ),
+        LoadLocal(
+            0,
+        ),
+        PushI64(
+            0,
+        ),
+        PushI64(
+            1,
+        ),
+        Slice,
         PushBytes(
             5,
+        ),
+        CmpEq,
+        Not,
+        Dup,
+        JumpIfFalse(
+            34,
+        ),
+        Pop,
+        LoadLocal(
+            0,
+        ),
+        DecodeField {
+            service: 4,
+            field: 8,
+        },
+        PushI64(
+            255,
+        ),
+        CmpEq,
+        JumpIfFalse(
+            36,
+        ),
+        Log {
+            level: 1,
+            message: 6,
+        },
+        PushBytes(
+            7,
         ),
         ServiceRequest {
             service: 46,
@@ -2183,7 +2223,7 @@ Program {
         Pop,
         Log {
             level: 1,
-            message: 6,
+            message: 8,
         },
         Ret,
     ],
@@ -2218,8 +2258,43 @@ Program {
             110,
         ],
         [
+            25,
             2,
             9,
+        ],
+        [
+            127,
+        ],
+        [
+            97,
+            108,
+            108,
+            32,
+            68,
+            84,
+            67,
+            32,
+            115,
+            116,
+            97,
+            116,
+            117,
+            115,
+            32,
+            98,
+            105,
+            116,
+            115,
+            32,
+            115,
+            117,
+            112,
+            112,
+            111,
+            114,
+            116,
+            101,
+            100,
         ],
         [
             241,
@@ -2291,22 +2366,46 @@ Program {
             pc: 17,
             file: 0,
             line: 10,
-            column: 5,
+            column: 12,
         },
         SourceSpan {
             pc: 20,
             file: 0,
             line: 11,
-            column: 5,
+            column: 8,
         },
         SourceSpan {
-            pc: 23,
+            pc: 30,
+            file: 0,
+            line: 11,
+            column: 23,
+        },
+        SourceSpan {
+            pc: 34,
+            file: 0,
+            line: 11,
+            column: 8,
+        },
+        SourceSpan {
+            pc: 35,
             file: 0,
             line: 12,
+            column: 9,
+        },
+        SourceSpan {
+            pc: 36,
+            file: 0,
+            line: 13,
             column: 5,
         },
         SourceSpan {
-            pc: 24,
+            pc: 39,
+            file: 0,
+            line: 14,
+            column: 5,
+        },
+        SourceSpan {
+            pc: 40,
             file: 0,
             line: 4,
             column: 5,

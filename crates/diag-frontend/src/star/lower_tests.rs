@@ -930,11 +930,12 @@ fn a_protocol_neutral_call_needs_its_profile_to_define_it() {
             (StarCode::NotInProfile, 4)
         ]
     );
-    // UDS defines all three, which are not lowered yet.
+    // UDS defines all three. `diag.read_dtc` is lowered, and needs a declared DTC service,
+    // which this variant lacks; the others are not lowered yet.
     assert_eq!(
         codes_over(&crate::profile::UDS_PROFILE, source),
         [
-            (StarCode::NotLowerable, 2),
+            (StarCode::UnknownService, 2),
             (StarCode::NotLowerable, 3),
             (StarCode::NotLowerable, 4)
         ]

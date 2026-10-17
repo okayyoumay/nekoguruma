@@ -645,6 +645,8 @@ fn a_request_needs_its_arguments_at_ingestion() {
 struct Answering {
     responses: std::collections::VecDeque<Vec<u8>>,
     logged: Vec<String>,
+    /// Each generic send-receive's service and request.
+    sent: Vec<(u32, Vec<u8>)>,
 }
 
 impl diag_ir::DiagHost for Answering {
@@ -653,8 +655,9 @@ impl diag_ir::DiagHost for Answering {
     fn service_request(&mut self, _: u16, _: &[u8]) -> Result<Vec<u8>, NotSent> {
         self.responses.pop_front().ok_or(NotSent)
     }
-    fn send_receive(&mut self, _: u32, _: &[u8]) -> Result<Vec<u8>, NotSent> {
-        Err(NotSent)
+    fn send_receive(&mut self, service: u32, request: &[u8]) -> Result<Vec<u8>, NotSent> {
+        self.sent.push((service, request.to_vec()));
+        self.responses.pop_front().ok_or(NotSent)
     }
     fn read_dtc(&mut self, _: u8) -> Result<Vec<u8>, NotSent> {
         Err(NotSent)
@@ -697,6 +700,16 @@ fn answered_in(
     source: &str,
     responses: &[&[u8]],
 ) -> Result<Vec<String>, String> {
+    run_answered(files, source, responses).map(|host| host.logged)
+}
+
+/// Runs the first variant's program for `main.star` of `files` against `responses`: the host
+/// once the program finishes, or the VM error it stopped with.
+fn run_answered(
+    files: Vec<(String, Vec<u8>)>,
+    source: &str,
+    responses: &[&[u8]],
+) -> Result<Answering, String> {
     let converted = convert(with(files, "main.star", source));
     let document = load_ecu_document(&converted.documents[0].bytes).expect("the document loads");
     let bytes = document.procedure().expect("a program");
@@ -705,11 +718,12 @@ fn answered_in(
     let mut host = Answering {
         responses: responses.iter().map(|r| r.to_vec()).collect(),
         logged: Vec::new(),
+        sent: Vec::new(),
     };
     loop {
         match vm.step_with_declarations(&program, document.variant().as_ref(), &mut host) {
             Ok(diag_ir::StepOutcome::Continue) => {}
-            Ok(diag_ir::StepOutcome::Finished) => return Ok(host.logged),
+            Ok(diag_ir::StepOutcome::Finished) => return Ok(host),
             Ok(other) => panic!("{other:?}"),
             Err(e) => return Err(format!("{e:?}")),
         }
@@ -808,6 +822,7 @@ fn ok_and_nrc_follow_the_variant_s_declared_negative_shape() {
         let mut host = Answering {
             responses: [response.to_vec()].into(),
             logged: Vec::new(),
+            sent: Vec::new(),
         };
         loop {
             match vm.step_with_declarations(&program, Some(&variant), &mut host) {
@@ -820,6 +835,288 @@ fn ok_and_nrc_follow_the_variant_s_declared_negative_shape() {
     assert_eq!(run(&[0x7E, 0x31]), ["negative", "out of range"]);
     // UDS's form is not negative under this shape.
     assert_eq!(run(&[0x7F, 0x22, 0x31]), ["positive", "no nrc", "7F"]);
+}
+
+// ---------------------------------------------------------------- `diag.read_dtc` (ADR-309, ADR-314)
+
+const READ_DTCS: &str = "\
+def main():
+    res = diag.read_dtc(0x08)
+    if res[\"ok\"]:
+        diag.log(1, \"positive\")
+    if res[\"nrc\"] == 0x31:
+        diag.log(1, \"out of range\")
+    if res[\"ok\"] and res[\"fields\"][\"mask\"] == 0xFF:
+        diag.log(1, \"mask\")
+    if res[\"raw\"] == b\"\\x59\\x02\\xff\\x12\\x34\\x56\\x09\":
+        diag.log(1, \"one record\")
+";
+
+#[test]
+fn a_dtc_read_sends_the_profile_s_request_to_the_declared_service() {
+    // ReadDTCInformation by status mask, availability mask 0xFF, one DTC with its status.
+    let host = run_answered(
+        example(),
+        READ_DTCS,
+        &[&[0x59, 0x02, 0xFF, 0x12, 0x34, 0x56, 0x09]],
+    )
+    .unwrap();
+    assert_eq!(host.logged, ["positive", "mask", "one record"]);
+    // The UDS profile's request, SID first, to the variant's DTC read service.
+    let converted = convert(with(example(), "main.star", READ_DTCS));
+    let document = load_ecu_document(&converted.documents[0].bytes).expect("the document loads");
+    let expected = document
+        .variant()
+        .and_then(|v| v.services())
+        .and_then(|services| {
+            services
+                .iter()
+                .find(|s| s.short_name() == Some("readDtcByStatusMask"))
+        })
+        .expect("the example declares it")
+        .id();
+    assert_eq!(host.sent, [(expected, vec![0x19, 0x02, 0x08])]);
+    // A negative response reads through the declared shape.
+    assert_eq!(
+        answered(READ_DTCS, &[&[0x7F, 0x19, 0x31]]).unwrap(),
+        ["out of range"]
+    );
+}
+
+#[test]
+fn a_dtc_read_is_checked_at_ingestion() {
+    let codes = |source: &str| -> Vec<crate::star::StarCode> {
+        procedures(with(example(), "main.star", source))
+            .err()
+            .map_or_else(Vec::new, |rejected| {
+                rejected.errors.iter().map(|e| e.code).collect()
+            })
+    };
+    use crate::star::StarCode::*;
+    // The mask selects nothing, but it is sent in a fixed field: a constant in range.
+    assert_eq!(
+        codes("def f(m):\n    diag.read_dtc(m)\n\ndef main():\n    f(1)\n"),
+        [NonConstantArgument]
+    );
+    assert_eq!(
+        codes("def main():\n    diag.read_dtc(0x100)\n"),
+        [ArgumentOutOfRange]
+    );
+    // The result has the profile's names, not the declared ones.
+    assert_eq!(
+        codes("def main():\n    x = diag.read_dtc(8)[\"fields\"][\"availabilityMask\"]\n"),
+        [NotInProfile]
+    );
+    // `dtcs` is a list, which a procedure cannot read yet.
+    assert_eq!(
+        codes("def main():\n    x = diag.read_dtc(8)[\"fields\"][\"dtcs\"]\n"),
+        [NotLowerable]
+    );
+    // A DTC result and a `diag.request` response of the same service are read differently.
+    let mixed = "def main():\n    r = diag.read_dtc(8)\n    if r[\"ok\"]:\n        \
+                 r = diag.request(0x19, {\"sub\": 2, \"statusMask\": 8})\n    \
+                 x = r[\"fields\"][\"mask\"]\n";
+    assert_eq!(codes(mixed), [NotLowerable]);
+}
+
+#[test]
+fn a_dtc_read_selects_no_service_when_two_fit_the_profile() {
+    let file = |name: &str| -> String {
+        example()
+            .into_iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, c)| String::from_utf8(c).expect("UTF-8"))
+            .expect("a table")
+    };
+    // A second service with the same SID, constant and field widths, its fields named apart.
+    let services = format!("{}readDtcAgain,0x19\n", file("services.csv"));
+    let fields = format!(
+        "{}request:readDtcAgain,sub,0,,uint,8,,,,,,0x02,,,\n\
+         request:readDtcAgain,mask,1,,uint,8,,,,,,,,,\n\
+         response:readDtcAgain,sub,0,,uint,8,,,,,,0x02,,,\n\
+         response:readDtcAgain,mask,1,,uint,8,,,,,,,,,\n\
+         response:readDtcAgain,records,2,,,,,,,,,,repeat,dtcRecord,\n",
+        file("fields.csv")
+    );
+    let files = with(
+        with(
+            with(
+                with(example(), "services.csv", &services),
+                "fields.csv",
+                &fields,
+            ),
+            "repeats.csv",
+            &format!("{}response:readDtcAgain,records,end\n", file("repeats.csv")),
+        ),
+        "main.star",
+        "def main():\n    diag.read_dtc(8)\n",
+    );
+    let errors = procedures(files).expect_err("rejected").errors;
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(errors[0].code, crate::star::StarCode::UnknownService);
+    assert!(errors[0].hint.starts_with("2 services"), "{errors:?}");
+}
+
+#[test]
+fn a_dtc_read_needs_one_service_that_fits_the_profile() {
+    let fields = example()
+        .into_iter()
+        .find(|(n, _)| n == "fields.csv")
+        .map(|(_, c)| String::from_utf8(c).expect("UTF-8"))
+        .expect("fields.csv");
+    let read = "def main():\n    diag.read_dtc(8)\n";
+    let codes = |fields: String| -> Vec<(crate::star::StarCode, String)> {
+        let files = with(with(example(), "fields.csv", &fields), "main.star", read);
+        procedures(files).err().map_or_else(Vec::new, |rejected| {
+            rejected
+                .errors
+                .into_iter()
+                .map(|e| (e.code, e.hint))
+                .collect()
+        })
+    };
+    // A 16-bit mask field is not the profile's 8-bit one: no service matches.
+    let wide = fields.replace(
+        "request:readDtcByStatusMask,statusMask,1,,uint,8,",
+        "request:readDtcByStatusMask,statusMask,1,,uint,16,",
+    );
+    assert_ne!(wide, fields);
+    let found = codes(wide);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].0, crate::star::StarCode::UnknownService);
+    // A 16-bit sub-function constant is not the profile's 8-bit one, even with the same
+    // value, and the mask then starts a byte later.
+    let wide_sub = fields
+        .replace(
+            "request:readDtcByStatusMask,sub,0,,uint,8,",
+            "request:readDtcByStatusMask,sub,0,,uint,16,",
+        )
+        .replace(
+            "request:readDtcByStatusMask,statusMask,1,",
+            "request:readDtcByStatusMask,statusMask,2,",
+        );
+    let found = codes(wide_sub);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].0, crate::star::StarCode::UnknownService);
+    // A 16-bit availability mask is not the width of a DTC's status.
+    let wide_mask = fields
+        .replace(
+            "response:readDtcByStatusMask,availabilityMask,1,,uint,8,",
+            "response:readDtcByStatusMask,availabilityMask,1,,uint,16,",
+        )
+        .replace(
+            "response:readDtcByStatusMask,records,2,",
+            "response:readDtcByStatusMask,records,3,",
+        );
+    let found = codes(wide_mask);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].0, crate::star::StarCode::NotInProfile);
+    assert!(found[0].1.contains("availabilityMask"), "{found:?}");
+    // A little-endian code would read the profile's code byte-reversed.
+    let little: String = fields
+        .lines()
+        .enumerate()
+        .map(|(at, line)| {
+            let cell = match at {
+                0 => "byte_order",
+                _ if line.starts_with("layout:dtcRecord,dtc,") => "little",
+                _ => "",
+            };
+            format!("{line},{cell}\n")
+        })
+        .collect();
+    let found = codes(little);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].0, crate::star::StarCode::NotInProfile);
+    assert!(found[0].1.contains("records"), "{found:?}");
+    // Records whose code is 16 bits wide are not the profile's DTC records.
+    let wide_status = fields.replace(
+        "layout:dtcRecord,dtc,0,,uint,24,",
+        "layout:dtcRecord,dtc,0,,uint,16,",
+    );
+    assert_ne!(wide_status, fields);
+    let found = codes(wide_status);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].0, crate::star::StarCode::NotInProfile);
+    assert!(found[0].1.contains("records"), "{found:?}");
+    // A records field off a byte edge is rejected with the tables already (csv-tables 5.4).
+    let unaligned = fields.replace(
+        "response:readDtcByStatusMask,records,2,,",
+        "response:readDtcByStatusMask,records,2,1,",
+    );
+    assert_ne!(unaligned, fields);
+    let tables = crate::tables::read_files(with(example(), "fields.csv", &unaligned))
+        .and_then(crate::tables::resolve);
+    let errors = tables.expect_err("rejected by the tables").errors;
+    assert!(
+        errors.iter().any(|e| e.hint.contains("byte edge")),
+        "{errors:?}"
+    );
+    // Records one byte after the mask leave a byte the profile's response does not have.
+    let late = fields.replace(
+        "response:readDtcByStatusMask,records,2,",
+        "response:readDtcByStatusMask,records,3,",
+    );
+    assert_ne!(late, fields);
+    let found = codes(late);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].0, crate::star::StarCode::NotInProfile);
+    assert!(found[0].1.contains("`records` apart"), "{found:?}");
+    // Records run to the end of the message, so nothing may follow them. The row is appended
+    // to the table, whatever line ends the checkout gives it.
+    let trailing = format!(
+        "{}\nresponse:readDtcByStatusMask,trailer,,,uint,8,,,,,,,,,\n",
+        fields.trim_end()
+    );
+    assert_ne!(trailing, fields);
+    let found = codes(trailing);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].0, crate::star::StarCode::NotInProfile);
+    assert!(found[0].1.contains("after `records`"), "{found:?}");
+    // Records placed one after the other have the same layout, but padded ones do not.
+    let sequential = fields
+        .replace("layout:dtcRecord,dtc,0,,", "layout:dtcRecord,dtc,,,")
+        .replace("layout:dtcRecord,status,3,,", "layout:dtcRecord,status,,,");
+    assert_ne!(sequential, fields);
+    assert_eq!(codes(sequential), []);
+    let padded = with(
+        with(
+            example(),
+            "layouts.csv",
+            "name,byte_size\ndtcRecord,5\ndtcStatus,1\nwatchdogReset,0\n",
+        ),
+        "main.star",
+        read,
+    );
+    let errors = procedures(padded).expect_err("rejected").errors;
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(errors[0].code, crate::star::StarCode::NotInProfile);
+    // A BCD mask field would send the mask as decimal digits, and a BCD availability mask
+    // would read its bits as digits: neither is the profile's raw mask.
+    let bcd_request = fields.replace(
+        "request:readDtcByStatusMask,statusMask,1,,uint,8,",
+        "request:readDtcByStatusMask,statusMask,1,,bcd,8,",
+    );
+    let found = codes(bcd_request);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].0, crate::star::StarCode::UnknownService);
+    let bcd_response = fields.replace(
+        "response:readDtcByStatusMask,availabilityMask,1,,uint,8,",
+        "response:readDtcByStatusMask,availabilityMask,1,,bcd,8,",
+    );
+    let found = codes(bcd_response);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].0, crate::star::StarCode::NotInProfile);
+    // A response whose field at the mask's position is not an integer does not fit the map.
+    let bytes_mask = fields.replace(
+        "response:readDtcByStatusMask,availabilityMask,1,,uint,8,",
+        "response:readDtcByStatusMask,availabilityMask,1,,bytes,8,",
+    );
+    assert_ne!(bytes_mask, fields);
+    let found = codes(bytes_mask);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].0, crate::star::StarCode::NotInProfile);
+    assert!(found[0].1.contains("availabilityMask"), "{found:?}");
 }
 
 #[test]

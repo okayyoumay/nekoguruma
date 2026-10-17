@@ -72,6 +72,18 @@ const DEFAULT_MAX_ITERATIONS: u32 = 1000;
 /// The `Fail` code of a loop that runs past its limit (subset 4.2, ADR-280).
 const LOOP_LIMIT_EXCEEDED: &str = "LOOP_LIMIT_EXCEEDED";
 
+/// Where the profile's DTC records are and how each one is laid out (`Lowerer::dtc_layout`).
+#[derive(Debug, Clone, Copy)]
+struct DtcLayout {
+    /// The mask's position among the response's top-level fields.
+    mask: usize,
+    /// The records field's position among them.
+    position: usize,
+    code_bytes: u8,
+    status_bytes: u8,
+    record_bytes: u8,
+}
+
 const TOO_MUCH_UNROLLING: &str = "the procedure's constant loops unroll to more than 2^20 \
      iterations, statements and expressions in all (4.2)";
 
@@ -171,9 +183,14 @@ enum Ty {
     /// A response's `fields` (subset 3.4): the response bytes, read only by a literal field
     /// name, which decodes the field through the declaration part (ADR-316, ADR-320).
     Fields,
+    /// The `dtcs` of a `diag.read_dtc` result (subset 3.4, ADR-323): the response's DTC records
+    /// as bytes, read by `len` and by an `int` index.
+    DtcList,
+    /// One DTC record of a `DtcList`: its bytes, read by the literal keys `code` and `status`.
+    Dtc,
 }
 
-const TYS: [Ty; 7] = [
+const TYS: [Ty; 9] = [
     Ty::Int,
     Ty::Float,
     Ty::Bool,
@@ -181,10 +198,12 @@ const TYS: [Ty; 7] = [
     Ty::Str,
     Ty::Response,
     Ty::Fields,
+    Ty::DtcList,
+    Ty::Dtc,
 ];
 
 impl Ty {
-    fn bit(self) -> u8 {
+    fn bit(self) -> u16 {
         match self {
             Ty::Int => 1,
             Ty::Float => 2,
@@ -193,6 +212,8 @@ impl Ty {
             Ty::Str => 16,
             Ty::Response => 32,
             Ty::Fields => 64,
+            Ty::DtcList => 128,
+            Ty::Dtc => 256,
         }
     }
 
@@ -205,6 +226,8 @@ impl Ty {
             Ty::Str => "str",
             Ty::Response => "response",
             Ty::Fields => "response fields",
+            Ty::DtcList => "DTC records",
+            Ty::Dtc => "DTC record",
         }
     }
 }
@@ -214,7 +237,7 @@ impl Ty {
 /// which decides what a field name means (ADR-320).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 struct Tys {
-    bits: u8,
+    bits: u16,
     service: Service,
 }
 
@@ -1585,6 +1608,18 @@ impl<'a> Lowerer<'a> {
                             self.field_key(code, key, tys.service, span)
                         }
                     }
+                    Val::Run(tys, code) if tys.one() == Some(Ty::Dtc) => {
+                        let literal = matches!(&index.node, ExprP::Literal(AstLiteral::String(_)));
+                        let key = if literal {
+                            b
+                        } else {
+                            Val::Run(Tys::default(), Vec::new())
+                        };
+                        self.dtc_key(id, code, key, span)
+                    }
+                    Val::Run(tys, code) if tys.one() == Some(Ty::DtcList) => {
+                        self.dtc_at(id, code, b, span)
+                    }
                     a => self.index(a, b, span),
                 }
             }
@@ -1801,6 +1836,13 @@ impl<'a> Lowerer<'a> {
                 );
                 return None;
             }
+            Ty::DtcList | Ty::Dtc => {
+                self.not_lowerable(
+                    span,
+                    "the truth of DTC records is not lowered; test `len(dtcs)` instead (3.4)",
+                );
+                return None;
+            }
         };
         Some(ops.into_iter().map(|op| (Ins::Op(op), span)).collect())
     }
@@ -1995,15 +2037,16 @@ impl<'a> Lowerer<'a> {
         }
         if [&a, &b]
             .iter()
-            .any(|v| matches!(v, Val::Run(tys, _) if tys.has(Ty::Response) || tys.has(Ty::Fields)))
+            .any(|v| matches!(v, Val::Run(tys, _) if [Ty::Response, Ty::Fields, Ty::DtcList, Ty::Dtc].into_iter().any(|ty| tys.has(ty))))
         {
             // Starlark would compare the dict, which a procedure that left out `["raw"]` gets
             // wrong silently (ADR-317 item 3).
             self.not_lowerable(
                 span,
                 format!(
-                    "`{}` does not take a response: read it through its keys, such as \
-                     `res[\"raw\"]` (3.4)",
+                    "`{}` does not take a response, DTC records or a DTC record: read it \
+                     through its keys, such as `res[\"raw\"]` or `dtc[\"code\"]`, or count \
+                     the records with `len` (3.4)",
                     binop_symbol(op)
                 ),
             );
@@ -2487,6 +2530,9 @@ impl<'a> Lowerer<'a> {
             .services()
             .and_then(|services| services.iter().find(|s| s.id() == service))
             .and_then(|s| s.positive());
+        if profiled && &*key == "dtcs" {
+            return self.dtc_records(code, service, span);
+        }
         let field = if profiled {
             let Some(position) = self.dtc_result_position(&key, span) else {
                 return Val::Run(Tys::default(), Vec::new());
@@ -2536,6 +2582,196 @@ impl<'a> Lowerer<'a> {
             span,
         ));
         Val::Run(Tys::of(ty), code)
+    }
+
+    /// The layout of the DTC records the profile's `diag.read_dtc` reads (ADR-314 item 4):
+    /// each record's code and status widths, and its size in bytes.
+    fn dtc_layout(&self) -> DtcLayout {
+        let map = self
+            .requests
+            .profile
+            .call(Intent::ReadDtc)
+            .and_then(|call| {
+                call.steps.iter().find_map(|step| match step.result {
+                    ResultMap::ReadDtc {
+                        mask,
+                        dtcs,
+                        code_bits,
+                        status_bits,
+                    } => Some((mask, dtcs, code_bits, status_bits)),
+                    _ => None,
+                })
+            });
+        let Some((mask, dtcs, code_bits, status_bits)) = map else {
+            unreachable!("only a `diag.read_dtc` the profile defines is lowered")
+        };
+        // `Profile::validate` makes both widths whole bytes.
+        DtcLayout {
+            mask: usize::from(mask.0),
+            position: usize::from(dtcs.0),
+            code_bytes: code_bits / 8,
+            status_bytes: status_bits / 8,
+            record_bytes: code_bits / 8 + status_bits / 8,
+        }
+    }
+
+    /// `res["fields"]["dtcs"]` of a `diag.read_dtc` result from `service` (subset 3.4, ADR-323):
+    /// `code` pushes the response bytes. The records are the bytes from the records field's
+    /// position to the end of the message, which `dtc_response_fits` checked at ingestion to be
+    /// a repeat of whole, unpadded records. The mask is decoded first and dropped: decoding
+    /// checks the whole message against the declaration, so a negative response, one to another
+    /// service, or one whose last record is cut short stops the run as any field read does
+    /// (ADR-316). The records are then whole.
+    fn dtc_records(&mut self, code: Code, service: u32, span: Span) -> Val {
+        let layout = self.dtc_layout();
+        let positive = self
+            .variant
+            .services()
+            .and_then(|services| services.iter().find(|s| s.id() == service))
+            .and_then(|s| s.positive());
+        let fields: Vec<_> = positive
+            .and_then(|positive| positive.fields())
+            .into_iter()
+            .flatten()
+            .collect();
+        let prefix = positive.and_then(|p| p.prefix()).map_or(0, |p| p.len());
+        // The fields before the records follow each other from the end of the prefix, each of a
+        // fixed length (`dtc_response_fits`).
+        let start_bits = fields[..layout.position]
+            .iter()
+            .fold((1 + prefix as u64) * 8, |at, field| {
+                at + u64::from(field.bit_length())
+            });
+        let (Some(mask), true) = (fields.get(layout.mask), start_bits % 8 == 0) else {
+            self.not_lowerable(
+                span,
+                "the DTC records do not start on a byte boundary, so they cannot be read (3.4)",
+            );
+            return Val::Run(Tys::default(), Vec::new());
+        };
+        let start = i64::try_from(start_bits / 8).unwrap_or(i64::MAX);
+        let mask = mask.id();
+        let mut code = code;
+        code.extend(
+            [
+                Ins::Op(Op::Dup),
+                Ins::Op(Op::DecodeField {
+                    service,
+                    field: mask,
+                }),
+                Ins::Op(Op::Pop),
+                Ins::Op(Op::PushI64(start)),
+                Ins::Op(Op::PushI64(i64::MAX)),
+                Ins::Op(Op::Slice),
+            ]
+            .map(|ins| (ins, span)),
+        );
+        Val::Run(
+            Tys {
+                bits: Ty::DtcList.bit(),
+                service: Service::Dtcs(service),
+            },
+            code,
+        )
+    }
+
+    /// `dtcs[i]` (subset 3.4, ADR-323): `code` pushes the records; the record is the `i`-th
+    /// record's bytes. An index outside the records, a negative one included, stops the run as
+    /// an index out of range, as one into bytes does: the record's first byte is read before
+    /// it is sliced. The records are whole (`dtc_records`), so a record that starts inside them
+    /// ends inside them.
+    fn dtc_at(&mut self, id: Option<usize>, code: Code, index: Val, span: Span) -> Val {
+        let index = match self.single(index, span, "an index") {
+            Some((Ty::Int, index)) => index,
+            Some((other, _)) => {
+                self.not_lowerable(
+                    span,
+                    format!(
+                        "DTC records are indexed by an int, not {} (3.4)",
+                        other.name()
+                    ),
+                );
+                return Val::Run(Tys::default(), Vec::new());
+            }
+            None => return Val::Run(Tys::default(), Vec::new()),
+        };
+        let Some(id) = id else {
+            return Val::Run(Tys::default(), Vec::new());
+        };
+        let size = i64::from(self.dtc_layout().record_bytes);
+        let start = self.temp(id, span);
+        let mut code = code;
+        code.extend(index);
+        code.extend(
+            [
+                Op::PushI64(size),
+                Op::Mul,
+                Op::StoreLocal(start),
+                // `IndexGet` leaves the records below the byte, which only checks the start.
+                Op::LoadLocal(start),
+                Op::IndexGet,
+                Op::Pop,
+                Op::LoadLocal(start),
+                Op::Dup,
+                Op::PushI64(size),
+                Op::Add,
+                Op::Slice,
+            ]
+            .map(|op| (Ins::Op(op), span)),
+        );
+        Val::Run(Tys::of(Ty::Dtc), code)
+    }
+
+    /// `rec["code"]` or `rec["status"]` of a DTC record (subset 3.4, ADR-323): `code` pushes the
+    /// record's bytes, and the field is read as a big-endian `uint` of the profile's width.
+    fn dtc_key(&mut self, id: Option<usize>, code: Code, key: Val, span: Span) -> Val {
+        let Val::Const(Const::Str(key)) = key else {
+            self.error(
+                StarCode::DynamicKeyNotAllowed,
+                span,
+                "a DTC record is read with a string literal key (3.4, 4.1)",
+            );
+            return Val::Run(Tys::default(), Vec::new());
+        };
+        let layout = self.dtc_layout();
+        let (offset, bytes) = match &*key {
+            "code" => (0, layout.code_bytes),
+            "status" => (layout.code_bytes, layout.status_bytes),
+            other => {
+                self.error(
+                    StarCode::NotInProfile,
+                    span,
+                    format!("a DTC record has `code` and `status`, not `{other}` (3.4)"),
+                );
+                return Val::Run(Tys::default(), Vec::new());
+            }
+        };
+        let Some(id) = id else {
+            return Val::Run(Tys::default(), Vec::new());
+        };
+        let record = self.temp(id, span);
+        let mut code = code;
+        code.push((Ins::Op(Op::StoreLocal(record)), span));
+        code.push((Ins::Op(Op::PushI64(0)), span));
+        for byte in offset..offset + bytes {
+            code.extend(
+                [
+                    Op::PushI64(8),
+                    Op::Shl,
+                    Op::LoadLocal(record),
+                    Op::PushI64(i64::from(byte)),
+                    Op::IndexGet,
+                    Op::Swap,
+                    Op::Pop,
+                    Op::BitOr,
+                ]
+                .map(|op| (Ins::Op(op), span)),
+            );
+        }
+        // The slot would otherwise keep a copy of the record in the VM state until the function
+        // returns.
+        code.extend([Op::PushI64(0), Op::StoreLocal(record)].map(|op| (Ins::Op(op), span)));
+        Val::Run(Tys::of(Ty::Int), code)
     }
 
     /// The marker that starts a negative response, and the position of its code: those of the
@@ -2635,6 +2871,21 @@ impl<'a> Lowerer<'a> {
     /// number, through the IR's conversions. The others are not lowered yet.
     fn run_builtin(&mut self, name: &str, values: Vec<Val>, span: Span) -> Val {
         let failed = || Val::Run(Tys::default(), Vec::new());
+        if let ("len", [Val::Run(tys, _)]) = (name, values.as_slice())
+            && tys.one() == Some(Ty::DtcList)
+        {
+            let Some(Val::Run(_, mut code)) = values.into_iter().next() else {
+                unreachable!("matched above")
+            };
+            // The records are whole (`dtc_records`), so their number is their length over a
+            // record's size. `Length` leaves the bytes below the length.
+            let size = i64::from(self.dtc_layout().record_bytes);
+            code.extend(
+                [Op::Length, Op::Swap, Op::Pop, Op::PushI64(size), Op::Div]
+                    .map(|op| (Ins::Op(op), span)),
+            );
+            return Val::Run(Tys::of(Ty::Int), code);
+        }
         if let ("int" | "float", [_]) = (name, values.as_slice()) {
             let value = values.into_iter().next().expect("one argument");
             let Some((ty, mut code)) = self.single(value, span, &format!("`{name}`")) else {
@@ -3749,7 +4000,11 @@ impl<'a> Lowerer<'a> {
                 Some(_) => fields[..=usize::from(dtcs.0)]
                     .iter()
                     .scan(Some((1 + prefix as u32) * 8), |next, field| {
-                        let start = (*next)?;
+                        // A field after one whose length is not fixed has no known start, so
+                        // the records' start could not be counted (`dtc_records`).
+                        let Some(start) = *next else {
+                            return Some((field, false));
+                        };
                         let placed = match field.placement() {
                             diag_ir::declaration::Placement::Absolute => {
                                 field.bit_offset() == start
@@ -3847,14 +4102,7 @@ impl<'a> Lowerer<'a> {
         };
         match key {
             "mask" => Some(usize::from(mask.0)),
-            "dtcs" => {
-                self.not_lowerable(
-                    span,
-                    "`dtcs` is a list of records, which a procedure cannot read yet; read `raw` \
-                     instead (3.4)",
-                );
-                None
-            }
+            "dtcs" => unreachable!("`dtcs` is read by `dtc_records`"),
             _ => {
                 self.error(
                     StarCode::NotInProfile,

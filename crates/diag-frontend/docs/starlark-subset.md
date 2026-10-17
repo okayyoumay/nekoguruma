@@ -331,7 +331,7 @@ A dict with fixed keys:
 }
 ```
 
-The keys of `fields` are `Field.short_name` from the IR declaration part. Under ADR-309 the result of `diag.read_dtc`, `diag.routine` and `diag.security_access` instead uses the names the application-layer profile maps the response to (ADR-314): `diag.read_dtc` gives `mask` (the availability status mask, an `int`) and `dtcs` (a list of dicts with `code` and `status`, both `int`), whatever the layer; `diag.routine` gives the declared names of its last step's response, since routine results are routine-specific; `diag.security_access` gives no `fields`, and its `raw` is the key response. The profile maps a shared name to a position among the declared response's top-level fields, so a definition keeps its own names; reading `dtcs` waits on decoding lists of records, and is `STAR_NOT_LOWERABLE` until then, while another name is `STAR_NOT_IN_PROFILE`. A `diag.request` result keeps the declared names. They are defined on
+The keys of `fields` are `Field.short_name` from the IR declaration part. Under ADR-309 the result of `diag.read_dtc`, `diag.routine` and `diag.security_access` instead uses the names the application-layer profile maps the response to (ADR-314): `diag.read_dtc` gives `mask` (the availability status mask, an `int`) and `dtcs` (a list of dicts with `code` and `status`, both `int`), whatever the layer; `diag.routine` gives the declared names of its last step's response, since routine results are routine-specific; `diag.security_access` gives no `fields`, and its `raw` is the key response. The profile maps a shared name to a position among the declared response's top-level fields, so a definition keeps its own names; `dtcs` is read record by record (below), while another name is `STAR_NOT_IN_PROFILE`. A `diag.request` result keeps the declared names. They are defined on
 the CSV table side, so a `fields` key is checked against the declaration part at import time.
 Which declared service a `diag.request`, `diag.routine` or `diag.read_dtc` call means is found
 from its SID or routine identifier and the constant fields of the request (`csv-tables.md` 5.3).
@@ -366,6 +366,32 @@ numeric conversion; `str` for text; `bytes` for bytes. A name the response does 
   response whose fields are read is kept in a variable of its own.
 
 Reading a field of a negative response stops the run, so a procedure tests `res["ok"]` first.
+
+**DTC records (ADR-323).** `res["fields"]["dtcs"]` is the response's DTC records, kept as the
+bytes they are:
+
+```python
+res = diag.read_dtc(0x08)
+if res["ok"]:
+    dtcs = res["fields"]["dtcs"]
+    # @maxIterations 1023
+    for i in range(len(dtcs)):
+        dtc = dtcs[i]
+        if dtc["status"] & 0x08:
+            diag.log(1, "confirmed")
+```
+
+- Reading `dtcs` stops the run when the response is negative, answers another service, or ends
+  in a record cut short, as a field read does.
+- `len(dtcs)` is the number of records, and `dtcs[i]` the `i`-th one, by an `int`. An index
+  outside the records, a negative one included, stops the run.
+- A record has `code` and `status`, both `int`, read by those literal keys; another key is
+  `STAR_NOT_IN_PROFILE`.
+- These are `STAR_NOT_LOWERABLE`: `for d in dtcs` (loop over `range(len(dtcs))` instead), the
+  truth value of the records or a record, and a comparison of either.
+- Each `res["fields"]["dtcs"]` decodes the response again, so store the records once before a
+  loop rather than reading them in it. The loop limit in the example allows 1023 records, the
+  most a 4095-byte response holds.
 
 ---
 

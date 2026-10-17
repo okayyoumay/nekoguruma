@@ -10,6 +10,9 @@ def main():
     dtcs = diag.read_dtc(0x09)
     if dtcs["ok"] and dtcs["fields"]["mask"] == 0xFF:
         diag.log(1, "all DTC status bits supported")
+        records = dtcs["fields"]["dtcs"]
+        if len(records) == 2 and records[1]["code"] == 0xC0FFEE and records[1]["status"] == 0x28:
+            diag.log(1, "two DTCs")
     check = diag.routine(0xFF01, 0x01, {})
     if check["ok"] and check["fields"]["result"] == 0:
         diag.log(1, "programming dependencies correct")

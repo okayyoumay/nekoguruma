@@ -76,7 +76,10 @@ shape survives inside the second as the access program of item 5.
    the reprogramming target (item 9). `Program::validate`, which every load runs, refuses flash
    plans on two targets, a hardware identity off the reprogramming target, a download service
    addressed to any other target, and any instruction between a plan's erase and its
-   post-transfer end that addresses another target.
+   post-transfer end that addresses another target. When the reprogramming target is an access
+   target, it also refuses a VIN source or a precondition source on a target behind it
+   (item 13), since a restart inside its plan reads them before the plan's replay has
+   made that target reachable again.
 5. **Access programs.** A target whose session and unlock other targets depend on (a gateway)
    can be declared an access target, with an access program: steps that only change that
    target's session and security state and read from it (session control to the default or an
@@ -127,16 +130,24 @@ shape survives inside the second as the access program of item 5.
    targets' declarations, refuses flash plans on more than one target, and refuses an access
    program with any service item 5 does not allow. The agent identifies each target's variant as
    the primary's is identified (8.9.1, ADR-315), through those declaration-only documents, and
-   the combination its variants pick is the program that runs. A writing job creates its journal
+   the combination its variants pick is the program that runs. Whether the job writes, which
+   policy class applies and whether it takes the reprogramming slot are fixed before anything is
+   sent from every combination the job holds: the job is a writing job when any of them writes,
+   takes the reprogramming slot when any of them has a flash plan, and is held to the policy
+   class that covers all of them, so the chosen combination never needs a guard the job lacks.
+   A writing job creates its journal
    before anything is sent, as now (ADR-252, ADR-293), and commits a combination record holding
    the chosen document's hash after identification and before the chosen program's first
    instruction. A restart of a journal with that record uses that document (amending ADR-318
    item 4's journal that records no document; the caller still supplies the documents) and,
    once the VIN matches and the per-vehicle lock is held, identifies every target again; a
    variant that differs from the recorded combination ends the restart in on-site intervention.
-   The one exception is the reprogramming target while the journal is inside its flash plan:
-   its ECU may answer only from its bootloader, so it is not identified again here, and
-   ADR-229's hardware identity and state checks validate it instead.
+   The one exception is the time the journal is inside the reprogramming target's flash plan:
+   that ECU may answer only from its bootloader, so it is not identified again here, and
+   ADR-229's hardware identity and state checks validate it instead; when it is an access
+   target, the targets behind it (item 13) are not reachable either, and are identified again,
+   against the same recorded combination, once the access programs have run again after the
+   plan's post-transfer end.
    A journal without the record holds no step of the program, since only access programs and
    identification reads ran, so its job starts again as a first run does. The host and the
    restart carry these documents in place of the single one (amending ADR-318 item 3).
@@ -191,15 +202,17 @@ shape survives inside the second as the access program of item 5.
     target is itself an access target (a gateway being reprogrammed), its keep-alive is watched
     only until its flash plan's entry and stops there, since the erase, the reset and the restart
     of the ECU silence it; the plan's own steps handle that ECU from then on. After the plan's
-    post-transfer end the agent runs that target's access program again, then the access programs
-    of every access target declared after it, in declaration order, keeping each alive again,
-    before any later instruction addresses another target; those later access targets may sit
-    behind it, so their keep-alive is not watched while the plan runs either. While the job is
-    inside that plan (from its entry to its post-transfer end, by the VM state or the journal),
-    the runs of item 5 after a restart or a reopening of the links skip that target's access
-    program, whose ECU may answer only from its bootloader, and the access programs of every
-    access target declared after it, and leave that target to ADR-229's restart order and the
-    plan's replay; the access targets declared before it still run. The restart's
+    post-transfer end the agent runs that target's access program again, then those of the
+    access targets behind it, in declaration order, keeping each alive again, before any later
+    instruction addresses another target. The targets behind it are every other target except the
+    access targets declared before it: any of them may be reached through it, so their keep-alive
+    is not watched while the plan runs either. While the job is inside that plan (from its entry
+    to its post-transfer end, by the VM state or the journal), the runs of item 5 after a restart
+    or a reopening of the links skip that target's access program, whose ECU may answer only from
+    its bootloader, and the access programs of the access targets behind it, and leave that target
+    to ADR-229's restart order and the plan's replay; the access targets declared before it still
+    run, and item 7's re-identification of the targets behind it waits for the post-transfer end.
+    The restart's
     teardown (ADR-264) likewise stops the reprogramming target's keep-alive before the ECUReset or
     the passive wait, and keeps the other access targets alive.
 
@@ -220,5 +233,8 @@ shape survives inside the second as the access program of item 5.
 - Other targets' state after a crash (communication disabled, DTC recording off) returns to
   normal when their sessions time out; the restart's wait covers only the reprogramming target's
   session, so a procedure that changes another target's state must restore it explicitly.
+- A gateway can be reprogrammed only when the VIN, its hardware identity and the safety
+  preconditions can be read from it or from the access targets declared before it (item 4); a
+  procedure that needs a precondition from an ECU behind the gateway it reprograms is refused.
 - Whether to keep a single target's own session alive the same way, and with which loss rule,
   is the open TesterPresent decision for ordinary jobs; item 11 gives it the mechanism.

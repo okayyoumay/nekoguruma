@@ -170,7 +170,10 @@ shape survives inside the second as the access program of item 5.
    link to each target, all on the job's VCI, under the job's per-VCI lock and, for a writing
    job, the reprogramming slot (8.8, ADR-257); the per-vehicle lock is still taken when the VIN
    first matches. Targets on buses the VCI cannot open at the same time are refused before
-   anything is sent.
+   anything is sent. Since the link is opened before the variant is identified, the conversion
+   and `check_job` refuse a target whose candidate variants differ in the link settings
+   (protocol, identifiers, addressing, bus parameters); probing a variant over its own link is
+   not part of this decision.
 9. **At most one target is reprogrammed.** A job's flash sessions and recovery plans all belong
    to one target, the reprogramming target, whose identity the journal records and the restart
    checks (ADR-229). Other targets may receive any request the job's policy allows (security

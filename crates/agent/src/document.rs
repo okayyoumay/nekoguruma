@@ -108,6 +108,7 @@ pub(crate) mod tests {
         let mut variant = EcuVariantT::default();
         variant.id = 1;
         variant.short_name = Some("v".into());
+        variant.protocols = Some(vec![uds_on_can()]);
         variant.services = Some(vec![service]);
         let mut document = EcuDocumentT::default();
         document.schema_version = IR_SCHEMA_VERSION;
@@ -116,6 +117,18 @@ pub(crate) mod tests {
         document.variant = Some(Box::new(variant));
         document.procedure = procedure;
         encode_ecu_document(&document)
+    }
+
+    /// The protocol of the test documents: UDS over ISO 15765 as `LinkConfig::iso15765(0x7E0,
+    /// 0x7E8)` opens it, so a document job runs on the link the runner tests give (ADR-324).
+    pub(crate) fn uds_on_can() -> diag_ir::declaration::ProtocolT {
+        let mut protocol = diag_ir::declaration::ProtocolT::default();
+        protocol.short_name = Some("ISO15765".into());
+        protocol.application_layer = Some("UDS".into());
+        protocol.baud_rate = 500_000;
+        protocol.tx_id = 0x7E0;
+        protocol.rx_id = 0x7E8;
+        protocol
     }
 
     fn program() -> Program {

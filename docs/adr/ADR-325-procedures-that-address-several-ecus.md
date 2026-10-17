@@ -87,9 +87,12 @@ shape survives inside the second as the access program of item 5.
    can be declared an access target, with an access program: steps that only change that
    target's session and security state and read from it (session control to the default or an
    extended session only, security access, reads). The declaration also gives the target's
-   session timeout and tester-present period (item 11); the conversion and `check_job` refuse a
-   period that is not positive or is more than a third of the session timeout, so that one lost
-   tester-present still leaves a full period of margin before the session can lapse (item 12). Several access targets (a gateway behind
+   session timeout, tester-present period and tester-present response window (item 11); the
+   conversion and `check_job` refuse a period or a response window that is not positive, a
+   period of more than a third of the session timeout, and a response window that with the
+   agent's event-delivery allowance (item 12) exceeds a third of it, so that a healthy target is
+   always confirmed before it would be counted lost and one lost tester-present still leaves a
+   full period of margin before the session can lapse (item 12). Several access targets (a gateway behind
    a gateway) run their access programs in declaration order. The access program is lowered on
    its own, once per variant of the access target, and travels with the job; the conversion and
    `check_job` refuse any other service in it. No access program runs before the job holds the
@@ -199,7 +202,8 @@ shape survives inside the second as the access program of item 5.
     channel is quiet, which traffic to another target on the same channel would starve), a
     TesterPresent message the agent builds itself with the suppress-positive-response bit clear,
     and the expected positive and negative responses set, so that the module reports an answer
-    that stops coming. The worker sends it while the VM runs and while it waits on the server, an
+    that stops coming, with the response window the target's declaration gives as the time the
+    module waits for that answer. The worker sends it while the VM runs and while it waits on the server, an
     HMI response or a `Wait`, at the period the target's declaration gives; it starts after
     communication is started on that link. Because the
     agent fixes the message, the procedure cannot send anything through the keep-alive. The same
@@ -207,9 +211,11 @@ shape survives inside the second as the access program of item 5.
 12. **A lost access target ends the job by the section rules.** The worker reports a failed
     tester-present as the tester-present error event of ISO 22900-2 (2022) Annex D, which the
     J2534 worker does not produce yet; the module discards the expected answers, so the agent sees
-    only these events. The agent counts as an access target's last good answer the end of its
-    access program and then every tester-present period that passes without an error event. It
-    counts the target as lost once that last good answer is older than the declared session
+    only these events, and silence is evidence only once the answer could no longer arrive. So
+    the agent counts as an access target's last good answer the end of its access program, and
+    then the sending time of each TesterPresent whose response window, plus the agent's own fixed
+    allowance for delivering the worker's events, has passed without an error event for it; a
+    TesterPresent still inside that time counts for nothing yet. It counts the target as lost once that last good answer is older than the declared session
     timeout less one tester-present period, the latest point at which the session is still
     certainly held, and latches the loss: a later quiet period does not restore the target,
     since the ECU may have relocked meanwhile and a TesterPresent is answered in the default
@@ -224,11 +230,9 @@ shape survives inside the second as the access program of item 5.
     erase may have left the ECU without a valid application. The agent does not run the
     access program again by itself. A request to any target that gets no answer is held rather
     than handled at once, since the gateway it passed may be failing before any error event has
-    arrived: the agent waits until one tester-present period of every access target has passed
-    after the failure. When every access target's last good answer is then newer than the
-    failure, the failure is handled as any failed request is; otherwise the agent keeps holding
-    until each such target has a newer good answer, with the same outcome, or is counted lost,
-    which bounds the wait by the session timeout and puts the outcome above in its place, except
+    arrived: the agent holds it until every access target has a last good answer sent after the
+    failure, and then handles the failure as any failed request is, or until one of them is
+    counted lost, which bounds the wait by the session timeout and puts the outcome above in its place, except
     that inside an uninterruptible section the job ends in on-site intervention, since the held
     request has no answer that would let the section continue to its end; so a
     request that times out first cannot turn a lost gateway into an ordinary interrupted step

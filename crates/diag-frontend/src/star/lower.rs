@@ -3331,9 +3331,10 @@ impl<'a> Lowerer<'a> {
 
     /// The one declared service of this variant that a profile's request template selects
     /// (ADR-314 item 2), with the complete request bytes, its SID first: the template's
-    /// constants and selecting arguments must equal the declared request's constants in order,
-    /// and its other arguments fill the declared request's fields in order, each of the
-    /// template's width. `args` gives the call's argument values. `None` after an error.
+    /// constants and selecting arguments, encoded at their widths, must be the declared
+    /// request's prefix byte for byte, and its other arguments fill the declared request's
+    /// fields in order, each a fixed integer of the template's width. `args` gives the call's
+    /// argument values. `None` after an error.
     fn select_template(
         &mut self,
         template: &crate::profile::Request,
@@ -3360,34 +3361,45 @@ impl<'a> Lowerer<'a> {
                 continue;
             };
             let fields: Vec<_> = request.params().into_iter().flatten().collect();
-            let (mut constants, mut fields_at) = (indexed.constants.iter(), fields.iter());
+            let mut fields_at = fields.iter();
+            // The constants lead the request (csv-tables 5.3), so they are its prefix.
+            let mut prefix = Vec::new();
             let mut values = HashMap::new();
-            let fits = template.parts.iter().all(|part| match *part {
-                Part::Const { value: expected, .. } => {
-                    matches!(constants.next(), Some((_, RequestConstant::Uint(c))) if *c == expected)
-                }
-                Part::Select { arg, .. } => {
-                    matches!(constants.next(), Some((_, RequestConstant::Uint(c))) if *c == value(arg))
-                }
-                Part::Arg { bits, arg } => fields_at.next().is_some_and(|field| {
-                    let fits = field.length_kind() == LengthKind::Fixed
-                        && field.bit_length() == u32::from(bits)
-                        && matches!(
-                            diag_ir::decode::scalar_kind(field),
-                            Ok(diag_ir::decode::ScalarKind::Integer)
-                        );
-                    if fits {
-                        let name = field.short_name().unwrap_or_default();
-                        // At most 64 bits wide (`Profile::validate`), so it fits an `i64`
-                        // read as the field's own bits.
-                        values.insert(name, ParamValue::Int(value(arg) as i64));
+            let fits = template.parts.iter().all(|part| {
+                let (bits, constant) = match *part {
+                    Part::Const { bits, value } => (bits, value),
+                    Part::Select { bits, arg } => (bits, value(arg)),
+                    _ => (0, 0),
+                };
+                match *part {
+                    // A constant after a field cannot be part of the prefix.
+                    Part::Const { .. } | Part::Select { .. } if values.is_empty() => {
+                        let width = usize::from(bits / 8);
+                        prefix.extend_from_slice(&constant.to_be_bytes()[8 - width..]);
+                        true
                     }
-                    fits
-                }),
-                // No call that is lowered through a template yet takes `params`.
-                Part::Params => false,
+                    Part::Const { .. } | Part::Select { .. } => false,
+                    Part::Arg { bits, arg } => fields_at.next().is_some_and(|field| {
+                        let fits = field.length_kind() == LengthKind::Fixed
+                            && field.bit_length() == u32::from(bits)
+                            && matches!(
+                                diag_ir::decode::scalar_kind(field),
+                                Ok(diag_ir::decode::ScalarKind::Integer)
+                            );
+                        if fits {
+                            let name = field.short_name().unwrap_or_default();
+                            // At most 64 bits wide (`Profile::validate`), so it fits an `i64`
+                            // read as the field's own bits.
+                            values.insert(name, ParamValue::Int(value(arg) as i64));
+                        }
+                        fits
+                    }),
+                    // No call that is lowered through a template yet takes `params`.
+                    Part::Params => false,
+                }
             });
-            if fits && constants.next().is_none() && fields_at.next().is_none() {
+            let declared_prefix = request.prefix().map(|p| p.bytes()).unwrap_or_default();
+            if fits && declared_prefix == &prefix[..] && fields_at.next().is_none() {
                 found.push((indexed.service_id, request, values));
             }
         }
@@ -3420,10 +3432,16 @@ impl<'a> Lowerer<'a> {
     }
 
     /// Whether the declared positive response of `service` fits the profile's `diag.read_dtc`
-    /// map (ADR-314 item 3): an integer field at the mask's position, and a field at the
-    /// records' position. Reports the field that does not.
+    /// map (ADR-314 item 3): an integer field as wide as a DTC's status at the mask's position,
+    /// and a field at the records' position. Reports the field that does not.
     fn dtc_response_fits(&mut self, service: u32, map: ResultMap, span: Span) -> bool {
-        let ResultMap::ReadDtc { mask, dtcs, .. } = map else {
+        let ResultMap::ReadDtc {
+            mask,
+            dtcs,
+            status_bits,
+            ..
+        } = map
+        else {
             unreachable!("`Profile::validate` gives `diag.read_dtc` its DTC map")
         };
         let fields: Vec<_> = self
@@ -3439,14 +3457,16 @@ impl<'a> Lowerer<'a> {
         let mask_field = fields.get(usize::from(mask.0));
         let problem = match mask_field {
             None => Some(format!("has no field at the mask's position {}", mask.0)),
+            // The availability mask is a status mask, as wide as each DTC's status.
             Some(field)
                 if !matches!(
                     diag_ir::decode::scalar_kind(field),
                     Ok(diag_ir::decode::ScalarKind::Integer)
-                ) =>
+                ) || field.length_kind() != LengthKind::Fixed
+                    || field.bit_length() != u32::from(status_bits) =>
             {
                 Some(format!(
-                    "has `{}`, which is not an integer, at the mask's position",
+                    "has `{}`, which is not a {status_bits}-bit integer, at the mask's position",
                     field.short_name().unwrap_or_default()
                 ))
             }

@@ -72,7 +72,8 @@ fn check(name: &str, actual: &str) {
 
 /// A host that records each request and answers with the first response in `responses.txt`
 /// that starts with the positive response SID and the request's first two bytes, or with just
-/// those bytes, enough for the program to go on.
+/// those bytes, enough for the program to go on. A generic send-receive's request starts with
+/// its SID, so it is matched on the positive response SID and the one byte after the SID.
 struct Recording {
     out: String,
     answers: Vec<Vec<u8>>,
@@ -109,8 +110,17 @@ impl DiagHost for Recording {
             .cloned()
             .unwrap_or(response))
     }
-    fn send_receive(&mut self, _: u32, _: &[u8]) -> Result<Vec<u8>, NotSent> {
-        Err(NotSent)
+    fn send_receive(&mut self, service: u32, request: &[u8]) -> Result<Vec<u8>, NotSent> {
+        writeln!(self.out, "send-receive {service} {}", hex(request)).expect("a String");
+        let (&sid, rest) = request.split_first().ok_or(NotSent)?;
+        let mut response = vec![sid + 0x40];
+        response.extend(rest.iter().take(1));
+        Ok(self
+            .answers
+            .iter()
+            .find(|answer| answer.starts_with(&response))
+            .cloned()
+            .unwrap_or(response))
     }
     fn read_dtc(&mut self, _: u8) -> Result<Vec<u8>, NotSent> {
         Err(NotSent)

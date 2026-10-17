@@ -946,6 +946,34 @@ fn a_dtc_read_needs_one_service_that_fits_the_profile() {
     let found = codes(wide);
     assert_eq!(found.len(), 1, "{found:?}");
     assert_eq!(found[0].0, crate::star::StarCode::UnknownService);
+    // A 16-bit sub-function constant is not the profile's 8-bit one, even with the same
+    // value, and the mask then starts a byte later.
+    let wide_sub = fields
+        .replace(
+            "request:readDtcByStatusMask,sub,0,,uint,8,",
+            "request:readDtcByStatusMask,sub,0,,uint,16,",
+        )
+        .replace(
+            "request:readDtcByStatusMask,statusMask,1,",
+            "request:readDtcByStatusMask,statusMask,2,",
+        );
+    let found = codes(wide_sub);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].0, crate::star::StarCode::UnknownService);
+    // A 16-bit availability mask is not the width of a DTC's status.
+    let wide_mask = fields
+        .replace(
+            "response:readDtcByStatusMask,availabilityMask,1,,uint,8,",
+            "response:readDtcByStatusMask,availabilityMask,1,,uint,16,",
+        )
+        .replace(
+            "response:readDtcByStatusMask,records,2,",
+            "response:readDtcByStatusMask,records,3,",
+        );
+    let found = codes(wide_mask);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].0, crate::star::StarCode::NotInProfile);
+    assert!(found[0].1.contains("availabilityMask"), "{found:?}");
     // A response whose field at the mask's position is not an integer does not fit the map.
     let bytes_mask = fields.replace(
         "response:readDtcByStatusMask,availabilityMask,1,,uint,8,",

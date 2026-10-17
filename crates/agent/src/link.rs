@@ -91,8 +91,13 @@ impl LinkConfig {
             params: Vec::new(),
             ..Self::iso15765(protocol.tx_id(), protocol.rx_id())
         };
+        let mut seen: Vec<&str> = Vec::new();
         for param in protocol.params().into_iter().flatten() {
             let name = param.short_name().unwrap_or_default();
+            if seen.contains(&name) {
+                return Err(refuse(format!("ComParam {name} is declared twice")));
+            }
+            seen.push(name);
             let value = u32::try_from(param.value()).map_err(|_| {
                 refuse(format!(
                     "ComParam {name} is {}, not a 32-bit unsigned value",
@@ -107,9 +112,6 @@ impl LinkConfig {
             };
             match timing {
                 Some(ms) => *ms = value.div_ceil(1_000),
-                None if config.params.iter().any(|(set, _)| set == name) => {
-                    return Err(refuse(format!("ComParam {name} is declared twice")));
-                }
                 None => config.params.push((name.to_owned(), value)),
             }
         }
@@ -714,6 +716,7 @@ mod tests {
             vec![protocol(&[("CP_RC78Handling", 0)])],
             vec![protocol(&[("CP_StMin", -1)])],
             vec![protocol(&[("CP_StMin", 0), ("CP_StMin", 1)])],
+            vec![protocol(&[("CP_P2Max", 50_000), ("CP_P2Max", 60_000)])],
         ] {
             let error = declared(protocols.clone()).expect_err("refused");
             assert!(

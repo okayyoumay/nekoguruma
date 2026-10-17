@@ -617,6 +617,12 @@ async fn run_program_within(
     if job.writes() && !holds_slot {
         return Err(JobError::NoReprogrammingSlot);
     }
+    // A document's job opens the link its variant declares, whoever built `config` (ADR-324).
+    if job.document.is_some() && job.declared_link().map_err(JobError::Link)? != *config {
+        return Err(JobError::Link(HostError::DeclaredLink(
+            "the link given is not the one the document declares".to_owned(),
+        )));
+    }
     let Job { program, document } = job;
     let config = config.clone();
 
@@ -1608,16 +1614,15 @@ mod tests {
             bare.declared_link(),
             Err(HostError::DeclaredLink(_))
         ));
-        // The document's protocol is UDS over ISO 15765, but declares no baud rate.
         let job = Job::from_document(crate::send_receive::tests::document_with(
             vec![Some(crate::send_receive::tests::uds_shape())],
             Some(&program(Vec::new())),
         ))
         .expect("the document carries its procedure");
-        assert!(matches!(
-            job.declared_link(),
-            Err(HostError::DeclaredLink(error)) if error.contains("baud rate")
-        ));
+        assert_eq!(
+            job.declared_link().expect("the document declares its link"),
+            LinkConfig::iso15765(0x7E0, 0x7E8)
+        );
     }
 
     fn run(code: Vec<Op>, max_steps: u64, host: &mut FakeHost) -> Result<VmState, JobError> {
@@ -10925,6 +10930,74 @@ mod tests {
             channel,
             worker_host::client::BearerAuth::new([0; 32], "test"),
         )
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_document_job_runs_only_on_the_link_it_declares() {
+        let job = || {
+            Job::from_document(crate::send_receive::tests::document_with(
+                vec![Some(crate::send_receive::tests::uds_shape())],
+                Some(&program(two_requests()[..2].to_vec())),
+            ))
+            .expect("the document carries its procedure")
+        };
+        let other = LinkConfig::iso15765(0x7E0, 0x7E9);
+        for entry in ["run", "journaled", "resume"] {
+            // Refused before the journal is touched, so the directory is never created.
+            let journal =
+                || file_setup(&std::env::temp_dir().join("ngr-runner-declared-link-never-created"));
+            let (result, _guards) = match entry {
+                "run" => {
+                    run_program(
+                        unreachable_client(),
+                        &other,
+                        job(),
+                        JobLimits::default(),
+                        vci_only_guards("declared-run"),
+                    )
+                    .await
+                }
+                "journaled" => {
+                    run_program_journaled(
+                        unreachable_client(),
+                        &other,
+                        job(),
+                        JobLimits::default(),
+                        journal(),
+                        vci_only_guards("declared-journaled"),
+                    )
+                    .await
+                }
+                _ => {
+                    resume_program_journaled(
+                        unreachable_client(),
+                        &other,
+                        job(),
+                        JobLimits::default(),
+                        journal(),
+                        vci_only_guards("declared-resume"),
+                    )
+                    .await
+                }
+            };
+            assert!(
+                matches!(result, Err(JobError::Link(HostError::DeclaredLink(_)))),
+                "{entry}: {result:?}"
+            );
+        }
+        // On the declared link the same job reaches the worker.
+        let (result, _guards) = run_program(
+            unreachable_client(),
+            &LinkConfig::iso15765(0x7E0, 0x7E8),
+            job(),
+            JobLimits::default(),
+            vci_only_guards("declared-same"),
+        )
+        .await;
+        assert!(
+            matches!(&result, Err(JobError::Link(error)) if !matches!(error, HostError::DeclaredLink(_))),
+            "{result:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

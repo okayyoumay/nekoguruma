@@ -3,7 +3,7 @@
 **Date:** 2026-10-17
 **Status:** Accepted
 **Affects:** `agent` (`src/link.rs`: `LinkConfig::declared`, `LinkConfig::params`,
-`set_up_link`; `src/runner.rs`: `Job::declared_link`; `src/main.rs`: `--tx-id` / `--rx-id`),
+`set_up_link`; `src/runner.rs`: `Job::declared_link` and the runner's entry points; `src/main.rs`: `--tx-id` / `--rx-id`),
 `j2534-0404-service` (`tests/agent_end_to_end.rs`), `crates/agent/docs/ngr-agent.md`,
 `crates/diag-frontend/docs/csv-tables.md` 4.3, design 8.2.4; ADR-235 item 4, ADR-309, ADR-319
 
@@ -34,7 +34,10 @@ Open points the declaration does not settle by itself:
 1. **A document's job opens the link its variant declares** (`LinkConfig::declared`,
    `Job::declared_link`). The variant must declare exactly one protocol. With none, the job
    has no link. With several, choosing one would need a rule no definition gives yet. Both are
-   refused before a worker starts. `ngr-agent run --document` takes its link this way, and
+   refused before a worker starts. Every runner entry point (`run_program`,
+   `run_program_journaled`, `resume_program_journaled`) refuses a document's job whose given
+   link is not the declared one, so a library caller cannot open another link for it either.
+   `ngr-agent run --document` takes its link this way, and
    refuses `--tx-id` and `--rx-id`. A program without a document declares no link, so
    `--program` keeps the hand-built link until bare programs are retired.
 2. **UDS on CAN, by either naming.** The protocol is accepted as UDS on CAN when its application

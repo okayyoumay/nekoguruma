@@ -3332,8 +3332,9 @@ impl<'a> Lowerer<'a> {
     /// The one declared service of this variant that a profile's request template selects
     /// (ADR-314 item 2), with the complete request bytes, its SID first: the template's
     /// constants and selecting arguments, encoded at their widths, must be the declared
-    /// request's prefix byte for byte, and its other arguments fill the declared request's
-    /// fields in order, each a fixed integer of the template's width. `args` gives the call's
+    /// request's prefix byte for byte, its other arguments fill the declared request's fields in
+    /// order, each a fixed `uint` of the template's width with no conversion, and the request
+    /// must encode to exactly the bytes the template stands for. `args` gives the call's
     /// argument values. `None` after an error.
     fn select_template(
         &mut self,
@@ -3364,6 +3365,8 @@ impl<'a> Lowerer<'a> {
             let mut fields_at = fields.iter();
             // The constants lead the request (csv-tables 5.3), so they are its prefix.
             let mut prefix = Vec::new();
+            // The operand the template stands for: the prefix, then each argument at its width.
+            let mut expected = Vec::new();
             let mut values = HashMap::new();
             let fits = template.parts.iter().all(|part| {
                 let (bits, constant) = match *part {
@@ -3376,6 +3379,7 @@ impl<'a> Lowerer<'a> {
                     Part::Const { .. } | Part::Select { .. } if values.is_empty() => {
                         let width = usize::from(bits / 8);
                         prefix.extend_from_slice(&constant.to_be_bytes()[8 - width..]);
+                        expected.extend_from_slice(&constant.to_be_bytes()[8 - width..]);
                         true
                     }
                     Part::Const { .. } | Part::Select { .. } => false,
@@ -3390,6 +3394,8 @@ impl<'a> Lowerer<'a> {
                         if let (true, Ok(value)) = (fits, value) {
                             let name = field.short_name().unwrap_or_default();
                             values.insert(name, ParamValue::Int(value));
+                            let width = usize::from(bits / 8);
+                            expected.extend_from_slice(&value.to_be_bytes()[8 - width..]);
                         }
                         fits && value.is_ok()
                     }),
@@ -3398,12 +3404,17 @@ impl<'a> Lowerer<'a> {
                 }
             });
             let declared_prefix = request.prefix().map(|p| p.bytes()).unwrap_or_default();
-            if fits && declared_prefix == &prefix[..] && fields_at.next().is_none() {
-                found.push((indexed.service_id, request, values));
+            if !fits || declared_prefix != &prefix[..] || fields_at.next().is_some() {
+                continue;
+            }
+            // The declared fields must also sit where the template puts the arguments, in its
+            // byte order: the request encodes to exactly the template's bytes.
+            if encode_request(&request, &values).is_ok_and(|operand| operand == expected) {
+                found.push((indexed.service_id, expected));
             }
         }
         let layer = self.requests.profile.layer;
-        let [(service, request, values)] = &found[..] else {
+        let [(service, operand)] = &found[..] else {
             self.error(
                 StarCode::UnknownService,
                 span,
@@ -3417,17 +3428,7 @@ impl<'a> Lowerer<'a> {
             );
             return None;
         };
-        match encode_request(request, values) {
-            Ok(operand) => Some((*service, [&[template.sid][..], &operand].concat())),
-            Err(e) => {
-                self.error(
-                    StarCode::ArgumentOutOfRange,
-                    span,
-                    format!("the {layer} profile's request cannot be encoded: {e} (3.1)"),
-                );
-                None
-            }
-        }
+        Some((*service, [&[template.sid][..], operand].concat()))
     }
 
     /// Whether the declared positive response of `service` fits the profile's `diag.read_dtc`
@@ -3437,8 +3438,8 @@ impl<'a> Lowerer<'a> {
         let ResultMap::ReadDtc {
             mask,
             dtcs,
+            code_bits,
             status_bits,
-            ..
         } = map
         else {
             unreachable!("`Profile::validate` gives `diag.read_dtc` its DTC map")
@@ -3468,11 +3469,21 @@ impl<'a> Lowerer<'a> {
                     field.short_name().unwrap_or_default()
                 ))
             }
-            Some(_) if fields.get(usize::from(dtcs.0)).is_none() => Some(format!(
-                "has no field at the DTC records' position {}",
-                dtcs.0
-            )),
-            Some(_) => None,
+            Some(_) => match fields.get(usize::from(dtcs.0)) {
+                None => Some(format!(
+                    "has no field at the DTC records' position {}",
+                    dtcs.0
+                )),
+                Some(records) if !self.is_dtc_records(records, code_bits, status_bits) => {
+                    Some(format!(
+                        "has `{}` at the DTC records' position, which is not a repeat until the \
+                         end of the message of a {code_bits}-bit code then a {status_bits}-bit \
+                         status, both `uint` without a conversion",
+                        records.short_name().unwrap_or_default()
+                    ))
+                }
+                Some(_) => None,
+            },
         };
         if let Some(problem) = problem {
             self.error(
@@ -3486,6 +3497,40 @@ impl<'a> Lowerer<'a> {
             return false;
         }
         true
+    }
+
+    /// Whether `records` repeats, until the end of the message, a layout of exactly a
+    /// `code_bits`-bit code and then a `status_bits`-bit status, each a `uint` without a
+    /// conversion: the records the profile's `dtcs` reads (ADR-314 item 4).
+    fn is_dtc_records(
+        &self,
+        records: &diag_ir::declaration::Field<'_>,
+        code_bits: u8,
+        status_bits: u8,
+    ) -> bool {
+        let Some(repeat) = records.shape_as_repeat() else {
+            return false;
+        };
+        if repeat.count() != diag_ir::declaration::RepeatCount::UntilEndOfPdu {
+            return false;
+        }
+        let layout = self
+            .variant
+            .layouts()
+            .and_then(|layouts| layouts.iter().find(|l| l.id() == repeat.layout_id()));
+        let fields: Vec<_> = layout
+            .and_then(|l| l.fields())
+            .into_iter()
+            .flatten()
+            .collect();
+        let at = |field: &diag_ir::declaration::Field<'_>, bits: u8, offset: u32| {
+            is_fixed_uint(field, bits)
+                && field.compu_type() == diag_ir::declaration::Compu::CompuIdentity
+                && field.placement() == diag_ir::declaration::Placement::Absolute
+                && field.bit_offset() == offset
+        };
+        matches!(&fields[..], [code, status]
+            if at(code, code_bits, 0) && at(status, status_bits, u32::from(code_bits)))
     }
 
     /// The position among the declared response's top-level fields of `key`, a name the

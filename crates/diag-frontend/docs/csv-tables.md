@@ -577,7 +577,9 @@ template's arguments in order, each a `fixed` `uint` of the template's width wit
 on the names a definition gives them. The request is built at ingestion and sent to that service.
 A variant without exactly one such service rejects every `diag.read_dtc` call
 (`STAR_UNKNOWN_SERVICE`), and one whose selected response does not fit the profile's result map
-is `STAR_NOT_IN_PROFILE` (subset spec 3.4). Service selection happens at ingestion, so a `params` value for a
+is `STAR_NOT_IN_PROFILE` (subset spec 3.4): on UDS, an 8-bit `uint` availability mask, then a
+repeat until the end of the message of a layout of a 24-bit `uint` code and an 8-bit `uint`
+status, none with a conversion. Service selection happens at ingestion, so a `params` value for a
 key that names a constant must be a constant expression; a value known only at run time is
 rejected (`STAR_NON_CONSTANT_ARGUMENT`). Since a call names
 every request field of the service it means, two services of one variant with the same SID could

@@ -1012,6 +1012,16 @@ fn a_dtc_read_needs_one_service_that_fits_the_profile() {
     assert_eq!(found.len(), 1, "{found:?}");
     assert_eq!(found[0].0, crate::star::StarCode::NotInProfile);
     assert!(found[0].1.contains("availabilityMask"), "{found:?}");
+    // Records whose code is 16 bits wide are not the profile's DTC records.
+    let wide_status = fields.replace(
+        "layout:dtcRecord,dtc,0,,uint,24,",
+        "layout:dtcRecord,dtc,0,,uint,16,",
+    );
+    assert_ne!(wide_status, fields);
+    let found = codes(wide_status);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].0, crate::star::StarCode::NotInProfile);
+    assert!(found[0].1.contains("records"), "{found:?}");
     // A BCD mask field would send the mask as decimal digits, and a BCD availability mask
     // would read its bits as digits: neither is the profile's raw mask.
     let bcd_request = fields.replace(

@@ -145,8 +145,9 @@ shape survives inside the second as the access program of item 5.
    sent from every combination the job holds: the job is a writing job when any of them writes,
    takes the reprogramming slot when any of them has a flash plan, and is held to the policy
    class that covers all of them, so the chosen combination never needs a guard the job lacks.
-   A writing job creates its journal
-   before anything is sent, as now (ADR-252, ADR-293), and commits a combination record holding
+   A job keeps a journal when any of its combinations has a flash plan or a section marked
+   recovery required (ADR-293), whether or not it writes; such a job creates its journal before
+   anything is sent, as now (ADR-252, ADR-293), and commits a combination record holding
    the chosen document's hash after identification and before the chosen program's first
    instruction. A restart of a journal with that record uses that document (amending ADR-318
    item 4's journal that records no document; the caller still supplies the documents) and,

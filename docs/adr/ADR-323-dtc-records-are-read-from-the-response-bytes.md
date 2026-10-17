@@ -3,7 +3,7 @@
 **Date:** 2026-10-17
 **Status:** Accepted
 **Affects:** `diag-frontend` Starlark lowering (`res["fields"]["dtcs"]`, `len`, indexing, a
-record's `code` and `status`), `crates/diag-frontend/docs/starlark-subset.md` 3.4; ADR-233,
+record's `code` and `status`), `crates/diag-frontend/docs/starlark-subset.md` 3.4, design 8.4; ADR-233,
 ADR-314, ADR-316
 
 ## Context

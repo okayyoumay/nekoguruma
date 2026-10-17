@@ -12,6 +12,7 @@
 //! - [`policy`]: which requests the runner may send (read-only, except on the simulator in a debug build)
 //! - [`runner`]: runs a [`diag_ir::Program`] to its end on a link
 //! - [`document`]: the variant's document a job's program decodes responses with (ADR-316)
+//! - [`send_receive`]: what the generic send-receive's answer is matched against (ADR-321, ADR-322)
 //!
 //! The contract between the VM and the worker (what `ServiceRequest` sends, what comes back,
 //! deadlines, the sync/async bridge) is ADR-235.
@@ -27,6 +28,7 @@ pub mod link;
 pub mod policy;
 pub mod restart;
 pub mod runner;
+pub mod send_receive;
 
 pub use document::JobDocument;
 pub use host::{HostError, Timings, WorkerHost};

@@ -1,7 +1,7 @@
 # ADR-321: The Generic Send-Receive Instruction
 
 **Date:** 2026-10-17
-**Status:** Accepted
+**Status:** Accepted (Decision item 5 and the Consequences on the agent superseded by ADR-322)
 **Affects:** `diag-ir` (`Op::SendReceive`, `DiagHost::send_receive`, `VmError::UnknownService`,
 `check_declarations`, `schema/ir.fbs`: `Protocol.application_layer`, `Protocol.negative_shape`,
 `NegativeShape`), `agent` (`policy::check_program`, `host.rs`, `runner::check_job`), design

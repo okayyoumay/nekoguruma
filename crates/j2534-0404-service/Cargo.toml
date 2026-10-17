@@ -30,6 +30,8 @@ portable-atomic = { workspace = true }
 # tests/agent_end_to_end.rs runs an agent job against this service.
 agent = { path = "../agent" }
 diag-ir = { workspace = true }
+# tests/agent_end_to_end.rs converts the example ECU with a procedure that reads DTCs.
+diag-frontend = { path = "../diag-frontend" }
 j2534-0404-mock = { workspace = true }
 j2534-0404-sys = { workspace = true }
 # tests/agent_restart_end_to_end.rs kills a process group.

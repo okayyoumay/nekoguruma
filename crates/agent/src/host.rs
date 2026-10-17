@@ -17,6 +17,7 @@ use vci_service_interface::{
 use worker_host::client::WorkerClient;
 
 use crate::link::{Link, LinkConfig};
+use crate::send_receive::{Expectation, NegativeShape};
 
 #[derive(Debug, thiserror::Error)]
 pub enum HostError {
@@ -75,6 +76,37 @@ pub enum HostError {
     UseFlashTransfer,
     #[error("{0} is not supported by this agent yet")]
     Unsupported(&'static str),
+    /// A `SendReceive` with no request bytes (ADR-321).
+    #[error("a SendReceive has an empty request")]
+    EmptyRequest,
+    /// A `SendReceive` naming a service the job's document does not declare with a request and
+    /// a positive response, or a job with no document (ADR-322 item 1).
+    #[error(
+        "SendReceive names service {0}, which the job's document does not declare with a request and a positive response"
+    )]
+    UndeclaredService(u32),
+    /// A `SendReceive` whose request does not start with its declared service's SID (ADR-322
+    /// item 1).
+    #[error(
+        "SendReceive of service {service} sends SID {sent:#04x}, but the service declares {declared:#04x}"
+    )]
+    WrongService {
+        service: u32,
+        declared: u8,
+        sent: u8,
+    },
+    /// The variant's negative-response shape cannot be used (ADR-322 item 3).
+    #[error("the document's negative-response shape cannot be used: {0}")]
+    BadNegativeShape(&'static str),
+    /// A `SendReceive` of RequestDownload or RequestTransferExit, which belong at a recovery
+    /// plan's declared boundaries (ADR-322 item 2).
+    #[error(
+        "service {0:#04x} must be sent with ServiceRequest at a recovery plan's boundary, not SendReceive"
+    )]
+    DownloadBySendReceive(u8),
+    /// A `SendReceive` that would end the transfer in progress (ADR-250, ADR-322 item 2).
+    #[error("service {0:#04x} would end the transfer in progress")]
+    TransferInterrupted(u8),
     #[error("link setup: {0}")]
     Setup(&'static str),
 }
@@ -339,12 +371,29 @@ impl WorkerHost {
     /// Every request leaves through here, so the policy is checked here (ADR-235 item 8).
     fn send_recv(&mut self, request: Vec<u8>) -> Result<Vec<u8>, HostError> {
         crate::policy::check_request(&request, self.link.permission)?;
+        let progress = Progress::for_request(&request)?;
         let handle = self.handle.clone();
-        handle.block_on(self.send_recv_async(request))
+        handle.block_on(self.send_recv_async(request, progress))
     }
 
-    async fn send_recv_async(&mut self, request: Vec<u8>) -> Result<Vec<u8>, HostError> {
-        let mut progress = Progress::for_request(&request)?;
+    /// [`send_recv`](Self::send_recv) for a generic send-receive, whose answer is matched
+    /// against `expected` from the job's document instead of UDS's rules (ADR-321).
+    fn send_expecting(
+        &mut self,
+        request: Vec<u8>,
+        expected: Expectation,
+    ) -> Result<Vec<u8>, HostError> {
+        crate::policy::check_request(&request, self.link.permission)?;
+        let progress = Progress::expecting(expected);
+        let handle = self.handle.clone();
+        handle.block_on(self.send_recv_async(request, progress))
+    }
+
+    async fn send_recv_async(
+        &mut self,
+        request: Vec<u8>,
+        mut progress: Progress,
+    ) -> Result<Vec<u8>, HostError> {
         let start = StartComPrimitiveRequest {
             cop_tag: None,
             cll_handle: Some(self.link.cll_handle),
@@ -410,9 +459,10 @@ fn expected_responses(progress: &Progress) -> Vec<ExpectedResponseData> {
         unique_resp_ids: vec![],
     };
     let prefix = &progress.positive_prefix;
+    let negative = progress.negative.pattern(progress.sid);
     vec![
         expected(0, &vec![0xFF; prefix.len()], prefix.clone()),
-        expected(1, &[0xFF, 0xFF], vec![0x7F, progress.sid]),
+        expected(1, &vec![0xFF; negative.len()], negative),
     ]
 }
 
@@ -435,6 +485,7 @@ fn positive_prefix(request: &[u8]) -> Vec<u8> {
 struct Progress {
     sid: u8,
     positive_prefix: Vec<u8>,
+    negative: NegativeShape,
     response: Option<Vec<u8>>,
     error: Option<i32>,
 }
@@ -445,18 +496,31 @@ impl Progress {
         Ok(Self {
             sid,
             positive_prefix: positive_prefix(request),
+            negative: NegativeShape::uds(),
             response: None,
             error: None,
         })
+    }
+
+    /// Waits for the answer `expected` describes (ADR-321).
+    fn expecting(expected: Expectation) -> Self {
+        Self {
+            sid: expected.sid,
+            positive_prefix: expected.positive,
+            negative: expected.negative,
+            response: None,
+            error: None,
+        }
     }
 
     /// Whether `response` answers the request: a positive response that begins as expected,
     /// or a complete negative response for its SID. Stricter than the worker's match, which
     /// also accepts a response shorter than the pattern.
     fn answers(&self, response: &[u8]) -> bool {
-        match response {
-            [0x7F, sid, _, ..] => *sid == self.sid,
-            _ => response.starts_with(&self.positive_prefix),
+        if response.first() == Some(&self.negative.marker) {
+            self.negative.is_negative(self.sid, response)
+        } else {
+            response.starts_with(&self.positive_prefix)
         }
     }
 
@@ -501,7 +565,8 @@ impl Progress {
             // A response pending the worker passes on, and anything that does not answer this
             // request, is not the final response (ADR-235 item 3).
             Some(event_item::Data::ResultData(result))
-                if self.answers(&result.data_bytes) && !is_response_pending(&result.data_bytes) =>
+                if self.answers(&result.data_bytes)
+                    && !self.negative.is_pending(self.sid, &result.data_bytes) =>
             {
                 self.response = Some(result.data_bytes);
             }
@@ -524,12 +589,6 @@ impl Progress {
         }
         None
     }
-}
-
-/// A negative response with code 0x78 (requestCorrectlyReceived-ResponsePending, ISO 14229-1:2026
-/// annex A.1).
-fn is_response_pending(response: &[u8]) -> bool {
-    matches!(response, [0x7F, _, 0x78, ..])
 }
 
 /// A host that counts the TransferData blocks the ECU confirmed (ADR-250), which the
@@ -586,9 +645,22 @@ impl DiagHost for WorkerHost {
         response
     }
 
-    // `policy::check_program` refuses the instruction, so no job reaches this yet.
-    fn send_receive(&mut self, _: u32, _: &[u8]) -> Result<Vec<u8>, HostError> {
-        Err(HostError::Unsupported("SendReceive"))
+    // The request is sent as it is (ADR-321). It must start with the declared service's SID,
+    // which the policy checked before the program ran (ADR-322 item 1), and the flash-plan
+    // rules `Program::validate` cannot apply to it apply here (item 2). The answer is matched
+    // against the service's positive response and the variant's negative-response shape
+    // (ADR-309 item 4).
+    fn send_receive(&mut self, service: u32, request: &[u8]) -> Result<Vec<u8>, HostError> {
+        let expected = crate::send_receive::prepare(
+            self.document.as_ref(),
+            service,
+            request,
+            self.transfer.accepted.is_some(),
+        )?;
+        let response = self.send_expecting(request.to_vec(), expected);
+        self.transfer
+            .after_request(request, response.as_deref().map_err(|_| ()));
+        response
     }
 
     fn read_dtc(&mut self, mask: u8) -> Result<Vec<u8>, HostError> {
@@ -961,6 +1033,52 @@ mod tests {
             event(Some(COP), status(PduComPrimitiveStatus::PduCopstFinished)),
         ]);
         assert_eq!(got.unwrap().unwrap(), [0x62, 0xF1, 0x90]);
+    }
+
+    /// A send-receive's answer is matched against its declared service and the declared
+    /// negative-response shape (ADR-321), not the UDS rules of `positive_prefix`.
+    #[test]
+    fn a_send_receive_waits_for_its_declared_answer() {
+        let document = crate::send_receive::tests::document_with(
+            vec![Some(crate::send_receive::tests::uds_shape())],
+            None,
+        );
+        let expected = crate::send_receive::expectation(
+            &document.variant(),
+            crate::send_receive::tests::READ_DTC,
+        )
+        .unwrap();
+        let progress = Progress::expecting(expected.clone());
+        assert_eq!(
+            expected_responses(&progress)
+                .iter()
+                .map(|e| (e.response_type, e.mask_data.clone(), e.pattern_data.clone()))
+                .collect::<Vec<_>>(),
+            [
+                (0, vec![0xFF, 0xFF], vec![0x59, 0x02]),
+                (1, vec![0xFF, 0xFF], vec![0x7F, 0x19]),
+            ]
+        );
+        let run = |events: Vec<EventItem>| {
+            let mut progress = Progress::expecting(expected.clone());
+            events
+                .into_iter()
+                .find_map(|item| progress.on_event(item, COP))
+        };
+        // Another sub-function's answer and a pending answer are not the result.
+        let got = run(vec![
+            event(Some(COP), result(&[0x59, 0x01, 0xFF, 0x01, 0x00, 0x02])),
+            event(Some(COP), result(&[0x7F, 0x19, 0x78])),
+            event(Some(COP), result(&[0x59, 0x02, 0xFF])),
+            event(Some(COP), status(PduComPrimitiveStatus::PduCopstFinished)),
+        ]);
+        assert_eq!(got.unwrap().unwrap(), [0x59, 0x02, 0xFF]);
+        let got = run(vec![
+            event(Some(COP), result(&[0x7F, 0x22, 0x31])),
+            event(Some(COP), result(&[0x7F, 0x19, 0x31])),
+            event(Some(COP), status(PduComPrimitiveStatus::PduCopstFinished)),
+        ]);
+        assert_eq!(got.unwrap().unwrap(), [0x7F, 0x19, 0x31]);
     }
 
     #[test]

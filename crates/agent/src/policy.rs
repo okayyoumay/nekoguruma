@@ -11,6 +11,7 @@
 //! [`Permission::Simulator`] variant does not exist in a release build, so no release code can
 //! name it, let alone grant it.
 
+use diag_ir::declaration::EcuVariant;
 use diag_ir::{Op, Program};
 
 use crate::host::HostError;
@@ -93,8 +94,14 @@ pub fn check_request(request: &[u8], permission: Permission) -> Result<(), HostE
     }
 }
 
-/// The first instruction of `program` the runner would refuse: its pc and why.
-pub fn check_program(program: &Program, permission: Permission) -> Result<(), (u32, HostError)> {
+/// The first instruction of `program` the runner would refuse: its pc and why. `variant` is the
+/// job's document's, which gives a `SendReceive`'s SID (ADR-322 item 1); without one, every
+/// `SendReceive` is refused.
+pub fn check_program(
+    program: &Program,
+    variant: Option<&EcuVariant<'_>>,
+    permission: Permission,
+) -> Result<(), (u32, HostError)> {
     for (pc, op) in program.code.iter().enumerate() {
         // Exhaustive, so a new instruction that sends something cannot slip past.
         let refused = match op {
@@ -104,10 +111,18 @@ pub fn check_program(program: &Program, permission: Permission) -> Result<(), (u
             Op::ServiceRequest { service } => check_service(*service, permission).err(),
             // Always ReadDTCInformation.
             Op::ReadDtc { .. } => None,
-            // Not served yet: the host does not match its answers against the declarations,
-            // and the read-only list is not kept per application layer (ADR-309 item 4,
-            // ADR-321), so it is refused whatever the permission.
-            Op::SendReceive { .. } => Some(HostError::Unsupported("SendReceive")),
+            // The host sends only a request that starts with the declared service's SID
+            // (ADR-322 item 1), so that SID is checked as a `ServiceRequest`'s would be. A
+            // download belongs at a recovery plan's boundary, which only a `ServiceRequest`
+            // can be (item 2).
+            Op::SendReceive { service } => {
+                match variant.and_then(|v| crate::send_receive::declared_sid(v, *service)) {
+                    None => Some(HostError::UndeclaredService(*service)),
+                    Some(sid) => crate::send_receive::check_flash_rules(sid, false)
+                        .and_then(|()| check_service(sid.into(), permission))
+                        .err(),
+                }
+            }
             // A routine can erase or actuate; none is read-only by its number alone.
             Op::RoutineControl { .. } => match permission {
                 Permission::ReadOnly => Some(HostError::NotAllowed(0x31)),
@@ -177,9 +192,9 @@ pub fn check_program(program: &Program, permission: Permission) -> Result<(), (u
 }
 
 /// Whether the program sends anything a read-only job may not (ADR-257), so it needs the
-/// reprogramming slot.
-pub fn writes(program: &Program) -> bool {
-    check_program(program, Permission::ReadOnly).is_err()
+/// reprogramming slot. `variant` is as for [`check_program`].
+pub fn writes(program: &Program, variant: Option<&EcuVariant<'_>>) -> bool {
+    check_program(program, variant, Permission::ReadOnly).is_err()
 }
 
 #[cfg(test)]
@@ -187,6 +202,10 @@ mod tests {
     use diag_ir::IR_SCHEMA_VERSION;
 
     use super::*;
+    use crate::send_receive::tests::{
+        DOWNLOAD, NO_REQUEST, READ_DTC, RESET, SESSION, TRANSFER_DATA, TRANSFER_EXIT, WRITE_DID,
+        document,
+    };
 
     const READ_ONLY: Permission = Permission::ReadOnly;
 
@@ -253,6 +272,7 @@ mod tests {
                 Op::ReadDtc { mask: 0x08 },
                 Op::Jump(0),
             ]),
+            None,
             READ_ONLY,
         )
         .unwrap();
@@ -263,6 +283,7 @@ mod tests {
                 Op::ServiceRequest { service: 0x2E },
                 Op::ServiceRequest { service: 0x11 },
             ]),
+            None,
             READ_ONLY,
         );
         assert!(
@@ -280,7 +301,7 @@ mod tests {
             (Op::SecurityAccess { level: 1 }, 0x27),
             (Op::FlashTransfer { block: 0 }, 0x36),
         ] {
-            let refused = check_program(&program(vec![Op::PushBytes(0), op]), READ_ONLY);
+            let refused = check_program(&program(vec![Op::PushBytes(0), op]), None, READ_ONLY);
             assert!(
                 matches!(refused, Err((1, HostError::NotAllowed(s))) if s == sid),
                 "{refused:?}"
@@ -288,31 +309,78 @@ mod tests {
         }
         let refused = check_program(
             &program(vec![Op::PushBytes(0), Op::ServiceRequest { service: 0x36 }]),
+            None,
             READ_ONLY,
         );
         assert!(
             matches!(refused, Err((1, HostError::UseFlashTransfer))),
             "{refused:?}"
         );
-        // The host does not serve it yet (ADR-321), even for a read.
-        let refused = check_program(
-            &program(vec![Op::PushBytes(0), Op::SendReceive { service: 1 }]),
-            READ_ONLY,
-        );
+    }
+
+    fn send_receive(service: u32) -> Program {
+        program(vec![Op::PushBytes(0), Op::SendReceive { service }])
+    }
+
+    /// The release agent's read-only rule (ADR-235 item 8) holds for a send-receive: its
+    /// declared SID is checked as a `ServiceRequest`'s (ADR-322 item 1). A release build runs
+    /// this test with its own ceiling, which is read-only.
+    #[test]
+    fn a_send_receive_is_checked_by_its_declared_service() {
+        let document = document();
+        let variant = Some(document.variant());
+        check_program(&send_receive(READ_DTC), variant.as_ref(), READ_ONLY).unwrap();
+        check_program(&send_receive(READ_DTC), variant.as_ref(), build_ceiling()).unwrap();
+        for service in [WRITE_DID, SESSION, RESET] {
+            let refused = check_program(&send_receive(service), variant.as_ref(), READ_ONLY);
+            assert!(
+                matches!(refused, Err((1, HostError::NotAllowed(_)))),
+                "{refused:?}"
+            );
+        }
+        #[cfg(not(debug_assertions))]
+        assert!(matches!(
+            check_program(&send_receive(WRITE_DID), variant.as_ref(), build_ceiling()),
+            Err((1, HostError::NotAllowed(0x2E)))
+        ));
+        // Undeclared, or no document at all.
+        for (service, variant) in [
+            (NO_REQUEST, variant.as_ref()),
+            (99, variant.as_ref()),
+            (READ_DTC, None),
+        ] {
+            let refused = check_program(&send_receive(service), variant, READ_ONLY);
+            assert!(
+                matches!(refused, Err((1, HostError::UndeclaredService(s))) if s == service),
+                "{refused:?}"
+            );
+        }
+        // A download belongs at a plan's boundary (ADR-322 item 2), whatever the permission.
+        for (service, sid) in [(DOWNLOAD, 0x34), (TRANSFER_EXIT, 0x37)] {
+            let refused = check_program(&send_receive(service), variant.as_ref(), READ_ONLY);
+            assert!(
+                matches!(refused, Err((1, HostError::DownloadBySendReceive(s))) if s == sid),
+                "{refused:?}"
+            );
+        }
+        let refused = check_program(&send_receive(TRANSFER_DATA), variant.as_ref(), READ_ONLY);
         assert!(
-            matches!(refused, Err((1, HostError::Unsupported("SendReceive")))),
+            matches!(refused, Err((1, HostError::UseFlashTransfer))),
             "{refused:?}"
         );
     }
 
     #[test]
     fn a_program_writes_when_a_read_only_job_may_not_send_it() {
-        assert!(!writes(&program(vec![
-            Op::PushBytes(0),
-            Op::ServiceRequest { service: 0x22 },
-            Op::ReadDtc { mask: 0x08 },
-        ])));
-        assert!(!writes(&program(Vec::new())));
+        assert!(!writes(
+            &program(vec![
+                Op::PushBytes(0),
+                Op::ServiceRequest { service: 0x22 },
+                Op::ReadDtc { mask: 0x08 },
+            ]),
+            None
+        ));
+        assert!(!writes(&program(Vec::new()), None));
         for op in [
             Op::ServiceRequest { service: 0x2E },
             Op::RoutineControl {
@@ -321,8 +389,14 @@ mod tests {
             },
             Op::FlashTransfer { block: 0 },
         ] {
-            assert!(writes(&program(vec![Op::PushBytes(0), op])));
+            assert!(writes(&program(vec![Op::PushBytes(0), op]), None));
         }
+        // A send-receive writes by its declared service.
+        let document = document();
+        let variant = Some(document.variant());
+        assert!(!writes(&send_receive(READ_DTC), variant.as_ref()));
+        assert!(writes(&send_receive(WRITE_DID), variant.as_ref()));
+        assert!(writes(&send_receive(READ_DTC), None));
     }
 
     #[cfg(debug_assertions)]
@@ -372,24 +446,29 @@ mod tests {
                     Op::PushBytes(0),
                     Op::FlashTransfer { block: 0 },
                 ]),
+                None,
                 SIMULATOR,
             )
             .unwrap();
             let refused = check_program(
                 &program(vec![Op::PushBytes(0), Op::SecurityAccess { level: 1 }]),
+                None,
                 SIMULATOR,
             );
             assert!(
                 matches!(refused, Err((1, HostError::NotAllowed(0x27)))),
                 "{refused:?}"
             );
-            // Not served by the host yet (ADR-321), not even on a simulator.
-            let refused = check_program(
-                &program(vec![Op::PushBytes(0), Op::SendReceive { service: 1 }]),
-                SIMULATOR,
-            );
+            // A send-receive of any declared service but a download.
+            let document = document();
+            let variant = Some(document.variant());
+            for service in [READ_DTC, WRITE_DID, SESSION, RESET] {
+                check_program(&send_receive(service), variant.as_ref(), SIMULATOR)
+                    .unwrap_or_else(|e| panic!("{service}: {e:?}"));
+            }
+            let refused = check_program(&send_receive(DOWNLOAD), variant.as_ref(), SIMULATOR);
             assert!(
-                matches!(refused, Err((1, HostError::Unsupported("SendReceive")))),
+                matches!(refused, Err((1, HostError::DownloadBySendReceive(0x34)))),
                 "{refused:?}"
             );
             // TransferData only through FlashTransfer, refused before the link opens.
@@ -399,6 +478,7 @@ mod tests {
                     Op::PushBytes(0),
                     Op::ServiceRequest { service: 0x36 },
                 ]),
+                None,
                 SIMULATOR,
             );
             assert!(
@@ -407,6 +487,7 @@ mod tests {
             );
             let refused = check_program(
                 &program(vec![Op::ServiceRequest { service: 0x122 }]),
+                None,
                 SIMULATOR,
             );
             assert!(

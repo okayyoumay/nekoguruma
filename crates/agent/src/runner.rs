@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use diag_ir::declaration::EcuVariant;
 use diag_ir::{
     DiagHost, IdentityKind, Program, StepError, StepOutcome, Vm, VmError, VmState, WaitingOn,
 };
@@ -78,6 +79,14 @@ impl Job {
 
     pub fn document(&self) -> Option<&JobDocument> {
         self.document.as_ref()
+    }
+
+    /// Whether the job's program sends anything a read-only job may not, so it needs the
+    /// reprogramming slot (`policy::writes`, ADR-257). A send-receive counts by its declared
+    /// service (ADR-322 item 1).
+    pub fn writes(&self) -> bool {
+        let variant = self.document.as_ref().map(JobDocument::variant);
+        policy::writes(&self.program, variant.as_ref())
     }
 }
 
@@ -279,13 +288,22 @@ type GuardSlot = Arc<Mutex<Option<JobGuards>>>;
 /// (ADR-247). A caller can make them before it launches a worker for the job, with
 /// [`policy::build_ceiling`] since the VCI is not known yet. Operands are not checked
 /// exhaustively: a bad one, such as a missing constant, fails when the VM reaches it.
+///
+/// A program alone has no declarations, so a `SendReceive` in it is refused here; [`check_job`]
+/// checks one against its job's document.
 pub fn check_program(program: &Program, permission: Permission) -> Result<(), JobError> {
+    check_runnable(program)?;
+    refuse_beyond(program, None, permission)
+}
+
+/// The checks of [`check_program`] that need neither the declarations nor the permission.
+fn check_runnable(program: &Program) -> Result<(), JobError> {
     // A program this VM cannot run must not reach the bus.
     Vm::new(program)
         .check_state(program)
         .map_err(|source| JobError::Vm { pc: 0, source })?;
     program.validate()?;
-    refuse_beyond(program, permission)
+    Ok(())
 }
 
 /// [`check_program`] for a job, which also checks the declarations its program names
@@ -293,8 +311,31 @@ pub fn check_program(program: &Program, permission: Permission) -> Result<(), Jo
 /// ADR-316, ADR-318) and the services it send-receives (ADR-321). A job without a document to
 /// decode with, or one whose document does not declare what the program names, is refused here
 /// rather than failing at the instruction, which could be after a write.
+///
+/// A send-receive's SID is its declared service's, which the policy checks (ADR-322 item 1),
+/// and the variant's negative-response shape must be one the host can match answers against
+/// (item 3). The declarations are checked before the policy, so a job without a document is
+/// refused as one.
 pub fn check_job(job: &Job, permission: Permission) -> Result<(), JobError> {
-    check_program(&job.program, permission)?;
+    check_runnable(&job.program)?;
+    check_declared(job)?;
+    let variant = job.document.as_ref().map(JobDocument::variant);
+    if let (Some(variant), Some(pc)) = (
+        &variant,
+        crate::send_receive::first_send_receive(&job.program.code),
+    ) {
+        crate::send_receive::negative_shape(variant)
+            .map_err(|source| JobError::Refused { pc, source })?;
+    }
+    if let Some(variant) = &variant {
+        crate::send_receive::check_plans(&job.program, variant)
+            .map_err(|(pc, source)| JobError::Refused { pc, source })?;
+    }
+    refuse_beyond(&job.program, variant.as_ref(), permission)
+}
+
+/// The declarations part of [`check_job`].
+fn check_declared(job: &Job) -> Result<(), JobError> {
     match &job.document {
         Some(document) => diag_ir::check_declarations(&job.program, &document.variant())
             .map_err(|(pc, source)| JobError::Undeclared { pc, source }),
@@ -311,9 +352,13 @@ pub fn check_job(job: &Job, permission: Permission) -> Result<(), JobError> {
     }
 }
 
-/// The policy part of [`check_program`].
-fn refuse_beyond(program: &Program, permission: Permission) -> Result<(), JobError> {
-    policy::check_program(program, permission)
+/// The policy part of [`check_program`] and [`check_job`].
+fn refuse_beyond(
+    program: &Program,
+    variant: Option<&EcuVariant<'_>>,
+    permission: Permission,
+) -> Result<(), JobError> {
+    policy::check_program(program, variant, permission)
         .map_err(|(pc, source)| JobError::Refused { pc, source })
 }
 
@@ -339,7 +384,7 @@ fn refuse_beyond(program: &Program, permission: Permission) -> Result<(), JobErr
 ///
 /// `guards` are the job's guards (`guards::JobGuards`, ADR-256, ADR-257, design 8.8.1). The
 /// caller takes them before it calls: `JobGuards::take` for a program that writes
-/// (`policy::writes`), `JobGuards::take_vci_only` for one that only reads. A writing program on
+/// ([`Job::writes`]), `JobGuards::take_vci_only` for one that only reads. A writing program on
 /// guards without the reprogramming slot ends in [`JobError::NoReprogrammingSlot`], checked
 /// with the policy before anything opens. The run takes the guards by value, so two runs can
 /// never use one set at once, holds them until the link is closed, and returns them with its
@@ -554,16 +599,16 @@ async fn run_program_within(
         return Err(JobError::LinkUnconfirmed);
     }
     check_job(&job, ceiling)?;
-    let Job { program, document } = job;
     // A program that writes needs the device's reprogramming slot (design 8.8.1, ADR-257).
     let holds_slot = guards
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
         .is_some_and(JobGuards::holds_slot);
-    if policy::writes(&program) && !holds_slot {
+    if job.writes() && !holds_slot {
         return Err(JobError::NoReprogrammingSlot);
     }
+    let Job { program, document } = job;
     let config = config.clone();
 
     let cancel = CancelOnDrop(Arc::new(AtomicBool::new(false)));
@@ -673,11 +718,16 @@ fn run_job(
         guards: Arc::clone(&guards),
         closed: false,
     };
-    let mut host = WorkerHost::new(handle.clone(), client, link, timings);
-    host.set_document(document);
     // The VCI is known now. Nothing has been sent to the ECU yet, so a program that needs more
     // than this link allows is refused with no effect on it.
-    if let Err(error) = refuse_beyond(program, permission) {
+    let refused = refuse_beyond(
+        program,
+        document.as_ref().map(JobDocument::variant).as_ref(),
+        permission,
+    );
+    let mut host = WorkerHost::new(handle.clone(), client, link, timings);
+    host.set_document(document);
+    if let Err(error) = refused {
         drop(host);
         open_link.close();
         return Err(error);
@@ -7585,6 +7635,137 @@ mod tests {
         assert_eq!(state.stack, [Value::Bytes(DECODED_VIN.to_vec())]);
     }
 
+    /// A send-receive is checked against its job's document before anything opens: the
+    /// declared service gives its SID to the policy and to `writes` (ADR-322 item 1), and the
+    /// variant's negative-response shape must be usable (item 3).
+    #[test]
+    fn a_send_receive_is_checked_against_the_jobs_document() {
+        use crate::send_receive::tests::{READ_DTC, WRITE_DID, document, document_with};
+        let send = |service| program(vec![Op::PushBytes(0), Op::SendReceive { service }]);
+        let job = |service, document| Job {
+            program: send(service),
+            document: Some(document),
+        };
+        check_job(&job(READ_DTC, document()), Permission::ReadOnly).unwrap();
+        assert!(!job(READ_DTC, document()).writes());
+        assert!(job(WRITE_DID, document()).writes());
+        let refused = check_job(&job(WRITE_DID, document()), Permission::ReadOnly);
+        assert!(
+            matches!(
+                refused,
+                Err(JobError::Refused {
+                    pc: 1,
+                    source: HostError::NotAllowed(0x2E)
+                })
+            ),
+            "{refused:?}"
+        );
+        // No document: the declarations check refuses it first.
+        assert!(matches!(
+            check_job(&send(READ_DTC).into(), Permission::ReadOnly),
+            Err(JobError::NoDeclarations)
+        ));
+        assert!(matches!(
+            check_program(&send(READ_DTC), Permission::ReadOnly),
+            Err(JobError::Refused {
+                pc: 1,
+                source: HostError::UndeclaredService(READ_DTC)
+            })
+        ));
+        // A shape the host cannot match answers against.
+        let refused = check_job(
+            &job(READ_DTC, document_with(vec![None], None)),
+            Permission::ReadOnly,
+        );
+        assert!(
+            matches!(
+                refused,
+                Err(JobError::Refused {
+                    pc: 1,
+                    source: HostError::BadNegativeShape(_)
+                })
+            ),
+            "{refused:?}"
+        );
+    }
+
+    /// A session change or reset by send-receive inside a plan's transfer is refused before the
+    /// link opens, as `Program::validate` refuses the same `ServiceRequest` (ADR-322 item 2),
+    /// not after the erase. The refusal comes before the policy, so a release build refuses it
+    /// the same way.
+    #[test]
+    fn a_send_receive_cannot_end_a_plans_transfer() {
+        use crate::send_receive::tests::{RESET, SESSION, document};
+        let flashing = |at: usize, service| {
+            let mut code = vec![
+                Op::Pop,
+                Op::RoutineControl { routine: 1, sub: 1 },
+                Op::ServiceRequest { service: 0x34 },
+                Op::ServiceRequest { service: 0x37 },
+                Op::Pop,
+            ];
+            code.splice(at..at, [Op::PushBytes(0), Op::SendReceive { service }]);
+            let mut program = program(code);
+            program.flash.push(diag_ir::FlashRecovery {
+                flash_session: 1,
+                stage: 1,
+                max_resumes: 0,
+                // No restart, so no identity or precondition sources are needed.
+                recovery_required: diag_ir::RecoveryRequired::FromPc(1),
+                boundaries: diag_ir::RecoveryBoundaries {
+                    entry_pc: 0,
+                    erase_pc: 1,
+                    transfer_exit_pc: 5,
+                    post_transfer_end_pc: 7,
+                },
+                timing: diag_ir::RecoveryTiming {
+                    session_timeout_millis: 5000,
+                    teardown_margin_millis: 0,
+                    ecu_startup_millis: 0,
+                    confirmation_window_millis: 0,
+                },
+                version_read_retries: 0,
+                no_application: None,
+            });
+            Job {
+                program,
+                document: Some(document()),
+            }
+        };
+        for (service, sid) in [(SESSION, 0x10), (RESET, 0x11)] {
+            for permission in [Permission::ReadOnly, policy::build_ceiling()] {
+                let refused = check_job(&flashing(3, service), permission);
+                assert!(
+                    matches!(
+                        refused,
+                        Err(JobError::Refused {
+                            pc: 4,
+                            source: HostError::TransferInterrupted(s)
+                        }) if s == sid
+                    ),
+                    "{refused:?}"
+                );
+            }
+        }
+        // A read in the transfer, and a session change before the download or after the
+        // transfer exit, pass this check (the simulator lets the plan's writes through).
+        #[cfg(debug_assertions)]
+        for (at, service) in [
+            (3, crate::send_receive::tests::READ_DTC),
+            (2, SESSION),
+            (4, SESSION),
+        ] {
+            let mut job = flashing(at, service);
+            if at == 4 {
+                // Inserted after the transfer exit, which stays at 3.
+                job.program.flash[0].boundaries.transfer_exit_pc = 3;
+                job.program.flash[0].boundaries.post_transfer_end_pc = 4;
+            }
+            check_job(&job, Permission::Simulator)
+                .unwrap_or_else(|e| panic!("{at} {service}: {e:?}"));
+        }
+    }
+
     #[test]
     fn a_program_that_decodes_needs_a_document() {
         let program = decoding_program();
@@ -10847,17 +11028,22 @@ mod tests {
             Op::RoutineControl { routine: 1, sub: 1 },
         ]);
         assert!(matches!(
-            refuse_beyond(&write, Permission::ReadOnly),
+            refuse_beyond(&write, None, Permission::ReadOnly),
             Err(JobError::Refused {
                 pc: 2,
                 source: HostError::NotAllowed(0x31)
             })
         ));
         assert!(
-            refuse_beyond(&program(two_requests()[..2].to_vec()), Permission::ReadOnly).is_ok()
+            refuse_beyond(
+                &program(two_requests()[..2].to_vec()),
+                None,
+                Permission::ReadOnly
+            )
+            .is_ok()
         );
         #[cfg(debug_assertions)]
-        assert!(refuse_beyond(&write, Permission::Simulator).is_ok());
+        assert!(refuse_beyond(&write, None, Permission::Simulator).is_ok());
     }
 
     #[tokio::test(flavor = "multi_thread")]

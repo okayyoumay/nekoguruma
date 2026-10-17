@@ -310,7 +310,8 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-318](ADR-318-a-job-carries-its-variants-document.md) | A Job Carries Its Variant's Document | Accepted | `agent` job runner (`Job`, `check_job`, `ngr-agent run --document`), `diag_ir::check_decode_fields` (now `check_declarations`, ADR-321), design 8.2.4; ADR-316, ADR-307 |
 | [ADR-319](ADR-319-the-agent-names-a-links-resource-by-iso-22900-2-short-names.md) | The Agent Names a Link's Resource by ISO 22900-2 (2022) Short Names | Accepted | `agent` link (`resource_data`), `iso22900-mock` short names, design 8.2.4; ADR-235 item 4, ADR-069 |
 | [ADR-320](ADR-320-a-field-read-follows-the-response-s-service.md) | A Field Read Follows the Response's Service | Accepted | `diag-frontend` Starlark lowering (`res["fields"]`), `diag_ir::decode::scalar_kind`, Starlark subset 3.4, design 8.4; ADR-316, ADR-317 |
-| [ADR-321](ADR-321-the-generic-send-receive-instruction.md) | The Generic Send-Receive Instruction | Accepted | `diag-ir` `Op::SendReceive`, `DiagHost::send_receive`, `check_declarations`, `Protocol.application_layer` and `negative_shape`; `agent` policy refusal; design 8.2.4; ADR-233, ADR-309, ADR-316 |
+| [ADR-321](ADR-321-the-generic-send-receive-instruction.md) | The Generic Send-Receive Instruction | Accepted (item 5 and the Consequences on the agent superseded by ADR-322) | `diag-ir` `Op::SendReceive`, `DiagHost::send_receive`, `check_declarations`, `Protocol.application_layer` and `negative_shape`; `agent` policy refusal; design 8.2.4; ADR-233, ADR-309, ADR-316 |
+| [ADR-322](ADR-322-the-agent-serves-the-generic-send-receive.md) | The Agent Serves the Generic Send-Receive | Accepted | `agent` `send_receive`, `WorkerHost::send_receive`, `policy::check_program` and `writes`, `check_job`, `Job::writes`; design 8.2.4; ADR-235, ADR-245, ADR-250, ADR-257, ADR-309, ADR-321 |
 
 ## Status Legend
 
@@ -731,7 +732,8 @@ the predecessor repository these ADRs came from.
 - ADR-318
 - ADR-319
 - ADR-320
-- ADR-321
+- ADR-321 (item 5 and the Consequences on the agent superseded by ADR-322)
+- ADR-322
 
 ### Acquired Data & Monitoring
 - ADR-236

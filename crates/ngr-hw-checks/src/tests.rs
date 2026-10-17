@@ -235,6 +235,87 @@ fn an_incomplete_or_inconsistent_profile_is_refused() {
     assert!(parse(&T0_PROFILE.replace("socketcan = \"can0\"", "")).is_err());
 }
 
+#[test]
+fn more_fields_are_checked_against_the_setup() {
+    let cases: &[(&str, &str)] = &[
+        // Connector pins, and identifiers that all differ.
+        ("pins = [6, 14]", "pins = [0, 14]"),
+        ("pins = [6, 14]", "pins = [6, 17]"),
+        ("functional_id = 0x7DF", "functional_id = 0x7E0"),
+        ("functional_id = 0x7DF", "functional_id = 0x800"),
+        // The physical layer comes from the typed keys, and a ComParam has a name.
+        ("CP_STmin = 0", "CP_STmin = 0\nCP_Baudrate = 250000"),
+        ("CP_STmin = 0", "CP_ = 0"),
+        // Empty and missing values, and integers that do not fit.
+        ("label = \"bench\"", "label = \"\""),
+        ("pname = \"Vendor VCI 1\"\n", ""),
+        ("firmware_version = \"1.2.3\"", "firmware_version = \"\""),
+        ("padding = 0xCC", "padding = 256"),
+        ("padding = 0xCC", "padding = -1"),
+        ("baud_rate = 500000", "baud_rate = 0x100000000"),
+    ];
+    for (from, to) in cases {
+        let text = t1("").replacen(from, to, 1);
+        assert_ne!(text, t1(""), "{from}");
+        assert!(parse(&text).is_err(), "{to}");
+    }
+    assert!(parse(&t1("").replace("addressing = \"normal\"", "addressing = \"mixed\"")).is_err());
+    for control in [
+        "kind = \"pin-switch\"\nname = \"x\"\npins = [7, 7]",
+        "kind = \"pin-switch\"\nname = \"x\"\npins = [17]",
+        "kind = \"programming-voltage\"\nname = \"x\"\npin = 0\nmillivolts = 18000",
+    ] {
+        let text = t1(&format!("[[hardware-control]]\n{control}"));
+        assert!(parse(&text).is_err(), "{control}");
+    }
+    assert!(parse(&t1("[power]\noff = [\"\"]\non = [\"relay\"]")).is_err());
+}
+
+#[test]
+fn a_loopback_runs_between_two_ends_of_one_bus() {
+    parse(T0_PROFILE).unwrap();
+    // T0 takes no addition either.
+    for extra in [
+        "expendable_ecu = true",
+        "[power]\noff = [\"relay\", \"off\"]\non = [\"relay\", \"on\"]",
+        "[[hardware-control]]\nkind = \"pin-switch\"\nname = \"x\"\npins = [7]",
+    ] {
+        let text = T0_PROFILE.replace("class = \"T0\"", &format!("class = \"T0\"\n{extra}"));
+        assert!(
+            matches!(
+                parse(&text),
+                Err(ProfileError::Adds {
+                    class: Class::T0,
+                    ..
+                })
+            ),
+            "{extra}"
+        );
+    }
+    // Two SocketCAN ends and no VCI; one bus at two rates or widths; identifiers not crossed.
+    let vci_end = T0_PROFILE.split("[[endpoint]]").nth(2).unwrap();
+    let can_end = T0_PROFILE.split("[[endpoint]]").nth(1).unwrap();
+    let no_vci = format!(
+        "class = \"T0\"\n[[endpoint]]{can_end}[[endpoint]]{}",
+        can_end.replace("can0", "can1")
+    );
+    assert!(parse(&no_vci).is_err());
+    let same_vci = format!("class = \"T0\"\n[[endpoint]]{vci_end}[[endpoint]]{vci_end}");
+    assert!(parse(&same_vci).is_err());
+    let rate = T0_PROFILE.replacen("baud_rate = 500000", "baud_rate = 250000", 1);
+    assert!(parse(&rate).is_err());
+    let not_crossed = T0_PROFILE.replacen("request_id = 0x124", "request_id = 0x125", 1);
+    assert!(parse(&not_crossed).is_err());
+}
+
+#[test]
+fn reading_the_profile_needs_the_variable() {
+    // The variable is not set in the test environment unless a hardware run sets it.
+    if std::env::var_os(profile::PROFILE_VAR).is_none() {
+        assert_eq!(profile::from_env(), Err(ProfileError::NotSet));
+    }
+}
+
 const READ: CheckDecl = CheckDecl {
     name: "hw_reads_the_vin",
     classes: &[Class::T1, Class::T2, Class::T3],
@@ -333,10 +414,15 @@ fn hw_the_profile_permits_a_check() {
     permits(&profile, &PROFILE_CHECK).unwrap();
 }
 
-/// Every declared check is a `hw_` test that runs somewhere.
+/// Every declared check is a `hw_` test that runs somewhere, declared once.
 #[test]
 fn every_declared_check_is_named_hw_and_has_a_class() {
-    for check in CHECKS {
+    for (index, check) in CHECKS.iter().enumerate() {
+        assert!(
+            CHECKS[..index].iter().all(|other| other.name != check.name),
+            "{} is declared twice",
+            check.name
+        );
         assert!(check.name.starts_with("hw_"), "{}", check.name);
         assert!(!check.classes.is_empty(), "{}", check.name);
     }

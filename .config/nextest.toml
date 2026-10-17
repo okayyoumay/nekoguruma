@@ -58,7 +58,8 @@ retries = 0
 # `#[ignore]`d, which a profile cannot override, hence `--run-ignored=only`. One VCI is one shared
 # resource, so they run one at a time, and a check that passes only on a retry is a finding.
 [profile.hardware]
-default-filter = 'test(/(^|::)hw_/)'
+# The last part of the test's name starts with `hw_`.
+default-filter = 'test(/(^|::)hw_[^:]*$/)'
 test-threads = 1
 fail-fast = false
 retries = 0

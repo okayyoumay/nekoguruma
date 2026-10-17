@@ -288,6 +288,7 @@ pub fn parse(text: &str) -> Result<Profile, ProfileError> {
             for endpoint in [&a, &b] {
                 check_endpoint(endpoint)?;
             }
+            check_loopback(&a, &b)?;
             Setup::Loopback([a, b])
         }
         (Class::T0, ..) => {
@@ -338,7 +339,10 @@ pub fn parse(text: &str) -> Result<Profile, ProfileError> {
         if !matches!(class, Class::T1 | Class::T2) {
             return Err(adds("power commands"));
         }
-        if power.off.is_empty() || power.on.is_empty() {
+        if [&power.off, &power.on]
+            .iter()
+            .any(|command| command.first().is_none_or(String::is_empty))
+        {
             return Err(invalid("`power` needs both an `off` and an `on` command"));
         }
     }
@@ -367,16 +371,38 @@ pub fn parse(text: &str) -> Result<Profile, ProfileError> {
     })
 }
 
+/// The connector pins (SAE J1962 has 16).
+const PINS: std::ops::RangeInclusive<u8> = 1..=16;
+
+/// The ComParams of the physical layer, which the profile's typed keys give and a check may not
+/// change (design 13.5).
+const PHYSICAL_COMPARAMS: &[&str] = &["CP_Baudrate", "CP_CanFDBaudrate", "CP_J1962_Pins"];
+
 fn check_vci(vci: &Vci) -> Result<(), ProfileError> {
-    if vci.library.is_empty() || vci.module.is_empty() {
-        return Err(invalid("a `vci` needs its `library` and `module`"));
+    if [
+        &vci.library,
+        &vci.module,
+        &vci.firmware_version,
+        &vci.library_version,
+    ]
+    .iter()
+    .any(|value| value.is_empty())
+    {
+        return Err(invalid(
+            "a `vci` needs its `library`, `module`, `firmware_version` and `library_version`",
+        ));
     }
     match vci.api {
         // A J2534 library reports no serial number, so the module is matched through its
-        // configured entry (design 13.5).
-        Api::J2534V0404 if vci.label.is_none() || vci.pname.is_none() => Err(invalid(
-            "a J2534 `vci` names the `label` and `pname` of its configured `modules` entry",
-        )),
+        // configured entry (design 13.5). An empty label would list every entry (ADR-281).
+        Api::J2534V0404
+            if vci.label.as_deref().is_none_or(str::is_empty)
+                || vci.pname.as_deref().is_none_or(str::is_empty) =>
+        {
+            Err(invalid(
+                "a J2534 `vci` names the `label` and `pname` of its configured `modules` entry",
+            ))
+        }
         Api::Iso22900 if vci.label.is_some() || vci.pname.is_some() => Err(invalid(
             "`label` and `pname` name a J2534 `modules` entry; a D-PDU API `vci` has none",
         )),
@@ -390,8 +416,10 @@ fn check_link(link: &Link) -> Result<(), ProfileError> {
             "a `link` needs its `protocol` and a `baud_rate` above 0",
         ));
     }
-    if link.pins[0] == link.pins[1] {
-        return Err(invalid("a `link`'s two `pins` must differ"));
+    if link.pins[0] == link.pins[1] || !link.pins.iter().all(|pin| PINS.contains(pin)) {
+        return Err(invalid(
+            "a `link`'s two `pins` must differ and be connector pins 1 to 16",
+        ));
     }
     let max = match link.id_bits {
         11 => 0x7FF,
@@ -413,8 +441,14 @@ fn check_link(link: &Link) -> Result<(), ProfileError> {
             )));
         }
     }
-    if link.request_id == link.response_id {
-        return Err(invalid("`request_id` and `response_id` must differ"));
+    if link.request_id == link.response_id
+        || link
+            .functional_id
+            .is_some_and(|id| id == link.request_id || id == link.response_id)
+    {
+        return Err(invalid(
+            "`request_id`, `response_id` and `functional_id` must differ",
+        ));
     }
     match (link.addressing, link.address) {
         (Addressing::Normal, None) | (Addressing::Extended | Addressing::Mixed, Some(_)) => {}
@@ -425,9 +459,22 @@ fn check_link(link: &Link) -> Result<(), ProfileError> {
             return Err(invalid("extended and mixed addressing need an `address`"));
         }
     }
-    if let Some(name) = link.comparams.keys().find(|name| !name.starts_with("CP_")) {
+    if let Some(name) = link
+        .comparams
+        .keys()
+        .find(|name| name.strip_prefix("CP_").is_none_or(str::is_empty))
+    {
         return Err(invalid(format!(
             "the ComParam {name:?} is not a ComParam name (`CP_...`)"
+        )));
+    }
+    if let Some(name) = link
+        .comparams
+        .keys()
+        .find(|name| PHYSICAL_COMPARAMS.contains(&name.as_str()))
+    {
+        return Err(invalid(format!(
+            "the ComParam {name:?} is physical-layer; the `link`'s own keys give it"
         )));
     }
     Ok(())
@@ -446,14 +493,54 @@ fn check_endpoint(endpoint: &Endpoint) -> Result<(), ProfileError> {
     check_link(&endpoint.link)
 }
 
+/// A T0 loopback runs between two different ends, at least one a VCI channel, on one bus: the
+/// same rate and identifier width, each end sending what the other receives (design 13.5).
+fn check_loopback(a: &Endpoint, b: &Endpoint) -> Result<(), ProfileError> {
+    if a.vci.is_none() && b.vci.is_none() {
+        return Err(invalid(
+            "a T0 loopback has a VCI channel at one end at least",
+        ));
+    }
+    if (a.vci.is_some() && a.vci == b.vci) || (a.socketcan.is_some() && a.socketcan == b.socketcan)
+    {
+        return Err(invalid(
+            "a T0 loopback's two endpoints must be different channels",
+        ));
+    }
+    let (x, y) = (&a.link, &b.link);
+    if x.baud_rate != y.baud_rate || x.id_bits != y.id_bits {
+        return Err(invalid(
+            "a T0 loopback's endpoints share one bus: the same `baud_rate` and `id_bits`",
+        ));
+    }
+    if x.request_id != y.response_id || x.response_id != y.request_id {
+        return Err(invalid(
+            "each T0 endpoint receives on the identifier the other sends on",
+        ));
+    }
+    Ok(())
+}
+
 fn check_control(control: &HardwareControl) -> Result<(), ProfileError> {
     if control.name().is_empty() {
         return Err(invalid("a hardware control needs a `name`"));
     }
     match control {
+        HardwareControl::ProgrammingVoltage { pin, .. } if !PINS.contains(pin) => Err(invalid(
+            "a `programming-voltage` control's `pin` is a connector pin 1 to 16",
+        )),
         HardwareControl::ProgrammingVoltage { .. } => Ok(()),
-        HardwareControl::PinSwitch { pins, .. } if pins.is_empty() => {
-            Err(invalid("a `pin-switch` control names its `pins`"))
+        HardwareControl::PinSwitch { pins, .. }
+            if pins.is_empty()
+                || !pins.iter().all(|pin| PINS.contains(pin))
+                || pins
+                    .iter()
+                    .enumerate()
+                    .any(|(i, pin)| pins[..i].contains(pin)) =>
+        {
+            Err(invalid(
+                "a `pin-switch` control names its `pins`, each a connector pin 1 to 16, once",
+            ))
         }
         HardwareControl::PinSwitch { .. } => Ok(()),
         HardwareControl::Ioctl { payload, range, .. } => match (payload, range) {

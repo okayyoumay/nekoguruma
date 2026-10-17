@@ -1,7 +1,7 @@
 # ADR-317: A `diag.request` Response Is Its Bytes at Run Time
 
 **Date:** 2026-10-16
-**Status:** Accepted
+**Status:** Accepted (Decision item 2 superseded by ADR-309: the marker and the code position come from the variant's declared negative-response shape)
 **Affects:** `diag-frontend` (`src/star/lower.rs`, `src/convert/tests.rs`),
 `crates/diag-frontend/docs/starlark-subset.md` 3.2 and 3.4, design 8.4; ADR-313 item 5,
 ADR-309 item 4

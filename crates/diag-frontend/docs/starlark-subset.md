@@ -342,10 +342,11 @@ given as internal (coded) values; the declaration part's conversions apply only 
 response values.
 
 **Lowering (ADR-317).** At run time a response is the bytes the host returned, and each key is
-lowered where it is read: `raw` is those bytes, `ok` is false only when the first byte is `7F`,
-and `nrc` is the third byte of a negative response and 0 otherwise. A negative response too
-short to hold its code stops the run when `nrc` is read. Until the declaration part carries the
-application layer's negative-response shape (ADR-309 item 4), that shape is UDS's. Another
+lowered where it is read: `raw` is those bytes, `ok` is false only when the first byte is the
+marker of the negative-response shape the variant's protocols declare (`7F` on UDS), and `nrc`
+is the byte at that shape's code position (the third on UDS) of a negative response and 0
+otherwise (ADR-309 item 4). A negative response too short to hold its code stops the run when
+`nrc` is read. Another
 string key is `STAR_UNSUPPORTED_SYNTAX`. A response used other than through its keys (its
 truth value, an operator such as `==`, a built-in) is `STAR_NOT_LOWERABLE`.
 

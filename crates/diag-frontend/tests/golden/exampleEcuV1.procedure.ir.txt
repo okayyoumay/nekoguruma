@@ -67,8 +67,21 @@ EcuDocumentT {
                                 },
                             ],
                         ),
-                        application_layer: None,
-                        negative_shape: None,
+                        application_layer: Some(
+                            "UDS",
+                        ),
+                        negative_shape: Some(
+                            NegativeShapeT {
+                                marker: 127,
+                                echoes_sid: true,
+                                code_at: 2,
+                                pending: Some(
+                                    [
+                                        120,
+                                    ],
+                                ),
+                            },
+                        ),
                     },
                 ],
             ),

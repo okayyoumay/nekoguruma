@@ -2360,9 +2360,9 @@ impl<'a> Lowerer<'a> {
     }
 
     /// `res["ok"]`, `res["nrc"]` or `res["raw"]` of a `diag.request` response (subset 3.4,
-    /// ADR-317): `code` pushes the response bytes. Until the declaration part carries the
-    /// application layer's negative-response shape (ADR-309 item 4), a response is negative when
-    /// its first byte is UDS's `7F`, and its NRC is then its third byte.
+    /// ADR-317): `code` pushes the response bytes. A response is negative when its first byte is
+    /// the marker of the variant's negative-response shape, and its NRC is then the byte at the
+    /// shape's code position (ADR-309 item 4, [`Self::negative_shape`]).
     fn response_key(
         &mut self,
         id: Option<usize>,
@@ -2397,14 +2397,15 @@ impl<'a> Lowerer<'a> {
                     (Ins::Op(Op::LoadLocal(response)), span),
                 ]);
                 code.extend(self.response_ok(span));
+                let code_at = i64::from(self.negative_shape().1);
                 code.extend(
                     [
                         Ins::Op(Op::Not),
                         Ins::JumpIfFalse(positive),
-                        // A negative response is `7F`, the SID and the NRC; a shorter one fails
-                        // the run as an index out of range.
+                        // A negative response holds the NRC at the shape's code position; a
+                        // shorter one fails the run as an index out of range.
                         Ins::Op(Op::LoadLocal(response)),
-                        Ins::Op(Op::PushI64(2)),
+                        Ins::Op(Op::PushI64(code_at)),
                         Ins::Op(Op::IndexGet),
                         Ins::Op(Op::Swap),
                         Ins::Op(Op::Pop),
@@ -2517,8 +2518,27 @@ impl<'a> Lowerer<'a> {
 
     /// Code that turns the response bytes on top of the stack into whether the response is
     /// positive: its first byte, if any, is not `7F`.
+    /// The marker that starts a negative response, and the position of its code: those of the
+    /// shape the variant's protocols declare, which all name one application layer (ADR-309
+    /// items 3 and 4). A variant that declares no protocol (in tests) uses its profile's.
+    fn negative_shape(&self) -> (u8, u8) {
+        let declared = self
+            .variant
+            .protocols()
+            .and_then(|protocols| protocols.iter().next())
+            .and_then(|protocol| protocol.negative_shape());
+        match declared {
+            Some(shape) => (shape.marker(), shape.code_at()),
+            None => {
+                let shape = self.requests.profile.negative;
+                (shape.marker, shape.code_at)
+            }
+        }
+    }
+
     fn response_ok(&mut self, span: Span) -> Code {
-        let negative = self.pool(&[0x7F]);
+        let marker = self.negative_shape().0;
+        let negative = self.pool(&[marker]);
         [
             Op::PushI64(0),
             Op::PushI64(1),

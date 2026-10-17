@@ -733,8 +733,7 @@ fn run_answered(
         match vm.step_with_declarations(&program, document.variant().as_ref(), &mut host) {
             Ok(diag_ir::StepOutcome::Continue) => {}
             Ok(diag_ir::StepOutcome::Finished) => return Ok(host),
-            // A procedure that ends as failed (ADR-280) reports its failure.
-            Ok(other) => return Err(format!("{other:?}")),
+            Ok(other) => panic!("{other:?}"),
             Err(e) => return Err(format!("{e:?}")),
         }
     }
@@ -928,8 +927,28 @@ fn each_dtc_record_reads_its_code_and_status() {
     // A last record cut short does not decode, so it stops the run.
     let error = answered(READ_EACH_DTC, &[&[0x59, 0x02, 0xFF, 0x12, 0x34]]).unwrap_err();
     assert!(error.contains("Undecodable"), "{error}");
-    // Reading the records of a negative response stops the run, as any field read does.
-    assert!(answered(READ_EACH_DTC, &[&[0x7F, 0x19, 0x31]]).is_err());
+    // Reading the records of a negative response, or of a response to another sub-function,
+    // stops the run, as any field read does.
+    for other in [
+        &[0x7F, 0x19, 0x31][..],
+        &[0x59, 0x0A, 0xFF, 0x12, 0x34, 0x56, 0x09],
+    ] {
+        let error = answered(READ_EACH_DTC, &[other]).unwrap_err();
+        assert!(error.contains("Undecodable"), "{other:02X?}: {error}");
+    }
+}
+
+/// The records and a record keep their type through a function's argument and result.
+#[test]
+fn dtc_records_pass_through_functions() {
+    let source = "def first(d):\n    return d[0]\n\ndef records():\n    \
+                  return diag.read_dtc(8)[\"fields\"][\"dtcs\"]\n\ndef main():\n    \
+                  dtc = first(records())\n    if dtc[\"code\"] == 0x123456:\n        \
+                  diag.log(1, \"first\")\n";
+    assert_eq!(
+        answered(source, &[&[0x59, 0x02, 0xFF, 0x12, 0x34, 0x56, 0x09]]).unwrap(),
+        ["first"]
+    );
 }
 
 #[test]

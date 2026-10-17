@@ -167,7 +167,8 @@ pub struct Pos(pub u8);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResultMap {
     /// `diag.read_dtc`: `mask` is the field at `mask`; `dtcs` the repeat-until-end field at
-    /// `dtcs`, whose records are a `code_bits`-bit code then a `status_bits`-bit status.
+    /// `dtcs`, whose records are a `code_bits`-bit code then a `status_bits`-bit status, each
+    /// whole bytes and at most 56 bits wide.
     ReadDtc {
         mask: Pos,
         dtcs: Pos,
@@ -307,7 +308,9 @@ impl Call {
                     status_bits,
                 } => {
                     dtc_maps += 1;
-                    let whole = |bits: u8| bits > 0 && bits <= 64 && bits.is_multiple_of(8);
+                    // At most 56 bits, so that a code or a status built from the record's bytes
+                    // is a non-negative `int` (ADR-323).
+                    let whole = |bits: u8| bits > 0 && bits <= 56 && bits.is_multiple_of(8);
                     intent == Intent::ReadDtc
                         && step.declared
                         && mask != dtcs

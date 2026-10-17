@@ -2044,8 +2044,9 @@ impl<'a> Lowerer<'a> {
             self.not_lowerable(
                 span,
                 format!(
-                    "`{}` does not take a response: read it through its keys, such as \
-                     `res[\"raw\"]` (3.4)",
+                    "`{}` does not take a response, DTC records or a DTC record: read it \
+                     through its keys, such as `res[\"raw\"]` or `dtc[\"code\"]`, or count \
+                     the records with `len` (3.4)",
                     binop_symbol(op)
                 ),
             );
@@ -3999,7 +4000,11 @@ impl<'a> Lowerer<'a> {
                 Some(_) => fields[..=usize::from(dtcs.0)]
                     .iter()
                     .scan(Some((1 + prefix as u32) * 8), |next, field| {
-                        let start = (*next)?;
+                        // A field after one whose length is not fixed has no known start, so
+                        // the records' start could not be counted (`dtc_records`).
+                        let Some(start) = *next else {
+                            return Some((field, false));
+                        };
                         let placed = match field.placement() {
                             diag_ir::declaration::Placement::Absolute => {
                                 field.bit_offset() == start

@@ -374,7 +374,7 @@ bytes they are:
 res = diag.read_dtc(0x08)
 if res["ok"]:
     dtcs = res["fields"]["dtcs"]
-    # @maxIterations 255
+    # @maxIterations 1023
     for i in range(len(dtcs)):
         dtc = dtcs[i]
         if dtc["status"] & 0x08:
@@ -389,6 +389,9 @@ if res["ok"]:
   `STAR_NOT_IN_PROFILE`.
 - These are `STAR_NOT_LOWERABLE`: `for d in dtcs` (loop over `range(len(dtcs))` instead), the
   truth value of the records or a record, and a comparison of either.
+- Each `res["fields"]["dtcs"]` decodes the response again, so store the records once before a
+  loop rather than reading them in it. The loop limit in the example allows 1023 records, the
+  most a 4095-byte response holds.
 
 ---
 

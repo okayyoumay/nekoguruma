@@ -41,7 +41,8 @@ records: a code then a status, each a whole-byte big-endian `uint` without a con
      outside the records, a negative one included, stops the run as an index out of range, as an
      index into bytes does.
    - A record's `code` and `status` are read with literal keys, each as a big-endian `uint` of
-     the profile's width, built from the record's bytes with `IndexGet`, shifts and `BitOr`.
+     the profile's width, built from the record's bytes with `IndexGet`, shifts and `BitOr`. A
+     profile's code and status are at most 56 bits wide, so the value is never negative.
    - Any other key is `STAR_NOT_IN_PROFILE`, and a key that is not a literal is
      `STAR_DYNAMIC_KEY_NOT_ALLOWED`.
    - The records and a record are their own lowering types, as a response and its fields are.

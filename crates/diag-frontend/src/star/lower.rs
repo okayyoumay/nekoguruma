@@ -3444,15 +3444,17 @@ impl<'a> Lowerer<'a> {
         else {
             unreachable!("`Profile::validate` gives `diag.read_dtc` its DTC map")
         };
-        let fields: Vec<_> = self
+        let positive = self
             .variant
             .services()
             .and_then(|services| services.iter().find(|s| s.id() == service))
-            .and_then(|s| s.positive())
+            .and_then(|s| s.positive());
+        let fields: Vec<_> = positive
             .and_then(|positive| positive.fields())
             .into_iter()
             .flatten()
             .collect();
+        let prefix = positive.and_then(|p| p.prefix()).map_or(0, |p| p.len());
         let layer = self.requests.profile.layer;
         let mask_field = fields.get(usize::from(mask.0));
         let problem = match mask_field {
@@ -3487,7 +3489,34 @@ impl<'a> Lowerer<'a> {
                     "declares fields after `{}`, which runs to the end of the message",
                     records.short_name().unwrap_or_default()
                 )),
-                Some(_) => None,
+                // The profile's fields are on the wire one after the other from the end of the
+                // prefix, as the profile's response has them.
+                Some(_) => fields[..=usize::from(dtcs.0)]
+                    .iter()
+                    .scan(Some((1 + prefix as u32) * 8), |next, field| {
+                        let start = (*next)?;
+                        let placed = match field.placement() {
+                            diag_ir::declaration::Placement::Absolute => {
+                                field.bit_offset() == start
+                            }
+                            diag_ir::declaration::Placement::AfterPrevious => {
+                                field.bit_offset() == 0 && start % 8 == 0
+                            }
+                            _ => false,
+                        };
+                        *next = (field.length_kind() == LengthKind::Fixed
+                            && field.shape_type() == diag_ir::declaration::Shape::NONE)
+                            .then(|| start + field.bit_length());
+                        Some((field, placed))
+                    })
+                    .find(|(_, placed)| !placed)
+                    .map(|(field, _)| {
+                        format!(
+                            "has `{}` apart from the field before it, so the response is not \
+                             the profile's fields one after the other",
+                            field.short_name().unwrap_or_default()
+                        )
+                    }),
             },
         };
         if let Some(problem) = problem {

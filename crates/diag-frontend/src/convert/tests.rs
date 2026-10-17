@@ -1035,11 +1035,21 @@ fn a_dtc_read_needs_one_service_that_fits_the_profile() {
         errors.iter().any(|e| e.hint.contains("byte edge")),
         "{errors:?}"
     );
-    // Records run to the end of the message, so nothing may follow them.
-    let trailing = fields.replace(
-        "response:readDtcByStatusMask,records,2,,,,,,,,,,repeat,dtcRecord,\n",
-        "response:readDtcByStatusMask,records,2,,,,,,,,,,repeat,dtcRecord,\n\
-         response:readDtcByStatusMask,trailer,,,uint,8,,,,,,,,,\n",
+    // Records one byte after the mask leave a byte the profile's response does not have.
+    let late = fields.replace(
+        "response:readDtcByStatusMask,records,2,",
+        "response:readDtcByStatusMask,records,3,",
+    );
+    assert_ne!(late, fields);
+    let found = codes(late);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].0, crate::star::StarCode::NotInProfile);
+    assert!(found[0].1.contains("`records` apart"), "{found:?}");
+    // Records run to the end of the message, so nothing may follow them. The row is appended
+    // to the table, whatever line ends the checkout gives it.
+    let trailing = format!(
+        "{}\nresponse:readDtcByStatusMask,trailer,,,uint,8,,,,,,,,,\n",
+        fields.trim_end()
     );
     assert_ne!(trailing, fields);
     let found = codes(trailing);

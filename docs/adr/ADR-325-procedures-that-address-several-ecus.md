@@ -209,7 +209,12 @@ shape survives inside the second as the access program of item 5.
     before the erase it ends as failed when the journal holds no transfer-start marker, and in
     on-site intervention, which a later resume may retry (ADR-290), when it does, since an earlier
     erase may have left the ECU without a valid application. The agent does not run the
-    access program again by itself. Keep-alive answers from targets that are not access targets
+    access program again by itself. A request that gets no answer while an access target has
+    reported tester-present errors since its last good answer is held rather than handled at
+    once: the agent waits until that access target answers again, when the failure is handled as
+    any failed request is, or is counted lost, when the outcome above takes its place, so a
+    request that times out first cannot turn a lost gateway into an ordinary interrupted step
+    (ADR-235). Keep-alive answers from targets that are not access targets
     are not watched: a request to such a target that fails is handled as any failed request is.
 13. **An access target carries no flash plan.** The conversion and `Program::validate` refuse
     a flash plan on a target declared as an access target. Reprogramming a gateway that other

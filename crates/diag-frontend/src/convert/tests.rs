@@ -413,6 +413,9 @@ impl diag_ir::DiagHost for Recording {
         self.0.push((service, payload.to_vec()));
         Ok(vec![service as u8 + 0x40])
     }
+    fn send_receive(&mut self, _: u32, _: &[u8]) -> Result<Vec<u8>, NotSent> {
+        Err(NotSent)
+    }
     fn read_dtc(&mut self, _: u8) -> Result<Vec<u8>, NotSent> {
         Err(NotSent)
     }
@@ -649,6 +652,9 @@ impl diag_ir::DiagHost for Answering {
 
     fn service_request(&mut self, _: u16, _: &[u8]) -> Result<Vec<u8>, NotSent> {
         self.responses.pop_front().ok_or(NotSent)
+    }
+    fn send_receive(&mut self, _: u32, _: &[u8]) -> Result<Vec<u8>, NotSent> {
+        Err(NotSent)
     }
     fn read_dtc(&mut self, _: u8) -> Result<Vec<u8>, NotSent> {
         Err(NotSent)

@@ -288,14 +288,15 @@ pub fn check_program(program: &Program, permission: Permission) -> Result<(), Jo
     refuse_beyond(program, permission)
 }
 
-/// [`check_program`] for a job, which also checks the response fields its program decodes
-/// (`Op::DecodeField`, ADR-316, ADR-318): a job without a document to decode them with, or one
-/// whose document does not declare a field the program decodes, is refused here rather than
-/// failing at the instruction, which could be after a write.
+/// [`check_program`] for a job, which also checks the declarations its program names
+/// (`diag_ir::check_declarations`): the response fields it decodes (`Op::DecodeField`,
+/// ADR-316, ADR-318) and the services it send-receives (ADR-321). A job without a document to
+/// decode with, or one whose document does not declare what the program names, is refused here
+/// rather than failing at the instruction, which could be after a write.
 pub fn check_job(job: &Job, permission: Permission) -> Result<(), JobError> {
     check_program(&job.program, permission)?;
     match &job.document {
-        Some(document) => diag_ir::check_decode_fields(&job.program, &document.variant())
+        Some(document) => diag_ir::check_declarations(&job.program, &document.variant())
             .map_err(|(pc, source)| JobError::Undeclared { pc, source }),
         None if job
             .program
@@ -1463,6 +1464,9 @@ mod tests {
             }
             Ok(vec![service as u8 + 0x40])
         }
+        fn send_receive(&mut self, _: u32, _: &[u8]) -> Result<Vec<u8>, HostError> {
+            Err(HostError::NoResponse)
+        }
         fn read_dtc(&mut self, _mask: u8) -> Result<Vec<u8>, HostError> {
             Err(HostError::NoResponse)
         }
@@ -2190,6 +2194,9 @@ mod tests {
                 }
                 _ => Ok(vec![service as u8 + 0x40]),
             }
+        }
+        fn send_receive(&mut self, _: u32, _: &[u8]) -> Result<Vec<u8>, HostError> {
+            Err(HostError::NoResponse)
         }
         fn read_dtc(&mut self, _: u8) -> Result<Vec<u8>, HostError> {
             Err(HostError::NoResponse)

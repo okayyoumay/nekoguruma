@@ -109,6 +109,9 @@ impl DiagHost for Recording {
             .cloned()
             .unwrap_or(response))
     }
+    fn send_receive(&mut self, _: u32, _: &[u8]) -> Result<Vec<u8>, NotSent> {
+        Err(NotSent)
+    }
     fn read_dtc(&mut self, _: u8) -> Result<Vec<u8>, NotSent> {
         Err(NotSent)
     }

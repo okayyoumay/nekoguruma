@@ -42,7 +42,8 @@ pub use generated::diag::ir::{
     Layout, LayoutArgs, LayoutBuilder, LayoutOffset, LayoutT, LengthKind, LinearScale,
     LinearScaleT, MonitorSet, MonitorSetArgs, MonitorSetBuilder, MonitorSetOffset, MonitorSetT,
     NegativeResponse, NegativeResponseArgs, NegativeResponseBuilder, NegativeResponseOffset,
-    NegativeResponseT, Placement, PositiveResponse, PositiveResponseArgs, PositiveResponseBuilder,
+    NegativeResponseT, NegativeShape, NegativeShapeArgs, NegativeShapeBuilder, NegativeShapeOffset,
+    NegativeShapeT, Placement, PositiveResponse, PositiveResponseArgs, PositiveResponseBuilder,
     PositiveResponseOffset, PositiveResponseT, Protocol, ProtocolArgs, ProtocolBuilder,
     ProtocolOffset, ProtocolT, Repeat, RepeatArgs, RepeatBuilder, RepeatCount, RepeatOffset,
     RepeatT, Request, RequestArgs, RequestBuilder, RequestOffset, RequestT, Select, SelectArgs,
@@ -275,6 +276,17 @@ mod tests {
             id: 7,
             short_name: Some("exampleEcuV1".into()),
             part_numbers: Some(vec!["NGR-EX-0001".into()]),
+            protocols: Some(vec![ProtocolT {
+                short_name: Some("ISO15765".into()),
+                application_layer: Some("UDS".into()),
+                negative_shape: Some(Box::new(NegativeShapeT {
+                    marker: 0x7F,
+                    echoes_sid: true,
+                    code_at: 2,
+                    pending: Some(vec![0x78, 0x21, 0x23]),
+                })),
+                ..Default::default()
+            }]),
             services: Some(vec![service]),
             ..Default::default()
         };
@@ -435,6 +447,16 @@ mod tests {
         assert_eq!(field.placement(), Placement::Absolute);
         assert_eq!(field.byte_order(), ByteOrder::Big);
         assert_eq!(service.p2_millis(), 50);
+
+        // The application layer and its negative-response shape (ADR-321).
+        let protocol = loaded.variant().unwrap().protocols().unwrap().get(0);
+        assert_eq!(protocol.application_layer(), Some("UDS"));
+        let shape = protocol.negative_shape().unwrap();
+        assert_eq!(
+            (shape.marker(), shape.echoes_sid(), shape.code_at()),
+            (0x7F, true, 2)
+        );
+        assert_eq!(shape.pending().unwrap().bytes(), [0x78, 0x21, 0x23]);
     }
 
     #[test]

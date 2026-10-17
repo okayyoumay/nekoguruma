@@ -17,6 +17,9 @@ impl DiagHost for NoHost {
     fn service_request(&mut self, _: u16, _: &[u8]) -> Result<Vec<u8>, NoHostError> {
         unreachable!("no primitive is lowered yet")
     }
+    fn send_receive(&mut self, _: u32, _: &[u8]) -> Result<Vec<u8>, NoHostError> {
+        unreachable!("no primitive is lowered yet")
+    }
     fn read_dtc(&mut self, _: u8) -> Result<Vec<u8>, NoHostError> {
         unreachable!("no primitive is lowered yet")
     }
@@ -969,6 +972,9 @@ impl DiagHost for ScriptedHost {
     type Error = NoHostError;
 
     fn service_request(&mut self, _: u16, _: &[u8]) -> Result<Vec<u8>, NoHostError> {
+        unreachable!("not lowered yet")
+    }
+    fn send_receive(&mut self, _: u32, _: &[u8]) -> Result<Vec<u8>, NoHostError> {
         unreachable!("not lowered yet")
     }
     fn read_dtc(&mut self, _: u8) -> Result<Vec<u8>, NoHostError> {

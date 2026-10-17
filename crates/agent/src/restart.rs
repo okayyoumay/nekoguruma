@@ -2596,6 +2596,9 @@ mod tests {
             }
             response.ok_or(HostError::NoResponse)
         }
+        fn send_receive(&mut self, _: u32, _: &[u8]) -> Result<Vec<u8>, HostError> {
+            Err(HostError::Unsupported("SendReceive"))
+        }
         fn read_dtc(&mut self, _: u8) -> Result<Vec<u8>, HostError> {
             Err(HostError::Unsupported("ReadDtc"))
         }

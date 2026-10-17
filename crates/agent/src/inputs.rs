@@ -584,6 +584,9 @@ mod tests {
             self.sent.push((service, payload.to_vec()));
             self.responses.remove(0)
         }
+        fn send_receive(&mut self, _: u32, _: &[u8]) -> Result<Vec<u8>, HostError> {
+            unreachable!()
+        }
         fn read_dtc(&mut self, _: u8) -> Result<Vec<u8>, HostError> {
             unreachable!()
         }

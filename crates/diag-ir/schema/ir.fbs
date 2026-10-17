@@ -320,6 +320,16 @@ table ComParam {
   unit_id: uint32 = 0;
 }
 
+// Where a negative response carries what (ADR-309 item 5, ADR-321): a marker byte first, then
+// the request's service identifier if echoes_sid, and the code at byte code_at.
+table NegativeShape {
+  marker: uint8;
+  echoes_sid: bool = false;
+  code_at: uint8;
+  // The codes that mean the answer is still pending, which the worker absorbs
+  pending: [uint8];
+}
+
 table Protocol {
   short_name: string;       // "ISO15765" etc.
   baud_rate: uint32;
@@ -329,6 +339,11 @@ table Protocol {
   functional_id: uint32 = 0;
   extended_addressing: bool = false;
   params: [ComParam];
+  // The application layer carried over this protocol ("UDS" etc., ADR-309 item 3) and the
+  // shape of its negative responses, which the generic send-receive matches answers against
+  // (ADR-309 item 4, ADR-321). Absent in a document whose definition names no layer.
+  application_layer: string;
+  negative_shape: NegativeShape;
 }
 
 // ---------------------------------------------------------------- Flash description

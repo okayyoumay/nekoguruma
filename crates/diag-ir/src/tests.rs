@@ -49,6 +49,11 @@ impl DiagHost for MockHost {
             .push(format!("service {service:#x} {payload:02x?}"));
         self.response()
     }
+    fn send_receive(&mut self, service: u32, request: &[u8]) -> Result<Vec<u8>, MockError> {
+        self.calls
+            .push(format!("send_receive {service} {request:02x?}"));
+        self.response()
+    }
     fn read_dtc(&mut self, mask: u8) -> Result<Vec<u8>, MockError> {
         self.calls.push(format!("read_dtc {mask:#x}"));
         self.response()
@@ -687,6 +692,8 @@ fn diagnostic_primitives_reach_the_host() {
         vec![
             Op::PushBytes(0),
             Op::ServiceRequest { service: 0x22 },
+            Op::PushBytes(4),
+            Op::SendReceive { service: 7 },
             Op::ReadDtc { mask: 0x08 },
             Op::PushBytes(1),
             Op::RoutineControl {
@@ -703,11 +710,18 @@ fn diagnostic_primitives_reach_the_host() {
                 message: 3,
             },
         ],
-        vec![vec![0xF1, 0x90], vec![0xAA], vec![7], b"done".to_vec()],
+        vec![
+            vec![0xF1, 0x90],
+            vec![0xAA],
+            vec![7],
+            b"done".to_vec(),
+            vec![0x19, 0x02, 0x08],
+        ],
     );
     let mut host = MockHost {
         responses: VecDeque::from([
             Ok(vec![0x62, 0xF1, 0x90]),
+            Ok(vec![0x59, 0x02, 0xFF]),
             Ok(vec![0x59]),
             Ok(vec![0x71]),
             Ok(vec![0x01]),
@@ -720,6 +734,7 @@ fn diagnostic_primitives_reach_the_host() {
         host.calls,
         [
             "service 0x22 [f1, 90]",
+            "send_receive 7 [19, 02, 08]",
             "read_dtc 0x8",
             "routine 0xff00 1 [aa]",
             "flash 3 [aa]",
@@ -733,12 +748,13 @@ fn diagnostic_primitives_reach_the_host() {
         vm.state.stack,
         [
             Value::Bytes(vec![0x62, 0xF1, 0x90]),
+            Value::Bytes(vec![0x59, 0x02, 0xFF]),
             Value::Bytes(vec![0x59]),
             Value::Bytes(vec![0x71]),
             Value::Bytes(vec![0x01]),
         ]
     );
-    assert_eq!(vm.state.steps, 11);
+    assert_eq!(vm.state.steps, 13);
 }
 
 /// 8.2.5: after a worker crash or VCI disconnect the VM state is retained and execution resumes
@@ -1029,6 +1045,7 @@ fn primitive_programs() -> Vec<(Op, Program)> {
     let alone = |op: Op| (op.clone(), prog(vec![i(0), op], constants.clone()));
     vec![
         with_bytes(Op::ServiceRequest { service: 0x22 }),
+        with_bytes(Op::SendReceive { service: 7 }),
         alone(Op::ReadDtc { mask: 0xFF }),
         with_bytes(Op::RoutineControl { routine: 1, sub: 1 }),
         with_bytes(Op::SecurityAccess { level: 1 }),
@@ -1058,6 +1075,7 @@ fn every_primitive_is_atomic_on_host_error() {
         host.fail_next = !matches!(
             op,
             Op::ServiceRequest { .. }
+                | Op::SendReceive { .. }
                 | Op::ReadDtc { .. }
                 | Op::RoutineControl { .. }
                 | Op::RecordInput { .. }
@@ -1754,6 +1772,7 @@ fn current_op_and_step_agree_on_primitives() {
 fn primitives_run_at_the_stack_limit() {
     let cases = [
         (Op::ServiceRequest { service: 1 }, MAX_STACK),
+        (Op::SendReceive { service: 1 }, MAX_STACK),
         (Op::RoutineControl { routine: 1, sub: 1 }, MAX_STACK),
         (Op::SecurityAccess { level: 1 }, MAX_STACK),
         (Op::FlashTransfer { block: 0 }, MAX_STACK),
@@ -3278,7 +3297,7 @@ mod decode_field {
         let bytes = document();
         let variant = load_ecu_document(&bytes).unwrap().variant().unwrap();
         let decode = |service, field| Op::DecodeField { service, field };
-        let check = |code| crate::check_decode_fields(&prog(code, Vec::new()), &variant);
+        let check = |code| crate::check_declarations(&prog(code, Vec::new()), &variant);
         assert_eq!(check(vec![decode(7, 1), decode(8, 4)]), Ok(()));
         assert_eq!(
             check(vec![decode(7, 1), i(0), decode(7, 6)]),
@@ -3309,6 +3328,33 @@ mod decode_field {
                     field: 99
                 }
             ))
+        );
+    }
+
+    #[test]
+    fn a_send_receive_must_name_a_service_with_a_positive_response() {
+        let bytes = document();
+        let variant = load_ecu_document(&bytes).unwrap().variant().unwrap();
+        let send = |service| Op::SendReceive { service };
+        let check = |code| crate::check_declarations(&prog(code, Vec::new()), &variant);
+        assert_eq!(check(vec![send(7), send(8)]), Ok(()));
+        // Service 9 declares no positive response, and service 10 does not exist.
+        for service in [9, 10] {
+            assert_eq!(
+                check(vec![send(7), i(0), send(service)]),
+                Err((2, VmError::UnknownService { service }))
+            );
+        }
+        // The first instruction that fails is reported, whatever its kind.
+        assert_eq!(
+            check(vec![
+                send(10),
+                Op::DecodeField {
+                    service: 7,
+                    field: 99
+                }
+            ]),
+            Err((0, VmError::UnknownService { service: 10 }))
         );
     }
 

@@ -33,7 +33,9 @@ use crate::declaration::{EcuVariant, Shape};
 /// patterns (ADR-315); a document of version 9 would read every entry as one pattern.
 /// 11: `Op` gained `DecodeField`, and `VmError` gained `NoDeclarations`, `UnknownField`,
 /// `ShapedField` and `Undecodable` (ADR-316).
-pub const IR_SCHEMA_VERSION: u32 = 11;
+/// 12: `Op` gained `SendReceive` and `VmError` gained `UnknownService`; `Protocol` gained
+/// `application_layer` and `negative_shape` (ADR-321).
+pub const IR_SCHEMA_VERSION: u32 = 12;
 
 /// The longest code, in bytes, that `Program::validate` accepts for a `Fail` (ADR-280).
 pub const MAX_FAILURE_CODE_LEN: usize = 128;
@@ -190,6 +192,16 @@ pub enum Op {
         service: u32,
         field: u32,
     },
+
+    // Diagnostic primitives. Appended after `DecodeField` (ADR-233, ADR-321).
+    /// The generic send-receive (ADR-309 item 4): sends the `Bytes` on top of the stack, a
+    /// complete request starting with its service identifier, and replaces them with the
+    /// answer. `service` (`Service.id`) is the declared service whose response the request
+    /// expects; the host matches the answer against that service's positive response and the
+    /// link protocol's negative-response shape, and builds no request bytes.
+    SendReceive {
+        service: u32,
+    },
 }
 
 // ---------------------------------------------------------------- Program
@@ -259,6 +271,7 @@ impl Op {
             Op::ServiceRequest { .. }
             | Op::ReadDtc { .. }
             | Op::RoutineControl { .. }
+            | Op::SendReceive { .. }
             | Op::SecurityAccess { .. }
             | Op::FlashTransfer { .. }
             | Op::Wait { .. }
@@ -359,6 +372,10 @@ pub trait DiagHost {
     type Error: std::error::Error + Send + Sync + 'static;
 
     fn service_request(&mut self, service: u16, payload: &[u8]) -> Result<Vec<u8>, Self::Error>;
+    /// [`Op::SendReceive`]: sends `request` as it is and returns the answer to it, matched
+    /// against the positive response of `service` (`Service.id`) and the negative-response
+    /// shape of the link's protocol (ADR-309 item 4, ADR-321).
+    fn send_receive(&mut self, service: u32, request: &[u8]) -> Result<Vec<u8>, Self::Error>;
     fn read_dtc(&mut self, mask: u8) -> Result<Vec<u8>, Self::Error>;
     fn routine_control(
         &mut self,
@@ -728,6 +745,12 @@ impl Vm {
                     .map_err(StepError::Host)?;
                 self.replace(1, Value::Bytes(response));
             }
+            Op::SendReceive { service } => {
+                let response = host
+                    .send_receive(*service, input.bytes())
+                    .map_err(StepError::Host)?;
+                self.replace(1, Value::Bytes(response));
+            }
             Op::ReadDtc { mask } => {
                 let response = host.read_dtc(*mask).map_err(StepError::Host)?;
                 self.push_checked(Value::Bytes(response));
@@ -805,9 +828,10 @@ impl Vm {
         Ok(match op {
             // Send the bytes on top of the stack and replace them with the answer, which needs
             // no room.
-            Op::ServiceRequest { .. } | Op::RoutineControl { .. } | Op::SecurityAccess { .. } => {
-                HostInput::Bytes(self.bytes_operand()?)
-            }
+            Op::ServiceRequest { .. }
+            | Op::SendReceive { .. }
+            | Op::RoutineControl { .. }
+            | Op::SecurityAccess { .. } => HostInput::Bytes(self.bytes_operand()?),
             // Send the bytes on top of the stack, which are then dropped.
             Op::FlashTransfer { .. } => HostInput::Bytes(self.bytes_operand()?),
             // Push the answer.
@@ -981,20 +1005,34 @@ fn store(slots: &mut Vec<Option<Value>>, slot: u16, value: Value) {
 
 /// The value of field `field` of service `service`'s positive response in `message`, decoded
 /// through `variant` ([`Op::DecodeField`], ADR-316).
-/// Checks every `Op::DecodeField` of `program` against `variant`, as the instruction checks it
-/// before decoding: the error of the first one that names a field the variant does not declare
-/// as a top-level field of the service's positive response, or one with a nested layout, with
-/// its instruction's index. These errors depend only on the declarations, so a caller can refuse
-/// such a program before it runs (ADR-316).
-pub fn check_decode_fields(
+/// Checks every instruction of `program` that names a declaration against `variant`, with the
+/// error of the first that fails and its instruction's index:
+/// - an `Op::DecodeField`, as the instruction checks it before decoding, naming a field the
+///   variant does not declare as a top-level field of the service's positive response, or one
+///   with a nested layout (ADR-316);
+/// - an `Op::SendReceive` naming a service the variant does not declare with a positive
+///   response, which the host could not match an answer against (ADR-321).
+///
+/// These errors depend only on the declarations, so a caller can refuse such a program before
+/// it runs.
+pub fn check_declarations(
     program: &Program,
     variant: &EcuVariant<'_>,
 ) -> Result<(), (u32, VmError)> {
     for (pc, op) in program.code.iter().enumerate() {
-        if let Op::DecodeField { service, field } = op {
-            declared_positive(variant, *service, *field)
-                .map_err(|error| (u32::try_from(pc).unwrap_or(u32::MAX), error))?;
-        }
+        let checked = match op {
+            Op::DecodeField { service, field } => {
+                declared_positive(variant, *service, *field).map(|_| ())
+            }
+            Op::SendReceive { service } => variant
+                .services()
+                .and_then(|services| services.iter().find(|s| s.id() == *service))
+                .and_then(|s| s.positive())
+                .map(|_| ())
+                .ok_or(VmError::UnknownService { service: *service }),
+            _ => Ok(()),
+        };
+        checked.map_err(|error| (u32::try_from(pc).unwrap_or(u32::MAX), error))?;
     }
     Ok(())
 }
@@ -1244,6 +1282,8 @@ pub enum VmError {
     ShapedField { service: u32, field: u32 },
     #[error("the response does not decode as service {service}'s positive response")]
     Undecodable { service: u32 },
+    #[error("service {service} has no declared positive response to send-receive")]
+    UnknownService { service: u32 },
 }
 
 #[cfg(test)]

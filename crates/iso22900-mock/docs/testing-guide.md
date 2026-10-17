@@ -168,7 +168,7 @@ The `rlib` portion exports the following Rust functions for use in test setup:
 | `STANDARD_BUS_TYPE_DWCAN` | 3111 | `PDUGetObjectId` of the bus type `ISO_11898_2_DWCAN` (ADR-319) |
 | `STANDARD_PROTOCOL_UDS_ON_CAN` | 3112 | `PDUGetObjectId` of the protocol `ISO_14229_3_on_ISO_15765_2` (ADR-319) |
 | `STANDARD_PIN_TYPE_HI`, `STANDARD_PIN_TYPE_LOW` | 3311, 3312 | `PDUGetObjectId` of the pin types `HI` and `LOW` (ADR-319) |
-| `STANDARD_COMPARAMS` | 3210 to 3219 | `PDUGetObjectId` of the ISO 22900-2 (2022) ComParams (Annex B.3) the agent sets on a UDS on CAN link: `CP_Baudrate`, `CP_P2Max`, `CP_P2Star`, `CP_RC78Handling`, `CP_RCByteOffset`, `CP_RC78CompletionTimeout`, `CP_CanPhysReqId`, `CP_CanRespUSDTId`; and the ISO 15765-2 `CP_BlockSize` and `CP_StMin` the example ECU declares (ADR-324). The mock keeps no ComParam values |
+| `STANDARD_COMPARAMS` | 3210 to 3219 | `PDUGetObjectId` of the ISO 22900-2 (2022) ComParams (Annex B.3) the agent sets on a UDS on CAN link: `CP_Baudrate`, `CP_P2Max`, `CP_P2Star`, `CP_RC78Handling`, `CP_RCByteOffset`, `CP_RC78CompletionTimeout`, `CP_CanPhysReqId`, `CP_CanRespUSDTId`; and `CP_BlockSize` and `CP_StMin`, the block size and minimum separation time of ISO 15765-2 (2024) 9.6.5.3 and 9.6.5.4, which the example ECU declares (ADR-324). The mock keeps no ComParam values |
 | `MOCK_LOGICAL_LINK_HANDLE` | 3001 | Base CLL handle (first `PDUCreateComLogicalLink`) |
 | `MOCK_COM_PRIMITIVE_HANDLE` | 4001 | Base COP handle (first `PDUStartComPrimitive`) |
 | `MOCK_TIMESTAMP` | 4242 | Timestamp returned by `PDUGetTimestamp` |

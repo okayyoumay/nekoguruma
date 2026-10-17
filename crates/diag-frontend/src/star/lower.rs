@@ -4340,9 +4340,11 @@ fn fold_method(s: &str, method: &str, args: &[Const]) -> Result<Const, String> {
 #[path = "lower_tests.rs"]
 mod tests;
 
-/// Whether `field` is a fixed-width `uint` of `bits` bits, a value sent or read as its own bits.
+/// Whether `field` is a fixed-width `uint` of `bits` bits, a value sent or read as its own bits:
+/// most significant byte first, as the profiles' values are (ADR-314 item 2).
 fn is_fixed_uint(field: &diag_ir::declaration::Field<'_>, bits: u8) -> bool {
     field.kind() == diag_ir::declaration::DataKind::Uint
+        && (bits <= 8 || field.byte_order() == diag_ir::declaration::ByteOrder::Big)
         && field.length_kind() == LengthKind::Fixed
         && field.bit_length() == u32::from(bits)
         && field.shape_type() == diag_ir::declaration::Shape::NONE

@@ -1012,6 +1012,23 @@ fn a_dtc_read_needs_one_service_that_fits_the_profile() {
     assert_eq!(found.len(), 1, "{found:?}");
     assert_eq!(found[0].0, crate::star::StarCode::NotInProfile);
     assert!(found[0].1.contains("availabilityMask"), "{found:?}");
+    // A little-endian code would read the profile's code byte-reversed.
+    let little: String = fields
+        .lines()
+        .enumerate()
+        .map(|(at, line)| {
+            let cell = match at {
+                0 => "byte_order",
+                _ if line.starts_with("layout:dtcRecord,dtc,") => "little",
+                _ => "",
+            };
+            format!("{line},{cell}\n")
+        })
+        .collect();
+    let found = codes(little);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].0, crate::star::StarCode::NotInProfile);
+    assert!(found[0].1.contains("records"), "{found:?}");
     // Records whose code is 16 bits wide are not the profile's DTC records.
     let wide_status = fields.replace(
         "layout:dtcRecord,dtc,0,,uint,24,",

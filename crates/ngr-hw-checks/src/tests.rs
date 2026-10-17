@@ -302,6 +302,40 @@ fn a_loopback_runs_between_two_ends_of_one_bus() {
     assert!(parse(&no_vci).is_err());
     let same_vci = format!("class = \"T0\"\n[[endpoint]]{vci_end}[[endpoint]]{vci_end}");
     assert!(parse(&same_vci).is_err());
+    // Two channels of one VCI, the preferred loopback, differ by their channel.
+    let channel = |name: &str, request: &str, response: &str| {
+        vci_end
+            .replacen(
+                "[endpoint.vci]",
+                &format!("channel = \"{name}\"\n[endpoint.vci]"),
+                1,
+            )
+            .replacen("request_id = 0x124", &format!("request_id = {request}"), 1)
+            .replacen(
+                "response_id = 0x123",
+                &format!("response_id = {response}"),
+                1,
+            )
+    };
+    let two_channels = format!(
+        "class = \"T0\"\n[[endpoint]]{}[[endpoint]]{}",
+        channel("CAN_CH1", "0x123", "0x124"),
+        channel("CAN_CH2", "0x124", "0x123")
+    );
+    parse(&two_channels).unwrap();
+    let one_channel = format!(
+        "class = \"T0\"\n[[endpoint]]{}[[endpoint]]{}",
+        channel("CAN_CH1", "0x123", "0x124"),
+        channel("CAN_CH1", "0x124", "0x123")
+    );
+    assert!(parse(&one_channel).is_err());
+    // A SocketCAN end has no channel.
+    let can_channel = T0_PROFILE.replacen(
+        "socketcan = \"can0\"",
+        "socketcan = \"can0\"\nchannel = \"1\"",
+        1,
+    );
+    assert!(parse(&can_channel).is_err());
     let rate = T0_PROFILE.replacen("baud_rate = 500000", "baud_rate = 250000", 1);
     assert!(parse(&rate).is_err());
     let not_crossed = T0_PROFILE.replacen("request_id = 0x124", "request_id = 0x125", 1);

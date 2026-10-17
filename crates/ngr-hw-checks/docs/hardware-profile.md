@@ -29,7 +29,7 @@ A TOML file outside the repository. Unknown keys are refused.
 | `class` | `"T0"`, `"T1"`, `"T2"` or `"T3"` (design 13.5) |
 | `[vci]` | T1 to T3: the VCI (below) |
 | `[link]` | T1 to T3: the link (below) |
-| `[[endpoint]]` | T0 only, exactly two: each names a `[endpoint.vci]` or a `socketcan` interface (such as `"can0"`), and a `[endpoint.link]`. At least one end is a VCI channel, the two ends differ, and their links are one bus: the same `baud_rate` and `id_bits`, each end's `request_id` the other's `response_id` |
+| `[[endpoint]]` | T0 only, exactly two: each names a `[endpoint.vci]`, with its `channel` (such as a J2534-2 additional channel's protocol name) when both ends are on one VCI, or a `socketcan` interface (such as `"can0"`), and a `[endpoint.link]`. At least one end is a VCI channel, the two ends differ (two ends on one VCI by their `channel`), and their links are one bus: the same `baud_rate` and `id_bits`, each end's `request_id` the other's `response_id` |
 | `allow` | Optional. Narrows the class to the listed operations: `"configuration-write"`, `"routine"`, `"reprogramming"`, `"fault-injection"`. Without it the profile keeps its class's operations |
 | `expendable_ecu` | T2 only: the ECU may be reprogrammed |
 | `[power]` | T1 and T2 only: the commands that switch the supply `off` and `on`, each a program and its arguments |

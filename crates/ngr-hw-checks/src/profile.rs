@@ -140,6 +140,9 @@ pub struct Link {
 #[serde(deny_unknown_fields)]
 pub struct Endpoint {
     pub vci: Option<Vci>,
+    /// The VCI's channel, such as a J2534-2 additional channel's protocol name. Required when
+    /// both ends are channels of the same VCI, and then different.
+    pub channel: Option<String>,
     /// A SocketCAN interface name, such as `can0`.
     pub socketcan: Option<String>,
     pub link: Link,
@@ -482,11 +485,12 @@ fn check_link(link: &Link) -> Result<(), ProfileError> {
 
 fn check_endpoint(endpoint: &Endpoint) -> Result<(), ProfileError> {
     match (&endpoint.vci, &endpoint.socketcan) {
-        (Some(vci), None) => check_vci(vci)?,
-        (None, Some(interface)) if !interface.is_empty() => {}
+        (Some(vci), None) if endpoint.channel.as_deref() != Some("") => check_vci(vci)?,
+        (None, Some(interface)) if !interface.is_empty() && endpoint.channel.is_none() => {}
         _ => {
             return Err(invalid(
-                "an `endpoint` names either a `vci` or a `socketcan` interface",
+                "an `endpoint` names either a `vci`, optionally with its `channel`, or a \
+                 `socketcan` interface",
             ));
         }
     }
@@ -501,10 +505,13 @@ fn check_loopback(a: &Endpoint, b: &Endpoint) -> Result<(), ProfileError> {
             "a T0 loopback has a VCI channel at one end at least",
         ));
     }
-    if (a.vci.is_some() && a.vci == b.vci) || (a.socketcan.is_some() && a.socketcan == b.socketcan)
-    {
+    // Two channels of one VCI are the preferred loopback; they differ by their channel.
+    let same_vci_channel =
+        a.vci.is_some() && a.vci == b.vci && (a.channel.is_none() || a.channel == b.channel);
+    if same_vci_channel || (a.socketcan.is_some() && a.socketcan == b.socketcan) {
         return Err(invalid(
-            "a T0 loopback's two endpoints must be different channels",
+            "a T0 loopback's two endpoints must be different channels; two ends on one VCI name \
+             different `channel`s",
         ));
     }
     let (x, y) = (&a.link, &b.link);

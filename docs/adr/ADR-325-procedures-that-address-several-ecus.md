@@ -119,7 +119,9 @@ shape survives inside the second as the access program of item 5.
    in on-site intervention (`IdentityNotEstablished`, which a later resume may retry, ADR-290)
    instead of the passive teardown ADR-229 takes there, which would reach the reprogramming
    target's default-session confirmation without an unlocked gateway. A step of an access
-   program that fails ends the job as a lost access target would at that point (item 12).
+   program that fails ends the job as a lost access target would at that point (item 12),
+   at once: nothing in this order is held for a keep-alive answer, since an access target has a
+   loss clock only once its access program has ended (item 12).
    Every run also runs them again after any reopening of the links (a worker crash or VCI
    disconnect that the job survives) before the program continues. The main program may still select the access target for anything else.
 6. **Lowered once per combination of variants.** The main program is lowered for each
@@ -182,9 +184,9 @@ shape survives inside the second as the access program of item 5.
    anything is sent. Since the link is opened before the variant is identified, the conversion
    and `check_job` refuse a target whose candidate variants differ in the link settings
    (protocol, identifiers, addressing, bus parameters); probing a variant over its own link is
-   not part of this decision. Each target's link is the one its variants declare (ADR-324); on an
-   access target a declared tester-present ComParam is refused, since the agent sets those
-   itself (item 11).
+   not part of this decision. Each target's link is the one its variants declare (ADR-324); on
+   an access target a declared tester-present ComParam is refused, since the agent sends
+   TesterPresent itself there and a second sender would make answers unattributable (item 11).
 9. **At most one target is reprogrammed.** A job's flash sessions and recovery plans all belong
    to one target, the reprogramming target, whose identity the journal records and the restart
    checks (ADR-229). Other targets may receive any request the job's policy allows (security
@@ -219,48 +221,82 @@ shape survives inside the second as the access program of item 5.
     (the agent sets none of its ComParams and refuses a declared one, item 8): a second sender
     on the same link would make answers unattributable, since the J2534 worker discards any
     frame that matches its own expected tester-present response within its window, and that
-    worker reports no tester-present error event anyway. The same mechanism can keep a single
-    target's own session alive, which is decided separately.
+    worker reports no tester-present error event anyway. A probe must also be able to go while a
+    request to another target on the same channel waits for its final response, since a
+    reprogramming's erase and check routines behind a gateway chain response-pending for longer
+    than the gateway's session timeout, and routed traffic does not restart the gateway's timer
+    (ISO 14229-2 (2021) 9.5 restarts it only on a request the gateway's own server receives).
+    That is the worker's duty: it sends a queued send-receive on one logical link while another
+    logical link of the same channel is in its receive phase. ISO 22900-2 (2022) models logical
+    links that share a physical resource as independent (an application creates several on one
+    resource, 8.4.9, and takes `PDULockResource`, 8.4.13, only when it wants exclusivity), so
+    the native worker, which starts the primitive in the module and returns, leaves this to the
+    module, and the real-hardware checks (design 13.5) verify it per VCI with a response-pending
+    chain on a link behind a gateway on the same channel. The J2534 worker does not meet it yet:
+    its one poll task per channel stays in the receive phase of one link's send-receive and
+    serves only its own cyclic tester-present meanwhile, so a sibling link's probe waits for the
+    whole chain and the gateway really lapses, which the agent counts as the loss it is. Until
+    that worker dispatches sibling sends during a receive phase, a job with access targets on it
+    loses the gateway on any exchange behind it longer than the session timeout less one period.
+    The same mechanism can keep a single target's own session alive, which is decided
+    separately.
 12. **A lost access target ends the job by the section rules.** The agent counts as an access
     target's good answer only a final response, positive or negative (a response pending is
     none; the worker waits it out), to a request the agent itself sent on that target's link, a
-    probe of item 11 or one of the VM's, dated by the agent's own monotonic clock read before
-    the send call; the end of the access program is the first good answer. Nothing else is
-    credited: not silence, not a probe that was cancelled or ended without a final response, not
-    an answer the agent cannot attribute, not any time the worker or the module reports, and a
-    lost-events notification on that link leaves the probe in flight uncredited. The ECU's
-    session timer stops when it receives a request from the client that opened the session and
-    restarts when its final response is complete (ISO 14229-2 (2021) 9.5), so the session is
-    held at least until the credited date plus the declared timeout, and every delay in the
-    worker, in event delivery or in the agent only makes a credited date older, never newer. It
-    counts the target as lost once that last good answer is older than the declared session
-    timeout less one period, the margin that covers the timer's tolerance, and latches the loss:
-    a later good answer does not restore the target, since the ECU may have relocked meanwhile
-    and a TesterPresent is answered in the default session as well. Because the link carries one
-    exchange at a time, an exchange of the VM with an access target that outlasts the timeout
-    less one period after the last good answer counts the target lost even though the ECU's
-    timer was stopped during it; this errs toward a loss and is accepted, since nothing the
-    agent observes proves more. On a loss the agent adapts design 8.10.1's rule for an expired authentication, without the
-    renewal: outside any section and in an interruptible section the job ends at the next
-    instruction boundary as failed, terminal as ADR-280's declared failure and journaled the same
-    way, with its own failure code (a new edge from Writing to Failed in design 5.6); in an
-    uninterruptible section it continues to the section's end and then ends the same way; in a
-    section marked recovery required it ends in on-site intervention. In a restart's steps
-    before the erase it ends as failed when the journal holds no transfer-start marker, and in
-    on-site intervention, which a later resume may retry (ADR-290), when it does, since an earlier
-    erase may have left the ECU without a valid application. The agent does not run the
-    access program again by itself. A request to any target that gets no answer, or whose link
-    reported lost events, is held rather than handled at once, since the gateway it passed may
-    be failing while every answer so far was still good: the agent holds it until every access
-    target has a good answer dated after the failure (while the VM holds the request its access
-    links are free, so a healthy gateway's probe releases the hold within about one period and
-    one response window), and then handles the failure as any failed request is, or until one of
-    them is counted lost, which bounds the wait by the session timeout and puts the outcome
-    above in its place, except that inside an uninterruptible section the job ends in on-site
-    intervention, since the held request has no answer that would let the section continue to
-    its end; so a request that times out first cannot turn a lost gateway into an ordinary
-    interrupted step (ADR-235). Keep-alive answers from targets that are not access targets are
-    not watched: a request to such a target that fails is handled as any failed request is.
+    probe of item 11 or one of the VM's; the end of the access program is the first good answer.
+    A final response is dated by the agent's own monotonic clock, read before the send call, of
+    the earliest request in the unbroken run of requests on that link, probes and the VM's
+    alike, directly before it that ended without a final response the agent saw (cancelled,
+    timed out, failed to send or lost from the event stream); when the request before it was
+    answered, by its own reading. The ECU answers each request at most once, and a worker
+    attributes a frame to whichever active primitive expects it, with nothing on the wire to
+    tell two TesterPresents apart, so a late answer to an unanswered probe can be credited to a
+    later one; dating at the run's first send puts every possible origin at or after the
+    credited time, at the cost of one period per unanswered probe, which the bounds of item 5
+    already allow for. Nothing else is credited: not silence, not a probe that was cancelled or
+    ended without a final response, not an answer the agent cannot attribute, not any time the
+    worker or the module reports, and a lost-events notification on that link leaves the probe
+    in flight uncredited. The ECU's session timer stops when it receives a request from the
+    client that opened the session and restarts when its final response is complete (ISO 14229-2
+    (2021) 9.5), so the session is held at least until the credited date plus the declared
+    timeout, and every delay in the worker, in event delivery or in the agent only makes a
+    credited date older, never newer. It counts the target as lost once that last good answer is
+    older than the declared session timeout less one period, the margin that covers the timer's
+    tolerance, and latches the loss: a later good answer does not restore the target, since the
+    ECU may have relocked meanwhile and a TesterPresent is answered in the default session as
+    well. Because the link carries one exchange at a time, an exchange of the VM with the access
+    target itself that outlasts the timeout less one period after the last good answer counts
+    the target lost even though the ECU's timer was stopped during it; this errs toward a loss
+    and is accepted, since nothing the agent observes proves more. An exchange with another
+    target on the same channel is not such a case: the probe must go meanwhile (item 11), and a
+    worker that holds it back loses the gateway in fact. On a loss the agent adapts design
+    8.10.1's rule for an expired authentication, without the renewal: outside any section and in
+    an interruptible section the job ends at the next instruction boundary as failed, terminal
+    as ADR-280's declared failure and journaled the same way, with its own failure code (a new
+    edge from Writing to Failed in design 5.6); in an uninterruptible section it continues to
+    the section's end and then ends the same way; in a section marked recovery required it ends
+    in on-site intervention. In a restart's steps before the erase it ends as failed when the
+    journal holds no transfer-start marker, and in on-site intervention, which a later resume
+    may retry (ADR-290), when it does, since an earlier erase may have left the ECU without a
+    valid application. The agent does not run the access program again by itself. A request to
+    any target that gets no answer, or whose link reported lost events, is held rather than
+    handled at once, since the gateway it passed may be failing while every answer so far was
+    still good: the agent holds it until every access target whose access program has ended has
+    a good answer dated after the failure (while the VM holds the request those links are free,
+    so a healthy gateway's probe releases the hold within about one period and one response
+    window), and then handles the failure as any failed request is, or until one of them is
+    counted lost, which bounds the wait by the session timeout and puts the outcome above in its
+    place, except that inside an uninterruptible section the job ends in on-site intervention,
+    since the held request has no answer that would let the section continue to its end; so a
+    request that times out first cannot turn a lost gateway into an ordinary interrupted step
+    (ADR-235). Access targets whose access program has not ended have no loss clock and no last
+    good answer, so nothing waits on them: a failure in item 5's order before every access
+    program has ended is handled at once by its own rule (an identification as the primary's
+    identification failing does, item 7; a VIN read as item 5 says; an access-program step as a
+    lost access target would), and an identification read of a later target that gets no answer
+    is held like any request, all access programs having ended by then. Keep-alive answers from
+    targets that are not access targets are not watched: a request to such a target that fails
+    is handled as any failed request is.
 13. **An access target carries no flash plan.** The conversion and `Program::validate` refuse
     a flash plan on a target declared as an access target. Reprogramming a gateway that other
     targets are reached through, as an access target, would need the chain behind it to be suspended during the
@@ -291,11 +327,18 @@ shape survives inside the second as the access program of item 5.
   read while locked (item 5); a vehicle that answers it only behind an unlocked gateway needs
   another route, decided separately.
 - A target declared as an access target cannot be reprogrammed (item 13).
-- A service on an access target whose answer takes longer than its session timeout less one
-  period, response-pending chain included, counts that target lost although the ECU's timer was
-  stopped (item 12), so procedures keep their requests to an access target short.
+- A service on an access target itself whose answer takes longer than its session timeout less
+  one period, response-pending chain included, counts that target lost although the ECU's timer
+  was stopped (item 12), so procedures keep their requests to an access target short.
+- A worker must send a queued send-receive on one logical link while another link of the same
+  channel waits for its response (item 11). The J2534 worker does not yet (one poll task per
+  channel), so on it a job with access targets loses the gateway on any exchange behind it
+  longer than the session timeout less one period, until that worker dispatches sibling sends
+  during a receive phase; the native worker leaves it to the module, which a real-hardware check
+  verifies per VCI.
 - The agent gives up an unanswered probe through `CancelComPrimitive`, which it does not call
   yet; the workers and `sim-vci` must end a running send-receive primitive on it, or the
-  response window would have to cover the whole send-receive ceiling.
+  response window would have to cover the whole send-receive ceiling. A late answer to a
+  cancelled probe is covered by item 12's dating rule, not by the cancel.
 - Whether to keep a single target's own session alive the same way, and with which loss rule,
   is the open TesterPresent decision for ordinary jobs; item 11 gives it the mechanism.

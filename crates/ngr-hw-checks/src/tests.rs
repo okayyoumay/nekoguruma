@@ -354,14 +354,11 @@ fn a_loopback_runs_between_two_ends_of_one_bus() {
     );
     assert!(parse(&loopback(&with_channel(vci_end, " "), &partner(&ch1))).is_err());
 
-    // The same module whatever the case of its names, or described with two versions.
-    let shouted = vci_end
-        .replacen("library = \"Vendor PDU\"", "library = \"VENDOR PDU\"", 1)
-        .replacen("module = \"SN-0001\"", "module = \"sn-0001\"", 1);
-    refused_for(
-        &loopback(&ch1, &partner(&shouted)),
-        "describe it differently",
-    );
+    // Names are matched exactly, as the library resolvers match them: a library in another
+    // case is another library.
+    let shouted = vci_end.replacen("library = \"Vendor PDU\"", "library = \"VENDOR PDU\"", 1);
+    parse(&loopback(vci_end, &partner(&shouted))).unwrap();
+    // One module described with two versions.
     let other_version = vci_end.replacen(
         "firmware_version = \"2.0\"",
         "firmware_version = \"2.1\"",

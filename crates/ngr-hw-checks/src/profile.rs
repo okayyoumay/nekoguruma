@@ -104,24 +104,20 @@ pub struct Vci {
 }
 
 impl Vci {
-    /// Whether `other` may name the same module. Names are compared as the libraries look them
-    /// up, ignoring ASCII case (a Windows registry key name ignores it too, design 7.1). A J2534
-    /// worker opens the configured entry its label selects, and its `pname` identifies the
-    /// device (ADR-281), so for J2534 the same label or the same `pname` is the same module,
-    /// whatever `module` says; for the D-PDU API, the module the library reports is.
+    /// Whether `other` may name the same module. Names are compared exactly, as the library
+    /// resolvers match them (design 7.1). A J2534 worker opens the configured entry its label
+    /// selects, and its `pname` identifies the device (ADR-281), so for J2534 the same label or
+    /// the same `pname` is the same module, whatever `module` says; for the D-PDU API, the module
+    /// the library reports is.
     pub fn identifies_same_module(&self, other: &Vci) -> bool {
-        let same = |a: &str, b: &str| a.trim().eq_ignore_ascii_case(b.trim());
-        let same_option = |a: &Option<String>, b: &Option<String>| match (a, b) {
-            (Some(a), Some(b)) => same(a, b),
-            _ => false,
-        };
         self.api == other.api
-            && same(&self.library, &other.library)
+            && self.library == other.library
             && match self.api {
                 Api::J2534V0404 => {
-                    same_option(&self.label, &other.label) || same_option(&self.pname, &other.pname)
+                    (self.label.is_some() && self.label == other.label)
+                        || (self.pname.is_some() && self.pname == other.pname)
                 }
-                Api::Iso22900 => same(&self.module, &other.module),
+                Api::Iso22900 => self.module == other.module,
             }
     }
 }

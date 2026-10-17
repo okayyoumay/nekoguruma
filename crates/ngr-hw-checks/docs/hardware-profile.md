@@ -82,7 +82,7 @@ does not take. A T3 profile can add nothing.
 
 The profile cannot see the hardware, so it only refuses what cannot be two channels:
 
-- Names are compared as the libraries look them up, ignoring ASCII case and surrounding spaces.
+- Library, module, label and `pname` are compared exactly, as the library resolvers match them.
 - Two J2534 ends are on one module when they name the same library and the same `label` or the
   same `pname` (ADR-281), whatever their `module` says. Two D-PDU API ends are on one module
   when they name the same library and `module`.

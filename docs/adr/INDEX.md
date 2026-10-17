@@ -253,7 +253,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-261](ADR-261-restart-identity-and-safety-gates.md) | The Restart's Identity and Safety Gates | Accepted (the promotion consequence settled by ADR-263; item 2's ending with the gates' decision superseded by ADR-264; the creation-prefix rule extended to the intended software version by ADR-268; the unjournaled-abort consequence closed for the identity abort by ADR-286 and for the on-site endings by ADR-290) | `agent` restart, runner, journaling |
 | [ADR-262](ADR-262-per-vehicle-lock-in-fixed-buckets.md) | The Per-Vehicle Lock Is One of 4096 Fixed Bucket Files | Accepted | `agent` guards |
 | [ADR-263](ADR-263-restart-promotes-to-the-per-vehicle-lock.md) | The Restart Promotes to the Per-Vehicle Lock at Its VIN Match | Accepted (the step 3 fallback consequence settled by ADR-267) | `agent` restart, runner |
-| [ADR-264](ADR-264-restart-teardown.md) | The Restart's Teardown Sends One Hard Reset or Waits Out the Session | Accepted (item 5's ending amended by ADR-265; item 5's `RestartOrderUnavailable` carrying the outcome superseded by ADR-276, which goes on with the erase; item 1's completed path counts only for the interrupted pass since ADR-269 item 2) | `agent` restart, runner; `sim-ecu` |
+| [ADR-264](ADR-264-restart-teardown.md) | The Restart's Teardown Sends One Hard Reset or Waits Out the Session | Accepted (item 5's ending amended by ADR-265; item 5's `RestartOrderUnavailable` carrying the outcome superseded by ADR-276, which goes on with the erase; item 1's completed path counts only for the interrupted pass since ADR-269 item 2; item 4's passive teardown amended by ADR-325) | `agent` restart, runner; `sim-ecu` |
 | [ADR-265](ADR-265-restart-default-session-confirmation.md) | The Restart Confirms the Default Session, with One Passive Retry | Accepted | `agent` restart, runner; `sim-ecu` |
 | [ADR-266](ADR-266-linux-j2534-registration-definition-format.md) | Linux J2534 Registration Definitions Are TOML Files Keyed Like the Windows Registry | Accepted | `ngr-library-resolver`, design 7.1.1, 7.2 |
 | [ADR-267](ADR-267-restart-identity-recheck.md) | The Restart Re-reads the Identity in the Default Session and Promotes There Too | Accepted | `agent` restart, runner |
@@ -296,23 +296,24 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-304](ADR-304-lowering-starlark-procedures.md) | Lowering Starlark Procedures to the IR | Accepted | `diag-frontend` Starlark lowering, subset spec 4.7 and 4.8, design 8.4 |
 | [ADR-305](ADR-305-lowering-starlark-loops.md) | Lowering Starlark Loops | Accepted | `diag-frontend` Starlark lowering, subset spec 4.2 |
 | [ADR-306](ADR-306-comparing-a-variant-pattern-with-a-decoded-field.md) | Comparing a Variant Pattern with a Decoded Field | Accepted (how entries combine and which variant wins decided by ADR-315) | `diag-ir` decoder, `diag-frontend` CSV variant patterns, design 8.9.1 |
-| [ADR-307](ADR-307-packaging-starlark-procedures-into-documents.md) | Packaging Starlark Procedures into Documents | Accepted (item 2's single lowering amended by ADR-311) | `diag-frontend` conversion, CSV format sections 1 and 6, design 8.2.6 |
+| [ADR-307](ADR-307-packaging-starlark-procedures-into-documents.md) | Packaging Starlark Procedures into Documents | Accepted (item 2's single lowering amended by ADR-311; item 1's one document per variant and procedure amended by ADR-325) | `diag-frontend` conversion, CSV format sections 1 and 6, design 8.2.6 |
 | [ADR-308](ADR-308-encoding-a-request-operand.md) | Encoding a Request Operand | Accepted | `diag-ir` request encoder, CSV format 5.3, design 8.2.2 |
 | [ADR-309](ADR-309-application-layer-profiles.md) | Application-Layer Profiles for Protocol-Neutral Diagnostic Calls | Accepted (items 2 and 5 given their form by ADR-314) | `diag-frontend` lowering and CSV tables, `diag-ir` primitives, `agent` host and read-only policy; ADR-235 items 2, 3 and 8; design 8.2.4, 8.4 |
 | [ADR-310](ADR-310-one-line-message-notation.md) | A One-Line Message Notation for the Vehicle-Knowledge Format | Accepted | `diag-frontend` message shapes (`messages.txt` replacing the CSV field tables), CSV format sections 1 and 5; design 8.4 |
-| [ADR-311](ADR-311-lowering-each-procedure-once-per-variant.md) | Lowering Each Procedure Once per Variant | Accepted (item 4 amended by ADR-313) | `diag-frontend` conversion and Starlark lowering, CSV format section 1, Starlark subset section 5 |
+| [ADR-311](ADR-311-lowering-each-procedure-once-per-variant.md) | Lowering Each Procedure Once per Variant | Accepted (item 4 amended by ADR-313; item 1's per-variant lowering extended to combinations of target variants by ADR-325) | `diag-frontend` conversion and Starlark lowering, CSV format section 1, Starlark subset section 5 |
 | [ADR-312](ADR-312-codex-as-pr-reviewer-with-copilot-fallback.md) | Codex as the Pull Request Reviewer, with Copilot as Fallback | Accepted | `.claude/skills/pr-review-loop` (Steps 0, 1, 4-5), `AGENTS.md`, `CLAUDE.md`; ADR-251 |
 | [ADR-313](ADR-313-selecting-a-request-service-from-a-table-index.md) | Selecting a Request's Service from an Index of the Tables | Accepted (item 5 superseded by ADR-317) | `diag-frontend` conversion and Starlark lowering, CSV format 5.3, Starlark subset 3.1, 3.2 and 3.4; ADR-311 item 4 |
 | [ADR-314](ADR-314-application-layer-profiles-as-typed-frontend-data.md) | Application-Layer Profiles as Typed Frontend Data | Accepted | `diag-frontend` profiles, Starlark subset 3.2 and 3.4, CSV format 5.3; ADR-309 items 2 and 5 |
 | [ADR-315](ADR-315-variant-patterns-grouped-into-patterns.md) | Variant Pattern Entries Grouped into Patterns | Accepted | `diag-ir` schema and decoder (`IR_SCHEMA_VERSION` 10), `diag-frontend` CSV variant patterns, CSV format 4.2, design 8.9.1; ADR-306 |
 | [ADR-316](ADR-316-the-vm-decodes-response-fields-through-the-declaration-part.md) | The VM Decodes Response Fields Through the Declaration Part | Accepted (the runner's stepping without declarations superseded by ADR-318) | `diag-ir` VM (`Op::DecodeField`, `Vm::step_with_declarations`, `IR_SCHEMA_VERSION` 11), `agent` policy and journal, design 8.2.4; ADR-233, ADR-297 |
 | [ADR-317](ADR-317-a-diag-request-response-is-its-bytes-at-run-time.md) | A `diag.request` Response Is Its Bytes at Run Time | Accepted (item 2 superseded by ADR-309) | `diag-frontend` Starlark lowering, Starlark subset 3.2 and 3.4, design 8.4; ADR-313 item 5, ADR-309 item 4 |
-| [ADR-318](ADR-318-a-job-carries-its-variants-document.md) | A Job Carries Its Variant's Document | Accepted | `agent` job runner (`Job`, `check_job`, `ngr-agent run --document`), `diag_ir::check_decode_fields` (now `check_declarations`, ADR-321), design 8.2.4; ADR-316, ADR-307 |
+| [ADR-318](ADR-318-a-job-carries-its-variants-document.md) | A Job Carries Its Variant's Document | Accepted (item 1 amended by ADR-325) | `agent` job runner (`Job`, `check_job`, `ngr-agent run --document`), `diag_ir::check_decode_fields` (now `check_declarations`, ADR-321), design 8.2.4; ADR-316, ADR-307 |
 | [ADR-319](ADR-319-the-agent-names-a-links-resource-by-iso-22900-2-short-names.md) | The Agent Names a Link's Resource by ISO 22900-2 (2022) Short Names | Accepted | `agent` link (`resource_data`), `iso22900-mock` short names, design 8.2.4; ADR-235 item 4, ADR-069 |
 | [ADR-320](ADR-320-a-field-read-follows-the-response-s-service.md) | A Field Read Follows the Response's Service | Accepted | `diag-frontend` Starlark lowering (`res["fields"]`), `diag_ir::decode::scalar_kind`, Starlark subset 3.4, design 8.4; ADR-316, ADR-317 |
 | [ADR-321](ADR-321-the-generic-send-receive-instruction.md) | The Generic Send-Receive Instruction | Accepted (item 5 and the Consequences on the agent superseded by ADR-322) | `diag-ir` `Op::SendReceive`, `DiagHost::send_receive`, `check_declarations`, `Protocol.application_layer` and `negative_shape`; `agent` policy refusal; design 8.2.4; ADR-233, ADR-309, ADR-316 |
 | [ADR-322](ADR-322-the-agent-serves-the-generic-send-receive.md) | The Agent Serves the Generic Send-Receive | Accepted | `agent` `send_receive`, `WorkerHost::send_receive`, `policy::check_program` and `writes`, `check_job`, `Job::writes`; design 8.2.4; ADR-235, ADR-245, ADR-250, ADR-257, ADR-309, ADR-321 |
 | [ADR-323](ADR-323-dtc-records-are-read-from-the-response-bytes.md) | DTC Records Are Read from the Response Bytes | Accepted | `diag-frontend` Starlark lowering of `dtcs` (`len`, indexing, `code` and `status`), Starlark subset 3.4; ADR-233, ADR-314, ADR-316 |
+| [ADR-325](ADR-325-procedures-that-address-several-ecus.md) | Procedures That Address Several ECUs | Accepted | `diag-ir` targets and `SelectTarget`, `diag-frontend` `diag.ecu` and lowering per combination of variants, `agent` one link and document per target, keep-alive, restart access steps, design 8.2.4, 8.2.6, 8.10; ADR-229, ADR-264, ADR-307, ADR-311, ADR-318 |
 
 ## Status Legend
 
@@ -682,7 +683,7 @@ the predecessor repository these ADRs came from.
 - ADR-261 (the promotion consequence settled by ADR-263; item 2's ending with the gates' decision superseded by ADR-264; the creation-prefix rule extended to the intended software version by ADR-268; the unjournaled-abort consequence closed for the identity abort by ADR-286 and for the on-site endings by ADR-290)
 - ADR-262
 - ADR-263 (the step 3 fallback consequence settled by ADR-267)
-- ADR-264 (item 5's ending amended by ADR-265; item 5's `RestartOrderUnavailable` carrying the outcome superseded by ADR-276, which goes on with the erase; item 1's completed path counts only for the interrupted pass since ADR-269 item 2)
+- ADR-264 (item 5's ending amended by ADR-265; item 5's `RestartOrderUnavailable` carrying the outcome superseded by ADR-276, which goes on with the erase; item 1's completed path counts only for the interrupted pass since ADR-269 item 2; item 4's passive teardown amended by ADR-325)
 - ADR-265
 - ADR-267
 - ADR-268 (item 5's completion counts only for the interrupted pass since ADR-269)
@@ -720,22 +721,23 @@ the predecessor repository these ADRs came from.
 - ADR-304
 - ADR-305
 - ADR-306 (how entries combine and which variant wins decided by ADR-315)
-- ADR-307 (item 2's single lowering amended by ADR-311)
+- ADR-307 (item 2's single lowering amended by ADR-311; item 1's one document per variant and procedure amended by ADR-325)
 - ADR-308
 - ADR-309 (items 2 and 5 given their form by ADR-314)
 - ADR-310
-- ADR-311 (item 4 amended by ADR-313)
+- ADR-311 (item 4 amended by ADR-313; item 1's per-variant lowering extended to combinations of target variants by ADR-325)
 - ADR-313 (item 5 superseded by ADR-317)
 - ADR-314
 - ADR-315
 - ADR-316 (the runner's stepping without declarations superseded by ADR-318)
 - ADR-317 (item 2 superseded by ADR-309)
-- ADR-318
+- ADR-318 (item 1 amended by ADR-325)
 - ADR-319
 - ADR-320
 - ADR-321 (item 5 and the Consequences on the agent superseded by ADR-322)
 - ADR-322
 - ADR-323
+- ADR-325
 
 ### Acquired Data & Monitoring
 - ADR-236

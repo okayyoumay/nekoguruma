@@ -1,7 +1,7 @@
 # ADR-318: A Job Carries Its Variant's Document
 
 **Date:** 2026-10-16
-**Status:** Accepted
+**Status:** Accepted (item 1 amended by ADR-325)
 **Affects:** `agent` (`src/document.rs`, `src/runner.rs`: `Job`, `check_job`,
 `JobError::NoDeclarations` and `JobError::Undeclared`; `src/host.rs`, `src/main.rs`:
 `ngr-agent run --document`), `diag-ir` (`check_decode_fields`), design 8.2.4,

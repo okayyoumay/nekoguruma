@@ -1,7 +1,7 @@
 # ADR-311: Lowering Each Procedure Once per Variant
 
 **Date:** 2026-10-16
-**Status:** Accepted (Decision item 4 amended by ADR-313)
+**Status:** Accepted (Decision item 4 amended by ADR-313; item 1's per-variant lowering extended to combinations of target variants by ADR-325)
 **Affects:** `diag-frontend` (`src/convert.rs`, `src/star/lower.rs`), `fuzz/seeds`,
 `crates/diag-frontend/docs/csv-tables.md` section 1, `starlark-subset.md` section 5, ADR-307
 item 2

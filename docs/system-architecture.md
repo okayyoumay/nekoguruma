@@ -1380,7 +1380,7 @@ T1 is what makes write and interruption checks safe on real VCIs: the VCI, its l
 **Procedure.**
 
 1. Prepare the setup for its class: only the profile's VCIs and CAN interfaces connected to the host, wiring and termination checked (about 60 ohm across CAN high and low with power off), supply voltage set and current limit on, for T3 the ignition on and the engine off.
-2. Write or check the hardware profile, then list the checks that the profile permits without running them (the harness compares each check's declared requirements with the profile).
+2. Write or check the hardware profile, then list the checks that the profile permits without running them (the harness compares each check's declared requirements with the profile; `cargo run -p ngr-hw-checks -- list`, whose profile keys are described in `crates/ngr-hw-checks/docs/hardware-profile.md`).
 3. Run the checks for the milestone or area being looked at with the command under **Running** above.
 4. Read the report.
 5. Turn findings into lasting records: a vendor behaviour the VCI profile can express becomes a profile item (9.3), an answer to an item in 17 ("Items to Confirm Early") is written down there, and a defect is fixed or tracked as an open item.

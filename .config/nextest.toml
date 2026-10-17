@@ -52,3 +52,13 @@ windows-cert-store = { max-threads = 1 }
 test-threads = 4
 fail-fast = false
 retries = 0
+
+# The real-hardware checks (design 13.5, ADR-275), run by hand with
+# `cargo nextest run --profile hardware --run-ignored=only` and never in CI. The `hw_` tests are
+# `#[ignore]`d, which a profile cannot override, hence `--run-ignored=only`. One VCI is one shared
+# resource, so they run one at a time, and a check that passes only on a retry is a finding.
+[profile.hardware]
+default-filter = 'test(/(^|::)hw_/)'
+test-threads = 1
+fail-fast = false
+retries = 0

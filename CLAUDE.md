@@ -185,6 +185,12 @@ seeds depend on this workspace's crates. On pull requests that change only docum
 `repo-checks.yml` always runs. CodeQL (`codeql.yml`, ADR-283) skips the same changes. Do not run cross-target builds locally unless asked; CI covers
 them.
 
+The real-hardware checks (design 13.5, ADR-275) are `#[ignore]`d `hw_` tests that CI never runs.
+Run them by hand with a hardware profile:
+`NGR_HW_PROFILE=<profile.toml> cargo nextest run --profile hardware --run-ignored=only`, after
+listing what the profile permits with `cargo run -p ngr-hw-checks -- list`
+(`crates/ngr-hw-checks/docs/hardware-profile.md`).
+
 The `msrv` job checks the workspace with the Rust version in `Cargo.toml`'s `rust-version`
 (`cargo check --workspace --all-targets`); every other job uses stable, except `fuzz` (nightly for cargo-fuzz; its seeds build with stable). On pull requests it runs
 only when a `Cargo.toml`, `Cargo.lock` or `.cargo/` changes, which covers Dependabot's update pull

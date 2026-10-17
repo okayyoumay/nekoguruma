@@ -52,9 +52,10 @@ from that service's declared request, so the two start with the same byte.
      RequestDownload up to its transfer exit, where `Program::validate` refuses the same
      `ServiceRequest`. `check_job` refuses it there before the link opens, so it cannot fail
      after the erase.
-   - At run time the host also refuses these four while it tracks a transfer (ADR-250), which
-     covers a transfer the static range does not show. Outside a transfer they pass, as they do in
-     a `ServiceRequest`.
+   - At run time the host also refuses these four while it tracks a transfer (ADR-250), as a
+     second line of defence: a tracked transfer starts only at a plan's RequestDownload, so it
+     lies inside the range `check_job` already checked. Outside a transfer they pass, as they do
+     in a `ServiceRequest`.
 3. **The answer is matched against the declarations.**
    - Positive: the answer starts with the declared positive response's SID and prefix. The worker
      is asked for answers that start the same way.
@@ -77,6 +78,9 @@ from that service's declared request, so the two start with the same byte.
 
 ## Consequences
 
+- The frontend's profile check still lets a profile declare the pending codes 0x21 and 0x23
+  (ADR-314, ADR-309 item 5), which the agent refuses until the link turns on their handling. The
+  only shipped profile, UDS, declares 0x78 alone.
 - A procedure with `diag.read_dtc` runs on the agent. An end-to-end test runs one through
   `j2534-0404-service` against `sim-vci`.
 - `check_job` checks the declarations before the policy, so a job with a send-receive and no

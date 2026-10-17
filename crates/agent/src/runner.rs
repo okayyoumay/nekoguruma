@@ -7689,13 +7689,13 @@ mod tests {
         );
     }
 
-    /// A session change by send-receive inside a plan's transfer is refused before the link
-    /// opens, as `Program::validate` refuses the same `ServiceRequest` (ADR-322 item 2), not
-    /// after the erase.
-    #[cfg(debug_assertions)]
+    /// A session change or reset by send-receive inside a plan's transfer is refused before the
+    /// link opens, as `Program::validate` refuses the same `ServiceRequest` (ADR-322 item 2),
+    /// not after the erase. The refusal comes before the policy, so a release build refuses it
+    /// the same way.
     #[test]
     fn a_send_receive_cannot_end_a_plans_transfer() {
-        use crate::send_receive::tests::{READ_DTC, SESSION, document};
+        use crate::send_receive::tests::{RESET, SESSION, document};
         let flashing = |at: usize, service| {
             let mut code = vec![
                 Op::Pop,
@@ -7732,20 +7732,38 @@ mod tests {
                 document: Some(document()),
             }
         };
-        let refused = check_job(&flashing(3, SESSION), Permission::Simulator);
-        assert!(
-            matches!(
-                refused,
-                Err(JobError::Refused {
-                    pc: 4,
-                    source: HostError::TransferInterrupted(0x10)
-                })
-            ),
-            "{refused:?}"
-        );
-        // A read in the transfer, and a session change before the download, pass.
-        check_job(&flashing(3, READ_DTC), Permission::Simulator).unwrap();
-        check_job(&flashing(2, SESSION), Permission::Simulator).unwrap();
+        for (service, sid) in [(SESSION, 0x10), (RESET, 0x11)] {
+            for permission in [Permission::ReadOnly, policy::build_ceiling()] {
+                let refused = check_job(&flashing(3, service), permission);
+                assert!(
+                    matches!(
+                        refused,
+                        Err(JobError::Refused {
+                            pc: 4,
+                            source: HostError::TransferInterrupted(s)
+                        }) if s == sid
+                    ),
+                    "{refused:?}"
+                );
+            }
+        }
+        // A read in the transfer, and a session change before the download or after the
+        // transfer exit, pass this check (the simulator lets the plan's writes through).
+        #[cfg(debug_assertions)]
+        for (at, service) in [
+            (3, crate::send_receive::tests::READ_DTC),
+            (2, SESSION),
+            (4, SESSION),
+        ] {
+            let mut job = flashing(at, service);
+            if at == 4 {
+                // Inserted after the transfer exit, which stays at 3.
+                job.program.flash[0].boundaries.transfer_exit_pc = 3;
+                job.program.flash[0].boundaries.post_transfer_end_pc = 4;
+            }
+            check_job(&job, Permission::Simulator)
+                .unwrap_or_else(|e| panic!("{at} {service}: {e:?}"));
+        }
     }
 
     #[test]

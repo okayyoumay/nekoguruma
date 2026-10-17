@@ -220,8 +220,9 @@ pub(crate) fn first_send_receive(code: &[Op]) -> Option<u32> {
 }
 
 /// Refuses a send-receive whose SID `Program::validate` would refuse as a `ServiceRequest` at
-/// the same place (ADR-245, ADR-250, ADR-322 item 2), which it cannot see, since the SID is
-/// the first byte of a run-time operand. `transfer` is whether the host tracks a transfer.
+/// the same place (ADR-245, ADR-250, ADR-322 item 2). `Program::validate` sees no SID in a
+/// send-receive, so the policy applies this to the declared SID and the host to the sent one.
+/// `transfer` is whether the host tracks a transfer.
 /// - RequestDownload (0x34) and RequestTransferExit (0x37) belong at a recovery plan's
 ///   declared boundaries, which only a `ServiceRequest` can be, so they are refused anywhere.
 /// - TransferData (0x36) goes through `FlashTransfer`'s block count (ADR-250).

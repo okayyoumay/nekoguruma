@@ -95,6 +95,9 @@ pub enum HostError {
         declared: u8,
         sent: u8,
     },
+    /// The link the job's document declares cannot be used (ADR-324).
+    #[error("the document's link cannot be used: {0}")]
+    DeclaredLink(String),
     /// The variant's negative-response shape cannot be used (ADR-322 item 3).
     #[error("the document's negative-response shape cannot be used: {0}")]
     BadNegativeShape(&'static str),

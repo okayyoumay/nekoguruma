@@ -37,8 +37,9 @@ options:
                        (default: the 'workers' directory next to ngr-agent)
   --locks <dir>        the device's lock directory for the VCI lock and the reprogramming
                        slot (default: the 'locks' directory next to ngr-agent)
-  --tx-id <id>         physical request CAN ID, 11-bit hex (default 7E0)
-  --rx-id <id>         response CAN ID, 11-bit hex (default 7E8)";
+  --tx-id <id>         with --program: physical request CAN ID, 11-bit hex (default 7E0)
+  --rx-id <id>         with --program: response CAN ID, 11-bit hex (default 7E8); a
+                       document's job takes its link from the protocol it declares";
 
 /// How often a job waiting for its guards tries again.
 const GUARD_POLL: Duration = Duration::from_millis(10);
@@ -63,7 +64,9 @@ struct RunArgs {
     job: JobFile,
     workers: Option<PathBuf>,
     locks: Option<PathBuf>,
-    link: LinkConfig,
+    /// The link of a program, from the command line. A document's job takes the link its
+    /// variant declares (ADR-324).
+    link: Option<LinkConfig>,
 }
 
 fn main() -> ExitCode {
@@ -111,8 +114,8 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<RunArgs, Strin
     let mut job = None;
     let mut workers = None;
     let mut locks = None;
-    let mut tx_id = 0x7E0;
-    let mut rx_id = 0x7E8;
+    let mut tx_id = None;
+    let mut rx_id = None;
     while let Some(flag) = args.next() {
         let flag = flag
             .into_string()
@@ -153,13 +156,24 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<RunArgs, Strin
                 return Err("--locks needs an absolute directory".to_owned());
             }
             "--locks" => locks = Some(PathBuf::from(value)),
-            "--tx-id" => tx_id = parse_can_id(&flag, &value)?,
-            "--rx-id" => rx_id = parse_can_id(&flag, &value)?,
+            "--tx-id" => tx_id = Some(parse_can_id(&flag, &value)?),
+            "--rx-id" => rx_id = Some(parse_can_id(&flag, &value)?),
             _ => return Err(format!("unknown option {flag:?}")),
         }
     }
-    let link = LinkConfig::iso15765(tx_id, rx_id);
-    link.validate().map_err(|error| error.to_string())?;
+    let link = match job {
+        Some(JobFile::Document(_)) if tx_id.is_some() || rx_id.is_some() => {
+            return Err(
+                "--tx-id and --rx-id are for --program: a document declares its link".to_owned(),
+            );
+        }
+        Some(JobFile::Document(_)) => None,
+        _ => {
+            let link = LinkConfig::iso15765(tx_id.unwrap_or(0x7E0), rx_id.unwrap_or(0x7E8));
+            link.validate().map_err(|error| error.to_string())?;
+            Some(link)
+        }
+    };
     Ok(RunArgs {
         api,
         vci: vci.ok_or("--vci is required")?,
@@ -229,8 +243,15 @@ fn read_job(file: &JobFile) -> Result<Job, String> {
 /// Runs the job and returns the final VM state as JSON.
 async fn run(args: RunArgs) -> Result<String, String> {
     let job = read_job(&args.job)?;
-    // A program the job would refuse does not need a worker.
+    // A program the job would refuse does not need a worker, nor does a link the document
+    // declares that cannot be used.
     check_job(&job, build_ceiling()).map_err(|error| format!("job failed: {error}"))?;
+    let link = match args.link {
+        Some(link) => link,
+        None => job
+            .declared_link()
+            .map_err(|error| format!("job failed: {error}"))?,
+    };
     // The per-VCI lock, and the reprogramming slot for a program that writes (design 8.8.1). The
     // wait polls a file lock, so it runs off the runtime's threads; nothing cancels it here.
     let dir = match args.locks {
@@ -269,7 +290,7 @@ async fn run(args: RunArgs) -> Result<String, String> {
     .await
     .map_err(|error| error.to_string())?;
     let (result, mut guards) =
-        run_program(worker.client, &args.link, job, JobLimits::default(), guards).await;
+        run_program(worker.client, &link, job, JobLimits::default(), guards).await;
     // The job has closed its link whatever the result, unless its guards say otherwise
     // (ADR-258). A stop that reaped the worker means the worker no longer holds the link; a
     // vendor device server may still hold the device a while, which the next open detects.
@@ -344,7 +365,7 @@ mod tests {
                 job: JobFile::Program(PathBuf::from("p.json")),
                 workers: None,
                 locks: None,
-                link: LinkConfig::iso15765(0x7E0, 0x7E8),
+                link: Some(LinkConfig::iso15765(0x7E0, 0x7E8)),
             })
         );
     }
@@ -376,10 +397,13 @@ mod tests {
         assert_eq!(args.mode, OperatingMode::Device);
         assert_eq!(args.workers, Some(PathBuf::from("w")));
         assert_eq!(args.locks, Some(locks));
-        assert_eq!((args.link.tx_id, args.link.rx_id), (0x7DF, 0x7E9));
+        let link = args.link.expect("a program's link");
+        assert_eq!((link.tx_id, link.rx_id), (0x7DF, 0x7E9));
         let args = parse(&["run", "--vci", "x", "--mode", "user", "--document", "v.dir"])
             .expect("valid arguments");
         assert_eq!(args.job, JobFile::Document(PathBuf::from("v.dir")));
+        // A document's job takes the link it declares.
+        assert_eq!(args.link, None);
     }
 
     #[test]
@@ -430,6 +454,29 @@ mod tests {
             &["run", "--vci", "x", "--program", "p", "--mode", ""],
             &["run", "--vci", "x", "--program", "p", "--mode", "Device"],
             &["run", "--vci", "x", "--program", "p", "--mode", "service"],
+            // A document declares its link.
+            &[
+                "run",
+                "--vci",
+                "x",
+                "--mode",
+                "user",
+                "--document",
+                "d",
+                "--tx-id",
+                "7E0",
+            ],
+            &[
+                "run",
+                "--rx-id",
+                "7E8",
+                "--vci",
+                "x",
+                "--mode",
+                "user",
+                "--document",
+                "d",
+            ],
         ] {
             assert!(parse(args).is_err(), "{args:?}");
         }

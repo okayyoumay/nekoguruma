@@ -4,7 +4,7 @@ EcuDocumentT {
         "csv-starlark",
     ),
     source_digest: Some(
-        "0ae06b242dfa2868a14a93c4f82e113cfdb8aa12fc6cd823ee968f6738cc1650",
+        "ad769107f4e6ab1106c203405667e47beed9615d9b586794c2e66cf58a8a9f07",
     ),
     variant: Some(
         EcuVariantT {
@@ -2060,10 +2060,10 @@ Program {
             service: 34,
         },
         StoreLocal(
-            2,
+            3,
         ),
         LoadLocal(
-            2,
+            3,
         ),
         DecodeField {
             service: 5,
@@ -2121,14 +2121,206 @@ Program {
         ),
         CmpEq,
         JumpIfFalse(
-            36,
+            130,
         ),
         Log {
             level: 1,
             message: 6,
         },
-        PushBytes(
+        LoadLocal(
+            1,
+        ),
+        Dup,
+        DecodeField {
+            service: 4,
+            field: 8,
+        },
+        Pop,
+        PushI64(
+            3,
+        ),
+        PushI64(
+            9223372036854775807,
+        ),
+        Slice,
+        StoreLocal(
+            2,
+        ),
+        LoadLocal(
+            2,
+        ),
+        Length,
+        Swap,
+        Pop,
+        PushI64(
+            4,
+        ),
+        Div,
+        PushI64(
+            2,
+        ),
+        CmpEq,
+        Dup,
+        JumpIfFalse(
+            98,
+        ),
+        Pop,
+        LoadLocal(
+            2,
+        ),
+        PushI64(
+            1,
+        ),
+        PushI64(
+            4,
+        ),
+        Mul,
+        StoreLocal(
+            4,
+        ),
+        LoadLocal(
+            4,
+        ),
+        IndexGet,
+        Pop,
+        LoadLocal(
+            4,
+        ),
+        Dup,
+        PushI64(
+            4,
+        ),
+        Add,
+        Slice,
+        StoreLocal(
+            5,
+        ),
+        PushI64(
+            0,
+        ),
+        PushI64(
+            8,
+        ),
+        Shl,
+        LoadLocal(
+            5,
+        ),
+        PushI64(
+            0,
+        ),
+        IndexGet,
+        Swap,
+        Pop,
+        BitOr,
+        PushI64(
+            8,
+        ),
+        Shl,
+        LoadLocal(
+            5,
+        ),
+        PushI64(
+            1,
+        ),
+        IndexGet,
+        Swap,
+        Pop,
+        BitOr,
+        PushI64(
+            8,
+        ),
+        Shl,
+        LoadLocal(
+            5,
+        ),
+        PushI64(
+            2,
+        ),
+        IndexGet,
+        Swap,
+        Pop,
+        BitOr,
+        PushI64(
+            0,
+        ),
+        StoreLocal(
+            5,
+        ),
+        PushI64(
+            12648430,
+        ),
+        CmpEq,
+        Dup,
+        JumpIfFalse(
+            128,
+        ),
+        Pop,
+        LoadLocal(
+            2,
+        ),
+        PushI64(
+            1,
+        ),
+        PushI64(
+            4,
+        ),
+        Mul,
+        StoreLocal(
+            6,
+        ),
+        LoadLocal(
+            6,
+        ),
+        IndexGet,
+        Pop,
+        LoadLocal(
+            6,
+        ),
+        Dup,
+        PushI64(
+            4,
+        ),
+        Add,
+        Slice,
+        StoreLocal(
             7,
+        ),
+        PushI64(
+            0,
+        ),
+        PushI64(
+            8,
+        ),
+        Shl,
+        LoadLocal(
+            7,
+        ),
+        PushI64(
+            3,
+        ),
+        IndexGet,
+        Swap,
+        Pop,
+        BitOr,
+        PushI64(
+            0,
+        ),
+        StoreLocal(
+            7,
+        ),
+        PushI64(
+            40,
+        ),
+        CmpEq,
+        JumpIfFalse(
+            130,
+        ),
+        Log {
+            level: 1,
+            message: 7,
+        },
+        PushBytes(
+            8,
         ),
         RoutineControl {
             routine: 65281,
@@ -2154,7 +2346,7 @@ Program {
         Not,
         Dup,
         JumpIfFalse(
-            53,
+            147,
         ),
         Pop,
         LoadLocal(
@@ -2169,14 +2361,14 @@ Program {
         ),
         CmpEq,
         JumpIfFalse(
-            55,
+            149,
         ),
         Log {
             level: 1,
-            message: 8,
+            message: 9,
         },
         PushBytes(
-            9,
+            10,
         ),
         ServiceRequest {
             service: 46,
@@ -2184,7 +2376,7 @@ Program {
         Pop,
         Log {
             level: 1,
-            message: 10,
+            message: 11,
         },
         Ret,
     ],
@@ -2256,6 +2448,16 @@ Program {
             116,
             101,
             100,
+        ],
+        [
+            116,
+            119,
+            111,
+            32,
+            68,
+            84,
+            67,
+            115,
         ],
         [],
         [
@@ -2392,46 +2594,94 @@ Program {
             pc: 36,
             file: 0,
             line: 13,
-            column: 13,
+            column: 19,
         },
         SourceSpan {
-            pc: 39,
+            pc: 44,
             file: 0,
             line: 14,
-            column: 8,
+            column: 16,
         },
         SourceSpan {
-            pc: 49,
+            pc: 45,
             file: 0,
             line: 14,
-            column: 24,
-        },
-        SourceSpan {
-            pc: 53,
-            file: 0,
-            line: 14,
-            column: 8,
-        },
-        SourceSpan {
-            pc: 54,
-            file: 0,
-            line: 15,
-            column: 9,
+            column: 12,
         },
         SourceSpan {
             pc: 55,
             file: 0,
-            line: 16,
-            column: 5,
+            line: 14,
+            column: 34,
         },
         SourceSpan {
-            pc: 58,
+            pc: 98,
+            file: 0,
+            line: 14,
+            column: 12,
+        },
+        SourceSpan {
+            pc: 101,
+            file: 0,
+            line: 14,
+            column: 69,
+        },
+        SourceSpan {
+            pc: 128,
+            file: 0,
+            line: 14,
+            column: 12,
+        },
+        SourceSpan {
+            pc: 129,
+            file: 0,
+            line: 15,
+            column: 13,
+        },
+        SourceSpan {
+            pc: 130,
+            file: 0,
+            line: 16,
+            column: 13,
+        },
+        SourceSpan {
+            pc: 133,
             file: 0,
             line: 17,
+            column: 8,
+        },
+        SourceSpan {
+            pc: 143,
+            file: 0,
+            line: 17,
+            column: 24,
+        },
+        SourceSpan {
+            pc: 147,
+            file: 0,
+            line: 17,
+            column: 8,
+        },
+        SourceSpan {
+            pc: 148,
+            file: 0,
+            line: 18,
+            column: 9,
+        },
+        SourceSpan {
+            pc: 149,
+            file: 0,
+            line: 19,
             column: 5,
         },
         SourceSpan {
-            pc: 59,
+            pc: 152,
+            file: 0,
+            line: 20,
+            column: 5,
+        },
+        SourceSpan {
+            pc: 153,
             file: 0,
             line: 4,
             column: 5,

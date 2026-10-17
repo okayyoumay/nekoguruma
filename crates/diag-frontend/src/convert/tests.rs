@@ -733,7 +733,8 @@ fn run_answered(
         match vm.step_with_declarations(&program, document.variant().as_ref(), &mut host) {
             Ok(diag_ir::StepOutcome::Continue) => {}
             Ok(diag_ir::StepOutcome::Finished) => return Ok(host),
-            Ok(other) => panic!("{other:?}"),
+            // A procedure that ends as failed (ADR-280) reports its failure.
+            Ok(other) => return Err(format!("{other:?}")),
             Err(e) => return Err(format!("{e:?}")),
         }
     }
@@ -893,6 +894,100 @@ fn a_dtc_read_sends_the_profile_s_request_to_the_declared_service() {
     );
 }
 
+const READ_EACH_DTC: &str = "\
+def main():
+    res = diag.read_dtc(0x08)
+    dtcs = res[\"fields\"][\"dtcs\"]
+    if len(dtcs) == 0:
+        diag.log(1, \"none\")
+    if len(dtcs) == 2:
+        diag.log(1, \"two\")
+    # @maxIterations 10
+    for i in range(len(dtcs)):
+        dtc = dtcs[i]
+        if dtc[\"code\"] == 0x123456 and dtc[\"status\"] == 0x09:
+            diag.log(1, \"first\")
+        if dtc[\"code\"] == 0xABCDEF and dtc[\"status\"] == 0x2F:
+            diag.log(1, \"second\")
+";
+
+/// `dtcs` is read record by record from the response's bytes (ADR-323).
+#[test]
+fn each_dtc_record_reads_its_code_and_status() {
+    let two = [
+        0x59, 0x02, 0xFF, 0x12, 0x34, 0x56, 0x09, 0xAB, 0xCD, 0xEF, 0x2F,
+    ];
+    assert_eq!(
+        answered(READ_EACH_DTC, &[&two]).unwrap(),
+        ["two", "first", "second"]
+    );
+    assert_eq!(
+        answered(READ_EACH_DTC, &[&[0x59, 0x02, 0xFF]]).unwrap(),
+        ["none"]
+    );
+    // A last record cut short does not decode, so it stops the run.
+    let error = answered(READ_EACH_DTC, &[&[0x59, 0x02, 0xFF, 0x12, 0x34]]).unwrap_err();
+    assert!(error.contains("Undecodable"), "{error}");
+    // Reading the records of a negative response stops the run, as any field read does.
+    assert!(answered(READ_EACH_DTC, &[&[0x7F, 0x19, 0x31]]).is_err());
+}
+
+#[test]
+fn a_dtc_index_outside_the_records_stops_the_run() {
+    let at = |index: &str| {
+        format!(
+            "def main():\n    dtcs = diag.read_dtc(8)[\"fields\"][\"dtcs\"]\n    \
+             if dtcs[{index}][\"status\"] == 9:\n        diag.log(1, \"read\")\n"
+        )
+    };
+    let two: &[u8] = &[
+        0x59, 0x02, 0xFF, 0x12, 0x34, 0x56, 0x09, 0xAB, 0xCD, 0xEF, 0x2F,
+    ];
+    assert_eq!(answered(&at("0"), &[two]).unwrap(), ["read"]);
+    for index in ["2", "-1", "-2"] {
+        let error = answered(&at(index), &[two]).unwrap_err();
+        assert!(error.contains("IndexOutOfRange"), "{index}: {error}");
+    }
+}
+
+#[test]
+fn dtc_records_are_checked_at_ingestion() {
+    let codes = |body: &str| -> Vec<crate::star::StarCode> {
+        let source =
+            format!("def main():\n    dtcs = diag.read_dtc(8)[\"fields\"][\"dtcs\"]\n{body}");
+        procedures(with(example(), "main.star", &source))
+            .err()
+            .map_or_else(Vec::new, |rejected| {
+                rejected.errors.iter().map(|e| e.code).collect()
+            })
+    };
+    use crate::star::StarCode::*;
+    assert_eq!(codes("    x = len(dtcs)\n"), []);
+    // A record has `code` and `status`, read by a literal.
+    assert_eq!(codes("    x = dtcs[0][\"code\"]\n"), []);
+    assert_eq!(
+        codes("    if dtcs[0][\"status\"] & 0x08:\n        diag.log(1, \"confirmed\")\n"),
+        []
+    );
+    assert_eq!(codes("    x = dtcs[0][\"mask\"]\n"), [NotInProfile]);
+    assert_eq!(
+        codes("    k = \"code\"\n    x = dtcs[0][k]\n"),
+        [DynamicKeyNotAllowed]
+    );
+    // The records are indexed by an int, and are neither true nor comparable.
+    assert_eq!(codes("    x = dtcs[\"a\"]\n"), [NotLowerable]);
+    assert_eq!(
+        codes("    if dtcs:\n        diag.log(1, \"some\")\n"),
+        [NotLowerable]
+    );
+    assert_eq!(codes("    x = dtcs == dtcs\n"), [NotLowerable]);
+    // A loop goes over `range(len(dtcs))`; the records themselves are not iterated.
+    assert_eq!(
+        codes("    for d in dtcs:\n        diag.log(1, \"one\")\n"),
+        [NotLowerable]
+    );
+}
+
 #[test]
 fn a_dtc_read_is_checked_at_ingestion() {
     let codes = |source: &str| -> Vec<crate::star::StarCode> {
@@ -917,10 +1012,10 @@ fn a_dtc_read_is_checked_at_ingestion() {
         codes("def main():\n    x = diag.read_dtc(8)[\"fields\"][\"availabilityMask\"]\n"),
         [NotInProfile]
     );
-    // `dtcs` is a list, which a procedure cannot read yet.
+    // `dtcs` reads (ADR-323).
     assert_eq!(
         codes("def main():\n    x = diag.read_dtc(8)[\"fields\"][\"dtcs\"]\n"),
-        [NotLowerable]
+        []
     );
     // A DTC result and a `diag.request` response of the same service are read differently.
     let mixed = "def main():\n    r = diag.read_dtc(8)\n    if r[\"ok\"]:\n        \

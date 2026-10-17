@@ -68,8 +68,8 @@ shared names.
 
 - Adding or correcting a profile is a code change and a frontend release, as ADR-309 already
   expects; authors cannot ship their own profile.
-- `dtcs` is a list, which neither the IR's run-time values nor its decoding hold yet, so reading
-  it waits on the response-field decoding work; `mask`, `ok`, `nrc` and `raw` do not.
+- `dtcs` is a list, which neither the IR's run-time values nor its decoding hold; ADR-323 reads
+  it record by record from the response bytes instead.
 - A definition whose DTC response declares an extra field before the mask or the record list does
   not fit the UDS map; the error names the field. The rule for which declared service a
   `diag.read_dtc` response decodes through moves from `csv-tables.md` 5.3 into the profile.

@@ -79,8 +79,15 @@ impl Setup {
         }
     }
 
-    /// Runs `document` with `ngr-agent` and returns the final state it prints.
+    /// Runs `document` with `ngr-agent` on the ECU [`definition::ecu_config`] configures, and
+    /// returns the final state it prints.
     fn run(&self, name: &str, document: &[u8]) -> VmState {
+        self.run_on(&definition::ecu_config(), name, document)
+    }
+
+    /// [`Setup::run`] on the ECU `ecu_config` configures. Every run starts a new mock, which
+    /// reads it again.
+    fn run_on(&self, ecu_config: &Path, name: &str, document: &[u8]) -> VmState {
         let path = self.root.join(format!("{name}.dir"));
         std::fs::write(&path, document).expect("document file should be writable");
         let mut child = Command::new(ngr_agent_path())
@@ -101,7 +108,8 @@ impl Setup {
             .arg(self.root.join("locks"))
             .env("VCI_CONFIG_PATH", &self.config)
             .env("NGR_PDU_API_ROOT_FILE", &self.root_file)
-            .env("NGR_SIM_ECU_CONFIG", definition::ecu_config())
+            .env("NGR_SIM_ECU_CONFIG", ecu_config)
+            .env_remove("NGR_SIM_ECU_STATE")
             .env_remove("VCI_SERVICE_INSECURE_NO_AUTH")
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -133,19 +141,27 @@ fn a_definition_runs_end_to_end_through_the_d_pdu_worker() {
 
     // Identify the variant: each variant's identification services, sent to the ECU.
     let reads = definition::documents("read.star");
-    let runs: Vec<_> = reads
-        .iter()
-        .map(|(name, document)| {
-            let (identification, services) = definition::identification(document);
-            (
-                services,
-                setup.run(&format!("{name}-identification"), &identification),
-            )
-        })
-        .collect();
-    let variant = definition::identified(&reads, &runs).expect("a variant is identified");
+    let identify = |ecu_config: &Path| {
+        let runs: Vec<_> = reads
+            .iter()
+            .map(|(name, document)| {
+                let (identification, services) = definition::identification(document);
+                let state = setup.run_on(
+                    ecu_config,
+                    &format!("{name}-identification"),
+                    &identification,
+                );
+                (services, state)
+            })
+            .collect();
+        definition::identified(&reads, &runs).expect("a variant is identified")
+    };
+    let variant = identify(&definition::ecu_config());
     // The simulated ECU reports software version 1.0.0, the first generation's.
     assert_eq!(reads[variant].0, "exampleEcuV1");
+    // An ECU of the second generation is told apart, although its variant sorts after the first.
+    let v2 = definition::ecu_config_with_version(&temp.path().join("ecu-v2.json"), "2.0.0");
+    assert_eq!(reads[identify(&v2)].0, "exampleEcuV2");
 
     // The read procedure checks every value it decodes; a value that differs fails the run.
     let state = setup.run(&reads[variant].0, &reads[variant].1);

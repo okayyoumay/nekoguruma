@@ -1,5 +1,6 @@
 # The read procedure of the end-to-end definition test (M2 exit criterion 1): the example ECU's
-# identification DIDs, a DID through a text-table conversion and the confirmed DTCs, each checked
+# identification DIDs, the active session (a DID under a text table, which reaches the procedure
+# as its internal value) and the confirmed DTCs, each checked
 # against the simulated ECU's configuration (`ecu.json`). It only reads, so it runs through
 # either worker. A value that differs ends the run as failed with its own code.
 

@@ -30,6 +30,22 @@ pub fn ecu_config() -> PathBuf {
     examples().join("end-to-end/ecu.json")
 }
 
+/// [`ecu_config`] with `sw_version` instead of its software version, written to `path`.
+#[allow(dead_code, reason = "only the D-PDU test identifies a second variant")]
+pub fn ecu_config_with_version(path: &std::path::Path, sw_version: &str) -> PathBuf {
+    let text = std::fs::read_to_string(ecu_config()).expect("the ECU configuration");
+    let text = text.replace(
+        "\"sw_version\": \"1.0.0\"",
+        &format!("\"sw_version\": \"{sw_version}\""),
+    );
+    assert!(
+        text.contains(sw_version),
+        "the configuration names its software version"
+    );
+    std::fs::write(path, text).expect("the ECU configuration should be writable");
+    path.to_owned()
+}
+
 /// One document per variant of the example ECU, in conversion order, each with `procedure` (a
 /// file of `examples/end-to-end`) as its procedure: the variant's short name and the document.
 pub fn documents(procedure: &str) -> Vec<(String, Vec<u8>)> {
@@ -133,6 +149,7 @@ pub fn identified(documents: &[(String, Vec<u8>)], runs: &[(Vec<u32>, VmState)])
         let variant = document
             .variant()
             .expect("a loaded document has its variant");
+        assert_eq!(services.len(), state.stack.len(), "one answer per service");
         for (service, answer) in services.iter().zip(&state.stack) {
             let Value::Bytes(answer) = answer else {
                 panic!("an answer is bytes: {answer:?}");

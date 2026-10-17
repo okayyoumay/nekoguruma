@@ -3,8 +3,9 @@
 //! One ECU's CSV + Starlark definition end to end through the j2534-0404 worker (M2 exit
 //! criterion 1). The example ECU converts to one document per variant; the variant is identified
 //! against the simulated ECU behind `sim-vci` from its software version, and its read procedure
-//! (identification DIDs, a text-table conversion, the confirmed DTCs) and its routine procedure
-//! (the programming session's P2* through a linear conversion, then a routine) run as agent jobs.
+//! (identification DIDs, the active session under a text table, the confirmed DTCs) and its
+//! routine procedure (the programming session's P2* through a linear conversion, then a routine
+//! the ECU refuses for want of an image) run as agent jobs.
 //! Each procedure checks every value it decodes and fails on the first that differs, so a
 //! finished job means the decoded results are the expected ones. The D-PDU worker runs the same
 //! read procedure in `crates/iso22900-service/tests/ngr_agent_definition_end_to_end.rs`.
@@ -81,6 +82,8 @@ fn a_definition_runs_end_to_end_through_the_j2534_worker() {
         std::env::set_var("VCI_CONFIG_PATH", &config_path);
         std::env::set_var("NGR_J2534_DEFINITION_DIR", &definition_dir);
         std::env::set_var("NGR_SIM_ECU_CONFIG", definition::ecu_config());
+        // A state file would replace the configuration.
+        std::env::remove_var("NGR_SIM_ECU_STATE");
         std::env::remove_var("VCI_SERVICE_INSECURE_NO_AUTH");
     }
 
@@ -170,7 +173,8 @@ async fn run_the_definition(dir: &Path) {
     // The routine changes the session, so it runs last.
     let routines = definition::documents("routine.star");
     assert_eq!(routines[variant].0, reads[variant].0);
-    run(&worker, dir, routines[variant].1.clone()).await;
+    let state = run(&worker, dir, routines[variant].1.clone()).await;
+    assert!(state.call_stack.is_empty(), "{state:?}");
 
     worker
         .stop(Duration::from_secs(5))

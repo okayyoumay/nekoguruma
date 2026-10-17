@@ -3111,7 +3111,7 @@ impl<'a> Lowerer<'a> {
                 }
                 !transfer
             });
-        let params = match self.request_params(id, "request", sid, params_arg) {
+        let params = match self.request_params(id, "request", sid, None, params_arg) {
             None => None,
             Some(Val::Const(Const::Dict(entries, _))) => Some(entries),
             Some(Val::Const(other)) => {
@@ -3211,16 +3211,19 @@ impl<'a> Lowerer<'a> {
     }
 
     /// The `params` of `diag.{function}(sid, ...)` as a value, `function` being `request` or
-    /// `routine`, whose services are the generated routine services. A dict literal is built
-    /// here, so that a value known only at run time is reported for what it is: under a key some
-    /// service with the SID holds as a constant it is needed to select the service (csv-tables
-    /// 5.3); under another key it is a field's value, which only a run-time encoding could send.
-    /// `None` once the dict literal's errors are reported.
+    /// `routine`. For `routine`, `selected` is the sub-function and identifier the call names, if
+    /// both are known, and only the generated routine services whose request starts with them
+    /// count. A dict literal is built here, so that a value known only at run time is reported
+    /// for what it is: under a key some such service with the SID holds as a constant it is
+    /// needed to select the service (csv-tables 5.3); under another key it is a field's value,
+    /// which only a run-time encoding could send. `None` once the dict literal's errors are
+    /// reported.
     fn request_params(
         &mut self,
         id: Option<usize>,
         function: &str,
         sid: Option<i64>,
+        selected: Option<&[u8]>,
         arg: &AstExpr,
     ) -> Option<Val> {
         let routine = function == "routine";
@@ -3254,6 +3257,10 @@ impl<'a> Lowerer<'a> {
                     let constant = self.requests.services.iter().any(|service| {
                         Some(i64::from(service.sid)) == sid
                             && service.routine == routine
+                            && selected.is_none_or(|selected| {
+                                self.request_prefix(service.service_id)
+                                    .is_some_and(|prefix| prefix.starts_with(selected))
+                            })
                             && service.constants.iter().any(|(name, _)| **name == *key)
                     });
                     if constant {
@@ -3305,29 +3312,34 @@ impl<'a> Lowerer<'a> {
         };
         let rid = self.constant_int(id, rid_arg, "routine", "routine_id", 0..=0xFFFF);
         let sub = self.constant_int(id, sub_arg, "routine", "sub", 0..=0xFF);
-        let params = match self.request_params(id, "routine", Some(0x31), params_arg) {
-            None => None,
-            Some(Val::Const(Const::Dict(entries, _))) => Some(entries),
-            Some(Val::Const(other)) => {
-                self.error(
-                    StarCode::UnsupportedSyntax,
-                    params_arg.span,
-                    format!(
-                        "`params` of `diag.routine` is a dict, not a {} (3.1)",
-                        other.type_name()
-                    ),
-                );
-                None
-            }
-            Some(_) => {
-                self.error(
-                    StarCode::NonConstantArgument,
-                    params_arg.span,
-                    "`params` of `diag.routine` must be a dict known at ingestion (3.1)",
-                );
-                None
-            }
-        };
+        // In range by the checks above.
+        let selected = rid
+            .zip(sub)
+            .map(|(rid, sub)| [&[sub as u8][..], &(rid as u16).to_be_bytes()].concat());
+        let params =
+            match self.request_params(id, "routine", Some(0x31), selected.as_deref(), params_arg) {
+                None => None,
+                Some(Val::Const(Const::Dict(entries, _))) => Some(entries),
+                Some(Val::Const(other)) => {
+                    self.error(
+                        StarCode::UnsupportedSyntax,
+                        params_arg.span,
+                        format!(
+                            "`params` of `diag.routine` is a dict, not a {} (3.1)",
+                            other.type_name()
+                        ),
+                    );
+                    None
+                }
+                Some(_) => {
+                    self.error(
+                        StarCode::NonConstantArgument,
+                        params_arg.span,
+                        "`params` of `diag.routine` must be a dict known at ingestion (3.1)",
+                    );
+                    None
+                }
+            };
         let profile = self.requests.profile;
         let call = profile.call(Intent::Routine).expect("the caller checked");
         let [step] = call.steps else {
@@ -3448,6 +3460,13 @@ impl<'a> Lowerer<'a> {
                 Val::Run(Tys::of(Ty::Response), Vec::new())
             }
         }
+    }
+
+    /// The declared request prefix of the service `service` (a `Service.id`).
+    fn request_prefix(&self, service: u32) -> Option<&'a [u8]> {
+        let at = *self.service_at.get(&service)?;
+        let request = self.variant.services()?.get(at).request()?;
+        Some(request.prefix().map(|p| p.bytes()).unwrap_or_default())
     }
 
     /// The one routine service of this variant whose request prefix starts with `selected` (the

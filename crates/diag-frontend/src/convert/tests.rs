@@ -1299,6 +1299,23 @@ fn a_routine_is_checked_at_ingestion() {
     assert_eq!(found.len(), 1, "{found:?}");
     assert_eq!(found[0].0, NotLowerable);
     assert!(found[0].1.contains("`diag.routine`"), "{found:?}");
+    // Another routine's constant of the same name is not this routine's: the run-time value is
+    // still a field's, not a selecting constant's.
+    let other = format!(
+        "{}routine:eraseMemory:start:request,level,0,,uint,8,,,,,,0x01,,,\n",
+        fields_with_level
+    );
+    let found: Vec<_> = procedures(with(
+        with(example(), "fields.csv", &other),
+        "main.star",
+        "def f(l):\n    diag.routine(0xFF01, 1, {\"level\": l})\n\ndef main():\n    f(3)\n",
+    ))
+    .expect_err("rejected")
+    .errors
+    .into_iter()
+    .map(|e| e.code)
+    .collect();
+    assert_eq!(found, [NotLowerable]);
     // A value the field cannot hold, and a sub-function out of range.
     let found = level("def main():\n    diag.routine(0xFF01, 1, {\"level\": 256})\n");
     assert_eq!(

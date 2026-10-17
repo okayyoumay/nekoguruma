@@ -122,9 +122,14 @@ shape survives inside the second as the access program of item 5.
    declaration-only documents of every candidate variant of every target are fetched before
    identification, since identification evaluates each candidate's variant patterns through
    that candidate's services (ADR-315); only the combination documents are fetched after it. A writing job
-   journals the chosen combination document's hash when its journal is created, and a restart
-   uses that document without identifying the variants again (amending ADR-318 item 4's journal
-   that records no document; the caller still supplies the documents). `check_job` refuses a combination document
+   creates its journal before anything is sent, as now (ADR-252, ADR-293), and commits a
+   combination record holding the chosen document's hash after identification and before the
+   chosen program's first instruction; a restart of a journal with that record uses that
+   document without identifying the variants again (amending ADR-318 item 4's journal that
+   records no document; the caller still supplies the documents). A journal without it holds
+   no step of the program, since only access programs and identification reads ran, so its job
+   starts again from the access programs as a first run does. `check_job` refuses a combination
+   document
    whose named hashes do not match the documents the job carries, checks each target's decodes
    against that target's declarations, and refuses flash plans on more than one target, before
    anything is sent; it also refuses an access program with any service item 5 does not allow.

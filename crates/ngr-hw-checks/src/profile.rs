@@ -103,6 +103,14 @@ pub struct Vci {
     pub library_version: String,
 }
 
+impl Vci {
+    /// Whether `other` names the same module: the same API, library and module. The other
+    /// fields describe that module, so they do not tell two modules apart.
+    pub fn identifies_same_module(&self, other: &Vci) -> bool {
+        self.api == other.api && self.library == other.library && self.module == other.module
+    }
+}
+
 /// How a link addresses its ECU.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -506,10 +514,21 @@ fn check_loopback(a: &Endpoint, b: &Endpoint) -> Result<(), ProfileError> {
             "a T0 loopback has a VCI channel at one end at least",
         ));
     }
-    // Two channels of one VCI are the preferred loopback; they differ by their channel.
-    let same_vci_channel = a.vci.is_some()
-        && a.vci == b.vci
-        && (a.channel.is_none() || b.channel.is_none() || a.channel == b.channel);
+    // Two channels of one VCI are the preferred loopback; they differ by their channel. The
+    // module is one device whatever else its two descriptions say, so they must agree.
+    let same_module = match (&a.vci, &b.vci) {
+        (Some(x), Some(y)) if x.identifies_same_module(y) => {
+            if x != y {
+                return Err(invalid(
+                    "a T0 loopback's two ends name one VCI module but describe it differently",
+                ));
+            }
+            true
+        }
+        _ => false,
+    };
+    let same_vci_channel =
+        same_module && (a.channel.is_none() || b.channel.is_none() || a.channel == b.channel);
     if same_vci_channel || (a.socketcan.is_some() && a.socketcan == b.socketcan) {
         return Err(invalid(
             "a T0 loopback's two endpoints must be different channels; two ends on one VCI name \

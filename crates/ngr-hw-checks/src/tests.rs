@@ -329,6 +329,24 @@ fn a_loopback_runs_between_two_ends_of_one_bus() {
         channel("CAN_CH1", "0x124", "0x123")
     );
     assert!(parse(&one_channel).is_err());
+    // One module described with two versions is still one module: refused with or without
+    // channels.
+    let other_version = vci_end.replacen(
+        "firmware_version = \"2.0\"",
+        "firmware_version = \"2.1\"",
+        1,
+    );
+    assert_ne!(other_version, vci_end);
+    for (first, second) in [
+        (vci_end.to_owned(), other_version.clone()),
+        (
+            channel("CAN_CH1", "0x123", "0x124"),
+            other_version.replacen("[endpoint.vci]", "channel = \"CAN_CH2\"\n[endpoint.vci]", 1),
+        ),
+    ] {
+        let text = format!("class = \"T0\"\n[[endpoint]]{first}[[endpoint]]{second}");
+        assert!(parse(&text).is_err());
+    }
     // A channel at one end only leaves the two ends undistinguished, in either order.
     let named = channel("CAN_CH1", "0x123", "0x124");
     for (first, second) in [(named.as_str(), vci_end), (vci_end, named.as_str())] {

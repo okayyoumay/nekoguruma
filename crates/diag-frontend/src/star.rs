@@ -140,8 +140,9 @@ pub enum StarCode {
     /// match (3.4; `csv-tables.md` 5.3).
     #[serde(rename = "STAR_UNKNOWN_SERVICE")]
     UnknownService,
-    /// A protocol-neutral call the profile of the variant's application layer does not define
-    /// (3.2, ADR-309 item 3).
+    /// A protocol-neutral call the profile of the variant's application layer does not define, a
+    /// result name it does not map, or a declared response that does not fit its map (3.2, 3.4,
+    /// ADR-309 item 3, ADR-314).
     #[serde(rename = "STAR_NOT_IN_PROFILE")]
     NotInProfile,
     /// A warning: a `range` loop with a bound known only at run time has no `@maxIterations`, so

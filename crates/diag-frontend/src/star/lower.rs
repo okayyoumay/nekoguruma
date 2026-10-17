@@ -9,7 +9,7 @@
 //! express for its operands is `STAR_NOT_LOWERABLE`.
 //!
 //! Not lowered yet, each its own backlog item: the other `diag` functions (`hmi` and `record`;
-//! `request`, `routine`, `read_dtc` and `security_access`; `flash_transfer`), built-ins and
+//! `routine` and `security_access`; `flash_transfer`), reading `dtcs` of `diag.read_dtc`, built-ins and
 //! string methods on values known only at run time, and section and idempotency annotations.
 //! Each is rejected with `STAR_NOT_LOWERABLE` (or `STAR_API_NOT_AVAILABLE` for a `diag`
 //! function without an instruction), so nothing is lowered silently wrong.
@@ -17,7 +17,7 @@
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
-use diag_ir::declaration::{EcuVariant, Request};
+use diag_ir::declaration::{EcuVariant, LengthKind, Request};
 use diag_ir::encode::{ParamValue, encode_request};
 use diag_ir::{IR_SCHEMA_VERSION, Op, Program, SourceSpan};
 use starlark_syntax::codemap::Span;
@@ -28,7 +28,7 @@ use starlark_syntax::syntax::ast::{
 };
 use starlark_syntax::syntax::uniplate::Visit;
 
-use crate::profile::Intent;
+use crate::profile::{Intent, Part, ResultMap, Source};
 
 use super::{
     Annotation, BUILTINS, Checked, Pending, RequestConstant, RequestIndex, STRING_METHODS,
@@ -226,6 +226,9 @@ enum Service {
     Unknown,
     /// The `Service.id` of the one request the response can come from.
     One(u32),
+    /// A `diag.read_dtc` result from the service of that `Service.id`: its `fields` are the
+    /// names the profile maps the response to, not the declared ones (ADR-314 item 4).
+    Dtcs(u32),
     /// Requests to more than one service: a variable assigned from both anywhere in its
     /// function (types are per variable, subset 4.8), or a parameter whose callers pass both.
     Several,
@@ -236,6 +239,7 @@ impl Service {
         match (self, other) {
             (Service::Unknown, s) | (s, Service::Unknown) => s,
             (Service::One(a), Service::One(b)) if a == b => Service::One(a),
+            (Service::Dtcs(a), Service::Dtcs(b)) if a == b => Service::Dtcs(a),
             _ => Service::Several,
         }
     }
@@ -254,6 +258,14 @@ impl Tys {
         Tys {
             bits: ty.bit(),
             service: Service::One(service),
+        }
+    }
+
+    /// A `diag.read_dtc` result from `service`.
+    fn from_dtc_service(service: u32) -> Self {
+        Tys {
+            bits: Ty::Response.bit(),
+            service: Service::Dtcs(service),
         }
     }
 
@@ -2456,8 +2468,9 @@ impl<'a> Lowerer<'a> {
             );
             return Val::Run(Tys::default(), Vec::new());
         };
-        let service = match service {
-            Service::One(service) => service,
+        let (service, profiled) = match service {
+            Service::One(service) => (service, false),
+            Service::Dtcs(service) => (service, true),
             // The request's own error is already reported.
             Service::Unknown => return Val::Run(Tys::default(), Vec::new()),
             Service::Several => {
@@ -2474,13 +2487,22 @@ impl<'a> Lowerer<'a> {
             .services()
             .and_then(|services| services.iter().find(|s| s.id() == service))
             .and_then(|s| s.positive());
-        let field = declared
-            .and_then(|positive| positive.fields())
-            .and_then(|fields| {
-                fields
-                    .iter()
-                    .find(|f| f.short_name().is_some_and(|name| name == &*key))
-            });
+        let field = if profiled {
+            let Some(position) = self.dtc_result_position(&key, span) else {
+                return Val::Run(Tys::default(), Vec::new());
+            };
+            declared
+                .and_then(|positive| positive.fields())
+                .and_then(|fields| fields.iter().nth(position))
+        } else {
+            declared
+                .and_then(|positive| positive.fields())
+                .and_then(|fields| {
+                    fields
+                        .iter()
+                        .find(|f| f.short_name().is_some_and(|name| name == &*key))
+                })
+        };
         let Some(field) = field else {
             self.error(
                 StarCode::UnsupportedSyntax,
@@ -3015,6 +3037,9 @@ impl<'a> Lowerer<'a> {
                 }
             }
             "request" => self.diag_request(id, args, span),
+            "read_dtc" if self.requests.profile.call(Intent::ReadDtc).is_some() => {
+                self.diag_read_dtc(id, args, span)
+            }
             "read_dtc" | "routine" | "security_access" => {
                 let intent = match name {
                     "read_dtc" => Intent::ReadDtc,
@@ -3253,6 +3278,233 @@ impl<'a> Lowerer<'a> {
         match self.bounded(Const::dict(entries), arg.span) {
             value @ Val::Const(Const::Dict(..)) => Some(value),
             _ => None,
+        }
+    }
+
+    /// `diag.read_dtc(mask)` through the variant's profile (ADR-309 items 2 to 4, ADR-314):
+    /// the request the profile's template builds, sent as it is by the generic send-receive to
+    /// the declared service the template selects. The result is read under the profile's names
+    /// ([`Self::dtc_result_position`]).
+    fn diag_read_dtc(&mut self, id: Option<usize>, args: &[&AstExpr], span: Span) -> Val {
+        let [mask_arg] = args else {
+            self.error(
+                StarCode::UnsupportedSyntax,
+                span,
+                "`diag.read_dtc` takes a status mask (3.1)",
+            );
+            return Val::Run(Tys::of(Ty::Response), Vec::new());
+        };
+        let mask = self.constant_int(id, mask_arg, "read_dtc", "mask", 0..=0xFF);
+        let profile = self.requests.profile;
+        let call = profile.call(Intent::ReadDtc).expect("the caller checked");
+        let [step] = call.steps else {
+            self.not_lowerable(
+                span,
+                format!(
+                    "the {} profile's `diag.read_dtc` takes several steps, which are not lowered \
+                     yet (3.2)",
+                    profile.layer
+                ),
+            );
+            return Val::Run(Tys::of(Ty::Response), Vec::new());
+        };
+        let Some(mask) = mask else {
+            return Val::Run(Tys::of(Ty::Response), Vec::new());
+        };
+        // In range by the check above.
+        let args = [(Source::Mask, mask as u64)];
+        let Some((service, bytes)) = self.select_template(&step.request, &args, span) else {
+            return Val::Run(Tys::of(Ty::Response), Vec::new());
+        };
+        if !self.dtc_response_fits(service, step.result, span) {
+            return Val::Run(Tys::of(Ty::Response), Vec::new());
+        }
+        let operand = self.pool(&bytes);
+        Val::Run(
+            Tys::from_dtc_service(service),
+            vec![
+                (Ins::Op(Op::PushBytes(operand)), span),
+                (Ins::Op(Op::SendReceive { service }), span),
+            ],
+        )
+    }
+
+    /// The one declared service of this variant that a profile's request template selects
+    /// (ADR-314 item 2), with the complete request bytes, its SID first: the template's
+    /// constants and selecting arguments must equal the declared request's constants in order,
+    /// and its other arguments fill the declared request's fields in order, each of the
+    /// template's width. `args` gives the call's argument values. `None` after an error.
+    fn select_template(
+        &mut self,
+        template: &crate::profile::Request,
+        args: &[(Source, u64)],
+        span: Span,
+    ) -> Option<(u32, Vec<u8>)> {
+        let value = |source: Source| {
+            args.iter()
+                .find(|(s, _)| *s == source)
+                .map(|&(_, v)| v)
+                .expect("the call gives each source its template uses")
+        };
+        let services = self.variant.services();
+        let mut found = Vec::new();
+        for indexed in &self.requests.services {
+            if indexed.sid != template.sid || indexed.routine {
+                continue;
+            }
+            let Some(request) = services.and_then(|services| {
+                self.service_at
+                    .get(&indexed.service_id)
+                    .and_then(|&at| services.get(at).request())
+            }) else {
+                continue;
+            };
+            let fields: Vec<_> = request.params().into_iter().flatten().collect();
+            let (mut constants, mut fields_at) = (indexed.constants.iter(), fields.iter());
+            let mut values = HashMap::new();
+            let fits = template.parts.iter().all(|part| match *part {
+                Part::Const { value: expected, .. } => {
+                    matches!(constants.next(), Some((_, RequestConstant::Uint(c))) if *c == expected)
+                }
+                Part::Select { arg, .. } => {
+                    matches!(constants.next(), Some((_, RequestConstant::Uint(c))) if *c == value(arg))
+                }
+                Part::Arg { bits, arg } => fields_at.next().is_some_and(|field| {
+                    let fits = field.length_kind() == LengthKind::Fixed
+                        && field.bit_length() == u32::from(bits)
+                        && matches!(
+                            diag_ir::decode::scalar_kind(field),
+                            Ok(diag_ir::decode::ScalarKind::Integer)
+                        );
+                    if fits {
+                        let name = field.short_name().unwrap_or_default();
+                        // At most 64 bits wide (`Profile::validate`), so it fits an `i64`
+                        // read as the field's own bits.
+                        values.insert(name, ParamValue::Int(value(arg) as i64));
+                    }
+                    fits
+                }),
+                // No call that is lowered through a template yet takes `params`.
+                Part::Params => false,
+            });
+            if fits && constants.next().is_none() && fields_at.next().is_none() {
+                found.push((indexed.service_id, request, values));
+            }
+        }
+        let layer = self.requests.profile.layer;
+        let [(service, request, values)] = &found[..] else {
+            self.error(
+                StarCode::UnknownService,
+                span,
+                format!(
+                    "{} services of this variant have SID 0x{:02X} and the constants and \
+                     fields the {layer} profile's request needs, not one (csv-tables 5.3, \
+                     ADR-314)",
+                    found.len(),
+                    template.sid
+                ),
+            );
+            return None;
+        };
+        match encode_request(request, values) {
+            Ok(operand) => Some((*service, [&[template.sid][..], &operand].concat())),
+            Err(e) => {
+                self.error(
+                    StarCode::ArgumentOutOfRange,
+                    span,
+                    format!("the {layer} profile's request cannot be encoded: {e} (3.1)"),
+                );
+                None
+            }
+        }
+    }
+
+    /// Whether the declared positive response of `service` fits the profile's `diag.read_dtc`
+    /// map (ADR-314 item 3): an integer field at the mask's position, and a field at the
+    /// records' position. Reports the field that does not.
+    fn dtc_response_fits(&mut self, service: u32, map: ResultMap, span: Span) -> bool {
+        let ResultMap::ReadDtc { mask, dtcs, .. } = map else {
+            unreachable!("`Profile::validate` gives `diag.read_dtc` its DTC map")
+        };
+        let fields: Vec<_> = self
+            .variant
+            .services()
+            .and_then(|services| services.iter().find(|s| s.id() == service))
+            .and_then(|s| s.positive())
+            .and_then(|positive| positive.fields())
+            .into_iter()
+            .flatten()
+            .collect();
+        let layer = self.requests.profile.layer;
+        let mask_field = fields.get(usize::from(mask.0));
+        let problem = match mask_field {
+            None => Some(format!("has no field at the mask's position {}", mask.0)),
+            Some(field)
+                if !matches!(
+                    diag_ir::decode::scalar_kind(field),
+                    Ok(diag_ir::decode::ScalarKind::Integer)
+                ) =>
+            {
+                Some(format!(
+                    "has `{}`, which is not an integer, at the mask's position",
+                    field.short_name().unwrap_or_default()
+                ))
+            }
+            Some(_) if fields.get(usize::from(dtcs.0)).is_none() => Some(format!(
+                "has no field at the DTC records' position {}",
+                dtcs.0
+            )),
+            Some(_) => None,
+        };
+        if let Some(problem) = problem {
+            self.error(
+                StarCode::NotInProfile,
+                span,
+                format!(
+                    "the positive response of the selected service {problem}, so it does not fit \
+                     the {layer} profile's `diag.read_dtc` (ADR-314)"
+                ),
+            );
+            return false;
+        }
+        true
+    }
+
+    /// The position among the declared response's top-level fields of `key`, a name the
+    /// profile's `diag.read_dtc` map defines (ADR-314 item 4), or `None` after an error.
+    fn dtc_result_position(&mut self, key: &str, span: Span) -> Option<usize> {
+        let profile = self.requests.profile;
+        let map = profile.call(Intent::ReadDtc).and_then(|call| {
+            call.steps.iter().find_map(|step| match step.result {
+                ResultMap::ReadDtc { mask, dtcs, .. } => Some((mask, dtcs)),
+                _ => None,
+            })
+        });
+        let Some((mask, _)) = map else {
+            unreachable!("only a `diag.read_dtc` the profile defines is lowered")
+        };
+        match key {
+            "mask" => Some(usize::from(mask.0)),
+            "dtcs" => {
+                self.not_lowerable(
+                    span,
+                    "`dtcs` is a list of records, which a procedure cannot read yet; read `raw` \
+                     instead (3.4)",
+                );
+                None
+            }
+            _ => {
+                self.error(
+                    StarCode::NotInProfile,
+                    span,
+                    format!(
+                        "the result of `diag.read_dtc` has `mask` and `dtcs`, the names the {} \
+                         profile maps it to, not `{key}` (3.4, ADR-314)",
+                        profile.layer
+                    ),
+                );
+                None
+            }
         }
     }
 

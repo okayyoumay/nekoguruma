@@ -1035,6 +1035,17 @@ fn a_dtc_read_needs_one_service_that_fits_the_profile() {
         errors.iter().any(|e| e.hint.contains("byte edge")),
         "{errors:?}"
     );
+    // Records run to the end of the message, so nothing may follow them.
+    let trailing = fields.replace(
+        "response:readDtcByStatusMask,records,2,,,,,,,,,,repeat,dtcRecord,\n",
+        "response:readDtcByStatusMask,records,2,,,,,,,,,,repeat,dtcRecord,\n\
+         response:readDtcByStatusMask,trailer,,,uint,8,,,,,,,,,\n",
+    );
+    assert_ne!(trailing, fields);
+    let found = codes(trailing);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].0, crate::star::StarCode::NotInProfile);
+    assert!(found[0].1.contains("after `records`"), "{found:?}");
     // Records placed one after the other have the same layout, but padded ones do not.
     let sequential = fields
         .replace("layout:dtcRecord,dtc,0,,", "layout:dtcRecord,dtc,,,")

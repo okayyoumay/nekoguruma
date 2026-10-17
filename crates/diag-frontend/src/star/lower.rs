@@ -3482,6 +3482,11 @@ impl<'a> Lowerer<'a> {
                         records.short_name().unwrap_or_default()
                     ))
                 }
+                // The records run to the end of the message, so nothing can follow them.
+                Some(records) if fields.len() > usize::from(dtcs.0) + 1 => Some(format!(
+                    "declares fields after `{}`, which runs to the end of the message",
+                    records.short_name().unwrap_or_default()
+                )),
                 Some(_) => None,
             },
         };

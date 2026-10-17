@@ -679,10 +679,19 @@ impl diag_ir::DiagHost for Answering {
     }
 }
 
-/// Runs the first variant's program for `main.star` against `responses`: the messages it
-/// logged, or the VM error it stopped with.
+/// Runs the first variant's program for `main.star` against `responses`, stepped with that
+/// variant's declarations (ADR-316): the messages it logged, or the VM error it stopped with.
 fn answered(source: &str, responses: &[&[u8]]) -> Result<Vec<String>, String> {
-    let converted = convert(with(example(), "main.star", source));
+    answered_in(example(), source, responses)
+}
+
+/// [`answered`] for the definition `files`.
+fn answered_in(
+    files: Vec<(String, Vec<u8>)>,
+    source: &str,
+    responses: &[&[u8]],
+) -> Result<Vec<String>, String> {
+    let converted = convert(with(files, "main.star", source));
     let document = load_ecu_document(&converted.documents[0].bytes).expect("the document loads");
     let bytes = document.procedure().expect("a program");
     let program: diag_ir::Program = postcard::from_bytes(bytes.bytes()).expect("a program");
@@ -692,7 +701,7 @@ fn answered(source: &str, responses: &[&[u8]]) -> Result<Vec<String>, String> {
         logged: Vec::new(),
     };
     loop {
-        match vm.step(&program, &mut host) {
+        match vm.step_with_declarations(&program, document.variant().as_ref(), &mut host) {
             Ok(diag_ir::StepOutcome::Continue) => {}
             Ok(diag_ir::StepOutcome::Finished) => return Ok(host.logged),
             Ok(other) => panic!("{other:?}"),
@@ -801,7 +810,7 @@ fn a_response_is_read_only_through_its_keys() {
     };
     let cases = [
         (read("res[\"okay\"]"), UnsupportedSyntax),
-        (read("res[\"fields\"]"), NotLowerable),
+        (read("res[\"fields\"] + 1"), NotLowerable),
         (read("res + b\"x\""), NotLowerable),
         (read("1 if res else 2"), NotLowerable),
         // Starlark would compare the dict: never equal to bytes, so a left-out `["raw"]`
@@ -815,6 +824,129 @@ fn a_response_is_read_only_through_its_keys() {
              def main():\n    x = get()[K]\n"
                 .to_owned(),
             DynamicKeyNotAllowed,
+        ),
+    ];
+    for (source, code) in cases {
+        let codes: Vec<_> = request_errors(&source).into_iter().map(|e| e.0).collect();
+        assert_eq!(codes, [code], "{source}");
+    }
+}
+
+// ---------------------------------------------------------------- Field reads (ADR-320)
+
+/// The VIN response of the simulated ECU, and a flash state with phase 2 and block 7.
+fn vin_answer() -> Vec<u8> {
+    let mut answer = vec![0x62, 0xF1, 0x90];
+    answer.extend_from_slice(b"NGRSIMECU00000001");
+    answer
+}
+
+#[test]
+fn a_field_read_decodes_the_declared_field() {
+    let source = "\
+def main():
+    res = diag.request(0x22, {\"did\": 0xF190})
+    if res[\"ok\"] and res[\"fields\"][\"vin\"] == \"NGRSIMECU00000001\":
+        diag.log(1, \"vin\")
+    state = diag.request(0x22, {\"did\": 0xFD00})[\"fields\"]
+    if state[\"phase\"] == 2 and state[\"blockNumber\"] + 1 == 8:
+        diag.log(1, \"state\")
+    session = diag.request(0x22, {\"did\": 0xF186})
+    if session[\"fields\"][\"session\"] == 3:
+        diag.log(1, \"session\")
+";
+    let state: &[u8] = &[0x62, 0xFD, 0x00, 2, 0, 0, 0, 7, 0, 0, 1, 0];
+    // The session's text table keeps the number.
+    let session: &[u8] = &[0x62, 0xF1, 0x86, 3];
+    assert_eq!(
+        answered(source, &[&vin_answer(), state, session]).unwrap(),
+        ["vin", "state", "session"]
+    );
+}
+
+#[test]
+fn a_float_field_reads_as_a_float() {
+    // The supply voltage, declared here for every variant, is linear: 0x89 / 10 = 13.7.
+    let files: Vec<_> = example()
+        .into_iter()
+        .map(|(name, bytes)| {
+            let bytes = if name == "dids.csv" {
+                String::from_utf8(bytes)
+                    .unwrap()
+                    .replace("exampleEcuV2,supplyVoltage", ",supplyVoltage")
+                    .into_bytes()
+            } else {
+                bytes
+            };
+            (name, bytes)
+        })
+        .collect();
+    let source = "\
+def main():
+    v = diag.request(0x22, {\"did\": 0xFD02})[\"fields\"][\"supplyVoltage\"]
+    if v > 13.5 and v < 13.75:
+        diag.log(1, \"in range\")
+";
+    assert_eq!(
+        answered_in(files, source, &[&[0x62, 0xFD, 0x02, 0x00, 0x89]]).unwrap(),
+        ["in range"]
+    );
+}
+
+#[test]
+fn a_field_of_a_negative_response_stops_the_run() {
+    let source = "\
+def main():
+    vin = diag.request(0x22, {\"did\": 0xF190})[\"fields\"][\"vin\"]
+";
+    let error = answered(source, &[&[0x7F, 0x22, 0x31]]).unwrap_err();
+    assert!(error.contains("Undecodable"), "{error}");
+}
+
+#[test]
+fn a_field_read_is_checked_against_the_declarations() {
+    use crate::star::StarCode::{DynamicKeyNotAllowed, NotLowerable, UnsupportedSyntax};
+    let read = |expr: &str| {
+        format!("def main():\n    res = diag.request(0x22, {{\"did\": 0xFD03}})\n    x = {expr}\n")
+    };
+    let cases = [
+        // Not a field of this service's response.
+        (read("res[\"fields\"][\"vin\"]"), UnsupportedSyntax),
+        // A select: no scalar value.
+        (read("res[\"fields\"][\"details\"]"), NotLowerable),
+        (read("res[\"fields\"][\"reason\"] + \"x\""), NotLowerable),
+        (read("res[\"fields\"] == res[\"fields\"]"), NotLowerable),
+        // A key that is not a literal, also where the checker does not see a response.
+        (
+            "K = \"reason\"\n\ndef get():\n    return diag.request(0x22, {\"did\": 0xFD03})\n\n\
+             def main():\n    x = get()[\"fields\"][K]\n"
+                .to_owned(),
+            DynamicKeyNotAllowed,
+        ),
+        // Two services on different paths: the field names are not known at ingestion.
+        (
+            "def main():\n    res = diag.request(0x22, {\"did\": 0xFD03})\n    \
+             if res[\"ok\"]:\n        res = diag.request(0x22, {\"did\": 0xFD01})\n    \
+             x = res[\"fields\"][\"reason\"]\n"
+                .to_owned(),
+            NotLowerable,
+        ),
+        // Types are per variable (4.8), so a variable reused for another service's response
+        // cannot be read, even one assignment after the other.
+        (
+            "def main():\n    res = diag.request(0x22, {\"did\": 0xFD03})\n    \
+             res = diag.request(0x22, {\"did\": 0xFD01})\n    \
+             x = res[\"fields\"][\"reason\"]\n"
+                .to_owned(),
+            NotLowerable,
+        ),
+        // Nor a parameter whose callers pass responses of different services.
+        (
+            "def get(r):\n    return r[\"fields\"][\"reason\"]\n\n\
+             def main():\n    x = get(diag.request(0x22, {\"did\": 0xFD03}))\n    \
+             y = get(diag.request(0x22, {\"did\": 0xFD01}))\n"
+                .to_owned(),
+            NotLowerable,
         ),
     ];
     for (source, code) in cases {

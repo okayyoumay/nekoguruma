@@ -4,7 +4,7 @@ EcuDocumentT {
         "csv-starlark",
     ),
     source_digest: Some(
-        "57ad91a52c23c917cb0564d008b281a7d3f4c222a2d403c1e8e57523aa3f2cfe",
+        "fe237a596d7e4dce08ba2d2e8c6c5937d304e55ee42f7ddf3cb345956701be5a",
     ),
     variant: Some(
         EcuVariantT {
@@ -2044,16 +2044,36 @@ Program {
         ServiceRequest {
             service: 34,
         },
-        Pop,
-        PushBytes(
+        StoreLocal(
+            0,
+        ),
+        LoadLocal(
+            0,
+        ),
+        DecodeField {
+            service: 5,
+            field: 20,
+        },
+        PushI64(
             3,
+        ),
+        CmpEq,
+        JumpIfFalse(
+            17,
+        ),
+        Log {
+            level: 1,
+            message: 3,
+        },
+        PushBytes(
+            4,
         ),
         ServiceRequest {
             service: 25,
         },
         Pop,
         PushBytes(
-            4,
+            5,
         ),
         ServiceRequest {
             service: 46,
@@ -2061,7 +2081,7 @@ Program {
         Pop,
         Log {
             level: 1,
-            message: 5,
+            message: 6,
         },
         Ret,
     ],
@@ -2076,6 +2096,24 @@ Program {
         [
             241,
             134,
+        ],
+        [
+            101,
+            120,
+            116,
+            101,
+            110,
+            100,
+            101,
+            100,
+            32,
+            115,
+            101,
+            115,
+            115,
+            105,
+            111,
+            110,
         ],
         [
             2,
@@ -2133,19 +2171,19 @@ Program {
             pc: 8,
             file: 0,
             line: 7,
-            column: 5,
+            column: 15,
         },
         SourceSpan {
             pc: 11,
             file: 0,
             line: 8,
-            column: 5,
+            column: 8,
         },
         SourceSpan {
-            pc: 14,
+            pc: 16,
             file: 0,
             line: 9,
-            column: 5,
+            column: 9,
         },
         SourceSpan {
             pc: 17,
@@ -2154,7 +2192,19 @@ Program {
             column: 5,
         },
         SourceSpan {
-            pc: 18,
+            pc: 20,
+            file: 0,
+            line: 11,
+            column: 5,
+        },
+        SourceSpan {
+            pc: 23,
+            file: 0,
+            line: 12,
+            column: 5,
+        },
+        SourceSpan {
+            pc: 24,
             file: 0,
             line: 4,
             column: 5,

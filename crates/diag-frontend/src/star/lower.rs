@@ -166,15 +166,19 @@ enum Ty {
     Bytes,
     Str,
     Response,
+    /// A response's `fields` (subset 3.4): the response bytes, read only by a literal field
+    /// name, which decodes the field through the declaration part (ADR-316, ADR-320).
+    Fields,
 }
 
-const TYS: [Ty; 6] = [
+const TYS: [Ty; 7] = [
     Ty::Int,
     Ty::Float,
     Ty::Bool,
     Ty::Bytes,
     Ty::Str,
     Ty::Response,
+    Ty::Fields,
 ];
 
 impl Ty {
@@ -186,6 +190,7 @@ impl Ty {
             Ty::Bytes => 8,
             Ty::Str => 16,
             Ty::Response => 32,
+            Ty::Fields => 64,
         }
     }
 
@@ -197,33 +202,79 @@ impl Ty {
             Ty::Bytes => "bytes",
             Ty::Str => "str",
             Ty::Response => "response",
+            Ty::Fields => "response fields",
         }
     }
 }
 
 /// The types a value may have at run time, inferred at ingestion. Empty until something is
-/// known about it.
+/// known about it. A response, and its fields, also carry the declared service they come from,
+/// which decides what a field name means (ADR-320).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-struct Tys(u8);
+struct Tys {
+    bits: u8,
+    service: Service,
+}
+
+/// The declared service a response comes from, as far as it is known at ingestion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Service {
+    /// No response, or one whose call was already reported as an error.
+    #[default]
+    Unknown,
+    /// The `Service.id` of the one request the response can come from.
+    One(u32),
+    /// Requests to more than one service: a variable assigned from both anywhere in its
+    /// function (types are per variable, subset 4.8), or a parameter whose callers pass both.
+    Several,
+}
+
+impl Service {
+    fn union(self, other: Service) -> Service {
+        match (self, other) {
+            (Service::Unknown, s) | (s, Service::Unknown) => s,
+            (Service::One(a), Service::One(b)) if a == b => Service::One(a),
+            _ => Service::Several,
+        }
+    }
+}
 
 impl Tys {
     fn of(ty: Ty) -> Self {
-        Tys(ty.bit())
+        Tys {
+            bits: ty.bit(),
+            service: Service::Unknown,
+        }
+    }
+
+    /// A response, or its fields (`ty`), from `service`.
+    fn from_service(ty: Ty, service: u32) -> Self {
+        Tys {
+            bits: ty.bit(),
+            service: Service::One(service),
+        }
     }
 
     fn union(self, other: Tys) -> Tys {
-        Tys(self.0 | other.0)
+        Tys {
+            bits: self.bits | other.bits,
+            service: self.service.union(other.service),
+        }
+    }
+
+    fn has(self, ty: Ty) -> bool {
+        self.bits & ty.bit() != 0
     }
 
     /// The one type, when there is exactly one.
     fn one(self) -> Option<Ty> {
-        TYS.into_iter().find(|ty| self.0 == ty.bit())
+        TYS.into_iter().find(|ty| self.bits == ty.bit())
     }
 
     fn describe(self) -> String {
         let names: Vec<_> = TYS
             .into_iter()
-            .filter(|ty| self.0 & ty.bit() != 0)
+            .filter(|ty| self.has(*ty))
             .map(Ty::name)
             .collect();
         if names.is_empty() {
@@ -1505,7 +1556,7 @@ impl<'a> Lowerer<'a> {
                 let a = self.expr(id, object);
                 let b = self.expr(id, index);
                 match a {
-                    Val::Run(tys, code) if tys == Tys::of(Ty::Response) => {
+                    Val::Run(tys, code) if matches!(tys.one(), Some(Ty::Response | Ty::Fields)) => {
                         // Subset 4.1 holds for a response however it reached here, also through
                         // a function the checker does not follow.
                         let literal = matches!(&index.node, ExprP::Literal(AstLiteral::String(_)));
@@ -1514,7 +1565,11 @@ impl<'a> Lowerer<'a> {
                         } else {
                             Val::Run(Tys::default(), Vec::new())
                         };
-                        self.response_key(id, code, key, span)
+                        if tys.one() == Some(Ty::Response) {
+                            self.response_key(id, code, key, tys.service, span)
+                        } else {
+                            self.field_key(code, key, tys.service, span)
+                        }
                     }
                     a => self.index(a, b, span),
                 }
@@ -1725,7 +1780,7 @@ impl<'a> Lowerer<'a> {
                 );
                 return None;
             }
-            Ty::Response => {
+            Ty::Response | Ty::Fields => {
                 self.not_lowerable(
                     span,
                     "a response is always true; test `res[\"ok\"]` instead (3.4)",
@@ -1924,10 +1979,9 @@ impl<'a> Lowerer<'a> {
                 }
             };
         }
-        let response = Ty::Response.bit();
         if [&a, &b]
             .iter()
-            .any(|v| matches!(v, Val::Run(tys, _) if tys.0 & response != 0))
+            .any(|v| matches!(v, Val::Run(tys, _) if tys.has(Ty::Response) || tys.has(Ty::Fields)))
         {
             // Starlark would compare the dict, which a procedure that left out `["raw"]` gets
             // wrong silently (ADR-317 item 3).
@@ -2307,7 +2361,14 @@ impl<'a> Lowerer<'a> {
     /// ADR-317): `code` pushes the response bytes. Until the declaration part carries the
     /// application layer's negative-response shape (ADR-309 item 4), a response is negative when
     /// its first byte is UDS's `7F`, and its NRC is then its third byte.
-    fn response_key(&mut self, id: Option<usize>, code: Code, key: Val, span: Span) -> Val {
+    fn response_key(
+        &mut self,
+        id: Option<usize>,
+        code: Code,
+        key: Val,
+        service: Service,
+        span: Span,
+    ) -> Val {
         let Val::Const(Const::Str(key)) = key else {
             self.error(
                 StarCode::DynamicKeyNotAllowed,
@@ -2358,13 +2419,13 @@ impl<'a> Lowerer<'a> {
                 );
                 Val::Run(Tys::of(Ty::Int), code)
             }
-            "fields" => {
-                self.not_lowerable(
-                    span,
-                    "reading `fields` of a response is not lowered yet (3.4)",
-                );
-                Val::Run(Tys::default(), Vec::new())
-            }
+            "fields" => Val::Run(
+                Tys {
+                    bits: Ty::Fields.bit(),
+                    service,
+                },
+                code,
+            ),
             other => {
                 self.error(
                     StarCode::UnsupportedSyntax,
@@ -2377,6 +2438,79 @@ impl<'a> Lowerer<'a> {
                 Val::Run(Tys::default(), Vec::new())
             }
         }
+    }
+
+    /// `res["fields"]["name"]` (subset 3.4, ADR-320): `code` pushes the response bytes of a
+    /// request to `service`, and the field the variant declares under `name` among the top-level
+    /// fields of that service's positive response is decoded from them (`Op::DecodeField`,
+    /// ADR-316). The field's declaration gives the value's type.
+    fn field_key(&mut self, code: Code, key: Val, service: Service, span: Span) -> Val {
+        let Val::Const(Const::Str(key)) = key else {
+            self.error(
+                StarCode::DynamicKeyNotAllowed,
+                span,
+                "a response's fields are read with a string literal key (3.4, 4.1)",
+            );
+            return Val::Run(Tys::default(), Vec::new());
+        };
+        let service = match service {
+            Service::One(service) => service,
+            // The request's own error is already reported.
+            Service::Unknown => return Val::Run(Tys::default(), Vec::new()),
+            Service::Several => {
+                self.not_lowerable(
+                    span,
+                    "this value can hold responses to different services, so its fields are not \
+                     known at ingestion; keep each response in a variable of its own (3.4, 4.8)",
+                );
+                return Val::Run(Tys::default(), Vec::new());
+            }
+        };
+        let declared = self
+            .variant
+            .services()
+            .and_then(|services| services.iter().find(|s| s.id() == service))
+            .and_then(|s| s.positive());
+        let field = declared
+            .and_then(|positive| positive.fields())
+            .and_then(|fields| {
+                fields
+                    .iter()
+                    .find(|f| f.short_name().is_some_and(|name| name == &*key))
+            });
+        let Some(field) = field else {
+            self.error(
+                StarCode::UnsupportedSyntax,
+                span,
+                format!(
+                    "the response declares no field `{key}` among the top-level fields of its \
+                     positive response (3.4)"
+                ),
+            );
+            return Val::Run(Tys::default(), Vec::new());
+        };
+        let ty = match diag_ir::decode::scalar_kind(&field) {
+            Ok(diag_ir::decode::ScalarKind::Integer) => Ty::Int,
+            Ok(diag_ir::decode::ScalarKind::Float) => Ty::Float,
+            Ok(diag_ir::decode::ScalarKind::Text) => Ty::Str,
+            Ok(diag_ir::decode::ScalarKind::Bytes) => Ty::Bytes,
+            Err(what) => {
+                self.not_lowerable(
+                    span,
+                    format!("the field `{key}` is {what}, which a procedure cannot read (3.4)"),
+                );
+                return Val::Run(Tys::default(), Vec::new());
+            }
+        };
+        let mut code = code;
+        code.push((
+            Ins::Op(Op::DecodeField {
+                service,
+                field: field.id(),
+            }),
+            span,
+        ));
+        Val::Run(Tys::of(ty), code)
     }
 
     /// Code that turns the response bytes on top of the stack into whether the response is
@@ -2934,7 +3068,7 @@ impl<'a> Lowerer<'a> {
         };
         // In range by the check above.
         let sid = sid as u8;
-        let Some((request, constants)) = self.select_request(sid, &params) else {
+        let Some((service, request, constants)) = self.select_request(sid, &params) else {
             let mut keys: Vec<&str> = params.iter().map(|(key, _)| &**key).collect();
             keys.sort_unstable();
             self.error(
@@ -2981,7 +3115,7 @@ impl<'a> Lowerer<'a> {
             Ok(operand) => {
                 let operand = self.pool(&operand);
                 Val::Run(
-                    Tys::of(Ty::Response),
+                    Tys::from_service(Ty::Response, service),
                     vec![
                         (Ins::Op(Op::PushBytes(operand)), span),
                         (
@@ -3084,7 +3218,7 @@ impl<'a> Lowerer<'a> {
         &self,
         sid: u8,
         params: &[(Rc<str>, Const)],
-    ) -> Option<(Request<'a>, HashSet<&'a str>)> {
+    ) -> Option<(u32, Request<'a>, HashSet<&'a str>)> {
         let services = self.variant.services()?;
         let mut found = None;
         for indexed in &self.requests.services {
@@ -3135,7 +3269,7 @@ impl<'a> Lowerer<'a> {
             if found.is_some() {
                 return None;
             }
-            found = Some((request, constants));
+            found = Some((indexed.service_id, request, constants));
         }
         found
     }

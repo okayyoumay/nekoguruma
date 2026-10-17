@@ -3063,6 +3063,15 @@ mod decode_field {
         }
     }
 
+    /// Halves the value.
+    fn linear() -> CompuT {
+        CompuT::CompuLinear(Box::new(CompuLinearT {
+            numerator: 1.0,
+            denominator: 2.0,
+            offset: 0.0,
+        }))
+    }
+
     /// A document whose service 7 answers with SID 0x62, prefix F1 90 and one field of each
     /// kind: a u16 (1), an i8 (2), an f32 (3), two ASCII bytes (4), two bytes (5), a group
     /// (6) and a u64 (8).
@@ -3131,6 +3140,49 @@ mod decode_field {
             })),
             ..Default::default()
         };
+        // Service 11: UTF-8 (1), UTF-16 (2) and an i8 with a linear conversion (3).
+        let text = ServiceT {
+            id: 11,
+            short_name: Some("t".into()),
+            positive: Some(Box::new(PositiveResponseT {
+                sid: 0x62,
+                prefix: None,
+                fields: Some(vec![
+                    next(1, DataKind::Utf8, 16),
+                    next(2, DataKind::Unicode2, 32),
+                    FieldT {
+                        compu: linear(),
+                        ..next(3, DataKind::Int, 8)
+                    },
+                ]),
+            })),
+            ..Default::default()
+        };
+        // Service 12: conversions the decoder does not run on these values, a text table on a
+        // float (1), a linear conversion on a string (2) and bytecode (3).
+        let unread = ServiceT {
+            id: 12,
+            short_name: Some("u".into()),
+            positive: Some(Box::new(PositiveResponseT {
+                sid: 0x62,
+                prefix: None,
+                fields: Some(vec![
+                    FieldT {
+                        compu: CompuT::CompuTextTable(Box::default()),
+                        ..next(1, DataKind::Float, 32)
+                    },
+                    FieldT {
+                        compu: linear(),
+                        ..next(2, DataKind::Ascii, 16)
+                    },
+                    FieldT {
+                        compu: CompuT::CompuBytecode(Box::default()),
+                        ..next(3, DataKind::Uint, 8)
+                    },
+                ]),
+            })),
+            ..Default::default()
+        };
         // Service 9 declares no positive response.
         let bare = ServiceT {
             id: 9,
@@ -3143,12 +3195,82 @@ mod decode_field {
             source_digest: Some("00".into()),
             variant: Some(Box::new(EcuVariantT {
                 id: 1,
-                services: Some(vec![service, converted, bare]),
+                services: Some(vec![service, converted, bare, text, unread]),
                 layouts: Some(vec![layout]),
                 ..Default::default()
             })),
             procedure: None,
         })
+    }
+
+    #[test]
+    fn a_field_is_typed_from_its_declaration_as_it_decodes() {
+        use crate::decode::{ScalarKind, scalar_kind};
+        let bytes = document();
+        let variant = load_ecu_document(&bytes).unwrap().variant().unwrap();
+        // A response for each service whose values all fit the VM.
+        let mut first = response();
+        let at = first.len() - 8;
+        first[at..].copy_from_slice(&1u64.to_be_bytes());
+        let responses = [
+            (7, first),
+            (
+                8,
+                vec![0x62, 0x0B, 0x03, 0x12, 0x34, 0, 0, 0, 0, 0, 0, 0, 1],
+            ),
+            (11, vec![0x62, b'o', b'k', 0, b'H', 0, b'i', 0xFE]),
+            (12, vec![0x62, 0, 0, 0, 0, b'o', b'k', 3]),
+        ];
+        let mut kinds = Vec::new();
+        for (service, message) in &responses {
+            let declared = variant
+                .services()
+                .unwrap()
+                .iter()
+                .find(|s| s.id() == *service)
+                .unwrap();
+            for field in declared.positive().unwrap().fields().unwrap().iter() {
+                let kind = scalar_kind(&field);
+                let decoded = decode(true, *service, field.id(), message);
+                // The type a field is given is the type of the value it decodes to.
+                match (kind, &decoded) {
+                    (Ok(ScalarKind::Integer), Ok(Value::I64(_)))
+                    | (Ok(ScalarKind::Float), Ok(Value::F64(_)))
+                    | (Ok(ScalarKind::Text | ScalarKind::Bytes), Ok(Value::Bytes(_)))
+                    | (Err(_), Err(_)) => {}
+                    _ => panic!(
+                        "service {service} field {}: {kind:?}, decoded {decoded:?}",
+                        field.id()
+                    ),
+                }
+                kinds.push((*service, field.id(), kind.ok()));
+            }
+        }
+        use ScalarKind::*;
+        assert_eq!(
+            kinds,
+            [
+                (7, 1, Some(Integer)),
+                (7, 2, Some(Integer)),
+                (7, 3, Some(Float)),
+                (7, 4, Some(Text)),
+                (7, 5, Some(Bytes)),
+                (7, 6, None),
+                (7, 8, Some(Integer)),
+                // A linear conversion gives a float; a text table keeps the number; BCD is a
+                // number.
+                (8, 1, Some(Float)),
+                (8, 2, Some(Integer)),
+                (8, 3, Some(Integer)),
+                (8, 4, Some(Integer)),
+                (11, 1, Some(Text)),
+                (11, 2, Some(Text)),
+                (11, 3, Some(Float)),
+                (12, 1, None),
+                (12, 2, None),
+                (12, 3, None),
+            ]
+        );
     }
 
     #[test]

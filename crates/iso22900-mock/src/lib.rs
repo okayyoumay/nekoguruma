@@ -17,8 +17,9 @@ use sim_ecu::{Addressing, EcuConfig, Fault, SimEcu};
 const MOCK_MODULE_HANDLE: UNUM32 = 1001;
 const MOCK_RESOURCE_ID: UNUM32 = 2001;
 /// The ISO 22900-2 (2022) ComParams (Annex B.3) the mock resolves, with the object ids it gives
-/// them: those the agent sets up a UDS on CAN link with. The mock keeps no ComParam values.
-pub const STANDARD_COMPARAMS: [(&str, UNUM32); 8] = [
+/// them: those the agent sets up a UDS on CAN link with, and the ISO 15765-2 block size and
+/// separation time the example ECU declares (ADR-324). The mock keeps no ComParam values.
+pub const STANDARD_COMPARAMS: [(&str, UNUM32); 10] = [
     ("CP_Baudrate", 3210),
     ("CP_P2Max", 3211),
     ("CP_P2Star", 3212),
@@ -27,6 +28,8 @@ pub const STANDARD_COMPARAMS: [(&str, UNUM32); 8] = [
     ("CP_RC78CompletionTimeout", 3215),
     ("CP_CanPhysReqId", 3216),
     ("CP_CanRespUSDTId", 3217),
+    ("CP_BlockSize", 3218),
+    ("CP_StMin", 3219),
 ];
 
 fn standard_comparam_id(name: &str) -> Option<UNUM32> {

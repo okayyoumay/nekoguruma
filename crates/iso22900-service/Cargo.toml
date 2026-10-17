@@ -32,6 +32,9 @@ tracing = { workspace = true }
 agent = { path = "../agent" }
 # tests/ngr_agent_dpdu_end_to_end.rs writes and reads diag-ir programs and states.
 diag-ir = { workspace = true }
+# tests/ngr_agent_definition_end_to_end.rs converts the example ECU and writes its documents.
+diag-frontend = { path = "../diag-frontend" }
+postcard = { workspace = true }
 iso22900-mock = { workspace = true }
 worker-host = { workspace = true }
 serial_test = "3"

@@ -1,0 +1,14 @@
+{
+  "vin": "NGRSIMECU00000001",
+  "part_number": "NGR-SIM-ECU",
+  "sw_version": "1.0.0",
+  "response_delay_ms": 0,
+  "drop_at_block": null,
+  "require_security_access": false,
+  "require_gateway_auth": false,
+  "fail_checksum": false,
+  "dtcs": [
+    { "dtc": 1193046, "status": 9 },
+    { "dtc": 11259375, "status": 47 }
+  ]
+}

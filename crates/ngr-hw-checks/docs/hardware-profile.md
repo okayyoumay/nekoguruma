@@ -29,7 +29,7 @@ A TOML file outside the repository. Unknown keys are refused.
 | `class` | `"T0"`, `"T1"`, `"T2"` or `"T3"` (design 13.5) |
 | `[vci]` | T1 to T3: the VCI (below) |
 | `[link]` | T1 to T3: the link (below) |
-| `[[endpoint]]` | T0 only, exactly two: each names a `[endpoint.vci]`, with its `channel` (such as a J2534-2 additional channel's protocol name) when both ends are on one VCI, or a `socketcan` interface (such as `"can0"`), and a `[endpoint.link]`. At least one end is a VCI channel, the two ends differ (two ends on one VCI by their `channel`), and their links are one bus: the same `baud_rate` and `id_bits`, each end's `request_id` the other's `response_id` |
+| `[[endpoint]]` | T0 only, exactly two: each names a `[endpoint.vci]`, with its `channel` (such as the protocol name of an SAE J2534-2 clause 7 additional channel) at both ends when both are on one VCI, or a `socketcan` interface (such as `"can0"`), and a `[endpoint.link]`. At least one end is a VCI channel, the two ends differ (two ends on one VCI by their `channel`), and their links are one bus: the same `baud_rate` and `id_bits`, each end's `request_id` the other's `response_id` |
 | `allow` | Optional. Narrows the class to the listed operations: `"configuration-write"`, `"routine"`, `"reprogramming"`, `"fault-injection"`. Without it the profile keeps its class's operations |
 | `expendable_ecu` | T2 only: the ECU may be reprogrammed |
 | `[power]` | T1 and T2 only: the commands that switch the supply `off` and `on`, each a program and its arguments |
@@ -63,7 +63,7 @@ does not take. A T3 profile can add nothing.
 |---|---|
 | `protocol` | The protocol name, such as `"ISO15765"` |
 | `baud_rate` | Bits per second |
-| `pins` | The two connector pins (1 to 16), CAN high first |
+| `pins` | The two connector pins (1 to 16; SAE J2534-1 6.8 lists their use), CAN high first |
 | `request_id`, `response_id`, `functional_id` | The physical request and response identifiers, and optionally the functional one; all different |
 | `id_bits` | 11 or 29; every identifier must fit |
 | `addressing` | `"normal"`, `"extended"` or `"mixed"`; the last two need an `address` byte |

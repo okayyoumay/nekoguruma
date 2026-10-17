@@ -329,6 +329,12 @@ fn a_loopback_runs_between_two_ends_of_one_bus() {
         channel("CAN_CH1", "0x124", "0x123")
     );
     assert!(parse(&one_channel).is_err());
+    // A channel at one end only leaves the two ends undistinguished, in either order.
+    let named = channel("CAN_CH1", "0x123", "0x124");
+    for (first, second) in [(named.as_str(), vci_end), (vci_end, named.as_str())] {
+        let text = format!("class = \"T0\"\n[[endpoint]]{first}[[endpoint]]{second}");
+        assert!(parse(&text).is_err());
+    }
     // A SocketCAN end has no channel.
     let can_channel = T0_PROFILE.replacen(
         "socketcan = \"can0\"",

@@ -140,8 +140,9 @@ pub struct Link {
 #[serde(deny_unknown_fields)]
 pub struct Endpoint {
     pub vci: Option<Vci>,
-    /// The VCI's channel, such as a J2534-2 additional channel's protocol name. Required when
-    /// both ends are channels of the same VCI, and then different.
+    /// The VCI's channel, such as the protocol name of an SAE J2534-2 clause 7 additional
+    /// channel. Required at both ends when both are channels of the same VCI, and then
+    /// different.
     pub channel: Option<String>,
     /// A SocketCAN interface name, such as `can0`.
     pub socketcan: Option<String>,
@@ -374,7 +375,7 @@ pub fn parse(text: &str) -> Result<Profile, ProfileError> {
     })
 }
 
-/// The connector pins (SAE J1962 has 16).
+/// The pins of the diagnostic connector, numbered 1 to 16 (SAE J2534-1 6.8 lists their use).
 const PINS: std::ops::RangeInclusive<u8> = 1..=16;
 
 /// The ComParams of the physical layer, which the profile's typed keys give and a check may not
@@ -506,8 +507,9 @@ fn check_loopback(a: &Endpoint, b: &Endpoint) -> Result<(), ProfileError> {
         ));
     }
     // Two channels of one VCI are the preferred loopback; they differ by their channel.
-    let same_vci_channel =
-        a.vci.is_some() && a.vci == b.vci && (a.channel.is_none() || a.channel == b.channel);
+    let same_vci_channel = a.vci.is_some()
+        && a.vci == b.vci
+        && (a.channel.is_none() || b.channel.is_none() || a.channel == b.channel);
     if same_vci_channel || (a.socketcan.is_some() && a.socketcan == b.socketcan) {
         return Err(invalid(
             "a T0 loopback's two endpoints must be different channels; two ends on one VCI name \

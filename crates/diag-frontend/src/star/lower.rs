@@ -3379,20 +3379,19 @@ impl<'a> Lowerer<'a> {
                         true
                     }
                     Part::Const { .. } | Part::Select { .. } => false,
+                    // A profile's argument is a raw value such as a bit mask, so its field is
+                    // an unsigned integer that sends it as it is, not BCD or a signed number.
                     Part::Arg { bits, arg } => fields_at.next().is_some_and(|field| {
-                        let fits = field.length_kind() == LengthKind::Fixed
-                            && field.bit_length() == u32::from(bits)
-                            && matches!(
-                                diag_ir::decode::scalar_kind(field),
-                                Ok(diag_ir::decode::ScalarKind::Integer)
-                            );
-                        if fits {
+                        let fits = is_fixed_uint(field, bits)
+                            && field.compu_type() == diag_ir::declaration::Compu::CompuIdentity;
+                        // A value an `i64` cannot hold selects nothing; the profiles' arguments
+                        // are 8 or 16 bits wide.
+                        let value = i64::try_from(value(arg));
+                        if let (true, Ok(value)) = (fits, value) {
                             let name = field.short_name().unwrap_or_default();
-                            // At most 64 bits wide (`Profile::validate`), so it fits an `i64`
-                            // read as the field's own bits.
-                            values.insert(name, ParamValue::Int(value(arg) as i64));
+                            values.insert(name, ParamValue::Int(value));
                         }
-                        fits
+                        fits && value.is_ok()
                     }),
                     // No call that is lowered through a template yet takes `params`.
                     Part::Params => false,
@@ -3457,16 +3456,15 @@ impl<'a> Lowerer<'a> {
         let mask_field = fields.get(usize::from(mask.0));
         let problem = match mask_field {
             None => Some(format!("has no field at the mask's position {}", mask.0)),
-            // The availability mask is a status mask, as wide as each DTC's status.
+            // The availability mask is a status mask, as wide as each DTC's status, and its bits
+            // are read as they are.
             Some(field)
-                if !matches!(
-                    diag_ir::decode::scalar_kind(field),
-                    Ok(diag_ir::decode::ScalarKind::Integer)
-                ) || field.length_kind() != LengthKind::Fixed
-                    || field.bit_length() != u32::from(status_bits) =>
+                if !is_fixed_uint(field, status_bits)
+                    || field.compu_type() != diag_ir::declaration::Compu::CompuIdentity =>
             {
                 Some(format!(
-                    "has `{}`, which is not a {status_bits}-bit integer, at the mask's position",
+                    "has `{}`, which is not a {status_bits}-bit `uint` without a conversion, at \
+                     the mask's position",
                     field.short_name().unwrap_or_default()
                 ))
             }
@@ -3590,8 +3588,9 @@ impl<'a> Lowerer<'a> {
         found
     }
 
-    /// The value of `arg`, an argument of `diag.{function}` that its instruction holds as a
-    /// fixed field: an `int` constant in `range` (subset 3.1), or `None` after an error.
+    /// The value of `arg`, an argument of `diag.{function}` that is fixed at ingestion, in its
+    /// instruction or in the request bytes built then: an `int` constant in `range` (subset
+    /// 3.1), or `None` after an error.
     fn constant_int(
         &mut self,
         id: Option<usize>,
@@ -3630,8 +3629,8 @@ impl<'a> Lowerer<'a> {
                     StarCode::NonConstantArgument,
                     arg.span,
                     format!(
-                        "`{what}` of `diag.{function}` must be known at ingestion: the \
-                         instruction holds it as a fixed field (3.1)"
+                        "`{what}` of `diag.{function}` must be known at ingestion: it is a \
+                         fixed field of the instruction or of the request built then (3.1)"
                     ),
                 );
                 None
@@ -4251,3 +4250,11 @@ fn fold_method(s: &str, method: &str, args: &[Const]) -> Result<Const, String> {
 #[cfg(test)]
 #[path = "lower_tests.rs"]
 mod tests;
+
+/// Whether `field` is a fixed-width `uint` of `bits` bits, a value sent or read as its own bits.
+fn is_fixed_uint(field: &diag_ir::declaration::Field<'_>, bits: u8) -> bool {
+    field.kind() == diag_ir::declaration::DataKind::Uint
+        && field.length_kind() == LengthKind::Fixed
+        && field.bit_length() == u32::from(bits)
+        && field.shape_type() == diag_ir::declaration::Shape::NONE
+}

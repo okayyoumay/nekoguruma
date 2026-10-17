@@ -258,8 +258,8 @@ diag.fail(code, detail)                 # Abnormal end of the procedure
 
 `params` is a dict literal with string keys.
 
-Arguments that the instruction holds as a fixed field must be constant at ingestion and in the
-range below; otherwise the call is rejected (`STAR_NON_CONSTANT_ARGUMENT` or
+Arguments that the instruction, or the request built at ingestion, holds as a fixed field must
+be constant at ingestion and in the range below; otherwise the call is rejected (`STAR_NON_CONSTANT_ARGUMENT` or
 `STAR_ARGUMENT_OUT_OF_RANGE`). The ranges are those of the values themselves, not of the `Op`
 field that stores them.
 

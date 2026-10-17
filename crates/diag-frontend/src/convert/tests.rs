@@ -920,6 +920,44 @@ fn a_dtc_read_is_checked_at_ingestion() {
 }
 
 #[test]
+fn a_dtc_read_selects_no_service_when_two_fit_the_profile() {
+    let file = |name: &str| -> String {
+        example()
+            .into_iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, c)| String::from_utf8(c).expect("UTF-8"))
+            .expect("a table")
+    };
+    // A second service with the same SID, constant and field widths, its fields named apart.
+    let services = format!("{}readDtcAgain,0x19\n", file("services.csv"));
+    let fields = format!(
+        "{}request:readDtcAgain,sub,0,,uint,8,,,,,,0x02,,,\n\
+         request:readDtcAgain,mask,1,,uint,8,,,,,,,,,\n\
+         response:readDtcAgain,sub,0,,uint,8,,,,,,0x02,,,\n\
+         response:readDtcAgain,mask,1,,uint,8,,,,,,,,,\n\
+         response:readDtcAgain,records,2,,,,,,,,,,repeat,dtcRecord,\n",
+        file("fields.csv")
+    );
+    let files = with(
+        with(
+            with(
+                with(example(), "services.csv", &services),
+                "fields.csv",
+                &fields,
+            ),
+            "repeats.csv",
+            &format!("{}response:readDtcAgain,records,end\n", file("repeats.csv")),
+        ),
+        "main.star",
+        "def main():\n    diag.read_dtc(8)\n",
+    );
+    let errors = procedures(files).expect_err("rejected").errors;
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(errors[0].code, crate::star::StarCode::UnknownService);
+    assert!(errors[0].hint.starts_with("2 services"), "{errors:?}");
+}
+
+#[test]
 fn a_dtc_read_needs_one_service_that_fits_the_profile() {
     let fields = example()
         .into_iter()
@@ -974,6 +1012,22 @@ fn a_dtc_read_needs_one_service_that_fits_the_profile() {
     assert_eq!(found.len(), 1, "{found:?}");
     assert_eq!(found[0].0, crate::star::StarCode::NotInProfile);
     assert!(found[0].1.contains("availabilityMask"), "{found:?}");
+    // A BCD mask field would send the mask as decimal digits, and a BCD availability mask
+    // would read its bits as digits: neither is the profile's raw mask.
+    let bcd_request = fields.replace(
+        "request:readDtcByStatusMask,statusMask,1,,uint,8,",
+        "request:readDtcByStatusMask,statusMask,1,,bcd,8,",
+    );
+    let found = codes(bcd_request);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].0, crate::star::StarCode::UnknownService);
+    let bcd_response = fields.replace(
+        "response:readDtcByStatusMask,availabilityMask,1,,uint,8,",
+        "response:readDtcByStatusMask,availabilityMask,1,,bcd,8,",
+    );
+    let found = codes(bcd_response);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].0, crate::star::StarCode::NotInProfile);
     // A response whose field at the mask's position is not an integer does not fit the map.
     let bytes_mask = fields.replace(
         "response:readDtcByStatusMask,availabilityMask,1,,uint,8,",

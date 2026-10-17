@@ -133,8 +133,8 @@ shape survives inside the second as the access program of item 5.
    program names its access target and the hash of the declaration-only document of the
    variant it was lowered for, and the agent runs the one whose variant it has just identified;
    `check_job` refuses an access program whose named target is not an access target or whose
-   hash names no document the job holds, and a job that lacks one for any candidate variant of
-   an access target.
+   hash names no document the job holds, and a job that lacks one, or holds more than one, for
+   any candidate variant of an access target.
    `check_job` validates all of them then: it also refuses a combination document whose named hashes
    do not match the documents the job holds, and a set of combination documents that lacks one,
    or holds more than one, for any tuple of one candidate variant per target the procedure
@@ -159,6 +159,8 @@ shape survives inside the second as the access program of item 5.
    The one exception is the time the journal is inside the reprogramming target's flash plan:
    that ECU may answer only from its bootloader, so it is not identified again here, and
    ADR-229's hardware identity and state checks validate it instead.
+   The record is part of the checkpoint summary a handover carries (design 8.2.5), and the
+   receiving device's journal starts from it, so a handed-over restart uses the same document.
    A journal without the record holds no step of the program, since only access programs and
    identification reads ran, so its job starts again as a first run does. The host and the
    restart carry these documents in place of the single one (amending ADR-318 item 3).

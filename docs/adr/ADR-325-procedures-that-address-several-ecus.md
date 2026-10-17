@@ -87,7 +87,9 @@ shape survives inside the second as the access program of item 5.
    can be declared an access target, with an access program: steps that only change that
    target's session and security state and read from it (session control to the default or an
    extended session only, security access, reads). The declaration also gives the target's
-   session timeout and tester-present period (item 11). Several access targets (a gateway behind
+   session timeout and tester-present period (item 11); the conversion and `check_job` refuse a
+   period that is not positive or is not at most half the session timeout, so that one lost
+   tester-present does not let the session lapse. Several access targets (a gateway behind
    a gateway) run their access programs in declaration order. The access program is lowered on
    its own, once per variant of the access target, and travels with the job; the conversion and
    `check_job` refuse any other service in it. No access program runs before the job holds the

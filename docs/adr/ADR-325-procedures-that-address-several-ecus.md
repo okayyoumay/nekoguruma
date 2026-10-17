@@ -189,7 +189,11 @@ shape survives inside the second as the access program of item 5.
     only until its flash plan's entry and stops there, since the erase, the reset and the restart
     of the ECU silence it; the plan's own steps handle that ECU from then on. After the plan's
     post-transfer end the agent runs that target's access program again, and keeps it alive
-    again, before any later instruction addresses another target. The restart's
+    again, before any later instruction addresses another target. While the job is inside that plan (from
+    its entry to its post-transfer end, by the VM state or the journal), the runs of item 5 after
+    a restart or a reopening of the links skip that target's access program, whose ECU may answer
+    only from its bootloader, and leave it to ADR-229's restart order and the plan's replay; the
+    other access targets' programs still run. The restart's
     teardown (ADR-264) likewise stops the reprogramming target's keep-alive before the ECUReset or
     the passive wait, and keeps the other access targets alive.
 

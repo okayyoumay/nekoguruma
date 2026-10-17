@@ -2806,6 +2806,7 @@ mod tests {
                 field: 0,
             },
             VmError::Undecodable { service: 0 },
+            VmError::UnknownService { service: 0 },
         ];
         // The match fails to compile when a variant is added, so the list above stays complete.
         for error in &errors {
@@ -2833,7 +2834,8 @@ mod tests {
                 | VmError::NoDeclarations
                 | VmError::UnknownField { .. }
                 | VmError::ShapedField { .. }
-                | VmError::Undecodable { .. } => {}
+                | VmError::Undecodable { .. }
+                | VmError::UnknownService { .. } => {}
             }
         }
         let encoded = |reason: RunStop| {

@@ -5834,6 +5834,204 @@ impl ComParamT {
     })
   }
 }
+pub enum NegativeShapeOffset {}
+#[derive(Copy, Clone, PartialEq)]
+
+pub struct NegativeShape<'a> {
+  pub _tab: ::flatbuffers::Table<'a>,
+}
+
+impl<'a> ::flatbuffers::Follow<'a> for NegativeShape<'a> {
+  type Inner = NegativeShape<'a>;
+  #[inline]
+  unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
+    Self { _tab: unsafe { ::flatbuffers::Table::new(buf, loc) } }
+  }
+}
+
+impl<'a> NegativeShape<'a> {
+  pub const VT_MARKER: ::flatbuffers::VOffsetT = 4;
+  pub const VT_ECHOES_SID: ::flatbuffers::VOffsetT = 6;
+  pub const VT_CODE_AT: ::flatbuffers::VOffsetT = 8;
+  pub const VT_PENDING: ::flatbuffers::VOffsetT = 10;
+
+  #[inline]
+  pub unsafe fn init_from_table(table: ::flatbuffers::Table<'a>) -> Self {
+    NegativeShape { _tab: table }
+  }
+  #[allow(unused_mut)]
+  pub fn create<'bldr: 'args, 'args: 'mut_bldr, 'mut_bldr, A: ::flatbuffers::Allocator + 'bldr>(
+    _fbb: &'mut_bldr mut ::flatbuffers::FlatBufferBuilder<'bldr, A>,
+    args: &'args NegativeShapeArgs<'args>
+  ) -> ::flatbuffers::WIPOffset<NegativeShape<'bldr>> {
+    let mut builder = NegativeShapeBuilder::new(_fbb);
+    if let Some(x) = args.pending { builder.add_pending(x); }
+    builder.add_code_at(args.code_at);
+    builder.add_echoes_sid(args.echoes_sid);
+    builder.add_marker(args.marker);
+    builder.finish()
+  }
+
+  pub fn unpack(&self) -> NegativeShapeT {
+    let marker = self.marker();
+    let echoes_sid = self.echoes_sid();
+    let code_at = self.code_at();
+    let pending = self.pending().map(|x| {
+      x.into_iter().collect()
+    });
+    NegativeShapeT {
+      marker,
+      echoes_sid,
+      code_at,
+      pending,
+    }
+  }
+
+  #[inline]
+  pub fn marker(&self) -> u8 {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<u8>(NegativeShape::VT_MARKER, Some(0)).unwrap()}
+  }
+  #[inline]
+  pub fn echoes_sid(&self) -> bool {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<bool>(NegativeShape::VT_ECHOES_SID, Some(false)).unwrap()}
+  }
+  #[inline]
+  pub fn code_at(&self) -> u8 {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<u8>(NegativeShape::VT_CODE_AT, Some(0)).unwrap()}
+  }
+  #[inline]
+  pub fn pending(&self) -> Option<::flatbuffers::Vector<'a, u8>> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'a, u8>>>(NegativeShape::VT_PENDING, None)}
+  }
+}
+
+impl ::flatbuffers::Verifiable for NegativeShape<'_> {
+  #[inline]
+  fn run_verifier(
+    v: &mut ::flatbuffers::Verifier, pos: usize
+  ) -> Result<(), ::flatbuffers::InvalidFlatbuffer> {
+    v.visit_table(pos)?
+     .visit_field::<u8>("marker", Self::VT_MARKER, false)?
+     .visit_field::<bool>("echoes_sid", Self::VT_ECHOES_SID, false)?
+     .visit_field::<u8>("code_at", Self::VT_CODE_AT, false)?
+     .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, u8>>>("pending", Self::VT_PENDING, false)?
+     .finish();
+    Ok(())
+  }
+}
+pub struct NegativeShapeArgs<'a> {
+    pub marker: u8,
+    pub echoes_sid: bool,
+    pub code_at: u8,
+    pub pending: Option<::flatbuffers::WIPOffset<::flatbuffers::Vector<'a, u8>>>,
+}
+impl<'a> Default for NegativeShapeArgs<'a> {
+  #[inline]
+  fn default() -> Self {
+    NegativeShapeArgs {
+      marker: 0,
+      echoes_sid: false,
+      code_at: 0,
+      pending: None,
+    }
+  }
+}
+
+pub struct NegativeShapeBuilder<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> {
+  fbb_: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>,
+  start_: ::flatbuffers::WIPOffset<::flatbuffers::TableUnfinishedWIPOffset>,
+}
+impl<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> NegativeShapeBuilder<'a, 'b, A> {
+  #[inline]
+  pub fn add_marker(&mut self, marker: u8) {
+    self.fbb_.push_slot::<u8>(NegativeShape::VT_MARKER, marker, 0);
+  }
+  #[inline]
+  pub fn add_echoes_sid(&mut self, echoes_sid: bool) {
+    self.fbb_.push_slot::<bool>(NegativeShape::VT_ECHOES_SID, echoes_sid, false);
+  }
+  #[inline]
+  pub fn add_code_at(&mut self, code_at: u8) {
+    self.fbb_.push_slot::<u8>(NegativeShape::VT_CODE_AT, code_at, 0);
+  }
+  #[inline]
+  pub fn add_pending(&mut self, pending: ::flatbuffers::WIPOffset<::flatbuffers::Vector<'b , u8>>) {
+    self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(NegativeShape::VT_PENDING, pending);
+  }
+  #[inline]
+  pub fn new(_fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>) -> NegativeShapeBuilder<'a, 'b, A> {
+    let start = _fbb.start_table();
+    NegativeShapeBuilder {
+      fbb_: _fbb,
+      start_: start,
+    }
+  }
+  #[inline]
+  pub fn finish(self) -> ::flatbuffers::WIPOffset<NegativeShape<'a>> {
+    let o = self.fbb_.end_table(self.start_);
+    ::flatbuffers::WIPOffset::new(o.value())
+  }
+}
+
+impl ::core::fmt::Debug for NegativeShape<'_> {
+  fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+    let mut ds = f.debug_struct("NegativeShape");
+      ds.field("marker", &self.marker());
+      ds.field("echoes_sid", &self.echoes_sid());
+      ds.field("code_at", &self.code_at());
+      ds.field("pending", &self.pending());
+      ds.finish()
+  }
+}
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq)]
+pub struct NegativeShapeT {
+  pub marker: u8,
+  pub echoes_sid: bool,
+  pub code_at: u8,
+  pub pending: Option<alloc::vec::Vec<u8>>,
+}
+impl Default for NegativeShapeT {
+  fn default() -> Self {
+    Self {
+      marker: 0,
+      echoes_sid: false,
+      code_at: 0,
+      pending: None,
+    }
+  }
+}
+impl NegativeShapeT {
+  pub fn pack<'b, A: ::flatbuffers::Allocator + 'b>(
+    &self,
+    _fbb: &mut ::flatbuffers::FlatBufferBuilder<'b, A>
+  ) -> ::flatbuffers::WIPOffset<NegativeShape<'b>> {
+    let marker = self.marker;
+    let echoes_sid = self.echoes_sid;
+    let code_at = self.code_at;
+    let pending = self.pending.as_ref().map(|x|{
+      _fbb.create_vector(x)
+    });
+    NegativeShape::create(_fbb, &NegativeShapeArgs{
+      marker,
+      echoes_sid,
+      code_at,
+      pending,
+    })
+  }
+}
 pub enum ProtocolOffset {}
 #[derive(Copy, Clone, PartialEq)]
 
@@ -5857,6 +6055,8 @@ impl<'a> Protocol<'a> {
   pub const VT_FUNCTIONAL_ID: ::flatbuffers::VOffsetT = 12;
   pub const VT_EXTENDED_ADDRESSING: ::flatbuffers::VOffsetT = 14;
   pub const VT_PARAMS: ::flatbuffers::VOffsetT = 16;
+  pub const VT_APPLICATION_LAYER: ::flatbuffers::VOffsetT = 18;
+  pub const VT_NEGATIVE_SHAPE: ::flatbuffers::VOffsetT = 20;
 
   #[inline]
   pub unsafe fn init_from_table(table: ::flatbuffers::Table<'a>) -> Self {
@@ -5868,6 +6068,8 @@ impl<'a> Protocol<'a> {
     args: &'args ProtocolArgs<'args>
   ) -> ::flatbuffers::WIPOffset<Protocol<'bldr>> {
     let mut builder = ProtocolBuilder::new(_fbb);
+    if let Some(x) = args.negative_shape { builder.add_negative_shape(x); }
+    if let Some(x) = args.application_layer { builder.add_application_layer(x); }
     if let Some(x) = args.params { builder.add_params(x); }
     builder.add_functional_id(args.functional_id);
     builder.add_rx_id(args.rx_id);
@@ -5890,6 +6092,12 @@ impl<'a> Protocol<'a> {
     let params = self.params().map(|x| {
       x.iter().map(|t| t.unpack()).collect()
     });
+    let application_layer = self.application_layer().map(|x| {
+      alloc::string::ToString::to_string(x)
+    });
+    let negative_shape = self.negative_shape().map(|x| {
+      alloc::boxed::Box::new(x.unpack())
+    });
     ProtocolT {
       short_name,
       baud_rate,
@@ -5898,6 +6106,8 @@ impl<'a> Protocol<'a> {
       functional_id,
       extended_addressing,
       params,
+      application_layer,
+      negative_shape,
     }
   }
 
@@ -5950,6 +6160,20 @@ impl<'a> Protocol<'a> {
     // which contains a valid value in this slot
     unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<ComParam>>>>(Protocol::VT_PARAMS, None)}
   }
+  #[inline]
+  pub fn application_layer(&self) -> Option<&'a str> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<&str>>(Protocol::VT_APPLICATION_LAYER, None)}
+  }
+  #[inline]
+  pub fn negative_shape(&self) -> Option<NegativeShape<'a>> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<NegativeShape>>(Protocol::VT_NEGATIVE_SHAPE, None)}
+  }
 }
 
 impl ::flatbuffers::Verifiable for Protocol<'_> {
@@ -5965,6 +6189,8 @@ impl ::flatbuffers::Verifiable for Protocol<'_> {
      .visit_field::<u32>("functional_id", Self::VT_FUNCTIONAL_ID, false)?
      .visit_field::<bool>("extended_addressing", Self::VT_EXTENDED_ADDRESSING, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, ::flatbuffers::ForwardsUOffset<ComParam>>>>("params", Self::VT_PARAMS, false)?
+     .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("application_layer", Self::VT_APPLICATION_LAYER, false)?
+     .visit_field::<::flatbuffers::ForwardsUOffset<NegativeShape>>("negative_shape", Self::VT_NEGATIVE_SHAPE, false)?
      .finish();
     Ok(())
   }
@@ -5977,6 +6203,8 @@ pub struct ProtocolArgs<'a> {
     pub functional_id: u32,
     pub extended_addressing: bool,
     pub params: Option<::flatbuffers::WIPOffset<::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<ComParam<'a>>>>>,
+    pub application_layer: Option<::flatbuffers::WIPOffset<&'a str>>,
+    pub negative_shape: Option<::flatbuffers::WIPOffset<NegativeShape<'a>>>,
 }
 impl<'a> Default for ProtocolArgs<'a> {
   #[inline]
@@ -5989,6 +6217,8 @@ impl<'a> Default for ProtocolArgs<'a> {
       functional_id: 0,
       extended_addressing: false,
       params: None,
+      application_layer: None,
+      negative_shape: None,
     }
   }
 }
@@ -6027,6 +6257,14 @@ impl<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> ProtocolBuilder<'a, 'b, A> {
     self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(Protocol::VT_PARAMS, params);
   }
   #[inline]
+  pub fn add_application_layer(&mut self, application_layer: ::flatbuffers::WIPOffset<&'b  str>) {
+    self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(Protocol::VT_APPLICATION_LAYER, application_layer);
+  }
+  #[inline]
+  pub fn add_negative_shape(&mut self, negative_shape: ::flatbuffers::WIPOffset<NegativeShape<'b >>) {
+    self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<NegativeShape>>(Protocol::VT_NEGATIVE_SHAPE, negative_shape);
+  }
+  #[inline]
   pub fn new(_fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>) -> ProtocolBuilder<'a, 'b, A> {
     let start = _fbb.start_table();
     ProtocolBuilder {
@@ -6051,6 +6289,8 @@ impl ::core::fmt::Debug for Protocol<'_> {
       ds.field("functional_id", &self.functional_id());
       ds.field("extended_addressing", &self.extended_addressing());
       ds.field("params", &self.params());
+      ds.field("application_layer", &self.application_layer());
+      ds.field("negative_shape", &self.negative_shape());
       ds.finish()
   }
 }
@@ -6064,6 +6304,8 @@ pub struct ProtocolT {
   pub functional_id: u32,
   pub extended_addressing: bool,
   pub params: Option<alloc::vec::Vec<ComParamT>>,
+  pub application_layer: Option<alloc::string::String>,
+  pub negative_shape: Option<alloc::boxed::Box<NegativeShapeT>>,
 }
 impl Default for ProtocolT {
   fn default() -> Self {
@@ -6075,6 +6317,8 @@ impl Default for ProtocolT {
       functional_id: 0,
       extended_addressing: false,
       params: None,
+      application_layer: None,
+      negative_shape: None,
     }
   }
 }
@@ -6094,6 +6338,12 @@ impl ProtocolT {
     let params = self.params.as_ref().map(|x|{
       let w: alloc::vec::Vec<_> = x.iter().map(|t| t.pack(_fbb)).collect();_fbb.create_vector(&w)
     });
+    let application_layer = self.application_layer.as_ref().map(|x|{
+      _fbb.create_string(x)
+    });
+    let negative_shape = self.negative_shape.as_ref().map(|x|{
+      x.pack(_fbb)
+    });
     Protocol::create(_fbb, &ProtocolArgs{
       short_name,
       baud_rate,
@@ -6102,6 +6352,8 @@ impl ProtocolT {
       functional_id,
       extended_addressing,
       params,
+      application_layer,
+      negative_shape,
     })
   }
 }

@@ -104,6 +104,10 @@ pub fn check_program(program: &Program, permission: Permission) -> Result<(), (u
             Op::ServiceRequest { service } => check_service(*service, permission).err(),
             // Always ReadDTCInformation.
             Op::ReadDtc { .. } => None,
+            // Not served yet: the host does not match its answers against the declarations,
+            // and the read-only list is not kept per application layer (ADR-309 item 4,
+            // ADR-321), so it is refused whatever the permission.
+            Op::SendReceive { .. } => Some(HostError::Unsupported("SendReceive")),
             // A routine can erase or actuate; none is read-only by its number alone.
             Op::RoutineControl { .. } => match permission {
                 Permission::ReadOnly => Some(HostError::NotAllowed(0x31)),
@@ -290,6 +294,15 @@ mod tests {
             matches!(refused, Err((1, HostError::UseFlashTransfer))),
             "{refused:?}"
         );
+        // The host does not serve it yet (ADR-321), even for a read.
+        let refused = check_program(
+            &program(vec![Op::PushBytes(0), Op::SendReceive { service: 1 }]),
+            READ_ONLY,
+        );
+        assert!(
+            matches!(refused, Err((1, HostError::Unsupported("SendReceive")))),
+            "{refused:?}"
+        );
     }
 
     #[test]
@@ -368,6 +381,15 @@ mod tests {
             );
             assert!(
                 matches!(refused, Err((1, HostError::NotAllowed(0x27)))),
+                "{refused:?}"
+            );
+            // Not served by the host yet (ADR-321), not even on a simulator.
+            let refused = check_program(
+                &program(vec![Op::PushBytes(0), Op::SendReceive { service: 1 }]),
+                SIMULATOR,
+            );
+            assert!(
+                matches!(refused, Err((1, HostError::Unsupported("SendReceive")))),
                 "{refused:?}"
             );
             // TransferData only through FlashTransfer, refused before the link opens.

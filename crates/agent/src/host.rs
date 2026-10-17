@@ -586,6 +586,11 @@ impl DiagHost for WorkerHost {
         response
     }
 
+    // `policy::check_program` refuses the instruction, so no job reaches this yet.
+    fn send_receive(&mut self, _: u32, _: &[u8]) -> Result<Vec<u8>, HostError> {
+        Err(HostError::Unsupported("SendReceive"))
+    }
+
     fn read_dtc(&mut self, mask: u8) -> Result<Vec<u8>, HostError> {
         self.send_recv(read_dtc_bytes(mask))
     }

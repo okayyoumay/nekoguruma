@@ -82,25 +82,28 @@ shape survives inside the second as the access program of item 5.
    target's session and security state and read from it (session control to the default or an
    extended session only, security access, reads). The declaration also gives the target's
    session timeout and tester-present period (item 11). Several access targets (a gateway behind
-   a gateway) run their access programs in declaration order. The access program is lowered on its own, once per variant of the access target,
-   and travels with the job; the conversion and `check_job` refuse any other service in it. The
-   agent runs it on every run, before anything else addresses another target: on a first run,
-   after the access target's own variant is identified (by reads, which the gateway answers
-   locked) and before the other targets are identified; on a restart (8.2.5), after the locks
-   and the server reservation and before the VIN read of ADR-229 item 2 step 2; and again after
-   any reopening of the links (a worker crash or VCI disconnect that the job survives) before
-   the program continues. Its session change and unlock reach an ECU before the vehicle is
-   identified and before the 8.9 safety preconditions are read, which ADR-229's order otherwise
-   avoids; this is accepted because a correct unlock changes no stored state (a wrong key counts
-   against the ECU's failed-attempt limit, as any security access does) and actuates nothing,
-   and the sessions lapse with their timeout. When the VIN then differs, the agent stops the
-   keep-alive, closes the links and lets those sessions lapse; on a first run the job ends in the
-   8.9.1 pre-check with nothing written, and on a restart as ADR-286 describes. When the VIN
-   matches and the per-vehicle lock must be waited for because another job holds it, the agent
-   stops every keep-alive before it waits and sends nothing while it waits, as ADR-263 requires;
-   once it holds the lock it runs the access programs again before anything else is sent. A lock
-   failure then leaves only the VIN read and the access programs sent (amending ADR-263 item 4),
-   and their sessions lapse. The main program may still select the access target for anything else.
+   a gateway) run their access programs in declaration order. The access program is lowered on
+   its own, once per variant of the access target, and travels with the job; the conversion and
+   `check_job` refuse any other service in it. A first run goes in this order: identify the
+   access targets (by reads, which a locked gateway answers), run their access programs, read
+   the VIN and take the per-vehicle lock when it matches (8.8), identify the other targets, and
+   pick the combination (item 7). A restart (8.2.5) runs the access programs after the locks and
+   the server reservation and before the VIN read of ADR-229 item 2 step 2. Every run also runs
+   them again after any reopening of the links (a worker crash or VCI disconnect that the job
+   survives) before the program continues. Their session change and unlock reach an ECU before
+   the vehicle is identified and before the 8.9 safety preconditions are read, which ADR-229's
+   order otherwise avoids; this is accepted because a correct unlock changes no stored state (a
+   wrong key counts against the ECU's failed-attempt limit, as any security access does) and
+   actuates nothing, and the sessions lapse with their timeout. When the VIN then differs, the
+   agent stops the keep-alive, closes the links and lets those sessions lapse; on a first run
+   the job ends in the 8.9.1 pre-check with nothing written, and on a restart as ADR-286
+   describes. When the VIN matches and the per-vehicle lock must be waited for because another
+   job holds it, the agent stops every keep-alive before it waits and sends nothing while it
+   waits, as ADR-263 requires. Once it holds the lock it starts again from the identification of
+   the access targets, since the job that held the lock may have changed them, and runs their
+   access programs before anything else is sent. A lock failure leaves only the identification
+   reads, the access programs and the VIN read sent (amending ADR-263 item 4), and their sessions
+   lapse. The main program may still select the access target for anything else.
 6. **Lowered once per combination of variants.** The main program is lowered for each
    combination of one variant per target, extending ADR-311's per-variant lowering, and must
    lower for every combination; the scoping of a procedure to some variants that ADR-311 item 2
@@ -109,32 +112,29 @@ shape survives inside the second as the access program of item 5.
    which names, for each other target, the content hash (design 8.2.6) of that variant's
    declaration-only document; the conversion emits a declaration-only document for every
    variant of a definition another procedure targets. The document's digest covers every
-   definition its program was lowered against (amending ADR-307 item 5). The conversion refuses a procedure whose
-   combinations exceed a bound set with the implementation, so the package cannot grow without
-   limit.
-7. **A job names the documents of every combination it may meet.** Since the variants behind
-   an access target are known only after its access program has run, a job names, by content
-   hash, its access programs, the declaration-only documents of the other targets' variants, and
-   the combinations' documents (amending ADR-318 item 1). The agent identifies each target's
-   variant as the primary's is identified (8.9.1, ADR-315), then picks the combination's
-   document, whose program is the one that runs, and fetches only what that combination needs
-   (8.2.6's lazy fetching); a job prepared for offline work prefetches them all. The
-   declaration-only documents of every candidate variant of every target are fetched before
-   identification, since identification evaluates each candidate's variant patterns through
-   that candidate's services (ADR-315); only the combination documents are fetched after it. A writing job
-   creates its journal before anything is sent, as now (ADR-252, ADR-293), and commits a
-   combination record holding the chosen document's hash after identification and before the
-   chosen program's first instruction; a restart of a journal with that record uses that
-   document without identifying the variants again (amending ADR-318 item 4's journal that
-   records no document; the caller still supplies the documents). A journal without it holds
-   no step of the program, since only access programs and identification reads ran, so its job
-   starts again from the access programs as a first run does. `check_job` refuses a combination
-   document
-   whose named hashes do not match the documents the job carries, checks each target's decodes
-   against that target's declarations, and refuses flash plans on more than one target, before
-   anything is sent; it also refuses an access program with any service item 5 does not allow.
-   The host and the restart carry these documents in place of the single one (amending ADR-318
-   item 3).
+   definition its program was lowered against (amending ADR-307 item 5). The conversion refuses
+   a procedure whose combinations exceed a bound set with the implementation, so the package
+   cannot grow without limit.
+7. **A job holds the documents of every combination it may meet.** Since the variants behind an
+   access target are known only after its access program has run, a job names, by content hash,
+   its access programs, the declaration-only documents of every candidate variant of every
+   target, and every combination's document (amending ADR-318 item 1), and the agent holds all
+   of them before anything is sent; the bound of item 6 keeps their number finite.
+   `check_job` validates all of them then: it refuses a combination document whose named hashes
+   do not match the documents the job holds, checks each combination's decodes against its
+   targets' declarations, refuses flash plans on more than one target, and refuses an access
+   program with any service item 5 does not allow. The agent identifies each target's variant as
+   the primary's is identified (8.9.1, ADR-315), through those declaration-only documents, and
+   the combination its variants pick is the program that runs. A writing job creates its journal
+   before anything is sent, as now (ADR-252, ADR-293), and commits a combination record holding
+   the chosen document's hash after identification and before the chosen program's first
+   instruction. A restart of a journal with that record uses that document (amending ADR-318
+   item 4's journal that records no document; the caller still supplies the documents) and,
+   once the VIN matches and the per-vehicle lock is held, identifies every target again; a
+   variant that differs from the recorded combination ends the restart in on-site intervention.
+   A journal without the record holds no step of the program, since only access programs and
+   identification reads ran, so its job starts again as a first run does. The host and the
+   restart carry these documents in place of the single one (amending ADR-318 item 3).
 8. **One link per target, under the same guards.** Before anything is sent the agent opens a
    link to each target, all on the job's VCI, under the job's per-VCI lock and, for a writing
    job, the reprogramming slot (8.8, ADR-257); the per-vehicle lock is still taken when the VIN

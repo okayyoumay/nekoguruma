@@ -88,8 +88,8 @@ shape survives inside the second as the access program of item 5.
    target's session and security state and read from it (session control to the default or an
    extended session only, security access, reads). The declaration also gives the target's
    session timeout and tester-present period (item 11); the conversion and `check_job` refuse a
-   period that is not positive or is not at most half the session timeout, so that one lost
-   tester-present does not let the session lapse. Several access targets (a gateway behind
+   period that is not positive or is more than a third of the session timeout, so that one lost
+   tester-present still leaves a full period of margin before the session can lapse (item 12). Several access targets (a gateway behind
    a gateway) run their access programs in declaration order. The access program is lowered on
    its own, once per variant of the access target, and travels with the job; the conversion and
    `check_job` refuse any other service in it. No access program runs before the job holds the
@@ -108,8 +108,9 @@ shape survives inside the second as the access program of item 5.
    only those reads sent. A restart (8.2.5) identifies the first access target and reads the VIN
    from it in ADR-229's order (item 2 step 2), since that target may have been reflashed after
    the journal recorded its variant, and, once it holds the per-vehicle lock, identifies it
-   again after any wait and runs the access programs in the same way before any other step. Since its VIN now comes from an access target rather than from the ECU being
-   reprogrammed, a step 2 VIN read that gets no answer or a negative response ends the restart
+   again after any wait, reads the VIN again and requires it to match, as a first run does,
+   and only then runs the access programs in the same way before any other step. Since its VIN
+   now comes from an access target rather than from the ECU being reprogrammed, a step 2 VIN read that gets no answer or a negative response ends the restart
    in on-site intervention (`IdentityNotEstablished`, which a later resume may retry, ADR-290)
    instead of the passive teardown ADR-229 takes there, which would reach the reprogramming
    target's default-session confirmation without an unlocked gateway. A step of an access
@@ -123,7 +124,7 @@ shape survives inside the second as the access program of item 5.
    for the primary variant (amending ADR-307 item 1's one document per variant and procedure),
    which names, for every target, the primary included, the content hash (design 8.2.6) of that variant's
    declaration-only document; the conversion emits a declaration-only document for every
-   variant of a definition another procedure targets. The document's digest covers every
+   variant of every target of a procedure, the primary's included. The document's digest covers every
    definition its program was lowered against (amending ADR-307 item 5). The conversion refuses
    a procedure whose combinations exceed a bound set with the implementation, so the package
    cannot grow without limit.
@@ -148,7 +149,8 @@ shape survives inside the second as the access program of item 5.
    the combination its variants pick is the program that runs. Whether the job writes, which
    policy class applies and whether it takes the reprogramming slot are fixed before anything is
    sent from every combination the job holds: the job is a writing job when any of them writes,
-   takes the reprogramming slot when any of them has a flash plan, and is held to the policy
+   takes the reprogramming slot when any of them writes (ADR-257; an access program's services
+   alone do not count, item 10), and is held to the policy
    class that covers all of them, so the chosen combination never needs a guard the job lacks.
    A job keeps a journal when any of its combinations has a flash plan or a section marked
    recovery required (ADR-293), whether or not it writes; such a job creates its journal before
@@ -158,9 +160,11 @@ shape survives inside the second as the access program of item 5.
    item 4's journal that records no document; the caller still supplies the documents) and,
    once the VIN matches and the per-vehicle lock is held, identifies every target again; a
    variant that differs from the recorded combination ends the restart in on-site intervention.
-   The one exception is the time the journal is inside the reprogramming target's flash plan:
-   that ECU may answer only from its bootloader, so it is not identified again here, and
-   ADR-229's hardware identity and state checks validate it instead.
+   The one exception is the reprogramming target once the journal has reached its flash plan,
+   whether inside the plan or past its end (ADR-271's recovery of a completed transfer): that
+   ECU may answer only from its bootloader, or as the variant the new software makes it, so it
+   is not identified again here, and ADR-229's hardware identity and state checks and ADR-271's
+   checks validate it instead, with the recorded document kept.
    The record is part of the checkpoint summary a handover carries (design 8.2.5), and the
    receiving device's journal starts from it, so a handed-over restart uses the same document.
    A journal without the record holds no step of the program, since only access programs and
@@ -203,9 +207,13 @@ shape survives inside the second as the access program of item 5.
 12. **A lost access target ends the job by the section rules.** The worker reports a failed
     tester-present as the tester-present error event of ISO 22900-2 (2022) Annex D, which the
     J2534 worker does not produce yet; the module discards the expected answers, so the agent sees
-    only these events. The agent counts an access target as lost when error events keep arriving
-    for every tester-present period across that target's declared session timeout, latches the
-    first such loss, and adapts design 8.10.1's rule for an expired authentication, without the
+    only these events. The agent counts as an access target's last good answer the end of its
+    access program and then every tester-present period that passes without an error event. It
+    counts the target as lost once that last good answer is older than the declared session
+    timeout less one tester-present period, the latest point at which the session is still
+    certainly held, and latches the loss: a later quiet period does not restore the target,
+    since the ECU may have relocked meanwhile and a TesterPresent is answered in the default
+    session as well. On a loss the agent adapts design 8.10.1's rule for an expired authentication, without the
     renewal: outside any section and in an interruptible section the job ends at the next
     instruction boundary as failed, terminal as ADR-280's declared failure and journaled the same
     way, with its own failure code (a new edge from Writing to Failed in design 5.6); in an
@@ -214,10 +222,13 @@ shape survives inside the second as the access program of item 5.
     before the erase it ends as failed when the journal holds no transfer-start marker, and in
     on-site intervention, which a later resume may retry (ADR-290), when it does, since an earlier
     erase may have left the ECU without a valid application. The agent does not run the
-    access program again by itself. A request that gets no answer while an access target has
-    reported tester-present errors since its last good answer is held rather than handled at
-    once: the agent waits until that access target answers again, when the failure is handled as
-    any failed request is, or is counted lost, when the outcome above takes its place, except
+    access program again by itself. A request to any target that gets no answer is held rather
+    than handled at once, since the gateway it passed may be failing before any error event has
+    arrived: the agent waits until one tester-present period of every access target has passed
+    after the failure. When every access target's last good answer is then newer than the
+    failure, the failure is handled as any failed request is; otherwise the agent keeps holding
+    until each such target has a newer good answer, with the same outcome, or is counted lost,
+    which bounds the wait by the session timeout and puts the outcome above in its place, except
     that inside an uninterruptible section the job ends in on-site intervention, since the held
     request has no answer that would let the section continue to its end; so a
     request that times out first cannot turn a lost gateway into an ordinary interrupted step

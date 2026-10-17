@@ -15,10 +15,12 @@ use diag_ir::declaration::EcuVariant;
 use crate::document::JobDocument;
 use crate::host::HostError;
 
-/// The response-pending codes `j2534-0404-service` recognises (ADR-309 item 5): 0x78
-/// (requestCorrectlyReceived-ResponsePending), 0x21 (busyRepeatRequest) and 0x23
-/// (routineNotComplete).
-const SUPPORTED_PENDING: &[u8] = &[0x78, 0x21, 0x23];
+/// The response-pending codes the link has the worker absorb: 0x78
+/// (requestCorrectlyReceived-ResponsePending) only, since the link turns on `CP_RC78Handling`
+/// alone (`link.rs`). The worker could also absorb 0x21 and 0x23 (ADR-309 item 5), but a code
+/// the link does not turn on would reach the host, which would skip it and end in `NoResponse`,
+/// and a list without 0x78 would let the worker's 0x78 through as the answer (ADR-322 item 3).
+const SUPPORTED_PENDING: &[u8] = &[0x78];
 
 /// How a negative response looks: the marker, then the request's SID when it is echoed, with
 /// the code at `code_at`.
@@ -85,9 +87,9 @@ pub fn declared_sid(variant: &EcuVariant<'_>, service: u32) -> Option<u8> {
 
 /// The negative-response shape of `variant`'s protocols (ADR-321 item 4), refused unless each
 /// protocol declares one, all the same, and it is one the workers support (ADR-309 item 5): a
-/// `7F` marker, the request's SID after it and the code at the next byte, with pending codes
-/// among 0x78, 0x21 and 0x23. The document comes from the server, so it is not trusted to be
-/// consistent (ADR-322 item 3).
+/// `7F` marker, the request's SID after it and the code at the next byte, with the pending
+/// codes the link turns on (`SUPPORTED_PENDING`). The document comes from the server, so it is
+/// not trusted to be consistent (ADR-322 item 3).
 pub(crate) fn negative_shape(variant: &EcuVariant<'_>) -> Result<NegativeShape, HostError> {
     let mut shape: Option<NegativeShape> = None;
     for protocol in variant.protocols().into_iter().flatten() {
@@ -129,13 +131,9 @@ pub(crate) fn negative_shape(variant: &EcuVariant<'_>) -> Result<NegativeShape, 
             "only a 7F marker, the echoed service identifier and the code after it are supported",
         ));
     }
-    if shape
-        .pending
-        .iter()
-        .any(|code| !SUPPORTED_PENDING.contains(code))
-    {
+    if shape.pending != SUPPORTED_PENDING {
         return Err(HostError::BadNegativeShape(
-            "only the pending codes 0x78, 0x21 and 0x23 are supported",
+            "the pending codes must be 0x78 alone, the one the link has the worker absorb",
         ));
     }
     Ok(shape)
@@ -185,6 +183,33 @@ pub(crate) fn prepare(
     }
     check_flash_rules(sent, transfer)?;
     Ok(expected)
+}
+
+/// Refuses a send-receive of a session change, a reset, an upload or a file transfer inside a
+/// recovery plan's transfer, from after its RequestDownload to its transfer exit, where
+/// `Program::validate` refuses the same `ServiceRequest` (ADR-250, ADR-322 item 2). The SID is
+/// the declared one (item 1), so this holds before the program runs; refused only at run time,
+/// it would fail after the erase.
+pub(crate) fn check_plans(
+    program: &diag_ir::Program,
+    variant: &EcuVariant<'_>,
+) -> Result<(), (u32, HostError)> {
+    for plan in &program.flash {
+        let b = &plan.boundaries;
+        let mut downloaded = false;
+        for pc in b.erase_pc..=b.transfer_exit_pc {
+            match program.code.get(pc as usize) {
+                Some(Op::ServiceRequest { service: 0x34 }) => downloaded = true,
+                Some(Op::SendReceive { service }) if downloaded => {
+                    if let Some(sid) = declared_sid(variant, *service) {
+                        check_flash_rules(sid, true).map_err(|error| (pc, error))?;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The first `Op::SendReceive` of `code`, and its index.
@@ -331,12 +356,10 @@ pub(crate) mod tests {
 
     #[test]
     fn the_declared_shape_is_checked_before_it_is_used() {
-        // Accepted: the UDS shape, also on several protocols and with every supported code.
+        // Accepted: the UDS shape, also on several protocols.
         for shapes in [
             vec![Some(uds_shape())],
             vec![Some(uds_shape()), Some(uds_shape())],
-            vec![Some(shape(0x7F, true, 2, &[0x78, 0x21, 0x23]))],
-            vec![Some(shape(0x7F, true, 2, &[]))],
         ] {
             let document = document_with(shapes.clone(), None);
             negative_shape(&document.variant()).unwrap_or_else(|e| panic!("{shapes:?}: {e}"));
@@ -354,6 +377,10 @@ pub(crate) mod tests {
             vec![Some(shape(0x7F, false, 1, &[0x78]))],
             vec![Some(shape(0x7F, true, 3, &[0x78]))],
             vec![Some(shape(0x7F, true, 2, &[0x78, 0x22]))],
+            // Codes the link does not have the worker absorb, or none.
+            vec![Some(shape(0x7F, true, 2, &[0x78, 0x21, 0x23]))],
+            vec![Some(shape(0x7F, true, 2, &[0x21]))],
+            vec![Some(shape(0x7F, true, 2, &[]))],
             // An absent shape reads as all zeros.
             vec![Some(NegativeShapeT::default())],
         ] {

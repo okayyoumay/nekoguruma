@@ -602,7 +602,7 @@ name}.lock`, `reprogramming.lock` and `vehicle-{k:03x}.lock`. The OS releases a 
 process dies, so a crashed run never blocks the next one, and the files are never deleted.
 
 - `JobGuards::take(GuardSetup { dir, vci }, poll, cancelled)` takes the per-VCI lock, then the
-  slot, for a job that writes (`policy::writes`). It waits while another job holds either,
+  slot, for a job that writes (`Job::writes`). It waits while another job holds either,
   retrying every `poll`, and stops on a cancel (`GuardError::Cancelled`).
 - `JobGuards::take_vci_only(...)` takes the per-VCI lock alone, for a job that only reads, so
   reads on other VCIs go on while a job reprograms. `JobGuards::holds_slot` tells the two

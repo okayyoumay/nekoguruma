@@ -327,6 +327,10 @@ pub fn check_job(job: &Job, permission: Permission) -> Result<(), JobError> {
         crate::send_receive::negative_shape(variant)
             .map_err(|source| JobError::Refused { pc, source })?;
     }
+    if let Some(variant) = &variant {
+        crate::send_receive::check_plans(&job.program, variant)
+            .map_err(|(pc, source)| JobError::Refused { pc, source })?;
+    }
     refuse_beyond(&job.program, variant.as_ref(), permission)
 }
 
@@ -380,7 +384,7 @@ fn refuse_beyond(
 ///
 /// `guards` are the job's guards (`guards::JobGuards`, ADR-256, ADR-257, design 8.8.1). The
 /// caller takes them before it calls: `JobGuards::take` for a program that writes
-/// (`policy::writes`), `JobGuards::take_vci_only` for one that only reads. A writing program on
+/// ([`Job::writes`]), `JobGuards::take_vci_only` for one that only reads. A writing program on
 /// guards without the reprogramming slot ends in [`JobError::NoReprogrammingSlot`], checked
 /// with the policy before anything opens. The run takes the guards by value, so two runs can
 /// never use one set at once, holds them until the link is closed, and returns them with its
@@ -7683,6 +7687,65 @@ mod tests {
             ),
             "{refused:?}"
         );
+    }
+
+    /// A session change by send-receive inside a plan's transfer is refused before the link
+    /// opens, as `Program::validate` refuses the same `ServiceRequest` (ADR-322 item 2), not
+    /// after the erase.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_send_receive_cannot_end_a_plans_transfer() {
+        use crate::send_receive::tests::{READ_DTC, SESSION, document};
+        let flashing = |at: usize, service| {
+            let mut code = vec![
+                Op::Pop,
+                Op::RoutineControl { routine: 1, sub: 1 },
+                Op::ServiceRequest { service: 0x34 },
+                Op::ServiceRequest { service: 0x37 },
+                Op::Pop,
+            ];
+            code.splice(at..at, [Op::PushBytes(0), Op::SendReceive { service }]);
+            let mut program = program(code);
+            program.flash.push(diag_ir::FlashRecovery {
+                flash_session: 1,
+                stage: 1,
+                max_resumes: 0,
+                // No restart, so no identity or precondition sources are needed.
+                recovery_required: diag_ir::RecoveryRequired::FromPc(1),
+                boundaries: diag_ir::RecoveryBoundaries {
+                    entry_pc: 0,
+                    erase_pc: 1,
+                    transfer_exit_pc: 5,
+                    post_transfer_end_pc: 7,
+                },
+                timing: diag_ir::RecoveryTiming {
+                    session_timeout_millis: 5000,
+                    teardown_margin_millis: 0,
+                    ecu_startup_millis: 0,
+                    confirmation_window_millis: 0,
+                },
+                version_read_retries: 0,
+                no_application: None,
+            });
+            Job {
+                program,
+                document: Some(document()),
+            }
+        };
+        let refused = check_job(&flashing(3, SESSION), Permission::Simulator);
+        assert!(
+            matches!(
+                refused,
+                Err(JobError::Refused {
+                    pc: 4,
+                    source: HostError::TransferInterrupted(0x10)
+                })
+            ),
+            "{refused:?}"
+        );
+        // A read in the transfer, and a session change before the download, pass.
+        check_job(&flashing(3, READ_DTC), Permission::Simulator).unwrap();
+        check_job(&flashing(2, SESSION), Permission::Simulator).unwrap();
     }
 
     #[test]

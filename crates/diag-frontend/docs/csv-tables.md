@@ -553,7 +553,9 @@ every field needs a value that fits it as given): a field's conversion applies o
 response is decoded, so a procedure never needs the inverse of a text table or another
 conversion that has none. Whether a received response's prefix matches is checked by the
 declaration-part decoder, not by the host, which checks only the response SID and, for some
-services, the identifier it echoes (ADR-235 item 3).
+services, the identifier it echoes (ADR-235 item 3). The generic send-receive is the exception:
+the agent's host takes only an answer that starts with the declared positive response's SID and
+prefix (ADR-322 item 3).
 
 Constants also identify the service a Starlark call means (design 8.4, subset spec 3.1). For
 `diag.request(sid, params)` the frontend takes the services of the variant with that SID whose

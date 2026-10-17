@@ -42,24 +42,34 @@ from that service's declared request, so the two start with the same byte.
    - The host still checks the request it sends against the link's permission, as it does for
      every request.
 2. **The flash-plan rules apply to the declared SID.**
-   - RequestDownload and RequestTransferExit are refused in a send-receive wherever it stands. A
-     recovery plan's declared boundaries are `ServiceRequest` instructions, so `Program::validate`
-     would refuse either service anywhere a send-receive can be. TransferData goes through
-     `FlashTransfer` (ADR-250), as for `ServiceRequest`. The policy refuses all three before the
-     link opens, and the host refuses them again.
-   - A session change, a reset, an upload or a file transfer is refused while the host tracks a
-     transfer (ADR-250). `Program::validate` refuses these between a plan's RequestDownload and
-     its transfer exit; the host's tracked transfer stands for that range at run time. Outside a
-     transfer they pass, as they do in a `ServiceRequest`.
+   - RequestDownload and RequestTransferExit are refused in a send-receive wherever it stands.
+     `Program::validate` allows them only inside a plan's transfer range, as that plan's single
+     RequestDownload and the `ServiceRequest` at its transfer exit, so a send-receive of either
+     would be a second one or outside every plan. TransferData goes through `FlashTransfer`
+     (ADR-250), as for `ServiceRequest`. The policy refuses all three before the link opens, and
+     the host refuses them again.
+   - A session change, a reset, an upload or a file transfer is refused from after a plan's
+     RequestDownload up to its transfer exit, where `Program::validate` refuses the same
+     `ServiceRequest`. `check_job` refuses it there before the link opens, so it cannot fail
+     after the erase.
+   - At run time the host also refuses these four while it tracks a transfer (ADR-250), which
+     covers a transfer the static range does not show. Outside a transfer they pass, as they do in
+     a `ServiceRequest`.
 3. **The answer is matched against the declarations.**
    - Positive: the answer starts with the declared positive response's SID and prefix. The worker
      is asked for answers that start the same way.
    - Negative: the negative-response shape of the variant's protocols (ADR-321 item 4). Every
      protocol must declare one, all must be the same, and the code must follow the marker and any
      echoed service identifier.
-   - The workers recognise only the `7F` marker, the echoed SID and the code at the next byte, with
-     the pending codes 0x78, 0x21 and 0x23 (ADR-309 item 5). Any other shape is refused. The
-     document comes from the server and is not trusted to be consistent.
+   - The workers recognise only the `7F` marker, the echoed SID and the code at the next byte
+     (ADR-309 item 5). Any other shape is refused. The document comes from the server and is not
+     trusted to be consistent.
+   - The pending codes must be 0x78 alone. The worker could also absorb 0x21 and 0x23 (ADR-309
+     item 5), but the link turns on only its 0x78 handling. A declared 0x21 the worker does not
+     absorb would end the primitive, and the host, skipping it as pending, would report no
+     response instead of the ECU's answer. A list without 0x78 would make the host take the 0x78
+     the worker passes on as the answer, against ADR-235 item 3. Turning on the other codes per
+     declared shape is a later change to the link.
    - The host skips a negative answer whose code is a declared pending code, as it skips 0x78 for
      the other instructions (ADR-235 item 3).
    - `check_job` checks the shape before the link opens, so an unusable one fails before

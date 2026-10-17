@@ -80,5 +80,9 @@ answers against the declarations.
   declared positive response and the protocol's negative-response shape, stops building
   request bytes for DTC reads, and keys its read-only list by application layer (ADR-309
   item 4). Until then a procedure that lowers to it cannot run on the agent.
+- A send-receive's service identifier is the first byte of its run-time operand, so neither
+  `Program::validate`'s flash-plan rules (ADR-245, ADR-250) nor the agent's static checks can
+  see it. The host that serves the instruction applies those rules to the request it sends,
+  and refuses an empty request.
 - The VM tests run the instruction against a scripted host; the declaration tests round-trip
   the new protocol fields.

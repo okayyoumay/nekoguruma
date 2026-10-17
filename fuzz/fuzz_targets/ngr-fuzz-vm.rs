@@ -21,6 +21,9 @@ impl DiagHost for Answering {
     fn service_request(&mut self, _service: u16, payload: &[u8]) -> Result<Vec<u8>, Infallible> {
         Ok(payload.to_vec())
     }
+    fn send_receive(&mut self, _service: u32, request: &[u8]) -> Result<Vec<u8>, Infallible> {
+        Ok(request.to_vec())
+    }
     fn read_dtc(&mut self, mask: u8) -> Result<Vec<u8>, Infallible> {
         Ok(vec![0x59, 0x02, mask])
     }

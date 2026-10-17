@@ -50,6 +50,15 @@ fn main() {
             vec![vec![0xF1, 0x90]],
         ),
         (
+            "send-receive",
+            vec![
+                Op::PushBytes(0),
+                Op::SendReceive { service: 1 },
+                Op::Pop,
+            ],
+            vec![vec![0x19, 0x02, 0x08]],
+        ),
+        (
             "loop",
             // Counts 3 down to 0, then pops the counter.
             vec![

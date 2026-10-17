@@ -293,7 +293,8 @@ mod tests {
         assert!(
             matches!(refused, Err((1, HostError::UseFlashTransfer))),
             "{refused:?}"
-        ); // The host does not serve it yet (ADR-321), even for a read.
+        );
+        // The host does not serve it yet (ADR-321), even for a read.
         let refused = check_program(
             &program(vec![Op::PushBytes(0), Op::SendReceive { service: 1 }]),
             READ_ONLY,

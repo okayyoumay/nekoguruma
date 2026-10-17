@@ -298,11 +298,12 @@ pub fn check_job(job: &Job, permission: Permission) -> Result<(), JobError> {
     match &job.document {
         Some(document) => diag_ir::check_declarations(&job.program, &document.variant())
             .map_err(|(pc, source)| JobError::Undeclared { pc, source }),
-        None if job
-            .program
-            .code
-            .iter()
-            .any(|op| matches!(op, diag_ir::Op::DecodeField { .. })) =>
+        None if job.program.code.iter().any(|op| {
+            matches!(
+                op,
+                diag_ir::Op::DecodeField { .. } | diag_ir::Op::SendReceive { .. }
+            )
+        }) =>
         {
             Err(JobError::NoDeclarations)
         }

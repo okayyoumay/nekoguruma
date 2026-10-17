@@ -1187,6 +1187,7 @@ fn primitive_classification_covers_every_instruction() {
             service: 0,
             field: 0,
         },
+        Op::SendReceive { service: 0 },
     ];
     for (index, op) in all.iter().enumerate() {
         // The postcard encoding starts with the variant index, so this also pins the variant

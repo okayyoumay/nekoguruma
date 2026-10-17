@@ -8,6 +8,7 @@
 //! debug build allows and only on the simulator (ADR-247). A third reads the VIN again and
 //! decodes it through the job's document (ADR-316). A fourth runs a procedure of the example
 //! ECU that reads DTCs with `diag.read_dtc`, which lowers to the generic send-receive (ADR-321).
+//! Every job comes from a document and opens the link its variant declares (ADR-324).
 //!
 //! This file holds a single test, so the process-wide `VCI_CONFIG_PATH` it sets for the
 //! spawned service cannot race with another test.
@@ -17,10 +18,10 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agent::guards::{GuardSetup, JobGuards};
-use agent::{Job, JobDocument, JobLimits, LinkConfig, run_program};
+use agent::{Job, JobDocument, JobLimits, run_program};
 use diag_ir::declaration::{
-    DataKind, EcuDocumentT, EcuVariantT, FieldT, Placement, PositiveResponseT, ServiceT,
-    encode_ecu_document,
+    DataKind, EcuDocumentT, EcuVariantT, FieldT, NegativeShapeT, Placement, PositiveResponseT,
+    ProtocolT, ServiceT, encode_ecu_document,
 };
 use diag_ir::{IR_SCHEMA_VERSION, Op, Program, Value};
 use worker_host::client::ConnectOptions;
@@ -107,7 +108,8 @@ fn write_program() -> Program {
     }
 }
 
-/// A variant's document with one service, 1: ReadDataByIdentifier of the VIN, whose positive
+/// A variant's document with one protocol, UDS over ISO 15765 at 500 kbit/s on the simulated
+/// ECU's identifiers, and one service, 1: ReadDataByIdentifier of the VIN, whose positive
 /// response is `62 F1 90` and the 17 ASCII bytes of field 1. Its procedure is `procedure`.
 fn vin_document(procedure: &Program) -> Vec<u8> {
     let mut vin = FieldT::default();
@@ -124,9 +126,22 @@ fn vin_document(procedure: &Program) -> Vec<u8> {
     service.id = 1;
     service.short_name = Some("readVin".into());
     service.positive = Some(Box::new(positive));
+    let mut shape = NegativeShapeT::default();
+    shape.marker = 0x7F;
+    shape.echoes_sid = true;
+    shape.code_at = 2;
+    shape.pending = Some(vec![0x78]);
+    let mut protocol = ProtocolT::default();
+    protocol.short_name = Some("ISO15765".into());
+    protocol.application_layer = Some("UDS".into());
+    protocol.baud_rate = 500_000;
+    protocol.tx_id = 0x7E0;
+    protocol.rx_id = 0x7E8;
+    protocol.negative_shape = Some(Box::new(shape));
     let mut variant = EcuVariantT::default();
     variant.id = 1;
     variant.short_name = Some("sim".into());
+    variant.protocols = Some(vec![protocol]);
     variant.services = Some(vec![service]);
     let mut document = EcuDocumentT::default();
     document.schema_version = IR_SCHEMA_VERSION;
@@ -135,6 +150,12 @@ fn vin_document(procedure: &Program) -> Vec<u8> {
     document.variant = Some(Box::new(variant));
     document.procedure = Some(postcard::to_allocvec(procedure).expect("program should serialize"));
     encode_ecu_document(&document)
+}
+
+/// The job of a [`vin_document`] whose procedure is `procedure`.
+fn document_job(procedure: &Program) -> Job {
+    let document = JobDocument::new(vin_document(procedure)).expect("the document loads");
+    Job::from_document(document).expect("the document carries its procedure")
 }
 
 /// A document whose procedure reads the VIN and decodes its field through the document.
@@ -151,8 +172,7 @@ fn decoding_job() -> Job {
         constants: vec![vec![0xF1, 0x90]],
         ..program()
     };
-    let document = JobDocument::new(vin_document(&procedure)).expect("the document loads");
-    Job::from_document(document).expect("the document carries its procedure")
+    document_job(&procedure)
 }
 
 /// A procedure that reads the DTCs whose status matches 0x08 and fails unless the ECU answers
@@ -296,10 +316,11 @@ async fn run_the_job() {
         .await
         .expect("client should connect");
 
+    let job = document_job(&program());
     let (state, _guards) = run_program(
         client,
-        &LinkConfig::iso15765(0x7E0, 0x7E8),
-        program(),
+        &job.declared_link().expect("the document declares its link"),
+        job,
         JobLimits::default(),
         job_guards(false),
     )
@@ -317,13 +338,14 @@ async fn run_the_job() {
 
     // The link of the first job is closed, so the worker can serve the next one. The agent
     // identified `sim-vci` from the module's version, which lets this job write.
+    let job = document_job(&write_program());
     let (state, _guards) = run_program(
         worker
             .connect(&ConnectOptions::default())
             .await
             .expect("client should connect"),
-        &LinkConfig::iso15765(0x7E0, 0x7E8),
-        write_program(),
+        &job.declared_link().expect("the document declares its link"),
+        job,
         JobLimits::default(),
         job_guards(true),
     )
@@ -340,13 +362,14 @@ async fn run_the_job() {
     assert_eq!(routine, &[0x7F, 0x31, 0x24], "{state:?}");
 
     // The VIN as the procedure reads it: decoded through the job's document.
+    let job = decoding_job();
     let (state, _guards) = run_program(
         worker
             .connect(&ConnectOptions::default())
             .await
             .expect("client should connect"),
-        &LinkConfig::iso15765(0x7E0, 0x7E8),
-        decoding_job(),
+        &job.declared_link().expect("the document declares its link"),
+        job,
         JobLimits::default(),
         job_guards(false),
     )
@@ -355,15 +378,23 @@ async fn run_the_job() {
     assert_eq!(state.stack, [Value::Bytes(VIN.to_vec())], "{state:?}");
 
     // DTCs read through the generic send-receive. The procedure fails unless the answer
-    // matched its declared response and the mask decoded, and the job only reads.
+    // matched its declared response and the mask decoded, and the job only reads. The example
+    // ECU's link carries its own ComParams, which the agent sets on the link.
     let job = read_dtc_job();
     assert!(!job.writes());
+    let link = job
+        .declared_link()
+        .expect("the example ECU declares its link");
+    assert_eq!(
+        link.params,
+        [("CP_BlockSize".to_owned(), 0), ("CP_StMin".to_owned(), 0)]
+    );
     let (state, _guards) = run_program(
         worker
             .connect(&ConnectOptions::default())
             .await
             .expect("client should connect"),
-        &LinkConfig::iso15765(0x7E0, 0x7E8),
+        &link,
         job,
         JobLimits::default(),
         job_guards(false),

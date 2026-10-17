@@ -242,8 +242,8 @@ pub(crate) fn check_flash_rules(sid: u8, transfer: bool) -> Result<(), HostError
 pub(crate) mod tests {
     use diag_ir::IR_SCHEMA_VERSION;
     use diag_ir::declaration::{
-        EcuDocumentT, EcuVariantT, NegativeShapeT, PositiveResponseT, ProtocolT, RequestT,
-        ServiceT, encode_ecu_document,
+        EcuDocumentT, EcuVariantT, NegativeShapeT, PositiveResponseT, RequestT, ServiceT,
+        encode_ecu_document,
     };
 
     use super::*;
@@ -304,9 +304,7 @@ pub(crate) mod tests {
             shapes
                 .into_iter()
                 .map(|shape| {
-                    let mut protocol = ProtocolT::default();
-                    protocol.short_name = Some("ISO15765".into());
-                    protocol.application_layer = Some("UDS".into());
+                    let mut protocol = crate::document::tests::uds_on_can();
                     protocol.negative_shape = shape.map(Box::new);
                     protocol
                 })

@@ -7,7 +7,7 @@
 variants), `agent` (`Job`, `check_job`, policy, one link per target, keep-alive, run and restart
 order), the workers' tester-present ComParams, `sim-ecu` (a gateway role), design 8.2.4, 8.2.5,
 8.2.6, 5.6, 8.10, 8.10.1; ADR-229 item 2, ADR-235 item 8, ADR-245, ADR-247 item 1, ADR-257,
-ADR-264 item 4, ADR-280, ADR-293, ADR-307 items 1 and 5, ADR-311 item 1, ADR-316, ADR-318 items 1, 3 and 4
+ADR-264 item 4, ADR-280, ADR-293, ADR-307 items 1 and 5, ADR-324, ADR-311 item 1, ADR-316, ADR-318 items 1, 3 and 4
 
 ## Context
 
@@ -180,7 +180,9 @@ shape survives inside the second as the access program of item 5.
    anything is sent. Since the link is opened before the variant is identified, the conversion
    and `check_job` refuse a target whose candidate variants differ in the link settings
    (protocol, identifiers, addressing, bus parameters); probing a variant over its own link is
-   not part of this decision.
+   not part of this decision. Each target's link is the one its variants declare (ADR-324); on an
+   access target a declared tester-present ComParam is refused, since the agent sets those
+   itself (item 11).
 9. **At most one target is reprogrammed.** A job's flash sessions and recovery plans all belong
    to one target, the reprogramming target, whose identity the journal records and the restart
    checks (ADR-229). Other targets may receive any request the job's policy allows (security

@@ -134,6 +134,9 @@ shape survives inside the second as the access program of item 5.
    item 4's journal that records no document; the caller still supplies the documents) and,
    once the VIN matches and the per-vehicle lock is held, identifies every target again; a
    variant that differs from the recorded combination ends the restart in on-site intervention.
+   The one exception is the reprogramming target while the journal is inside its flash plan:
+   its ECU may answer only from its bootloader, so it is not identified again here, and
+   ADR-229's hardware identity and state checks validate it instead.
    A journal without the record holds no step of the program, since only access programs and
    identification reads ran, so its job starts again as a first run does. The host and the
    restart carry these documents in place of the single one (amending ADR-318 item 3).
@@ -188,12 +191,15 @@ shape survives inside the second as the access program of item 5.
     target is itself an access target (a gateway being reprogrammed), its keep-alive is watched
     only until its flash plan's entry and stops there, since the erase, the reset and the restart
     of the ECU silence it; the plan's own steps handle that ECU from then on. After the plan's
-    post-transfer end the agent runs that target's access program again, and keeps it alive
-    again, before any later instruction addresses another target. While the job is inside that plan (from
-    its entry to its post-transfer end, by the VM state or the journal), the runs of item 5 after
-    a restart or a reopening of the links skip that target's access program, whose ECU may answer
-    only from its bootloader, and leave it to ADR-229's restart order and the plan's replay; the
-    other access targets' programs still run. The restart's
+    post-transfer end the agent runs that target's access program again, then the access programs
+    of every access target declared after it, in declaration order, keeping each alive again,
+    before any later instruction addresses another target; those later access targets may sit
+    behind it, so their keep-alive is not watched while the plan runs either. While the job is
+    inside that plan (from its entry to its post-transfer end, by the VM state or the journal),
+    the runs of item 5 after a restart or a reopening of the links skip that target's access
+    program, whose ECU may answer only from its bootloader, and the access programs of every
+    access target declared after it, and leave that target to ADR-229's restart order and the
+    plan's replay; the access targets declared before it still run. The restart's
     teardown (ADR-264) likewise stops the reprogramming target's keep-alive before the ECUReset or
     the passive wait, and keeps the other access targets alive.
 

@@ -6,7 +6,8 @@
 //!
 //! A second job switches the ECU to its programming session and runs a routine, which only a
 //! debug build allows and only on the simulator (ADR-247). A third reads the VIN again and
-//! decodes it through the job's document (ADR-316).
+//! decodes it through the job's document (ADR-316). A fourth runs a procedure of the example
+//! ECU that reads DTCs with `diag.read_dtc`, which lowers to the generic send-receive (ADR-321).
 //!
 //! This file holds a single test, so the process-wide `VCI_CONFIG_PATH` it sets for the
 //! spawned service cannot race with another test.
@@ -154,6 +155,61 @@ fn decoding_job() -> Job {
     Job::from_document(document).expect("the document carries its procedure")
 }
 
+/// A procedure that reads the DTCs whose status matches 0x08 and fails unless the ECU answers
+/// positively with every status bit available, as the simulated ECU does
+/// (`sim_ecu::DTC_STATUS_AVAILABILITY_MASK`).
+const READ_DTC_PROCEDURE: &str = "\
+def main():
+    dtcs = diag.read_dtc(0x08)
+    if not dtcs[\"ok\"]:
+        diag.fail(\"NO_DTCS\", \"the ECU refused the DTC read\")
+    if dtcs[\"fields\"][\"mask\"] != 0xFF:
+        diag.fail(\"MASK\", \"not every status bit is available\")
+";
+
+/// The first variant's document of the example ECU (`crates/diag-frontend/examples/example-ecu`)
+/// with [`READ_DTC_PROCEDURE`] as its procedure.
+fn read_dtc_job() -> Job {
+    use diag_frontend::convert::{lower_procedures, to_ir};
+    use diag_frontend::tables::{read_files, resolve};
+
+    let dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../diag-frontend/examples/example-ecu");
+    let mut files: Vec<(String, Vec<u8>)> = std::fs::read_dir(&dir)
+        .expect("example directory")
+        .map(|entry| {
+            let entry = entry.expect("entry");
+            let name = entry.file_name().into_string().expect("UTF-8 name");
+            // A Windows checkout may have CRLF line ends.
+            let text = std::fs::read_to_string(entry.path())
+                .expect("example file")
+                .replace("\r\n", "\n");
+            (name, text.into_bytes())
+        })
+        .collect();
+    files.push((
+        "read_dtc.star".to_owned(),
+        READ_DTC_PROCEDURE.as_bytes().to_vec(),
+    ));
+    files.sort();
+    let tables = read_files(files).unwrap_or_else(|e| panic!("does not read: {e:?}"));
+    let definition = resolve(tables).unwrap_or_else(|e| panic!("does not resolve: {e:?}"));
+    let procedures =
+        lower_procedures(&definition).unwrap_or_else(|e| panic!("does not lower: {e:?}"));
+    let converted = to_ir(&definition, &procedures);
+    let document = converted.documents.into_iter().next().expect("a document");
+    let document = JobDocument::new(document.bytes).expect("the document loads");
+    let job = Job::from_document(document).expect("the document carries its procedure");
+    assert!(
+        job.program()
+            .code
+            .iter()
+            .any(|op| matches!(op, Op::SendReceive { .. })),
+        "diag.read_dtc lowers to the generic send-receive"
+    );
+    job
+}
+
 #[test]
 fn agent_job_reads_the_vin_from_sim_vci() {
     let nanos = SystemTime::now()
@@ -297,6 +353,23 @@ async fn run_the_job() {
     .await;
     let state = state.expect("the decoding job should finish");
     assert_eq!(state.stack, [Value::Bytes(VIN.to_vec())], "{state:?}");
+
+    // DTCs read through the generic send-receive. The procedure fails unless the answer
+    // matched its declared response and the mask decoded, and the job only reads.
+    let job = read_dtc_job();
+    assert!(!job.writes());
+    let (state, _guards) = run_program(
+        worker
+            .connect(&ConnectOptions::default())
+            .await
+            .expect("client should connect"),
+        &LinkConfig::iso15765(0x7E0, 0x7E8),
+        job,
+        JobLimits::default(),
+        job_guards(false),
+    )
+    .await;
+    state.expect("the DTC job should finish");
 
     worker
         .stop(Duration::from_secs(5))

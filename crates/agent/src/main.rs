@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use agent::guards::{GuardSetup, JobGuards};
 use agent::launch::{Api, launch_worker};
-use agent::policy::{build_ceiling, writes};
+use agent::policy::build_ceiling;
 use agent::{Job, JobDocument, JobLimits, LinkConfig, check_job, run_program};
 use diag_ir::{Program, Value, VmState};
 use worker_host::service::{LaunchOptions, OperatingMode, Stopped, WorkerLayout};
@@ -229,7 +229,6 @@ fn read_job(file: &JobFile) -> Result<Job, String> {
 /// Runs the job and returns the final VM state as JSON.
 async fn run(args: RunArgs) -> Result<String, String> {
     let job = read_job(&args.job)?;
-    let program = job.program();
     // A program the job would refuse does not need a worker.
     check_job(&job, build_ceiling()).map_err(|error| format!("job failed: {error}"))?;
     // The per-VCI lock, and the reprogramming slot for a program that writes (design 8.8.1). The
@@ -242,7 +241,7 @@ async fn run(args: RunArgs) -> Result<String, String> {
         dir,
         vci: args.vci.clone(),
     };
-    let writes = writes(program);
+    let writes = job.writes();
     let guards = tokio::task::spawn_blocking(move || {
         let never = AtomicBool::new(false);
         if writes {

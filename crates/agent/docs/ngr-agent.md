@@ -30,15 +30,17 @@ Steps (`agent::check_job`, `agent::guards::JobGuards`, `agent::launch::launch_wo
 
 1. Read the program, or the document and its procedure, and check the job (`agent::check_job`):
    a program that decodes response fields without a document, or decodes a field the document
-   does not declare (ADR-318), a program with a generic send-receive, which this agent does
-   not serve yet (`Op::SendReceive`, ADR-321), a program whose schema version or
+   does not declare (ADR-318), a generic send-receive (`Op::SendReceive`, ADR-321) whose
+   service the document does not declare with a request and a positive response, or whose
+   variant's negative-response shape the workers do not support (ADR-322), a program whose schema version or
    size this VM does not accept, one whose restart declaration `Program::validate` refuses
    (ADR-245), or one with a request this build may never send (a release build sends only
    read-only requests; ADR-235 item 8, ADR-247), fails here,
    before any worker starts. A bad operand, such as a missing constant, fails only when the VM
    reaches it, after the worker has started.
 2. Take the job's guards from the `--locks` directory, named by `--vci` ("Job guards" below):
-   the per-VCI lock, plus the reprogramming slot when the program writes (`policy::writes`).
+   the per-VCI lock, plus the reprogramming slot when the program writes (`Job::writes`; a
+   send-receive counts by its declared service, ADR-322).
    The run waits here while another job on the device holds them.
 3. Resolve the VCI name the way each worker build resolves it on its side (design 7.1.1). For
    J2534, through `ngr_library_resolver::j2534_0404`: the build's registry view on Windows, the

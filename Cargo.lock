@@ -1285,6 +1285,7 @@ name = "j2534-0404-service"
 version = "0.1.0"
 dependencies = [
  "agent",
+ "diag-frontend",
  "diag-ir",
  "j2534-0404",
  "j2534-0404-mock",

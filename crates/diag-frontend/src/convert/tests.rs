@@ -1178,6 +1178,40 @@ fn a_routine_sends_routine_control_with_the_rest_of_its_request() {
 }
 
 #[test]
+fn a_routine_s_own_constants_select_it_and_lead_its_operand() {
+    let fields = format!(
+        "{}\nroutine:checkProgrammingDependencies:start:request,mode,0,,uint,8,,,,,,0x05,,,\n",
+        example()
+            .into_iter()
+            .find(|(n, _)| n == "fields.csv")
+            .map(|(_, c)| String::from_utf8(c).expect("UTF-8"))
+            .expect("fields.csv")
+            .trim_end()
+    );
+    let files = || with(example(), "fields.csv", &fields);
+    // The constant follows the three bytes the instruction sends itself.
+    let host = run_answered(
+        files(),
+        "def main():\n    diag.routine(0xFF01, 1, {\"mode\": 5})\n",
+        &[&[0x71, 0x01, 0xFF, 0x01, 0x00]],
+    )
+    .unwrap();
+    assert_eq!(host.routines, [(0xFF01, 0x01, vec![5])]);
+    // Another value, or none, selects nothing.
+    for params in ["{\"mode\": 6}", "{}"] {
+        let source = format!("def main():\n    diag.routine(0xFF01, 1, {params})\n");
+        let errors = procedures(with(files(), "main.star", &source))
+            .expect_err("rejected")
+            .errors;
+        assert_eq!(
+            errors.iter().map(|e| e.code).collect::<Vec<_>>(),
+            [crate::star::StarCode::UnknownService],
+            "{params}"
+        );
+    }
+}
+
+#[test]
 fn a_routine_is_checked_at_ingestion() {
     let codes = |source: &str| -> Vec<crate::star::StarCode> {
         procedures(with(example(), "main.star", source))
@@ -1235,6 +1269,46 @@ fn a_routine_is_checked_at_ingestion() {
     assert_eq!(found.len(), 1, "{found:?}");
     assert_eq!(found[0].0, NonConstantArgument);
     assert!(found[0].1.contains("`diag.routine`"), "{found:?}");
+    // A run-time value for one of its fields is not encoded at ingestion.
+    let fields_with_level = format!(
+        "{}\nroutine:checkProgrammingDependencies:start:request,level,0,,uint,8,,,,,,,,,\n",
+        example()
+            .into_iter()
+            .find(|(n, _)| n == "fields.csv")
+            .map(|(_, c)| String::from_utf8(c).expect("UTF-8"))
+            .expect("fields.csv")
+            .trim_end()
+    );
+    let level = |source: &str| -> Vec<(crate::star::StarCode, String)> {
+        procedures(with(
+            with(example(), "fields.csv", &fields_with_level),
+            "main.star",
+            source,
+        ))
+        .err()
+        .map_or_else(Vec::new, |rejected| {
+            rejected
+                .errors
+                .into_iter()
+                .map(|e| (e.code, e.hint))
+                .collect()
+        })
+    };
+    let found =
+        level("def f(l):\n    diag.routine(0xFF01, 1, {\"level\": l})\n\ndef main():\n    f(3)\n");
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].0, NotLowerable);
+    assert!(found[0].1.contains("`diag.routine`"), "{found:?}");
+    // A value the field cannot hold, and a sub-function out of range.
+    let found = level("def main():\n    diag.routine(0xFF01, 1, {\"level\": 256})\n");
+    assert_eq!(
+        found.iter().map(|f| f.0).collect::<Vec<_>>(),
+        [ArgumentOutOfRange]
+    );
+    assert_eq!(
+        codes("def main():\n    diag.routine(0xFF01, 0x100, {})\n"),
+        [ArgumentOutOfRange]
+    );
     // The result has the response's declared names (ADR-314 item 4).
     assert_eq!(
         codes("def main():\n    x = diag.routine(0xFF01, 1, {})[\"fields\"][\"other\"]\n"),

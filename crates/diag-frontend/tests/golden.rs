@@ -132,7 +132,12 @@ impl DiagHost for Recording {
         sub: u8,
         payload: &[u8],
     ) -> Result<Vec<u8>, NotSent> {
-        writeln!(self.out, "routine {routine:04X} {sub:02X} {}", hex(payload)).expect("a String");
+        let payload = if payload.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", hex(payload))
+        };
+        writeln!(self.out, "routine {routine:04X} {sub:02X}{payload}").expect("a String");
         let mut response = vec![0x71, sub];
         response.extend(routine.to_be_bytes());
         Ok(self

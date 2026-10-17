@@ -3352,13 +3352,35 @@ impl<'a> Lowerer<'a> {
             );
             return Val::Run(Tys::of(Ty::Response), Vec::new());
         }
+        // The selection below builds exactly this template's prefix: the sub-function, then the
+        // 16-bit identifier, then `params`.
+        let expected = [
+            Part::Select {
+                bits: 8,
+                arg: Source::Sub,
+            },
+            Part::Select {
+                bits: 16,
+                arg: Source::Rid,
+            },
+            Part::Params,
+        ];
+        if step.request.parts != expected {
+            self.not_lowerable(
+                span,
+                format!(
+                    "the {} profile's `diag.routine` request is not the sub-function, the 16-bit \
+                     routine identifier and `params`, the only one lowered yet (3.2)",
+                    profile.layer
+                ),
+            );
+            return Val::Run(Tys::of(Ty::Response), Vec::new());
+        }
         let (Some(rid), Some(sub), Some(params)) = (rid, sub, params) else {
             return Val::Run(Tys::of(Ty::Response), Vec::new());
         };
         // In range by the checks above.
         let (rid, sub) = (rid as u16, sub as u8);
-        // `Profile::validate` makes the UDS routine step the sub-function and then the 16-bit
-        // identifier, both selecting, then `params`.
         let selected: Vec<u8> = [&[sub][..], &rid.to_be_bytes()].concat();
         let Some((service, request, constants)) = self.select_routine(&selected, &params) else {
             let mut keys: Vec<&str> = params.iter().map(|(key, _)| &**key).collect();

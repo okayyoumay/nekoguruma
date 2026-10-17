@@ -277,6 +277,7 @@ field that stores them.
 | `detail` of `diag.fail` | `str` expression, which may be built at run time |
 | `params` of `diag.hmi` | dict whose values are all constants (3.2) |
 | `params` of `diag.request` | dict known at ingestion whose keys and values select one declared service of the variant and give its other request fields (3.4); a call that selects none, or more than one, is rejected (`STAR_UNKNOWN_SERVICE`) |
+| `params` of `diag.routine` | dict known at ingestion whose keys and values give the routine service's own constants and other request fields, as for `diag.request`; a call whose `routine_id`, `sub` and `params` select no generated routine service is rejected (`STAR_UNKNOWN_SERVICE`) |
 | `session_id` | `int` naming a flash session declared in the declaration part (`FlashSession` in `ir.fbs`); an unknown session is rejected (`STAR_UNKNOWN_FLASH_SESSION`) |
 
 A `diag.wait` whose duration is only known at run time needs a stack-operand variant of `Wait`.

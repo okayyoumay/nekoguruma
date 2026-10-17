@@ -403,8 +403,10 @@ const PINS: std::ops::RangeInclusive<u8> = 1..=16;
 
 /// The ComParams of the physical layer, which the profile's typed keys give and a check may not
 /// change (design 13.5).
-/// The physical-layer ComParams (the bus type class of ISO 22900-2 (2022) Annex B.3.2, as
-/// `j2534-0404-service` groups them), compared ignoring ASCII case.
+/// The physical-layer ComParams: the bus type class (`PDU_PC_BUSTYPE`, ISO 22900-2 (2022)
+/// Annex B.3.2), by the names of `j2534-0404-service`'s `BUSTYPE_UNUM32` and `BUSTYPE_BYTES`
+/// (`crates/j2534-0404-service/src/service/comparam_support.rs`), which this list mirrors in
+/// full; a name added there belongs here too. Compared ignoring ASCII case.
 const PHYSICAL_COMPARAMS: &[&str] = &[
     "CP_Baudrate",
     "CP_BitSamplePoint",
@@ -414,14 +416,24 @@ const PHYSICAL_COMPARAMS: &[&str] = &[
     "CP_SyncJumpWidth",
     "CP_SyncJumpWidth_Ecu",
     "CP_ListenOnly",
-    "CP_CanBaudrateRecord",
-    "CP_K_L_LineInit",
-    "CP_K_LinePullup",
     "CP_TerminationType",
     "CP_TerminationType_Ecu",
+    "CP_NetworkLine",
+    "CP_K_L_LineInit",
+    "CP_K_LinePullup",
+    "CP_UartConfig",
+    "CP_Parity",
     "CP_CANFDBaudrate",
     "CP_CANFDBitSamplePoint",
     "CP_CANFDSyncJumpWidth",
+    "CP_J1850IFRCtrl",
+    "CP_Node_Address",
+    "CP_AnalogSampleRate",
+    "CP_AnalogActiveChannels",
+    "CP_AnalogSamplesPerReading",
+    "CP_AnalogReadingsPerMsg",
+    "CP_AnalogAveragingMethod",
+    "CP_CanBaudrateRecord",
 ];
 
 /// A channel name as the J2534 worker reads it: ASCII case ignored, surrounding spaces dropped,

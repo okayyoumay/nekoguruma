@@ -413,7 +413,14 @@ fn a_loopback_runs_between_two_ends_of_one_bus() {
     );
     refused_for(&can_channel, "socketcan");
     // Other physical-layer ComParams, in any case, are refused like `CP_Baudrate`.
-    for name in ["CP_CANFDBaudrate", "CP_BAUDRATE", "CP_TerminationType"] {
+    for name in [
+        "CP_CANFDBaudrate",
+        "CP_BAUDRATE",
+        "CP_TerminationType",
+        "CP_NetworkLine",
+        "CP_UartConfig",
+        "CP_J1850IFRCtrl",
+    ] {
         let text = t1("").replacen("CP_STmin = 0", &format!("{name} = 1"), 1);
         refused_for(&text, "physical-layer");
     }

@@ -2516,8 +2516,6 @@ impl<'a> Lowerer<'a> {
         Val::Run(Tys::of(ty), code)
     }
 
-    /// Code that turns the response bytes on top of the stack into whether the response is
-    /// positive: its first byte, if any, is not `7F`.
     /// The marker that starts a negative response, and the position of its code: those of the
     /// shape the variant's protocols declare, which all name one application layer (ADR-309
     /// items 3 and 4). A variant that declares no protocol (in tests) uses its profile's.
@@ -2536,6 +2534,8 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    /// Code that turns the response bytes on top of the stack into whether the response is
+    /// positive: its first byte, if any, is not the declared shape's marker.
     fn response_ok(&mut self, span: Span) -> Code {
         let marker = self.negative_shape().0;
         let negative = self.pool(&[marker]);

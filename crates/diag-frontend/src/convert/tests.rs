@@ -789,7 +789,9 @@ fn ok_and_nrc_follow_the_variant_s_declared_negative_shape() {
         (0x7F, true, 2, Some(vec![0x78]))
     );
     // Lowered against a variant that declares another shape, `ok` and `nrc` read that one.
+    // A marker followed directly by its code, with no echoed service identifier.
     shape.marker = 0x7E;
+    shape.echoes_sid = false;
     shape.code_at = 1;
     let bytes = encode_ecu_document(&document);
     let variant = load_ecu_document(&bytes)

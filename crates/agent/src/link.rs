@@ -534,7 +534,11 @@ async fn set_up_link(
         .params
         .iter()
         .map(|(name, value)| (name.as_str(), *value, true));
-    let mut set = Vec::new();
+    // The identifiers go into the response ID table below; resolved first, so a declared alias
+    // of either is caught as well.
+    let phys_req = comparam_id(client, deadline, "CP_CanPhysReqId").await?;
+    let resp = comparam_id(client, deadline, "CP_CanRespUSDTId").await?;
+    let mut set = vec![phys_req, resp];
     for (name, value, is_declared) in own
         .into_iter()
         .map(|(name, value)| (name, value, false))
@@ -568,8 +572,6 @@ async fn set_up_link(
     }
 
     // The table makes the worker install the flow-control filter for the ECU's IDs.
-    let phys_req = comparam_id(client, deadline, "CP_CanPhysReqId").await?;
-    let resp = comparam_id(client, deadline, "CP_CanRespUSDTId").await?;
     unary(
         deadline,
         "SetUniqueRespIdTable",

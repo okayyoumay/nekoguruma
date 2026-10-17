@@ -11207,7 +11207,8 @@ mod tests {
         fail_open: bool,
         calls: Arc<Mutex<Vec<&'static str>>>,
         /// ComParam names by object id - 1, ignoring case as the workers do. `CP_Unknown` is
-        /// not known, and `CP_BaudrateAlias` resolves to `CP_Baudrate`'s id.
+        /// not known, `CP_BaudrateAlias` resolves to `CP_Baudrate`'s id and `CP_PhysReqAlias`
+        /// to `CP_CanPhysReqId`'s.
         comparams: Mutex<Vec<String>>,
         /// Each SetComParam: the ComParam's name, its value and its class.
         set: Arc<Mutex<Vec<(String, u32, i32)>>>,
@@ -11222,6 +11223,7 @@ mod tests {
             let name = match name.to_ascii_lowercase() {
                 name if name == "cp_unknown" => return 0xFFFF_FFFE,
                 name if name == "cp_baudratealias" => "cp_baudrate".to_owned(),
+                name if name == "cp_physreqalias" => "cp_canphysreqid".to_owned(),
                 name => name,
             };
             let mut names = self.comparams.lock().unwrap();
@@ -11558,6 +11560,7 @@ mod tests {
         for (name, expected) in [
             ("CP_Unknown", "does not know ComParam CP_Unknown"),
             ("CP_BaudrateAlias", "ComParam CP_BaudrateAlias sets what"),
+            ("CP_PhysReqAlias", "ComParam CP_PhysReqAlias sets what"),
         ] {
             let (mut client, _calls, _set) = fake_worker_recording(false, false).await;
             let config = LinkConfig {

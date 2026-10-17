@@ -96,11 +96,12 @@ shape survives inside the second as the access program of item 5.
    program, from the first access target, which a locked gateway answers with reads. A first run
    goes in this order: identify the first access target and read the VIN from it; when the VIN
    matches, take the per-vehicle lock (8.8), waiting for it with nothing more sent while another
-   job holds it; then read the VIN again, since the vehicle may have changed during the wait,
-   and, for each access target in declaration order, identify it (the first again, since the
-   job that held the lock may have changed it) and run its access
-   program at once, so that an inner gateway is reached through an unlocked outer one; then
-   identify the other targets and pick the combination (item 7). A VIN that differs, at either
+   job holds it; then identify the first access target again, since the job that held the lock
+   may have reflashed it, and read the VIN again with the variant now identified, since the
+   vehicle may have changed during the wait; then, for each access target in declaration order,
+   run its access program at once, identifying each one after the first just before its
+   program, so that an inner gateway is reached through an unlocked outer one; then identify
+   the other targets and pick the combination (item 7). A VIN that differs, at either
    read, ends a first run in the 8.9.1 pre-check with only reads sent, and a lock failure leaves
    only those reads sent. A restart (8.2.5) reads the VIN in ADR-229's order (item 2 step 2) and,
    once it holds the per-vehicle lock, runs the access programs in the same way before any other

@@ -4,7 +4,7 @@ EcuDocumentT {
         "csv-starlark",
     ),
     source_digest: Some(
-        "fadc6b3ae863d3d9803d29085fa7a7b246ca82e7c9829b59490359dcf28ff7aa",
+        "0ae06b242dfa2868a14a93c4f82e113cfdb8aa12fc6cd823ee968f6738cc1650",
     ),
     variant: Some(
         EcuVariantT {
@@ -2060,10 +2060,10 @@ Program {
             service: 34,
         },
         StoreLocal(
-            1,
+            2,
         ),
         LoadLocal(
-            1,
+            2,
         ),
         DecodeField {
             service: 5,
@@ -2087,10 +2087,10 @@ Program {
             service: 4,
         },
         StoreLocal(
-            0,
+            1,
         ),
         LoadLocal(
-            0,
+            1,
         ),
         PushI64(
             0,
@@ -2110,7 +2110,7 @@ Program {
         ),
         Pop,
         LoadLocal(
-            0,
+            1,
         ),
         DecodeField {
             service: 4,
@@ -2130,13 +2130,61 @@ Program {
         PushBytes(
             7,
         ),
+        RoutineControl {
+            routine: 65281,
+            sub: 1,
+        },
+        StoreLocal(
+            0,
+        ),
+        LoadLocal(
+            0,
+        ),
+        PushI64(
+            0,
+        ),
+        PushI64(
+            1,
+        ),
+        Slice,
+        PushBytes(
+            5,
+        ),
+        CmpEq,
+        Not,
+        Dup,
+        JumpIfFalse(
+            53,
+        ),
+        Pop,
+        LoadLocal(
+            0,
+        ),
+        DecodeField {
+            service: 15,
+            field: 29,
+        },
+        PushI64(
+            0,
+        ),
+        CmpEq,
+        JumpIfFalse(
+            55,
+        ),
+        Log {
+            level: 1,
+            message: 8,
+        },
+        PushBytes(
+            9,
+        ),
         ServiceRequest {
             service: 46,
         },
         Pop,
         Log {
             level: 1,
-            message: 8,
+            message: 10,
         },
         Ret,
     ],
@@ -2208,6 +2256,41 @@ Program {
             116,
             101,
             100,
+        ],
+        [],
+        [
+            112,
+            114,
+            111,
+            103,
+            114,
+            97,
+            109,
+            109,
+            105,
+            110,
+            103,
+            32,
+            100,
+            101,
+            112,
+            101,
+            110,
+            100,
+            101,
+            110,
+            99,
+            105,
+            101,
+            115,
+            32,
+            99,
+            111,
+            114,
+            114,
+            101,
+            99,
+            116,
         ],
         [
             241,
@@ -2309,16 +2392,46 @@ Program {
             pc: 36,
             file: 0,
             line: 13,
-            column: 5,
+            column: 13,
         },
         SourceSpan {
             pc: 39,
             file: 0,
             line: 14,
+            column: 8,
+        },
+        SourceSpan {
+            pc: 49,
+            file: 0,
+            line: 14,
+            column: 24,
+        },
+        SourceSpan {
+            pc: 53,
+            file: 0,
+            line: 14,
+            column: 8,
+        },
+        SourceSpan {
+            pc: 54,
+            file: 0,
+            line: 15,
+            column: 9,
+        },
+        SourceSpan {
+            pc: 55,
+            file: 0,
+            line: 16,
             column: 5,
         },
         SourceSpan {
-            pc: 40,
+            pc: 58,
+            file: 0,
+            line: 17,
+            column: 5,
+        },
+        SourceSpan {
+            pc: 59,
             file: 0,
             line: 4,
             column: 5,

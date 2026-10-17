@@ -1,7 +1,7 @@
 # ADR-257: Every Job Runs on Guards It Holds
 
 **Date:** 2026-10-09
-**Status:** Accepted (lock files must be regular files since ADR-262 item 6)
+**Status:** Accepted (lock files must be regular files since ADR-262 item 6; ADR-325 item 10 adds an access class that does not need the reprogramming slot)
 **Affects:** `agent` (`src/guards.rs`, `src/runner.rs`, `src/policy.rs`, `src/main.rs`), `j2534-0404-service` (tests), ADR-256
 
 ## Context

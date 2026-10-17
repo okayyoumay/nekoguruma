@@ -1,7 +1,7 @@
 # ADR-316: The VM Decodes Response Fields Through the Declaration Part
 
 **Date:** 2026-10-16
-**Status:** Accepted (Decision item 2's note on the runner and the first Consequence superseded by ADR-318)
+**Status:** Accepted (Decision item 2's note on the runner and the first Consequence superseded by ADR-318; decoding extended to the current target's declaration part by ADR-325 item 3)
 **Affects:** `diag-ir` (`src/lib.rs`: `Op::DecodeField`, `Vm::step_with_declarations`, four
 `VmError` variants, `IR_SCHEMA_VERSION` 11), `agent` (`src/policy.rs`, `src/journal.rs`), the IR
 golden files, design 8.2.4; ADR-233, ADR-297

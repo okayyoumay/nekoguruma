@@ -1322,6 +1322,61 @@ fn a_variant_s_protocols_name_one_application_layer_a_profile_ships_for() {
             ),
         ]
     );
+    // A row that mixes both variants is reported once.
+    let mut found = resolved_with(
+        "protocols.csv",
+        header,
+        &[
+            ",ISO15765,500000,0x7E0,0x7E8,UDS",
+            ",KLINE,10400,0x7E1,0x7E9,KWP2000",
+        ],
+    );
+    found.sort();
+    assert_eq!(
+        found,
+        vec![
+            at(
+                UnknownReference,
+                "protocols.csv",
+                Some(3),
+                Some("application_layer")
+            ),
+            at(
+                Duplicate,
+                "protocols.csv",
+                Some(3),
+                Some("application_layer")
+            ),
+        ]
+    );
+    // A scope that also names an unknown variant still mixes the variants it does name.
+    let mut found = resolved_with(
+        "protocols.csv",
+        header,
+        &[
+            ",ISO15765,500000,0x7E0,0x7E8,UDS",
+            "exampleEcuV2;typo,KLINE,10400,0x7E1,0x7E9,KWP2000",
+        ],
+    );
+    found.sort();
+    assert_eq!(
+        found,
+        vec![
+            at(
+                UnknownReference,
+                "protocols.csv",
+                Some(3),
+                Some("application_layer")
+            ),
+            at(UnknownReference, "protocols.csv", Some(3), Some("variants")),
+            at(
+                Duplicate,
+                "protocols.csv",
+                Some(3),
+                Some("application_layer")
+            ),
+        ]
+    );
 }
 
 #[test]

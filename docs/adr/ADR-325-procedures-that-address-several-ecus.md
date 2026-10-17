@@ -112,14 +112,14 @@ shape survives inside the second as the access program of item 5.
    instead of the passive teardown ADR-229 takes there, which would reach the reprogramming
    target's default-session confirmation without an unlocked gateway. A step of an access
    program that fails ends the job as a lost access target would at that point (item 12).
-   Every run also runs them again after any reopening of the links (a worker crash or VCI disconnect that the job survives) before the
-   program continues. The main program may still select the access target for anything else.
+   Every run also runs them again after any reopening of the links (a worker crash or VCI
+   disconnect that the job survives) before the program continues. The main program may still select the access target for anything else.
 6. **Lowered once per combination of variants.** The main program is lowered for each
    combination of one variant per target, extending ADR-311's per-variant lowering, and must
    lower for every combination; the scoping of a procedure to some variants that ADR-311 item 2
    leaves open applies to targets as well. Each combination's program goes in its own document
    for the primary variant (amending ADR-307 item 1's one document per variant and procedure),
-   which names, for each other target, the content hash (design 8.2.6) of that variant's
+   which names, for every target, the primary included, the content hash (design 8.2.6) of that variant's
    declaration-only document; the conversion emits a declaration-only document for every
    variant of a definition another procedure targets. The document's digest covers every
    definition its program was lowered against (amending ADR-307 item 5). The conversion refuses
@@ -212,7 +212,9 @@ shape survives inside the second as the access program of item 5.
     access program again by itself. A request that gets no answer while an access target has
     reported tester-present errors since its last good answer is held rather than handled at
     once: the agent waits until that access target answers again, when the failure is handled as
-    any failed request is, or is counted lost, when the outcome above takes its place, so a
+    any failed request is, or is counted lost, when the outcome above takes its place, except
+    that inside an uninterruptible section the job ends in on-site intervention, since the held
+    request has no answer that would let the section continue to its end; so a
     request that times out first cannot turn a lost gateway into an ordinary interrupted step
     (ADR-235). Keep-alive answers from targets that are not access targets
     are not watched: a request to such a target that fails is handled as any failed request is.

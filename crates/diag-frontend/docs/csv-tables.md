@@ -204,13 +204,20 @@ Each row compares `expected` with the value the field decodes to, not with the b
 | `rx_id` | integer, 0x000 to 0x7FF | yes | Physical response identifier |
 | `functional_id` | integer, 0x000 to 0x7FF | no | Default 0 (none) |
 | `extended_addressing` | boolean | no | Default `no` |
+| `application_layer` | text | no | The application layer the protocol carries, default `UDS` |
 
 The identifiers are 11-bit CAN identifiers. A 29-bit identifier also needs the ComParams that
 select the identifier format, which this version does not define, so a value above 0x7FF is
 rejected (`CSV_BAD_VALUE`); the agent's link accepts only 11-bit identifiers for the same reason
 (ADR-235 item 4).
 
-ADR-309 adds a column naming the application layer the protocol carries (UDS first), which selects the profile the variant's procedures are lowered through and must be the same for every protocol of a variant; this version has no such column and every protocol is UDS.
+`application_layer` selects the application-layer profile the variant's procedures are lowered
+through (ADR-309 item 3, ADR-314). It must name a profile that ships with the frontend, `UDS`
+being the only one, or it is rejected (`CSV_UNKNOWN_REFERENCE`). Every protocol of one variant
+must name the same application layer, since a variant's procedures are one program per variant
+whose requests belong to one layer; a protocol whose layer differs from that of the variant's
+first protocol is rejected (`CSV_DUPLICATE`). An ECU reachable over two application layers is
+declared as two variants.
 
 `comparams.csv`, one `ComParam` per row, appended to the named protocol's `params` in row order.
 

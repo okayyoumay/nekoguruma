@@ -19,6 +19,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 
 use serde::Serialize;
+
+use crate::profile::Profile;
 use starlark_syntax::codemap::Span;
 use starlark_syntax::syntax::ast::{
     ArgumentP, AssignTargetP, AstArgument, AstAssignTarget, AstExpr, AstLiteral, AstNoPayload,
@@ -38,9 +40,22 @@ pub use lower::{Lowered, lower};
 /// The services of one variant as `diag.request` selects among them (`csv-tables.md` 5.3,
 /// ADR-313): what the IR does not keep, the names of each request's constants, beside the id of
 /// the IR service the call then encodes and sends. The frontend builds it from the tables.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct RequestIndex {
     pub services: Vec<IndexedService>,
+    /// The profile of the application layer the variant's protocols name, through which its
+    /// protocol-neutral calls are lowered (ADR-309 item 3).
+    pub profile: &'static Profile,
+}
+
+/// No services, over UDS.
+impl Default for RequestIndex {
+    fn default() -> Self {
+        Self {
+            services: Vec::new(),
+            profile: &crate::profile::UDS_PROFILE,
+        }
+    }
 }
 
 /// One service of a [`RequestIndex`].
@@ -125,6 +140,10 @@ pub enum StarCode {
     /// match (3.4; `csv-tables.md` 5.3).
     #[serde(rename = "STAR_UNKNOWN_SERVICE")]
     UnknownService,
+    /// A protocol-neutral call the profile of the variant's application layer does not define
+    /// (3.2, ADR-309 item 3).
+    #[serde(rename = "STAR_NOT_IN_PROFILE")]
+    NotInProfile,
     /// A warning: a `range` loop with a bound known only at run time has no `@maxIterations`, so
     /// the default limit applies (4.2).
     #[serde(rename = "STAR_LOOP_LIMIT_DEFAULTED")]
@@ -154,6 +173,7 @@ impl StarCode {
             Self::NotLowerable => "STAR_NOT_LOWERABLE",
             Self::ApiNotAvailable => "STAR_API_NOT_AVAILABLE",
             Self::UnknownService => "STAR_UNKNOWN_SERVICE",
+            Self::NotInProfile => "STAR_NOT_IN_PROFILE",
             Self::LoopLimitDefaulted => "STAR_LOOP_LIMIT_DEFAULTED",
         }
     }

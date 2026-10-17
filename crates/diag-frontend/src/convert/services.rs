@@ -230,7 +230,10 @@ impl<'a> Index<'a> {
                 }
             })
             .collect();
-        RequestIndex { services }
+        let protocol = &tables.protocols[self.definition.variants[variant].protocols[0]];
+        let profile = crate::profile::get(&protocol.application_layer)
+            .expect("resolving checks that a profile ships for every protocol's layer");
+        RequestIndex { services, profile }
     }
 
     /// The services of `variant`, as the tables define or generate them: its `services.csv`

@@ -200,6 +200,7 @@ impl<'a> Resolver<'a> {
         let service_map = self.services(&services, &dids, &routines);
 
         self.protocols_per_variant(&protocols);
+        self.application_layers(&protocols);
         self.comparams(&comparams, &protocols, &units);
         self.variant_patterns(&service_map, &conversions);
         self.nrcs(&nrcs, &service_map, &texts);
@@ -330,6 +331,70 @@ impl<'a> Resolver<'a> {
                     format!("variant {} has no protocol in protocols.csv", variant.name),
                 );
             }
+        }
+    }
+
+    /// A protocol names an application layer a profile ships for, and the protocols of one
+    /// variant all name the same one (4.3, ADR-309 item 3).
+    fn application_layers(&mut self, protocols: &[Variants]) {
+        for row in &self.t.protocols {
+            if crate::profile::get(&row.application_layer).is_none() {
+                let known: Vec<&str> = crate::profile::ALL.iter().map(|p| p.layer).collect();
+                self.error(
+                    ErrorCode::UnknownReference,
+                    "protocols.csv",
+                    row.line,
+                    "application_layer",
+                    format!(
+                        "no profile ships for application layer {:?} (known: {})",
+                        row.application_layer,
+                        known.join(", ")
+                    ),
+                );
+            }
+        }
+        // A row is reported once, however many of its variants it mixes, against the first
+        // protocol of the first of them.
+        let mut mixed = Vec::new();
+        for (row, scope) in self.t.protocols.iter().zip(protocols) {
+            let clash = self
+                .t
+                .variants
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| scope.contains(i))
+                .find_map(|(i, variant)| {
+                    let (first, _) = self
+                        .t
+                        .protocols
+                        .iter()
+                        .zip(protocols)
+                        .find(|(_, s)| s.contains(&i))?;
+                    (first.application_layer != row.application_layer).then_some((variant, first))
+                });
+            if let Some((variant, first)) = clash {
+                mixed.push((
+                    row.line,
+                    format!(
+                        "variant {} has protocols over application layers {:?} (protocol {}) \
+                         and {:?} (protocol {}); declare a variant per application layer",
+                        variant.name,
+                        first.application_layer,
+                        first.name,
+                        row.application_layer,
+                        row.name,
+                    ),
+                ));
+            }
+        }
+        for (line, message) in mixed {
+            self.error(
+                ErrorCode::Duplicate,
+                "protocols.csv",
+                line,
+                "application_layer",
+                message,
+            );
         }
     }
 

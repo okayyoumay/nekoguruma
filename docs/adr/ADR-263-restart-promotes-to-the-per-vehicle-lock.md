@@ -1,7 +1,7 @@
 # ADR-263: The Restart Promotes to the Per-Vehicle Lock at Its VIN Match
 
 **Date:** 2026-10-09
-**Status:** Accepted (the step 3 fallback consequence settled by ADR-267)
+**Status:** Accepted (the step 3 fallback consequence settled by ADR-267; item 4's sends before a lock failure include the access programs since ADR-325 item 5)
 **Affects:** `agent` (`src/restart.rs`, `src/runner.rs`, `docs/ngr-agent.md`), ADR-229 item 2, ADR-256 item 6, ADR-261, ADR-262
 
 ## Context

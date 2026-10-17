@@ -252,7 +252,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-260](ADR-260-sim-vci-stays-separate-from-the-j2534-mock.md) | `sim-vci` Stays Separate from `j2534-0404-mock` | Accepted | `sim-vci`, `j2534-0404-mock` |
 | [ADR-261](ADR-261-restart-identity-and-safety-gates.md) | The Restart's Identity and Safety Gates | Accepted (the promotion consequence settled by ADR-263; item 2's ending with the gates' decision superseded by ADR-264; the creation-prefix rule extended to the intended software version by ADR-268; the unjournaled-abort consequence closed for the identity abort by ADR-286 and for the on-site endings by ADR-290) | `agent` restart, runner, journaling |
 | [ADR-262](ADR-262-per-vehicle-lock-in-fixed-buckets.md) | The Per-Vehicle Lock Is One of 4096 Fixed Bucket Files | Accepted | `agent` guards |
-| [ADR-263](ADR-263-restart-promotes-to-the-per-vehicle-lock.md) | The Restart Promotes to the Per-Vehicle Lock at Its VIN Match | Accepted (the step 3 fallback consequence settled by ADR-267) | `agent` restart, runner |
+| [ADR-263](ADR-263-restart-promotes-to-the-per-vehicle-lock.md) | The Restart Promotes to the Per-Vehicle Lock at Its VIN Match | Accepted (the step 3 fallback consequence settled by ADR-267; item 4's sends before a lock failure include the access programs since ADR-325 item 5) | `agent` restart, runner |
 | [ADR-264](ADR-264-restart-teardown.md) | The Restart's Teardown Sends One Hard Reset or Waits Out the Session | Accepted (item 5's ending amended by ADR-265; item 5's `RestartOrderUnavailable` carrying the outcome superseded by ADR-276, which goes on with the erase; item 1's completed path counts only for the interrupted pass since ADR-269 item 2; item 4's passive teardown amended by ADR-325) | `agent` restart, runner; `sim-ecu` |
 | [ADR-265](ADR-265-restart-default-session-confirmation.md) | The Restart Confirms the Default Session, with One Passive Retry | Accepted | `agent` restart, runner; `sim-ecu` |
 | [ADR-266](ADR-266-linux-j2534-registration-definition-format.md) | Linux J2534 Registration Definitions Are TOML Files Keyed Like the Windows Registry | Accepted | `ngr-library-resolver`, design 7.1.1, 7.2 |
@@ -313,7 +313,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-321](ADR-321-the-generic-send-receive-instruction.md) | The Generic Send-Receive Instruction | Accepted (item 5 and the Consequences on the agent superseded by ADR-322) | `diag-ir` `Op::SendReceive`, `DiagHost::send_receive`, `check_declarations`, `Protocol.application_layer` and `negative_shape`; `agent` policy refusal; design 8.2.4; ADR-233, ADR-309, ADR-316 |
 | [ADR-322](ADR-322-the-agent-serves-the-generic-send-receive.md) | The Agent Serves the Generic Send-Receive | Accepted | `agent` `send_receive`, `WorkerHost::send_receive`, `policy::check_program` and `writes`, `check_job`, `Job::writes`; design 8.2.4; ADR-235, ADR-245, ADR-250, ADR-257, ADR-309, ADR-321 |
 | [ADR-323](ADR-323-dtc-records-are-read-from-the-response-bytes.md) | DTC Records Are Read from the Response Bytes | Accepted | `diag-frontend` Starlark lowering of `dtcs` (`len`, indexing, `code` and `status`), Starlark subset 3.4; ADR-233, ADR-314, ADR-316 |
-| [ADR-325](ADR-325-procedures-that-address-several-ecus.md) | Procedures That Address Several ECUs | Accepted | `diag-ir` targets and `SelectTarget`, `diag-frontend` `diag.ecu` and lowering per combination of variants, `agent` one link and document per target, access programs, keep-alive, policy access class, design 8.2.4, 8.2.5, 8.2.6, 8.10; ADR-229, ADR-235, ADR-245, ADR-247, ADR-257, ADR-264, ADR-280, ADR-307, ADR-311, ADR-316, ADR-318 |
+| [ADR-325](ADR-325-procedures-that-address-several-ecus.md) | Procedures That Address Several ECUs | Accepted | `diag-ir` targets and `SelectTarget`, `diag-frontend` `diag.ecu` and lowering per combination of variants, `agent` one link and document per target, access programs, keep-alive, policy access class, design 8.2.4, 8.2.5, 8.2.6, 8.10; ADR-229, ADR-235, ADR-245, ADR-247, ADR-257, ADR-263, ADR-264, ADR-280, ADR-307, ADR-311, ADR-316, ADR-318 |
 
 ## Status Legend
 
@@ -682,7 +682,7 @@ the predecessor repository these ADRs came from.
 - ADR-259
 - ADR-261 (the promotion consequence settled by ADR-263; item 2's ending with the gates' decision superseded by ADR-264; the creation-prefix rule extended to the intended software version by ADR-268; the unjournaled-abort consequence closed for the identity abort by ADR-286 and for the on-site endings by ADR-290)
 - ADR-262
-- ADR-263 (the step 3 fallback consequence settled by ADR-267)
+- ADR-263 (the step 3 fallback consequence settled by ADR-267; item 4's sends before a lock failure include the access programs since ADR-325 item 5)
 - ADR-264 (item 5's ending amended by ADR-265; item 5's `RestartOrderUnavailable` carrying the outcome superseded by ADR-276, which goes on with the erase; item 1's completed path counts only for the interrupted pass since ADR-269 item 2; item 4's passive teardown amended by ADR-325)
 - ADR-265
 - ADR-267

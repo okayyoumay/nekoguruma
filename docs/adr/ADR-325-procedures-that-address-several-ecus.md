@@ -6,8 +6,8 @@
 `diag-frontend` (procedure targets, `diag.ecu`, access programs, lowering per combination of
 variants), `agent` (`Job`, `check_job`, policy, one link per target, keep-alive, run and restart
 order), the workers' tester-present ComParams, `sim-ecu` (a gateway role), design 8.2.4, 8.2.5,
-8.2.6, 5.6, 8.10, 8.10.1; ADR-229 item 2, ADR-235 item 8, ADR-245, ADR-247 item 1, ADR-257, ADR-264
-item 4, ADR-280, ADR-307 items 1 and 5, ADR-311 item 1, ADR-316, ADR-318 items 1, 3 and 4
+8.2.6, 5.6, 8.10, 8.10.1; ADR-229 item 2, ADR-235 item 8, ADR-245, ADR-247 item 1, ADR-257, ADR-263 item 4,
+ADR-264 item 4, ADR-280, ADR-307 items 1 and 5, ADR-311 item 1, ADR-316, ADR-318 items 1, 3 and 4
 
 ## Context
 
@@ -95,7 +95,12 @@ shape survives inside the second as the access program of item 5.
    against the ECU's failed-attempt limit, as any security access does) and actuates nothing,
    and the sessions lapse with their timeout. When the VIN then differs, the agent stops the
    keep-alive, closes the links and lets those sessions lapse; on a first run the job ends in the
-   8.9.1 pre-check with nothing written, and on a restart as ADR-286 describes. The main program may still select the access target for anything else.
+   8.9.1 pre-check with nothing written, and on a restart as ADR-286 describes. When the VIN
+   matches and the per-vehicle lock must be waited for because another job holds it, the agent
+   stops every keep-alive before it waits and sends nothing while it waits, as ADR-263 requires;
+   once it holds the lock it runs the access programs again before anything else is sent. A lock
+   failure then leaves only the VIN read and the access programs sent (amending ADR-263 item 4),
+   and their sessions lapse. The main program may still select the access target for anything else.
 6. **Lowered once per combination of variants.** The main program is lowered for each
    combination of one variant per target, extending ADR-311's per-variant lowering, and must
    lower for every combination; the scoping of a procedure to some variants that ADR-311 item 2
@@ -113,7 +118,10 @@ shape survives inside the second as the access program of item 5.
    the combinations' documents (amending ADR-318 item 1). The agent identifies each target's
    variant as the primary's is identified (8.9.1, ADR-315), then picks the combination's
    document, whose program is the one that runs, and fetches only what that combination needs
-   (8.2.6's lazy fetching); a job prepared for offline work prefetches them all. A writing job
+   (8.2.6's lazy fetching); a job prepared for offline work prefetches them all. The
+   declaration-only documents of every candidate variant of every target are fetched before
+   identification, since identification evaluates each candidate's variant patterns through
+   that candidate's services (ADR-315); only the combination documents are fetched after it. A writing job
    journals the chosen combination document's hash when its journal is created, and a restart
    uses that document without identifying the variants again (amending ADR-318 item 4's journal
    that records no document; the caller still supplies the documents). `check_job` refuses a combination document
@@ -172,7 +180,9 @@ shape survives inside the second as the access program of item 5.
 13. **The reprogramming target's keep-alive stops at its flash plan.** When the reprogramming
     target is itself an access target (a gateway being reprogrammed), its keep-alive is watched
     only until its flash plan's entry and stops there, since the erase, the reset and the restart
-    of the ECU silence it; the plan's own steps handle that ECU from then on. The restart's
+    of the ECU silence it; the plan's own steps handle that ECU from then on. After the plan's
+    post-transfer end the agent runs that target's access program again, and keeps it alive
+    again, before any later instruction addresses another target. The restart's
     teardown (ADR-264) likewise stops the reprogramming target's keep-alive before the ECUReset or
     the passive wait, and keeps the other access targets alive.
 

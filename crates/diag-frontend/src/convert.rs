@@ -22,8 +22,8 @@ use std::fmt::Write as _;
 
 use diag_ir::IR_SCHEMA_VERSION;
 use diag_ir::declaration::{
-    ComParamT, EcuDocumentT, EcuVariant, EcuVariantT, ProtocolT, encode_ecu_document,
-    load_ecu_document,
+    ComParamT, EcuDocumentT, EcuVariant, EcuVariantT, NegativeShapeT, ProtocolT,
+    encode_ecu_document, load_ecu_document,
 };
 use sha2::{Digest, Sha256};
 
@@ -231,6 +231,17 @@ fn declarations(definition: &Definition) -> Vec<EcuDocumentT> {
                 protocol.functional_id = row.functional_id.into();
                 protocol.extended_addressing = row.extended_addressing;
                 protocol.params = Some(Vec::new());
+                // The layer names a shipped profile (4.3), whose shape and pending codes the
+                // agent reads answers with (ADR-309 item 4).
+                let profile = crate::profile::get(&row.application_layer)
+                    .expect("resolving checks that a profile ships for every protocol's layer");
+                protocol.application_layer = Some(row.application_layer.clone());
+                let mut shape = NegativeShapeT::default();
+                shape.marker = profile.negative.marker;
+                shape.echoes_sid = profile.negative.echoes_sid;
+                shape.code_at = profile.negative.code_at;
+                shape.pending = Some(profile.pending.to_vec());
+                protocol.negative_shape = Some(Box::new(shape));
                 protocol
             })
             .collect();

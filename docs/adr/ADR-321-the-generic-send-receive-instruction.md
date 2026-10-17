@@ -74,8 +74,8 @@ answers against the declarations.
 
 - Schema version 12. A runtime of version 11 cannot decode a program that uses
   `SendReceive`, and documents of version 11 carry no application layer.
-- The frontend writes neither field yet. It names a protocol's application layer and writes
-  the profile's negative-response shape into the declaration once the UDS profile ships.
+- The frontend writes both fields: each protocol's application layer (`csv-tables.md` 4.3),
+  and its profile's negative-response shape and pending codes.
 - The agent can serve the instruction only after its host matches answers against the
   declared positive response and the protocol's negative-response shape, stops building
   request bytes for DTC reads, and keys its read-only list by application layer (ADR-309

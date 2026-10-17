@@ -204,7 +204,7 @@ Each row compares `expected` with the value the field decodes to, not with the b
 | `rx_id` | integer, 0x000 to 0x7FF | yes | Physical response identifier |
 | `functional_id` | integer, 0x000 to 0x7FF | no | Default 0 (none) |
 | `extended_addressing` | boolean | no | Default `no` |
-| `application_layer` | text | no | The application layer the protocol carries, default `UDS` |
+| `application_layer` | text | no | `Protocol.application_layer`, the application layer the protocol carries, default `UDS`; its profile's negative-response shape and pending codes go into `Protocol.negative_shape` |
 
 The identifiers are 11-bit CAN identifiers. A 29-bit identifier also needs the ComParams that
 select the identifier format, which this version does not define, so a value above 0x7FF is

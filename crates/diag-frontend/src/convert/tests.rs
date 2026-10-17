@@ -766,6 +766,63 @@ fn an_empty_response_is_ok_and_a_short_negative_one_has_no_nrc() {
 }
 
 #[test]
+fn ok_and_nrc_follow_the_variant_s_declared_negative_shape() {
+    let files = with(example(), "main.star", READ_VIN);
+    let definition = resolve(read_files(files).expect("reads")).expect("resolves");
+    let converted = to_ir(&definition, &lower_procedures(&definition).expect("lowers"));
+    // Each protocol carries its application layer and that profile's shape (ADR-309 item 4).
+    let mut document = documents(&converted).remove(0);
+    let protocol = &mut document
+        .variant
+        .as_mut()
+        .and_then(|v| v.protocols.as_mut())
+        .expect("protocols")[0];
+    assert_eq!(protocol.application_layer.as_deref(), Some("UDS"));
+    let shape = protocol.negative_shape.as_mut().expect("a shape");
+    assert_eq!(
+        (
+            shape.marker,
+            shape.echoes_sid,
+            shape.code_at,
+            shape.pending.clone()
+        ),
+        (0x7F, true, 2, Some(vec![0x78]))
+    );
+    // Lowered against a variant that declares another shape, `ok` and `nrc` read that one.
+    // A marker followed directly by its code, with no echoed service identifier.
+    shape.marker = 0x7E;
+    shape.echoes_sid = false;
+    shape.code_at = 1;
+    let bytes = encode_ecu_document(&document);
+    let variant = load_ecu_document(&bytes)
+        .expect("the document loads")
+        .variant()
+        .expect("a variant");
+    let checked = crate::star::check("main.star", READ_VIN).expect("checks");
+    let requests = super::services::Index::new(&definition).request_index(0);
+    let program = crate::star::lower("main.star", &checked, variant, &requests)
+        .expect("lowers")
+        .program;
+    let run = |response: &[u8]| {
+        let mut vm = diag_ir::Vm::new(&program);
+        let mut host = Answering {
+            responses: [response.to_vec()].into(),
+            logged: Vec::new(),
+        };
+        loop {
+            match vm.step_with_declarations(&program, Some(&variant), &mut host) {
+                Ok(diag_ir::StepOutcome::Continue) => {}
+                Ok(diag_ir::StepOutcome::Finished) => return host.logged,
+                other => panic!("{other:?}"),
+            }
+        }
+    };
+    assert_eq!(run(&[0x7E, 0x31]), ["negative", "out of range"]);
+    // UDS's form is not negative under this shape.
+    assert_eq!(run(&[0x7F, 0x22, 0x31]), ["positive", "no nrc", "7F"]);
+}
+
+#[test]
 fn a_response_is_read_where_it_is_passed_and_each_call_sends_once() {
     let source = "\
 def nrc_of(res):

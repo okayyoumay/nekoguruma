@@ -103,15 +103,16 @@ shape survives inside the second as the access program of item 5.
    program, so that an inner gateway is reached through an unlocked outer one; then identify
    the other targets and pick the combination (item 7). A VIN that differs, at either
    read, ends a first run in the 8.9.1 pre-check with only reads sent, and a lock failure leaves
-   only those reads sent. A restart (8.2.5) reads the VIN in ADR-229's order (item 2 step 2) and,
-   once it holds the per-vehicle lock, runs the access programs in the same way before any other
-   step. Since its VIN now comes from an access target rather than from the ECU being
+   only those reads sent. A restart (8.2.5) identifies the first access target and reads the VIN
+   from it in ADR-229's order (item 2 step 2), since that target may have been reflashed after
+   the journal recorded its variant, and, once it holds the per-vehicle lock, identifies it
+   again after any wait and runs the access programs in the same way before any other step. Since its VIN now comes from an access target rather than from the ECU being
    reprogrammed, a step 2 VIN read that gets no answer or a negative response ends the restart
    in on-site intervention (`IdentityNotEstablished`, which a later resume may retry, ADR-290)
    instead of the passive teardown ADR-229 takes there, which would reach the reprogramming
    target's default-session confirmation without an unlocked gateway. A step of an access
-   program that fails ends the job as a lost access target would at that point (item 12). Every run also runs them again after any
-   reopening of the links (a worker crash or VCI disconnect that the job survives) before the
+   program that fails ends the job as a lost access target would at that point (item 12).
+   Every run also runs them again after any reopening of the links (a worker crash or VCI disconnect that the job survives) before the
    program continues. The main program may still select the access target for anything else.
 6. **Lowered once per combination of variants.** The main program is lowered for each
    combination of one variant per target, extending ADR-311's per-variant lowering, and must
@@ -128,8 +129,13 @@ shape survives inside the second as the access program of item 5.
    access target are known only after its access program has run, a job names, by content hash,
    its access programs, the declaration-only documents of every candidate variant of every
    target, and every combination's document (amending ADR-318 item 1), and the agent holds all
-   of them before anything is sent; the bound of item 6 keeps their number finite.
-   `check_job` validates all of them then: it refuses a combination document whose named hashes
+   of them before anything is sent; the bound of item 6 keeps their number finite. Each access
+   program names its access target and the hash of the declaration-only document of the
+   variant it was lowered for, and the agent runs the one whose variant it has just identified;
+   `check_job` refuses an access program whose named target is not an access target or whose
+   hash names no document the job holds, and a job that lacks one for any candidate variant of
+   an access target.
+   `check_job` validates all of them then: it also refuses a combination document whose named hashes
    do not match the documents the job holds, checks each combination's decodes against its
    targets' declarations, refuses flash plans on more than one target, and refuses an access
    program with any service item 5 does not allow. The agent identifies each target's variant as

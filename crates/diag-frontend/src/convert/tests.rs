@@ -1022,6 +1022,19 @@ fn a_dtc_read_needs_one_service_that_fits_the_profile() {
     assert_eq!(found.len(), 1, "{found:?}");
     assert_eq!(found[0].0, crate::star::StarCode::NotInProfile);
     assert!(found[0].1.contains("records"), "{found:?}");
+    // A records field off a byte edge is rejected with the tables already (csv-tables 5.4).
+    let unaligned = fields.replace(
+        "response:readDtcByStatusMask,records,2,,",
+        "response:readDtcByStatusMask,records,2,1,",
+    );
+    assert_ne!(unaligned, fields);
+    let tables = crate::tables::read_files(with(example(), "fields.csv", &unaligned))
+        .and_then(crate::tables::resolve);
+    let errors = tables.expect_err("rejected by the tables").errors;
+    assert!(
+        errors.iter().any(|e| e.hint.contains("byte edge")),
+        "{errors:?}"
+    );
     // Records placed one after the other have the same layout, but padded ones do not.
     let sequential = fields
         .replace("layout:dtcRecord,dtc,0,,", "layout:dtcRecord,dtc,,,")

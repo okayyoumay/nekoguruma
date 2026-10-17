@@ -258,6 +258,20 @@ Ok(
         },
     ],
 )
+checkProgrammingDependencies.start [71 01 FF 01 00]
+Ok(
+    [
+        DecodedField {
+            id: 29,
+            short_name: "result",
+            value: Unsigned(
+                0,
+            ),
+            text_id: 4,
+            unit_id: 0,
+        },
+    ],
+)
 vin.write [6E F1 90]
 Ok(
     [],

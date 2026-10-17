@@ -10,5 +10,6 @@
 * lastResetReason.read 62 FD 03 01
 * lastResetReason.read 62 FD 03 02 07 00 01 23 45
 * readDtcByStatusMask 59 02 FF 01 23 45 09 C0 FF EE 28
+* checkProgrammingDependencies.start 71 01 FF 01 00
 * vin.write 6E F1 90
 exampleEcuV2 supplyVoltage.read 62 FD 02 00 89

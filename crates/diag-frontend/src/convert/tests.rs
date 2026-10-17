@@ -647,6 +647,8 @@ struct Answering {
     logged: Vec<String>,
     /// Each generic send-receive's service and request.
     sent: Vec<(u32, Vec<u8>)>,
+    /// Each `RoutineControl`'s routine identifier, sub-function and operand.
+    routines: Vec<(u16, u8, Vec<u8>)>,
 }
 
 impl diag_ir::DiagHost for Answering {
@@ -662,8 +664,14 @@ impl diag_ir::DiagHost for Answering {
     fn read_dtc(&mut self, _: u8) -> Result<Vec<u8>, NotSent> {
         Err(NotSent)
     }
-    fn routine_control(&mut self, _: u16, _: u8, _: &[u8]) -> Result<Vec<u8>, NotSent> {
-        Err(NotSent)
+    fn routine_control(
+        &mut self,
+        routine: u16,
+        sub: u8,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, NotSent> {
+        self.routines.push((routine, sub, payload.to_vec()));
+        self.responses.pop_front().ok_or(NotSent)
     }
     fn security_access(&mut self, _: u64, _: u8, _: &[u8]) -> Result<Option<Vec<u8>>, NotSent> {
         Err(NotSent)
@@ -719,6 +727,7 @@ fn run_answered(
         responses: responses.iter().map(|r| r.to_vec()).collect(),
         logged: Vec::new(),
         sent: Vec::new(),
+        routines: Vec::new(),
     };
     loop {
         match vm.step_with_declarations(&program, document.variant().as_ref(), &mut host) {
@@ -823,6 +832,7 @@ fn ok_and_nrc_follow_the_variant_s_declared_negative_shape() {
             responses: [response.to_vec()].into(),
             logged: Vec::new(),
             sent: Vec::new(),
+            routines: Vec::new(),
         };
         loop {
             match vm.step_with_declarations(&program, Some(&variant), &mut host) {
@@ -1117,6 +1127,215 @@ fn a_dtc_read_needs_one_service_that_fits_the_profile() {
     assert_eq!(found.len(), 1, "{found:?}");
     assert_eq!(found[0].0, crate::star::StarCode::NotInProfile);
     assert!(found[0].1.contains("availabilityMask"), "{found:?}");
+}
+
+// ---------------------------------------------------------------- `diag.routine` (ADR-309, ADR-314)
+
+const CHECK_DEPENDENCIES: &str = "\
+def main():
+    res = diag.routine(0xFF01, 0x01, {})
+    if res[\"ok\"] and res[\"fields\"][\"result\"] == 0:
+        diag.log(1, \"correct\")
+    if res[\"nrc\"] == 0x22:
+        diag.log(1, \"conditions not correct\")
+";
+
+#[test]
+fn a_routine_sends_routine_control_with_the_rest_of_its_request() {
+    // The routine has no request fields: the operand after the sub-function and the identifier,
+    // which the instruction sends itself, is empty.
+    let host = run_answered(
+        example(),
+        CHECK_DEPENDENCIES,
+        &[&[0x71, 0x01, 0xFF, 0x01, 0x00]],
+    )
+    .unwrap();
+    assert_eq!(host.logged, ["correct"]);
+    assert_eq!(host.routines, [(0xFF01, 0x01, vec![])]);
+    // A negative answer reads through the declared shape.
+    assert_eq!(
+        answered(CHECK_DEPENDENCIES, &[&[0x7F, 0x31, 0x22]]).unwrap(),
+        ["conditions not correct"]
+    );
+    // A request field follows the identifier, and `params` names it.
+    let fields = example()
+        .into_iter()
+        .find(|(n, _)| n == "fields.csv")
+        .map(|(_, c)| String::from_utf8(c).expect("UTF-8"))
+        .expect("fields.csv");
+    let fields = format!(
+        "{}\nroutine:checkProgrammingDependencies:start:request,level,0,,uint,8,,,,,,,,,\n",
+        fields.trim_end()
+    );
+    let source = "def main():\n    diag.routine(0xFF01, 0x01, {\"level\": 3})\n";
+    let host = run_answered(
+        with(example(), "fields.csv", &fields),
+        source,
+        &[&[0x71, 0x01, 0xFF, 0x01, 0x00]],
+    )
+    .unwrap();
+    assert_eq!(host.routines, [(0xFF01, 0x01, vec![3])]);
+}
+
+#[test]
+fn a_routine_s_own_constants_select_it_and_lead_its_operand() {
+    let fields = format!(
+        "{}\nroutine:checkProgrammingDependencies:start:request,mode,0,,uint,8,,,,,,0x05,,,\n",
+        example()
+            .into_iter()
+            .find(|(n, _)| n == "fields.csv")
+            .map(|(_, c)| String::from_utf8(c).expect("UTF-8"))
+            .expect("fields.csv")
+            .trim_end()
+    );
+    let files = || with(example(), "fields.csv", &fields);
+    // The constant follows the three bytes the instruction sends itself.
+    let host = run_answered(
+        files(),
+        "def main():\n    diag.routine(0xFF01, 1, {\"mode\": 5})\n",
+        &[&[0x71, 0x01, 0xFF, 0x01, 0x00]],
+    )
+    .unwrap();
+    assert_eq!(host.routines, [(0xFF01, 0x01, vec![5])]);
+    // Another value, or none, selects nothing.
+    for params in ["{\"mode\": 6}", "{}"] {
+        let source = format!("def main():\n    diag.routine(0xFF01, 1, {params})\n");
+        let errors = procedures(with(files(), "main.star", &source))
+            .expect_err("rejected")
+            .errors;
+        assert_eq!(
+            errors.iter().map(|e| e.code).collect::<Vec<_>>(),
+            [crate::star::StarCode::UnknownService],
+            "{params}"
+        );
+    }
+}
+
+#[test]
+fn a_routine_is_checked_at_ingestion() {
+    let codes = |source: &str| -> Vec<crate::star::StarCode> {
+        procedures(with(example(), "main.star", source))
+            .err()
+            .map_or_else(Vec::new, |rejected| {
+                rejected.errors.iter().map(|e| e.code).collect()
+            })
+    };
+    use crate::star::StarCode::*;
+    // The identifier and sub-function select the service, so they are constants in range.
+    assert_eq!(
+        codes("def f(r):\n    diag.routine(r, 1, {})\n\ndef main():\n    f(0xFF01)\n"),
+        [NonConstantArgument]
+    );
+    assert_eq!(
+        codes("def main():\n    diag.routine(0x10000, 1, {})\n"),
+        [ArgumentOutOfRange]
+    );
+    // An identifier no routine has, a sub-function the routine lacks (stop), and a param the
+    // service does not take select nothing.
+    assert_eq!(
+        codes("def main():\n    diag.routine(0xFF02, 1, {})\n"),
+        [UnknownService]
+    );
+    assert_eq!(
+        codes("def main():\n    diag.routine(0xFF01, 2, {})\n"),
+        [UnknownService]
+    );
+    assert_eq!(
+        codes("def main():\n    diag.routine(0xFF01, 1, {\"level\": 3})\n"),
+        [UnknownService]
+    );
+    // A routine's own constant selects the service too, so a run-time value for it is refused
+    // as such.
+    let fields = example()
+        .into_iter()
+        .find(|(n, _)| n == "fields.csv")
+        .map(|(_, c)| String::from_utf8(c).expect("UTF-8"))
+        .expect("fields.csv");
+    let fields = format!(
+        "{}\nroutine:checkProgrammingDependencies:start:request,mode,0,,uint,8,,,,,,0x01,,,\n",
+        fields.trim_end()
+    );
+    let source = "def f(m):\n    diag.routine(0xFF01, 1, {\"mode\": m})\n\ndef main():\n    f(1)\n";
+    let found: Vec<_> = procedures(with(
+        with(example(), "fields.csv", &fields),
+        "main.star",
+        source,
+    ))
+    .expect_err("rejected")
+    .errors
+    .into_iter()
+    .map(|e| (e.code, e.hint))
+    .collect();
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].0, NonConstantArgument);
+    assert!(found[0].1.contains("`diag.routine`"), "{found:?}");
+    // A run-time value for one of its fields is not encoded at ingestion.
+    let fields_with_level = format!(
+        "{}\nroutine:checkProgrammingDependencies:start:request,level,0,,uint,8,,,,,,,,,\n",
+        example()
+            .into_iter()
+            .find(|(n, _)| n == "fields.csv")
+            .map(|(_, c)| String::from_utf8(c).expect("UTF-8"))
+            .expect("fields.csv")
+            .trim_end()
+    );
+    let level = |source: &str| -> Vec<(crate::star::StarCode, String)> {
+        procedures(with(
+            with(example(), "fields.csv", &fields_with_level),
+            "main.star",
+            source,
+        ))
+        .err()
+        .map_or_else(Vec::new, |rejected| {
+            rejected
+                .errors
+                .into_iter()
+                .map(|e| (e.code, e.hint))
+                .collect()
+        })
+    };
+    let found =
+        level("def f(l):\n    diag.routine(0xFF01, 1, {\"level\": l})\n\ndef main():\n    f(3)\n");
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].0, NotLowerable);
+    assert!(found[0].1.contains("`diag.routine`"), "{found:?}");
+    // Another routine's constant of the same name is not this routine's: the run-time value is
+    // still a field's, not a selecting constant's.
+    let other = format!(
+        "{}routine:eraseMemory:start:request,level,0,,uint,8,,,,,,0x01,,,\n",
+        fields_with_level
+    );
+    let found: Vec<_> = procedures(with(
+        with(example(), "fields.csv", &other),
+        "main.star",
+        "def f(l):\n    diag.routine(0xFF01, 1, {\"level\": l})\n\ndef main():\n    f(3)\n",
+    ))
+    .expect_err("rejected")
+    .errors
+    .into_iter()
+    .map(|e| e.code)
+    .collect();
+    assert_eq!(found, [NotLowerable]);
+    // A value the field cannot hold, and a sub-function out of range.
+    let found = level("def main():\n    diag.routine(0xFF01, 1, {\"level\": 256})\n");
+    assert_eq!(
+        found.iter().map(|f| f.0).collect::<Vec<_>>(),
+        [ArgumentOutOfRange]
+    );
+    assert_eq!(
+        codes("def main():\n    diag.routine(0xFF01, 0x100, {})\n"),
+        [ArgumentOutOfRange]
+    );
+    // The result has the response's declared names (ADR-314 item 4).
+    assert_eq!(
+        codes("def main():\n    x = diag.routine(0xFF01, 1, {})[\"fields\"][\"other\"]\n"),
+        [UnsupportedSyntax]
+    );
+    // `diag.request` never selects a routine service.
+    assert_eq!(
+        codes("def main():\n    diag.request(0x31, {})\n"),
+        [UnknownService]
+    );
 }
 
 #[test]

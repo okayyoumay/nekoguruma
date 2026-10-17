@@ -2,7 +2,7 @@ use diag_ir::declaration::{EcuDocumentT, EcuVariantT, encode_ecu_document, load_
 use diag_ir::{DiagHost, StepOutcome, Vm, WaitingOn};
 
 use super::*;
-use crate::profile::Profile;
+use crate::profile::{Intent, Profile};
 use crate::star::check;
 
 /// A host for procedures that call no primitive: every call is a test failure.
@@ -930,13 +930,50 @@ fn a_protocol_neutral_call_needs_its_profile_to_define_it() {
             (StarCode::NotInProfile, 4)
         ]
     );
-    // UDS defines all three. `diag.read_dtc` is lowered, and needs a declared DTC service,
-    // which this variant lacks; the others are not lowered yet.
+    // A layer other than UDS sends a routine with the generic send-receive, which only UDS's
+    // `RoutineControl` lowering covers yet (ADR-309 item 4).
+    static SEND_RECEIVE_ROUTINE: Profile = Profile {
+        layer: "TEST",
+        calls: &[crate::profile::Call {
+            intent: Intent::Routine,
+            steps: &[crate::profile::Step {
+                kind: crate::profile::StepKind::SendReceive,
+                request: crate::profile::Request {
+                    sid: 0x31,
+                    parts: &[
+                        crate::profile::Part::Select {
+                            bits: 8,
+                            arg: crate::profile::Source::Sub,
+                        },
+                        crate::profile::Part::Select {
+                            bits: 16,
+                            arg: crate::profile::Source::Rid,
+                        },
+                        crate::profile::Part::Params,
+                    ],
+                },
+                declared: true,
+                result: crate::profile::ResultMap::Declared,
+            }],
+        }],
+        negative: crate::profile::NEGATIVE_7F,
+        pending: &[0x78],
+    };
+    assert_eq!(SEND_RECEIVE_ROUTINE.validate(), Ok(()));
+    assert_eq!(
+        codes_over(
+            &SEND_RECEIVE_ROUTINE,
+            "def main():\n    diag.routine(0x0203, 1, {})\n"
+        ),
+        [(StarCode::NotLowerable, 2)]
+    );
+    // UDS defines all three. `diag.read_dtc` and `diag.routine` are lowered, and need a
+    // declared service, which this variant lacks; `diag.security_access` is not lowered yet.
     assert_eq!(
         codes_over(&crate::profile::UDS_PROFILE, source),
         [
             (StarCode::UnknownService, 2),
-            (StarCode::NotLowerable, 3),
+            (StarCode::UnknownService, 3),
             (StarCode::NotLowerable, 4)
         ]
     );

@@ -9,7 +9,7 @@
 //! express for its operands is `STAR_NOT_LOWERABLE`.
 //!
 //! Not lowered yet, each its own backlog item: the other `diag` functions (`hmi` and `record`;
-//! `routine` and `security_access`; `flash_transfer`), reading `dtcs` of `diag.read_dtc`, built-ins and
+//! `security_access`; `flash_transfer`), reading `dtcs` of `diag.read_dtc`, built-ins and
 //! string methods on values known only at run time, and section and idempotency annotations.
 //! Each is rejected with `STAR_NOT_LOWERABLE` (or `STAR_API_NOT_AVAILABLE` for a `diag`
 //! function without an instruction), so nothing is lowered silently wrong.
@@ -28,7 +28,7 @@ use starlark_syntax::syntax::ast::{
 };
 use starlark_syntax::syntax::uniplate::Visit;
 
-use crate::profile::{Intent, Part, ResultMap, Source};
+use crate::profile::{Intent, Part, ResultMap, Source, StepKind};
 
 use super::{
     Annotation, BUILTINS, Checked, Pending, RequestConstant, RequestIndex, STRING_METHODS,
@@ -3040,6 +3040,9 @@ impl<'a> Lowerer<'a> {
             "read_dtc" if self.requests.profile.call(Intent::ReadDtc).is_some() => {
                 self.diag_read_dtc(id, args, span)
             }
+            "routine" if self.requests.profile.call(Intent::Routine).is_some() => {
+                self.diag_routine(id, args, span)
+            }
             "read_dtc" | "routine" | "security_access" => {
                 let intent = match name {
                     "read_dtc" => Intent::ReadDtc,
@@ -3108,7 +3111,7 @@ impl<'a> Lowerer<'a> {
                 }
                 !transfer
             });
-        let params = match self.request_params(id, sid, params_arg) {
+        let params = match self.request_params(id, "request", sid, None, params_arg) {
             None => None,
             Some(Val::Const(Const::Dict(entries, _))) => Some(entries),
             Some(Val::Const(other)) => {
@@ -3207,17 +3210,23 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    /// The `params` of `diag.request(sid, ...)` as a value. A dict literal is built here, so
-    /// that a value known only at run time is reported for what it is: under a key some service
-    /// with the SID holds as a constant it is needed to select the service (csv-tables 5.3);
-    /// under another key it is a field's value, which only a run-time encoding could send.
-    /// `None` once the dict literal's errors are reported.
+    /// The `params` of `diag.{function}(sid, ...)` as a value, `function` being `request` or
+    /// `routine`. For `routine`, `selected` is the sub-function and identifier the call names, if
+    /// both are known, and only the generated routine services whose request starts with them
+    /// count. A dict literal is built here, so that a value known only at run time is reported
+    /// for what it is: under a key some such service with the SID holds as a constant it is
+    /// needed to select the service (csv-tables 5.3); under another key it is a field's value,
+    /// which only a run-time encoding could send. `None` once the dict literal's errors are
+    /// reported.
     fn request_params(
         &mut self,
         id: Option<usize>,
+        function: &str,
         sid: Option<i64>,
+        selected: Option<&[u8]>,
         arg: &AstExpr,
     ) -> Option<Val> {
+        let routine = function == "routine";
         let ExprP::Dict(pairs) = &arg.node else {
             return Some(self.expr(id, arg));
         };
@@ -3247,7 +3256,11 @@ impl<'a> Lowerer<'a> {
                     complete = false;
                     let constant = self.requests.services.iter().any(|service| {
                         Some(i64::from(service.sid)) == sid
-                            && !service.routine
+                            && service.routine == routine
+                            && selected.is_none_or(|selected| {
+                                self.request_prefix(service.service_id)
+                                    .is_some_and(|prefix| prefix.starts_with(selected))
+                            })
                             && service.constants.iter().any(|(name, _)| **name == *key)
                     });
                     if constant {
@@ -3255,16 +3268,16 @@ impl<'a> Lowerer<'a> {
                             StarCode::NonConstantArgument,
                             value.span,
                             format!(
-                                "the `{key}` param of `diag.request` selects the service, so \
-                                 it must be known at ingestion (3.4)"
+                                "the `{key}` param of `diag.{function}` selects the service, \
+                                 so it must be known at ingestion (3.4)"
                             ),
                         );
                     } else {
                         self.not_lowerable(
                             value.span,
                             format!(
-                                "the `{key}` param of `diag.request` is known only at run time; \
-                                 a request is encoded at ingestion for now (3.2)"
+                                "the `{key}` param of `diag.{function}` is known only at run \
+                                 time; a request is encoded at ingestion for now (3.2)"
                             ),
                         );
                     }
@@ -3279,6 +3292,248 @@ impl<'a> Lowerer<'a> {
             value @ Val::Const(Const::Dict(..)) => Some(value),
             _ => None,
         }
+    }
+
+    /// `diag.routine(routine_id, sub, params)` through the variant's profile (ADR-309 items 2 to
+    /// 4, ADR-314): on UDS the profile's one `RoutineControl` step, which recovery relies on
+    /// (ADR-309 item 6). The template's sub-function and routine identifier select the variant's
+    /// generated routine service, whose request prefix starts with them; `params` then gives the
+    /// service's own constants and fields by name, as for `diag.request` (csv-tables 5.3). The
+    /// instruction sends the sub-function and identifier itself, so its operand is the rest of
+    /// the request. The result reads the declared names of the response (ADR-314 item 4).
+    fn diag_routine(&mut self, id: Option<usize>, args: &[&AstExpr], span: Span) -> Val {
+        let [rid_arg, sub_arg, params_arg] = args else {
+            self.error(
+                StarCode::UnsupportedSyntax,
+                span,
+                "`diag.routine` takes a routine identifier, a sub-function and params (3.1)",
+            );
+            return Val::Run(Tys::of(Ty::Response), Vec::new());
+        };
+        let rid = self.constant_int(id, rid_arg, "routine", "routine_id", 0..=0xFFFF);
+        let sub = self.constant_int(id, sub_arg, "routine", "sub", 0..=0xFF);
+        // In range by the checks above.
+        let selected = rid
+            .zip(sub)
+            .map(|(rid, sub)| [&[sub as u8][..], &(rid as u16).to_be_bytes()].concat());
+        let params =
+            match self.request_params(id, "routine", Some(0x31), selected.as_deref(), params_arg) {
+                None => None,
+                Some(Val::Const(Const::Dict(entries, _))) => Some(entries),
+                Some(Val::Const(other)) => {
+                    self.error(
+                        StarCode::UnsupportedSyntax,
+                        params_arg.span,
+                        format!(
+                            "`params` of `diag.routine` is a dict, not a {} (3.1)",
+                            other.type_name()
+                        ),
+                    );
+                    None
+                }
+                Some(_) => {
+                    self.error(
+                        StarCode::NonConstantArgument,
+                        params_arg.span,
+                        "`params` of `diag.routine` must be a dict known at ingestion (3.1)",
+                    );
+                    None
+                }
+            };
+        let profile = self.requests.profile;
+        let call = profile.call(Intent::Routine).expect("the caller checked");
+        let [step] = call.steps else {
+            self.not_lowerable(
+                span,
+                format!(
+                    "the {} profile's `diag.routine` takes several steps, which are not lowered \
+                     yet (3.2)",
+                    profile.layer
+                ),
+            );
+            return Val::Run(Tys::of(Ty::Response), Vec::new());
+        };
+        if step.kind != StepKind::RoutineControl {
+            self.not_lowerable(
+                span,
+                format!(
+                    "the {} profile sends `diag.routine` with the generic send-receive, which is \
+                     not lowered yet (3.2)",
+                    profile.layer
+                ),
+            );
+            return Val::Run(Tys::of(Ty::Response), Vec::new());
+        }
+        // The selection below builds exactly this template's prefix: the sub-function, then the
+        // 16-bit identifier, then `params`.
+        let expected = [
+            Part::Select {
+                bits: 8,
+                arg: Source::Sub,
+            },
+            Part::Select {
+                bits: 16,
+                arg: Source::Rid,
+            },
+            Part::Params,
+        ];
+        if step.request.parts != expected {
+            self.not_lowerable(
+                span,
+                format!(
+                    "the {} profile's `diag.routine` request is not the sub-function, the 16-bit \
+                     routine identifier and `params`, the only one lowered yet (3.2)",
+                    profile.layer
+                ),
+            );
+            return Val::Run(Tys::of(Ty::Response), Vec::new());
+        }
+        let (Some(rid), Some(sub), Some(params)) = (rid, sub, params) else {
+            return Val::Run(Tys::of(Ty::Response), Vec::new());
+        };
+        // In range by the checks above.
+        let (rid, sub) = (rid as u16, sub as u8);
+        let selected: Vec<u8> = [&[sub][..], &rid.to_be_bytes()].concat();
+        let Some((service, request, constants)) = self.select_routine(&selected, &params) else {
+            let mut keys: Vec<&str> = params.iter().map(|(key, _)| &**key).collect();
+            keys.sort_unstable();
+            self.error(
+                StarCode::UnknownService,
+                span,
+                format!(
+                    "no single routine service of this variant has routine identifier \
+                     0x{rid:04X}, sub-function 0x{sub:02X}, takes the params {} and has the \
+                     constants they give (csv-tables 5.3)",
+                    if keys.is_empty() {
+                        "{}".to_owned()
+                    } else {
+                        keys.join(", ")
+                    }
+                ),
+            );
+            return Val::Run(Tys::of(Ty::Response), Vec::new());
+        };
+        let mut values = HashMap::new();
+        for (key, value) in params.iter() {
+            if constants.contains(&**key) {
+                continue;
+            }
+            let value = match value {
+                Const::Int(n) => ParamValue::Int(*n),
+                Const::Float(x) => ParamValue::Float(*x),
+                Const::Bytes(bytes) => ParamValue::Bytes(bytes),
+                Const::Str(text) => ParamValue::Text(text),
+                other => {
+                    self.error(
+                        StarCode::UnsupportedSyntax,
+                        params_arg.span,
+                        format!(
+                            "the `{key}` param of `diag.routine` is an int, float, bytes or str, \
+                             not a {} (3.1)",
+                            other.type_name()
+                        ),
+                    );
+                    return Val::Run(Tys::of(Ty::Response), Vec::new());
+                }
+            };
+            values.insert(&**key, value);
+        }
+        match encode_request(&request, &values) {
+            // The instruction sends the sub-function and the identifier before its operand.
+            Ok(operand) if operand.starts_with(&selected) => {
+                let operand = self.pool(&operand[selected.len()..]);
+                Val::Run(
+                    Tys::from_service(Ty::Response, service),
+                    vec![
+                        (Ins::Op(Op::PushBytes(operand)), span),
+                        (Ins::Op(Op::RoutineControl { routine: rid, sub }), span),
+                    ],
+                )
+            }
+            Ok(_) => unreachable!("the selected request's prefix starts with them"),
+            Err(e) => {
+                self.error(
+                    StarCode::ArgumentOutOfRange,
+                    params_arg.span,
+                    format!("the request of `diag.routine` cannot be encoded: {e} (3.1)"),
+                );
+                Val::Run(Tys::of(Ty::Response), Vec::new())
+            }
+        }
+    }
+
+    /// The declared request prefix of the service `service` (a `Service.id`).
+    fn request_prefix(&self, service: u32) -> Option<&'a [u8]> {
+        let at = *self.service_at.get(&service)?;
+        let request = self.variant.services()?.get(at).request()?;
+        Some(request.prefix().map(|p| p.bytes()).unwrap_or_default())
+    }
+
+    /// The one routine service of this variant whose request prefix starts with `selected` (the
+    /// sub-function and routine identifier) and whose other constants and fields `params` names
+    /// exactly, as `diag.request` selects (csv-tables 5.3), with the names of those constants.
+    fn select_routine(
+        &self,
+        selected: &[u8],
+        params: &[(Rc<str>, Const)],
+    ) -> Option<(u32, Request<'a>, HashSet<&'a str>)> {
+        let services = self.variant.services()?;
+        let mut found = None;
+        for indexed in &self.requests.services {
+            if !indexed.routine {
+                continue;
+            }
+            let Some(request) = self
+                .service_at
+                .get(&indexed.service_id)
+                .and_then(|&at| services.get(at).request())
+            else {
+                continue;
+            };
+            let prefix = request.prefix().map(|p| p.bytes()).unwrap_or_default();
+            if request.sid() != 0x31 || !prefix.starts_with(selected) {
+                continue;
+            }
+            let constants_match = indexed.constants.iter().all(|(name, constant)| {
+                params
+                    .iter()
+                    .find(|(key, _)| **key == **name)
+                    .is_some_and(|(_, value)| match (constant, value) {
+                        (RequestConstant::Uint(c), Const::Int(n)) => {
+                            u64::try_from(*n).is_ok_and(|n| n == *c)
+                        }
+                        (RequestConstant::Bytes(c), Const::Bytes(b)) => **c == **b,
+                        _ => false,
+                    })
+            });
+            if !constants_match {
+                continue;
+            }
+            let constants: HashSet<&'a str> = indexed
+                .constants
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect();
+            let fields: HashSet<&str> = request
+                .params()
+                .into_iter()
+                .flatten()
+                .map(|field| field.short_name().unwrap_or_default())
+                .collect();
+            let rest: HashSet<&str> = params
+                .iter()
+                .map(|(key, _)| &**key)
+                .filter(|key| !constants.contains(key))
+                .collect();
+            if rest != fields {
+                continue;
+            }
+            if found.is_some() {
+                return None;
+            }
+            found = Some((indexed.service_id, request, constants));
+        }
+        found
     }
 
     /// `diag.read_dtc(mask)` through the variant's profile (ADR-309 items 2 to 4, ADR-314):

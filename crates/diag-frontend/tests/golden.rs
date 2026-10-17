@@ -73,7 +73,8 @@ fn check(name: &str, actual: &str) {
 /// A host that records each request and answers with the first response in `responses.txt`
 /// that starts with the positive response SID and the request's first two bytes, or with just
 /// those bytes, enough for the program to go on. A generic send-receive's request starts with
-/// its SID, so it is matched on the positive response SID and the one byte after the SID.
+/// its SID, so it is matched on the positive response SID and the one byte after the SID; a
+/// `RoutineControl` on the positive response SID, its sub-function and its routine identifier.
 struct Recording {
     out: String,
     answers: Vec<Vec<u8>>,
@@ -125,8 +126,26 @@ impl DiagHost for Recording {
     fn read_dtc(&mut self, _: u8) -> Result<Vec<u8>, NotSent> {
         Err(NotSent)
     }
-    fn routine_control(&mut self, _: u16, _: u8, _: &[u8]) -> Result<Vec<u8>, NotSent> {
-        Err(NotSent)
+    fn routine_control(
+        &mut self,
+        routine: u16,
+        sub: u8,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, NotSent> {
+        let payload = if payload.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", hex(payload))
+        };
+        writeln!(self.out, "routine {routine:04X} {sub:02X}{payload}").expect("a String");
+        let mut response = vec![0x71, sub];
+        response.extend(routine.to_be_bytes());
+        Ok(self
+            .answers
+            .iter()
+            .find(|answer| answer.starts_with(&response))
+            .cloned()
+            .unwrap_or(response))
     }
     fn security_access(&mut self, _: u64, _: u8, _: &[u8]) -> Result<Option<Vec<u8>>, NotSent> {
         Err(NotSent)

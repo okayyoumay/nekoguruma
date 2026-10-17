@@ -1211,12 +1211,14 @@ name = "iso22900-service"
 version = "0.1.0"
 dependencies = [
  "agent",
+ "diag-frontend",
  "diag-ir",
  "iso22900",
  "iso22900-mock",
  "iso22900-registry",
  "iso22900-sys",
  "ngr-library-resolver",
+ "postcard",
  "serde_json",
  "serial_test",
  "tempfile",

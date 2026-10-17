@@ -7,7 +7,7 @@
 variants), `agent` (`Job`, `check_job`, policy, one link per target, keep-alive, run and restart
 order), the workers' tester-present ComParams, `sim-ecu` (a gateway role), design 8.2.4, 8.2.5,
 8.2.6, 5.6, 8.10, 8.10.1; ADR-229 item 2, ADR-235 item 8, ADR-245, ADR-247 item 1, ADR-257,
-ADR-264 item 4, ADR-280, ADR-307 items 1 and 5, ADR-311 item 1, ADR-316, ADR-318 items 1, 3 and 4
+ADR-264 item 4, ADR-280, ADR-293, ADR-307 items 1 and 5, ADR-311 item 1, ADR-316, ADR-318 items 1, 3 and 4
 
 ## Context
 
@@ -136,7 +136,10 @@ shape survives inside the second as the access program of item 5.
    hash names no document the job holds, and a job that lacks one for any candidate variant of
    an access target.
    `check_job` validates all of them then: it also refuses a combination document whose named hashes
-   do not match the documents the job holds, checks each combination's decodes against its
+   do not match the documents the job holds, and a set of combination documents that lacks one,
+   or holds more than one, for any tuple of one candidate variant per target the procedure
+   permits, so the variants identified always pick exactly one program; it checks each
+   combination's decodes against its
    targets' declarations, refuses flash plans on more than one target, and refuses an access
    program with any service item 5 does not allow. The agent identifies each target's variant as
    the primary's is identified (8.9.1, ADR-315), through those declaration-only documents, and

@@ -3499,7 +3499,7 @@ impl<'a> Lowerer<'a> {
         true
     }
 
-    /// Whether `records` repeats, until the end of the message, a layout of exactly a
+    /// Whether `records` repeats, until the end of the message, an unpadded layout of exactly a
     /// `code_bits`-bit code and then a `status_bits`-bit status, each a `uint` without a
     /// conversion: the records the profile's `dtcs` reads (ADR-314 item 4).
     fn is_dtc_records(
@@ -3523,14 +3523,24 @@ impl<'a> Lowerer<'a> {
             .into_iter()
             .flatten()
             .collect();
+        // A field starts at `offset` bits into the record: placed there, or right after the
+        // previous field (whole bytes here, so the bit position is 0).
         let at = |field: &diag_ir::declaration::Field<'_>, bits: u8, offset: u32| {
+            use diag_ir::declaration::Placement;
             is_fixed_uint(field, bits)
                 && field.compu_type() == diag_ir::declaration::Compu::CompuIdentity
-                && field.placement() == diag_ir::declaration::Placement::Absolute
-                && field.bit_offset() == offset
+                && match field.placement() {
+                    Placement::Absolute => field.bit_offset() == offset,
+                    Placement::AfterPrevious => field.bit_offset() == 0,
+                    _ => false,
+                }
         };
-        matches!(&fields[..], [code, status]
-            if at(code, code_bits, 0) && at(status, status_bits, u32::from(code_bits)))
+        // Each record is the layout's size apart, so it may not be padded (0 is its extent).
+        let size = u32::from(code_bits) / 8 + u32::from(status_bits) / 8;
+        let unpadded = layout.is_some_and(|l| l.byte_size() == 0 || l.byte_size() == size);
+        unpadded
+            && matches!(&fields[..], [code, status]
+                if at(code, code_bits, 0) && at(status, status_bits, u32::from(code_bits)))
     }
 
     /// The position among the declared response's top-level fields of `key`, a name the

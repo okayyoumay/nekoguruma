@@ -220,6 +220,10 @@ first protocol is rejected (`CSV_DUPLICATE`). An ECU reachable over two applicat
 declared as two variants.
 
 `comparams.csv`, one `ComParam` per row, appended to the named protocol's `params` in row order.
+The agent sets them on the job's link as written (ADR-324). It reads `CP_P2Max`, `CP_P2Star`
+and `CP_RC78CompletionTimeout` as the link's timings, in microseconds as ISO 22900-2 defines
+them, and refuses a ComParam the link sets from the protocol row itself (such as `CP_Baudrate`
+or the CAN identifiers).
 
 | Column | Type | Required | Meaning |
 |---|---|---|---|

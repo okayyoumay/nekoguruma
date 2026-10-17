@@ -19,10 +19,25 @@ ngr-agent run --vci <name> --mode <device|user> (--program <file> | --document <
 | `--document` | A variant's document (design 8.2.6, `.dir`): its procedure is the program, and the job decodes response fields through its variant's declarations (`agent::JobDocument`). The document is checked as `diag_ir::declaration::load_ecu_document` checks it (ADR-296), and one without a procedure, or whose procedure is not exactly one program, is refused (ADR-318). Give exactly one of `--program` and `--document` |
 | `--workers` | Directory of worker builds, laid out as `<dir>/<ABI name>/j2534-0404-service[.exe]` and `<dir>/<ABI name>/iso22900-service[.exe]` (design 7.3). Default: `workers` next to the `ngr-agent` executable |
 | `--locks` | The device's lock directory for the job's guards ("Job guards" below), as an absolute path. Default: `locks` next to the `ngr-agent` executable. Lock files are opened read-only, so a file another user created still locks. The agent creates a missing directory writable by its owner only, so a device whose agents run as several users needs it prepared beforehand: writable by all of them, and with the sticky bit (or an equivalent ACL) so that no user can delete another's lock files (ADR-257). It must also be readable by every agent user, since the per-vehicle lock lists it, and on Unix support hard links, with which it creates its files (ADR-262). On Unix a directory that group or others may write without the sticky bit, or without being readable by them, is refused |
-| `--tx-id`, `--rx-id` | Physical request and response CAN IDs in hex, with or without `0x`. Default `7E0` / `7E8`. Only 11-bit IDs: the link does not set the CAN ID format |
+| `--tx-id`, `--rx-id` | With `--program` only: physical request and response CAN IDs in hex, with or without `0x`. Default `7E0` / `7E8`. Only 11-bit IDs: the link does not set the CAN ID format. With `--document` they are refused, since the document declares its link |
 
-The link is UDS on ISO 15765 at 500 kbit/s (`LinkConfig::iso15765`), with the CAN IDs from the
-command line rather than from the program. Its resource is named by the ISO 22900-2 (2022)
+A document's job opens the link its variant declares (`agent::Job::declared_link`, ADR-324):
+
+- The variant must declare exactly one protocol. It must carry `UDS`, under the short name
+  `ISO15765`, `ISO_14229_3_on_ISO_15765_2` or `ISO_15765_3_on_ISO_15765_2`, without extended
+  addressing.
+- The baud rate and the two identifiers are the protocol's.
+- `CP_P2Max`, `CP_P2Star` and `CP_RC78CompletionTimeout`, in microseconds, give the timings,
+  rounded up to whole milliseconds. Without them the timings are those of a program's link
+  below.
+- The protocol's other ComParams are set on the link as declared, after the link's own.
+- A ComParam the link sets itself, a ComParam declared twice, or a value outside an unsigned
+  32-bit integer is refused.
+- A document whose link cannot be used fails before any worker starts.
+
+A program's link is UDS on ISO 15765 at 500 kbit/s (`LinkConfig::iso15765`), with the CAN IDs
+from the command line, P2 1 s, P2* 5 s and a 25 s bound on a response-pending chain. Either
+link's resource is named by the ISO 22900-2 (2022)
 short names of UDS on dual-wire CAN (Annex B.1, B.2), which both worker kinds resolve
 (`agent::link::resource_data`, ADR-319).
 

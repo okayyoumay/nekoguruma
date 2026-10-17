@@ -81,6 +81,15 @@ impl Job {
         self.document.as_ref()
     }
 
+    /// The link the job's document declares ([`LinkConfig::declared`], ADR-324). A program
+    /// without a document declares none.
+    pub fn declared_link(&self) -> Result<LinkConfig, HostError> {
+        let document = self.document.as_ref().ok_or_else(|| {
+            HostError::DeclaredLink("a program without a document declares no link".to_owned())
+        })?;
+        LinkConfig::declared(&document.variant())
+    }
+
     /// Whether the job's program sends anything a read-only job may not, so it needs the
     /// reprogramming slot (`policy::writes`, ADR-257). A send-receive counts by its declared
     /// service (ADR-322 item 1).
@@ -1590,6 +1599,25 @@ mod tests {
             preconditions: Default::default(),
             flash: Vec::new(),
         }
+    }
+
+    #[test]
+    fn only_a_job_with_a_document_declares_its_link() {
+        let bare = Job::from(program(Vec::new()));
+        assert!(matches!(
+            bare.declared_link(),
+            Err(HostError::DeclaredLink(_))
+        ));
+        // The document's protocol is UDS over ISO 15765, but declares no baud rate.
+        let job = Job::from_document(crate::send_receive::tests::document_with(
+            vec![Some(crate::send_receive::tests::uds_shape())],
+            Some(&program(Vec::new())),
+        ))
+        .expect("the document carries its procedure");
+        assert!(matches!(
+            job.declared_link(),
+            Err(HostError::DeclaredLink(error)) if error.contains("baud rate")
+        ));
     }
 
     fn run(code: Vec<Op>, max_steps: u64, host: &mut FakeHost) -> Result<VmState, JobError> {

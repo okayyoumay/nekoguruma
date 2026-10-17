@@ -1210,6 +1210,31 @@ fn a_routine_is_checked_at_ingestion() {
         codes("def main():\n    diag.routine(0xFF01, 1, {\"level\": 3})\n"),
         [UnknownService]
     );
+    // A routine's own constant selects the service too, so a run-time value for it is refused
+    // as such.
+    let fields = example()
+        .into_iter()
+        .find(|(n, _)| n == "fields.csv")
+        .map(|(_, c)| String::from_utf8(c).expect("UTF-8"))
+        .expect("fields.csv");
+    let fields = format!(
+        "{}\nroutine:checkProgrammingDependencies:start:request,mode,0,,uint,8,,,,,,0x01,,,\n",
+        fields.trim_end()
+    );
+    let source = "def f(m):\n    diag.routine(0xFF01, 1, {\"mode\": m})\n\ndef main():\n    f(1)\n";
+    let found: Vec<_> = procedures(with(
+        with(example(), "fields.csv", &fields),
+        "main.star",
+        source,
+    ))
+    .expect_err("rejected")
+    .errors
+    .into_iter()
+    .map(|e| (e.code, e.hint))
+    .collect();
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].0, NonConstantArgument);
+    assert!(found[0].1.contains("`diag.routine`"), "{found:?}");
     // The result has the response's declared names (ADR-314 item 4).
     assert_eq!(
         codes("def main():\n    x = diag.routine(0xFF01, 1, {})[\"fields\"][\"other\"]\n"),

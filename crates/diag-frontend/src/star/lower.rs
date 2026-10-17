@@ -9,7 +9,7 @@
 //! express for its operands is `STAR_NOT_LOWERABLE`.
 //!
 //! Not lowered yet, each its own backlog item: the other `diag` functions (`hmi` and `record`;
-//! `routine` and `security_access`; `flash_transfer`), reading `dtcs` of `diag.read_dtc`, built-ins and
+//! `security_access`; `flash_transfer`), reading `dtcs` of `diag.read_dtc`, built-ins and
 //! string methods on values known only at run time, and section and idempotency annotations.
 //! Each is rejected with `STAR_NOT_LOWERABLE` (or `STAR_API_NOT_AVAILABLE` for a `diag`
 //! function without an instruction), so nothing is lowered silently wrong.
@@ -3111,7 +3111,7 @@ impl<'a> Lowerer<'a> {
                 }
                 !transfer
             });
-        let params = match self.request_params(id, sid, params_arg) {
+        let params = match self.request_params(id, "request", sid, params_arg) {
             None => None,
             Some(Val::Const(Const::Dict(entries, _))) => Some(entries),
             Some(Val::Const(other)) => {
@@ -3210,17 +3210,20 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    /// The `params` of `diag.request(sid, ...)` as a value. A dict literal is built here, so
-    /// that a value known only at run time is reported for what it is: under a key some service
-    /// with the SID holds as a constant it is needed to select the service (csv-tables 5.3);
-    /// under another key it is a field's value, which only a run-time encoding could send.
+    /// The `params` of `diag.{function}(sid, ...)` as a value, `function` being `request` or
+    /// `routine`, whose services are the generated routine services. A dict literal is built
+    /// here, so that a value known only at run time is reported for what it is: under a key some
+    /// service with the SID holds as a constant it is needed to select the service (csv-tables
+    /// 5.3); under another key it is a field's value, which only a run-time encoding could send.
     /// `None` once the dict literal's errors are reported.
     fn request_params(
         &mut self,
         id: Option<usize>,
+        function: &str,
         sid: Option<i64>,
         arg: &AstExpr,
     ) -> Option<Val> {
+        let routine = function == "routine";
         let ExprP::Dict(pairs) = &arg.node else {
             return Some(self.expr(id, arg));
         };
@@ -3250,7 +3253,7 @@ impl<'a> Lowerer<'a> {
                     complete = false;
                     let constant = self.requests.services.iter().any(|service| {
                         Some(i64::from(service.sid)) == sid
-                            && !service.routine
+                            && service.routine == routine
                             && service.constants.iter().any(|(name, _)| **name == *key)
                     });
                     if constant {
@@ -3258,16 +3261,16 @@ impl<'a> Lowerer<'a> {
                             StarCode::NonConstantArgument,
                             value.span,
                             format!(
-                                "the `{key}` param of `diag.request` selects the service, so \
-                                 it must be known at ingestion (3.4)"
+                                "the `{key}` param of `diag.{function}` selects the service, \
+                                 so it must be known at ingestion (3.4)"
                             ),
                         );
                     } else {
                         self.not_lowerable(
                             value.span,
                             format!(
-                                "the `{key}` param of `diag.request` is known only at run time; \
-                                 a request is encoded at ingestion for now (3.2)"
+                                "the `{key}` param of `diag.{function}` is known only at run \
+                                 time; a request is encoded at ingestion for now (3.2)"
                             ),
                         );
                     }
@@ -3302,7 +3305,7 @@ impl<'a> Lowerer<'a> {
         };
         let rid = self.constant_int(id, rid_arg, "routine", "routine_id", 0..=0xFFFF);
         let sub = self.constant_int(id, sub_arg, "routine", "sub", 0..=0xFF);
-        let params = match self.request_params(id, Some(0x31), params_arg) {
+        let params = match self.request_params(id, "routine", Some(0x31), params_arg) {
             None => None,
             Some(Val::Const(Const::Dict(entries, _))) => Some(entries),
             Some(Val::Const(other)) => {

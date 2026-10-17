@@ -84,8 +84,10 @@ shape survives inside the second as the access program of item 5.
    session timeout and tester-present period (item 11). Several access targets (a gateway behind
    a gateway) run their access programs in declaration order. The access program is lowered on
    its own, once per variant of the access target, and travels with the job; the conversion and
-   `check_job` refuse any other service in it. A first run goes in this order: identify the
-   access targets (by reads, which a locked gateway answers), run their access programs, read
+   `check_job` refuse any other service in it. A first run goes in this order: for each access
+   target in declaration order, identify it (by reads, which a locked gateway answers) and run
+   its access program at once, so that an inner gateway is reached through an unlocked outer
+   one; then read
    the VIN and take the per-vehicle lock when it matches (8.8), identify the other targets, and
    pick the combination (item 7). A restart (8.2.5) runs the access programs after the locks and
    the server reservation and before the VIN read of ADR-229 item 2 step 2. Every run also runs
@@ -99,9 +101,9 @@ shape survives inside the second as the access program of item 5.
    the job ends in the 8.9.1 pre-check with nothing written, and on a restart as ADR-286
    describes. When the VIN matches and the per-vehicle lock must be waited for because another
    job holds it, the agent stops every keep-alive before it waits and sends nothing while it
-   waits, as ADR-263 requires. Once it holds the lock it starts again from the identification of
-   the access targets, since the job that held the lock may have changed them, and runs their
-   access programs before anything else is sent. A lock failure leaves only the identification
+   waits, as ADR-263 requires. Once it holds the lock it again identifies each access target and
+   runs its access program, in the same order, since the job that held the lock may have changed
+   them, before anything else is sent. A lock failure leaves only the identification
    reads, the access programs and the VIN read sent (amending ADR-263 item 4), and their sessions
    lapse. The main program may still select the access target for anything else.
 6. **Lowered once per combination of variants.** The main program is lowered for each

@@ -68,7 +68,7 @@ does not take. A T3 profile can add nothing.
 | `id_bits` | 11 or 29; every identifier must fit |
 | `addressing` | `"normal"`, `"extended"` or `"mixed"`; the last two need an `address` byte |
 | `padding` | The padding byte; absent for no padding |
-| `[link.comparams]` | The transport ComParams by name (`CP_...`). The physical layer (`CP_Baudrate`, `CP_CanFDBaudrate`, `CP_J1962_Pins`) comes from the keys above and is refused here |
+| `[link.comparams]` | The transport ComParams by name (`CP_...`). The physical layer (the bus type ComParams of ISO 22900-2 (2022) Annex B.3.2, such as `CP_Baudrate`, `CP_CANFDBaudrate` or `CP_TerminationType`, in any case) comes from the keys above and is refused here |
 
 `[[hardware-control]]`, by `kind`, each with a `name` that checks refer to:
 
@@ -77,6 +77,20 @@ does not take. A T3 profile can add nothing.
 | `programming-voltage` | `pin`, `millivolts` |
 | `pin-switch` | `pins`, each a connector pin once |
 | `ioctl` | `id`, and either its exact `payload` (bytes) or its safe `range` (`[low, high]`) |
+
+## Telling the two loopback ends apart
+
+The profile cannot see the hardware, so it only refuses what cannot be two channels:
+
+- Names are compared as the libraries look them up, ignoring ASCII case and surrounding spaces.
+- Two J2534 ends are on one module when they name the same library and the same `label` or the
+  same `pname` (ADR-281), whatever their `module` says. Two D-PDU API ends are on one module
+  when they name the same library and `module`.
+- Two ends on one module must describe it identically and name different `channel`s, compared
+  as the J2534 worker reads them: `CAN_CH1`, `can_ch1` and `CAN_CH01` are one channel.
+- One device reached through both APIs, one at each end, looks like two modules here. Design
+  13.5's procedure (only the profile's VCIs connected) and the module match against the attached
+  device cover it.
 
 ## Check declarations
 

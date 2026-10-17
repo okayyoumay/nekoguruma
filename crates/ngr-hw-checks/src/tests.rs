@@ -292,78 +292,137 @@ fn a_loopback_runs_between_two_ends_of_one_bus() {
             "{extra}"
         );
     }
-    // Two SocketCAN ends and no VCI; one bus at two rates or widths; identifiers not crossed.
-    let vci_end = T0_PROFILE.split("[[endpoint]]").nth(2).unwrap();
+    // The two ends of `T0_PROFILE`: a SocketCAN end sending 0x123, and a VCI end sending 0x124.
     let can_end = T0_PROFILE.split("[[endpoint]]").nth(1).unwrap();
-    let no_vci = format!(
-        "class = \"T0\"\n[[endpoint]]{can_end}[[endpoint]]{}",
-        can_end.replace("can0", "can1")
-    );
-    assert!(parse(&no_vci).is_err());
-    let same_vci = format!("class = \"T0\"\n[[endpoint]]{vci_end}[[endpoint]]{vci_end}");
-    assert!(parse(&same_vci).is_err());
-    // Two channels of one VCI, the preferred loopback, differ by their channel.
-    let channel = |name: &str, request: &str, response: &str| {
-        vci_end
-            .replacen(
-                "[endpoint.vci]",
-                &format!("channel = \"{name}\"\n[endpoint.vci]"),
-                1,
-            )
-            .replacen("request_id = 0x124", &format!("request_id = {request}"), 1)
-            .replacen(
-                "response_id = 0x123",
-                &format!("response_id = {response}"),
-                1,
-            )
+    let vci_end = T0_PROFILE.split("[[endpoint]]").nth(2).unwrap();
+    // The same end sending 0x123 instead, so that it pairs with `vci_end`.
+    let partner = |end: &str| {
+        end.replacen("request_id = 0x124", "request_id = 0x999", 1)
+            .replacen("response_id = 0x123", "response_id = 0x124", 1)
+            .replacen("request_id = 0x999", "request_id = 0x123", 1)
     };
-    let two_channels = format!(
-        "class = \"T0\"\n[[endpoint]]{}[[endpoint]]{}",
-        channel("CAN_CH1", "0x123", "0x124"),
-        channel("CAN_CH2", "0x124", "0x123")
+    let with_channel = |end: &str, name: &str| {
+        end.replacen(
+            "[endpoint.vci]",
+            &format!("channel = \"{name}\"\n[endpoint.vci]"),
+            1,
+        )
+    };
+    let loopback = |a: &str, b: &str| format!("class = \"T0\"\n[[endpoint]]{a}[[endpoint]]{b}");
+    // Refused, and for the reason the message names.
+    let refused_for = |text: &str, reason: &str| match parse(text) {
+        Err(ProfileError::Invalid(message)) => {
+            assert!(
+                message.contains(reason),
+                "{message} does not say {reason:?}"
+            )
+        }
+        other => panic!("{other:?}: expected a refusal for {reason:?}"),
+    };
+
+    // Two SocketCAN ends and no VCI.
+    let can_partner = can_end
+        .replace("can0", "can1")
+        .replacen("request_id = 0x123", "request_id = 0x999", 1)
+        .replacen("response_id = 0x124", "response_id = 0x123", 1)
+        .replacen("request_id = 0x999", "request_id = 0x124", 1);
+    refused_for(&loopback(can_end, &can_partner), "VCI channel at one end");
+    // One VCI end with a channel, opposite a SocketCAN end, is a valid loopback.
+    parse(&loopback(can_end, &with_channel(vci_end, "CAN_CH1"))).unwrap();
+
+    // Two channels of one VCI, the preferred loopback, differ by their channel.
+    let ch1 = with_channel(vci_end, "CAN_CH1");
+    parse(&loopback(&ch1, &partner(&with_channel(vci_end, "CAN_CH2")))).unwrap();
+    // The same channel, however it is spelled, or a channel at one end only, in either order.
+    for other in ["CAN_CH1", "can_ch1", " CAN_CH01 "] {
+        refused_for(
+            &loopback(&ch1, &partner(&with_channel(vci_end, other))),
+            "must be different channels",
+        );
+    }
+    refused_for(
+        &loopback(vci_end, &partner(vci_end)),
+        "must be different channels",
     );
-    parse(&two_channels).unwrap();
-    let one_channel = format!(
-        "class = \"T0\"\n[[endpoint]]{}[[endpoint]]{}",
-        channel("CAN_CH1", "0x123", "0x124"),
-        channel("CAN_CH1", "0x124", "0x123")
+    refused_for(
+        &loopback(&ch1, &partner(vci_end)),
+        "must be different channels",
     );
-    assert!(parse(&one_channel).is_err());
-    // One module described with two versions is still one module: refused with or without
-    // channels.
+    refused_for(
+        &loopback(vci_end, &partner(&ch1)),
+        "must be different channels",
+    );
+    assert!(parse(&loopback(&with_channel(vci_end, " "), &partner(&ch1))).is_err());
+
+    // The same module whatever the case of its names, or described with two versions.
+    let shouted = vci_end
+        .replacen("library = \"Vendor PDU\"", "library = \"VENDOR PDU\"", 1)
+        .replacen("module = \"SN-0001\"", "module = \"sn-0001\"", 1);
+    refused_for(
+        &loopback(&ch1, &partner(&shouted)),
+        "describe it differently",
+    );
     let other_version = vci_end.replacen(
         "firmware_version = \"2.0\"",
         "firmware_version = \"2.1\"",
         1,
     );
-    assert_ne!(other_version, vci_end);
-    for (first, second) in [
-        (vci_end.to_owned(), other_version.clone()),
-        (
-            channel("CAN_CH1", "0x123", "0x124"),
-            other_version.replacen("[endpoint.vci]", "channel = \"CAN_CH2\"\n[endpoint.vci]", 1),
-        ),
+    refused_for(
+        &loopback(&ch1, &partner(&with_channel(&other_version, "CAN_CH2"))),
+        "describe it differently",
+    );
+    // Two modules of one library are two devices.
+    let second_module = vci_end.replacen("module = \"SN-0001\"", "module = \"SN-0002\"", 1);
+    parse(&loopback(vci_end, &partner(&second_module))).unwrap();
+
+    // J2534 names its module by the configured entry: the same label or `pname` is one device,
+    // and two entries reporting the same `module` are two.
+    let j2534 = |label: &str, pname: &str, module: &str| {
+        vci_end
+            .replacen("api = \"iso22900\"", "api = \"j2534-0404\"", 1)
+            .replacen(
+                "module = \"SN-0001\"",
+                &format!("module = \"{module}\"\nlabel = \"{label}\"\npname = \"{pname}\""),
+                1,
+            )
+    };
+    let first = j2534("bench-a", "Vendor VCI A", "VCI");
+    parse(&loopback(
+        &first,
+        &partner(&j2534("bench-b", "Vendor VCI B", "VCI")),
+    ))
+    .unwrap();
+    for other in [
+        j2534("bench-a", "Vendor VCI B", "VCI-2"),
+        j2534("bench-b", "Vendor VCI A", "VCI-2"),
     ] {
-        let text = format!("class = \"T0\"\n[[endpoint]]{first}[[endpoint]]{second}");
-        assert!(parse(&text).is_err());
+        assert!(parse(&loopback(&first, &partner(&other))).is_err());
     }
-    // A channel at one end only leaves the two ends undistinguished, in either order.
-    let named = channel("CAN_CH1", "0x123", "0x124");
-    for (first, second) in [(named.as_str(), vci_end), (vci_end, named.as_str())] {
-        let text = format!("class = \"T0\"\n[[endpoint]]{first}[[endpoint]]{second}");
-        assert!(parse(&text).is_err());
-    }
+    // A loopback across the two APIs is two modules (design 13.5).
+    parse(&loopback(
+        vci_end,
+        &partner(&j2534("bench-a", "Vendor VCI A", "SN-0001")),
+    ))
+    .unwrap();
+
     // A SocketCAN end has no channel.
     let can_channel = T0_PROFILE.replacen(
         "socketcan = \"can0\"",
         "socketcan = \"can0\"\nchannel = \"1\"",
         1,
     );
-    assert!(parse(&can_channel).is_err());
+    refused_for(&can_channel, "socketcan");
+    // Other physical-layer ComParams, in any case, are refused like `CP_Baudrate`.
+    for name in ["CP_CANFDBaudrate", "CP_BAUDRATE", "CP_TerminationType"] {
+        let text = t1("").replacen("CP_STmin = 0", &format!("{name} = 1"), 1);
+        refused_for(&text, "physical-layer");
+    }
     let rate = T0_PROFILE.replacen("baud_rate = 500000", "baud_rate = 250000", 1);
-    assert!(parse(&rate).is_err());
+    refused_for(&rate, "one bus");
+    let width = T0_PROFILE.replacen("id_bits = 11", "id_bits = 29", 1);
+    refused_for(&width, "one bus");
     let not_crossed = T0_PROFILE.replacen("request_id = 0x124", "request_id = 0x125", 1);
-    assert!(parse(&not_crossed).is_err());
+    refused_for(&not_crossed, "receives on the identifier");
 }
 
 #[test]

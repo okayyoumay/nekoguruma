@@ -104,10 +104,25 @@ pub struct Vci {
 }
 
 impl Vci {
-    /// Whether `other` names the same module: the same API, library and module. The other
-    /// fields describe that module, so they do not tell two modules apart.
+    /// Whether `other` may name the same module. Names are compared as the libraries look them
+    /// up, ignoring ASCII case (a Windows registry key name ignores it too, design 7.1). A J2534
+    /// worker opens the configured entry its label selects, and its `pname` identifies the
+    /// device (ADR-281), so for J2534 the same label or the same `pname` is the same module,
+    /// whatever `module` says; for the D-PDU API, the module the library reports is.
     pub fn identifies_same_module(&self, other: &Vci) -> bool {
-        self.api == other.api && self.library == other.library && self.module == other.module
+        let same = |a: &str, b: &str| a.trim().eq_ignore_ascii_case(b.trim());
+        let same_option = |a: &Option<String>, b: &Option<String>| match (a, b) {
+            (Some(a), Some(b)) => same(a, b),
+            _ => false,
+        };
+        self.api == other.api
+            && same(&self.library, &other.library)
+            && match self.api {
+                Api::J2534V0404 => {
+                    same_option(&self.label, &other.label) || same_option(&self.pname, &other.pname)
+                }
+                Api::Iso22900 => same(&self.module, &other.module),
+            }
     }
 }
 
@@ -388,7 +403,40 @@ const PINS: std::ops::RangeInclusive<u8> = 1..=16;
 
 /// The ComParams of the physical layer, which the profile's typed keys give and a check may not
 /// change (design 13.5).
-const PHYSICAL_COMPARAMS: &[&str] = &["CP_Baudrate", "CP_CanFDBaudrate", "CP_J1962_Pins"];
+/// The physical-layer ComParams (the bus type class of ISO 22900-2 (2022) Annex B.3.2, as
+/// `j2534-0404-service` groups them), compared ignoring ASCII case.
+const PHYSICAL_COMPARAMS: &[&str] = &[
+    "CP_Baudrate",
+    "CP_BitSamplePoint",
+    "CP_BitSamplePoint_Ecu",
+    "CP_SamplesPerBit",
+    "CP_SamplesPerBit_Ecu",
+    "CP_SyncJumpWidth",
+    "CP_SyncJumpWidth_Ecu",
+    "CP_ListenOnly",
+    "CP_CanBaudrateRecord",
+    "CP_K_L_LineInit",
+    "CP_K_LinePullup",
+    "CP_TerminationType",
+    "CP_TerminationType_Ecu",
+    "CP_CANFDBaudrate",
+    "CP_CANFDBitSamplePoint",
+    "CP_CANFDSyncJumpWidth",
+];
+
+/// A channel name as the J2534 worker reads it: ASCII case ignored, surrounding spaces dropped,
+/// and a `_CH` index read as a number, so `CAN_CH1`, `can_ch1` and `CAN_CH01` are one channel.
+fn channel_key(name: &str) -> String {
+    let upper = name.trim().to_ascii_uppercase();
+    if let Some(index) = upper.rfind("_CH") {
+        let (head, digits) = (&upper[..index], &upper[index + 3..]);
+        if !head.is_empty() && !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+            let number = digits.trim_start_matches('0');
+            return format!("{head}_CH{}", if number.is_empty() { "0" } else { number });
+        }
+    }
+    upper
+}
 
 fn check_vci(vci: &Vci) -> Result<(), ProfileError> {
     if [
@@ -480,11 +528,11 @@ fn check_link(link: &Link) -> Result<(), ProfileError> {
             "the ComParam {name:?} is not a ComParam name (`CP_...`)"
         )));
     }
-    if let Some(name) = link
-        .comparams
-        .keys()
-        .find(|name| PHYSICAL_COMPARAMS.contains(&name.as_str()))
-    {
+    if let Some(name) = link.comparams.keys().find(|name| {
+        PHYSICAL_COMPARAMS
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case(name))
+    }) {
         return Err(invalid(format!(
             "the ComParam {name:?} is physical-layer; the `link`'s own keys give it"
         )));
@@ -494,7 +542,14 @@ fn check_link(link: &Link) -> Result<(), ProfileError> {
 
 fn check_endpoint(endpoint: &Endpoint) -> Result<(), ProfileError> {
     match (&endpoint.vci, &endpoint.socketcan) {
-        (Some(vci), None) if endpoint.channel.as_deref() != Some("") => check_vci(vci)?,
+        (Some(vci), None)
+            if endpoint
+                .channel
+                .as_deref()
+                .is_none_or(|c| !c.trim().is_empty()) =>
+        {
+            check_vci(vci)?
+        }
         (None, Some(interface)) if !interface.is_empty() && endpoint.channel.is_none() => {}
         _ => {
             return Err(invalid(
@@ -527,9 +582,12 @@ fn check_loopback(a: &Endpoint, b: &Endpoint) -> Result<(), ProfileError> {
         }
         _ => false,
     };
-    let same_vci_channel =
-        same_module && (a.channel.is_none() || b.channel.is_none() || a.channel == b.channel);
-    if same_vci_channel || (a.socketcan.is_some() && a.socketcan == b.socketcan) {
+    let same_vci_channel = same_module
+        && match (&a.channel, &b.channel) {
+            (Some(x), Some(y)) => channel_key(x) == channel_key(y),
+            _ => true,
+        };
+    if same_vci_channel {
         return Err(invalid(
             "a T0 loopback's two endpoints must be different channels; two ends on one VCI name \
              different `channel`s",

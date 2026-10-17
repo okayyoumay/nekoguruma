@@ -28,6 +28,8 @@ use starlark_syntax::syntax::ast::{
 };
 use starlark_syntax::syntax::uniplate::Visit;
 
+use crate::profile::Intent;
+
 use super::{
     Annotation, BUILTINS, Checked, Pending, RequestConstant, RequestIndex, STRING_METHODS,
     StarCode, StarError, collect_locals, is_string_expression, resolve, to_u32,
@@ -2993,6 +2995,28 @@ impl<'a> Lowerer<'a> {
                 }
             }
             "request" => self.diag_request(id, args, span),
+            "read_dtc" | "routine" | "security_access" => {
+                let intent = match name {
+                    "read_dtc" => Intent::ReadDtc,
+                    "routine" => Intent::Routine,
+                    _ => Intent::SecurityAccess,
+                };
+                let profile = self.requests.profile;
+                if profile.call(intent).is_none() {
+                    self.error(
+                        StarCode::NotInProfile,
+                        span,
+                        format!(
+                            "the {} profile of this variant's protocols does not define \
+                             `diag.{name}` (3.2)",
+                            profile.layer
+                        ),
+                    );
+                } else {
+                    self.not_lowerable(span, format!("`diag.{name}` is not lowered yet (3.2)"));
+                }
+                Val::Run(Tys::default(), Vec::new())
+            }
             "ecu_info" | "precondition" => {
                 self.error(
                     StarCode::ApiNotAvailable,

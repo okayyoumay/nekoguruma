@@ -136,6 +136,9 @@ pub struct ProtocolRow {
     pub rx_id: u16,
     pub functional_id: u16,
     pub extended_addressing: bool,
+    /// The application layer the protocol carries, which names the profile the variant's
+    /// procedures are lowered through (ADR-309 item 3).
+    pub application_layer: String,
 }
 
 pub(crate) const PROTOCOLS: Spec = Spec {
@@ -148,6 +151,7 @@ pub(crate) const PROTOCOLS: Spec = Spec {
         ("rx_id", true),
         ("functional_id", false),
         ("extended_addressing", false),
+        ("application_layer", false),
     ],
 };
 
@@ -160,6 +164,12 @@ pub(crate) fn protocols(sheet: &Sheet, errors: &mut Errors) -> Vec<ProtocolRow> 
         let rx_id = row.required(e, "rx_id", as_u16(0x7FF));
         let functional_id = row.or(e, "functional_id", 0, as_u16(0x7FF));
         let extended_addressing = row.or(e, "extended_addressing", false, values::boolean);
+        let application_layer = row.or(
+            e,
+            "application_layer",
+            crate::profile::UDS.to_owned(),
+            values::text,
+        );
         Some(ProtocolRow {
             line: row.line,
             variants: variants?,
@@ -169,6 +179,7 @@ pub(crate) fn protocols(sheet: &Sheet, errors: &mut Errors) -> Vec<ProtocolRow> 
             rx_id: rx_id?,
             functional_id: functional_id?,
             extended_addressing: extended_addressing?,
+            application_layer: application_layer?,
         })
     })
 }

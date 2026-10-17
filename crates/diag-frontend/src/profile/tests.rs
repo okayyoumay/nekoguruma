@@ -1,107 +1,5 @@
 use super::*;
 
-/// The UDS calls as ADR-314 sketches them.
-const READ_DTC: Call = Call {
-    intent: Intent::ReadDtc,
-    steps: &[Step {
-        kind: StepKind::SendReceive,
-        request: Request {
-            sid: 0x19,
-            parts: &[
-                Part::Const {
-                    bits: 8,
-                    value: 0x02,
-                },
-                Part::Arg {
-                    bits: 8,
-                    arg: Source::Mask,
-                },
-            ],
-        },
-        declared: true,
-        result: ResultMap::ReadDtc {
-            mask: Pos(0),
-            dtcs: Pos(1),
-            code_bits: 24,
-            status_bits: 8,
-        },
-    }],
-};
-
-const ROUTINE_REQUEST: Request = Request {
-    sid: 0x31,
-    parts: &[
-        Part::Select {
-            bits: 8,
-            arg: Source::Sub,
-        },
-        Part::Select {
-            bits: 16,
-            arg: Source::Rid,
-        },
-        Part::Params,
-    ],
-};
-
-const ROUTINE: Call = Call {
-    intent: Intent::Routine,
-    steps: &[Step {
-        kind: StepKind::RoutineControl,
-        request: ROUTINE_REQUEST,
-        declared: true,
-        result: ResultMap::Declared,
-    }],
-};
-
-const SECURITY_ACCESS: Call = Call {
-    intent: Intent::SecurityAccess,
-    steps: &[
-        Step {
-            kind: StepKind::SendReceive,
-            request: Request {
-                sid: 0x27,
-                parts: &[Part::Arg {
-                    bits: 8,
-                    arg: Source::Level,
-                }],
-            },
-            declared: false,
-            result: ResultMap::Seed { after_bytes: 2 },
-        },
-        Step {
-            kind: StepKind::SecurityKey,
-            request: Request { sid: 0, parts: &[] },
-            declared: false,
-            result: ResultMap::None,
-        },
-        Step {
-            kind: StepKind::SendReceive,
-            request: Request {
-                sid: 0x27,
-                parts: &[
-                    Part::Arg {
-                        bits: 8,
-                        arg: Source::LevelPlusOne,
-                    },
-                    Part::Arg {
-                        bits: 0,
-                        arg: Source::Key,
-                    },
-                ],
-            },
-            declared: false,
-            result: ResultMap::None,
-        },
-    ],
-};
-
-const UDS_LIKE: Profile = Profile {
-    layer: UDS,
-    calls: &[READ_DTC, ROUTINE, SECURITY_ACCESS],
-    negative: NEGATIVE_7F,
-    pending: &[0x78],
-};
-
 #[test]
 fn every_shipped_profile_is_valid() {
     for profile in ALL {
@@ -117,12 +15,12 @@ fn every_shipped_profile_is_valid() {
 
 #[test]
 fn a_profile_of_the_three_calls_is_valid_and_looked_up_by_intent() {
-    assert_eq!(UDS_LIKE.validate(), Ok(()));
-    let call = UDS_LIKE.call(Intent::Routine).expect("defined");
+    assert_eq!(UDS_PROFILE.validate(), Ok(()));
+    let call = UDS_PROFILE.call(Intent::Routine).expect("defined");
     assert_eq!(call.steps[0].request.sid, 0x31);
     let only_dtcs = Profile {
         calls: &[READ_DTC],
-        ..UDS_LIKE
+        ..UDS_PROFILE
     };
     assert!(only_dtcs.call(Intent::SecurityAccess).is_none());
 }
@@ -134,7 +32,7 @@ fn the_negative_shape_and_pending_codes_are_those_the_workers_support() {
             marker: 0x7E,
             ..NEGATIVE_7F
         },
-        ..UDS_LIKE
+        ..UDS_PROFILE
     };
     assert_eq!(other_marker.validate(), Err(ProfileError::NegativeShape));
     let no_sid = Profile {
@@ -143,22 +41,22 @@ fn the_negative_shape_and_pending_codes_are_those_the_workers_support() {
             code_at: 1,
             ..NEGATIVE_7F
         },
-        ..UDS_LIKE
+        ..UDS_PROFILE
     };
     assert_eq!(no_sid.validate(), Err(ProfileError::NegativeShape));
     let pending_22 = Profile {
         pending: &[0x78, 0x22],
-        ..UDS_LIKE
+        ..UDS_PROFILE
     };
     assert_eq!(pending_22.validate(), Err(ProfileError::PendingCode(0x22)));
     let twice = Profile {
         pending: &[0x21, 0x21],
-        ..UDS_LIKE
+        ..UDS_PROFILE
     };
     assert_eq!(twice.validate(), Err(ProfileError::PendingTwice(0x21)));
     let all = Profile {
         pending: &[0x78, 0x21, 0x23],
-        ..UDS_LIKE
+        ..UDS_PROFILE
     };
     assert_eq!(all.validate(), Ok(()));
 }
@@ -168,7 +66,7 @@ fn malformed_calls_are_refused() {
     fn with(call: Call) -> Result<(), ProfileError> {
         Profile {
             calls: Box::leak(Box::new([call])),
-            ..UDS_LIKE
+            ..UDS_PROFILE
         }
         .validate()
     }
@@ -180,7 +78,7 @@ fn malformed_calls_are_refused() {
     };
     let twice = Profile {
         calls: &[READ_DTC, READ_DTC],
-        ..UDS_LIKE
+        ..UDS_PROFILE
     };
     assert_eq!(
         twice.validate(),
@@ -381,7 +279,7 @@ fn check(intent: Intent, steps: Vec<Step>) -> Result<(), ProfileError> {
             intent,
             steps: leak(steps),
         }]),
-        ..UDS_LIKE
+        ..UDS_PROFILE
     }
     .validate()
 }
@@ -756,7 +654,7 @@ fn routine_control_serves_only_uds_routine_control() {
     let profile = |layer, sid| Profile {
         layer,
         calls: leak(vec![routine(sid)]),
-        ..UDS_LIKE
+        ..UDS_PROFILE
     };
     assert_eq!(profile(UDS, 0x31).validate(), Ok(()));
     assert_eq!(
@@ -780,7 +678,7 @@ fn routine_control_serves_only_uds_routine_control() {
     };
     let uds = Profile {
         calls: leak(vec![send_receive]),
-        ..UDS_LIKE
+        ..UDS_PROFILE
     };
     assert_eq!(uds.validate(), Err(ProfileError::StepKind(Intent::Routine)));
     let other = Profile {

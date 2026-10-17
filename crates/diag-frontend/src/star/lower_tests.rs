@@ -2,6 +2,7 @@ use diag_ir::declaration::{EcuDocumentT, EcuVariantT, encode_ecu_document, load_
 use diag_ir::{DiagHost, StepOutcome, Vm, WaitingOn};
 
 use super::*;
+use crate::profile::Profile;
 use crate::star::check;
 
 /// A host for procedures that call no primitive: every call is a test failure.
@@ -891,6 +892,52 @@ fn diag_functions_without_an_instruction_are_not_available() {
     assert_eq!(
         codes("def main():\n    diag.ecu_info()\n"),
         [(StarCode::ApiNotAvailable, 2)]
+    );
+}
+
+#[test]
+fn a_protocol_neutral_call_needs_its_profile_to_define_it() {
+    let checked = |source: &str| check("t.star", source).unwrap_or_else(|e| panic!("{e:#?}"));
+    let bytes = empty_document();
+    let variant = load_ecu_document(&bytes)
+        .expect("the document loads")
+        .variant()
+        .expect("a variant");
+    let codes_over = |profile: &'static Profile, source: &str| -> Vec<(StarCode, u32)> {
+        let requests = RequestIndex {
+            services: Vec::new(),
+            profile,
+        };
+        match lower("t.star", &checked(source), variant, &requests) {
+            Ok(_) => Vec::new(),
+            Err(errors) => errors.iter().map(|e| (e.code, e.line)).collect(),
+        }
+    };
+    // A profile that defines no call, as one for another application layer might leave some out.
+    static NONE: Profile = Profile {
+        layer: "TEST",
+        calls: &[],
+        negative: crate::profile::NEGATIVE_7F,
+        pending: &[0x78],
+    };
+    let source = "def main():\n    diag.read_dtc(0xFF)\n    diag.routine(0x0203, 1, {})\n    \
+                  diag.security_access(1)\n";
+    assert_eq!(
+        codes_over(&NONE, source),
+        [
+            (StarCode::NotInProfile, 2),
+            (StarCode::NotInProfile, 3),
+            (StarCode::NotInProfile, 4)
+        ]
+    );
+    // UDS defines all three, which are not lowered yet.
+    assert_eq!(
+        codes_over(&crate::profile::UDS_PROFILE, source),
+        [
+            (StarCode::NotLowerable, 2),
+            (StarCode::NotLowerable, 3),
+            (StarCode::NotLowerable, 4)
+        ]
     );
 }
 

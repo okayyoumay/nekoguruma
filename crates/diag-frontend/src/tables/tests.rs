@@ -1261,6 +1261,70 @@ fn example_text(file: &str) -> String {
 }
 
 #[test]
+fn a_variant_s_protocols_name_one_application_layer_a_profile_ships_for() {
+    // Without the column, or with it, a protocol carries UDS.
+    let definition = resolve(read_files(example()).expect("reads")).expect("resolves");
+    assert!(
+        definition
+            .tables
+            .protocols
+            .iter()
+            .all(|p| p.application_layer == "UDS")
+    );
+    let header = "variants,name,baud_rate,tx_id,rx_id,application_layer";
+    assert_eq!(
+        resolved_with(
+            "protocols.csv",
+            header,
+            &[",ISO15765,500000,0x7E0,0x7E8,UDS"]
+        ),
+        vec![]
+    );
+    // A layer no profile ships for.
+    assert_eq!(
+        resolved_with(
+            "protocols.csv",
+            header,
+            &[",ISO15765,500000,0x7E0,0x7E8,KWP2000"]
+        ),
+        vec![at(
+            UnknownReference,
+            "protocols.csv",
+            Some(2),
+            Some("application_layer")
+        )]
+    );
+    // Two layers in one variant, reported on the protocol whose layer differs from the first.
+    // Only exampleEcuV2 has both.
+    let mut found = resolved_with(
+        "protocols.csv",
+        header,
+        &[
+            ",ISO15765,500000,0x7E0,0x7E8,UDS",
+            "exampleEcuV2,KLINE,10400,0x7E1,0x7E9,KWP2000",
+        ],
+    );
+    found.sort();
+    assert_eq!(
+        found,
+        vec![
+            at(
+                UnknownReference,
+                "protocols.csv",
+                Some(3),
+                Some("application_layer")
+            ),
+            at(
+                Duplicate,
+                "protocols.csv",
+                Some(3),
+                Some("application_layer")
+            ),
+        ]
+    );
+}
+
+#[test]
 fn an_unknown_variant_is_reported_only_where_it_is_written() {
     // A typo in a protocol's scope does not also fail its ComParams or the variant it missed.
     assert_eq!(

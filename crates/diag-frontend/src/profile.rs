@@ -10,7 +10,7 @@
 //! top-level fields, so a definition keeps its own field names.
 
 /// The profiles that ship with the frontend, one per application layer.
-pub const ALL: &[&Profile] = &[];
+pub const ALL: &[&Profile] = &[&UDS_PROFILE];
 
 /// The profile of the application layer `layer` (`Profile::layer`), if one ships.
 pub fn get(layer: &str) -> Option<&'static Profile> {
@@ -432,6 +432,115 @@ impl Call {
         Ok(())
     }
 }
+
+/// The UDS profile (ADR-309 items 2 and 4, ADR-314). Response pending is 0x78 (ISO 14229-1
+/// clause A.1).
+pub static UDS_PROFILE: Profile = Profile {
+    layer: UDS,
+    calls: &[READ_DTC, ROUTINE, SECURITY_ACCESS],
+    negative: NEGATIVE_7F,
+    pending: &[0x78],
+};
+
+/// `diag.read_dtc`: ReadDTCInformation, reporting by status mask (ISO 14229-1 clause 11.3).
+const READ_DTC: Call = Call {
+    intent: Intent::ReadDtc,
+    steps: &[Step {
+        kind: StepKind::SendReceive,
+        request: Request {
+            sid: 0x19,
+            parts: &[
+                Part::Const {
+                    bits: 8,
+                    value: 0x02,
+                },
+                Part::Arg {
+                    bits: 8,
+                    arg: Source::Mask,
+                },
+            ],
+        },
+        declared: true,
+        result: ResultMap::ReadDtc {
+            mask: Pos(0),
+            dtcs: Pos(1),
+            code_bits: 24,
+            status_bits: 8,
+        },
+    }],
+};
+
+/// RoutineControl's request: the sub-function, the routine identifier, then the routine's own
+/// fields (ISO 14229-1 clause 13.2).
+const ROUTINE_REQUEST: Request = Request {
+    sid: 0x31,
+    parts: &[
+        Part::Select {
+            bits: 8,
+            arg: Source::Sub,
+        },
+        Part::Select {
+            bits: 16,
+            arg: Source::Rid,
+        },
+        Part::Params,
+    ],
+};
+
+/// `diag.routine`: the one `RoutineControl` step recovery relies on (ADR-309 items 4 and 6).
+const ROUTINE: Call = Call {
+    intent: Intent::Routine,
+    steps: &[Step {
+        kind: StepKind::RoutineControl,
+        request: ROUTINE_REQUEST,
+        declared: true,
+        result: ResultMap::Declared,
+    }],
+};
+
+/// `diag.security_access`: the seed request, the server's seed-to-key step, then the send-key
+/// request (ISO 14229-1 clause 9.4).
+const SECURITY_ACCESS: Call = Call {
+    intent: Intent::SecurityAccess,
+    steps: &[
+        Step {
+            kind: StepKind::SendReceive,
+            request: Request {
+                sid: 0x27,
+                parts: &[Part::Arg {
+                    bits: 8,
+                    arg: Source::Level,
+                }],
+            },
+            declared: false,
+            result: ResultMap::Seed { after_bytes: 2 },
+        },
+        Step {
+            kind: StepKind::SecurityKey,
+            request: Request { sid: 0, parts: &[] },
+            declared: false,
+            result: ResultMap::None,
+        },
+        Step {
+            kind: StepKind::SendReceive,
+            request: Request {
+                sid: 0x27,
+                parts: &[
+                    Part::Arg {
+                        bits: 8,
+                        arg: Source::LevelPlusOne,
+                    },
+                    Part::Arg {
+                        bits: 0,
+                        arg: Source::Key,
+                    },
+                ],
+            },
+            declared: false,
+            result: ResultMap::None,
+        },
+    ],
+};
 
 #[cfg(test)]
 mod tests;

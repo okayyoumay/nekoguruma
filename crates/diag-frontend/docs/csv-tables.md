@@ -222,8 +222,9 @@ declared as two variants.
 `comparams.csv`, one `ComParam` per row, appended to the named protocol's `params` in row order.
 The agent sets them on the job's link as written (ADR-324). It reads `CP_P2Max`, `CP_P2Star`
 and `CP_RC78CompletionTimeout` as the link's timings, in microseconds as ISO 22900-2 defines
-them, and refuses a ComParam the link sets from the protocol row itself (such as `CP_Baudrate`
-or the CAN identifiers).
+them. It refuses a ComParam with a `unit`, since it cannot convert units (give the value in
+the ComParam's own unit), and a ComParam the link sets from the protocol row itself (such as
+`CP_Baudrate` or the CAN identifiers); `crates/agent/docs/ngr-agent.md` lists the rest.
 
 | Column | Type | Required | Meaning |
 |---|---|---|---|

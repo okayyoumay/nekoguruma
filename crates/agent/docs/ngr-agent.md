@@ -24,16 +24,20 @@ ngr-agent run --vci <name> --mode <device|user> (--program <file> | --document <
 A document's job opens the link its variant declares (`agent::Job::declared_link`, ADR-324):
 
 - The variant must declare exactly one protocol. It must carry `UDS`, under the short name
-  `ISO15765`, `ISO_14229_3_on_ISO_15765_2` or `ISO_15765_3_on_ISO_15765_2`, without extended
-  addressing.
+  `ISO15765` or `ISO_14229_3_on_ISO_15765_2`, without extended addressing.
 - The baud rate and the two identifiers are the protocol's.
 - `CP_P2Max`, `CP_P2Star` and `CP_RC78CompletionTimeout`, in microseconds, give the timings,
   rounded up to whole milliseconds. Without them the timings are those of a program's link
   below.
-- The protocol's other ComParams are set on the link as declared, after the link's own.
-- A ComParam the link sets itself, a ComParam declared twice, or a value outside an unsigned
-  32-bit integer is refused.
-- A document whose link cannot be used fails before any worker starts.
+- The protocol's other ComParams are set on the link as declared, after the link's own, with
+  the class the worker takes from the ComParam. Names compare ignoring case.
+- Refused: a ComParam the link sets itself, one that lets a primitive outlast the host's
+  deadline (`CP_RC21*`, `CP_RC23*`, `CP_RepeatReqCount*`, `CP_ModifyTiming`), a name not
+  starting `CP_`, a ComParam declared twice or with a unit, and a value outside an unsigned
+  32-bit integer (ADR-324 item 3).
+- A document whose link cannot be used fails before any worker starts. A ComParam the worker
+  does not know, or resolves to one the link already set, fails when the link is set up,
+  naming the ComParam.
 
 A program's link is UDS on ISO 15765 at 500 kbit/s (`LinkConfig::iso15765`), with the CAN IDs
 from the command line, P2 1 s, P2* 5 s and a 25 s bound on a response-pending chain. Either

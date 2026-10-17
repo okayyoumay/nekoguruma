@@ -11206,11 +11206,30 @@ mod tests {
         fail_disconnect: bool,
         fail_open: bool,
         calls: Arc<Mutex<Vec<&'static str>>>,
+        /// ComParam names by object id - 1, ignoring case as the workers do. `CP_Unknown` is
+        /// not known, and `CP_BaudrateAlias` resolves to `CP_Baudrate`'s id.
+        comparams: Mutex<Vec<String>>,
+        /// Each SetComParam: the ComParam's name, its value and its class.
+        set: Arc<Mutex<Vec<(String, u32, i32)>>>,
     }
 
     impl FakeWorker {
         fn note(&self, rpc: &'static str) {
             self.calls.lock().unwrap().push(rpc);
+        }
+
+        fn comparam_id(&self, name: &str) -> u32 {
+            let name = match name.to_ascii_lowercase() {
+                name if name == "cp_unknown" => return 0xFFFF_FFFE,
+                name if name == "cp_baudratealias" => "cp_baudrate".to_owned(),
+                name => name,
+            };
+            let mut names = self.comparams.lock().unwrap();
+            let at = names.iter().position(|n| *n == name).unwrap_or_else(|| {
+                names.push(name);
+                names.len() - 1
+            });
+            u32::try_from(at + 1).unwrap()
         }
     }
 
@@ -11363,8 +11382,20 @@ mod tests {
         }
         async fn set_com_param(
             &self,
-            _: tonic::Request<vci_service_interface::SetComParamRequest>,
+            request: tonic::Request<vci_service_interface::SetComParamRequest>,
         ) -> Result<tonic::Response<vci_service_interface::Response>, tonic::Status> {
+            let item = request.into_inner().param_item.unwrap_or_default();
+            if let (
+                Some(vci_service_interface::param_item::Id::ParamId(id)),
+                Some(vci_service_interface::param_item::ParamData::Unum32(value)),
+            ) = (item.id, item.param_data)
+            {
+                let name = self.comparams.lock().unwrap()[usize::try_from(id - 1).unwrap()].clone();
+                self.set
+                    .lock()
+                    .unwrap()
+                    .push((name, value, item.com_param_class));
+            }
             Ok(tonic::Response::new(Default::default()))
         }
         async fn start_com_primitive(
@@ -11411,11 +11442,13 @@ mod tests {
         }
         async fn get_object_id(
             &self,
-            _: tonic::Request<vci_service_interface::GetObjectIdRequest>,
+            request: tonic::Request<vci_service_interface::GetObjectIdRequest>,
         ) -> Result<tonic::Response<vci_service_interface::ObjectIdResponse>, tonic::Status>
         {
             Ok(tonic::Response::new(
-                vci_service_interface::ObjectIdResponse { pdu_object_id: 1 },
+                vci_service_interface::ObjectIdResponse {
+                    pdu_object_id: self.comparam_id(&request.into_inner().shortname),
+                },
             ))
         }
         async fn get_unique_resp_id_table(
@@ -11443,11 +11476,25 @@ mod tests {
         fail_disconnect: bool,
         fail_open: bool,
     ) -> (WorkerClient, Arc<Mutex<Vec<&'static str>>>) {
+        let (client, calls, _set) = fake_worker_recording(fail_disconnect, fail_open).await;
+        (client, calls)
+    }
+
+    /// The ComParams a [`FakeWorker`] was given: name, value and class.
+    type SetComParams = Arc<Mutex<Vec<(String, u32, i32)>>>;
+
+    async fn fake_worker_recording(
+        fail_disconnect: bool,
+        fail_open: bool,
+    ) -> (WorkerClient, Arc<Mutex<Vec<&'static str>>>, SetComParams) {
         let calls = Arc::new(Mutex::new(Vec::new()));
+        let set = Arc::new(Mutex::new(Vec::new()));
         let service = FakeWorker {
             fail_disconnect,
             fail_open,
             calls: Arc::clone(&calls),
+            comparams: Mutex::new(Vec::new()),
+            set: Arc::clone(&set),
         };
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
@@ -11468,7 +11515,64 @@ mod tests {
             channel,
             worker_host::client::BearerAuth::new([0; 32], "test"),
         );
-        (client, calls)
+        (client, calls, set)
+    }
+
+    /// The link sets its own ComParams, then the declared ones as declared, each with the class
+    /// the worker takes from the ComParam (ADR-324 item 3).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn declared_comparams_are_set_after_the_links_own() {
+        let (mut client, _calls, set) = fake_worker_recording(false, false).await;
+        let config = LinkConfig {
+            params: vec![("CP_BlockSize".to_owned(), 8), ("CP_StMin".to_owned(), 20)],
+            ..LinkConfig::iso15765(0x7E0, 0x7E8)
+        };
+        let link = link::open(&mut client, &config, Duration::from_secs(5))
+            .await
+            .expect("the link opens");
+        link::close(&mut client, link, Duration::from_secs(5))
+            .await
+            .expect("the link closes");
+        let set = set.lock().unwrap().clone();
+        let com = vci_service_interface::PduParamClass::PduPcCom as i32;
+        let specified = vci_service_interface::PduParamClass::PduPcSpecified as i32;
+        assert_eq!(
+            set,
+            [
+                ("cp_baudrate".to_owned(), 500_000, com),
+                ("cp_p2max".to_owned(), 1_000_000, com),
+                ("cp_p2star".to_owned(), 5_000_000, com),
+                ("cp_rc78handling".to_owned(), 1, com),
+                ("cp_rcbyteoffset".to_owned(), 2, com),
+                ("cp_rc78completiontimeout".to_owned(), 25_000_000, com),
+                ("cp_blocksize".to_owned(), 8, specified),
+                ("cp_stmin".to_owned(), 20, specified),
+            ]
+        );
+    }
+
+    /// A declared ComParam the worker does not know, or resolves to one already set, stops the
+    /// link's set-up and names the ComParam.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_declared_comparam_the_worker_cannot_take_stops_the_link() {
+        for (name, expected) in [
+            ("CP_Unknown", "does not know ComParam CP_Unknown"),
+            ("CP_BaudrateAlias", "ComParam CP_BaudrateAlias sets what"),
+        ] {
+            let (mut client, _calls, _set) = fake_worker_recording(false, false).await;
+            let config = LinkConfig {
+                params: vec![(name.to_owned(), 1)],
+                ..LinkConfig::iso15765(0x7E0, 0x7E8)
+            };
+            let error = link::open(&mut client, &config, Duration::from_secs(5))
+                .await
+                .err()
+                .expect("refused");
+            assert!(
+                matches!(&error, HostError::DeclaredLink(why) if why.contains(expected)),
+                "{name}: {error}"
+            );
+        }
     }
 
     /// A link whose disconnect fails is not confirmed closed: the job's result stands, and the

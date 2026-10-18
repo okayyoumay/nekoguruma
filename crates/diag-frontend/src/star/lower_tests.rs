@@ -334,11 +334,14 @@ fn jumps_stay_in_their_copies(program: &Program) {
             .map(|s| (s.start_pc, s.end_pc))
             .collect()
     };
+    let mut jumps = 0;
     for (pc, op) in program.code.iter().enumerate() {
         if let Op::Jump(target) | Op::JumpIfFalse(target) = op {
             assert_eq!(covering(pc as u32), covering(*target), "jump at {pc}");
+            jumps += 1;
         }
     }
+    assert!(jumps > 0, "the program has a jump to check");
 }
 
 /// The calls to the copies of the function that logs `message`: whether each call is in a
@@ -402,6 +405,13 @@ def main():
     let program = lowered(source).expect("lowers");
     program.validate().expect("valid");
     jumps_stay_in_their_copies(&program);
+    // Each copy of `helper` branches on its parameter.
+    let branches = program
+        .code
+        .iter()
+        .filter(|op| matches!(op, Op::JumpIfFalse(_)))
+        .count();
+    assert_eq!(branches, 2);
     // `main` calls the outside copy of `helper`, and the section's `inner` its own copy.
     assert_eq!(calls_to(&program, "helper"), [(false, false), (true, true)]);
     // `write`, and its copies of `inner` and `helper`, each covered by a section.

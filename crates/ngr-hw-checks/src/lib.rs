@@ -1,6 +1,7 @@
 //! The real-hardware check harness (design 13.5, ADR-275).
 //!
 //! - [`profile`]: the hardware profile `NGR_HW_PROFILE` names, checked against its class
+//! - [`device`]: the module match, whether the device a worker reports is the profile's
 //! - [`CheckDecl`]: what a check needs, as static data the harness reads without running it
 //! - [`permits`] and [`listing`]: which checks a profile permits
 //! - [`begin`]: the first call of every `hw_` test, which fails without a permitting profile
@@ -10,6 +11,7 @@
 //! so `cargo run -p ngr-hw-checks -- list` lists it. The checks run with
 //! `cargo nextest run --profile hardware --run-ignored=only`; CI never runs them.
 
+pub mod device;
 pub mod profile;
 
 pub use profile::{Class, Operation, Profile, ProfileError};

@@ -2,8 +2,8 @@
 
 `ngr-hw-checks` is the harness of the real-hardware checks (design 13.5, ADR-275). This page
 describes the hardware profile it reads, how a check declares what it needs, and how the two are
-compared. The guarded VCI handle, the module match against the attached device and the report
-writer are not part of the crate yet.
+compared, and how the device a worker reports is matched with the profile. The guarded VCI
+handle, opening the device through a worker and the report writer are not part of the crate yet.
 
 ## Running
 
@@ -53,9 +53,9 @@ does not take. A T3 profile can add nothing.
 |---|---|
 | `api` | `"j2534-0404"` or `"iso22900"` |
 | `library` | The library name, resolved as in design 7.1 |
-| `module` | The device name or serial number the library reports |
+| `module` | D-PDU API: the device name or serial number the library reports (see "The module match"). J2534: a description only, not compared with the device |
 | `label`, `pname` | J2534 only, and required there, not empty: the label and the device name of the configured `modules` entry (ADR-281) |
-| `firmware_version`, `library_version` | What the device reports, compared after opening |
+| `firmware_version`, `library_version` | What the device reports, compared after opening (see "The module match"); a D-PDU API profile writes each as `major.minor.revision`, each part 0 to 255 with no leading zero |
 
 `[link]`, the values an IR `Protocol` declaration carries:
 
@@ -91,6 +91,35 @@ The profile cannot see the hardware, so it only refuses what cannot be two chann
 - One device reached through both APIs, one at each end, looks like two modules here. Design
   13.5's procedure (only the profile's VCIs connected) and the module match against the attached
   device cover it.
+
+## The module match
+
+`ngr_hw_checks::device` decides from a worker's answers whether the attached device is the
+profile's, so that a check can refuse a wrong one before it creates a link (design 13.5, ADR-275
+item 4). The answers are the modules of the worker's `GetModuleIds`, its `GetVersion` after
+opening, and for J2534 the `modules` entries of the worker's configuration (ADR-281).
+
+Values are compared without their surrounding spaces, and a profile whose `module` (D-PDU API)
+or `label` (J2534) is blank is refused before anything is matched.
+
+- **D-PDU API.** A library writes `vendor_module_name` as a list of `attribute='value'` pairs or
+  as plain text (ISO 22900-2 (2022) 10.1.4.6). Exactly one reported module must have the
+  profile's `module` as its whole `vendor_module_name` or as the value of one of its attributes,
+  such as a serial number; none, or several, is refused. `vendor_additional_info` is not read: it
+  describes how the module is connected, which can change while the module stays the same.
+- **J2534.** A J2534 library reports no serial number and lists configured modules whether or not
+  they are present, so the configured `modules` entry with the profile's `label` must be the only
+  entry, and its `pname` must be the profile's. Exactly one reported module carries that label
+  (`j2534-0404-service` reports the label as `vendor_module_name`), and its
+  `vendor_additional_info`, the library the worker loaded, must be the profile's `library`. The
+  profile's `module` is not compared. Requiring a single configured entry is ADR-275 item 4's
+  rule; a worker that starts only the label it is asked for (ADR-281) would let it be relaxed.
+- **Versions.** J2534 reports its versions as strings: the firmware version in `hw_name` and the
+  library (DLL) version in `fw_name`, compared exactly with `firmware_version` and
+  `library_version`. The D-PDU API reports numbers, coded as major, minor and revision in their
+  three high bytes (ISO 22900-2 (2022) 10.1.4.15): `fw_version` and `pdu_api_sw_version` are
+  compared as `major.minor.revision`, so a D-PDU profile writes `firmware_version = "2.1.0"`;
+  any other form is refused when the profile is read.
 
 ## Check declarations
 

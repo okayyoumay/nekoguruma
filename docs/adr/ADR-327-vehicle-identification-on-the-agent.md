@@ -67,18 +67,19 @@ maintainer chose to run the loop on the agent.
 3. **Narrowing.** A candidate is dropped only when a fact contradicts it: a presence answer
    (bus and response identifier) that no ECU definition in any of its entries could have given, an identified variant whose ECU definition
    none of its entries allows (counted only once every other definition that uses the same
-   endpoint and is still named by a remaining candidate has been read conclusively, since an ECU can match the patterns of two alternative
+   endpoint and is still named by a remaining candidate has been read conclusively on that endpoint, since an ECU can match the patterns of two alternative
    definitions; a sibling that is out of reach or inconclusive, item 5, has not been ruled out, so the candidates that need it stay and, if more than one candidate is
    left at the end, the operator chooses; when several match, all of them stay possible
    and the operator chooses, as for variants in item 7, amending ADR-326 item 3's first match), or an identification value whose matching rule (a VIN position
-   range, or a read field) gives a value outside the candidate's. A read is conclusive when every
-   identification request of the definition got either a positive response that decodes or a
+   range, or a read field) gives a value outside the candidate's. Conclusiveness is judged per
+   definition and endpoint, over the variants whose declared links are on that endpoint: a read
+   there is conclusive when every identification request of those variants got either a positive response that decodes or a
    negative response that the ECU definition declares, for that request, as proof that the ECU
    cannot report what its patterns expect. No negative response proves that by default: the
    same code (requestOutOfRange, for example) can mean an identifier the ECU lacks or one that
    is unavailable in the current session or state, so only the ECU definition's author can say
-   which codes are definitive for that ECU. A conclusive read whose
-   variants all fail to match rules out only that definition; a read with no variant matching
+   which codes are definitive for that ECU. A conclusive read on an endpoint
+   whose variants there all fail to match rules out only that definition on that endpoint; a read with no variant matching
    in which some request got no answer or an undeclared negative response is inconclusive and rules out nothing, since ADR-315 counts those
    entries as failed; the
    others sharing the endpoint stay possible, and the endpoint becomes an unrecognized variant
@@ -161,7 +162,10 @@ maintainer chose to run the loop on the agent.
    definitions they name, without candidates, so a fact that contradicts the chosen definition
    (the reason it was chosen by hand) cannot end the job early; or ask for access to every ECU,
    for which the plan holds every ECU definition the tenant may use, also without candidates.
-   In both, items 4 and 5 read every definition in the plan with no narrowing, and each entry's
+   A definition chosen by hand keeps its VIN matching
+   rules in the plan without narrowing anything, so the VIN is still read from the sources they
+   name (item 5), reported, and used to promote to the per-vehicle lock (8.8). In both, items 4
+   and 5 read every definition in the plan with no narrowing, and each entry's
    state is reported as ADR-326 item 3 gives it. Both are recorded as operator choices.
 
 ## Consequences

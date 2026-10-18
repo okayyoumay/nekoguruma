@@ -110,42 +110,42 @@ shape survives inside the second as the access program of item 5.
    behind a gateway) run their access programs in declaration order. The access program is
    lowered on its own, once per variant of the access target, and travels with the job; the
    conversion and `check_job` refuse any other service in it. Every target's variant is
-   identified outside the combination programs, and the first access target's before the
-   per-vehicle lock and the safety preconditions of 8.9, so in a procedure with several targets
-   or with an access target, a one-target procedure whose primary is an access target included,
-   the conversion and `check_job` also refuse a variant pattern (8.9.1) of any target whose
-   service is not a read of the kind an access program may send; identification then sends only
-   reads, whatever the job's class. No access program runs before the job holds the per-vehicle
-   lock, since a session change or an unlock on a shared gateway could end the session that
-   another job of this device on the same vehicle depends on (8.8). So the VIN is read, without
-   any access program, from the first access target, which a locked gateway answers with reads.
-   A first run goes in this order: identify the first access target and read the VIN from it;
-   when the VIN matches, take the per-vehicle lock (8.8), waiting for it with nothing more sent
-   while another job holds it; then identify the first access target again, since the job that
-   held the lock may have reflashed it, and read the VIN again with the variant now identified,
-   since the vehicle may have changed during the wait; then, for each access target in
-   declaration order, run its access program at once, identifying each one after the first just
-   before its program, so that an inner gateway is reached through an unlocked outer one; then
-   identify the other targets and pick the combination (item 7). A VIN that differs, at either
-   read, ends a first run in the 8.9.1 pre-check with only reads sent, and a lock failure leaves
-   only those reads sent. A procedure with several targets and no access target goes the same
-   way with its VIN-source target in place of the first access target: identify that target and
-   read the VIN, take the per-vehicle lock, identify it again and read the VIN again, then
-   identify the other targets and pick the combination, so no variant that picks the combination
-   is identified before the lock is held. A restart (8.2.5) identifies the first access target
-   and reads the VIN from it in ADR-229's order (item 2 step 2), since that target may have been
-   reflashed after the journal recorded its variant, and, once it holds the per-vehicle lock,
-   identifies it again after any wait, reads the VIN again and requires it to match, as a first
-   run does, and only then runs the access programs in the same way before any other step; a
-   restart of a procedure with several targets and no access target does the same with its
-   VIN-source target, identifying it again after any wait for the lock and reading the VIN
-   again, so a vehicle exchanged during the wait is caught before any recovery step. When that
-   VIN-source target is the reprogramming target and the journal has reached its flash plan, it
-   is not identified at either point, since it may answer only from its bootloader (item 7's
-   exception): both VIN reads go through the recorded combination's declarations for it, as
-   ADR-229 reads a one-target restart's VIN, and ADR-229's checks validate it. Since its VIN now
-   comes from an access target rather than from the ECU being reprogrammed, a step 2 VIN read
-   that gets no answer or a negative response ends the restart in on-site intervention
+   identified outside the combination programs, and the first access target's before the per-
+   vehicle lock and the safety preconditions of 8.9, so in a procedure with several targets or
+   with an access target, a one-target procedure whose primary is an access target included, the
+   conversion and `check_job` also refuse a variant pattern (8.9.1) of any target whose service
+   is not a read of the kind an access program may send; identification then sends only reads,
+   whatever the job's class. No access program runs before the job holds the per-vehicle lock,
+   since a session change or an unlock on a shared gateway could end the session that another
+   job of this device on the same vehicle depends on (8.8). So the VIN is read, without any
+   access program, from the first access target, which a locked gateway answers with reads. A
+   first run goes in this order: identify the first access target and read the VIN from it; when
+   the VIN matches, take the per-vehicle lock (8.8), waiting for it with nothing more sent while
+   another job holds it; then identify the first access target again, since the job that held
+   the lock may have reflashed it, and read the VIN again with the variant now identified, since
+   the vehicle may have changed during the wait; then, for each access target in declaration
+   order, run its access program at once, identifying each one after the first just before its
+   program, so that an inner gateway is reached through an unlocked outer one; then identify the
+   other targets and pick the combination (item 7). A VIN that differs, at either read, ends a
+   first run in the 8.9.1 pre-check with only reads sent, and a lock failure leaves only those
+   reads sent. A procedure with several targets and no access target goes the same way with its
+   VIN-source target in place of the first access target: identify that target and read the VIN,
+   take the per-vehicle lock, identify it again and read the VIN again, then identify the other
+   targets and pick the combination, so no variant that picks the combination is identified
+   before the lock is held. A restart (8.2.5) identifies the first access target and reads the
+   VIN from it in ADR-229's order (item 2 step 2), since that target may have been reflashed
+   after the journal recorded its variant, and, once it holds the per-vehicle lock, identifies
+   it again after any wait, reads the VIN again and requires it to match, as a first run does,
+   and only then runs the access programs in the same way before any other step; a restart of a
+   procedure with several targets and no access target does the same with its VIN-source target,
+   identifying it again after any wait for the lock and reading the VIN again, so a vehicle
+   exchanged during the wait is caught before any recovery step. When that VIN-source target is
+   the reprogramming target and the journal has reached its flash plan, it is not identified at
+   either point, since it may answer only from its bootloader (item 7's exception): both VIN
+   reads go through the recorded combination's declarations for it, as ADR-229 reads a one-
+   target restart's VIN, and ADR-229's checks validate it. Since its VIN now comes from an
+   access target rather than from the ECU being reprogrammed, a step 2 VIN read that gets no
+   answer or a negative response ends the restart in on-site intervention
    (`IdentityNotEstablished`, which a later resume may retry, ADR-290) instead of the passive
    teardown ADR-229 takes there, which would reach the reprogramming target's default-session
    confirmation without an unlocked gateway. A step of an access program that fails ends the job
@@ -155,11 +155,21 @@ shape survives inside the second as the access program of item 5.
    is lost; a target without a clock yet holds nothing. A loss counted while an access program
    runs ends the job as a failing step of it does. Every run also runs them again after any
    reopening of the links (a worker crash or VCI disconnect that the job survives) before the
-   program continues; when such a rerun fails, or a loss is counted during it, while the VM is
-   inside an uninterruptible section, the job ends in on-site intervention, since the section
-   cannot continue to its end without the gateway. The main program may still select an access
-   target, but only for reads: the conversion and `check_job` refuse any other service a
-   combination program addresses to an access target, since a session change, a reset or a new
+   program continues, but revalidates the vehicle first, since the cable may now reach another
+   vehicle or a target may have been reflashed while the links were down (design 8.8): it
+   identifies the first access target again and reads the VIN from it, which must match the
+   job's VIN, and identifies each access target again just before its access program runs, which
+   must find the variant the chosen combination names for it; after the last access program it
+   identifies the other targets again, which must also find the chosen combination's variants,
+   except the reprogramming target once the journal has reached its flash plan (item 7's
+   exception). A VIN or a variant that differs ends the job in on-site intervention before
+   anything else is sent, as a restart's differing variant does (item 7), since the program may
+   already have changed the vehicle. When such a rerun or this revalidation fails, or a loss is
+   counted during it, while the VM is inside an uninterruptible section, the job ends in on-site
+   intervention, since the section cannot continue to its end without the gateway; elsewhere it
+   ends as a lost access target would at that point (item 12). The main program may still select
+   an access target, but only for reads: the conversion and `check_job` refuse any other service
+   a combination program addresses to an access target, since a session change, a reset or a new
    security access there would undo the access program while TesterPresent kept being answered
    in the default session, so the loss clock would not see it. A procedure that must change a
    gateway's own state does so in a separate procedure that does not declare it an access

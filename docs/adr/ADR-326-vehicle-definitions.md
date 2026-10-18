@@ -1,7 +1,7 @@
 # ADR-326: Vehicle Definitions for Model Identification and Topology
 
 **Date:** 2026-10-18
-**Status:** Accepted (items 2, 3 and 5 and the Consequences' runtime path amended by ADR-327: a VIN matching rule names the service and field its VIN is read from; when several alternatives of an entry match, the operator chooses; the agent runs identification from a plan and checks variants before a job changes an ECU, so the agent's variant identification and runtime change)
+**Status:** Accepted (items 2, 3 and 5 and the Consequences amended by ADR-327: a VIN matching rule names the service and field its VIN is read from, and an identified variant that contradicts a candidate's topology is a vehicle-derived value for the candidates and the scope check; when several alternatives of an entry match, the entry is ambiguous and the operator chooses; the agent runs identification from a signed plan and guards jobs that change an ECU, so its variant identification and runtime, the IR (variant attributes, definitive negative responses) and the signed job inputs change)
 **Affects:** design 8.1 (L3), 8.3 (ODX subset), 8.8.2 (new), 9.2; `diag-frontend` (a new
 definition kind), `server` (identification, catalog, prefetch), `db/migrations/`
 (`operator_roles.scope`), `schemas/record-template.schema.json` (`appliesTo.models`),

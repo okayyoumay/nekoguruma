@@ -5,9 +5,9 @@
 **Affects:** `agent` (an identification job; the variant guard of jobs that change an ECU),
 `server` (identification plans, re-evaluation of the reported facts, guard lists),
 `diag-frontend` and `diag-ir` (operator-facing variant attributes, definitive negative
-responses, the read-only check of identification services), design 8.2.4, 8.8.2, 8.9.1;
+responses, the read-only check of identification services), design 8.2.4, 8.2.5, 8.8.2, 8.9.1;
 ADR-235 item 8, ADR-315 item 3, ADR-318 items 1 and 4, ADR-324 items 1 and 2, ADR-325 item 7,
-ADR-326 items 2, 3 and 5; `docs/glossary.md`
+ADR-326 items 2, 3 and 5 and its Consequences; `docs/glossary.md`
 
 ## Context
 
@@ -41,7 +41,11 @@ maintainer chose to run the loop on the agent.
    may use that no value established from the vehicle contradicts; values the operator entered
    are left out when the plan is compiled and applied by the server afterwards (item 6), so an
    operator's entry cannot remove a model before the vehicle is read, and the server keeps the
-   candidate set that ADR-326 item 5 evaluates a role's scope against. The plan holds, per
+   candidate set that ADR-326 item 5 evaluates a role's scope against. The identification job
+   itself is authorized without that scope check, which cannot be evaluated before the values
+   exist, and its plan is not narrowed by the operator's role, since a narrowed plan could
+   identify an out-of-scope vehicle as one inside the scope; it is read-only, and the scope
+   check applies to the jobs that follow. The plan holds, per
    candidate, its identifier, its identification values and their matching rules, and its ECU
    entries (role, alternative ECU definitions, optional flag, gateway entry); and the documents
    of every variant of every ECU definition the candidates name, referenced by hash as other job
@@ -56,12 +60,15 @@ maintainer chose to run the loop on the agent.
    any link opens, so neither an identification job nor item 7's guard can itself be the first
    request that changes an ECU. These refusals do not depend on the build; the host's check of
    every request (ADR-235 item 8) stays a second checkpoint where ADR-247 leaves it in force.
-2. **Presence first.** Before any other request, for each distinct link of the ECU definitions
-   in the plan whose protocol declares a functional identifier, the agent sends one presence
-   request functionally (for UDS, TesterPresent with a response requested) and records each
-   physical response identifier that answered. An endpoint is a physical address: the bus
-   (protocol family, pins and baud rate, which tell physical networks apart) and the physical
-   request and response identifiers; definitions whose links differ only in timing or other
+2. **Presence first.** Before any other request, for each distinct bus and functional
+   identifier that the declared links of the plan's variants give (a variant's protocol may
+   declare one), the agent sends one presence request functionally (for UDS, TesterPresent with a
+   response requested) and records each physical response identifier that answered. Unlike the
+   single final response of ADR-235 item 3, this request collects every answer that arrives
+   within the response window on any response identifier of that bus the VCI lets it receive.
+   An endpoint is a physical address: the bus (the link's resource as the agent resolves it,
+   ADR-319: protocol, bus type and pins, with its baud rate, so two spellings of one stack that
+   ADR-324 item 2 accepts name the same bus) and the physical request and response identifiers; definitions whose links differ only in timing or other
    ComParams that do not distinguish the network share an endpoint, since they can reach the
    same ECU. A functional answer shows only the bus and the response identifier, not which
    physical request identifier the ECU listens on, so a presence answer is recorded as that pair
@@ -77,15 +84,19 @@ maintainer chose to run the loop on the agent.
    declares, which ADR-324 item 2 leaves unused for a document job's link; that link still sends
    only physical requests. ADR-235 item 8's read-only policy forbids TesterPresent because it
    keeps a session alive that the job may not own; the presence request is excepted for an
-   identification job only, and is sent once per link, never repeated as a keep-alive. A
+   identification job only, and is sent once per bus and functional identifier, never repeated
+   as a keep-alive. A
    functional request reaches every ECU on the bus, so it may restart the S3 timer of an ECU
    that is in a session another tester opened, when the ECU cannot tell the two testers apart
    (ISO 14229-2 (2021) 9.5 restarts the timer on any request from the client that opened the
    session); sent once, it extends such a session by at most one S3 period, as any single read
    addressed to that ECU would. The other TesterPresent requests stay forbidden to read-only
    jobs, apart from the agent's own keep-alive of access targets (ADR-325 item 11).
-3. **Narrowing.** A candidate is dropped only when a fact contradicts it: an identified variant
-   whose ECU definition none of its entries allows, or an identification value whose matching
+3. **Narrowing.** A candidate is dropped only when a fact contradicts it: an identified variant,
+   on an endpoint that one of the candidate's entries uses, of an ECU definition that no entry of
+   that candidate lists (the candidate expects another ECU at that address, which is stronger
+   evidence than a presence answer, since an unlisted device at an address the candidate does
+   not use drops nothing), or an identification value whose matching
    rule (a VIN position range, or a read field) gives a value outside the candidate's. An
    identified variant counts against candidates only once every other definition that uses the
    same endpoint and is still named by a remaining candidate has been read conclusively on that
@@ -105,7 +116,9 @@ maintainer chose to run the loop on the agent.
    which some request got no answer or an undeclared negative response is inconclusive and rules
    out nothing, since ADR-315 counts those entries as failed. The other definitions sharing the
    endpoint stay possible, and an entry becomes an unrecognized variant (ADR-326 item 3) only
-   when every alternative of that entry using the endpoint has been read without a match. When
+   when every alternative of that entry using the endpoint has been read conclusively without a
+   match; when some of those reads were inconclusive and none matched, the entry is reported as
+   answered but not identified, a state beside ADR-326 item 3's. When
    two alternatives of one entry both match, neither is taken as fitted: the entry is ambiguous,
    its state says so, and the operator picks the alternative, then the variant as item 7 says
    (amending ADR-326 item 3, under which the first matching alternative is fitted). A missing
@@ -146,8 +159,8 @@ maintainer chose to run the loop on the agent.
    identifiers are local to a document, ADR-318), read over that variant's link. When a
    candidate declares a VIN matching rule, the VIN is read after the presence requests and before
    any ECU definition's read: the distinct sources the candidates' rules name are tried in turn,
-   in a fixed order, until one gives a VIN that decodes; two sources on the same service and link
-   whose declarations differ are distinct and each is tried. When no source gives a VIN, every
+   in a fixed order, until one decodes to a well-formed VIN (ADR-261 item 3); two sources on the same service and link
+   whose declarations differ are distinct and each is tried. When no source gives one, every
    VIN rule stays unevaluated. When no candidate declares a VIN matching rule, identification
    reads no VIN (the data author's choice).
 6. **The agent reports facts; the server decides.** The job reports the VIN when read, the
@@ -156,54 +169,67 @@ maintainer chose to run the loop on the agent.
    response code, or no answer, so the server can tell a conclusive read from an inconclusive one
    by item 3), and the entry states of ADR-326 item 3 with item 3's ambiguous state. The server
    recomputes the candidates from these facts with the same rules, so the agent's narrowing only
-   chooses what to read, and then applies the values the operator entered (item 1). One
-   candidate is selected; several go to the operator, as ADR-326 item 2 says, with ADR-326
-   item 5's rule that operator choices never widen what a role permits.
+   chooses what to read, and then applies the values the operator entered (item 1). An identified
+   variant that contradicts a candidate's topology (item 3) is a value established from the
+   vehicle, so it counts for ADR-326 item 2's candidates and for item 5's scope check as the VIN
+   and read fields do. One candidate is selected; several go to the operator, as ADR-326 item 2
+   says, with ADR-326 item 5's rule that operator choices never widen what a role permits.
 7. **Ambiguous variants, operator attributes and the guard.** A variant may carry
    operator-facing attributes, labels with values (transmission: manual), that say nothing to the
    ECU and serve only this choice. When more than one variant of an ECU definition matches in an
    identification job, the agent reports all of them instead of the first one ADR-315 item 3
-   selects, and the operator picks one by its attributes. A job that does not change an ECU
-   identifies each target's variant before its program runs (ADR-325 item 7) and is refused when
-   no candidate matches. A job changes an ECU at a target when any combination it holds sends to
+   selects, and the operator picks one by its attributes. The pick is recorded for the job's
+   data and the vehicle view; it selects no document: a job that does not change an ECU
+   identifies each target's variant before its program runs (ADR-325 item 7, by ADR-315's first
+   match) and is refused when no candidate matches. A job changes an ECU at a target when any combination it holds sends to
    that target a request outside the read-only set of item 1, the services of access programs
    aside (ADR-325 item 10): a configuration write, reprogramming, a DTC clear, a routine (which
-   can erase or actuate whatever its number), a reset, an input-output control. Such a target
+   can erase or actuate whatever its number), a reset, an input-output control. This is wider
+   than the writing job of ADR-257 and ADR-325 item 7, which decides the reprogramming slot and
+   is not changed by it. Such a target
    needs its variant identification to match exactly one variant of exactly one ECU definition
    (8.9.1), and the agent can only know that by trying every variant that could be fitted there.
    So for each target it changes the job also holds a guard list: the declaration-only documents
    of every variant, of any ECU definition the tenant may use, whose declared link is on that
-   target's bus and shares its request or its response identifier (the test ADR-325 item 8 uses
+   target's bus (item 2's resolved bus) and shares its request or its response identifier (the test ADR-325 item 8 uses
    for two links that reach one ECU), the target's own candidates included. The server compiles
    the list whatever the identification concluded about the vehicle (a model-level fact such as
    the VIN cannot rule out an ECU fitted as a replacement, and neither the selected vehicle nor
    the operator's choice may remove a definition from it) and signs it with the job; `check_job`
    refuses a guard document that is not on the signed list, a list that lacks a candidate of its
    target, and a guard variant whose declared link ADR-324 refuses (amending ADR-318 item 1's
-   one document and ADR-325 item 7's job that holds exactly its candidates' documents). The
-   guard runs once the target's variant has been identified (after its access program, for a
-   target behind an access target), with the per-vehicle lock held and the job's VIN matched
-   (8.8), and before the chosen combination's first instruction, so before anything that changes
-   an ECU is sent: the agent runs variant identification for every variant on the list over the
+   one document and ADR-325 item 7's job that holds exactly its candidates' documents). A job that
+   changes an ECU without a guard list for that target (a bare program, or a document run
+   without a server) is refused; a debug build against `sim-vci`, where ADR-247 lets any job
+   write, runs the guard only for the targets it holds lists for. The guard runs once the
+   target's variant has been identified (after its access program, for a target behind an access
+   target), after the job's VIN has matched and with the per-vehicle lock held for a job that
+   reads a VIN, and otherwise under the guards the job holds (8.8, ADR-257), and before the
+   chosen combination's first instruction, so before anything that changes an ECU is sent: the agent runs variant identification for every variant on the list over the
    target's own link (ADR-325 item 8), sending only the read-only identification requests item 1
-   allows. A guard variant whose declared identifiers differ from the target's link gets no
-   answer there and so leaves the guard inconclusive. The job is refused unless exactly one
+   allows. A guard variant whose declared identifiers differ from the target's link may get no
+   answer there, or a negative response its definition does not declare definitive, and so
+   leaves the guard inconclusive. The job is refused unless exactly one
    variant on each list matches, it is the variant identified for that target, and every
    identification request of every variant on the list got a positive response that decodes or a
    negative response its ECU definition declares definitive for it (item 3); no answer or an
    undeclared negative response leaves a variant unexcluded and refuses the job, unlike ADR-315's
-   selection, which treats it as no match. A refused job sends nothing after the identification
-   requests and the access programs. This holds whatever the operator picked, so an operator's
-   choice never decides which ECU a job changes. The guard runs on every run, a restart's
-   included, together with ADR-325 item 7's identification of every target again, and on a job
-   without a journal as on one with. The one exception is ADR-325 item 7's: the reprogramming
+   selection, which treats it as no match. A refused first run sends nothing after the
+   identification requests and the access programs; a refusal on a restart, after a reopening
+   of the links or on a handed-over job, once any step of the program has run, ends in on-site
+   intervention. This holds whatever the operator picked, so an operator's choice never decides
+   which ECU a job changes. The guard runs on every run, a restart's included, together with
+   ADR-325 item 7's identification of every target again, after every reopening of the links
+   that re-runs identification (ADR-325 item 5), and on a job without a journal as on one with.
+   The one exception is ADR-325 item 7's: the reprogramming
    target once the journal has reached its flash plan, which may answer only from its bootloader
    and is validated by ADR-229's hardware identity and state checks instead. For it the
-   combination record that ADR-325 item 7 commits after identification also records that the
-   guard passed and the hashes of the target's guard list (amending ADR-318 item 4 further), and
-   a restart that carries a different guard list for that target, or whose record lacks the
-   pass, ends in on-site intervention as a variant that differs from the recorded combination
-   does. The record is part of the checkpoint summary a handover carries, so a handed-over
+   combination record that ADR-325 item 7 commits, now only after the guard has passed on every
+   target the job changes and before the first instruction, also records that the guard passed
+   and the hashes of the target's guard list (amending ADR-318 item 4 and ADR-325 item 7's
+   record), and a restart inside the flash plan that carries a different guard list for that
+   target, or whose record lacks the pass or is missing, ends in on-site intervention as a
+   variant that differs from the recorded combination does. The record is part of the checkpoint summary a handover carries, so a handed-over
    restart is held to the same list.
 8. **Manual paths.** The operator can choose a vehicle definition by hand (an unregistered or
    misidentified vehicle), and the plan then holds that definition's entries and the ECU
@@ -239,6 +265,11 @@ maintainer chose to run the loop on the agent.
   read inconclusive, so a guard is refused whenever any variant on its list (the target's own
   other patterns included) gets a negative response or no answer; the guard can be used in
   practice only once that declaration exists.
+- An access target's variant is chosen by ADR-315's first match and is not guarded, and its
+  access program (session control and security access) is sent before any guard runs; a target
+  behind an access target is guarded only after it. A guard's expected silences behind an
+  access target wait out ADR-325 item 12's hold, which lengthens the guard there. Both are
+  accepted.
 - Identification through an access target (ADR-325 item 5) is not covered: an identification job
   runs no access program, so an ECU behind a locked gateway is reported as not answering.
   Identifying through an unlocked gateway is a later decision.

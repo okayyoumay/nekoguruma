@@ -1,7 +1,7 @@
 # ADR-325: Procedures That Address Several ECUs
 
 **Date:** 2026-10-17
-**Status:** Accepted (item 7's exact list of declaration-only documents widened by ADR-327: a job that changes an ECU also holds the signed guard list of each target it changes)
+**Status:** Accepted (item 7's exact list of declaration-only documents widened, and its combination record and restart rule extended, by ADR-327: a job that changes an ECU also holds the signed guard list of each target it changes, the record is committed only after every guard passes and holds the reprogramming target's guard pass and list hashes, and a restart inside the flash plan with another list, no pass or no record ends in on-site intervention)
 **Affects:** `diag-ir` (`Program`, `Op`, `VmState`, `DiagHost`, the restart declaration),
 `diag-frontend` (procedure targets, `diag.ecu`, access programs, lowering per combination of
 variants), `agent` (`Job`, `check_job`, policy, one link per target, keep-alive, run and restart

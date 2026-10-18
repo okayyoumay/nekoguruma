@@ -3,7 +3,8 @@
 //! One ECU's CSV + Starlark definition end to end through the j2534-0404 worker (M2 exit
 //! criterion 1). The example ECU converts to one document per variant; the variant is identified
 //! against the simulated ECU behind `sim-vci` from its software version, and its read procedure
-//! (identification DIDs, the active session under a text table, the confirmed DTCs) and its
+//! (identification DIDs, the active session under a text table, a battery voltage and a boot time
+//! under linear conversions, the confirmed DTCs) and its
 //! routine procedure (the programming session's P2* through a linear conversion, then a routine
 //! the ECU refuses for want of an image) run as agent jobs.
 //! Each procedure checks every value it decodes and fails on the first that differs, so a

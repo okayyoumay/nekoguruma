@@ -100,6 +100,9 @@ or `reconnect()` of the simulated ECU leaves it as it is.
 | FD04 | a fixed battery voltage, `BATTERY_VOLTAGE_RAW` (0x007D), as 2 bytes, big endian; the example ECU definition reads it in 0.1 V units as 12.5 V |
 | FD05 | a fixed boot time, `BOOT_TIME_RAW` (0x002D), as 2 bytes, big endian; the example ECU definition reads it in 10 ms units as 450 ms |
 
+The example ECU definition (`crates/diag-frontend/examples/example-ecu`) also declares FD02 and
+FD03, which the simulator does not answer (RequestOutOfRange).
+
 FD00 phase codes: 00 idle, 01 erased, 02 transferring (next block), 03 transfer complete,
 04 verified, 05 interrupted (last stored block). The received byte count is zero when no
 download is open. It is the state check a resume starts with (design 8.2.5): the resume address

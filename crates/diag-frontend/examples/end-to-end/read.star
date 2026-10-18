@@ -1,10 +1,9 @@
 # The read procedure of the end-to-end definition test (M2 exit criterion 1): the example ECU's
 # identification DIDs, the active session (a DID under a text table, which reaches the procedure
 # as its internal value), the battery voltage and the boot time (DIDs under linear conversions,
-# which reach the procedure as physical values)
-# and the confirmed DTCs, each checked
-# against the simulated ECU: its configuration (`ecu.json`) and, for the voltage and the boot
-# time, its fixed readings (`crates/sim-ecu/docs/simulated-ecu.md`). It only reads, so it runs through
+# which reach the procedure as physical values) and the confirmed DTCs. Each is checked against
+# the simulated ECU: its configuration (`ecu.json`) and, for the voltage and the boot time, its
+# fixed readings (`crates/sim-ecu/docs/simulated-ecu.md`). It only reads, so it runs through
 # either worker. A value that differs ends the run as failed with its own code.
 
 def main():

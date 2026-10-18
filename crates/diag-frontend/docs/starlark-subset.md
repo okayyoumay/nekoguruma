@@ -720,7 +720,7 @@ names them at the end of its hint (`(in variant V1)`, `(in variants V1, V2)`).
   instruction set (a `fields` key, a flash session, an argument's range, an instruction the IR
   lacks) is checked by the lowering
 - Constant folding is done during bytecode generation
-- After generation, verify with a dry run on the `diag-ir` VM (vehicle access mocked) (12.1)
+- After generation, verify with a dry run on the `diag-ir` VM (vehicle access mocked) (12.1): `diag_ir::dry_run` with a script of answers, or with answers built from the declaration part (ADR-328)
 
 ## 7. Verification
 

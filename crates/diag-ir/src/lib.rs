@@ -2,6 +2,7 @@
 //!
 //! - Declaration part: FlatBuffers (`schema/ir.fbs`), read through [`declaration`]; responses
 //!   are decoded with it by [`decode`], and request operands encoded by [`encode`]. This file handles the procedure part.
+//! - [`dry_run`]: a procedure run with vehicle access mocked (12.1, ADR-328).
 //! - Procedure part: custom bytecode VM. The entire execution state must be serializable (8.2.3).
 
 // The FlatBuffers bindings of the declaration part name `alloc::` paths (`declaration`).
@@ -9,6 +10,7 @@ extern crate alloc;
 
 pub mod declaration;
 pub mod decode;
+pub mod dry_run;
 pub mod encode;
 mod recovery;
 

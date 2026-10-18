@@ -31,7 +31,11 @@ maintainer chose to run the loop on the agent.
 
 1. **An identification job runs the loop on the agent.** It is a read-only job kind that carries
    an identification plan, which the server compiles from the candidate vehicle definitions and
-   signs with the job instruction. The plan holds, per candidate, its identifier, its
+   signs with the job instruction. The plan's candidates are every vehicle definition the tenant
+   may use that no value established from the vehicle contradicts; values the operator entered
+   are left out when the plan is compiled and applied by the server afterwards (item 6), so an
+   operator's entry cannot remove a model before the vehicle is read, and the server keeps the
+   candidate set that ADR-326 item 5 evaluates a role's scope against. The plan holds, per candidate, its identifier, its
    identification values and their matching rules, and its ECU entries (role, alternative ECU
    definitions, optional flag, gateway entry); and the documents of every variant of every ECU
    definition the candidates name, referenced by hash as other job documents are (ADR-318), so

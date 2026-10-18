@@ -413,3 +413,89 @@ fn the_report_stops_growing_at_its_budget() {
         MAX_REPORT_BYTES / ((1 << 20) + 1 + EVENT_COST)
     );
 }
+
+#[test]
+fn a_repeat_too_large_to_count_is_capped() {
+    let layout = LayoutT {
+        id: 1,
+        short_name: Some("l1".into()),
+        byte_size: 0,
+        fields: Some(vec![at(11, DataKind::Uint, 0, 8)]),
+    };
+    let field = FieldT {
+        shape: ShapeT::Repeat(Box::new(RepeatT {
+            layout_id: 1,
+            count: RepeatCount::Fixed,
+            fixed_count: u32::MAX,
+            item_byte_size: u32::MAX,
+            ..Default::default()
+        })),
+        ..next(1, DataKind::Bytes, 0)
+    };
+    let (answer, _) = built(vec![field, next(2, DataKind::Uint, 8)], vec![layout]);
+    assert_eq!(answer.len(), crate::MAX_BYTES_LEN);
+}
+
+#[test]
+fn a_number_whose_length_is_another_fields_ends_the_built_answer() {
+    let fields = vec![
+        next(1, DataKind::Uint, 8),
+        FieldT {
+            length_kind: LengthKind::FromField,
+            length_field_id: 1,
+            ..next(2, DataKind::Uint, 0)
+        },
+        next(3, DataKind::Uint, 8),
+    ];
+    let (answer, decoded) = built(fields, vec![]);
+    // A width of zero is no number, so the answer stops before it and needs a script.
+    assert_eq!(answer, [0x62, 0]);
+    assert!(decoded.is_err(), "{decoded:?}");
+}
+
+#[test]
+fn decoded_values_count_toward_the_budget() {
+    // 4096 fields that all read the same 256 bytes: a 257-byte answer decodes to 1 MiB.
+    let fields: Vec<FieldT> = (1..=4096)
+        .map(|id| at(id, DataKind::Bytes, 8, 8 * 256))
+        .collect();
+    let buf = document(vec![service(7, "wide", 0x22, &[], fields)], vec![]);
+    let program = program(
+        vec![
+            Op::PushBytes(0),
+            Op::ServiceRequest { service: 0x22 },
+            Op::Pop,
+            Op::Jump(0),
+        ],
+        vec![vec![]],
+    );
+    let report = run(&buf, &program, &Script::new());
+    assert_eq!(report.end, DryRunEnd::Host(DryRunError::ReportTooLarge));
+    assert!(
+        report.events.len() < MAX_REPORT_BYTES / (4096 * 256),
+        "{} events",
+        report.events.len()
+    );
+}
+
+#[test]
+fn a_last_log_past_the_budget_still_ends_the_run() {
+    let buf = document(vec![service(7, "big", 0x2E, &[], vec![])], vec![]);
+    let mut request = vec![0x2E];
+    request.resize(MAX_REPORT_BYTES - 2 * EVENT_COST, 0);
+    let program = program(
+        vec![
+            Op::PushBytes(0),
+            Op::SendReceive { service: 7 },
+            Op::Pop,
+            Op::Log {
+                level: 1,
+                message: 1,
+            },
+        ],
+        vec![request, b"a message past the budget".to_vec()],
+    );
+    let report = run(&buf, &program, &Script::new());
+    assert_eq!(report.end, DryRunEnd::Host(DryRunError::ReportTooLarge));
+    assert_eq!(report.events.len(), 1);
+}

@@ -49,7 +49,8 @@ A shared dry run has to settle three things the VM leaves to its host:
    built from the service's declared positive response: its SID and prefix, then the fewest
    bytes each field decodes from, all zero but a terminator. A fixed field takes its width; a
    leading length is a zero prefix and an empty value; a length or repeat count taken from
-   another field is that field's zero, so an empty value or no items; a terminated value takes
+   another field is that field's zero, so an empty bytes or text value or no items (a number
+   cannot be zero bits wide, so one with such a length ends the answer); a terminated value takes
    its minimum bytes and then its terminator, or its maximum when no terminator fits below it; a
    group takes its layout's declared size and a fixed repeat its items' total size. A value
    that reads to the end of the message (a terminated value with no terminator and no maximum,
@@ -81,9 +82,11 @@ A shared dry run has to settle three things the VM leaves to its host:
    reported.
 
 7. **Bounded by the caller and by the report.** The caller gives a step limit. The report holds
-   at most `MAX_REPORT_BYTES` (64 MiB) of requests, answers, seeds and keys, transfer data,
+   at most `MAX_REPORT_BYTES` (64 MiB) of requests, answers, service names, decoded values
+   (each field's size, name and bytes, nested fields included), seeds and keys, transfer data,
    forms and messages, each event counted as at least `EVENT_COST` bytes besides its own; an
-   event past that ends the run with a host error before its bytes are copied. A definition run
+   event past that ends the run with a host error before it is stored, and a log message past
+   it, which the host cannot refuse, ends the run after its step. A definition run
    at ingestion is untrusted, and a loop resending a 16 MiB value would otherwise grow the
    report without bound.
 

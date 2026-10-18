@@ -13,7 +13,7 @@ use crate::declaration::{
     DataKind, EcuVariant, Field, LengthKind, Placement, PositiveResponse, RepeatCount, Service,
     Shape, Termination,
 };
-use crate::decode::{DecodeError, DecodedField, Layouts, decode_positive_response};
+use crate::decode::{DecodeError, DecodedField, Layouts, PhysicalValue, decode_positive_response};
 use crate::{
     DiagHost, Failure, Program, ProgramError, StepError, StepOutcome, Vm, VmError, WaitingOn,
 };
@@ -208,10 +208,11 @@ pub fn dry_run(
         if vm.state.steps >= max_steps {
             break DryRunEnd::StepLimit;
         }
-        match vm.step_with_declarations(program, Some(variant), &mut host) {
-            Ok(StepOutcome::Continue) if host.over_budget => {
-                break DryRunEnd::Host(DryRunError::ReportTooLarge);
-            }
+        let outcome = vm.step_with_declarations(program, Some(variant), &mut host);
+        if host.over_budget {
+            break DryRunEnd::Host(DryRunError::ReportTooLarge);
+        }
+        match outcome {
             Ok(StepOutcome::Continue) => {}
             Ok(StepOutcome::Finished) => break DryRunEnd::Finished,
             Ok(StepOutcome::Failed(failure)) => break DryRunEnd::Failed(failure),
@@ -289,10 +290,20 @@ impl ScriptedHost<'_, '_> {
                 (built_response(&positive, self.variant.layouts()), true)
             }
         };
-        self.charge(request.len() + answer.len())?;
         let decoded = service
             .positive()
             .map(|positive| decode_positive_response(&positive, self.variant.layouts(), &answer));
+        let decoded_bytes = match &decoded {
+            Some(Ok(fields)) => decoded_cost(fields),
+            _ => 0,
+        };
+        self.charge(
+            request
+                .len()
+                .saturating_add(answer.len())
+                .saturating_add(name.len())
+                .saturating_add(decoded_bytes),
+        )?;
         self.events.push(DryRunEvent::Request {
             request: request.to_vec(),
             service: name,
@@ -363,7 +374,7 @@ fn built_response(positive: &PositiveResponse<'_>, layouts: Layouts<'_>) -> Vec<
     for field in positive.fields().into_iter().flatten() {
         let at = match field.placement() {
             Placement::AfterPrevious => match cursor {
-                Some(previous) => previous.div_ceil(8) * 8 + u64::from(field.bit_offset()),
+                Some(previous) => byte_edge(previous).saturating_add(u64::from(field.bit_offset())),
                 None => break,
             },
             _ => u64::from(field.bit_offset()),
@@ -390,6 +401,18 @@ fn built_response(positive: &PositiveResponse<'_>, layouts: Layouts<'_>) -> Vec<
     bytes
 }
 
+/// The first byte edge at or after bit `bits`, saturating.
+fn byte_edge(bits: u64) -> u64 {
+    bits.div_ceil(8).saturating_mul(8)
+}
+
+fn is_string(kind: DataKind) -> bool {
+    matches!(
+        kind,
+        DataKind::Bytes | DataKind::Ascii | DataKind::Utf8 | DataKind::Unicode2
+    )
+}
+
 /// The least a field placed at bit `at` takes in a built answer.
 struct Extent {
     /// Where it ends, in bits from the SID.
@@ -405,9 +428,9 @@ struct Extent {
 /// when that is not known from the declaration (a `Select`, a repeat up to a marker, or a
 /// layout of no declared size).
 fn least_extent(field: &Field<'_>, layouts: Layouts<'_>, at: u64) -> Option<Extent> {
-    let edge = at.div_ceil(8) * 8;
+    let edge = byte_edge(at);
     let sized = |bits: u64| Extent {
-        end: edge + bits,
+        end: edge.saturating_add(bits),
         terminator: None,
         followed: true,
     };
@@ -426,7 +449,8 @@ fn least_extent(field: &Field<'_>, layouts: Layouts<'_>, at: u64) -> Option<Exte
         let repeat = field.shape_as_repeat()?;
         return match repeat.count() {
             RepeatCount::Fixed => Some(sized(
-                8 * u64::from(repeat.fixed_count()) * u64::from(repeat.item_byte_size()),
+                (8 * u64::from(repeat.fixed_count()))
+                    .saturating_mul(u64::from(repeat.item_byte_size())),
             )),
             // A count field built as zero gives no items.
             RepeatCount::FromField => Some(sized(0)),
@@ -439,11 +463,13 @@ fn least_extent(field: &Field<'_>, layouts: Layouts<'_>, at: u64) -> Option<Exte
     }
     match field.length_kind() {
         LengthKind::Fixed => Some(Extent {
-            end: at + u64::from(field.bit_length()),
+            end: at.saturating_add(u64::from(field.bit_length())),
             terminator: None,
             followed: true,
         }),
-        // A length field built as zero gives an empty value.
+        // A length field built as zero gives an empty value, which only bytes and text take;
+        // a number needs at least one bit, so its extent is not known.
+        LengthKind::FromField if !is_string(field.kind()) => None,
         LengthKind::FromField => Some(Extent {
             end: at,
             terminator: None,
@@ -451,7 +477,7 @@ fn least_extent(field: &Field<'_>, layouts: Layouts<'_>, at: u64) -> Option<Exte
         }),
         // A zero length prefix, then no value.
         LengthKind::LeadingLength => Some(Extent {
-            end: (at + u64::from(field.bit_length())).div_ceil(8) * 8,
+            end: byte_edge(at.saturating_add(u64::from(field.bit_length()))),
             terminator: None,
             followed: true,
         }),
@@ -485,6 +511,29 @@ fn least_extent(field: &Field<'_>, layouts: Layouts<'_>, at: u64) -> Option<Exte
         }
         _ => None,
     }
+}
+
+/// What `fields` count toward [`MAX_REPORT_BYTES`]: each field's size, its name and its
+/// value's bytes, nested fields included.
+fn decoded_cost(fields: &[DecodedField]) -> usize {
+    fields.iter().fold(0, |total: usize, field| {
+        let value = match &field.value {
+            PhysicalValue::Text(text) => text.len(),
+            PhysicalValue::Bytes(bytes) => bytes.len(),
+            PhysicalValue::Group(fields) | PhysicalValue::Select { fields, .. } => {
+                decoded_cost(fields)
+            }
+            PhysicalValue::Repeat(items) => items.iter().fold(0, |sum: usize, item| {
+                sum.saturating_add(size_of::<Vec<DecodedField>>())
+                    .saturating_add(decoded_cost(item))
+            }),
+            PhysicalValue::Unsigned(_) | PhysicalValue::Signed(_) | PhysicalValue::Float(_) => 0,
+        };
+        total
+            .saturating_add(size_of::<DecodedField>())
+            .saturating_add(field.short_name.len())
+            .saturating_add(value)
+    })
 }
 
 impl DiagHost for ScriptedHost<'_, '_> {

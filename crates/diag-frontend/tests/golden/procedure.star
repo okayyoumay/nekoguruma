@@ -1,9 +1,19 @@
 # The procedure the IR golden test lowers for every variant of the example ECU and runs against
-# a host that records each request and answers it positively from responses.txt.
+# a host that records each request and answers it positively from responses.txt. The VIN write
+# is a section function (subset 4.5) whose helper is also called outside it, so the program holds
+# two copies of the helper and a section over the write's copies (ADR-301, ADR-329).
+
+def read_vin():
+    diag.request(0x22, {"did": 0xF190})
+
+# @section uninterruptible expected=2000
+def write_vin():
+    read_vin()
+    diag.request(0x2E, {"did": 0xF190, "vin": "WVWZZZ1JZXW000001"})
 
 def main():
     diag.request(0x10, {"sub": 0x03})
-    diag.request(0x22, {"did": 0xF190})
+    read_vin()
     session = diag.request(0x22, {"did": 0xF186})
     if session["fields"]["session"] == 3:
         diag.log(1, "extended session")
@@ -16,5 +26,5 @@ def main():
     check = diag.routine(0xFF01, 0x01, {})
     if check["ok"] and check["fields"]["result"] == 0:
         diag.log(1, "programming dependencies correct")
-    diag.request(0x2E, {"did": 0xF190, "vin": "WVWZZZ1JZXW000001"})
+    write_vin()
     diag.log(1, "done")

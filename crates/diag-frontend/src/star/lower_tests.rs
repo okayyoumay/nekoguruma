@@ -1209,15 +1209,11 @@ fn a_protocol_neutral_call_needs_its_profile_to_define_it() {
         ),
         [(StarCode::NotLowerable, 2)]
     );
-    // UDS defines all three. `diag.read_dtc` and `diag.routine` are lowered, and need a
-    // declared service, which this variant lacks; `diag.security_access` is not lowered yet.
+    // UDS defines all three. `diag.read_dtc` and `diag.routine` need a declared service,
+    // which this variant lacks; `diag.security_access` needs none.
     assert_eq!(
         codes_over(&crate::profile::UDS_PROFILE, source),
-        [
-            (StarCode::UnknownService, 2),
-            (StarCode::UnknownService, 3),
-            (StarCode::NotLowerable, 4)
-        ]
+        [(StarCode::UnknownService, 2), (StarCode::UnknownService, 3)]
     );
 }
 
@@ -1288,18 +1284,28 @@ def main():
 }
 
 /// A host that records the calls procedures make, and reports a wait as done only from its
-/// `waits_pending`-th inquiry on.
+/// `waits_pending`-th inquiry on. `ServiceRequest`s are answered from `responses` and keys from
+/// `keys` in order, a key only from its `keys_pending`-th inquiry on.
 #[derive(Default)]
 struct ScriptedHost {
     calls: Vec<String>,
     waits_pending: u32,
+    responses: std::collections::VecDeque<Vec<u8>>,
+    keys: std::collections::VecDeque<Vec<u8>>,
+    keys_pending: u32,
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02X}")).collect()
 }
 
 impl DiagHost for ScriptedHost {
     type Error = NoHostError;
 
-    fn service_request(&mut self, _: u16, _: &[u8]) -> Result<Vec<u8>, NoHostError> {
-        unreachable!("not lowered yet")
+    fn service_request(&mut self, service: u16, payload: &[u8]) -> Result<Vec<u8>, NoHostError> {
+        self.calls
+            .push(format!("request {service:02X} {}", hex(payload)));
+        Ok(self.responses.pop_front().expect("a scripted response"))
     }
     fn send_receive(&mut self, _: u32, _: &[u8]) -> Result<Vec<u8>, NoHostError> {
         unreachable!("not lowered yet")
@@ -1310,8 +1316,18 @@ impl DiagHost for ScriptedHost {
     fn routine_control(&mut self, _: u16, _: u8, _: &[u8]) -> Result<Vec<u8>, NoHostError> {
         unreachable!("not lowered yet")
     }
-    fn security_access(&mut self, _: u64, _: u8, _: &[u8]) -> Result<Option<Vec<u8>>, NoHostError> {
-        unreachable!("not lowered yet")
+    fn security_access(
+        &mut self,
+        _: u64,
+        level: u8,
+        seed: &[u8],
+    ) -> Result<Option<Vec<u8>>, NoHostError> {
+        if self.keys_pending > 0 {
+            self.keys_pending -= 1;
+            return Ok(None);
+        }
+        self.calls.push(format!("key {level:02X} {}", hex(seed)));
+        Ok(Some(self.keys.pop_front().expect("a scripted key")))
     }
     fn flash_transfer(&mut self, _: u32, _: &[u8]) -> Result<(), NoHostError> {
         unreachable!("not lowered yet")
@@ -1339,7 +1355,8 @@ impl DiagHost for ScriptedHost {
     }
 }
 
-/// Runs `source` against `host` to its end, counting the steps that waited.
+/// Runs `source` against `host` to its end, counting the steps that waited, for a timer or a
+/// key.
 fn run_on(source: &str, host: &mut ScriptedHost) -> u32 {
     let program = lowered(source).unwrap_or_else(|errors| panic!("{errors:#?}"));
     let mut vm = Vm::new(&program);
@@ -1348,11 +1365,178 @@ fn run_on(source: &str, host: &mut ScriptedHost) -> u32 {
         match vm.step(&program, host) {
             Ok(StepOutcome::Continue) => {}
             Ok(StepOutcome::Finished) => return waited,
-            Ok(StepOutcome::Waiting(WaitingOn::Timer)) => waited += 1,
+            Ok(StepOutcome::Waiting(WaitingOn::Timer | WaitingOn::SeedKey)) => waited += 1,
             other => panic!("{other:?}"),
         }
     }
     panic!("the procedure did not end")
+}
+
+/// Logs what a `diag.security_access(0x01)` result holds.
+const SECURITY_ACCESS: &str = "\
+def main():
+    res = diag.security_access(0x01)
+    if res[\"ok\"]:
+        diag.log(1, \"unlocked\")
+    else:
+        diag.log(1, \"refused\")
+    if res[\"nrc\"] == 0x35:
+        diag.log(1, \"invalid key\")
+    if res[\"nrc\"] == 0x22:
+        diag.log(1, \"conditions not correct\")
+    if res[\"raw\"] == b\"\\x67\\x02\":
+        diag.log(1, \"key response\")
+";
+
+fn security_access_host(responses: &[&[u8]], keys: &[&[u8]]) -> ScriptedHost {
+    ScriptedHost {
+        responses: responses.iter().map(|r| r.to_vec()).collect(),
+        keys: keys.iter().map(|k| k.to_vec()).collect(),
+        ..ScriptedHost::default()
+    }
+}
+
+#[test]
+fn security_access_sends_the_seed_request_the_key_step_and_the_key() {
+    let mut host = security_access_host(
+        &[&[0x67, 0x01, 0xAA, 0xBB], &[0x67, 0x02]],
+        &[&[0x12, 0x34]],
+    );
+    host.keys_pending = 2;
+    // The VM waits on the key until the host has it, then goes on.
+    assert_eq!(run_on(SECURITY_ACCESS, &mut host), 2);
+    assert_eq!(
+        host.calls,
+        [
+            "request 27 01",
+            "key 01 AABB",
+            "request 27 021234",
+            "log 1 unlocked",
+            "log 1 key response"
+        ]
+    );
+    // The highest level, and a seed response with no seed bytes after the level, or none at all:
+    // the host is handed what there is.
+    let mut host = security_access_host(&[&[0x67, 0x7D], &[0x67, 0x7E]], &[&[0x01]]);
+    run_on("def main():\n    diag.security_access(0x7D)\n", &mut host);
+    assert_eq!(host.calls, ["request 27 7D", "key 7D ", "request 27 7E01"]);
+    let mut host = security_access_host(&[&[0x67], &[0x67, 0x02]], &[&[0x01]]);
+    run_on("def main():\n    diag.security_access(1)\n", &mut host);
+    assert_eq!(host.calls, ["request 27 01", "key 01 ", "request 27 0201"]);
+}
+
+#[test]
+fn security_access_in_a_loop_starts_each_call_from_a_new_seed_request() {
+    let mut host = security_access_host(
+        &[
+            &[0x67, 0x01, 0x11],
+            &[0x7F, 0x27, 0x35],
+            &[0x67, 0x01, 0x22],
+            &[0x67, 0x02],
+        ],
+        &[&[0xA1], &[0xA2]],
+    );
+    let source = "\
+def main():
+    for i in range(2):
+        res = diag.security_access(0x01)
+        if res[\"ok\"]:
+            diag.log(1, \"unlocked\")
+";
+    run_on(source, &mut host);
+    assert_eq!(
+        host.calls,
+        [
+            "request 27 01",
+            "key 01 11",
+            "request 27 02A1",
+            "request 27 01",
+            "key 01 22",
+            "request 27 02A2",
+            "log 1 unlocked"
+        ]
+    );
+}
+
+#[test]
+fn a_negative_seed_response_ends_security_access_before_the_key_step() {
+    let mut host = security_access_host(&[&[0x7F, 0x27, 0x22]], &[]);
+    run_on(SECURITY_ACCESS, &mut host);
+    assert_eq!(
+        host.calls,
+        [
+            "request 27 01",
+            "log 1 refused",
+            "log 1 conditions not correct"
+        ]
+    );
+}
+
+#[test]
+fn a_negative_key_response_is_the_security_access_result() {
+    let mut host = security_access_host(&[&[0x67, 0x01, 0x5A], &[0x7F, 0x27, 0x35]], &[&[0x99]]);
+    run_on(SECURITY_ACCESS, &mut host);
+    assert_eq!(
+        host.calls,
+        [
+            "request 27 01",
+            "key 01 5A",
+            "request 27 0299",
+            "log 1 refused",
+            "log 1 invalid key"
+        ]
+    );
+}
+
+#[test]
+fn security_access_arguments_and_results_are_checked() {
+    use StarCode::*;
+    let cases = [
+        (
+            "def main():\n    diag.security_access(2)\n",
+            ArgumentOutOfRange,
+        ),
+        (
+            "def main():\n    diag.security_access(0)\n",
+            ArgumentOutOfRange,
+        ),
+        (
+            "def main():\n    diag.security_access(0xFF)\n",
+            ArgumentOutOfRange,
+        ),
+        (
+            "def f(n):\n    diag.security_access(n)\n\ndef main():\n    f(1)\n",
+            NonConstantArgument,
+        ),
+        (
+            "def main():\n    diag.security_access(\"1\")\n",
+            UnsupportedSyntax,
+        ),
+        (
+            "def main():\n    diag.security_access(1, 2)\n",
+            UnsupportedSyntax,
+        ),
+        (
+            "def main():\n    diag.security_access(0x7F)\n",
+            ArgumentOutOfRange,
+        ),
+        (
+            "def main():\n    diag.security_access(0x81)\n",
+            ArgumentOutOfRange,
+        ),
+        // The result has no fields (ADR-314 item 4).
+        (
+            "def main():\n    res = diag.security_access(1)\n    x = res[\"fields\"][\"key\"]\n",
+            NotInProfile,
+        ),
+    ];
+    for (source, code) in cases {
+        let found = codes(source);
+        assert!(
+            !found.is_empty() && found.iter().all(|(c, _)| *c == code),
+            "{source}: {found:?}"
+        );
+    }
 }
 
 #[test]

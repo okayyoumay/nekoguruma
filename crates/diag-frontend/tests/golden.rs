@@ -180,6 +180,58 @@ impl DiagHost for Recording {
     }
 }
 
+/// The lowering's sections (ADR-332): sorted and disjoint, one over each diagnostic primitive
+/// alone, the rest `CheckState` pieces that share their neighbours' interruptibility and
+/// expected duration, so each section function's copy is covered without a gap.
+fn assert_sections_split(program: &Program) {
+    let primitive = |pc: u32| program.code[pc as usize].is_diagnostic_primitive();
+    let covering = |pc: u32| {
+        program
+            .sections
+            .iter()
+            .filter(|s| (s.start_pc..s.end_pc).contains(&pc))
+            .count()
+    };
+    for pair in program.sections.windows(2) {
+        assert!(pair[0].end_pc <= pair[1].start_pc, "{pair:?}");
+    }
+    let mut primitives = 0;
+    for pc in 0..program.code.len() as u32 {
+        if primitive(pc) {
+            primitives += 1;
+            assert_eq!(covering(pc), 1, "the primitive at {pc}");
+        }
+    }
+    assert!(primitives > 0);
+    let is_piece = |s: &diag_ir::Section| !(s.start_pc..s.end_pc).any(primitive);
+    for section in &program.sections {
+        if is_piece(section) {
+            assert!(matches!(
+                section.idempotency,
+                diag_ir::Idempotency::CheckState
+            ));
+        } else {
+            assert_eq!(section.end_pc, section.start_pc + 1, "{section:?}");
+        }
+    }
+    for pair in program.sections.windows(2) {
+        if pair[0].end_pc == pair[1].start_pc && (is_piece(&pair[0]) || is_piece(&pair[1])) {
+            assert_eq!(
+                (
+                    format!("{:?}", pair[0].interruptible),
+                    pair[0].expected_millis
+                ),
+                (
+                    format!("{:?}", pair[1].interruptible),
+                    pair[1].expected_millis
+                ),
+                "{pair:?}"
+            );
+        }
+    }
+    assert!(program.sections.iter().any(is_piece), "a section function");
+}
+
 /// The requests and logs `program` produces with the declarations of `variant`, answered from
 /// `answers`, then how it ends.
 fn run(program: &Program, variant: &EcuVariant<'_>, answers: Vec<Vec<u8>>) -> String {
@@ -232,6 +284,8 @@ fn the_example_ecu_converts_runs_and_decodes_as_recorded() {
         let program: Program =
             postcard::from_bytes(loaded.procedure().expect("a procedure").bytes())
                 .expect("a program");
+        program.validate().expect("the program is valid");
+        assert_sections_split(&program);
 
         // The declaration part and the program, the procedure's bytes shown as the program.
         let mut unpacked = loaded.unpack();

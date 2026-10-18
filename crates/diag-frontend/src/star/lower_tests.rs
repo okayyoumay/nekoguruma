@@ -307,12 +307,6 @@ fn large_dicts_compare_in_linear_time() {
     assert!(started.elapsed() < std::time::Duration::from_secs(60));
 }
 
-#[test]
-fn idempotency_annotations_are_not_dropped() {
-    let source = "def main():\n    # @idempotency unsafe\n    x = 1\n";
-    assert_eq!(codes(source), vec![(StarCode::NotLowerable, 2)]);
-}
-
 /// The instructions of `program` that log `message`.
 fn logs_of(program: &Program, message: &str) -> Vec<u32> {
     let index = program
@@ -327,12 +321,15 @@ fn logs_of(program: &Program, message: &str) -> Vec<u32> {
         .collect()
 }
 
-/// Every jump stays in the copy it is in: its target is covered by the same sections.
+/// Every jump stays in the copy it is in: its target is in the same sections of the copies that
+/// run in a section function (a primitive outside every section has one of its own that is
+/// `Yes`, which is left out).
 fn jumps_stay_in_their_copies(program: &Program) {
-    let covering = |pc: u32| -> Vec<(u32, u32)> {
+    let covering = |pc: u32| -> Vec<(String, u32)> {
         in_a_section(program, pc)
             .iter()
-            .map(|s| (s.start_pc, s.end_pc))
+            .filter(|s| !matches!(s.interruptible, Interruptible::Yes))
+            .map(|s| (format!("{:?}", s.interruptible), s.expected_millis))
             .collect()
     };
     let mut jumps = 0;
@@ -382,6 +379,362 @@ fn in_a_section(program: &Program, pc: u32) -> Vec<&Section> {
         .collect()
 }
 
+/// The invariant of ADR-332 for a lowered program: the sections are sorted and never overlap,
+/// every diagnostic primitive has a section over it alone, a section that covers no primitive
+/// is a `CheckState` piece, and pieces share their neighbours' interruptibility and duration, so
+/// the copy of a section function they cut is covered without a gap by one set of attributes.
+fn assert_sections_split(program: &Program) {
+    let attributes = |s: &Section| (format!("{:?}", s.interruptible), s.expected_millis);
+    for pair in program.sections.windows(2) {
+        assert!(pair[0].start_pc < pair[1].start_pc, "sorted: {pair:?}");
+        assert!(pair[0].end_pc <= pair[1].start_pc, "disjoint: {pair:?}");
+    }
+    let primitive = |pc: u32| program.code[pc as usize].is_diagnostic_primitive();
+    let mut pieces = Vec::new();
+    for section in &program.sections {
+        let covered = (section.start_pc..section.end_pc).filter(|&pc| primitive(pc));
+        match covered.count() {
+            0 => {
+                assert!(
+                    matches!(section.idempotency, Idempotency::CheckState),
+                    "a piece says nothing: {section:?}"
+                );
+                pieces.push(section);
+            }
+            1 => assert_eq!(section.end_pc, section.start_pc + 1, "{section:?}"),
+            _ => panic!("one primitive at most: {section:?}"),
+        }
+    }
+    for pc in (0..program.code.len() as u32).filter(|&pc| primitive(pc)) {
+        let [section] = in_a_section(program, pc)[..] else {
+            panic!("exactly one section covers the primitive at {pc}");
+        };
+        assert_eq!((section.start_pc, section.end_pc), (pc, pc + 1));
+    }
+    for pair in program.sections.windows(2) {
+        let adjacent = pair[0].end_pc == pair[1].start_pc;
+        let piece = |s: &Section| pieces.iter().any(|p| std::ptr::eq(*p, s));
+        if adjacent && (piece(&pair[0]) || piece(&pair[1])) {
+            assert_eq!(attributes(&pair[0]), attributes(&pair[1]), "{pair:?}");
+        }
+    }
+}
+
+/// The primitives of `program` in pc order, each with the idempotency of its section.
+fn primitives_of(program: &Program) -> Vec<String> {
+    (0..program.code.len() as u32)
+        .filter(|&pc| program.code[pc as usize].is_diagnostic_primitive())
+        .map(|pc| {
+            let [section] = in_a_section(program, pc)[..] else {
+                panic!("one section covers the primitive at {pc}");
+            };
+            format!("{:?}", section.idempotency)
+        })
+        .collect()
+}
+
+#[test]
+fn a_call_has_its_default_idempotency_and_an_annotation_replaces_it() {
+    let source = "\
+def main():
+    diag.wait(1)
+    # @idempotency unsafe
+    diag.wait(2)
+    # @idempotency checkState
+    diag.log(1, \"x\")
+    diag.log(1, \"y\")
+";
+    let program = lowered(source).expect("lowers");
+    program.validate().expect("valid");
+    assert_sections_split(&program);
+    assert_eq!(
+        primitives_of(&program),
+        ["Safe", "Unsafe", "CheckState", "Safe"]
+    );
+    // Outside every section each primitive's section is `Yes` with an expected duration of 0.
+    assert_eq!(program.sections.len(), 4);
+    for section in &program.sections {
+        assert_eq!(section.end_pc, section.start_pc + 1);
+        assert!(matches!(section.interruptible, Interruptible::Yes));
+        assert_eq!(section.expected_millis, 0);
+    }
+}
+
+#[test]
+fn an_annotation_reaches_nested_statements_and_the_inner_one_wins() {
+    let source = "\
+def helper():
+    diag.wait(5)
+
+def pick(n):
+    # @idempotency unsafe
+    if n > 1:
+        diag.wait(1)
+    else:
+        diag.log(1, \"e\")
+
+def main():
+    # @idempotency unsafe
+    for i in range(3):
+        diag.wait(1)
+        # @idempotency checkState
+        if i > 1:
+            diag.wait(2)
+        diag.log(1, \"a\")
+        helper()
+    pick(2)
+";
+    let program = lowered(source).expect("lowers");
+    program.validate().expect("valid");
+    assert_sections_split(&program);
+    // `main`'s copy comes first: the loop's `wait` and `log` are `Unsafe` and the `if`'s
+    // `wait` `CheckState`. `helper`, which the loop calls, keeps its own default, and `pick`
+    // gives both branches its annotation.
+    let found = primitives_of(&program);
+    assert_eq!(found.len(), 6);
+    assert_eq!(found[..3], ["Unsafe", "CheckState", "Unsafe"]);
+    let mut rest = found[3..].to_vec();
+    rest.sort();
+    assert_eq!(rest, ["Safe", "Unsafe", "Unsafe"]);
+}
+
+#[test]
+fn an_annotation_applies_to_the_first_statement_of_its_line_only() {
+    let source = "def main():\n    # @idempotency unsafe\n    diag.wait(1); diag.wait(2)\n";
+    let program = lowered(source).expect("lowers");
+    assert_eq!(primitives_of(&program), ["Unsafe", "Safe"]);
+}
+
+#[test]
+fn an_annotation_reaches_every_iteration_of_an_unrolled_loop() {
+    let source = "\
+L = [1, 2, 3]
+
+def main():
+    # @idempotency unsafe
+    for n in L:
+        diag.wait(n)
+";
+    let program = lowered(source).expect("lowers");
+    assert_sections_split(&program);
+    assert_eq!(primitives_of(&program), ["Unsafe", "Unsafe", "Unsafe"]);
+}
+
+#[test]
+fn an_annotated_statement_without_a_primitive_is_refused() {
+    let found = |source: &str| codes(source);
+    let bad = StarCode::BadAnnotation;
+    assert_eq!(
+        found("def main():\n    # @idempotency safe\n    x = 1\n"),
+        [(bad, 3)]
+    );
+    // The functions a statement calls keep their own annotations and defaults.
+    assert_eq!(
+        found(
+            "def helper():\n    diag.wait(1)\n\ndef main():\n    # @idempotency safe\n    helper()\n"
+        ),
+        [(bad, 6)]
+    );
+    assert_eq!(
+        found("def main():\n    # @idempotency safe\n    if 1 < 2:\n        x = 1\n"),
+        [(bad, 3)]
+    );
+    assert_eq!(
+        found("def main():\n    # @idempotency safe\n    \"\"\"A docstring.\"\"\"\n    pass\n"),
+        [(bad, 3)]
+    );
+    // An unrolled body is lowered once per item, and reports the problem once.
+    assert_eq!(
+        found(
+            "L = [1, 2, 3]\n\ndef main():\n    for n in L:\n        # @idempotency safe\n        x = n\n"
+        ),
+        [(bad, 6)]
+    );
+    // A statement whose primitive is in a branch that never runs is still lowered, so it has
+    // one.
+    assert_eq!(
+        found("def main():\n    # @idempotency safe\n    if 1 > 2:\n        diag.wait(1)\n"),
+        []
+    );
+}
+
+#[test]
+fn an_error_in_an_annotated_unrolled_body_is_reported_alone() {
+    // The error repeats in each iteration, and is recorded once; the annotation is not
+    // reported on top of it.
+    let source = "\
+L = [1, 2]
+
+def main():
+    for n in L:
+        # @idempotency safe
+        x = n.upper()
+";
+    let found = codes(source);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_ne!(found[0].0, StarCode::BadAnnotation);
+}
+
+#[test]
+fn a_call_that_is_not_in_the_defaults_table_is_not_safe_by_default() {
+    let op = Op::Ret;
+    let default = |call| format!("{:?}", default_idempotency(call, &op));
+    for call in [
+        "read_dtc",
+        "ecu_info",
+        "precondition",
+        "wait",
+        "capture",
+        "log",
+        "hmi",
+        "record",
+    ] {
+        assert_eq!(default(call), "Safe", "{call}");
+    }
+    for call in ["security_access", "routine", "flash_transfer"] {
+        assert_eq!(default(call), "CheckState", "{call}");
+    }
+    assert_eq!(default("request"), "Unsafe");
+    assert_eq!(default("anything_new"), "Unsafe");
+    let read = Op::ServiceRequest { service: 0x22 };
+    assert_eq!(
+        format!("{:?}", default_idempotency("request", &read)),
+        "Safe"
+    );
+}
+
+#[test]
+fn a_section_copy_is_cut_around_its_primitives() {
+    let source = "\
+# @section uninterruptible expected=700
+def write():
+    x = 1
+    diag.wait(1)
+    y = x + 2
+    # @idempotency unsafe
+    diag.wait(y)
+    z = 3
+
+def main():
+    diag.log(1, \"before\")
+    write()
+";
+    let program = lowered(source).expect("lowers");
+    program.validate().expect("valid");
+    assert_sections_split(&program);
+    // The copy of `write` is the call target that a section covers.
+    let entry = program
+        .code
+        .iter()
+        .find_map(|op| match op {
+            Op::Call(at)
+                if in_a_section(&program, *at)
+                    .iter()
+                    .any(|s| matches!(s.interruptible, Interruptible::No)) =>
+            {
+                Some(*at)
+            }
+            _ => None,
+        })
+        .expect("a call into the section");
+    let copy: Vec<&Section> = program
+        .sections
+        .iter()
+        .filter(|s| matches!(s.interruptible, Interruptible::No))
+        .collect();
+    // Contiguous from the call's target to the copy's `Ret`, and every piece has the section
+    // function's attributes.
+    assert_eq!(copy[0].start_pc, entry);
+    for pair in copy.windows(2) {
+        assert_eq!(pair[0].end_pc, pair[1].start_pc);
+    }
+    let end = copy.last().unwrap().end_pc;
+    assert!(matches!(program.code[end as usize - 1], Op::Ret));
+    for section in &copy {
+        assert_eq!(section.expected_millis, 700);
+    }
+    let kinds: Vec<String> = copy
+        .iter()
+        .map(|s| format!("{:?}", s.idempotency))
+        .collect();
+    assert_eq!(
+        kinds,
+        ["CheckState", "Safe", "CheckState", "Unsafe", "CheckState"]
+    );
+    // The two primitives of the copy are one instruction each.
+    let single: Vec<u32> = copy
+        .iter()
+        .filter(|s| {
+            s.end_pc == s.start_pc + 1
+                && program.code[s.start_pc as usize].is_diagnostic_primitive()
+        })
+        .map(|s| s.start_pc)
+        .collect();
+    assert_eq!(single.len(), 2);
+    // The `log` before the call is outside the section: `Yes`, 0.
+    let before = (0..entry)
+        .find(|&pc| program.code[pc as usize].is_diagnostic_primitive())
+        .expect("the log");
+    let [outside] = in_a_section(&program, before)[..] else {
+        panic!("one section");
+    };
+    assert!(matches!(outside.interruptible, Interruptible::Yes));
+    assert_eq!(outside.expected_millis, 0);
+}
+
+#[test]
+fn a_helper_called_in_and_outside_a_section_is_tagged_in_each_copy() {
+    let source = "\
+def helper():
+    # @idempotency unsafe
+    diag.wait(1)
+    diag.log(1, \"h\")
+
+# @section recoveryRequired expected=9
+def write():
+    helper()
+
+def main():
+    helper()
+    write()
+";
+    let program = lowered(source).expect("lowers");
+    program.validate().expect("valid");
+    assert_sections_split(&program);
+    // Two copies of `helper`: each has the annotation on its wait and the default on its log.
+    let found: Vec<(String, String, u32)> = (0..program.code.len() as u32)
+        .filter(|&pc| program.code[pc as usize].is_diagnostic_primitive())
+        .map(|pc| {
+            let [section] = in_a_section(&program, pc)[..] else {
+                panic!("one section");
+            };
+            (
+                format!("{:?}", section.idempotency),
+                format!("{:?}", section.interruptible),
+                section.expected_millis,
+            )
+        })
+        .collect();
+    assert_eq!(found.len(), 4);
+    let outside = ("Yes".to_owned(), 0);
+    let inside = ("RecoveryRequired".to_owned(), 9);
+    let mut waits = Vec::new();
+    let mut logs = Vec::new();
+    for (idempotency, interruptible, millis) in found {
+        match idempotency.as_str() {
+            "Unsafe" => waits.push((interruptible, millis)),
+            "Safe" => logs.push((interruptible, millis)),
+            other => panic!("{other}"),
+        }
+    }
+    waits.sort();
+    logs.sort();
+    // Sorted by name, `RecoveryRequired` comes before `Yes`.
+    let expected = vec![inside, outside];
+    assert_eq!(waits, expected);
+    assert_eq!(logs, expected);
+}
+
 #[test]
 fn a_section_function_and_what_it_calls_are_covered_by_its_section() {
     let source = "\
@@ -415,40 +768,58 @@ def main():
     assert_eq!(branches, 2);
     // `main` calls the outside copy of `helper`, and the section's `inner` its own copy.
     assert_eq!(calls_to(&program, "helper"), [(false, false), (true, true)]);
-    // `write`, and its copies of `inner` and `helper`, each covered by a section.
-    assert_eq!(program.sections.len(), 3);
-    for section in &program.sections {
+    assert_sections_split(&program);
+    // `main`'s copy of `helper` has a `Yes` section for each of its two logs, and nothing else
+    // is outside the section: the copies of `write`, `inner` and `helper` are covered by pieces
+    // and one-instruction sections that all have the section's attributes.
+    let (outside, inside): (Vec<&Section>, Vec<&Section>) = program
+        .sections
+        .iter()
+        .partition(|s| matches!(s.interruptible, Interruptible::Yes));
+    assert_eq!(outside.len(), 2);
+    for section in outside {
+        assert_eq!(section.end_pc, section.start_pc + 1);
+        assert!(matches!(section.idempotency, Idempotency::Safe));
+        assert_eq!(section.expected_millis, 0);
+    }
+    assert!(!inside.is_empty());
+    for section in inside {
         assert!(matches!(
             section.interruptible,
             Interruptible::RecoveryRequired
         ));
-        assert!(matches!(section.idempotency, Idempotency::CheckState));
         assert_eq!(section.expected_millis, 500);
     }
     // `helper` runs twice: from `main`, outside every section, and from the section's copy.
     let helpers = logs_of(&program, "helper");
     assert_eq!(helpers.len(), 2);
-    let covered: Vec<usize> = helpers
+    let mut kinds: Vec<bool> = helpers
         .iter()
-        .map(|&pc| in_a_section(&program, pc).len())
+        .map(|&pc| {
+            let [section] = in_a_section(&program, pc)[..] else {
+                panic!("one section covers each log");
+            };
+            matches!(section.interruptible, Interruptible::Yes)
+        })
         .collect();
-    assert_eq!(covered.iter().filter(|&&n| n == 0).count(), 1);
-    assert_eq!(covered.iter().filter(|&&n| n == 1).count(), 1);
+    kinds.sort();
+    assert_eq!(kinds, [false, true]);
     let [write] = logs_of(&program, "write")[..] else {
         panic!("one copy of `write`");
     };
     assert_eq!(in_a_section(&program, write).len(), 1);
-    // `main` calls the one copy of `write` twice.
-    let section_entry = program
-        .sections
-        .iter()
-        .find(|s| (s.start_pc..s.end_pc).contains(&write))
-        .unwrap()
-        .start_pc;
+    // `main` calls the one copy of `write` twice: the calls from outside every section that
+    // enter a section.
+    let in_section = |pc: u32| {
+        in_a_section(&program, pc)
+            .iter()
+            .any(|s| matches!(s.interruptible, Interruptible::RecoveryRequired))
+    };
     let calls = program
         .code
         .iter()
-        .filter(|op| matches!(op, Op::Call(at) if *at == section_entry))
+        .enumerate()
+        .filter(|(pc, op)| matches!(op, Op::Call(at) if in_section(*at) && !in_section(*pc as u32)))
         .count();
     assert_eq!(calls, 2);
     assert_eq!(run(source), Ok(None));
@@ -2105,7 +2476,6 @@ fn unrolling_stops_once_a_budget_is_spent() {
     let document = load_ecu_document(&bytes).expect("the document loads");
     let requests = RequestIndex::default();
     let mut lowerer = Lowerer::new(&checked, document.variant().expect("a variant"), &requests);
-    lowerer.annotations();
     lowerer.constants();
     lowerer.globals_built = lowerer.built;
     lowerer.functions();
@@ -2159,7 +2529,6 @@ fn unrolling_counts_the_arguments_of_a_call() {
         let checked = check("t.star", &source).unwrap_or_else(|errors| panic!("{errors:#?}"));
         let document = load_ecu_document(&bytes).expect("the document loads");
         let mut lowerer = Lowerer::new(&checked, document.variant().expect("a variant"), &requests);
-        lowerer.annotations();
         lowerer.constants();
         lowerer.globals_built = lowerer.built;
         lowerer.functions();

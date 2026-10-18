@@ -26,8 +26,7 @@ fn the_example_procedure_passes() {
 
 #[test]
 fn a_valid_procedure_passes_with_its_annotations() {
-    let checked = passes(
-        r#""""A docstring."""
+    let source = r#""""A docstring."""
 LIMIT = 3
 KEYS = {"a": 1}
 
@@ -55,8 +54,8 @@ def main():
             break
     write()
     v = KEYS["a"] if total else -1
-"#,
-    );
+"#;
+    let checked = passes(source);
     assert_eq!(
         checked.annotations,
         [
@@ -68,6 +67,7 @@ def main():
             },
             Annotation::Idempotency {
                 line: 11,
+                statement_at: source.find("diag.flash_transfer").unwrap() as u32,
                 value: Idempotency::CheckState
             },
             Annotation::MaxIterations {
@@ -845,15 +845,44 @@ fn a_loop_after_a_jump_in_its_outer_body_is_still_reached() {
 }
 
 #[test]
-fn only_one_comment_marker_starts_an_annotation() {
-    let checked = passes(
-        "def main():\n    ## @idempotency safe\n    ## @unknown\n    # @idempotency checkState\n    \
-         diag.wait(1)\n",
+fn a_statement_takes_one_idempotency() {
+    assert_eq!(
+        codes(
+            "def main():\n    # @idempotency safe\n    # @idempotency unsafe\n    diag.wait(1)\n"
+        ),
+        [(StarCode::BadAnnotation, 3)]
     );
+    // One each for two statements, also on one line, is fine.
+    assert_eq!(
+        codes(
+            "def main():\n    # @idempotency safe\n    diag.wait(1)\n    # @idempotency unsafe\n    diag.wait(2)\n"
+        ),
+        []
+    );
+}
+
+#[test]
+fn an_idempotency_stands_on_a_line_of_its_own() {
+    assert_eq!(
+        codes("def main():\n    diag.wait(1)  # @idempotency unsafe\n    diag.wait(2)\n"),
+        [(StarCode::BadAnnotation, 2)]
+    );
+    assert_eq!(
+        codes("def main():\n    # @idempotency unsafe\n    diag.wait(1)\n"),
+        []
+    );
+}
+
+#[test]
+fn only_one_comment_marker_starts_an_annotation() {
+    let source = "def main():\n    ## @idempotency safe\n    ## @unknown\n    # @idempotency \
+                  checkState\n    diag.wait(1)\n";
+    let checked = passes(source);
     assert_eq!(
         checked.annotations,
         [Annotation::Idempotency {
             line: 4,
+            statement_at: source.find("diag.wait").unwrap() as u32,
             value: Idempotency::CheckState
         }]
     );

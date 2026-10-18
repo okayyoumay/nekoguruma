@@ -6,12 +6,13 @@
 //! cover, `and`, `or`, `not`, conditional expressions, `if`/`elif`/`else`, `for` loops
 //! (ADR-305), and `diag.fail`, `diag.wait`, `diag.log` and `diag.capture`, and section functions,
 //! each covered by a `Section` together with its own copies of the functions it reaches (ADR-301,
-//! ADR-329). Every value that reaches run time has one type, inferred at ingestion (ADR-304); an
-//! operation the IR cannot express for its operands is `STAR_NOT_LOWERABLE`.
+//! ADR-329). Every diagnostic primitive gets a one-instruction `Section` that carries its
+//! idempotency, from `@idempotency` or the call's default (ADR-332). Every value that reaches
+//! run time has one type, inferred at ingestion (ADR-304); an operation the IR cannot express
+//! for its operands is `STAR_NOT_LOWERABLE`.
 //!
 //! Not lowered yet, each its own backlog item: the other `diag` functions (`hmi` and `record`;
-//! `flash_transfer`), built-ins and string methods on values known only at run time, and
-//! idempotency annotations.
+//! `flash_transfer`), and built-ins and string methods on values known only at run time.
 //! Each is rejected with `STAR_NOT_LOWERABLE` (or `STAR_API_NOT_AVAILABLE` for a `diag`
 //! function without an instruction), so nothing is lowered silently wrong.
 
@@ -140,7 +141,6 @@ fn lower_here<'a>(
     requests: &'a RequestIndex,
 ) -> Result<Lowered, Vec<StarError>> {
     let mut lowerer = Lowerer::new(checked, variant, requests);
-    lowerer.annotations();
     lowerer.constants();
     lowerer.globals_built = lowerer.built;
     lowerer.functions();
@@ -462,6 +462,10 @@ struct Label(u32);
 #[derive(Debug, Clone)]
 enum Ins {
     Op(Op),
+    /// A diagnostic primitive (`Op::is_diagnostic_primitive`) with the idempotency of the `diag`
+    /// call it comes from, which the assembly turns into a one-instruction `Section` (ADR-332).
+    /// A copy of a function's code carries it with the instruction.
+    Primitive(Op, Idempotency),
     Jump(Label),
     JumpIfFalse(Label),
     Call(usize),
@@ -580,6 +584,14 @@ struct Lowerer<'a> {
     assigned: HashMap<*const AstStmt, Rc<HashSet<String>>>,
     /// The copies of the functions the program holds, in layout order (ADR-301).
     copies: Vec<FuncCopy>,
+    /// `@idempotency` values by the byte offset where their statement begins (4.6, ADR-332).
+    idempotency: HashMap<u32, Idempotency>,
+    /// The annotated statements being lowered, innermost last: the value, and whether the
+    /// statement has lowered to a diagnostic primitive yet. Calls to functions are not lowered
+    /// inline, so a statement's frame never covers a called function's code.
+    annotated: Vec<(Idempotency, bool)>,
+    /// How many errors were reported or repeated, which `error` dedupes, outside inference.
+    attempted: usize,
 }
 
 /// Where `break` and `continue` jump in the loop being lowered.
@@ -637,12 +649,36 @@ impl<'a> Lowerer<'a> {
             mention_counts: HashMap::new(),
             assigned: HashMap::new(),
             copies: Vec::new(),
+            idempotency: checked
+                .annotations
+                .iter()
+                .filter_map(|annotation| match annotation {
+                    Annotation::Idempotency {
+                        statement_at,
+                        value,
+                        ..
+                    } => Some((
+                        *statement_at,
+                        match value {
+                            super::Idempotency::Safe => Idempotency::Safe,
+                            super::Idempotency::CheckState => Idempotency::CheckState,
+                            super::Idempotency::Unsafe => Idempotency::Unsafe,
+                        },
+                    )),
+                    _ => None,
+                })
+                .collect(),
+            annotated: Vec::new(),
+            attempted: 0,
         }
     }
 
     /// Records an error once per code and place: an unrolled body is lowered once per item and
     /// reports the same problem at the same place each time.
     fn error(&mut self, code: StarCode, span: Span, hint: impl Into<String>) {
+        if self.quiet == 0 {
+            self.attempted += 1;
+        }
         if self.quiet == 0 && self.reported.insert((code, span.begin(), span.end())) {
             self.errors.push(Pending {
                 code,
@@ -669,30 +705,6 @@ impl<'a> Lowerer<'a> {
 
     fn top_level(&self) -> Vec<&'a AstStmt> {
         super::Checker::statements(self.checked.module.statement())
-    }
-
-    /// Rejects the annotations whose ranges are not lowered yet, so their attributes are not
-    /// dropped silently (ADR-304). `@maxIterations` belongs to a `for`, which is rejected itself,
-    /// and `@section` to its function ([`Lowerer::functions`]).
-    fn annotations(&mut self) {
-        let codemap = self
-            .checked
-            .module
-            .file_span(self.checked.module.statement().span)
-            .file;
-        for annotation in &self.checked.annotations {
-            let (line, what) = match annotation {
-                Annotation::Idempotency { line, .. } => {
-                    (*line, "an `@idempotency` annotation (4.6)")
-                }
-                Annotation::MaxIterations { .. } | Annotation::Section { .. } => continue,
-            };
-            let begin = codemap.line_span(line.saturating_sub(1) as usize).begin();
-            self.not_lowerable(
-                Span::new(begin, begin),
-                format!("{what} is not lowered yet"),
-            );
-        }
     }
 
     /// Folds the top-level constants in order; each may name the ones before it.
@@ -963,7 +975,12 @@ impl<'a> Lowerer<'a> {
             .into_iter()
             .enumerate()
         {
-            if index == 0 && is_string_expression(stmt) {
+            // An annotated docstring is lowered, so that the annotation is reported as one that
+            // covers no primitive.
+            if index == 0
+                && is_string_expression(stmt)
+                && !self.idempotency.contains_key(&stmt.span.begin().get())
+            {
                 continue;
             }
             self.stmt(id, stmt, &mut code);
@@ -988,7 +1005,36 @@ impl<'a> Lowerer<'a> {
 
     // ------------------------------------------------------------ Statements
 
+    /// Lowers a statement. One with an `@idempotency` annotation sets the idempotency of every
+    /// primitive it lowers to, the nested statements of an `if` or `for` included, until a
+    /// nested annotation takes over (4.6, ADR-332). It is `STAR_BAD_ANNOTATION` when the
+    /// statement lowers to none, so an annotation never does nothing.
     fn stmt(&mut self, id: usize, stmt: &AstStmt, code: &mut Code) {
+        // A list of statements begins where its first statement does, which holds the annotation.
+        let value = match stmt.node {
+            StmtP::Statements(_) => None,
+            _ => self.idempotency.get(&stmt.span.begin().get()).copied(),
+        };
+        let Some(value) = value else {
+            return self.statement(id, stmt, code);
+        };
+        let attempted = self.attempted;
+        self.annotated.push((value, false));
+        self.statement(id, stmt, code);
+        let (_, lowered) = self.annotated.pop().expect("the frame pushed above");
+        // Another error means the statement was not lowered in full, and a spent budget that
+        // it was cut short: they are reported instead.
+        if !lowered && self.attempted == attempted && self.exhausted.is_none() {
+            self.error(
+                StarCode::BadAnnotation,
+                stmt.span,
+                "`@idempotency` annotates a statement that lowers to no `diag` call, so it has \
+                 nothing to apply to; the functions the statement calls keep their own (4.6)",
+            );
+        }
+    }
+
+    fn statement(&mut self, id: usize, stmt: &AstStmt, code: &mut Code) {
         if self.unrolling > 0 && !self.unroll_step(stmt.span, 1) {
             return;
         }
@@ -3297,7 +3343,48 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    /// Lowers `diag.{name}(...)` and gives each diagnostic primitive it emits the call's
+    /// idempotency (ADR-332): the innermost `@idempotency` around the call, or else the default
+    /// of 4.6 for the Starlark call, whatever instructions it lowers to. A primitive an argument
+    /// emitted (an inner `diag` call) keeps its own.
     fn call_diag(&mut self, id: Option<usize>, name: &str, args: &[&AstExpr], span: Span) -> Val {
+        let value = self.call_diag_untagged(id, name, args, span);
+        let annotation = self.annotated.last().map(|(value, _)| *value);
+        let tag = |code: Code, lowered: &mut bool| -> Code {
+            code.into_iter()
+                .map(|(ins, span)| match ins {
+                    Ins::Op(op) if op.is_diagnostic_primitive() => {
+                        *lowered = true;
+                        let idempotency =
+                            annotation.unwrap_or_else(|| default_idempotency(name, &op));
+                        (Ins::Primitive(op, idempotency), span)
+                    }
+                    other => (other, span),
+                })
+                .collect()
+        };
+        let mut lowered = false;
+        let value = match value {
+            Val::Const(value) => Val::Const(value),
+            Val::Run(tys, code) => Val::Run(tys, tag(code, &mut lowered)),
+            Val::Void(code) => Val::Void(tag(code, &mut lowered)),
+        };
+        if lowered {
+            // The primitive is in every annotated statement around the call.
+            for (_, covers) in &mut self.annotated {
+                *covers = true;
+            }
+        }
+        value
+    }
+
+    fn call_diag_untagged(
+        &mut self,
+        id: Option<usize>,
+        name: &str,
+        args: &[&AstExpr],
+        span: Span,
+    ) -> Val {
         match name {
             "fail" => {
                 let [code_arg, detail] = args else {
@@ -4574,10 +4661,12 @@ impl<'a> Lowerer<'a> {
     // ------------------------------------------------------------ Assembly
 
     /// Lays out the entry (a call to `main`, then the end) and the copies of the functions, and
-    /// resolves labels, calls and source positions. Each copy that runs in a section is covered
-    /// by a `Section` with that section function's attributes (ADR-301); its idempotency is
-    /// `CheckState`, which the job runner treats as it treats code outside every section, until
-    /// `@idempotency` is lowered (ADR-329).
+    /// resolves labels, calls and source positions. Every diagnostic primitive gets a `Section`
+    /// over that instruction alone, with the idempotency of its `diag` call. Each copy that runs
+    /// in a section is covered, without a gap, by such sections and by `CheckState` pieces
+    /// between them (ADR-329), all with that section function's interruptibility and expected
+    /// duration (ADR-301). A primitive outside every section is `Yes` with duration 0. The
+    /// sections never overlap (ADR-332).
     fn assemble(&mut self) -> Program {
         let main = self.by_name.get("main").copied().unwrap_or(0);
         let entry_span = self.funcs[main].def.name.span;
@@ -4594,19 +4683,46 @@ impl<'a> Lowerer<'a> {
             (Ins::Call(main), entry_span, ENTRY),
             (Ins::Op(Op::Ret), entry_span, ENTRY),
         ];
-        // The range of each copy that runs in a section, by its first and last instruction.
-        let mut ranges: Vec<(usize, u32, u32)> = Vec::new();
+        // The sections, in layout order and so by start pc (ADR-332).
+        let mut sections: Vec<Section> = Vec::new();
         let mut pc = 2u32;
         for (at, copy) in self.copies.iter().enumerate() {
             let start = pc;
+            let mut primitives: Vec<(u32, Idempotency)> = Vec::new();
             for (ins, span) in &self.funcs[copy.func].code {
                 if !matches!(ins, Ins::Mark(_)) {
+                    if let Ins::Primitive(_, idempotency) = ins {
+                        primitives.push((pc, *idempotency));
+                    }
                     pc += 1;
                 }
                 code.push((ins.clone(), *span, at));
             }
-            if let Some(section) = copy.section {
-                ranges.push((section, start, pc));
+            // Outside every section a primitive's section is as interruptible as the code
+            // around it; inside one it keeps the section function's attributes.
+            let (interruptible, expected_millis) = match copy.section {
+                Some(section) => self.funcs[section].section.expect("a section function"),
+                None => (Interruptible::Yes, 0),
+            };
+            let section = |start_pc, end_pc, idempotency| Section {
+                start_pc,
+                end_pc,
+                interruptible,
+                idempotency,
+                expected_millis,
+            };
+            // The copy's range is cut around its primitives: the pieces between cover none and
+            // say nothing about idempotency.
+            let mut cursor = start;
+            for (primitive, idempotency) in primitives {
+                if copy.section.is_some() && cursor < primitive {
+                    sections.push(section(cursor, primitive, Idempotency::CheckState));
+                }
+                sections.push(section(primitive, primitive + 1, idempotency));
+                cursor = primitive + 1;
+            }
+            if copy.section.is_some() && cursor < pc {
+                sections.push(section(cursor, pc, Idempotency::CheckState));
             }
         }
         // Positions of labels, counting only real instructions.
@@ -4625,7 +4741,7 @@ impl<'a> Lowerer<'a> {
         for (ins, span, at) in code {
             let op = match ins {
                 Ins::Mark(_) => continue,
-                Ins::Op(op) => op,
+                Ins::Op(op) | Ins::Primitive(op, _) => op,
                 Ins::Jump(label) => Op::Jump(positions[&(at, label)]),
                 Ins::JumpIfFalse(label) => Op::JumpIfFalse(positions[&(at, label)]),
                 Ins::Call(callee) => {
@@ -4637,20 +4753,6 @@ impl<'a> Lowerer<'a> {
             ops.push(op);
             spans.push(span);
         }
-        let sections = ranges
-            .into_iter()
-            .map(|(section, start_pc, end_pc)| {
-                let (interruptible, expected_millis) =
-                    self.funcs[section].section.expect("a section function");
-                Section {
-                    start_pc,
-                    end_pc,
-                    interruptible,
-                    idempotency: Idempotency::CheckState,
-                    expected_millis,
-                }
-            })
-            .collect();
         let source_map = self.source_map(&spans);
         Program {
             schema_version: IR_SCHEMA_VERSION,
@@ -4796,6 +4898,31 @@ fn binary_hint(op: BinOp, a: Ty, b: Ty) -> String {
         a.name(),
         b.name()
     )
+}
+
+/// The idempotency of a primitive that `diag.{call}` lowered to, when no `@idempotency` applies
+/// (subset 4.6). It follows the Starlark call, not the instruction: every instruction of
+/// `security_access` is `CheckState`. A `request` follows its service identifier, which the
+/// request instruction holds: a read of data or of DTC information (0x22, 0x19) is `Safe`, any
+/// other service `Unsafe`. Every call of the table is listed, and a name not in it is `Unsafe`,
+/// so a call that starts to lower cannot become `Safe` by default.
+fn default_idempotency(call: &str, op: &Op) -> Idempotency {
+    match (call, op) {
+        (
+            "request",
+            Op::ServiceRequest {
+                service: 0x22 | 0x19,
+            },
+        ) => Idempotency::Safe,
+        ("request", _) => Idempotency::Unsafe,
+        (
+            "read_dtc" | "ecu_info" | "precondition" | "wait" | "capture" | "log" | "hmi"
+            | "record",
+            _,
+        ) => Idempotency::Safe,
+        ("security_access" | "routine" | "flash_transfer", _) => Idempotency::CheckState,
+        _ => Idempotency::Unsafe,
+    }
 }
 
 /// Whether some `return` in the body carries a value.

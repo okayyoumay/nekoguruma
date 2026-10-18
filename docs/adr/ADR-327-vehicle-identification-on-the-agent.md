@@ -97,7 +97,7 @@ maintainer chose to run the loop on the agent.
    (item 3), so they would leave every candidate
    for every definition and erase the differences between them; how likely an answer is enters
    only through the tie-breakers. Ties go to the one named by
-   more remaining candidates, then to one whose endpoint answered the presence request, then to the lowest
+   more remaining candidates, then to one with more of its endpoints matched by a presence answer (item 2), then to the lowest
    identifier, so the order is deterministic. A read is the definition's variant identification
    (8.9.1) and the fields the candidates' matching rules read from it, each variant
    tested over the link it declares (ADR-324 item 1, which gives each variant its own declared

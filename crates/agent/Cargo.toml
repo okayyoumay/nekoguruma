@@ -32,4 +32,5 @@ tracing.workspace = true
 libc = "0.2"
 
 [dev-dependencies]
+diag-frontend = { path = "../diag-frontend" }
 sim-ecu.workspace = true

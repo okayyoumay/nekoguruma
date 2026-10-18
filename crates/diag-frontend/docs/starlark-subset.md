@@ -71,7 +71,7 @@ starts there. A file without `main`, or whose `main` takes parameters, is reject
 | Top-level statements other than constant assignments and `def` | The procedure runs from `main` only | `STAR_TOPLEVEL_STATEMENT_NOT_ALLOWED` |
 | `*args`, `**kwargs`, keyword-only parameters, keyword arguments to built-ins and `diag` functions | Not supported in version 1 | `STAR_UNSUPPORTED_SYNTAX` |
 | A missing, repeated or unknown argument, or too many positional arguments, in a call to a user function (2.7) | The call cannot be bound to the parameters | `STAR_ARGUMENT_MISMATCH` |
-| Calls that pass functions needing more than 1,000 specialized copies (2.6) | Bounds ingestion work on untrusted input | `STAR_SPECIALIZATION_LIMIT` |
+| Calls that pass functions, or sections, needing more than 1,000 specialized copies (2.6, 4.5) | Bounds ingestion work on untrusted input | `STAR_SPECIALIZATION_LIMIT` |
 | Type annotations | Not base Starlark | `STAR_UNSUPPORTED_SYNTAX` |
 | `set` | No IR value type for it; not supported in version 1 | `STAR_UNSUPPORTED_SYNTAX` |
 | Dict access with a computed key `d[expr]` | Key cannot be resolved statically (list and bytes indexing are allowed) | `STAR_DYNAMIC_KEY_NOT_ALLOWED` |
@@ -551,7 +551,11 @@ authentication time (8.10.1) each time the function is called.
   own body, every function it calls, directly or not, and every function it receives as an
   argument and calls (2.6). The lowering gives each such function a copy that only the section
   reaches and covers that copy with the same attributes; a function also called outside the
-  section keeps its own copy there. These copies count toward the specialization budget of 2.6.
+  section keeps its own copy there. These copies count toward the specialization budget of 2.6:
+  the call that would make the 1,001st is `STAR_SPECIALIZATION_LIMIT`.
+- **Idempotency.** A section says nothing about whether its steps may be repeated: each `Section`
+  it lowers to is `CheckState`, which the job runner judges as code outside every section, until
+  `@idempotency` (4.6) is lowered (ADR-329). Without `expected=`, the expected duration is 0.
 - **No nesting.** A call to a section function from anything that runs inside a section,
   directly or through other functions or function arguments, is rejected at that call
   (`STAR_BAD_ANNOTATION`). A call to a section function from outside every section, as many

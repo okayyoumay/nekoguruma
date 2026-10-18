@@ -307,17 +307,169 @@ fn large_dicts_compare_in_linear_time() {
 }
 
 #[test]
-fn section_and_idempotency_annotations_are_not_dropped() {
-    for (source, line) in [
-        ("# @section uninterruptible\ndef main():\n    pass\n", 1),
-        ("def main():\n    # @idempotency unsafe\n    x = 1\n", 2),
-    ] {
-        assert_eq!(
-            codes(source),
-            vec![(StarCode::NotLowerable, line)],
-            "{source}"
-        );
+fn idempotency_annotations_are_not_dropped() {
+    let source = "def main():\n    # @idempotency unsafe\n    x = 1\n";
+    assert_eq!(codes(source), vec![(StarCode::NotLowerable, 2)]);
+}
+
+/// The instructions of `program` that log `message`.
+fn logs_of(program: &Program, message: &str) -> Vec<u32> {
+    let index = program
+        .constants
+        .iter()
+        .position(|c| c == message.as_bytes())
+        .expect("the message is a constant") as u32;
+    (0..program.code.len() as u32)
+        .filter(
+            |&pc| matches!(program.code[pc as usize], Op::Log { message, .. } if message == index),
+        )
+        .collect()
+}
+
+fn in_a_section(program: &Program, pc: u32) -> Vec<&Section> {
+    program
+        .sections
+        .iter()
+        .filter(|s| (s.start_pc..s.end_pc).contains(&pc))
+        .collect()
+}
+
+#[test]
+fn a_section_function_and_what_it_calls_are_covered_by_its_section() {
+    let source = "\
+def helper():
+    diag.log(1, \"helper\")
+
+def inner():
+    helper()
+
+# @section recoveryRequired expected=500
+def write():
+    inner()
+    diag.log(1, \"write\")
+
+def main():
+    helper()
+    write()
+    write()
+";
+    let program = lowered(source).expect("lowers");
+    program.validate().expect("valid");
+    // `write`, and its copies of `inner` and `helper`, each covered by a section.
+    assert_eq!(program.sections.len(), 3);
+    for section in &program.sections {
+        assert!(matches!(
+            section.interruptible,
+            Interruptible::RecoveryRequired
+        ));
+        assert!(matches!(section.idempotency, Idempotency::CheckState));
+        assert_eq!(section.expected_millis, 500);
     }
+    // `helper` runs twice: from `main`, outside every section, and from the section's copy.
+    let helpers = logs_of(&program, "helper");
+    assert_eq!(helpers.len(), 2);
+    let covered: Vec<usize> = helpers
+        .iter()
+        .map(|&pc| in_a_section(&program, pc).len())
+        .collect();
+    assert_eq!(covered.iter().filter(|&&n| n == 0).count(), 1);
+    assert_eq!(covered.iter().filter(|&&n| n == 1).count(), 1);
+    let [write] = logs_of(&program, "write")[..] else {
+        panic!("one copy of `write`");
+    };
+    assert_eq!(in_a_section(&program, write).len(), 1);
+    // `main` calls the one copy of `write` twice.
+    let section_entry = program
+        .sections
+        .iter()
+        .find(|s| (s.start_pc..s.end_pc).contains(&write))
+        .unwrap()
+        .start_pc;
+    let calls = program
+        .code
+        .iter()
+        .filter(|op| matches!(op, Op::Call(at) if *at == section_entry))
+        .count();
+    assert_eq!(calls, 2);
+    assert_eq!(run(source), Ok(None));
+}
+
+#[test]
+fn each_section_has_its_own_copies_and_its_own_attributes() {
+    let source = "\
+def helper():
+    diag.log(1, \"helper\")
+
+# @section uninterruptible expected=10
+def first():
+    helper()
+
+# @section interruptible
+def second():
+    helper()
+
+def main():
+    first()
+    second()
+";
+    let program = lowered(source).expect("lowers");
+    program.validate().expect("valid");
+    let helpers = logs_of(&program, "helper");
+    assert_eq!(helpers.len(), 2);
+    let attributes: Vec<(bool, u32)> = helpers
+        .iter()
+        .map(|&pc| {
+            let [section] = in_a_section(&program, pc)[..] else {
+                panic!("one section covers each copy");
+            };
+            (
+                matches!(section.interruptible, Interruptible::No),
+                section.expected_millis,
+            )
+        })
+        .collect();
+    let mut sorted = attributes.clone();
+    sorted.sort();
+    assert_eq!(sorted, [(false, 0), (true, 10)]);
+}
+
+#[test]
+fn main_can_be_a_section_function() {
+    let source = "# @section uninterruptible\ndef main():\n    diag.log(1, \"m\")\n";
+    let program = lowered(source).expect("lowers");
+    program.validate().expect("valid");
+    let [log] = logs_of(&program, "m")[..] else {
+        panic!("one log");
+    };
+    assert_eq!(in_a_section(&program, log).len(), 1);
+}
+
+#[test]
+fn sections_need_at_most_a_thousand_copies() {
+    // 501 helpers reached from each of two sections: 2 + 1002 copies.
+    let mut source = String::new();
+    for n in 0..501 {
+        source.push_str(&format!("def h{n}():\n    pass\n\n"));
+    }
+    let calls: String = (0..501).map(|n| format!("    h{n}()\n")).collect();
+    source.push_str(&format!("# @section interruptible\ndef a():\n{calls}\n"));
+    source.push_str(&format!("# @section interruptible\ndef b():\n{calls}\n"));
+    source.push_str("def main():\n    a()\n    b()\n");
+    let found = codes(&source);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].0, StarCode::SpecializationLimit);
+
+    // 499 helpers: 2 + 998 copies, within the budget.
+    let mut source = String::new();
+    for n in 0..499 {
+        source.push_str(&format!("def h{n}():\n    pass\n\n"));
+    }
+    let calls: String = (0..499).map(|n| format!("    h{n}()\n")).collect();
+    source.push_str(&format!("# @section interruptible\ndef a():\n{calls}\n"));
+    source.push_str(&format!("# @section interruptible\ndef b():\n{calls}\n"));
+    source.push_str("def main():\n    a()\n    b()\n");
+    let program = lowered(&source).expect("within the budget");
+    assert_eq!(program.sections.len(), 1000);
 }
 
 #[test]

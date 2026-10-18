@@ -89,10 +89,12 @@ shape survives inside the second as the access program of item 5.
    plan's erase and its post-transfer end that addresses another target. It also refuses a flash
    plan on an access target (item 13) and, in a procedure with several targets or an access
    target, a missing VIN source, since its first run reads the VIN to take the per-vehicle lock
-   before identifying the targets that pick the combination (item 5), and, in a procedure with
-   access targets, a VIN source anywhere but on the first access target; `check_job` refuses
-   such a job without a target VIN, and one whose combinations declare different VIN sources,
-   since the VIN is read before a combination is chosen.
+   before identifying the targets that pick the combination (item 5), and a VIN source whose
+   service is not a read of the kind item 5 allows for variant patterns, in any candidate
+   variant, since it is sent before the per-vehicle lock and the safety preconditions of 8.9,
+   and, in a procedure with access targets, a VIN source anywhere but on the first access
+   target; `check_job` refuses such a job without a target VIN, and one whose combinations
+   declare different VIN sources, since the VIN is read before a combination is chosen.
 5. **Access programs.** A target whose session and unlock other targets depend on (a gateway)
    can be declared an access target, with an access program: steps that only change that
    target's session and security state and read from it (session control to the default or an

@@ -271,7 +271,8 @@ field that stores them.
 | `routine_id` | `int`, 0x0000 to 0xFFFF |
 | `sub` | `int`, 0x00 to 0xFF |
 | `level` | `int`, odd, 0x01 to 0x7D (the seed sub-function; the key is sent with `level + 1`; ISO 14229-1 (2026) 9.4 gives the seed requests that range, and a sub-function's bit 7 asks the server not to answer) |
-| `millis`, `back_millis` | `int`, 0 to 2^32 - 1 |
+| `millis` of `diag.wait` | `int`, 0 to 2^32 - 1; may be an expression known only at run time, whose value the VM checks against that range when the wait runs (`WaitOutOfRange`) |
+| `back_millis` | `int`, 0 to 2^32 - 1 |
 | `form_id`, `template_id` | `str` naming the form or record template |
 | `level` of `diag.log` | `int`, 0 to 255 |
 | `code` of `diag.fail` | non-empty `str` constant, 1 to 64 bytes of UTF-8 (the IR accepts 1 to 128; `Program::validate` checks the constant, ADR-280) |
@@ -281,7 +282,10 @@ field that stores them.
 | `params` of `diag.routine` | dict known at ingestion whose keys and values give the routine service's own constants and other request fields, as for `diag.request`; a call whose `routine_id`, `sub` and `params` select no generated routine service is rejected (`STAR_UNKNOWN_SERVICE`) |
 | `session_id` | `int` naming a flash session declared in the declaration part (`FlashSession` in `ir.fbs`); an unknown session is rejected (`STAR_UNKNOWN_FLASH_SESSION`) |
 
-A `diag.wait` whose duration is only known at run time needs a stack-operand variant of `Wait`.
+A `diag.wait` whose duration is known at ingestion lowers to `Wait`, with the range checked then. One whose
+duration is an `int` computed at run time lowers to the code that pushes it, then `WaitFromStack` (ADR-233),
+which stops the run with `WaitOutOfRange` for a value outside the range; a run-time value of another type is
+rejected as a constant of that type is (`STAR_UNSUPPORTED_SYNTAX`).
 
 ### 3.2 Lowering
 
@@ -296,7 +300,7 @@ instruction exists, the transpiler rejects calls to it (`STAR_API_NOT_AVAILABLE`
 | `diag.routine` | `RoutineControl` | the rest of the request after the sub-function and the routine identifier (bytes), built at ingestion from `params`; the instruction holds `routine_id` and `sub`, which select the variant's generated routine service through the profile (ADR-309 item 4, ADR-314). The call's value is the response, read under the response's declared names (3.4) |
 | `diag.security_access` | `ServiceRequest`, `SecurityAccess`, `ServiceRequest` | expands to the profile's three steps (ADR-309 item 4, ADR-314): the seed request (on UDS the SecurityAccess service with the odd sub-function `level`), `SecurityAccess`, which turns the seed into the key through the host, and the send-key request (on UDS sub-function `level + 1`) carrying that key. The profile decodes neither response through a declared service, so both requests are `ServiceRequest`s of the template's SID with the payload it gives, and the variant needs no declared service for them; the seed is the seed response after the profile's leading bytes (on UDS the response SID and the level). A negative seed response ends the call before the key step, like a failed `diag.request`, and is its value; otherwise the value is the send-key response, positive or negative |
 | `diag.flash_transfer` | `FlashTransfer` | one block (bytes) per instruction; the call expands to a loop over the flash session's blocks |
-| `diag.wait` | `Wait` | none |
+| `diag.wait` | `Wait`, or `WaitFromStack` | none for a constant duration; for a duration known only at run time, the duration in milliseconds (`int`), pushed before `WaitFromStack` |
 | `diag.hmi` | `HmiRequest` | none: the instruction sends a constant, so the transpiler encodes the form and its constant `params` into one constant-pool entry; parameters known only at run time need a variant that takes them from the stack |
 | `diag.record` | `RecordInput` | none: the template reference is a constant-pool entry |
 | `diag.capture` | `MonitorCapture` | none |

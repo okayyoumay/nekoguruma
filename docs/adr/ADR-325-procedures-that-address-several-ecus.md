@@ -98,37 +98,41 @@ shape survives inside the second as the access program of item 5.
    timeout before the target would be counted lost (item 12). Several access targets (a gateway
    behind a gateway) run their access programs in declaration order. The access program is
    lowered on its own, once per variant of the access target, and travels with the job; the
-   conversion and `check_job` refuse any other service in it. No access program runs before the
-   job holds the per-vehicle lock, since a session change or an unlock on a shared gateway could
-   end the session that another job of this device on the same vehicle depends on (8.8). So the
-   VIN is read, without any access program, from the first access target, which a locked gateway
-   answers with reads. A first run goes in this order: identify the first access target and read
-   the VIN from it; when the VIN matches, take the per-vehicle lock (8.8), waiting for it with
-   nothing more sent while another job holds it; then identify the first access target again,
-   since the job that held the lock may have reflashed it, and read the VIN again with the
-   variant now identified, since the vehicle may have changed during the wait; then, for each
-   access target in declaration order, run its access program at once, identifying each one
-   after the first just before its program, so that an inner gateway is reached through an
-   unlocked outer one; then identify the other targets and pick the combination (item 7). A VIN
-   that differs, at either read, ends a first run in the 8.9.1 pre-check with only reads sent,
-   and a lock failure leaves only those reads sent. A restart (8.2.5) identifies the first
-   access target and reads the VIN from it in ADR-229's order (item 2 step 2), since that target
-   may have been reflashed after the journal recorded its variant, and, once it holds the
-   per-vehicle lock, identifies it again after any wait, reads the VIN again and requires it to
-   match, as a first run does, and only then runs the access programs in the same way before any
-   other step. Since its VIN now comes from an access target rather than from the ECU being
-   reprogrammed, a step 2 VIN read that gets no answer or a negative response ends the restart
-   in on-site intervention (`IdentityNotEstablished`, which a later resume may retry, ADR-290)
-   instead of the passive teardown ADR-229 takes there, which would reach the reprogramming
-   target's default-session confirmation without an unlocked gateway. A step of an access
-   program that fails ends the job as a lost access target would at that point (item 12). A
-   failure in this order is held for the access targets that already have a loss clock, which
-   starts at the first final response of a target's access program (item 12), and is handled by
-   its own rule only once none of them is lost; a target without a clock yet holds nothing. A
-   loss counted while an access program runs ends the job as a failing step of it does. Every
-   run also runs them again after any reopening of the links (a worker crash or VCI disconnect
-   that the job survives) before the program continues. The main program may still select the
-   access target for anything else.
+   conversion and `check_job` refuse any other service in it. Every target's variant is
+   identified outside the combination programs, and the first access target's before the
+   per-vehicle lock and the safety preconditions of 8.9, so in a procedure with several targets
+   the conversion and `check_job` also refuse a variant pattern (8.9.1) of any target whose
+   service is not a read of the kind an access program may send; identification then sends only
+   reads, whatever the job's class. No access program runs before the job holds the per-vehicle
+   lock, since a session change or an unlock on a shared gateway could end the session that
+   another job of this device on the same vehicle depends on (8.8). So the VIN is read, without
+   any access program, from the first access target, which a locked gateway answers with reads.
+   A first run goes in this order: identify the first access target and read the VIN from it;
+   when the VIN matches, take the per-vehicle lock (8.8), waiting for it with nothing more sent
+   while another job holds it; then identify the first access target again, since the job that
+   held the lock may have reflashed it, and read the VIN again with the variant now identified,
+   since the vehicle may have changed during the wait; then, for each access target in
+   declaration order, run its access program at once, identifying each one after the first just
+   before its program, so that an inner gateway is reached through an unlocked outer one; then
+   identify the other targets and pick the combination (item 7). A VIN that differs, at either
+   read, ends a first run in the 8.9.1 pre-check with only reads sent, and a lock failure leaves
+   only those reads sent. A restart (8.2.5) identifies the first access target and reads the VIN
+   from it in ADR-229's order (item 2 step 2), since that target may have been reflashed after
+   the journal recorded its variant, and, once it holds the per-vehicle lock, identifies it
+   again after any wait, reads the VIN again and requires it to match, as a first run does, and
+   only then runs the access programs in the same way before any other step. Since its VIN now
+   comes from an access target rather than from the ECU being reprogrammed, a step 2 VIN read
+   that gets no answer or a negative response ends the restart in on-site intervention
+   (`IdentityNotEstablished`, which a later resume may retry, ADR-290) instead of the passive
+   teardown ADR-229 takes there, which would reach the reprogramming target's default-session
+   confirmation without an unlocked gateway. A step of an access program that fails ends the job
+   as a lost access target would at that point (item 12). A failure in this order is held for
+   the access targets that already have a loss clock, which starts at the first final response
+   of a target's access program (item 12), and is handled by its own rule only once none of them
+   is lost; a target without a clock yet holds nothing. A loss counted while an access program
+   runs ends the job as a failing step of it does. Every run also runs them again after any
+   reopening of the links (a worker crash or VCI disconnect that the job survives) before the
+   program continues. The main program may still select the access target for anything else.
 6. **Lowered once per combination of variants.** The main program is lowered for each
    combination of one variant per target, extending ADR-311's per-variant lowering, and must
    lower for every combination; the scoping of a procedure to some variants that ADR-311 item 2

@@ -129,7 +129,8 @@ maintainer chose to run the loop on the agent.
    in a plan without candidates, item 8, every definition in the plan) and not yet read or out of
    reach, the agent reads the one whose outcome leaves the fewest candidates in the worst case,
    counting as outcomes the distinct sets of candidates that a possible response would leave:
-   each variant it may report, combined with the values the candidates' matching rules expect
+   each set of variants it may report together (variants on different declared links of one
+   definition can match at once, and item 7 reports every match), combined with the values the candidates' matching rules expect
    from the fields read with it, grouped by the candidates the response satisfies (two
    candidates whose expected values overlap, such as one prefix of the other, stay in one
    outcome), and a conclusive match of no variant, likewise grouped by the candidates the values
@@ -159,10 +160,14 @@ maintainer chose to run the loop on the agent.
    carries the VIN, as the variant document that declares them defines them (service and field
    identifiers are local to a document, ADR-318), read over that variant's link. When a
    candidate declares a VIN matching rule, the VIN is read after the presence requests and before
-   any ECU definition's read: the distinct sources the candidates' rules name are tried in turn,
-   in a fixed order, until one decodes to a well-formed VIN (ADR-261 item 3); two sources on the same service and link
-   whose declarations differ are distinct and each is tried. When no source gives one, every
-   VIN rule stays unevaluated. When no candidate declares a VIN matching rule, identification
+   any ECU definition's read: the distinct services and links the candidates' sources name are
+   read in turn, in a fixed order, until one establishes a VIN. One response is decoded with the
+   declaration of every source on that service and link (two sources whose declarations differ
+   are distinct), and it establishes a VIN only when every declaration that decodes it to a
+   well-formed VIN (ADR-261 item 3) gives the same one; well-formed values that disagree
+   establish none, since a response decoded with another ECU's layout can look like a VIN, and
+   the next service and link is read. When none establishes one, every VIN rule stays
+   unevaluated. When no candidate declares a VIN matching rule, identification
    reads no VIN (the data author's choice).
 6. **The agent reports facts; the server decides.** The job reports the VIN when read, the
    presence answers, each read's decoded identification fields and matching variants, the
@@ -228,7 +233,8 @@ maintainer chose to run the loop on the agent.
    combination record that ADR-325 item 7 commits, now only after the guard has passed on every
    target the job changes and before the first instruction, also records that the guard passed
    and the hashes of the target's guard list (amending ADR-318 item 4 and ADR-325 item 7's
-   record), and a restart inside the flash plan that carries a different guard list for that
+   record), and a restart once the journal has reached the flash plan (inside it or past its
+   end) that carries a different guard list for that
    target, or whose record lacks the pass or is missing, ends in on-site intervention as a
    variant that differs from the recorded combination does. The record is part of the checkpoint summary a handover carries, so a handed-over
    restart is held to the same list.

@@ -174,12 +174,15 @@ maintainer chose to run the loop on the agent.
    the agent journals that it passed before the first request that changes the ECU, together
    with the hashes of the program and of every document the check covered (the journal
    otherwise identifies neither, ADR-318 item 4, which this amends for these jobs), and a
-   restart of an interrupted job whose journal records it with the same hashes as the restart
-   carries (ADR-229 item 2) does not repeat it,
+   restart of an interrupted reprogramming job whose journal records it with the same hashes
+   as the restart carries does not repeat it,
    since an erased application may no longer answer the identification requests; the restart
-   identifies the ECU by the journaled VIN and hardware part number under ADR-229 item 2's rules
-   instead. A restart whose journal does not record a passed check has changed nothing yet and
-   runs the check again; one whose carried program or documents differ from the recorded
+   identifies the ECU by the VIN and hardware part number journaled before the erase, under
+   ADR-229 item 2's rules, instead. Every other restart runs the check again: one whose
+   journal does not record a passed check has changed nothing yet, and a job that does not
+   erase the application (a configuration write, a DTC clear, a routine) journals no such
+   identity, while its ECU can still answer, so the check is the only way to confirm the
+   restart reaches the same ECU; one whose carried program or documents differ from the recorded
    hashes is refused, since the ECU may already be changed and the check could not be rerun.
 8. **Manual paths.** The operator can choose a vehicle definition by hand (an unregistered or
    misidentified vehicle), and the plan then holds that definition's entries and the ECU

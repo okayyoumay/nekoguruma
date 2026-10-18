@@ -147,15 +147,16 @@ shape survives inside the second as the access program of item 5.
    lower for every combination; the scoping of a procedure to some variants that ADR-311 item 2
    leaves open applies to targets as well. Each combination's program goes in its own document
    for the primary variant (amending ADR-307 item 1's one document per variant and procedure),
-   which names the procedure it was lowered from (its definition and file, ADR-307 item 3) and,
-   for every target, the primary included, the content hash (design 8.2.6) of that variant's
-   declaration-only document, and, for every target, the hashes of the declaration-only
-   documents of all of its candidate variants, the same list in every combination of the
-   procedure; the conversion emits a declaration-only document for every variant of every target
-   of a procedure, the primary's included. The document's digest covers every definition its
-   program was lowered against (amending ADR-307 item 5). The conversion refuses a procedure
-   whose combinations exceed a bound set with the implementation, so the package cannot grow
-   without limit.
+   which names the procedure it was lowered from by its definition, its file (ADR-307 item 3)
+   and the content hash of that file's source, so two revisions of a package that keep the name
+   but change the source name different procedures, and, for every target, the primary included,
+   the content hash (design 8.2.6) of that variant's declaration-only document, and, for every
+   target, the hashes of the declaration-only documents of all of its candidate variants, the
+   same list in every combination of the procedure; the conversion emits a declaration-only
+   document for every variant of every target of a procedure, the primary's included. The
+   document's digest covers every definition its program was lowered against (amending ADR-307
+   item 5). The conversion refuses a procedure whose combinations exceed a bound set with the
+   implementation, so the package cannot grow without limit.
 7. **A job holds the documents of every combination it may meet.** Since the variants behind an
    access target are known only after its access program has run, a job names, by content hash,
    its access programs, the declaration-only documents of every candidate variant of every
@@ -167,44 +168,47 @@ shape survives inside the second as the access program of item 5.
    target is not an access target or whose hash names no document the job holds, and a job that
    lacks one, or holds more than one, for any candidate variant of an access target. `check_job`
    validates all of them then: it refuses a job whose combination documents and access programs
-   do not all name one procedure, since otherwise the variants identified could pick a program
-   of another procedure that has the same targets and candidates, and it also refuses a
-   combination document whose named hashes do not match the documents the job holds, combination
-   documents that name different candidate lists, a job whose declaration-only documents are not
-   exactly the documents of that list, and a set of combination documents that lacks one, or
-   holds more than one, for any tuple of one candidate variant per target of that list; the list
-   is signed with the combination documents, so a job cannot leave out a variant together with
-   every combination that contains it, so the variants identified always pick exactly one
-   program; it checks each combination's decodes against its targets' declarations, refuses
-   flash plans on more than one target, and refuses an access program with any service item 5
-   does not allow; it checks each access program's decodes and services against the declarations
-   of the declaration-only document that program names, as it checks a combination's, so an
-   access program that would fail while decoding is refused before it changes the gateway's
-   session or security state. The agent identifies each target's variant as the primary's is
-   identified (8.9.1, ADR-315), through those declaration-only documents, and the combination
-   its variants pick is the program that runs. Whether the job writes, which policy class
-   applies and whether it takes the reprogramming slot are fixed before anything is sent from
-   every combination the job holds: the job is a writing job when any of them writes, takes the
-   reprogramming slot when any of them writes (ADR-257; an access program's services alone do
-   not count, item 10), and is held to the policy class that covers all of them, so the chosen
-   combination never needs a guard the job lacks. A job keeps a journal when any of its
-   combinations has a flash plan or a section marked recovery required (ADR-293), whether or not
-   it writes; such a job creates its journal before anything is sent, as now (ADR-252, ADR-293),
-   and commits a combination record holding the chosen document's hash after identification and
-   before the chosen program's first instruction. A restart of a journal with that record uses
-   that document (amending ADR-318 item 4's journal that records no document; the caller still
-   supplies the documents) and, once the VIN matches and the per-vehicle lock is held,
-   identifies every target again; a variant that differs from the recorded combination ends the
-   restart in on-site intervention. The one exception is the reprogramming target once the
-   journal has reached its flash plan, whether inside the plan or past its end (ADR-271's
-   recovery of a completed transfer): that ECU may answer only from its bootloader, or as the
-   variant the new software makes it, so it is not identified again here, and ADR-229's hardware
-   identity and state checks and ADR-271's checks validate it instead, with the recorded
-   document kept. The record is part of the checkpoint summary a handover carries (design
-   8.2.5), and the receiving device's journal starts from it, so a handed-over restart uses the
-   same document. A journal without the record holds no step of the program, since only access
-   programs and identification reads ran, so its job starts again as a first run does. The host
-   and the restart carry these documents in place of the single one (amending ADR-318 item 3).
+   do not all name one procedure, source hash included, since otherwise the variants identified
+   could pick a program of another procedure, or of another revision of the same one, that has
+   the same targets and candidates (one source lowered against the same named declaration-only
+   documents gives the same programs, so documents of two revisions that agree on both are
+   interchangeable), and it also refuses a combination document whose named hashes do not match
+   the documents the job holds, combination documents that name different candidate lists, a job
+   whose declaration-only documents are not exactly the documents of that list, and a set of
+   combination documents that lacks one, or holds more than one, for any tuple of one candidate
+   variant per target of that list; the list is signed with the combination documents, so a job
+   cannot leave out a variant together with every combination that contains it, so the variants
+   identified always pick exactly one program; it checks each combination's decodes against its
+   targets' declarations, refuses flash plans on more than one target, and refuses an access
+   program with any service item 5 does not allow; it checks each access program's decodes and
+   services against the declarations of the declaration-only document that program names, as it
+   checks a combination's, so an access program that would fail while decoding is refused before
+   it changes the gateway's session or security state. The agent identifies each target's
+   variant as the primary's is identified (8.9.1, ADR-315), through those declaration-only
+   documents, and the combination its variants pick is the program that runs. Whether the job
+   writes, which policy class applies and whether it takes the reprogramming slot are fixed
+   before anything is sent from every combination the job holds: the job is a writing job when
+   any of them writes, takes the reprogramming slot when any of them writes (ADR-257; an access
+   program's services alone do not count, item 10), and is held to the policy class that covers
+   all of them, so the chosen combination never needs a guard the job lacks. A job keeps a
+   journal when any of its combinations has a flash plan or a section marked recovery required
+   (ADR-293), whether or not it writes; such a job creates its journal before anything is sent,
+   as now (ADR-252, ADR-293), and commits a combination record holding the chosen document's
+   hash after identification and before the chosen program's first instruction. A restart of a
+   journal with that record uses that document (amending ADR-318 item 4's journal that records
+   no document; the caller still supplies the documents) and, once the VIN matches and the
+   per-vehicle lock is held, identifies every target again; a variant that differs from the
+   recorded combination ends the restart in on-site intervention. The one exception is the
+   reprogramming target once the journal has reached its flash plan, whether inside the plan or
+   past its end (ADR-271's recovery of a completed transfer): that ECU may answer only from its
+   bootloader, or as the variant the new software makes it, so it is not identified again here,
+   and ADR-229's hardware identity and state checks and ADR-271's checks validate it instead,
+   with the recorded document kept. The record is part of the checkpoint summary a handover
+   carries (design 8.2.5), and the receiving device's journal starts from it, so a handed-over
+   restart uses the same document. A journal without the record holds no step of the program,
+   since only access programs and identification reads ran, so its job starts again as a first
+   run does. The host and the restart carry these documents in place of the single one (amending
+   ADR-318 item 3).
 8. **One link per target, under the same guards.** Before anything is sent the agent opens a
    link to each target, all on the job's VCI, under the job's per-VCI lock and, for a writing
    job, the reprogramming slot (8.8, ADR-257); the per-vehicle lock is still taken when the VIN

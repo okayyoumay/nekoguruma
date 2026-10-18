@@ -23,8 +23,9 @@ use crate::{
 /// make the report take unbounded memory (ADR-328 item 7).
 pub const MAX_REPORT_BYTES: usize = 64 << 20;
 
-/// What one event counts toward [`MAX_REPORT_BYTES`] besides its bytes.
-pub const EVENT_COST: usize = 64;
+/// What one event counts toward [`MAX_REPORT_BYTES`] besides its bytes: twice its size in the
+/// events list, since the list's storage can grow to twice its length.
+pub const EVENT_COST: usize = 2 * size_of::<DryRunEvent>();
 
 /// The answers a dry run gives. Each list is answered in order, and its last answer again once
 /// the list is used up, so a procedure that polls gets a steady answer.

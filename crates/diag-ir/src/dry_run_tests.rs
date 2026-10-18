@@ -499,3 +499,19 @@ fn a_last_log_past_the_budget_still_ends_the_run() {
     assert_eq!(report.end, DryRunEnd::Host(DryRunError::ReportTooLarge));
     assert_eq!(report.events.len(), 1);
 }
+
+#[test]
+fn events_without_bytes_count_their_own_size() {
+    let buf = document(vec![], vec![]);
+    let program = program(vec![Op::Wait { millis: 1 }, Op::Jump(0)], Vec::new());
+    let loaded = load_ecu_document(&buf).expect("test document loads");
+    let report = dry_run(
+        &program,
+        &loaded.variant().expect("a variant"),
+        &Script::new(),
+        u64::MAX,
+    );
+    assert_eq!(report.end, DryRunEnd::Host(DryRunError::ReportTooLarge));
+    assert_eq!(report.events.len(), MAX_REPORT_BYTES / EVENT_COST);
+    assert!(report.events.capacity() * size_of::<DryRunEvent>() <= MAX_REPORT_BYTES);
+}

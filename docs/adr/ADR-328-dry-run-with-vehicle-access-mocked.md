@@ -85,7 +85,8 @@ A shared dry run has to settle three things the VM leaves to its host:
 7. **Bounded by the caller and by the report.** The caller gives a step limit. The report holds
    at most `MAX_REPORT_BYTES` (64 MiB) of requests, answers, service names, decoded values
    (each field's size, name and bytes, nested fields included), seeds and keys, transfer data,
-   forms and messages, each event counted as at least `EVENT_COST` bytes besides its own; an
+   forms and messages, each event also counted as `EVENT_COST`, twice its size in the events list, whose storage can
+   grow to twice its length; an
    event past that ends the run with a host error before it is stored, and a log message past
    it, which the host cannot refuse, ends the run after its step. A definition run
    at ingestion is untrusted, and a loop resending a 16 MiB value would otherwise grow the

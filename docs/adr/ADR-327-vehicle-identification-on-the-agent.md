@@ -184,10 +184,12 @@ maintainer chose to run the loop on the agent.
    operator-facing attributes, labels with values (transmission: manual), that say nothing to the
    ECU and serve only this choice. When more than one variant of an ECU definition matches in an
    identification job, the agent reports all of them instead of the first one ADR-315 item 3
-   selects, and the operator picks one by its attributes. The pick is recorded for the job's
-   data and the vehicle view; it selects no document: a job that does not change an ECU
-   identifies each target's variant before its program runs (ADR-325 item 7, by ADR-315's first
-   match) and is refused when no candidate matches. A job changes an ECU at a target when any combination it holds sends to
+   selects, and the operator picks one by its attributes. The pick is recorded with the vehicle
+   and passed, signed, with the jobs that follow: a job that does not change an ECU identifies
+   each target's variant before its program runs (ADR-325 item 7) and, where it carries a pick
+   for that target, takes the picked variant when its patterns match and is refused when they
+   do not; without a pick it takes ADR-315's first match, and it is refused when no candidate
+   matches. A job changes an ECU at a target when any combination it holds sends to
    that target a request outside the read-only set of item 1, the services of access programs
    aside (ADR-325 item 10): a configuration write, reprogramming, a DTC clear, a routine (which
    can erase or actuate whatever its number), a reset, an input-output control. This is wider
@@ -230,12 +232,14 @@ maintainer chose to run the loop on the agent.
    The one exception is ADR-325 item 7's: the reprogramming
    target once the journal has reached its flash plan, which may answer only from its bootloader
    and is validated by ADR-229's hardware identity and state checks instead. For it the
-   combination record that ADR-325 item 7 commits, now only after the guard has passed on every
+   combination record that ADR-325 item 7 commits (or, for a job that commits none, such as a
+   single target without an access target, a guard record the journal commits at the same
+   point), now only after the guard has passed on every
    target the job changes and before the first instruction, also records that the guard passed
    and the hashes of the target's guard list (amending ADR-318 item 4 and ADR-325 item 7's
    record), and a restart once the journal has reached the flash plan (inside it or past its
    end) that carries a different guard list for that
-   target, or whose record lacks the pass or is missing, ends in on-site intervention as a
+   target, or whose record (combination or guard) lacks the pass or is missing, ends in on-site intervention as a
    variant that differs from the recorded combination does. The record is part of the checkpoint summary a handover carries, so a handed-over
    restart is held to the same list.
 8. **Manual paths.** The operator can choose a vehicle definition by hand (an unregistered or

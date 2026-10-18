@@ -611,7 +611,7 @@ lowered program the sections therefore never overlap, and each diagnostic primit
 exactly one (ADR-332).
 
 - **Extent.** An annotation applies to every diagnostic primitive its statement lowers to,
-  including those of the nested statements of an `if`, `for` or `while`. An annotation on a
+  including those of the nested statements of an `if` or a `for`. An annotation on a
   nested statement takes precedence there. It does not reach:
   - the functions the statement calls, which keep their own annotations and defaults;
   - a nested `def` or lambda, which is a function of its own (2.6).

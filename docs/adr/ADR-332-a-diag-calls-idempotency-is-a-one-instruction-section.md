@@ -4,7 +4,7 @@
 **Status:** Accepted
 **Affects:** `diag-frontend` Starlark lowering (`src/star/lower.rs`: the annotations and the
 section ranges built per covered copy), `crates/diag-frontend/docs/starlark-subset.md` 4.5 and
-4.6, design 8.2.5; ADR-233, ADR-301, ADR-329, ADR-330
+4.6, design 8.2.5; ADR-233, ADR-301 item 3, ADR-329, ADR-330
 
 ## Context
 
@@ -42,7 +42,7 @@ sections from overlapping.
    ahead of an erase and trigger a false refusal; no reader reads idempotency at an
    instruction that is not a primitive.
 2. **What an annotation reaches.** An `@idempotency` applies to every primitive its statement
-   lowers to, including those of the nested statements of an `if`, `for` or `while`. An
+   lowers to, including those of the nested statements of an `if` or a `for`. An
    annotation on a nested statement takes precedence there.
 
    It does not reach:
@@ -112,3 +112,7 @@ Rejected alternatives:
   properties of item 4. The entry check before an uninterruptible section (design 8.10.1)
   builds on item 6.
 - ADR-329 item 3 is realized by this ADR. Its item 1 stays for the pieces between primitives.
+- ADR-301 item 3 covered each copy with one `Section`. A copy is now covered by several
+  contiguous ones with the same interruptibility and expected duration. ADR-301 item 5 still
+  holds: every range is still part of a function body or a copy of one, and nothing changes in
+  the IR, the VM or the agent.

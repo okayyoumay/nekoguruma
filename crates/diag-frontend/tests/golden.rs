@@ -75,10 +75,14 @@ fn check(name: &str, actual: &str) {
 /// those bytes, enough for the program to go on. A generic send-receive's request starts with
 /// its SID, so it is matched on the positive response SID and the one byte after the SID; a
 /// `RoutineControl` on the positive response SID, its sub-function and its routine identifier.
+/// A seed is answered with [`GOLDEN_KEY`].
 struct Recording {
     out: String,
     answers: Vec<Vec<u8>>,
 }
+
+/// The key the recording host gives for any seed.
+const GOLDEN_KEY: [u8; 2] = [0xC0, 0xDE];
 
 #[derive(Debug)]
 struct NotSent;
@@ -147,8 +151,14 @@ impl DiagHost for Recording {
             .cloned()
             .unwrap_or(response))
     }
-    fn security_access(&mut self, _: u64, _: u8, _: &[u8]) -> Result<Option<Vec<u8>>, NotSent> {
-        Err(NotSent)
+    fn security_access(
+        &mut self,
+        _: u64,
+        level: u8,
+        seed: &[u8],
+    ) -> Result<Option<Vec<u8>>, NotSent> {
+        writeln!(self.out, "security-access {level:02X} {}", hex(seed)).expect("a String");
+        Ok(Some(GOLDEN_KEY.to_vec()))
     }
     fn flash_transfer(&mut self, _: u32, _: &[u8]) -> Result<(), NotSent> {
         Err(NotSent)

@@ -1,7 +1,9 @@
 # The procedure the IR golden test lowers for every variant of the example ECU and runs against
 # a host that records each request and answers it positively from responses.txt. The VIN write
 # is a section function (subset 4.5) whose helper is also called outside it, so the program holds
-# two copies of the helper and a section over the write's copies (ADR-301, ADR-329).
+# two copies of the helper and a section over the write's copies (ADR-301, ADR-329). The security
+# access sends the profile's seed and key requests, which no declared service answers, so the
+# host answers them with their bare positive response.
 
 def read_vin():
     diag.request(0x22, {"did": 0xF190})
@@ -26,5 +28,8 @@ def main():
     check = diag.routine(0xFF01, 0x01, {})
     if check["ok"] and check["fields"]["result"] == 0:
         diag.log(1, "programming dependencies correct")
+    unlock = diag.security_access(0x01)
+    if unlock["ok"]:
+        diag.log(1, "unlocked")
     write_vin()
     diag.log(1, "done")

@@ -4,7 +4,7 @@ EcuDocumentT {
         "csv-starlark",
     ),
     source_digest: Some(
-        "f1b6c3d867271af8ef9dd23ef04c06bc18b9a4394dc08c0b5a0e4cbb15d34132",
+        "9834c276584017eaefd1966428c1440496675d37c4579419f7a393a4a11a014a",
     ),
     variant: Some(
         EcuVariantT {
@@ -2310,7 +2310,7 @@ Program {
         },
         Pop,
         Call(
-            150,
+            183,
         ),
         PushBytes(
             1,
@@ -2435,15 +2435,15 @@ Program {
         ),
         Mul,
         StoreLocal(
-            4,
+            5,
         ),
         LoadLocal(
-            4,
+            5,
         ),
         IndexGet,
         Pop,
         LoadLocal(
-            4,
+            5,
         ),
         Dup,
         PushI64(
@@ -2452,7 +2452,7 @@ Program {
         Add,
         Slice,
         StoreLocal(
-            5,
+            6,
         ),
         PushI64(
             0,
@@ -2462,7 +2462,7 @@ Program {
         ),
         Shl,
         LoadLocal(
-            5,
+            6,
         ),
         PushI64(
             0,
@@ -2476,7 +2476,7 @@ Program {
         ),
         Shl,
         LoadLocal(
-            5,
+            6,
         ),
         PushI64(
             1,
@@ -2490,7 +2490,7 @@ Program {
         ),
         Shl,
         LoadLocal(
-            5,
+            6,
         ),
         PushI64(
             2,
@@ -2503,7 +2503,7 @@ Program {
             0,
         ),
         StoreLocal(
-            5,
+            6,
         ),
         PushI64(
             12648430,
@@ -2525,15 +2525,15 @@ Program {
         ),
         Mul,
         StoreLocal(
-            6,
+            7,
         ),
         LoadLocal(
-            6,
+            7,
         ),
         IndexGet,
         Pop,
         LoadLocal(
-            6,
+            7,
         ),
         Dup,
         PushI64(
@@ -2542,7 +2542,7 @@ Program {
         Add,
         Slice,
         StoreLocal(
-            7,
+            8,
         ),
         PushI64(
             0,
@@ -2552,7 +2552,7 @@ Program {
         ),
         Shl,
         LoadLocal(
-            7,
+            8,
         ),
         PushI64(
             3,
@@ -2565,7 +2565,7 @@ Program {
             0,
         ),
         StoreLocal(
-            7,
+            8,
         ),
         PushI64(
             40,
@@ -2626,16 +2626,100 @@ Program {
             level: 1,
             message: 8,
         },
-        Call(
-            154,
+        PushBytes(
+            9,
+        ),
+        ServiceRequest {
+            service: 39,
+        },
+        StoreLocal(
+            9,
+        ),
+        LoadLocal(
+            9,
+        ),
+        PushI64(
+            0,
+        ),
+        PushI64(
+            1,
+        ),
+        Slice,
+        PushBytes(
+            4,
+        ),
+        CmpEq,
+        Not,
+        JumpIfFalse(
+            167,
+        ),
+        PushBytes(
+            10,
+        ),
+        LoadLocal(
+            9,
+        ),
+        PushI64(
+            2,
+        ),
+        PushI64(
+            9223372036854775807,
+        ),
+        Slice,
+        SecurityAccess {
+            level: 1,
+        },
+        Concat,
+        ServiceRequest {
+            service: 39,
+        },
+        StoreLocal(
+            9,
+        ),
+        LoadLocal(
+            9,
+        ),
+        PushI64(
+            0,
+        ),
+        StoreLocal(
+            9,
+        ),
+        StoreLocal(
+            4,
+        ),
+        LoadLocal(
+            4,
+        ),
+        PushI64(
+            0,
+        ),
+        PushI64(
+            1,
+        ),
+        Slice,
+        PushBytes(
+            4,
+        ),
+        CmpEq,
+        Not,
+        JumpIfFalse(
+            180,
         ),
         Log {
             level: 1,
-            message: 9,
+            message: 11,
+        },
+        Call(
+            187,
+        ),
+        Log {
+            level: 1,
+            message: 12,
         },
         Ret,
         PushBytes(
-            11,
+            14,
         ),
         ServiceRequest {
             service: 34,
@@ -2643,10 +2727,10 @@ Program {
         Pop,
         Ret,
         Call(
-            159,
+            192,
         ),
         PushBytes(
-            10,
+            13,
         ),
         ServiceRequest {
             service: 46,
@@ -2654,7 +2738,7 @@ Program {
         Pop,
         Ret,
         PushBytes(
-            11,
+            14,
         ),
         ServiceRequest {
             service: 34,
@@ -2773,6 +2857,22 @@ Program {
             116,
         ],
         [
+            1,
+        ],
+        [
+            2,
+        ],
+        [
+            117,
+            110,
+            108,
+            111,
+            99,
+            107,
+            101,
+            100,
+        ],
+        [
             100,
             111,
             110,
@@ -2806,15 +2906,15 @@ Program {
     ],
     sections: [
         Section {
-            start_pc: 154,
-            end_pc: 159,
+            start_pc: 187,
+            end_pc: 192,
             interruptible: No,
             idempotency: CheckState,
             expected_millis: 2000,
         },
         Section {
-            start_pc: 159,
-            end_pc: 163,
+            start_pc: 192,
+            end_pc: 196,
             interruptible: No,
             idempotency: CheckState,
             expected_millis: 2000,
@@ -2824,205 +2924,223 @@ Program {
         SourceSpan {
             pc: 0,
             file: 0,
-            line: 14,
+            line: 16,
             column: 5,
         },
         SourceSpan {
             pc: 2,
             file: 0,
-            line: 15,
+            line: 17,
             column: 5,
         },
         SourceSpan {
             pc: 5,
             file: 0,
-            line: 16,
+            line: 18,
             column: 5,
         },
         SourceSpan {
             pc: 6,
             file: 0,
-            line: 17,
+            line: 19,
             column: 15,
         },
         SourceSpan {
             pc: 9,
             file: 0,
-            line: 18,
+            line: 20,
             column: 8,
         },
         SourceSpan {
             pc: 14,
             file: 0,
-            line: 19,
+            line: 21,
             column: 9,
         },
         SourceSpan {
             pc: 15,
             file: 0,
-            line: 20,
+            line: 22,
             column: 12,
         },
         SourceSpan {
             pc: 18,
             file: 0,
-            line: 21,
+            line: 23,
             column: 8,
         },
         SourceSpan {
             pc: 28,
             file: 0,
-            line: 21,
+            line: 23,
             column: 23,
         },
         SourceSpan {
             pc: 32,
             file: 0,
-            line: 21,
+            line: 23,
             column: 8,
         },
         SourceSpan {
             pc: 33,
             file: 0,
-            line: 22,
+            line: 24,
             column: 9,
         },
         SourceSpan {
             pc: 34,
             file: 0,
-            line: 23,
+            line: 25,
             column: 19,
         },
         SourceSpan {
             pc: 42,
             file: 0,
-            line: 24,
+            line: 26,
             column: 16,
         },
         SourceSpan {
             pc: 43,
             file: 0,
-            line: 24,
+            line: 26,
             column: 12,
         },
         SourceSpan {
             pc: 53,
             file: 0,
-            line: 24,
+            line: 26,
             column: 34,
         },
         SourceSpan {
             pc: 96,
             file: 0,
-            line: 24,
+            line: 26,
             column: 12,
         },
         SourceSpan {
             pc: 99,
             file: 0,
-            line: 24,
+            line: 26,
             column: 69,
         },
         SourceSpan {
             pc: 126,
             file: 0,
-            line: 24,
+            line: 26,
             column: 12,
         },
         SourceSpan {
             pc: 127,
             file: 0,
-            line: 25,
+            line: 27,
             column: 13,
         },
         SourceSpan {
             pc: 128,
             file: 0,
-            line: 26,
+            line: 28,
             column: 13,
         },
         SourceSpan {
             pc: 131,
             file: 0,
-            line: 27,
+            line: 29,
             column: 8,
         },
         SourceSpan {
             pc: 141,
             file: 0,
-            line: 27,
+            line: 29,
             column: 24,
         },
         SourceSpan {
             pc: 145,
             file: 0,
-            line: 27,
+            line: 29,
             column: 8,
         },
         SourceSpan {
             pc: 146,
             file: 0,
-            line: 28,
+            line: 30,
             column: 9,
         },
         SourceSpan {
             pc: 147,
             file: 0,
-            line: 29,
-            column: 5,
+            line: 31,
+            column: 14,
         },
         SourceSpan {
-            pc: 148,
+            pc: 171,
             file: 0,
-            line: 30,
+            line: 32,
+            column: 8,
+        },
+        SourceSpan {
+            pc: 179,
+            file: 0,
+            line: 33,
+            column: 9,
+        },
+        SourceSpan {
+            pc: 180,
+            file: 0,
+            line: 34,
             column: 5,
         },
         SourceSpan {
-            pc: 149,
+            pc: 181,
+            file: 0,
+            line: 35,
+            column: 5,
+        },
+        SourceSpan {
+            pc: 182,
+            file: 0,
+            line: 16,
+            column: 5,
+        },
+        SourceSpan {
+            pc: 183,
+            file: 0,
+            line: 9,
+            column: 5,
+        },
+        SourceSpan {
+            pc: 186,
+            file: 0,
+            line: 8,
+            column: 5,
+        },
+        SourceSpan {
+            pc: 187,
+            file: 0,
+            line: 13,
+            column: 5,
+        },
+        SourceSpan {
+            pc: 188,
             file: 0,
             line: 14,
             column: 5,
         },
         SourceSpan {
-            pc: 150,
-            file: 0,
-            line: 7,
-            column: 5,
-        },
-        SourceSpan {
-            pc: 153,
-            file: 0,
-            line: 6,
-            column: 5,
-        },
-        SourceSpan {
-            pc: 154,
-            file: 0,
-            line: 11,
-            column: 5,
-        },
-        SourceSpan {
-            pc: 155,
+            pc: 191,
             file: 0,
             line: 12,
             column: 5,
         },
         SourceSpan {
-            pc: 158,
+            pc: 192,
             file: 0,
-            line: 10,
+            line: 9,
             column: 5,
         },
         SourceSpan {
-            pc: 159,
+            pc: 195,
             file: 0,
-            line: 7,
-            column: 5,
-        },
-        SourceSpan {
-            pc: 162,
-            file: 0,
-            line: 6,
+            line: 8,
             column: 5,
         },
     ],

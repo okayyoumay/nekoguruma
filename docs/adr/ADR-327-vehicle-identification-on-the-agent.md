@@ -54,13 +54,15 @@ maintainer chose to run the loop on the agent.
 3. **Narrowing.** A candidate is dropped only when a fact contradicts it: a present endpoint
    that no ECU definition in any of its entries uses, an identified variant whose ECU definition
    none of its entries allows (counted only once every other definition that uses the same
-   endpoint and is still named by a remaining candidate has been read with an answer, since an ECU can
-   match the patterns of two alternative definitions; a sibling that is out of reach, item 5, has
-   not been ruled out, so the candidates that need it stay and, if more than one candidate is
+   endpoint and is still named by a remaining candidate has been read conclusively (every one of its
+   identification requests answered), since an ECU can match the patterns of two alternative
+   definitions; a sibling that is out of reach or inconclusive, item 5, has not been ruled out, so the candidates that need it stay and, if more than one candidate is
    left at the end, the operator chooses; when several match, all of them stay possible
    and the operator chooses, as for variants in item 7, amending ADR-326 item 3's first match), or an identification value whose matching rule (a VIN position
-   range, or a read field) gives a value outside the candidate's. A read of a definition whose
-   endpoint answers but whose variants all fail to match rules out only that definition; the
+   range, or a read field) gives a value outside the candidate's. A conclusive read of a definition
+   (every identification request answered) whose variants all fail to match rules out only that
+   definition; a read in which some requests go unanswered and no variant matches is
+   inconclusive and rules out nothing, since ADR-315 counts the unanswered entries as failed; the
    others sharing the endpoint stay possible, and the endpoint becomes an unrecognized variant
    (ADR-326 item 3) only when every definition using it has been read without a match. A
    missing answer never drops a candidate. An ECU definition that no remaining candidate names,
@@ -81,7 +83,9 @@ maintainer chose to run the loop on the agent.
    read or is out of reach, or when no candidate remains; a plan without candidates (item 8)
    ends when every definition in it has been read or is out of reach. Out of reach is
    established only by a physical read, per definition: a definition whose identification
-   requests all go unanswered is out of reach. Alternatives that share an endpoint may use
+   requests all go unanswered is out of reach, and one whose requests are partly unanswered
+   with no variant matching is inconclusive; both count as tried for the end of the loop and
+   keep the candidates that need them. Alternatives that share an endpoint may use
    different identification requests, so each one is still tried; the endpoint itself counts
    as out of reach only when every definition using it that is still in play has been tried
    without an answer. Silence to the presence request alone never puts a definition out of
@@ -111,9 +115,9 @@ maintainer chose to run the loop on the agent.
    definition the tenant may use), its own definition included (amending ADR-318 item 1, under
    which a job carries one variant's document). Before anything that writes is sent the agent
    runs variant identification over all of them, and the job is refused unless exactly one
-   variant of one definition matches, it is the job's own, and every other definition's
-   identification requests were answered (a negative response is an answer; no answer leaves
-   that definition unexcluded, which makes the check inconclusive and refuses the write, unlike
+   variant of one definition matches, it is the job's own, and every identification request of
+   every carried variant was answered, those of the job's own definition's other variants
+   included (a negative response is an answer; no answer leaves a variant unexcluded, which makes the check inconclusive and refuses the write, unlike
    ADR-315's selection, which treats it as no match). This holds whatever the operator picked,
    so an operator's choice never decides a write's target.
 8. **Manual paths.** The operator can choose a vehicle definition by hand (an unregistered or

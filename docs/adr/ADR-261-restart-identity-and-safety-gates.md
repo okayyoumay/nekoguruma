@@ -1,7 +1,7 @@
 # ADR-261: The Restart's Identity and Safety Gates
 
 **Date:** 2026-10-09
-**Status:** Accepted (the promotion consequence settled by ADR-263; item 2's ending with the gates' decision superseded by ADR-264; the creation-prefix rule extended to the intended software version by ADR-268; the unjournaled-abort consequence closed for the identity abort by ADR-286 and for the on-site endings by ADR-290)
+**Status:** Accepted (the promotion consequence settled by ADR-263; item 2's ending with the gates' decision superseded by ADR-264; the creation-prefix rule extended to the intended software version by ADR-268; the unjournaled-abort consequence closed for the identity abort by ADR-286 and for the on-site endings by ADR-290; item 3's passive ending for a VIN read with no answer or a negative response replaced by on-site intervention when the VIN is read through an access target, by ADR-325 item 5)
 **Affects:** `agent` (`src/restart.rs`, `src/runner.rs`, `src/journaling.rs`, `src/journal.rs`, `docs/ngr-agent.md`), ADR-244, ADR-255 item 5
 
 ## Context

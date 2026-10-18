@@ -6,8 +6,8 @@
 `diag-frontend` (procedure targets, `diag.ecu`, access programs, lowering per combination of
 variants), `agent` (`Job`, `check_job`, policy, one link per target, keep-alive, run and restart
 order), the workers' cyclic tester-present (kept off), `sim-ecu` (a gateway role), design 8.2.4, 8.2.5,
-8.2.6, 5.6, 8.10, 8.10.1; ADR-229 item 2, ADR-233 item 3, ADR-235 item 8, ADR-244, ADR-245, ADR-247 item 1, ADR-257,
-ADR-264 item 4, ADR-280, ADR-293, ADR-307 items 1 and 5, ADR-309 item 3, ADR-311 item 1, ADR-313 items 1 and 2, ADR-320 item 1, ADR-316, ADR-318 items 1, 3 and 4,
+8.2.6, 5.6, 8.10, 8.10.1; ADR-229 item 2, ADR-233 item 3, ADR-235 items 3 and 8, ADR-244, ADR-245, ADR-247 item 1, ADR-257,
+ADR-261 item 3, ADR-264 item 4, ADR-280, ADR-293, ADR-307 items 1 and 5, ADR-309 item 3, ADR-311 item 1, ADR-313 items 1 and 2, ADR-320 item 1, ADR-316, ADR-318 items 1, 3 and 4,
 ADR-321, ADR-322 items 1 and 3, ADR-324
 
 ## Context
@@ -49,9 +49,10 @@ shape survives inside the second as the access program of item 5.
    its definition's protocol. Targets addressed functionally (one request that several ECUs
    answer) are not part of this decision; they are decided with the functional requests of the
    generic OBD package, and the target model leaves room for them. The conversion refuses more
-   than eight targets per procedure, and two roles bound to the same definition (the primary's
-   included), since `SelectTarget` would then switch between names of one ECU and a step meant
-   for one target would reach the other.
+   than eight targets per procedure, a role name declared twice in one procedure, since
+   `diag.ecu(role)` would then name no single target, and two roles bound to the same definition
+   (the primary's included), since `SelectTarget` would then switch between names of one ECU and
+   a step meant for one target would reach the other.
 2. **Starlark addresses a target through a handle.** `diag.ecu(role)` returns the handle of a
    declared target; the role must be a constant, so every handle is known at conversion. The
    diagnostic calls are available on the handle (`gw.security_access(level)`,

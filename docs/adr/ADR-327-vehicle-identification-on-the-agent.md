@@ -62,8 +62,12 @@ maintainer chose to run the loop on the agent.
    item 2 leaves unused for a document job's link; that link still sends only physical
    requests. ADR-235 item 8's read-only policy forbids TesterPresent because it keeps
    a session alive that the job may not own; the presence request is excepted for an
-   identification job only, since it is sent once per link before any session is opened and
-   asks for nothing to be kept alive. Every other TesterPresent stays forbidden to read-only jobs.
+   identification job only. It is sent once per link, never repeated as a keep-alive. Like any
+   request, it restarts the S3 timer of an ECU that is already in a non-default session opened
+   by someone else, but the reads every read-only job sends do the same (ISO 14229-2 restarts
+   the timer on any request, as `sim-ecu` models), so the exception adds no new effect on an
+   unowned session; what ADR-235 keeps forbidden is a TesterPresent sent to hold a session
+   open, and every other TesterPresent stays forbidden to read-only jobs.
 3. **Narrowing.** A candidate is dropped only when a fact contradicts it: a presence answer
    (bus and response identifier) that no ECU definition in any of its entries could have given, an identified variant whose ECU definition
    none of its entries allows (counted only once every other definition that uses the same

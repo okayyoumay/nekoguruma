@@ -46,21 +46,23 @@ maintainer chose to run the loop on the agent.
 2. **Presence first.** For each distinct link of the ECU definitions in the plan whose protocol
    declares a functional identifier, the agent sends one presence request functionally (for UDS,
    TesterPresent with a response requested) and records each physical response identifier that
-   answered as a present endpoint. Presence belongs to the endpoint, not to an ECU definition. An
+   answered. An
    endpoint is a physical address: the bus (protocol family, pins and baud rate, which tell
    physical networks apart) and the physical request and response identifiers; definitions
    whose links differ only in timing or other ComParams that do not distinguish the network
-   share an endpoint, since they can reach the same ECU. Presence is keyed by endpoint
-   because alternatives such as two suppliers' ECUs for one role
-   often share an endpoint, and an answer says only that one of the definitions using it is
+   share an endpoint, since they can reach the same ECU. A functional answer shows only the bus
+   and the response identifier, not which physical request identifier the ECU listens on, so a
+   presence answer is recorded as that pair and counts for every endpoint with that bus and
+   response identifier. Presence is keyed this way, not by ECU definition, because alternatives such as two suppliers' ECUs for one role
+   often share an endpoint, and an answer says only that one of the definitions that could give it is
    fitted, until a read tells which. An answer is evidence of presence; silence is not
    evidence of absence, since an ECU behind a gateway, a sleeping ECU or one on a link without
    functional addressing may not answer. This is the one functional request the agent sends,
    and it uses the functional identifier the ECU definition's protocol declares, which ADR-324
    item 2 leaves unused for a document job's link; that link still sends only physical
    requests.
-3. **Narrowing.** A candidate is dropped only when a fact contradicts it: a present endpoint
-   that no ECU definition in any of its entries uses, an identified variant whose ECU definition
+3. **Narrowing.** A candidate is dropped only when a fact contradicts it: a presence answer
+   (bus and response identifier) that no ECU definition in any of its entries could have given, an identified variant whose ECU definition
    none of its entries allows (counted only once every other definition that uses the same
    endpoint and is still named by a remaining candidate has been read conclusively, since an ECU can match the patterns of two alternative
    definitions; a sibling that is out of reach or inconclusive, item 5, has not been ruled out, so the candidates that need it stay and, if more than one candidate is

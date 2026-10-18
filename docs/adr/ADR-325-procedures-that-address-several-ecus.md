@@ -74,15 +74,16 @@ shape survives inside the second as the access program of item 5.
 4. **The restart declaration names its target.** The identity sources, the precondition sources
    and the flash recovery plans of the procedure part (ADR-245) each name the target they refer
    to. The VIN source may be on any target, except in a procedure with access targets (below);
-   the hardware identity and every flash plan are on
-   the reprogramming target (item 9). `Program::validate`, which every load runs, refuses flash
-   plans on two targets, a hardware identity off the reprogramming target, a download service
-   addressed to any other target, and any instruction between a plan's erase and its
-   post-transfer end that addresses another target. It also refuses a flash plan on an access
-   target (item 13) and, in a procedure with access targets, a missing VIN source or one
-   anywhere but on the first access target (item 5); `check_job` refuses such a job without a
-   target VIN, and one whose combinations declare different VIN sources, since the VIN is read
-   before a combination is chosen.
+   the hardware identity, the software version and every flash plan are on the reprogramming
+   target (item 9). `Program::validate`, which every load runs, refuses flash plans on two
+   targets, a hardware identity or software version source off the reprogramming target (the
+   restart compares that version before the erase and reads it back after the transfer,
+   ADR-229), a download service addressed to any other target, and any instruction between a
+   plan's erase and its post-transfer end that addresses another target. It also refuses a flash
+   plan on an access target (item 13) and, in a procedure with access targets, a missing VIN
+   source or one anywhere but on the first access target (item 5); `check_job` refuses such a
+   job without a target VIN, and one whose combinations declare different VIN sources, since the
+   VIN is read before a combination is chosen.
 5. **Access programs.** A target whose session and unlock other targets depend on (a gateway)
    can be declared an access target, with an access program: steps that only change that
    target's session and security state and read from it (session control to the default or an
@@ -94,36 +95,39 @@ shape survives inside the second as the access program of item 5.
    and a response window shorter than the link's declared P2 (so the module's own receive
    timeout ends an unanswered probe before the agent gives it up) or longer than a fifth of the
    session timeout, so that even with one probe unanswered the next answer is due a fifth of the
-   timeout before the target would be counted lost (item 12). Several access targets (a gateway behind
-   a gateway) run their access programs in declaration order. The access program is lowered on
-   its own, once per variant of the access target, and travels with the job; the conversion and
-   `check_job` refuse any other service in it. No access program runs before the job holds the
-   per-vehicle lock, since a session change or an unlock on a shared gateway could end the
-   session that another job of this device on the same vehicle depends on (8.8). So the VIN is read, without any access
-   program, from the first access target, which a locked gateway answers with reads. A first run
-   goes in this order: identify the first access target and read the VIN from it; when the VIN
-   matches, take the per-vehicle lock (8.8), waiting for it with nothing more sent while another
-   job holds it; then identify the first access target again, since the job that held the lock
-   may have reflashed it, and read the VIN again with the variant now identified, since the
-   vehicle may have changed during the wait; then, for each access target in declaration order,
-   run its access program at once, identifying each one after the first just before its
-   program, so that an inner gateway is reached through an unlocked outer one; then identify
-   the other targets and pick the combination (item 7). A VIN that differs, at either
-   read, ends a first run in the 8.9.1 pre-check with only reads sent, and a lock failure leaves
-   only those reads sent. A restart (8.2.5) identifies the first access target and reads the VIN
-   from it in ADR-229's order (item 2 step 2), since that target may have been reflashed after
-   the journal recorded its variant, and, once it holds the per-vehicle lock, identifies it
-   again after any wait, reads the VIN again and requires it to match, as a first run does,
-   and only then runs the access programs in the same way before any other step. Since its VIN
-   now comes from an access target rather than from the ECU being reprogrammed, a step 2 VIN read that gets no answer or a negative response ends the restart
+   timeout before the target would be counted lost (item 12). Several access targets (a gateway
+   behind a gateway) run their access programs in declaration order. The access program is
+   lowered on its own, once per variant of the access target, and travels with the job; the
+   conversion and `check_job` refuse any other service in it. No access program runs before the
+   job holds the per-vehicle lock, since a session change or an unlock on a shared gateway could
+   end the session that another job of this device on the same vehicle depends on (8.8). So the
+   VIN is read, without any access program, from the first access target, which a locked gateway
+   answers with reads. A first run goes in this order: identify the first access target and read
+   the VIN from it; when the VIN matches, take the per-vehicle lock (8.8), waiting for it with
+   nothing more sent while another job holds it; then identify the first access target again,
+   since the job that held the lock may have reflashed it, and read the VIN again with the
+   variant now identified, since the vehicle may have changed during the wait; then, for each
+   access target in declaration order, run its access program at once, identifying each one
+   after the first just before its program, so that an inner gateway is reached through an
+   unlocked outer one; then identify the other targets and pick the combination (item 7). A VIN
+   that differs, at either read, ends a first run in the 8.9.1 pre-check with only reads sent,
+   and a lock failure leaves only those reads sent. A restart (8.2.5) identifies the first
+   access target and reads the VIN from it in ADR-229's order (item 2 step 2), since that target
+   may have been reflashed after the journal recorded its variant, and, once it holds the
+   per-vehicle lock, identifies it again after any wait, reads the VIN again and requires it to
+   match, as a first run does, and only then runs the access programs in the same way before any
+   other step. Since its VIN now comes from an access target rather than from the ECU being
+   reprogrammed, a step 2 VIN read that gets no answer or a negative response ends the restart
    in on-site intervention (`IdentityNotEstablished`, which a later resume may retry, ADR-290)
    instead of the passive teardown ADR-229 takes there, which would reach the reprogramming
    target's default-session confirmation without an unlocked gateway. A step of an access
-   program that fails ends the job as a lost access target would at that point (item 12),
-   at once: nothing in this order is held for a keep-alive answer, since an access target has a
-   loss clock only once its access program has ended (item 12).
-   Every run also runs them again after any reopening of the links (a worker crash or VCI
-   disconnect that the job survives) before the program continues. The main program may still select the access target for anything else.
+   program that fails ends the job as a lost access target would at that point (item 12), at
+   once: nothing in this order is held for a keep-alive answer, since an access target has a
+   loss clock only from the first final response of its access program (item 12), and a loss
+   counted while that program runs ends the job as that failing step does. Every run also runs
+   them again after any reopening of the links (a worker crash or VCI disconnect that the job
+   survives) before the program continues. The main program may still select the access target
+   for anything else.
 6. **Lowered once per combination of variants.** The main program is lowered for each
    combination of one variant per target, extending ADR-311's per-variant lowering, and must
    lower for every combination; the scoping of a procedure to some variants that ADR-311 item 2
@@ -243,26 +247,30 @@ shape survives inside the second as the access program of item 5.
 12. **A lost access target ends the job by the section rules.** The agent counts as an access
     target's good answer only a final response, positive or negative (a response pending is
     none; the worker waits it out), to a request the agent itself sent on that target's link, a
-    probe of item 11 or one of the VM's; the end of the access program is the first good answer.
-    The agent keeps, for that link, the send times of the requests that may still be owed an
-    answer, each read from its own monotonic clock before the send call: every request it sends,
-    probes and the VM's alike, joins them, and every final response it sees removes the oldest
-    one and is dated by it, so a request that ended without a final response the agent saw
-    (cancelled, timed out, failed to send or lost from the event stream) stays among them. The
-    ECU answers each request at most once, and a worker attributes a frame to whichever active
-    primitive expects it, with nothing on the wire to tell two TesterPresents apart, so a late
-    answer to an unanswered request can be credited to a later one, and several such answers can
-    arrive one after another; matching each answer to the oldest request still owed one keeps
-    every credited date at or before the send of the request the answer may really belong to. An
-    answer that never arrives leaves its request among them for the rest of the job on that link
-    (until the links are reopened and the access program runs again), so each such request
-    delays every later credited date by about one period; one is within the bounds of item 5,
-    and several in a job count the target lost, which errs toward a loss and is accepted.
-    Nothing else is credited: not silence, not a probe that was cancelled or ended without a
-    final response, not an answer the agent cannot attribute, not any time the worker or the
-    module reports, and a lost-events notification on that link leaves the probe in flight
-    uncredited. The ECU's session timer stops when it receives a request from the client that
-    opened the session and restarts when its final response is complete (ISO 14229-2 (2021)
+    probe of item 11 or one of the VM's; the first final response of the target's access program
+    is the first good answer, so the target has a loss clock from then on, its access program's
+    own waits included, and a loss counted before that program ends ends the job as a failing
+    step of it does (item 5); without that clock a gateway that relocked during a wait inside
+    its access program would go unseen, since a TesterPresent is answered in the default session
+    too. The agent keeps, for that link, the send times of the requests that may still be owed
+    an answer, each read from its own monotonic clock before the send call: every request it
+    sends, probes and the VM's alike, joins them, and every final response it sees removes the
+    oldest one and is dated by it, so a request that ended without a final response the agent
+    saw (cancelled, timed out, failed to send or lost from the event stream) stays among them.
+    The ECU answers each request at most once, and a worker attributes a frame to whichever
+    active primitive expects it, with nothing on the wire to tell two TesterPresents apart, so a
+    late answer to an unanswered request can be credited to a later one, and several such
+    answers can arrive one after another; matching each answer to the oldest request still owed
+    one keeps every credited date at or before the send of the request the answer may really
+    belong to. An answer that never arrives leaves its request among them for the rest of the
+    job on that link (until the links are reopened and the access program runs again), so each
+    such request delays every later credited date by about one period; one is within the bounds
+    of item 5, and several in a job count the target lost, which errs toward a loss and is
+    accepted. Nothing else is credited: not silence, not a probe that was cancelled or ended
+    without a final response, not an answer the agent cannot attribute, not any time the worker
+    or the module reports, and a lost-events notification on that link leaves the probe in
+    flight uncredited. The ECU's session timer stops when it receives a request from the client
+    that opened the session and restarts when its final response is complete (ISO 14229-2 (2021)
     9.5), so the session is held at least until the credited date plus the declared timeout, and
     every delay in the worker, in event delivery or in the agent only makes a credited date
     older, never newer. It counts the target as lost once that last good answer is older than
@@ -286,22 +294,21 @@ shape survives inside the second as the access program of item 5.
     valid application. The agent does not run the access program again by itself. A request to
     any target that gets no answer, or whose link reported lost events, is held rather than
     handled at once, since the gateway it passed may be failing while every answer so far was
-    still good: the agent holds it until every access target whose access program has ended has
-    a good answer dated after the failure (while the VM holds the request those links are free,
-    so a healthy gateway's probe releases the hold within about one period and one response
-    window), and then handles the failure as any failed request is, or until one of them is
-    counted lost, which bounds the wait by the session timeout and puts the outcome above in its
-    place, except that inside an uninterruptible section the job ends in on-site intervention,
-    since the held request has no answer that would let the section continue to its end; so a
-    request that times out first cannot turn a lost gateway into an ordinary interrupted step
-    (ADR-235). Access targets whose access program has not ended have no loss clock and no last
-    good answer, so nothing waits on them: a failure in item 5's order before every access
-    program has ended is handled at once by its own rule (an identification as the primary's
-    identification failing does, item 7; a VIN read as item 5 says; an access-program step as a
-    lost access target would), and an identification read of a later target that gets no answer
-    is held like any request, all access programs having ended by then. Keep-alive answers from
-    targets that are not access targets are not watched: a request to such a target that fails
-    is handled as any failed request is.
+    still good: the agent holds it until every access target that has a loss clock has a good
+    answer dated after the failure (while the VM holds the request those links are free, so a
+    healthy gateway's probe releases the hold within about one period and one response window),
+    and then handles the failure as any failed request is, or until one of them is counted lost,
+    which bounds the wait by the session timeout and puts the outcome above in its place, except
+    that inside an uninterruptible section the job ends in on-site intervention, since the held
+    request has no answer that would let the section continue to its end; so a request that
+    times out first cannot turn a lost gateway into an ordinary interrupted step (ADR-235).
+    Access targets without a loss clock have no last good answer, so nothing waits on them: a
+    failure in item 5's order before every access program has ended is handled at once by its
+    own rule (an identification as the primary's identification failing does, item 7; a VIN read
+    as item 5 says; an access-program step as a lost access target would), and an identification
+    read of a later target that gets no answer is held like any request, all access programs
+    having ended by then. Keep-alive answers from targets that are not access targets are not
+    watched: a request to such a target that fails is handled as any failed request is.
 13. **An access target carries no flash plan.** The conversion and `Program::validate` refuse
     a flash plan on a target declared as an access target. Reprogramming a gateway that other
     targets are reached through, as an access target, would need the chain behind it to be suspended during the

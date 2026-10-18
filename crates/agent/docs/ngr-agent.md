@@ -88,7 +88,7 @@ Steps (`agent::check_job`, `agent::guards::JobGuards`, `agent::launch::launch_wo
    worker that has not exited 5 s after that is killed and reported on stderr. When the job's link was not confirmed closed and the worker
    cannot be stopped either, the run fails with "the worker may still hold the VCI", and the
    locks stay held until the process exits (ADR-258). The policy is read-only, except that a debug build may send any request once
-   the worker's VCI has identified itself as `sim-vci` (ADR-247); a program that needs more
+   the worker's VCI has identified itself as `sim-vci` (ADR-247) or `iso22900-mock` (ADR-331); a program that needs more
    than the VCI allows is refused after the link opens, before its first instruction runs.
    On that permission the `FlashTransfer` instruction also works (ADR-250); `SecurityAccess`
    stays refused, since an agent without a server has no key source (design 8.10, ADR-259).
@@ -219,7 +219,7 @@ every record after it and after a procedure failure, in a commit and when it rea
 logged. No on-site ending is journaled.
 
 `ngr-agent run` uses `run_program` and keeps no journal; it sends read-only requests, or any
-request to `sim-vci` in a debug build (ADR-247).
+request to `sim-vci` or `iso22900-mock` in a debug build (ADR-247, ADR-331).
 
 ## Restart classification
 

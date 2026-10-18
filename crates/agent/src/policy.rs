@@ -6,8 +6,9 @@
 //! again once the link is open and the VCI is known, and in the host for every request it
 //! sends, so a refused request never reaches the bus.
 //!
-//! The one exception is a debug build talking to the `sim-vci` simulator (ADR-247): there a job
-//! may send any request, so the write paths can be exercised without hardware. The
+//! The one exception is a debug build talking to a simulated VCI, `sim-vci` (ADR-247) or
+//! `iso22900-mock` (ADR-331): there a job may send any request, so the write paths can be
+//! exercised without hardware. The
 //! [`Permission::Simulator`] variant does not exist in a release build, so no release code can
 //! name it, let alone grant it.
 
@@ -21,7 +22,7 @@ use crate::host::HostError;
 pub enum Permission {
     /// Only [`READ_ONLY_SERVICES`] (ADR-235 item 8).
     ReadOnly,
-    /// Any request the host implements, on the simulated VCI of a debug build (ADR-247).
+    /// Any request the host implements, on a simulated VCI of a debug build (ADR-247, ADR-331).
     /// The `FlashTransfer` instruction is covered too (ADR-250). The `SecurityAccess`
     /// instruction is still refused: a standalone agent has no key source (ADR-259).
     #[cfg(debug_assertions)]
@@ -54,20 +55,39 @@ const J2534_SERVICE_VENDOR_NAME: &str = "j2534-0404";
 #[cfg(debug_assertions)]
 const J2534_SERVICE_PDU_API_SW_NAME: &str = "J2534";
 
-/// The permission for the VCI a worker reports (ADR-247): the simulator one only when the
-/// firmware and DLL names are those `sim-vci` reports through `j2534-0404-service` (`hw_name`
-/// carries the firmware version string, `fw_name` the DLL version string) and that service
-/// itself answered (it sets `vendor_name` and `pdu_api_sw_name` to constants). The last two
-/// matter because another worker, `iso22900-service`, fills `hw_name` and `fw_name` from other
-/// sources, so the meaning of those two fields holds only for the J2534 worker. Anything else,
-/// including a vendor interface, is read-only. Debug builds only: a release build never asks.
+/// What `iso22900-mock` reports through `iso22900-service` (ADR-331): the service passes the
+/// library's version data through unchanged, so all four come from the mock.
+#[cfg(debug_assertions)]
+const ISO22900_MOCK_VERSION: [&str; 4] = [
+    "Mock Hardware",
+    "Mock Firmware",
+    "Mock Vendor",
+    "iso22900-mock",
+];
+
+/// The permission for the VCI a worker reports (ADR-247, ADR-331): the simulator one only for
+/// the two simulated VCIs. The first is `sim-vci` through `j2534-0404-service`: its firmware and
+/// DLL names (`hw_name` carries the firmware version string, `fw_name` the DLL version string),
+/// and that service itself answered (it sets `vendor_name` and `pdu_api_sw_name` to constants).
+/// The last two matter because another worker, `iso22900-service`, fills `hw_name` and `fw_name`
+/// from other sources, so the meaning of those two fields holds only for the J2534 worker. The
+/// second is `iso22900-mock` through `iso22900-service`, which reports exactly the mock's four
+/// names; `j2534-0404-service` cannot report them, since its API name is always `J2534`.
+/// Anything else, including a vendor interface, is read-only. Debug builds only: a release build
+/// never asks.
 #[cfg(debug_assertions)]
 pub fn identify(version: &vci_service_interface::VersionData) -> Permission {
-    if version.hw_name.starts_with("NGR-SIM ")
+    let sim_vci = version.hw_name.starts_with("NGR-SIM ")
         && version.fw_name.starts_with("sim-vci ")
         && version.vendor_name == J2534_SERVICE_VENDOR_NAME
-        && version.pdu_api_sw_name == J2534_SERVICE_PDU_API_SW_NAME
-    {
+        && version.pdu_api_sw_name == J2534_SERVICE_PDU_API_SW_NAME;
+    let iso22900_mock = [
+        version.hw_name.as_str(),
+        version.fw_name.as_str(),
+        version.vendor_name.as_str(),
+        version.pdu_api_sw_name.as_str(),
+    ] == ISO22900_MOCK_VERSION;
+    if sim_vci || iso22900_mock {
         Permission::Simulator
     } else {
         Permission::ReadOnly
@@ -562,6 +582,35 @@ mod tests {
                     identify(&version(hw, fw)),
                     Permission::ReadOnly,
                     "{hw:?} / {fw:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn only_the_mock_names_identify_the_d_pdu_simulator() {
+            let [hw, fw, vendor, api] = ISO22900_MOCK_VERSION;
+            assert_eq!(
+                identify(&version_from(hw, fw, vendor, api)),
+                Permission::Simulator
+            );
+            // Each name changed in turn, and the mock's API name from the J2534 worker.
+            for names in [
+                ["", fw, vendor, api],
+                [hw, "", vendor, api],
+                [hw, fw, "", api],
+                [hw, fw, vendor, ""],
+                ["mock hardware", fw, vendor, api],
+                [hw, fw, vendor, "iso22900-mock "],
+                [hw, fw, vendor, "ISO22900-MOCK"],
+                [hw, fw, "Real Vendor", api],
+                [hw, fw, "j2534-0404", api],
+                [hw, fw, vendor, "J2534"],
+            ] {
+                let [hw, fw, vendor, api] = names;
+                assert_eq!(
+                    identify(&version_from(hw, fw, vendor, api)),
+                    Permission::ReadOnly,
+                    "{names:?}"
                 );
             }
         }

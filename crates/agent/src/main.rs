@@ -1,7 +1,6 @@
 //! `ngr-agent`: the device-side agent (design 3.3). The job runner lives in the `agent` library.
-//! The binary's one command, `ngr-agent run`, runs one IR program, or the procedure of a
-//! variant's document, on a VCI and prints the final VM state as JSON
-//! (`crates/agent/docs/ngr-agent.md`).
+//! The binary's one command, `ngr-agent run`, runs the procedure of a variant's document on a
+//! VCI and prints the final VM state as JSON (`crates/agent/docs/ngr-agent.md`).
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -12,16 +11,16 @@ use std::time::Duration;
 use agent::guards::{GuardSetup, JobGuards};
 use agent::launch::{Api, launch_worker};
 use agent::policy::build_ceiling;
-use agent::{Job, JobDocument, JobLimits, LinkConfig, check_job, run_program};
-use diag_ir::{Program, Value, VmState};
+use agent::{Job, JobDocument, JobLimits, check_job, run_program};
+use diag_ir::{Value, VmState};
 use worker_host::service::{LaunchOptions, OperatingMode, Stopped, WorkerLayout};
 
 const USAGE: &str = "\
-usage: ngr-agent run --vci <name> --mode <device|user> (--program <file> | --document <file>)
-                     [options]
+usage: ngr-agent run --vci <name> --mode <device|user> --document <file> [options]
 
-Runs an IR program (diag-ir Program as JSON), or the procedure of a variant's document, on a
-J2534 v04.04 or D-PDU API VCI and prints the final VM state as JSON on stdout.
+Runs the procedure of a variant's document on a J2534 v04.04 or D-PDU API VCI and prints the
+final VM state as JSON on stdout. The job takes its link from the protocol the variant
+declares.
 
 options:
   --vci <name>         library name the worker service resolves: a J2534 library, or the
@@ -30,16 +29,12 @@ options:
   --mode <device|user> the device's operating mode, passed to the worker: device mode
                        refuses a library that fails the pre-load checks, user mode
                        reports the findings and loads it
-  --program <file>     IR program file (JSON); it decodes no response fields
   --document <file>    a variant's document (.dir): runs its procedure, which decodes
-                       response fields through the variant's declarations
+                       response fields through the variant's declarations (required)
   --workers <dir>      worker binaries, laid out as <dir>/<ABI name>/<binary>
                        (default: the 'workers' directory next to ngr-agent)
   --locks <dir>        the device's lock directory for the VCI lock and the reprogramming
-                       slot (default: the 'locks' directory next to ngr-agent)
-  --tx-id <id>         with --program: physical request CAN ID, 11-bit hex (default 7E0)
-  --rx-id <id>         with --program: response CAN ID, 11-bit hex (default 7E8); a
-                       document's job takes its link from the protocol it declares";
+                       slot (default: the 'locks' directory next to ngr-agent)";
 
 /// How often a job waiting for its guards tries again.
 const GUARD_POLL: Duration = Duration::from_millis(10);
@@ -47,26 +42,16 @@ const GUARD_POLL: Duration = Duration::from_millis(10);
 /// How long a stopping worker may take to close its link before it is killed.
 const STOP_GRACE: Duration = Duration::from_secs(5);
 
-/// The file a run's job comes from.
-#[derive(Debug, PartialEq, Eq)]
-enum JobFile {
-    /// A `diag_ir::Program` as JSON.
-    Program(PathBuf),
-    /// A variant's document, whose procedure is the program (design 8.2.6).
-    Document(PathBuf),
-}
-
 #[derive(Debug, PartialEq, Eq)]
 struct RunArgs {
     api: Api,
     vci: String,
     mode: OperatingMode,
-    job: JobFile,
+    /// The variant's document, whose procedure is the program (design 8.2.6). The job takes
+    /// the link its variant declares (ADR-324).
+    document: PathBuf,
     workers: Option<PathBuf>,
     locks: Option<PathBuf>,
-    /// The link of a program, from the command line. A document's job takes the link its
-    /// variant declares (ADR-324).
-    link: Option<LinkConfig>,
 }
 
 fn main() -> ExitCode {
@@ -111,11 +96,9 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<RunArgs, Strin
     let mut api = Api::J2534;
     let mut vci = None;
     let mut mode = None;
-    let mut job = None;
+    let mut document = None;
     let mut workers = None;
     let mut locks = None;
-    let mut tx_id = None;
-    let mut rx_id = None;
     while let Some(flag) = args.next() {
         let flag = flag
             .into_string()
@@ -145,60 +128,28 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<RunArgs, Strin
                     .parse()
                     .map_err(|error| format!("--api: {error}"))?
             }
-            "--program" | "--document" if job.is_some() => {
-                return Err("give --program or --document, once".to_owned());
+            "--document" if document.is_some() => {
+                return Err("give --document once".to_owned());
             }
-            "--program" => job = Some(JobFile::Program(PathBuf::from(value))),
-            "--document" => job = Some(JobFile::Document(PathBuf::from(value))),
+            "--document" => document = Some(PathBuf::from(value)),
             "--workers" => workers = Some(PathBuf::from(value)),
             // A relative path would name a different lock set from each working directory.
             "--locks" if !Path::new(&value).is_absolute() => {
                 return Err("--locks needs an absolute directory".to_owned());
             }
             "--locks" => locks = Some(PathBuf::from(value)),
-            "--tx-id" => tx_id = Some(parse_can_id(&flag, &value)?),
-            "--rx-id" => rx_id = Some(parse_can_id(&flag, &value)?),
             _ => return Err(format!("unknown option {flag:?}")),
         }
     }
-    let link = match job {
-        Some(JobFile::Document(_)) if tx_id.is_some() || rx_id.is_some() => {
-            return Err(
-                "--tx-id and --rx-id are for --program: a document declares its link".to_owned(),
-            );
-        }
-        Some(JobFile::Document(_)) => None,
-        _ => {
-            let link = LinkConfig::iso15765(tx_id.unwrap_or(0x7E0), rx_id.unwrap_or(0x7E8));
-            link.validate().map_err(|error| error.to_string())?;
-            Some(link)
-        }
-    };
     Ok(RunArgs {
         api,
         vci: vci.ok_or("--vci is required")?,
         // The mode is fixed per device at installation (design 6.2); there is no default.
         mode: mode.ok_or("--mode is required")?,
-        job: job.ok_or("--program or --document is required")?,
+        document: document.ok_or("--document is required")?,
         workers,
         locks,
-        link,
     })
-}
-
-/// A CAN ID in hex, with or without a `0x` prefix.
-fn parse_can_id(flag: &str, value: &OsString) -> Result<u32, String> {
-    let text = value.to_str().unwrap_or_default();
-    let digits = text
-        .strip_prefix("0x")
-        .or_else(|| text.strip_prefix("0X"))
-        .unwrap_or(text);
-    let invalid = || format!("{flag} {value:?} is not a hex CAN ID");
-    // `from_str_radix` would also take a sign.
-    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(invalid());
-    }
-    u32::from_str_radix(digits, 16).map_err(|_| invalid())
 }
 
 /// The `workers` directory next to the running executable.
@@ -220,38 +171,24 @@ fn next_to_exe(name: &str, flag: &str) -> Result<PathBuf, String> {
     Ok(dir.join(name))
 }
 
-/// Reads the job a run's file gives.
-fn read_job(file: &JobFile) -> Result<Job, String> {
-    match file {
-        JobFile::Program(path) => {
-            let text = std::fs::read_to_string(path)
-                .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-            let program: Program = serde_json::from_str(&text)
-                .map_err(|error| format!("{} is not an IR program: {error}", path.display()))?;
-            Ok(program.into())
-        }
-        JobFile::Document(path) => {
-            let bytes = std::fs::read(path)
-                .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-            JobDocument::new(bytes)
-                .and_then(Job::from_document)
-                .map_err(|error| format!("{}: {error}", path.display()))
-        }
-    }
+/// Reads the job a run's document gives.
+fn read_job(path: &Path) -> Result<Job, String> {
+    let bytes =
+        std::fs::read(path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    JobDocument::new(bytes)
+        .and_then(Job::from_document)
+        .map_err(|error| format!("{}: {error}", path.display()))
 }
 
 /// Runs the job and returns the final VM state as JSON.
 async fn run(args: RunArgs) -> Result<String, String> {
-    let job = read_job(&args.job)?;
+    let job = read_job(&args.document)?;
     // A program the job would refuse does not need a worker, nor does a link the document
     // declares that cannot be used.
     check_job(&job, build_ceiling()).map_err(|error| format!("job failed: {error}"))?;
-    let link = match args.link {
-        Some(link) => link,
-        None => job
-            .declared_link()
-            .map_err(|error| format!("job failed: {error}"))?,
-    };
+    let link = job
+        .declared_link()
+        .map_err(|error| format!("job failed: {error}"))?;
     // The per-VCI lock, and the reprogramming slot for a program that writes (design 8.8.1). The
     // wait polls a file lock, so it runs off the runtime's threads; nothing cancels it here.
     let dir = match args.locks {
@@ -355,17 +292,16 @@ mod tests {
                 "sim-vci",
                 "--mode",
                 "user",
-                "--program",
-                "p.json"
+                "--document",
+                "v.dir"
             ]),
             Ok(RunArgs {
                 api: Api::J2534,
                 vci: "sim-vci".to_owned(),
                 mode: OperatingMode::User,
-                job: JobFile::Program(PathBuf::from("p.json")),
+                document: PathBuf::from("v.dir"),
                 workers: None,
                 locks: None,
-                link: Some(LinkConfig::iso15765(0x7E0, 0x7E8)),
             })
         );
     }
@@ -379,12 +315,8 @@ mod tests {
             "w",
             "--locks",
             locks.to_str().expect("a UTF-8 temp dir"),
-            "--tx-id",
-            "0x7DF",
-            "--rx-id",
-            "7e9",
-            "--program",
-            "p.json",
+            "--document",
+            "v.dir",
             "--vci",
             "x",
             "--mode",
@@ -394,16 +326,11 @@ mod tests {
         ])
         .expect("valid arguments");
         assert_eq!(args.api, Api::Dpdu);
+        assert_eq!(args.vci, "x");
         assert_eq!(args.mode, OperatingMode::Device);
+        assert_eq!(args.document, PathBuf::from("v.dir"));
         assert_eq!(args.workers, Some(PathBuf::from("w")));
         assert_eq!(args.locks, Some(locks));
-        let link = args.link.expect("a program's link");
-        assert_eq!((link.tx_id, link.rx_id), (0x7DF, 0x7E9));
-        let args = parse(&["run", "--vci", "x", "--mode", "user", "--document", "v.dir"])
-            .expect("valid arguments");
-        assert_eq!(args.job, JobFile::Document(PathBuf::from("v.dir")));
-        // A document's job takes the link it declares.
-        assert_eq!(args.link, None);
     }
 
     #[test]
@@ -411,19 +338,8 @@ mod tests {
         for args in [
             &[][..],
             &["start"],
-            &["run", "--mode", "user", "--program", "p.json"],
-            // One job file.
-            &[
-                "run",
-                "--vci",
-                "x",
-                "--mode",
-                "user",
-                "--program",
-                "p",
-                "--document",
-                "d",
-            ],
+            &["run", "--mode", "user", "--document", "d.dir"],
+            // One document, and one is required.
             &[
                 "run",
                 "--vci",
@@ -434,60 +350,21 @@ mod tests {
                 "d",
                 "--document",
                 "d",
-            ],
-            &[
-                "run",
-                "--vci",
-                "x",
-                "--mode",
-                "user",
-                "--program",
-                "p",
-                "--program",
-                "p",
             ],
             &["run", "--vci", "x", "--mode", "user"],
             &["run", "--vci"],
             // The mode has no default and only the exact spellings select one.
-            &["run", "--vci", "x", "--program", "p"],
-            &["run", "--vci", "x", "--program", "p", "--mode"],
-            &["run", "--vci", "x", "--program", "p", "--mode", ""],
-            &["run", "--vci", "x", "--program", "p", "--mode", "Device"],
-            &["run", "--vci", "x", "--program", "p", "--mode", "service"],
-            // A document declares its link.
-            &[
-                "run",
-                "--vci",
-                "x",
-                "--mode",
-                "user",
-                "--document",
-                "d",
-                "--tx-id",
-                "7E0",
-            ],
-            &[
-                "run",
-                "--rx-id",
-                "7E8",
-                "--vci",
-                "x",
-                "--mode",
-                "user",
-                "--document",
-                "d",
-            ],
+            &["run", "--vci", "x", "--document", "d"],
+            &["run", "--vci", "x", "--document", "d", "--mode"],
+            &["run", "--vci", "x", "--document", "d", "--mode", ""],
+            &["run", "--vci", "x", "--document", "d", "--mode", "Device"],
+            &["run", "--vci", "x", "--document", "d", "--mode", "service"],
         ] {
             assert!(parse(args).is_err(), "{args:?}");
         }
-        let valid = ["run", "--vci", "x", "--mode", "user", "--program", "p"];
+        let valid = ["run", "--vci", "x", "--mode", "user", "--document", "d"];
         for extra in [
-            &["--tx-id", "7G0"][..],
-            &["--tx-id", "+7E0"],
-            &["--tx-id", "0x"],
-            // 29-bit IDs need the link to set the ID format.
-            &["--rx-id", "18DAF110"],
-            &["--verbose", "1"],
+            &["--verbose", "1"][..],
             &["--locks"],
             &["--locks", ""],
             &["--locks", "locks"],
@@ -500,6 +377,24 @@ mod tests {
             let args: Vec<&str> = valid.iter().chain(extra).copied().collect();
             assert!(parse(&args).is_err(), "{args:?}");
         }
+    }
+
+    /// A job is always a document: the options that gave a bare program and its link are gone.
+    #[test]
+    fn the_retired_program_and_link_options_are_unknown() {
+        let valid = ["run", "--vci", "x", "--mode", "user", "--document", "d"];
+        for extra in [
+            &["--program", "p.json"][..],
+            &["--tx-id", "7E0"],
+            &["--rx-id", "7E8"],
+        ] {
+            let args: Vec<&str> = valid.iter().chain(extra).copied().collect();
+            let error = parse(&args).expect_err("a retired option");
+            assert!(error.starts_with("unknown option"), "{error}");
+        }
+        let error = parse(&["run", "--vci", "x", "--mode", "user", "--program", "p.json"])
+            .expect_err("a retired option");
+        assert!(error.starts_with("unknown option"), "{error}");
     }
 
     #[test]

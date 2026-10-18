@@ -3,7 +3,7 @@
 #![cfg(debug_assertions)]
 //! `ngr-agent run --api dpdu` end to end without hardware: the agent binary resolves the
 //! `iso22900-mock` library through a root description file, picks the `iso22900-service` build
-//! for its ABI from a workers directory, launches it and runs an IR program on the simulated
+//! for its ABI from a workers directory, launches it and runs the procedure of a variant's document on the simulated
 //! ECU the mock answers from (ADR-299).
 //!
 //! `ngr-agent` belongs to another package, so cargo builds it only when the `agent` package is
@@ -34,6 +34,29 @@ fn ngr_agent_path() -> PathBuf {
         path.display()
     );
     path
+}
+
+/// A variant's document whose procedure is `procedure`: its protocol is UDS over ISO 15765 at
+/// 500 kbit/s on 7E0 / 7E8, the link the job opens (ADR-324).
+fn document(procedure: &Program) -> Vec<u8> {
+    use diag_ir::declaration::{EcuDocumentT, EcuVariantT, ProtocolT, encode_ecu_document};
+    let mut protocol = ProtocolT::default();
+    protocol.short_name = Some("ISO15765".into());
+    protocol.application_layer = Some("UDS".into());
+    protocol.baud_rate = 500_000;
+    protocol.tx_id = 0x7E0;
+    protocol.rx_id = 0x7E8;
+    let mut variant = EcuVariantT::default();
+    variant.id = 1;
+    variant.short_name = Some("sim".into());
+    variant.protocols = Some(vec![protocol]);
+    let mut document = EcuDocumentT::default();
+    document.schema_version = IR_SCHEMA_VERSION;
+    document.source_format = Some("csv-starlark".into());
+    document.source_digest = Some("00".into());
+    document.variant = Some(Box::new(variant));
+    document.procedure = Some(postcard::to_allocvec(procedure).expect("program should serialize"));
+    encode_ecu_document(&document)
 }
 
 /// Installs the service binary as `<workers>/<ABI name>/iso22900-service`, the layout
@@ -68,7 +91,7 @@ fn program() -> Program {
 }
 
 #[test]
-fn ngr_agent_runs_a_program_on_a_d_pdu_api_vci() {
+fn ngr_agent_runs_a_document_on_a_d_pdu_api_vci() {
     let temp = tempfile::tempdir().expect("temporary directory");
     let root = temp.path();
     let library = iso22900_mock::mock_library_path().expect("the mock cdylib should be built");
@@ -89,12 +112,8 @@ fn ngr_agent_runs_a_program_on_a_d_pdu_api_vci() {
             "require_gateway_auth":false,"fail_checksum":false}"#,
     )
     .expect("ECU configuration should be writable");
-    let program_path = root.join("program.json");
-    std::fs::write(
-        &program_path,
-        serde_json::to_vec(&program()).expect("program should serialize"),
-    )
-    .expect("program file should be writable");
+    let document_path = root.join("variant.dir");
+    std::fs::write(&document_path, document(&program())).expect("document should be writable");
 
     let mut child = Command::new(ngr_agent_path())
         .args([
@@ -105,9 +124,9 @@ fn ngr_agent_runs_a_program_on_a_d_pdu_api_vci() {
             LIBRARY_NAME,
             "--mode",
             "user",
-            "--program",
+            "--document",
         ])
-        .arg(&program_path)
+        .arg(&document_path)
         .arg("--workers")
         .arg(&workers)
         .arg("--locks")

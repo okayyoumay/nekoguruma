@@ -33,8 +33,9 @@ impl Drop for TempDir {
     }
 }
 
-fn write_program(dir: &Path, code: Vec<Op>) -> PathBuf {
-    let program = Program {
+/// The program a document's procedure is: `code` over one constant, the VIN's DID.
+fn program(code: Vec<Op>) -> Program {
+    Program {
         schema_version: IR_SCHEMA_VERSION,
         code,
         constants: vec![vec![0xF1, 0x90]],
@@ -43,14 +44,13 @@ fn write_program(dir: &Path, code: Vec<Op>) -> PathBuf {
         identity: Default::default(),
         preconditions: Default::default(),
         flash: Vec::new(),
-    };
-    let path = dir.join("program.json");
-    std::fs::write(
-        &path,
-        serde_json::to_vec(&program).expect("program should serialize"),
-    )
-    .expect("program file should be writable");
-    path
+    }
+}
+
+/// A variant's document whose procedure is `code`.
+fn write_program(dir: &Path, code: Vec<Op>) -> PathBuf {
+    let procedure = postcard::to_allocvec(&program(code)).expect("program should serialize");
+    write_document(dir, Some(procedure))
 }
 
 // Only the debug-only tests read the VIN through a worker.
@@ -79,34 +79,33 @@ fn usage_error_exits_with_2() {
 }
 
 #[test]
-fn a_29_bit_can_id_is_a_usage_error() {
-    let output = ngr_agent()
-        .args([
-            "run",
-            "--vci",
-            "x",
-            "--mode",
-            "user",
-            "--program",
-            "p.json",
-            "--tx-id",
-            "18DA10F1",
-        ])
-        .output()
-        .expect("ngr-agent should run");
-    assert_eq!(output.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("11-bit"));
+fn the_retired_program_and_link_options_are_usage_errors() {
+    for extra in [
+        &["--program", "p.json"][..],
+        &["--document", "d.dir", "--tx-id", "7E0"],
+        &["--document", "d.dir", "--rx-id", "7E8"],
+    ] {
+        let output = ngr_agent()
+            .args(["run", "--vci", "x", "--mode", "user"])
+            .args(extra)
+            .output()
+            .expect("ngr-agent should run");
+        assert_eq!(output.status.code(), Some(2), "{extra:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("unknown option"), "{stderr}");
+        assert!(output.stdout.is_empty());
+    }
 }
 
 #[test]
-fn unreadable_program_exits_with_1() {
-    let temp = TempDir::new("missing");
+fn a_run_without_a_document_is_a_usage_error() {
     let output = ngr_agent()
-        .args(["run", "--vci", "none", "--mode", "user", "--program"])
-        .arg(temp.0.join("missing.json"))
+        .args(["run", "--vci", "x", "--mode", "user"])
         .output()
         .expect("ngr-agent should run");
-    assert_fails_with(output, "cannot read");
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--document is required"));
+    assert!(output.stdout.is_empty());
 }
 
 #[test]
@@ -118,40 +117,27 @@ fn refused_program_exits_with_1_before_resolving_the_vci() {
         vec![Op::PushBytes(0), Op::SecurityAccess { level: 1 }],
     );
     let output = ngr_agent()
-        .args(["run", "--vci", "none", "--mode", "user", "--program"])
+        .args(["run", "--vci", "none", "--mode", "user", "--document"])
         .arg(program)
         .output()
         .expect("ngr-agent should run");
     assert_fails_with(output, "refused");
 }
 
-#[test]
-fn a_program_that_decodes_without_a_document_exits_with_1_before_resolving_the_vci() {
-    let temp = TempDir::new("no-document");
-    let program = write_program(
-        &temp.0,
-        vec![
-            Op::PushBytes(0),
-            Op::DecodeField {
-                service: 1,
-                field: 1,
-            },
-        ],
-    );
-    let output = ngr_agent()
-        .args(["run", "--vci", "none", "--mode", "user", "--program"])
-        .arg(program)
-        .output()
-        .expect("ngr-agent should run");
-    assert_fails_with(output, "no document");
-}
-
-/// A variant's document with no services, carrying `procedure`.
+/// A variant's document with no services, carrying `procedure`. Its protocol is UDS over
+/// ISO 15765 at 500 kbit/s on 7E0 / 7E8, so a job that gets as far as the link can open one.
 fn write_document(dir: &Path, procedure: Option<Vec<u8>>) -> PathBuf {
-    use diag_ir::declaration::{EcuDocumentT, EcuVariantT, encode_ecu_document};
+    use diag_ir::declaration::{EcuDocumentT, EcuVariantT, ProtocolT, encode_ecu_document};
     let mut variant = EcuVariantT::default();
     variant.id = 1;
     variant.short_name = Some("v".into());
+    let mut protocol = ProtocolT::default();
+    protocol.short_name = Some("ISO15765".into());
+    protocol.application_layer = Some("UDS".into());
+    protocol.baud_rate = 500_000;
+    protocol.tx_id = 0x7E0;
+    protocol.rx_id = 0x7E8;
+    variant.protocols = Some(vec![protocol]);
     let mut document = EcuDocumentT::default();
     document.schema_version = IR_SCHEMA_VERSION;
     document.source_format = Some("csv-starlark".into());
@@ -170,20 +156,14 @@ fn a_document_that_cannot_run_exits_with_1_before_resolving_the_vci() {
     std::fs::write(&not_a_document, b"not a document").expect("file should be writable");
     // A field the document does not declare.
     let decodes = Program {
-        schema_version: IR_SCHEMA_VERSION,
-        code: vec![
+        constants: vec![vec![0x62]],
+        ..program(vec![
             Op::PushBytes(0),
             Op::DecodeField {
                 service: 1,
                 field: 1,
             },
-        ],
-        constants: vec![vec![0x62]],
-        sections: Vec::new(),
-        source_map: Vec::new(),
-        identity: Default::default(),
-        preconditions: Default::default(),
-        flash: Vec::new(),
+        ])
     };
     let undeclared = write_document(
         &temp.0,
@@ -223,7 +203,7 @@ fn a_write_is_refused_before_resolving_the_vci_in_a_release_build() {
         vec![Op::PushBytes(0), Op::ServiceRequest { service: 0x2E }],
     );
     let output = ngr_agent()
-        .args(["run", "--vci", "none", "--mode", "user", "--program"])
+        .args(["run", "--vci", "none", "--mode", "user", "--document"])
         .arg(program)
         .output()
         .expect("ngr-agent should run");
@@ -257,7 +237,7 @@ fn unknown_vci_exits_with_1() {
     let temp = TempDir::new("unknown-vci");
     let definitions = write_definitions(&temp.0, None);
     let output = ngr_agent()
-        .args(["run", "--vci", "test-vci", "--mode", "user", "--program"])
+        .args(["run", "--vci", "test-vci", "--mode", "user", "--document"])
         .arg(read_vin(&temp.0))
         .arg("--workers")
         .arg(&temp.0)
@@ -276,7 +256,7 @@ fn missing_worker_build_exits_with_1() {
     // Any library header does: the agent's own executable stands in for the VCI library.
     let definitions = write_definitions(&temp.0, Some(Path::new(env!("CARGO_BIN_EXE_ngr-agent"))));
     let output = ngr_agent()
-        .args(["run", "--vci", "test-vci", "--mode", "user", "--program"])
+        .args(["run", "--vci", "test-vci", "--mode", "user", "--document"])
         .arg(read_vin(&temp.0))
         .arg("--workers")
         .arg(temp.0.join("empty"))
@@ -318,7 +298,7 @@ fn long_size_passed_to_the_worker(name: &str, extra: &str) -> String {
     std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o755))
         .expect("stand-in worker should be executable");
     let output = ngr_agent()
-        .args(["run", "--vci", "test-vci", "--mode", "user", "--program"])
+        .args(["run", "--vci", "test-vci", "--mode", "user", "--document"])
         .arg(read_vin(&temp.0))
         .arg("--workers")
         .arg(&workers)
@@ -373,7 +353,7 @@ fn a_run_waits_for_the_vci_lock() {
     )
     .expect("the test takes the VCI lock");
     let mut child = ngr_agent()
-        .args(["run", "--vci", "test-vci", "--mode", "user", "--program"])
+        .args(["run", "--vci", "test-vci", "--mode", "user", "--document"])
         .arg(read_vin(&temp.0))
         .arg("--workers")
         .arg(&temp.0)
@@ -423,7 +403,7 @@ fn a_writing_run_waits_for_the_reprogramming_slot() {
         vec![Op::PushBytes(0), Op::ServiceRequest { service: 0x2E }],
     );
     let mut child = ngr_agent()
-        .args(["run", "--vci", "test-vci", "--mode", "user", "--program"])
+        .args(["run", "--vci", "test-vci", "--mode", "user", "--document"])
         .arg(program)
         .arg("--workers")
         .arg(&temp.0)

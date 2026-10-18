@@ -4,7 +4,7 @@
 **Status:** Accepted
 **Affects:** `agent` (an identification job, write jobs' variant check), `server` (identification plans, re-evaluation of
 the reported facts), `diag-frontend` and `diag-ir` (operator-facing variant attributes), design
-8.8.2, 8.9.1; ADR-315 (ambiguous variant matches), ADR-318 item 1, ADR-324 item 2, ADR-326 items 3 and 5; `docs/glossary.md`
+8.8.2, 8.9.1; ADR-235 item 8, ADR-315 (ambiguous variant matches), ADR-318 item 1, ADR-324 item 2, ADR-326 items 3 and 5; `docs/glossary.md`
 
 ## Context
 
@@ -60,7 +60,10 @@ maintainer chose to run the loop on the agent.
    functional addressing may not answer. This is the one functional request the agent sends,
    and it uses the functional identifier the ECU definition's protocol declares, which ADR-324
    item 2 leaves unused for a document job's link; that link still sends only physical
-   requests.
+   requests. ADR-235 item 8's read-only policy forbids TesterPresent because it keeps
+   a session alive that the job may not own; the presence request is excepted for an
+   identification job only, since it is sent once per link before any session is opened and
+   asks for nothing to be kept alive. Every other TesterPresent stays forbidden to read-only jobs.
 3. **Narrowing.** A candidate is dropped only when a fact contradicts it: a presence answer
    (bus and response identifier) that no ECU definition in any of its entries could have given, an identified variant whose ECU definition
    none of its entries allows (counted only once every other definition that uses the same

@@ -56,9 +56,10 @@ A shared dry run has to settle three things the VM leaves to its host:
    that reads to the end of the message (a terminated value with no terminator and no maximum,
    a repeat to the end) ends the answer, and so does a field whose extent the declaration does
    not give (a select, a repeat up to a marker, a layout of no declared size): a field placed
-   after it has no bytes and the answer fails to decode from there, so such a response needs a
-   scripted answer. A length or count field with a conversion that maps zero elsewhere needs
-   one too. A built answer lets a procedure go on and its field reads decode; a procedure that
+   after it has no bytes, and since a response decodes whole or not at all, every field read of
+   it fails, so such a response needs a scripted answer. A length or count field with a
+   conversion that maps zero elsewhere needs one too. Otherwise a built answer lets a procedure
+   go on and its field reads decode; a procedure that
    checks a value may then take its own failure path, which the report shows as the run's end.
    A service with no positive response needs a scripted answer.
 

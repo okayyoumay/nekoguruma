@@ -54,8 +54,10 @@ maintainer chose to run the loop on the agent.
 3. **Narrowing.** A candidate is dropped only when a fact contradicts it: a present endpoint
    that no ECU definition in any of its entries uses, an identified variant whose ECU definition
    none of its entries allows (counted only once every other definition that uses the same
-   endpoint and is still named by a remaining candidate has been read, since an ECU can match
-   the patterns of two alternative definitions; when several match, all of them stay possible
+   endpoint and is still named by a remaining candidate has been read or is out of reach, item
+   5, since an ECU can match the patterns of two alternative definitions; a sibling that did not
+   answer its own requests cannot have matched, so the drop then rests on the identified match,
+   not on the silence; when several match, all of them stay possible
    and the operator chooses, as for variants in item 7, amending ADR-326 item 3's first match), or an identification value whose matching rule (a VIN position
    range, or a read field) gives a value outside the candidate's. A read of a definition whose
    endpoint answers but whose variants all fail to match rules out only that definition; the

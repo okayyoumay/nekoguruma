@@ -47,9 +47,10 @@ maintainer chose to run the loop on the agent.
    declares a functional identifier, the agent sends one presence request functionally (for UDS,
    TesterPresent with a response requested) and records each physical response identifier that
    answered as a present endpoint. Presence belongs to the endpoint, not to an ECU definition. An
-   endpoint is a physical address: the bus (protocol family and pins) and the physical request
-   and response identifiers; definitions whose links differ only in baud rate, timing or other
-   ComParams share an endpoint, since they can reach the same ECU. Presence is keyed by endpoint
+   endpoint is a physical address: the bus (protocol family, pins and baud rate, which tell
+   physical networks apart) and the physical request and response identifiers; definitions
+   whose links differ only in timing or other ComParams that do not distinguish the network
+   share an endpoint, since they can reach the same ECU. Presence is keyed by endpoint
    because alternatives such as two suppliers' ECUs for one role
    often share an endpoint, and an answer says only that one of the definitions using it is
    fitted, until a read tells which. An answer is evidence of presence; silence is not

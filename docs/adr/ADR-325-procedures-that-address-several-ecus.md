@@ -6,7 +6,7 @@
 `diag-frontend` (procedure targets, `diag.ecu`, access programs, lowering per combination of
 variants), `agent` (`Job`, `check_job`, policy, one link per target, keep-alive, run and restart
 order), the workers' cyclic tester-present (kept off), `sim-ecu` (a gateway role), design 8.2.4, 8.2.5,
-8.2.6, 5.6, 8.10, 8.10.1; ADR-229 item 2, ADR-235 item 8, ADR-245, ADR-247 item 1, ADR-257,
+8.2.6, 5.6, 8.10, 8.10.1; ADR-229 item 2, ADR-233 item 3, ADR-235 item 8, ADR-244, ADR-245, ADR-247 item 1, ADR-257,
 ADR-264 item 4, ADR-280, ADR-293, ADR-307 items 1 and 5, ADR-311 item 1, ADR-316, ADR-318 items 1, 3 and 4,
 ADR-321, ADR-322 items 1 and 3, ADR-324
 
@@ -81,10 +81,12 @@ shape survives inside the second as the access program of item 5.
    restart compares that version before the erase and reads it back after the transfer,
    ADR-229), a download service addressed to any other target, and any instruction between a
    plan's erase and its post-transfer end that addresses another target. It also refuses a flash
-   plan on an access target (item 13) and, in a procedure with access targets, a missing VIN
-   source or one anywhere but on the first access target (item 5); `check_job` refuses such a
-   job without a target VIN, and one whose combinations declare different VIN sources, since the
-   VIN is read before a combination is chosen.
+   plan on an access target (item 13) and, in a procedure with several targets or an access
+   target, a missing VIN source, since its first run reads the VIN to take the per-vehicle lock
+   before identifying the targets that pick the combination (item 5), and, in a procedure with
+   access targets, a VIN source anywhere but on the first access target; `check_job` refuses
+   such a job without a target VIN, and one whose combinations declare different VIN sources,
+   since the VIN is read before a combination is chosen.
 5. **Access programs.** A target whose session and unlock other targets depend on (a gateway)
    can be declared an access target, with an access program: steps that only change that
    target's session and security state and read from it (session control to the default or an

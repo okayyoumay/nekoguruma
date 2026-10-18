@@ -239,7 +239,11 @@ maintainer chose to run the loop on the agent.
    gives, so a slower ECU's first frame is not missed because the target answered first (amending ADR-235 item 3 for these requests, as item 2
    does for presence); any frame there counts, whether or not a
    multi-frame response would complete. An answer on any of them other than the target's own
-   shows a second ECU that would receive the job's changes and refuses the job, and a job whose
+   shows a second ECU that would receive the job's changes and refuses the job, and so does a
+   second answer on the target's own identifier to one request (a second final response, or a
+   response that starts while another is still arriving there; a response-pending answer
+   followed by its final response is one answer), which shows two ECUs sharing both
+   identifiers; and a job whose
    VCI cannot receive one of those identifiers beside the target's link is refused, so a fitted
    ECU of a listed variant cannot hide behind the target's response filter: it is sent its own
    variant's identification requests and answers them on its own identifier. A guard variant whose declared identifiers differ from the target's link may get no
@@ -314,7 +318,9 @@ maintainer chose to run the loop on the agent.
   there that answers none of the identification requests, its own variant's included, stays
   unseen, and so does one that answers on a response identifier no listed variant declares (an
   unknown device, or one of an ECU definition the tenant may not use), since without a
-  declaration an answer there cannot be told apart from the bus's other traffic. A job refused because its VCI cannot receive those identifiers beside the target's
+  declaration an answer there cannot be told apart from the bus's other traffic. Two ECUs that
+  share both of the target's identifiers are seen only when their answers arrive as separate
+  frames; identical answers sent at the same instant merge on the bus and look like one. A job refused because its VCI cannot receive those identifiers beside the target's
   link needs another VCI. These are accepted.
 - Until ECU definitions declare definitive negative responses, every negative response leaves a
   read inconclusive, so a guard is refused whenever any variant on its list (the target's own

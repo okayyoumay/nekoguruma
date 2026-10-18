@@ -1,7 +1,7 @@
 # ADR-307: Packaging Starlark Procedures into Documents
 
 **Date:** 2026-10-16
-**Status:** Accepted (Decision item 2's single lowering amended by ADR-311)
+**Status:** Accepted (Decision item 2's single lowering amended by ADR-311; item 1's one document per variant and procedure and item 5's digest amended by ADR-325)
 **Affects:** `diag-frontend` (`src/convert.rs`, `src/tables/mod.rs`, `src/star.rs`),
 `crates/diag-frontend/docs/csv-tables.md` sections 1 and 6, `starlark-subset.md` 2.1, ADR-295 item 1, design
 8.2.6

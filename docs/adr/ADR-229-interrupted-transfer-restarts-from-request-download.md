@@ -1,7 +1,7 @@
 # ADR-229: Interrupted Transfers Restart from RequestDownload; Write Procedures Are a Reference Implementation
 
 **Date:** 2026-10-05
-**Status:** Accepted (item 1's `recovery_required_from_step` replaced by ADR-245's recovery-required point; the fields the Consequences list as missing are declared as ADR-245 describes; item 2's failed confirmation after an accepted reset gets one passive retry since ADR-265; item 2 step 3's post-transfer completion counts only for the interrupted pass since ADR-269; item 2's identity abort is journaled as a terminal state since ADR-286)
+**Status:** Accepted (item 1's `recovery_required_from_step` replaced by ADR-245's recovery-required point; the fields the Consequences list as missing are declared as ADR-245 describes; item 2's failed confirmation after an accepted reset gets one passive retry since ADR-265; item 2 step 3's post-transfer completion counts only for the interrupted pass since ADR-269; item 2's identity abort is journaled as a terminal state since ADR-286; item 2's steps after the per-vehicle lock preceded by the access programs of ADR-325 item 5, which also ends a failed step 2 VIN read in on-site intervention there)
 **Affects:** `docs/system-architecture.md` (8.2.5, 16.1), `crates/agent` (write-job journal), `crates/sim-ecu` (flash state), `crates/diag-ir` (resume model)
 
 ## Context

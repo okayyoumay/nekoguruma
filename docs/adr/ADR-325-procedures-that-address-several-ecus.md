@@ -133,7 +133,15 @@ shape survives inside the second as the access program of item 5.
    is lost; a target without a clock yet holds nothing. A loss counted while an access program
    runs ends the job as a failing step of it does. Every run also runs them again after any
    reopening of the links (a worker crash or VCI disconnect that the job survives) before the
-   program continues. The main program may still select the access target for anything else.
+   program continues; when such a rerun fails, or a loss is counted during it, while the VM is
+   inside an uninterruptible section, the job ends in on-site intervention, since the section
+   cannot continue to its end without the gateway. The main program may still select an access
+   target, but only for reads: the conversion and `check_job` refuse any other service a
+   combination program addresses to an access target, since a session change, a reset or a new
+   security access there would undo the access program while TesterPresent kept being answered
+   in the default session, so the loss clock would not see it. A procedure that must change a
+   gateway's own state does so in a separate procedure that does not declare it an access
+   target.
 6. **Lowered once per combination of variants.** The main program is lowered for each
    combination of one variant per target, extending ADR-311's per-variant lowering, and must
    lower for every combination; the scoping of a procedure to some variants that ADR-311 item 2

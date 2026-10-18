@@ -1,7 +1,7 @@
 # ADR-324: A Document Job's Link Comes from Its Declared Protocol
 
 **Date:** 2026-10-17
-**Status:** Accepted (item 2's unused functional identifier: used for the presence request of identification jobs by ADR-327; item 1's single link per job: an identification job and a write job's variant check open each carried variant's declared link in turn, one link per distinct link, ADR-327)
+**Status:** Accepted (item 1's one link per job extended to one link per target by ADR-325 item 8; item 2's unused functional identifier used for the presence request of identification jobs, and item 1's single link per job widened for an identification job, which opens each distinct declared link in turn, by ADR-327)
 **Affects:** `agent` (`src/link.rs`: `LinkConfig::declared`, `LinkConfig::params`,
 `set_up_link`; `src/runner.rs`: `Job::declared_link` and the runner's entry points; `src/main.rs`: `--tx-id` / `--rx-id`),
 `j2534-0404-service` (`tests/agent_end_to_end.rs`), `crates/agent/docs/ngr-agent.md`,

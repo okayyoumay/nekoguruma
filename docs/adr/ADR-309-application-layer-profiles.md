@@ -1,7 +1,7 @@
 # ADR-309: Application-Layer Profiles for Protocol-Neutral Diagnostic Calls
 
 **Date:** 2026-10-16
-**Status:** Accepted (items 2 and 5 given their form by ADR-314)
+**Status:** Accepted (items 2 and 5 given their form by ADR-314; item 3's one program per variant lowered per combination of target variants, each call against its target's declarations, by ADR-325 item 6)
 **Affects:** `diag-frontend` (Starlark lowering, CSV tables), `diag-ir` (`Op`, `DiagHost`, declaration
 part schema), `agent` (`src/host.rs`, `src/link.rs`, `src/policy.rs`),
 `crates/diag-frontend/docs/starlark-subset.md`, `crates/diag-frontend/docs/csv-tables.md`, ADR-235

@@ -1,7 +1,7 @@
 # ADR-280: `diag.fail` Is a Terminal `Fail` Instruction, Journaled so a Restart Does Not Resume the Job
 
 **Date:** 2026-10-12
-**Status:** Accepted (schema-compatibility consequence relaxed by ADR-281 item 4; the terminal-record rule extended to the restart's identity abort by ADR-286; the open consequence on the step limit and a VM error decided by ADR-288, which journals both as terminal)
+**Status:** Accepted (schema-compatibility consequence relaxed by ADR-281 item 4; the terminal-record rule extended to the restart's identity abort by ADR-286; the open consequence on the step limit and a VM error decided by ADR-288, which journals both as terminal; ADR-325 item 12 ends a job the same way on a lost access target)
 **Affects:** `diag-ir` (`src/lib.rs`, `src/recovery.rs`), `agent` (`src/runner.rs`, `src/journal.rs`, `src/journaling.rs`, `src/restart.rs`, `src/policy.rs`, `docs/ngr-agent.md`), `diag-frontend` (`docs/starlark-subset.md`), `docs/system-architecture.md` 5.6, 8.2.4, 8.2.5; ADR-233, ADR-244, ADR-254, ADR-276
 
 ## Context

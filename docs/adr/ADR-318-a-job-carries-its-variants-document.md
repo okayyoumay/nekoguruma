@@ -1,7 +1,7 @@
 # ADR-318: A Job Carries Its Variant's Document
 
 **Date:** 2026-10-16
-**Status:** Accepted (item 1 amended for write jobs (any job that can change the ECU, routines included) by ADR-327: they also carry the document of every variant, of any ECU definition the tenant may use, whose declared link is on the job's endpoint; item 4 and the undetected replacement in Consequences amended for those jobs by ADR-327: once their variant check passes, the journal records the hashes of the program and of every document the check covered, and a restart carrying others is refused)
+**Status:** Accepted (items 1, 3 and 4 amended by ADR-325; item 1 further amended by ADR-327: a job that changes an ECU also carries, for each target it changes, a signed guard list of the documents of every variant, of any ECU definition the tenant may use, whose declared link is on that target's bus and shares its request or response identifier; item 4 further amended by ADR-327: ADR-325's combination record also holds the guard lists' hashes)
 **Affects:** `agent` (`src/document.rs`, `src/runner.rs`: `Job`, `check_job`,
 `JobError::NoDeclarations` and `JobError::Undeclared`; `src/host.rs`, `src/main.rs`:
 `ngr-agent run --document`), `diag-ir` (`check_decode_fields`), design 8.2.4,

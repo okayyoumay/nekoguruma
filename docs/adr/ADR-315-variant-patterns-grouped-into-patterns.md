@@ -1,7 +1,7 @@
 # ADR-315: Variant Pattern Entries Grouped into Patterns
 
 **Date:** 2026-10-16
-**Status:** Accepted (several matching variants: reported to the operator in identification jobs and refused for writes by ADR-327)
+**Status:** Accepted (item 3's first matching variant: several matching variants reported to the operator in identification jobs and refused for writes by ADR-327)
 **Affects:** `diag-ir` (`schema/ir.fbs`, `src/decode.rs`, `IR_SCHEMA_VERSION` 10),
 `diag-frontend` (`src/tables/rows.rs`, `src/convert/services.rs`, the IR golden files),
 `crates/diag-frontend/docs/csv-tables.md` 4.2, design 8.9.1; ADR-306

@@ -58,8 +58,8 @@ addressing = "normal"
 api = "iso22900"
 library = "Vendor PDU"
 module = "SN-0001"
-firmware_version = "2.0"
-library_version = "1.0"
+firmware_version = "2.0.0"
+library_version = "1.0.0"
 [endpoint.link]
 protocol = "CAN"
 baud_rate = 500000
@@ -269,6 +269,22 @@ fn more_fields_are_checked_against_the_setup() {
         assert!(parse(&text).is_err(), "{control}");
     }
     assert!(parse(&t1("[power]\noff = [\"\"]\non = [\"relay\"]")).is_err());
+    // A blank value is an empty one.
+    assert!(parse(&t1("").replacen("label = \"bench\"", "label = \" \"", 1)).is_err());
+    // A D-PDU API module reports coded versions, so its profile writes them as such; a J2534
+    // device reports strings, which are taken as written.
+    parse(T0_PROFILE).unwrap();
+    for (from, to) in [
+        ("firmware_version = \"2.0.0\"", "firmware_version = \"2.0\""),
+        (
+            "library_version = \"1.0.0\"",
+            "library_version = \"1.0.256\"",
+        ),
+    ] {
+        let text = T0_PROFILE.replacen(from, to, 1);
+        assert_ne!(text, T0_PROFILE, "{from}");
+        assert!(parse(&text).is_err(), "{to}");
+    }
 }
 
 #[test]
@@ -360,8 +376,8 @@ fn a_loopback_runs_between_two_ends_of_one_bus() {
     parse(&loopback(vci_end, &partner(&shouted))).unwrap();
     // One module described with two versions.
     let other_version = vci_end.replacen(
-        "firmware_version = \"2.0\"",
-        "firmware_version = \"2.1\"",
+        "firmware_version = \"2.0.0\"",
+        "firmware_version = \"2.1.0\"",
         1,
     );
     refused_for(

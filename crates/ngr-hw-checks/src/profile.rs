@@ -454,18 +454,30 @@ fn check_vci(vci: &Vci) -> Result<(), ProfileError> {
         &vci.library_version,
     ]
     .iter()
-    .any(|value| value.is_empty())
+    .any(|value| value.trim().is_empty())
     {
         return Err(invalid(
             "a `vci` needs its `library`, `module`, `firmware_version` and `library_version`",
+        ));
+    }
+    // The D-PDU API reports its versions as coded numbers, which the module match compares as
+    // `major.minor.revision` (ISO 22900-2 (2022) 10.1.4.15).
+    if vci.api == Api::Iso22900
+        && ![&vci.firmware_version, &vci.library_version]
+            .iter()
+            .all(|version| crate::device::is_coded_version(version))
+    {
+        return Err(invalid(
+            "a D-PDU API `vci` writes `firmware_version` and `library_version` as \
+             `major.minor.revision`, each 0 to 255",
         ));
     }
     match vci.api {
         // A J2534 library reports no serial number, so the module is matched through its
         // configured entry (design 13.5). An empty label would list every entry (ADR-281).
         Api::J2534V0404
-            if vci.label.as_deref().is_none_or(str::is_empty)
-                || vci.pname.as_deref().is_none_or(str::is_empty) =>
+            if vci.label.as_deref().is_none_or(|s| s.trim().is_empty())
+                || vci.pname.as_deref().is_none_or(|s| s.trim().is_empty()) =>
         {
             Err(invalid(
                 "a J2534 `vci` names the `label` and `pname` of its configured `modules` entry",

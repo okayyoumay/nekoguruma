@@ -124,25 +124,41 @@ fn a_j2534_module_from_another_library_is_refused() {
 }
 
 #[test]
-fn a_dpdu_module_is_found_by_its_name_or_its_additional_information() {
+fn a_dpdu_module_is_found_by_its_whole_name_or_an_attribute_value_of_it() {
     let modules = [
-        reported("Vendor VCI", "SN-41"),
-        reported("Vendor VCI", "SN-42"),
+        reported("VendorName='Vendor' SerialNumber='SN-41'", ""),
+        reported("VendorName='Vendor' SerialNumber='SN-42' ", ""),
     ];
     assert_eq!(select_module(&dpdu(), &modules, &[]), Ok(1));
-    let by_name = [reported("SN-42", "")];
+    let by_name = [reported(" SN-42 ", "")];
     assert_eq!(select_module(&dpdu(), &by_name, &[]), Ok(0));
+}
+
+#[test]
+fn a_dpdu_modules_additional_information_is_not_read() {
+    assert_eq!(
+        select_module(&dpdu(), &[reported("Vendor VCI", "SN-42")], &[]),
+        Err(MatchRefusal::NoModule {
+            module: "SN-42".into()
+        })
+    );
+    assert_eq!(
+        select_module(&dpdu(), &[reported("", "SerialNumber='SN-42'")], &[]),
+        Err(MatchRefusal::NoModule {
+            module: "SN-42".into()
+        })
+    );
 }
 
 #[test]
 fn a_dpdu_profile_matching_no_module_or_several_is_refused() {
     assert_eq!(
-        select_module(&dpdu(), &[reported("Vendor VCI", "SN-41")], &[]),
+        select_module(&dpdu(), &[reported("SerialNumber='SN-41'", "")], &[]),
         Err(MatchRefusal::NoModule {
             module: "SN-42".into()
         })
     );
-    let both = [reported("SN-42", ""), reported("Vendor VCI", "SN-42")];
+    let both = [reported("SN-42", ""), reported("SerialNumber='SN-42'", "")];
     assert_eq!(
         select_module(&dpdu(), &both, &[]),
         Err(MatchRefusal::SeveralModules {
@@ -153,6 +169,56 @@ fn a_dpdu_profile_matching_no_module_or_several_is_refused() {
 }
 
 #[test]
+fn an_empty_module_or_label_is_refused_before_matching() {
+    let unnamed = Vci {
+        module: "  ".into(),
+        ..dpdu()
+    };
+    assert_eq!(
+        select_module(&unnamed, &[reported("", "")], &[]),
+        Err(MatchRefusal::Unnamed { what: "module" })
+    );
+    let unlabelled = Vci {
+        label: Some(" ".into()),
+        ..j2534()
+    };
+    assert_eq!(
+        select_module(&unlabelled, &[reported("", "Vendor VCI")], &bench()),
+        Err(MatchRefusal::Unnamed { what: "label" })
+    );
+}
+
+#[test]
+fn a_j2534_profile_with_nothing_configured_is_refused() {
+    assert_eq!(
+        select_module(&j2534(), &[reported("bench", "Vendor VCI")], &[]),
+        Err(MatchRefusal::UnknownLabel {
+            label: "bench".into()
+        })
+    );
+}
+
+#[test]
+fn attribute_values_are_read_from_quoted_pairs_only() {
+    assert_eq!(
+        attribute_values("A='x' B = 'y z' C=unquoted D='open"),
+        vec!["x", "y z"]
+    );
+    assert!(attribute_values("").is_empty());
+}
+
+#[test]
+fn a_coded_version_is_three_decimal_bytes() {
+    assert!(is_coded_version("2.1.0"));
+    assert!(is_coded_version("255.0.255"));
+    for bad in [
+        "4.5", "1.2.3.4", "256.0.0", "1..2", "a.b.c", "-1.0.0", "+1.0.0", "",
+    ] {
+        assert!(!is_coded_version(bad), "{bad}");
+    }
+}
+
+#[test]
 fn j2534_versions_are_compared_as_the_strings_the_device_reports() {
     let version = ReportedVersion {
         hw_name: "1.2.3".into(),
@@ -160,6 +226,11 @@ fn j2534_versions_are_compared_as_the_strings_the_device_reports() {
         ..Default::default()
     };
     assert_eq!(check_versions(&j2534(), &version), Ok(()));
+    let padded = ReportedVersion {
+        hw_name: " 1.2.3 ".into(),
+        ..version.clone()
+    };
+    assert_eq!(check_versions(&j2534(), &padded), Ok(()));
     assert_eq!(
         check_versions(
             &j2534(),

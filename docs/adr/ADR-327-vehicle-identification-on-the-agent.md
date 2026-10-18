@@ -63,8 +63,9 @@ maintainer chose to run the loop on the agent.
    (ADR-326 item 3) only when every definition using it has been read without a match. A
    missing answer never drops a candidate. An ECU definition that no remaining candidate names,
    or that a read has ruled out, is no longer read.
-4. **The next ECU.** Among the ECU definitions still named by a remaining candidate and not yet
-   read, the agent reads the one whose outcome leaves the fewest candidates in the worst case,
+4. **The next ECU.** Among the ECU definitions still named by a remaining candidate (in a plan
+   without candidates, item 8, every definition in the plan) and not yet read or out of reach,
+   the agent reads the one whose outcome leaves the fewest candidates in the worst case,
    counting as outcomes each combination of a variant it may report and the values the
    candidates' matching rules expect from the fields read with it, a match of no variant, and no
    answer; ties go to the one named by
@@ -73,10 +74,14 @@ maintainer chose to run the loop on the agent.
    (8.9.1) and the fields the candidates' matching rules read from it. Each ECU definition is
    read at most once per job.
 5. **End.** The loop ends when every ECU definition still named and not ruled out has been
-   read or is out of reach, or when no candidate remains. Out of reach is established only by a
-   physical read: an endpoint that answers none of a definition's identification requests is out
-   of reach, and the other definitions using it are not read. Silence to the presence request
-   alone never puts a definition out of reach. When a
+   read or is out of reach, or when no candidate remains; a plan without candidates (item 8)
+   ends when every definition in it has been read or is out of reach. Out of reach is
+   established only by a physical read, per definition: a definition whose identification
+   requests all go unanswered is out of reach. Alternatives that share an endpoint may use
+   different identification requests, so each one is still tried; the endpoint itself counts
+   as out of reach only when every definition using it that is still in play has been tried
+   without an answer. Silence to the presence request alone never puts a definition out of
+   reach. When a
    candidate declares a VIN matching rule, the VIN is read first, from the source the plan
    names; when none does, identification reads no VIN (the data author's choice).
 6. **The agent reports facts; the server decides.** The job reports the VIN when read, the
@@ -93,16 +98,21 @@ maintainer chose to run the loop on the agent.
    other jobs that do not write; such a job checks, before its procedure runs, that its
    variant's patterns match the ECU, and is refused when they do not. A job that writes
    configuration values or reprograms an ECU needs its variant identification to match exactly
-   one variant (8.9.1), and the agent can only know that by trying every variant: so a write job
-   carries, beside its own variant's document, the documents of every other variant of the same
-   ECU definition (amending ADR-318 item 1, under which a job carries one variant's document),
-   and before anything that writes is sent the agent runs variant identification over all of
-   them; the job is refused unless exactly one variant matches and it is the job's own, whatever
-   the operator picked, so an operator's choice never decides a write's target.
+   variant of exactly one ECU definition (8.9.1), and the agent can only know that by trying
+   every variant that could be fitted there. So a write job carries, beside its own variant's
+   document, the documents of every variant of every ECU definition that uses the same endpoint
+   among those the vehicle's identification considered (its selected vehicle definition's
+   entries, or, when the vehicle was identified by hand or without a definition, every ECU
+   definition the tenant may use), its own definition included (amending ADR-318 item 1, under
+   which a job carries one variant's document). Before anything that writes is sent the agent
+   runs variant identification over all of them, and the job is refused unless exactly one
+   variant of one definition matches and it is the job's own, whatever the operator picked, so
+   an operator's choice never decides a write's target.
 8. **Manual paths.** The operator can choose a vehicle definition by hand (an unregistered or
    misidentified vehicle), and the identification job then identifies that definition's entries
    only; or ask for access to every ECU, for which the plan holds every ECU definition the
-   tenant may use, without candidates, and each is identified on its own. Both are recorded as
+   tenant may use, without candidates, and each is identified on its own (items 4 and 5 then
+   read every definition in the plan, with no narrowing). Both are recorded as
    operator choices.
 
 ## Consequences
@@ -115,8 +125,9 @@ maintainer chose to run the loop on the agent.
   choice in item 4 matters most on large plans.
 - Item 7 tightens writes: before it, a write job carried one variant's document and nothing
   checked that no other variant of its ECU matched. Variant patterns that overlap now block
-  writes until they are made exact, and a write job's payload grows by the other variants'
-  documents.
+  writes until they are made exact, as do alternative ECU definitions on one endpoint whose
+  patterns overlap; a write job's payload grows by the documents of every variant that could be
+  fitted at its endpoint.
 - Gateway unlocking before identification is not covered: an ECU behind a locked gateway is
   reported as not answering. Identifying through an unlocked gateway is a later decision, with
   the multi-ECU procedure design.

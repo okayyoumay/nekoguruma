@@ -101,6 +101,7 @@ shape survives inside the second as the access program of item 5.
    conversion and `check_job` refuse any other service in it. Every target's variant is
    identified outside the combination programs, and the first access target's before the
    per-vehicle lock and the safety preconditions of 8.9, so in a procedure with several targets
+   or with an access target, a one-target procedure whose primary is an access target included,
    the conversion and `check_job` also refuse a variant pattern (8.9.1) of any target whose
    service is not a read of the kind an access program may send; identification then sends only
    reads, whatever the job's class. No access program runs before the job holds the per-vehicle
@@ -138,12 +139,14 @@ shape survives inside the second as the access program of item 5.
    lower for every combination; the scoping of a procedure to some variants that ADR-311 item 2
    leaves open applies to targets as well. Each combination's program goes in its own document
    for the primary variant (amending ADR-307 item 1's one document per variant and procedure),
-   which names, for every target, the primary included, the content hash (design 8.2.6) of that variant's
-   declaration-only document; the conversion emits a declaration-only document for every
-   variant of every target of a procedure, the primary's included. The document's digest covers every
-   definition its program was lowered against (amending ADR-307 item 5). The conversion refuses
-   a procedure whose combinations exceed a bound set with the implementation, so the package
-   cannot grow without limit.
+   which names, for every target, the primary included, the content hash (design 8.2.6) of that
+   variant's declaration-only document, and, for every target, the hashes of the
+   declaration-only documents of all of its candidate variants, the same list in every
+   combination of the procedure; the conversion emits a declaration-only document for every
+   variant of every target of a procedure, the primary's included. The document's digest covers
+   every definition its program was lowered against (amending ADR-307 item 5). The conversion
+   refuses a procedure whose combinations exceed a bound set with the implementation, so the
+   package cannot grow without limit.
 7. **A job holds the documents of every combination it may meet.** Since the variants behind an
    access target are known only after its access program has run, a job names, by content hash,
    its access programs, the declaration-only documents of every candidate variant of every
@@ -155,12 +158,15 @@ shape survives inside the second as the access program of item 5.
    hash names no document the job holds, and a job that lacks one, or holds more than one, for
    any candidate variant of an access target. `check_job` validates all of them then: it also
    refuses a combination document whose named hashes do not match the documents the job holds,
-   and a set of combination documents that lacks one, or holds more than one, for any tuple of
-   one candidate variant per target the procedure permits, so the variants identified always
-   pick exactly one program; it checks each combination's decodes against its targets'
-   declarations, refuses flash plans on more than one target, and refuses an access program with
-   any service item 5 does not allow; it checks each access program's decodes and services
-   against the declarations of the declaration-only document that program names, as it checks a
+   combination documents that name different candidate lists, a job whose declaration-only
+   documents are not exactly the documents of that list, and a set of combination documents that
+   lacks one, or holds more than one, for any tuple of one candidate variant per target of that
+   list; the list is signed with the combination documents, so a job cannot leave out a variant
+   together with every combination that contains it, so the variants identified always pick
+   exactly one program; it checks each combination's decodes against its targets' declarations,
+   refuses flash plans on more than one target, and refuses an access program with any service
+   item 5 does not allow; it checks each access program's decodes and services against the
+   declarations of the declaration-only document that program names, as it checks a
    combination's, so an access program that would fail while decoding is refused before it
    changes the gateway's session or security state. The agent identifies each target's variant
    as the primary's is identified (8.9.1, ADR-315), through those declaration-only documents,

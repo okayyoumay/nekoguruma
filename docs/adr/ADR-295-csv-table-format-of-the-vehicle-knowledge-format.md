@@ -1,7 +1,7 @@
 # ADR-295: The CSV Table Format of the Proprietary Vehicle-Knowledge Format
 
 **Date:** 2026-10-14
-**Status:** Accepted (Decision item 11 amended by ADR-298; Decision item 1's one document per variant amended by ADR-307 for a directory with procedures; Decision item 5 and item 1's four field tables superseded by ADR-310)
+**Status:** Accepted (Decision item 11 amended by ADR-298; Decision item 1's one document per variant amended by ADR-307 for a directory with procedures; Decision item 5 and item 1's four field tables superseded by ADR-310; the consequence that a procedure is lowered against one variant's document extended to one lowering per combination of target variants by ADR-325 item 6)
 **Affects:** `diag-frontend` (`docs/csv-tables.md`, `examples/example-ecu/`), design 8.4
 
 ## Context

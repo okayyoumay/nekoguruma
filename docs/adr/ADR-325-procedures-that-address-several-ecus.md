@@ -7,7 +7,7 @@
 variants), `agent` (`Job`, `check_job`, policy, one link per target, keep-alive, run and restart
 order), the workers' cyclic tester-present (kept off), `sim-ecu` (a gateway role), design 8.2.4, 8.2.5,
 8.2.6, 5.6, 8.10, 8.10.1; ADR-229 item 2, ADR-233 item 3, ADR-235 items 3 and 8, ADR-244, ADR-245, ADR-247 item 1, ADR-257,
-ADR-261 item 3, ADR-264 item 4, ADR-280, ADR-293, ADR-307 items 1 and 5, ADR-309 item 3, ADR-311 item 1, ADR-313 items 1 and 2, ADR-320 item 1, ADR-316, ADR-318 items 1, 3 and 4,
+ADR-261 item 3, ADR-264 item 4, ADR-280, ADR-293, ADR-295, ADR-307 items 1 and 5, ADR-309 item 3, ADR-311 item 1, ADR-313 items 1 and 2, ADR-320 item 1, ADR-316, ADR-318 items 1, 3 and 4,
 ADR-321, ADR-322 items 1 and 3, ADR-324
 
 ## Context
@@ -147,35 +147,36 @@ shape survives inside the second as the access program of item 5.
    exception): both VIN reads go through the recorded combination's declarations for it, as
    ADR-229 reads a one- target restart's VIN, and ADR-229's checks validate it. Since its VIN
    now comes from an access target rather than from the ECU being reprogrammed, a step 2 VIN
-   read that gets no answer or a negative response ends the restart in on-site intervention
-   (`IdentityNotEstablished`, which a later resume may retry, ADR-290) instead of the passive
-   teardown ADR-229 takes there, which would reach the reprogramming target's default-session
-   confirmation without an unlocked gateway. A step of an access program that fails ends the job
-   as a lost access target would at that point (item 12). A failure in this order is held for
-   the access targets that already have a loss clock, which starts at the first final response
-   of a target's access program (item 12), and is handled by its own rule only once none of them
-   is lost; a target without a clock yet holds nothing. A loss counted while an access program
-   runs ends the job as a failing step of it does. Every run also runs them again after any
-   reopening of the links (a worker crash or VCI disconnect that the job survives) before the
-   program continues, but revalidates the vehicle first, since the cable may now reach another
-   vehicle or a target may have been reflashed while the links were down (design 8.8): it
-   identifies the first access target again and reads the VIN from it, which must match the
-   job's VIN, and identifies each access target again just before its access program runs, which
-   must find the variant the chosen combination names for it; after the last access program it
-   identifies the other targets again, which must also find the chosen combination's variants,
-   except the reprogramming target once the journal has reached its flash plan (item 7's
-   exception). A VIN or a variant that differs ends the job in on-site intervention before
-   anything else is sent, as a restart's differing variant does (item 7), since the program may
-   already have changed the vehicle. When such a rerun or this revalidation fails, or a loss is
-   counted during it, while the VM is inside an uninterruptible section, the job ends in on-site
-   intervention, since the section cannot continue to its end without the gateway; elsewhere it
-   ends as a lost access target would at that point (item 12). The main program may still select
-   an access target, but only for reads: the conversion and `check_job` refuse any other service
-   a combination program addresses to an access target, since a session change, a reset or a new
-   security access there would undo the access program while TesterPresent kept being answered
-   in the default session, so the loss clock would not see it. A procedure that must change a
-   gateway's own state does so in a separate procedure that does not declare it an access
-   target.
+   read that does not establish the VIN (no answer, a negative response or a value that does not
+   decode to a well-formed VIN, every cause ADR-261 item 3 counts as `VinNotEstablished`) ends
+   the restart in on-site intervention (`IdentityNotEstablished`, which a later resume may
+   retry, ADR-290) instead of the passive teardown ADR-229 takes there, which would reach the
+   reprogramming target's default-session confirmation without an unlocked gateway. A step of an
+   access program that fails ends the job as a lost access target would at that point (item 12).
+   A failure in this order is held for the access targets that already have a loss clock, which
+   starts at the first final response of a target's access program (item 12), and is handled by
+   its own rule only once none of them is lost; a target without a clock yet holds nothing. A
+   loss counted while an access program runs ends the job as a failing step of it does. Every
+   run also runs them again after any reopening of the links (a worker crash or VCI disconnect
+   that the job survives) before the program continues, but revalidates the vehicle first, since
+   the cable may now reach another vehicle or a target may have been reflashed while the links
+   were down (design 8.8): it identifies the first access target again and reads the VIN from
+   it, which must match the job's VIN, and identifies each access target again just before its
+   access program runs, which must find the variant the chosen combination names for it; after
+   the last access program it identifies the other targets again, which must also find the
+   chosen combination's variants, except the reprogramming target once the journal has reached
+   its flash plan (item 7's exception). A VIN or a variant that differs ends the job in on-site
+   intervention before anything else is sent, as a restart's differing variant does (item 7),
+   since the program may already have changed the vehicle. When such a rerun or this
+   revalidation fails, or a loss is counted during it, while the VM is inside an uninterruptible
+   section, the job ends in on-site intervention, since the section cannot continue to its end
+   without the gateway; elsewhere it ends as a lost access target would at that point (item 12).
+   The main program may still select an access target, but only for reads: the conversion and
+   `check_job` refuse any other service a combination program addresses to an access target,
+   since a session change, a reset or a new security access there would undo the access program
+   while TesterPresent kept being answered in the default session, so the loss clock would not
+   see it. A procedure that must change a gateway's own state does so in a separate procedure
+   that does not declare it an access target.
 6. **Lowered once per combination of variants.** The main program is lowered for each
    combination of one variant per target, extending ADR-311's per-variant lowering, and must
    lower for every combination; the scoping of a procedure to some variants that ADR-311 item 2

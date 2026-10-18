@@ -776,7 +776,9 @@ does not have:
   the flash state (three fields at fixed positions), the power cycle count and, in the second variant only, a supply
   voltage with a linear conversion and a unit; and a last reset reason whose details are a
   `select` on the reason (`select_cases.csv`): no data, the `watchdogReset` layout, or a range of
-  reasons without data.
+  reasons without data; then, in both variants, a battery voltage (the supply voltage's 0.1 V
+  linear conversion) and a boot time (the 10 ms linear conversion), which the end-to-end
+  procedure reads through their conversions.
 - `services.csv`: three session controls told apart by their `sub` constant, and
   ReadDTCInformation by status mask, whose response repeats the `dtcRecord` layout to the end of
   the message.

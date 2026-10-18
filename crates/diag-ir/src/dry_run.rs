@@ -119,23 +119,38 @@ pub enum DryRunEvent {
     },
 }
 
-/// The most bytes of a request a [`DryRunError`] keeps: errors end the run outside the report
-/// budget, so a long request is cut short (ADR-328 item 7).
-pub const MAX_ERROR_REQUEST_BYTES: usize = 64;
+/// The most bytes of a request, or of a service name, a [`DryRunError`] keeps: errors end the
+/// run outside the report budget, so long ones are cut short (ADR-328 item 7).
+pub const MAX_ERROR_BYTES: usize = 64;
 
-/// The first [`MAX_ERROR_REQUEST_BYTES`] bytes of `request`, for an error.
+/// The most service names [`DryRunError::Ambiguous`] lists.
+pub const MAX_ERROR_SERVICES: usize = 8;
+
+/// `service`'s name cut to at most [`MAX_ERROR_BYTES`] bytes at a character boundary, for an
+/// error.
+fn error_name(service: &Service<'_>) -> String {
+    let name = service.short_name().unwrap_or_default();
+    let mut end = name.len().min(MAX_ERROR_BYTES);
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    name[..end].to_owned()
+}
+
+/// The first [`MAX_ERROR_BYTES`] bytes of `request`, for an error.
 fn error_request(request: &[u8]) -> Vec<u8> {
-    request[..request.len().min(MAX_ERROR_REQUEST_BYTES)].to_vec()
+    request[..request.len().min(MAX_ERROR_BYTES)].to_vec()
 }
 
 /// Why the mocked vehicle access could not answer. A `request` here is the request's first
-/// [`MAX_ERROR_REQUEST_BYTES`] bytes.
+/// [`MAX_ERROR_BYTES`] bytes, and a service name its first [`MAX_ERROR_BYTES`] bytes.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DryRunError {
     /// No declared service has the request's SID and a prefix the request starts with.
     #[error("the request {request:02X?} belongs to no declared service")]
     Undeclared { request: Vec<u8> },
-    /// Several declared services match the request equally well.
+    /// Several declared services match the request equally well; at most
+    /// [`MAX_ERROR_SERVICES`] of them are named.
     #[error("the request {request:02X?} matches several declared services: {services:?}")]
     Ambiguous {
         request: Vec<u8>,
@@ -296,7 +311,7 @@ impl ScriptedHost<'_, '_> {
                     service
                         .positive()
                         .ok_or_else(|| DryRunError::NoPositiveResponse {
-                            service: name.clone(),
+                            service: error_name(&service),
                         })?;
                 (built_response(&positive, self.variant.layouts()), true)
             }
@@ -305,7 +320,9 @@ impl ScriptedHost<'_, '_> {
             .positive()
             .map(|positive| decode_positive_response(&positive, self.variant.layouts(), &answer));
         let decoded_bytes = match &decoded {
-            Some(Ok(fields)) => decoded_cost(fields),
+            // Twice the count: the decoder's vectors and strings grow as they fill, so their
+            // storage can reach twice their length.
+            Some(Ok(fields)) => decoded_cost(fields).saturating_mul(2),
             _ => 0,
         };
         self.charge(
@@ -362,7 +379,8 @@ fn resolve<'v>(variant: EcuVariant<'v>, request: &[u8]) -> Result<Service<'v>, D
             request: error_request(request),
             services: best
                 .iter()
-                .map(|s| s.short_name().unwrap_or_default().to_owned())
+                .take(MAX_ERROR_SERVICES)
+                .map(error_name)
                 .collect(),
         }),
     }
@@ -572,7 +590,7 @@ impl DiagHost for ScriptedHost<'_, '_> {
             .sid();
         if request.first() != Some(&sid) {
             return Err(DryRunError::WrongService {
-                service: declared.short_name().unwrap_or_default().to_owned(),
+                service: error_name(&declared),
                 sid,
                 request: error_request(request),
             });

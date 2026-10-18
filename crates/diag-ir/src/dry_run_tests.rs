@@ -529,7 +529,29 @@ fn an_error_keeps_only_the_start_of_a_long_request() {
     assert_eq!(
         report.end,
         DryRunEnd::Host(DryRunError::Undeclared {
-            request: request[..MAX_ERROR_REQUEST_BYTES].to_vec()
+            request: request[..MAX_ERROR_BYTES].to_vec()
+        })
+    );
+}
+
+#[test]
+fn an_error_keeps_only_the_start_of_a_long_service_name() {
+    let name = "é".repeat(1000);
+    let bare = ServiceT {
+        positive: None,
+        ..service(7, &name, 0x22, &[], vec![])
+    };
+    let buf = document(vec![bare], vec![]);
+    let program = program(
+        vec![Op::PushBytes(0), Op::ServiceRequest { service: 0x22 }],
+        vec![vec![]],
+    );
+    let report = run(&buf, &program, &Script::new());
+    // "é" is two bytes, so the name is cut at the character boundary at 64 bytes.
+    assert_eq!(
+        report.end,
+        DryRunEnd::Host(DryRunError::NoPositiveResponse {
+            service: "é".repeat(MAX_ERROR_BYTES / 2)
         })
     );
 }

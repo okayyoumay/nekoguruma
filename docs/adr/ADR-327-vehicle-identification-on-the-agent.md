@@ -150,10 +150,12 @@ maintainer chose to run the loop on the agent.
    service and field as one variant document of that ECU definition declares them, read over
    that variant's link (amending ADR-326 item 2, whose rule names only a field of an ECU's read
    service; service and field identifiers are local to a document, ADR-318). One response is
-   decoded with the declaration of every rule source on that service and link, and it
-   establishes the field's value only when every one of those declarations decodes it to the
-   same value; when any of them fails to decode it, or decodes it to another value, the field
-   stays unevaluated and narrows nothing (item 3), since a layout of another variant could
+   decoded with the declaration of every rule source on that service and link for the same
+   information component (ADR-326 item 2: OEM, vehicle model, model year or vehicle type; rules
+   for different components are evaluated apart, since their values differ by nature), and it
+   establishes that component's value only when every one of those declarations decodes it to
+   the same value; when any of them fails to decode it, or decodes it to another value, that
+   component stays unevaluated from this response and narrows nothing (item 3), since a layout of another variant could
    decode the response to a value that drops the fitted vehicle's candidate. The endpoints of a
    definition are those of its variants' links. Each ECU definition is read at most once per
    job.

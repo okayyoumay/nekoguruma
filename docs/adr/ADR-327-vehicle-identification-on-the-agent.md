@@ -4,7 +4,7 @@
 **Status:** Accepted
 **Affects:** `agent` (an identification job, write jobs' variant check), `server` (identification plans, re-evaluation of
 the reported facts), `diag-frontend` and `diag-ir` (operator-facing variant attributes), design
-8.8.2, 8.9.1; ADR-235 item 8, ADR-315 (ambiguous variant matches), ADR-318 item 1, ADR-324 item 2, ADR-326 items 3 and 5; `docs/glossary.md`
+8.8.2, 8.9.1; ADR-235 item 8, ADR-315 (ambiguous variant matches), ADR-318 item 1, ADR-324 items 1 and 2, ADR-326 items 3 and 5; `docs/glossary.md`
 
 ## Context
 
@@ -92,13 +92,16 @@ maintainer chose to run the loop on the agent.
    each variant it may report, combined with the values the candidates' matching rules expect
    from the fields read with it, grouped by the candidates the response satisfies (two
    candidates whose expected values overlap, such as one prefix of the other, stay in one
-   outcome), and a conclusive match of no variant. No answer and an inconclusive read are left out of the count: they narrow nothing
+   outcome), and a conclusive match of no variant, likewise grouped by the
+   candidates the values of its decoded rule fields satisfy. No answer and an inconclusive read are left out of the count: they narrow nothing
    (item 3), so they would leave every candidate
    for every definition and erase the differences between them; how likely an answer is enters
    only through the tie-breakers. Ties go to the one named by
    more remaining candidates, then to one whose endpoint answered the presence request, then to the lowest
    identifier, so the order is deterministic. A read is the definition's variant identification
-   (8.9.1) and the fields the candidates' matching rules read from it. Each ECU definition is
+   (8.9.1) and the fields the candidates' matching rules read from it, sent over that
+   definition's own declared link (ADR-324 item 1), so the job opens one link per definition it
+   reads (amending ADR-324 item 1's single link per job for this job kind). Each ECU definition is
    read at most once per job.
 5. **End.** The loop ends when every ECU definition still named and not ruled out has been
    read or is out of reach, or when no candidate remains; a plan without candidates (item 8)
@@ -135,7 +138,9 @@ maintainer chose to run the loop on the agent.
    replacement, and neither the selected vehicle nor the operator's choice may remove a
    definition from the check (amending ADR-318 item 1, under
    which a job carries one variant's document). Before anything that writes is sent the agent
-   runs variant identification over all of them, and the job is refused unless exactly one
+   runs variant identification over all of them, each definition over its own declared link,
+   opened in turn and closed again (amending ADR-324 item 1, under which a document job opens
+   only its own variant's link), and then opens the job's own declared link for the procedure, and the job is refused unless exactly one
    variant of one definition matches, it is the job's own, and the read of every carried definition
    was conclusive in item 3's sense, the job's own definition's other variants included (no
    answer, or a negative response the ECU definition does not declare definitive, leaves a

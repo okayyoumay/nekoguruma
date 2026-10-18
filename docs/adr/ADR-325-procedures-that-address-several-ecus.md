@@ -168,15 +168,17 @@ shape survives inside the second as the access program of item 5.
    leaves open applies to targets as well. Each combination's program goes in its own document
    for the primary variant (amending ADR-307 item 1's one document per variant and procedure),
    which names the procedure it was lowered from by its definition, its file (ADR-307 item 3)
-   and the content hash of that file's source, so two revisions of a package that keep the name
-   but change the source name different procedures, and, for every target, the primary included,
-   the content hash (design 8.2.6) of that variant's declaration-only document, and, for every
-   target, the hashes of the declaration-only documents of all of its candidate variants, the
-   same list in every combination of the procedure; the conversion emits a declaration-only
-   document for every variant of every target of a procedure, the primary's included. The
-   document's digest covers every definition its program was lowered against (amending ADR-307
-   item 5). The conversion refuses a procedure whose combinations exceed a bound set with the
-   implementation, so the package cannot grow without limit.
+   and the identity of the conversion that emitted it, a hash the conversion computes over the
+   package's whole source (every definition and procedure file) and its own version, so
+   documents of two package revisions, or of two converter versions whose application-layer
+   profiles differ (ADR-309 item 2), never share an identity, and, for every target, the primary
+   included, the content hash (design 8.2.6) of that variant's declaration-only document, and,
+   for every target, the hashes of the declaration-only documents of all of its candidate
+   variants, the same list in every combination of the procedure; the conversion emits a
+   declaration-only document for every variant of every target of a procedure, the primary's
+   included. The document's digest covers every definition its program was lowered against
+   (amending ADR-307 item 5). The conversion refuses a procedure whose combinations exceed a
+   bound set with the implementation, so the package cannot grow without limit.
 7. **A job holds the documents of every combination it may meet.** Since the variants behind an
    access target are known only after its access program has run, a job names, by content hash,
    its access programs, the declaration-only documents of every candidate variant of every
@@ -188,13 +190,12 @@ shape survives inside the second as the access program of item 5.
    target is not an access target or whose hash names no document the job holds, and a job that
    lacks one, or holds more than one, for any candidate variant of an access target. `check_job`
    validates all of them then: it refuses a job whose combination documents and access programs
-   do not all name one procedure, source hash included, since otherwise the variants identified
-   could pick a program of another procedure, or of another revision of the same one, that has
-   the same targets and candidates (one source lowered against the same named declaration-only
-   documents gives the same programs, so documents of two revisions that agree on both are
-   interchangeable), and it also refuses a combination document whose named hashes do not match
-   the documents the job holds, combination documents that name different candidate lists, a job
-   whose declaration-only documents are not exactly the documents of that list, and a set of
+   do not all name one procedure and one conversion identity, since otherwise the variants
+   identified could pick a program of another procedure, or one lowered from another package
+   revision or by another converter version, that has the same targets and candidates, and it
+   also refuses a combination document whose named hashes do not match the documents the job
+   holds, combination documents that name different candidate lists, a job whose
+   declaration-only documents are not exactly the documents of that list, and a set of
    combination documents that lacks one, or holds more than one, for any tuple of one candidate
    variant per target of that list; the list is signed with the combination documents, so a job
    cannot leave out a variant together with every combination that contains it, so the variants
@@ -227,7 +228,9 @@ shape survives inside the second as the access program of item 5.
    carries (design 8.2.5), and the receiving device's journal starts from it, so a handed-over
    restart uses the same document. A journal without the record holds no step of the program,
    since only access programs and identification reads ran, so its job starts again as a first
-   run does. The host and the restart carry these documents in place of the single one (amending
+   run does, unless the journal holds a terminal record (a loss or a failing access-program step
+   ended it, item 5, ADR-280), which ends the job as any terminal journal does and sends
+   nothing. The host and the restart carry these documents in place of the single one (amending
    ADR-318 item 3).
 8. **One link per target, under the same guards.** Before anything is sent the agent opens a
    link to each target, all on the job's VCI, under the job's per-VCI lock and, for a writing

@@ -244,27 +244,32 @@ shape survives inside the second as the access program of item 5.
     target's good answer only a final response, positive or negative (a response pending is
     none; the worker waits it out), to a request the agent itself sent on that target's link, a
     probe of item 11 or one of the VM's; the end of the access program is the first good answer.
-    A final response is dated by the agent's own monotonic clock, read before the send call, of
-    the earliest request in the unbroken run of requests on that link, probes and the VM's
-    alike, directly before it that ended without a final response the agent saw (cancelled,
-    timed out, failed to send or lost from the event stream); when the request before it was
-    answered, by its own reading. The ECU answers each request at most once, and a worker
-    attributes a frame to whichever active primitive expects it, with nothing on the wire to
-    tell two TesterPresents apart, so a late answer to an unanswered probe can be credited to a
-    later one; dating at the run's first send puts every possible origin at or after the
-    credited time, at the cost of one period per unanswered probe, which the bounds of item 5
-    already allow for. Nothing else is credited: not silence, not a probe that was cancelled or
-    ended without a final response, not an answer the agent cannot attribute, not any time the
-    worker or the module reports, and a lost-events notification on that link leaves the probe
-    in flight uncredited. The ECU's session timer stops when it receives a request from the
-    client that opened the session and restarts when its final response is complete (ISO 14229-2
-    (2021) 9.5), so the session is held at least until the credited date plus the declared
-    timeout, and every delay in the worker, in event delivery or in the agent only makes a
-    credited date older, never newer. It counts the target as lost once that last good answer is
-    older than the declared session timeout less one period, the margin that covers the timer's
-    tolerance, and latches the loss: a later good answer does not restore the target, since the
-    ECU may have relocked meanwhile and a TesterPresent is answered in the default session as
-    well. Because the link carries one exchange at a time, an exchange of the VM with the access
+    The agent keeps, for that link, the send times of the requests that may still be owed an
+    answer, each read from its own monotonic clock before the send call: every request it sends,
+    probes and the VM's alike, joins them, and every final response it sees removes the oldest
+    one and is dated by it, so a request that ended without a final response the agent saw
+    (cancelled, timed out, failed to send or lost from the event stream) stays among them. The
+    ECU answers each request at most once, and a worker attributes a frame to whichever active
+    primitive expects it, with nothing on the wire to tell two TesterPresents apart, so a late
+    answer to an unanswered request can be credited to a later one, and several such answers can
+    arrive one after another; matching each answer to the oldest request still owed one keeps
+    every credited date at or before the send of the request the answer may really belong to. An
+    answer that never arrives leaves its request among them for the rest of the job on that link
+    (until the links are reopened and the access program runs again), so each such request
+    delays every later credited date by about one period; one is within the bounds of item 5,
+    and several in a job count the target lost, which errs toward a loss and is accepted.
+    Nothing else is credited: not silence, not a probe that was cancelled or ended without a
+    final response, not an answer the agent cannot attribute, not any time the worker or the
+    module reports, and a lost-events notification on that link leaves the probe in flight
+    uncredited. The ECU's session timer stops when it receives a request from the client that
+    opened the session and restarts when its final response is complete (ISO 14229-2 (2021)
+    9.5), so the session is held at least until the credited date plus the declared timeout, and
+    every delay in the worker, in event delivery or in the agent only makes a credited date
+    older, never newer. It counts the target as lost once that last good answer is older than
+    the declared session timeout less one period, the margin that covers the timer's tolerance,
+    and latches the loss: a later good answer does not restore the target, since the ECU may
+    have relocked meanwhile and a TesterPresent is answered in the default session as well.
+    Because the link carries one exchange at a time, an exchange of the VM with the access
     target itself that outlasts the timeout less one period after the last good answer counts
     the target lost even though the ECU's timer was stopped during it; this errs toward a loss
     and is accepted, since nothing the agent observes proves more. An exchange with another

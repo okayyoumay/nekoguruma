@@ -126,20 +126,29 @@ fn read_did(did: u16, data: &[u8]) -> Vec<u8> {
     response
 }
 
+const DTCS: [u8; 11] = [
+    0x59, 0x02, 0xFF, 0x12, 0x34, 0x56, 0x09, 0xAB, 0xCD, 0xEF, 0x2F,
+];
+
 /// The answers the simulated ECU of `ecu.json` gives the read procedure.
 fn ecu_script() -> Script {
-    ecu_script_with_dtcs(&[
-        0x59, 0x02, 0xFF, 0x12, 0x34, 0x56, 0x09, 0xAB, 0xCD, 0xEF, 0x2F,
-    ])
+    ecu_script_with(&[0x00, 0x7D], &[0x00, 0x2D], &DTCS)
 }
 
 /// [`ecu_script`] with `dtcs` as the answer to the DTC read.
 fn ecu_script_with_dtcs(dtcs: &[u8]) -> Script {
+    ecu_script_with(&[0x00, 0x7D], &[0x00, 0x2D], dtcs)
+}
+
+/// [`ecu_script`] with the given battery voltage and boot time readings and DTC answer.
+fn ecu_script_with(voltage: &[u8], boot: &[u8], dtcs: &[u8]) -> Script {
     Script::new()
         .response("activeSession.read", read_did(0xF186, &[0x01]))
         .response("sparePartNumber.read", read_did(0xF187, b"NGR-SIM-ECU"))
         .response("softwareVersion.read", read_did(0xF189, b"1.0.0"))
         .response("vin.read", read_did(0xF190, b"NGRSIMECU00000001"))
+        .response("batteryVoltage.read", read_did(0xFD04, voltage))
+        .response("bootTime.read", read_did(0xFD05, boot))
         .response("readDtcByStatusMask", dtcs)
 }
 
@@ -154,6 +163,8 @@ fn the_read_procedure_runs_with_scripted_answers() {
             ("sparePartNumber.read", false),
             ("softwareVersion.read", false),
             ("vin.read", false),
+            ("batteryVoltage.read", false),
+            ("bootTime.read", false),
             ("readDtcByStatusMask", false),
         ]
     );
@@ -161,14 +172,19 @@ fn the_read_procedure_runs_with_scripted_answers() {
         panic!("the VIN request: {:?}", report.events[3]);
     };
     assert_eq!(request, &[0x22, 0xF1, 0x90]);
-    let DryRunEvent::Request { request, .. } = &report.events[4] else {
-        panic!("the DTC request: {:?}", report.events[4]);
+    let DryRunEvent::Request { request, .. } = &report.events[6] else {
+        panic!("the DTC request: {:?}", report.events[6]);
     };
     assert_eq!(request, &[0x19, 0x02, 0x08]);
     assert_eq!(
         decoded(&report, 3, "vin"),
         PhysicalValue::Text("NGRSIMECU00000001".to_owned())
     );
+    assert_eq!(
+        decoded(&report, 4, "batteryVoltage"),
+        PhysicalValue::Float(12.5)
+    );
+    assert_eq!(decoded(&report, 5, "bootTime"), PhysicalValue::Float(450.0));
     assert_eq!(
         report.events.last(),
         Some(&DryRunEvent::Log {
@@ -221,6 +237,24 @@ fn a_scripted_answer_takes_the_procedures_failure_path() {
         panic!("{report:#?}");
     };
     assert_eq!(code, "PART_NUMBER");
+
+    // A reading one step off either converted value.
+    for (script, expected) in [
+        (
+            ecu_script_with(&[0x00, 0x7E], &[0x00, 0x2D], &DTCS),
+            "BATTERY_VOLTAGE",
+        ),
+        (
+            ecu_script_with(&[0x00, 0x7D], &[0x00, 0x2E], &DTCS),
+            "BOOT_TIME",
+        ),
+    ] {
+        let report = run(&document("read.star", "exampleEcuV1"), None, &script);
+        let DryRunEnd::Failed(Failure { code, .. }) = &report.end else {
+            panic!("{report:#?}");
+        };
+        assert_eq!(code, expected);
+    }
 
     // One confirmed DTC instead of two.
     let script = ecu_script_with_dtcs(&[0x59, 0x02, 0xFF, 0x12, 0x34, 0x56, 0x09]);

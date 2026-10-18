@@ -194,6 +194,34 @@ Ok(
         },
     ],
 )
+batteryVoltage.read [62 FD 04 00 7D]
+Ok(
+    [
+        DecodedField {
+            id: 34,
+            short_name: "batteryVoltage",
+            value: Float(
+                12.5,
+            ),
+            text_id: 0,
+            unit_id: 1,
+        },
+    ],
+)
+bootTime.read [62 FD 05 00 2D]
+Ok(
+    [
+        DecodedField {
+            id: 35,
+            short_name: "bootTime",
+            value: Float(
+                450.0,
+            ),
+            text_id: 0,
+            unit_id: 2,
+        },
+    ],
+)
 readDtcByStatusMask [59 02 FF 01 23 45 09 C0 FF EE 28]
 Ok(
     [

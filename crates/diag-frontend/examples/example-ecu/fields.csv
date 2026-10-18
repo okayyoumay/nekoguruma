@@ -40,3 +40,5 @@ did:lastResetReason,reason,0,,uint,8,,,,,,,,,
 did:lastResetReason,details,1,,,,,,,,,,select,,reason
 layout:watchdogReset,taskId,0,,uint,8,,,,,,,,,
 layout:watchdogReset,programCounter,1,,uint,32,,,,,,,,,
+did:batteryVoltage,batteryVoltage,0,,uint,16,,,,supplyVoltage,volt,,,,
+did:bootTime,bootTime,0,,uint,16,,,,tenMilliseconds,millisecond,,,,

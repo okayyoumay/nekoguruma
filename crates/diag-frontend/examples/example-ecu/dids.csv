@@ -7,3 +7,5 @@ variants,name,did,read,write,write_session,write_security,note
 ,powerCycles,0xFD01,yes,no,,,
 exampleEcuV2,supplyVoltage,0xFD02,yes,no,,,
 ,lastResetReason,0xFD03,yes,no,,,
+,batteryVoltage,0xFD04,yes,no,,,
+,bootTime,0xFD05,yes,no,,,

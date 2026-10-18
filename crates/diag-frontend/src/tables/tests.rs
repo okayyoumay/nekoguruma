@@ -101,7 +101,7 @@ fn the_example_definition_reads_from_its_directory() {
         (0x7E0, 0x7E8, 0x7DF, false)
     );
     assert_eq!(tables.texts.len(), 13);
-    assert_eq!(tables.fields.len(), 41);
+    assert_eq!(tables.fields.len(), 43);
     let session = tables
         .conversions
         .iter()
@@ -692,7 +692,7 @@ fn a_directory_follows_links_and_rejects_entries_that_are_not_files() {
     }
     std::os::unix::fs::symlink(example_dir().join("dids.csv"), dir.join("dids.csv")).expect("link");
     let tables = read_directory(&dir).expect("valid through the link");
-    assert_eq!(tables.dids.len(), 8);
+    assert_eq!(tables.dids.len(), 10);
     std::fs::create_dir(dir.join("odd.csv")).expect("directory");
     std::os::unix::fs::symlink(dir.join("missing"), dir.join("broken.star")).expect("link");
     let result = read_directory(&dir);
@@ -812,8 +812,8 @@ fn the_example_definition_resolves_into_two_variants() {
     // supplyVoltage is scoped to the second variant; every other DID is in both.
     assert!(!names(&definition.variants[0]).contains(&"supplyVoltage"));
     assert!(names(&definition.variants[1]).contains(&"supplyVoltage"));
-    assert_eq!(names(&definition.variants[0]).len(), 7);
-    assert_eq!(names(&definition.variants[1]).len(), 8);
+    assert_eq!(names(&definition.variants[0]).len(), 9);
+    assert_eq!(names(&definition.variants[1]).len(), 10);
     for variant in &definition.variants {
         assert_eq!(variant.protocols, vec![0]);
         assert_eq!(variant.comparams, vec![0, 1]);
@@ -1208,7 +1208,7 @@ fn a_key_is_unique_within_each_variant_document() {
     files.push(("fields.csv".into(), fields.into_bytes()));
     assert_eq!(
         resolved(files),
-        vec![at(Duplicate, "dids.csv", Some(11), Some("did"))]
+        vec![at(Duplicate, "dids.csv", Some(13), Some("did"))]
     );
     assert_eq!(
         resolved_with(

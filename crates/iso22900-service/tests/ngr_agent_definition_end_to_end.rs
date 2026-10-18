@@ -5,9 +5,9 @@
 //! as `crates/j2534-0404-service/tests/definition_end_to_end.rs` runs it through the j2534-0404
 //! worker: `ngr-agent run --api dpdu --document` runs each document on the simulated ECU
 //! `iso22900-mock` answers from (ADR-299), configured as the J2534 test configures `sim-vci`'s.
-//! The variant is identified from the same answers, and the read procedure checks the same
-//! decoded values. The routine is not run here: a debug-build agent changes the session only on
-//! `sim-vci` (ADR-247), so the job would be refused.
+//! The variant is identified from the same answers, the read procedure checks the same decoded
+//! values, and the routine procedure runs with the same result: a debug-build agent treats
+//! `iso22900-mock` as a simulated VCI and may change the session there (ADR-331).
 //!
 //! `ngr-agent` belongs to another package, so cargo builds it only when the `agent` package is
 //! tested in the same run (as `cargo test --workspace` and CI do). It is looked up next to the
@@ -165,5 +165,15 @@ fn a_definition_runs_end_to_end_through_the_d_pdu_worker() {
 
     // The read procedure checks every value it decodes; a value that differs fails the run.
     let state = setup.run(&reads[variant].0, &reads[variant].1);
+    assert!(state.call_stack.is_empty(), "{state:?}");
+
+    // The routine procedure checks the programming session's P2* and the ECU's refusal of the
+    // routine, as through the j2534-0404 worker.
+    let routines = definition::documents("routine.star");
+    assert_eq!(routines[variant].0, reads[variant].0);
+    let state = setup.run(
+        &format!("{}-routine", routines[variant].0),
+        &routines[variant].1,
+    );
     assert!(state.call_stack.is_empty(), "{state:?}");
 }

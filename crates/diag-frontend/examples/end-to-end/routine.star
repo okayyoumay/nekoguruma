@@ -2,7 +2,7 @@
 # session, whose P2* the response gives in tens of milliseconds (a linear conversion), then the
 # check-programming-dependencies routine, which the simulated ECU refuses with
 # requestSequenceError (0x24) while no image has been transferred. It changes the session, which
-# a debug-build agent sends only to `sim-vci` (ADR-247).
+# a debug-build agent sends only to a simulated VCI (ADR-247, ADR-331).
 
 def main():
     session = diag.request(0x10, {"sub": 0x02})

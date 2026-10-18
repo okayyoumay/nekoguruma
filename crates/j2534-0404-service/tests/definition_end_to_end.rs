@@ -9,7 +9,7 @@
 //! the ECU refuses for want of an image) run as agent jobs.
 //! Each procedure checks every value it decodes and fails on the first that differs, so a
 //! finished job means the decoded results are the expected ones. The D-PDU worker runs the same
-//! read procedure in `crates/iso22900-service/tests/ngr_agent_definition_end_to_end.rs`.
+//! procedures in `crates/iso22900-service/tests/ngr_agent_definition_end_to_end.rs`.
 //!
 //! This file holds a single test, so the process-wide variables it sets for the spawned service
 //! cannot race with another test.

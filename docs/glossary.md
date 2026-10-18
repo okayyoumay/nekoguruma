@@ -388,6 +388,9 @@ Shared Rust crate that loads and parses `config.toml`, independent of any gRPC/J
 **vci-service-launcher**  
 Shared Rust crate that provides the startup template for all gRPC services. Handles DLL loading, gRPC server lifecycle, JSON-RPC stdio control channel, and logging initialization.
 
+**Vehicle definition** (ADR-326)  
+An L3 definition that describes a vehicle as a whole, modelled on ODX's vehicle information specification (ISO 22901-1 (2008) 7.3.10): identification values (OEM, vehicle model, model year, vehicle type) with the rules that match them against the VIN or values read from the vehicle, and a topology of ECU entries, each a role name, the ECU definitions that may fill it (alternatives), whether it is optional and the gateway it is reached through. The server and the UI use it; agents run ECU documents only (design 8.8.2).
+
 **Working-set / Active-set** (ComParam)  
 D-PDU API distinguishes between the *working set* (parameters staged for the next update) and the *active set* (parameters currently in effect on hardware). `COPT_UPDATEPARAM` copies the working set to the active set and applies it to hardware. A ComPrimitive (`COPT_SENDRECV`/`COPT_STARTCOMM`) binds whichever set applies (Active normally, or Working when `temp_param_update` is set) once, synchronously, at `StartComPrimitive` call time — not live, at whatever moment the poll task later gets around to executing it (ADR-067; see `temp_param_update` below). The `UniqueRespIdTable` gets the same Working/Active split, promoted at the same two points (`ConnectComLogicalLink`, `COPT_UPDATEPARAM`) — but with one asymmetry: a ComPrimitive always resolves the table from Active, never Working, even under `temp_param_update` (ADR-068; see `UniqueRespIdTable` above).
 

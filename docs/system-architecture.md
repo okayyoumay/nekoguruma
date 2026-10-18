@@ -705,7 +705,7 @@ Diagnostic sequences are implemented in-house. The layers are separated so that 
 | L0 Transport | J2534 / D-PDU API | Worker | Implementation per standard |
 | L1 Protocol | ISO 15765-2, UDS (ISO 14229), DoIP in future | Worker | Protocol implementation |
 | L2 Diagnostic primitives | RDBID, ReadDTC, RoutineControl, security access, reprogramming procedure building blocks | Agent | Shared implementation |
-| L3 Vehicle knowledge | ECU variant definitions, service definitions, conversion formulas, procedure definitions; generic OBD as a standard package (ADR-237) | Distributed as data in intermediate representation | Front end per supply format |
+| L3 Vehicle knowledge | Vehicle definitions (model identification and topology, 8.8.2), ECU variant definitions, service definitions, conversion formulas, procedure definitions; generic OBD as a standard package (ADR-237) | Distributed as data in intermediate representation (vehicle definitions stay with the server, 8.8.2) | Front end per supply format |
 | L4 Service | Mapping to the SOVD resource model | Server | Mapping implementation |
 | L5 API | SOVD / ExVe compatible endpoints | Server | External contract |
 
@@ -863,7 +863,7 @@ Because ODX / OTX are large specifications, the supported subset is declared in 
 
 | Standard | Supported | Excluded |
 |---|---|---|
-| ODX | DIAG-LAYER-CONTAINER, ECU-VARIANT, DIAG-SERVICE, REQUEST / POS-RESPONSE / NEG-RESPONSE, DATA-OBJECT-PROP, COMPU-METHOD, DTC-DOP, TABLE, ECU-VARIANT-PATTERN, COMPARAM, flash description (ODX-F) | SINGLE-ECU-JOB (because it presupposes Java job execution on a D-Server. Equivalent processing is written in procedure definitions) |
+| ODX | DIAG-LAYER-CONTAINER, ECU-VARIANT, DIAG-SERVICE, REQUEST / POS-RESPONSE / NEG-RESPONSE, DATA-OBJECT-PROP, COMPU-METHOD, DTC-DOP, TABLE, ECU-VARIANT-PATTERN, COMPARAM, flash description (ODX-F), VEHICLE-INFO-SPEC (information components with matching components on diagnostic services, logical links, ECU groups; 8.8.2) | SINGLE-ECU-JOB and MULTIPLE-ECU-JOB (ISO 22901-1 (2008) 7.3.5.7 and 7.3.11; because they presuppose Java job execution on a D-Server. Equivalent processing is written in procedure definitions) |
 | OTX | Core, DiagCom, Flash, HMI, Quantities, Logging, EventHandling, i18n | Extensions for external program calls and Java calls (because they contradict the "limited enumeration of instructions" policy) |
 
 OEM-specific extensions and variations in specification interpretation (dialects) are absorbed by adding or updating supply format front ends (9.2). The operating practice is to detect them via ingestion-time validation and provide a corresponding front end.
@@ -981,6 +981,14 @@ Operation with multiple VCIs connected to a single device, handling multiple veh
 - **Resource contention**: The high-resolution timer for monitoring and the CPU consumption of concurrent acquisition jobs can interfere. During monitoring, the measured update interval is re-evaluated, and if it cannot be achieved, the value is lowered and reported
 - **UI display**: The screen explicitly shows the VCI-to-vehicle correspondence to prevent operating on the wrong target
 
+#### 8.8.2 Vehicle Definitions
+
+Which vehicle model a job's vehicle is, and which ECUs that model carries, are described by vehicle definitions, a kind of L3 definition of their own modelled on ODX's vehicle information specification (ISO 22901-1 (2008) 7.3.10) (ADR-326).
+
+- **Identification**: a vehicle definition states its OEM, vehicle model, model year and vehicle type, each possibly with several values. A value for a job's vehicle comes from the operator, or from the vehicle through matching rules the definition declares: a position range of the VIN compared with expected text, or a field of a read service of one of its ECUs compared as variant patterns compare (8.9.1). A definition no known value contradicts is a candidate; one candidate is selected, several are offered to the operator, and with none the operator picks one or works with ECU definitions and generic packages alone. The selected definition's identifier, which carries no personal data, is recorded with the job and its data
+- **Topology**: a vehicle definition lists ECU entries, each a role name, the ECU definitions that may fill it in order (alternatives, as ODX's ECU groups; the fitted one is the first whose variant identification selects a variant), whether it is optional, and the entry of the gateway it is reached through, if any. An entry whose ECU answers identification with no matching variant is reported as an unrecognized variant, never as absent. How an ECU is reached stays its ECU definition's declared protocol (8.2.4); an ECU reached differently in two vehicles is two ECU definitions
+- **Users**: the server and the UI. They identify the vehicle, build the SOVD `components` hierarchy (8.7) and the vehicle view, expand prefetching for a vehicle model to its ECU definitions (5.7), and resolve the model and OEM scopes of roles (6.8) and record templates against the identification values. A role's scope is checked only against values established from the vehicle: a scoped role authorizes a job only when every candidate those values leave is inside its scope, so an operator's entry or choice never widens what a role permits. Agents do not fetch vehicle definitions: a job carries the ECU documents it runs (8.2.4), and the agent's variant identification and locking do not change
+
 ### 8.9 Execution Preconditions and Safety Guards
 
 Procedure definitions in the IR declaratively carry **execution preconditions**, which the runtime verifies before execution. Each precondition names the values that satisfy it and its source (an ECU service field or a runtime input) for the default session, plus one for the programming session when a restart can check it again there, in the procedure part (ADR-245). If they are not met, execution does not proceed and the reason is displayed. Since conditions are part of the sequence definition, they can be added per vehicle model via extensions.
@@ -1042,7 +1050,8 @@ The core has no knowledge whatsoever of specific VCIs or vehicle models.
 | Extension point | Form | Location | When added |
 |---|---|---|---|
 | VCI profile | Data (declarative) | Agent (installed outside this software; 9.3) | No redistribution needed |
-| Vehicle/ECU definitions (IR declaration part) | Data | Agent | No redistribution needed |
+| Vehicle definitions (model identification and topology, 8.8.2) | Data | Server | No redistribution needed |
+| ECU definitions (IR declaration part) | Data | Agent | No redistribution needed |
 | Procedure definitions (IR procedure part) | Data | Agent | No redistribution needed |
 | Screen/report definitions | Data | Server | No redistribution needed |
 | Record templates (field definitions for work records) | Data | Server | No redistribution needed |

@@ -315,6 +315,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-323](ADR-323-dtc-records-are-read-from-the-response-bytes.md) | DTC Records Are Read from the Response Bytes | Accepted | `diag-frontend` Starlark lowering of `dtcs` (`len`, indexing, `code` and `status`), Starlark subset 3.4; ADR-233, ADR-314, ADR-316 |
 | [ADR-324](ADR-324-a-document-jobs-link-comes-from-its-declared-protocol.md) | A Document Job's Link Comes from Its Declared Protocol | Accepted (item 1's one link per job extended to one link per target by ADR-325 item 8) | `agent` link (`LinkConfig::declared`, declared ComParams), `Job::declared_link`, `ngr-agent run`; design 8.2.4; ADR-235 item 4, ADR-309, ADR-319 |
 | [ADR-325](ADR-325-procedures-that-address-several-ecus.md) | Procedures That Address Several ECUs | Accepted | `diag-ir` targets and `SelectTarget`, `diag-frontend` `diag.ecu` and lowering per combination of variants, `agent` one link and document per target, access programs, keep-alive, policy access class, design 8.2.4, 8.2.5, 8.2.6, 8.10; ADR-229, ADR-233, ADR-235, ADR-244, ADR-245, ADR-247, ADR-257, ADR-264, ADR-280, ADR-293, ADR-307, ADR-309, ADR-311, ADR-313, ADR-316, ADR-320, ADR-318, ADR-321, ADR-322, ADR-324 |
+| [ADR-326](ADR-326-vehicle-definitions.md) | Vehicle Definitions for Model Identification and Topology | Accepted | `diag-frontend` (vehicle definition kind), `server` (identification, catalog, prefetch), role and record-template model scopes, SOVD components; design 8.1, 8.3, 8.8.2, 9.2; ADR-306, ADR-315, ADR-318, ADR-324 |
 
 ## Status Legend
 
@@ -740,6 +741,7 @@ the predecessor repository these ADRs came from.
 - ADR-323
 - ADR-324 (item 1's one link per job extended to one link per target by ADR-325 item 8)
 - ADR-325
+- ADR-326
 
 ### Acquired Data & Monitoring
 - ADR-236

@@ -470,13 +470,14 @@ fn expected_responses(progress: &Progress) -> Vec<ExpectedResponseData> {
 }
 
 /// How a positive response to `request` begins: the SID plus 0x40, then what the server echoes
-/// of the request (ISO 14229-1:2026 clauses 9.7, 10.2 and 11.3). A sub-function is echoed
+/// of the request (ISO 14229-1:2026 clauses 9.4, 9.7, 10.2 and 11.3). A sub-function is echoed
 /// without its suppress bit. A DID is matched only when one was requested, since the
 /// standard does not fix the order of several in the response.
 fn positive_prefix(request: &[u8]) -> Vec<u8> {
     match request {
         [0x22, hi, lo] => vec![0x62, *hi, *lo],
         [0x19, sub, ..] => vec![0x59, sub & 0x7F],
+        [0x27, sub, ..] => vec![0x67, sub & 0x7F],
         [0x3E, sub, ..] => vec![0x7E, sub & 0x7F],
         [sid, ..] => vec![sid.wrapping_add(0x40)],
         [] => Vec::new(),
@@ -1122,6 +1123,10 @@ mod tests {
         assert!(!answers(&[0x19, 0x02, 0x08], &[0x59, 0x03, 0xFF]));
         assert!(answers(&[0x3E, 0x00], &[0x7E, 0x00]));
         assert!(answers(&[0x3E, 0x80], &[0x7E, 0x00]));
+        // A seed or key response echoes the security level it answers.
+        assert!(answers(&[0x27, 0x01], &[0x67, 0x01, 0xAA]));
+        assert!(!answers(&[0x27, 0x01], &[0x67, 0x03, 0xAA]));
+        assert!(answers(&[0x27, 0x02, 0x12], &[0x67, 0x02]));
         assert!(answers(&[0xFF], &[0x3F]));
     }
 

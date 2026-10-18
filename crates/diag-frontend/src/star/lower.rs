@@ -3714,7 +3714,7 @@ impl<'a> Lowerer<'a> {
             return failed;
         };
         let level = self
-            .constant_int(id, level_arg, "security_access", "level", 0x01..=0xFD)
+            .constant_int(id, level_arg, "security_access", "level", 0x01..=0x7D)
             .filter(|&level| {
                 // The seed is requested with an odd sub-function, the key sent with the next one.
                 let odd = level % 2 == 1;

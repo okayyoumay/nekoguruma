@@ -270,7 +270,7 @@ field that stores them.
 | `mask` | `int`, 0x00 to 0xFF |
 | `routine_id` | `int`, 0x0000 to 0xFFFF |
 | `sub` | `int`, 0x00 to 0xFF |
-| `level` | `int`, odd, 0x01 to 0xFD (the seed sub-function; the key is sent with `level + 1`) |
+| `level` | `int`, odd, 0x01 to 0x7D (the seed sub-function; the key is sent with `level + 1`; ISO 14229-1 (2026) 9.4 gives the seed requests that range, and a sub-function's bit 7 asks the server not to answer) |
 | `millis`, `back_millis` | `int`, 0 to 2^32 - 1 |
 | `form_id`, `template_id` | `str` naming the form or record template |
 | `level` of `diag.log` | `int`, 0 to 255 |

@@ -1415,10 +1415,47 @@ fn security_access_sends_the_seed_request_the_key_step_and_the_key() {
             "log 1 key response"
         ]
     );
-    // The highest odd level, and a seed request answered with no seed bytes.
-    let mut host = security_access_host(&[&[0x67, 0xFD], &[0x67, 0xFE]], &[&[0x01]]);
-    run_on("def main():\n    diag.security_access(0xFD)\n", &mut host);
-    assert_eq!(host.calls, ["request 27 FD", "key FD ", "request 27 FE01"]);
+    // The highest level, and a seed response with no seed bytes after the level, or none at all:
+    // the host is handed what there is.
+    let mut host = security_access_host(&[&[0x67, 0x7D], &[0x67, 0x7E]], &[&[0x01]]);
+    run_on("def main():\n    diag.security_access(0x7D)\n", &mut host);
+    assert_eq!(host.calls, ["request 27 7D", "key 7D ", "request 27 7E01"]);
+    let mut host = security_access_host(&[&[0x67], &[0x67, 0x02]], &[&[0x01]]);
+    run_on("def main():\n    diag.security_access(1)\n", &mut host);
+    assert_eq!(host.calls, ["request 27 01", "key 01 ", "request 27 0201"]);
+}
+
+#[test]
+fn security_access_in_a_loop_starts_each_call_from_a_new_seed_request() {
+    let mut host = security_access_host(
+        &[
+            &[0x67, 0x01, 0x11],
+            &[0x7F, 0x27, 0x35],
+            &[0x67, 0x01, 0x22],
+            &[0x67, 0x02],
+        ],
+        &[&[0xA1], &[0xA2]],
+    );
+    let source = "\
+def main():
+    for i in range(2):
+        res = diag.security_access(0x01)
+        if res[\"ok\"]:
+            diag.log(1, \"unlocked\")
+";
+    run_on(source, &mut host);
+    assert_eq!(
+        host.calls,
+        [
+            "request 27 01",
+            "key 01 11",
+            "request 27 02A1",
+            "request 27 01",
+            "key 01 22",
+            "request 27 02A2",
+            "log 1 unlocked"
+        ]
+    );
 }
 
 #[test]
@@ -1478,6 +1515,14 @@ fn security_access_arguments_and_results_are_checked() {
         (
             "def main():\n    diag.security_access(1, 2)\n",
             UnsupportedSyntax,
+        ),
+        (
+            "def main():\n    diag.security_access(0x7F)\n",
+            ArgumentOutOfRange,
+        ),
+        (
+            "def main():\n    diag.security_access(0x81)\n",
+            ArgumentOutOfRange,
         ),
         // The result has no fields (ADR-314 item 4).
         (

@@ -574,8 +574,9 @@ other keys of `params`; `diag.request` never selects a generated routine service
 the constants only as prefix bytes, so the conversion hands the lowering an index of each
 variant's services with their request constants by name and value; a call that selects no
 service, or more than one, is rejected (`STAR_UNKNOWN_SERVICE`, ADR-313).
-`diag.security_access` needs no declared service: the host builds its requests and reads the
-seed from the response itself (subset spec 3.2). Under ADR-309 the seed and key requests come from the application-layer profile instead.
+`diag.security_access` needs no declared service: its seed and key requests come from the
+application-layer profile, which also reads the seed from the seed response, and are sent as
+`ServiceRequest`s of the profile's SID (subset spec 3.2, ADR-309, ADR-314).
 `diag.read_dtc(mask)` is lowered through the profile (ADR-314): its request template selects the
 variant's one service whose SID and request prefix are the template's constants at their widths
 (on UDS, SID 0x19 and one 1-byte constant 0x02) and whose other request fields take the

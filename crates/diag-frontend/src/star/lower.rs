@@ -10,8 +10,8 @@
 //! operation the IR cannot express for its operands is `STAR_NOT_LOWERABLE`.
 //!
 //! Not lowered yet, each its own backlog item: the other `diag` functions (`hmi` and `record`;
-//! `security_access`; `flash_transfer`), built-ins and string methods on values known only at
-//! run time, and idempotency annotations.
+//! `flash_transfer`), built-ins and string methods on values known only at run time, and
+//! idempotency annotations.
 //! Each is rejected with `STAR_NOT_LOWERABLE` (or `STAR_API_NOT_AVAILABLE` for a `diag`
 //! function without an instruction), so nothing is lowered silently wrong.
 
@@ -261,6 +261,8 @@ enum Service {
     /// A `diag.read_dtc` result from the service of that `Service.id`: its `fields` are the
     /// names the profile maps the response to, not the declared ones (ADR-314 item 4).
     Dtcs(u32),
+    /// A `diag.security_access` result, which has no `fields` (ADR-314 item 4).
+    Key,
     /// Requests to more than one service: a variable assigned from both anywhere in its
     /// function (types are per variable, subset 4.8), or a parameter whose callers pass both.
     Several,
@@ -272,6 +274,7 @@ impl Service {
             (Service::Unknown, s) | (s, Service::Unknown) => s,
             (Service::One(a), Service::One(b)) if a == b => Service::One(a),
             (Service::Dtcs(a), Service::Dtcs(b)) if a == b => Service::Dtcs(a),
+            (Service::Key, Service::Key) => Service::Key,
             _ => Service::Several,
         }
     }
@@ -2646,6 +2649,17 @@ impl<'a> Lowerer<'a> {
             Service::Dtcs(service) => (service, true),
             // The request's own error is already reported.
             Service::Unknown => return Val::Run(Tys::default(), Vec::new()),
+            Service::Key => {
+                self.error(
+                    StarCode::NotInProfile,
+                    span,
+                    format!(
+                        "a `diag.security_access` result has no fields, so `{key}` is not one; \
+                         its `raw` is the key response (3.4, ADR-314)"
+                    ),
+                );
+                return Val::Run(Tys::default(), Vec::new());
+            }
             Service::Several => {
                 self.not_lowerable(
                     span,
@@ -3424,6 +3438,9 @@ impl<'a> Lowerer<'a> {
             "routine" if self.requests.profile.call(Intent::Routine).is_some() => {
                 self.diag_routine(id, args, span)
             }
+            "security_access" if self.requests.profile.call(Intent::SecurityAccess).is_some() => {
+                self.diag_security_access(id, args, span)
+            }
             "read_dtc" | "routine" | "security_access" => {
                 let intent = match name {
                     "read_dtc" => Intent::ReadDtc,
@@ -3673,6 +3690,138 @@ impl<'a> Lowerer<'a> {
             value @ Val::Const(Const::Dict(..)) => Some(value),
             _ => None,
         }
+    }
+
+    /// `diag.security_access(level)` through the variant's profile (ADR-309 items 2 and 4,
+    /// ADR-314): the seed request, the `SecurityAccess` step that turns the seed into a key
+    /// through the host, then the send-key request carrying that key. The profile's requests are
+    /// not decoded through declared services, so each is a `ServiceRequest` of the template's SID
+    /// whose payload the template gives. A negative seed response ends the call before the key
+    /// step, as a failed `diag.request` does, and is its value; otherwise the value is the
+    /// send-key response, positive or negative. The result has no `fields` (ADR-314 item 4).
+    fn diag_security_access(&mut self, id: Option<usize>, args: &[&AstExpr], span: Span) -> Val {
+        let key_result = Tys {
+            bits: Ty::Response.bit(),
+            service: Service::Key,
+        };
+        let failed = Val::Run(key_result, Vec::new());
+        let [level_arg] = args else {
+            self.error(
+                StarCode::UnsupportedSyntax,
+                span,
+                "`diag.security_access` takes a security level (3.1)",
+            );
+            return failed;
+        };
+        let level = self
+            .constant_int(id, level_arg, "security_access", "level", 0x01..=0xFD)
+            .filter(|&level| {
+                // The seed is requested with an odd sub-function, the key sent with the next one.
+                let odd = level % 2 == 1;
+                if !odd {
+                    self.error(
+                        StarCode::ArgumentOutOfRange,
+                        level_arg.span,
+                        format!(
+                            "`level` of `diag.security_access` is {level}, which is even; a \
+                             seed is requested with an odd level (3.1)"
+                        ),
+                    );
+                }
+                odd
+            });
+        let profile = self.requests.profile;
+        let call = profile
+            .call(Intent::SecurityAccess)
+            .expect("the caller checked");
+        let [seed_step, key_step, send_step] = call.steps else {
+            self.not_lowerable(
+                span,
+                format!(
+                    "the {} profile's `diag.security_access` is not the seed request, the key \
+                     step and the send-key request, the only form lowered yet (3.2)",
+                    profile.layer
+                ),
+            );
+            return failed;
+        };
+        let ResultMap::Seed { after_bytes } = seed_step.result else {
+            unreachable!("a validated profile reads the seed from the step before the key step")
+        };
+        if seed_step.declared || send_step.declared || key_step.kind != StepKind::SecurityKey {
+            self.not_lowerable(
+                span,
+                format!(
+                    "the {} profile's `diag.security_access` decodes a step through a declared \
+                     service, which is not lowered yet (3.2)",
+                    profile.layer
+                ),
+            );
+            return failed;
+        }
+        let (Some(level), Some(id)) = (level, id) else {
+            return failed;
+        };
+        // In range by the checks above.
+        let level = level as u8;
+        let args = [
+            (Source::Level, u64::from(level)),
+            (Source::LevelPlusOne, u64::from(level) + 1),
+        ];
+        let (seed_payload, false) = template_payload(&seed_step.request, &args) else {
+            unreachable!("a validated profile sends the key only in the send-key request")
+        };
+        let (key_prefix, true) = template_payload(&send_step.request, &args) else {
+            unreachable!("a validated profile sends the key in the send-key request")
+        };
+        let seed_payload = self.pool(&seed_payload);
+        let response = self.temp(id, span);
+        let end = self.label();
+        let mut code: Code = [
+            Ins::Op(Op::PushBytes(seed_payload)),
+            Ins::Op(Op::ServiceRequest {
+                service: u16::from(seed_step.request.sid),
+            }),
+            Ins::Op(Op::StoreLocal(response)),
+            Ins::Op(Op::LoadLocal(response)),
+        ]
+        .map(|ins| (ins, span))
+        .to_vec();
+        code.extend(self.response_ok(span));
+        code.push((Ins::JumpIfFalse(end), span));
+        if !key_prefix.is_empty() {
+            let key_prefix = self.pool(&key_prefix);
+            code.push((Ins::Op(Op::PushBytes(key_prefix)), span));
+        }
+        code.extend(
+            [
+                Ins::Op(Op::LoadLocal(response)),
+                Ins::Op(Op::PushI64(i64::from(after_bytes))),
+                Ins::Op(Op::PushI64(i64::MAX)),
+                Ins::Op(Op::Slice),
+                Ins::Op(Op::SecurityAccess { level }),
+            ]
+            .map(|ins| (ins, span)),
+        );
+        if !key_prefix.is_empty() {
+            code.push((Ins::Op(Op::Concat), span));
+        }
+        code.extend(
+            [
+                Ins::Op(Op::ServiceRequest {
+                    service: u16::from(send_step.request.sid),
+                }),
+                Ins::Op(Op::StoreLocal(response)),
+                Ins::Mark(end),
+                Ins::Op(Op::LoadLocal(response)),
+                // The slot would otherwise keep a copy of the response in the VM state, and its
+                // journaled checkpoints, until the function returns.
+                Ins::Op(Op::PushI64(0)),
+                Ins::Op(Op::StoreLocal(response)),
+            ]
+            .map(|ins| (ins, span)),
+        );
+        Val::Run(key_result, code)
     }
 
     /// `diag.routine(routine_id, sub, params)` through the variant's profile (ADR-309 items 2 to
@@ -5013,6 +5162,39 @@ fn fold_method(s: &str, method: &str, args: &[Const]) -> Result<Const, String> {
 #[cfg(test)]
 #[path = "lower_tests.rs"]
 mod tests;
+
+/// The payload of a profile request `template` that no declared service decodes: its parts
+/// after the SID, each constant or argument at its width, from `args`. The key, which only the
+/// host's key step gives, is not part of it; `true` says it follows the payload, as the
+/// argument that runs to the end of the request.
+fn template_payload(template: &crate::profile::Request, args: &[(Source, u64)]) -> (Vec<u8>, bool) {
+    let mut payload = Vec::new();
+    let mut key = false;
+    for part in template.parts {
+        let (bits, value) = match *part {
+            Part::Const { bits, value } => (bits, value),
+            Part::Arg {
+                arg: Source::Key, ..
+            } => {
+                key = true;
+                continue;
+            }
+            Part::Arg { bits, arg } | Part::Select { bits, arg } => (
+                bits,
+                args.iter()
+                    .find(|(source, _)| *source == arg)
+                    .map(|&(_, value)| value)
+                    .expect("the call gives each source its template uses"),
+            ),
+            Part::Params => {
+                unreachable!("a validated profile gives `diag.security_access` no params")
+            }
+        };
+        let width = usize::from(bits / 8);
+        payload.extend_from_slice(&value.to_be_bytes()[8 - width..]);
+    }
+    (payload, key)
+}
 
 /// Whether `field` is a fixed-width `uint` of `bits` bits, a value sent or read as its own bits:
 /// most significant byte first, as the profiles' values are (ADR-314 item 2).

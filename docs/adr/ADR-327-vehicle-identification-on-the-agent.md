@@ -6,7 +6,7 @@
 `server` (identification plans, re-evaluation of the reported facts, guard lists),
 `diag-frontend` and `diag-ir` (operator-facing variant attributes, definitive negative
 responses, the read-only check of identification services), design 8.2.4, 8.2.5, 8.8.2, 8.9.1;
-ADR-235 item 8, ADR-315 item 3, ADR-318 items 1 and 4, ADR-324 items 1 and 2, ADR-325 item 7,
+ADR-235 items 3 and 8, ADR-315 item 3, ADR-318 items 1 and 4, ADR-324 items 1 and 2, ADR-325 item 7,
 ADR-326 items 2, 3 and 5 and its Consequences; `docs/glossary.md`
 
 ## Context
@@ -215,7 +215,17 @@ maintainer chose to run the loop on the agent.
    reads a VIN, and otherwise under the guards the job holds (8.8, ADR-257), and before the
    chosen combination's first instruction, so before anything that changes an ECU is sent: the agent runs variant identification for every variant on the list over the
    target's own link (ADR-325 item 8), sending only the read-only identification requests item 1
-   allows. A guard variant whose declared identifiers differ from the target's link may get no
+   allows. Each of those requests goes to the target's request identifier, and every ECU that
+   listens there receives it, as it would receive the job's changes, so each one, like item 2's
+   presence request, collects every answer that arrives within the response window on each
+   response identifier that a listed variant's declared link pairs with the target's request
+   identifier, not only on the target's own (amending ADR-235 item 3 for these requests, as item 2
+   does for presence); any frame there counts, whether or not a
+   multi-frame response would complete. An answer on any of them other than the target's own
+   shows a second ECU that would receive the job's changes and refuses the job, and a job whose
+   VCI cannot receive one of those identifiers beside the target's link is refused, so a fitted
+   ECU of a listed variant cannot hide behind the target's response filter: it is sent its own
+   variant's identification requests and answers them on its own identifier. A guard variant whose declared identifiers differ from the target's link may get no
    answer there, or a negative response its definition does not declare definitive, and so
    leaves the guard inconclusive. The job is refused unless exactly one
    variant on each list matches, it is the variant identified for that target, and every
@@ -274,6 +284,11 @@ maintainer chose to run the loop on the agent.
   block those jobs until they are made exact, as do alternative ECU definitions on one bus whose
   patterns overlap or whose identifiers only partly match the target's (their variants get no
   answer on the target's link); a job's payload grows by its guard lists.
+- The guard sees a second ECU on the target's request identifier only by its answer on its own
+  response identifier, so each guard request waits out its whole response window, and an ECU
+  there that answers none of the identification requests, its own variant's included, stays
+  unseen. A job refused because its VCI cannot receive those identifiers beside the target's
+  link needs another VCI. These are accepted.
 - Until ECU definitions declare definitive negative responses, every negative response leaves a
   read inconclusive, so a guard is refused whenever any variant on its list (the target's own
   other patterns included) gets a negative response or no answer; the guard can be used in

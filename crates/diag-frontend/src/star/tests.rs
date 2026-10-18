@@ -845,6 +845,35 @@ fn a_loop_after_a_jump_in_its_outer_body_is_still_reached() {
 }
 
 #[test]
+fn a_statement_takes_one_idempotency() {
+    assert_eq!(
+        codes(
+            "def main():\n    # @idempotency safe\n    # @idempotency unsafe\n    diag.wait(1)\n"
+        ),
+        [(StarCode::BadAnnotation, 3)]
+    );
+    // One each for two statements, also on one line, is fine.
+    assert_eq!(
+        codes(
+            "def main():\n    # @idempotency safe\n    diag.wait(1)\n    # @idempotency unsafe\n    diag.wait(2)\n"
+        ),
+        []
+    );
+}
+
+#[test]
+fn an_idempotency_stands_on_a_line_of_its_own() {
+    assert_eq!(
+        codes("def main():\n    diag.wait(1)  # @idempotency unsafe\n    diag.wait(2)\n"),
+        [(StarCode::BadAnnotation, 2)]
+    );
+    assert_eq!(
+        codes("def main():\n    # @idempotency unsafe\n    diag.wait(1)\n"),
+        []
+    );
+}
+
+#[test]
 fn only_one_comment_marker_starts_an_annotation() {
     let source = "def main():\n    ## @idempotency safe\n    ## @unknown\n    # @idempotency \
                   checkState\n    diag.wait(1)\n";

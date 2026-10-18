@@ -1873,6 +1873,8 @@ impl Checker<'_> {
         let mut annotations = Vec::new();
         // The section functions, by the line of their `def`.
         let mut sectioned: BTreeMap<u32, String> = BTreeMap::new();
+        // The statements that have an `@idempotency`, by where they begin.
+        let mut idempotent: HashSet<u32> = HashSet::new();
         for &span in module.comments() {
             let file_span = module.file_span(span);
             // One comment marker: after `##` the text starts with `#`, an ordinary comment.
@@ -1938,6 +1940,20 @@ impl Checker<'_> {
                             continue;
                         }
                     };
+                    // A comment after code would take that statement's line and so annotate a
+                    // later one.
+                    if !source_lines
+                        .get(line as usize - 1)
+                        .is_some_and(|text| text.trim_start().starts_with('#'))
+                    {
+                        bad(
+                            self,
+                            "`@idempotency` stands on a line of its own, directly before the \
+                             statement it annotates (4.6)"
+                                .to_owned(),
+                        );
+                        continue;
+                    }
                     let target = enclosing(line, column).and_then(|def| next_statement(def, line));
                     let Some((_, _, statement_at)) = target else {
                         bad(
@@ -1947,6 +1963,15 @@ impl Checker<'_> {
                         );
                         continue;
                     };
+                    if !idempotent.insert(statement_at) {
+                        bad(
+                            self,
+                            "this statement already has an `@idempotency`; a statement takes one \
+                             (4.6)"
+                                .to_owned(),
+                        );
+                        continue;
+                    }
                     annotations.push(Annotation::Idempotency {
                         line,
                         statement_at,

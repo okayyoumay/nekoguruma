@@ -559,6 +559,51 @@ fn an_annotated_statement_without_a_primitive_is_refused() {
 }
 
 #[test]
+fn an_error_in_an_annotated_unrolled_body_is_reported_alone() {
+    // The error repeats in each iteration, and is recorded once; the annotation is not
+    // reported on top of it.
+    let source = "\
+L = [1, 2]
+
+def main():
+    for n in L:
+        # @idempotency safe
+        x = n.upper()
+";
+    let found = codes(source);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_ne!(found[0].0, StarCode::BadAnnotation);
+}
+
+#[test]
+fn a_call_that_is_not_in_the_defaults_table_is_not_safe_by_default() {
+    let op = Op::Ret;
+    let default = |call| format!("{:?}", default_idempotency(call, &op));
+    for call in [
+        "read_dtc",
+        "ecu_info",
+        "precondition",
+        "wait",
+        "capture",
+        "log",
+        "hmi",
+        "record",
+    ] {
+        assert_eq!(default(call), "Safe", "{call}");
+    }
+    for call in ["security_access", "routine", "flash_transfer"] {
+        assert_eq!(default(call), "CheckState", "{call}");
+    }
+    assert_eq!(default("request"), "Unsafe");
+    assert_eq!(default("anything_new"), "Unsafe");
+    let read = Op::ServiceRequest { service: 0x22 };
+    assert_eq!(
+        format!("{:?}", default_idempotency("request", &read)),
+        "Safe"
+    );
+}
+
+#[test]
 fn a_section_copy_is_cut_around_its_primitives() {
     let source = "\
 # @section uninterruptible expected=700

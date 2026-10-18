@@ -618,6 +618,10 @@ exactly one (ADR-332).
 - **No silent annotation.** A statement that lowers to no diagnostic primitive cannot be
   annotated (`STAR_BAD_ANNOTATION`), so an annotation never does nothing.
 - **Copies.** A specialized copy (2.6, 4.5) carries its original's annotations.
+- **Placement.** The annotation stands on a line of its own, directly before a statement of the
+  same function; a comment after code on the same line is rejected (`STAR_BAD_ANNOTATION`), as is
+  a second `@idempotency` before the same statement. An annotation before an `if` covers its
+  `elif` and `else` parts, which are nested statements of the `if`.
 
 ### 4.7 Source Maps
 
@@ -730,8 +734,8 @@ names them at the end of its hint (`(in variant V1)`, `(in variants V1, V2)`).
   Within it, an annotation belongs to a nested `def` (2.6) whose body holds the line in the same
   way. A comment after a statement takes that statement's line and indentation.
   `@maxIterations` takes an integer from 1 to 2^32 - 1 and must precede a `for` in the same
-  function; `@idempotency` takes `safe`, `checkState` or `unsafe` and must precede a statement in
-  the same function; `@section` belongs to no function, starts its line, and must have a
+  function; `@idempotency` takes `safe`, `checkState` or `unsafe`, must start its own line and precede a
+  statement in the same function; `@section` belongs to no function, starts its line, and must have a
   top-level `def` as the next line of code (4.5).
   An integer, negative ones included, outside its range is `STAR_ARGUMENT_OUT_OF_RANGE`, any
   other fault `STAR_BAD_ANNOTATION`
@@ -754,7 +758,10 @@ names them at the end of its hint (`(in variant V1)`, `(in variants V1, V2)`).
   alone, the pieces between get `CheckState`, and all take the section function's interruptibility
   and expected duration (`Yes` and 0 outside every section) (ADR-332). A statement is lowered
   also when its branch can never run, and that counts as lowering its primitives. An annotated
-  statement that lowers to none is `STAR_BAD_ANNOTATION`
+  statement that lowers to none is `STAR_BAD_ANNOTATION`. An annotation counts as used when its
+  statement lowers a `diag` call that reaches a primitive, even in a branch or operand the
+  lowering then folds away, and even when an inner annotation takes precedence over it
+  everywhere
 - The check of 2.3 sees the syntax only. A computed key, or a slice, is found on the expressions known to be
   dicts without type inference: dict literals, the responses of `diag.request`, `diag.routine`
   and `diag.read_dtc` (3.4), a response's `"fields"` (not the values in it, nor another dict's

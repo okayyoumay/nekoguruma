@@ -590,6 +590,8 @@ struct Lowerer<'a> {
     /// statement has lowered to a diagnostic primitive yet. Calls to functions are not lowered
     /// inline, so a statement's frame never covers a called function's code.
     annotated: Vec<(Idempotency, bool)>,
+    /// How many errors were reported or repeated, which `error` dedupes, outside inference.
+    attempted: usize,
 }
 
 /// Where `break` and `continue` jump in the loop being lowered.
@@ -667,12 +669,16 @@ impl<'a> Lowerer<'a> {
                 })
                 .collect(),
             annotated: Vec::new(),
+            attempted: 0,
         }
     }
 
     /// Records an error once per code and place: an unrolled body is lowered once per item and
     /// reports the same problem at the same place each time.
     fn error(&mut self, code: StarCode, span: Span, hint: impl Into<String>) {
+        if self.quiet == 0 {
+            self.attempted += 1;
+        }
         if self.quiet == 0 && self.reported.insert((code, span.begin(), span.end())) {
             self.errors.push(Pending {
                 code,
@@ -1012,13 +1018,13 @@ impl<'a> Lowerer<'a> {
         let Some(value) = value else {
             return self.statement(id, stmt, code);
         };
-        let errors = self.errors.len();
+        let attempted = self.attempted;
         self.annotated.push((value, false));
         self.statement(id, stmt, code);
         let (_, lowered) = self.annotated.pop().expect("the frame pushed above");
         // Another error means the statement was not lowered in full, and a spent budget that
         // it was cut short: they are reported instead.
-        if !lowered && self.errors.len() == errors && self.exhausted.is_none() {
+        if !lowered && self.attempted == attempted && self.exhausted.is_none() {
             self.error(
                 StarCode::BadAnnotation,
                 stmt.span,
@@ -4894,12 +4900,12 @@ fn binary_hint(op: BinOp, a: Ty, b: Ty) -> String {
     )
 }
 
-/// Whether some `return` in the body carries a value.
 /// The idempotency of a primitive that `diag.{call}` lowered to, when no `@idempotency` applies
 /// (subset 4.6). It follows the Starlark call, not the instruction: every instruction of
 /// `security_access` is `CheckState`. A `request` follows its service identifier, which the
 /// request instruction holds: a read of data or of DTC information (0x22, 0x19) is `Safe`, any
-/// other service `Unsafe`.
+/// other service `Unsafe`. Every call of the table is listed, and a name not in it is `Unsafe`,
+/// so a call that starts to lower cannot become `Safe` by default.
 fn default_idempotency(call: &str, op: &Op) -> Idempotency {
     match (call, op) {
         (
@@ -4909,12 +4915,17 @@ fn default_idempotency(call: &str, op: &Op) -> Idempotency {
             },
         ) => Idempotency::Safe,
         ("request", _) => Idempotency::Unsafe,
-        ("security_access" | "routine", _) => Idempotency::CheckState,
-        // `wait`, `capture`, `log` and `read_dtc`.
-        _ => Idempotency::Safe,
+        (
+            "read_dtc" | "ecu_info" | "precondition" | "wait" | "capture" | "log" | "hmi"
+            | "record",
+            _,
+        ) => Idempotency::Safe,
+        ("security_access" | "routine" | "flash_transfer", _) => Idempotency::CheckState,
+        _ => Idempotency::Unsafe,
     }
 }
 
+/// Whether some `return` in the body carries a value.
 fn returns_value(stmt: &AstStmt) -> bool {
     match &stmt.node {
         StmtP::Return(value) => value.is_some(),

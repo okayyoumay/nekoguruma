@@ -1,7 +1,7 @@
 # ADR-329: A Lowered Section Is CheckState Until Idempotency Is Lowered
 
 **Date:** 2026-10-18
-**Status:** Accepted
+**Status:** Accepted (item 3 realized by ADR-332)
 **Affects:** `diag-frontend` Starlark lowering of section functions (`src/star/lower.rs`),
 `crates/diag-frontend/docs/starlark-subset.md` 4.5, design 8.4; ADR-245, ADR-271, ADR-301
 

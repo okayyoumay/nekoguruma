@@ -7,7 +7,7 @@
 variants), `agent` (`Job`, `check_job`, policy, one link per target, keep-alive, run and restart
 order), the workers' cyclic tester-present (kept off), `sim-ecu` (a gateway role), design 8.2.4, 8.2.5,
 8.2.6, 5.6, 8.10, 8.10.1; ADR-229 item 2, ADR-233 item 3, ADR-235 item 8, ADR-244, ADR-245, ADR-247 item 1, ADR-257,
-ADR-264 item 4, ADR-280, ADR-293, ADR-307 items 1 and 5, ADR-309 item 3, ADR-311 item 1, ADR-313 items 1 and 2, ADR-316, ADR-318 items 1, 3 and 4,
+ADR-264 item 4, ADR-280, ADR-293, ADR-307 items 1 and 5, ADR-309 item 3, ADR-311 item 1, ADR-313 items 1 and 2, ADR-320 item 1, ADR-316, ADR-318 items 1, 3 and 4,
 ADR-321, ADR-322 items 1 and 3, ADR-324
 
 ## Context
@@ -60,20 +60,24 @@ shape survives inside the second as the access program of item 5.
    a function that receives a handle is specialized per handle. The module-level calls keep addressing the
    primary target, so existing procedures do not change. Each call is lowered against its
    target's declaration part.
-3. **The IR selects the target.** `Program` lists its targets in declaration order, the
-   primary first, each marked as an access target or not (item 5). A
-   `SelectTarget` instruction, appended after the existing ones (ADR-233), makes one of them
-   current, and the VM tells the host on every change and when it starts from a restored
-   state. The instructions that address an ECU act on the current target, its link and its
-   declarations: `ServiceRequest`, `SendReceive`, `ReadDtc`, `RoutineControl`,
-   `SecurityAccess` (whose key request to the server names the current target's ECU),
-   `FlashTransfer`, `MonitorCapture` and `DecodeField` (extending ADR-316's decoding to the
-   current target's declaration part); `Wait`, `HmiRequest`, `RecordInput`,
-   `Log` and `Fail` address none. The current target is part of `VmState`, so the journal
-   records it with the rest of the state and a restored state resumes on the right target. A
-   program starts on the primary target. The lowering emits `SelectTarget` before every
-   instruction that addresses an ECU whose target is not certainly current on every path that
-   reaches it, so the existing instruction encodings stay as they are.
+3. **The IR selects the target.** `Program` lists its targets in declaration order, the primary
+   first, each marked as an access target or not (item 5). A `SelectTarget` instruction,
+   appended after the existing ones (ADR-233), makes one of them current, and the VM tells the
+   host on every change and when it starts from a restored state. The instructions that address
+   an ECU act on the current target, its link and its declarations: `ServiceRequest`,
+   `SendReceive`, `ReadDtc`, `RoutineControl`, `SecurityAccess` (whose key request to the server
+   names the current target's ECU), `FlashTransfer`, `MonitorCapture` and `DecodeField`
+   (extending ADR-316's decoding to the current target's declaration part); `Wait`,
+   `HmiRequest`, `RecordInput`, `Log` and `Fail` address none. The current target is part of
+   `VmState`, so the journal records it with the rest of the state and a restored state resumes
+   on the right target. A program starts on the primary target. The lowering emits
+   `SelectTarget` before every instruction that addresses an ECU whose target is not certainly
+   current on every path that reaches it, so the existing instruction encodings stay as they
+   are. A response's inferred type carries the target its request was sent to, beside its
+   declared service (ADR-320 item 1), and a field read decodes through that target's declaration
+   part: the lowering makes that target current before the `DecodeField`, and refuses a field
+   read on a value whose possible responses come from more than one target, as it refuses one
+   whose responses come from more than one service.
 4. **The restart declaration names its target.** The identity sources, the precondition sources
    and the flash recovery plans of the procedure part (ADR-245) each name the target they refer
    to. The VIN source may be on any target, except in a procedure with access targets (below);

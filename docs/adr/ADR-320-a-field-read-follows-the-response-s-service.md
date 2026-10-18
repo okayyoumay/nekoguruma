@@ -1,7 +1,7 @@
 # ADR-320: A Field Read Follows the Response's Service
 
 **Date:** 2026-10-16
-**Status:** Accepted
+**Status:** Accepted (item 1's response type also carries its target, and a field read decodes through that target's declarations, by ADR-325 item 3)
 **Affects:** `diag-frontend` (`src/star/lower.rs`: `Tys`, `Ty::Fields`, `field_key`;
 `src/convert/tests.rs`), `diag-ir` (`decode::scalar_kind`),
 `crates/diag-frontend/docs/starlark-subset.md` 3.4, design 8.4; ADR-316, ADR-317

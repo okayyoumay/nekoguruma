@@ -6,7 +6,7 @@
 `server` (identification plans, re-evaluation of the reported facts, guard lists),
 `diag-frontend` and `diag-ir` (operator-facing variant attributes, definitive negative
 responses, the read-only check of identification services), design 8.2.4, 8.2.5, 8.8.2, 8.9.1;
-ADR-235 items 3 and 8, ADR-315 item 3, ADR-318 items 1 and 4 and its Consequences, ADR-324 items 1 and 2, ADR-325 item 7,
+ADR-229 item 2, ADR-235 items 3 and 8, ADR-244's record set, ADR-315 item 3, ADR-318 items 1 and 4 and its Consequences, ADR-324 items 1 and 2, ADR-325 item 7,
 ADR-326 items 2, 3 and 5 and its Consequences; `docs/glossary.md`
 
 ## Context

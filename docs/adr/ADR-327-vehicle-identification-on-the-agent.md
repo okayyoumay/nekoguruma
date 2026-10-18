@@ -4,7 +4,7 @@
 **Status:** Accepted
 **Affects:** `agent` (an identification job, write jobs' variant check), `server` (identification plans, re-evaluation of
 the reported facts), `diag-frontend` and `diag-ir` (operator-facing variant attributes), design
-8.8.2, 8.9.1; ADR-315 (ambiguous variant matches), ADR-318 item 1, ADR-324 item 2, ADR-326 item 5; `docs/glossary.md`
+8.8.2, 8.9.1; ADR-315 (ambiguous variant matches), ADR-318 item 1, ADR-324 item 2, ADR-326 items 3 and 5; `docs/glossary.md`
 
 ## Context
 
@@ -56,7 +56,7 @@ maintainer chose to run the loop on the agent.
    none of its entries allows (counted only once every other definition that uses the same
    endpoint and is still named by a remaining candidate has been read, since an ECU can match
    the patterns of two alternative definitions; when several match, all of them stay possible
-   and the operator chooses, as for variants in item 7), or an identification value whose matching rule (a VIN position
+   and the operator chooses, as for variants in item 7, amending ADR-326 item 3's first match), or an identification value whose matching rule (a VIN position
    range, or a read field) gives a value outside the candidate's. A read of a definition whose
    endpoint answers but whose variants all fail to match rules out only that definition; the
    others sharing the endpoint stay possible, and the endpoint becomes an unrecognized variant
@@ -67,8 +67,10 @@ maintainer chose to run the loop on the agent.
    without candidates, item 8, every definition in the plan) and not yet read or out of reach,
    the agent reads the one whose outcome leaves the fewest candidates in the worst case,
    counting as outcomes each combination of a variant it may report and the values the
-   candidates' matching rules expect from the fields read with it, a match of no variant, and no
-   answer; ties go to the one named by
+   candidates' matching rules expect from the fields read with it, and a match of no variant. No
+   answer is left out of the count: it narrows nothing (item 3), so it would leave every candidate
+   for every definition and erase the differences between them; how likely an answer is enters
+   only through the tie-breakers. Ties go to the one named by
    more remaining candidates, then to one whose endpoint answered the presence request, then to the lowest
    identifier, so the order is deterministic. A read is the definition's variant identification
    (8.9.1) and the fields the candidates' matching rules read from it. Each ECU definition is
@@ -109,17 +111,21 @@ maintainer chose to run the loop on the agent.
    variant of one definition matches and it is the job's own, whatever the operator picked, so
    an operator's choice never decides a write's target.
 8. **Manual paths.** The operator can choose a vehicle definition by hand (an unregistered or
-   misidentified vehicle), and the identification job then identifies that definition's entries
-   only; or ask for access to every ECU, for which the plan holds every ECU definition the
-   tenant may use, without candidates, and each is identified on its own (items 4 and 5 then
-   read every definition in the plan, with no narrowing). Both are recorded as
-   operator choices.
+   misidentified vehicle), and the plan then holds that definition's entries and the ECU
+   definitions they name, without candidates, so a fact that contradicts the chosen definition
+   (the reason it was chosen by hand) cannot end the job early; or ask for access to every ECU,
+   for which the plan holds every ECU definition the tenant may use, also without candidates.
+   In both, items 4 and 5 read every definition in the plan with no narrowing, and each entry's
+   state is reported as ADR-326 item 3 gives it. Both are recorded as operator choices.
 
 ## Consequences
 
 - ADR-326 item 5 changes in one point: the agent runs identification from a plan. It still holds
   no vehicle definition, and the server remains the authority for the selected definition and
   for authorization.
+- ADR-326 item 3 changes in one point: when the ECU at an entry matches the patterns of more than
+  one of its alternatives, the first is no longer taken as fitted; all matching alternatives stay
+  possible and the operator chooses (item 3).
 - An identification plan can be large for a tenant with many models or for access to every ECU;
   its documents are fetched lazily by hash, but each read costs bus time, so the worst-case
   choice in item 4 matters most on large plans.

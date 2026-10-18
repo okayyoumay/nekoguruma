@@ -314,8 +314,8 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-322](ADR-322-the-agent-serves-the-generic-send-receive.md) | The Agent Serves the Generic Send-Receive | Accepted | `agent` `send_receive`, `WorkerHost::send_receive`, `policy::check_program` and `writes`, `check_job`, `Job::writes`; design 8.2.4; ADR-235, ADR-245, ADR-250, ADR-257, ADR-309, ADR-321 |
 | [ADR-323](ADR-323-dtc-records-are-read-from-the-response-bytes.md) | DTC Records Are Read from the Response Bytes | Accepted | `diag-frontend` Starlark lowering of `dtcs` (`len`, indexing, `code` and `status`), Starlark subset 3.4; ADR-233, ADR-314, ADR-316 |
 | [ADR-324](ADR-324-a-document-jobs-link-comes-from-its-declared-protocol.md) | A Document Job's Link Comes from Its Declared Protocol | Accepted (item 2's functional identifier used by identification jobs, ADR-327) | `agent` link (`LinkConfig::declared`, declared ComParams), `Job::declared_link`, `ngr-agent run`; design 8.2.4; ADR-235 item 4, ADR-309, ADR-319 |
-| [ADR-326](ADR-326-vehicle-definitions.md) | Vehicle Definitions for Model Identification and Topology | Accepted (item 5 amended by ADR-327) | `diag-frontend` (vehicle definition kind), `server` (identification, catalog, prefetch), role and record-template model scopes, SOVD components; design 8.1, 8.3, 8.8.2, 9.2; ADR-306, ADR-315, ADR-318, ADR-324 |
-| [ADR-327](ADR-327-vehicle-identification-on-the-agent.md) | Vehicle Identification Runs on the Agent | Accepted | `agent` identification job, `server` identification plans, variant attributes in `diag-frontend` / `diag-ir`; design 8.8.2, 8.9.1; ADR-315, ADR-318 item 1, ADR-324 item 2, ADR-326 item 5 |
+| [ADR-326](ADR-326-vehicle-definitions.md) | Vehicle Definitions for Model Identification and Topology | Accepted (items 3 and 5 amended by ADR-327) | `diag-frontend` (vehicle definition kind), `server` (identification, catalog, prefetch), role and record-template model scopes, SOVD components; design 8.1, 8.3, 8.8.2, 9.2; ADR-306, ADR-315, ADR-318, ADR-324 |
+| [ADR-327](ADR-327-vehicle-identification-on-the-agent.md) | Vehicle Identification Runs on the Agent | Accepted | `agent` identification job, `server` identification plans, variant attributes in `diag-frontend` / `diag-ir`; design 8.8.2, 8.9.1; ADR-315, ADR-318 item 1, ADR-324 item 2, ADR-326 items 3 and 5 |
 
 ## Status Legend
 
@@ -740,7 +740,7 @@ the predecessor repository these ADRs came from.
 - ADR-322
 - ADR-323
 - ADR-324 (item 2's functional identifier used by identification jobs, ADR-327)
-- ADR-326 (item 5 amended by ADR-327)
+- ADR-326 (items 3 and 5 amended by ADR-327)
 - ADR-327
 
 ### Acquired Data & Monitoring

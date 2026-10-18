@@ -1,7 +1,7 @@
 # ADR-326: Vehicle Definitions for Model Identification and Topology
 
 **Date:** 2026-10-18
-**Status:** Accepted (item 5's agent that does not use vehicle definitions amended by ADR-327: the agent runs identification from a plan)
+**Status:** Accepted (item 3's first matching alternative and item 5's agent that does not use vehicle definitions amended by ADR-327: when several alternatives match, the operator chooses; the agent runs identification from a plan)
 **Affects:** design 8.1 (L3), 8.3 (ODX subset), 8.8.2 (new), 9.2; `diag-frontend` (a new
 definition kind), `server` (identification, catalog, prefetch), `db/migrations/`
 (`operator_roles.scope`), `schemas/record-template.schema.json` (`appliesTo.models`),

@@ -144,8 +144,17 @@ maintainer chose to run the loop on the agent.
    declares (ADR-324 item 1, which gives each variant its own declared link): the variants are
    grouped by declared link and each group is identified on its link, so the job opens one link
    per distinct link it reads, one at a time (amending ADR-324 item 1's single link per job for
-   this job kind). The endpoints of a definition are those of its variants' links. Each ECU
-   definition is read at most once per job.
+   this job kind). A matching rule's read field names its source as a VIN rule does (item 5): a
+   service and field as one variant document of that ECU definition declares them, read over
+   that variant's link (amending ADR-326 item 2, whose rule names only a field of an ECU's read
+   service; service and field identifiers are local to a document, ADR-318). One response is
+   decoded with the declaration of every rule source on that service and link, and it
+   establishes the field's value only when every one of those declarations decodes it to the
+   same value; when any of them fails to decode it, or decodes it to another value, the field
+   stays unevaluated and narrows nothing (item 3), since a layout of another variant could
+   decode the response to a value that drops the fitted vehicle's candidate. The endpoints of a
+   definition are those of its variants' links. Each ECU definition is read at most once per
+   job.
 5. **End, and the VIN.** The loop ends when every ECU definition still in play has been read or
    is out of reach, or when no candidate remains; a plan without candidates (item 8) ends when
    every definition in it has been read or is out of reach. Out of reach is established only by
@@ -170,7 +179,8 @@ maintainer chose to run the loop on the agent.
    unevaluated. When no candidate declares a VIN matching rule, identification
    reads no VIN (the data author's choice).
 6. **The agent reports facts; the server decides.** The job reports the VIN when read, the
-   presence answers, each read's decoded identification fields and matching variants, the
+   presence answers, each read's decoded identification fields and matching variants, each
+   rule field's established value or that it stayed unevaluated, the
    outcome of each of its identification requests (decoded positive response, the negative
    response code, or no answer, so the server can tell a conclusive read from an inconclusive one
    by item 3), and the entry states of ADR-326 item 3 with item 3's ambiguous state. The server

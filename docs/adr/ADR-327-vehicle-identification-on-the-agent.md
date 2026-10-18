@@ -159,5 +159,5 @@ maintainer chose to run the loop on the agent.
   reported as not answering. Identifying through an unlocked gateway is a later decision, with
   the multi-ECU procedure design.
 - Follow-up work (the agent's identification job, the server's plan and re-evaluation, variant
-  attributes in the CSV format and the IR, the write refusal on ambiguous variants) is in the
+  attributes and definitive negative responses in the CSV format and the IR, the write refusal on ambiguous variants) is in the
   backlog.

@@ -121,13 +121,14 @@ shape survives inside the second as the access program of item 5.
    in on-site intervention (`IdentityNotEstablished`, which a later resume may retry, ADR-290)
    instead of the passive teardown ADR-229 takes there, which would reach the reprogramming
    target's default-session confirmation without an unlocked gateway. A step of an access
-   program that fails ends the job as a lost access target would at that point (item 12), at
-   once: nothing in this order is held for a keep-alive answer, since an access target has a
-   loss clock only from the first final response of its access program (item 12), and a loss
-   counted while that program runs ends the job as that failing step does. Every run also runs
-   them again after any reopening of the links (a worker crash or VCI disconnect that the job
-   survives) before the program continues. The main program may still select the access target
-   for anything else.
+   program that fails ends the job as a lost access target would at that point (item 12). A
+   failure in this order is held for the access targets that already have a loss clock, which
+   starts at the first final response of a target's access program (item 12), and is handled by
+   its own rule only once none of them is lost; a target without a clock yet holds nothing. A
+   loss counted while an access program runs ends the job as a failing step of it does. Every
+   run also runs them again after any reopening of the links (a worker crash or VCI disconnect
+   that the job survives) before the program continues. The main program may still select the
+   access target for anything else.
 6. **Lowered once per combination of variants.** The main program is lowered for each
    combination of one variant per target, extending ADR-311's per-variant lowering, and must
    lower for every combination; the scoping of a procedure to some variants that ADR-311 item 2
@@ -144,43 +145,44 @@ shape survives inside the second as the access program of item 5.
    its access programs, the declaration-only documents of every candidate variant of every
    target, and every combination's document (amending ADR-318 item 1), and the agent holds all
    of them before anything is sent; the bound of item 6 keeps their number finite. Each access
-   program names its access target and the hash of the declaration-only document of the
-   variant it was lowered for, and the agent runs the one whose variant it has just identified;
+   program names its access target and the hash of the declaration-only document of the variant
+   it was lowered for, and the agent runs the one whose variant it has just identified;
    `check_job` refuses an access program whose named target is not an access target or whose
    hash names no document the job holds, and a job that lacks one, or holds more than one, for
-   any candidate variant of an access target.
-   `check_job` validates all of them then: it also refuses a combination document whose named hashes
-   do not match the documents the job holds, and a set of combination documents that lacks one,
-   or holds more than one, for any tuple of one candidate variant per target the procedure
-   permits, so the variants identified always pick exactly one program; it checks each
-   combination's decodes against its
-   targets' declarations, refuses flash plans on more than one target, and refuses an access
-   program with any service item 5 does not allow. The agent identifies each target's variant as
-   the primary's is identified (8.9.1, ADR-315), through those declaration-only documents, and
-   the combination its variants pick is the program that runs. Whether the job writes, which
+   any candidate variant of an access target. `check_job` validates all of them then: it also
+   refuses a combination document whose named hashes do not match the documents the job holds,
+   and a set of combination documents that lacks one, or holds more than one, for any tuple of
+   one candidate variant per target the procedure permits, so the variants identified always
+   pick exactly one program; it checks each combination's decodes against its targets'
+   declarations, refuses flash plans on more than one target, and refuses an access program with
+   any service item 5 does not allow; it checks each access program's decodes and services
+   against the declarations of the declaration-only document that program names, as it checks a
+   combination's, so an access program that would fail while decoding is refused before it
+   changes the gateway's session or security state. The agent identifies each target's variant
+   as the primary's is identified (8.9.1, ADR-315), through those declaration-only documents,
+   and the combination its variants pick is the program that runs. Whether the job writes, which
    policy class applies and whether it takes the reprogramming slot are fixed before anything is
    sent from every combination the job holds: the job is a writing job when any of them writes,
    takes the reprogramming slot when any of them writes (ADR-257; an access program's services
-   alone do not count, item 10), and is held to the policy
-   class that covers all of them, so the chosen combination never needs a guard the job lacks.
-   A job keeps a journal when any of its combinations has a flash plan or a section marked
-   recovery required (ADR-293), whether or not it writes; such a job creates its journal before
-   anything is sent, as now (ADR-252, ADR-293), and commits a combination record holding
-   the chosen document's hash after identification and before the chosen program's first
-   instruction. A restart of a journal with that record uses that document (amending ADR-318
-   item 4's journal that records no document; the caller still supplies the documents) and,
-   once the VIN matches and the per-vehicle lock is held, identifies every target again; a
-   variant that differs from the recorded combination ends the restart in on-site intervention.
-   The one exception is the reprogramming target once the journal has reached its flash plan,
-   whether inside the plan or past its end (ADR-271's recovery of a completed transfer): that
-   ECU may answer only from its bootloader, or as the variant the new software makes it, so it
-   is not identified again here, and ADR-229's hardware identity and state checks and ADR-271's
-   checks validate it instead, with the recorded document kept.
-   The record is part of the checkpoint summary a handover carries (design 8.2.5), and the
-   receiving device's journal starts from it, so a handed-over restart uses the same document.
-   A journal without the record holds no step of the program, since only access programs and
-   identification reads ran, so its job starts again as a first run does. The host and the
-   restart carry these documents in place of the single one (amending ADR-318 item 3).
+   alone do not count, item 10), and is held to the policy class that covers all of them, so the
+   chosen combination never needs a guard the job lacks. A job keeps a journal when any of its
+   combinations has a flash plan or a section marked recovery required (ADR-293), whether or not
+   it writes; such a job creates its journal before anything is sent, as now (ADR-252, ADR-293),
+   and commits a combination record holding the chosen document's hash after identification and
+   before the chosen program's first instruction. A restart of a journal with that record uses
+   that document (amending ADR-318 item 4's journal that records no document; the caller still
+   supplies the documents) and, once the VIN matches and the per-vehicle lock is held,
+   identifies every target again; a variant that differs from the recorded combination ends the
+   restart in on-site intervention. The one exception is the reprogramming target once the
+   journal has reached its flash plan, whether inside the plan or past its end (ADR-271's
+   recovery of a completed transfer): that ECU may answer only from its bootloader, or as the
+   variant the new software makes it, so it is not identified again here, and ADR-229's hardware
+   identity and state checks and ADR-271's checks validate it instead, with the recorded
+   document kept. The record is part of the checkpoint summary a handover carries (design
+   8.2.5), and the receiving device's journal starts from it, so a handed-over restart uses the
+   same document. A journal without the record holds no step of the program, since only access
+   programs and identification reads ran, so its job starts again as a first run does. The host
+   and the restart carry these documents in place of the single one (amending ADR-318 item 3).
 8. **One link per target, under the same guards.** Before anything is sent the agent opens a
    link to each target, all on the job's VCI, under the job's per-VCI lock and, for a writing
    job, the reprogramming slot (8.8, ADR-257); the per-vehicle lock is still taken when the VIN
@@ -302,13 +304,15 @@ shape survives inside the second as the access program of item 5.
     that inside an uninterruptible section the job ends in on-site intervention, since the held
     request has no answer that would let the section continue to its end; so a request that
     times out first cannot turn a lost gateway into an ordinary interrupted step (ADR-235).
-    Access targets without a loss clock have no last good answer, so nothing waits on them: a
-    failure in item 5's order before every access program has ended is handled at once by its
-    own rule (an identification as the primary's identification failing does, item 7; a VIN read
-    as item 5 says; an access-program step as a lost access target would), and an identification
-    read of a later target that gets no answer is held like any request, all access programs
-    having ended by then. Keep-alive answers from targets that are not access targets are not
-    watched: a request to such a target that fails is handled as any failed request is.
+    Access targets without a loss clock have no last good answer, so nothing waits on them, and
+    with none that has one a failure is handled at once. In item 5's order this means a failure
+    is held for the outer access targets whose clocks already run, so an inner target's
+    identification that gets no answer because an outer gateway relocked ends as that gateway's
+    loss, and only when none of them is lost is it handled by its own rule (an identification as
+    the primary's identification failing does, item 7; a VIN read as item 5 says; an
+    access-program step as a lost access target would). Keep-alive answers from targets that are
+    not access targets are not watched: a request to such a target that fails is handled as any
+    failed request is.
 13. **An access target carries no flash plan.** The conversion and `Program::validate` refuse
     a flash plan on a target declared as an access target. Reprogramming a gateway that other
     targets are reached through, as an access target, would need the chain behind it to be suspended during the

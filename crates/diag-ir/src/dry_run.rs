@@ -387,37 +387,39 @@ fn resolve<'v>(variant: EcuVariant<'v>, request: &[u8]) -> Result<Service<'v>, D
 }
 
 /// A positive response built from its declaration (ADR-328 item 3): the SID and prefix, then
-/// the fewest bytes each field decodes from, all zero but a terminator. A field placed after
-/// the previous one is built only while that one's end is known; the first that is not ends
-/// the answer, so its field and those after it need a scripted answer to decode.
+/// the fewest bytes each field decodes from, all zero but a terminator. The first field whose
+/// extent is not known, or that reads to the end of the message, ends the answer: no field
+/// after it, wherever it is placed, adds bytes, so the response needs a scripted answer to
+/// decode.
 fn built_response(positive: &PositiveResponse<'_>, layouts: Layouts<'_>) -> Vec<u8> {
     let prefix = positive.prefix().map_or(&[][..], |p| p.bytes());
     let mut bytes = vec![positive.sid()];
     bytes.extend_from_slice(prefix);
     let start = 8 * bytes.len() as u64;
-    // Where the previous field ends, in bits from the SID; `None` once it is not known.
-    let mut cursor = Some(start);
+    // Where the previous field ends, in bits from the SID.
+    let mut cursor = start;
     // Terminator bytes, at byte positions, to write once the length is known.
     let mut terminators: Vec<(u64, u8)> = Vec::new();
     let mut end = start;
     for field in positive.fields().into_iter().flatten() {
         let at = match field.placement() {
-            Placement::AfterPrevious => match cursor {
-                Some(previous) => byte_edge(previous).saturating_add(u64::from(field.bit_offset())),
-                None => break,
-            },
+            Placement::AfterPrevious => {
+                byte_edge(cursor).saturating_add(u64::from(field.bit_offset()))
+            }
             _ => u64::from(field.bit_offset()),
         };
         let Some(built) = least_extent(&field, layouts, at) else {
-            cursor = None;
-            continue;
+            break;
         };
         if let Some((terminator, count)) = built.terminator {
             let last = built.end / 8;
             terminators.extend((last - count..last).map(|at| (at, terminator)));
         }
         end = end.max(built.end);
-        cursor = built.followed.then_some(built.end);
+        if !built.followed {
+            break;
+        }
+        cursor = built.end;
     }
     let len = usize::try_from(end.div_ceil(8))
         .map_or(crate::MAX_BYTES_LEN, |n| n.min(crate::MAX_BYTES_LEN));

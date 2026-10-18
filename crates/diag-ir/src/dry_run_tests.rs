@@ -555,3 +555,25 @@ fn an_error_keeps_only_the_start_of_a_long_service_name() {
         })
     );
 }
+
+#[test]
+fn no_field_after_one_of_unknown_extent_adds_bytes() {
+    let layout = LayoutT {
+        id: 1,
+        short_name: Some("l1".into()),
+        byte_size: 0,
+        fields: Some(vec![at(11, DataKind::Uint, 0, 8)]),
+    };
+    let fields = vec![
+        next(1, DataKind::Uint, 8),
+        FieldT {
+            shape: ShapeT::Group(Box::new(GroupT { layout_id: 1 })),
+            ..next(2, DataKind::Bytes, 0)
+        },
+        // Placed absolutely, it would otherwise give the group a byte to decode from.
+        at(3, DataKind::Uint, 8 * 4, 8),
+    ];
+    let (answer, decoded) = built(fields, vec![layout]);
+    assert_eq!(answer, [0x62, 0]);
+    assert!(decoded.is_err(), "{decoded:?}");
+}

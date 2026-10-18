@@ -52,14 +52,15 @@ A shared dry run has to settle three things the VM leaves to its host:
    another field is that field's zero, so an empty bytes or text value or no items (a number
    cannot be zero bits wide, so one with such a length ends the answer); a terminated value takes
    its minimum bytes and then its terminator, or its maximum when no terminator fits below it; a
-   group takes its layout's declared size and a fixed repeat its items' total size. A value
-   that reads to the end of the message (a terminated value with no terminator and no maximum,
-   a repeat to the end) ends the answer, and so does a field whose extent the declaration does
-   not give (a select, a repeat up to a marker, a layout of no declared size): a field placed
-   after it has no bytes, and since a response decodes whole or not at all, every field read of
-   it fails, so such a response needs a scripted answer. A length or count field with a
-   conversion that maps zero elsewhere needs one too. Otherwise a built answer lets a procedure
-   go on and its field reads decode; a procedure that
+   group takes its layout's declared size and a fixed repeat its items' total size. The answer
+   ends at the first field that reads to the end of the message (a terminated value with no
+   terminator and no maximum, a repeat to the end) or whose extent the declaration does not give
+   (a select, a repeat up to a marker, a layout of no declared size): no field after it adds
+   bytes, wherever it is placed. A field of unknown extent, or any field after one that reads to
+   the end, then has nothing to decode from, and since a response decodes whole or not at all,
+   every field read of that response fails, so it needs a scripted answer. A length or count
+   field with a conversion that maps zero elsewhere needs one too. Otherwise a built answer lets
+   a procedure go on and its field reads decode; a procedure that
    checks a value may then take its own failure path, which the report shows as the run's end.
    A service with no positive response needs a scripted answer.
 

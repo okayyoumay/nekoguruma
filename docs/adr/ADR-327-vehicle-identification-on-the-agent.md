@@ -163,10 +163,10 @@ maintainer chose to run the loop on the agent.
    any ECU definition's read: the distinct services and links the candidates' sources name are
    read in turn, in a fixed order, until one establishes a VIN. One response is decoded with the
    declaration of every source on that service and link (two sources whose declarations differ
-   are distinct), and it establishes a VIN only when every declaration that decodes it to a
-   well-formed VIN (ADR-261 item 3) gives the same one; well-formed values that disagree
-   establish none, since a response decoded with another ECU's layout can look like a VIN, and
-   the next service and link is read. When none establishes one, every VIN rule stays
+   are distinct), and it establishes a VIN only when every one of those declarations decodes
+   it to the same well-formed VIN (ADR-261 item 3); if any of them fails to decode it, or decodes
+   it to something else, the response establishes none, since a response decoded with another ECU's
+   layout can look like a VIN, and the next service and link is read. When none establishes one, every VIN rule stays
    unevaluated. When no candidate declares a VIN matching rule, identification
    reads no VIN (the data author's choice).
 6. **The agent reports facts; the server decides.** The job reports the VIN when read, the

@@ -7,6 +7,7 @@ log 1 all DTC status bits supported
 log 1 two DTCs
 routine FF01 01
 log 1 programming dependencies correct
+request 22 F1 90
 request 2E F1 90 57 56 57 5A 5A 5A 31 4A 5A 58 57 30 30 30 30 30 31
 log 1 done
 finished

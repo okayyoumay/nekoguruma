@@ -4,13 +4,14 @@
 //! The core of the lowering: top-level constants (folded at ingestion), top-level `def`s with
 //! positional parameters, calls between them, locals, the operators the IR's instructions
 //! cover, `and`, `or`, `not`, conditional expressions, `if`/`elif`/`else`, `for` loops
-//! (ADR-305), and `diag.fail`, `diag.wait`, `diag.log` and `diag.capture`. Every value that
-//! reaches run time has one type, inferred at ingestion (ADR-304); an operation the IR cannot
-//! express for its operands is `STAR_NOT_LOWERABLE`.
+//! (ADR-305), and `diag.fail`, `diag.wait`, `diag.log` and `diag.capture`, and section functions,
+//! each covered by a `Section` together with its own copies of the functions it reaches (ADR-301,
+//! ADR-329). Every value that reaches run time has one type, inferred at ingestion (ADR-304); an
+//! operation the IR cannot express for its operands is `STAR_NOT_LOWERABLE`.
 //!
 //! Not lowered yet, each its own backlog item: the other `diag` functions (`hmi` and `record`;
-//! `security_access`; `flash_transfer`), reading `dtcs` of `diag.read_dtc`, built-ins and
-//! string methods on values known only at run time, and section and idempotency annotations.
+//! `security_access`; `flash_transfer`), built-ins and string methods on values known only at
+//! run time, and idempotency annotations.
 //! Each is rejected with `STAR_NOT_LOWERABLE` (or `STAR_API_NOT_AVAILABLE` for a `diag`
 //! function without an instruction), so nothing is lowered silently wrong.
 
@@ -19,7 +20,7 @@ use std::rc::Rc;
 
 use diag_ir::declaration::{EcuVariant, LengthKind, Request};
 use diag_ir::encode::{ParamValue, encode_request};
-use diag_ir::{IR_SCHEMA_VERSION, Op, Program, SourceSpan};
+use diag_ir::{IR_SCHEMA_VERSION, Idempotency, Interruptible, Op, Program, Section, SourceSpan};
 use starlark_syntax::codemap::Span;
 use starlark_syntax::lexer::TokenInt;
 use starlark_syntax::syntax::ast::{
@@ -32,7 +33,7 @@ use crate::profile::{Intent, Part, ResultMap, Source, StepKind};
 
 use super::{
     Annotation, BUILTINS, Checked, Pending, RequestConstant, RequestIndex, STRING_METHODS,
-    StarCode, StarError, collect_locals, is_string_expression, resolve, to_u32,
+    SectionKind, StarCode, StarError, collect_locals, is_string_expression, resolve, to_u32,
 };
 
 /// The largest constant a fold or literal may build ([`Const::size`]), so a constant expression
@@ -68,6 +69,14 @@ const NAME_BYTES_PER_UNIT: usize = 64;
 /// The limit of a `range` loop whose bound is known only at run time and that has no
 /// `@maxIterations` (subset 4.2).
 const DEFAULT_MAX_ITERATIONS: u32 = 1000;
+
+/// The most specialized copies of functions one file may need (subset 2.6): a section's copies
+/// of the functions it reaches count toward it (4.5, ADR-301).
+const MAX_COPIES: usize = 1000;
+
+/// The most instructions the specialized copies may hold together (subset 2.6, 4.5), so a large
+/// function reached from many sections cannot make the converter build an unbounded program.
+const MAX_COPIED_INSTRUCTIONS: usize = 1 << 22;
 
 /// The `Fail` code of a loop that runs past its limit (subset 4.2, ADR-280).
 const LOOP_LIMIT_EXCEEDED: &str = "LOOP_LIMIT_EXCEEDED";
@@ -486,8 +495,16 @@ struct Func<'a> {
     ret: Tys,
     label: Label,
     code: Code,
-    /// Whether the function is part of the program: reached from `main`.
-    emitted: bool,
+    /// The attributes of a section function (4.5): its interruptibility and expected duration.
+    section: Option<(Interruptible, u32)>,
+}
+
+/// One copy of a function in the program (ADR-301): the function, and the section function
+/// whose call it runs in, or `None` for the copy that runs outside every section.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct FuncCopy {
+    func: usize,
+    section: Option<usize>,
 }
 
 struct Lowerer<'a> {
@@ -558,6 +575,8 @@ struct Lowerer<'a> {
     mention_counts: HashMap<usize, HashMap<String, usize>>,
     /// The names each loop body assigns, by body, taken once.
     assigned: HashMap<*const AstStmt, Rc<HashSet<String>>>,
+    /// The copies of the functions the program holds, in layout order (ADR-301).
+    copies: Vec<FuncCopy>,
 }
 
 /// Where `break` and `continue` jump in the loop being lowered.
@@ -614,6 +633,7 @@ impl<'a> Lowerer<'a> {
             variable_escapes: HashMap::new(),
             mention_counts: HashMap::new(),
             assigned: HashMap::new(),
+            copies: Vec::new(),
         }
     }
 
@@ -649,7 +669,8 @@ impl<'a> Lowerer<'a> {
     }
 
     /// Rejects the annotations whose ranges are not lowered yet, so their attributes are not
-    /// dropped silently (ADR-304). `@maxIterations` belongs to a `for`, which is rejected itself.
+    /// dropped silently (ADR-304). `@maxIterations` belongs to a `for`, which is rejected itself,
+    /// and `@section` to its function ([`Lowerer::functions`]).
     fn annotations(&mut self) {
         let codemap = self
             .checked
@@ -658,11 +679,10 @@ impl<'a> Lowerer<'a> {
             .file;
         for annotation in &self.checked.annotations {
             let (line, what) = match annotation {
-                Annotation::Section { line, .. } => (*line, "a `@section` annotation (4.5)"),
                 Annotation::Idempotency { line, .. } => {
                     (*line, "an `@idempotency` annotation (4.6)")
                 }
-                Annotation::MaxIterations { .. } => continue,
+                Annotation::MaxIterations { .. } | Annotation::Section { .. } => continue,
             };
             let begin = codemap.line_span(line.saturating_sub(1) as usize).begin();
             self.not_lowerable(
@@ -693,8 +713,39 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    /// Numbers the top-level `def`s and gives each its slots.
+    /// Numbers the top-level `def`s and gives each its slots and, for a section function, its
+    /// section's attributes (4.5).
     fn functions(&mut self) {
+        let codemap = self
+            .checked
+            .module
+            .file_span(self.checked.module.statement().span)
+            .file;
+        // The checker attaches each `@section` to the top-level `def` on its `def` line.
+        let sections: HashMap<u32, (Interruptible, u32)> = self
+            .checked
+            .annotations
+            .iter()
+            .filter_map(|annotation| match annotation {
+                Annotation::Section {
+                    def,
+                    kind,
+                    expected_millis,
+                    ..
+                } => Some((
+                    *def,
+                    (
+                        match kind {
+                            SectionKind::Interruptible => Interruptible::Yes,
+                            SectionKind::Uninterruptible => Interruptible::No,
+                            SectionKind::RecoveryRequired => Interruptible::RecoveryRequired,
+                        },
+                        expected_millis.unwrap_or(0),
+                    ),
+                )),
+                _ => None,
+            })
+            .collect();
         for stmt in self.top_level() {
             let StmtP::Def(def) = &stmt.node else {
                 continue;
@@ -730,6 +781,7 @@ impl<'a> Lowerer<'a> {
                 .collect();
             let label = self.label();
             let id = self.funcs.len();
+            let line = codemap.find_line(stmt.span.begin()) as u32 + 1;
             self.by_name.insert(def.name.node.ident.clone(), id);
             self.funcs.push(Func {
                 def,
@@ -742,7 +794,7 @@ impl<'a> Lowerer<'a> {
                 ret: Tys::default(),
                 label,
                 code: Vec::new(),
-                emitted: false,
+                section: sections.get(&line).copied(),
             });
         }
     }
@@ -812,7 +864,85 @@ impl<'a> Lowerer<'a> {
                 }
             }
             self.funcs[id].code = code;
-            self.funcs[id].emitted = true;
+        }
+        self.plan_copies(main);
+    }
+
+    /// The copy a call to `callee` reaches from a copy that runs in `section`: a section
+    /// function's call enters its own section, and any other function runs in the caller's.
+    fn copy_for(&self, callee: usize, section: Option<usize>) -> FuncCopy {
+        FuncCopy {
+            func: callee,
+            section: if self.funcs[callee].section.is_some() {
+                Some(callee)
+            } else {
+                section
+            },
+        }
+    }
+
+    /// Lists the copies the program holds (ADR-301): starting from the entry's call to `main`,
+    /// each call reaches the copy [`Lowerer::copy_for`] names, so every function a section
+    /// reaches gets a copy that only that section runs, and a function also called outside every
+    /// section keeps its own copy there. The copies a section needs count toward the budgets of
+    /// 2.6, in copies and in instructions, before each is made; the call that would pass one is
+    /// `STAR_SPECIALIZATION_LIMIT`.
+    fn plan_copies(&mut self, main: usize) {
+        let first = self.copy_for(main, None);
+        let mut listed: HashSet<FuncCopy> = HashSet::from([first]);
+        self.copies = vec![first];
+        let mut specialized = usize::from(first.section.is_some());
+        let mut copied = if first.section.is_some() {
+            self.funcs[main].code.len()
+        } else {
+            0
+        };
+        let mut next = 0;
+        while next < self.copies.len() {
+            let copy = self.copies[next];
+            next += 1;
+            let calls: Vec<(usize, Span)> = self.funcs[copy.func]
+                .code
+                .iter()
+                .filter_map(|(ins, span)| match ins {
+                    Ins::Call(callee) => Some((*callee, *span)),
+                    _ => None,
+                })
+                .collect();
+            for (callee, span) in calls {
+                let target = self.copy_for(callee, copy.section);
+                if copy.section.is_some() && target.section != copy.section {
+                    // The checker rejects a section function called inside a section.
+                    self.error(
+                        StarCode::BadAnnotation,
+                        span,
+                        "a section function is called inside a section (4.5)",
+                    );
+                    continue;
+                }
+                if listed.contains(&target) {
+                    continue;
+                }
+                if target.section.is_some() {
+                    let size = self.funcs[callee].code.len();
+                    if specialized == MAX_COPIES || copied + size > MAX_COPIED_INSTRUCTIONS {
+                        self.error(
+                            StarCode::SpecializationLimit,
+                            span,
+                            format!(
+                                "the sections need more than {MAX_COPIES} copies of the \
+                                 functions they reach, or more than {MAX_COPIED_INSTRUCTIONS} \
+                                 instructions in them (2.6, 4.5)"
+                            ),
+                        );
+                        return;
+                    }
+                    specialized += 1;
+                    copied += size;
+                }
+                listed.insert(target);
+                self.copies.push(target);
+            }
         }
     }
 
@@ -4232,49 +4362,90 @@ impl<'a> Lowerer<'a> {
 
     // ------------------------------------------------------------ Assembly
 
-    /// Lays out the entry (a call to `main`, then the end) and the functions, and resolves
-    /// labels, calls and source positions.
+    /// Lays out the entry (a call to `main`, then the end) and the copies of the functions, and
+    /// resolves labels, calls and source positions. Each copy that runs in a section is covered
+    /// by a `Section` with that section function's attributes (ADR-301); its idempotency is
+    /// `CheckState`, which the job runner treats as it treats code outside every section, until
+    /// `@idempotency` is lowered (ADR-329).
     fn assemble(&mut self) -> Program {
         let main = self.by_name.get("main").copied().unwrap_or(0);
         let entry_span = self.funcs[main].def.name.span;
-        let mut code: Code = vec![
-            (Ins::Call(main), entry_span),
-            (Ins::Op(Op::Ret), entry_span),
+        // Labels are unique within a function's body, so a copy's are told apart by its index.
+        let index: HashMap<FuncCopy, usize> = self
+            .copies
+            .iter()
+            .enumerate()
+            .map(|(at, copy)| (*copy, at))
+            .collect();
+        // The entry belongs to no copy and runs outside every section.
+        const ENTRY: usize = usize::MAX;
+        let mut code: Vec<(Ins, Span, usize)> = vec![
+            (Ins::Call(main), entry_span, ENTRY),
+            (Ins::Op(Op::Ret), entry_span, ENTRY),
         ];
-        for func in self.funcs.iter_mut().filter(|f| f.emitted) {
-            code.append(&mut func.code);
+        // The range of each copy that runs in a section, by its first and last instruction.
+        let mut ranges: Vec<(usize, u32, u32)> = Vec::new();
+        let mut pc = 2u32;
+        for (at, copy) in self.copies.iter().enumerate() {
+            let start = pc;
+            for (ins, span) in &self.funcs[copy.func].code {
+                if !matches!(ins, Ins::Mark(_)) {
+                    pc += 1;
+                }
+                code.push((ins.clone(), *span, at));
+            }
+            if let Some(section) = copy.section {
+                ranges.push((section, start, pc));
+            }
         }
         // Positions of labels, counting only real instructions.
-        let mut positions: HashMap<Label, u32> = HashMap::new();
+        let mut positions: HashMap<(usize, Label), u32> = HashMap::new();
         let mut pc = 0u32;
-        for (ins, _) in &code {
+        for (ins, _, at) in &code {
             match ins {
                 Ins::Mark(label) => {
-                    positions.insert(*label, pc);
+                    positions.insert((*at, *label), pc);
                 }
                 _ => pc += 1,
             }
         }
-        let labels: Vec<Label> = self.funcs.iter().map(|f| f.label).collect();
         let mut ops = Vec::with_capacity(pc as usize);
         let mut spans = Vec::with_capacity(pc as usize);
-        for (ins, span) in code {
+        for (ins, span, at) in code {
             let op = match ins {
                 Ins::Mark(_) => continue,
                 Ins::Op(op) => op,
-                Ins::Jump(label) => Op::Jump(positions[&label]),
-                Ins::JumpIfFalse(label) => Op::JumpIfFalse(positions[&label]),
-                Ins::Call(callee) => Op::Call(positions[&labels[callee]]),
+                Ins::Jump(label) => Op::Jump(positions[&(at, label)]),
+                Ins::JumpIfFalse(label) => Op::JumpIfFalse(positions[&(at, label)]),
+                Ins::Call(callee) => {
+                    let caller = self.copies.get(at).and_then(|copy| copy.section);
+                    let target = index[&self.copy_for(callee, caller)];
+                    Op::Call(positions[&(target, self.funcs[callee].label)])
+                }
             };
             ops.push(op);
             spans.push(span);
         }
+        let sections = ranges
+            .into_iter()
+            .map(|(section, start_pc, end_pc)| {
+                let (interruptible, expected_millis) =
+                    self.funcs[section].section.expect("a section function");
+                Section {
+                    start_pc,
+                    end_pc,
+                    interruptible,
+                    idempotency: Idempotency::CheckState,
+                    expected_millis,
+                }
+            })
+            .collect();
         let source_map = self.source_map(&spans);
         Program {
             schema_version: IR_SCHEMA_VERSION,
             code: ops,
             constants: std::mem::take(&mut self.pool),
-            sections: Vec::new(),
+            sections,
             source_map,
             identity: Default::default(),
             preconditions: Default::default(),

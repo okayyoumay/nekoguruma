@@ -1745,11 +1745,11 @@ fn each_procedure_is_lowered_for_each_variant() {
 
 #[test]
 fn an_error_every_variant_gives_is_reported_once() {
-    let section = "# @section uninterruptible\ndef main():\n    pass\n";
-    let rejected = procedures(with(example(), "a.star", section)).expect_err("not lowerable");
+    let annotated = "def main():\n    # @idempotency unsafe\n    x = 1\n";
+    let rejected = procedures(with(example(), "a.star", annotated)).expect_err("not lowerable");
     let found: Vec<(crate::star::StarCode, u32)> =
         rejected.errors.iter().map(|e| (e.code, e.line)).collect();
-    assert_eq!(found, [(crate::star::StarCode::NotLowerable, 1)]);
+    assert_eq!(found, [(crate::star::StarCode::NotLowerable, 2)]);
     assert!(!rejected.errors[0].hint.contains("(in variant"));
     assert!(!rejected.errors[0].hint.contains("(in variants"));
 }

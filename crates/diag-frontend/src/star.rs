@@ -133,6 +133,9 @@ pub enum StarCode {
     /// lowering does not cover yet (2.5, 4.4).
     #[serde(rename = "STAR_NOT_LOWERABLE")]
     NotLowerable,
+    /// Functions that need more specialized copies than the budget of 2.6 allows (4.5).
+    #[serde(rename = "STAR_SPECIALIZATION_LIMIT")]
+    SpecializationLimit,
     /// A `diag` function with no IR instruction yet (3.2).
     #[serde(rename = "STAR_API_NOT_AVAILABLE")]
     ApiNotAvailable,
@@ -172,6 +175,7 @@ impl StarCode {
             Self::NestingTooDeep => "STAR_NESTING_TOO_DEEP",
             Self::NonConstantArgument => "STAR_NON_CONSTANT_ARGUMENT",
             Self::NotLowerable => "STAR_NOT_LOWERABLE",
+            Self::SpecializationLimit => "STAR_SPECIALIZATION_LIMIT",
             Self::ApiNotAvailable => "STAR_API_NOT_AVAILABLE",
             Self::UnknownService => "STAR_UNKNOWN_SERVICE",
             Self::NotInProfile => "STAR_NOT_IN_PROFILE",

@@ -71,7 +71,7 @@ starts there. A file without `main`, or whose `main` takes parameters, is reject
 | Top-level statements other than constant assignments and `def` | The procedure runs from `main` only | `STAR_TOPLEVEL_STATEMENT_NOT_ALLOWED` |
 | `*args`, `**kwargs`, keyword-only parameters, keyword arguments to built-ins and `diag` functions | Not supported in version 1 | `STAR_UNSUPPORTED_SYNTAX` |
 | A missing, repeated or unknown argument, or too many positional arguments, in a call to a user function (2.7) | The call cannot be bound to the parameters | `STAR_ARGUMENT_MISMATCH` |
-| Calls that pass functions needing more than 1,000 specialized copies (2.6) | Bounds ingestion work on untrusted input | `STAR_SPECIALIZATION_LIMIT` |
+| Calls that pass functions, or sections, needing more than 1,000 specialized copies (2.6, 4.5) | Bounds ingestion work on untrusted input | `STAR_SPECIALIZATION_LIMIT` |
 | Type annotations | Not base Starlark | `STAR_UNSUPPORTED_SYNTAX` |
 | `set` | No IR value type for it; not supported in version 1 | `STAR_UNSUPPORTED_SYNTAX` |
 | Dict access with a computed key `d[expr]` | Key cannot be resolved statically (list and bytes indexing are allowed) | `STAR_DYNAMIC_KEY_NOT_ALLOWED` |
@@ -184,8 +184,9 @@ combination of functions it receives, in which each call through a function para
 (4.1) is judged by source function along the specialized call paths, so `invoke(reenter)`, where
 `invoke(f)` calls `f()` and `reenter()` calls `invoke(done)`, is rejected although it reaches two
 different copies of `invoke`. Specialization has a budget of 1,000 copies per file, counted before
-each copy is built, so a file whose helpers multiply copies cannot exhaust the server; the call
-that would exceed it is `STAR_SPECIALIZATION_LIMIT`. No IR instruction is involved.
+each copy is built, so a file whose helpers multiply copies cannot exhaust the server; the copies
+also hold at most 2^22 instructions together. The call that would exceed either is
+`STAR_SPECIALIZATION_LIMIT`. No IR instruction is involved.
 
 ### 2.7 Default Values and Keyword Arguments
 
@@ -551,7 +552,11 @@ authentication time (8.10.1) each time the function is called.
   own body, every function it calls, directly or not, and every function it receives as an
   argument and calls (2.6). The lowering gives each such function a copy that only the section
   reaches and covers that copy with the same attributes; a function also called outside the
-  section keeps its own copy there. These copies count toward the specialization budget of 2.6.
+  section keeps its own copy there. These copies count toward the specialization budget of 2.6,
+  in copies and in instructions: the call that would pass it is `STAR_SPECIALIZATION_LIMIT`.
+- **Idempotency.** A section says nothing about whether its steps may be repeated: each `Section`
+  it lowers to is `CheckState`, which the job runner judges as code outside every section, until
+  `@idempotency` (4.6) is lowered (ADR-329). Without `expected=`, the expected duration is 0.
 - **No nesting.** A call to a section function from anything that runs inside a section,
   directly or through other functions or function arguments, is rejected at that call
   (`STAR_BAD_ANNOTATION`). A call to a section function from outside every section, as many
@@ -700,6 +705,12 @@ names them at the end of its hint (`(in variant V1)`, `(in variants V1, V2)`).
   functions reachable from any section function are marked, and a call from a marked function
   to a section function is reported, unless it closes a cycle, which is reported as recursion
   only. Calls through function parameters (2.6) are followed along the specialized call paths
+- Sections (4.5) are lowered as copies keyed by the function and the section function whose call
+  they run in, or none outside every section: starting from the entry's call to `main`, a call to
+  a section function reaches that function's section copy, and any other call stays in the
+  caller's section. Each section copy's range becomes a `Section` with the section function's
+  attributes, and every section copy counts toward the budget of 2.6, in copies and in
+  instructions, before it is made
 - The check of 2.3 sees the syntax only. A computed key, or a slice, is found on the expressions known to be
   dicts without type inference: dict literals, the responses of `diag.request`, `diag.routine`
   and `diag.read_dtc` (3.4), a response's `"fields"` (not the values in it, nor another dict's

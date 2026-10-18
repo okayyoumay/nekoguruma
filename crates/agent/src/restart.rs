@@ -3222,4 +3222,80 @@ mod tests {
         assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
         assert_eq!(host.0.armed_faults(), &[sim_ecu::Fault::BusError]);
     }
+
+    /// A Starlark section function that calls a helper also called outside it (ADR-301): the
+    /// helper's instructions are in the section only on the section's path, so the agent treats
+    /// an interruption in the section's copy as inside a recovery-required section and one in the
+    /// copy `main` calls directly as outside every section.
+    #[test]
+    fn a_lowered_section_covers_its_helper_only_on_its_own_path() {
+        use diag_frontend::star::{RequestIndex, check, lower};
+        use diag_ir::declaration::{
+            EcuDocumentT, EcuVariantT, encode_ecu_document, load_ecu_document,
+        };
+        let source = "\
+def helper():
+    diag.log(1, \"helper\")
+
+# @section recoveryRequired
+def write():
+    helper()
+
+def main():
+    helper()
+    write()
+";
+        let checked = check("t.star", source).expect("checks");
+        let mut document = EcuDocumentT::default();
+        document.schema_version = IR_SCHEMA_VERSION;
+        document.source_format = Some("test".to_owned());
+        document.source_digest = Some(String::new());
+        document.variant = Some(Box::new(EcuVariantT::default()));
+        let bytes = encode_ecu_document(&document);
+        let variant = load_ecu_document(&bytes).unwrap().variant().unwrap();
+        let program = lower("t.star", &checked, variant, &RequestIndex::default())
+            .expect("lowers")
+            .program;
+        program.validate().expect("valid");
+        let helper = program
+            .constants
+            .iter()
+            .position(|c| c.as_slice() == b"helper")
+            .unwrap() as u32;
+        let logs: Vec<bool> = (0..program.code.len() as u32)
+            .filter(|&pc| matches!(program.code[pc as usize], Op::Log { message, .. } if message == helper))
+            .map(|pc| in_section_outside_plans(&program, pc))
+            .collect();
+        let mut sorted = logs.clone();
+        sorted.sort();
+        assert_eq!(sorted, [false, true], "{program:#?}");
+        // Each call reaches the copy on its own side: `main`'s the one outside the section, and
+        // `write`'s the one inside it.
+        let logs_at: Vec<u32> = (0..program.code.len() as u32)
+            .filter(|&pc| matches!(program.code[pc as usize], Op::Log { message, .. } if message == helper))
+            .collect();
+        let mut calls: Vec<(bool, bool)> = program
+            .code
+            .iter()
+            .enumerate()
+            .filter_map(|(pc, op)| match op {
+                Op::Call(target) => {
+                    let end = (*target..program.code.len() as u32)
+                        .find(|&at| matches!(program.code[at as usize], Op::Ret))?;
+                    logs_at
+                        .iter()
+                        .any(|log| (*target..end).contains(log))
+                        .then(|| {
+                            (
+                                in_section_outside_plans(&program, pc as u32),
+                                in_section_outside_plans(&program, *target),
+                            )
+                        })
+                }
+                _ => None,
+            })
+            .collect();
+        calls.sort();
+        assert_eq!(calls, [(false, false), (true, true)]);
+    }
 }

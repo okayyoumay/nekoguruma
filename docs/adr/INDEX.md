@@ -318,6 +318,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-326](ADR-326-vehicle-definitions.md) | Vehicle Definitions for Model Identification and Topology | Accepted (items 2, 3 and 5 and the Consequences amended by ADR-327) | `diag-frontend` (vehicle definition kind), `server` (identification, catalog, prefetch), role and record-template model scopes, SOVD components; design 8.1, 8.3, 8.8.2, 9.2; ADR-306, ADR-315, ADR-318, ADR-324 |
 | [ADR-327](ADR-327-vehicle-identification-on-the-agent.md) | Vehicle Identification Runs on the Agent | Accepted | `agent` identification job and variant guard, `server` identification plans and guard lists, variant attributes and definitive negative responses in `diag-frontend` / `diag-ir`; design 8.2.4, 8.2.5, 8.8.2, 8.9.1; ADR-229 item 2, ADR-235 items 3 and 8, ADR-244's record set, ADR-315 item 3, ADR-318 items 1 and 4 and its Consequences, ADR-324 items 1 and 2, ADR-325 item 7, ADR-326 items 2, 3 and 5 and its Consequences |
 | [ADR-328](ADR-328-dry-run-with-vehicle-access-mocked.md) | Dry Run with Vehicle Access Mocked | Accepted | `diag-ir` `dry_run` (`Script`, `DryRunReport`), `diag-frontend` dry-run tests; design 12.1, `starlark-subset.md` 6; ADR-233, ADR-280, ADR-297, ADR-321 |
+| [ADR-329](ADR-329-a-lowered-section-is-check-state-until-idempotency-is-lowered.md) | A Lowered Section Is CheckState Until Idempotency Is Lowered | Accepted | `diag-frontend` lowering of section functions; `starlark-subset.md` 4.5, design 8.4; ADR-245, ADR-271, ADR-301 |
 
 ## Status Legend
 
@@ -746,6 +747,7 @@ the predecessor repository these ADRs came from.
 - ADR-326 (items 2, 3 and 5 and the Consequences amended by ADR-327)
 - ADR-327
 - ADR-328
+- ADR-329
 
 ### Acquired Data & Monitoring
 - ADR-236

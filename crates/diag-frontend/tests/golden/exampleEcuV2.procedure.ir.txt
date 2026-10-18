@@ -4,7 +4,7 @@ EcuDocumentT {
         "csv-starlark",
     ),
     source_digest: Some(
-        "96f1ff0018b67d208e661b36796cbe08bbc37245afd3ea27e8b0d201bdcfddf4",
+        "f1b6c3d867271af8ef9dd23ef04c06bc18b9a4394dc08c0b5a0e4cbb15d34132",
     ),
     variant: Some(
         EcuVariantT {
@@ -2309,15 +2309,11 @@ Program {
             service: 16,
         },
         Pop,
+        Call(
+            150,
+        ),
         PushBytes(
             1,
-        ),
-        ServiceRequest {
-            service: 34,
-        },
-        Pop,
-        PushBytes(
-            2,
         ),
         ServiceRequest {
             service: 34,
@@ -2337,14 +2333,14 @@ Program {
         ),
         CmpEq,
         JumpIfFalse(
-            17,
+            15,
         ),
         Log {
             level: 1,
-            message: 3,
+            message: 2,
         },
         PushBytes(
-            4,
+            3,
         ),
         SendReceive {
             service: 4,
@@ -2363,13 +2359,13 @@ Program {
         ),
         Slice,
         PushBytes(
-            5,
+            4,
         ),
         CmpEq,
         Not,
         Dup,
         JumpIfFalse(
-            34,
+            32,
         ),
         Pop,
         LoadLocal(
@@ -2384,11 +2380,11 @@ Program {
         ),
         CmpEq,
         JumpIfFalse(
-            130,
+            128,
         ),
         Log {
             level: 1,
-            message: 6,
+            message: 5,
         },
         LoadLocal(
             1,
@@ -2425,7 +2421,7 @@ Program {
         CmpEq,
         Dup,
         JumpIfFalse(
-            98,
+            96,
         ),
         Pop,
         LoadLocal(
@@ -2515,7 +2511,7 @@ Program {
         CmpEq,
         Dup,
         JumpIfFalse(
-            128,
+            126,
         ),
         Pop,
         LoadLocal(
@@ -2576,14 +2572,14 @@ Program {
         ),
         CmpEq,
         JumpIfFalse(
-            130,
+            128,
         ),
         Log {
             level: 1,
-            message: 7,
+            message: 6,
         },
         PushBytes(
-            8,
+            7,
         ),
         RoutineControl {
             routine: 65281,
@@ -2603,13 +2599,13 @@ Program {
         ),
         Slice,
         PushBytes(
-            5,
+            4,
         ),
         CmpEq,
         Not,
         Dup,
         JumpIfFalse(
-            147,
+            145,
         ),
         Pop,
         LoadLocal(
@@ -2624,12 +2620,31 @@ Program {
         ),
         CmpEq,
         JumpIfFalse(
-            149,
+            147,
+        ),
+        Log {
+            level: 1,
+            message: 8,
+        },
+        Call(
+            154,
         ),
         Log {
             level: 1,
             message: 9,
         },
+        Ret,
+        PushBytes(
+            11,
+        ),
+        ServiceRequest {
+            service: 34,
+        },
+        Pop,
+        Ret,
+        Call(
+            159,
+        ),
         PushBytes(
             10,
         ),
@@ -2637,19 +2652,19 @@ Program {
             service: 46,
         },
         Pop,
-        Log {
-            level: 1,
-            message: 11,
+        Ret,
+        PushBytes(
+            11,
+        ),
+        ServiceRequest {
+            service: 34,
         },
+        Pop,
         Ret,
     ],
     constants: [
         [
             3,
-        ],
-        [
-            241,
-            144,
         ],
         [
             241,
@@ -2758,6 +2773,12 @@ Program {
             116,
         ],
         [
+            100,
+            111,
+            110,
+            101,
+        ],
+        [
             241,
             144,
             87,
@@ -2779,174 +2800,229 @@ Program {
             49,
         ],
         [
-            100,
-            111,
-            110,
-            101,
+            241,
+            144,
         ],
     ],
-    sections: [],
+    sections: [
+        Section {
+            start_pc: 154,
+            end_pc: 159,
+            interruptible: No,
+            idempotency: CheckState,
+            expected_millis: 2000,
+        },
+        Section {
+            start_pc: 159,
+            end_pc: 163,
+            interruptible: No,
+            idempotency: CheckState,
+            expected_millis: 2000,
+        },
+    ],
     source_map: [
         SourceSpan {
             pc: 0,
             file: 0,
-            line: 4,
+            line: 14,
             column: 5,
         },
         SourceSpan {
             pc: 2,
             file: 0,
-            line: 5,
+            line: 15,
             column: 5,
         },
         SourceSpan {
             pc: 5,
             file: 0,
-            line: 6,
+            line: 16,
             column: 5,
         },
         SourceSpan {
-            pc: 8,
+            pc: 6,
             file: 0,
-            line: 7,
+            line: 17,
             column: 15,
         },
         SourceSpan {
-            pc: 11,
+            pc: 9,
             file: 0,
-            line: 8,
+            line: 18,
             column: 8,
         },
         SourceSpan {
-            pc: 16,
+            pc: 14,
             file: 0,
-            line: 9,
+            line: 19,
             column: 9,
         },
         SourceSpan {
-            pc: 17,
+            pc: 15,
             file: 0,
-            line: 10,
+            line: 20,
             column: 12,
         },
         SourceSpan {
-            pc: 20,
+            pc: 18,
             file: 0,
-            line: 11,
+            line: 21,
             column: 8,
         },
         SourceSpan {
-            pc: 30,
+            pc: 28,
             file: 0,
-            line: 11,
+            line: 21,
             column: 23,
+        },
+        SourceSpan {
+            pc: 32,
+            file: 0,
+            line: 21,
+            column: 8,
+        },
+        SourceSpan {
+            pc: 33,
+            file: 0,
+            line: 22,
+            column: 9,
         },
         SourceSpan {
             pc: 34,
             file: 0,
-            line: 11,
-            column: 8,
-        },
-        SourceSpan {
-            pc: 35,
-            file: 0,
-            line: 12,
-            column: 9,
-        },
-        SourceSpan {
-            pc: 36,
-            file: 0,
-            line: 13,
+            line: 23,
             column: 19,
         },
         SourceSpan {
-            pc: 44,
+            pc: 42,
             file: 0,
-            line: 14,
+            line: 24,
             column: 16,
         },
         SourceSpan {
-            pc: 45,
+            pc: 43,
             file: 0,
-            line: 14,
+            line: 24,
             column: 12,
         },
         SourceSpan {
-            pc: 55,
+            pc: 53,
             file: 0,
-            line: 14,
+            line: 24,
             column: 34,
         },
         SourceSpan {
-            pc: 98,
+            pc: 96,
             file: 0,
-            line: 14,
+            line: 24,
             column: 12,
         },
         SourceSpan {
-            pc: 101,
+            pc: 99,
             file: 0,
-            line: 14,
+            line: 24,
             column: 69,
+        },
+        SourceSpan {
+            pc: 126,
+            file: 0,
+            line: 24,
+            column: 12,
+        },
+        SourceSpan {
+            pc: 127,
+            file: 0,
+            line: 25,
+            column: 13,
         },
         SourceSpan {
             pc: 128,
             file: 0,
-            line: 14,
-            column: 12,
-        },
-        SourceSpan {
-            pc: 129,
-            file: 0,
-            line: 15,
+            line: 26,
             column: 13,
         },
         SourceSpan {
-            pc: 130,
+            pc: 131,
             file: 0,
-            line: 16,
-            column: 13,
-        },
-        SourceSpan {
-            pc: 133,
-            file: 0,
-            line: 17,
+            line: 27,
             column: 8,
         },
         SourceSpan {
-            pc: 143,
+            pc: 141,
             file: 0,
-            line: 17,
+            line: 27,
             column: 24,
+        },
+        SourceSpan {
+            pc: 145,
+            file: 0,
+            line: 27,
+            column: 8,
+        },
+        SourceSpan {
+            pc: 146,
+            file: 0,
+            line: 28,
+            column: 9,
         },
         SourceSpan {
             pc: 147,
             file: 0,
-            line: 17,
-            column: 8,
+            line: 29,
+            column: 5,
         },
         SourceSpan {
             pc: 148,
             file: 0,
-            line: 18,
-            column: 9,
+            line: 30,
+            column: 5,
         },
         SourceSpan {
             pc: 149,
             file: 0,
-            line: 19,
+            line: 14,
             column: 5,
         },
         SourceSpan {
-            pc: 152,
+            pc: 150,
             file: 0,
-            line: 20,
+            line: 7,
             column: 5,
         },
         SourceSpan {
             pc: 153,
             file: 0,
-            line: 4,
+            line: 6,
+            column: 5,
+        },
+        SourceSpan {
+            pc: 154,
+            file: 0,
+            line: 11,
+            column: 5,
+        },
+        SourceSpan {
+            pc: 155,
+            file: 0,
+            line: 12,
+            column: 5,
+        },
+        SourceSpan {
+            pc: 158,
+            file: 0,
+            line: 10,
+            column: 5,
+        },
+        SourceSpan {
+            pc: 159,
+            file: 0,
+            line: 7,
+            column: 5,
+        },
+        SourceSpan {
+            pc: 162,
+            file: 0,
+            line: 6,
             column: 5,
         },
     ],

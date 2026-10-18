@@ -123,7 +123,7 @@ fn the_example_dtcs_and_flash_session_convert() {
 
 #[test]
 fn dtcs_and_flash_sessions_follow_their_variants_and_layouts() {
-    // Ids 34 to 36 follow the example's 33 fields.
+    // Ids 36 to 38 follow the example's 35 fields.
     let files = with_fields(&[
         "layout:snap,odometer,0,,uint,16,,,,,,,,,,,",
         "layout:snap,temperature,2,,int,8,,,,,,,,,,,",

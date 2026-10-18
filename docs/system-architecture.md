@@ -863,7 +863,7 @@ Because ODX / OTX are large specifications, the supported subset is declared in 
 
 | Standard | Supported | Excluded |
 |---|---|---|
-| ODX | DIAG-LAYER-CONTAINER, ECU-VARIANT, DIAG-SERVICE, REQUEST / POS-RESPONSE / NEG-RESPONSE, DATA-OBJECT-PROP, COMPU-METHOD, DTC-DOP, TABLE, ECU-VARIANT-PATTERN, COMPARAM, flash description (ODX-F), VEHICLE-INFO-SPEC (information components with matching components on diagnostic services, logical links, ECU groups; 8.8.2) | SINGLE-ECU-JOB and MULTIPLE-ECU-JOB (because they presuppose Java job execution on a D-Server. Equivalent processing is written in procedure definitions) |
+| ODX | DIAG-LAYER-CONTAINER, ECU-VARIANT, DIAG-SERVICE, REQUEST / POS-RESPONSE / NEG-RESPONSE, DATA-OBJECT-PROP, COMPU-METHOD, DTC-DOP, TABLE, ECU-VARIANT-PATTERN, COMPARAM, flash description (ODX-F), VEHICLE-INFO-SPEC (information components with matching components on diagnostic services, logical links, ECU groups; 8.8.2) | SINGLE-ECU-JOB and MULTIPLE-ECU-JOB (ISO 22901-1 (2008) 7.3.5.7 and 7.3.11; because they presuppose Java job execution on a D-Server. Equivalent processing is written in procedure definitions) |
 | OTX | Core, DiagCom, Flash, HMI, Quantities, Logging, EventHandling, i18n | Extensions for external program calls and Java calls (because they contradict the "limited enumeration of instructions" policy) |
 
 OEM-specific extensions and variations in specification interpretation (dialects) are absorbed by adding or updating supply format front ends (9.2). The operating practice is to detect them via ingestion-time validation and provide a corresponding front end.

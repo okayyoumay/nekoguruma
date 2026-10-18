@@ -11,8 +11,8 @@ definition kind), `server` (identification, catalog, prefetch), `db/migrations/`
 
 Vehicle knowledge (L3, design 8.1) is defined per ECU: an ECU definition holds its variants,
 their identification patterns (8.9.1, ADR-306, ADR-315), its protocol and link parameters
-(ADR-324), its services and its procedures. A procedure that addresses several ECUs binds each
-of its targets to an ECU definition (ADR-325). Nothing describes a vehicle as a whole.
+(ADR-324), its services and its procedures, and a job carries the documents of the ECU
+definitions it runs (ADR-318). Nothing describes a vehicle as a whole.
 
 Yet several parts of the design already speak of vehicle models:
 
@@ -26,7 +26,7 @@ Yet several parts of the design already speak of vehicle models:
 
 None of them says what a vehicle model is, how a job's vehicle is mapped to one, or where the
 list of ECUs fitted to a model is kept. Vehicle-wide work (a DTC scan and clear over every ECU,
-showing an operator what a vehicle carries, picking the right gateway for ADR-325's targets)
+showing an operator what a vehicle carries, finding the gateway an ECU is reached through)
 needs that list: which ECUs a model has, how each is reached (directly, or behind which
 gateway), and which ECUs are alternatives of one another (optional equipment, supplier
 changes).
@@ -76,7 +76,7 @@ ODX subset (8.3) neither includes nor excludes it.
    vehicle model to the manifests of the ECU definitions its definitions refer to, and resolves
    the model and OEM scopes of roles and record templates against the identification values:
    `models` names vehicle-model values and `oem` OEM values, so one scope covers every
-   definition of that model. A job still carries the ECU documents it runs (ADR-318, ADR-325);
+   definition of that model. A job still carries the ECU documents it runs (ADR-318);
    the agent's runtime, its variant identification and its locking (8.8) do not change.
 6. **Supply formats.** The proprietary CSV format gets a vehicle definition directory, one
    per vehicle definition, with fixed tables for the identification values, the matching
@@ -84,7 +84,7 @@ ODX subset (8.3) neither includes nor excludes it.
    definitions (ADR-298); its tables are specified with their implementation. The ODX
    frontend converts the vehicle information specification's information components and
    their matching components that refer to diagnostic services (a reference to a multiple-ECU
-   job is refused at ingestion, as such jobs are, design 8.3), and the logical links and ECU
+   job, ISO 22901-1 (2008) 7.3.11, is refused at ingestion, as such jobs are, design 8.3), and the logical links and ECU
    groups of each vehicle information as entries; connectors and pins are not kept beyond what
    item 4 folds into ECU definitions.
 
@@ -99,8 +99,8 @@ ODX subset (8.3) neither includes nor excludes it.
   and the declared fields; it uses the agent's existing reads, and the server decides.
 - Item 4 duplicates an ECU definition for every distinct way it is reached. If that becomes a
   burden, per-entry link parameters can be added in a later ADR without changing items 1 to 3.
-- ADR-325's targets keep binding to ECU definitions; a procedure written per vehicle (a
-  vehicle-wide DTC scan over every fitted entry, or targets resolved by role name through the
+- Procedures keep naming the ECU definitions they address; a procedure written per vehicle (a
+  vehicle-wide DTC scan over every fitted entry, or ECUs resolved by role name through the
   topology) is a later decision.
 - Follow-up work (the CSV format and conversion, server identification and use, the ODX
   conversion) is in the backlog.

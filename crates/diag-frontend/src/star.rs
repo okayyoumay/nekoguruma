@@ -243,7 +243,13 @@ pub enum Annotation {
         expected_millis: Option<u32>,
     },
     /// `@idempotency value`, attached to the statement that follows (4.6).
-    Idempotency { line: u32, value: Idempotency },
+    Idempotency {
+        line: u32,
+        /// The byte offset where that statement begins: of the statements that share its line,
+        /// only the first is annotated.
+        statement_at: u32,
+        value: Idempotency,
+    },
 }
 
 /// A procedure that passed the checks: its AST and annotations, for the lowering. The AST nests
@@ -1798,9 +1804,17 @@ impl Checker<'_> {
         };
         let mut statements = Vec::new();
         collect_statements(module.statement(), &mut statements);
-        let statement_lines: Vec<(u32, bool)> = statements
+        // Each statement's line, whether it is a `for`, and the byte offset it begins at, which
+        // tells apart the statements that share a line (`a; b`).
+        let statement_lines: Vec<(u32, bool, u32)> = statements
             .iter()
-            .map(|stmt| (line_of(stmt.span), matches!(stmt.node, StmtP::For(_))))
+            .map(|stmt| {
+                (
+                    line_of(stmt.span),
+                    matches!(stmt.node, StmtP::For(_)),
+                    stmt.span.begin().get(),
+                )
+            })
             .collect();
         // A top-level `def` holds the lines after its own up to the next top-level statement, and
         // of those the comments indented further than `def`: a comment after the last statement
@@ -1828,11 +1842,11 @@ impl Checker<'_> {
         };
         // The statement after `line`, if it is in the function `def`.
         let next_statement = |def: (u32, u32), line: u32| {
-            let at = statement_lines.partition_point(|(begin, _)| *begin <= line);
+            let at = statement_lines.partition_point(|(begin, ..)| *begin <= line);
             statement_lines
                 .get(at)
                 .copied()
-                .filter(|(at, _)| def.0 < *at && *at <= def.1)
+                .filter(|(at, ..)| def.0 < *at && *at <= def.1)
         };
         // The top-level `def`s by line, with their names.
         let top_defs: Vec<(u32, String)> = top
@@ -1895,7 +1909,7 @@ impl Checker<'_> {
                         continue;
                     };
                     let target = enclosing(line, column).and_then(|def| next_statement(def, line));
-                    let Some((for_line, true)) = target else {
+                    let Some((for_line, true, _)) = target else {
                         bad(
                             self,
                             "`@maxIterations` must precede a `for` statement in the same function \
@@ -1925,15 +1939,19 @@ impl Checker<'_> {
                         }
                     };
                     let target = enclosing(line, column).and_then(|def| next_statement(def, line));
-                    if target.is_none() {
+                    let Some((_, _, statement_at)) = target else {
                         bad(
                             self,
                             "`@idempotency` must precede a statement in the same function (4.6)"
                                 .to_owned(),
                         );
                         continue;
-                    }
-                    annotations.push(Annotation::Idempotency { line, value });
+                    };
+                    annotations.push(Annotation::Idempotency {
+                        line,
+                        statement_at,
+                        value,
+                    });
                 }
                 "section" => {
                     let kind = match args.first() {

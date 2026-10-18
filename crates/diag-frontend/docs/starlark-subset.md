@@ -571,8 +571,8 @@ authentication time (8.10.1) each time the function is called.
   pieces between, which cover no primitive, carry `CheckState`, meaning "not stated", which the
   job runner judges as code outside every section (ADR-329, ADR-332). Every piece carries the
   section function's interruptibility and expected duration, so a copy's pieces are contiguous,
-  and a section is entered only by the section function's call. Until `@idempotency` is lowered,
-  each copy is one `CheckState` range. Without `expected=`, the expected duration is 0.
+  and a section is entered only by the section function's call. Without `expected=`, the expected
+  duration is 0.
 - **No nesting.** A call to a section function from anything that runs inside a section,
   directly or through other functions or function arguments, is rejected at that call
   (`STAR_BAD_ANNOTATION`). A call to a section function from outside every section, as many
@@ -618,8 +618,6 @@ exactly one (ADR-332).
 - **No silent annotation.** A statement that lowers to no diagnostic primitive cannot be
   annotated (`STAR_BAD_ANNOTATION`), so an annotation never does nothing.
 - **Copies.** A specialized copy (2.6, 4.5) carries its original's annotations.
-
-`@idempotency` is not lowered yet (`STAR_NOT_LOWERABLE`).
 
 ### 4.7 Source Maps
 
@@ -744,9 +742,19 @@ names them at the end of its hint (`(in variant V1)`, `(in variants V1, V2)`).
 - Sections (4.5) are lowered as copies keyed by the function and the section function whose call
   they run in, or none outside every section: starting from the entry's call to `main`, a call to
   a section function reaches that function's section copy, and any other call stays in the
-  caller's section. Each section copy's range becomes a `Section` with the section function's
-  attributes, and every section copy counts toward the budget of 2.6, in copies and in
+  caller's section. Every section copy counts toward the budget of 2.6, in copies and in
   instructions, before it is made
+- Idempotency (4.6) is a tag on each diagnostic primitive instruction, set where the `diag` call
+  is lowered: the value of the innermost `@idempotency` statement being lowered, else the default
+  of the Starlark call. The tag stays with the instruction in the function's code, so each copy
+  carries it. The annotation is attached to its statement by the byte offset where that statement
+  begins, which tells apart the statements that share a line, and is in force while that statement
+  is lowered, nested statements included, but not while a called function is. Assembly cuts each
+  section copy's range around its primitives: a primitive gets a `Section` over its instruction
+  alone, the pieces between get `CheckState`, and all take the section function's interruptibility
+  and expected duration (`Yes` and 0 outside every section) (ADR-332). A statement is lowered
+  also when its branch can never run, and that counts as lowering its primitives. An annotated
+  statement that lowers to none is `STAR_BAD_ANNOTATION`
 - The check of 2.3 sees the syntax only. A computed key, or a slice, is found on the expressions known to be
   dicts without type inference: dict literals, the responses of `diag.request`, `diag.routine`
   and `diag.read_dtc` (3.4), a response's `"fields"` (not the values in it, nor another dict's

@@ -2050,6 +2050,97 @@ def main():
         assert_eq!(host.waits, 3);
     }
 
+    #[test]
+    fn a_lowered_uninterruptible_section_holds_a_cancel_at_its_primitives() {
+        // Each primitive of the section's copy has a section of its own (ADR-332); it keeps the
+        // function's interruptibility, so a cancel that arrives at the first one waits until the
+        // function returns, while the primitive outside every section is a point it stops at.
+        let source = "\
+# @section uninterruptible expected=100
+def write():
+    diag.log(1, \"cancel\")
+    x = 1
+    diag.log(1, \"second\")
+    diag.log(1, \"third\")
+
+def main():
+    diag.log(1, \"before\")
+    write()
+    diag.log(1, \"after\")
+";
+        let program = lowered(source);
+        let held = cancel_held_at(&program);
+        let section = |pc: usize| {
+            program
+                .sections
+                .iter()
+                .filter(|s| (s.start_pc as usize..s.end_pc as usize).contains(&pc))
+                .collect::<Vec<_>>()
+        };
+        let mut inside = 0;
+        for (pc, op) in program.code.iter().enumerate() {
+            if !op.is_diagnostic_primitive() {
+                continue;
+            }
+            let [section] = section(pc)[..] else {
+                panic!("one section over the primitive at {pc}");
+            };
+            assert_eq!(
+                held[pc],
+                !matches!(section.interruptible, Interruptible::Yes)
+            );
+            inside += usize::from(held[pc]);
+        }
+        assert_eq!(inside, 3);
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut host = FakeHost {
+            cancel_on_log: Some(("cancel", Arc::clone(&flag))),
+            ..FakeHost::default()
+        };
+        let result = run_plain(&program, &mut host, JobLimits::default(), &flag);
+        assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
+        assert_eq!(host.logs, ["before", "cancel", "second", "third"]);
+    }
+
+    #[test]
+    fn a_lowered_recovery_required_section_records_one_intent_per_pass() {
+        // The copy of `write` is cut into a section for each of its three primitives and the
+        // pieces between them, all `RecoveryRequired`, so each call is one pass through the
+        // section: one intent, ahead of its first primitive (ADR-291, ADR-332).
+        let source = "\
+# @section recoveryRequired
+def write():
+    diag.log(1, \"a\")
+    x = 1
+    diag.log(1, \"b\")
+    diag.log(1, \"c\")
+
+def main():
+    write()
+    write()
+";
+        let program = lowered(source);
+        assert!(program.sections.len() >= 5, "{:?}", program.sections);
+        let run = |program: &Program| {
+            let commits = Rc::new(Cell::new(0));
+            let mut host = FakeHost::default();
+            let mut journal = counting_journal(&commits, None);
+            run_on(
+                program,
+                &mut host,
+                JobLimits::default(),
+                &AtomicBool::new(false),
+                Some(&mut journal),
+            )
+            .unwrap();
+            assert_eq!(host.logs, ["a", "b", "c", "a", "b", "c"]);
+            commits.get()
+        };
+        let mut plain = program.clone();
+        plain.sections.clear();
+        assert_eq!(run(&program), run(&plain) + 2);
+    }
+
     // ------------------------------------------------------------ journaling (ADR-252)
 
     /// Counts the journal's commits in a cell the host reads, and fails the commit numbered

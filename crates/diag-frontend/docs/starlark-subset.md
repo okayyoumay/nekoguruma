@@ -565,9 +565,14 @@ authentication time (8.10.1) each time the function is called.
   reaches and covers that copy with the same attributes; a function also called outside the
   section keeps its own copy there. These copies count toward the specialization budget of 2.6,
   in copies and in instructions: the call that would pass it is `STAR_SPECIALIZATION_LIMIT`.
-- **Idempotency.** A section says nothing about whether its steps may be repeated: each `Section`
-  it lowers to is `CheckState`, which the job runner judges as code outside every section, until
-  `@idempotency` (4.6) is lowered (ADR-329). Without `expected=`, the expected duration is 0.
+- **Idempotency.** A section says nothing about whether its steps may be repeated: that is an
+  attribute of each `diag` call (4.6). The lowering cuts each covered copy's range around its
+  diagnostic primitives. A primitive's one-instruction range carries the call's idempotency. The
+  pieces between, which cover no primitive, carry `CheckState`, meaning "not stated", which the
+  job runner judges as code outside every section (ADR-329, ADR-332). Every piece carries the
+  section function's interruptibility and expected duration, so a copy's pieces are contiguous,
+  and a section is entered only by the section function's call. Until `@idempotency` is lowered,
+  each copy is one `CheckState` range. Without `expected=`, the expected duration is 0.
 - **No nesting.** A call to a section function from anything that runs inside a section,
   directly or through other functions or function arguments, is rejected at that call
   (`STAR_BAD_ANNOTATION`). A call to a section function from outside every section, as many
@@ -595,6 +600,26 @@ used:
     # @idempotency unsafe
     diag.routine(0xFF00, 0x01, {})
 ```
+
+Every `diag` call that lowers to a diagnostic primitive carries an idempotency: the annotation's,
+or the default above. `request`'s default follows its service identifier, which is a constant
+(3.1). The lowering emits one `Section` over the primitive instruction alone, `pc..pc + 1`, not
+over the instructions that set up its operands. Outside every section it is `interruptible: yes`
+with an expected duration of 0. Inside a section function it carries that function's
+interruptibility and expected duration, and the function's range is cut around it (4.5). In a
+lowered program the sections therefore never overlap, and each diagnostic primitive is covered by
+exactly one (ADR-332).
+
+- **Extent.** An annotation applies to every diagnostic primitive its statement lowers to,
+  including those of the nested statements of an `if` or a `for`. An annotation on a
+  nested statement takes precedence there. It does not reach:
+  - the functions the statement calls, which keep their own annotations and defaults;
+  - a nested `def` or lambda, which is a function of its own (2.6).
+- **No silent annotation.** A statement that lowers to no diagnostic primitive cannot be
+  annotated (`STAR_BAD_ANNOTATION`), so an annotation never does nothing.
+- **Copies.** A specialized copy (2.6, 4.5) carries its original's annotations.
+
+`@idempotency` is not lowered yet (`STAR_NOT_LOWERABLE`).
 
 ### 4.7 Source Maps
 

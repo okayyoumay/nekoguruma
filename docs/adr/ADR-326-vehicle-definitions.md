@@ -61,8 +61,11 @@ ODX subset (8.3) neither includes nor excludes it.
    in the definition (`engine`, `gateway`), the ECU definitions that may fill it, in order, and
    whether the entry is optional. An entry with several definitions is a group of alternatives
    (ODX's ECU group): the fitted one is the first whose variant identification (8.9.1) selects a
-   variant; when none does, a mandatory entry is reported as not answering and an optional one
-   as not fitted. An entry may name the entry of the gateway it is reached through; the gateway
+   variant. When none does, the entry's state says why: if an ECU answered an identification
+   request but no variant matched, the entry is reported as an unrecognized variant (the same
+   case as the `VARIANT_MISMATCH` failure), so an installed but unsupported ECU is never hidden
+   as absent; only when no identification request was answered is a mandatory entry reported as
+   not answering and an optional one as not fitted. An entry may name the entry of the gateway it is reached through; the gateway
    relation is acyclic and every gateway named is an entry of the same definition.
 4. **Link parameters stay with the ECU definition.** How an ECU is reached (protocol, pins,
    identifiers, baud rate, ComParams) is its definition's declared protocol (ADR-324); a vehicle
@@ -76,7 +79,13 @@ ODX subset (8.3) neither includes nor excludes it.
    vehicle model to the manifests of the ECU definitions its definitions refer to, and resolves
    the model and OEM scopes of roles and record templates against the identification values:
    `models` names vehicle-model values and `oem` OEM values, so one scope covers every
-   definition of that model. A job still carries the ECU documents it runs (ADR-318);
+   definition of that model. Only values established from the vehicle (a VIN matching rule on
+   the VIN the job is bound to, or a field read from its ECUs) count for a role's scope: a
+   scoped role authorizes a job only when every candidate those values leave is inside its
+   scope, so an operator's entry or choice among candidates can narrow the selection but never
+   widen what a role permits (design 6.8); a vehicle no such value identifies needs a role with
+   no model or OEM scope. Record templates, which grant nothing, may use the selected
+   definition whichever way it was chosen. A job still carries the ECU documents it runs (ADR-318);
    the agent's runtime, its variant identification and its locking (8.8) do not change.
 6. **Supply formats.** The proprietary CSV format gets a vehicle definition directory, one
    per vehicle definition, with fixed tables for the identification values, the matching

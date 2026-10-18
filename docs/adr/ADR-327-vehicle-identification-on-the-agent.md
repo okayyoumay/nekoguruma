@@ -65,7 +65,9 @@ maintainer chose to run the loop on the agent.
    declare one), the agent sends one presence request functionally (for UDS, TesterPresent with a
    response requested) and records each physical response identifier that answered. Unlike the
    single final response of ADR-235 item 3, this request collects every answer that arrives
-   within the response window on any response identifier of that bus the VCI lets it receive.
+   within the response window on any response identifier of that bus the VCI lets it receive;
+   the window is no shorter than the longest P2 time (ADR-235 item 4) that the declared links on
+   that bus and functional identifier give.
    An endpoint is a physical address: the bus (the link's resource as the agent resolves it,
    ADR-319: protocol, bus type and pins, with its baud rate, so two spellings of one stack that
    ADR-324 item 2 accepts name the same bus) and the physical request and response identifiers; definitions whose links differ only in timing or other
@@ -168,16 +170,17 @@ maintainer chose to run the loop on the agent.
    whose rule gives only the position range and expected text): a service and the field that
    carries the VIN, as the variant document that declares them defines them (service and field
    identifiers are local to a document, ADR-318), read over that variant's link. When a
-   candidate declares a VIN matching rule, the VIN is read after the presence requests and before
-   any ECU definition's read: the distinct services and links the candidates' sources name are
+   candidate declares a VIN matching rule, or the plan holds a definition chosen by hand that
+   declares one (item 8), the VIN is read after the presence requests and before
+   any ECU definition's read: the distinct services and links those rules' sources name are
    read in turn, in a fixed order, until one establishes a VIN. One response is decoded with the
    declaration of every source on that service and link (two sources whose declarations differ
    are distinct), and it establishes a VIN only when every one of those declarations decodes
    it to the same well-formed VIN (ADR-261 item 3); if any of them fails to decode it, or decodes
    it to something else, the response establishes none, since a response decoded with another ECU's
    layout can look like a VIN, and the next service and link is read. When none establishes one, every VIN rule stays
-   unevaluated. When no candidate declares a VIN matching rule, identification
-   reads no VIN (the data author's choice).
+   unevaluated. When neither a candidate nor a definition chosen by hand declares a VIN matching
+   rule, identification reads no VIN (the data author's choice).
 6. **The agent reports facts; the server decides.** The job reports the VIN when read, the
    presence answers, each read's decoded identification fields and matching variants, each
    rule field's established value or that it stayed unevaluated, the
@@ -227,9 +230,11 @@ maintainer chose to run the loop on the agent.
    target's own link (ADR-325 item 8), sending only the read-only identification requests item 1
    allows. Each of those requests goes to the target's request identifier, and every ECU that
    listens there receives it, as it would receive the job's changes, so each one, like item 2's
-   presence request, collects every answer that arrives within the response window on each
-   response identifier that a listed variant's declared link pairs with the target's request
-   identifier, not only on the target's own (amending ADR-235 item 3 for these requests, as item 2
+   presence request, collects every answer that arrives on each response identifier that a
+   listed variant's declared link pairs with the target's request identifier, not only on the
+   target's own, for a response window no shorter than the longest P2 time (the time an ECU has
+   to start its answer, ADR-235 item 4) that the target's link or any of those declared links
+   gives, so a slower ECU's first frame is not missed because the target answered first (amending ADR-235 item 3 for these requests, as item 2
    does for presence); any frame there counts, whether or not a
    multi-frame response would complete. An answer on any of them other than the target's own
    shows a second ECU that would receive the job's changes and refuses the job, and a job whose

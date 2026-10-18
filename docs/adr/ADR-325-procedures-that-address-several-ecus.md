@@ -44,12 +44,14 @@ shape survives inside the second as the access program of item 5.
 1. **A procedure names its targets.** A procedure declares the ECUs it addresses as targets,
    each a role name the procedure chooses (`gateway`, `engine`) bound to an ECU definition that
    the conversion finds in the same package by the definition's identifier. The ECU of the
-   definition the procedure belongs to is the primary target, which a procedure that declares
-   no other target addresses alone, as before. A target is reached physically, by the
-   addressing of its definition's protocol. Targets addressed functionally (one request that
-   several ECUs answer) are not part of this decision; they are decided with the functional
-   requests of the generic OBD package, and the target model leaves room for them. The
-   conversion refuses more than eight targets per procedure.
+   definition the procedure belongs to is the primary target, which a procedure that declares no
+   other target addresses alone, as before. A target is reached physically, by the addressing of
+   its definition's protocol. Targets addressed functionally (one request that several ECUs
+   answer) are not part of this decision; they are decided with the functional requests of the
+   generic OBD package, and the target model leaves room for them. The conversion refuses more
+   than eight targets per procedure, and two roles bound to the same definition (the primary's
+   included), since `SelectTarget` would then switch between names of one ECU and a step meant
+   for one target would reach the other.
 2. **Starlark addresses a target through a handle.** `diag.ecu(role)` returns the handle of a
    declared target; the role must be a constant, so every handle is known at conversion. The
    diagnostic calls are available on the handle (`gw.security_access(level)`,
@@ -220,12 +222,15 @@ shape survives inside the second as the access program of item 5.
    link to each target, all on the job's VCI, under the job's per-VCI lock and, for a writing
    job, the reprogramming slot (8.8, ADR-257); the per-vehicle lock is still taken when the VIN
    first matches. Targets on buses the VCI cannot open at the same time are refused before
-   anything is sent. Since the link is opened before the variant is identified, the conversion
-   and `check_job` refuse a target whose candidate variants differ in the link settings
-   (protocol, identifiers, addressing, bus parameters); probing a variant over its own link is
-   not part of this decision. Each target's link is the one its variants declare (ADR-324); on
-   an access target a declared tester-present ComParam is refused, since the agent sends
-   TesterPresent itself there and a second sender would make answers unattributable (item 11).
+   anything is sent, and so are two targets whose links share a request or response identifier
+   on the same bus, since their traffic would reach, or be answered by, the same ECU whichever
+   target is current; the conversion refuses the same over the candidate variants' declared
+   links. Since the link is opened before the variant is identified, the conversion and
+   `check_job` refuse a target whose candidate variants differ in the link settings (protocol,
+   identifiers, addressing, bus parameters); probing a variant over its own link is not part of
+   this decision. Each target's link is the one its variants declare (ADR-324); on an access
+   target a declared tester-present ComParam is refused, since the agent sends TesterPresent
+   itself there and a second sender would make answers unattributable (item 11).
 9. **At most one target is reprogrammed.** A job's flash sessions and recovery plans all belong
    to one target, the reprogramming target, whose identity the journal records and the restart
    checks (ADR-229). Other targets may receive any request the job's policy allows (security

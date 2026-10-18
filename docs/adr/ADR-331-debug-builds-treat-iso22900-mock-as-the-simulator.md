@@ -38,8 +38,7 @@ simulator.
    Prefixes are not enough, and case and spacing must match. `iso22900-service` copies the
    library's version data into these fields unchanged.
 3. **One worker only.** `j2534-0404-service` cannot report the mock's API name, because it always
-   sets that field to `J2534`. So the mock's identity holds only through the D-PDU worker, just as
-   `sim-vci`'s holds only through the J2534 worker.
+   sets that field to `J2534`. So the mock's identity holds only through the D-PDU worker.
 
 ## Consequences
 
@@ -50,6 +49,11 @@ simulator.
   simulator in a debug build. As in ADR-247, the library would have to mislead deliberately:
   the names belong to this repository's mock, and debug builds are developer builds. Release
   builds are not affected.
+- The same holds for `sim-vci`'s names, which ADR-247 did not record: the vendor and API names
+  that ADR-247 item 2 takes as proof that `j2534-0404-service` answered are copied from the
+  library by `iso22900-service`. A D-PDU library that reported `j2534-0404`, `J2534` and
+  `sim-vci`'s prefixes would earn the simulator permission through the D-PDU worker. Only a
+  deliberately misleading library does that, so the risk is the one above.
 - Without a configured `sim-ecu`, the mock answers each ComPrimitive with a result item that
   carries no data (ADR-299). A write job then reaches no ECU at all.
 - Matching exactly, rather than by prefix as ADR-247 does for `sim-vci`, means a change to the

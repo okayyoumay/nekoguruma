@@ -68,9 +68,10 @@ const ISO22900_MOCK_VERSION: [&str; 4] = [
 /// The permission for the VCI a worker reports (ADR-247, ADR-331): the simulator one only for
 /// the two simulated VCIs. The first is `sim-vci` through `j2534-0404-service`: its firmware and
 /// DLL names (`hw_name` carries the firmware version string, `fw_name` the DLL version string),
-/// and that service itself answered (it sets `vendor_name` and `pdu_api_sw_name` to constants).
-/// The last two matter because another worker, `iso22900-service`, fills `hw_name` and `fw_name`
-/// from other sources, so the meaning of those two fields holds only for the J2534 worker. The
+/// and the constant `vendor_name` and `pdu_api_sw_name` that service sets. The last two matter
+/// because another worker, `iso22900-service`, fills `hw_name` and `fw_name` from other sources,
+/// so the meaning of those two fields holds only for the J2534 worker; they rule out an honest
+/// D-PDU library, though `iso22900-service` copies a library's own names (ADR-331). The
 /// second is `iso22900-mock` through `iso22900-service`, which reports exactly the mock's four
 /// names; `j2534-0404-service` cannot report them, since its API name is always `J2534`.
 /// Anything else, including a vendor interface, is read-only. Debug builds only: a release build

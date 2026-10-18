@@ -64,12 +64,13 @@ maintainer chose to run the loop on the agent.
    and the operator chooses, as for variants in item 7, amending ADR-326 item 3's first match), or an identification value whose matching rule (a VIN position
    range, or a read field) gives a value outside the candidate's. A read is conclusive when every
    identification request of the definition got either a positive response that decodes or a
-   negative response saying the ECU does not support the service or the identifier (for UDS,
-   serviceNotSupported, subFunctionNotSupported or requestOutOfRange, ISO 14229-1 annex A), since
-   only those prove that the ECU cannot report what a pattern expects. A conclusive read whose
+   negative response that the ECU definition declares, for that request, as proof that the ECU
+   cannot report what its patterns expect. No negative response proves that by default: the
+   same code (requestOutOfRange, for example) can mean an identifier the ECU lacks or one that
+   is unavailable in the current session or state, so only the ECU definition's author can say
+   which codes are definitive for that ECU. A conclusive read whose
    variants all fail to match rules out only that definition; a read with no variant matching
-   in which some request got no answer or another negative response (busy, conditions not
-   correct, access denied) is inconclusive and rules out nothing, since ADR-315 counts those
+   in which some request got no answer or an undeclared negative response is inconclusive and rules out nothing, since ADR-315 counts those
    entries as failed; the
    others sharing the endpoint stay possible, and the endpoint becomes an unrecognized variant
    (ADR-326 item 3) only when every definition using it has been read without a match. A
@@ -126,8 +127,8 @@ maintainer chose to run the loop on the agent.
    runs variant identification over all of them, and the job is refused unless exactly one
    variant of one definition matches, it is the job's own, and the read of every carried definition
    was conclusive in item 3's sense, the job's own definition's other variants included (no
-   answer, or a negative response other than one saying the service or identifier is not
-   supported, leaves a variant unexcluded, which makes the check inconclusive and refuses the
+   answer, or a negative response the ECU definition does not declare definitive, leaves a
+   variant unexcluded, which makes the check inconclusive and refuses the
    write, unlike ADR-315's selection, which treats it as no match). This holds whatever the operator picked,
    so an operator's choice never decides a write's target.
 8. **Manual paths.** The operator can choose a vehicle definition by hand (an unregistered or

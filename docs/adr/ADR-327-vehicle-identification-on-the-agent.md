@@ -98,11 +98,12 @@ maintainer chose to run the loop on the agent.
    evidence than a presence answer, since an unlisted device at an address the candidate does
    not use drops nothing), or an identification value whose matching
    rule (a VIN position range, or a read field) gives a value outside the candidate's. An
-   identified variant counts against candidates only once every other definition that uses the
-   same endpoint and is still named by a remaining candidate has been read conclusively on that
-   endpoint, since an ECU can match the patterns of two alternative definitions; a sibling that
-   is out of reach or inconclusive (item 5) has not been ruled out, so the candidates that need
-   it stay and, if more than one candidate is left at the end, the operator chooses.
+   identified variant counts against a candidate only once every definition that the
+   candidate's entries list at that endpoint has been read there conclusively without a match,
+   since an ECU can match the patterns of two alternative definitions: a candidate whose own
+   definition at that endpoint also matched is not contradicted, and one whose own definition
+   is out of reach or inconclusive there (item 5) has not been ruled out, so it stays and, if
+   more than one candidate is left at the end, the operator chooses.
    Conclusiveness is judged per definition and endpoint, over the variants whose declared links
    are on that endpoint: a read there is conclusive when every identification request of those
    variants got either a positive response that decodes or a negative response that the ECU

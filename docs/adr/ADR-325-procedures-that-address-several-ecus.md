@@ -308,21 +308,22 @@ shape survives inside the second as the access program of item 5.
     during a receive phase, a job with access targets on it loses the gateway on any exchange
     behind it longer than the session timeout less one period. The same mechanism can keep a
     single target's own session alive, which is decided separately.
-12. **A lost access target ends the job by the section rules.** A session probe (item 11) whose
-    answer reports another session than the one the access program's last positive
-    session-control response confirmed, or is negative, counts the target lost at once, since a
-    server starts in its default session (ISO 14229-1 (2026) 9.2.1) and a reset or a session
-    timeout there drops the unlock with it, while TesterPresent and reads would still be
-    answered. Otherwise the agent counts as an access target's good answer only a final
-    response, positive or negative (a response pending is none; the worker waits it out), to a
-    request the agent itself sent on that target's link, a probe of item 11 or one of the VM's;
-    the first final response of the target's access program is the first good answer, so the
-    target has a loss clock from then on, its access program's own waits included, and a loss
-    counted before that program ends ends the job as a failing step of it does (item 5); without
-    that clock a gateway that relocked during a wait inside its access program would go unseen,
-    since a TesterPresent is answered in the default session too. The agent keeps, for that
-    link, the send times of the requests that may still be owed an answer, each read from its
-    own monotonic clock before the send call: every request it sends, probes and the VM's alike,
+12. **A lost access target ends the job by the section rules.** A session probe (item 11) counts
+    the target lost at once unless its answer is positive and decodes to exactly the session the
+    access program's last positive session-control response confirmed (a negative answer,
+    another session, or a missing or malformed session value all count), since a server starts
+    in its default session (ISO 14229-1 (2026) 9.2.1) and a reset or a session timeout there
+    drops the unlock with it, while TesterPresent and reads would still be answered. Otherwise
+    the agent counts as an access target's good answer only a final response, positive or
+    negative (a response pending is none; the worker waits it out), to a request the agent
+    itself sent on that target's link, a probe of item 11 or one of the VM's; the first final
+    response of the target's access program is the first good answer, so the target has a loss
+    clock from then on, its access program's own waits included, and a loss counted before that
+    program ends ends the job as a failing step of it does (item 5); without that clock a
+    gateway that relocked during a wait inside its access program would go unseen, since a
+    TesterPresent is answered in the default session too. The agent keeps, for that link, the
+    send times of the requests that may still be owed an answer, each read from its own
+    monotonic clock before the send call: every request it sends, probes and the VM's alike,
     joins them, and every final response it sees removes the oldest one and is dated by it, so a
     request that ended without a final response the agent saw (cancelled, timed out, failed to
     send or lost from the event stream) stays among them. The ECU answers each request at most

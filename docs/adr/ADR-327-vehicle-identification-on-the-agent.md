@@ -170,7 +170,13 @@ maintainer chose to run the loop on the agent.
    variant unexcluded, which makes the check inconclusive and refuses the
    write, unlike ADR-315's selection, which treats it as no match). The check sends only the
    read-only identification requests item 1 allows. This holds whatever the operator picked,
-   so an operator's choice never decides a write's target.
+   so an operator's choice never decides a write's target. The check guards a job's first run:
+   the agent journals that it passed before the first request that changes the ECU, and a
+   restart of an interrupted job whose journal records it (ADR-229 item 2) does not repeat it,
+   since an erased application may no longer answer the identification requests; the restart
+   identifies the ECU by the journaled VIN and hardware part number under ADR-229 item 2's rules
+   instead. A restart whose journal does not record a passed check has changed nothing yet and
+   runs the check again.
 8. **Manual paths.** The operator can choose a vehicle definition by hand (an unregistered or
    misidentified vehicle), and the plan then holds that definition's entries and the ECU
    definitions they name, without candidates, so a fact that contradicts the chosen definition

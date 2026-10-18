@@ -1,7 +1,7 @@
 # ADR-324: A Document Job's Link Comes from Its Declared Protocol
 
 **Date:** 2026-10-17
-**Status:** Accepted
+**Status:** Accepted (item 1's one link per job extended to one link per target by ADR-325 item 8)
 **Affects:** `agent` (`src/link.rs`: `LinkConfig::declared`, `LinkConfig::params`,
 `set_up_link`; `src/runner.rs`: `Job::declared_link` and the runner's entry points; `src/main.rs`: `--tx-id` / `--rx-id`),
 `j2534-0404-service` (`tests/agent_end_to_end.rs`), `crates/agent/docs/ngr-agent.md`,

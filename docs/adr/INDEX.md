@@ -313,7 +313,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-321](ADR-321-the-generic-send-receive-instruction.md) | The Generic Send-Receive Instruction | Accepted (item 5 and the Consequences on the agent superseded by ADR-322) | `diag-ir` `Op::SendReceive`, `DiagHost::send_receive`, `check_declarations`, `Protocol.application_layer` and `negative_shape`; `agent` policy refusal; design 8.2.4; ADR-233, ADR-309, ADR-316 |
 | [ADR-322](ADR-322-the-agent-serves-the-generic-send-receive.md) | The Agent Serves the Generic Send-Receive | Accepted | `agent` `send_receive`, `WorkerHost::send_receive`, `policy::check_program` and `writes`, `check_job`, `Job::writes`; design 8.2.4; ADR-235, ADR-245, ADR-250, ADR-257, ADR-309, ADR-321 |
 | [ADR-323](ADR-323-dtc-records-are-read-from-the-response-bytes.md) | DTC Records Are Read from the Response Bytes | Accepted | `diag-frontend` Starlark lowering of `dtcs` (`len`, indexing, `code` and `status`), Starlark subset 3.4; ADR-233, ADR-314, ADR-316 |
-| [ADR-324](ADR-324-a-document-jobs-link-comes-from-its-declared-protocol.md) | A Document Job's Link Comes from Its Declared Protocol | Accepted | `agent` link (`LinkConfig::declared`, declared ComParams), `Job::declared_link`, `ngr-agent run`; design 8.2.4; ADR-235 item 4, ADR-309, ADR-319 |
+| [ADR-324](ADR-324-a-document-jobs-link-comes-from-its-declared-protocol.md) | A Document Job's Link Comes from Its Declared Protocol | Accepted (item 1's one link per job extended to one link per target by ADR-325 item 8) | `agent` link (`LinkConfig::declared`, declared ComParams), `Job::declared_link`, `ngr-agent run`; design 8.2.4; ADR-235 item 4, ADR-309, ADR-319 |
 | [ADR-325](ADR-325-procedures-that-address-several-ecus.md) | Procedures That Address Several ECUs | Accepted | `diag-ir` targets and `SelectTarget`, `diag-frontend` `diag.ecu` and lowering per combination of variants, `agent` one link and document per target, access programs, keep-alive, policy access class, design 8.2.4, 8.2.5, 8.2.6, 8.10; ADR-229, ADR-235, ADR-245, ADR-247, ADR-257, ADR-264, ADR-280, ADR-293, ADR-307, ADR-311, ADR-316, ADR-318, ADR-324 |
 
 ## Status Legend
@@ -738,7 +738,7 @@ the predecessor repository these ADRs came from.
 - ADR-321 (item 5 and the Consequences on the agent superseded by ADR-322)
 - ADR-322
 - ADR-323
-- ADR-324
+- ADR-324 (item 1's one link per job extended to one link per target by ADR-325 item 8)
 - ADR-325
 
 ### Acquired Data & Monitoring

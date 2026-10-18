@@ -147,43 +147,47 @@ shape survives inside the second as the access program of item 5.
    lower for every combination; the scoping of a procedure to some variants that ADR-311 item 2
    leaves open applies to targets as well. Each combination's program goes in its own document
    for the primary variant (amending ADR-307 item 1's one document per variant and procedure),
-   which names, for every target, the primary included, the content hash (design 8.2.6) of that
-   variant's declaration-only document, and, for every target, the hashes of the
-   declaration-only documents of all of its candidate variants, the same list in every
-   combination of the procedure; the conversion emits a declaration-only document for every
-   variant of every target of a procedure, the primary's included. The document's digest covers
-   every definition its program was lowered against (amending ADR-307 item 5). The conversion
-   refuses a procedure whose combinations exceed a bound set with the implementation, so the
-   package cannot grow without limit.
+   which names the procedure it was lowered from (its definition and file, ADR-307 item 3) and,
+   for every target, the primary included, the content hash (design 8.2.6) of that variant's
+   declaration-only document, and, for every target, the hashes of the declaration-only
+   documents of all of its candidate variants, the same list in every combination of the
+   procedure; the conversion emits a declaration-only document for every variant of every target
+   of a procedure, the primary's included. The document's digest covers every definition its
+   program was lowered against (amending ADR-307 item 5). The conversion refuses a procedure
+   whose combinations exceed a bound set with the implementation, so the package cannot grow
+   without limit.
 7. **A job holds the documents of every combination it may meet.** Since the variants behind an
    access target are known only after its access program has run, a job names, by content hash,
    its access programs, the declaration-only documents of every candidate variant of every
    target, and every combination's document (amending ADR-318 item 1), and the agent holds all
    of them before anything is sent; the bound of item 6 keeps their number finite. Each access
-   program names its access target and the hash of the declaration-only document of the variant
-   it was lowered for, and the agent runs the one whose variant it has just identified;
-   `check_job` refuses an access program whose named target is not an access target or whose
-   hash names no document the job holds, and a job that lacks one, or holds more than one, for
-   any candidate variant of an access target. `check_job` validates all of them then: it also
-   refuses a combination document whose named hashes do not match the documents the job holds,
-   combination documents that name different candidate lists, a job whose declaration-only
-   documents are not exactly the documents of that list, and a set of combination documents that
-   lacks one, or holds more than one, for any tuple of one candidate variant per target of that
-   list; the list is signed with the combination documents, so a job cannot leave out a variant
-   together with every combination that contains it, so the variants identified always pick
-   exactly one program; it checks each combination's decodes against its targets' declarations,
-   refuses flash plans on more than one target, and refuses an access program with any service
-   item 5 does not allow; it checks each access program's decodes and services against the
-   declarations of the declaration-only document that program names, as it checks a
-   combination's, so an access program that would fail while decoding is refused before it
-   changes the gateway's session or security state. The agent identifies each target's variant
-   as the primary's is identified (8.9.1, ADR-315), through those declaration-only documents,
-   and the combination its variants pick is the program that runs. Whether the job writes, which
-   policy class applies and whether it takes the reprogramming slot are fixed before anything is
-   sent from every combination the job holds: the job is a writing job when any of them writes,
-   takes the reprogramming slot when any of them writes (ADR-257; an access program's services
-   alone do not count, item 10), and is held to the policy class that covers all of them, so the
-   chosen combination never needs a guard the job lacks. A job keeps a journal when any of its
+   program names its procedure, as a combination document does, its access target and the hash
+   of the declaration-only document of the variant it was lowered for, and the agent runs the
+   one whose variant it has just identified; `check_job` refuses an access program whose named
+   target is not an access target or whose hash names no document the job holds, and a job that
+   lacks one, or holds more than one, for any candidate variant of an access target. `check_job`
+   validates all of them then: it refuses a job whose combination documents and access programs
+   do not all name one procedure, since otherwise the variants identified could pick a program
+   of another procedure that has the same targets and candidates, and it also refuses a
+   combination document whose named hashes do not match the documents the job holds, combination
+   documents that name different candidate lists, a job whose declaration-only documents are not
+   exactly the documents of that list, and a set of combination documents that lacks one, or
+   holds more than one, for any tuple of one candidate variant per target of that list; the list
+   is signed with the combination documents, so a job cannot leave out a variant together with
+   every combination that contains it, so the variants identified always pick exactly one
+   program; it checks each combination's decodes against its targets' declarations, refuses
+   flash plans on more than one target, and refuses an access program with any service item 5
+   does not allow; it checks each access program's decodes and services against the declarations
+   of the declaration-only document that program names, as it checks a combination's, so an
+   access program that would fail while decoding is refused before it changes the gateway's
+   session or security state. The agent identifies each target's variant as the primary's is
+   identified (8.9.1, ADR-315), through those declaration-only documents, and the combination
+   its variants pick is the program that runs. Whether the job writes, which policy class
+   applies and whether it takes the reprogramming slot are fixed before anything is sent from
+   every combination the job holds: the job is a writing job when any of them writes, takes the
+   reprogramming slot when any of them writes (ADR-257; an access program's services alone do
+   not count, item 10), and is held to the policy class that covers all of them, so the chosen
+   combination never needs a guard the job lacks. A job keeps a journal when any of its
    combinations has a flash plan or a section marked recovery required (ADR-293), whether or not
    it writes; such a job creates its journal before anything is sent, as now (ADR-252, ADR-293),
    and commits a combination record holding the chosen document's hash after identification and

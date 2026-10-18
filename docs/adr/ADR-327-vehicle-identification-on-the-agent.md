@@ -129,8 +129,13 @@ maintainer chose to run the loop on the agent.
    without an answer. Silence to the presence request alone never puts a definition out of
    reach. When a
    candidate declares a VIN matching rule, the VIN is read first: the distinct VIN sources the
-   candidates' rules name (a service and its link) are tried in turn, in a fixed order, until
-   one gives a VIN that decodes, and a VIN no source gives leaves every VIN rule unevaluated; when none does, identification reads no VIN (the data author's choice).
+   candidates' rules name are tried in turn, in a fixed order, until one gives a VIN that
+   decodes. A source is a service and the field that carries the VIN, as the variant document
+   that declares them defines them (service and field identifiers are local to a document,
+   ADR-318), read over that variant's link; two sources on the same service and link whose
+   declarations differ are distinct and each is tried. When no source gives a VIN, every VIN
+   rule stays unevaluated. When no candidate declares a VIN matching rule, identification
+   reads no VIN (the data author's choice).
 6. **The agent reports facts; the server decides.** The job reports the VIN when read, the
    presence answers, each read's decoded identification fields and matching variants,
    the outcome of each of its identification requests (decoded positive response, the negative

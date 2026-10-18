@@ -234,12 +234,14 @@ maintainer chose to run the loop on the agent.
    and is validated by ADR-229's hardware identity and state checks instead. For it the
    combination record that ADR-325 item 7 commits (or, for a job that commits none, such as a
    single target without an access target, a guard record the journal commits at the same
-   point), now only after the guard has passed on every
+   point, holding as that record does the hash of the document whose program runs and the
+   variant identified), now only after the guard has passed on every
    target the job changes and before the first instruction, also records that the guard passed
    and the hashes of the target's guard list (amending ADR-318 item 4 and ADR-325 item 7's
    record), and a restart once the journal has reached the flash plan (inside it or past its
    end) that carries a different guard list for that
-   target, or whose record (combination or guard) lacks the pass or is missing, ends in on-site intervention as a
+   target, whose program's document or identified variant differs from the record, or whose
+   record (combination or guard) lacks the pass or is missing, ends in on-site intervention as a
    variant that differs from the recorded combination does. The record is part of the checkpoint summary a handover carries, so a handed-over
    restart is held to the same list.
 8. **Manual paths.** The operator can choose a vehicle definition by hand (an unregistered or

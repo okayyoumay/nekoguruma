@@ -7,7 +7,8 @@
 variants), `agent` (`Job`, `check_job`, policy, one link per target, keep-alive, run and restart
 order), the workers' cyclic tester-present (kept off), `sim-ecu` (a gateway role), design 8.2.4, 8.2.5,
 8.2.6, 5.6, 8.10, 8.10.1; ADR-229 item 2, ADR-235 item 8, ADR-245, ADR-247 item 1, ADR-257,
-ADR-264 item 4, ADR-280, ADR-293, ADR-307 items 1 and 5, ADR-324, ADR-311 item 1, ADR-316, ADR-318 items 1, 3 and 4
+ADR-264 item 4, ADR-280, ADR-293, ADR-307 items 1 and 5, ADR-311 item 1, ADR-316, ADR-318 items 1, 3 and 4,
+ADR-321, ADR-322 items 1 and 3, ADR-324
 
 ## Context
 
@@ -117,13 +118,17 @@ shape survives inside the second as the access program of item 5.
    before its program, so that an inner gateway is reached through an unlocked outer one; then
    identify the other targets and pick the combination (item 7). A VIN that differs, at either
    read, ends a first run in the 8.9.1 pre-check with only reads sent, and a lock failure leaves
-   only those reads sent. A restart (8.2.5) identifies the first access target and reads the VIN
-   from it in ADR-229's order (item 2 step 2), since that target may have been reflashed after
-   the journal recorded its variant, and, once it holds the per-vehicle lock, identifies it
-   again after any wait, reads the VIN again and requires it to match, as a first run does, and
-   only then runs the access programs in the same way before any other step. Since its VIN now
-   comes from an access target rather than from the ECU being reprogrammed, a step 2 VIN read
-   that gets no answer or a negative response ends the restart in on-site intervention
+   only those reads sent. A procedure with several targets and no access target goes the same
+   way with its VIN-source target in place of the first access target: identify that target and
+   read the VIN, take the per-vehicle lock, identify it again and read the VIN again, then
+   identify the other targets and pick the combination, so no variant that picks the combination
+   is identified before the lock is held. A restart (8.2.5) identifies the first access target
+   and reads the VIN from it in ADR-229's order (item 2 step 2), since that target may have been
+   reflashed after the journal recorded its variant, and, once it holds the per-vehicle lock,
+   identifies it again after any wait, reads the VIN again and requires it to match, as a first
+   run does, and only then runs the access programs in the same way before any other step. Since
+   its VIN now comes from an access target rather than from the ECU being reprogrammed, a step 2
+   VIN read that gets no answer or a negative response ends the restart in on-site intervention
    (`IdentityNotEstablished`, which a later resume may retry, ADR-290) instead of the passive
    teardown ADR-229 takes there, which would reach the reprogramming target's default-session
    confirmation without an unlocked gateway. A step of an access program that fails ends the job

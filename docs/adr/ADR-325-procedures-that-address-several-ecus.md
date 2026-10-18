@@ -133,9 +133,13 @@ shape survives inside the second as the access program of item 5.
    run does, and only then runs the access programs in the same way before any other step; a
    restart of a procedure with several targets and no access target does the same with its
    VIN-source target, identifying it again after any wait for the lock and reading the VIN
-   again, so a vehicle exchanged during the wait is caught before any recovery step. Since its
-   VIN now comes from an access target rather than from the ECU being reprogrammed, a step 2 VIN
-   read that gets no answer or a negative response ends the restart in on-site intervention
+   again, so a vehicle exchanged during the wait is caught before any recovery step. When that
+   VIN-source target is the reprogramming target and the journal has reached its flash plan, it
+   is not identified at either point, since it may answer only from its bootloader (item 7's
+   exception): both VIN reads go through the recorded combination's declarations for it, as
+   ADR-229 reads a one-target restart's VIN, and ADR-229's checks validate it. Since its VIN now
+   comes from an access target rather than from the ECU being reprogrammed, a step 2 VIN read
+   that gets no answer or a negative response ends the restart in on-site intervention
    (`IdentityNotEstablished`, which a later resume may retry, ADR-290) instead of the passive
    teardown ADR-229 takes there, which would reach the reprogramming target's default-session
    confirmation without an unlocked gateway. A step of an access program that fails ends the job

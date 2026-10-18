@@ -129,11 +129,11 @@ maintainer chose to run the loop on the agent.
    configuration values or reprograms an ECU needs its variant identification to match exactly one
    variant of exactly one ECU definition (8.9.1), and the agent can only know that by trying
    every variant that could be fitted there. So a write job carries, beside its own variant's
-   document, the documents of every variant of every ECU definition that uses the same endpoint
-   among those the vehicle's identification considered (the entries of every candidate still
-   left when the identification ended, not only the selected one, so the operator's choice of
-   a vehicle cannot remove a definition from the check; or, when the vehicle was identified by hand or without a definition, every ECU
-   definition the tenant may use), its own definition included (amending ADR-318 item 1, under
+   document, the documents of every variant of every ECU definition the tenant may use that uses
+   the same endpoint, its own definition included, whatever the identification concluded about
+   the vehicle: a model-level fact such as the VIN cannot rule out an ECU fitted as a
+   replacement, and neither the selected vehicle nor the operator's choice may remove a
+   definition from the check (amending ADR-318 item 1, under
    which a job carries one variant's document). Before anything that writes is sent the agent
    runs variant identification over all of them, and the job is refused unless exactly one
    variant of one definition matches, it is the job's own, and the read of every carried definition

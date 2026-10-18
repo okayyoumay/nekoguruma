@@ -54,10 +54,10 @@ maintainer chose to run the loop on the agent.
 3. **Narrowing.** A candidate is dropped only when a fact contradicts it: a present endpoint
    that no ECU definition in any of its entries uses, an identified variant whose ECU definition
    none of its entries allows (counted only once every other definition that uses the same
-   endpoint and is still named by a remaining candidate has been read or is out of reach, item
-   5, since an ECU can match the patterns of two alternative definitions; a sibling that did not
-   answer its own requests cannot have matched, so the drop then rests on the identified match,
-   not on the silence; when several match, all of them stay possible
+   endpoint and is still named by a remaining candidate has been read with an answer, since an ECU can
+   match the patterns of two alternative definitions; a sibling that is out of reach, item 5, has
+   not been ruled out, so the candidates that need it stay and, if more than one candidate is
+   left at the end, the operator chooses; when several match, all of them stay possible
    and the operator chooses, as for variants in item 7, amending ADR-326 item 3's first match), or an identification value whose matching rule (a VIN position
    range, or a read field) gives a value outside the candidate's. A read of a definition whose
    endpoint answers but whose variants all fail to match rules out only that definition; the
@@ -101,17 +101,21 @@ maintainer chose to run the loop on the agent.
    and the operator picks one by its attributes. The picked variant can be used for reads and
    other jobs that do not write; such a job checks, before its procedure runs, that its
    variant's patterns match the ECU, and is refused when they do not. A job that writes
-   configuration values or reprograms an ECU needs its variant identification to match exactly
+   configuration values or reprograms an ECU needs its variant identification to match exactly one
    variant of exactly one ECU definition (8.9.1), and the agent can only know that by trying
    every variant that could be fitted there. So a write job carries, beside its own variant's
    document, the documents of every variant of every ECU definition that uses the same endpoint
-   among those the vehicle's identification considered (its selected vehicle definition's
-   entries, or, when the vehicle was identified by hand or without a definition, every ECU
+   among those the vehicle's identification considered (the entries of every candidate still
+   left when the identification ended, not only the selected one, so the operator's choice of
+   a vehicle cannot remove a definition from the check; or, when the vehicle was identified by hand or without a definition, every ECU
    definition the tenant may use), its own definition included (amending ADR-318 item 1, under
    which a job carries one variant's document). Before anything that writes is sent the agent
    runs variant identification over all of them, and the job is refused unless exactly one
-   variant of one definition matches and it is the job's own, whatever the operator picked, so
-   an operator's choice never decides a write's target.
+   variant of one definition matches, it is the job's own, and every other definition's
+   identification requests were answered (a negative response is an answer; no answer leaves
+   that definition unexcluded, which makes the check inconclusive and refuses the write, unlike
+   ADR-315's selection, which treats it as no match). This holds whatever the operator picked,
+   so an operator's choice never decides a write's target.
 8. **Manual paths.** The operator can choose a vehicle definition by hand (an unregistered or
    misidentified vehicle), and the plan then holds that definition's entries and the ECU
    definitions they name, without candidates, so a fact that contradicts the chosen definition

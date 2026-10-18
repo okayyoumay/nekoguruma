@@ -4,13 +4,14 @@
 //! The core of the lowering: top-level constants (folded at ingestion), top-level `def`s with
 //! positional parameters, calls between them, locals, the operators the IR's instructions
 //! cover, `and`, `or`, `not`, conditional expressions, `if`/`elif`/`else`, `for` loops
-//! (ADR-305), and `diag.fail`, `diag.wait`, `diag.log` and `diag.capture`. Every value that
-//! reaches run time has one type, inferred at ingestion (ADR-304); an operation the IR cannot
-//! express for its operands is `STAR_NOT_LOWERABLE`.
+//! (ADR-305), and `diag.fail`, `diag.wait`, `diag.log` and `diag.capture`, and section functions,
+//! each covered by a `Section` together with its own copies of the functions it reaches (ADR-301,
+//! ADR-329). Every value that reaches run time has one type, inferred at ingestion (ADR-304); an
+//! operation the IR cannot express for its operands is `STAR_NOT_LOWERABLE`.
 //!
 //! Not lowered yet, each its own backlog item: the other `diag` functions (`hmi` and `record`;
-//! `security_access`; `flash_transfer`), reading `dtcs` of `diag.read_dtc`, built-ins and
-//! string methods on values known only at run time, and section and idempotency annotations.
+//! `security_access`; `flash_transfer`), built-ins and string methods on values known only at
+//! run time, and idempotency annotations.
 //! Each is rejected with `STAR_NOT_LOWERABLE` (or `STAR_API_NOT_AVAILABLE` for a `diag`
 //! function without an instruction), so nothing is lowered silently wrong.
 

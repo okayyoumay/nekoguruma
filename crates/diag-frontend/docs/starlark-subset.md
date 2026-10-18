@@ -704,6 +704,11 @@ names them at the end of its hint (`(in variant V1)`, `(in variants V1, V2)`).
   functions reachable from any section function are marked, and a call from a marked function
   to a section function is reported, unless it closes a cycle, which is reported as recursion
   only. Calls through function parameters (2.6) are followed along the specialized call paths
+- Sections (4.5) are lowered as copies keyed by the function and the section function whose call
+  they run in, or none outside every section: starting from the entry's call to `main`, a call to
+  a section function reaches that function's section copy, and any other call stays in the
+  caller's section. Each section copy's range becomes a `Section` with the section function's
+  attributes, and every section copy counts toward the 1,000-copy budget before it is made
 - The check of 2.3 sees the syntax only. A computed key, or a slice, is found on the expressions known to be
   dicts without type inference: dict literals, the responses of `diag.request`, `diag.routine`
   and `diag.read_dtc` (3.4), a response's `"fields"` (not the values in it, nor another dict's

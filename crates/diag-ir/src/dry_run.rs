@@ -9,11 +9,22 @@
 
 use std::collections::HashMap;
 
-use crate::declaration::{EcuVariant, LengthKind, Placement, PositiveResponse, Service};
-use crate::decode::{DecodeError, DecodedField, decode_positive_response};
+use crate::declaration::{
+    DataKind, EcuVariant, Field, LengthKind, Placement, PositiveResponse, RepeatCount, Service,
+    Shape, Termination,
+};
+use crate::decode::{DecodeError, DecodedField, Layouts, decode_positive_response};
 use crate::{
     DiagHost, Failure, Program, ProgramError, StepError, StepOutcome, Vm, VmError, WaitingOn,
 };
+
+/// The most bytes of requests, answers, transfer data, forms and messages one report holds,
+/// each event counted as at least [`EVENT_COST`] bytes, so a definition run at ingestion cannot
+/// make the report take unbounded memory (ADR-328 item 7).
+pub const MAX_REPORT_BYTES: usize = 64 << 20;
+
+/// What one event counts toward [`MAX_REPORT_BYTES`] besides its bytes.
+pub const EVENT_COST: usize = 64;
 
 /// The answers a dry run gives. Each list is answered in order, and its last answer again once
 /// the list is used up, so a procedure that polls gets a steady answer.
@@ -31,7 +42,9 @@ impl Script {
     }
 
     /// Adds a whole response, starting with its SID, to the answers to the service named
-    /// `service` (`Service.short_name`). A negative response may be scripted too.
+    /// `service` (`Service.short_name`). A negative response may be scripted too; it is the
+    /// final answer, so a response-pending code, which the worker absorbs on a real link, is
+    /// not one to script.
     pub fn response(mut self, service: &str, bytes: impl Into<Vec<u8>>) -> Self {
         self.responses
             .entry(service.to_owned())
@@ -117,15 +130,30 @@ pub enum DryRunError {
         request: Vec<u8>,
         services: Vec<String>,
     },
-    /// A `SendReceive` names a service the variant does not declare.
-    #[error("no declared service has id {service}")]
+    /// A `SendReceive` names a service the variant does not declare with a request and a
+    /// positive response, as the agent's host requires (ADR-322 item 3).
+    #[error("no declared service with a request and a positive response has id {service}")]
     UnknownService { service: u32 },
+    /// A `SendReceive` request is empty or does not start with its service's declared SID,
+    /// which the agent's host refuses (ADR-322 item 1).
+    #[error("the request {request:02X?} does not start with service {service}'s SID {sid:02X}")]
+    WrongService {
+        service: String,
+        sid: u8,
+        request: Vec<u8>,
+    },
+    /// A `ServiceRequest` operand wider than one byte, which is no SID.
+    #[error("service {service:#X} is not a one-byte SID")]
+    NotASid { service: u16 },
     /// The service has no declared positive response and no answer is scripted.
     #[error("service {service} has no positive response to build an answer from")]
     NoPositiveResponse { service: String },
     /// The script has no answer of this kind.
     #[error("the script has no {what}")]
     NotScripted { what: &'static str },
+    /// The report would grow past [`MAX_REPORT_BYTES`].
+    #[error("the report would hold more than {MAX_REPORT_BYTES} bytes")]
+    ReportTooLarge,
 }
 
 /// How a dry run ended.
@@ -165,6 +193,8 @@ pub fn dry_run(
         script,
         used: HashMap::new(),
         events: Vec::new(),
+        report_bytes: 0,
+        over_budget: false,
     };
     if let Err(error) = program.validate() {
         return DryRunReport {
@@ -179,6 +209,9 @@ pub fn dry_run(
             break DryRunEnd::StepLimit;
         }
         match vm.step_with_declarations(program, Some(variant), &mut host) {
+            Ok(StepOutcome::Continue) if host.over_budget => {
+                break DryRunEnd::Host(DryRunError::ReportTooLarge);
+            }
             Ok(StepOutcome::Continue) => {}
             Ok(StepOutcome::Finished) => break DryRunEnd::Finished,
             Ok(StepOutcome::Failed(failure)) => break DryRunEnd::Failed(failure),
@@ -208,9 +241,28 @@ struct ScriptedHost<'s, 'v> {
     script: &'s Script,
     used: HashMap<Answers, usize>,
     events: Vec<DryRunEvent>,
+    /// What the events count toward [`MAX_REPORT_BYTES`].
+    report_bytes: usize,
+    /// Whether an event was refused for the budget; the run ends after that step.
+    over_budget: bool,
 }
 
 impl ScriptedHost<'_, '_> {
+    /// Records `event`, which holds `bytes` bytes, unless the report would grow past
+    /// [`MAX_REPORT_BYTES`]. Called before the event's bytes are copied.
+    fn charge(&mut self, bytes: usize) -> Result<(), DryRunError> {
+        let total = self
+            .report_bytes
+            .saturating_add(bytes)
+            .saturating_add(EVENT_COST);
+        if total > MAX_REPORT_BYTES {
+            self.over_budget = true;
+            return Err(DryRunError::ReportTooLarge);
+        }
+        self.report_bytes = total;
+        Ok(())
+    }
+
     /// The next answer from `list`, or its last once it is used up.
     fn next(&mut self, which: Answers, list: &[Vec<u8>]) -> Option<Vec<u8>> {
         let last = list.len().checked_sub(1)?;
@@ -234,9 +286,10 @@ impl ScriptedHost<'_, '_> {
                         .ok_or_else(|| DryRunError::NoPositiveResponse {
                             service: name.clone(),
                         })?;
-                (built_response(&positive), true)
+                (built_response(&positive, self.variant.layouts()), true)
             }
         };
+        self.charge(request.len() + answer.len())?;
         let decoded = service
             .positive()
             .map(|positive| decode_positive_response(&positive, self.variant.layouts(), &answer));
@@ -293,14 +346,19 @@ fn resolve<'v>(variant: EcuVariant<'v>, request: &[u8]) -> Result<Service<'v>, D
     }
 }
 
-/// A positive response built from its declaration: the SID and prefix, then zero bytes up to
-/// the end of the last field whose position and length are fixed. A field of another length,
-/// or one with a shape, takes no bytes, nor does any field placed after it.
-fn built_response(positive: &PositiveResponse<'_>) -> Vec<u8> {
+/// A positive response built from its declaration (ADR-328 item 3): the SID and prefix, then
+/// the fewest bytes each field decodes from, all zero but a terminator. A field placed after
+/// the previous one is built only while that one's end is known; the first that is not ends
+/// the answer, so its field and those after it need a scripted answer to decode.
+fn built_response(positive: &PositiveResponse<'_>, layouts: Layouts<'_>) -> Vec<u8> {
     let prefix = positive.prefix().map_or(&[][..], |p| p.bytes());
-    let start = 8 * (1 + prefix.len() as u64);
+    let mut bytes = vec![positive.sid()];
+    bytes.extend_from_slice(prefix);
+    let start = 8 * bytes.len() as u64;
     // Where the previous field ends, in bits from the SID; `None` once it is not known.
     let mut cursor = Some(start);
+    // Terminator bytes, at byte positions, to write once the length is known.
+    let mut terminators: Vec<(u64, u8)> = Vec::new();
     let mut end = start;
     for field in positive.fields().into_iter().flatten() {
         let at = match field.placement() {
@@ -310,20 +368,123 @@ fn built_response(positive: &PositiveResponse<'_>) -> Vec<u8> {
             },
             _ => u64::from(field.bit_offset()),
         };
-        if field.length_kind() != LengthKind::Fixed || field.shape().is_some() {
+        let Some(built) = least_extent(&field, layouts, at) else {
             cursor = None;
             continue;
+        };
+        if let Some((terminator, count)) = built.terminator {
+            let last = built.end / 8;
+            terminators.extend((last - count..last).map(|at| (at, terminator)));
         }
-        let field_end = at + u64::from(field.bit_length());
-        cursor = Some(field_end);
-        end = end.max(field_end);
+        end = end.max(built.end);
+        cursor = built.followed.then_some(built.end);
     }
     let len = usize::try_from(end.div_ceil(8))
         .map_or(crate::MAX_BYTES_LEN, |n| n.min(crate::MAX_BYTES_LEN));
-    let mut bytes = vec![positive.sid()];
-    bytes.extend_from_slice(prefix);
     bytes.resize(len.max(bytes.len()), 0);
+    for (at, terminator) in terminators {
+        if let Some(byte) = usize::try_from(at).ok().and_then(|at| bytes.get_mut(at)) {
+            *byte = terminator;
+        }
+    }
     bytes
+}
+
+/// The least a field placed at bit `at` takes in a built answer.
+struct Extent {
+    /// Where it ends, in bits from the SID.
+    end: u64,
+    /// A terminator other than zero bytes, and how many bytes before `end` it fills.
+    terminator: Option<(u8, u64)>,
+    /// Whether a field placed after it can follow: false when the field reads to the end of
+    /// the message.
+    followed: bool,
+}
+
+/// The least `field` decodes from when it starts at bit `at`, with every value zero, or `None`
+/// when that is not known from the declaration (a `Select`, a repeat up to a marker, or a
+/// layout of no declared size).
+fn least_extent(field: &Field<'_>, layouts: Layouts<'_>, at: u64) -> Option<Extent> {
+    let edge = at.div_ceil(8) * 8;
+    let sized = |bits: u64| Extent {
+        end: edge + bits,
+        terminator: None,
+        followed: true,
+    };
+    if field.shape_type() != Shape::NONE {
+        let layout_size = |id: u32| {
+            layouts
+                .into_iter()
+                .flatten()
+                .find(|l| l.id() == id)
+                .map(|l| u64::from(l.byte_size()))
+                .filter(|&size| size > 0)
+        };
+        if let Some(group) = field.shape_as_group() {
+            return Some(sized(8 * layout_size(group.layout_id())?));
+        }
+        let repeat = field.shape_as_repeat()?;
+        return match repeat.count() {
+            RepeatCount::Fixed => Some(sized(
+                8 * u64::from(repeat.fixed_count()) * u64::from(repeat.item_byte_size()),
+            )),
+            // A count field built as zero gives no items.
+            RepeatCount::FromField => Some(sized(0)),
+            RepeatCount::UntilEndOfPdu => Some(Extent {
+                followed: false,
+                ..sized(0)
+            }),
+            _ => None,
+        };
+    }
+    match field.length_kind() {
+        LengthKind::Fixed => Some(Extent {
+            end: at + u64::from(field.bit_length()),
+            terminator: None,
+            followed: true,
+        }),
+        // A length field built as zero gives an empty value.
+        LengthKind::FromField => Some(Extent {
+            end: at,
+            terminator: None,
+            followed: true,
+        }),
+        // A zero length prefix, then no value.
+        LengthKind::LeadingLength => Some(Extent {
+            end: (at + u64::from(field.bit_length())).div_ceil(8) * 8,
+            terminator: None,
+            followed: true,
+        }),
+        LengthKind::Terminated => {
+            let min = u64::from(field.min_bytes());
+            let max = u64::from(field.max_bytes());
+            let unit = if field.kind() == DataKind::Unicode2 {
+                2
+            } else {
+                1
+            };
+            match field.termination() {
+                Termination::Zero | Termination::HexFF if max == 0 || min + unit <= max => {
+                    // `min_bytes` of data, then a terminator ends the value.
+                    let terminator =
+                        (field.termination() == Termination::HexFF).then_some((0xFF, unit));
+                    Some(Extent {
+                        terminator,
+                        ..sized(8 * (min + unit))
+                    })
+                }
+                // No room for a terminator below `max_bytes`, or the value reads to the end
+                // of the message up to `max_bytes`: with more bytes after it, it is that long.
+                _ if max != 0 => Some(sized(8 * max)),
+                // It reads to the end of the message, so nothing can follow it.
+                _ => Some(Extent {
+                    followed: false,
+                    ..sized(8 * min)
+                }),
+            }
+        }
+        _ => None,
+    }
 }
 
 impl DiagHost for ScriptedHost<'_, '_> {
@@ -331,9 +492,8 @@ impl DiagHost for ScriptedHost<'_, '_> {
 
     fn service_request(&mut self, service: u16, payload: &[u8]) -> Result<Vec<u8>, DryRunError> {
         // A `ServiceRequest` operand is the SID (ADR-233); a wider one is no SID any service has.
-        let mut request = vec![u8::try_from(service).map_err(|_| DryRunError::Undeclared {
-            request: payload.to_vec(),
-        })?];
+        let mut request =
+            vec![u8::try_from(service).map_err(|_| DryRunError::NotASid { service })?];
         request.extend_from_slice(payload);
         self.send(request)
     }
@@ -344,8 +504,19 @@ impl DiagHost for ScriptedHost<'_, '_> {
             .services()
             .into_iter()
             .flatten()
-            .find(|s| s.id() == service)
+            .find(|s| s.id() == service && s.positive().is_some())
             .ok_or(DryRunError::UnknownService { service })?;
+        let sid = declared
+            .request()
+            .ok_or(DryRunError::UnknownService { service })?
+            .sid();
+        if request.first() != Some(&sid) {
+            return Err(DryRunError::WrongService {
+                service: declared.short_name().unwrap_or_default().to_owned(),
+                sid,
+                request: request.to_vec(),
+            });
+        }
         self.answer(request, declared)
     }
 
@@ -378,6 +549,7 @@ impl DiagHost for ScriptedHost<'_, '_> {
             self.next(Answers::Key, &script.keys)
                 .ok_or(DryRunError::NotScripted { what: "key" })?
         };
+        self.charge(seed.len() + key.len())?;
         self.events.push(DryRunEvent::SecurityAccess {
             level,
             seed: seed.to_vec(),
@@ -387,6 +559,7 @@ impl DiagHost for ScriptedHost<'_, '_> {
     }
 
     fn flash_transfer(&mut self, block: u32, data: &[u8]) -> Result<(), DryRunError> {
+        self.charge(data.len())?;
         self.events.push(DryRunEvent::FlashTransfer {
             block,
             data: data.to_vec(),
@@ -395,6 +568,7 @@ impl DiagHost for ScriptedHost<'_, '_> {
     }
 
     fn wait(&mut self, _inquiry: u64, millis: u32) -> Result<bool, DryRunError> {
+        self.charge(0)?;
         self.events.push(DryRunEvent::Wait { millis });
         Ok(true)
     }
@@ -405,6 +579,7 @@ impl DiagHost for ScriptedHost<'_, '_> {
             self.next(Answers::Form, &script.forms)
                 .ok_or(DryRunError::NotScripted { what: "HMI answer" })?
         };
+        self.charge(form.len() + answer.len())?;
         self.events.push(DryRunEvent::Hmi {
             form: form.to_vec(),
             answer: answer.clone(),
@@ -424,6 +599,7 @@ impl DiagHost for ScriptedHost<'_, '_> {
                     what: "record answer",
                 })?
         };
+        self.charge(template.len() + answer.len())?;
         self.events.push(DryRunEvent::RecordInput {
             template: template.to_vec(),
             answer: answer.clone(),
@@ -432,15 +608,25 @@ impl DiagHost for ScriptedHost<'_, '_> {
     }
 
     fn monitor_capture(&mut self, back_millis: u32) -> Result<(), DryRunError> {
+        self.charge(0)?;
         self.events
             .push(DryRunEvent::MonitorCapture { back_millis });
         Ok(())
     }
 
+    // `log` cannot fail, so a message past the budget is dropped and the run ends after this
+    // step (`ScriptedHost::over_budget`).
     fn log(&mut self, level: u8, message: &str) {
+        if self.charge(message.len()).is_err() {
+            return;
+        }
         self.events.push(DryRunEvent::Log {
             level,
             message: message.to_owned(),
         });
     }
 }
+
+#[cfg(test)]
+#[path = "dry_run_tests.rs"]
+mod tests;

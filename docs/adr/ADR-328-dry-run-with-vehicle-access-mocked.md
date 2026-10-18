@@ -38,23 +38,36 @@ A shared dry run has to settle three things the VM leaves to its host:
    `ServiceRequest`; `ReadDtc` and `RoutineControl` as the agent's host builds them for UDS) and
    resolved to the declared service with the request's SID whose request prefix is the longest
    the request starts with. A request no declared service matches, two services matching it
-   equally well, or a `SendReceive` to an undeclared service id, ends the run with a host error:
-   a definition that sends what it does not declare is what the validation is for.
+   equally well, a `ServiceRequest` operand wider than a byte, a `SendReceive` to a service
+   declared without a request and a positive response, or a `SendReceive` request that is empty
+   or starts with another SID (the agent's host refuses the last two, ADR-322 items 1 and 3)
+   ends the run with a host error: a definition that sends what it does not declare is what the
+   validation is for.
 
 3. **Answers come from the script, else from the declaration.** The script holds whole
    responses per service short name, negative responses included. Without one, the answer is
-   built from the service's declared positive response: its SID and prefix, then zero bytes to
-   the end of the last field whose position and length are fixed, so a field of another length,
-   a shaped field, and any field placed after one of them are left empty. A built answer is
-   enough for a procedure to go on and for its field reads to decode; a procedure that checks a
-   value may then take its own failure path, which the report shows as the run's end. A service
-   with no positive response needs a scripted answer.
+   built from the service's declared positive response: its SID and prefix, then the fewest
+   bytes each field decodes from, all zero but a terminator. A fixed field takes its width; a
+   leading length is a zero prefix and an empty value; a length or repeat count taken from
+   another field is that field's zero, so an empty value or no items; a terminated value takes
+   its minimum bytes and then its terminator, or its maximum when no terminator fits below it; a
+   group takes its layout's declared size and a fixed repeat its items' total size. A value
+   that reads to the end of the message (a terminated value with no terminator and no maximum,
+   a repeat to the end) ends the answer, and so does a field whose extent the declaration does
+   not give (a select, a repeat up to a marker, a layout of no declared size): a field placed
+   after it has no bytes and the answer fails to decode from there, so such a response needs a
+   scripted answer. A length or count field with a conversion that maps zero elsewhere needs
+   one too. A built answer lets a procedure go on and its field reads decode; a procedure that
+   checks a value may then take its own failure path, which the report shows as the run's end.
+   A service with no positive response needs a scripted answer.
 
 4. **Every answer is decoded and reported.** Each request event carries the request, the
    service it went to, the answer, whether it was built or scripted, and the answer decoded
    through the service's positive response (`decode_positive_response`, ADR-297), so a negative
    or malformed answer shows as a decode error in the report rather than stopping the run. The
-   run stops only where the VM stops (a VM error, `Fail`, the end) or the host cannot answer.
+   run stops only where the VM stops (a VM error, `Fail`, the end), the host cannot answer, or a
+   limit is reached (item 7). A scripted negative response is the final answer: a response
+   pending code, which the worker absorbs on a real link, reaches the procedure as it is.
 
 5. **Lists answer in order, then repeat their last answer.** Each service's responses, and the
    keys, HMI answers and record answers, are used in order; once a list is used up its last
@@ -67,6 +80,13 @@ A shared dry run has to settle three things the VM leaves to its host:
    to wait for. `FlashTransfer` and `MonitorCapture` are reported and succeed. Log messages are
    reported.
 
+7. **Bounded by the caller and by the report.** The caller gives a step limit. The report holds
+   at most `MAX_REPORT_BYTES` (64 MiB) of requests, answers, seeds and keys, transfer data,
+   forms and messages, each event counted as at least `EVENT_COST` bytes besides its own; an
+   event past that ends the run with a host error before its bytes are copied. A definition run
+   at ingestion is untrusted, and a loop resending a 16 MiB value would otherwise grow the
+   report without bound.
+
 ## Consequences
 
 - The server's ingestion check, the frontend and tests can share one host whose rules are
@@ -78,5 +98,9 @@ A shared dry run has to settle three things the VM leaves to its host:
   other.
 - Built answers are zeros, so they exercise a procedure's structure, not its values. Checking
   values needs a script.
+- Only what the declaration decides is checked. The agent's own refusals at run time (the
+  flash-plan rules for a send-receive, ADR-322 item 2, and a `TransferData` sent by
+  `ServiceRequest` instead of `FlashTransfer`, ADR-250) are not repeated, so a run the dry run
+  finishes can still be refused by the agent there.
 - When the IR gains targets (ADR-325), the dry run takes the declaration part of each target
   instead of one variant.

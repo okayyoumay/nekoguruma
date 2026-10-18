@@ -14,8 +14,8 @@ use std::time::Duration;
 
 use diag_ir::declaration::EcuVariant;
 use diag_ir::{
-    DiagHost, IdentityKind, Interruptible, Program, StepError, StepOutcome, Vm, VmError, VmState,
-    WaitingOn,
+    DiagHost, IdentityKind, Interruptible, Op, Program, StepError, StepOutcome, Vm, VmError,
+    VmState, WaitingOn,
 };
 use tokio::runtime::{Handle, RuntimeFlavor};
 use worker_host::client::WorkerClient;
@@ -384,9 +384,10 @@ fn refuse_beyond(
 /// keep their locks and a run refuses them with [`JobError::LinkUnconfirmed`] until
 /// [`JobGuards::worker_gone`]. Dropping the returned future cancels the job:
 /// the call or primitive in flight finishes, no further instruction runs, and the link is
-/// closed. Inside an uninterruptible section (design 5.6, 8.10.1) the cancel is held: the
-/// section runs to its end, and the job stops before the first instruction outside every such
-/// section. That happens after the future is gone, so a caller that dropped it must not hand
+/// closed. Inside an uninterruptible or a recovery-required section (design 5.6, 8.10.1) the
+/// cancel is held: the section runs to its end, and the job stops before the first instruction
+/// outside every such section that is not a `Ret`; a procedure that ends first finishes
+/// (ADR-330). That happens after the future is gone, so a caller that dropped it must not hand
 /// the worker to another job yet (ADR-235 consequences).
 ///
 /// The job is checked by [`check_job`] against [`policy::build_ceiling`] before anything opens,
@@ -1329,14 +1330,32 @@ enum RunEnd {
     Stopped(Vm),
 }
 
-/// Whether the instruction at `pc` lies in an uninterruptible section (design 8.10.1). A
-/// Starlark section function gives each copy of the functions it reaches a section of its own
-/// (ADR-329), so a helper's copy inside the section is covered too.
-fn uninterruptible_at(program: &Program, pc: u32) -> bool {
-    program.sections.iter().any(|section| {
-        matches!(section.interruptible, Interruptible::No)
-            && (section.start_pc..section.end_pc).contains(&pc)
-    })
+/// Per instruction, whether it lies in a section that is not interruptible: an uninterruptible
+/// or a recovery-required one (design 5.6, 8.10.1, ADR-330). A Starlark section function gives
+/// each copy of the functions it reaches a section of its own (ADR-329), so a helper's copy
+/// inside the section is covered too. Computed once per run, so a step does not scan the
+/// sections.
+fn cancel_held_at(program: &Program) -> Vec<bool> {
+    let mut held = vec![false; program.code.len()];
+    for section in &program.sections {
+        if matches!(section.interruptible, Interruptible::Yes) {
+            continue;
+        }
+        let end = (section.end_pc as usize).min(held.len());
+        for at in held.iter_mut().take(end).skip(section.start_pc as usize) {
+            *at = true;
+        }
+    }
+    held
+}
+
+/// Whether a cancel waits at `pc` (ADR-330): inside a section that is not interruptible, or at
+/// a `Ret`, so that the returns after a procedure's last section do not turn a procedure that
+/// ran to its end into a cancelled one; a cancel is then taken before the next instruction
+/// that is neither.
+fn holds_cancel(program: &Program, holds: &[bool], pc: u32) -> bool {
+    holds.get(pc as usize).copied().unwrap_or(false)
+        || matches!(program.code.get(pc as usize), Some(Op::Ret))
 }
 
 /// The step loop from `vm`'s state, shared by a run from the program's start and the restart's
@@ -1369,11 +1388,12 @@ where
     // Whether the journal has seen this arrival yet (a timer wait polls the same instruction
     // again).
     let mut arrived = true;
-    // A cancel requested inside an uninterruptible section is held until the section ends
-    // (design 5.6, 8.10.1): the loop and the journal's boundary reads see this flag instead.
+    // A cancel is taken only at an interruptible point (ADR-330): elsewhere the loop and the
+    // journal's boundary reads see a flag that is never set.
+    let holds = cancel_held_at(program);
     let held = AtomicBool::new(false);
     loop {
-        let cancelled = if uninterruptible_at(program, vm.state.pc) {
+        let cancelled = if holds_cancel(program, &holds, vm.state.pc) {
             &held
         } else {
             cancelled
@@ -1976,10 +1996,56 @@ def main():
             assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
             host.logs
         };
+        // A recovery-required section is no interruptible point either (ADR-330).
         assert_eq!(run("uninterruptible"), ["helper", "in section"]);
-        // Elsewhere a cancel stops the job before its next instruction.
+        assert_eq!(run("recoveryRequired"), ["helper", "in section"]);
+        // In an interruptible section a cancel stops the job before its next instruction.
         assert_eq!(run("interruptible"), ["helper"]);
-        assert_eq!(run("recoveryRequired"), ["helper"]);
+    }
+
+    #[test]
+    fn a_procedure_that_ends_inside_a_held_cancel_finishes() {
+        // The cancel comes in the last section; only returns run after it, so the procedure
+        // ran to its end and is not reported as cancelled (ADR-330).
+        for source in [
+            "# @section uninterruptible\ndef main():\n    diag.log(1, \"cancel\")\n    diag.log(1, \"last\")\n",
+            "# @section uninterruptible\ndef write():\n    diag.log(1, \"cancel\")\n    diag.log(1, \"last\")\n\ndef main():\n    write()\n",
+        ] {
+            let flag = Arc::new(AtomicBool::new(false));
+            let mut host = FakeHost {
+                cancel_on_log: Some(("cancel", Arc::clone(&flag))),
+                ..FakeHost::default()
+            };
+            let result = run_plain(&lowered(source), &mut host, JobLimits::default(), &flag);
+            assert!(result.is_ok(), "{source}: {result:?}");
+            assert_eq!(host.logs, ["cancel", "last"]);
+        }
+    }
+
+    #[test]
+    fn a_cancel_held_through_a_wait_in_a_section_stops_after_it() {
+        // `FakeHost::wait` answers "not yet" twice, so the loop polls the same instruction
+        // with the cancel already set.
+        let source = "\
+# @section uninterruptible
+def write():
+    diag.log(1, \"cancel\")
+    diag.wait(10)
+    diag.log(1, \"after the wait\")
+
+def main():
+    write()
+    diag.log(1, \"outside\")
+";
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut host = FakeHost {
+            cancel_on_log: Some(("cancel", Arc::clone(&flag))),
+            ..FakeHost::default()
+        };
+        let result = run_plain(&lowered(source), &mut host, JobLimits::default(), &flag);
+        assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
+        assert_eq!(host.logs, ["cancel", "after the wait"]);
+        assert_eq!(host.waits, 3);
     }
 
     // ------------------------------------------------------------ journaling (ADR-252)

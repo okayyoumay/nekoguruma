@@ -120,7 +120,10 @@ maintainer chose to run the loop on the agent.
    candidates' rules name (a service and its link) are tried in turn, in a fixed order, until
    one gives a VIN that decodes, and a VIN no source gives leaves every VIN rule unevaluated; when none does, identification reads no VIN (the data author's choice).
 6. **The agent reports facts; the server decides.** The job reports the VIN when read, the
-   presence answers, each read's decoded identification fields and matching variants, and the
+   presence answers, each read's decoded identification fields and matching variants,
+   the outcome of each of its identification requests (decoded positive response, the negative
+   response code, or no answer, so the server can tell a conclusive read from an inconclusive
+   one by item 3), and the
    entry states of ADR-326 item 3. The server recomputes the candidates from these facts with
    the same rules, so the agent's narrowing only chooses what to read. One candidate is selected;
    several go to the operator, as ADR-326 item 2 says, with ADR-326 item 5's rule that operator

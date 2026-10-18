@@ -867,6 +867,34 @@ fn a_deeply_nested_procedure_lowers_on_the_parser_stack() {
 }
 
 #[test]
+fn a_left_shift_at_run_time_keeps_every_bit_or_stops_the_run() {
+    assert!(holds("x, n", "3, 4", "x << n == 48"));
+    assert!(holds("x, n", "-3, 4", "x << n == -48"));
+    assert!(holds("x, n", "0, 63", "x << n == 0"));
+    assert!(holds(
+        "x, n",
+        "-1, 63",
+        "x << n == -4611686018427387904 * 2"
+    ));
+    assert!(holds("x", "1", "x << 62 == 4611686018427387904"));
+    // A bit lost, or a count outside 0 to 63, stops the run where Starlark would grow or fail.
+    for (args, expr, error) in [
+        ("1, 63", "x << n", "Overflow"),
+        ("3, 62", "x << n", "Overflow"),
+        ("1, 64", "x << n", "ShiftOutOfRange(64)"),
+        ("1, -1", "x << n", "ShiftOutOfRange(-1)"),
+    ] {
+        let source = format!(
+            "def f(x, n):\n    return {expr}\n\ndef main():\n    if f({args}) == 0:\n        diag.fail(\"ZERO\", \"\")\n"
+        );
+        let found = run(&source).expect_err(&source);
+        assert!(found.contains(error), "{source}: {found}");
+    }
+    let augmented = "def f(x):\n    x <<= 2\n    return x\n\ndef main():\n    if f(5) != 20:\n        diag.fail(\"NO\", \"\")\n";
+    assert_eq!(run(augmented), Ok(None));
+}
+
+#[test]
 fn a_right_shift_is_arithmetic() {
     assert!(holds("x", "-8", "x >> 1 == -4"));
     assert!(holds("x", "-1", "x >> 63 == -1"));
@@ -1097,8 +1125,6 @@ fn what_the_ir_cannot_express_is_not_lowerable() {
         "def f(x):\n    return x // 2.0\n\ndef main():\n    f(1.0)\n",
         // `int` of a string at run time.
         "def f(x):\n    return int(x)\n\ndef main():\n    f(\"1\")\n",
-        // A run-time `<<`.
-        "def f(x):\n    return x << 1\n\ndef main():\n    f(1)\n",
         // Bytes and a string joined at run time.
         "def f(x):\n    return x + \"a\"\n\ndef main():\n    f(b\"b\")\n",
         // A local of two types.

@@ -37,7 +37,8 @@ use crate::declaration::{EcuVariant, Shape};
 /// `ShapedField` and `Undecodable` (ADR-316).
 /// 12: `Op` gained `SendReceive` and `VmError` gained `UnknownService`; `Protocol` gained
 /// `application_layer` and `negative_shape` (ADR-321).
-pub const IR_SCHEMA_VERSION: u32 = 12;
+/// 13: `Op` gained `ShlChecked`, for the same reason as version 3.
+pub const IR_SCHEMA_VERSION: u32 = 13;
 
 /// The longest code, in bytes, that `Program::validate` accepts for a `Fail` (ADR-280).
 pub const MAX_FAILURE_CODE_LEN: usize = 128;
@@ -204,6 +205,14 @@ pub enum Op {
     SendReceive {
         service: u32,
     },
+
+    // Arithmetic. Appended after `SendReceive` (ADR-233).
+    /// Shifts the `I64` below the top of the stack left by the `I64` on top, as `Shl` does,
+    /// but as a multiplication by a power of two: a result that does not fit an `I64`, so that
+    /// shifting it back right arithmetically would not give the operand, is `VmError::Overflow`.
+    /// A Starlark integer grows rather than losing bits, so this is the shift that `<<` lowers
+    /// to. The shift takes 0 to 63, as `Shl` does.
+    ShlChecked,
 }
 
 // ---------------------------------------------------------------- Program
@@ -317,6 +326,7 @@ impl Op {
             | Op::Slice
             | Op::IntToFloat
             | Op::FloatToInt
+            | Op::ShlChecked
             | Op::DecodeField { .. }
             | Op::Fail { .. } => false,
         }
@@ -585,7 +595,7 @@ impl Vm {
                 let result = arithmetic(op, self.top(2)?)?;
                 self.replace(2, result);
             }
-            Op::BitAnd | Op::BitOr | Op::BitXor | Op::Shl | Op::Shr => {
+            Op::BitAnd | Op::BitOr | Op::BitXor | Op::Shl | Op::Shr | Op::ShlChecked => {
                 let result = bitwise(op, self.top(2)?)?;
                 self.replace(2, result);
             }
@@ -889,6 +899,7 @@ impl Vm {
             | Op::Slice
             | Op::IntToFloat
             | Op::FloatToInt
+            | Op::ShlChecked
             | Op::DecodeField { .. } => HostInput::Nothing,
             // The checks of `Fail` run in `execute`, before it changes anything.
             Op::Fail { .. } => HostInput::Nothing,
@@ -1157,7 +1168,8 @@ fn arithmetic(op: &Op, operands: &[Value]) -> Result<Value, VmError> {
     }
 }
 
-/// Bitwise operations on the 64-bit pattern; shifts are logical and take 0 to 63.
+/// Bitwise operations on the 64-bit pattern; shifts are logical and take 0 to 63, and
+/// `ShlChecked` refuses to drop bits.
 fn bitwise(op: &Op, operands: &[Value]) -> Result<Value, VmError> {
     let [Value::I64(a), Value::I64(b)] = operands else {
         return Err(VmError::TypeMismatch);
@@ -1175,6 +1187,14 @@ fn bitwise(op: &Op, operands: &[Value]) -> Result<Value, VmError> {
         Op::BitXor => a ^ b,
         Op::Shl => (bits << shift()?) as i64,
         Op::Shr => (bits >> shift()?) as i64,
+        Op::ShlChecked => {
+            let shift = shift()?;
+            let shifted = a << shift;
+            if shifted >> shift != *a {
+                return Err(VmError::Overflow);
+            }
+            shifted
+        }
         _ => unreachable!("not a bitwise op"),
     }))
 }

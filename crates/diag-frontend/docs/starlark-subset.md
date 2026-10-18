@@ -498,8 +498,9 @@ def main():
   lowers `x >> n` as `x >> n` for `x >= 0` and as `~((~x) >> n)` for negative `x` (the complement
   is `BitXor` with -1), which gives the arithmetic result with the existing instructions
 - `<<` must not lose bits, since a Starlark integer would grow instead, but the IR's `Shl` drops
-  shifted-out bits. A `<<` with a run-time operand needs an overflow-checked shift and is
-  rejected (`STAR_NOT_LOWERABLE`) until one exists; constant operands are folded at ingestion
+  shifted-out bits. A `<<` with a run-time operand lowers to the IR's `ShlChecked`, which stops
+  the run with an overflow when the result does not fit 64 bits, where Starlark would grow;
+  constant operands are folded at ingestion under the same rule
 - A shift count outside 0 to 63 is an error, at run time and when constants are folded.
   Starlark accepts larger right shifts; this subset does not
 - No implicit conversion between `int` and `float` beyond what Starlark itself does for

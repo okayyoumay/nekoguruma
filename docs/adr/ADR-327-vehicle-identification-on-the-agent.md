@@ -43,6 +43,11 @@ maintainer chose to run the loop on the agent.
    vehicle definition (amending ADR-326 item 5): the plan is all it reads, and the server can
    prefetch it with the job for offline work. The job holds the per-VCI lock and promotes to the
    per-vehicle lock when it reads a VIN (8.8); it sends only reads and presence requests.
+   Every service a variant pattern or a VIN source names must be in ADR-235 item 8's read-only
+   set: a document whose identification would send anything else is rejected when it is
+   ingested, and a plan or job that carries one is refused before any link opens, so neither
+   an identification job nor item 7's check can itself be the first request that changes the
+   ECU; the host's check of every request (ADR-235 item 8) stays the second checkpoint.
 2. **Presence first.** For each distinct link of the ECU definitions in the plan whose protocol
    declares a functional identifier, the agent sends one presence request functionally (for UDS,
    TesterPresent with a response requested) and records each physical response identifier that
@@ -64,8 +69,10 @@ maintainer chose to run the loop on the agent.
    a session alive that the job may not own; the presence request is excepted for an
    identification job only. It is sent once per link, never repeated as a keep-alive. Like any
    request, it restarts the S3 timer of an ECU that is already in a non-default session opened
-   by someone else, but the reads every read-only job sends do the same (ISO 14229-2 restarts
-   the timer on any request, as `sim-ecu` models), so the exception adds no new effect on an
+   by someone else, but the reads every read-only job sends do the same (ISO 14229-2 (2021)
+   9.5 restarts the timer on any request from the client that opened the session, and a
+   tester on the same identifiers cannot be told apart from that client; `sim-ecu` models
+   it so), so the exception adds no new effect on an
    unowned session; what ADR-235 keeps forbidden is a TesterPresent sent to hold a session
    open, and every other TesterPresent stays forbidden to read-only jobs.
 3. **Narrowing.** A candidate is dropped only when a fact contradicts it: a presence answer
@@ -161,7 +168,8 @@ maintainer chose to run the loop on the agent.
    was answered conclusively in item 3's sense (no
    answer, or a negative response the ECU definition does not declare definitive, leaves a
    variant unexcluded, which makes the check inconclusive and refuses the
-   write, unlike ADR-315's selection, which treats it as no match). This holds whatever the operator picked,
+   write, unlike ADR-315's selection, which treats it as no match). The check sends only the
+   read-only identification requests item 1 allows. This holds whatever the operator picked,
    so an operator's choice never decides a write's target.
 8. **Manual paths.** The operator can choose a vehicle definition by hand (an unregistered or
    misidentified vehicle), and the plan then holds that definition's entries and the ECU
@@ -194,5 +202,5 @@ maintainer chose to run the loop on the agent.
   reported as not answering. Identifying through an unlocked gateway is a later decision, with
   the multi-ECU procedure design.
 - Follow-up work (the agent's identification job, the server's plan and re-evaluation, variant
-  attributes and definitive negative responses in the CSV format and the IR, the write refusal on ambiguous variants) is in the
+  attributes and definitive negative responses in the CSV format and the IR, the read-only check of identification services, the write refusal on ambiguous variants) is in the
   backlog.

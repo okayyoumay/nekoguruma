@@ -3422,7 +3422,36 @@ impl<'a> Lowerer<'a> {
                     return Val::Void(Vec::new());
                 };
                 let level = self.constant_int(id, level, name, "level", 0..=255);
-                let message = match self.expr(id, message) {
+                let message_val = self.expr(id, message);
+                // A message known only at run time is the stack operand of `LogFromStack`; a
+                // constant one is pooled for `Log` (3.1).
+                if !matches!(message_val, Val::Const(_)) {
+                    let Some((ty, mut code)) =
+                        self.single(message_val, message.span, "a `diag.log` message")
+                    else {
+                        return Val::Void(Vec::new());
+                    };
+                    if ty != Ty::Str {
+                        self.error(
+                            StarCode::UnsupportedSyntax,
+                            message.span,
+                            format!("a `diag.log` message is a str, not a {}", ty.name()),
+                        );
+                        return Val::Void(Vec::new());
+                    }
+                    let Some(level) = level else {
+                        return Val::Void(Vec::new());
+                    };
+                    code.push((
+                        Ins::Op(Op::LogFromStack {
+                            // In range by the check above.
+                            level: level as u8,
+                        }),
+                        span,
+                    ));
+                    return Val::Void(code);
+                }
+                let message = match message_val {
                     Val::Const(Const::Str(text)) => Some(text),
                     Val::Const(other) => {
                         self.error(
@@ -3432,16 +3461,7 @@ impl<'a> Lowerer<'a> {
                         );
                         None
                     }
-                    _ => {
-                        self.error(
-                            StarCode::NonConstantArgument,
-                            message.span,
-                            "a `diag.log` message must be a string constant: `Log` takes it from \
-                             the constant pool, and a message built at run time needs a log \
-                             instruction that takes it from the stack (3.2)",
-                        );
-                        None
-                    }
+                    _ => unreachable!("a run-time message returned above"),
                 };
                 match (level, message) {
                     (Some(level), Some(text)) => {

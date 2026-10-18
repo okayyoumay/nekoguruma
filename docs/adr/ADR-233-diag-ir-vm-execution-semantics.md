@@ -1,7 +1,7 @@
 # ADR-233: diag-ir VM Execution Semantics
 
 **Date:** 2026-10-06
-**Status:** Accepted (item 3's `VmState::checkpoint` and `resume_count` removed by ADR-245; `Op::Fail` and `StepOutcome::Failed` appended by ADR-280; `Op::SelectTarget` appended, `VmState` given the current target and the host told of target changes by ADR-325 item 3; `Op::ShlChecked` appended, a left shift that fails on overflow instead of dropping bits (item 5; Starlark subset 4.4); `Op::WaitFromStack` appended, a wait whose duration is a run-time operand, with `VmError::WaitOutOfRange` for a duration outside 0 to `u32::MAX` (item 3; Starlark subset 3.1))
+**Status:** Accepted (item 3's `VmState::checkpoint` and `resume_count` removed by ADR-245; `Op::Fail` and `StepOutcome::Failed` appended by ADR-280; `Op::SelectTarget` appended, `VmState` given the current target and the host told of target changes by ADR-325 item 3; `Op::ShlChecked` appended, a left shift that fails on overflow instead of dropping bits (item 5; Starlark subset 4.4); `Op::WaitFromStack` appended, a wait whose duration is a run-time operand, with `VmError::WaitOutOfRange` for a duration outside 0 to `u32::MAX` (item 3; Starlark subset 3.1); `Op::LogFromStack` appended, a log whose message is a run-time operand (item 3; Starlark subset 3.1))
 **Affects:** `diag-ir` (`src/lib.rs`: `Vm::step`, `VmState`, `DiagHost`, `StepOutcome`, `VmError`), `docs/system-architecture.md` 8.2.4
 
 ## Context

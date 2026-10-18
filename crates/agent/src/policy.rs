@@ -140,6 +140,7 @@ pub fn check_program(
             // Answered by the agent or the server; nothing reaches the ECU.
             Op::Wait { .. }
             | Op::WaitFromStack
+            | Op::LogFromStack { .. }
             | Op::HmiRequest { .. }
             | Op::RecordInput { .. }
             | Op::MonitorCapture { .. }

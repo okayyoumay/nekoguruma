@@ -1230,6 +1230,7 @@ fn primitive_classification_covers_every_instruction() {
         Op::SendReceive { service: 0 },
         Op::ShlChecked,
         Op::WaitFromStack,
+        Op::LogFromStack { level: 0 },
     ];
     for (index, op) in all.iter().enumerate() {
         // The postcard encoding starts with the variant index, so this also pins the variant
@@ -1239,7 +1240,7 @@ fn primitive_classification_covers_every_instruction() {
             index,
             "{op:?} moved"
         );
-        let expected = matches!(op, Op::Log { .. })
+        let expected = matches!(op, Op::Log { .. } | Op::LogFromStack { .. })
             || primitives
                 .iter()
                 .any(|p| std::mem::discriminant(p) == std::mem::discriminant(op));
@@ -1798,6 +1799,16 @@ fn current_op_and_step_agree_on_primitives() {
             vec![],
             VmError::BadConstant(1),
         ),
+        (
+            vec![Op::LogFromStack { level: 0 }],
+            vec![],
+            VmError::StackUnderflow,
+        ),
+        (
+            with(vec![i(1)], Op::LogFromStack { level: 0 }),
+            vec![],
+            VmError::TypeMismatch,
+        ),
     ];
     for (code, constants, expected) in invalid {
         let setup_steps = code.len() - 1;
@@ -1835,6 +1846,13 @@ fn current_op_and_step_agree_on_primitives() {
                     message: 1,
                 },
             ],
+            vec![vec![], b"ok".to_vec()],
+        ),
+    ));
+    valid.push((
+        Op::LogFromStack { level: 1 },
+        prog(
+            vec![Op::PushBytes(1), Op::LogFromStack { level: 1 }],
             vec![vec![], b"ok".to_vec()],
         ),
     ));
@@ -1877,6 +1895,7 @@ fn primitives_run_at_the_stack_limit() {
         ),
         (Op::Wait { millis: 1 }, MAX_STACK),
         (Op::WaitFromStack, MAX_STACK),
+        (Op::LogFromStack { level: 0 }, MAX_STACK),
         (Op::MonitorCapture { back_millis: 1 }, MAX_STACK),
         (Op::ReadDtc { mask: 1 }, MAX_STACK - 1),
         (Op::HmiRequest { form: 0 }, MAX_STACK - 1),
@@ -1891,8 +1910,8 @@ fn primitives_run_at_the_stack_limit() {
     assert!(cases.iter().all(|(op, _)| op.is_diagnostic_primitive()));
     assert_eq!(
         cases.len(),
-        primitive_programs().len() + 1,
-        "every primitive plus Log"
+        primitive_programs().len() + 2,
+        "every primitive plus the two logs"
     );
 
     for (op, depth) in cases {
@@ -1925,6 +1944,30 @@ fn primitives_run_at_the_stack_limit() {
         assert_eq!(host.calls.len() + host.logs.len(), 1, "{op:?}");
         assert!(vm.state.stack.len() <= MAX_STACK, "{op:?}");
     }
+}
+
+/// `LogFromStack` hands the host the operand's text, decoding invalid UTF-8 lossily, and pops
+/// the operand; the constant `Log` still refuses invalid UTF-8.
+#[test]
+fn log_from_stack_decodes_lossily_and_pops() {
+    let program = prog(
+        vec![
+            i(7),
+            Op::PushBytes(0),
+            Op::LogFromStack { level: 4 },
+            Op::PushBytes(1),
+            Op::LogFromStack { level: 5 },
+        ],
+        vec![vec![b'a', 0xFF, b'b'], "caf\u{e9}".as_bytes().to_vec()],
+    );
+    let mut vm = Vm::new(&program);
+    let mut host = MockHost::default();
+    while vm.step(&program, &mut host).unwrap() != StepOutcome::Finished {}
+    assert_eq!(
+        host.logs,
+        [(4, "a\u{FFFD}b".to_owned()), (5, "caf\u{e9}".to_owned())]
+    );
+    assert_eq!(vm.state.stack, [Value::I64(7)]);
 }
 
 // ---------------------------------------------------------------- Restart declaration (ADR-245)

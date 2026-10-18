@@ -275,6 +275,7 @@ field that stores them.
 | `back_millis` | `int`, 0 to 2^32 - 1 |
 | `form_id`, `template_id` | `str` naming the form or record template |
 | `level` of `diag.log` | `int`, 0 to 255 |
+| `message` of `diag.log` | `str` expression, which may be built at run time |
 | `code` of `diag.fail` | non-empty `str` constant, 1 to 64 bytes of UTF-8 (the IR accepts 1 to 128; `Program::validate` checks the constant, ADR-280) |
 | `detail` of `diag.fail` | `str` expression, which may be built at run time |
 | `params` of `diag.hmi` | dict whose values are all constants (3.2) |
@@ -286,6 +287,11 @@ A `diag.wait` whose duration is known at ingestion lowers to `Wait`, with the ra
 duration is an `int` computed at run time lowers to the code that pushes it, then `WaitFromStack` (ADR-233),
 which stops the run with `WaitOutOfRange` for a value outside the range; a run-time value of another type is
 rejected as a constant of that type is (`STAR_UNSUPPORTED_SYNTAX`).
+
+A `diag.log` whose message is a constant `str` lowers to `Log`, which takes it from the constant pool. One whose
+message is a `str` built at run time lowers to the code that pushes it, then `LogFromStack` (ADR-233); the VM
+decodes invalid UTF-8 in it lossily, so a log never stops a run. A message of another type, `bytes` included, is
+rejected whether it is a constant or computed at run time (`STAR_UNSUPPORTED_SYNTAX`); the level stays a constant.
 
 ### 3.2 Lowering
 
@@ -304,7 +310,7 @@ instruction exists, the transpiler rejects calls to it (`STAR_API_NOT_AVAILABLE`
 | `diag.hmi` | `HmiRequest` | none: the instruction sends a constant, so the transpiler encodes the form and its constant `params` into one constant-pool entry; parameters known only at run time need a variant that takes them from the stack |
 | `diag.record` | `RecordInput` | none: the template reference is a constant-pool entry |
 | `diag.capture` | `MonitorCapture` | none |
-| `diag.log` | `Log` | none; the message is a constant, so a message built at run time needs a log instruction that takes it from the stack |
+| `diag.log` | `Log`, or `LogFromStack` | none for a constant message; for a message built at run time, the message (`str`, as bytes), pushed before `LogFromStack` |
 | `diag.ecu_info` | none yet | |
 | `diag.precondition` | none yet | |
 | `diag.fail` | `Fail` | `code` as a constant-pool entry; `detail` as bytes from the stack, since it can be built at run time. The instruction ends the procedure as failed and is terminal (ADR-280) |

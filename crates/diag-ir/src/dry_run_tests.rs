@@ -500,6 +500,33 @@ fn a_last_log_past_the_budget_still_ends_the_run() {
     assert_eq!(report.events.len(), 1);
 }
 
+/// A log whose message is a run-time operand is charged by the text the host receives: invalid
+/// UTF-8 decodes to longer text, and a message past the budget ends the run after its step.
+#[test]
+fn a_run_time_log_message_counts_toward_the_budget() {
+    let buf = document(vec![], vec![]);
+    let program = program(
+        vec![
+            Op::PushBytes(0),
+            Op::LogFromStack { level: 2 },
+            Op::PushBytes(1),
+            Op::LogFromStack { level: 3 },
+            Op::Wait { millis: 1 },
+        ],
+        vec![vec![b'o', 0xFF, b'k'], vec![0xFF; MAX_REPORT_BYTES / 2]],
+    );
+    let report = run(&buf, &program, &Script::new());
+    // Each invalid byte becomes three bytes of text, so the second message is past the budget.
+    assert_eq!(report.end, DryRunEnd::Host(DryRunError::ReportTooLarge));
+    assert_eq!(
+        report.events,
+        vec![DryRunEvent::Log {
+            level: 2,
+            message: "o\u{FFFD}k".to_owned()
+        }]
+    );
+}
+
 #[test]
 fn events_without_bytes_count_their_own_size() {
     let buf = document(vec![], vec![]);

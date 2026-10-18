@@ -172,10 +172,11 @@ maintainer chose to run the loop on the agent.
    read-only identification requests item 1 allows. This holds whatever the operator picked,
    so an operator's choice never decides a write's target. The check guards a job's first run:
    the agent journals that it passed before the first request that changes the ECU, together
-   with the hashes of the program and of every document the check covered (the journal
+   with the hashes of the program and of every document the check covered, the job's own
+   document's hash and its matched variant recorded apart from the others (the journal
    otherwise identifies neither, ADR-318 item 4, which this amends for these jobs), and a
-   restart of an interrupted reprogramming job whose journal records it with the same hashes
-   as the restart carries does not repeat it,
+   restart of an interrupted reprogramming job whose journal records it with the same hashes,
+   the same document as the job's own included, as the restart carries does not repeat it,
    since an erased application may no longer answer the identification requests; the restart
    identifies the ECU by the VIN and hardware part number journaled before the erase, under
    ADR-229 item 2's rules, instead. Every other restart runs the check again: one whose

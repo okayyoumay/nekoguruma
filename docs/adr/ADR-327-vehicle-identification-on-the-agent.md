@@ -4,7 +4,7 @@
 **Status:** Accepted
 **Affects:** `agent` (an identification job, write jobs' variant check), `server` (identification plans, re-evaluation of
 the reported facts), `diag-frontend` and `diag-ir` (operator-facing variant attributes), design
-8.8.2, 8.9.1; ADR-315 (ambiguous variant matches), ADR-318 item 1, ADR-326 item 5; `docs/glossary.md`
+8.8.2, 8.9.1; ADR-315 (ambiguous variant matches), ADR-318 item 1, ADR-324 item 2, ADR-326 item 5; `docs/glossary.md`
 
 ## Context
 
@@ -47,10 +47,16 @@ maintainer chose to run the loop on the agent.
    often share an endpoint, and an answer says only that one of the definitions using it is
    fitted, until a read tells which. An answer is evidence of presence; silence is not
    evidence of absence, since an ECU behind a gateway, a sleeping ECU or one on a link without
-   functional addressing may not answer.
+   functional addressing may not answer. This is the one functional request the agent sends,
+   and it uses the functional identifier the ECU definition's protocol declares, which ADR-324
+   item 2 leaves unused for a document job's link; that link still sends only physical
+   requests.
 3. **Narrowing.** A candidate is dropped only when a fact contradicts it: a present endpoint
    that no ECU definition in any of its entries uses, an identified variant whose ECU definition
-   none of its entries allows, or an identification value whose matching rule (a VIN position
+   none of its entries allows (counted only once every other definition that uses the same
+   endpoint and is still named by a remaining candidate has been read, since an ECU can match
+   the patterns of two alternative definitions; when several match, all of them stay possible
+   and the operator chooses, as for variants in item 7), or an identification value whose matching rule (a VIN position
    range, or a read field) gives a value outside the candidate's. A read of a definition whose
    endpoint answers but whose variants all fail to match rules out only that definition; the
    others sharing the endpoint stay possible, and the endpoint becomes an unrecognized variant
@@ -59,13 +65,18 @@ maintainer chose to run the loop on the agent.
    or that a read has ruled out, is no longer read.
 4. **The next ECU.** Among the ECU definitions still named by a remaining candidate and not yet
    read, the agent reads the one whose outcome leaves the fewest candidates in the worst case,
-   counting each variant it may report and no answer as outcomes; ties go to the one named by
+   counting as outcomes each combination of a variant it may report and the values the
+   candidates' matching rules expect from the fields read with it, a match of no variant, and no
+   answer; ties go to the one named by
    more remaining candidates, then to one whose endpoint answered the presence request, then to the lowest
    identifier, so the order is deterministic. A read is the definition's variant identification
    (8.9.1) and the fields the candidates' matching rules read from it. Each ECU definition is
    read at most once per job.
-5. **End.** The loop ends when every ECU definition still named has been read, when no
-   candidate remains, or when every unread one is out of reach (it did not answer). When a
+5. **End.** The loop ends when every ECU definition still named and not ruled out has been
+   read or is out of reach, or when no candidate remains. Out of reach is established only by a
+   physical read: an endpoint that answers none of a definition's identification requests is out
+   of reach, and the other definitions using it are not read. Silence to the presence request
+   alone never puts a definition out of reach. When a
    candidate declares a VIN matching rule, the VIN is read first, from the source the plan
    names; when none does, identification reads no VIN (the data author's choice).
 6. **The agent reports facts; the server decides.** The job reports the VIN when read, the

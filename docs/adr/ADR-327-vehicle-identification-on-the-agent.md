@@ -2,9 +2,9 @@
 
 **Date:** 2026-10-18
 **Status:** Accepted
-**Affects:** `agent` (an identification job), `server` (identification plans, re-evaluation of
+**Affects:** `agent` (an identification job, write jobs' variant check), `server` (identification plans, re-evaluation of
 the reported facts), `diag-frontend` and `diag-ir` (operator-facing variant attributes), design
-8.8.2, 8.9.1; ADR-315 (ambiguous variant matches), ADR-326 item 5; `docs/glossary.md`
+8.8.2, 8.9.1; ADR-315 (ambiguous variant matches), ADR-318 item 1, ADR-326 item 5; `docs/glossary.md`
 
 ## Context
 
@@ -41,19 +41,26 @@ maintainer chose to run the loop on the agent.
    per-vehicle lock when it reads a VIN (8.8); it sends only reads and presence requests.
 2. **Presence first.** For each distinct link of the ECU definitions in the plan whose protocol
    declares a functional identifier, the agent sends one presence request functionally (for UDS,
-   TesterPresent with a response requested) and marks every ECU definition whose physical
-   response identifier answered as present. An answer is evidence of presence; silence is not
+   TesterPresent with a response requested) and records each physical response identifier that
+   answered as a present endpoint. Presence belongs to the endpoint (the link and the response
+   identifier), not to an ECU definition: alternatives such as two suppliers' ECUs for one role
+   often share an endpoint, and an answer says only that one of the definitions using it is
+   fitted, until a read tells which. An answer is evidence of presence; silence is not
    evidence of absence, since an ECU behind a gateway, a sleeping ECU or one on a link without
    functional addressing may not answer.
-3. **Narrowing.** A candidate is dropped only when a fact contradicts it: a present or
-   identified ECU that none of its entries can hold, an identified variant whose ECU definition
+3. **Narrowing.** A candidate is dropped only when a fact contradicts it: a present endpoint
+   that no ECU definition in any of its entries uses, an identified variant whose ECU definition
    none of its entries allows, or an identification value whose matching rule (a VIN position
-   range, or a read field) gives a value outside the candidate's. A missing answer never drops a
-   candidate. An ECU definition that no remaining candidate names is no longer read.
+   range, or a read field) gives a value outside the candidate's. A read of a definition whose
+   endpoint answers but whose variants all fail to match rules out only that definition; the
+   others sharing the endpoint stay possible, and the endpoint becomes an unrecognized variant
+   (ADR-326 item 3) only when every definition using it has been read without a match. A
+   missing answer never drops a candidate. An ECU definition that no remaining candidate names,
+   or that a read has ruled out, is no longer read.
 4. **The next ECU.** Among the ECU definitions still named by a remaining candidate and not yet
    read, the agent reads the one whose outcome leaves the fewest candidates in the worst case,
    counting each variant it may report and no answer as outcomes; ties go to the one named by
-   more remaining candidates, then to an ECU already marked present, then to the lowest
+   more remaining candidates, then to one whose endpoint answered the presence request, then to the lowest
    identifier, so the order is deterministic. A read is the definition's variant identification
    (8.9.1) and the fields the candidates' matching rules read from it. Each ECU definition is
    read at most once per job.
@@ -72,11 +79,15 @@ maintainer chose to run the loop on the agent.
    only this choice. When more than one variant of an ECU definition matches in an
    identification job, the agent reports all of them instead of the first one ADR-315 selects,
    and the operator picks one by its attributes. The picked variant can be used for reads and
-   other jobs that do not write. A job that writes configuration values or reprograms an ECU
-   needs its variant identification to match exactly one variant (8.9.1); it is refused when
-   several match, whatever the operator picked, so an operator's choice never decides a write's
-   target. Other jobs pinned to a variant use it when it is among the matching ones, and are
-   refused when it is not; jobs not pinned keep ADR-315's first match.
+   other jobs that do not write; such a job checks, before its procedure runs, that its
+   variant's patterns match the ECU, and is refused when they do not. A job that writes
+   configuration values or reprograms an ECU needs its variant identification to match exactly
+   one variant (8.9.1), and the agent can only know that by trying every variant: so a write job
+   carries, beside its own variant's document, the documents of every other variant of the same
+   ECU definition (amending ADR-318 item 1, under which a job carries one variant's document),
+   and before anything that writes is sent the agent runs variant identification over all of
+   them; the job is refused unless exactly one variant matches and it is the job's own, whatever
+   the operator picked, so an operator's choice never decides a write's target.
 8. **Manual paths.** The operator can choose a vehicle definition by hand (an unregistered or
    misidentified vehicle), and the identification job then identifies that definition's entries
    only; or ask for access to every ECU, for which the plan holds every ECU definition the
@@ -91,8 +102,10 @@ maintainer chose to run the loop on the agent.
 - An identification plan can be large for a tenant with many models or for access to every ECU;
   its documents are fetched lazily by hash, but each read costs bus time, so the worst-case
   choice in item 4 matters most on large plans.
-- Item 7 tightens writes: before it, a write took ADR-315's first matching variant even when
-  several matched. Variant patterns that overlap now block writes until they are made exact.
+- Item 7 tightens writes: before it, a write job carried one variant's document and nothing
+  checked that no other variant of its ECU matched. Variant patterns that overlap now block
+  writes until they are made exact, and a write job's payload grows by the other variants'
+  documents.
 - Gateway unlocking before identification is not covered: an ECU behind a locked gateway is
   reported as not answering. Identifying through an unlocked gateway is a later decision, with
   the multi-ECU procedure design.

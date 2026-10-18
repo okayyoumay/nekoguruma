@@ -1,8 +1,8 @@
 // Relies on the debug-only runtime VCI_CONFIG_PATH override; see ADR-073.
 #![cfg(debug_assertions)]
 //! `ngr-agent run` end to end without hardware: the agent binary resolves `sim-vci`, picks the
-//! `j2534-0404-service` build for its ABI from a workers directory, launches it and runs an IR
-//! program file on the simulated ECU behind it.
+//! `j2534-0404-service` build for its ABI from a workers directory, launches it and runs the
+//! procedure of a variant's document on the simulated ECU behind it.
 //!
 //! `ngr-agent` belongs to another package, so cargo builds it only when the `agent` package is
 //! tested in the same run (as `cargo test --workspace` and CI do). It is looked up next to the
@@ -81,6 +81,29 @@ fn program() -> Program {
     }
 }
 
+/// A variant's document whose procedure is `procedure`: its protocol is UDS over ISO 15765 at
+/// 500 kbit/s on 7E0 / 7E8, the link the job opens (ADR-324).
+fn document(procedure: &Program) -> Vec<u8> {
+    use diag_ir::declaration::{EcuDocumentT, EcuVariantT, ProtocolT, encode_ecu_document};
+    let mut protocol = ProtocolT::default();
+    protocol.short_name = Some("ISO15765".into());
+    protocol.application_layer = Some("UDS".into());
+    protocol.baud_rate = 500_000;
+    protocol.tx_id = 0x7E0;
+    protocol.rx_id = 0x7E8;
+    let mut variant = EcuVariantT::default();
+    variant.id = 1;
+    variant.short_name = Some("sim".into());
+    variant.protocols = Some(vec![protocol]);
+    let mut document = EcuDocumentT::default();
+    document.schema_version = IR_SCHEMA_VERSION;
+    document.source_format = Some("csv-starlark".into());
+    document.source_digest = Some("00".into());
+    document.variant = Some(Box::new(variant));
+    document.procedure = Some(postcard::to_allocvec(procedure).expect("program should serialize"));
+    encode_ecu_document(&document)
+}
+
 /// Installs the service binary as `<workers>/<ABI name>/j2534-0404-service`, the layout
 /// `ngr-agent` selects from.
 fn install_worker(workers: &Path, abi_name: &str) {
@@ -94,7 +117,7 @@ fn install_worker(workers: &Path, abi_name: &str) {
 }
 
 #[test]
-fn ngr_agent_runs_a_program_file_on_sim_vci() {
+fn ngr_agent_runs_a_document_on_sim_vci() {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system clock should be after unix epoch")
@@ -116,17 +139,13 @@ fn ngr_agent_runs_a_program_file_on_sim_vci() {
     std::fs::create_dir_all(&definition_dir).expect("definition directory");
     j2534_0404_mock::write_definition(&definition_dir, LIBRARY_NAME, &sim_vci)
         .expect("definition file should be writable");
-    let program_path = root.join("program.json");
-    std::fs::write(
-        &program_path,
-        serde_json::to_vec(&program()).expect("program should serialize"),
-    )
-    .expect("program file should be writable");
+    let document_path = root.join("variant.dir");
+    std::fs::write(&document_path, document(&program())).expect("document should be writable");
 
     // The agent and the worker it launches both resolve the library through the definition.
     let mut child = Command::new(ngr_agent_path())
-        .args(["run", "--vci", LIBRARY_NAME, "--mode", "user", "--program"])
-        .arg(&program_path)
+        .args(["run", "--vci", LIBRARY_NAME, "--mode", "user", "--document"])
+        .arg(&document_path)
         .arg("--workers")
         .arg(&workers)
         // Its own lock directory, not the one next to the shared target directory's binary.

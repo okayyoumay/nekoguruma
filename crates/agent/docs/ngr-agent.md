@@ -1,13 +1,14 @@
 # `ngr-agent`
 
-`ngr-agent` is the binary of the `agent` crate (design 3.3). It has one command, which runs a
-single IR program, or the procedure of a variant's document, on a VCI for local end-to-end runs
-and tests; it does not connect to the server or take jobs from it.
+`ngr-agent` is the binary of the `agent` crate (design 3.3). It has one command, which runs the
+procedure of a variant's document on a VCI for local end-to-end runs and tests; it does not
+connect to the server or take jobs from it. A job is always a document: a bare program has no
+declarations to decode with and no declared link, so the command takes none.
 
 ## `ngr-agent run`
 
 ```sh
-ngr-agent run --vci <name> --mode <device|user> (--program <file> | --document <file>) [--api <j2534|dpdu>] [--workers <dir>] [--locks <dir>] [--tx-id <hex>] [--rx-id <hex>]
+ngr-agent run --vci <name> --mode <device|user> --document <file> [--api <j2534|dpdu>] [--workers <dir>] [--locks <dir>]
 ```
 
 | Option | Meaning |
@@ -15,20 +16,18 @@ ngr-agent run --vci <name> --mode <device|user> (--program <file> | --document <
 | `--vci` | The library name, resolved the same way by the agent (step 3) and the worker service (design 7.1.1). For J2534 v04.04: the registry key name on Windows, the `Name` of a registration definition on Linux. For the D-PDU API: the `SHORT_NAME` of an implementation in the root description file |
 | `--api` | The API the VCI's library implements: `j2534` (J2534 v04.04, `j2534-0404-service`; the default) or `dpdu` (the D-PDU API, `iso22900-service`). The names are those of a VCI profile's `standard.kind` (`schemas/vci-profile.schema.json`) |
 | `--mode` | The device's operating mode (design 6.2), `device` or `user`. Required: the mode is fixed per device at installation, and this command, which has no installation of its own, takes it from the command line rather than defaulting to either. It is passed to the worker (ADR-281 Decision item 2); design 7.2 gives it its meaning for a failed library check: device mode refuses the library, user mode reports the findings and loads it. Both worker services apply it to the checks they run before loading |
-| `--program` | IR program file: a `diag_ir::Program` serialized as JSON. A program alone has no declarations to decode response fields with, so one that decodes (`Op::DecodeField`, ADR-316) is refused in step 1 |
-| `--document` | A variant's document (design 8.2.6, `.dir`): its procedure is the program, and the job decodes response fields through its variant's declarations (`agent::JobDocument`). The document is checked as `diag_ir::declaration::load_ecu_document` checks it (ADR-296), and one without a procedure, or whose procedure is not exactly one program, is refused (ADR-318). Give exactly one of `--program` and `--document` |
+| `--document` | A variant's document (design 8.2.6, `.dir`): its procedure is the program, and the job decodes response fields through its variant's declarations (`agent::JobDocument`). The document is checked as `diag_ir::declaration::load_ecu_document` checks it (ADR-296), and one without a procedure, or whose procedure is not exactly one program, is refused (ADR-318). Required, given once. The options `--program`, `--tx-id` and `--rx-id` of earlier versions are gone: they are refused as unknown options (exit status 2) |
 | `--workers` | Directory of worker builds, laid out as `<dir>/<ABI name>/j2534-0404-service[.exe]` and `<dir>/<ABI name>/iso22900-service[.exe]` (design 7.3). Default: `workers` next to the `ngr-agent` executable |
 | `--locks` | The device's lock directory for the job's guards ("Job guards" below), as an absolute path. Default: `locks` next to the `ngr-agent` executable. Lock files are opened read-only, so a file another user created still locks. The agent creates a missing directory writable by its owner only, so a device whose agents run as several users needs it prepared beforehand: writable by all of them, and with the sticky bit (or an equivalent ACL) so that no user can delete another's lock files (ADR-257). It must also be readable by every agent user, since the per-vehicle lock lists it, and on Unix support hard links, with which it creates its files (ADR-262). On Unix a directory that group or others may write without the sticky bit, or without being readable by them, is refused |
-| `--tx-id`, `--rx-id` | With `--program` only: physical request and response CAN IDs in hex, with or without `0x`. Default `7E0` / `7E8`. Only 11-bit IDs: the link does not set the CAN ID format. With `--document` they are refused, since the document declares its link |
 
-A document's job opens the link its variant declares (`agent::Job::declared_link`, ADR-324):
+The job opens the link its variant declares (`agent::Job::declared_link`, ADR-324):
 
 - The variant must declare exactly one protocol. It must carry `UDS`, under the short name
   `ISO15765` or `ISO_14229_3_on_ISO_15765_2`, without extended addressing.
 - The baud rate and the two identifiers are the protocol's.
 - `CP_P2Max`, `CP_P2Star` and `CP_RC78CompletionTimeout`, in microseconds, give the timings,
-  rounded up to whole milliseconds. Without them the timings are those of a program's link
-  below.
+  rounded up to whole milliseconds. Without them the timings are the link's defaults
+  (`LinkConfig::iso15765`): P2 1 s, P2* 5 s and a 25 s bound on a response-pending chain.
 - The protocol's other ComParams are set on the link as declared, after the link's own, with
   the class the worker takes from the ComParam. Names compare ignoring case.
 - Refused: a ComParam the link sets itself, one that lets a primitive outlast the host's
@@ -39,16 +38,14 @@ A document's job opens the link its variant declares (`agent::Job::declared_link
   does not know, or resolves to one the link already set, fails when the link is set up,
   naming the ComParam.
 
-A program's link is UDS on ISO 15765 at 500 kbit/s (`LinkConfig::iso15765`), with the CAN IDs
-from the command line, P2 1 s, P2* 5 s and a 25 s bound on a response-pending chain. Either
-link's resource is named by the ISO 22900-2 (2022)
+The link's resource is named by the ISO 22900-2 (2022)
 short names of UDS on dual-wire CAN (Annex B.1, B.2), which both worker kinds resolve
 (`agent::link::resource_data`, ADR-319).
 
 Steps (`agent::check_job`, `agent::guards::JobGuards`, `agent::launch::launch_worker`, then `agent::run_program`):
 
-1. Read the program, or the document and its procedure, and check the job (`agent::check_job`):
-   a program that decodes response fields without a document, or decodes a field the document
+1. Read the document and its procedure, and check the job (`agent::check_job`):
+   a program that decodes a field the document
    does not declare (ADR-318), a generic send-receive (`Op::SendReceive`, ADR-321) whose
    service the document does not declare with a request and a positive response, or whose
    variant's negative-response shape the workers do not support (ADR-322), a program whose schema version or
@@ -123,7 +120,7 @@ commits 0 (ADR-252).
 | Exit status | Meaning | Output |
 |---|---|---|
 | 0 | The program ran to its end | The final `diag_ir::VmState` as one line of JSON on stdout. A negative response is a value on the stack, not a failure |
-| 1 | Reading the program, launching the worker or the job failed (including a procedure that ended itself as failed, `JobError::ProcedureFailed`), the worker may still hold the VCI after a failed link close, or the final state holds a non-finite float (infinity or NaN), which JSON cannot represent | The reason on stderr |
+| 1 | Reading the document, launching the worker or the job failed (including a procedure that ended itself as failed, `JobError::ProcedureFailed`), the worker may still hold the VCI after a failed link close, or the final state holds a non-finite float (infinity or NaN), which JSON cannot represent | The reason on stderr |
 | 2 | Invalid command line | The error and the usage on stderr |
 
 The worker's own log goes to stderr.

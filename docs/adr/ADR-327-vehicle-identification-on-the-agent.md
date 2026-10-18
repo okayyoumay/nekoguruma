@@ -184,7 +184,7 @@ maintainer chose to run the loop on the agent.
    erase the application (a configuration write, a DTC clear, a routine) journals no such
    identity, while its ECU can still answer, so the check is the only way to confirm the
    restart reaches the same ECU; one whose carried program or documents differ from the recorded
-   hashes is refused, since the ECU may already be changed and the check could not be rerun.
+   hashes, or that names another covered document as its own, is refused, since the ECU may already be changed and the check could not be rerun.
 8. **Manual paths.** The operator can choose a vehicle definition by hand (an unregistered or
    misidentified vehicle), and the plan then holds that definition's entries and the ECU
    definitions they name, without candidates, so a fact that contradicts the chosen definition

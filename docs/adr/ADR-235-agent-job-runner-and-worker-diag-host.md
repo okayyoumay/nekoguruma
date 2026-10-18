@@ -1,7 +1,7 @@
 # ADR-235: Agent Job Runner and the Worker-Backed DiagHost
 
 **Date:** 2026-10-06
-**Status:** Accepted (item 8 relaxed for debug builds against `sim-vci` by ADR-247; item 3's lost VCI told apart by ADR-289; item 2's `ReadDtc` request building, item 3's UDS response patterns and item 8's single UDS allowlist superseded by ADR-309; item 4's protocol name superseded by ADR-319; item 4's caller-built link superseded for a document's job by ADR-324; item 8's read-only ceiling widened inside access programs by ADR-325 item 10; item 3's immediate failure on no response or lost events held behind an access target with a loss clock until its state is known, by ADR-325 item 12)
+**Status:** Accepted (item 8 relaxed for debug builds against `sim-vci` by ADR-247; item 3's lost VCI told apart by ADR-289; item 2's `ReadDtc` request building, item 3's UDS response patterns and item 8's single UDS allowlist superseded by ADR-309; item 4's protocol name superseded by ADR-319; item 4's caller-built link superseded for a document's job by ADR-324; item 8's read-only ceiling widened inside access programs by ADR-325 item 10; item 3's immediate failure on no response or lost events held behind an access target with a loss clock until its state is known, by ADR-325 item 12; item 8's TesterPresent ban excepted for an identification job's functional presence request, and item 3's one answer to a request widened to every answer in the response window for that request and for the variant guard's requests, by ADR-327)
 **Affects:** `agent` (`src/runner.rs`, `src/host.rs`, `src/link.rs`, `src/policy.rs`), `j2534-0404-service` (`tests/agent_end_to_end.rs`), `docs/system-architecture.md` 3.3 / 8.2.4
 
 ## Context

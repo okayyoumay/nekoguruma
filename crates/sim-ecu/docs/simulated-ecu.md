@@ -97,6 +97,8 @@ or `reconnect()` of the simulated ECU leaves it as it is.
 | F190 | `EcuConfig::vin`; writable as 17 ASCII alphanumeric bytes, behind security access |
 | FD00 | flash state: phase code (1 byte), block number (4 bytes), bytes received of the current download (4 bytes), big endian |
 | FD01 | `SimEcu::power_cycles` (ECU resets, power losses, reconnections) as 4 bytes, big endian, saturating |
+| FD04 | a fixed battery voltage, `BATTERY_VOLTAGE_RAW` (0x007D), as 2 bytes, big endian; the example ECU definition reads it in 0.1 V units as 12.5 V |
+| FD05 | a fixed boot time, `BOOT_TIME_RAW` (0x002D), as 2 bytes, big endian; the example ECU definition reads it in 10 ms units as 450 ms |
 
 FD00 phase codes: 00 idle, 01 erased, 02 transferring (next block), 03 transfer complete,
 04 verified, 05 interrupted (last stored block). The received byte count is zero when no

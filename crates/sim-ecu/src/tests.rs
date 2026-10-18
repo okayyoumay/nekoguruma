@@ -2608,3 +2608,12 @@ fn a_fault_for_a_request_passes_other_requests_of_its_service_by() {
         pos(&[0x62, 0xF1, 0x86, 0x01])
     );
 }
+
+#[test]
+fn the_battery_voltage_and_boot_time_dids_report_their_fixed_readings() {
+    let mut ecu = ecu();
+    assert_eq!(
+        ecu.request(&[0x22, 0xFD, 0x04, 0xFD, 0x05]),
+        SimResponse::Positive(vec![0x62, 0xFD, 0x04, 0x00, 0x7D, 0xFD, 0x05, 0x00, 0x2D])
+    );
+}

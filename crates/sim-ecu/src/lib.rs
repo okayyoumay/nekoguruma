@@ -40,6 +40,19 @@ pub const DID_FLASH_STATE: u16 = 0xFD00;
 /// Simulator-specific DID (system supplier range) reporting [`SimEcu::power_cycles`] as a
 /// 4-byte big-endian count (saturating), so that a test can tell a reset from a passive teardown.
 pub const DID_POWER_CYCLES: u16 = 0xFD01;
+/// Simulator-specific DID (system supplier range) reporting a fixed battery voltage,
+/// [`BATTERY_VOLTAGE_RAW`], as 2 bytes big endian, so that a definition can read a value through
+/// a conversion.
+pub const DID_BATTERY_VOLTAGE: u16 = 0xFD04;
+/// Simulator-specific DID (system supplier range) reporting a fixed boot time,
+/// [`BOOT_TIME_RAW`], as 2 bytes big endian, for the same purpose.
+pub const DID_BOOT_TIME: u16 = 0xFD05;
+/// The raw value [`DID_BATTERY_VOLTAGE`] reports. The example ECU definition reads it in 0.1 V
+/// units, as 12.5 V (`crates/diag-frontend/examples/example-ecu`).
+pub const BATTERY_VOLTAGE_RAW: u16 = 0x007D;
+/// The raw value [`DID_BOOT_TIME`] reports. The example ECU definition reads it in 10 ms units,
+/// as 450 ms.
+pub const BOOT_TIME_RAW: u16 = 0x002D;
 
 /// eraseMemory routine (Annex F).
 pub const RID_ERASE_MEMORY: u16 = 0xFF00;

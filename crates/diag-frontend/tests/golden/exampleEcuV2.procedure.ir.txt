@@ -4,7 +4,7 @@ EcuDocumentT {
         "csv-starlark",
     ),
     source_digest: Some(
-        "ad769107f4e6ab1106c203405667e47beed9615d9b586794c2e66cf58a8a9f07",
+        "96f1ff0018b67d208e661b36796cbe08bbc37245afd3ea27e8b0d201bdcfddf4",
     ),
     variant: Some(
         EcuVariantT {
@@ -1422,6 +1422,182 @@ EcuDocumentT {
                     ServiceT {
                         id: 14,
                         short_name: Some(
+                            "batteryVoltage.read",
+                        ),
+                        request: Some(
+                            RequestT {
+                                sid: 34,
+                                prefix: Some(
+                                    [
+                                        253,
+                                        4,
+                                    ],
+                                ),
+                                params: Some(
+                                    [],
+                                ),
+                            },
+                        ),
+                        positive: Some(
+                            PositiveResponseT {
+                                sid: 98,
+                                prefix: Some(
+                                    [
+                                        253,
+                                        4,
+                                    ],
+                                ),
+                                fields: Some(
+                                    [
+                                        FieldT {
+                                            id: 34,
+                                            short_name: Some(
+                                                "batteryVoltage",
+                                            ),
+                                            placement: Absolute,
+                                            bit_offset: 24,
+                                            length_kind: Fixed,
+                                            bit_length: 16,
+                                            kind: Uint,
+                                            byte_order: Big,
+                                            compu: CompuLinear(
+                                                CompuLinearT {
+                                                    numerator: 1.0,
+                                                    denominator: 10.0,
+                                                    offset: 0.0,
+                                                },
+                                            ),
+                                            unit_id: 1,
+                                            length_field_id: 0,
+                                            min_bytes: 0,
+                                            max_bytes: 0,
+                                            termination: EndOfPdu,
+                                            shape: NONE,
+                                        },
+                                    ],
+                                ),
+                            },
+                        ),
+                        negatives: Some(
+                            [
+                                NegativeResponseT {
+                                    nrc: 18,
+                                    message_id: 10,
+                                    retryable: false,
+                                },
+                                NegativeResponseT {
+                                    nrc: 34,
+                                    message_id: 11,
+                                    retryable: false,
+                                },
+                                NegativeResponseT {
+                                    nrc: 49,
+                                    message_id: 12,
+                                    retryable: false,
+                                },
+                                NegativeResponseT {
+                                    nrc: 51,
+                                    message_id: 13,
+                                    retryable: false,
+                                },
+                            ],
+                        ),
+                        required_session: 0,
+                        required_security_level: 0,
+                        p2_millis: 50,
+                        p2_star_millis: 5000,
+                    },
+                    ServiceT {
+                        id: 15,
+                        short_name: Some(
+                            "bootTime.read",
+                        ),
+                        request: Some(
+                            RequestT {
+                                sid: 34,
+                                prefix: Some(
+                                    [
+                                        253,
+                                        5,
+                                    ],
+                                ),
+                                params: Some(
+                                    [],
+                                ),
+                            },
+                        ),
+                        positive: Some(
+                            PositiveResponseT {
+                                sid: 98,
+                                prefix: Some(
+                                    [
+                                        253,
+                                        5,
+                                    ],
+                                ),
+                                fields: Some(
+                                    [
+                                        FieldT {
+                                            id: 35,
+                                            short_name: Some(
+                                                "bootTime",
+                                            ),
+                                            placement: Absolute,
+                                            bit_offset: 24,
+                                            length_kind: Fixed,
+                                            bit_length: 16,
+                                            kind: Uint,
+                                            byte_order: Big,
+                                            compu: CompuLinear(
+                                                CompuLinearT {
+                                                    numerator: 10.0,
+                                                    denominator: 1.0,
+                                                    offset: 0.0,
+                                                },
+                                            ),
+                                            unit_id: 2,
+                                            length_field_id: 0,
+                                            min_bytes: 0,
+                                            max_bytes: 0,
+                                            termination: EndOfPdu,
+                                            shape: NONE,
+                                        },
+                                    ],
+                                ),
+                            },
+                        ),
+                        negatives: Some(
+                            [
+                                NegativeResponseT {
+                                    nrc: 18,
+                                    message_id: 10,
+                                    retryable: false,
+                                },
+                                NegativeResponseT {
+                                    nrc: 34,
+                                    message_id: 11,
+                                    retryable: false,
+                                },
+                                NegativeResponseT {
+                                    nrc: 49,
+                                    message_id: 12,
+                                    retryable: false,
+                                },
+                                NegativeResponseT {
+                                    nrc: 51,
+                                    message_id: 13,
+                                    retryable: false,
+                                },
+                            ],
+                        ),
+                        required_session: 0,
+                        required_security_level: 0,
+                        p2_millis: 50,
+                        p2_star_millis: 5000,
+                    },
+                    ServiceT {
+                        id: 16,
+                        short_name: Some(
                             "eraseMemory.start",
                         ),
                         request: Some(
@@ -1484,7 +1660,7 @@ EcuDocumentT {
                         p2_star_millis: 10000,
                     },
                     ServiceT {
-                        id: 15,
+                        id: 17,
                         short_name: Some(
                             "checkProgrammingDependencies.start",
                         ),
@@ -2440,7 +2616,7 @@ Program {
             0,
         ),
         DecodeField {
-            service: 15,
+            service: 17,
             field: 29,
         },
         PushI64(

@@ -91,8 +91,10 @@ fn the_example_services_have_ids_in_row_order() {
         (11, "powerCycles.read"),
         (12, "supplyVoltage.read"),
         (13, "lastResetReason.read"),
-        (14, "eraseMemory.start"),
-        (15, "checkProgrammingDependencies.start"),
+        (14, "batteryVoltage.read"),
+        (15, "bootTime.read"),
+        (16, "eraseMemory.start"),
+        (17, "checkProgrammingDependencies.start"),
     ]
     .into_iter()
     .map(|(id, name)| (id, name.to_owned()))
@@ -719,13 +721,13 @@ fn every_routine_part_and_did_record_constants_convert() {
     let files = appended(files, "dids.csv", &[",rec,0x1234,yes,yes,,,"]);
     let documents = documents(&convert(files));
     let document = &documents[0];
-    // After the example's 15 services and rec's read and write.
+    // After the example's 17 services and rec's read and write.
     let parts = [
         ("start", 0x01, "s"),
         ("stop", 0x02, "t"),
         ("results", 0x03, "u"),
     ];
-    for (n, (part, sub, field_name)) in (18..).zip(parts) {
+    for (n, (part, sub, field_name)) in (20..).zip(parts) {
         let s = service(document, &format!("cycle.{part}"));
         assert_eq!(s.id, n);
         assert_eq!(request(s), (0x31, &[sub, 0xAB, 0x01][..], &[][..]));

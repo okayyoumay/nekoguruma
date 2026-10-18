@@ -140,6 +140,8 @@ fn ecu_script_with_dtcs(dtcs: &[u8]) -> Script {
         .response("sparePartNumber.read", read_did(0xF187, b"NGR-SIM-ECU"))
         .response("softwareVersion.read", read_did(0xF189, b"1.0.0"))
         .response("vin.read", read_did(0xF190, b"NGRSIMECU00000001"))
+        .response("batteryVoltage.read", read_did(0xFD04, &[0x00, 0x7D]))
+        .response("bootTime.read", read_did(0xFD05, &[0x00, 0x2D]))
         .response("readDtcByStatusMask", dtcs)
 }
 
@@ -154,6 +156,8 @@ fn the_read_procedure_runs_with_scripted_answers() {
             ("sparePartNumber.read", false),
             ("softwareVersion.read", false),
             ("vin.read", false),
+            ("batteryVoltage.read", false),
+            ("bootTime.read", false),
             ("readDtcByStatusMask", false),
         ]
     );
@@ -161,14 +165,19 @@ fn the_read_procedure_runs_with_scripted_answers() {
         panic!("the VIN request: {:?}", report.events[3]);
     };
     assert_eq!(request, &[0x22, 0xF1, 0x90]);
-    let DryRunEvent::Request { request, .. } = &report.events[4] else {
-        panic!("the DTC request: {:?}", report.events[4]);
+    let DryRunEvent::Request { request, .. } = &report.events[6] else {
+        panic!("the DTC request: {:?}", report.events[6]);
     };
     assert_eq!(request, &[0x19, 0x02, 0x08]);
     assert_eq!(
         decoded(&report, 3, "vin"),
         PhysicalValue::Text("NGRSIMECU00000001".to_owned())
     );
+    assert_eq!(
+        decoded(&report, 4, "batteryVoltage"),
+        PhysicalValue::Float(12.5)
+    );
+    assert_eq!(decoded(&report, 5, "bootTime"), PhysicalValue::Float(450.0));
     assert_eq!(
         report.events.last(),
         Some(&DryRunEvent::Log {

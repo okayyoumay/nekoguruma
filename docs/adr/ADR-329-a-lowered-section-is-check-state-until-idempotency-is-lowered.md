@@ -38,9 +38,15 @@ places that read a section's idempotency today are the restart checks:
 
 ## Consequences
 
-- A procedure written in Starlark can declare interruptibility now. A `recoveryRequired` section
-  is journaled and judged by the agent as ADR-291 and ADR-293 describe, and an `uninterruptible`
-  one holds a cancellation until it ends.
+- A procedure written in Starlark can declare interruptibility now, and its program carries it.
+  The agent reads only `recoveryRequired` so far: a journaled run (`run_program_journaled`) keeps
+  a journal for it and writes its intents as ADR-291 and ADR-293 describe, and the restart checks
+  judge it. `uninterruptible`, `interruptible` and the expected duration reach the program but
+  no part of the agent acts on them yet.
+- One section function becomes several `Section` entries, one per copy it runs (ADR-301 item 3).
+  A check made when a section is entered, such as comparing the expected duration with the
+  remaining OEM authentication time (design 8.10.1), has to tell the section function's own
+  entry from a call into a helper's copy inside the section.
 - A reader of the IR sees `CheckState` on every lowered section; it means "not stated", not that
   the author chose a state query. A later change to how the job runner treats `CheckState` must
   keep it equivalent to "not covered" for sections this ADR lowers, or lower them differently.

@@ -74,6 +74,10 @@ const DEFAULT_MAX_ITERATIONS: u32 = 1000;
 /// of the functions it reaches count toward it (4.5, ADR-301).
 const MAX_COPIES: usize = 1000;
 
+/// The most instructions the specialized copies may hold together (subset 2.6, 4.5), so a large
+/// function reached from many sections cannot make the converter build an unbounded program.
+const MAX_COPIED_INSTRUCTIONS: usize = 1 << 22;
+
 /// The `Fail` code of a loop that runs past its limit (subset 4.2, ADR-280).
 const LOOP_LIMIT_EXCEEDED: &str = "LOOP_LIMIT_EXCEEDED";
 
@@ -491,8 +495,6 @@ struct Func<'a> {
     ret: Tys,
     label: Label,
     code: Code,
-    /// Whether the function is part of the program: reached from `main`.
-    emitted: bool,
     /// The attributes of a section function (4.5): its interruptibility and expected duration.
     section: Option<(Interruptible, u32)>,
 }
@@ -792,7 +794,6 @@ impl<'a> Lowerer<'a> {
                 ret: Tys::default(),
                 label,
                 code: Vec::new(),
-                emitted: false,
                 section: sections.get(&line).copied(),
             });
         }
@@ -863,7 +864,6 @@ impl<'a> Lowerer<'a> {
                 }
             }
             self.funcs[id].code = code;
-            self.funcs[id].emitted = true;
         }
         self.plan_copies(main);
     }
@@ -884,13 +884,19 @@ impl<'a> Lowerer<'a> {
     /// Lists the copies the program holds (ADR-301): starting from the entry's call to `main`,
     /// each call reaches the copy [`Lowerer::copy_for`] names, so every function a section
     /// reaches gets a copy that only that section runs, and a function also called outside every
-    /// section keeps its own copy there. The copies a section needs count toward the budget of
-    /// 2.6, before each is made; the call that would pass it is `STAR_SPECIALIZATION_LIMIT`.
+    /// section keeps its own copy there. The copies a section needs count toward the budgets of
+    /// 2.6, in copies and in instructions, before each is made; the call that would pass one is
+    /// `STAR_SPECIALIZATION_LIMIT`.
     fn plan_copies(&mut self, main: usize) {
         let first = self.copy_for(main, None);
         let mut listed: HashSet<FuncCopy> = HashSet::from([first]);
         self.copies = vec![first];
         let mut specialized = usize::from(first.section.is_some());
+        let mut copied = if first.section.is_some() {
+            self.funcs[main].code.len()
+        } else {
+            0
+        };
         let mut next = 0;
         while next < self.copies.len() {
             let copy = self.copies[next];
@@ -918,18 +924,21 @@ impl<'a> Lowerer<'a> {
                     continue;
                 }
                 if target.section.is_some() {
-                    if specialized == MAX_COPIES {
+                    let size = self.funcs[callee].code.len();
+                    if specialized == MAX_COPIES || copied + size > MAX_COPIED_INSTRUCTIONS {
                         self.error(
                             StarCode::SpecializationLimit,
                             span,
                             format!(
                                 "the sections need more than {MAX_COPIES} copies of the \
-                                 functions they reach (2.6, 4.5)"
+                                 functions they reach, or more than {MAX_COPIED_INSTRUCTIONS} \
+                                 instructions in them (2.6, 4.5)"
                             ),
                         );
                         return;
                     }
                     specialized += 1;
+                    copied += size;
                 }
                 listed.insert(target);
                 self.copies.push(target);

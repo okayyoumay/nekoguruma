@@ -326,6 +326,50 @@ fn logs_of(program: &Program, message: &str) -> Vec<u32> {
         .collect()
 }
 
+/// Every jump stays in the copy it is in: its target is covered by the same sections.
+fn jumps_stay_in_their_copies(program: &Program) {
+    let covering = |pc: u32| -> Vec<(u32, u32)> {
+        in_a_section(program, pc)
+            .iter()
+            .map(|s| (s.start_pc, s.end_pc))
+            .collect()
+    };
+    for (pc, op) in program.code.iter().enumerate() {
+        if let Op::Jump(target) | Op::JumpIfFalse(target) = op {
+            assert_eq!(covering(pc as u32), covering(*target), "jump at {pc}");
+        }
+    }
+}
+
+/// The calls to the copies of the function that logs `message`: whether each call is in a
+/// section, and whether the copy it reaches is.
+fn calls_to(program: &Program, message: &str) -> Vec<(bool, bool)> {
+    let logs = logs_of(program, message);
+    let mut found: Vec<(bool, bool)> = program
+        .code
+        .iter()
+        .enumerate()
+        .filter_map(|(pc, op)| match op {
+            // The copy entered at `target` holds a log before its first `Ret`.
+            Op::Call(target) => {
+                let end = (*target..program.code.len() as u32)
+                    .find(|&at| matches!(program.code[at as usize], Op::Ret))?;
+                logs.iter()
+                    .any(|&log| (*target..end).contains(&log))
+                    .then(|| {
+                        (
+                            !in_a_section(program, pc as u32).is_empty(),
+                            !in_a_section(program, *target).is_empty(),
+                        )
+                    })
+            }
+            _ => None,
+        })
+        .collect();
+    found.sort();
+    found
+}
+
 fn in_a_section(program: &Program, pc: u32) -> Vec<&Section> {
     program
         .sections
@@ -337,11 +381,13 @@ fn in_a_section(program: &Program, pc: u32) -> Vec<&Section> {
 #[test]
 fn a_section_function_and_what_it_calls_are_covered_by_its_section() {
     let source = "\
-def helper():
+def helper(n):
+    if n > 1:
+        diag.log(1, \"twice\")
     diag.log(1, \"helper\")
 
 def inner():
-    helper()
+    helper(2)
 
 # @section recoveryRequired expected=500
 def write():
@@ -349,12 +395,15 @@ def write():
     diag.log(1, \"write\")
 
 def main():
-    helper()
+    helper(1)
     write()
     write()
 ";
     let program = lowered(source).expect("lowers");
     program.validate().expect("valid");
+    jumps_stay_in_their_copies(&program);
+    // `main` calls the outside copy of `helper`, and the section's `inner` its own copy.
+    assert_eq!(calls_to(&program, "helper"), [(false, false), (true, true)]);
     // `write`, and its copies of `inner` and `helper`, each covered by a section.
     assert_eq!(program.sections.len(), 3);
     for section in &program.sections {
@@ -446,30 +495,61 @@ fn main_can_be_a_section_function() {
 
 #[test]
 fn sections_need_at_most_a_thousand_copies() {
-    // 501 helpers reached from each of two sections: 2 + 1002 copies.
-    let mut source = String::new();
-    for n in 0..501 {
-        source.push_str(&format!("def h{n}():\n    pass\n\n"));
+    // Section `a` reaches `first` helpers and `b` reaches `second`: 2 + first + second copies.
+    let source = |first: usize, second: usize| {
+        let mut source = String::new();
+        for n in 0..first.max(second) {
+            source.push_str(&format!("def h{n}():\n    pass\n\n"));
+        }
+        let calls =
+            |count: usize| -> String { (0..count).map(|n| format!("    h{n}()\n")).collect() };
+        source.push_str(&format!(
+            "# @section interruptible\ndef a():\n{}\n",
+            calls(first)
+        ));
+        source.push_str(&format!(
+            "# @section interruptible\ndef b():\n{}\n",
+            calls(second)
+        ));
+        source.push_str("def main():\n    a()\n    b()\n");
+        source
+    };
+    let program = lowered(&source(500, 498)).expect("1,000 copies are within the budget");
+    assert_eq!(program.sections.len(), 1000);
+
+    // The 1,001st copy is `b`'s copy of `h498`, at its call in `b`.
+    let text = source(500, 499);
+    let found = codes(&text);
+    let call_line = text
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| *line == "    h498()")
+        .last()
+        .map(|(at, _)| at as u32 + 1)
+        .unwrap();
+    assert_eq!(found, vec![(StarCode::SpecializationLimit, call_line)]);
+}
+
+#[test]
+fn the_copies_of_a_large_function_are_bounded_in_instructions() {
+    // About 270,000 instructions in `big`, and copies for 100 sections.
+    let items: Vec<String> = (0..300).map(|n| n.to_string()).collect();
+    let mut source = format!(
+        "A = [{}]\n\ndef big():\n    for a in A:\n        for b in A:\n            diag.log(1, \"x\")\n\n",
+        items.join(", ")
+    );
+    for n in 0..100 {
+        source.push_str(&format!(
+            "# @section interruptible\ndef s{n}():\n    big()\n\n"
+        ));
     }
-    let calls: String = (0..501).map(|n| format!("    h{n}()\n")).collect();
-    source.push_str(&format!("# @section interruptible\ndef a():\n{calls}\n"));
-    source.push_str(&format!("# @section interruptible\ndef b():\n{calls}\n"));
-    source.push_str("def main():\n    a()\n    b()\n");
+    let calls: String = (0..100).map(|n| format!("    s{n}()\n")).collect();
+    source.push_str(&format!("def main():\n{calls}"));
+    let started = std::time::Instant::now();
     let found = codes(&source);
+    assert!(started.elapsed() < std::time::Duration::from_secs(60));
     assert_eq!(found.len(), 1, "{found:?}");
     assert_eq!(found[0].0, StarCode::SpecializationLimit);
-
-    // 499 helpers: 2 + 998 copies, within the budget.
-    let mut source = String::new();
-    for n in 0..499 {
-        source.push_str(&format!("def h{n}():\n    pass\n\n"));
-    }
-    let calls: String = (0..499).map(|n| format!("    h{n}()\n")).collect();
-    source.push_str(&format!("# @section interruptible\ndef a():\n{calls}\n"));
-    source.push_str(&format!("# @section interruptible\ndef b():\n{calls}\n"));
-    source.push_str("def main():\n    a()\n    b()\n");
-    let program = lowered(&source).expect("within the budget");
-    assert_eq!(program.sections.len(), 1000);
 }
 
 #[test]

@@ -317,6 +317,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-325](ADR-325-procedures-that-address-several-ecus.md) | Procedures That Address Several ECUs | Accepted (item 7's exact list of declaration-only documents widened, its combination record and restart rule extended, and its identification taking an operator's variant pick for a read-only job, by ADR-327) | `diag-ir` targets and `SelectTarget`, `diag-frontend` `diag.ecu` and lowering per combination of variants, `agent` one link and document per target, access programs, keep-alive, policy access class, design 8.2.4, 8.2.5, 8.2.6, 8.10; ADR-229, ADR-233, ADR-235, ADR-244, ADR-245, ADR-247, ADR-254, ADR-257, ADR-261, ADR-264, ADR-280, ADR-293, ADR-295, ADR-307, ADR-309, ADR-311, ADR-313, ADR-316, ADR-320, ADR-318, ADR-321, ADR-322, ADR-324 |
 | [ADR-326](ADR-326-vehicle-definitions.md) | Vehicle Definitions for Model Identification and Topology | Accepted (items 2, 3 and 5 and the Consequences amended by ADR-327) | `diag-frontend` (vehicle definition kind), `server` (identification, catalog, prefetch), role and record-template model scopes, SOVD components; design 8.1, 8.3, 8.8.2, 9.2; ADR-306, ADR-315, ADR-318, ADR-324 |
 | [ADR-327](ADR-327-vehicle-identification-on-the-agent.md) | Vehicle Identification Runs on the Agent | Accepted | `agent` identification job and variant guard, `server` identification plans and guard lists, variant attributes and definitive negative responses in `diag-frontend` / `diag-ir`; design 8.2.4, 8.2.5, 8.8.2, 8.9.1; ADR-229 item 2, ADR-235 items 3 and 8, ADR-244's record set, ADR-315 item 3, ADR-318 items 1 and 4 and its Consequences, ADR-324 items 1 and 2, ADR-325 item 7, ADR-326 items 2, 3 and 5 and its Consequences |
+| [ADR-328](ADR-328-dry-run-with-vehicle-access-mocked.md) | Dry Run with Vehicle Access Mocked | Accepted | `diag-ir` `dry_run` (`Script`, `DryRunReport`), `diag-frontend` dry-run tests; design 12.1, `starlark-subset.md` 6; ADR-233, ADR-280, ADR-297, ADR-321 |
 
 ## Status Legend
 
@@ -744,6 +745,7 @@ the predecessor repository these ADRs came from.
 - ADR-325 (item 7's exact list of declaration-only documents widened, its combination record and restart rule extended, and its identification taking an operator's variant pick for a read-only job, by ADR-327)
 - ADR-326 (items 2, 3 and 5 and the Consequences amended by ADR-327)
 - ADR-327
+- ADR-328
 
 ### Acquired Data & Monitoring
 - ADR-236

@@ -266,8 +266,9 @@ maintainer chose to run the loop on the agent.
    match. Even there the check for a second ECU still runs: together with ADR-229's VIN and
    hardware identity reads, before anything that changes an ECU, the agent sends the listed
    variants' identification requests over the target's link and collects answers as above, and
-   an answer on a listed response identifier other than the target's, or a VCI that cannot
-   receive one of them, ends the job in on-site intervention, so an ECU that came to share the
+   an answer on a listed response identifier other than the target's, a second answer on the
+   target's own identifier to one request (as above), or a VCI that cannot receive one of them,
+   ends the job in on-site intervention, so an ECU that came to share the
    target's request identifier while the links were down is still caught; the target's own
    answers to those requests are not evaluated. For it the
    combination record that ADR-325 item 7 commits (or, for a job that commits none, such as a

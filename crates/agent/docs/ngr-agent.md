@@ -651,7 +651,10 @@ run on guards without the slot, ends in `JobError::NoReprogrammingSlot` before a
 a release build refuses every writing program first (`JobError::Refused`). A new run after an agent crash or a loss of the
 device's power takes them with `JobGuards::take` before it calls the runner, so a duplicate
 resume of the same job waits there without opening a link. A dropped future releases them only
-once the job thread has ended. A job that survives a worker crash, a VCI disconnect or a loss
+once the job thread has ended. A cancel (a dropped future) that comes inside an uninterruptible
+section is held (design 5.6, 8.10.1): the section runs to its end, and the job stops before the
+first instruction outside every such section, so the job thread may run on for the rest of the
+section, bounded by the step limit. A job that survives a worker crash, a VCI disconnect or a loss
 of the vehicle's supply alone gets them back, still held, and passes them to its next run. A
 VCI name has 1 to `MAX_VCI_NAME` (100) bytes. The lock directory is one per device,
 shared by every agent process on it whichever user it runs as: each of them must be able to

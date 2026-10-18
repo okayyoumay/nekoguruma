@@ -14,7 +14,8 @@ use std::time::Duration;
 
 use diag_ir::declaration::EcuVariant;
 use diag_ir::{
-    DiagHost, IdentityKind, Program, StepError, StepOutcome, Vm, VmError, VmState, WaitingOn,
+    DiagHost, IdentityKind, Interruptible, Program, StepError, StepOutcome, Vm, VmError, VmState,
+    WaitingOn,
 };
 use tokio::runtime::{Handle, RuntimeFlavor};
 use worker_host::client::WorkerClient;
@@ -383,7 +384,9 @@ fn refuse_beyond(
 /// keep their locks and a run refuses them with [`JobError::LinkUnconfirmed`] until
 /// [`JobGuards::worker_gone`]. Dropping the returned future cancels the job:
 /// the call or primitive in flight finishes, no further instruction runs, and the link is
-/// closed. That happens after the future is gone, so a caller that dropped it must not hand
+/// closed. Inside an uninterruptible section (design 5.6, 8.10.1) the cancel is held: the
+/// section runs to its end, and the job stops before the first instruction outside every such
+/// section. That happens after the future is gone, so a caller that dropped it must not hand
 /// the worker to another job yet (ADR-235 consequences).
 ///
 /// The job is checked by [`check_job`] against [`policy::build_ceiling`] before anything opens,
@@ -1326,6 +1329,16 @@ enum RunEnd {
     Stopped(Vm),
 }
 
+/// Whether the instruction at `pc` lies in an uninterruptible section (design 8.10.1). A
+/// Starlark section function gives each copy of the functions it reaches a section of its own
+/// (ADR-329), so a helper's copy inside the section is covered too.
+fn uninterruptible_at(program: &Program, pc: u32) -> bool {
+    program.sections.iter().any(|section| {
+        matches!(section.interruptible, Interruptible::No)
+            && (section.start_pc..section.end_pc).contains(&pc)
+    })
+}
+
 /// The step loop from `vm`'s state, shared by a run from the program's start and the restart's
 /// replay (ADR-273). The caller commits the run start (ADR-272, ADR-274), not this loop. With `stop_before`, the loop ends in
 /// [`RunEnd::Stopped`] when execution arrives at that instruction, before the journal's
@@ -1356,7 +1369,15 @@ where
     // Whether the journal has seen this arrival yet (a timer wait polls the same instruction
     // again).
     let mut arrived = true;
+    // A cancel requested inside an uninterruptible section is held until the section ends
+    // (design 5.6, 8.10.1): the loop and the journal's boundary reads see this flag instead.
+    let held = AtomicBool::new(false);
     loop {
+        let cancelled = if uninterruptible_at(program, vm.state.pc) {
+            &held
+        } else {
+            cancelled
+        };
         if cancelled.load(Ordering::Relaxed) {
             return Err(JobError::Cancelled);
         }
@@ -1516,6 +1537,10 @@ mod tests {
         cancel_after: Option<(u32, Arc<AtomicBool>)>,
         /// The job's document (`Declarations`).
         document: Option<JobDocument>,
+        /// The messages logged, in order.
+        logs: Vec<String>,
+        /// Set when this message is logged, as a dropped job future would.
+        cancel_on_log: Option<(&'static str, Arc<AtomicBool>)>,
     }
 
     impl DiagHost for FakeHost {
@@ -1563,7 +1588,14 @@ mod tests {
         fn monitor_capture(&mut self, _: u32) -> Result<(), HostError> {
             Err(HostError::Unsupported("MonitorCapture"))
         }
-        fn log(&mut self, _: u8, _: &str) {}
+        fn log(&mut self, _: u8, message: &str) {
+            self.logs.push(message.to_owned());
+            if let Some((at, flag)) = &self.cancel_on_log
+                && *at == message
+            {
+                flag.store(true, Ordering::Relaxed);
+            }
+        }
     }
 
     impl RuntimeInputs for FakeHost {
@@ -1885,6 +1917,69 @@ mod tests {
             Err(JobError::Cancelled)
         ));
         assert_eq!(host.requests, 1);
+    }
+
+    /// `source` lowered for a variant that declares nothing.
+    fn lowered(source: &str) -> Program {
+        use diag_frontend::star::{RequestIndex, check, lower};
+        use diag_ir::declaration::{
+            EcuDocumentT, EcuVariantT, encode_ecu_document, load_ecu_document,
+        };
+        let checked = check("t.star", source).expect("checks");
+        let mut document = EcuDocumentT::default();
+        document.schema_version = IR_SCHEMA_VERSION;
+        document.source_format = Some("test".to_owned());
+        document.source_digest = Some(String::new());
+        document.variant = Some(Box::new(EcuVariantT::default()));
+        let bytes = encode_ecu_document(&document);
+        let variant = load_ecu_document(&bytes).unwrap().variant().unwrap();
+        let program = lower("t.star", &checked, variant, &RequestIndex::default())
+            .expect("lowers")
+            .program;
+        program.validate().expect("valid");
+        program
+    }
+
+    #[test]
+    fn a_cancel_inside_an_uninterruptible_section_waits_for_its_end() {
+        // The cancel arrives in a helper's copy inside the section, then the section goes on to
+        // its end; the first step after it, here the helper's copy outside every section, stops.
+        let source = |attribute: &str| {
+            format!(
+                "\
+def helper():
+    diag.log(1, \"helper\")
+
+# @section {attribute}
+def write():
+    helper()
+    diag.log(1, \"in section\")
+
+def main():
+    write()
+    helper()
+"
+            )
+        };
+        let run = |attribute: &str| {
+            let flag = Arc::new(AtomicBool::new(false));
+            let mut host = FakeHost {
+                cancel_on_log: Some(("helper", Arc::clone(&flag))),
+                ..FakeHost::default()
+            };
+            let result = run_plain(
+                &lowered(&source(attribute)),
+                &mut host,
+                JobLimits::default(),
+                &flag,
+            );
+            assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
+            host.logs
+        };
+        assert_eq!(run("uninterruptible"), ["helper", "in section"]);
+        // Elsewhere a cancel stops the job before its next instruction.
+        assert_eq!(run("interruptible"), ["helper"]);
+        assert_eq!(run("recoveryRequired"), ["helper"]);
     }
 
     // ------------------------------------------------------------ journaling (ADR-252)

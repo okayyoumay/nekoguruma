@@ -1,0 +1,101 @@
+# ADR-327: Vehicle Identification Runs on the Agent
+
+**Date:** 2026-10-18
+**Status:** Accepted
+**Affects:** `agent` (an identification job), `server` (identification plans, re-evaluation of
+the reported facts), `diag-frontend` and `diag-ir` (operator-facing variant attributes), design
+8.8.2, 8.9.1; ADR-315 (ambiguous variant matches), ADR-326 item 5; `docs/glossary.md`
+
+## Context
+
+ADR-326 describes vehicles by vehicle definitions: identification values with their matching
+rules, and a topology of ECU entries whose alternatives are ECU definitions. It leaves the
+server to identify a vehicle from values a read-only job reports, and says the agent does not
+use vehicle definitions.
+
+Identifying the configuration of a connected vehicle takes many reads, each chosen from what
+the previous ones showed: which ECUs answer, which variant each one is, and so which vehicle
+definitions remain possible and which ECUs are still worth reading. Driving that loop from the
+server costs one round trip per step and does not work while the device is offline (design 5.7).
+
+The maintainer set the procedure: check which ECUs are present with functional requests; narrow
+the candidate vehicles from what the ECUs report; drop the ECUs no remaining candidate can carry;
+read the next most useful ECU; repeat until every ECU is read, none is left to read, or the rest
+are out of reach. When several models or several variants of one ECU remain, the operator
+chooses, for variants from information attached to them (for example manual or automatic
+transmission). A manual model choice and an access to every ECU remain for unregistered vehicles
+and misidentification. Whether the VIN is used is up to the author of the vehicle data. The
+maintainer chose to run the loop on the agent.
+
+## Decision
+
+1. **An identification job runs the loop on the agent.** It is a read-only job kind that carries
+   an identification plan, which the server compiles from the candidate vehicle definitions and
+   signs with the job instruction. The plan holds, per candidate, its identifier, its
+   identification values and their matching rules, and its ECU entries (role, alternative ECU
+   definitions, optional flag, gateway entry); and the documents of every variant of every ECU
+   definition the candidates name, referenced by hash as other job documents are (ADR-318), so
+   variant identification and field decoding work as in any job. The agent still fetches no
+   vehicle definition (amending ADR-326 item 5): the plan is all it reads, and the server can
+   prefetch it with the job for offline work. The job holds the per-VCI lock and promotes to the
+   per-vehicle lock when it reads a VIN (8.8); it sends only reads and presence requests.
+2. **Presence first.** For each distinct link of the ECU definitions in the plan whose protocol
+   declares a functional identifier, the agent sends one presence request functionally (for UDS,
+   TesterPresent with a response requested) and marks every ECU definition whose physical
+   response identifier answered as present. An answer is evidence of presence; silence is not
+   evidence of absence, since an ECU behind a gateway, a sleeping ECU or one on a link without
+   functional addressing may not answer.
+3. **Narrowing.** A candidate is dropped only when a fact contradicts it: a present or
+   identified ECU that none of its entries can hold, an identified variant whose ECU definition
+   none of its entries allows, or an identification value whose matching rule (a VIN position
+   range, or a read field) gives a value outside the candidate's. A missing answer never drops a
+   candidate. An ECU definition that no remaining candidate names is no longer read.
+4. **The next ECU.** Among the ECU definitions still named by a remaining candidate and not yet
+   read, the agent reads the one whose outcome leaves the fewest candidates in the worst case,
+   counting each variant it may report and no answer as outcomes; ties go to the one named by
+   more remaining candidates, then to an ECU already marked present, then to the lowest
+   identifier, so the order is deterministic. A read is the definition's variant identification
+   (8.9.1) and the fields the candidates' matching rules read from it. Each ECU definition is
+   read at most once per job.
+5. **End.** The loop ends when every ECU definition still named has been read, when no
+   candidate remains, or when every unread one is out of reach (it did not answer). When a
+   candidate declares a VIN matching rule, the VIN is read first, from the source the plan
+   names; when none does, identification reads no VIN (the data author's choice).
+6. **The agent reports facts; the server decides.** The job reports the VIN when read, the
+   presence answers, each read's decoded identification fields and matching variants, and the
+   entry states of ADR-326 item 3. The server recomputes the candidates from these facts with
+   the same rules, so the agent's narrowing only chooses what to read. One candidate is selected;
+   several go to the operator, as ADR-326 item 2 says, with ADR-326 item 5's rule that operator
+   choices never widen what a role permits.
+7. **Ambiguous variants and operator attributes.** A variant may carry operator-facing
+   attributes, labels with values (transmission: manual), that say nothing to the ECU and serve
+   only this choice. When more than one variant of an ECU definition matches in an
+   identification job, the agent reports all of them instead of the first one ADR-315 selects,
+   and the operator picks one by its attributes. The picked variant can be used for reads and
+   other jobs that do not write. A job that writes configuration values or reprograms an ECU
+   needs its variant identification to match exactly one variant (8.9.1); it is refused when
+   several match, whatever the operator picked, so an operator's choice never decides a write's
+   target. Other jobs pinned to a variant use it when it is among the matching ones, and are
+   refused when it is not; jobs not pinned keep ADR-315's first match.
+8. **Manual paths.** The operator can choose a vehicle definition by hand (an unregistered or
+   misidentified vehicle), and the identification job then identifies that definition's entries
+   only; or ask for access to every ECU, for which the plan holds every ECU definition the
+   tenant may use, without candidates, and each is identified on its own. Both are recorded as
+   operator choices.
+
+## Consequences
+
+- ADR-326 item 5 changes in one point: the agent runs identification from a plan. It still holds
+  no vehicle definition, and the server remains the authority for the selected definition and
+  for authorization.
+- An identification plan can be large for a tenant with many models or for access to every ECU;
+  its documents are fetched lazily by hash, but each read costs bus time, so the worst-case
+  choice in item 4 matters most on large plans.
+- Item 7 tightens writes: before it, a write took ADR-315's first matching variant even when
+  several matched. Variant patterns that overlap now block writes until they are made exact.
+- Gateway unlocking before identification is not covered: an ECU behind a locked gateway is
+  reported as not answering. Identifying through an unlocked gateway is a later decision, with
+  the multi-ECU procedure design.
+- Follow-up work (the agent's identification job, the server's plan and re-evaluation, variant
+  attributes in the CSV format and the IR, the write refusal on ambiguous variants) is in the
+  backlog.

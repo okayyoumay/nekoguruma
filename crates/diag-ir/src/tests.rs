@@ -1087,6 +1087,10 @@ fn primitive_programs() -> Vec<(Op, Program)> {
         with_bytes(Op::SecurityAccess { level: 1 }),
         with_bytes(Op::FlashTransfer { block: 0 }),
         alone(Op::Wait { millis: 10 }),
+        (
+            Op::WaitFromStack,
+            prog(vec![i(10), Op::WaitFromStack], constants.clone()),
+        ),
         alone(Op::HmiRequest { form: 1 }),
         alone(Op::RecordInput { template: 1 }),
         alone(Op::MonitorCapture { back_millis: 10 }),
@@ -1225,6 +1229,7 @@ fn primitive_classification_covers_every_instruction() {
         },
         Op::SendReceive { service: 0 },
         Op::ShlChecked,
+        Op::WaitFromStack,
     ];
     for (index, op) in all.iter().enumerate() {
         // The postcard encoding starts with the variant index, so this also pins the variant
@@ -1576,6 +1581,39 @@ fn waits_carry_a_stable_inquiry() {
     assert!(i[0] < i[2] && i[2] < i[5], "{i:?}");
 }
 
+/// `WaitFromStack` polls the host with the duration from the stack and the same inquiry, keeps
+/// its operand while the wait is not over, and pops it when it is.
+#[test]
+fn wait_from_stack_polls_with_the_operand_and_pops_it_when_over() {
+    let program = prog(vec![i(250), Op::WaitFromStack, i(7)], Vec::new());
+    let mut vm = Vm::new(&program);
+    let mut host = MockHost {
+        timers: VecDeque::from([false, false, true]),
+        ..MockHost::default()
+    };
+    assert_eq!(vm.step(&program, &mut host).unwrap(), StepOutcome::Continue);
+    let before = postcard::to_allocvec(&vm.state).unwrap();
+    for _ in 0..2 {
+        assert_eq!(
+            vm.step(&program, &mut host).unwrap(),
+            StepOutcome::Waiting(WaitingOn::Timer)
+        );
+        assert_eq!(postcard::to_allocvec(&vm.state).unwrap(), before);
+    }
+    assert_eq!(vm.step(&program, &mut host).unwrap(), StepOutcome::Continue);
+    assert!(vm.state.stack.is_empty());
+    assert_eq!(vm.state.pc, 2);
+    assert_eq!(host.calls, ["wait 250", "wait 250", "wait 250"]);
+    assert!(host.inquiries.iter().all(|n| *n == host.inquiries[0]));
+    // The bounds themselves are accepted.
+    for millis in [0, i64::from(u32::MAX)] {
+        let program = prog(vec![i(millis), Op::WaitFromStack], Vec::new());
+        let mut vm = Vm::new(&program);
+        run(&mut vm, &program, &mut MockHost::default());
+        assert!(vm.state.stack.is_empty());
+    }
+}
+
 /// Values that are easy to get wrong in serialization survive a round trip bit for bit.
 #[test]
 fn unusual_values_round_trip() {
@@ -1703,6 +1741,22 @@ fn current_op_and_step_agree_on_primitives() {
             vec![],
             VmError::StackUnderflow,
         ),
+        (vec![Op::WaitFromStack], vec![], VmError::StackUnderflow),
+        (
+            with(vec![Op::PushF64(1.0)], Op::WaitFromStack),
+            vec![],
+            VmError::TypeMismatch,
+        ),
+        (
+            with(vec![i(-1)], Op::WaitFromStack),
+            vec![],
+            VmError::WaitOutOfRange(-1),
+        ),
+        (
+            with(vec![i(i64::from(u32::MAX) + 1)], Op::WaitFromStack),
+            vec![],
+            VmError::WaitOutOfRange(i64::from(u32::MAX) + 1),
+        ),
         (
             with(full(), Op::ReadDtc { mask: 1 }),
             vec![],
@@ -1822,6 +1876,7 @@ fn primitives_run_at_the_stack_limit() {
             MAX_STACK,
         ),
         (Op::Wait { millis: 1 }, MAX_STACK),
+        (Op::WaitFromStack, MAX_STACK),
         (Op::MonitorCapture { back_millis: 1 }, MAX_STACK),
         (Op::ReadDtc { mask: 1 }, MAX_STACK - 1),
         (Op::HmiRequest { form: 0 }, MAX_STACK - 1),
@@ -1843,7 +1898,11 @@ fn primitives_run_at_the_stack_limit() {
     for (op, depth) in cases {
         let mut stack = vec![Value::I64(0); depth];
         if let Some(top) = stack.last_mut() {
-            *top = Value::Bytes(vec![0x41]);
+            // `WaitFromStack` takes a duration; the other primitives here take bytes.
+            *top = match op {
+                Op::WaitFromStack => Value::I64(1),
+                _ => Value::Bytes(vec![0x41]),
+            };
         }
         let program = prog(vec![op.clone()], vec![b"ok".to_vec()]);
         let mut vm = Vm::resume(VmState {

@@ -38,7 +38,9 @@ use crate::declaration::{EcuVariant, Shape};
 /// 12: `Op` gained `SendReceive` and `VmError` gained `UnknownService`; `Protocol` gained
 /// `application_layer` and `negative_shape` (ADR-321).
 /// 13: `Op` gained `ShlChecked`, for the same reason as version 3.
-pub const IR_SCHEMA_VERSION: u32 = 13;
+/// 14: `Op` gained `WaitFromStack` and `VmError` gained `WaitOutOfRange`, for the same reason
+/// as version 3.
+pub const IR_SCHEMA_VERSION: u32 = 14;
 
 /// The longest code, in bytes, that `Program::validate` accepts for a `Fail` (ADR-280).
 pub const MAX_FAILURE_CODE_LEN: usize = 128;
@@ -213,6 +215,13 @@ pub enum Op {
     /// A Starlark integer grows rather than losing bits, so this is the shift that `<<` lowers
     /// to. The shift takes 0 to 63, as `Shl` does.
     ShlChecked,
+
+    // Diagnostic primitives. Appended after `ShlChecked` (ADR-233).
+    /// Like `Wait`, but the duration in milliseconds is the `I64` on top of the stack. It must
+    /// be 0 to `u32::MAX`; any other value is `VmError::WaitOutOfRange`, and a non-`I64` operand
+    /// is `VmError::TypeMismatch`, both before the host is called. While the wait is not over
+    /// the state is unchanged, operand included; when it is over, the operand is popped.
+    WaitFromStack,
 }
 
 // ---------------------------------------------------------------- Program
@@ -286,6 +295,7 @@ impl Op {
             | Op::SecurityAccess { .. }
             | Op::FlashTransfer { .. }
             | Op::Wait { .. }
+            | Op::WaitFromStack
             | Op::HmiRequest { .. }
             | Op::RecordInput { .. }
             | Op::MonitorCapture { .. }
@@ -792,6 +802,15 @@ impl Vm {
                     return Ok(Executed::Waiting(WaitingOn::Timer));
                 }
             }
+            Op::WaitFromStack => {
+                let HostInput::Millis(millis) = input else {
+                    unreachable!("check_primitive returns millis for this instruction");
+                };
+                if !host.wait(inquiry, millis).map_err(StepError::Host)? {
+                    return Ok(Executed::Waiting(WaitingOn::Timer));
+                }
+                self.state.stack.pop();
+            }
             Op::HmiRequest { .. } => {
                 match host
                     .hmi_request(inquiry, input.bytes())
@@ -862,6 +881,13 @@ impl Vm {
                     .map_err(|_| VmError::InvalidUtf8(*message))?,
             ),
             Op::Wait { .. } | Op::MonitorCapture { .. } => HostInput::Nothing,
+            // The duration is the `I64` on top of the stack, which is popped once the wait is over.
+            Op::WaitFromStack => match self.top(1)?[0] {
+                Value::I64(millis) => HostInput::Millis(
+                    u32::try_from(millis).map_err(|_| VmError::WaitOutOfRange(millis))?,
+                ),
+                _ => return Err(VmError::TypeMismatch),
+            },
             // Not a diagnostic primitive: checked during execution.
             Op::PushI64(_)
             | Op::PushF64(_)
@@ -966,6 +992,7 @@ enum HostInput<'a> {
     Nothing,
     Bytes(&'a [u8]),
     Text(&'a str),
+    Millis(u32),
 }
 
 impl<'a> HostInput<'a> {
@@ -1240,7 +1267,7 @@ pub enum WaitingOn {
     Hmi,
     /// The key for a security access seed has not arrived from the server.
     SeedKey,
-    /// A `Wait` instruction's time has not passed.
+    /// A `Wait` or `WaitFromStack` instruction's time has not passed.
     Timer,
 }
 
@@ -1306,6 +1333,8 @@ pub enum VmError {
     Undecodable { service: u32 },
     #[error("service {service} has no declared positive response to send-receive")]
     UnknownService { service: u32 },
+    #[error("wait duration out of range: {0}")]
+    WaitOutOfRange(i64),
 }
 
 #[cfg(test)]

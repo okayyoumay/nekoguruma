@@ -3373,8 +3373,31 @@ impl<'a> Lowerer<'a> {
                     );
                     return Val::Void(Vec::new());
                 };
+                let value = self.expr(id, millis);
+                // A `diag.wait` duration known only at run time is the stack operand of
+                // `WaitFromStack`, which checks its range when it runs (3.1).
+                if name == "wait" && !matches!(value, Val::Const(_)) {
+                    let Some((ty, mut code)) =
+                        self.single(value, millis.span, "a `diag.wait` duration")
+                    else {
+                        return Val::Void(Vec::new());
+                    };
+                    if ty != Ty::Int {
+                        self.error(
+                            StarCode::UnsupportedSyntax,
+                            millis.span,
+                            format!(
+                                "`{what}` of `diag.wait` is an int, not a {} (3.1)",
+                                ty.name()
+                            ),
+                        );
+                        return Val::Void(Vec::new());
+                    }
+                    code.push((Ins::Op(Op::WaitFromStack), span));
+                    return Val::Void(code);
+                }
                 let Some(millis) =
-                    self.constant_int(id, millis, name, what, 0..=i64::from(u32::MAX))
+                    self.constant_int_of(value, millis, name, what, 0..=i64::from(u32::MAX))
                 else {
                     return Val::Void(Vec::new());
                 };
@@ -4476,7 +4499,20 @@ impl<'a> Lowerer<'a> {
         what: &str,
         range: std::ops::RangeInclusive<i64>,
     ) -> Option<i64> {
-        match self.expr(id, arg) {
+        let value = self.expr(id, arg);
+        self.constant_int_of(value, arg, function, what, range)
+    }
+
+    /// [`Lowerer::constant_int`] for an argument already lowered to `value`.
+    fn constant_int_of(
+        &mut self,
+        value: Val,
+        arg: &AstExpr,
+        function: &str,
+        what: &str,
+        range: std::ops::RangeInclusive<i64>,
+    ) -> Option<i64> {
+        match value {
             Val::Const(Const::Int(n)) if range.contains(&n) => Some(n),
             Val::Const(Const::Int(n)) => {
                 self.error(

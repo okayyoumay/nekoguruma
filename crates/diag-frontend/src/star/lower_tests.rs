@@ -1,5 +1,5 @@
 use diag_ir::declaration::{EcuDocumentT, EcuVariantT, encode_ecu_document, load_ecu_document};
-use diag_ir::{DiagHost, StepOutcome, Vm, WaitingOn};
+use diag_ir::{DiagHost, StepError, StepOutcome, Vm, VmError, WaitingOn};
 
 use super::*;
 use crate::profile::{Intent, Profile};
@@ -1642,6 +1642,54 @@ def main():
     );
 }
 
+/// A `diag.wait` duration computed at run time lowers to `WaitFromStack` and reaches the host
+/// with its value; a wait not yet over is stepped again with the operand kept.
+#[test]
+fn a_wait_with_a_run_time_duration_reaches_the_host() {
+    let source = "\
+def pause(n):
+    diag.wait(n * 2 + 1)
+
+def main():
+    pause(5)
+    diag.log(1, \"between\")
+    pause(0)
+    diag.wait(7)
+";
+    let program = lowered(source).unwrap_or_else(|errors| panic!("{errors:#?}"));
+    assert!(program.code.contains(&Op::WaitFromStack));
+    let mut host = ScriptedHost {
+        waits_pending: 2,
+        ..ScriptedHost::default()
+    };
+    assert_eq!(run_on(source, &mut host), 2);
+    assert_eq!(host.calls, ["wait 11", "log 1 between", "wait 1", "wait 7"]);
+}
+
+/// A run-time duration outside 0 to `u32::MAX` stops the run before the host is called.
+#[test]
+fn a_run_time_wait_duration_out_of_range_stops_the_run() {
+    for (n, expected) in [
+        ("-1", -1_i64),
+        ("4294967296", 4_294_967_296),
+        ("4294967295 + 5", 4_294_967_300),
+    ] {
+        let source = format!("def pause(n):\n    diag.wait(n)\n\ndef main():\n    pause({n})\n");
+        let program = lowered(&source).unwrap_or_else(|errors| panic!("{errors:#?}"));
+        let mut host = ScriptedHost::default();
+        let mut vm = Vm::new(&program);
+        let error = loop {
+            match vm.step(&program, &mut host) {
+                Ok(StepOutcome::Continue) => {}
+                Err(StepError::Vm(error)) => break error,
+                other => panic!("{other:?}"),
+            }
+        };
+        assert_eq!(error, VmError::WaitOutOfRange(expected), "{n}");
+        assert!(host.calls.is_empty(), "{n}: {:?}", host.calls);
+    }
+}
+
 #[test]
 fn a_wait_not_yet_over_is_stepped_again() {
     let mut host = ScriptedHost {
@@ -1661,11 +1709,6 @@ fn wait_log_and_capture_arguments_are_checked() {
     use StarCode::*;
     let cases = [
         // Known only at run time.
-        (
-            "def f(n):\n    diag.wait(n)\n\ndef main():\n    f(1)\n",
-            NonConstantArgument,
-            2,
-        ),
         (
             "def f(n):\n    diag.capture(n)\n\ndef main():\n    f(1)\n",
             NonConstantArgument,
@@ -1694,7 +1737,12 @@ fn wait_log_and_capture_arguments_are_checked() {
             ArgumentOutOfRange,
             2,
         ),
-        // The wrong type or number of arguments.
+        // The wrong type or number of arguments, also for a duration known only at run time.
+        (
+            "def f(n):\n    diag.wait(n)\n\ndef main():\n    f(1.5)\n",
+            UnsupportedSyntax,
+            2,
+        ),
         ("def main():\n    diag.wait(1.5)\n", UnsupportedSyntax, 2),
         (
             "def main():\n    diag.log(1, b\"x\")\n",

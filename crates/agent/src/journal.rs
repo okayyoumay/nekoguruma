@@ -2807,6 +2807,7 @@ mod tests {
             },
             VmError::Undecodable { service: 0 },
             VmError::UnknownService { service: 0 },
+            VmError::WaitOutOfRange(0),
         ];
         // The match fails to compile when a variant is added, so the list above stays complete.
         for error in &errors {
@@ -2835,7 +2836,8 @@ mod tests {
                 | VmError::UnknownField { .. }
                 | VmError::ShapedField { .. }
                 | VmError::Undecodable { .. }
-                | VmError::UnknownService { .. } => {}
+                | VmError::UnknownService { .. }
+                | VmError::WaitOutOfRange(_) => {}
             }
         }
         let encoded = |reason: RunStop| {

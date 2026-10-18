@@ -217,13 +217,13 @@ pub fn check_versions(vci: &Vci, version: &ReportedVersion) -> Result<(), MatchR
     if firmware != vci.firmware_version.trim() {
         return Err(MatchRefusal::FirmwareDiffers {
             reported: firmware,
-            profile: vci.firmware_version.clone(),
+            profile: vci.firmware_version.trim().to_owned(),
         });
     }
     if library != vci.library_version.trim() {
         return Err(MatchRefusal::LibraryVersionDiffers {
             reported: library,
-            profile: vci.library_version.clone(),
+            profile: vci.library_version.trim().to_owned(),
         });
     }
     Ok(())

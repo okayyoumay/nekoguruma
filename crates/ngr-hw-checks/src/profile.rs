@@ -465,7 +465,7 @@ fn check_vci(vci: &Vci) -> Result<(), ProfileError> {
     if vci.api == Api::Iso22900
         && ![&vci.firmware_version, &vci.library_version]
             .iter()
-            .all(|version| crate::device::is_coded_version(version))
+            .all(|version| crate::device::is_coded_version(version.trim()))
     {
         return Err(invalid(
             "a D-PDU API `vci` writes `firmware_version` and `library_version` as \

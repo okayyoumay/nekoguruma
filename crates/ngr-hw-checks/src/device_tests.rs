@@ -289,6 +289,11 @@ fn dpdu_versions_are_compared_as_major_minor_revision() {
         ..Default::default()
     };
     assert_eq!(check_versions(&dpdu(), &version), Ok(()));
+    let padded = Vci {
+        firmware_version: " 2.1.0 ".into(),
+        ..dpdu()
+    };
+    assert_eq!(check_versions(&padded, &version), Ok(()));
     assert_eq!(
         check_versions(
             &dpdu(),

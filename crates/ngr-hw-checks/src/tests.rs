@@ -274,6 +274,7 @@ fn more_fields_are_checked_against_the_setup() {
     // A D-PDU API module reports coded versions, so its profile writes them as such; a J2534
     // device reports strings, which are taken as written.
     parse(T0_PROFILE).unwrap();
+    parse(&T0_PROFILE.replacen("\"2.0.0\"", "\" 2.0.0 \"", 1)).unwrap();
     for (from, to) in [
         ("firmware_version = \"2.0.0\"", "firmware_version = \"2.0\""),
         (
@@ -290,6 +291,7 @@ fn more_fields_are_checked_against_the_setup() {
 #[test]
 fn a_loopback_runs_between_two_ends_of_one_bus() {
     parse(T0_PROFILE).unwrap();
+    parse(&T0_PROFILE.replacen("\"2.0.0\"", "\" 2.0.0 \"", 1)).unwrap();
     // T0 takes no addition either.
     for extra in [
         "expendable_ecu = true",

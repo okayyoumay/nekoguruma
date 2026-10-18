@@ -174,16 +174,19 @@ maintainer chose to run the loop on the agent.
    identifiers are local to a document, ADR-318), read over that variant's link. When a
    candidate declares a VIN matching rule, or the plan holds a definition chosen by hand that
    declares one (item 8), the VIN is read after the presence requests and before
-   any ECU definition's read: the distinct services and links those rules' sources name are
-   read in turn, in a fixed order, until one establishes a VIN. One response is decoded with the
+   any ECU definition's read: every distinct service and link those rules' sources name is read
+   in turn, in a fixed order. One response is decoded with the
    declaration of every source on that service and link (two sources whose declarations differ
    are distinct), and it establishes a VIN only when every one of those declarations decodes
    it to the same well-formed VIN (ADR-261 item 3); if any of them fails to decode it, or decodes
    it to something else, the response establishes none, since a response decoded with another ECU's
-   layout can look like a VIN, and the next service and link is read. When none establishes one, every VIN rule stays
-   unevaluated. When neither a candidate nor a definition chosen by hand declares a VIN matching
+   layout can look like a VIN. The VIN is established only when at least one response
+   establishes one and every response that establishes one gives the same VIN; two that differ
+   (an ECU fitted from another vehicle may keep that vehicle's VIN) establish none and are both
+   reported. When no VIN is established, every VIN rule stays unevaluated and the job does not
+   promote to the per-vehicle lock. When neither a candidate nor a definition chosen by hand declares a VIN matching
    rule, identification reads no VIN (the data author's choice).
-6. **The agent reports facts; the server decides.** The job reports the VIN when read, the
+6. **The agent reports facts; the server decides.** The job reports the VIN when established and every VIN an accepted response gave, the
    presence answers, each read's decoded identification fields and matching variants, each
    rule field's established value or that it stayed unevaluated, the
    outcome of each of its identification requests (decoded positive response, the negative

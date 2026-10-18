@@ -224,6 +224,7 @@ fn a_folded_shift_count_outside_0_to_63_is_an_error() {
         (BinOp::RightShift, 64),
         (BinOp::RightShift, -1),
         (BinOp::LeftShift, 64),
+        (BinOp::LeftShift, -1),
     ] {
         assert!(fold(op, &Const::Int(1), &Const::Int(n)).is_err(), "{n}");
     }
@@ -892,6 +893,48 @@ fn a_left_shift_at_run_time_keeps_every_bit_or_stops_the_run() {
     }
     let augmented = "def f(x):\n    x <<= 2\n    return x\n\ndef main():\n    if f(5) != 20:\n        diag.fail(\"NO\", \"\")\n";
     assert_eq!(run(augmented), Ok(None));
+}
+
+#[test]
+fn a_left_shift_at_run_time_matches_the_folded_one() {
+    // The literal i64::MIN is out of range in Starlark source, so it is written as a sum.
+    let literal = |v: i64| {
+        if v == i64::MIN {
+            format!("({} - 1)", v + 1)
+        } else {
+            format!("({v})")
+        }
+    };
+    for (x, n) in [
+        (0, 63),
+        (-1, 63),
+        (i64::MIN, 0),
+        (i64::MIN, 1),
+        (1, 63),
+        (-2, 63),
+        (3, 62),
+        (0, 64),
+        (1, -1),
+        (i64::MAX >> 1, 1),
+    ] {
+        let source = format!(
+            "def f(x, n):\n    return x << n\n\ndef main():\n    f({}, {})\n",
+            literal(x),
+            literal(n)
+        );
+        match fold(BinOp::LeftShift, &Const::Int(x), &Const::Int(n)) {
+            Ok(Const::Int(v)) => assert!(
+                holds(
+                    "x, n",
+                    &format!("{}, {}", literal(x), literal(n)),
+                    &format!("x << n == {}", literal(v))
+                ),
+                "{x} << {n}"
+            ),
+            Ok(other) => panic!("{other:?}"),
+            Err(_) => assert!(run(&source).is_err(), "{x} << {n}"),
+        }
+    }
 }
 
 #[test]

@@ -55,7 +55,7 @@ does not take. A T3 profile can add nothing.
 | `library` | The library name, resolved as in design 7.1 |
 | `module` | D-PDU API: the device name or serial number the library reports (see "The module match"). J2534: a description only, not compared with the device |
 | `label`, `pname` | J2534 only, and required there, not empty: the label and the device name of the configured `modules` entry (ADR-281) |
-| `firmware_version`, `library_version` | What the device reports, compared after opening (see "The module match"); a D-PDU API profile writes each as `major.minor.revision`, each part 0 to 255 |
+| `firmware_version`, `library_version` | What the device reports, compared after opening (see "The module match"); a D-PDU API profile writes each as `major.minor.revision`, each part 0 to 255 with no leading zero |
 
 `[link]`, the values an IR `Protocol` declaration carries:
 

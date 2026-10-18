@@ -76,14 +76,14 @@ pub fn coded_version(version: u32) -> String {
 }
 
 /// Whether `version` is written as [`coded_version`] writes one: three decimal numbers from 0 to
-/// 255, separated by dots.
+/// 255, separated by dots, with no sign and no leading zero, so that a matching device's version
+/// reads the same.
 pub fn is_coded_version(version: &str) -> bool {
     let parts: Vec<&str> = version.split('.').collect();
     parts.len() == 3
         && parts.iter().all(|part| {
-            !part.is_empty()
-                && part.bytes().all(|b| b.is_ascii_digit())
-                && part.parse::<u8>().is_ok()
+            part.parse::<u8>()
+                .is_ok_and(|byte| byte.to_string() == *part)
         })
 }
 
@@ -125,7 +125,7 @@ fn identifies(vendor: &str, module: &str) -> bool {
 /// - J2534: the configured `modules` entry with the profile's `label` must be the only entry, so
 ///   a configured module that is not attached cannot be taken for the attached one (ADR-275 item
 ///   4), and its `pname` must be the profile's; exactly one reported module carries that label,
-///   from the profile's library.
+///   from the profile's library. Names are compared without their surrounding spaces.
 pub fn select_module(
     vci: &Vci,
     reported: &[ReportedModule],
@@ -145,13 +145,13 @@ pub fn select_module(
                 .collect()
         }
         Api::J2534V0404 => {
-            let label = vci.label.clone().unwrap_or_default();
-            if label.trim().is_empty() {
+            let label = vci.label.as_deref().unwrap_or_default().trim().to_owned();
+            if label.is_empty() {
                 return Err(MatchRefusal::Unnamed { what: "label" });
             }
             let entry = configured
                 .iter()
-                .find(|entry| entry.label == label)
+                .find(|entry| entry.label.trim() == label)
                 .ok_or_else(|| MatchRefusal::UnknownLabel {
                     label: label.clone(),
                 })?;
@@ -160,8 +160,8 @@ pub fn select_module(
                     count: configured.len(),
                 });
             }
-            let pname = vci.pname.clone().unwrap_or_default();
-            if entry.pname != pname {
+            let pname = vci.pname.as_deref().unwrap_or_default().trim().to_owned();
+            if entry.pname.trim() != pname {
                 return Err(MatchRefusal::PnameDiffers {
                     label,
                     configured: entry.pname.clone(),
@@ -171,15 +171,15 @@ pub fn select_module(
             let matches: Vec<usize> = reported
                 .iter()
                 .enumerate()
-                .filter(|(_, m)| m.name == label)
+                .filter(|(_, m)| m.name.trim() == label)
                 .map(|(at, _)| at)
                 .collect();
             if let [at] = matches[..]
-                && reported[at].additional_info != vci.library
+                && reported[at].additional_info.trim() != vci.library.trim()
             {
                 return Err(MatchRefusal::LibraryDiffers {
                     reported: reported[at].additional_info.clone(),
-                    profile: vci.library.clone(),
+                    profile: vci.library.trim().to_owned(),
                 });
             }
             matches
@@ -187,7 +187,7 @@ pub fn select_module(
     };
     let module = match vci.api {
         Api::Iso22900 => vci.module.trim().to_owned(),
-        Api::J2534V0404 => vci.label.clone().unwrap_or_default(),
+        Api::J2534V0404 => vci.label.as_deref().unwrap_or_default().trim().to_owned(),
     };
     match matches[..] {
         [] => Err(MatchRefusal::NoModule { module }),

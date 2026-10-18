@@ -469,7 +469,7 @@ fn check_vci(vci: &Vci) -> Result<(), ProfileError> {
     {
         return Err(invalid(
             "a D-PDU API `vci` writes `firmware_version` and `library_version` as \
-             `major.minor.revision`, each 0 to 255",
+             `major.minor.revision`, each 0 to 255 with no leading zero",
         ));
     }
     match vci.api {

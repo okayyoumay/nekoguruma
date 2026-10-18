@@ -189,6 +189,28 @@ fn an_empty_module_or_label_is_refused_before_matching() {
 }
 
 #[test]
+fn j2534_names_are_compared_without_surrounding_spaces() {
+    let padded = Vci {
+        library: " Vendor VCI ".into(),
+        label: Some(" bench ".into()),
+        pname: Some("Vendor VCI 1 ".into()),
+        ..j2534()
+    };
+    let configured = vec![ConfiguredModule {
+        label: "bench ".into(),
+        pname: " Vendor VCI 1".into(),
+    }];
+    let modules = [reported(" bench", "Vendor VCI ")];
+    assert_eq!(select_module(&padded, &modules, &configured), Ok(0));
+    assert_eq!(
+        select_module(&padded, &[], &configured),
+        Err(MatchRefusal::NoModule {
+            module: "bench".into()
+        })
+    );
+}
+
+#[test]
 fn a_j2534_profile_with_nothing_configured_is_refused() {
     assert_eq!(
         select_module(&j2534(), &[reported("bench", "Vendor VCI")], &[]),

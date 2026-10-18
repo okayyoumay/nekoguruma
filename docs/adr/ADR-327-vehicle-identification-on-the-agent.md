@@ -135,17 +135,20 @@ maintainer chose to run the loop on the agent.
    configuration values or reprograms an ECU needs its variant identification to match exactly one
    variant of exactly one ECU definition (8.9.1), and the agent can only know that by trying
    every variant that could be fitted there. So a write job carries, beside its own variant's
-   document, the documents of every variant of every ECU definition the tenant may use that uses
-   the same endpoint, its own definition included, whatever the identification concluded about
+   document, the documents of every variant, of any ECU definition the tenant may use, whose
+   declared link resolves to the job's endpoint, its own definition's other variants there
+   included; variants of those definitions on other endpoints are not carried, since they
+   could not be fitted at this one. This holds whatever the identification concluded about
    the vehicle: a model-level fact such as the VIN cannot rule out an ECU fitted as a
    replacement, and neither the selected vehicle nor the operator's choice may remove a
    definition from the check (amending ADR-318 item 1, under
    which a job carries one variant's document). Before anything that writes is sent the agent
-   runs variant identification over all of them, each variant over the link it declares,
-   one link per distinct link, opened in turn and closed again (amending ADR-324 item 1, under which a document job opens
+   runs variant identification over all of them, each variant over the link it declares
+   (links on the same endpoint that differ only in timing ComParams), one link per distinct
+   link, opened in turn and closed again (amending ADR-324 item 1, under which a document job opens
    only its own variant's link), and then opens the job's own declared link for the procedure, and the job is refused unless exactly one
-   variant of one definition matches, it is the job's own, and the read of every carried definition
-   was conclusive in item 3's sense, the job's own definition's other variants included (no
+   variant of one definition matches, it is the job's own, and every request of every carried variant
+   was answered conclusively in item 3's sense (no
    answer, or a negative response the ECU definition does not declare definitive, leaves a
    variant unexcluded, which makes the check inconclusive and refuses the
    write, unlike ADR-315's selection, which treats it as no match). This holds whatever the operator picked,

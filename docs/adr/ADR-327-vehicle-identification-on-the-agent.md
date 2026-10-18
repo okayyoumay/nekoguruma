@@ -6,7 +6,7 @@
 `server` (identification plans, re-evaluation of the reported facts, guard lists),
 `diag-frontend` and `diag-ir` (operator-facing variant attributes, definitive negative
 responses, the read-only check of identification services), design 8.2.4, 8.2.5, 8.8.2, 8.9.1;
-ADR-235 items 3 and 8, ADR-315 item 3, ADR-318 items 1 and 4, ADR-324 items 1 and 2, ADR-325 item 7,
+ADR-235 items 3 and 8, ADR-315 item 3, ADR-318 items 1 and 4 and its Consequences, ADR-324 items 1 and 2, ADR-325 item 7,
 ADR-326 items 2, 3 and 5 and its Consequences; `docs/glossary.md`
 
 ## Context
@@ -248,7 +248,8 @@ maintainer chose to run the loop on the agent.
    variant identified), now only after the guard has passed on every
    target the job changes and before the first instruction, also records that the guard passed
    and the hashes of the target's guard list (amending ADR-318 item 4 and ADR-325 item 7's
-   record), and a restart once the journal has reached the flash plan (inside it or past its
+   record; for such a restart this also ends ADR-318's consequence that a replacement document
+   goes undetected, which still holds before the flash plan), and a restart once the journal has reached the flash plan (inside it or past its
    end) that carries a different guard list for that
    target, whose program's document or identified variant differs from the record, or whose
    record (combination or guard) lacks the pass or is missing, ends in on-site intervention as a

@@ -258,6 +258,42 @@ fn bitwise_and_shifts() {
 }
 
 #[test]
+fn a_checked_shift_refuses_to_leave_the_64_bit_range() {
+    // As a multiplication by a power of two, negative operands included.
+    assert_eq!(eval(vec![i(3), i(4), Op::ShlChecked]), [Value::I64(48)]);
+    assert_eq!(eval(vec![i(-3), i(4), Op::ShlChecked]), [Value::I64(-48)]);
+    assert_eq!(eval(vec![i(0), i(63), Op::ShlChecked]), [Value::I64(0)]);
+    assert_eq!(
+        eval(vec![i(-1), i(63), Op::ShlChecked]),
+        [Value::I64(i64::MIN)]
+    );
+    assert_eq!(
+        eval(vec![i(i64::MAX >> 1), i(1), Op::ShlChecked]),
+        [Value::I64(i64::MAX - 1)]
+    );
+    // A bit shifted out, or into the sign, is an overflow where `Shl` would drop it.
+    for (value, shift) in [(1, 63), (3, 62), (i64::MAX, 1), (i64::MIN, 1), (-2, 63)] {
+        assert_eq!(
+            expect_vm_error(vec![i(value), i(shift), Op::ShlChecked], vec![], 2),
+            VmError::Overflow,
+            "{value} << {shift}"
+        );
+    }
+    assert_eq!(
+        expect_vm_error(vec![i(0), i(64), Op::ShlChecked], vec![], 2),
+        VmError::ShiftOutOfRange(64)
+    );
+    assert_eq!(
+        expect_vm_error(vec![i(1), i(-1), Op::ShlChecked], vec![], 2),
+        VmError::ShiftOutOfRange(-1)
+    );
+    assert_eq!(
+        expect_vm_error(vec![i(1), Op::PushF64(1.0), Op::ShlChecked], vec![], 2),
+        VmError::TypeMismatch
+    );
+}
+
+#[test]
 fn comparisons() {
     const T: Value = Value::Bool(true);
     const F: Value = Value::Bool(false);
@@ -1188,6 +1224,7 @@ fn primitive_classification_covers_every_instruction() {
             field: 0,
         },
         Op::SendReceive { service: 0 },
+        Op::ShlChecked,
     ];
     for (index, op) in all.iter().enumerate() {
         // The postcard encoding starts with the variant index, so this also pins the variant

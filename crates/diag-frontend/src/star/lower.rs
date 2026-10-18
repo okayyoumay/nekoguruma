@@ -2248,6 +2248,12 @@ impl<'a> Lowerer<'a> {
                 }));
                 Ty::Int
             }
+            // A Starlark integer grows rather than losing bits, so a result past 64 bits stops
+            // the run, as the IR's checked shift does (4.4).
+            (BinOp::LeftShift, Ty::Int, Ty::Int) => {
+                code.push(at(Op::ShlChecked));
+                Ty::Int
+            }
             (BinOp::RightShift, Ty::Int, Ty::Int) => {
                 let Some(id) = id else {
                     return Val::Run(Tys::default(), Vec::new());
@@ -4714,7 +4720,6 @@ fn binop_symbol(op: BinOp) -> &'static str {
 fn binary_hint(op: BinOp, a: Ty, b: Ty) -> String {
     let symbol = binop_symbol(op);
     let reason = match op {
-        BinOp::LeftShift => "an overflow-checked shift instruction (4.4)",
         BinOp::In | BinOp::NotIn => "a search instruction",
         BinOp::Percent if a == Ty::Str => "string formatting instructions (2.5)",
         BinOp::FloorDivide | BinOp::Percent

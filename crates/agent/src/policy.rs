@@ -179,6 +179,7 @@ pub fn check_program(
             | Op::Slice
             | Op::IntToFloat
             | Op::FloatToInt
+            | Op::ShlChecked
             // Decodes in the VM; sends nothing (ADR-316).
             | Op::DecodeField { .. }
             // Ends the procedure; sends nothing (ADR-280).

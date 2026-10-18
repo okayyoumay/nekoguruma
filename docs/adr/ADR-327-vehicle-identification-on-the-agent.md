@@ -139,8 +139,10 @@ maintainer chose to run the loop on the agent.
    identification job, the agent reports all of them instead of the first one ADR-315 selects,
    and the operator picks one by its attributes. The picked variant can be used for reads and
    other jobs that do not write; such a job checks, before its procedure runs, that its
-   variant's patterns match the ECU, and is refused when they do not. A job that writes
-   configuration values or reprograms an ECU needs its variant identification to match exactly one
+   variant's patterns match the ECU, and is refused when they do not. A job that can change
+   the ECU (a write job in this ADR: one whose procedure writes configuration values,
+   reprograms, clears DTCs, runs a routine, which can erase or actuate whatever its number,
+   or sends any other request outside ADR-235 item 8's read-only set) needs its variant identification to match exactly one
    variant of exactly one ECU definition (8.9.1), and the agent can only know that by trying
    every variant that could be fitted there. So a write job carries, beside its own variant's
    document, the documents of every variant, of any ECU definition the tenant may use, whose

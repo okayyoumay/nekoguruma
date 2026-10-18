@@ -7,7 +7,7 @@
 variants), `agent` (`Job`, `check_job`, policy, one link per target, keep-alive, run and restart
 order), the workers' cyclic tester-present (kept off), `sim-ecu` (a gateway role), design 8.2.4, 8.2.5,
 8.2.6, 5.6, 8.10, 8.10.1; ADR-229 item 2, ADR-233 item 3, ADR-235 item 8, ADR-244, ADR-245, ADR-247 item 1, ADR-257,
-ADR-264 item 4, ADR-280, ADR-293, ADR-307 items 1 and 5, ADR-311 item 1, ADR-316, ADR-318 items 1, 3 and 4,
+ADR-264 item 4, ADR-280, ADR-293, ADR-307 items 1 and 5, ADR-309 item 3, ADR-311 item 1, ADR-313 items 1 and 2, ADR-316, ADR-318 items 1, 3 and 4,
 ADR-321, ADR-322 items 1 and 3, ADR-324
 
 ## Context
@@ -256,68 +256,77 @@ shape survives inside the second as the access program of item 5.
     access program to the end of the job (so the session survives the server round trip of its
     own security access), the agent itself sends a TesterPresent with the positive response not
     suppressed on that target's link, as an ordinary send-receive primitive with the positive
-    and the negative response expected, from a task of its own on the runtime, so it runs while
-    the VM runs and while it waits on the server, an HMI response or a `Wait`. A probe goes
-    every period the declaration gives, measured from the previous probe's send, as soon as the
-    link is free; the agent waits up to the declared response window for the probe's final
-    response and then cancels the primitive. The link is shared with the VM's own requests to
-    that target one exchange at a time, in arrival order, so a request of the VM to that target
-    waits at most one probe exchange and a probe waits at most one exchange of the VM (ISO
-    14229-2 (2021) 10.1.4.2 sends a physically addressed TesterPresent only while no other
-    request is outstanding). The probe is the agent's message, not the procedure's, so the
-    policy's exclusion of TesterPresent from read-only jobs does not apply to it; it is sent
-    only on an access target's link and only once that target's access program has started, the
-    session being the job's own, and the procedure cannot send anything through it. The workers'
-    cyclic tester-present of ISO 22900-2 (2022) Annex B stays off on an access target's link
-    (the agent sets none of its ComParams and refuses a declared one, item 8): a second sender
-    on the same link would make answers unattributable, since the J2534 worker discards any
-    frame that matches its own expected tester-present response within its window, and that
-    worker reports no tester-present error event anyway. A probe must also be able to go while a
-    request to another target on the same channel waits for its final response, since a
-    reprogramming's erase and check routines behind a gateway chain response-pending for longer
-    than the gateway's session timeout, and routed traffic does not restart the gateway's timer
-    (ISO 14229-2 (2021) 9.5 restarts it only on a request the gateway's own server receives).
-    That is the worker's duty: it sends a queued send-receive on one logical link while another
-    logical link of the same channel is in its receive phase. ISO 22900-2 (2022) models logical
-    links that share a physical resource as independent (an application creates several on one
-    resource, 8.4.9, and takes `PDULockResource`, 8.4.13, only when it wants exclusivity), so
-    the native worker, which starts the primitive in the module and returns, leaves this to the
-    module, and the real-hardware checks (design 13.5) verify it per VCI with a response-pending
-    chain on a link behind a gateway on the same channel. The J2534 worker does not meet it yet:
-    its one poll task per channel stays in the receive phase of one link's send-receive and
-    serves only its own cyclic tester-present meanwhile, so a sibling link's probe waits for the
-    whole chain and the gateway really lapses, which the agent counts as the loss it is. Until
-    that worker dispatches sibling sends during a receive phase, a job with access targets on it
-    loses the gateway on any exchange behind it longer than the session timeout less one period.
-    The same mechanism can keep a single target's own session alive, which is decided
-    separately.
-12. **A lost access target ends the job by the section rules.** The agent counts as an access
-    target's good answer only a final response, positive or negative (a response pending is
-    none; the worker waits it out), to a request the agent itself sent on that target's link, a
-    probe of item 11 or one of the VM's; the first final response of the target's access program
-    is the first good answer, so the target has a loss clock from then on, its access program's
-    own waits included, and a loss counted before that program ends ends the job as a failing
-    step of it does (item 5); without that clock a gateway that relocked during a wait inside
-    its access program would go unseen, since a TesterPresent is answered in the default session
-    too. The agent keeps, for that link, the send times of the requests that may still be owed
-    an answer, each read from its own monotonic clock before the send call: every request it
-    sends, probes and the VM's alike, joins them, and every final response it sees removes the
-    oldest one and is dated by it, so a request that ended without a final response the agent
-    saw (cancelled, timed out, failed to send or lost from the event stream) stays among them.
-    The ECU answers each request at most once, and a worker attributes a frame to whichever
-    active primitive expects it, with nothing on the wire to tell two TesterPresents apart, so a
-    late answer to an unanswered request can be credited to a later one, and several such
-    answers can arrive one after another; matching each answer to the oldest request still owed
-    one keeps every credited date at or before the send of the request the answer may really
-    belong to. An answer that never arrives leaves its request among them for the rest of the
-    job on that link (until the links are reopened and the access program runs again), so each
-    such request delays every later credited date by about one period; one is within the bounds
-    of item 5, and several in a job count the target lost, which errs toward a loss and is
-    accepted. Nothing else is credited: not silence, not a probe that was cancelled or ended
-    without a final response, not an answer the agent cannot attribute, not any time the worker
-    or the module reports, and a lost-events notification on that link leaves the probe in
-    flight uncredited. The ECU's session timer stops when it receives a request from the client
-    that opened the session and restarts when its final response is complete (ISO 14229-2 (2021)
+    and the negative response expected; when the access program leaves the target in a session
+    other than the default one, the probe is instead a ReadDataByIdentifier of the active
+    diagnostic session (identifier F186, ISO 14229-1 (2026) Annex C.1), which restarts the
+    session timer as any request does and shows whether the session is still the one the access
+    program left. The conversion and `check_job` refuse such an access program when any
+    candidate variant of its target does not declare that identifier. The agent sends the probe
+    from a task of its own on the runtime, so it runs while the VM runs and while it waits on
+    the server, an HMI response or a `Wait`. A probe goes every period the declaration gives,
+    measured from the previous probe's send, as soon as the link is free; the agent waits up to
+    the declared response window for the probe's final response and then cancels the primitive.
+    The link is shared with the VM's own requests to that target one exchange at a time, in
+    arrival order, so a request of the VM to that target waits at most one probe exchange and a
+    probe waits at most one exchange of the VM (ISO 14229-2 (2021) 10.1.4.2 sends a physically
+    addressed TesterPresent only while no other request is outstanding). The probe is the
+    agent's message, not the procedure's, so the policy's exclusion of TesterPresent from
+    read-only jobs does not apply to it; it is sent only on an access target's link and only
+    once that target's access program has started, the session being the job's own, and the
+    procedure cannot send anything through it. The workers' cyclic tester-present of ISO 22900-2
+    (2022) Annex B stays off on an access target's link (the agent sets none of its ComParams
+    and refuses a declared one, item 8): a second sender on the same link would make answers
+    unattributable, since the J2534 worker discards any frame that matches its own expected
+    tester-present response within its window, and that worker reports no tester-present error
+    event anyway. A probe must also be able to go while a request to another target on the same
+    channel waits for its final response, since a reprogramming's erase and check routines
+    behind a gateway chain response-pending for longer than the gateway's session timeout, and
+    routed traffic does not restart the gateway's timer (ISO 14229-2 (2021) 9.5 restarts it only
+    on a request the gateway's own server receives). That is the worker's duty: it sends a
+    queued send-receive on one logical link while another logical link of the same channel is in
+    its receive phase. ISO 22900-2 (2022) models logical links that share a physical resource as
+    independent (an application creates several on one resource, 8.4.9, and takes
+    `PDULockResource`, 8.4.13, only when it wants exclusivity), so the native worker, which
+    starts the primitive in the module and returns, leaves this to the module, and the
+    real-hardware checks (design 13.5) verify it per VCI with a response-pending chain on a link
+    behind a gateway on the same channel. The J2534 worker does not meet it yet: its one poll
+    task per channel stays in the receive phase of one link's send-receive and serves only its
+    own cyclic tester-present meanwhile, so a sibling link's probe waits for the whole chain and
+    the gateway really lapses, which the agent counts as the loss it is. Until that worker
+    dispatches sibling sends during a receive phase, a job with access targets on it loses the
+    gateway on any exchange behind it longer than the session timeout less one period. The same
+    mechanism can keep a single target's own session alive, which is decided separately.
+12. **A lost access target ends the job by the section rules.** A session probe (item 11) whose
+    answer reports another session than the one the access program left, or is negative, counts
+    the target lost at once, since a server starts in its default session (ISO 14229-1 (2026)
+    9.2.1) and a reset or a session timeout there drops the unlock with it, while TesterPresent
+    and reads would still be answered. Otherwise the agent counts as an access target's good
+    answer only a final response, positive or negative (a response pending is none; the worker
+    waits it out), to a request the agent itself sent on that target's link, a probe of item 11
+    or one of the VM's; the first final response of the target's access program is the first
+    good answer, so the target has a loss clock from then on, its access program's own waits
+    included, and a loss counted before that program ends ends the job as a failing step of it
+    does (item 5); without that clock a gateway that relocked during a wait inside its access
+    program would go unseen, since a TesterPresent is answered in the default session too. The
+    agent keeps, for that link, the send times of the requests that may still be owed an answer,
+    each read from its own monotonic clock before the send call: every request it sends, probes
+    and the VM's alike, joins them, and every final response it sees removes the oldest one and
+    is dated by it, so a request that ended without a final response the agent saw (cancelled,
+    timed out, failed to send or lost from the event stream) stays among them. The ECU answers
+    each request at most once, and a worker attributes a frame to whichever active primitive
+    expects it, with nothing on the wire to tell two TesterPresents apart, so a late answer to
+    an unanswered request can be credited to a later one, and several such answers can arrive
+    one after another; matching each answer to the oldest request still owed one keeps every
+    credited date at or before the send of the request the answer may really belong to. An
+    answer that never arrives leaves its request among them for the rest of the job on that link
+    (until the links are reopened and the access program runs again), so each such request
+    delays every later credited date by about one period; one is within the bounds of item 5,
+    and several in a job count the target lost, which errs toward a loss and is accepted.
+    Nothing else is credited: not silence, not a probe that was cancelled or ended without a
+    final response, not an answer the agent cannot attribute, not any time the worker or the
+    module reports, and a lost-events notification on that link leaves the probe in flight
+    uncredited. The ECU's session timer stops when it receives a request from the client that
+    opened the session and restarts when its final response is complete (ISO 14229-2 (2021)
     9.5), so the session is held at least until the credited date plus the declared timeout, and
     every delay in the worker, in event delivery or in the agent only makes a credited date
     older, never newer. It counts the target as lost once that last good answer is older than
@@ -397,6 +406,13 @@ shape survives inside the second as the access program of item 5.
   longer than the session timeout less one period, until that worker dispatches sibling sends
   during a receive phase; the native worker leaves it to the module, which a real-hardware check
   verifies per VCI.
+- A gateway that resets or relocks on its own and answers again before the loss threshold is
+  seen only by the session probe of item 11, so an access program that changes the session needs
+  its target's variants to declare the active-session identifier (item 11). An access program
+  that unlocks in the default session has nothing the probe can read: a relock there shows only
+  as requests behind the gateway failing, each handled by its own rule rather than as a loss.
+  That residual is accepted, since a gateway that guards writes and active tests in practice
+  requires an extended session first.
 - The agent gives up an unanswered probe through `CancelComPrimitive`, which it does not call
   yet; the workers and `sim-vci` must end a running send-receive primitive on it, or the
   response window would have to cover the whole send-receive ceiling. A late answer to a

@@ -99,9 +99,11 @@ maintainer chose to run the loop on the agent.
    only through the tie-breakers. Ties go to the one named by
    more remaining candidates, then to one whose endpoint answered the presence request, then to the lowest
    identifier, so the order is deterministic. A read is the definition's variant identification
-   (8.9.1) and the fields the candidates' matching rules read from it, sent over that
-   definition's own declared link (ADR-324 item 1), so the job opens one link per definition it
-   reads (amending ADR-324 item 1's single link per job for this job kind). Each ECU definition is
+   (8.9.1) and the fields the candidates' matching rules read from it, each variant
+   tested over the link it declares (ADR-324 item 1, which gives each variant its own declared
+   link): the variants are grouped by declared link and each group is identified on its link,
+   so the job opens one link per distinct link it reads (amending ADR-324 item 1's single link
+   per job for this job kind). The endpoints of a definition are those of its variants' links. Each ECU definition is
    read at most once per job.
 5. **End.** The loop ends when every ECU definition still named and not ruled out has been
    read or is out of reach, or when no candidate remains; a plan without candidates (item 8)
@@ -114,8 +116,9 @@ maintainer chose to run the loop on the agent.
    as out of reach only when every definition using it that is still in play has been tried
    without an answer. Silence to the presence request alone never puts a definition out of
    reach. When a
-   candidate declares a VIN matching rule, the VIN is read first, from the source the plan
-   names; when none does, identification reads no VIN (the data author's choice).
+   candidate declares a VIN matching rule, the VIN is read first: the distinct VIN sources the
+   candidates' rules name (a service and its link) are tried in turn, in a fixed order, until
+   one gives a VIN that decodes, and a VIN no source gives leaves every VIN rule unevaluated; when none does, identification reads no VIN (the data author's choice).
 6. **The agent reports facts; the server decides.** The job reports the VIN when read, the
    presence answers, each read's decoded identification fields and matching variants, and the
    entry states of ADR-326 item 3. The server recomputes the candidates from these facts with
@@ -138,8 +141,8 @@ maintainer chose to run the loop on the agent.
    replacement, and neither the selected vehicle nor the operator's choice may remove a
    definition from the check (amending ADR-318 item 1, under
    which a job carries one variant's document). Before anything that writes is sent the agent
-   runs variant identification over all of them, each definition over its own declared link,
-   opened in turn and closed again (amending ADR-324 item 1, under which a document job opens
+   runs variant identification over all of them, each variant over the link it declares,
+   one link per distinct link, opened in turn and closed again (amending ADR-324 item 1, under which a document job opens
    only its own variant's link), and then opens the job's own declared link for the procedure, and the job is refused unless exactly one
    variant of one definition matches, it is the job's own, and the read of every carried definition
    was conclusive in item 3's sense, the job's own definition's other variants included (no

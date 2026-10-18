@@ -396,7 +396,7 @@ fn the_report_stops_growing_at_its_budget() {
     let buf = document(vec![service(7, "big", 0x2E, &[], vec![])], vec![]);
     let mut request = vec![0x2E];
     request.resize(1 << 20, 0);
-    // Each round reports the 1 MiB request and its 1-byte answer.
+    // Each round reports the 1 MiB request, its 1-byte answer and the service's name.
     let program = program(
         vec![
             Op::PushBytes(0),
@@ -410,7 +410,7 @@ fn the_report_stops_growing_at_its_budget() {
     assert_eq!(report.end, DryRunEnd::Host(DryRunError::ReportTooLarge));
     assert_eq!(
         report.events.len(),
-        MAX_REPORT_BYTES / ((1 << 20) + 1 + EVENT_COST)
+        MAX_REPORT_BYTES / ((1 << 20) + 1 + "big".len() + EVENT_COST)
     );
 }
 
@@ -536,7 +536,7 @@ fn an_error_keeps_only_the_start_of_a_long_request() {
 
 #[test]
 fn an_error_keeps_only_the_start_of_a_long_service_name() {
-    let name = "é".repeat(1000);
+    let name = "€".repeat(1000);
     let bare = ServiceT {
         positive: None,
         ..service(7, &name, 0x22, &[], vec![])
@@ -547,11 +547,11 @@ fn an_error_keeps_only_the_start_of_a_long_service_name() {
         vec![vec![]],
     );
     let report = run(&buf, &program, &Script::new());
-    // "é" is two bytes, so the name is cut at the character boundary at 64 bytes.
+    // "€" is three bytes, so the name is cut back to the character boundary at 63 bytes.
     assert_eq!(
         report.end,
         DryRunEnd::Host(DryRunError::NoPositiveResponse {
-            service: "é".repeat(MAX_ERROR_BYTES / 2)
+            service: "€".repeat(MAX_ERROR_BYTES / 3)
         })
     );
 }

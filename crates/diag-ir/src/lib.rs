@@ -40,7 +40,8 @@ use crate::declaration::{EcuVariant, Shape};
 /// 13: `Op` gained `ShlChecked`, for the same reason as version 3.
 /// 14: `Op` gained `WaitFromStack` and `VmError` gained `WaitOutOfRange`, for the same reason
 /// as version 3.
-pub const IR_SCHEMA_VERSION: u32 = 14;
+/// 15: `Op` gained `LogFromStack`, for the same reason as version 3.
+pub const IR_SCHEMA_VERSION: u32 = 15;
 
 /// The longest code, in bytes, that `Program::validate` accepts for a `Fail` (ADR-280).
 pub const MAX_FAILURE_CODE_LEN: usize = 128;
@@ -222,6 +223,16 @@ pub enum Op {
     /// is `VmError::TypeMismatch`, both before the host is called. While the wait is not over
     /// the state is unchanged, operand included; when it is over, the operand is popped.
     WaitFromStack,
+
+    // Diagnostic primitives. Appended after `WaitFromStack` (ADR-233).
+    /// Like `Log`, but the message is the `Bytes` on top of the stack, which is popped. The
+    /// bytes are the message's UTF-8 text; invalid UTF-8 is decoded lossily (each invalid
+    /// sequence becomes U+FFFD), so a log never stops a run, whereas the constant `Log` keeps its
+    /// `VmError::InvalidUtf8` check. A non-`Bytes` operand is `VmError::TypeMismatch`, before the
+    /// host is called.
+    LogFromStack {
+        level: u8,
+    },
 }
 
 // ---------------------------------------------------------------- Program
@@ -296,6 +307,7 @@ impl Op {
             | Op::FlashTransfer { .. }
             | Op::Wait { .. }
             | Op::WaitFromStack
+            | Op::LogFromStack { .. }
             | Op::HmiRequest { .. }
             | Op::RecordInput { .. }
             | Op::MonitorCapture { .. }
@@ -833,6 +845,13 @@ impl Vm {
                 .monitor_capture(*back_millis)
                 .map_err(StepError::Host)?,
             Op::Log { level, .. } => host.log(*level, input.text()),
+            Op::LogFromStack { level } => {
+                {
+                    let text = String::from_utf8_lossy(input.bytes());
+                    host.log(*level, &text);
+                }
+                self.state.stack.pop();
+            }
 
             // Terminal and not a primitive: the state stays on the instruction, like a wait, so
             // stepping again gives the same outcome (ADR-280).
@@ -865,6 +884,8 @@ impl Vm {
             | Op::SecurityAccess { .. } => HostInput::Bytes(self.bytes_operand()?),
             // Send the bytes on top of the stack, which are then dropped.
             Op::FlashTransfer { .. } => HostInput::Bytes(self.bytes_operand()?),
+            // Log the bytes on top of the stack, which are then dropped.
+            Op::LogFromStack { .. } => HostInput::Bytes(self.bytes_operand()?),
             // Push the answer.
             Op::ReadDtc { .. } => {
                 self.check_room(0, 1)?;

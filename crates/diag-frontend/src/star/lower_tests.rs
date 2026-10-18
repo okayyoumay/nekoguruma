@@ -1690,6 +1690,35 @@ fn a_run_time_wait_duration_out_of_range_stops_the_run() {
     }
 }
 
+/// A `diag.log` message built at run time lowers to `LogFromStack` and reaches the host with
+/// its text; a constant message still lowers to `Log`.
+#[test]
+fn a_log_with_a_run_time_message_reaches_the_host() {
+    let source = "\
+def say(who):
+    diag.log(3, \"hello \" + who)
+
+def main():
+    say(\"ecu\")
+    diag.log(1, \"constant\")
+    say(\"\")
+";
+    let program = lowered(source).unwrap_or_else(|errors| panic!("{errors:#?}"));
+    assert!(program.code.contains(&Op::LogFromStack { level: 3 }));
+    assert!(
+        program
+            .code
+            .iter()
+            .any(|op| matches!(op, Op::Log { level: 1, .. }))
+    );
+    let mut host = ScriptedHost::default();
+    run_on(source, &mut host);
+    assert_eq!(
+        host.calls,
+        ["log 3 hello ecu", "log 1 constant", "log 3 hello "]
+    );
+}
+
 #[test]
 fn a_wait_not_yet_over_is_stepped_again() {
     let mut host = ScriptedHost {
@@ -1719,11 +1748,6 @@ fn wait_log_and_capture_arguments_are_checked() {
             NonConstantArgument,
             2,
         ),
-        (
-            "def f(s):\n    diag.log(1, s)\n\ndef main():\n    f(\"x\")\n",
-            NonConstantArgument,
-            2,
-        ),
         // Outside the ranges of 3.1.
         ("def main():\n    diag.wait(-1)\n", ArgumentOutOfRange, 2),
         (
@@ -1746,6 +1770,16 @@ fn wait_log_and_capture_arguments_are_checked() {
         ("def main():\n    diag.wait(1.5)\n", UnsupportedSyntax, 2),
         (
             "def main():\n    diag.log(1, b\"x\")\n",
+            UnsupportedSyntax,
+            2,
+        ),
+        (
+            "def f(b):\n    diag.log(1, b)\n\ndef main():\n    f(b\"x\")\n",
+            UnsupportedSyntax,
+            2,
+        ),
+        (
+            "def f(n):\n    diag.log(1, n + 1)\n\ndef main():\n    f(1)\n",
             UnsupportedSyntax,
             2,
         ),

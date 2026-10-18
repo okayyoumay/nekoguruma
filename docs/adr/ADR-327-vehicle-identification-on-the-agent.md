@@ -4,7 +4,7 @@
 **Status:** Accepted
 **Affects:** `agent` (an identification job, write jobs' variant check), `server` (identification plans, re-evaluation of
 the reported facts), `diag-frontend` and `diag-ir` (operator-facing variant attributes), design
-8.8.2, 8.9.1; ADR-235 item 8, ADR-315 (ambiguous variant matches), ADR-318 item 1, ADR-324 items 1 and 2, ADR-326 items 3 and 5; `docs/glossary.md`
+8.8.2, 8.9.1; ADR-235 item 8, ADR-315 (ambiguous variant matches), ADR-318 items 1 and 4, ADR-324 items 1 and 2, ADR-326 items 3 and 5; `docs/glossary.md`
 
 ## Context
 
@@ -173,7 +173,7 @@ maintainer chose to run the loop on the agent.
    so an operator's choice never decides a write's target. The check guards a job's first run:
    the agent journals that it passed before the first request that changes the ECU, together
    with the hashes of the program and of every document the check covered (the journal
-   otherwise identifies neither, ADR-318 item 4), and a
+   otherwise identifies neither, ADR-318 item 4, which this amends for these jobs), and a
    restart of an interrupted job whose journal records it with the same hashes as the restart
    carries (ADR-229 item 2) does not repeat it,
    since an erased application may no longer answer the identification requests; the restart

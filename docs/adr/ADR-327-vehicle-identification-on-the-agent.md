@@ -256,7 +256,14 @@ maintainer chose to run the loop on the agent.
    that re-runs identification (ADR-325 item 5), and on a job without a journal as on one with.
    The one exception is ADR-325 item 7's: the reprogramming
    target once the journal has reached its flash plan, which may answer only from its bootloader
-   and is validated by ADR-229's hardware identity and state checks instead. For it the
+   and is validated by ADR-229's hardware identity and state checks instead of by the variant
+   match. Even there the check for a second ECU still runs: together with ADR-229's VIN and
+   hardware identity reads, before anything that changes an ECU, the agent sends the listed
+   variants' identification requests over the target's link and collects answers as above, and
+   an answer on a listed response identifier other than the target's, or a VCI that cannot
+   receive one of them, ends the job in on-site intervention, so an ECU that came to share the
+   target's request identifier while the links were down is still caught; the target's own
+   answers to those requests are not evaluated. For it the
    combination record that ADR-325 item 7 commits (or, for a job that commits none, such as a
    single target without an access target, a guard record the journal commits at the same
    point, holding as that record does the hash of the document whose program runs and the
@@ -303,7 +310,9 @@ maintainer chose to run the loop on the agent.
 - The guard sees a second ECU on the target's request identifier only by its answer on its own
   response identifier, so each guard request waits out its whole response window, and an ECU
   there that answers none of the identification requests, its own variant's included, stays
-  unseen. A job refused because its VCI cannot receive those identifiers beside the target's
+  unseen, and so does one that answers on a response identifier no listed variant declares (an
+  unknown device, or one of an ECU definition the tenant may not use), since without a
+  declaration an answer there cannot be told apart from the bus's other traffic. A job refused because its VCI cannot receive those identifiers beside the target's
   link needs another VCI. These are accepted.
 - Until ECU definitions declare definitive negative responses, every negative response leaves a
   read inconclusive, so a guard is refused whenever any variant on its list (the target's own

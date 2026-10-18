@@ -87,8 +87,9 @@ A shared dry run has to settle three things the VM leaves to its host:
    (each field's size, name and bytes, nested fields included), seeds and keys, transfer data,
    forms and messages, each event also counted as `EVENT_COST`, twice its size in the events list, whose storage can
    grow to twice its length; an
-   event past that ends the run with a host error before it is stored, and a log message past
-   it, which the host cannot refuse, ends the run after its step. A definition run
+   event past that ends the run with a host error before it is stored, a log message past
+   it, which the host cannot refuse, ends the run after its step, and a host error that ends
+   the run keeps only the first `MAX_ERROR_REQUEST_BYTES` (64) bytes of the request it names. A definition run
    at ingestion is untrusted, and a loop resending a 16 MiB value would otherwise grow the
    report without bound.
 

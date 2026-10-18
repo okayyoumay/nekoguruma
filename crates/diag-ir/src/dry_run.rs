@@ -119,7 +119,17 @@ pub enum DryRunEvent {
     },
 }
 
-/// Why the mocked vehicle access could not answer.
+/// The most bytes of a request a [`DryRunError`] keeps: errors end the run outside the report
+/// budget, so a long request is cut short (ADR-328 item 7).
+pub const MAX_ERROR_REQUEST_BYTES: usize = 64;
+
+/// The first [`MAX_ERROR_REQUEST_BYTES`] bytes of `request`, for an error.
+fn error_request(request: &[u8]) -> Vec<u8> {
+    request[..request.len().min(MAX_ERROR_REQUEST_BYTES)].to_vec()
+}
+
+/// Why the mocked vehicle access could not answer. A `request` here is the request's first
+/// [`MAX_ERROR_REQUEST_BYTES`] bytes.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DryRunError {
     /// No declared service has the request's SID and a prefix the request starts with.
@@ -325,7 +335,7 @@ impl ScriptedHost<'_, '_> {
 /// prefix is the longest the request starts with.
 fn resolve<'v>(variant: EcuVariant<'v>, request: &[u8]) -> Result<Service<'v>, DryRunError> {
     let undeclared = || DryRunError::Undeclared {
-        request: request.to_vec(),
+        request: error_request(request),
     };
     let (&sid, rest) = request.split_first().ok_or_else(undeclared)?;
     let mut best: Vec<Service<'v>> = Vec::new();
@@ -349,7 +359,7 @@ fn resolve<'v>(variant: EcuVariant<'v>, request: &[u8]) -> Result<Service<'v>, D
         [] => Err(undeclared()),
         [service] => Ok(*service),
         _ => Err(DryRunError::Ambiguous {
-            request: request.to_vec(),
+            request: error_request(request),
             services: best
                 .iter()
                 .map(|s| s.short_name().unwrap_or_default().to_owned())
@@ -564,7 +574,7 @@ impl DiagHost for ScriptedHost<'_, '_> {
             return Err(DryRunError::WrongService {
                 service: declared.short_name().unwrap_or_default().to_owned(),
                 sid,
-                request: request.to_vec(),
+                request: error_request(request),
             });
         }
         self.answer(request, declared)

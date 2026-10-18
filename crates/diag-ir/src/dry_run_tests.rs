@@ -515,3 +515,21 @@ fn events_without_bytes_count_their_own_size() {
     assert_eq!(report.events.len(), MAX_REPORT_BYTES / EVENT_COST);
     assert!(report.events.capacity() * size_of::<DryRunEvent>() <= MAX_REPORT_BYTES);
 }
+
+#[test]
+fn an_error_keeps_only_the_start_of_a_long_request() {
+    let buf = document(vec![], vec![]);
+    let mut request = vec![0x22];
+    request.resize(1 << 20, 0xAB);
+    let program = program(
+        vec![Op::PushBytes(0), Op::ServiceRequest { service: 0x22 }],
+        vec![request[1..].to_vec()],
+    );
+    let report = run(&buf, &program, &Script::new());
+    assert_eq!(
+        report.end,
+        DryRunEnd::Host(DryRunError::Undeclared {
+            request: request[..MAX_ERROR_REQUEST_BYTES].to_vec()
+        })
+    );
+}

@@ -46,8 +46,11 @@ maintainer chose to run the loop on the agent.
 2. **Presence first.** For each distinct link of the ECU definitions in the plan whose protocol
    declares a functional identifier, the agent sends one presence request functionally (for UDS,
    TesterPresent with a response requested) and records each physical response identifier that
-   answered as a present endpoint. Presence belongs to the endpoint (the link and the response
-   identifier), not to an ECU definition: alternatives such as two suppliers' ECUs for one role
+   answered as a present endpoint. Presence belongs to the endpoint, not to an ECU definition. An
+   endpoint is a physical address: the bus (protocol family and pins) and the physical request
+   and response identifiers; definitions whose links differ only in baud rate, timing or other
+   ComParams share an endpoint, since they can reach the same ECU. Presence is keyed by endpoint
+   because alternatives such as two suppliers' ECUs for one role
    often share an endpoint, and an answer says only that one of the definitions using it is
    fitted, until a read tells which. An answer is evidence of presence; silence is not
    evidence of absence, since an ECU behind a gateway, a sleeping ECU or one on a link without
@@ -79,9 +82,11 @@ maintainer chose to run the loop on the agent.
 4. **The next ECU.** Among the ECU definitions still named by a remaining candidate (in a plan
    without candidates, item 8, every definition in the plan) and not yet read or out of reach,
    the agent reads the one whose outcome leaves the fewest candidates in the worst case,
-   counting as outcomes each combination of a variant it may report and the values the
-   candidates' matching rules expect from the fields read with it, and a conclusive match of no
-   variant. No answer and an inconclusive read are left out of the count: they narrow nothing
+   counting as outcomes the distinct sets of candidates that a possible response would leave:
+   each variant it may report, combined with the values the candidates' matching rules expect
+   from the fields read with it, grouped by the candidates the response satisfies (two
+   candidates whose expected values overlap, such as one prefix of the other, stay in one
+   outcome), and a conclusive match of no variant. No answer and an inconclusive read are left out of the count: they narrow nothing
    (item 3), so they would leave every candidate
    for every definition and erase the differences between them; how likely an answer is enters
    only through the tie-breakers. Ties go to the one named by

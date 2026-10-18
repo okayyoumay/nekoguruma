@@ -1,7 +1,7 @@
 # ADR-252: The Job Runner Journals at the Flash Recovery Plan's Boundaries
 
 **Date:** 2026-10-08
-**Status:** Accepted (item 2's open point decided by ADR-253; the step reaching a plan's end records the VM state since ADR-271, a step from inside the plan only since ADR-274; item 6 superseded by ADR-272; item 2 extended by ADR-291: a `RecoveryRequired` section outside the plans gets an intent ahead of its first primitive; item 7 amended by ADR-293: a program with a `RecoveryRequired` section keeps a journal without a plan too)
+**Status:** Accepted (item 2's open point decided by ADR-253; the step reaching a plan's end records the VM state since ADR-271, a step from inside the plan only since ADR-274; item 6 superseded by ADR-272; item 2 extended by ADR-291: a `RecoveryRequired` section outside the plans gets an intent ahead of its first primitive; item 7 amended by ADR-293: a program with a `RecoveryRequired` section keeps a journal without a plan too; item 3's cancel stop limited to interruptible points by ADR-330)
 **Affects:** `agent` (`src/runner.rs`, `src/journaling.rs`, `src/inputs.rs`, `src/host.rs`), `j2534-0404-service` (`tests/agent_flash_transfer.rs`)
 
 ## Context

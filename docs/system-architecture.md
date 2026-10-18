@@ -384,7 +384,7 @@ After a restart, ReadBackVerification is the state check's match itself (the int
 
 OnSiteInterventionRequired is final, except for one case. An OnSiteInterventionRequired that a restart reaches after it counted its resume, from a live read (identity or software version not established, an unexpected version, a precondition that does not hold, the default session not confirmed, a continuation not safe to repeat or a missing plan-end state), ends that run but is not journaled: a later resume of the job may try again, counting another resume, within the plan's resume limit (8.2.5), which bounds the repeats (ADR-290). The on-site endings derived from the journal and the program, or from the caller's input, are decided again by every resume before it counts one (ADR-286).
 
-Cancellation by the user does not take effect immediately. In an uninterruptible section (8.10.1), the cancel request is held, and the job transitions to Cancelled once it reaches an interruptible point. For every terminal state, the result is finalized only by the agent's report. The server never treats a disconnection as a failure or automatically reissues a write job.
+Cancellation by the user does not take effect immediately. In an uninterruptible or a recovery-required section (8.10.1), the cancel request is held, and the job transitions to Cancelled once it reaches an interruptible point; a procedure that ends before reaching one finishes instead (ADR-330). For every terminal state, the result is finalized only by the agent's report. The server never treats a disconnection as a failure or automatically reissues a write job.
 
 ### 5.7 Starting Work Offline
 

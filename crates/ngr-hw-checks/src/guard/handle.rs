@@ -184,8 +184,8 @@ struct State {
     closing: BTreeSet<u32>,
     /// Links whose return to the default session has been registered and has not run.
     session_back: BTreeSet<u32>,
-    /// How long a send-receive on each link may take (see [`completion_ceiling`]).
-    ceilings: BTreeMap<u32, Duration>,
+    /// The response timings of each link, which decide how long a send-receive may take.
+    timings: BTreeMap<u32, LinkTimings>,
 }
 
 /// The part of the handle the teardown steps share.
@@ -284,7 +284,7 @@ impl Shared {
             let state = self.lock();
             (
                 state.events.get(&cll.cll_handle).cloned(),
-                state.ceilings.get(&cll.cll_handle).copied(),
+                state.timings.get(&cll.cll_handle).map(LinkTimings::ceiling),
             )
         };
         let events =
@@ -293,7 +293,7 @@ impl Shared {
             .options
             .response_timeout
             .or(ceiling)
-            .unwrap_or_else(|| completion_ceiling(&[]));
+            .unwrap_or_else(|| Timings::default().ceiling());
         let expected = Expectation::of(request);
         let mut response = None;
         let mut error = None;
@@ -371,7 +371,9 @@ impl Expectation {
         // The sub-function is echoed without its suppress-response bit, a DID as requested (ISO
         // 14229-1 (2026) 9.4, 10.2 and 11.3).
         let positive = match request {
-            [0x22, hi, lo, ..] => vec![0x62, *hi, *lo],
+            // A DID is matched only for a single-DID read: the ECU may return several in any order,
+            // so a read of more matches the service only (as the agent's matcher does).
+            [0x22, hi, lo] => vec![0x62, *hi, *lo],
             [0x19 | 0x3E | 0x10, sub, ..] => vec![sid.wrapping_add(0x40), sub & 0x7F],
             [sid, ..] => vec![sid.wrapping_add(0x40)],
             [] => Vec::new(),
@@ -584,27 +586,101 @@ fn spelling(name: &str, link: &Link) -> String {
         .unwrap_or_else(|| name.to_owned())
 }
 
-/// How long a send-receive on a link set up with `own` may take: P2, the 0x78 completion timeout
-/// and one more P2* (the agent's `send_recv_ceiling`), as the link sets them (a value the plan
-/// lacks is the handle's default), and a margin for the worker and the transmission.
-fn completion_ceiling(own: &[(String, Value, PduParamClass)]) -> Duration {
-    let micros = |name: &str| {
-        own.iter()
-            .find_map(|(n, value, _)| match value {
-                Value::Number(v) if canonical(n) == canonical(name) => Some(u64::from(*v)),
-                _ => None,
-            })
-            .or_else(|| {
-                DEFAULTS
-                    .iter()
-                    .find(|(n, _)| *n == name)
-                    .map(|(_, v)| u64::from(*v))
-            })
-            .unwrap_or(0)
+/// The time ceiling of a send-receive with no finite 0x78 completion timeout: the worker never
+/// ends such a primitive for taking too long (`CP_RC78CompletionTimeout` zero means no ceiling),
+/// so the handle bounds the wait itself, long enough that no real response-pending chain
+/// reaches it and short enough that a hung ECU cannot hold a hardware run forever. The
+/// primitive is cancelled when it passes.
+const UNBOUNDED_COMPLETION_BOUND: Duration = Duration::from_secs(600);
+
+/// The three ComParams that decide how long a primitive runs, in microseconds as set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Timings {
+    p2_max: u32,
+    p2_star: u32,
+    rc78_completion: u32,
+}
+
+impl Default for Timings {
+    fn default() -> Self {
+        Timings {
+            p2_max: 1_000_000,
+            p2_star: 5_000_000,
+            rc78_completion: 25_000_000,
+        }
+    }
+}
+
+impl Timings {
+    /// What the plan sets (a value it lacks is the handle's default).
+    fn of(own: &[(String, Value, PduParamClass)]) -> Self {
+        let get = |name: &str, default: u32| {
+            own.iter()
+                .find_map(|(n, value, _)| match value {
+                    Value::Number(v) if canonical(n) == canonical(name) => Some(*v),
+                    _ => None,
+                })
+                .unwrap_or(default)
+        };
+        let default = Timings::default();
+        Timings {
+            p2_max: get("CP_P2Max", default.p2_max),
+            p2_star: get("CP_P2Star", default.p2_star),
+            rc78_completion: get("CP_RC78CompletionTimeout", default.rc78_completion),
+        }
+    }
+
+    /// How long a send-receive may take: P2, the 0x78 completion timeout and one more P2* (the
+    /// agent's `send_recv_ceiling`), and a margin for the worker and the transmission. A zero
+    /// is read as `j2534-0404-service` reads it: P2 zero is its 50 ms, P2* zero its 5 s, and
+    /// a zero completion timeout is no ceiling, for which the wait is
+    /// [`UNBOUNDED_COMPLETION_BOUND`].
+    fn ceiling(&self) -> Duration {
+        let micros = |v: u32, zero: Duration| {
+            if v == 0 {
+                zero
+            } else {
+                Duration::from_micros(u64::from(v))
+            }
+        };
+        micros(self.p2_max, Duration::from_millis(50))
+            + micros(self.p2_star, Duration::from_secs(5))
+            + micros(self.rc78_completion, UNBOUNDED_COMPLETION_BOUND)
+            + Duration::from_secs(2)
+    }
+}
+
+/// The timings of a link: those in effect, and those a `SetComParam` staged. The worker applies
+/// a staged value at the connect or at `COPT_UPDATEPARAM`; the handle waits for the longer of
+/// the two until an update primitive is accepted, then for the staged one.
+#[derive(Debug, Clone, Copy)]
+struct LinkTimings {
+    active: Timings,
+    staged: Timings,
+}
+
+impl LinkTimings {
+    fn ceiling(&self) -> Duration {
+        self.active.ceiling().max(self.staged.ceiling())
+    }
+}
+
+/// The timing ComParam a `SetComParam` item sets, by name or learned id, and its value.
+fn timing_change(item: &ParamItem, learned: &Learned) -> Option<(&'static str, u32)> {
+    let name = match item.id.as_ref()? {
+        param_item::Id::ParamName(name) => name.clone(),
+        param_item::Id::ParamId(id) => learned
+            .objects
+            .get(&(ObjectType::ObjtComparam, *id))?
+            .clone(),
     };
-    Duration::from_micros(
-        micros("CP_P2Max") + micros("CP_P2Star") + micros("CP_RC78CompletionTimeout"),
-    ) + Duration::from_secs(2)
+    let Some(param_item::ParamData::Unum32(value)) = item.param_data else {
+        return None;
+    };
+    let name = ["cp_p2max", "cp_p2star", "cp_rc78completiontimeout"]
+        .into_iter()
+        .find(|known| *known == canonical(&name))?;
+    Some((name, value))
 }
 
 /// The ComParams a link is set up with, by the name the worker is asked for.
@@ -807,6 +883,16 @@ impl<'r> GuardedHandle<'r> {
         self.shared.lock().links.clone()
     }
 
+    /// How long [`GuardedHandle::send_receive`] waits on `cll` by default (when
+    /// [`HandleOptions::response_timeout`] is `None`), from the timings the link is set to.
+    pub fn response_ceiling(&self, cll: ComLogicalLinkHandle) -> Option<Duration> {
+        self.shared
+            .lock()
+            .timings
+            .get(&cll.cll_handle)
+            .map(LinkTimings::ceiling)
+    }
+
     /// The ids the harness has learned from the worker's answers.
     pub fn learned(&self) -> Learned {
         self.shared.lock().learned.clone()
@@ -823,7 +909,7 @@ impl<'r> GuardedHandle<'r> {
         let class = self.shared.profile.class;
         // Planned first, so that a link the handle cannot set up is not created.
         let Plan { own, table } = plan(link, class)?;
-        let ceiling = completion_ceiling(&own);
+        let timings = Timings::of(&own);
         let found = self
             .get_resource_ids(GetResourceIdsRequest {
                 module_handle: Some(module),
@@ -856,7 +942,13 @@ impl<'r> GuardedHandle<'r> {
             .cll_handle
             .ok_or_else(|| HandleError::Setup("no logical link handle".to_owned()))?;
 
-        self.shared.lock().ceilings.insert(cll.cll_handle, ceiling);
+        self.shared.lock().timings.insert(
+            cll.cll_handle,
+            LinkTimings {
+                active: timings,
+                staged: timings,
+            },
+        );
         for (name, value, param_class) in own {
             let id = self.param_id(&name).await?;
             self.set_com_param(SetComParamRequest {
@@ -1031,11 +1123,26 @@ impl<'r> GuardedHandle<'r> {
         request: SetComParamRequest,
     ) -> Result<vci_service_interface::Response, HandleError> {
         let grant = self.shared.admit(&Request::SetComParam(&request))?;
+        let change = request.cll_handle.zip(
+            request
+                .param_item
+                .as_ref()
+                .and_then(|item| timing_change(item, &self.shared.lock().learned)),
+        );
         let response = self
             .shared
             .send("SetComParam", self.client.clone().set_com_param(request))
             .await?;
         self.shared.apply(&grant);
+        if let Some((cll, (name, value))) = change
+            && let Some(timings) = self.shared.lock().timings.get_mut(&cll.cll_handle)
+        {
+            match name {
+                "cp_p2max" => timings.staged.p2_max = value,
+                "cp_p2star" => timings.staged.p2_star = value,
+                _ => timings.staged.rc78_completion = value,
+            }
+        }
         Ok(response)
     }
 
@@ -1075,12 +1182,21 @@ impl<'r> GuardedHandle<'r> {
                 return_to_default_session(self.shared.clone(), self.client.clone(), cll),
             );
         }
-        self.shared
+        let updates = request.cop_type == ComOperationType::CoptUpdateparam as i32;
+        let response = self
+            .shared
             .send(
                 "StartComPrimitive",
                 self.client.clone().start_com_primitive(request),
             )
-            .await
+            .await?;
+        if updates
+            && let Some(cll) = cll
+            && let Some(timings) = self.shared.lock().timings.get_mut(&cll.cll_handle)
+        {
+            timings.active = timings.staged;
+        }
+        Ok(response)
     }
 
     /// Sends the UDS request `request` on `cll` as a send-receive primitive and returns the
@@ -1290,21 +1406,103 @@ mod tests {
         assert!(!names.contains(&"CP_P2Max") && !names.contains(&"CP_TesterPresentMessage"));
     }
 
+    fn ceiling_of(profile: &Profile) -> Duration {
+        let Plan { own, .. } = plan(link_of(profile), profile.class).unwrap();
+        Timings::of(&own).ceiling()
+    }
+
     #[test]
     fn the_default_deadline_covers_the_completion_timeout_the_link_is_set_to() {
         // The handle's own defaults: P2 1 s + 0x78 chain 25 s + P2* 5 s, and a margin.
         let t3 = &shapes()[2];
-        let Plan { own, .. } = plan(link_of(t3), t3.class).unwrap();
-        assert_eq!(completion_ceiling(&own), Duration::from_secs(33));
-        assert!(completion_ceiling(&own) > Duration::from_secs(25));
+        assert_eq!(ceiling_of(t3), Duration::from_secs(33));
         // A profile that pins the timings is waited for as pinned.
         let pinned = profile(
             "T3",
             "id_bits = 11\naddressing = \"normal\"\n[link.comparams]\nCP_P2Max = 2000000\n\
              CP_P2Star = 3000000\nCP_RC78CompletionTimeout = 60000000\n",
         );
-        let Plan { own, .. } = plan(link_of(&pinned), pinned.class).unwrap();
-        assert_eq!(completion_ceiling(&own), Duration::from_secs(67));
+        assert_eq!(ceiling_of(&pinned), Duration::from_secs(67));
+    }
+
+    #[test]
+    fn zero_timings_are_read_as_the_worker_reads_them() {
+        let zeros = |extra: &str| {
+            profile(
+                "T3",
+                &format!("id_bits = 11\naddressing = \"normal\"\n[link.comparams]\n{extra}"),
+            )
+        };
+        // P2* zero is the worker's 5 s: the same as leaving the default.
+        assert_eq!(
+            ceiling_of(&zeros("CP_P2Star = 0\n")),
+            Duration::from_secs(33)
+        );
+        // P2 zero is the worker's 50 ms.
+        assert_eq!(
+            ceiling_of(&zeros("CP_P2Max = 0\n")),
+            Duration::from_millis(50) + Duration::from_secs(5 + 25 + 2)
+        );
+        // A zero completion timeout is no ceiling in the worker: the handle's bound, far above
+        // any finite one, and not a deadline of zero.
+        let unbounded = ceiling_of(&zeros("CP_RC78CompletionTimeout = 0\n"));
+        assert_eq!(
+            unbounded,
+            UNBOUNDED_COMPLETION_BOUND + Duration::from_secs(1 + 5 + 2)
+        );
+    }
+
+    #[test]
+    fn a_timing_change_grows_the_deadline_until_an_update_and_follows_it_after() {
+        let t3 = &shapes()[2];
+        let Plan { own, .. } = plan(link_of(t3), t3.class).unwrap();
+        let initial = Timings::of(&own);
+        let mut link = LinkTimings {
+            active: initial,
+            staged: initial,
+        };
+        let learned = Learned::default();
+        let set = |name: &str, value: u32| {
+            let item = ParamItem {
+                id: Some(param_item::Id::ParamName(name.to_owned())),
+                com_param_class: PduParamClass::PduPcSpecified as i32,
+                param_data: Some(param_item::ParamData::Unum32(value)),
+            };
+            timing_change(&item, &learned).unwrap()
+        };
+        let (name, value) = set("CP_RC78CompletionTimeout", 60_000_000);
+        assert_eq!(name, "cp_rc78completiontimeout");
+        link.staged.rc78_completion = value;
+        assert_eq!(link.ceiling(), Duration::from_secs(68));
+        // A smaller staged value does not shorten the wait before the update.
+        link.staged.rc78_completion = 1_000_000;
+        link.staged.p2_max = set("cp_p2max", 3_000_000).1;
+        assert_eq!(link.ceiling(), Duration::from_secs(33));
+        link.active = link.staged;
+        assert_eq!(link.ceiling(), Duration::from_secs(11));
+        // Anything but the three timings is not a change.
+        let other = ParamItem {
+            id: Some(param_item::Id::ParamName("CP_BlockSize".to_owned())),
+            param_data: Some(param_item::ParamData::Unum32(1)),
+            ..ParamItem::default()
+        };
+        assert!(timing_change(&other, &learned).is_none());
+    }
+
+    #[test]
+    fn a_read_of_several_dids_matches_the_service_only() {
+        let positive = |request: &[u8]| {
+            Expectation::of(request).descriptors()[0]
+                .pattern_data
+                .clone()
+        };
+        assert_eq!(positive(&[0x22, 0xF1, 0x90]), [0x62, 0xF1, 0x90]);
+        assert_eq!(positive(&[0x22, 0xF1, 0x90, 0xF1, 0x91]), [0x62]);
+        // Records in the other order still answer the read.
+        assert!(
+            Expectation::of(&[0x22, 0xF1, 0x90, 0xF1, 0x91])
+                .answers(&[0x62, 0xF1, 0x91, 1, 0xF1, 0x90, 2])
+        );
     }
 
     #[test]

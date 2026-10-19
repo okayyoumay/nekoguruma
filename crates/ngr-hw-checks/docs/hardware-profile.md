@@ -262,7 +262,14 @@ connection is served by the runtime.
   stream, which `send_receive(cll, request)` reads (it returns the final response, a negative one
   included, or `NoResponse`). It waits up to `HandleOptions::response_timeout`, by default the link's ceiling
   (P2, the 0x78 completion timeout and P2* the link is set to, the profile's when it pins them,
-  plus 2 s), and cancels the primitive when the wait ends.
+  plus 2 s), and cancels the primitive when the wait ends. Zeros are read as
+  `j2534-0404-service` reads them: P2 zero is 50 ms, P2* zero is 5 s, and a zero completion
+  timeout is no ceiling in the worker, so the handle waits at most 10 minutes (and then cancels)
+  rather than forever. A `SetComParam` of P2, P2* or the completion timeout through the handle
+  updates the ceiling: until a `COPT_UPDATEPARAM` primitive is accepted the longer of the old and
+  the new value is waited for, afterwards the new one (`response_ceiling` reports it). A read of
+  one DID expects `62` and that DID; a read of several expects `62` only, since the ECU may
+  return the records in any order.
 - **State.** A `GetResourceIds` answer records the resource each id stands for and a `GetObjectId`
   answer the name of the id, into the learned ids. The `cll_handle` of a granted
   `CreateComLogicalLink` is bound to its endpoint, a granted `SetComParam` or

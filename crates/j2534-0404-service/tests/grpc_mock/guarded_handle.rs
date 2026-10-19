@@ -423,3 +423,53 @@ async fn a_send_receive_that_times_out_cancels_its_primitive() {
     drop(run);
     server.shutdown().await;
 }
+
+/// A timing a check changes through the handle changes how long the default send-receive waits.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn the_default_deadline_follows_a_timing_the_check_changes() {
+    let server = TestServer::start().await;
+    let profile = t3();
+    let reports = Reports::new();
+    let mut run = RunGuard::start_in(&profile, "hw_guarded_handle", reports.dir());
+    let mut handle = GuardedHandle::attach(
+        &profile,
+        &vci(&profile),
+        server.worker_client().await,
+        module(),
+        HandleOptions::default(),
+        &mut run,
+    )
+    .await
+    .expect("the handle opens the profile's link");
+    let [cll] = *handle.links() else {
+        panic!("one link");
+    };
+    // P2 1 s, the 0x78 chain 25 s, P2* 5 s and the margin.
+    let before = handle.response_ceiling(cll).expect("a ceiling");
+    assert_eq!(before, std::time::Duration::from_secs(33));
+    handle
+        .set_com_param(vci_service_interface::SetComParamRequest {
+            cll_handle: Some(cll),
+            param_item: Some(vci_service_interface::ParamItem {
+                id: Some(vci_service_interface::param_item::Id::ParamName(
+                    "CP_RC78CompletionTimeout".to_owned(),
+                )),
+                com_param_class: vci_service_interface::PduParamClass::PduPcSpecified as i32,
+                param_data: Some(vci_service_interface::param_item::ParamData::Unum32(
+                    60_000_000,
+                )),
+            }),
+        })
+        .await
+        .expect("the timing is set");
+    assert_eq!(
+        handle.response_ceiling(cll),
+        Some(std::time::Duration::from_secs(68))
+    );
+    drop(handle);
+    run.pass();
+    assert!(run.run_teardown().is_empty());
+    drop(run);
+    server.shutdown().await;
+}

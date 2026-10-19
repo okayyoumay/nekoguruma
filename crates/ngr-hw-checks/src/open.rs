@@ -62,6 +62,9 @@ pub enum OpenError {
     Config(String),
     #[error("the worker reports the selected module without a handle")]
     NoHandle,
+    /// `GetVersion` answered without version data, so the versions cannot be compared.
+    #[error("the worker answered `GetVersion` without version data")]
+    NoVersion,
     /// The device is not the profile's. No link was created. `stopped` is how the worker ended
     /// afterwards, `None` when stopping it failed.
     #[error("the attached device is not the profile's: {refusal}")]
@@ -208,7 +211,7 @@ async fn match_device(
         )
         .await?
         .version_data
-        .unwrap_or_default();
+        .ok_or(OpenError::NoVersion)?;
         let version = ReportedVersion {
             hw_name: data.hw_name,
             fw_name: data.fw_name,

@@ -25,7 +25,7 @@ use worker_host::abi::Abi;
 use crate::Refusal;
 use crate::device::{ReportedModule, ReportedVersion, attribute_values, coded_version};
 use crate::profile::{Api, Profile, Setup, Vci};
-use crate::teardown::Teardown;
+use crate::teardown::{StepFailure, Teardown, TeardownHandle};
 
 /// The report directory below the user's data directory.
 const SUBDIR: [&str; 2] = ["nekoguruma", "hw-reports"];
@@ -552,6 +552,8 @@ pub struct RunGuard {
     check: String,
     dir: Option<PathBuf>,
     teardown: Teardown,
+    /// What failed in the steps run so far, by an early [`RunGuard::run_teardown`] or at drop.
+    teardown_failures: Vec<StepFailure>,
 }
 
 impl RunGuard {
@@ -577,14 +579,24 @@ impl RunGuard {
             check: check.to_owned(),
             dir,
             teardown: Teardown::new(),
+            teardown_failures: Vec::new(),
         }
     }
 
     /// The run's teardown steps (design 13.5 "Cleanup"): register one as each resource is
     /// acquired. Dropping the guard runs them first, in reverse, and a step that fails fails
     /// the check even if it recorded a pass.
-    pub fn teardown(&mut self) -> &mut Teardown {
-        &mut self.teardown
+    pub fn teardown(&mut self) -> TeardownHandle<'_> {
+        TeardownHandle(&mut self.teardown)
+    }
+
+    /// Runs the registered steps now (early cleanup, such as before the check's last reads) and
+    /// returns what failed, for information. The failures stay with the guard: dropping it fails
+    /// the check even if it records a pass afterwards. A step registered later runs at drop.
+    pub fn run_teardown(&mut self) -> Vec<StepFailure> {
+        let failures = self.teardown.run();
+        self.teardown_failures.extend(failures.iter().cloned());
+        failures
     }
 
     /// The report, for `add_device` and other entries.
@@ -643,7 +655,8 @@ impl Drop for RunGuard {
     fn drop(&mut self) {
         // The steps run first, whatever the check did, and before the report is written, so
         // that a failed step is in it.
-        let failures = self.teardown.run();
+        self.run_teardown();
+        let failures = std::mem::take(&mut self.teardown_failures);
         if std::thread::panicking() {
             // A check that panics after recording a pass (in a later guard's drop, say) failed.
             let check = self.check.clone();

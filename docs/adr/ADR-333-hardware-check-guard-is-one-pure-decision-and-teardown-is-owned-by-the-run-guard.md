@@ -50,7 +50,9 @@ present.
    have been set to the profile's value (`Grant::SetsComParams`, applied by the caller after the
    worker accepted the request) and refuses `ConnectComLogicalLink` until all are: the baud rate,
    the physical request and response identifiers, the functional identifier if the profile has
-   one, the CAN ID formats when the width or addressing is not 11-bit normal, the address byte
+   one, the CAN ID formats of the physical request, the USDT response and, with a functional
+   identifier, the functional request, on every link (the D-PDU API leaves a link's defaults to
+   the vendor library, so even an 11-bit normal profile sets them to its encoding), the address byte
    when the addressing has one, the request and tester-present address modes on every link (the J2534 preset of
    `ISO_14229_3_on_ISO_15765_2` sends tester present functionally to its own 0x7DF with handling
    on, so a profile without a functional identifier sets both to physical), the filler handling
@@ -157,9 +159,11 @@ present.
    the caller waits for it on a channel with a timeout, so `run` works from inside a runtime's
    thread (blocking on the runtime there would panic) and a step that blocks inside `poll`, where
    no runtime timer fires, times out as well: it is reported, its thread is left behind and never
-   joined, and the remaining steps run. `Drop` runs the rest and never panics. `RunGuard::teardown()` gives the run's
-   `Teardown`; the guard's `Drop` runs it before anything else, whatever the check did, and when
-   a step failed it turns a recorded pass into a failure naming the steps (and appends them to
+   joined, and the remaining steps run. `Drop` runs the rest and never panics. `RunGuard::teardown()` gives the check a
+   handle that registers steps and sets the timeout but cannot run them; running goes through the
+   guard, whose `run_teardown()` does early cleanup and keeps the failures, so a failure is never
+   returned to the check and lost. The guard's drop runs the rest; the guard's `Drop` runs it before anything else, whatever the check did, and when
+   a step failed (early or at drop) it turns a recorded pass into a failure naming the steps (and appends them to
    a recorded failure), then writes the report as before.
 
 Alternatives rejected:

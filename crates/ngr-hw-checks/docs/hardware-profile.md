@@ -198,13 +198,13 @@ Anything it cannot classify is refused.
   data through, so on any other class the guard cannot classify its identifier or payload). One link per profile endpoint (T0: one per
   VCI end, created for the end whose `channel` the resource's protocol name is, or else whose
   `protocol` it is; a SocketCAN end has no worker link). `ConnectComLogicalLink` is refused until
-  the pinned ComParams (baud rate, request, response and functional identifiers, formats and
-  address byte when the link needs them, the request and tester-present address modes (physical when the profile has no functional
+  the pinned ComParams (baud rate, request, response and functional identifiers, the physical, response and functional formats on
+  every link, the address byte when the addressing has one, the request and tester-present address modes (physical when the profile has no functional
   identifier, since the worker's preset sends tester present functionally), the filler handling (0 on an unpadded profile, since
   the worker's preset pads) and, when the profile pads, the filler byte, `[link.comparams]`) have
   been set to the profile's values, which the caller records from `SetsComParams` grants. A
   `SetUniqueRespIdTable` replaces the table on both workers, so it must carry the request and
-  response identifiers (and the formats and address byte the link needs), each at the profile's
+  response identifiers (and the physical and response formats, and the address byte when the addressing has one), each at the profile's
   value, in exactly one entry; an empty or partial table, or one with more than one entry, is
   refused. The `Context` names the profile VCI its worker
   fronts, and a link is created only for an endpoint on it (on a T0 of two VCIs each worker's
@@ -238,8 +238,9 @@ Anything it cannot classify is refused.
 them in reverse, each at most once, each under `catch_unwind`; a failing or panicking step does
 not stop the others. An async step runs on a detached thread with its own runtime; the caller waits for it with a
 timeout (`set_timeout`; 30 s by default), so it can be run from inside a runtime and a step that
-blocks is reported as timed out and left behind while the rest run. A `RunGuard` owns one
-(`RunGuard::teardown()`), runs it when dropped, also while a check panics, and turns a failed
+blocks is reported as timed out and left behind while the rest run. A `RunGuard` owns one: `RunGuard::teardown()` gives a handle that registers steps and sets
+the timeout only, `RunGuard::run_teardown()` runs them early and keeps their failures, and the
+guard runs the rest when dropped, also while a check panics, and turns a failed
 step into a failed check even if the check recorded a pass.
 
 ## Reports

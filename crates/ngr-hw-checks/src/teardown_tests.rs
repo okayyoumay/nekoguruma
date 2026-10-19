@@ -267,3 +267,36 @@ fn an_async_step_that_blocks_inside_poll_times_out_and_the_rest_runs() {
     assert_eq!(failures.len(), 1);
     assert!(failures[0].reason.contains("timed out"), "{failures:?}");
 }
+
+#[test]
+fn an_early_teardown_run_keeps_its_failures_for_the_check() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("reports");
+    let log = log();
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let mut run = RunGuard::start_in(&t3_profile(), "hw_e", dir.clone());
+        run.teardown()
+            .register("device", || Err("the device is busy".to_owned()));
+        run.teardown().register("power", step(&log, "power"));
+        // Early cleanup: the failure is returned for information and kept by the guard.
+        let failures = run.run_teardown();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].name, "device");
+        assert_eq!(events(&log), ["power"]);
+        // A step registered after the early run runs at drop.
+        run.teardown().register("link", step(&log, "link"));
+        run.pass();
+    }));
+    // The check recorded a pass, but the guard fails it, naming the step.
+    assert!(result.is_err());
+    assert_eq!(events(&log), ["power", "link"]);
+    let table = only_report(&dir);
+    let checks = table["check"].as_array().unwrap();
+    assert_eq!(checks.len(), 1);
+    assert_eq!(checks[0]["outcome"].as_str(), Some("failed"));
+    let message = checks[0]["message"].as_str().unwrap();
+    assert!(
+        message.contains("teardown failed") && message.contains("device"),
+        "{message}"
+    );
+}

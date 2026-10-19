@@ -407,8 +407,7 @@ pub(super) fn table_required(link: &Link) -> Vec<String> {
 
 /// The canonical names of the ComParams the profile pins, which must all be set to the
 /// profile's value before the link is connected: the baud rate, the physical request and
-/// response identifiers, the functional identifier if the profile has one, the CAN ID formats
-/// when the width or addressing is not 11-bit normal, the address byte when the addressing has
+/// response identifiers, the functional identifier if the profile has one, the CAN ID formats, the address byte when the addressing has
 /// one, the filler handling on every link (and the filler byte when the profile pads), and every
 /// `[link.comparams]` entry. The worker's own
 /// defaults are not the profile's.
@@ -427,11 +426,13 @@ pub(super) fn required(link: &Link) -> Vec<String> {
         names.push("cp_canfuncreqid");
     }
     let addressed = link.addressing != Addressing::Normal;
-    if link.id_bits == 29 || addressed {
-        names.extend(["cp_canphysreqformat", "cp_canrespusdtformat"]);
-        if functional {
-            names.push("cp_canfuncreqformat");
-        }
+    // The formats on every link: the D-PDU API leaves a link's defaults to the vendor library,
+    // which the guard cannot know, and the J2534 preset's 0x05 is only the 11-bit normal one. An
+    // address byte is needed (and then required) only when the addressing has one; for a normal
+    // profile the library's default of none is not pinned.
+    names.extend(["cp_canphysreqformat", "cp_canrespusdtformat"]);
+    if functional {
+        names.push("cp_canfuncreqformat");
     }
     if addressed {
         names.extend(["cp_canphysreqextaddr", "cp_canrespusdtextaddr"]);

@@ -125,6 +125,41 @@ impl Teardown {
     }
 }
 
+/// What a check gets of its run's teardown (`RunGuard::teardown`): it can register steps and set
+/// the timeout, but not run them. Running goes through the run guard, which keeps what failed, so
+/// a failure cannot be returned to the check and lost.
+pub struct TeardownHandle<'a>(pub(crate) &'a mut Teardown);
+
+impl TeardownHandle<'_> {
+    /// See [`Teardown::set_timeout`].
+    pub fn set_timeout(&mut self, timeout: Duration) {
+        self.0.set_timeout(timeout);
+    }
+
+    /// See [`Teardown::register`].
+    pub fn register(
+        &mut self,
+        name: impl Into<String>,
+        step: impl FnOnce() -> Result<(), String> + Send + 'static,
+    ) {
+        self.0.register(name, step);
+    }
+
+    /// See [`Teardown::register_async`].
+    pub fn register_async(
+        &mut self,
+        name: impl Into<String>,
+        step: impl Future<Output = Result<(), String>> + Send + 'static,
+    ) {
+        self.0.register_async(name, step);
+    }
+
+    /// Whether no step is left to run.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
 impl Drop for Teardown {
     /// Runs what is left. Never panics: a failure goes to stderr.
     fn drop(&mut self) {

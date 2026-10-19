@@ -239,6 +239,17 @@ fn set(env: &Env, item: ParamItem) -> Result<Grant, GuardRefusal> {
     }))
 }
 
+/// The response table entries of the default 11-bit normal link: the identifiers and the
+/// formats (0x05: segmented, with flow control).
+fn table_items(phys: u32, resp: u32) -> Vec<ParamItem> {
+    vec![
+        unum("CP_CanPhysReqId", phys),
+        unum("CP_CanRespUSDTId", resp),
+        unum("CP_CanPhysReqFormat", 0x05),
+        unum("CP_CanRespUSDTFormat", 0x05),
+    ]
+}
+
 fn set_table(env: &Env, items: Vec<ParamItem>) -> Result<Grant, GuardRefusal> {
     env.decide(Request::SetUniqueRespIdTable(
         &SetUniqueRespIdTableRequest {
@@ -595,11 +606,7 @@ fn an_alias_of_the_baud_rate_is_compared_like_it() {
         assert!(
             set_table(
                 &env,
-                vec![
-                    unum(name, 500_000),
-                    unum("CP_CanPhysReqId", 0x7E0),
-                    unum("CP_CanRespUSDTId", 0x7E8)
-                ]
+                [vec![unum(name, 500_000)], table_items(0x7E0, 0x7E8)].concat()
             )
             .is_ok(),
             "{name}"
@@ -745,15 +752,7 @@ fn each_allow_listed_comparam_passes() {
 #[test]
 fn identifiers_in_the_response_table_are_compared_too() {
     let env = Env::linked(profile("T3"), false);
-    let table = |phys: u32, resp: u32| {
-        set_table(
-            &env,
-            vec![
-                unum("CP_CanPhysReqId", phys),
-                unum("CP_CanRespUSDTId", resp),
-            ],
-        )
-    };
+    let table = |phys: u32, resp: u32| set_table(&env, table_items(phys, resp));
     assert!(table(0x7E0, 0x7E8).is_ok());
     assert!(table(0x7E1, 0x7E8).is_err());
     assert!(table(0x7E0, 0x7E9).is_err());
@@ -991,18 +990,19 @@ fn a_link_connects_only_once_the_profiles_comparams_are_set() {
         assert!(connect(&env).is_err(), "still missing after {label}");
     }
     // The identifiers go in through the response table, the functional one through SetComParam.
-    let table = set_table(
-        &env,
-        vec![
-            unum("CP_CanPhysReqId", 0x7E0),
-            unum("CP_CanRespUSDTId", 0x7E8),
-        ],
-    );
+    let table = set_table(&env, table_items(0x7E0, 0x7E8));
     assert_eq!(
         table,
         Ok(Grant::SetsComParams {
             cll: CLL,
-            names: vec!["cp_canphysreqid".to_owned(), "cp_canrespusdtid".to_owned()]
+            names: [
+                "cp_canphysreqformat",
+                "cp_canphysreqid",
+                "cp_canrespusdtformat",
+                "cp_canrespusdtid"
+            ]
+            .map(str::to_owned)
+            .to_vec()
         })
     );
     apply(&mut env, table);
@@ -1012,6 +1012,10 @@ fn a_link_connects_only_once_the_profiles_comparams_are_set() {
     };
     assert!(why.contains("cp_canfuncreqid"), "{why}");
     let grant = set(&env, unum("CP_CanFuncReqId", 0x7DF));
+    apply(&mut env, grant);
+    // A 29-bit format on an 11-bit profile is refused; the functional format is still missing.
+    assert!(set(&env, unum("CP_CanFuncReqFormat", 0x07)).is_err());
+    let grant = set(&env, unum("CP_CanFuncReqFormat", 0x05));
     apply(&mut env, grant);
     // The worker's preset sends tester present functionally: both modes are pinned.
     let Err(GuardRefusal::LinkSetup(why)) = connect(&env) else {
@@ -1088,7 +1092,9 @@ fn the_connect_check_requires_what_the_profile_pins() {
         [
             "cp_baudrate",
             "cp_canfillerbytehandling",
+            "cp_canphysreqformat",
             "cp_canphysreqid",
+            "cp_canrespusdtformat",
             "cp_canrespusdtid",
             "cp_requestaddrmode",
             "cp_testerpresentaddrmode"
@@ -1099,19 +1105,21 @@ fn the_connect_check_requires_what_the_profile_pins() {
 #[test]
 fn a_response_table_replaces_the_old_one_and_must_be_complete() {
     let mut env = Env::linked(profile("T3"), false);
-    let complete = |phys: u32, resp: u32| {
-        vec![
-            unum("CP_CanPhysReqId", phys),
-            unum("CP_CanRespUSDTId", resp),
-        ]
-    };
+    let complete = table_items;
     // A complete table passes and records its names.
     let grant = set_table(&env, complete(0x7E0, 0x7E8));
     assert_eq!(
         grant,
         Ok(Grant::SetsComParams {
             cll: CLL,
-            names: vec!["cp_canphysreqid".to_owned(), "cp_canrespusdtid".to_owned()]
+            names: [
+                "cp_canphysreqformat",
+                "cp_canphysreqid",
+                "cp_canrespusdtformat",
+                "cp_canrespusdtid"
+            ]
+            .map(str::to_owned)
+            .to_vec()
         })
     );
     apply(&mut env, grant);
@@ -1402,6 +1410,49 @@ fn raw_frame_flags_must_equal_the_profile_in_both_directions() {
     };
     assert!(t0_send(&[TxFlagBit::TxFlagIso15765FramePad]).is_ok());
     assert!(t0_send(&[]).is_err());
+}
+
+#[test]
+fn the_formats_are_set_before_connect_on_an_11_bit_normal_link() {
+    let mut env = Env::linked(
+        profile_with(
+            "T3",
+            &L {
+                functional: None,
+                ..L::default()
+            },
+        ),
+        false,
+    );
+    let required = link::required(env.endpoint_link(0));
+    let others: Vec<String> = required
+        .iter()
+        .filter(|n| !n.ends_with("format"))
+        .cloned()
+        .collect();
+    env.links.get_mut(&CLL).unwrap().set.extend(others);
+    let Err(GuardRefusal::LinkSetup(why)) = connect(&env) else {
+        panic!("connect should be refused");
+    };
+    assert!(
+        why.contains("cp_canphysreqformat") && why.contains("cp_canrespusdtformat"),
+        "{why}"
+    );
+    // A 29-bit format is not the profile's.
+    assert!(set(&env, unum("CP_CanPhysReqFormat", 0x07)).is_err());
+    assert!(set(&env, unum("CP_CanRespUSDTFormat", 0x06)).is_err());
+    let grant = set(&env, unum("CP_CanPhysReqFormat", 0x05));
+    apply(&mut env, grant);
+    assert!(connect(&env).is_err());
+    let grant = set(&env, unum("CP_CanRespUSDTFormat", 0x05));
+    apply(&mut env, grant);
+    assert_eq!(connect(&env), Ok(Grant::Pass));
+    // The extended address of a normal profile is not required.
+    assert!(
+        !link::required(env.endpoint_link(0))
+            .iter()
+            .any(|n| n.ends_with("extaddr"))
+    );
 }
 
 #[test]

@@ -275,7 +275,11 @@ fn a_directory_inside_another_work_tree_is_accepted() {
     let path = Report::new(&profile("j2534-0404", ""))
         .write_to(&dir)
         .unwrap();
-    assert!(path.starts_with(&dir));
+    // The written path is the resolved one (`\\?\` on Windows, `/private` on macOS).
+    assert_eq!(
+        path.parent().unwrap().canonicalize().unwrap(),
+        dir.canonicalize().unwrap()
+    );
 }
 
 #[test]

@@ -183,7 +183,7 @@ access or session beyond the extended one) are the class's lists, not declared o
 Each run writes a report (design 13.5 "Reports"). A check builds it with
 `ngr_hw_checks::report::Report::new(&profile)`, adds its results with `record` (passed, failed or
 refused, with a message) and `record_refusal`, adds what the opened device reported with
-`set_device`, and ends with `write`. A `hw_` test normally holds a `report::RunGuard` instead
+`add_device` for each device it opened, and ends with `write`. A `hw_` test normally holds a `report::RunGuard` instead
 (`RunGuard::start(&profile, name)`), which writes the report when it is dropped: a check that fails
 by panic still leaves its report, with the check recorded as failed, and so does one that ends
 without recording a result. The test ends with `pass()` or `finish(outcome, message)`.
@@ -193,11 +193,12 @@ panic, the write error goes to stderr so it does not hide the check's own failur
 
 - **Content (TOML).** `started_at` (UTC, RFC 3339), `host` (the `HOSTNAME` or `COMPUTERNAME`
   variable, else `/etc/hostname`), `os` (the OS and architecture the harness was built for) with
-  `os_version` where `/etc/os-release` gives one, `class`, `identifiers_in_full`, a `[device]`
-  table and one `[[check]]` table per result. `[device]` holds `abi` (the worker's), `vendor` and
+  `os_version` where `/etc/os-release` gives one, `class`, `identifiers_in_full`, one `[[device]]`
+  table per opened device (a T0 loopback may open two) and one `[[check]]` table per result.
+  `[[device]]` holds `abi` (the worker's), `vendor` and
   `model`, `firmware_version` and
   `library_version` (J2534: the strings the worker reports; D-PDU API: the coded numbers as
-  `major.minor.revision`). It is absent when no check opened a device. For the D-PDU API,
+  `major.minor.revision`). There is none when no check opened a device. For the D-PDU API,
   `vendor` and `model` are the vendor and hardware names `GetVersion` reports, falling back to
   the profile's library and the module's `vendor_module_name` when the library leaves them empty.
   J2534 reports neither (its worker answers constants), so for J2534 they are the profile's

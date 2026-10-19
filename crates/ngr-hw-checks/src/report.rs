@@ -3,7 +3,7 @@
 //! of each check, written as a TOML file in a directory only the running user can read.
 //!
 //! - [`Report::new`] starts a report for a profile; a check adds its results with
-//!   [`Report::record`] and, when it opened a device, [`Report::set_device`].
+//!   [`Report::record`] and, for each device it opened, [`Report::add_device`].
 //! - [`Report::write`] writes it to [`reports_dir`], the `nekoguruma/hw-reports` directory of the
 //!   user's data directory; [`Report::write_to`] takes the directory, for tests.
 //! - VINs and serial numbers are masked ([`Masker`]) unless the profile sets
@@ -243,9 +243,9 @@ pub struct Report {
     pub class: String,
     /// Whether VINs and serial numbers are in full (the profile asked for it).
     pub identifiers_in_full: bool,
-    /// Absent when no check opened a device.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub device: Option<DeviceInfo>,
+    /// One entry per opened device (a T0 loopback may open two); empty when no check opened one.
+    #[serde(rename = "device", skip_serializing_if = "Vec::is_empty")]
+    pub devices: Vec<DeviceInfo>,
     #[serde(rename = "check")]
     pub checks: Vec<CheckResult>,
     #[serde(skip)]
@@ -269,7 +269,7 @@ impl Report {
             os_version: os_version.map(|v| masker.text(v)),
             class: format!("{:?}", profile.class),
             identifiers_in_full: profile.report_full_identifiers,
-            device: None,
+            devices: Vec::new(),
             checks: Vec::new(),
             masker,
         }
@@ -289,7 +289,7 @@ impl Report {
             os_version: os_version().map(|v| masker.text(&v)),
             class: "unknown".to_owned(),
             identifiers_in_full: false,
-            device: None,
+            devices: Vec::new(),
             checks: Vec::new(),
             masker,
         }
@@ -314,11 +314,11 @@ impl Report {
         self.record(name, Outcome::Refused, &refusal.to_string());
     }
 
-    /// Sets what the opened device reported: the ABI of the worker, the library the profile
+    /// Adds what an opened device reported: the ABI of the worker, the library the profile
     /// names as the vendor's, the module and the versions. D-PDU API versions are coded numbers
     /// and are written as `major.minor.revision`; J2534 reports them as strings (`hw_name` is the
     /// firmware, `fw_name` the library).
-    pub fn set_device(
+    pub fn add_device(
         &mut self,
         vci: &Vci,
         abi: Abi,
@@ -332,7 +332,7 @@ impl Report {
             ),
             Api::J2534V0404 => (version.hw_name.clone(), version.fw_name.clone()),
         };
-        self.device = Some(DeviceInfo {
+        self.devices.push(DeviceInfo {
             abi: abi.name().to_owned(),
             vendor: self.masker.text(match vci.api {
                 Api::Iso22900 if !version.vendor_name.trim().is_empty() => &version.vendor_name,
@@ -534,7 +534,7 @@ impl RunGuard {
         }
     }
 
-    /// The report, for `set_device` and other entries.
+    /// The report, for `add_device` and other entries.
     pub fn report(&mut self) -> &mut Report {
         &mut self.report
     }

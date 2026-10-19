@@ -83,7 +83,7 @@ fn the_profile_can_ask_for_full_identifiers() {
         Outcome::Failed,
         &format!("VIN {VIN} on SN-1234567890"),
     );
-    report.set_device(
+    report.add_device(
         vci(&profile),
         Abi::LinuxX86_64,
         &module("Serial='SN-1234567890'"),
@@ -132,7 +132,7 @@ fn a_serial_number_is_masked_in_the_module_name() {
 fn the_report_has_every_field_and_no_identifier() {
     let profile = profile("iso22900", "");
     let mut report = Report::new(&profile);
-    report.set_device(
+    report.add_device(
         vci(&profile),
         Abi::LinuxArm64,
         &module("SerialNumber='1234567890'"),
@@ -153,7 +153,7 @@ fn the_report_has_every_field_and_no_identifier() {
     assert!(!table["host"].as_str().unwrap().is_empty());
     assert!(table["os"].as_str().unwrap().contains(std::env::consts::OS));
     assert_eq!(table["class"].as_str(), Some("T3"));
-    let device = table["device"].as_table().unwrap();
+    let device = table["device"].as_array().unwrap()[0].as_table().unwrap();
     assert_eq!(device["abi"].as_str(), Some("linux-arm64"));
     assert_eq!(device["vendor"].as_str(), Some("Vendor VCI"));
     assert_eq!(device["model"].as_str(), Some("SerialNumber='****7890'"));
@@ -175,9 +175,9 @@ fn the_report_has_every_field_and_no_identifier() {
 fn j2534_versions_are_the_reported_strings_and_no_device_leaves_them_out() {
     let profile = profile("j2534-0404", "");
     let mut report = Report::new(&profile);
-    assert!(!report.to_toml().unwrap().contains("[device]"));
-    report.set_device(vci(&profile), Abi::WinX86, &module("bench"), &version());
-    let device = report.device.unwrap();
+    assert!(!report.to_toml().unwrap().contains("[[device]]"));
+    report.add_device(vci(&profile), Abi::WinX86, &module("bench"), &version());
+    let device = report.devices[0].clone();
     assert_eq!(device.firmware_version, "fw 1.2.3");
     assert_eq!(device.library_version, "dll 4.5.6");
     assert_eq!(device.model, "bench");
@@ -386,7 +386,7 @@ fn no_text_field_of_a_report_carries_a_vin() {
         fw_name: format!("dll {VIN}"),
         ..version()
     };
-    report.set_device(vci(&profile), Abi::WinX86, &module(VIN), &version);
+    report.add_device(vci(&profile), Abi::WinX86, &module(VIN), &version);
     report.record("hw_x", Outcome::Failed, &format!("read {VIN}"));
     let toml = report.to_toml().unwrap();
     assert!(!toml.contains(VIN), "{toml}");
@@ -401,8 +401,8 @@ fn a_d_pdu_device_reports_the_vendor_and_model_it_names() {
         hw_name: "Acme Box 7".into(),
         ..version()
     };
-    report.set_device(vci(&profile), Abi::WinX86, &module("Acme"), &version);
-    let device = report.device.unwrap();
+    report.add_device(vci(&profile), Abi::WinX86, &module("Acme"), &version);
+    let device = report.devices[0].clone();
     assert_eq!(device.vendor, "Acme Diagnostics");
     assert_eq!(device.model, "Acme Box 7");
 }
@@ -477,4 +477,27 @@ fn a_serial_attribute_with_spaces_around_its_equals_sign_is_masked() {
     let masked = masker.module_name(Api::Iso22900, "Name='bench' SerialNumber = '1234567890'");
     assert!(!masked.contains("1234567890"), "{masked}");
     assert!(masked.contains("bench"), "{masked}");
+}
+
+#[test]
+fn a_loopback_with_two_devices_reports_both() {
+    let profile = profile("iso22900", "");
+    let mut report = Report::new(&profile);
+    let first = ReportedVersion {
+        vendor_name: "Acme".into(),
+        hw_name: "Box A".into(),
+        ..version()
+    };
+    let second = ReportedVersion {
+        vendor_name: "Other".into(),
+        hw_name: "Box B".into(),
+        ..version()
+    };
+    report.add_device(vci(&profile), Abi::WinX86, &module("a"), &first);
+    report.add_device(vci(&profile), Abi::WinX86, &module("b"), &second);
+    let table: toml::Table = report.to_toml().unwrap().parse().unwrap();
+    let devices = table["device"].as_array().unwrap();
+    assert_eq!(devices.len(), 2);
+    assert_eq!(devices[0]["model"].as_str(), Some("Box A"));
+    assert_eq!(devices[1]["model"].as_str(), Some("Box B"));
 }

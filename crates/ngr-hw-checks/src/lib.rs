@@ -115,7 +115,13 @@ pub fn begin(check: &CheckDecl) -> (Profile, report::RunGuard) {
         Ok(profile) => profile,
         Err(error) => {
             let mut run = report::RunGuard::start_without_profile(check.name);
-            run.finish(report::Outcome::Failed, &error.to_string());
+            // The error names the profile's path and can quote its text, which may hold serial
+            // numbers no profile tells the masker about; the report keeps a fixed message and
+            // the details go to the test's output.
+            run.finish(
+                report::Outcome::Failed,
+                "the hardware profile could not be read or is invalid; see the test output",
+            );
             panic!("{error}");
         }
     };

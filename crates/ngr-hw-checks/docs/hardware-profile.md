@@ -281,8 +281,10 @@ connection is served by the runtime.
   return to the default session and the link's closing cancel it first. A return interrupted
   that way stays pending. A suspended transmit queue (`PDU_IOCTL_SUSPEND_TX_QUEUE`) is resumed
   by a teardown step, and before any return to the default session, since a suspended queue
-  would hold the `10 01` back. A session is marked pending only once the worker accepted the
-  session change (or its answer was lost), not when it refused it. The closing step of a link
+  would hold the `10 01` back. A session change marks the return pending before it is sent, and the mark stays when
+  the call succeeds, times out or is dropped; only an error from the worker (the link is not
+  connected, say) takes it back. Resuming a transmit queue forgets only the suspensions that
+  resume covers (the same link; a module's resume covers its links). The closing step of a link
   has the time for its three requests. A response ceiling also adds the completion timeout of a
   `0x21` / `0x23` re-request chain when its handling is on (the handle sets none, and the guard
   refuses a check that does, so the worker's preset, off, stands).

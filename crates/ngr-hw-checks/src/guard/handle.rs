@@ -733,6 +733,38 @@ async fn return_to_default_session(
     result
 }
 
+/// Marks the return to the default session of a link pending while a session change is on its
+/// way to the worker, and keeps the mark unless the worker refused the change, also when the
+/// future that sent it is dropped (the worker may already hold the request). A link that was
+/// already pending stays so whatever happens.
+struct ProvisionalSession<'a> {
+    shared: &'a Shared,
+    cll: ComLogicalLinkHandle,
+    /// The mark was not there before, so a refusal may take it away.
+    added: bool,
+    refused: bool,
+}
+
+impl<'a> ProvisionalSession<'a> {
+    fn new(shared: &'a Shared, cll: ComLogicalLinkHandle) -> Self {
+        let added = shared.lock().session_back.insert(cll.cll_handle);
+        Self {
+            shared,
+            cll,
+            added,
+            refused: false,
+        }
+    }
+}
+
+impl Drop for ProvisionalSession<'_> {
+    fn drop(&mut self) {
+        if self.added && self.refused {
+            self.shared.lock().session_back.remove(&self.cll.cll_handle);
+        }
+    }
+}
+
 /// Puts a link's pending return to the default session back unless the return succeeded.
 struct PendingSession<'a> {
     shared: &'a Shared,
@@ -968,6 +1000,20 @@ impl LinkTimings {
 }
 
 /// The timing ComParam a `SetComParam` item sets, by name or learned id, and its value.
+/// Whether a resume sent on `resumed` resumes a queue suspended on `saved`: the same link or
+/// module, a module's resume also covering its links, and the system's covering all.
+fn resume_covers(
+    resumed: &Option<io_ctl_request::Handle>,
+    saved: &Option<io_ctl_request::Handle>,
+) -> bool {
+    use io_ctl_request::Handle::{CllHandle, ModuleHandle, SystemHandle};
+    match (resumed, saved) {
+        (Some(SystemHandle(_)), _) => true,
+        (Some(ModuleHandle(m)), Some(CllHandle(c))) => c.module_handle == m.module_handle,
+        (resumed, saved) => resumed == saved,
+    }
+}
+
 /// The name of the IO control a request carries, by name or learned id.
 fn ioctl_name(request: &IoCtlRequest, learned: &Learned) -> Option<String> {
     match request.io_ctrl_command.as_ref()? {
@@ -1446,6 +1492,7 @@ impl<'r> GuardedHandle<'r> {
             name.as_deref()
                 .is_some_and(|n| n.eq_ignore_ascii_case(wanted))
         };
+        let resumed_scope = request.handle;
         let suspends = is("PDU_IOCTL_SUSPEND_TX_QUEUE");
         let resumes = is("PDU_IOCTL_RESUME_TX_QUEUE");
         if suspends {
@@ -1496,7 +1543,12 @@ impl<'r> GuardedHandle<'r> {
             self.shared.lock().suspended.pop();
         }
         if resumes && sent.is_ok() {
-            self.shared.lock().suspended.clear();
+            // Only what the resume covers is resumed.
+            let resumed = resumed_scope;
+            self.shared
+                .lock()
+                .suspended
+                .retain(|saved| !resume_covers(&resumed, &saved.handle));
         }
         sent
     }
@@ -1668,6 +1720,10 @@ impl<'r> GuardedHandle<'r> {
             );
         }
         let updates = request.cop_type == ComOperationType::CoptUpdateparam as i32;
+        // The ECU may be in the session as soon as the request is on its way: the return is
+        // pending from before the call, whether it succeeds, times out or is dropped. Only a
+        // refusal by the worker (the link is not connected, say) takes the marker back.
+        let mut provisional = entering.map(|cll| ProvisionalSession::new(&self.shared, cll));
         let sent = self
             .shared
             .send(
@@ -1675,13 +1731,12 @@ impl<'r> GuardedHandle<'r> {
                 self.client.clone().start_com_primitive(request),
             )
             .await;
-        // The ECU is in the session once the worker accepted the start, or may be when the
-        // answer was lost; not when the worker refused it (the link is not connected, say).
-        if let Some(cll) = entering
-            && matches!(sent, Ok(_) | Err(HandleError::Timeout { .. }))
+        if let (Some(provisional), Err(HandleError::Rpc { .. } | HandleError::VciLost)) =
+            (provisional.as_mut(), &sent)
         {
-            self.shared.lock().session_back.insert(cll.cll_handle);
+            provisional.refused = true;
         }
+        drop(provisional);
         let response = sent?;
         // The staged timings are in effect once the update has finished successfully; until
         // then (and when it fails, which is returned) the longer of the two is waited for.
@@ -1748,6 +1803,7 @@ impl<'r> GuardedHandle<'r> {
 
 #[cfg(test)]
 mod tests {
+    use vci_service_interface::ModuleHandle as ModuleHandle_;
     use vci_service_interface::ResultData;
 
     use super::*;
@@ -2115,6 +2171,76 @@ mod tests {
             timing_change(&item("CP_RC23Handling"), &Learned::default()),
             Some(("cp_rc23handling", 1))
         );
+    }
+
+    fn shared() -> Shared {
+        let profile = &shapes()[2];
+        let Setup::Link { vci, .. } = &profile.setup else {
+            unreachable!()
+        };
+        Shared {
+            profile: profile.clone(),
+            vci: vci.clone(),
+            module: 1,
+            options: HandleOptions::default(),
+            state: Mutex::new(State::default()),
+        }
+    }
+
+    #[test]
+    fn a_session_change_in_flight_stays_pending_unless_the_worker_refused_it() {
+        let cll = ComLogicalLinkHandle {
+            module_handle: 1,
+            cll_handle: 10,
+        };
+        let pending = |shared: &Shared| shared.lock().session_back.contains(&10);
+        // Dropped mid-call (or answered, or timed out): the worker may hold the request.
+        let shared = shared();
+        drop(ProvisionalSession::new(&shared, cll));
+        assert!(pending(&shared));
+        // Refused by the worker: nothing happened.
+        let shared = self::shared();
+        let mut mark = ProvisionalSession::new(&shared, cll);
+        assert!(pending(&shared));
+        mark.refused = true;
+        drop(mark);
+        assert!(!pending(&shared));
+        // A return that was already pending stays so after a refusal of a later change.
+        let shared = self::shared();
+        shared.lock().session_back.insert(10);
+        let mut mark = ProvisionalSession::new(&shared, cll);
+        mark.refused = true;
+        drop(mark);
+        assert!(pending(&shared));
+    }
+
+    #[test]
+    fn a_resume_covers_only_what_it_resumes() {
+        use io_ctl_request::Handle::{CllHandle, ModuleHandle, SystemHandle};
+        let link = |module, cll| {
+            Some(CllHandle(ComLogicalLinkHandle {
+                module_handle: module,
+                cll_handle: cll,
+            }))
+        };
+        let module = |module| {
+            Some(ModuleHandle(ModuleHandle_ {
+                module_handle: module,
+            }))
+        };
+        assert!(resume_covers(&link(1, 10), &link(1, 10)));
+        assert!(!resume_covers(&link(1, 10), &link(1, 11)));
+        assert!(resume_covers(&module(1), &link(1, 11)));
+        assert!(!resume_covers(&module(2), &link(1, 11)));
+        assert!(!resume_covers(&link(1, 10), &module(1)));
+        assert!(resume_covers(
+            &Some(SystemHandle(Default::default())),
+            &link(1, 10)
+        ));
+        // Two saved resumes, one link resumed: the other stays saved.
+        let mut saved: Vec<Option<io_ctl_request::Handle>> = vec![link(1, 10), link(1, 11)];
+        saved.retain(|s| !resume_covers(&link(1, 10), s));
+        assert_eq!(saved, [link(1, 11)]);
     }
 
     #[test]

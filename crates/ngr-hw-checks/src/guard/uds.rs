@@ -144,8 +144,9 @@ fn tx_flag_bytes(ctrl: &ComPrimitiveCtrlData) -> Result<[u8; 4], GuardRefusal> {
     Ok(bytes)
 }
 
-/// The two TxFlag bits that describe the frame (the CAN identifier width and extended
-/// addressing) must agree with the profile's link.
+/// The three TxFlag bits that describe the frame (the CAN identifier width, extended
+/// addressing and frame padding) must equal the profile's link, set or not: on a RawMode link
+/// the worker takes the frame's format from the flags alone.
 fn flags_agree(flags: [u8; 4], link: &Link) -> Result<(), GuardRefusal> {
     let wide = flags[2] & 0x01 != 0;
     if wide != (link.id_bits == 29) {
@@ -157,6 +158,12 @@ fn flags_agree(flags: [u8; 4], link: &Link) -> Result<(), GuardRefusal> {
     if addressed != (link.addressing != Addressing::Normal) {
         return Err(GuardRefusal::Frame(
             "the ISO15765_ADDR_TYPE flag does not match the profile's addressing",
+        ));
+    }
+    let padded = flags[3] & 0x40 != 0;
+    if padded != link.padding.is_some() {
+        return Err(GuardRefusal::Frame(
+            "the ISO15765_FRAME_PAD flag does not match the profile's padding",
         ));
     }
     Ok(())
@@ -207,6 +214,15 @@ pub(super) fn start_com_primitive(
     match ComOperationType::try_from(request.cop_type) {
         // The start and stop communication messages, if the primitive carries one, are
         // requests like any other.
+        // T0 has no communication session: the J2534 preset would arm a cyclic tester-present
+        // frame at the start, an ECU-addressed message.
+        Ok(ComOperationType::CoptStartcomm | ComOperationType::CoptStopcomm)
+            if ctx.profile.class == Class::T0 =>
+        {
+            Err(GuardRefusal::Frame(
+                "T0 has no communication to start or stop; it exchanges raw frames only",
+            ))
+        }
         Ok(ComOperationType::CoptStartcomm | ComOperationType::CoptStopcomm) => {
             sends(&request.cop_data)
         }
@@ -244,6 +260,10 @@ fn payload(
     flags: [u8; 4],
     data: &[u8],
 ) -> Result<Grant, GuardRefusal> {
+    // A RawMode frame is sent as its flags say: they must be the profile's, in both directions.
+    if bound.raw_mode {
+        flags_agree(flags, link)?;
+    }
     match class {
         Class::T0 => {
             if !bound.raw_mode {
@@ -257,7 +277,6 @@ fn payload(
                     "T0 frames go only to the sending endpoint's request identifier",
                 ));
             }
-            flags_agree(flags, link)?;
             Ok(Grant::Pass)
         }
         // The ECU is simulated; its requests are not read.

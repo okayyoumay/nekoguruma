@@ -39,7 +39,9 @@ present.
    `ISO_11898_2_DWCAN` the agent uses, and exactly two pins: the profile's first pin as `HI` and
    its second as `LOW` (ISO 22900-2 (2022) Annex B). A resource by name is refused. The create
    flag may carry RawMode (D.2.3) and nothing else, and RawMode only on T0 and T1: on T2 and T3
-   a RawMode link is refused (item 3). There is one link per profile endpoint: one,
+   a RawMode link is refused (item 3). On T0 a link is created in RawMode and in no other
+   way: T0 exchanges raw frames only, and a protocol link would let the J2534 preset arm a cyclic
+   tester-present frame. There is one link per profile endpoint: one,
    or two for T0, and a link is created for the endpoint whose own identity the resource names:
    the protocol name of its `channel` (SAE J2534-2 clause 7 additional channel, a `_CH<n>` name
    read as the worker reads it) when the endpoint has one, else its protocol. A SocketCAN end has
@@ -109,9 +111,12 @@ present.
    like a flow control frame can be a routine request on the wire (`31 01 FF 00` after the
    identifier). A raw-bound handle that appears in the context on T2 or T3 anyway is refused,
    never decoded, so no frame decoder exists. On T0 a raw frame passes only to the sending
-   endpoint's request identifier, with the profile's flags (`TX_FLAG_CAN_29BIT_ID`,
-   `ISO15765_ADDR_TYPE`) and a raw TxFlag of four bytes with named bits only; its content is not
-   read. T1 passes raw frames undecoded. On every class and link mode, TxFlags that would
+   endpoint's request identifier and its content is not read; T0 has no communication to start,
+   so `COPT_STARTCOMM` and `COPT_STOPCOMM` are refused there. On a RawMode link (T0, T1) the worker
+   takes the frame's format from the flags alone, so the three wire-format flags
+   (`TX_FLAG_CAN_29BIT_ID`, `ISO15765_ADDR_TYPE`, `ISO15765_FRAME_PAD`) must each equal the
+   profile's, set or not, as named bits or as a raw TxFlag of four bytes with named bits only. T1
+   passes raw frames otherwise undecoded. On every class and link mode, TxFlags that would
    override the profile are refused: frame padding when the profile has none (the J2534 worker
    turns padding on from the flag, apart from the ComParam), the 29-bit flag on 11-bit
    identifiers, and the extended addressing flag on normal addressing. The agent's list is kept apart on

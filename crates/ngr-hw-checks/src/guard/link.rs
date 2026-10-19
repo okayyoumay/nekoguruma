@@ -51,6 +51,13 @@ pub(super) fn create(
         None => return Err(GuardRefusal::Undecodable("a link without a resource")),
     };
     let raw_mode = create_flag(request)?;
+    // T0 exchanges raw frames between its endpoints only: a link that is not RawMode would
+    // speak the protocol (and the J2534 preset arms a cyclic tester-present).
+    if !raw_mode && ctx.profile.class == Class::T0 {
+        return Err(refuse(
+            "a T0 link is created in RawMode: T0 exchanges raw frames between its endpoints only",
+        ));
+    }
     // A worker passes RawMode data through to the device, and a native ISO 15765 channel
     // segments it itself, so the guard cannot tell what a raw payload sends (ADR-333 item 3).
     if raw_mode && matches!(ctx.profile.class, Class::T2 | Class::T3) {

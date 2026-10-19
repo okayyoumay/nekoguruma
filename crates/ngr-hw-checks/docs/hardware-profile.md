@@ -218,8 +218,10 @@ Anything it cannot classify is refused.
   resolved, the request's class field ignored): a ComParam no rule covers passes only when it is
   a listed protocol or timing ComParam (P2, P2*, ISO 15765-2 timing and flow control, response
   pending, tester-present timing) or the profile sets it, and every other name is refused. `COPT_RESTORE_PARAM` is refused.
-- **Requests.** T1 passes every request. T0 passes only raw frames to the sending end's own
-  `request_id`. T2 (until an authorized job exists) and T3 pass the read-only list: session
+- **Requests.** T1 passes every request. T0 creates RawMode links only, passes only raw frames to the sending end's own
+  `request_id` and refuses `COPT_STARTCOMM`/`COPT_STOPCOMM` (no communication to start). On a
+  RawMode link the 29-bit, addressing and padding flags must each equal the profile's, set or
+  not. T2 (until an authorized job exists) and T3 pass the read-only list: session
   control to the default or extended session, ReadDataByIdentifier, ReadDTCInformation with a
   defined report type, and TesterPresent with sub-function 0, each with its length rule. The
   rule applies to direct requests, periodic ones and a `CP_TesterPresentMessage`. A raw-bound

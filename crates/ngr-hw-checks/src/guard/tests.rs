@@ -79,23 +79,26 @@ fn profile(class: &str) -> Profile {
     profile_with(class, &L::default())
 }
 
+/// One end of a T0 loopback on a channel of the profile's VCI.
+fn t0_end(channel: &str, request: u32, response: u32, padding: Option<u8>) -> String {
+    format!(
+        "[[endpoint]]\nchannel = \"{channel}\"\n[endpoint.vci]\n{VCI}\n[endpoint.link]\n{}",
+        link_toml(&L {
+            request,
+            response,
+            functional: None,
+            padding,
+            ..L::default()
+        })
+    )
+}
+
 /// A T0 loopback of two channels of one VCI, each end's request identifier the other's response.
 fn loopback() -> Profile {
-    let end = |channel: &str, request: u32, response: u32| {
-        format!(
-            "[[endpoint]]\nchannel = \"{channel}\"\n[endpoint.vci]\n{VCI}\n[endpoint.link]\n{}",
-            link_toml(&L {
-                request,
-                response,
-                functional: None,
-                ..L::default()
-            })
-        )
-    };
     parse(&format!(
         "class = \"T0\"\n{}{}",
-        end("CAN_CH1", 0x123, 0x124),
-        end("CAN_CH2", 0x124, 0x123)
+        t0_end("CAN_CH1", 0x123, 0x124, None),
+        t0_end("CAN_CH2", 0x124, 0x123, None)
     ))
     .unwrap()
 }
@@ -204,10 +207,17 @@ fn create_request(resource: create::Resource) -> CreateComLogicalLinkRequest {
     }
 }
 
+/// Creates the link for `resource`: in RawMode on T0, which creates no other kind.
 fn create_with(env: &Env, resource: &ResourceData) -> Result<Grant, GuardRefusal> {
-    env.decide(Request::CreateComLogicalLink(&create_request(
-        create::Resource::RscData(resource.clone()),
-    )))
+    let mut request = create_request(create::Resource::RscData(resource.clone()));
+    if env.profile.class == Class::T0 {
+        request.cll_create_flag = Some(create::CllCreateFlag::CllCreateFlagBits(
+            vci_service_interface::CllCreateFlag {
+                bits: vec![CllCreateFlagBit::CllCreateFlagRawMode as i32],
+            },
+        ));
+    }
+    env.decide(Request::CreateComLogicalLink(&request))
 }
 
 fn param_by_name(name: &str, data: param_item::ParamData) -> ParamItem {
@@ -466,10 +476,11 @@ fn create_channel(env: &Env, channel: &str) -> Result<Grant, GuardRefusal> {
     create_with(env, &channel_resource(channel))
 }
 
+/// The grant of a T0 link, which is always RawMode.
 fn creates(endpoint: usize) -> Result<Grant, GuardRefusal> {
     Ok(Grant::CreatesLink {
         endpoint,
-        raw_mode: false,
+        raw_mode: true,
     })
 }
 
@@ -1244,6 +1255,112 @@ fn both_channels_of_one_vci_stay_available_to_its_worker() {
     let env = Env::new(loopback());
     assert_eq!(create_channel(&env, "CAN_CH1"), creates(0));
     assert_eq!(create_channel(&env, "CAN_CH2"), creates(1));
+}
+
+#[test]
+fn t0_has_raw_links_only_and_nothing_to_start() {
+    let env = Env::new(loopback());
+    // A link that is not RawMode would speak the protocol.
+    let request = create_request(create::Resource::RscData(channel_resource("CAN_CH1")));
+    assert!(matches!(
+        env.decide(Request::CreateComLogicalLink(&request)),
+        Err(GuardRefusal::LinkSetup(_))
+    ));
+    assert_eq!(create_channel(&env, "CAN_CH1"), creates(0));
+    // No communication to start or stop, whatever the data, on a raw link too.
+    let raw = Env::linked(loopback(), true);
+    for cop in [
+        ComOperationType::CoptStartcomm,
+        ComOperationType::CoptStopcomm,
+    ] {
+        for data in [&[][..], &[0x10, 0x03]] {
+            assert!(
+                matches!(
+                    raw.decide(Request::StartComPrimitive(&start(cop, data, 0))),
+                    Err(GuardRefusal::Frame(_))
+                ),
+                "{cop:?} {data:02x?}"
+            );
+        }
+    }
+    // A raw frame to its own request identifier still passes.
+    assert!(raw_send(&raw, &frame(0x123, &[0x01, 0x00])).is_ok());
+    // T1 still starts communication.
+    let t1 = Env::linked(profile("T1"), false);
+    assert!(
+        t1.decide(Request::StartComPrimitive(&start(
+            ComOperationType::CoptStartcomm,
+            &[],
+            0
+        )))
+        .is_ok()
+    );
+}
+
+#[test]
+fn raw_frame_flags_must_equal_the_profile_in_both_directions() {
+    let l = L {
+        id_bits: 29,
+        request: 0x18DA_10F1,
+        response: 0x18DA_F110,
+        functional: None,
+        addressing: "extended",
+        address: Some(0x42),
+        padding: Some(0x55),
+        ..L::default()
+    };
+    let env = Env::linked(profile_with("T1", &l), true);
+    let data = frame(0x18DA_10F1, &[0x42, 0x03, 0x22, 0xF1, 0x90]);
+    let all = [
+        TxFlagBit::TxFlagCan29bitId,
+        TxFlagBit::TxFlagIso15765AddrType,
+        TxFlagBit::TxFlagIso15765FramePad,
+    ];
+    let send_with = |bits: &[TxFlagBit]| {
+        env.decide(Request::StartComPrimitive(&start_flags(
+            &data,
+            flag_bits(bits),
+        )))
+    };
+    assert!(send_with(&all).is_ok());
+    // The same as raw bytes: byte 2 bit 0, byte 3 bits 7 and 6.
+    let raw = com_primitive_ctrl_data::TxFlag::TxFlagRaw(vec![0, 0, 0x01, 0xC0]);
+    assert!(
+        env.decide(Request::StartComPrimitive(&start_flags(&data, raw)))
+            .is_ok()
+    );
+    // Omitting any one of the three is refused (the frame would go out in another format).
+    for omitted in 0..3 {
+        let bits: Vec<TxFlagBit> = all
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != omitted)
+            .map(|(_, b)| *b)
+            .collect();
+        assert!(
+            matches!(send_with(&bits), Err(GuardRefusal::Frame(_))),
+            "omitted {omitted}"
+        );
+    }
+    assert!(send_with(&[]).is_err());
+
+    // T0 with a padded profile refuses an omitted padding bit and takes it when present.
+    let padded = parse(&format!(
+        "class = \"T0\"\n{}{}",
+        t0_end("CAN_CH1", 0x123, 0x124, Some(0xAA)),
+        t0_end("CAN_CH2", 0x124, 0x123, Some(0xAA))
+    ))
+    .unwrap();
+    let t0 = Env::linked(padded, true);
+    let frame = frame(0x123, &[0x01]);
+    let t0_send = |bits: &[TxFlagBit]| {
+        t0.decide(Request::StartComPrimitive(&start_flags(
+            &frame,
+            flag_bits(bits),
+        )))
+    };
+    assert!(t0_send(&[TxFlagBit::TxFlagIso15765FramePad]).is_ok());
+    assert!(t0_send(&[]).is_err());
 }
 
 #[test]

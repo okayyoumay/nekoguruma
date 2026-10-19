@@ -44,17 +44,15 @@ from `AGENTS.md` rather than from the files Copilot reads.
    rounds and the number of findings fixed, accepted and declined. After about ten pull requests
    reviewed by Codex the maintainer compares them with the Copilot pull requests before the
    switch and decides whether to keep Codex, return to Copilot or split the work between them.
-   **Amended 2026-10-19: the comparison is done and Codex stays the reviewer.** It covered the
-   38 pull requests Codex alone reviewed after the switch against the 30 Copilot ones before it.
-   On code pull requests the two were close: median 2 rounds each (mean 3.5 for Codex, 3.0 for
-   Copilot), about four findings per pull request, and a clean last review on 32 of 34 against 25
-   of 26. Codex rated no finding P3, while about a tenth of Copilot's were Low, and it had a few
-   more findings declined or accepted (6 of 223, against almost none). Its cost shows on long
-   design ADRs, where it kept finding new high-rated cases for 45 to 47 rounds on two pull
-   requests. Its usage limit stopped it on four pull requests in three days, and the per-pull
-   request fallback to Copilot handled each. Codex stays the reviewer and Copilot the fallback,
-   with no change to items 1 to 3; the review summary in item 4 is still recorded, so a later
-   comparison can reuse it.
+   **Amended 2026-10-19: the comparison is done and Codex stays the reviewer.** On code pull
+   requests the two reviewers needed about the same number of rounds, found about as much, and
+   almost always ended on a clean review. Codex rated nothing P3, so each of its findings was
+   worth fixing, while some of Copilot's were Low; it had a few more findings declined, mostly
+   about scope or cases that already fail closed. Its cost shows on long design ADRs, where it
+   keeps finding new high-rated cases round after round. Its usage limit stopped it on some pull
+   requests, and the per-pull request fallback to Copilot handled each. Codex stays the reviewer
+   and Copilot the fallback, with no change to items 1 to 3; the review summary in item 4 is
+   still recorded, so a later comparison can reuse it.
 
 ## Consequences
 

@@ -125,8 +125,8 @@ fn identifies(vendor: &str, module: &str) -> bool {
 ///   connection, which can change while the module stays the same.
 /// - J2534: the configured `modules` entry with the profile's `label` must be the only entry, so
 ///   a configured module that is not attached cannot be taken for the attached one (ADR-275 item
-///   4), and its `pname` must be the profile's; exactly one reported module carries that label,
-///   from the profile's library. Names are compared without their surrounding spaces.
+///   4), and its `pname` must be the profile's; the worker reports exactly one module, which
+///   carries that label and comes from the profile's library. Names are compared without their surrounding spaces.
 pub fn select_module(
     vci: &Vci,
     reported: &[ReportedModule],
@@ -167,6 +167,15 @@ pub fn select_module(
                     label,
                     configured: entry.pname.clone(),
                     profile: pname,
+                });
+            }
+            // The harness reads the `modules` entries from its own view of the configuration,
+            // which can differ from the worker's, so the worker must also report exactly one
+            // module, as the agent requires of a worker (ADR-235 item 4).
+            if reported.len() > 1 {
+                return Err(MatchRefusal::SeveralModules {
+                    module: label,
+                    count: reported.len(),
                 });
             }
             let matches: Vec<usize> = reported

@@ -483,6 +483,18 @@ fn check_vci(vci: &Vci) -> Result<(), ProfileError> {
                 "a J2534 `vci` names the `label` and `pname` of its configured `modules` entry",
             ))
         }
+        // The label a worker gives its default entry when it reads no `modules`: a worker that
+        // reads another file than the harness would report it and be taken for the profile's.
+        Api::J2534V0404
+            if vci
+                .label
+                .as_deref()
+                .is_some_and(|s| s.trim() == "j2534-0404") =>
+        {
+            Err(invalid(
+                "a J2534 `vci`'s `label` is not `j2534-0404`, which a worker without `modules`                  gives its default entry",
+            ))
+        }
         Api::Iso22900 if vci.label.is_some() || vci.pname.is_some() => Err(invalid(
             "`label` and `pname` name a J2534 `modules` entry; a D-PDU API `vci` has none",
         )),

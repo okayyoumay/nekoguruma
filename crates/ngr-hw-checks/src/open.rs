@@ -6,19 +6,23 @@
 //!
 //! 1. Start the worker for the profile's library as the agent starts it
 //!    (`agent::launch::launch_worker`).
-//! 2. `GetModuleIds`, and for J2534 the `modules` entries of the worker's configuration, then
-//!    [`select_module`]: a wrong, absent or ambiguous module is refused here, before anything is
-//!    opened.
+//! 2. `GetModuleIds`, and for J2534 the `modules` entries of the harness's own view of the
+//!    worker's configuration, then [`select_module`]: a wrong, absent or ambiguous module, or a
+//!    J2534 worker that reports more than one, is refused here, before anything is opened.
 //! 3. `ModuleConnect` on the selected module, `GetVersion`, then [`check_versions`].
 //!
-//! A refusal at any step disconnects the module if it was connected and stops the worker, so a
-//! refused device is left as found. A check creates its links only on the returned
+//! Every worker request is bounded by the launch options' `request_timeout`; a request that
+//! times out is an error. A refusal or an error at any step disconnects the module, when the
+//! step is `ModuleConnect` or later (a failed `ModuleConnect` can leave the device opened), and
+//! stops the worker, which is killed if it does not exit. A hung or failed disconnect does not
+//! keep the worker from being stopped. A check creates its links only on the returned
 //! [`OpenedDevice`].
 //!
 //! The J2534 worker lists every configured `modules` entry until it can be started with a label
-//! (ADR-281 Decision item 3), so [`select_module`]'s rule that the profile's entry is the only
-//! configured one applies in full.
+//! and `pname` (ADR-281 Decision item 3), so [`select_module`]'s rule that the profile's entry is
+//! the only configured one applies in full, and the worker must report one module.
 
+use std::future::Future;
 use std::time::Duration;
 
 use agent::launch::{Api, LaunchError, launch_worker};
@@ -48,13 +52,23 @@ pub enum OpenError {
     /// A worker request failed; `call` names it.
     #[error("{call} failed: {message}")]
     Rpc { call: &'static str, message: String },
+    /// A worker request got no answer within the request timeout.
+    #[error("{call} got no answer within {timeout:?}")]
+    Timeout {
+        call: &'static str,
+        timeout: Duration,
+    },
     #[error("cannot read the worker's `modules` configuration: {0}")]
     Config(String),
     #[error("the worker reports the selected module without a handle")]
     NoHandle,
-    /// The device is not the profile's. No link was created.
-    #[error("the attached device is not the profile's: {0}")]
-    Refused(#[from] MatchRefusal),
+    /// The device is not the profile's. No link was created. `stopped` is how the worker ended
+    /// afterwards, `None` when stopping it failed.
+    #[error("the attached device is not the profile's: {refusal}")]
+    Refused {
+        refusal: MatchRefusal,
+        stopped: Option<Stopped>,
+    },
     #[error("cannot stop the worker: {0}")]
     Stop(#[from] ServiceError),
 }
@@ -68,6 +82,7 @@ pub struct OpenedDevice {
     module_handle: ModuleHandle,
     module: ReportedModule,
     version: ReportedVersion,
+    timeout: Duration,
 }
 
 impl OpenedDevice {
@@ -93,7 +108,7 @@ impl OpenedDevice {
     /// Disconnects the module and stops the worker. Dropping the device kills the worker without
     /// disconnecting the module.
     pub async fn close(mut self) -> Result<Stopped, OpenError> {
-        disconnect(&mut self.client, self.module_handle).await;
+        disconnect(&mut self.client, self.module_handle, self.timeout).await;
         Ok(self.process.stop(STOP_GRACE).await?)
     }
 }
@@ -113,7 +128,8 @@ pub async fn open_device(
     };
     let worker = launch_worker(api, &vci.library, mode, workers, options).await?;
     let (abi, process, mut client) = (worker.abi, worker.process, worker.client);
-    match match_device(vci, abi, &mut client).await {
+    let timeout = options.request_timeout;
+    match match_device(vci, abi, &mut client, timeout).await {
         Ok((module_handle, module, version)) => Ok(OpenedDevice {
             abi,
             process,
@@ -121,10 +137,14 @@ pub async fn open_device(
             module_handle,
             module,
             version,
+            timeout,
         }),
-        Err(error) => {
-            // The refusal is the result; a worker that does not stop is killed on drop.
-            let _ = process.stop(STOP_GRACE).await;
+        Err(mut error) => {
+            // The error is the result; a worker that does not stop is killed on drop.
+            let ended = process.stop(STOP_GRACE).await.ok();
+            if let OpenError::Refused { stopped, .. } = &mut error {
+                *stopped = ended;
+            }
             Err(error)
         }
     }
@@ -136,15 +156,17 @@ async fn match_device(
     vci: &Vci,
     abi: Abi,
     client: &mut WorkerClient,
+    timeout: Duration,
 ) -> Result<(ModuleHandle, ReportedModule, ReportedVersion), OpenError> {
-    let reported = client
-        .get_module_ids(GetModuleIdsRequest {})
-        .await
-        .map_err(|status| rpc("GetModuleIds", status))?
-        .into_inner()
-        .module_id_list
-        .map(|list| list.module_data)
-        .unwrap_or_default();
+    let reported = bounded(
+        timeout,
+        "GetModuleIds",
+        client.get_module_ids(GetModuleIdsRequest {}),
+    )
+    .await?
+    .module_id_list
+    .map(|list| list.module_data)
+    .unwrap_or_default();
     let modules: Vec<ReportedModule> = reported
         .iter()
         .map(|data| ReportedModule {
@@ -156,59 +178,86 @@ async fn match_device(
         profile::Api::J2534V0404 => configured_modules(abi, &vci.library)?,
         profile::Api::Iso22900 => Vec::new(),
     };
-    let at = select_module(vci, &modules, &configured)?;
+    let at = select_module(vci, &modules, &configured).map_err(|refusal| OpenError::Refused {
+        refusal,
+        stopped: None,
+    })?;
     let module_handle = reported[at].module_handle.ok_or(OpenError::NoHandle)?;
 
-    client
-        .module_connect(ModuleConnectRequest {
+    let connected = bounded(
+        timeout,
+        "ModuleConnect",
+        client.module_connect(ModuleConnectRequest {
             module_handle: Some(module_handle),
-        })
-        .await
-        .map_err(|status| rpc("ModuleConnect", status))?;
+        }),
+    )
+    .await;
+    if let Err(error) = connected {
+        // The device can be open although the call failed or timed out; disconnecting a module
+        // that is not connected changes nothing.
+        disconnect(client, module_handle, timeout).await;
+        return Err(error);
+    }
     let version = async {
-        let data = client
-            .get_version(GetVersionRequest {
+        let data = bounded(
+            timeout,
+            "GetVersion",
+            client.get_version(GetVersionRequest {
                 module_handle: Some(module_handle),
-            })
-            .await
-            .map_err(|status| rpc("GetVersion", status))?
-            .into_inner()
-            .version_data
-            .unwrap_or_default();
+            }),
+        )
+        .await?
+        .version_data
+        .unwrap_or_default();
         let version = ReportedVersion {
             hw_name: data.hw_name,
             fw_name: data.fw_name,
             fw_version: data.fw_version,
             pdu_api_sw_version: data.pdu_api_sw_version,
         };
-        check_versions(vci, &version)?;
+        check_versions(vci, &version).map_err(|refusal| OpenError::Refused {
+            refusal,
+            stopped: None,
+        })?;
         Ok::<_, OpenError>(version)
     }
     .await;
     match version {
         Ok(version) => Ok((module_handle, modules[at].clone(), version)),
         Err(error) => {
-            disconnect(client, module_handle).await;
+            disconnect(client, module_handle, timeout).await;
             Err(error)
         }
     }
 }
 
-fn rpc(call: &'static str, status: impl std::fmt::Display) -> OpenError {
-    OpenError::Rpc {
-        call,
-        message: status.to_string(),
+/// Calls a unary worker request, failing when it errors or gets no answer within `timeout`.
+async fn bounded<T>(
+    timeout: Duration,
+    call: &'static str,
+    request: impl Future<Output = Result<tonic::Response<T>, tonic::Status>>,
+) -> Result<T, OpenError> {
+    match tokio::time::timeout(timeout, request).await {
+        Err(_) => Err(OpenError::Timeout { call, timeout }),
+        Ok(Err(status)) => Err(OpenError::Rpc {
+            call,
+            message: status.to_string(),
+        }),
+        Ok(Ok(response)) => Ok(response.into_inner()),
     }
 }
 
-/// Disconnects `module_handle`, ignoring a failure: it is the cleanup of a device that is being
-/// let go.
-async fn disconnect(client: &mut WorkerClient, module_handle: ModuleHandle) {
-    let _ = client
-        .module_disconnect(ModuleDisconnectRequest {
+/// Disconnects `module_handle` within `timeout`, ignoring a failure: it is the cleanup of a
+/// device that is being let go, and the worker is stopped next either way.
+async fn disconnect(client: &mut WorkerClient, module_handle: ModuleHandle, timeout: Duration) {
+    let _ = bounded(
+        timeout,
+        "ModuleDisconnect",
+        client.module_disconnect(ModuleDisconnectRequest {
             module_handle: Some(module_handle),
-        })
-        .await;
+        }),
+    )
+    .await;
 }
 
 /// The `modules` entries of the J2534 worker configuration for `library`, read from the file the

@@ -79,7 +79,11 @@ async fn open(vci: &Vci) -> Result<Stopped, OpenError> {
 
 fn refusal(result: Result<Stopped, OpenError>) -> MatchRefusal {
     match result {
-        Err(OpenError::Refused(refusal)) => refusal,
+        // The worker was stopped and exited by itself, not killed, so the cleanup ran.
+        Err(OpenError::Refused {
+            refusal,
+            stopped: Some(Stopped::Exited),
+        }) => refusal,
         other => panic!("the device should be refused, not {other:?}"),
     }
 }

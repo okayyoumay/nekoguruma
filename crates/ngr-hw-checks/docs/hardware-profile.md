@@ -54,7 +54,7 @@ does not take. A T3 profile can add nothing.
 | `api` | `"j2534-0404"` or `"iso22900"` |
 | `library` | The library name, resolved as in design 7.1 |
 | `module` | D-PDU API: the device name or serial number the library reports (see "The module match"). J2534: a description only, not compared with the device |
-| `label`, `pname` | J2534 only, and required there, not empty: the label and the device name of the configured `modules` entry (ADR-281) |
+| `label`, `pname` | J2534 only, and required there, not empty, and the label is not `j2534-0404` (the worker's default entry): the label and the device name of the configured `modules` entry (ADR-281) |
 | `firmware_version`, `library_version` | What the device reports, compared after opening (see "The module match"); a D-PDU API profile writes each as `major.minor.revision`, each part 0 to 255 with no leading zero |
 
 `[link]`, the values an IR `Protocol` declaration carries:
@@ -130,23 +130,30 @@ device (design 13.5, ADR-275 item 4). It takes the `Vci`, the workers directory
 1. Starts the worker for the profile's `library` through the agent's launch path
    (`agent::launch::launch_worker`), so the library is resolved, and the worker build chosen, as
    in production (design 7.1, 7.3).
-2. Asks the worker for its modules (`GetModuleIds`), reads the `modules` entries of the worker's
-   configuration for J2534 (`vci-service-config`, the file the worker reads), and runs
-   `select_module`. A refusal here comes before anything is opened.
+2. Asks the worker for its modules (`GetModuleIds`), reads the `modules` entries of the
+   configuration for J2534 (`vci-service-config`, in the harness's process), and runs
+   `select_module`. A refusal here comes before anything is opened. For J2534 the worker must
+   report exactly one module.
 3. Opens the selected module (`ModuleConnect`), reads `GetVersion` and runs `check_versions`.
 
 It returns an `OpenedDevice` only when both matches hold. On a refusal, or when a worker request
-fails, it disconnects the module if it was connected and stops the worker, and returns an
-`OpenError` (`Refused` wraps the `MatchRefusal`). It creates no link; a check creates links only
-on the returned device, and `OpenedDevice::close` disconnects the module and stops the worker.
+fails, it stops the worker, and disconnects the module first when `ModuleConnect` was called (a
+failed connect can leave a J2534 device open). It returns an `OpenError`; `Refused` wraps the
+`MatchRefusal` and says how the worker ended. Every worker request is bounded by the launch
+options' `request_timeout` (set it high enough for the device's connect), a hung disconnect does
+not keep the worker from being stopped, and a worker that does not exit is killed. It creates no
+link; a check creates links only on the returned device, and `OpenedDevice::close` disconnects
+the module and stops the worker.
 
-The J2534 worker lists every configured `modules` entry until it can be started with the
-profile's label (ADR-281 Decision item 3), so the harness starts it with the library name only,
-and a configuration with other entries than the profile's is refused (`SeveralConfigured`). The
-harness reads the configuration from its own process: it finds the file the way the worker does
-only when both builds use the same configuration root and `VCI_CONFIG_PATH`. A worker that
-ignores the file's settings (the launcher's writability check, design 7.2) reports its default
-entry, which does not carry the profile's label, so the match refuses it.
+Residual for J2534, until the worker can be started with the profile's label and `pname`
+(ADR-281 Decision item 3): the worker lists every `modules` entry of the file it reads, and the
+harness reads its own view of that file. A worker that reads a file with a single entry that
+names another device than the profile's `pname` passes the match, since the harness cannot see
+that file. The profile refuses the label `j2534-0404`, which a worker gives its default entry
+when the file is absent, so that entry is never taken for the profile's. A file that fails the
+worker's writability check (design 7.2) stops a device-mode worker from starting and is applied
+in user mode. What covers the remaining case is design 13.5's procedure step 1, that only the
+profile's VCI is attached while a check runs.
 
 Tests: `crates/iso22900-service/tests/hw_open.rs` and `crates/j2534-0404-service/tests/hw_open.rs`
 open the D-PDU API and J2534 mocks through a worker and show each refusal they can reach.

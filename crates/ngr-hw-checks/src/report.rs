@@ -523,13 +523,20 @@ impl RunGuard {
 
 impl Drop for RunGuard {
     fn drop(&mut self) {
-        if !self.recorded() {
-            let message = if std::thread::panicking() {
-                "the check panicked"
-            } else {
-                "the check ended without recording a result"
-            };
-            self.finish(Outcome::Failed, message);
+        if std::thread::panicking() {
+            // A check that panics after recording a pass (in a later guard's drop, say) failed.
+            let check = self.check.clone();
+            self.report
+                .checks
+                .retain(|c| c.name != check || c.outcome != Outcome::Passed);
+            if !self.recorded() {
+                self.finish(Outcome::Failed, "the check panicked");
+            }
+        } else if !self.recorded() {
+            self.finish(
+                Outcome::Failed,
+                "the check ended without recording a result",
+            );
         }
         let written = match &self.dir {
             Some(dir) => self.report.write_to(dir),

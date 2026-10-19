@@ -167,7 +167,9 @@ above, `PowerSwitching`, and `HardwareControl` with a control's name). A check r
 the profile's class is one of its classes and the profile allows each of its operations. The
 `list` command and `ngr_hw_checks::listing` compare every declaration with the profile without
 running anything, and `ngr_hw_checks::begin`, the first call of every `hw_` test, refuses the
-check the same way before it reaches any device. A `hw_` test in any crate declares itself in
+check the same way before it reaches any device. `begin` also returns the run's report guard, so
+a refused check still leaves a report recording the refusal; a profile that cannot be read leaves
+none, since the report's class and masking come from it. A `hw_` test in any crate declares itself in
 `CHECKS`, so the listing covers every check; a test that is not there is not listed.
 
 "Permitted" means only that the profile's class and operations cover the declaration. What a

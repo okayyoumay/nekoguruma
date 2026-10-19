@@ -421,3 +421,24 @@ fn a_passing_check_whose_report_cannot_be_written_fails() {
     assert!(result.is_err());
     assert!(!refused.exists());
 }
+
+#[test]
+fn a_check_that_panics_after_passing_is_reported_failed() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("reports");
+    let profile = profile("j2534-0404", "");
+    let result = std::panic::catch_unwind(|| {
+        let mut run = RunGuard::start_in(&profile, "hw_w", dir.clone());
+        run.pass();
+        panic!("a later guard failed");
+    });
+    assert!(result.is_err());
+    let file = std::fs::read_dir(&dir).unwrap().next().unwrap().unwrap();
+    let table: toml::Table = std::fs::read_to_string(file.path())
+        .unwrap()
+        .parse()
+        .unwrap();
+    let checks = table["check"].as_array().unwrap();
+    assert_eq!(checks.len(), 1);
+    assert_eq!(checks[0]["outcome"].as_str(), Some("failed"));
+}

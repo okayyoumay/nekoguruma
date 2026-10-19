@@ -251,14 +251,18 @@ connection is served by the runtime.
   response table's one entry, the rest with `SetComParam`; the tester-present message is `3E 80`
   and both address modes are physical), the agent's timing and response-pending defaults
   (P2 1 s, P2* 5 s, 0x78 handling, completion limit 25 s) unless the profile pins one, then
-  `ConnectComLogicalLink` and a subscription to the link's events. Each request is decided like a
+  `ConnectComLogicalLink` and a subscription to the link's events. Every `SetComParam` carries
+  the class `PDU_PC_SPECIFIED`, so the worker resolves the ComParam's real class (a concrete class
+  would be forwarded to a D-PDU library as given); the response table's items are `UNIQUE_ID`. Each request is decided like a
   check's own. A profile the handle cannot plan (no value for a pinned name) fails before the link
   is created.
 - **Calls.** One method per RPC a check can use, each asking `decide` first. A refusal is
   `HandleError::Refused`, and nothing reaches the worker. `ModuleConnect`, `ModuleDisconnect`,
   `SubscribeEvent` and `GetEventItem` are not offered: the harness owns the device and the event
   stream, which `send_receive(cll, request)` reads (it returns the final response, a negative one
-  included, or `NoResponse`).
+  included, or `NoResponse`). It waits up to `HandleOptions::response_timeout`, by default the link's ceiling
+  (P2, the 0x78 completion timeout and P2* the link is set to, the profile's when it pins them,
+  plus 2 s), and cancels the primitive when the wait ends.
 - **State.** A `GetResourceIds` answer records the resource each id stands for and a `GetObjectId`
   answer the name of the id, into the learned ids. The `cll_handle` of a granted
   `CreateComLogicalLink` is bound to its endpoint, a granted `SetComParam` or

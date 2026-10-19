@@ -46,21 +46,21 @@ use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
 use tonic::Streaming;
 use vci_service_interface::{
-    CllCreateFlag, CllCreateFlagBit, ComLogicalLinkHandle, ComLogicalLinkResponse,
-    ComOperationType, ComParamResponse, ComPrimitiveCtrlData, ComPrimitiveHandle,
-    ComPrimitiveResponse, ConflictingResourcesResponse, ConnectComLogicalLinkRequest,
-    CreateComLogicalLinkRequest, DestroyComLogicalLinkRequest, DisconnectComLogicalLinkRequest,
-    EcuUniqueRespData, EventNotification, ExpectedResponseData, GetComParamRequest,
-    GetConflictingResourcesRequest, GetModuleIdsRequest, GetObjectIdRequest, GetResourceIdsRequest,
-    GetResourceStatusRequest, GetStatusRequest, GetTimestampRequest, GetUniqueRespIdTableRequest,
-    GetVersionRequest, IoCtlRequest, IoCtlResponse, LockResourceRequest, ModuleDisconnectRequest,
-    ModuleHandle, ModuleIdsResponse, ObjectIdResponse, ObjectType, ParamItem,
-    PduComPrimitiveStatus, PduErrorEvent, PduParamClass, PinData, ResourceData,
-    ResourceIdsResponse, ResourceStatusResponse, SetComParamRequest, SetUniqueRespIdTableRequest,
-    StartComPrimitiveRequest, StatusResponse, SubscribeEventRequest, TimestampResponse,
-    UniqueRespIdTableItem, UniqueRespIdTableResponse, UnlockResourceRequest, VersionResponse,
-    create_com_logical_link_request, event_item, event_notification, param_item, pin_data,
-    resource_data, subscribe_event_request,
+    CancelComPrimitiveRequest, CllCreateFlag, CllCreateFlagBit, ComLogicalLinkHandle,
+    ComLogicalLinkResponse, ComOperationType, ComParamResponse, ComPrimitiveCtrlData,
+    ComPrimitiveHandle, ComPrimitiveResponse, ConflictingResourcesResponse,
+    ConnectComLogicalLinkRequest, CreateComLogicalLinkRequest, DestroyComLogicalLinkRequest,
+    DisconnectComLogicalLinkRequest, EcuUniqueRespData, EventNotification, ExpectedResponseData,
+    GetComParamRequest, GetConflictingResourcesRequest, GetModuleIdsRequest, GetObjectIdRequest,
+    GetResourceIdsRequest, GetResourceStatusRequest, GetStatusRequest, GetTimestampRequest,
+    GetUniqueRespIdTableRequest, GetVersionRequest, IoCtlRequest, IoCtlResponse,
+    LockResourceRequest, ModuleDisconnectRequest, ModuleHandle, ModuleIdsResponse,
+    ObjectIdResponse, ObjectType, ParamItem, PduComPrimitiveStatus, PduErrorEvent, PduParamClass,
+    PinData, ResourceData, ResourceIdsResponse, ResourceStatusResponse, SetComParamRequest,
+    SetUniqueRespIdTableRequest, StartComPrimitiveRequest, StatusResponse, SubscribeEventRequest,
+    TimestampResponse, UniqueRespIdTableItem, UniqueRespIdTableResponse, UnlockResourceRequest,
+    VersionResponse, create_com_logical_link_request, event_item, event_notification, param_item,
+    pin_data, resource_data, subscribe_event_request,
 };
 use worker_host::client::WorkerClient;
 
@@ -153,15 +153,19 @@ pub enum HandleError {
 pub struct HandleOptions {
     /// How long a unary worker request may take.
     pub request_timeout: Duration,
-    /// How long [`GuardedHandle::send_receive`] waits for the end of a primitive.
-    pub response_timeout: Duration,
+    /// How long [`GuardedHandle::send_receive`] waits for the end of a primitive. `None` (the
+    /// default) is the link's own ceiling: the P2, P2* and 0x78 completion timeout the link is
+    /// set to (the profile's when it pins them) plus a margin, so an ECU that keeps answering
+    /// response-pending within its completion timeout is waited for. When the wait ends, the
+    /// primitive is cancelled before the call returns.
+    pub response_timeout: Option<Duration>,
 }
 
 impl Default for HandleOptions {
     fn default() -> Self {
         Self {
             request_timeout: Duration::from_secs(5),
-            response_timeout: Duration::from_secs(10),
+            response_timeout: None,
         }
     }
 }
@@ -180,6 +184,8 @@ struct State {
     closing: BTreeSet<u32>,
     /// Links whose return to the default session has been registered and has not run.
     session_back: BTreeSet<u32>,
+    /// How long a send-receive on each link may take (see [`completion_ceiling`]).
+    ceilings: BTreeMap<u32, Duration>,
 }
 
 /// The part of the handle the teardown steps share.
@@ -269,30 +275,52 @@ impl Shared {
     /// Waits for the end of primitive `cop` on link `cll` and returns the response to `request`.
     async fn await_result(
         &self,
+        client: &mut WorkerClient,
         cll: ComLogicalLinkHandle,
         cop: ComPrimitiveHandle,
         request: &[u8],
     ) -> Result<Vec<u8>, HandleError> {
-        let events = self
-            .lock()
-            .events
-            .get(&cll.cll_handle)
-            .cloned()
-            .ok_or_else(|| HandleError::Setup("the link has no event stream".to_owned()))?;
+        let (events, ceiling) = {
+            let state = self.lock();
+            (
+                state.events.get(&cll.cll_handle).cloned(),
+                state.ceilings.get(&cll.cll_handle).copied(),
+            )
+        };
+        let events =
+            events.ok_or_else(|| HandleError::Setup("the link has no event stream".to_owned()))?;
+        let timeout = self
+            .options
+            .response_timeout
+            .or(ceiling)
+            .unwrap_or_else(|| completion_ceiling(&[]));
         let expected = Expectation::of(request);
         let mut response = None;
         let mut error = None;
-        let deadline = tokio::time::Instant::now() + self.options.response_timeout;
+        let deadline = tokio::time::Instant::now() + timeout;
         let mut stream = events.lock().await;
         loop {
-            let notification = tokio::time::timeout_at(deadline, stream.message())
-                .await
-                .map_err(|_| HandleError::NoResponse)?
-                .map_err(|status| HandleError::Rpc {
-                    call: "SubscribeEvent",
-                    message: status.to_string(),
-                })?
-                .ok_or(HandleError::EventStreamEnded)?;
+            let notification = match tokio::time::timeout_at(deadline, stream.message()).await {
+                Ok(notification) => notification,
+                Err(_) => {
+                    // Nothing is left running after the caller gave up; a failed cancel (the
+                    // primitive ended meanwhile) changes nothing.
+                    let cancel = CancelComPrimitiveRequest {
+                        cop_handle: Some(cop),
+                    };
+                    if self.admit(&Request::CancelComPrimitive(&cancel)).is_ok() {
+                        let _ = self
+                            .send("CancelComPrimitive", client.cancel_com_primitive(cancel))
+                            .await;
+                    }
+                    return Err(HandleError::NoResponse);
+                }
+            }
+            .map_err(|status| HandleError::Rpc {
+                call: "SubscribeEvent",
+                message: status.to_string(),
+            })?
+            .ok_or(HandleError::EventStreamEnded)?;
             let item = match notification.event_data {
                 Some(event_notification::EventData::Item(item)) => item,
                 Some(event_notification::EventData::Lost(_)) => {
@@ -457,7 +485,7 @@ async fn return_to_default_session(
         let (_, cop) = shared
             .start(&mut client, send_receive_request(cll, &request))
             .await?;
-        shared.await_result(cll, cop, &request).await
+        shared.await_result(&mut client, cll, cop, &request).await
     };
     run.await.map(drop).map_err(|e| e.to_string())
 }
@@ -556,6 +584,29 @@ fn spelling(name: &str, link: &Link) -> String {
         .unwrap_or_else(|| name.to_owned())
 }
 
+/// How long a send-receive on a link set up with `own` may take: P2, the 0x78 completion timeout
+/// and one more P2* (the agent's `send_recv_ceiling`), as the link sets them (a value the plan
+/// lacks is the handle's default), and a margin for the worker and the transmission.
+fn completion_ceiling(own: &[(String, Value, PduParamClass)]) -> Duration {
+    let micros = |name: &str| {
+        own.iter()
+            .find_map(|(n, value, _)| match value {
+                Value::Number(v) if canonical(n) == canonical(name) => Some(u64::from(*v)),
+                _ => None,
+            })
+            .or_else(|| {
+                DEFAULTS
+                    .iter()
+                    .find(|(n, _)| *n == name)
+                    .map(|(_, v)| u64::from(*v))
+            })
+            .unwrap_or(0)
+    };
+    Duration::from_micros(
+        micros("CP_P2Max") + micros("CP_P2Star") + micros("CP_RC78CompletionTimeout"),
+    ) + Duration::from_secs(2)
+}
+
 /// The ComParams a link is set up with, by the name the worker is asked for.
 struct Plan {
     /// Set one by one with `SetComParam`.
@@ -579,7 +630,7 @@ fn plan(link: &Link, class: Class) -> Result<Plan, HandleError> {
             plan.table.push((spelling(&name, link), value));
         } else {
             plan.own
-                .push((spelling(&name, link), value, PduParamClass::PduPcCom));
+                .push((spelling(&name, link), value, PduParamClass::PduPcSpecified));
         }
     }
     if class != Class::T0 {
@@ -592,7 +643,7 @@ fn plan(link: &Link, class: Class) -> Result<Plan, HandleError> {
                 plan.own.push((
                     name.to_owned(),
                     Value::Number(value),
-                    PduParamClass::PduPcCom,
+                    PduParamClass::PduPcSpecified,
                 ));
             }
         }
@@ -772,6 +823,7 @@ impl<'r> GuardedHandle<'r> {
         let class = self.shared.profile.class;
         // Planned first, so that a link the handle cannot set up is not created.
         let Plan { own, table } = plan(link, class)?;
+        let ceiling = completion_ceiling(&own);
         let found = self
             .get_resource_ids(GetResourceIdsRequest {
                 module_handle: Some(module),
@@ -804,6 +856,7 @@ impl<'r> GuardedHandle<'r> {
             .cll_handle
             .ok_or_else(|| HandleError::Setup("no logical link handle".to_owned()))?;
 
+        self.shared.lock().ceilings.insert(cll.cll_handle, ceiling);
         for (name, value, param_class) in own {
             let id = self.param_id(&name).await?;
             self.set_com_param(SetComParamRequest {
@@ -1046,7 +1099,9 @@ impl<'r> GuardedHandle<'r> {
             .ok_or_else(|| {
                 HandleError::Setup("StartComPrimitive returned no primitive handle".to_owned())
             })?;
-        self.shared.await_result(cll, cop, request).await
+        self.shared
+            .await_result(&mut self.client.clone(), cll, cop, request)
+            .await
     }
 
     passthrough! {
@@ -1071,7 +1126,7 @@ impl<'r> GuardedHandle<'r> {
         /// `GetComParam`.
         get_com_param(GetComParam, GetComParamRequest) -> ComParamResponse = "GetComParam";
         /// `CancelComPrimitive`.
-        cancel_com_primitive(CancelComPrimitive, vci_service_interface::CancelComPrimitiveRequest) -> vci_service_interface::Response = "CancelComPrimitive";
+        cancel_com_primitive(CancelComPrimitive, CancelComPrimitiveRequest) -> vci_service_interface::Response = "CancelComPrimitive";
         /// `GetStatus`.
         get_status(GetStatus, GetStatusRequest) -> StatusResponse = "GetStatus";
         /// `IoCtl`, of the IO controls the guard lets through.
@@ -1233,6 +1288,35 @@ mod tests {
         let Plan { own, .. } = plan(&ends[1].link, Class::T0).unwrap();
         let names: Vec<&str> = own.iter().map(|(n, ..)| n.as_str()).collect();
         assert!(!names.contains(&"CP_P2Max") && !names.contains(&"CP_TesterPresentMessage"));
+    }
+
+    #[test]
+    fn the_default_deadline_covers_the_completion_timeout_the_link_is_set_to() {
+        // The handle's own defaults: P2 1 s + 0x78 chain 25 s + P2* 5 s, and a margin.
+        let t3 = &shapes()[2];
+        let Plan { own, .. } = plan(link_of(t3), t3.class).unwrap();
+        assert_eq!(completion_ceiling(&own), Duration::from_secs(33));
+        assert!(completion_ceiling(&own) > Duration::from_secs(25));
+        // A profile that pins the timings is waited for as pinned.
+        let pinned = profile(
+            "T3",
+            "id_bits = 11\naddressing = \"normal\"\n[link.comparams]\nCP_P2Max = 2000000\n\
+             CP_P2Star = 3000000\nCP_RC78CompletionTimeout = 60000000\n",
+        );
+        let Plan { own, .. } = plan(link_of(&pinned), pinned.class).unwrap();
+        assert_eq!(completion_ceiling(&own), Duration::from_secs(67));
+    }
+
+    #[test]
+    fn every_comparam_is_sent_as_specified_so_the_worker_resolves_its_class() {
+        for profile in shapes() {
+            let Plan { own, table } = plan(link_of(&profile), profile.class).unwrap();
+            assert!(
+                own.iter()
+                    .all(|(_, _, class)| *class == PduParamClass::PduPcSpecified)
+            );
+            assert!(!table.is_empty());
+        }
     }
 
     #[test]

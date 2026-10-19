@@ -70,7 +70,7 @@ fn vci(profile: &Profile) -> profile::Vci {
 fn options() -> HandleOptions {
     HandleOptions {
         request_timeout: std::time::Duration::from_secs(5),
-        response_timeout: std::time::Duration::from_secs(5),
+        response_timeout: Some(std::time::Duration::from_secs(5)),
     }
 }
 
@@ -366,4 +366,60 @@ async fn a_t0_raw_frame_is_transmitted_as_the_guard_reads_it() {
         drop(run);
         server.shutdown().await;
     }
+}
+
+/// A send-receive whose wait ends cancels the primitive: the worker reports it cancelled, not
+/// still executing (the worker's own P2 is far longer than the handle's wait here).
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_send_receive_that_times_out_cancels_its_primitive() {
+    let server = TestServer::start().await;
+    let profile = t3();
+    let reports = Reports::new();
+    let mut run = RunGuard::start_in(&profile, "hw_guarded_handle", reports.dir());
+    let mut handle = GuardedHandle::attach(
+        &profile,
+        &vci(&profile),
+        server.worker_client().await,
+        module(),
+        HandleOptions {
+            request_timeout: std::time::Duration::from_secs(5),
+            response_timeout: Some(std::time::Duration::from_millis(300)),
+        },
+        &mut run,
+    )
+    .await
+    .expect("the handle opens the profile's link");
+    let [cll] = *handle.links() else {
+        panic!("one link");
+    };
+    let silent = handle.send_receive(cll, &[0x22, 0xF1, 0x90]).await;
+    assert_eq!(silent, Err(HandleError::NoResponse));
+
+    // The first primitive of the worker is number 1.
+    let status = handle
+        .get_status(vci_service_interface::GetStatusRequest {
+            handle: Some(
+                vci_service_interface::get_status_request::Handle::CopHandle(
+                    vci_service_interface::ComPrimitiveHandle {
+                        module_handle: cll.module_handle,
+                        cll_handle: cll.cll_handle,
+                        cop_handle: 1,
+                    },
+                ),
+            ),
+        })
+        .await
+        .expect("the primitive's status");
+    assert_eq!(
+        status.status,
+        Some(vci_service_interface::status_response::Status::CopStatus(
+            vci_service_interface::PduComPrimitiveStatus::PduCopstCancelled as i32
+        ))
+    );
+    drop(handle);
+    run.pass();
+    assert!(run.run_teardown().is_empty());
+    drop(run);
+    server.shutdown().await;
 }

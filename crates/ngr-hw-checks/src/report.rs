@@ -81,8 +81,9 @@ pub struct DeviceInfo {
     /// For the D-PDU API the vendor name `GetVersion` reports; for J2534, or when the library
     /// leaves it empty, the library the profile names.
     pub vendor: String,
-    /// For the D-PDU API the hardware name `GetVersion` reports; for J2534, or when the library
-    /// leaves it empty, the module as the worker reports it (`vendor_module_name`).
+    /// For the D-PDU API the hardware name `GetVersion` reports, or when the library leaves it
+    /// empty, the module as the worker reports it (`vendor_module_name`); for J2534 the device
+    /// name (`pname`) of the configured entry the profile names.
     pub model: String,
     pub firmware_version: String,
     pub library_version: String,
@@ -149,18 +150,9 @@ impl Masker {
     /// not the check digit holds) and serial numbers such as `SN-1234567890`. A hexadecimal
     /// literal (`0x` and hexadecimal digits only), or a run of them joined by `-` or `_`, is a
     /// code, not a serial number, and is kept.
+    /// Names the profile gives (a library, a J2534 label or device name) are masked the same
+    /// way, since they can carry a serial number too.
     pub fn text(&self, text: &str) -> String {
-        self.mask(text, true)
-    }
-
-    /// A name the profile gives, such as a library or a configured J2534 label: only the known
-    /// serial numbers and VIN-shaped tokens (17 letters and digits, one of them a digit) in it
-    /// are masked, so that a library named like `op20pt32` stays readable.
-    pub fn name(&self, name: &str) -> String {
-        self.mask(name, false)
-    }
-
-    fn mask(&self, text: &str, serial_like: bool) -> String {
         if self.full {
             return text.to_owned();
         }
@@ -168,12 +160,11 @@ impl Masker {
         for serial in &self.known {
             text = text.replace(serial.as_str(), &Self::mask_value(serial));
         }
-        let is_part =
-            |c: char| c.is_ascii_alphanumeric() || (serial_like && (c == '-' || c == '_'));
+        let is_part = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_';
         let mut out = String::with_capacity(text.len());
         let mut token = String::new();
         let flush = |token: &mut String, out: &mut String| {
-            if Self::is_identifier(token, serial_like) {
+            if Self::is_serial_like(token) {
                 out.push_str(&Self::mask_value(token));
             } else {
                 out.push_str(token);
@@ -192,14 +183,11 @@ impl Masker {
         out
     }
 
-    /// Whether `token` is a VIN or, with `serial_like`, looks like a serial number.
-    fn is_identifier(token: &str, serial_like: bool) -> bool {
+    /// Whether `token` looks like a VIN or a serial number.
+    fn is_serial_like(token: &str) -> bool {
         let alphanumeric = token.bytes().filter(u8::is_ascii_alphanumeric).count();
         if !token.bytes().any(|b| b.is_ascii_digit()) {
             return false;
-        }
-        if !serial_like {
-            return alphanumeric == 17 && alphanumeric == token.len();
         }
         // A run of hexadecimal literals, such as `0x7E0-0x7E8`, is codes, not a serial number.
         let hex_literals = token.split(['-', '_']).all(|part| {
@@ -216,13 +204,13 @@ impl Masker {
     /// has each value masked whose attribute name contains "serial" (any case), and text that is
     /// no such list is a device name or a serial number and is masked whole; the result is then
     /// masked as free text. A J2534 name is the label of a configured entry, not a serial
-    /// number, and is masked as a [name](Self::name).
+    /// number, and is masked as free text only.
     pub fn module_name(&self, api: Api, name: &str) -> String {
         if self.full {
             return name.to_owned();
         }
         let masked = match api {
-            Api::J2534V0404 => return self.name(name),
+            Api::J2534V0404 => name.to_owned(),
             Api::Iso22900 if attribute_values(name).is_empty() => {
                 if name.trim().is_empty() {
                     String::new()
@@ -382,13 +370,19 @@ impl Report {
                 Api::Iso22900 if !version.vendor_name.trim().is_empty() => {
                     self.masker.text(&version.vendor_name)
                 }
-                _ => self.masker.name(&vci.library),
+                _ => self.masker.text(&vci.library),
             },
             model: match vci.api {
                 Api::Iso22900 if !version.hw_name.trim().is_empty() => {
                     self.masker.text(&version.hw_name)
                 }
-                _ => self.masker.module_name(vci.api, &module.name),
+                // The profile's `pname` is the device name of the configured entry (ADR-281);
+                // the label only selects it.
+                Api::J2534V0404 => match vci.pname.as_deref() {
+                    Some(pname) if !pname.trim().is_empty() => self.masker.text(pname),
+                    _ => self.masker.module_name(vci.api, &module.name),
+                },
+                Api::Iso22900 => self.masker.module_name(vci.api, &module.name),
             },
             firmware_version: self.masker.text(&firmware),
             library_version: self.masker.text(&library),

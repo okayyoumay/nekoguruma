@@ -70,9 +70,8 @@ fn a_vin_in_free_text_is_masked() {
     assert_eq!(masked, "read ****6752, then (VIN=****6752)");
     // Not an identifier: letters only.
     assert_eq!(masker.text("ABCDEFGHJKLMNPRST"), "ABCDEFGHJKLMNPRST");
-    // A name keeps everything but a VIN: 16 characters are not one.
-    assert_eq!(masker.name("WVWZZZ1JZ3W38675"), "WVWZZZ1JZ3W38675");
-    assert_eq!(masker.name(&format!("lib {VIN}")), "lib ****6752");
+    // 16 characters are not a VIN, but they still look like a serial number.
+    assert_eq!(masker.text("WVWZZZ1JZ3W38675"), "****8675");
 }
 
 #[test]
@@ -182,7 +181,8 @@ fn j2534_versions_are_the_reported_strings_and_no_device_leaves_them_out() {
     let device = report.devices[0].clone();
     assert_eq!(device.firmware_version, "fw 1.2.3");
     assert_eq!(device.library_version, "dll 4.5.6");
-    assert_eq!(device.model, "bench");
+    // The model is the configured entry's device name, not the label that selects it.
+    assert_eq!(device.model, "Vendor VCI 1");
 }
 
 #[test]
@@ -544,16 +544,12 @@ fn codes_and_short_numbers_are_not_serial_numbers() {
 }
 
 #[test]
-fn a_library_and_a_j2534_label_keep_their_names() {
-    let profile = profile("j2534-0404", "");
-    let masker = Masker::for_profile(&profile);
-    assert_eq!(masker.name("op20pt32"), "op20pt32");
+fn a_serial_in_a_profile_name_is_masked() {
+    let masker = Masker::for_profile(&profile("j2534-0404", ""));
+    assert_eq!(masker.text("Vendor-SN-1234567890"), "****7890");
+    assert_eq!(masker.module_name(Api::J2534V0404, "bench"), "bench");
     assert_eq!(
-        masker.module_name(Api::J2534V0404, "bench-vci-01"),
-        "bench-vci-01"
+        masker.module_name(Api::J2534V0404, "bench SN1234567890"),
+        "bench ****7890"
     );
-    let mut report = Report::new(&profile);
-    let library = vci(&profile).library.clone();
-    report.add_device(vci(&profile), Abi::WinX86, &module("bench"), &version());
-    assert_eq!(report.devices[0].vendor, library);
 }

@@ -202,7 +202,7 @@ panic, the write error goes to stderr so it does not hide the check's own failur
   `vendor` and `model` are the vendor and hardware names `GetVersion` reports, falling back to
   the profile's library and the module's `vendor_module_name` when the library leaves them empty.
   J2534 reports neither (its worker answers constants), so for J2534 they are the profile's
-  library and the configured label. No serial-number field is read from the device.
+  library and `pname`, the device name of the configured entry (the label only selects it). No serial-number field is read from the device.
 - **Place.** `nekoguruma/hw-reports` in the user's data directory: `$XDG_DATA_HOME` or
   `~/.local/share` on Linux, `~/Library/Application Support` on macOS, `%LOCALAPPDATA%` on
   Windows. A file is named by the run's start time and process id (`20261019T101500Z-4242.toml`),
@@ -213,17 +213,15 @@ panic, the write error goes to stderr so it does not hide the check's own failur
   On Windows the files take the ACLs of the user's profile, which by default only that user and
   administrators can read; the harness sets no ACL.
 - **Masking.** Unless the profile sets `report_full_identifiers`, a masked value is `****` and its
-  last 4 characters (all of a value shorter than 8 characters is replaced by `****`). In free text
-  (the host name, the OS description, check messages and what the device reports) every
-  serial-like token is masked: a run of letters, digits, `-` and `_` that holds at least 8
+  last 4 characters (all of a value shorter than 8 characters is replaced by `****`). In every
+  text field (the host name, the OS description, check messages, what the device reports, and
+  the library, label and `pname` the profile gives) every serial-like token is masked: a run of letters, digits, `-` and `_` that holds at least 8
   letters and digits, one of them a digit. That covers every VIN and serial numbers in forms such
   as `SN-1234567890`, whether or not the profile names them; a hexadecimal literal (`0x7E8`), or a
   run of them joined by `-` or `_`, is kept as a code. Masked too are the values of the module
   name's attributes whose name contains "serial", a D-PDU API module name that has no attributes
   (a device name or a serial number), and the profile's D-PDU API `module` wherever it occurs.
-  Names the profile gives (the library, and the configured label that is a J2534 module name)
-  are kept, except for a VIN-shaped token (17 letters and digits, one of them a digit) or a known
-  module in them. A check that writes its own free text goes through `Report::masker()`. Masking
+  A library named like `op20pt32` is therefore written as `****pt32`. A check that writes its own free text goes through `Report::masker()`. Masking
   is a heuristic both ways: it also masks other long codes written without `0x`, such as a 29-bit
   CAN identifier, and a serial number in a form none of these rules covers stays in the report,
   so read a report before sharing it.

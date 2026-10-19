@@ -107,11 +107,18 @@ pub fn start(
 
 /// The first call of a `hw_` test: the profile `NGR_HW_PROFILE` names, if it permits `check`,
 /// and the run's [`report::RunGuard`], which writes the report when the test ends. Panics
-/// otherwise, so the test fails before it reaches any device. A profile that cannot be read
-/// leaves no report, since the report's class and masking come from it; one that does not permit
-/// the check leaves a report with the check refused.
+/// otherwise, so the test fails before it reaches any device, after recording the failure: a
+/// profile that cannot be read leaves a report with the class unknown and every identifier
+/// masked, and one that does not permit the check leaves a report with the check refused.
 pub fn begin(check: &CheckDecl) -> (Profile, report::RunGuard) {
-    let profile = profile::from_env().unwrap_or_else(|error| panic!("{error}"));
+    let profile = match profile::from_env() {
+        Ok(profile) => profile,
+        Err(error) => {
+            let mut run = report::RunGuard::start_without_profile(check.name);
+            run.finish(report::Outcome::Failed, &error.to_string());
+            panic!("{error}");
+        }
+    };
     let mut run = report::RunGuard::start(&profile, check.name);
     if let Err(error) = start(check, Ok(profile.clone())) {
         run.finish(report::Outcome::Refused, &error.to_string());

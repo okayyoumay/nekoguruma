@@ -168,8 +168,9 @@ the profile's class is one of its classes and the profile allows each of its ope
 `list` command and `ngr_hw_checks::listing` compare every declaration with the profile without
 running anything, and `ngr_hw_checks::begin`, the first call of every `hw_` test, refuses the
 check the same way before it reaches any device. `begin` also returns the run's report guard, so
-a refused check still leaves a report recording the refusal; a profile that cannot be read leaves
-none, since the report's class and masking come from it. A `hw_` test in any crate declares itself in
+a refused check still leaves a report recording the refusal, and a profile that cannot be read
+leaves one with the class `unknown` and every identifier masked. A check whose recorded result is
+not a pass (`finish` with failed or refused) fails as a test as well, whether or not it panicked. A `hw_` test in any crate declares itself in
 `CHECKS`, so the listing covers every check; a test that is not there is not listed.
 
 "Permitted" means only that the profile's class and operations cover the declaration. What a

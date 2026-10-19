@@ -272,6 +272,26 @@ impl Report {
         }
     }
 
+    /// The report of a run whose profile could not be read: the class is `unknown` and every
+    /// identifier is masked, since no profile asks for them in full.
+    pub fn without_profile() -> Self {
+        let masker = Masker {
+            full: false,
+            known: Vec::new(),
+        };
+        Report {
+            started_at: rfc3339(SystemTime::now()),
+            host: masker.text(&host_name()),
+            os: format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
+            os_version: os_version().map(|v| masker.text(&v)),
+            class: "unknown".to_owned(),
+            identifiers_in_full: false,
+            device: None,
+            checks: Vec::new(),
+            masker,
+        }
+    }
+
     /// The masker the report applies, for a check that writes its own free text.
     pub fn masker(&self) -> &Masker {
         &self.masker
@@ -494,6 +514,12 @@ impl RunGuard {
         Self::new(Report::new(profile), check, Some(dir))
     }
 
+    /// [`RunGuard::start`] for a run whose profile could not be read
+    /// ([`Report::without_profile`]).
+    pub fn start_without_profile(check: &str) -> Self {
+        Self::new(Report::without_profile(), check, None)
+    }
+
     fn new(report: Report, check: &str, dir: Option<PathBuf>) -> Self {
         RunGuard {
             report,
@@ -543,7 +569,20 @@ impl Drop for RunGuard {
             None => self.report.write(),
         };
         match written {
-            Ok(path) => eprintln!("hardware report: {}", path.display()),
+            Ok(path) => {
+                eprintln!("hardware report: {}", path.display());
+                // A check that recorded anything but a pass fails as a test too, also when it
+                // ended without panicking.
+                if !std::thread::panicking()
+                    && let Some(result) = self
+                        .report
+                        .checks
+                        .iter()
+                        .find(|c| c.name == self.check && c.outcome != Outcome::Passed)
+                {
+                    panic!("{}: {:?}: {}", result.name, result.outcome, result.message);
+                }
+            }
             // Unwinding already fails the check; a second panic would abort the test process.
             Err(error) if std::thread::panicking() => {
                 eprintln!("cannot write the hardware report: {error}");

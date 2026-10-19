@@ -442,3 +442,31 @@ fn a_check_that_panics_after_passing_is_reported_failed() {
     assert_eq!(checks.len(), 1);
     assert_eq!(checks[0]["outcome"].as_str(), Some("failed"));
 }
+
+#[test]
+fn a_recorded_failure_fails_the_test_and_is_written() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("reports");
+    let profile = profile("j2534-0404", "");
+    let result = std::panic::catch_unwind(|| {
+        let mut run = RunGuard::start_in(&profile, "hw_v", dir.clone());
+        run.finish(Outcome::Failed, "the loopback frame did not come back");
+    });
+    assert!(result.is_err());
+    let file = std::fs::read_dir(&dir).unwrap().next().unwrap().unwrap();
+    let text = std::fs::read_to_string(file.path()).unwrap();
+    assert!(
+        text.contains("failed") && text.contains("loopback"),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_report_without_a_profile_masks_everything() {
+    let mut report = Report::without_profile();
+    report.record("hw_u", Outcome::Failed, &format!("cannot read {VIN}.toml"));
+    let text = report.to_toml().unwrap();
+    assert!(!text.contains(VIN), "{text}");
+    assert!(text.contains("class = \"unknown\""), "{text}");
+    assert!(!report.identifiers_in_full);
+}

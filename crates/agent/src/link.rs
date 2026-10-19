@@ -440,9 +440,13 @@ async fn open_module<C: WorkerApi>(
     Ok(module_handle)
 }
 
+/// The setup error `create_link` returns when `GetResourceIds` finds no resource, before any
+/// `CreateComLogicalLink` is sent.
+const NO_RESOURCE: &str = "no resource for the protocol";
+
 /// Whether a failed `CreateComLogicalLink` created nothing: the worker (or the guard in front of
 /// it, as `PermissionDenied`) refused the request, or there was no resource to create it on. A
-/// timeout or any other status does not say.
+/// timeout, any other status, or a create that answered without a link handle does not say.
 fn nothing_created(error: &HostError) -> bool {
     use tonic::Code::{
         AlreadyExists, FailedPrecondition, InvalidArgument, NotFound, PermissionDenied,
@@ -460,7 +464,7 @@ fn nothing_created(error: &HostError) -> bool {
                 | AlreadyExists
                 | Unauthenticated
         ),
-        HostError::Setup(_) => true,
+        HostError::Setup(message) => *message == NO_RESOURCE,
         _ => false,
     }
 }
@@ -542,7 +546,7 @@ async fn create_link<C: WorkerApi>(
     .resource_id_list
     .and_then(|list| list.resource_id_data_array.into_iter().next())
     .and_then(|data| data.resource_id_array.into_iter().next())
-    .ok_or(HostError::Setup("no resource for the protocol"))?;
+    .ok_or(HostError::Setup(NO_RESOURCE))?;
 
     unary(
         deadline,
@@ -736,6 +740,24 @@ mod tests {
 
     use super::*;
     use crate::JobDocument;
+
+    /// Only a refusal or a missing resource proves a failed create left no link: a create that
+    /// answered without a handle, or a timeout, may have created one the runner cannot name.
+    #[test]
+    fn a_failed_create_is_clean_only_when_nothing_can_have_been_created() {
+        assert!(nothing_created(&HostError::Setup(NO_RESOURCE)));
+        assert!(!nothing_created(&HostError::Setup(
+            "no logical link handle"
+        )));
+        assert!(nothing_created(&HostError::Rpc {
+            rpc: "CreateComLogicalLink",
+            status: Box::new(tonic::Status::permission_denied("refused")),
+        }));
+        assert!(!nothing_created(&HostError::Rpc {
+            rpc: "CreateComLogicalLink",
+            status: Box::new(tonic::Status::unavailable("gone")),
+        }));
+    }
 
     /// The example ECU's protocol: UDS over ISO 15765 at 500 kbit/s on 7E0 / 7E8.
     fn protocol(params: &[(&str, i64)]) -> ProtocolT {

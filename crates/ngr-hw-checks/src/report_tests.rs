@@ -277,3 +277,91 @@ fn a_directory_inside_another_work_tree_is_accepted() {
         .unwrap();
     assert!(path.starts_with(&dir));
 }
+
+#[test]
+fn a_vin_shaped_host_name_is_masked_unless_asked_for() {
+    let masked = Report::with_host(&profile("j2534-0404", ""), VIN, Some(&format!("OS {VIN}")));
+    assert_eq!(masked.host, "****6752");
+    assert_eq!(masked.os_version.as_deref(), Some("OS ****6752"));
+    let full = Report::with_host(
+        &profile("j2534-0404", "report_full_identifiers = true"),
+        VIN,
+        None,
+    );
+    assert_eq!(full.host, VIN);
+}
+
+#[test]
+fn a_panicking_check_still_leaves_a_failed_report() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("reports");
+    let profile = profile("j2534-0404", "");
+    let result = std::panic::catch_unwind(|| {
+        let _run = RunGuard::start_in(&profile, "hw_x", dir.clone());
+        panic!("assertion failed");
+    });
+    assert!(result.is_err());
+    let files: Vec<_> = std::fs::read_dir(&dir).unwrap().collect();
+    assert_eq!(files.len(), 1);
+    let table: toml::Table = std::fs::read_to_string(files[0].as_ref().unwrap().path())
+        .unwrap()
+        .parse()
+        .unwrap();
+    let check = &table["check"].as_array().unwrap()[0];
+    assert_eq!(check["name"].as_str(), Some("hw_x"));
+    assert_eq!(check["outcome"].as_str(), Some("failed"));
+    assert!(check["message"].as_str().unwrap().contains("panicked"));
+}
+
+#[test]
+fn a_finished_check_keeps_its_recorded_result() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("reports");
+    {
+        let mut run = RunGuard::start_in(&profile("j2534-0404", ""), "hw_y", dir.clone());
+        run.pass();
+    }
+    let path = std::fs::read_dir(&dir)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let text = std::fs::read_to_string(path).unwrap();
+    assert!(text.contains("outcome = \"passed\""), "{text}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_path_that_leads_into_the_repository_is_refused() {
+    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let report = Report::new(&profile("j2534-0404", ""));
+    // `..` after an existing directory resolves into the repository.
+    let dotdot = crate_dir
+        .join("docs")
+        .join("..")
+        .join("report-guard-dotdot");
+    assert!(matches!(
+        report.write_to(&dotdot),
+        Err(ReportError::InsideRepository(_))
+    ));
+    // `..` below a directory that does not exist is refused outright.
+    let missing = crate_dir
+        .join("no-such-dir")
+        .join("..")
+        .join("report-guard-dotdot");
+    assert!(report.write_to(&missing).is_err());
+    // A symlink outside the repository that points into it.
+    let root = tempfile::tempdir().unwrap();
+    let link = root.path().join("link");
+    std::os::unix::fs::symlink(crate_dir.join("docs"), &link).unwrap();
+    let through = link.join("report-guard-symlink");
+    assert!(matches!(
+        report.write_to(&through),
+        Err(ReportError::InsideRepository(_))
+    ));
+    for name in ["report-guard-dotdot", "report-guard-symlink"] {
+        assert!(!crate_dir.join(name).exists());
+        assert!(!crate_dir.join("docs").join(name).exists());
+    }
+}

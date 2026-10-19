@@ -252,16 +252,23 @@ pub struct Report {
 impl Report {
     /// Starts the report of a run with `profile`, now.
     pub fn new(profile: &Profile) -> Self {
+        Self::with_host(profile, &host_name(), os_version().as_deref())
+    }
+
+    /// [`Report::new`] with the host name and OS description given. Both are masked like any
+    /// other text, since a host name can carry a VIN or a serial number.
+    fn with_host(profile: &Profile, host: &str, os_version: Option<&str>) -> Self {
+        let masker = Masker::for_profile(profile);
         Report {
             started_at: rfc3339(SystemTime::now()),
-            host: host_name(),
+            host: masker.text(host),
             os: format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
-            os_version: os_version(),
+            os_version: os_version.map(|v| masker.text(v)),
             class: format!("{:?}", profile.class),
             identifiers_in_full: profile.report_full_identifiers,
             device: None,
             checks: Vec::new(),
-            masker: Masker::for_profile(profile),
+            masker,
         }
     }
 
@@ -328,7 +335,7 @@ impl Report {
     /// id, with a counter if that name is taken; no file is overwritten.
     pub fn write_to(&self, dir: &Path) -> Result<PathBuf, ReportError> {
         let text = self.to_toml()?;
-        let dir = std::path::absolute(dir).map_err(io(dir))?;
+        let dir = resolve(dir)?;
         if let Some(repo) = repository_root(Path::new(env!("CARGO_MANIFEST_DIR")))
             && dir.starts_with(&repo)
         {
@@ -457,9 +464,111 @@ fn rfc3339(time: SystemTime) -> String {
     out
 }
 
+/// A run's report that is written when the guard goes out of scope, so that a check which
+/// fails by panic (an assertion, an `unwrap`) still leaves its report. The check ends with
+/// [`RunGuard::pass`] or [`RunGuard::finish`]; a guard dropped while the thread panics records
+/// the check as failed, and one dropped without a result records that as a failure too. Drop
+/// never panics: a report that cannot be written is described on stderr.
+pub struct RunGuard {
+    report: Report,
+    check: String,
+    dir: Option<PathBuf>,
+}
+
+impl RunGuard {
+    /// Starts the report of `check` for `profile`; it is written to [`reports_dir`] on drop.
+    pub fn start(profile: &Profile, check: &str) -> Self {
+        Self::new(Report::new(profile), check, None)
+    }
+
+    /// Like [`RunGuard::start`], writing to `dir`.
+    pub fn start_in(profile: &Profile, check: &str, dir: PathBuf) -> Self {
+        Self::new(Report::new(profile), check, Some(dir))
+    }
+
+    fn new(report: Report, check: &str, dir: Option<PathBuf>) -> Self {
+        RunGuard {
+            report,
+            check: check.to_owned(),
+            dir,
+        }
+    }
+
+    /// The report, for `set_device` and other entries.
+    pub fn report(&mut self) -> &mut Report {
+        &mut self.report
+    }
+
+    /// Records the check's result.
+    pub fn finish(&mut self, outcome: Outcome, message: &str) {
+        self.report.record(&self.check.clone(), outcome, message);
+    }
+
+    pub fn pass(&mut self) {
+        self.finish(Outcome::Passed, "");
+    }
+
+    fn recorded(&self) -> bool {
+        self.report.checks.iter().any(|c| c.name == self.check)
+    }
+}
+
+impl Drop for RunGuard {
+    fn drop(&mut self) {
+        if !self.recorded() {
+            let message = if std::thread::panicking() {
+                "the check panicked"
+            } else {
+                "the check ended without recording a result"
+            };
+            self.finish(Outcome::Failed, message);
+        }
+        let written = match &self.dir {
+            Some(dir) => self.report.write_to(dir),
+            None => self.report.write(),
+        };
+        match written {
+            Ok(path) => eprintln!("hardware report: {}", path.display()),
+            Err(error) => eprintln!("cannot write the hardware report: {error}"),
+        }
+    }
+}
+
 #[cfg(test)]
 #[path = "report_tests.rs"]
 mod tests;
+
+/// `dir` as an absolute path with symlinks resolved, before anything is created: the nearest
+/// existing ancestor is canonicalized and the components below it are appended. A `..` among
+/// those components is refused, since it could lead out of the place that was checked.
+fn resolve(dir: &Path) -> Result<PathBuf, ReportError> {
+    let absolute = std::path::absolute(dir).map_err(io(dir))?;
+    let mut existing = absolute.as_path();
+    let mut missing = Vec::new();
+    while !existing.exists() {
+        let (Some(parent), Some(name)) = (existing.parent(), existing.file_name()) else {
+            // A trailing `..` or the root: nothing to append, and `exists` failed.
+            return Err(io(dir)(std::io::ErrorKind::InvalidInput.into()));
+        };
+        missing.push(name);
+        existing = parent;
+    }
+    let mut resolved = existing.canonicalize().map_err(io(existing))?;
+    for name in missing.into_iter().rev() {
+        resolved.push(name);
+    }
+    if absolute.strip_prefix(existing).is_ok_and(|rest| {
+        rest.components()
+            .any(|c| c == std::path::Component::ParentDir)
+    }) {
+        return Err(io(dir)(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the path has `..` below its existing part",
+        )));
+    }
+    // The repository root is compared in its canonical form too.
+    Ok(resolved)
+}
 
 /// The root of the Git work tree that holds `crate_dir`, if it still exists. Only this
 /// repository is refused: a user data directory inside some other work tree (a home directory
@@ -468,5 +577,5 @@ fn repository_root(crate_dir: &Path) -> Option<PathBuf> {
     crate_dir
         .ancestors()
         .find(|a| a.join(".git").exists())
-        .map(Path::to_owned)
+        .map(|root| root.canonicalize().unwrap_or_else(|_| root.to_owned()))
 }

@@ -180,7 +180,12 @@ access or session beyond the extended one) are the class's lists, not declared o
 Each run writes a report (design 13.5 "Reports"). A check builds it with
 `ngr_hw_checks::report::Report::new(&profile)`, adds its results with `record` (passed, failed or
 refused, with a message) and `record_refusal`, adds what the opened device reported with
-`set_device`, and ends with `write`. `hw_the_profile_permits_a_check` does this.
+`set_device`, and ends with `write`. A `hw_` test normally holds a `report::RunGuard` instead
+(`RunGuard::start(&profile, name)`), which writes the report when it is dropped: a check that fails
+by panic still leaves its report, with the check recorded as failed, and so does one that ends
+without recording a result. The test ends with `pass()` or `finish(outcome, message)`.
+`hw_the_profile_permits_a_check` does this. A report that cannot be written is reported on stderr
+and does not hide the check's own failure.
 
 - **Content (TOML).** `started_at` (UTC, RFC 3339), `host` (the `HOSTNAME` or `COMPUTERNAME`
   variable, else `/etc/hostname`), `os` (the OS and architecture the harness was built for) with
@@ -195,7 +200,7 @@ refused, with a message) and `record_refusal`, adds what the opened device repor
   `~/.local/share` on Linux, `~/Library/Application Support` on macOS, `%LOCALAPPDATA%` on
   Windows. A file is named by the run's start time and process id (`20261019T101500Z-4242.toml`),
   with a counter if that name exists; a report never overwrites another. A directory inside this
-  repository's work tree is refused. How long reports are kept is up to the owner of the setup.
+  repository's work tree is refused, after symlinks in the path are resolved (a `..` below the existing part of the path is refused). How long reports are kept is up to the owner of the setup.
 - **Permissions.** On Unix the directories are created with mode 0700 and each file with mode 0600
   in the creating call; an existing report directory that group or others can access is refused.
   On Windows the files take the ACLs of the user's profile, which by default only that user and

@@ -572,3 +572,30 @@ fn every_declared_check_is_named_hw_and_has_a_class() {
         assert!(!check.classes.is_empty(), "{}", check.name);
     }
 }
+
+#[test]
+fn two_spellings_of_one_comparam_are_refused_whatever_their_values() {
+    let with = |lines: &str| t1("").replacen("CP_STmin = 0", lines, 1);
+    let refused = |lines: &str, a: &str, b: &str| match parse(&with(lines)) {
+        Err(ProfileError::Invalid(message)) => {
+            assert!(
+                message.contains(a) && message.contains(b),
+                "{message} does not name {a} and {b}"
+            )
+        }
+        other => panic!("{other:?}: expected a refusal for {lines:?}"),
+    };
+    // An alias of the same ComParam, with different and with equal values.
+    refused("CP_BSTx = 1\nCP_BS_TX = 2", "CP_BSTx", "CP_BS_TX");
+    refused("CP_BSTx = 1\nCP_BS_TX = 1", "CP_BSTx", "CP_BS_TX");
+    refused(
+        "CP_STminTx = 1
+CP_STmin_Tx = 1",
+        "CP_STminTx",
+        "CP_STmin_Tx",
+    );
+    // Another case of one name.
+    refused("CP_P2Max = 1000\nCP_P2MAX = 1000", "CP_P2Max", "CP_P2MAX");
+    // Distinct ComParams still parse.
+    parse(&with("CP_BSTx = 1\nCP_STminTx = 2\nCP_P2Max = 3")).unwrap();
+}

@@ -86,20 +86,18 @@ pub(super) fn check_tester_present(class: Class, message: &[u8]) -> Result<(), G
         Class::T0 => Err(GuardRefusal::Frame(
             "T0 sends no ECU-addressed request, so it has no tester-present message",
         )),
-        Class::T1 => Ok(()),
         // The worker sends the message cyclically, so only a TesterPresent request is allowed:
         // anything else (session control included) would repeat with no session grant.
-        Class::T2 | Class::T3 => {
-            read_only(class, message, message.len())?;
-            match message {
-                [0x3E, ..] => Ok(()),
-                _ => Err(GuardRefusal::Request {
-                    class,
-                    sid: message[0],
-                    sub: message.get(1).map(|b| b & 0x7F),
-                }),
-            }
-        }
+        // The ECU is simulated on T1, but a cyclic session change would need teardown state.
+        Class::T1 | Class::T2 | Class::T3 => match message {
+            [0x3E, 0x00 | 0x80] => Ok(()),
+            [] => Err(GuardRefusal::Undecodable("an empty tester-present message")),
+            _ => Err(GuardRefusal::Request {
+                class,
+                sid: message[0],
+                sub: message.get(1).map(|b| b & 0x7F),
+            }),
+        },
     }
 }
 

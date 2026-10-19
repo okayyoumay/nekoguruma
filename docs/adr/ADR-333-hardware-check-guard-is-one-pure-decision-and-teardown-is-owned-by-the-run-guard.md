@@ -76,12 +76,16 @@ present.
    the same bits `j2534-0404-service` decodes), the address and filler ComParams must agree with
    the profile's address and padding, the request and tester-present address modes may be
    functional only with a functional identifier, a tester-present message (which the worker sends cyclically) is
-   a TesterPresent request (`3E 00` or `3E 80`) on T2 and T3, nothing else, session control
-   included; T1 passes it and T0 refuses it, and a ComParam the profile's `[link.comparams]` fixes keeps the
+   a TesterPresent request (`3E 00` or `3E 80`) on T1, T2 and T3, nothing else, session control
+   included (a cyclic session change would need teardown state, also on the simulated ECU); T0
+   refuses it, and a ComParam the profile's `[link.comparams]` fixes keeps the
    profile's value. A ComParam no rule covers passes only if it is on the short list of protocol
    and timing ComParams (session timing, ISO 15765-2 frame timing and flow control, response
    pending handling, tester-present timing; ISO 22900-2 (2022) Annex B) or the profile sets it.
-   Unknown, vendor and other physical-layer names are refused. `COPT_RESTORE_PARAM` is refused on
+   Unknown, vendor and other physical-layer names are refused. The profile check refuses two
+   `[link.comparams]` keys of one canonical name (an alias or another case), whatever their
+   values, so the profile has one value per ComParam; the alias table is shared by the profile
+   check and the guard (`comparam`). `COPT_RESTORE_PARAM` is refused on
    every class, since it would put back ComParams the guard compared with the profile.
 3. **UDS requests and frames.** T1 passes every request undecoded (the ECU is simulated; a
    session change is still reported so it can be undone). T0 sends no ECU-addressed request: only

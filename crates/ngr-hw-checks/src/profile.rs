@@ -566,6 +566,19 @@ fn check_link(link: &Link) -> Result<(), ProfileError> {
             "the ComParam {name:?} is not a ComParam name (`CP_...`)"
         )));
     }
+    // Two spellings of one ComParam (an alias, or another case) cannot both be the profile's
+    // value for it, whatever the values.
+    let keys: Vec<&String> = link.comparams.keys().collect();
+    for (i, a) in keys.iter().enumerate() {
+        if let Some(b) = keys[..i]
+            .iter()
+            .find(|b| crate::comparam::canonical(b) == crate::comparam::canonical(a))
+        {
+            return Err(invalid(format!(
+                "the `link.comparams` keys {b:?} and {a:?} name one ComParam"
+            )));
+        }
+    }
     if let Some(name) = link.comparams.keys().find(|name| {
         PHYSICAL_COMPARAMS
             .iter()

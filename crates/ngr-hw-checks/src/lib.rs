@@ -16,6 +16,7 @@
 //! so `cargo run -p ngr-hw-checks -- list` lists it. The checks run with
 //! `cargo nextest run --profile hardware --run-ignored=only`; CI never runs them.
 
+pub mod comparam;
 pub mod device;
 pub mod guard;
 pub mod open;

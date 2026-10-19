@@ -71,7 +71,7 @@ does not take. A T3 profile can add nothing.
 | `id_bits` | 11 or 29; every identifier must fit |
 | `addressing` | `"normal"`, `"extended"` or `"mixed"`; the last two need an `address` byte |
 | `padding` | The padding byte; absent for no padding |
-| `[link.comparams]` | The transport ComParams by name (`CP_...`). The physical layer (the bus type ComParams of ISO 22900-2 (2022) Annex B.3.2, such as `CP_Baudrate`, `CP_CANFDBaudrate` or `CP_TerminationType`, in any case) comes from the keys above and is refused here |
+| `[link.comparams]` | The transport ComParams by name (`CP_...`). Two keys that name one ComParam (the same name in another case, or an alias such as `CP_BSTx` and `CP_BS_TX`, which the guard resolves to one canonical name) are refused, whatever their values. The physical layer (the bus type ComParams of ISO 22900-2 (2022) Annex B.3.2, such as `CP_Baudrate`, `CP_CANFDBaudrate` or `CP_TerminationType`, in any case) comes from the keys above and is refused here |
 
 `[[hardware-control]]`, by `kind`, each with a `name` that checks refer to:
 
@@ -207,7 +207,7 @@ Anything it cannot classify is refused.
   fronts, and a link is created only for an endpoint on it (on a T0 of two VCIs each worker's
   context binds its own end). `SetComParam` and the ComParams of `SetUniqueRespIdTable` keep the profile's values:
   `CP_Baudrate`, the identifiers, the CAN ID format (ISO 22900-2 (2022) Table B.13 and B.14), the
-  address byte and the padding; a `CP_TesterPresentMessage` on T2 and T3 may only be a
+  address byte and the padding; a `CP_TesterPresentMessage` on T1, T2 and T3 may only be a
   TesterPresent request (`3E 00` or `3E 80`), since the worker sends it cyclically; other physical-layer ComParams are refused; functional
   addressing needs a `functional_id`; a `[link.comparams]` entry keeps its value. The rules are an
   allow-list over canonical names (case folded, the J2534 worker's aliases such as `DATA_RATE`

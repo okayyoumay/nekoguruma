@@ -609,7 +609,7 @@ fn an_alias_of_the_baud_rate_is_compared_like_it() {
 
 #[test]
 fn every_alias_resolves_to_its_canonical_rule() {
-    use super::link::{ALIASES, canonical};
+    use crate::comparam::{ALIASES, canonical};
     // A profile that sets padding, a functional id and an address, so the rules have values.
     let env = Env::linked(
         profile_with(
@@ -854,14 +854,19 @@ fn a_tester_present_message_is_judged_as_a_request() {
     );
     assert!(set(&t3, alias).is_err());
     assert!(set(&t3, unum("CP_TesterPresentMessage", 0x3E)).is_err());
-    // T1's ECU is simulated; T0 has no ECU to address.
-    assert!(
-        set(
-            &Env::linked(profile("T1"), false),
-            message(&[0x2E, 1, 2, 3])
-        )
-        .is_ok()
-    );
+    // The same on T1 (a cyclic session change would need teardown state); T0 has no ECU to
+    // address.
+    let t1 = Env::linked(profile("T1"), false);
+    assert!(set(&t1, message(&[0x3E, 0x00])).is_ok());
+    assert!(set(&t1, message(&[0x3E, 0x80])).is_ok());
+    for other in [
+        &[0x10, 0x02][..],
+        &[0x2E, 0xF1, 0x90, 0x01],
+        &[0x3E, 0x01],
+        &[],
+    ] {
+        assert!(set(&t1, message(other)).is_err(), "{other:02x?}");
+    }
     assert!(set(&Env::linked(loopback(), false), message(&[0x3E, 0x80])).is_err());
 }
 

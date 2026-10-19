@@ -92,7 +92,11 @@ present.
    profile's value. A ComParam no rule covers passes only if it is on the short list of protocol
    and timing ComParams (session timing, ISO 15765-2 frame timing and flow control, response
    pending handling, tester-present timing; ISO 22900-2 (2022) Annex B) or the profile sets it.
-   Unknown, vendor and other physical-layer names are refused. The profile check compares
+   Unknown, vendor and other physical-layer names are refused. The profile accepts in `[link.comparams]` only what the guard can enforce: a numeric
+   ComParam of the short list above (byte fields, the ComParams the typed fields give, physical
+   names and unknown or vendor names are refused at parse, naming the key and the typed field to
+   use), so every pinned entry is compared with its value and required before connect. The
+   profile check compares
    physical-layer names canonically too, so an alias such as `CP_Bit_Sample_Point` is refused
    like `CP_BitSamplePoint`. The profile check refuses two
    `[link.comparams]` keys of one canonical name (an alias or another case), whatever their

@@ -74,3 +74,86 @@ pub fn canonical(name: &str) -> String {
         .find(|(alias, _)| *alias == lower)
         .map_or(lower, |(_, canonical)| (*canonical).to_owned())
 }
+
+/// Protocol and timing ComParams that pass without a rule against the profile, and the only ones
+/// a profile may pin in `[link.comparams]` (canonical, lowercase): what the agent's link sets (`CP_P2Max`, `CP_P2Star`, the 0x78 response-pending
+/// handling) and the UDS-on-CAN timing, flow control and tester-present ComParams a read-only
+/// check may set, by the names of ISO 22900-2 (2022) Annex B (B.3 on the timing, error handling
+/// and tester-present classes, and the transport layer of ISO 15765-2 (2024) clause 10). The
+/// ComParams with a rule (identifiers, formats, addresses, filler, address modes, the
+/// tester-present message, the baud rate) are not here, and neither is anything else: a name
+/// that is on no list is refused.
+pub const ALLOWED: &[&str] = &[
+    // Session timing.
+    "cp_p2max",
+    "cp_p2star",
+    "cp_p2max_ecu",
+    "cp_p2star_ecu",
+    "cp_p3phys",
+    "cp_p3func",
+    "cp_cyclicresptimeout",
+    // ISO 15765-2 frame timing and flow control.
+    "cp_ar",
+    "cp_ar_ecu",
+    "cp_as",
+    "cp_as_ecu",
+    "cp_br",
+    "cp_br_ecu",
+    "cp_bs",
+    "cp_bs_ecu",
+    "cp_cr",
+    "cp_cr_ecu",
+    "cp_cs",
+    "cp_cs_ecu",
+    "cp_blocksize",
+    "cp_blocksize_ecu",
+    "cp_blocksizeoverride",
+    "cp_stmin",
+    "cp_stmin_ecu",
+    "cp_stminoverride",
+    "cp_canmaxnumwaitframes",
+    // Response pending handling.
+    "cp_rc78handling",
+    "cp_rc78completiontimeout",
+    "cp_rcbyteoffset",
+    // Tester present timing and handling (the message and address mode have rules).
+    "cp_testerpresenttime",
+    "cp_testerpresenthandling",
+    "cp_testerpresentreqrsp",
+    "cp_testerpresentexpposresp",
+    "cp_testerpresentexpnegresp",
+    "cp_testerpresentsendtype",
+    "cp_testerpresentimmed",
+];
+
+/// The ComParams of [`ALLOWED`] whose value is not a number (byte fields): a `SetComParam` may
+/// set them, but a profile cannot pin one with an integer.
+pub const NON_NUMERIC: &[&str] = &["cp_testerpresentexpposresp", "cp_testerpresentexpnegresp"];
+
+/// Whether a profile's `[link.comparams]` may pin this canonical name: a numeric ComParam on the
+/// allow-list, which the guard compares and requires.
+pub fn profile_may_pin(canonical: &str) -> bool {
+    ALLOWED.contains(&canonical) && !NON_NUMERIC.contains(&canonical)
+}
+
+/// The profile key that gives a ComParam the guard derives from the typed fields, by canonical
+/// name.
+pub fn typed_field(canonical: &str) -> Option<&'static str> {
+    Some(match canonical {
+        "cp_baudrate" => "`baud_rate`",
+        "cp_canphysreqid" => "`request_id`",
+        "cp_canrespusdtid" | "cp_canrespuudtid" => "`response_id`",
+        "cp_canfuncreqid" => "`functional_id`",
+        "cp_canphysreqformat"
+        | "cp_canfuncreqformat"
+        | "cp_canrespusdtformat"
+        | "cp_canrespuudtformat" => "`id_bits` and `addressing`",
+        "cp_canphysreqextaddr"
+        | "cp_canfuncreqextaddr"
+        | "cp_canrespusdtextaddr"
+        | "cp_canrespuudtextaddr" => "`address`",
+        "cp_canfillerbyte" | "cp_canfillerbytehandling" => "`padding`",
+        "cp_requestaddrmode" | "cp_testerpresentaddrmode" => "`functional_id`",
+        _ => return None,
+    })
+}

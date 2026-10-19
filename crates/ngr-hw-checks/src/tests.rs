@@ -612,3 +612,34 @@ fn an_alias_of_a_physical_comparam_is_refused_like_its_name() {
         }
     }
 }
+
+#[test]
+fn only_comparams_the_guard_can_enforce_are_pinned_in_the_profile() {
+    let with = |line: &str| t1("").replacen("CP_STmin = 0", line, 1);
+    let refused = |line: &str, says: &str| match parse(&with(line)) {
+        Err(ProfileError::Invalid(message)) => {
+            assert!(
+                message.contains(line.split(' ').next().unwrap()) && message.contains(says),
+                "{message} does not name the key and say {says:?}"
+            )
+        }
+        other => panic!("{other:?}: expected a refusal for {line:?}"),
+    };
+    // A byte field cannot be pinned with an integer.
+    refused("CP_TesterPresentMessage = 0", "cannot be pinned");
+    refused("CP_TesterPresentExpPosResp = 0", "cannot be pinned");
+    // Typed fields have their own keys.
+    refused("CP_Baudrate = 500000", "baud_rate");
+    refused("DATA_RATE = 500000", "CP_");
+    refused("CP_CanPhysReqId = 2016", "request_id");
+    refused("CP_CanFillerByteHandling = 1", "padding");
+    refused("CP_RequestAddrMode = 1", "functional_id");
+    // Unknown and vendor names.
+    refused("CP_VendorSpecific = 1", "cannot be pinned");
+    // A timing ComParam still parses, in any spelling the guard resolves.
+    let profile = parse(&with("CP_P2Max = 1000\nCP_BSTx = 3")).unwrap();
+    let Setup::Link { link, .. } = &profile.setup else {
+        unreachable!()
+    };
+    assert_eq!(link.comparams["CP_P2Max"], 1000);
+}

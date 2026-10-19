@@ -586,9 +586,28 @@ fn check_link(link: &Link) -> Result<(), ProfileError> {
             .iter()
             .any(|p| crate::comparam::canonical(p) == canonical)
     }) {
+        let given = crate::comparam::typed_field(&crate::comparam::canonical(name))
+            .map_or_else(|| "keys".to_owned(), |field| format!("{field} key"));
         return Err(invalid(format!(
-            "the ComParam {name:?} is physical-layer; the `link`'s own keys give it"
+            "the ComParam {name:?} is physical-layer; the `link`'s own {given} gives it"
         )));
+    }
+    // Only what the guard can enforce, as a number: it compares the value and requires it before
+    // the link connects.
+    for name in link.comparams.keys() {
+        let canonical = crate::comparam::canonical(name);
+        if crate::comparam::profile_may_pin(&canonical) {
+            continue;
+        }
+        return Err(invalid(match crate::comparam::typed_field(&canonical) {
+            Some(field) => format!(
+                "the ComParam {name:?} is given by the `link`'s own {field}, not by `comparams`"
+            ),
+            None => format!(
+                "the ComParam {name:?} cannot be pinned in `comparams`: only numeric protocol and \
+                 timing ComParams the guard enforces can"
+            ),
+        }));
     }
     Ok(())
 }

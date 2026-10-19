@@ -12,7 +12,7 @@ use vci_service_interface::{
 };
 
 use super::{Context, Grant, GuardRefusal, uds};
-use crate::comparam::canonical;
+use crate::comparam::{ALLOWED, canonical};
 use crate::profile::{Addressing, Class, Link, PHYSICAL_COMPARAMS, channel_key};
 
 /// The bus type the agent names a CAN link's resource by (ISO 22900-2 (2022) Annex B.1).
@@ -261,57 +261,6 @@ fn format_matches(raw: u32, link: &Link, usdt: bool) -> Result<(), String> {
     Ok(())
 }
 
-/// Protocol and timing ComParams that pass without a rule against the profile (canonical,
-/// lowercase): what the agent's link sets (`CP_P2Max`, `CP_P2Star`, the 0x78 response-pending
-/// handling) and the UDS-on-CAN timing, flow control and tester-present ComParams a read-only
-/// check may set, by the names of ISO 22900-2 (2022) Annex B (B.3 on the timing, error handling
-/// and tester-present classes, and the transport layer of ISO 15765-2 (2024) clause 10). The
-/// ComParams with a rule (identifiers, formats, addresses, filler, address modes, the
-/// tester-present message, the baud rate) are not here, and neither is anything else: a name
-/// that is on no list is refused.
-const ALLOWED: &[&str] = &[
-    // Session timing.
-    "cp_p2max",
-    "cp_p2star",
-    "cp_p2max_ecu",
-    "cp_p2star_ecu",
-    "cp_p3phys",
-    "cp_p3func",
-    "cp_cyclicresptimeout",
-    // ISO 15765-2 frame timing and flow control.
-    "cp_ar",
-    "cp_ar_ecu",
-    "cp_as",
-    "cp_as_ecu",
-    "cp_br",
-    "cp_br_ecu",
-    "cp_bs",
-    "cp_bs_ecu",
-    "cp_cr",
-    "cp_cr_ecu",
-    "cp_cs",
-    "cp_cs_ecu",
-    "cp_blocksize",
-    "cp_blocksize_ecu",
-    "cp_blocksizeoverride",
-    "cp_stmin",
-    "cp_stmin_ecu",
-    "cp_stminoverride",
-    "cp_canmaxnumwaitframes",
-    // Response pending handling.
-    "cp_rc78handling",
-    "cp_rc78completiontimeout",
-    "cp_rcbyteoffset",
-    // Tester present timing and handling (the message and address mode have rules).
-    "cp_testerpresenttime",
-    "cp_testerpresenthandling",
-    "cp_testerpresentreqrsp",
-    "cp_testerpresentexpposresp",
-    "cp_testerpresentexpnegresp",
-    "cp_testerpresentsendtype",
-    "cp_testerpresentimmed",
-];
-
 /// Checks one ComParam a check sets, by its name or by the id the harness learned for it.
 pub(super) fn check_param(
     ctx: &Context<'_>,
@@ -413,8 +362,8 @@ pub(super) fn check_param(
             };
             uds::check_tester_present(ctx.profile.class, message)?;
         }
-        // A protocol or timing ComParam on the allow-list, or one the profile itself sets.
-        other if ALLOWED.contains(&other) || fixed.is_some() => {}
+        // A protocol or timing ComParam on the allow-list (what a profile may fix is on it too).
+        other if ALLOWED.contains(&other) => {}
         _ => {
             return Err(wrong(
                 "is not a ComParam the guard knows; unknown and vendor ComParams are refused",

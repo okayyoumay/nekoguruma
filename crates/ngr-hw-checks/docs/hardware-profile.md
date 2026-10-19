@@ -213,11 +213,17 @@ panic, the write error goes to stderr so it does not hide the check's own failur
   On Windows the files take the ACLs of the user's profile, which by default only that user and
   administrators can read; the harness sets no ACL.
 - **Masking.** Unless the profile sets `report_full_identifiers`, a masked value is `****` and its
-  last 4 characters (all of a value shorter than 8 characters is replaced by `****`). Masked are
-  every VIN-shaped token (17 letters and digits with at least one digit, whether or not its check
-  digit holds) in any text, the values of the module name's attributes whose name contains
-  "serial", a D-PDU API module name that has no attributes (a device name or a serial number),
-  and the profile's D-PDU API `module` wherever it occurs in a message. A J2534 module name is a
-  configured label and is kept. A check that writes its own free text goes through
-  `Report::masker()`. Masking is a heuristic: a serial number in a form none of these rules
-  covers stays in the report, so read a report before sharing it.
+  last 4 characters (all of a value shorter than 8 characters is replaced by `****`). In free text
+  (the host name, the OS description, check messages and what the device reports) every
+  serial-like token is masked: a run of letters, digits, `-` and `_` that holds at least 8
+  letters and digits, one of them a digit. That covers every VIN and serial numbers in forms such
+  as `SN-1234567890`, whether or not the profile names them; a hexadecimal literal (`0x7E8`), or a
+  run of them joined by `-` or `_`, is kept as a code. Masked too are the values of the module
+  name's attributes whose name contains "serial", a D-PDU API module name that has no attributes
+  (a device name or a serial number), and the profile's D-PDU API `module` wherever it occurs.
+  Names the profile gives (the library, and the configured label that is a J2534 module name)
+  are kept, except for a VIN-shaped token (17 letters and digits, one of them a digit) or a known
+  module in them. A check that writes its own free text goes through `Report::masker()`. Masking
+  is a heuristic both ways: it also masks other long codes written without `0x`, such as a 29-bit
+  CAN identifier, and a serial number in a form none of these rules covers stays in the report,
+  so read a report before sharing it.

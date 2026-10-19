@@ -68,9 +68,11 @@ fn a_vin_in_free_text_is_masked() {
     let masked = masker.text(&format!("read {VIN}, then (VIN={VIN})"));
     assert!(!masked.contains(VIN), "{masked}");
     assert_eq!(masked, "read ****6752, then (VIN=****6752)");
-    // Not VIN-shaped: 16 characters, 17 letters only.
-    assert_eq!(masker.text("WVWZZZ1JZ3W38675"), "WVWZZZ1JZ3W38675");
+    // Not an identifier: letters only.
     assert_eq!(masker.text("ABCDEFGHJKLMNPRST"), "ABCDEFGHJKLMNPRST");
+    // A name keeps everything but a VIN: 16 characters are not one.
+    assert_eq!(masker.name("WVWZZZ1JZ3W38675"), "WVWZZZ1JZ3W38675");
+    assert_eq!(masker.name(&format!("lib {VIN}")), "lib ****6752");
 }
 
 #[test]
@@ -507,4 +509,51 @@ fn a_serial_inside_a_longer_one_does_not_expose_the_longer_one() {
     let masker = Masker::with_known(false, vec!["1234".into(), "VEHICLE-UNIT-1234".into()]);
     let masked = masker.text("module VEHICLE-UNIT-1234 ready");
     assert!(!masked.contains("VEHICLE-UNIT"), "{masked}");
+}
+
+#[test]
+fn a_serial_the_profile_does_not_name_is_masked_in_free_text() {
+    // A J2534 profile names no serial number, and a check may still write one.
+    let profile = profile("j2534-0404", "");
+    let mut report = Report::with_host(&profile, "SN-1234567890", Some("bench AB12CD34EF"));
+    report.record(
+        "hw_x",
+        Outcome::Failed,
+        "device SN_9876543210 (serial 12345678) answered 0x7E8",
+    );
+    let text = report.to_toml().unwrap();
+    for serial in ["1234567890", "9876543210", "12345678", "AB12CD34EF"] {
+        assert!(!text.contains(serial), "{serial}: {text}");
+    }
+    assert!(text.contains("****7890"), "{text}");
+    assert!(text.contains("answered 0x7E8"), "{text}");
+}
+
+#[test]
+fn codes_and_short_numbers_are_not_serial_numbers() {
+    let masker = Masker::for_profile(&profile("j2534-0404", ""));
+    for kept in [
+        "status 0x00000007",
+        "ids 0x18DA10F1-0x18DAF110",
+        "500000 baud on pins 6_14",
+        "PDU_ERR_FCT_FAILED",
+        "version 04.04.12",
+    ] {
+        assert_eq!(masker.text(kept), kept);
+    }
+}
+
+#[test]
+fn a_library_and_a_j2534_label_keep_their_names() {
+    let profile = profile("j2534-0404", "");
+    let masker = Masker::for_profile(&profile);
+    assert_eq!(masker.name("op20pt32"), "op20pt32");
+    assert_eq!(
+        masker.module_name(Api::J2534V0404, "bench-vci-01"),
+        "bench-vci-01"
+    );
+    let mut report = Report::new(&profile);
+    let library = vci(&profile).library.clone();
+    report.add_device(vci(&profile), Abi::WinX86, &module("bench"), &version());
+    assert_eq!(report.devices[0].vendor, library);
 }

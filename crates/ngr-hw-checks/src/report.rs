@@ -143,9 +143,24 @@ impl Masker {
         }
     }
 
-    /// Free text with every VIN-shaped token (17 letters and digits with at least one digit,
-    /// whether or not the check digit holds) and every known serial number masked.
+    /// Free text with every serial-like token and every known serial number masked. A
+    /// serial-like token is a run of letters, digits, `-` and `_` that holds at least 8 letters
+    /// and digits, one of them a digit: it covers every VIN (17 letters and digits, whether or
+    /// not the check digit holds) and serial numbers such as `SN-1234567890`. A hexadecimal
+    /// literal (`0x` and hexadecimal digits only), or a run of them joined by `-` or `_`, is a
+    /// code, not a serial number, and is kept.
     pub fn text(&self, text: &str) -> String {
+        self.mask(text, true)
+    }
+
+    /// A name the profile gives, such as a library or a configured J2534 label: only the known
+    /// serial numbers and VIN-shaped tokens (17 letters and digits, one of them a digit) in it
+    /// are masked, so that a library named like `op20pt32` stays readable.
+    pub fn name(&self, name: &str) -> String {
+        self.mask(name, false)
+    }
+
+    fn mask(&self, text: &str, serial_like: bool) -> String {
         if self.full {
             return text.to_owned();
         }
@@ -153,10 +168,12 @@ impl Masker {
         for serial in &self.known {
             text = text.replace(serial.as_str(), &Self::mask_value(serial));
         }
+        let is_part =
+            |c: char| c.is_ascii_alphanumeric() || (serial_like && (c == '-' || c == '_'));
         let mut out = String::with_capacity(text.len());
         let mut token = String::new();
         let flush = |token: &mut String, out: &mut String| {
-            if token.len() == 17 && token.bytes().any(|b| b.is_ascii_digit()) {
+            if Self::is_identifier(token, serial_like) {
                 out.push_str(&Self::mask_value(token));
             } else {
                 out.push_str(token);
@@ -164,7 +181,7 @@ impl Masker {
             token.clear();
         };
         for c in text.chars() {
-            if c.is_ascii_alphanumeric() {
+            if is_part(c) {
                 token.push(c);
             } else {
                 flush(&mut token, &mut out);
@@ -175,16 +192,37 @@ impl Masker {
         out
     }
 
+    /// Whether `token` is a VIN or, with `serial_like`, looks like a serial number.
+    fn is_identifier(token: &str, serial_like: bool) -> bool {
+        let alphanumeric = token.bytes().filter(u8::is_ascii_alphanumeric).count();
+        if !token.bytes().any(|b| b.is_ascii_digit()) {
+            return false;
+        }
+        if !serial_like {
+            return alphanumeric == 17 && alphanumeric == token.len();
+        }
+        // A run of hexadecimal literals, such as `0x7E0-0x7E8`, is codes, not a serial number.
+        let hex_literals = token.split(['-', '_']).all(|part| {
+            part.strip_prefix("0x")
+                .or_else(|| part.strip_prefix("0X"))
+                .is_some_and(|digits| {
+                    !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_hexdigit())
+                })
+        });
+        alphanumeric >= 8 && !hex_literals
+    }
+
     /// A module's `vendor_module_name`. For the D-PDU API a list of `attribute='value'` pairs
     /// has each value masked whose attribute name contains "serial" (any case), and text that is
-    /// no such list is a device name or a serial number and is masked whole. A J2534 name is the
-    /// label of a configured entry, not a serial number, and is masked as free text.
+    /// no such list is a device name or a serial number and is masked whole; the result is then
+    /// masked as free text. A J2534 name is the label of a configured entry, not a serial
+    /// number, and is masked as a [name](Self::name).
     pub fn module_name(&self, api: Api, name: &str) -> String {
         if self.full {
             return name.to_owned();
         }
         let masked = match api {
-            Api::J2534V0404 => name.to_owned(),
+            Api::J2534V0404 => return self.name(name),
             Api::Iso22900 if attribute_values(name).is_empty() => {
                 if name.trim().is_empty() {
                     String::new()
@@ -340,10 +378,12 @@ impl Report {
         };
         self.devices.push(DeviceInfo {
             abi: abi.name().to_owned(),
-            vendor: self.masker.text(match vci.api {
-                Api::Iso22900 if !version.vendor_name.trim().is_empty() => &version.vendor_name,
-                _ => &vci.library,
-            }),
+            vendor: match vci.api {
+                Api::Iso22900 if !version.vendor_name.trim().is_empty() => {
+                    self.masker.text(&version.vendor_name)
+                }
+                _ => self.masker.name(&vci.library),
+            },
             model: match vci.api {
                 Api::Iso22900 if !version.hw_name.trim().is_empty() => {
                     self.masker.text(&version.hw_name)

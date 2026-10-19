@@ -60,12 +60,13 @@ use vci_service_interface::{
     GetObjectIdRequest, GetResourceIdsRequest, GetResourceStatusRequest, GetStatusRequest,
     GetTimestampRequest, GetUniqueRespIdTableRequest, GetVersionRequest, IoCtlRequest,
     IoCtlResponse, LockResourceRequest, ModuleDisconnectRequest, ModuleHandle, ModuleIdsResponse,
-    ObjectIdResponse, ObjectType, ParamItem, PduComPrimitiveStatus, PduErrorEvent, PduParamClass,
-    PinData, ResourceData, ResourceIdsResponse, ResourceStatusResponse, SetComParamRequest,
-    SetUniqueRespIdTableRequest, StartComPrimitiveRequest, StatusResponse, SubscribeEventRequest,
-    TimestampResponse, UniqueRespIdTableItem, UniqueRespIdTableResponse, UnlockResourceRequest,
-    VersionResponse, create_com_logical_link_request, event_item, event_notification,
-    io_ctl_request, param_item, pin_data, resource_data, subscribe_event_request,
+    ObjectIdResponse, ObjectType, ParamItem, PduComPrimitiveStatus, PduError, PduErrorEvent,
+    PduParamClass, PinData, ResourceData, ResourceIdsResponse, ResourceStatusResponse,
+    SetComParamRequest, SetUniqueRespIdTableRequest, StartComPrimitiveRequest, StatusResponse,
+    SubscribeEventRequest, TimestampResponse, UniqueRespIdTableItem, UniqueRespIdTableResponse,
+    UnlockResourceRequest, VersionResponse, create_com_logical_link_request, event_item,
+    event_notification, io_ctl_request, param_item, pin_data, resource_data,
+    subscribe_event_request,
 };
 use worker_host::client::WorkerClient;
 use worker_host::service::Stopped;
@@ -284,7 +285,9 @@ impl Shared {
             learned: &state.learned,
         };
         let decision = decide(&ctx, request);
-        if let (true, Some(trace)) = (record, &state.trace) {
+        // A first look records only a refusal: the request is not decided again when it is
+        // refused, and a granted one is recorded when it is sent.
+        if let (true, Some(trace)) = (record || decision.is_err(), &state.trace) {
             trace
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -505,6 +508,32 @@ impl Shared {
         Ok(())
     }
 
+    /// Cancels a primitive the handle never saw end, which may well have ended. The J2534
+    /// worker answers a cancel of an ended primitive with success; a worker that names the
+    /// handle as invalid in the error detail (`PDU_ERR_INVALID_HANDLE`, as `j2534-0404-service`
+    /// does for a forgotten one and `iso22900-service` passes on from the vendor library) has
+    /// nothing left to cancel either, and that is success too. Any other failure is returned.
+    async fn cancel_maybe_ended(
+        &self,
+        client: &mut WorkerClient,
+        cop: ComPrimitiveHandle,
+    ) -> Result<(), HandleError> {
+        let cancel = CancelComPrimitiveRequest {
+            cop_handle: Some(cop),
+        };
+        self.admit(&Request::CancelComPrimitive(&cancel))?;
+        let timeout = self.options.request_timeout;
+        match tokio::time::timeout(timeout, client.cancel_com_primitive(cancel)).await {
+            Err(_) => Err(HandleError::Timeout {
+                call: "CancelComPrimitive",
+                timeout,
+            }),
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(status)) if names_invalid_handle(&status) => Ok(()),
+            Ok(Err(status)) => Err(worker_error("CancelComPrimitive", &status)),
+        }
+    }
+
     /// Cancels everything outstanding on `cll`: the primitive a dropped wait left running and
     /// every primitive started through the handle that it has not seen end. Tries all, and
     /// returns the first failure.
@@ -520,7 +549,7 @@ impl Shared {
             .remove(&cll.cll_handle)
             .unwrap_or_default();
         for (index, cop) in started.iter().enumerate() {
-            if let Err(error) = self.cancel(client, *cop).await {
+            if let Err(error) = self.cancel_maybe_ended(client, *cop).await {
                 // Still outstanding: this one and the rest not yet tried.
                 self.lock()
                     .started
@@ -943,6 +972,13 @@ fn is_definite_refusal(code: tonic::Code) -> bool {
             | AlreadyExists
             | Unauthenticated
     )
+}
+
+/// Whether a status says, in its error detail, that a handle is invalid (unknown, or forgotten
+/// after the primitive ended).
+fn names_invalid_handle(status: &tonic::Status) -> bool {
+    vci_service_interface::error_detail_from_status(status)
+        .is_some_and(|detail| detail.pdu_error == PduError::PduErrInvalidHandle as i32)
 }
 
 /// The error of a failed worker call, by whether the worker rejected the request.
@@ -1814,7 +1850,9 @@ impl GuardedHandle {
     /// The decision on a request the handle never sends (the harness owns the module), for the
     /// trace; always a refusal.
     pub(super) fn decide_module_request(&self, request: &Request<'_>) -> HandleError {
-        match self.shared.admit(request) {
+        // Nothing is sent for a granted one, so only a refusal is recorded: the trace keeps
+        // matching what the worker received.
+        match self.shared.check(request) {
             Err(error) => error,
             Ok(_) => HandleError::Setup(format!("{} is not offered by the handle", request.rpc())),
         }
@@ -2229,12 +2267,17 @@ impl GuardedHandle {
         drop(provisional);
         let response = sent?;
         if let (Some(cll), Some(cop)) = (cll, response.cop_handle) {
-            self.shared
-                .lock()
-                .started
-                .entry(cll.cll_handle)
-                .or_default()
-                .push(cop);
+            let mut state = self.shared.lock();
+            let started = state.started.entry(cll.cll_handle).or_default();
+            if self.shared.subscribes {
+                started.push(cop);
+            } else {
+                // The handle does not read this link's events (a job does), so it never sees a
+                // primitive end and would cancel every one a long job started, one request each,
+                // at the disconnect. Only the latest is kept: cancelling it stops what may still
+                // run, and the link's disconnect ends the rest.
+                *started = vec![cop];
+            }
         }
         // The staged timings are in effect once the update has finished successfully; until
         // then (and when it fails, which is returned) the longer of the two is waited for.

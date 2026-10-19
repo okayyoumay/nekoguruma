@@ -355,9 +355,17 @@ pub(crate) async fn open_tracked<C: WorkerApi>(
     let cll_handle = match create_link(client, config, deadline, module_handle).await {
         Ok(cll_handle) => cll_handle,
         Err(error) => {
-            let cleaned_up = disconnect_module(client, module_handle, deadline)
-                .await
-                .is_ok();
+            // A module the client holds is not disconnected here, so that proves nothing: the
+            // failed create left nothing behind only when the worker refused it. A create that
+            // timed out or failed otherwise may have made a link nobody holds a handle for
+            // (ADR-258).
+            let cleaned_up = if client.held_module().is_some() {
+                nothing_created(&error)
+            } else {
+                disconnect_module(client, module_handle, deadline)
+                    .await
+                    .is_ok()
+            };
             return Err(OpenFailure { error, cleaned_up });
         }
     };
@@ -430,6 +438,31 @@ async fn open_module<C: WorkerApi>(
         return Err(OpenFailure { error, cleaned_up });
     }
     Ok(module_handle)
+}
+
+/// Whether a failed `CreateComLogicalLink` created nothing: the worker (or the guard in front of
+/// it, as `PermissionDenied`) refused the request, or there was no resource to create it on. A
+/// timeout or any other status does not say.
+fn nothing_created(error: &HostError) -> bool {
+    use tonic::Code::{
+        AlreadyExists, FailedPrecondition, InvalidArgument, NotFound, PermissionDenied,
+        ResourceExhausted, Unauthenticated, Unimplemented,
+    };
+    match error {
+        HostError::Rpc { status, .. } => matches!(
+            status.code(),
+            PermissionDenied
+                | InvalidArgument
+                | FailedPrecondition
+                | NotFound
+                | ResourceExhausted
+                | Unimplemented
+                | AlreadyExists
+                | Unauthenticated
+        ),
+        HostError::Setup(_) => true,
+        _ => false,
+    }
 }
 
 /// What a job may send through this module (ADR-247). A debug build asks the worker which VCI

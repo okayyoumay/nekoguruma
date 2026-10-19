@@ -7,7 +7,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use agent::guards::{GuardSetup, JobGuards};
-use agent::{HostError, JobError, JobLimits, LinkConfig, run_program};
+#[cfg(debug_assertions)]
+use agent::{HostError, JobError};
+use agent::{JobLimits, LinkConfig, run_program};
 use diag_ir::{IR_SCHEMA_VERSION, Op, Program};
 use tokio::sync::mpsc;
 use tonic::codegen::tokio_stream::wrappers::ReceiverStream;
@@ -355,6 +357,7 @@ fn guards() -> JobGuards {
     take_guards(false)
 }
 
+#[cfg(debug_assertions)]
 fn guards_with_writes() -> JobGuards {
     take_guards(true)
 }
@@ -498,6 +501,75 @@ async fn a_read_only_job_passes_the_guard_on_every_call() {
     assert!(run.run_teardown().is_empty());
     let after = fake.log.lock().unwrap().clone();
     assert_eq!(after.iter().filter(|e| *e == "ModuleDisconnect").count(), 1);
+}
+
+/// A long job starts many primitives, none of whose events the handle reads: the guarded
+/// disconnect cancels at most one (the latest), not one per primitive inside the runner's
+/// deadline.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_job_with_many_primitives_costs_one_cancel_at_the_disconnect() {
+    let Setup_ {
+        fake,
+        client,
+        mut run,
+        ..
+    } = setup().await;
+    let many = Program {
+        code: (0..50)
+            .flat_map(|_| [Op::PushBytes(0), Op::ServiceRequest { service: 0x22 }])
+            .collect(),
+        ..program(0x22)
+    };
+    let (result, _guards) = run_program(
+        client.clone(),
+        &LinkConfig::iso15765(0x7E0, 0x7E8),
+        many,
+        JobLimits::default(),
+        guards(),
+    )
+    .await;
+    result.expect("the reads pass the guard");
+    let log = fake.log.lock().unwrap().clone();
+    let count = |prefix: &str| log.iter().filter(|e| e.starts_with(prefix)).count();
+    assert_eq!(count("StartComPrimitive"), 50);
+    assert_eq!(count("CancelComPrimitive"), 1, "{log:#?}");
+    // And the trace still matches what the worker saw.
+    assert_eq!(rpc_names(&log), granted(&client.trace()));
+    run.pass();
+    assert!(run.run_teardown().is_empty());
+}
+
+/// A job that asks for the module it does not own is refused, and the refusal (not a grant, since
+/// nothing is sent) is what the trace records.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_module_request_of_a_job_is_refused_and_traced_as_a_refusal() {
+    use agent::client::WorkerApi;
+    let Setup_ {
+        fake,
+        mut client,
+        mut run,
+        ..
+    } = setup().await;
+    let connect = client
+        .module_connect(vci::ModuleConnectRequest {
+            module_handle: Some(ModuleHandle { module_handle: 1 }),
+        })
+        .await;
+    assert_eq!(connect.unwrap_err().code(), tonic::Code::PermissionDenied);
+    // Granted for the held module's own handle, but nothing is sent, so nothing is recorded.
+    let disconnect = client
+        .module_disconnect(vci::ModuleDisconnectRequest {
+            module_handle: Some(ModuleHandle { module_handle: 1 }),
+        })
+        .await;
+    assert!(disconnect.is_err());
+    assert!(fake.log.lock().unwrap().is_empty());
+    let trace = client.trace().lock().unwrap().clone();
+    assert_eq!(trace.len(), 1, "{trace:?}");
+    assert_eq!(trace[0].0, "ModuleConnect");
+    assert!(trace[0].1.is_err());
+    run.pass();
+    assert!(run.run_teardown().is_empty());
 }
 
 /// A write is refused by the guard before it reaches the worker, for a VCI the agent's own

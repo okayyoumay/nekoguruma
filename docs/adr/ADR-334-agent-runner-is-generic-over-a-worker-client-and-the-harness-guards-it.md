@@ -63,7 +63,24 @@ nothing else, while the guard refuses a connect until every ComParam the profile
 - The handle cancels the primitives it started and has not seen end before a disconnect or destroy,
   so a job's primitive is cancelled there (the fake and the workers answer a cancel of an ended
   primitive with success).
-- Open items: a multi-module D-PDU worker lists several modules, which the harness's `GetModuleIds`
-  filtering does not handle yet; a hardware check that runs a document job through the agent on T3;
-  29-bit and extended-addressing profiles through the agent (the runner's link set-up supports 11-bit
-  identifiers only).
+- The handle does not read a job's events, so it never sees a job's primitive end. It keeps only the
+  latest primitive per link and cancels that one before a disconnect or destroy (the link's own
+  disconnect ends the rest), so a long job costs one cancel inside the runner's deadline, not one per
+  primitive. A cancel that fails with the error detail `PDU_ERR_INVALID_HANDLE` (what
+  `j2534-0404-service` answers for a primitive it forgot, and what `iso22900-service` passes on from
+  the vendor library as an internal error carrying that detail) is taken as "already ended".
+- A job's own return to the default session (`10 01`) is not observed (its answer arrives on the event
+  stream the job reads, which the client does not wrap), so the guarded disconnect after it sends
+  one more `10 01` to the ECU, within the runner's deadline. Only `send_receive` through the handle
+  keeps the pending return in step.
+- The decision trace is what the worker received plus the refusals: a call the guard refused is
+  recorded and not sent, a module call granted locally is neither recorded nor sent.
+- A failed `CreateComLogicalLink` with a held module marks the job's guards unconfirmed (ADR-258)
+  unless the worker or the guard refused it (a `PermissionDenied` or a status the workers use for
+  refusals); a timeout may have left a link nobody holds a handle for, and the module is not
+  disconnected to clean it.
+- Identifiers and addressing: the runner's own link set-up refuses 29-bit identifiers
+  (`LinkConfig::validate`) and a document-declared link with extended addressing (`declared`); a link
+  built by hand with extended addressing goes through, and the client then appends the profile's
+  extended format and address bytes to the response table. The runner still sets `CP_RCByteOffset` to 2
+  whatever the addressing, which has not been checked against a worker for extended addressing.

@@ -11857,7 +11857,7 @@ def main():
 
     /// A client that holds its module: delegates every call to the real client.
     #[derive(Clone)]
-    struct Held(WorkerClient);
+    struct Held(WorkerClient, Option<tonic::Status>);
 
     macro_rules! delegate {
         ($($name:ident($request:ty) -> $response:ty;)*) => {$(
@@ -11878,7 +11878,6 @@ def main():
             get_version(vci_service_interface::GetVersionRequest) -> vci_service_interface::VersionResponse;
             get_resource_ids(vci_service_interface::GetResourceIdsRequest) -> vci_service_interface::ResourceIdsResponse;
             get_object_id(vci_service_interface::GetObjectIdRequest) -> vci_service_interface::ObjectIdResponse;
-            create_com_logical_link(vci_service_interface::CreateComLogicalLinkRequest) -> vci_service_interface::ComLogicalLinkResponse;
             destroy_com_logical_link(vci_service_interface::DestroyComLogicalLinkRequest) -> vci_service_interface::Response;
             connect_com_logical_link(vci_service_interface::ConnectComLogicalLinkRequest) -> vci_service_interface::Response;
             disconnect_com_logical_link(vci_service_interface::DisconnectComLogicalLinkRequest) -> vci_service_interface::Response;
@@ -11887,6 +11886,22 @@ def main():
             start_com_primitive(vci_service_interface::StartComPrimitiveRequest) -> vci_service_interface::ComPrimitiveResponse;
             subscribe_event(vci_service_interface::SubscribeEventRequest) -> tonic::Streaming<vci_service_interface::EventNotification>;
             io_ctl(vci_service_interface::IoCtlRequest) -> vci_service_interface::IoCtlResponse;
+        }
+
+        fn create_com_logical_link(
+            &mut self,
+            request: vci_service_interface::CreateComLogicalLinkRequest,
+        ) -> impl Future<
+            Output = crate::client::Reply<vci_service_interface::ComLogicalLinkResponse>,
+        > + Send {
+            let refused = self.1.clone();
+            let create = WorkerApi::create_com_logical_link(&mut self.0, request);
+            async move {
+                match refused {
+                    Some(status) => Err(status),
+                    None => create.await,
+                }
+            }
         }
 
         fn held_module(&self) -> Option<ModuleHandle> {
@@ -11906,7 +11921,7 @@ def main():
         ] {
             let (client, calls) = fake_worker_with(fail_disconnect, fail_open).await;
             let (result, mut guards) = run_program(
-                Held(client),
+                Held(client, None),
                 &LinkConfig::iso15765(0x7E0, 0x7E8),
                 program(Vec::new()),
                 JobLimits::default(),
@@ -11923,6 +11938,53 @@ def main():
                 "{tag}: {calls:?}"
             );
             assert!(calls.contains(&"DestroyComLogicalLink"), "{tag}: {calls:?}");
+            guards.worker_gone();
+        }
+    }
+
+    /// A failed create with a held module (ADR-258): a refusal created nothing, so the guards stay
+    /// unmarked; a create that timed out or failed otherwise may have left a link nobody holds a
+    /// handle for, and the module is not disconnected here, so the guards are marked.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_create_with_a_held_module_marks_the_guards_unless_it_was_refused() {
+        for (tag, status, marked) in [
+            (
+                "held-create-denied",
+                tonic::Status::permission_denied("guard"),
+                false,
+            ),
+            (
+                "held-create-invalid",
+                tonic::Status::invalid_argument("worker"),
+                false,
+            ),
+            (
+                "held-create-unavailable",
+                tonic::Status::unavailable("transport"),
+                true,
+            ),
+            (
+                "held-create-internal",
+                tonic::Status::internal("library"),
+                true,
+            ),
+        ] {
+            let (client, calls) = fake_worker(false).await;
+            let (result, mut guards) = run_program(
+                Held(client, Some(status)),
+                &LinkConfig::iso15765(0x7E0, 0x7E8),
+                program(Vec::new()),
+                JobLimits::default(),
+                vci_only_guards(tag),
+            )
+            .await;
+            assert!(
+                matches!(result, Err(JobError::Link(_))),
+                "{tag}: {result:?}"
+            );
+            assert_eq!(guards.link_unconfirmed(), marked, "{tag}");
+            let calls = calls.lock().unwrap().clone();
+            assert!(!calls.contains(&"ModuleDisconnect"), "{tag}: {calls:?}");
             guards.worker_gone();
         }
     }

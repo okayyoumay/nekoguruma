@@ -333,6 +333,14 @@ connection is served by the runtime.
   at link creation (a job's link is not RawMode). `HandleError::Rpc` and `WorkerRefused` carry the
   worker's status code, so a refusal by the worker reaches the runner unchanged, and the lost VCI
   as the status the host recognises.
+  The handle keeps only the latest primitive of a job's link, since it does not read the job's
+  events, and cancels that one before a disconnect or destroy (a cancel answered with an invalid
+  handle counts as already ended). A job's own `10 01` is not observed, so the disconnect after it
+  sends one more. A failed create with a held module marks the job's guards unconfirmed unless the
+  worker or the guard refused it. The runner's link set-up refuses 29-bit identifiers and a
+  document-declared link with extended addressing; a hand-built extended-addressing link works
+  (the client appends the profile's extended format and address bytes), with the runner's
+  `CP_RCByteOffset` of 2 unchanged and unchecked for that addressing.
 - **Links created by a check.** Whatever creates a link through the handle, including a link a
   check destroys and creates again, gets the same per-link set-up: the teardown step, the event
   stream and timings to wait by (the handle's defaults, 1 s, 5 s and 25 s, until the check sets

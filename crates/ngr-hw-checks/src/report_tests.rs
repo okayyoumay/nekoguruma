@@ -47,6 +47,7 @@ fn vci(profile: &Profile) -> &Vci {
 
 fn version() -> ReportedVersion {
     ReportedVersion {
+        vendor_name: String::new(),
         hw_name: "fw 1.2.3".into(),
         fw_name: "dll 4.5.6".into(),
         fw_version: 0x0201_0000,
@@ -135,7 +136,11 @@ fn the_report_has_every_field_and_no_identifier() {
         vci(&profile),
         Abi::LinuxArm64,
         &module("SerialNumber='1234567890'"),
-        &version(),
+        // A D-PDU device that names no hardware falls back to the module name.
+        &ReportedVersion {
+            hw_name: String::new(),
+            ..version()
+        },
     );
     report.record("hw_a", Outcome::Passed, "");
     report.record("hw_b", Outcome::Failed, &format!("VIN {VIN} differs"));
@@ -376,6 +381,7 @@ fn no_text_field_of_a_report_carries_a_vin() {
     let profile = parse(&text).unwrap();
     let mut report = Report::with_host(&profile, VIN, Some(VIN));
     let version = ReportedVersion {
+        vendor_name: String::new(),
         hw_name: format!("fw {VIN}"),
         fw_name: format!("dll {VIN}"),
         ..version()
@@ -384,4 +390,34 @@ fn no_text_field_of_a_report_carries_a_vin() {
     report.record("hw_x", Outcome::Failed, &format!("read {VIN}"));
     let toml = report.to_toml().unwrap();
     assert!(!toml.contains(VIN), "{toml}");
+}
+
+#[test]
+fn a_d_pdu_device_reports_the_vendor_and_model_it_names() {
+    let profile = profile("iso22900", "");
+    let mut report = Report::new(&profile);
+    let version = ReportedVersion {
+        vendor_name: "Acme Diagnostics".into(),
+        hw_name: "Acme Box 7".into(),
+        ..version()
+    };
+    report.set_device(vci(&profile), Abi::WinX86, &module("Acme"), &version);
+    let device = report.device.unwrap();
+    assert_eq!(device.vendor, "Acme Diagnostics");
+    assert_eq!(device.model, "Acme Box 7");
+}
+
+#[test]
+fn a_passing_check_whose_report_cannot_be_written_fails() {
+    let refused = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join("report-guard-test")
+        .join("lost");
+    let profile = profile("j2534-0404", "");
+    let result = std::panic::catch_unwind(|| {
+        let mut run = RunGuard::start_in(&profile, "hw_z", refused.clone());
+        run.pass();
+    });
+    assert!(result.is_err());
+    assert!(!refused.exists());
 }

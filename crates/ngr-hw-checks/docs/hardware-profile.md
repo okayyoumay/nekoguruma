@@ -184,18 +184,21 @@ refused, with a message) and `record_refusal`, adds what the opened device repor
 (`RunGuard::start(&profile, name)`), which writes the report when it is dropped: a check that fails
 by panic still leaves its report, with the check recorded as failed, and so does one that ends
 without recording a result. The test ends with `pass()` or `finish(outcome, message)`.
-`hw_the_profile_permits_a_check` does this. A report that cannot be written is reported on stderr
-and does not hide the check's own failure.
+`hw_the_profile_permits_a_check` does this. A report that cannot be written fails a check
+that would otherwise pass, since every run leaves a report; when the check is already failing by
+panic, the write error goes to stderr so it does not hide the check's own failure.
 
 - **Content (TOML).** `started_at` (UTC, RFC 3339), `host` (the `HOSTNAME` or `COMPUTERNAME`
   variable, else `/etc/hostname`), `os` (the OS and architecture the harness was built for) with
   `os_version` where `/etc/os-release` gives one, `class`, `identifiers_in_full`, a `[device]`
-  table and one `[[check]]` table per result. `[device]` holds `abi` (the worker's), `vendor` (the
-  library the profile names), `model` (the module's `vendor_module_name`), `firmware_version` and
+  table and one `[[check]]` table per result. `[device]` holds `abi` (the worker's), `vendor` and
+  `model`, `firmware_version` and
   `library_version` (J2534: the strings the worker reports; D-PDU API: the coded numbers as
-  `major.minor.revision`). It is absent when no check opened a device. The API offers no
-  separate vendor or model field, so those two are the library name and the module name. No
-  serial-number field is read from the device.
+  `major.minor.revision`). It is absent when no check opened a device. For the D-PDU API,
+  `vendor` and `model` are the vendor and hardware names `GetVersion` reports, falling back to
+  the profile's library and the module's `vendor_module_name` when the library leaves them empty.
+  J2534 reports neither (its worker answers constants), so for J2534 they are the profile's
+  library and the configured label. No serial-number field is read from the device.
 - **Place.** `nekoguruma/hw-reports` in the user's data directory: `$XDG_DATA_HOME` or
   `~/.local/share` on Linux, `~/Library/Application Support` on macOS, `%LOCALAPPDATA%` on
   Windows. A file is named by the run's start time and process id (`20261019T101500Z-4242.toml`),

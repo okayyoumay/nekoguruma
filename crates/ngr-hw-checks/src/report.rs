@@ -311,8 +311,16 @@ impl Report {
         };
         self.device = Some(DeviceInfo {
             abi: abi.name().to_owned(),
-            vendor: self.masker.text(&vci.library),
-            model: self.masker.module_name(vci.api, &module.name),
+            vendor: self.masker.text(match vci.api {
+                Api::Iso22900 if !version.vendor_name.trim().is_empty() => &version.vendor_name,
+                _ => &vci.library,
+            }),
+            model: match vci.api {
+                Api::Iso22900 if !version.hw_name.trim().is_empty() => {
+                    self.masker.text(&version.hw_name)
+                }
+                _ => self.masker.module_name(vci.api, &module.name),
+            },
             firmware_version: self.masker.text(&firmware),
             library_version: self.masker.text(&library),
         });
@@ -529,7 +537,12 @@ impl Drop for RunGuard {
         };
         match written {
             Ok(path) => eprintln!("hardware report: {}", path.display()),
-            Err(error) => eprintln!("cannot write the hardware report: {error}"),
+            // Unwinding already fails the check; a second panic would abort the test process.
+            Err(error) if std::thread::panicking() => {
+                eprintln!("cannot write the hardware report: {error}");
+            }
+            // Every run leaves a report (design 13.5), so a check whose report is lost fails.
+            Err(error) => panic!("cannot write the hardware report: {error}"),
         }
     }
 }

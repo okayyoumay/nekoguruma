@@ -258,12 +258,14 @@ fn a_coded_version_is_three_decimal_bytes() {
 #[test]
 fn j2534_versions_are_compared_as_the_strings_the_device_reports() {
     let version = ReportedVersion {
+        vendor_name: String::new(),
         hw_name: "1.2.3".into(),
         fw_name: "4.5".into(),
         ..Default::default()
     };
     assert_eq!(check_versions(&j2534(), &version), Ok(()));
     let padded = ReportedVersion {
+        vendor_name: String::new(),
         hw_name: " 1.2.3 ".into(),
         ..version.clone()
     };
@@ -272,6 +274,7 @@ fn j2534_versions_are_compared_as_the_strings_the_device_reports() {
         check_versions(
             &j2534(),
             &ReportedVersion {
+                vendor_name: String::new(),
                 hw_name: "1.2.4".into(),
                 ..version.clone()
             }

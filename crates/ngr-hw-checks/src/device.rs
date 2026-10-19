@@ -30,7 +30,11 @@ pub struct ConfiguredModule {
 /// The fields of the worker's `GetVersion` answer the match reads.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ReportedVersion {
-    /// `hw_name`: for J2534 the firmware version string the device reports.
+    /// `vendor_name`: for the D-PDU API the vendor the library reports; the J2534 worker reports
+    /// a constant.
+    pub vendor_name: String,
+    /// `hw_name`: for J2534 the firmware version string the device reports; for the D-PDU API
+    /// the hardware's name.
     pub hw_name: String,
     /// `fw_name`: for J2534 the library (DLL) version string.
     pub fw_name: String,

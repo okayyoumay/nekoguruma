@@ -409,7 +409,7 @@ const PINS: std::ops::RangeInclusive<u8> = 1..=16;
 /// Annex B.3.2), by the names of `j2534-0404-service`'s `BUSTYPE_UNUM32` and `BUSTYPE_BYTES`
 /// (`crates/j2534-0404-service/src/service/comparam_support.rs`), which this list mirrors in
 /// full; a name added there belongs here too. Compared ignoring ASCII case.
-const PHYSICAL_COMPARAMS: &[&str] = &[
+pub(crate) const PHYSICAL_COMPARAMS: &[&str] = &[
     "CP_Baudrate",
     "CP_BitSamplePoint",
     "CP_BitSamplePoint_Ecu",
@@ -440,7 +440,7 @@ const PHYSICAL_COMPARAMS: &[&str] = &[
 
 /// A channel name as the J2534 worker reads it: ASCII case ignored, surrounding spaces dropped,
 /// and a `_CH` index read as a number, so `CAN_CH1`, `can_ch1` and `CAN_CH01` are one channel.
-fn channel_key(name: &str) -> String {
+pub(crate) fn channel_key(name: &str) -> String {
     let upper = name.trim().to_ascii_uppercase();
     if let Some(index) = upper.rfind("_CH") {
         let (head, digits) = (&upper[..index], &upper[index + 3..]);
@@ -566,14 +566,57 @@ fn check_link(link: &Link) -> Result<(), ProfileError> {
             "the ComParam {name:?} is not a ComParam name (`CP_...`)"
         )));
     }
+    // Two spellings of one ComParam (an alias, or another case) cannot both be the profile's
+    // value for it, whatever the values.
+    let keys: Vec<&String> = link.comparams.keys().collect();
+    for (i, a) in keys.iter().enumerate() {
+        if let Some(b) = keys[..i]
+            .iter()
+            .find(|b| crate::comparam::canonical(b) == crate::comparam::canonical(a))
+        {
+            return Err(invalid(format!(
+                "the `link.comparams` keys {b:?} and {a:?} name one ComParam"
+            )));
+        }
+    }
     if let Some(name) = link.comparams.keys().find(|name| {
+        // By canonical name, so an alias of a physical ComParam is refused like its name.
+        let canonical = crate::comparam::canonical(name);
         PHYSICAL_COMPARAMS
             .iter()
-            .any(|p| p.eq_ignore_ascii_case(name))
+            .any(|p| crate::comparam::canonical(p) == canonical)
     }) {
+        let given = crate::comparam::typed_field(&crate::comparam::canonical(name))
+            .map_or_else(|| "keys".to_owned(), |field| format!("{field} key"));
         return Err(invalid(format!(
-            "the ComParam {name:?} is physical-layer; the `link`'s own keys give it"
+            "the ComParam {name:?} is physical-layer; the `link`'s own {given} gives it"
         )));
+    }
+    // Only what the guard can enforce, as a number: it compares the value and requires it before
+    // the link connects.
+    for (name, value) in &link.comparams {
+        let canonical = crate::comparam::canonical(name);
+        if crate::comparam::profile_may_pin(&canonical) {
+            // The workers set a numeric ComParam as an unsigned 32-bit value (the J2534 worker
+            // refuses a signed one), so a value outside that range could never be set and the
+            // link could never connect.
+            if u32::try_from(*value).is_err() {
+                return Err(invalid(format!(
+                    "the ComParam {name:?} has the value {value}, outside 0 to {}",
+                    u32::MAX
+                )));
+            }
+            continue;
+        }
+        return Err(invalid(match crate::comparam::typed_field(&canonical) {
+            Some(field) => format!(
+                "the ComParam {name:?} is given by the `link`'s own {field}, not by `comparams`"
+            ),
+            None => format!(
+                "the ComParam {name:?} cannot be pinned in `comparams`: only numeric protocol and \
+                 timing ComParams the guard enforces can"
+            ),
+        }));
     }
     Ok(())
 }

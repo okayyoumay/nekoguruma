@@ -3,7 +3,9 @@
 `ngr-hw-checks` is the harness of the real-hardware checks (design 13.5, ADR-275). This page
 describes the hardware profile it reads, how a check declares what it needs, and how the two are
 compared, how the device a worker reports is matched with the profile, and how the harness opens
-it, and how a run's report is written. The guarded VCI handle is not part of the crate yet.
+it, how a run's report is written, and what the guard decides about each worker request and how a
+run's teardown works (ADR-333). The seam that routes a check's, or the agent's, worker calls
+through the guard is not part of the crate yet.
 
 ## Running
 
@@ -62,14 +64,15 @@ does not take. A T3 profile can add nothing.
 
 | Key | Meaning |
 |---|---|
-| `protocol` | The protocol name, such as `"ISO15765"` |
+| `protocol` | The ISO 22900-2 (2022) protocol short name the link's resource is created by, as the agent sends it: `"ISO_14229_3_on_ISO_15765_2"` for UDS on CAN. The guard compares it with the resource of a `CreateComLogicalLink` ignoring ASCII case and has no alias table |
 | `baud_rate` | Bits per second |
 | `pins` | The two connector pins (1 to 16; SAE J2534-1 6.8 lists their use), CAN high first |
 | `request_id`, `response_id`, `functional_id` | The physical request and response identifiers, and optionally the functional one; all different |
 | `id_bits` | 11 or 29; every identifier must fit |
 | `addressing` | `"normal"`, `"extended"` or `"mixed"`; the last two need an `address` byte |
 | `padding` | The padding byte; absent for no padding |
-| `[link.comparams]` | The transport ComParams by name (`CP_...`). The physical layer (the bus type ComParams of ISO 22900-2 (2022) Annex B.3.2, such as `CP_Baudrate`, `CP_CANFDBaudrate` or `CP_TerminationType`, in any case) comes from the keys above and is refused here |
+| `[link.comparams]` | Numeric protocol and timing ComParams by name (`CP_...`) that the guard enforces: P2, P2*, the ISO 15765-2 timing and flow control (`CP_BlockSize`, `CP_STmin`, ...), response pending and tester-present timing, each a value from 0 to 4294967295 (the workers set them as unsigned 32-bit numbers). A byte-field ComParam (such as `CP_TesterPresentMessage`), a ComParam the typed keys above give (`CP_Baudrate` is `baud_rate`, the identifiers, formats, address, filler and address modes) and an unknown or vendor name are refused, naming the key. Two keys that name one ComParam (the same name in another case, or an alias such as `CP_BSTx` and `CP_BS_TX`, which the guard resolves to one canonical name) are refused, whatever their values. A physical-layer ComParam is refused by its canonical name,
+so an alias (`CP_Bit_Sample_Point`) is refused like the name. The physical layer (the bus type ComParams of ISO 22900-2 (2022) Annex B.3.2, such as `CP_Baudrate`, `CP_CANFDBaudrate` or `CP_TerminationType`, in any case) comes from the keys above and is refused here |
 
 `[[hardware-control]]`, by `kind`, each with a `name` that checks refer to:
 
@@ -177,6 +180,70 @@ not a pass (`finish` with failed or refused) fails as a test as well, whether or
 check then sends is limited by the guarded handle (design 13.5 "Guarded VCI access"): a T2 write
 passes only inside an authorized job, and T3's other limits (no DTC clearing, resets, security
 access or session beyond the extended one) are the class's lists, not declared operations.
+
+## Guard
+
+`ngr_hw_checks::guard::decide` is the decision core of the guarded VCI handle (design 13.5
+"Guarded VCI access", ADR-275 item 4, ADR-333). It is a pure function of the profile, the links
+the harness has bound, the ids it has learned from the worker's `GetResourceIds` and `GetObjectId`
+answers, and one request (`guard::Request`, one variant per RPC of `service VciService`). It
+returns a `Grant` (`Pass`, `CreatesLink`, `SetsComParams`, `DestroysLink`, `EntersSession`) or a `GuardRefusal`.
+Anything it cannot classify is refused.
+
+- **Link setup.** `ModuleConnect` is refused (the harness opens the device). A link is created
+  only from the profile link's protocol, the bus type the agent uses
+  (`ISO_11898_2_DWCAN`) and exactly its two pins (the first of `pins` as `HI`, the second as
+  `LOW`), by resource data or by a learned resource id; a resource by name, or an id not learned,
+  is refused. A create flag may carry RawMode only, and RawMode only on T0 (a worker passes raw
+  data through, so on any other class the guard cannot classify its identifier or payload). One link per profile endpoint (T0: one per
+  VCI end, created for the end whose `channel` the resource's protocol name is, or else whose
+  `protocol` it is; a SocketCAN end has no worker link). `ConnectComLogicalLink` is refused until
+  the pinned ComParams (baud rate, request, response and functional identifiers, the physical, response and functional formats on
+  every link, the address byte when the addressing has one, the request and tester-present address modes (physical when the profile has no functional
+  identifier, since the worker's preset sends tester present functionally), the tester-present message (T1 to T3), the filler handling (0 on an unpadded profile, since
+  the worker's preset pads) and, when the profile pads, the filler byte, `[link.comparams]`) have
+  been set to the profile's values, which the caller records from `SetsComParams` grants. A
+  `SetUniqueRespIdTable` replaces the table on both workers, so it must carry the request and
+  response identifiers (and the physical and response formats, and the address byte when the addressing has one), each at the profile's
+  value, in exactly one entry; an empty or partial table, or one with more than one entry, is
+  refused. The `Context` names the profile VCI its worker
+  fronts, and a link is created only for an endpoint on it (on a T0 of two VCIs each worker's
+  context binds its own end). `SetComParam` and the ComParams of `SetUniqueRespIdTable` keep the profile's values:
+  `CP_Baudrate`, the identifiers, the CAN ID format (ISO 22900-2 (2022) Table B.13 and B.14), the
+  address byte and the padding; a `CP_TesterPresentMessage` on T1, T2 and T3 may only be a
+  TesterPresent request (`3E 00` or `3E 80`), since the worker sends it cyclically; other physical-layer ComParams are refused; functional
+  addressing needs a `functional_id`; a `[link.comparams]` entry keeps its value. TxFlags that override the profile (frame padding
+  without profile padding, the 29-bit or extended-addressing flag against the profile) are
+  refused on every class. The rules are an
+  allow-list over canonical names (case folded, the J2534 worker's aliases such as `DATA_RATE`
+  resolved, the request's class field ignored): a ComParam no rule covers passes only when it is
+  a listed protocol or timing ComParam (P2, P2*, ISO 15765-2 timing and flow control, response
+  pending, tester-present timing) (only ones the J2534 worker can set: `CP_TesterPresentImmed` is not on its lists, so it is
+  refused) and every other name is refused. The tester-present message must also be set before
+  a T1 to T3 link connects, and only as `3E 00` or `3E 80`. `COPT_RESTORE_PARAM` is refused.
+- **Requests.** T1 passes every request. T0 creates RawMode links only, passes only raw frames with the sending end's own
+  `request_id` and, under extended or mixed addressing, its `address` as the fifth byte and refuses `COPT_STARTCOMM`/`COPT_STOPCOMM` (no communication to start). On a
+  RawMode link the 29-bit, addressing and padding flags must each equal the profile's, set or
+  not. T2 (until an authorized job exists) and T3 pass the read-only list: session
+  control to the default or extended session, ReadDataByIdentifier, ReadDTCInformation with a
+  defined report type, and TesterPresent with sub-function 0, each with its length rule. The
+  rule applies to direct requests, periodic ones and a `CP_TesterPresentMessage`. A raw-bound
+  handle on T1, T2 or T3 is refused, not decoded. T0 raw frames also need the profile's flags.
+- **IO controls.** `PDU_IOCTL_READ_VBATT` and the queue, buffer and receive-filter housekeeping
+  pass on every class. Every other IOCTL, including programming voltage, is refused on every
+  class, whatever the profile's `[[hardware-control]]` list says.
+
+## Teardown
+
+`ngr_hw_checks::teardown::Teardown` holds the steps a check registers as it acquires a resource
+(power, device, link): `register` for a closure, `register_async` for a future. `run` executes
+them in reverse, each at most once, each under `catch_unwind`; a failing or panicking step does
+not stop the others. An async step runs on a detached thread with its own runtime; the caller waits for it with a
+timeout (`set_timeout`; 30 s by default), so it can be run from inside a runtime and a step that
+blocks is reported as timed out and left behind while the rest run. A `RunGuard` owns one: `RunGuard::teardown()` gives a handle that registers steps and sets
+the timeout only, `RunGuard::run_teardown()` runs them early and keeps their failures, and the
+guard runs the rest when dropped, also while a check panics, and turns a failed
+step into a failed check even if the check recorded a pass.
 
 ## Reports
 

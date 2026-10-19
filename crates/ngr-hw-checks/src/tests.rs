@@ -572,3 +572,92 @@ fn every_declared_check_is_named_hw_and_has_a_class() {
         assert!(!check.classes.is_empty(), "{}", check.name);
     }
 }
+
+#[test]
+fn two_spellings_of_one_comparam_are_refused_whatever_their_values() {
+    let with = |lines: &str| t1("").replacen("CP_STmin = 0", lines, 1);
+    let refused = |lines: &str, a: &str, b: &str| match parse(&with(lines)) {
+        Err(ProfileError::Invalid(message)) => {
+            assert!(
+                message.contains(a) && message.contains(b),
+                "{message} does not name {a} and {b}"
+            )
+        }
+        other => panic!("{other:?}: expected a refusal for {lines:?}"),
+    };
+    // An alias of the same ComParam, with different and with equal values.
+    refused("CP_BSTx = 1\nCP_BS_TX = 2", "CP_BSTx", "CP_BS_TX");
+    refused("CP_BSTx = 1\nCP_BS_TX = 1", "CP_BSTx", "CP_BS_TX");
+    refused(
+        "CP_STminTx = 1
+CP_STmin_Tx = 1",
+        "CP_STminTx",
+        "CP_STmin_Tx",
+    );
+    // Another case of one name.
+    refused("CP_P2Max = 1000\nCP_P2MAX = 1000", "CP_P2Max", "CP_P2MAX");
+    // Distinct ComParams still parse.
+    parse(&with("CP_BSTx = 1\nCP_STminTx = 2\nCP_P2Max = 3")).unwrap();
+}
+
+#[test]
+fn an_alias_of_a_physical_comparam_is_refused_like_its_name() {
+    for name in ["CP_Bit_Sample_Point", "CP_Network_Line", "CP_NodeAddress"] {
+        let text = t1("").replacen("CP_STmin = 0", &format!("{name} = 1"), 1);
+        match parse(&text) {
+            Err(ProfileError::Invalid(message)) => {
+                assert!(message.contains("physical-layer"), "{name}: {message}")
+            }
+            other => panic!("{name}: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn only_comparams_the_guard_can_enforce_are_pinned_in_the_profile() {
+    let with = |line: &str| t1("").replacen("CP_STmin = 0", line, 1);
+    let refused = |line: &str, says: &str| match parse(&with(line)) {
+        Err(ProfileError::Invalid(message)) => {
+            assert!(
+                message.contains(line.split(' ').next().unwrap()) && message.contains(says),
+                "{message} does not name the key and say {says:?}"
+            )
+        }
+        other => panic!("{other:?}: expected a refusal for {line:?}"),
+    };
+    // A byte field cannot be pinned with an integer.
+    refused("CP_TesterPresentMessage = 0", "cannot be pinned");
+    refused("CP_TesterPresentExpPosResp = 0", "cannot be pinned");
+    // Typed fields have their own keys.
+    refused("CP_Baudrate = 500000", "baud_rate");
+    refused("DATA_RATE = 500000", "CP_");
+    refused("CP_CanPhysReqId = 2016", "request_id");
+    refused("CP_CanFillerByteHandling = 1", "padding");
+    refused("CP_RequestAddrMode = 1", "functional_id");
+    // Unknown and vendor names.
+    refused("CP_VendorSpecific = 1", "cannot be pinned");
+    // A value the workers cannot set as an unsigned 32-bit number.
+    refused("CP_STmin = -1", "outside");
+    refused("CP_P2Max = 4294967296", "outside");
+    // A timing ComParam still parses, in any spelling the guard resolves.
+    let profile = parse(&with("CP_P2Max = 1000\nCP_BSTx = 3")).unwrap();
+    let Setup::Link { link, .. } = &profile.setup else {
+        unreachable!()
+    };
+    assert_eq!(link.comparams["CP_P2Max"], 1000);
+}
+
+#[test]
+fn comparams_the_worker_cannot_set_are_not_pinnable() {
+    // `CP_TesterPresentImmed` is on no real-protocol allow-list of j2534-0404-service, so
+    // `SetComParam` can never set it and a profile pinning it could never connect.
+    let text = t1("").replacen("CP_STmin = 0", "CP_TesterPresentImmed = 1", 1);
+    match parse(&text) {
+        Err(ProfileError::Invalid(message)) => {
+            assert!(message.contains("CP_TesterPresentImmed"), "{message}")
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(!crate::comparam::profile_may_pin("cp_testerpresentimmed"));
+    assert!(!crate::comparam::ALLOWED.contains(&"cp_testerpresentimmed"));
+}

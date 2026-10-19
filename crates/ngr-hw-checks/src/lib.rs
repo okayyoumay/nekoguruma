@@ -4,6 +4,9 @@
 //! - [`device`]: the module match, whether the device a worker reports is the profile's
 //! - [`open`]: starting the profile's worker, running the module match and opening the device
 //! - [`report`]: the report of a run, written to a directory only the running user can read
+//! - [`guard`]: the decision core of the guarded VCI handle, one pure function over the profile,
+//!   the bound links and a worker request (ADR-333)
+//! - [`teardown`]: the steps a run registers as it acquires resources and runs in reverse, once
 //! - [`CheckDecl`]: what a check needs, as static data the harness reads without running it
 //! - [`permits`] and [`listing`]: which checks a profile permits
 //! - [`begin`]: the first call of every `hw_` test, which fails without a permitting profile
@@ -13,10 +16,13 @@
 //! so `cargo run -p ngr-hw-checks -- list` lists it. The checks run with
 //! `cargo nextest run --profile hardware --run-ignored=only`; CI never runs them.
 
+pub mod comparam;
 pub mod device;
+pub mod guard;
 pub mod open;
 pub mod profile;
 pub mod report;
+pub mod teardown;
 
 pub use profile::{Class, Operation, Profile, ProfileError};
 

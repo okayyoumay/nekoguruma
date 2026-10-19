@@ -322,6 +322,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-330](ADR-330-a-cancel-waits-for-an-interruptible-point.md) | A Cancel Waits for an Interruptible Point | Accepted | `agent` job runner (`run_vm`, `cancel_held_at`, `holds_cancel`), `crates/agent/docs/ngr-agent.md`; design 5.6, 8.10.1; ADR-235 item 7, ADR-252 item 3, ADR-301, ADR-329 |
 | [ADR-331](ADR-331-debug-builds-treat-iso22900-mock-as-the-simulator.md) | Debug Builds Treat `iso22900-mock` as the Simulator | Accepted | `agent` policy (`identify`), `crates/agent/docs/ngr-agent.md`, `iso22900-service` definition end-to-end test, design 8.2.4; ADR-247, ADR-299 |
 | [ADR-332](ADR-332-a-diag-calls-idempotency-is-a-one-instruction-section.md) | A `diag` Call's Idempotency Is a One-Instruction Section | Accepted | `diag-frontend` lowering of `@idempotency` and section ranges, `starlark-subset.md` 4.5, 4.6, design 8.2.5; ADR-233, ADR-301, ADR-329, ADR-330 |
+| [ADR-333](ADR-333-hardware-check-guard-is-one-pure-decision-and-teardown-is-owned-by-the-run-guard.md) | The Hardware-Check Guard Is One Pure Decision over the Profile, and Teardown Is Owned by the Run Guard | Accepted | `ngr-hw-checks` guard, teardown, `report::RunGuard`, design 13.5; ADR-275 items 4 and 6 |
 
 ## Status Legend
 
@@ -665,6 +666,7 @@ the predecessor repository these ADRs came from.
 - ADR-292 (the consequence that a crash shows as `HostError::Rpc` superseded by ADR-294: the agent reports `HostError::VciLost`)
 - ADR-299
 - ADR-312
+- ADR-333
 
 ### Timestamps / Clock
 - ADR-057 (amended by ADR-102)

@@ -25,6 +25,7 @@ use worker_host::abi::Abi;
 use crate::Refusal;
 use crate::device::{ReportedModule, ReportedVersion, attribute_values, coded_version};
 use crate::profile::{Api, Profile, Setup, Vci};
+use crate::teardown::{StepFailure, Teardown, TeardownHandle};
 
 /// The report directory below the user's data directory.
 const SUBDIR: [&str; 2] = ["nekoguruma", "hw-reports"];
@@ -540,6 +541,9 @@ fn rfc3339(time: SystemTime) -> String {
 /// [`RunGuard::pass`] or [`RunGuard::finish`]; a guard dropped while the thread panics records
 /// the check as failed, and one dropped without a result records that as a failure too.
 ///
+/// The guard also owns the run's [`Teardown`] ([`RunGuard::teardown`]): dropping it runs the
+/// registered steps first, and a failed step turns a recorded pass into a failure (ADR-333).
+///
 /// When the thread is not already panicking, dropping the guard panics, so the test fails, if
 /// the check recorded anything but a pass or if its report cannot be written. During an unwind it
 /// never panics again: a report that cannot be written is then described on stderr.
@@ -547,6 +551,9 @@ pub struct RunGuard {
     report: Report,
     check: String,
     dir: Option<PathBuf>,
+    teardown: Teardown,
+    /// What failed in the steps run so far, by an early [`RunGuard::run_teardown`] or at drop.
+    teardown_failures: Vec<StepFailure>,
 }
 
 impl RunGuard {
@@ -571,7 +578,25 @@ impl RunGuard {
             report,
             check: check.to_owned(),
             dir,
+            teardown: Teardown::new(),
+            teardown_failures: Vec::new(),
         }
+    }
+
+    /// The run's teardown steps (design 13.5 "Cleanup"): register one as each resource is
+    /// acquired. Dropping the guard runs them first, in reverse, and a step that fails fails
+    /// the check even if it recorded a pass.
+    pub fn teardown(&mut self) -> TeardownHandle<'_> {
+        TeardownHandle(&mut self.teardown)
+    }
+
+    /// Runs the registered steps now (early cleanup, such as before the check's last reads) and
+    /// returns what failed, for information. The failures stay with the guard: dropping it fails
+    /// the check even if it records a pass afterwards. A step registered later runs at drop.
+    pub fn run_teardown(&mut self) -> Vec<StepFailure> {
+        let failures = self.teardown.run();
+        self.teardown_failures.extend(failures.iter().cloned());
+        failures
     }
 
     /// The report, for `add_device` and other entries.
@@ -593,8 +618,45 @@ impl RunGuard {
     }
 }
 
+impl RunGuard {
+    /// Puts the failed teardown steps into the check's result: a recorded pass becomes a
+    /// failure, and any other recorded result gets the steps appended.
+    fn record_teardown_failures(&mut self, failures: &[crate::teardown::StepFailure]) {
+        if failures.is_empty() {
+            return;
+        }
+        let steps: Vec<String> = failures.iter().map(ToString::to_string).collect();
+        let text = format!("teardown failed: {}", steps.join("; "));
+        let check = self.check.clone();
+        let was_pass = self
+            .report
+            .checks
+            .iter()
+            .any(|c| c.name == check && c.outcome == Outcome::Passed);
+        self.report
+            .checks
+            .retain(|c| c.name != check || c.outcome != Outcome::Passed);
+        if was_pass {
+            self.finish(Outcome::Failed, &text);
+            return;
+        }
+        let text = self.report.masker().text(&text);
+        for result in self.report.checks.iter_mut().filter(|c| c.name == check) {
+            result.message = if result.message.is_empty() {
+                text.clone()
+            } else {
+                format!("{}; {text}", result.message)
+            };
+        }
+    }
+}
+
 impl Drop for RunGuard {
     fn drop(&mut self) {
+        // The steps run first, whatever the check did, and before the report is written, so
+        // that a failed step is in it.
+        self.run_teardown();
+        let failures = std::mem::take(&mut self.teardown_failures);
         if std::thread::panicking() {
             // A check that panics after recording a pass (in a later guard's drop, say) failed.
             let check = self.check.clone();
@@ -610,6 +672,7 @@ impl Drop for RunGuard {
                 "the check ended without recording a result",
             );
         }
+        self.record_teardown_failures(&failures);
         let written = match &self.dir {
             Some(dir) => self.report.write_to(dir),
             None => self.report.write(),

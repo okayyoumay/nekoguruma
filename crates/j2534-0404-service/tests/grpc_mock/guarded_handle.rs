@@ -19,10 +19,10 @@ use ngr_hw_checks::report::RunGuard;
 use serial_test::serial;
 use vci_service_interface::{
     ComOperationType, ComPrimitiveCtrlData, ConnectComLogicalLinkRequest,
-    CreateComLogicalLinkRequest, DestroyComLogicalLinkRequest, EcuUniqueRespData, ModuleHandle,
-    ParamItem, PduParamClass, SetComParamRequest, SetUniqueRespIdTableRequest,
-    StartComPrimitiveRequest, TxFlag, TxFlagBit, UniqueRespIdTableItem, com_primitive_ctrl_data,
-    create_com_logical_link_request, param_item,
+    CreateComLogicalLinkRequest, DestroyComLogicalLinkRequest, DisconnectComLogicalLinkRequest,
+    EcuUniqueRespData, ModuleHandle, ParamItem, PduParamClass, SetComParamRequest,
+    SetUniqueRespIdTableRequest, StartComPrimitiveRequest, TxFlag, TxFlagBit,
+    UniqueRespIdTableItem, com_primitive_ctrl_data, create_com_logical_link_request, param_item,
 };
 
 use crate::harness::*;
@@ -738,6 +738,70 @@ async fn destroying_a_link_in_another_session_returns_it_to_the_default_one_firs
     run.pass();
     assert!(run.run_teardown().is_empty());
     assert_eq!(server.backdoor.write_msgs_count(), 4);
+    drop(run);
+    server.shutdown().await;
+}
+
+/// A disconnect of a link in another session is settled the same way: the return to the default
+/// session goes first, on a link that is still connected, and a failed return refuses it.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn disconnecting_a_link_in_another_session_returns_it_to_the_default_one_first() {
+    let server = TestServer::start().await;
+    let profile = t3();
+    let reports = Reports::new();
+    let mut run = RunGuard::start_in(&profile, "hw_guarded_handle", reports.dir());
+    let mut handle = GuardedHandle::attach(
+        &profile,
+        &vci(&profile),
+        server.worker_client().await,
+        module(),
+        HandleOptions {
+            request_timeout: std::time::Duration::from_secs(5),
+            response_timeout: Some(std::time::Duration::from_millis(300)),
+        },
+        &mut run,
+    )
+    .await
+    .expect("the handle opens the profile's link");
+    let [cll] = *handle.links() else {
+        panic!("one link");
+    };
+    let arm = |sub: u8| {
+        server.backdoor.arm_write_rx_injection(
+            MOCK_CHANNEL_ID,
+            &can_frame(0x7E8, &[0x50, sub, 0x00, 0x32, 0x01, 0xF4]),
+            j2534_0404::ISO15765,
+            50,
+        )
+    };
+    arm(0x03);
+    handle
+        .send_receive(cll, &[0x10, 0x03])
+        .await
+        .expect("the session starts");
+    let disconnect = || DisconnectComLogicalLinkRequest {
+        cll_handle: Some(cll),
+    };
+
+    // No answer to the return: the link stays connected.
+    let refused = handle.disconnect_com_logical_link(disconnect()).await;
+    assert!(matches!(refused, Err(HandleError::Setup(_))), "{refused:?}");
+    assert_eq!(server.backdoor.disconnect_count(), 0);
+    assert_eq!(server.backdoor.write_msgs_count(), 2);
+
+    arm(0x01);
+    handle
+        .disconnect_com_logical_link(disconnect())
+        .await
+        .expect("returned, then disconnected");
+    assert_eq!(server.backdoor.write_msgs_count(), 3);
+    assert_eq!(server.backdoor.disconnect_count(), 1);
+
+    drop(handle);
+    run.pass();
+    assert!(run.run_teardown().is_empty());
+    assert_eq!(server.backdoor.write_msgs_count(), 3);
     drop(run);
     server.shutdown().await;
 }

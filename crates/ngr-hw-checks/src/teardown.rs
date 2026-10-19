@@ -148,12 +148,25 @@ impl Teardown {
                     Ok(result) => result,
                     Err(payload) => Err(format!("panicked: {}", panic_text(payload.as_ref()))),
                 },
-                Action::Async(future) => run_async(
-                    future,
-                    step.timeout
-                        .as_ref()
-                        .map_or(self.timeout, |timeout| timeout()),
-                ),
+                Action::Async(future) => {
+                    // The step's timeout is read inside the same panic boundary as the step.
+                    let timeout = match &step.timeout {
+                        None => Ok(self.timeout),
+                        Some(timeout) => {
+                            catch_unwind(AssertUnwindSafe(timeout)).map_err(|payload| {
+                                format!("timeout panicked: {}", panic_text(payload.as_ref()))
+                            })
+                        }
+                    };
+                    match timeout {
+                        Ok(timeout) => run_async(future, timeout),
+                        Err(reason) => {
+                            // The step is not run; dropping it must not panic out either.
+                            let _ = catch_unwind(AssertUnwindSafe(|| drop(future)));
+                            Err(reason)
+                        }
+                    }
+                }
             };
             if let Err(reason) = result {
                 failures.push(StepFailure {

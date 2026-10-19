@@ -334,3 +334,21 @@ fn a_step_timeout_can_be_read_when_the_step_runs() {
     *timeout.lock().unwrap() = Duration::from_secs(5);
     assert!(teardown.run().is_empty());
 }
+
+/// A timeout callback that panics fails its step, and the steps registered before it still run.
+#[test]
+fn a_panicking_timeout_callback_fails_its_step_and_the_rest_run() {
+    let log = log();
+    let mut teardown = Teardown::new();
+    teardown.register("first", step(&log, "first"));
+    teardown.register_async_with_timeout_fn(
+        "bad timeout",
+        || -> Duration { panic!("no timeout") },
+        async { Ok(()) },
+    );
+    let failures = teardown.run();
+    assert_eq!(events(&log), ["first"]);
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert_eq!(failures[0].name, "bad timeout");
+    assert!(failures[0].reason.contains("no timeout"), "{failures:?}");
+}

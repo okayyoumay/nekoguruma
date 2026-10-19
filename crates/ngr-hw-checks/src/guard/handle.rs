@@ -321,8 +321,14 @@ impl Shared {
 
     /// Waits for the end of primitive `cop`: its response to `expected`, or with `None` (a
     /// primitive that has no response, such as an update of ComParams) its successful finish,
-    /// which returns no bytes. The primitive is cancelled when the wait ends or the worker lost
-    /// events, since it may still be running.
+    /// which returns no bytes.
+    ///
+    /// Every way out while the primitive may still be running, whatever the reason (the wait
+    /// ran out, events were lost, the event stream failed or ended, no stream), goes through
+    /// the one cancel here: [`Shared::read_outcome`] says what happened, and this cancels unless
+    /// the primitive reached a terminal status. The worker answers a cancel of a primitive that
+    /// ended with success, so a cancel that fails is the error returned: the primitive may still
+    /// be running.
     async fn await_primitive(
         &self,
         client: &mut WorkerClient,
@@ -331,41 +337,55 @@ impl Shared {
         expected: Option<Expectation>,
         cap: Option<Duration>,
     ) -> Result<Vec<u8>, HandleError> {
-        let events = self
-            .lock()
-            .events
-            .get(&cll.cll_handle)
-            .cloned()
-            .ok_or_else(|| HandleError::Setup("the link has no event stream".to_owned()))?;
+        match self.read_outcome(cll, cop, expected, cap).await {
+            Outcome::Ended(result) => result,
+            Outcome::Running(error) => {
+                self.cancel(client, cop).await?;
+                Err(error)
+            }
+        }
+    }
+
+    /// Reads the link's events until primitive `cop` ends or the wait does. Sends nothing.
+    async fn read_outcome(
+        &self,
+        cll: ComLogicalLinkHandle,
+        cop: ComPrimitiveHandle,
+        expected: Option<Expectation>,
+        cap: Option<Duration>,
+    ) -> Outcome {
+        let Some(events) = self.lock().events.get(&cll.cll_handle).cloned() else {
+            return Outcome::Running(HandleError::Setup(
+                "the link has no event stream".to_owned(),
+            ));
+        };
         let timeout = self.wait_for(cll);
         let timeout = cap.map_or(timeout, |cap| timeout.min(cap));
         let mut response = None;
         let mut error = None;
-        let deadline = tokio::time::Instant::now() + timeout;
+        let now = tokio::time::Instant::now();
+        // A timeout too long to add is, in effect, none.
+        let deadline = now
+            .checked_add(timeout)
+            .unwrap_or_else(|| now + Duration::from_secs(86_400 * 365));
         let mut stream = events.lock().await;
         loop {
             let notification = match tokio::time::timeout_at(deadline, stream.message()).await {
-                Ok(notification) => notification,
-                Err(_) => {
-                    // Nothing is left running after the caller gave up. The worker answers a
-                    // cancel of a primitive that already ended with success, so a cancel that
-                    // fails is reported: the primitive may still be running.
-                    self.cancel(client, cop).await?;
-                    return Err(HandleError::NoResponse);
+                Err(_) => return Outcome::Running(HandleError::NoResponse),
+                Ok(Err(status)) => {
+                    return Outcome::Running(HandleError::Rpc {
+                        call: "SubscribeEvent",
+                        message: status.to_string(),
+                    });
                 }
-            }
-            .map_err(|status| HandleError::Rpc {
-                call: "SubscribeEvent",
-                message: status.to_string(),
-            })?
-            .ok_or(HandleError::EventStreamEnded)?;
+                Ok(Ok(None)) => return Outcome::Running(HandleError::EventStreamEnded),
+                Ok(Ok(Some(notification))) => notification,
+            };
             let item = match notification.event_data {
                 Some(event_notification::EventData::Item(item)) => item,
+                // The end of the primitive may be among the lost events.
                 Some(event_notification::EventData::Lost(_)) => {
-                    // The end of the primitive may be among the lost events, so it may still
-                    // be running: stop it, and report a cancel that failed in preference.
-                    self.cancel(client, cop).await?;
-                    return Err(HandleError::EventsLost);
+                    return Outcome::Running(HandleError::EventsLost);
                 }
                 None => continue,
             };
@@ -390,17 +410,25 @@ impl Shared {
                         || status == PduComPrimitiveStatus::PduCopstCancelled as i32 =>
                 {
                     let finished = status == PduComPrimitiveStatus::PduCopstFinished as i32;
-                    return match (response, error) {
+                    return Outcome::Ended(match (response, error) {
                         (Some(response), _) => Ok(response),
                         (None, None) if expected.is_none() && finished => Ok(Vec::new()),
                         (None, Some(code)) => Err(HandleError::PrimitiveFailed(code)),
                         (None, None) => Err(HandleError::NoResponse),
-                    };
+                    });
                 }
                 _ => {}
             }
         }
     }
+}
+
+/// How waiting for a primitive ended.
+enum Outcome {
+    /// The primitive reached a terminal status; this is its result.
+    Ended(Result<Vec<u8>, HandleError>),
+    /// The wait ended with the primitive possibly still running, for this reason.
+    Running(HandleError),
 }
 
 /// How a response to a UDS request begins, so the worker ends the primitive on an answer to this
@@ -517,7 +545,9 @@ async fn close_link(
 /// response (`wait`, which the step never exceeds and after which it cancels the primitive), the
 /// start request and the cancel request, and a margin; never less than the teardown's default.
 fn session_reset_timeout(wait: Duration, request_timeout: Duration) -> Duration {
-    (wait + request_timeout * 2 + Duration::from_secs(1)).max(crate::teardown::DEFAULT_STEP_TIMEOUT)
+    wait.saturating_add(request_timeout.saturating_mul(2))
+        .saturating_add(Duration::from_secs(1))
+        .max(crate::teardown::DEFAULT_STEP_TIMEOUT)
 }
 
 /// The teardown step that returns the ECU on `cll` to the default session, once.
@@ -1205,6 +1235,49 @@ impl<'r> GuardedHandle<'r> {
         Ok(response)
     }
 
+    /// Settles a pending return to the default session before `cll` stops being usable. Every
+    /// operation that ends a link's ability to talk (disconnect, destroy, stopping
+    /// communication) calls this first: a link that entered another session is sent `10 01` and
+    /// must answer `50 01`, or the operation is refused with `what` named, and the return stays
+    /// registered with the run. A link with nothing pending passes at once.
+    async fn settle_session(
+        &self,
+        cll: Option<ComLogicalLinkHandle>,
+        what: &str,
+    ) -> Result<(), HandleError> {
+        let Some(cll) = cll else {
+            return Ok(());
+        };
+        if !self.shared.lock().session_back.contains(&cll.cll_handle) {
+            return Ok(());
+        }
+        return_to_default_session(self.shared.clone(), self.client.clone(), cll)
+            .await
+            .map_err(|reason| {
+                HandleError::Setup(format!(
+                    "the link is not {what}: it could not be returned to the default session \
+                     first: {reason}"
+                ))
+            })
+    }
+
+    /// `DisconnectComLogicalLink`, after a pending return to the default session.
+    pub async fn disconnect_com_logical_link(
+        &mut self,
+        request: DisconnectComLogicalLinkRequest,
+    ) -> Result<vci_service_interface::Response, HandleError> {
+        self.shared
+            .admit(&Request::DisconnectComLogicalLink(&request))?;
+        self.settle_session(request.cll_handle, "disconnected")
+            .await?;
+        self.shared
+            .send(
+                "DisconnectComLogicalLink",
+                self.client.clone().disconnect_com_logical_link(request),
+            )
+            .await
+    }
+
     /// `DestroyComLogicalLink`; the link is dropped from the table.
     pub async fn destroy_com_logical_link(
         &mut self,
@@ -1213,21 +1286,7 @@ impl<'r> GuardedHandle<'r> {
         let grant = self
             .shared
             .admit(&Request::DestroyComLogicalLink(&request))?;
-        // A link that entered another session goes back to the default one first: the step
-        // registered for it would find no link afterwards. If the return fails the destroy is
-        // refused, and the step stays registered with the run.
-        if let Some(cll) = request.cll_handle
-            && self.shared.lock().session_back.contains(&cll.cll_handle)
-        {
-            return_to_default_session(self.shared.clone(), self.client.clone(), cll)
-                .await
-                .map_err(|reason| {
-                    HandleError::Setup(format!(
-                        "the link is not destroyed: it could not be returned to the default \
-                         session first: {reason}"
-                    ))
-                })?;
-        }
+        self.settle_session(request.cll_handle, "destroyed").await?;
         let response = self
             .shared
             .send(
@@ -1296,6 +1355,11 @@ impl<'r> GuardedHandle<'r> {
     ) -> Result<ComPrimitiveResponse, HandleError> {
         let cll = request.cll_handle;
         let grant = self.shared.admit(&Request::StartComPrimitive(&request))?;
+        // Stopping communication ends the tester present that keeps a session up.
+        if request.cop_type == ComOperationType::CoptStopcomm as i32 {
+            self.settle_session(cll, "taken out of communication")
+                .await?;
+        }
         if let (Grant::EntersSession(_), Some(cll)) = (&grant, cll)
             && self.shared.lock().session_back.insert(cll.cll_handle)
         {
@@ -1362,8 +1426,6 @@ impl<'r> GuardedHandle<'r> {
         get_resource_status(GetResourceStatus, GetResourceStatusRequest) -> ResourceStatusResponse = "GetResourceStatus";
         /// `GetConflictingResources`.
         get_conflicting_resources(GetConflictingResources, GetConflictingResourcesRequest) -> ConflictingResourcesResponse = "GetConflictingResources";
-        /// `DisconnectComLogicalLink`.
-        disconnect_com_logical_link(DisconnectComLogicalLink, DisconnectComLogicalLinkRequest) -> vci_service_interface::Response = "DisconnectComLogicalLink";
         /// `LockResource`.
         lock_resource(LockResource, LockResourceRequest) -> vci_service_interface::Response = "LockResource";
         /// `UnlockResource`.

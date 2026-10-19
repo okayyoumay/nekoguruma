@@ -57,8 +57,10 @@ present.
    `ISO_14229_3_on_ISO_15765_2` sends tester present functionally to its own 0x7DF with handling
    on, so a profile without a functional identifier sets both to physical), the filler handling
    on every link (the preset pads, so an unpadded profile sets it to 0; a padded one sets it to 1
-   and sets the filler byte), and every
-   `[link.comparams]` entry. The other preset defaults of a ComParam with a rule (formats 0x05,
+   and sets the filler byte), the tester-present message on T1 to T3 (the preset arms a cyclic
+   one and a D-PDU library's default is unknown, so a link starts communication only after the
+   message is set and has passed the TesterPresent-only rule; on T0 the ComParam is refused), and
+   every `[link.comparams]` entry. The other preset defaults of a ComParam with a rule (formats 0x05,
    address 0, ids 0x7E0, 0x7E8 and 0x7DF) are pinned above or equal the profile's whenever the
    profile does not need the ComParam; the D-PDU API side has library-specific defaults the guard
    cannot know, so the same set is required there too. The format ComParams' padding bits (Table B.13, bits 5 and 4) cannot
@@ -94,7 +96,11 @@ present.
    profile's value. A ComParam no rule covers passes only if it is on the short list of protocol
    and timing ComParams (session timing, ISO 15765-2 frame timing and flow control, response
    pending handling, tester-present timing; ISO 22900-2 (2022) Annex B) or the profile sets it.
-   Unknown, vendor and other physical-layer names are refused. The profile accepts in `[link.comparams]` only what the guard can enforce: a numeric
+   The short list holds only ComParams the J2534 worker's `SetComParam` accepts on CAN and ISO
+   15765 (checked against `comparam_support.rs`): `CP_TesterPresentImmed`, which is on no
+   real-protocol allow-list there, was removed, so it can be neither set nor pinned (the guard
+   does not pass what the worker would refuse). Unknown, vendor and other physical-layer names
+   are refused. The profile accepts in `[link.comparams]` only what the guard can enforce: a numeric
    ComParam of the short list above (byte fields, the ComParams the typed fields give, physical
    names and unknown or vendor names are refused at parse, naming the key and the typed field to
    use), so every pinned entry is compared with its value and required before connect. The

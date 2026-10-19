@@ -123,7 +123,6 @@ pub const ALLOWED: &[&str] = &[
     "cp_testerpresentexpposresp",
     "cp_testerpresentexpnegresp",
     "cp_testerpresentsendtype",
-    "cp_testerpresentimmed",
 ];
 
 /// The ComParams of [`ALLOWED`] whose value is not a number (byte fields): a `SetComParam` may

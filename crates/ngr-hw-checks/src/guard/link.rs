@@ -383,7 +383,9 @@ pub(super) fn check_param(
         }
     }
     // Accepted at the profile's value: a required ComParam is now set, for the connect check.
-    Ok(required(link).contains(&lower).then_some(lower))
+    Ok(required(link, ctx.profile.class)
+        .contains(&lower)
+        .then_some(lower))
 }
 
 /// The pinned ComParams a response table holds: those of the UNIQUE_ID class that
@@ -391,6 +393,7 @@ pub(super) fn check_param(
 /// format and address). The functional request ComParams are of the COM class, set with
 /// `SetComParam`, and the J2534 worker reads them from the ComParam set, not from the table.
 pub(super) fn table_required(link: &Link) -> Vec<String> {
+    // The tester-present message is not table-held, so the class does not matter here.
     const IN_TABLE: [&str; 6] = [
         "cp_canphysreqid",
         "cp_canphysreqformat",
@@ -399,7 +402,7 @@ pub(super) fn table_required(link: &Link) -> Vec<String> {
         "cp_canrespusdtformat",
         "cp_canrespusdtextaddr",
     ];
-    required(link)
+    required(link, Class::T3)
         .into_iter()
         .filter(|name| IN_TABLE.contains(&name.as_str()))
         .collect()
@@ -408,10 +411,11 @@ pub(super) fn table_required(link: &Link) -> Vec<String> {
 /// The canonical names of the ComParams the profile pins, which must all be set to the
 /// profile's value before the link is connected: the baud rate, the physical request and
 /// response identifiers, the functional identifier if the profile has one, the CAN ID formats, the address byte when the addressing has
-/// one, the filler handling on every link (and the filler byte when the profile pads), and every
+/// one, the filler handling on every link (and the filler byte when the profile pads), the
+/// tester-present message on T1 to T3, and every
 /// `[link.comparams]` entry. The worker's own
 /// defaults are not the profile's.
-pub(super) fn required(link: &Link) -> Vec<String> {
+pub(super) fn required(link: &Link, class: Class) -> Vec<String> {
     let mut names = vec!["cp_baudrate", "cp_canphysreqid", "cp_canrespusdtid"];
     // The J2534 preset of ISO_14229_3_on_ISO_15765_2 (`comparam_defaults.rs`) sends tester
     // present functionally (`CP_TesterPresentAddrMode` 1, to the preset's 0x7DF) with handling
@@ -448,6 +452,13 @@ pub(super) fn required(link: &Link) -> Vec<String> {
     names.push("cp_canfillerbytehandling");
     if link.padding.is_some() {
         names.push("cp_canfillerbyte");
+    }
+    // The tester-present message too, wherever tester present exists (T1 to T3): the worker's
+    // preset arms a cyclic message and a D-PDU library's default is unknown, so a link starts
+    // communication only once the message is set and has passed the TesterPresent-only rule. On
+    // T0 the ComParam is refused and nothing is started.
+    if class != Class::T0 {
+        names.push("cp_testerpresentmessage");
     }
     let mut names: Vec<String> = names.into_iter().map(str::to_owned).collect();
     names.extend(link.comparams.keys().map(|key| canonical(key)));

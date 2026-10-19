@@ -139,7 +139,7 @@ impl Env {
     /// With the link `CLL` bound and every profile-pinned ComParam recorded as set.
     fn ready(profile: Profile) -> Self {
         let mut env = Self::linked(profile, false);
-        let required = link::required(env.endpoint_link(0));
+        let required = link::required(env.endpoint_link(0), env.profile.class);
         env.links.get_mut(&CLL).unwrap().set.extend(required);
         env
     }
@@ -671,6 +671,7 @@ fn unknown_and_vendor_comparams_are_refused_whatever_their_class() {
     ];
     for name in [
         "CP_VendorWire",
+        "CP_TesterPresentImmed",
         "VENDOR_SPECIFIC",
         "CP_SamplesPerBit",
         "CP_W1Max",
@@ -738,7 +739,6 @@ fn each_allow_listed_comparam_passes() {
         "CP_TesterPresentExpPosResp",
         "CP_TesterPresentExpNegResp",
         "CP_TesterPresentSendType",
-        "CP_TesterPresentImmed",
         // The aliases of some of them.
         "ISO15765_STMIN",
         "ISO15765_BS",
@@ -1035,6 +1035,29 @@ fn a_link_connects_only_once_the_profiles_comparams_are_set() {
     assert!(set(&env, unum("CP_CanFillerByteHandling", 1)).is_err());
     let grant = set(&env, unum("CP_CanFillerByteHandling", 0));
     apply(&mut env, grant);
+    // The tester-present message is the last one: the preset arms a cyclic one, and a D-PDU
+    // library's default is unknown. Only TesterPresent passes the rule, and records it.
+    let Err(GuardRefusal::LinkSetup(why)) = connect(&env) else {
+        panic!("connect should be refused");
+    };
+    assert!(why.contains("cp_testerpresentmessage"), "{why}");
+    let message = |bytes: &[u8]| {
+        param_by_name(
+            "CP_TesterPresentMessage",
+            param_item::ParamData::Bytefield(bytes.to_vec()),
+        )
+    };
+    assert!(set(&env, message(&[0x10, 0x03])).is_err());
+    assert!(connect(&env).is_err());
+    let grant = set(&env, message(&[0x3E, 0x80]));
+    assert_eq!(
+        grant,
+        Ok(Grant::SetsComParams {
+            cll: CLL,
+            names: vec!["cp_testerpresentmessage".to_owned()]
+        })
+    );
+    apply(&mut env, grant);
     assert_eq!(connect(&env), Ok(Grant::Pass));
 
     // A value changed to another than the profile's is refused at SetComParam anyway, and a
@@ -1060,7 +1083,7 @@ fn the_connect_check_requires_what_the_profile_pins() {
         unreachable!()
     };
     assert_eq!(
-        link::required(link),
+        link::required(link, Class::T2),
         [
             "cp_baudrate",
             "cp_canfillerbyte",
@@ -1074,6 +1097,7 @@ fn the_connect_check_requires_what_the_profile_pins() {
             "cp_requestaddrmode",
             "cp_stmin",
             "cp_testerpresentaddrmode",
+            "cp_testerpresentmessage",
         ]
     );
     // The plain 11-bit link needs the baud rate and the identifiers only.
@@ -1088,7 +1112,7 @@ fn the_connect_check_requires_what_the_profile_pins() {
         unreachable!()
     };
     assert_eq!(
-        link::required(link),
+        link::required(link, Class::T3),
         [
             "cp_baudrate",
             "cp_canfillerbytehandling",
@@ -1097,7 +1121,8 @@ fn the_connect_check_requires_what_the_profile_pins() {
             "cp_canrespusdtformat",
             "cp_canrespusdtid",
             "cp_requestaddrmode",
-            "cp_testerpresentaddrmode"
+            "cp_testerpresentaddrmode",
+            "cp_testerpresentmessage"
         ]
     );
 }
@@ -1424,7 +1449,7 @@ fn the_formats_are_set_before_connect_on_an_11_bit_normal_link() {
         ),
         false,
     );
-    let required = link::required(env.endpoint_link(0));
+    let required = link::required(env.endpoint_link(0), env.profile.class);
     let others: Vec<String> = required
         .iter()
         .filter(|n| !n.ends_with("format"))
@@ -1449,7 +1474,7 @@ fn the_formats_are_set_before_connect_on_an_11_bit_normal_link() {
     assert_eq!(connect(&env), Ok(Grant::Pass));
     // The extended address of a normal profile is not required.
     assert!(
-        !link::required(env.endpoint_link(0))
+        !link::required(env.endpoint_link(0), env.profile.class)
             .iter()
             .any(|n| n.ends_with("extaddr"))
     );
@@ -1469,7 +1494,7 @@ fn the_address_modes_are_set_before_connect() {
         ),
         false,
     );
-    let required = link::required(env.endpoint_link(0));
+    let required = link::required(env.endpoint_link(0), env.profile.class);
     let others: Vec<String> = required
         .iter()
         .filter(|n| !n.ends_with("addrmode"))
@@ -1499,7 +1524,7 @@ fn the_address_modes_are_set_before_connect() {
     // With a functional identifier either value is allowed, but both are still to be set.
     let mut env = Env::ready(profile("T3"));
     env.links.get_mut(&CLL).unwrap().set.clear();
-    let required = link::required(env.endpoint_link(0));
+    let required = link::required(env.endpoint_link(0), env.profile.class);
     let others: Vec<String> = required
         .into_iter()
         .filter(|n| !n.ends_with("addrmode"))

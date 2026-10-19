@@ -646,3 +646,18 @@ fn only_comparams_the_guard_can_enforce_are_pinned_in_the_profile() {
     };
     assert_eq!(link.comparams["CP_P2Max"], 1000);
 }
+
+#[test]
+fn comparams_the_worker_cannot_set_are_not_pinnable() {
+    // `CP_TesterPresentImmed` is on no real-protocol allow-list of j2534-0404-service, so
+    // `SetComParam` can never set it and a profile pinning it could never connect.
+    let text = t1("").replacen("CP_STmin = 0", "CP_TesterPresentImmed = 1", 1);
+    match parse(&text) {
+        Err(ProfileError::Invalid(message)) => {
+            assert!(message.contains("CP_TesterPresentImmed"), "{message}")
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(!crate::comparam::profile_may_pin("cp_testerpresentimmed"));
+    assert!(!crate::comparam::ALLOWED.contains(&"cp_testerpresentimmed"));
+}

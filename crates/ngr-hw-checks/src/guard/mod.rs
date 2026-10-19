@@ -280,7 +280,7 @@ pub fn decide(ctx: &Context<'_>, request: &Request<'_>) -> Result<Grant, GuardRe
         Request::ConnectComLogicalLink(r) => {
             // A link connects with the profile's ComParams, not the worker's defaults.
             let (bound, link) = ctx.bound(r.cll_handle.as_ref())?;
-            let missing: Vec<String> = link::required(link)
+            let missing: Vec<String> = link::required(link, ctx.profile.class)
                 .into_iter()
                 .filter(|name| !bound.set.contains(name))
                 .collect();

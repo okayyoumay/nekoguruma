@@ -200,7 +200,7 @@ Anything it cannot classify is refused.
   `protocol` it is; a SocketCAN end has no worker link). `ConnectComLogicalLink` is refused until
   the pinned ComParams (baud rate, request, response and functional identifiers, the physical, response and functional formats on
   every link, the address byte when the addressing has one, the request and tester-present address modes (physical when the profile has no functional
-  identifier, since the worker's preset sends tester present functionally), the filler handling (0 on an unpadded profile, since
+  identifier, since the worker's preset sends tester present functionally), the tester-present message (T1 to T3), the filler handling (0 on an unpadded profile, since
   the worker's preset pads) and, when the profile pads, the filler byte, `[link.comparams]`) have
   been set to the profile's values, which the caller records from `SetsComParams` grants. A
   `SetUniqueRespIdTable` replaces the table on both workers, so it must carry the request and
@@ -218,7 +218,9 @@ Anything it cannot classify is refused.
   allow-list over canonical names (case folded, the J2534 worker's aliases such as `DATA_RATE`
   resolved, the request's class field ignored): a ComParam no rule covers passes only when it is
   a listed protocol or timing ComParam (P2, P2*, ISO 15765-2 timing and flow control, response
-  pending, tester-present timing) or the profile sets it, and every other name is refused. `COPT_RESTORE_PARAM` is refused.
+  pending, tester-present timing) (only ones the J2534 worker can set: `CP_TesterPresentImmed` is not on its lists, so it is
+  refused) and every other name is refused. The tester-present message must also be set before
+  a T1 to T3 link connects, and only as `3E 00` or `3E 80`. `COPT_RESTORE_PARAM` is refused.
 - **Requests.** T1 passes every request. T0 creates RawMode links only, passes only raw frames with the sending end's own
   `request_id` and, under extended or mixed addressing, its `address` as the fifth byte and refuses `COPT_STARTCOMM`/`COPT_STOPCOMM` (no communication to start). On a
   RawMode link the 29-bit, addressing and padding flags must each equal the profile's, set or

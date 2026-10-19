@@ -63,10 +63,10 @@ use vci_service_interface::{
     ObjectIdResponse, ObjectType, ParamItem, PduComPrimitiveStatus, PduError, PduErrorEvent,
     PduParamClass, PinData, ResourceData, ResourceIdsResponse, ResourceStatusResponse,
     SetComParamRequest, SetUniqueRespIdTableRequest, StartComPrimitiveRequest, StatusResponse,
-    SubscribeEventRequest, TimestampResponse, UniqueRespIdTableItem, UniqueRespIdTableResponse,
-    UnlockResourceRequest, VersionResponse, create_com_logical_link_request, event_item,
-    event_notification, io_ctl_request, param_item, pin_data, resource_data,
-    subscribe_event_request,
+    SubscribeEventRequest, TimestampResponse, TxFlag, TxFlagBit, UniqueRespIdTableItem,
+    UniqueRespIdTableResponse, UnlockResourceRequest, VersionResponse, com_primitive_ctrl_data,
+    create_com_logical_link_request, event_item, event_notification, io_ctl_request, param_item,
+    pin_data, resource_data, subscribe_event_request,
 };
 use worker_host::client::WorkerClient;
 use worker_host::service::Stopped;
@@ -233,6 +233,10 @@ struct State {
     /// The primitive being waited for on each link, while a wait is under way. A wait whose
     /// future is dropped leaves its entry, and the next operation or the teardown cancels it.
     inflight: BTreeMap<u32, ComPrimitiveHandle>,
+    /// The receive-only primitive listening on each link (`raw_listen`).
+    monitors: BTreeMap<u32, ComPrimitiveHandle>,
+    /// Frames a link's monitor received that no `raw_receive` has taken yet.
+    raw_frames: BTreeMap<u32, std::collections::VecDeque<Vec<u8>>>,
     /// The primitives started on each link through `start_com_primitive` that the handle has
     /// not seen end: cancelled before the link's session is settled, it is disconnected or
     /// destroyed, and by the teardown (cancelling one that ended succeeds and changes nothing).
@@ -364,6 +368,8 @@ impl Shared {
                 state.timings.remove(cll);
                 state.session_registered.remove(cll);
                 state.inflight.remove(cll);
+                state.monitors.remove(cll);
+                state.raw_frames.remove(cll);
                 state.started.remove(cll);
                 state.suspended.retain(|saved| {
                     !matches!(&saved.handle, Some(io_ctl_request::Handle::CllHandle(c)) if c.cll_handle == *cll)
@@ -972,6 +978,17 @@ fn is_definite_refusal(code: tonic::Code) -> bool {
             | AlreadyExists
             | Unauthenticated
     )
+}
+
+/// Whether a received frame is an echo of the link's own transmission, by its RxFlag: a loopback
+/// copy (`TX_MSG_TYPE`, bit 0 of the last byte) or a TX indication (bit 3), as SAE J2534-1
+/// defines the RxStatus bits the worker copies.
+fn is_echo(rx_flag: &[u8]) -> bool {
+    const TX_MSG_TYPE: u8 = 0x01;
+    const TX_INDICATION: u8 = 0x08;
+    rx_flag
+        .last()
+        .is_some_and(|byte| byte & (TX_MSG_TYPE | TX_INDICATION) != 0)
 }
 
 /// Whether a status says, in its error detail, that a handle is invalid (unknown, or forgotten
@@ -1820,6 +1837,229 @@ impl GuardedHandle {
             }
         }
         self.connect_com_logical_link(request).await
+    }
+
+    /// The profile's link of a RawMode link (T0 only), for the raw API.
+    fn raw_link(&self, cll: ComLogicalLinkHandle) -> Result<Link, HandleError> {
+        let (link, _) = self.profile_link(cll)?;
+        let raw = self
+            .shared
+            .lock()
+            .links
+            .get(&cll.cll_handle)
+            .is_some_and(|bound| bound.raw_mode);
+        if raw && self.shared.profile.class == Class::T0 {
+            Ok(link)
+        } else {
+            Err(HandleError::Refused {
+                rpc: "StartComPrimitive",
+                refusal: GuardRefusal::Frame(
+                    "raw frames are a T0 tool: this link is not a RawMode link of a T0 profile",
+                ),
+            })
+        }
+    }
+
+    /// The TxFlags of a RawMode send on `cll`, from the profile: the 29-bit identifier flag, the
+    /// extended-addressing flag when the addressing is not normal, the frame-padding flag when
+    /// the profile pads. A RawMode worker takes the frame's format from these alone, and the guard
+    /// requires each to equal the profile's.
+    pub fn raw_flags(&self, cll: ComLogicalLinkHandle) -> Result<Vec<TxFlagBit>, HandleError> {
+        let link = self.raw_link(cll)?;
+        let mut flags = Vec::new();
+        if link.id_bits == 29 {
+            flags.push(TxFlagBit::TxFlagCan29bitId);
+        }
+        if link.addressing != Addressing::Normal {
+            flags.push(TxFlagBit::TxFlagIso15765AddrType);
+        }
+        if link.padding.is_some() {
+            flags.push(TxFlagBit::TxFlagIso15765FramePad);
+        }
+        Ok(flags)
+    }
+
+    /// The RawMode frame the end of `cll` sends for `payload`: its request identifier in four
+    /// bytes, most significant first, the profile's address byte under extended or mixed
+    /// addressing, then the payload (design 13.5; the data is the literal `PassThruMessage.Data`
+    /// of the J2534 worker, and a receiver gets the same bytes whole). With an empty payload it is
+    /// the end's own header.
+    pub fn raw_frame(
+        &self,
+        cll: ComLogicalLinkHandle,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, HandleError> {
+        let link = self.raw_link(cll)?;
+        let mut frame = link.request_id.to_be_bytes().to_vec();
+        if link.addressing != Addressing::Normal {
+            frame.push(link.address.unwrap_or(0));
+        }
+        frame.extend_from_slice(payload);
+        Ok(frame)
+    }
+
+    /// Sends one RawMode frame with `payload` from the end of `cll` (a send, no receive), through
+    /// the guard. Returns the primitive; it is recorded like any started primitive.
+    pub async fn raw_send(
+        &mut self,
+        cll: ComLogicalLinkHandle,
+        payload: &[u8],
+    ) -> Result<ComPrimitiveHandle, HandleError> {
+        let request = StartComPrimitiveRequest {
+            cop_tag: None,
+            cll_handle: Some(cll),
+            cop_type: ComOperationType::CoptSendrecv as i32,
+            cop_data: self.raw_frame(cll, payload)?,
+            cop_ctrl_data: Some(ComPrimitiveCtrlData {
+                time: 0,
+                num_send_cycles: 1,
+                num_receive_cycles: 0,
+                temp_param_update: 0,
+                expected_response_array: vec![],
+                tx_flag: Some(com_primitive_ctrl_data::TxFlag::TxFlagBits(TxFlag {
+                    bits: self
+                        .raw_flags(cll)?
+                        .iter()
+                        .map(|&flag| flag as i32)
+                        .collect(),
+                })),
+            }),
+        };
+        self.start_com_primitive(request)
+            .await?
+            .cop_handle
+            .ok_or_else(|| {
+                HandleError::Setup("StartComPrimitive returned no primitive handle".to_owned())
+            })
+    }
+
+    /// Starts the receive-only primitive of `cll` (no send, receives until cancelled), whose
+    /// frames `raw_receive` reads. Its data is the receiving end's own header: the guard reads any
+    /// non-empty data of a RawMode primitive as a frame, and a header of the end's own is the
+    /// frame it accepts. Its one expected response matches any frame, so every frame of the link
+    /// reaches it. It stays recorded as started, so the link's closing cancels it. At most one per link.
+    pub async fn raw_listen(
+        &mut self,
+        cll: ComLogicalLinkHandle,
+    ) -> Result<ComPrimitiveHandle, HandleError> {
+        let request = StartComPrimitiveRequest {
+            cop_tag: None,
+            cll_handle: Some(cll),
+            cop_type: ComOperationType::CoptSendrecv as i32,
+            cop_data: self.raw_frame(cll, &[])?,
+            cop_ctrl_data: Some(ComPrimitiveCtrlData {
+                time: 0,
+                num_send_cycles: 0,
+                num_receive_cycles: -1,
+                temp_param_update: 0,
+                // One descriptor that matches any frame, as the worker's receive-only monitors
+                // take it: without one nothing is delivered to the primitive.
+                expected_response_array: vec![ExpectedResponseData {
+                    response_type: 0,
+                    acceptance_id: 0,
+                    mask_data: vec![],
+                    pattern_data: vec![],
+                    unique_resp_ids: vec![],
+                }],
+                tx_flag: Some(com_primitive_ctrl_data::TxFlag::TxFlagBits(TxFlag {
+                    bits: self
+                        .raw_flags(cll)?
+                        .iter()
+                        .map(|&flag| flag as i32)
+                        .collect(),
+                })),
+            }),
+        };
+        let cop = self
+            .start_com_primitive(request)
+            .await?
+            .cop_handle
+            .ok_or_else(|| {
+                HandleError::Setup("StartComPrimitive returned no primitive handle".to_owned())
+            })?;
+        self.shared.lock().monitors.insert(cll.cll_handle, cop);
+        Ok(cop)
+    }
+
+    /// Waits up to `timeout` for the frame `expected` (the whole frame, as the sender's
+    /// `raw_frame` built it) on the monitor of `cll`, and returns it. Echoes of the end's own
+    /// transmissions (TX indications and loopback copies) are skipped. Frames of the monitor that
+    /// are not `expected` stay buffered for a later call, so the order of the calls does not lose
+    /// them. [`HandleError::NoResponse`] when the deadline passes.
+    pub async fn raw_receive(
+        &mut self,
+        cll: ComLogicalLinkHandle,
+        expected: &[u8],
+        timeout: Duration,
+    ) -> Result<Vec<u8>, HandleError> {
+        let monitor = self
+            .shared
+            .lock()
+            .monitors
+            .get(&cll.cll_handle)
+            .copied()
+            .ok_or_else(|| HandleError::Setup("the link has no monitor (raw_listen)".to_owned()))?;
+        let events = self
+            .shared
+            .lock()
+            .events
+            .get(&cll.cll_handle)
+            .cloned()
+            .ok_or_else(|| HandleError::Setup("the link has no event stream".to_owned()))?;
+        let now = tokio::time::Instant::now();
+        let deadline = now
+            .checked_add(timeout)
+            .unwrap_or_else(|| now + Duration::from_secs(86_400 * 365));
+        let mut stream = events.lock().await;
+        loop {
+            {
+                let mut state = self.shared.lock();
+                if let Some(frames) = state.raw_frames.get_mut(&cll.cll_handle)
+                    && let Some(at) = frames.iter().position(|frame| frame == expected)
+                {
+                    return Ok(frames.remove(at).expect("found above"));
+                }
+            }
+            let notification = match tokio::time::timeout_at(deadline, stream.message()).await {
+                Err(_) => return Err(HandleError::NoResponse),
+                Ok(Err(status)) => return Err(worker_error("SubscribeEvent", &status)),
+                Ok(Ok(None)) => return Err(HandleError::EventStreamEnded),
+                Ok(Ok(Some(notification))) => notification,
+            };
+            let item = match notification.event_data {
+                Some(event_notification::EventData::Item(item)) => item,
+                Some(event_notification::EventData::Lost(_)) => {
+                    return Err(HandleError::EventsLost);
+                }
+                None => continue,
+            };
+            match item.data {
+                Some(event_item::Data::ErrorData(code))
+                    if code == PduErrorEvent::PduErrEvtLostCommToVci as i32
+                        && item.cop_handle.is_none_or(|handle| handle == monitor) =>
+                {
+                    return Err(HandleError::VciLost);
+                }
+                _ if item.cop_handle != Some(monitor) => {}
+                Some(event_item::Data::ResultData(result)) if !is_echo(&result.rx_flag) => {
+                    self.shared
+                        .lock()
+                        .raw_frames
+                        .entry(cll.cll_handle)
+                        .or_default()
+                        .push_back(result.data_bytes);
+                }
+                Some(event_item::Data::CopStatus(status))
+                    if status == PduComPrimitiveStatus::PduCopstFinished as i32
+                        || status == PduComPrimitiveStatus::PduCopstCancelled as i32 =>
+                {
+                    // The monitor ended: nothing more arrives on this link.
+                    self.shared.lock().monitors.remove(&cll.cll_handle);
+                    return Err(HandleError::NoResponse);
+                }
+                _ => {}
+            }
+        }
     }
 
     /// Turns the trace of the guard's decisions on and returns it: every decision from now on is

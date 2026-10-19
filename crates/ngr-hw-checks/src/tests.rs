@@ -537,6 +537,39 @@ fn a_hardware_check_without_a_profile_fails() {
     assert_eq!(start(&READ, Ok(t3.clone())), Ok(t3));
 }
 
+/// The first hardware check (design 13.5): listed for a T0 profile, refused on every other class,
+/// and it fails without a profile.
+#[test]
+fn the_t0_loopback_check_is_listed_for_t0_and_refused_elsewhere() {
+    assert!(CHECKS.contains(&T0_LOOPBACK_CHECK));
+    assert_eq!(T0_LOOPBACK_CHECK.name, "hw_t0_two_endpoint_loopback");
+    let t0 = parse(T0_PROFILE).unwrap();
+    assert_eq!(
+        listing(&t0, &[T0_LOOPBACK_CHECK]),
+        "hw_t0_two_endpoint_loopback: permitted\n"
+    );
+    assert_eq!(start(&T0_LOOPBACK_CHECK, Ok(t0.clone())), Ok(t0));
+    for class in ["T1", "T2", "T3"] {
+        let profile = parse(&profile(class, "")).unwrap();
+        assert_eq!(
+            listing(&profile, &[T0_LOOPBACK_CHECK]),
+            format!(
+                "hw_t0_two_endpoint_loopback: refused: the check runs on [T0], not on the \
+                 profile's {class}\n"
+            )
+        );
+        assert!(matches!(
+            start(&T0_LOOPBACK_CHECK, Ok(profile)),
+            Err(StartError::Refused { .. })
+        ));
+    }
+    // Without a profile it does not start.
+    assert_eq!(
+        start(&T0_LOOPBACK_CHECK, Err(ProfileError::NotSet)),
+        Err(StartError::Profile(ProfileError::NotSet))
+    );
+}
+
 #[test]
 fn a_profile_is_read_from_its_file() {
     let dir = std::env::temp_dir().join(format!("ngr-hw-checks-{}", std::process::id()));

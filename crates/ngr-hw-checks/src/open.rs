@@ -23,6 +23,7 @@
 //! the only configured one applies in full, and the worker must report one module.
 
 use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use agent::launch::{Api, LaunchError, launch_worker};
@@ -80,6 +81,8 @@ pub enum OpenError {
 /// links on it; creating them is not part of opening it.
 pub struct OpenedDevice {
     abi: Abi,
+    library: PathBuf,
+    long_size: u8,
     process: WorkerProcess,
     client: WorkerClient,
     module_handle: ModuleHandle,
@@ -92,6 +95,16 @@ impl OpenedDevice {
     /// The ABI of the worker that opened the device.
     pub fn abi(&self) -> Abi {
         self.abi
+    }
+
+    /// The library the worker loaded (design 7.1.1), for the report of a check.
+    pub fn library(&self) -> &Path {
+        &self.library
+    }
+
+    /// The `unsigned long` width the worker was started with (design 7.1.2).
+    pub fn long_size(&self) -> u8 {
+        self.long_size
     }
 
     pub fn module_handle(&self) -> ModuleHandle {
@@ -144,10 +157,13 @@ pub async fn open_device(
     };
     let worker = launch_worker(api, &vci.library, mode, workers, options).await?;
     let (abi, process, mut client) = (worker.abi, worker.process, worker.client);
+    let (library, long_size) = (worker.library, worker.long_size);
     let timeout = options.request_timeout;
     match match_device(vci, abi, &mut client, timeout).await {
         Ok((module_handle, module, version)) => Ok(OpenedDevice {
             abi,
+            library,
+            long_size,
             process,
             client,
             module_handle,

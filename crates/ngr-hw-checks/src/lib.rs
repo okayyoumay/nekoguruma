@@ -7,6 +7,7 @@
 //! - [`guard`]: the decision core, one pure function over the profile, the bound links and a worker
 //!   request, and [`guard::GuardedHandle`], the handle a check gets in place of a worker client
 //!   (ADR-333)
+//! - [`checks`]: the bodies of the hardware checks, over guarded handles, so CI runs them on a mock
 //! - [`teardown`]: the steps a run registers as it acquires resources and runs in reverse, once
 //! - [`CheckDecl`]: what a check needs, as static data the harness reads without running it
 //! - [`permits`] and [`listing`]: which checks a profile permits
@@ -17,6 +18,7 @@
 //! so `cargo run -p ngr-hw-checks -- list` lists it. The checks run with
 //! `cargo nextest run --profile hardware --run-ignored=only`; CI never runs them.
 
+pub mod checks;
 pub mod comparam;
 pub mod device;
 pub mod guard;
@@ -39,13 +41,22 @@ pub struct CheckDecl {
 
 /// The declarations of every hardware check, which [`listing`] reads. A new `hw_` test adds its
 /// declaration here.
-pub const CHECKS: &[CheckDecl] = &[PROFILE_CHECK];
+pub const CHECKS: &[CheckDecl] = &[PROFILE_CHECK, T0_LOOPBACK_CHECK];
 
 /// `hw_the_profile_permits_a_check`: the profile reads and permits a check that needs nothing,
 /// on every class. It opens no device; it shows that the `hardware` run finds the profile.
 pub const PROFILE_CHECK: CheckDecl = CheckDecl {
     name: "hw_the_profile_permits_a_check",
     classes: &[Class::T0, Class::T1, Class::T2, Class::T3],
+    operations: &[],
+};
+
+/// `hw_t0_two_endpoint_loopback`: on a T0 loopback of two VCI ends, each end sends single RawMode
+/// frames that the other must receive exactly, in both directions (`checks::t0_loopback`). It
+/// needs a T0 profile and no operation beyond the class's.
+pub const T0_LOOPBACK_CHECK: CheckDecl = CheckDecl {
+    name: "hw_t0_two_endpoint_loopback",
+    classes: &[Class::T0],
     operations: &[],
 };
 

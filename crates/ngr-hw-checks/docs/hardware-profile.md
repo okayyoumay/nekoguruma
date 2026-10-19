@@ -383,6 +383,54 @@ connection is served by the runtime.
   T0 (the sending end's request identifier and, under extended or mixed addressing, its address
   byte); the payload is not read.
 
+## The T0 loopback check
+
+`hw_t0_two_endpoint_loopback` (`ngr_hw_checks::T0_LOOPBACK_CHECK`, declared for T0 only, no
+operation beyond the class's) is the first hardware check. The harness lists it for a T0 profile
+and refuses it on T1, T2 and T3 (`cargo run -p ngr-hw-checks -- list`), and the test fails without
+`NGR_HW_PROFILE`, like every `hw_` test. Its test is
+`crates/j2534-0404-service/tests/hw_t0_loopback.rs`; its body is `checks::t0_loopback::run`, a
+function over guarded handles and the profile, so CI runs it against `j2534-0404-mock`
+(`tests/grpc_mock/t0_loopback_check.rs`, with a relay task playing the loopback).
+
+- **What it does.** Both ends listen, then each end sends single RawMode frames of 1 to 7 bytes
+  (6 under extended or mixed addressing, which takes a byte of the frame) that the other must
+  receive byte for byte, A to B and B to A. A frame that does not arrive within 3 s fails the check
+  and names the frame. The result message records the library path, the ABI and the `unsigned
+  long` width of each device, masked as the report masks. Both ends must be J2534 VCI ends: a
+  SocketCAN end or a D-PDU API end is refused with nothing sent.
+- **ABI check (design 7.1.2).** For each device the ABI detected from the library file must be
+  the worker's, and the width the worker ran with must be the registration definition's
+  `LongSize`, else the ABI's default (the test looks the definition up the way the launch did; on
+  Windows it checks the default only). `OpenedDevice::library()` and `long_size()` give what the
+  launch resolved (`agent::launch::LaunchedWorker`). The exact frame round trip confirms the
+  width in practice.
+- **Workers and the library.** The worker directory (`<abi>/j2534-0404-service`, design 7.3) is
+  the root `NGR_HW_WORKERS` names, else this workspace's build for the host ABI, installed in a
+  temporary directory. The vendor's library is found by the OS lookup (design 7.1.1): the test fails
+  if `NGR_J2534_DEFINITION_DIR`, the debug override of that lookup (ADR-282), is set. The test is
+  not gated on `debug_assertions`.
+- **Raw API.** On a T0 link the handle offers `raw_flags`, `raw_frame`, `raw_send`, `raw_listen`
+  and `raw_receive`, each decided by the guard and refused on a non-T0 or non-RawMode link.
+  `raw_flags` is the profile's TxFlags (29-bit identifier, extended addressing, padding), and
+  `raw_frame` the end's request identifier in four bytes, most significant first, the address
+  byte under extended or mixed addressing, then the payload; `raw_send` is a send with no
+  receive. `raw_listen` starts the link's receive-only monitor (no send, receives until
+  cancelled), with the end's own header as its data, since the guard reads any non-empty data of
+  a RawMode primitive as a frame, and one expected response that matches any frame. The monitor is
+  a started primitive, so the link's closing cancels it.
+- **RawMode receive form.** A receiver gets the whole frame the sender transmitted: the sender's
+  request identifier, the address byte if any, then the payload, in `ResultData.data_bytes` with
+  no header split. `raw_receive(cll, expected, timeout)` returns the first frame equal to
+  `expected`, skips the echoes of the link's own transmissions (the `TX_MSG_TYPE` and
+  `TX_INDICATION` RxFlag bits) and buffers other frames of the monitor for a later call, so the
+  order of the calls loses none; `NoResponse` when the deadline passes.
+- **One module, two channels.** The check takes the two ends as one handle with two links or as
+  two handles. The test runs two modules: a link on an additional channel (`..._CH1`, SAE J2534-2
+  clause 7) is made by the worker from a compound protocol name that `GetResourceIds` does not
+  accept, and the handle creates links through `GetResourceIds`, so a loopback of two channels of
+  one module is refused by the test with that reason.
+
 ## Teardown
 
 `ngr_hw_checks::teardown::Teardown` holds the steps a check registers as it acquires a resource

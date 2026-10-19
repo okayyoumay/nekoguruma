@@ -266,8 +266,8 @@ async fn the_teardown_steps_run_once_after_a_panic() {
     server.shutdown().await;
 }
 
-/// A RawMode send on `cll` with `data` as the literal frame, no response expected.
-fn raw_send(
+/// A RawMode send request of a handcrafted frame, which the handle's own raw API never builds.
+fn raw_request(
     cll: vci_service_interface::ComLogicalLinkHandle,
     data: &[u8],
     flags: &[TxFlagBit],
@@ -297,14 +297,16 @@ fn raw_send(
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn a_t0_raw_frame_is_transmitted_as_the_guard_reads_it() {
-    for (addressing, frame, flags) in [
+    for (addressing, payload, frame, flags) in [
         (
             "normal",
+            vec![0x01, 0x02, 0x03],
             can_frame(0x124, &[0x01, 0x02, 0x03]),
             Vec::<TxFlagBit>::new(),
         ),
         (
             "extended",
+            vec![0x01, 0x02, 0x03],
             can_frame(0x124, &[0x55, 0x01, 0x02, 0x03]),
             vec![TxFlagBit::TxFlagIso15765AddrType],
         ),
@@ -328,8 +330,11 @@ async fn a_t0_raw_frame_is_transmitted_as_the_guard_reads_it() {
         };
         assert!(handle.bound_links()[&cll.cll_handle].raw_mode);
 
+        // The handle's raw API builds the header, the flags and the send from the profile.
+        assert_eq!(handle.raw_frame(cll, &payload).unwrap(), frame);
+        assert_eq!(handle.raw_flags(cll).unwrap(), flags);
         handle
-            .start_com_primitive(raw_send(cll, &frame, &flags))
+            .raw_send(cll, &payload)
             .await
             .expect("the guard passes the frame to its own request identifier");
         // The worker hands the frame to the library as it is.
@@ -353,7 +358,7 @@ async fn a_t0_raw_frame_is_transmitted_as_the_guard_reads_it() {
         }
         for request in requests {
             let refused = handle
-                .start_com_primitive(raw_send(cll, &request, &flags))
+                .start_com_primitive(raw_request(cll, &request, &flags))
                 .await
                 .expect_err("a frame to another header is refused");
             assert!(
@@ -1260,4 +1265,112 @@ async fn a_suspended_queue_is_resumed_before_its_link_is_destroyed_or_disconnect
         drop(run);
         server.shutdown().await;
     }
+}
+
+/// The raw API is a T0 tool: on a T3 link it is refused without a worker request.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn the_raw_api_is_refused_outside_t0() {
+    let server = TestServer::start().await;
+    let profile = t3();
+    let reports = Reports::new();
+    let mut run = RunGuard::start_in(&profile, "hw_guarded_handle", reports.dir());
+    let mut handle = GuardedHandle::attach(
+        &profile,
+        &vci(&profile),
+        server.worker_client().await,
+        module(),
+        options(),
+        &run,
+    )
+    .await
+    .expect("the handle opens the profile's link");
+    let [cll] = *handle.links() else {
+        panic!("one link");
+    };
+    let written = server.backdoor.write_msgs_count();
+    assert!(matches!(
+        handle.raw_flags(cll),
+        Err(HandleError::Refused { .. })
+    ));
+    assert!(matches!(
+        handle.raw_frame(cll, &[1]),
+        Err(HandleError::Refused { .. })
+    ));
+    assert!(matches!(
+        handle.raw_send(cll, &[1]).await,
+        Err(HandleError::Refused { .. })
+    ));
+    assert!(matches!(
+        handle.raw_listen(cll).await,
+        Err(HandleError::Refused { .. })
+    ));
+    assert!(
+        handle
+            .raw_receive(cll, &[1], std::time::Duration::from_millis(10))
+            .await
+            .is_err()
+    );
+    assert_eq!(server.backdoor.write_msgs_count(), written);
+    drop(handle);
+    run.pass();
+    assert!(run.run_teardown().is_empty());
+    drop(run);
+    server.shutdown().await;
+}
+
+/// The receive-only monitor of a T0 link gets the frames the other end sent, whole; the one it
+/// is asked for is returned, the others stay buffered for a later call, and the wait ends in
+/// `NoResponse` when the frame does not come.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_raw_monitor_returns_the_expected_frame_and_buffers_the_others() {
+    let server = TestServer::start().await;
+    let profile = t0("normal");
+    let reports = Reports::new();
+    let mut run = RunGuard::start_in(&profile, "hw_guarded_handle", reports.dir());
+    let mut handle = GuardedHandle::attach(
+        &profile,
+        &vci(&profile),
+        server.worker_client().await,
+        module(),
+        options(),
+        &run,
+    )
+    .await
+    .expect("the handle opens the T0 link in RawMode");
+    let [cll] = *handle.links() else {
+        panic!("one link");
+    };
+    handle.raw_listen(cll).await.expect("the monitor starts");
+    // The other end's frames carry its request identifier (0x123).
+    let first = can_frame(0x123, &[0x01]);
+    let second = can_frame(0x123, &[0x02, 0x03]);
+    for frame in [&first, &second] {
+        server
+            .backdoor
+            .inject_rx(MOCK_CHANNEL_ID, frame, j2534_0404::ISO15765);
+    }
+    let timeout = std::time::Duration::from_secs(3);
+    // The second is asked for first: the first is buffered, and still there afterwards.
+    assert_eq!(
+        handle.raw_receive(cll, &second, timeout).await.unwrap(),
+        second
+    );
+    assert_eq!(
+        handle.raw_receive(cll, &first, timeout).await.unwrap(),
+        first
+    );
+    // A frame that never comes.
+    let missing = can_frame(0x123, &[0x09]);
+    let silent = handle
+        .raw_receive(cll, &missing, std::time::Duration::from_millis(300))
+        .await;
+    assert_eq!(silent, Err(HandleError::NoResponse));
+    drop(handle);
+    run.pass();
+    // The closing cancels the monitor.
+    assert!(run.run_teardown().is_empty());
+    drop(run);
+    server.shutdown().await;
 }

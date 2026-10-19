@@ -195,6 +195,12 @@ Alternatives rejected:
   grants, and registers the teardown steps (the device, each link, the return to the default
   session before a session-entering request is sent). The seam that routes the agent's job runner
   through `decide` is separate work; until it exists, a job the agent runs is not mediated.
+- The handle does not borrow the run: `RunGuard::teardown()` gives a clonable, register-only
+  handle over a teardown shared by all of the run's handles, so the two VCI modules of a T0
+  loopback are driven from one run, with their steps in one global reverse order. The guard needs
+  no state across handles, because a handle's context binds the endpoints of its own VCI only
+  (`Context::vci`); nothing refuses a second handle on the same module, which would create that
+  module's links again, so a check opens one handle per VCI.
 - The handle creates the profile's links itself, through the guard, with every ComParam
   `required()` lists at the profile's value (the table's identifiers, formats and address in the
   one-entry response table, the rest with `SetComParam`), because the agent's own link setup does

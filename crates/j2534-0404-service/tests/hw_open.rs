@@ -239,7 +239,7 @@ async fn a_handle_opens_a_t3_profile_on_an_opened_device_and_closes_it() {
             request_timeout: std::time::Duration::from_secs(5),
             response_timeout: Some(std::time::Duration::from_secs(1)),
         },
-        &mut run,
+        &run,
     )
     .await
     .expect("the handle creates and connects the profile's link");

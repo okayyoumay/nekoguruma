@@ -199,7 +199,7 @@ fn teardown_runs_when_the_check_panics_and_a_clean_one_stays_a_pass() {
     let dir = root.path().join("reports");
     let log = log();
     let result = catch_unwind(AssertUnwindSafe(|| {
-        let mut run = RunGuard::start_in(&t3_profile(), "hw_p", dir.clone());
+        let run = RunGuard::start_in(&t3_profile(), "hw_p", dir.clone());
         run.teardown().register("power", step(&log, "power"));
         run.teardown().register("device", step(&log, "device"));
         run.teardown().register("link", step(&log, "link"));
@@ -363,4 +363,23 @@ fn a_maximal_timeout_does_not_panic() {
     teardown.register_async_with_timeout("own", Duration::MAX, async { Ok(()) });
     teardown.register_async_with_timeout_fn("fn", || Duration::MAX, async { Ok(()) });
     assert!(teardown.run().is_empty());
+}
+
+/// Clones of a run's handle register into the same run, and the steps of all of them run in one
+/// reverse registration order.
+#[test]
+fn cloned_handles_share_one_reverse_order() {
+    let log = log();
+    let dir = tempfile::tempdir().unwrap();
+    let mut run = RunGuard::start_in(&t3_profile(), "hw_p", dir.path().join("reports"));
+    let mut first = run.teardown();
+    let mut second = first.clone();
+    first.register("a1", step(&log, "a1"));
+    second.register("b1", step(&log, "b1"));
+    first.register("a2", step(&log, "a2"));
+    assert!(!second.is_empty());
+    assert!(run.run_teardown().is_empty());
+    assert_eq!(events(&log), ["a2", "b1", "a1"]);
+    assert!(first.is_empty());
+    run.pass();
 }

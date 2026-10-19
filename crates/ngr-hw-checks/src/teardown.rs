@@ -16,6 +16,7 @@ use std::any::Any;
 use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 /// How long an async step may take before it is given up on, unless set otherwise.
@@ -143,18 +144,37 @@ impl Teardown {
     pub fn run(&mut self) -> Vec<StepFailure> {
         let mut failures = Vec::new();
         while let Some(step) = self.steps.pop() {
-            let name = step.name.clone();
-            let default = self.timeout;
-            // Nothing outside the step's own work may stop the steps after it: a panic anywhere
-            // in handling one step fails that step only.
-            let result = catch_unwind(AssertUnwindSafe(|| run_step(step, default))).unwrap_or_else(
-                |payload| Err(format!("panicked: {}", panic_text(payload.as_ref()))),
-            );
-            if let Err(reason) = result {
-                failures.push(StepFailure { name, reason });
-            }
+            failures.extend(run_one(step, self.timeout));
         }
         failures
+    }
+}
+
+/// Runs one step, however it ends, and returns its failure. Nothing outside the step's own work
+/// may stop the steps after it: a panic anywhere in handling one step fails that step only.
+fn run_one(step: Step, default: Duration) -> Option<StepFailure> {
+    let name = step.name.clone();
+    catch_unwind(AssertUnwindSafe(|| run_step(step, default)))
+        .unwrap_or_else(|payload| Err(format!("panicked: {}", panic_text(payload.as_ref()))))
+        .err()
+        .map(|reason| StepFailure { name, reason })
+}
+
+/// Runs the steps of a teardown shared between handles, last registered first. The lock is held
+/// only to take the next step, never while one runs, so a step may register further steps (they
+/// run next) and other handles may register meanwhile.
+pub(crate) fn run_shared(shared: &Mutex<Teardown>) -> Vec<StepFailure> {
+    let mut failures = Vec::new();
+    loop {
+        let (step, default) = {
+            let mut teardown: MutexGuard<'_, Teardown> =
+                shared.lock().unwrap_or_else(PoisonError::into_inner);
+            match teardown.steps.pop() {
+                Some(step) => (step, teardown.timeout),
+                None => return failures,
+            }
+        };
+        failures.extend(run_one(step, default));
     }
 }
 
@@ -187,13 +207,20 @@ fn run_step(step: Step, default: Duration) -> Result<(), String> {
 
 /// What a check gets of its run's teardown (`RunGuard::teardown`): it can register steps and set
 /// the timeout, but not run them. Running goes through the run guard, which keeps what failed, so
-/// a failure cannot be returned to the check and lost.
-pub struct TeardownHandle<'a>(pub(crate) &'a mut Teardown);
+/// a failure cannot be returned to the check and lost. The handle is cheap to clone and every
+/// clone registers into the same run, so several guarded handles (a T0 loopback of two VCI
+/// modules) share one teardown, and the steps of all run in one reverse registration order.
+#[derive(Clone)]
+pub struct TeardownHandle(pub(crate) Arc<Mutex<Teardown>>);
 
-impl TeardownHandle<'_> {
+impl TeardownHandle {
+    fn lock(&self) -> MutexGuard<'_, Teardown> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// See [`Teardown::set_timeout`].
     pub fn set_timeout(&mut self, timeout: Duration) {
-        self.0.set_timeout(timeout);
+        self.lock().set_timeout(timeout);
     }
 
     /// See [`Teardown::register`].
@@ -202,7 +229,7 @@ impl TeardownHandle<'_> {
         name: impl Into<String>,
         step: impl FnOnce() -> Result<(), String> + Send + 'static,
     ) {
-        self.0.register(name, step);
+        self.lock().register(name, step);
     }
 
     /// See [`Teardown::register_async`].
@@ -211,7 +238,7 @@ impl TeardownHandle<'_> {
         name: impl Into<String>,
         step: impl Future<Output = Result<(), String>> + Send + 'static,
     ) {
-        self.0.register_async(name, step);
+        self.lock().register_async(name, step);
     }
 
     /// See [`Teardown::register_async_with_timeout`].
@@ -221,7 +248,7 @@ impl TeardownHandle<'_> {
         timeout: Duration,
         step: impl Future<Output = Result<(), String>> + Send + 'static,
     ) {
-        self.0.register_async_with_timeout(name, timeout, step);
+        self.lock().register_async_with_timeout(name, timeout, step);
     }
 
     /// See [`Teardown::register_async_with_timeout_fn`].
@@ -231,12 +258,13 @@ impl TeardownHandle<'_> {
         timeout: impl Fn() -> Duration + Send + 'static,
         step: impl Future<Output = Result<(), String>> + Send + 'static,
     ) {
-        self.0.register_async_with_timeout_fn(name, timeout, step);
+        self.lock()
+            .register_async_with_timeout_fn(name, timeout, step);
     }
 
     /// Whether no step is left to run.
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.lock().is_empty()
     }
 }
 

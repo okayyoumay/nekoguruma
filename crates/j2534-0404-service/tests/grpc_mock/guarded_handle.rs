@@ -112,7 +112,7 @@ async fn a_t3_handle_reads_a_did_and_refuses_a_write_before_the_worker() {
         server.worker_client().await,
         module(),
         options(),
-        &mut run,
+        &run,
     )
     .await
     .expect("the handle opens the profile's link");
@@ -209,14 +209,14 @@ async fn the_teardown_steps_run_once_after_a_panic() {
     let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
         tokio::task::block_in_place(|| {
             handle.block_on(async {
-                let mut run = RunGuard::start_in(&profile, "hw_guarded_handle", reports.dir());
+                let run = RunGuard::start_in(&profile, "hw_guarded_handle", reports.dir());
                 let mut handle = GuardedHandle::attach(
                     &profile,
                     &vci(&profile),
                     client,
                     module(),
                     options(),
-                    &mut run,
+                    &run,
                 )
                 .await
                 .expect("the handle opens the profile's link");
@@ -319,7 +319,7 @@ async fn a_t0_raw_frame_is_transmitted_as_the_guard_reads_it() {
             server.worker_client().await,
             module(),
             options(),
-            &mut run,
+            &run,
         )
         .await
         .expect("the handle opens the T0 link in RawMode");
@@ -389,7 +389,7 @@ async fn a_send_receive_that_times_out_cancels_its_primitive() {
             request_timeout: std::time::Duration::from_secs(5),
             response_timeout: Some(std::time::Duration::from_millis(300)),
         },
-        &mut run,
+        &run,
     )
     .await
     .expect("the handle opens the profile's link");
@@ -441,7 +441,7 @@ async fn the_default_deadline_follows_a_timing_the_check_changes() {
         server.worker_client().await,
         module(),
         HandleOptions::default(),
-        &mut run,
+        &run,
     )
     .await
     .expect("the handle opens the profile's link");
@@ -536,7 +536,7 @@ async fn a_link_created_again_through_the_handle_reads_a_did() {
         server.worker_client().await,
         module(),
         options(),
-        &mut run,
+        &run,
     )
     .await
     .expect("the handle opens the profile's link");
@@ -677,7 +677,7 @@ async fn destroying_a_link_in_another_session_returns_it_to_the_default_one_firs
             request_timeout: std::time::Duration::from_secs(5),
             response_timeout: Some(std::time::Duration::from_millis(300)),
         },
-        &mut run,
+        &run,
     )
     .await
     .expect("the handle opens the profile's link");
@@ -760,7 +760,7 @@ async fn disconnecting_a_link_in_another_session_returns_it_to_the_default_one_f
             request_timeout: std::time::Duration::from_secs(5),
             response_timeout: Some(std::time::Duration::from_millis(300)),
         },
-        &mut run,
+        &run,
     )
     .await
     .expect("the handle opens the profile's link");
@@ -821,7 +821,7 @@ async fn a_return_to_the_default_session_by_the_check_clears_the_pending_one() {
         server.worker_client().await,
         module(),
         options(),
-        &mut run,
+        &run,
     )
     .await
     .expect("the handle opens the profile's link");
@@ -875,7 +875,7 @@ async fn an_abandoned_destroy_leaves_the_return_to_the_teardown() {
             request_timeout: std::time::Duration::from_secs(5),
             response_timeout: Some(std::time::Duration::from_secs(30)),
         },
-        &mut run,
+        &run,
     )
     .await
     .expect("the handle opens the profile's link");
@@ -935,7 +935,7 @@ async fn the_teardown_resumes_a_suspended_transmit_queue() {
         server.worker_client().await,
         module(),
         options(),
-        &mut run,
+        &run,
     )
     .await
     .expect("the handle opens the profile's link");
@@ -987,7 +987,7 @@ async fn a_refused_session_change_leaves_no_return_pending() {
         server.worker_client().await,
         module(),
         options(),
-        &mut run,
+        &run,
     )
     .await
     .expect("the handle opens the profile's link");
@@ -1018,4 +1018,96 @@ async fn a_refused_session_change_leaves_no_return_pending() {
     assert_eq!(server.backdoor.write_msgs_count(), 0);
     drop(run);
     server.shutdown().await;
+}
+
+/// A T0 loopback of two VCI modules is driven from one run: two handles (one worker each) on the
+/// same run register their teardown into it, and the steps of both run in one reverse
+/// registration order. The guard needs nothing shared between them: each handle's context binds
+/// its own module's endpoint.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn two_handles_on_one_run_are_torn_down_in_reverse_order() {
+    let first_server = TestServer::start().await;
+    let second_server = TestServer::start().await;
+    let vci_toml = |label: &str, pname: &str| {
+        format!(
+            "api = \"j2534-0404\"\nlibrary = \"mock-lib\"\nmodule = \"{label}\"\n\
+             label = \"{label}\"\npname = \"{pname}\"\nfirmware_version = \"1.0.0\"\n\
+             library_version = \"1.0.0\"\n"
+        )
+    };
+    let end = |label: &str, pname: &str, request: u32, response: u32| {
+        format!(
+            "[[endpoint]]\n[endpoint.vci]\n{}[endpoint.link]\n\
+             protocol = \"ISO_14229_3_on_ISO_15765_2\"\nbaud_rate = 500000\npins = [6, 14]\n\
+             request_id = {request}\nresponse_id = {response}\nid_bits = 11\n\
+             addressing = \"normal\"\n",
+            vci_toml(label, pname)
+        )
+    };
+    let profile = profile::parse(&format!(
+        "class = \"T0\"\n{}{}",
+        end("Bench A", "J2534-2:a", 0x123, 0x124),
+        end("Bench B", "J2534-2:b", 0x124, 0x123)
+    ))
+    .expect("a T0 profile of two modules");
+    let Setup::Loopback(ends) = &profile.setup else {
+        panic!("a loopback");
+    };
+    let [vci_a, vci_b] = [0, 1].map(|i| ends[i].vci.clone().expect("a VCI end"));
+
+    let reports = Reports::new();
+    let mut run = RunGuard::start_in(&profile, "hw_guarded_handle", reports.dir());
+    // Markers between the handles' steps tell how many modules were closed when they ran.
+    let library = j2534_0404_mock::mock_library_path().expect("the mock");
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let marker = |name: &'static str, run: &RunGuard| {
+        let backdoor = MockBackdoor::open(&library);
+        let seen = std::sync::Arc::clone(&seen);
+        run.teardown().register(name, move || {
+            seen.lock().unwrap().push((name, backdoor.close_count()));
+            Ok(())
+        });
+    };
+    marker("before", &run);
+    let first = GuardedHandle::attach(
+        &profile,
+        &vci_a,
+        first_server.worker_client().await,
+        module(),
+        options(),
+        &run,
+    )
+    .await
+    .expect("the first module's end opens");
+    marker("between", &run);
+    let second = GuardedHandle::attach(
+        &profile,
+        &vci_b,
+        second_server.worker_client().await,
+        module(),
+        options(),
+        &run,
+    )
+    .await
+    .expect("the second module's end opens on the same run, while the first is open");
+    marker("after", &run);
+    // Each handle bound its own end of the loopback.
+    assert_eq!(first.links().len(), 1);
+    assert_eq!(second.links().len(), 1);
+    assert_eq!(first.bound_links().values().next().unwrap().endpoint, 0);
+    assert_eq!(second.bound_links().values().next().unwrap().endpoint, 1);
+
+    run.pass();
+    assert!(run.run_teardown().is_empty());
+    // Last registered first: "after", then the second handle's steps (one module closed by the
+    // time "between" runs), then the first's (two by the time "before" runs).
+    assert_eq!(
+        *seen.lock().unwrap(),
+        [("after", 0), ("between", 1), ("before", 2)]
+    );
+    drop((first, second));
+    drop(run);
+    first_server.shutdown().await;
+    second_server.shutdown().await;
 }

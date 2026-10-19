@@ -25,7 +25,7 @@ use worker_host::abi::Abi;
 use crate::Refusal;
 use crate::device::{ReportedModule, ReportedVersion, attribute_values, coded_version};
 use crate::profile::{Api, Profile, Setup, Vci};
-use crate::teardown::{StepFailure, Teardown, TeardownHandle};
+use crate::teardown::{StepFailure, Teardown, TeardownHandle, run_shared};
 
 /// The report directory below the user's data directory.
 const SUBDIR: [&str; 2] = ["nekoguruma", "hw-reports"];
@@ -551,7 +551,7 @@ pub struct RunGuard {
     report: Report,
     check: String,
     dir: Option<PathBuf>,
-    teardown: Teardown,
+    teardown: std::sync::Arc<std::sync::Mutex<Teardown>>,
     /// What failed in the steps run so far, by an early [`RunGuard::run_teardown`] or at drop.
     teardown_failures: Vec<StepFailure>,
 }
@@ -578,7 +578,7 @@ impl RunGuard {
             report,
             check: check.to_owned(),
             dir,
-            teardown: Teardown::new(),
+            teardown: std::sync::Arc::default(),
             teardown_failures: Vec::new(),
         }
     }
@@ -586,15 +586,15 @@ impl RunGuard {
     /// The run's teardown steps (design 13.5 "Cleanup"): register one as each resource is
     /// acquired. Dropping the guard runs them first, in reverse, and a step that fails fails
     /// the check even if it recorded a pass.
-    pub fn teardown(&mut self) -> TeardownHandle<'_> {
-        TeardownHandle(&mut self.teardown)
+    pub fn teardown(&self) -> TeardownHandle {
+        TeardownHandle(std::sync::Arc::clone(&self.teardown))
     }
 
     /// Runs the registered steps now (early cleanup, such as before the check's last reads) and
     /// returns what failed, for information. The failures stay with the guard: dropping it fails
     /// the check even if it records a pass afterwards. A step registered later runs at drop.
     pub fn run_teardown(&mut self) -> Vec<StepFailure> {
-        let failures = self.teardown.run();
+        let failures = run_shared(&self.teardown);
         self.teardown_failures.extend(failures.iter().cloned());
         failures
     }

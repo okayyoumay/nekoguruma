@@ -1166,12 +1166,13 @@ fn resource_for(link: &Link, channel: Option<&str>) -> ResourceData {
 
 /// The handle of a hardware check on its VCI. See the module documentation.
 ///
-/// It borrows the run's teardown, so the check ends its use of the handle (by dropping it)
-/// before it records its result on the [`RunGuard`].
-pub struct GuardedHandle<'r> {
+/// It registers its steps with the run's teardown through a clone of the run's handle, so it does
+/// not borrow the [`RunGuard`]: several handles (the two VCI modules of a T0 loopback) can be open
+/// on one run, and the steps of all run in one global reverse registration order.
+pub struct GuardedHandle {
     client: WorkerClient,
     shared: Arc<Shared>,
-    teardown: TeardownHandle<'r>,
+    teardown: TeardownHandle,
     links: Vec<ComLogicalLinkHandle>,
 }
 
@@ -1185,7 +1186,7 @@ macro_rules! passthrough {
     )*};
 }
 
-impl<'r> GuardedHandle<'r> {
+impl GuardedHandle {
     /// Opens the profile's links on a device `open_device` opened and matched with `vci`, and
     /// returns the handle. Registers the device's closing (module disconnect, worker stop) with
     /// `run`, then each link's, before any of them is used. On an error the steps registered so
@@ -1195,8 +1196,8 @@ impl<'r> GuardedHandle<'r> {
         vci: &Vci,
         device: OpenedDevice,
         options: HandleOptions,
-        run: &'r mut RunGuard,
-    ) -> Result<GuardedHandle<'r>, HandleError> {
+        run: &RunGuard,
+    ) -> Result<GuardedHandle, HandleError> {
         let client = device.client();
         let module = device.module_handle();
         let close: Step = Box::pin(async move {
@@ -1221,8 +1222,8 @@ impl<'r> GuardedHandle<'r> {
         client: WorkerClient,
         module: ModuleHandle,
         options: HandleOptions,
-        run: &'r mut RunGuard,
-    ) -> Result<GuardedHandle<'r>, HandleError> {
+        run: &RunGuard,
+    ) -> Result<GuardedHandle, HandleError> {
         let mut closing = client.clone();
         let timeout = options.request_timeout;
         let close: Step = Box::pin(async move {
@@ -1244,9 +1245,9 @@ impl<'r> GuardedHandle<'r> {
         client: WorkerClient,
         module: ModuleHandle,
         options: HandleOptions,
-        run: &'r mut RunGuard,
+        run: &RunGuard,
         close_device: Step,
-    ) -> Result<GuardedHandle<'r>, HandleError> {
+    ) -> Result<GuardedHandle, HandleError> {
         let mut teardown = run.teardown();
         teardown.register_async("close the device", close_device);
         let mut handle = GuardedHandle {

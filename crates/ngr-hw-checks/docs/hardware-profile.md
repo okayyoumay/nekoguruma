@@ -239,8 +239,14 @@ Anything it cannot classify is refused.
 
 `ngr_hw_checks::guard::GuardedHandle` is what a check gets of the worker (design 13.5 "Guarded VCI
 access"); the check never holds the worker client. It owns the client and the state the decision
-rests on (the link table and the learned ids), and borrows the run's teardown, so a check drops
-the handle before it records its result on the `RunGuard`. A check runs on a multi-thread tokio
+rests on (the link table and the learned ids). It registers its teardown steps through a clone of
+the run's `TeardownHandle` (`RunGuard::teardown()`, clonable, register-only), so it borrows nothing
+from the `RunGuard` (`open` and `attach` take `&RunGuard`): a T0 loopback of two VCI modules opens
+one handle per module on the same run, and the steps of all handles run in one reverse
+registration order. Each handle's guard context binds the endpoints of its own VCI only, so the
+handles share no guard state; a check opens one handle per VCI (a second handle on the same module
+would create the profile's links again). Devices a check wants in the report are added by the
+check with `report().add_device`, once per device; the handle adds none. A check runs on a multi-thread tokio
 runtime: a teardown step waits for its requests on a thread of its own while the worker's
 connection is served by the runtime.
 

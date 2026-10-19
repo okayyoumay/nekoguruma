@@ -708,3 +708,14 @@ check as well.
   table, a negative, short or long response, a wrong echo, or a field that does not fit its
   encoding reads as "cannot be decoded". ASCII text keeps surrounding spaces as they are; a
   field of only spaces, or with any byte outside 0x20 to 0x7E, cannot be decoded.
+
+## The worker client
+
+The runner, the host and the link set-up call the worker through the trait `agent::client::WorkerApi`
+(ADR-334): one method per RPC they use, with the generated gRPC client's signatures, and
+`held_module()`. `ngr-agent` uses `worker_host::client::WorkerClient`, which implements the trait by
+delegating, so a production call is unchanged. A client that holds the worker's module itself
+(`held_module()` is `Some`) is used by the hardware harness's guarded client
+(`ngr_hw_checks::guard::GuardedClient`, design 13.5): the link set-up then neither lists, connects
+nor disconnects the module, a failed open never disconnects it, and its owner closes it. The default
+(`None`) is the production behaviour: the job opens and closes the worker's only module.

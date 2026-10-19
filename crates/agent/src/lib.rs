@@ -1,6 +1,7 @@
 //! Agent (design 3.3): runs IR procedures against a worker.
 //!
 //! - [`launch`]: launching the worker that matches a VCI library's ABI (7.3)
+//! - [`client`]: the worker client as a trait, so the hardware harness can guard a job's calls (ADR-334)
 //! - [`link`]: the communication link a job runs on, set up through the worker's D-PDU API
 //!   before the procedure starts
 //! - [`host`]: [`diag_ir::DiagHost`] on top of the worker gRPC client
@@ -17,6 +18,7 @@
 //! The contract between the VM and the worker (what `ServiceRequest` sends, what comes back,
 //! deadlines, the sync/async bridge) is ADR-235.
 
+pub mod client;
 pub mod document;
 pub mod guards;
 pub mod host;
@@ -30,6 +32,7 @@ pub mod restart;
 pub mod runner;
 pub mod send_receive;
 
+pub use client::WorkerApi;
 pub use document::JobDocument;
 pub use host::{HostError, Timings, WorkerHost};
 pub use journal::Vin;

@@ -17,4 +17,5 @@ vci-service-interface = { workspace = true }
 worker-host = { workspace = true }
 
 [dev-dependencies]
+diag-ir = { workspace = true }
 tempfile = "3"

@@ -14,13 +14,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::client::WorkerApi;
 use diag_ir::declaration::EcuVariant;
 use diag_ir::{
     DiagHost, IdentityKind, Interruptible, Op, Program, StepError, StepOutcome, Vm, VmError,
     VmState, WaitingOn,
 };
 use tokio::runtime::{Handle, RuntimeFlavor};
-use worker_host::client::WorkerClient;
 
 use crate::document::{Declarations, JobDocument};
 use crate::guards::{GuardError, JobGuards};
@@ -404,8 +404,8 @@ fn refuse_beyond(
 /// with the policy before anything opens. The run takes the guards by value, so two runs can
 /// never use one set at once, holds them until the link is closed, and returns them with its
 /// result. A dropped future releases them only once the job thread has ended.
-pub async fn run_program(
-    client: WorkerClient,
+pub async fn run_program<C: WorkerApi>(
+    client: C,
     config: &LinkConfig,
     program: impl Into<Job>,
     limits: JobLimits,
@@ -431,8 +431,8 @@ pub async fn run_program(
 /// ends the job before the request it guards is sent. A program with neither keeps no journal
 /// and creates no file. `guards` are taken and returned as for [`run_program`]; a program with a
 /// plan writes, so they must hold the reprogramming slot (`JobGuards::take`).
-pub async fn run_program_journaled(
-    client: WorkerClient,
+pub async fn run_program_journaled<C: WorkerApi>(
+    client: C,
     config: &LinkConfig,
     program: impl Into<Job>,
     limits: JobLimits,
@@ -539,8 +539,8 @@ pub async fn run_program_journaled(
 /// lock is held while the job runs as well, so a second writer of the same journal ends in
 /// `JobError::Journal(JournalError::InUse)` with nothing sent (ADR-255). The start deadline and
 /// a server reservation are not taken here.
-pub async fn resume_program_journaled(
-    client: WorkerClient,
+pub async fn resume_program_journaled<C: WorkerApi>(
+    client: C,
     config: &LinkConfig,
     program: impl Into<Job>,
     limits: JobLimits,
@@ -561,8 +561,8 @@ pub async fn resume_program_journaled(
 
 /// Puts `guards` in a slot, runs the job with it and takes the guards back, so every entry
 /// point returns them with its result.
-async fn run_guarded(
-    client: WorkerClient,
+async fn run_guarded<C: WorkerApi>(
+    client: C,
     config: &LinkConfig,
     job: impl Into<Job>,
     limits: JobLimits,
@@ -590,8 +590,8 @@ async fn run_guarded(
 }
 
 /// [`run_program`] with the build's ceiling given, so tests can run under a lower one.
-async fn run_program_within(
-    client: WorkerClient,
+async fn run_program_within<C: WorkerApi>(
+    client: C,
     config: &LinkConfig,
     job: Job,
     limits: JobLimits,
@@ -658,9 +658,9 @@ async fn run_program_within(
     clippy::too_many_arguments,
     reason = "the job's whole input, split only by what the caller owns"
 )]
-fn run_job(
+fn run_job<C: WorkerApi>(
     handle: Handle,
-    mut client: WorkerClient,
+    mut client: C,
     config: &LinkConfig,
     program: &Program,
     document: Option<JobDocument>,
@@ -792,9 +792,9 @@ fn run_job(
 /// the job panics, by `Drop`. The job's result stands whether or not that works; a failure is
 /// logged and marks the job's guards (`JobGuards::mark_link_unconfirmed`, ADR-258), since the
 /// worker may then still hold the VCI.
-struct OpenLink {
+struct OpenLink<C: WorkerApi> {
     handle: Handle,
-    client: WorkerClient,
+    client: C,
     module_handle: vci_service_interface::ModuleHandle,
     cll_handle: vci_service_interface::ComLogicalLinkHandle,
     deadline: Duration,
@@ -802,7 +802,7 @@ struct OpenLink {
     closed: bool,
 }
 
-impl OpenLink {
+impl<C: WorkerApi> OpenLink<C> {
     /// Closes the link. The link's event stream must be dropped before.
     fn close(mut self) {
         self.teardown();
@@ -837,7 +837,7 @@ fn mark_link_unconfirmed(slot: &GuardSlot) {
     }
 }
 
-impl Drop for OpenLink {
+impl<C: WorkerApi> Drop for OpenLink<C> {
     fn drop(&mut self) {
         self.teardown();
     }
@@ -1502,6 +1502,7 @@ mod tests {
 
     use diag_ir::{IR_SCHEMA_VERSION, Op, Value};
     use vci_service_interface::{ComLogicalLinkHandle, ModuleHandle};
+    use worker_host::client::WorkerClient;
 
     use super::*;
 
@@ -11852,6 +11853,78 @@ def main():
         // Every step of the close was tried.
         assert!(calls.contains(&"ModuleDisconnect"), "{calls:?}");
         guards.worker_gone();
+    }
+
+    /// A client that holds its module: delegates every call to the real client.
+    #[derive(Clone)]
+    struct Held(WorkerClient);
+
+    macro_rules! delegate {
+        ($($name:ident($request:ty) -> $response:ty;)*) => {$(
+            fn $name(
+                &mut self,
+                request: $request,
+            ) -> impl Future<Output = crate::client::Reply<$response>> + Send {
+                WorkerApi::$name(&mut self.0, request)
+            }
+        )*};
+    }
+
+    impl WorkerApi for Held {
+        delegate! {
+            get_module_ids(vci_service_interface::GetModuleIdsRequest) -> vci_service_interface::ModuleIdsResponse;
+            module_connect(vci_service_interface::ModuleConnectRequest) -> vci_service_interface::Response;
+            module_disconnect(vci_service_interface::ModuleDisconnectRequest) -> vci_service_interface::Response;
+            get_version(vci_service_interface::GetVersionRequest) -> vci_service_interface::VersionResponse;
+            get_resource_ids(vci_service_interface::GetResourceIdsRequest) -> vci_service_interface::ResourceIdsResponse;
+            get_object_id(vci_service_interface::GetObjectIdRequest) -> vci_service_interface::ObjectIdResponse;
+            create_com_logical_link(vci_service_interface::CreateComLogicalLinkRequest) -> vci_service_interface::ComLogicalLinkResponse;
+            destroy_com_logical_link(vci_service_interface::DestroyComLogicalLinkRequest) -> vci_service_interface::Response;
+            connect_com_logical_link(vci_service_interface::ConnectComLogicalLinkRequest) -> vci_service_interface::Response;
+            disconnect_com_logical_link(vci_service_interface::DisconnectComLogicalLinkRequest) -> vci_service_interface::Response;
+            set_com_param(vci_service_interface::SetComParamRequest) -> vci_service_interface::Response;
+            set_unique_resp_id_table(vci_service_interface::SetUniqueRespIdTableRequest) -> vci_service_interface::Response;
+            start_com_primitive(vci_service_interface::StartComPrimitiveRequest) -> vci_service_interface::ComPrimitiveResponse;
+            subscribe_event(vci_service_interface::SubscribeEventRequest) -> tonic::Streaming<vci_service_interface::EventNotification>;
+            io_ctl(vci_service_interface::IoCtlRequest) -> vci_service_interface::IoCtlResponse;
+        }
+
+        fn held_module(&self) -> Option<ModuleHandle> {
+            Some(ModuleHandle { module_handle: 1 })
+        }
+    }
+
+    /// A client that holds the module (ADR-334): the job neither lists, connects nor disconnects
+    /// it, whether the link closes cleanly or its disconnect fails, and a failed open leaves it
+    /// alone too.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_held_module_is_never_listed_connected_or_disconnected() {
+        for (tag, fail_disconnect, fail_open) in [
+            ("held-ok", false, false),
+            ("held-close-fails", true, false),
+            ("held-open-fails", false, true),
+        ] {
+            let (client, calls) = fake_worker_with(fail_disconnect, fail_open).await;
+            let (result, mut guards) = run_program(
+                Held(client),
+                &LinkConfig::iso15765(0x7E0, 0x7E8),
+                program(Vec::new()),
+                JobLimits::default(),
+                vci_only_guards(tag),
+            )
+            .await;
+            assert_eq!(result.is_err(), fail_open, "{tag}: {result:?}");
+            let calls = calls.lock().unwrap().clone();
+            for module_call in ["GetModuleIds", "ModuleConnect", "ModuleDisconnect"] {
+                assert!(!calls.contains(&module_call), "{tag}: {calls:?}");
+            }
+            assert!(
+                calls.contains(&"DisconnectComLogicalLink"),
+                "{tag}: {calls:?}"
+            );
+            assert!(calls.contains(&"DestroyComLogicalLink"), "{tag}: {calls:?}");
+            guards.worker_gone();
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

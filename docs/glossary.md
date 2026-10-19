@@ -141,6 +141,9 @@ The IR instruction that sends a complete request, built by the frontend through 
 **Generic OBD**  
 The emissions-related diagnostic data that vehicles under an OBD mandate (depending on jurisdiction, vehicle class and model year) must report to any scan tool, with standardized requests and identifiers: SAE J1979 / ISO 15031-5 (on ISO 15765-4, and on ISO 9141-2, ISO 14230-4 or SAE J1850 in older vehicles), SAE J1979-2 ("OBD on UDS") and WWH-OBD (ISO 27145). The system provides it as a standard vehicle-knowledge package, independent of maker ODX data (ADR-237).
 
+**Guarded client** (ADR-334)  
+The hardware harness's implementation of the agent's worker-client trait (`agent::client::WorkerApi`, `ngr_hw_checks::guard::GuardedClient`): a job run through the agent calls the worker through the same guarded handle a direct **hardware check** uses, so the guard decides every call. The harness owns the module, and the client completes the job's link set-up from the hardware profile (design 13.5).
+
 **Guard list** (ADR-327)  
 The server-signed list of declaration-only documents that a job carries for each target it changes (by a write, reprogramming, a DTC clear, a routine or another request outside the read-only set, access programs aside): every variant, of any ECU definition the tenant may use, whose declared link is on the target's bus and shares its request or response identifier, whatever the identification concluded. Before anything that changes an ECU is sent, the agent identifies them all over the target's link, listening on every response identifier a listed variant pairs with the target's request identifier, and refuses the job when another ECU answers there, or unless exactly the target's identified variant matches and every identification request got a positive response that decodes or a negative response the ECU definition declares definitive for it (design 8.9.1).
 

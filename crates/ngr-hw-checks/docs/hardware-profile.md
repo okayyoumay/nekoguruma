@@ -6,8 +6,9 @@ compared, how the device a worker reports is matched with the profile, and how t
 it, how a run's report is written, and what the guard decides about each worker request and how a
 run's teardown works (ADR-333). A check reaches the worker only through `guard::GuardedHandle`
 (the "Guarded handle" section), which decides every call with the guard and registers the
-teardown steps. The agent job runner's own seam through the guard is the part that is not in the
-crate yet; a job the agent runs is not mediated until it exists.
+teardown steps. A job the agent runs is mediated the same way, through `guard::GuardedClient`,
+which implements the agent's worker-client trait over the same handle (ADR-334; the "Agent
+jobs" part of the Guarded handle section).
 
 ## Running
 
@@ -312,6 +313,26 @@ connection is served by the runtime.
   handle call that must register a step, is refused with `TeardownClosed`
   (`HandleError::TeardownClosed`), and a link created at that moment is released at once rather
   than left without a step. An early `run_teardown` does not close registration.
+- **Agent jobs.** `GuardedClient::open` / `attach` hold the device (the module and its closing,
+  no link) and are the `WorkerApi` client of `agent::run_program` and the other runner entry points
+  (ADR-334); the production path is unchanged. Every call the job makes goes through the handle,
+  so the guard decides it, and a refusal reaches the runner as `PermissionDenied`. The harness owns
+  the module (`held_module`): the job's link set-up lists, connects and disconnects none, and the
+  device's closing step disconnects it once. The runner's set-up gives the baud rate, timing, the
+  two identifiers and nothing more, so the client completes it from the profile: on
+  `SetUniqueRespIdTable` it appends the profile's other table entries (formats, address bytes);
+  on `ConnectComLogicalLink` it first sets every other pinned ComParam (address modes, the
+  functional identifier, the filler, the tester-present message, the profile's own) at the
+  profile's value, each added request decided and recorded like any other. The job's own values
+  are compared with the profile's unchanged, so a mismatch is still refused. The handle keeps no
+  event stream for the job's link (the job subscribes itself, and a worker keeps one subscription
+  per link); it subscribes again only when it must read events itself, such as the return to the
+  default session after the job. `GuardedClient::trace()` is the record of every decision (the RPC
+  and the guard's answer), in order. The handle's request timeout is at least the runner's 5 s
+  unary deadline, which bounds a guarded call that carries several worker requests. T0 is refused
+  at link creation (a job's link is not RawMode). `HandleError::Rpc` and `WorkerRefused` carry the
+  worker's status code, so a refusal by the worker reaches the runner unchanged, and the lost VCI
+  as the status the host recognises.
 - **Links created by a check.** Whatever creates a link through the handle, including a link a
   check destroys and creates again, gets the same per-link set-up: the teardown step, the event
   stream and timings to wait by (the handle's defaults, 1 s, 5 s and 25 s, until the check sets

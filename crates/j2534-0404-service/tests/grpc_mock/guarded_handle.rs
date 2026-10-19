@@ -1192,3 +1192,72 @@ async fn a_primitive_started_directly_is_cancelled_before_the_return() {
     drop(run);
     server.shutdown().await;
 }
+
+/// A queue suspended on a link is resumed before the link is destroyed or disconnected, since the
+/// guard refuses an IO control on a destroyed link: the teardown then has nothing left to resume
+/// and reports no failure.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_suspended_queue_is_resumed_before_its_link_is_destroyed_or_disconnected() {
+    for destroy in [true, false] {
+        let server = TestServer::start().await;
+        let profile = t3();
+        let reports = Reports::new();
+        let mut run = RunGuard::start_in(&profile, "hw_guarded_handle", reports.dir());
+        let mut handle = GuardedHandle::attach(
+            &profile,
+            &vci(&profile),
+            server.worker_client().await,
+            module(),
+            options(),
+            &run,
+        )
+        .await
+        .expect("the handle opens the profile's link");
+        let [cll] = *handle.links() else {
+            panic!("one link");
+        };
+        let suspend = handle
+            .get_object_id(vci_service_interface::GetObjectIdRequest {
+                object_type: vci_service_interface::ObjectType::ObjtIoCtrl as i32,
+                shortname: "PDU_IOCTL_SUSPEND_TX_QUEUE".to_owned(),
+            })
+            .await
+            .expect("the id")
+            .pdu_object_id;
+        handle
+            .io_ctl(vci_service_interface::IoCtlRequest {
+                handle: Some(vci_service_interface::io_ctl_request::Handle::CllHandle(
+                    cll,
+                )),
+                io_ctrl_command: Some(
+                    vci_service_interface::io_ctl_request::IoCtrlCommand::IoCtrlCommandId(suspend),
+                ),
+                input_data: None,
+                has_output: false,
+            })
+            .await
+            .expect("the queue is suspended");
+        if destroy {
+            handle
+                .destroy_com_logical_link(DestroyComLogicalLinkRequest {
+                    cll_handle: Some(cll),
+                })
+                .await
+                .expect("the queue is resumed, then the link destroyed");
+            assert!(handle.bound_links().is_empty());
+        } else {
+            handle
+                .disconnect_com_logical_link(DisconnectComLogicalLinkRequest {
+                    cll_handle: Some(cll),
+                })
+                .await
+                .expect("the queue is resumed, then the link disconnected");
+        }
+        drop(handle);
+        run.pass();
+        assert!(run.run_teardown().is_empty(), "destroy: {destroy}");
+        drop(run);
+        server.shutdown().await;
+    }
+}

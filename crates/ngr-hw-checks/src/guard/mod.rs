@@ -18,7 +18,8 @@
 //!   request through [`decide`], keeps the link table and the learned ids, opens the profile's links
 //!   and registers the teardown steps.
 //!
-//! The seam that routes the agent's job runner through [`decide`] is not part of this module.
+//! The seam that routes the agent's job runner through [`decide`] is not part of this crate yet;
+//! a direct check's seam is [`GuardedHandle`].
 
 use std::collections::{BTreeMap, BTreeSet};
 

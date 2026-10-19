@@ -4,8 +4,10 @@
 describes the hardware profile it reads, how a check declares what it needs, and how the two are
 compared, how the device a worker reports is matched with the profile, and how the harness opens
 it, how a run's report is written, and what the guard decides about each worker request and how a
-run's teardown works (ADR-333). The seam that routes a check's, or the agent's, worker calls
-through the guard is not part of the crate yet.
+run's teardown works (ADR-333). A check reaches the worker only through `guard::GuardedHandle`
+(the "Guarded handle" section), which decides every call with the guard and registers the
+teardown steps. The agent job runner's own seam through the guard is the part that is not in the
+crate yet; a job the agent runs is not mediated until it exists.
 
 ## Running
 
@@ -303,7 +305,7 @@ connection is served by the runtime.
   destroyed, its communication is stopped, and in the teardown steps (the return to the default
   session and the link's closing), the handle cancels every one still recorded (cancelling one
   that already ended succeeds and changes nothing), so a direct `10 03` cannot race the `10 01`.
-  The device's closing step is bounded by the request timeout (plus the worker's stop grace
+  A link's suspended transmit queue is resumed before the link is disconnected or destroyed (the guard refuses an IO control on a destroyed link), and the saved resume of a destroyed link is dropped. The steps that cancel and resume first are given a request timeout for each primitive and queue they handle. The device's closing step is bounded by the request timeout (plus the worker's stop grace
   period for a worker process), never less than the 30 s default.
 - **Registration closes.** When the run ends its teardown (`RunGuard` drop), registration closes
   under the same lock that finds no step left. A `TeardownHandle` that outlives the run, and any

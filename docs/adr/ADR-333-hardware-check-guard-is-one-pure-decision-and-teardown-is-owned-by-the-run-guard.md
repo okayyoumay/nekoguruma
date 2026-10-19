@@ -9,7 +9,8 @@
 ADR-275 item 4 says a check reaches the VCI only through a guarded handle, and item 6 says
 teardown steps run in reverse, once, on pass, failure and panic. Both stayed prose. The handle has
 two parts: a decision (is this worker request allowed?) and a seam that routes a direct check or
-the agent's job runner through it and keeps the state the decision needs. The decision is what
+the agent's job runner through it and keeps the state the decision needs (a direct check's seam
+is `GuardedHandle`; the agent runner's is separate work). The decision is what
 the class rules rest on, and it needs to be testable without a worker or a device.
 
 Three facts shape it. The worker creates links by resource id and sets ComParams by id, and
@@ -234,7 +235,7 @@ Alternatives rejected:
   0x78 handling and the declared ComParams, and the two identifiers in the response table, and
   then connects. It never sets the functional identifier, the CAN ID formats, the address byte,
   the filler or a profile's `[link.comparams]`. Through the guard, a profile that has any of
-  these has its connect refused until the seam sets them (it must set them itself before or
-  while handing the agent its link, or the agent's connect fails); the worker's defaults are not
+  these has its connect refused until the agent runner's seam sets them (it must set them itself
+  before or while handing the agent its link, or the agent's connect fails); the worker's defaults are not
   assumed to equal the profile's (the J2534 CAN preset is 500 kbit/s whatever the profile says).
 - ADR-275 items 4 and 6 are unchanged; this ADR gives the rules their concrete form.

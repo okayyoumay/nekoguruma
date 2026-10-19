@@ -319,6 +319,9 @@ impl Shared {
                 state.session_registered.remove(cll);
                 state.inflight.remove(cll);
                 state.started.remove(cll);
+                state.suspended.retain(|saved| {
+                    !matches!(&saved.handle, Some(io_ctl_request::Handle::CllHandle(c)) if c.cll_handle == *cll)
+                });
             }
             Grant::Pass | Grant::CreatesLink { .. } | Grant::EntersSession(_) => {}
         }
@@ -457,6 +460,45 @@ impl Shared {
             }
         }
         first.map_or(Ok(()), Err)
+    }
+
+    /// Resumes the transmit queue a check suspended on `cll` itself, before the link stops being
+    /// usable: the guard refuses an IO control on a link that was destroyed, so a resume left for
+    /// the teardown would fail there.
+    async fn resume_link(
+        &self,
+        client: &mut WorkerClient,
+        cll: ComLogicalLinkHandle,
+    ) -> Result<(), HandleError> {
+        let on_link = |saved: &IoCtlRequest| matches!(&saved.handle, Some(io_ctl_request::Handle::CllHandle(c)) if c.cll_handle == cll.cll_handle);
+        loop {
+            let found = {
+                let mut state = self.lock();
+                let at = state.suspended.iter().position(on_link);
+                at.map(|at| state.suspended.remove(at))
+            };
+            let Some(request) = found else {
+                return Ok(());
+            };
+            let sent = async {
+                self.admit(&Request::IoCtl(&request))?;
+                self.send("IoCtl", client.io_ctl(request.clone())).await
+            }
+            .await;
+            if let Err(error) = sent {
+                self.lock().suspended.push(request);
+                return Err(error);
+            }
+        }
+    }
+
+    /// How many requests the steps that end a link may send before their own: a cancel for each
+    /// outstanding primitive, and a resume for each suspended queue.
+    fn outstanding_requests(&self, cll: ComLogicalLinkHandle) -> usize {
+        let state = self.lock();
+        usize::from(state.inflight.contains_key(&cll.cll_handle))
+            + state.started.get(&cll.cll_handle).map_or(0, Vec::len)
+            + state.suspended.len()
     }
 
     /// Resumes the transmit queues a check suspended, each through the guard. A suspended
@@ -669,11 +711,13 @@ fn device_close_timeout(budget: Duration) -> Duration {
         .max(crate::teardown::DEFAULT_STEP_TIMEOUT)
 }
 
-/// The time the step that closes a link is given: its cancel, disconnect and destroy requests, each
-/// bounded by `request_timeout`, and a margin; never less than the teardown's default.
-fn close_link_timeout(request_timeout: Duration) -> Duration {
+/// The time the step that closes a link is given: its disconnect and destroy requests and one
+/// request for each primitive to cancel and queue to resume before them (`before`), each bounded by
+/// `request_timeout`, and a margin; never less than the teardown's default.
+fn close_link_timeout(request_timeout: Duration, before: usize) -> Duration {
+    let requests = u32::try_from(before.saturating_add(3)).unwrap_or(u32::MAX);
     request_timeout
-        .saturating_mul(3)
+        .saturating_mul(requests)
         .saturating_add(Duration::from_secs(1))
         .max(crate::teardown::DEFAULT_STEP_TIMEOUT)
 }
@@ -728,9 +772,13 @@ async fn close_link(
 
 /// The time the step that returns a link to the default session is given: the wait for the
 /// response (`wait`, which the step never exceeds and after which it cancels the primitive), the
-/// start request and the cancel request, and a margin; never less than the teardown's default.
-fn session_reset_timeout(wait: Duration, request_timeout: Duration) -> Duration {
-    wait.saturating_add(request_timeout.saturating_mul(2))
+/// start request and the cancel request, a request for each outstanding primitive and suspended
+/// queue (`before`), and a margin; never less than the teardown's default.
+fn session_reset_timeout(wait: Duration, request_timeout: Duration, before: usize) -> Duration {
+    // The start and cancel requests of the return itself, and one request for each primitive to
+    // cancel and queue to resume first.
+    let requests = u32::try_from(before.saturating_add(2)).unwrap_or(u32::MAX);
+    wait.saturating_add(request_timeout.saturating_mul(requests))
         .saturating_add(Duration::from_secs(1))
         .max(crate::teardown::DEFAULT_STEP_TIMEOUT)
 }
@@ -1597,9 +1645,15 @@ impl GuardedHandle {
                     .insert(cll.cll_handle, BoundLink::new(endpoint, raw_mode));
                 state.closing.insert(cll.cll_handle);
             }
-            if let Err(closed) = self.teardown.register_async_with_timeout(
+            let shared = self.shared.clone();
+            if let Err(closed) = self.teardown.register_async_with_timeout_fn(
                 format!("close link {}", cll.cll_handle),
-                close_link_timeout(self.shared.options.request_timeout),
+                move || {
+                    close_link_timeout(
+                        shared.options.request_timeout,
+                        shared.outstanding_requests(cll),
+                    )
+                },
                 close_link(self.shared.clone(), self.client.clone(), cll),
             ) {
                 // No step will release the link, so it is released now.
@@ -1761,6 +1815,9 @@ impl GuardedHandle {
             self.shared
                 .cancel_outstanding(&mut self.client.clone(), cll)
                 .await?;
+            self.shared
+                .resume_link(&mut self.client.clone(), cll)
+                .await?;
         }
         self.settle_session(request.cll_handle, "disconnected")
             .await?;
@@ -1783,6 +1840,9 @@ impl GuardedHandle {
         if let Some(cll) = request.cll_handle {
             self.shared
                 .cancel_outstanding(&mut self.client.clone(), cll)
+                .await?;
+            self.shared
+                .resume_link(&mut self.client.clone(), cll)
                 .await?;
         }
         self.settle_session(request.cll_handle, "destroyed").await?;
@@ -1879,7 +1939,13 @@ impl GuardedHandle {
             let shared = self.shared.clone();
             if let Err(closed) = self.teardown.register_async_with_timeout_fn(
                 format!("return link {} to the default session", cll.cll_handle),
-                move || session_reset_timeout(shared.wait_for(cll), shared.options.request_timeout),
+                move || {
+                    session_reset_timeout(
+                        shared.wait_for(cll),
+                        shared.options.request_timeout,
+                        shared.outstanding_requests(cll),
+                    )
+                },
                 return_to_default_session(self.shared.clone(), self.client.clone(), cll),
             ) {
                 // Nothing was sent, so nothing needs returning.
@@ -2219,12 +2285,16 @@ mod tests {
     fn the_session_reset_step_has_time_for_the_longest_wait() {
         let request = Duration::from_secs(5);
         let long = Duration::from_secs(68);
-        assert!(session_reset_timeout(long, request) > long + request * 2);
-        assert!(session_reset_timeout(long, request) > crate::teardown::DEFAULT_STEP_TIMEOUT);
+        assert!(session_reset_timeout(long, request, 0) > long + request * 2);
+        // Each outstanding primitive and suspended queue is one more request before the return.
+        assert!(session_reset_timeout(long, request, 4) > long + request * 6);
+        // Saturating, not overflowing.
+        assert!(session_reset_timeout(long, Duration::MAX, usize::MAX) >= long);
+        assert!(session_reset_timeout(long, request, 0) > crate::teardown::DEFAULT_STEP_TIMEOUT);
         // A short wait keeps the teardown's default.
         let short = Duration::from_secs(3);
         assert_eq!(
-            session_reset_timeout(short, request),
+            session_reset_timeout(short, request, 0),
             crate::teardown::DEFAULT_STEP_TIMEOUT
         );
     }
@@ -2518,13 +2588,14 @@ mod tests {
     #[test]
     fn the_close_step_has_time_for_its_requests() {
         let request = Duration::from_secs(20);
-        assert!(close_link_timeout(request) > request * 3);
+        assert!(close_link_timeout(request, 0) > request * 3);
+        assert!(close_link_timeout(request, 2) > request * 5);
         assert_eq!(
-            close_link_timeout(Duration::from_secs(1)),
+            close_link_timeout(Duration::from_secs(1), 0),
             crate::teardown::DEFAULT_STEP_TIMEOUT
         );
         // Saturating, not overflowing.
-        assert_eq!(close_link_timeout(Duration::MAX), Duration::MAX);
+        assert_eq!(close_link_timeout(Duration::MAX, usize::MAX), Duration::MAX);
     }
 
     #[test]

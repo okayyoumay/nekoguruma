@@ -239,7 +239,7 @@ jobs:
               -- -max_total_time=60 -rss_limit_mb=2048
           done
       - if: failure()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: fuzz-artifacts
           path: fuzz/artifacts/
@@ -316,7 +316,7 @@ jobs:
             --target ${{ matrix.target }} --message-format=json |
             jq -r 'select(.reason == "compiler-artifact" and .profile.test and .target.name == "sim_vci_end_to_end") | .executable')"
           cp "$exe" target/${{ matrix.target }}/debug/sim_vci_end_to_end.exe
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: abi-launch-${{ matrix.target }}
           path: |
@@ -382,11 +382,11 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@v8
         with:
           name: abi-launch-x86_64-pc-windows-gnullvm
           path: target/x86_64-pc-windows-gnullvm
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@v8
         with:
           name: abi-launch-i686-pc-windows-gnullvm
           path: target/i686-pc-windows-gnullvm

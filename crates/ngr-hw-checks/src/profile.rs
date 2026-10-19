@@ -594,9 +594,18 @@ fn check_link(link: &Link) -> Result<(), ProfileError> {
     }
     // Only what the guard can enforce, as a number: it compares the value and requires it before
     // the link connects.
-    for name in link.comparams.keys() {
+    for (name, value) in &link.comparams {
         let canonical = crate::comparam::canonical(name);
         if crate::comparam::profile_may_pin(&canonical) {
+            // The workers set a numeric ComParam as an unsigned 32-bit value (the J2534 worker
+            // refuses a signed one), so a value outside that range could never be set and the
+            // link could never connect.
+            if u32::try_from(*value).is_err() {
+                return Err(invalid(format!(
+                    "the ComParam {name:?} has the value {value}, outside 0 to {}",
+                    u32::MAX
+                )));
+            }
             continue;
         }
         return Err(invalid(match crate::comparam::typed_field(&canonical) {

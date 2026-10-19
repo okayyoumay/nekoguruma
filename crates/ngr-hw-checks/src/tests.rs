@@ -636,6 +636,9 @@ fn only_comparams_the_guard_can_enforce_are_pinned_in_the_profile() {
     refused("CP_RequestAddrMode = 1", "functional_id");
     // Unknown and vendor names.
     refused("CP_VendorSpecific = 1", "cannot be pinned");
+    // A value the workers cannot set as an unsigned 32-bit number.
+    refused("CP_STmin = -1", "outside");
+    refused("CP_P2Max = 4294967296", "outside");
     // A timing ComParam still parses, in any spelling the guard resolves.
     let profile = parse(&with("CP_P2Max = 1000\nCP_BSTx = 3")).unwrap();
     let Setup::Link { link, .. } = &profile.setup else {

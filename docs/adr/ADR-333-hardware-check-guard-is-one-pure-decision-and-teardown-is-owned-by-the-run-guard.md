@@ -38,7 +38,8 @@ present.
    the profile link's protocol (ASCII case ignored, no alias table), the dual-wire CAN bus type
    `ISO_11898_2_DWCAN` the agent uses, and exactly two pins: the profile's first pin as `HI` and
    its second as `LOW` (ISO 22900-2 (2022) Annex B). A resource by name is refused. The create
-   flag may carry RawMode (D.2.3) and nothing else. There is one link per profile endpoint: one,
+   flag may carry RawMode (D.2.3) and nothing else, and RawMode only on T0 and T1: on T2 and T3
+   a RawMode link is refused (item 3). There is one link per profile endpoint: one,
    or two for T0. ComParams are compared by name (or by the name a learned id stands for): the
    baud rate must equal the profile's, every other physical-layer ComParam is refused (the list
    of `profile`, with the ComParams of class `PDU_PC_BUSTYPE`), the identifiers must equal the
@@ -63,15 +64,15 @@ present.
    an empty request, an undefined service, a response service, a wrong length. DTC clearing,
    security access, writes, routines, resets and the services that read memory by address
    (0x23) or periodically (0x2A) or change a dynamic identifier (0x2C) are not on it. The same
-   rule applies to a request sent directly, to one repeated by a periodic primitive (a send count
-   above one, or -1) and to one inside a raw frame. A raw frame is `[4-byte CAN id][address byte
-   for extended or mixed addressing][PCI and data]`: it must go to the profile's request or
-   functional identifier, carry the profile's address byte, and its `TX_FLAG_CAN_29BIT_ID` and
-   `ISO15765_ADDR_TYPE` flags must agree with the profile; a raw TxFlag must be four bytes
-   with only named bits. The PCI byte (ISO 15765-2 (2024) 9.6) says what follows: a single
-   frame, including the escape length form, is decoded; a first frame is decoded from its leading
-   bytes and its declared length; a flow control frame passes; a consecutive frame, any other
-   PCI type and a frame too short for its PCI are refused. The agent's list is kept apart on
+   rule applies to a request sent directly and to one repeated by a periodic primitive (a send
+   count above one, or -1). A RawMode link is refused on T2 and T3, at creation: a worker passes
+   RawMode data through, and a native ISO 15765 channel segments it itself, so bytes that look
+   like a flow control frame can be a routine request on the wire (`31 01 FF 00` after the
+   identifier). A raw-bound handle that appears in the context on T2 or T3 anyway is refused,
+   never decoded, so no frame decoder exists. On T0 a raw frame passes only to the sending
+   endpoint's request identifier, with the profile's flags (`TX_FLAG_CAN_29BIT_ID`,
+   `ISO15765_ADDR_TYPE`) and a raw TxFlag of four bytes with named bits only; its content is not
+   read. T1 passes raw frames undecoded. The agent's list is kept apart on
    purpose: it is narrower (no session, no tester present) because a production job owns no
    session, while a T3 check may; the guard's list also looks at sub-function and length. The
    crate documents the relation next to its list; it does not reuse `policy`, so a change to the
@@ -110,10 +111,6 @@ Alternatives rejected:
 - **Teardown as a separate local that relies on drop order.** The order of locals is easy to get
   wrong, a step cannot be registered from code that does not own the local, and a failed step
   could not reach the report. One owner, the run's guard, fixes the order and the outcome.
-- **Decoding consecutive frames with state across frames.** It would make the decision stateful
-  and bring reassembly timing into the guard. A consecutive frame is refused, so a multi-frame
-  request through a raw link is limited to what its first frame shows and cannot be completed
-  through the guard.
 
 ## Consequences
 
@@ -124,10 +121,16 @@ Alternatives rejected:
   runner through `decide`, keeps the link table, records learned ids and registers teardown
   steps for grants is separate work. Until it exists, nothing enforces the decision on a live
   worker.
-- The raw-frame form is the one design 13.5 and the proto describe: the PCI byte follows the
-  identifier and address byte. A worker whose raw mode takes the unsegmented message instead
-  (a native J2534 ISO 15765 channel) reads the same bytes differently, which the seam's check
-  against a real worker must settle before checks send raw frames on T2 or T3.
+- RawMode is refused on T2 and T3 until the seam settles, against the workers, what a raw
+  payload sends: `j2534-0404-service` passes it through unchanged, so the form (with or without
+  transport PCI) depends on the worker. Checks on those classes use ordinary links and
+  requests. Only then can raw frames be classified there.
+- `SetUniqueRespIdTable` entries are judged by their ComParams only. The
+  `unique_resp_identifier` of an entry is the D-PDU unique response identifier, a tag the client
+  assigns and that expected-response data refers to; it carries no CAN identifier, so it is not
+  compared with the profile.
+- `ModuleDisconnect` without a handle is refused, like `ModuleConnect`: it would disconnect the
+  module the harness holds.
 - A profile's protocol name must be the ISO 22900-2 (2022) short name the agent sends
   (`ISO_14229_3_on_ISO_15765_2`); another spelling of the same protocol is refused.
 - ADR-275 items 4 and 6 are unchanged; this ADR gives the rules their concrete form.

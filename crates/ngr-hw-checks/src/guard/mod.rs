@@ -224,8 +224,10 @@ pub fn decide(ctx: &Context<'_>, request: &Request<'_>) -> Result<Grant, GuardRe
         Request::ModuleConnect(_) => Err(GuardRefusal::LinkSetup(
             "the harness opens the device; a check does not connect a module".to_owned(),
         )),
+        // Without a handle it would disconnect whatever module the worker holds, the harness's
+        // own included; the harness closes its device itself.
         Request::ModuleDisconnect(r) => match &r.module_handle {
-            None => Ok(Grant::Pass),
+            None => Err(GuardRefusal::Module),
             Some(handle) => ctx.module_of(Some(handle)).map(|()| Grant::Pass),
         },
         Request::GetVersion(r) => ctx

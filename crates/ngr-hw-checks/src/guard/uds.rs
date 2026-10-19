@@ -1,4 +1,4 @@
-//! StartComPrimitive: the UDS request a payload carries, directly or inside a raw CAN frame, and
+//! StartComPrimitive: the UDS request a payload carries and
 //! the lists each class holds it to (design 13.5 "Guarded VCI access", second and third bullet;
 //! ADR-333 item 3).
 //!
@@ -6,7 +6,10 @@
 //!   identifier pass, and their content is not read.
 //! - T1 passes every request (the ECU is simulated); the frame is not decoded.
 //! - T2 and T3 pass only [`read_only`] requests. Until an authorized job exists (design 13.5
-//!   "Writes on a real ECU"), T2 is held to the T3 list.
+//!   "Writes on a real ECU"), T2 is held to the T3 list. A RawMode link is refused on both
+//!   (`link::create`), since a worker passes raw data through and a native ISO 15765 channel
+//!   segments it itself, so the guard cannot tell what a raw payload sends; no frame decoder
+//!   exists here.
 //!
 //! [`READ_ONLY_SERVICES`] of the agent's `policy` module is the production job runner's list of
 //! services (ReadDTCInformation and ReadDataByIdentifier). This list is wider on purpose: a
@@ -232,10 +235,11 @@ fn payload(
         Class::T2 | Class::T3 if !bound.raw_mode => {
             read_only(class, data, data.len()).map(|s| s.map_or(Grant::Pass, Grant::EntersSession))
         }
-        Class::T2 | Class::T3 => {
-            flags_agree(flags, link)?;
-            raw_frame(class, link, data)
-        }
+        // Not reachable through `create`, which refuses a RawMode link on these classes; a raw
+        // link found in the context anyway is refused, never decoded.
+        Class::T2 | Class::T3 => Err(GuardRefusal::Frame(
+            "a RawMode link on T2 or T3: its data is passed through and cannot be classified",
+        )),
     }
 }
 
@@ -248,95 +252,4 @@ fn frame_id(data: &[u8]) -> Result<u32, GuardRefusal> {
             "a raw frame shorter than its identifier",
         )),
     }
-}
-
-/// A raw frame on T2 or T3: `[4-byte CAN id][address byte, for extended or mixed
-/// addressing][PCI and data]`. Only the profile's request identifiers pass, the address byte
-/// must be the profile's, and the transport PCI byte (ISO 15765-2 (2024) 9.6) says what is
-/// carried:
-///
-/// - a single frame is decoded, including the escape length of 9.6.2;
-/// - a first frame is decoded from its leading bytes and its declared length;
-/// - a flow control frame carries no request and passes;
-/// - a consecutive frame is refused, since what it continues is not known here;
-/// - any other PCI type, and a frame too short for its PCI, is refused.
-fn raw_frame(class: Class, link: &Link, data: &[u8]) -> Result<Grant, GuardRefusal> {
-    let id = frame_id(data)?;
-    if id != link.request_id && Some(id) != link.functional_id {
-        return Err(GuardRefusal::Frame(
-            "the frame does not go to the profile's request identifiers",
-        ));
-    }
-    let mut at = 4;
-    if link.addressing != Addressing::Normal {
-        match data.get(at) {
-            Some(&ae) if Some(ae) == link.address => at += 1,
-            _ => {
-                return Err(GuardRefusal::Frame(
-                    "the address byte is not the profile's address",
-                ));
-            }
-        }
-    }
-    let Some(&pci) = data.get(at) else {
-        return Err(GuardRefusal::Frame("a frame without a PCI byte"));
-    };
-    let low = usize::from(pci & 0x0F);
-    let session = match pci >> 4 {
-        0x0 => {
-            let (len, start) = if low != 0 {
-                if low > 7 {
-                    return Err(GuardRefusal::Frame("a single frame length above 7"));
-                }
-                (low, at + 1)
-            } else {
-                match data.get(at + 1) {
-                    Some(&len) => (usize::from(len), at + 2),
-                    None => return Err(GuardRefusal::Frame("a single frame without its length")),
-                }
-            };
-            let Some(body) = start.checked_add(len).and_then(|end| data.get(start..end)) else {
-                return Err(GuardRefusal::Frame(
-                    "a single frame shorter than its length",
-                ));
-            };
-            read_only(class, body, len)?
-        }
-        0x1 => {
-            let Some(&second) = data.get(at + 1) else {
-                return Err(GuardRefusal::Frame("a first frame without its length"));
-            };
-            let short = (low << 8) | usize::from(second);
-            let (total, start) = if short != 0 {
-                (short, at + 2)
-            } else {
-                match data.get(at + 2..at + 6) {
-                    Some(long) => {
-                        let long = u32::from_be_bytes([long[0], long[1], long[2], long[3]]);
-                        (long as usize, at + 6)
-                    }
-                    None => return Err(GuardRefusal::Frame("a first frame without its length")),
-                }
-            };
-            let head = &data[start.min(data.len())..];
-            if head.len() < 2 || total <= head.len() {
-                return Err(GuardRefusal::Frame(
-                    "a first frame whose length does not fit its bytes",
-                ));
-            }
-            read_only(class, head, total)?
-        }
-        0x2 => {
-            return Err(GuardRefusal::Frame(
-                "a consecutive frame is not decoded: its request began in an earlier frame",
-            ));
-        }
-        0x3 => None,
-        _ => {
-            return Err(GuardRefusal::Frame(
-                "a PCI type that is not a transport frame",
-            ));
-        }
-    };
-    Ok(session.map_or(Grant::Pass, Grant::EntersSession))
 }

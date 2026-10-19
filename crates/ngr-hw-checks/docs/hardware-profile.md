@@ -193,7 +193,8 @@ Anything it cannot classify is refused.
   only from the profile link's protocol, the bus type the agent uses
   (`ISO_11898_2_DWCAN`) and exactly its two pins (the first of `pins` as `HI`, the second as
   `LOW`), by resource data or by a learned resource id; a resource by name, or an id not learned,
-  is refused. A create flag may carry RawMode only. One link per profile endpoint (T0: one per
+  is refused. A create flag may carry RawMode only, and RawMode only on T0 and T1 (a worker
+  passes raw data through, so the guard cannot classify it). One link per profile endpoint (T0: one per
   end). `SetComParam` and the ComParams of `SetUniqueRespIdTable` keep the profile's values:
   `CP_Baudrate`, the identifiers, the CAN ID format (ISO 22900-2 (2022) Table B.13 and B.14), the
   address byte and the padding; other physical-layer ComParams are refused; functional
@@ -203,9 +204,8 @@ Anything it cannot classify is refused.
   `request_id`. T2 (until an authorized job exists) and T3 pass the read-only list: session
   control to the default or extended session, ReadDataByIdentifier, ReadDTCInformation with a
   defined report type, and TesterPresent with sub-function 0, each with its length rule. The
-  rule applies to direct requests, periodic ones, a `CP_TesterPresentMessage` and the request
-  inside a raw frame (identifier, address byte and flags must agree with the profile; single and
-  first frames are decoded, flow control passes, consecutive frames are refused).
+  rule applies to direct requests, periodic ones and a `CP_TesterPresentMessage`. A raw-bound
+  handle on T2 or T3 is refused, not decoded. T0 raw frames also need the profile's flags.
 - **IO controls.** `PDU_IOCTL_READ_VBATT` and the queue, buffer and receive-filter housekeeping
   pass on every class. Every other IOCTL, including programming voltage, is refused on every
   class, whatever the profile's `[[hardware-control]]` list says.

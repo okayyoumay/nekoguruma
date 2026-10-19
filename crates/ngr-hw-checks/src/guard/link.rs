@@ -12,7 +12,7 @@ use vci_service_interface::{
 };
 
 use super::{Context, Grant, GuardRefusal, uds};
-use crate::profile::{Addressing, Link, PHYSICAL_COMPARAMS};
+use crate::profile::{Addressing, Class, Link, PHYSICAL_COMPARAMS};
 
 /// The bus type the agent names a CAN link's resource by (ISO 22900-2 (2022) Annex B.1).
 const BUS_TYPE: &str = "ISO_11898_2_DWCAN";
@@ -50,6 +50,14 @@ pub(super) fn create(
         None => return Err(GuardRefusal::Undecodable("a link without a resource")),
     };
     let raw_mode = create_flag(request)?;
+    // A worker passes RawMode data through to the device, and a native ISO 15765 channel
+    // segments it itself, so the guard cannot tell what a raw payload sends (ADR-333 item 3).
+    if raw_mode && matches!(ctx.profile.class, Class::T2 | Class::T3) {
+        return Err(refuse(
+            "a RawMode link is refused on T2 and T3: the worker passes its data through, so \
+             the request it carries cannot be classified",
+        ));
+    }
 
     let links = ctx.endpoint_links();
     let mut mismatch = None;

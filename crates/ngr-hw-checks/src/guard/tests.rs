@@ -380,7 +380,7 @@ fn an_unlearned_pin_type_id_is_refused_and_a_learned_one_compares_by_name() {
 
 #[test]
 fn only_the_raw_mode_create_flag_is_allowed() {
-    let env = Env::new(profile("T3"));
+    let env = Env::new(profile("T1"));
     let mut request = create_request(create::Resource::RscData(profile_resource()));
     let with = |request: &mut CreateComLogicalLinkRequest, flag| {
         request.cll_create_flag = Some(flag);
@@ -768,6 +768,14 @@ fn the_harness_opens_the_module_not_the_check() {
         env.decide(Request::ModuleDisconnect(&disconnect)),
         Ok(Grant::Pass)
     );
+    // Without a handle it would disconnect whatever the worker holds.
+    let anonymous = vci_service_interface::ModuleDisconnectRequest {
+        module_handle: None,
+    };
+    assert_eq!(
+        env.decide(Request::ModuleDisconnect(&anonymous)),
+        Err(GuardRefusal::Module)
+    );
 }
 
 #[test]
@@ -986,171 +994,62 @@ fn raw_send(env: &Env, data: &[u8]) -> Result<Grant, GuardRefusal> {
 }
 
 #[test]
-fn raw_frames_on_t3_are_decoded() {
+fn a_raw_mode_link_is_refused_on_t2_and_t3() {
+    let raw = create::CllCreateFlag::CllCreateFlagBits(vci_service_interface::CllCreateFlag {
+        bits: vec![CllCreateFlagBit::CllCreateFlagRawMode as i32],
+    });
+    let raw_bytes = create::CllCreateFlag::CllCreateFlagRaw(vec![0x80, 0, 0, 0]);
     for class in ["T2", "T3"] {
-        let env = Env::linked(profile(class), true);
-        // A single frame to the request identifier, and to the functional one.
-        assert!(raw_send(&env, &frame(0x7E0, &[0x03, 0x22, 0xF1, 0x90])).is_ok());
-        assert!(raw_send(&env, &frame(0x7DF, &[0x02, 0x3E, 0x80])).is_ok());
-        // Padding after the data is not data.
-        assert!(
-            raw_send(
-                &env,
-                &frame(0x7E0, &[0x03, 0x22, 0xF1, 0x90, 0x55, 0x55, 0x55])
-            )
-            .is_ok()
-        );
-        // Not the request identifiers.
-        assert!(raw_send(&env, &frame(0x7E8, &[0x03, 0x22, 0xF1, 0x90])).is_err());
-        assert!(raw_send(&env, &frame(0x123, &[0x03, 0x22, 0xF1, 0x90])).is_err());
-        // A write.
-        assert!(raw_send(&env, &frame(0x7E0, &[0x04, 0x2E, 0xF1, 0x90, 0x01])).is_err());
-        // A single frame whose length claims more than it holds, or a length that cannot be.
-        assert!(raw_send(&env, &frame(0x7E0, &[0x07, 0x22, 0xF1, 0x90])).is_err());
-        assert!(
-            raw_send(
-                &env,
-                &frame(0x7E0, &[0x09, 0x22, 0xF1, 0x90, 0, 0, 0, 0, 0])
-            )
-            .is_err()
-        );
-        // The escape form of the length (CAN FD).
-        assert!(raw_send(&env, &frame(0x7E0, &[0x00, 0x03, 0x22, 0xF1, 0x90])).is_ok());
-        assert!(raw_send(&env, &frame(0x7E0, &[0x00, 0x05, 0x22, 0xF1, 0x90])).is_err());
-        assert!(raw_send(&env, &frame(0x7E0, &[0x00])).is_err());
-        assert!(raw_send(&env, &frame(0x7E0, &[0x00, 0x00])).is_err());
-        // A first frame is decoded from its leading bytes and its declared length.
-        assert!(
-            raw_send(
-                &env,
-                &frame(0x7E0, &[0x10, 0x09, 0x22, 0xF1, 0x90, 0xF1, 0x87, 0xF1])
-            )
-            .is_ok()
-        );
-        assert!(
-            raw_send(
-                &env,
-                &frame(0x7E0, &[0x10, 0x08, 0x22, 0xF1, 0x90, 0xF1, 0x87, 0xF1])
-            )
-            .is_err()
-        );
-        assert!(
-            raw_send(
-                &env,
-                &frame(0x7E0, &[0x10, 0x0A, 0x2E, 0xF1, 0x90, 0x01, 0x02, 0x03])
-            )
-            .is_err()
-        );
-        // A first frame that is not longer than what it holds is no first frame.
-        assert!(raw_send(&env, &frame(0x7E0, &[0x10, 0x03, 0x22, 0xF1, 0x90])).is_err());
-        // The 32-bit length.
-        assert!(
-            raw_send(
-                &env,
-                &frame(0x7E0, &[0x10, 0x00, 0, 0, 0x10, 0x01, 0x22, 0xF1, 0x90])
-            )
-            .is_ok()
-        );
-        assert!(raw_send(&env, &frame(0x7E0, &[0x10, 0x00, 0, 0])).is_err());
-        // A flow control frame carries no request; a consecutive frame cannot be classified.
-        assert!(raw_send(&env, &frame(0x7E0, &[0x30, 0x00, 0x00])).is_ok());
-        assert!(raw_send(&env, &frame(0x7E0, &[0x21, 0x2E, 0xF1, 0x90, 0x01])).is_err());
-        // Any other PCI type, a frame without one, or without an identifier.
-        for nibble in 4..=0xF_u8 {
+        let env = Env::new(profile(class));
+        for flag in [raw.clone(), raw_bytes.clone()] {
+            let mut request = create_request(create::Resource::RscData(profile_resource()));
+            request.cll_create_flag = Some(flag);
             assert!(
-                raw_send(&env, &frame(0x7E0, &[nibble << 4, 0x22, 0xF1, 0x90])).is_err(),
-                "{nibble:x}"
+                matches!(
+                    env.decide(Request::CreateComLogicalLink(&request)),
+                    Err(GuardRefusal::LinkSetup(_))
+                ),
+                "{class}"
             );
         }
-        assert!(raw_send(&env, &frame(0x7E0, &[])).is_err());
-        assert!(raw_send(&env, &[0x00, 0x00, 0x07]).is_err());
+        // The same link without RawMode is fine.
+        assert!(create_with(&env, &profile_resource()).is_ok());
+    }
+    // T0 and T1 keep RawMode.
+    for (env, class) in [
+        (Env::new(profile("T1")), "T1"),
+        (Env::new(loopback()), "T0"),
+    ] {
+        let mut request = create_request(create::Resource::RscData(profile_resource()));
+        request.cll_create_flag = Some(raw.clone());
+        assert_eq!(
+            env.decide(Request::CreateComLogicalLink(&request)),
+            Ok(Grant::CreatesLink {
+                endpoint: 0,
+                raw_mode: true
+            }),
+            "{class}"
+        );
     }
 }
 
 #[test]
-fn raw_flags_must_agree_with_the_profile() {
+fn a_raw_bound_handle_on_t2_and_t3_is_refused_not_decoded() {
+    // Native ISO 15765 segments raw data itself, so this is RoutineControl on the wire although
+    // its first byte after the identifier looks like a flow control PCI.
+    let routine = frame(0x7E0, &[0x31, 0x01, 0xFF, 0x00]);
     let read = frame(0x7E0, &[0x03, 0x22, 0xF1, 0x90]);
-    let env = Env::linked(profile("T3"), true);
-    let with_flags = |env: &Env, data: &[u8], flag| {
-        env.decide(Request::StartComPrimitive(&start_flags(data, flag)))
-    };
-    // 29-bit flag on an 11-bit profile.
-    assert!(with_flags(&env, &read, flag_bits(&[TxFlagBit::TxFlagCan29bitId])).is_err());
-    assert!(with_flags(&env, &read, flag_bits(&[])).is_ok());
-    // Named bits that say nothing about the frame pass.
-    assert!(with_flags(&env, &read, flag_bits(&[TxFlagBit::TxFlagSuppressPosResp])).is_ok());
-    assert!(
-        with_flags(
-            &env,
-            &read,
-            com_primitive_ctrl_data::TxFlag::TxFlagRaw(vec![0x40, 0, 0, 0x40])
-        )
-        .is_ok()
-    );
-    // A raw flag that is not four bytes, or carries a bit no name covers.
-    for raw in [
-        vec![0x40, 0, 0],
-        vec![0, 0, 0, 0, 0],
-        vec![0x01, 0, 0, 0],
-        vec![0, 0, 0x04, 0],
-        vec![0, 0, 0, 0x01],
-    ] {
-        assert!(
-            with_flags(
-                &env,
-                &read,
-                com_primitive_ctrl_data::TxFlag::TxFlagRaw(raw.clone())
-            )
-            .is_err(),
-            "{raw:02x?}"
-        );
+    for class in ["T2", "T3"] {
+        let env = Env::linked(profile(class), true);
+        for data in [&routine, &read] {
+            assert!(
+                matches!(raw_send(&env, data), Err(GuardRefusal::Frame(_))),
+                "{class} {data:02x?}"
+            );
+        }
+        // Receive-only primitives and the ones without a message still pass.
+        assert!(send(&env, &[], 0).is_ok());
     }
-    // A named bit set by value that is not a TxFlagBit.
-    let unnamed = com_primitive_ctrl_data::TxFlag::TxFlagBits(TxFlag { bits: vec![5] });
-    assert!(with_flags(&env, &read, unnamed).is_err());
-
-    // A 29-bit profile needs the flag; an extended one needs the flag and the address byte.
-    let wide = Env::linked(
-        profile_with(
-            "T3",
-            &L {
-                id_bits: 29,
-                request: 0x18DA_10F1,
-                response: 0x18DA_F110,
-                functional: None,
-                addressing: "extended",
-                address: Some(0x42),
-                ..L::default()
-            },
-        ),
-        true,
-    );
-    let good = frame(0x18DA_10F1, &[0x42, 0x03, 0x22, 0xF1, 0x90]);
-    let flags = flag_bits(&[
-        TxFlagBit::TxFlagCan29bitId,
-        TxFlagBit::TxFlagIso15765AddrType,
-    ]);
-    assert!(with_flags(&wide, &good, flags.clone()).is_ok());
-    // Without the flags (the 29-bit one, or the addressing one).
-    assert!(with_flags(&wide, &good, flag_bits(&[])).is_err());
-    assert!(with_flags(&wide, &good, flag_bits(&[TxFlagBit::TxFlagCan29bitId])).is_err());
-    assert!(
-        with_flags(
-            &wide,
-            &good,
-            flag_bits(&[TxFlagBit::TxFlagIso15765AddrType])
-        )
-        .is_err()
-    );
-    // A wrong address byte, or none.
-    let wrong = frame(0x18DA_10F1, &[0x43, 0x03, 0x22, 0xF1, 0x90]);
-    assert!(with_flags(&wide, &wrong, flags.clone()).is_err());
-    let missing = frame(0x18DA_10F1, &[]);
-    assert!(with_flags(&wide, &missing, flags.clone()).is_err());
-    let write = frame(0x18DA_10F1, &[0x42, 0x04, 0x2E, 0xF1, 0x90, 0x01]);
-    assert!(with_flags(&wide, &write, flags).is_err());
-    // An extended-addressing frame sent on an 11-bit normal profile has flags that disagree.
-    assert!(with_flags(&env, &read, flag_bits(&[TxFlagBit::TxFlagIso15765AddrType])).is_err());
 }
 
 #[test]

@@ -311,7 +311,7 @@ impl Report {
         };
         self.device = Some(DeviceInfo {
             abi: abi.name().to_owned(),
-            vendor: vci.library.clone(),
+            vendor: self.masker.text(&vci.library),
             model: self.masker.module_name(vci.api, &module.name),
             firmware_version: self.masker.text(&firmware),
             library_version: self.masker.text(&library),

@@ -365,3 +365,19 @@ fn a_path_that_leads_into_the_repository_is_refused() {
         assert!(!crate_dir.join("docs").join(name).exists());
     }
 }
+
+#[test]
+fn no_text_field_of_a_report_carries_a_vin() {
+    let text = profile_text("j2534-0404", "").replace("Vendor VCI\"", &format!("Vendor {VIN}\""));
+    let profile = parse(&text).unwrap();
+    let mut report = Report::with_host(&profile, VIN, Some(VIN));
+    let version = ReportedVersion {
+        hw_name: format!("fw {VIN}"),
+        fw_name: format!("dll {VIN}"),
+        ..version()
+    };
+    report.set_device(vci(&profile), Abi::WinX86, &module(VIN), &version);
+    report.record("hw_x", Outcome::Failed, &format!("read {VIN}"));
+    let toml = report.to_toml().unwrap();
+    assert!(!toml.contains(VIN), "{toml}");
+}

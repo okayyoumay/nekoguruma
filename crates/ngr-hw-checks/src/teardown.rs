@@ -32,6 +32,8 @@ enum Action {
 struct Step {
     name: String,
     action: Action,
+    /// The time this async step may take, instead of the teardown's.
+    timeout: Option<Duration>,
 }
 
 /// A step that failed, panicked or timed out.
@@ -81,6 +83,7 @@ impl Teardown {
         self.steps.push(Step {
             name: name.into(),
             action: Action::Sync(Box::new(step)),
+            timeout: None,
         });
     }
 
@@ -93,6 +96,22 @@ impl Teardown {
         self.steps.push(Step {
             name: name.into(),
             action: Action::Async(Box::pin(step)),
+            timeout: None,
+        });
+    }
+
+    /// Registers a step that needs a runtime and more (or less) time than the teardown's
+    /// timeout gives it. Other steps keep the teardown's.
+    pub fn register_async_with_timeout(
+        &mut self,
+        name: impl Into<String>,
+        timeout: Duration,
+        step: impl Future<Output = Result<(), String>> + Send + 'static,
+    ) {
+        self.steps.push(Step {
+            name: name.into(),
+            action: Action::Async(Box::pin(step)),
+            timeout: Some(timeout),
         });
     }
 
@@ -112,7 +131,7 @@ impl Teardown {
                     Ok(result) => result,
                     Err(payload) => Err(format!("panicked: {}", panic_text(payload.as_ref()))),
                 },
-                Action::Async(future) => run_async(future, self.timeout),
+                Action::Async(future) => run_async(future, step.timeout.unwrap_or(self.timeout)),
             };
             if let Err(reason) = result {
                 failures.push(StepFailure {
@@ -152,6 +171,16 @@ impl TeardownHandle<'_> {
         step: impl Future<Output = Result<(), String>> + Send + 'static,
     ) {
         self.0.register_async(name, step);
+    }
+
+    /// See [`Teardown::register_async_with_timeout`].
+    pub fn register_async_with_timeout(
+        &mut self,
+        name: impl Into<String>,
+        timeout: Duration,
+        step: impl Future<Output = Result<(), String>> + Send + 'static,
+    ) {
+        self.0.register_async_with_timeout(name, timeout, step);
     }
 
     /// Whether no step is left to run.

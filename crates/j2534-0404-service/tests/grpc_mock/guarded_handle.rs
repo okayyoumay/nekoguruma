@@ -18,8 +18,11 @@ use ngr_hw_checks::profile::{self, Profile, Setup};
 use ngr_hw_checks::report::RunGuard;
 use serial_test::serial;
 use vci_service_interface::{
-    ComOperationType, ComPrimitiveCtrlData, ModuleHandle, StartComPrimitiveRequest, TxFlag,
-    TxFlagBit, com_primitive_ctrl_data,
+    ComOperationType, ComPrimitiveCtrlData, ConnectComLogicalLinkRequest,
+    CreateComLogicalLinkRequest, DestroyComLogicalLinkRequest, EcuUniqueRespData, ModuleHandle,
+    ParamItem, PduParamClass, SetComParamRequest, SetUniqueRespIdTableRequest,
+    StartComPrimitiveRequest, TxFlag, TxFlagBit, UniqueRespIdTableItem, com_primitive_ctrl_data,
+    create_com_logical_link_request, param_item,
 };
 
 use crate::harness::*;
@@ -466,6 +469,142 @@ async fn the_default_deadline_follows_a_timing_the_check_changes() {
     assert_eq!(
         handle.response_ceiling(cll),
         Some(std::time::Duration::from_secs(68))
+    );
+    drop(handle);
+    run.pass();
+    assert!(run.run_teardown().is_empty());
+    drop(run);
+    server.shutdown().await;
+}
+
+fn named(name: &str, class: PduParamClass, data: param_item::ParamData) -> ParamItem {
+    ParamItem {
+        id: Some(param_item::Id::ParamName(name.to_owned())),
+        com_param_class: class as i32,
+        param_data: Some(data),
+    }
+}
+
+/// A link a check destroys and creates again through the handle works like the first: it has
+/// an event stream and timings, so a DID read on it succeeds once the check has set the
+/// profile's ComParams and connected it.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_link_created_again_through_the_handle_reads_a_did() {
+    let server = TestServer::start().await;
+    let profile = t3();
+    let reports = Reports::new();
+    let mut run = RunGuard::start_in(&profile, "hw_guarded_handle", reports.dir());
+    let mut handle = GuardedHandle::attach(
+        &profile,
+        &vci(&profile),
+        server.worker_client().await,
+        module(),
+        options(),
+        &mut run,
+    )
+    .await
+    .expect("the handle opens the profile's link");
+    let [first] = *handle.links() else {
+        panic!("one link");
+    };
+    handle
+        .destroy_com_logical_link(DestroyComLogicalLinkRequest {
+            cll_handle: Some(first),
+        })
+        .await
+        .expect("the link is destroyed");
+    assert!(handle.bound_links().is_empty());
+
+    // The same resource, found again.
+    let resource = *handle
+        .learned()
+        .resources
+        .keys()
+        .next()
+        .expect("a learned resource");
+    let cll = handle
+        .create_com_logical_link(CreateComLogicalLinkRequest {
+            module_handle: Some(module()),
+            resource: Some(create_com_logical_link_request::Resource::ResourceId(
+                resource,
+            )),
+            cll_create_flag: None,
+        })
+        .await
+        .expect("the link is created again")
+        .cll_handle
+        .expect("a handle");
+    let com = PduParamClass::PduPcSpecified;
+    let number = |v: u32| param_item::ParamData::Unum32(v);
+    for (name, value) in [
+        ("CP_Baudrate", 500_000),
+        ("CP_RequestAddrMode", 1),
+        ("CP_TesterPresentAddrMode", 0),
+        ("CP_CanFuncReqId", 0x7DF),
+        ("CP_CanFuncReqFormat", 4),
+        ("CP_CanFuncReqExtAddr", 0),
+        ("CP_CanFillerByteHandling", 1),
+        ("CP_CanFillerByte", 0xCC),
+        ("CP_BlockSize", 0),
+    ] {
+        handle
+            .set_com_param(SetComParamRequest {
+                cll_handle: Some(cll),
+                param_item: Some(named(name, com, number(value))),
+            })
+            .await
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+    }
+    handle
+        .set_com_param(SetComParamRequest {
+            cll_handle: Some(cll),
+            param_item: Some(named(
+                "CP_TesterPresentMessage",
+                com,
+                param_item::ParamData::Bytefield(vec![0x3E, 0x80]),
+            )),
+        })
+        .await
+        .expect("the tester-present message");
+    let unique = PduParamClass::PduPcUniqueId;
+    handle
+        .set_unique_resp_id_table(SetUniqueRespIdTableRequest {
+            cll_handle: Some(cll),
+            unique_resp_id_table: Some(UniqueRespIdTableItem {
+                unique_data: vec![EcuUniqueRespData {
+                    unique_resp_identifier: 1,
+                    params: [
+                        ("CP_CanPhysReqId", 0x7E0),
+                        ("CP_CanPhysReqFormat", 4),
+                        ("CP_CanRespUSDTId", 0x7E8),
+                        ("CP_CanRespUSDTFormat", 4),
+                    ]
+                    .map(|(name, value)| named(name, unique, number(value)))
+                    .to_vec(),
+                }],
+            }),
+        })
+        .await
+        .expect("the response table");
+    handle
+        .connect_com_logical_link(ConnectComLogicalLinkRequest {
+            cll_handle: Some(cll),
+        })
+        .await
+        .expect("the guard lets the connect through");
+
+    let channel = MOCK_CHANNEL_ID + 1;
+    let answer = [0x62, 0xF1, 0x90, 0x41];
+    server.backdoor.arm_write_rx_injection(
+        channel,
+        &can_frame(0x7E8, &answer),
+        j2534_0404::ISO15765,
+        50,
+    );
+    assert_eq!(
+        handle.send_receive(cll, &[0x22, 0xF1, 0x90]).await,
+        Ok(answer.to_vec())
     );
     drop(handle);
     run.pass();

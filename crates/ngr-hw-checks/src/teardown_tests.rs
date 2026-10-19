@@ -300,3 +300,22 @@ fn an_early_teardown_run_keeps_its_failures_for_the_check() {
         "{message}"
     );
 }
+
+/// A step registered with its own timeout is held to that, not to the teardown's: a slow step
+/// with a longer timeout completes, and one with a shorter timeout is reported, while a step
+/// registered the usual way keeps the teardown's.
+#[test]
+fn a_step_can_have_its_own_timeout() {
+    let slow = || async {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        Ok(())
+    };
+    let mut teardown = Teardown::new();
+    teardown.set_timeout(Duration::from_millis(100));
+    teardown.register_async("default", slow());
+    teardown.register_async_with_timeout("longer", Duration::from_secs(5), slow());
+    teardown.register_async_with_timeout("shorter", Duration::from_millis(50), slow());
+    let failures = teardown.run();
+    let names: Vec<&str> = failures.iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(names, ["shorter", "default"], "{failures:?}");
+}

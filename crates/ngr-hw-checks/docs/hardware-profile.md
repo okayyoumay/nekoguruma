@@ -270,6 +270,11 @@ connection is served by the runtime.
   the new value is waited for, afterwards the new one (`response_ceiling` reports it). A read of
   one DID expects `62` and that DID; a read of several expects `62` only, since the ECU may
   return the records in any order.
+- **Links created by a check.** Whatever creates a link through the handle, including a link a
+  check destroys and creates again, gets the same per-link set-up: the teardown step, the event
+  stream and timings to wait by (the handle's defaults, 1 s, 5 s and 25 s, until the check sets
+  others). The check then sets the profile's ComParams itself, as the guard requires before the
+  connect.
 - **State.** A `GetResourceIds` answer records the resource each id stands for and a `GetObjectId`
   answer the name of the id, into the learned ids. The `cll_handle` of a granted
   `CreateComLogicalLink` is bound to its endpoint, a granted `SetComParam` or
@@ -278,7 +283,11 @@ connection is served by the runtime.
 - **Teardown.** The steps are registered as the resources are acquired and run in reverse: the
   device's closing, then each link's disconnect and destroy (skipped when the check destroyed it),
   then, per link, one return to the default session (`10 01`, itself decided) registered before a
-  request that enters another session is sent. Power: the handle registers nothing for the
+  request that enters another session is sent. That step waits for the response no longer than
+  the link's response wait is when it is registered, and has its own timeout (that wait, the
+  start and cancel requests and a margin, at least the 30 s default of other steps) so it ends by
+  cancelling the primitive instead of being dropped by the teardown. Teardown steps may carry
+  their own timeout (`register_async_with_timeout`). Power: the handle registers nothing for the
   profile's power commands. A check that switches power registers the power-off step itself before
   it switches power on.
 - **RawMode form.** On a T0 link the data of a send is the literal frame the worker passes on.

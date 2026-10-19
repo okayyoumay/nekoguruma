@@ -251,6 +251,7 @@ impl Shared {
                 state.events.remove(cll);
                 state.closing.remove(cll);
                 state.session_back.remove(cll);
+                state.timings.remove(cll);
             }
             Grant::Pass | Grant::CreatesLink { .. } | Grant::EntersSession(_) => {}
         }
@@ -272,6 +273,16 @@ impl Shared {
         Ok((grant, cop))
     }
 
+    /// How long a send-receive on `cll` waits now: the option, else the link's ceiling.
+    fn wait_for(&self, cll: ComLogicalLinkHandle) -> Duration {
+        self.options.response_timeout.unwrap_or_else(|| {
+            self.lock()
+                .timings
+                .get(&cll.cll_handle)
+                .map_or_else(|| Timings::default().ceiling(), LinkTimings::ceiling)
+        })
+    }
+
     /// Waits for the end of primitive `cop` on link `cll` and returns the response to `request`.
     async fn await_result(
         &self,
@@ -279,21 +290,16 @@ impl Shared {
         cll: ComLogicalLinkHandle,
         cop: ComPrimitiveHandle,
         request: &[u8],
+        cap: Option<Duration>,
     ) -> Result<Vec<u8>, HandleError> {
-        let (events, ceiling) = {
-            let state = self.lock();
-            (
-                state.events.get(&cll.cll_handle).cloned(),
-                state.timings.get(&cll.cll_handle).map(LinkTimings::ceiling),
-            )
-        };
-        let events =
-            events.ok_or_else(|| HandleError::Setup("the link has no event stream".to_owned()))?;
-        let timeout = self
-            .options
-            .response_timeout
-            .or(ceiling)
-            .unwrap_or_else(|| Timings::default().ceiling());
+        let events = self
+            .lock()
+            .events
+            .get(&cll.cll_handle)
+            .cloned()
+            .ok_or_else(|| HandleError::Setup("the link has no event stream".to_owned()))?;
+        let timeout = self.wait_for(cll);
+        let timeout = cap.map_or(timeout, |cap| timeout.min(cap));
         let expected = Expectation::of(request);
         let mut response = None;
         let mut error = None;
@@ -468,11 +474,19 @@ async fn close_link(
     }
 }
 
+/// The time the step that returns a link to the default session is given: the wait for the
+/// response (`wait`, which the step never exceeds and after which it cancels the primitive), the
+/// start request and the cancel request, and a margin; never less than the teardown's default.
+fn session_reset_timeout(wait: Duration, request_timeout: Duration) -> Duration {
+    (wait + request_timeout * 2 + Duration::from_secs(1)).max(crate::teardown::DEFAULT_STEP_TIMEOUT)
+}
+
 /// The teardown step that returns the ECU on `cll` to the default session, once.
 async fn return_to_default_session(
     shared: Arc<Shared>,
     mut client: WorkerClient,
     cll: ComLogicalLinkHandle,
+    wait: Duration,
 ) -> Result<(), String> {
     {
         let mut state = shared.lock();
@@ -487,7 +501,9 @@ async fn return_to_default_session(
         let (_, cop) = shared
             .start(&mut client, send_receive_request(cll, &request))
             .await?;
-        shared.await_result(&mut client, cll, cop, &request).await
+        shared
+            .await_result(&mut client, cll, cop, &request, Some(wait))
+            .await
     };
     run.await.map(drop).map_err(|e| e.to_string())
 }
@@ -976,7 +992,6 @@ impl<'r> GuardedHandle<'r> {
             cll_handle: Some(cll),
         })
         .await?;
-        self.subscribe(cll).await?;
         Ok(cll)
     }
 
@@ -1094,6 +1109,18 @@ impl<'r> GuardedHandle<'r> {
                 format!("close link {}", cll.cll_handle),
                 close_link(self.shared.clone(), self.client.clone(), cll),
             );
+            // Whatever creates a link through the handle gets what a send-receive needs: its
+            // event stream, and timings to wait by (the handle's defaults until the check sets
+            // others; `open_link` replaces them with what it sets).
+            self.shared
+                .lock()
+                .timings
+                .entry(cll.cll_handle)
+                .or_insert(LinkTimings {
+                    active: Timings::default(),
+                    staged: Timings::default(),
+                });
+            self.subscribe(cll).await?;
         }
         Ok(response)
     }
@@ -1177,9 +1204,13 @@ impl<'r> GuardedHandle<'r> {
         if let (Grant::EntersSession(_), Some(cll)) = (&grant, cll)
             && self.shared.lock().session_back.insert(cll.cll_handle)
         {
-            self.teardown.register_async(
+            // The step waits no longer than the link's response wait is now, and has the time
+            // for that, so it ends by itself and cancels instead of being dropped.
+            let wait = self.shared.wait_for(cll);
+            self.teardown.register_async_with_timeout(
                 format!("return link {} to the default session", cll.cll_handle),
-                return_to_default_session(self.shared.clone(), self.client.clone(), cll),
+                session_reset_timeout(wait, self.shared.options.request_timeout),
+                return_to_default_session(self.shared.clone(), self.client.clone(), cll, wait),
             );
         }
         let updates = request.cop_type == ComOperationType::CoptUpdateparam as i32;
@@ -1216,7 +1247,7 @@ impl<'r> GuardedHandle<'r> {
                 HandleError::Setup("StartComPrimitive returned no primitive handle".to_owned())
             })?;
         self.shared
-            .await_result(&mut self.client.clone(), cll, cop, request)
+            .await_result(&mut self.client.clone(), cll, cop, request, None)
             .await
     }
 
@@ -1487,6 +1518,20 @@ mod tests {
             ..ParamItem::default()
         };
         assert!(timing_change(&other, &learned).is_none());
+    }
+
+    #[test]
+    fn the_session_reset_step_has_time_for_the_longest_wait() {
+        let request = Duration::from_secs(5);
+        let long = Duration::from_secs(68);
+        assert!(session_reset_timeout(long, request) > long + request * 2);
+        assert!(session_reset_timeout(long, request) > crate::teardown::DEFAULT_STEP_TIMEOUT);
+        // A short wait keeps the teardown's default.
+        let short = Duration::from_secs(3);
+        assert_eq!(
+            session_reset_timeout(short, request),
+            crate::teardown::DEFAULT_STEP_TIMEOUT
+        );
     }
 
     #[test]

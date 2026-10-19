@@ -1002,7 +1002,7 @@ async fn a_refused_session_change_leaves_no_return_pending() {
         .expect("the link is disconnected");
     let refused = handle.send_receive(cll, &[0x10, 0x03]).await;
     assert!(
-        matches!(refused, Err(HandleError::Rpc { .. })),
+        matches!(refused, Err(HandleError::WorkerRefused { .. })),
         "the worker refuses a primitive on a link that is not connected: {refused:?}"
     );
     handle

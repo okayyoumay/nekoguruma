@@ -123,9 +123,15 @@ pub enum HandleError {
         rpc: &'static str,
         refusal: GuardRefusal,
     },
-    /// A worker request failed; `call` names it.
+    /// A worker request failed in a way that does not say whether the worker applied it: a
+    /// transport failure, or a status the worker does not use to reject a request. `call` names
+    /// it.
     #[error("{call} failed: {message}")]
     Rpc { call: &'static str, message: String },
+    /// The worker rejected the request, with a status it uses for that (see
+    /// [`is_definite_refusal`]): it did not apply it.
+    #[error("{call} rejected by the worker: {message}")]
+    WorkerRefused { call: &'static str, message: String },
     /// A worker request got no answer within the request timeout.
     #[error("{call} got no answer within {timeout:?}")]
     Timeout {
@@ -254,10 +260,7 @@ impl Shared {
             {
                 Err(HandleError::VciLost)
             }
-            Ok(Err(status)) => Err(HandleError::Rpc {
-                call,
-                message: status.to_string(),
-            }),
+            Ok(Err(status)) => Err(worker_error(call, &status)),
             Ok(Ok(response)) => Ok(response.into_inner()),
         }
     }
@@ -731,6 +734,52 @@ async fn return_to_default_session(
     });
     pending.done = result.is_ok();
     result
+}
+
+/// Whether a status is one the workers return for a request they reject without applying it:
+/// `InvalidArgument` (a malformed or unsupported value), `FailedPrecondition` (the wrong state,
+/// such as a link that is not connected), `NotFound` (an unknown handle), `ResourceExhausted`,
+/// `Unimplemented` and `AlreadyExists`, which `j2534-0404-service` and `iso22900-service` return
+/// before they act, and `Unauthenticated`, which the listener returns before the request reaches
+/// the service. Every other status is ambiguous: `Internal` is a library error that can come
+/// after part of the work was done, `Cancelled` can be the worker cancelling work or the
+/// transport dropping the call, and `Unavailable`, `Unknown`, `DeadlineExceeded` and the
+/// transport's own errors say nothing about the worker's state.
+fn is_definite_refusal(code: tonic::Code) -> bool {
+    use tonic::Code::{
+        AlreadyExists, FailedPrecondition, InvalidArgument, NotFound, ResourceExhausted,
+        Unauthenticated, Unimplemented,
+    };
+    matches!(
+        code,
+        InvalidArgument
+            | FailedPrecondition
+            | NotFound
+            | ResourceExhausted
+            | Unimplemented
+            | AlreadyExists
+            | Unauthenticated
+    )
+}
+
+/// The error of a failed worker call, by whether the worker rejected the request.
+fn worker_error(call: &'static str, status: &tonic::Status) -> HandleError {
+    let message = status.to_string();
+    if is_definite_refusal(status.code()) {
+        HandleError::WorkerRefused { call, message }
+    } else {
+        HandleError::Rpc { call, message }
+    }
+}
+
+/// Whether an error says the worker did not apply the request, so state kept in case it did can
+/// be dropped: only a rejection by the worker, or the lost VCI it reports for an offline link.
+/// A transport failure, a timeout and every other status leave it unknown.
+fn undoes_request(error: &HandleError) -> bool {
+    matches!(
+        error,
+        HandleError::WorkerRefused { .. } | HandleError::VciLost
+    )
 }
 
 /// Marks the return to the default session of a link pending while a session change is on its
@@ -1538,8 +1587,9 @@ impl<'r> GuardedHandle<'r> {
             .shared
             .send("IoCtl", self.client.clone().io_ctl(request))
             .await;
-        // A refused suspension suspended nothing; a lost answer may have.
-        if suspends && matches!(&sent, Err(e) if !matches!(e, HandleError::Timeout { .. })) {
+        // A rejected suspension suspended nothing; with any other failure it may have. The
+        // record was made before the call, so it is dropped only for a rejection.
+        if suspends && matches!(&sent, Err(error) if undoes_request(error)) {
             self.shared.lock().suspended.pop();
         }
         if resumes && sent.is_ok() {
@@ -1731,10 +1781,8 @@ impl<'r> GuardedHandle<'r> {
                 self.client.clone().start_com_primitive(request),
             )
             .await;
-        if let (Some(provisional), Err(HandleError::Rpc { .. } | HandleError::VciLost)) =
-            (provisional.as_mut(), &sent)
-        {
-            provisional.refused = true;
+        if let (Some(provisional), Err(error)) = (provisional.as_mut(), &sent) {
+            provisional.refused = undoes_request(error);
         }
         drop(provisional);
         let response = sent?;
@@ -2212,6 +2260,91 @@ mod tests {
         mark.refused = true;
         drop(mark);
         assert!(pending(&shared));
+    }
+
+    #[test]
+    fn only_the_statuses_a_worker_rejects_with_are_definite_refusals() {
+        use tonic::Code::*;
+        for code in [
+            InvalidArgument,
+            FailedPrecondition,
+            NotFound,
+            ResourceExhausted,
+            Unimplemented,
+            AlreadyExists,
+            Unauthenticated,
+        ] {
+            assert!(is_definite_refusal(code), "{code:?}");
+            assert!(matches!(
+                worker_error("X", &tonic::Status::new(code, "no")),
+                HandleError::WorkerRefused { .. }
+            ));
+        }
+        for code in [
+            Ok,
+            Cancelled,
+            Unknown,
+            DeadlineExceeded,
+            PermissionDenied,
+            Aborted,
+            OutOfRange,
+            Internal,
+            Unavailable,
+            DataLoss,
+        ] {
+            assert!(!is_definite_refusal(code), "{code:?}");
+            assert!(matches!(
+                worker_error("X", &tonic::Status::new(code, "?")),
+                HandleError::Rpc { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn only_a_rejection_undoes_what_was_kept_in_case_the_worker_applied_it() {
+        let cll = ComLogicalLinkHandle {
+            module_handle: 1,
+            cll_handle: 10,
+        };
+        let rejected = HandleError::WorkerRefused {
+            call: "X",
+            message: String::new(),
+        };
+        let ambiguous = [
+            HandleError::Rpc {
+                call: "X",
+                message: String::new(),
+            },
+            HandleError::Timeout {
+                call: "X",
+                timeout: Duration::from_secs(1),
+            },
+            HandleError::EventStreamEnded,
+        ];
+        assert!(undoes_request(&rejected));
+        assert!(undoes_request(&HandleError::VciLost));
+        assert!(ambiguous.iter().all(|e| !undoes_request(e)));
+        // The session mark: kept for every ambiguous outcome, taken back for a rejection.
+        for (error, kept) in
+            std::iter::once((&rejected, false)).chain(ambiguous.iter().map(|e| (e, true)))
+        {
+            let shared = shared();
+            let mut mark = ProvisionalSession::new(&shared, cll);
+            mark.refused = undoes_request(error);
+            drop(mark);
+            assert_eq!(shared.lock().session_back.contains(&10), kept, "{error:?}");
+        }
+        // The saved resume follows the same rule (the io_ctl record is dropped only when
+        // `undoes_request` says so).
+        for (error, kept) in
+            std::iter::once((&rejected, false)).chain(ambiguous.iter().map(|e| (e, true)))
+        {
+            let mut saved = vec![1];
+            if undoes_request(error) {
+                saved.pop();
+            }
+            assert_eq!(!saved.is_empty(), kept, "{error:?}");
+        }
     }
 
     #[test]

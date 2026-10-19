@@ -514,6 +514,155 @@ fn comparams_are_compared_with_the_profile() {
 }
 
 #[test]
+fn an_alias_of_the_baud_rate_is_compared_like_it() {
+    let env = Env::linked(profile("T3"), false);
+    for name in ["DATA_RATE", "data_rate", "CP_Baudrate"] {
+        assert!(set(&env, unum(name, 500_000)).is_ok(), "{name}");
+        assert!(set(&env, unum(name, 250_000)).is_err(), "{name}");
+        assert!(
+            set_table(&env, vec![unum(name, 250_000)]).is_err(),
+            "{name}"
+        );
+        assert!(set_table(&env, vec![unum(name, 500_000)]).is_ok(), "{name}");
+    }
+    // Through a learned id as well.
+    let mut env = env;
+    env.learned
+        .objects
+        .insert((ObjectType::ObjtComparam, 5), "DATA_RATE".to_owned());
+    let by_id = |value| ParamItem {
+        id: Some(param_item::Id::ParamId(5)),
+        com_param_class: PduParamClass::PduPcCom as i32,
+        param_data: Some(param_item::ParamData::Unum32(value)),
+    };
+    assert!(set(&env, by_id(500_000)).is_ok());
+    assert!(set(&env, by_id(250_000)).is_err());
+}
+
+#[test]
+fn every_alias_resolves_to_its_canonical_rule() {
+    use super::link::{ALIASES, canonical};
+    // A profile that sets padding, a functional id and an address, so the rules have values.
+    let env = Env::linked(
+        profile_with(
+            "T3",
+            &L {
+                padding: Some(0x55),
+                comparams: "CP_BlockSize = 8",
+                ..L::default()
+            },
+        ),
+        false,
+    );
+    for (alias, canon) in ALIASES {
+        assert_eq!(canonical(alias), *canon, "{alias}");
+        assert_eq!(canonical(&alias.to_ascii_uppercase()), *canon, "{alias}");
+        // The canonical name is not itself an alias, so there is one step.
+        assert_eq!(canonical(canon), *canon, "{canon}");
+        for value in [0, 1, 8, 500_000, 0x7E0, 0x55] {
+            assert_eq!(
+                set(&env, unum(alias, value)).is_ok(),
+                set(&env, unum(canon, value)).is_ok(),
+                "{alias} / {canon} = {value}"
+            );
+        }
+    }
+}
+
+#[test]
+fn unknown_and_vendor_comparams_are_refused_whatever_their_class() {
+    let env = Env::linked(profile("T3"), false);
+    let classes = [
+        PduParamClass::PduPcSpecified,
+        PduParamClass::PduPcTiming,
+        PduParamClass::PduPcInit,
+        PduParamClass::PduPcCom,
+        PduParamClass::PduPcErrhdl,
+        PduParamClass::PduPcBustype,
+        PduParamClass::PduPcUniqueId,
+        PduParamClass::PduPcTesterPresent,
+    ];
+    for name in [
+        "CP_VendorWire",
+        "VENDOR_SPECIFIC",
+        "CP_SamplesPerBit",
+        "CP_W1Max",
+        "CP_P3Min",
+        "CP_SwCan_HighVoltage",
+        "CP_J1939SourceAddress",
+        "CP_CanFirstConsecutiveFrameValue",
+        "",
+    ] {
+        for class in classes {
+            let mut item = unum(name, 1);
+            item.com_param_class = class as i32;
+            assert!(
+                matches!(set(&env, item.clone()), Err(GuardRefusal::LinkSetup(_))),
+                "{name} {class:?}"
+            );
+            assert!(set_table(&env, vec![item]).is_err(), "{name} {class:?}");
+        }
+    }
+    // The class never admits a name, and the allow-listed ones pass under any class but the
+    // bus type's.
+    let mut timing = unum("CP_P2Max", 1);
+    timing.com_param_class = PduParamClass::PduPcSpecified as i32;
+    assert!(set(&env, timing.clone()).is_ok());
+    timing.com_param_class = PduParamClass::PduPcBustype as i32;
+    assert!(set(&env, timing).is_err());
+}
+
+#[test]
+fn each_allow_listed_comparam_passes() {
+    let env = Env::linked(profile("T3"), false);
+    for name in [
+        "CP_P2Max",
+        "CP_P2Star",
+        "CP_P2Max_Ecu",
+        "CP_P2Star_Ecu",
+        "CP_P3Phys",
+        "CP_P3Func",
+        "CP_CyclicRespTimeout",
+        "CP_Ar",
+        "CP_Ar_Ecu",
+        "CP_As",
+        "CP_As_Ecu",
+        "CP_Br",
+        "CP_Br_Ecu",
+        "CP_Bs",
+        "CP_Bs_Ecu",
+        "CP_Cr",
+        "CP_Cr_Ecu",
+        "CP_Cs",
+        "CP_Cs_Ecu",
+        "CP_BlockSize",
+        "CP_BlockSize_Ecu",
+        "CP_BlockSizeOverride",
+        "CP_STmin",
+        "CP_STmin_Ecu",
+        "CP_STminOverride",
+        "CP_CanMaxNumWaitFrames",
+        "CP_RC78Handling",
+        "CP_RC78CompletionTimeout",
+        "CP_RCByteOffset",
+        "CP_TesterPresentTime",
+        "CP_TesterPresentHandling",
+        "CP_TesterPresentReqRsp",
+        "CP_TesterPresentExpPosResp",
+        "CP_TesterPresentExpNegResp",
+        "CP_TesterPresentSendType",
+        "CP_TesterPresentImmed",
+        // The aliases of some of them.
+        "ISO15765_STMIN",
+        "ISO15765_BS",
+        "BS_TX",
+        "P2_MAX",
+    ] {
+        assert!(set(&env, unum(name, 1)).is_ok(), "{name}");
+    }
+}
+
+#[test]
 fn identifiers_in_the_response_table_are_compared_too() {
     let env = Env::linked(profile("T3"), false);
     let table = |phys: u32, resp: u32| {

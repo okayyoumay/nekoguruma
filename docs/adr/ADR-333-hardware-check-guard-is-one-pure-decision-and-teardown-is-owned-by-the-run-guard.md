@@ -40,7 +40,12 @@ present.
    its second as `LOW` (ISO 22900-2 (2022) Annex B). A resource by name is refused. The create
    flag may carry RawMode (D.2.3) and nothing else, and RawMode only on T0 and T1: on T2 and T3
    a RawMode link is refused (item 3). There is one link per profile endpoint: one,
-   or two for T0. ComParams are compared by name (or by the name a learned id stands for): the
+   or two for T0. ComParam rules are an allow-list over canonical names. A name (or the name a learned id
+   stands for) is first reduced to its canonical form: ASCII case folded and the aliases
+   `j2534-0404-service` accepts for one ComParam resolved (`DATA_RATE` is `CP_Baudrate`, and so on),
+   so a rule cannot be skipped by another spelling; `iso22900-service` resolves names in the
+   D-PDU library, so a name the guard does not know is refused. The request's class field never
+   admits a ComParam; it can only add a refusal. Then the rules apply: the
    baud rate must equal the profile's, every other physical-layer ComParam is refused (the list
    of `profile`, with the ComParams of class `PDU_PC_BUSTYPE`), the identifiers must equal the
    profile's (the unsegmented response identifier is refused, the functional one needs a
@@ -50,7 +55,10 @@ present.
    the profile's address and padding, the request and tester-present address modes may be
    functional only with a functional identifier, a tester-present message is judged as a UDS
    request by the class list, and a ComParam the profile's `[link.comparams]` fixes keeps the
-   profile's value. Timing and the other ComParams pass. `COPT_RESTORE_PARAM` is refused on
+   profile's value. A ComParam no rule covers passes only if it is on the short list of protocol
+   and timing ComParams (session timing, ISO 15765-2 frame timing and flow control, response
+   pending handling, tester-present timing; ISO 22900-2 (2022) Annex B) or the profile sets it.
+   Unknown, vendor and other physical-layer names are refused. `COPT_RESTORE_PARAM` is refused on
    every class, since it would put back ComParams the guard compared with the profile.
 3. **UDS requests and frames.** T1 passes every request undecoded (the ECU is simulated; a
    session change is still reported so it can be undone). T0 sends no ECU-addressed request: only

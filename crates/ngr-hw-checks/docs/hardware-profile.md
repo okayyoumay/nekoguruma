@@ -198,8 +198,11 @@ Anything it cannot classify is refused.
   end). `SetComParam` and the ComParams of `SetUniqueRespIdTable` keep the profile's values:
   `CP_Baudrate`, the identifiers, the CAN ID format (ISO 22900-2 (2022) Table B.13 and B.14), the
   address byte and the padding; other physical-layer ComParams are refused; functional
-  addressing needs a `functional_id`; a `[link.comparams]` entry keeps its value; timing and
-  the rest pass. `COPT_RESTORE_PARAM` is refused.
+  addressing needs a `functional_id`; a `[link.comparams]` entry keeps its value. The rules are an
+  allow-list over canonical names (case folded, the J2534 worker's aliases such as `DATA_RATE`
+  resolved, the request's class field ignored): a ComParam no rule covers passes only when it is
+  a listed protocol or timing ComParam (P2, P2*, ISO 15765-2 timing and flow control, response
+  pending, tester-present timing) or the profile sets it, and every other name is refused. `COPT_RESTORE_PARAM` is refused.
 - **Requests.** T1 passes every request. T0 passes only raw frames to the sending end's own
   `request_id`. T2 (until an authorized job exists) and T3 pass the read-only list: session
   control to the default or extended session, ReadDataByIdentifier, ReadDTCInformation with a

@@ -9,7 +9,7 @@ use vci_service_interface::{
 };
 
 use super::*;
-use crate::profile::parse;
+use crate::profile::{Setup, parse};
 
 const MODULE: u32 = 1;
 const CLL: u32 = 10;
@@ -118,14 +118,23 @@ impl Env {
     /// With the link `CLL` bound to endpoint 0.
     fn linked(profile: Profile, raw_mode: bool) -> Self {
         let mut env = Self::new(profile);
-        env.links.insert(
-            CLL,
-            BoundLink {
-                endpoint: 0,
-                raw_mode,
-            },
-        );
+        env.links.insert(CLL, BoundLink::new(0, raw_mode));
         env
+    }
+
+    /// With the link `CLL` bound and every profile-pinned ComParam recorded as set.
+    fn ready(profile: Profile) -> Self {
+        let mut env = Self::linked(profile, false);
+        let required = link::required(env.endpoint_link(0));
+        env.links.get_mut(&CLL).unwrap().set.extend(required);
+        env
+    }
+
+    fn endpoint_link(&self, index: usize) -> &crate::profile::Link {
+        match &self.profile.setup {
+            crate::profile::Setup::Link { link, .. } => link,
+            crate::profile::Setup::Loopback(ends) => &ends[index].link,
+        }
     }
 
     fn decide(&self, request: Request<'_>) -> Result<Grant, GuardRefusal> {
@@ -436,42 +445,78 @@ fn a_second_link_is_refused_on_a_one_link_profile() {
     );
 }
 
+/// The resource of a loopback end that is a channel of the VCI, named by its channel.
+fn channel_resource(channel: &str) -> ResourceData {
+    resource(channel, "ISO_11898_2_DWCAN", &[(6, "HI"), (14, "LOW")])
+}
+
+fn create_channel(env: &Env, channel: &str) -> Result<Grant, GuardRefusal> {
+    create_with(env, &channel_resource(channel))
+}
+
+fn creates(endpoint: usize) -> Result<Grant, GuardRefusal> {
+    Ok(Grant::CreatesLink {
+        endpoint,
+        raw_mode: false,
+    })
+}
+
 #[test]
-fn a_loopback_takes_one_link_per_endpoint() {
+fn a_loopback_takes_one_link_per_channel_and_binds_the_one_named() {
     let mut env = Env::new(loopback());
-    let first = create_with(&env, &profile_resource());
+    // Each end creates its own channel's link, and a request for B binds B first.
+    assert_eq!(create_channel(&env, "CAN_CH1"), creates(0));
+    assert_eq!(create_channel(&env, "CAN_CH2"), creates(1));
+    // The name is read as the worker reads it.
+    assert_eq!(create_channel(&env, "can_ch02"), creates(1));
+    env.links.insert(CLL, BoundLink::new(1, false));
+    assert_eq!(create_channel(&env, "CAN_CH1"), creates(0));
+    // Endpoint B's resource twice is refused.
     assert_eq!(
-        first,
-        Ok(Grant::CreatesLink {
-            endpoint: 0,
-            raw_mode: false
-        })
-    );
-    env.links.insert(
-        CLL,
-        BoundLink {
-            endpoint: 0,
-            raw_mode: false,
-        },
-    );
-    assert_eq!(
-        create_with(&env, &profile_resource()),
-        Ok(Grant::CreatesLink {
-            endpoint: 1,
-            raw_mode: false
-        })
-    );
-    env.links.insert(
-        11,
-        BoundLink {
-            endpoint: 1,
-            raw_mode: false,
-        },
-    );
-    assert_eq!(
-        create_with(&env, &profile_resource()),
+        create_channel(&env, "CAN_CH2"),
         Err(GuardRefusal::LinkCount)
     );
+    env.links.insert(11, BoundLink::new(0, false));
+    // A third channel is no endpoint's, and neither is the profile's protocol name.
+    for name in ["CAN_CH3", PROTOCOL, "CAN"] {
+        assert!(
+            matches!(create_channel(&env, name), Err(GuardRefusal::LinkSetup(_))),
+            "{name}"
+        );
+    }
+    assert_eq!(
+        create_channel(&env, "CAN_CH1"),
+        Err(GuardRefusal::LinkCount)
+    );
+}
+
+#[test]
+fn a_socketcan_end_has_no_worker_link() {
+    let text = format!(
+        "class = \"T0\"\n[[endpoint]]\nsocketcan = \"can0\"\n[endpoint.link]\n{}\
+         [[endpoint]]\nchannel = \"CAN_CH1\"\n[endpoint.vci]\n{VCI}\n[endpoint.link]\n{}",
+        link_toml(&L {
+            request: 0x123,
+            response: 0x124,
+            functional: None,
+            ..L::default()
+        }),
+        link_toml(&L {
+            request: 0x124,
+            response: 0x123,
+            functional: None,
+            ..L::default()
+        })
+    );
+    let mut env = Env::new(parse(&text).unwrap());
+    // Only the VCI end is a worker link, and it is endpoint 1.
+    assert_eq!(create_channel(&env, "CAN_CH1"), creates(1));
+    env.links.insert(CLL, BoundLink::new(1, false));
+    assert_eq!(
+        create_channel(&env, "CAN_CH1"),
+        Err(GuardRefusal::LinkCount)
+    );
+    assert!(create_channel(&env, PROTOCOL).is_err());
 }
 
 #[test]
@@ -849,6 +894,130 @@ fn the_can_id_format_must_describe_the_profiles_link() {
     assert!(set(&normal, unum("CP_CanFillerByte", 0x1FF)).is_err());
 }
 
+fn connect(env: &Env) -> Result<Grant, GuardRefusal> {
+    env.decide(Request::ConnectComLogicalLink(
+        &ConnectComLogicalLinkRequest { cll_handle: cll() },
+    ))
+}
+
+/// What the seam does with a grant after the worker accepted the request.
+fn apply(env: &mut Env, grant: Result<Grant, GuardRefusal>) {
+    if let Ok(Grant::SetsComParams { cll, names }) = grant {
+        env.links.get_mut(&cll).unwrap().set.extend(names);
+    }
+}
+
+#[test]
+fn a_link_connects_only_once_the_profiles_comparams_are_set() {
+    let link = L {
+        comparams: "CP_BlockSize = 8",
+        ..L::default()
+    };
+    let mut env = Env::linked(profile_with("T3", &link), false);
+    // Right after create nothing is set.
+    assert!(matches!(connect(&env), Err(GuardRefusal::LinkSetup(_))));
+
+    // A ComParam without a profile value (timing) sets nothing the connect needs.
+    let timing = set(&env, unum("CP_P2Max", 1));
+    assert_eq!(timing, Ok(Grant::Pass));
+    apply(&mut env, timing);
+
+    let steps: Vec<(&str, ParamItem, &str)> = vec![
+        ("baud", unum("DATA_RATE", 500_000), "cp_baudrate"),
+        ("blocksize", unum("cp_blocksize", 8), "cp_blocksize"),
+    ];
+    for (label, item, canonical) in steps {
+        let grant = set(&env, item);
+        assert_eq!(
+            grant,
+            Ok(Grant::SetsComParams {
+                cll: CLL,
+                names: vec![canonical.to_owned()]
+            }),
+            "{label}"
+        );
+        apply(&mut env, grant);
+        assert!(connect(&env).is_err(), "still missing after {label}");
+    }
+    // The identifiers go in through the response table, the functional one through SetComParam.
+    let table = set_table(
+        &env,
+        vec![
+            unum("CP_CanPhysReqId", 0x7E0),
+            unum("CP_CanRespUSDTId", 0x7E8),
+        ],
+    );
+    assert_eq!(
+        table,
+        Ok(Grant::SetsComParams {
+            cll: CLL,
+            names: vec!["cp_canphysreqid".to_owned(), "cp_canrespusdtid".to_owned()]
+        })
+    );
+    apply(&mut env, table);
+    // All but one set: refused, and the message names what is missing.
+    let Err(GuardRefusal::LinkSetup(why)) = connect(&env) else {
+        panic!("connect should be refused");
+    };
+    assert!(why.contains("cp_canfuncreqid"), "{why}");
+    let grant = set(&env, unum("CP_CanFuncReqId", 0x7DF));
+    apply(&mut env, grant);
+    assert_eq!(connect(&env), Ok(Grant::Pass));
+
+    // A value changed to another than the profile's is refused at SetComParam anyway, and a
+    // set that is refused records nothing.
+    assert!(set(&env, unum("CP_Baudrate", 250_000)).is_err());
+    assert!(set(&env, unum("DATA_RATE", 250_000)).is_err());
+}
+
+#[test]
+fn the_connect_check_requires_what_the_profile_pins() {
+    let l = L {
+        id_bits: 29,
+        request: 0x18DA_10F1,
+        response: 0x18DA_F110,
+        functional: None,
+        addressing: "extended",
+        address: Some(0x42),
+        padding: Some(0x55),
+        comparams: "CP_STmin = 2",
+    };
+    let profile = profile_with("T2", &l);
+    let Setup::Link { link, .. } = &profile.setup else {
+        unreachable!()
+    };
+    assert_eq!(
+        link::required(link),
+        [
+            "cp_baudrate",
+            "cp_canfillerbyte",
+            "cp_canfillerbytehandling",
+            "cp_canphysreqextaddr",
+            "cp_canphysreqformat",
+            "cp_canphysreqid",
+            "cp_canrespusdtextaddr",
+            "cp_canrespusdtformat",
+            "cp_canrespusdtid",
+            "cp_stmin",
+        ]
+    );
+    // The plain 11-bit link needs the baud rate and the identifiers only.
+    let plain = profile_with(
+        "T3",
+        &L {
+            functional: None,
+            ..L::default()
+        },
+    );
+    let Setup::Link { link, .. } = &plain.setup else {
+        unreachable!()
+    };
+    assert_eq!(
+        link::required(link),
+        ["cp_baudrate", "cp_canphysreqid", "cp_canrespusdtid"]
+    );
+}
+
 #[test]
 fn unknown_handles_and_other_modules_are_refused() {
     let env = Env::new(profile("T3"));
@@ -873,7 +1042,7 @@ fn unknown_handles_and_other_modules_are_refused() {
         )),
         Err(GuardRefusal::UnknownHandle)
     );
-    let linked = Env::linked(profile("T3"), false);
+    let linked = Env::ready(profile("T3"));
     assert_eq!(
         linked.decide(Request::ConnectComLogicalLink(
             &ConnectComLogicalLinkRequest { cll_handle: handle }
@@ -1169,7 +1338,12 @@ fn a_raw_mode_link_is_refused_on_t2_and_t3() {
         (Env::new(profile("T1")), "T1"),
         (Env::new(loopback()), "T0"),
     ] {
-        let mut request = create_request(create::Resource::RscData(profile_resource()));
+        let resource = if class == "T0" {
+            channel_resource("CAN_CH1")
+        } else {
+            profile_resource()
+        };
+        let mut request = create_request(create::Resource::RscData(resource));
         request.cll_create_flag = Some(raw.clone());
         assert_eq!(
             env.decide(Request::CreateComLogicalLink(&request)),
@@ -1213,13 +1387,7 @@ fn t0_passes_only_frames_between_its_endpoints() {
     assert!(raw_send(&env, &[0x00, 0x01]).is_err());
     // The other endpoint's link sends to its own.
     let mut other = Env::new(loopback());
-    other.links.insert(
-        CLL,
-        BoundLink {
-            endpoint: 1,
-            raw_mode: true,
-        },
-    );
+    other.links.insert(CLL, BoundLink::new(1, true));
     assert!(raw_send(&other, &frame(0x124, &[0x01, 0x00])).is_ok());
     assert!(raw_send(&other, &frame(0x123, &[0x01, 0x00])).is_err());
     // A frame whose flags disagree with the link.
@@ -1411,7 +1579,7 @@ fn every_rpc_has_a_variant() {
 #[test]
 fn every_request_variant_is_decided() {
     use vci_service_interface as v;
-    let env = Env::linked(profile("T3"), false);
+    let env = Env::ready(profile("T3"));
     let module_request = v::GetModuleIdsRequest {};
     let connect = v::ModuleConnectRequest {
         module_handle: module(),

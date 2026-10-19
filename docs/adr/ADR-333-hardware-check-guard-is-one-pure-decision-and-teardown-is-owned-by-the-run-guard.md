@@ -40,7 +40,17 @@ present.
    its second as `LOW` (ISO 22900-2 (2022) Annex B). A resource by name is refused. The create
    flag may carry RawMode (D.2.3) and nothing else, and RawMode only on T0 and T1: on T2 and T3
    a RawMode link is refused (item 3). There is one link per profile endpoint: one,
-   or two for T0. ComParam rules are an allow-list over canonical names. A name (or the name a learned id
+   or two for T0, and a link is created for the endpoint whose own identity the resource names:
+   the protocol name of its `channel` (SAE J2534-2 clause 7 additional channel, a `_CH<n>` name
+   read as the worker reads it) when the endpoint has one, else its protocol. A SocketCAN end has
+   no worker link. The grant binds that endpoint, not the first free one. A link is not
+   connected with the worker's defaults: the guard keeps, per bound link, which pinned ComParams
+   have been set to the profile's value (`Grant::SetsComParams`, applied by the caller after the
+   worker accepted the request) and refuses `ConnectComLogicalLink` until all are: the baud rate,
+   the physical request and response identifiers, the functional identifier if the profile has
+   one, the CAN ID formats when the width or addressing is not 11-bit normal, the address byte
+   when the addressing has one, the filler when the profile pads, and every `[link.comparams]`
+   entry. ComParam rules are an allow-list over canonical names. A name (or the name a learned id
    stands for) is first reduced to its canonical form: ASCII case folded and the aliases
    `j2534-0404-service` accepts for one ComParam resolved (`DATA_RATE` is `CP_Baudrate`, and so on),
    so a rule cannot be skipped by another spelling; `iso22900-service` resolves names in the
@@ -100,9 +110,11 @@ present.
    acquired (`register` for a closure, `register_async` for a future). `run` pops them in
    reverse, so each runs at most once, a second `run` or `Drop` finds none, each step runs under
    `catch_unwind`, a failing or panicking step does not stop the rest, and the failures are
-   returned. An async step runs on a scoped OS thread with a fresh current-thread runtime and a
-   timeout, so `run` works from inside a runtime's thread, where blocking on the runtime would
-   panic. `Drop` runs the rest and never panics. `RunGuard::teardown()` gives the run's
+   returned. An async step runs on a detached OS thread with a fresh current-thread runtime, and
+   the caller waits for it on a channel with a timeout, so `run` works from inside a runtime's
+   thread (blocking on the runtime there would panic) and a step that blocks inside `poll`, where
+   no runtime timer fires, times out as well: it is reported, its thread is left behind and never
+   joined, and the remaining steps run. `Drop` runs the rest and never panics. `RunGuard::teardown()` gives the run's
    `Teardown`; the guard's `Drop` runs it before anything else, whatever the check did, and when
    a step failed it turns a recorded pass into a failure naming the steps (and appends them to
    a recorded failure), then writes the report as before.
@@ -141,4 +153,11 @@ Alternatives rejected:
   module the harness holds.
 - A profile's protocol name must be the ISO 22900-2 (2022) short name the agent sends
   (`ISO_14229_3_on_ISO_15765_2`); another spelling of the same protocol is refused.
+- The agent's link setup (`open` in `crates/agent/src/link.rs`) sets the baud rate, P2, P2*, the
+  0x78 handling and the declared ComParams, and the two identifiers in the response table, and
+  then connects. It never sets the functional identifier, the CAN ID formats, the address byte,
+  the filler or a profile's `[link.comparams]`. Through the guard, a profile that has any of
+  these has its connect refused until the seam sets them (it must set them itself before or
+  while handing the agent its link, or the agent's connect fails); the worker's defaults are not
+  assumed to equal the profile's (the J2534 CAN preset is 500 kbit/s whatever the profile says).
 - ADR-275 items 4 and 6 are unchanged; this ADR gives the rules their concrete form.

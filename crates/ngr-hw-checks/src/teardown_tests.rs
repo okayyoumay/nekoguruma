@@ -248,3 +248,22 @@ fn a_failed_step_is_added_to_a_recorded_failure() {
     assert!(message.contains("no response to the read"), "{message}");
     assert!(message.contains("the relay did not answer"), "{message}");
 }
+
+#[test]
+fn an_async_step_that_blocks_inside_poll_times_out_and_the_rest_runs() {
+    let log = log();
+    let mut teardown = Teardown::new();
+    teardown.set_timeout(Duration::from_millis(100));
+    teardown.register("power", step(&log, "power"));
+    // Blocks the thread that polls it, where no runtime timer can fire.
+    teardown.register_async("channel", async {
+        std::thread::sleep(Duration::from_secs(2));
+        Ok(())
+    });
+    let started = std::time::Instant::now();
+    let failures = teardown.run();
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert_eq!(events(&log), ["power"]);
+    assert_eq!(failures.len(), 1);
+    assert!(failures[0].reason.contains("timed out"), "{failures:?}");
+}

@@ -7,9 +7,10 @@
 //! that fails or panics does not stop the others; [`Teardown::run`] returns what failed, and the
 //! run's [`crate::report::RunGuard`] turns a failure into a failed check.
 //!
-//! An async step is driven on a scoped OS thread with its own current-thread runtime and a
-//! timeout, so `run` can be called from anywhere: blocking on a runtime from inside a runtime's
-//! worker thread panics, and a thread of its own does not.
+//! An async step is driven on a detached OS thread with its own current-thread runtime, and the
+//! caller waits for it with a timeout, so `run` can be called from anywhere (blocking on a runtime
+//! from inside a runtime's worker thread panics, and a thread of its own does not) and a step
+//! that blocks inside `poll` cannot hold the teardown up: it is left behind and the rest runs.
 
 use std::any::Any;
 use std::future::Future;
@@ -142,35 +143,39 @@ fn panic_text(payload: &(dyn Any + Send)) -> String {
         .unwrap_or_else(|| "no message".to_owned())
 }
 
-/// Drives `future` to its end, or for at most `timeout`, on a thread of its own with a fresh
-/// current-thread runtime.
+/// Drives `future` to its end, or for at most `timeout`, on a detached thread with a fresh
+/// current-thread runtime. The caller waits on a channel, so a step that blocks inside `poll`,
+/// where no runtime timer can fire, still times out: the thread is left behind, never joined, and
+/// the remaining steps run.
 fn run_async(future: AsyncStep, timeout: Duration) -> Result<(), String> {
-    std::thread::scope(|scope| {
-        let spawned = std::thread::Builder::new()
-            .name("teardown-step".to_owned())
-            .spawn_scoped(scope, move || {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("teardown-step".to_owned())
+        .spawn(move || {
+            let outcome = catch_unwind(AssertUnwindSafe(|| {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
                     .map_err(|e| format!("cannot start a runtime: {e}"))?;
-                // The timer is created inside the runtime, not before it.
+                // The timer is created inside the runtime, not before it. It ends a step that
+                // is merely waiting, so its thread does not outlive the teardown.
                 let result =
                     runtime.block_on(async move { tokio::time::timeout(timeout, future).await });
-                // A step that left tasks behind does not hold the teardown up.
                 runtime.shutdown_background();
-                match result {
-                    Ok(result) => result,
-                    Err(_) => Err(format!("timed out after {timeout:?}")),
-                }
-            });
-        match spawned {
-            Ok(handle) => match handle.join() {
-                Ok(result) => result,
-                Err(payload) => Err(format!("panicked: {}", panic_text(payload.as_ref()))),
-            },
-            Err(e) => Err(format!("cannot start a thread: {e}")),
-        }
-    })
+                result.unwrap_or_else(|_| Err(format!("timed out after {timeout:?}")))
+            }))
+            .unwrap_or_else(|payload| Err(format!("panicked: {}", panic_text(payload.as_ref()))));
+            // The receiver is gone when the caller gave up.
+            let _ = sender.send(outcome);
+        });
+    if let Err(e) = spawned {
+        return Err(format!("cannot start a thread: {e}"));
+    }
+    // A grace period beyond the step's own timer, for the step that cannot be interrupted.
+    match receiver.recv_timeout(timeout + Duration::from_millis(250)) {
+        Ok(result) => result,
+        Err(_) => Err(format!("timed out after {timeout:?}")),
+    }
 }
 
 #[cfg(test)]

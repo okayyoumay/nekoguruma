@@ -440,7 +440,7 @@ pub(crate) const PHYSICAL_COMPARAMS: &[&str] = &[
 
 /// A channel name as the J2534 worker reads it: ASCII case ignored, surrounding spaces dropped,
 /// and a `_CH` index read as a number, so `CAN_CH1`, `can_ch1` and `CAN_CH01` are one channel.
-fn channel_key(name: &str) -> String {
+pub(crate) fn channel_key(name: &str) -> String {
     let upper = name.trim().to_ascii_uppercase();
     if let Some(index) = upper.rfind("_CH") {
         let (head, digits) = (&upper[..index], &upper[index + 3..]);

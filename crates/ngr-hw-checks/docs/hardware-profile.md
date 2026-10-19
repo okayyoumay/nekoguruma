@@ -186,7 +186,7 @@ access or session beyond the extended one) are the class's lists, not declared o
 "Guarded VCI access", ADR-275 item 4, ADR-333). It is a pure function of the profile, the links
 the harness has bound, the ids it has learned from the worker's `GetResourceIds` and `GetObjectId`
 answers, and one request (`guard::Request`, one variant per RPC of `service VciService`). It
-returns a `Grant` (`Pass`, `CreatesLink`, `DestroysLink`, `EntersSession`) or a `GuardRefusal`.
+returns a `Grant` (`Pass`, `CreatesLink`, `SetsComParams`, `DestroysLink`, `EntersSession`) or a `GuardRefusal`.
 Anything it cannot classify is refused.
 
 - **Link setup.** `ModuleConnect` is refused (the harness opens the device). A link is created
@@ -195,7 +195,11 @@ Anything it cannot classify is refused.
   `LOW`), by resource data or by a learned resource id; a resource by name, or an id not learned,
   is refused. A create flag may carry RawMode only, and RawMode only on T0 and T1 (a worker
   passes raw data through, so the guard cannot classify it). One link per profile endpoint (T0: one per
-  end). `SetComParam` and the ComParams of `SetUniqueRespIdTable` keep the profile's values:
+  VCI end, created for the end whose `channel` the resource's protocol name is, or else whose
+  `protocol` it is; a SocketCAN end has no worker link). `ConnectComLogicalLink` is refused until
+  the pinned ComParams (baud rate, request, response and functional identifiers, formats and
+  address byte when the link needs them, filler, `[link.comparams]`) have been set to the
+  profile's values, which the caller records from `SetsComParams` grants. `SetComParam` and the ComParams of `SetUniqueRespIdTable` keep the profile's values:
   `CP_Baudrate`, the identifiers, the CAN ID format (ISO 22900-2 (2022) Table B.13 and B.14), the
   address byte and the padding; other physical-layer ComParams are refused; functional
   addressing needs a `functional_id`; a `[link.comparams]` entry keeps its value. The rules are an
@@ -218,8 +222,9 @@ Anything it cannot classify is refused.
 `ngr_hw_checks::teardown::Teardown` holds the steps a check registers as it acquires a resource
 (power, device, link): `register` for a closure, `register_async` for a future. `run` executes
 them in reverse, each at most once, each under `catch_unwind`; a failing or panicking step does
-not stop the others. An async step runs on a scoped thread with its own runtime and a timeout
-(`set_timeout`; 30 s by default), so it can be run from inside a runtime. A `RunGuard` owns one
+not stop the others. An async step runs on a detached thread with its own runtime; the caller waits for it with a
+timeout (`set_timeout`; 30 s by default), so it can be run from inside a runtime and a step that
+blocks is reported as timed out and left behind while the rest run. A `RunGuard` owns one
 (`RunGuard::teardown()`), runs it when dropped, also while a check panics, and turns a failed
 step into a failed check even if the check recorded a pass.
 

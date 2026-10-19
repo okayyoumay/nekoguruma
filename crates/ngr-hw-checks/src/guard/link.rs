@@ -12,7 +12,7 @@ use vci_service_interface::{
 };
 
 use super::{Context, Grant, GuardRefusal, uds};
-use crate::profile::{Addressing, Class, Link, PHYSICAL_COMPARAMS};
+use crate::profile::{Addressing, Class, Link, PHYSICAL_COMPARAMS, channel_key};
 
 /// The bus type the agent names a CAN link's resource by (ISO 22900-2 (2022) Annex B.1).
 const BUS_TYPE: &str = "ISO_11898_2_DWCAN";
@@ -59,11 +59,12 @@ pub(super) fn create(
         ));
     }
 
-    let links = ctx.endpoint_links();
+    // The endpoint is the one whose own identity the resource names: its channel selector when
+    // it has one, else its protocol.
     let mut mismatch = None;
     let mut matched = false;
-    for (endpoint, link) in links.iter().enumerate() {
-        match resource_matches(ctx, &resource, link) {
+    for (endpoint, link, channel) in ctx.worker_endpoints() {
+        match resource_matches(ctx, &resource, link, channel) {
             Ok(()) => {
                 matched = true;
                 if !ctx.links.values().any(|b| b.endpoint == endpoint) {
@@ -130,6 +131,7 @@ fn resource_matches(
     ctx: &Context<'_>,
     resource: &ResourceData,
     link: &Link,
+    channel: Option<&str>,
 ) -> Result<(), GuardRefusal> {
     let protocol = match &resource.protocol {
         Some(resource_data::Protocol::ProtocolName(name)) => name.clone(),
@@ -138,11 +140,24 @@ fn resource_matches(
         }
         None => return Err(refuse("the resource names no protocol")),
     };
-    if !protocol.eq_ignore_ascii_case(&link.protocol) {
-        return Err(refuse(format!(
-            "protocol {protocol:?} is not the profile's {:?}",
-            link.protocol
-        )));
+    match channel {
+        // An additional channel is named by its protocol name, as the worker reads it (ASCII
+        // case, spaces and the channel number's leading zeros do not matter).
+        Some(channel) => {
+            if channel_key(&protocol) != channel_key(channel) {
+                return Err(refuse(format!(
+                    "protocol {protocol:?} is not the endpoint's channel {channel:?}"
+                )));
+            }
+        }
+        None => {
+            if !protocol.eq_ignore_ascii_case(&link.protocol) {
+                return Err(refuse(format!(
+                    "protocol {protocol:?} is not the profile's {:?}",
+                    link.protocol
+                )));
+            }
+        }
     }
     let bus = match &resource.bus_type {
         Some(resource_data::BusType::BusTypeName(name)) => name.clone(),
@@ -369,7 +384,7 @@ pub(super) fn check_param(
     ctx: &Context<'_>,
     link: &Link,
     item: &ParamItem,
-) -> Result<(), GuardRefusal> {
+) -> Result<Option<String>, GuardRefusal> {
     let name = match &item.id {
         Some(param_item::Id::ParamName(name)) => name.clone(),
         Some(param_item::Id::ParamId(id)) => {
@@ -484,5 +499,41 @@ pub(super) fn check_param(
             None => return Err(wrong("has no numeric value")),
         }
     }
-    Ok(())
+    // Accepted at the profile's value: a required ComParam is now set, for the connect check.
+    Ok(required(link).contains(&lower).then_some(lower))
+}
+
+/// The canonical names of the ComParams the profile pins, which must all be set to the
+/// profile's value before the link is connected: the baud rate, the physical request and
+/// response identifiers, the functional identifier if the profile has one, the CAN ID formats
+/// when the width or addressing is not 11-bit normal, the address byte when the addressing has
+/// one, the filler when the profile pads, and every `[link.comparams]` entry. The worker's own
+/// defaults are not the profile's.
+pub(super) fn required(link: &Link) -> Vec<String> {
+    let mut names = vec!["cp_baudrate", "cp_canphysreqid", "cp_canrespusdtid"];
+    let functional = link.functional_id.is_some();
+    if functional {
+        names.push("cp_canfuncreqid");
+    }
+    let addressed = link.addressing != Addressing::Normal;
+    if link.id_bits == 29 || addressed {
+        names.extend(["cp_canphysreqformat", "cp_canrespusdtformat"]);
+        if functional {
+            names.push("cp_canfuncreqformat");
+        }
+    }
+    if addressed {
+        names.extend(["cp_canphysreqextaddr", "cp_canrespusdtextaddr"]);
+        if functional {
+            names.push("cp_canfuncreqextaddr");
+        }
+    }
+    if link.padding.is_some() {
+        names.extend(["cp_canfillerbyte", "cp_canfillerbytehandling"]);
+    }
+    let mut names: Vec<String> = names.into_iter().map(str::to_owned).collect();
+    names.extend(link.comparams.keys().map(|key| canonical(key)));
+    names.sort();
+    names.dedup();
+    names
 }

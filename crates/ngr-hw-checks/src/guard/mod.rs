@@ -17,7 +17,7 @@
 //! The seam that routes the agent's job runner and a direct check through [`decide`] is not part
 //! of this module.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use vci_service_interface::{
     CancelComPrimitiveRequest, ConnectComLogicalLinkRequest, DisconnectComLogicalLinkRequest,
@@ -137,11 +137,26 @@ impl Request<'_> {
 
 /// A link the harness has created: which profile endpoint it serves and whether it was created
 /// in RawMode (ISO 22900-2 (2022) D.2.3), which decides how a payload is read.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BoundLink {
     /// Index into the profile's endpoints: 0 for a one-link profile; 0 or 1 for a T0 loopback.
     pub endpoint: usize,
     pub raw_mode: bool,
+    /// The canonical names of the profile-pinned ComParams that have been set on this link to
+    /// the profile's value (see [`Grant::SetsComParams`]). `ConnectComLogicalLink` is refused
+    /// until every required one is here.
+    pub set: BTreeSet<String>,
+}
+
+impl BoundLink {
+    /// A link on `endpoint` with no profile ComParam set yet.
+    pub fn new(endpoint: usize, raw_mode: bool) -> Self {
+        BoundLink {
+            endpoint,
+            raw_mode,
+            set: BTreeSet::new(),
+        }
+    }
 }
 
 /// The links of the check by their `cll_handle`.
@@ -170,12 +185,15 @@ pub struct Context<'a> {
 }
 
 /// A request the guard lets through, and what the caller must do about it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Grant {
     /// Send it; nothing changes.
     Pass,
     /// A link is created on this profile endpoint; bind the handle of the response to it.
     CreatesLink { endpoint: usize, raw_mode: bool },
+    /// Send it; once the worker has accepted it, add these canonical ComParam names to the
+    /// `set` of the link `cll`. Each was checked against the profile's value.
+    SetsComParams { cll: u32, names: Vec<String> },
     /// The link with this `cll_handle` goes away; drop it from the table.
     DestroysLink(u32),
     /// The request moves the ECU to this diagnostic session (the sub-function with the
@@ -255,7 +273,22 @@ pub fn decide(ctx: &Context<'_>, request: &Request<'_>) -> Result<Grant, GuardRe
                 r.cll_handle.map_or(0, |h| h.cll_handle),
             ))
         }
-        Request::ConnectComLogicalLink(r) => ctx.known_link(r.cll_handle.as_ref()),
+        Request::ConnectComLogicalLink(r) => {
+            // A link connects with the profile's ComParams, not the worker's defaults.
+            let (bound, link) = ctx.bound(r.cll_handle.as_ref())?;
+            let missing: Vec<String> = link::required(link)
+                .into_iter()
+                .filter(|name| !bound.set.contains(name))
+                .collect();
+            if missing.is_empty() {
+                Ok(Grant::Pass)
+            } else {
+                Err(GuardRefusal::LinkSetup(format!(
+                    "the link is not connected before the profile's ComParams are set: {}",
+                    missing.join(", ")
+                )))
+            }
+        }
         Request::DisconnectComLogicalLink(r) => ctx.known_link(r.cll_handle.as_ref()),
         Request::LockResource(r) => ctx.known_link(r.cll_handle.as_ref()),
         Request::UnlockResource(r) => ctx.known_link(r.cll_handle.as_ref()),
@@ -267,8 +300,8 @@ pub fn decide(ctx: &Context<'_>, request: &Request<'_>) -> Result<Grant, GuardRe
                 .param_item
                 .as_ref()
                 .ok_or(GuardRefusal::Undecodable("SetComParam without a ComParam"))?;
-            link::check_param(ctx, link, item)?;
-            Ok(Grant::Pass)
+            let names = link::check_param(ctx, link, item)?.into_iter().collect();
+            Ok(sets(r.cll_handle, names))
         }
         Request::SetUniqueRespIdTable(r) => {
             let (_, link) = ctx.bound(r.cll_handle.as_ref())?;
@@ -278,12 +311,15 @@ pub fn decide(ctx: &Context<'_>, request: &Request<'_>) -> Result<Grant, GuardRe
                 .ok_or(GuardRefusal::Undecodable(
                     "SetUniqueRespIdTable without a table",
                 ))?;
+            let mut names = Vec::new();
             for entry in &table.unique_data {
                 for item in &entry.params {
-                    link::check_param(ctx, link, item)?;
+                    names.extend(link::check_param(ctx, link, item)?);
                 }
             }
-            Ok(Grant::Pass)
+            names.sort();
+            names.dedup();
+            Ok(sets(r.cll_handle, names))
         }
         Request::StartComPrimitive(r) => {
             let (bound, link) = ctx.bound(r.cll_handle.as_ref())?;
@@ -333,12 +369,38 @@ pub fn decide(ctx: &Context<'_>, request: &Request<'_>) -> Result<Grant, GuardRe
     }
 }
 
+/// The grant of a ComParam request that passed: `Pass`, or the pinned ComParams it set.
+fn sets(cll: Option<ComLogicalLinkHandle>, names: Vec<String>) -> Grant {
+    match cll {
+        Some(h) if !names.is_empty() => Grant::SetsComParams {
+            cll: h.cll_handle,
+            names,
+        },
+        _ => Grant::Pass,
+    }
+}
+
 impl<'a> Context<'a> {
     /// The profile's links in endpoint order: one, or a T0 loopback's two.
     fn endpoint_links(&self) -> Vec<&'a Link> {
         match &self.profile.setup {
             Setup::Link { link, .. } => vec![link],
             Setup::Loopback(ends) => ends.iter().map(|e| &e.link).collect(),
+        }
+    }
+
+    /// The endpoints a worker link can be created for, with their index: the VCI ends. A
+    /// SocketCAN end is not on the worker. The channel is the selector of an additional channel
+    /// of a VCI (SAE J2534-2 clause 7).
+    fn worker_endpoints(&self) -> Vec<(usize, &'a Link, Option<&'a str>)> {
+        match &self.profile.setup {
+            Setup::Link { link, .. } => vec![(0, link, None)],
+            Setup::Loopback(ends) => ends
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| e.vci.is_some())
+                .map(|(i, e)| (i, &e.link, e.channel.as_deref()))
+                .collect(),
         }
     }
 

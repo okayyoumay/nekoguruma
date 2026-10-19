@@ -319,3 +319,18 @@ fn a_step_can_have_its_own_timeout() {
     let names: Vec<&str> = failures.iter().map(|f| f.name.as_str()).collect();
     assert_eq!(names, ["shorter", "default"], "{failures:?}");
 }
+
+/// A step's timeout can be read when the step runs, not when it is registered.
+#[test]
+fn a_step_timeout_can_be_read_when_the_step_runs() {
+    let timeout = Arc::new(Mutex::new(Duration::from_millis(30)));
+    let mut teardown = Teardown::new();
+    let read = Arc::clone(&timeout);
+    teardown.register_async_with_timeout_fn("slow", move || *read.lock().unwrap(), async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        Ok(())
+    });
+    // Changed after the registration: the step has time for its slow work.
+    *timeout.lock().unwrap() = Duration::from_secs(5);
+    assert!(teardown.run().is_empty());
+}

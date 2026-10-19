@@ -262,12 +262,13 @@ connection is served by the runtime.
   stream, which `send_receive(cll, request)` reads (it returns the final response, a negative one
   included, or `NoResponse`). It waits up to `HandleOptions::response_timeout`, by default the link's ceiling
   (P2, the 0x78 completion timeout and P2* the link is set to, the profile's when it pins them,
-  plus 2 s), and cancels the primitive when the wait ends. Zeros are read as
+  plus 2 s), and cancels the primitive when the wait ends or the worker reports lost events (a failed cancel is then the error returned). Zeros are read as
   `j2534-0404-service` reads them: P2 zero is 50 ms, P2* zero is 5 s, and a zero completion
   timeout is no ceiling in the worker, so the handle waits at most 10 minutes (and then cancels)
   rather than forever. A `SetComParam` of P2, P2* or the completion timeout through the handle
-  updates the ceiling: until a `COPT_UPDATEPARAM` primitive is accepted the longer of the old and
-  the new value is waited for, afterwards the new one (`response_ceiling` reports it). A read of
+  updates the ceiling: until the link is connected or a `COPT_UPDATEPARAM` primitive has finished
+  successfully (the handle waits for it) the longer of the old and the new value is waited for,
+  afterwards the new one; an update that fails or times out changes nothing (`response_ceiling` reports it). A read of
   one DID expects `62` and that DID; a read of several expects `62` only, since the ECU may
   return the records in any order.
 - **Links created by a check.** Whatever creates a link through the handle, including a link a
@@ -283,11 +284,13 @@ connection is served by the runtime.
 - **Teardown.** The steps are registered as the resources are acquired and run in reverse: the
   device's closing, then each link's disconnect and destroy (skipped when the check destroyed it),
   then, per link, one return to the default session (`10 01`, itself decided) registered before a
-  request that enters another session is sent. That step waits for the response no longer than
-  the link's response wait is when it is registered, and has its own timeout (that wait, the
-  start and cancel requests and a margin, at least the 30 s default of other steps) so it ends by
-  cancelling the primitive instead of being dropped by the teardown. Teardown steps may carry
-  their own timeout (`register_async_with_timeout`). Power: the handle registers nothing for the
+  request that enters another session is sent. That step reads the link's response wait when it
+  runs (the longer of the timings in effect and those staged), waits no longer than that, and
+  cancels the primitive when the wait ends; its timeout is read at the same moment (that wait, the
+  start and cancel requests and a margin, at least the 30 s default of other steps), via
+  `register_async_with_timeout_fn`. A check that destroys a link in another session has it
+  returned first: the handle sends the same `10 01`, and refuses the destroy if that fails, so the
+  step stays registered. Power: the handle registers nothing for the
   profile's power commands. A check that switches power registers the power-off step itself before
   it switches power on.
 - **RawMode form.** On a T0 link the data of a send is the literal frame the worker passes on.

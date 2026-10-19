@@ -237,6 +237,13 @@ impl Shared {
         }
     }
 
+    /// The staged timings of `cll` are the ones in effect.
+    fn promote_timings(&self, cll: ComLogicalLinkHandle) {
+        if let Some(timings) = self.lock().timings.get_mut(&cll.cll_handle) {
+            timings.active = timings.staged;
+        }
+    }
+
     /// Applies what a granted request changes, after the worker accepted it.
     fn apply(&self, grant: &Grant) {
         let mut state = self.lock();
@@ -292,6 +299,37 @@ impl Shared {
         request: &[u8],
         cap: Option<Duration>,
     ) -> Result<Vec<u8>, HandleError> {
+        self.await_primitive(client, cll, cop, Some(Expectation::of(request)), cap)
+            .await
+    }
+
+    /// Cancels primitive `cop`, through the guard.
+    async fn cancel(
+        &self,
+        client: &mut WorkerClient,
+        cop: ComPrimitiveHandle,
+    ) -> Result<(), HandleError> {
+        let cancel = CancelComPrimitiveRequest {
+            cop_handle: Some(cop),
+        };
+        self.admit(&Request::CancelComPrimitive(&cancel))?;
+        self.send("CancelComPrimitive", client.cancel_com_primitive(cancel))
+            .await
+            .map(drop)
+    }
+
+    /// Waits for the end of primitive `cop`: its response to `expected`, or with `None` (a
+    /// primitive that has no response, such as an update of ComParams) its successful finish,
+    /// which returns no bytes. The primitive is cancelled when the wait ends or the worker lost
+    /// events, since it may still be running.
+    async fn await_primitive(
+        &self,
+        client: &mut WorkerClient,
+        cll: ComLogicalLinkHandle,
+        cop: ComPrimitiveHandle,
+        expected: Option<Expectation>,
+        cap: Option<Duration>,
+    ) -> Result<Vec<u8>, HandleError> {
         let events = self
             .lock()
             .events
@@ -300,7 +338,6 @@ impl Shared {
             .ok_or_else(|| HandleError::Setup("the link has no event stream".to_owned()))?;
         let timeout = self.wait_for(cll);
         let timeout = cap.map_or(timeout, |cap| timeout.min(cap));
-        let expected = Expectation::of(request);
         let mut response = None;
         let mut error = None;
         let deadline = tokio::time::Instant::now() + timeout;
@@ -311,14 +348,7 @@ impl Shared {
                 Err(_) => {
                     // Nothing is left running after the caller gave up; a failed cancel (the
                     // primitive ended meanwhile) changes nothing.
-                    let cancel = CancelComPrimitiveRequest {
-                        cop_handle: Some(cop),
-                    };
-                    if self.admit(&Request::CancelComPrimitive(&cancel)).is_ok() {
-                        let _ = self
-                            .send("CancelComPrimitive", client.cancel_com_primitive(cancel))
-                            .await;
-                    }
+                    let _ = self.cancel(client, cop).await;
                     return Err(HandleError::NoResponse);
                 }
             }
@@ -330,6 +360,9 @@ impl Shared {
             let item = match notification.event_data {
                 Some(event_notification::EventData::Item(item)) => item,
                 Some(event_notification::EventData::Lost(_)) => {
+                    // The end of the primitive may be among the lost events, so it may still
+                    // be running: stop it, and report a cancel that failed in preference.
+                    self.cancel(client, cop).await?;
                     return Err(HandleError::EventsLost);
                 }
                 None => continue,
@@ -340,7 +373,9 @@ impl Shared {
             }
             match item.data {
                 Some(event_item::Data::ResultData(result))
-                    if expected.answers(&result.data_bytes) =>
+                    if expected
+                        .as_ref()
+                        .is_some_and(|expected| expected.answers(&result.data_bytes)) =>
                 {
                     response = Some(result.data_bytes);
                 }
@@ -352,8 +387,10 @@ impl Shared {
                     if status == PduComPrimitiveStatus::PduCopstFinished as i32
                         || status == PduComPrimitiveStatus::PduCopstCancelled as i32 =>
                 {
+                    let finished = status == PduComPrimitiveStatus::PduCopstFinished as i32;
                     return match (response, error) {
                         (Some(response), _) => Ok(response),
+                        (None, None) if expected.is_none() && finished => Ok(Vec::new()),
                         (None, Some(code)) => Err(HandleError::PrimitiveFailed(code)),
                         (None, None) => Err(HandleError::NoResponse),
                     };
@@ -486,7 +523,6 @@ async fn return_to_default_session(
     shared: Arc<Shared>,
     mut client: WorkerClient,
     cll: ComLogicalLinkHandle,
-    wait: Duration,
 ) -> Result<(), String> {
     {
         let mut state = shared.lock();
@@ -495,6 +531,8 @@ async fn return_to_default_session(
             return Ok(());
         }
     }
+    // The link's response wait as it is now, active and staged timings alike.
+    let wait = shared.wait_for(cll);
     // DiagnosticSessionControl to the default session (ISO 14229-1 (2026) 9.2).
     let request = [0x10, 0x01];
     let run = async {
@@ -505,7 +543,13 @@ async fn return_to_default_session(
             .await_result(&mut client, cll, cop, &request, Some(wait))
             .await
     };
-    run.await.map(drop).map_err(|e| e.to_string())
+    let result = run.await.map(drop).map_err(|e| e.to_string());
+    if result.is_err() {
+        // Still to be done: a later run of the step (the teardown's, after a refused destroy)
+        // tries again.
+        shared.lock().session_back.insert(cll.cll_handle);
+    }
+    result
 }
 
 /// The value of a ComParam the handle sets.
@@ -1125,6 +1169,28 @@ impl<'r> GuardedHandle<'r> {
         Ok(response)
     }
 
+    /// `ConnectComLogicalLink`, which the guard allows once the profile's ComParams are set. A
+    /// connect puts the staged timings into effect.
+    pub async fn connect_com_logical_link(
+        &mut self,
+        request: ConnectComLogicalLinkRequest,
+    ) -> Result<vci_service_interface::Response, HandleError> {
+        self.shared
+            .admit(&Request::ConnectComLogicalLink(&request))?;
+        let cll = request.cll_handle;
+        let response = self
+            .shared
+            .send(
+                "ConnectComLogicalLink",
+                self.client.clone().connect_com_logical_link(request),
+            )
+            .await?;
+        if let Some(cll) = cll {
+            self.shared.promote_timings(cll);
+        }
+        Ok(response)
+    }
+
     /// `DestroyComLogicalLink`; the link is dropped from the table.
     pub async fn destroy_com_logical_link(
         &mut self,
@@ -1133,6 +1199,21 @@ impl<'r> GuardedHandle<'r> {
         let grant = self
             .shared
             .admit(&Request::DestroyComLogicalLink(&request))?;
+        // A link that entered another session goes back to the default one first: the step
+        // registered for it would find no link afterwards. If the return fails the destroy is
+        // refused, and the step stays registered with the run.
+        if let Some(cll) = request.cll_handle
+            && self.shared.lock().session_back.contains(&cll.cll_handle)
+        {
+            return_to_default_session(self.shared.clone(), self.client.clone(), cll)
+                .await
+                .map_err(|reason| {
+                    HandleError::Setup(format!(
+                        "the link is not destroyed: it could not be returned to the default \
+                         session first: {reason}"
+                    ))
+                })?;
+        }
         let response = self
             .shared
             .send(
@@ -1204,13 +1285,14 @@ impl<'r> GuardedHandle<'r> {
         if let (Grant::EntersSession(_), Some(cll)) = (&grant, cll)
             && self.shared.lock().session_back.insert(cll.cll_handle)
         {
-            // The step waits no longer than the link's response wait is now, and has the time
-            // for that, so it ends by itself and cancels instead of being dropped.
-            let wait = self.shared.wait_for(cll);
-            self.teardown.register_async_with_timeout(
+            // The step waits no longer than the link's response wait is when it runs, and has
+            // the time for that (read at the same moment), so it ends by itself and cancels
+            // instead of being dropped.
+            let shared = self.shared.clone();
+            self.teardown.register_async_with_timeout_fn(
                 format!("return link {} to the default session", cll.cll_handle),
-                session_reset_timeout(wait, self.shared.options.request_timeout),
-                return_to_default_session(self.shared.clone(), self.client.clone(), cll, wait),
+                move || session_reset_timeout(shared.wait_for(cll), shared.options.request_timeout),
+                return_to_default_session(self.shared.clone(), self.client.clone(), cll),
             );
         }
         let updates = request.cop_type == ComOperationType::CoptUpdateparam as i32;
@@ -1221,11 +1303,17 @@ impl<'r> GuardedHandle<'r> {
                 self.client.clone().start_com_primitive(request),
             )
             .await?;
+        // The staged timings are in effect once the update has finished successfully; until
+        // then (and if it fails or times out) the longer of the two is waited for.
         if updates
-            && let Some(cll) = cll
-            && let Some(timings) = self.shared.lock().timings.get_mut(&cll.cll_handle)
+            && let (Some(cll), Some(cop)) = (cll, response.cop_handle)
+            && self
+                .shared
+                .await_primitive(&mut self.client.clone(), cll, cop, None, None)
+                .await
+                .is_ok()
         {
-            timings.active = timings.staged;
+            self.shared.promote_timings(cll);
         }
         Ok(response)
     }
@@ -1262,8 +1350,6 @@ impl<'r> GuardedHandle<'r> {
         get_resource_status(GetResourceStatus, GetResourceStatusRequest) -> ResourceStatusResponse = "GetResourceStatus";
         /// `GetConflictingResources`.
         get_conflicting_resources(GetConflictingResources, GetConflictingResourcesRequest) -> ConflictingResourcesResponse = "GetConflictingResources";
-        /// `ConnectComLogicalLink`, which the guard allows once the profile's ComParams are set.
-        connect_com_logical_link(ConnectComLogicalLink, ConnectComLogicalLinkRequest) -> vci_service_interface::Response = "ConnectComLogicalLink";
         /// `DisconnectComLogicalLink`.
         disconnect_com_logical_link(DisconnectComLogicalLink, DisconnectComLogicalLinkRequest) -> vci_service_interface::Response = "DisconnectComLogicalLink";
         /// `LockResource`.

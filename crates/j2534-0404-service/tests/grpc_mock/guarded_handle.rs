@@ -470,6 +470,41 @@ async fn the_default_deadline_follows_a_timing_the_check_changes() {
         handle.response_ceiling(cll),
         Some(std::time::Duration::from_secs(68))
     );
+    // A shorter timing is staged in place of the longer one: the link is still in effect on the
+    // defaults (33 s), which are waited for until an update of the ComParams has finished.
+    handle
+        .set_com_param(vci_service_interface::SetComParamRequest {
+            cll_handle: Some(cll),
+            param_item: Some(vci_service_interface::ParamItem {
+                id: Some(vci_service_interface::param_item::Id::ParamName(
+                    "CP_RC78CompletionTimeout".to_owned(),
+                )),
+                com_param_class: vci_service_interface::PduParamClass::PduPcSpecified as i32,
+                param_data: Some(vci_service_interface::param_item::ParamData::Unum32(
+                    1_000_000,
+                )),
+            }),
+        })
+        .await
+        .expect("the timing is set");
+    assert_eq!(
+        handle.response_ceiling(cll),
+        Some(std::time::Duration::from_secs(33))
+    );
+    handle
+        .start_com_primitive(StartComPrimitiveRequest {
+            cop_tag: None,
+            cll_handle: Some(cll),
+            cop_type: ComOperationType::CoptUpdateparam as i32,
+            cop_data: vec![],
+            cop_ctrl_data: None,
+        })
+        .await
+        .expect("the update starts");
+    assert_eq!(
+        handle.response_ceiling(cll),
+        Some(std::time::Duration::from_secs(9))
+    );
     drop(handle);
     run.pass();
     assert!(run.run_teardown().is_empty());
@@ -547,6 +582,7 @@ async fn a_link_created_again_through_the_handle_reads_a_did() {
         ("CP_CanFillerByteHandling", 1),
         ("CP_CanFillerByte", 0xCC),
         ("CP_BlockSize", 0),
+        ("CP_RC78CompletionTimeout", 1_000_000),
     ] {
         handle
             .set_com_param(SetComParamRequest {
@@ -587,12 +623,22 @@ async fn a_link_created_again_through_the_handle_reads_a_did() {
         })
         .await
         .expect("the response table");
+    // The link starts on the handle's defaults (1 s + 25 s + 5 s + 2 s); the shorter completion
+    // timeout is staged and takes effect at the connect.
+    assert_eq!(
+        handle.response_ceiling(cll),
+        Some(std::time::Duration::from_secs(33))
+    );
     handle
         .connect_com_logical_link(ConnectComLogicalLinkRequest {
             cll_handle: Some(cll),
         })
         .await
         .expect("the guard lets the connect through");
+    assert_eq!(
+        handle.response_ceiling(cll),
+        Some(std::time::Duration::from_secs(9))
+    );
 
     let channel = MOCK_CHANNEL_ID + 1;
     let answer = [0x62, 0xF1, 0x90, 0x41];
@@ -609,6 +655,74 @@ async fn a_link_created_again_through_the_handle_reads_a_did() {
     drop(handle);
     run.pass();
     assert!(run.run_teardown().is_empty());
+    drop(run);
+    server.shutdown().await;
+}
+
+/// A link that entered another session is returned to the default one before it is destroyed,
+/// and a destroy whose return fails is refused, so the teardown still owns the return.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn destroying_a_link_in_another_session_returns_it_to_the_default_one_first() {
+    let server = TestServer::start().await;
+    let profile = t3();
+    let reports = Reports::new();
+    let mut run = RunGuard::start_in(&profile, "hw_guarded_handle", reports.dir());
+    let mut handle = GuardedHandle::attach(
+        &profile,
+        &vci(&profile),
+        server.worker_client().await,
+        module(),
+        HandleOptions {
+            request_timeout: std::time::Duration::from_secs(5),
+            response_timeout: Some(std::time::Duration::from_millis(300)),
+        },
+        &mut run,
+    )
+    .await
+    .expect("the handle opens the profile's link");
+    let [cll] = *handle.links() else {
+        panic!("one link");
+    };
+    let answer = |sub: u8| can_frame(0x7E8, &[0x50, sub, 0x00, 0x32, 0x01, 0xF4]);
+    let arm = |sub: u8| {
+        server.backdoor.arm_write_rx_injection(
+            MOCK_CHANNEL_ID,
+            &answer(sub),
+            j2534_0404::ISO15765,
+            50,
+        )
+    };
+    arm(0x03);
+    handle
+        .send_receive(cll, &[0x10, 0x03])
+        .await
+        .expect("the session starts");
+    assert_eq!(server.backdoor.write_msgs_count(), 1);
+
+    // The ECU does not answer the return: the destroy is refused and the link stays.
+    let destroy = || DestroyComLogicalLinkRequest {
+        cll_handle: Some(cll),
+    };
+    let refused = handle.destroy_com_logical_link(destroy()).await;
+    assert!(matches!(refused, Err(HandleError::Setup(_))), "{refused:?}");
+    assert_eq!(server.backdoor.write_msgs_count(), 2);
+    assert_eq!(handle.bound_links().len(), 1);
+
+    // It answers: the return is sent, then the link is destroyed.
+    arm(0x01);
+    handle
+        .destroy_com_logical_link(destroy())
+        .await
+        .expect("the link is returned and destroyed");
+    assert_eq!(server.backdoor.write_msgs_count(), 3);
+    assert!(handle.bound_links().is_empty());
+
+    // The teardown has nothing left to send for the session.
+    drop(handle);
+    run.pass();
+    assert!(run.run_teardown().is_empty());
+    assert_eq!(server.backdoor.write_msgs_count(), 3);
     drop(run);
     server.shutdown().await;
 }

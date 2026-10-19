@@ -29,11 +29,13 @@ enum Action {
     Async(AsyncStep),
 }
 
+type StepTimeout = Box<dyn Fn() -> Duration + Send>;
+
 struct Step {
     name: String,
     action: Action,
     /// The time this async step may take, instead of the teardown's.
-    timeout: Option<Duration>,
+    timeout: Option<StepTimeout>,
 }
 
 /// A step that failed, panicked or timed out.
@@ -111,7 +113,22 @@ impl Teardown {
         self.steps.push(Step {
             name: name.into(),
             action: Action::Async(Box::pin(step)),
-            timeout: Some(timeout),
+            timeout: Some(Box::new(move || timeout)),
+        });
+    }
+
+    /// Like [`Teardown::register_async_with_timeout`], with the timeout read when the step starts
+    /// to run, for a step whose time depends on state that can change after it is registered.
+    pub fn register_async_with_timeout_fn(
+        &mut self,
+        name: impl Into<String>,
+        timeout: impl Fn() -> Duration + Send + 'static,
+        step: impl Future<Output = Result<(), String>> + Send + 'static,
+    ) {
+        self.steps.push(Step {
+            name: name.into(),
+            action: Action::Async(Box::pin(step)),
+            timeout: Some(Box::new(timeout)),
         });
     }
 
@@ -131,7 +148,12 @@ impl Teardown {
                     Ok(result) => result,
                     Err(payload) => Err(format!("panicked: {}", panic_text(payload.as_ref()))),
                 },
-                Action::Async(future) => run_async(future, step.timeout.unwrap_or(self.timeout)),
+                Action::Async(future) => run_async(
+                    future,
+                    step.timeout
+                        .as_ref()
+                        .map_or(self.timeout, |timeout| timeout()),
+                ),
             };
             if let Err(reason) = result {
                 failures.push(StepFailure {
@@ -181,6 +203,16 @@ impl TeardownHandle<'_> {
         step: impl Future<Output = Result<(), String>> + Send + 'static,
     ) {
         self.0.register_async_with_timeout(name, timeout, step);
+    }
+
+    /// See [`Teardown::register_async_with_timeout_fn`].
+    pub fn register_async_with_timeout_fn(
+        &mut self,
+        name: impl Into<String>,
+        timeout: impl Fn() -> Duration + Send + 'static,
+        step: impl Future<Output = Result<(), String>> + Send + 'static,
+    ) {
+        self.0.register_async_with_timeout_fn(name, timeout, step);
     }
 
     /// Whether no step is left to run.

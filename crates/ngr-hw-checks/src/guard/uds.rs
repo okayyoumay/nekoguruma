@@ -240,7 +240,15 @@ pub(super) fn start_com_primitive(
             if request.cop_data.is_empty() && cycles != 0 {
                 return Err(GuardRefusal::Undecodable("a send without a request"));
             }
-            sends(&request.cop_data)
+            let grant = sends(&request.cop_data)?;
+            // A repeated request would enter the session again after the harness returned the
+            // ECU to the default one, so only a one-shot one may enter another session.
+            if matches!(grant, Grant::EntersSession(_)) && !(0..=1).contains(&cycles) {
+                return Err(GuardRefusal::Frame(
+                    "a periodic or repeated DiagnosticSessionControl to a non-default session",
+                ));
+            }
+            Ok(grant)
         }
         // It would put back the ComParams the guard compared with the profile.
         Ok(ComOperationType::CoptRestoreParam) => Err(GuardRefusal::LinkSetup(
@@ -272,7 +280,9 @@ fn payload(
                 ));
             }
             // The whole header, as the worker passes it on: the 4-byte identifier, then the
-            // address byte under extended or mixed addressing, then the payload.
+            // address byte under extended or mixed addressing, then the payload. That is the
+            // literal frame data of both workers; the payload is UDS data that the ISO 15765
+            // channel segments, so it holds no transport PCI, and it is not read here.
             let id = frame_id(data)?;
             if id != link.request_id {
                 return Err(GuardRefusal::Frame(

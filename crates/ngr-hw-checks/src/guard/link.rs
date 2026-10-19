@@ -16,10 +16,10 @@ use crate::comparam::{ALLOWED, canonical};
 use crate::profile::{Addressing, Class, Link, PHYSICAL_COMPARAMS, channel_key};
 
 /// The bus type the agent names a CAN link's resource by (ISO 22900-2 (2022) Annex B.1).
-const BUS_TYPE: &str = "ISO_11898_2_DWCAN";
+pub(super) const BUS_TYPE: &str = "ISO_11898_2_DWCAN";
 /// The DLC pin types of dual-wire CAN (ISO 22900-2 (2022) Annex B.2): the first of the profile's
 /// pins is CAN high, the second CAN low.
-const PIN_TYPES: [&str; 2] = ["HI", "LOW"];
+pub(super) const PIN_TYPES: [&str; 2] = ["HI", "LOW"];
 
 fn refuse(why: impl Into<String>) -> GuardRefusal {
     GuardRefusal::LinkSetup(why.into())

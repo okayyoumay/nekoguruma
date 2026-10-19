@@ -9,7 +9,8 @@
 ADR-275 item 4 says a check reaches the VCI only through a guarded handle, and item 6 says
 teardown steps run in reverse, once, on pass, failure and panic. Both stayed prose. The handle has
 two parts: a decision (is this worker request allowed?) and a seam that routes a direct check or
-the agent's job runner through it and keeps the state the decision needs. The decision is what
+the agent's job runner through it and keeps the state the decision needs (a direct check's seam
+is `GuardedHandle`; the agent runner's is separate work). The decision is what
 the class rules rest on, and it needs to be testable without a worker or a device.
 
 Three facts shape it. The worker creates links by resource id and sets ComParams by id, and
@@ -124,7 +125,7 @@ present.
    security access, writes, routines, resets and the services that read memory by address
    (0x23) or periodically (0x2A) or change a dynamic identifier (0x2C) are not on it. The same
    rule applies to a request sent directly and to one repeated by a periodic primitive (a send
-   count above one, or -1). RawMode is a T0 tool: a RawMode link is refused on T1, T2 and T3, at creation. A worker passes
+   count above one, or -1). A periodic or repeated DiagnosticSessionControl to a non-default session is refused, since it would enter the session again after the harness returned the ECU to the default one. RawMode is a T0 tool: a RawMode link is refused on T1, T2 and T3, at creation. A worker passes
    RawMode data through, with the identifier chosen by the client and the bytes after the header
    read as the UDS payload, and a native ISO 15765 channel segments it itself, so bytes that look
    like a flow control frame can be a routine request on the wire (`31 01 FF 00` after the
@@ -190,14 +191,38 @@ Alternatives rejected:
 - A check that needs a service or IO control outside the lists must extend them by a reviewed
   change to the guard (and, for a state-changing service on T2, wait for the authorized-job path
   that design 13.5 describes). Nothing in a profile widens them.
-- The decision is not the whole handle. The seam that routes direct checks and the agent's job
-  runner through `decide`, keeps the link table, records learned ids and registers teardown
-  steps for grants is separate work. Until it exists, nothing enforces the decision on a live
-  worker.
-- RawMode is refused on T1, T2 and T3 until the seam settles, against the workers, what a raw
-  payload sends: `j2534-0404-service` passes it through unchanged, so the form (with or without
-  transport PCI) depends on the worker. Checks on those classes use ordinary links, whose UDS the
-  guard sees. Only then can raw frames be classified there.
+- The guarded handle (`guard::GuardedHandle`) uses the decision: it keeps the link table and the
+  learned ids, passes every call of a check through `decide`, binds and unbinds links on the
+  grants, and registers the teardown steps (the device, each link, the return to the default
+  session before a session-entering request is sent). The seam that routes the agent's job runner
+  through `decide` is separate work; until it exists, a job the agent runs is not mediated.
+- The handle does not borrow the run: `RunGuard::teardown()` gives a clonable, register-only
+  handle over a teardown shared by all of the run's handles, so the two VCI modules of a T0
+  loopback are driven from one run, with their steps in one global reverse order. The guard needs
+  no state across handles, because a handle's context binds the endpoints of its own VCI only
+  (`Context::vci`); nothing refuses a second handle on the same module, which would create that
+  module's links again, so a check opens one handle per VCI.
+- Registration closes when the run ends its teardown, atomically with the pass that finds no step
+  left; a later registration through a surviving `TeardownHandle` clone is an error
+  (`TeardownClosed`), never queued for after the report. The handle cancels every primitive it
+  started and has not seen end before it settles, disconnects or destroys a link, and in its
+  teardown steps.
+- The handle creates the profile's links itself, through the guard, with every ComParam
+  `required()` lists at the profile's value (the table's identifiers, formats and address in the
+  one-entry response table, the rest with `SetComParam`), because the agent's own link setup does
+  not set them. A link that entered another session is returned to the default one before the
+  handle disconnects or destroys it or stops its communication (the destroy is refused unless the ECU answers `50 01`), and the staged response timings take
+  effect at the connect or after a finished ComParam update. Power is not registered by the handle: a check that switches power registers its
+  off step first.
+- RawMode is refused on T1, T2 and T3: the frame form is settled against the workers, but a
+  worker passes the data through, the identifier is the client's and the bytes after the header
+  are UDS data, so on those classes the guard would need a frame decoder. On T0 the form is the
+  literal frame: `j2534-0404-service` transmits `cop_data` unchanged as the message data (the
+  CAN identifier in four bytes, the address byte when the `ISO15765_ADDR_TYPE` flag is set, then
+  the payload), and the hardware ISO 15765 channel it requires for RawMode segments the payload,
+  so the payload carries no ISO 15765-2 (2024) protocol control information (clause 9.6). `iso22900-service`
+  forwards the data and flags to the D-PDU library, which defines the form (ISO 22900-2 (2022)
+  D.2.1). The T0 check (identifier, then the address byte, content unread) matches both.
 - `SetUniqueRespIdTable` entries are judged by their ComParams only. The
   `unique_resp_identifier` of an entry is the D-PDU unique response identifier, a tag the client
   assigns and that expected-response data refers to; it carries no CAN identifier, so it is not
@@ -210,7 +235,7 @@ Alternatives rejected:
   0x78 handling and the declared ComParams, and the two identifiers in the response table, and
   then connects. It never sets the functional identifier, the CAN ID formats, the address byte,
   the filler or a profile's `[link.comparams]`. Through the guard, a profile that has any of
-  these has its connect refused until the seam sets them (it must set them itself before or
-  while handing the agent its link, or the agent's connect fails); the worker's defaults are not
+  these has its connect refused until the agent runner's seam sets them (it must set them itself
+  before or while handing the agent its link, or the agent's connect fails); the worker's defaults are not
   assumed to equal the profile's (the J2534 CAN preset is 500 kbit/s whatever the profile says).
 - ADR-275 items 4 and 6 are unchanged; this ADR gives the rules their concrete form.

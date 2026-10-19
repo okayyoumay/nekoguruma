@@ -4,8 +4,10 @@
 describes the hardware profile it reads, how a check declares what it needs, and how the two are
 compared, how the device a worker reports is matched with the profile, and how the harness opens
 it, how a run's report is written, and what the guard decides about each worker request and how a
-run's teardown works (ADR-333). The seam that routes a check's, or the agent's, worker calls
-through the guard is not part of the crate yet.
+run's teardown works (ADR-333). A check reaches the worker only through `guard::GuardedHandle`
+(the "Guarded handle" section), which decides every call with the guard and registers the
+teardown steps. The agent job runner's own seam through the guard is the part that is not in the
+crate yet; a job the agent runs is not mediated until it exists.
 
 ## Running
 
@@ -227,11 +229,130 @@ Anything it cannot classify is refused.
   not. T2 (until an authorized job exists) and T3 pass the read-only list: session
   control to the default or extended session, ReadDataByIdentifier, ReadDTCInformation with a
   defined report type, and TesterPresent with sub-function 0, each with its length rule. The
-  rule applies to direct requests, periodic ones and a `CP_TesterPresentMessage`. A raw-bound
+  rule applies to direct requests, periodic ones and a `CP_TesterPresentMessage`. A periodic or
+  repeated DiagnosticSessionControl to a non-default session is refused (it would enter the
+  session again after the harness returned the ECU to the default one). A raw-bound
   handle on T1, T2 or T3 is refused, not decoded. T0 raw frames also need the profile's flags.
 - **IO controls.** `PDU_IOCTL_READ_VBATT` and the queue, buffer and receive-filter housekeeping
   pass on every class. Every other IOCTL, including programming voltage, is refused on every
   class, whatever the profile's `[[hardware-control]]` list says.
+
+## Guarded handle
+
+`ngr_hw_checks::guard::GuardedHandle` is what a check gets of the worker (design 13.5 "Guarded VCI
+access"); the check never holds the worker client. It owns the client and the state the decision
+rests on (the link table and the learned ids). It registers its teardown steps through a clone of
+the run's `TeardownHandle` (`RunGuard::teardown()`, clonable, register-only), so it borrows nothing
+from the `RunGuard` (`open` and `attach` take `&RunGuard`): a T0 loopback of two VCI modules opens
+one handle per module on the same run, and the steps of all handles run in one reverse
+registration order. Each handle's guard context binds the endpoints of its own VCI only, so the
+handles share no guard state; a check opens one handle per VCI (a second handle on the same module
+would create the profile's links again). Devices a check wants in the report are added by the
+check with `report().add_device`, once per device; the handle adds none. A check runs on a multi-thread tokio
+runtime: a teardown step waits for its requests on a thread of its own while the worker's
+connection is served by the runtime.
+
+- **Opening.** `GuardedHandle::open(profile, vci, device, options, run)` takes the `OpenedDevice`
+  of `open_device`; `attach` takes a client and an already connected module of a worker the caller
+  hosts (the closing is then the module disconnect only). Both register the device's closing with
+  the run first, then create the profile's links: per endpoint on this VCI, `GetResourceIds` and
+  `CreateComLogicalLink` (RawMode on T0 only), every ComParam the guard requires with the profile's
+  value (the identifiers, formats and address of the physical request and the USDT response in the
+  response table's one entry, the rest with `SetComParam`; the tester-present message is `3E 80`
+  and both address modes are physical), the agent's timing and response-pending defaults
+  (P2 1 s, P2* 5 s, 0x78 handling, completion limit 25 s) unless the profile pins one, then
+  `ConnectComLogicalLink` and a subscription to the link's events. Every `SetComParam` carries
+  the class `PDU_PC_SPECIFIED`, so the worker resolves the ComParam's real class (a concrete class
+  would be forwarded to a D-PDU library as given); the response table's items are `UNIQUE_ID`. Each request is decided like a
+  check's own. A profile the handle cannot plan (no value for a pinned name) fails before the link
+  is created.
+- **Calls.** One method per RPC a check can use, each asking `decide` first. A refusal is
+  `HandleError::Refused`, and nothing reaches the worker. `ModuleConnect`, `ModuleDisconnect`,
+  `SubscribeEvent` and `GetEventItem` are not offered: the harness owns the device and the event
+  stream, which `send_receive(cll, request)` reads (it returns the final response, a negative one
+  included, or `NoResponse`). It waits up to `HandleOptions::response_timeout`, by default the link's ceiling
+  (P2, the 0x78 completion timeout and P2* the link is set to, the profile's when it pins them,
+  plus 2 s), and cancels the primitive on every way out of the wait while it may still run (the wait ending,
+  lost events, a failed or ended event stream) (a cancel that fails is then the error returned: the worker answers a cancel of a primitive that
+  already ended with success). Zeros are read as
+  `j2534-0404-service` reads them: P2 zero is 50 ms, P2* zero is 5 s, and a zero completion
+  timeout is no ceiling in the worker, so the handle waits 10 minutes in all (whatever P2 and P2*
+  are) and then cancels, rather than forever. A `SetComParam` of P2, P2* or the completion timeout through the handle
+  updates the ceiling: until the link is connected or a `COPT_UPDATEPARAM` primitive has finished
+  successfully (the handle waits for it) the longer of the old and the new value is waited for,
+  afterwards the new one; an update that fails, is cancelled or times out is the error of the `start_com_primitive` call and
+  changes nothing (`response_ceiling` reports it). A read of
+  one DID expects `62` and that DID; a read of several expects `62` only, since the ECU may
+  return the records in any order.
+- **Abandoned waits and suspended queues.** A wait whose future is dropped (a check's own
+  `tokio::time::timeout`) leaves the primitive recorded; the next primitive on the link, the
+  return to the default session and the link's closing cancel it first. A return interrupted
+  that way stays pending. A suspended transmit queue (`PDU_IOCTL_SUSPEND_TX_QUEUE`) is resumed
+  by a teardown step, and before any return to the default session, since a suspended queue
+  would hold the `10 01` back. A session change marks the return pending before it is sent, and the mark stays when
+  the call succeeds, times out or is dropped; only a rejection by the worker (`HandleError::WorkerRefused`: the
+  statuses `InvalidArgument`, `FailedPrecondition`, `NotFound`, `ResourceExhausted`,
+  `Unimplemented`, `AlreadyExists` and `Unauthenticated`, which the workers return for a request
+  they did not apply; or the lost VCI) takes it back. Any other status and every transport error
+  is `HandleError::Rpc`, which says nothing about the worker's state, so the mark, and the saved
+  resume of a suspension, stay. Resuming a transmit queue forgets only the suspensions that
+  resume covers (the same link; a module's resume covers its links). The closing step of a link
+  has the time for its three requests. A response ceiling also adds the completion timeout of a
+  `0x21` / `0x23` re-request chain when its handling is on (the handle sets none, and the guard
+  refuses a check that does, so the worker's preset, off, stands).
+- **Outstanding primitives.** Every primitive started through `start_com_primitive` is recorded
+  until the handle sees it end. Before a link's session is settled, it is disconnected or
+  destroyed, its communication is stopped, and in the teardown steps (the return to the default
+  session and the link's closing), the handle cancels every one still recorded (cancelling one
+  that already ended succeeds and changes nothing), so a direct `10 03` cannot race the `10 01`.
+  A link's suspended transmit queue is resumed before the link is disconnected or destroyed (the guard refuses an IO control on a destroyed link), and the saved resume of a destroyed link is dropped. The steps that cancel and resume first are given a request timeout for each primitive and queue they handle. The device's closing step is bounded by the request timeout (plus the worker's stop grace
+  period for a worker process), never less than the 30 s default.
+- **Registration closes.** When the run ends its teardown (`RunGuard` drop), registration closes
+  under the same lock that finds no step left. A `TeardownHandle` that outlives the run, and any
+  handle call that must register a step, is refused with `TeardownClosed`
+  (`HandleError::TeardownClosed`), and a link created at that moment is released at once rather
+  than left without a step. An early `run_teardown` does not close registration.
+- **Links created by a check.** Whatever creates a link through the handle, including a link a
+  check destroys and creates again, gets the same per-link set-up: the teardown step, the event
+  stream and timings to wait by (the handle's defaults, 1 s, 5 s and 25 s, until the check sets
+  others). The check then sets the profile's ComParams itself, as the guard requires before the
+  connect.
+- **Events.** A lost VCI (the worker's link-wide error event, with no primitive handle, or one
+  bound to the primitive; or a request refused on the offline link) ends the wait with
+  `HandleError::VciLost`, as in the agent. The handle keeps the pending return to the default
+  session in step with what `send_receive` observes: a positive answer to DiagnosticSessionControl
+  to the default session clears it, one to another session sets it.
+- **State.** A `GetResourceIds` answer records the resource each id stands for and a `GetObjectId`
+  answer the name of the id, into the learned ids. The `cll_handle` of a granted
+  `CreateComLogicalLink` is bound to its endpoint, a granted `SetComParam` or
+  `SetUniqueRespIdTable` marks its pinned ComParams as set once the worker accepted it, and a
+  granted `DestroyComLogicalLink` drops the link.
+- **Teardown.** The steps are registered as the resources are acquired and run in reverse: the
+  device's closing, then each link's disconnect and destroy (skipped when the check destroyed it),
+  then, per link, one return to the default session (`10 01`, itself decided) registered before a
+  request that enters another session is sent. That step reads the link's response wait when it
+  runs (the longer of the timings in effect and those staged), waits no longer than that, and
+  cancels the primitive when the wait ends; its timeout is read at the same moment (that wait, the
+  start and cancel requests and a margin, at least the 30 s default of other steps), via
+  `register_async_with_timeout_fn` (a panicking timeout callback fails its step like a panic in
+  the step). A check that disconnects or destroys a link, or stops its communication, in another
+  session has it returned first: the handle sends the same `10 01`, and refuses the destroy if the ECU does not
+  answer with the positive `50 01` (a negative response is a failure too), so the step stays
+  registered and reports the failure when it runs. The device step fails when the worker had to
+  be killed. Power: the handle registers nothing for the
+  profile's power commands. A check that switches power registers the power-off step itself before
+  it switches power on.
+- **RawMode form.** On a T0 link the data of a send is the literal frame the worker passes on.
+  `j2534-0404-service` transmits `cop_data` unchanged as `PassThruMessage.Data`: the CAN identifier
+  in four bytes, most significant first; the address byte next when the `ISO15765_ADDR_TYPE` flag is
+  set (the guard requires the flag to equal the profile's addressing); then the payload. The
+  link is a hardware ISO 15765 channel (a software ISO-TP link refuses RawMode), which segments
+  the payload itself, so the payload holds no ISO 15765-2 (2024) protocol control information (clause 9.6).
+  `iso22900-service` forwards `cop_data` and the TxFlags to the D-PDU library untouched, and the
+  form is the library's (ISO 22900-2 (2022) D.2.1, Table D.4 gives the identifier in four bytes);
+  it has no test of a RawMode send against a library. This is the header the guard compares on
+  T0 (the sending end's request identifier and, under extended or mixed addressing, its address
+  byte); the payload is not read.
 
 ## Teardown
 

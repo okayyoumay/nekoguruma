@@ -16,6 +16,7 @@ use std::any::Any;
 use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 /// How long an async step may take before it is given up on, unless set otherwise.
@@ -29,9 +30,13 @@ enum Action {
     Async(AsyncStep),
 }
 
+type StepTimeout = Box<dyn Fn() -> Duration + Send>;
+
 struct Step {
     name: String,
     action: Action,
+    /// The time this async step may take, instead of the teardown's.
+    timeout: Option<StepTimeout>,
 }
 
 /// A step that failed, panicked or timed out.
@@ -51,6 +56,8 @@ impl std::fmt::Display for StepFailure {
 pub struct Teardown {
     steps: Vec<Step>,
     timeout: Duration,
+    /// The run has finished its teardown: a handle refuses further registrations.
+    closed: bool,
 }
 
 impl Default for Teardown {
@@ -64,6 +71,7 @@ impl Teardown {
         Self {
             steps: Vec::new(),
             timeout: DEFAULT_STEP_TIMEOUT,
+            closed: false,
         }
     }
 
@@ -81,6 +89,7 @@ impl Teardown {
         self.steps.push(Step {
             name: name.into(),
             action: Action::Sync(Box::new(step)),
+            timeout: None,
         });
     }
 
@@ -93,6 +102,37 @@ impl Teardown {
         self.steps.push(Step {
             name: name.into(),
             action: Action::Async(Box::pin(step)),
+            timeout: None,
+        });
+    }
+
+    /// Registers a step that needs a runtime and more (or less) time than the teardown's
+    /// timeout gives it. Other steps keep the teardown's.
+    pub fn register_async_with_timeout(
+        &mut self,
+        name: impl Into<String>,
+        timeout: Duration,
+        step: impl Future<Output = Result<(), String>> + Send + 'static,
+    ) {
+        self.steps.push(Step {
+            name: name.into(),
+            action: Action::Async(Box::pin(step)),
+            timeout: Some(Box::new(move || timeout)),
+        });
+    }
+
+    /// Like [`Teardown::register_async_with_timeout`], with the timeout read when the step starts
+    /// to run, for a step whose time depends on state that can change after it is registered.
+    pub fn register_async_with_timeout_fn(
+        &mut self,
+        name: impl Into<String>,
+        timeout: impl Fn() -> Duration + Send + 'static,
+        step: impl Future<Output = Result<(), String>> + Send + 'static,
+    ) {
+        self.steps.push(Step {
+            name: name.into(),
+            action: Action::Async(Box::pin(step)),
+            timeout: Some(Box::new(timeout)),
         });
     }
 
@@ -107,65 +147,171 @@ impl Teardown {
     pub fn run(&mut self) -> Vec<StepFailure> {
         let mut failures = Vec::new();
         while let Some(step) = self.steps.pop() {
-            let result = match step.action {
-                Action::Sync(f) => match catch_unwind(AssertUnwindSafe(f)) {
-                    Ok(result) => result,
-                    Err(payload) => Err(format!("panicked: {}", panic_text(payload.as_ref()))),
-                },
-                Action::Async(future) => run_async(future, self.timeout),
-            };
-            if let Err(reason) = result {
-                failures.push(StepFailure {
-                    name: step.name,
-                    reason,
-                });
-            }
+            failures.extend(run_one(step, self.timeout));
         }
         failures
     }
 }
 
+/// Runs one step, however it ends, and returns its failure. Nothing outside the step's own work
+/// may stop the steps after it: a panic anywhere in handling one step fails that step only.
+fn run_one(step: Step, default: Duration) -> Option<StepFailure> {
+    let name = step.name.clone();
+    catch_unwind(AssertUnwindSafe(|| run_step(step, default)))
+        .unwrap_or_else(|payload| Err(format!("panicked: {}", panic_text(payload.as_ref()))))
+        .err()
+        .map(|reason| StepFailure { name, reason })
+}
+
+/// Runs the steps of a teardown shared between handles, last registered first. The lock is held
+/// only to take the next step, never while one runs, so a step may register further steps (they
+/// run next) and other handles may register meanwhile.
+///
+/// With `close`, the run is ending: the call that finds no step left closes registration, under
+/// the same lock, so a registration either lands before it (and its step runs here) or is
+/// refused ([`TeardownClosed`]); none is queued for a drop after the report was written.
+pub(crate) fn run_shared(shared: &Mutex<Teardown>, close: bool) -> Vec<StepFailure> {
+    let mut failures = Vec::new();
+    loop {
+        let (step, default) = {
+            let mut teardown: MutexGuard<'_, Teardown> =
+                shared.lock().unwrap_or_else(PoisonError::into_inner);
+            match teardown.steps.pop() {
+                Some(step) => (step, teardown.timeout),
+                None => {
+                    teardown.closed |= close;
+                    return failures;
+                }
+            }
+        };
+        failures.extend(run_one(step, default));
+    }
+}
+
+/// Runs one step, with `default` as the timeout of an async step that has none of its own.
+fn run_step(step: Step, default: Duration) -> Result<(), String> {
+    match step.action {
+        Action::Sync(f) => match catch_unwind(AssertUnwindSafe(f)) {
+            Ok(result) => result,
+            Err(payload) => Err(format!("panicked: {}", panic_text(payload.as_ref()))),
+        },
+        Action::Async(future) => {
+            // The step's timeout is read inside the same panic boundary as the step.
+            let timeout = match &step.timeout {
+                None => Ok(default),
+                Some(timeout) => catch_unwind(AssertUnwindSafe(timeout)).map_err(|payload| {
+                    format!("timeout panicked: {}", panic_text(payload.as_ref()))
+                }),
+            };
+            match timeout {
+                Ok(timeout) => run_async(future, timeout),
+                Err(reason) => {
+                    // The step is not run; dropping it must not panic out either.
+                    let _ = catch_unwind(AssertUnwindSafe(|| drop(future)));
+                    Err(reason)
+                }
+            }
+        }
+    }
+}
+
 /// What a check gets of its run's teardown (`RunGuard::teardown`): it can register steps and set
 /// the timeout, but not run them. Running goes through the run guard, which keeps what failed, so
-/// a failure cannot be returned to the check and lost.
-pub struct TeardownHandle<'a>(pub(crate) &'a mut Teardown);
+/// a failure cannot be returned to the check and lost. The handle is cheap to clone and every
+/// clone registers into the same run, so several guarded handles (a T0 loopback of two VCI
+/// modules) share one teardown, and the steps of all run in one reverse registration order.
+#[derive(Clone)]
+pub struct TeardownHandle(pub(crate) Arc<Mutex<Teardown>>);
 
-impl TeardownHandle<'_> {
-    /// See [`Teardown::set_timeout`].
-    pub fn set_timeout(&mut self, timeout: Duration) {
-        self.0.set_timeout(timeout);
+/// The run has ended its teardown, so a step registered now would never run in time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("the run's teardown has ended; a step registered now would not run")]
+pub struct TeardownClosed;
+
+impl TeardownHandle {
+    /// The teardown, unless the run closed registration.
+    fn open(&self) -> Result<MutexGuard<'_, Teardown>, TeardownClosed> {
+        let teardown = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if teardown.closed {
+            Err(TeardownClosed)
+        } else {
+            Ok(teardown)
+        }
     }
 
-    /// See [`Teardown::register`].
+    /// See [`Teardown::set_timeout`].
+    pub fn set_timeout(&mut self, timeout: Duration) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .set_timeout(timeout);
+    }
+
+    /// See [`Teardown::register`]. Refused once the run has ended its teardown.
     pub fn register(
         &mut self,
         name: impl Into<String>,
         step: impl FnOnce() -> Result<(), String> + Send + 'static,
-    ) {
-        self.0.register(name, step);
+    ) -> Result<(), TeardownClosed> {
+        self.open()?.register(name, step);
+        Ok(())
     }
 
-    /// See [`Teardown::register_async`].
+    /// See [`Teardown::register_async`]. Refused once the run has ended its teardown.
     pub fn register_async(
         &mut self,
         name: impl Into<String>,
         step: impl Future<Output = Result<(), String>> + Send + 'static,
-    ) {
-        self.0.register_async(name, step);
+    ) -> Result<(), TeardownClosed> {
+        self.open()?.register_async(name, step);
+        Ok(())
+    }
+
+    /// See [`Teardown::register_async_with_timeout`]. Refused once the run has ended its
+    /// teardown.
+    pub fn register_async_with_timeout(
+        &mut self,
+        name: impl Into<String>,
+        timeout: Duration,
+        step: impl Future<Output = Result<(), String>> + Send + 'static,
+    ) -> Result<(), TeardownClosed> {
+        self.open()?
+            .register_async_with_timeout(name, timeout, step);
+        Ok(())
+    }
+
+    /// See [`Teardown::register_async_with_timeout_fn`]. Refused once the run has ended its
+    /// teardown.
+    pub fn register_async_with_timeout_fn(
+        &mut self,
+        name: impl Into<String>,
+        timeout: impl Fn() -> Duration + Send + 'static,
+        step: impl Future<Output = Result<(), String>> + Send + 'static,
+    ) -> Result<(), TeardownClosed> {
+        self.open()?
+            .register_async_with_timeout_fn(name, timeout, step);
+        Ok(())
     }
 
     /// Whether no step is left to run.
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_empty()
     }
 }
 
 impl Drop for Teardown {
     /// Runs what is left. Never panics: a failure goes to stderr.
     fn drop(&mut self) {
-        let failures = catch_unwind(AssertUnwindSafe(|| self.run())).unwrap_or_default();
-        for failure in failures {
-            eprintln!("teardown step failed: {failure}");
+        // `run` is panic-safe per step; should anything still escape it, the steps left run on.
+        while !self.steps.is_empty() {
+            if let Ok(failures) = catch_unwind(AssertUnwindSafe(|| self.run())) {
+                for failure in failures {
+                    eprintln!("teardown step failed: {failure}");
+                }
+            }
         }
     }
 }
@@ -207,7 +353,7 @@ fn run_async(future: AsyncStep, timeout: Duration) -> Result<(), String> {
         return Err(format!("cannot start a thread: {e}"));
     }
     // A grace period beyond the step's own timer, for the step that cannot be interrupted.
-    match receiver.recv_timeout(timeout + Duration::from_millis(250)) {
+    match receiver.recv_timeout(timeout.saturating_add(Duration::from_millis(250))) {
         Ok(result) => result,
         Err(_) => Err(format!("timed out after {timeout:?}")),
     }

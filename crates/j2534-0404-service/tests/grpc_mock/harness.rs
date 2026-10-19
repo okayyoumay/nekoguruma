@@ -620,6 +620,29 @@ impl MockBackdoor {
         }
     }
 
+    /// Cumulative count of `PassThruClose` calls since the last `reset()`.
+    pub(crate) fn close_count(&self) -> usize {
+        unsafe {
+            let f: Symbol<unsafe extern "system" fn() -> usize> = self
+                .lib
+                .get(b"__mock_get_close_count\0")
+                .expect("__mock_get_close_count should be exported");
+            f()
+        }
+    }
+
+    /// Cumulative count of `PassThruWriteMsgs` calls across every channel since the last
+    /// `reset()`.
+    pub(crate) fn write_msgs_count(&self) -> usize {
+        unsafe {
+            let f: Symbol<unsafe extern "system" fn() -> usize> = self
+                .lib
+                .get(b"__mock_get_write_msgs_count\0")
+                .expect("__mock_get_write_msgs_count should be exported");
+            f()
+        }
+    }
+
     /// SAE J2534-2 clause 7 (Additional Channels, ADR-156 Decision 4/Phase
     /// 2b): overrides the `_CHx` capacity the mock reports via
     /// `DEVICE_INFO_<PROTOCOL>_SUPPORTED` (and enforces at `PassThruConnect`)
@@ -1864,6 +1887,21 @@ impl TestServer {
         VciServiceClient::connect(format!("http://127.0.0.1:{}", self.port))
             .await
             .expect("client should connect")
+    }
+
+    /// A client of the kind the check harness's guarded handle holds (`WorkerClient`), for this
+    /// in-process service. The service checks no bearer token here, so the key is arbitrary.
+    pub(crate) async fn worker_client(&self) -> worker_host::client::WorkerClient {
+        let channel =
+            tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{}", self.port))
+                .expect("endpoint")
+                .connect()
+                .await
+                .expect("client should connect");
+        VciServiceClient::with_interceptor(
+            channel,
+            worker_host::client::BearerAuth::new([0; 32], worker_host::client::TOKEN_SUBJECT),
+        )
     }
 
     pub(crate) async fn shutdown(mut self) {

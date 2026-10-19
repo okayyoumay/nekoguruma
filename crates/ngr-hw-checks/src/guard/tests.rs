@@ -2320,3 +2320,29 @@ fn every_request_variant_is_decided() {
         }
     }
 }
+
+#[test]
+fn a_repeated_session_change_to_a_non_default_session_is_refused() {
+    for class in ["T1", "T3"] {
+        let env = Env::linked(profile(class), false);
+        // One-shot (and the default of no control data): the session is granted.
+        assert_eq!(
+            send(&env, &[0x10, 0x03], 1),
+            Ok(Grant::EntersSession(0x03)),
+            "{class}"
+        );
+        // Periodic, repeated or until cancelled: it would enter the session again after the
+        // harness returned the ECU to the default one.
+        for cycles in [2, 10, -1] {
+            assert!(
+                matches!(
+                    send(&env, &[0x10, 0x03], cycles),
+                    Err(GuardRefusal::Frame(_))
+                ),
+                "{class} {cycles}"
+            );
+        }
+        // A repeated return to the default session enters nothing.
+        assert_eq!(send(&env, &[0x10, 0x01], -1), Ok(Grant::Pass), "{class}");
+    }
+}

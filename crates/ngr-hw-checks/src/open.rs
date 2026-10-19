@@ -108,6 +108,19 @@ impl OpenedDevice {
         &self.version
     }
 
+    /// The time closing the device may take: the module disconnect, bounded by the request
+    /// timeout the worker was launched with, and the stop grace period.
+    pub(crate) fn close_budget(&self) -> Duration {
+        self.timeout.saturating_add(STOP_GRACE)
+    }
+
+    /// A client for the worker, which shares its connection. The guarded handle
+    /// ([`crate::guard::GuardedHandle`]) is the only user a check gets; the client itself is not
+    /// handed to a check (design 13.5 "Guarded VCI access").
+    pub(crate) fn client(&self) -> WorkerClient {
+        self.client.clone()
+    }
+
     /// Disconnects the module and stops the worker. Dropping the device kills the worker without
     /// disconnecting the module.
     pub async fn close(mut self) -> Result<Stopped, OpenError> {

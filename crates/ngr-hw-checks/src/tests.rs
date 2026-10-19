@@ -269,6 +269,11 @@ fn more_fields_are_checked_against_the_setup() {
         assert!(parse(&text).is_err(), "{control}");
     }
     assert!(parse(&t1("[power]\noff = [\"\"]\non = [\"relay\"]")).is_err());
+    // The worker's default entry label cannot name the profile's entry, also with spaces round it.
+    for label in ["j2534-0404", " j2534-0404 "] {
+        let text = t1("").replacen("label = \"bench\"", &format!("label = \"{label}\""), 1);
+        assert!(parse(&text).is_err(), "{label}");
+    }
     // A blank value is an empty one.
     assert!(parse(&t1("").replacen("label = \"bench\"", "label = \" \"", 1)).is_err());
     // A D-PDU API module reports coded versions, so its profile writes them as such; a J2534

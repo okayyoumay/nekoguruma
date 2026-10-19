@@ -6,6 +6,12 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+agent = { path = "../agent" }
 serde = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true }
 toml = { workspace = true }
+tonic = "0.14.6"
+vci-service-config = { workspace = true }
+vci-service-interface = { workspace = true }
+worker-host = { workspace = true }

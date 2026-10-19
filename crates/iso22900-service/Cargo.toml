@@ -28,6 +28,8 @@ vci-service-interface = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+# tests/hw_open.rs opens the check harness's device through this service.
+ngr-hw-checks = { path = "../ngr-hw-checks" }
 # tests/agent_launch.rs launches this service through the agent's launch path.
 agent = { path = "../agent" }
 # tests/ngr_agent_dpdu_end_to_end.rs writes and reads diag-ir programs and states.

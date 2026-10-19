@@ -113,6 +113,21 @@ fn a_j2534_module_the_worker_does_not_report_or_reports_twice_is_refused() {
 }
 
 #[test]
+fn a_j2534_worker_reporting_several_modules_is_refused() {
+    let several = [
+        reported("bench", "Vendor VCI"),
+        reported("other", "Vendor VCI"),
+    ];
+    assert_eq!(
+        select_module(&j2534(), &several, &bench()),
+        Err(MatchRefusal::SeveralModules {
+            module: "bench".into(),
+            count: 2
+        })
+    );
+}
+
+#[test]
 fn a_j2534_module_from_another_library_is_refused() {
     assert_eq!(
         select_module(&j2534(), &[reported("bench", "Other VCI")], &bench()),

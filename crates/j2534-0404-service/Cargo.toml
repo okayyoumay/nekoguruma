@@ -27,6 +27,8 @@ tracing = { workspace = true }
 portable-atomic = { workspace = true }
 
 [dev-dependencies]
+# tests/hw_open.rs opens the check harness's device through this service.
+ngr-hw-checks = { path = "../ngr-hw-checks" }
 # tests/agent_end_to_end.rs runs an agent job against this service.
 agent = { path = "../agent" }
 diag-ir = { workspace = true }

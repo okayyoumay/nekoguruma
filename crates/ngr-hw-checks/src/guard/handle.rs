@@ -63,6 +63,7 @@ use vci_service_interface::{
     pin_data, resource_data, subscribe_event_request,
 };
 use worker_host::client::WorkerClient;
+use worker_host::service::Stopped;
 
 use super::link::{BUS_TYPE, PIN_TYPES, required, table_required};
 use super::{BoundLink, Context, Grant, GuardRefusal, Learned, LinkTable, Request, decide};
@@ -346,9 +347,10 @@ impl Shared {
             let notification = match tokio::time::timeout_at(deadline, stream.message()).await {
                 Ok(notification) => notification,
                 Err(_) => {
-                    // Nothing is left running after the caller gave up; a failed cancel (the
-                    // primitive ended meanwhile) changes nothing.
-                    let _ = self.cancel(client, cop).await;
+                    // Nothing is left running after the caller gave up. The worker answers a
+                    // cancel of a primitive that already ended with success, so a cancel that
+                    // fails is reported: the primitive may still be running.
+                    self.cancel(client, cop).await?;
                     return Err(HandleError::NoResponse);
                 }
             }
@@ -543,7 +545,16 @@ async fn return_to_default_session(
             .await_result(&mut client, cll, cop, &request, Some(wait))
             .await
     };
-    let result = run.await.map(drop).map_err(|e| e.to_string());
+    // Only the positive response to the request ends the session: a negative response, or any
+    // other answer, leaves the ECU where it was.
+    let result = run.await.map_err(|e| e.to_string()).and_then(|response| {
+        match response.as_slice() {
+            [0x50, 0x01, ..] => Ok(()),
+            other => Err(format!(
+                "the ECU did not accept the return to the default session: it answered {other:02X?}"
+            )),
+        }
+    });
     if result.is_err() {
         // Still to be done: a later run of the step (the teardown's, after a refused destroy)
         // tries again.
@@ -842,11 +853,14 @@ impl<'r> GuardedHandle<'r> {
         let client = device.client();
         let module = device.module_handle();
         let close: Step = Box::pin(async move {
-            device
-                .close()
-                .await
-                .map(drop)
-                .map_err(|error| error.to_string())
+            match device.close().await {
+                Ok(Stopped::Exited) => Ok(()),
+                // The device is released, but the worker did not follow its stop request.
+                Ok(Stopped::Killed) => {
+                    Err("the worker did not exit after its stop request and was killed".to_owned())
+                }
+                Err(error) => Err(error.to_string()),
+            }
         });
         Self::start(profile, vci, client, module, options, run, close).await
     }
@@ -1304,15 +1318,13 @@ impl<'r> GuardedHandle<'r> {
             )
             .await?;
         // The staged timings are in effect once the update has finished successfully; until
-        // then (and if it fails or times out) the longer of the two is waited for.
-        if updates
-            && let (Some(cll), Some(cop)) = (cll, response.cop_handle)
-            && self
-                .shared
+        // then (and when it fails, which is returned) the longer of the two is waited for.
+        if updates && let (Some(cll), Some(cop)) = (cll, response.cop_handle) {
+            // An update that fails, is cancelled or times out is the call's error, and the
+            // timings stay as they were.
+            self.shared
                 .await_primitive(&mut self.client.clone(), cll, cop, None, None)
-                .await
-                .is_ok()
-        {
+                .await?;
             self.shared.promote_timings(cll);
         }
         Ok(response)

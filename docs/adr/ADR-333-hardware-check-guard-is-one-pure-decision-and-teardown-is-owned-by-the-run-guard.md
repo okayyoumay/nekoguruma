@@ -199,7 +199,7 @@ Alternatives rejected:
   `required()` lists at the profile's value (the table's identifiers, formats and address in the
   one-entry response table, the rest with `SetComParam`), because the agent's own link setup does
   not set them. A link that entered another session is returned to the default one before the
-  handle destroys it (the destroy is refused if that fails), and the staged response timings take
+  handle destroys it (the destroy is refused unless the ECU answers `50 01`), and the staged response timings take
   effect at the connect or after a finished ComParam update. Power is not registered by the handle: a check that switches power registers its
   off step first.
 - RawMode is refused on T1, T2 and T3: the frame form is settled against the workers, but a

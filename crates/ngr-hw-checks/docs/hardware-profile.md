@@ -262,13 +262,15 @@ connection is served by the runtime.
   stream, which `send_receive(cll, request)` reads (it returns the final response, a negative one
   included, or `NoResponse`). It waits up to `HandleOptions::response_timeout`, by default the link's ceiling
   (P2, the 0x78 completion timeout and P2* the link is set to, the profile's when it pins them,
-  plus 2 s), and cancels the primitive when the wait ends or the worker reports lost events (a failed cancel is then the error returned). Zeros are read as
+  plus 2 s), and cancels the primitive when the wait ends or the worker reports lost events (a cancel that fails is then the error returned: the worker answers a cancel of a primitive that
+  already ended with success). Zeros are read as
   `j2534-0404-service` reads them: P2 zero is 50 ms, P2* zero is 5 s, and a zero completion
   timeout is no ceiling in the worker, so the handle waits at most 10 minutes (and then cancels)
   rather than forever. A `SetComParam` of P2, P2* or the completion timeout through the handle
   updates the ceiling: until the link is connected or a `COPT_UPDATEPARAM` primitive has finished
   successfully (the handle waits for it) the longer of the old and the new value is waited for,
-  afterwards the new one; an update that fails or times out changes nothing (`response_ceiling` reports it). A read of
+  afterwards the new one; an update that fails, is cancelled or times out is the error of the `start_com_primitive` call and
+  changes nothing (`response_ceiling` reports it). A read of
   one DID expects `62` and that DID; a read of several expects `62` only, since the ECU may
   return the records in any order.
 - **Links created by a check.** Whatever creates a link through the handle, including a link a
@@ -289,8 +291,10 @@ connection is served by the runtime.
   cancels the primitive when the wait ends; its timeout is read at the same moment (that wait, the
   start and cancel requests and a margin, at least the 30 s default of other steps), via
   `register_async_with_timeout_fn`. A check that destroys a link in another session has it
-  returned first: the handle sends the same `10 01`, and refuses the destroy if that fails, so the
-  step stays registered. Power: the handle registers nothing for the
+  returned first: the handle sends the same `10 01`, and refuses the destroy if the ECU does not
+  answer with the positive `50 01` (a negative response is a failure too), so the step stays
+  registered and reports the failure when it runs. The device step fails when the worker had to
+  be killed. Power: the handle registers nothing for the
   profile's power commands. A check that switches power registers the power-off step itself before
   it switches power on.
 - **RawMode form.** On a T0 link the data of a send is the literal frame the worker passes on.

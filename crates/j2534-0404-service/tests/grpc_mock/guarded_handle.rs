@@ -709,20 +709,35 @@ async fn destroying_a_link_in_another_session_returns_it_to_the_default_one_firs
     assert_eq!(server.backdoor.write_msgs_count(), 2);
     assert_eq!(handle.bound_links().len(), 1);
 
+    // The ECU refuses the return (7F 10 22): that is no return either.
+    server.backdoor.arm_write_rx_injection(
+        MOCK_CHANNEL_ID,
+        &can_frame(0x7E8, &[0x7F, 0x10, 0x22]),
+        j2534_0404::ISO15765,
+        50,
+    );
+    let refused = handle.destroy_com_logical_link(destroy()).await;
+    assert!(
+        matches!(refused, Err(HandleError::Setup(ref m)) if m.contains("7F, 10, 22")),
+        "{refused:?}"
+    );
+    assert_eq!(server.backdoor.write_msgs_count(), 3);
+    assert_eq!(handle.bound_links().len(), 1);
+
     // It answers: the return is sent, then the link is destroyed.
     arm(0x01);
     handle
         .destroy_com_logical_link(destroy())
         .await
         .expect("the link is returned and destroyed");
-    assert_eq!(server.backdoor.write_msgs_count(), 3);
+    assert_eq!(server.backdoor.write_msgs_count(), 4);
     assert!(handle.bound_links().is_empty());
 
     // The teardown has nothing left to send for the session.
     drop(handle);
     run.pass();
     assert!(run.run_teardown().is_empty());
-    assert_eq!(server.backdoor.write_msgs_count(), 3);
+    assert_eq!(server.backdoor.write_msgs_count(), 4);
     drop(run);
     server.shutdown().await;
 }

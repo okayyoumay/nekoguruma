@@ -214,7 +214,7 @@ Alternatives rejected:
   literal frame: `j2534-0404-service` transmits `cop_data` unchanged as the message data (the
   CAN identifier in four bytes, the address byte when the `ISO15765_ADDR_TYPE` flag is set, then
   the payload), and the hardware ISO 15765 channel it requires for RawMode segments the payload,
-  so the payload carries no ISO 15765-2 (2024) protocol control information. `iso22900-service`
+  so the payload carries no ISO 15765-2 (2024) protocol control information (clause 9.6). `iso22900-service`
   forwards the data and flags to the D-PDU library, which defines the form (ISO 22900-2 (2022)
   D.2.1). The T0 check (identifier, then the address byte, content unread) matches both.
 - `SetUniqueRespIdTable` entries are judged by their ComParams only. The

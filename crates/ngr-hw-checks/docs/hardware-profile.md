@@ -333,7 +333,7 @@ connection is served by the runtime.
   in four bytes, most significant first; the address byte next when the `ISO15765_ADDR_TYPE` flag is
   set (the guard requires the flag to equal the profile's addressing); then the payload. The
   link is a hardware ISO 15765 channel (a software ISO-TP link refuses RawMode), which segments
-  the payload itself, so the payload holds no ISO 15765-2 (2024) protocol control information.
+  the payload itself, so the payload holds no ISO 15765-2 (2024) protocol control information (clause 9.6).
   `iso22900-service` forwards `cop_data` and the TxFlags to the D-PDU library untouched, and the
   form is the library's (ISO 22900-2 (2022) D.2.1, Table D.4 gives the identifier in four bytes);
   it has no test of a RawMode send against a library. This is the header the guard compares on

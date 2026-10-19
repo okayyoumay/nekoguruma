@@ -114,14 +114,20 @@ impl Masker {
             Setup::Link { vci, .. } => vec![vci],
             Setup::Loopback(ends) => ends.iter().filter_map(|e| e.vci.as_ref()).collect(),
         };
-        Masker {
-            full: profile.report_full_identifiers,
-            known: vcis
-                .into_iter()
+        Self::with_known(
+            profile.report_full_identifiers,
+            vcis.into_iter()
                 .filter(|v| v.api == Api::Iso22900 && !v.module.trim().is_empty())
                 .map(|v| v.module.trim().to_owned())
                 .collect(),
-        }
+        )
+    }
+
+    /// A masker for these known serial numbers, longest first, so that masking a shorter one
+    /// that occurs inside a longer one cannot leave the rest of the longer one readable.
+    fn with_known(full: bool, mut known: Vec<String>) -> Self {
+        known.sort_by_key(|serial| std::cmp::Reverse(serial.len()));
+        Masker { full, known }
     }
 
     /// The mask of one value.

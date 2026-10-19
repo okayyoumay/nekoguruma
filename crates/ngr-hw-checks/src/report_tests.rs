@@ -501,3 +501,10 @@ fn a_loopback_with_two_devices_reports_both() {
     assert_eq!(devices[0]["model"].as_str(), Some("Box A"));
     assert_eq!(devices[1]["model"].as_str(), Some("Box B"));
 }
+
+#[test]
+fn a_serial_inside_a_longer_one_does_not_expose_the_longer_one() {
+    let masker = Masker::with_known(false, vec!["1234".into(), "VEHICLE-UNIT-1234".into()]);
+    let masked = masker.text("module VEHICLE-UNIT-1234 ready");
+    assert!(!masked.contains("VEHICLE-UNIT"), "{masked}");
+}

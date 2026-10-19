@@ -298,6 +298,18 @@ connection is served by the runtime.
   has the time for its three requests. A response ceiling also adds the completion timeout of a
   `0x21` / `0x23` re-request chain when its handling is on (the handle sets none, and the guard
   refuses a check that does, so the worker's preset, off, stands).
+- **Outstanding primitives.** Every primitive started through `start_com_primitive` is recorded
+  until the handle sees it end. Before a link's session is settled, it is disconnected or
+  destroyed, its communication is stopped, and in the teardown steps (the return to the default
+  session and the link's closing), the handle cancels every one still recorded (cancelling one
+  that already ended succeeds and changes nothing), so a direct `10 03` cannot race the `10 01`.
+  The device's closing step is bounded by the request timeout (plus the worker's stop grace
+  period for a worker process), never less than the 30 s default.
+- **Registration closes.** When the run ends its teardown (`RunGuard` drop), registration closes
+  under the same lock that finds no step left. A `TeardownHandle` that outlives the run, and any
+  handle call that must register a step, is refused with `TeardownClosed`
+  (`HandleError::TeardownClosed`), and a link created at that moment is released at once rather
+  than left without a step. An early `run_teardown` does not close registration.
 - **Links created by a check.** Whatever creates a link through the handle, including a link a
   check destroys and creates again, gets the same per-link set-up: the teardown step, the event
   stream and timings to wait by (the handle's defaults, 1 s, 5 s and 25 s, until the check sets

@@ -176,9 +176,12 @@ fn a_failed_step_turns_a_recorded_pass_into_a_failed_check() {
     let log = log();
     let result = catch_unwind(AssertUnwindSafe(|| {
         let mut run = RunGuard::start_in(&t3_profile(), "hw_t", dir.clone());
-        run.teardown().register("power", step(&log, "power"));
         run.teardown()
-            .register("device", || Err("the device is busy".to_owned()));
+            .register("power", step(&log, "power"))
+            .unwrap();
+        run.teardown()
+            .register("device", || Err("the device is busy".to_owned()))
+            .unwrap();
         run.pass();
     }));
     // The guard's drop fails the test, and the other step ran.
@@ -200,9 +203,13 @@ fn teardown_runs_when_the_check_panics_and_a_clean_one_stays_a_pass() {
     let log = log();
     let result = catch_unwind(AssertUnwindSafe(|| {
         let run = RunGuard::start_in(&t3_profile(), "hw_p", dir.clone());
-        run.teardown().register("power", step(&log, "power"));
-        run.teardown().register("device", step(&log, "device"));
-        run.teardown().register("link", step(&log, "link"));
+        run.teardown()
+            .register("power", step(&log, "power"))
+            .unwrap();
+        run.teardown()
+            .register("device", step(&log, "device"))
+            .unwrap();
+        run.teardown().register("link", step(&log, "link")).unwrap();
         panic!("an assertion failed");
     }));
     assert!(result.is_err());
@@ -218,7 +225,9 @@ fn teardown_runs_when_the_check_panics_and_a_clean_one_stays_a_pass() {
     let log = self::log();
     {
         let mut run = RunGuard::start_in(&t3_profile(), "hw_c", dir.clone());
-        run.teardown().register("power", step(&log, "power"));
+        run.teardown()
+            .register("power", step(&log, "power"))
+            .unwrap();
         run.pass();
     }
     assert_eq!(events(&log), ["power"]);
@@ -236,7 +245,8 @@ fn a_failed_step_is_added_to_a_recorded_failure() {
     let result = catch_unwind(AssertUnwindSafe(|| {
         let mut run = RunGuard::start_in(&t3_profile(), "hw_f", dir.clone());
         run.teardown()
-            .register("power", || Err("the relay did not answer".to_owned()));
+            .register("power", || Err("the relay did not answer".to_owned()))
+            .unwrap();
         run.finish(Outcome::Failed, "no response to the read");
     }));
     assert!(result.is_err());
@@ -276,15 +286,18 @@ fn an_early_teardown_run_keeps_its_failures_for_the_check() {
     let result = catch_unwind(AssertUnwindSafe(|| {
         let mut run = RunGuard::start_in(&t3_profile(), "hw_e", dir.clone());
         run.teardown()
-            .register("device", || Err("the device is busy".to_owned()));
-        run.teardown().register("power", step(&log, "power"));
+            .register("device", || Err("the device is busy".to_owned()))
+            .unwrap();
+        run.teardown()
+            .register("power", step(&log, "power"))
+            .unwrap();
         // Early cleanup: the failure is returned for information and kept by the guard.
         let failures = run.run_teardown();
         assert_eq!(failures.len(), 1);
         assert_eq!(failures[0].name, "device");
         assert_eq!(events(&log), ["power"]);
         // A step registered after the early run runs at drop.
-        run.teardown().register("link", step(&log, "link"));
+        run.teardown().register("link", step(&log, "link")).unwrap();
         run.pass();
     }));
     // The check recorded a pass, but the guard fails it, naming the step.
@@ -374,12 +387,71 @@ fn cloned_handles_share_one_reverse_order() {
     let mut run = RunGuard::start_in(&t3_profile(), "hw_p", dir.path().join("reports"));
     let mut first = run.teardown();
     let mut second = first.clone();
-    first.register("a1", step(&log, "a1"));
-    second.register("b1", step(&log, "b1"));
-    first.register("a2", step(&log, "a2"));
+    first.register("a1", step(&log, "a1")).unwrap();
+    second.register("b1", step(&log, "b1")).unwrap();
+    first.register("a2", step(&log, "a2")).unwrap();
     assert!(!second.is_empty());
     assert!(run.run_teardown().is_empty());
     assert_eq!(events(&log), ["a2", "b1", "a1"]);
     assert!(first.is_empty());
     run.pass();
+}
+
+/// Registration closes when the run ends its teardown: a handle that outlives the run is refused
+/// instead of queueing a step for after the report was written.
+#[test]
+fn registration_is_refused_after_the_run_ended_its_teardown() {
+    let log = log();
+    let shared = Arc::new(Mutex::new(Teardown::new()));
+    let mut handle = TeardownHandle(Arc::clone(&shared));
+    handle.register("early", step(&log, "early")).unwrap();
+    // An early run does not close registration.
+    assert!(run_shared(&shared, false).is_empty());
+    handle.register("later", step(&log, "later")).unwrap();
+    assert!(run_shared(&shared, true).is_empty());
+    assert_eq!(events(&log), ["early", "later"]);
+    assert_eq!(
+        handle.register("too late", step(&log, "too late")),
+        Err(TeardownClosed)
+    );
+    assert_eq!(
+        handle.register_async("too late", async { Ok(()) }),
+        Err(TeardownClosed)
+    );
+    assert!(handle.is_empty());
+    assert_eq!(events(&log), ["early", "later"]);
+}
+
+/// A registration that races the closing either lands before it, and its step runs, or is
+/// refused; none is accepted and left unrun.
+#[test]
+fn a_registration_racing_the_close_is_run_or_refused() {
+    for _ in 0..20 {
+        let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let shared = Arc::new(Mutex::new(Teardown::new()));
+        let mut handle = TeardownHandle(Arc::clone(&shared));
+        let counted = Arc::clone(&ran);
+        let registering = std::thread::spawn(move || {
+            let mut accepted = 0;
+            for _ in 0..2000 {
+                let ran = Arc::clone(&counted);
+                let step = move || {
+                    ran.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                };
+                if handle.register("step", step).is_ok() {
+                    accepted += 1;
+                }
+            }
+            accepted
+        });
+        std::thread::sleep(Duration::from_micros(200));
+        assert!(run_shared(&shared, true).is_empty());
+        let accepted = registering.join().unwrap();
+        assert_eq!(
+            ran.load(std::sync::atomic::Ordering::SeqCst),
+            accepted,
+            "every accepted step ran"
+        );
+    }
 }

@@ -594,7 +594,7 @@ impl RunGuard {
     /// returns what failed, for information. The failures stay with the guard: dropping it fails
     /// the check even if it records a pass afterwards. A step registered later runs at drop.
     pub fn run_teardown(&mut self) -> Vec<StepFailure> {
-        let failures = run_shared(&self.teardown);
+        let failures = run_shared(&self.teardown, false);
         self.teardown_failures.extend(failures.iter().cloned());
         failures
     }
@@ -655,7 +655,10 @@ impl Drop for RunGuard {
     fn drop(&mut self) {
         // The steps run first, whatever the check did, and before the report is written, so
         // that a failed step is in it.
-        self.run_teardown();
+        // The last run of the steps also closes registration, so a handle that outlives the run
+        // cannot queue a step for after the report was written.
+        let last = run_shared(&self.teardown, true);
+        self.teardown_failures.extend(last);
         let failures = std::mem::take(&mut self.teardown_failures);
         if std::thread::panicking() {
             // A check that panics after recording a pass (in a later guard's drop, say) failed.

@@ -71,7 +71,7 @@ use crate::comparam::canonical;
 use crate::open::OpenedDevice;
 use crate::profile::{Addressing, Class, Link, Profile, Vci};
 use crate::report::RunGuard;
-use crate::teardown::TeardownHandle;
+use crate::teardown::{TeardownClosed, TeardownHandle};
 
 /// What `GetObjectId` answers for a name the worker does not know (`PDU_ID_UNDEF`, ISO 22900-2
 /// (2022) 8.4.23).
@@ -147,6 +147,10 @@ pub enum HandleError {
     /// The VCI was lost: the worker reported the loss of communication with it.
     #[error("the VCI was lost")]
     VciLost,
+    /// The run had already ended its teardown, so the step that releases a resource could not
+    /// be registered.
+    #[error(transparent)]
+    TeardownClosed(#[from] TeardownClosed),
     /// The primitive failed with this D-PDU error event code.
     #[error("the primitive failed with error event {0:#x}")]
     PrimitiveFailed(i32),
@@ -181,6 +185,12 @@ impl Default for HandleOptions {
 }
 
 type Events = Arc<AsyncMutex<Streaming<EventNotification>>>;
+/// How the device is closed: the step, and the time it may take.
+struct DeviceClose {
+    step: Step,
+    budget: Duration,
+}
+
 type Step = Pin<Box<dyn Future<Output = Result<(), String>> + Send>>;
 
 /// What the decisions rest on, and what the teardown steps still have to do.
@@ -201,6 +211,10 @@ struct State {
     /// The primitive being waited for on each link, while a wait is under way. A wait whose
     /// future is dropped leaves its entry, and the next operation or the teardown cancels it.
     inflight: BTreeMap<u32, ComPrimitiveHandle>,
+    /// The primitives started on each link through `start_com_primitive` that the handle has
+    /// not seen end: cancelled before the link's session is settled, it is disconnected or
+    /// destroyed, and by the teardown (cancelling one that ended succeeds and changes nothing).
+    started: BTreeMap<u32, Vec<ComPrimitiveHandle>>,
     /// The requests that resume the transmit queues a check suspended.
     suspended: Vec<IoCtlRequest>,
     /// The step that resumes them is registered and has not started.
@@ -304,6 +318,7 @@ impl Shared {
                 state.timings.remove(cll);
                 state.session_registered.remove(cll);
                 state.inflight.remove(cll);
+                state.started.remove(cll);
             }
             Grant::Pass | Grant::CreatesLink { .. } | Grant::EntersSession(_) => {}
         }
@@ -394,6 +409,9 @@ impl Shared {
         if state.inflight.get(&cll.cll_handle) == Some(&cop) {
             state.inflight.remove(&cll.cll_handle);
         }
+        if let Some(started) = state.started.get_mut(&cll.cll_handle) {
+            started.retain(|started| *started != cop);
+        }
         drop(state);
         result
     }
@@ -410,6 +428,35 @@ impl Shared {
             self.lock().inflight.remove(&cll.cll_handle);
         }
         Ok(())
+    }
+
+    /// Cancels everything outstanding on `cll`: the primitive a dropped wait left running and
+    /// every primitive started through the handle that it has not seen end. Tries all, and
+    /// returns the first failure.
+    async fn cancel_outstanding(
+        &self,
+        client: &mut WorkerClient,
+        cll: ComLogicalLinkHandle,
+    ) -> Result<(), HandleError> {
+        let mut first = self.cancel_stale(client, cll).await.err();
+        let started = self
+            .lock()
+            .started
+            .remove(&cll.cll_handle)
+            .unwrap_or_default();
+        for (index, cop) in started.iter().enumerate() {
+            if let Err(error) = self.cancel(client, *cop).await {
+                // Still outstanding: this one and the rest not yet tried.
+                self.lock()
+                    .started
+                    .entry(cll.cll_handle)
+                    .or_default()
+                    .extend(started[index..].iter().copied());
+                first.get_or_insert(error);
+                break;
+            }
+        }
+        first.map_or(Ok(()), Err)
     }
 
     /// Resumes the transmit queues a check suspended, each through the guard. A suspended
@@ -613,6 +660,15 @@ fn send_receive_request(cll: ComLogicalLinkHandle, data: &[u8]) -> StartComPrimi
     }
 }
 
+/// The time the step that closes the device is given: what closing may take (`budget`: the
+/// module disconnect's request timeout, and for a worker process its stop grace period) and a
+/// margin; never less than the teardown's default.
+fn device_close_timeout(budget: Duration) -> Duration {
+    budget
+        .saturating_add(Duration::from_secs(1))
+        .max(crate::teardown::DEFAULT_STEP_TIMEOUT)
+}
+
 /// The time the step that closes a link is given: its cancel, disconnect and destroy requests, each
 /// bounded by `request_timeout`, and a margin; never less than the teardown's default.
 fn close_link_timeout(request_timeout: Duration) -> Duration {
@@ -633,7 +689,7 @@ async fn close_link(
     }
     // A primitive a dropped wait left running is stopped first; the destroy below ends any that
     // the cancel does not reach.
-    let _ = shared.cancel_stale(&mut client, cll).await;
+    let _ = shared.cancel_outstanding(&mut client, cll).await;
     let disconnect = DisconnectComLogicalLinkRequest {
         cll_handle: Some(cll),
     };
@@ -703,7 +759,7 @@ async fn return_to_default_session(
     // What would hold the return back goes first: a primitive a dropped wait left running, a
     // transmit queue a check suspended.
     shared
-        .cancel_stale(&mut client, cll)
+        .cancel_outstanding(&mut client, cll)
         .await
         .map_err(|e| e.to_string())?;
     shared
@@ -1200,6 +1256,7 @@ impl GuardedHandle {
     ) -> Result<GuardedHandle, HandleError> {
         let client = device.client();
         let module = device.module_handle();
+        let budget = device.close_budget();
         let close: Step = Box::pin(async move {
             match device.close().await {
                 Ok(Stopped::Exited) => Ok(()),
@@ -1210,7 +1267,19 @@ impl GuardedHandle {
                 Err(error) => Err(error.to_string()),
             }
         });
-        Self::start(profile, vci, client, module, options, run, close).await
+        Self::start(
+            profile,
+            vci,
+            client,
+            module,
+            options,
+            run,
+            DeviceClose {
+                step: close,
+                budget,
+            },
+        )
+        .await
     }
 
     /// Like [`GuardedHandle::open`], for a worker the caller hosts: `client` talks to it and
@@ -1236,7 +1305,20 @@ impl GuardedHandle {
                 Ok(Ok(_)) => Ok(()),
             }
         });
-        Self::start(profile, vci, client, module, options, run, close).await
+        let budget = options.request_timeout;
+        Self::start(
+            profile,
+            vci,
+            client,
+            module,
+            options,
+            run,
+            DeviceClose {
+                step: close,
+                budget,
+            },
+        )
+        .await
     }
 
     async fn start(
@@ -1246,10 +1328,14 @@ impl GuardedHandle {
         module: ModuleHandle,
         options: HandleOptions,
         run: &RunGuard,
-        close_device: Step,
+        close: DeviceClose,
     ) -> Result<GuardedHandle, HandleError> {
         let mut teardown = run.teardown();
-        teardown.register_async("close the device", close_device);
+        teardown.register_async_with_timeout(
+            "close the device",
+            device_close_timeout(close.budget),
+            close.step,
+        )?;
         let mut handle = GuardedHandle {
             client,
             shared: Arc::new(Shared {
@@ -1511,11 +1597,15 @@ impl GuardedHandle {
                     .insert(cll.cll_handle, BoundLink::new(endpoint, raw_mode));
                 state.closing.insert(cll.cll_handle);
             }
-            self.teardown.register_async_with_timeout(
+            if let Err(closed) = self.teardown.register_async_with_timeout(
                 format!("close link {}", cll.cll_handle),
                 close_link_timeout(self.shared.options.request_timeout),
                 close_link(self.shared.clone(), self.client.clone(), cll),
-            );
+            ) {
+                // No step will release the link, so it is released now.
+                let _ = close_link(self.shared.clone(), self.client.clone(), cll).await;
+                return Err(closed.into());
+            }
             // Whatever creates a link through the handle gets what a send-receive needs: its
             // event stream, and timings to wait by (the handle's defaults until the check sets
             // others; `open_link` replaces them with what it sets).
@@ -1574,14 +1664,22 @@ impl GuardedHandle {
             if register {
                 let shared = self.shared.clone();
                 let mut client = self.client.clone();
-                self.teardown
-                    .register_async("resume the transmit queue", async move {
-                        shared.lock().resume_registered = false;
-                        shared
-                            .resume_queues(&mut client)
-                            .await
-                            .map_err(|e| e.to_string())
-                    });
+                if let Err(closed) =
+                    self.teardown
+                        .register_async("resume the transmit queue", async move {
+                            shared.lock().resume_registered = false;
+                            shared
+                                .resume_queues(&mut client)
+                                .await
+                                .map_err(|e| e.to_string())
+                        })
+                {
+                    // Nothing was sent: the suspension is not recorded either.
+                    let mut state = self.shared.lock();
+                    state.suspended.pop();
+                    state.resume_registered = false;
+                    return Err(closed.into());
+                }
             }
         }
         let sent = self
@@ -1659,6 +1757,11 @@ impl GuardedHandle {
     ) -> Result<vci_service_interface::Response, HandleError> {
         self.shared
             .admit(&Request::DisconnectComLogicalLink(&request))?;
+        if let Some(cll) = request.cll_handle {
+            self.shared
+                .cancel_outstanding(&mut self.client.clone(), cll)
+                .await?;
+        }
         self.settle_session(request.cll_handle, "disconnected")
             .await?;
         self.shared
@@ -1677,6 +1780,11 @@ impl GuardedHandle {
         let grant = self
             .shared
             .admit(&Request::DestroyComLogicalLink(&request))?;
+        if let Some(cll) = request.cll_handle {
+            self.shared
+                .cancel_outstanding(&mut self.client.clone(), cll)
+                .await?;
+        }
         self.settle_session(request.cll_handle, "destroyed").await?;
         let response = self
             .shared
@@ -1750,6 +1858,11 @@ impl GuardedHandle {
         }
         // Stopping communication ends the tester present that keeps a session up.
         if request.cop_type == ComOperationType::CoptStopcomm as i32 {
+            if let Some(cll) = cll {
+                self.shared
+                    .cancel_outstanding(&mut self.client.clone(), cll)
+                    .await?;
+            }
             self.settle_session(cll, "taken out of communication")
                 .await?;
         }
@@ -1764,11 +1877,18 @@ impl GuardedHandle {
             // the time for that (read at the same moment), so it ends by itself and cancels
             // instead of being dropped.
             let shared = self.shared.clone();
-            self.teardown.register_async_with_timeout_fn(
+            if let Err(closed) = self.teardown.register_async_with_timeout_fn(
                 format!("return link {} to the default session", cll.cll_handle),
                 move || session_reset_timeout(shared.wait_for(cll), shared.options.request_timeout),
                 return_to_default_session(self.shared.clone(), self.client.clone(), cll),
-            );
+            ) {
+                // Nothing was sent, so nothing needs returning.
+                self.shared
+                    .lock()
+                    .session_registered
+                    .remove(&cll.cll_handle);
+                return Err(closed.into());
+            }
         }
         let updates = request.cop_type == ComOperationType::CoptUpdateparam as i32;
         // The ECU may be in the session as soon as the request is on its way: the return is
@@ -1787,6 +1907,14 @@ impl GuardedHandle {
         }
         drop(provisional);
         let response = sent?;
+        if let (Some(cll), Some(cop)) = (cll, response.cop_handle) {
+            self.shared
+                .lock()
+                .started
+                .entry(cll.cll_handle)
+                .or_default()
+                .push(cop);
+        }
         // The staged timings are in effect once the update has finished successfully; until
         // then (and when it fails, which is returned) the longer of the two is waited for.
         if updates && let (Some(cll), Some(cop)) = (cll, response.cop_handle) {
@@ -2375,6 +2503,16 @@ mod tests {
         let mut saved: Vec<Option<io_ctl_request::Handle>> = vec![link(1, 10), link(1, 11)];
         saved.retain(|s| !resume_covers(&link(1, 10), s));
         assert_eq!(saved, [link(1, 11)]);
+    }
+
+    #[test]
+    fn the_device_close_step_follows_the_requests_it_makes() {
+        let default = crate::teardown::DEFAULT_STEP_TIMEOUT;
+        // A short budget keeps the default; a longer request timeout lengthens the step.
+        assert_eq!(device_close_timeout(Duration::from_secs(5)), default);
+        let long = Duration::from_secs(90);
+        assert_eq!(device_close_timeout(long), long + Duration::from_secs(1));
+        assert_eq!(device_close_timeout(Duration::MAX), Duration::MAX);
     }
 
     #[test]

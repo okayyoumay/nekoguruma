@@ -201,6 +201,11 @@ Alternatives rejected:
   no state across handles, because a handle's context binds the endpoints of its own VCI only
   (`Context::vci`); nothing refuses a second handle on the same module, which would create that
   module's links again, so a check opens one handle per VCI.
+- Registration closes when the run ends its teardown, atomically with the pass that finds no step
+  left; a later registration through a surviving `TeardownHandle` clone is an error
+  (`TeardownClosed`), never queued for after the report. The handle cancels every primitive it
+  started and has not seen end before it settles, disconnects or destroys a link, and in its
+  teardown steps.
 - The handle creates the profile's links itself, through the guard, with every ComParam
   `required()` lists at the profile's value (the table's identifiers, formats and address in the
   one-entry response table, the rest with `SetComParam`), because the agent's own link setup does

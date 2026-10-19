@@ -1064,10 +1064,12 @@ async fn two_handles_on_one_run_are_torn_down_in_reverse_order() {
     let marker = |name: &'static str, run: &RunGuard| {
         let backdoor = MockBackdoor::open(&library);
         let seen = std::sync::Arc::clone(&seen);
-        run.teardown().register(name, move || {
-            seen.lock().unwrap().push((name, backdoor.close_count()));
-            Ok(())
-        });
+        run.teardown()
+            .register(name, move || {
+                seen.lock().unwrap().push((name, backdoor.close_count()));
+                Ok(())
+            })
+            .expect("the run is still open");
     };
     marker("before", &run);
     let first = GuardedHandle::attach(
@@ -1110,4 +1112,83 @@ async fn two_handles_on_one_run_are_torn_down_in_reverse_order() {
     drop(run);
     first_server.shutdown().await;
     second_server.shutdown().await;
+}
+
+/// A `10 03` started directly (nobody waits for it) is cancelled before the teardown writes
+/// `10 01`: the first primitive of the link is cancelled or finished by the time the return fails.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_primitive_started_directly_is_cancelled_before_the_return() {
+    let server = TestServer::start().await;
+    let profile = t3();
+    let reports = Reports::new();
+    let run = RunGuard::start_in(&profile, "hw_guarded_handle", reports.dir());
+    let mut handle = GuardedHandle::attach(
+        &profile,
+        &vci(&profile),
+        server.worker_client().await,
+        module(),
+        HandleOptions {
+            request_timeout: std::time::Duration::from_secs(5),
+            response_timeout: Some(std::time::Duration::from_millis(300)),
+        },
+        &run,
+    )
+    .await
+    .expect("the handle opens the profile's link");
+    let [cll] = *handle.links() else {
+        panic!("one link");
+    };
+    // The ECU does not answer either request: the primitive would wait for the P2 window.
+    let cop = handle
+        .start_com_primitive(StartComPrimitiveRequest {
+            cop_tag: None,
+            cll_handle: Some(cll),
+            cop_type: ComOperationType::CoptSendrecv as i32,
+            cop_data: vec![0x10, 0x03],
+            cop_ctrl_data: Some(ComPrimitiveCtrlData {
+                time: 0,
+                num_send_cycles: 1,
+                num_receive_cycles: 1,
+                temp_param_update: 0,
+                expected_response_array: vec![],
+                tx_flag: None,
+            }),
+        })
+        .await
+        .expect("the session change starts")
+        .cop_handle
+        .expect("a primitive handle");
+    // The return fails (the ECU is silent), but the primitive was cancelled first.
+    let refused = handle
+        .destroy_com_logical_link(DestroyComLogicalLinkRequest {
+            cll_handle: Some(cll),
+        })
+        .await;
+    assert!(matches!(refused, Err(HandleError::Setup(_))), "{refused:?}");
+    let status = handle
+        .get_status(vci_service_interface::GetStatusRequest {
+            handle: Some(vci_service_interface::get_status_request::Handle::CopHandle(cop)),
+        })
+        .await
+        .expect("the primitive's status");
+    assert_eq!(
+        status.status,
+        Some(vci_service_interface::status_response::Status::CopStatus(
+            vci_service_interface::PduComPrimitiveStatus::PduCopstCancelled as i32
+        ))
+    );
+    // The teardown returns the ECU once it answers.
+    drop(handle);
+    let mut run = run;
+    server.backdoor.arm_write_rx_injection(
+        MOCK_CHANNEL_ID,
+        &can_frame(0x7E8, &[0x50, 0x01, 0x00, 0x32, 0x01, 0xF4]),
+        j2534_0404::ISO15765,
+        50,
+    );
+    run.pass();
+    assert!(run.run_teardown().is_empty());
+    drop(run);
+    server.shutdown().await;
 }

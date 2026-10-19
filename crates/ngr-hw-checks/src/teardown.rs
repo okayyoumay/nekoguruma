@@ -56,6 +56,8 @@ impl std::fmt::Display for StepFailure {
 pub struct Teardown {
     steps: Vec<Step>,
     timeout: Duration,
+    /// The run has finished its teardown: a handle refuses further registrations.
+    closed: bool,
 }
 
 impl Default for Teardown {
@@ -69,6 +71,7 @@ impl Teardown {
         Self {
             steps: Vec::new(),
             timeout: DEFAULT_STEP_TIMEOUT,
+            closed: false,
         }
     }
 
@@ -163,7 +166,11 @@ fn run_one(step: Step, default: Duration) -> Option<StepFailure> {
 /// Runs the steps of a teardown shared between handles, last registered first. The lock is held
 /// only to take the next step, never while one runs, so a step may register further steps (they
 /// run next) and other handles may register meanwhile.
-pub(crate) fn run_shared(shared: &Mutex<Teardown>) -> Vec<StepFailure> {
+///
+/// With `close`, the run is ending: the call that finds no step left closes registration, under
+/// the same lock, so a registration either lands before it (and its step runs here) or is
+/// refused ([`TeardownClosed`]); none is queued for a drop after the report was written.
+pub(crate) fn run_shared(shared: &Mutex<Teardown>, close: bool) -> Vec<StepFailure> {
     let mut failures = Vec::new();
     loop {
         let (step, default) = {
@@ -171,7 +178,10 @@ pub(crate) fn run_shared(shared: &Mutex<Teardown>) -> Vec<StepFailure> {
                 shared.lock().unwrap_or_else(PoisonError::into_inner);
             match teardown.steps.pop() {
                 Some(step) => (step, teardown.timeout),
-                None => return failures,
+                None => {
+                    teardown.closed |= close;
+                    return failures;
+                }
             }
         };
         failures.extend(run_one(step, default));
@@ -213,58 +223,82 @@ fn run_step(step: Step, default: Duration) -> Result<(), String> {
 #[derive(Clone)]
 pub struct TeardownHandle(pub(crate) Arc<Mutex<Teardown>>);
 
+/// The run has ended its teardown, so a step registered now would never run in time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("the run's teardown has ended; a step registered now would not run")]
+pub struct TeardownClosed;
+
 impl TeardownHandle {
-    fn lock(&self) -> MutexGuard<'_, Teardown> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    /// The teardown, unless the run closed registration.
+    fn open(&self) -> Result<MutexGuard<'_, Teardown>, TeardownClosed> {
+        let teardown = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if teardown.closed {
+            Err(TeardownClosed)
+        } else {
+            Ok(teardown)
+        }
     }
 
     /// See [`Teardown::set_timeout`].
     pub fn set_timeout(&mut self, timeout: Duration) {
-        self.lock().set_timeout(timeout);
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .set_timeout(timeout);
     }
 
-    /// See [`Teardown::register`].
+    /// See [`Teardown::register`]. Refused once the run has ended its teardown.
     pub fn register(
         &mut self,
         name: impl Into<String>,
         step: impl FnOnce() -> Result<(), String> + Send + 'static,
-    ) {
-        self.lock().register(name, step);
+    ) -> Result<(), TeardownClosed> {
+        self.open()?.register(name, step);
+        Ok(())
     }
 
-    /// See [`Teardown::register_async`].
+    /// See [`Teardown::register_async`]. Refused once the run has ended its teardown.
     pub fn register_async(
         &mut self,
         name: impl Into<String>,
         step: impl Future<Output = Result<(), String>> + Send + 'static,
-    ) {
-        self.lock().register_async(name, step);
+    ) -> Result<(), TeardownClosed> {
+        self.open()?.register_async(name, step);
+        Ok(())
     }
 
-    /// See [`Teardown::register_async_with_timeout`].
+    /// See [`Teardown::register_async_with_timeout`]. Refused once the run has ended its
+    /// teardown.
     pub fn register_async_with_timeout(
         &mut self,
         name: impl Into<String>,
         timeout: Duration,
         step: impl Future<Output = Result<(), String>> + Send + 'static,
-    ) {
-        self.lock().register_async_with_timeout(name, timeout, step);
+    ) -> Result<(), TeardownClosed> {
+        self.open()?
+            .register_async_with_timeout(name, timeout, step);
+        Ok(())
     }
 
-    /// See [`Teardown::register_async_with_timeout_fn`].
+    /// See [`Teardown::register_async_with_timeout_fn`]. Refused once the run has ended its
+    /// teardown.
     pub fn register_async_with_timeout_fn(
         &mut self,
         name: impl Into<String>,
         timeout: impl Fn() -> Duration + Send + 'static,
         step: impl Future<Output = Result<(), String>> + Send + 'static,
-    ) {
-        self.lock()
+    ) -> Result<(), TeardownClosed> {
+        self.open()?
             .register_async_with_timeout_fn(name, timeout, step);
+        Ok(())
     }
 
     /// Whether no step is left to run.
     pub fn is_empty(&self) -> bool {
-        self.lock().is_empty()
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_empty()
     }
 }
 

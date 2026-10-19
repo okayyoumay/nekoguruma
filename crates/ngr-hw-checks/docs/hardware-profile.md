@@ -199,9 +199,15 @@ Anything it cannot classify is refused.
   `protocol` it is; a SocketCAN end has no worker link). `ConnectComLogicalLink` is refused until
   the pinned ComParams (baud rate, request, response and functional identifiers, formats and
   address byte when the link needs them, filler, `[link.comparams]`) have been set to the
-  profile's values, which the caller records from `SetsComParams` grants. `SetComParam` and the ComParams of `SetUniqueRespIdTable` keep the profile's values:
+  profile's values, which the caller records from `SetsComParams` grants. A
+  `SetUniqueRespIdTable` replaces the table on both workers, so it must carry the request and
+  response identifiers (and the formats and address byte the link needs), each at the profile's
+  value; an empty or partial table is refused. The `Context` names the profile VCI its worker
+  fronts, and a link is created only for an endpoint on it (on a T0 of two VCIs each worker's
+  context binds its own end). `SetComParam` and the ComParams of `SetUniqueRespIdTable` keep the profile's values:
   `CP_Baudrate`, the identifiers, the CAN ID format (ISO 22900-2 (2022) Table B.13 and B.14), the
-  address byte and the padding; other physical-layer ComParams are refused; functional
+  address byte and the padding; a `CP_TesterPresentMessage` on T2 and T3 may only be a
+  TesterPresent request (`3E 00` or `3E 80`), since the worker sends it cyclically; other physical-layer ComParams are refused; functional
   addressing needs a `functional_id`; a `[link.comparams]` entry keeps its value. The rules are an
   allow-list over canonical names (case folded, the J2534 worker's aliases such as `DATA_RATE`
   resolved, the request's class field ignored): a ComParam no rule covers passes only when it is

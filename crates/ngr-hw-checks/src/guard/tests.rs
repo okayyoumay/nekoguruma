@@ -102,14 +102,25 @@ fn loopback() -> Profile {
 
 struct Env {
     profile: Profile,
+    vci: crate::profile::Vci,
     links: LinkTable,
     learned: Learned,
 }
 
 impl Env {
     fn new(profile: Profile) -> Self {
+        let vci = match &profile.setup {
+            Setup::Link { vci, .. } => vci.clone(),
+            Setup::Loopback(ends) => ends.iter().find_map(|e| e.vci.clone()).unwrap(),
+        };
+        Self::for_vci(profile, vci)
+    }
+
+    /// The context of the worker that fronts `vci`.
+    fn for_vci(profile: Profile, vci: crate::profile::Vci) -> Self {
         Env {
             profile,
+            vci,
             links: LinkTable::new(),
             learned: Learned::default(),
         }
@@ -142,6 +153,7 @@ impl Env {
             &Context {
                 profile: &self.profile,
                 module: MODULE,
+                vci: &self.vci,
                 links: &self.links,
                 learned: &self.learned,
             },
@@ -568,7 +580,18 @@ fn an_alias_of_the_baud_rate_is_compared_like_it() {
             set_table(&env, vec![unum(name, 250_000)]).is_err(),
             "{name}"
         );
-        assert!(set_table(&env, vec![unum(name, 500_000)]).is_ok(), "{name}");
+        assert!(
+            set_table(
+                &env,
+                vec![
+                    unum(name, 500_000),
+                    unum("CP_CanPhysReqId", 0x7E0),
+                    unum("CP_CanRespUSDTId", 0x7E8)
+                ]
+            )
+            .is_ok(),
+            "{name}"
+        );
     }
     // Through a learned id as well.
     let mut env = env;
@@ -813,6 +836,17 @@ fn a_tester_present_message_is_judged_as_a_request() {
     };
     let t3 = Env::linked(profile("T3"), false);
     assert!(set(&t3, message(&[0x3E, 0x80])).is_ok());
+    assert!(set(&t3, message(&[0x3E, 0x00])).is_ok());
+    // The worker sends it cyclically: nothing but TesterPresent, session control included.
+    for other in [
+        &[0x10, 0x03][..],
+        &[0x10, 0x01],
+        &[0x22, 0xF1, 0x90],
+        &[0x19, 0x0A],
+        &[0x2E, 0xF1, 0x90, 0x01],
+    ] {
+        assert!(set(&t3, message(other)).is_err(), "{other:02x?}");
+    }
     assert!(set(&t3, message(&[0x2E, 0xF1, 0x90, 0x01])).is_err());
     let alias = param_by_name(
         "CP_TesterPresentMsg",
@@ -1016,6 +1050,160 @@ fn the_connect_check_requires_what_the_profile_pins() {
         link::required(link),
         ["cp_baudrate", "cp_canphysreqid", "cp_canrespusdtid"]
     );
+}
+
+#[test]
+fn a_response_table_replaces_the_old_one_and_must_be_complete() {
+    let mut env = Env::linked(profile("T3"), false);
+    let complete = |phys: u32, resp: u32| {
+        vec![
+            unum("CP_CanPhysReqId", phys),
+            unum("CP_CanRespUSDTId", resp),
+        ]
+    };
+    // A complete table passes and records its names.
+    let grant = set_table(&env, complete(0x7E0, 0x7E8));
+    assert_eq!(
+        grant,
+        Ok(Grant::SetsComParams {
+            cll: CLL,
+            names: vec!["cp_canphysreqid".to_owned(), "cp_canrespusdtid".to_owned()]
+        })
+    );
+    apply(&mut env, grant);
+    // An empty table, or one without the response id or the request id, is refused: also after
+    // a complete one, since the new table replaces it.
+    assert!(matches!(
+        set_table(&env, vec![]),
+        Err(GuardRefusal::LinkSetup(_))
+    ));
+    let Err(GuardRefusal::LinkSetup(why)) = set_table(&env, vec![unum("CP_CanPhysReqId", 0x7E0)])
+    else {
+        panic!("a table without the response id is refused");
+    };
+    assert!(why.contains("cp_canrespusdtid"), "{why}");
+    assert!(set_table(&env, vec![unum("CP_CanRespUSDTId", 0x7E8)]).is_err());
+    // Several entries together may carry the identifiers.
+    let split = env.decide(Request::SetUniqueRespIdTable(
+        &SetUniqueRespIdTableRequest {
+            cll_handle: cll(),
+            unique_resp_id_table: Some(UniqueRespIdTableItem {
+                unique_data: vec![
+                    EcuUniqueRespData {
+                        unique_resp_identifier: 1,
+                        params: vec![unum("CP_CanPhysReqId", 0x7E0)],
+                    },
+                    EcuUniqueRespData {
+                        unique_resp_identifier: 2,
+                        params: vec![unum("CP_CanRespUSDTId", 0x7E8)],
+                    },
+                ],
+            }),
+        },
+    ));
+    assert!(split.is_ok());
+    // A wrong value is refused as before.
+    assert!(set_table(&env, complete(0x7E1, 0x7E8)).is_err());
+}
+
+#[test]
+fn a_table_must_carry_the_formats_and_address_the_link_needs() {
+    let env = Env::linked(
+        profile_with(
+            "T3",
+            &L {
+                id_bits: 29,
+                request: 0x18DA_10F1,
+                response: 0x18DA_F110,
+                functional: Some(0x18DB_33F1),
+                addressing: "extended",
+                address: Some(0x42),
+                ..L::default()
+            },
+        ),
+        false,
+    );
+    let ids = vec![
+        unum("CP_CanPhysReqId", 0x18DA_10F1),
+        unum("CP_CanRespUSDTId", 0x18DA_F110),
+    ];
+    assert!(set_table(&env, ids.clone()).is_err());
+    let mut full = ids;
+    full.extend([
+        unum("CP_CanPhysReqFormat", 0x0F),
+        unum("CP_CanRespUSDTFormat", 0x0F),
+        unum("CP_CanPhysReqExtAddr", 0x42),
+        unum("CP_CanRespUSDTExtAddr", 0x42),
+    ]);
+    // The functional identifier is a COM-class ComParam, not held by the table.
+    assert!(set_table(&env, full).is_ok());
+}
+
+/// A T0 loopback of two VCIs (two J2534 modules), no channels.
+fn two_vci_loopback() -> Profile {
+    let vci = |label: &str, pname: &str| {
+        VCI.replace("label = \"bench\"", &format!("label = \"{label}\""))
+            .replace("pname = \"Vendor VCI 1\"", &format!("pname = \"{pname}\""))
+    };
+    let end = |vci: String, request: u32, response: u32| {
+        format!(
+            "[[endpoint]]\n[endpoint.vci]\n{vci}\n[endpoint.link]\n{}",
+            link_toml(&L {
+                request,
+                response,
+                functional: None,
+                ..L::default()
+            })
+        )
+    };
+    parse(&format!(
+        "class = \"T0\"\n{}{}",
+        end(vci("bench-a", "Vendor VCI A"), 0x123, 0x124),
+        end(vci("bench-b", "Vendor VCI B"), 0x124, 0x123)
+    ))
+    .unwrap()
+}
+
+#[test]
+fn each_worker_of_a_two_vci_loopback_binds_only_its_own_end() {
+    let profile = two_vci_loopback();
+    let Setup::Loopback(ends) = &profile.setup else {
+        unreachable!()
+    };
+    let vci_a = ends[0].vci.clone().unwrap();
+    let vci_b = ends[1].vci.clone().unwrap();
+    let mut other = vci_a.clone();
+    let a = Env::for_vci(profile.clone(), vci_a);
+    let b = Env::for_vci(profile, vci_b);
+    // The resource is the same for both; the context decides. B creating first binds B.
+    assert_eq!(create_with(&b, &profile_resource()), creates(1));
+    assert_eq!(create_with(&a, &profile_resource()), creates(0));
+    // Another VCI's context still binds only its own end, once.
+    let mut a = a;
+    a.links.insert(CLL, BoundLink::new(0, false));
+    assert_eq!(
+        create_with(&a, &profile_resource()),
+        Err(GuardRefusal::LinkCount)
+    );
+    let mut b = b;
+    b.links.insert(CLL, BoundLink::new(1, false));
+    assert_eq!(
+        create_with(&b, &profile_resource()),
+        Err(GuardRefusal::LinkCount)
+    );
+    // A VCI the profile does not name gets no link.
+    other.label = Some("elsewhere".to_owned());
+    other.pname = Some("Another VCI".to_owned());
+    let stranger = Env::for_vci(a.profile.clone(), other);
+    assert!(create_with(&stranger, &profile_resource()).is_err());
+}
+
+#[test]
+fn both_channels_of_one_vci_stay_available_to_its_worker() {
+    // The two-channel loopback: one VCI, so one worker holds both ends.
+    let env = Env::new(loopback());
+    assert_eq!(create_channel(&env, "CAN_CH1"), creates(0));
+    assert_eq!(create_channel(&env, "CAN_CH2"), creates(1));
 }
 
 #[test]

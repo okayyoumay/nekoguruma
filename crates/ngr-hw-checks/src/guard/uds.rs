@@ -79,15 +79,27 @@ pub(super) fn read_only(
     }
 }
 
-/// A tester-present message set as a ComParam (`CP_TesterPresentMessage`): the class's rule for
-/// a request. T0 sends no ECU-addressed message.
+/// A tester-present message set as a ComParam (`CP_TesterPresentMessage`): on T2 and T3 a
+/// TesterPresent request only, since the worker repeats it. T0 sends no ECU-addressed message.
 pub(super) fn check_tester_present(class: Class, message: &[u8]) -> Result<(), GuardRefusal> {
     match class {
         Class::T0 => Err(GuardRefusal::Frame(
             "T0 sends no ECU-addressed request, so it has no tester-present message",
         )),
         Class::T1 => Ok(()),
-        Class::T2 | Class::T3 => read_only(class, message, message.len()).map(|_| ()),
+        // The worker sends the message cyclically, so only a TesterPresent request is allowed:
+        // anything else (session control included) would repeat with no session grant.
+        Class::T2 | Class::T3 => {
+            read_only(class, message, message.len())?;
+            match message {
+                [0x3E, ..] => Ok(()),
+                _ => Err(GuardRefusal::Request {
+                    class,
+                    sid: message[0],
+                    sub: message.get(1).map(|b| b & 0x7F),
+                }),
+            }
+        }
     }
 }
 

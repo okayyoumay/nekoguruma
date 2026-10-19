@@ -50,7 +50,17 @@ present.
    the physical request and response identifiers, the functional identifier if the profile has
    one, the CAN ID formats when the width or addressing is not 11-bit normal, the address byte
    when the addressing has one, the filler when the profile pads, and every `[link.comparams]`
-   entry. ComParam rules are an allow-list over canonical names. A name (or the name a learned id
+   entry. Both workers replace the response table with the one a request carries, so a
+   `SetUniqueRespIdTable` must itself carry every pinned ComParam a table can hold, each at the
+   profile's value, the entries taken together: the physical request id, format and address, and
+   the USDT response id, format and address, as far as the profile needs them (the UNIQUE_ID
+   class of ISO 22900-2 (2022) Annex B; the functional request ComParams are of the COM class and
+   the J2534 worker reads them from the ComParam set, so they are set with `SetComParam`, not
+   required in the table). An empty or partial table is refused, also after a complete one.
+   The guard does not track a replacement; it refuses a table that would leave the link short.
+   `Context` names the profile VCI its worker fronts, and a link is created only for an endpoint
+   on that VCI, so on a T0 loopback of two VCIs each worker's context binds its own end whatever
+   the order of creation (two channels of one VCI are both that VCI's). ComParam rules are an allow-list over canonical names. A name (or the name a learned id
    stands for) is first reduced to its canonical form: ASCII case folded and the aliases
    `j2534-0404-service` accepts for one ComParam resolved (`DATA_RATE` is `CP_Baudrate`, and so on),
    so a rule cannot be skipped by another spelling; `iso22900-service` resolves names in the
@@ -63,8 +73,9 @@ present.
    id width and addressing (bits of Table B.13 and B.14, verified against ISO 22900-2 (2022);
    the same bits `j2534-0404-service` decodes), the address and filler ComParams must agree with
    the profile's address and padding, the request and tester-present address modes may be
-   functional only with a functional identifier, a tester-present message is judged as a UDS
-   request by the class list, and a ComParam the profile's `[link.comparams]` fixes keeps the
+   functional only with a functional identifier, a tester-present message (which the worker sends cyclically) is
+   a TesterPresent request (`3E 00` or `3E 80`) on T2 and T3, nothing else, session control
+   included; T1 passes it and T0 refuses it, and a ComParam the profile's `[link.comparams]` fixes keeps the
    profile's value. A ComParam no rule covers passes only if it is on the short list of protocol
    and timing ComParams (session timing, ISO 15765-2 frame timing and flow control, response
    pending handling, tester-present timing; ISO 22900-2 (2022) Annex B) or the profile sets it.

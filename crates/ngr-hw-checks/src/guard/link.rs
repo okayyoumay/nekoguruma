@@ -503,6 +503,25 @@ pub(super) fn check_param(
     Ok(required(link).contains(&lower).then_some(lower))
 }
 
+/// The pinned ComParams a response table holds: those of the UNIQUE_ID class that
+/// `required` lists (ISO 22900-2 (2022) Annex B: the physical request and the USDT response id,
+/// format and address). The functional request ComParams are of the COM class, set with
+/// `SetComParam`, and the J2534 worker reads them from the ComParam set, not from the table.
+pub(super) fn table_required(link: &Link) -> Vec<String> {
+    const IN_TABLE: [&str; 6] = [
+        "cp_canphysreqid",
+        "cp_canphysreqformat",
+        "cp_canphysreqextaddr",
+        "cp_canrespusdtid",
+        "cp_canrespusdtformat",
+        "cp_canrespusdtextaddr",
+    ];
+    required(link)
+        .into_iter()
+        .filter(|name| IN_TABLE.contains(&name.as_str()))
+        .collect()
+}
+
 /// The canonical names of the ComParams the profile pins, which must all be set to the
 /// profile's value before the link is connected: the baud rate, the physical request and
 /// response identifiers, the functional identifier if the profile has one, the CAN ID formats

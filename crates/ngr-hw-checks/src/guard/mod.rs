@@ -34,7 +34,7 @@ use vci_service_interface::{
     subscribe_event_request,
 };
 
-use crate::profile::{Class, Link, Profile, Setup};
+use crate::profile::{Class, Link, Profile, Setup, Vci};
 
 mod ioctl;
 mod link;
@@ -178,8 +178,12 @@ pub struct Learned {
 #[derive(Debug, Clone, Copy)]
 pub struct Context<'a> {
     pub profile: &'a Profile,
-    /// The handle of the one module the check opened.
+    /// The handle of the one module the check opened on this worker.
     pub module: u32,
+    /// The profile's VCI this worker fronts. A link is created only for an endpoint on this VCI,
+    /// so on a T0 loopback of two VCIs, each worker's context binds its own end only, whatever
+    /// the order the links are created in. Two channels of one VCI are both this VCI's.
+    pub vci: &'a Vci,
     pub links: &'a LinkTable,
     pub learned: &'a Learned,
 }
@@ -319,6 +323,19 @@ pub fn decide(ctx: &Context<'_>, request: &Request<'_>) -> Result<Grant, GuardRe
             }
             names.sort();
             names.dedup();
+            // Both workers replace the table with this one, so it must hold every identifier
+            // ComParam a table can hold (the UNIQUE_ID class), each at the profile's value:
+            // an empty or partial table would leave the link without what a set recorded.
+            let missing: Vec<String> = link::table_required(link)
+                .into_iter()
+                .filter(|name| !names.contains(name))
+                .collect();
+            if !missing.is_empty() {
+                return Err(GuardRefusal::LinkSetup(format!(
+                    "the response table replaces the old one and must carry the profile's {}",
+                    missing.join(", ")
+                )));
+            }
             Ok(sets(r.cll_handle, names))
         }
         Request::StartComPrimitive(r) => {
@@ -394,11 +411,18 @@ impl<'a> Context<'a> {
     /// of a VCI (SAE J2534-2 clause 7).
     fn worker_endpoints(&self) -> Vec<(usize, &'a Link, Option<&'a str>)> {
         match &self.profile.setup {
-            Setup::Link { link, .. } => vec![(0, link, None)],
+            Setup::Link { vci, link } if vci.identifies_same_module(self.vci) => {
+                vec![(0, link, None)]
+            }
+            Setup::Link { .. } => Vec::new(),
             Setup::Loopback(ends) => ends
                 .iter()
                 .enumerate()
-                .filter(|(_, e)| e.vci.is_some())
+                .filter(|(_, e)| {
+                    e.vci
+                        .as_ref()
+                        .is_some_and(|v| v.identifies_same_module(self.vci))
+                })
                 .map(|(i, e)| (i, &e.link, e.channel.as_deref()))
                 .collect(),
         }

@@ -240,7 +240,15 @@ pub(super) fn start_com_primitive(
             if request.cop_data.is_empty() && cycles != 0 {
                 return Err(GuardRefusal::Undecodable("a send without a request"));
             }
-            sends(&request.cop_data)
+            let grant = sends(&request.cop_data)?;
+            // A repeated request would enter the session again after the harness returned the
+            // ECU to the default one, so only a one-shot one may enter another session.
+            if matches!(grant, Grant::EntersSession(_)) && !(0..=1).contains(&cycles) {
+                return Err(GuardRefusal::Frame(
+                    "a periodic or repeated DiagnosticSessionControl to a non-default session",
+                ));
+            }
+            Ok(grant)
         }
         // It would put back the ComParams the guard compared with the profile.
         Ok(ComOperationType::CoptRestoreParam) => Err(GuardRefusal::LinkSetup(

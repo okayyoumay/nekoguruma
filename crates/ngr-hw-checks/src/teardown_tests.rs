@@ -352,3 +352,15 @@ fn a_panicking_timeout_callback_fails_its_step_and_the_rest_run() {
     assert_eq!(failures[0].name, "bad timeout");
     assert!(failures[0].reason.contains("no timeout"), "{failures:?}");
 }
+
+/// A timeout of `Duration::MAX` (a step's own, or the teardown's) does not overflow the wait for
+/// the step.
+#[test]
+fn a_maximal_timeout_does_not_panic() {
+    let mut teardown = Teardown::new();
+    teardown.set_timeout(Duration::MAX);
+    teardown.register_async("default", async { Ok(()) });
+    teardown.register_async_with_timeout("own", Duration::MAX, async { Ok(()) });
+    teardown.register_async_with_timeout_fn("fn", || Duration::MAX, async { Ok(()) });
+    assert!(teardown.run().is_empty());
+}

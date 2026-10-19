@@ -124,7 +124,7 @@ present.
    security access, writes, routines, resets and the services that read memory by address
    (0x23) or periodically (0x2A) or change a dynamic identifier (0x2C) are not on it. The same
    rule applies to a request sent directly and to one repeated by a periodic primitive (a send
-   count above one, or -1). RawMode is a T0 tool: a RawMode link is refused on T1, T2 and T3, at creation. A worker passes
+   count above one, or -1). A periodic or repeated DiagnosticSessionControl to a non-default session is refused, since it would enter the session again after the harness returned the ECU to the default one. RawMode is a T0 tool: a RawMode link is refused on T1, T2 and T3, at creation. A worker passes
    RawMode data through, with the identifier chosen by the client and the bytes after the header
    read as the UDS payload, and a native ISO 15765 channel segments it itself, so bytes that look
    like a flow control frame can be a routine request on the wire (`31 01 FF 00` after the

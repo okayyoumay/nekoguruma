@@ -855,3 +855,167 @@ async fn a_return_to_the_default_session_by_the_check_clears_the_pending_one() {
     drop(run);
     server.shutdown().await;
 }
+
+/// A destroy abandoned in the middle of the return to the default session (its caller gave up)
+/// leaves the return pending: the teardown still sends `10 01`, after stopping the primitive the
+/// abandoned wait left running.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn an_abandoned_destroy_leaves_the_return_to_the_teardown() {
+    let server = TestServer::start().await;
+    let profile = t3();
+    let reports = Reports::new();
+    let mut run = RunGuard::start_in(&profile, "hw_guarded_handle", reports.dir());
+    let mut handle = GuardedHandle::attach(
+        &profile,
+        &vci(&profile),
+        server.worker_client().await,
+        module(),
+        HandleOptions {
+            request_timeout: std::time::Duration::from_secs(5),
+            response_timeout: Some(std::time::Duration::from_secs(30)),
+        },
+        &mut run,
+    )
+    .await
+    .expect("the handle opens the profile's link");
+    let [cll] = *handle.links() else {
+        panic!("one link");
+    };
+    let answer = |sub: u8| can_frame(0x7E8, &[0x50, sub, 0x00, 0x32, 0x01, 0xF4]);
+    server.backdoor.arm_write_rx_injection(
+        MOCK_CHANNEL_ID,
+        &answer(0x03),
+        j2534_0404::ISO15765,
+        50,
+    );
+    handle
+        .send_receive(cll, &[0x10, 0x03])
+        .await
+        .expect("the session starts");
+
+    // The ECU is silent and the caller gives up after a short while.
+    let abandoned = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        handle.destroy_com_logical_link(DestroyComLogicalLinkRequest {
+            cll_handle: Some(cll),
+        }),
+    )
+    .await;
+    assert!(abandoned.is_err(), "the destroy was still waiting");
+    assert_eq!(server.backdoor.write_msgs_count(), 2);
+    assert_eq!(handle.bound_links().len(), 1);
+
+    // The teardown returns the ECU after all.
+    drop(handle);
+    run.pass();
+    server.backdoor.arm_write_rx_injection(
+        MOCK_CHANNEL_ID,
+        &answer(0x01),
+        j2534_0404::ISO15765,
+        50,
+    );
+    assert!(run.run_teardown().is_empty());
+    assert_eq!(server.backdoor.write_msgs_count(), 3);
+    drop(run);
+    server.shutdown().await;
+}
+
+/// A transmit queue a check suspended is resumed by the teardown, before the session is returned.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn the_teardown_resumes_a_suspended_transmit_queue() {
+    let server = TestServer::start().await;
+    let profile = t3();
+    let reports = Reports::new();
+    let mut run = RunGuard::start_in(&profile, "hw_guarded_handle", reports.dir());
+    let mut handle = GuardedHandle::attach(
+        &profile,
+        &vci(&profile),
+        server.worker_client().await,
+        module(),
+        options(),
+        &mut run,
+    )
+    .await
+    .expect("the handle opens the profile's link");
+    let [cll] = *handle.links() else {
+        panic!("one link");
+    };
+    let suspend = handle
+        .get_object_id(vci_service_interface::GetObjectIdRequest {
+            object_type: vci_service_interface::ObjectType::ObjtIoCtrl as i32,
+            shortname: "PDU_IOCTL_SUSPEND_TX_QUEUE".to_owned(),
+        })
+        .await
+        .expect("the id")
+        .pdu_object_id;
+    let ioctl = |id: u32| vci_service_interface::IoCtlRequest {
+        handle: Some(vci_service_interface::io_ctl_request::Handle::CllHandle(
+            cll,
+        )),
+        io_ctrl_command: Some(
+            vci_service_interface::io_ctl_request::IoCtrlCommand::IoCtrlCommandId(id),
+        ),
+        input_data: None,
+        has_output: false,
+    };
+    handle
+        .io_ctl(ioctl(suspend))
+        .await
+        .expect("the queue is suspended");
+    drop(handle);
+    run.pass();
+    // The steps ran: the resume went through the guard and the worker accepted it, so none failed.
+    assert!(run.run_teardown().is_empty());
+    drop(run);
+    server.shutdown().await;
+}
+
+/// A session change the worker refuses (the link is not connected) leaves no return pending, so
+/// the link can be destroyed.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_refused_session_change_leaves_no_return_pending() {
+    let server = TestServer::start().await;
+    let profile = t3();
+    let reports = Reports::new();
+    let mut run = RunGuard::start_in(&profile, "hw_guarded_handle", reports.dir());
+    let mut handle = GuardedHandle::attach(
+        &profile,
+        &vci(&profile),
+        server.worker_client().await,
+        module(),
+        options(),
+        &mut run,
+    )
+    .await
+    .expect("the handle opens the profile's link");
+    let [cll] = *handle.links() else {
+        panic!("one link");
+    };
+    handle
+        .disconnect_com_logical_link(DisconnectComLogicalLinkRequest {
+            cll_handle: Some(cll),
+        })
+        .await
+        .expect("the link is disconnected");
+    let refused = handle.send_receive(cll, &[0x10, 0x03]).await;
+    assert!(
+        matches!(refused, Err(HandleError::Rpc { .. })),
+        "the worker refuses a primitive on a link that is not connected: {refused:?}"
+    );
+    handle
+        .destroy_com_logical_link(DestroyComLogicalLinkRequest {
+            cll_handle: Some(cll),
+        })
+        .await
+        .expect("nothing is pending");
+    assert_eq!(server.backdoor.write_msgs_count(), 0);
+    drop(handle);
+    run.pass();
+    assert!(run.run_teardown().is_empty());
+    assert_eq!(server.backdoor.write_msgs_count(), 0);
+    drop(run);
+    server.shutdown().await;
+}

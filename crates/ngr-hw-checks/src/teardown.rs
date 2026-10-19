@@ -143,39 +143,45 @@ impl Teardown {
     pub fn run(&mut self) -> Vec<StepFailure> {
         let mut failures = Vec::new();
         while let Some(step) = self.steps.pop() {
-            let result = match step.action {
-                Action::Sync(f) => match catch_unwind(AssertUnwindSafe(f)) {
-                    Ok(result) => result,
-                    Err(payload) => Err(format!("panicked: {}", panic_text(payload.as_ref()))),
-                },
-                Action::Async(future) => {
-                    // The step's timeout is read inside the same panic boundary as the step.
-                    let timeout = match &step.timeout {
-                        None => Ok(self.timeout),
-                        Some(timeout) => {
-                            catch_unwind(AssertUnwindSafe(timeout)).map_err(|payload| {
-                                format!("timeout panicked: {}", panic_text(payload.as_ref()))
-                            })
-                        }
-                    };
-                    match timeout {
-                        Ok(timeout) => run_async(future, timeout),
-                        Err(reason) => {
-                            // The step is not run; dropping it must not panic out either.
-                            let _ = catch_unwind(AssertUnwindSafe(|| drop(future)));
-                            Err(reason)
-                        }
-                    }
-                }
-            };
+            let name = step.name.clone();
+            let default = self.timeout;
+            // Nothing outside the step's own work may stop the steps after it: a panic anywhere
+            // in handling one step fails that step only.
+            let result = catch_unwind(AssertUnwindSafe(|| run_step(step, default))).unwrap_or_else(
+                |payload| Err(format!("panicked: {}", panic_text(payload.as_ref()))),
+            );
             if let Err(reason) = result {
-                failures.push(StepFailure {
-                    name: step.name,
-                    reason,
-                });
+                failures.push(StepFailure { name, reason });
             }
         }
         failures
+    }
+}
+
+/// Runs one step, with `default` as the timeout of an async step that has none of its own.
+fn run_step(step: Step, default: Duration) -> Result<(), String> {
+    match step.action {
+        Action::Sync(f) => match catch_unwind(AssertUnwindSafe(f)) {
+            Ok(result) => result,
+            Err(payload) => Err(format!("panicked: {}", panic_text(payload.as_ref()))),
+        },
+        Action::Async(future) => {
+            // The step's timeout is read inside the same panic boundary as the step.
+            let timeout = match &step.timeout {
+                None => Ok(default),
+                Some(timeout) => catch_unwind(AssertUnwindSafe(timeout)).map_err(|payload| {
+                    format!("timeout panicked: {}", panic_text(payload.as_ref()))
+                }),
+            };
+            match timeout {
+                Ok(timeout) => run_async(future, timeout),
+                Err(reason) => {
+                    // The step is not run; dropping it must not panic out either.
+                    let _ = catch_unwind(AssertUnwindSafe(|| drop(future)));
+                    Err(reason)
+                }
+            }
+        }
     }
 }
 
@@ -237,9 +243,13 @@ impl TeardownHandle<'_> {
 impl Drop for Teardown {
     /// Runs what is left. Never panics: a failure goes to stderr.
     fn drop(&mut self) {
-        let failures = catch_unwind(AssertUnwindSafe(|| self.run())).unwrap_or_default();
-        for failure in failures {
-            eprintln!("teardown step failed: {failure}");
+        // `run` is panic-safe per step; should anything still escape it, the steps left run on.
+        while !self.steps.is_empty() {
+            if let Ok(failures) = catch_unwind(AssertUnwindSafe(|| self.run())) {
+                for failure in failures {
+                    eprintln!("teardown step failed: {failure}");
+                }
+            }
         }
     }
 }
@@ -281,7 +291,7 @@ fn run_async(future: AsyncStep, timeout: Duration) -> Result<(), String> {
         return Err(format!("cannot start a thread: {e}"));
     }
     // A grace period beyond the step's own timer, for the step that cannot be interrupted.
-    match receiver.recv_timeout(timeout + Duration::from_millis(250)) {
+    match receiver.recv_timeout(timeout.saturating_add(Duration::from_millis(250))) {
         Ok(result) => result,
         Err(_) => Err(format!("timed out after {timeout:?}")),
     }

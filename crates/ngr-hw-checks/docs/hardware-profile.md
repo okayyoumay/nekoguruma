@@ -227,7 +227,9 @@ Anything it cannot classify is refused.
   not. T2 (until an authorized job exists) and T3 pass the read-only list: session
   control to the default or extended session, ReadDataByIdentifier, ReadDTCInformation with a
   defined report type, and TesterPresent with sub-function 0, each with its length rule. The
-  rule applies to direct requests, periodic ones and a `CP_TesterPresentMessage`. A raw-bound
+  rule applies to direct requests, periodic ones and a `CP_TesterPresentMessage`. A periodic or
+  repeated DiagnosticSessionControl to a non-default session is refused (it would enter the
+  session again after the harness returned the ECU to the default one). A raw-bound
   handle on T1, T2 or T3 is refused, not decoded. T0 raw frames also need the profile's flags.
 - **IO controls.** `PDU_IOCTL_READ_VBATT` and the queue, buffer and receive-filter housekeeping
   pass on every class. Every other IOCTL, including programming voltage, is refused on every
@@ -274,6 +276,16 @@ connection is served by the runtime.
   changes nothing (`response_ceiling` reports it). A read of
   one DID expects `62` and that DID; a read of several expects `62` only, since the ECU may
   return the records in any order.
+- **Abandoned waits and suspended queues.** A wait whose future is dropped (a check's own
+  `tokio::time::timeout`) leaves the primitive recorded; the next primitive on the link, the
+  return to the default session and the link's closing cancel it first. A return interrupted
+  that way stays pending. A suspended transmit queue (`PDU_IOCTL_SUSPEND_TX_QUEUE`) is resumed
+  by a teardown step, and before any return to the default session, since a suspended queue
+  would hold the `10 01` back. A session is marked pending only once the worker accepted the
+  session change (or its answer was lost), not when it refused it. The closing step of a link
+  has the time for its three requests. A response ceiling also adds the completion timeout of a
+  `0x21` / `0x23` re-request chain when its handling is on (the handle sets none, and the guard
+  refuses a check that does, so the worker's preset, off, stands).
 - **Links created by a check.** Whatever creates a link through the handle, including a link a
   check destroys and creates again, gets the same per-link set-up: the teardown step, the event
   stream and timings to wait by (the handle's defaults, 1 s, 5 s and 25 s, until the check sets

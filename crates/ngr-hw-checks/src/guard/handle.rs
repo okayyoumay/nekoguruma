@@ -59,8 +59,8 @@ use vci_service_interface::{
     PinData, ResourceData, ResourceIdsResponse, ResourceStatusResponse, SetComParamRequest,
     SetUniqueRespIdTableRequest, StartComPrimitiveRequest, StatusResponse, SubscribeEventRequest,
     TimestampResponse, UniqueRespIdTableItem, UniqueRespIdTableResponse, UnlockResourceRequest,
-    VersionResponse, create_com_logical_link_request, event_item, event_notification, param_item,
-    pin_data, resource_data, subscribe_event_request,
+    VersionResponse, create_com_logical_link_request, event_item, event_notification,
+    io_ctl_request, param_item, pin_data, resource_data, subscribe_event_request,
 };
 use worker_host::client::WorkerClient;
 use worker_host::service::Stopped;
@@ -190,6 +190,15 @@ struct State {
     session_back: BTreeSet<u32>,
     /// The response timings of each link, which decide how long a send-receive may take.
     timings: BTreeMap<u32, LinkTimings>,
+    /// Links whose return-to-default-session step is registered and has not started.
+    session_registered: BTreeSet<u32>,
+    /// The primitive being waited for on each link, while a wait is under way. A wait whose
+    /// future is dropped leaves its entry, and the next operation or the teardown cancels it.
+    inflight: BTreeMap<u32, ComPrimitiveHandle>,
+    /// The requests that resume the transmit queues a check suspended.
+    suspended: Vec<IoCtlRequest>,
+    /// The step that resumes them is registered and has not started.
+    resume_registered: bool,
 }
 
 /// The part of the handle the teardown steps share.
@@ -290,6 +299,8 @@ impl Shared {
                 state.closing.remove(cll);
                 state.session_back.remove(cll);
                 state.timings.remove(cll);
+                state.session_registered.remove(cll);
+                state.inflight.remove(cll);
             }
             Grant::Pass | Grant::CreatesLink { .. } | Grant::EntersSession(_) => {}
         }
@@ -367,11 +378,52 @@ impl Shared {
         expected: Option<Expectation>,
         cap: Option<Duration>,
     ) -> Result<Vec<u8>, HandleError> {
-        match self.read_outcome(cll, cop, expected, cap).await {
+        self.lock().inflight.insert(cll.cll_handle, cop);
+        let result = match self.read_outcome(cll, cop, expected, cap).await {
             Outcome::Ended(result) => result,
             Outcome::Running(error) => {
+                // A cancel that fails leaves the primitive recorded as running.
                 self.cancel(client, cop).await?;
                 Err(error)
+            }
+        };
+        let mut state = self.lock();
+        if state.inflight.get(&cll.cll_handle) == Some(&cop) {
+            state.inflight.remove(&cll.cll_handle);
+        }
+        drop(state);
+        result
+    }
+
+    /// Cancels the primitive a dropped wait left running on `cll`, if there is one.
+    async fn cancel_stale(
+        &self,
+        client: &mut WorkerClient,
+        cll: ComLogicalLinkHandle,
+    ) -> Result<(), HandleError> {
+        let stale = self.lock().inflight.get(&cll.cll_handle).copied();
+        if let Some(cop) = stale {
+            self.cancel(client, cop).await?;
+            self.lock().inflight.remove(&cll.cll_handle);
+        }
+        Ok(())
+    }
+
+    /// Resumes the transmit queues a check suspended, each through the guard. A suspended
+    /// queue would hold back the return to the default session.
+    async fn resume_queues(&self, client: &mut WorkerClient) -> Result<(), HandleError> {
+        loop {
+            let Some(request) = self.lock().suspended.pop() else {
+                return Ok(());
+            };
+            let sent = async {
+                self.admit(&Request::IoCtl(&request))?;
+                self.send("IoCtl", client.io_ctl(request.clone())).await
+            }
+            .await;
+            if let Err(error) = sent {
+                self.lock().suspended.push(request);
+                return Err(error);
             }
         }
     }
@@ -558,6 +610,15 @@ fn send_receive_request(cll: ComLogicalLinkHandle, data: &[u8]) -> StartComPrimi
     }
 }
 
+/// The time the step that closes a link is given: its cancel, disconnect and destroy requests, each
+/// bounded by `request_timeout`, and a margin; never less than the teardown's default.
+fn close_link_timeout(request_timeout: Duration) -> Duration {
+    request_timeout
+        .saturating_mul(3)
+        .saturating_add(Duration::from_secs(1))
+        .max(crate::teardown::DEFAULT_STEP_TIMEOUT)
+}
+
 /// The teardown step of a link: disconnects and destroys it, unless the check destroyed it.
 async fn close_link(
     shared: Arc<Shared>,
@@ -567,6 +628,9 @@ async fn close_link(
     if !shared.lock().closing.remove(&cll.cll_handle) {
         return Ok(());
     }
+    // A primitive a dropped wait left running is stopped first; the destroy below ends any that
+    // the cancel does not reach.
+    let _ = shared.cancel_stale(&mut client, cll).await;
     let disconnect = DisconnectComLogicalLinkRequest {
         cll_handle: Some(cll),
     };
@@ -620,11 +684,29 @@ async fn return_to_default_session(
 ) -> Result<(), String> {
     {
         let mut state = shared.lock();
+        state.session_registered.remove(&cll.cll_handle);
         if !state.session_back.remove(&cll.cll_handle) || !state.links.contains_key(&cll.cll_handle)
         {
             return Ok(());
         }
     }
+    // Still to be done unless this succeeds, however it ends, a dropped future included: a later
+    // run of the step (the teardown's, after a refused or abandoned destroy) tries again.
+    let mut pending = PendingSession {
+        shared: &shared,
+        cll,
+        done: false,
+    };
+    // What would hold the return back goes first: a primitive a dropped wait left running, a
+    // transmit queue a check suspended.
+    shared
+        .cancel_stale(&mut client, cll)
+        .await
+        .map_err(|e| e.to_string())?;
+    shared
+        .resume_queues(&mut client)
+        .await
+        .map_err(|e| e.to_string())?;
     // The link's response wait as it is now, active and staged timings alike.
     let wait = shared.wait_for(cll);
     // DiagnosticSessionControl to the default session (ISO 14229-1 (2026) 9.2).
@@ -647,12 +729,23 @@ async fn return_to_default_session(
             )),
         }
     });
-    if result.is_err() {
-        // Still to be done: a later run of the step (the teardown's, after a refused destroy)
-        // tries again.
-        shared.lock().session_back.insert(cll.cll_handle);
-    }
+    pending.done = result.is_ok();
     result
+}
+
+/// Puts a link's pending return to the default session back unless the return succeeded.
+struct PendingSession<'a> {
+    shared: &'a Shared,
+    cll: ComLogicalLinkHandle,
+    done: bool,
+}
+
+impl Drop for PendingSession<'_> {
+    fn drop(&mut self) {
+        if !self.done {
+            self.shared.lock().session_back.insert(self.cll.cll_handle);
+        }
+    }
 }
 
 /// The value of a ComParam the handle sets.
@@ -762,6 +855,14 @@ struct Timings {
     p2_max: u32,
     p2_star: u32,
     rc78_completion: u32,
+    /// The worker re-requests after a busy (0x21) or not-ready (0x23) answer, each within its own
+    /// completion timeout, when its handling is on (`CP_RC21Handling`, `CP_RC23Handling`). The
+    /// handle sets none of them, and the guard refuses a check that does, so these keep the
+    /// worker's preset (off) unless the guard's list is widened.
+    rc21_handling: u32,
+    rc21_completion: u32,
+    rc23_handling: u32,
+    rc23_completion: u32,
 }
 
 impl Default for Timings {
@@ -770,6 +871,10 @@ impl Default for Timings {
             p2_max: 1_000_000,
             p2_star: 5_000_000,
             rc78_completion: 25_000_000,
+            rc21_handling: 0,
+            rc21_completion: 0,
+            rc23_handling: 0,
+            rc23_completion: 0,
         }
     }
 }
@@ -790,6 +895,24 @@ impl Timings {
             p2_max: get("CP_P2Max", default.p2_max),
             p2_star: get("CP_P2Star", default.p2_star),
             rc78_completion: get("CP_RC78CompletionTimeout", default.rc78_completion),
+            rc21_handling: get("CP_RC21Handling", 0),
+            rc21_completion: get("CP_RC21CompletionTimeout", 0),
+            rc23_handling: get("CP_RC23Handling", 0),
+            rc23_completion: get("CP_RC23CompletionTimeout", 0),
+        }
+    }
+
+    /// Sets the timing the canonical ComParam `name` stands for (see [`TIMING_COMPARAMS`]).
+    fn set(&mut self, name: &str, value: u32) {
+        match name {
+            "cp_p2max" => self.p2_max = value,
+            "cp_p2star" => self.p2_star = value,
+            "cp_rc78completiontimeout" => self.rc78_completion = value,
+            "cp_rc21handling" => self.rc21_handling = value,
+            "cp_rc21completiontimeout" => self.rc21_completion = value,
+            "cp_rc23handling" => self.rc23_handling = value,
+            "cp_rc23completiontimeout" => self.rc23_completion = value,
+            _ => {}
         }
     }
 
@@ -813,6 +936,18 @@ impl Timings {
         micros(self.p2_max, Duration::from_millis(50))
             .saturating_add(micros(self.p2_star, Duration::from_secs(5)))
             .saturating_add(micros(self.rc78_completion, Duration::ZERO))
+            // A re-request chain keeps its own ceiling, anchored at its first occurrence; a zero
+            // completion timeout is the worker's 5 s.
+            .saturating_add(if self.rc21_handling != 0 {
+                micros(self.rc21_completion, Duration::from_secs(5))
+            } else {
+                Duration::ZERO
+            })
+            .saturating_add(if self.rc23_handling != 0 {
+                micros(self.rc23_completion, Duration::from_secs(5))
+            } else {
+                Duration::ZERO
+            })
             .saturating_add(Duration::from_secs(2))
     }
 }
@@ -833,6 +968,27 @@ impl LinkTimings {
 }
 
 /// The timing ComParam a `SetComParam` item sets, by name or learned id, and its value.
+/// The name of the IO control a request carries, by name or learned id.
+fn ioctl_name(request: &IoCtlRequest, learned: &Learned) -> Option<String> {
+    match request.io_ctrl_command.as_ref()? {
+        io_ctl_request::IoCtrlCommand::IoCtrlCommandName(name) => Some(name.clone()),
+        io_ctl_request::IoCtrlCommand::IoCtrlCommandId(id) => {
+            learned.objects.get(&(ObjectType::ObjtIoCtrl, *id)).cloned()
+        }
+    }
+}
+
+/// The ComParams that decide how long a primitive may run, by canonical name.
+const TIMING_COMPARAMS: [&str; 7] = [
+    "cp_p2max",
+    "cp_p2star",
+    "cp_rc78completiontimeout",
+    "cp_rc21handling",
+    "cp_rc21completiontimeout",
+    "cp_rc23handling",
+    "cp_rc23completiontimeout",
+];
+
 fn timing_change(item: &ParamItem, learned: &Learned) -> Option<(&'static str, u32)> {
     let name = match item.id.as_ref()? {
         param_item::Id::ParamName(name) => name.clone(),
@@ -844,7 +1000,7 @@ fn timing_change(item: &ParamItem, learned: &Learned) -> Option<(&'static str, u
     let Some(param_item::ParamData::Unum32(value)) = item.param_data else {
         return None;
     };
-    let name = ["cp_p2max", "cp_p2star", "cp_rc78completiontimeout"]
+    let name = TIMING_COMPARAMS
         .into_iter()
         .find(|known| *known == canonical(&name))?;
     Some((name, value))
@@ -1259,8 +1415,9 @@ impl<'r> GuardedHandle<'r> {
                     .insert(cll.cll_handle, BoundLink::new(endpoint, raw_mode));
                 state.closing.insert(cll.cll_handle);
             }
-            self.teardown.register_async(
+            self.teardown.register_async_with_timeout(
                 format!("close link {}", cll.cll_handle),
+                close_link_timeout(self.shared.options.request_timeout),
                 close_link(self.shared.clone(), self.client.clone(), cll),
             );
             // Whatever creates a link through the handle gets what a send-receive needs: its
@@ -1277,6 +1434,71 @@ impl<'r> GuardedHandle<'r> {
             self.subscribe(cll).await?;
         }
         Ok(response)
+    }
+
+    /// `IoCtl`, of the IO controls the guard lets through. A suspension of the transmit queue
+    /// registers its resumption with the run first, since a suspended queue holds back the
+    /// return to the default session.
+    pub async fn io_ctl(&mut self, request: IoCtlRequest) -> Result<IoCtlResponse, HandleError> {
+        self.shared.admit(&Request::IoCtl(&request))?;
+        let name = ioctl_name(&request, &self.shared.lock().learned);
+        let is = |wanted: &str| {
+            name.as_deref()
+                .is_some_and(|n| n.eq_ignore_ascii_case(wanted))
+        };
+        let suspends = is("PDU_IOCTL_SUSPEND_TX_QUEUE");
+        let resumes = is("PDU_IOCTL_RESUME_TX_QUEUE");
+        if suspends {
+            // The worker takes an IO control by its id only.
+            let resume_id = self
+                .get_object_id(GetObjectIdRequest {
+                    object_type: ObjectType::ObjtIoCtrl as i32,
+                    shortname: "PDU_IOCTL_RESUME_TX_QUEUE".to_owned(),
+                })
+                .await?
+                .pdu_object_id;
+            if resume_id == PDU_ID_UNDEF {
+                return Err(HandleError::Setup(
+                    "the worker cannot resume the transmit queue, so it is not suspended"
+                        .to_owned(),
+                ));
+            }
+            let resume = IoCtlRequest {
+                handle: request.handle,
+                io_ctrl_command: Some(io_ctl_request::IoCtrlCommand::IoCtrlCommandId(resume_id)),
+                input_data: None,
+                has_output: false,
+            };
+            let register = {
+                let mut state = self.shared.lock();
+                state.suspended.push(resume);
+                !std::mem::replace(&mut state.resume_registered, true)
+            };
+            if register {
+                let shared = self.shared.clone();
+                let mut client = self.client.clone();
+                self.teardown
+                    .register_async("resume the transmit queue", async move {
+                        shared.lock().resume_registered = false;
+                        shared
+                            .resume_queues(&mut client)
+                            .await
+                            .map_err(|e| e.to_string())
+                    });
+            }
+        }
+        let sent = self
+            .shared
+            .send("IoCtl", self.client.clone().io_ctl(request))
+            .await;
+        // A refused suspension suspended nothing; a lost answer may have.
+        if suspends && matches!(&sent, Err(e) if !matches!(e, HandleError::Timeout { .. })) {
+            self.shared.lock().suspended.pop();
+        }
+        if resumes && sent.is_ok() {
+            self.shared.lock().suspended.clear();
+        }
+        sent
     }
 
     /// `ConnectComLogicalLink`, which the guard allows once the profile's ComParams are set. A
@@ -1384,11 +1606,7 @@ impl<'r> GuardedHandle<'r> {
         if let Some((cll, (name, value))) = change
             && let Some(timings) = self.shared.lock().timings.get_mut(&cll.cll_handle)
         {
-            match name {
-                "cp_p2max" => timings.staged.p2_max = value,
-                "cp_p2star" => timings.staged.p2_star = value,
-                _ => timings.staged.rc78_completion = value,
-            }
+            timings.staged.set(name, value);
         }
         Ok(response)
     }
@@ -1421,13 +1639,23 @@ impl<'r> GuardedHandle<'r> {
     ) -> Result<ComPrimitiveResponse, HandleError> {
         let cll = request.cll_handle;
         let grant = self.shared.admit(&Request::StartComPrimitive(&request))?;
+        if let Some(cll) = cll {
+            // A primitive a dropped wait left running goes first.
+            self.shared
+                .cancel_stale(&mut self.client.clone(), cll)
+                .await?;
+        }
         // Stopping communication ends the tester present that keeps a session up.
         if request.cop_type == ComOperationType::CoptStopcomm as i32 {
             self.settle_session(cll, "taken out of communication")
                 .await?;
         }
-        if let (Grant::EntersSession(_), Some(cll)) = (&grant, cll)
-            && self.shared.lock().session_back.insert(cll.cll_handle)
+        let entering = match (&grant, cll) {
+            (Grant::EntersSession(_), Some(cll)) => Some(cll),
+            _ => None,
+        };
+        if let Some(cll) = entering
+            && self.shared.lock().session_registered.insert(cll.cll_handle)
         {
             // The step waits no longer than the link's response wait is when it runs, and has
             // the time for that (read at the same moment), so it ends by itself and cancels
@@ -1440,13 +1668,21 @@ impl<'r> GuardedHandle<'r> {
             );
         }
         let updates = request.cop_type == ComOperationType::CoptUpdateparam as i32;
-        let response = self
+        let sent = self
             .shared
             .send(
                 "StartComPrimitive",
                 self.client.clone().start_com_primitive(request),
             )
-            .await?;
+            .await;
+        // The ECU is in the session once the worker accepted the start, or may be when the
+        // answer was lost; not when the worker refused it (the link is not connected, say).
+        if let Some(cll) = entering
+            && matches!(sent, Ok(_) | Err(HandleError::Timeout { .. }))
+        {
+            self.shared.lock().session_back.insert(cll.cll_handle);
+        }
+        let response = sent?;
         // The staged timings are in effect once the update has finished successfully; until
         // then (and when it fails, which is returned) the longer of the two is waited for.
         if updates && let (Some(cll), Some(cop)) = (cll, response.cop_handle) {
@@ -1505,8 +1741,6 @@ impl<'r> GuardedHandle<'r> {
         cancel_com_primitive(CancelComPrimitive, CancelComPrimitiveRequest) -> vci_service_interface::Response = "CancelComPrimitive";
         /// `GetStatus`.
         get_status(GetStatus, GetStatusRequest) -> StatusResponse = "GetStatus";
-        /// `IoCtl`, of the IO controls the guard lets through.
-        io_ctl(IoCtl, IoCtlRequest) -> IoCtlResponse = "IoCtl";
         /// `GetUniqueRespIdTable`.
         get_unique_resp_id_table(GetUniqueRespIdTable, GetUniqueRespIdTableRequest) -> UniqueRespIdTableResponse = "GetUniqueRespIdTable";
     }
@@ -1854,6 +2088,45 @@ mod tests {
             done,
             Some(Outcome::Ended(Err(HandleError::PrimitiveFailed(c)))) if c == tx
         ));
+    }
+
+    #[test]
+    fn a_requested_chain_adds_its_completion_timeout_when_its_handling_is_on() {
+        let mut timings = Timings::default();
+        assert_eq!(timings.ceiling(), Duration::from_secs(33));
+        timings.set("cp_rc21handling", 1);
+        timings.set("cp_rc21completiontimeout", 1_300_000);
+        timings.set("cp_rc23handling", 2);
+        // A zero completion timeout is the worker's 5 s.
+        assert_eq!(
+            timings.ceiling(),
+            Duration::from_secs(33 + 1 + 5) + Duration::from_millis(300)
+        );
+        // With the handling off nothing is added.
+        timings.set("cp_rc21handling", 0);
+        timings.set("cp_rc23handling", 0);
+        assert_eq!(timings.ceiling(), Duration::from_secs(33));
+        let item = |name: &str| ParamItem {
+            id: Some(param_item::Id::ParamName(name.to_owned())),
+            param_data: Some(param_item::ParamData::Unum32(1)),
+            ..ParamItem::default()
+        };
+        assert_eq!(
+            timing_change(&item("CP_RC23Handling"), &Learned::default()),
+            Some(("cp_rc23handling", 1))
+        );
+    }
+
+    #[test]
+    fn the_close_step_has_time_for_its_requests() {
+        let request = Duration::from_secs(20);
+        assert!(close_link_timeout(request) > request * 3);
+        assert_eq!(
+            close_link_timeout(Duration::from_secs(1)),
+            crate::teardown::DEFAULT_STEP_TIMEOUT
+        );
+        // Saturating, not overflowing.
+        assert_eq!(close_link_timeout(Duration::MAX), Duration::MAX);
     }
 
     #[test]

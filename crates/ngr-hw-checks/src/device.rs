@@ -4,7 +4,8 @@
 //!
 //! The answers are those of the worker's `GetModuleIds` (each module's `vendor_module_name` and
 //! `vendor_additional_info`) and `GetVersion` (`VersionData`), and for J2534 the `modules` entries
-//! of the worker's configuration (ADR-281). Reading them from a worker is the harness's part.
+//! of the worker's configuration (ADR-281). [`crate::open::open_device`] reads them from a worker
+//! and applies the match.
 
 use crate::profile::{Api, Vci};
 

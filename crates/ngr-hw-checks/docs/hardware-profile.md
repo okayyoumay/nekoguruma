@@ -2,8 +2,8 @@
 
 `ngr-hw-checks` is the harness of the real-hardware checks (design 13.5, ADR-275). This page
 describes the hardware profile it reads, how a check declares what it needs, and how the two are
-compared, and how the device a worker reports is matched with the profile. The guarded VCI
-handle, opening the device through a worker and the report writer are not part of the crate yet.
+compared, how the device a worker reports is matched with the profile, and how the harness opens
+it. The guarded VCI handle and the report writer are not part of the crate yet.
 
 ## Running
 
@@ -120,6 +120,36 @@ or `label` (J2534) is blank is refused before anything is matched.
   three high bytes (ISO 22900-2 (2022) 10.1.4.15): `fw_version` and `pdu_api_sw_version` are
   compared as `major.minor.revision`, so a D-PDU profile writes `firmware_version = "2.1.0"`;
   any other form is refused when the profile is read.
+
+## Opening the device
+
+`ngr_hw_checks::open::open_device` is the harness's step from a profile's `[vci]` to an opened
+device (design 13.5, ADR-275 item 4). It takes the `Vci`, the workers directory
+(`WorkerLayout`), the operating mode and the launch options, and does the following in order:
+
+1. Starts the worker for the profile's `library` through the agent's launch path
+   (`agent::launch::launch_worker`), so the library is resolved, and the worker build chosen, as
+   in production (design 7.1, 7.3).
+2. Asks the worker for its modules (`GetModuleIds`), reads the `modules` entries of the worker's
+   configuration for J2534 (`vci-service-config`, the file the worker reads), and runs
+   `select_module`. A refusal here comes before anything is opened.
+3. Opens the selected module (`ModuleConnect`), reads `GetVersion` and runs `check_versions`.
+
+It returns an `OpenedDevice` only when both matches hold. On a refusal, or when a worker request
+fails, it disconnects the module if it was connected and stops the worker, and returns an
+`OpenError` (`Refused` wraps the `MatchRefusal`). It creates no link; a check creates links only
+on the returned device, and `OpenedDevice::close` disconnects the module and stops the worker.
+
+The J2534 worker lists every configured `modules` entry until it can be started with the
+profile's label (ADR-281 Decision item 3), so the harness starts it with the library name only,
+and a configuration with other entries than the profile's is refused (`SeveralConfigured`). The
+harness reads the configuration from its own process: it finds the file the way the worker does
+only when both builds use the same configuration root and `VCI_CONFIG_PATH`. A worker that
+ignores the file's settings (the launcher's writability check, design 7.2) reports its default
+entry, which does not carry the profile's label, so the match refuses it.
+
+Tests: `crates/iso22900-service/tests/hw_open.rs` and `crates/j2534-0404-service/tests/hw_open.rs`
+open the D-PDU API and J2534 mocks through a worker and show each refusal they can reach.
 
 ## Check declarations
 

@@ -52,7 +52,9 @@ present.
    when the addressing has one, the filler when the profile pads, and every `[link.comparams]`
    entry. Both workers replace the response table with the one a request carries, so a
    `SetUniqueRespIdTable` must itself carry every pinned ComParam a table can hold, each at the
-   profile's value, the entries taken together: the physical request id, format and address, and
+   profile's value, in exactly one entry (the link addresses one ECU, and the J2534 worker takes
+   the physical addressing from the first entry and pairs a response with its request only within
+   an entry): the physical request id, format and address, and
    the USDT response id, format and address, as far as the profile needs them (the UNIQUE_ID
    class of ISO 22900-2 (2022) Annex B; the functional request ComParams are of the COM class and
    the J2534 worker reads them from the ComParam set, so they are set with `SetComParam`, not

@@ -202,7 +202,8 @@ Anything it cannot classify is refused.
   profile's values, which the caller records from `SetsComParams` grants. A
   `SetUniqueRespIdTable` replaces the table on both workers, so it must carry the request and
   response identifiers (and the formats and address byte the link needs), each at the profile's
-  value; an empty or partial table is refused. The `Context` names the profile VCI its worker
+  value, in exactly one entry; an empty or partial table, or one with more than one entry, is
+  refused. The `Context` names the profile VCI its worker
   fronts, and a link is created only for an endpoint on it (on a T0 of two VCIs each worker's
   context binds its own end). `SetComParam` and the ComParams of `SetUniqueRespIdTable` keep the profile's values:
   `CP_Baudrate`, the identifiers, the CAN ID format (ISO 22900-2 (2022) Table B.13 and B.14), the

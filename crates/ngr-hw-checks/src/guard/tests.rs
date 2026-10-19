@@ -1083,25 +1083,47 @@ fn a_response_table_replaces_the_old_one_and_must_be_complete() {
     };
     assert!(why.contains("cp_canrespusdtid"), "{why}");
     assert!(set_table(&env, vec![unum("CP_CanRespUSDTId", 0x7E8)]).is_err());
-    // Several entries together may carry the identifiers.
-    let split = env.decide(Request::SetUniqueRespIdTable(
+    // The pairing must sit in one entry: split across two, or repeated in a second entry, it
+    // is refused, since the worker addresses from the first entry and pairs within one.
+    let two = |first: Vec<ParamItem>, second: Vec<ParamItem>| {
+        env.decide(Request::SetUniqueRespIdTable(
+            &SetUniqueRespIdTableRequest {
+                cll_handle: cll(),
+                unique_resp_id_table: Some(UniqueRespIdTableItem {
+                    unique_data: vec![
+                        EcuUniqueRespData {
+                            unique_resp_identifier: 1,
+                            params: first,
+                        },
+                        EcuUniqueRespData {
+                            unique_resp_identifier: 2,
+                            params: second,
+                        },
+                    ],
+                }),
+            },
+        ))
+    };
+    assert!(matches!(
+        two(
+            vec![unum("CP_CanPhysReqId", 0x7E0)],
+            vec![unum("CP_CanRespUSDTId", 0x7E8)]
+        ),
+        Err(GuardRefusal::LinkSetup(_))
+    ));
+    assert!(matches!(
+        two(complete(0x7E0, 0x7E8), complete(0x7E0, 0x7E8)),
+        Err(GuardRefusal::LinkSetup(_))
+    ));
+    let none = env.decide(Request::SetUniqueRespIdTable(
         &SetUniqueRespIdTableRequest {
             cll_handle: cll(),
             unique_resp_id_table: Some(UniqueRespIdTableItem {
-                unique_data: vec![
-                    EcuUniqueRespData {
-                        unique_resp_identifier: 1,
-                        params: vec![unum("CP_CanPhysReqId", 0x7E0)],
-                    },
-                    EcuUniqueRespData {
-                        unique_resp_identifier: 2,
-                        params: vec![unum("CP_CanRespUSDTId", 0x7E8)],
-                    },
-                ],
+                unique_data: vec![],
             }),
         },
     ));
-    assert!(split.is_ok());
+    assert!(matches!(none, Err(GuardRefusal::LinkSetup(_))));
     // A wrong value is refused as before.
     assert!(set_table(&env, complete(0x7E1, 0x7E8)).is_err());
 }

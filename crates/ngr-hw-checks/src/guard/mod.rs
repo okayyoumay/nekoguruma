@@ -315,11 +315,18 @@ pub fn decide(ctx: &Context<'_>, request: &Request<'_>) -> Result<Grant, GuardRe
                 .ok_or(GuardRefusal::Undecodable(
                     "SetUniqueRespIdTable without a table",
                 ))?;
+            // A profile's link addresses one ECU, and the J2534 worker takes the physical
+            // addressing from the first entry and pairs a response with its request only within
+            // one entry, so the table is exactly one entry holding the whole pairing.
+            let [entry] = table.unique_data.as_slice() else {
+                return Err(GuardRefusal::LinkSetup(format!(
+                    "the response table must have exactly one entry, the profile's ECU, not {}",
+                    table.unique_data.len()
+                )));
+            };
             let mut names = Vec::new();
-            for entry in &table.unique_data {
-                for item in &entry.params {
-                    names.extend(link::check_param(ctx, link, item)?);
-                }
+            for item in &entry.params {
+                names.extend(link::check_param(ctx, link, item)?);
             }
             names.sort();
             names.dedup();

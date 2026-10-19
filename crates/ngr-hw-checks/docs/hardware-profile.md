@@ -233,6 +233,55 @@ Anything it cannot classify is refused.
   pass on every class. Every other IOCTL, including programming voltage, is refused on every
   class, whatever the profile's `[[hardware-control]]` list says.
 
+## Guarded handle
+
+`ngr_hw_checks::guard::GuardedHandle` is what a check gets of the worker (design 13.5 "Guarded VCI
+access"); the check never holds the worker client. It owns the client and the state the decision
+rests on (the link table and the learned ids), and borrows the run's teardown, so a check drops
+the handle before it records its result on the `RunGuard`. A check runs on a multi-thread tokio
+runtime: a teardown step waits for its requests on a thread of its own while the worker's
+connection is served by the runtime.
+
+- **Opening.** `GuardedHandle::open(profile, vci, device, options, run)` takes the `OpenedDevice`
+  of `open_device`; `attach` takes a client and an already connected module of a worker the caller
+  hosts (the closing is then the module disconnect only). Both register the device's closing with
+  the run first, then create the profile's links: per endpoint on this VCI, `GetResourceIds` and
+  `CreateComLogicalLink` (RawMode on T0 only), every ComParam the guard requires with the profile's
+  value (the identifiers, formats and address of the physical request and the USDT response in the
+  response table's one entry, the rest with `SetComParam`; the tester-present message is `3E 80`
+  and both address modes are physical), the agent's timing and response-pending defaults
+  (P2 1 s, P2* 5 s, 0x78 handling, completion limit 25 s) unless the profile pins one, then
+  `ConnectComLogicalLink` and a subscription to the link's events. Each request is decided like a
+  check's own. A profile the handle cannot plan (no value for a pinned name) fails before the link
+  is created.
+- **Calls.** One method per RPC a check can use, each asking `decide` first. A refusal is
+  `HandleError::Refused`, and nothing reaches the worker. `ModuleConnect`, `ModuleDisconnect`,
+  `SubscribeEvent` and `GetEventItem` are not offered: the harness owns the device and the event
+  stream, which `send_receive(cll, request)` reads (it returns the final response, a negative one
+  included, or `NoResponse`).
+- **State.** A `GetResourceIds` answer records the resource each id stands for and a `GetObjectId`
+  answer the name of the id, into the learned ids. The `cll_handle` of a granted
+  `CreateComLogicalLink` is bound to its endpoint, a granted `SetComParam` or
+  `SetUniqueRespIdTable` marks its pinned ComParams as set once the worker accepted it, and a
+  granted `DestroyComLogicalLink` drops the link.
+- **Teardown.** The steps are registered as the resources are acquired and run in reverse: the
+  device's closing, then each link's disconnect and destroy (skipped when the check destroyed it),
+  then, per link, one return to the default session (`10 01`, itself decided) registered before a
+  request that enters another session is sent. Power: the handle registers nothing for the
+  profile's power commands. A check that switches power registers the power-off step itself before
+  it switches power on.
+- **RawMode form.** On a T0 link the data of a send is the literal frame the worker passes on.
+  `j2534-0404-service` transmits `cop_data` unchanged as `PassThruMessage.Data`: the CAN identifier
+  in four bytes, most significant first; the address byte next when the `ISO15765_ADDR_TYPE` flag is
+  set (the guard requires the flag to equal the profile's addressing); then the payload. The
+  link is a hardware ISO 15765 channel (a software ISO-TP link refuses RawMode), which segments
+  the payload itself, so the payload holds no ISO 15765-2 (2024) protocol control information.
+  `iso22900-service` forwards `cop_data` and the TxFlags to the D-PDU library untouched, and the
+  form is the library's (ISO 22900-2 (2022) D.2.1, Table D.4 gives the identifier in four bytes);
+  it has no test of a RawMode send against a library. This is the header the guard compares on
+  T0 (the sending end's request identifier and, under extended or mixed addressing, its address
+  byte); the payload is not read.
+
 ## Teardown
 
 `ngr_hw_checks::teardown::Teardown` holds the steps a check registers as it acquires a resource

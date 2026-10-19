@@ -272,7 +272,9 @@ fn payload(
                 ));
             }
             // The whole header, as the worker passes it on: the 4-byte identifier, then the
-            // address byte under extended or mixed addressing, then the payload.
+            // address byte under extended or mixed addressing, then the payload. That is the
+            // literal frame data of both workers; the payload is UDS data that the ISO 15765
+            // channel segments, so it holds no transport PCI, and it is not read here.
             let id = frame_id(data)?;
             if id != link.request_id {
                 return Err(GuardRefusal::Frame(

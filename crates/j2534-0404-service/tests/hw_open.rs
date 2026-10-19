@@ -17,8 +17,10 @@
 use std::path::Path;
 
 use ngr_hw_checks::device::MatchRefusal;
+use ngr_hw_checks::guard::{GuardRefusal, GuardedHandle, HandleError, HandleOptions};
 use ngr_hw_checks::open::{OpenError, open_device};
 use ngr_hw_checks::profile::{Api, Vci};
+use ngr_hw_checks::report::RunGuard;
 use serial_test::serial;
 use worker_host::service::{LaunchOptions, OperatingMode, Stopped, WorkerLayout};
 
@@ -49,9 +51,15 @@ fn vci(label: &str, pname: &str, firmware: &str, library: &str) -> Vci {
     }
 }
 
-/// Opens `vci` against the mock with `modules` configured as `(label, pname)` entries; `Ok` holds
-/// the device already closed, with how its worker ended.
-async fn open(vci: &Vci, modules: &[(&str, &str)]) -> Result<Stopped, OpenError> {
+/// A worker layout and configuration for the mock with `modules` configured as `(label, pname)`
+/// entries, in a temporary directory that lives as long as the value.
+struct Environment {
+    _temp: tempfile::TempDir,
+    workers: WorkerLayout,
+    abi: worker_host::abi::Abi,
+}
+
+fn environment(modules: &[(&str, &str)]) -> Environment {
     let temp = tempfile::tempdir().expect("temporary directory");
     let root = temp.path();
     let library = j2534_0404_mock::mock_library_path().expect("the mock cdylib should be built");
@@ -79,14 +87,25 @@ async fn open(vci: &Vci, modules: &[(&str, &str)]) -> Result<Stopped, OpenError>
         std::env::set_var("VCI_CONFIG_PATH", &config_path);
         std::env::remove_var("VCI_SERVICE_INSECURE_NO_AUTH");
     }
+    Environment {
+        _temp: temp,
+        workers,
+        abi,
+    }
+}
+
+/// Opens `vci` against the mock with `modules` configured as `(label, pname)` entries; `Ok` holds
+/// the device already closed, with how its worker ended.
+async fn open(vci: &Vci, modules: &[(&str, &str)]) -> Result<Stopped, OpenError> {
+    let env = environment(modules);
     let device = open_device(
         vci,
-        &workers,
+        &env.workers,
         OperatingMode::User,
         &LaunchOptions::default(),
     )
     .await?;
-    assert_eq!(device.abi(), abi);
+    assert_eq!(device.abi(), env.abi);
     assert_eq!(device.module().name, "Bench 1");
     assert_eq!(device.module().additional_info, LIBRARY_NAME);
     assert_eq!(device.version().hw_name, "1.0.0");
@@ -179,4 +198,72 @@ async fn a_different_library_version_is_refused_after_opening() {
             profile: "2.0.0".to_owned()
         }
     );
+}
+
+/// The guarded handle on a device the harness opened through a worker process: the profile's link
+/// is created and connected through the guard, a request reaches the worker (the mock answers
+/// no request), a state-changing request is refused before it does, and the teardown closes the
+/// link and the device, so the worker exits by itself.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_handle_opens_a_t3_profile_on_an_opened_device_and_closes_it() {
+    let env = environment(&[ENTRY]);
+    let profile = ngr_hw_checks::profile::parse(
+        "class = \"T3\"\n[vci]\napi = \"j2534-0404\"\nlibrary = \"mock-lib\"\n\
+         module = \"description only\"\nlabel = \"Bench 1\"\npname = \"J2534-2:mock\"\n\
+         firmware_version = \"1.0.0\"\nlibrary_version = \"1.0.0\"\n\
+         [link]\nprotocol = \"ISO_14229_3_on_ISO_15765_2\"\nbaud_rate = 500000\n\
+         pins = [6, 14]\nrequest_id = 0x7E0\nresponse_id = 0x7E8\nid_bits = 11\n\
+         addressing = \"normal\"\n",
+    )
+    .expect("a T3 profile");
+    let ngr_hw_checks::profile::Setup::Link { vci, .. } = &profile.setup else {
+        panic!("a one-link profile");
+    };
+    let device = open_device(
+        vci,
+        &env.workers,
+        OperatingMode::User,
+        &LaunchOptions::default(),
+    )
+    .await
+    .expect("the mock matches the profile");
+
+    let reports = tempfile::tempdir().expect("temporary directory");
+    let mut run = RunGuard::start_in(&profile, "hw_open", reports.path().join("reports"));
+    let mut handle = GuardedHandle::open(
+        &profile,
+        vci,
+        device,
+        HandleOptions {
+            request_timeout: std::time::Duration::from_secs(5),
+            response_timeout: std::time::Duration::from_secs(1),
+        },
+        &mut run,
+    )
+    .await
+    .expect("the handle creates and connects the profile's link");
+    let [cll] = *handle.links() else {
+        panic!("one link");
+    };
+
+    // The read reaches the worker; the mock has no ECU behind it.
+    let silent = handle.send_receive(cll, &[0x22, 0xF1, 0x90]).await;
+    assert_eq!(silent, Err(HandleError::NoResponse));
+    let refused = handle.send_receive(cll, &[0x2E, 0xF1, 0x90, 0x00]).await;
+    assert!(
+        matches!(
+            refused,
+            Err(HandleError::Refused {
+                refusal: GuardRefusal::Request { sid: 0x2E, .. },
+                ..
+            })
+        ),
+        "{refused:?}"
+    );
+
+    drop(handle);
+    run.pass();
+    // The link and the device are closed, and the worker has exited.
+    assert!(run.run_teardown().is_empty());
 }

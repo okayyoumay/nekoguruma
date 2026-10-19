@@ -14,8 +14,11 @@
 //!   per-class lists
 //! - [`ioctl`]: the IOCTLs that pass and the hardware controls that never do here
 //!
-//! The seam that routes the agent's job runner and a direct check through [`decide`] is not part
-//! of this module.
+//! - [`GuardedHandle`]: the handle a direct check gets in place of a worker client. It passes every
+//!   request through [`decide`], keeps the link table and the learned ids, opens the profile's links
+//!   and registers the teardown steps.
+//!
+//! The seam that routes the agent's job runner through [`decide`] is not part of this module.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -36,9 +39,12 @@ use vci_service_interface::{
 
 use crate::profile::{Class, Link, Profile, Setup, Vci};
 
+mod handle;
 mod ioctl;
 mod link;
 mod uds;
+
+pub use handle::{GuardedHandle, HandleError, HandleOptions};
 
 /// A worker request, one variant per RPC of `service VciService` in `service.proto`. [`decide`]
 /// matches it without a catch-all arm, so an RPC added to the service does not compile until it

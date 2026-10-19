@@ -83,6 +83,10 @@
 //!   `ModuleConnect` over N configured entries, `pname` reaching `PassThruOpen`,
 //!   single-open-device reject-on-switch, and `modules = []` startup failure
 //!   (ADR-106)
+//! - [`guarded_handle`] — the real-hardware check harness's guarded VCI handle
+//!   (`ngr_hw_checks::guard::GuardedHandle`, design 13.5, ADR-333) on this service: opening a T3
+//!   profile's link, reading a DID, a refused write, the teardown after a panic, and the
+//!   RawMode frame a T0 link transmits
 //! - [`concat`] — `CP_EnableConcatenation` multi-segment response merging on
 //!   the KWP/J1850 family (ISO 22900-2:2022 Table B.11; see ADR-148)
 //! - [`fd_can`] — SAE J2534-2 clause 21 CAN FD's connect-time protocol
@@ -163,6 +167,7 @@ mod fd_iso15765;
 mod flow_control_filters;
 mod ft_can;
 mod gm_uart;
+mod guarded_handle;
 mod honda_diagh;
 mod j1708;
 mod j1850_autodetect;

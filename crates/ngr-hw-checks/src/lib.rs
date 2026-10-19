@@ -4,8 +4,9 @@
 //! - [`device`]: the module match, whether the device a worker reports is the profile's
 //! - [`open`]: starting the profile's worker, running the module match and opening the device
 //! - [`report`]: the report of a run, written to a directory only the running user can read
-//! - [`guard`]: the decision core of the guarded VCI handle, one pure function over the profile,
-//!   the bound links and a worker request (ADR-333)
+//! - [`guard`]: the decision core, one pure function over the profile, the bound links and a worker
+//!   request, and [`guard::GuardedHandle`], the handle a check gets in place of a worker client
+//!   (ADR-333)
 //! - [`teardown`]: the steps a run registers as it acquires resources and runs in reverse, once
 //! - [`CheckDecl`]: what a check needs, as static data the harness reads without running it
 //! - [`permits`] and [`listing`]: which checks a profile permits

@@ -190,14 +190,25 @@ Alternatives rejected:
 - A check that needs a service or IO control outside the lists must extend them by a reviewed
   change to the guard (and, for a state-changing service on T2, wait for the authorized-job path
   that design 13.5 describes). Nothing in a profile widens them.
-- The decision is not the whole handle. The seam that routes direct checks and the agent's job
-  runner through `decide`, keeps the link table, records learned ids and registers teardown
-  steps for grants is separate work. Until it exists, nothing enforces the decision on a live
-  worker.
-- RawMode is refused on T1, T2 and T3 until the seam settles, against the workers, what a raw
-  payload sends: `j2534-0404-service` passes it through unchanged, so the form (with or without
-  transport PCI) depends on the worker. Checks on those classes use ordinary links, whose UDS the
-  guard sees. Only then can raw frames be classified there.
+- The guarded handle (`guard::GuardedHandle`) uses the decision: it keeps the link table and the
+  learned ids, passes every call of a check through `decide`, binds and unbinds links on the
+  grants, and registers the teardown steps (the device, each link, the return to the default
+  session before a session-entering request is sent). The seam that routes the agent's job runner
+  through `decide` is separate work; until it exists, a job the agent runs is not mediated.
+- The handle creates the profile's links itself, through the guard, with every ComParam
+  `required()` lists at the profile's value (the table's identifiers, formats and address in the
+  one-entry response table, the rest with `SetComParam`), because the agent's own link setup does
+  not set them. Power is not registered by the handle: a check that switches power registers its
+  off step first.
+- RawMode is refused on T1, T2 and T3: the frame form is settled against the workers, but a
+  worker passes the data through, the identifier is the client's and the bytes after the header
+  are UDS data, so on those classes the guard would need a frame decoder. On T0 the form is the
+  literal frame: `j2534-0404-service` transmits `cop_data` unchanged as the message data (the
+  CAN identifier in four bytes, the address byte when the `ISO15765_ADDR_TYPE` flag is set, then
+  the payload), and the hardware ISO 15765 channel it requires for RawMode segments the payload,
+  so the payload carries no ISO 15765-2 (2024) protocol control information. `iso22900-service`
+  forwards the data and flags to the D-PDU library, which defines the form (ISO 22900-2 (2022)
+  D.2.1). The T0 check (identifier, then the address byte, content unread) matches both.
 - `SetUniqueRespIdTable` entries are judged by their ComParams only. The
   `unique_resp_identifier` of an entry is the D-PDU unique response identifier, a tag the client
   assigns and that expected-response data refers to; it carries no CAN identifier, so it is not

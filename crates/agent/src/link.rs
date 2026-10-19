@@ -444,15 +444,21 @@ async fn open_module<C: WorkerApi>(
 /// `CreateComLogicalLink` is sent.
 const NO_RESOURCE: &str = "no resource for the protocol";
 
-/// Whether a failed `CreateComLogicalLink` created nothing: the worker (or the guard in front of
-/// it, as `PermissionDenied`) refused the request, or there was no resource to create it on. A
-/// timeout, any other status, or a create that answered without a link handle does not say.
+/// Whether a failed `create_link` created nothing: it failed in `GetResourceIds`, before any
+/// `CreateComLogicalLink` was sent, or the worker (or the guard in front of it, as
+/// `PermissionDenied`) refused the create. A timeout or any other status of the create, or a
+/// create that answered without a link handle, does not say.
 fn nothing_created(error: &HostError) -> bool {
     use tonic::Code::{
         AlreadyExists, FailedPrecondition, InvalidArgument, NotFound, PermissionDenied,
         ResourceExhausted, Unauthenticated, Unimplemented,
     };
     match error {
+        HostError::Rpc {
+            rpc: "GetResourceIds",
+            ..
+        }
+        | HostError::WorkerUnresponsive("GetResourceIds") => true,
         HostError::Rpc { status, .. } => matches!(
             status.code(),
             PermissionDenied
@@ -757,6 +763,17 @@ mod tests {
             rpc: "CreateComLogicalLink",
             status: Box::new(tonic::Status::unavailable("gone")),
         }));
+        assert!(!nothing_created(&HostError::WorkerUnresponsive(
+            "CreateComLogicalLink"
+        )));
+        // The resource lookup comes before the create, so any failure of it left no link.
+        assert!(nothing_created(&HostError::Rpc {
+            rpc: "GetResourceIds",
+            status: Box::new(tonic::Status::unavailable("gone")),
+        }));
+        assert!(nothing_created(&HostError::WorkerUnresponsive(
+            "GetResourceIds"
+        )));
     }
 
     /// The example ECU's protocol: UDS over ISO 15765 at 500 kbit/s on 7E0 / 7E8.

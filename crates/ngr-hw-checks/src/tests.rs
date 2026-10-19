@@ -599,3 +599,16 @@ CP_STmin_Tx = 1",
     // Distinct ComParams still parse.
     parse(&with("CP_BSTx = 1\nCP_STminTx = 2\nCP_P2Max = 3")).unwrap();
 }
+
+#[test]
+fn an_alias_of_a_physical_comparam_is_refused_like_its_name() {
+    for name in ["CP_Bit_Sample_Point", "CP_Network_Line", "CP_NodeAddress"] {
+        let text = t1("").replacen("CP_STmin = 0", &format!("{name} = 1"), 1);
+        match parse(&text) {
+            Err(ProfileError::Invalid(message)) => {
+                assert!(message.contains("physical-layer"), "{name}: {message}")
+            }
+            other => panic!("{name}: {other:?}"),
+        }
+    }
+}

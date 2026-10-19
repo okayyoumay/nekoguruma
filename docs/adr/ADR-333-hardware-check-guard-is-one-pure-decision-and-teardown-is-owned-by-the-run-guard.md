@@ -49,8 +49,10 @@ present.
    worker accepted the request) and refuses `ConnectComLogicalLink` until all are: the baud rate,
    the physical request and response identifiers, the functional identifier if the profile has
    one, the CAN ID formats when the width or addressing is not 11-bit normal, the address byte
-   when the addressing has one, the filler when the profile pads, and every `[link.comparams]`
-   entry. Both workers replace the response table with the one a request carries, so a
+   when the addressing has one, the filler handling on every link (the J2534 preset pads, so an
+   unpadded profile sets it to 0; a padded one sets it to 1 and sets the filler byte), and every
+   `[link.comparams]` entry. The format ComParams' padding bits (Table B.13, bits 5 and 4) cannot
+   contradict the pinned handling: an overwrite against the profile's padding is refused. Both workers replace the response table with the one a request carries, so a
    `SetUniqueRespIdTable` must itself carry every pinned ComParam a table can hold, each at the
    profile's value, in exactly one entry (the link addresses one ECU, and the J2534 worker takes
    the physical addressing from the first entry and pairs a response with its request only within
@@ -82,7 +84,9 @@ present.
    profile's value. A ComParam no rule covers passes only if it is on the short list of protocol
    and timing ComParams (session timing, ISO 15765-2 frame timing and flow control, response
    pending handling, tester-present timing; ISO 22900-2 (2022) Annex B) or the profile sets it.
-   Unknown, vendor and other physical-layer names are refused. The profile check refuses two
+   Unknown, vendor and other physical-layer names are refused. The profile check compares
+   physical-layer names canonically too, so an alias such as `CP_Bit_Sample_Point` is refused
+   like `CP_BitSamplePoint`. The profile check refuses two
    `[link.comparams]` keys of one canonical name (an alias or another case), whatever their
    values, so the profile has one value per ComParam; the alias table is shared by the profile
    check and the guard (`comparam`). `COPT_RESTORE_PARAM` is refused on
@@ -107,7 +111,10 @@ present.
    never decoded, so no frame decoder exists. On T0 a raw frame passes only to the sending
    endpoint's request identifier, with the profile's flags (`TX_FLAG_CAN_29BIT_ID`,
    `ISO15765_ADDR_TYPE`) and a raw TxFlag of four bytes with named bits only; its content is not
-   read. T1 passes raw frames undecoded. The agent's list is kept apart on
+   read. T1 passes raw frames undecoded. On every class and link mode, TxFlags that would
+   override the profile are refused: frame padding when the profile has none (the J2534 worker
+   turns padding on from the flag, apart from the ComParam), the 29-bit flag on 11-bit
+   identifiers, and the extended addressing flag on normal addressing. The agent's list is kept apart on
    purpose: it is narrower (no session, no tester present) because a production job owns no
    session, while a T3 check may; the guard's list also looks at sub-function and length. The
    crate documents the relation next to its list; it does not reuse `policy`, so a change to the

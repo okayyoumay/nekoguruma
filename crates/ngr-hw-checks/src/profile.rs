@@ -580,9 +580,11 @@ fn check_link(link: &Link) -> Result<(), ProfileError> {
         }
     }
     if let Some(name) = link.comparams.keys().find(|name| {
+        // By canonical name, so an alias of a physical ComParam is refused like its name.
+        let canonical = crate::comparam::canonical(name);
         PHYSICAL_COMPARAMS
             .iter()
-            .any(|p| p.eq_ignore_ascii_case(name))
+            .any(|p| crate::comparam::canonical(p) == canonical)
     }) {
         return Err(invalid(format!(
             "the ComParam {name:?} is physical-layer; the `link`'s own keys give it"

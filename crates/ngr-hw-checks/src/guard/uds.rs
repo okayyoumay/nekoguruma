@@ -162,6 +162,29 @@ fn flags_agree(flags: [u8; 4], link: &Link) -> Result<(), GuardRefusal> {
     Ok(())
 }
 
+/// TxFlag bits that would override what the profile says, whatever the link's mode: frame
+/// padding when the profile has none (the J2534 worker turns padding on from the flag, apart
+/// from the ComParam), the 29-bit identifier flag on an 11-bit profile and the extended
+/// addressing flag on normal addressing. A flag that is not set overrides nothing here.
+fn flags_override(flags: [u8; 4], link: &Link) -> Result<(), GuardRefusal> {
+    if flags[3] & 0x40 != 0 && link.padding.is_none() {
+        return Err(GuardRefusal::Frame(
+            "the ISO15765_FRAME_PAD flag asks for padding the profile does not have",
+        ));
+    }
+    if flags[2] & 0x01 != 0 && link.id_bits != 29 {
+        return Err(GuardRefusal::Frame(
+            "the CAN_29BIT_ID flag on a profile with 11-bit identifiers",
+        ));
+    }
+    if flags[3] & 0x80 != 0 && link.addressing == Addressing::Normal {
+        return Err(GuardRefusal::Frame(
+            "the ISO15765_ADDR_TYPE flag on a profile with normal addressing",
+        ));
+    }
+    Ok(())
+}
+
 /// StartComPrimitive on a bound link.
 pub(super) fn start_com_primitive(
     ctx: &Context<'_>,
@@ -170,10 +193,15 @@ pub(super) fn start_com_primitive(
     request: &StartComPrimitiveRequest,
 ) -> Result<Grant, GuardRefusal> {
     let sends = |data: &[u8]| {
+        let flags = match &request.cop_ctrl_data {
+            Some(ctrl) => tx_flag_bytes(ctrl)?,
+            None => [0; 4],
+        };
+        flags_override(flags, link)?;
         if data.is_empty() {
             Ok(Grant::Pass)
         } else {
-            payload(ctx.profile.class, bound, link, request, data)
+            payload(ctx.profile.class, bound, link, flags, data)
         }
     };
     match ComOperationType::try_from(request.cop_type) {
@@ -213,13 +241,9 @@ fn payload(
     class: Class,
     bound: &BoundLink,
     link: &Link,
-    request: &StartComPrimitiveRequest,
+    flags: [u8; 4],
     data: &[u8],
 ) -> Result<Grant, GuardRefusal> {
-    let flags = match &request.cop_ctrl_data {
-        Some(ctrl) => tx_flag_bytes(ctrl)?,
-        None => [0; 4],
-    };
     match class {
         Class::T0 => {
             if !bound.raw_mode {

@@ -339,7 +339,7 @@ pub(super) fn check_param(
         "cp_baudrate" => equals(link.baud_rate)?,
         _ if PHYSICAL_COMPARAMS
             .iter()
-            .any(|p| p.eq_ignore_ascii_case(&lower))
+            .any(|p| crate::comparam::canonical(p) == lower)
             || item.com_param_class == PduParamClass::PduPcBustype as i32 =>
         {
             return Err(wrong(
@@ -452,7 +452,8 @@ pub(super) fn table_required(link: &Link) -> Vec<String> {
 /// profile's value before the link is connected: the baud rate, the physical request and
 /// response identifiers, the functional identifier if the profile has one, the CAN ID formats
 /// when the width or addressing is not 11-bit normal, the address byte when the addressing has
-/// one, the filler when the profile pads, and every `[link.comparams]` entry. The worker's own
+/// one, the filler handling on every link (and the filler byte when the profile pads), and every
+/// `[link.comparams]` entry. The worker's own
 /// defaults are not the profile's.
 pub(super) fn required(link: &Link) -> Vec<String> {
     let mut names = vec!["cp_baudrate", "cp_canphysreqid", "cp_canrespusdtid"];
@@ -473,8 +474,14 @@ pub(super) fn required(link: &Link) -> Vec<String> {
             names.push("cp_canfuncreqextaddr");
         }
     }
+    // The worker's preset pads (filler handling on, filler byte 0x55), so the handling is set
+    // on every link: to 1 with the profile's filler byte, or to 0 when the profile has no
+    // padding. The format ComParams' padding bits (Table B.13, bits 5 and 4) cannot disagree:
+    // `format_matches` refuses an overwrite that contradicts the profile's padding, and the
+    // default format leaves it to the handling.
+    names.push("cp_canfillerbytehandling");
     if link.padding.is_some() {
-        names.extend(["cp_canfillerbyte", "cp_canfillerbytehandling"]);
+        names.push("cp_canfillerbyte");
     }
     let mut names: Vec<String> = names.into_iter().map(str::to_owned).collect();
     names.extend(link.comparams.keys().map(|key| canonical(key)));

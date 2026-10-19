@@ -1001,6 +1001,14 @@ fn a_link_connects_only_once_the_profiles_comparams_are_set() {
     assert!(why.contains("cp_canfuncreqid"), "{why}");
     let grant = set(&env, unum("CP_CanFuncReqId", 0x7DF));
     apply(&mut env, grant);
+    // The worker's preset pads, so an unpadded profile has to switch the padding off.
+    let Err(GuardRefusal::LinkSetup(why)) = connect(&env) else {
+        panic!("connect should be refused");
+    };
+    assert!(why.contains("cp_canfillerbytehandling"), "{why}");
+    assert!(set(&env, unum("CP_CanFillerByteHandling", 1)).is_err());
+    let grant = set(&env, unum("CP_CanFillerByteHandling", 0));
+    apply(&mut env, grant);
     assert_eq!(connect(&env), Ok(Grant::Pass));
 
     // A value changed to another than the profile's is refused at SetComParam anyway, and a
@@ -1053,7 +1061,12 @@ fn the_connect_check_requires_what_the_profile_pins() {
     };
     assert_eq!(
         link::required(link),
-        ["cp_baudrate", "cp_canphysreqid", "cp_canrespusdtid"]
+        [
+            "cp_baudrate",
+            "cp_canfillerbytehandling",
+            "cp_canphysreqid",
+            "cp_canrespusdtid"
+        ]
     );
 }
 
@@ -1231,6 +1244,61 @@ fn both_channels_of_one_vci_stay_available_to_its_worker() {
     let env = Env::new(loopback());
     assert_eq!(create_channel(&env, "CAN_CH1"), creates(0));
     assert_eq!(create_channel(&env, "CAN_CH2"), creates(1));
+}
+
+#[test]
+fn frame_padding_flags_follow_the_profiles_padding() {
+    let read = [0x22, 0xF1, 0x90];
+    let named = || flag_bits(&[TxFlagBit::TxFlagIso15765FramePad]);
+    let raw = || com_primitive_ctrl_data::TxFlag::TxFlagRaw(vec![0, 0, 0, 0x40]);
+    let unpadded = Env::linked(profile("T3"), false);
+    let padded = Env::linked(
+        profile_with(
+            "T3",
+            &L {
+                padding: Some(0x55),
+                ..L::default()
+            },
+        ),
+        false,
+    );
+    let send_with = |env: &Env, flag: Option<com_primitive_ctrl_data::TxFlag>| {
+        let request = match flag {
+            Some(flag) => start_flags(&read, flag),
+            None => start(ComOperationType::CoptSendrecv, &read, 1),
+        };
+        env.decide(Request::StartComPrimitive(&request))
+    };
+    // Without the flag a read passes; with it, on a profile that does not pad, it is refused.
+    assert!(send_with(&unpadded, None).is_ok());
+    assert!(matches!(
+        send_with(&unpadded, Some(named())),
+        Err(GuardRefusal::Frame(_))
+    ));
+    assert!(matches!(
+        send_with(&unpadded, Some(raw())),
+        Err(GuardRefusal::Frame(_))
+    ));
+    // On a padded profile it passes.
+    assert!(send_with(&padded, Some(named())).is_ok());
+    assert!(send_with(&padded, Some(raw())).is_ok());
+    // The other flags that would override the profile, on a link that is not RawMode.
+    let wide = flag_bits(&[TxFlagBit::TxFlagCan29bitId]);
+    let addressed = flag_bits(&[TxFlagBit::TxFlagIso15765AddrType]);
+    assert!(send_with(&unpadded, Some(wide)).is_err());
+    assert!(send_with(&unpadded, Some(addressed)).is_err());
+    // Every class with a profile link, a receive-only primitive too.
+    for class in ["T1", "T2"] {
+        let env = Env::linked(profile(class), false);
+        assert!(send_with(&env, Some(named())).is_err(), "{class}");
+    }
+    let mut receive = start_flags(&[], named());
+    receive.cop_ctrl_data.as_mut().unwrap().num_send_cycles = 0;
+    assert!(
+        unpadded
+            .decide(Request::StartComPrimitive(&receive))
+            .is_err()
+    );
 }
 
 #[test]

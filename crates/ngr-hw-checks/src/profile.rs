@@ -409,7 +409,7 @@ const PINS: std::ops::RangeInclusive<u8> = 1..=16;
 /// Annex B.3.2), by the names of `j2534-0404-service`'s `BUSTYPE_UNUM32` and `BUSTYPE_BYTES`
 /// (`crates/j2534-0404-service/src/service/comparam_support.rs`), which this list mirrors in
 /// full; a name added there belongs here too. Compared ignoring ASCII case.
-const PHYSICAL_COMPARAMS: &[&str] = &[
+pub(crate) const PHYSICAL_COMPARAMS: &[&str] = &[
     "CP_Baudrate",
     "CP_BitSamplePoint",
     "CP_BitSamplePoint_Ecu",

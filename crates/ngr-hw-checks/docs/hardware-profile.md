@@ -3,7 +3,9 @@
 `ngr-hw-checks` is the harness of the real-hardware checks (design 13.5, ADR-275). This page
 describes the hardware profile it reads, how a check declares what it needs, and how the two are
 compared, how the device a worker reports is matched with the profile, and how the harness opens
-it, and how a run's report is written. The guarded VCI handle is not part of the crate yet.
+it, how a run's report is written, and what the guard decides about each worker request and how a
+run's teardown works (ADR-333). The seam that routes a check's, or the agent's, worker calls
+through the guard is not part of the crate yet.
 
 ## Running
 
@@ -62,7 +64,7 @@ does not take. A T3 profile can add nothing.
 
 | Key | Meaning |
 |---|---|
-| `protocol` | The protocol name, such as `"ISO15765"` |
+| `protocol` | The ISO 22900-2 (2022) protocol short name the link's resource is created by, as the agent sends it: `"ISO_14229_3_on_ISO_15765_2"` for UDS on CAN. The guard compares it with the resource of a `CreateComLogicalLink` ignoring ASCII case and has no alias table |
 | `baud_rate` | Bits per second |
 | `pins` | The two connector pins (1 to 16; SAE J2534-1 6.8 lists their use), CAN high first |
 | `request_id`, `response_id`, `functional_id` | The physical request and response identifiers, and optionally the functional one; all different |
@@ -177,6 +179,46 @@ not a pass (`finish` with failed or refused) fails as a test as well, whether or
 check then sends is limited by the guarded handle (design 13.5 "Guarded VCI access"): a T2 write
 passes only inside an authorized job, and T3's other limits (no DTC clearing, resets, security
 access or session beyond the extended one) are the class's lists, not declared operations.
+
+## Guard
+
+`ngr_hw_checks::guard::decide` is the decision core of the guarded VCI handle (design 13.5
+"Guarded VCI access", ADR-275 item 4, ADR-333). It is a pure function of the profile, the links
+the harness has bound, the ids it has learned from the worker's `GetResourceIds` and `GetObjectId`
+answers, and one request (`guard::Request`, one variant per RPC of `service VciService`). It
+returns a `Grant` (`Pass`, `CreatesLink`, `DestroysLink`, `EntersSession`) or a `GuardRefusal`.
+Anything it cannot classify is refused.
+
+- **Link setup.** `ModuleConnect` is refused (the harness opens the device). A link is created
+  only from the profile link's protocol, the bus type the agent uses
+  (`ISO_11898_2_DWCAN`) and exactly its two pins (the first of `pins` as `HI`, the second as
+  `LOW`), by resource data or by a learned resource id; a resource by name, or an id not learned,
+  is refused. A create flag may carry RawMode only. One link per profile endpoint (T0: one per
+  end). `SetComParam` and the ComParams of `SetUniqueRespIdTable` keep the profile's values:
+  `CP_Baudrate`, the identifiers, the CAN ID format (ISO 22900-2 (2022) Table B.13 and B.14), the
+  address byte and the padding; other physical-layer ComParams are refused; functional
+  addressing needs a `functional_id`; a `[link.comparams]` entry keeps its value; timing and
+  the rest pass. `COPT_RESTORE_PARAM` is refused.
+- **Requests.** T1 passes every request. T0 passes only raw frames to the sending end's own
+  `request_id`. T2 (until an authorized job exists) and T3 pass the read-only list: session
+  control to the default or extended session, ReadDataByIdentifier, ReadDTCInformation with a
+  defined report type, and TesterPresent with sub-function 0, each with its length rule. The
+  rule applies to direct requests, periodic ones, a `CP_TesterPresentMessage` and the request
+  inside a raw frame (identifier, address byte and flags must agree with the profile; single and
+  first frames are decoded, flow control passes, consecutive frames are refused).
+- **IO controls.** `PDU_IOCTL_READ_VBATT` and the queue, buffer and receive-filter housekeeping
+  pass on every class. Every other IOCTL, including programming voltage, is refused on every
+  class, whatever the profile's `[[hardware-control]]` list says.
+
+## Teardown
+
+`ngr_hw_checks::teardown::Teardown` holds the steps a check registers as it acquires a resource
+(power, device, link): `register` for a closure, `register_async` for a future. `run` executes
+them in reverse, each at most once, each under `catch_unwind`; a failing or panicking step does
+not stop the others. An async step runs on a scoped thread with its own runtime and a timeout
+(`set_timeout`; 30 s by default), so it can be run from inside a runtime. A `RunGuard` owns one
+(`RunGuard::teardown()`), runs it when dropped, also while a check panics, and turns a failed
+step into a failed check even if the check recorded a pass.
 
 ## Reports
 

@@ -58,12 +58,13 @@ pub(super) fn create(
             "a T0 link is created in RawMode: T0 exchanges raw frames between its endpoints only",
         ));
     }
-    // A worker passes RawMode data through to the device, and a native ISO 15765 channel
-    // segments it itself, so the guard cannot tell what a raw payload sends (ADR-333 item 3).
-    if raw_mode && matches!(ctx.profile.class, Class::T2 | Class::T3) {
+    // RawMode is a T0 tool. A worker passes RawMode data through to the device, with the
+    // identifier chosen by the client and the bytes after the header read as the UDS payload, so
+    // the guard cannot classify a raw payload (ADR-333 item 3).
+    if raw_mode && ctx.profile.class != Class::T0 {
         return Err(refuse(
-            "a RawMode link is refused on T2 and T3: the worker passes its data through, so \
-             the request it carries cannot be classified",
+            "a RawMode link is refused outside T0: the worker passes its data through, so the \
+             identifier and the request it carries cannot be classified",
         ));
     }
 

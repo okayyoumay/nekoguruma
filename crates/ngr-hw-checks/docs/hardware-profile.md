@@ -194,8 +194,8 @@ Anything it cannot classify is refused.
   only from the profile link's protocol, the bus type the agent uses
   (`ISO_11898_2_DWCAN`) and exactly its two pins (the first of `pins` as `HI`, the second as
   `LOW`), by resource data or by a learned resource id; a resource by name, or an id not learned,
-  is refused. A create flag may carry RawMode only, and RawMode only on T0 and T1 (a worker
-  passes raw data through, so the guard cannot classify it). One link per profile endpoint (T0: one per
+  is refused. A create flag may carry RawMode only, and RawMode only on T0 (a worker passes raw
+  data through, so on any other class the guard cannot classify its identifier or payload). One link per profile endpoint (T0: one per
   VCI end, created for the end whose `channel` the resource's protocol name is, or else whose
   `protocol` it is; a SocketCAN end has no worker link). `ConnectComLogicalLink` is refused until
   the pinned ComParams (baud rate, request, response and functional identifiers, formats and
@@ -219,14 +219,14 @@ Anything it cannot classify is refused.
   resolved, the request's class field ignored): a ComParam no rule covers passes only when it is
   a listed protocol or timing ComParam (P2, P2*, ISO 15765-2 timing and flow control, response
   pending, tester-present timing) or the profile sets it, and every other name is refused. `COPT_RESTORE_PARAM` is refused.
-- **Requests.** T1 passes every request. T0 creates RawMode links only, passes only raw frames to the sending end's own
-  `request_id` and refuses `COPT_STARTCOMM`/`COPT_STOPCOMM` (no communication to start). On a
+- **Requests.** T1 passes every request. T0 creates RawMode links only, passes only raw frames with the sending end's own
+  `request_id` and, under extended or mixed addressing, its `address` as the fifth byte and refuses `COPT_STARTCOMM`/`COPT_STOPCOMM` (no communication to start). On a
   RawMode link the 29-bit, addressing and padding flags must each equal the profile's, set or
   not. T2 (until an authorized job exists) and T3 pass the read-only list: session
   control to the default or extended session, ReadDataByIdentifier, ReadDTCInformation with a
   defined report type, and TesterPresent with sub-function 0, each with its length rule. The
   rule applies to direct requests, periodic ones and a `CP_TesterPresentMessage`. A raw-bound
-  handle on T2 or T3 is refused, not decoded. T0 raw frames also need the profile's flags.
+  handle on T1, T2 or T3 is refused, not decoded. T0 raw frames also need the profile's flags.
 - **IO controls.** `PDU_IOCTL_READ_VBATT` and the queue, buffer and receive-filter housekeeping
   pass on every class. Every other IOCTL, including programming voltage, is refused on every
   class, whatever the profile's `[[hardware-control]]` list says.

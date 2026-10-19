@@ -2,12 +2,12 @@
 //! the lists each class holds it to (design 13.5 "Guarded VCI access", second and third bullet;
 //! ADR-333 item 3).
 //!
-//! - T0 sends no ECU-addressed request: only raw frames to the sending endpoint's own request
-//!   identifier pass, and their content is not read.
-//! - T1 passes every request (the ECU is simulated); the frame is not decoded.
+//! - T0 sends no ECU-addressed request: only raw frames pass, with the sending endpoint's own
+//!   request identifier and address byte (the whole header), and their content is not read.
+//! - T1 passes every request (the ECU is simulated), on ordinary links only.
 //! - T2 and T3 pass only [`read_only`] requests. Until an authorized job exists (design 13.5
-//!   "Writes on a real ECU"), T2 is held to the T3 list. A RawMode link is refused on both
-//!   (`link::create`), since a worker passes raw data through and a native ISO 15765 channel
+//!   "Writes on a real ECU"), T2 is held to the T3 list. A RawMode link is refused on T1, T2
+//!   and T3 (`link::create`), since a worker passes raw data through and a native ISO 15765 channel
 //!   segments it itself, so the guard cannot tell what a raw payload sends; no frame decoder
 //!   exists here.
 //!
@@ -271,28 +271,39 @@ fn payload(
                     "T0 sends no ECU-addressed request; only raw frames between the endpoints",
                 ));
             }
+            // The whole header, as the worker passes it on: the 4-byte identifier, then the
+            // address byte under extended or mixed addressing, then the payload.
             let id = frame_id(data)?;
             if id != link.request_id {
                 return Err(GuardRefusal::Frame(
                     "T0 frames go only to the sending endpoint's request identifier",
                 ));
             }
+            if link.addressing != Addressing::Normal {
+                match (data.get(4), link.address) {
+                    (Some(&ae), Some(address)) if ae == address => {}
+                    (None, _) => {
+                        return Err(GuardRefusal::Frame("a raw frame shorter than its header"));
+                    }
+                    _ => {
+                        return Err(GuardRefusal::Frame(
+                            "the address byte is not the endpoint's profile address",
+                        ));
+                    }
+                }
+            }
             Ok(Grant::Pass)
         }
+        // Not reachable through `create`, which refuses a RawMode link outside T0; a raw link
+        // found in the context anyway is refused, never decoded.
+        Class::T1 | Class::T2 | Class::T3 if bound.raw_mode => Err(GuardRefusal::Frame(
+            "a RawMode link outside T0: its data is passed through and cannot be classified",
+        )),
         // The ECU is simulated; its requests are not read.
-        Class::T1 => Ok(if bound.raw_mode {
-            Grant::Pass
-        } else {
-            granted(data)
-        }),
-        Class::T2 | Class::T3 if !bound.raw_mode => {
+        Class::T1 => Ok(granted(data)),
+        Class::T2 | Class::T3 => {
             read_only(class, data, data.len()).map(|s| s.map_or(Grant::Pass, Grant::EntersSession))
         }
-        // Not reachable through `create`, which refuses a RawMode link on these classes; a raw
-        // link found in the context anyway is refused, never decoded.
-        Class::T2 | Class::T3 => Err(GuardRefusal::Frame(
-            "a RawMode link on T2 or T3: its data is passed through and cannot be classified",
-        )),
     }
 }
 

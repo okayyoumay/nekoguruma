@@ -38,8 +38,8 @@ present.
    the profile link's protocol (ASCII case ignored, no alias table), the dual-wire CAN bus type
    `ISO_11898_2_DWCAN` the agent uses, and exactly two pins: the profile's first pin as `HI` and
    its second as `LOW` (ISO 22900-2 (2022) Annex B). A resource by name is refused. The create
-   flag may carry RawMode (D.2.3) and nothing else, and RawMode only on T0 and T1: on T2 and T3
-   a RawMode link is refused (item 3). On T0 a link is created in RawMode and in no other
+   flag may carry RawMode (D.2.3) and nothing else, and RawMode only on T0: on T1, T2 and
+   T3 a RawMode link is refused (item 3). On T0 a link is created in RawMode and in no other
    way: T0 exchanges raw frames only, and a protocol link would let the J2534 preset arm a cyclic
    tester-present frame. There is one link per profile endpoint: one,
    or two for T0, and a link is created for the endpoint whose own identity the resource names:
@@ -116,17 +116,21 @@ present.
    security access, writes, routines, resets and the services that read memory by address
    (0x23) or periodically (0x2A) or change a dynamic identifier (0x2C) are not on it. The same
    rule applies to a request sent directly and to one repeated by a periodic primitive (a send
-   count above one, or -1). A RawMode link is refused on T2 and T3, at creation: a worker passes
-   RawMode data through, and a native ISO 15765 channel segments it itself, so bytes that look
+   count above one, or -1). RawMode is a T0 tool: a RawMode link is refused on T1, T2 and T3, at creation. A worker passes
+   RawMode data through, with the identifier chosen by the client and the bytes after the header
+   read as the UDS payload, and a native ISO 15765 channel segments it itself, so bytes that look
    like a flow control frame can be a routine request on the wire (`31 01 FF 00` after the
-   identifier). A raw-bound handle that appears in the context on T2 or T3 anyway is refused,
+   identifier), and on T1 it would reach any identifier and could enter a session unseen. A
+   raw-bound handle that appears in the context on T1, T2 or T3 anyway is refused,
    never decoded, so no frame decoder exists. On T0 a raw frame passes only to the sending
-   endpoint's request identifier and its content is not read; T0 has no communication to start,
-   so `COPT_STARTCOMM` and `COPT_STOPCOMM` are refused there. On a RawMode link (T0, T1) the worker
+   endpoint's complete header: its request identifier, and under extended or mixed addressing its
+   profile address byte as the fifth byte, with a payload long enough to hold it. Its content
+   is not read; T0 has no communication to start,
+   so `COPT_STARTCOMM` and `COPT_STOPCOMM` are refused there. On a RawMode link (T0 only) the worker
    takes the frame's format from the flags alone, so the three wire-format flags
    (`TX_FLAG_CAN_29BIT_ID`, `ISO15765_ADDR_TYPE`, `ISO15765_FRAME_PAD`) must each equal the
    profile's, set or not, as named bits or as a raw TxFlag of four bytes with named bits only. T1
-   passes raw frames otherwise undecoded. On every class and link mode, TxFlags that would
+   passes ordinary requests undecoded. On every class and link mode, TxFlags that would
    override the profile are refused: frame padding when the profile has none (the J2534 worker
    turns padding on from the flag, apart from the ComParam), the 29-bit flag on 11-bit
    identifiers, and the extended addressing flag on normal addressing. The agent's list is kept apart on
@@ -180,10 +184,10 @@ Alternatives rejected:
   runner through `decide`, keeps the link table, records learned ids and registers teardown
   steps for grants is separate work. Until it exists, nothing enforces the decision on a live
   worker.
-- RawMode is refused on T2 and T3 until the seam settles, against the workers, what a raw
+- RawMode is refused on T1, T2 and T3 until the seam settles, against the workers, what a raw
   payload sends: `j2534-0404-service` passes it through unchanged, so the form (with or without
-  transport PCI) depends on the worker. Checks on those classes use ordinary links and
-  requests. Only then can raw frames be classified there.
+  transport PCI) depends on the worker. Checks on those classes use ordinary links, whose UDS the
+  guard sees. Only then can raw frames be classified there.
 - `SetUniqueRespIdTable` entries are judged by their ComParams only. The
   `unique_resp_identifier` of an entry is the D-PDU unique response identifier, a tag the client
   assigns and that expected-response data refers to; it carries no CAN identifier, so it is not

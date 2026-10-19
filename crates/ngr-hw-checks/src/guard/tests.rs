@@ -411,8 +411,9 @@ fn an_unlearned_pin_type_id_is_refused_and_a_learned_one_compares_by_name() {
 
 #[test]
 fn only_the_raw_mode_create_flag_is_allowed() {
-    let env = Env::new(profile("T1"));
-    let mut request = create_request(create::Resource::RscData(profile_resource()));
+    // RawMode exists on T0 only.
+    let env = Env::new(loopback());
+    let mut request = create_request(create::Resource::RscData(channel_resource("CAN_CH1")));
     let with = |request: &mut CreateComLogicalLinkRequest, flag| {
         request.cll_create_flag = Some(flag);
         env.decide(Request::CreateComLogicalLink(request))
@@ -1313,17 +1314,30 @@ fn t0_has_raw_links_only_and_nothing_to_start() {
 
 #[test]
 fn raw_frame_flags_must_equal_the_profile_in_both_directions() {
-    let l = L {
+    // RawMode exists on T0: a 29-bit, extended, padded loopback.
+    let l = |request, response| L {
         id_bits: 29,
-        request: 0x18DA_10F1,
-        response: 0x18DA_F110,
+        request,
+        response,
         functional: None,
         addressing: "extended",
         address: Some(0x42),
         padding: Some(0x55),
         ..L::default()
     };
-    let env = Env::linked(profile_with("T1", &l), true);
+    let end = |channel: &str, request, response| {
+        format!(
+            "[[endpoint]]\nchannel = \"{channel}\"\n[endpoint.vci]\n{VCI}\n[endpoint.link]\n{}",
+            link_toml(&l(request, response))
+        )
+    };
+    let wide = parse(&format!(
+        "class = \"T0\"\n{}{}",
+        end("CAN_CH1", 0x18DA_10F1, 0x18DA_F110),
+        end("CAN_CH2", 0x18DA_F110, 0x18DA_10F1)
+    ))
+    .unwrap();
+    let env = Env::linked(wide, true);
     let data = frame(0x18DA_10F1, &[0x42, 0x03, 0x22, 0xF1, 0x90]);
     let all = [
         TxFlagBit::TxFlagCan29bitId,
@@ -1358,7 +1372,20 @@ fn raw_frame_flags_must_equal_the_profile_in_both_directions() {
     }
     assert!(send_with(&[]).is_err());
 
-    // T0 with a padded profile refuses an omitted padding bit and takes it when present.
+    // The whole header on T0: the id, then the address byte, then something to send.
+    let go = |data: &[u8]| {
+        env.decide(Request::StartComPrimitive(&start_flags(
+            data,
+            flag_bits(&all),
+        )))
+    };
+    assert!(go(&frame(0x18DA_10F1, &[0x42, 0x01])).is_ok());
+    assert!(go(&frame(0x18DA_10F1, &[0x43, 0x01])).is_err());
+    assert!(go(&frame(0x18DA_10F1, &[])).is_err());
+    assert!(go(&[0x18, 0xDA, 0x10]).is_err());
+    assert!(go(&frame(0x18DA_F110, &[0x42, 0x01])).is_err());
+
+    // A padded 11-bit T0 profile refuses an omitted padding bit and takes it when present.
     let padded = parse(&format!(
         "class = \"T0\"\n{}{}",
         t0_end("CAN_CH1", 0x123, 0x124, Some(0xAA)),
@@ -1700,9 +1727,11 @@ fn t1_passes_every_request_undecoded() {
     ] {
         assert!(session_grant("T1", bytes).is_ok(), "{bytes:02x?}");
     }
-    // Even raw frames to any identifier.
+    // A raw-bound handle on T1 (never created by the guard) is refused, not passed: its id
+    // and its UDS payload would go unseen.
     let env = Env::linked(profile("T1"), true);
-    assert!(send(&env, &[0, 0, 0x01, 0x23, 0x02, 0x2E, 0xF1], 1).is_ok());
+    assert!(send(&env, &[0, 0, 0x07, 0xE0, 0x10, 0x03], 1).is_err());
+    assert!(send(&env, &[0, 0, 0x01, 0x23, 0x02, 0x2E, 0xF1], 1).is_err());
 }
 
 #[test]
@@ -1785,12 +1814,12 @@ fn raw_send(env: &Env, data: &[u8]) -> Result<Grant, GuardRefusal> {
 }
 
 #[test]
-fn a_raw_mode_link_is_refused_on_t2_and_t3() {
+fn a_raw_mode_link_is_refused_outside_t0() {
     let raw = create::CllCreateFlag::CllCreateFlagBits(vci_service_interface::CllCreateFlag {
         bits: vec![CllCreateFlagBit::CllCreateFlagRawMode as i32],
     });
     let raw_bytes = create::CllCreateFlag::CllCreateFlagRaw(vec![0x80, 0, 0, 0]);
-    for class in ["T2", "T3"] {
+    for class in ["T1", "T2", "T3"] {
         let env = Env::new(profile(class));
         for flag in [raw.clone(), raw_bytes.clone()] {
             let mut request = create_request(create::Resource::RscData(profile_resource()));
@@ -1803,39 +1832,38 @@ fn a_raw_mode_link_is_refused_on_t2_and_t3() {
                 "{class}"
             );
         }
-        // The same link without RawMode is fine.
+        // The same link without RawMode is fine, and a T1 link starts communication.
         assert!(create_with(&env, &profile_resource()).is_ok());
     }
-    // T0 and T1 keep RawMode.
-    for (env, class) in [
-        (Env::new(profile("T1")), "T1"),
-        (Env::new(loopback()), "T0"),
-    ] {
-        let resource = if class == "T0" {
-            channel_resource("CAN_CH1")
-        } else {
-            profile_resource()
-        };
-        let mut request = create_request(create::Resource::RscData(resource));
-        request.cll_create_flag = Some(raw.clone());
-        assert_eq!(
-            env.decide(Request::CreateComLogicalLink(&request)),
-            Ok(Grant::CreatesLink {
-                endpoint: 0,
-                raw_mode: true
-            }),
-            "{class}"
-        );
-    }
+    let t1 = Env::linked(profile("T1"), false);
+    assert!(
+        t1.decide(Request::StartComPrimitive(&start(
+            ComOperationType::CoptStartcomm,
+            &[],
+            0
+        )))
+        .is_ok()
+    );
+    // T0 keeps RawMode.
+    let env = Env::new(loopback());
+    let mut request = create_request(create::Resource::RscData(channel_resource("CAN_CH1")));
+    request.cll_create_flag = Some(raw.clone());
+    assert_eq!(
+        env.decide(Request::CreateComLogicalLink(&request)),
+        Ok(Grant::CreatesLink {
+            endpoint: 0,
+            raw_mode: true
+        })
+    );
 }
 
 #[test]
-fn a_raw_bound_handle_on_t2_and_t3_is_refused_not_decoded() {
+fn a_raw_bound_handle_outside_t0_is_refused_not_decoded() {
     // Native ISO 15765 segments raw data itself, so this is RoutineControl on the wire although
     // its first byte after the identifier looks like a flow control PCI.
     let routine = frame(0x7E0, &[0x31, 0x01, 0xFF, 0x00]);
     let read = frame(0x7E0, &[0x03, 0x22, 0xF1, 0x90]);
-    for class in ["T2", "T3"] {
+    for class in ["T1", "T2", "T3"] {
         let env = Env::linked(profile(class), true);
         for data in [&routine, &read] {
             assert!(

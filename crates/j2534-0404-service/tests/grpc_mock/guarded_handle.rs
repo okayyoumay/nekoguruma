@@ -805,3 +805,53 @@ async fn disconnecting_a_link_in_another_session_returns_it_to_the_default_one_f
     drop(run);
     server.shutdown().await;
 }
+
+/// A check that returns the ECU to the default session itself leaves nothing pending: the
+/// destroy and the teardown send no second `10 01`.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_return_to_the_default_session_by_the_check_clears_the_pending_one() {
+    let server = TestServer::start().await;
+    let profile = t3();
+    let reports = Reports::new();
+    let mut run = RunGuard::start_in(&profile, "hw_guarded_handle", reports.dir());
+    let mut handle = GuardedHandle::attach(
+        &profile,
+        &vci(&profile),
+        server.worker_client().await,
+        module(),
+        options(),
+        &mut run,
+    )
+    .await
+    .expect("the handle opens the profile's link");
+    let [cll] = *handle.links() else {
+        panic!("one link");
+    };
+    for session in [0x03, 0x01] {
+        server.backdoor.arm_write_rx_injection(
+            MOCK_CHANNEL_ID,
+            &can_frame(0x7E8, &[0x50, session, 0x00, 0x32, 0x01, 0xF4]),
+            j2534_0404::ISO15765,
+            50,
+        );
+        handle
+            .send_receive(cll, &[0x10, session])
+            .await
+            .expect("the session answers");
+    }
+    assert_eq!(server.backdoor.write_msgs_count(), 2);
+    handle
+        .destroy_com_logical_link(DestroyComLogicalLinkRequest {
+            cll_handle: Some(cll),
+        })
+        .await
+        .expect("nothing is pending, so the link is destroyed at once");
+    assert_eq!(server.backdoor.write_msgs_count(), 2);
+    drop(handle);
+    run.pass();
+    assert!(run.run_teardown().is_empty());
+    assert_eq!(server.backdoor.write_msgs_count(), 2);
+    drop(run);
+    server.shutdown().await;
+}

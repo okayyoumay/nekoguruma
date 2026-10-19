@@ -50,11 +50,11 @@ use vci_service_interface::{
     ComLogicalLinkResponse, ComOperationType, ComParamResponse, ComPrimitiveCtrlData,
     ComPrimitiveHandle, ComPrimitiveResponse, ConflictingResourcesResponse,
     ConnectComLogicalLinkRequest, CreateComLogicalLinkRequest, DestroyComLogicalLinkRequest,
-    DisconnectComLogicalLinkRequest, EcuUniqueRespData, EventNotification, ExpectedResponseData,
-    GetComParamRequest, GetConflictingResourcesRequest, GetModuleIdsRequest, GetObjectIdRequest,
-    GetResourceIdsRequest, GetResourceStatusRequest, GetStatusRequest, GetTimestampRequest,
-    GetUniqueRespIdTableRequest, GetVersionRequest, IoCtlRequest, IoCtlResponse,
-    LockResourceRequest, ModuleDisconnectRequest, ModuleHandle, ModuleIdsResponse,
+    DisconnectComLogicalLinkRequest, EcuUniqueRespData, EventItem, EventNotification,
+    ExpectedResponseData, GetComParamRequest, GetConflictingResourcesRequest, GetModuleIdsRequest,
+    GetObjectIdRequest, GetResourceIdsRequest, GetResourceStatusRequest, GetStatusRequest,
+    GetTimestampRequest, GetUniqueRespIdTableRequest, GetVersionRequest, IoCtlRequest,
+    IoCtlResponse, LockResourceRequest, ModuleDisconnectRequest, ModuleHandle, ModuleIdsResponse,
     ObjectIdResponse, ObjectType, ParamItem, PduComPrimitiveStatus, PduErrorEvent, PduParamClass,
     PinData, ResourceData, ResourceIdsResponse, ResourceStatusResponse, SetComParamRequest,
     SetUniqueRespIdTableRequest, StartComPrimitiveRequest, StatusResponse, SubscribeEventRequest,
@@ -138,6 +138,9 @@ pub enum HandleError {
     /// The primitive ended without a response to the request.
     #[error("the primitive ended without a response")]
     NoResponse,
+    /// The VCI was lost: the worker reported the loss of communication with it.
+    #[error("the VCI was lost")]
+    VciLost,
     /// The primitive failed with this D-PDU error event code.
     #[error("the primitive failed with error event {0:#x}")]
     PrimitiveFailed(i32),
@@ -230,11 +233,38 @@ impl Shared {
         let timeout = self.options.request_timeout;
         match tokio::time::timeout(timeout, request).await {
             Err(_) => Err(HandleError::Timeout { call, timeout }),
+            // A request refused on a link the worker took offline after a lost VCI is the lost
+            // VCI: the worker attaches the link's last error event to the status.
+            Ok(Err(status))
+                if status.code() == tonic::Code::FailedPrecondition
+                    && vci_service_interface::error_detail_from_status(&status)
+                        .and_then(|detail| detail.error_event_data)
+                        .is_some_and(|data| {
+                            data.error_event == PduErrorEvent::PduErrEvtLostCommToVci as i32
+                        }) =>
+            {
+                Err(HandleError::VciLost)
+            }
             Ok(Err(status)) => Err(HandleError::Rpc {
                 call,
                 message: status.to_string(),
             }),
             Ok(Ok(response)) => Ok(response.into_inner()),
+        }
+    }
+
+    /// Keeps the pending return to the default session in step with the session the ECU is
+    /// observed to be in: a positive answer to DiagnosticSessionControl to the default session
+    /// clears it, one to another session sets it (the step itself is registered when the
+    /// request is granted).
+    fn observe_session(&self, cll: ComLogicalLinkHandle, request: &[u8], response: &[u8]) {
+        if let ([0x10, ..], [0x50, session, ..]) = (request, response) {
+            let mut state = self.lock();
+            if session & 0x7F == 0x01 {
+                state.session_back.remove(&cll.cll_handle);
+            } else if state.links.contains_key(&cll.cll_handle) {
+                state.session_back.insert(cll.cll_handle);
+            }
         }
     }
 
@@ -361,8 +391,7 @@ impl Shared {
         };
         let timeout = self.wait_for(cll);
         let timeout = cap.map_or(timeout, |cap| timeout.min(cap));
-        let mut response = None;
-        let mut error = None;
+        let mut progress = Progress::default();
         let now = tokio::time::Instant::now();
         // A timeout too long to add is, in effect, none.
         let deadline = now
@@ -389,37 +418,70 @@ impl Shared {
                 }
                 None => continue,
             };
-            // Events of earlier primitives, and of none, are not this request's.
-            if item.cop_handle != Some(cop) {
-                continue;
-            }
-            match item.data {
-                Some(event_item::Data::ResultData(result))
-                    if expected
-                        .as_ref()
-                        .is_some_and(|expected| expected.answers(&result.data_bytes)) =>
-                {
-                    response = Some(result.data_bytes);
-                }
-                // The ECU did not answer: reported as no response when the primitive ends.
-                Some(event_item::Data::ErrorData(code))
-                    if code == PduErrorEvent::PduErrEvtRxTimeout as i32 => {}
-                Some(event_item::Data::ErrorData(code)) => error = Some(code),
-                Some(event_item::Data::CopStatus(status))
-                    if status == PduComPrimitiveStatus::PduCopstFinished as i32
-                        || status == PduComPrimitiveStatus::PduCopstCancelled as i32 =>
-                {
-                    let finished = status == PduComPrimitiveStatus::PduCopstFinished as i32;
-                    return Outcome::Ended(match (response, error) {
-                        (Some(response), _) => Ok(response),
-                        (None, None) if expected.is_none() && finished => Ok(Vec::new()),
-                        (None, Some(code)) => Err(HandleError::PrimitiveFailed(code)),
-                        (None, None) => Err(HandleError::NoResponse),
-                    });
-                }
-                _ => {}
+            if let Some(outcome) = progress.on_item(item, cop, expected.as_ref()) {
+                return outcome;
             }
         }
+    }
+}
+
+/// What the events of one primitive have shown so far.
+#[derive(Default)]
+struct Progress {
+    response: Option<Vec<u8>>,
+    error: Option<i32>,
+}
+
+impl Progress {
+    /// Takes one event; returns the outcome once it ends the wait. Mirrors the agent host's
+    /// classification (`crates/agent/src/host.rs`).
+    fn on_item(
+        &mut self,
+        item: EventItem,
+        cop: ComPrimitiveHandle,
+        expected: Option<&Expectation>,
+    ) -> Option<Outcome> {
+        // A lost VCI ends the primitive at once. The worker reports it for the whole link, with
+        // no primitive handle, before it cancels the primitives; one bound to this primitive
+        // counts the same. It comes before the primitive filter below, which would drop it.
+        if item.cop_handle.is_none_or(|handle| handle == cop)
+            && matches!(
+                item.data,
+                Some(event_item::Data::ErrorData(code))
+                    if code == PduErrorEvent::PduErrEvtLostCommToVci as i32
+            )
+        {
+            return Some(Outcome::Ended(Err(HandleError::VciLost)));
+        }
+        // Events of earlier primitives, and of none, are not this request's.
+        if item.cop_handle != Some(cop) {
+            return None;
+        }
+        match item.data {
+            Some(event_item::Data::ResultData(result))
+                if expected.is_some_and(|expected| expected.answers(&result.data_bytes)) =>
+            {
+                self.response = Some(result.data_bytes);
+            }
+            // The ECU did not answer: reported as no response when the primitive ends.
+            Some(event_item::Data::ErrorData(code))
+                if code == PduErrorEvent::PduErrEvtRxTimeout as i32 => {}
+            Some(event_item::Data::ErrorData(code)) => self.error = Some(code),
+            Some(event_item::Data::CopStatus(status))
+                if status == PduComPrimitiveStatus::PduCopstFinished as i32
+                    || status == PduComPrimitiveStatus::PduCopstCancelled as i32 =>
+            {
+                let finished = status == PduComPrimitiveStatus::PduCopstFinished as i32;
+                return Some(Outcome::Ended(match (self.response.take(), self.error) {
+                    (Some(response), _) => Ok(response),
+                    (None, None) if expected.is_none() && finished => Ok(Vec::new()),
+                    (None, Some(code)) => Err(HandleError::PrimitiveFailed(code)),
+                    (None, None) => Err(HandleError::NoResponse),
+                }));
+            }
+            _ => {}
+        }
+        None
     }
 }
 
@@ -744,10 +806,14 @@ impl Timings {
                 Duration::from_micros(u64::from(v))
             }
         };
+        if self.rc78_completion == 0 {
+            // No ceiling in the worker: the bound is the whole wait, whatever P2 and P2* are.
+            return UNBOUNDED_COMPLETION_BOUND;
+        }
         micros(self.p2_max, Duration::from_millis(50))
-            + micros(self.p2_star, Duration::from_secs(5))
-            + micros(self.rc78_completion, UNBOUNDED_COMPLETION_BOUND)
-            + Duration::from_secs(2)
+            .saturating_add(micros(self.p2_star, Duration::from_secs(5)))
+            .saturating_add(micros(self.rc78_completion, Duration::ZERO))
+            .saturating_add(Duration::from_secs(2))
     }
 }
 
@@ -1410,9 +1476,12 @@ impl<'r> GuardedHandle<'r> {
             .ok_or_else(|| {
                 HandleError::Setup("StartComPrimitive returned no primitive handle".to_owned())
             })?;
-        self.shared
+        let response = self
+            .shared
             .await_result(&mut self.client.clone(), cll, cop, request, None)
-            .await
+            .await?;
+        self.shared.observe_session(cll, request, &response);
+        Ok(response)
     }
 
     passthrough! {
@@ -1445,6 +1514,8 @@ impl<'r> GuardedHandle<'r> {
 
 #[cfg(test)]
 mod tests {
+    use vci_service_interface::ResultData;
+
     use super::*;
     use crate::profile::{Setup, parse};
 
@@ -1637,10 +1708,7 @@ mod tests {
         // A zero completion timeout is no ceiling in the worker: the handle's bound, far above
         // any finite one, and not a deadline of zero.
         let unbounded = ceiling_of(&zeros("CP_RC78CompletionTimeout = 0\n"));
-        assert_eq!(
-            unbounded,
-            UNBOUNDED_COMPLETION_BOUND + Duration::from_secs(1 + 5 + 2)
-        );
+        assert_eq!(unbounded, UNBOUNDED_COMPLETION_BOUND);
     }
 
     #[test]
@@ -1692,6 +1760,100 @@ mod tests {
             session_reset_timeout(short, request),
             crate::teardown::DEFAULT_STEP_TIMEOUT
         );
+    }
+
+    #[test]
+    fn an_unbounded_completion_timeout_caps_the_whole_wait() {
+        // Large P2 and P2* do not add to the bound.
+        let big = profile(
+            "T3",
+            "id_bits = 11\naddressing = \"normal\"\n[link.comparams]\nCP_P2Max = 4000000000\n\
+             CP_P2Star = 4000000000\nCP_RC78CompletionTimeout = 0\n",
+        );
+        assert_eq!(ceiling_of(&big), UNBOUNDED_COMPLETION_BOUND);
+        // A finite one is the sum, saturating rather than overflowing.
+        let finite = profile(
+            "T3",
+            "id_bits = 11\naddressing = \"normal\"\n[link.comparams]\nCP_P2Max = 4000000000\n\
+             CP_P2Star = 4000000000\nCP_RC78CompletionTimeout = 4000000000\n",
+        );
+        assert_eq!(ceiling_of(&finite), Duration::from_secs(12_002));
+    }
+
+    fn event(cop: Option<ComPrimitiveHandle>, data: event_item::Data) -> EventItem {
+        EventItem {
+            cop_handle: cop,
+            timestamp: 0,
+            data: Some(data),
+            cop_tag: None,
+        }
+    }
+
+    const COP: ComPrimitiveHandle = ComPrimitiveHandle {
+        module_handle: 1,
+        cll_handle: 10,
+        cop_handle: 5,
+    };
+
+    #[test]
+    fn a_lost_vci_ends_the_wait_whoever_it_is_bound_to() {
+        let lost = PduErrorEvent::PduErrEvtLostCommToVci as i32;
+        let other = ComPrimitiveHandle {
+            cop_handle: 4,
+            ..COP
+        };
+        let ended = |cop: Option<ComPrimitiveHandle>| {
+            Progress::default().on_item(event(cop, event_item::Data::ErrorData(lost)), COP, None)
+        };
+        // For the whole link, with no primitive handle, or for this primitive.
+        for cop in [None, Some(COP)] {
+            assert!(matches!(
+                ended(cop),
+                Some(Outcome::Ended(Err(HandleError::VciLost)))
+            ));
+        }
+        // Bound to an earlier primitive it is not this request's.
+        assert!(ended(Some(other)).is_none());
+        // Another link-wide error is not a lost VCI, and not this primitive's either.
+        let tx = PduErrorEvent::PduErrEvtTxError as i32;
+        assert!(
+            Progress::default()
+                .on_item(event(None, event_item::Data::ErrorData(tx)), COP, None)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_primitive_ends_with_its_response_or_its_error() {
+        let mut progress = Progress::default();
+        let expected = Expectation::of(&[0x22, 0xF1, 0x90]);
+        let on = |p: &mut Progress, data| p.on_item(event(Some(COP), data), COP, Some(&expected));
+        assert!(
+            on(
+                &mut progress,
+                event_item::Data::ResultData(ResultData {
+                    data_bytes: vec![0x62, 0xF1, 0x90, 1],
+                    ..ResultData::default()
+                })
+            )
+            .is_none()
+        );
+        let done = on(
+            &mut progress,
+            event_item::Data::CopStatus(PduComPrimitiveStatus::PduCopstFinished as i32),
+        );
+        assert!(matches!(done, Some(Outcome::Ended(Ok(r))) if r == [0x62, 0xF1, 0x90, 1]));
+        let mut failed = Progress::default();
+        let tx = PduErrorEvent::PduErrEvtTxError as i32;
+        assert!(on(&mut failed, event_item::Data::ErrorData(tx)).is_none());
+        let done = on(
+            &mut failed,
+            event_item::Data::CopStatus(PduComPrimitiveStatus::PduCopstCancelled as i32),
+        );
+        assert!(matches!(
+            done,
+            Some(Outcome::Ended(Err(HandleError::PrimitiveFailed(c)))) if c == tx
+        ));
     }
 
     #[test]

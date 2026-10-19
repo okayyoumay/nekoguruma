@@ -266,8 +266,8 @@ connection is served by the runtime.
   lost events, a failed or ended event stream) (a cancel that fails is then the error returned: the worker answers a cancel of a primitive that
   already ended with success). Zeros are read as
   `j2534-0404-service` reads them: P2 zero is 50 ms, P2* zero is 5 s, and a zero completion
-  timeout is no ceiling in the worker, so the handle waits at most 10 minutes (and then cancels)
-  rather than forever. A `SetComParam` of P2, P2* or the completion timeout through the handle
+  timeout is no ceiling in the worker, so the handle waits 10 minutes in all (whatever P2 and P2*
+  are) and then cancels, rather than forever. A `SetComParam` of P2, P2* or the completion timeout through the handle
   updates the ceiling: until the link is connected or a `COPT_UPDATEPARAM` primitive has finished
   successfully (the handle waits for it) the longer of the old and the new value is waited for,
   afterwards the new one; an update that fails, is cancelled or times out is the error of the `start_com_primitive` call and
@@ -279,6 +279,11 @@ connection is served by the runtime.
   stream and timings to wait by (the handle's defaults, 1 s, 5 s and 25 s, until the check sets
   others). The check then sets the profile's ComParams itself, as the guard requires before the
   connect.
+- **Events.** A lost VCI (the worker's link-wide error event, with no primitive handle, or one
+  bound to the primitive; or a request refused on the offline link) ends the wait with
+  `HandleError::VciLost`, as in the agent. The handle keeps the pending return to the default
+  session in step with what `send_receive` observes: a positive answer to DiagnosticSessionControl
+  to the default session clears it, one to another session sets it.
 - **State.** A `GetResourceIds` answer records the resource each id stands for and a `GetObjectId`
   answer the name of the id, into the learned ids. The `cll_handle` of a granted
   `CreateComLogicalLink` is bound to its endpoint, a granted `SetComParam` or

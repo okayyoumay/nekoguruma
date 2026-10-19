@@ -470,3 +470,11 @@ fn a_report_without_a_profile_masks_everything() {
     assert!(text.contains("class = \"unknown\""), "{text}");
     assert!(!report.identifiers_in_full);
 }
+
+#[test]
+fn a_serial_attribute_with_spaces_around_its_equals_sign_is_masked() {
+    let masker = Masker::for_profile(&profile("iso22900", ""));
+    let masked = masker.module_name(Api::Iso22900, "Name='bench' SerialNumber = '1234567890'");
+    assert!(!masked.contains("1234567890"), "{masked}");
+    assert!(masked.contains("bench"), "{masked}");
+}

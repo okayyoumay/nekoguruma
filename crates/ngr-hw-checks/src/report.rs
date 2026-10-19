@@ -12,7 +12,7 @@
 //! Directories are created with mode 0700 and files with mode 0600 on Unix, in the call that
 //! creates them, so there is no moment when another user can read them. On Windows the files take
 //! the ACLs of the user's profile directory, which only that user and administrators read by
-//! default; no ACL is set here. A directory inside a Git work tree is refused.
+//! default; no ACL is set here. A directory inside this repository's work tree is refused.
 
 use std::fmt::Write as _;
 use std::io::Write as _;
@@ -78,9 +78,11 @@ pub struct CheckResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DeviceInfo {
     pub abi: String,
-    /// The library the profile names for the VCI, which is the vendor's own library.
+    /// For the D-PDU API the vendor name `GetVersion` reports; for J2534, or when the library
+    /// leaves it empty, the library the profile names.
     pub vendor: String,
-    /// The module as the worker reports it (`vendor_module_name`).
+    /// For the D-PDU API the hardware name `GetVersion` reports; for J2534, or when the library
+    /// leaves it empty, the module as the worker reports it (`vendor_module_name`).
     pub model: String,
     pub firmware_version: String,
     pub library_version: String,
@@ -195,6 +197,7 @@ impl Masker {
         while let Some(equals) = rest.find('=') {
             let (before, after) = rest.split_at(equals + 1);
             let name = before[..before.len() - 1]
+                .trim_end()
                 .rsplit(|c: char| c.is_whitespace() || c == ',' || c == ';')
                 .next()
                 .unwrap_or("");
@@ -495,8 +498,11 @@ fn rfc3339(time: SystemTime) -> String {
 /// A run's report that is written when the guard goes out of scope, so that a check which
 /// fails by panic (an assertion, an `unwrap`) still leaves its report. The check ends with
 /// [`RunGuard::pass`] or [`RunGuard::finish`]; a guard dropped while the thread panics records
-/// the check as failed, and one dropped without a result records that as a failure too. Drop
-/// never panics: a report that cannot be written is described on stderr.
+/// the check as failed, and one dropped without a result records that as a failure too.
+///
+/// When the thread is not already panicking, dropping the guard panics, so the test fails, if
+/// the check recorded anything but a pass or if its report cannot be written. During an unwind it
+/// never panics again: a report that cannot be written is then described on stderr.
 pub struct RunGuard {
     report: Report,
     check: String,

@@ -3,6 +3,7 @@
 //! - [`profile`]: the hardware profile `NGR_HW_PROFILE` names, checked against its class
 //! - [`device`]: the module match, whether the device a worker reports is the profile's
 //! - [`open`]: starting the profile's worker, running the module match and opening the device
+//! - [`report`]: the report of a run, written to a directory only the running user can read
 //! - [`CheckDecl`]: what a check needs, as static data the harness reads without running it
 //! - [`permits`] and [`listing`]: which checks a profile permits
 //! - [`begin`]: the first call of every `hw_` test, which fails without a permitting profile
@@ -15,6 +16,7 @@
 pub mod device;
 pub mod open;
 pub mod profile;
+pub mod report;
 
 pub use profile::{Class, Operation, Profile, ProfileError};
 
@@ -103,10 +105,32 @@ pub fn start(
     Ok(profile)
 }
 
-/// The first call of a `hw_` test: the profile `NGR_HW_PROFILE` names, if it permits `check`.
-/// Panics otherwise, so the test fails before it reaches any device.
-pub fn begin(check: &CheckDecl) -> Profile {
-    start(check, profile::from_env()).unwrap_or_else(|error| panic!("{error}"))
+/// The first call of a `hw_` test: the profile `NGR_HW_PROFILE` names, if it permits `check`,
+/// and the run's [`report::RunGuard`], which writes the report when the test ends. Panics
+/// otherwise, so the test fails before it reaches any device, after recording the failure: a
+/// profile that cannot be read leaves a report with the class unknown and every identifier
+/// masked, and one that does not permit the check leaves a report with the check refused.
+pub fn begin(check: &CheckDecl) -> (Profile, report::RunGuard) {
+    let profile = match profile::from_env() {
+        Ok(profile) => profile,
+        Err(error) => {
+            let mut run = report::RunGuard::start_without_profile(check.name);
+            // The error names the profile's path and can quote its text, which may hold serial
+            // numbers no profile tells the masker about; the report keeps a fixed message and
+            // the details go to the test's output.
+            run.finish(
+                report::Outcome::Failed,
+                "the hardware profile could not be read or is invalid; see the test output",
+            );
+            panic!("{error}");
+        }
+    };
+    let mut run = report::RunGuard::start(&profile, check.name);
+    if let Err(error) = start(check, Ok(profile.clone())) {
+        run.finish(report::Outcome::Refused, &error.to_string());
+        panic!("{error}");
+    }
+    (profile, run)
 }
 
 #[cfg(test)]

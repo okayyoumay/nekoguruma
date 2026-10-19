@@ -554,8 +554,9 @@ fn a_profile_is_read_from_its_file() {
 #[test]
 #[ignore = "real-hardware check, design 13.5: run with `cargo nextest run --profile hardware --run-ignored=only`"]
 fn hw_the_profile_permits_a_check() {
-    let profile = begin(&PROFILE_CHECK);
-    permits(&profile, &PROFILE_CHECK).unwrap();
+    // The guard writes the report when the check ends, also when an assertion panics.
+    let (_profile, mut run) = begin(&PROFILE_CHECK);
+    run.pass();
 }
 
 /// Every declared check is a `hw_` test that runs somewhere, declared once.

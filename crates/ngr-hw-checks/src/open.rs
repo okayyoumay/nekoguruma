@@ -213,6 +213,7 @@ async fn match_device(
         .version_data
         .ok_or(OpenError::NoVersion)?;
         let version = ReportedVersion {
+            vendor_name: data.vendor_name,
             hw_name: data.hw_name,
             fw_name: data.fw_name,
             fw_version: data.fw_version,

@@ -1,0 +1,555 @@
+use super::*;
+use crate::profile::parse;
+
+const VIN: &str = "WVWZZZ1JZ3W386752";
+
+fn profile_text(api: &str, extra: &str) -> String {
+    let names = if api == "j2534-0404" {
+        "label = \"bench\"\npname = \"Vendor VCI 1\""
+    } else {
+        ""
+    };
+    format!(
+        r#"
+class = "T3"
+{extra}
+
+[vci]
+api = "{api}"
+library = "Vendor VCI"
+module = "SN-1234567890"
+{names}
+firmware_version = "1.2.3"
+library_version = "4.5.6"
+
+[link]
+protocol = "ISO15765"
+baud_rate = 500000
+pins = [6, 14]
+request_id = 0x7E0
+response_id = 0x7E8
+id_bits = 11
+addressing = "normal"
+"#
+    )
+}
+
+fn profile(api: &str, extra: &str) -> Profile {
+    parse(&profile_text(api, extra)).unwrap()
+}
+
+fn vci(profile: &Profile) -> &Vci {
+    match &profile.setup {
+        Setup::Link { vci, .. } => vci,
+        Setup::Loopback(_) => unreachable!(),
+    }
+}
+
+fn version() -> ReportedVersion {
+    ReportedVersion {
+        vendor_name: String::new(),
+        hw_name: "fw 1.2.3".into(),
+        fw_name: "dll 4.5.6".into(),
+        fw_version: 0x0201_0000,
+        pdu_api_sw_version: 0x0300_0100,
+    }
+}
+
+fn module(name: &str) -> ReportedModule {
+    ReportedModule {
+        name: name.into(),
+        additional_info: String::new(),
+    }
+}
+
+#[test]
+fn a_vin_in_free_text_is_masked() {
+    let masker = Masker::for_profile(&profile("j2534-0404", ""));
+    let masked = masker.text(&format!("read {VIN}, then (VIN={VIN})"));
+    assert!(!masked.contains(VIN), "{masked}");
+    assert_eq!(masked, "read ****6752, then (VIN=****6752)");
+    // Not an identifier: letters only.
+    assert_eq!(masker.text("ABCDEFGHJKLMNPRST"), "ABCDEFGHJKLMNPRST");
+    // 16 characters are not a VIN, but they still look like a serial number.
+    assert_eq!(masker.text("WVWZZZ1JZ3W38675"), "****8675");
+}
+
+#[test]
+fn the_profile_can_ask_for_full_identifiers() {
+    let profile = profile("iso22900", "report_full_identifiers = true");
+    assert!(profile.report_full_identifiers);
+    let mut report = Report::new(&profile);
+    report.record(
+        "hw_x",
+        Outcome::Failed,
+        &format!("VIN {VIN} on SN-1234567890"),
+    );
+    report.add_device(
+        vci(&profile),
+        Abi::LinuxX86_64,
+        &module("Serial='SN-1234567890'"),
+        &version(),
+    );
+    let text = report.to_toml().unwrap();
+    assert!(
+        text.contains(VIN) && text.contains("SN-1234567890"),
+        "{text}"
+    );
+    assert!(text.contains("identifiers_in_full = true"));
+    assert!(
+        !parse(&profile_text("iso22900", ""))
+            .unwrap()
+            .report_full_identifiers
+    );
+}
+
+#[test]
+fn a_serial_number_is_masked_in_the_module_name() {
+    let profile = profile("iso22900", "");
+    let masker = Masker::for_profile(&profile);
+    assert_eq!(
+        masker.module_name(
+            Api::Iso22900,
+            "Name='Vendor Box' SerialNumber='1234567890' Fw='2'"
+        ),
+        "Name='Vendor Box' SerialNumber='****7890' Fw='2'"
+    );
+    // Plain text is a device name or a serial number: masked whole, short ones fully.
+    assert_eq!(masker.module_name(Api::Iso22900, "ABC123"), "****");
+    assert_eq!(
+        masker.module_name(Api::Iso22900, "ABCDEF123456"),
+        "****3456"
+    );
+    // A J2534 label is not a serial number.
+    assert_eq!(masker.module_name(Api::J2534V0404, "bench"), "bench");
+    // The profile's own D-PDU `module` is a serial number wherever it appears.
+    assert_eq!(
+        masker.text("module SN-1234567890 absent"),
+        "module ****7890 absent"
+    );
+}
+
+#[test]
+fn the_report_has_every_field_and_no_identifier() {
+    let profile = profile("iso22900", "");
+    let mut report = Report::new(&profile);
+    report.add_device(
+        vci(&profile),
+        Abi::LinuxArm64,
+        &module("SerialNumber='1234567890'"),
+        // A D-PDU device that names no hardware falls back to the module name.
+        &ReportedVersion {
+            hw_name: String::new(),
+            ..version()
+        },
+    );
+    report.record("hw_a", Outcome::Passed, "");
+    report.record("hw_b", Outcome::Failed, &format!("VIN {VIN} differs"));
+    report.record_refusal("hw_c", &Refusal::Operation(crate::Operation::Reprogramming));
+    let text = report.to_toml().unwrap();
+    let table: toml::Table = text.parse().unwrap();
+    let started = table["started_at"].as_str().unwrap();
+    assert_eq!(started.len(), 20, "{started}");
+    assert!(started.ends_with('Z') && started.as_bytes()[10] == b'T');
+    assert!(!table["host"].as_str().unwrap().is_empty());
+    assert!(table["os"].as_str().unwrap().contains(std::env::consts::OS));
+    assert_eq!(table["class"].as_str(), Some("T3"));
+    let device = table["device"].as_array().unwrap()[0].as_table().unwrap();
+    assert_eq!(device["abi"].as_str(), Some("linux-arm64"));
+    assert_eq!(device["vendor"].as_str(), Some("Vendor VCI"));
+    assert_eq!(device["model"].as_str(), Some("SerialNumber='****7890'"));
+    assert_eq!(device["firmware_version"].as_str(), Some("2.1.0"));
+    assert_eq!(device["library_version"].as_str(), Some("3.0.1"));
+    let checks = table["check"].as_array().unwrap();
+    let outcomes: Vec<_> = checks
+        .iter()
+        .map(|c| c["outcome"].as_str().unwrap())
+        .collect();
+    assert_eq!(outcomes, ["passed", "failed", "refused"]);
+    assert!(
+        !text.contains(VIN) && !text.contains("1234567890"),
+        "{text}"
+    );
+}
+
+#[test]
+fn j2534_versions_are_the_reported_strings_and_no_device_leaves_them_out() {
+    let profile = profile("j2534-0404", "");
+    let mut report = Report::new(&profile);
+    assert!(!report.to_toml().unwrap().contains("[[device]]"));
+    report.add_device(vci(&profile), Abi::WinX86, &module("bench"), &version());
+    let device = report.devices[0].clone();
+    assert_eq!(device.firmware_version, "fw 1.2.3");
+    assert_eq!(device.library_version, "dll 4.5.6");
+    // The model is the configured entry's device name, not the label that selects it.
+    assert_eq!(device.model, "Vendor VCI 1");
+}
+
+#[test]
+fn the_time_is_utc_rfc_3339() {
+    let at = |secs| rfc3339(UNIX_EPOCH + std::time::Duration::from_secs(secs));
+    assert_eq!(at(0), "1970-01-01T00:00:00Z");
+    assert_eq!(at(951_782_400 + 86_399), "2000-02-29T23:59:59Z");
+    assert_eq!(at(1_781_000_000), "2026-06-09T10:13:20Z");
+}
+
+#[test]
+fn the_data_directory_follows_the_platform() {
+    let env = |pairs: &'static [(&'static str, &'static str)]| {
+        move |name: &str| {
+            pairs
+                .iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| std::ffi::OsString::from(v))
+        }
+    };
+    if cfg!(unix) && !cfg!(target_os = "macos") {
+        let xdg = env(&[("XDG_DATA_HOME", "/x/data"), ("HOME", "/home/u")]);
+        assert_eq!(data_dir(xdg), Some(PathBuf::from("/x/data")));
+        let home = env(&[("HOME", "/home/u")]);
+        assert_eq!(data_dir(home), Some(PathBuf::from("/home/u/.local/share")));
+        let relative = env(&[("XDG_DATA_HOME", "rel"), ("HOME", "/home/u")]);
+        assert_eq!(
+            data_dir(relative),
+            Some(PathBuf::from("/home/u/.local/share"))
+        );
+        assert_eq!(data_dir(env(&[])), None);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn the_directory_and_file_are_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("nekoguruma").join("hw-reports");
+    let report = Report::new(&profile("j2534-0404", ""));
+    let first = report.write_to(&dir).unwrap();
+    let second = report.write_to(&dir).unwrap();
+    assert_ne!(
+        first, second,
+        "a second report does not overwrite the first"
+    );
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&dir), 0o700);
+    assert_eq!(mode(dir.parent().unwrap()), 0o700);
+    assert_eq!(mode(&first), 0o600);
+    assert_eq!(mode(&second), 0o600);
+    assert!(
+        std::fs::read_to_string(&first)
+            .unwrap()
+            .contains("class = \"T3\"")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn an_existing_directory_others_can_read_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("reports");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let error = Report::new(&profile("j2534-0404", ""))
+        .write_to(&dir)
+        .unwrap_err();
+    assert!(
+        matches!(error, ReportError::TooOpen { mode: 0o755, .. }),
+        "{error}"
+    );
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+}
+
+#[test]
+fn a_directory_inside_this_repository_is_refused() {
+    let crate_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let dir = crate_dir
+        .join("target")
+        .join("report-guard-test")
+        .join("reports");
+    let error = Report::new(&profile("j2534-0404", ""))
+        .write_to(&dir)
+        .unwrap_err();
+    assert!(matches!(error, ReportError::InsideRepository(_)), "{error}");
+    assert!(!dir.exists());
+}
+
+#[test]
+fn a_directory_inside_another_work_tree_is_accepted() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join(".git")).unwrap();
+    let dir = root.path().join("reports");
+    let path = Report::new(&profile("j2534-0404", ""))
+        .write_to(&dir)
+        .unwrap();
+    // The written path is the resolved one (`\\?\` on Windows, `/private` on macOS).
+    assert_eq!(
+        path.parent().unwrap().canonicalize().unwrap(),
+        dir.canonicalize().unwrap()
+    );
+}
+
+#[test]
+fn a_vin_shaped_host_name_is_masked_unless_asked_for() {
+    let masked = Report::with_host(&profile("j2534-0404", ""), VIN, Some(&format!("OS {VIN}")));
+    assert_eq!(masked.host, "****6752");
+    assert_eq!(masked.os_version.as_deref(), Some("OS ****6752"));
+    let full = Report::with_host(
+        &profile("j2534-0404", "report_full_identifiers = true"),
+        VIN,
+        None,
+    );
+    assert_eq!(full.host, VIN);
+}
+
+#[test]
+fn a_panicking_check_still_leaves_a_failed_report() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("reports");
+    let profile = profile("j2534-0404", "");
+    let result = std::panic::catch_unwind(|| {
+        let _run = RunGuard::start_in(&profile, "hw_x", dir.clone());
+        panic!("assertion failed");
+    });
+    assert!(result.is_err());
+    let files: Vec<_> = std::fs::read_dir(&dir).unwrap().collect();
+    assert_eq!(files.len(), 1);
+    let table: toml::Table = std::fs::read_to_string(files[0].as_ref().unwrap().path())
+        .unwrap()
+        .parse()
+        .unwrap();
+    let check = &table["check"].as_array().unwrap()[0];
+    assert_eq!(check["name"].as_str(), Some("hw_x"));
+    assert_eq!(check["outcome"].as_str(), Some("failed"));
+    assert!(check["message"].as_str().unwrap().contains("panicked"));
+}
+
+#[test]
+fn a_finished_check_keeps_its_recorded_result() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("reports");
+    {
+        let mut run = RunGuard::start_in(&profile("j2534-0404", ""), "hw_y", dir.clone());
+        run.pass();
+    }
+    let path = std::fs::read_dir(&dir)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let text = std::fs::read_to_string(path).unwrap();
+    assert!(text.contains("outcome = \"passed\""), "{text}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_path_that_leads_into_the_repository_is_refused() {
+    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let report = Report::new(&profile("j2534-0404", ""));
+    // `..` after an existing directory resolves into the repository.
+    let dotdot = crate_dir
+        .join("docs")
+        .join("..")
+        .join("report-guard-dotdot");
+    assert!(matches!(
+        report.write_to(&dotdot),
+        Err(ReportError::InsideRepository(_))
+    ));
+    // `..` below a directory that does not exist is refused outright.
+    let missing = crate_dir
+        .join("no-such-dir")
+        .join("..")
+        .join("report-guard-dotdot");
+    assert!(report.write_to(&missing).is_err());
+    // A symlink outside the repository that points into it.
+    let root = tempfile::tempdir().unwrap();
+    let link = root.path().join("link");
+    std::os::unix::fs::symlink(crate_dir.join("docs"), &link).unwrap();
+    let through = link.join("report-guard-symlink");
+    assert!(matches!(
+        report.write_to(&through),
+        Err(ReportError::InsideRepository(_))
+    ));
+    for name in ["report-guard-dotdot", "report-guard-symlink"] {
+        assert!(!crate_dir.join(name).exists());
+        assert!(!crate_dir.join("docs").join(name).exists());
+    }
+}
+
+#[test]
+fn no_text_field_of_a_report_carries_a_vin() {
+    let text = profile_text("j2534-0404", "").replace("Vendor VCI\"", &format!("Vendor {VIN}\""));
+    let profile = parse(&text).unwrap();
+    let mut report = Report::with_host(&profile, VIN, Some(VIN));
+    let version = ReportedVersion {
+        vendor_name: String::new(),
+        hw_name: format!("fw {VIN}"),
+        fw_name: format!("dll {VIN}"),
+        ..version()
+    };
+    report.add_device(vci(&profile), Abi::WinX86, &module(VIN), &version);
+    report.record("hw_x", Outcome::Failed, &format!("read {VIN}"));
+    let toml = report.to_toml().unwrap();
+    assert!(!toml.contains(VIN), "{toml}");
+}
+
+#[test]
+fn a_d_pdu_device_reports_the_vendor_and_model_it_names() {
+    let profile = profile("iso22900", "");
+    let mut report = Report::new(&profile);
+    let version = ReportedVersion {
+        vendor_name: "Acme Diagnostics".into(),
+        hw_name: "Acme Box 7".into(),
+        ..version()
+    };
+    report.add_device(vci(&profile), Abi::WinX86, &module("Acme"), &version);
+    let device = report.devices[0].clone();
+    assert_eq!(device.vendor, "Acme Diagnostics");
+    assert_eq!(device.model, "Acme Box 7");
+}
+
+#[test]
+fn a_passing_check_whose_report_cannot_be_written_fails() {
+    let refused = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join("report-guard-test")
+        .join("lost");
+    let profile = profile("j2534-0404", "");
+    let result = std::panic::catch_unwind(|| {
+        let mut run = RunGuard::start_in(&profile, "hw_z", refused.clone());
+        run.pass();
+    });
+    assert!(result.is_err());
+    assert!(!refused.exists());
+}
+
+#[test]
+fn a_check_that_panics_after_passing_is_reported_failed() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("reports");
+    let profile = profile("j2534-0404", "");
+    let result = std::panic::catch_unwind(|| {
+        let mut run = RunGuard::start_in(&profile, "hw_w", dir.clone());
+        run.pass();
+        panic!("a later guard failed");
+    });
+    assert!(result.is_err());
+    let file = std::fs::read_dir(&dir).unwrap().next().unwrap().unwrap();
+    let table: toml::Table = std::fs::read_to_string(file.path())
+        .unwrap()
+        .parse()
+        .unwrap();
+    let checks = table["check"].as_array().unwrap();
+    assert_eq!(checks.len(), 1);
+    assert_eq!(checks[0]["outcome"].as_str(), Some("failed"));
+}
+
+#[test]
+fn a_recorded_failure_fails_the_test_and_is_written() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("reports");
+    let profile = profile("j2534-0404", "");
+    let result = std::panic::catch_unwind(|| {
+        let mut run = RunGuard::start_in(&profile, "hw_v", dir.clone());
+        run.finish(Outcome::Failed, "the loopback frame did not come back");
+    });
+    assert!(result.is_err());
+    let file = std::fs::read_dir(&dir).unwrap().next().unwrap().unwrap();
+    let text = std::fs::read_to_string(file.path()).unwrap();
+    assert!(
+        text.contains("failed") && text.contains("loopback"),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_report_without_a_profile_masks_everything() {
+    let mut report = Report::without_profile();
+    report.record("hw_u", Outcome::Failed, &format!("cannot read {VIN}.toml"));
+    let text = report.to_toml().unwrap();
+    assert!(!text.contains(VIN), "{text}");
+    assert!(text.contains("class = \"unknown\""), "{text}");
+    assert!(!report.identifiers_in_full);
+}
+
+#[test]
+fn a_serial_attribute_with_spaces_around_its_equals_sign_is_masked() {
+    let masker = Masker::for_profile(&profile("iso22900", ""));
+    let masked = masker.module_name(Api::Iso22900, "Name='bench' SerialNumber = '1234567890'");
+    assert!(!masked.contains("1234567890"), "{masked}");
+    assert!(masked.contains("bench"), "{masked}");
+}
+
+#[test]
+fn a_loopback_with_two_devices_reports_both() {
+    let profile = profile("iso22900", "");
+    let mut report = Report::new(&profile);
+    let first = ReportedVersion {
+        vendor_name: "Acme".into(),
+        hw_name: "Box A".into(),
+        ..version()
+    };
+    let second = ReportedVersion {
+        vendor_name: "Other".into(),
+        hw_name: "Box B".into(),
+        ..version()
+    };
+    report.add_device(vci(&profile), Abi::WinX86, &module("a"), &first);
+    report.add_device(vci(&profile), Abi::WinX86, &module("b"), &second);
+    let table: toml::Table = report.to_toml().unwrap().parse().unwrap();
+    let devices = table["device"].as_array().unwrap();
+    assert_eq!(devices.len(), 2);
+    assert_eq!(devices[0]["model"].as_str(), Some("Box A"));
+    assert_eq!(devices[1]["model"].as_str(), Some("Box B"));
+}
+
+#[test]
+fn a_serial_inside_a_longer_one_does_not_expose_the_longer_one() {
+    let masker = Masker::with_known(false, vec!["1234".into(), "VEHICLE-UNIT-1234".into()]);
+    let masked = masker.text("module VEHICLE-UNIT-1234 ready");
+    assert!(!masked.contains("VEHICLE-UNIT"), "{masked}");
+}
+
+#[test]
+fn a_serial_the_profile_does_not_name_is_masked_in_free_text() {
+    // A J2534 profile names no serial number, and a check may still write one.
+    let profile = profile("j2534-0404", "");
+    let mut report = Report::with_host(&profile, "SN-1234567890", Some("bench AB12CD34EF"));
+    report.record(
+        "hw_x",
+        Outcome::Failed,
+        "device SN_9876543210 (serial 12345678) answered 0x7E8",
+    );
+    let text = report.to_toml().unwrap();
+    for serial in ["1234567890", "9876543210", "12345678", "AB12CD34EF"] {
+        assert!(!text.contains(serial), "{serial}: {text}");
+    }
+    assert!(text.contains("****7890"), "{text}");
+    assert!(text.contains("answered 0x7E8"), "{text}");
+}
+
+#[test]
+fn codes_and_short_numbers_are_not_serial_numbers() {
+    let masker = Masker::for_profile(&profile("j2534-0404", ""));
+    for kept in [
+        "status 0x00000007",
+        "ids 0x18DA10F1-0x18DAF110",
+        "500000 baud on pins 6_14",
+        "PDU_ERR_FCT_FAILED",
+        "version 04.04.12",
+    ] {
+        assert_eq!(masker.text(kept), kept);
+    }
+}
+
+#[test]
+fn a_serial_in_a_profile_name_is_masked() {
+    let masker = Masker::for_profile(&profile("j2534-0404", ""));
+    assert_eq!(masker.text("Vendor-SN-1234567890"), "****7890");
+    assert_eq!(masker.module_name(Api::J2534V0404, "bench"), "bench");
+    assert_eq!(
+        masker.module_name(Api::J2534V0404, "bench SN1234567890"),
+        "bench ****7890"
+    );
+}

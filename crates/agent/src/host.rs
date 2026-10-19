@@ -8,13 +8,13 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::time::{Duration, Instant};
 
+use crate::client::WorkerApi;
 use diag_ir::DiagHost;
 use tokio::runtime::Handle;
 use vci_service_interface::{
     ComOperationType, ComPrimitiveCtrlData, ComPrimitiveHandle, EventItem, ExpectedResponseData,
     PduComPrimitiveStatus, PduErrorEvent, StartComPrimitiveRequest, event_item, event_notification,
 };
-use worker_host::client::WorkerClient;
 
 use crate::link::{Link, LinkConfig};
 use crate::send_receive::{Expectation, NegativeShape};
@@ -315,9 +315,9 @@ fn check_transfer_response(block: u64, counter: u8, response: Vec<u8>) -> Result
 }
 
 /// The VM's host for one job on one link.
-pub struct WorkerHost {
+pub struct WorkerHost<C: WorkerApi> {
     handle: Handle,
-    client: WorkerClient,
+    client: C,
     link: Link,
     timings: Timings,
     /// When each `Wait` inquiry started.
@@ -330,8 +330,8 @@ pub struct WorkerHost {
     document: Option<crate::document::JobDocument>,
 }
 
-impl WorkerHost {
-    pub fn new(handle: Handle, client: WorkerClient, link: Link, timings: Timings) -> Self {
+impl<C: WorkerApi> WorkerHost<C> {
+    pub fn new(handle: Handle, client: C, link: Link, timings: Timings) -> Self {
         Self {
             handle,
             client,
@@ -364,7 +364,7 @@ impl WorkerHost {
     }
 
     /// Gives back the client and the link, to close it.
-    pub fn into_parts(self) -> (WorkerClient, Link) {
+    pub fn into_parts(self) -> (C, Link) {
         (self.client, self.link)
     }
 
@@ -602,21 +602,21 @@ pub trait TransferProgress {
     fn transfer_block_index(&self) -> Option<u64>;
 }
 
-impl crate::document::Declarations for WorkerHost {
+impl<C: WorkerApi> crate::document::Declarations for WorkerHost<C> {
     fn declarations(&self) -> Option<crate::document::JobDocument> {
         self.document.clone()
     }
 }
 
-impl TransferProgress for WorkerHost {
+impl<C: WorkerApi> TransferProgress for WorkerHost<C> {
     fn transfer_block_index(&self) -> Option<u64> {
-        WorkerHost::transfer_block_index(self)
+        WorkerHost::<C>::transfer_block_index(self)
     }
 }
 
 /// The supply voltage comes from the VCI; the worker interface has no defined source for the
 /// other inputs.
-impl crate::inputs::RuntimeInputs for WorkerHost {
+impl<C: WorkerApi> crate::inputs::RuntimeInputs for WorkerHost<C> {
     fn read(&mut self, input: diag_ir::RuntimeInput) -> Result<crate::inputs::Reading, HostError> {
         use crate::inputs::Reading;
         use diag_ir::RuntimeInput;
@@ -636,7 +636,7 @@ impl crate::inputs::RuntimeInputs for WorkerHost {
     }
 }
 
-impl DiagHost for WorkerHost {
+impl<C: WorkerApi> DiagHost for WorkerHost<C> {
     type Error = HostError;
 
     fn service_request(&mut self, service: u16, payload: &[u8]) -> Result<Vec<u8>, HostError> {

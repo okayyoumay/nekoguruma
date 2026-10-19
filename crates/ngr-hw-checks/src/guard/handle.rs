@@ -29,6 +29,11 @@
 //! (unless the profile pins them), `ConnectComLogicalLink` and a subscription to the link's
 //! events. Every one of these requests is itself decided, like a check's.
 //!
+//! The handle also serves the agent's job runner (`GuardedClient`, ADR-334): `open_with` and
+//! `attach_with` can hold the device without creating links, subscribe only when the handle reads
+//! events itself, and `set_table_completed` and `connect_completing` add the profile's own
+//! ComParams to the job's link set-up.
+//!
 //! What the handle does not do: switching power on or off. A profile's power commands belong to
 //! a check that uses them, which must register the power-off step before it switches power on
 //! (design 13.5 "Cleanup"); no step is registered for them here.
@@ -55,12 +60,13 @@ use vci_service_interface::{
     GetObjectIdRequest, GetResourceIdsRequest, GetResourceStatusRequest, GetStatusRequest,
     GetTimestampRequest, GetUniqueRespIdTableRequest, GetVersionRequest, IoCtlRequest,
     IoCtlResponse, LockResourceRequest, ModuleDisconnectRequest, ModuleHandle, ModuleIdsResponse,
-    ObjectIdResponse, ObjectType, ParamItem, PduComPrimitiveStatus, PduErrorEvent, PduParamClass,
-    PinData, ResourceData, ResourceIdsResponse, ResourceStatusResponse, SetComParamRequest,
-    SetUniqueRespIdTableRequest, StartComPrimitiveRequest, StatusResponse, SubscribeEventRequest,
-    TimestampResponse, UniqueRespIdTableItem, UniqueRespIdTableResponse, UnlockResourceRequest,
-    VersionResponse, create_com_logical_link_request, event_item, event_notification,
-    io_ctl_request, param_item, pin_data, resource_data, subscribe_event_request,
+    ObjectIdResponse, ObjectType, ParamItem, PduComPrimitiveStatus, PduError, PduErrorEvent,
+    PduParamClass, PinData, ResourceData, ResourceIdsResponse, ResourceStatusResponse,
+    SetComParamRequest, SetUniqueRespIdTableRequest, StartComPrimitiveRequest, StatusResponse,
+    SubscribeEventRequest, TimestampResponse, UniqueRespIdTableItem, UniqueRespIdTableResponse,
+    UnlockResourceRequest, VersionResponse, create_com_logical_link_request, event_item,
+    event_notification, io_ctl_request, param_item, pin_data, resource_data,
+    subscribe_event_request,
 };
 use worker_host::client::WorkerClient;
 use worker_host::service::Stopped;
@@ -127,11 +133,19 @@ pub enum HandleError {
     /// transport failure, or a status the worker does not use to reject a request. `call` names
     /// it.
     #[error("{call} failed: {message}")]
-    Rpc { call: &'static str, message: String },
+    Rpc {
+        call: &'static str,
+        code: tonic::Code,
+        message: String,
+    },
     /// The worker rejected the request, with a status it uses for that (see
     /// [`is_definite_refusal`]): it did not apply it.
     #[error("{call} rejected by the worker: {message}")]
-    WorkerRefused { call: &'static str, message: String },
+    WorkerRefused {
+        call: &'static str,
+        code: tonic::Code,
+        message: String,
+    },
     /// A worker request got no answer within the request timeout.
     #[error("{call} got no answer within {timeout:?}")]
     Timeout {
@@ -184,11 +198,19 @@ impl Default for HandleOptions {
     }
 }
 
+/// One decision of the guard: the RPC and what it was told.
+pub type Decision = (&'static str, Result<Grant, GuardRefusal>);
+
+/// The record of the guard's decisions (see [`GuardedHandle::enable_trace`]).
+pub type Trace = Arc<Mutex<Vec<Decision>>>;
+
 type Events = Arc<AsyncMutex<Streaming<EventNotification>>>;
 /// How the device is closed: the step, and the time it may take.
 struct DeviceClose {
     step: Step,
     budget: Duration,
+    /// Create the profile's links (not when the caller creates its own).
+    links: bool,
 }
 
 type Step = Pin<Box<dyn Future<Output = Result<(), String>> + Send>>;
@@ -219,6 +241,8 @@ struct State {
     suspended: Vec<IoCtlRequest>,
     /// The step that resumes them is registered and has not started.
     resume_registered: bool,
+    /// Every decision of the guard, when a check or the harness asked for the record.
+    trace: Option<Trace>,
 }
 
 /// The part of the handle the teardown steps share.
@@ -227,6 +251,9 @@ struct Shared {
     vci: Vci,
     module: u32,
     options: HandleOptions,
+    /// Subscribe to the events of a link the handle creates: not when something else (the
+    /// agent's job) subscribes, since a worker keeps one subscription per link.
+    subscribes: bool,
     state: Mutex<State>,
 }
 
@@ -237,8 +264,18 @@ impl Shared {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// The guard's decision on `request`, over the current state.
+    /// The guard's decision on `request`, over the current state, recorded in the trace.
     fn admit(&self, request: &Request<'_>) -> Result<Grant, HandleError> {
+        self.decide_request(request, true)
+    }
+
+    /// The decision on `request` without a record: a first look, before steps that must only
+    /// run for a request the guard will allow, which is then decided (and recorded) when sent.
+    fn check(&self, request: &Request<'_>) -> Result<Grant, HandleError> {
+        self.decide_request(request, false)
+    }
+
+    fn decide_request(&self, request: &Request<'_>, record: bool) -> Result<Grant, HandleError> {
         let state = self.lock();
         let ctx = Context {
             profile: &self.profile,
@@ -247,7 +284,16 @@ impl Shared {
             links: &state.links,
             learned: &state.learned,
         };
-        decide(&ctx, request).map_err(|refusal| HandleError::Refused {
+        let decision = decide(&ctx, request);
+        // A first look records only a refusal: the request is not decided again when it is
+        // refused, and a granted one is recorded when it is sent.
+        if let (true, Some(trace)) = (record || decision.is_err(), &state.trace) {
+            trace
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push((request.rpc(), decision.clone()));
+        }
+        decision.map_err(|refusal| HandleError::Refused {
             rpc: request.rpc(),
             refusal,
         })
@@ -400,7 +446,12 @@ impl Shared {
         cap: Option<Duration>,
     ) -> Result<Vec<u8>, HandleError> {
         self.lock().inflight.insert(cll.cll_handle, cop);
-        let result = match self.read_outcome(cll, cop, expected, cap).await {
+        let subscribed = self.ensure_events(client, cll).await;
+        let outcome = match subscribed {
+            Ok(()) => self.read_outcome(cll, cop, expected, cap).await,
+            Err(error) => Outcome::Running(error),
+        };
+        let result = match outcome {
             Outcome::Ended(result) => result,
             Outcome::Running(error) => {
                 // A cancel that fails leaves the primitive recorded as running.
@@ -419,6 +470,30 @@ impl Shared {
         result
     }
 
+    /// Subscribes to the events of `cll` through the guard when the handle holds no stream for
+    /// it (the agent's job subscribed itself while the handle did not, and ended; or the link
+    /// was created by a caller that reads events itself).
+    async fn ensure_events(
+        &self,
+        client: &mut WorkerClient,
+        cll: ComLogicalLinkHandle,
+    ) -> Result<(), HandleError> {
+        if self.lock().events.contains_key(&cll.cll_handle) {
+            return Ok(());
+        }
+        let request = SubscribeEventRequest {
+            handle: Some(subscribe_event_request::Handle::CllHandle(cll)),
+        };
+        self.admit(&Request::SubscribeEvent(&request))?;
+        let stream = self
+            .send("SubscribeEvent", client.subscribe_event(request))
+            .await?;
+        self.lock()
+            .events
+            .insert(cll.cll_handle, Arc::new(AsyncMutex::new(stream)));
+        Ok(())
+    }
+
     /// Cancels the primitive a dropped wait left running on `cll`, if there is one.
     async fn cancel_stale(
         &self,
@@ -431,6 +506,32 @@ impl Shared {
             self.lock().inflight.remove(&cll.cll_handle);
         }
         Ok(())
+    }
+
+    /// Cancels a primitive the handle never saw end, which may well have ended. The J2534
+    /// worker answers a cancel of an ended primitive with success; a worker that names the
+    /// handle as invalid in the error detail (`PDU_ERR_INVALID_HANDLE`, as `j2534-0404-service`
+    /// does for a forgotten one and `iso22900-service` passes on from the vendor library) has
+    /// nothing left to cancel either, and that is success too. Any other failure is returned.
+    async fn cancel_maybe_ended(
+        &self,
+        client: &mut WorkerClient,
+        cop: ComPrimitiveHandle,
+    ) -> Result<(), HandleError> {
+        let cancel = CancelComPrimitiveRequest {
+            cop_handle: Some(cop),
+        };
+        self.admit(&Request::CancelComPrimitive(&cancel))?;
+        let timeout = self.options.request_timeout;
+        match tokio::time::timeout(timeout, client.cancel_com_primitive(cancel)).await {
+            Err(_) => Err(HandleError::Timeout {
+                call: "CancelComPrimitive",
+                timeout,
+            }),
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(status)) if names_invalid_handle(&status) => Ok(()),
+            Ok(Err(status)) => Err(worker_error("CancelComPrimitive", &status)),
+        }
     }
 
     /// Cancels everything outstanding on `cll`: the primitive a dropped wait left running and
@@ -448,7 +549,7 @@ impl Shared {
             .remove(&cll.cll_handle)
             .unwrap_or_default();
         for (index, cop) in started.iter().enumerate() {
-            if let Err(error) = self.cancel(client, *cop).await {
+            if let Err(error) = self.cancel_maybe_ended(client, *cop).await {
                 // Still outstanding: this one and the rest not yet tried.
                 self.lock()
                     .started
@@ -548,6 +649,7 @@ impl Shared {
                 Ok(Err(status)) => {
                     return Outcome::Running(HandleError::Rpc {
                         call: "SubscribeEvent",
+                        code: status.code(),
                         message: status.to_string(),
                     });
                 }
@@ -814,6 +916,12 @@ async fn return_to_default_session(
         .resume_queues(&mut client)
         .await
         .map_err(|e| e.to_string())?;
+    // The events of the link are read from before the request goes out; a job that read them
+    // itself may have left the handle with no stream.
+    shared
+        .ensure_events(&mut client, cll)
+        .await
+        .map_err(|e| e.to_string())?;
     // The link's response wait as it is now, active and staged timings alike.
     let wait = shared.wait_for(cll);
     // DiagnosticSessionControl to the default session (ISO 14229-1 (2026) 9.2).
@@ -866,13 +974,28 @@ fn is_definite_refusal(code: tonic::Code) -> bool {
     )
 }
 
+/// Whether a status says, in its error detail, that a handle is invalid (unknown, or forgotten
+/// after the primitive ended).
+fn names_invalid_handle(status: &tonic::Status) -> bool {
+    vci_service_interface::error_detail_from_status(status)
+        .is_some_and(|detail| detail.pdu_error == PduError::PduErrInvalidHandle as i32)
+}
+
 /// The error of a failed worker call, by whether the worker rejected the request.
 fn worker_error(call: &'static str, status: &tonic::Status) -> HandleError {
-    let message = status.to_string();
-    if is_definite_refusal(status.code()) {
-        HandleError::WorkerRefused { call, message }
+    let (code, message) = (status.code(), status.to_string());
+    if is_definite_refusal(code) {
+        HandleError::WorkerRefused {
+            call,
+            code,
+            message,
+        }
     } else {
-        HandleError::Rpc { call, message }
+        HandleError::Rpc {
+            call,
+            code,
+            message,
+        }
     }
 }
 
@@ -1302,6 +1425,20 @@ impl GuardedHandle {
         options: HandleOptions,
         run: &RunGuard,
     ) -> Result<GuardedHandle, HandleError> {
+        Self::open_with(profile, vci, device, options, run, true).await
+    }
+
+    /// [`GuardedHandle::open`], with or without creating the profile's links. Without them the
+    /// handle holds the device only (and closes it with the run); whoever drives the handle
+    /// creates the links, through the handle's guarded methods.
+    pub(super) async fn open_with(
+        profile: &Profile,
+        vci: &Vci,
+        device: OpenedDevice,
+        options: HandleOptions,
+        run: &RunGuard,
+        links: bool,
+    ) -> Result<GuardedHandle, HandleError> {
         let client = device.client();
         let module = device.module_handle();
         let budget = device.close_budget();
@@ -1325,6 +1462,7 @@ impl GuardedHandle {
             DeviceClose {
                 step: close,
                 budget,
+                links,
             },
         )
         .await
@@ -1340,6 +1478,20 @@ impl GuardedHandle {
         module: ModuleHandle,
         options: HandleOptions,
         run: &RunGuard,
+    ) -> Result<GuardedHandle, HandleError> {
+        Self::attach_with(profile, vci, client, module, options, run, true).await
+    }
+
+    /// [`GuardedHandle::attach`], with or without creating the profile's links (see
+    /// [`GuardedHandle::open_with`]).
+    pub(super) async fn attach_with(
+        profile: &Profile,
+        vci: &Vci,
+        client: WorkerClient,
+        module: ModuleHandle,
+        options: HandleOptions,
+        run: &RunGuard,
+        links: bool,
     ) -> Result<GuardedHandle, HandleError> {
         let mut closing = client.clone();
         let timeout = options.request_timeout;
@@ -1364,6 +1516,7 @@ impl GuardedHandle {
             DeviceClose {
                 step: close,
                 budget,
+                links,
             },
         )
         .await
@@ -1378,6 +1531,7 @@ impl GuardedHandle {
         run: &RunGuard,
         close: DeviceClose,
     ) -> Result<GuardedHandle, HandleError> {
+        let links = close.links;
         let mut teardown = run.teardown();
         teardown.register_async_with_timeout(
             "close the device",
@@ -1391,11 +1545,16 @@ impl GuardedHandle {
                 vci: vci.clone(),
                 module: module.module_handle,
                 options,
+                subscribes: links,
                 state: Mutex::new(State::default()),
             }),
             teardown,
             links: Vec::new(),
         };
+        if !links {
+            // The device is held; the links are created by whoever drives the handle.
+            return Ok(handle);
+        }
         let endpoints: Vec<(usize, Link, Option<String>)> = {
             let state = handle.shared.lock();
             let ctx = Context {
@@ -1555,20 +1714,148 @@ impl GuardedHandle {
     /// Subscribes to the events of `cll` and keeps the stream for [`GuardedHandle::send_receive`].
     /// The subscription is not a request a check makes, and changes nothing on the device.
     async fn subscribe(&mut self, cll: ComLogicalLinkHandle) -> Result<(), HandleError> {
-        let stream = self
-            .shared
-            .send(
-                "SubscribeEvent",
-                self.client.clone().subscribe_event(SubscribeEventRequest {
-                    handle: Some(subscribe_event_request::Handle::CllHandle(cll)),
-                }),
-            )
-            .await?;
+        self.shared
+            .ensure_events(&mut self.client.clone(), cll)
+            .await
+    }
+
+    /// The profile's link a bound link serves, and the pinned ComParams already set on it.
+    fn profile_link(
+        &self,
+        cll: ComLogicalLinkHandle,
+    ) -> Result<(Link, BTreeSet<String>), HandleError> {
+        let state = self.shared.lock();
+        let bound = state
+            .links
+            .get(&cll.cll_handle)
+            .ok_or_else(|| HandleError::Setup("the link is not bound".to_owned()))?;
+        let ctx = Context {
+            profile: &self.shared.profile,
+            module: self.shared.module,
+            vci: &self.shared.vci,
+            links: &state.links,
+            learned: &state.learned,
+        };
+        let link = ctx
+            .endpoint_links()
+            .get(bound.endpoint)
+            .map(|link| (*link).clone())
+            .ok_or_else(|| HandleError::Setup("the link has no profile endpoint".to_owned()))?;
+        Ok((link, bound.set.clone()))
+    }
+
+    /// `SetUniqueRespIdTable` for a caller that sets up the link itself (the agent's job), with
+    /// the profile's own entries added: the caller gives the two identifiers, and the table
+    /// replaces the old one, so the formats and address bytes the profile pins are appended
+    /// (their ids resolved first) before the guard decides the whole table. The caller's own
+    /// values are compared with the profile's unchanged, so a mismatch is still refused. A
+    /// table that is not one entry is left as it is, for the guard to refuse.
+    pub(super) async fn set_table_completed(
+        &mut self,
+        mut request: SetUniqueRespIdTableRequest,
+    ) -> Result<vci_service_interface::Response, HandleError> {
+        if let Some(cll) = request.cll_handle {
+            let (link, _) = self.profile_link(cll)?;
+            let given: BTreeSet<String> = match request
+                .unique_resp_id_table
+                .as_ref()
+                .map(|table| table.unique_data.as_slice())
+            {
+                Some([entry]) => {
+                    let state = self.shared.lock();
+                    entry
+                        .params
+                        .iter()
+                        .filter_map(|item| match item.id.as_ref()? {
+                            param_item::Id::ParamName(name) => Some(canonical(name)),
+                            param_item::Id::ParamId(id) => state
+                                .learned
+                                .objects
+                                .get(&(ObjectType::ObjtComparam, *id))
+                                .map(|name| canonical(name)),
+                        })
+                        .collect()
+                }
+                _ => return self.set_unique_resp_id_table(request).await,
+            };
+            let mut added = Vec::new();
+            for name in table_required(&link) {
+                if !given.contains(&name) {
+                    let id = self.param_id(&spelling(&name, &link)).await?;
+                    added.push(value_of(&name, &link)?.item(id, PduParamClass::PduPcUniqueId));
+                }
+            }
+            if let Some([entry]) = request
+                .unique_resp_id_table
+                .as_mut()
+                .map(|table| table.unique_data.as_mut_slice())
+            {
+                entry.params.extend(added);
+            }
+        }
+        self.set_unique_resp_id_table(request).await
+    }
+
+    /// `ConnectComLogicalLink` for a caller that sets up the link itself (the agent's job): the
+    /// pinned ComParams the caller did not set (address modes, the functional identifier, the
+    /// filler, the tester-present message, the profile's own) are set at the profile's value
+    /// first, each decided like any request, so the guard lets the connect through.
+    pub(super) async fn connect_completing(
+        &mut self,
+        request: ConnectComLogicalLinkRequest,
+    ) -> Result<vci_service_interface::Response, HandleError> {
+        if let Some(cll) = request.cll_handle {
+            let (link, set) = self.profile_link(cll)?;
+            for name in required(&link, self.shared.profile.class) {
+                if set.contains(&name) {
+                    continue;
+                }
+                let value = value_of(&name, &link)?;
+                let id = self.param_id(&spelling(&name, &link)).await?;
+                self.set_com_param(SetComParamRequest {
+                    cll_handle: Some(cll),
+                    param_item: Some(value.item(id, PduParamClass::PduPcSpecified)),
+                })
+                .await?;
+            }
+        }
+        self.connect_com_logical_link(request).await
+    }
+
+    /// Turns the trace of the guard's decisions on and returns it: every decision from now on is
+    /// appended, whoever asked (a check, the handle's own set-up, a teardown step).
+    pub fn enable_trace(&self) -> Trace {
         self.shared
             .lock()
-            .events
-            .insert(cll.cll_handle, Arc::new(AsyncMutex::new(stream)));
-        Ok(())
+            .trace
+            .get_or_insert_with(Trace::default)
+            .clone()
+    }
+
+    /// `SubscribeEvent` for a caller that reads the events itself (the agent's job). The stream
+    /// is the caller's: the handle keeps none, and so reads no events of the link meanwhile.
+    pub(super) async fn subscribe_event(
+        &mut self,
+        request: SubscribeEventRequest,
+    ) -> Result<Streaming<EventNotification>, HandleError> {
+        self.shared.admit(&Request::SubscribeEvent(&request))?;
+        self.shared
+            .send(
+                "SubscribeEvent",
+                self.client.clone().subscribe_event(request),
+            )
+            .await
+    }
+
+    /// The decision on a request the handle never sends (the harness owns the module), for the
+    /// trace; always a refusal.
+    pub(super) fn decide_module_request(&self, request: &Request<'_>) -> HandleError {
+        // Nothing is sent for a granted one, so only a refusal is recorded: the trace keeps
+        // matching what the worker received.
+        match self.shared.check(request) {
+            Err(error) => error,
+            Ok(_) => HandleError::Setup(format!("{} is not offered by the handle", request.rpc())),
+        }
     }
 
     /// `GetResourceIds`; the resource each returned id stands for is learned.
@@ -1671,7 +1958,9 @@ impl GuardedHandle {
                     active: Timings::default(),
                     staged: Timings::default(),
                 });
-            self.subscribe(cll).await?;
+            if self.shared.subscribes {
+                self.subscribe(cll).await?;
+            }
         }
         Ok(response)
     }
@@ -1810,7 +2099,7 @@ impl GuardedHandle {
         request: DisconnectComLogicalLinkRequest,
     ) -> Result<vci_service_interface::Response, HandleError> {
         self.shared
-            .admit(&Request::DisconnectComLogicalLink(&request))?;
+            .check(&Request::DisconnectComLogicalLink(&request))?;
         if let Some(cll) = request.cll_handle {
             self.shared
                 .cancel_outstanding(&mut self.client.clone(), cll)
@@ -1821,6 +2110,8 @@ impl GuardedHandle {
         }
         self.settle_session(request.cll_handle, "disconnected")
             .await?;
+        self.shared
+            .admit(&Request::DisconnectComLogicalLink(&request))?;
         self.shared
             .send(
                 "DisconnectComLogicalLink",
@@ -1834,9 +2125,8 @@ impl GuardedHandle {
         &mut self,
         request: DestroyComLogicalLinkRequest,
     ) -> Result<vci_service_interface::Response, HandleError> {
-        let grant = self
-            .shared
-            .admit(&Request::DestroyComLogicalLink(&request))?;
+        self.shared
+            .check(&Request::DestroyComLogicalLink(&request))?;
         if let Some(cll) = request.cll_handle {
             self.shared
                 .cancel_outstanding(&mut self.client.clone(), cll)
@@ -1846,6 +2136,9 @@ impl GuardedHandle {
                 .await?;
         }
         self.settle_session(request.cll_handle, "destroyed").await?;
+        let grant = self
+            .shared
+            .admit(&Request::DestroyComLogicalLink(&request))?;
         let response = self
             .shared
             .send(
@@ -1974,12 +2267,17 @@ impl GuardedHandle {
         drop(provisional);
         let response = sent?;
         if let (Some(cll), Some(cop)) = (cll, response.cop_handle) {
-            self.shared
-                .lock()
-                .started
-                .entry(cll.cll_handle)
-                .or_default()
-                .push(cop);
+            let mut state = self.shared.lock();
+            let started = state.started.entry(cll.cll_handle).or_default();
+            if self.shared.subscribes {
+                started.push(cop);
+            } else {
+                // The handle does not read this link's events (a job does), so it never sees a
+                // primitive end and would cancel every one a long job started, one request each,
+                // at the disconnect. Only the latest is kept: cancelling it stops what may still
+                // run, and the link's disconnect ends the rest.
+                *started = vec![cop];
+            }
         }
         // The staged timings are in effect once the update has finished successfully; until
         // then (and when it fails, which is returned) the longer of the two is waited for.
@@ -2003,6 +2301,10 @@ impl GuardedHandle {
         cll: ComLogicalLinkHandle,
         request: &[u8],
     ) -> Result<Vec<u8>, HandleError> {
+        // The events are read from before the request goes out.
+        self.shared
+            .ensure_events(&mut self.client.clone(), cll)
+            .await?;
         let cop = self
             .start_com_primitive(send_receive_request(cll, request))
             .await?
@@ -2430,6 +2732,7 @@ mod tests {
             vci: vci.clone(),
             module: 1,
             options: HandleOptions::default(),
+            subscribes: true,
             state: Mutex::new(State::default()),
         }
     }
@@ -2507,11 +2810,13 @@ mod tests {
         };
         let rejected = HandleError::WorkerRefused {
             call: "X",
+            code: tonic::Code::NotFound,
             message: String::new(),
         };
         let ambiguous = [
             HandleError::Rpc {
                 call: "X",
+                code: tonic::Code::Unavailable,
                 message: String::new(),
             },
             HandleError::Timeout {

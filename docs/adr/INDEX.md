@@ -323,6 +323,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-331](ADR-331-debug-builds-treat-iso22900-mock-as-the-simulator.md) | Debug Builds Treat `iso22900-mock` as the Simulator | Accepted | `agent` policy (`identify`), `crates/agent/docs/ngr-agent.md`, `iso22900-service` definition end-to-end test, design 8.2.4; ADR-247, ADR-299 |
 | [ADR-332](ADR-332-a-diag-calls-idempotency-is-a-one-instruction-section.md) | A `diag` Call's Idempotency Is a One-Instruction Section | Accepted | `diag-frontend` lowering of `@idempotency` and section ranges, `starlark-subset.md` 4.5, 4.6, design 8.2.5; ADR-233, ADR-301, ADR-329, ADR-330 |
 | [ADR-333](ADR-333-hardware-check-guard-is-one-pure-decision-and-teardown-is-owned-by-the-run-guard.md) | The Hardware-Check Guard Is One Pure Decision over the Profile, and Teardown Is Owned by the Run Guard | Accepted | `ngr-hw-checks` guard, teardown, `report::RunGuard`, design 13.5; ADR-275 items 4 and 6 |
+| [ADR-334](ADR-334-agent-runner-is-generic-over-a-worker-client-and-the-harness-guards-it.md) | The Agent Runner Is Generic over a Worker Client, and the Harness Guards It | Accepted | `agent` worker-client trait and generic runner, `ngr-hw-checks` `guard::runner`, design 13.5; ADR-275 item 4, ADR-333, ADR-235 |
 
 ## Status Legend
 
@@ -667,6 +668,7 @@ the predecessor repository these ADRs came from.
 - ADR-299
 - ADR-312
 - ADR-333
+- ADR-334
 
 ### Timestamps / Clock
 - ADR-057 (amended by ADR-102)

@@ -2,6 +2,7 @@
 
 use std::time::Duration;
 
+use crate::client::WorkerApi;
 use diag_ir::declaration::{EcuVariant, Protocol};
 use tonic::Streaming;
 use vci_service_interface::{
@@ -13,7 +14,6 @@ use vci_service_interface::{
     SubscribeEventRequest, UniqueRespIdTableItem, create_com_logical_link_request, param_item,
     pin_data, resource_data, subscribe_event_request,
 };
-use worker_host::client::WorkerClient;
 
 use crate::host::{HostError, unary};
 use crate::policy::Permission;
@@ -283,8 +283,8 @@ fn micros(ms: u32) -> u32 {
     ms.saturating_mul(1_000)
 }
 
-async fn comparam_id(
-    client: &mut WorkerClient,
+async fn comparam_id<C: WorkerApi>(
+    client: &mut C,
     deadline: Duration,
     shortname: &str,
 ) -> Result<u32, HostError> {
@@ -307,8 +307,8 @@ async fn comparam_id(
 /// response ID table, connects it and subscribes to its events (ADR-235 item 4). The worker
 /// answers 0x78 itself (`CP_RC78Handling`), so the procedure only sees final responses. If a
 /// step fails, what was already opened is closed again.
-pub async fn open(
-    client: &mut WorkerClient,
+pub async fn open<C: WorkerApi>(
+    client: &mut C,
     config: &LinkConfig,
     deadline: Duration,
 ) -> Result<Link, HostError> {
@@ -337,12 +337,60 @@ impl OpenFailure {
 }
 
 /// [`open`], also telling whether a failed open left anything open on the worker.
-pub(crate) async fn open_tracked(
-    client: &mut WorkerClient,
+pub(crate) async fn open_tracked<C: WorkerApi>(
+    client: &mut C,
     config: &LinkConfig,
     deadline: Duration,
 ) -> Result<Link, OpenFailure> {
     config.validate().map_err(OpenFailure::clean)?;
+    // A client that holds the module (the hardware harness's guarded client) has it opened and
+    // closes it itself: the job neither lists, connects nor disconnects it.
+    let module_handle = match client.held_module() {
+        Some(held) => held,
+        None => open_module(client, deadline).await?,
+    };
+
+    let permission = vci_permission(client, deadline, module_handle).await;
+
+    let cll_handle = match create_link(client, config, deadline, module_handle).await {
+        Ok(cll_handle) => cll_handle,
+        Err(error) => {
+            // A module the client holds is not disconnected here, so that proves nothing: the
+            // failed create left nothing behind only when the worker refused it. A create that
+            // timed out or failed otherwise may have made a link nobody holds a handle for
+            // (ADR-258).
+            let cleaned_up = if client.held_module().is_some() {
+                nothing_created(&error)
+            } else {
+                disconnect_module(client, module_handle, deadline)
+                    .await
+                    .is_ok()
+            };
+            return Err(OpenFailure { error, cleaned_up });
+        }
+    };
+    match set_up_link(client, config, deadline, cll_handle).await {
+        Ok(events) => Ok(Link {
+            module_handle,
+            cll_handle,
+            events,
+            permission,
+        }),
+        Err(error) => {
+            let cleaned_up = teardown(client, module_handle, cll_handle, deadline)
+                .await
+                .is_ok();
+            Err(OpenFailure { error, cleaned_up })
+        }
+    }
+}
+
+/// Opens the worker's only module (several are refused) and returns its handle. A module that
+/// fails to connect is disconnected again.
+async fn open_module<C: WorkerApi>(
+    client: &mut C,
+    deadline: Duration,
+) -> Result<ModuleHandle, OpenFailure> {
     let modules = unary(
         deadline,
         "GetModuleIds",
@@ -389,31 +437,41 @@ pub(crate) async fn open_tracked(
             .is_ok();
         return Err(OpenFailure { error, cleaned_up });
     }
+    Ok(module_handle)
+}
 
-    let permission = vci_permission(client, deadline, module_handle).await;
+/// The setup error `create_link` returns when `GetResourceIds` finds no resource, before any
+/// `CreateComLogicalLink` is sent.
+const NO_RESOURCE: &str = "no resource for the protocol";
 
-    let cll_handle = match create_link(client, config, deadline, module_handle).await {
-        Ok(cll_handle) => cll_handle,
-        Err(error) => {
-            let cleaned_up = disconnect_module(client, module_handle, deadline)
-                .await
-                .is_ok();
-            return Err(OpenFailure { error, cleaned_up });
-        }
+/// Whether a failed `create_link` created nothing: it failed in `GetResourceIds`, before any
+/// `CreateComLogicalLink` was sent, or the worker (or the guard in front of it, as
+/// `PermissionDenied`) refused the create. A timeout or any other status of the create, or a
+/// create that answered without a link handle, does not say.
+fn nothing_created(error: &HostError) -> bool {
+    use tonic::Code::{
+        AlreadyExists, FailedPrecondition, InvalidArgument, NotFound, PermissionDenied,
+        ResourceExhausted, Unauthenticated, Unimplemented,
     };
-    match set_up_link(client, config, deadline, cll_handle).await {
-        Ok(events) => Ok(Link {
-            module_handle,
-            cll_handle,
-            events,
-            permission,
-        }),
-        Err(error) => {
-            let cleaned_up = teardown(client, module_handle, cll_handle, deadline)
-                .await
-                .is_ok();
-            Err(OpenFailure { error, cleaned_up })
+    match error {
+        HostError::Rpc {
+            rpc: "GetResourceIds",
+            ..
         }
+        | HostError::WorkerUnresponsive("GetResourceIds") => true,
+        HostError::Rpc { status, .. } => matches!(
+            status.code(),
+            PermissionDenied
+                | InvalidArgument
+                | FailedPrecondition
+                | NotFound
+                | ResourceExhausted
+                | Unimplemented
+                | AlreadyExists
+                | Unauthenticated
+        ),
+        HostError::Setup(message) => *message == NO_RESOURCE,
+        _ => false,
     }
 }
 
@@ -421,8 +479,8 @@ pub(crate) async fn open_tracked(
 /// it fronts, since only the simulator may be written to. A VCI whose version cannot be read
 /// is not the simulator: the job stays read-only, as it would in a release build.
 #[cfg(debug_assertions)]
-async fn vci_permission(
-    client: &mut WorkerClient,
+async fn vci_permission<C: WorkerApi>(
+    client: &mut C,
     deadline: Duration,
     module_handle: ModuleHandle,
 ) -> Permission {
@@ -448,8 +506,8 @@ async fn vci_permission(
 
 /// A release build never asks: its links are read-only whatever the VCI (ADR-247).
 #[cfg(not(debug_assertions))]
-async fn vci_permission(
-    _client: &mut WorkerClient,
+async fn vci_permission<C: WorkerApi>(
+    _client: &mut C,
     _deadline: Duration,
     _module_handle: ModuleHandle,
 ) -> Permission {
@@ -476,8 +534,8 @@ pub fn resource_data(config: &LinkConfig) -> ResourceData {
     }
 }
 
-async fn create_link(
-    client: &mut WorkerClient,
+async fn create_link<C: WorkerApi>(
+    client: &mut C,
     config: &LinkConfig,
     deadline: Duration,
     module_handle: ModuleHandle,
@@ -494,7 +552,7 @@ async fn create_link(
     .resource_id_list
     .and_then(|list| list.resource_id_data_array.into_iter().next())
     .and_then(|data| data.resource_id_array.into_iter().next())
-    .ok_or(HostError::Setup("no resource for the protocol"))?;
+    .ok_or(HostError::Setup(NO_RESOURCE))?;
 
     unary(
         deadline,
@@ -512,8 +570,8 @@ async fn create_link(
     .ok_or(HostError::Setup("no logical link handle"))
 }
 
-async fn set_up_link(
-    client: &mut WorkerClient,
+async fn set_up_link<C: WorkerApi>(
+    client: &mut C,
     config: &LinkConfig,
     deadline: Duration,
     cll_handle: ComLogicalLinkHandle,
@@ -609,8 +667,8 @@ async fn set_up_link(
 }
 
 /// Disconnects and destroys the logical link and disconnects the module.
-pub async fn close(
-    client: &mut WorkerClient,
+pub async fn close<C: WorkerApi>(
+    client: &mut C,
     link: Link,
     deadline: Duration,
 ) -> Result<(), HostError> {
@@ -625,8 +683,8 @@ pub async fn close(
 }
 
 /// Runs every step even after one fails, and returns the first failure.
-pub(crate) async fn teardown(
-    client: &mut WorkerClient,
+pub(crate) async fn teardown<C: WorkerApi>(
+    client: &mut C,
     module_handle: ModuleHandle,
     cll_handle: ComLogicalLinkHandle,
     deadline: Duration,
@@ -655,11 +713,15 @@ pub(crate) async fn teardown(
     disconnected.and(destroyed).and(module_disconnected)
 }
 
-async fn disconnect_module(
-    client: &mut WorkerClient,
+async fn disconnect_module<C: WorkerApi>(
+    client: &mut C,
     module_handle: ModuleHandle,
     deadline: Duration,
 ) -> Result<(), HostError> {
+    // A module the client holds is closed by its owner.
+    if client.held_module().is_some() {
+        return Ok(());
+    }
     let result = unary(
         deadline,
         "ModuleDisconnect",
@@ -684,6 +746,35 @@ mod tests {
 
     use super::*;
     use crate::JobDocument;
+
+    /// Only a refusal or a missing resource proves a failed create left no link: a create that
+    /// answered without a handle, or a timeout, may have created one the runner cannot name.
+    #[test]
+    fn a_failed_create_is_clean_only_when_nothing_can_have_been_created() {
+        assert!(nothing_created(&HostError::Setup(NO_RESOURCE)));
+        assert!(!nothing_created(&HostError::Setup(
+            "no logical link handle"
+        )));
+        assert!(nothing_created(&HostError::Rpc {
+            rpc: "CreateComLogicalLink",
+            status: Box::new(tonic::Status::permission_denied("refused")),
+        }));
+        assert!(!nothing_created(&HostError::Rpc {
+            rpc: "CreateComLogicalLink",
+            status: Box::new(tonic::Status::unavailable("gone")),
+        }));
+        assert!(!nothing_created(&HostError::WorkerUnresponsive(
+            "CreateComLogicalLink"
+        )));
+        // The resource lookup comes before the create, so any failure of it left no link.
+        assert!(nothing_created(&HostError::Rpc {
+            rpc: "GetResourceIds",
+            status: Box::new(tonic::Status::unavailable("gone")),
+        }));
+        assert!(nothing_created(&HostError::WorkerUnresponsive(
+            "GetResourceIds"
+        )));
+    }
 
     /// The example ECU's protocol: UDS over ISO 15765 at 500 kbit/s on 7E0 / 7E8.
     fn protocol(params: &[(&str, i64)]) -> ProtocolT {

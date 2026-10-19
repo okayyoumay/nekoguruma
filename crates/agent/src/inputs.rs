@@ -23,13 +23,13 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use crate::client::WorkerApi;
 use diag_ir::{DiagHost, RuntimeInput, Source};
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
 use vci_service_interface::{
     DataItem, GetObjectIdRequest, IoCtlRequest, ObjectType, data_item, io_ctl_request,
 };
-use worker_host::client::WorkerClient;
 
 use crate::host::{HostError, unary};
 use crate::link::Link;
@@ -169,9 +169,9 @@ fn vbatt_lookup(found: Result<u32, HostError>) -> Result<VbattId, HostError> {
 /// worker does not know the name, the VCI offers no voltage: [`Reading::CannotBeEstablished`].
 /// A D-PDU worker reports an unknown name as an internal error, which stays a [`HostError`]
 /// (it fails the check all the same). Blocks on `handle`, like the host's other primitives.
-pub(crate) fn read_supply_voltage(
+pub(crate) fn read_supply_voltage<C: WorkerApi>(
     handle: &Handle,
-    client: &mut WorkerClient,
+    client: &mut C,
     link: &Link,
     cached: &mut VbattId,
     deadline: Duration,
@@ -666,7 +666,10 @@ mod tests {
 
     /// The real host serves as sender and inputs in one call (compile-level check).
     #[expect(dead_code, reason = "only has to compile")]
-    fn worker_host_resolves_any_source(host: &mut crate::WorkerHost, source: Source) {
+    fn worker_host_resolves_any_source(
+        host: &mut crate::WorkerHost<worker_host::client::WorkerClient>,
+        source: Source,
+    ) {
         let _ = resolve_source(source, &ServiceSources::default(), host);
     }
 

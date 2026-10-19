@@ -18,8 +18,9 @@
 //!   request through [`decide`], keeps the link table and the learned ids, opens the profile's links
 //!   and registers the teardown steps.
 //!
-//! The seam that routes the agent's job runner through [`decide`] is not part of this crate yet;
-//! a direct check's seam is [`GuardedHandle`].
+//! - [`GuardedClient`]: the same handle as the agent runner's worker client (ADR-334), which holds
+//!   the module, decides every call the job makes and completes the job's link set-up from the
+//!   profile.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -43,9 +44,11 @@ use crate::profile::{Class, Link, Profile, Setup, Vci};
 mod handle;
 mod ioctl;
 mod link;
+mod runner;
 mod uds;
 
-pub use handle::{GuardedHandle, HandleError, HandleOptions};
+pub use handle::{Decision, GuardedHandle, HandleError, HandleOptions, Trace};
+pub use runner::GuardedClient;
 
 /// A worker request, one variant per RPC of `service VciService` in `service.proto`. [`decide`]
 /// matches it without a catch-all arm, so an RPC added to the service does not compile until it

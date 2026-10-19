@@ -51,9 +51,15 @@ present.
    worker accepted the request) and refuses `ConnectComLogicalLink` until all are: the baud rate,
    the physical request and response identifiers, the functional identifier if the profile has
    one, the CAN ID formats when the width or addressing is not 11-bit normal, the address byte
-   when the addressing has one, the filler handling on every link (the J2534 preset pads, so an
-   unpadded profile sets it to 0; a padded one sets it to 1 and sets the filler byte), and every
-   `[link.comparams]` entry. The format ComParams' padding bits (Table B.13, bits 5 and 4) cannot
+   when the addressing has one, the request and tester-present address modes on every link (the J2534 preset of
+   `ISO_14229_3_on_ISO_15765_2` sends tester present functionally to its own 0x7DF with handling
+   on, so a profile without a functional identifier sets both to physical), the filler handling
+   on every link (the preset pads, so an unpadded profile sets it to 0; a padded one sets it to 1
+   and sets the filler byte), and every
+   `[link.comparams]` entry. The other preset defaults of a ComParam with a rule (formats 0x05,
+   address 0, ids 0x7E0, 0x7E8 and 0x7DF) are pinned above or equal the profile's whenever the
+   profile does not need the ComParam; the D-PDU API side has library-specific defaults the guard
+   cannot know, so the same set is required there too. The format ComParams' padding bits (Table B.13, bits 5 and 4) cannot
    contradict the pinned handling: an overwrite against the profile's padding is refused. Both workers replace the response table with the one a request carries, so a
    `SetUniqueRespIdTable` must itself carry every pinned ComParam a table can hold, each at the
    profile's value, in exactly one entry (the link addresses one ECU, and the J2534 worker takes

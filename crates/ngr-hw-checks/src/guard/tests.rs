@@ -1012,6 +1012,16 @@ fn a_link_connects_only_once_the_profiles_comparams_are_set() {
     assert!(why.contains("cp_canfuncreqid"), "{why}");
     let grant = set(&env, unum("CP_CanFuncReqId", 0x7DF));
     apply(&mut env, grant);
+    // The worker's preset sends tester present functionally: both modes are pinned.
+    let Err(GuardRefusal::LinkSetup(why)) = connect(&env) else {
+        panic!("connect should be refused");
+    };
+    assert!(why.contains("cp_testerpresentaddrmode"), "{why}");
+    for (name, value) in [("CP_RequestAddrMode", 1), ("CP_TesterPresentAddrMode", 0)] {
+        let grant = set(&env, unum(name, value));
+        assert!(grant.is_ok(), "{name}");
+        apply(&mut env, grant);
+    }
     // The worker's preset pads, so an unpadded profile has to switch the padding off.
     let Err(GuardRefusal::LinkSetup(why)) = connect(&env) else {
         panic!("connect should be refused");
@@ -1056,7 +1066,9 @@ fn the_connect_check_requires_what_the_profile_pins() {
             "cp_canrespusdtextaddr",
             "cp_canrespusdtformat",
             "cp_canrespusdtid",
+            "cp_requestaddrmode",
             "cp_stmin",
+            "cp_testerpresentaddrmode",
         ]
     );
     // The plain 11-bit link needs the baud rate and the identifiers only.
@@ -1076,7 +1088,9 @@ fn the_connect_check_requires_what_the_profile_pins() {
             "cp_baudrate",
             "cp_canfillerbytehandling",
             "cp_canphysreqid",
-            "cp_canrespusdtid"
+            "cp_canrespusdtid",
+            "cp_requestaddrmode",
+            "cp_testerpresentaddrmode"
         ]
     );
 }
@@ -1361,6 +1375,65 @@ fn raw_frame_flags_must_equal_the_profile_in_both_directions() {
     };
     assert!(t0_send(&[TxFlagBit::TxFlagIso15765FramePad]).is_ok());
     assert!(t0_send(&[]).is_err());
+}
+
+#[test]
+fn the_address_modes_are_set_before_connect() {
+    // Without a functional identifier both modes must be physical, and the preset's tester
+    // present (functional, to its own identifier) must not be left in place.
+    let mut env = Env::linked(
+        profile_with(
+            "T3",
+            &L {
+                functional: None,
+                ..L::default()
+            },
+        ),
+        false,
+    );
+    let required = link::required(env.endpoint_link(0));
+    let others: Vec<String> = required
+        .iter()
+        .filter(|n| !n.ends_with("addrmode"))
+        .cloned()
+        .collect();
+    env.links.get_mut(&CLL).unwrap().set.extend(others);
+    let Err(GuardRefusal::LinkSetup(why)) = connect(&env) else {
+        panic!("connect should be refused");
+    };
+    assert!(
+        why.contains("cp_requestaddrmode") && why.contains("cp_testerpresentaddrmode"),
+        "{why}"
+    );
+    // Functional is refused, so the preset's cannot be kept by setting it again.
+    assert!(set(&env, unum("CP_TesterPresentAddrMode", 1)).is_err());
+    assert!(set(&env, unum("CP_RequestAddrMode", 2)).is_err());
+    let grant = set(&env, unum("CP_RequestAddrMode", 1));
+    apply(&mut env, grant);
+    assert!(
+        connect(&env).is_err(),
+        "the tester present mode is still missing"
+    );
+    let grant = set(&env, unum("CP_TesterPresentAddrMode", 0));
+    apply(&mut env, grant);
+    assert_eq!(connect(&env), Ok(Grant::Pass));
+
+    // With a functional identifier either value is allowed, but both are still to be set.
+    let mut env = Env::ready(profile("T3"));
+    env.links.get_mut(&CLL).unwrap().set.clear();
+    let required = link::required(env.endpoint_link(0));
+    let others: Vec<String> = required
+        .into_iter()
+        .filter(|n| !n.ends_with("addrmode"))
+        .collect();
+    env.links.get_mut(&CLL).unwrap().set.extend(others);
+    assert!(connect(&env).is_err());
+    for (name, value) in [("CP_RequestAddrMode", 2), ("CP_TesterPresentAddrMode", 1)] {
+        let grant = set(&env, unum(name, value));
+        assert!(grant.is_ok(), "{name}");
+        apply(&mut env, grant);
+    }
+    assert_eq!(connect(&env), Ok(Grant::Pass));
 }
 
 #[test]

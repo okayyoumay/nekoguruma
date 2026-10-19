@@ -199,7 +199,8 @@ Anything it cannot classify is refused.
   VCI end, created for the end whose `channel` the resource's protocol name is, or else whose
   `protocol` it is; a SocketCAN end has no worker link). `ConnectComLogicalLink` is refused until
   the pinned ComParams (baud rate, request, response and functional identifiers, formats and
-  address byte when the link needs them, the filler handling (0 on an unpadded profile, since
+  address byte when the link needs them, the request and tester-present address modes (physical when the profile has no functional
+  identifier, since the worker's preset sends tester present functionally), the filler handling (0 on an unpadded profile, since
   the worker's preset pads) and, when the profile pads, the filler byte, `[link.comparams]`) have
   been set to the profile's values, which the caller records from `SetsComParams` grants. A
   `SetUniqueRespIdTable` replaces the table on both workers, so it must carry the request and

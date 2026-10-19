@@ -464,6 +464,14 @@ pub(super) fn table_required(link: &Link) -> Vec<String> {
 /// defaults are not the profile's.
 pub(super) fn required(link: &Link) -> Vec<String> {
     let mut names = vec!["cp_baudrate", "cp_canphysreqid", "cp_canrespusdtid"];
+    // The J2534 preset of ISO_14229_3_on_ISO_15765_2 (`comparam_defaults.rs`) sends tester
+    // present functionally (`CP_TesterPresentAddrMode` 1, to the preset's 0x7DF) with handling
+    // on, and requests physically (`CP_RequestAddrMode` 1). Both modes are pinned, so a profile
+    // without a functional identifier is set to physical and nothing goes to the preset's. The
+    // other defaults of a ComParam with a rule (formats 0x05, address 0, filler 0x55 with the
+    // handling on, ids 0x7E0/0x7E8/0x7DF) are pinned above, or equal the profile's whenever the
+    // profile does not need the ComParam.
+    names.extend(["cp_requestaddrmode", "cp_testerpresentaddrmode"]);
     let functional = link.functional_id.is_some();
     if functional {
         names.push("cp_canfuncreqid");

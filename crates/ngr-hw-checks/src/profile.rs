@@ -222,6 +222,8 @@ struct RawProfile {
     power: Option<Power>,
     #[serde(default, rename = "hardware-control")]
     hardware_controls: Vec<HardwareControl>,
+    #[serde(default)]
+    report_full_identifiers: bool,
 }
 
 /// The attached setup: one link, or a T0 profile's two endpoints.
@@ -245,6 +247,9 @@ pub struct Profile {
     pub operations: Vec<Operation>,
     pub power: Option<Power>,
     pub hardware_controls: Vec<HardwareControl>,
+    /// The profile asks for VINs and serial numbers in full in the run's report (design 13.5
+    /// "Reports"); without it they are masked. Off unless the profile says `true`.
+    pub report_full_identifiers: bool,
 }
 
 impl Profile {
@@ -391,6 +396,7 @@ pub fn parse(text: &str) -> Result<Profile, ProfileError> {
         operations,
         power: raw.power,
         hardware_controls: raw.hardware_controls,
+        report_full_identifiers: raw.report_full_identifiers,
     })
 }
 

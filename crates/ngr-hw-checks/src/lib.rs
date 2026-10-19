@@ -3,6 +3,7 @@
 //! - [`profile`]: the hardware profile `NGR_HW_PROFILE` names, checked against its class
 //! - [`device`]: the module match, whether the device a worker reports is the profile's
 //! - [`open`]: starting the profile's worker, running the module match and opening the device
+//! - [`report`]: the report of a run, written to a directory only the running user can read
 //! - [`CheckDecl`]: what a check needs, as static data the harness reads without running it
 //! - [`permits`] and [`listing`]: which checks a profile permits
 //! - [`begin`]: the first call of every `hw_` test, which fails without a permitting profile
@@ -15,6 +16,7 @@
 pub mod device;
 pub mod open;
 pub mod profile;
+pub mod report;
 
 pub use profile::{Class, Operation, Profile, ProfileError};
 

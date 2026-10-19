@@ -3,7 +3,7 @@
 `ngr-hw-checks` is the harness of the real-hardware checks (design 13.5, ADR-275). This page
 describes the hardware profile it reads, how a check declares what it needs, and how the two are
 compared, how the device a worker reports is matched with the profile, and how the harness opens
-it. The guarded VCI handle and the report writer are not part of the crate yet.
+it, and how a run's report is written. The guarded VCI handle is not part of the crate yet.
 
 ## Running
 
@@ -31,6 +31,7 @@ A TOML file outside the repository. Unknown keys are refused.
 | `[link]` | T1 to T3: the link (below) |
 | `[[endpoint]]` | T0 only, exactly two: each names a `[endpoint.vci]`, with its `channel` (such as the protocol name of an SAE J2534-2 clause 7 additional channel) at both ends when both are on one VCI, or a `socketcan` interface (such as `"can0"`), and a `[endpoint.link]`. At least one end is a VCI channel, the two ends differ (two ends on one VCI by their `channel`), and their links are one bus: the same `baud_rate` and `id_bits`, each end's `request_id` the other's `response_id` |
 | `allow` | Optional. Narrows the class to the listed operations: `"configuration-write"`, `"routine"`, `"reprogramming"`, `"fault-injection"`. Without it the profile keeps its class's operations |
+| `report_full_identifiers` | Optional, `false` by default: `true` puts VINs and serial numbers in the run's report in full instead of masked (see "Reports") |
 | `expendable_ecu` | T2 only: the ECU may be reprogrammed |
 | `[power]` | T1 and T2 only: the commands that switch the supply `off` and `on`, each a program and its arguments |
 | `[[hardware-control]]` | T1 and T2 only: a hardware control the wiring is safe for, with its complete parameters (below) |
@@ -173,3 +174,38 @@ check the same way before it reaches any device. A `hw_` test in any crate decla
 check then sends is limited by the guarded handle (design 13.5 "Guarded VCI access"): a T2 write
 passes only inside an authorized job, and T3's other limits (no DTC clearing, resets, security
 access or session beyond the extended one) are the class's lists, not declared operations.
+
+## Reports
+
+Each run writes a report (design 13.5 "Reports"). A check builds it with
+`ngr_hw_checks::report::Report::new(&profile)`, adds its results with `record` (passed, failed or
+refused, with a message) and `record_refusal`, adds what the opened device reported with
+`set_device`, and ends with `write`. `hw_the_profile_permits_a_check` does this.
+
+- **Content (TOML).** `started_at` (UTC, RFC 3339), `host` (the `HOSTNAME` or `COMPUTERNAME`
+  variable, else `/etc/hostname`), `os` (the OS and architecture the harness was built for) with
+  `os_version` where `/etc/os-release` gives one, `class`, `identifiers_in_full`, a `[device]`
+  table and one `[[check]]` table per result. `[device]` holds `abi` (the worker's), `vendor` (the
+  library the profile names), `model` (the module's `vendor_module_name`), `firmware_version` and
+  `library_version` (J2534: the strings the worker reports; D-PDU API: the coded numbers as
+  `major.minor.revision`). It is absent when no check opened a device. The API offers no
+  separate vendor or model field, so those two are the library name and the module name. No
+  serial-number field is read from the device.
+- **Place.** `nekoguruma/hw-reports` in the user's data directory: `$XDG_DATA_HOME` or
+  `~/.local/share` on Linux, `~/Library/Application Support` on macOS, `%LOCALAPPDATA%` on
+  Windows. A file is named by the run's start time and process id (`20261019T101500Z-4242.toml`),
+  with a counter if that name exists; a report never overwrites another. A directory inside this
+  repository's work tree is refused. How long reports are kept is up to the owner of the setup.
+- **Permissions.** On Unix the directories are created with mode 0700 and each file with mode 0600
+  in the creating call; an existing report directory that group or others can access is refused.
+  On Windows the files take the ACLs of the user's profile, which by default only that user and
+  administrators can read; the harness sets no ACL.
+- **Masking.** Unless the profile sets `report_full_identifiers`, a masked value is `****` and its
+  last 4 characters (all of a value shorter than 8 characters is replaced by `****`). Masked are
+  every VIN-shaped token (17 letters and digits with at least one digit, whether or not its check
+  digit holds) in any text, the values of the module name's attributes whose name contains
+  "serial", a D-PDU API module name that has no attributes (a device name or a serial number),
+  and the profile's D-PDU API `module` wherever it occurs in a message. A J2534 module name is a
+  configured label and is kept. A check that writes its own free text goes through
+  `Report::masker()`. Masking is a heuristic: a serial number in a form none of these rules
+  covers stays in the report, so read a report before sharing it.

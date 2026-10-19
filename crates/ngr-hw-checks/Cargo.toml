@@ -15,3 +15,6 @@ tonic = "0.14.6"
 vci-service-config = { workspace = true }
 vci-service-interface = { workspace = true }
 worker-host = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

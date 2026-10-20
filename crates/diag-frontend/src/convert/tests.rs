@@ -454,6 +454,9 @@ impl diag_ir::DiagHost for Recording {
     fn artifact_bytes(&mut self, _: u64, _: u32) -> Result<Vec<u8>, NotSent> {
         Err(NotSent)
     }
+    fn runtime_input(&mut self, _: diag_ir::RuntimeInput) -> Result<i64, NotSent> {
+        Err(NotSent)
+    }
     fn log(&mut self, _: u8, _: &str) {}
 }
 
@@ -663,6 +666,10 @@ struct Answering {
     sent: Vec<(u32, Vec<u8>)>,
     /// Each `RoutineControl`'s routine identifier, sub-function and operand.
     routines: Vec<(u16, u8, Vec<u8>)>,
+    /// Each runtime input read, and the value every read of one answers (`None`: not
+    /// established).
+    inputs_read: Vec<diag_ir::RuntimeInput>,
+    input_value: Option<i64>,
 }
 
 impl diag_ir::DiagHost for Answering {
@@ -708,6 +715,10 @@ impl diag_ir::DiagHost for Answering {
     fn artifact_bytes(&mut self, _: u64, _: u32) -> Result<Vec<u8>, NotSent> {
         Err(NotSent)
     }
+    fn runtime_input(&mut self, input: diag_ir::RuntimeInput) -> Result<i64, NotSent> {
+        self.inputs_read.push(input);
+        self.input_value.ok_or(NotSent)
+    }
     fn log(&mut self, _: u8, message: &str) {
         self.logged.push(message.to_owned());
     }
@@ -745,6 +756,8 @@ fn run_answered(
         logged: Vec::new(),
         sent: Vec::new(),
         routines: Vec::new(),
+        inputs_read: Vec::new(),
+        input_value: Some(12_500),
     };
     loop {
         match vm.step_with_declarations(&program, document.variant().as_ref(), &mut host) {
@@ -850,6 +863,8 @@ fn ok_and_nrc_follow_the_variant_s_declared_negative_shape() {
             logged: Vec::new(),
             sent: Vec::new(),
             routines: Vec::new(),
+            inputs_read: Vec::new(),
+            input_value: None,
         };
         loop {
             match vm.step_with_declarations(&program, Some(&variant), &mut host) {

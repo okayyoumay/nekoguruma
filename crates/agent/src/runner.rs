@@ -1735,6 +1735,9 @@ mod tests {
         fn artifact_bytes(&mut self, _: u64, _: u32) -> Result<Vec<u8>, HostError> {
             Err(HostError::Unsupported("FlashBlock"))
         }
+        fn runtime_input(&mut self, input: diag_ir::RuntimeInput) -> Result<i64, HostError> {
+            Err(HostError::InputNotEstablished(input))
+        }
         fn log(&mut self, _: u8, message: &str) {
             self.logs.push(message.to_owned());
             if let Some((at, flag)) = &self.cancel_on_log
@@ -2735,6 +2738,11 @@ def main():
         fn artifact_bytes(&mut self, _: u64, _: u32) -> Result<Vec<u8>, HostError> {
             Err(HostError::Unsupported("FlashBlock"))
         }
+        fn runtime_input(&mut self, input: diag_ir::RuntimeInput) -> Result<i64, HostError> {
+            RuntimeInputs::read(self, input)?
+                .value()
+                .ok_or(HostError::InputNotEstablished(input))
+        }
         fn log(&mut self, _: u8, _: &str) {}
     }
 
@@ -2887,6 +2895,108 @@ def main():
             &AtomicBool::new(false),
             Some(journal),
         )
+    }
+
+    /// A program with `ReadInput` passes the read-only policy, and the job reads the input
+    /// through the host's runtime inputs (ADR-338): a value is pushed as an `I64`, and an input
+    /// the host cannot establish (no source, an undecodable reading, a text reading) is a host
+    /// error that leaves the job resumable, sending nothing.
+    #[test]
+    fn a_read_input_passes_the_policy_and_reads_through_the_runtime_inputs() {
+        use diag_ir::RuntimeInput::{IgnitionOn, SupplyVoltageMillivolts, VehicleSpeedKmh};
+        let read = |input| Op::ReadInput { input };
+        let reads = program(vec![read(SupplyVoltageMillivolts), read(IgnitionOn)]);
+        assert!(
+            crate::policy::check_program(&reads, None, crate::policy::Permission::ReadOnly).is_ok()
+        );
+        assert!(!crate::policy::writes(&reads, None));
+
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        host.voltage = Some(13_100);
+        host.inputs =
+            crate::inputs::FixedInputs::new().with(IgnitionOn, crate::inputs::Reading::Value(1));
+        let state = run_on(
+            &reads,
+            &mut host,
+            JobLimits::default(),
+            &AtomicBool::new(false),
+            None::<&mut JobJournal>,
+        )
+        .expect("the inputs are read");
+        assert_eq!(state.stack, [Value::I64(13_100), Value::I64(1)]);
+        assert_eq!(host.sent(), []);
+
+        // An input the host has no reading for, one it cannot decode and one that reads as text
+        // are all a host error at the instruction.
+        let unknown = program(vec![read(VehicleSpeedKmh)]);
+        for reading in [
+            None,
+            Some(crate::inputs::Reading::CannotBeEstablished),
+            Some(crate::inputs::Reading::CannotBeDecoded),
+            Some(crate::inputs::Reading::Text("87".to_owned())),
+        ] {
+            host.inputs = crate::inputs::FixedInputs::new();
+            if let Some(reading) = reading {
+                host.inputs = std::mem::take(&mut host.inputs).with(VehicleSpeedKmh, reading);
+            }
+            let result = run_on(
+                &unknown,
+                &mut host,
+                JobLimits::default(),
+                &AtomicBool::new(false),
+                None::<&mut JobJournal>,
+            );
+            assert!(
+                matches!(
+                    result,
+                    Err(JobError::Host {
+                        pc: 0,
+                        source: HostError::InputNotEstablished(VehicleSpeedKmh)
+                    })
+                ),
+                "{result:?}"
+            );
+            assert_eq!(host.sent(), []);
+        }
+    }
+
+    /// A run stopped by an input the host cannot establish leaves a non-terminal journal (no stop
+    /// record, ADR-288), and a resume on a host that can read the input completes the job.
+    #[test]
+    fn an_unestablished_input_leaves_the_job_resumable() {
+        use diag_ir::RuntimeInput::VehicleSpeedKmh;
+        let program = program(vec![
+            Op::ReadInput {
+                input: VehicleSpeedKmh,
+            },
+            Op::Pop,
+        ]);
+        let dir = journal_dir("input-unestablished");
+        let result = first_run(&program, &dir, JobLimits::default(), |_| {});
+        assert!(
+            matches!(
+                result,
+                Err(JobError::Host {
+                    source: HostError::InputNotEstablished(VehicleSpeedKmh),
+                    ..
+                })
+            ),
+            "{result:?}"
+        );
+        let state = Journal::read(&dir, &job_key()).unwrap();
+        assert_eq!(state.facts.run_stopped, None);
+        assert_eq!(state.facts.procedure_failed, None);
+        assert_eq!(
+            restart::classify(&program, Ok(&state)),
+            RestartDecision::PlainStart
+        );
+
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        host.inputs = crate::inputs::FixedInputs::new()
+            .with(VehicleSpeedKmh, crate::inputs::Reading::Value(0));
+        let result = resume(&program, &dir, &mut host, false);
+        assert!(result.is_ok(), "{result:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// Each marker is committed before the request it guards, the identity before the erase,
@@ -13177,6 +13287,36 @@ def main():
         assert!(calls.contains(&"DisconnectComLogicalLink"), "{calls:?}");
         // Every step of the close was tried.
         assert!(calls.contains(&"ModuleDisconnect"), "{calls:?}");
+        guards.worker_gone();
+    }
+
+    /// The worker host has a source for the supply voltage only: any other input is not
+    /// established (ADR-338), and no RPC is made to find out.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_worker_host_cannot_establish_an_input_the_vci_does_not_offer() {
+        let (client, calls) = fake_worker(false).await;
+        let (result, mut guards) = run_program(
+            client,
+            &LinkConfig::iso15765(0x7E0, 0x7E8),
+            program(vec![Op::ReadInput {
+                input: diag_ir::RuntimeInput::IgnitionOn,
+            }]),
+            JobLimits::default(),
+            vci_only_guards("read-input"),
+        )
+        .await;
+        assert!(
+            matches!(
+                result,
+                Err(JobError::Host {
+                    pc: 0,
+                    source: HostError::InputNotEstablished(diag_ir::RuntimeInput::IgnitionOn)
+                })
+            ),
+            "{result:?}"
+        );
+        let calls = calls.lock().unwrap().clone();
+        assert!(!calls.contains(&"StartComPrimitive"), "{calls:?}");
         guards.worker_gone();
     }
 

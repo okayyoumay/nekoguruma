@@ -823,6 +823,16 @@ check as well.
   encoding reads as "cannot be decoded". ASCII text keeps surrounding spaces as they are; a
   field of only spaces, or with any byte outside 0x20 to 0x7E, cannot be decoded.
 
+A program's `ReadInput` (what `diag.precondition` lowers to for a runtime-input source,
+ADR-338) reaches the same inputs through `DiagHost::runtime_input`, which `WorkerHost`
+implements with `RuntimeInputs::read`. Only an integer reading is a value. `CannotBeEstablished`,
+`CannotBeDecoded` and a text reading are `HostError::InputNotEstablished(input)`, and so a host
+error of the job: the runner records no stop for it (it is not a `VmError`, ADR-288), the VM state
+stays at the instruction, and the job can be resumed on a VCI that can read the input. A worker failure while reading
+(a D-PDU worker's internal error for an unknown name among them) is the worker's own `HostError`,
+a host error of the job in the same way. The
+restart's own checks read the same sources and still treat any non-integer reading as not met.
+
 ## The worker client
 
 The runner, the host and the link set-up call the worker through the trait `agent::client::WorkerApi`

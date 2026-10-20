@@ -112,6 +112,11 @@ pub enum HostError {
     TransferInterrupted(u8),
     #[error("link setup: {0}")]
     Setup(&'static str),
+    /// A `ReadInput` of a runtime input the agent cannot establish: it has no source on this VCI,
+    /// the reading could not be decoded, or it is not an integer. Nothing was changed, so the job
+    /// can be resumed once the input can be read (ADR-338, ADR-288).
+    #[error("the runtime input {0:?} cannot be established")]
+    InputNotEstablished(diag_ir::RuntimeInput),
 }
 
 fn error_event_name(code: i32) -> String {
@@ -726,9 +731,27 @@ impl<C: WorkerApi> DiagHost for WorkerHost<C> {
         Err(HostError::Unsupported("FlashBlock"))
     }
 
+    // Reads through the host's runtime inputs, the source the restart's precondition checks use
+    // (`inputs`): a value is the integer reading, and an input the agent cannot establish or
+    // decode, or one that reads as text, is [`HostError::InputNotEstablished`], like a failure to
+    // reach the worker a host error the job can be resumed after (ADR-338, ADR-288).
+    fn runtime_input(&mut self, input: diag_ir::RuntimeInput) -> Result<i64, HostError> {
+        use crate::inputs::RuntimeInputs;
+        integer_reading(input, self.read(input)?)
+    }
+
     fn log(&mut self, level: u8, message: &str) {
         tracing::info!(level, "{message}");
     }
+}
+
+/// The integer a runtime-input reading gives `ReadInput`: anything else (no source, an
+/// undecodable answer, text) is [`HostError::InputNotEstablished`] (ADR-338).
+fn integer_reading(
+    input: diag_ir::RuntimeInput,
+    reading: crate::inputs::Reading,
+) -> Result<i64, HostError> {
+    reading.value().ok_or(HostError::InputNotEstablished(input))
 }
 
 /// Whether `millis` have passed since the first poll of `inquiry` at or before `now`. A finished
@@ -750,6 +773,28 @@ fn wait_elapsed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only an integer reading is a value for `ReadInput`; a reading the agent cannot establish
+    /// or decode, or one that is text, is the repeatable host error (ADR-338).
+    #[test]
+    fn only_an_integer_reading_reads_as_an_input() {
+        use crate::inputs::Reading;
+        let input = diag_ir::RuntimeInput::VehicleSpeedKmh;
+        assert!(matches!(integer_reading(input, Reading::Value(87)), Ok(87)));
+        for reading in [
+            Reading::CannotBeEstablished,
+            Reading::CannotBeDecoded,
+            Reading::Text("87".to_owned()),
+        ] {
+            assert!(
+                matches!(
+                    integer_reading(input, reading.clone()),
+                    Err(HostError::InputNotEstablished(i)) if i == input
+                ),
+                "{reading:?}"
+            );
+        }
+    }
 
     #[test]
     fn requests_are_encoded_with_the_sid_first() {

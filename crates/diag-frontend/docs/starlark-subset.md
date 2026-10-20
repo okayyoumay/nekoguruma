@@ -275,6 +275,7 @@ field that stores them.
 | `millis` of `diag.wait` | `int`, 0 to 2^32 - 1; may be an expression known only at run time, whose value the VM checks against that range when the wait runs (`WaitOutOfRange`) |
 | `back_millis` | `int`, 0 to 2^32 - 1 |
 | `form_id`, `template_id` | `str` naming the form or record template |
+| `name` of `diag.precondition` | `str` constant, one of `voltage`, `externalSupply`, `ignition`, `engine`, `vehicleSpeed` (the names `# @preconditions` takes, 4.9); another `str` is `STAR_ARGUMENT_OUT_OF_RANGE`, a value known only at run time `STAR_NON_CONSTANT_ARGUMENT` and a constant of another type `STAR_UNSUPPORTED_SYNTAX`. The name need not be in `# @preconditions` |
 | `level` of `diag.log` | `int`, 0 to 255 |
 | `message` of `diag.log` | `str` expression, which may be built at run time |
 | `code` of `diag.fail` | non-empty `str` constant, 1 to 64 bytes of UTF-8 (the IR accepts 1 to 128; `Program::validate` checks the constant, ADR-280) |
@@ -313,7 +314,7 @@ instruction exists, the transpiler rejects calls to it (`STAR_API_NOT_AVAILABLE`
 | `diag.capture` | `MonitorCapture` | none |
 | `diag.log` | `Log`, or `LogFromStack` | none for a constant message; for a message built at run time, the message (`str`, as bytes), pushed before `LogFromStack` |
 | `diag.ecu_info` | none yet | |
-| `diag.precondition` | none yet | |
+| `diag.precondition` | `ReadInput`, or `PushBytes`, `SendReceive`, `DecodeField` | none for a runtime input: `ReadInput { input }` pushes the value as an `int` (ADR-338). For a service source, the request (bytes) is built at ingestion and pushed before `SendReceive`, then `DecodeField` reads the field from the answer. Which of the two is chosen at ingestion from the default-session source of the variant's `preconditions.csv` row of that kind (`csv-tables.md` 4.14); the programming-session source is not used. The call's value is an `int`: millivolts, 0 or 1 for a flag, km/h, or the integer the field holds. A kind with no row, or a row with no default-session source, is `STAR_UNKNOWN_PRECONDITION`; a service source whose field does not decode to an integer (a numeric conversion gives a float), or whose service the variant does not declare with a request that has no fields, is `STAR_NOT_LOWERABLE`. The call reads the row's default-session source, so a service-backed one must be called while the ECU is in a session that answers that read (normally the default session). A runtime input the agent cannot establish is a host error, which leaves the state untouched, and the job can be resumed; a service source is a read like `diag.request`'s: a negative answer or an answer that does not decode ends the run as a field read without a check does, with a `VmError`, which is terminal |
 | `diag.fail` | `Fail` | `code` as a constant-pool entry; `detail` as bytes from the stack, since it can be built at run time. The instruction ends the procedure as failed and is terminal (ADR-280) |
 
 **Target contract (ADR-309).** The table describes the lowering as built; the protocol-neutral calls `diag.read_dtc`, `diag.routine` and `diag.security_access` go through their profile. ADR-309 changes it: `diag.read_dtc`, `diag.routine` and `diag.security_access` name an intent and are lowered through the application-layer profile of the variant's protocol into that variant's declared services; `diag.read_dtc` lowers to a generic send-receive instead of `ReadDtc`; `diag.routine` keeps `RoutineControl` on UDS and uses the generic send-receive on other application layers; `diag.flash_transfer` stays UDS-only. UDS is the first profile. A profile is typed data shipped with the frontend (`diag_frontend::profile`, ADR-314): per call, the steps it expands to, each with a request template that selects the declared service by value and position and a map from the response to the result. The variant's protocols name its application layer (`csv-tables.md` 4.3), and a call to `diag.read_dtc`, `diag.routine` or `diag.security_access` that its profile does not define is rejected (`STAR_NOT_IN_PROFILE`). The UDS profile defines all three. `diag.read_dtc` is lowered: a variant with no single declared service its template selects is `STAR_UNKNOWN_SERVICE`, and one whose selected response does not fit the profile's map is `STAR_NOT_IN_PROFILE`, naming the field. `diag.routine` is lowered the same way: a variant without exactly one generated routine service its identifier, sub-function and `params` select is `STAR_UNKNOWN_SERVICE`. `diag.security_access` is lowered through the profile's templates alone (3.2 above), so it selects no declared service.
@@ -604,7 +605,7 @@ used:
 
 | Call | Default |
 |---|---|
-| `request` with a read service (ReadDataByIdentifier, ReadDTCInformation), DiagnosticSessionControl (0x10) or TesterPresent (0x3E), `read_dtc`, `ecu_info`, `precondition` | `Safe` (a repeat of a session change or a tester-present re-enters the wanted session and behaves in any residual state, ADR-336 item 8) |
+| `request` with a read service (ReadDataByIdentifier, ReadDTCInformation), DiagnosticSessionControl (0x10) or TesterPresent (0x3E), `read_dtc`, `ecu_info`, `precondition` | `Safe` (a service-backed `precondition` is a read; a runtime-input one, `ReadInput`, is no diagnostic primitive and has no section of its own, and inside a section function the assembly covers it with a `CheckState` piece; a repeat of a session change or a tester-present re-enters the wanted session and behaves in any residual state, ADR-336 item 8) |
 | `wait`, `capture`, `log` | `Safe` (no ECU state changes) |
 | `hmi`, `record` | `Safe`: a repeat at the same instruction keeps its inquiry number, so the host treats it as a poll of the open inquiry, not a new one (ADR-233) |
 | `security_access`, `routine`, `flash_transfer` | `CheckState` (a repeated security access starts again from a new seed request) |
@@ -766,7 +767,7 @@ def main():
   a row in the variant's `preconditions.csv` (`STAR_UNKNOWN_PRECONDITION`, one error at the
   annotation naming the missing kinds in the table's spelling). The program carries exactly the
   named preconditions, each as `Precondition { satisfied, default_session, programming_session }`
-  from its row (`csv-tables.md` 4.14); without the annotation it declares none. Every program of
+  from its row (`csv-tables.md` 4.14); without the annotation it declares none. The annotation is not what `diag.precondition(name)` reads from (3.2): that call reads a value while the program runs, from its own row's default-session source, whether or not the program names the kind here. A service-backed call must therefore run while the ECU is in a session that answers that read, normally the default session; a negative or undecodable answer ends the run with a `VmError` (terminal), and an input the agent cannot establish is a host error the job can be resumed after (ADR-338). Every program of
   the variant carries `identity.csv` as `Program.identity`, whether or not it names any
   precondition. A procedure with a flash plan must carry the annotation and name at least
   `voltage`, `externalSupply` and `ignition`, the checks design 8.9.1 makes mandatory before
@@ -834,7 +835,7 @@ The error codes of the restart declaration (ADR-336, 4.9); `STAR_UNKNOWN_PRECOND
 |---|---|
 | `STAR_PLAN_SHAPE` | a `@flashPlan` function breaks a shape rule (call count, call site, `return`, section callee, never called) |
 | `STAR_PLAN_INVALID` | the lowered program is refused by `Program::validate` with an error that names a pc; located at the source of that pc (an error without a pc is `STAR_NOT_LOWERABLE`) |
-| `STAR_UNKNOWN_PRECONDITION` | a name in `# @preconditions` has no row in the variant's `preconditions.csv` |
+| `STAR_UNKNOWN_PRECONDITION` | a name in `# @preconditions`, or the kind a `diag.precondition` call names, has no row in the variant's `preconditions.csv` (for the call, also a row with no default-session source, which the tables never produce) |
 
 ---
 

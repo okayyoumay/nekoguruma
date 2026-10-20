@@ -108,10 +108,13 @@ items 1 to 3 read them the same way.
    - The resumed run commits a run start with the restored state (the invariant of ADR-274). This
      settles the open point of ADR-272 item 2 for this kind of run. It gets its own step budget
      (ADR-287).
-7. **End states.** Every ending of this decision other than a completed run is on-site
-   intervention, never `Failed`: `Failed` is the procedure's own verdict (ADR-280). The new
-   on-site reasons are `UnconfirmedRequest`, `NotResumable { cause }`,
-   `ProcedureResumeLimitReached` and `ProcedureIdentityNotEstablished`.
+7. **End states.** The endings this decision adds are on-site intervention, never `Failed`:
+   `Failed` is the procedure's own verdict (ADR-280). The new on-site reasons are
+   `UnconfirmedRequest`, `NotResumable { cause }`, `ProcedureResumeLimitReached` and
+   `ProcedureIdentityNotEstablished`. Endings that other decisions give a resumed or repeated
+   run keep their states: the procedure's own `Fail` (ADR-280), the identity abort (ADR-286),
+   and a lost access target during the 8.2.4 reopening, which ends as failed while the journal
+   holds no transfer-start marker (ADR-325 item 12), as it does for any restart without one.
 
 8. **`Safe` covers the session the ECU is left in.** A checkpoint resume does not establish the
    default session first: a plain procedure declares no session timeout or startup time to wait

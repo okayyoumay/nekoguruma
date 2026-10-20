@@ -620,7 +620,11 @@ over the instructions that set up its operands. Outside every section it is `int
 with an expected duration of 0. Inside a section function it carries that function's
 interruptibility and expected duration, and the function's range is cut around it (4.5). In a
 lowered program the sections therefore never overlap, and each diagnostic primitive is covered by
-exactly one (ADR-332).
+exactly one (ADR-332). The exception is a plan function's expansion (4.9, the contract of
+ADR-336): the plan's own section covers the whole expansion, so the pieces of a section function
+inlined in it, and the one-instruction sections of its `diag` calls, lie inside that section and
+keep their own attributes; the readers combine covering sections conservatively (ADR-332 item 5,
+ADR-330).
 
 `Safe` means that a repeat is harmless and that the primitive behaves correctly in any session
 and security state the procedure can leave the ECU in: its default session after a timeout, or
@@ -761,6 +765,10 @@ def main():
   access target's table when the procedure has access targets and else from the primary's, and
   the precondition sources from the reprogramming target's table (the primary's for a plain
   procedure).
+- **Identity for a restartable plan.** A plan that allows a restart (`recovery=never`, or a
+  recovery-required point after the erase) needs all three rows of the variant's `identity.csv`
+  (`vin`, `hardware_part_number`, `software_version`), which the restart reads
+  (`STAR_PLAN_SHAPE`, naming the missing kind).
 - **UDS only, one segment.** `diag.flash_transfer` or `@flashPlan` in a variant whose application
   layer is not UDS is `STAR_NOT_IN_PROFILE`. A session has one segment per plan.
 - **Validation.** `Program::validate` runs on every lowered program. A refusal that names a pc is

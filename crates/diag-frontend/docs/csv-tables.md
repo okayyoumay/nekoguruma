@@ -41,7 +41,7 @@ directory, a link to nothing) is rejected (`CSV_UNKNOWN_FILE`).
 | `dtcs.csv` | no | 4.11 | `DtcDefinition` |
 | `flash_sessions.csv` | no | 4.12 | `FlashSession` |
 | `flash_segments.csv` | no | 4.12 | `FlashSegment` |
-| `identity.csv` | no | 4.13 | `Program.identity` of each program of the variant (ADR-336; the converter reads it once implemented, and until then the file is `CSV_UNKNOWN_FILE`) |
+| `identity.csv` | no; all three kinds when a procedure of the variant has a flash plan that allows a restart (`starlark-subset.md` 4.9) | 4.13 | `Program.identity` of each program of the variant (ADR-336; the converter reads it once implemented, and until then the file is `CSV_UNKNOWN_FILE`) |
 | `preconditions.csv` | no | 4.14 | `Program.preconditions` of each program of the variant (ADR-336; same status as `identity.csv`) |
 
 The table conversion produces the declaration part of each variant's documents (design 8.2.6),

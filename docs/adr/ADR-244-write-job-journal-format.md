@@ -1,7 +1,7 @@
 # ADR-244: Write-Job Journal as an Append-Only Record Log
 
 **Date:** 2026-10-07
-**Status:** Accepted (record set extended by ADR-253, ADR-261, ADR-268, ADR-272, ADR-280, ADR-286 and ADR-288; item 4's target VIN is a journal record since ADR-261, and its version being written since ADR-268; the no-lock consequence superseded by ADR-255 item 7; a combination record holding the chosen document's hash added by ADR-325 item 7; that record's guard pass and guard-list hashes, and a guard record holding them with the running document's hash and identified variant for a job without one, added by ADR-327)
+**Status:** Accepted (record set extended by ADR-253, ADR-261, ADR-268, ADR-272, ADR-280, ADR-286, ADR-288 and ADR-335; item 4's target VIN is a journal record since ADR-261, and its version being written since ADR-268; the no-lock consequence superseded by ADR-255 item 7; a combination record holding the chosen document's hash added by ADR-325 item 7; that record's guard pass and guard-list hashes, and a guard record holding them with the running document's hash and identified variant for a job without one, added by ADR-327)
 **Affects:** `crates/agent/src/journal.rs`, `crates/agent/tests/journal_crash.rs`, `docs/system-architecture.md` (5.5)
 
 ## Context

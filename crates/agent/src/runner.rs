@@ -2,8 +2,10 @@
 //!
 //! No server. Of the section attributes, the runner acts on interruptibility: a cancel is taken
 //! only at an interruptible point (ADR-330), and a `RecoveryRequired` section is journaled
-//! (ADR-291, ADR-293); idempotency is not read yet. A host error ends the job; the VM state then
-//! still points at the failed primitive (ADR-233 item 1). [`run_program_journaled`] also writes the
+//! (ADR-291, ADR-293). Idempotency decides which primitives outside the flash plans get a
+//! request marker and how a restart classifies a plain procedure (ADR-335); a primitive that
+//! fails is not repeated within the run. A host error ends the job; the VM state then still
+//! points at the failed primitive (ADR-233 item 1). [`run_program_journaled`] also writes the
 //! write-job journal at a flash recovery plan's boundaries (`journaling`, ADR-252), and
 //! [`resume_program_journaled`] goes on with a job whose journal exists (`restart`, ADR-255).
 //! A [`Job`] is a program and, when its program decodes response fields, the variant's

@@ -68,6 +68,14 @@ fn vci_ends(profile: &Profile) -> Result<[Vci; 2], String> {
     };
     let mut found = Vec::new();
     for (at, end) in ends.iter().enumerate() {
+        // `GetResourceIds` answers base protocol names only, so the guarded handle creates no
+        // link on an additional channel, whichever module it is on.
+        if let Some(channel) = &end.channel {
+            return Err(format!(
+                "endpoint {at} names the additional channel {channel:?}; the guarded handle \
+                 creates no additional-channel link yet, so each end uses its module's base channel"
+            ));
+        }
         match &end.vci {
             Some(vci) if vci.api == Api::J2534V0404 => found.push(vci.clone()),
             Some(_) => {

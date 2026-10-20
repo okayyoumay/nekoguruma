@@ -2042,6 +2042,30 @@ impl GuardedHandle {
             .ok_or(HandleError::NoResponse)
     }
 
+    /// Discards what the monitor of `cll` has received so far: the frames already buffered, and
+    /// those its events deliver until the link stays quiet for 50 ms. A check calls it before a
+    /// send, so a frame received afterwards cannot be an earlier copy of the one it awaits.
+    pub async fn raw_drain(&mut self, cll: ComLogicalLinkHandle) -> Result<(), HandleError> {
+        const QUIET: Duration = Duration::from_millis(50);
+        // A busy bus can fill the buffer while it drains; each full buffer is discarded in turn.
+        for _ in 0..8 {
+            self.shared.lock().raw_frames.remove(&cll.cll_handle);
+            // An empty frame is never received, so the wait only buffers what arrives.
+            match self.raw_wait(cll, RawWait::Frame(&[]), QUIET).await {
+                Err(HandleError::NoResponse) => {
+                    self.shared.lock().raw_frames.remove(&cll.cll_handle);
+                    return Ok(());
+                }
+                Err(HandleError::RawBufferFull { .. }) => continue,
+                Err(error) => return Err(error),
+                Ok(_) => continue,
+            }
+        }
+        Err(HandleError::RawBufferFull {
+            cap: RAW_BUFFER_CAP,
+        })
+    }
+
     /// Reads the link's events until `wait` is met or `timeout` passes: the monitor's frames go
     /// into the link's buffer (a `Frame` wait takes its frame out), and the events of the send a
     /// `SendEnd` wait is for end it or fail it. Events of other primitives are dropped.

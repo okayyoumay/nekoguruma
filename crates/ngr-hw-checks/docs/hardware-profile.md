@@ -407,8 +407,9 @@ carrying its own address byte.
 
 - **What it does.** Both ends listen, then each end sends single RawMode frames of 1 to 7 bytes
   (6 under extended or mixed addressing, which takes a byte of the frame) that the other must
-  receive byte for byte, A to B and B to A. A frame that does not arrive within 3 s fails the check
-  and names the frame. The result message records the library path, the ABI and the `unsigned
+  receive byte for byte, A to B and B to A. Before each send the receiving end's monitor is drained
+  (`raw_drain`), so a copy of the frame received before it was sent cannot answer it. A frame
+  that does not arrive within 3 s fails the check and names the frame. The result message records the library path, the ABI and the `unsigned
   long` width of each device, masked as the report masks. Both ends must be J2534 VCI ends: a
   SocketCAN end or a D-PDU API end is refused with nothing sent.
 - **ABI check (design 7.1.2).** For each device the ABI read from the library file's header must

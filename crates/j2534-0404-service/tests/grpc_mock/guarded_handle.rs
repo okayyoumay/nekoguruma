@@ -1387,6 +1387,18 @@ async fn a_raw_monitor_returns_the_expected_frame_and_buffers_the_others() {
         .inject_rx(MOCK_CHANNEL_ID, &unrelated, j2534_0404::ISO15765);
     let full = handle.raw_receive(cll, &missing, timeout).await;
     assert_eq!(full, Err(HandleError::RawBufferFull { cap: 1024 }));
+    // A drain discards the buffer and what is still arriving: a frame received before the drain
+    // no longer answers a wait.
+    handle.raw_drain(cll).await.expect("the drain");
+    let early = can_frame(0x123, &[0x0C]);
+    server
+        .backdoor
+        .inject_rx(MOCK_CHANNEL_ID, &early, j2534_0404::ISO15765);
+    handle.raw_drain(cll).await.expect("the drain");
+    let gone = handle
+        .raw_receive(cll, &early, std::time::Duration::from_millis(300))
+        .await;
+    assert_eq!(gone, Err(HandleError::NoResponse));
     drop(handle);
     run.pass();
     // The closing cancels the monitor.

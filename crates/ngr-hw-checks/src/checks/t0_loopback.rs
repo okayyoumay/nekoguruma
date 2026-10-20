@@ -229,6 +229,19 @@ pub async fn run(
         for from in 0..2 {
             let to = 1 - from;
             let bytes = payload(from, len);
+            // What the receiver holds already cannot answer this send: a copy of the frame
+            // received before it was sent (bus traffic, an earlier run) proves nothing.
+            let (receiver, to_cll) = end_of(&mut ends, to)?;
+            match receiver.raw_drain(to_cll).await {
+                Ok(()) => {}
+                Err(HandleError::RawBufferFull { cap }) => {
+                    return Err(CheckError::Frame(format!(
+                        "end {to} kept receiving unrelated frames (more than {cap} at a time); \
+                         the bus is not a quiet loopback"
+                    )));
+                }
+                Err(error) => return Err(error.into()),
+            }
             let (sender, from_cll) = end_of(&mut ends, from)?;
             let frame = sender.raw_frame(from_cll, &bytes)?;
             sender

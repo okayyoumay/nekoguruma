@@ -443,7 +443,8 @@ pub(crate) const PHYSICAL_COMPARAMS: &[&str] = &[
 /// The bus framing a T0 loopback end uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Framing {
-    /// Raw CAN (`CAN`, `ISO_11898_RAW`, their additional channels): bus payloads as they are.
+    /// Raw CAN (`CAN`, `ISO_11898_RAW` and the worker's other CAN names, their additional
+    /// channels): bus payloads as they are.
     RawCan,
     /// ISO 15765 transport (`ISO15765`, `ISO-TP`, `ISO_14229_3_on_ISO_15765_2` and the other
     /// ISO 22900-2 (2022) Annex B.1 names over ISO 15765, their additional channels), which
@@ -451,21 +452,39 @@ enum Framing {
     Iso15765,
 }
 
-/// The framing of a T0 loopback end's `protocol`, matched as the worker matches protocol names
-/// (ignoring ASCII case and an additional-channel suffix); `None` for a protocol the loopback
-/// does not run on.
+/// The framing of a T0 loopback end's `protocol`, from the names `j2534-0404-service` maps to a
+/// CAN or an ISO 15765 channel (`map_protocol_name`, matched ignoring ASCII case, and an
+/// additional channel's `_CHn` suffix); `None` for a protocol the loopback does not run on, or a
+/// name the worker would not recognise.
 fn framing(protocol: &str) -> Option<Framing> {
-    let key = channel_key(protocol);
-    let base = match key.rfind("_CH") {
+    let key = channel_key(protocol).to_ascii_lowercase();
+    let base = match key.rfind("_ch") {
         Some(index) if key[index + 3..].bytes().all(|b| b.is_ascii_digit()) => &key[..index],
         _ => key.as_str(),
     };
-    if base.contains("15765") || base == "ISO-TP" || base == "ISOTP" {
-        Some(Framing::Iso15765)
-    } else if base == "CAN" || base == "CAN_PS" || base == "ISO_11898_RAW" {
-        Some(Framing::RawCan)
-    } else {
-        None
+    match base {
+        "can" | "iso11898" | "iso-11898" | "iso_11898" | "iso11898-1" | "iso-11898-1"
+        | "iso_11898_1" | "can_iso" | "can-iso" | "iso_11898_raw" => Some(Framing::RawCan),
+        "iso15765"
+        | "iso-15765"
+        | "iso_15765"
+        | "iso15765-2"
+        | "iso-15765-2"
+        | "iso_15765_2"
+        | "iso15765-4"
+        | "iso-15765-4"
+        | "iso_15765_4"
+        | "iso-tp"
+        | "isotp"
+        | "iso_tp"
+        | "iso_15765_3_on_iso_15765_2"
+        | "iso_14229_3_on_iso_15765_2"
+        | "iso_14230_3_on_iso_15765_2"
+        | "sae_j2190_on_iso_15765_2"
+        | "iso_15031_5_on_iso_15765_4"
+        | "iso_14229_3"
+        | "iso_15765_3" => Some(Framing::Iso15765),
+        _ => None,
     }
 }
 

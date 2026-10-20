@@ -393,12 +393,15 @@ and refuses it on T1, T2 and T3 (`cargo run -p ngr-hw-checks -- list`), and the 
 function over guarded handles and the profile, so CI runs it against `j2534-0404-mock`
 (`tests/grpc_mock/t0_loopback_check.rs`, with a relay task playing the loopback).
 
-The profile parser refuses a loopback whose two ends cannot exchange the same bytes: the ends must
-be both raw CAN (`CAN`, `ISO_11898_RAW`) or both ISO 15765 (`ISO15765`, `ISO-TP`, an ISO 22900-2
-(2022) Annex B.1 name over ISO 15765, or an additional channel of one; names match ignoring case), since an ISO 15765
-end segments its payload and a raw CAN end does not; any other protocol is refused; and they must share
-the `addressing` and, when addressed, the `address`, since each end accepts only frames carrying
-its own address byte.
+The profile parser refuses a loopback whose two ends cannot exchange the same bytes. The ends must
+be both raw CAN or both ISO 15765, by the names `j2534-0404-service` maps to those channels
+(ignoring case, and an additional channel's `_CHn` suffix): `CAN`, `ISO_11898_RAW` and the
+worker's other CAN aliases, or `ISO15765`, `ISO-TP`, the worker's other ISO 15765 aliases and the
+ISO 22900-2 (2022) Annex B.1 names over ISO 15765 it recognises, such as
+`ISO_14229_3_on_ISO_15765_2`. An ISO 15765 end segments its payload and a raw CAN end does not,
+and any other protocol, or a name the worker does not recognise, is refused. The ends must also
+share the `addressing` and, when addressed, the `address`, since each end accepts only frames
+carrying its own address byte.
 
 - **What it does.** Both ends listen, then each end sends single RawMode frames of 1 to 7 bytes
   (6 under extended or mixed addressing, which takes a byte of the frame) that the other must

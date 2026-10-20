@@ -136,6 +136,11 @@ async fn hw_t0_two_endpoint_loopback() {
             }
         };
         facts.push(DeviceFacts::of(&device, declared_long_size(vci)));
+        // The handle takes the device, so it goes into the report first (design 13.5
+        // "Reports").
+        guard
+            .report()
+            .add_device(vci, device.abi(), device.module(), device.version());
         let handle = GuardedHandle::open(
             &profile,
             vci,

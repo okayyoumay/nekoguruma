@@ -36,9 +36,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use diag_ir::{
-    DiagHost, FlashRecovery, Idempotency, IdentityKind, Interruptible, NoApplication, Precondition,
-    PreconditionKind, Program, RecoveryRequired, RecoveryTiming, RuntimeInput, Source, Vm, VmError,
-    VmState,
+    DiagHost, FlashRecovery, Idempotency, IdentityKind, Interruptible, NoApplication, Op,
+    Precondition, PreconditionKind, Program, RecoveryRequired, RecoveryTiming, RuntimeInput,
+    Source, Vm, VmError, VmState,
 };
 
 use crate::host::HostError;
@@ -324,10 +324,11 @@ pub struct Confirmation {
 
 /// Decides how the job of `program` goes on, from its journal as `Journal::read` (or
 /// `Journal::open`) gave it. No journal at all (`JournalError::NotFound`) is a plain start only
-/// for a program that keeps none ([`keeps_journal`]). For one with a flash recovery plan or a
-/// `RecoveryRequired` section it is on-site intervention: the runner creates the journal before
-/// it sends anything, so a missing one cannot be told from one lost after an erase or inside the
-/// section (ADR-293). A journal that holds a procedure failure is
+/// for a program with no flash recovery plan, no `RecoveryRequired` section and no primitive that
+/// is not safe to repeat ([`missing_journal_is_plain_start`]). For any other it is on-site
+/// intervention: the runner creates the journal before it sends anything, so a missing one cannot
+/// be told from one lost after an erase, inside the section or after a request that changed the
+/// ECU (ADR-293, ADR-335 item 1). A journal that holds a procedure failure is
 /// decided first, as [`RestartDecision::Failed`], whatever else it holds (ADR-280); one that holds an
 /// identity abort is decided next, as [`RestartDecision::Aborted`] (ADR-286), and one that holds a
 /// run's stop after that, as [`RestartDecision::Stopped`] (ADR-288).
@@ -337,7 +338,7 @@ pub fn classify(
 ) -> RestartDecision {
     let state = match journal {
         Ok(state) => state,
-        Err(JournalError::NotFound) if !keeps_journal(program) => {
+        Err(JournalError::NotFound) if missing_journal_is_plain_start(program) => {
             return RestartDecision::PlainStart;
         }
         Err(JournalError::NotFound) => {
@@ -1249,7 +1250,9 @@ pub fn next_steps(state: &JournalState) -> u64 {
         exit.map(|e| e.intent_at),
         exit.and_then(|e| e.last_post_step),
         facts.last_intent,
+        facts.last_request,
         state.last_vm_state.as_ref().map(|(at, _)| *at),
+        state.latest_checkpoint.as_ref().map(|(at, _)| *at),
     ]
     .into_iter()
     .flatten()
@@ -1329,15 +1332,54 @@ fn recovery_required(program: &Program, at: StepRef) -> Option<OnSiteReason> {
         .map(|section| OnSiteReason::RecoveryRequiredSection { section, at })
 }
 
-/// Whether a job of `program` keeps a write-job journal: a program with a flash recovery plan
-/// (ADR-252 item 7), or with a section marked `RecoveryRequired`, whose passes the journal
-/// records (ADR-291, ADR-293). Any other program keeps none.
-pub(crate) fn keeps_journal(program: &Program) -> bool {
-    !program.flash.is_empty()
-        || program
+/// Whether the diagnostic primitive at `pc` is safe to repeat (ADR-335): at least one section
+/// covers it and every section that covers it is `Safe`. A primitive outside every section, or
+/// covered by a `Safe` and a non-`Safe` section at once (hand-built IR, which `Program::validate`
+/// accepts), is not, as the readers combine covering sections conservatively (ADR-332 item 5).
+pub(crate) fn safe_to_repeat(program: &Program, pc: u32) -> bool {
+    let mut covering = program
+        .sections
+        .iter()
+        .filter(|section| (section.start_pc..section.end_pc).contains(&pc))
+        .peekable();
+    covering.peek().is_some()
+        && covering.all(|section| matches!(section.idempotency, Idempotency::Safe))
+}
+
+/// Whether `pc` lies inside a flash recovery plan's range (`entry_pc` up to, not including,
+/// `post_transfer_end_pc`).
+pub(crate) fn in_plan(program: &Program, pc: u32) -> bool {
+    program
+        .flash
+        .iter()
+        .any(|plan| (plan.boundaries.entry_pc..plan.boundaries.post_transfer_end_pc).contains(&pc))
+}
+
+/// Whether the diagnostic primitive at `pc` gets a request marker before it is sent: it lies
+/// outside every plan's range and is not safe to repeat (ADR-335 item 2).
+pub(crate) fn needs_request_marker(program: &Program, pc: u32) -> bool {
+    program
+        .code
+        .get(pc as usize)
+        .is_some_and(Op::is_diagnostic_primitive)
+        && !in_plan(program, pc)
+        && !safe_to_repeat(program, pc)
+}
+
+/// Whether a missing journal of a job of `program` is a plain start (ADR-335 item 1, ADR-293):
+/// the program has no flash recovery plan, no section marked `RecoveryRequired` and no
+/// diagnostic primitive that is not safe to repeat. Every journaled job creates its journal
+/// before it sends anything, so for any other program a missing one cannot be told from one lost
+/// after a request that changed the ECU.
+pub(crate) fn missing_journal_is_plain_start(program: &Program) -> bool {
+    program.flash.is_empty()
+        && !program
             .sections
             .iter()
             .any(|section| matches!(section.interruptible, Interruptible::RecoveryRequired))
+        && (0..program.code.len() as u32).all(|pc| {
+            !program.code[pc as usize].is_diagnostic_primitive() || safe_to_repeat(program, pc)
+        })
 }
 
 /// Whether `pc` lies in a section marked `RecoveryRequired` and outside every plan's range
@@ -1387,12 +1429,9 @@ pub(crate) fn unsafe_continuation(program: &Program, verified: &FlashRecovery) -
             .filter(move |section| (section.start_pc..section.end_pc).contains(&pc))
     };
     let not_safe = |pc: u32| {
-        let mut sections = covering(pc).peekable();
-        sections.peek().is_none()
-            || sections.any(|section| {
-                !matches!(section.idempotency, Idempotency::Safe)
-                    || matches!(section.interruptible, Interruptible::RecoveryRequired)
-            })
+        !safe_to_repeat(program, pc)
+            || covering(pc)
+                .any(|section| matches!(section.interruptible, Interruptible::RecoveryRequired))
     };
     let end = verified.boundaries.post_transfer_end_pc;
     let next = program
@@ -2006,29 +2045,102 @@ mod tests {
             decide(&program, &journal_until(&program, ENTRY)),
             RestartDecision::PlainStart
         );
-        // No journal: a plain start only for a program that keeps none.
+        // No journal: a plain start only for a program with no plan, no `RecoveryRequired`
+        // section and no primitive that is not safe to repeat (ADR-335 item 1).
         assert_eq!(
             classify(&program, Err(&JournalError::NotFound)),
             RestartDecision::OnSiteInterventionRequired(OnSiteReason::MissingJournal)
         );
+        let section = |start_pc, end_pc, interruptible, idempotency| Section {
+            start_pc,
+            end_pc,
+            interruptible,
+            idempotency,
+            expected_millis: 0,
+        };
         let mut no_plan = program.clone();
         no_plan.flash.clear();
-        assert_eq!(
-            classify(&no_plan, Err(&JournalError::NotFound)),
-            RestartDecision::PlainStart
-        );
-        // A `RecoveryRequired` section keeps a journal without a plan too (ADR-293).
-        no_plan.sections.push(Section {
-            start_pc: 0,
-            end_pc: 2,
-            interruptible: Interruptible::RecoveryRequired,
-            idempotency: Idempotency::Safe,
-            expected_millis: 0,
-        });
+        // The primitives of the plan's code, outside every section, are not safe to repeat.
         assert_eq!(
             classify(&no_plan, Err(&JournalError::NotFound)),
             RestartDecision::OnSiteInterventionRequired(OnSiteReason::MissingJournal)
         );
+        let all = no_plan.code.len() as u32;
+        no_plan
+            .sections
+            .push(section(0, all, Interruptible::Yes, Idempotency::Safe));
+        assert_eq!(
+            classify(&no_plan, Err(&JournalError::NotFound)),
+            RestartDecision::PlainStart
+        );
+        // One `Unsafe` section over a single primitive, or one overlapping a `Safe` one, is not.
+        let mut unsafe_one = no_plan.clone();
+        unsafe_one.sections.push(section(
+            ERASE,
+            ERASE + 1,
+            Interruptible::Yes,
+            Idempotency::Unsafe,
+        ));
+        assert_eq!(
+            classify(&unsafe_one, Err(&JournalError::NotFound)),
+            RestartDecision::OnSiteInterventionRequired(OnSiteReason::MissingJournal)
+        );
+        // A primitive left outside every section.
+        let mut uncovered = no_plan.clone();
+        uncovered.sections[0].end_pc = ERASE;
+        assert_eq!(
+            classify(&uncovered, Err(&JournalError::NotFound)),
+            RestartDecision::OnSiteInterventionRequired(OnSiteReason::MissingJournal)
+        );
+        // A `RecoveryRequired` section keeps a journal without a plan too (ADR-293).
+        no_plan.sections.push(section(
+            0,
+            2,
+            Interruptible::RecoveryRequired,
+            Idempotency::Safe,
+        ));
+        assert_eq!(
+            classify(&no_plan, Err(&JournalError::NotFound)),
+            RestartDecision::OnSiteInterventionRequired(OnSiteReason::MissingJournal)
+        );
+    }
+
+    /// A primitive is safe to repeat only when a section covers it and every covering section is
+    /// `Safe` (ADR-335); the request marker is for the primitives outside the plans that are not.
+    #[test]
+    fn safe_to_repeat_combines_the_covering_sections_conservatively() {
+        let mut program = program(RecoveryRequired::Never);
+        let section = |start_pc, end_pc, idempotency| Section {
+            start_pc,
+            end_pc,
+            interruptible: Interruptible::Yes,
+            idempotency,
+            expected_millis: 0,
+        };
+        // Outside every section.
+        assert!(!safe_to_repeat(&program, ERASE));
+        program.sections = vec![
+            section(0, 5, Idempotency::Safe),
+            section(3, 4, Idempotency::Unsafe),
+            section(5, 7, Idempotency::Safe),
+            section(6, 7, Idempotency::CheckState),
+        ];
+        assert!(safe_to_repeat(&program, 2));
+        // Covered by a `Safe` and an `Unsafe` section at once.
+        assert!(!safe_to_repeat(&program, 3));
+        assert!(safe_to_repeat(&program, 4));
+        assert!(safe_to_repeat(&program, 5));
+        assert!(!safe_to_repeat(&program, 6));
+        assert!(!safe_to_repeat(&program, 8));
+        // A request marker needs a primitive outside every plan that is not safe to repeat: pc 3
+        // is the erase, inside the plan (entry 2 up to 8).
+        assert!(!needs_request_marker(&program, 3));
+        program.flash.clear();
+        assert!(needs_request_marker(&program, 3));
+        assert!(!needs_request_marker(&program, 4));
+        // The Pop at 8 is no primitive.
+        assert!(!needs_request_marker(&program, 8));
+        assert!(needs_request_marker(&program, EXIT));
     }
 
     /// An identity abort is final (ADR-286): it is decided before the interruption point is

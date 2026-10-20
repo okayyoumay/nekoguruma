@@ -423,14 +423,14 @@ pub async fn run_program<C: WorkerApi>(
     .await
 }
 
-/// [`run_program`] that also writes the write-job journal for a program with a flash recovery
-/// plan (ADR-244, ADR-252), or with a section marked `RecoveryRequired` (ADR-293): the journal of
+/// [`run_program`] that also writes the job's journal (ADR-244, ADR-252, ADR-335): the journal of
 /// `journal.key` is created in `journal.dir` once the link is open and the policy allows the
-/// program, before anything is sent to the ECU, and the runner commits to it at the plan's
-/// boundaries and ahead of each pass through such a section (`journaling`). A commit that fails
-/// ends the job before the request it guards is sent. A program with neither keeps no journal
-/// and creates no file. `guards` are taken and returned as for [`run_program`]; a program with a
-/// plan writes, so they must hold the reprogramming slot (`JobGuards::take`).
+/// program, before anything is sent to the ECU, for every program. The runner commits to it at a
+/// flash plan's boundaries, ahead of each pass through a `RecoveryRequired` section (ADR-291,
+/// ADR-293) and, outside the plans, ahead of each primitive that is not safe to repeat and after
+/// each primitive (`journaling`). A commit that fails ends the job before the request it guards
+/// is sent. `guards` are taken and returned as for [`run_program`]; a program that writes needs
+/// the reprogramming slot (`JobGuards::take`).
 pub async fn run_program_journaled<C: WorkerApi>(
     client: C,
     config: &LinkConfig,
@@ -472,8 +472,9 @@ pub async fn run_program_journaled<C: WorkerApi>(
 ///   with a journal commits such a stop as the journal's last record before it returns the
 ///   error, and a commit that fails ends the job in [`JobError::Journal`] instead;
 /// - a plain start runs the program from its start on the same journal, its step count going on
-///   after the journal's last record (`restart::next_steps`); a program without a flash
-///   recovery plan and without a journal runs without one;
+///   after the journal's last record (`restart::next_steps`); a missing journal is a plain
+///   start only for a program that sends nothing it could not repeat
+///   (`restart::missing_journal_is_plain_start`, ADR-335 item 1), which then runs without one;
 /// - an interrupted transfer makes the checks of `restart::check_before_ecu` (resume limit,
 ///   supply voltage), commits the incremented resume count and makes the gates of
 ///   `restart::check_gates` (ADR-229 item 2 step 2, ADR-261), which send only
@@ -528,8 +529,9 @@ pub async fn run_program_journaled<C: WorkerApi>(
 ///   unsafely (`restart::unsafe_continuation`) ends in [`JobError::OnSiteInterventionRequired`]
 ///   (`UnsafeContinuation`), and a journal with no usable end state in the same error
 ///   (`MissingPlanEndState`), both with nothing sent after the verification;
-/// - a journal that rules a restart out, or a missing or unreadable one for a program with a
-///   plan, ends the job in on-site intervention with nothing sent.
+/// - a journal that rules a restart out, or an unreadable one, or a missing one for any program
+///   that is not a plain start without it, ends the job in on-site intervention with nothing
+///   sent.
 ///
 /// `guards` are taken and returned as for [`run_program`]. After an agent crash or a loss of the
 /// device's power, the new run takes them with `JobGuards::take` before it calls this, waiting
@@ -758,7 +760,7 @@ fn run_job<C: WorkerApi>(
     // behind; a resumed job opened its journal before the link (above), and opening it only cuts
     // a torn last frame, which any later open would cut as well.
     let result = std::panic::catch_unwind(AssertUnwindSafe(|| match journal {
-        Some(JournalMode::Create(setup)) if restart::keeps_journal(program) => {
+        Some(JournalMode::Create(setup)) => {
             let mut journal = JobJournal::create(setup)?;
             run_on(program, &mut host, limits, cancelled, Some(&mut journal))
         }
@@ -1042,7 +1044,7 @@ where
         // final, nothing is sent and no resume counted (ADR-288).
         RestartDecision::Stopped(stopped) => Err(stopped_error(&stopped)),
         RestartDecision::PlainStart => match opened {
-            Ok(journal) if restart::keeps_journal(program) => {
+            Ok(journal) => {
                 let first_step = restart::next_steps(journal.state());
                 let mut journal = JobJournal::new(journal, sources);
                 run_on_from(
@@ -1055,9 +1057,9 @@ where
                 )
                 .map(Restarted::Finished)
             }
-            // A program with neither a plan nor a `RecoveryRequired` section keeps no journal
-            // (ADR-252 item 7, ADR-293).
-            _ => run_on(program, host, limits, cancelled, None::<&mut JobJournal<S>>)
+            // No journal at all: `classify` allowed a plain start only for a program that sends
+            // nothing it could not repeat (ADR-335 item 1), and the run keeps none.
+            Err(_) => run_on(program, host, limits, cancelled, None::<&mut JobJournal<S>>)
                 .map(Restarted::Finished),
         },
         RestartDecision::Restart(point) => {
@@ -2137,8 +2139,12 @@ def main():
             assert_eq!(host.logs, ["a", "b", "c", "a", "b", "c"]);
             commits.get()
         };
+        // The same sections made interruptible: their idempotency still decides which primitives
+        // get a request marker (ADR-335), so the difference is the two intents.
         let mut plain = program.clone();
-        plain.sections.clear();
+        for section in &mut plain.sections {
+            section.interruptible = Interruptible::Yes;
+        }
         assert_eq!(run(&program), run(&plain) + 2);
     }
 
@@ -2742,26 +2748,27 @@ def main():
         let mut host = FlashHost::new(Rc::clone(&commits));
         let mut journal = counting_journal(&commits, None);
         run_flash(&mut host, &mut journal).unwrap();
-        // Commits: 1 the run start, 2 the step into the entry with the VM state, 3 the hardware
-        // part number, 4 the software version, 5 the transfer start, 6 the erase's step, 7 the
-        // RequestDownload's step, 8-13 each block and its step, 14 the exit marker, 15
-        // RequestTransferExit's step, 16 the Pop's step after it, which reaches the plan's end and
-        // carries the VM state, 17 the completion.
+        // Commits: 1 the run start, 2 the request marker of the session change (outside every
+        // plan and section, so not safe to repeat, ADR-335), 3 its checkpoint, 4 the step into
+        // the entry with the VM state, 5 the hardware part number, 6 the software version, 7 the
+        // transfer start, 8 the erase's step, 9 the RequestDownload's step, 10-15 each block and
+        // its step, 16 the exit marker, 17 RequestTransferExit's step, 18 the Pop's step after
+        // it, which reaches the plan's end and carries the VM state, 19 the completion.
         assert_eq!(
             host.log,
             [
-                (Sent::Service(0x10, vec![0x01]), 1),
-                (Sent::Service(0x22, vec![0xF1, 0x91]), 2),
-                (Sent::Service(0x22, vec![0xF1, 0x95]), 3),
-                (Sent::Routine(0xFF00), 5),
-                (Sent::Service(0x34, vec![0x01]), 6),
-                (Sent::Block, 7),
+                (Sent::Service(0x10, vec![0x01]), 2),
+                (Sent::Service(0x22, vec![0xF1, 0x91]), 4),
+                (Sent::Service(0x22, vec![0xF1, 0x95]), 5),
+                (Sent::Routine(0xFF00), 7),
+                (Sent::Service(0x34, vec![0x01]), 8),
                 (Sent::Block, 9),
                 (Sent::Block, 11),
-                (Sent::Service(0x37, vec![0x01]), 14),
+                (Sent::Block, 13),
+                (Sent::Service(0x37, vec![0x01]), 16),
             ]
         );
-        assert_eq!(commits.get(), 17);
+        assert_eq!(commits.get(), 19);
         let facts = &journal.journal().state().facts;
         let transfer = facts.transfer.as_ref().unwrap();
         assert_eq!(transfer.last_block, Some(3));
@@ -2788,7 +2795,8 @@ def main():
     fn a_failed_transfer_start_commit_ends_the_job_before_the_erase() {
         let commits = Rc::new(Cell::new(0));
         let mut host = FlashHost::new(Rc::clone(&commits));
-        let mut journal = counting_journal(&commits, Some(5));
+        // The transfer-start marker is the seventh commit (see the commit list above).
+        let mut journal = counting_journal(&commits, Some(7));
         let result = run_flash(&mut host, &mut journal);
         assert!(
             matches!(result, Err(JobError::Journal(JournalError::Io(_)))),
@@ -2808,7 +2816,8 @@ def main():
     fn a_failed_exit_marker_commit_ends_the_job_before_request_transfer_exit() {
         let commits = Rc::new(Cell::new(0));
         let mut host = FlashHost::new(Rc::clone(&commits));
-        let mut journal = counting_journal(&commits, Some(14));
+        // The exit marker is the sixteenth commit (see the commit list above).
+        let mut journal = counting_journal(&commits, Some(16));
         let result = run_flash(&mut host, &mut journal);
         assert!(
             matches!(result, Err(JobError::Journal(JournalError::Io(_)))),
@@ -2828,7 +2837,7 @@ def main():
         let commits = Rc::new(Cell::new(0));
         let mut host = FlashHost::new(Rc::clone(&commits));
         // The second block's commit.
-        let mut journal = counting_journal(&commits, Some(10));
+        let mut journal = counting_journal(&commits, Some(12));
         assert!(matches!(
             run_flash(&mut host, &mut journal),
             Err(JobError::Journal(JournalError::Io(_)))
@@ -3183,8 +3192,8 @@ def main():
             Some(&mut journal),
         )
         .unwrap();
-        // The adjacent-plans count (17 + 12 + 1) plus one intent per plan.
-        assert_eq!(commits.get(), 17 + 12 + 1 + 2);
+        // The adjacent-plans count (19 + 12 + 1) plus one intent per plan.
+        assert_eq!(commits.get(), 19 + 12 + 1 + 2);
         assert_eq!(
             journal.journal().state().facts.last_intent.map(|at| at.pc),
             Some(download + shift)
@@ -3269,7 +3278,9 @@ def main():
             .iter()
             .find(|(sent, _)| *sent == Sent::Routine(0xFF03))
             .unwrap();
-        assert_eq!(before, after, "no second intent in the same pass");
+        // Between the two requests: the first one's checkpoint and the second one's request
+        // marker (ADR-335), no second intent.
+        assert_eq!(after - before, 2, "no second intent in the same pass");
         let (_, baseline, _) = {
             let mut plain = program.clone();
             plain.sections.clear();
@@ -3764,11 +3775,12 @@ def main():
             Some(&mut journal),
         )
         .unwrap();
-        // The run start, then the first plan: 14 records up to RequestTransferExit's step, then
-        // the step into the second plan's entry (with the VM state) and the first plan's
-        // completion. The second: transfer start, 2 steps, 6 for the blocks, exit marker, its
-        // step, the Pop that reaches the end (with the VM state), completion.
-        assert_eq!(commits.get(), 17 + 12 + 1);
+        // The run start, the session change's request marker and checkpoint (outside every plan
+        // and section, ADR-335), then the first plan: 14 records up to RequestTransferExit's
+        // step, then the step into the second plan's entry (with the VM state) and the first
+        // plan's completion. The second: transfer start, 2 steps, 6 for the blocks, exit marker,
+        // its step, the Pop that reaches the end (with the VM state), completion.
+        assert_eq!(commits.get(), 19 + 12 + 1);
         // The first plan's end is the second's entry: one record holds that state, and the
         // second plan's end state comes after it.
         let state = journal.journal().state();
@@ -3790,7 +3802,7 @@ def main():
             .filter(|(sent, _)| matches!(sent, Sent::Routine(_)))
             .map(|(_, commits)| *commits)
             .collect();
-        assert_eq!(routines, [5, 18]);
+        assert_eq!(routines, [7, 20]);
         let reads = host
             .sent()
             .iter()
@@ -4070,8 +4082,276 @@ def main():
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// A plain program, no plan: a read at 1 under a `Safe` section, a routine at 4 under an
+    /// `Unsafe` one, and a request at 7 under none.
+    fn plain_procedure() -> Program {
+        let mut code = Vec::new();
+        for op in [
+            Op::ServiceRequest { service: 0x22 },
+            Op::RoutineControl {
+                routine: 0xFF01,
+                sub: 1,
+            },
+            Op::ServiceRequest { service: 0x3E },
+        ] {
+            code.extend([Op::PushBytes(0), op, Op::Pop]);
+        }
+        let mut program = program(code);
+        program.sections = vec![
+            plain_section(0, 3, diag_ir::Idempotency::Safe),
+            plain_section(3, 6, diag_ir::Idempotency::Unsafe),
+        ];
+        program.validate().unwrap();
+        program
+    }
+
+    fn plain_section(
+        start_pc: u32,
+        end_pc: u32,
+        idempotency: diag_ir::Idempotency,
+    ) -> diag_ir::Section {
+        diag_ir::Section {
+            start_pc,
+            end_pc,
+            interruptible: diag_ir::Interruptible::Yes,
+            idempotency,
+            expected_millis: 0,
+        }
+    }
+
+    /// Runs `program` on a [`FlashHost`] against a counting journal; the host's log holds the
+    /// commits made before each request.
+    fn run_counting(
+        program: &Program,
+        fail_at: Option<u64>,
+    ) -> (
+        Result<VmState, JobError>,
+        FlashHost,
+        u64,
+        JobJournal<CountingStore>,
+    ) {
+        let commits = Rc::new(Cell::new(0));
+        let mut host = FlashHost::new(Rc::clone(&commits));
+        let mut journal = counting_journal(&commits, fail_at);
+        let result = run_on(
+            program,
+            &mut host,
+            JobLimits::default(),
+            &AtomicBool::new(false),
+            Some(&mut journal),
+        );
+        (result, host, commits.get(), journal)
+    }
+
+    /// ADR-335 item 2: a plain procedure journals its run start, a request marker before each
+    /// primitive that is not safe to repeat, committed before the request is sent, and a
+    /// checkpoint after each primitive, and none of it touches the facts a flash plan reads.
     #[test]
-    fn a_program_without_a_plan_keeps_no_journal() {
+    fn a_plain_procedure_journals_a_marker_before_an_unsafe_primitive_and_a_checkpoint_after_each()
+    {
+        let (result, host, commits, journal) = run_counting(&plain_procedure(), None);
+        result.unwrap();
+        // Commits: 1 the run start; the read is `Safe`, so no marker, sent after 1; 2 its
+        // checkpoint; 3 the routine's marker, sent after it; 4 its checkpoint; 5 the marker of
+        // the request outside every section, sent after it; 6 its checkpoint.
+        assert_eq!(
+            host.log,
+            [
+                (Sent::Service(0x22, vec![0x01]), 1),
+                (Sent::Routine(0xFF01), 3),
+                (Sent::Service(0x3E, vec![0x01]), 5),
+            ]
+        );
+        assert_eq!(commits, 6);
+        let state = journal.journal().state();
+        let facts = &state.facts;
+        let at = |pc, steps| StepRef { pc, steps };
+        assert_eq!(facts.first_request, Some(at(4, 4)));
+        assert_eq!(facts.last_request, Some(at(7, 7)));
+        // The newest state is the last primitive's checkpoint, standing after it.
+        let (checkpoint, bytes) = state.latest_checkpoint.as_ref().unwrap();
+        assert_eq!(*checkpoint, at(7, 7));
+        let after: VmState = postcard::from_bytes(bytes).unwrap();
+        assert_eq!((after.pc, after.steps), (8, 8));
+        // What a flash plan reads: only the run start's state, no step, no intent, no transfer.
+        let (start, _) = state.last_vm_state.as_ref().unwrap();
+        assert_eq!(*start, at(0, 0));
+        assert_eq!(state.previous_vm_state, None);
+        assert_eq!(facts.last_step, None);
+        assert_eq!(facts.last_intent, None);
+        assert_eq!(facts.transfer, None);
+    }
+
+    /// A primitive outside every section and one under a `Safe` and an `Unsafe` section at once
+    /// are both not safe to repeat, so both get a marker (ADR-335); one under `Safe` sections
+    /// alone gets none.
+    #[test]
+    fn an_uncovered_primitive_and_an_overlapped_one_get_a_request_marker() {
+        let requests = |sections: Vec<diag_ir::Section>| {
+            let mut program = plain_procedure();
+            program.sections = sections;
+            let (result, _, commits, journal) = run_counting(&program, None);
+            result.unwrap();
+            let facts = &journal.journal().state().facts;
+            (
+                commits,
+                facts.first_request.map(|at| at.pc),
+                facts.last_request.map(|at| at.pc),
+            )
+        };
+        use diag_ir::Idempotency::{Safe, Unsafe};
+        // Every primitive `Safe`: the run start and three checkpoints.
+        assert_eq!(requests(vec![plain_section(0, 9, Safe)]), (4, None, None));
+        // The routine under both: one marker.
+        assert_eq!(
+            requests(vec![plain_section(0, 9, Safe), plain_section(4, 5, Unsafe)]),
+            (5, Some(4), Some(4))
+        );
+        // Under no section: a marker for each of the three.
+        assert_eq!(requests(Vec::new()), (7, Some(1), Some(7)));
+    }
+
+    /// The marker is committed through `arrive` with the cancel check an intent has (ADR-291): a
+    /// cancelled job leaves none.
+    #[test]
+    fn a_cancelled_job_leaves_no_request_marker() {
+        let program = plain_procedure();
+        let commits = Rc::new(Cell::new(0));
+        let mut host = FlashHost::new(Rc::clone(&commits));
+        let mut journal = counting_journal(&commits, None);
+        let mut vm = Vm::new(&program);
+        vm.state.pc = 4;
+        vm.state.steps = 4;
+        let result = journal.arrive(&program, &vm.state, &mut host, &AtomicBool::new(true));
+        assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
+        assert_eq!(commits.get(), 0);
+        journal
+            .arrive(&program, &vm.state, &mut host, &AtomicBool::new(false))
+            .unwrap();
+        assert_eq!(commits.get(), 1);
+        assert_eq!(
+            journal.journal().state().facts.last_request,
+            Some(StepRef { pc: 4, steps: 4 })
+        );
+        // The read at 1 is safe to repeat: nothing to commit, cancelled or not.
+        vm.state.pc = 1;
+        vm.state.steps = 1;
+        journal
+            .arrive(&program, &vm.state, &mut host, &AtomicBool::new(true))
+            .unwrap();
+        assert_eq!(commits.get(), 1);
+    }
+
+    /// A marker that cannot be committed ends the job before the request it guards.
+    #[test]
+    fn a_failed_request_marker_commit_ends_the_job_before_the_request() {
+        // Commit 3 is the routine's marker (see the commit list above).
+        let (result, host, commits, _) = run_counting(&plain_procedure(), Some(3));
+        assert!(
+            matches!(result, Err(JobError::Journal(JournalError::Io(_)))),
+            "{result:?}"
+        );
+        assert_eq!(host.sent(), [Sent::Service(0x22, vec![0x01])]);
+        assert_eq!(commits, 2);
+    }
+
+    /// A flash program gets checkpoints outside its plan's range only, and what its plan's
+    /// restart reads is as before (ADR-335 item 2): the session change ahead of the plan is not
+    /// safe to repeat, so it gets a marker and a checkpoint, and the plan's records are those
+    /// the older tests list. With every primitive outside the plan `Safe`, there is no marker,
+    /// and the routine after the plan gets a checkpoint that is not a state the plan's restart
+    /// reads.
+    #[test]
+    fn a_flash_program_gets_checkpoints_only_outside_its_plan() {
+        let at = |pc, steps| StepRef { pc, steps };
+        let (result, _, commits, journal) = run_counting(&flash_program(), None);
+        result.unwrap();
+        // The 17 records of the plan's run, the session change's marker and its checkpoint.
+        assert_eq!(commits, 19);
+        let state = journal.journal().state();
+        let facts = &state.facts;
+        assert_eq!(
+            (facts.first_request, facts.last_request),
+            (Some(at(1, 1)), Some(at(1, 1)))
+        );
+        assert_eq!(facts.last_intent, None);
+        assert_eq!(facts.last_step, Some(at(EXIT + 1, 17)));
+        assert_eq!(
+            state.last_vm_state.as_ref().map(|s| s.0),
+            Some(at(EXIT + 1, 17))
+        );
+        assert_eq!(
+            state.previous_vm_state.as_ref().map(|s| s.0),
+            Some(at(ENTRY - 1, 2))
+        );
+        // The newest state is the plan's end state: no checkpoint inside the plan's range.
+        assert_eq!(state.latest_checkpoint, state.last_vm_state);
+
+        let program = safe_outside_the_plan(completed_path_program());
+        let routine = program
+            .code
+            .iter()
+            .position(|op| {
+                matches!(
+                    op,
+                    Op::RoutineControl {
+                        routine: 0xFF02,
+                        ..
+                    }
+                )
+            })
+            .unwrap() as u32;
+        let (result, _, _, journal) = run_counting(&program, None);
+        result.unwrap();
+        let state = journal.journal().state();
+        assert_eq!(state.facts.last_request, None);
+        // The plan's last step, the Pop after RequestTransferExit, is the newest step and carries
+        // the newest state of the plan's restart; the routine's checkpoint is newer than both.
+        let last = program.flash[0].boundaries.post_transfer_end_pc - 1;
+        assert_eq!(state.facts.last_step.map(|at| at.pc), Some(last));
+        assert_eq!(state.last_vm_state.as_ref().map(|s| s.0.pc), Some(last));
+        assert_eq!(
+            state.latest_checkpoint.as_ref().map(|s| s.0.pc),
+            Some(routine)
+        );
+    }
+
+    /// A plain start on the journal of an earlier run counts its steps on from the newest record,
+    /// the new ones included, so its markers and checkpoints come after theirs (ADR-335).
+    #[test]
+    fn a_plain_start_on_an_existing_journal_commits_after_the_new_records() {
+        let program = plain_procedure();
+        let dir = journal_dir("plain-start-after-markers");
+        // The routine's response is lost, after its marker and the read's checkpoint.
+        let result = first_run(&program, &dir, JobLimits::default(), |host| {
+            host.lose_routine = Some(0xFF01);
+        });
+        assert!(
+            matches!(result, Err(JobError::Host { pc: 4, .. })),
+            "{result:?}"
+        );
+        let before = Journal::read(&dir, &job_key()).unwrap();
+        assert_eq!(before.facts.last_request, Some(StepRef { pc: 4, steps: 4 }));
+        let first_step = restart::next_steps(&before);
+        assert!(first_step > 4);
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        resume(&program, &dir, &mut host, false).expect("a plain start runs the program");
+        let after = Journal::read(&dir, &job_key()).unwrap();
+        assert_eq!(after.facts.first_request, before.facts.first_request);
+        assert_eq!(
+            after.facts.last_request,
+            Some(StepRef {
+                pc: 7,
+                steps: first_step + 7
+            })
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A first run that cannot open its link creates no journal, whatever the program: nothing
+    /// has been sent, so the job can be tried again.
+    #[test]
+    fn a_plain_program_leaves_no_journal_when_its_link_fails() {
         let dir =
             std::env::temp_dir().join(format!("ngr-runner-no-journal-{}", std::process::id()));
         let setup = JournalSetup {
@@ -4081,7 +4361,7 @@ def main():
             vin: None,
             intended_software_version: None,
         };
-        // Fails when the link opens, before the journal would be created: no file appears.
+        // Fails when the link opens, before the journal is created: no file appears.
         let slot = vci_only_slot("no-journal");
         let result = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -8780,7 +9060,8 @@ def main():
     /// intended version, and every primitive outside the plan is `Safe`: the restart goes on
     /// from the plan's end, runs the routine after the plan again and completes, with no erase
     /// and no ECUReset sent by the restart or the program after the plan. The continuation
-    /// commits no run start (ADR-274 item 4), and with no plan after it, nothing at all.
+    /// commits no run start (ADR-274 item 4), and with no plan after it, only the checkpoint of
+    /// the routine it runs again (ADR-335).
     #[test]
     fn a_verified_restart_goes_on_after_the_plan_and_completes() {
         let program = safe_outside_the_plan(completed_path_program());
@@ -8796,8 +9077,10 @@ def main():
         expected.push(Sent::Routine(0xFF02));
         assert_eq!(full_log(&host), expected);
         let after = Journal::read(&dir, &job_key()).unwrap();
-        // The resume record, and no run start or step.
-        assert_eq!(after.records, before.records + 1);
+        // The resume record and the routine's checkpoint, and no run start or step; the
+        // checkpoint is no state the flash-plan restart reads.
+        assert_eq!(after.records, before.records + 2);
+        assert_ne!(after.latest_checkpoint, before.latest_checkpoint);
         assert_eq!(after.last_vm_state, before.last_vm_state);
         assert_eq!(after.facts.last_step, before.facts.last_step);
         std::fs::remove_dir_all(&dir).unwrap();
@@ -11032,7 +11315,8 @@ def main():
     }
 
     /// A program with a plan whose journal is missing or does not read back needs on-site
-    /// intervention, with nothing sent; one without a plan and without a journal runs.
+    /// intervention, with nothing sent; so does one without a plan that is not safe to repeat. A
+    /// program whose every primitive is `Safe` runs without a journal.
     #[test]
     fn a_missing_or_unreadable_journal_sends_nothing() {
         let program = flash_program();
@@ -11067,9 +11351,31 @@ def main():
         assert!(host.session_reads.is_empty());
         std::fs::remove_dir_all(&dir).unwrap();
 
-        let plain = program_without_plan();
+        // A program with no plan whose requests are not safe to repeat (no section covers them)
+        // is refused as well; with every primitive `Safe` the missing journal is a plain start
+        // (ADR-335 item 1).
+        let mut plain = program_without_plan();
         let dir = journal_dir("resume-no-plan");
         let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        let result = resume(&plain, &dir, &mut host, false);
+        assert!(
+            matches!(
+                result,
+                Err(JobError::OnSiteInterventionRequired(
+                    OnSiteReason::MissingJournal
+                ))
+            ),
+            "{result:?}"
+        );
+        assert_eq!(host.sent(), []);
+        plain.sections.push(diag_ir::Section {
+            start_pc: 0,
+            end_pc: plain.code.len() as u32,
+            interruptible: diag_ir::Interruptible::Yes,
+            idempotency: diag_ir::Idempotency::Safe,
+            expected_millis: 0,
+        });
+        plain.validate().unwrap();
         resume(&plain, &dir, &mut host, false).expect("the program runs");
         assert_eq!(host.sent().len(), 2);
         // Only the guards' lock directory: no journal was created.
@@ -11110,8 +11416,10 @@ def main():
     #[test]
     fn a_recovery_required_section_without_a_plan_keeps_a_journal() {
         let program = recovery_section_without_plan();
-        assert!(crate::restart::keeps_journal(&program));
-        assert!(!crate::restart::keeps_journal(&program_without_plan()));
+        assert!(!crate::restart::missing_journal_is_plain_start(&program));
+        assert!(!crate::restart::missing_journal_is_plain_start(
+            &program_without_plan()
+        ));
         let refused = |result: &Result<VmState, JobError>| {
             matches!(
                 result,

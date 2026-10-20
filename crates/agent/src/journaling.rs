@@ -16,7 +16,9 @@
 //! - at the first diagnostic primitive at or past a plan's recovery-required point that is
 //!   neither of those, once per pass through the plan: a request intent (ADR-253);
 //! - at the first diagnostic primitive of a pass through a section marked `RecoveryRequired`
-//!   outside every plan: a request intent (ADR-291).
+//!   outside every plan: a request intent (ADR-291);
+//! - at every diagnostic primitive outside every plan's range (`entry_pc` up to, not including,
+//!   `post_transfer_end_pc`) that is not safe to repeat: a request marker (ADR-335 item 2).
 //!
 //! When an instruction completes ([`JobJournal::completed`]):
 //! - a `FlashTransfer`: the block, by the host's running index;
@@ -28,7 +30,10 @@
 //!   `post_transfer_end_pc`, whatever its instruction: a step record with the VM state after it
 //!   (ADR-271 item 2, ADR-274; one record when that pc is also a plan's entry; a jump to the end
 //!   from outside the plan records nothing), then, after the plan's exit marker, the
-//!   post-transfer completion.
+//!   post-transfer completion;
+//! - a diagnostic primitive outside every plan's range: a checkpoint with the VM state after it
+//!   (ADR-335 item 2), except where the step brings execution to a plan's `entry_pc`, whose
+//!   step record carries that state already.
 //!
 //! When the procedure ends itself as failed (`Op::Fail`): a procedure-failure record, the job's
 //! last ([`JobJournal::procedure_failed`], ADR-280). A restart's identity abort is committed by
@@ -49,7 +54,7 @@ use crate::inputs::{FieldBytes, ServiceSources, read_field_bytes};
 use crate::journal::{
     FileStore, JobKey, Journal, JournalError, RunStop, StageId, StepRef, Store, Vin,
 };
-use crate::restart::in_section_outside_plans;
+use crate::restart::{in_section_outside_plans, needs_request_marker};
 use crate::runner::JobError;
 
 /// Where a job keeps its journal, under which key, and how it reads the ECU's identity.
@@ -229,6 +234,21 @@ impl<S: Store> JobJournal<S> {
         } else {
             self.in_recovery_section = false;
         }
+        // Outside the plans, a primitive that is not safe to repeat is written ahead as well, so
+        // a crash before its response shows that it may have been sent (ADR-335 item 2).
+        if needs_request_marker(program, pc) {
+            self.request(at, cancelled)?;
+        }
+        Ok(())
+    }
+
+    /// Commits a request marker at `at`, before the request there is sent (ADR-335 item 2).
+    fn request(&mut self, at: StepRef, cancelled: &AtomicBool) -> Result<(), JobError> {
+        // As for an intent: a cancelled job sends nothing more, so it leaves no marker either.
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(JobError::Cancelled);
+        }
+        self.journal.commit_request(at)?;
         Ok(())
     }
 
@@ -268,12 +288,21 @@ impl<S: Store> JobJournal<S> {
         let inside = program.flash.iter().any(|plan| {
             (plan.boundaries.entry_pc..plan.boundaries.post_transfer_end_pc).contains(&at.pc)
         });
+        let primitive = op.is_some_and(Op::is_diagnostic_primitive);
         if enters {
             let encoded = postcard::to_allocvec(after)
                 .map_err(|_| JournalError::Invariant("the VM state does not encode"))?;
             self.journal.commit_step(at, Some(&encoded))?;
-        } else if inside && op.is_some_and(Op::is_diagnostic_primitive) {
-            self.journal.commit_step(at, None)?;
+        } else if inside {
+            if primitive {
+                self.journal.commit_step(at, None)?;
+            }
+        } else if primitive {
+            // A plain procedure's resume origin (ADR-335 item 2); the flash-plan facts do not
+            // read it.
+            let encoded = postcard::to_allocvec(after)
+                .map_err(|_| JournalError::Invariant("the VM state does not encode"))?;
+            self.journal.commit_checkpoint(at, &encoded)?;
         }
         for plan in &program.flash {
             if after.pc == plan.boundaries.post_transfer_end_pc

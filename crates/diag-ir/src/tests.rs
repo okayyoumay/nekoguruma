@@ -2811,6 +2811,22 @@ fn the_number_of_plans_is_capped() {
     );
 }
 
+/// The plain procedure's resume count lives under a reserved stage (ADR-335 item 6).
+#[test]
+fn a_plan_cannot_use_the_reserved_stage() {
+    let mut program = recovery_program();
+    assert_eq!(program.validate(), Ok(()));
+    let flash_session = program.flash[0].flash_session;
+    program.flash[0].stage = PLAIN_PROCEDURE_STAGE;
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::ReservedStage {
+            flash_session,
+            stage: PLAIN_PROCEDURE_STAGE
+        })
+    );
+}
+
 #[test]
 fn a_backward_jump_does_not_cross_the_recovery_point() {
     // FromPc(4): the jump at 4 back to the erase crosses it; a jump at 2 does not.

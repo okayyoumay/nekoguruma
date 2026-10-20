@@ -254,16 +254,15 @@ at, the others at the step they completed). The facts a flash plan's restart rea
 the last and previous VM state, the last intent, the interruption point) are not changed by either
 record, so the classification of a journal with a plan is the one described below.
 `restart::next_steps` counts them, so a run that goes on with the journal records after them. A
-primitive costs one fsync for its checkpoint and two when it is not safe to repeat. Nothing reads
-the new facts yet.
+primitive costs one fsync for its checkpoint and two when it is not safe to repeat. The restart
+classification reads the new facts ("A plain procedure" below).
 
 Because every journaled job now keeps a journal, a plain program's declared failure, step-limit
 stop or VM refusal is terminal across resumes, as for a plan program (ADR-280, ADR-288), and
 `run_program_journaled` called again with an existing job key on a plain program fails because
 the journal exists, instead of running the program again.
 
-The restart's use of the records, the classification of a plain procedure, is not implemented
-(below).
+The restart's use of the records is the classification of a plain procedure, below.
 
 ## Restart classification
 
@@ -279,7 +278,7 @@ step count, of the last completed step, the two transfer markers and the last re
 | a procedure-failure record (ADR-280), checked before every row below | `Failed`, with the record's position, code and detail |
 | an identity-abort record (ADR-286), checked right after the procedure-failure record | `Aborted`, with the `IdentityKind`, whatever the transfer state |
 | interruption point at or past a plan's recovery-required point and before its end, or inside a `RecoveryRequired` section the journal can place it in (inside a plan, on the step into a plan's entry, or at a completed plan's end); a point no later than the last post-transfer step of a completed transfer counts as at that plan's end; also, whatever the point, an intent of a `RecoveryRequired` section outside the plans with no transfer-start marker after it (ADR-291) | `OnSiteInterventionRequired` |
-| no transfer-start marker | plain start |
+| no transfer-start marker | the plain procedure's classification (below): a plain start, a checkpoint-resume decision or `OnSiteInterventionRequired` |
 | transfer-start marker | `Restart`, for the plan of the marker's stage, with the VM state at its entry; `OnSiteInterventionRequired` if that plan never allows a restart |
 
 A restart's entry state is the newest state the journal holds if it stands at the plan's entry (a
@@ -305,11 +304,56 @@ plan's entry; otherwise, or for a stage the program does not declare, the decisi
 `OnSiteInterventionRequired`. Its step count continues after the journal's last record
 (`restart::next_steps`), so the restart's records come after the old ones.
 
-ADR-335 item 3 onwards decides how a restart classifies a plain procedure (a plain start, a resume
-from the latest checkpoint, or on-site intervention with the reasons `UnconfirmedRequest`,
-`NotResumable`, `ProcedureResumeLimitReached` and `ProcedureIdentityNotEstablished`). None of that
-is implemented: a journal with no transfer-start marker is still a plain start, the new records
-are not read, and the table above is the classification as built.
+### A plain procedure
+
+A journal with no transfer-start marker is a plain procedure's (ADR-335 items 3 to 7), after the
+checks above (a failure, an abort, a stop and a `RecoveryRequired` section) have not decided it. A
+started transfer keeps the flash path. `restart::classify_plain_procedure` decides in this order:
+
+| Journal | Decision |
+|---|---|
+| no `Request` was ever recorded, whatever the journal's states | plain start on the same journal, counted (below) |
+| the last `Request` is not older than the state of the latest checkpoint (the newest record that carries a VM state), or there is no such state | `OnSiteInterventionRequired(UnconfirmedRequest { at })`: the unsafe primitive may have reached the ECU. It holds at every later resume until a person acts |
+| the latest checkpoint's state does not decode, or fails `Vm::check_state` with its step count set to `restart::next_steps` | `OnSiteInterventionRequired(InvalidEntryState)`, before the conditions below read the state |
+| otherwise, from the latest checkpoint's state, one of the conditions below fails | `OnSiteInterventionRequired(NotResumable { cause })` |
+| otherwise | `ResumeFromCheckpoint`, with the checkpoint's step and its state, whose step count is `restart::next_steps` and which passed `Vm::check_state` |
+
+The comparison of the request is with the state's own step count: a checkpoint or a step state is
+taken after the completed step, so its count is one past its record's, and a run start's is the
+step about to run. A cancel while a request's marker was committed leaves a marker with no later
+state, which reads as unconfirmed too. The conditions of the checkpoint resume are checked in this
+order, and the first that fails is the cause:
+
+1. the checkpoint's pc is an interruptible point (`restart::interruptible_point`, the rule the
+   runner marks cancel points with, ADR-330): not inside a section whose `interruptible` is not
+   `Yes`, and not a `Ret`. Otherwise the cause is `UninterruptibleSection { pc }`, also for a
+   checkpoint standing on the return after a `No` section's last primitive (ADR-335 item 3). A
+   plain procedure declares no re-entry point, so such a checkpoint never resumes (ADR-335
+   item 5);
+2. nothing reachable from the checkpoint is a hazard. Reachability (`Program::reachable_from`) is
+   the forward closure over fallthrough, jumps, calls and returns, with the state's suspended
+   callers as the returns' targets; it is conservative (both ways of a conditional jump). The
+   lowest reachable pc that is one of these is the cause: an instruction in a plan's range
+   (`PlanAhead { flash_session }`), a diagnostic primitive in a `RecoveryRequired` section
+   (`RecoveryRequiredAhead { section, pc }`), or a diagnostic primitive that is not safe to repeat
+   (`UnsafePrimitiveAhead { pc }`; one outside every section is not safe, and a loop's back edge or
+   a call can make an earlier one reachable);
+3. the job names a target VIN and the program declares a VIN source, otherwise `NoIdentity`.
+
+A plain start on an existing journal counts as a resume of the plain procedure: the runner commits
+the existing resume record under the reserved stage `diag_ir::PLAIN_PROCEDURE_STAGE` before anything
+is sent, after a cancel check, and a stage already resumed `JobLimits::max_procedure_resumes` times
+(agent policy, default 3, not in the IR) ends the job in
+`OnSiteInterventionRequired(ProcedureResumeLimitReached { resumes, max })` with nothing sent. A
+plain start of a missing journal runs without one and is not counted. ADR-335 item 6 counts a
+checkpoint resume under the same stage and limit when one runs; the runner's
+`CheckpointResumeNotImplemented` ending below counts none.
+
+The runner does not run a `ResumeFromCheckpoint` decision (the VIN read and lock, the resume
+count and the run from the restored state of ADR-335 item 6). A job that reaches it ends in
+`OnSiteInterventionRequired(CheckpointResumeNotImplemented { at })` with nothing sent and no resume
+counted, rather than in a plain start, which would send the requests the journal records a second
+time.
 
 ## Restart entry
 
@@ -323,11 +367,12 @@ it classifies the journal.
 
 | Decision | What the runner does |
 |---|---|
-| plain start | runs the program from its start on the same journal; its step count starts at `restart::next_steps`, after the journal's last record, and the identity is read again. A program whose journal is missing (a plain start only for a program that sends nothing it could not repeat, ADR-335 item 1) runs without one |
+| plain start | on an existing journal, checks the plain stage's resume count against `JobLimits::max_procedure_resumes` (`ProcedureResumeLimitReached`), takes a cancel check, commits the resume record, then runs the program from its start on the same journal; its step count starts at `restart::next_steps`, after the journal's last record, and the identity is read again. A program whose journal is missing (a plain start only for a program that sends nothing it could not repeat, ADR-335 item 1) runs without one |
 | `Failed` | ends in `JobError::ProcedureFailed` with the record's position, code and detail, read under the journal's lock before the worker link is opened; nothing is sent to the ECU and no resume is counted (ADR-280) |
 | `Aborted` | ends in `JobError::IdentityMismatch` with the journaled `IdentityKind`, read under the journal's lock before the worker link is opened and before the target VIN and intended version are compared; nothing is sent to the ECU and no resume is counted (ADR-286) |
 | `Stopped` | ends in the error the stopped run returned, `JobError::StepLimit` with the recorded step count or `JobError::Vm` with the recorded position and error, read under the journal's lock before the worker link is opened; nothing is sent to the ECU and no resume is counted, so a plain start does not send the pre-erase requests again and a restart does not redo the transfer (ADR-288) |
 | `OnSiteInterventionRequired` | ends in `JobError::OnSiteInterventionRequired` with the classification's reason; nothing is sent |
+| `ResumeFromCheckpoint` | ends in `JobError::OnSiteInterventionRequired(CheckpointResumeNotImplemented)`; nothing is sent and no resume is counted (A plain procedure above) |
 | `Restart` | runs `restart::check_before_ecu`, then the gates of `restart::check_gates` (which promote the guards to the per-vehicle lock once the VIN matches, ADR-263), then the teardown of `restart::teardown` (ADR-264), then the default-session confirmation of `restart::confirm_default_session` (ADR-265). An ECU that cannot be confirmed ends the job in `JobError::OnSiteInterventionRequired(DefaultSessionNotConfirmed)`. Then `restart::check_identity` (step 3a) reads the VIN and the hardware identity again: a different one ends the job in `IdentityMismatch` (journaled first, ADR-286), one that cannot be established in `OnSiteInterventionRequired(IdentityNotEstablished)`, and a matching VIN promotes the guards again (the lock's fallback when step 2 could not read it). Then `restart::check_state` (step 3b-2) reads the software version and decides between redoing the transfer and the read-back verification (`restart::check_state` below): a version nobody wrote ends the job in `OnSiteInterventionRequired(UnexpectedSoftwareVersion)`, one that cannot be established in `OnSiteInterventionRequired(SoftwareVersionNotEstablished)`. When the state check decides to redo the transfer, `restart::check_reentry` (step 4a) checks every declared precondition again through its default-session source: one that does not hold ends the job in `OnSiteInterventionRequired(PreconditionNotMet)`. When step 4a passes, the program's steps from the plan's entry boundary up to, not including, its erase run again from `RestartPoint::entry_state` (step 4b-2, ADR-273; `replay to the erase` below), and then `restart::check_before_erase` (step 4b-3) checks every declared precondition once more through its programming-session source: one that does not hold ends the job in `OnSiteInterventionRequired(PreconditionNotMetBeforeErase)` with no erase sent. After that check the same VM goes on from the erase as a first run does (step 4c, ADR-276; `redo from the erase` below), and the job ends as that first run would. When the state check decides the read-back verification, the program goes on after the plan instead (`continuation after the read-back verification` below), and the job ends as a first run would; the gates' reads, at most one ECUReset, the F186 reads, step 3a's two reads, step 3b-2's version reads, step 4a's precondition reads, the replayed steps, step 4b-3's precondition reads and then the redone transfer and the rest of the program, or after a verification the program's steps after the plan, reach the ECU |
 
 The on-site endings that the `Restart` row reaches after `check_before_ecu` has committed the

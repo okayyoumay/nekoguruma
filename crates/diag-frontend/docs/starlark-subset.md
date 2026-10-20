@@ -281,7 +281,7 @@ field that stores them.
 | `params` of `diag.hmi` | dict whose values are all constants (3.2) |
 | `params` of `diag.request` | dict known at ingestion whose keys and values select one declared service of the variant and give its other request fields (3.4); a call that selects none, or more than one, is rejected (`STAR_UNKNOWN_SERVICE`) |
 | `params` of `diag.routine` | dict known at ingestion whose keys and values give the routine service's own constants and other request fields, as for `diag.request`; a call whose `routine_id`, `sub` and `params` select no generated routine service is rejected (`STAR_UNKNOWN_SERVICE`) |
-| `session_id` | `int` naming a flash session declared in the declaration part (`FlashSession` in `ir.fbs`); an unknown session is rejected (`STAR_UNKNOWN_FLASH_SESSION`) |
+| `session_id` | `int` naming a flash session declared in the declaration part (`FlashSession` in `ir.fbs`); an unknown session is rejected (`STAR_UNKNOWN_FLASH_SESSION`). Under the target contract of 3.2 (ADR-336) it must name a session of the target whose handle the call is made on, and its value is the RequestTransferExit response in the 3.4 shape without `fields` |
 
 A `diag.wait` whose duration is known at ingestion lowers to `Wait`, with the range checked then. One whose
 duration is an `int` computed at run time lowers to the code that pushes it, then `WaitFromStack` (ADR-233),
@@ -305,7 +305,7 @@ instruction exists, the transpiler rejects calls to it (`STAR_API_NOT_AVAILABLE`
 | `diag.read_dtc` | `SendReceive` | the complete request (bytes), built at ingestion from the profile's template with the `mask` constant, of the declared service the template selects (ADR-309 item 4, ADR-314 item 2); the call's value is the response, read under the profile's names (3.4) |
 | `diag.routine` | `RoutineControl` | the rest of the request after the sub-function and the routine identifier (bytes), built at ingestion from `params`; the instruction holds `routine_id` and `sub`, which select the variant's generated routine service through the profile (ADR-309 item 4, ADR-314). The call's value is the response, read under the response's declared names (3.4) |
 | `diag.security_access` | `ServiceRequest`, `SecurityAccess`, `ServiceRequest` | expands to the profile's three steps (ADR-309 item 4, ADR-314): the seed request (on UDS the SecurityAccess service with the odd sub-function `level`), `SecurityAccess`, which turns the seed into the key through the host, and the send-key request (on UDS sub-function `level + 1`) carrying that key. The profile decodes neither response through a declared service, so both requests are `ServiceRequest`s of the template's SID with the payload it gives, and the variant needs no declared service for them; the seed is the seed response after the profile's leading bytes (on UDS the response SID and the level). A negative seed response ends the call before the key step, like a failed `diag.request`, and is its value; otherwise the value is the send-key response, positive or negative |
-| `diag.flash_transfer` | `FlashTransfer` | one block (bytes) per instruction; the call expands to a loop over the flash session's blocks |
+| `diag.flash_transfer` | `FlashTransfer` | none lowered today: the converter refuses the call (`STAR_NOT_LOWERABLE`). The contract ADR-336 decides is below: the call expands to RequestDownload, a loop of `FlashBlock` and `FlashTransfer`, and RequestTransferExit, whose run-time operands are the block index for `FlashBlock` and the block bytes it leaves for `FlashTransfer` |
 | `diag.wait` | `Wait`, or `WaitFromStack` | none for a constant duration; for a duration known only at run time, the duration in milliseconds (`int`), pushed before `WaitFromStack` |
 | `diag.hmi` | `HmiRequest` | none: the instruction sends a constant, so the transpiler encodes the form and its constant `params` into one constant-pool entry; parameters known only at run time need a variant that takes them from the stack |
 | `diag.record` | `RecordInput` | none: the template reference is a constant-pool entry |
@@ -316,6 +316,8 @@ instruction exists, the transpiler rejects calls to it (`STAR_API_NOT_AVAILABLE`
 | `diag.fail` | `Fail` | `code` as a constant-pool entry; `detail` as bytes from the stack, since it can be built at run time. The instruction ends the procedure as failed and is terminal (ADR-280) |
 
 **Target contract (ADR-309).** The table describes the lowering as built; the protocol-neutral calls `diag.read_dtc`, `diag.routine` and `diag.security_access` go through their profile. ADR-309 changes it: `diag.read_dtc`, `diag.routine` and `diag.security_access` name an intent and are lowered through the application-layer profile of the variant's protocol into that variant's declared services; `diag.read_dtc` lowers to a generic send-receive instead of `ReadDtc`; `diag.routine` keeps `RoutineControl` on UDS and uses the generic send-receive on other application layers; `diag.flash_transfer` stays UDS-only. UDS is the first profile. A profile is typed data shipped with the frontend (`diag_frontend::profile`, ADR-314): per call, the steps it expands to, each with a request template that selects the declared service by value and position and a map from the response to the result. The variant's protocols name its application layer (`csv-tables.md` 4.3), and a call to `diag.read_dtc`, `diag.routine` or `diag.security_access` that its profile does not define is rejected (`STAR_NOT_IN_PROFILE`). The UDS profile defines all three. `diag.read_dtc` is lowered: a variant with no single declared service its template selects is `STAR_UNKNOWN_SERVICE`, and one whose selected response does not fit the profile's map is `STAR_NOT_IN_PROFILE`, naming the field. `diag.routine` is lowered the same way: a variant without exactly one generated routine service its identifier, sub-function and `params` select is `STAR_UNKNOWN_SERVICE`. `diag.security_access` is lowered through the profile's templates alone (3.2 above), so it selects no declared service.
+
+**Target contract (ADR-336).** ADR-336 decides the lowering of `diag.flash_transfer(session)`, which the converter will do only inside a plan function (4.9). The call expands to a `ServiceRequest` of RequestDownload (0x34) whose operand is built from the session's segment (the two format bytes from `flash_segments.csv`, then the start address and length big-endian in the widths the format byte gives, ISO 14229-1 (2026) 14.2.2.3; a value that does not fit is a conversion error). A `for` loop over `ceil(length / block_size)` blocks follows, a constant count that must not exceed 2^32 - 1, the largest block number the write-job journal records (a segment with more blocks is a conversion error), each pass `LoadLocal i; FlashBlock; FlashTransfer`. A `ServiceRequest` of RequestTransferExit (0x37, the service id alone) ends it. `Op::FlashBlock { session, segment }` pops an `int` block index and pushes that block's bytes, which the VM takes from the host's `artifact_bytes(offset, len)`; the agent has verified the artifact's hash at job check (design 8.2.5, 11.3). The block is the segment's `block_size` payload, the last block shorter when the length does not divide. The RequestDownload response is dropped: a negative one makes the first `FlashTransfer` a host error, which interrupts the plan: a plan that allows a restart there (`recovery=never`, or a recovery-required point after the RequestDownload) redoes it within `maxResumes`, and with the default point at the erase the job ends in on-site intervention. A procedure of a variant whose application layer is not UDS is rejected (`STAR_NOT_IN_PROFILE`). A session with more than one segment is `STAR_NOT_LOWERABLE`.
 
 ### 3.3 Synchronous Calls
 
@@ -524,7 +526,7 @@ Interruptibility (8.10.1) is specified with comment annotations. Code outside ev
 `interruptible: yes`.
 
 Every comment whose text starts with `@` is an annotation. An annotation that is not one of the
-forms in 4.2, 4.5 and 4.6, has an unknown or misspelled keyword or attribute, or stands where its
+forms in 4.2, 4.5, 4.6 and 4.9 (the last are the contract of ADR-336), has an unknown or misspelled keyword or attribute, or stands where its
 form does not allow it is rejected at ingestion (`STAR_BAD_ANNOTATION`), so a typo such as
 `# @section uninteruptible` cannot silently leave a range interruptible.
 
@@ -573,6 +575,14 @@ authentication time (8.10.1) each time the function is called.
   section function's interruptibility and expected duration, so a copy's pieces are contiguous,
   and a section is entered only by the section function's call. Without `expected=`, the expected
   duration is 0.
+- **Plan functions.** A function may carry `@section` and `@flashPlan` (4.9) together, and a plan
+  function must: its `@section` is `uninterruptible` or `recoveryRequired`, since design 8.10.1
+  makes the range from the erase to the completed write uninterruptible (`STAR_PLAN_SHAPE`). A section
+  function that a plan function reaches is not called there: it is expanded in place, entered by
+  fallthrough at its first piece (ADR-336 item 3; this changes the entry rule above for that case).
+  The plan function's own section covers the whole expansion, inlined code included; an inlined
+  `interruptible` piece does not lift it, since a cancel is held wherever any covering section is
+  not `interruptible` (ADR-330).
 - **No nesting.** A call to a section function from anything that runs inside a section,
   directly or through other functions or function arguments, is rejected at that call
   (`STAR_BAD_ANNOTATION`). A call to a section function from outside every section, as many
@@ -596,6 +606,8 @@ used:
 | `security_access`, `routine`, `flash_transfer` | `CheckState` (a repeated security access starts again from a new seed request) |
 | any other `request` | `Unsafe`, since a service the transpiler does not classify may change ECU state |
 
+**Target contract (ADR-336 item 8).** Two defaults change. A `request` with DiagnosticSessionControl (0x10) or TesterPresent (0x3E) is `Safe` everywhere: a repeat re-enters the session the procedure wanted and behaves in any residual state (ADR-335). Inside a plan function's expansion (4.9), an unannotated `request` of any other service that is not a read is `CheckState`, "not stated": the plan's redo rules govern a repeat there, and `Unsafe` would refuse every plan that changes session or resets the ECU after the transfer. `# @idempotency unsafe` still forces a refusal. The table above is what the converter does today.
+
 ```python
     # @idempotency unsafe
     diag.routine(0xFF00, 0x01, {})
@@ -608,7 +620,11 @@ over the instructions that set up its operands. Outside every section it is `int
 with an expected duration of 0. Inside a section function it carries that function's
 interruptibility and expected duration, and the function's range is cut around it (4.5). In a
 lowered program the sections therefore never overlap, and each diagnostic primitive is covered by
-exactly one (ADR-332).
+exactly one (ADR-332). The exception is a plan function's expansion (4.9, the contract of
+ADR-336): the plan's own section covers the whole expansion, so the pieces of a section function
+inlined in it, and the one-instruction sections of its `diag` calls, lie inside that section and
+keep their own attributes; the readers combine covering sections conservatively (ADR-332 item 5,
+ADR-330).
 
 `Safe` means that a repeat is harmless and that the primitive behaves correctly in any session
 and security state the procedure can leave the ECU in: its default session after a timeout, or
@@ -675,6 +691,91 @@ type, so the transpiler infers at ingestion which types each value can have (ADR
 
 ---
 
+### 4.9 Flash plans and preconditions
+
+**Target contract (ADR-336).** This section is what ADR-336 decides. The converter lowers none of it today, and refuses `diag.flash_transfer` (3.2).
+
+A flash recovery plan (design 8.2.5) is a whole top-level function that the lowering expands in
+place at its one call site in `main`. ECU facts (identity and precondition sources, the plan's
+timings and block format) come from the definition directory's tables (`csv-tables.md` 4.12, 4.13
+and 4.14); the annotations below give only what the procedure knows.
+
+```python
+# @section uninterruptible expected=180000
+# @flashPlan session=1 maxResumes=3 recovery=never
+def write_application():
+    diag.request(0x10, {"session": 0x02})
+    diag.security_access(0x11)
+    # @erase
+    diag.routine(0xFF00, 0x01, {})
+    res = diag.flash_transfer(1)
+    if not res["ok"]:
+        diag.fail("TRANSFER_EXIT_REFUSED", "")
+    diag.routine(0xFF01, 0x01, {})
+    diag.request(0x11, {"reset": 0x01})
+
+# @preconditions voltage externalSupply ignition engine vehicleSpeed
+def main():
+    write_application()
+```
+
+- **`# @flashPlan session=<int> [maxResumes=<int>] [recovery=never]`.** It stands directly before a
+  top-level `def` other than `main`, under the placement rules of `@section` (4.5), and may share
+  the `def` with one. `session` must name a `FlashSession` of the target the call
+  addresses (`STAR_UNKNOWN_FLASH_SESSION`). `maxResumes` is an integer from 1 to 65535
+  (`STAR_ARGUMENT_OUT_OF_RANGE`) and defaults to 3. The plan's stage is the session id; the
+  maximum id is refused because it is the reserved id of a plain procedure. `@flashPlan`,
+  `@erase` and `@recoveryRequired` follow the placement rules of 4.5 for a `def` and of 4.6 for a
+  statement: alone at the start of a line, directly before what they annotate, with only comments
+  and blank lines between; a misplaced one is `STAR_BAD_ANNOTATION`.
+- **Shape (`STAR_PLAN_SHAPE`).** Each is an error: the function is not called exactly once; the
+  call is not a statement of `main`'s body (inside an `if` is allowed, inside a `for` is not);
+  the call is in another function, a plan or a section function; the plan has a `return` (it ends
+  by falling off its body or by `diag.fail`); the plan is the callee of a section function; a plan
+  function is never called; `main` carries the annotation (nothing calls it, so it has no call
+  site to expand at); the plan function carries no `@section uninterruptible` or
+  `@section recoveryRequired` (4.5); the plan's `diag.flash_transfer` call names another session than its
+  annotation, or the plan has no `diag.flash_transfer` call or more than one.
+- **Coverage.** Everything that runs during the call is in the plan. Functions it calls, directly
+  or not, section functions included, are expanded in place, not copied and called: a plan
+  contains no `Call` or `Ret` (ADR-245 item 4). A `Ret` becomes a jump to the join, locals get
+  fresh slots in `main`'s frame, and the copies count toward the specialization budget of 2.6.
+- **Boundaries.** The entry is the first instruction of the expansion and the post-transfer end
+  the pc after its last. The transfer exit is the RequestTransferExit the `diag.flash_transfer`
+  expansion emits. The erase point is the `diag.routine` statement annotated `# @erase`, a single
+  call and a top-level statement of the plan before the transfer; with no `erase-memory` step in
+  the session `@erase` is refused and the erase point is the RequestDownload, and with one it is
+  required. The `@erase` and `diag.flash_transfer` statements are top-level statements of the plan
+  so no jump skips them; loops and `if`s between them are fine.
+- **Recovery-required point.** By default the plan requires on-site intervention from the erase
+  point (no automatic restart after it). `recovery=never` declares that no step does.
+  `# @recoveryRequired` before a statement of the plan moves the point to that statement's first
+  instruction; it is exclusive with `recovery=never`. A plan function whose section is
+  `recoveryRequired` requires on-site intervention from its entry, the only point that agrees with
+  a section covering the whole plan (`Program::validate` refuses a contradiction); `# @recoveryRequired`
+  and `recovery=never` are refused in it (`STAR_PLAN_SHAPE`).
+- **`# @preconditions <name> ...`** stands directly before `def main()` and names preconditions
+  among `voltage`, `externalSupply`, `ignition`, `engine` and `vehicleSpeed`. Each needs a row in
+  the variant's `preconditions.csv` (`STAR_UNKNOWN_PRECONDITION`). A procedure with a flash plan
+  must carry it and name at least `voltage`, `externalSupply` and `ignition`, the checks design
+  8.9.1 makes mandatory before reprogramming (`STAR_PLAN_SHAPE`). For a procedure without a plan
+  it is optional; without it the program declares none.
+- **Targets.** A plan's target is the target of the handle `diag.flash_transfer` is called on.
+  Its identity sources come from that target's `identity.csv`, the VIN source from the first
+  access target's table when the procedure has access targets and else from the primary's, and
+  the precondition sources from the reprogramming target's table (the primary's for a plain
+  procedure).
+- **Identity for a restartable plan.** A plan that allows a restart (`recovery=never`, or a
+  recovery-required point after the erase) needs all three rows of the variant's `identity.csv`
+  (`vin`, `hardware_part_number`, `software_version`), which the restart reads
+  (`STAR_PLAN_SHAPE`, naming the missing kind).
+- **UDS only, one segment.** `diag.flash_transfer` or `@flashPlan` in a variant whose application
+  layer is not UDS is `STAR_NOT_IN_PROFILE`. A session has one segment per plan.
+- **Validation.** `Program::validate` runs on every lowered program. A refusal that names a pc is
+  `STAR_PLAN_INVALID` at the source of that pc; one without a pc stays `STAR_NOT_LOWERABLE`.
+- **Layout.** `main`'s body is emitted at pc 0 and ends in a `Ret`, so no `Call` leads to a plan
+  (ADR-336 item 5, amending ADR-304 item 1).
+
 ## 5. Error Reporting
 
 **All subset violations are listed**. Do not stop at the first one.
@@ -716,6 +817,14 @@ names them at the end of its hint (`(in variant V1)`, `(in variants V1, V2)`).
 }
 ```
 
+The error codes of the flash plan contract (ADR-336, 4.9):
+
+| Code | Meaning |
+|---|---|
+| `STAR_PLAN_SHAPE` | a `@flashPlan` function breaks a shape rule (call count, call site, `return`, section callee, never called) |
+| `STAR_PLAN_INVALID` | the lowered plan is refused by `Program::validate`; located at the source of the pc the refusal names |
+| `STAR_UNKNOWN_PRECONDITION` | a name in `# @preconditions` has no row in the variant's `preconditions.csv` |
+
 ---
 
 ## 6. Implementation Notes
@@ -732,7 +841,7 @@ names them at the end of its hint (`(in variant V1)`, `(in variants V1, V2)`).
   a long run of digits or spaces (ADR-303)
 - Detection uses an "allowlist approach". Unknown node kinds are rejected as
   `STAR_UNSUPPORTED_SYNTAX` so that nothing slips through by oversight
-- Comment annotations (4.2, 4.5, 4.6) are taken from the comment tokens the parser's lexer
+- Comment annotations (4.2, 4.5, 4.6, and 4.9 once ADR-336 is implemented) are taken from the comment tokens the parser's lexer
   reports, never from raw source lines, so `# @` inside a string literal is not an annotation.
   The text after the one comment marker must start with `@`, so `## @...` is an ordinary comment.
   Each annotation is attached by its line to the following statement. An annotation belongs to

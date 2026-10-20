@@ -1,7 +1,7 @@
 # ADR-304: Lowering Starlark Procedures to the IR
 
 **Date:** 2026-10-15
-**Status:** Accepted (item 4's run-time `<<` lowered through `Op::ShlChecked`; Starlark subset 4.4)
+**Status:** Accepted (item 4's run-time `<<` lowered through `Op::ShlChecked`; Starlark subset 4.4; item 1 superseded in part by ADR-336: main's body is emitted at pc 0)
 **Affects:** `diag-frontend` (`src/star/lower.rs`, `docs/starlark-subset.md` 4.7 and 4.8); `docs/system-architecture.md` 8.4
 
 ## Context

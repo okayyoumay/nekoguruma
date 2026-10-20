@@ -1,7 +1,7 @@
 # ADR-301: Starlark Sections Are Whole Functions
 
 **Date:** 2026-10-15
-**Status:** Accepted (item 3's one `Section` per copy split around each diagnostic primitive by ADR-332)
+**Status:** Accepted (item 3's one `Section` per copy split around each diagnostic primitive by ADR-332; the Consequences' open question on a plan answered by ADR-336: a plan function is expanded in place)
 **Affects:** `diag-frontend` (`docs/starlark-subset.md` 4.5 and section 6, `src/star.rs`, `examples/sequence.example.star`); `docs/system-architecture.md` 8.4; ADR-300 Consequences
 
 ## Context

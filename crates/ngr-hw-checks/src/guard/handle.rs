@@ -2108,6 +2108,13 @@ impl GuardedHandle {
                 Some(event_item::Data::ResultData(result))
                     if item.cop_handle == monitor && !is_echo(&result.rx_flag) =>
                 {
+                    // The awaited frame is returned before the cap is applied: only frames kept
+                    // for later count against it.
+                    if let RawWait::Frame(expected) = wait
+                        && result.data_bytes == expected
+                    {
+                        return Ok(Some(result.data_bytes));
+                    }
                     let mut state = self.shared.lock();
                     let frames = state.raw_frames.entry(cll.cll_handle).or_default();
                     if frames.len() >= RAW_BUFFER_CAP {

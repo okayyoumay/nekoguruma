@@ -1367,6 +1367,26 @@ async fn a_raw_monitor_returns_the_expected_frame_and_buffers_the_others() {
         .raw_receive(cll, &missing, std::time::Duration::from_millis(300))
         .await;
     assert_eq!(silent, Err(HandleError::NoResponse));
+    // A full buffer still lets the awaited frame through; only a frame to keep beyond it fails.
+    let unrelated = can_frame(0x123, &[0x0A]);
+    for _ in 0..1024 {
+        server
+            .backdoor
+            .inject_rx(MOCK_CHANNEL_ID, &unrelated, j2534_0404::ISO15765);
+    }
+    let awaited = can_frame(0x123, &[0x0B]);
+    server
+        .backdoor
+        .inject_rx(MOCK_CHANNEL_ID, &awaited, j2534_0404::ISO15765);
+    assert_eq!(
+        handle.raw_receive(cll, &awaited, timeout).await.unwrap(),
+        awaited
+    );
+    server
+        .backdoor
+        .inject_rx(MOCK_CHANNEL_ID, &unrelated, j2534_0404::ISO15765);
+    let full = handle.raw_receive(cll, &missing, timeout).await;
+    assert_eq!(full, Err(HandleError::RawBufferFull { cap: 1024 }));
     drop(handle);
     run.pass();
     // The closing cancels the monitor.

@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 use super::*;
 
+mod restart;
+
 fn example_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/example-ecu")
 }
@@ -1637,7 +1639,9 @@ fn with_fields(rows: &[&str], services: &[&str]) -> (Vec<(String, Vec<u8>)>, u32
         services_csv.push('\n');
     }
     let mut files = with("fields.csv", &fields);
-    files.retain(|(n, _)| n != "services.csv");
+    // These tests change the example's DID records, which identity sources would judge too
+    // (they have their own tests).
+    files.retain(|(n, _)| n != "services.csv" && n != "identity.csv");
     files.push(("services.csv".into(), services_csv.into_bytes()));
     (files, first)
 }

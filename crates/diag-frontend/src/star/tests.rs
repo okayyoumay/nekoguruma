@@ -383,6 +383,63 @@ def main():
     );
 }
 
+/// `@preconditions` stands directly before `def main()` and names the five preconditions (4.9).
+#[test]
+fn preconditions_stand_directly_before_main() {
+    passes("# @preconditions voltage\ndef main():\n    pass\n");
+    passes(
+        "# @preconditions voltage externalSupply ignition engine vehicleSpeed\n\
+         def main():\n    pass\n",
+    );
+    // Other comments and blank lines may come between, and a section may share the `def`.
+    passes("def f():\n    pass\n\n# @preconditions ignition\n\n# More.\ndef main():\n    f()\n");
+    passes("# @section interruptible\n# @preconditions ignition\ndef main():\n    pass\n");
+    let bad = |source: &str, lines: &[u32]| {
+        let found = codes(source);
+        assert!(
+            found
+                .iter()
+                .all(|(code, _)| *code == StarCode::BadAnnotation),
+            "{source}: {found:?}"
+        );
+        let found: Vec<u32> = found.iter().map(|(_, line)| *line).collect();
+        assert_eq!(found, lines, "{source}");
+    };
+    // Not before `main`: another `def`, a constant, inside a body, after code.
+    bad(
+        "# @preconditions voltage\ndef f():\n    pass\n\ndef main():\n    f()\n",
+        &[1],
+    );
+    bad(
+        "# @preconditions voltage\nX = 1\ndef main():\n    pass\n",
+        &[1],
+    );
+    bad(
+        "def main():\n    # @preconditions voltage\n    pass\n",
+        &[2],
+    );
+    bad("def main():\n    pass\n# @preconditions voltage\n", &[3]);
+    bad(
+        "X = 1  # @preconditions voltage\ndef main():\n    pass\n",
+        &[1],
+    );
+    // A name that is not a precondition (the table's spelling is not the annotation's), one
+    // named twice, none, and a second annotation.
+    bad(
+        "# @preconditions external_supply\ndef main():\n    pass\n",
+        &[1],
+    );
+    bad(
+        "# @preconditions voltage voltage\ndef main():\n    pass\n",
+        &[1],
+    );
+    bad("# @preconditions\ndef main():\n    pass\n", &[1]);
+    bad(
+        "# @preconditions voltage\n# @preconditions engine\ndef main():\n    pass\n",
+        &[2],
+    );
+}
+
 #[test]
 fn a_def_takes_one_section() {
     let source = "\

@@ -7,6 +7,7 @@ use crate::tables::{read_directory, read_files, resolve};
 
 mod dtcs_and_flash;
 mod idempotency;
+mod restart;
 mod services;
 
 /// The example definition's files, by name.
@@ -371,8 +372,17 @@ fn every_procedure_goes_with_every_variant() {
         .filter(|(n, _)| n.ends_with(".csv"))
         .map(|(n, c)| (n.as_str(), c.as_slice()))
         .collect();
+    // The lowering sees the variant's services and restart facts through its request index.
+    let definition = resolve(read_files(files.clone()).expect("reads")).expect("resolves");
+    let index = crate::convert::services::Index::new(&definition);
     for converted in &converted.documents {
         let document = load_ecu_document(&converted.bytes).expect("the document loads");
+        let at = definition
+            .tables
+            .variants
+            .iter()
+            .position(|v| v.name == converted.name)
+            .expect("a variant of the definition");
         let file = converted.procedure.as_deref().expect("a procedure");
         let source = if file == "a.star" { LOG } else { FAIL };
         // Each document's digest covers the tables and its own procedure file only.
@@ -386,7 +396,7 @@ fn every_procedure_goes_with_every_variant() {
             file,
             &checked,
             document.variant().expect("a variant"),
-            &crate::star::RequestIndex::default(),
+            &index.request_index(at),
         )
         .expect("lowers")
         .program;

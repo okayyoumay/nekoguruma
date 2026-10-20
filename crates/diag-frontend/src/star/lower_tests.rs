@@ -1589,6 +1589,7 @@ fn a_protocol_neutral_call_needs_its_profile_to_define_it() {
         let requests = RequestIndex {
             services: Vec::new(),
             profile,
+            ..RequestIndex::default()
         };
         match lower("t.star", &checked(source), variant, &requests) {
             Ok(_) => Vec::new(),
@@ -2571,4 +2572,105 @@ def main():
             diag.log(1, \"ok\")
 ";
     assert_eq!(run_logged(source).0, ["log 1 ok"]);
+}
+
+// ---------------------------------------------------------------- Restart declaration (ADR-336)
+
+/// A request index whose restart facts are a VIN source and the voltage and ignition
+/// preconditions: the first from a service, the second with a programming-session source.
+fn restart_index() -> RequestIndex {
+    let precondition = |lower, upper, default, programming| diag_ir::Precondition {
+        satisfied: diag_ir::Satisfied { lower, upper },
+        default_session: Some(default),
+        programming_session: Some(programming),
+    };
+    let supply = diag_ir::Source::RuntimeInput(diag_ir::RuntimeInput::SupplyVoltageMillivolts);
+    let read = diag_ir::Source::EcuService {
+        service_id: 4,
+        field_id: 9,
+    };
+    RequestIndex {
+        identity: diag_ir::IdentitySources {
+            vin: Some(read),
+            ..Default::default()
+        },
+        preconditions: diag_ir::Preconditions {
+            voltage_mv: Some(precondition(12_000, 15_000, supply, read)),
+            ignition: Some(precondition(
+                1,
+                1,
+                diag_ir::Source::RuntimeInput(diag_ir::RuntimeInput::IgnitionOn),
+                diag_ir::Source::RuntimeInput(diag_ir::RuntimeInput::IgnitionOn),
+            )),
+            ..Default::default()
+        },
+        ..RequestIndex::default()
+    }
+}
+
+fn lowered_against(source: &str, requests: &RequestIndex) -> Result<Program, Vec<StarError>> {
+    let checked = check("t.star", source).unwrap_or_else(|errors| panic!("{errors:#?}"));
+    let bytes = empty_document();
+    let variant = load_ecu_document(&bytes)
+        .expect("the document loads")
+        .variant()
+        .expect("a variant");
+    lower("t.star", &checked, variant, requests).map(|lowered| lowered.program)
+}
+
+#[test]
+fn a_program_carries_the_identity_and_only_the_named_preconditions() {
+    let requests = restart_index();
+    // Every program of the variant has the identity sources, one without the annotation too.
+    let plain = lowered_against("def main():\n    pass\n", &requests).expect("lowers");
+    assert_eq!(plain.identity, requests.identity);
+    assert_eq!(plain.preconditions, diag_ir::Preconditions::default());
+    plain.validate().expect("a plain procedure validates");
+
+    let source = "# @preconditions ignition voltage\ndef main():\n    pass\n";
+    let program = lowered_against(source, &requests).expect("lowers");
+    assert_eq!(program.identity, requests.identity);
+    assert_eq!(
+        program.preconditions.voltage_mv,
+        requests.preconditions.voltage_mv
+    );
+    assert_eq!(
+        program.preconditions.ignition,
+        requests.preconditions.ignition
+    );
+    assert_eq!(program.preconditions.engine, None);
+    program.validate().expect("the declaration validates");
+
+    let source = "# @preconditions ignition\ndef main():\n    pass\n";
+    let program = lowered_against(source, &requests).expect("lowers");
+    assert_eq!(program.preconditions.voltage_mv, None);
+    assert!(program.preconditions.ignition.is_some());
+}
+
+#[test]
+fn a_precondition_without_a_row_is_unknown() {
+    let source = "\
+# @preconditions voltage engine vehicleSpeed externalSupply
+def main():
+    pass
+";
+    let errors = lowered_against(source, &restart_index()).expect_err("rejected");
+    assert_eq!(
+        errors.iter().map(|e| (e.code, e.line)).collect::<Vec<_>>(),
+        [(StarCode::UnknownPrecondition, 1)]
+    );
+    // One error names every missing kind, in the order written.
+    assert!(
+        errors[0]
+            .hint
+            .contains("engine, vehicle_speed, external_supply"),
+        "{}",
+        errors[0].hint
+    );
+    // With no table at all, any name is unknown.
+    let errors = lowered("# @preconditions ignition\ndef main():\n    pass\n").expect_err("no row");
+    assert_eq!(
+        errors.iter().map(|e| e.code).collect::<Vec<_>>(),
+        [StarCode::UnknownPrecondition]
+    );
 }

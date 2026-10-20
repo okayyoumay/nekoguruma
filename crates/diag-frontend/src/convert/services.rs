@@ -14,6 +14,10 @@ use diag_ir::declaration::{
     SelectT, ServiceT, ShapeT, Termination, TextEntryT, VariantPatternT,
 };
 
+use diag_ir::{
+    IdentityKind, IdentitySources, Precondition, PreconditionKind, Preconditions, Satisfied, Source,
+};
+
 use crate::star::{IndexedService, RequestConstant, RequestIndex};
 use crate::tables::rows::{
     self, ConversionKind, ConversionRow, FieldRow, FieldType, Length, RoutinePart, Terminator,
@@ -233,7 +237,69 @@ impl<'a> Index<'a> {
         let protocol = &tables.protocols[self.definition.variants[variant].protocols[0]];
         let profile = crate::profile::get(&protocol.application_layer)
             .expect("resolving checks that a profile ships for every protocol's layer");
-        RequestIndex { services, profile }
+        let (identity, preconditions) = self.restart(variant);
+        RequestIndex {
+            services,
+            profile,
+            identity,
+            preconditions,
+        }
+    }
+
+    /// The identity sources and preconditions of `variant` (4.13, 4.14, ADR-336 item 1), as
+    /// every program lowered for it carries them. A source is the field's `Field.id` of the
+    /// generated read's `Service.id` in the document (section 3), the key the agent's source
+    /// table is built over.
+    fn restart(&self, variant: usize) -> (IdentitySources, Preconditions) {
+        let tables = &self.definition.tables;
+        let rows = &self.definition.variants[variant];
+        let source = |source: &rows::SourceRef| match source {
+            rows::SourceRef::Input(input) => Source::RuntimeInput(*input),
+            rows::SourceRef::Service { service, field } => {
+                // Resolving checked that the service is a DID read of one field with this name.
+                let did = rows::Container::Did(service.name.clone());
+                Source::EcuService {
+                    service_id: self.service_ids[service],
+                    field_id: self.field_ids[self.fields_by_name[&(&did, field.as_str())]]
+                        .expect("a source field is not a constant"),
+                }
+            }
+        };
+        let mut identity = IdentitySources::default();
+        for &i in &rows.identity {
+            let row = &tables.identity[i];
+            let slot = match row.kind {
+                IdentityKind::Vin => &mut identity.vin,
+                IdentityKind::HardwarePartNumber => &mut identity.hardware_part_number,
+                IdentityKind::SoftwareVersion => &mut identity.software_version,
+            };
+            *slot = Some(source(&rows::SourceRef::Service {
+                service: row.service.clone(),
+                field: row.field.clone(),
+            }));
+        }
+        let mut preconditions = Preconditions::default();
+        for &i in &rows.preconditions {
+            let row = &tables.preconditions[i];
+            let default = source(&row.default_source);
+            let slot = match row.kind {
+                PreconditionKind::Voltage => &mut preconditions.voltage_mv,
+                PreconditionKind::ExternalSupply => &mut preconditions.external_supply,
+                PreconditionKind::Ignition => &mut preconditions.ignition,
+                PreconditionKind::Engine => &mut preconditions.engine,
+                PreconditionKind::VehicleSpeed => &mut preconditions.vehicle_speed,
+            };
+            *slot = Some(Precondition {
+                satisfied: Satisfied {
+                    lower: row.lower,
+                    upper: row.upper,
+                },
+                default_session: Some(default),
+                // The programming-session source defaults to the default one (4.14).
+                programming_session: Some(row.programming_source.as_ref().map_or(default, source)),
+            });
+        }
+        (identity, preconditions)
     }
 
     /// The services of `variant`, as the tables define or generate them: its `services.csv`

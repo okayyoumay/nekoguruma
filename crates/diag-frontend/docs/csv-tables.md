@@ -41,8 +41,8 @@ directory, a link to nothing) is rejected (`CSV_UNKNOWN_FILE`).
 | `dtcs.csv` | no | 4.11 | `DtcDefinition` |
 | `flash_sessions.csv` | no | 4.12 | `FlashSession` |
 | `flash_segments.csv` | no | 4.12 | `FlashSegment` |
-| `identity.csv` | no; all three kinds when a procedure of the variant has a flash plan that allows a restart (`starlark-subset.md` 4.9) | 4.13 | `Program.identity` of each program of the variant (ADR-336; the converter reads it once implemented, and until then the file is `CSV_UNKNOWN_FILE`) |
-| `preconditions.csv` | no | 4.14 | `Program.preconditions` of each program of the variant (ADR-336; same status as `identity.csv`) |
+| `identity.csv` | no; all three kinds when a procedure of the variant has a flash plan that allows a restart (`starlark-subset.md` 4.9) | 4.13 | `Program.identity` of each program of the variant (ADR-336) |
+| `preconditions.csv` | no | 4.14 | `Program.preconditions` of each program of the variant, those the procedure names (ADR-336) |
 
 The table conversion produces the declaration part of each variant's documents (design 8.2.6),
 with `source_format` set to `csv-starlark` (ADR-254). Each `.star` file directly in the
@@ -442,10 +442,11 @@ The deprecated `FlashSession` fields are left at their schema defaults. The reco
 preconditions belong to the procedure part (ADR-245) and have no table here, apart from the
 columns below.
 
-**Target contract (ADR-336).** ADR-336 decides the columns below, which the converter reads once
-implemented; the plan's boundaries come from the Starlark procedure (`starlark-subset.md` 4.9).
-They are optional as a group's defaults say, and become the `FlashRecovery` of each plan that names
-the session, in every program of the variant.
+The columns below carry the recovery facts of ADR-336. They are read and range-checked here and
+kept on the session's row; they become the `RecoveryTiming`, `version_read_retries` and
+`no_application` of each plan that names the session, in every program of the variant (the plan's
+boundaries come from the Starlark procedure, `starlark-subset.md` 4.9). A plan needs the first
+five; a session no plan names may leave them empty.
 
 | Column | Type | Required | Meaning |
 |---|---|---|---|
@@ -467,8 +468,13 @@ the session, in every program of the variant.
 | `length` | integer, 1 to 2^64 - 1 | yes | `start_address + length` and `artifact_offset + length` must not exceed 2^64 |
 | `block_size` | integer, 1 to 2^32 - 1 | yes | |
 | `checksum` | bytes | no | Default empty |
-| `data_format` | integer, 0x00 to 0xFF | no | ADR-336: the dataFormatIdentifier of the RequestDownload built from the segment, default 0x00 (`FlashSegment` field) |
-| `address_and_length_format` | integer, 0x00 to 0xFF | no | ADR-336: the addressAndLengthFormatIdentifier, default 0x44; its nibbles give the widths of the address and length (ISO 14229-1 (2026) 14.2.2.3), and a value that does not fit is a conversion error (`FlashSegment` field) |
+| `data_format` | integer, 0x00 to 0xFF | no | ADR-336: the dataFormatIdentifier of the RequestDownload built from the segment, default 0x00 |
+| `address_and_length_format` | integer, 0x00 to 0xFF | no | ADR-336: the addressAndLengthFormatIdentifier, default 0x44; its nibbles give the widths of the address and length (ISO 14229-1 (2026) 14.2.2.3), and a value that does not fit is a conversion error |
+
+The RequestDownload that a plan's `diag.flash_transfer` expands to is built from the two format
+bytes. **Target contract (ADR-336 item 1).** They become the `FlashSegment` fields `data_format`
+and `address_and_length_format`, appended to `ir.fbs` with defaults; until the schema has them,
+the converter reads and checks the columns and keeps the values on the segment's row.
 
 Under ADR-336, `block_size` is the payload of one TransferData request. `block_size + 2` must not
 exceed the ECU's maxNumberOfBlockLength (14.2.3.2), and the lowering refuses a `block_size` above
@@ -479,22 +485,29 @@ must not overlap (`CSV_DUPLICATE`).
 
 ### 4.13 `identity.csv` (scoped)
 
-**Target contract (ADR-336).** ADR-336 decides this table; the converter reads it once
-implemented. One row per identity value, copied into `Program.identity` of every program of the
-variant, plain procedures included.
+One row per identity value, copied into `Program.identity` of every program the converter lowers
+for the variant, plain procedures included (ADR-336 item 1). A kind is given once per variant
+(`CSV_DUPLICATE`).
 
 | Column | Type | Required | Meaning |
 |---|---|---|---|
 | `kind` | `vin`, `hardware_part_number` or `software_version` | yes | The value read; one row per kind per variant |
-| `service` | service name | yes | A generated DID read of the variant (`vin.read`, a ReadDataByIdentifier of one DID, 4.7), the request shape the agent's source table reads; any other service is refused |
-| `field` | name | yes | The top-level response field that holds the value: the DID's only response field, so that it is the whole data record after the echoed identifier (the response shape the agent's source table decodes), of an ASCII text or unsigned integer type, the encodings the agent's source table decodes; for `vin`, a fixed 17-byte ASCII text field only, since the agent's VIN checks compare a 17-character text |
+| `service` | service name | yes | A generated DID read of the variant (`vin.read`, a ReadDataByIdentifier of one DID, 4.7), the request shape the agent's source table reads; any other service is `CSV_BAD_VALUE`, one the variant does not have `CSV_UNKNOWN_REFERENCE` |
+| `field` | name | yes | The top-level response field that holds the value: the DID's only response field, so that it is the whole data record after the echoed identifier (the response shape the agent's source table decodes), of an ASCII text or unsigned integer type, the encodings the agent's source table decodes; for `vin`, a fixed 17-byte ASCII text field only, since the agent's VIN checks compare a 17-character text. A DID of several fields, or a field of another type, is `CSV_BAD_VALUE`; a field the response lacks is `CSV_UNKNOWN_REFERENCE` |
+
+The field starts at byte 0 of the record (no `byte` other than 0, no `bit`). The unsigned integer
+is a `uint` field of whole bytes, up to seven, in big-endian order, the one encoding the agent
+reads; the agent holds the value as a signed 64-bit integer, which every seven-byte value fits. The row becomes `Source::EcuService { service_id, field_id }`, the
+`Service.id` of the read and the `Field.id` of the field in the variant's document (section 3),
+the pair the agent's source table is keyed by. The field rules of section 5 run first: these
+checks follow them (section 7), and a definition with an error in `fields.csv` reports no
+identity or precondition field error.
 
 ### 4.14 `preconditions.csv` (scoped)
 
-**Target contract (ADR-336).** ADR-336 decides this table; the converter reads it once
-implemented. One row per precondition kind. A program carries only the rows its procedure names
-with `# @preconditions` (`starlark-subset.md` 4.9), as `Precondition { satisfied, default_session,
-programming_session }`.
+One row per precondition kind and variant (`CSV_DUPLICATE` otherwise). A program carries only the
+rows its procedure names with `# @preconditions` (`starlark-subset.md` 4.9), as `Precondition {
+satisfied, default_session, programming_session }`.
 
 | Column | Type | Required | Meaning |
 |---|---|---|---|
@@ -503,11 +516,14 @@ programming_session }`.
 | `default_source` | source | yes | Where the value is read in the default session |
 | `programming_source` | source | no | The same in the programming session; default the default source |
 
-A source is `<service>.<field>`, a service name and a top-level response field split at the last dot. The service is a generated DID read of the variant (`<did>.read`, a ReadDataByIdentifier of one DID, 4.7): a read in ADR-327 item 1's sense, so the check sends nothing that changes the ECU, and the request shape the agent's source table reads; any other service is refused. The field is the DID's only response field, the whole data record after the echoed identifier, as in `identity.csv`, and its type is an unsigned integer (not a signed integer, text, bytes or a float: the agent reads a service-backed value as an unsigned big-endian integer and compares it with the range), or `input:<name>` with
+A source is `<service>.<field>`, a service name and a top-level response field split at the last dot. The service is a generated DID read of the variant (`<did>.read`, a ReadDataByIdentifier of one DID, 4.7): a read in ADR-327 item 1's sense, so the check sends nothing that changes the ECU, and the request shape the agent's source table reads; any other service is refused. The field is the DID's only response field, the whole data record after the echoed identifier, as in `identity.csv`, and its type is an unsigned integer of whole bytes in big-endian order (not a signed integer, text, bytes or a float: the agent reads a service-backed value as an unsigned big-endian integer and compares it with the range), or `input:<name>` with
 `name` the runtime input of the row's own kind, a value the agent supplies: `supply_voltage_mv`
 for `voltage`, `external_supply` for `external_supply`, `ignition_on` for `ignition`,
 `engine_running` for `engine` and `vehicle_speed_kmh` for `vehicle_speed`. Another input is
-refused, as `Program::validate` refuses it.
+refused, as `Program::validate` refuses it. The range is the value as read, not converted:
+a service source and the range must agree on the unit. Every violation is `CSV_BAD_VALUE`
+(`CSV_UNKNOWN_REFERENCE` for a service or field that does not exist). The programming-session
+source is read by a restart only, after the plan's own steps have put the ECU in that session.
 
 ---
 
@@ -778,7 +794,9 @@ on its own (the file set, the record format, the header, each cell, and names de
 one table); then the rules that compare rows with each other or with other tables (references,
 variant scoping, a key defined twice in one variant's document); then the rules of fields (5.2
 to 5.5, the conversion and type pairs of 4.5, the services of 4.6, the status layouts of 4.11
-and the layout rules of section 6), which follow the references the stage before resolved. A stage runs only when the
+and the layout rules of section 6), which follow the references the stage before resolved, and
+last the fields that identity and precondition sources name (4.13, 4.14), which are judged once
+the field rules hold. A stage runs only when the
 earlier ones find no error, since a rule that follows a row with an error can be checked neither
 way; a definition with errors of an earlier stage therefore lists only those (ADR-298).
 
@@ -842,7 +860,11 @@ does not have:
   result as a text table; both start only, in the programming session.
 - `dtcs.csv`: two DTCs sharing the `dtcStatus` layout, whose eight one-bit fields are the bits
   of the DTC status byte (ISO 14229-1 (2026) Annex D), under names of the example's own.
-- `flash_sessions.csv` and `flash_segments.csv`: one flash session with one segment.
+- `flash_sessions.csv` and `flash_segments.csv`: one flash session with one segment, with the
+  recovery timings and the RequestDownload format bytes.
+- `identity.csv`: the VIN, the one field of its DID. The spare part number and software version
+  DIDs are terminated text, which an identity row refuses (4.13), so they have no row.
+- `preconditions.csv`: the five preconditions, all read from the agent's inputs.
 
 A row of `fields.csv` from it, the VIN in its data record:
 

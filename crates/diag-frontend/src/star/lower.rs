@@ -21,7 +21,10 @@ use std::rc::Rc;
 
 use diag_ir::declaration::{EcuVariant, LengthKind, Request};
 use diag_ir::encode::{ParamValue, encode_request};
-use diag_ir::{IR_SCHEMA_VERSION, Idempotency, Interruptible, Op, Program, Section, SourceSpan};
+use diag_ir::{
+    IR_SCHEMA_VERSION, Idempotency, Interruptible, Op, PreconditionKind, Preconditions, Program,
+    Section, SourceSpan,
+};
 use starlark_syntax::codemap::Span;
 use starlark_syntax::lexer::TokenInt;
 use starlark_syntax::syntax::ast::{
@@ -144,6 +147,7 @@ fn lower_here<'a>(
     lowerer.constants();
     lowerer.globals_built = lowerer.built;
     lowerer.functions();
+    lowerer.preconditions();
     if lowerer.errors.is_empty() {
         lowerer.infer();
         lowerer.reject_if_exhausted();
@@ -592,6 +596,8 @@ struct Lowerer<'a> {
     annotated: Vec<(Idempotency, bool)>,
     /// How many errors were reported or repeated, which `error` dedupes, outside inference.
     attempted: usize,
+    /// The preconditions `# @preconditions` names, from the variant's table (4.9).
+    preconditions: Preconditions,
 }
 
 /// Where `break` and `continue` jump in the loop being lowered.
@@ -670,6 +676,7 @@ impl<'a> Lowerer<'a> {
                 .collect(),
             annotated: Vec::new(),
             attempted: 0,
+            preconditions: Preconditions::default(),
         }
     }
 
@@ -725,6 +732,60 @@ impl<'a> Lowerer<'a> {
                     ),
                 }
             }
+        }
+    }
+
+    /// The preconditions `# @preconditions` names, taken from the variant's `preconditions.csv`;
+    /// a name without a row is `STAR_UNKNOWN_PRECONDITION` (4.9, ADR-336 item 6). Without the
+    /// annotation the program declares none.
+    fn preconditions(&mut self) {
+        let table = &self.requests.preconditions;
+        let mut named = Preconditions::default();
+        let mut missing = Vec::new();
+        for annotation in &self.checked.annotations {
+            let Annotation::Preconditions { span, kinds, .. } = annotation else {
+                continue;
+            };
+            let mut absent = Vec::new();
+            for &kind in kinds {
+                let (row, slot, name) = match kind {
+                    PreconditionKind::Voltage => {
+                        (&table.voltage_mv, &mut named.voltage_mv, "voltage")
+                    }
+                    PreconditionKind::ExternalSupply => (
+                        &table.external_supply,
+                        &mut named.external_supply,
+                        "external_supply",
+                    ),
+                    PreconditionKind::Ignition => {
+                        (&table.ignition, &mut named.ignition, "ignition")
+                    }
+                    PreconditionKind::Engine => (&table.engine, &mut named.engine, "engine"),
+                    PreconditionKind::VehicleSpeed => (
+                        &table.vehicle_speed,
+                        &mut named.vehicle_speed,
+                        "vehicle_speed",
+                    ),
+                };
+                match row {
+                    Some(row) => *slot = Some(row.clone()),
+                    None => absent.push(name),
+                }
+            }
+            if !absent.is_empty() {
+                missing.push((*span, absent));
+            }
+        }
+        self.preconditions = named;
+        for (span, absent) in missing {
+            self.error(
+                StarCode::UnknownPrecondition,
+                span,
+                format!(
+                    "the variant's preconditions.csv has no row of kind {} (4.9)",
+                    absent.join(", ")
+                ),
+            );
         }
     }
 
@@ -4760,8 +4821,8 @@ impl<'a> Lowerer<'a> {
             constants: std::mem::take(&mut self.pool),
             sections,
             source_map,
-            identity: Default::default(),
-            preconditions: Default::default(),
+            identity: self.requests.identity.clone(),
+            preconditions: self.preconditions.clone(),
             flash: Default::default(),
         }
     }

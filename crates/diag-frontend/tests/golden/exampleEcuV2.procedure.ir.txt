@@ -4,7 +4,7 @@ EcuDocumentT {
         "csv-starlark",
     ),
     source_digest: Some(
-        "9834c276584017eaefd1966428c1440496675d37c4579419f7a393a4a11a014a",
+        "9e3fac6e1ab88c08e9d0160aa4b1290dee423ed2596993fd948adec270800640",
     ),
     variant: Some(
         EcuVariantT {
@@ -3050,237 +3050,327 @@ Program {
         SourceSpan {
             pc: 0,
             file: 0,
-            line: 16,
+            line: 18,
             column: 5,
         },
         SourceSpan {
             pc: 2,
             file: 0,
-            line: 17,
+            line: 19,
             column: 5,
         },
         SourceSpan {
             pc: 5,
             file: 0,
-            line: 18,
+            line: 20,
             column: 5,
         },
         SourceSpan {
             pc: 6,
             file: 0,
-            line: 19,
+            line: 21,
             column: 15,
         },
         SourceSpan {
             pc: 9,
             file: 0,
-            line: 20,
+            line: 22,
             column: 8,
         },
         SourceSpan {
             pc: 14,
             file: 0,
-            line: 21,
+            line: 23,
             column: 9,
         },
         SourceSpan {
             pc: 15,
             file: 0,
-            line: 22,
+            line: 24,
             column: 12,
         },
         SourceSpan {
             pc: 18,
             file: 0,
-            line: 23,
+            line: 25,
             column: 8,
         },
         SourceSpan {
             pc: 28,
             file: 0,
-            line: 23,
+            line: 25,
             column: 23,
         },
         SourceSpan {
             pc: 32,
             file: 0,
-            line: 23,
+            line: 25,
             column: 8,
         },
         SourceSpan {
             pc: 33,
             file: 0,
-            line: 24,
+            line: 26,
             column: 9,
         },
         SourceSpan {
             pc: 34,
             file: 0,
-            line: 25,
+            line: 27,
             column: 19,
         },
         SourceSpan {
             pc: 42,
             file: 0,
-            line: 26,
+            line: 28,
             column: 16,
         },
         SourceSpan {
             pc: 43,
             file: 0,
-            line: 26,
+            line: 28,
             column: 12,
         },
         SourceSpan {
             pc: 53,
             file: 0,
-            line: 26,
+            line: 28,
             column: 34,
         },
         SourceSpan {
             pc: 96,
             file: 0,
-            line: 26,
+            line: 28,
             column: 12,
         },
         SourceSpan {
             pc: 99,
             file: 0,
-            line: 26,
+            line: 28,
             column: 69,
         },
         SourceSpan {
             pc: 126,
             file: 0,
-            line: 26,
+            line: 28,
             column: 12,
         },
         SourceSpan {
             pc: 127,
             file: 0,
-            line: 27,
+            line: 29,
             column: 13,
         },
         SourceSpan {
             pc: 128,
             file: 0,
-            line: 28,
+            line: 30,
             column: 13,
         },
         SourceSpan {
             pc: 131,
             file: 0,
-            line: 29,
+            line: 31,
             column: 8,
         },
         SourceSpan {
             pc: 141,
             file: 0,
-            line: 29,
+            line: 31,
             column: 24,
         },
         SourceSpan {
             pc: 145,
             file: 0,
-            line: 29,
+            line: 31,
             column: 8,
         },
         SourceSpan {
             pc: 146,
             file: 0,
-            line: 30,
+            line: 32,
             column: 9,
         },
         SourceSpan {
             pc: 147,
             file: 0,
-            line: 31,
+            line: 33,
             column: 14,
         },
         SourceSpan {
             pc: 171,
             file: 0,
-            line: 32,
+            line: 34,
             column: 8,
         },
         SourceSpan {
             pc: 179,
             file: 0,
-            line: 33,
+            line: 35,
             column: 9,
         },
         SourceSpan {
             pc: 180,
             file: 0,
-            line: 34,
+            line: 36,
             column: 5,
         },
         SourceSpan {
             pc: 181,
             file: 0,
-            line: 35,
+            line: 37,
             column: 5,
         },
         SourceSpan {
             pc: 182,
             file: 0,
-            line: 16,
+            line: 18,
             column: 5,
         },
         SourceSpan {
             pc: 183,
             file: 0,
-            line: 9,
+            line: 10,
             column: 5,
         },
         SourceSpan {
             pc: 186,
             file: 0,
-            line: 8,
+            line: 9,
             column: 5,
         },
         SourceSpan {
             pc: 187,
             file: 0,
-            line: 13,
+            line: 14,
             column: 5,
         },
         SourceSpan {
             pc: 188,
             file: 0,
-            line: 14,
+            line: 15,
             column: 5,
         },
         SourceSpan {
             pc: 191,
             file: 0,
-            line: 12,
+            line: 13,
             column: 5,
         },
         SourceSpan {
             pc: 192,
             file: 0,
-            line: 9,
+            line: 10,
             column: 5,
         },
         SourceSpan {
             pc: 195,
             file: 0,
-            line: 8,
+            line: 9,
             column: 5,
         },
     ],
     identity: IdentitySources {
-        vin: None,
+        vin: Some(
+            EcuService {
+                service_id: 8,
+                field_id: 23,
+            },
+        ),
         hardware_part_number: None,
         software_version: None,
     },
     preconditions: Preconditions {
-        voltage_mv: None,
-        external_supply: None,
-        ignition: None,
-        engine: None,
-        vehicle_speed: None,
+        voltage_mv: Some(
+            Precondition {
+                satisfied: Satisfied {
+                    lower: 12000,
+                    upper: 15000,
+                },
+                default_session: Some(
+                    RuntimeInput(
+                        SupplyVoltageMillivolts,
+                    ),
+                ),
+                programming_session: Some(
+                    RuntimeInput(
+                        SupplyVoltageMillivolts,
+                    ),
+                ),
+            },
+        ),
+        external_supply: Some(
+            Precondition {
+                satisfied: Satisfied {
+                    lower: 1,
+                    upper: 1,
+                },
+                default_session: Some(
+                    RuntimeInput(
+                        ExternalSupplyConnected,
+                    ),
+                ),
+                programming_session: Some(
+                    RuntimeInput(
+                        ExternalSupplyConnected,
+                    ),
+                ),
+            },
+        ),
+        ignition: Some(
+            Precondition {
+                satisfied: Satisfied {
+                    lower: 1,
+                    upper: 1,
+                },
+                default_session: Some(
+                    RuntimeInput(
+                        IgnitionOn,
+                    ),
+                ),
+                programming_session: Some(
+                    RuntimeInput(
+                        IgnitionOn,
+                    ),
+                ),
+            },
+        ),
+        engine: Some(
+            Precondition {
+                satisfied: Satisfied {
+                    lower: 0,
+                    upper: 0,
+                },
+                default_session: Some(
+                    RuntimeInput(
+                        EngineRunning,
+                    ),
+                ),
+                programming_session: Some(
+                    RuntimeInput(
+                        EngineRunning,
+                    ),
+                ),
+            },
+        ),
+        vehicle_speed: Some(
+            Precondition {
+                satisfied: Satisfied {
+                    lower: 0,
+                    upper: 0,
+                },
+                default_session: Some(
+                    RuntimeInput(
+                        VehicleSpeedKmh,
+                    ),
+                ),
+                programming_session: Some(
+                    RuntimeInput(
+                        VehicleSpeedKmh,
+                    ),
+                ),
+            },
+        ),
     },
     flash: [],
 }

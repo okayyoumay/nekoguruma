@@ -5,7 +5,7 @@
 **Affects:** `agent` (`src/journaling.rs`, `src/journal.rs`, `src/restart.rs`, `src/runner.rs`,
 `docs/ngr-agent.md`), `diag-ir` (`Program::validate`, a reachability check), design 5.6, 8.2.5,
 8.10.1, `crates/diag-frontend/docs/starlark-subset.md` 4.6; ADR-244, ADR-252 item 7, ADR-253
-item 3, ADR-271 item 4, ADR-272 item 2, ADR-293 items 1 to 3, ADR-330, ADR-332
+item 3, ADR-271 item 4, ADR-272 item 2, ADR-293 items 1 to 3, ADR-325 item 7, ADR-330, ADR-332
 
 ## Context
 
@@ -18,8 +18,11 @@ sends its `Unsafe` primitives a second time.
 
 What a decision has to work with:
 
-- A restart opens a fresh link, so the ECU is back in its default session with security access
-  locked (ADR-265). A resumed run cannot assume the session or the unlock its procedure set up.
+- A restart opens a fresh link, but within its session timeout the ECU may still hold the
+  session and the unlock the procedure had entered, or it may have fallen back to its default
+  session and relocked. A flash restart settles this with ADR-265's teardown and default-session
+  confirmation, which waits the session timeout and startup time a flash plan declares; a plain
+  procedure declares neither, so a resumed run knows neither state.
 - The IR has no state query. A `CheckState` primitive cannot be settled by asking the ECU.
 - A lowered section gives no re-entry boundary: ADR-332 item 4 cuts a section function into
   one-instruction pieces, so no range says where a procedure may be entered again.
@@ -57,7 +60,8 @@ What a decision has to work with:
    - otherwise, if no `Request` was ever recorded, the job makes a plain start on the same
      journal, counted by item 6. A repeat is preferred to a skip whenever it is allowed, because
      the repeat re-establishes the session and the unlock through the procedure's own steps;
-   - otherwise the job resumes from the latest checkpoint when all of these hold:
+   - otherwise the job resumes from the latest checkpoint when all of these hold (the
+     continuation runs in whatever session the ECU is in, item 8):
      - (S) every diagnostic primitive reachable from the checkpoint's pc outside every plan is
        covered only by `Safe` sections, none of them `RecoveryRequired`, and no plan entry is
        reachable. Reachability is the forward closure over jumps, calls and returns, and is
@@ -100,12 +104,26 @@ What a decision has to work with:
    on-site reasons are `UnconfirmedRequest`, `NotResumable { cause }`,
    `ProcedureResumeLimitReached` and `ProcedureIdentityNotEstablished`.
 
+8. **`Safe` covers the session the ECU is left in.** A checkpoint resume does not establish the
+   default session first: a plain procedure declares no session timeout or startup time to wait
+   (ADR-265 takes them from the flash plan), and sending a session change would itself be a
+   request that changes the ECU. A primitive is therefore `Safe` only when a repeat is harmless
+   and it behaves correctly in any session and security state the procedure can leave the ECU
+   in: the default session after a timeout, or the session and unlock the procedure had
+   entered. A continuation that is all `Safe` changes nothing whichever of these holds, so
+   running it in the residual state is sound. An author whose read needs a particular session
+   leaves it unannotated (`Unsafe` by the 4.6 defaults), which makes the resume end on site
+   instead.
+
 Rejected alternatives:
 - **Resume at the checkpoint whenever S holds, even if no request was sent.** It skips `Safe`
   context steps (a session change, an unlock check) when a sound repeat exists.
 - **Allow unsent non-`Safe` primitives ahead.** It sends requests that change the ECU under a
   lost session or unlock, with no state check.
 - **Resume at the start of the enclosing section.** Lowered IR declares no such boundary.
+- **Establish the default session before a checkpoint resume.** A plain procedure declares no
+  session timeout or startup time to wait, and a session change is a request that changes the
+  ECU, which the continuation must not send.
 - **Continue an interrupted `No` section to its end.** The design's uninterruptible unit, flash,
   is redone from a declared point and never continued.
 - **Batch the `Safe` checkpoints.** The resume origin would be lost.
@@ -128,6 +146,9 @@ Rejected alternatives:
   when the 4.6 table is revisited together with the restart-declaration syntax.
 - The handover summary (design 8.2.5) gains the new facts but no VM state. A receiving device
   can make a plain start or ends on site.
+- ADR-325 item 7's journal condition (any combination with a flash plan or a recovery-required
+  section) becomes every journaled job; a missing journal of a job with several combinations is a
+  plain start only when every combination meets item 1's condition.
 - ADR-252 item 7 (journals) and ADR-293 items 1 to 3 (which jobs keep one, and the
   missing-journal rule) are amended, as is ADR-253 item 3's no-journal case. ADR-272 item 2's
   open point is settled for this run kind.

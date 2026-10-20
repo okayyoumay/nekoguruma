@@ -53,11 +53,14 @@ comment annotations next to the code they describe.
    [maxResumes=<int>] [recovery=never]` stands directly before a top-level `def` other than
    `main` (nothing calls `main`, so it has no call site to expand at), under the
    placement rules of `@section`, and may share the `def` with one. `session` must name a
-   `FlashSession` of the target the call addresses. `maxResumes` defaults to 3, and the stage is
+   `FlashSession` of the target the call addresses. `maxResumes` is 1 to 65535, the range
+   `FlashRecovery.max_resumes` and `Program::validate` accept, and defaults to 3; the stage is
    the session id. Each of these is a `STAR_PLAN_SHAPE` error: the function is not called
    exactly once; the call is not a statement of `main`'s body (an `if` is allowed, a `for` is
    not); the caller is another function, a plan or a section function; the plan has a `return`;
-   the plan is the callee of a section function.
+   the plan is the callee of a section function; the plan has no `diag.flash_transfer` call, more
+   than one, or one that names another session than the annotation, which would build the plan
+   from one session's recovery facts and the download from another's.
 3. **Everything that runs during the plan's call is in the plan** (ADR-301 item 3). Every function
    the plan calls, directly or not, section functions included, is expanded in place: its `Ret`
    becomes a jump to the join, its locals take fresh slots in `main`'s frame, and its section
@@ -77,8 +80,11 @@ comment annotations next to the code they describe.
 5. **Layout (amends ADR-304 item 1).** `main`'s body is emitted at pc 0 and ends in a `Ret`; the
    other functions follow. No `Call` leads to a plan any more.
 6. **Preconditions a procedure requires** are `# @preconditions voltage ignition ...` before
-   `def main()`. Each name needs a row in `preconditions.csv` (`STAR_UNKNOWN_PRECONDITION`). The
-   annotation is optional; without it the program declares none.
+   `def main()`. Each name needs a row in `preconditions.csv` (`STAR_UNKNOWN_PRECONDITION`). A
+   procedure with a flash plan must carry it and name at least the supply voltage, the external
+   power supply and the ignition state, which design 8.9.1 makes mandatory before reprogramming
+   (`STAR_PLAN_SHAPE`); otherwise the annotation is optional and without it the program declares
+   none.
 7. **Targets until the IR carries them.** A plan's target is the target of the handle
    `diag.flash_transfer` is called on. Its hardware-part-number and software-version sources
    come from that target's `identity.csv`, the VIN source from the first access target's table
@@ -153,7 +159,9 @@ Rejected alternatives:
   Items 1 and 14 keep identity and precondition sources in CSV (alternative: Starlark). Item 4
   cross-checks `@erase` against the session's `erase-memory` step (alternative: trust either
   one). Item 8 defaults in-plan requests to `CheckState` (alternative: require explicit
-  annotations). Item 6 makes `@preconditions` optional (alternative: required for a plan).
+  annotations). Item 6 first made `@preconditions` optional for every procedure; review made it required, with
+  design 8.9.1's three checks, for a procedure with a plan, since an omission would otherwise let
+  an erase run unchecked.
   Item 2's `maxResumes` defaults to 3 (alternative: required). Item 1 adds the two format fields
   to `FlashSegment` now, in the one schema bump `FlashBlock` needs (alternative: constants).
   Item 12 makes the host pre-check maxNumberOfBlockLength (alternative: let the ECU refuse).

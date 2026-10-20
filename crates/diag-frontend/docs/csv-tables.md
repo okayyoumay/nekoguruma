@@ -486,7 +486,7 @@ variant, plain procedures included.
 | Column | Type | Required | Meaning |
 |---|---|---|---|
 | `kind` | `vin`, `hardware_part_number` or `software_version` | yes | The value read; one row per kind per variant |
-| `service` | name | yes | A service of the variant that reads; a service that is not a read (the set of ADR-327 item 1) is refused |
+| `service` | service name | yes | A service of the variant that reads, generated ones included (`vin.read`); a service that is not a read (the set of ADR-327 item 1) is refused |
 | `field` | name | yes | The top-level response field that holds the value |
 
 ### 4.14 `preconditions.csv` (scoped)
@@ -499,11 +499,11 @@ programming_session }`.
 | Column | Type | Required | Meaning |
 |---|---|---|---|
 | `kind` | `voltage`, `external_supply`, `ignition`, `engine` or `vehicle_speed` | yes | The precondition |
-| `lower`, `upper` | integer | yes | The range of the value that satisfies it |
+| `lower`, `upper` | integer, -2^63 to 2^63 - 1, `lower` no greater than `upper` | yes | The range of the value that satisfies it, inclusive; for `external_supply`, `ignition` and `engine`, which are flags, both are 0 or 1 |
 | `default_source` | source | yes | Where the value is read in the default session |
 | `programming_source` | source | no | The same in the programming session; default the default source |
 
-A source is `<service>.<field>`, a service and a top-level response field, or `input:<name>` with
+A source is `<service>.<field>`, a service name and a top-level response field split at the last dot, or `input:<name>` with
 `name` one of `supply_voltage_mv`, `external_supply`, `ignition_on`, `engine_running` and
 `vehicle_speed_kmh`, a value the agent supplies.
 

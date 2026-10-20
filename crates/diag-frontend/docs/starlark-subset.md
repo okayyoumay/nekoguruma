@@ -526,7 +526,7 @@ Interruptibility (8.10.1) is specified with comment annotations. Code outside ev
 `interruptible: yes`.
 
 Every comment whose text starts with `@` is an annotation. An annotation that is not one of the
-forms in 4.2, 4.5 and 4.6, has an unknown or misspelled keyword or attribute, or stands where its
+forms in 4.2, 4.5, 4.6 and 4.9 (the last are the contract of ADR-336), has an unknown or misspelled keyword or attribute, or stands where its
 form does not allow it is rejected at ingestion (`STAR_BAD_ANNOTATION`), so a typo such as
 `# @section uninteruptible` cannot silently leave a range interruptible.
 
@@ -705,7 +705,7 @@ def write_application():
     diag.routine(0xFF01, 0x01, {})
     diag.request(0x11, {"reset": 0x01})
 
-# @preconditions voltage ignition engine vehicleSpeed
+# @preconditions voltage externalSupply ignition engine vehicleSpeed
 def main():
     write_application()
 ```
@@ -713,14 +713,19 @@ def main():
 - **`# @flashPlan session=<int> [maxResumes=<int>] [recovery=never]`.** It stands directly before a
   top-level `def` other than `main`, under the placement rules of `@section` (4.5), and may share
   the `def` with one. `session` must name a `FlashSession` of the target the call
-  addresses (`STAR_UNKNOWN_FLASH_SESSION`). `maxResumes` defaults to 3. The plan's stage is the
-  session id; the maximum id is refused because it is the reserved id of a plain procedure.
+  addresses (`STAR_UNKNOWN_FLASH_SESSION`). `maxResumes` is an integer from 1 to 65535
+  (`STAR_ARGUMENT_OUT_OF_RANGE`) and defaults to 3. The plan's stage is the session id; the
+  maximum id is refused because it is the reserved id of a plain procedure. `@flashPlan`,
+  `@erase` and `@recoveryRequired` follow the placement rules of 4.5 for a `def` and of 4.6 for a
+  statement: alone at the start of a line, directly before what they annotate, with only comments
+  and blank lines between; a misplaced one is `STAR_BAD_ANNOTATION`.
 - **Shape (`STAR_PLAN_SHAPE`).** Each is an error: the function is not called exactly once; the
   call is not a statement of `main`'s body (inside an `if` is allowed, inside a `for` is not);
   the call is in another function, a plan or a section function; the plan has a `return` (it ends
   by falling off its body or by `diag.fail`); the plan is the callee of a section function; a plan
   function is never called; `main` carries the annotation (nothing calls it, so it has no call
-  site to expand at).
+  site to expand at); the plan's `diag.flash_transfer` call names another session than its
+  annotation, or the plan has no `diag.flash_transfer` call or more than one.
 - **Coverage.** Everything that runs during the call is in the plan. Functions it calls, directly
   or not, section functions included, are expanded in place, not copied and called: a plan
   contains no `Call` or `Ret` (ADR-245 item 4). A `Ret` becomes a jump to the join, locals get
@@ -737,9 +742,11 @@ def main():
   `# @recoveryRequired` before a statement of the plan moves the point to that statement's first
   instruction; it is exclusive with `recovery=never`.
 - **`# @preconditions <name> ...`** stands directly before `def main()` and names preconditions
-  among `voltage`, `external_supply`, `ignition`, `engine` and `vehicleSpeed`. Each needs a row in
-  the variant's `preconditions.csv` (`STAR_UNKNOWN_PRECONDITION`). It is optional; without it the
-  program declares none.
+  among `voltage`, `externalSupply`, `ignition`, `engine` and `vehicleSpeed`. Each needs a row in
+  the variant's `preconditions.csv` (`STAR_UNKNOWN_PRECONDITION`). A procedure with a flash plan
+  must carry it and name at least `voltage`, `externalSupply` and `ignition`, the checks design
+  8.9.1 makes mandatory before reprogramming (`STAR_PLAN_SHAPE`). For a procedure without a plan
+  it is optional; without it the program declares none.
 - **Targets.** A plan's target is the target of the handle `diag.flash_transfer` is called on.
   Its identity sources come from that target's `identity.csv`, the VIN source from the first
   access target's table when the procedure has access targets and else from the primary's, and
@@ -817,7 +824,7 @@ The error codes of the flash plan contract (ADR-336, 4.9):
   a long run of digits or spaces (ADR-303)
 - Detection uses an "allowlist approach". Unknown node kinds are rejected as
   `STAR_UNSUPPORTED_SYNTAX` so that nothing slips through by oversight
-- Comment annotations (4.2, 4.5, 4.6) are taken from the comment tokens the parser's lexer
+- Comment annotations (4.2, 4.5, 4.6, and 4.9 once ADR-336 is implemented) are taken from the comment tokens the parser's lexer
   reports, never from raw source lines, so `# @` inside a string literal is not an annotation.
   The text after the one comment marker must start with `@`, so `## @...` is an ordinary comment.
   Each annotation is attached by its line to the following statement. An annotation belongs to

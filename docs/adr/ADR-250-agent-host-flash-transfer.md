@@ -1,7 +1,7 @@
 # ADR-250: The Agent Host Implements FlashTransfer with Its Own Block Count
 
 **Date:** 2026-10-08
-**Status:** Accepted
+**Status:** Accepted (items 1 to 3 amended by ADR-336: the transfer's block bytes come from `FlashBlock`, and the host checks the ECU's maxNumberOfBlockLength)
 **Affects:** `agent` (`src/host.rs`, `src/policy.rs`), `diag-ir` (`src/recovery.rs`), `j2534-0404-service` (`tests/agent_flash_transfer.rs`), ADR-245 items 4 and 6, ADR-247 Decision item 4
 
 ## Context

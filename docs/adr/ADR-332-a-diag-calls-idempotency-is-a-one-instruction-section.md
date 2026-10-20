@@ -1,7 +1,7 @@
 # ADR-332: A `diag` Call's Idempotency Is a One-Instruction Section
 
 **Date:** 2026-10-18
-**Status:** Accepted
+**Status:** Accepted (item 6 amended by ADR-336: a section function inside a plan is entered by fallthrough, and the 4.6 revisit is done there)
 **Affects:** `diag-frontend` Starlark lowering (`src/star/lower.rs`: the annotations and the
 section ranges built per covered copy), `crates/diag-frontend/docs/starlark-subset.md` 4.5 and
 4.6, design 8.2.5; ADR-233, ADR-301 item 3, ADR-329, ADR-330

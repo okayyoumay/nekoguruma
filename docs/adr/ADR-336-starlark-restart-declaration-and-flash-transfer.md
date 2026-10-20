@@ -37,12 +37,15 @@ comment annotations next to the code they describe.
    every `Program` it lowers for the variant; `ir.fbs` gains no field for them (ADR-245 item 1's
    one home stays).
    - `identity.csv` names, for `vin`, `hardware_part_number` and `software_version`, a read
-     service and the response field. A row whose service is not a read is refused. A plain
+     service and the response field. The service is a generated single-DID read (`<did>.read`),
+     the shape the agent's source table resolves (ADR-327 item 1's reads), and the field ASCII
+     text or an unsigned integer; anything else is refused. A plain
      procedure gets its VIN source from it too (ADR-335 item 6, ADR-327).
    - `preconditions.csv` names, for `voltage`, `external_supply`, `ignition`, `engine` and
      `vehicle_speed`, the satisfying range, a default-session source and an optional
-     programming-session source. A source is `<service>.<field>` or `input:<name>` for one of
-     the agent's own inputs.
+     programming-session source. A source is `<service>.<field>`, a generated single-DID read
+     and an unsigned integer field, so the safety check never sends a request that changes the
+     ECU, or `input:<name>` for the agent's input of the row's own kind.
    - `flash_sessions.csv` gains the session timeout, teardown margin, ECU startup time,
      confirmation window, version-read retries and the optional no-application response; they
      become the plan's `RecoveryTiming`, `version_read_retries` and `no_application`.
@@ -112,8 +115,11 @@ comment annotations next to the code they describe.
     a RequestTransferExit (0x37, the service id alone). The call's value is the 0x37 response in
     the 3.4 shape with no `fields`. The 0x34 response is dropped: a negative one makes the first
     `FlashTransfer` a host error (no tracked transfer, ADR-250 item 3), which interrupts a step
-    inside the plan and hands the run to ADR-229's restart within `maxResumes`. A terminal
-    `Fail` there would strand an erased ECU.
+    inside the plan. Where the plan allows a restart at that point (`recovery=never`, or a
+    recovery-required point after the RequestDownload), ADR-229's restart redoes it within
+    `maxResumes`; with the default point at the erase it ends in on-site intervention (ADR-245
+    item 3). Either is safer than a terminal `Fail`, which would leave an erased ECU with no
+    sanctioned next step.
 11. **`Op::FlashBlock { session, segment }`**, appended after `LogFromStack` (ADR-233), pops an
     `I64` block index and pushes that block's `Bytes`. The VM, stepped with declarations
     (ADR-316), finds the segment on the current target, checks the index, computes the offset
@@ -155,8 +161,8 @@ Rejected alternatives:
 - **A `diag.erase(...)` call instead of `# @erase`.** It is a second way to send a routine.
 - **Several RequestDownload rounds in one plan.** It needs an ADR-245 and journal change (one
   exit marker per plan).
-- **A terminal `Fail` on a refused RequestDownload.** It forfeits the sanctioned restart after
-  an erase.
+- **A terminal `Fail` on a refused RequestDownload.** It forfeits the restart or the on-site
+  ending the plan sanctions after an erase.
 
 ## Consequences
 

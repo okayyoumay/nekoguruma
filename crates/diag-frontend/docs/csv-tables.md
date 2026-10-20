@@ -486,8 +486,8 @@ variant, plain procedures included.
 | Column | Type | Required | Meaning |
 |---|---|---|---|
 | `kind` | `vin`, `hardware_part_number` or `software_version` | yes | The value read; one row per kind per variant |
-| `service` | service name | yes | A service of the variant that reads, generated ones included (`vin.read`); a service that is not a read (the set of ADR-327 item 1) is refused |
-| `field` | name | yes | The top-level response field that holds the value |
+| `service` | service name | yes | A generated DID read of the variant (`vin.read`, a ReadDataByIdentifier of one DID, 4.7), the request shape the agent's source table reads; any other service is refused |
+| `field` | name | yes | The top-level response field that holds the value, of an ASCII text or unsigned integer type, the encodings the agent's source table decodes |
 
 ### 4.14 `preconditions.csv` (scoped)
 
@@ -503,7 +503,7 @@ programming_session }`.
 | `default_source` | source | yes | Where the value is read in the default session |
 | `programming_source` | source | no | The same in the programming session; default the default source |
 
-A source is `<service>.<field>`, a service name and a top-level response field split at the last dot whose type is an unsigned integer (not a signed integer, text, bytes or a float: the agent reads a service-backed value as an unsigned big-endian integer and compares it with the range), or `input:<name>` with
+A source is `<service>.<field>`, a service name and a top-level response field split at the last dot. The service is a generated DID read of the variant (`<did>.read`, a ReadDataByIdentifier of one DID, 4.7): a read in ADR-327 item 1's sense, so the check sends nothing that changes the ECU, and the request shape the agent's source table reads; any other service is refused. The field's type is an unsigned integer (not a signed integer, text, bytes or a float: the agent reads a service-backed value as an unsigned big-endian integer and compares it with the range), or `input:<name>` with
 `name` the runtime input of the row's own kind, a value the agent supplies: `supply_voltage_mv`
 for `voltage`, `external_supply` for `external_supply`, `ignition_on` for `ignition`,
 `engine_running` for `engine` and `vehicle_speed_kmh` for `vehicle_speed`. Another input is

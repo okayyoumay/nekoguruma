@@ -94,8 +94,21 @@ For `read_uint` and `write_uint`, `offset` counts bytes from the start of `b`, `
 constant multiple of 8 from 8 to 56 (so every value fits a non-negative `I64`), and the bytes are
 big-endian (this helper's fixed encoding). A field that is not byte-aligned, or little-endian, is read
 through the declaration part's decode plan instead. An `offset` that runs past the end of `b`, or
-a `v` outside 0 to 2^`bits` - 1, is an error at run time. Both are built from `IndexGet`,
-`IndexSet`, shifts and `BitOr`.
+a `v` outside 0 to 2^`bits` - 1, is an error at run time. `bits` is a constant (a run-time
+`bits` is `STAR_NON_CONSTANT_ARGUMENT`, and a constant other than 8, 16, ..., 56 is
+`STAR_ARGUMENT_OUT_OF_RANGE`), so with operands known only at run time both lower to code
+unrolled once per byte, built from `IndexGet`, `IndexSet`, shifts, `BitOr` and `BitAnd`. A byte
+past the end of `b`, and a negative `offset`, give the VM's `IndexOutOfRange` error; a `v` that
+does not fit gives `Fail` with code `UINT_OUT_OF_RANGE` and a detail that names the line. With
+constant operands both are evaluated at ingestion, where an out-of-range field or value is
+`STAR_NOT_LOWERABLE`.
+
+`len` of bytes known only at run time lowers to the IR's length instruction. Every other
+built-in and string method of this section that takes a value known only at run time (`abs`,
+`min`, `max`, `bool`, `str`, `type`, `to_hex`, `from_hex`, `len` of a string, `find`, `upper`,
+`lower`, `strip`, `startswith`, `endswith`, `format`, `join`) is `STAR_NOT_LOWERABLE`, and its
+hint names the kind of instruction the IR would need first (for example a string-search
+instruction for `find`).
 
 `int` and `float` of a number known only at run time lower to the IR's conversions between
 integers and floats (`int` rounds toward zero, and a NaN, an infinity or a value out of the

@@ -504,8 +504,10 @@ programming_session }`.
 | `programming_source` | source | no | The same in the programming session; default the default source |
 
 A source is `<service>.<field>`, a service name and a top-level response field split at the last dot, or `input:<name>` with
-`name` one of `supply_voltage_mv`, `external_supply`, `ignition_on`, `engine_running` and
-`vehicle_speed_kmh`, a value the agent supplies.
+`name` the runtime input of the row's own kind, a value the agent supplies: `supply_voltage_mv`
+for `voltage`, `external_supply` for `external_supply`, `ignition_on` for `ignition`,
+`engine_running` for `engine` and `vehicle_speed_kmh` for `vehicle_speed`. Another input is
+refused, as `Program::validate` refuses it.
 
 ---
 

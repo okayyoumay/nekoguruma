@@ -58,7 +58,9 @@ comment annotations next to the code they describe.
    the session id. Each of these is a `STAR_PLAN_SHAPE` error: the function is not called
    exactly once; the call is not a statement of `main`'s body (an `if` is allowed, a `for` is
    not); the caller is another function, a plan or a section function; the plan has a `return`;
-   the plan is the callee of a section function; the plan has no `diag.flash_transfer` call, more
+   the plan is the callee of a section function; the plan function is not also a section
+   function marked `uninterruptible` or `recoveryRequired` (design 8.10.1 makes the range from
+   the erase to the completed write uninterruptible, so a cancel is held there, ADR-330); the plan has no `diag.flash_transfer` call, more
    than one, or one that names another session than the annotation, which would build the plan
    from one session's recovery facts and the download from another's.
 3. **Everything that runs during the plan's call is in the plan** (ADR-301 item 3). Every function
@@ -116,7 +118,7 @@ comment annotations next to the code they describe.
     `DiagHost::artifact_bytes(offset, len)`, which must return exactly `len` bytes. It sends
     nothing and is no diagnostic primitive (no section, intent or journal record). Design 8.2.4's
     "no file access" holds: the instruction names a declared segment, and the host decides what
-    the artifact is. Conversion refuses a `block_size` above `MAX_BYTES_LEN - 2`.
+    the artifact is. Conversion refuses a `block_size` above `MAX_BYTES_LEN - 2` and a block count above 2^63 - 1, the largest index the VM's integers hold.
 12. **The agent's artifact.** The job names the artifact by content hash, as it names documents
     (ADR-318). `check_job` hashes the cached file before the first instruction (design 4.1, 11.1,
     11.3), refuses a mismatch and any plan segment outside the file, and hands the bytes to

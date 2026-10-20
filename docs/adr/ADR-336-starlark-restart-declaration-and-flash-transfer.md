@@ -40,7 +40,7 @@ comment annotations next to the code they describe.
      service and the response field. The service is a generated single-DID read (`<did>.read`),
      the shape the agent's source table resolves (ADR-327 item 1's reads), the field the DID's
      only response field (the whole data record after the echoed identifier), and that field ASCII
-     text or an unsigned integer (ASCII text for the VIN, which the agent compares as text);
+     text or an unsigned integer (a fixed 17-byte ASCII field for the VIN, which the agent compares as a 17-character text);
      anything else is refused. A procedure whose plan allows a restart needs all three rows,
      which `Program::validate` requires of a restartable plan. A plain
      procedure gets its VIN source from it too (ADR-335 item 6, ADR-327).

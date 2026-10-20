@@ -2811,6 +2811,103 @@ fn the_number_of_plans_is_capped() {
     );
 }
 
+/// The instructions `reachable_from` reaches, as a list of pcs.
+fn reached(code: Vec<Op>, pc: u32, return_pcs: &[u32]) -> Vec<u32> {
+    prog(code, vec![b"E".to_vec()])
+        .reachable_from(pc, return_pcs)
+        .iter()
+        .enumerate()
+        .filter(|(_, reached)| **reached)
+        .map(|(pc, _)| pc as u32)
+        .collect()
+}
+
+#[test]
+fn reachability_follows_a_straight_line_from_the_start_pc() {
+    let code = vec![Op::Pop; 4];
+    assert_eq!(reached(code.clone(), 0, &[]), [0, 1, 2, 3]);
+    assert_eq!(reached(code.clone(), 2, &[]), [2, 3]);
+    // A start past the code reaches nothing.
+    assert_eq!(reached(code, 4, &[]), Vec::<u32>::new());
+}
+
+#[test]
+fn reachability_takes_both_ways_of_a_conditional_jump() {
+    let code = vec![Op::JumpIfFalse(3), Op::Pop, Op::Jump(4), Op::Pop, Op::Pop];
+    assert_eq!(reached(code.clone(), 0, &[]), [0, 1, 2, 3, 4]);
+    // An unconditional jump skips what it jumps over.
+    assert_eq!(reached(code, 1, &[]), [1, 2, 4]);
+}
+
+#[test]
+fn reachability_ends_on_a_loop_and_includes_its_head() {
+    // 0 is before the loop; 1..=3 loop; 4 is after.
+    let code = vec![Op::Pop, Op::Pop, Op::JumpIfFalse(4), Op::Jump(1), Op::Pop];
+    assert_eq!(reached(code.clone(), 2, &[]), [1, 2, 3, 4]);
+    // Standing in the loop, the code before it is not reached.
+    assert!(!reached(code, 3, &[]).contains(&0));
+}
+
+#[test]
+fn reachability_explores_a_callee_and_goes_on_after_the_call() {
+    // 0 calls the function at 3; 1 is after the call; 2 ends the main line; 3 and 4 are the
+    // function; 5 is another function only reachable by a call nobody makes.
+    let code = vec![Op::Call(3), Op::Pop, Op::Ret, Op::Pop, Op::Ret, Op::Pop];
+    assert_eq!(reached(code, 0, &[]), [0, 1, 2, 3, 4]);
+}
+
+#[test]
+fn reachability_does_not_continue_past_a_return_the_caller_does_not_make() {
+    // The callee at 2 returns to the caller, which goes on at 1 (a return); the code after the
+    // callee's own return (4) is not reached from the call.
+    let code = vec![Op::Call(2), Op::Ret, Op::Pop, Op::Ret, Op::Pop];
+    assert_eq!(reached(code, 0, &[]), [0, 1, 2, 3]);
+    // At the top level a return ends the program.
+    assert_eq!(reached(vec![Op::Ret, Op::Pop], 0, &[]), [0]);
+}
+
+#[test]
+fn reachability_continues_in_the_caller_after_a_return_of_the_checkpoints_frame() {
+    // A checkpoint inside the function at 3 (pc 3), called from pc 0, whose return position
+    // is 1: the return at 4 goes on at 1, and so reaches 1 and 2, not the unrelated 5.
+    let code = vec![Op::Call(3), Op::Pop, Op::Ret, Op::Pop, Op::Ret, Op::Pop];
+    assert_eq!(reached(code.clone(), 3, &[1]), [1, 2, 3, 4]);
+    // Without the suspended caller the same return ends the program.
+    assert_eq!(reached(code, 3, &[]), [3, 4]);
+}
+
+#[test]
+fn reachability_unwinds_every_suspended_caller_innermost_first() {
+    // Two suspended callers: the innermost returns to 2, the outer one to 4. The returns at 3
+    // and 2 unwind them in turn; 5 follows only the outer return.
+    let code = vec![Op::Pop, Op::Pop, Op::Ret, Op::Ret, Op::Pop, Op::Ret];
+    // Standing at 3 with return positions [4, 2]: the return goes to 2, whose return goes to 4.
+    assert_eq!(reached(code.clone(), 3, &[4, 2]), [2, 3, 4, 5]);
+    // Standing at 2: the return goes to 4 at the outer level.
+    assert_eq!(reached(code, 2, &[4]), [2, 4, 5]);
+}
+
+#[test]
+fn reachability_ends_on_a_declared_failure_and_ignores_targets_past_the_code() {
+    let code = vec![Op::Pop, Op::Fail { code: 0 }, Op::Pop];
+    assert_eq!(reached(code, 0, &[]), [0, 1]);
+    // A jump to the code's end, a call to it and a jump past it end the paths.
+    let code = vec![Op::JumpIfFalse(4), Op::Call(4), Op::Jump(9), Op::Pop];
+    assert_eq!(reached(code.clone(), 0, &[]), [0, 1, 2]);
+    // A return position at the end of the code ends the path too.
+    assert_eq!(reached(code, 3, &[4]), [3]);
+}
+
+/// A program with many calls and loops is searched once per level, not once per path.
+#[test]
+fn reachability_is_linear_in_the_code() {
+    let mut code = vec![Op::Call(1); 100_000];
+    code.push(Op::Ret);
+    let program = prog(code, Vec::new());
+    let reached = program.reachable_from(0, &[0; 8]);
+    assert!(reached.iter().all(|reached| *reached));
+}
+
 /// The plain procedure's resume count lives under a reserved stage (ADR-335 item 6).
 #[test]
 fn a_plan_cannot_use_the_reserved_stage() {

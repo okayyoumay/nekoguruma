@@ -57,6 +57,10 @@ pub enum RestartDecision {
     PlainStart,
     /// A transfer was started: it is redone in the restart order of ADR-229 item 2.
     Restart(Box<RestartPoint>),
+    /// A plain procedure (no transfer started) sent requests that changed or may have changed the
+    /// ECU, all of them confirmed, and what lies ahead of its latest checkpoint is safe to run
+    /// again: it goes on from the checkpoint (ADR-335 item 3).
+    ResumeFromCheckpoint(Box<CheckpointResume>),
     /// The job must not go on automatically (design 5.6, 8.10.1).
     OnSiteInterventionRequired(OnSiteReason),
     /// The procedure ended itself as failed (`Op::Fail`, ADR-280): the job is over and is not
@@ -92,6 +96,44 @@ pub struct RestartPoint {
     pub facts: RecoveryFacts,
 }
 
+/// What a checkpoint resume starts from (ADR-335 item 3).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CheckpointResume {
+    /// The journal step of the checkpoint record the state comes from.
+    pub at: StepRef,
+    /// The VM state of that checkpoint, which the resumed run starts from. It stands at the step
+    /// about to run, was checked with `Vm::check_state` against the program, and has its step
+    /// count set to [`next_steps`], since the journal orders records by it and refuses one that
+    /// does not come after the last.
+    pub state: VmState,
+}
+
+/// Why a plain procedure's journal cannot be resumed from its latest checkpoint (ADR-335
+/// item 3), in the order `classify` checks the conditions: the point is interruptible, nothing
+/// ahead may not be repeated, and the vehicle is identified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotResumableCause {
+    /// A diagnostic primitive reachable from the checkpoint is not safe to repeat
+    /// ([`safe_to_repeat`]); `pc` is the lowest such one. It may be reachable only through a
+    /// loop back or a call.
+    UnsafePrimitiveAhead { pc: u32 },
+    /// A diagnostic primitive reachable from the checkpoint lies in a `RecoveryRequired`
+    /// section (`section` indexes `Program::sections`); `pc` is the lowest such one.
+    RecoveryRequiredAhead { section: usize, pc: u32 },
+    /// An instruction of a flash recovery plan's range is reachable from the checkpoint: a plan
+    /// has its own journal and restart order, which a continuation from a plain checkpoint must
+    /// not enter.
+    PlanAhead { flash_session: u32 },
+    /// The checkpoint stands where a cancel is not taken (ADR-330, [`interruptible_point`]):
+    /// inside a section that is not `Yes`, or on a `Ret`. A plain procedure declares no re-entry
+    /// point for such a section (ADR-335 item 5).
+    UninterruptibleSection { pc: u32 },
+    /// The job names no target VIN or the program declares no VIN source, so a resume could not
+    /// tell that it runs against the vehicle the procedure started on (ADR-335 item 3,
+    /// ADR-261).
+    NoIdentity,
+}
+
 /// Why a job needs on-site intervention.
 #[derive(Debug, Clone, PartialEq)]
 pub enum OnSiteReason {
@@ -111,8 +153,28 @@ pub enum OnSiteReason {
     /// The journal has no VM state for the plan's entry, or the one it has is not the state
     /// at that entry.
     MissingEntryState { flash_session: u32 },
-    /// The VM state at the entry does not decode, or fails `Vm::check_state` (ADR-245 item 7).
+    /// The VM state at the entry does not decode, or fails `Vm::check_state` (ADR-245 item 7). A
+    /// plain procedure's latest checkpoint state that does not decode or fails the check is this
+    /// too (ADR-335 item 3).
     InvalidEntryState(String),
+    /// A plain procedure sent a request ahead of a primitive that is not safe to repeat
+    /// (`Request`, ADR-335 item 2) and the journal holds no state newer than it, so that
+    /// primitive may have reached the ECU and its outcome is unknown (ADR-335 items 3 and 4).
+    /// `at` is the request. It holds for every later resume until a person acts.
+    UnconfirmedRequest { at: StepRef },
+    /// A plain procedure that sent requests cannot be resumed from its latest checkpoint
+    /// (ADR-335 items 3 and 5); `cause` says which condition fails.
+    NotResumable { cause: NotResumableCause },
+    /// A plain procedure was started again or resumed as often as the agent allows
+    /// (`JobLimits::max_procedure_resumes`, ADR-335 item 6): `resumes` were counted under the
+    /// plain procedure's stage. Nothing is sent and no resume is counted.
+    ProcedureResumeLimitReached { resumes: u16, max: u16 },
+    /// `classify` decided a checkpoint resume for a plain procedure
+    /// ([`RestartDecision::ResumeFromCheckpoint`], ADR-335 item 3), but the agent does not run
+    /// the continuation yet, and a plain start would send the requests it already sent a second
+    /// time. The job ends here with nothing sent and no resume counted; `at` is the checkpoint it
+    /// would go on from.
+    CheckpointResumeNotImplemented { at: StepRef },
     /// The transfer's plan never allows a restart (`FlashRecovery::allows_restart`), so the
     /// program need not declare what a restart reads (ADR-245 item 6).
     RestartNotAllowed { flash_session: u32 },
@@ -331,7 +393,9 @@ pub struct Confirmation {
 /// ECU (ADR-293, ADR-335 item 1). A journal that holds a procedure failure is
 /// decided first, as [`RestartDecision::Failed`], whatever else it holds (ADR-280); one that holds an
 /// identity abort is decided next, as [`RestartDecision::Aborted`] (ADR-286), and one that holds a
-/// run's stop after that, as [`RestartDecision::Stopped`] (ADR-288).
+/// run's stop after that, as [`RestartDecision::Stopped`] (ADR-288). A journal with a started
+/// transfer takes the flash restart order; one without is a plain procedure's and goes through
+/// [`classify_plain_procedure`] (ADR-335 item 3).
 pub fn classify(
     program: &Program,
     journal: Result<&JournalState, &JournalError>,
@@ -388,7 +452,7 @@ pub fn classify(
         return RestartDecision::OnSiteInterventionRequired(reason);
     }
     let Some(transfer) = &facts.transfer else {
-        return RestartDecision::PlainStart;
+        return classify_plain_procedure(program, state);
     };
     let Some(plan) = program
         .flash
@@ -428,6 +492,101 @@ pub fn classify(
         interrupted_at,
         entry_state,
         facts: facts.clone(),
+    }))
+}
+
+/// The classification of a job whose journal holds no transfer-start marker (ADR-335 items 3 to
+/// 5), after the checks `classify` makes first. The journal holds a plain procedure's requests
+/// and checkpoints (ADR-335 item 2). In this order:
+/// - a `Request` newer than the newest state record is [`OnSiteReason::UnconfirmedRequest`]: the
+///   primitive it guards may have reached the ECU, and the VM state after it was never journaled.
+///   The newest state record is the latest checkpoint, whose own step count says which step runs
+///   next whatever the record's kind: a checkpoint or a step state is taken after the completed
+///   step, so its count is one past the record's, and a run start's is the step about to run.
+///   Comparing the request with that count therefore needs no case per kind. A cancel while a
+///   request's marker was committed leaves a marker with no later state, which reads as
+///   unconfirmed too. A latest checkpoint that is missing for a journal that holds a request is
+///   the same, and one that does not decode is [`OnSiteReason::InvalidEntryState`];
+/// - no request ever recorded: [`RestartDecision::PlainStart`], on the same journal. The caller
+///   counts it (ADR-335 item 6);
+/// - otherwise a checkpoint resume from the latest checkpoint, when all of these hold, checked in
+///   this order, each failure a [`OnSiteReason::NotResumable`]:
+///   (I) the checkpoint's pc is an interruptible point ([`interruptible_point`]), so a `No`
+///   section is never resumed from (ADR-335 item 5);
+///   (S) nothing reachable from the checkpoint ([`Program::reachable_from`], with the state's
+///   suspended callers) is a hazard: the lowest-pc instruction that lies in a plan's range, is a
+///   diagnostic primitive in a `RecoveryRequired` section, or is a diagnostic primitive that is
+///   not safe to repeat ([`safe_to_repeat`]; one outside every section is not);
+///   (identified) the job names a target VIN and the program declares a VIN source.
+///
+///   The state then gets its step count from [`next_steps`] and must pass `Vm::check_state`
+///   ([`OnSiteReason::InvalidEntryState`]), and the answer is
+///   [`RestartDecision::ResumeFromCheckpoint`].
+///
+/// Nothing is contacted. The VIN read, the lock and the resume count are the caller's.
+fn classify_plain_procedure(program: &Program, state: &JournalState) -> RestartDecision {
+    let on_site = |reason| RestartDecision::OnSiteInterventionRequired(reason);
+    let not_resumable = |cause| on_site(OnSiteReason::NotResumable { cause });
+    let facts = &state.facts;
+    // The first request is recorded with the last, so none of either means none was sent.
+    let (Some(_), Some(request)) = (facts.first_request, facts.last_request) else {
+        return RestartDecision::PlainStart;
+    };
+    let Some((at, bytes)) = &state.latest_checkpoint else {
+        return on_site(OnSiteReason::UnconfirmedRequest { at: request });
+    };
+    let mut resumed = match decode_state(bytes) {
+        Ok(decoded) => decoded,
+        Err(EntryStateError::Invalid(why)) => return on_site(OnSiteReason::InvalidEntryState(why)),
+        // `decode_state` has no other failure.
+        Err(EntryStateError::Missing) => {
+            return on_site(OnSiteReason::UnconfirmedRequest { at: request });
+        }
+    };
+    if request.steps >= resumed.steps {
+        return on_site(OnSiteReason::UnconfirmedRequest { at: request });
+    }
+    let pc = resumed.pc;
+    if !interruptible_point(program, pc) {
+        return not_resumable(NotResumableCause::UninterruptibleSection { pc });
+    }
+    let return_pcs: Vec<u32> = resumed
+        .call_stack
+        .iter()
+        .map(|frame| frame.return_pc)
+        .collect();
+    let reachable = program.reachable_from(pc, &return_pcs);
+    for ahead in (0..program.code.len() as u32).filter(|&ahead| reachable[ahead as usize]) {
+        if let Some(plan) = program.flash.iter().find(|plan| {
+            (plan.boundaries.entry_pc..plan.boundaries.post_transfer_end_pc).contains(&ahead)
+        }) {
+            return not_resumable(NotResumableCause::PlanAhead {
+                flash_session: plan.flash_session,
+            });
+        }
+        if !program.code[ahead as usize].is_diagnostic_primitive() {
+            continue;
+        }
+        if let Some(section) = program.sections.iter().position(|section| {
+            matches!(section.interruptible, Interruptible::RecoveryRequired)
+                && (section.start_pc..section.end_pc).contains(&ahead)
+        }) {
+            return not_resumable(NotResumableCause::RecoveryRequiredAhead { section, pc: ahead });
+        }
+        if !safe_to_repeat(program, ahead) {
+            return not_resumable(NotResumableCause::UnsafePrimitiveAhead { pc: ahead });
+        }
+    }
+    if facts.target_vin.is_none() || program.identity.vin.is_none() {
+        return not_resumable(NotResumableCause::NoIdentity);
+    }
+    resumed.steps = next_steps(state);
+    if let Err(error) = Vm::resume(resumed.clone()).check_state(program) {
+        return on_site(OnSiteReason::InvalidEntryState(error.to_string()));
+    }
+    RestartDecision::ResumeFromCheckpoint(Box::new(CheckpointResume {
+        at: *at,
+        state: resumed,
     }))
 }
 
@@ -1353,6 +1512,19 @@ pub(crate) fn in_plan(program: &Program, pc: u32) -> bool {
         .flash
         .iter()
         .any(|plan| (plan.boundaries.entry_pc..plan.boundaries.post_transfer_end_pc).contains(&pc))
+}
+
+/// Whether `pc` is an interruptible point in ADR-330's sense: a cancel is taken there. It is not
+/// inside a section whose `interruptible` is not `Yes` (an uninterruptible or a
+/// recovery-required one), and not a `Ret`, so the returns after a procedure's last section do
+/// not count. The runner's `cancel_held_at` and `holds_cancel` are the same rule, computed once
+/// per run; a checkpoint resume (ADR-335 item 3 condition I, item 5) may start only here.
+pub(crate) fn interruptible_point(program: &Program, pc: u32) -> bool {
+    !matches!(program.code.get(pc as usize), Some(Op::Ret))
+        && !program.sections.iter().any(|section| {
+            !matches!(section.interruptible, Interruptible::Yes)
+                && (section.start_pc..section.end_pc).contains(&pc)
+        })
 }
 
 /// Whether the diagnostic primitive at `pc` gets a request marker before it is sent: it lies
@@ -3426,5 +3598,313 @@ def main():
             .collect();
         calls.sort();
         assert_eq!(calls, [(false, false), (true, true)]);
+    }
+
+    // ------------------------------------------------ a plain procedure (ADR-335 item 3)
+
+    const VIN: &str = "WDB12345678901234";
+
+    fn plain_section(
+        start_pc: u32,
+        end_pc: u32,
+        idempotency: Idempotency,
+        interruptible: Interruptible,
+    ) -> Section {
+        Section {
+            start_pc,
+            end_pc,
+            interruptible,
+            idempotency,
+            expected_millis: 0,
+        }
+    }
+
+    /// Three steps of an operand, a request and a Pop: the requests are at 1, 4 and 7. The first is
+    /// under a `Safe` section, the second under none, the third under a `Safe` one; the VIN is
+    /// read from a source.
+    fn plain_program() -> Program {
+        let mut code = Vec::new();
+        for service in [0x22, 0x10, 0x3E] {
+            code.extend([Op::PushBytes(0), Op::ServiceRequest { service }, Op::Pop]);
+        }
+        Program {
+            schema_version: IR_SCHEMA_VERSION,
+            code,
+            constants: vec![vec![1]],
+            sections: vec![
+                plain_section(0, 3, Idempotency::Safe, Interruptible::Yes),
+                plain_section(6, 9, Idempotency::Safe, Interruptible::Yes),
+            ],
+            source_map: Vec::new(),
+            identity: diag_ir::IdentitySources {
+                vin: Some(diag_ir::Source::EcuService {
+                    service_id: 1,
+                    field_id: 3,
+                }),
+                ..Default::default()
+            },
+            preconditions: Default::default(),
+            flash: Vec::new(),
+        }
+    }
+
+    /// A journal of a run that targets the VIN (when `vin`), started at pc 0 and sent a request
+    /// at pc 1 that it saw confirmed by a checkpoint: the request is at step 2, the checkpoint's
+    /// record at step 6 carries `state`.
+    fn plain_journal(program: &Program, vin: bool, state: &VmState) -> Journal<Memory> {
+        let mut journal = Journal::on_store(Memory, plain_key());
+        if vin {
+            journal
+                .commit_target_vin(&crate::journal::Vin::new(VIN.to_owned()))
+                .unwrap();
+        }
+        journal
+            .commit_run_start(at(0), &state_bytes(&state_at_pc(program, 0, 0)))
+            .unwrap();
+        journal.commit_request(at(2)).unwrap();
+        journal
+            .commit_checkpoint(at(6), &state_bytes(state))
+            .unwrap();
+        journal
+    }
+
+    fn not_resumable(cause: NotResumableCause) -> RestartDecision {
+        RestartDecision::OnSiteInterventionRequired(OnSiteReason::NotResumable { cause })
+    }
+
+    fn plain_key() -> JobKey {
+        JobKey {
+            job_id: shared_proto::JobId("0190f5a8-7c2e-7d4b-9a6e-3f1c2b4d5e6f".to_owned()),
+            generation: 1,
+        }
+    }
+
+    /// A journal with no request makes a plain start, and one with a request newer than the
+    /// newest state record, or no state record at all, is unconfirmed.
+    #[test]
+    fn a_plain_journal_is_a_plain_start_until_a_request_is_recorded() {
+        let program = plain_program();
+        let mut none = Journal::on_store(Memory, plain_key());
+        none.commit_run_start(at(0), &state_bytes(&state_at_pc(&program, 0, 0)))
+            .unwrap();
+        none.commit_checkpoint(at(1), &state_bytes(&state_at_pc(&program, 2, 2)))
+            .unwrap();
+        assert_eq!(decide(&program, &none), RestartDecision::PlainStart);
+        // A request with no state record at all: unconfirmed.
+        let mut bare = Journal::on_store(Memory, plain_key());
+        bare.commit_request(at(4)).unwrap();
+        assert_eq!(
+            decide(&program, &bare),
+            RestartDecision::OnSiteInterventionRequired(OnSiteReason::UnconfirmedRequest {
+                at: at(4)
+            })
+        );
+        // A request at step 8, newer than the checkpoint's state (step 3).
+        let mut journal = plain_journal(&program, true, &state_at_pc(&program, 5, 3));
+        journal.commit_request(at(8)).unwrap();
+        assert_eq!(
+            decide(&program, &journal),
+            RestartDecision::OnSiteInterventionRequired(OnSiteReason::UnconfirmedRequest {
+                at: at(8)
+            })
+        );
+    }
+
+    /// The comparison is with the state's own step count: a checkpoint is taken after the
+    /// completed step, so its state is one past its record, and a request at the record's own step
+    /// is confirmed by it, while one at the state's step is not.
+    #[test]
+    fn a_request_is_confirmed_by_a_state_after_its_step() {
+        let program = plain_program();
+        // The request at step 2; the checkpoint's state says step 3: confirmed.
+        let journal = plain_journal(&program, true, &state_at_pc(&program, 5, 3));
+        assert!(matches!(
+            decide(&program, &journal),
+            RestartDecision::ResumeFromCheckpoint(_)
+                | RestartDecision::OnSiteInterventionRequired(_)
+        ));
+        assert!(!matches!(
+            decide(&program, &journal),
+            RestartDecision::OnSiteInterventionRequired(OnSiteReason::UnconfirmedRequest { .. })
+        ));
+        // A state at step 2 is the step about to run, the request's own: unconfirmed.
+        let journal = plain_journal(&program, true, &state_at_pc(&program, 5, 2));
+        assert_eq!(
+            decide(&program, &journal),
+            RestartDecision::OnSiteInterventionRequired(OnSiteReason::UnconfirmedRequest {
+                at: at(2)
+            })
+        );
+    }
+
+    /// The checkpoint stands at pc 2, ahead of the requests at 4 (under no section) and 7.
+    #[test]
+    fn the_lowest_hazard_ahead_is_named_whatever_its_kind() {
+        let state = |program: &Program| state_at_pc(program, 2, 7);
+        // The unsafe request at 4 comes before the recovery-required section at 6 to 8.
+        let mut program = plain_program();
+        program.sections[1].interruptible = Interruptible::RecoveryRequired;
+        let journal = plain_journal(&program, true, &state(&program));
+        assert_eq!(
+            decide(&program, &journal),
+            not_resumable(NotResumableCause::UnsafePrimitiveAhead { pc: 4 })
+        );
+        // Covered by a `Safe` section, the request at 4 is fine, and the section at 6 refuses.
+        program
+            .sections
+            .push(plain_section(3, 6, Idempotency::Safe, Interruptible::Yes));
+        let journal = plain_journal(&program, true, &state(&program));
+        assert_eq!(
+            decide(&program, &journal),
+            not_resumable(NotResumableCause::RecoveryRequiredAhead { section: 1, pc: 7 })
+        );
+        // A primitive in a recovery-required section that is also `Unsafe` is that, not unsafe.
+        program.sections[1].idempotency = Idempotency::Unsafe;
+        let journal = plain_journal(&program, true, &state(&program));
+        assert_eq!(
+            decide(&program, &journal),
+            not_resumable(NotResumableCause::RecoveryRequiredAhead { section: 1, pc: 7 })
+        );
+        // Everything ahead safe: the checkpoint resume is decided.
+        let mut program = plain_program();
+        program
+            .sections
+            .push(plain_section(3, 6, Idempotency::Safe, Interruptible::Yes));
+        let journal = plain_journal(&program, true, &state(&program));
+        let RestartDecision::ResumeFromCheckpoint(point) = decide(&program, &journal) else {
+            panic!("{:?}", decide(&program, &journal));
+        };
+        assert_eq!(point.at, at(6));
+        assert_eq!(point.state.pc, 2);
+        // The step count goes on after the journal's records.
+        assert_eq!(point.state.steps, next_steps(journal.state()));
+    }
+
+    /// Reachability follows the checkpoint's suspended callers: a return goes on in the caller,
+    /// where an unsafe request lies, but only with the frame in the state.
+    #[test]
+    fn a_return_to_the_caller_counts_toward_what_lies_ahead() {
+        // 0 calls the function at 5; the caller goes on at 1 with an unsafe request at 2; the
+        // function reads at 6 under a `Safe` section and returns at 8.
+        let mut program = plain_program();
+        program.code = vec![
+            Op::Call(5),
+            Op::PushBytes(0),
+            Op::ServiceRequest { service: 0x10 },
+            Op::Pop,
+            Op::Ret,
+            Op::PushBytes(0),
+            Op::ServiceRequest { service: 0x22 },
+            Op::Pop,
+            Op::Ret,
+        ];
+        program.sections = vec![plain_section(5, 8, Idempotency::Safe, Interruptible::Yes)];
+        let mut inside = state_at_pc(&program, 7, 7);
+        // With no suspended caller the return at 8 ends the program: nothing unsafe ahead.
+        let journal = plain_journal(&program, true, &inside);
+        assert!(matches!(
+            decide(&program, &journal),
+            RestartDecision::ResumeFromCheckpoint(_)
+        ));
+        inside.call_stack = vec![diag_ir::Frame {
+            return_pc: 1,
+            locals: Vec::new(),
+        }];
+        let journal = plain_journal(&program, true, &inside);
+        assert_eq!(
+            decide(&program, &journal),
+            not_resumable(NotResumableCause::UnsafePrimitiveAhead { pc: 2 })
+        );
+    }
+
+    #[test]
+    fn a_plan_ahead_is_named_before_the_primitives_in_it() {
+        // The checkpoint at 0 of the plan fixture: its entry (2) is ahead, and so is its erase (3).
+        let mut program = program(RecoveryRequired::Never);
+        program.identity.vin = Some(diag_ir::Source::EcuService {
+            service_id: 1,
+            field_id: 3,
+        });
+        let journal = plain_journal(&program, true, &state_at_pc(&program, 0, 7));
+        assert_eq!(
+            decide(&program, &journal),
+            not_resumable(NotResumableCause::PlanAhead { flash_session: 1 })
+        );
+    }
+
+    /// The checks come in order: an uninterruptible point before what lies ahead, what lies ahead
+    /// before the identity; a state that fails `Vm::check_state` or does not decode is an invalid
+    /// state.
+    #[test]
+    fn the_checkpoint_resume_conditions_are_checked_in_order() {
+        let mut program = plain_program();
+        program
+            .sections
+            .push(plain_section(3, 6, Idempotency::Safe, Interruptible::Yes));
+        // No VIN named and an unsafe request ahead (4 is under no section here): the request.
+        let mut open = program.clone();
+        open.sections.pop();
+        let journal = plain_journal(&open, false, &state_at_pc(&open, 2, 7));
+        assert_eq!(
+            decide(&open, &journal),
+            not_resumable(NotResumableCause::UnsafePrimitiveAhead { pc: 4 })
+        );
+        // Nothing unsafe ahead: no VIN named, then no VIN source.
+        let journal = plain_journal(&program, false, &state_at_pc(&program, 2, 7));
+        assert_eq!(
+            decide(&program, &journal),
+            not_resumable(NotResumableCause::NoIdentity)
+        );
+        let mut no_source = program.clone();
+        no_source.identity.vin = None;
+        let journal = plain_journal(&no_source, true, &state_at_pc(&no_source, 2, 7));
+        assert_eq!(
+            decide(&no_source, &journal),
+            not_resumable(NotResumableCause::NoIdentity)
+        );
+        // An uninterruptible point first, even with no VIN named.
+        let mut held = program.clone();
+        held.sections
+            .push(plain_section(2, 3, Idempotency::Safe, Interruptible::No));
+        let journal = plain_journal(&held, false, &state_at_pc(&held, 2, 7));
+        assert_eq!(
+            decide(&held, &journal),
+            not_resumable(NotResumableCause::UninterruptibleSection { pc: 2 })
+        );
+        // A state the VM refuses: its pc is far past the code.
+        let journal = plain_journal(&program, true, &state_at_pc(&program, 99, 7));
+        assert!(matches!(
+            decide(&program, &journal),
+            RestartDecision::OnSiteInterventionRequired(OnSiteReason::InvalidEntryState(_))
+        ));
+        // A state that does not decode.
+        let mut journal = plain_journal(&program, true, &state_at_pc(&program, 2, 7));
+        journal.commit_checkpoint(at(7), b"junk").unwrap();
+        assert!(matches!(
+            decide(&program, &journal),
+            RestartDecision::OnSiteInterventionRequired(OnSiteReason::InvalidEntryState(_))
+        ));
+    }
+
+    /// ADR-330: an instruction is an interruptible point unless it lies in a section that is not
+    /// `Yes` or is a `Ret`; a position past the code has neither.
+    #[test]
+    fn interruptible_points_follow_the_sections_and_returns() {
+        let mut program = plain_program();
+        program.code[2] = Op::Ret;
+        program.sections = vec![
+            plain_section(3, 4, Idempotency::Safe, Interruptible::No),
+            plain_section(4, 5, Idempotency::Safe, Interruptible::RecoveryRequired),
+            plain_section(5, 6, Idempotency::Safe, Interruptible::Yes),
+        ];
+        let points: Vec<bool> = (0..=program.code.len() as u32)
+            .map(|pc| interruptible_point(&program, pc))
+            .collect();
+        assert_eq!(
+            points,
+            [
+                true, true, false, false, false, true, true, true, true, true
+            ]
+        );
     }
 }

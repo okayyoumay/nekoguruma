@@ -555,6 +555,62 @@ impl Program {
         Ok(())
     }
 
+    /// For each instruction, whether execution that stands at `pc` with the suspended callers'
+    /// return positions `return_pcs` (outermost first, innermost last, as
+    /// `VmState::call_stack[i].return_pc`) can reach it, `pc` itself included (ADR-335 item 3,
+    /// condition S). It is the forward closure over the VM's control flow:
+    /// - an instruction falls through to the next one; a jump goes to its target; a conditional
+    ///   jump goes to its target and to the next instruction;
+    /// - a call explores the callee as a nested call, whose return ends that path because the
+    ///   caller goes on, and also goes on at the next instruction at the current level;
+    /// - a return at the level `pc` stands in goes on at the innermost suspended caller's return
+    ///   position, then outwards through `return_pcs`; with none left it ends the program;
+    /// - a declared failure ends the path, and so does a position at or past the end of the code
+    ///   (the program ends there), so an out-of-range target is ignored.
+    ///
+    /// Each instruction is visited once per level (the checkpoint's own frame and each caller
+    /// above it, plus the nested level), so the cost is linear in the code's length times
+    /// `return_pcs.len() + 2`. The result is conservative where the VM's data would decide
+    /// (both ways of a conditional jump are taken), and reaches nothing when `pc` is out of range.
+    pub fn reachable_from(&self, pc: u32, return_pcs: &[u32]) -> Vec<bool> {
+        let len = self.code.len();
+        // Levels 0..=callers are the frames (a level's number is how many callers are still
+        // suspended above it); `nested` is any call made on the way, whose callers are not
+        // tracked since its return ends the path.
+        let callers = return_pcs.len();
+        let nested = callers + 1;
+        let levels = callers + 2;
+        let mut visited = vec![false; len * levels];
+        let mut reached = vec![false; len];
+        let mut pending = vec![(pc, callers)];
+        while let Some((pc, level)) = pending.pop() {
+            let index = pc as usize;
+            if index >= len || std::mem::replace(&mut visited[index * levels + level], true) {
+                continue;
+            }
+            reached[index] = true;
+            match self.code[index] {
+                Op::Fail { .. } => {}
+                Op::Ret => {
+                    if level != nested && level > 0 {
+                        pending.push((return_pcs[level - 1], level - 1));
+                    }
+                }
+                Op::Jump(to) => pending.push((to, level)),
+                Op::JumpIfFalse(to) => {
+                    pending.push((to, level));
+                    pending.push((pc + 1, level));
+                }
+                Op::Call(to) => {
+                    pending.push((to, nested));
+                    pending.push((pc + 1, level));
+                }
+                _ => pending.push((pc + 1, level)),
+            }
+        }
+        reached
+    }
+
     /// The checks of one plan that need only the plan and the code.
     fn validate_plan(&self, plan: &FlashRecovery) -> Result<(), ProgramError> {
         let flash_session = plan.flash_session;

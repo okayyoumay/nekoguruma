@@ -45,6 +45,12 @@ pub struct JobLimits {
     /// teardown (ADR-264), so it also bounds how late those waits see a cancel; at least 1 ms is
     /// used.
     pub wait_poll: Duration,
+    /// How often a plain procedure (the step ranges outside every flash plan) may be started
+    /// again on its existing journal or resumed from a checkpoint, the two counted together
+    /// under one stage of the journal. A plain procedure has no plan to carry `max_resumes`, so
+    /// this is the agent's policy and not in the IR (ADR-335 item 6). At the limit the job ends
+    /// in on-site intervention (`ProcedureResumeLimitReached`) with nothing sent.
+    pub max_procedure_resumes: u16,
 }
 
 impl Default for JobLimits {
@@ -52,6 +58,7 @@ impl Default for JobLimits {
         Self {
             max_steps: 1_000_000,
             wait_poll: Duration::from_millis(10),
+            max_procedure_resumes: 3,
         }
     }
 }
@@ -472,9 +479,23 @@ pub async fn run_program_journaled<C: WorkerApi>(
 ///   with a journal commits such a stop as the journal's last record before it returns the
 ///   error, and a commit that fails ends the job in [`JobError::Journal`] instead;
 /// - a plain start runs the program from its start on the same journal, its step count going on
-///   after the journal's last record (`restart::next_steps`); a missing journal is a plain
-///   start only for a program that sends nothing it could not repeat
-///   (`restart::missing_journal_is_plain_start`, ADR-335 item 1), which then runs without one;
+///   after the journal's last record (`restart::next_steps`). On an existing journal it is
+///   counted as a resume under the plain procedure's stage (`diag_ir::PLAIN_PROCEDURE_STAGE`,
+///   ADR-335 item 6), committed before anything is sent; a stage resumed
+///   `JobLimits::max_procedure_resumes` times ends the job in
+///   [`JobError::OnSiteInterventionRequired`] (`ProcedureResumeLimitReached`) with nothing
+///   sent, and a cancel before the commit in [`JobError::Cancelled`]. A missing journal is a
+///   plain start only for a program that sends nothing it could not repeat
+///   (`restart::missing_journal_is_plain_start`, ADR-335 item 1), which then runs without one,
+///   uncounted;
+/// - a plain procedure that sent requests (`Request` records, ADR-335 item 2) ends in
+///   [`JobError::OnSiteInterventionRequired`] with nothing sent and no resume counted when its
+///   last request has no later state record (`UnconfirmedRequest`) or when it cannot be
+///   resumed from its latest checkpoint (`NotResumable`: an unsafe primitive, a
+///   `RecoveryRequired` section or a plan ahead, a checkpoint in an uninterruptible section, no
+///   target VIN or VIN source). Where it can, the decision is a checkpoint resume
+///   (`RestartDecision::ResumeFromCheckpoint`), which the runner does not run yet: it ends in
+///   the same error (`CheckpointResumeNotImplemented`), also with nothing sent;
 /// - an interrupted transfer makes the checks of `restart::check_before_ecu` (resume limit,
 ///   supply voltage), commits the incremented resume count and makes the gates of
 ///   `restart::check_gates` (ADR-229 item 2 step 2, ADR-261), which send only
@@ -1044,7 +1065,23 @@ where
         // final, nothing is sent and no resume counted (ADR-288).
         RestartDecision::Stopped(stopped) => Err(stopped_error(&stopped)),
         RestartDecision::PlainStart => match opened {
-            Ok(journal) => {
+            Ok(mut journal) => {
+                // A plain start on an existing journal counts as a resume of the plain
+                // procedure (ADR-335 item 6): checked, then committed, before anything is sent.
+                let stage = crate::journal::StageId(diag_ir::PLAIN_PROCEDURE_STAGE);
+                let resumes = journal.state().facts.resume_count(stage);
+                if resumes >= limits.max_procedure_resumes {
+                    return Err(JobError::OnSiteInterventionRequired(
+                        OnSiteReason::ProcedureResumeLimitReached {
+                            resumes,
+                            max: limits.max_procedure_resumes,
+                        },
+                    ));
+                }
+                if cancelled.load(Ordering::Relaxed) {
+                    return Err(JobError::Cancelled);
+                }
+                journal.commit_resume(stage, None)?;
                 let first_step = restart::next_steps(journal.state());
                 let mut journal = JobJournal::new(journal, sources);
                 run_on_from(
@@ -1062,6 +1099,14 @@ where
             Err(_) => run_on(program, host, limits, cancelled, None::<&mut JobJournal<S>>)
                 .map(Restarted::Finished),
         },
+        // The decision is a continuation from the checkpoint, which is not run yet (the VIN read
+        // and lock, the resume count and the run from the restored state are still to be written).
+        // A plain start would send the requests the journal records a second time, so the job
+        // ends here, with nothing sent and no resume counted.
+        // TODO: run the checkpoint resume of ADR-335 item 6 here.
+        RestartDecision::ResumeFromCheckpoint(point) => Err(JobError::OnSiteInterventionRequired(
+            OnSiteReason::CheckpointResumeNotImplemented { at: point.at },
+        )),
         RestartDecision::Restart(point) => {
             // `classify` restarts only from a journal it read.
             let mut journal = opened?;
@@ -4320,9 +4365,13 @@ def main():
     /// the new ones included, so its markers and checkpoints come after theirs (ADR-335).
     #[test]
     fn a_plain_start_on_an_existing_journal_commits_after_the_new_records() {
-        let program = plain_procedure();
+        // The routine is `Safe` here: a lost response to a non-`Safe` one is an unconfirmed
+        // request, which a plain start must not repeat (ADR-335 item 4). The request at 7 is
+        // the only marker.
+        let mut program = plain_procedure();
+        program.sections[1].idempotency = diag_ir::Idempotency::Safe;
         let dir = journal_dir("plain-start-after-markers");
-        // The routine's response is lost, after its marker and the read's checkpoint.
+        // The routine's response is lost, after the read's checkpoint.
         let result = first_run(&program, &dir, JobLimits::default(), |host| {
             host.lose_routine = Some(0xFF01);
         });
@@ -4331,25 +4380,23 @@ def main():
             "{result:?}"
         );
         let before = Journal::read(&dir, &job_key()).unwrap();
-        assert_eq!(before.facts.last_request, Some(StepRef { pc: 4, steps: 4 }));
-        // The failed routine left its marker but no checkpoint: the latest is the read's.
+        assert_eq!(before.facts.last_request, None);
+        // The failed routine left no checkpoint: the latest is the read's.
         assert_eq!(
             before.latest_checkpoint.as_ref().map(|c| c.0),
             Some(StepRef { pc: 1, steps: 1 })
         );
         let first_step = restart::next_steps(&before);
-        assert!(first_step > 4);
+        assert!(first_step > 1);
         let mut host = FlashHost::new(Rc::new(Cell::new(0)));
         resume(&program, &dir, &mut host, false).expect("a plain start runs the program");
         let after = Journal::read(&dir, &job_key()).unwrap();
-        assert_eq!(after.facts.first_request, before.facts.first_request);
-        assert_eq!(
-            after.facts.last_request,
-            Some(StepRef {
-                pc: 7,
-                steps: first_step + 7
-            })
-        );
+        let marker = StepRef {
+            pc: 7,
+            steps: first_step + 7,
+        };
+        assert_eq!(after.facts.first_request, Some(marker));
+        assert_eq!(after.facts.last_request, Some(marker));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -4642,6 +4689,446 @@ def main():
             .unwrap()
             .facts
             .resume_count(crate::journal::StageId(7))
+    }
+
+    // ------------------------------------------------ plain procedure restart (ADR-335 items 3 to 7)
+
+    /// One step of a plain procedure: an operand, the request for `service` and its Pop.
+    fn request_step(service: u16) -> [Op; 3] {
+        [Op::PushBytes(0), Op::ServiceRequest { service }, Op::Pop]
+    }
+
+    /// A plain program of one request step for each `(service, idempotency)`, three instructions
+    /// each with a section of their own (interruptible), reading the VIN as `flash_program` does.
+    /// The request of step `n` is at pc `3 * n + 1`.
+    fn plain_steps(steps: &[(u16, diag_ir::Idempotency)]) -> Program {
+        let mut code = Vec::new();
+        let mut sections = Vec::new();
+        for (service, idempotency) in steps {
+            let start = code.len() as u32;
+            code.extend(request_step(*service));
+            sections.push(plain_section(start, start + 3, *idempotency));
+        }
+        let mut program = program(code);
+        program.sections = sections;
+        program.identity.vin = Some(diag_ir::Source::EcuService {
+            service_id: 1,
+            field_id: 3,
+        });
+        program.validate().expect("the fixture is a valid program");
+        program
+    }
+
+    /// A first run of `program` that targets `vin` and is cancelled once its request for
+    /// `service` was sent (and its checkpoint committed), so the job is resumable.
+    fn cancelled_after(program: &Program, dir: &std::path::Path, vin: Option<&str>, service: u16) {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        host.cancel_on_service = Some((service, Arc::clone(&cancelled)));
+        let mut journal = JobJournal::create(file_setup_for(dir, vin)).unwrap();
+        let result = run_on(
+            program,
+            &mut host,
+            JobLimits::default(),
+            &cancelled,
+            Some(&mut journal),
+        );
+        assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
+    }
+
+    /// A first run whose response to `service` is lost.
+    fn lost_response(program: &Program, dir: &std::path::Path, service: u16, pc: u32) {
+        let result = first_run(program, dir, JobLimits::default(), |host| {
+            host.lose_service = Some(service);
+        });
+        assert!(
+            matches!(&result, Err(JobError::Host { pc: at, .. }) if *at == pc),
+            "{result:?}"
+        );
+    }
+
+    /// [`resume`] with the job's limits given.
+    fn resume_limited(
+        program: &Program,
+        dir: &std::path::Path,
+        host: &mut FlashHost,
+        limits: JobLimits,
+        vin: Option<&str>,
+    ) -> Result<VmState, JobError> {
+        resume_to_erase(
+            program,
+            host,
+            limits,
+            &AtomicBool::new(false),
+            Journal::open(dir, &job_key()),
+            identity_sources(),
+            vin.map(|vin| crate::journal::Vin::new(vin.to_owned()))
+                .as_ref(),
+            None,
+            &dir_slot(dir),
+        )
+    }
+
+    /// The resumes counted under the plain procedure's stage.
+    fn plain_resumes(dir: &std::path::Path) -> u16 {
+        Journal::read(dir, &job_key())
+            .unwrap()
+            .facts
+            .resume_count(crate::journal::StageId(diag_ir::PLAIN_PROCEDURE_STAGE))
+    }
+
+    /// Resumes the job once on a fresh host, set up by `prepare`, and returns its result and the
+    /// host.
+    fn resume_plain_job(
+        program: &Program,
+        dir: &std::path::Path,
+        prepare: impl FnOnce(&mut FlashHost),
+    ) -> (Result<VmState, JobError>, FlashHost) {
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        prepare(&mut host);
+        let result = resume_limited(
+            program,
+            dir,
+            &mut host,
+            JobLimits::default(),
+            Some(TARGET_VIN),
+        );
+        (result, host)
+    }
+
+    /// Nothing was sent and the plain stage's count stayed at `resumes`.
+    fn assert_nothing_sent(host: &FlashHost, dir: &std::path::Path, resumes: u16) {
+        assert_eq!(host.sent(), []);
+        assert_eq!(plain_resumes(dir), resumes);
+    }
+
+    use diag_ir::Idempotency::{Safe, Unsafe};
+
+    /// ADR-335 item 4: an `Unsafe` primitive in flight (its marker is the newest record, no state
+    /// after it) is unconfirmed, now and at every later resume, with nothing sent.
+    #[test]
+    fn an_unsafe_primitive_in_flight_is_an_unconfirmed_request() {
+        let program = plain_steps(&[(0x22, Safe), (0x10, Unsafe), (0x3E, Safe)]);
+        let dir = journal_dir("plain-unconfirmed");
+        lost_response(&program, &dir, 0x10, 4);
+        for _ in 0..2 {
+            let (result, host) = resume_plain_job(&program, &dir, |_| {});
+            assert_eq!(
+                reason_of(&result),
+                &OnSiteReason::UnconfirmedRequest {
+                    at: StepRef { pc: 4, steps: 4 }
+                }
+            );
+            assert_nothing_sent(&host, &dir, 0);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A marker with no state after it, as a cancel during its commit leaves (here committed
+    /// directly), reads as unconfirmed as well.
+    #[test]
+    fn a_request_marker_with_no_later_state_is_unconfirmed() {
+        let program = plain_steps(&[(0x22, Safe), (0x10, Unsafe), (0x3E, Safe)]);
+        let dir = journal_dir("plain-marker-only");
+        cancelled_after(&program, &dir, Some(TARGET_VIN), 0x22);
+        let at = StepRef { pc: 4, steps: 4 };
+        Journal::open(&dir, &job_key())
+            .unwrap()
+            .commit_request(at)
+            .unwrap();
+        let (result, host) = resume_plain_job(&program, &dir, |_| {});
+        assert_eq!(reason_of(&result), &OnSiteReason::UnconfirmedRequest { at });
+        assert_nothing_sent(&host, &dir, 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// ADR-335 items 3 and 6: with no request ever recorded the job makes a plain start on its
+    /// journal, counted under the plain stage; at the limit (3 by default) it ends on site with
+    /// nothing sent, and the limit is the agent's policy.
+    #[test]
+    fn a_plain_start_is_counted_and_stops_at_the_limit() {
+        let program = plain_steps(&[(0x22, Safe), (0x3E, Safe)]);
+        for (max, limits) in [
+            (3, JobLimits::default()),
+            (
+                1,
+                JobLimits {
+                    max_procedure_resumes: 1,
+                    ..JobLimits::default()
+                },
+            ),
+            (
+                5,
+                JobLimits {
+                    max_procedure_resumes: 5,
+                    ..JobLimits::default()
+                },
+            ),
+        ] {
+            let dir = journal_dir("plain-start-limit");
+            lost_response(&program, &dir, 0x3E, 4);
+            for count in 1..=max {
+                let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+                host.lose_service = Some(0x3E);
+                // The repeat runs the program again from its start and fails the same way.
+                let result = resume_limited(&program, &dir, &mut host, limits, Some(TARGET_VIN));
+                assert!(
+                    matches!(result, Err(JobError::Host { pc: 4, .. })),
+                    "{max} {count}: {result:?}"
+                );
+                assert_eq!(host.sent().len(), 2, "the read and the lost request");
+                assert_eq!(plain_resumes(&dir), count);
+            }
+            let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+            let result = resume_limited(&program, &dir, &mut host, limits, Some(TARGET_VIN));
+            assert_eq!(
+                reason_of(&result),
+                &OnSiteReason::ProcedureResumeLimitReached { resumes: max, max }
+            );
+            assert_nothing_sent(&host, &dir, max);
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    /// A cancel that is set before the resume count is committed ends the plain start with no
+    /// count and nothing sent.
+    #[test]
+    fn a_cancel_before_the_plain_start_counts_no_resume() {
+        let program = plain_steps(&[(0x22, Safe), (0x3E, Safe)]);
+        let dir = journal_dir("plain-start-cancelled");
+        lost_response(&program, &dir, 0x3E, 4);
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        let result = resume(&program, &dir, &mut host, true);
+        assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
+        assert_nothing_sent(&host, &dir, 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A job with no journal at all is a plain start that is not counted: it keeps none.
+    #[test]
+    fn a_plain_start_without_a_journal_is_not_counted() {
+        let program = plain_steps(&[(0x22, Safe)]);
+        let dir = journal_dir("plain-start-no-journal");
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        resume(&program, &dir, &mut host, false).expect("a plain start runs the program");
+        assert!(matches!(
+            Journal::read(&dir, &job_key()),
+            Err(JournalError::NotFound)
+        ));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The program of the checkpoint-resume rows: a safe read, an unsafe request at pc 4 and two
+    /// safe requests after it.
+    fn resumable_program() -> Program {
+        plain_steps(&[(0x22, Safe), (0x10, Unsafe), (0x3E, Safe), (0x22, Safe)])
+    }
+
+    /// ADR-335 item 3: requests recorded and confirmed, only safe primitives ahead, an
+    /// interruptible checkpoint, a target VIN and a VIN source decide a checkpoint resume. The
+    /// resume itself is not run yet: the job ends on site with nothing sent and no resume
+    /// counted, not in a plain start that would send the unsafe request again.
+    #[test]
+    fn a_checkpoint_resume_decision_ends_on_site_with_nothing_sent() {
+        let program = resumable_program();
+        let dir = journal_dir("plain-checkpoint-resume");
+        cancelled_after(&program, &dir, Some(TARGET_VIN), 0x10);
+        let state = Journal::read(&dir, &job_key()).unwrap();
+        let at = StepRef { pc: 4, steps: 4 };
+        let RestartDecision::ResumeFromCheckpoint(point) = restart::classify(&program, Ok(&state))
+        else {
+            panic!("{:?}", restart::classify(&program, Ok(&state)));
+        };
+        assert_eq!(point.at, at);
+        // Standing after the request, at its Pop, with the count going on after the journal's.
+        assert_eq!(point.state.pc, 5);
+        assert_eq!(point.state.steps, restart::next_steps(&state));
+        let (result, host) = resume_plain_job(&program, &dir, |_| {});
+        assert_eq!(
+            reason_of(&result),
+            &OnSiteReason::CheckpointResumeNotImplemented { at }
+        );
+        assert_nothing_sent(&host, &dir, 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Resumes the job of `program` that was cancelled after `service`, and returns the reason.
+    fn not_resumable(program: &Program, tag: &str, service: u16) -> OnSiteReason {
+        let dir = journal_dir(tag);
+        cancelled_after(program, &dir, Some(TARGET_VIN), service);
+        let (result, host) = resume_plain_job(program, &dir, |_| {});
+        let reason = reason_of(&result).clone();
+        assert_nothing_sent(&host, &dir, 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+        reason
+    }
+
+    fn unresumable(cause: restart::NotResumableCause) -> OnSiteReason {
+        OnSiteReason::NotResumable { cause }
+    }
+
+    /// A primitive ahead that is not safe to repeat ends the resume, the lowest one named: plainly
+    /// ahead, behind a loop's back edge (before the checkpoint in pc order) and behind a call.
+    #[test]
+    fn an_unsafe_primitive_ahead_is_not_resumable() {
+        use restart::NotResumableCause::UnsafePrimitiveAhead;
+        // Plainly ahead: the request at 7.
+        let program = plain_steps(&[(0x22, Safe), (0x10, Unsafe), (0x3E, Unsafe)]);
+        assert_eq!(
+            not_resumable(&program, "plain-unsafe-ahead", 0x10),
+            unresumable(UnsafePrimitiveAhead { pc: 7 })
+        );
+        // Only through the back edge: the unsafe request at 1 is behind the checkpoint.
+        let mut program = plain_steps(&[(0x10, Unsafe), (0x22, Safe)]);
+        program.code.push(Op::Jump(0));
+        assert_eq!(
+            not_resumable(&program, "plain-unsafe-loop", 0x22),
+            unresumable(UnsafePrimitiveAhead { pc: 1 })
+        );
+        // Only through a call, to a request that no section covers.
+        let mut program = plain_steps(&[(0x10, Unsafe), (0x22, Safe)]);
+        program.code.extend([Op::Call(8), Op::Ret]);
+        program.code.extend(request_step(0x3E));
+        program.code.push(Op::Ret);
+        assert_eq!(
+            not_resumable(&program, "plain-unsafe-call", 0x22),
+            unresumable(UnsafePrimitiveAhead { pc: 9 })
+        );
+    }
+
+    #[test]
+    fn a_recovery_required_section_ahead_is_not_resumable() {
+        let mut program = plain_steps(&[(0x22, Safe), (0x10, Unsafe), (0x3E, Safe)]);
+        program.sections[2].interruptible = diag_ir::Interruptible::RecoveryRequired;
+        assert_eq!(
+            not_resumable(&program, "plain-recovery-ahead", 0x10),
+            unresumable(restart::NotResumableCause::RecoveryRequiredAhead { section: 2, pc: 7 })
+        );
+    }
+
+    /// ADR-335 test matrix, last row: a flash program that crashed after the non-safe session
+    /// change ahead of its plan, before the transfer, cannot go on from the checkpoint into the
+    /// plan, which has its own restart order.
+    #[test]
+    fn a_plan_ahead_is_not_resumable() {
+        assert_eq!(
+            not_resumable(&flash_program(), "plain-plan-ahead", 0x10),
+            unresumable(restart::NotResumableCause::PlanAhead { flash_session: 1 })
+        );
+    }
+
+    /// ADR-335 item 5: a checkpoint inside a section that is not `Yes` never resumes; neither does
+    /// one standing on the `Ret` after such a section's last primitive (ADR-330 item 2).
+    #[test]
+    fn a_checkpoint_in_an_uninterruptible_section_is_not_resumable() {
+        use restart::NotResumableCause::UninterruptibleSection;
+        // The cancel is not taken inside a `No` section, so the run ends in a lost response.
+        let mut program = plain_steps(&[(0x10, Unsafe), (0x22, Safe), (0x3E, Safe)]);
+        for section in &mut program.sections[1..] {
+            section.interruptible = diag_ir::Interruptible::No;
+        }
+        let dir = journal_dir("plain-no-section");
+        lost_response(&program, &dir, 0x3E, 7);
+        let (result, host) = resume_plain_job(&program, &dir, |_| {});
+        assert_eq!(
+            reason_of(&result),
+            &unresumable(UninterruptibleSection { pc: 5 })
+        );
+        assert_nothing_sent(&host, &dir, 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        // The section holds the request but not the return after it: the run ends there.
+        let program = program_with_return_after_no_section();
+        program.validate().unwrap();
+        let dir = journal_dir("plain-no-section-ret");
+        first_run(&program, &dir, JobLimits::default(), |_| {}).expect("the job completes");
+        let (result, host) = resume_plain_job(&program, &dir, |_| {});
+        assert_eq!(
+            reason_of(&result),
+            &unresumable(UninterruptibleSection { pc: 5 })
+        );
+        assert_nothing_sent(&host, &dir, 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An unsafe request, then a safe read in a `No` section that ends before the program's `Ret`.
+    fn program_with_return_after_no_section() -> Program {
+        let mut program = plain_steps(&[(0x10, Unsafe), (0x22, Safe)]);
+        // The second step's Pop is replaced by the return, outside its section.
+        program.code[5] = Op::Ret;
+        program.sections[1] = diag_ir::Section {
+            end_pc: 5,
+            interruptible: diag_ir::Interruptible::No,
+            ..program.sections[1].clone()
+        };
+        program
+    }
+
+    /// Without a target VIN or without a VIN source a resume could not tell which vehicle it
+    /// goes on with.
+    #[test]
+    fn a_resume_with_no_identity_is_not_resumable() {
+        use restart::NotResumableCause::NoIdentity;
+        // The job names no VIN.
+        let program = resumable_program();
+        let dir = journal_dir("plain-no-target-vin");
+        cancelled_after(&program, &dir, None, 0x10);
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        let result = resume_limited(&program, &dir, &mut host, JobLimits::default(), None);
+        assert_eq!(reason_of(&result), &unresumable(NoIdentity));
+        assert_nothing_sent(&host, &dir, 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+        // The program declares no VIN source.
+        let mut program = resumable_program();
+        program.identity.vin = None;
+        assert_eq!(
+            not_resumable(&program, "plain-no-vin-source", 0x10),
+            unresumable(NoIdentity)
+        );
+    }
+
+    /// A job with a started transfer keeps the flash path: the plain procedure's classification
+    /// does not apply, although the journal holds a request and a checkpoint of its steps ahead
+    /// of the plan.
+    #[test]
+    fn a_started_transfer_takes_the_flash_path() {
+        let program = flash_program();
+        let dir = journal_dir("plain-flash-path");
+        interrupted(&program, &dir);
+        let state = Journal::read(&dir, &job_key()).unwrap();
+        assert!(state.facts.last_request.is_some() && state.latest_checkpoint.is_some());
+        assert!(matches!(
+            restart::classify(&program, Ok(&state)),
+            RestartDecision::Restart(_)
+        ));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The restart's reading of an interruptible point is the runner's cancel marking (ADR-330).
+    #[test]
+    fn the_restart_and_the_runner_agree_on_interruptible_points() {
+        let mut no = plain_steps(&[(0x10, Unsafe), (0x22, Safe), (0x3E, Safe)]);
+        no.sections[1].interruptible = diag_ir::Interruptible::No;
+        no.code.push(Op::Ret);
+        let mut recovery = resumable_program();
+        recovery.sections[2].interruptible = diag_ir::Interruptible::RecoveryRequired;
+        for program in [
+            resumable_program(),
+            no,
+            recovery,
+            program_with_return_after_no_section(),
+            flash_program(),
+        ] {
+            let held = cancel_held_at(&program);
+            // One past the code too: no instruction there, no section.
+            for pc in 0..=program.code.len() as u32 {
+                assert_eq!(
+                    restart::interruptible_point(&program, pc),
+                    !holds_cancel(&program, &held, pc),
+                    "pc {pc}"
+                );
+            }
+        }
     }
 
     /// [`flash_program`] whose procedure ends itself as failed right after the erase, with the
@@ -8652,7 +9139,8 @@ def main():
     /// count over the limit.
     #[test]
     fn a_plain_start_has_its_own_step_budget() {
-        let program = flash_program();
+        // The session change ahead of the plan is `Safe`: no request, so a plain start.
+        let program = safe_before_the_plan(flash_program());
         let dir = journal_dir("plain-start-budget");
         let result = first_run_cancelled_on(&program, &dir, JobLimits::default(), 0x10, |_| {});
         assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
@@ -9060,6 +9548,17 @@ def main():
             section(boundaries.post_transfer_end_pc, program.code.len() as u32),
         ];
         program.sections.extend(sections);
+        program.validate().expect("the fixture is a valid program");
+        program
+    }
+
+    /// `program` with one `Safe` section before its plan's entry, so the steps ahead of the plan
+    /// are safe to repeat and a job interrupted there makes a plain start (ADR-335 item 3).
+    fn safe_before_the_plan(mut program: Program) -> Program {
+        let entry_pc = program.flash[0].boundaries.entry_pc;
+        program
+            .sections
+            .push(plain_section(0, entry_pc, diag_ir::Idempotency::Safe));
         program.validate().expect("the fixture is a valid program");
         program
     }
@@ -11195,7 +11694,9 @@ def main():
     /// after the old ones.
     #[test]
     fn a_plain_start_goes_on_with_the_existing_journal() {
-        let program = flash_program();
+        // The session change ahead of the plan is `Safe`, so the job sent no request that a plain
+        // start would repeat (ADR-335 item 3).
+        let program = safe_before_the_plan(flash_program());
         let dir = journal_dir("resume-plain");
         // Cancelled after its session change, before the erase.
         let result = first_run_cancelled_on(&program, &dir, JobLimits::default(), 0x10, |_| {});
@@ -11525,6 +12026,17 @@ def main():
 
         // Before the section: a plain start that runs the program again and journals the
         // section's intent, so a crash after it would be refused in turn.
+        // The first routine is `Safe` here: a lost response to a non-`Safe` one would be an
+        // unconfirmed request (ADR-335 item 4), not a plain start.
+        let mut program = program;
+        program.sections.push(diag_ir::Section {
+            start_pc: 0,
+            end_pc: 3,
+            interruptible: diag_ir::Interruptible::Yes,
+            idempotency: diag_ir::Idempotency::Safe,
+            expected_millis: 0,
+        });
+        program.validate().unwrap();
         let dir = journal_dir("no-plan-section-before");
         let result = first_run(&program, &dir, JobLimits::default(), |host| {
             host.lose_routine = Some(0xFF01);

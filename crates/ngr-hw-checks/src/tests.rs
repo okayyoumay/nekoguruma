@@ -434,6 +434,14 @@ fn a_loopback_runs_between_two_ends_of_one_bus() {
         &partner(&with_protocol(&second_module, "ISO_11898_RAW")),
     ))
     .unwrap();
+    parse(&loopback(
+        &with_protocol(vci_end, "ISO15765"),
+        &partner(&with_protocol(
+            &second_module,
+            "ISO_14229_3_on_ISO_15765_2_with_ISO_11783_5",
+        )),
+    ))
+    .unwrap();
     // A name the worker does not map, such as `CAN_PS`, is refused before any device opens.
     refused_for(
         &loopback(vci_end, &partner(&with_protocol(&second_module, "CAN_PS"))),

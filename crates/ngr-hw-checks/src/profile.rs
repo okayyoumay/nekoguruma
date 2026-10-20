@@ -482,6 +482,7 @@ fn framing(protocol: &str) -> Option<Framing> {
         | "iso_14230_3_on_iso_15765_2"
         | "sae_j2190_on_iso_15765_2"
         | "iso_15031_5_on_iso_15765_4"
+        | "iso_14229_3_on_iso_15765_2_with_iso_11783_5"
         | "iso_14229_3"
         | "iso_15765_3" => Some(Framing::Iso15765),
         _ => None,

@@ -374,9 +374,11 @@ connection is served by the runtime.
 - **RawMode form.** On a T0 link the data of a send is the literal frame the worker passes on.
   `j2534-0404-service` transmits `cop_data` unchanged as `PassThruMessage.Data`: the CAN identifier
   in four bytes, most significant first; the address byte next when the `ISO15765_ADDR_TYPE` flag is
-  set (the guard requires the flag to equal the profile's addressing); then the payload. The
-  link is a hardware ISO 15765 channel (a software ISO-TP link refuses RawMode), which segments
-  the payload itself, so the payload holds no ISO 15765-2 (2024) protocol control information (clause 9.6).
+  set (the guard requires the flag to equal the profile's addressing); then the payload. On an ISO
+  15765 end the link is a hardware ISO 15765 channel (a software ISO-TP link refuses RawMode),
+  which segments the payload itself, so the payload holds no ISO 15765-2 (2024) protocol control
+  information (clause 9.6). On a raw CAN end the payload goes on the bus as it is, as the CAN
+  frame's data.
   `iso22900-service` forwards `cop_data` and the TxFlags to the D-PDU library untouched, and the
   form is the library's (ISO 22900-2 (2022) D.2.1, Table D.4 gives the identifier in four bytes);
   it has no test of a RawMode send against a library. This is the header the guard compares on

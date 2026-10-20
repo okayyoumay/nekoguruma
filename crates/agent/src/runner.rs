@@ -1421,6 +1421,13 @@ where
     if let Some(journal) = journal.as_deref_mut() {
         journal.run_start(&vm.state)?;
     }
+    // The start of a run from the program's first instruction is an interruptible point whatever
+    // sections cover it (ADR-330): a procedure whose `main` is itself a section would otherwise
+    // hold a cancel that came in while the link was opening, and run to its end. Only this entry
+    // has the rule; a restart's replay and a checkpoint resume enter `run_vm` themselves.
+    if cancelled.load(Ordering::Relaxed) {
+        return Err(JobError::Cancelled);
+    }
     match run_vm(
         program, host, limits, cancelled, journal, vm, None, first_step,
     )? {
@@ -2134,6 +2141,30 @@ def main():
             let result = run_plain(&lowered(source), &mut host, JobLimits::default(), &flag);
             assert!(result.is_ok(), "{source}: {result:?}");
             assert_eq!(host.logs, ["cancel", "last"]);
+        }
+    }
+
+    #[test]
+    fn a_cancel_before_the_first_step_is_taken_though_main_is_a_section() {
+        // `main`'s own section covers the first instruction, but the start of the run is an
+        // interruptible point (ADR-330): a cancel that came in while the link was opening ends
+        // the job before anything is sent or logged.
+        for kind in ["uninterruptible", "recoveryRequired"] {
+            let source = format!("# @section {kind}\ndef main():\n    diag.log(1, \"ran\")\n");
+            let program = lowered(&source);
+            assert!(
+                holds_cancel(&program, &cancel_held_at(&program), 0),
+                "{kind}: pc 0 is covered by the section"
+            );
+            let flag = AtomicBool::new(true);
+            let mut host = FakeHost::default();
+            let result = run_plain(&program, &mut host, JobLimits::default(), &flag);
+            assert!(
+                matches!(result, Err(JobError::Cancelled)),
+                "{kind}: {result:?}"
+            );
+            assert!(host.logs.is_empty(), "{kind}: {:?}", host.logs);
+            assert_eq!(host.requests, 0, "{kind}");
         }
     }
 

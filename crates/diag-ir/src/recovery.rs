@@ -380,7 +380,26 @@ impl ProgramError {
             | Self::TransferBeforeRequestDownload { pc, .. }
             | Self::TransferInterrupted { pc, .. }
             | Self::PlanInSubroutine { pc, .. } => Some(*pc),
-            _ => None,
+            Self::TooManyFlashRecoveries { .. }
+            | Self::BoundaryOutOfOrder { .. }
+            | Self::DuplicateFlashSession(_)
+            | Self::DuplicateStage(_)
+            | Self::OverlappingFlashRecoveries { .. }
+            | Self::ContradictoryInterruptibility { .. }
+            | Self::UnsafeSectionInReplay { .. }
+            | Self::InvalidNoApplicationNrc { .. }
+            | Self::FlagRangeOutOfDomain(_)
+            | Self::EmptyRange(_)
+            | Self::InputDoesNotReport { .. }
+            | Self::IdentityFromRuntimeInput(_)
+            | Self::ZeroId { .. }
+            | Self::MissingIdentitySource(_)
+            | Self::UnmappedPrecondition { .. }
+            | Self::MissingSessionTimeout { .. }
+            | Self::ZeroResumeLimit { .. }
+            | Self::InvalidSection { .. }
+            | Self::MissingRequestDownload { .. }
+            | Self::ReservedStage { .. } => None,
         }
     }
 }

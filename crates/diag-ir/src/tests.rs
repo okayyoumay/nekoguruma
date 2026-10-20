@@ -4190,16 +4190,60 @@ mod flash_block {
 
 #[test]
 fn a_program_error_names_its_pc_only_when_it_has_one() {
-    assert_eq!(ProgramError::DownloadOutsidePlan { pc: 7 }.pc(), Some(7));
-    assert_eq!(
+    let with_pc = [
+        ProgramError::BadFailureCode { pc: 7 },
+        ProgramError::WrongBoundaryInstruction {
+            flash_session: 1,
+            pc: 7,
+        },
+        ProgramError::RecoveryRequiredOutOfRange {
+            flash_session: 1,
+            pc: 7,
+        },
+        ProgramError::JumpOutOfRecovery {
+            flash_session: 1,
+            pc: 7,
+        },
+        ProgramError::BackwardJumpAcrossRecovery {
+            flash_session: 1,
+            pc: 7,
+        },
+        ProgramError::CallOrReturnInPlan {
+            flash_session: 1,
+            pc: 7,
+        },
+        ProgramError::ControlFlowIntoPlan {
+            flash_session: 1,
+            pc: 7,
+        },
+        ProgramError::DownloadOutsidePlan { pc: 7 },
+        ProgramError::FlashBlockOutsidePlan { pc: 7 },
+        ProgramError::FlashBlockSessionMismatch {
+            pc: 7,
+            session: 2,
+            flash_session: 1,
+        },
+        ProgramError::UndeclaredTransferBoundary {
+            flash_session: 1,
+            pc: 7,
+        },
+        ProgramError::TransferBeforeRequestDownload {
+            flash_session: 1,
+            pc: 7,
+        },
         ProgramError::TransferInterrupted {
             flash_session: 1,
-            pc: 9,
-            service: 0x10
-        }
-        .pc(),
-        Some(9)
-    );
+            pc: 7,
+            service: 0x10,
+        },
+        ProgramError::PlanInSubroutine {
+            flash_session: 1,
+            pc: 7,
+        },
+    ];
+    for error in with_pc {
+        assert_eq!(error.pc(), Some(7), "{error:?}");
+    }
     assert_eq!(
         ProgramError::BoundaryOutOfOrder { flash_session: 1 }.pc(),
         None

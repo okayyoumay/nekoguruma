@@ -574,7 +574,10 @@ authentication time (8.10.1) each time the function is called.
   pieces between, which cover no primitive, carry `CheckState`, meaning "not stated", which the
   job runner judges as code outside every section (ADR-329, ADR-332). Every piece carries the
   section function's interruptibility and expected duration, so a copy's pieces are contiguous,
-  and a section is entered only by the section function's call. Without `expected=`, the expected
+  and a section is entered only by the section function's call. The exception is `main`'s own
+  section, which covers the first instruction and is entered at the start of the run; that start
+  is an interruptible point, so a cancel set before the first step is taken there (the job runner
+  checks it before the first step of a run from the program's start, ADR-330). Without `expected=`, the expected
   duration is 0.
 - **Plan functions.** A function may carry `@section` and `@flashPlan` (4.9) together, and a plan
   function must: its `@section` is `uninterruptible` or `recoveryRequired`, since design 8.10.1

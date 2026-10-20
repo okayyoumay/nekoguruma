@@ -4,7 +4,9 @@
 # two copies of the helper and a section over the write's copies (ADR-301, ADR-329). The security
 # access sends the profile's seed and key requests, which no declared service answers, so the
 # host answers them with their bare positive response. `main` names every precondition, so the
-# program carries all five of the variant's `preconditions.csv` beside its `identity.csv`.
+# program carries all five of the variant's `preconditions.csv` beside its `identity.csv`. The
+# `write_uint` and `read_uint` take an offset known only at run time, so they lower to their
+# per-byte sequences (subset 2.4).
 
 def read_vin():
     diag.request(0x22, {"did": 0xF190})
@@ -21,6 +23,9 @@ def main():
     session = diag.request(0x22, {"did": 0xF186})
     if session["fields"]["session"] == 3:
         diag.log(1, "extended session")
+    frame = write_uint(b"\x00\x00\x00", session["fields"]["session"] - 3, 16, 0x1234)
+    if read_uint(frame, 0, 16) == 0x1234:
+        diag.log(1, "uint round trip")
     dtcs = diag.read_dtc(0x09)
     if dtcs["ok"] and dtcs["fields"]["mask"] == 0xFF:
         diag.log(1, "all DTC status bits supported")

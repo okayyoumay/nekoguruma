@@ -455,7 +455,8 @@ enum Framing {
 /// additional channel's `_CHn` suffix); `None` for a protocol the loopback does not run on, or a
 /// name the worker would not recognise.
 fn framing(protocol: &str) -> Option<Framing> {
-    let key = channel_key(protocol).to_ascii_lowercase();
+    // Not `channel_key`: the worker matches the name as given, so surrounding spaces are no alias.
+    let key = protocol.to_ascii_lowercase();
     let base = match key.rfind("_ch") {
         // A bare `_CH` is no channel index: the worker does not recognise `CAN_CH`.
         Some(index)

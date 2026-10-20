@@ -462,6 +462,14 @@ fn a_loopback_runs_between_two_ends_of_one_bus() {
         ),
         "runs on raw CAN",
     );
+    // The worker does not trim a protocol name, so `" CAN "` is no CAN name.
+    refused_for(
+        &loopback(
+            &with_protocol(vci_end, " CAN "),
+            &partner(&with_protocol(&second_module, " CAN ")),
+        ),
+        "runs on raw CAN",
+    );
     // A bare `_CH` names no channel index, and the worker does not map `CAN_CH`.
     refused_for(
         &loopback(

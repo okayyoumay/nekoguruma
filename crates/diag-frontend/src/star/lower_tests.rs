@@ -1452,6 +1452,281 @@ fn bytes_are_indexed_at_run_time() {
     }
 }
 
+/// `read_uint` of the bytes `0x11 0x22 ... 0x77` at `offset`, in a function whose operands are
+/// known only at run time.
+fn read_uint_holds(offset: i64, bits: u32, expect: i64) -> bool {
+    holds(
+        "b, o",
+        &format!("b\"\\x11\\x22\\x33\\x44\\x55\\x66\\x77\", {offset}"),
+        &format!("read_uint(b, o, {bits}) == {expect}"),
+    )
+}
+
+#[test]
+fn read_uint_reads_big_endian_at_run_time() {
+    for (bits, expect) in [
+        (8, 0x11),
+        (16, 0x1122),
+        (24, 0x112233),
+        (32, 0x11223344),
+        (40, 0x1122334455),
+        (48, 0x112233445566),
+        (56, 0x11223344556677),
+    ] {
+        assert!(read_uint_holds(0, bits, expect), "{bits} bits");
+    }
+    assert!(read_uint_holds(2, 16, 0x3344));
+    // The last byte, and the last field that fits.
+    assert!(read_uint_holds(6, 8, 0x77));
+    assert!(read_uint_holds(5, 16, 0x6677));
+    // A high bit stays a non-negative value.
+    assert!(holds(
+        "b, o",
+        "b\"\\xff\\xff\\xff\\xff\\xff\\xff\\xff\", 0",
+        "read_uint(b, o, 56) == 72057594037927935"
+    ));
+}
+
+#[test]
+fn read_uint_past_the_end_or_before_the_start_is_an_error() {
+    for (offset, bits) in [
+        (7, 8),
+        (6, 16),
+        (1000, 8),
+        (-1, 8),
+        (-3, 16),
+        (i64::MAX, 16),
+    ] {
+        let result = run(&format!(
+            "def f(b, o):\n    return read_uint(b, o, {bits})\n\ndef main():\n    f(b\"\\x11\\x22\\x33\\x44\\x55\\x66\\x77\", {offset})\n"
+        ));
+        assert!(
+            result
+                .as_ref()
+                .is_err_and(|e| e.contains("IndexOutOfRange")),
+            "{offset}, {bits}: {result:?}"
+        );
+    }
+}
+
+#[test]
+fn read_uint_takes_its_operands_from_any_expression() {
+    // Bytes built at run time, and a computed offset.
+    assert!(holds(
+        "a, b",
+        "b\"\\x01\\x02\", b\"\\x03\\x04\"",
+        "read_uint(a + b, len(a), 16) == 0x0304"
+    ));
+}
+
+#[test]
+fn write_uint_writes_big_endian_at_run_time() {
+    for bits in [8, 16, 24, 32, 40, 48, 56] {
+        let width = bits / 8;
+        let value: u64 = (1..=width).fold(0, |acc, i| (acc << 8) | (0xa0 + i));
+        // Eight bytes, the field at offset 1 and zeros after it.
+        let mut expect = String::from("\\x00");
+        for i in 0..7 {
+            expect.push_str(&format!("\\x{:02x}", if i < width { 0xa1 + i } else { 0 }));
+        }
+        assert!(
+            holds(
+                "b, o, v",
+                &format!("b\"\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\", 1, {value}"),
+                &format!("write_uint(b, o, {bits}, v) == b\"{expect}\"")
+            ),
+            "{bits} bits"
+        );
+    }
+    // The bytes around the field are kept, the field ends at the last byte, and the operand's
+    // value is not changed.
+    assert!(holds(
+        "b, o",
+        "b\"\\x11\\x22\\x33\\x44\", 2",
+        "write_uint(b, o, 16, 0xbeef) == b\"\\x11\\x22\\xbe\\xef\""
+    ));
+    assert!(holds(
+        "b, o",
+        "b\"\\x11\\x22\\x33\\x44\", 0",
+        "write_uint(b, o, 8, 0) == b\"\\x00\\x22\\x33\\x44\""
+    ));
+    assert!(holds(
+        "b, o",
+        "b\"\\x11\\x22\", 0",
+        "read_uint(write_uint(b, o, 16, 0x0102), 0, 16) == 0x0102 and b == b\"\\x11\\x22\""
+    ));
+    // The widest value of a width.
+    assert!(holds(
+        "b, v",
+        "b\"\\x00\\x00\", 65535",
+        "write_uint(b, 0, 16, v) == b\"\\xff\\xff\""
+    ));
+}
+
+#[test]
+fn write_uint_refuses_a_value_that_does_not_fit_and_an_offset_past_the_end() {
+    for value in [
+        "65536",
+        "-1",
+        "9223372036854775807",
+        "-9223372036854775807 - 1",
+    ] {
+        let result = run(&format!(
+            "def f(b, o, v):\n    return write_uint(b, o, 16, v)\n\ndef main():\n    f(b\"\\x00\\x00\", 0, {value})\n"
+        ));
+        let Ok(Some((code, detail))) = &result else {
+            panic!("{value}: {result:?}")
+        };
+        assert_eq!(code, "UINT_OUT_OF_RANGE", "{value}");
+        assert!(detail.contains("16 bits"), "{detail}");
+    }
+    for (offset, bits) in [(1, 16), (2, 8), (-1, 8)] {
+        let result = run(&format!(
+            "def f(b, o):\n    return write_uint(b, o, {bits}, 1)\n\ndef main():\n    f(b\"\\x00\\x00\", {offset})\n"
+        ));
+        assert!(
+            result
+                .as_ref()
+                .is_err_and(|e| e.contains("IndexOutOfRange")),
+            "{offset}, {bits}: {result:?}"
+        );
+    }
+}
+
+#[test]
+fn read_uint_and_write_uint_fold_on_constants() {
+    let source = "\
+B = b\"\\x01\\x02\\x03\"
+R = read_uint(B, 1, 16)
+W = write_uint(B, 1, 16, 0xaabb)
+
+def main():
+    if R == 0x0203 and W == b\"\\x01\\xaa\\xbb\":
+        diag.fail(\"OK\", \"\")
+";
+    assert_eq!(failed_with(source), "OK");
+    // A constant past the end is reported at ingestion.
+    for call in ["read_uint(B, 2, 16)", "write_uint(B, 0, 8, 256)"] {
+        let found = codes(&format!(
+            "B = b\"\\x01\\x02\\x03\"\nX = {call}\n\ndef main():\n    pass\n"
+        ));
+        assert_eq!(found, vec![(StarCode::NotLowerable, 2)], "{call}");
+    }
+}
+
+#[test]
+fn the_width_of_read_uint_and_write_uint_is_a_constant_multiple_of_8_up_to_56() {
+    for bits in ["0", "7", "12", "64", "-8", "True"] {
+        let found = codes(&format!(
+            "def f(b):\n    return read_uint(b, 0, {bits})\n\ndef main():\n    f(b\"\\x01\")\n"
+        ));
+        assert_eq!(found, vec![(StarCode::ArgumentOutOfRange, 2)], "{bits}");
+    }
+    let found = codes(
+        "def f(b, n):\n    return write_uint(b, 0, n, 1)\n\ndef main():\n    f(b\"\\x01\", 8)\n",
+    );
+    assert_eq!(found, vec![(StarCode::NonConstantArgument, 2)]);
+    let found = codes("def f(b):\n    return read_uint(b, 0)\n\ndef main():\n    f(b\"\\x01\")\n");
+    assert_eq!(found, vec![(StarCode::UnsupportedSyntax, 2)]);
+    // The operands have their types.
+    let found = codes("def f(b):\n    return read_uint(b, 0, 8)\n\ndef main():\n    f(1)\n");
+    assert_eq!(found, vec![(StarCode::NotLowerable, 2)]);
+}
+
+#[test]
+fn len_of_bytes_known_at_run_time_lowers() {
+    assert!(holds("b", "b\"\\x01\\x02\\x03\"", "len(b) == 3"));
+    assert!(holds("a, b", "b\"\\x01\", b\"\\x02\"", "len(a + b) == 2"));
+}
+
+#[test]
+fn a_built_in_that_does_not_lower_names_the_instruction_it_waits_for() {
+    let cases = [
+        (
+            "def f(x):\n    return abs(x)\n",
+            "1",
+            "absolute-value instruction",
+        ),
+        (
+            "def f(x):\n    return min(x, 2)\n",
+            "1",
+            "minimum and maximum instruction",
+        ),
+        (
+            "def f(x):\n    return max(x, 2)\n",
+            "1",
+            "minimum and maximum instruction",
+        ),
+        (
+            "def f(x):\n    return str(x)\n",
+            "1",
+            "integer-to-text conversion instruction",
+        ),
+        (
+            "def f(x):\n    return bool(x)\n",
+            "1",
+            "truth-conversion instruction",
+        ),
+        (
+            "def f(x):\n    return to_hex(x)\n",
+            "b\"a\"",
+            "bytes-to-hex-text instruction",
+        ),
+        (
+            "def f(x):\n    return from_hex(x)\n",
+            "\"61\"",
+            "hex-text-to-bytes instruction",
+        ),
+        (
+            "def f(x):\n    return len(x)\n",
+            "\"a\"",
+            "character-count instruction",
+        ),
+        (
+            "def f(x):\n    return x.find(\"a\")\n",
+            "\"a\"",
+            "string-search instruction",
+        ),
+        (
+            "def f(x):\n    return x.upper()\n",
+            "\"a\"",
+            "case-mapping instruction",
+        ),
+        (
+            "def f(x):\n    return x.strip()\n",
+            "\"a\"",
+            "trimming instruction",
+        ),
+        (
+            "def f(x):\n    return x.startswith(\"a\")\n",
+            "\"a\"",
+            "prefix and suffix comparison",
+        ),
+        (
+            "def f(x):\n    return x.format(1)\n",
+            "\"a\"",
+            "text-formatting instruction",
+        ),
+        (
+            "def f(x):\n    return x.join([\"a\"])\n",
+            "\"a\"",
+            "text-join instruction",
+        ),
+    ];
+    for (function, arg, waits) in cases {
+        let source = format!("{function}\ndef main():\n    f({arg})\n");
+        let checked = check("t.star", &source).unwrap_or_else(|e| panic!("{e:#?}"));
+        let errors = lower_for_a_variant(&checked).expect_err(&source);
+        assert!(
+            errors
+                .iter()
+                .all(|e| e.code == StarCode::NotLowerable && e.hint.contains(waits)),
+            "{source}: {errors:#?}"
+        );
+        assert!(!errors.is_empty(), "{source}");
+    }
+}
+
 #[test]
 fn constants_are_folded_at_ingestion() {
     let source = "\

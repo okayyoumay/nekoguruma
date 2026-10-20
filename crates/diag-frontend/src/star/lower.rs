@@ -12,9 +12,10 @@
 //! for its operands is `STAR_NOT_LOWERABLE`.
 //!
 //! Not lowered yet, each its own backlog item: the other `diag` functions (`hmi` and `record`;
-//! `flash_transfer`), and built-ins and string methods on values known only at run time.
-//! Each is rejected with `STAR_NOT_LOWERABLE` (or `STAR_API_NOT_AVAILABLE` for a `diag`
-//! function without an instruction), so nothing is lowered silently wrong.
+//! `flash_transfer`). The built-ins and string methods on values known only at run time that
+//! have no lowering (`abs`, `str`, `find`, ...) name the instruction they wait for. Each is
+//! rejected with `STAR_NOT_LOWERABLE` (or `STAR_API_NOT_AVAILABLE` for a `diag` function without
+//! an instruction), so nothing is lowered silently wrong.
 
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -84,6 +85,8 @@ const MAX_COPIED_INSTRUCTIONS: usize = 1 << 22;
 
 /// The `Fail` code of a loop that runs past its limit (subset 4.2, ADR-280).
 const LOOP_LIMIT_EXCEEDED: &str = "LOOP_LIMIT_EXCEEDED";
+/// The `Fail` code of a `write_uint` whose value does not fit its width (2.4).
+const UINT_OUT_OF_RANGE: &str = "UINT_OUT_OF_RANGE";
 
 /// Where the profile's DTC records are and how each one is laid out (`Lowerer::dtc_layout`).
 #[derive(Debug, Clone, Copy)]
@@ -3144,10 +3147,14 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    /// A built-in of 2.4 on values known only at run time: `int` of a number and `float` of a
-    /// number, through the IR's conversions. The others are not lowered yet.
-    fn run_builtin(&mut self, name: &str, values: Vec<Val>, span: Span) -> Val {
+    /// A built-in of 2.4 on values known only at run time: `len` of bytes, `int` of a number and
+    /// `float` of a number, through the IR's conversions, and `read_uint` and `write_uint`. The
+    /// others are rejected with the instruction they wait for.
+    fn run_builtin(&mut self, id: Option<usize>, name: &str, values: Vec<Val>, span: Span) -> Val {
         let failed = || Val::Run(Tys::default(), Vec::new());
+        if let "read_uint" | "write_uint" = name {
+            return self.run_uint(id, name, values, span);
+        }
         if let ("len", [Val::Run(tys, _)]) = (name, values.as_slice())
             && tys.one() == Some(Ty::DtcList)
         {
@@ -3162,6 +3169,26 @@ impl<'a> Lowerer<'a> {
                     .map(|op| (Ins::Op(op), span)),
             );
             return Val::Run(Tys::of(Ty::Int), code);
+        }
+        if let ("len", [_]) = (name, values.as_slice()) {
+            let value = values.into_iter().next().expect("one argument");
+            let Some((ty, mut code)) = self.single(value, span, "`len`") else {
+                return failed();
+            };
+            if ty == Ty::Bytes {
+                // `Length` leaves the bytes below the length.
+                code.extend([Op::Length, Op::Swap, Op::Pop].map(|op| (Ins::Op(op), span)));
+                return Val::Run(Tys::of(Ty::Int), code);
+            }
+            self.not_lowerable(
+                span,
+                format!(
+                    "`len` of a {} known only at run time {} (2.4)",
+                    ty.name(),
+                    waits_for(name)
+                ),
+            );
+            return failed();
         }
         if let ("int" | "float", [_]) = (name, values.as_slice()) {
             let value = values.into_iter().next().expect("one argument");
@@ -3182,8 +3209,9 @@ impl<'a> Lowerer<'a> {
                     self.not_lowerable(
                         span,
                         format!(
-                            "`{name}` of a {} known only at run time is not lowered yet (2.4)",
-                            ty.name()
+                            "`{name}` of a {} known only at run time {} (2.4)",
+                            ty.name(),
+                            waits_for(name)
                         ),
                     );
                     return failed();
@@ -3193,9 +3221,176 @@ impl<'a> Lowerer<'a> {
         }
         self.not_lowerable(
             span,
-            format!("`{name}` on a value known only at run time is not lowered yet (2.4)"),
+            format!(
+                "`{name}` on a value known only at run time {} (2.4)",
+                waits_for(name)
+            ),
         );
         failed()
+    }
+
+    /// The arguments of `read_uint` and `write_uint` that do not depend on the operands (2.4):
+    /// their number, and that `bits` is a constant multiple of 8 from 8 to 56. Other built-ins
+    /// pass. Reports an error and gives `false` otherwise.
+    fn check_uint_bits(&mut self, name: &str, values: &[Val], span: Span) -> bool {
+        let arguments = match name {
+            "read_uint" => 3,
+            "write_uint" => 4,
+            _ => return true,
+        };
+        if values.len() != arguments {
+            self.error(
+                StarCode::UnsupportedSyntax,
+                span,
+                format!(
+                    "`{name}` takes {arguments} arguments, not {} (2.4)",
+                    values.len()
+                ),
+            );
+            return false;
+        }
+        match &values[2] {
+            Val::Const(Const::Int(bits)) if (8..=56).contains(bits) && bits % 8 == 0 => true,
+            Val::Const(_) => {
+                self.error(
+                    StarCode::ArgumentOutOfRange,
+                    span,
+                    format!("`{name}` takes `bits` as a multiple of 8 from 8 to 56 (2.4)"),
+                );
+                false
+            }
+            Val::Run(..) | Val::Void(_) => {
+                self.error(
+                    StarCode::NonConstantArgument,
+                    span,
+                    format!("`bits` of `{name}` is a constant, so the bytes can be unrolled (2.4)"),
+                );
+                false
+            }
+        }
+    }
+
+    /// `read_uint(b, offset, bits)` and `write_uint(b, offset, bits, v)` on operands known only
+    /// at run time (2.4): `bits` is a constant (checked by the caller), so the bytes are read or
+    /// written by code unrolled once per byte, most significant first. A byte past the end of `b`
+    /// is the VM's `IndexOutOfRange` from `IndexGet` or `IndexSet`, which a negative offset also
+    /// gives; a `v` of `write_uint` outside 0 to 2^`bits` - 1 ends the procedure with `Fail`
+    /// code `UINT_OUT_OF_RANGE`.
+    fn run_uint(&mut self, id: Option<usize>, name: &str, values: Vec<Val>, span: Span) -> Val {
+        let failed = || Val::Run(Tys::default(), Vec::new());
+        let Some(id) = id else {
+            self.not_lowerable(
+                span,
+                format!("`{name}` needs a function to hold its operands"),
+            );
+            return failed();
+        };
+        let Some(Val::Const(Const::Int(bits))) = values.get(2) else {
+            unreachable!("`bits` is checked to be a constant before lowering")
+        };
+        let (bits, bytes) = (*bits, *bits / 8);
+        let write = name == "write_uint";
+        // The operands, as the types they must have.
+        let mut operands = Vec::new();
+        for (at, value) in values.into_iter().enumerate() {
+            if at == 2 {
+                continue;
+            }
+            let want = if at == 0 { Ty::Bytes } else { Ty::Int };
+            let Some((ty, code)) = self.single(value, span, &format!("`{name}`")) else {
+                return failed();
+            };
+            if ty != want {
+                self.not_lowerable(
+                    span,
+                    format!(
+                        "an operand of `{name}` must be {}, not {} (2.4)",
+                        want.name(),
+                        ty.name()
+                    ),
+                );
+                return failed();
+            }
+            operands.push(code);
+        }
+        let slots: Vec<u16> = operands.iter().map(|_| self.temp(id, span)).collect();
+        let mut code: Code = Vec::new();
+        for (operand, &slot) in operands.into_iter().zip(&slots) {
+            code.extend(operand);
+            code.push((Ins::Op(Op::StoreLocal(slot)), span));
+        }
+        let (bytes_slot, offset_slot) = (slots[0], slots[1]);
+        let mut ops = Vec::new();
+        // The offset of byte `i`, which `IndexGet` and `IndexSet` check.
+        let at = |i: i64| {
+            let mut ops = vec![Op::LoadLocal(offset_slot)];
+            if i > 0 {
+                ops.extend([Op::PushI64(i), Op::Add]);
+            }
+            ops
+        };
+        if write {
+            let value_slot = slots[2];
+            // `Shr` is logical, so a negative value leaves its high bits set as well.
+            let ok = self.label();
+            code.extend(
+                [
+                    Ins::Op(Op::LoadLocal(value_slot)),
+                    Ins::Op(Op::PushI64(bits)),
+                    Ins::Op(Op::Shr),
+                    Ins::Op(Op::PushI64(0)),
+                    Ins::Op(Op::CmpEq),
+                    Ins::Op(Op::Not),
+                    Ins::JumpIfFalse(ok),
+                ]
+                .map(|ins| (ins, span)),
+            );
+            let failure = self.pool(UINT_OUT_OF_RANGE.as_bytes());
+            let detail = self.pool(
+                format!(
+                    "`write_uint` on line {} was given a value that does not fit {bits} bits",
+                    self.line_of(span)
+                )
+                .as_bytes(),
+            );
+            code.extend(
+                [
+                    Ins::Op(Op::PushBytes(detail)),
+                    Ins::Op(Op::Fail { code: failure }),
+                    Ins::Mark(ok),
+                ]
+                .map(|ins| (ins, span)),
+            );
+            ops.push(Op::LoadLocal(bytes_slot));
+            for i in 0..bytes {
+                ops.extend(at(i));
+                ops.extend([
+                    Op::LoadLocal(value_slot),
+                    Op::PushI64(8 * (bytes - 1 - i)),
+                    Op::Shr,
+                    Op::PushI64(0xff),
+                    Op::BitAnd,
+                    // Leaves the bytes with the byte written.
+                    Op::IndexSet,
+                ]);
+            }
+        } else {
+            ops.push(Op::PushI64(0));
+            for i in 0..bytes {
+                if i > 0 {
+                    ops.extend([Op::PushI64(8), Op::Shl]);
+                }
+                ops.push(Op::LoadLocal(bytes_slot));
+                ops.extend(at(i));
+                // `IndexGet` leaves the bytes below the byte read.
+                ops.extend([Op::IndexGet, Op::Swap, Op::Pop, Op::BitOr]);
+            }
+        }
+        // The slot would otherwise keep a copy of the bytes in the VM state until the function
+        // returns.
+        ops.extend([Op::PushI64(0), Op::StoreLocal(bytes_slot)]);
+        code.extend(ops.into_iter().map(|op| (Ins::Op(op), span)));
+        Val::Run(Tys::of(if write { Ty::Bytes } else { Ty::Int }), code)
     }
 
     /// Divides the two floats on top of the stack. Starlark rejects a division by zero, while
@@ -3295,6 +3490,9 @@ impl<'a> Lowerer<'a> {
                 }
                 let values: Vec<Val> = positional.iter().map(|arg| self.expr(id, arg)).collect();
                 if BUILTINS.contains(&name) {
+                    if !self.check_uint_bits(name, &values, span) {
+                        return Val::Run(Tys::default(), Vec::new());
+                    }
                     let all_const = values.iter().all(|v| matches!(v, Val::Const(_)));
                     let (consts, values_copy): (Option<Vec<Const>>, Vec<Val>) = if all_const {
                         let consts = values
@@ -3326,7 +3524,7 @@ impl<'a> Lowerer<'a> {
                             self.not_lowerable(span, reason);
                             Val::Run(Tys::default(), Vec::new())
                         }
-                        None => self.run_builtin(name, values_copy, span),
+                        None => self.run_builtin(id, name, values_copy, span),
                     };
                 }
                 self.not_lowerable(span, format!("`{name}` cannot be called here"));
@@ -3371,8 +3569,9 @@ impl<'a> Lowerer<'a> {
                         self.not_lowerable(
                             span,
                             format!(
-                                "`.{}` on a value known only at run time is not lowered yet (2.4)",
-                                method.node
+                                "`.{}` on a value known only at run time {} (2.4)",
+                                method.node,
+                                waits_for(&method.node)
                             ),
                         );
                         Val::Run(Tys::default(), Vec::new())
@@ -5755,6 +5954,32 @@ fn fold_builtin(name: &str, args: &[Const]) -> Result<Const, String> {
         }
         ("float", [Const::Int(n)]) => Ok(Const::Float(*n as f64)),
         ("float", [Const::Float(f)]) => Ok(Const::Float(*f)),
+        ("read_uint", [Const::Bytes(b), Const::Int(offset), Const::Int(bits)]) => {
+            let field = uint_field(b.len(), *offset, *bits)?;
+            Ok(Const::Int(
+                b[field]
+                    .iter()
+                    .fold(0, |acc, &byte| (acc << 8) | i64::from(byte)),
+            ))
+        }
+        (
+            "write_uint",
+            [
+                Const::Bytes(b),
+                Const::Int(offset),
+                Const::Int(bits),
+                Const::Int(v),
+            ],
+        ) => {
+            let field = uint_field(b.len(), *offset, *bits)?;
+            if !(0..1i64 << bits).contains(v) {
+                return Err(format!("the value {v} does not fit {bits} bits"));
+            }
+            let mut out = b.to_vec();
+            let width = field.len();
+            out[field].copy_from_slice(&v.to_be_bytes()[8 - width..]);
+            Ok(Const::bytes(out))
+        }
         ("min" | "max", [_, _, ..]) => {
             let mut best = args[0].clone();
             // The first of equal values is kept, as in Starlark.
@@ -5771,8 +5996,45 @@ fn fold_builtin(name: &str, args: &[Const]) -> Result<Const, String> {
             Ok(best)
         }
         _ => Err(format!(
-            "`{name}` with these arguments is not lowered yet (2.4)"
+            "`{name}` with these arguments is not evaluated at ingestion, and on values known \
+             only at run time {} (2.4)",
+            waits_for(name)
         )),
+    }
+}
+
+/// The range of bytes a `read_uint` or `write_uint` of `bits` bits at `offset` covers in bytes
+/// of length `len`, or why it is out of range (2.4). `bits` is checked before this.
+fn uint_field(len: usize, offset: i64, bits: i64) -> Result<std::ops::Range<usize>, String> {
+    let width = usize::try_from(bits / 8).expect("bits is checked");
+    usize::try_from(offset)
+        .ok()
+        .and_then(|start| Some(start..start.checked_add(width)?))
+        .filter(|field| field.end <= len)
+        .ok_or_else(|| format!("{bits} bits at offset {offset} are out of range of {len} bytes"))
+}
+
+/// What a built-in or string method of 2.4 on a value known only at run time waits for, as the
+/// end of the sentence `... {waits_for}`. Those that lower give no message here.
+fn waits_for(name: &str) -> &'static str {
+    match name {
+        "len" => "needs a character-count instruction (a string is UTF-8 bytes at run time)",
+        "abs" => "needs an absolute-value instruction",
+        "bool" => "needs a truth-conversion instruction",
+        "min" | "max" => "needs a minimum and maximum instruction",
+        "str" => "needs an integer-to-text conversion instruction",
+        "type" => "needs a type-name instruction",
+        "range" => "is only lowered as the sequence of a `for`",
+        "to_hex" => "needs a bytes-to-hex-text instruction",
+        "from_hex" => "needs a hex-text-to-bytes instruction",
+        "int" | "float" => "needs a text-to-number conversion instruction",
+        "find" => "needs a string-search instruction",
+        "startswith" | "endswith" => "needs a prefix and suffix comparison instruction",
+        "upper" | "lower" => "needs a case-mapping instruction",
+        "strip" => "needs a trimming instruction",
+        "format" => "needs a text-formatting instruction",
+        "join" => "needs a text-join instruction",
+        _ => "is not a built-in of 2.4",
     }
 }
 
@@ -5784,7 +6046,9 @@ fn fold_method(s: &str, method: &str, args: &[Const]) -> Result<Const, String> {
         ("startswith", [Const::Str(p)]) => Ok(Const::Bool(s.starts_with(&**p))),
         ("endswith", [Const::Str(p)]) => Ok(Const::Bool(s.ends_with(&**p))),
         _ => Err(format!(
-            "`.{method}` with these arguments is not lowered yet (2.4)"
+            "`.{method}` with these arguments is not evaluated at ingestion, and on values known \
+             only at run time {} (2.4)",
+            waits_for(method)
         )),
     }
 }

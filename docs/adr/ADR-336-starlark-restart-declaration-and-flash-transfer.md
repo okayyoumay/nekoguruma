@@ -39,7 +39,8 @@ comment annotations next to the code they describe.
    - `identity.csv` names, for `vin`, `hardware_part_number` and `software_version`, a read
      service and the response field. The service is a generated single-DID read (`<did>.read`),
      the shape the agent's source table resolves (ADR-327 item 1's reads), and the field ASCII
-     text or an unsigned integer; anything else is refused. A plain
+     text or an unsigned integer (ASCII text for the VIN, which the agent compares as text);
+     anything else is refused. A plain
      procedure gets its VIN source from it too (ADR-335 item 6, ADR-327).
    - `preconditions.csv` names, for `voltage`, `external_supply`, `ignition`, `engine` and
      `vehicle_speed`, the satisfying range, a default-session source and an optional

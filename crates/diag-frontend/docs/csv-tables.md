@@ -487,7 +487,7 @@ variant, plain procedures included.
 |---|---|---|---|
 | `kind` | `vin`, `hardware_part_number` or `software_version` | yes | The value read; one row per kind per variant |
 | `service` | service name | yes | A generated DID read of the variant (`vin.read`, a ReadDataByIdentifier of one DID, 4.7), the request shape the agent's source table reads; any other service is refused |
-| `field` | name | yes | The top-level response field that holds the value, of an ASCII text or unsigned integer type, the encodings the agent's source table decodes |
+| `field` | name | yes | The top-level response field that holds the value, of an ASCII text or unsigned integer type, the encodings the agent's source table decodes; for `vin`, ASCII text only, since the agent's VIN checks compare text |
 
 ### 4.14 `preconditions.csv` (scoped)
 

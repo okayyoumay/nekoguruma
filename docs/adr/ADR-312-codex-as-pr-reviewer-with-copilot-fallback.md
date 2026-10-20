@@ -1,7 +1,7 @@
 # ADR-312: Codex as the Pull Request Reviewer, with Copilot as Fallback
 
 **Date:** 2026-10-16
-**Status:** Accepted
+**Status:** Accepted (Decision item 4 amended 2026-10-19: comparison done, Codex kept)
 **Affects:** `.claude/skills/pr-review-loop/SKILL.md` (Steps 0, 1, 4 and 5), `AGENTS.md`, `CLAUDE.md` ("Pull requests"), `.github/instructions/docs.instructions.md`; ADR-251
 
 ## Context
@@ -44,6 +44,15 @@ from `AGENTS.md` rather than from the files Copilot reads.
    rounds and the number of findings fixed, accepted and declined. After about ten pull requests
    reviewed by Codex the maintainer compares them with the Copilot pull requests before the
    switch and decides whether to keep Codex, return to Copilot or split the work between them.
+   **Amended 2026-10-19: the comparison is done and Codex stays the reviewer.** On code pull
+   requests the two reviewers needed about the same number of rounds, found about as much, and
+   almost always ended on a clean review. Codex rated nothing P3, so each of its findings was
+   worth fixing, while some of Copilot's were Low; it had a few more findings declined, mostly
+   about scope or cases that already fail closed. Its cost shows on long design ADRs, where it
+   keeps finding new high-rated cases round after round. Its usage limit stopped it on some pull
+   requests, and the per-pull request fallback to Copilot handled each. Codex stays the reviewer
+   and Copilot the fallback, with no change to items 1 to 3; the review summary in item 4 is
+   still recorded, so a later comparison can reuse it.
 
 ## Consequences
 
@@ -57,7 +66,9 @@ from `AGENTS.md` rather than from the files Copilot reads.
   a pull request that fell back to Copilot. If an automatic review arrives anyway, the loop tells
   the maintainer and handles its findings like any other result.
 - Whether Codex follows the pointer in `AGENTS.md` as faithfully as it would follow rules written
-  there is unverified; the first Codex reviews show it. If it does not, the fallback is to copy
-  the rules into `AGENTS.md` and keep both copies in step.
+  there was unverified at first. Its reviews since show that it does: its findings apply rules
+  that only the files in `.github/` state, such as a standards citation without its edition and
+  clause, or a change to the IR that leaves its golden files out. If that changes, the fallback is
+  to copy the rules into `AGENTS.md` and keep both copies in step.
 - The re-review convergence wording in `.github/copilot-instructions.md` uses Copilot's severity
   names; Codex relies on the mapping in `AGENTS.md` to read it.

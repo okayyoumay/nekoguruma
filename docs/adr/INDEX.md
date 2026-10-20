@@ -301,7 +301,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-309](ADR-309-application-layer-profiles.md) | Application-Layer Profiles for Protocol-Neutral Diagnostic Calls | Accepted (items 2 and 5 given their form by ADR-314; item 3's one program per variant lowered per combination of target variants, each call against its target's declarations, by ADR-325 item 6) | `diag-frontend` lowering and CSV tables, `diag-ir` primitives, `agent` host and read-only policy; ADR-235 items 2, 3 and 8; design 8.2.4, 8.4 |
 | [ADR-310](ADR-310-one-line-message-notation.md) | A One-Line Message Notation for the Vehicle-Knowledge Format | Accepted | `diag-frontend` message shapes (`messages.txt` replacing the CSV field tables), CSV format sections 1 and 5; design 8.4 |
 | [ADR-311](ADR-311-lowering-each-procedure-once-per-variant.md) | Lowering Each Procedure Once per Variant | Accepted (item 4 amended by ADR-313; item 1's per-variant lowering extended to combinations of target variants by ADR-325) | `diag-frontend` conversion and Starlark lowering, CSV format section 1, Starlark subset section 5 |
-| [ADR-312](ADR-312-codex-as-pr-reviewer-with-copilot-fallback.md) | Codex as the Pull Request Reviewer, with Copilot as Fallback | Accepted | `.claude/skills/pr-review-loop` (Steps 0, 1, 4-5), `AGENTS.md`, `CLAUDE.md`; ADR-251 |
+| [ADR-312](ADR-312-codex-as-pr-reviewer-with-copilot-fallback.md) | Codex as the Pull Request Reviewer, with Copilot as Fallback | Accepted (Decision item 4 amended: comparison done, Codex kept) | `.claude/skills/pr-review-loop` (Steps 0, 1, 4-5), `AGENTS.md`, `CLAUDE.md`; ADR-251 |
 | [ADR-313](ADR-313-selecting-a-request-service-from-a-table-index.md) | Selecting a Request's Service from an Index of the Tables | Accepted (item 5 superseded by ADR-317; items 1 and 2's single variant and index given per target for a procedure with several targets by ADR-325 item 6) | `diag-frontend` conversion and Starlark lowering, CSV format 5.3, Starlark subset 3.1, 3.2 and 3.4; ADR-311 item 4 |
 | [ADR-314](ADR-314-application-layer-profiles-as-typed-frontend-data.md) | Application-Layer Profiles as Typed Frontend Data | Accepted | `diag-frontend` profiles, Starlark subset 3.2 and 3.4, CSV format 5.3; ADR-309 items 2 and 5 |
 | [ADR-315](ADR-315-variant-patterns-grouped-into-patterns.md) | Variant Pattern Entries Grouped into Patterns | Accepted (item 3's first matching variant: reported in full by identification jobs, guarded for jobs that change an ECU, and replaced by the operator's pick for a read-only job, by ADR-327) | `diag-ir` schema and decoder (`IR_SCHEMA_VERSION` 10), `diag-frontend` CSV variant patterns, CSV format 4.2, design 8.9.1; ADR-306 |
@@ -666,7 +666,7 @@ the predecessor repository these ADRs came from.
 - ADR-283
 - ADR-292 (the consequence that a crash shows as `HostError::Rpc` superseded by ADR-294: the agent reports `HostError::VciLost`)
 - ADR-299
-- ADR-312
+- ADR-312 (Decision item 4 amended: comparison done, Codex kept)
 - ADR-333
 - ADR-334
 

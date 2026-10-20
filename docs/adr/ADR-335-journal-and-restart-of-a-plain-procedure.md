@@ -157,8 +157,11 @@ Rejected alternatives:
   session with an unannotated request is therefore not repeatable after that step. The remedy is
   a revised default for session control and TesterPresent, which ADR-332 (Consequences) expects
   when the 4.6 table is revisited together with the restart-declaration syntax.
-- The handover summary (design 8.2.5) gains the new facts but no VM state. A receiving device
-  can make a plain start or ends on site.
+- The handover summary (design 8.2.5) gains two of the new facts and no VM state: whether a
+  `Request` was ever recorded, and whether the last one is newer than the newest state record.
+  A receiving device makes a plain start when none was recorded and otherwise ends on site,
+  `UnconfirmedRequest` when the last one is unconfirmed and `NotResumable` otherwise, since it
+  holds no checkpoint to resume from.
 - ADR-244's record set gains `Checkpoint` and `Request`.
 - ADR-325 item 7's journal condition (any combination with a flash plan or a recovery-required
   section) becomes every journaled job; a missing journal of a job with several combinations is a

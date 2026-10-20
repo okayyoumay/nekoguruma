@@ -3,9 +3,10 @@
 
 use super::*;
 
-/// The program `main.star` lowers to for each variant.
-fn programs(source: &str) -> Vec<diag_ir::Program> {
-    let converted = convert(with(example(), "main.star", source));
+/// The program `main.star` lowers to for each variant of `files` (the example, or the example
+/// with a service added).
+fn programs_of(files: Vec<(String, Vec<u8>)>, source: &str) -> Vec<diag_ir::Program> {
+    let converted = convert(with(files, "main.star", source));
     converted
         .documents
         .iter()
@@ -20,7 +21,11 @@ fn programs(source: &str) -> Vec<diag_ir::Program> {
 /// The idempotency of the one section over each diagnostic primitive of the program, in pc order,
 /// the same for every variant.
 fn idempotency_of(source: &str) -> Vec<String> {
-    let mut found: Vec<Vec<String>> = programs(source)
+    idempotency_in(example(), source)
+}
+
+fn idempotency_in(files: Vec<(String, Vec<u8>)>, source: &str) -> Vec<String> {
+    let mut found: Vec<Vec<String>> = programs_of(files, source)
         .iter()
         .map(|program| {
             program.validate().expect("valid");
@@ -61,7 +66,24 @@ fn a_request_is_safe_when_it_reads_and_unsafe_otherwise() {
                   diag.request(0x22, {\"did\": 0xF190})\n";
     assert_eq!(
         idempotency_of(source),
-        ["Safe", "Safe", "Unsafe", "Unsafe", "Safe", "Unsafe"]
+        ["Safe", "Safe", "Safe", "Unsafe", "Safe", "Unsafe"]
+    );
+}
+
+#[test]
+fn a_session_change_and_a_tester_present_default_to_safe_and_an_annotation_overrides() {
+    // ADR-336 item 8: a repeat of either is harmless in any state.
+    let source = "def main():\n    \
+                  diag.request(0x10, {\"sub\": 3})\n    \
+                  # @idempotency unsafe\n    \
+                  diag.request(0x10, {\"sub\": 3})\n    \
+                  diag.request(0x3E, {})\n    \
+                  # @idempotency unsafe\n    \
+                  diag.request(0x3E, {})\n";
+    let files = super::services::appended(example(), "services.csv", &["testerPresent,0x3E"]);
+    assert_eq!(
+        idempotency_in(files, source),
+        ["Safe", "Unsafe", "Safe", "Unsafe"]
     );
 }
 

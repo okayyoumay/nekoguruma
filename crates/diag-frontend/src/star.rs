@@ -145,6 +145,11 @@ pub enum StarCode {
     /// lowering does not cover yet (2.5, 4.4).
     #[serde(rename = "STAR_NOT_LOWERABLE")]
     NotLowerable,
+    /// A lowered program that `Program::validate` refuses for an instruction it names, reported
+    /// at that instruction's source (4.5, ADR-336 item 4). A refusal that names none is
+    /// `STAR_NOT_LOWERABLE`.
+    #[serde(rename = "STAR_PLAN_INVALID")]
+    PlanInvalid,
     /// Functions that need more specialized copies than the budget of 2.6 allows (4.5).
     #[serde(rename = "STAR_SPECIALIZATION_LIMIT")]
     SpecializationLimit,
@@ -188,6 +193,7 @@ impl StarCode {
             Self::NestingTooDeep => "STAR_NESTING_TOO_DEEP",
             Self::NonConstantArgument => "STAR_NON_CONSTANT_ARGUMENT",
             Self::NotLowerable => "STAR_NOT_LOWERABLE",
+            Self::PlanInvalid => "STAR_PLAN_INVALID",
             Self::SpecializationLimit => "STAR_SPECIALIZATION_LIMIT",
             Self::ApiNotAvailable => "STAR_API_NOT_AVAILABLE",
             Self::UnknownService => "STAR_UNKNOWN_SERVICE",

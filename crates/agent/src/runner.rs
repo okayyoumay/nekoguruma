@@ -970,6 +970,7 @@ where
                 vm,
                 None,
                 run_start,
+                false,
             )? {
                 RunEnd::Finished(state) => Ok(state),
                 // No stop point was given.
@@ -1134,6 +1135,7 @@ where
                 vm,
                 None,
                 run_start,
+                false,
             )? {
                 RunEnd::Finished(state) => Ok(Restarted::Finished(state)),
                 // No stop point was given.
@@ -1206,6 +1208,7 @@ where
                 vm,
                 Some(plan.boundaries.erase_pc),
                 run_start,
+                false,
             )? {
                 RunEnd::Stopped(vm) => {
                     // Step 4b-3 (ADR-229 item 2 step 4, ADR-245 item 6): the replayed steps
@@ -1307,6 +1310,7 @@ where
         vm,
         None,
         run_start,
+        false,
     )? {
         RunEnd::Finished(state) => Ok(state),
         // No stop point was given.
@@ -1421,8 +1425,12 @@ where
     if let Some(journal) = journal.as_deref_mut() {
         journal.run_start(&vm.state)?;
     }
+    // The start of a run from the program's first instruction is an interruptible point whatever
+    // sections cover it (ADR-337): a procedure whose `main` is itself a section would otherwise
+    // hold a cancel that came in while the link was opening, and run to its end. Only this entry
+    // has the rule; a restart's replay and a checkpoint resume enter `run_vm` without it.
     match run_vm(
-        program, host, limits, cancelled, journal, vm, None, first_step,
+        program, host, limits, cancelled, journal, vm, None, first_step, true,
     )? {
         RunEnd::Finished(state) => Ok(state),
         // No stop point was given.
@@ -1487,6 +1495,8 @@ fn run_vm<H, S>(
     mut vm: Vm,
     stop_before: Option<u32>,
     run_start: u64,
+    // The first instruction is an interruptible point whatever sections cover it (ADR-337).
+    cancel_at_entry: bool,
 ) -> Result<RunEnd, JobError>
 where
     H: DiagHost<Error = HostError> + RuntimeInputs + TransferProgress + Declarations,
@@ -1503,8 +1513,10 @@ where
     // journal's boundary reads see a flag that is never set.
     let holds = cancel_held_at(program);
     let held = AtomicBool::new(false);
+    let mut entry = cancel_at_entry;
     loop {
-        let cancelled = if holds_cancel(program, &holds, vm.state.pc) {
+        let cancelled = if !std::mem::take(&mut entry) && holds_cancel(program, &holds, vm.state.pc)
+        {
             &held
         } else {
             cancelled
@@ -2134,6 +2146,30 @@ def main():
             let result = run_plain(&lowered(source), &mut host, JobLimits::default(), &flag);
             assert!(result.is_ok(), "{source}: {result:?}");
             assert_eq!(host.logs, ["cancel", "last"]);
+        }
+    }
+
+    #[test]
+    fn a_cancel_before_the_first_step_is_taken_though_main_is_a_section() {
+        // `main`'s own section covers the first instruction, but the start of the run is an
+        // interruptible point (ADR-337): a cancel that came in while the link was opening ends
+        // the job before anything is sent or logged.
+        for kind in ["uninterruptible", "recoveryRequired"] {
+            let source = format!("# @section {kind}\ndef main():\n    diag.log(1, \"ran\")\n");
+            let program = lowered(&source);
+            assert!(
+                holds_cancel(&program, &cancel_held_at(&program), 0),
+                "{kind}: pc 0 is covered by the section"
+            );
+            let flag = AtomicBool::new(true);
+            let mut host = FakeHost::default();
+            let result = run_plain(&program, &mut host, JobLimits::default(), &flag);
+            assert!(
+                matches!(result, Err(JobError::Cancelled)),
+                "{kind}: {result:?}"
+            );
+            assert!(host.logs.is_empty(), "{kind}: {:?}", host.logs);
+            assert_eq!(host.requests, 0, "{kind}");
         }
     }
 

@@ -2680,3 +2680,96 @@ def main():
         [StarCode::UnknownPrecondition]
     );
 }
+
+#[test]
+fn main_is_at_pc_zero_and_ends_in_a_ret_with_the_other_functions_after_it() {
+    // ADR-336 item 5: no entry call to `main`, so a plan can start in `main`'s own frame.
+    let source = "\
+def helper():
+    diag.log(1, \"b\")
+
+def main():
+    diag.log(1, \"a\")
+    helper()
+";
+    let program = lowered(source).expect("lowers");
+    program.validate().expect("valid");
+    // `main`: the wait, the call, the end; then `helper`: the wait, the return.
+    let ret = program
+        .code
+        .iter()
+        .position(|op| matches!(op, Op::Ret))
+        .expect("a Ret");
+    let call = program
+        .code
+        .iter()
+        .position(|op| matches!(op, Op::Call(_)))
+        .expect("a call");
+    assert!(call < ret, "main's call comes before its Ret");
+    assert_eq!(program.code[call], Op::Call(ret as u32 + 1));
+    assert!(program.code[..call].iter().any(Op::is_diagnostic_primitive));
+    assert!(!program.code.iter().any(|op| matches!(op, Op::Call(0))));
+    // The source map starts at pc 0 with `main`'s first statement (line 5).
+    assert_eq!(
+        (program.source_map[0].pc, program.source_map[0].line),
+        (0, 5)
+    );
+    // The VM runs it in the top-level frame and ends at that `Ret`.
+    assert_eq!(run(source), Ok(None));
+}
+
+#[test]
+fn a_validate_refusal_naming_a_pc_is_plan_invalid_at_its_span() {
+    let source = "def main():\n    diag.wait(1)\n    diag.wait(2)\n";
+    let checked = check("t.star", source).expect("checks");
+    let module = &checked.module;
+    let base = module.statement().span.begin().get();
+    let second = source.find("diag.wait(2)").expect("the second call") as u32;
+    let spans = vec![
+        Span::new(
+            starlark_syntax::codemap::Pos::new(base),
+            starlark_syntax::codemap::Pos::new(base),
+        ),
+        Span::new(
+            starlark_syntax::codemap::Pos::new(base + second),
+            starlark_syntax::codemap::Pos::new(base + second),
+        ),
+    ];
+    let error = ProgramError::DownloadOutsidePlan { pc: 1 };
+    let found = resolve(
+        "t.star",
+        module,
+        vec![invalid_program(&checked, &spans, &error)],
+    );
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].code, StarCode::PlanInvalid);
+    assert_eq!((found[0].line, found[0].column), (3, 5));
+    assert!(
+        found[0].hint.contains("download instruction at 1"),
+        "{}",
+        found[0].hint
+    );
+}
+
+#[test]
+fn a_validate_refusal_naming_no_pc_is_not_lowerable() {
+    let source = "def main():\n    diag.wait(1)\n";
+    let checked = check("t.star", source).expect("checks");
+    let spans = vec![checked.module.statement().span];
+    for error in [
+        ProgramError::BoundaryOutOfOrder { flash_session: 1 },
+        // A pc past the code names no instruction either.
+        ProgramError::RecoveryRequiredOutOfRange {
+            flash_session: 1,
+            pc: 99,
+        },
+    ] {
+        let found = resolve(
+            "t.star",
+            &checked.module,
+            vec![invalid_program(&checked, &spans, &error)],
+        );
+        assert_eq!(found[0].code, StarCode::NotLowerable);
+        assert_eq!((found[0].line, found[0].column), (1, 1));
+    }
+}

@@ -2,10 +2,9 @@
 
 **Date:** 2026-10-20
 **Status:** Accepted
-**Affects:** `diag-ir` (`Op::ReadInput`, `DiagHost::runtime_input`, `VmError::InputNotEstablished`,
-`IR_SCHEMA_VERSION` 17, `dry_run::Script::input`), `diag-frontend` (the lowering of
-`diag.precondition`), `agent` (`policy::check_program`, `host.rs`, the journal's run-stop
-record), Starlark subset 3.1, 3.2, 4.6 and 5, design 8.2.4 and 8.9; ADR-233, ADR-245, ADR-254,
+**Affects:** `diag-ir` (`Op::ReadInput`, `DiagHost::runtime_input`, `IR_SCHEMA_VERSION` 17, `dry_run::Script::input`),
+`diag-frontend` (the lowering of `diag.precondition`), `agent` (`policy::check_program`,
+`host.rs` and its `HostError::InputNotEstablished`), Starlark subset 3.1, 3.2, 4.6 and 5, design 8.2.4 and 8.9; ADR-233, ADR-245, ADR-254,
 ADR-316, ADR-321, ADR-328, ADR-336
 
 ## Context
@@ -55,30 +54,43 @@ Open choices:
    - A `Source::RuntimeInput(input)` lowers to a new `Op::ReadInput { input }`.
 3. **`Op::ReadInput { input: RuntimeInput }` is appended after `FlashBlock` (ADR-233), with
    `IR_SCHEMA_VERSION` 16 to 17.** It pushes an `I64`. The VM calls the new
-   `DiagHost::runtime_input(input) -> Result<Option<i64>, Self::Error>`. The value is in the unit
-   the precondition checks use: millivolts for the supply voltage, 0 or 1 for the flags, km/h for
-   the speed. `Ok(None)`, an input the host cannot establish, is the appended
-   `VmError::InputNotEstablished { input }`; nothing is pushed and the step can be repeated, as
-   after a host error. The VM checks the stack's room before the host is called, so an answer is
-   never discarded. The instruction sends nothing and is no diagnostic primitive, as
-   `DecodeField` and `FlashBlock` are not, so it has no section and no intent marker. It needs
-   no declaration part. Every policy class allows it.
+   `DiagHost::runtime_input(input) -> Result<i64, Self::Error>`. The value is in the unit the
+   precondition checks use: millivolts for the supply voltage, 0 or 1 for the flags, km/h for the
+   speed. A host that cannot establish the reading returns its own error, which the VM surfaces
+   as `StepError::Host` with the state untouched: nothing is pushed and the step can be repeated,
+   as after any host error. That is deliberate: the job runner ends a job for good on a
+   `VmError` (ADR-288), and whether the input can be read depends on the VCI the job runs on,
+   not on the program, so a resume on a VCI that has the source must be able to try again. The
+   VM checks the stack's room before the host is called, so an answer is never discarded. The
+   instruction sends nothing and is no diagnostic primitive, as `DecodeField` and `FlashBlock`
+   are not, so it needs no declaration part and has no intent marker of its own; inside a
+   section function the assembly covers it with a `CheckState` piece (Starlark subset
+   4.6). Every policy class allows it.
 4. **The value is an `int`** in Starlark, the subset's type for an `I64`. A flag is 0 or 1.
 5. **The agent's `WorkerHost::runtime_input` reads through its `RuntimeInputs`.** `Reading::Value`
-   is the answer; `CannotBeEstablished` and `CannotBeDecoded` are `None`; a text reading, which
-   no input gives, is `None` too; a failure to reach the worker is a host error. Today the host
-   has a source for the supply voltage only (`inputs.rs`), so a procedure that reads another
-   input stops with `InputNotEstablished`. A restart's checks and the instruction use the same
-   source, so they cannot disagree about a value.
+   is the answer; `CannotBeEstablished`, `CannotBeDecoded` and a text reading (which no input
+   gives) are the new `HostError::InputNotEstablished(input)`, a host error the job can be
+   resumed after (ADR-288); so is a failure to reach the worker. Today the host has a source for
+   the supply voltage only (`inputs.rs`), so a procedure that reads another input ends in that
+   error. A D-PDU worker that does not know `READ_VBATT` answers the lookup with an internal
+   error, which the read maps to `CannotBeEstablished` as a J2534 worker's not-found already is
+   (without caching it, since an internal error may pass); the restart's checks treat both as
+   not met, as before. For a runtime input, the restart's checks and the instruction read through
+   the same `RuntimeInputs`, so they cannot disagree about a value. For a service source they
+   can differ in how the same field reads: the call decodes it through the declaration, while the
+   restart check reads the raw unsigned value through the agent's source table and, for its
+   second check, falls back to the programming-session source.
 6. **The dry run answers from its script.** `Script::input(input, value)` sets what
-   `ReadInput` reads. An input the script does not set is `None`, so the run ends with
-   `InputNotEstablished` as on a vehicle without that input: a dry run builds a positive answer
-   for a request from the declaration (ADR-328), but it invents no measurement. The read leaves no
-   event and charges nothing against the report budget, since it sends and allocates nothing.
-7. **Both orders are part of the journal format.** The agent's run-stop record holds a
-   `VmError` by variant index (ADR-288), and `InputNotEstablished` holds a `RuntimeInput`, so
-   `VmError` is appended to (as before) and the order of `RuntimeInput`'s variants joins the
-   formats that are only appended to. The journal's encoding test lists both.
+   `ReadInput` reads. An input the script does not set is a `DryRunError` (`NotScripted`), as on
+   a vehicle without that input: a dry run builds a positive answer for a request from the
+   declaration (ADR-328), but it invents no measurement. The read leaves no event and charges
+   nothing against the report budget, since it sends and allocates nothing.
+7. **The call reads in the session the ECU is in.** The source is the row's default-session one,
+   so a service-backed `diag.precondition` must be called while the ECU is in a session that
+   answers that read, normally the default session; the call does not change the session. A
+   negative answer or an answer that does not decode ends the run as any field read without a
+   check does, with a `VmError` (terminal, ADR-288). Only an input the agent cannot establish is
+   a host error.
 
 ## Alternatives rejected
 
@@ -98,7 +110,12 @@ Open choices:
   restart; a procedure that wants it can compare against its own constant.
 - **Giving 0, or a sentinel, for an unestablished input.** The subset has no `None`, and a
   sentinel would let a procedure treat "unknown" as a reading. ADR-229 already treats an input
-  that cannot be established as a failed check, and the instruction stops the run the same way.
+  that cannot be established as a failed check, and the instruction stops the run instead.
+- **A VM error for an unestablished input** (`Ok(None)` from the host turned into a new `VmError`).
+  The job runner journals a `VmError` as a terminal stop (ADR-288), so a run that met an input
+  the VCI could not read could never be resumed on one that can. Whether an input is available
+  is a fact about the host, like a lost worker, so it is a host error, which leaves the job
+  resumable and adds nothing to the journal's `VmError` encoding or to `RuntimeInput`'s order.
 - **Reading the programming-session source.** It is meant for the one place the agent knows the
   ECU is in the programming session, the restart's second check (ADR-229 item 2); a call has no
   such guarantee.
@@ -112,6 +129,8 @@ Open choices:
   as for every appended instruction (ADR-233). The IR golden files change only in their version.
 - Every `DiagHost` gains `runtime_input`, test hosts included; the fuzz target's host answers 0.
 - A procedure that reads an input the VCI cannot supply (every input but the supply voltage, today)
-  stops with `InputNotEstablished`; the agent's sources for the other inputs are separate work.
+  ends in `HostError::InputNotEstablished`, and the job can be resumed; the agent's sources for
+  the other inputs are separate work.
+- `VmError` and the journal's formats are unchanged by this ADR.
 - A service-backed precondition costs one request per call, and the answer is not cached: two
   calls send twice.

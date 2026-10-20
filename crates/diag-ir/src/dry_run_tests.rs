@@ -822,8 +822,8 @@ fn an_input_the_script_does_not_set_is_not_established() {
     let report = run(&buf, &program, &Script::new().input(IgnitionOn, 1));
     assert_eq!(
         report.end,
-        DryRunEnd::Vm(VmError::InputNotEstablished {
-            input: EngineRunning
+        DryRunEnd::Host(DryRunError::NotScripted {
+            what: "value for the runtime input"
         })
     );
     assert_eq!(report.steps, 0);

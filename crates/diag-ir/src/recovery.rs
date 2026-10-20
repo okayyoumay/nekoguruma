@@ -23,10 +23,7 @@ pub enum Source {
     RuntimeInput(RuntimeInput),
 }
 
-/// A vehicle fact the agent supplies without asking the ECU. The agent's write-job journal stores
-/// one in the run-stop record (`VmError::InputNotEstablished`, ADR-338), encoded by variant
-/// index, so the variant order is part of that journal's format: append new variants, never
-/// reorder.
+/// A vehicle fact the agent supplies without asking the ECU.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub enum RuntimeInput {

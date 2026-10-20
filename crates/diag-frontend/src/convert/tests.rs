@@ -454,7 +454,7 @@ impl diag_ir::DiagHost for Recording {
     fn artifact_bytes(&mut self, _: u64, _: u32) -> Result<Vec<u8>, NotSent> {
         Err(NotSent)
     }
-    fn runtime_input(&mut self, _: diag_ir::RuntimeInput) -> Result<Option<i64>, NotSent> {
+    fn runtime_input(&mut self, _: diag_ir::RuntimeInput) -> Result<i64, NotSent> {
         Err(NotSent)
     }
     fn log(&mut self, _: u8, _: &str) {}
@@ -715,9 +715,9 @@ impl diag_ir::DiagHost for Answering {
     fn artifact_bytes(&mut self, _: u64, _: u32) -> Result<Vec<u8>, NotSent> {
         Err(NotSent)
     }
-    fn runtime_input(&mut self, input: diag_ir::RuntimeInput) -> Result<Option<i64>, NotSent> {
+    fn runtime_input(&mut self, input: diag_ir::RuntimeInput) -> Result<i64, NotSent> {
         self.inputs_read.push(input);
-        Ok(self.input_value)
+        self.input_value.ok_or(NotSent)
     }
     fn log(&mut self, _: u8, message: &str) {
         self.logged.push(message.to_owned());

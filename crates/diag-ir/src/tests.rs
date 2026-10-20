@@ -127,14 +127,15 @@ impl DiagHost for MockHost {
                 .collect()),
         }
     }
-    fn runtime_input(&mut self, input: RuntimeInput) -> Result<Option<i64>, MockError> {
+    fn runtime_input(&mut self, input: RuntimeInput) -> Result<i64, MockError> {
         self.calls.push(format!("input {input:?}"));
         self.fail()?;
-        Ok(self
-            .inputs
+        // An input the test did not set is one the host cannot establish.
+        self.inputs
             .iter()
             .find(|(set, _)| *set == input)
-            .map(|&(_, value)| value))
+            .map(|&(_, value)| value)
+            .ok_or(MockError)
     }
     fn log(&mut self, level: u8, message: &str) {
         assert!(!self.forbidden, "the host must not be called");
@@ -4315,7 +4316,7 @@ mod read_input {
     }
 
     #[test]
-    fn an_input_the_host_cannot_establish_stops_the_run_and_leaves_the_state() {
+    fn an_input_the_host_cannot_establish_is_a_host_error_and_leaves_the_state() {
         let program = prog(vec![i(1), read(VOLTAGE)], vec![]);
         let mut host = MockHost::default();
         let mut vm = Vm::new(&program);
@@ -4323,9 +4324,7 @@ mod read_input {
         let before = postcard::to_allocvec(&vm.state).expect("encodes");
         for _ in 0..2 {
             match vm.step(&program, &mut host) {
-                Err(StepError::Vm(error)) => {
-                    assert_eq!(error, VmError::InputNotEstablished { input: VOLTAGE });
-                }
+                Err(StepError::Host(MockError)) => {}
                 other => panic!("{other:?}"),
             }
             assert_eq!(postcard::to_allocvec(&vm.state).expect("encodes"), before);
@@ -4370,17 +4369,5 @@ mod read_input {
         ));
         assert_eq!(vm.state.stack.len(), MAX_STACK);
         assert_eq!(vm.state.pc, 0);
-    }
-
-    #[test]
-    fn the_error_survives_the_journal_encoding() {
-        for input in [
-            RuntimeInput::SupplyVoltageMillivolts,
-            RuntimeInput::VehicleSpeedKmh,
-        ] {
-            let error = VmError::InputNotEstablished { input };
-            let bytes = postcard::to_allocvec(&error).expect("encodes");
-            assert_eq!(postcard::from_bytes::<VmError>(&bytes), Ok(error));
-        }
     }
 }

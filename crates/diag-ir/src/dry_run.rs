@@ -77,8 +77,7 @@ impl Script {
     /// Sets the value `Op::ReadInput` of `input` reads (ADR-338), in the unit the precondition
     /// checks use: millivolts, 0 or 1 for a flag, km/h. A later call for the same input replaces
     /// the value. An input that is not set is one the run cannot establish
-    /// ([`VmError::InputNotEstablished`]), as on a vehicle that offers none: a dry run invents
-    /// no measurement.
+    /// (a [`DryRunError`], as on a vehicle that offers none): a dry run invents no measurement.
     pub fn input(mut self, input: RuntimeInput, value: i64) -> Self {
         self.inputs.retain(|(set, _)| *set != input);
         self.inputs.push((input, value));
@@ -720,13 +719,15 @@ impl DiagHost for ScriptedHost<'_, '_> {
 
     // A read of the script's value for the input: it sends nothing and allocates nothing, so it
     // leaves no event and charges nothing (ADR-338).
-    fn runtime_input(&mut self, input: RuntimeInput) -> Result<Option<i64>, DryRunError> {
-        Ok(self
-            .script
+    fn runtime_input(&mut self, input: RuntimeInput) -> Result<i64, DryRunError> {
+        self.script
             .inputs
             .iter()
             .find(|(set, _)| *set == input)
-            .map(|&(_, value)| value))
+            .map(|&(_, value)| value)
+            .ok_or(DryRunError::NotScripted {
+                what: "value for the runtime input",
+            })
     }
 
     // `log` cannot fail, so a message past the budget is dropped and the run ends after this

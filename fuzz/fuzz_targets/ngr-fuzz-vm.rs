@@ -51,8 +51,8 @@ impl DiagHost for Answering {
     fn artifact_bytes(&mut self, _offset: u64, len: u32) -> Result<Vec<u8>, Infallible> {
         Ok(vec![0; len as usize])
     }
-    fn runtime_input(&mut self, _input: RuntimeInput) -> Result<Option<i64>, Infallible> {
-        Ok(Some(0))
+    fn runtime_input(&mut self, _input: RuntimeInput) -> Result<i64, Infallible> {
+        Ok(0)
     }
     fn wait(&mut self, _inquiry: u64, _millis: u32) -> Result<bool, Infallible> {
         Ok(true)

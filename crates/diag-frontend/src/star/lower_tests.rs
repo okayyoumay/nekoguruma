@@ -48,7 +48,7 @@ impl DiagHost for NoHost {
     fn artifact_bytes(&mut self, _: u64, _: u32) -> Result<Vec<u8>, NoHostError> {
         unreachable!("no primitive is lowered yet")
     }
-    fn runtime_input(&mut self, _: RuntimeInput) -> Result<Option<i64>, NoHostError> {
+    fn runtime_input(&mut self, _: RuntimeInput) -> Result<i64, NoHostError> {
         unreachable!("no primitive is lowered yet")
     }
     fn log(&mut self, _: u8, _: &str) {}
@@ -1802,13 +1802,13 @@ impl DiagHost for ScriptedHost {
     fn artifact_bytes(&mut self, _: u64, _: u32) -> Result<Vec<u8>, NoHostError> {
         unreachable!("no artifact is scripted")
     }
-    fn runtime_input(&mut self, input: RuntimeInput) -> Result<Option<i64>, NoHostError> {
+    fn runtime_input(&mut self, input: RuntimeInput) -> Result<i64, NoHostError> {
         self.calls.push(format!("input {input:?}"));
-        Ok(self
-            .inputs
+        self.inputs
             .iter()
             .find(|(set, _)| *set == input)
-            .map(|&(_, value)| value))
+            .map(|&(_, value)| value)
+            .ok_or(NoHostError)
     }
     fn log(&mut self, level: u8, message: &str) {
         self.calls.push(format!("log {level} {message}"));
@@ -2763,7 +2763,7 @@ def main():
 }
 
 #[test]
-fn a_precondition_the_host_cannot_establish_stops_the_run() {
+fn a_precondition_the_host_cannot_establish_is_a_host_error() {
     let program = lowered_against(
         "def main():\n    x = diag.precondition(\"voltage\")\n",
         &restart_index(),
@@ -2774,16 +2774,11 @@ fn a_precondition_the_host_cannot_establish_stops_the_run() {
     let error = loop {
         match vm.step(&program, &mut host) {
             Ok(StepOutcome::Continue) => {}
-            Err(StepError::Vm(error)) => break error,
+            Err(StepError::Host(error)) => break error,
             other => panic!("{other:?}"),
         }
     };
-    assert_eq!(
-        error,
-        VmError::InputNotEstablished {
-            input: RuntimeInput::SupplyVoltageMillivolts
-        }
-    );
+    assert!(matches!(error, NoHostError));
 }
 
 #[test]

@@ -807,7 +807,8 @@ check as well.
   through the worker's IoCtl RPC. The host looks up the id of `PDU_IOCTL_READ_VBATT` by name
   (`GetObjectId`, IOCTL object type) on first use and keeps it. When the J2534 worker does not
   know the name, the VCI offers no voltage and the input reads "cannot be established"; a
-  D-PDU worker reports an unknown name as an internal error, which stays a `HostError`.
+  D-PDU worker reports an unknown name as an internal error, which reads the same way (not
+  cached, since an internal error may pass).
   The worker interface has no defined source for external supply, ignition, engine running or
   vehicle speed: raw pin voltages and analog inputs carry no agreed meaning for them, and
   `sim-vci` simulates only the battery voltage (ADR-238). So they read "cannot be established". `FixedInputs` holds fixed readings for tests.
@@ -822,6 +823,14 @@ check as well.
   table, a negative, short or long response, a wrong echo, or a field that does not fit its
   encoding reads as "cannot be decoded". ASCII text keeps surrounding spaces as they are; a
   field of only spaces, or with any byte outside 0x20 to 0x7E, cannot be decoded.
+
+A program's `ReadInput` (what `diag.precondition` lowers to for a runtime-input source,
+ADR-338) reaches the same inputs through `DiagHost::runtime_input`, which `WorkerHost`
+implements with `RuntimeInputs::read`. Only an integer reading is a value. `CannotBeEstablished`,
+`CannotBeDecoded` and a text reading are `HostError::InputNotEstablished(input)`, and so a host
+error of the job: the runner records no stop for it (it is not a `VmError`, ADR-288), the VM state
+stays at the instruction, and the job can be resumed on a VCI that can read the input. The
+restart's own checks read the same sources and still treat any non-integer reading as not met.
 
 ## The worker client
 

@@ -438,6 +438,71 @@ pub(crate) const PHYSICAL_COMPARAMS: &[&str] = &[
     "CP_CanBaudrateRecord",
 ];
 
+/// The bus framing a T0 loopback end uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Framing {
+    /// Raw CAN (`CAN`, `ISO_11898_RAW` and the worker's other CAN names, their additional
+    /// channels): bus payloads as they are.
+    RawCan,
+    /// ISO 15765 transport (`ISO15765`, `ISO-TP`, `ISO_14229_3_on_ISO_15765_2` and the other
+    /// ISO 22900-2 (2022) Annex B.1 names over ISO 15765, their additional channels), which
+    /// segments payloads.
+    Iso15765,
+}
+
+/// The framing of a T0 loopback end's `protocol`, from the names `j2534-0404-service` maps to a
+/// CAN or an ISO 15765 channel (`map_protocol_name`, matched ignoring ASCII case, and an
+/// additional channel's `_CHn` suffix); `None` for a protocol the loopback does not run on, or a
+/// name the worker would not recognise.
+fn framing(protocol: &str) -> Option<Framing> {
+    // Not `channel_key`: the worker matches the name as given, so surrounding spaces are no alias.
+    let key = protocol.to_ascii_lowercase();
+    let base = match key.rfind("_ch") {
+        // A bare `_CH` is no channel index: the worker does not recognise `CAN_CH`.
+        Some(index)
+            if !key[index + 3..].is_empty()
+                && key[index + 3..].bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            &key[..index]
+        }
+        _ => key.as_str(),
+    };
+    match base {
+        "can"
+        | "iso11898"
+        | "iso-11898"
+        | "iso_11898"
+        | "iso11898-1"
+        | "iso-11898-1"
+        | "iso_11898_1"
+        | "can_iso"
+        | "can-iso"
+        | "iso_11898_raw"
+        | "iso_11783_12_on_iso_11783_5" => Some(Framing::RawCan),
+        "iso15765"
+        | "iso-15765"
+        | "iso_15765"
+        | "iso15765-2"
+        | "iso-15765-2"
+        | "iso_15765_2"
+        | "iso15765-4"
+        | "iso-15765-4"
+        | "iso_15765_4"
+        | "iso-tp"
+        | "isotp"
+        | "iso_tp"
+        | "iso_15765_3_on_iso_15765_2"
+        | "iso_14229_3_on_iso_15765_2"
+        | "iso_14230_3_on_iso_15765_2"
+        | "sae_j2190_on_iso_15765_2"
+        | "iso_15031_5_on_iso_15765_4"
+        | "iso_14229_3_on_iso_15765_2_with_iso_11783_5"
+        | "iso_14229_3"
+        | "iso_15765_3" => Some(Framing::Iso15765),
+        _ => None,
+    }
+}
+
 /// A channel name as the J2534 worker reads it: ASCII case ignored, surrounding spaces dropped,
 /// and a `_CH` index read as a number, so `CAN_CH1`, `can_ch1` and `CAN_CH01` are one channel.
 pub(crate) fn channel_key(name: &str) -> String {
@@ -675,9 +740,55 @@ fn check_loopback(a: &Endpoint, b: &Endpoint) -> Result<(), ProfileError> {
         ));
     }
     let (x, y) = (&a.link, &b.link);
+    // A raw CAN end exchanges bus payloads as they are, while an ISO 15765 end segments and
+    // reassembles them, so a byte-for-byte loopback needs one protocol family at both ends.
+    match (framing(&x.protocol), framing(&y.protocol)) {
+        // Frame padding and extended or mixed addressing are ISO 15765 framing. The worker passes
+        // the padding TxFlag on as `TX_ISO15765_FRAME_PAD`, an ISO 15765-2 padding flag that means
+        // nothing on a raw CAN channel (SAE J2534-1 (v04.04) 8.7.3), and drops the addressing
+        // flag there, so the address byte would travel as plain payload and the check would not
+        // exercise the addressing the profile declares.
+        (Some(Framing::RawCan), Some(Framing::RawCan))
+            if x.padding.is_some()
+                || y.padding.is_some()
+                || x.addressing != Addressing::Normal
+                || y.addressing != Addressing::Normal =>
+        {
+            return Err(invalid(
+                "a raw CAN T0 loopback end takes no `padding` and only `normal` addressing: both \
+                 are ISO 15765 framing",
+            ));
+        }
+        (Some(one), Some(other)) if one == other => {}
+        (Some(_), Some(_)) => {
+            return Err(invalid(
+                "a T0 loopback's endpoints are both raw CAN or both ISO 15765 (`protocol`): the two \
+                 frame the same payload differently",
+            ));
+        }
+        _ => {
+            return Err(invalid(
+                "a T0 loopback runs on raw CAN (`CAN`, `ISO_11898_RAW`) or ISO 15765 (`ISO15765`, \
+                 `ISO_14229_3_on_ISO_15765_2`, ...) at both ends",
+            ));
+        }
+    }
     if x.baud_rate != y.baud_rate || x.id_bits != y.id_bits {
         return Err(invalid(
             "a T0 loopback's endpoints share one bus: the same `baud_rate` and `id_bits`",
+        ));
+    }
+    // A link uses one address byte for the requests it sends and for the responses it accepts
+    // (`CP_CanPhysReqExtAddr` and `CP_CanRespUSDTExtAddr`), and the J2534 worker builds a link's
+    // flow-control filter from it, so each end receives only what carries its own address: the
+    // two ends must share the addressing and the address, or every frame is dropped and the
+    // failure looks like a hardware fault.
+    if x.addressing != y.addressing
+        || (x.addressing != Addressing::Normal && x.address != y.address)
+    {
+        return Err(invalid(
+            "a T0 loopback's endpoints share one `addressing` and, when addressed, one `address`: \
+             each end accepts only frames that carry its own address byte",
         ));
     }
     if x.request_id != y.response_id || x.response_id != y.request_id {

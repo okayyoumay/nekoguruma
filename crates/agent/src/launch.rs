@@ -137,6 +137,12 @@ struct Library {
 /// A running worker and a client connected to it.
 pub struct LaunchedWorker {
     pub abi: Abi,
+    /// The library the lookup resolved and the worker loads (7.1.1).
+    pub library: PathBuf,
+    /// The `unsigned long` width the worker was started with (7.1.2): for a J2534 worker the
+    /// override, else the registration definition's `LongSize`, else the ABI's default; for a
+    /// D-PDU API worker, which takes none, the ABI's default.
+    pub long_size: u8,
     pub process: WorkerProcess,
     pub client: WorkerClient,
 }
@@ -155,23 +161,23 @@ pub async fn launch_worker(
     workers: &WorkerLayout,
     options: &LaunchOptions,
 ) -> Result<LaunchedWorker, LaunchError> {
-    let (abi, options) = match api {
+    let (library, abi, long_size, options) = match api {
         Api::J2534 => {
             let (library, abi) = resolve(vci, RESOLUTIONS, lookup_j2534, abi::detect_file)?;
-            let long_size = long_size(vci, abi, options.long_size.or(library.long_size))?;
+            let long_size = worker_long_size(vci, abi, options.long_size, &library)?;
             let options = LaunchOptions {
                 long_size: Some(long_size),
                 ..options.clone()
             };
-            (abi, options)
+            (library.path, abi, long_size, options)
         }
         Api::Dpdu => {
-            let (_, abi) = resolve(vci, RESOLUTIONS, lookup_dpdu, abi::detect_file)?;
+            let (library, abi) = resolve(vci, RESOLUTIONS, lookup_dpdu, abi::detect_file)?;
             let options = LaunchOptions {
                 long_size: None,
                 ..options.clone()
             };
-            (abi, options)
+            (library.path, abi, abi.default_long_size(), options)
         }
     };
     let binary = workers.find(api.service(), abi)?;
@@ -179,9 +185,22 @@ pub async fn launch_worker(
     let client = process.connect(&ConnectOptions::default()).await?;
     Ok(LaunchedWorker {
         abi,
+        library,
+        long_size,
         process,
         client,
     })
+}
+
+/// The width a J2534 worker for `library` is launched with: `requested` (the caller's override),
+/// else the `LongSize` of the registration definition the lookup resolved, else the ABI's default.
+fn worker_long_size(
+    vci: &str,
+    abi: Abi,
+    requested: Option<u8>,
+    library: &Library,
+) -> Result<u8, LaunchError> {
+    long_size(vci, abi, requested.or(library.long_size))
 }
 
 /// The width to launch `abi`'s worker with: `declared`, else the ABI's default (7.1.2). A
@@ -382,6 +401,27 @@ mod tests {
         assert_eq!(long_size("v", Abi::LinuxX86_64, Some(8)).unwrap(), 8);
         assert_eq!(long_size("v", Abi::LinuxArmhf, None).unwrap(), 4);
         assert_eq!(long_size("v", Abi::LinuxArmhf, Some(4)).unwrap(), 4);
+    }
+
+    #[test]
+    fn the_worker_width_is_the_override_then_the_definitions_then_the_abi_default() {
+        let library = |long_size| Library {
+            path: PathBuf::from("lib"),
+            long_size,
+        };
+        let width = |abi, requested, declared| {
+            worker_long_size("v", abi, requested, &library(declared)).unwrap()
+        };
+        // The definition's LongSize, else the ABI's default.
+        assert_eq!(width(Abi::LinuxX86_64, None, Some(4)), 4);
+        assert_eq!(width(Abi::LinuxX86_64, None, Some(8)), 8);
+        assert_eq!(width(Abi::LinuxX86_64, None, None), 8);
+        assert_eq!(width(Abi::LinuxArmhf, None, None), 4);
+        // An override of the caller wins over the definition.
+        assert_eq!(width(Abi::LinuxX86_64, Some(8), Some(4)), 8);
+        // A width the ABI cannot have is refused, from either source.
+        assert!(worker_long_size("v", Abi::LinuxX86, None, &library(Some(8))).is_err());
+        assert!(worker_long_size("v", Abi::LinuxX86, Some(8), &library(None)).is_err());
     }
 
     #[test]

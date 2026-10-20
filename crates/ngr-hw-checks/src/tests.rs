@@ -394,6 +394,118 @@ fn a_loopback_runs_between_two_ends_of_one_bus() {
     // Two modules of one library are two devices.
     let second_module = vci_end.replacen("module = \"SN-0001\"", "module = \"SN-0002\"", 1);
     parse(&loopback(vci_end, &partner(&second_module))).unwrap();
+    // One protocol family at both ends: a raw CAN end opposite an ISO 15765 end frames the same
+    // payload differently, while an additional channel of the protocol is the same family.
+    let with_protocol = |end: &str, name: &str| {
+        end.replacen("protocol = \"CAN\"", &format!("protocol = \"{name}\""), 1)
+    };
+    refused_for(
+        &loopback(
+            vci_end,
+            &partner(&with_protocol(&second_module, "ISO15765")),
+        ),
+        "both raw CAN or both ISO 15765",
+    );
+    parse(&loopback(
+        &with_protocol(vci_end, "CAN"),
+        &partner(&with_protocol(&second_module, "can_ch1")),
+    ))
+    .unwrap();
+    // Names are matched ignoring case, aliases of one family agree, and a protocol outside the
+    // two families is refused.
+    refused_for(
+        &loopback(
+            vci_end,
+            &partner(&with_protocol(&second_module, "iso15765")),
+        ),
+        "both raw CAN or both ISO 15765",
+    );
+    refused_for(
+        &loopback(vci_end, &partner(&with_protocol(&second_module, "ISO-TP"))),
+        "both raw CAN or both ISO 15765",
+    );
+    parse(&loopback(
+        &with_protocol(vci_end, "iso-tp"),
+        &partner(&with_protocol(&second_module, "ISO_14229_3_on_ISO_15765_2")),
+    ))
+    .unwrap();
+    parse(&loopback(
+        vci_end,
+        &partner(&with_protocol(&second_module, "ISO_11898_RAW")),
+    ))
+    .unwrap();
+    parse(&loopback(
+        vci_end,
+        &partner(&with_protocol(
+            &second_module,
+            "ISO_11783_12_on_ISO_11783_5",
+        )),
+    ))
+    .unwrap();
+    parse(&loopback(
+        &with_protocol(vci_end, "ISO15765"),
+        &partner(&with_protocol(
+            &second_module,
+            "ISO_14229_3_on_ISO_15765_2_with_ISO_11783_5",
+        )),
+    ))
+    .unwrap();
+    // A name the worker does not map, such as `CAN_PS`, is refused before any device opens.
+    refused_for(
+        &loopback(vci_end, &partner(&with_protocol(&second_module, "CAN_PS"))),
+        "runs on raw CAN",
+    );
+    refused_for(
+        &loopback(
+            &with_protocol(vci_end, "ISO9141"),
+            &partner(&with_protocol(&second_module, "ISO9141")),
+        ),
+        "runs on raw CAN",
+    );
+    // Frame padding is ISO 15765 framing, so a raw CAN end takes none.
+    refused_for(
+        &loopback(
+            &with_protocol(vci_end, "CAN").replacen(
+                "addressing = \"normal\"",
+                "addressing = \"normal\"\npadding = 0xCC",
+                1,
+            ),
+            &partner(&with_protocol(&second_module, "CAN")),
+        ),
+        "takes no `padding`",
+    );
+    // So is extended addressing.
+    refused_for(
+        &loopback(
+            &with_protocol(vci_end, "CAN").replacen(
+                "addressing = \"normal\"",
+                "addressing = \"extended\"\naddress = 0x10",
+                1,
+            ),
+            &partner(&with_protocol(&second_module, "CAN")).replacen(
+                "addressing = \"normal\"",
+                "addressing = \"extended\"\naddress = 0x10",
+                1,
+            ),
+        ),
+        "only `normal` addressing",
+    );
+    // The worker does not trim a protocol name, so `" CAN "` is no CAN name.
+    refused_for(
+        &loopback(
+            &with_protocol(vci_end, " CAN "),
+            &partner(&with_protocol(&second_module, " CAN ")),
+        ),
+        "runs on raw CAN",
+    );
+    // A bare `_CH` names no channel index, and the worker does not map `CAN_CH`.
+    refused_for(
+        &loopback(
+            &with_protocol(vci_end, "CAN_CH"),
+            &partner(&with_protocol(&second_module, "CAN_CH")),
+        ),
+        "runs on raw CAN",
+    );
 
     // J2534 names its module by the configured entry: the same label or `pname` is one device,
     // and two entries reporting the same `module` are two.
@@ -448,6 +560,35 @@ fn a_loopback_runs_between_two_ends_of_one_bus() {
     refused_for(&rate, "one bus");
     let width = T0_PROFILE.replacen("id_bits = 11", "id_bits = 29", 1);
     refused_for(&width, "one bus");
+    // The two ends share the addressing and, when addressed, the address byte (over ISO 15765:
+    // a raw CAN end takes only normal addressing).
+    let iso15765 = T0_PROFILE.replace("protocol = \"CAN\"", "protocol = \"ISO15765\"");
+    let extended_both = |a: &str, b: &str| {
+        let first = iso15765.replacen(
+            "addressing = \"normal\"",
+            &format!("addressing = \"extended\"\naddress = {a}"),
+            1,
+        );
+        first.replacen(
+            "addressing = \"normal\"",
+            &format!("addressing = \"extended\"\naddress = {b}"),
+            1,
+        )
+    };
+    parse(&extended_both("0x55", "0x55")).unwrap();
+    refused_for(&extended_both("0x10", "0xF1"), "share one `addressing`");
+    let one_extended = iso15765.replacen(
+        "addressing = \"normal\"",
+        "addressing = \"extended\"\naddress = 0x55",
+        1,
+    );
+    refused_for(&one_extended, "share one `addressing`");
+    let mixed_and_extended = extended_both("0x55", "0x55").replacen(
+        "addressing = \"extended\"",
+        "addressing = \"mixed\"",
+        1,
+    );
+    refused_for(&mixed_and_extended, "share one `addressing`");
     let not_crossed = T0_PROFILE.replacen("request_id = 0x124", "request_id = 0x125", 1);
     refused_for(&not_crossed, "receives on the identifier");
 }
@@ -535,6 +676,39 @@ fn a_hardware_check_without_a_profile_fails() {
         })
     ));
     assert_eq!(start(&READ, Ok(t3.clone())), Ok(t3));
+}
+
+/// The first hardware check (design 13.5): listed for a T0 profile, refused on every other class,
+/// and it fails without a profile.
+#[test]
+fn the_t0_loopback_check_is_listed_for_t0_and_refused_elsewhere() {
+    assert!(CHECKS.contains(&T0_LOOPBACK_CHECK));
+    assert_eq!(T0_LOOPBACK_CHECK.name, "hw_t0_two_endpoint_loopback");
+    let t0 = parse(T0_PROFILE).unwrap();
+    assert_eq!(
+        listing(&t0, &[T0_LOOPBACK_CHECK]),
+        "hw_t0_two_endpoint_loopback: permitted\n"
+    );
+    assert_eq!(start(&T0_LOOPBACK_CHECK, Ok(t0.clone())), Ok(t0));
+    for class in ["T1", "T2", "T3"] {
+        let profile = parse(&profile(class, "")).unwrap();
+        assert_eq!(
+            listing(&profile, &[T0_LOOPBACK_CHECK]),
+            format!(
+                "hw_t0_two_endpoint_loopback: refused: the check runs on [T0], not on the \
+                 profile's {class}\n"
+            )
+        );
+        assert!(matches!(
+            start(&T0_LOOPBACK_CHECK, Ok(profile)),
+            Err(StartError::Refused { .. })
+        ));
+    }
+    // Without a profile it does not start.
+    assert_eq!(
+        start(&T0_LOOPBACK_CHECK, Err(ProfileError::NotSet)),
+        Err(StartError::Profile(ProfileError::NotSet))
+    );
 }
 
 #[test]

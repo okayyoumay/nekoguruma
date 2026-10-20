@@ -195,6 +195,7 @@ mod startcomm_comparam;
 mod startcomm_optional_message_tx;
 mod stopcomm_data_tx;
 mod sw_can;
+mod t0_loopback_check;
 mod tester_present_addr_mode;
 mod tester_present_message_length;
 mod tester_present_reqrsp;

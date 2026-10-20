@@ -127,5 +127,16 @@ the D-PDU/ISO 14229 standard meaning of the parameter.
   protocol, and adding new TX-scheduling behavior was out of scope for this
   fix) — **amended by ADR-060**, which implements the actual gap
   enforcement these two ComParams configure.
-- `CP_P2Star_Ecu`/`CP_P2Max_Ecu` remain stored-only with no per-ECU
-  override mechanism — also out of scope for this fix.
+- `CP_P2Star_Ecu`/`CP_P2Max_Ecu` remain stored-only, and this is the
+  intended end state, not a gap. ISO 22900-2 (2022) describes both as
+  performance requirements on the *server* (how soon the ECU must start
+  its response, and its enhanced-timing response after an RC 0x78), with
+  notes that each must be smaller than the client's `CP_P2Max` /
+  `CP_P2Star` by the CAN transmission time (the 2009 edition's
+  descriptions say the same). They bound what an ECU must do; they are
+  not tester timeouts and not per-ECU overrides of the client's values.
+  The tester-side waits are already `CP_P2Max` (ADR-053) and `CP_P2Star`
+  (ADR-102). `j2534-0404-service` is the tester and never plays the
+  server, so no code path consumes an ECU-side value. Reconsider only if
+  the service gains an ECU-simulation role or a validation of the
+  Ecu < client relation.

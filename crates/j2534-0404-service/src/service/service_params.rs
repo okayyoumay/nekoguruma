@@ -75,10 +75,12 @@ pub(super) const PARAM_CYCLIC_RESP_TIMEOUT: ComParamId = ComParamId(0x8010);
 /// for the independent total-duration ceiling.
 pub(super) const PARAM_P2_STAR: ComParamId = ComParamId(0x8011);
 
-/// ECU-side extended response-waiting time P2* in ms (D-PDU CP_P2Star_Ecu).
+/// ECU-side extended response-waiting time P2* (D-PDU CP_P2Star_Ecu). Stored
+/// only, by design: a server-side requirement, not a tester timeout (ADR-056).
 pub(super) const PARAM_P2_STAR_ECU: ComParamId = ComParamId(0x8012);
 
-/// ECU-side P2Max timing in ms (D-PDU CP_P2Max_Ecu).
+/// ECU-side P2Max timing (D-PDU CP_P2Max_Ecu). Stored only, by design; see
+/// `PARAM_P2_STAR_ECU`.
 pub(super) const PARAM_P2_MAX_ECU: ComParamId = ComParamId(0x8013);
 
 /// Enable/disable dynamic timing modification (D-PDU CP_ModifyTiming).

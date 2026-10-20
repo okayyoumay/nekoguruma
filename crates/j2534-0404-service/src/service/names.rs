@@ -3101,6 +3101,8 @@ impl J2534Service {
             "cp_p3phys" => Some(PARAM_P3_PHYS),
             "cp_p3func" => Some(PARAM_P3_FUNC),
             "cp_p2star" => Some(PARAM_P2_STAR),
+            // ECU-only (ISO 22900-2 (2022) B.3.4/B.3.5, Table B.10): the name still
+            // resolves, `comparam_support::is_ecu_only_param` refuses the set/get.
             "cp_p2star_ecu" => Some(PARAM_P2_STAR_ECU),
             "cp_p2max_ecu" => Some(PARAM_P2_MAX_ECU),
             "cp_modifytiming" => Some(PARAM_MODIFY_TIMING),

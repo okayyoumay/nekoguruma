@@ -41,6 +41,8 @@
 //!   resume paths (ADR-147)
 //! - [`p3_gap`] — `CP_P3Func`/`CP_P3Phys` minimum inter-request gap
 //!   enforcement on CAN (ADR-060)
+//! - [`ecu_only_comparams`] — `CP_P2Max_Ecu`/`CP_P2Star_Ecu` refused with
+//!   `PDU_ERR_COMPARAM_NOT_SUPPORTED` on every protocol (ADR-056)
 //! - [`connect_flags`] — `PassThruConnect` `Flags` derivation from Working
 //!   ComParams / `UniqueRespIdTable` (ADR-065)
 //! - [`clear_msg_filters`] — `CLEAR_MSG_FILTERS` IoCtl filter rebuild on
@@ -160,6 +162,7 @@ mod concat;
 mod connect_flags;
 mod cop_ctrl_cycles;
 mod cop_tag;
+mod ecu_only_comparams;
 mod ethernet_ndis;
 mod fault_tolerant_can;
 mod fd_can;

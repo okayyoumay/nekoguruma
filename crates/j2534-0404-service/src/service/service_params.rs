@@ -75,12 +75,14 @@ pub(super) const PARAM_CYCLIC_RESP_TIMEOUT: ComParamId = ComParamId(0x8010);
 /// for the independent total-duration ceiling.
 pub(super) const PARAM_P2_STAR: ComParamId = ComParamId(0x8011);
 
-/// ECU-side extended response-waiting time P2* (D-PDU CP_P2Star_Ecu). Stored
-/// only, by design: a server-side requirement, not a tester timeout (ADR-056).
+/// ECU-side extended response-waiting time P2* (D-PDU CP_P2Star_Ecu). ECU-only
+/// (ISO 22900-2 (2022) B.3.4, B.3.5, Table B.10; 2009 B.3.4, B.3.5, Tables
+/// B.10/B.19): `comparam_support` refuses it on every protocol. The id stays
+/// minted so the name lookup still resolves it (ADR-056).
 pub(super) const PARAM_P2_STAR_ECU: ComParamId = ComParamId(0x8012);
 
-/// ECU-side P2Max timing (D-PDU CP_P2Max_Ecu). Stored only, by design; see
-/// `PARAM_P2_STAR_ECU`.
+/// ECU-side P2Max timing (D-PDU CP_P2Max_Ecu). ECU-only and refused on every
+/// protocol, like `PARAM_P2_STAR_ECU`.
 pub(super) const PARAM_P2_MAX_ECU: ComParamId = ComParamId(0x8013);
 
 /// Enable/disable dynamic timing modification (D-PDU CP_ModifyTiming).

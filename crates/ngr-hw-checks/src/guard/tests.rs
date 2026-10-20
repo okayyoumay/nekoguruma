@@ -676,6 +676,8 @@ fn unknown_and_vendor_comparams_are_refused_whatever_their_class() {
         "CP_SamplesPerBit",
         "CP_W1Max",
         "CP_P3Min",
+        "CP_P2Max_Ecu",
+        "CP_P2Star_Ecu",
         "CP_SwCan_HighVoltage",
         "CP_J1939SourceAddress",
         "CP_CanFirstConsecutiveFrameValue",
@@ -706,8 +708,6 @@ fn each_allow_listed_comparam_passes() {
     for name in [
         "CP_P2Max",
         "CP_P2Star",
-        "CP_P2Max_Ecu",
-        "CP_P2Star_Ecu",
         "CP_P3Phys",
         "CP_P3Func",
         "CP_CyclicRespTimeout",

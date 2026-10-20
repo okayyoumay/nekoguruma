@@ -82,13 +82,12 @@ pub fn canonical(name: &str) -> String {
 /// and tester-present classes, and the transport layer of ISO 15765-2 (2024) clause 10). The
 /// ComParams with a rule (identifiers, formats, addresses, filler, address modes, the
 /// tester-present message, the baud rate) are not here, and neither is anything else: a name
-/// that is on no list is refused.
+/// that is on no list is refused. `CP_P2Max_Ecu` and `CP_P2Star_Ecu` are left out too: they
+/// are ECU-only (2022 B.3.4, B.3.5, Table B.10) and the service refuses them.
 pub const ALLOWED: &[&str] = &[
     // Session timing.
     "cp_p2max",
     "cp_p2star",
-    "cp_p2max_ecu",
-    "cp_p2star_ecu",
     "cp_p3phys",
     "cp_p3func",
     "cp_cyclicresptimeout",

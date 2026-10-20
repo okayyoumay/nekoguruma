@@ -1244,6 +1244,10 @@ fn primitive_classification_covers_every_instruction() {
         Op::ShlChecked,
         Op::WaitFromStack,
         Op::LogFromStack { level: 0 },
+        Op::FlashBlock {
+            session: 0,
+            segment: 0,
+        },
     ];
     for (index, op) in all.iter().enumerate() {
         // The postcard encoding starts with the variant index, so this also pins the variant

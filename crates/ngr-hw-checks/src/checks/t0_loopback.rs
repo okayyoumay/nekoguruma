@@ -234,10 +234,10 @@ pub async fn run(
             let (receiver, to_cll) = end_of(&mut ends, to)?;
             match receiver.raw_drain(to_cll).await {
                 Ok(()) => {}
-                Err(HandleError::RawBufferFull { cap }) => {
+                Err(HandleError::NotQuiet) => {
                     return Err(CheckError::Frame(format!(
-                        "end {to} kept receiving unrelated frames (more than {cap} at a time); \
-                         the bus is not a quiet loopback"
+                        "end {to} kept receiving frames before the {len}-byte send; the bus is \
+                         not a quiet loopback"
                     )));
                 }
                 Err(error) => return Err(error.into()),

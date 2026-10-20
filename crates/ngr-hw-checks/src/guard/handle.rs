@@ -176,6 +176,9 @@ pub enum HandleError {
     /// The monitor's buffer is full of frames nobody asked for.
     #[error("the link's monitor received more than {cap} unrelated frames")]
     RawBufferFull { cap: usize },
+    /// The monitor kept receiving frames while it was drained: the link was never quiet.
+    #[error("the link never went quiet while its monitor was drained")]
+    NotQuiet,
     /// The primitive failed with this D-PDU error event code.
     #[error("the primitive failed with error event {0:#x}")]
     PrimitiveFailed(i32),
@@ -2043,27 +2046,30 @@ impl GuardedHandle {
     }
 
     /// Discards what the monitor of `cll` has received so far: the frames already buffered, and
-    /// those its events deliver until the link stays quiet for 50 ms. A check calls it before a
+    /// those its events deliver until a 50 ms window passes with no frame. A check calls it before a
     /// send, so a frame received afterwards cannot be an earlier copy of the one it awaits.
+    /// [`HandleError::NotQuiet`] when the link has not gone quiet within about 2 s.
     pub async fn raw_drain(&mut self, cll: ComLogicalLinkHandle) -> Result<(), HandleError> {
         const QUIET: Duration = Duration::from_millis(50);
-        // A busy bus can fill the buffer while it drains; each full buffer is discarded in turn.
-        for _ in 0..8 {
+        const TRIES: usize = 40;
+        for _ in 0..TRIES {
             self.shared.lock().raw_frames.remove(&cll.cll_handle);
-            // An empty frame is never received, so the wait only buffers what arrives.
+            // An empty frame is never received, so the wait only buffers what arrives; a window
+            // that buffered nothing is the quiet interval.
             match self.raw_wait(cll, RawWait::Frame(&[]), QUIET).await {
-                Err(HandleError::NoResponse) => {
-                    self.shared.lock().raw_frames.remove(&cll.cll_handle);
-                    return Ok(());
-                }
-                Err(HandleError::RawBufferFull { .. }) => continue,
+                Err(HandleError::NoResponse) | Err(HandleError::RawBufferFull { .. }) | Ok(_) => {}
                 Err(error) => return Err(error),
-                Ok(_) => continue,
+            }
+            let mut state = self.shared.lock();
+            let received = state
+                .raw_frames
+                .remove(&cll.cll_handle)
+                .is_some_and(|frames| !frames.is_empty());
+            if !received {
+                return Ok(());
             }
         }
-        Err(HandleError::RawBufferFull {
-            cap: RAW_BUFFER_CAP,
-        })
+        Err(HandleError::NotQuiet)
     }
 
     /// Reads the link's events until `wait` is met or `timeout` passes: the monitor's frames go

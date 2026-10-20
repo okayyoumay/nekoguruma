@@ -1399,6 +1399,21 @@ async fn a_raw_monitor_returns_the_expected_frame_and_buffers_the_others() {
         .raw_receive(cll, &early, std::time::Duration::from_millis(300))
         .await;
     assert_eq!(gone, Err(HandleError::NoResponse));
+    // A link that keeps receiving never goes quiet: the drain says so instead of returning.
+    let chatter = can_frame(0x123, &[0x0D]);
+    let library = j2534_0404_mock::mock_library_path().expect("the mock");
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stopped = std::sync::Arc::clone(&stop);
+    let noise = tokio::spawn(async move {
+        let backdoor = MockBackdoor::open(&library);
+        while !stopped.load(std::sync::atomic::Ordering::Relaxed) {
+            backdoor.inject_rx(MOCK_CHANNEL_ID, &chatter, j2534_0404::ISO15765);
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    });
+    assert_eq!(handle.raw_drain(cll).await, Err(HandleError::NotQuiet));
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    noise.await.unwrap();
     drop(handle);
     run.pass();
     // The closing cancels the monitor.

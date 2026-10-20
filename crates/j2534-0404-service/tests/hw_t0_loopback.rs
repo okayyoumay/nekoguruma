@@ -76,6 +76,18 @@ fn vci_ends(profile: &Profile) -> Result<[Vci; 2], String> {
                  creates no additional-channel link yet, so each end uses its module's base channel"
             ));
         }
+        // The same holds for an additional channel named in the link's `protocol` (`..._CH1`).
+        let protocol = end.link.protocol.to_ascii_uppercase();
+        if let Some(index) = protocol.rfind("_CH")
+            && !protocol[index + 3..].is_empty()
+            && protocol[index + 3..].bytes().all(|b| b.is_ascii_digit())
+        {
+            return Err(format!(
+                "endpoint {at}'s protocol {:?} names an additional channel; the guarded handle \
+                 creates no additional-channel link yet, so each end uses its base protocol",
+                end.link.protocol
+            ));
+        }
         match &end.vci {
             Some(vci) if vci.api == Api::J2534V0404 => found.push(vci.clone()),
             Some(_) => {

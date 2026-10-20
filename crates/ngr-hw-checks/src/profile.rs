@@ -463,8 +463,17 @@ fn framing(protocol: &str) -> Option<Framing> {
         _ => key.as_str(),
     };
     match base {
-        "can" | "iso11898" | "iso-11898" | "iso_11898" | "iso11898-1" | "iso-11898-1"
-        | "iso_11898_1" | "can_iso" | "can-iso" | "iso_11898_raw" => Some(Framing::RawCan),
+        "can"
+        | "iso11898"
+        | "iso-11898"
+        | "iso_11898"
+        | "iso11898-1"
+        | "iso-11898-1"
+        | "iso_11898_1"
+        | "can_iso"
+        | "can-iso"
+        | "iso_11898_raw"
+        | "iso_11783_12_on_iso_11783_5" => Some(Framing::RawCan),
         "iso15765"
         | "iso-15765"
         | "iso_15765"

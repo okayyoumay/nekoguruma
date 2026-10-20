@@ -435,6 +435,14 @@ fn a_loopback_runs_between_two_ends_of_one_bus() {
     ))
     .unwrap();
     parse(&loopback(
+        vci_end,
+        &partner(&with_protocol(
+            &second_module,
+            "ISO_11783_12_on_ISO_11783_5",
+        )),
+    ))
+    .unwrap();
+    parse(&loopback(
         &with_protocol(vci_end, "ISO15765"),
         &partner(&with_protocol(
             &second_module,

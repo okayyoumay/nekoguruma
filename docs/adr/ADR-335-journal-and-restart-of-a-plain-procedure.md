@@ -73,8 +73,11 @@ What a decision has to work with:
      identity.
 
    A pc outside every section counts as not `Safe` for S, as ADR-271's continuation rule reads
-   it, and as an interruptible point for I. This is ADR-271 item 4's all-`Safe` continuation
-   rule applied from a checkpoint instead of from a plan's end.
+   it. I is exactly the runner's interruptible-point marking of ADR-330: a pc outside every
+   section is an interruptible point except a `Ret` (ADR-330 item 2), so a checkpoint standing on
+   the return after a `No` section's last primitive is not one, and the job ends on site
+   (uninterruptible section) as item 5 requires. This is ADR-271 item 4's all-`Safe`
+   continuation rule applied from a checkpoint instead of from a plan's end.
 4. **The primitive in flight.** A `Safe` primitive has no `Request`, so the resumed or repeated
    run runs it again. An `Unsafe` or `CheckState` primitive in flight gives `UnconfirmedRequest`.
    Every later resume decides it again before it counts one, so it holds until a person acts, as
@@ -147,6 +150,7 @@ Rejected alternatives:
   when the 4.6 table is revisited together with the restart-declaration syntax.
 - The handover summary (design 8.2.5) gains the new facts but no VM state. A receiving device
   can make a plain start or ends on site.
+- ADR-244's record set gains `Checkpoint` and `Request`.
 - ADR-325 item 7's journal condition (any combination with a flash plan or a recovery-required
   section) becomes every journaled job; a missing journal of a job with several combinations is a
   plain start only when every combination meets item 1's condition.

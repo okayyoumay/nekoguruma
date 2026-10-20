@@ -471,9 +471,10 @@ five; a session no plan names may leave them empty.
 | `data_format` | integer, 0x00 to 0xFF | no | ADR-336: the dataFormatIdentifier of the RequestDownload built from the segment, default 0x00 |
 | `address_and_length_format` | integer, 0x00 to 0xFF | no | ADR-336: the addressAndLengthFormatIdentifier, default 0x44; its nibbles give the widths of the address and length (ISO 14229-1 (2026) 14.2.2.3), and a value that does not fit is a conversion error |
 
-The two format bytes are kept on the segment's row; the converter does not write them into
-`FlashSegment` (`ir.fbs` has no field for them), and the RequestDownload that a plan's
-`diag.flash_transfer` expands to is built from them.
+The RequestDownload that a plan's `diag.flash_transfer` expands to is built from the two format
+bytes. **Target contract (ADR-336 item 1).** They become the `FlashSegment` fields `data_format`
+and `address_and_length_format`, appended to `ir.fbs` with defaults; until the schema has them,
+the converter reads and checks the columns and keeps the values on the segment's row.
 
 Under ADR-336, `block_size` is the payload of one TransferData request. `block_size + 2` must not
 exceed the ECU's maxNumberOfBlockLength (14.2.3.2), and the lowering refuses a `block_size` above

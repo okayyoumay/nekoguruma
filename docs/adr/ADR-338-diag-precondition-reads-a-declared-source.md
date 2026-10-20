@@ -73,9 +73,9 @@ Open choices:
    resumed after (ADR-288); so is a failure to reach the worker. Today the host has a source for
    the supply voltage only (`inputs.rs`), so a procedure that reads another input ends in that
    error. A D-PDU worker that does not know `READ_VBATT` answers the lookup with an internal
-   error, which the read maps to `CannotBeEstablished` as a J2534 worker's not-found already is
-   (without caching it, since an internal error may pass); the restart's checks treat both as
-   not met, as before. For a runtime input, the restart's checks and the instruction read through
+   error, which stays that worker's `HostError`: the worker cannot tell an unknown name from
+   another vendor failure there, so the agent does not read it as a missing input. Either way
+   the job can be resumed, and the restart's checks treat both as not met, as before. For a runtime input, the restart's checks and the instruction read through
    the same `RuntimeInputs`, so they cannot disagree about a value. For a service source they
    can differ in how the same field reads: the call decodes it through the declaration, while the
    restart check reads the raw unsigned value through the agent's source table and, for its

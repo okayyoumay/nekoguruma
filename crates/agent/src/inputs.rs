@@ -167,8 +167,8 @@ fn vbatt_lookup(found: Result<u32, HostError>) -> Result<VbattId, HostError> {
 /// Reads the supply voltage from the VCI of `link`. The IOCTL id is resolved by name on the
 /// first call and kept in `cached`, together with an "unsupported" outcome. When the J2534
 /// worker does not know the name, the VCI offers no voltage: [`Reading::CannotBeEstablished`].
-/// A D-PDU worker reports an unknown name as an internal error: that is the same outcome for
-/// this call, but it is not cached, since an internal error may be a passing fault. Blocks on `handle`, like the host's other primitives.
+/// A D-PDU worker reports an unknown name as an internal error, which stays a [`HostError`]
+/// (it fails the check all the same). Blocks on `handle`, like the host's other primitives.
 pub(crate) fn read_supply_voltage<C: WorkerApi>(
     handle: &Handle,
     client: &mut C,
@@ -188,11 +188,6 @@ pub(crate) fn read_supply_voltage<C: WorkerApi>(
                 client.get_object_id(request),
             ))
             .map(|response| response.pdu_object_id);
-        if let Err(HostError::Rpc { status, .. }) = &found
-            && status.code() == tonic::Code::Internal
-        {
-            return Ok(Reading::CannotBeEstablished);
-        }
         *cached = vbatt_lookup(found)?;
     }
     let id = match *cached {

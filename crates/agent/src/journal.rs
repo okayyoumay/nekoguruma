@@ -139,6 +139,11 @@ pub struct RecoveryFacts {
     /// A run stopped on the step limit or on an instruction the VM refused (ADR-288). Terminal
     /// like `procedure_failed`: no record follows it, and a restart does not resume the job.
     pub run_stopped: Option<StoppedRun>,
+    /// The first request journaled before a primitive outside the plans that is not safe to
+    /// repeat (ADR-335 item 2). `None` when the job sent none.
+    pub first_request: Option<StepRef>,
+    /// The newest such request.
+    pub last_request: Option<StepRef>,
 }
 
 /// Why a run stopped without reaching the program's end or a `Fail` (ADR-288).
@@ -185,6 +190,8 @@ impl RecoveryFacts {
             procedure_failed: None,
             identity_mismatch: None,
             run_stopped: None,
+            first_request: None,
+            last_request: None,
         }
     }
 
@@ -344,6 +351,28 @@ impl RecoveryFacts {
                 }
                 self.last_intent = Some(*at);
             }
+            Record::Checkpoint { at, .. } => {
+                // It names no request and changes no fact; only its place is checked.
+                if !after_last_step(at, self) {
+                    return Err("a checkpoint must come after the last step");
+                }
+                // The request marker and the checkpoint of one primitive share a step count, so
+                // the relation is not strict. (The order against the latest checkpoint, which the
+                // facts do not hold, is `JournalState::checkpoint_in_order`.)
+                if self.last_request.is_some_and(|last| at.steps < last.steps) {
+                    return Err("a checkpoint must not precede the last request");
+                }
+            }
+            Record::Request { at } => {
+                if !after_last_step(at, self) {
+                    return Err("a request must come after the last step");
+                }
+                if self.last_request.is_some_and(|last| at.steps <= last.steps) {
+                    return Err("requests must come in step order");
+                }
+                self.first_request.get_or_insert(*at);
+                self.last_request = Some(*at);
+            }
             Record::PostTransferComplete => {
                 let exit = self.open_transfer().and_then(|t| t.exit.as_mut()).ok_or(
                     "post-transfer completion needs RequestTransferExit in an open transfer",
@@ -438,6 +467,12 @@ pub struct JournalState {
     /// plan and every run that starts from a restored entry state commits a run start
     /// (ADR-274). Memory stays bounded however long a loop runs.
     pub previous_vm_state: Option<(StepRef, Vec<u8>)>,
+    /// The newest VM state of any record that carries one: a checkpoint, a run start or a step
+    /// with a state (ADR-335 item 2). Unlike the two above it follows the checkpoints of a
+    /// plain procedure, which they do not (the flash-plan restart reads those only). A
+    /// checkpoint and a step are at the step they completed, a run start at the step count it
+    /// starts at.
+    pub latest_checkpoint: Option<(StepRef, Vec<u8>)>,
     /// Records in the journal.
     pub records: u64,
 }
@@ -499,6 +534,17 @@ enum Record {
     RunStopped {
         at: StepRef,
         reason: RunStop,
+    },
+    /// The VM state after the diagnostic primitive at `at`, outside every plan's range
+    /// (ADR-335 item 2). Changes no fact; the state folds into `latest_checkpoint` only.
+    Checkpoint {
+        at: StepRef,
+        vm_state: Vec<u8>,
+    },
+    /// A request the primitive at `at` is about to send, committed before it: a primitive
+    /// outside the plans that is not safe to repeat (ADR-335 item 2).
+    Request {
+        at: StepRef,
     },
 }
 
@@ -688,6 +734,7 @@ impl Journal<FileStore> {
                 facts,
                 last_vm_state: None,
                 previous_vm_state: None,
+                latest_checkpoint: None,
                 records,
             },
             poisoned: false,
@@ -769,6 +816,7 @@ impl<S: Store> Journal<S> {
                 facts: RecoveryFacts::new(key),
                 last_vm_state: None,
                 previous_vm_state: None,
+                latest_checkpoint: None,
                 records: 0,
             },
             poisoned: false,
@@ -919,11 +967,33 @@ impl<S: Store> Journal<S> {
         self.commit(Record::RunStopped { at, reason })
     }
 
+    /// Records the VM state after the diagnostic primitive at `at`, outside every plan's range
+    /// (ADR-335 item 2), unless the step carries a boundary state already.
+    pub fn commit_checkpoint(&mut self, at: StepRef, vm_state: &[u8]) -> Result<(), JournalError> {
+        if vm_state.len() > MAX_FRAME as usize {
+            return Err(JournalError::TooLarge);
+        }
+        self.commit(Record::Checkpoint {
+            at,
+            vm_state: vm_state.to_vec(),
+        })
+    }
+
+    /// A request marker, committed before a primitive outside the plans that is not safe to
+    /// repeat is sent, so a crash before its response still shows that it may have been
+    /// (ADR-335 item 2).
+    pub fn commit_request(&mut self, at: StepRef) -> Result<(), JournalError> {
+        self.commit(Record::Request { at })
+    }
+
     fn commit(&mut self, record: Record) -> Result<(), JournalError> {
         if self.poisoned {
             return Err(JournalError::Poisoned);
         }
         creation_prefix_allowed(&record, self.state.records, &self.state.facts)
+            .map_err(JournalError::Invariant)?;
+        self.state
+            .checkpoint_in_order(&record)
             .map_err(JournalError::Invariant)?;
         let mut facts = self.state.facts.clone();
         facts.apply(&record).map_err(JournalError::Invariant)?;
@@ -946,8 +1016,22 @@ impl<S: Store> Journal<S> {
 }
 
 impl JournalState {
+    /// Whether `record` keeps the checkpoints in order: a checkpoint is not behind the latest
+    /// state record (a run start, a step with a state, or a checkpoint). A checkpoint and the
+    /// run start or checkpoint before it can share a step count, so the relation is not strict.
+    fn checkpoint_in_order(&self, record: &Record) -> Result<(), &'static str> {
+        match (record, &self.latest_checkpoint) {
+            (Record::Checkpoint { at, .. }, Some((last, _))) if at.steps < last.steps => {
+                Err("a checkpoint must not precede the latest checkpoint")
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Takes the VM state `record` carries, a step's or a run start's, as the newest one; the
-    /// one it replaces becomes the previous one.
+    /// one it replaces becomes the previous one. A checkpoint's state is not one of these (the
+    /// flash-plan restart reads them, ADR-335 item 2); it and the others fold into
+    /// `latest_checkpoint`.
     fn fold_vm_state(&mut self, record: Record) {
         match record {
             Record::Step {
@@ -955,7 +1039,11 @@ impl JournalState {
                 vm_state: Some(vm_state),
             }
             | Record::RunStart { at, vm_state } => {
+                self.latest_checkpoint = Some((at, vm_state.clone()));
                 self.previous_vm_state = self.last_vm_state.replace((at, vm_state));
+            }
+            Record::Checkpoint { at, vm_state } => {
+                self.latest_checkpoint = Some((at, vm_state));
             }
             _ => {}
         }
@@ -1101,6 +1189,7 @@ fn load(bytes: &[u8], key: &JobKey) -> Result<Loaded, JournalError> {
         facts: RecoveryFacts::new(header.key),
         last_vm_state: None,
         previous_vm_state: None,
+        latest_checkpoint: None,
         records: 0,
     };
     let mut offset = next;
@@ -1123,6 +1212,9 @@ fn load(bytes: &[u8], key: &JobKey) -> Result<Loaded, JournalError> {
             return Err(corrupt(offset, "a record is out of sequence"));
         }
         creation_prefix_allowed(&entry.record, state.records, &state.facts)
+            .map_err(|reason| corrupt(offset, reason))?;
+        state
+            .checkpoint_in_order(&entry.record)
             .map_err(|reason| corrupt(offset, reason))?;
         state
             .facts
@@ -1240,9 +1332,28 @@ mod tests {
 
     const STAGE: StageId = StageId(1);
 
+    /// A store that keeps nothing, for tests of the folds.
+    struct NullStore;
+
+    impl Store for NullStore {
+        fn append_sync(&mut self, _: &[u8]) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
     /// Every kind of commit, in a write job's order, with a second attempt and a procedure failure
     /// at the end.
-    fn script<S: Store>(journal: &mut Journal<S>, mut after_each: impl FnMut(&Journal<S>)) {
+    fn script<S: Store>(journal: &mut Journal<S>, after_each: impl FnMut(&Journal<S>)) {
+        script_of(journal, false, after_each);
+    }
+
+    /// [`script`], and with `new_records` a request marker and a checkpoint (ADR-335) after the
+    /// first step and again before the second attempt's step, in step order.
+    fn script_of<S: Store>(
+        journal: &mut Journal<S>,
+        new_records: bool,
+        mut after_each: impl FnMut(&Journal<S>),
+    ) {
         type Commit<S> = fn(&mut Journal<S>) -> Result<(), JournalError>;
         let commits: [Commit<S>; 15] = [
             |j| j.commit_ecu_hardware_part_number(b"HW-1"),
@@ -1262,6 +1373,14 @@ mod tests {
             // The job's last record (ADR-280).
             |j| j.commit_procedure_failed(at(6, 40), "ERASE_REFUSED", "detail"),
         ];
+        let mut commits = Vec::from(commits);
+        if new_records {
+            // The later pair first, so the indexes stay those of the base script.
+            commits.insert(12, |j| j.commit_checkpoint(at(9, 32), b"cp-2"));
+            commits.insert(12, |j| j.commit_request(at(9, 31)));
+            commits.insert(3, |j| j.commit_checkpoint(at(8, 13), b"cp-1"));
+            commits.insert(3, |j| j.commit_request(at(8, 12)));
+        }
         for commit in commits {
             commit(journal).expect("the script commits");
             after_each(journal);
@@ -1311,16 +1430,172 @@ mod tests {
         );
     }
 
+    /// The checkpoint and request records read back as written (ADR-335 item 2).
+    #[test]
+    fn reads_back_the_checkpoints_and_requests() {
+        let dir = TempDir::new();
+        let mut journal = Journal::create(&dir.0, &key(), None, None).expect("create");
+        script_of(&mut journal, true, |_| {});
+        let state = journal.state().clone();
+        drop(journal);
+        let reopened = Journal::open(&dir.0, &key()).expect("open");
+        assert_eq!(reopened.state(), &state);
+        assert_eq!(state.records, 19);
+        assert_eq!(state.facts.first_request, Some(at(8, 12)));
+        assert_eq!(state.facts.last_request, Some(at(9, 31)));
+        // The second attempt's step carries a newer state than the checkpoints.
+        assert_eq!(state.latest_checkpoint, Some((at(3, 30), b"vm-2".to_vec())));
+    }
+
+    /// The new records add facts and change none of the flash plan's (ADR-335 item 2): the
+    /// journal of the script with them folds to the same facts and states as without, apart
+    /// from the request facts and the newest state in between.
+    #[test]
+    fn the_new_records_change_no_flash_plan_fact() {
+        let mut plain = Journal::on_store(NullStore, key());
+        let mut plain_states = Vec::new();
+        script_of(&mut plain, false, |j| plain_states.push(j.state().clone()));
+        let mut extended = Journal::on_store(NullStore, key());
+        let mut seen = Vec::new();
+        script_of(&mut extended, true, |j| seen.push(j.state().clone()));
+        assert_eq!(seen.len(), plain_states.len() + 4);
+        // The base commit each extended state stands at: the new records are numbers 3, 4, 14
+        // and 15, and change nothing the flash plan reads.
+        let base = |index: usize| match index {
+            0..=2 => index,
+            3 | 4 => 2,
+            5..=13 => index - 2,
+            14 | 15 => 11,
+            _ => index - 4,
+        };
+        let flash_view = |state: &JournalState| {
+            let mut view = state.clone();
+            view.facts.first_request = None;
+            view.facts.last_request = None;
+            view.latest_checkpoint = None;
+            view.records = 0;
+            view
+        };
+        for (index, state) in seen.iter().enumerate() {
+            assert_eq!(
+                flash_view(state),
+                flash_view(&plain_states[base(index)]),
+                "state {index}"
+            );
+        }
+        // A checkpoint is the newest state, but not one the flash plan's restart reads.
+        let after_checkpoint = &seen[4];
+        assert_eq!(
+            after_checkpoint.latest_checkpoint.as_ref().map(|c| c.0),
+            Some(at(8, 13))
+        );
+        assert_eq!(
+            after_checkpoint.last_vm_state,
+            Some((at(2, 10), b"vm-1".to_vec()))
+        );
+        assert_eq!(after_checkpoint.previous_vm_state, None);
+    }
+
+    /// The folds of the new facts: the newest state of any kind, and the first and last request
+    /// (ADR-335 item 2); a record out of place is refused and changes nothing.
+    #[test]
+    fn folds_the_latest_checkpoint_and_the_first_and_last_request() {
+        let mut journal = Journal::on_store(NullStore, key());
+        journal.commit_run_start(at(0, 0), b"init").unwrap();
+        let state = journal.state();
+        assert_eq!(state.latest_checkpoint, Some((at(0, 0), b"init".to_vec())));
+        assert_eq!(
+            (state.facts.first_request, state.facts.last_request),
+            (None, None)
+        );
+
+        journal.commit_checkpoint(at(1, 1), b"c1").unwrap();
+        let state = journal.state();
+        assert_eq!(state.latest_checkpoint, Some((at(1, 1), b"c1".to_vec())));
+        assert_eq!(state.last_vm_state, Some((at(0, 0), b"init".to_vec())));
+        assert_eq!(state.previous_vm_state, None);
+
+        journal.commit_step(at(2, 2), Some(b"s")).unwrap();
+        let state = journal.state();
+        assert_eq!(state.latest_checkpoint, Some((at(2, 2), b"s".to_vec())));
+        assert_eq!(state.last_vm_state, Some((at(2, 2), b"s".to_vec())));
+        assert_eq!(state.previous_vm_state, Some((at(0, 0), b"init".to_vec())));
+
+        journal.commit_request(at(3, 3)).unwrap();
+        journal.commit_request(at(4, 4)).unwrap();
+        journal.commit_request(at(6, 6)).unwrap();
+        let facts = &journal.state().facts;
+        assert_eq!(
+            (facts.first_request, facts.last_request),
+            (Some(at(3, 3)), Some(at(6, 6)))
+        );
+        // The state a request is not.
+        assert_eq!(
+            journal.state().latest_checkpoint,
+            Some((at(2, 2), b"s".to_vec()))
+        );
+
+        // Out of place: a request that does not come after the last one, a step that was
+        // completed already, and a state too large for a frame. Nothing is recorded.
+        let before = journal.state().clone();
+        journal
+            .commit_request(at(6, 6))
+            .expect_err("not after the last request");
+        journal
+            .commit_request(at(2, 2))
+            .expect_err("not after the last step");
+        journal
+            .commit_checkpoint(at(2, 2), b"c")
+            .expect_err("not after the last step");
+        assert!(matches!(
+            journal.commit_checkpoint(at(9, 9), &vec![0; MAX_FRAME as usize + 1]),
+            Err(JournalError::TooLarge)
+        ));
+        assert_eq!(journal.state(), &before);
+        journal.commit_checkpoint(at(7, 7), b"c7").unwrap();
+        assert_eq!(
+            journal.state().latest_checkpoint,
+            Some((at(7, 7), b"c7".to_vec()))
+        );
+    }
+
+    /// A checkpoint is not behind the last request or the latest checkpoint; it may share a step
+    /// count with either (the request marker and the checkpoint of one primitive do).
+    #[test]
+    fn a_checkpoint_does_not_go_backwards() {
+        let mut journal = Journal::on_store(NullStore, key());
+        journal.commit_run_start(at(0, 0), b"init").unwrap();
+        journal.commit_request(at(10, 10)).unwrap();
+        let before = journal.state().clone();
+        journal
+            .commit_checkpoint(at(5, 5), b"c5")
+            .expect_err("behind the last request");
+        assert_eq!(journal.state(), &before);
+        journal.commit_checkpoint(at(10, 10), b"c10").unwrap();
+        journal.commit_checkpoint(at(12, 12), b"c12").unwrap();
+        // Behind the latest checkpoint, with no newer request in the way.
+        let mut other = Journal::on_store(NullStore, key());
+        other.commit_run_start(at(0, 0), b"init").unwrap();
+        other.commit_checkpoint(at(8, 8), b"c8").unwrap();
+        other
+            .commit_checkpoint(at(7, 7), b"c7")
+            .expect_err("behind the latest checkpoint");
+        other.commit_checkpoint(at(8, 8), b"c8b").unwrap();
+    }
+
     /// Every prefix of the file reads back as the state after its last whole frame: the
     /// prefixes are what a crash during an append can leave.
     #[test]
     fn every_cut_reads_back_as_the_last_whole_commit() {
         let vin = Vin::new("WDB12345678901234".to_owned());
-        for target_vin in [None, Some(&vin)] {
+        for (target_vin, new_records) in [None, Some(&vin)]
+            .into_iter()
+            .flat_map(|vin| [(vin, false), (vin, true)])
+        {
             let dir = TempDir::new();
             let mut journal = Journal::create(&dir.0, &key(), target_vin, None).expect("create");
             let mut boundaries = vec![(journal.store.len as usize, journal.state().clone())];
-            script(&mut journal, |j| {
+            script_of(&mut journal, new_records, |j| {
                 boundaries.push((j.store.len as usize, j.state().clone()));
             });
             let bytes = fs::read(path(&dir)).expect("read");
@@ -1335,6 +1610,7 @@ mod tests {
                     facts: RecoveryFacts::new(key()),
                     last_vm_state: None,
                     previous_vm_state: None,
+                    latest_checkpoint: None,
                     records: 0,
                 };
                 boundaries.insert(0, (next, empty));
@@ -1891,6 +2167,7 @@ mod tests {
                 facts,
                 last_vm_state: None,
                 previous_vm_state: None,
+                latest_checkpoint: None,
                 records: 0,
             },
             poisoned: false,
@@ -2661,6 +2938,7 @@ mod tests {
                 facts: RecoveryFacts::new(key()),
                 last_vm_state: None,
                 previous_vm_state: None,
+                latest_checkpoint: None,
                 records: 0,
             },
             poisoned: false,
@@ -2754,6 +3032,11 @@ mod tests {
                 at: at(0, 0),
                 reason: RunStop::StepLimit,
             },
+            Record::Checkpoint {
+                at: at(0, 0),
+                vm_state: Vec::new(),
+            },
+            Record::Request { at: at(0, 0) },
         ];
         for (index, record) in records.iter().enumerate() {
             assert_eq!(

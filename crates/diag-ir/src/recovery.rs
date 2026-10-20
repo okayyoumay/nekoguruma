@@ -345,7 +345,16 @@ pub enum ProgramError {
         "the program declares {count} recovery plans; at most {MAX_FLASH_RECOVERIES} are allowed"
     )]
     TooManyFlashRecoveries { count: usize },
+    #[error(
+        "flash session {flash_session}: stage {stage} is reserved for the plain procedure's resume count"
+    )]
+    ReservedStage { flash_session: u32, stage: u32 },
 }
+
+/// The stage id the agent's journal keeps the resume count of a plain procedure under, the step
+/// ranges outside every plan (ADR-335 item 6). No recovery plan may use it
+/// ([`ProgramError::ReservedStage`]).
+pub const PLAIN_PROCEDURE_STAGE: u32 = u32::MAX;
 
 /// The most recovery plans a program may declare. Each plan's checks pass over the whole code
 /// once, so the cap keeps loading linear in the code's length; a procedure has one plan per
@@ -418,6 +427,12 @@ impl Program {
             }
         }
         for (index, plan) in self.flash.iter().enumerate() {
+            if plan.stage == PLAIN_PROCEDURE_STAGE {
+                return Err(ProgramError::ReservedStage {
+                    flash_session: plan.flash_session,
+                    stage: plan.stage,
+                });
+            }
             self.validate_plan(plan)?;
             for other in &self.flash[..index] {
                 if other.flash_session == plan.flash_session {

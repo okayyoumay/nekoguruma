@@ -721,6 +721,11 @@ impl<C: WorkerApi> DiagHost for WorkerHost<C> {
         Err(HostError::Unsupported("MonitorCapture"))
     }
 
+    // The agent holds no artifact yet (ADR-336 item 12).
+    fn artifact_bytes(&mut self, _offset: u64, _len: u32) -> Result<Vec<u8>, HostError> {
+        Err(HostError::Unsupported("FlashBlock"))
+    }
+
     fn log(&mut self, level: u8, message: &str) {
         tracing::info!(level, "{message}");
     }

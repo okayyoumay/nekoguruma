@@ -194,9 +194,9 @@ pub enum JobError {
     LinkUnconfirmed,
     #[error("the job thread panicked")]
     Panicked,
-    /// The program decodes response fields (`Op::DecodeField`, ADR-316) but the job has no
-    /// document to decode them with.
-    #[error("the program decodes response fields, but the job has no document")]
+    /// The program needs the declaration part (`Op::DecodeField`, ADR-316; `Op::SendReceive`,
+    /// ADR-321; `Op::FlashBlock`, ADR-336) but the job has no document to give it.
+    #[error("the program needs the declarations, but the job has no document")]
     NoDeclarations,
     /// Instruction `pc` decodes a field the job's document does not declare as a top-level
     /// field of the service's positive response, or one with a nested layout.
@@ -329,7 +329,8 @@ fn check_runnable(program: &Program) -> Result<(), JobError> {
 
 /// [`check_program`] for a job, which also checks the declarations its program names
 /// (`diag_ir::check_declarations`): the response fields it decodes (`Op::DecodeField`,
-/// ADR-316, ADR-318) and the services it send-receives (ADR-321). A job without a document to
+/// ADR-316, ADR-318), the services it send-receives (ADR-321) and the flash segments whose blocks
+/// it reads (`Op::FlashBlock`, ADR-336). A job without a document to
 /// decode with, or one whose document does not declare what the program names, is refused here
 /// rather than failing at the instruction, which could be after a write.
 ///
@@ -363,7 +364,9 @@ fn check_declared(job: &Job) -> Result<(), JobError> {
         None if job.program.code.iter().any(|op| {
             matches!(
                 op,
-                diag_ir::Op::DecodeField { .. } | diag_ir::Op::SendReceive { .. }
+                diag_ir::Op::DecodeField { .. }
+                    | diag_ir::Op::SendReceive { .. }
+                    | diag_ir::Op::FlashBlock { .. }
             )
         }) =>
         {
@@ -1717,6 +1720,9 @@ mod tests {
         fn monitor_capture(&mut self, _: u32) -> Result<(), HostError> {
             Err(HostError::Unsupported("MonitorCapture"))
         }
+        fn artifact_bytes(&mut self, _: u64, _: u32) -> Result<Vec<u8>, HostError> {
+            Err(HostError::Unsupported("FlashBlock"))
+        }
         fn log(&mut self, _: u8, message: &str) {
             self.logs.push(message.to_owned());
             if let Some((at, flag)) = &self.cancel_on_log
@@ -2689,6 +2695,9 @@ def main():
         }
         fn monitor_capture(&mut self, _: u32) -> Result<(), HostError> {
             Err(HostError::Unsupported("MonitorCapture"))
+        }
+        fn artifact_bytes(&mut self, _: u64, _: u32) -> Result<Vec<u8>, HostError> {
+            Err(HostError::Unsupported("FlashBlock"))
         }
         fn log(&mut self, _: u8, _: &str) {}
     }
@@ -9301,6 +9310,40 @@ def main():
                 }
             ),
             "{error:?}"
+        );
+    }
+
+    /// A flash block names a segment of the document, so a job without one, or with one that
+    /// does not declare the segment, is refused before anything is sent (ADR-336).
+    #[test]
+    fn a_flash_block_needs_a_document_that_declares_its_segment() {
+        // The block read sits in the plan of its session, which `Program::validate` requires.
+        let mut program = flash_program();
+        let session = program.flash[0].flash_session;
+        let erase = program.flash[0].boundaries.erase_pc as usize;
+        assert!(matches!(program.code[erase + 1], Op::Pop));
+        program.code[erase + 1] = Op::FlashBlock {
+            session,
+            segment: 0,
+        };
+        assert!(matches!(
+            check_job(&program.clone().into(), Permission::ReadOnly),
+            Err(JobError::NoDeclarations)
+        ));
+        let job = Job {
+            program,
+            document: Some(vin_job_document()),
+        };
+        let refused = check_job(&job, Permission::ReadOnly);
+        assert!(
+            matches!(
+                refused,
+                Err(JobError::Undeclared {
+                    pc,
+                    source: VmError::UnknownFlashSession { session: s }
+                }) if pc as usize == erase + 1 && s == session
+            ),
+            "{refused:?}"
         );
     }
 

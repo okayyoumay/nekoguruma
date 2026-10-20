@@ -604,3 +604,180 @@ fn no_field_after_one_of_unknown_extent_adds_bytes() {
     assert_eq!(answer, [0x62, 0]);
     assert!(decoded.is_err(), "{decoded:?}");
 }
+
+// ---------------------------------------------------------------- FlashBlock (ADR-336 item 15)
+
+/// A document with flash session 2 holding `segment`, and the services a plan's erase,
+/// download and transfer exit send (any answer will do).
+fn flash_document(segment: crate::declaration::FlashSegmentT) -> Vec<u8> {
+    use crate::declaration::FlashSessionT;
+    encode_ecu_document(&EcuDocumentT {
+        schema_version: IR_SCHEMA_VERSION,
+        source_format: Some("csv-starlark".into()),
+        source_digest: Some("00".into()),
+        variant: Some(Box::new(EcuVariantT {
+            id: 1,
+            services: Some(vec![
+                service(1, "erase", 0x31, &[], vec![]),
+                service(2, "download", 0x34, &[], vec![]),
+                service(3, "exit", 0x37, &[], vec![]),
+            ]),
+            flash_sessions: Some(vec![FlashSessionT {
+                id: 2,
+                segments: Some(vec![segment]),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        })),
+        procedure: None,
+    })
+}
+
+/// A program of flash session 2 whose plan starts with `ops`, which `FlashBlock` must sit in
+/// (`Program::validate`), then erases, requests the download and exits the transfer.
+fn in_plan(mut ops: Vec<Op>) -> Program {
+    use crate::{
+        FlashRecovery, IdentitySources, NoApplication, RecoveryBoundaries, RecoveryRequired,
+        RecoveryTiming, Source,
+    };
+    let erase = ops.len() as u32 + 1;
+    ops.extend([
+        Op::PushBytes(0),
+        Op::RoutineControl { routine: 1, sub: 1 },
+        Op::Pop,
+        Op::PushBytes(0),
+        Op::ServiceRequest { service: 0x34 },
+        Op::Pop,
+        Op::PushBytes(0),
+        Op::ServiceRequest { service: 0x37 },
+        Op::Pop,
+    ]);
+    let mut program = program(ops, vec![vec![]]);
+    let source = Some(Source::EcuService {
+        service_id: 1,
+        field_id: 1,
+    });
+    program.identity = IdentitySources {
+        vin: source,
+        hardware_part_number: source,
+        software_version: source,
+    };
+    program.flash.push(FlashRecovery {
+        flash_session: 2,
+        stage: 1,
+        max_resumes: 3,
+        recovery_required: RecoveryRequired::Never,
+        boundaries: RecoveryBoundaries {
+            entry_pc: 0,
+            erase_pc: erase,
+            transfer_exit_pc: erase + 6,
+            post_transfer_end_pc: erase + 8,
+        },
+        timing: RecoveryTiming {
+            session_timeout_millis: 5000,
+            teardown_margin_millis: 500,
+            ecu_startup_millis: 2000,
+            confirmation_window_millis: 10_000,
+        },
+        version_read_retries: 2,
+        no_application: Some(NoApplication::Nrc(0x22)),
+    });
+    program
+}
+
+#[test]
+fn a_flash_block_is_served_as_zeros_of_the_blocks_length() {
+    let buf = flash_document(crate::declaration::FlashSegmentT {
+        artifact_offset: 16,
+        length: 10,
+        block_size: 4,
+        ..Default::default()
+    });
+    // The last block has two bytes; the log shows what the block held.
+    let program = in_plan(vec![
+        Op::PushI64(2),
+        Op::FlashBlock {
+            session: 2,
+            segment: 0,
+        },
+        Op::LogFromStack { level: 1 },
+    ]);
+    let report = run(&buf, &program, &Script::new());
+    assert_eq!(report.end, DryRunEnd::Finished, "{report:?}");
+    assert_eq!(
+        report.events.first(),
+        Some(&DryRunEvent::Log {
+            level: 1,
+            message: "\0\0".into()
+        })
+    );
+}
+
+#[test]
+fn a_flash_block_outside_the_declarations_ends_the_run_with_the_vms_error() {
+    let buf = flash_document(crate::declaration::FlashSegmentT {
+        length: 10,
+        block_size: 4,
+        ..Default::default()
+    });
+    let program = in_plan(vec![
+        Op::PushI64(3),
+        Op::FlashBlock {
+            session: 2,
+            segment: 0,
+        },
+    ]);
+    let report = run(&buf, &program, &Script::new());
+    assert_eq!(
+        report.end,
+        DryRunEnd::Vm(VmError::BlockOutOfRange {
+            session: 2,
+            segment: 0,
+            index: 3
+        })
+    );
+}
+
+#[test]
+fn flash_blocks_count_toward_the_budget() {
+    let buf = flash_document(crate::declaration::FlashSegmentT {
+        length: 1 << 20,
+        block_size: 1 << 20,
+        ..Default::default()
+    });
+    let program = in_plan(vec![
+        Op::PushI64(0),
+        Op::FlashBlock {
+            session: 2,
+            segment: 0,
+        },
+        Op::Pop,
+        Op::Jump(0),
+    ]);
+    let report = run(&buf, &program, &Script::new());
+    assert_eq!(report.end, DryRunEnd::Host(DryRunError::ReportTooLarge));
+}
+
+#[test]
+fn a_flash_block_outside_a_plan_is_invalid() {
+    let buf = flash_document(crate::declaration::FlashSegmentT {
+        length: 10,
+        block_size: 4,
+        ..Default::default()
+    });
+    let program = program(
+        vec![
+            Op::PushI64(0),
+            Op::FlashBlock {
+                session: 2,
+                segment: 0,
+            },
+        ],
+        vec![],
+    );
+    let report = run(&buf, &program, &Script::new());
+    assert_eq!(
+        report.end,
+        DryRunEnd::Invalid(crate::ProgramError::FlashBlockOutsidePlan { pc: 1 })
+    );
+}

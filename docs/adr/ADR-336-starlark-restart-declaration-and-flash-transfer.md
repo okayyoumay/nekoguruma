@@ -177,7 +177,7 @@ Rejected alternatives:
   design 8.9.1's three checks, for a procedure with a plan, since an omission would otherwise let
   an erase run unchecked.
   Item 2's `maxResumes` defaults to 3 (alternative: required). Item 1 adds the two format fields
-  to `FlashSegment` now, in the one schema bump `FlashBlock` needs (alternative: constants).
+  to `FlashSegment` now, in a schema bump of their own (alternative: constants).
   Item 12 makes the host pre-check maxNumberOfBlockLength (alternative: let the ECU refuse).
   Item 14 gives the author no access to the 0x34 response (alternative: expose it). The
   maintainer may overrule any of them.

@@ -75,7 +75,7 @@ comment annotations next to the code they describe.
    top-level statement annotated `# @erase`, or the `ServiceRequest 0x34` when the session's steps
    have no `erase-memory`; `@erase` is required exactly when they have it. `recovery_required`
    is the erase point by default, `Never` with `recovery=never`, or the first instruction of the
-   statement annotated `# @recoveryRequired` (exclusive with `recovery=never`). The `@erase` and
+   statement annotated `# @recoveryRequired` (exclusive with `recovery=never`). A plan function whose section is `recoveryRequired` requires on-site intervention from its entry, the only point that agrees with that section, and takes neither marker. The `@erase` and
    `diag.flash_transfer` statements are top-level statements of the plan, so no jump skips them.
    A `Program::validate` refusal is `STAR_PLAN_INVALID` at the source span of the pc the error
    names; `STAR_NOT_LOWERABLE` stays for an error without one.
@@ -118,7 +118,7 @@ comment annotations next to the code they describe.
     `DiagHost::artifact_bytes(offset, len)`, which must return exactly `len` bytes. It sends
     nothing and is no diagnostic primitive (no section, intent or journal record). Design 8.2.4's
     "no file access" holds: the instruction names a declared segment, and the host decides what
-    the artifact is. Conversion refuses a `block_size` above `MAX_BYTES_LEN - 2` and a block count above 2^63 - 1, the largest index the VM's integers hold.
+    the artifact is. Conversion refuses a `block_size` above `MAX_BYTES_LEN - 2` and a block count above 2^32 - 1, the largest block number the write-job journal records (ADR-250 item 5).
 12. **The agent's artifact.** The job names the artifact by content hash, as it names documents
     (ADR-318). `check_job` hashes the cached file before the first instruction (design 4.1, 11.1,
     11.3), refuses a mismatch and any plan segment outside the file, and hands the bytes to

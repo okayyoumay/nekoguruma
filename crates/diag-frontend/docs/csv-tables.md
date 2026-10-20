@@ -503,7 +503,7 @@ programming_session }`.
 | `default_source` | source | yes | Where the value is read in the default session |
 | `programming_source` | source | no | The same in the programming session; default the default source |
 
-A source is `<service>.<field>`, a service name and a top-level response field split at the last dot, or `input:<name>` with
+A source is `<service>.<field>`, a service name and a top-level response field split at the last dot whose type decodes to an integer (an unsigned or signed integer field, not text, bytes or a float, since the agent compares an integer with the range), or `input:<name>` with
 `name` the runtime input of the row's own kind, a value the agent supplies: `supply_voltage_mv`
 for `voltage`, `external_supply` for `external_supply`, `ignition_on` for `ignition`,
 `engine_running` for `engine` and `vehicle_speed_kmh` for `vehicle_speed`. Another input is

@@ -403,8 +403,9 @@ ISO 22900-2 (2022) Annex B.1 names over ISO 15765 it recognises, such as
 `ISO_14229_3_on_ISO_15765_2`. An ISO 15765 end segments its payload and a raw CAN end does not,
 and any other protocol, or a name the worker does not recognise, is refused. A name is matched as
 the worker matches it, without trimming spaces, and a `_CH` with no digits after it is no
-additional channel. A raw CAN end takes no `padding`: frame padding is an ISO 15765-2 TxFlag with
-no meaning on a raw CAN channel (SAE J2534-1 (v04.04) 8.7.3). The ends must also
+additional channel. A raw CAN end takes no `padding` and only `normal` addressing: frame padding is an
+ISO 15765-2 TxFlag with no meaning on a raw CAN channel (SAE J2534-1 (v04.04) 8.7.3), and the
+worker drops the extended-addressing flag there, so the address byte would be plain payload. The ends must also
 share the `addressing` and, when addressed, the `address`, since each end accepts only frames
 carrying its own address byte.
 

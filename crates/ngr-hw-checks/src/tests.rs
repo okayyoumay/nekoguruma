@@ -474,6 +474,22 @@ fn a_loopback_runs_between_two_ends_of_one_bus() {
         ),
         "takes no `padding`",
     );
+    // So is extended addressing.
+    refused_for(
+        &loopback(
+            &with_protocol(vci_end, "CAN").replacen(
+                "addressing = \"normal\"",
+                "addressing = \"extended\"\naddress = 0x10",
+                1,
+            ),
+            &partner(&with_protocol(&second_module, "CAN")).replacen(
+                "addressing = \"normal\"",
+                "addressing = \"extended\"\naddress = 0x10",
+                1,
+            ),
+        ),
+        "only `normal` addressing",
+    );
     // The worker does not trim a protocol name, so `" CAN "` is no CAN name.
     refused_for(
         &loopback(
@@ -544,9 +560,11 @@ fn a_loopback_runs_between_two_ends_of_one_bus() {
     refused_for(&rate, "one bus");
     let width = T0_PROFILE.replacen("id_bits = 11", "id_bits = 29", 1);
     refused_for(&width, "one bus");
-    // The two ends share the addressing and, when addressed, the address byte.
+    // The two ends share the addressing and, when addressed, the address byte (over ISO 15765:
+    // a raw CAN end takes only normal addressing).
+    let iso15765 = T0_PROFILE.replace("protocol = \"CAN\"", "protocol = \"ISO15765\"");
     let extended_both = |a: &str, b: &str| {
-        let first = T0_PROFILE.replacen(
+        let first = iso15765.replacen(
             "addressing = \"normal\"",
             &format!("addressing = \"extended\"\naddress = {a}"),
             1,
@@ -559,7 +577,7 @@ fn a_loopback_runs_between_two_ends_of_one_bus() {
     };
     parse(&extended_both("0x55", "0x55")).unwrap();
     refused_for(&extended_both("0x10", "0xF1"), "share one `addressing`");
-    let one_extended = T0_PROFILE.replacen(
+    let one_extended = iso15765.replacen(
         "addressing = \"normal\"",
         "addressing = \"extended\"\naddress = 0x55",
         1,

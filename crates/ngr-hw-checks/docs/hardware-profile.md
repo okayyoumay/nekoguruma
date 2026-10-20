@@ -394,8 +394,9 @@ function over guarded handles and the profile, so CI runs it against `j2534-0404
 (`tests/grpc_mock/t0_loopback_check.rs`, with a relay task playing the loopback).
 
 The profile parser refuses a loopback whose two ends cannot exchange the same bytes: the ends must
-be both raw CAN or both ISO 15765 (a `protocol` naming ISO 15765, or an additional channel of
-one), since an ISO 15765 end segments its payload and a raw CAN end does not, and they must share
+be both raw CAN (`CAN`, `ISO_11898_RAW`) or both ISO 15765 (`ISO15765`, `ISO-TP`, an ISO 22900-2
+name over ISO 15765, or an additional channel of one; names match ignoring case), since an ISO 15765
+end segments its payload and a raw CAN end does not; any other protocol is refused; and they must share
 the `addressing` and, when addressed, the `address`, since each end accepts only frames carrying
 its own address byte.
 

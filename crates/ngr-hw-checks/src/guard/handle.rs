@@ -1007,7 +1007,7 @@ const RAW_SEND_BOUND: Duration = Duration::from_secs(2);
 
 /// Whether a received frame is an echo of the link's own transmission, by its RxFlag: a loopback
 /// copy (`TX_MSG_TYPE`, bit 0 of the last byte) or a TX indication (bit 3), as SAE J2534-1
-/// defines the RxStatus bits the worker copies.
+/// (v04.04) 8.7.2 defines the RxStatus bits the worker copies.
 fn is_echo(rx_flag: &[u8]) -> bool {
     const TX_MSG_TYPE: u8 = 0x01;
     const TX_INDICATION: u8 = 0x08;

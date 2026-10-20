@@ -98,9 +98,17 @@ fn vci_ends(profile: &Profile) -> Result<[Vci; 2], String> {
 #[ignore = "real-hardware check, design 13.5: run with `cargo nextest run --profile hardware --run-ignored=only`"]
 async fn hw_t0_two_endpoint_loopback() {
     // Declared before the run guard, so it is dropped after the guard's teardown: the workers
-    // (installed in it) are stopped by then.
-    let temp = tempfile::tempdir().expect("temporary directory");
+    // (installed in it) are stopped by then. It is created after `begin`, which comes first.
+    let temp: tempfile::TempDir;
     let (profile, mut guard) = begin(&T0_LOOPBACK_CHECK);
+    temp = match tempfile::tempdir() {
+        Ok(temp) => temp,
+        Err(error) => {
+            let why = format!("the temporary worker directory: {error}");
+            guard.finish(Outcome::Failed, &why);
+            panic!("{why}");
+        }
+    };
     if std::env::var_os("NGR_J2534_DEFINITION_DIR").is_some() {
         let why = "NGR_J2534_DEFINITION_DIR replaces the OS lookup of the vendor's library \
                    (design 7.1.1, ADR-282); unset it for a hardware run";

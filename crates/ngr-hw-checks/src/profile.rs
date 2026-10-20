@@ -440,10 +440,32 @@ pub(crate) const PHYSICAL_COMPARAMS: &[&str] = &[
 
 /// A channel name as the J2534 worker reads it: ASCII case ignored, surrounding spaces dropped,
 /// and a `_CH` index read as a number, so `CAN_CH1`, `can_ch1` and `CAN_CH01` are one channel.
-/// Whether a protocol is ISO 15765 transport (`ISO15765`, `ISO_14229_3_on_ISO_15765_2`, their
-/// additional channels) rather than raw CAN: the two frame one payload differently on the bus.
-fn segments(protocol: &str) -> bool {
-    protocol.contains("15765")
+/// The bus framing a T0 loopback end uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Framing {
+    /// Raw CAN (`CAN`, `ISO_11898_RAW`, their additional channels): bus payloads as they are.
+    RawCan,
+    /// ISO 15765 transport (`ISO15765`, `ISO-TP`, `ISO_14229_3_on_ISO_15765_2` and the other
+    /// ISO 22900-2 names over ISO 15765, their additional channels), which segments payloads.
+    Iso15765,
+}
+
+/// The framing of a T0 loopback end's `protocol`, matched as the worker matches protocol names
+/// (ignoring ASCII case and an additional-channel suffix); `None` for a protocol the loopback
+/// does not run on.
+fn framing(protocol: &str) -> Option<Framing> {
+    let key = channel_key(protocol);
+    let base = match key.rfind("_CH") {
+        Some(index) if key[index + 3..].bytes().all(|b| b.is_ascii_digit()) => &key[..index],
+        _ => key.as_str(),
+    };
+    if base.contains("15765") || base == "ISO-TP" || base == "ISOTP" {
+        Some(Framing::Iso15765)
+    } else if base == "CAN" || base == "CAN_PS" || base == "ISO_11898_RAW" {
+        Some(Framing::RawCan)
+    } else {
+        None
+    }
 }
 
 pub(crate) fn channel_key(name: &str) -> String {
@@ -683,11 +705,20 @@ fn check_loopback(a: &Endpoint, b: &Endpoint) -> Result<(), ProfileError> {
     let (x, y) = (&a.link, &b.link);
     // A raw CAN end exchanges bus payloads as they are, while an ISO 15765 end segments and
     // reassembles them, so a byte-for-byte loopback needs one protocol family at both ends.
-    if segments(&x.protocol) != segments(&y.protocol) {
-        return Err(invalid(
-            "a T0 loopback's endpoints are both raw CAN or both ISO 15765 (`protocol`): the two \
-             frame the same payload differently",
-        ));
+    match (framing(&x.protocol), framing(&y.protocol)) {
+        (Some(one), Some(other)) if one == other => {}
+        (Some(_), Some(_)) => {
+            return Err(invalid(
+                "a T0 loopback's endpoints are both raw CAN or both ISO 15765 (`protocol`): the two \
+                 frame the same payload differently",
+            ));
+        }
+        _ => {
+            return Err(invalid(
+                "a T0 loopback runs on raw CAN (`CAN`, `ISO_11898_RAW`) or ISO 15765 (`ISO15765`, \
+                 `ISO_14229_3_on_ISO_15765_2`, ...) at both ends",
+            ));
+        }
     }
     if x.baud_rate != y.baud_rate || x.id_bits != y.id_bits {
         return Err(invalid(

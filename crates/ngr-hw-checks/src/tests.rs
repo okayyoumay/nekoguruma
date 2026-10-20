@@ -411,6 +411,36 @@ fn a_loopback_runs_between_two_ends_of_one_bus() {
         &partner(&with_protocol(&second_module, "can_ch1")),
     ))
     .unwrap();
+    // Names are matched ignoring case, aliases of one family agree, and a protocol outside the
+    // two families is refused.
+    refused_for(
+        &loopback(
+            vci_end,
+            &partner(&with_protocol(&second_module, "iso15765")),
+        ),
+        "both raw CAN or both ISO 15765",
+    );
+    refused_for(
+        &loopback(vci_end, &partner(&with_protocol(&second_module, "ISO-TP"))),
+        "both raw CAN or both ISO 15765",
+    );
+    parse(&loopback(
+        &with_protocol(vci_end, "iso-tp"),
+        &partner(&with_protocol(&second_module, "ISO_14229_3_on_ISO_15765_2")),
+    ))
+    .unwrap();
+    parse(&loopback(
+        vci_end,
+        &partner(&with_protocol(&second_module, "ISO_11898_RAW")),
+    ))
+    .unwrap();
+    refused_for(
+        &loopback(
+            &with_protocol(vci_end, "ISO9141"),
+            &partner(&with_protocol(&second_module, "ISO9141")),
+        ),
+        "runs on raw CAN",
+    );
 
     // J2534 names its module by the configured entry: the same label or `pname` is one device,
     // and two entries reporting the same `module` are two.

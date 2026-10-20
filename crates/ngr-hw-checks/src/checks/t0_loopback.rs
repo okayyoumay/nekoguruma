@@ -6,9 +6,10 @@
 //! one link each); the check takes either as [`Ends`]. Every request goes through the guard, so
 //! the frames are the T0 ones the guard allows: the sending end's own header, and the payload.
 //!
-//! A frame is a single ISO 15765-2 frame (a payload of 1 to 7 bytes, one less under extended or
-//! mixed addressing, which takes a byte of the frame for the address). The receiver gets the whole
-//! frame (the sender's identifier, the address byte, the payload), compared byte for byte.
+//! A frame is a single ISO 15765-2 (2024) frame (clause 9.2: a payload of 1 to 7 bytes, one less
+//! under extended or mixed addressing, which takes a byte of the frame for the address). The
+//! receiver gets the whole frame (the sender's identifier, the address byte, the payload),
+//! compared byte for byte.
 
 use std::path::PathBuf;
 use std::time::Duration;

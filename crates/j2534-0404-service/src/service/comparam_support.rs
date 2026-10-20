@@ -113,6 +113,17 @@ pub(super) fn check_param_allowed(
     }
 }
 
+/// ComParams the D-PDU API refuses because they are ECU-specific: ISO 22900-2
+/// (2022) B.3.4 says the API does not interpret such a ComParam and returns an
+/// error code when one is passed, and B.3.5 defines usage "E" as relevant only
+/// to ECU software generation or configuration; Table B.10 marks both entries
+/// below "S,E" (2009: B.3.4, B.3.5, Tables B.10/B.19). The name-to-id lookup
+/// still resolves them (an object id is not a support statement), so a set or
+/// get is refused here with `PDU_ERR_COMPARAM_NOT_SUPPORTED` (ADR-056).
+fn is_ecu_only_param(p: ComParamId) -> bool {
+    matches!(p, PARAM_P2_STAR_ECU | PARAM_P2_MAX_ECU)
+}
+
 fn is_param_allowed(protocol: ChannelProtocol, param_id: ComParamId) -> bool {
     // ADR-219 amendment (design-advisor decision, same-day follow-up to the
     // original ADR-219 landing): a vendor ComParamId (`param_id.is_vendor()`,
@@ -133,6 +144,13 @@ fn is_param_allowed(protocol: ChannelProtocol, param_id: ComParamId) -> bool {
     // silently shadow that id's own protocol-specific exclusion.
     if param_id.is_vendor() {
         return true;
+    }
+    // ECU-only ComParams (ISO 22900-2 (2022) B.3.4/B.3.5, Table B.10; 2009
+    // B.3.4/B.3.5, Tables B.10/B.19): refused on every protocol, ahead of the
+    // protocol branches and the "Unknown protocol" fallback, so no family
+    // list needs to omit them individually.
+    if is_ecu_only_param(param_id) {
+        return false;
     }
     // SAE J2534-2 clause 13 Honda DIAG-H Protocol (ADR-174/Phase 10):
     // deliberately checked *before* the universal-param short-circuit below,
@@ -704,8 +722,6 @@ fn is_can_param(p: ComParamId) -> bool {
         // get/settable here too.
         | ComParamId(j2534_0404::P2_MIN) | ComParamId(j2534_0404::P2_MAX)
         | PARAM_P2_STAR
-        | PARAM_P2_STAR_ECU
-        | PARAM_P2_MAX_ECU
         // CP_P3Func / CP_P3Phys (CAN context): stored service-level, no
         // J2534 SET_CONFIG equivalent for the CAN family (unlike KWP, where
         // these forward via native P3_MIN/P3_MAX -- see is_kwp_param and
@@ -851,8 +867,6 @@ fn is_kwp_param(p: ComParamId) -> bool {
         // ── Application: Timing ──────────────────────────────────────────────
         | PARAM_CYCLIC_RESP_TIMEOUT
         | PARAM_P2_STAR
-        | PARAM_P2_STAR_ECU
-        | PARAM_P2_MAX_ECU
         | PARAM_MODIFY_TIMING
         | PARAM_SESSION_TIMING_ECU
         | PARAM_SESSION_TIMING_OVERRIDE
@@ -1850,6 +1864,42 @@ mod tests {
                 "DATA_RATE should be allowed for protocol {:#x}",
                 proto.value()
             );
+        }
+    }
+
+    /// ISO 22900-2 (2022) B.3.4/B.3.5 and Table B.10: the ECU-only `_Ecu`
+    /// timing ComParams are refused on every protocol (also the unknown-protocol
+    /// fallback and the universal path), with `PDU_ERR_COMPARAM_NOT_SUPPORTED`,
+    /// while the tester-side `CP_P2Star` stays accepted where it was.
+    #[test]
+    fn ecu_only_p2_timing_comparams_are_refused_on_every_protocol() {
+        use vci_service_interface::error_detail_from_status;
+
+        for proto in [
+            ChannelProtocol::CAN,
+            ChannelProtocol::ISO15765,
+            ChannelProtocol::ISO9141,
+            ChannelProtocol::ISO14230,
+            ChannelProtocol::J1850VPW,
+            ChannelProtocol::J1850PWM,
+            ChannelProtocol::SCI_A_ENGINE,
+            ChannelProtocol::SCI_A_TRANS,
+            ChannelProtocol::from_raw(0x7777),
+        ] {
+            for id in [PARAM_P2_STAR_ECU, PARAM_P2_MAX_ECU] {
+                let status = check_param_allowed(proto, id, None).unwrap_err();
+                let detail = error_detail_from_status(&status).expect("ErrorDetail attached");
+                assert_eq!(
+                    detail.pdu_error,
+                    PduError::PduErrComparamNotSupported as i32,
+                    "{:#x} on protocol {:#x}",
+                    id.0,
+                    proto.value()
+                );
+            }
+        }
+        for proto in [ChannelProtocol::CAN, ChannelProtocol::ISO14230] {
+            assert!(check_param_allowed(proto, PARAM_P2_STAR, None).is_ok());
         }
     }
 

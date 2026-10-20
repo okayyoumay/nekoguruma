@@ -618,8 +618,8 @@ Source: ISO 22900-3, application layer ComParam table.
 | CP_P2Min | S | S | — | — |
 | CP_P2Max | S | S | — | — |
 | CP_P2Star | S | S | — | — |
-| CP_P2Star_Ecu | S | S | — | — |
-| CP_P2Max_Ecu | S | S | — | — |
+| CP_P2Star_Ecu | — | — | — | — |
+| CP_P2Max_Ecu | — | — | — | — |
 | CP_ModifyTiming | S² | S¹ | — | — |
 | CP_SessionTiming_Ecu (Structfield) | S² | S | — | — |
 | CP_SessionTimingOverride (Structfield) | S² | S | — | — |
@@ -637,8 +637,11 @@ auto-handler's per-occurrence reload window: each 0x78 reloads the response
 deadline to `now + CP_P2Star` (ISO 14229-2 (2021) 9.2 P2*client semantics,
 ADR-102 — supersedes ADR-057's anchor-once treatment of this value).
 `CP_RC78CompletionTimeout` below is a separate, independent total-duration
-ceiling. `CP_P2Star_Ecu`/`CP_P2Max_Ecu` remain stored-only; no per-ECU
-override mechanism exists.
+ceiling. `CP_P2Star_Ecu`/`CP_P2Max_Ecu` are refused on every protocol
+with `PDU_ERR_COMPARAM_NOT_SUPPORTED`, shown as "—" in the table above: ISO 22900-2
+(2022) B.3.4 has the D-PDU API return an error for ECU-specific ComParams, B.3.5 defines
+usage "E" as ECU-side only, and Table B.10 marks both "S,E" (2009: B.3.4, B.3.5,
+Tables B.10/B.19). The name still resolves to its id (ADR-056).
 
 ¹ `CP_ModifyTiming` on KWP is no longer purely passive storage: when
 enabled on a protocol where `ChannelProtocol::kwp_access_timing_applies()`

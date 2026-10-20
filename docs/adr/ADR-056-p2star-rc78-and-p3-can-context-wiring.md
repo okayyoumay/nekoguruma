@@ -127,5 +127,20 @@ the D-PDU/ISO 14229 standard meaning of the parameter.
   protocol, and adding new TX-scheduling behavior was out of scope for this
   fix) — **amended by ADR-060**, which implements the actual gap
   enforcement these two ComParams configure.
-- `CP_P2Star_Ecu`/`CP_P2Max_Ecu` remain stored-only with no per-ECU
-  override mechanism — also out of scope for this fix.
+- `CP_P2Star_Ecu`/`CP_P2Max_Ecu` are refused, not stored: `SetComParam`
+  and `GetComParam` return `PDU_ERR_COMPARAM_NOT_SUPPORTED` for them on
+  every protocol. They are performance requirements on the *server* (how
+  soon the ECU must start its response, and its enhanced-timing response
+  after an RC 0x78; ISO 22900-2 (2022) B.5.1, Table B.10, with notes that
+  each must be smaller than the client's `CP_P2Max` / `CP_P2Star` by the
+  CAN transmission time), not tester timeouts and not per-ECU overrides.
+  ISO 22900-2 (2022) B.3.4 says ECU-specific ComParams are not
+  interpreted by the D-PDU API, which returns an error code when one is
+  passed; B.3.5 defines usage "E" as relevant only to ECU software
+  generation or configuration; Table B.10 marks both entries "S,E". The
+  2009 edition says the same in B.3.4, B.3.5 and Tables B.10/B.19. The
+  tester-side waits are `CP_P2Max` (ADR-053) and `CP_P2Star` (ADR-102).
+  The name-to-id lookup still resolves both names, because an object id
+  is not a support statement; the refusal sits in the per-protocol
+  allowlist (`comparam_support::is_ecu_only_param`). Reconsider only if
+  the service gains an ECU-simulation role.

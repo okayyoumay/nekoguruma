@@ -19,19 +19,8 @@ fn the_example_declares_its_identity_preconditions_and_recovery_facts() {
         .collect();
     assert_eq!(
         identity,
-        [
-            (IdentityKind::Vin, "vin", "vin"),
-            (
-                IdentityKind::HardwarePartNumber,
-                "sparePartNumber",
-                "sparePartNumber"
-            ),
-            (
-                IdentityKind::SoftwareVersion,
-                "softwareVersion",
-                "softwareVersion"
-            ),
-        ]
+        // The part number and version DIDs are terminated text, which no identity row takes.
+        [(IdentityKind::Vin, "vin", "vin")]
     );
     let kinds: Vec<_> = tables.preconditions.iter().map(|r| r.kind).collect();
     assert_eq!(
@@ -53,7 +42,7 @@ fn the_example_declares_its_identity_preconditions_and_recovery_facts() {
     assert_eq!(voltage.programming_source, None);
     // Both variants hold every row.
     for variant in &definition.variants {
-        assert_eq!(variant.identity, [0, 1, 2]);
+        assert_eq!(variant.identity, [0]);
         assert_eq!(variant.preconditions, [0, 1, 2, 3, 4]);
     }
     let session = &tables.flash_sessions[0];
@@ -427,6 +416,7 @@ fn a_source_field_has_the_type_the_agent_decodes() {
         "numberVin,0xFD18",
         "offsetValue,0xFD19",
         "wideValue,0xFD1A",
+        "leadingText,0xFD1B",
     ];
     let fields = [
         "did:floatValue,floatValue,0,,float,32",
@@ -439,6 +429,7 @@ fn a_source_field_has_the_type_the_agent_decodes() {
         "did:numberVin,numberVin,0,,uint,64",
         "did:offsetValue,offsetValue,1,,uint,16",
         "did:wideValue,wideValue,0,,uint,56",
+        "did:leadingText,leadingText,0,,ascii,8,leading",
     ];
     // An identity value is ASCII text or an unsigned integer, whatever the width.
     let kind_errors = |kind: &str, did: &str, field: &str| {
@@ -481,13 +472,16 @@ fn a_source_field_has_the_type_the_agent_decodes() {
         vec![]
     );
     assert_eq!(
-        bad(kind_errors(
-            "software_version",
-            "variableVin",
-            "variableVin"
-        )),
+        bad(kind_errors("software_version", "shortVin", "shortVin")),
         vec![]
     );
+    // An ASCII identity value has one fixed length: a terminated or length-prefixed text has
+    // none the agent's source table can describe.
+    for kind in ["hardware_part_number", "software_version"] {
+        for did in ["variableVin", "leadingText"] {
+            assert_eq!(bad(kind_errors(kind, did, did)), wrong, "{kind} {did}");
+        }
+    }
     // A VIN is a fixed 17-byte ASCII text: no other length, no terminated text, no number.
     assert_eq!(bad(kind_errors("vin", "vin", "vin")), vec![]);
     for did in ["shortVin", "variableVin", "numberVin"] {

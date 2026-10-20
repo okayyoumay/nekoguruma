@@ -66,8 +66,7 @@ fn every_program_of_a_variant_carries_its_identity_and_the_named_preconditions()
         let names = |kind: IdentityKind| {
             let source = match kind {
                 IdentityKind::Vin => identity.vin,
-                IdentityKind::HardwarePartNumber => identity.hardware_part_number,
-                IdentityKind::SoftwareVersion => identity.software_version,
+                _ => unreachable!("the example declares only the VIN"),
             };
             source_names(document, source.expect("a source"))
         };
@@ -76,14 +75,9 @@ fn every_program_of_a_variant_carries_its_identity_and_the_named_preconditions()
             ("vin.read".into(), "vin".into()),
             "{index}"
         );
-        assert_eq!(
-            names(IdentityKind::HardwarePartNumber),
-            ("sparePartNumber.read".into(), "sparePartNumber".into())
-        );
-        assert_eq!(
-            names(IdentityKind::SoftwareVersion),
-            ("softwareVersion.read".into(), "softwareVersion".into())
-        );
+        // The part number and version DIDs of the example are terminated text: no row.
+        assert_eq!(identity.hardware_part_number, None);
+        assert_eq!(identity.software_version, None);
         let named = index % 2 == 0;
         let p = &program.preconditions;
         assert_eq!(p.voltage_mv.is_some(), named, "{index}");

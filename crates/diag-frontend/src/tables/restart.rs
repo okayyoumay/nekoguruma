@@ -138,7 +138,16 @@ impl Checker<'_> {
                 "{name} must be a fixed 17-byte ascii field (136 bits), since the agent compares \
                  the VIN as a 17-character text"
             )),
-            (Want::Identity, Some(FieldType::Ascii)) => None,
+            (Want::Identity, Some(FieldType::Ascii))
+                if fixed && field.bits.is_some_and(|b| b % 8 == 0) =>
+            {
+                None
+            }
+            (Want::Identity, Some(FieldType::Ascii)) => Some(format!(
+                "{name} must be a fixed-length ascii field of whole bytes, since the agent's \
+                 source table reads a field of one fixed length and a terminated or \
+                 length-prefixed text has none"
+            )),
             (Want::Identity | Want::Number, Some(FieldType::Uint)) => unsigned(field),
             (Want::Identity, _) => Some(format!(
                 "{name} must be an ascii text or an unsigned integer, the encodings the agent \

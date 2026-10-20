@@ -861,8 +861,8 @@ does not have:
   of the DTC status byte (ISO 14229-1 (2026) Annex D), under names of the example's own.
 - `flash_sessions.csv` and `flash_segments.csv`: one flash session with one segment, with the
   recovery timings and the RequestDownload format bytes.
-- `identity.csv`: the VIN, the spare part number (as the hardware part number) and the software
-  version, each the one field of its DID.
+- `identity.csv`: the VIN, the one field of its DID. The spare part number and software version
+  DIDs are terminated text, which an identity row refuses (4.13), so they have no row.
 - `preconditions.csv`: the five preconditions, all read from the agent's inputs.
 
 A row of `fields.csv` from it, the VIN in its data record:

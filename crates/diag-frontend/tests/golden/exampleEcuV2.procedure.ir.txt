@@ -4,7 +4,7 @@ EcuDocumentT {
         "csv-starlark",
     ),
     source_digest: Some(
-        "dc7b075d272f0ea184368cb47f8553c521605cba9f39d0640c0fc7d587c6a69e",
+        "9e3fac6e1ab88c08e9d0160aa4b1290dee423ed2596993fd948adec270800640",
     ),
     variant: Some(
         EcuVariantT {
@@ -3277,18 +3277,8 @@ Program {
                 field_id: 23,
             },
         ),
-        hardware_part_number: Some(
-            EcuService {
-                service_id: 6,
-                field_id: 21,
-            },
-        ),
-        software_version: Some(
-            EcuService {
-                service_id: 7,
-                field_id: 22,
-            },
-        ),
+        hardware_part_number: None,
+        software_version: None,
     },
     preconditions: Preconditions {
         voltage_mv: Some(

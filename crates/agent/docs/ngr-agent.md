@@ -338,13 +338,15 @@ order, and the first that fails is the cause:
    (`RecoveryRequiredAhead { section, pc }`), or a diagnostic primitive that is not safe to repeat
    (`UnsafePrimitiveAhead { pc }`; one outside every section is not safe, and a loop's back edge or
    a call can make an earlier one reachable);
-3. the job names a target VIN and the program declares a VIN source, otherwise `NoIdentity`.
+3. the job names a well-formed target VIN and the program declares a VIN source, otherwise
+   `NoIdentity`.
 
 A plain start on an existing journal counts as a resume of the plain procedure: the runner commits
 the existing resume record under the reserved stage `diag_ir::PLAIN_PROCEDURE_STAGE` before anything
 is sent, after a cancel check, and a stage already resumed `JobLimits::max_procedure_resumes` times
 (agent policy, default 3, not in the IR) ends the job in
-`OnSiteInterventionRequired(ProcedureResumeLimitReached { resumes, max })` with nothing sent. A plain start of a missing journal runs without one and is not counted.
+`OnSiteInterventionRequired(ProcedureResumeLimitReached { resumes, max })` with nothing sent. A
+plain start of a missing journal runs without one and is not counted.
 
 A `ResumeFromCheckpoint` decision runs in this order, each failure ending the job as stated:
 
@@ -362,8 +364,11 @@ A `ResumeFromCheckpoint` decision runs in this order, each failure ending the jo
    from that state with a step budget of its own (ADR-287). The run is journaled as a first run
    is (requests, checkpoints, a declared failure, a stop), and the job ends as that run would. The
    checkpoint's unsafe requests are not sent again; the continuation holds only primitives that
-   are safe to repeat and runs in whatever session the ECU is in (ADR-335 item 8). It follows the
-   same entry checks as the other restart paths.
+   are safe to repeat and runs in whatever session the ECU is in (ADR-335 item 8). Before any of
+   this, as for every restart, a journal another run holds ends the job (`InUse`), a recorded
+   failure, identity abort or stop ends it in its own error, and a target VIN or intended
+   software version that differs from the journal's is `OnSiteInterventionRequired`
+   (`TargetVinDiffers`, `IntendedVersionDiffers`), all with nothing sent.
 
 ## Restart entry
 

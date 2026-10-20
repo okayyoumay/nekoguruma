@@ -173,10 +173,12 @@ pub enum OnSiteReason {
     ProcedureResumeLimitReached { resumes: u16, max: u16 },
     /// A checkpoint resume of a plain procedure could not establish the vehicle (ADR-335 items 6
     /// and 7, ADR-261): the VIN read through the program's source gave no answer, a negative
-    /// response, a value that is not a well-formed VIN, or failed in the worker, or the job names
-    /// no target VIN or the program no source. Nothing but that read was sent. The resume stays
-    /// counted, and the job can be resumed again within the limit (ADR-290). A well-formed VIN that
-    /// differs is not this reason but [`JobError::IdentityMismatch`].
+    /// response, a value that is not a well-formed VIN, or failed in the worker. Nothing but that
+    /// read was sent. The resume stays counted, and the job can be resumed again within the limit
+    /// (ADR-290). A job with no well-formed target VIN, or a program with no source, never gets
+    /// this far, since classification makes it `NotResumable` (`NoIdentity`); the check keeps the
+    /// same ending for it defensively. A well-formed VIN that differs is not this reason but
+    /// [`JobError::IdentityMismatch`].
     ProcedureIdentityNotEstablished,
     /// The transfer's plan never allows a restart (`FlashRecovery::allows_restart`), so the
     /// program need not declare what a restart reads (ADR-245 item 6).
@@ -587,7 +589,13 @@ fn classify_plain_procedure(program: &Program, state: &JournalState) -> RestartD
             return not_resumable(NotResumableCause::UnsafePrimitiveAhead { pc: ahead });
         }
     }
-    if facts.target_vin.is_none() || program.identity.vin.is_none() {
+    // A target VIN that is not well-formed could never match a VIN read, so it is no identity.
+    if !facts
+        .target_vin
+        .as_ref()
+        .is_some_and(|vin| Vin::is_well_formed_text(vin.as_str()))
+        || program.identity.vin.is_none()
+    {
         return not_resumable(NotResumableCause::NoIdentity);
     }
     RestartDecision::ResumeFromCheckpoint(Box::new(CheckpointResume {

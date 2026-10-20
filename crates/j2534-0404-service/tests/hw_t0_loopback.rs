@@ -169,7 +169,7 @@ async fn hw_t0_two_endpoint_loopback() {
         guard
             .report()
             .add_device(vci, device.abi(), device.module(), device.version());
-        let handle = GuardedHandle::open(
+        let handle = match GuardedHandle::open(
             &profile,
             vci,
             device,
@@ -180,7 +180,18 @@ async fn hw_t0_two_endpoint_loopback() {
             &guard,
         )
         .await
-        .expect("the guarded handle creates the end's link");
+        {
+            Ok(handle) => handle,
+            Err(error) => {
+                // The vendor's or the worker's answer goes into the report before the test fails.
+                let why = Masker::for_profile(&profile).text(&format!(
+                    "the link on the profile's device {:?} did not open: {error}",
+                    vci.library
+                ));
+                guard.finish(Outcome::Failed, &why);
+                panic!("{why}");
+            }
+        };
         handles.push(handle);
     }
     let masker = Masker::for_profile(&profile);

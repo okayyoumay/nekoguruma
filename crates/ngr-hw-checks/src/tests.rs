@@ -462,6 +462,14 @@ fn a_loopback_runs_between_two_ends_of_one_bus() {
         ),
         "runs on raw CAN",
     );
+    // A bare `_CH` names no channel index, and the worker does not map `CAN_CH`.
+    refused_for(
+        &loopback(
+            &with_protocol(vci_end, "CAN_CH"),
+            &partner(&with_protocol(&second_module, "CAN_CH")),
+        ),
+        "runs on raw CAN",
+    );
 
     // J2534 names its module by the configured entry: the same label or `pname` is one device,
     // and two entries reporting the same `module` are two.

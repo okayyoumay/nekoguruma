@@ -438,8 +438,6 @@ pub(crate) const PHYSICAL_COMPARAMS: &[&str] = &[
     "CP_CanBaudrateRecord",
 ];
 
-/// A channel name as the J2534 worker reads it: ASCII case ignored, surrounding spaces dropped,
-/// and a `_CH` index read as a number, so `CAN_CH1`, `can_ch1` and `CAN_CH01` are one channel.
 /// The bus framing a T0 loopback end uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Framing {
@@ -459,7 +457,13 @@ enum Framing {
 fn framing(protocol: &str) -> Option<Framing> {
     let key = channel_key(protocol).to_ascii_lowercase();
     let base = match key.rfind("_ch") {
-        Some(index) if key[index + 3..].bytes().all(|b| b.is_ascii_digit()) => &key[..index],
+        // A bare `_CH` is no channel index: the worker does not recognise `CAN_CH`.
+        Some(index)
+            if !key[index + 3..].is_empty()
+                && key[index + 3..].bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            &key[..index]
+        }
         _ => key.as_str(),
     };
     match base {
@@ -498,6 +502,8 @@ fn framing(protocol: &str) -> Option<Framing> {
     }
 }
 
+/// A channel name as the J2534 worker reads it: ASCII case ignored, surrounding spaces dropped,
+/// and a `_CH` index read as a number, so `CAN_CH1`, `can_ch1` and `CAN_CH01` are one channel.
 pub(crate) fn channel_key(name: &str) -> String {
     let upper = name.trim().to_ascii_uppercase();
     if let Some(index) = upper.rfind("_CH") {

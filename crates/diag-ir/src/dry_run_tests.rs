@@ -604,3 +604,106 @@ fn no_field_after_one_of_unknown_extent_adds_bytes() {
     assert_eq!(answer, [0x62, 0]);
     assert!(decoded.is_err(), "{decoded:?}");
 }
+
+// ---------------------------------------------------------------- FlashBlock (ADR-336 item 15)
+
+fn flash_document(segment: crate::declaration::FlashSegmentT) -> Vec<u8> {
+    use crate::declaration::FlashSessionT;
+    encode_ecu_document(&EcuDocumentT {
+        schema_version: IR_SCHEMA_VERSION,
+        source_format: Some("csv-starlark".into()),
+        source_digest: Some("00".into()),
+        variant: Some(Box::new(EcuVariantT {
+            id: 1,
+            flash_sessions: Some(vec![FlashSessionT {
+                id: 2,
+                segments: Some(vec![segment]),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        })),
+        procedure: None,
+    })
+}
+
+#[test]
+fn a_flash_block_is_served_as_zeros_of_the_blocks_length() {
+    let buf = flash_document(crate::declaration::FlashSegmentT {
+        artifact_offset: 16,
+        length: 10,
+        block_size: 4,
+        ..Default::default()
+    });
+    // The last block has two bytes; the log shows what the block held.
+    let program = program(
+        vec![
+            Op::PushI64(2),
+            Op::FlashBlock {
+                session: 2,
+                segment: 0,
+            },
+            Op::LogFromStack { level: 1 },
+        ],
+        vec![],
+    );
+    let report = run(&buf, &program, &Script::new());
+    assert_eq!(report.end, DryRunEnd::Finished);
+    assert_eq!(
+        report.events,
+        [DryRunEvent::Log {
+            level: 1,
+            message: "\0\0".into()
+        }]
+    );
+}
+
+#[test]
+fn a_flash_block_outside_the_declarations_ends_the_run_with_the_vms_error() {
+    let buf = flash_document(crate::declaration::FlashSegmentT {
+        length: 10,
+        block_size: 4,
+        ..Default::default()
+    });
+    let program = program(
+        vec![
+            Op::PushI64(3),
+            Op::FlashBlock {
+                session: 2,
+                segment: 0,
+            },
+        ],
+        vec![],
+    );
+    let report = run(&buf, &program, &Script::new());
+    assert_eq!(
+        report.end,
+        DryRunEnd::Vm(VmError::BlockOutOfRange {
+            session: 2,
+            segment: 0,
+            index: 3
+        })
+    );
+}
+
+#[test]
+fn flash_blocks_count_toward_the_budget() {
+    let buf = flash_document(crate::declaration::FlashSegmentT {
+        length: 1 << 20,
+        block_size: 1 << 20,
+        ..Default::default()
+    });
+    let program = program(
+        vec![
+            Op::PushI64(0),
+            Op::FlashBlock {
+                session: 2,
+                segment: 0,
+            },
+            Op::Pop,
+            Op::Jump(0),
+        ],
+        vec![],
+    );
+    let report = run(&buf, &program, &Script::new());
+    assert_eq!(report.end, DryRunEnd::Host(DryRunError::ReportTooLarge));
+}

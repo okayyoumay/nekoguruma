@@ -451,6 +451,9 @@ impl diag_ir::DiagHost for Recording {
     fn monitor_capture(&mut self, _: u32) -> Result<(), NotSent> {
         Err(NotSent)
     }
+    fn artifact_bytes(&mut self, _: u64, _: u32) -> Result<Vec<u8>, NotSent> {
+        Err(NotSent)
+    }
     fn log(&mut self, _: u8, _: &str) {}
 }
 
@@ -700,6 +703,9 @@ impl diag_ir::DiagHost for Answering {
         Err(NotSent)
     }
     fn monitor_capture(&mut self, _: u32) -> Result<(), NotSent> {
+        Err(NotSent)
+    }
+    fn artifact_bytes(&mut self, _: u64, _: u32) -> Result<Vec<u8>, NotSent> {
         Err(NotSent)
     }
     fn log(&mut self, _: u8, message: &str) {

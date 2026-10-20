@@ -175,6 +175,9 @@ impl DiagHost for Recording {
     fn monitor_capture(&mut self, _: u32) -> Result<(), NotSent> {
         Err(NotSent)
     }
+    fn artifact_bytes(&mut self, _: u64, _: u32) -> Result<Vec<u8>, NotSent> {
+        Err(NotSent)
+    }
     fn log(&mut self, level: u8, message: &str) {
         writeln!(self.out, "log {level} {message}").expect("a String");
     }

@@ -616,6 +616,9 @@ mod tests {
         fn monitor_capture(&mut self, _: u32) -> Result<(), HostError> {
             unreachable!()
         }
+        fn artifact_bytes(&mut self, _: u64, _: u32) -> Result<Vec<u8>, HostError> {
+            unreachable!()
+        }
         fn log(&mut self, _: u8, _: &str) {}
     }
 

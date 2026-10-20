@@ -41,7 +41,10 @@ use crate::declaration::{EcuVariant, Shape};
 /// 14: `Op` gained `WaitFromStack` and `VmError` gained `WaitOutOfRange`, for the same reason
 /// as version 3.
 /// 15: `Op` gained `LogFromStack`, for the same reason as version 3.
-pub const IR_SCHEMA_VERSION: u32 = 15;
+/// 16: `Op` gained `FlashBlock`, and `VmError` gained `UnknownFlashSession`,
+/// `UnknownFlashSegment`, `ZeroBlockSize`, `BlockOutOfRange` and `ArtifactLength`
+/// (ADR-336 item 11).
+pub const IR_SCHEMA_VERSION: u32 = 16;
 
 /// The longest code, in bytes, that `Program::validate` accepts for a `Fail` (ADR-280).
 pub const MAX_FAILURE_CODE_LEN: usize = 128;
@@ -233,6 +236,22 @@ pub enum Op {
     LogFromStack {
         level: u8,
     },
+
+    // Flash artifact. Appended after `LogFromStack` (ADR-233, ADR-336).
+    /// Pops the `I64` block index on top of the stack and pushes that block of a flash segment's
+    /// artifact bytes as `Bytes` (ADR-336 item 11). `session` is `FlashSession.id` and `segment`
+    /// an index into that session's `segments`, both in the declaration part the VM is stepped
+    /// with ([`Vm::step_with_declarations`]). The segment's blocks are `block_size` bytes each
+    /// from `artifact_offset`, the last one shorter when `length` is no multiple of it. The VM
+    /// asks [`DiagHost::artifact_bytes`] for the block and requires exactly its length back.
+    /// It sends nothing and is no diagnostic primitive. Stepping without declarations, an
+    /// unknown session or segment, a zero block size, an index below 0 or past the last block,
+    /// an artifact range that overflows, and a wrong-length answer are `VmError`s; a non-`I64`
+    /// operand is `VmError::TypeMismatch`.
+    FlashBlock {
+        session: u32,
+        segment: u32,
+    },
 }
 
 // ---------------------------------------------------------------- Program
@@ -350,6 +369,7 @@ impl Op {
             | Op::FloatToInt
             | Op::ShlChecked
             | Op::DecodeField { .. }
+            | Op::FlashBlock { .. }
             | Op::Fail { .. } => false,
         }
     }
@@ -446,6 +466,10 @@ pub trait DiagHost {
         template: &[u8],
     ) -> Result<Option<Vec<u8>>, Self::Error>;
     fn monitor_capture(&mut self, back_millis: u32) -> Result<(), Self::Error>;
+    /// [`Op::FlashBlock`]: `len` bytes of the flash artifact starting at `offset`, the range the
+    /// VM computed from the declared segment. The answer must be exactly `len` bytes long; the
+    /// VM refuses any other length (ADR-336 item 11).
+    fn artifact_bytes(&mut self, offset: u64, len: u32) -> Result<Vec<u8>, Self::Error>;
     fn log(&mut self, level: u8, message: &str);
 }
 
@@ -554,8 +578,8 @@ impl Vm {
     }
 
     /// [`Vm::step`] with the declaration part of the variant the program runs on, which
-    /// [`Op::DecodeField`] decodes through (ADR-316). Without it, `DecodeField` is
-    /// [`VmError::NoDeclarations`].
+    /// [`Op::DecodeField`] decodes through (ADR-316) and [`Op::FlashBlock`] finds its segment in
+    /// (ADR-336). Without it, both are [`VmError::NoDeclarations`].
     pub fn step_with_declarations<H: DiagHost>(
         &mut self,
         program: &Program,
@@ -676,6 +700,25 @@ impl Vm {
                 let declarations = declarations.ok_or(VmError::NoDeclarations)?;
                 let value = decode_field(declarations, *service, *field, message)?;
                 self.replace(1, value);
+            }
+            Op::FlashBlock { session, segment } => {
+                let [Value::I64(index)] = self.top(1)? else {
+                    return Err(VmError::TypeMismatch.into());
+                };
+                let index = *index;
+                let declarations = declarations.ok_or(VmError::NoDeclarations)?;
+                let (offset, len) = flash_block_range(declarations, *session, *segment, index)?;
+                // The stack is untouched until the answer is checked, so a wrong answer leaves
+                // the state on the instruction like a host error does.
+                let bytes = host.artifact_bytes(offset, len).map_err(StepError::Host)?;
+                if bytes.len() != len as usize {
+                    return Err(VmError::ArtifactLength {
+                        expected: len,
+                        got: bytes.len() as u64,
+                    }
+                    .into());
+                }
+                self.replace(1, Value::Bytes(bytes));
             }
             Op::Not => {
                 let Value::Bool(b) = self.top(1)?[0] else {
@@ -947,7 +990,8 @@ impl Vm {
             | Op::IntToFloat
             | Op::FloatToInt
             | Op::ShlChecked
-            | Op::DecodeField { .. } => HostInput::Nothing,
+            | Op::DecodeField { .. }
+            | Op::FlashBlock { .. } => HostInput::Nothing,
             // The checks of `Fail` run in `execute`, before it changes anything.
             Op::Fail { .. } => HostInput::Nothing,
         })
@@ -1091,11 +1135,66 @@ pub fn check_declarations(
                 .and_then(|s| s.positive())
                 .map(|_| ())
                 .ok_or(VmError::UnknownService { service: *service }),
+            Op::FlashBlock { session, segment } => {
+                declared_segment(variant, *session, *segment).map(|_| ())
+            }
             _ => Ok(()),
         };
         checked.map_err(|error| (u32::try_from(pc).unwrap_or(u32::MAX), error))?;
     }
     Ok(())
+}
+
+/// The offset, block size and length of segment `segment` (an index into `segments`) of flash
+/// session `session` (`FlashSession.id`), with the segment's block size checked to be non-zero.
+fn declared_segment(
+    variant: &EcuVariant<'_>,
+    session: u32,
+    segment: u32,
+) -> Result<(u64, u32, u64), VmError> {
+    let declared = variant
+        .flash_sessions()
+        .and_then(|sessions| sessions.iter().find(|s| s.id() == session))
+        .ok_or(VmError::UnknownFlashSession { session })?;
+    let found = declared
+        .segments()
+        .filter(|segments| (segment as usize) < segments.len())
+        .map(|segments| segments.get(segment as usize))
+        .ok_or(VmError::UnknownFlashSegment { session, segment })?;
+    if found.block_size() == 0 {
+        return Err(VmError::ZeroBlockSize { session, segment });
+    }
+    Ok((found.artifact_offset(), found.block_size(), found.length()))
+}
+
+/// The artifact offset and length of block `index` of the segment ([`Op::FlashBlock`]).
+fn flash_block_range(
+    variant: &EcuVariant<'_>,
+    session: u32,
+    segment: u32,
+    index: i64,
+) -> Result<(u64, u32), VmError> {
+    let (artifact_offset, block_size, length) = declared_segment(variant, session, segment)?;
+    let out_of_range = || VmError::BlockOutOfRange {
+        session,
+        segment,
+        index,
+    };
+    let block = u64::try_from(index).map_err(|_| out_of_range())?;
+    let size = u64::from(block_size);
+    if block >= length.div_ceil(size) {
+        return Err(out_of_range());
+    }
+    // Checked, not trusted: the document is data from outside.
+    let within = block.checked_mul(size).ok_or(VmError::Overflow)?;
+    let offset = artifact_offset
+        .checked_add(within)
+        .ok_or(VmError::Overflow)?;
+    let len = size.min(length - within);
+    if len > MAX_BYTES_LEN as u64 {
+        return Err(VmError::BytesTooLong(len));
+    }
+    Ok((offset, len as u32))
 }
 
 /// The positive response of `service` whose top-level field `field` is declared without a
@@ -1356,6 +1455,20 @@ pub enum VmError {
     UnknownService { service: u32 },
     #[error("wait duration out of range: {0}")]
     WaitOutOfRange(i64),
+    #[error("the declarations have no flash session {session}")]
+    UnknownFlashSession { session: u32 },
+    #[error("flash session {session} has no segment {segment}")]
+    UnknownFlashSegment { session: u32, segment: u32 },
+    #[error("segment {segment} of flash session {session} declares a block size of zero")]
+    ZeroBlockSize { session: u32, segment: u32 },
+    #[error("block {index} is outside segment {segment} of flash session {session}")]
+    BlockOutOfRange {
+        session: u32,
+        segment: u32,
+        index: i64,
+    },
+    #[error("the host gave {got} artifact bytes for a block of {expected}")]
+    ArtifactLength { expected: u32, got: u64 },
 }
 
 #[cfg(test)]

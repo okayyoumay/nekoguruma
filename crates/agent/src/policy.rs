@@ -205,6 +205,8 @@ pub fn check_program(
             | Op::ShlChecked
             // Decodes in the VM; sends nothing (ADR-316).
             | Op::DecodeField { .. }
+            // Reads the artifact through the host; sends nothing (ADR-336 item 12).
+            | Op::FlashBlock { .. }
             // Ends the procedure; sends nothing (ADR-280).
             | Op::Fail { .. } => None,
         };

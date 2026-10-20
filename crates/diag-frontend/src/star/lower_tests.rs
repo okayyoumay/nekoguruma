@@ -45,6 +45,9 @@ impl DiagHost for NoHost {
     fn monitor_capture(&mut self, _: u32) -> Result<(), NoHostError> {
         unreachable!("no primitive is lowered yet")
     }
+    fn artifact_bytes(&mut self, _: u64, _: u32) -> Result<Vec<u8>, NoHostError> {
+        unreachable!("no primitive is lowered yet")
+    }
     fn log(&mut self, _: u8, _: &str) {}
 }
 
@@ -1790,6 +1793,9 @@ impl DiagHost for ScriptedHost {
     fn monitor_capture(&mut self, back_millis: u32) -> Result<(), NoHostError> {
         self.calls.push(format!("capture {back_millis}"));
         Ok(())
+    }
+    fn artifact_bytes(&mut self, _: u64, _: u32) -> Result<Vec<u8>, NoHostError> {
+        unreachable!("no artifact is scripted")
     }
     fn log(&mut self, level: u8, message: &str) {
         self.calls.push(format!("log {level} {message}"));

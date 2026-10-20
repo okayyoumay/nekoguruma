@@ -3091,6 +3091,24 @@ mod tests {
             VmError::Undecodable { service: 0 },
             VmError::UnknownService { service: 0 },
             VmError::WaitOutOfRange(0),
+            VmError::UnknownFlashSession { session: 0 },
+            VmError::UnknownFlashSegment {
+                session: 0,
+                segment: 0,
+            },
+            VmError::ZeroBlockSize {
+                session: 0,
+                segment: 0,
+            },
+            VmError::BlockOutOfRange {
+                session: 0,
+                segment: 0,
+                index: 0,
+            },
+            VmError::ArtifactLength {
+                expected: 0,
+                got: 0,
+            },
         ];
         // The match fails to compile when a variant is added, so the list above stays complete.
         for error in &errors {
@@ -3120,7 +3138,12 @@ mod tests {
                 | VmError::ShapedField { .. }
                 | VmError::Undecodable { .. }
                 | VmError::UnknownService { .. }
-                | VmError::WaitOutOfRange(_) => {}
+                | VmError::WaitOutOfRange(_)
+                | VmError::UnknownFlashSession { .. }
+                | VmError::UnknownFlashSegment { .. }
+                | VmError::ZeroBlockSize { .. }
+                | VmError::BlockOutOfRange { .. }
+                | VmError::ArtifactLength { .. } => {}
             }
         }
         let encoded = |reason: RunStop| {

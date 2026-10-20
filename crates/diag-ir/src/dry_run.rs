@@ -694,6 +694,14 @@ impl DiagHost for ScriptedHost<'_, '_> {
         Ok(())
     }
 
+    // A dry run has no artifact: the block is zero bytes of the requested length (ADR-336 item
+    // 15). Charged before the allocation, so a large declared block cannot exhaust memory; it
+    // leaves no event, as it is no request.
+    fn artifact_bytes(&mut self, _offset: u64, len: u32) -> Result<Vec<u8>, DryRunError> {
+        self.charge(len as usize)?;
+        Ok(vec![0; len as usize])
+    }
+
     // `log` cannot fail, so a message past the budget is dropped and the run ends after this
     // step (`ScriptedHost::over_budget`).
     fn log(&mut self, level: u8, message: &str) {

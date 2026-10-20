@@ -165,6 +165,17 @@ pub enum HandleError {
     /// be registered.
     #[error(transparent)]
     TeardownClosed(#[from] TeardownClosed),
+    /// The link's receive-only monitor ended (a nonzero `CP_CyclicRespTimeout` can end it, or it
+    /// was cancelled), so nothing more arrives on the link.
+    #[error("the link's monitor ended; nothing more arrives on the link")]
+    MonitorEnded,
+    /// A raw frame was not transmitted: the worker reported a transmit error, cancelled the send,
+    /// or did not confirm it in time.
+    #[error("the frame was not sent: {0}")]
+    SendFailed(String),
+    /// The monitor's buffer is full of frames nobody asked for.
+    #[error("the link's monitor received more than {cap} unrelated frames")]
+    RawBufferFull { cap: usize },
     /// The primitive failed with this D-PDU error event code.
     #[error("the primitive failed with error event {0:#x}")]
     PrimitiveFailed(i32),
@@ -745,6 +756,14 @@ enum Outcome {
     Running(HandleError),
 }
 
+/// What `raw_wait` waits for.
+enum RawWait<'a> {
+    /// A frame on the monitor, equal to this.
+    Frame(&'a [u8]),
+    /// The end of this send.
+    SendEnd(ComPrimitiveHandle),
+}
+
 /// How a response to a UDS request begins, so the worker ends the primitive on an answer to this
 /// request only.
 struct Expectation {
@@ -979,6 +998,12 @@ fn is_definite_refusal(code: tonic::Code) -> bool {
             | Unauthenticated
     )
 }
+
+/// How many frames a link's monitor keeps for a later `raw_receive`.
+const RAW_BUFFER_CAP: usize = 1024;
+
+/// How long `raw_send` waits for the worker to confirm the transmission of a frame.
+const RAW_SEND_BOUND: Duration = Duration::from_secs(2);
 
 /// Whether a received frame is an echo of the link's own transmission, by its RxFlag: a loopback
 /// copy (`TX_MSG_TYPE`, bit 0 of the last byte) or a TX indication (bit 3), as SAE J2534-1
@@ -1925,12 +1950,25 @@ impl GuardedHandle {
                 })),
             }),
         };
-        self.start_com_primitive(request)
+        let cop = self
+            .start_com_primitive(request)
             .await?
             .cop_handle
             .ok_or_else(|| {
                 HandleError::Setup("StartComPrimitive returned no primitive handle".to_owned())
-            })
+            })?;
+        // The send's own events are read here, so a transmit error is the call's error (and the
+        // frames the monitor receives meanwhile are kept for `raw_receive`).
+        match self
+            .raw_wait(cll, RawWait::SendEnd(cop), RAW_SEND_BOUND)
+            .await
+        {
+            Ok(_) => Ok(cop),
+            Err(HandleError::NoResponse) => Err(HandleError::SendFailed(format!(
+                "no confirmation within {RAW_SEND_BOUND:?}"
+            ))),
+            Err(error) => Err(error),
+        }
     }
 
     /// Starts the receive-only primitive of `cll` (no send, receives until cancelled), whose
@@ -1942,6 +1980,11 @@ impl GuardedHandle {
         &mut self,
         cll: ComLogicalLinkHandle,
     ) -> Result<ComPrimitiveHandle, HandleError> {
+        // One monitor per link: the one that listens is returned, not replaced.
+        let existing = self.shared.lock().monitors.get(&cll.cll_handle).copied();
+        if let Some(cop) = existing {
+            return Ok(cop);
+        }
         let request = StartComPrimitiveRequest {
             cop_tag: None,
             cll_handle: Some(cll),
@@ -1984,21 +2027,36 @@ impl GuardedHandle {
     /// Waits up to `timeout` for the frame `expected` (the whole frame, as the sender's
     /// `raw_frame` built it) on the monitor of `cll`, and returns it. Echoes of the end's own
     /// transmissions (TX indications and loopback copies) are skipped. Frames of the monitor that
-    /// are not `expected` stay buffered for a later call, so the order of the calls does not lose
-    /// them. [`HandleError::NoResponse`] when the deadline passes.
+    /// are not `expected` stay buffered (up to 1024 per link, then
+    /// [`HandleError::RawBufferFull`]) for a later call, so the order of the calls does not lose
+    /// them. [`HandleError::NoResponse`] when the deadline passes, [`HandleError::MonitorEnded`]
+    /// when the monitor ended.
     pub async fn raw_receive(
         &mut self,
         cll: ComLogicalLinkHandle,
         expected: &[u8],
         timeout: Duration,
     ) -> Result<Vec<u8>, HandleError> {
-        let monitor = self
-            .shared
-            .lock()
-            .monitors
-            .get(&cll.cll_handle)
-            .copied()
-            .ok_or_else(|| HandleError::Setup("the link has no monitor (raw_listen)".to_owned()))?;
+        self.raw_wait(cll, RawWait::Frame(expected), timeout)
+            .await?
+            .ok_or(HandleError::NoResponse)
+    }
+
+    /// Reads the link's events until `wait` is met or `timeout` passes: the monitor's frames go
+    /// into the link's buffer (a `Frame` wait takes its frame out), and the events of the send a
+    /// `SendEnd` wait is for end it or fail it. Events of other primitives are dropped.
+    async fn raw_wait(
+        &self,
+        cll: ComLogicalLinkHandle,
+        wait: RawWait<'_>,
+        timeout: Duration,
+    ) -> Result<Option<Vec<u8>>, HandleError> {
+        let monitor = self.shared.lock().monitors.get(&cll.cll_handle).copied();
+        if matches!(wait, RawWait::Frame(_)) && monitor.is_none() {
+            return Err(HandleError::Setup(
+                "the link has no monitor (raw_listen)".to_owned(),
+            ));
+        }
         let events = self
             .shared
             .lock()
@@ -2012,12 +2070,12 @@ impl GuardedHandle {
             .unwrap_or_else(|| now + Duration::from_secs(86_400 * 365));
         let mut stream = events.lock().await;
         loop {
-            {
+            if let RawWait::Frame(expected) = wait {
                 let mut state = self.shared.lock();
                 if let Some(frames) = state.raw_frames.get_mut(&cll.cll_handle)
                     && let Some(at) = frames.iter().position(|frame| frame == expected)
                 {
-                    return Ok(frames.remove(at).expect("found above"));
+                    return Ok(frames.remove(at));
                 }
             }
             let notification = match tokio::time::timeout_at(deadline, stream.message()).await {
@@ -2033,29 +2091,59 @@ impl GuardedHandle {
                 }
                 None => continue,
             };
+            let send = match wait {
+                RawWait::SendEnd(cop) => Some(cop),
+                RawWait::Frame(_) => None,
+            };
+            let ours = |handle: Option<ComPrimitiveHandle>| {
+                handle.is_some() && (handle == monitor || handle == send)
+            };
             match item.data {
                 Some(event_item::Data::ErrorData(code))
                     if code == PduErrorEvent::PduErrEvtLostCommToVci as i32
-                        && item.cop_handle.is_none_or(|handle| handle == monitor) =>
+                        && (item.cop_handle.is_none() || ours(item.cop_handle)) =>
                 {
                     return Err(HandleError::VciLost);
                 }
-                _ if item.cop_handle != Some(monitor) => {}
-                Some(event_item::Data::ResultData(result)) if !is_echo(&result.rx_flag) => {
-                    self.shared
-                        .lock()
-                        .raw_frames
-                        .entry(cll.cll_handle)
-                        .or_default()
-                        .push_back(result.data_bytes);
+                Some(event_item::Data::ResultData(result))
+                    if item.cop_handle == monitor && !is_echo(&result.rx_flag) =>
+                {
+                    let mut state = self.shared.lock();
+                    let frames = state.raw_frames.entry(cll.cll_handle).or_default();
+                    if frames.len() >= RAW_BUFFER_CAP {
+                        return Err(HandleError::RawBufferFull {
+                            cap: RAW_BUFFER_CAP,
+                        });
+                    }
+                    frames.push_back(result.data_bytes);
+                }
+                Some(event_item::Data::ErrorData(code))
+                    if send.is_some()
+                        && item.cop_handle == send
+                        && code != PduErrorEvent::PduErrEvtRxTimeout as i32 =>
+                {
+                    return Err(HandleError::SendFailed(format!(
+                        "transmit error event {code:#x}"
+                    )));
                 }
                 Some(event_item::Data::CopStatus(status))
-                    if status == PduComPrimitiveStatus::PduCopstFinished as i32
-                        || status == PduComPrimitiveStatus::PduCopstCancelled as i32 =>
+                    if send.is_some() && item.cop_handle == send =>
+                {
+                    if status == PduComPrimitiveStatus::PduCopstFinished as i32 {
+                        return Ok(None);
+                    }
+                    if status == PduComPrimitiveStatus::PduCopstCancelled as i32 {
+                        return Err(HandleError::SendFailed("the send was cancelled".to_owned()));
+                    }
+                }
+                Some(event_item::Data::CopStatus(status))
+                    if item.cop_handle == monitor
+                        && (status == PduComPrimitiveStatus::PduCopstFinished as i32
+                            || status == PduComPrimitiveStatus::PduCopstCancelled as i32) =>
                 {
                     // The monitor ended: nothing more arrives on this link.
                     self.shared.lock().monitors.remove(&cll.cll_handle);
-                    return Err(HandleError::NoResponse);
+                    return Err(HandleError::MonitorEnded);
                 }
                 _ => {}
             }
@@ -3128,6 +3216,18 @@ mod tests {
         let long = Duration::from_secs(90);
         assert_eq!(device_close_timeout(long), long + Duration::from_secs(1));
         assert_eq!(device_close_timeout(Duration::MAX), Duration::MAX);
+    }
+
+    #[test]
+    fn a_frame_is_an_echo_when_its_rx_flag_has_a_tx_bit() {
+        // `TX_MSG_TYPE` and `TX_INDICATION` are the last byte's bits 0 and 3.
+        assert!(is_echo(&[0, 0, 0, 0x01]));
+        assert!(is_echo(&[0, 0, 0, 0x08]));
+        assert!(is_echo(&[0, 0, 0, 0x09]));
+        // Other bits (start of message, break) and an empty flag are not echoes.
+        assert!(!is_echo(&[0, 0, 0, 0x02]));
+        assert!(!is_echo(&[0, 0, 0, 0x04]));
+        assert!(!is_echo(&[]));
     }
 
     #[test]

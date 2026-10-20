@@ -97,12 +97,16 @@ fn vci_ends(profile: &Profile) -> Result<[Vci; 2], String> {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "real-hardware check, design 13.5: run with `cargo nextest run --profile hardware --run-ignored=only`"]
 async fn hw_t0_two_endpoint_loopback() {
+    // Declared before the run guard, so it is dropped after the guard's teardown: the workers
+    // (installed in it) are stopped by then.
+    let temp = tempfile::tempdir().expect("temporary directory");
     let (profile, mut guard) = begin(&T0_LOOPBACK_CHECK);
-    assert!(
-        std::env::var_os("NGR_J2534_DEFINITION_DIR").is_none(),
-        "NGR_J2534_DEFINITION_DIR replaces the OS lookup of the vendor's library (design 7.1.1, \
-         ADR-282); unset it for a hardware run"
-    );
+    if std::env::var_os("NGR_J2534_DEFINITION_DIR").is_some() {
+        let why = "NGR_J2534_DEFINITION_DIR replaces the OS lookup of the vendor's library \
+                   (design 7.1.1, ADR-282); unset it for a hardware run";
+        guard.finish(Outcome::Refused, why);
+        panic!("{why}");
+    }
     let ends = match vci_ends(&profile) {
         Ok(ends) => ends,
         Err(why) => {
@@ -110,16 +114,27 @@ async fn hw_t0_two_endpoint_loopback() {
             panic!("{why}");
         }
     };
-    let temp = tempfile::tempdir().expect("temporary directory");
     let layout = workers(temp.path());
     let options = LaunchOptions::default();
 
     let mut facts = Vec::new();
     let mut handles = Vec::new();
     for vci in &ends {
-        let device = open_device(vci, &layout, OperatingMode::User, &options)
-            .await
-            .expect("the profile's device opens");
+        let device = match open_device(vci, &layout, OperatingMode::User, &options).await {
+            Ok(device) => device,
+            Err(error) => {
+                // Without NGR_HW_WORKERS only the build for the host's ABI is installed, and a
+                // library of another ABI (a 32-bit DLL on Windows) needs its own worker.
+                let why = format!(
+                    "the profile's device {:?} did not open: {error}. If no worker is installed \
+                     for the library's ABI, set NGR_HW_WORKERS to a worker directory that holds \
+                     every ABI's build (design 7.3)",
+                    vci.library
+                );
+                guard.finish(Outcome::Failed, &Masker::for_profile(&profile).text(&why));
+                panic!("{why}");
+            }
+        };
         facts.push(DeviceFacts::of(&device, declared_long_size(vci)));
         let handle = GuardedHandle::open(
             &profile,

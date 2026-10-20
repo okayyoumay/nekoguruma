@@ -680,6 +680,19 @@ fn check_loopback(a: &Endpoint, b: &Endpoint) -> Result<(), ProfileError> {
             "a T0 loopback's endpoints share one bus: the same `baud_rate` and `id_bits`",
         ));
     }
+    // A link uses one address byte for the requests it sends and for the responses it accepts
+    // (`CP_CanPhysReqExtAddr` and `CP_CanRespUSDTExtAddr`), and the J2534 worker builds a link's
+    // flow-control filter from it, so each end receives only what carries its own address: the
+    // two ends must share the addressing and the address, or every frame is dropped and the
+    // failure looks like a hardware fault.
+    if x.addressing != y.addressing
+        || (x.addressing != Addressing::Normal && x.address != y.address)
+    {
+        return Err(invalid(
+            "a T0 loopback's endpoints share one `addressing` and, when addressed, one `address`: \
+             each end accepts only frames that carry its own address byte",
+        ));
+    }
     if x.request_id != y.response_id || x.response_id != y.request_id {
         return Err(invalid(
             "each T0 endpoint receives on the identifier the other sends on",

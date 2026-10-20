@@ -70,6 +70,12 @@ pub enum CheckError {
     /// A frame did not arrive, or arrived different.
     #[error("{0}")]
     Frame(String),
+    /// The sending end could not transmit a frame (a transmit error, a cancel, no confirmation).
+    #[error("{0}")]
+    Send(String),
+    /// The receiving end's monitor ended, so no frame can arrive.
+    #[error("{0}")]
+    Monitor(String),
 }
 
 impl CheckError {
@@ -82,8 +88,12 @@ impl CheckError {
     }
 }
 
-/// The ABI of the library is the worker's, and the width the worker ran with is the definition's
-/// `LongSize`, else the ABI's default (design 7.1.2).
+/// What this verifies, and no more: the ABI read from the library file's header is the ABI of the
+/// worker the launch chose (the launch resolved the worker from that same header, so a mismatch
+/// shows a launch that went wrong), and the width the launch passed to the worker is the
+/// registration definition's `LongSize`, else the ABI's default (design 7.1.2). The worker does
+/// not report its width or ABI back, so neither is read from the running worker; the frame round
+/// trip is what exercises the `unsigned long` fields in practice.
 pub fn check_abi(facts: &DeviceFacts) -> Result<(), CheckError> {
     let detected = detect_file(&facts.library).map_err(|error| {
         CheckError::Abi(format!(
@@ -220,11 +230,29 @@ pub async fn run(
             let bytes = payload(from, len);
             let (sender, from_cll) = end_of(&mut ends, from)?;
             let frame = sender.raw_frame(from_cll, &bytes)?;
-            sender.raw_send(from_cll, &bytes).await?;
+            sender
+                .raw_send(from_cll, &bytes)
+                .await
+                .map_err(|error| match error {
+                    HandleError::SendFailed(why) => CheckError::Send(format!(
+                        "end {from} could not send the {len}-byte frame {frame:02X?}: {why}"
+                    )),
+                    other => other.into(),
+                })?;
             let (receiver, to_cll) = end_of(&mut ends, to)?;
             let got = receiver.raw_receive(to_cll, &frame, frame_timeout).await;
             match got {
                 Ok(_) => {}
+                Err(HandleError::MonitorEnded) => {
+                    return Err(CheckError::Monitor(format!(
+                        "end {to}'s monitor ended before the {len}-byte frame {frame:02X?} arrived"
+                    )));
+                }
+                Err(HandleError::RawBufferFull { cap }) => {
+                    return Err(CheckError::Frame(format!(
+                        "end {to} received more than {cap} unrelated frames; the bus is not a quiet loopback"
+                    )));
+                }
                 Err(HandleError::NoResponse) => {
                     return Err(CheckError::Frame(format!(
                         "end {to} did not receive the {len}-byte frame {frame:02X?} end {from} sent within {frame_timeout:?}"
@@ -238,7 +266,8 @@ pub async fn run(
         .iter()
         .map(|facts| {
             format!(
-                "library {}, ABI {}, unsigned long {} bytes",
+                "library {}, ABI {} (its header matches the worker), unsigned long {} bytes \
+                 (the launch's setting, from the definition or the ABI default)",
                 facts.library.display(),
                 facts.abi.name(),
                 facts.long_size

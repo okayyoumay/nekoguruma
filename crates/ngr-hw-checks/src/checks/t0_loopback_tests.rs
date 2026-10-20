@@ -80,4 +80,9 @@ fn a_refusal_is_refused_and_every_other_failure_failed() {
     );
     assert_eq!(CheckError::Frame(String::new()).outcome(), Outcome::Failed);
     assert_eq!(CheckError::Abi(String::new()).outcome(), Outcome::Failed);
+    assert_eq!(CheckError::Send(String::new()).outcome(), Outcome::Failed);
+    assert_eq!(
+        CheckError::Monitor(String::new()).outcome(),
+        Outcome::Failed
+    );
 }

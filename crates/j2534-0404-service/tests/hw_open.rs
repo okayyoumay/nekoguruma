@@ -106,6 +106,12 @@ async fn open(vci: &Vci, modules: &[(&str, &str)]) -> Result<Stopped, OpenError>
     )
     .await?;
     assert_eq!(device.abi(), env.abi);
+    // What the launch resolved reaches the opened device: the library of the definition the
+    // lookup found, and the width the worker was started with (no `LongSize` declared here, so
+    // the ABI's default).
+    let library = j2534_0404_mock::mock_library_path().expect("the mock cdylib");
+    assert_eq!(device.library().file_name(), library.file_name());
+    assert_eq!(device.long_size(), env.abi.default_long_size());
     assert_eq!(device.module().name, "Bench 1");
     assert_eq!(device.module().additional_info, LIBRARY_NAME);
     assert_eq!(device.version().hw_name, "1.0.0");

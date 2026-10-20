@@ -448,6 +448,33 @@ fn a_loopback_runs_between_two_ends_of_one_bus() {
     refused_for(&rate, "one bus");
     let width = T0_PROFILE.replacen("id_bits = 11", "id_bits = 29", 1);
     refused_for(&width, "one bus");
+    // The two ends share the addressing and, when addressed, the address byte.
+    let extended_both = |a: &str, b: &str| {
+        let first = T0_PROFILE.replacen(
+            "addressing = \"normal\"",
+            &format!("addressing = \"extended\"\naddress = {a}"),
+            1,
+        );
+        first.replacen(
+            "addressing = \"normal\"",
+            &format!("addressing = \"extended\"\naddress = {b}"),
+            1,
+        )
+    };
+    parse(&extended_both("0x55", "0x55")).unwrap();
+    refused_for(&extended_both("0x10", "0xF1"), "share one `addressing`");
+    let one_extended = T0_PROFILE.replacen(
+        "addressing = \"normal\"",
+        "addressing = \"extended\"\naddress = 0x55",
+        1,
+    );
+    refused_for(&one_extended, "share one `addressing`");
+    let mixed_and_extended = extended_both("0x55", "0x55").replacen(
+        "addressing = \"extended\"",
+        "addressing = \"mixed\"",
+        1,
+    );
+    refused_for(&mixed_and_extended, "share one `addressing`");
     let not_crossed = T0_PROFILE.replacen("request_id = 0x124", "request_id = 0x125", 1);
     refused_for(&not_crossed, "receives on the identifier");
 }

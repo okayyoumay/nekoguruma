@@ -399,17 +399,25 @@ function over guarded handles and the profile, so CI runs it against `j2534-0404
   and names the frame. The result message records the library path, the ABI and the `unsigned
   long` width of each device, masked as the report masks. Both ends must be J2534 VCI ends: a
   SocketCAN end or a D-PDU API end is refused with nothing sent.
-- **ABI check (design 7.1.2).** For each device the ABI detected from the library file must be
-  the worker's, and the width the worker ran with must be the registration definition's
-  `LongSize`, else the ABI's default (the test looks the definition up the way the launch did; on
-  Windows it checks the default only). `OpenedDevice::library()` and `long_size()` give what the
-  launch resolved (`agent::launch::LaunchedWorker`). The exact frame round trip confirms the
-  width in practice.
+- **ABI check (design 7.1.2).** For each device the ABI read from the library file's header must
+  be the worker's, and the width the launch passed to the worker must be the registration
+  definition's `LongSize`, else the ABI's default (the test looks the definition up the way the
+  launch did; on Windows it checks the default only). That is all it verifies: the worker does not
+  report its width or ABI back, so neither is read from the running worker, and a mismatch shows a
+  launch that went wrong. `OpenedDevice::library()` and `long_size()` give what the launch
+  resolved (`agent::launch::LaunchedWorker`). The exact frame round trip is what exercises the
+  `unsigned long` fields in practice; the result message says what each value is.
+- **Addressing of the ends.** A link uses one address byte for the requests it sends and for the
+  responses it accepts, and the worker builds its flow-control filter from it, so the profile
+  check refuses a T0 loopback whose two ends differ in `addressing`, or in `address` when
+  addressed: every frame would be dropped, and the failure would look like a hardware fault.
 - **Workers and the library.** The worker directory (`<abi>/j2534-0404-service`, design 7.3) is
   the root `NGR_HW_WORKERS` names, else this workspace's build for the host ABI, installed in a
   temporary directory. The vendor's library is found by the OS lookup (design 7.1.1): the test fails
   if `NGR_J2534_DEFINITION_DIR`, the debug override of that lookup (ADR-282), is set. The test is
-  not gated on `debug_assertions`.
+  not gated on `debug_assertions`. A launch that finds no worker for a library's ABI (a 32-bit DLL on Windows without
+  `NGR_HW_WORKERS`) fails the check with a message that says to set it, and the temporary
+  directory outlives the run's teardown.
 - **Raw API.** On a T0 link the handle offers `raw_flags`, `raw_frame`, `raw_send`, `raw_listen`
   and `raw_receive`, each decided by the guard and refused on a non-T0 or non-RawMode link.
   `raw_flags` is the profile's TxFlags (29-bit identifier, extended addressing, padding), and
@@ -423,8 +431,12 @@ function over guarded handles and the profile, so CI runs it against `j2534-0404
   request identifier, the address byte if any, then the payload, in `ResultData.data_bytes` with
   no header split. `raw_receive(cll, expected, timeout)` returns the first frame equal to
   `expected`, skips the echoes of the link's own transmissions (the `TX_MSG_TYPE` and
-  `TX_INDICATION` RxFlag bits) and buffers other frames of the monitor for a later call, so the
-  order of the calls loses none; `NoResponse` when the deadline passes.
+  `TX_INDICATION` RxFlag bits) and buffers other frames of the monitor for a later call (up to
+  1024 per link, then `RawBufferFull`), so the order of the calls loses none; `NoResponse` when the
+  deadline passes and `MonitorEnded` when the monitor ended (a cancel, or a nonzero pinned
+  `CP_CyclicRespTimeout`). `raw_send` also waits (2 s) for the send's own end, so a transmit error
+  is `SendFailed`, which the check reports as a send failure of that end. A link has one monitor:
+  a second `raw_listen` returns it.
 - **One module, two channels.** The check takes the two ends as one handle with two links or as
   two handles. The test runs two modules: a link on an additional channel (`..._CH1`, SAE J2534-2
   clause 7) is made by the worker from a compound protocol name that `GetResourceIds` does not

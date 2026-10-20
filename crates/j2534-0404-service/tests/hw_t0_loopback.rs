@@ -197,6 +197,11 @@ async fn hw_t0_two_endpoint_loopback() {
     drop((first, second));
     match result {
         Ok(message) => guard.finish(Outcome::Passed, &message),
-        Err(error) => guard.finish(error.outcome(), &masker.text(&error.to_string())),
+        Err(error) => {
+            // The report keeps the outcome; the test still fails, so the run command does too.
+            let why = masker.text(&error.to_string());
+            guard.finish(error.outcome(), &why);
+            panic!("{why}");
+        }
     }
 }

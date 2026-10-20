@@ -31,19 +31,25 @@ What a decision has to work with:
 
 ## Decision
 
+In this decision a diagnostic primitive is *safe to repeat* when at least one section covers it
+and every section covering it is `Safe`. A primitive outside every section, or covered by a
+`Safe` and a non-`Safe` section at once (possible in hand-built IR, which `Program::validate`
+accepts), is not: the readers combine covering sections conservatively (ADR-332 item 5), and
+items 1 to 3 read them the same way.
+
 1. **Every journaled job keeps a journal.** `run_program_journaled` and
    `resume_program_journaled` create and open one for every program, not only for one with a
    plan or a `RecoveryRequired` section. `ngr-agent run` still keeps none. A missing journal at
    a resume is a plain start only for a program with no plan, no `RecoveryRequired` section and
-   no primitive outside the plans that is not `Safe`. For every other program it is
+   no primitive outside the plans that is not safe to repeat. For every other program it is
    `OnSiteInterventionRequired(MissingJournal)`: a lost journal cannot be told from a crash after
    a write. This generalises ADR-293's missing-journal rule.
 2. **Two new append-only records**, with no format version change (the ADR-244 pattern).
    - `Checkpoint { at, vm_state }` is committed after every diagnostic primitive outside every
      plan's range (a plan's range runs from its entry to its post-transfer end). It is skipped
      where the step already writes a boundary state at the same step count.
-   - `Request { at }` is committed before every primitive outside the plans whose covering
-     section is not `Safe`. The runner takes the cancel check there that intents have
+   - `Request { at }` is committed before every primitive outside the plans that is not safe to
+     repeat. The runner takes the cancel check there that intents have
      (ADR-291).
 
    They fold into new facts only: the latest checkpoint (the newest record that carries a VM
@@ -63,7 +69,7 @@ What a decision has to work with:
    - otherwise the job resumes from the latest checkpoint when all of these hold (the
      continuation runs in whatever session the ECU is in, item 8):
      - (S) every diagnostic primitive reachable from the checkpoint's pc outside every plan is
-       covered only by `Safe` sections, none of them `RecoveryRequired`, and no plan entry is
+       safe to repeat and covered by no `RecoveryRequired` section, and no plan entry is
        reachable. Reachability is the forward closure over jumps, calls and returns, and is
        conservative;
      - (I) the checkpoint's pc is an interruptible point in ADR-330's sense;
@@ -72,8 +78,8 @@ What a decision has to work with:
      primitive ahead, recovery-required section ahead, plan ahead, uninterruptible section, no
      identity.
 
-   A pc outside every section counts as not `Safe` for S, as ADR-271's continuation rule reads
-   it. I is exactly the runner's interruptible-point marking of ADR-330: a pc outside every
+   A primitive outside every section is not safe to repeat for S, as ADR-271's continuation
+   rule reads it. I is exactly the runner's interruptible-point marking of ADR-330: a pc outside every
    section is an interruptible point except a `Ret` (ADR-330 item 2), so a checkpoint standing on
    the return after a `No` section's last primitive is not one, and the job ends on site
    (uninterruptible section) as item 5 requires. This is ADR-271 item 4's all-`Safe`

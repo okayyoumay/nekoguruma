@@ -610,6 +610,13 @@ interruptibility and expected duration, and the function's range is cut around i
 lowered program the sections therefore never overlap, and each diagnostic primitive is covered by
 exactly one (ADR-332).
 
+`Safe` means that a repeat is harmless and that the primitive behaves correctly in any session
+and security state the procedure can leave the ECU in: its default session after a timeout, or
+the session and unlock the procedure had entered. A restarted agent resumes a plain procedure in
+whatever state the ECU is in, and only when everything after its last write is `Safe`
+(ADR-335). The defaults above treat a read as working in either state, so a read that the ECU
+serves only in a non-default session or after an unlock needs `# @idempotency unsafe`.
+
 - **Extent.** An annotation applies to every diagnostic primitive its statement lowers to,
   including those of the nested statements of an `if` or a `for`. An annotation on a
   nested statement takes precedence there. It does not reach:

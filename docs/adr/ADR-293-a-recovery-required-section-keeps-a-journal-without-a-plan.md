@@ -1,7 +1,7 @@
 # ADR-293: A `RecoveryRequired` Section Keeps a Journal without a Flash Recovery Plan
 
 **Date:** 2026-10-14
-**Status:** Accepted (a job with several target combinations keeps a journal when any of them would, by ADR-325 item 7)
+**Status:** Accepted (a job with several target combinations keeps a journal when any of them would, by ADR-325 item 7; items 1 to 3 amended by ADR-335: every journaled job keeps a journal, and a missing one is a plain start only for an all-`Safe` program)
 **Affects:** `agent` (`src/restart.rs`, `src/runner.rs`, `docs/ngr-agent.md`); ADR-252 item 7,
 ADR-291 Consequences
 

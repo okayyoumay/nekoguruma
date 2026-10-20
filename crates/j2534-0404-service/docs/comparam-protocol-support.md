@@ -637,8 +637,8 @@ auto-handler's per-occurrence reload window: each 0x78 reloads the response
 deadline to `now + CP_P2Star` (ISO 14229-2 (2021) 9.2 P2*client semantics,
 ADR-102 — supersedes ADR-057's anchor-once treatment of this value).
 `CP_RC78CompletionTimeout` below is a separate, independent total-duration
-ceiling. `CP_P2Star_Ecu`/`CP_P2Max_Ecu` remain stored-only by design: ISO 22900-2
-defines them as the server's own response-timing requirements (smaller than
+ceiling. `CP_P2Star_Ecu`/`CP_P2Max_Ecu` remain stored-only by design: ISO 22900-2 (2022)
+B.5.1 (2009: Table B.19) defines them as the server's own response-timing requirements (smaller than
 the client's `CP_P2Star`/`CP_P2Max`), which a tester has no use for (ADR-056).
 
 ¹ `CP_ModifyTiming` on KWP is no longer purely passive storage: when

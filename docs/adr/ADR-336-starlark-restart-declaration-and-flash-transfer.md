@@ -68,7 +68,10 @@ comment annotations next to the code they describe.
    becomes a jump to the join, its locals take fresh slots in `main`'s frame, and its section
    pieces (ADR-332 item 4) are laid over the inlined range. Inlined instructions count toward
    the copy limits. A section function inlined in a plan is entered by fallthrough at its first
-   piece, which amends ADR-332 item 6.
+   piece, which amends ADR-332 item 6. The plan function's own section (item 2) covers the whole
+   expansion, inlined code included, and an inlined piece marked `interruptible` does not lift it:
+   a cancel is held wherever any covering section is not `Yes` (ADR-330), so the plan stays
+   uninterruptible from its entry to its end.
 4. **Boundaries are derived from the lowered code.** The plan's entry is the first instruction of
    the expansion, and its post-transfer end is the pc after the last. The transfer exit is the
    `ServiceRequest 0x37` the expansion emits. The erase point is the `RoutineControl` of the
@@ -173,11 +176,8 @@ Rejected alternatives:
   is a `Call` change (design 12.1's golden update).
 - A run carries about 110,000 blocks at the default step limit, so an image larger than that
   times `block_size` needs a higher limit or several runs.
-- `block_size + 2` is also capped by the worker's message size; J2534 v04.04 has a limit the
-  agent does not yet check at the job.
-- Follow-ups: several downloads per plan (needs the ADR-245 amendment), a host-computed digest for
-  CheckMemory, a RequestTransferExit parameter record, precondition sources on another target, and
-  the check of `block_size + 2` against the worker's message size.
+- `block_size + 2` is also capped by the worker's message size; J2534 v04.04 has such a limit.
+- One download per plan (item 13) stays until the journal and ADR-245 are amended for several.
 - ADR-245, ADR-250, ADR-254, ADR-295, ADR-301, ADR-304, ADR-318, ADR-328, ADR-332 and ADR-335
   carry a status annotation pointing here. ADR-301's open question on a plan is answered by
   item 3, and ADR-335's remedy for session control by item 8. ADR-330 item 4's cancel held inside

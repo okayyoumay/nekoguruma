@@ -580,6 +580,9 @@ authentication time (8.10.1) each time the function is called.
   makes the range from the erase to the completed write uninterruptible (`STAR_PLAN_SHAPE`). A section
   function that a plan function reaches is not called there: it is expanded in place, entered by
   fallthrough at its first piece (ADR-336 item 3; this changes the entry rule above for that case).
+  The plan function's own section covers the whole expansion, inlined code included; an inlined
+  `interruptible` piece does not lift it, since a cancel is held wherever any covering section is
+  not `interruptible` (ADR-330).
 - **No nesting.** A call to a section function from anything that runs inside a section,
   directly or through other functions or function arguments, is rejected at that call
   (`STAR_BAD_ANNOTATION`). A call to a section function from outside every section, as many

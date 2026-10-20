@@ -111,9 +111,10 @@ What a decision has to work with:
    and it behaves correctly in any session and security state the procedure can leave the ECU
    in: the default session after a timeout, or the session and unlock the procedure had
    entered. A continuation that is all `Safe` changes nothing whichever of these holds, so
-   running it in the residual state is sound. An author whose read needs a particular session
-   leaves it unannotated (`Unsafe` by the 4.6 defaults), which makes the resume end on site
-   instead.
+   running it in the residual state is sound. The 4.6 defaults make every read `Safe`, so an
+   author whose read, DTC read, `ecu_info` or `precondition` needs a particular session (or
+   unlock) annotates it `# @idempotency unsafe`, which makes the resume end on site instead; an
+   unannotated read is taken to work in either state.
 
 Rejected alternatives:
 - **Resume at the checkpoint whenever S holds, even if no request was sent.** It skips `Safe`

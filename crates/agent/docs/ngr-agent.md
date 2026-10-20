@@ -221,6 +221,10 @@ logged. No on-site ending is journaled.
 `ngr-agent run` uses `run_program` and keeps no journal; it sends read-only requests, or any
 request to `sim-vci` or `iso22900-mock` in a debug build (ADR-247, ADR-331).
 
+ADR-335 decides the journal of a plain procedure (a program outside its plans): a journal for every
+journaled job, the `Checkpoint` and `Request` records and their folds. The records, and the
+missing-journal rule it changes, are not implemented; this section describes the journal as built.
+
 ## Restart classification
 
 `agent::restart::classify` reads a job's journal with the program and decides, without
@@ -260,6 +264,11 @@ counts it. It must decode, pass `Vm::check_state` and stand at the
 plan's entry; otherwise, or for a stage the program does not declare, the decision is
 `OnSiteInterventionRequired`. Its step count continues after the journal's last record
 (`restart::next_steps`), so the restart's records come after the old ones.
+
+ADR-335 decides how a restart classifies a plain procedure (a plain start, a resume from the latest
+checkpoint, or on-site intervention with the reasons `UnconfirmedRequest`, `NotResumable`,
+`ProcedureResumeLimitReached` and `ProcedureIdentityNotEstablished`). None of it is implemented;
+the table above is the classification as built.
 
 ## Restart entry
 

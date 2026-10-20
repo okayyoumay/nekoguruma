@@ -610,6 +610,10 @@ interruptibility and expected duration, and the function's range is cut around i
 lowered program the sections therefore never overlap, and each diagnostic primitive is covered by
 exactly one (ADR-332).
 
+`Safe` means that a repeat is harmless and tolerates a fresh link in the default session, which is
+what a restarted agent offers. A plain procedure is resumable after its writes only if everything
+after them is `Safe` (ADR-335).
+
 - **Extent.** An annotation applies to every diagnostic primitive its statement lowers to,
   including those of the nested statements of an `if` or a `for`. An annotation on a
   nested statement takes precedence there. It does not reach:

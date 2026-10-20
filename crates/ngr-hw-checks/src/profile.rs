@@ -446,7 +446,8 @@ enum Framing {
     /// Raw CAN (`CAN`, `ISO_11898_RAW`, their additional channels): bus payloads as they are.
     RawCan,
     /// ISO 15765 transport (`ISO15765`, `ISO-TP`, `ISO_14229_3_on_ISO_15765_2` and the other
-    /// ISO 22900-2 names over ISO 15765, their additional channels), which segments payloads.
+    /// ISO 22900-2 (2022) Annex B.1 names over ISO 15765, their additional channels), which
+    /// segments payloads.
     Iso15765,
 }
 

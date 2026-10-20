@@ -395,7 +395,7 @@ function over guarded handles and the profile, so CI runs it against `j2534-0404
 
 The profile parser refuses a loopback whose two ends cannot exchange the same bytes: the ends must
 be both raw CAN (`CAN`, `ISO_11898_RAW`) or both ISO 15765 (`ISO15765`, `ISO-TP`, an ISO 22900-2
-name over ISO 15765, or an additional channel of one; names match ignoring case), since an ISO 15765
+(2022) Annex B.1 name over ISO 15765, or an additional channel of one; names match ignoring case), since an ISO 15765
 end segments its payload and a raw CAN end does not; any other protocol is refused; and they must share
 the `addressing` and, when addressed, the `address`, since each end accepts only frames carrying
 its own address byte.

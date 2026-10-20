@@ -23,7 +23,7 @@ use diag_ir::declaration::{EcuVariant, LengthKind, Request};
 use diag_ir::encode::{ParamValue, encode_request};
 use diag_ir::{
     IR_SCHEMA_VERSION, Idempotency, Interruptible, Op, PreconditionKind, Preconditions, Program,
-    Section, SourceSpan,
+    ProgramError, Section, SourceSpan,
 };
 use starlark_syntax::codemap::Span;
 use starlark_syntax::lexer::TokenInt;
@@ -137,6 +137,28 @@ pub struct Lowered {
     pub warnings: Vec<StarError>,
 }
 
+/// The error for a program `validate` refused (ADR-336 item 4): `STAR_PLAN_INVALID` at the source
+/// span of the instruction the error names, and `STAR_NOT_LOWERABLE` at the start of the file for
+/// one that names none (or one past the code). `spans` holds each instruction's source span.
+fn invalid_program(checked: &Checked, spans: &[Span], error: &ProgramError) -> Pending {
+    let hint = format!("the lowered program is not valid: {error}");
+    match error.pc().and_then(|pc| spans.get(pc as usize)) {
+        Some(span) => Pending {
+            code: StarCode::PlanInvalid,
+            span: *span,
+            hint,
+        },
+        None => {
+            let span = checked.module.statement().span;
+            Pending {
+                code: StarCode::NotLowerable,
+                span: Span::new(span.begin(), span.begin()),
+                hint,
+            }
+        }
+    }
+}
+
 fn lower_here<'a>(
     file: &str,
     checked: &'a Checked,
@@ -160,18 +182,13 @@ fn lower_here<'a>(
         let errors = std::mem::take(&mut lowerer.errors);
         return Err(resolve(file, &checked.module, errors));
     }
-    let program = lowerer.assemble();
+    let (program, spans) = lowerer.assemble();
     // Every check `validate` makes is one the lowering guarantees by construction.
     if let Err(error) = program.validate() {
-        let span = checked.module.statement().span;
         return Err(resolve(
             file,
             &checked.module,
-            vec![Pending {
-                code: StarCode::NotLowerable,
-                span: Span::new(span.begin(), span.begin()),
-                hint: format!("the lowered program is not valid: {error}"),
-            }],
+            vec![invalid_program(checked, &spans, &error)],
         ));
     }
     let warnings = std::mem::take(&mut lowerer.warnings);
@@ -957,7 +974,7 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    /// Lists the copies the program holds (ADR-301): starting from the entry's call to `main`,
+    /// Lists the copies the program holds (ADR-301): starting from `main`,
     /// each call reaches the copy [`Lowerer::copy_for`] names, so every function a section
     /// reaches gets a copy that only that section runs, and a function also called outside every
     /// section keeps its own copy there. The copies a section needs count toward the budgets of
@@ -4721,16 +4738,14 @@ impl<'a> Lowerer<'a> {
 
     // ------------------------------------------------------------ Assembly
 
-    /// Lays out the entry (a call to `main`, then the end) and the copies of the functions, and
+    /// Lays out the copies of the functions, `main`'s body first and ending in a `Ret`, and
     /// resolves labels, calls and source positions. Every diagnostic primitive gets a `Section`
     /// over that instruction alone, with the idempotency of its `diag` call. Each copy that runs
     /// in a section is covered, without a gap, by such sections and by `CheckState` pieces
     /// between them (ADR-329), all with that section function's interruptibility and expected
     /// duration (ADR-301). A primitive outside every section is `Yes` with duration 0. The
     /// sections never overlap (ADR-332).
-    fn assemble(&mut self) -> Program {
-        let main = self.by_name.get("main").copied().unwrap_or(0);
-        let entry_span = self.funcs[main].def.name.span;
+    fn assemble(&mut self) -> (Program, Vec<Span>) {
         // Labels are unique within a function's body, so a copy's are told apart by its index.
         let index: HashMap<FuncCopy, usize> = self
             .copies
@@ -4738,15 +4753,12 @@ impl<'a> Lowerer<'a> {
             .enumerate()
             .map(|(at, copy)| (*copy, at))
             .collect();
-        // The entry belongs to no copy and runs outside every section.
-        const ENTRY: usize = usize::MAX;
-        let mut code: Vec<(Ins, Span, usize)> = vec![
-            (Ins::Call(main), entry_span, ENTRY),
-            (Ins::Op(Op::Ret), entry_span, ENTRY),
-        ];
+        // `main`'s copy is the first and begins at pc 0 (ADR-336 item 5): the program runs it in
+        // the top-level frame, and its closing `Ret` ends the program.
+        let mut code: Vec<(Ins, Span, usize)> = Vec::new();
         // The sections, in layout order and so by start pc (ADR-332).
         let mut sections: Vec<Section> = Vec::new();
-        let mut pc = 2u32;
+        let mut pc = 0u32;
         for (at, copy) in self.copies.iter().enumerate() {
             let start = pc;
             let mut primitives: Vec<(u32, Idempotency)> = Vec::new();
@@ -4815,7 +4827,7 @@ impl<'a> Lowerer<'a> {
             spans.push(span);
         }
         let source_map = self.source_map(&spans);
-        Program {
+        let program = Program {
             schema_version: IR_SCHEMA_VERSION,
             code: ops,
             constants: std::mem::take(&mut self.pool),
@@ -4824,7 +4836,8 @@ impl<'a> Lowerer<'a> {
             identity: self.requests.identity.clone(),
             preconditions: self.preconditions.clone(),
             flash: Default::default(),
-        }
+        };
+        (program, spans)
     }
 
     /// One entry for each run of instructions from the same source position; an entry covers
@@ -4964,15 +4977,16 @@ fn binary_hint(op: BinOp, a: Ty, b: Ty) -> String {
 /// The idempotency of a primitive that `diag.{call}` lowered to, when no `@idempotency` applies
 /// (subset 4.6). It follows the Starlark call, not the instruction: every instruction of
 /// `security_access` is `CheckState`. A `request` follows its service identifier, which the
-/// request instruction holds: a read of data or of DTC information (0x22, 0x19) is `Safe`, any
-/// other service `Unsafe`. Every call of the table is listed, and a name not in it is `Unsafe`,
+/// request instruction holds: a read of data or of DTC information (0x22, 0x19), a
+/// DiagnosticSessionControl (0x10) and a TesterPresent (0x3E) are `Safe` (a repeat re-enters the
+/// session and is harmless in any state, ADR-336 item 8), any other service `Unsafe`. Every call of the table is listed, and a name not in it is `Unsafe`,
 /// so a call that starts to lower cannot become `Safe` by default.
 fn default_idempotency(call: &str, op: &Op) -> Idempotency {
     match (call, op) {
         (
             "request",
             Op::ServiceRequest {
-                service: 0x22 | 0x19,
+                service: 0x22 | 0x19 | 0x10 | 0x3E,
             },
         ) => Idempotency::Safe,
         ("request", _) => Idempotency::Unsafe,

@@ -4187,3 +4187,22 @@ mod flash_block {
         );
     }
 }
+
+#[test]
+fn a_program_error_names_its_pc_only_when_it_has_one() {
+    assert_eq!(ProgramError::DownloadOutsidePlan { pc: 7 }.pc(), Some(7));
+    assert_eq!(
+        ProgramError::TransferInterrupted {
+            flash_session: 1,
+            pc: 9,
+            service: 0x10
+        }
+        .pc(),
+        Some(9)
+    );
+    assert_eq!(
+        ProgramError::BoundaryOutOfOrder { flash_session: 1 }.pc(),
+        None
+    );
+    assert_eq!(ProgramError::InvalidSection { section: 0 }.pc(), None);
+}

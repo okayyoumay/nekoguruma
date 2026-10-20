@@ -361,6 +361,30 @@ pub enum ProgramError {
     ReservedStage { flash_session: u32, stage: u32 },
 }
 
+impl ProgramError {
+    /// The instruction the error names, when it names one: the position a front end can map back
+    /// to its source. It may lie outside the code (`RecoveryRequiredOutOfRange`).
+    pub fn pc(&self) -> Option<u32> {
+        match self {
+            Self::BadFailureCode { pc }
+            | Self::WrongBoundaryInstruction { pc, .. }
+            | Self::RecoveryRequiredOutOfRange { pc, .. }
+            | Self::JumpOutOfRecovery { pc, .. }
+            | Self::BackwardJumpAcrossRecovery { pc, .. }
+            | Self::CallOrReturnInPlan { pc, .. }
+            | Self::ControlFlowIntoPlan { pc, .. }
+            | Self::DownloadOutsidePlan { pc }
+            | Self::FlashBlockOutsidePlan { pc }
+            | Self::FlashBlockSessionMismatch { pc, .. }
+            | Self::UndeclaredTransferBoundary { pc, .. }
+            | Self::TransferBeforeRequestDownload { pc, .. }
+            | Self::TransferInterrupted { pc, .. }
+            | Self::PlanInSubroutine { pc, .. } => Some(*pc),
+            _ => None,
+        }
+    }
+}
+
 /// The stage id the agent's journal keeps the resume count of a plain procedure under, the step
 /// ranges outside every plan (ADR-335 item 6). No recovery plan may use it
 /// ([`ProgramError::ReservedStage`]).

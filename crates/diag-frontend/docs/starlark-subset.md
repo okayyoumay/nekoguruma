@@ -42,7 +42,8 @@ reports `STAR_SYNTAX_ERROR` at its first byte that is not. The top level
 holds only constant assignments and `def` statements, and a docstring may open the file and each
 function. A top-level constant cannot call `diag` or a function of the file, which run only
 from `main`. The procedure's entry point is `def main():`, which takes no parameters; the VM
-starts there. A file without `main`, or whose `main` takes parameters, is rejected
+starts there: `main`'s body is the program's first instruction and ends in a `Ret`, with the other
+functions after it, so nothing calls `main` (4.9). A file without `main`, or whose `main` takes parameters, is rejected
 (`STAR_NO_MAIN`).
 
 ### 2.2 Accepted
@@ -600,13 +601,13 @@ used:
 
 | Call | Default |
 |---|---|
-| `request` with a read service (ReadDataByIdentifier, ReadDTCInformation), `read_dtc`, `ecu_info`, `precondition` | `Safe` |
+| `request` with a read service (ReadDataByIdentifier, ReadDTCInformation), DiagnosticSessionControl (0x10) or TesterPresent (0x3E), `read_dtc`, `ecu_info`, `precondition` | `Safe` (a repeat of a session change or a tester-present re-enters the wanted session and behaves in any residual state, ADR-336 item 8) |
 | `wait`, `capture`, `log` | `Safe` (no ECU state changes) |
 | `hmi`, `record` | `Safe`: a repeat at the same instruction keeps its inquiry number, so the host treats it as a poll of the open inquiry, not a new one (ADR-233) |
 | `security_access`, `routine`, `flash_transfer` | `CheckState` (a repeated security access starts again from a new seed request) |
-| any other `request` | `Unsafe`, since a service the transpiler does not classify may change ECU state |
+| any other `request` | `Unsafe`, outside a flash plan's expansion (below), since a service the transpiler does not classify may change ECU state |
 
-**Target contract (ADR-336 item 8).** Two defaults change. A `request` with DiagnosticSessionControl (0x10) or TesterPresent (0x3E) is `Safe` everywhere: a repeat re-enters the session the procedure wanted and behaves in any residual state (ADR-335). Inside a plan function's expansion (4.9), an unannotated `request` of any other service that is not a read is `CheckState`, "not stated": the plan's redo rules govern a repeat there, and `Unsafe` would refuse every plan that changes session or resets the ECU after the transfer. `# @idempotency unsafe` still forces a refusal. The table above is what the converter does today.
+**ADR-336 item 8.** A `request` with DiagnosticSessionControl (0x10) or TesterPresent (0x3E) is `Safe` everywhere, as the table says (ADR-335); `# @idempotency` still replaces it. Target contract, not lowered yet: inside a plan function's expansion (4.9), an unannotated `request` of any other service that is not a read is `CheckState`, "not stated": the plan's redo rules govern a repeat there, and `Unsafe` would refuse every plan that changes session or resets the ECU after the transfer. `# @idempotency unsafe` still forces a refusal. The `CheckState` default inside a plan is not applied yet.
 
 ```python
     # @idempotency unsafe
@@ -829,7 +830,7 @@ The error codes of the restart declaration (ADR-336, 4.9); `STAR_UNKNOWN_PRECOND
 | Code | Meaning |
 |---|---|
 | `STAR_PLAN_SHAPE` | a `@flashPlan` function breaks a shape rule (call count, call site, `return`, section callee, never called) |
-| `STAR_PLAN_INVALID` | the lowered plan is refused by `Program::validate`; located at the source of the pc the refusal names |
+| `STAR_PLAN_INVALID` | the lowered program is refused by `Program::validate` with an error that names a pc; located at the source of that pc (an error without a pc is `STAR_NOT_LOWERABLE`) |
 | `STAR_UNKNOWN_PRECONDITION` | a name in `# @preconditions` has no row in the variant's `preconditions.csv` |
 
 ---
@@ -867,7 +868,7 @@ The error codes of the restart declaration (ADR-336, 4.9); `STAR_UNKNOWN_PRECOND
   to a section function is reported, unless it closes a cycle, which is reported as recursion
   only. Calls through function parameters (2.6) are followed along the specialized call paths
 - Sections (4.5) are lowered as copies keyed by the function and the section function whose call
-  they run in, or none outside every section: starting from the entry's call to `main`, a call to
+  they run in, or none outside every section: starting from `main`, a call to
   a section function reaches that function's section copy, and any other call stays in the
   caller's section. Every section copy counts toward the budget of 2.6, in copies and in
   instructions, before it is made

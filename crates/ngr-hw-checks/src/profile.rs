@@ -440,6 +440,12 @@ pub(crate) const PHYSICAL_COMPARAMS: &[&str] = &[
 
 /// A channel name as the J2534 worker reads it: ASCII case ignored, surrounding spaces dropped,
 /// and a `_CH` index read as a number, so `CAN_CH1`, `can_ch1` and `CAN_CH01` are one channel.
+/// Whether a protocol is ISO 15765 transport (`ISO15765`, `ISO_14229_3_on_ISO_15765_2`, their
+/// additional channels) rather than raw CAN: the two frame one payload differently on the bus.
+fn segments(protocol: &str) -> bool {
+    protocol.contains("15765")
+}
+
 pub(crate) fn channel_key(name: &str) -> String {
     let upper = name.trim().to_ascii_uppercase();
     if let Some(index) = upper.rfind("_CH") {
@@ -675,6 +681,14 @@ fn check_loopback(a: &Endpoint, b: &Endpoint) -> Result<(), ProfileError> {
         ));
     }
     let (x, y) = (&a.link, &b.link);
+    // A raw CAN end exchanges bus payloads as they are, while an ISO 15765 end segments and
+    // reassembles them, so a byte-for-byte loopback needs one protocol family at both ends.
+    if segments(&x.protocol) != segments(&y.protocol) {
+        return Err(invalid(
+            "a T0 loopback's endpoints are both raw CAN or both ISO 15765 (`protocol`): the two \
+             frame the same payload differently",
+        ));
+    }
     if x.baud_rate != y.baud_rate || x.id_bits != y.id_bits {
         return Err(invalid(
             "a T0 loopback's endpoints share one bus: the same `baud_rate` and `id_bits`",

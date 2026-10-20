@@ -393,6 +393,12 @@ and refuses it on T1, T2 and T3 (`cargo run -p ngr-hw-checks -- list`), and the 
 function over guarded handles and the profile, so CI runs it against `j2534-0404-mock`
 (`tests/grpc_mock/t0_loopback_check.rs`, with a relay task playing the loopback).
 
+The profile parser refuses a loopback whose two ends cannot exchange the same bytes: the ends must
+be both raw CAN or both ISO 15765 (a `protocol` naming ISO 15765, or an additional channel of
+one), since an ISO 15765 end segments its payload and a raw CAN end does not, and they must share
+the `addressing` and, when addressed, the `address`, since each end accepts only frames carrying
+its own address byte.
+
 - **What it does.** Both ends listen, then each end sends single RawMode frames of 1 to 7 bytes
   (6 under extended or mixed addressing, which takes a byte of the frame) that the other must
   receive byte for byte, A to B and B to A. A frame that does not arrive within 3 s fails the check

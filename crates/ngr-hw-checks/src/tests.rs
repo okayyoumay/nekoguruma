@@ -394,6 +394,23 @@ fn a_loopback_runs_between_two_ends_of_one_bus() {
     // Two modules of one library are two devices.
     let second_module = vci_end.replacen("module = \"SN-0001\"", "module = \"SN-0002\"", 1);
     parse(&loopback(vci_end, &partner(&second_module))).unwrap();
+    // One protocol family at both ends: a raw CAN end opposite an ISO 15765 end frames the same
+    // payload differently, while an additional channel of the protocol is the same family.
+    let with_protocol = |end: &str, name: &str| {
+        end.replacen("protocol = \"CAN\"", &format!("protocol = \"{name}\""), 1)
+    };
+    refused_for(
+        &loopback(
+            vci_end,
+            &partner(&with_protocol(&second_module, "ISO15765")),
+        ),
+        "both raw CAN or both ISO 15765",
+    );
+    parse(&loopback(
+        &with_protocol(vci_end, "CAN"),
+        &partner(&with_protocol(&second_module, "can_ch1")),
+    ))
+    .unwrap();
 
     // J2534 names its module by the configured entry: the same label or `pname` is one device,
     // and two entries reporting the same `module` are two.

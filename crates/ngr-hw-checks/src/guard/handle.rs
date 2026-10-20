@@ -2818,7 +2818,7 @@ mod tests {
             "class = \"T0\"\n[[endpoint]]\nsocketcan = \"can0\"\n[endpoint.link]\nprotocol = \"CAN\"\n\
              baud_rate = 500000\npins = [6, 14]\nrequest_id = 0x123\nresponse_id = 0x124\n\
              id_bits = 11\naddressing = \"normal\"\n[[endpoint]]\n[endpoint.vci]\n{VCI}\n\
-             [endpoint.link]\nprotocol = \"ISO_14229_3_on_ISO_15765_2\"\nbaud_rate = 500000\n\
+             [endpoint.link]\nprotocol = \"CAN\"\nbaud_rate = 500000\n\
              pins = [6, 14]\nrequest_id = 0x124\nresponse_id = 0x123\nid_bits = 11\n\
              addressing = \"normal\"\n"
         ))

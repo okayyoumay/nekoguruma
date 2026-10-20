@@ -52,7 +52,7 @@ fn t0(addressing: &str) -> Profile {
     };
     profile::parse(&format!(
         "class = \"T0\"\n\
-         [[endpoint]]\nsocketcan = \"can0\"\n[endpoint.link]\nprotocol = \"CAN\"\n\
+         [[endpoint]]\nsocketcan = \"can0\"\n[endpoint.link]\nprotocol = \"ISO15765\"\n\
          baud_rate = 500000\npins = [6, 14]\nrequest_id = 0x123\nresponse_id = 0x124\n\
          id_bits = 11\naddressing = \"{addressing}\"\n{address}\
          [[endpoint]]\n[endpoint.vci]\n{VCI}\n[endpoint.link]\nprotocol = \

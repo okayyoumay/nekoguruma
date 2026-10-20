@@ -240,7 +240,7 @@ async fn a_missing_frame_fails_the_loopback_check() {
 /// A T0 profile with one SocketCAN end and one VCI end.
 fn socketcan_end() -> Profile {
     profile::parse(&format!(
-        "class = \"T0\"\n[[endpoint]]\nsocketcan = \"can0\"\n[endpoint.link]\nprotocol = \"CAN\"\n\
+        "class = \"T0\"\n[[endpoint]]\nsocketcan = \"can0\"\n[endpoint.link]\nprotocol = \"ISO15765\"\n\
          baud_rate = 500000\npins = [6, 14]\nid_bits = 11\naddressing = \"normal\"\n\
          request_id = 0x123\nresponse_id = 0x124\n\
          [[endpoint]]\n[endpoint.vci]\n{}[endpoint.link]\n{LINK}request_id = 0x124\nresponse_id = 0x123\n",

@@ -48,6 +48,9 @@ impl DiagHost for Answering {
     fn flash_transfer(&mut self, _block: u32, _data: &[u8]) -> Result<(), Infallible> {
         Ok(())
     }
+    fn artifact_bytes(&mut self, _offset: u64, len: u32) -> Result<Vec<u8>, Infallible> {
+        Ok(vec![0; len as usize])
+    }
     fn wait(&mut self, _inquiry: u64, _millis: u32) -> Result<bool, Infallible> {
         Ok(true)
     }

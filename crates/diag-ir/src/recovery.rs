@@ -285,6 +285,16 @@ pub enum ProgramError {
     ControlFlowIntoPlan { flash_session: u32, pc: u32 },
     #[error("the download instruction at {pc} is outside every plan's transfer range")]
     DownloadOutsidePlan { pc: u32 },
+    #[error("the flash block read at {pc} is outside every plan's code range")]
+    FlashBlockOutsidePlan { pc: u32 },
+    #[error(
+        "the flash block read at {pc} names flash session {session} but sits in the plan of flash session {flash_session}"
+    )]
+    FlashBlockSessionMismatch {
+        pc: u32,
+        session: u32,
+        flash_session: u32,
+    },
     #[error(
         "flash session {flash_session}: section {section} is unsafe to replay but the restart replays it"
     )]
@@ -458,6 +468,22 @@ impl Program {
             });
             if is_download(op) && !in_transfer {
                 return Err(ProgramError::DownloadOutsidePlan { pc });
+            }
+            // A block read names the session of the plan it sits in (ADR-336): the plan's range
+            // is what the agent runs with that session's artifact and recovery rules.
+            if let Op::FlashBlock { session, .. } = *op {
+                let Some(plan) = self.flash.iter().find(|plan| {
+                    (plan.boundaries.entry_pc..plan.boundaries.post_transfer_end_pc).contains(&pc)
+                }) else {
+                    return Err(ProgramError::FlashBlockOutsidePlan { pc });
+                };
+                if plan.flash_session != session {
+                    return Err(ProgramError::FlashBlockSessionMismatch {
+                        pc,
+                        session,
+                        flash_session: plan.flash_session,
+                    });
+                }
             }
         }
 

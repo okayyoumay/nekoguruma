@@ -313,8 +313,10 @@ pub struct SourceSpan {
 }
 
 impl Op {
-    /// Whether this instruction goes through [`DiagHost`]. The job runner journals around these
-    /// (8.2.5 checkpoint granularity, ADR-233).
+    /// Whether this instruction is a diagnostic primitive, one the job runner journals around
+    /// (8.2.5 checkpoint granularity, ADR-233). [`Op::FlashBlock`] is not: it calls
+    /// [`DiagHost::artifact_bytes`], a read that sends nothing to the vehicle and changes no
+    /// host state.
     pub fn is_diagnostic_primitive(&self) -> bool {
         // Exhaustive on purpose: a new instruction must be classified here.
         match self {
@@ -566,7 +568,9 @@ impl Vm {
     ///
     /// A step is atomic: it either completes (operands consumed, results pushed, `pc` advanced,
     /// `steps` incremented) or leaves the state unchanged. Everything the VM can check is checked
-    /// before the host is called, so a host answer is never discarded. After a host error the
+    /// before the host is called, so a host answer is never discarded, with one exception:
+    /// [`Op::FlashBlock`] checks the length of the answer, and a wrong length is
+    /// [`VmError::ArtifactLength`] (the read changed nothing, so the step can be repeated). After a host error the
     /// state still points at the primitive, so stepping again repeats it (8.2.5); whether that
     /// is safe is the job runner's decision (`Section::idempotency`, ADR-229), not the VM's.
     pub fn step<H: DiagHost>(
@@ -614,7 +618,8 @@ impl Vm {
         // Unchanged until the instruction completes, so it identifies a waiting inquiry.
         let inquiry = self.state.steps;
         // Every check a primitive needs before the host call, shared with `current_op`. Nothing
-        // after a host call below can fail, so a `VmError` always means the host was not called.
+        // after a host call below can fail, so a `VmError` means the host was not called, except
+        // `VmError::ArtifactLength` from `Op::FlashBlock`, whose read leaves the host's state alone.
         let input = self.check_primitive(op, program)?;
         match op {
             Op::PushI64(v) => self.push(Value::I64(*v))?,
@@ -1116,7 +1121,10 @@ fn store(slots: &mut Vec<Option<Value>>, slot: u16, value: Value) {
 ///   variant does not declare as a top-level field of the service's positive response, or one
 ///   with a nested layout (ADR-316);
 /// - an `Op::SendReceive` naming a service the variant does not declare with a positive
-///   response, which the host could not match an answer against (ADR-321).
+///   response, which the host could not match an answer against (ADR-321);
+/// - an `Op::FlashBlock` naming a flash session or segment the variant does not declare, a
+///   segment with a zero block size, one whose end (offset plus length) passes `u64::MAX`, or one
+///   whose longest block is longer than [`MAX_BYTES_LEN`] (ADR-336).
 ///
 /// These errors depend only on the declarations, so a caller can refuse such a program before
 /// it runs.
@@ -1146,7 +1154,8 @@ pub fn check_declarations(
 }
 
 /// The offset, block size and length of segment `segment` (an index into `segments`) of flash
-/// session `session` (`FlashSession.id`), with the segment's block size checked to be non-zero.
+/// session `session` (`FlashSession.id`), with the segment's block size checked to be non-zero,
+/// its end not to overflow and its longest block to fit [`MAX_BYTES_LEN`].
 fn declared_segment(
     variant: &EcuVariant<'_>,
     session: u32,
@@ -1164,7 +1173,13 @@ fn declared_segment(
     if found.block_size() == 0 {
         return Err(VmError::ZeroBlockSize { session, segment });
     }
-    Ok((found.artifact_offset(), found.block_size(), found.length()))
+    let (offset, length) = (found.artifact_offset(), found.length());
+    offset.checked_add(length).ok_or(VmError::Overflow)?;
+    let longest = u64::from(found.block_size()).min(length);
+    if longest > MAX_BYTES_LEN as u64 {
+        return Err(VmError::BytesTooLong(longest));
+    }
+    Ok((offset, found.block_size(), length))
 }
 
 /// The artifact offset and length of block `index` of the segment ([`Op::FlashBlock`]).
@@ -1185,15 +1200,14 @@ fn flash_block_range(
     if block >= length.div_ceil(size) {
         return Err(out_of_range());
     }
-    // Checked, not trusted: the document is data from outside.
+    // Sums that `declared_segment` already bounded; the products are checked again because the
+    // document is data from outside.
     let within = block.checked_mul(size).ok_or(VmError::Overflow)?;
     let offset = artifact_offset
         .checked_add(within)
         .ok_or(VmError::Overflow)?;
+    // At most the longest block, which `declared_segment` bounded by `MAX_BYTES_LEN`.
     let len = size.min(length - within);
-    if len > MAX_BYTES_LEN as u64 {
-        return Err(VmError::BytesTooLong(len));
-    }
     Ok((offset, len as u32))
 }
 

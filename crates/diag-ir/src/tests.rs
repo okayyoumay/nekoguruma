@@ -120,8 +120,8 @@ impl DiagHost for MockHost {
         match self.artifact_answer.take() {
             Some(answer) => Ok(answer),
             // The bytes of an artifact whose byte at position `n` is `n % 251`.
-            None => Ok((offset..offset + u64::from(len))
-                .map(|n| (n % 251) as u8)
+            None => Ok((0..u64::from(len))
+                .map(|i| (offset.wrapping_add(i) % 251) as u8)
                 .collect()),
         }
     }
@@ -2166,6 +2166,43 @@ fn a_plan_needs_a_request_download() {
 }
 
 #[test]
+fn a_flash_block_sits_in_the_plan_of_its_session() {
+    let block = |session| Op::FlashBlock {
+        session,
+        segment: 0,
+    };
+    // Inside the plan's range (0..5), before the erase and after the transfer exit.
+    for pc in [0, 4] {
+        let mut program = recovery_program();
+        program.code[pc] = block(1);
+        assert_eq!(program.validate(), Ok(()), "pc {pc}");
+    }
+    // Outside every plan, and with no plan at all.
+    let mut program = recovery_program();
+    program.code[7] = block(1);
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::FlashBlockOutsidePlan { pc: 7 })
+    );
+    let program = prog(vec![block(1)], Vec::new());
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::FlashBlockOutsidePlan { pc: 0 })
+    );
+    // In a plan of another session.
+    let mut program = recovery_program();
+    program.code[0] = block(2);
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::FlashBlockSessionMismatch {
+            pc: 0,
+            session: 2,
+            flash_session: 1
+        })
+    );
+}
+
+#[test]
 fn download_instructions_belong_to_a_transfer_range() {
     for op in [
         Op::ServiceRequest { service: 0x34 },
@@ -3797,7 +3834,9 @@ mod flash_block {
     }
 
     /// Session 4 has two segments: 10 bytes in blocks of 4 at artifact offset 100, and a
-    /// segment with a block size of zero. Session 5 has a segment at the top of the offset range.
+    /// segment with a block size of zero. Session 5 has a segment that ends at the top of the
+    /// offset range, session 6 one whose end passes it, and session 7 a segment with a block
+    /// longer than a byte string may be and a short one with such a block size.
     fn document() -> Vec<u8> {
         encode_ecu_document(&EcuDocumentT {
             schema_version: IR_SCHEMA_VERSION,
@@ -3813,7 +3852,20 @@ mod flash_block {
                     },
                     FlashSessionT {
                         id: 5,
+                        segments: Some(vec![segment(u64::MAX - 8, 8, 4)]),
+                        ..Default::default()
+                    },
+                    FlashSessionT {
+                        id: 6,
                         segments: Some(vec![segment(u64::MAX - 3, 8, 4)]),
+                        ..Default::default()
+                    },
+                    FlashSessionT {
+                        id: 7,
+                        segments: Some(vec![
+                            segment(0, MAX_BYTES_LEN as u64 + 1, MAX_BYTES_LEN as u32 + 1),
+                            segment(0, 6, MAX_BYTES_LEN as u32 + 1),
+                        ]),
                         ..Default::default()
                     },
                 ]),
@@ -3961,8 +4013,68 @@ mod flash_block {
             forbidden: true,
             ..Default::default()
         };
-        // Block 1 starts at u64::MAX + 1.
-        assert_eq!(block(5, 0, 1, &mut host), Err(VmError::Overflow));
+        // The segment's end passes u64::MAX, so no block of it can be read.
+        for index in [0, 1] {
+            assert_eq!(block(6, 0, index, &mut host), Err(VmError::Overflow));
+        }
+    }
+
+    #[test]
+    fn a_range_ending_at_u64_max_reads_its_blocks() {
+        for (index, offset) in [(0, u64::MAX - 8), (1, u64::MAX - 4)] {
+            let mut host = MockHost::default();
+            let expected: Vec<u8> = (0..4u64)
+                .map(|i| (offset.wrapping_add(i) % 251) as u8)
+                .collect();
+            assert_eq!(block(5, 0, index, &mut host), Ok(Value::Bytes(expected)));
+            assert_eq!(host.calls, [format!("artifact {offset} 4")]);
+        }
+    }
+
+    #[test]
+    fn a_block_longer_than_a_byte_string_is_refused_before_the_host_is_called() {
+        let mut host = MockHost {
+            forbidden: true,
+            ..Default::default()
+        };
+        let too_long = Err(VmError::BytesTooLong(MAX_BYTES_LEN as u64 + 1));
+        assert_eq!(block(7, 0, 0, &mut host), too_long);
+        // Later blocks of a segment whose longest block is too long are refused as well.
+        assert_eq!(block(7, 0, 1, &mut host), too_long);
+    }
+
+    #[test]
+    fn a_block_size_past_the_segment_is_no_longer_than_the_segment() {
+        // The longest block is the segment's length when that is less than the block size.
+        let mut host = MockHost::default();
+        assert_eq!(
+            block(7, 1, 0, &mut host),
+            Ok(Value::Bytes((0..6).collect()))
+        );
+        assert_eq!(host.calls, ["artifact 0 6"]);
+    }
+
+    #[test]
+    fn check_declarations_refuses_a_range_past_u64_and_a_block_too_long() {
+        let bytes = document();
+        let document = load_ecu_document(&bytes).expect("the document loads");
+        let variant = document.variant().expect("a variant");
+        let program = |session, segment| {
+            prog(
+                vec![Op::PushI64(0), Op::FlashBlock { session, segment }],
+                vec![],
+            )
+        };
+        assert_eq!(check_declarations(&program(5, 0), &variant), Ok(()));
+        assert_eq!(check_declarations(&program(7, 1), &variant), Ok(()));
+        assert_eq!(
+            check_declarations(&program(6, 0), &variant),
+            Err((1, VmError::Overflow))
+        );
+        assert_eq!(
+            check_declarations(&program(7, 0), &variant),
+            Err((1, VmError::BytesTooLong(MAX_BYTES_LEN as u64 + 1)))
+        );
     }
 
     #[test]

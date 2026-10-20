@@ -278,10 +278,12 @@ impl ScriptedHost<'_, '_> {
     /// Records `event`, which holds `bytes` bytes, unless the report would grow past
     /// [`MAX_REPORT_BYTES`]. Called before the event's bytes are copied.
     fn charge(&mut self, bytes: usize) -> Result<(), DryRunError> {
-        let total = self
-            .report_bytes
-            .saturating_add(bytes)
-            .saturating_add(EVENT_COST);
+        self.charge_total(bytes.saturating_add(EVENT_COST))
+    }
+
+    /// Counts `cost` toward the budget, as [`Self::charge`] does but without the per-event cost.
+    fn charge_total(&mut self, cost: usize) -> Result<(), DryRunError> {
+        let total = self.report_bytes.saturating_add(cost);
         if total > MAX_REPORT_BYTES {
             self.over_budget = true;
             return Err(DryRunError::ReportTooLarge);
@@ -695,10 +697,11 @@ impl DiagHost for ScriptedHost<'_, '_> {
     }
 
     // A dry run has no artifact: the block is zero bytes of the requested length (ADR-336 item
-    // 15). Charged before the allocation, so a large declared block cannot exhaust memory; it
-    // leaves no event, as it is no request.
+    // 15). It leaves no event, as it is no request, so only its bytes are charged (no event
+    // cost). One block is at most `MAX_BYTES_LEN` (`check_declarations`); the charge, made before
+    // the allocation, bounds the total over a run.
     fn artifact_bytes(&mut self, _offset: u64, len: u32) -> Result<Vec<u8>, DryRunError> {
-        self.charge(len as usize)?;
+        self.charge_total(len as usize)?;
         Ok(vec![0; len as usize])
     }
 

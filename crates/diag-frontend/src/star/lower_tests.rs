@@ -1578,8 +1578,8 @@ fn what_the_ir_cannot_express_is_not_lowerable() {
 #[test]
 fn diag_functions_without_an_instruction_are_not_available() {
     assert_eq!(
-        codes("def main():\n    diag.ecu_info()\n"),
-        [(StarCode::ApiNotAvailable, 2)]
+        codes("def main():\n    diag.hmi(\"f\", {})\n"),
+        [(StarCode::NotLowerable, 2)]
     );
 }
 
@@ -1698,7 +1698,7 @@ fn every_problem_is_reported() {
         found,
         [
             (StarCode::NotLowerable, 2),
-            (StarCode::ApiNotAvailable, 3),
+            (StarCode::NotLowerable, 3),
             (StarCode::NotLowerable, 4)
         ]
     );
@@ -2953,4 +2953,104 @@ fn a_validate_refusal_naming_no_pc_is_not_lowerable() {
         assert_eq!(found[0].code, StarCode::NotLowerable);
         assert_eq!((found[0].line, found[0].column), (1, 1));
     }
+}
+
+// ---------------------------------------------------------------- `diag.ecu_info` (ADR-339)
+
+#[test]
+fn ecu_info_is_read_by_a_literal_key_only() {
+    use StarCode::*;
+    let requests = restart_index();
+    let cases = [
+        // The call has no value of its own: a statement, a variable, an argument.
+        ("def main():\n    diag.ecu_info()\n", NotLowerable),
+        ("def main():\n    x = diag.ecu_info()\n", NotLowerable),
+        (
+            "def main():\n    diag.log(1, diag.ecu_info())\n",
+            NotLowerable,
+        ),
+        // Wrong arguments, and a key that is no literal or not a key.
+        (
+            "def main():\n    diag.ecu_info(1)[\"vin\"]\n",
+            UnsupportedSyntax,
+        ),
+        (
+            "def main():\n    diag.ecu_info()[\"serial\"]\n",
+            UnsupportedSyntax,
+        ),
+        (
+            "def f(k):\n    diag.ecu_info()[k]\n\ndef main():\n    f(\"vin\")\n",
+            DynamicKeyNotAllowed,
+        ),
+        // A key whose row the index lacks.
+        (
+            "def main():\n    diag.ecu_info()[\"part_number\"]\n",
+            UnknownIdentity,
+        ),
+        // A row whose service the variant does not declare.
+        ("def main():\n    diag.ecu_info()[\"vin\"]\n", NotLowerable),
+    ];
+    for (source, code) in cases {
+        let found = error_codes(source, &requests);
+        assert!(
+            !found.is_empty() && found.iter().all(|&(c, line)| c == code && line >= 1),
+            "{source}: {found:?}"
+        );
+    }
+}
+
+/// A document whose variant is named `name`.
+fn named_variant_document(name: &str) -> Vec<u8> {
+    let mut variant = EcuVariantT::default();
+    variant.short_name = Some(name.to_owned());
+    let mut document = EcuDocumentT::default();
+    document.schema_version = IR_SCHEMA_VERSION;
+    document.source_format = Some("test".to_owned());
+    document.source_digest = Some(String::new());
+    document.variant = Some(Box::new(variant));
+    encode_ecu_document(&document)
+}
+
+#[test]
+fn ecu_info_variant_is_the_variants_short_name_as_a_constant() {
+    let source = "\
+def main():
+    if diag.ecu_info()[\"variant\"] == \"bench\":
+        diag.log(1, \"bench\")
+    else:
+        diag.log(1, \"other\")
+";
+    let checked = check("t.star", source).expect("checks");
+    for (name, logged) in [("bench", "log 1 bench"), ("road", "log 1 other")] {
+        let bytes = named_variant_document(name);
+        let variant = load_ecu_document(&bytes)
+            .expect("the document loads")
+            .variant()
+            .expect("a variant");
+        let program = lower("t.star", &checked, variant, &RequestIndex::default())
+            .expect("lowers")
+            .program;
+        // A constant: no read, and the comparison folds to the branch taken.
+        assert!(
+            !program
+                .code
+                .iter()
+                .any(|op| matches!(op, Op::SendReceive { .. }))
+        );
+        let mut vm = Vm::new(&program);
+        let mut host = ScriptedHost::default();
+        loop {
+            match vm.step(&program, &mut host) {
+                Ok(StepOutcome::Continue) => {}
+                Ok(StepOutcome::Finished) => break,
+                other => panic!("{other:?}"),
+            }
+        }
+        assert_eq!(host.calls, [logged]);
+    }
+    // A variant with no short name has no name to give.
+    assert_eq!(
+        codes("def main():\n    diag.ecu_info()[\"variant\"]\n"),
+        [(StarCode::NotLowerable, 2)]
+    );
 }

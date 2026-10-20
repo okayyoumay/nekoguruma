@@ -142,6 +142,9 @@ pub enum StarCode {
     /// A name in `# @preconditions` that has no row in the variant's `preconditions.csv` (4.9).
     #[serde(rename = "STAR_UNKNOWN_PRECONDITION")]
     UnknownPrecondition,
+    /// A `diag.ecu_info()` key whose value the variant's `identity.csv` has no row for (3.2).
+    #[serde(rename = "STAR_UNKNOWN_IDENTITY")]
+    UnknownIdentity,
     /// An annotation value outside its range (4.2, 4.5).
     #[serde(rename = "STAR_ARGUMENT_OUT_OF_RANGE")]
     ArgumentOutOfRange,
@@ -201,6 +204,7 @@ impl StarCode {
             Self::BuiltinNotAllowed => "STAR_BUILTIN_NOT_ALLOWED",
             Self::BadAnnotation => "STAR_BAD_ANNOTATION",
             Self::UnknownPrecondition => "STAR_UNKNOWN_PRECONDITION",
+            Self::UnknownIdentity => "STAR_UNKNOWN_IDENTITY",
             Self::ArgumentOutOfRange => "STAR_ARGUMENT_OUT_OF_RANGE",
             Self::SourceTooLarge => "STAR_SOURCE_TOO_LARGE",
             Self::NestingTooDeep => "STAR_NESTING_TOO_DEEP",

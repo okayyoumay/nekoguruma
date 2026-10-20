@@ -486,7 +486,10 @@ must not overlap (`CSV_DUPLICATE`).
 ### 4.13 `identity.csv` (scoped)
 
 One row per identity value, copied into `Program.identity` of every program the converter lowers
-for the variant, plain procedures included (ADR-336 item 1). A kind is given once per variant
+for the variant, plain procedures included (ADR-336 item 1). A procedure also reads a row through
+`diag.ecu_info()` (`starlark-subset.md` 3.2, ADR-339): the `vin`, `hardware_part_number` and
+`software_version` rows are the keys `vin`, `part_number` and `software_version`, and a variant
+without the row cannot use that key. A kind is given once per variant
 (`CSV_DUPLICATE`).
 
 | Column | Type | Required | Meaning |

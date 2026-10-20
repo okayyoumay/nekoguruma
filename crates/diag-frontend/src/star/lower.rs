@@ -1847,6 +1847,9 @@ impl<'a> Lowerer<'a> {
             }
             ExprP::Index(parts) => {
                 let (object, index) = &**parts;
+                if let Some(args) = self.ecu_info_call(id, object) {
+                    return self.call_diag_keyed(id, "ecu_info", &args, Some(index), span);
+                }
                 let a = self.expr(id, object);
                 let b = self.expr(id, index);
                 match a {
@@ -3426,7 +3429,20 @@ impl<'a> Lowerer<'a> {
     /// of 4.6 for the Starlark call, whatever instructions it lowers to. A primitive an argument
     /// emitted (an inner `diag` call) keeps its own.
     fn call_diag(&mut self, id: Option<usize>, name: &str, args: &[&AstExpr], span: Span) -> Val {
-        let value = self.call_diag_untagged(id, name, args, span);
+        self.call_diag_keyed(id, name, args, None, span)
+    }
+
+    /// [`Self::call_diag`] for a call that a literal key reads (`diag.ecu_info()["vin"]`, 3.2),
+    /// `key` being the key's expression.
+    fn call_diag_keyed(
+        &mut self,
+        id: Option<usize>,
+        name: &str,
+        args: &[&AstExpr],
+        key: Option<&AstExpr>,
+        span: Span,
+    ) -> Val {
+        let value = self.call_diag_untagged(id, name, args, key, span);
         let annotation = self.annotated.last().map(|(value, _)| *value);
         let tag = |code: Code, lowered: &mut bool| -> Code {
             code.into_iter()
@@ -3461,6 +3477,7 @@ impl<'a> Lowerer<'a> {
         id: Option<usize>,
         name: &str,
         args: &[&AstExpr],
+        key: Option<&AstExpr>,
         span: Span,
     ) -> Val {
         match name {
@@ -3678,19 +3695,205 @@ impl<'a> Lowerer<'a> {
                 Val::Run(Tys::default(), Vec::new())
             }
             "precondition" => self.diag_precondition(id, args, span),
-            "ecu_info" => {
-                self.error(
-                    StarCode::ApiNotAvailable,
-                    span,
-                    format!("`diag.{name}` has no IR instruction yet (3.2)"),
-                );
-                Val::Run(Tys::default(), Vec::new())
-            }
+            "ecu_info" => self.diag_ecu_info(id, args, key, span),
             _ => {
                 self.not_lowerable(span, format!("`diag.{name}` is not lowered yet (3.2)"));
                 Val::Run(Tys::default(), Vec::new())
             }
         }
+    }
+
+    /// The arguments of `object` when it is a call to `diag.ecu_info`, which an index reads
+    /// directly (3.2, ADR-339); `None` for any other expression.
+    fn ecu_info_call<'e>(
+        &self,
+        id: Option<usize>,
+        object: &'e AstExpr,
+    ) -> Option<Vec<&'e AstExpr>> {
+        let ExprP::Call(function, args) = &object.node else {
+            return None;
+        };
+        let ExprP::Dot(module, method) = &function.node else {
+            return None;
+        };
+        let is_diag = matches!(&module.node, ExprP::Identifier(m) if m.node.ident == "diag")
+            && !id.is_some_and(|id| self.funcs[id].slots.contains_key("diag"))
+            && !self.globals.contains_key("diag")
+            && !self.by_name.contains_key("diag");
+        if !is_diag || method.node != "ecu_info" {
+            return None;
+        }
+        // A non-positional argument is no argument the call takes: it is refused as the wrong
+        // arguments below, by its count.
+        Some(
+            args.args
+                .iter()
+                .map(|arg| match &arg.node {
+                    ArgumentP::Positional(expr) | ArgumentP::Named(_, expr) => expr,
+                    ArgumentP::Args(expr) | ArgumentP::KwArgs(expr) => expr,
+                })
+                .collect(),
+        )
+    }
+
+    /// `diag.ecu_info()["key"]` (subset 3.2, ADR-339): the variant's short name for `variant`,
+    /// a string constant; for `vin`, `part_number` and `software_version`, a read of the DID
+    /// the variant's `identity.csv` row of that kind names (`vin`, `hardware_part_number`,
+    /// `software_version`, 4.13), lowered like a service source of `diag.precondition`: a
+    /// send-receive of the DID read and a decode of its field. Each key read is a request of its
+    /// own at the point of access. The value is a `str` for an ASCII field and an `int` for an
+    /// unsigned integer one, as the row's field is declared. The call has no value of its own,
+    /// so it is refused unless a literal key reads it.
+    fn diag_ecu_info(
+        &mut self,
+        id: Option<usize>,
+        args: &[&AstExpr],
+        key: Option<&AstExpr>,
+        span: Span,
+    ) -> Val {
+        let none = || Val::Run(Tys::default(), Vec::new());
+        if !args.is_empty() {
+            self.error(
+                StarCode::UnsupportedSyntax,
+                span,
+                "`diag.ecu_info` takes no arguments (3.1)",
+            );
+            return none();
+        }
+        let Some(key_arg) = key else {
+            self.not_lowerable(
+                span,
+                "`diag.ecu_info()` has no value of its own: read a key of it with a string                  literal, `diag.ecu_info()[\"vin\"]` (3.2)",
+            );
+            return none();
+        };
+        if !matches!(&key_arg.node, ExprP::Literal(AstLiteral::String(_))) {
+            self.error(
+                StarCode::DynamicKeyNotAllowed,
+                key_arg.span,
+                "`diag.ecu_info()` is read with a string literal key (3.2, 4.1)",
+            );
+            return none();
+        }
+        let Val::Const(Const::Str(key)) = self.expr(id, key_arg) else {
+            return none();
+        };
+        let (label, source) = match &*key {
+            "variant" => {
+                let Some(name) = self.variant.short_name() else {
+                    self.not_lowerable(
+                        key_arg.span,
+                        "the variant declares no short name for `diag.ecu_info()[\"variant\"]` (3.2)",
+                    );
+                    return none();
+                };
+                return Val::Const(Const::str(name));
+            }
+            "vin" => ("vin", self.requests.identity.vin),
+            "part_number" => (
+                "hardware_part_number",
+                self.requests.identity.hardware_part_number,
+            ),
+            "software_version" => ("software_version", self.requests.identity.software_version),
+            other => {
+                self.error(
+                    StarCode::UnsupportedSyntax,
+                    key_arg.span,
+                    format!(
+                        "`diag.ecu_info()` has the keys `variant`, `vin`, `part_number` and \
+                         `software_version`, not `{other}` (3.2)"
+                    ),
+                );
+                return none();
+            }
+        };
+        let Some(source) = source else {
+            self.error(
+                StarCode::UnknownIdentity,
+                key_arg.span,
+                format!("the variant's identity.csv has no row of kind {label} (3.2)"),
+            );
+            return none();
+        };
+        let diag_ir::Source::EcuService {
+            service_id,
+            field_id,
+        } = source
+        else {
+            self.not_lowerable(
+                key_arg.span,
+                format!("the {label} identity row is not a service source (3.2)"),
+            );
+            return none();
+        };
+        let request = self
+            .service_at
+            .get(&service_id)
+            .and_then(|&at| self.variant.services()?.get(at).request());
+        let Some(request) = request else {
+            self.not_lowerable(
+                key_arg.span,
+                format!(
+                    "the {label} identity row names a service the variant does not declare \
+                     with a request (3.2)"
+                ),
+            );
+            return none();
+        };
+        if request.params().is_some_and(|params| !params.is_empty()) {
+            self.not_lowerable(
+                key_arg.span,
+                format!(
+                    "the {label} identity row names a request with fields, which sends no fixed \
+                     bytes (3.2)"
+                ),
+            );
+            return none();
+        }
+        let field_kind = self
+            .variant
+            .services()
+            .and_then(|services| services.iter().find(|s| s.id() == service_id))
+            .and_then(|s| s.positive())
+            .and_then(|positive| positive.fields())
+            .and_then(|fields| fields.iter().find(|f| f.id() == field_id))
+            .map(|field| diag_ir::decode::scalar_kind(&field));
+        let ty = match field_kind {
+            Some(Ok(diag_ir::decode::ScalarKind::Integer)) => Ty::Int,
+            Some(Ok(diag_ir::decode::ScalarKind::Text)) => Ty::Str,
+            _ => {
+                self.not_lowerable(
+                    key_arg.span,
+                    format!(
+                        "the {label} identity row is not an integer or text field of a declared \
+                         positive response (3.2)"
+                    ),
+                );
+                return none();
+            }
+        };
+        let mut bytes = vec![request.sid()];
+        bytes.extend_from_slice(request.prefix().map(|p| p.bytes()).unwrap_or_default());
+        let operand = self.pool(&bytes);
+        Val::Run(
+            Tys::of(ty),
+            vec![
+                (Ins::Op(Op::PushBytes(operand)), span),
+                (
+                    Ins::Op(Op::SendReceive {
+                        service: service_id,
+                    }),
+                    span,
+                ),
+                (
+                    Ins::Op(Op::DecodeField {
+                        service: service_id,
+                        field: field_id,
+                    }),
+                    span,
+                ),
+            ],
+        )
     }
 
     /// `diag.precondition(name)` (subset 3.2, ADR-338): the current value of the precondition

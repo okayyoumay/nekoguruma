@@ -296,3 +296,155 @@ fn a_service_precondition_with_a_converted_field_is_not_an_int() {
     assert_eq!(rejected.errors.len(), 1);
     assert_eq!(rejected.errors[0].code, crate::star::StarCode::NotLowerable);
 }
+
+// ---------------------------------------------------------------- `diag.ecu_info` (ADR-339)
+
+/// A VIN answer: the DID read's positive response, the identifier, then 17 ASCII bytes.
+fn vin_answer() -> Vec<u8> {
+    let mut answer = vec![0x62, 0xF1, 0x90];
+    answer.extend_from_slice(b"WVWZZZ1JZXW000001");
+    answer
+}
+
+/// The example's identity table with a part number and a software version as integer reads.
+fn identity_table() -> Vec<(String, Vec<u8>)> {
+    with(
+        example(),
+        "identity.csv",
+        "variants,kind,service,field,note\n\
+         ,vin,vin.read,vin,\n\
+         ,hardware_part_number,powerCycles.read,powerCycles,\n\
+         ,software_version,activeSession.read,session,\n",
+    )
+}
+
+const ECU_INFO: &str = "\
+def main():
+    diag.log(1, diag.ecu_info()[\"variant\"])
+    if diag.ecu_info()[\"vin\"] == \"WVWZZZ1JZXW000001\":
+        diag.log(1, \"known vehicle\")
+";
+
+#[test]
+fn ecu_info_reads_the_vin_and_names_the_variant() {
+    let host = run_answered(example(), ECU_INFO, &[&vin_answer()]).expect("the program runs");
+    assert_eq!(host.logged, ["exampleEcuV1", "known vehicle"]);
+    // One DID read, with the request the declared VIN read sends.
+    assert_eq!(host.sent.len(), 1);
+    assert_eq!(host.sent[0].1, [0x22, 0xF1, 0x90]);
+    assert!(host.inputs_read.is_empty());
+    // Another VIN is another value: the answer is decoded through the field.
+    let mut other = vin_answer();
+    *other.last_mut().unwrap() = b'2';
+    let host = run_answered(example(), ECU_INFO, &[&other]).expect("the program runs");
+    assert_eq!(host.logged, ["exampleEcuV1"]);
+}
+
+#[test]
+fn ecu_info_keys_are_separate_reads_in_the_order_of_access() {
+    let source = "\
+def main():
+    if diag.ecu_info()[\"software_version\"] == 3:
+        diag.log(1, \"extended\")
+    if diag.ecu_info()[\"part_number\"] == 7:
+        diag.log(1, \"seven\")
+    if diag.ecu_info()[\"vin\"] == \"WVWZZZ1JZXW000001\":
+        diag.log(1, \"vin\")
+    if diag.ecu_info()[\"vin\"] == \"WVWZZZ1JZXW000001\":
+        diag.log(1, \"vin again\")
+";
+    let host = run_answered(
+        identity_table(),
+        source,
+        &[
+            &[0x62, 0xF1, 0x86, 3],
+            &[0x62, 0xFD, 0x01, 0, 0, 0, 7],
+            &vin_answer(),
+            &vin_answer(),
+        ],
+    )
+    .expect("the program runs");
+    assert_eq!(host.logged, ["extended", "seven", "vin", "vin again"]);
+    let requests: Vec<_> = host.sent.iter().map(|(_, r)| r.clone()).collect();
+    assert_eq!(
+        requests,
+        [
+            vec![0x22, 0xF1, 0x86],
+            vec![0x22, 0xFD, 0x01],
+            vec![0x22, 0xF1, 0x90],
+            vec![0x22, 0xF1, 0x90],
+        ]
+    );
+}
+
+#[test]
+fn an_ecu_info_read_is_a_safe_send_receive_the_declarations_accept() {
+    let converted = convert(with(example(), "main.star", ECU_INFO));
+    for converted in &converted.documents {
+        let document = load_ecu_document(&converted.bytes).expect("the document loads");
+        let bytes = document.procedure().expect("a program");
+        let program: Program = postcard::from_bytes(bytes.bytes()).expect("a program");
+        program.validate().expect("valid");
+        diag_ir::check_declarations(&program, &document.variant().expect("a variant"))
+            .expect("the service and field are declared");
+        let send = program
+            .code
+            .iter()
+            .position(|op| matches!(op, diag_ir::Op::SendReceive { .. }))
+            .expect("a send-receive");
+        assert!(matches!(
+            program.code[send + 1],
+            diag_ir::Op::DecodeField { .. }
+        ));
+        let section = program
+            .sections
+            .iter()
+            .find(|s| s.start_pc as usize <= send && send < s.end_pc as usize)
+            .expect("a section over the primitive");
+        assert!(
+            matches!(section.idempotency, diag_ir::Idempotency::Safe),
+            "{section:?}"
+        );
+    }
+    // Each variant names itself.
+    let names: Vec<_> = documents(&converted)
+        .iter()
+        .map(|d| variant(d).short_name.clone().expect("a name"))
+        .collect();
+    assert_eq!(names, ["exampleEcuV1", "exampleEcuV2"]);
+}
+
+#[test]
+fn an_ecu_info_key_without_an_identity_row_is_unknown() {
+    // The example declares only the VIN: its part number and version are terminated text.
+    for key in ["part_number", "software_version"] {
+        let source =
+            format!("def main():\n    diag.log(1, \"x\")\n    diag.ecu_info()[\"{key}\"]\n");
+        let definition = resolve(read_files(with(example(), "a.star", &source)).expect("reads"))
+            .expect("resolves");
+        let rejected = lower_procedures(&definition).expect_err("rejected");
+        assert!(
+            rejected
+                .errors
+                .iter()
+                .all(|e| (e.code, e.line) == (crate::star::StarCode::UnknownIdentity, 3)),
+            "{:?}",
+            rejected.errors
+        );
+        assert!(!rejected.errors.is_empty());
+    }
+    // The variant name and the VIN need no more than the example has.
+    convert(with(
+        example(),
+        "a.star",
+        "def main():\n    diag.log(1, diag.ecu_info()[\"variant\"])\n",
+    ));
+}
+
+#[test]
+fn a_negative_ecu_info_answer_ends_the_run_with_a_vm_error() {
+    let error = run_answered(example(), ECU_INFO, &[&[0x7F, 0x22, 0x31]])
+        .err()
+        .expect("the run stops");
+    assert!(error.starts_with("Vm(Undecodable"), "{error}");
+}

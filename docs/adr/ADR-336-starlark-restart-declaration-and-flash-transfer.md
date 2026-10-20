@@ -50,7 +50,8 @@ comment annotations next to the code they describe.
      (default 0x44), which become `FlashSegment` fields in `ir.fbs`, appended with defaults.
      `block_size` is the TransferData payload per block.
 2. **A plan is a whole top-level function, expanded in place.** `# @flashPlan session=<int>
-   [maxResumes=<int>] [recovery=never]` stands directly before a top-level `def`, under the
+   [maxResumes=<int>] [recovery=never]` stands directly before a top-level `def` other than
+   `main` (nothing calls `main`, so it has no call site to expand at), under the
    placement rules of `@section`, and may share the `def` with one. `session` must name a
    `FlashSession` of the target the call addresses. `maxResumes` defaults to 3, and the stage is
    the session id. Each of these is a `STAR_PLAN_SHAPE` error: the function is not called

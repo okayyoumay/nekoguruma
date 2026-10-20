@@ -692,8 +692,6 @@ timings and block format) come from the definition directory's tables (`csv-tabl
 and 4.14); the annotations below give only what the procedure knows.
 
 ```python
-# @preconditions voltage ignition engine vehicleSpeed
-
 # @section uninterruptible expected=180000
 # @flashPlan session=1 maxResumes=3 recovery=never
 def write_application():
@@ -707,20 +705,22 @@ def write_application():
     diag.routine(0xFF01, 0x01, {})
     diag.request(0x11, {"reset": 0x01})
 
+# @preconditions voltage ignition engine vehicleSpeed
 def main():
     write_application()
 ```
 
 - **`# @flashPlan session=<int> [maxResumes=<int>] [recovery=never]`.** It stands directly before a
-  top-level `def`, under the placement rules of `@section` (4.5), and may share the `def` with one;
-  `main` itself may carry it. `session` must name a `FlashSession` of the target the call
+  top-level `def` other than `main`, under the placement rules of `@section` (4.5), and may share
+  the `def` with one. `session` must name a `FlashSession` of the target the call
   addresses (`STAR_UNKNOWN_FLASH_SESSION`). `maxResumes` defaults to 3. The plan's stage is the
   session id; the maximum id is refused because it is the reserved id of a plain procedure.
 - **Shape (`STAR_PLAN_SHAPE`).** Each is an error: the function is not called exactly once; the
   call is not a statement of `main`'s body (inside an `if` is allowed, inside a `for` is not);
   the call is in another function, a plan or a section function; the plan has a `return` (it ends
   by falling off its body or by `diag.fail`); the plan is the callee of a section function; a plan
-  function is never called.
+  function is never called; `main` carries the annotation (nothing calls it, so it has no call
+  site to expand at).
 - **Coverage.** Everything that runs during the call is in the plan. Functions it calls, directly
   or not, section functions included, are expanded in place, not copied and called: a plan
   contains no `Call` or `Ret` (ADR-245 item 4). A `Ret` becomes a jump to the join, locals get

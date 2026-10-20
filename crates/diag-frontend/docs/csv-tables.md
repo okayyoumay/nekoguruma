@@ -453,8 +453,8 @@ the session, in every program of the variant.
 | `teardown_margin_ms` | integer, 0 to 2^32 - 1 | with a plan | `RecoveryTiming`: the margin added to it before a passive teardown is confirmed |
 | `ecu_startup_ms` | integer, 0 to 2^32 - 1 | with a plan | `RecoveryTiming`: the ECU's startup time after a reset |
 | `confirmation_window_ms` | integer, 0 to 2^32 - 1 | with a plan | `RecoveryTiming`: the window for confirming the default session |
-| `version_read_retries` | integer, 0 to 2^32 - 1 | with a plan | `FlashRecovery.version_read_retries` |
-| `no_application_nrc` | integer, 0x01 to 0xFF | no | `FlashRecovery.no_application`, the response that means no valid application is present; default none |
+| `version_read_retries` | integer, 0 to 255 | with a plan | `FlashRecovery.version_read_retries` |
+| `no_application_nrc` | integer, 0x01 to 0xFF except 0x78 (a response pending, which the worker absorbs; `Program::validate` refuses it) | no | `FlashRecovery.no_application`, the response that means no valid application is present; default none |
 
 `flash_segments.csv`, appended to the named session's `segments` in row order. It has no
 `variants` column: a segment belongs to exactly the variants of its session.

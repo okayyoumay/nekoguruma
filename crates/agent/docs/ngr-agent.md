@@ -344,16 +344,26 @@ A plain start on an existing journal counts as a resume of the plain procedure: 
 the existing resume record under the reserved stage `diag_ir::PLAIN_PROCEDURE_STAGE` before anything
 is sent, after a cancel check, and a stage already resumed `JobLimits::max_procedure_resumes` times
 (agent policy, default 3, not in the IR) ends the job in
-`OnSiteInterventionRequired(ProcedureResumeLimitReached { resumes, max })` with nothing sent. A
-plain start of a missing journal runs without one and is not counted. ADR-335 item 6 counts a
-checkpoint resume under the same stage and limit when one runs; the runner's
-`CheckpointResumeNotImplemented` ending below counts none.
+`OnSiteInterventionRequired(ProcedureResumeLimitReached { resumes, max })` with nothing sent. A plain start of a missing journal runs without one and is not counted.
 
-The runner does not run a `ResumeFromCheckpoint` decision (the VIN read and lock, the resume
-count and the run from the restored state of ADR-335 item 6). A job that reaches it ends in
-`OnSiteInterventionRequired(CheckpointResumeNotImplemented { at })` with nothing sent and no resume
-counted, rather than in a plain start, which would send the requests the journal records a second
-time.
+A `ResumeFromCheckpoint` decision runs in this order, each failure ending the job as stated:
+
+1. The limit and the count, as for a plain start (`ProcedureResumeLimitReached` with nothing
+   sent, then a cancel check, then the resume record), before anything is sent. A checkpoint
+   resume counts under the same stage and limit (ADR-335 item 6).
+2. The identity (`restart::check_procedure_identity`, ADR-261, ADR-263): the ECU's VIN is read
+   through the program's VIN source, the only request sent before the run, with a cancel check
+   before and after. A well-formed VIN equal to the job's takes the per-vehicle lock; another
+   well-formed VIN is `JobError::IdentityMismatch`, journaled first and terminal (ADR-286); a VIN
+   that cannot be established (no answer, a negative response, a malformed value, a worker
+   failure) is `OnSiteInterventionRequired(ProcedureIdentityNotEstablished)`. The count stays, and
+   the job can be resumed again within the limit (ADR-290).
+3. The run: a run start with the restored state is committed first (ADR-274), then the VM goes on
+   from that state with a step budget of its own (ADR-287). The run is journaled as a first run
+   is (requests, checkpoints, a declared failure, a stop), and the job ends as that run would. The
+   checkpoint's unsafe requests are not sent again; the continuation holds only primitives that
+   are safe to repeat and runs in whatever session the ECU is in (ADR-335 item 8). It follows the
+   same entry checks as the other restart paths.
 
 ## Restart entry
 
@@ -372,7 +382,7 @@ it classifies the journal.
 | `Aborted` | ends in `JobError::IdentityMismatch` with the journaled `IdentityKind`, read under the journal's lock before the worker link is opened and before the target VIN and intended version are compared; nothing is sent to the ECU and no resume is counted (ADR-286) |
 | `Stopped` | ends in the error the stopped run returned, `JobError::StepLimit` with the recorded step count or `JobError::Vm` with the recorded position and error, read under the journal's lock before the worker link is opened; nothing is sent to the ECU and no resume is counted, so a plain start does not send the pre-erase requests again and a restart does not redo the transfer (ADR-288) |
 | `OnSiteInterventionRequired` | ends in `JobError::OnSiteInterventionRequired` with the classification's reason; nothing is sent |
-| `ResumeFromCheckpoint` | ends in `JobError::OnSiteInterventionRequired(CheckpointResumeNotImplemented)`; nothing is sent and no resume is counted (A plain procedure above) |
+| `ResumeFromCheckpoint` | counts the resume, reads and checks the VIN (taking the vehicle lock), commits a run start with the restored state and goes on from the checkpoint, ending as a first run would; the steps are those of "A plain procedure" above |
 | `Restart` | runs `restart::check_before_ecu`, then the gates of `restart::check_gates` (which promote the guards to the per-vehicle lock once the VIN matches, ADR-263), then the teardown of `restart::teardown` (ADR-264), then the default-session confirmation of `restart::confirm_default_session` (ADR-265). An ECU that cannot be confirmed ends the job in `JobError::OnSiteInterventionRequired(DefaultSessionNotConfirmed)`. Then `restart::check_identity` (step 3a) reads the VIN and the hardware identity again: a different one ends the job in `IdentityMismatch` (journaled first, ADR-286), one that cannot be established in `OnSiteInterventionRequired(IdentityNotEstablished)`, and a matching VIN promotes the guards again (the lock's fallback when step 2 could not read it). Then `restart::check_state` (step 3b-2) reads the software version and decides between redoing the transfer and the read-back verification (`restart::check_state` below): a version nobody wrote ends the job in `OnSiteInterventionRequired(UnexpectedSoftwareVersion)`, one that cannot be established in `OnSiteInterventionRequired(SoftwareVersionNotEstablished)`. When the state check decides to redo the transfer, `restart::check_reentry` (step 4a) checks every declared precondition again through its default-session source: one that does not hold ends the job in `OnSiteInterventionRequired(PreconditionNotMet)`. When step 4a passes, the program's steps from the plan's entry boundary up to, not including, its erase run again from `RestartPoint::entry_state` (step 4b-2, ADR-273; `replay to the erase` below), and then `restart::check_before_erase` (step 4b-3) checks every declared precondition once more through its programming-session source: one that does not hold ends the job in `OnSiteInterventionRequired(PreconditionNotMetBeforeErase)` with no erase sent. After that check the same VM goes on from the erase as a first run does (step 4c, ADR-276; `redo from the erase` below), and the job ends as that first run would. When the state check decides the read-back verification, the program goes on after the plan instead (`continuation after the read-back verification` below), and the job ends as a first run would; the gates' reads, at most one ECUReset, the F186 reads, step 3a's two reads, step 3b-2's version reads, step 4a's precondition reads, the replayed steps, step 4b-3's precondition reads and then the redone transfer and the rest of the program, or after a verification the program's steps after the plan, reach the ECU |
 
 The on-site endings that the `Restart` row reaches after `check_before_ecu` has committed the

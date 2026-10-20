@@ -1,5 +1,5 @@
 use diag_ir::declaration::{EcuDocumentT, EcuVariantT, encode_ecu_document, load_ecu_document};
-use diag_ir::{DiagHost, StepError, StepOutcome, Vm, VmError, WaitingOn};
+use diag_ir::{DiagHost, RuntimeInput, StepError, StepOutcome, Vm, VmError, WaitingOn};
 
 use super::*;
 use crate::profile::{Intent, Profile};
@@ -46,6 +46,9 @@ impl DiagHost for NoHost {
         unreachable!("no primitive is lowered yet")
     }
     fn artifact_bytes(&mut self, _: u64, _: u32) -> Result<Vec<u8>, NoHostError> {
+        unreachable!("no primitive is lowered yet")
+    }
+    fn runtime_input(&mut self, _: RuntimeInput) -> Result<Option<i64>, NoHostError> {
         unreachable!("no primitive is lowered yet")
     }
     fn log(&mut self, _: u8, _: &str) {}
@@ -1737,6 +1740,8 @@ struct ScriptedHost {
     responses: std::collections::VecDeque<Vec<u8>>,
     keys: std::collections::VecDeque<Vec<u8>>,
     keys_pending: u32,
+    /// The values `Op::ReadInput` reads; an input not listed is not established.
+    inputs: Vec<(RuntimeInput, i64)>,
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -1796,6 +1801,14 @@ impl DiagHost for ScriptedHost {
     }
     fn artifact_bytes(&mut self, _: u64, _: u32) -> Result<Vec<u8>, NoHostError> {
         unreachable!("no artifact is scripted")
+    }
+    fn runtime_input(&mut self, input: RuntimeInput) -> Result<Option<i64>, NoHostError> {
+        self.calls.push(format!("input {input:?}"));
+        Ok(self
+            .inputs
+            .iter()
+            .find(|(set, _)| *set == input)
+            .map(|&(_, value)| value))
     }
     fn log(&mut self, level: u8, message: &str) {
         self.calls.push(format!("log {level} {message}"));
@@ -2678,6 +2691,179 @@ def main():
     assert_eq!(
         errors.iter().map(|e| e.code).collect::<Vec<_>>(),
         [StarCode::UnknownPrecondition]
+    );
+}
+
+// ---------------------------------------------------------------- `diag.precondition` (ADR-338)
+
+/// Runs `source` lowered against `requests` on `host` to its end.
+fn run_against(source: &str, requests: &RequestIndex, host: &mut ScriptedHost) -> Program {
+    let program = lowered_against(source, requests).unwrap_or_else(|errors| panic!("{errors:#?}"));
+    let mut vm = Vm::new(&program);
+    for _ in 0..10_000 {
+        match vm.step(&program, host) {
+            Ok(StepOutcome::Continue) => {}
+            Ok(StepOutcome::Finished) => return program,
+            other => panic!("{other:?}"),
+        }
+    }
+    panic!("the procedure did not end")
+}
+
+fn error_codes(source: &str, requests: &RequestIndex) -> Vec<(StarCode, u32)> {
+    match lowered_against(source, requests) {
+        Ok(_) => Vec::new(),
+        Err(errors) => errors.iter().map(|e| (e.code, e.line)).collect(),
+    }
+}
+
+#[test]
+fn a_precondition_from_a_runtime_input_lowers_to_read_input() {
+    use diag_ir::RuntimeInput::{IgnitionOn, SupplyVoltageMillivolts};
+    // No `@preconditions`: the call reads a value during the run and declares nothing.
+    let source = "\
+def main():
+    if diag.precondition(\"voltage\") > 12000:
+        diag.log(1, \"supply high\")
+    if diag.precondition(\"ignition\") == 1:
+        diag.log(1, \"ignition on\")
+";
+    let mut host = ScriptedHost {
+        inputs: vec![(SupplyVoltageMillivolts, 12_600), (IgnitionOn, 1)],
+        ..ScriptedHost::default()
+    };
+    let program = run_against(source, &restart_index(), &mut host);
+    assert_eq!(
+        host.calls,
+        [
+            "input SupplyVoltageMillivolts",
+            "log 1 supply high",
+            "input IgnitionOn",
+            "log 1 ignition on"
+        ]
+    );
+    assert!(program.code.contains(&Op::ReadInput {
+        input: SupplyVoltageMillivolts
+    }));
+    assert_eq!(program.preconditions, diag_ir::Preconditions::default());
+    // A read of an input is no diagnostic primitive, so no section covers it.
+    let read_at = program
+        .code
+        .iter()
+        .position(|op| matches!(op, Op::ReadInput { .. }))
+        .expect("a read");
+    assert!(!program.code[read_at].is_diagnostic_primitive());
+    assert!(
+        program
+            .sections
+            .iter()
+            .all(|s| !(s.start_pc..s.end_pc).contains(&(read_at as u32)))
+    );
+    program.validate().expect("valid");
+}
+
+#[test]
+fn a_precondition_the_host_cannot_establish_stops_the_run() {
+    let program = lowered_against(
+        "def main():\n    x = diag.precondition(\"voltage\")\n",
+        &restart_index(),
+    )
+    .expect("lowers");
+    let mut vm = Vm::new(&program);
+    let mut host = ScriptedHost::default();
+    let error = loop {
+        match vm.step(&program, &mut host) {
+            Ok(StepOutcome::Continue) => {}
+            Err(StepError::Vm(error)) => break error,
+            other => panic!("{other:?}"),
+        }
+    };
+    assert_eq!(
+        error,
+        VmError::InputNotEstablished {
+            input: RuntimeInput::SupplyVoltageMillivolts
+        }
+    );
+}
+
+#[test]
+fn a_precondition_name_is_a_known_string_constant() {
+    use StarCode::*;
+    let requests = restart_index();
+    let cases = [
+        // Not a kind: the table's spelling is not the call's, as for `@preconditions`.
+        (
+            "def main():\n    diag.precondition(\"batteryMilliVolt\")\n",
+            ArgumentOutOfRange,
+        ),
+        (
+            "def main():\n    diag.precondition(\"vehicle_speed\")\n",
+            ArgumentOutOfRange,
+        ),
+        // Known only at run time.
+        (
+            "def f(n):\n    diag.precondition(n)\n\ndef main():\n    f(\"voltage\")\n",
+            NonConstantArgument,
+        ),
+        ("def main():\n    diag.precondition(1)\n", UnsupportedSyntax),
+        ("def main():\n    diag.precondition()\n", UnsupportedSyntax),
+        (
+            "def main():\n    diag.precondition(\"voltage\", \"ignition\")\n",
+            UnsupportedSyntax,
+        ),
+        // A kind the variant's table has no row for.
+        (
+            "def main():\n    diag.precondition(\"engine\")\n",
+            UnknownPrecondition,
+        ),
+    ];
+    for (source, code) in cases {
+        let found = error_codes(source, &requests);
+        assert_eq!(found, [(code, 2)], "{source}");
+    }
+    // The error names the kind that has no row.
+    let errors = lowered_against(cases[6].0, &requests).expect_err("no row");
+    assert!(errors[0].hint.contains("engine"), "{}", errors[0].hint);
+}
+
+#[test]
+fn a_precondition_row_without_a_default_session_source_is_refused() {
+    let mut requests = restart_index();
+    requests
+        .preconditions
+        .voltage_mv
+        .as_mut()
+        .expect("a row")
+        .default_session = None;
+    let errors = lowered_against(
+        "def main():\n    diag.precondition(\"voltage\")\n",
+        &requests,
+    )
+    .expect_err("refused");
+    assert_eq!(
+        errors.iter().map(|e| (e.code, e.line)).collect::<Vec<_>>(),
+        [(StarCode::UnknownPrecondition, 2)]
+    );
+    assert!(
+        errors[0].hint.contains("default-session"),
+        "{}",
+        errors[0].hint
+    );
+}
+
+#[test]
+fn a_service_source_the_variant_does_not_declare_is_not_lowerable() {
+    // `restart_index` reads the voltage in the programming session from service 4, which the
+    // empty document lacks; make that the default source too.
+    let mut requests = restart_index();
+    let row = requests.preconditions.voltage_mv.as_mut().expect("a row");
+    row.default_session = row.programming_session;
+    assert_eq!(
+        error_codes(
+            "def main():\n    diag.precondition(\"voltage\")\n",
+            &requests
+        ),
+        [(StarCode::NotLowerable, 2)]
     );
 }
 

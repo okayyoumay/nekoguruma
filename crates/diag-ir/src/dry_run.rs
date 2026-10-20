@@ -15,7 +15,8 @@ use crate::declaration::{
 };
 use crate::decode::{DecodeError, DecodedField, Layouts, PhysicalValue, decode_positive_response};
 use crate::{
-    DiagHost, Failure, Program, ProgramError, StepError, StepOutcome, Vm, VmError, WaitingOn,
+    DiagHost, Failure, Program, ProgramError, RuntimeInput, StepError, StepOutcome, Vm, VmError,
+    WaitingOn,
 };
 
 /// The most bytes of requests, answers, transfer data, forms and messages one report holds,
@@ -35,6 +36,7 @@ pub struct Script {
     keys: Vec<Vec<u8>>,
     forms: Vec<Vec<u8>>,
     records: Vec<Vec<u8>>,
+    inputs: Vec<(RuntimeInput, i64)>,
 }
 
 impl Script {
@@ -69,6 +71,17 @@ impl Script {
     /// Adds an operator's answer to a record template (4.3.1).
     pub fn record(mut self, bytes: impl Into<Vec<u8>>) -> Self {
         self.records.push(bytes.into());
+        self
+    }
+
+    /// Sets the value `Op::ReadInput` of `input` reads (ADR-338), in the unit the precondition
+    /// checks use: millivolts, 0 or 1 for a flag, km/h. A later call for the same input replaces
+    /// the value. An input that is not set is one the run cannot establish
+    /// ([`VmError::InputNotEstablished`]), as on a vehicle that offers none: a dry run invents
+    /// no measurement.
+    pub fn input(mut self, input: RuntimeInput, value: i64) -> Self {
+        self.inputs.retain(|(set, _)| *set != input);
+        self.inputs.push((input, value));
         self
     }
 }
@@ -703,6 +716,17 @@ impl DiagHost for ScriptedHost<'_, '_> {
     fn artifact_bytes(&mut self, _offset: u64, len: u32) -> Result<Vec<u8>, DryRunError> {
         self.charge_total(len as usize)?;
         Ok(vec![0; len as usize])
+    }
+
+    // A read of the script's value for the input: it sends nothing and allocates nothing, so it
+    // leaves no event and charges nothing (ADR-338).
+    fn runtime_input(&mut self, input: RuntimeInput) -> Result<Option<i64>, DryRunError> {
+        Ok(self
+            .script
+            .inputs
+            .iter()
+            .find(|(set, _)| *set == input)
+            .map(|&(_, value)| value))
     }
 
     // `log` cannot fail, so a message past the budget is dropped and the run ends after this

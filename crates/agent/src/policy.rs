@@ -207,6 +207,8 @@ pub fn check_program(
             | Op::DecodeField { .. }
             // Reads the artifact through the host; sends nothing (ADR-336 item 12).
             | Op::FlashBlock { .. }
+            // Reads a runtime input through the host; sends nothing (ADR-338).
+            | Op::ReadInput { .. }
             // Ends the procedure; sends nothing (ADR-280).
             | Op::Fail { .. } => None,
         };

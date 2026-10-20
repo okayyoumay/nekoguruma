@@ -3109,6 +3109,9 @@ mod tests {
                 expected: 0,
                 got: 0,
             },
+            VmError::InputNotEstablished {
+                input: diag_ir::RuntimeInput::SupplyVoltageMillivolts,
+            },
         ];
         // The match fails to compile when a variant is added, so the list above stays complete.
         for error in &errors {
@@ -3143,7 +3146,8 @@ mod tests {
                 | VmError::UnknownFlashSegment { .. }
                 | VmError::ZeroBlockSize { .. }
                 | VmError::BlockOutOfRange { .. }
-                | VmError::ArtifactLength { .. } => {}
+                | VmError::ArtifactLength { .. }
+                | VmError::InputNotEstablished { .. } => {}
             }
         }
         let encoded = |reason: RunStop| {
@@ -3158,6 +3162,20 @@ mod tests {
         for (index, error) in errors.into_iter().enumerate() {
             let bytes = encoded(RunStop::Vm(error.clone()));
             assert_eq!(bytes[..5], [14, 0, 0, 1, index as u8], "{error:?}");
+        }
+        // `InputNotEstablished` holds a `RuntimeInput`, also encoded by variant index (ADR-338).
+        for (index, input) in [
+            diag_ir::RuntimeInput::SupplyVoltageMillivolts,
+            diag_ir::RuntimeInput::ExternalSupplyConnected,
+            diag_ir::RuntimeInput::IgnitionOn,
+            diag_ir::RuntimeInput::EngineRunning,
+            diag_ir::RuntimeInput::VehicleSpeedKmh,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let bytes = encoded(RunStop::Vm(VmError::InputNotEstablished { input }));
+            assert_eq!(bytes[5..], [index as u8], "{input:?}");
         }
     }
 

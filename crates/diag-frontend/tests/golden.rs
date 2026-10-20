@@ -178,6 +178,9 @@ impl DiagHost for Recording {
     fn artifact_bytes(&mut self, _: u64, _: u32) -> Result<Vec<u8>, NotSent> {
         Err(NotSent)
     }
+    fn runtime_input(&mut self, _: diag_ir::RuntimeInput) -> Result<Option<i64>, NotSent> {
+        Err(NotSent)
+    }
     fn log(&mut self, level: u8, message: &str) {
         writeln!(self.out, "log {level} {message}").expect("a String");
     }

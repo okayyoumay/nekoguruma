@@ -44,7 +44,8 @@ use crate::declaration::{EcuVariant, Shape};
 /// 16: `Op` gained `FlashBlock`, and `VmError` gained `UnknownFlashSession`,
 /// `UnknownFlashSegment`, `ZeroBlockSize`, `BlockOutOfRange` and `ArtifactLength`
 /// (ADR-336 item 11).
-pub const IR_SCHEMA_VERSION: u32 = 16;
+/// 17: `Op` gained `ReadInput`, and `VmError` gained `InputNotEstablished` (ADR-338).
+pub const IR_SCHEMA_VERSION: u32 = 17;
 
 /// The longest code, in bytes, that `Program::validate` accepts for a `Fail` (ADR-280).
 pub const MAX_FAILURE_CODE_LEN: usize = 128;
@@ -252,6 +253,17 @@ pub enum Op {
         session: u32,
         segment: u32,
     },
+
+    // Runtime input. Appended after `FlashBlock` (ADR-233, ADR-338).
+    /// Pushes the current value of the runtime input `input` as an `I64` (ADR-338): the host
+    /// answers through [`DiagHost::runtime_input`] in the unit the input's precondition checks
+    /// use (millivolts, 0 or 1 for a flag, km/h). An input the host cannot establish is
+    /// `VmError::InputNotEstablished`. It sends nothing to the vehicle and is no diagnostic
+    /// primitive, like [`Op::DecodeField`]; it needs no declaration part. A stack with no room
+    /// for the value is `VmError::StackOverflow`, before the host is called.
+    ReadInput {
+        input: RuntimeInput,
+    },
 }
 
 // ---------------------------------------------------------------- Program
@@ -316,7 +328,8 @@ impl Op {
     /// Whether this instruction is a diagnostic primitive, one the job runner journals around
     /// (8.2.5 checkpoint granularity, ADR-233). [`Op::FlashBlock`] is not: it calls
     /// [`DiagHost::artifact_bytes`], a read that sends nothing to the vehicle and changes no
-    /// host state.
+    /// host state. Neither is [`Op::ReadInput`] (ADR-338), which calls
+    /// [`DiagHost::runtime_input`] likewise.
     pub fn is_diagnostic_primitive(&self) -> bool {
         // Exhaustive on purpose: a new instruction must be classified here.
         match self {
@@ -372,6 +385,7 @@ impl Op {
             | Op::ShlChecked
             | Op::DecodeField { .. }
             | Op::FlashBlock { .. }
+            | Op::ReadInput { .. }
             | Op::Fail { .. } => false,
         }
     }
@@ -472,6 +486,11 @@ pub trait DiagHost {
     /// VM computed from the declared segment. The answer must be exactly `len` bytes long; the
     /// VM refuses any other length (ADR-336 item 11).
     fn artifact_bytes(&mut self, offset: u64, len: u32) -> Result<Vec<u8>, Self::Error>;
+    /// [`Op::ReadInput`]: the current value of `input` as the precondition checks hold it
+    /// (millivolts, 0 or 1 for a flag, km/h), without sending anything to the ECU. `Ok(None)`
+    /// means the host cannot establish it, which the VM reports as
+    /// [`VmError::InputNotEstablished`] (ADR-338).
+    fn runtime_input(&mut self, input: RuntimeInput) -> Result<Option<i64>, Self::Error>;
     fn log(&mut self, level: u8, message: &str);
 }
 
@@ -570,7 +589,9 @@ impl Vm {
     /// `steps` incremented) or leaves the state unchanged. Everything the VM can check is checked
     /// before the host is called, so a host answer is never discarded, with one exception:
     /// [`Op::FlashBlock`] checks the length of the answer, and a wrong length is
-    /// [`VmError::ArtifactLength`] (the read changed nothing, so the step can be repeated). After a host error the
+    /// [`VmError::ArtifactLength`] (the read changed nothing, so the step can be repeated), and
+    /// [`Op::ReadInput`] has no answer to keep when the host cannot establish the input
+    /// ([`VmError::InputNotEstablished`], likewise repeatable). After a host error the
     /// state still points at the primitive, so stepping again repeats it (8.2.5); whether that
     /// is safe is the job runner's decision (`Section::idempotency`, ADR-229), not the VM's.
     pub fn step<H: DiagHost>(
@@ -619,7 +640,8 @@ impl Vm {
         let inquiry = self.state.steps;
         // Every check a primitive needs before the host call, shared with `current_op`. Nothing
         // after a host call below can fail, so a `VmError` means the host was not called, except
-        // `VmError::ArtifactLength` from `Op::FlashBlock`, whose read leaves the host's state alone.
+        // `VmError::ArtifactLength` from `Op::FlashBlock` and `VmError::InputNotEstablished` from
+        // `Op::ReadInput`, whose reads leave the host's state alone.
         let input = self.check_primitive(op, program)?;
         match op {
             Op::PushI64(v) => self.push(Value::I64(*v))?,
@@ -724,6 +746,15 @@ impl Vm {
                     .into());
                 }
                 self.replace(1, Value::Bytes(bytes));
+            }
+            Op::ReadInput { input } => {
+                // Room is checked before the host is called, so its answer is never discarded.
+                self.check_room(0, 1)?;
+                let value = host
+                    .runtime_input(*input)
+                    .map_err(StepError::Host)?
+                    .ok_or(VmError::InputNotEstablished { input: *input })?;
+                self.push_checked(Value::I64(value));
             }
             Op::Not => {
                 let Value::Bool(b) = self.top(1)?[0] else {
@@ -996,7 +1027,8 @@ impl Vm {
             | Op::FloatToInt
             | Op::ShlChecked
             | Op::DecodeField { .. }
-            | Op::FlashBlock { .. } => HostInput::Nothing,
+            | Op::FlashBlock { .. }
+            | Op::ReadInput { .. } => HostInput::Nothing,
             // The checks of `Fail` run in `execute`, before it changes anything.
             Op::Fail { .. } => HostInput::Nothing,
         })
@@ -1483,6 +1515,8 @@ pub enum VmError {
     },
     #[error("the host gave {got} artifact bytes for a block of {expected}")]
     ArtifactLength { expected: u32, got: u64 },
+    #[error("the host cannot establish the runtime input {input:?}")]
+    InputNotEstablished { input: RuntimeInput },
 }
 
 #[cfg(test)]

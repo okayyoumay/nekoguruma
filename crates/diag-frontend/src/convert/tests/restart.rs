@@ -176,3 +176,123 @@ fn a_variant_without_the_tables_gets_a_program_without_the_facts() {
         program.validate().expect("a plain program validates");
     }
 }
+
+// ---------------------------------------------------------------- `diag.precondition` (ADR-338)
+
+/// A program that reads a precondition of each kind of source: the voltage from a runtime
+/// input, the vehicle speed from the power-cycle count, a service source.
+const READS: &str = "\
+def main():
+    if diag.precondition(\"voltage\") > 12000:
+        diag.log(1, \"supply high\")
+    if diag.precondition(\"vehicleSpeed\") == 7:
+        diag.log(1, \"seven cycles\")
+";
+
+fn reads_table() -> Vec<(String, Vec<u8>)> {
+    with_restart(
+        "kind,lower,upper,default_source\n\
+         voltage,12000,15000,input:supply_voltage_mv\n\
+         vehicle_speed,0,9,powerCycles.read.powerCycles\n",
+    )
+}
+
+#[test]
+fn a_service_precondition_reads_the_did_and_a_runtime_one_asks_the_host() {
+    let host = run_answered(reads_table(), READS, &[&[0x62, 0xFD, 0x01, 0, 0, 0, 7]])
+        .expect("the program runs");
+    assert_eq!(host.logged, ["supply high", "seven cycles"]);
+    // The service source is a send-receive of the DID read; the input is read from the host.
+    assert_eq!(host.sent.len(), 1);
+    assert_eq!(host.sent[0].1, [0x22, 0xFD, 0x01]);
+    assert_eq!(host.inputs_read, [RuntimeInput::SupplyVoltageMillivolts]);
+    // The answer is decoded through the field: another count is another value.
+    let host = run_answered(reads_table(), READS, &[&[0x62, 0xFD, 0x01, 0, 0, 0, 8]])
+        .expect("the program runs");
+    assert_eq!(host.logged, ["supply high"]);
+}
+
+#[test]
+fn a_service_precondition_is_a_safe_send_receive_the_declarations_accept() {
+    let converted = convert(with(reads_table(), "main.star", READS));
+    for converted in &converted.documents {
+        let document = load_ecu_document(&converted.bytes).expect("the document loads");
+        let bytes = document.procedure().expect("a program");
+        let program: Program = postcard::from_bytes(bytes.bytes()).expect("a program");
+        program.validate().expect("valid");
+        diag_ir::check_declarations(&program, &document.variant().expect("a variant"))
+            .expect("the service and field are declared");
+        let send = program
+            .code
+            .iter()
+            .position(|op| matches!(op, diag_ir::Op::SendReceive { .. }))
+            .expect("a send-receive");
+        assert!(matches!(
+            program.code[send + 1],
+            diag_ir::Op::DecodeField { .. }
+        ));
+        let section = program
+            .sections
+            .iter()
+            .find(|s| s.start_pc as usize <= send && send < s.end_pc as usize)
+            .expect("a section over the primitive");
+        assert!(
+            matches!(section.idempotency, diag_ir::Idempotency::Safe),
+            "{section:?}"
+        );
+        assert!(
+            program
+                .code
+                .iter()
+                .any(|op| matches!(op, diag_ir::Op::ReadInput { .. }))
+        );
+    }
+}
+
+#[test]
+fn a_precondition_read_needs_a_row_of_its_kind_in_the_variant() {
+    // The first variant has only the voltage row; the vehicle speed has none there.
+    let table = "variants,kind,lower,upper,default_source\n\
+                 ,voltage,1,2,input:supply_voltage_mv\n\
+                 exampleEcuV2,vehicle_speed,0,9,powerCycles.read.powerCycles\n";
+    let definition =
+        resolve(read_files(with(with_restart(table), "a.star", READS)).expect("reads"))
+            .expect("resolves");
+    let rejected = lower_procedures(&definition).expect_err("rejected");
+    assert_eq!(rejected.errors.len(), 1);
+    assert_eq!(
+        rejected.errors[0].code,
+        crate::star::StarCode::UnknownPrecondition
+    );
+}
+
+#[test]
+fn a_service_precondition_with_a_converted_field_is_not_an_int() {
+    // The supply voltage, declared here for every variant, has a linear conversion: its field
+    // decodes to a float, so it cannot be the `int` the call gives.
+    let files: Vec<_> = with(
+        reads_table(),
+        "preconditions.csv",
+        "kind,lower,upper,default_source\n\
+         voltage,1,9,supplyVoltage.read.supplyVoltage\n",
+    )
+    .into_iter()
+    .map(|(name, bytes)| {
+        let bytes = if name == "dids.csv" {
+            String::from_utf8(bytes)
+                .unwrap()
+                .replace("exampleEcuV2,supplyVoltage", ",supplyVoltage")
+                .into_bytes()
+        } else {
+            bytes
+        };
+        (name, bytes)
+    })
+    .collect();
+    let source = "def main():\n    diag.precondition(\"voltage\")\n";
+    let definition =
+        resolve(read_files(with(files, "a.star", source)).expect("reads")).expect("resolves");
+    let rejected = lower_procedures(&definition).expect_err("rejected");
+    assert_eq!(rejected.errors.len(), 1);
+    assert_eq!(rejected.errors[0].code, crate::star::StarCode::NotLowerable);
+}

@@ -25,7 +25,7 @@ def write_image():
 
 def main():
     # Check preconditions (8.9)
-    volt = diag.precondition("batteryMilliVolt")
+    volt = diag.precondition("voltage")
     if volt < MIN_MILLIVOLT:
         diag.fail("POWER_CONDITION", "Insufficient voltage: %dmV" % volt)
 

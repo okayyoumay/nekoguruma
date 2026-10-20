@@ -6,7 +6,7 @@
 
 use std::convert::Infallible;
 
-use diag_ir::{DiagHost, Program, StepOutcome, Vm, VmState};
+use diag_ir::{DiagHost, Program, RuntimeInput, StepOutcome, Vm, VmState};
 use libfuzzer_sys::fuzz_target;
 
 /// How many instructions one input may run.
@@ -50,6 +50,9 @@ impl DiagHost for Answering {
     }
     fn artifact_bytes(&mut self, _offset: u64, len: u32) -> Result<Vec<u8>, Infallible> {
         Ok(vec![0; len as usize])
+    }
+    fn runtime_input(&mut self, _input: RuntimeInput) -> Result<Option<i64>, Infallible> {
+        Ok(Some(0))
     }
     fn wait(&mut self, _inquiry: u64, _millis: u32) -> Result<bool, Infallible> {
         Ok(true)

@@ -726,6 +726,14 @@ impl<C: WorkerApi> DiagHost for WorkerHost<C> {
         Err(HostError::Unsupported("FlashBlock"))
     }
 
+    // Reads through the host's runtime inputs, the source the restart's precondition checks use
+    // (`inputs`): a value is the integer reading, and an input the agent cannot establish or
+    // decode is `None` (ADR-338). Only a failure to reach the worker is an error.
+    fn runtime_input(&mut self, input: diag_ir::RuntimeInput) -> Result<Option<i64>, HostError> {
+        use crate::inputs::RuntimeInputs;
+        Ok(self.read(input)?.value())
+    }
+
     fn log(&mut self, level: u8, message: &str) {
         tracing::info!(level, "{message}");
     }

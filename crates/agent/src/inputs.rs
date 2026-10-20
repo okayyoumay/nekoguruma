@@ -619,6 +619,9 @@ mod tests {
         fn artifact_bytes(&mut self, _: u64, _: u32) -> Result<Vec<u8>, HostError> {
             unreachable!()
         }
+        fn runtime_input(&mut self, input: RuntimeInput) -> Result<Option<i64>, HostError> {
+            Ok(self.inputs.read(input)?.value())
+        }
         fn log(&mut self, _: u8, _: &str) {}
     }
 

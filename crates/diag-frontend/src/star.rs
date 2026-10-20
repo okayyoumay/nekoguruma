@@ -87,6 +87,19 @@ pub enum RequestConstant {
     Bytes(Vec<u8>),
 }
 
+/// The precondition a name of `# @preconditions` and of `diag.precondition` stands for (4.9,
+/// 3.2); `None` for any other name. These spellings differ from `preconditions.csv`'s.
+fn precondition_kind(name: &str) -> Option<PreconditionKind> {
+    Some(match name {
+        "voltage" => PreconditionKind::Voltage,
+        "externalSupply" => PreconditionKind::ExternalSupply,
+        "ignition" => PreconditionKind::Ignition,
+        "engine" => PreconditionKind::Engine,
+        "vehicleSpeed" => PreconditionKind::VehicleSpeed,
+        _ => return None,
+    })
+}
+
 /// The error codes of `docs/starlark-subset.md` that the checker and the lowering report.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub enum StarCode {
@@ -2087,13 +2100,9 @@ impl Checker<'_> {
                 "preconditions" => {
                     let mut kinds = Vec::new();
                     for name in &args {
-                        let kind = match *name {
-                            "voltage" => PreconditionKind::Voltage,
-                            "externalSupply" => PreconditionKind::ExternalSupply,
-                            "ignition" => PreconditionKind::Ignition,
-                            "engine" => PreconditionKind::Engine,
-                            "vehicleSpeed" => PreconditionKind::VehicleSpeed,
-                            _ => {
+                        let kind = match precondition_kind(name) {
+                            Some(kind) => kind,
+                            None => {
                                 bad(
                                     self,
                                     format!(

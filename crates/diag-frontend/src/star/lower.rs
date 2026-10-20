@@ -3677,7 +3677,8 @@ impl<'a> Lowerer<'a> {
                 }
                 Val::Run(Tys::default(), Vec::new())
             }
-            "ecu_info" | "precondition" => {
+            "precondition" => self.diag_precondition(id, args, span),
+            "ecu_info" => {
                 self.error(
                     StarCode::ApiNotAvailable,
                     span,
@@ -3688,6 +3689,169 @@ impl<'a> Lowerer<'a> {
             _ => {
                 self.not_lowerable(span, format!("`diag.{name}` is not lowered yet (3.2)"));
                 Val::Run(Tys::default(), Vec::new())
+            }
+        }
+    }
+
+    /// `diag.precondition(name)` (subset 3.2, ADR-338): the current value of the precondition
+    /// `name` names, an `int` read from the default-session source of the variant's
+    /// `preconditions.csv` row of that kind, chosen here. The name is a string constant (the
+    /// spelling `# @preconditions` uses) and need not appear in that annotation, which declares
+    /// what the program checks before it runs, not what it reads during the run. A service
+    /// source lowers to a send-receive of the DID read and a decode of its field, the
+    /// instructions a `diag.request` and a field read lower to; a runtime input to
+    /// `Op::ReadInput`.
+    fn diag_precondition(&mut self, id: Option<usize>, args: &[&AstExpr], span: Span) -> Val {
+        let none = || Val::Run(Tys::of(Ty::Int), Vec::new());
+        let [name_arg] = args else {
+            self.error(
+                StarCode::UnsupportedSyntax,
+                span,
+                "`diag.precondition` takes the name of a precondition (3.1)",
+            );
+            return none();
+        };
+        let name = match self.expr(id, name_arg) {
+            Val::Const(Const::Str(name)) => name,
+            Val::Const(other) => {
+                self.error(
+                    StarCode::UnsupportedSyntax,
+                    name_arg.span,
+                    format!(
+                        "`name` of `diag.precondition` is a str, not a {} (3.1)",
+                        other.type_name()
+                    ),
+                );
+                return none();
+            }
+            _ => {
+                self.error(
+                    StarCode::NonConstantArgument,
+                    name_arg.span,
+                    "`name` of `diag.precondition` must be known at ingestion: it selects the \
+                     source the value is read from (3.1)",
+                );
+                return none();
+            }
+        };
+        let Some(kind) = super::precondition_kind(&name) else {
+            self.error(
+                StarCode::ArgumentOutOfRange,
+                name_arg.span,
+                format!(
+                    "`{name}` is not a precondition; `diag.precondition` takes `voltage`, \
+                     `externalSupply`, `ignition`, `engine` or `vehicleSpeed` (3.2)"
+                ),
+            );
+            return none();
+        };
+        let table = &self.requests.preconditions;
+        let row = match kind {
+            PreconditionKind::Voltage => &table.voltage_mv,
+            PreconditionKind::ExternalSupply => &table.external_supply,
+            PreconditionKind::Ignition => &table.ignition,
+            PreconditionKind::Engine => &table.engine,
+            PreconditionKind::VehicleSpeed => &table.vehicle_speed,
+        };
+        let Some(row) = row else {
+            self.error(
+                StarCode::UnknownPrecondition,
+                name_arg.span,
+                format!("the variant's preconditions.csv has no row of kind {name} (3.2)"),
+            );
+            return none();
+        };
+        let Some(source) = row.default_session else {
+            self.error(
+                StarCode::UnknownPrecondition,
+                name_arg.span,
+                format!(
+                    "the variant's preconditions.csv row of kind {name} has no default-session \
+                     source to read the value from (3.2)"
+                ),
+            );
+            return none();
+        };
+        match source {
+            diag_ir::Source::RuntimeInput(input) => Val::Run(
+                Tys::of(Ty::Int),
+                vec![(Ins::Op(Op::ReadInput { input }), span)],
+            ),
+            diag_ir::Source::EcuService {
+                service_id,
+                field_id,
+            } => {
+                let request = self
+                    .service_at
+                    .get(&service_id)
+                    .and_then(|&at| self.variant.services()?.get(at).request());
+                let Some(request) = request else {
+                    self.not_lowerable(
+                        name_arg.span,
+                        format!(
+                            "the source of the {name} precondition is a service the variant \
+                             does not declare with a request (3.2)"
+                        ),
+                    );
+                    return none();
+                };
+                // A DID read: the SID and the identifier, which the request's prefix holds.
+                if request.params().is_some_and(|params| !params.is_empty()) {
+                    self.not_lowerable(
+                        name_arg.span,
+                        format!(
+                            "the source of the {name} precondition is a request with fields, \
+                             which sends no fixed bytes (3.2)"
+                        ),
+                    );
+                    return none();
+                }
+                // The value is an `int`: the field must decode to an integer, as the table's
+                // source rules ask (`csv-tables.md` 4.14), not to the float a numeric
+                // conversion would give.
+                let field_kind = self
+                    .variant
+                    .services()
+                    .and_then(|services| services.iter().find(|s| s.id() == service_id))
+                    .and_then(|s| s.positive())
+                    .and_then(|positive| positive.fields())
+                    .and_then(|fields| fields.iter().find(|f| f.id() == field_id))
+                    .map(|field| diag_ir::decode::scalar_kind(&field));
+                match field_kind {
+                    Some(Ok(diag_ir::decode::ScalarKind::Integer)) => {}
+                    Some(Ok(_) | Err(_)) | None => {
+                        self.not_lowerable(
+                            name_arg.span,
+                            format!(
+                                "the source of the {name} precondition is not an integer field \
+                                 of a declared positive response (3.2)"
+                            ),
+                        );
+                        return none();
+                    }
+                }
+                let mut bytes = vec![request.sid()];
+                bytes.extend_from_slice(request.prefix().map(|p| p.bytes()).unwrap_or_default());
+                let operand = self.pool(&bytes);
+                Val::Run(
+                    Tys::of(Ty::Int),
+                    vec![
+                        (Ins::Op(Op::PushBytes(operand)), span),
+                        (
+                            Ins::Op(Op::SendReceive {
+                                service: service_id,
+                            }),
+                            span,
+                        ),
+                        (
+                            Ins::Op(Op::DecodeField {
+                                service: service_id,
+                                field: field_id,
+                            }),
+                            span,
+                        ),
+                    ],
+                )
             }
         }
     }

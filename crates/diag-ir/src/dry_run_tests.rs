@@ -781,3 +781,50 @@ fn a_flash_block_outside_a_plan_is_invalid() {
         DryRunEnd::Invalid(crate::ProgramError::FlashBlockOutsidePlan { pc: 1 })
     );
 }
+
+// ---------------------------------------------------------------- ReadInput (ADR-338)
+
+#[test]
+fn a_read_input_gives_the_scripted_value_and_leaves_no_event() {
+    use crate::RuntimeInput::{IgnitionOn, SupplyVoltageMillivolts};
+    let buf = document(Vec::new(), Vec::new());
+    let program = program(
+        vec![
+            Op::ReadInput {
+                input: SupplyVoltageMillivolts,
+            },
+            Op::ReadInput { input: IgnitionOn },
+            Op::CmpGt,
+        ],
+        Vec::new(),
+    );
+    let script = Script::new()
+        .input(SupplyVoltageMillivolts, 12_000)
+        .input(IgnitionOn, 0)
+        // A later value for the same input replaces the earlier one.
+        .input(SupplyVoltageMillivolts, 13_000);
+    let report = run(&buf, &program, &script);
+    assert_eq!(report.end, DryRunEnd::Finished);
+    assert_eq!(report.events, []);
+    assert_eq!(report.steps, 3);
+}
+
+#[test]
+fn an_input_the_script_does_not_set_is_not_established() {
+    use crate::RuntimeInput::{EngineRunning, IgnitionOn};
+    let buf = document(Vec::new(), Vec::new());
+    let program = program(
+        vec![Op::ReadInput {
+            input: EngineRunning,
+        }],
+        Vec::new(),
+    );
+    let report = run(&buf, &program, &Script::new().input(IgnitionOn, 1));
+    assert_eq!(
+        report.end,
+        DryRunEnd::Vm(VmError::InputNotEstablished {
+            input: EngineRunning
+        })
+    );
+    assert_eq!(report.steps, 0);
+}

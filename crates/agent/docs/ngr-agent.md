@@ -768,7 +768,7 @@ outside every such section that is not a `Ret`, so a procedure that ends first f
 start of a run from the program's first instruction (a new run, or a plain start on an existing
 journal) is an interruptible point even when `main` is itself such a section, so a cancel that
 came in before the first step ends the job as cancelled with nothing sent; a checkpoint resume and
-a restart's replay keep the rule above. The
+a restart's replay keep the rule above (ADR-337). The
 job thread, with its guards and link, may therefore run on for as long as the section takes,
 waits included, and the worker must not be handed to another job meanwhile. A job that survives a worker crash, a VCI disconnect or a loss
 of the vehicle's supply alone gets them back, still held, and passes them to its next run. A

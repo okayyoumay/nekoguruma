@@ -38,7 +38,8 @@ comment annotations next to the code they describe.
    one home stays).
    - `identity.csv` names, for `vin`, `hardware_part_number` and `software_version`, a read
      service and the response field. The service is a generated single-DID read (`<did>.read`),
-     the shape the agent's source table resolves (ADR-327 item 1's reads), and the field ASCII
+     the shape the agent's source table resolves (ADR-327 item 1's reads), the field the DID's
+     only response field (the whole data record after the echoed identifier), and that field ASCII
      text or an unsigned integer (ASCII text for the VIN, which the agent compares as text);
      anything else is refused. A procedure whose plan allows a restart needs all three rows,
      which `Program::validate` requires of a restartable plan. A plain

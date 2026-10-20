@@ -462,6 +462,18 @@ fn a_loopback_runs_between_two_ends_of_one_bus() {
         ),
         "runs on raw CAN",
     );
+    // Frame padding is ISO 15765 framing, so a raw CAN end takes none.
+    refused_for(
+        &loopback(
+            &with_protocol(vci_end, "CAN").replacen(
+                "addressing = \"normal\"",
+                "addressing = \"normal\"\npadding = 0xCC",
+                1,
+            ),
+            &partner(&with_protocol(&second_module, "CAN")),
+        ),
+        "takes no `padding`",
+    );
     // The worker does not trim a protocol name, so `" CAN "` is no CAN name.
     refused_for(
         &loopback(

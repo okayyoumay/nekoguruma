@@ -743,6 +743,16 @@ fn check_loopback(a: &Endpoint, b: &Endpoint) -> Result<(), ProfileError> {
     // A raw CAN end exchanges bus payloads as they are, while an ISO 15765 end segments and
     // reassembles them, so a byte-for-byte loopback needs one protocol family at both ends.
     match (framing(&x.protocol), framing(&y.protocol)) {
+        // Frame padding is ISO 15765 framing: the worker passes its TxFlag on as
+        // `TX_ISO15765_FRAME_PAD`, an ISO 15765-2 padding flag that means nothing on a raw CAN
+        // channel (SAE J2534-1 (v04.04) 8.7.3), where a frame carries every byte as given.
+        (Some(Framing::RawCan), Some(Framing::RawCan))
+            if x.padding.is_some() || y.padding.is_some() =>
+        {
+            return Err(invalid(
+                "a raw CAN T0 loopback end takes no `padding`: frame padding is ISO 15765 framing",
+            ));
+        }
         (Some(one), Some(other)) if one == other => {}
         (Some(_), Some(_)) => {
             return Err(invalid(

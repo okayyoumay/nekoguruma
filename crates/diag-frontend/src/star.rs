@@ -21,6 +21,7 @@ use std::rc::Rc;
 use serde::Serialize;
 
 use crate::profile::Profile;
+use diag_ir::{IdentitySources, PreconditionKind, Preconditions};
 use starlark_syntax::codemap::Span;
 use starlark_syntax::syntax::ast::{
     ArgumentP, AssignTargetP, AstArgument, AstAssignTarget, AstExpr, AstLiteral, AstNoPayload,
@@ -46,14 +47,22 @@ pub struct RequestIndex {
     /// The profile of the application layer the variant's protocols name, through which its
     /// protocol-neutral calls are lowered (ADR-309 item 3).
     pub profile: &'static Profile,
+    /// The variant's `identity.csv`, which every program lowered for it carries (`csv-tables.md`
+    /// 4.13, ADR-336 item 1). The services and fields are those of the declaration part.
+    pub identity: IdentitySources,
+    /// The variant's `preconditions.csv`; a program carries the ones its `# @preconditions` names
+    /// (`csv-tables.md` 4.14, subset 4.9).
+    pub preconditions: Preconditions,
 }
 
-/// No services, over UDS.
+/// No services and no restart facts, over UDS.
 impl Default for RequestIndex {
     fn default() -> Self {
         Self {
             services: Vec::new(),
             profile: &crate::profile::UDS_PROFILE,
+            identity: IdentitySources::default(),
+            preconditions: Preconditions::default(),
         }
     }
 }
@@ -114,9 +123,12 @@ pub enum StarCode {
     /// A built-in, method or `diag` function the subset does not provide (2.3, 2.4, 3.1).
     #[serde(rename = "STAR_BUILTIN_NOT_ALLOWED")]
     BuiltinNotAllowed,
-    /// A malformed, unknown or unpaired annotation (4.2, 4.5, 4.6).
+    /// A malformed, unknown or unpaired annotation (4.2, 4.5, 4.6, 4.9).
     #[serde(rename = "STAR_BAD_ANNOTATION")]
     BadAnnotation,
+    /// A name in `# @preconditions` that has no row in the variant's `preconditions.csv` (4.9).
+    #[serde(rename = "STAR_UNKNOWN_PRECONDITION")]
+    UnknownPrecondition,
     /// An annotation value outside its range (4.2, 4.5).
     #[serde(rename = "STAR_ARGUMENT_OUT_OF_RANGE")]
     ArgumentOutOfRange,
@@ -170,6 +182,7 @@ impl StarCode {
             Self::FailNotAllowed => "STAR_FAIL_NOT_ALLOWED",
             Self::BuiltinNotAllowed => "STAR_BUILTIN_NOT_ALLOWED",
             Self::BadAnnotation => "STAR_BAD_ANNOTATION",
+            Self::UnknownPrecondition => "STAR_UNKNOWN_PRECONDITION",
             Self::ArgumentOutOfRange => "STAR_ARGUMENT_OUT_OF_RANGE",
             Self::SourceTooLarge => "STAR_SOURCE_TOO_LARGE",
             Self::NestingTooDeep => "STAR_NESTING_TOO_DEEP",
@@ -224,7 +237,7 @@ pub enum Idempotency {
 }
 
 /// A checked annotation, by the 1-based line of its comment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Annotation {
     /// `@maxIterations n`, attached to the `for` statement that follows (4.2).
     MaxIterations {
@@ -249,6 +262,14 @@ pub enum Annotation {
         /// only the first is annotated.
         statement_at: u32,
         value: Idempotency,
+    },
+    /// `@preconditions name ...`, directly before `def main()` (4.9).
+    Preconditions {
+        line: u32,
+        /// The comment, where a name without a row in the variant's table is reported.
+        span: Span,
+        /// The preconditions the procedure requires, in the order written.
+        kinds: Vec<PreconditionKind>,
     },
 }
 
@@ -1875,7 +1896,9 @@ impl Checker<'_> {
         let mut sectioned: BTreeMap<u32, String> = BTreeMap::new();
         // The statements that have an `@idempotency`, by where they begin.
         let mut idempotent: HashSet<u32> = HashSet::new();
-        for &span in module.comments() {
+        // Whether `main` has its `@preconditions`.
+        let mut preconditioned = false;
+        'comments: for &span in module.comments() {
             let file_span = module.file_span(span);
             // One comment marker: after `##` the text starts with `#`, an ordinary comment.
             let source = file_span.source_span();
@@ -1887,7 +1910,7 @@ impl Checker<'_> {
                 self.error(
                     StarCode::BadAnnotation,
                     span,
-                    "an annotation keyword follows `@` directly, as in `@section` (4.2, 4.5, 4.6)",
+                    "an annotation keyword follows `@` directly, as in `@section` (4.2, 4.5, 4.6, 4.9)",
                 );
                 continue;
             }
@@ -2055,6 +2078,71 @@ impl Checker<'_> {
                         expected_millis,
                     });
                 }
+                "preconditions" => {
+                    let mut kinds = Vec::new();
+                    for name in &args {
+                        let kind = match *name {
+                            "voltage" => PreconditionKind::Voltage,
+                            "externalSupply" => PreconditionKind::ExternalSupply,
+                            "ignition" => PreconditionKind::Ignition,
+                            "engine" => PreconditionKind::Engine,
+                            "vehicleSpeed" => PreconditionKind::VehicleSpeed,
+                            _ => {
+                                bad(
+                                    self,
+                                    format!(
+                                        "`{name}` is not a precondition; `@preconditions` takes \
+                                         `voltage`, `externalSupply`, `ignition`, `engine` and \
+                                         `vehicleSpeed` (4.9)"
+                                    ),
+                                );
+                                continue 'comments;
+                            }
+                        };
+                        if kinds.contains(&kind) {
+                            bad(self, format!("`{name}` is named twice (4.9)"));
+                            continue 'comments;
+                        }
+                        kinds.push(kind);
+                    }
+                    if kinds.is_empty() {
+                        bad(
+                            self,
+                            "`@preconditions` names at least one precondition (4.9)".to_owned(),
+                        );
+                        continue;
+                    }
+                    // Alone at the start of its line, with only comments and blank lines
+                    // between it and `def main()`.
+                    let standalone = source_lines
+                        .get(line as usize - 1)
+                        .is_some_and(|text| text.starts_with('#'));
+                    let before_main = next_code
+                        .get(line as usize + 1)
+                        .filter(|_| standalone)
+                        .and_then(|next| {
+                            top_defs
+                                .binary_search_by_key(next, |(def_line, _)| *def_line)
+                                .ok()
+                        })
+                        .is_some_and(|at| top_defs[at].1 == "main");
+                    if !before_main {
+                        bad(
+                            self,
+                            "`@preconditions` must directly precede `def main()` (4.9)".to_owned(),
+                        );
+                        continue;
+                    }
+                    if preconditioned {
+                        bad(
+                            self,
+                            "`main` already has a `@preconditions`; it takes one (4.9)".to_owned(),
+                        );
+                        continue;
+                    }
+                    preconditioned = true;
+                    annotations.push(Annotation::Preconditions { line, span, kinds });
+                }
                 "endsection" => bad(
                     self,
                     "`@endsection` does not exist: a section is a whole top-level `def`, marked \
@@ -2063,7 +2151,7 @@ impl Checker<'_> {
                 ),
                 other => bad(
                     self,
-                    format!("unknown annotation `@{other}`; see 4.2, 4.5 and 4.6"),
+                    format!("unknown annotation `@{other}`; see 4.2, 4.5, 4.6 and 4.9"),
                 ),
             }
         }

@@ -693,7 +693,7 @@ type, so the transpiler infers at ingestion which types each value can have (ADR
 
 ### 4.9 Flash plans and preconditions
 
-**Target contract (ADR-336).** This section is what ADR-336 decides. The converter lowers none of it today, and refuses `diag.flash_transfer` (3.2).
+**Target contract (ADR-336).** This section is what ADR-336 decides. The converter implements `# @preconditions` and the copy of `identity.csv` into every program (below); it lowers none of the flash plan, and refuses `diag.flash_transfer` (3.2).
 
 A flash recovery plan (design 8.2.5) is a whole top-level function that the lowering expands in
 place at its one call site in `main`. ECU facts (identity and precondition sources, the plan's
@@ -754,12 +754,19 @@ def main():
   `recoveryRequired` requires on-site intervention from its entry, the only point that agrees with
   a section covering the whole plan (`Program::validate` refuses a contradiction); `# @recoveryRequired`
   and `recovery=never` are refused in it (`STAR_PLAN_SHAPE`).
-- **`# @preconditions <name> ...`** stands directly before `def main()` and names preconditions
-  among `voltage`, `externalSupply`, `ignition`, `engine` and `vehicleSpeed`. Each needs a row in
-  the variant's `preconditions.csv` (`STAR_UNKNOWN_PRECONDITION`). A procedure with a flash plan
-  must carry it and name at least `voltage`, `externalSupply` and `ignition`, the checks design
-  8.9.1 makes mandatory before reprogramming (`STAR_PLAN_SHAPE`). For a procedure without a plan
-  it is optional; without it the program declares none.
+- **`# @preconditions <name> ...`** stands directly before `def main()`, alone at the start of its
+  line, with only comments and blank lines (and a `@section`) between, and names preconditions
+  among `voltage`, `externalSupply`, `ignition`, `engine` and `vehicleSpeed`. A name outside
+  those (the table's `external_supply` is not one), a name given twice, none, a second
+  annotation, or one that is not directly before `main` is `STAR_BAD_ANNOTATION`. Each name needs
+  a row in the variant's `preconditions.csv` (`STAR_UNKNOWN_PRECONDITION`, one error at the
+  annotation naming the missing kinds in the table's spelling). The program carries exactly the
+  named preconditions, each as `Precondition { satisfied, default_session, programming_session }`
+  from its row (`csv-tables.md` 4.14); without the annotation it declares none. Every program of
+  the variant carries `identity.csv` as `Program.identity`, whether or not it names any
+  precondition. A procedure with a flash plan must carry the annotation and name at least
+  `voltage`, `externalSupply` and `ignition`, the checks design 8.9.1 makes mandatory before
+  reprogramming (`STAR_PLAN_SHAPE`).
 - **Targets.** A plan's target is the target of the handle `diag.flash_transfer` is called on.
   Its identity sources come from that target's `identity.csv`, the VIN source from the first
   access target's table when the procedure has access targets and else from the primary's, and
@@ -817,7 +824,7 @@ names them at the end of its hint (`(in variant V1)`, `(in variants V1, V2)`).
 }
 ```
 
-The error codes of the flash plan contract (ADR-336, 4.9):
+The error codes of the restart declaration (ADR-336, 4.9); `STAR_UNKNOWN_PRECONDITION` is reported by the converter, the other two belong to the flash plan contract:
 
 | Code | Meaning |
 |---|---|
@@ -841,7 +848,7 @@ The error codes of the flash plan contract (ADR-336, 4.9):
   a long run of digits or spaces (ADR-303)
 - Detection uses an "allowlist approach". Unknown node kinds are rejected as
   `STAR_UNSUPPORTED_SYNTAX` so that nothing slips through by oversight
-- Comment annotations (4.2, 4.5, 4.6, and 4.9 once ADR-336 is implemented) are taken from the comment tokens the parser's lexer
+- Comment annotations (4.2, 4.5, 4.6, and 4.9) are taken from the comment tokens the parser's lexer
   reports, never from raw source lines, so `# @` inside a string literal is not an annotation.
   The text after the one comment marker must start with `@`, so `## @...` is an ordinary comment.
   Each annotation is attached by its line to the following statement. An annotation belongs to
@@ -852,7 +859,7 @@ The error codes of the flash plan contract (ADR-336, 4.9):
   `@maxIterations` takes an integer from 1 to 2^32 - 1 and must precede a `for` in the same
   function; `@idempotency` takes `safe`, `checkState` or `unsafe`, must start its own line and precede a
   statement in the same function; `@section` belongs to no function, starts its line, and must have a
-  top-level `def` as the next line of code (4.5).
+  top-level `def` as the next line of code (4.5); `@preconditions` the same with `def main()` (4.9).
   An integer, negative ones included, outside its range is `STAR_ARGUMENT_OUT_OF_RANGE`, any
   other fault `STAR_BAD_ANNOTATION`
 - Section nesting (4.5) is found on the call graph the recursion check builds, in one pass: the

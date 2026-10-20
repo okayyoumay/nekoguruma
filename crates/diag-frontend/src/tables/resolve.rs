@@ -22,6 +22,8 @@ pub struct VariantRows {
     pub nrcs: Vec<usize>,
     pub dtcs: Vec<usize>,
     pub flash_sessions: Vec<usize>,
+    pub identity: Vec<usize>,
+    pub preconditions: Vec<usize>,
 }
 
 /// A definition whose references resolve and whose scoped rows are assigned to variants.
@@ -63,6 +65,10 @@ pub fn resolve(tables: Tables) -> Result<Definition, Rejected> {
     // The field rules need resolved references, so they form the next stage.
     let definition = Definition { tables, variants };
     super::fields::check(&definition, &mut errors);
+    // The fields a source names are judged once the field rules hold for all fields.
+    if errors.0.is_empty() {
+        super::restart::check(&definition, &mut errors);
+    }
     if errors.0.is_empty() {
         Ok(definition)
     } else {
@@ -188,6 +194,16 @@ impl<'a> Resolver<'a> {
             .iter()
             .map(|r| self.scope("flash_sessions.csv", r.line, &r.variants))
             .collect();
+        let identity: Vec<Variants> = t
+            .identity
+            .iter()
+            .map(|r| self.scope("identity.csv", r.line, &r.variants))
+            .collect();
+        let preconditions: Vec<Variants> = t
+            .preconditions
+            .iter()
+            .map(|r| self.scope("preconditions.csv", r.line, &r.variants))
+            .collect();
 
         let catalog = |rows: &[CatalogRow]| -> HashSet<String> {
             rows.iter().map(|r| r.key.clone()).collect()
@@ -208,6 +224,7 @@ impl<'a> Resolver<'a> {
         self.conversion_scales(&conversions, &texts);
         self.dtcs(&dtcs, &layouts, &texts);
         self.flash(&flash_sessions);
+        self.restart_sources(&identity, &preconditions, &service_map);
         self.fields(&conversions, &units, &layouts);
         self.nested(&layouts);
         self.per_variant_duplicates(
@@ -218,6 +235,8 @@ impl<'a> Resolver<'a> {
             &nrcs,
             &dtcs,
             &flash_sessions,
+            &identity,
+            &preconditions,
         );
 
         let members = |sets: &[Variants], v: usize| -> Vec<usize> {
@@ -237,6 +256,8 @@ impl<'a> Resolver<'a> {
                 nrcs: members(&nrcs, v),
                 dtcs: members(&dtcs, v),
                 flash_sessions: members(&flash_sessions, v),
+                identity: members(&identity, v),
+                preconditions: members(&preconditions, v),
             })
             .collect()
     }
@@ -1038,6 +1059,86 @@ impl<'a> Resolver<'a> {
         }
     }
 
+    /// The services that identity and precondition sources name exist in each of the row's
+    /// variants and are generated DID reads (4.13, 4.14): the single-DID 0x22 read the agent's
+    /// source table resolves, so the check sends nothing that changes the ECU (ADR-336 item 1).
+    /// Their fields are checked with the other field rules.
+    fn restart_sources(
+        &mut self,
+        identity: &[Variants],
+        preconditions: &[Variants],
+        services: &HashMap<ServiceName, ServiceInfo>,
+    ) {
+        let t = self.t;
+        for (row, variants) in t.identity.iter().zip(identity) {
+            self.read_service(
+                "identity.csv",
+                row.line,
+                "service",
+                &row.service,
+                variants,
+                services,
+            );
+        }
+        for (row, variants) in t.preconditions.iter().zip(preconditions) {
+            for (column, source) in [
+                ("default_source", Some(&row.default_source)),
+                ("programming_source", row.programming_source.as_ref()),
+            ] {
+                if let Some(SourceRef::Service { service, .. }) = source {
+                    self.read_service(
+                        "preconditions.csv",
+                        row.line,
+                        column,
+                        service,
+                        variants,
+                        services,
+                    );
+                }
+            }
+        }
+    }
+
+    fn read_service(
+        &mut self,
+        file: &'static str,
+        line: Line,
+        column: &str,
+        name: &ServiceName,
+        variants: &Variants,
+        services: &HashMap<ServiceName, ServiceInfo>,
+    ) {
+        let Some(service) = services.get(name) else {
+            self.unknown(file, line, column, format!("no service {}", show(name)));
+            return;
+        };
+        let missing: Vec<&str> = variants
+            .difference(&service.variants)
+            .map(|&v| self.t.variants[v].name.as_str())
+            .collect();
+        if !missing.is_empty() && !service.partial && !self.partial.contains(&(file, line)) {
+            let hint = format!(
+                "service {} is not in the document of {}",
+                show(name),
+                missing.join(", ")
+            );
+            self.unknown(file, line, column, hint);
+        }
+        if name.generated != Some(Generated::Read) {
+            self.error(
+                ErrorCode::BadValue,
+                file,
+                line,
+                column,
+                format!(
+                    "{} is not a generated DID read (<did>.read); a source reads one DID with \
+                     ReadDataByIdentifier",
+                    show(name)
+                ),
+            );
+        }
+    }
+
     /// A field's container belongs to a row that exists (a routine container to a sub-function
     /// the routine has), and its conversion, unit, layout and `ref` exist; `ref` names a field
     /// earlier in the same container (5.1, 5.2). A DID needs a field (4.7).
@@ -1219,6 +1320,8 @@ impl<'a> Resolver<'a> {
         nrcs: &[Variants],
         dtcs: &[Variants],
         flash_sessions: &[Variants],
+        identity: &[Variants],
+        preconditions: &[Variants],
     ) {
         let t = self.t;
         self.unique_per_variant(
@@ -1288,6 +1391,22 @@ impl<'a> Resolver<'a> {
                 .iter()
                 .zip(flash_sessions)
                 .map(|(r, v)| (r.line, v, r.id, format!("flash session {}", r.id))),
+        );
+        self.unique_per_variant(
+            "identity.csv",
+            "kind",
+            t.identity.iter().zip(identity).map(|(r, v)| {
+                let kind = identity_name(r.kind);
+                (r.line, v, kind, format!("identity {kind}"))
+            }),
+        );
+        self.unique_per_variant(
+            "preconditions.csv",
+            "kind",
+            t.preconditions.iter().zip(preconditions).map(|(r, v)| {
+                let kind = precondition_name(r.kind);
+                (r.line, v, kind, format!("precondition {kind}"))
+            }),
         );
     }
 

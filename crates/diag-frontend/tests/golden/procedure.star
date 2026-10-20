@@ -3,7 +3,8 @@
 # is a section function (subset 4.5) whose helper is also called outside it, so the program holds
 # two copies of the helper and a section over the write's copies (ADR-301, ADR-329). The security
 # access sends the profile's seed and key requests, which no declared service answers, so the
-# host answers them with their bare positive response.
+# host answers them with their bare positive response. `main` names every precondition, so the
+# program carries all five of the variant's `preconditions.csv` beside its `identity.csv`.
 
 def read_vin():
     diag.request(0x22, {"did": 0xF190})
@@ -13,6 +14,7 @@ def write_vin():
     read_vin()
     diag.request(0x2E, {"did": 0xF190, "vin": "WVWZZZ1JZXW000001"})
 
+# @preconditions voltage externalSupply ignition engine vehicleSpeed
 def main():
     diag.request(0x10, {"sub": 0x03})
     read_vin()

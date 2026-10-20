@@ -1,0 +1,4 @@
+variants,kind,service,field,note
+,vin,vin.read,vin,The VIN DID: a fixed 17-byte text
+,hardware_part_number,sparePartNumber.read,sparePartNumber,
+,software_version,softwareVersion.read,softwareVersion,

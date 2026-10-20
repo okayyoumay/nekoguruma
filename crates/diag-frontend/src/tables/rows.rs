@@ -2,6 +2,8 @@
 //! need no other table: required cells, value types and ranges, and the cells a row's own kind
 //! does not use. Rules that compare rows or tables are not checked here.
 
+use diag_ir::{IdentityKind, PreconditionKind, RuntimeInput};
+
 use super::error::{ErrorCode, Errors};
 use super::sheet::{Row, Sheet, Spec};
 use super::values::{self, Parsed, ServiceName};
@@ -849,12 +851,31 @@ pub struct FlashSessionRow {
     pub id: u32,
     pub name: String,
     pub steps: Vec<FlashStep>,
+    /// The plan's recovery facts (ADR-336 item 1): `RecoveryTiming` and the plan's
+    /// `version_read_retries` and `no_application`. A plan that names the session needs the
+    /// first five; the table does not, since a session no plan names has no use for them.
+    pub session_timeout_ms: Option<u32>,
+    pub teardown_margin_ms: Option<u32>,
+    pub ecu_startup_ms: Option<u32>,
+    pub confirmation_window_ms: Option<u32>,
+    pub version_read_retries: Option<u8>,
+    pub no_application_nrc: Option<u8>,
 }
 
 pub(crate) const FLASH_SESSIONS: Spec = Spec {
     file: "flash_sessions.csv",
     scoped: true,
-    columns: &[("id", true), ("name", true), ("steps", true)],
+    columns: &[
+        ("id", true),
+        ("name", true),
+        ("steps", true),
+        ("session_timeout_ms", false),
+        ("teardown_margin_ms", false),
+        ("ecu_startup_ms", false),
+        ("confirmation_window_ms", false),
+        ("version_read_retries", false),
+        ("no_application_nrc", false),
+    ],
 };
 
 pub(crate) fn flash_sessions(sheet: &Sheet, errors: &mut Errors) -> Vec<FlashSessionRow> {
@@ -881,12 +902,34 @@ pub(crate) fn flash_sessions(sheet: &Sheet, errors: &mut Errors) -> Vec<FlashSes
         let id = row.required(e, "id", as_u32(1));
         let name = row.required(e, "name", values::name);
         let steps = row.required(e, "steps", |c| values::list(c, true, step));
+        let session_timeout_ms = row.optional(e, "session_timeout_ms", as_u32(1));
+        let teardown_margin_ms = row.optional(e, "teardown_margin_ms", as_u32(0));
+        let ecu_startup_ms = row.optional(e, "ecu_startup_ms", as_u32(0));
+        let confirmation_window_ms = row.optional(e, "confirmation_window_ms", as_u32(0));
+        let version_read_retries = row.optional(e, "version_read_retries", as_u8(0, 0xFF));
+        // 0x78 is a response pending, which the worker absorbs, so it never means "no
+        // application"; `Program::validate` refuses it as well.
+        let no_application_nrc = row.optional(e, "no_application_nrc", |c| {
+            let nrc = as_u8(0x01, 0xFF)(c)?;
+            if nrc == 0x78 {
+                return Err(
+                    "0x78 is a response pending, which is not a no-application answer".into(),
+                );
+            }
+            Ok(nrc)
+        });
         Some(FlashSessionRow {
             line: row.line,
             variants: variants?,
             id: id?,
             name: name?,
             steps: steps?,
+            session_timeout_ms: session_timeout_ms.ok()?,
+            teardown_margin_ms: teardown_margin_ms.ok()?,
+            ecu_startup_ms: ecu_startup_ms.ok()?,
+            confirmation_window_ms: confirmation_window_ms.ok()?,
+            version_read_retries: version_read_retries.ok()?,
+            no_application_nrc: no_application_nrc.ok()?,
         })
     })
 }
@@ -902,6 +945,10 @@ pub struct FlashSegmentRow {
     pub artifact_offset: u64,
     pub block_size: u32,
     pub checksum: Vec<u8>,
+    /// The dataFormatIdentifier of the RequestDownload built from the segment (ADR-336 item 1).
+    pub data_format: u8,
+    /// The addressAndLengthFormatIdentifier of that RequestDownload.
+    pub address_and_length_format: u8,
 }
 
 pub(crate) const FLASH_SEGMENTS: Spec = Spec {
@@ -915,6 +962,8 @@ pub(crate) const FLASH_SEGMENTS: Spec = Spec {
         ("artifact_offset", true),
         ("block_size", true),
         ("checksum", false),
+        ("data_format", false),
+        ("address_and_length_format", false),
     ],
 };
 
@@ -927,6 +976,9 @@ pub(crate) fn flash_segments(sheet: &Sheet, errors: &mut Errors) -> Vec<FlashSeg
         let artifact_offset = row.required(e, "artifact_offset", as_u64(0));
         let block_size = row.required(e, "block_size", as_u32(1));
         let checksum = row.or(e, "checksum", Vec::new(), values::bytes);
+        let data_format = row.or(e, "data_format", 0x00, as_u8(0, 0xFF));
+        let address_and_length_format =
+            row.or(e, "address_and_length_format", 0x44, as_u8(0, 0xFF));
         if let Some(length) = length {
             for (column, start) in [
                 ("start_address", start_address),
@@ -951,6 +1003,217 @@ pub(crate) fn flash_segments(sheet: &Sheet, errors: &mut Errors) -> Vec<FlashSeg
             artifact_offset: artifact_offset?,
             block_size: block_size?,
             checksum: checksum?,
+            data_format: data_format?,
+            address_and_length_format: address_and_length_format?,
+        })
+    })
+}
+
+// ---------------------------------------------------------------- 4.13, 4.14 Restart
+
+/// The name `identity.csv` gives an identity kind.
+pub fn identity_name(kind: IdentityKind) -> &'static str {
+    match kind {
+        IdentityKind::Vin => "vin",
+        IdentityKind::HardwarePartNumber => "hardware_part_number",
+        IdentityKind::SoftwareVersion => "software_version",
+    }
+}
+
+/// The name `preconditions.csv` gives a precondition kind.
+pub fn precondition_name(kind: PreconditionKind) -> &'static str {
+    match kind {
+        PreconditionKind::Voltage => "voltage",
+        PreconditionKind::ExternalSupply => "external_supply",
+        PreconditionKind::Ignition => "ignition",
+        PreconditionKind::Engine => "engine",
+        PreconditionKind::VehicleSpeed => "vehicle_speed",
+    }
+}
+
+/// An `identity.csv` row (4.13).
+#[derive(Debug, Clone, PartialEq)]
+pub struct IdentityRow {
+    pub line: Line,
+    pub variants: Scope,
+    pub kind: IdentityKind,
+    /// The service as written; resolving checks that it is a generated DID read.
+    pub service: ServiceName,
+    pub field: String,
+}
+
+pub(crate) const IDENTITY: Spec = Spec {
+    file: "identity.csv",
+    scoped: true,
+    columns: &[("kind", true), ("service", true), ("field", true)],
+};
+
+pub(crate) fn identity(sheet: &Sheet, errors: &mut Errors) -> Vec<IdentityRow> {
+    sheet.rows(errors, |row, e| {
+        let variants = scope(row, e);
+        let kind = row.required(e, "kind", |c| {
+            values::keyword(
+                c,
+                &[
+                    ("vin", IdentityKind::Vin),
+                    ("hardware_part_number", IdentityKind::HardwarePartNumber),
+                    ("software_version", IdentityKind::SoftwareVersion),
+                ],
+            )
+        });
+        let service = row.required(e, "service", values::service_name);
+        let field = row.required(e, "field", values::name);
+        Some(IdentityRow {
+            line: row.line,
+            variants: variants?,
+            kind: kind?,
+            service: service?,
+            field: field?,
+        })
+    })
+}
+
+/// Where a precondition's value is read (4.14).
+#[derive(Debug, Clone, PartialEq)]
+pub enum SourceRef {
+    /// `<service>.<field>`: a field of a service's response.
+    Service { service: ServiceName, field: String },
+    /// `input:<name>`: a value the agent supplies.
+    Input(RuntimeInput),
+}
+
+/// The inputs `input:<name>` can name, with the precondition each reports.
+const INPUTS: [(&str, RuntimeInput); 5] = [
+    ("supply_voltage_mv", RuntimeInput::SupplyVoltageMillivolts),
+    ("external_supply", RuntimeInput::ExternalSupplyConnected),
+    ("ignition_on", RuntimeInput::IgnitionOn),
+    ("engine_running", RuntimeInput::EngineRunning),
+    ("vehicle_speed_kmh", RuntimeInput::VehicleSpeedKmh),
+];
+
+fn source(cell: &str) -> Parsed<SourceRef> {
+    if let Some(name) = cell.strip_prefix("input:") {
+        return values::keyword(name, &INPUTS).map(SourceRef::Input);
+    }
+    // The service is everything before the last dot: `vin.read.vin` is service `vin.read`.
+    let (service, field) = cell
+        .rsplit_once('.')
+        .ok_or_else(|| format!("{cell:?} is neither <service>.<field> nor input:<name>"))?;
+    Ok(SourceRef::Service {
+        service: values::service_name(service)?,
+        field: values::name(field)?,
+    })
+}
+
+/// A `preconditions.csv` row (4.14).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PreconditionRow {
+    pub line: Line,
+    pub variants: Scope,
+    pub kind: PreconditionKind,
+    pub lower: i64,
+    pub upper: i64,
+    pub default_source: SourceRef,
+    pub programming_source: Option<SourceRef>,
+}
+
+pub(crate) const PRECONDITIONS: Spec = Spec {
+    file: "preconditions.csv",
+    scoped: true,
+    columns: &[
+        ("kind", true),
+        ("lower", true),
+        ("upper", true),
+        ("default_source", true),
+        ("programming_source", false),
+    ],
+};
+
+pub(crate) fn preconditions(sheet: &Sheet, errors: &mut Errors) -> Vec<PreconditionRow> {
+    sheet.rows(errors, |row, e| {
+        let variants = scope(row, e);
+        let kind = row.required(e, "kind", |c| {
+            values::keyword(
+                c,
+                &[
+                    ("voltage", PreconditionKind::Voltage),
+                    ("external_supply", PreconditionKind::ExternalSupply),
+                    ("ignition", PreconditionKind::Ignition),
+                    ("engine", PreconditionKind::Engine),
+                    ("vehicle_speed", PreconditionKind::VehicleSpeed),
+                ],
+            )
+        });
+        // A flag is 0 or 1 (`Program::validate` refuses anything else).
+        let flag = matches!(
+            kind,
+            Some(
+                PreconditionKind::ExternalSupply
+                    | PreconditionKind::Ignition
+                    | PreconditionKind::Engine
+            )
+        );
+        let (min, max) = if flag {
+            (0, 1)
+        } else {
+            (i64::MIN.into(), i64::MAX.into())
+        };
+        let bound = |c: &str| values::integer(c, true, min, max).map(|v| v as i64);
+        let lower = row.required(e, "lower", bound);
+        let upper = row.required(e, "upper", bound);
+        if let (Some(lower), Some(upper)) = (lower, upper)
+            && lower > upper
+        {
+            row.error(
+                e,
+                ErrorCode::BadValue,
+                "upper",
+                format!("upper {upper} is below lower {lower}, which leaves no satisfying value"),
+            );
+        }
+        let default_source = row.required(e, "default_source", source);
+        let programming_source = row.optional(e, "programming_source", source);
+        // `input:<name>` is the input of the row's own kind only.
+        if let Some(kind) = kind {
+            let sources = [
+                ("default_source", default_source.as_ref()),
+                (
+                    "programming_source",
+                    programming_source.as_ref().ok().and_then(Option::as_ref),
+                ),
+            ];
+            for (column, found) in sources {
+                if let Some(SourceRef::Input(input)) = found
+                    && !input.reports(kind)
+                {
+                    let own = INPUTS
+                        .iter()
+                        .find(|(_, i)| i.reports(kind))
+                        .map_or("", |(name, _)| *name);
+                    row.error(
+                        e,
+                        ErrorCode::BadValue,
+                        column,
+                        format!(
+                            "{} reports another fact than {}; use input:{own}",
+                            INPUTS
+                                .iter()
+                                .find(|(_, i)| i == input)
+                                .map_or("", |(name, _)| *name),
+                            precondition_name(kind),
+                        ),
+                    );
+                }
+            }
+        }
+        Some(PreconditionRow {
+            line: row.line,
+            variants: variants?,
+            kind: kind?,
+            lower: lower?,
+            upper: upper?,
+            default_source: default_source?,
+            programming_source: programming_source.ok()?,
         })
     })
 }

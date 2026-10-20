@@ -572,6 +572,8 @@ impl Program {
     /// above it, plus the nested level), so the cost is linear in the code's length times
     /// `return_pcs.len() + 2`. The result is conservative where the VM's data would decide
     /// (both ways of a conditional jump are taken), and reaches nothing when `pc` is out of range.
+    /// `return_pcs` should come from a state that passed `Vm::check_state`, which bounds the call
+    /// depth; an absurd length that would overflow the table's size reaches every instruction.
     pub fn reachable_from(&self, pc: u32, return_pcs: &[u32]) -> Vec<bool> {
         let len = self.code.len();
         // Levels 0..=callers are the frames (a level's number is how many callers are still
@@ -580,7 +582,13 @@ impl Program {
         let callers = return_pcs.len();
         let nested = callers + 1;
         let levels = callers + 2;
-        let mut visited = vec![false; len * levels];
+        // Callers pass a state `Vm::check_state` accepted, whose call depth is bounded; a size
+        // that would wrap anyway is answered conservatively, every instruction reached, instead
+        // of allocating or panicking.
+        let Some(states) = len.checked_mul(levels) else {
+            return vec![true; len];
+        };
+        let mut visited = vec![false; states];
         let mut reached = vec![false; len];
         let mut pending = vec![(pc, callers)];
         while let Some((pc, level)) = pending.pop() {

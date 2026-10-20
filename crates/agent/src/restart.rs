@@ -124,10 +124,16 @@ pub enum NotResumableCause {
     /// has its own journal and restart order, which a continuation from a plain checkpoint must
     /// not enter.
     PlanAhead { flash_session: u32 },
-    /// The checkpoint stands where a cancel is not taken (ADR-330, [`interruptible_point`]):
-    /// inside a section that is not `Yes`, or on a `Ret`. A plain procedure declares no re-entry
-    /// point for such a section (ADR-335 item 5).
+    /// The checkpoint stands inside a section that is not `Yes`, where a cancel is not taken
+    /// (ADR-330, [`interruptible_point`]). A plain procedure declares no re-entry point for such
+    /// a section (ADR-335 item 5).
     UninterruptibleSection { pc: u32 },
+    /// The checkpoint stands on a `Ret`, outside every section that is not `Yes`: a return is not
+    /// an interruptible point (ADR-330 item 2, [`interruptible_point`]). It is the state after
+    /// the last primitive of a section when the return follows the section, which ADR-335 item 3
+    /// reads as the uninterruptible-section case when that section is not `Yes`; the cause
+    /// names what the checkpoint stands on.
+    AtReturn { pc: u32 },
     /// The job names no target VIN or the program declares no VIN source, so a resume could not
     /// tell that it runs against the vehicle the procedure started on (ADR-335 item 3,
     /// ADR-261).
@@ -498,6 +504,8 @@ pub fn classify(
 /// The classification of a job whose journal holds no transfer-start marker (ADR-335 items 3 to
 /// 5), after the checks `classify` makes first. The journal holds a plain procedure's requests
 /// and checkpoints (ADR-335 item 2). In this order:
+/// - no request ever recorded: [`RestartDecision::PlainStart`], on the same journal, whatever
+///   the journal's states (a plain start needs none). The caller counts it (ADR-335 item 6);
 /// - a `Request` newer than the newest state record is [`OnSiteReason::UnconfirmedRequest`]: the
 ///   primitive it guards may have reached the ECU, and the VM state after it was never journaled.
 ///   The newest state record is the latest checkpoint, whose own step count says which step runs
@@ -505,23 +513,23 @@ pub fn classify(
 ///   step, so its count is one past the record's, and a run start's is the step about to run.
 ///   Comparing the request with that count therefore needs no case per kind. A cancel while a
 ///   request's marker was committed leaves a marker with no later state, which reads as
-///   unconfirmed too. A latest checkpoint that is missing for a journal that holds a request is
-///   the same, and one that does not decode is [`OnSiteReason::InvalidEntryState`];
-/// - no request ever recorded: [`RestartDecision::PlainStart`], on the same journal. The caller
-///   counts it (ADR-335 item 6);
+///   unconfirmed too, and so does a journal that holds a request and no checkpoint;
+/// - a latest checkpoint state that does not decode, or fails `Vm::check_state` with its step
+///   count set to [`next_steps`], is [`OnSiteReason::InvalidEntryState`]. It is checked before
+///   the conditions below, which read the state's pc and call stack;
 /// - otherwise a checkpoint resume from the latest checkpoint, when all of these hold, checked in
 ///   this order, each failure a [`OnSiteReason::NotResumable`]:
-///   (I) the checkpoint's pc is an interruptible point ([`interruptible_point`]), so a `No`
-///   section is never resumed from (ADR-335 item 5);
+///   (I) the checkpoint's pc is an interruptible point ([`interruptible_point`]): not inside a
+///   section that is not `Yes` ([`NotResumableCause::UninterruptibleSection`]) and not on a `Ret`
+///   ([`NotResumableCause::AtReturn`]), so a `No` section is never resumed from (ADR-335
+///   item 5);
 ///   (S) nothing reachable from the checkpoint ([`Program::reachable_from`], with the state's
 ///   suspended callers) is a hazard: the lowest-pc instruction that lies in a plan's range, is a
 ///   diagnostic primitive in a `RecoveryRequired` section, or is a diagnostic primitive that is
 ///   not safe to repeat ([`safe_to_repeat`]; one outside every section is not);
 ///   (identified) the job names a target VIN and the program declares a VIN source.
 ///
-///   The state then gets its step count from [`next_steps`] and must pass `Vm::check_state`
-///   ([`OnSiteReason::InvalidEntryState`]), and the answer is
-///   [`RestartDecision::ResumeFromCheckpoint`].
+///   The answer is then [`RestartDecision::ResumeFromCheckpoint`], with the checked state.
 ///
 /// Nothing is contacted. The VIN read, the lock and the resume count are the caller's.
 fn classify_plain_procedure(program: &Program, state: &JournalState) -> RestartDecision {
@@ -546,9 +554,19 @@ fn classify_plain_procedure(program: &Program, state: &JournalState) -> RestartD
     if request.steps >= resumed.steps {
         return on_site(OnSiteReason::UnconfirmedRequest { at: request });
     }
+    // A damaged state is refused before the checks below read its pc and call stack.
+    resumed.steps = next_steps(state);
+    if let Err(error) = Vm::resume(resumed.clone()).check_state(program) {
+        return on_site(OnSiteReason::InvalidEntryState(error.to_string()));
+    }
     let pc = resumed.pc;
     if !interruptible_point(program, pc) {
-        return not_resumable(NotResumableCause::UninterruptibleSection { pc });
+        // The section is the cause when both hold.
+        return not_resumable(if in_uninterruptible_section(program, pc) {
+            NotResumableCause::UninterruptibleSection { pc }
+        } else {
+            NotResumableCause::AtReturn { pc }
+        });
     }
     let return_pcs: Vec<u32> = resumed
         .call_stack
@@ -579,10 +597,6 @@ fn classify_plain_procedure(program: &Program, state: &JournalState) -> RestartD
     }
     if facts.target_vin.is_none() || program.identity.vin.is_none() {
         return not_resumable(NotResumableCause::NoIdentity);
-    }
-    resumed.steps = next_steps(state);
-    if let Err(error) = Vm::resume(resumed.clone()).check_state(program) {
-        return on_site(OnSiteReason::InvalidEntryState(error.to_string()));
     }
     RestartDecision::ResumeFromCheckpoint(Box::new(CheckpointResume {
         at: *at,
@@ -1521,10 +1535,15 @@ pub(crate) fn in_plan(program: &Program, pc: u32) -> bool {
 /// per run; a checkpoint resume (ADR-335 item 3 condition I, item 5) may start only here.
 pub(crate) fn interruptible_point(program: &Program, pc: u32) -> bool {
     !matches!(program.code.get(pc as usize), Some(Op::Ret))
-        && !program.sections.iter().any(|section| {
-            !matches!(section.interruptible, Interruptible::Yes)
-                && (section.start_pc..section.end_pc).contains(&pc)
-        })
+        && !in_uninterruptible_section(program, pc)
+}
+
+/// Whether `pc` lies inside a section whose `interruptible` is not `Yes`.
+fn in_uninterruptible_section(program: &Program, pc: u32) -> bool {
+    program.sections.iter().any(|section| {
+        !matches!(section.interruptible, Interruptible::Yes)
+            && (section.start_pc..section.end_pc).contains(&pc)
+    })
 }
 
 /// Whether the diagnostic primitive at `pc` gets a request marker before it is sent: it lies
@@ -3884,6 +3903,60 @@ def main():
             decide(&program, &journal),
             RestartDecision::OnSiteInterventionRequired(OnSiteReason::InvalidEntryState(_))
         ));
+    }
+
+    /// A damaged state is an invalid state before the conditions that read it, so a bad pc is not
+    /// reported as a missing identity and a call stack past the limit is not walked.
+    #[test]
+    fn a_damaged_checkpoint_state_is_invalid_before_the_conditions() {
+        let program = plain_program();
+        let invalid = |journal: Journal<Memory>| {
+            assert!(
+                matches!(
+                    decide(&program, &journal),
+                    RestartDecision::OnSiteInterventionRequired(OnSiteReason::InvalidEntryState(_))
+                ),
+                "{:?}",
+                decide(&program, &journal)
+            );
+        };
+        // A bad pc, with no target VIN named.
+        invalid(plain_journal(
+            &program,
+            false,
+            &state_at_pc(&program, 99, 7),
+        ));
+        // A call stack longer than the VM allows.
+        let mut deep = state_at_pc(&program, 2, 7);
+        deep.call_stack = vec![
+            diag_ir::Frame {
+                return_pc: 0,
+                locals: Vec::new(),
+            };
+            diag_ir::MAX_CALL_DEPTH + 1
+        ];
+        invalid(plain_journal(&program, false, &deep));
+    }
+
+    /// A checkpoint on a `Ret` outside every section that is not `Yes` is `AtReturn`; inside such
+    /// a section the section is the cause even on a `Ret`.
+    #[test]
+    fn a_checkpoint_on_a_return_is_at_return() {
+        let mut program = plain_program();
+        program.code[2] = Op::Ret;
+        let journal = plain_journal(&program, true, &state_at_pc(&program, 2, 7));
+        assert_eq!(
+            decide(&program, &journal),
+            not_resumable(NotResumableCause::AtReturn { pc: 2 })
+        );
+        program
+            .sections
+            .push(plain_section(2, 3, Idempotency::Safe, Interruptible::No));
+        let journal = plain_journal(&program, true, &state_at_pc(&program, 2, 7));
+        assert_eq!(
+            decide(&program, &journal),
+            not_resumable(NotResumableCause::UninterruptibleSection { pc: 2 })
+        );
     }
 
     /// ADR-330: an instruction is an interruptible point unless it lies in a section that is not

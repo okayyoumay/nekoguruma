@@ -5017,11 +5017,65 @@ def main():
         );
     }
 
+    /// ADR-335 item 5: with no request recorded, an interruption inside a `No` section is a
+    /// counted plain start, not an uninterruptible-section ending: the interruptibility check
+    /// applies only to a checkpoint resume.
+    #[test]
+    fn a_safe_primitive_in_a_no_section_with_no_request_is_a_plain_start() {
+        let mut program = plain_steps(&[(0x22, Safe), (0x3E, Safe)]);
+        for section in &mut program.sections {
+            section.interruptible = diag_ir::Interruptible::No;
+        }
+        let dir = journal_dir("plain-no-section-start");
+        lost_response(&program, &dir, 0x3E, 4);
+        // The latest checkpoint stands at pc 2, inside the first `No` section.
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        host.lose_service = Some(0x3E);
+        let result = resume_limited(
+            &program,
+            &dir,
+            &mut host,
+            JobLimits::default(),
+            Some(TARGET_VIN),
+        );
+        assert!(
+            matches!(result, Err(JobError::Host { pc: 4, .. })),
+            "{result:?}"
+        );
+        assert_eq!(plain_resumes(&dir), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A `CheckState` primitive cannot be settled by a query, so it counts as not safe to repeat:
+    /// in flight it is an unconfirmed request, and ahead of a confirmed checkpoint it is a hazard.
+    #[test]
+    fn a_check_state_primitive_is_not_safe_to_repeat() {
+        use diag_ir::Idempotency::CheckState;
+        let program = plain_steps(&[(0x22, Safe), (0x10, CheckState), (0x3E, Safe)]);
+        let dir = journal_dir("plain-check-state-flight");
+        lost_response(&program, &dir, 0x10, 4);
+        let (result, host) = resume_plain_job(&program, &dir, |_| {});
+        assert_eq!(
+            reason_of(&result),
+            &OnSiteReason::UnconfirmedRequest {
+                at: StepRef { pc: 4, steps: 4 }
+            }
+        );
+        assert_nothing_sent(&host, &dir, 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        let program = plain_steps(&[(0x22, Safe), (0x10, Unsafe), (0x3E, CheckState)]);
+        assert_eq!(
+            not_resumable(&program, "plain-check-state-ahead", 0x10),
+            unresumable(restart::NotResumableCause::UnsafePrimitiveAhead { pc: 7 })
+        );
+    }
+
     /// ADR-335 item 5: a checkpoint inside a section that is not `Yes` never resumes; neither does
     /// one standing on the `Ret` after such a section's last primitive (ADR-330 item 2).
     #[test]
     fn a_checkpoint_in_an_uninterruptible_section_is_not_resumable() {
-        use restart::NotResumableCause::UninterruptibleSection;
+        use restart::NotResumableCause::{AtReturn, UninterruptibleSection};
         // The cancel is not taken inside a `No` section, so the run ends in a lost response.
         let mut program = plain_steps(&[(0x10, Unsafe), (0x22, Safe), (0x3E, Safe)]);
         for section in &mut program.sections[1..] {
@@ -5037,16 +5091,14 @@ def main():
         assert_nothing_sent(&host, &dir, 0);
         std::fs::remove_dir_all(&dir).unwrap();
 
-        // The section holds the request but not the return after it: the run ends there.
+        // The section holds the request but not the return after it: the checkpoint stands on
+        // a `Ret` outside the section (`AtReturn`; ADR-335 item 3 calls it the section's case).
         let program = program_with_return_after_no_section();
         program.validate().unwrap();
         let dir = journal_dir("plain-no-section-ret");
         first_run(&program, &dir, JobLimits::default(), |_| {}).expect("the job completes");
         let (result, host) = resume_plain_job(&program, &dir, |_| {});
-        assert_eq!(
-            reason_of(&result),
-            &unresumable(UninterruptibleSection { pc: 5 })
-        );
+        assert_eq!(reason_of(&result), &unresumable(AtReturn { pc: 5 }));
         assert_nothing_sent(&host, &dir, 0);
         std::fs::remove_dir_all(&dir).unwrap();
     }

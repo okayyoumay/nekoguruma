@@ -312,9 +312,9 @@ started transfer keeps the flash path. `restart::classify_plain_procedure` decid
 
 | Journal | Decision |
 |---|---|
+| no `Request` was ever recorded, whatever the journal's states | plain start on the same journal, counted (below) |
 | the last `Request` is not older than the state of the latest checkpoint (the newest record that carries a VM state), or there is no such state | `OnSiteInterventionRequired(UnconfirmedRequest { at })`: the unsafe primitive may have reached the ECU. It holds at every later resume until a person acts |
-| the latest checkpoint's state does not decode | `OnSiteInterventionRequired(InvalidEntryState)` |
-| no `Request` was ever recorded | plain start on the same journal, counted (below) |
+| the latest checkpoint's state does not decode, or fails `Vm::check_state` with its step count set to `restart::next_steps` | `OnSiteInterventionRequired(InvalidEntryState)`, before the conditions below read the state |
 | otherwise, from the latest checkpoint's state, one of the conditions below fails | `OnSiteInterventionRequired(NotResumable { cause })` |
 | otherwise | `ResumeFromCheckpoint`, with the checkpoint's step and its state, whose step count is `restart::next_steps` and which passed `Vm::check_state` |
 
@@ -326,8 +326,11 @@ order, and the first that fails is the cause:
 
 1. the checkpoint's pc is an interruptible point (`restart::interruptible_point`, the rule the
    runner marks cancel points with, ADR-330): not inside a section whose `interruptible` is not
-   `Yes`, and not a `Ret`. Otherwise `UninterruptibleSection { pc }`; a plain procedure declares no
-   re-entry point, so such a checkpoint never resumes (ADR-335 item 5);
+   `Yes`, and not a `Ret`. Inside such a section the cause is `UninterruptibleSection { pc }`
+   (checked first); on a `Ret` it is `AtReturn { pc }`, which is how a checkpoint standing on the
+   return after a `No` section's last primitive is reported, where ADR-335 item 3 reads it as the
+   uninterruptible-section case. A plain procedure declares no re-entry point, so such a
+   checkpoint never resumes (ADR-335 item 5);
 2. nothing reachable from the checkpoint is a hazard. Reachability (`Program::reachable_from`) is
    the forward closure over fallthrough, jumps, calls and returns, with the state's suspended
    callers as the returns' targets; it is conservative (both ways of a conditional jump). The
@@ -343,8 +346,9 @@ the existing resume record under the reserved stage `diag_ir::PLAIN_PROCEDURE_ST
 is sent, after a cancel check, and a stage already resumed `JobLimits::max_procedure_resumes` times
 (agent policy, default 3, not in the IR) ends the job in
 `OnSiteInterventionRequired(ProcedureResumeLimitReached { resumes, max })` with nothing sent. A
-plain start of a missing journal runs without one and is not counted. A checkpoint resume is counted
-under the same stage and limit (ADR-335 item 6).
+plain start of a missing journal runs without one and is not counted. ADR-335 item 6 counts a
+checkpoint resume under the same stage and limit when one runs; the runner's
+`CheckpointResumeNotImplemented` ending below counts none.
 
 The runner does not run a `ResumeFromCheckpoint` decision (the VIN read and lock, the resume
 count and the run from the restored state of ADR-335 item 6). A job that reaches it ends in

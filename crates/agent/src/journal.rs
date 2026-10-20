@@ -356,6 +356,12 @@ impl RecoveryFacts {
                 if !after_last_step(at, self) {
                     return Err("a checkpoint must come after the last step");
                 }
+                // The request marker and the checkpoint of one primitive share a step count, so
+                // the relation is not strict. (The order against the latest checkpoint, which the
+                // facts do not hold, is `JournalState::checkpoint_in_order`.)
+                if self.last_request.is_some_and(|last| at.steps < last.steps) {
+                    return Err("a checkpoint must not precede the last request");
+                }
             }
             Record::Request { at } => {
                 if !after_last_step(at, self) {
@@ -986,6 +992,9 @@ impl<S: Store> Journal<S> {
         }
         creation_prefix_allowed(&record, self.state.records, &self.state.facts)
             .map_err(JournalError::Invariant)?;
+        self.state
+            .checkpoint_in_order(&record)
+            .map_err(JournalError::Invariant)?;
         let mut facts = self.state.facts.clone();
         facts.apply(&record).map_err(JournalError::Invariant)?;
         let entry = Entry {
@@ -1007,6 +1016,18 @@ impl<S: Store> Journal<S> {
 }
 
 impl JournalState {
+    /// Whether `record` keeps the checkpoints in order: a checkpoint is not behind the latest
+    /// state record (a run start, a step with a state, or a checkpoint). A checkpoint and the
+    /// run start or checkpoint before it can share a step count, so the relation is not strict.
+    fn checkpoint_in_order(&self, record: &Record) -> Result<(), &'static str> {
+        match (record, &self.latest_checkpoint) {
+            (Record::Checkpoint { at, .. }, Some((last, _))) if at.steps < last.steps => {
+                Err("a checkpoint must not precede the latest checkpoint")
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Takes the VM state `record` carries, a step's or a run start's, as the newest one; the
     /// one it replaces becomes the previous one. A checkpoint's state is not one of these (the
     /// flash-plan restart reads them, ADR-335 item 2); it and the others fold into
@@ -1191,6 +1212,9 @@ fn load(bytes: &[u8], key: &JobKey) -> Result<Loaded, JournalError> {
             return Err(corrupt(offset, "a record is out of sequence"));
         }
         creation_prefix_allowed(&entry.record, state.records, &state.facts)
+            .map_err(|reason| corrupt(offset, reason))?;
+        state
+            .checkpoint_in_order(&entry.record)
             .map_err(|reason| corrupt(offset, reason))?;
         state
             .facts
@@ -1533,6 +1557,30 @@ mod tests {
             journal.state().latest_checkpoint,
             Some((at(7, 7), b"c7".to_vec()))
         );
+    }
+
+    /// A checkpoint is not behind the last request or the latest checkpoint; it may share a step
+    /// count with either (the request marker and the checkpoint of one primitive do).
+    #[test]
+    fn a_checkpoint_does_not_go_backwards() {
+        let mut journal = Journal::on_store(NullStore, key());
+        journal.commit_run_start(at(0, 0), b"init").unwrap();
+        journal.commit_request(at(10, 10)).unwrap();
+        let before = journal.state().clone();
+        journal
+            .commit_checkpoint(at(5, 5), b"c5")
+            .expect_err("behind the last request");
+        assert_eq!(journal.state(), &before);
+        journal.commit_checkpoint(at(10, 10), b"c10").unwrap();
+        journal.commit_checkpoint(at(12, 12), b"c12").unwrap();
+        // Behind the latest checkpoint, with no newer request in the way.
+        let mut other = Journal::on_store(NullStore, key());
+        other.commit_run_start(at(0, 0), b"init").unwrap();
+        other.commit_checkpoint(at(8, 8), b"c8").unwrap();
+        other
+            .commit_checkpoint(at(7, 7), b"c7")
+            .expect_err("behind the latest checkpoint");
+        other.commit_checkpoint(at(8, 8), b"c8b").unwrap();
     }
 
     /// Every prefix of the file reads back as the state after its last whole frame: the

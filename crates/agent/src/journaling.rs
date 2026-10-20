@@ -33,7 +33,8 @@
 //!   post-transfer completion;
 //! - a diagnostic primitive outside every plan's range: a checkpoint with the VM state after it
 //!   (ADR-335 item 2), except where the step brings execution to a plan's `entry_pc`, whose
-//!   step record carries that state already.
+//!   step record carries that state already. A state too large for a frame leaves no checkpoint
+//!   and does not end the job.
 //!
 //! When the procedure ends itself as failed (`Op::Fail`): a procedure-failure record, the job's
 //! last ([`JobJournal::procedure_failed`], ADR-280). A restart's identity abort is committed by
@@ -302,7 +303,21 @@ impl<S: Store> JobJournal<S> {
             // read it.
             let encoded = postcard::to_allocvec(after)
                 .map_err(|_| JournalError::Invariant("the VM state does not encode"))?;
-            self.journal.commit_checkpoint(at, &encoded)?;
+            // A state too large for a frame is skipped, not the job's end: `commit_checkpoint`
+            // refuses it before anything is appended, so the journal is unchanged and the job
+            // goes on. A missing checkpoint only makes a restart more conservative (ADR-335):
+            // the latest checkpoint stays an older one, from which a resume re-runs only
+            // primitives that are safe to repeat, and a completed request that is not safe to
+            // repeat, with no state after it, counts as unconfirmed.
+            match self.journal.commit_checkpoint(at, &encoded) {
+                Err(JournalError::TooLarge) => {
+                    tracing::warn!(
+                        pc = at.pc,
+                        "the VM state is too large for a checkpoint; none is recorded"
+                    );
+                }
+                result => result?,
+            }
         }
         for plan in &program.flash {
             if after.pc == plan.boundaries.post_transfer_end_pc

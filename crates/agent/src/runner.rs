@@ -4332,6 +4332,11 @@ def main():
         );
         let before = Journal::read(&dir, &job_key()).unwrap();
         assert_eq!(before.facts.last_request, Some(StepRef { pc: 4, steps: 4 }));
+        // The failed routine left its marker but no checkpoint: the latest is the read's.
+        assert_eq!(
+            before.latest_checkpoint.as_ref().map(|c| c.0),
+            Some(StepRef { pc: 1, steps: 1 })
+        );
         let first_step = restart::next_steps(&before);
         assert!(first_step > 4);
         let mut host = FlashHost::new(Rc::new(Cell::new(0)));
@@ -4345,6 +4350,65 @@ def main():
                 steps: first_step + 7
             })
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A VM state too large for a frame leaves no checkpoint and does not end the job (ADR-335):
+    /// the run completes, the oversized step's request keeps its marker, and the journal reads
+    /// back with the earlier checkpoint as its latest.
+    #[test]
+    fn an_oversized_checkpoint_is_skipped_and_the_job_goes_on() {
+        let mut program = program(vec![
+            Op::PushBytes(0),
+            Op::ServiceRequest { service: 0x22 },
+            Op::Pop,
+            // The large value stays on the stack, so every later state is too large.
+            Op::PushBytes(1),
+            Op::PushBytes(0),
+            Op::ServiceRequest { service: 0x10 },
+            Op::Pop,
+            Op::Pop,
+        ]);
+        program
+            .constants
+            .push(vec![0; crate::journal::MAX_FRAME as usize + 1]);
+        let dir = journal_dir("oversized-checkpoint");
+        first_run(&program, &dir, JobLimits::default(), |_| {}).expect("the job runs to its end");
+        let state = Journal::read(&dir, &job_key()).expect("the journal reads back");
+        let at = |pc, steps| StepRef { pc, steps };
+        // Both requests got their markers; only the first step has a checkpoint.
+        assert_eq!(state.facts.first_request, Some(at(1, 1)));
+        assert_eq!(state.facts.last_request, Some(at(5, 5)));
+        assert_eq!(
+            state.latest_checkpoint.as_ref().map(|c| c.0),
+            Some(at(1, 1))
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A plain program keeps a journal like any other job: `run_program_journaled` creates its
+    /// file, and a second call with the same key fails because the journal exists.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_plain_program_creates_a_journal_and_a_second_first_run_is_refused() {
+        let dir = journal_dir("plain-creates-journal");
+        let run = || async {
+            let (client, _calls) = fake_worker(false).await;
+            run_program_journaled(
+                client,
+                &LinkConfig::iso15765(0x7E0, 0x7E8),
+                program(Vec::new()),
+                JobLimits::default(),
+                file_setup_for(&dir, None),
+                vci_only_guards("plain-creates-journal"),
+            )
+            .await
+            .0
+        };
+        run().await.expect("a plain program runs");
+        let state = Journal::read(&dir, &job_key()).expect("the job left a journal");
+        assert_eq!(state.records, 1, "the run start");
+        let again = run().await;
+        assert!(matches!(again, Err(JobError::Journal(_))), "{again:?}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

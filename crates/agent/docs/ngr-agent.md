@@ -184,7 +184,8 @@ instruction runs, it commits:
   ADR-335 item 2). A primitive is safe to repeat when at least one section covers it and every
   section covering it is `Safe` (`restart::safe_to_repeat`); one outside every section, or under a
   `Safe` and a non-`Safe` section at once, is not. The runner takes the cancel check an intent
-  has before the commit, so a cancelled job leaves no marker.
+  has before the commit, so a cancel that arrives while the marker is being committed still
+  leaves a marker for a request that was never sent, as an intent can.
 
 When an instruction completes, it commits the block of a `FlashTransfer`, under the host's
 running index (`TransferProgress`, ADR-250); a step record for every diagnostic primitive inside
@@ -241,8 +242,13 @@ share one step count:
 | `Checkpoint { at, vm_state }` | after a diagnostic primitive outside every plan's range, with the VM state after it; not where the step carries a boundary state | `JournalState::latest_checkpoint` only |
 | `Request { at }` | before a diagnostic primitive outside the plans that is not safe to repeat | `RecoveryFacts::first_request` and `last_request` |
 
-The checkpoint must come after the last step, and a request after the last step and after the
-previous request. `JournalState::latest_checkpoint` is the newest state of any record that carries
+The checkpoint must come after the last step and not before the last request or the latest
+checkpoint (it may share their step count), and a request after the last step and after the
+previous request. A VM state whose record would not fit in a frame (`MAX_FRAME`) leaves no
+checkpoint and does not end the job: the commit is refused before anything is appended, the
+journal is unchanged, and the run goes on. A missing checkpoint only makes a restart more
+conservative (ADR-335): the latest checkpoint stays an older one, and a completed request that is
+not safe to repeat with no state after it counts as unconfirmed. `JournalState::latest_checkpoint` is the newest state of any record that carries
 one: a checkpoint, a run start or a step with a state (a run start is at the step count it starts
 at, the others at the step they completed). The facts a flash plan's restart reads (the last step,
 the last and previous VM state, the last intent, the interruption point) are not changed by either
@@ -250,6 +256,11 @@ record, so the classification of a journal with a plan is the one described belo
 `restart::next_steps` counts them, so a run that goes on with the journal records after them. A
 primitive costs one fsync for its checkpoint and two when it is not safe to repeat. Nothing reads
 the new facts yet.
+
+Because every journaled job now keeps a journal, a plain program's declared failure, step-limit
+stop or VM refusal is terminal across resumes, as for a plan program (ADR-280, ADR-288), and
+`run_program_journaled` called again with an existing job key on a plain program fails because
+the journal exists, instead of running the program again.
 
 The restart's use of the records, the classification of a plain procedure, is not implemented
 (below).

@@ -2587,6 +2587,23 @@ mod tests {
         assert_eq!(next_steps(j.state()), 1);
     }
 
+    /// A checkpoint newer than every request and step counts for the next run's step count: the
+    /// next run's first record comes after it.
+    #[test]
+    fn a_checkpoint_newer_than_the_last_request_counts() {
+        let program = program(RecoveryRequired::Never);
+        let mut j = new_journal();
+        let bytes = state_bytes(&Vm::new(&program).state);
+        j.commit_run_start(at(0), &bytes).unwrap();
+        j.commit_request(at(3)).unwrap();
+        j.commit_checkpoint(at(3), &bytes).unwrap();
+        assert_eq!(next_steps(j.state()), 4);
+        // A primitive that is safe to repeat leaves a checkpoint and no marker.
+        j.commit_checkpoint(at(4), &bytes).unwrap();
+        assert_eq!(j.state().facts.last_request, Some(at(3)));
+        assert_eq!(next_steps(j.state()), 5);
+    }
+
     /// A resume record after the completion does not undo it: the restart that committed the
     /// resume and crashed before any new record is still past the plan's end.
     #[test]

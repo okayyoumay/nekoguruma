@@ -496,8 +496,18 @@ pub async fn run_program_journaled<C: WorkerApi>(
 ///   resumed from its latest checkpoint (`NotResumable`: an unsafe primitive, a
 ///   `RecoveryRequired` section or a plan ahead, a checkpoint in an uninterruptible section, no
 ///   target VIN or VIN source). Where it can, the decision is a checkpoint resume
-///   (`RestartDecision::ResumeFromCheckpoint`), which the runner does not run yet: it ends in
-///   the same error (`CheckpointResumeNotImplemented`), also with nothing sent;
+///   (`RestartDecision::ResumeFromCheckpoint`, ADR-335 items 6 and 7): it counts the resume as a
+///   plain start does, then `restart::check_procedure_identity` reads the VIN through the
+///   program's source, the one request it sends before the run. A VIN equal to the job's takes
+///   the per-vehicle lock (`JobGuards::take_vehicle`, ADR-263; a cancel while waiting is
+///   [`JobError::Cancelled`], a failed lock [`JobError::VehicleLock`], guards missing from the slot
+///   [`JobError::GuardsMissing`]); another well-formed VIN
+///   ends the job in [`JobError::IdentityMismatch`], journaled first (ADR-286) and terminal; a VIN
+///   that cannot be established ends it in [`JobError::OnSiteInterventionRequired`]
+///   (`ProcedureIdentityNotEstablished`), with the resume counted and the job resumable again
+///   within the limit (ADR-290). Then the run commits a run start with the restored state
+///   (ADR-274) and goes on from the checkpoint with a step budget of its own (ADR-287), journaled
+///   as a first run is, and ends as that run would;
 /// - an interrupted transfer makes the checks of `restart::check_before_ecu` (resume limit,
 ///   supply voltage), commits the incremented resume count and makes the gates of
 ///   `restart::check_gates` (ADR-229 item 2 step 2, ADR-261), which send only
@@ -1069,21 +1079,8 @@ where
         RestartDecision::PlainStart => match opened {
             Ok(mut journal) => {
                 // A plain start on an existing journal counts as a resume of the plain
-                // procedure (ADR-335 item 6): checked, then committed, before anything is sent.
-                let stage = crate::journal::StageId(diag_ir::PLAIN_PROCEDURE_STAGE);
-                let resumes = journal.state().facts.resume_count(stage);
-                if resumes >= limits.max_procedure_resumes {
-                    return Err(JobError::OnSiteInterventionRequired(
-                        OnSiteReason::ProcedureResumeLimitReached {
-                            resumes,
-                            max: limits.max_procedure_resumes,
-                        },
-                    ));
-                }
-                if cancelled.load(Ordering::Relaxed) {
-                    return Err(JobError::Cancelled);
-                }
-                journal.commit_resume(stage, None)?;
+                // procedure (ADR-335 item 6), before anything is sent.
+                count_procedure_resume(&mut journal, limits, cancelled)?;
                 let first_step = restart::next_steps(journal.state());
                 let mut journal = JobJournal::new(journal, sources);
                 run_on_from(
@@ -1101,14 +1098,47 @@ where
             Err(_) => run_on(program, host, limits, cancelled, None::<&mut JobJournal<S>>)
                 .map(Restarted::Finished),
         },
-        // The decision is a continuation from the checkpoint, which is not run yet (the VIN read
-        // and lock, the resume count and the run from the restored state are still to be written).
-        // A plain start would send the requests the journal records a second time, so the job
-        // ends here, with nothing sent and no resume counted.
-        // TODO: run the checkpoint resume of ADR-335 item 6 here.
-        RestartDecision::ResumeFromCheckpoint(point) => Err(JobError::OnSiteInterventionRequired(
-            OnSiteReason::CheckpointResumeNotImplemented { at: point.at },
-        )),
+        // A plain procedure that sent requests goes on from its latest checkpoint (ADR-335
+        // item 6): the limit and the count first, then the identity (nothing else is read), then
+        // the run from the restored state.
+        RestartDecision::ResumeFromCheckpoint(point) => {
+            // `classify` decides a checkpoint resume only from a journal it read.
+            let mut journal = opened?;
+            count_procedure_resume(&mut journal, limits, cancelled)?;
+            let poll = limits.wait_poll.max(Duration::from_millis(1));
+            let target_vin = journal.state().facts.target_vin.clone();
+            restart::check_procedure_identity(
+                program,
+                target_vin.as_ref(),
+                &sources,
+                host,
+                cancelled,
+                |vin| promote_to_vehicle(guards, vin, poll, cancelled),
+            )
+            .map_err(|error| journal_identity_abort(&mut journal, error))?;
+            let point = *point;
+            let run_start = point.state.steps;
+            let vm = Vm::resume(point.state.clone());
+            let mut journal = JobJournal::new(journal, sources);
+            // The resumed run commits a run start with the restored state first (ADR-274).
+            journal.run_start(&point.state)?;
+            match run_vm(
+                program,
+                host,
+                limits,
+                cancelled,
+                Some(&mut journal),
+                vm,
+                None,
+                run_start,
+            )? {
+                RunEnd::Finished(state) => Ok(Restarted::Finished(state)),
+                // No stop point was given.
+                RunEnd::Stopped(_) => Err(JobError::Journal(JournalError::Invariant(
+                    "the checkpoint resume stopped without a stop point",
+                ))),
+            }
+        }
         RestartDecision::Restart(point) => {
             // `classify` restarts only from a journal it read.
             let mut journal = opened?;
@@ -1281,6 +1311,33 @@ where
             "the continuation stopped without a stop point",
         ))),
     }
+}
+
+/// The count of a plain procedure's resume (ADR-335 item 6), shared by a plain start on an existing
+/// journal and a checkpoint resume: a stage already resumed `limits.max_procedure_resumes` times
+/// ends in `ProcedureResumeLimitReached`, then a cancel ends the job, then the resume record is
+/// committed under the reserved stage. The checks that need no ECU come first and nothing has been
+/// sent yet.
+fn count_procedure_resume<S: Store>(
+    journal: &mut Journal<S>,
+    limits: JobLimits,
+    cancelled: &AtomicBool,
+) -> Result<(), JobError> {
+    let stage = crate::journal::StageId(diag_ir::PLAIN_PROCEDURE_STAGE);
+    let resumes = journal.state().facts.resume_count(stage);
+    if resumes >= limits.max_procedure_resumes {
+        return Err(JobError::OnSiteInterventionRequired(
+            OnSiteReason::ProcedureResumeLimitReached {
+                resumes,
+                max: limits.max_procedure_resumes,
+            },
+        ));
+    }
+    if cancelled.load(Ordering::Relaxed) {
+        return Err(JobError::Cancelled);
+    }
+    journal.commit_resume(stage, None)?;
+    Ok(())
 }
 
 /// Takes the job's guards out of `slot`, takes the per-vehicle lock of `vin` on them, waiting
@@ -4926,15 +4983,29 @@ def main():
         plain_steps(&[(0x22, Safe), (0x10, Unsafe), (0x3E, Safe), (0x22, Safe)])
     }
 
-    /// ADR-335 item 3: requests recorded and confirmed, only safe primitives ahead, an
-    /// interruptible checkpoint, a target VIN and a VIN source decide a checkpoint resume. The
-    /// resume itself is not run yet: the job ends on site with nothing sent and no resume
-    /// counted, not in a plain start that would send the unsafe request again.
+    /// The service numbers of the requests a host was sent, without the VIN read.
+    fn services_without_vin_read(host: &FlashHost) -> Vec<u16> {
+        host.sent()
+            .iter()
+            .filter(|sent| **sent != read_of([0xF1, 0x90]))
+            .map(|sent| match sent {
+                Sent::Service(service, _) => *service,
+                other => panic!("{other:?}"),
+            })
+            .collect()
+    }
+
+    /// ADR-335 items 3 and 6: requests recorded and confirmed, only safe primitives ahead, an
+    /// interruptible checkpoint, a target VIN and a VIN source resume the job from its latest
+    /// checkpoint. The resume counts under the plain stage, reads the VIN, takes the vehicle lock,
+    /// commits a run start with the restored state and sends only what lies after the checkpoint:
+    /// the unsafe request that the checkpoint confirms is not sent again.
     #[test]
-    fn a_checkpoint_resume_decision_ends_on_site_with_nothing_sent() {
+    fn a_confirmed_plain_procedure_resumes_from_its_checkpoint() {
         let program = resumable_program();
         let dir = journal_dir("plain-checkpoint-resume");
-        cancelled_after(&program, &dir, Some(TARGET_VIN), 0x10);
+        // The unsafe request at 4 completed; the safe one at 7 lost its response.
+        lost_response(&program, &dir, 0x3E, 7);
         let state = Journal::read(&dir, &job_key()).unwrap();
         let at = StepRef { pc: 4, steps: 4 };
         let RestartDecision::ResumeFromCheckpoint(point) = restart::classify(&program, Ok(&state))
@@ -4945,12 +5016,246 @@ def main():
         // Standing after the request, at its Pop, with the count going on after the journal's.
         assert_eq!(point.state.pc, 5);
         assert_eq!(point.state.steps, restart::next_steps(&state));
+        let slot = dir_slot(&dir);
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        let result = resume_in(&program, &dir, &mut host, false, Some(TARGET_VIN), &slot)
+            .expect("the resume runs to the program's end");
+        assert_eq!(result.pc as usize, program.code.len());
+        // The VIN first, then the safe requests after the checkpoint; never the unsafe 0x10.
+        assert_eq!(host.sent()[0], read_of([0xF1, 0x90]));
+        assert_eq!(services_without_vin_read(&host), [0x3E, 0x22]);
+        let vin_reads = host
+            .sent()
+            .iter()
+            .filter(|s| **s == read_of([0xF1, 0x90]))
+            .count();
+        assert_eq!(vin_reads, 1, "the VIN is read once");
+        assert!(slot.lock().unwrap().as_ref().unwrap().holds_vehicle());
+        // The resume record, then the run start with the restored state, then the run's records.
+        let after = Journal::read(&dir, &job_key()).unwrap();
+        assert_eq!(plain_resumes(&dir), 1);
+        let (start, bytes) = after.last_vm_state.as_ref().unwrap();
+        assert_eq!(
+            *start,
+            StepRef {
+                pc: 5,
+                steps: point.state.steps
+            }
+        );
+        let restored: VmState = postcard::from_bytes(bytes).unwrap();
+        assert_eq!(restored, point.state);
+        assert_eq!(after.facts.last_request, Some(at));
+        let (latest, _) = after.latest_checkpoint.as_ref().unwrap();
+        assert!(latest.steps > point.state.steps);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Another well-formed VIN is the journaled identity abort: terminal, nothing sent at a later
+    /// resume, no further resume counted (ADR-286).
+    #[test]
+    fn a_checkpoint_resume_on_another_vehicle_is_an_identity_abort() {
+        let program = resumable_program();
+        let dir = journal_dir("plain-resume-other-vin");
+        lost_response(&program, &dir, 0x3E, 7);
+        let before = Journal::read(&dir, &job_key()).unwrap();
+        let slot = dir_slot(&dir);
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        host.vin_script = [IdAnswer::value("WDB99999999999999")].into();
+        let result = resume_in(&program, &dir, &mut host, false, Some(TARGET_VIN), &slot);
+        assert!(
+            matches!(
+                result,
+                Err(JobError::IdentityMismatch {
+                    identity: diag_ir::IdentityKind::Vin
+                })
+            ),
+            "{result:?}"
+        );
+        assert_eq!(host.sent(), [read_of([0xF1, 0x90])]);
+        assert_eq!(plain_resumes(&dir), 1);
+        // No lock was taken and no run start was committed.
+        assert!(!slot.lock().unwrap().as_ref().unwrap().holds_vehicle());
+        // Release the guards, which a later resume takes again.
+        drop(slot);
+        let after = Journal::read(&dir, &job_key()).unwrap();
+        assert_eq!(after.last_vm_state, before.last_vm_state);
+        assert_eq!(after.latest_checkpoint, before.latest_checkpoint);
+        let journal = Journal::read(&dir, &job_key()).unwrap();
+        assert_eq!(
+            journal.facts.identity_mismatch,
+            Some(diag_ir::IdentityKind::Vin)
+        );
         let (result, host) = resume_plain_job(&program, &dir, |_| {});
+        assert!(
+            matches!(result, Err(JobError::IdentityMismatch { .. })),
+            "{result:?}"
+        );
+        assert_nothing_sent(&host, &dir, 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A second crash during the continuation: the next resume goes on from the newer checkpoint
+    /// of the first resume's run, counts again, and sends only the rest.
+    #[test]
+    fn a_checkpoint_resume_that_crashes_again_resumes_from_the_newer_checkpoint() {
+        let program = plain_steps(&[(0x22, Safe), (0x10, Unsafe), (0x3E, Safe), (0x2F, Safe)]);
+        let dir = journal_dir("plain-resume-twice");
+        lost_response(&program, &dir, 0x3E, 7);
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        host.lose_service = Some(0x2F);
+        let result = resume_limited(
+            &program,
+            &dir,
+            &mut host,
+            JobLimits::default(),
+            Some(TARGET_VIN),
+        );
+        assert!(
+            matches!(result, Err(JobError::Host { pc: 10, .. })),
+            "{result:?}"
+        );
+        assert_eq!(services_without_vin_read(&host), [0x3E, 0x2F]);
+        assert_eq!(plain_resumes(&dir), 1);
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        resume_limited(
+            &program,
+            &dir,
+            &mut host,
+            JobLimits::default(),
+            Some(TARGET_VIN),
+        )
+        .expect("the second resume completes");
+        // The 0x3E that the first resume completed is not sent again.
+        assert_eq!(services_without_vin_read(&host), [0x2F]);
+        assert_eq!(plain_resumes(&dir), 2);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The resumed run has a step budget of its own (ADR-287): a limit that covers its steps but
+    /// not the journal's step count on top of them still lets it complete.
+    #[test]
+    fn a_checkpoint_resume_has_its_own_step_budget() {
+        let program = resumable_program();
+        let dir = journal_dir("plain-resume-budget");
+        lost_response(&program, &dir, 0x3E, 7);
+        let state = Journal::read(&dir, &job_key()).unwrap();
+        let start = restart::next_steps(&state);
+        // From pc 5 to the end of the 12 instructions.
+        let run = program.code.len() as u64 - 5;
+        let limits = JobLimits {
+            max_steps: run + 1,
+            ..JobLimits::default()
+        };
+        assert!(start + run > limits.max_steps, "{start}");
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        let state = resume_limited(&program, &dir, &mut host, limits, Some(TARGET_VIN))
+            .expect("the resumed run completes within its own budget");
+        assert_eq!(state.steps, start + run);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A VIN that cannot be established (no answer, a refusal, a malformed value, a worker
+    /// failure) ends the resume on site with the resume counted, and the job can be resumed again
+    /// within the limit (ADR-335 items 6 and 7, ADR-290); nothing but the VIN read is sent.
+    #[test]
+    fn a_checkpoint_resume_whose_vin_is_not_established_can_be_resumed_again() {
+        let program = resumable_program();
+        let dir = journal_dir("plain-resume-vin-unread");
+        lost_response(&program, &dir, 0x3E, 7);
+        let limits = JobLimits {
+            max_procedure_resumes: 5,
+            ..JobLimits::default()
+        };
+        let before = Journal::read(&dir, &job_key()).unwrap();
+        for (count, answer) in [
+            IdAnswer::Refuse,
+            IdAnswer::value("short"),
+            IdAnswer::value("WDB1234567890123I"),
+            IdAnswer::Fail,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+            host.vin_script = [answer].into();
+            let result = resume_limited(&program, &dir, &mut host, limits, Some(TARGET_VIN));
+            assert_eq!(
+                reason_of(&result),
+                &OnSiteReason::ProcedureIdentityNotEstablished,
+                "{count}"
+            );
+            assert_eq!(host.sent(), [read_of([0xF1, 0x90])]);
+            assert_eq!(plain_resumes(&dir), count as u16 + 1);
+            // No run start was committed.
+            let after = Journal::read(&dir, &job_key()).unwrap();
+            assert_eq!(after.last_vm_state, before.last_vm_state);
+            assert_eq!(after.latest_checkpoint, before.latest_checkpoint);
+        }
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        resume_limited(&program, &dir, &mut host, limits, Some(TARGET_VIN))
+            .expect("a VIN that reads correctly resumes the job");
+        assert_eq!(plain_resumes(&dir), 5);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A resume at the limit ends on site before anything is sent, the VIN read included.
+    #[test]
+    fn a_checkpoint_resume_at_the_limit_sends_nothing() {
+        let program = resumable_program();
+        let dir = journal_dir("plain-resume-limit");
+        lost_response(&program, &dir, 0x3E, 7);
+        let limits = JobLimits {
+            max_procedure_resumes: 1,
+            ..JobLimits::default()
+        };
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        host.vin_script = [IdAnswer::Refuse].into();
+        let result = resume_limited(&program, &dir, &mut host, limits, Some(TARGET_VIN));
         assert_eq!(
             reason_of(&result),
-            &OnSiteReason::CheckpointResumeNotImplemented { at }
+            &OnSiteReason::ProcedureIdentityNotEstablished
         );
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        let result = resume_limited(&program, &dir, &mut host, limits, Some(TARGET_VIN));
+        assert_eq!(
+            reason_of(&result),
+            &OnSiteReason::ProcedureResumeLimitReached { resumes: 1, max: 1 }
+        );
+        assert_nothing_sent(&host, &dir, 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A cancel before the resume is counted ends the job with no count and nothing sent; one that
+    /// arrives during the VIN read ends it after the count and that read, taking no lock.
+    #[test]
+    fn a_cancelled_checkpoint_resume_sends_nothing_more() {
+        let program = resumable_program();
+        let dir = journal_dir("plain-resume-cancelled");
+        lost_response(&program, &dir, 0x3E, 7);
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        let result = resume(&program, &dir, &mut host, true);
+        assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
         assert_nothing_sent(&host, &dir, 0);
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        host.cancel_on_vin_read = Some((0, Arc::clone(&cancelled)));
+        let slot = dir_slot(&dir);
+        let result = resume_to_erase(
+            &program,
+            &mut host,
+            JobLimits::default(),
+            &cancelled,
+            Journal::open(&dir, &job_key()),
+            identity_sources(),
+            Some(&target()),
+            None,
+            &slot,
+        );
+        assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
+        assert_eq!(host.sent(), [read_of([0xF1, 0x90])]);
+        assert_eq!(plain_resumes(&dir), 1);
+        assert!(!slot.lock().unwrap().as_ref().unwrap().holds_vehicle());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -171,12 +171,15 @@ pub enum OnSiteReason {
     /// (`JobLimits::max_procedure_resumes`, ADR-335 item 6): `resumes` were counted under the
     /// plain procedure's stage. Nothing is sent and no resume is counted.
     ProcedureResumeLimitReached { resumes: u16, max: u16 },
-    /// `classify` decided a checkpoint resume for a plain procedure
-    /// ([`RestartDecision::ResumeFromCheckpoint`], ADR-335 item 3), but the agent does not run
-    /// the continuation yet, and a plain start would send the requests it already sent a second
-    /// time. The job ends here with nothing sent and no resume counted; `at` is the checkpoint it
-    /// would go on from.
-    CheckpointResumeNotImplemented { at: StepRef },
+    /// A checkpoint resume of a plain procedure could not establish the vehicle (ADR-335 items 6
+    /// and 7, ADR-261): the VIN read through the program's source gave no answer, a negative
+    /// response, a value that is not a well-formed VIN, or failed in the worker. Nothing but that
+    /// read was sent. The resume stays counted, and the job can be resumed again within the limit
+    /// (ADR-290). A job with no well-formed target VIN, or a program with no source, never gets
+    /// this far, since classification makes it `NotResumable` (`NoIdentity`); the check keeps the
+    /// same ending for it defensively. A well-formed VIN that differs is not this reason but
+    /// [`JobError::IdentityMismatch`].
+    ProcedureIdentityNotEstablished,
     /// The transfer's plan never allows a restart (`FlashRecovery::allows_restart`), so the
     /// program need not declare what a restart reads (ADR-245 item 6).
     RestartNotAllowed { flash_session: u32 },
@@ -586,7 +589,13 @@ fn classify_plain_procedure(program: &Program, state: &JournalState) -> RestartD
             return not_resumable(NotResumableCause::UnsafePrimitiveAhead { pc: ahead });
         }
     }
-    if facts.target_vin.is_none() || program.identity.vin.is_none() {
+    // A target VIN that is not well-formed could never match a VIN read, so it is no identity.
+    if !facts
+        .target_vin
+        .as_ref()
+        .is_some_and(|vin| Vin::is_well_formed_text(vin.as_str()))
+        || program.identity.vin.is_none()
+    {
         return not_resumable(NotResumableCause::NoIdentity);
     }
     RestartDecision::ResumeFromCheckpoint(Box::new(CheckpointResume {
@@ -886,6 +895,65 @@ where
         Err(error) => {
             tracing::warn!(%error, "the ECU's hardware identity could not be read after the restart");
             not_established(IdentityKind::HardwarePartNumber)
+        }
+    }
+}
+
+/// The identity check of a checkpoint resume of a plain procedure (ADR-335 items 6 and 7,
+/// ADR-261, ADR-263): the VIN half of [`check_identity`]. The ECU's VIN is read through the
+/// program's source and must equal `target_vin`, the VIN the journal recorded at the job's first
+/// run:
+/// - a well-formed equal VIN calls `promote` with the target VIN, which takes the per-vehicle lock;
+///   its error is returned as it is;
+/// - a well-formed VIN that differs is [`JobError::IdentityMismatch`], which the caller journals
+///   (ADR-286);
+/// - anything else (no target VIN or no declared source, no answer, a negative response, a value
+///   that is not a well-formed VIN, a worker failure) is
+///   [`OnSiteReason::ProcedureIdentityNotEstablished`].
+///
+/// A cancel stops it at the start and before and right after the read. Nothing here sends anything
+/// but the ReadDataByIdentifier request of the source. No VIN is put in a log message or a result
+/// (design 16.2).
+pub(crate) fn check_procedure_identity<H>(
+    program: &Program,
+    target_vin: Option<&Vin>,
+    sources: &ServiceSources,
+    host: &mut H,
+    cancelled: &AtomicBool,
+    promote: impl FnOnce(&Vin) -> Result<(), JobError>,
+) -> Result<(), JobError>
+where
+    H: DiagHost<Error = HostError> + RuntimeInputs,
+{
+    let not_established = || {
+        Err(JobError::OnSiteInterventionRequired(
+            OnSiteReason::ProcedureIdentityNotEstablished,
+        ))
+    };
+    if cancelled.load(Ordering::Relaxed) {
+        return Err(JobError::Cancelled);
+    }
+    let (Some(target_vin), Some(source)) = (
+        target_vin.filter(|vin| Vin::is_well_formed_text(vin.as_str())),
+        program.identity.vin,
+    ) else {
+        return not_established();
+    };
+    match cancellable(cancelled, || resolve_source(source, sources, host))? {
+        Ok(Reading::Text(text))
+            if Vin::is_well_formed_text(&text) && text == target_vin.as_str() =>
+        {
+            promote(target_vin)
+        }
+        Ok(Reading::Text(text)) if Vin::is_well_formed_text(&text) => {
+            Err(JobError::IdentityMismatch {
+                identity: IdentityKind::Vin,
+            })
+        }
+        Ok(_) => not_established(),
+        Err(error) => {
+            tracing::warn!(%error, "the ECU's VIN could not be read for a checkpoint resume");
+            not_established()
         }
     }
 }

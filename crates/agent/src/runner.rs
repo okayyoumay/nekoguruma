@@ -5075,7 +5075,7 @@ def main():
     /// one standing on the `Ret` after such a section's last primitive (ADR-330 item 2).
     #[test]
     fn a_checkpoint_in_an_uninterruptible_section_is_not_resumable() {
-        use restart::NotResumableCause::{AtReturn, UninterruptibleSection};
+        use restart::NotResumableCause::UninterruptibleSection;
         // The cancel is not taken inside a `No` section, so the run ends in a lost response.
         let mut program = plain_steps(&[(0x10, Unsafe), (0x22, Safe), (0x3E, Safe)]);
         for section in &mut program.sections[1..] {
@@ -5092,13 +5092,16 @@ def main():
         std::fs::remove_dir_all(&dir).unwrap();
 
         // The section holds the request but not the return after it: the checkpoint stands on
-        // a `Ret` outside the section (`AtReturn`; ADR-335 item 3 calls it the section's case).
+        // a `Ret` outside the section, which ADR-335 item 3 gives the same cause.
         let program = program_with_return_after_no_section();
         program.validate().unwrap();
         let dir = journal_dir("plain-no-section-ret");
         first_run(&program, &dir, JobLimits::default(), |_| {}).expect("the job completes");
         let (result, host) = resume_plain_job(&program, &dir, |_| {});
-        assert_eq!(reason_of(&result), &unresumable(AtReturn { pc: 5 }));
+        assert_eq!(
+            reason_of(&result),
+            &unresumable(UninterruptibleSection { pc: 5 })
+        );
         assert_nothing_sent(&host, &dir, 0);
         std::fs::remove_dir_all(&dir).unwrap();
     }

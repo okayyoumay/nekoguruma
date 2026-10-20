@@ -124,16 +124,12 @@ pub enum NotResumableCause {
     /// has its own journal and restart order, which a continuation from a plain checkpoint must
     /// not enter.
     PlanAhead { flash_session: u32 },
-    /// The checkpoint stands inside a section that is not `Yes`, where a cancel is not taken
-    /// (ADR-330, [`interruptible_point`]). A plain procedure declares no re-entry point for such
-    /// a section (ADR-335 item 5).
+    /// The checkpoint stands where a cancel is not taken (ADR-330, [`interruptible_point`]):
+    /// inside a section that is not `Yes`, or on a `Ret`, which is not an interruptible point
+    /// either (ADR-330 item 2). A plain procedure declares no re-entry point for such a section
+    /// (ADR-335 item 5), and ADR-335 item 3 gives a checkpoint on the return after a `No`
+    /// section's last primitive this cause too.
     UninterruptibleSection { pc: u32 },
-    /// The checkpoint stands on a `Ret`, outside every section that is not `Yes`: a return is not
-    /// an interruptible point (ADR-330 item 2, [`interruptible_point`]). It is the state after
-    /// the last primitive of a section when the return follows the section, which ADR-335 item 3
-    /// reads as the uninterruptible-section case when that section is not `Yes`; the cause
-    /// names what the checkpoint stands on.
-    AtReturn { pc: u32 },
     /// The job names no target VIN or the program declares no VIN source, so a resume could not
     /// tell that it runs against the vehicle the procedure started on (ADR-335 item 3,
     /// ADR-261).
@@ -520,9 +516,9 @@ pub fn classify(
 /// - otherwise a checkpoint resume from the latest checkpoint, when all of these hold, checked in
 ///   this order, each failure a [`OnSiteReason::NotResumable`]:
 ///   (I) the checkpoint's pc is an interruptible point ([`interruptible_point`]): not inside a
-///   section that is not `Yes` ([`NotResumableCause::UninterruptibleSection`]) and not on a `Ret`
-///   ([`NotResumableCause::AtReturn`]), so a `No` section is never resumed from (ADR-335
-///   item 5);
+///   section that is not `Yes` and not on a `Ret`, otherwise
+///   [`NotResumableCause::UninterruptibleSection`], so a `No` section is never resumed from
+///   (ADR-335 items 3 and 5);
 ///   (S) nothing reachable from the checkpoint ([`Program::reachable_from`], with the state's
 ///   suspended callers) is a hazard: the lowest-pc instruction that lies in a plan's range, is a
 ///   diagnostic primitive in a `RecoveryRequired` section, or is a diagnostic primitive that is
@@ -561,12 +557,7 @@ fn classify_plain_procedure(program: &Program, state: &JournalState) -> RestartD
     }
     let pc = resumed.pc;
     if !interruptible_point(program, pc) {
-        // The section is the cause when both hold.
-        return not_resumable(if in_uninterruptible_section(program, pc) {
-            NotResumableCause::UninterruptibleSection { pc }
-        } else {
-            NotResumableCause::AtReturn { pc }
-        });
+        return not_resumable(NotResumableCause::UninterruptibleSection { pc });
     }
     let return_pcs: Vec<u32> = resumed
         .call_stack
@@ -3938,16 +3929,16 @@ def main():
         invalid(plain_journal(&program, false, &deep));
     }
 
-    /// A checkpoint on a `Ret` outside every section that is not `Yes` is `AtReturn`; inside such
-    /// a section the section is the cause even on a `Ret`.
+    /// A checkpoint on a `Ret` is not resumed from, outside a section as inside one that is not
+    /// `Yes` (ADR-330 item 2, ADR-335 item 3).
     #[test]
-    fn a_checkpoint_on_a_return_is_at_return() {
+    fn a_checkpoint_on_a_return_is_not_resumable() {
         let mut program = plain_program();
         program.code[2] = Op::Ret;
         let journal = plain_journal(&program, true, &state_at_pc(&program, 2, 7));
         assert_eq!(
             decide(&program, &journal),
-            not_resumable(NotResumableCause::AtReturn { pc: 2 })
+            not_resumable(NotResumableCause::UninterruptibleSection { pc: 2 })
         );
         program
             .sections

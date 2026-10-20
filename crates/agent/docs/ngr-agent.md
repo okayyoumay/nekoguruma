@@ -326,11 +326,10 @@ order, and the first that fails is the cause:
 
 1. the checkpoint's pc is an interruptible point (`restart::interruptible_point`, the rule the
    runner marks cancel points with, ADR-330): not inside a section whose `interruptible` is not
-   `Yes`, and not a `Ret`. Inside such a section the cause is `UninterruptibleSection { pc }`
-   (checked first); on a `Ret` it is `AtReturn { pc }`, which is how a checkpoint standing on the
-   return after a `No` section's last primitive is reported, where ADR-335 item 3 reads it as the
-   uninterruptible-section case. A plain procedure declares no re-entry point, so such a
-   checkpoint never resumes (ADR-335 item 5);
+   `Yes`, and not a `Ret`. Otherwise the cause is `UninterruptibleSection { pc }`, also for a
+   checkpoint standing on the return after a `No` section's last primitive (ADR-335 item 3). A
+   plain procedure declares no re-entry point, so such a checkpoint never resumes (ADR-335
+   item 5);
 2. nothing reachable from the checkpoint is a hazard. Reachability (`Program::reachable_from`) is
    the forward closure over fallthrough, jumps, calls and returns, with the state's suspended
    callers as the returns' targets; it is conservative (both ways of a conditional jump). The

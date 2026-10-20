@@ -494,8 +494,9 @@ for the variant, plain procedures included (ADR-336 item 1). A kind is given onc
 | `service` | service name | yes | A generated DID read of the variant (`vin.read`, a ReadDataByIdentifier of one DID, 4.7), the request shape the agent's source table reads; any other service is `CSV_BAD_VALUE`, one the variant does not have `CSV_UNKNOWN_REFERENCE` |
 | `field` | name | yes | The top-level response field that holds the value: the DID's only response field, so that it is the whole data record after the echoed identifier (the response shape the agent's source table decodes), of an ASCII text or unsigned integer type, the encodings the agent's source table decodes; for `vin`, a fixed 17-byte ASCII text field only, since the agent's VIN checks compare a 17-character text. A DID of several fields, or a field of another type, is `CSV_BAD_VALUE`; a field the response lacks is `CSV_UNKNOWN_REFERENCE` |
 
-The unsigned integer is a `uint` field of whole bytes, up to eight, in big-endian order, the one
-encoding the agent reads. The row becomes `Source::EcuService { service_id, field_id }`, the
+The field starts at byte 0 of the record (no `byte` other than 0, no `bit`). The unsigned integer
+is a `uint` field of whole bytes, up to seven, in big-endian order, the one encoding the agent
+reads; the agent holds the value as a signed 64-bit integer, which every seven-byte value fits. The row becomes `Source::EcuService { service_id, field_id }`, the
 `Service.id` of the read and the `Field.id` of the field in the variant's document (section 3),
 the pair the agent's source table is keyed by. The field rules of section 5 run first: these
 checks follow them (section 7), and a definition with an error in `fields.csv` reports no

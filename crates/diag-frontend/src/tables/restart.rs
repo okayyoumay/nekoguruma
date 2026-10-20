@@ -113,6 +113,16 @@ impl Checker<'_> {
             );
             return;
         }
+        if field.byte.is_some_and(|byte| byte != 0) || field.bit != 0 {
+            bad(
+                ErrorCode::BadValue,
+                format!(
+                    "{name} does not start at byte 0 of the record; the agent reads the record \
+                     from its first byte"
+                ),
+            );
+            return;
+        }
         if field.constant.is_some() || field.shape.is_some() {
             bad(
                 ErrorCode::BadValue,
@@ -145,14 +155,14 @@ impl Checker<'_> {
     }
 }
 
-/// Why a `uint` field is not one the agent reads: it decodes whole bytes, at most eight, as a
-/// big-endian integer.
+/// Why a `uint` field is not one the agent reads: it decodes whole bytes as a big-endian
+/// integer into a signed 64-bit value, so at most seven bytes, whose every value fits.
 fn unsigned(field: &FieldRow) -> Option<String> {
-    let whole_bytes = field.bit == 0 && field.bits.is_some_and(|b| b % 8 == 0 && b <= 64);
+    let whole_bytes = field.bit == 0 && field.bits.is_some_and(|b| b % 8 == 0 && b <= 56);
     if !field.big_endian || !whole_bytes {
         return Some(format!(
-            "{} must be a big-endian uint of whole bytes, 8 at most, since the agent reads an \
-             unsigned big-endian integer",
+            "{} must be a big-endian uint of whole bytes, 7 at most, since the agent reads an \
+             unsigned big-endian integer into a signed 64-bit value",
             field.name
         ));
     }

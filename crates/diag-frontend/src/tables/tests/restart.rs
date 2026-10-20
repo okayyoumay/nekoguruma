@@ -425,6 +425,8 @@ fn a_source_field_has_the_type_the_agent_decodes() {
         "shortVin,0xFD16",
         "variableVin,0xFD17",
         "numberVin,0xFD18",
+        "offsetValue,0xFD19",
+        "wideValue,0xFD1A",
     ];
     let fields = [
         "did:floatValue,floatValue,0,,float,32",
@@ -435,6 +437,8 @@ fn a_source_field_has_the_type_the_agent_decodes() {
         "did:shortVin,shortVin,0,,ascii,128",
         "did:variableVin,variableVin,0,,ascii,,terminated,17,end",
         "did:numberVin,numberVin,0,,uint,64",
+        "did:offsetValue,offsetValue,1,,uint,16",
+        "did:wideValue,wideValue,0,,uint,56",
     ];
     // An identity value is ASCII text or an unsigned integer, whatever the width.
     let kind_errors = |kind: &str, did: &str, field: &str| {
@@ -459,8 +463,9 @@ fn a_source_field_has_the_type_the_agent_decodes() {
             "{did}"
         );
     }
-    // The agent reads whole bytes as a big-endian integer.
-    for did in ["littleValue", "bitValue"] {
+    // The agent reads whole bytes as a big-endian integer from the record's first byte, into a
+    // signed 64-bit value: seven bytes at most.
+    for did in ["littleValue", "bitValue", "offsetValue", "numberVin"] {
         assert_eq!(
             bad(kind_errors("software_version", did, did)),
             wrong,
@@ -469,6 +474,10 @@ fn a_source_field_has_the_type_the_agent_decodes() {
     }
     assert_eq!(
         bad(kind_errors("hardware_part_number", "shortVin", "shortVin")),
+        vec![]
+    );
+    assert_eq!(
+        bad(kind_errors("software_version", "wideValue", "wideValue")),
         vec![]
     );
     assert_eq!(
@@ -506,9 +515,12 @@ fn a_source_field_has_the_type_the_agent_decodes() {
         "bitValue",
         "shortVin",
         "variableVin",
+        "offsetValue",
+        "numberVin",
     ] {
         assert_eq!(precondition(did), wrong, "{did}");
     }
+    assert_eq!(precondition("wideValue").len(), 0);
     assert_eq!(precondition("powerCycles").len(), 0);
     // The programming-session source is judged the same way.
     assert_eq!(

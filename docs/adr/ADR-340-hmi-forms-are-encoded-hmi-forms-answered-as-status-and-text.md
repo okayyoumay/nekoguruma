@@ -221,10 +221,16 @@ each call's value and how a decline, a timeout and a cancel surface; which check
    needed to match them. An open deadline that has passed means the job has timed out: a run
    that resumes with one starts with the cancel raised and the timeout as its reason, whether it
    resumes from a checkpoint or starts again from the first instruction, so a crash between the
-   expiry and the timed-out answer loses nothing. Until the server accepts an inquiry the operator
-   has not seen it, so nothing durable exists yet: the host counts the timeout from its first send
-   in memory, so a server that stays unreachable still ends the wait, and a restart before the
-   acceptance asks again with a fresh wait. A handover (ADR-229) follows the same rule from the
+   expiry and the timed-out answer loses nothing. The server keeps the deadline with the job's open
+   wait, not with one request id: a request that supersedes an accepted inquiry of the same job
+   that has no answer (a restart's new request id, or the same request sent again because its
+   acceptance never arrived) keeps that deadline, and the `HmiAccepted` for it returns it. The host
+   sends the request again until an acceptance arrives, so a lost `HmiAccepted`, or a crash before
+   the runner journaled it, still ends with the server's deadline in the journal. Until any
+   acceptance arrives, the host also counts the timeout in memory from its first send, so a
+   server that stays unreachable still ends the wait; that clock can end the wait earlier than
+   the server's deadline by at most the request's delivery time. If the server never accepted
+   the inquiry, the operator has not seen it, and a restart asks it with a fresh wait. A handover (ADR-229) follows the same rule from the
    server's side, without any message from the failed device: the server marks the job timed out
    when an inquiry it accepted has passed its deadline with no answer it relayed, and puts the
    mark in the instruction it signs for the receiving device, whose run then starts with the

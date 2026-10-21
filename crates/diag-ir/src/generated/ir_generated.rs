@@ -6379,6 +6379,8 @@ impl<'a> FlashSegment<'a> {
   pub const VT_ARTIFACT_OFFSET: ::flatbuffers::VOffsetT = 10;
   pub const VT_BLOCK_SIZE: ::flatbuffers::VOffsetT = 12;
   pub const VT_CHECKSUM: ::flatbuffers::VOffsetT = 14;
+  pub const VT_DATA_FORMAT: ::flatbuffers::VOffsetT = 16;
+  pub const VT_ADDRESS_AND_LENGTH_FORMAT: ::flatbuffers::VOffsetT = 18;
 
   #[inline]
   pub unsafe fn init_from_table(table: ::flatbuffers::Table<'a>) -> Self {
@@ -6396,6 +6398,8 @@ impl<'a> FlashSegment<'a> {
     if let Some(x) = args.checksum { builder.add_checksum(x); }
     builder.add_block_size(args.block_size);
     if let Some(x) = args.short_name { builder.add_short_name(x); }
+    builder.add_address_and_length_format(args.address_and_length_format);
+    builder.add_data_format(args.data_format);
     builder.finish()
   }
 
@@ -6410,6 +6414,8 @@ impl<'a> FlashSegment<'a> {
     let checksum = self.checksum().map(|x| {
       x.into_iter().collect()
     });
+    let data_format = self.data_format();
+    let address_and_length_format = self.address_and_length_format();
     FlashSegmentT {
       short_name,
       start_address,
@@ -6417,6 +6423,8 @@ impl<'a> FlashSegment<'a> {
       artifact_offset,
       block_size,
       checksum,
+      data_format,
+      address_and_length_format,
     }
   }
 
@@ -6462,6 +6470,20 @@ impl<'a> FlashSegment<'a> {
     // which contains a valid value in this slot
     unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'a, u8>>>(FlashSegment::VT_CHECKSUM, None)}
   }
+  #[inline]
+  pub fn data_format(&self) -> u8 {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<u8>(FlashSegment::VT_DATA_FORMAT, Some(0)).unwrap()}
+  }
+  #[inline]
+  pub fn address_and_length_format(&self) -> u8 {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<u8>(FlashSegment::VT_ADDRESS_AND_LENGTH_FORMAT, Some(68)).unwrap()}
+  }
 }
 
 impl ::flatbuffers::Verifiable for FlashSegment<'_> {
@@ -6476,6 +6498,8 @@ impl ::flatbuffers::Verifiable for FlashSegment<'_> {
      .visit_field::<u64>("artifact_offset", Self::VT_ARTIFACT_OFFSET, false)?
      .visit_field::<u32>("block_size", Self::VT_BLOCK_SIZE, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, u8>>>("checksum", Self::VT_CHECKSUM, false)?
+     .visit_field::<u8>("data_format", Self::VT_DATA_FORMAT, false)?
+     .visit_field::<u8>("address_and_length_format", Self::VT_ADDRESS_AND_LENGTH_FORMAT, false)?
      .finish();
     Ok(())
   }
@@ -6487,6 +6511,8 @@ pub struct FlashSegmentArgs<'a> {
     pub artifact_offset: u64,
     pub block_size: u32,
     pub checksum: Option<::flatbuffers::WIPOffset<::flatbuffers::Vector<'a, u8>>>,
+    pub data_format: u8,
+    pub address_and_length_format: u8,
 }
 impl<'a> Default for FlashSegmentArgs<'a> {
   #[inline]
@@ -6498,6 +6524,8 @@ impl<'a> Default for FlashSegmentArgs<'a> {
       artifact_offset: 0,
       block_size: 0,
       checksum: None,
+      data_format: 0,
+      address_and_length_format: 68,
     }
   }
 }
@@ -6532,6 +6560,14 @@ impl<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> FlashSegmentBuilder<'a, 'b, A
     self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(FlashSegment::VT_CHECKSUM, checksum);
   }
   #[inline]
+  pub fn add_data_format(&mut self, data_format: u8) {
+    self.fbb_.push_slot::<u8>(FlashSegment::VT_DATA_FORMAT, data_format, 0);
+  }
+  #[inline]
+  pub fn add_address_and_length_format(&mut self, address_and_length_format: u8) {
+    self.fbb_.push_slot::<u8>(FlashSegment::VT_ADDRESS_AND_LENGTH_FORMAT, address_and_length_format, 68);
+  }
+  #[inline]
   pub fn new(_fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>) -> FlashSegmentBuilder<'a, 'b, A> {
     let start = _fbb.start_table();
     FlashSegmentBuilder {
@@ -6555,6 +6591,8 @@ impl ::core::fmt::Debug for FlashSegment<'_> {
       ds.field("artifact_offset", &self.artifact_offset());
       ds.field("block_size", &self.block_size());
       ds.field("checksum", &self.checksum());
+      ds.field("data_format", &self.data_format());
+      ds.field("address_and_length_format", &self.address_and_length_format());
       ds.finish()
   }
 }
@@ -6567,6 +6605,8 @@ pub struct FlashSegmentT {
   pub artifact_offset: u64,
   pub block_size: u32,
   pub checksum: Option<alloc::vec::Vec<u8>>,
+  pub data_format: u8,
+  pub address_and_length_format: u8,
 }
 impl Default for FlashSegmentT {
   fn default() -> Self {
@@ -6577,6 +6617,8 @@ impl Default for FlashSegmentT {
       artifact_offset: 0,
       block_size: 0,
       checksum: None,
+      data_format: 0,
+      address_and_length_format: 68,
     }
   }
 }
@@ -6595,6 +6637,8 @@ impl FlashSegmentT {
     let checksum = self.checksum.as_ref().map(|x|{
       _fbb.create_vector(x)
     });
+    let data_format = self.data_format;
+    let address_and_length_format = self.address_and_length_format;
     FlashSegment::create(_fbb, &FlashSegmentArgs{
       short_name,
       start_address,
@@ -6602,6 +6646,8 @@ impl FlashSegmentT {
       artifact_offset,
       block_size,
       checksum,
+      data_format,
+      address_and_length_format,
     })
   }
 }

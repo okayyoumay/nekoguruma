@@ -367,6 +367,10 @@ table FlashSegment {
   artifact_offset: uint64;
   block_size: uint32;
   checksum: [uint8];
+  // The data format and address-and-length format identifiers the plan's RequestDownload sends
+  // for this segment, from `flash_segments.csv` (ADR-336 item 1)
+  data_format: uint8 = 0;
+  address_and_length_format: uint8 = 0x44;
 }
 
 table FlashSession {

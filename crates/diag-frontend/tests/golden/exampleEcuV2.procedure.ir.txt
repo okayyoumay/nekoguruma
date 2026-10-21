@@ -1,5 +1,5 @@
 EcuDocumentT {
-    schema_version: 17,
+    schema_version: 18,
     source_format: Some(
         "csv-starlark",
     ),
@@ -2174,6 +2174,8 @@ EcuDocumentT {
                                     checksum: Some(
                                         [],
                                     ),
+                                    data_format: 0,
+                                    address_and_length_format: 68,
                                 },
                             ],
                         ),
@@ -2296,7 +2298,7 @@ EcuDocumentT {
     procedure: None,
 }
 Program {
-    schema_version: 17,
+    schema_version: 18,
     code: [
         PushBytes(
             0,

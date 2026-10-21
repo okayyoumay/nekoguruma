@@ -2,7 +2,7 @@
 
 **Date:** 2026-10-21
 **Status:** Accepted
-**Affects:** `diag-ir` (new `hmi` module, `Op::HmiRequestFromStack`, `IR_SCHEMA_VERSION` 17 to 18,
+**Affects:** `diag-ir` (new `hmi` module, `Op::HmiRequestFromStack`, `IR_SCHEMA_VERSION` 18 to 19,
 `Program::validate`, `VmError`, `dry_run::Script`), `diag-frontend` (the lowering of `diag.hmi`
 and `diag.record` and of the answer's keys), `agent` (`host.rs`, `runner.rs`, `policy.rs`; the
 agent-server protocol is left to an ADR of its own), Starlark subset 2.5, 3.1, 3.2, 3.4 and 4.6,
@@ -74,7 +74,7 @@ each call's value and how a decline, a timeout and a cancel surface; which check
    - `HmiRequest { form }` and `RecordInput { template }` keep their meaning: the template has no
      `Runtime` slot, and the VM sends its `HmiForm` (a `RecordInput` template has no params).
    - `Op::HmiRequestFromStack { form: u32 }` is appended after `ReadInput` (ADR-233 item 10),
-     `IR_SCHEMA_VERSION` 17 to 18. It decodes the template at `form`, pops one value per `Runtime`
+     `IR_SCHEMA_VERSION` 18 to 19. It decodes the template at `form`, pops one value per `Runtime`
      slot, the first slot being the deepest, maps `I64` to `Int`, `Bool` to `Bool` and `Bytes` that
      are valid UTF-8 to `Text`, fills the slots, encodes the `HmiForm` with the codec of item 1 and
      calls `DiagHost::hmi_request(inquiry, &bytes)`. The trait does not change. Before the host is
@@ -220,7 +220,7 @@ each call's value and how a decline, a timeout and a cancel surface; which check
 
 - Both calls lower, so `diag.flash_transfer` is the one `diag` call left without a lowering
   (ADR-336). The two backlog items on `diag.hmi` / `diag.record` and on the stack variant close.
-- `IR_SCHEMA_VERSION` becomes 18: a runtime of 17 cannot decode `HmiRequestFromStack`, and the
+- `IR_SCHEMA_VERSION` becomes 19: a runtime of 18 cannot decode `HmiRequestFromStack`, and the
   version a server matches against `capabilities` (9.5) changes, as for every appended
   instruction (ADR-233). `VmError` gains `BadHmiForm` and `HmiFormTooLong` (both raised before the host call),
   `ProgramError` gains `BadHmiForm`. ADR-330 item 2 is amended for a cancel an HMI timeout

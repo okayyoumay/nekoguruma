@@ -106,6 +106,8 @@ impl<'a> DtcsAndFlash<'a> {
                             segment.artifact_offset = s.artifact_offset;
                             segment.block_size = s.block_size;
                             segment.checksum = Some(s.checksum.clone());
+                            segment.data_format = s.data_format;
+                            segment.address_and_length_format = s.address_and_length_format;
                             segment
                         })
                         .collect(),

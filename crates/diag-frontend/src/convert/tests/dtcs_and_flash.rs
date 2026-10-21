@@ -118,6 +118,36 @@ fn the_example_dtcs_and_flash_session_convert() {
             )
         );
         assert_eq!(segments(session), [("app", 0, 0x1_0000, 0, 0x100, &[][..])]);
+        assert_eq!(formats(session), [(0x00, 0x44)]);
+    }
+}
+
+/// Each segment's RequestDownload formats as (data format, address-and-length format).
+fn formats(session: &FlashSessionT) -> Vec<(u8, u8)> {
+    session
+        .segments
+        .iter()
+        .flatten()
+        .map(|s| (s.data_format, s.address_and_length_format))
+        .collect()
+}
+
+#[test]
+fn segment_formats_reach_the_loaded_document() {
+    let files = with(
+        example(),
+        "flash_segments.csv",
+        "session,name,start_address,length,artifact_offset,block_size,data_format,\
+         address_and_length_format\n\
+         application,app,0x0,0x100,0,0x40,0x11,0x24\n\
+         application,appTail,0x100,0x100,0x100,0x40,,\n",
+    );
+    for document in documents(&convert(files)) {
+        let [session] = sessions(&document) else {
+            panic!("one flash session")
+        };
+        // The second row takes the table's defaults (csv-tables.md 4.12).
+        assert_eq!(formats(session), [(0x11, 0x24), (0x00, 0x44)]);
     }
 }
 

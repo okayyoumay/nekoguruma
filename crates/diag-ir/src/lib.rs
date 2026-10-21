@@ -45,7 +45,9 @@ use crate::declaration::{EcuVariant, Shape};
 /// `UnknownFlashSegment`, `ZeroBlockSize`, `BlockOutOfRange` and `ArtifactLength`
 /// (ADR-336 item 11).
 /// 17: `Op` gained `ReadInput` (ADR-338).
-pub const IR_SCHEMA_VERSION: u32 = 17;
+/// 18: `FlashSegment` gained `data_format` and `address_and_length_format` (ADR-336 item 1); a
+/// document of version 17 would read every segment with the default formats.
+pub const IR_SCHEMA_VERSION: u32 = 18;
 
 /// The longest code, in bytes, that `Program::validate` accepts for a `Fail` (ADR-280).
 pub const MAX_FAILURE_CODE_LEN: usize = 128;

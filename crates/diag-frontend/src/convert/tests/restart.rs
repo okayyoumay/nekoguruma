@@ -307,7 +307,7 @@ fn vin_answer() -> Vec<u8> {
 }
 
 /// The example's identity table with a part number and a software version as integer reads.
-fn identity_table() -> Vec<(String, Vec<u8>)> {
+pub(super) fn identity_table() -> Vec<(String, Vec<u8>)> {
     with(
         example(),
         "identity.csv",

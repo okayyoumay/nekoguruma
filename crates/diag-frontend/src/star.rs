@@ -21,7 +21,9 @@ use std::rc::Rc;
 use serde::Serialize;
 
 use crate::profile::Profile;
-use diag_ir::{IdentitySources, PLAIN_PROCEDURE_STAGE, PreconditionKind, Preconditions};
+use diag_ir::{
+    IdentitySources, PLAIN_PROCEDURE_STAGE, PreconditionKind, Preconditions, RecoveryTiming,
+};
 use starlark_syntax::codemap::Span;
 use starlark_syntax::lexer::TokenInt;
 use starlark_syntax::syntax::ast::{
@@ -54,6 +56,24 @@ pub struct RequestIndex {
     /// The variant's `preconditions.csv`; a program carries the ones its `# @preconditions` names
     /// (`csv-tables.md` 4.14, subset 4.9).
     pub preconditions: Preconditions,
+    /// The recovery facts of the variant's `flash_sessions.csv` rows, one per flash session, which
+    /// a plan that names the session copies into its `FlashRecovery` (`csv-tables.md` 4.12,
+    /// ADR-336 item 1).
+    pub flash: Vec<FlashFacts>,
+}
+
+/// The recovery facts of one flash session's row in `flash_sessions.csv` (`csv-tables.md` 4.12).
+/// A session no plan names may leave them out, so each is optional here; a plan that names the
+/// session needs the timing and the retry count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlashFacts {
+    /// `FlashSession.id`.
+    pub session: u32,
+    /// The four timings, present only when the row gives all of them.
+    pub timing: Option<RecoveryTiming>,
+    pub version_read_retries: Option<u8>,
+    /// The NRC that means no valid application is present.
+    pub no_application_nrc: Option<u8>,
 }
 
 /// No services and no restart facts, over UDS.
@@ -64,6 +84,7 @@ impl Default for RequestIndex {
             profile: &crate::profile::UDS_PROFILE,
             identity: IdentitySources::default(),
             preconditions: Preconditions::default(),
+            flash: Vec::new(),
         }
     }
 }
@@ -2457,18 +2478,20 @@ impl Checker<'_> {
                 "`@erase` and `@recoveryRequired` belong to a function with a `@flashPlan` (4.9)",
             );
         }
-        self.flash_plans(&annotations);
+        let plan_defs: HashSet<u32> = planned.union(&attempted).copied().collect();
+        self.flash_plans(&annotations, &plan_defs);
         annotations
     }
 
     /// The shape rules of flash plans (4.9, ADR-336 items 2, 4 and 6), which the syntax alone
     /// decides. What needs the variant's tables is checked in the lowering.
-    fn flash_plans(&mut self, annotations: &[Annotation]) {
+    fn flash_plans(&mut self, annotations: &[Annotation], plan_defs: &HashSet<u32>) {
         let plans: Vec<&Annotation> = annotations
             .iter()
             .filter(|a| matches!(a, Annotation::FlashPlan { .. }))
             .collect();
         if plans.is_empty() {
+            self.stray_transfers(plan_defs, &HashSet::new());
             return;
         }
         let module = self.module;
@@ -2552,7 +2575,7 @@ impl Checker<'_> {
         }
         let mut walked: HashSet<usize> = HashSet::new();
         let mut found: Vec<(Span, String)> = Vec::new();
-        for plan in plans {
+        for plan in &plans {
             let Annotation::FlashPlan {
                 def: def_line,
                 span: plan_span,
@@ -2865,6 +2888,63 @@ impl Checker<'_> {
         }
         for (span, hint) in found {
             self.error(StarCode::PlanShape, span, hint);
+        }
+        self.stray_transfers(plan_defs, &reported);
+    }
+
+    /// A `diag.flash_transfer` in a function that is no plan and that nothing reaches from `main`
+    /// is a shape error (4.9). The lowering lowers only what `main` reaches and refuses a
+    /// transfer there, so without this one in an uncalled helper would pass unreported.
+    /// `plan_lines` are the `def` lines of the functions with a `@flashPlan`, a faulty one
+    /// included (its fault is reported already), and `reported` the transfers already reported
+    /// as reached from a plan.
+    fn stray_transfers(&mut self, plan_lines: &HashSet<u32>, reported: &HashSet<u32>) {
+        let module = self.module;
+        let codemap = module.file_span(module.statement().span).file;
+        let line_of = |span: Span| to_u32(codemap.find_line(span.begin()) + 1);
+        // The functions `main` reaches, and the top level, whose transfers the lowering judges.
+        let mut callees: Vec<Vec<usize>> = vec![Vec::new(); self.next_function];
+        for call in &self.calls {
+            callees[call.caller].push(call.callee);
+        }
+        let mut reached = vec![false; self.next_function];
+        let mut stack: Vec<usize> = vec![0];
+        stack.extend(self.def_ids.get("main").copied());
+        while let Some(function) = stack.pop() {
+            if std::mem::replace(&mut reached[function], true) {
+                continue;
+            }
+            stack.extend(callees[function].iter().copied());
+        }
+        let mut calls = Vec::new();
+        for stmt in Self::statements(module.statement()) {
+            let StmtP::Def(def) = &stmt.node else {
+                continue;
+            };
+            let id = self.def_ids[def.name.node.ident.as_str()];
+            if reached[id] || plan_lines.contains(&line_of(stmt.span)) {
+                continue;
+            }
+            let mut inner = Vec::new();
+            collect_statements(&def.body, &mut inner);
+            for inner in &inner {
+                for expr in stmt_exprs(inner) {
+                    find_diag_calls(expr, "flash_transfer", &mut calls);
+                }
+            }
+        }
+        let spans: Vec<Span> = calls
+            .iter()
+            .map(|call| call.span)
+            .filter(|span| !reported.contains(&span.begin().get()))
+            .collect();
+        for span in spans {
+            self.error(
+                StarCode::PlanShape,
+                span,
+                "`diag.flash_transfer` belongs in a flash plan function, a top-level function \
+                 with a `@flashPlan` (4.9)",
+            );
         }
     }
 

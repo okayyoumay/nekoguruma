@@ -15,10 +15,11 @@ use diag_ir::declaration::{
 };
 
 use diag_ir::{
-    IdentityKind, IdentitySources, Precondition, PreconditionKind, Preconditions, Satisfied, Source,
+    IdentityKind, IdentitySources, Precondition, PreconditionKind, Preconditions, RecoveryTiming,
+    Satisfied, Source,
 };
 
-use crate::star::{IndexedService, RequestConstant, RequestIndex};
+use crate::star::{FlashFacts, IndexedService, RequestConstant, RequestIndex};
 use crate::tables::rows::{
     self, ConversionKind, ConversionRow, FieldRow, FieldType, Length, RoutinePart, Terminator,
     Timing,
@@ -238,11 +239,40 @@ impl<'a> Index<'a> {
         let profile = crate::profile::get(&protocol.application_layer)
             .expect("resolving checks that a profile ships for every protocol's layer");
         let (identity, preconditions) = self.restart(variant);
+        let flash = self.definition.variants[variant]
+            .flash_sessions
+            .iter()
+            .map(|&i| {
+                let row = &tables.flash_sessions[i];
+                FlashFacts {
+                    session: row.id,
+                    timing: match (
+                        row.session_timeout_ms,
+                        row.teardown_margin_ms,
+                        row.ecu_startup_ms,
+                        row.confirmation_window_ms,
+                    ) {
+                        (Some(session), Some(teardown), Some(startup), Some(confirmation)) => {
+                            Some(RecoveryTiming {
+                                session_timeout_millis: session,
+                                teardown_margin_millis: teardown,
+                                ecu_startup_millis: startup,
+                                confirmation_window_millis: confirmation,
+                            })
+                        }
+                        _ => None,
+                    },
+                    version_read_retries: row.version_read_retries,
+                    no_application_nrc: row.no_application_nrc,
+                }
+            })
+            .collect();
         RequestIndex {
             services,
             profile,
             identity,
             preconditions,
+            flash,
         }
     }
 

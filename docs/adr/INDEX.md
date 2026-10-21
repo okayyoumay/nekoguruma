@@ -325,7 +325,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-333](ADR-333-hardware-check-guard-is-one-pure-decision-and-teardown-is-owned-by-the-run-guard.md) | The Hardware-Check Guard Is One Pure Decision over the Profile, and Teardown Is Owned by the Run Guard | Accepted (the agent's read-only list it names renamed `policy::UDS_READ_ONLY_SERVICES` by ADR-342) | `ngr-hw-checks` guard, teardown, `report::RunGuard`, design 13.5; ADR-275 items 4 and 6 |
 | [ADR-334](ADR-334-agent-runner-is-generic-over-a-worker-client-and-the-harness-guards-it.md) | The Agent Runner Is Generic over a Worker Client, and the Harness Guards It | Accepted | `agent` worker-client trait and generic runner, `ngr-hw-checks` `guard::runner`, design 13.5; ADR-275 item 4, ADR-333, ADR-235 |
 | [ADR-335](ADR-335-journal-and-restart-of-a-plain-procedure.md) | Journal and Restart of a Plain Procedure | Accepted (the Consequences' remedy realized by ADR-336: session control and TesterPresent default to `Safe`) | `agent` journal, restart and runner, `diag-ir` validation, design 5.6, 8.2.5, 8.10.1; ADR-252, ADR-253, ADR-272, ADR-293 |
-| [ADR-336](ADR-336-starlark-restart-declaration-and-flash-transfer.md) | The Starlark Restart Declaration and `diag.flash_transfer` | Accepted | `diag-frontend` Starlark lowering, subset spec 3.1, 3.2, 4.5, 4.6, 4.9 and 5, CSV tables 1 and 4.12, `diag-ir` (`Op::FlashBlock`, `DiagHost::artifact_bytes`, `FlashSegment`), `agent` host and `check_job`, design 8.2.4, 8.2.5, 8.4, 8.9, 11.3; ADR-245, ADR-250, ADR-295, ADR-301, ADR-304, ADR-332, ADR-335 |
+| [ADR-336](ADR-336-starlark-restart-declaration-and-flash-transfer.md) | The Starlark Restart Declaration and `diag.flash_transfer` | Accepted (Consequences' step figure corrected: a block costs 12 steps, about 83,000 blocks at the default limit) | `diag-frontend` Starlark lowering, subset spec 3.1, 3.2, 4.5, 4.6, 4.9 and 5, CSV tables 1 and 4.12, `diag-ir` (`Op::FlashBlock`, `DiagHost::artifact_bytes`, `FlashSegment`), `agent` host and `check_job`, design 8.2.4, 8.2.5, 8.4, 8.9, 11.3; ADR-245, ADR-250, ADR-295, ADR-301, ADR-304, ADR-332, ADR-335 |
 | [ADR-337](ADR-337-a-run-start-is-an-interruptible-point.md) | A Run's Start Is an Interruptible Point | Accepted | `agent` job runner (`run_on_from`, `run_vm`), `crates/agent/docs/ngr-agent.md`, Starlark subset 4.5; design 5.6, 8.10.1; ADR-330, ADR-332, ADR-336 |
 | [ADR-338](ADR-338-diag-precondition-reads-a-declared-source.md) | `diag.precondition` Reads the Row's Default-Session Source | Accepted | `diag-ir` (`Op::ReadInput`, `DiagHost::runtime_input`, `IR_SCHEMA_VERSION` 17, dry run), `diag-frontend` Starlark lowering, `agent` policy and host, Starlark subset 3.1, 3.2, 4.6 and 5, design 8.2.4, 8.9; ADR-233, ADR-245, ADR-254, ADR-316, ADR-321, ADR-328, ADR-336 |
 | [ADR-339](ADR-339-diag-ecu-info-reads-the-declared-identity.md) | `diag.ecu_info` Reads the Declared Identity Through a Literal Key | Accepted | `diag-frontend` Starlark lowering (`STAR_UNKNOWN_IDENTITY`), Starlark subset 3.2, 3.4, 4.6 and 5, `csv-tables.md` 4.13; ADR-254, ADR-336, ADR-338 |
@@ -727,7 +727,7 @@ the predecessor repository these ADRs came from.
 - ADR-330 (the Consequences' program with one section over all of its code can be cancelled before its first step since ADR-337; item 2 amended by ADR-340: a procedure that ends while an HMI timeout's cancel is held ends as cancelled, not completed)
 - ADR-331
 - ADR-335 (the Consequences' remedy realized by ADR-336: session control and TesterPresent default to `Safe`)
-- ADR-336
+- ADR-336 (Consequences' step figure corrected: a block costs 12 steps, about 83,000 blocks at the default limit)
 - ADR-337
 - ADR-342
 
@@ -772,7 +772,7 @@ the predecessor repository these ADRs came from.
 - ADR-328 (`FlashBlock` served as zero bytes of the requested length by ADR-336; item 2's and the Consequences' `ReadDtc` bytes no longer built by the agent's host, only by the dry run, by ADR-342)
 - ADR-329 (item 3 realized by ADR-332)
 - ADR-332 (item 6 amended by ADR-336: a section function inside a plan is entered by fallthrough, and the 4.6 revisit is done there)
-- ADR-336
+- ADR-336 (Consequences' step figure corrected: a block costs 12 steps, about 83,000 blocks at the default limit)
 - ADR-338
 - ADR-339
 - ADR-340

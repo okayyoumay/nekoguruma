@@ -6,6 +6,7 @@ use super::*;
 use crate::tables::{read_directory, read_files, resolve};
 
 mod dtcs_and_flash;
+mod flash_plan;
 mod idempotency;
 mod restart;
 mod services;

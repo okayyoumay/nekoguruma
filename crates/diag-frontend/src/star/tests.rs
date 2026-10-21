@@ -1669,7 +1669,7 @@ fn a_valid_flash_plan_passes_with_its_annotations() {
         .replace("flash_transfer(1)", "flash_transfer(SESSION)")
         .replace("    write()", "    if True:\n        write()");
     passes(&source);
-    // `diag.flash_transfer` outside a plan is the lowering's to refuse, not the checker's.
+    // `diag.flash_transfer` outside a plan, where `main` reaches it, is the lowering's to refuse.
     passes("def main():\n    diag.flash_transfer(1)\n");
 }
 
@@ -2138,4 +2138,21 @@ fn a_section_function_inlined_in_a_plan_does_not_nest() {
         "{:?}",
         codes(&outside)
     );
+}
+
+/// A `diag.flash_transfer` in a function nothing reaches, which the lowering never sees, is
+/// refused by the checker, with or without a plan in the file.
+#[test]
+fn a_transfer_outside_a_plan_is_refused_wherever_it_stands() {
+    use StarCode::PlanShape as Shape;
+    let helper = "def helper():\n    diag.flash_transfer(1)\n\ndef main():\n    pass\n";
+    assert_eq!(codes(helper), [(Shape, 2)]);
+    let beside = PLAN.to_owned() + "\ndef helper():\n    diag.flash_transfer(1)\n";
+    assert_eq!(codes(&beside), [(Shape, 13)]);
+    // A helper the plan reaches is reported once, as reached from the plan.
+    let reached = PLAN.replace(
+        "    res = diag.flash_transfer(1)",
+        "    res = diag.flash_transfer(1)\n    helper()",
+    ) + "\ndef helper():\n    diag.flash_transfer(1)\n";
+    assert_eq!(codes(&reached), [(Shape, 14)]);
 }

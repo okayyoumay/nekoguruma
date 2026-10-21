@@ -16,6 +16,7 @@ Rules for this folder:
 | `backlog.md` | Project-wide status and open items, per area |
 | `worker-crates-backlog.md` | Open items and known flaky tests of the worker crates (`iso22900*`, `j2534-0404*`, `vci-service-*`), per crate |
 | `development-plan.md` | Milestones with goals and exit criteria; says which milestone is current |
+| `hmi-protocol-draft.md` | Draft of the agent-server HMI protocol ADR (ADR-340 items 5 and 6), deleted when that ADR is written |
 
 Backlog files are named `*backlog.md`; only they are checked against the backlog format below.
 

@@ -201,7 +201,12 @@ each call's value and how a decline, a timeout and a cancel surface; which check
    Completed: when the procedure reaches its end while that cancel is still held, which ADR-330
    item 2 would let finish, the job ends as cancelled by the HMI timeout instead, as it would have
    at an interruptible point. Every instruction ran, and the job's outcome still says the operator
-   never answered. A procedure that ends by `diag.fail` or an error while the cancel is held ends
+   never answered. The timeout outlives a restart: the runner commits a journal record of it
+   (`Record::HmiTimedOut`) before the host returns the timed-out answer, so no checkpoint can
+   hold that answer without the record, and a restart that finds the record starts its run with
+   the cancel already raised and the timeout as its reason. The same rules then apply to the
+   resumed run, whether it resumes from a checkpoint or starts again from the first instruction,
+   so a repeated form answered after the restart cannot let the job end as Completed. A procedure that ends by `diag.fail` or an error while the cancel is held ends
    that way, as ADR-330 item 2 says. Where the timeout's value comes from (the job
    instruction or the agent's settings) is a separate decision.
 7. **The dry run keeps its contract.** `Script::form` and `Script::record` still take answer

@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agent::guards::{GuardSetup, JobGuards};
-use agent::policy::READ_ONLY_SERVICES;
+use agent::policy::UDS_READ_ONLY_SERVICES;
 use agent::{HostError, JobError, JobLimits, LinkConfig, run_program};
 use diag_ir::{IR_SCHEMA_VERSION, Op, Program};
 use j2534_0404_mock::mock_library_path;
@@ -138,7 +138,7 @@ async fn run_the_job() {
         .await
         .expect("client should connect");
 
-    assert!(!READ_ONLY_SERVICES.contains(&0x10));
+    assert!(!UDS_READ_ONLY_SERVICES.contains(&0x10));
     // The program writes, so its guards hold the slot: the refusal below is the policy's, not
     // the missing slot's.
     let (result, _guards) = run_program(

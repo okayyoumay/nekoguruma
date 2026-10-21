@@ -13224,6 +13224,44 @@ def main():
         (client, calls, set)
     }
 
+    /// The host checks every request against its link's application layer (ADR-342): on a
+    /// read-only link with no layer a read never reaches the worker, on UDS it does; and
+    /// `ReadDtc` sends nothing at all.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_host_judges_requests_by_its_link_s_application_layer() {
+        use diag_ir::DiagHost;
+        for (layer, sent) in [(None, false), (Some(policy::ApplicationLayer::Uds), true)] {
+            let (mut client, calls) = fake_worker(false).await;
+            let config = LinkConfig::iso15765(0x7E0, 0x7E8);
+            let mut link = link::open(&mut client, &config, Duration::from_secs(5))
+                .await
+                .expect("the link opens");
+            assert_eq!(link.application_layer, Some(policy::ApplicationLayer::Uds));
+            assert_eq!(link.permission(), Permission::ReadOnly);
+            link.application_layer = layer;
+            let handle = tokio::runtime::Handle::current();
+            let timings = Timings::for_link(&config);
+            let (read, read_dtc) = tokio::task::spawn_blocking(move || {
+                let mut host = WorkerHost::new(handle, client, link, timings);
+                (
+                    host.service_request(0x22, &[0xF1, 0x90]),
+                    host.read_dtc(0x08),
+                )
+            })
+            .await
+            .unwrap();
+            let reached = calls.lock().unwrap().contains(&"StartComPrimitive");
+            assert_eq!(reached, sent, "{layer:?}: {read:?}");
+            if !sent {
+                assert!(matches!(read, Err(HostError::NotAllowed(0x22))), "{read:?}");
+            }
+            assert!(
+                matches!(read_dtc, Err(HostError::Unsupported("ReadDtc"))),
+                "{read_dtc:?}"
+            );
+        }
+    }
+
     /// The link sets its own ComParams, then the declared ones as declared, each with the class
     /// the worker takes from the ComParam (ADR-324 item 3).
     #[tokio::test(flavor = "multi_thread")]

@@ -11,13 +11,13 @@
 //!   segments it itself, so the guard cannot tell what a raw payload sends; no frame decoder
 //!   exists here.
 //!
-//! [`READ_ONLY_SERVICES`] of the agent's `policy` module is the production job runner's list of
-//! services (ReadDTCInformation and ReadDataByIdentifier). This list is wider on purpose: a
+//! [`UDS_READ_ONLY_SERVICES`] of the agent's `policy` module is the production job runner's list
+//! of UDS services (ReadDTCInformation and ReadDataByIdentifier). This list is wider on purpose: a
 //! hardware check on T3 may own a session (design 13.5's class table allows the default and the
 //! extended session, and tester present), and it is narrower in another way: it also looks at the
 //! sub-function and the length of the request. The two are kept apart (ADR-333 item 3).
 //!
-//! [`READ_ONLY_SERVICES`]: agent::policy::READ_ONLY_SERVICES
+//! [`UDS_READ_ONLY_SERVICES`]: agent::policy::UDS_READ_ONLY_SERVICES
 
 use vci_service_interface::{
     ComOperationType, ComPrimitiveCtrlData, StartComPrimitiveRequest, TxFlagBit,

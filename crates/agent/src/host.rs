@@ -202,12 +202,6 @@ pub fn service_request_bytes(service: u16, payload: &[u8]) -> Result<Vec<u8>, Ho
     Ok(request)
 }
 
-/// ReadDTCInformation (0x19), sub-function reportDTCByStatusMask (0x02); ISO 14229-1:2026
-/// clause 11.3.
-pub fn read_dtc_bytes(mask: u8) -> Vec<u8> {
-    vec![0x19, 0x02, mask]
-}
-
 /// RoutineControl (0x31): sub-function, routine identifier, option record; ISO 14229-1:2026
 /// clause 13.2.
 pub fn routine_control_bytes(routine: u16, sub: u8, payload: &[u8]) -> Vec<u8> {
@@ -439,7 +433,7 @@ impl<C: WorkerApi> WorkerHost<C> {
     ///
     /// Every request leaves through here, so the policy is checked here (ADR-235 item 8).
     fn send_recv(&mut self, request: Vec<u8>) -> Result<Vec<u8>, HostError> {
-        crate::policy::check_request(&request, self.link.permission)?;
+        crate::policy::check_request(&request, self.link.application_layer, self.link.permission)?;
         let progress = Progress::for_request(&request)?;
         let handle = self.handle.clone();
         handle.block_on(self.send_recv_async(request, progress))
@@ -452,7 +446,7 @@ impl<C: WorkerApi> WorkerHost<C> {
         request: Vec<u8>,
         expected: Expectation,
     ) -> Result<Vec<u8>, HostError> {
-        crate::policy::check_request(&request, self.link.permission)?;
+        crate::policy::check_request(&request, self.link.application_layer, self.link.permission)?;
         let progress = Progress::expecting(expected);
         let handle = self.handle.clone();
         handle.block_on(self.send_recv_async(request, progress))
@@ -733,8 +727,10 @@ impl<C: WorkerApi> DiagHost for WorkerHost<C> {
         response
     }
 
-    fn read_dtc(&mut self, mask: u8) -> Result<Vec<u8>, HostError> {
-        self.send_recv(read_dtc_bytes(mask))
+    // `diag.read_dtc` lowers to a send-receive (ADR-309 item 4), so no request is built for
+    // the instruction (ADR-342); the policy refuses it before the link opens.
+    fn read_dtc(&mut self, _mask: u8) -> Result<Vec<u8>, HostError> {
+        Err(HostError::Unsupported("ReadDtc"))
     }
 
     // Goes through `send_recv`, so the link's permission decides (ADR-235 item 8, ADR-247).
@@ -869,7 +865,6 @@ mod tests {
             service_request_bytes(0x100, &[]),
             Err(HostError::BadService(0x100))
         ));
-        assert_eq!(read_dtc_bytes(0x08), [0x19, 0x02, 0x08]);
         assert_eq!(
             routine_control_bytes(0xFF00, 0x01, &[0xAA]),
             [0x31, 0x01, 0xFF, 0x00, 0xAA]

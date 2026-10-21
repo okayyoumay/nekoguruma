@@ -1,7 +1,7 @@
 # ADR-322: The Agent Serves the Generic Send-Receive
 
 **Date:** 2026-10-17
-**Status:** Accepted (items 1 and 3 use the current target's declarations in a procedure with several targets, ADR-325 item 3)
+**Status:** Accepted (items 1 and 3 use the current target's declarations in a procedure with several targets, ADR-325 item 3; the Consequences' open per-layer read-only list and `ReadDtc` request building closed by ADR-342)
 **Affects:** `agent` (`send_receive`, `host.rs` `WorkerHost::send_receive`, `policy::check_program`,
 `policy::writes`, `runner::check_job`, `Job::writes`, `ngr-agent run`), design 8.2.4;
 ADR-235, ADR-245, ADR-247, ADR-250, ADR-257, ADR-309, ADR-321
